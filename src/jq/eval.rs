@@ -405,9 +405,9 @@ impl<W: Clone + AsRef<[u64]>> QueryResult<'_, W> {
     /// evaluator-parity tests rely on.
     pub fn collect_owned(self) -> Vec<OwnedValue> {
         match self {
-            QueryResult::One(v) => vec![to_owned(&v)],
-            QueryResult::OneCursor(c) => vec![to_owned(&c.value())],
-            QueryResult::Many(vs) => vs.iter().map(to_owned).collect(),
+            QueryResult::One(v) => vec![to_owned_lossy(&v)],
+            QueryResult::OneCursor(c) => vec![to_owned_lossy(&c.value())],
+            QueryResult::Many(vs) => vs.iter().map(to_owned_lossy).collect(),
             QueryResult::None => Vec::new(),
             QueryResult::Error(_) => Vec::new(),
             QueryResult::Owned(o) => vec![o],
@@ -514,7 +514,30 @@ fn type_name<W>(value: &StandardJson<'_, W>) -> &'static str {
     }
 }
 
-/// Convert a StandardJson value to an OwnedValue.
+/// Convert a `StandardJson` value to an `OwnedValue`, **discarding whatever
+/// it cannot decode** — use [`to_owned`] unless the value is already known
+/// to decode.
+///
+/// This is the minority variant, and the name says what it does rather than
+/// where it is used (#1989). Three separate losses, none of them reported:
+/// an undecodable string becomes `String::new()`, an object member whose key
+/// fails to decode is dropped from the map entirely, and a trailing unpaired
+/// member (#1194, `{"a":1,"b"}`) is silently ignored — a `for` loop over
+/// `fields` cannot tell that case from genuine exhaustion, which is exactly
+/// why [`to_owned`] walks with `uncons`/`ends_unpaired` instead.
+///
+/// Sound only where the caller already knows the value decodes. Every
+/// remaining call site satisfies that one of three ways: it sits inside
+/// `scalar_fallback`/an explicit `scalar_decode_failure` guard that has
+/// already rejected the undecodable case; it renders an
+/// already-classified value into an `EvalError` message; or it is fed
+/// exclusively by an already-owned or reindexed document, where no
+/// undecodable borrowed string can exist. `to_owned_for_error_message` was
+/// considered and rejected as the name: roughly a third of the call sites
+/// (`QueryResult::collect_owned`, `push_owned_values`, `Item::into_owned`,
+/// the `Partial` folds) are not error-message contexts at all, and a name
+/// that is a lie at a third of its sites is worse than one that simply
+/// names the hazard.
 ///
 /// Panics past [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH)
 /// levels of nesting (#1005) — see that constant's own doc comment for why
@@ -529,11 +552,11 @@ fn type_name<W>(value: &StandardJson<'_, W>) -> &'static str {
 /// ordinary deep `..`/`recurse` document navigation, which is why this
 /// needs the higher, separately-tuned ceiling rather than
 /// `eval_generic::MAX_NESTING_DEPTH`.
-fn to_owned<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) -> OwnedValue {
-    to_owned_at_depth(value, 0)
+fn to_owned_lossy<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) -> OwnedValue {
+    to_owned_lossy_at_depth(value, 0)
 }
 
-fn to_owned_at_depth<W: Clone + AsRef<[u64]>>(
+fn to_owned_lossy_at_depth<W: Clone + AsRef<[u64]>>(
     value: &StandardJson<'_, W>,
     depth: usize,
 ) -> OwnedValue {
@@ -551,7 +574,7 @@ fn to_owned_at_depth<W: Clone + AsRef<[u64]>>(
         }
         StandardJson::Array(elements) => {
             let items: Vec<OwnedValue> = (*elements)
-                .map(|e| to_owned_at_depth(&e, depth + 1))
+                .map(|e| to_owned_lossy_at_depth(&e, depth + 1))
                 .collect();
             OwnedValue::Array(items)
         }
@@ -563,7 +586,7 @@ fn to_owned_at_depth<W: Clone + AsRef<[u64]>>(
                     if let Ok(cow) = key_str_val.as_str() {
                         map.insert(
                             cow.into_owned(),
-                            to_owned_at_depth(&field.value(), depth + 1),
+                            to_owned_lossy_at_depth(&field.value(), depth + 1),
                         );
                     }
                 }
@@ -574,24 +597,26 @@ fn to_owned_at_depth<W: Clone + AsRef<[u64]>>(
     }
 }
 
-/// Fallible twin of [`to_owned`], raising [`EvalError::decode_failure`] on an
-/// undecodable string value instead of silently substituting an empty string
-/// (#1746) -- mirrors `eval_generic::to_owned_at_depth`'s already-fixed
-/// shape (#1247/#1620/#1660), which this private, `StandardJson`-specific
-/// copy never received.
+/// Materialize a `StandardJson` value as an `OwnedValue`, raising
+/// [`EvalError::decode_failure`] on anything it cannot decode.
 ///
-/// Used only at this file's primary result-value materialization points
-/// (`builtin_path`, `eval_assign`, `eval_update`, `yq_assign_noop_check`,
-/// `builtin_setpath`, `builtin_del`, `delpaths_one`,
-/// `map_over`/`builtin_map_values`, `builtin_to_entries`, `eval_slice_expr`
-/// (#1943) -- not exhaustive, see #1908/#1953 for the remaining audit)
-/// rather than replacing [`to_owned`] everywhere: this file has on the order of 150
-/// other `to_owned` call sites, roughly 50 of them a real instance of the
-/// same #1746 bug shape (filed as #1755) and the rest `QueryResult`
-/// collector boilerplate or error-message rendering -- changing the
-/// infallible function's own signature would force a Result-threading edit
-/// at every one of them in a single change. Left as a documented gap for a
-/// follow-up rather than attempted here (#1746's own comment thread).
+/// **This is the default.** #1989 gave it the short name and pushed the
+/// infallible variant out to [`to_owned_lossy`], so that a new call site
+/// written as a bare `to_owned` gets the checked conversion and a
+/// `Result` the compiler makes you handle — rather than silently
+/// substituting `""` and carrying on, which is the bug shape #1746, #1755,
+/// #1902, #1953, #1972, #1999, #2001, #2023 and #1989 each rediscovered at
+/// one more site. Reaching for [`to_owned_lossy`] is now the deliberate,
+/// visible act, and it has to be justified against that function's own
+/// soundness rule.
+///
+/// Mirrors `eval_generic::to_owned_at_depth`'s already-fixed shape
+/// (#1247/#1620/#1660), which this private, `StandardJson`-specific copy
+/// originally never received.
+///
+/// A decode failure raised here is never suppressed by `?` — see
+/// [`suppresses`], and [`to_owned_or_suppress`] for the call-site idiom
+/// where the *other* error kinds this can raise still respect `optional`.
 ///
 /// A field's key is resolved through [`resolve_display_key`] (#1734), the
 /// same shared sequence `eval_generic::to_owned_at_depth` uses: a key that
@@ -605,13 +630,11 @@ fn to_owned_at_depth<W: Clone + AsRef<[u64]>>(
 /// before this fix, `StandardJson`'s own
 /// [`DocumentValue`](super::document::DocumentValue) impl making the shared
 /// helper directly usable.
-fn to_owned_checked<W: Clone + AsRef<[u64]>>(
-    value: &StandardJson<'_, W>,
-) -> Result<OwnedValue, EvalError> {
-    to_owned_checked_at_depth(value, 0)
+fn to_owned<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) -> Result<OwnedValue, EvalError> {
+    to_owned_at_depth(value, 0)
 }
 
-fn to_owned_checked_at_depth<W: Clone + AsRef<[u64]>>(
+fn to_owned_at_depth<W: Clone + AsRef<[u64]>>(
     value: &StandardJson<'_, W>,
     depth: usize,
 ) -> Result<OwnedValue, EvalError> {
@@ -626,7 +649,7 @@ fn to_owned_checked_at_depth<W: Clone + AsRef<[u64]>>(
         },
         StandardJson::Array(elements) => {
             let items: Vec<OwnedValue> = (*elements)
-                .map(|e| to_owned_checked_at_depth(&e, depth + 1))
+                .map(|e| to_owned_at_depth(&e, depth + 1))
                 .collect::<Result<_, _>>()?;
             OwnedValue::Array(items)
         }
@@ -658,7 +681,7 @@ fn to_owned_checked_at_depth<W: Clone + AsRef<[u64]>>(
                 let Some(key) = resolve_display_key(&key_val, &map, &mut guard)? else {
                     return Err(f.malformed_member_error());
                 };
-                map.insert(key, to_owned_checked_at_depth(&field.value(), depth + 1)?);
+                map.insert(key, to_owned_at_depth(&field.value(), depth + 1)?);
                 f = rest;
             }
             if f.ends_unpaired() {
@@ -699,7 +722,7 @@ fn scalar_decode_failure<W: Clone + AsRef<[u64]>>(
 /// item 5): decode failure wins unconditionally, `optional` suppresses the
 /// remaining type error, and otherwise `err()` builds it. `err` is called at
 /// most once and only in the final, un-suppressed case, so a caller whose
-/// constructor itself does real work (`to_owned`, formatting) pays nothing
+/// constructor itself does real work (`to_owned_lossy`, formatting) pays nothing
 /// extra on the two earlier-return paths.
 fn scalar_fallback<'a, W: Clone + AsRef<[u64]>>(
     value: &StandardJson<'a, W>,
@@ -720,15 +743,15 @@ fn scalar_fallback<'a, W: Clone + AsRef<[u64]>>(
 /// `index_one`/[`EvalError::cannot_index`] and `SliceBounds::resolved_bound`
 /// never inspect an Array/Object candidate's *contents* — only its type
 /// name, to build the `Cannot index ... with array/object`/`Array or string
-/// slice indices must be integers` message — so a full recursive [`to_owned`]
+/// slice indices must be integers` message — so a full recursive [`to_owned_lossy`]
 /// of a large navigated container candidate is pure waste when it can only
 /// ever be rejected on type. Mirrors [`json_is_truthy`]'s existing "classify
-/// without paying for `to_owned`'s full deep copy" idiom, for the same
+/// without paying for `to_owned_lossy`'s full deep copy" idiom, for the same
 /// reason: `.. | .[.k]?` visits every node in a tree, and on a
 /// linear-nesting document `.k`'s value at depth *i* is the entire
 /// remaining subtree (#626).
 ///
-/// #1755: `to_owned_checked`, not `to_owned`, on the scalar fallback -- an
+/// #1755: `to_owned`, not `to_owned_lossy`, on the scalar fallback -- an
 /// undecodable string candidate (a computed index/slice-bound key) must
 /// raise, not silently become `""` and get indexed/compared as though
 /// that were the real key.
@@ -738,15 +761,15 @@ fn to_owned_key_shape<W: Clone + AsRef<[u64]>>(
     match value {
         StandardJson::Array(_) => Ok(OwnedValue::Array(Vec::new())),
         StandardJson::Object(_) => Ok(OwnedValue::Object(IndexMap::new())),
-        other => to_owned_checked(other),
+        other => to_owned(other),
     }
 }
 
 /// jq truthiness of a borrowed value: everything except `null` and `false`.
 ///
-/// Equivalent to `to_owned(value).is_truthy()` — [`to_owned`] maps
+/// Equivalent to `to_owned_lossy(value).is_truthy()` — [`to_owned_lossy`] maps
 /// `StandardJson::Error` to `OwnedValue::Null`, which is falsy — but O(1)
-/// where `to_owned` deep-copies whole arrays and objects to answer a yes/no
+/// where `to_owned_lossy` deep-copies whole arrays and objects to answer a yes/no
 /// question. That matters for the stream operators, which test *every* output
 /// rather than just the first.
 fn json_is_truthy<W>(value: &StandardJson<'_, W>) -> bool {
@@ -997,13 +1020,13 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     return QueryResult::One(value);
                 }
                 // jq array slicing yields a single sub-array, not a stream of
-                // elements. #1932: `to_owned_checked`, not an unchecked
-                // `to_owned`, per element -- an undecodable element's string
+                // elements. #1932: `to_owned`, not an unchecked
+                // `to_owned_lossy`, per element -- an undecodable element's string
                 // content must raise `decode_failure`, not silently become
                 // `""` (the same #1755 shape the adjacent `StandardJson::
                 // Object` arm below already guards against; this arm was
                 // apparently missed when #1755 patched that one). Mirrors
-                // that `Object` arm's own single `to_owned_checked` call
+                // that `Object` arm's own single `to_owned` call
                 // (code review, #1941: an earlier version of this fix used
                 // `promote_borrowed_checked` instead, built for a different
                 // shape -- accumulating a partial prefix for a fan-out
@@ -1013,11 +1036,11 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // -- a #1194 malformed-member error nested inside a sliced
                 // element respects `optional` the same way the sibling
                 // `Object` arm below already does (#1953); can't use the
-                // `to_owned_checked_or_suppress!` macro directly inside
+                // `to_owned_or_suppress!` macro directly inside
                 // `.map()` here since its `return` would return from the
                 // closure, not this function.
                 let sliced = slice_elements::<W>(elements, *start, *end);
-                match sliced.iter().map(to_owned_checked).collect() {
+                match sliced.iter().map(to_owned).collect() {
                     Ok(items) => QueryResult::Owned(OwnedValue::Array(items)),
                     Err(e) => suppress_or_raise(e, optional),
                 }
@@ -1083,16 +1106,16 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // re-deriving key/value-pair iteration against the cursor's own
             // field type.
             StandardJson::Object(_) if S::TAG == EvalTag::Yq => {
-                // #1755: to_owned_checked, not to_owned -- an undecodable
+                // #1755: to_owned, not to_owned_lossy -- an undecodable
                 // field value must raise, not silently become "" and get
                 // sliced as if it were the real value. #1953: a non-decode-
-                // failure to_owned_checked error (a #1194 malformed-member
+                // failure to_owned error (a #1194 malformed-member
                 // error -- a #1642 collision error is itself tagged as a
                 // decode failure and so is unaffected by this) respects
                 // `optional` the same way the sibling `_ if optional` arm
                 // below does -- only a genuine decode failure is
                 // unconditional.
-                let owned = match to_owned_checked(&value) {
+                let owned = match to_owned(&value) {
                     Ok(v) => v,
                     Err(e) => return suppress_or_raise(e, optional),
                 };
@@ -1112,7 +1135,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         // #1820/#1907: `scalar_fallback` -- an undecodable-string scalar must
         // raise its own decode failure, not the generic `cannot_iterate_with`
-        // message built from an unchecked `to_owned` (which silently
+        // message built from an unchecked `to_owned_lossy` (which silently
         // substitutes `""` into the message and, worse, would still report
         // "cannot iterate" instead of the real reason, even under `?`, where
         // a decode failure must never be suppressed, #1247/#1620).
@@ -1133,7 +1156,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 QueryResult::Many(results)
             }
             _ => scalar_fallback(&value, optional, || {
-                EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))
+                EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
             }),
         },
 
@@ -1379,7 +1402,7 @@ fn eval_comma<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     for expr in exprs {
         match eval_single::<W, S>(expr, value.clone(), optional).materialize_cursor() {
-            // #1790: to_owned_checked, not to_owned -- a heterogeneous
+            // #1790: to_owned, not to_owned_lossy -- a heterogeneous
             // comma (a navigable branch alongside an already-owned one,
             // e.g. `[.a, 1]`) used to promote the borrowed branch's
             // undecodable string to `""` here, silently, the moment the
@@ -1464,7 +1487,7 @@ fn eval_array_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Collect all outputs from the inner expression into an array
     let result = eval_single::<W, S>(inner, value, optional);
 
-    // #1755: to_owned_checked, not to_owned -- an undecodable string among
+    // #1755: to_owned, not to_owned_lossy -- an undecodable string among
     // the constructed elements must raise, not silently become "". Not
     // named in #1755's own site audit (this helper backs both literal `[
     // ...]` construction, Expr::Array below, and every `min_by`/`max_by`/
@@ -1475,12 +1498,12 @@ fn eval_array_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // was silently swallowed entirely rather than merely corrupting the
     // eventual output value.
     let items: Vec<OwnedValue> = match result.materialize_cursor() {
-        QueryResult::One(v) => match to_owned_checked(&v) {
+        QueryResult::One(v) => match to_owned(&v) {
             Ok(v) => vec![v],
             Err(e) => return QueryResult::Error(e),
         },
         QueryResult::OneCursor(_) => unreachable!(),
-        QueryResult::Many(vs) => match vs.iter().map(to_owned_checked).collect::<Result<_, _>>() {
+        QueryResult::Many(vs) => match vs.iter().map(to_owned).collect::<Result<_, _>>() {
             Ok(items) => items,
             Err(e) => return QueryResult::Error(e),
         },
@@ -1553,7 +1576,7 @@ fn stream_outputs<W: Clone + AsRef<[u64]>>(
     }
 }
 
-/// The [`to_owned_checked`]/[`promote_borrowed_checked`] counterpart to
+/// The [`to_owned`]/[`promote_borrowed_checked`] counterpart to
 /// [`stream_outputs`]: identical fold, except a decode failure discovered
 /// while materializing an output becomes part of the returned `Control`
 /// too, not just an escape `result` already carried going in. #1902/#1934
@@ -1588,7 +1611,7 @@ fn stream_outputs_checked<W: Clone + AsRef<[u64]>>(
     result: QueryResult<'_, W>,
 ) -> (Vec<OwnedValue>, Option<Control>) {
     match result.materialize_cursor() {
-        QueryResult::One(v) => match to_owned_checked(&v) {
+        QueryResult::One(v) => match to_owned(&v) {
             Ok(v) => (vec![v], None),
             Err(e) => (Vec::new(), Some(Control::Error(e))),
         },
@@ -1818,7 +1841,7 @@ fn collect_recursive<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// `push_promoted`/`promote_borrowed_checked` already established for the
 /// main promotion path (#1755/#1790) -- this is that rule's other half, for
 /// the terminal-control path those two never covered. Before this fix,
-/// `borrowed`'s conversion here ran through unchecked `to_owned`, silently
+/// `borrowed`'s conversion here ran through unchecked `to_owned_lossy`, silently
 /// substituting `""` for an undecodable string instead of raising.
 ///
 /// `Control::Halt` is deliberately excluded from the preemption (#1832
@@ -1938,10 +1961,10 @@ fn finish_result<W: Clone + AsRef<[u64]>>(
         return result;
     };
     match result.materialize_cursor() {
-        QueryResult::One(v) => partial(vec![to_owned(&v)], control),
+        QueryResult::One(v) => partial(vec![to_owned_lossy(&v)], control),
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
         QueryResult::Owned(v) => partial(vec![v], control),
-        QueryResult::Many(vs) => partial(vs.iter().map(to_owned).collect(), control),
+        QueryResult::Many(vs) => partial(vs.iter().map(to_owned_lossy).collect(), control),
         QueryResult::ManyOwned(vs) => partial(vs, control),
         // No output from `result` itself (e.g. an `optional` filter matched
         // nothing) -- nothing to splice the trailing control onto but the
@@ -2252,7 +2275,7 @@ where
         // routed through `ArgFanout::yq_native`/`reject_many_in_yq`/etc.)
         // shares the identical #1746-shaped bug the `All` lazy sink above
         // was fixed for: `stream_outputs`'s own fold uses unchecked
-        // `to_owned` via `QueryResult::collect_owned`, silently substituting
+        // `to_owned_lossy` via `QueryResult::collect_owned`, silently substituting
         // `""` for an undecodable argument instead of raising. Confirmed
         // live: `succinctly yq 'has(.b)'` on an undecodable `.b` answered
         // `false` instead of raising, pre-fix.
@@ -2442,8 +2465,16 @@ fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         return fanout_two_args_lazy::<W, S, _>(outer, inner, value, optional, body);
     }
 
+    // #1989: `stream_outputs_checked`, not `stream_outputs` -- the same
+    // #1746-shaped bug #2023 fixed at `fanout_arg`'s own eager path, at the
+    // two-argument twin it left behind. `stream_outputs`'s fold materializes
+    // through `QueryResult::collect_owned`, which uses the unchecked
+    // conversion and so silently substitutes `""` for an undecodable
+    // argument instead of raising -- the argument then gets used as though
+    // that empty string were the real value (a path element, a pattern, a
+    // set of regex flags).
     let (mut outers, outer_trailing) =
-        stream_outputs(eval_single::<W, S>(outer, value.clone(), optional));
+        stream_outputs_checked(eval_single::<W, S>(outer, value.clone(), optional));
     if let Err(e) = apply_arg_fanout(fanout, &mut outers) {
         // #1533's other half. Two things had to be established live against
         // the pinned yq v4.53.3 oracle, not assumed:
@@ -2471,7 +2502,7 @@ fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // not an extra one, with the same side-effect profile the loop's
         // first iteration would have had.
         let (mut probe_inners, probe_inner_trailing) =
-            stream_outputs(eval_single::<W, S>(inner, value.clone(), optional));
+            stream_outputs_checked(eval_single::<W, S>(inner, value.clone(), optional));
         if let Err(inner_e) = apply_arg_fanout(fanout, &mut probe_inners) {
             return match probe_inner_trailing {
                 Some(inner_control) => partial(Vec::new(), inner_control),
@@ -2487,7 +2518,7 @@ fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut out: Vec<OwnedValue> = Vec::new();
     for o in outers {
         let (mut inners, inner_trailing) =
-            stream_outputs(eval_single::<W, S>(inner, value.clone(), optional));
+            stream_outputs_checked(eval_single::<W, S>(inner, value.clone(), optional));
         if let Err(e) = apply_arg_fanout(fanout, &mut inners) {
             // Same reasoning as the outer slot above.
             return match inner_trailing {
@@ -2531,7 +2562,7 @@ fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 fn item_to_owned<W: Clone + AsRef<[u64]>>(item: Item<'_, W>) -> OwnedValue {
     match item {
         Item::Owned(v) => v,
-        Item::Borrowed(v) => to_owned(&v),
+        Item::Borrowed(v) => to_owned_lossy(&v),
     }
 }
 
@@ -2681,7 +2712,7 @@ pub(crate) fn suppresses(e: &EvalError, optional: bool) -> bool {
 /// every checked-conversion and bare-error site.
 ///
 /// Not universal, though: `builtin_recurse_f`/`builtin_recurse_cond`'s own
-/// `to_owned_checked` sites deliberately do *not* route through here (#1953)
+/// `to_owned` sites deliberately do *not* route through here (#1953)
 /// -- see `builtin_recurse_f`'s own doc comment for why (its `optional`
 /// parameter is unused throughout the rest of the function, matching real
 /// jq's own `recurse` having no internal optional-suppression concept).
@@ -2695,8 +2726,8 @@ pub(crate) fn suppress_or_raise<'a, W>(e: EvalError, optional: bool) -> QueryRes
     }
 }
 
-/// [`to_owned_checked`] plus [`suppress_or_raise`] in one call, per #2001's
-/// own suggestion: collapses the `match to_owned_checked(&value) { Ok(v) =>
+/// [`to_owned`] plus [`suppress_or_raise`] in one call, per #2001's
+/// own suggestion: collapses the `match to_owned(&value) { Ok(v) =>
 /// v, Err(e) => return suppress_or_raise(e, optional) }` four-liner this
 /// issue's whole lineage (#1194→#1953→#1972→#1999→#2001) keeps
 /// rediscovering missing at one more call site, into a single call. A macro
@@ -2707,28 +2738,28 @@ pub(crate) fn suppress_or_raise<'a, W>(e: EvalError, optional: bool) -> QueryRes
 /// already establish for the identical "no-`Try`-impl, need-early-return"
 /// shape against `GenericResult`; this is that same idiom's `eval.rs`
 /// twin, not a new one.
-macro_rules! to_owned_checked_or_suppress {
+macro_rules! to_owned_or_suppress {
     ($value:expr, $optional:expr) => {
-        match to_owned_checked($value) {
+        match to_owned($value) {
             Ok(v) => v,
             Err(e) => return suppress_or_raise(e, $optional),
         }
     };
 }
 
-/// The collection-level twin of [`to_owned_checked_or_suppress`]: converts
-/// every item of `$iter` with `to_owned_checked`, short-circuiting on the
+/// The collection-level twin of [`to_owned_or_suppress`]: converts
+/// every item of `$iter` with `to_owned`, short-circuiting on the
 /// first error (code review, #1989/#2028) -- was hand-rolled as `match
-/// $iter.map(|v| to_owned_checked(&v)).collect() { Ok(v) => v, Err(e) =>
+/// $iter.map(|v| to_owned(&v)).collect() { Ok(v) => v, Err(e) =>
 /// return suppress_or_raise(e, $optional) }` at three separate call sites
 /// (`builtin_combinations`, `builtin_combinations_n`, `builtin_skip`)
 /// before this consolidation -- the exact "keeps rediscovering missing at
-/// one more call site" pattern [`to_owned_checked_or_suppress`]'s own doc
+/// one more call site" pattern [`to_owned_or_suppress`]'s own doc
 /// comment already names for the single-value case.
-macro_rules! to_owned_checked_vec_or_suppress {
+macro_rules! to_owned_vec_or_suppress {
     ($iter:expr, $optional:expr) => {
         match $iter
-            .map(|v| to_owned_checked(&v))
+            .map(|v| to_owned(&v))
             .collect::<Result<Vec<OwnedValue>, EvalError>>()
         {
             Ok(v) => v,
@@ -2789,13 +2820,13 @@ fn prepend<W: Clone + AsRef<[u64]>>(
     match result.materialize_cursor() {
         QueryResult::None => owned_vec_to_result(prefix),
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
-        // #1908 (Category 2 of #1820's audit): `to_owned_checked`, not
-        // `to_owned` -- the catch handler's own result can hold an
+        // #1908 (Category 2 of #1820's audit): `to_owned`, not
+        // `to_owned_lossy` -- the catch handler's own result can hold an
         // undecodable string (e.g. `try (.a, (.b | error({x: .}))) catch
         // .x` on a `.b` whose bytes don't decode), and this splice must
         // raise `EvalError::decode_failure` instead of silently
         // substituting `""`, matching #1755's established rule.
-        QueryResult::One(v) => match to_owned_checked(&v) {
+        QueryResult::One(v) => match to_owned(&v) {
             Ok(owned) => {
                 prefix.push(owned);
                 owned_vec_to_result(prefix)
@@ -2888,13 +2919,13 @@ fn result_to_owned_full<W: Clone + AsRef<[u64]>>(
     result: QueryResult<'_, W>,
 ) -> Result<Option<(OwnedValue, Option<Control>)>, EvalEscape> {
     match result.materialize_cursor() {
-        QueryResult::One(v) => Ok(Some((to_owned(&v), None))),
+        QueryResult::One(v) => Ok(Some((to_owned_lossy(&v), None))),
         QueryResult::OneCursor(_) => unreachable!(),
         QueryResult::Owned(v) => Ok(Some((v, None))),
         // An empty `Many`/`ManyOwned` is the same "zero outputs" case as a
         // bare `QueryResult::None` below, not a distinct error -- both mean
         // the argument's generator produced nothing.
-        QueryResult::Many(vs) => Ok(vs.first().map(|v| (to_owned(v), None))),
+        QueryResult::Many(vs) => Ok(vs.first().map(|v| (to_owned_lossy(v), None))),
         QueryResult::ManyOwned(vs) => Ok(vs.into_iter().next().map(|v| (v, None))),
         // Same "take the first output" policy already applied to
         // `Many`/`ManyOwned` above — a `Partial` prefix is never empty (see
@@ -2936,7 +2967,7 @@ fn result_to_owned_full<W: Clone + AsRef<[u64]>>(
 /// filtered stream from a value that was single all along. `None`, `Error` and
 /// `Break` pass through untouched — filtering says nothing about them.
 ///
-/// Borrowed values stay borrowed: this never calls [`to_owned`], so `//` over a
+/// Borrowed values stay borrowed: this never calls [`to_owned_lossy`], so `//` over a
 /// document-derived stream keeps the zero-copy path.
 fn retain_truthy<W: Clone + AsRef<[u64]>>(result: QueryResult<'_, W>) -> QueryResult<'_, W> {
     match result.materialize_cursor() {
@@ -3029,10 +3060,10 @@ fn push_owned_values<W: Clone + AsRef<[u64]>>(
     out: &mut Vec<OwnedValue>,
 ) -> Option<Control> {
     match result.materialize_cursor() {
-        QueryResult::One(v) => out.push(to_owned(&v)),
+        QueryResult::One(v) => out.push(to_owned_lossy(&v)),
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
         QueryResult::Owned(v) => out.push(v),
-        QueryResult::Many(vs) => out.extend(vs.iter().map(to_owned)),
+        QueryResult::Many(vs) => out.extend(vs.iter().map(to_owned_lossy)),
         QueryResult::ManyOwned(vs) => out.extend(vs),
         QueryResult::None => {}
         QueryResult::Error(e) => return Some(Control::Error(e)),
@@ -3046,7 +3077,7 @@ fn push_owned_values<W: Clone + AsRef<[u64]>>(
     None
 }
 
-/// The [`to_owned_checked`]/[`promote_borrowed_checked`] counterpart to
+/// The [`to_owned`]/[`promote_borrowed_checked`] counterpart to
 /// [`push_owned_values`]: identical push, except a decode failure
 /// discovered while materializing an output is treated exactly like an
 /// ordinary trailing error -- returned as `Some(Control::Error(_))`, with
@@ -3060,7 +3091,7 @@ fn push_owned_values_checked<W: Clone + AsRef<[u64]>>(
     out: &mut Vec<OwnedValue>,
 ) -> Option<Control> {
     match result.materialize_cursor() {
-        QueryResult::One(v) => match to_owned_checked(&v) {
+        QueryResult::One(v) => match to_owned(&v) {
             Ok(v) => out.push(v),
             Err(e) => return Some(Control::Error(e)),
         },
@@ -3128,10 +3159,10 @@ enum Item<'a, W = Vec<u64>> {
 
 impl<W: Clone + AsRef<[u64]>> Item<'_, W> {
     /// Materialize, for the owned-surface bridge ([`eval_each_owned`]) and for
-    /// consumers that were going to `to_owned` anyway.
+    /// consumers that were going to `to_owned_lossy` anyway.
     fn into_owned(self) -> OwnedValue {
         match self {
-            Item::Borrowed(v) => to_owned(&v),
+            Item::Borrowed(v) => to_owned_lossy(&v),
             Item::Owned(v) => v,
         }
     }
@@ -3145,7 +3176,7 @@ impl<W: Clone + AsRef<[u64]>> Item<'_, W> {
     /// unchecked.
     fn into_owned_checked(self) -> Result<OwnedValue, EvalError> {
         match self {
-            Item::Borrowed(v) => to_owned_checked(&v),
+            Item::Borrowed(v) => to_owned(&v),
             Item::Owned(v) => Ok(v),
         }
     }
@@ -3207,7 +3238,7 @@ pub(crate) enum Flow {
 /// always answers [`Demand::Continue`], this delivers exactly the values
 /// [`push_owned_values`] would collect, in the same order, and reports the
 /// same terminal [`Control`]. It *is* `push_owned_values` plus a demand check
-/// between values, minus the `to_owned` on borrowed items. So an un-lazified
+/// between values, minus the `to_owned_lossy` on borrowed items. So an un-lazified
 /// arm is a missed optimization, never a behaviour change — and a lazy arm can
 /// only shrink the set of sub-expressions evaluated, never reorder or alter
 /// the values delivered. `collect_each` asserts this differentially in tests
@@ -3720,12 +3751,12 @@ fn each_label<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 fn materialize_bound_values<W: Clone + AsRef<[u64]>>(
     bound_result: QueryResult<'_, W>,
 ) -> Result<(Vec<OwnedValue>, Option<Control>), Flow> {
-    // #1902: to_owned_checked/promote_borrowed_checked, not to_owned -- the
+    // #1902: to_owned/promote_borrowed_checked, not to_owned_lossy -- the
     // lazy twin of the same bug `eval_as`'s own bound-value conversion had.
     // A checked-conversion failure folds into the trailing control exactly
     // like an ordinary `Partial`'s control (the `Partial` arm below).
     match bound_result.materialize_cursor() {
-        QueryResult::One(v) => match to_owned_checked(&v) {
+        QueryResult::One(v) => match to_owned(&v) {
             Ok(v) => Ok((vec![v], None)),
             Err(e) => Ok((Vec::new(), Some(Control::Error(e)))),
         },
@@ -4071,7 +4102,7 @@ pub(crate) fn classify_nth_n(n_owned: OwnedValue) -> Result<usize, EvalError> {
 /// large-integer discipline generally). The `QueryResult::One` call site
 /// builds its `OwnedValue` from `num.as_i64()`/`as_f64()` directly (trying
 /// the exact integer path first, same as this function does internally)
-/// rather than routing through [`to_owned`], which would box an unused copy
+/// rather than routing through [`to_owned_lossy`], which would box an unused copy
 /// of the source digits for no benefit here (also a #1879 review finding).
 ///
 /// Real jq's own definition (`builtin.jq`):
@@ -4455,7 +4486,7 @@ fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// at all. Now stops at the first undecodable item, keeping whatever prefix
 /// already converted cleanly -- the same partial-prefix contract every
 /// other `_checked` sibling in this file gives. Named `_checked` rather
-/// than renaming this function outright since an unchecked, `to_owned`-only
+/// than renaming this function outright since an unchecked, `to_owned_lossy`-only
 /// twin was the pre-fix shape reviewers had to compare against; nothing
 /// else in this file still needs that unchecked twin (its only other
 /// caller, the test-only `collect_each` below, was switched to this
@@ -4631,7 +4662,7 @@ fn eval_fanout<'a, W: Clone + AsRef<[u64]>>(
     for bit in bits {
         match body(bit).materialize_cursor() {
             // #1832: push_promoted/promote_borrowed_checked, not unchecked
-            // to_owned -- eval_fanout had the identical #1755/#1790
+            // to_owned_lossy -- eval_fanout had the identical #1755/#1790
             // silently-corrupt-on-promotion bug shape already fixed for
             // eval_pipe/eval_comma, just never applied here.
             QueryResult::One(v) => {
@@ -4979,7 +5010,14 @@ where
     W: Clone + AsRef<[u64]>,
 {
     let mut vals = Vec::new();
-    let control = push_owned_values(operand_result, &mut vals);
+    // #1989: `push_owned_values_checked`, not `push_owned_values` -- unary
+    // minus is not an error-message context, it consumes the value. With
+    // the unchecked push an undecodable operand became `""` and then fell
+    // into `arith_negate`'s own type error, which *renders* it: `-.a` on an
+    // undecodable `.a` reported `string ("") cannot be negated` (a
+    // catchable, `?`-suppressible error naming content the document never
+    // held) instead of the decode failure, which `?` may not suppress.
+    let control = push_owned_values_checked(operand_result, &mut vals);
 
     let mut out: Vec<OwnedValue> = Vec::new();
     for val in vals {
@@ -6087,12 +6125,12 @@ fn eval_boolean<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Evaluate boolean NOT.
 fn eval_not<W: Clone + AsRef<[u64]>>(value: StandardJson<'_, W>) -> QueryResult<'_, W> {
-    // Not one of #1820's actual bugs, despite `to_owned`'s silent `""`
+    // Not one of #1820's actual bugs, despite `to_owned_lossy`'s silent `""`
     // substitution touching this function too: truthiness never depends on
     // a string's *content* (`json_is_truthy`/`OwnedValue::is_truthy` both
     // only exclude `Null`/`Bool(false)`), so a corrupted string still
     // produces the correct verdict either way. Recursively decoding via
-    // `to_owned_checked` doesn't just waste work -- for a container that
+    // `to_owned` doesn't just waste work -- for a container that
     // merely *contains* an undecodable string (always truthy, regardless
     // of what's inside), it wrongly raises where jq would just answer
     // `false`. Use the O(1), non-recursive check instead.
@@ -6247,8 +6285,8 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `error` raises the input value, as jq does — `{"x":1} | error` reports
     // `{"x":1}`, not `null`.
     let payload = match msg {
-        // #1907: `to_owned_checked` on the materialized `One`/`OneCursor`
-        // case and on `Many`'s first element, not the plain `to_owned`
+        // #1907: `to_owned` on the materialized `One`/`OneCursor`
+        // case and on `Many`'s first element, not the plain `to_owned_lossy`
         // `result_to_owned` uses internally -- the same asymmetry the `None`
         // arm below was already fixed for by #1820.
         // `result_to_owned`/`result_to_owned_ctrl`/`result_to_owned_full`
@@ -6278,7 +6316,7 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // ones) would otherwise silently resurrect it.
         Some(msg_expr) => {
             let msg_result = eval_single::<W, S>(msg_expr, value, optional).materialize_cursor();
-            // #1953: `to_owned_checked`'s own materialization error here can
+            // #1953: `to_owned`'s own materialization error here can
             // be a genuine decode failure (never suppressed by `optional`,
             // #1247/#1620 -- a #1642 collision error counts as one too, per
             // `EvalError::colliding_display_key`'s own delegation to
@@ -6289,8 +6327,8 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // function's own `None` arm below now uses too, so there's no
             // risk of conflating the two.
             let checked = match &msg_result {
-                QueryResult::One(v) => Some(to_owned_checked(v)),
-                QueryResult::Many(vs) => vs.first().map(to_owned_checked),
+                QueryResult::One(v) => Some(to_owned(v)),
+                QueryResult::Many(vs) => vs.first().map(to_owned),
                 _ => None,
             };
             if let Some(checked) = checked {
@@ -6310,7 +6348,7 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
             }
         }
-        // #1820/#1953: to_owned_checked, not to_owned -- bare `error` raises
+        // #1820/#1953: to_owned, not to_owned_lossy -- bare `error` raises
         // the *payload* verbatim (per this function's own doc comment
         // above), so an undecodable string used to silently become the `""`
         // payload instead of raising its own decode failure. A genuine
@@ -6324,7 +6362,7 @@ fn eval_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // once payload conversion has already succeeded; this one gates the
         // conversion itself), not the same code path, even though both
         // answer to the same ambient `optional`.
-        None => match to_owned_checked(&value) {
+        None => match to_owned(&value) {
             Ok(v) => v,
             Err(e) => return suppress_or_raise(e, optional),
         },
@@ -6838,7 +6876,7 @@ fn builtin_length<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
         }
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::has_no_length(&to_owned(&value))),
+        _ => QueryResult::Error(EvalError::has_no_length(&to_owned_lossy(&value))),
     }
 }
 
@@ -6854,7 +6892,7 @@ fn builtin_utf8bytelength<W: Clone + AsRef<[u64]>>(
             Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::no_utf8_byte_length(&to_owned(&value))),
+        _ => QueryResult::Error(EvalError::no_utf8_byte_length(&to_owned_lossy(&value))),
     }
 }
 
@@ -6870,15 +6908,15 @@ fn builtin_keys<W: Clone + AsRef<[u64]>>(
             // than a fourth hand-rolled copy of the uncons/
             // key_display_string/ends_unpaired walk (`document.rs`'s own
             // `DocumentFields::keys()` default, this file's
-            // `to_owned_checked_at_depth`, and an earlier draft of this very
+            // `to_owned_at_depth`, and an earlier draft of this very
             // function). Closes two gaps this function used to have on its
             // own: a decode-failure key is now preserved via its raw source
-            // span (#1642, matching `to_owned_checked`/`path()`/`tojson`'s
+            // span (#1642, matching `to_owned`/`path()`/`tojson`'s
             // policy, not silently dropped), a #1194 structurally malformed
             // key now raises, and -- as a consequence of reusing the shared
             // walk rather than re-deriving a narrower one -- a malformed
             // `,`/`:` delimiter (#1677) now raises too, closing a gap that
-            // `to_owned_checked_at_depth` still has (out of scope for this
+            // `to_owned_at_depth` still has (out of scope for this
             // fix to touch there; noted, not silently left stale).
             //
             // Not `DocumentFields::keys()` (that trait method's own
@@ -6919,9 +6957,9 @@ fn builtin_keys<W: Clone + AsRef<[u64]>>(
             // fallback -- an undecodable-string scalar must raise its own
             // decode failure, never suppressed by `?` (#1247/#1620),
             // instead of the generic `has_no_keys` message built from an
-            // unchecked `to_owned`.
+            // unchecked `to_owned_lossy`.
             scalar_fallback(&value, optional, || {
-                EvalError::has_no_keys(&to_owned(&value))
+                EvalError::has_no_keys(&to_owned_lossy(&value))
             })
         }
     }
@@ -7069,11 +7107,11 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // of `xs`; `xs` itself also receives this same input (`. as $x | xs`
     // doesn't change `.`).
     //
-    // #1755: to_owned_checked, not to_owned -- an undecodable key must
+    // #1755: to_owned, not to_owned_lossy -- an undecodable key must
     // raise, not silently compare as "". #2001: a non-decode-failure error
     // (a #1194 malformed-member shape) respects `optional` the same way
     // this function's own `check_escape`/fanout handling below does.
-    let key_owned = to_owned_checked_or_suppress!(&value, optional);
+    let key_owned = to_owned_or_suppress!(&value, optional);
     let (candidates, xs_escape) = eval_owned_multi_keep_partial::<S>(obj_expr, &key_owned);
     // `key_owned` doesn't change across `candidates`, so this is computed
     // once rather than once per candidate (#909 review). Semantics-aware --
@@ -7185,9 +7223,9 @@ fn builtin_upper_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // agree with `==`'s own yq-mode strict Int/Float distinction (#950
     // review) rather than silently falling back to widening equality.
     //
-    // #1755: to_owned_checked, not to_owned -- an undecodable input must
+    // #1755: to_owned, not to_owned_lossy -- an undecodable input must
     // raise, not silently compare as "". #2015: `..._or_suppress`, not
-    // unconditional `to_owned_checked` -- `IN(s)` is literally `any(s ==
+    // unconditional `to_owned` -- `IN(s)` is literally `any(s ==
     // .; .)` (see this function's own doc comment), and `any`/`all`'s own
     // `any_all_gen_cond` already treats a non-decode-failure error here as
     // respecting `optional` (#2001); hardcoding this one sibling builtin to
@@ -7196,7 +7234,7 @@ fn builtin_upper_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // principled reason to differ from `any`/`all`'s own already-fixed
     // behavior (contrast `builtin_recurse_f`'s own doc comment, which does
     // give one for *its* unused `optional`).
-    let current = to_owned_checked_or_suppress!(&value, optional);
+    let current = to_owned_or_suppress!(&value, optional);
     let mut found = false;
     // #2015: `optional`, not hardcoded `false` -- `s`'s own generator
     // errors are `any_all_gen_cond`'s `gen` in `IN(s)`'s own `any(s ==
@@ -7322,7 +7360,7 @@ fn map_over<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut results = Vec::new();
     for elem in elements {
         match eval_single::<W, S>(f, elem, optional).materialize_cursor() {
-            QueryResult::One(v) => match to_owned_checked(&v) {
+            QueryResult::One(v) => match to_owned(&v) {
                 Ok(owned) => results.push(owned),
                 Err(e) => return QueryResult::Error(e),
             },
@@ -7330,7 +7368,7 @@ fn map_over<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(v) => results.push(v),
             QueryResult::Many(vs) => {
                 for v in &vs {
-                    match to_owned_checked(v) {
+                    match to_owned(v) {
                         Ok(owned) => results.push(owned),
                         Err(e) => return QueryResult::Error(e),
                     }
@@ -7384,9 +7422,9 @@ fn builtin_map<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // non-container `value` wasn't -- an undecodable-string scalar
             // must raise its own decode failure, never suppressed by `?`
             // (#1247/#1620), instead of the generic message built from an
-            // unchecked `to_owned`.
+            // unchecked `to_owned_lossy`.
             scalar_fallback(&value, optional, || {
-                EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))
+                EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
             })
         }
     }
@@ -7456,14 +7494,14 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 let field_val = field.value;
                 let value_to_insert =
                     match eval_single::<W, S>(f, field_val, optional).materialize_cursor() {
-                        QueryResult::One(v) => match to_owned_checked(&v) {
+                        QueryResult::One(v) => match to_owned(&v) {
                             Ok(owned) => Some(owned),
                             Err(e) => return QueryResult::Error(e),
                         },
                         QueryResult::OneCursor(_) => unreachable!(),
                         QueryResult::Owned(v) => Some(v),
                         QueryResult::Many(vs) => match vs.first() {
-                            Some(v) => match to_owned_checked(v) {
+                            Some(v) => match to_owned(v) {
                                 Ok(owned) => Some(owned),
                                 Err(e) => return QueryResult::Error(e),
                             },
@@ -7514,7 +7552,7 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // to run its delimiter check, then discards it.
                 let elem = cursor.value();
                 match eval_single::<W, S>(f, elem, optional).materialize_cursor() {
-                    QueryResult::One(v) => match to_owned_checked(&v) {
+                    QueryResult::One(v) => match to_owned(&v) {
                         Ok(owned) => results.push(owned),
                         Err(e) => return QueryResult::Error(e),
                     },
@@ -7522,7 +7560,7 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     QueryResult::Owned(v) => results.push(v),
                     QueryResult::Many(vs) => {
                         if let Some(v) = vs.first() {
-                            match to_owned_checked(v) {
+                            match to_owned(v) {
                                 Ok(owned) => results.push(owned),
                                 Err(e) => return QueryResult::Error(e),
                             }
@@ -7567,7 +7605,7 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #1820: scalar_decode_failure first -- same gap as builtin_map's
         // sibling fallback above.
         _ => scalar_fallback(&value, optional, || {
-            EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))
+            EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
         }),
     }
 }
@@ -7580,14 +7618,14 @@ fn builtin_add<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // add is [.[] | .] folded with +, and .[] over an object iterates its
     // values, so jq accepts an object here as readily as an array (#422).
     //
-    // #1755: to_owned_checked, not to_owned -- an undecodable element must
+    // #1755: to_owned, not to_owned_lossy -- an undecodable element must
     // raise, not silently fold in as "".
     let items: Result<Vec<OwnedValue>, EvalError> = match value {
-        StandardJson::Array(elements) => elements.map(|e| to_owned_checked(&e)).collect(),
-        StandardJson::Object(fields) => fields.map(|f| to_owned_checked(&f.value())).collect(),
+        StandardJson::Array(elements) => elements.map(|e| to_owned(&e)).collect(),
+        StandardJson::Object(fields) => fields.map(|f| to_owned(&f.value())).collect(),
         _ => {
             return scalar_fallback(&value, optional, || {
-                EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))
+                EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
             });
         }
     };
@@ -7618,10 +7656,10 @@ fn any_all_over<'a, W: Clone + AsRef<[u64]> + 'a>(
     elements: impl Iterator<Item = StandardJson<'a, W>>,
     target_truthy: bool,
 ) -> Result<bool, EvalError> {
-    // #1755: to_owned_checked, not to_owned -- an undecodable element must
+    // #1755: to_owned, not to_owned_lossy -- an undecodable element must
     // raise, not silently become "" (truthy) and decide the answer.
     for elem in elements {
-        if to_owned_checked(&elem)?.is_truthy() == target_truthy {
+        if to_owned(&elem)?.is_truthy() == target_truthy {
             return Ok(target_truthy);
         }
     }
@@ -7662,8 +7700,17 @@ fn builtin_any<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         StandardJson::Object(_) if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
         StandardJson::Object(fields) => owned_bool(any_all_over(fields.map(|f| f.value()), true)),
         _ if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))),
+        // #1989: `scalar_fallback`, not a bare `_ if optional` + type error.
+        // jq mode's wildcard also catches `String`, so an undecodable string
+        // input was either silently swallowed by `?` or misreported as
+        // `Cannot iterate over string ("")` -- the empty spelling being the
+        // unchecked conversion's own substitute, not the document's content.
+        // The yq arms above already route through `scalar_fallback`; this
+        // gives jq mode the same "decode failure wins over `optional`"
+        // ordering the #1247/#1620 rule requires.
+        _ => scalar_fallback(&value, optional, || {
+            EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
+        }),
     }
 }
 
@@ -7692,8 +7739,11 @@ fn builtin_all<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         StandardJson::Object(_) if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
         StandardJson::Object(fields) => owned_bool(any_all_over(fields.map(|f| f.value()), false)),
         _ if S::TAG == EvalTag::Yq => yq_reject_non_array(&value),
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))),
+        // #1989: same `scalar_fallback` conversion as `builtin_any` above --
+        // see its comment for why the jq-mode wildcard needed one too.
+        _ => scalar_fallback(&value, optional, || {
+            EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
+        }),
     }
 }
 
@@ -7742,14 +7792,19 @@ fn any_all_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         StandardJson::Object(fields) => {
             any_all_f_over::<W, S>(cond, fields.map(|f| f.value()), target_truthy)
         }
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))),
+        // #1989: `scalar_fallback`, for the same reason as bare
+        // `any`/`all` above -- `any(cond)`/`all(cond)` on an undecodable
+        // string input reported `Cannot iterate over string ("")` (or
+        // nothing at all under `?`) rather than the decode failure.
+        _ => scalar_fallback(&value, optional, || {
+            EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
+        }),
     }
 }
 
 /// Shared element loop for [`any_all_f`]'s `Array`/`Object` arms.
 ///
-/// #1755 review: an earlier version of this fix `to_owned_checked`-collected
+/// #1755 review: an earlier version of this fix `to_owned`-collected
 /// every element into a `Vec` upfront, before `cond` ever ran -- so a
 /// decode failure past the deciding element aborted a call that should
 /// have short-circuited before reaching it. Oracle-verified:
@@ -7764,7 +7819,7 @@ fn any_all_f_over<'a, W: Clone + AsRef<[u64]> + 'a, S: EvalSemantics>(
     target_truthy: bool,
 ) -> QueryResult<'a, W> {
     for cursor_elem in elements {
-        let elem = match to_owned_checked(&cursor_elem) {
+        let elem = match to_owned(&cursor_elem) {
             Ok(v) => v,
             Err(e) => return QueryResult::Error(e),
         };
@@ -7812,7 +7867,7 @@ fn any_all_gen_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // printed by the time a match was found. `cond` is now probed per output
     // *as `gen` produces it*, and a match stops `gen` outright.
     //
-    // Still `to_owned` + the owned bridge, not `eval_each` on `value`
+    // Still `to_owned_lossy` + the owned bridge, not `eval_each` on `value`
     // directly: `eval_owned_expr_fork` -> `eval_owned_input` is what ran
     // before, and switching to the cursor path here would silently change
     // duplicate-key and number-spelling fidelity.
@@ -7824,7 +7879,7 @@ fn any_all_gen_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `all(2, (5|stderr); .==2)` writes `5` there too, and is pinned by
     // `test_short_circuit_side_effect_shapes_already_match_jq_820`.
     //
-    // #1755: to_owned_checked, not to_owned -- an undecodable root value
+    // #1755: to_owned, not to_owned_lossy -- an undecodable root value
     // must raise, not silently become "" and get fed to `gen` as if it
     // were the real value. #2001: a genuine decode failure still raises
     // unconditionally either way, but a non-decode-failure error (a #1194
@@ -7835,7 +7890,7 @@ fn any_all_gen_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `suppress_or_raise`'s own doc comment), so treating this entry
     // point's own conversion as unconditional was the actual gap, not a
     // deliberate split.
-    let owned = to_owned_checked_or_suppress!(&value, optional);
+    let owned = to_owned_or_suppress!(&value, optional);
 
     let mut matched = false;
     // `cond`'s own escape is not `gen`'s, so it travels out-of-band rather
@@ -7911,10 +7966,10 @@ fn builtin_min<W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => {
-            // #1755: to_owned_checked, not to_owned -- an undecodable
+            // #1755: to_owned, not to_owned_lossy -- an undecodable
             // string element must raise, not silently sort in as "".
             let items: Result<Vec<OwnedValue>, EvalError> =
-                elements.map(|e| to_owned_checked(&e)).collect();
+                elements.map(|e| to_owned(&e)).collect();
             let items = match items {
                 Ok(items) => items,
                 Err(e) => return QueryResult::Error(e),
@@ -7930,7 +7985,7 @@ fn builtin_min<W: Clone + AsRef<[u64]>>(
         // unconditionally, never be suppressed by `optional`/`?` (the
         // #1247/#1620 rule) or misreported as an ordinary type error.
         _ => scalar_fallback(&value, optional, || {
-            EvalError::pair_cannot_be_iterated(&to_owned(&value), &to_owned(&value))
+            EvalError::pair_cannot_be_iterated(&to_owned_lossy(&value), &to_owned_lossy(&value))
         }),
     }
 }
@@ -7942,10 +7997,10 @@ fn builtin_max<W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => {
-            // #1755: to_owned_checked, not to_owned -- an undecodable
+            // #1755: to_owned, not to_owned_lossy -- an undecodable
             // string element must raise, not silently sort in as "".
             let items: Result<Vec<OwnedValue>, EvalError> =
-                elements.map(|e| to_owned_checked(&e)).collect();
+                elements.map(|e| to_owned(&e)).collect();
             let items = match items {
                 Ok(items) => items,
                 Err(e) => return QueryResult::Error(e),
@@ -7959,7 +8014,7 @@ fn builtin_max<W: Clone + AsRef<[u64]>>(
         }
         // #1755: same reasoning as builtin_min's own scalar arm above.
         _ => scalar_fallback(&value, optional, || {
-            EvalError::pair_cannot_be_iterated(&to_owned(&value), &to_owned(&value))
+            EvalError::pair_cannot_be_iterated(&to_owned_lossy(&value), &to_owned_lossy(&value))
         }),
     }
 }
@@ -8024,10 +8079,10 @@ fn object_pair_type_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     if optional {
         QueryResult::None
     } else {
-        // #1755: to_owned_checked, not to_owned -- a field the key filter
+        // #1755: to_owned, not to_owned_lossy -- a field the key filter
         // `f` never touches can still be undecodable, and must raise
         // rather than silently drop out of this error message's operand.
-        let original = match to_owned_checked(&StandardJson::Object(fields)) {
+        let original = match to_owned(&StandardJson::Object(fields)) {
             Ok(v) => v,
             Err(e) => return QueryResult::Error(e),
         };
@@ -8063,13 +8118,13 @@ fn builtin_min_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
             }
 
-            // #1755: to_owned_checked, not to_owned -- an undecodable
+            // #1755: to_owned, not to_owned_lossy -- an undecodable
             // string result must raise, not silently return "".
             let (_, v) = keyed
                 .into_iter()
                 .min_by(|(a, _), (b, _)| compare_values(a, b))
                 .unwrap();
-            let min = match to_owned_checked(&v) {
+            let min = match to_owned(&v) {
                 Ok(v) => v,
                 Err(e) => return QueryResult::Error(e),
             };
@@ -8091,7 +8146,7 @@ fn builtin_min_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // unconditionally, checked ahead of `optional` -- see
         // `scalar_decode_failure`.
         _ => scalar_fallback(&value, optional, || {
-            EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))
+            EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
         }),
     }
 }
@@ -8125,13 +8180,13 @@ fn builtin_max_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
             }
 
-            // #1755: to_owned_checked, not to_owned -- an undecodable
+            // #1755: to_owned, not to_owned_lossy -- an undecodable
             // string result must raise, not silently return "".
             let (_, v) = keyed
                 .into_iter()
                 .max_by(|(a, _), (b, _)| compare_values(a, b))
                 .unwrap();
-            let max = match to_owned_checked(&v) {
+            let max = match to_owned(&v) {
                 Ok(v) => v,
                 Err(e) => return QueryResult::Error(e),
             };
@@ -8151,7 +8206,7 @@ fn builtin_max_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #1755: same decode-failure precedence as min_by's own scalar arm
         // above.
         _ => scalar_fallback(&value, optional, || {
-            EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))
+            EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
         }),
     }
 }
@@ -8222,13 +8277,13 @@ fn trim_edge<'a, W: Clone + AsRef<[u64]>>(
     pattern_owned: OwnedValue,
     edge: StringEdge,
 ) -> QueryResult<'a, W> {
-    // `to_owned_checked` stays inside this function rather than being
+    // `to_owned` stays inside this function rather than being
     // hoisted into its caller -- it is only reached on these two cold
     // paths, so hoisting would pay for a whole-document copy on the hot
-    // one. #1755: not to_owned -- a passed-through undecodable value must
+    // one. #1755: not to_owned_lossy -- a passed-through undecodable value must
     // raise, not silently become "".
     let OwnedValue::String(pattern) = pattern_owned else {
-        return match to_owned_checked(value) {
+        return match to_owned(value) {
             Ok(v) => QueryResult::Owned(v),
             Err(e) => QueryResult::Error(e),
         };
@@ -8260,7 +8315,7 @@ fn trim_edge<'a, W: Clone + AsRef<[u64]>>(
         },
         // jq's ltrimstr/rtrimstr are total: a non-string input passes
         // through unchanged.
-        _ => match to_owned_checked(value) {
+        _ => match to_owned(value) {
             Ok(v) => v,
             Err(e) => return QueryResult::Error(e),
         },
@@ -8435,7 +8490,7 @@ fn builtin_split<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// JSON text.
 ///
 /// Takes `elem` by value (moved from [`to_owned_key_shape`] at the call
-/// site, not [`to_owned`]) so a container element's contents are never
+/// site, not [`to_owned_lossy`]) so a container element's contents are never
 /// materialized at all -- they're discarded unread here regardless -- and a
 /// string element is moved rather than cloned a second time.
 /// yq's own `.nan`/`.inf`/`-.inf` spelling for a non-finite element or
@@ -8695,7 +8750,7 @@ fn collect_join_parts<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     if S::TAG == EvalTag::Yq {
         return match value {
             StandardJson::Array(elements) => {
-                // `to_owned_key_shape`, not `to_owned`: a container element
+                // `to_owned_key_shape`, not `to_owned_lossy`: a container element
                 // collapses to an empty-string part regardless of its
                 // contents (see `yq_join_element_part`'s doc comment), so
                 // deep-copying it first would be pure waste (#1044 review).
@@ -8738,14 +8793,14 @@ fn collect_join_parts<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // finding in the regex builtins: a dedicated `join(...)?` test for each
     // site still showed 0 coverage hits on the guard itself.
     //
-    // #1755: `to_owned_checked`, not `to_owned` -- an undecodable element
+    // #1755: `to_owned`, not `to_owned_lossy` -- an undecodable element
     // must raise, not silently join in as "". Stops decoding at the first
     // `Array`/`Object` part rather than `.collect()`ing every element up
     // front (#1535 review): `+` fails on any such part unconditionally,
     // regardless of the separator's own value, so no later element can
     // change whether the fold that consumes this list will fail there --
     // and the original, pre-#1535 `try_fold` never decoded past that same
-    // point either. Not just an optimization: `to_owned`/`to_owned_checked`
+    // point either. Not just an optimization: `to_owned_lossy`/`to_owned`
     // panic past `MAX_VALUE_TREE_DEPTH` (#1005), so eagerly decoding every
     // element regardless of an early doomed one would reach a
     // pathologically deep *later* element the original algorithm could
@@ -8756,16 +8811,19 @@ fn collect_join_parts<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // completely, not just narrows it.
     let parts: Result<Vec<OwnedValue>, EvalError> = match value {
         StandardJson::Array(elements) => {
-            collect_jq_join_parts_until_first_container(elements.map(|e| to_owned_checked(&e)))
+            collect_jq_join_parts_until_first_container(elements.map(|e| to_owned(&e)))
         }
-        StandardJson::Object(fields) => collect_jq_join_parts_until_first_container(
-            fields.map(|f| to_owned_checked(&f.value())),
-        ),
+        StandardJson::Object(fields) => {
+            collect_jq_join_parts_until_first_container(fields.map(|f| to_owned(&f.value())))
+        }
         _ => {
             if let Some(e) = scalar_decode_failure(&value) {
                 return Err(e);
             }
-            return Err(EvalError::cannot_iterate_with(S::TAG, &to_owned(&value)));
+            return Err(EvalError::cannot_iterate_with(
+                S::TAG,
+                &to_owned_lossy(&value),
+            ));
         }
     };
     Ok(JoinParts::Jq(parts?))
@@ -8775,14 +8833,14 @@ fn collect_join_parts<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// arms for why this stops at the first `Array`/`Object` part instead of
 /// draining `elements` fully: `join_element_part` is applied lazily, one
 /// pulled element at a time, so nothing past that first container element
-/// is ever decoded via `to_owned` at all.
+/// is ever decoded via `to_owned_lossy` at all.
 fn collect_jq_join_parts_until_first_container(
     elements: impl Iterator<Item = Result<OwnedValue, EvalError>>,
 ) -> Result<Vec<OwnedValue>, EvalError> {
     let mut parts = Vec::new();
     for elem in elements {
         // #1755: propagates a decode failure immediately, same as the
-        // `to_owned_checked(&e)?` this replaced -- an undecodable element
+        // `to_owned(&e)?` this replaced -- an undecodable element
         // must raise before the container short-circuit below ever gets a
         // chance to apply to it.
         let part = join_element_part(elem?);
@@ -8812,7 +8870,7 @@ fn join_parts_with_separator<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `parts.iter()`, not a consuming `into_iter()`: `parts` is shared
         // across every separator output, so each fold clones only the part
         // it actually accumulates -- a String/scalar clone, not the
-        // `to_owned`/`to_json()` decode `collect_join_parts` already paid
+        // `to_owned_lossy`/`to_json()` decode `collect_join_parts` already paid
         // once, up front.
         JoinParts::Jq(parts) => {
             let result = parts.iter().try_fold(None, |acc, part| {
@@ -8837,15 +8895,15 @@ fn builtin_contains<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Hoisted out of the fan-out: the input does not vary with `b`, and
-    // `to_owned` deep-copies the whole document — inside the loop, an N-output
+    // `to_owned_lossy` deep-copies the whole document — inside the loop, an N-output
     // argument would pay for it N times.
     //
-    // #1755: to_owned_checked, not to_owned -- an undecodable input must
+    // #1755: to_owned, not to_owned_lossy -- an undecodable input must
     // raise, not silently be checked for containment as "". #2001: a
     // non-decode-failure error (a #1194 malformed-member shape) respects
     // `optional` the same way the closure's own kind-mismatch check below
     // does.
-    let input = to_owned_checked_or_suppress!(&value, optional);
+    let input = to_owned_or_suppress!(&value, optional);
     fanout_arg::<W, S, _>(
         b_expr,
         value.clone(),
@@ -8946,15 +9004,15 @@ fn builtin_inside<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Hoisted out of the fan-out: the input does not vary with `b`, and
-    // `to_owned` deep-copies the whole document. Same reasoning as
+    // `to_owned_lossy` deep-copies the whole document. Same reasoning as
     // `builtin_contains`, of which this is the inverse.
     //
-    // #1755: to_owned_checked, not to_owned -- an undecodable input must
+    // #1755: to_owned, not to_owned_lossy -- an undecodable input must
     // raise, not silently be checked for containment as "". #2001: a
     // non-decode-failure error (a #1194 malformed-member shape) respects
     // `optional` the same way the closure's own kind-mismatch check below
     // does -- mirrors `builtin_contains`'s matching fix.
-    let input = to_owned_checked_or_suppress!(&value, optional);
+    let input = to_owned_or_suppress!(&value, optional);
     fanout_arg::<W, S, _>(
         b_expr,
         value.clone(),
@@ -9019,9 +9077,9 @@ fn builtin_last<W: Clone + AsRef<[u64]>>(
                 // jq: [] | last => null
                 QueryResult::Owned(OwnedValue::Null)
             } else {
-                // #1755: to_owned_checked, not to_owned -- an undecodable
+                // #1755: to_owned, not to_owned_lossy -- an undecodable
                 // element must raise, not silently become "".
-                match to_owned_checked(&items[items.len() - 1]) {
+                match to_owned(&items[items.len() - 1]) {
                     Ok(v) => QueryResult::Owned(v),
                     Err(e) => QueryResult::Error(e),
                 }
@@ -9074,11 +9132,11 @@ fn builtin_reverse<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match value {
-        // #1755: to_owned_checked, not to_owned -- an undecodable element
+        // #1755: to_owned, not to_owned_lossy -- an undecodable element
         // must raise, not silently reverse in as "".
         StandardJson::Array(elements) => {
             let items: Result<Vec<OwnedValue>, EvalError> =
-                elements.map(|e| to_owned_checked(&e)).collect();
+                elements.map(|e| to_owned(&e)).collect();
             let mut items = match items {
                 Ok(items) => items,
                 Err(e) => return QueryResult::Error(e),
@@ -9114,7 +9172,7 @@ fn builtin_flatten<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     depth: usize,
 ) -> QueryResult<'_, W> {
-    // #1755: to_owned_checked, not to_owned -- an undecodable element must
+    // #1755: to_owned, not to_owned_lossy -- an undecodable element must
     // raise, not silently flatten in as "".
     //
     // #1901: unlike jq (`flatten` is defined over `[.[]]`, and `.[]` on an
@@ -9126,17 +9184,17 @@ fn builtin_flatten<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // two copies of the same error literal (#1901 review).
     let yq_reject_non_array = || EvalError::yq_only_arrays_supported_for("flatten");
     let items: Result<Vec<OwnedValue>, EvalError> = match &value {
-        StandardJson::Array(elements) => elements.map(|e| to_owned_checked(&e)).collect(),
+        StandardJson::Array(elements) => elements.map(|e| to_owned(&e)).collect(),
         StandardJson::Object(_) if S::TAG == EvalTag::Yq => {
             return scalar_fallback(&value, optional, yq_reject_non_array);
         }
-        StandardJson::Object(fields) => fields.map(|f| to_owned_checked(&f.value())).collect(),
+        StandardJson::Object(fields) => fields.map(|f| to_owned(&f.value())).collect(),
         _ if S::TAG == EvalTag::Yq => {
             return scalar_fallback(&value, optional, yq_reject_non_array);
         }
         _ => {
             return scalar_fallback(&value, optional, || {
-                EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))
+                EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
             });
         }
     };
@@ -9163,7 +9221,7 @@ fn flatten_owned(items: Vec<OwnedValue>, depth: usize) -> Vec<OwnedValue> {
 /// [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH) levels of
 /// `tree_depth` (#1017) -- currently only reachable at a `tree_depth`
 /// this deep via a value already capped there by an upstream guard
-/// (#1005's `to_owned`/reindex-bridge), so this is defense-in-depth
+/// (#1005's `to_owned_lossy`/reindex-bridge), so this is defense-in-depth
 /// against that invariant changing, not a currently-live independent
 /// crash path.
 fn flatten_owned_at_depth(
@@ -9253,9 +9311,9 @@ fn builtin_group_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         unreachable!("eval_array_construction only returns Owned/Error/Break/Halt")
                     }
                 };
-                // #1755: to_owned_checked, not to_owned -- an undecodable
+                // #1755: to_owned, not to_owned_lossy -- an undecodable
                 // string element must raise, not silently sort in as "".
-                let owned_item = match to_owned_checked(&item) {
+                let owned_item = match to_owned(&item) {
                     Ok(v) => v,
                     Err(e) => return QueryResult::Error(e),
                 };
@@ -9316,7 +9374,7 @@ fn builtin_group_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // unconditionally, checked ahead of `optional` -- see
         // `scalar_decode_failure`.
         _ => scalar_fallback(&value, optional, || {
-            EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))
+            EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
         }),
     }
 }
@@ -9338,10 +9396,10 @@ fn builtin_unique<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
     match value {
         StandardJson::Array(elements) => {
-            // #1755: to_owned_checked, not to_owned -- an undecodable
+            // #1755: to_owned, not to_owned_lossy -- an undecodable
             // string element must raise, not silently sort in as "".
             let items: Result<Vec<OwnedValue>, EvalError> =
-                elements.map(|e| to_owned_checked(&e)).collect();
+                elements.map(|e| to_owned(&e)).collect();
             let mut items = match items {
                 Ok(items) => items,
                 Err(e) => return QueryResult::Error(e),
@@ -9376,7 +9434,7 @@ fn builtin_unique<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // unconditionally, checked ahead of `optional` -- see
         // `scalar_decode_failure`.
         _ => scalar_fallback(&value, optional, || {
-            EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))
+            EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
         }),
     }
 }
@@ -9417,9 +9475,9 @@ fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         unreachable!("eval_array_construction only returns Owned/Error/Break/Halt")
                     }
                 };
-                // #1755: to_owned_checked, not to_owned -- an undecodable
+                // #1755: to_owned, not to_owned_lossy -- an undecodable
                 // string element must raise, not silently sort in as "".
-                let owned_item = match to_owned_checked(&item) {
+                let owned_item = match to_owned(&item) {
                     Ok(v) => v,
                     Err(e) => return QueryResult::Error(e),
                 };
@@ -9455,7 +9513,7 @@ fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // unconditionally, checked ahead of `optional` -- see
         // `scalar_decode_failure`.
         _ => scalar_fallback(&value, optional, || {
-            EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))
+            EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
         }),
     }
 }
@@ -9467,10 +9525,10 @@ fn builtin_sort<W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => {
-            // #1755: to_owned_checked, not to_owned -- an undecodable
+            // #1755: to_owned, not to_owned_lossy -- an undecodable
             // string element must raise, not silently sort in as "".
             let items: Result<Vec<OwnedValue>, EvalError> =
-                elements.map(|e| to_owned_checked(&e)).collect();
+                elements.map(|e| to_owned(&e)).collect();
             let mut items = match items {
                 Ok(items) => items,
                 Err(e) => return QueryResult::Error(e),
@@ -9482,7 +9540,7 @@ fn builtin_sort<W: Clone + AsRef<[u64]>>(
         // unconditionally, checked ahead of `optional` -- see
         // `scalar_decode_failure`.
         _ => scalar_fallback(&value, optional, || {
-            EvalError::cannot_be_sorted(&to_owned(&value))
+            EvalError::cannot_be_sorted(&to_owned_lossy(&value))
         }),
     }
 }
@@ -9512,9 +9570,9 @@ fn builtin_sort_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         unreachable!("eval_array_construction only returns Owned/Error/Break/Halt")
                     }
                 };
-                // #1755: to_owned_checked, not to_owned -- an undecodable
+                // #1755: to_owned, not to_owned_lossy -- an undecodable
                 // string element must raise, not silently sort in as "".
-                let owned_item = match to_owned_checked(&item) {
+                let owned_item = match to_owned(&item) {
                     Ok(v) => v,
                     Err(e) => return QueryResult::Error(e),
                 };
@@ -9544,7 +9602,7 @@ fn builtin_sort_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // unconditionally, checked ahead of `optional` -- see
         // `scalar_decode_failure`.
         _ => scalar_fallback(&value, optional, || {
-            EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))
+            EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
         }),
     }
 }
@@ -9593,7 +9651,7 @@ fn builtin_to_entries<W: Clone + AsRef<[u64]>>(
                 // needs `collect_cursors_checked` to return resolved
                 // positions too, a shared-trait-signature change with a
                 // wider blast radius than this fix's own #1677 scope.
-                let val = match to_owned_checked(&cursor.value()) {
+                let val = match to_owned(&cursor.value()) {
                     Ok(v) => v,
                     Err(e) => return QueryResult::Error(e),
                 };
@@ -9635,7 +9693,7 @@ fn builtin_to_entries<W: Clone + AsRef<[u64]>>(
                 let Some(key) = key_display_string(&field.key) else {
                     return QueryResult::Error(fields.malformed_member_error());
                 };
-                let val = match to_owned_checked(&field.value) {
+                let val = match to_owned(&field.value) {
                     Ok(val) => val,
                     Err(e) => return QueryResult::Error(e),
                 };
@@ -9649,11 +9707,11 @@ fn builtin_to_entries<W: Clone + AsRef<[u64]>>(
         }
         _ => {
             // #1820: the Array/Object arms are already checked (this is
-            // `to_owned_checked`'s own "primary" call site); the residual
+            // `to_owned`'s own "primary" call site); the residual
             // scalar fallback was missed. Same guard as builtin_keys'
             // sibling fallback.
             scalar_fallback(&value, optional, || {
-                EvalError::has_no_keys(&to_owned(&value))
+                EvalError::has_no_keys(&to_owned_lossy(&value))
             })
         }
     }
@@ -9750,7 +9808,7 @@ fn builtin_from_entries<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // map(f) is [.[] | f], and .[] over an object iterates its values, so jq
     // accepts an object of entries as readily as an array of them (#422).
     //
-    // #1755: to_owned_checked, not to_owned -- an undecodable entry must
+    // #1755: to_owned, not to_owned_lossy -- an undecodable entry must
     // raise, not silently become "".
     //
     // #1901: unlike jq (which accepts an object of entries as readily as
@@ -9761,17 +9819,17 @@ fn builtin_from_entries<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // review), same pattern as `builtin_flatten`.
     let yq_reject_non_array = || EvalError::yq_from_entries_requires_array();
     let entries: Result<Vec<OwnedValue>, EvalError> = match &value {
-        StandardJson::Array(elements) => elements.map(|elem| to_owned_checked(&elem)).collect(),
+        StandardJson::Array(elements) => elements.map(|elem| to_owned(&elem)).collect(),
         StandardJson::Object(_) if S::TAG == EvalTag::Yq => {
             return scalar_fallback(&value, optional, yq_reject_non_array);
         }
-        StandardJson::Object(fields) => fields.map(|f| to_owned_checked(&f.value())).collect(),
+        StandardJson::Object(fields) => fields.map(|f| to_owned(&f.value())).collect(),
         _ if S::TAG == EvalTag::Yq => {
             return scalar_fallback(&value, optional, yq_reject_non_array);
         }
         _ => {
             return scalar_fallback(&value, optional, || {
-                EvalError::cannot_iterate_with(S::TAG, &to_owned(&value))
+                EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
             });
         }
     };
@@ -9828,7 +9886,7 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         let index = crate::json::JsonIndex::build(&entry_json);
         let cursor = index.root(&entry_json);
 
-        // #1755: to_owned_checked, not to_owned -- an undecodable output
+        // #1755: to_owned, not to_owned_lossy -- an undecodable output
         // of `f` must raise, not silently become "" and get folded into
         // the object as if it were the real value. Not reachable via any
         // query today: `entry_json` comes from `owned_to_json_bytes`,
@@ -9838,7 +9896,7 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // fixed anyway for the same structural-consistency reason as
         // `collect_rhs_outputs`'s masked fix (#1778).
         match eval_single::<Vec<u64>, S>(f, cursor.value(), optional).materialize_cursor() {
-            QueryResult::One(v) => match to_owned_checked(&v) {
+            QueryResult::One(v) => match to_owned(&v) {
                 Ok(v) => transformed.push(v),
                 Err(e) => return QueryResult::Error(e),
             },
@@ -9846,7 +9904,7 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(v) => transformed.push(v),
             QueryResult::Many(vs) => {
                 for v in vs {
-                    match to_owned_checked(&v) {
+                    match to_owned(&v) {
                         Ok(v) => transformed.push(v),
                         Err(e) => return QueryResult::Error(e),
                     }
@@ -10027,11 +10085,11 @@ fn eval_string_interpolation_single_value<'a, W: Clone + AsRef<[u64]>, S: EvalSe
             StringPart::Expr(expr) => {
                 let val = eval_single::<W, S>(expr, value.clone(), optional).materialize_cursor();
                 let s = match val {
-                    // #1972: to_owned_checked, not to_owned -- an
+                    // #1972: to_owned, not to_owned_lossy -- an
                     // undecodable borrowed slot value used to silently
                     // become `""` instead of raising, same root cause as
                     // #1932/#1943's own fast-path consumers.
-                    QueryResult::One(v) => match to_owned_checked(&v) {
+                    QueryResult::One(v) => match to_owned(&v) {
                         Ok(v) => owned_to_string::<S>(&v),
                         Err(e) => return QueryResult::Error(e),
                     },
@@ -10039,7 +10097,7 @@ fn eval_string_interpolation_single_value<'a, W: Clone + AsRef<[u64]>, S: EvalSe
                     QueryResult::Owned(v) => owned_to_string::<S>(&v),
                     QueryResult::Many(vs) => {
                         if let Some(v) = vs.first() {
-                            match to_owned_checked(v) {
+                            match to_owned(v) {
                                 Ok(v) => owned_to_string::<S>(&v),
                                 Err(e) => return QueryResult::Error(e),
                             }
@@ -10306,11 +10364,11 @@ fn eval_format<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // #1755: to_owned_checked, not to_owned -- an undecodable string must
+    // #1755: to_owned, not to_owned_lossy -- an undecodable string must
     // raise, not silently format `""` (or a container holding `""` for a
     // nested field). Every `@format` function shares this single
     // materialization point via `format_owned`.
-    let owned = match to_owned_checked(&value) {
+    let owned = match to_owned(&value) {
         Ok(v) => v,
         Err(e) => return e.into(),
     };
@@ -11188,7 +11246,7 @@ fn props_value_to_string(value: &OwnedValue) -> String {
         // not reachable through any real filter (#1064, verified via
         // `cargo llvm-cov` and a direct entry-point probe, not assumed):
         // `@props` only ever sees a `Float` here via `eval_format`'s
-        // `to_owned(&value)`, which always round-trips a *finite* computed
+        // `to_owned_lossy(&value)`, which always round-trips a *finite* computed
         // number through `from_number_bytes` -- and that always
         // reconstructs a `NumberLiteral`, never a bare `Float`, for any
         // valid RFC-8259 number text. Only a NaN/Infinity sentinel
@@ -11237,7 +11295,7 @@ fn owned_to_yaml_at_depth(value: &OwnedValue, depth: usize) -> String {
         // not reachable through any real filter (#1064, verified via
         // `cargo llvm-cov` and a direct entry-point probe, not assumed):
         // `@yaml` only ever sees a `Float` here via `eval_format`'s
-        // `to_owned(&value)`, which always round-trips a *finite* computed
+        // `to_owned_lossy(&value)`, which always round-trips a *finite* computed
         // number through `from_number_bytes` -- and that always
         // reconstructs a `NumberLiteral`, never a bare `Float`, for any
         // valid RFC-8259 number text. Only a NaN/Infinity sentinel
@@ -11354,9 +11412,9 @@ fn builtin_tostring<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     _optional: bool,
 ) -> QueryResult<'_, W> {
-    // #1755: to_owned_checked, not to_owned -- an undecodable value must
+    // #1755: to_owned, not to_owned_lossy -- an undecodable value must
     // raise, not silently stringify as "".
-    match to_owned_checked(&value) {
+    match to_owned(&value) {
         Ok(owned) => QueryResult::Owned(OwnedValue::String(owned_to_string::<S>(&owned))),
         Err(e) => QueryResult::Error(e),
     }
@@ -11383,7 +11441,7 @@ fn builtin_tonumber<W: Clone + AsRef<[u64]>>(
             Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::cannot_parse_as_number(&to_owned(&value))),
+        _ => QueryResult::Error(EvalError::cannot_parse_as_number(&to_owned_lossy(&value))),
     }
 }
 
@@ -11522,15 +11580,15 @@ fn builtin_skip<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::One(v) => {
             if let StandardJson::Number(num) = v {
                 // Built directly from `num.as_i64()`/`as_f64()` rather than
-                // `to_owned(&v)` (a #1879 review finding): `to_owned` routes
+                // `to_owned_lossy(&v)` (a #1879 review finding): `to_owned_lossy` routes
                 // a `StandardJson::Number` through `from_number_bytes`,
                 // which re-validates the digit span and boxes a copy of the
                 // source text into `OwnedValue::NumberLiteral` -- allocation
                 // and work `classify_skip_n` immediately throws away, since
                 // its match arms only read the parsed `Int`/`Float`. This
                 // still preserves exact integer precision past `f64`'s
-                // 53-bit mantissa (the #1879 fix `to_owned` was introduced
-                // for), since `as_i64()` is tried first, same as `to_owned`
+                // 53-bit mantissa (the #1879 fix `to_owned_lossy` was introduced
+                // for), since `as_i64()` is tried first, same as `to_owned_lossy`
                 // itself does internally.
                 let owned = match num.as_i64() {
                     Ok(i) => OwnedValue::Int(i),
@@ -11555,21 +11613,21 @@ fn builtin_skip<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
 
     // Evaluate expr and skip first n results. #1989: each of these three
-    // arms used bare `to_owned` -- an undecodable string in a real,
+    // arms used bare `to_owned_lossy` -- an undecodable string in a real,
     // navigated `expr` output silently became "" instead of raising, with
     // no guard at all (unlike its sibling `n`-classification arms above).
     let result = eval_single::<W, S>(expr, value, optional);
     match result {
         QueryResult::One(v) => {
             if n == 0 {
-                QueryResult::Owned(to_owned_checked_or_suppress!(&v, optional))
+                QueryResult::Owned(to_owned_or_suppress!(&v, optional))
             } else {
                 QueryResult::None
             }
         }
         QueryResult::OneCursor(c) => {
             if n == 0 {
-                QueryResult::Owned(to_owned_checked_or_suppress!(&c.value(), optional))
+                QueryResult::Owned(to_owned_or_suppress!(&c.value(), optional))
             } else {
                 QueryResult::None
             }
@@ -11582,7 +11640,7 @@ fn builtin_skip<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
         }
         QueryResult::Many(results) => {
-            let skipped = to_owned_checked_vec_or_suppress!(results.into_iter().skip(n), optional);
+            let skipped = to_owned_vec_or_suppress!(results.into_iter().skip(n), optional);
             owned_vec_to_result(skipped)
         }
         QueryResult::ManyOwned(results) => {
@@ -11609,9 +11667,9 @@ fn builtin_tojson<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     _optional: bool,
 ) -> QueryResult<'_, W> {
-    // #1755: to_owned_checked, not to_owned -- an undecodable value must
+    // #1755: to_owned, not to_owned_lossy -- an undecodable value must
     // raise, not silently serialize with "" in its place.
-    match to_owned_checked(&value) {
+    match to_owned(&value) {
         Ok(owned) => QueryResult::Owned(OwnedValue::String(owned_value_to_json::<S>(&owned))),
         Err(e) => QueryResult::Error(e),
     }
@@ -11638,7 +11696,9 @@ fn builtin_fromjson<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::only_strings_can_be_parsed(&to_owned(&value))),
+        _ => QueryResult::Error(EvalError::only_strings_can_be_parsed(&to_owned_lossy(
+            &value,
+        ))),
     }
 }
 
@@ -12099,19 +12159,24 @@ fn builtin_implode<W: Clone + AsRef<[u64]>>(
                                 return if optional {
                                     QueryResult::None
                                 } else {
-                                    QueryResult::Error(EvalError::cannot_be_imploded(&to_owned(
-                                        &elem,
-                                    )))
+                                    QueryResult::Error(EvalError::cannot_be_imploded(
+                                        &to_owned_lossy(&elem),
+                                    ))
                                 };
                             }
                         },
                     },
+                    // #1989: `scalar_fallback`, mirroring #1755's own
+                    // per-element conversion in the sort family -- an
+                    // undecodable *element* was masked as `"" can't be
+                    // imploded, unicode codepoint needs to be numeric`
+                    // (naming content the document never held) and
+                    // suppressed outright under `?`. The decode failure has
+                    // to be checked before `optional` is consulted at all.
                     _ => {
-                        return if optional {
-                            QueryResult::None
-                        } else {
-                            QueryResult::Error(EvalError::cannot_be_imploded(&to_owned(&elem)))
-                        };
+                        return scalar_fallback(&elem, optional, || {
+                            EvalError::cannot_be_imploded(&to_owned_lossy(&elem))
+                        })
                     }
                 };
                 // jq substitutes U+FFFD for any codepoint char::from_u32 rejects
@@ -12237,7 +12302,7 @@ fn builtin_test<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
                 },
                 _ if optional => QueryResult::None,
-                _ => QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
+                _ => QueryResult::Error(EvalError::cannot_be_matched(&to_owned_lossy(&value))),
             }
         },
     )
@@ -12419,12 +12484,12 @@ fn search_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // (any type). `owned_value_eq::<S>`, not plain `==`, so this
             // agrees with `==`'s own yq-mode strict Int/Float distinction
             // (#950 review).
-            // #1755: to_owned_checked, not to_owned -- an undecodable
+            // #1755: to_owned, not to_owned_lossy -- an undecodable
             // element must raise, not silently compare as "".
             SearchOccurrence::All => {
                 let mut indices = Vec::new();
                 for (i, elem) in (*elements).enumerate() {
-                    let owned = match to_owned_checked(&elem) {
+                    let owned = match to_owned(&elem) {
                         Ok(v) => v,
                         Err(e) => return QueryResult::Error(e),
                     };
@@ -12436,7 +12501,7 @@ fn search_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
             SearchOccurrence::First => {
                 for (i, elem) in (*elements).enumerate() {
-                    let owned = match to_owned_checked(&elem) {
+                    let owned = match to_owned(&elem) {
                         Ok(v) => v,
                         Err(e) => return QueryResult::Error(e),
                     };
@@ -12456,7 +12521,7 @@ fn search_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             SearchOccurrence::Last => {
                 let mut last = None;
                 for (i, elem) in (*elements).enumerate() {
-                    let owned = match to_owned_checked(&elem) {
+                    let owned = match to_owned(&elem) {
                         Ok(v) => v,
                         Err(e) => return QueryResult::Error(e),
                     };
@@ -12519,9 +12584,9 @@ fn builtin_upper_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     _optional: bool,
 ) -> QueryResult<'a, W> {
-    // #1755: to_owned_checked, not to_owned -- an undecodable input must
+    // #1755: to_owned, not to_owned_lossy -- an undecodable input must
     // raise, not silently seed the fold with "" in its place.
-    let current = match to_owned_checked(&value) {
+    let current = match to_owned(&value) {
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
@@ -12541,7 +12606,7 @@ fn builtin_upper_index_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     _optional: bool,
 ) -> QueryResult<'a, W> {
     // #1755: see `builtin_upper_index`'s identical reasoning.
-    let current = match to_owned_checked(&value) {
+    let current = match to_owned(&value) {
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
@@ -12608,10 +12673,10 @@ fn builtin_tojsonstream<W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'_, W> {
     // Simplified: just return the value as JSON lines format
     //
-    // #1820: to_owned_checked, not to_owned -- an undecodable string
+    // #1820: to_owned, not to_owned_lossy -- an undecodable string
     // anywhere in `value` used to silently become `""` in the *actual
     // streamed output* below, not just an error message.
-    let owned = match to_owned_checked(&value) {
+    let owned = match to_owned(&value) {
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
@@ -12658,11 +12723,11 @@ fn builtin_fromjsonstream<W: Clone + AsRef<[u64]>>(
             // For now, return the input - full implementation would
             // reconstruct.
             //
-            // #1820: to_owned_checked, not to_owned -- this passes the
+            // #1820: to_owned, not to_owned_lossy -- this passes the
             // array straight through as real output, so an undecodable
             // string inside it used to silently become `""` instead of
             // raising.
-            match to_owned_checked(&value) {
+            match to_owned(&value) {
                 Ok(v) => QueryResult::Owned(v),
                 Err(e) => QueryResult::Error(e),
             }
@@ -12729,14 +12794,14 @@ fn getpath_one_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         };
     };
 
-    // #1755/#1953: to_owned_checked, not to_owned -- an undecodable root
+    // #1755/#1953: to_owned, not to_owned_lossy -- an undecodable root
     // value must raise, not silently become "" and get walked as if it were
     // the real value. A genuine decode failure (a #1642 collision counts as
     // one) is unconditional regardless of `optional` (that flag only
     // governs the path-shape check above, never a decode failure); a #1194
     // malformed-member error is ordinary like any other and
     // `suppress_or_raise` lets `optional` suppress it instead.
-    let mut current = match to_owned_checked(value) {
+    let mut current = match to_owned(value) {
         Ok(v) => v,
         Err(e) => return suppress_or_raise(e, optional),
     };
@@ -13417,7 +13482,11 @@ fn builtin_match<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
                 },
                 _ if optional => return QueryResult::None,
-                _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
+                _ => {
+                    return QueryResult::Error(EvalError::cannot_be_matched(&to_owned_lossy(
+                        &value,
+                    )))
+                }
             };
 
             // Build regex
@@ -14200,7 +14269,11 @@ fn builtin_test_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
                 },
                 _ if optional => return QueryResult::None,
-                _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
+                _ => {
+                    return QueryResult::Error(EvalError::cannot_be_matched(&to_owned_lossy(
+                        &value,
+                    )))
+                }
             };
 
             // Build regex with flags
@@ -14267,7 +14340,11 @@ fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
                 },
                 _ if optional => return QueryResult::None,
-                _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
+                _ => {
+                    return QueryResult::Error(EvalError::cannot_be_matched(&to_owned_lossy(
+                        &value,
+                    )))
+                }
             };
 
             // Build regex
@@ -14450,7 +14527,11 @@ fn yq_sub_arity3_empty_replace<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
                 },
                 _ if optional => return QueryResult::None,
-                _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
+                _ => {
+                    return QueryResult::Error(EvalError::cannot_be_matched(&to_owned_lossy(
+                        &value,
+                    )))
+                }
             };
 
             let re = match build_regex(&pattern, None) {
@@ -14502,7 +14583,7 @@ fn sub_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
+        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned_lossy(&value))),
     };
 
     // Build regex
@@ -14686,8 +14767,13 @@ fn fanout_regex_pattern_with_collected_flags<'a, W: Clone + AsRef<[u64]>, S: Eva
         |raw_pattern| {
             // Re-evaluated per pattern, matching jq: the array construction
             // holding `flags` sits inside `$re`'s own binding.
+            // #1989: `stream_outputs_checked` -- an undecodable `flags`
+            // argument (`splits(","; .flags)`) used to be materialized as
+            // `""` by `stream_outputs`'s unchecked fold and then applied as
+            // "no flags at all", silently answering with the wrong match
+            // semantics instead of raising.
             let (raw_flags_values, trailing) =
-                stream_outputs(eval_single::<W, S>(flags_expr, value.clone(), optional));
+                stream_outputs_checked(eval_single::<W, S>(flags_expr, value.clone(), optional));
             let mut resolved_pattern: Option<String> = None;
             let mut flags = vec_with_capacity(raw_flags_values.len());
             for raw_flags in raw_flags_values {
@@ -14913,7 +14999,7 @@ fn scan_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>>(
             Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
+        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned_lossy(&value))),
     };
 
     // Build regex
@@ -15010,7 +15096,7 @@ fn yq_split_ignores_arguments<'a, W: Clone + AsRef<[u64]>>(
             Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(value))),
+        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned_lossy(value))),
     };
     QueryResult::Owned(OwnedValue::Array(split_into_individual_chars(&input)))
 }
@@ -15047,7 +15133,7 @@ fn split_regex_resolved<'a, W: Clone + AsRef<[u64]>>(
             Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(value))),
+        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned_lossy(value))),
     };
 
     // One match list per flags value, concatenated in flags order -- see
@@ -15157,7 +15243,7 @@ fn splits_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>>(
             Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => return QueryResult::None,
-        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned(&value))),
+        _ => return QueryResult::Error(EvalError::cannot_be_matched(&to_owned_lossy(&value))),
     };
 
     // One match list per flags value, concatenated in flags order -- jq's
@@ -15196,7 +15282,7 @@ fn splits_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>>(
 /// `eval_comma`'s own identical shape.
 ///
 /// #1755 review: an earlier version of `eval_pipe`'s own fix left this
-/// specific promotion path on unchecked `to_owned`, silently corrupting an
+/// specific promotion path on unchecked `to_owned_lossy`, silently corrupting an
 /// already-borrowed undecodable element the moment any sibling forced
 /// promotion to owned -- `.[] | (if type == "string" then . else . + 0
 /// end)` on `["\xff\xfe", 1]` returned `ManyOwned([String(""), Int(1)])`
@@ -15213,7 +15299,7 @@ fn push_promoted<'a, W: Clone + AsRef<[u64]>>(
     match owned {
         Some(acc) => {
             for r in rs {
-                acc.push(to_owned_checked(&r)?);
+                acc.push(to_owned(&r)?);
             }
             Ok(())
         }
@@ -15237,7 +15323,7 @@ fn promote_borrowed_checked<W: Clone + AsRef<[u64]>>(
 ) -> Result<Vec<OwnedValue>, (Vec<OwnedValue>, EvalError)> {
     let mut acc = vec_with_capacity(borrowed.len());
     for b in &borrowed {
-        match to_owned_checked(b) {
+        match to_owned(b) {
             Ok(v) => acc.push(v),
             Err(e) => return Err((acc, e)),
         }
@@ -15276,9 +15362,9 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     // Check if any expression in the pipe needs path context (PathNoArg, Parent)
     if exprs.iter().any(needs_path_context) {
-        // #1755: to_owned_checked, not to_owned -- an undecodable input
+        // #1755: to_owned, not to_owned_lossy -- an undecodable input
         // must raise, not silently become "" for the path-context walk.
-        let owned = match to_owned_checked(&value) {
+        let owned = match to_owned(&value) {
             Ok(v) => v,
             Err(e) => return QueryResult::Error(e),
         };
@@ -15443,8 +15529,8 @@ fn pipe_owned_prefix<'a, S: EvalSemantics, W>(
             QueryResult::Owned(r) => all_results.push(r),
             QueryResult::OneCursor(_) => unreachable!(),
             QueryResult::ManyOwned(rs) => all_results.extend(rs),
-            QueryResult::One(r) => all_results.push(to_owned(&r)),
-            QueryResult::Many(rs) => all_results.extend(rs.iter().map(to_owned)),
+            QueryResult::One(r) => all_results.push(to_owned_lossy(&r)),
+            QueryResult::Many(rs) => all_results.extend(rs.iter().map(to_owned_lossy)),
             QueryResult::None => {}
             QueryResult::Error(e) => return partial(all_results, Control::Error(e)),
             QueryResult::Break(label) => return partial(all_results, Control::Break(label)),
@@ -16070,7 +16156,7 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
                 for t in &ts {
                     match index_one::<W>(t.clone(), k, optional) {
-                        // `resolve_terminal_prefix`, not unchecked `to_owned`
+                        // `resolve_terminal_prefix`, not unchecked `to_owned_lossy`
                         // (#1897): an undecodable string already accumulated
                         // must raise `EvalError::decode_failure` on
                         // promotion, not silently become `""` -- the same
@@ -16243,7 +16329,7 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // S outer, T middle, E inner (point 2 above). The result is always
     // owned: slicing constructs a new array/string (see `eval_single`'s
     // `Expr::Slice` arm), so there is nothing to borrow except its rare
-    // whole-value fast paths, which `to_owned` below just copies out of.
+    // whole-value fast paths, which `to_owned_lossy` below just copies out of.
     //
     // All three factors, not just `starts.len() * ends.len()`: the loop
     // below is genuinely S outer / T middle / E inner, so the true upper
@@ -16268,7 +16354,7 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     };
                     for t in ts {
                         match eval_single::<W, S>(&slice_expr, t.clone(), optional) {
-                            // #1943: to_owned_checked, not to_owned -- the
+                            // #1943: to_owned, not to_owned_lossy -- the
                             // `Expr::Slice` fast path for a fully-open
                             // bound (`matches!(start, None|Some(0)) &&
                             // end.is_none()`) returns the target's original
@@ -16282,7 +16368,7 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                             // Slice` array arm, which had the identical
                             // unconditional-raise gap this same PR fixes.
                             QueryResult::One(v) => {
-                                out.push(to_owned_checked_or_suppress!(&v, optional));
+                                out.push(to_owned_or_suppress!(&v, optional));
                             }
                             QueryResult::Owned(v) => out.push(v),
                             QueryResult::None => {}
@@ -17367,7 +17453,7 @@ fn yq_assign_skip_rhs<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // A decode-failure `Err` here falls through to `None` like any other
     // "doesn't apply" reason above -- this function's callers
     // (`eval_compound_assign`/`eval_alternative_assign`) always fall
-    // through to `eval_update` on `None`, whose own `to_owned_checked` call
+    // through to `eval_update` on `None`, whose own `to_owned` call
     // raises the identical error properly (#1746), so nothing is lost by
     // not threading a `Result` through this wrapper too.
     match yq_assign_noop_check::<W, S>(path_expr, input) {
@@ -17380,7 +17466,7 @@ fn yq_assign_skip_rhs<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// `pristine`/`paths` pair the check's own static-path resolution already
 /// computed when it turns out *not* to be a no-op -- an earlier version
 /// threw that work away on `None` and made every caller redo an identical
-/// `to_owned` + `resolve_dynamic_indexes` pass moments later, doubling a
+/// `to_owned_lossy` + `resolve_dynamic_indexes` pass moments later, doubling a
 /// full O(document-size) DOM materialization on every non-no-op yq-mode
 /// static-path assignment (the common case). [`eval_assign`] is the one
 /// caller wired up to actually reuse `Continue`'s payload; the two
@@ -17419,7 +17505,7 @@ fn yq_assign_noop_check<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     if S::TAG != EvalTag::Yq || needs_path_prepass(path_expr) {
         return Ok(YqAssignNoopCheck::NotChecked);
     }
-    let pristine = to_owned_checked(input)?;
+    let pristine = to_owned(input)?;
     // A static path (the only kind reaching this point) never actually
     // evaluates `path_expr` -- `resolve_dynamic_indexes`'s own fast path
     // is an unconditional `Ok(vec![path_expr.clone()])` -- so this can't
@@ -17524,7 +17610,7 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `builtin_del` (#537) already separates `del(...)?` from a `?` written
     // inside the path.
     // #1233 (code review): reuse `yq_noop_check`'s own resolution instead
-    // of redoing an identical `to_owned` + `resolve_dynamic_indexes` pass
+    // of redoing an identical `to_owned_lossy` + `resolve_dynamic_indexes` pass
     // -- see `YqAssignNoopCheck::Continue`'s doc comment. Only the
     // `NotChecked` case (jq mode, or a genuinely dynamic path) still needs
     // to resolve here from scratch, exactly as this function always did
@@ -17533,13 +17619,13 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         YqAssignNoopCheck::Continue { pristine, paths } => (pristine, paths),
         YqAssignNoopCheck::Skip(_) => unreachable!("handled by the early return above"),
         YqAssignNoopCheck::NotChecked => {
-            // #1953: a non-decode-failure to_owned_checked error (a #1194
+            // #1953: a non-decode-failure to_owned error (a #1194
             // malformed-member error -- a #1642 collision error is itself
             // tagged as a decode failure and so is unaffected by this)
             // respects `optional` like every other fallible step at this
             // boundary (per this function's own doc comment above) -- only
             // a genuine decode failure is unconditional.
-            let pristine = match to_owned_checked(&input) {
+            let pristine = match to_owned(&input) {
                 Ok(pristine) => pristine,
                 Err(e) => return suppress_or_raise(e, optional),
             };
@@ -17616,11 +17702,11 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     scalar_slice_noop: bool,
 ) -> QueryResult<'a, W> {
     // Convert input to owned for modification. #1953: a non-decode-failure
-    // to_owned_checked error respects `optional` like every other fallible
+    // to_owned error respects `optional` like every other fallible
     // step at this boundary (see this function's own `resolve_dynamic_indexes`
     // arm and `eval_assign`'s matching comment below) -- only a genuine
     // decode failure is unconditional.
-    let mut result = match to_owned_checked(&input) {
+    let mut result = match to_owned(&input) {
         Ok(result) => result,
         Err(e) => return suppress_or_raise(e, optional),
     };
@@ -17686,7 +17772,7 @@ fn collect_rhs_outputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> Result<(Vec<OwnedValue>, Option<Control>), QueryResult<'a, W>> {
     match eval_single::<W, S>(value_expr, input.clone(), optional).materialize_cursor() {
-        QueryResult::One(v) => match to_owned_checked(&v) {
+        QueryResult::One(v) => match to_owned(&v) {
             Ok(owned) => Ok((vec![owned], None)),
             Err(e) => Err(QueryResult::Error(e)),
         },
@@ -17694,7 +17780,7 @@ fn collect_rhs_outputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             unreachable!("materialize_cursor should have converted this")
         }
         QueryResult::Owned(v) => Ok((vec![v], None)),
-        QueryResult::Many(vs) => match vs.iter().map(to_owned_checked).collect() {
+        QueryResult::Many(vs) => match vs.iter().map(to_owned).collect() {
             Ok(owned) => Ok((owned, None)),
             Err(e) => Err(QueryResult::Error(e)),
         },
@@ -17839,11 +17925,11 @@ fn eval_update_multi<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Err(early_return) => return early_return,
         };
 
-    // #1953: a non-decode-failure to_owned_checked error respects `optional`
+    // #1953: a non-decode-failure to_owned error respects `optional`
     // like the sibling `resolve_dynamic_indexes` arm just below (and
     // `eval_assign`/`eval_update`'s matching sites) -- only a genuine
     // decode failure is unconditional.
-    let pristine = match to_owned_checked(&input) {
+    let pristine = match to_owned(&input) {
         Ok(v) => v,
         Err(e) => return suppress_or_raise(e, optional),
     };
@@ -26629,7 +26715,7 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     // Evaluate input to get the stream of values
     let input_result = eval_single::<W, S>(input, value.clone(), optional);
-    // #1902/#1934: to_owned_checked/promote_borrowed_checked, not to_owned --
+    // #1902/#1934: to_owned/promote_borrowed_checked, not to_owned_lossy --
     // an undecodable input element used to silently become `""` instead of
     // raising. A decode failure is never suppressed by `optional` (#1620),
     // matching the "drop the prefix, propagate unconditionally" policy the
@@ -26641,14 +26727,14 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // arm below already does (#1934 item 3: this used to be unconditionally
     // fatal regardless of `optional`, unlike that sibling arm). #1934 item 6:
     // this widening -- a malformed key/collision now raises here where the
-    // pre-#1902 unchecked `to_owned` silently dropped the offending member --
-    // is `to_owned_checked`'s own already-established contract from #1755
+    // pre-#1902 unchecked `to_owned_lossy` silently dropped the offending member --
+    // is `to_owned`'s own already-established contract from #1755
     // onward, not new scope creep specific to `reduce`; #1907 tracks the
-    // general "`to_owned_checked`'s `Err` can carry a non-decode-failure
+    // general "`to_owned`'s `Err` can carry a non-decode-failure
     // error" question this arm (and its `eval_foreach`/`eval_as` siblings)
     // are instances of.
     let input_values: Vec<OwnedValue> = match input_result.materialize_cursor() {
-        QueryResult::One(v) => match to_owned_checked(&v) {
+        QueryResult::One(v) => match to_owned(&v) {
             Ok(v) => vec![v],
             Err(e) => return suppress_or_raise(e, optional),
         },
@@ -27003,7 +27089,7 @@ fn eval_owned_expr_full<S: EvalSemantics>(
     let cursor = index.root(json_bytes);
 
     match eval_single::<Vec<u64>, S>(expr, cursor.value(), optional).materialize_cursor() {
-        QueryResult::One(v) => Ok(Some((to_owned(&v), None))),
+        QueryResult::One(v) => Ok(Some((to_owned_lossy(&v), None))),
         QueryResult::OneCursor(_) => unreachable!(),
         QueryResult::Owned(v) => Ok(Some((v, None))),
         // #1937 (round 2, after `/code-review` caught a worse regression in
@@ -27035,9 +27121,9 @@ fn eval_owned_expr_full<S: EvalSemantics>(
         // still out of scope per #1522's design doc.
         QueryResult::Many(vs) => match vs.len() {
             0 => Ok(None),
-            1 => Ok(Some((to_owned(&vs[0]), None))),
+            1 => Ok(Some((to_owned_lossy(&vs[0]), None))),
             _ => Ok(Some((
-                OwnedValue::Array(vs.iter().map(to_owned).collect()),
+                OwnedValue::Array(vs.iter().map(to_owned_lossy).collect()),
                 None,
             ))),
         },
@@ -27094,7 +27180,7 @@ fn eval_owned_expr_full<S: EvalSemantics>(
 /// returned cleanly. Same "a control signal that already fired must still
 /// surface" rule as `#791`/`#987`/`#1832`/`#1897` elsewhere in this file --
 /// only the discovery point differs (here, `eval_owned_expr_full`'s own
-/// `Partial` arm rather than a checked `to_owned`).
+/// `Partial` arm rather than a checked `to_owned_lossy`).
 ///
 /// `eval_owned_expr_ctrl`, the sibling this doc comment used to describe as
 /// sharing this exact gap, does too -- code review (#1559) caught that the
@@ -27162,9 +27248,9 @@ fn eval_owned_input<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let cursor = index.root(json_bytes);
 
     match eval_single::<Vec<u64>, S>(expr, cursor.value(), optional).materialize_cursor() {
-        QueryResult::One(v) => QueryResult::Owned(to_owned(&v)),
+        QueryResult::One(v) => QueryResult::Owned(to_owned_lossy(&v)),
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
-        QueryResult::Many(vs) => QueryResult::ManyOwned(vs.iter().map(to_owned).collect()),
+        QueryResult::Many(vs) => QueryResult::ManyOwned(vs.iter().map(to_owned_lossy).collect()),
         QueryResult::Owned(v) => QueryResult::Owned(v),
         QueryResult::ManyOwned(vs) => QueryResult::ManyOwned(vs),
         QueryResult::None => QueryResult::None,
@@ -27370,14 +27456,14 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // .+$v)` emits `1`, `3` before erroring — the input stream's own control
     // is held until the loop over that prefix has run its course.
     let input_result = eval_single::<W, S>(input, value.clone(), optional);
-    // #1902: to_owned_checked/promote_borrowed_checked, not to_owned -- a
+    // #1902: to_owned/promote_borrowed_checked, not to_owned_lossy -- a
     // checked-conversion failure folds into `input_control` exactly like an
     // ordinary `Partial`'s control (the comment above): the already-decoded
     // prefix is still iterated below before the decode failure surfaces as
     // the terminal control.
     let (input_values, input_control): (Vec<OwnedValue>, Option<Control>) =
         match input_result.materialize_cursor() {
-            QueryResult::One(v) => match to_owned_checked(&v) {
+            QueryResult::One(v) => match to_owned(&v) {
                 Ok(v) => (vec![v], None),
                 Err(e) => (Vec::new(), Some(Control::Error(e))),
             },
@@ -27409,7 +27495,7 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // #1902: same checked-conversion treatment as `input_values` above.
     let (init_values, init_control): (Vec<OwnedValue>, Option<Control>) =
         match init_result.materialize_cursor() {
-            QueryResult::One(v) => match to_owned_checked(&v) {
+            QueryResult::One(v) => match to_owned(&v) {
                 Ok(v) => (vec![v], None),
                 Err(e) => (Vec::new(), Some(Control::Error(e))),
             },
@@ -27846,13 +27932,13 @@ fn eval_until<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // #1755: to_owned_checked, not to_owned -- an undecodable starting
+    // #1755: to_owned, not to_owned_lossy -- an undecodable starting
     // value must raise unconditionally on a genuine decode failure,
     // matching this crate's own "decode failure is never suppressed by
     // `?`" rule directly rather than relying on ever reaching `finish_fork`
     // (which #1902 also made exempt decode failures from its own `optional`
     // suppression, but that's this comment's own sibling function, not a
-    // guarantee this early return depends on). #1953: `to_owned_checked`'s
+    // guarantee this early return depends on). #1953: `to_owned`'s
     // `Err` can also carry a non-decode-failure error (a #1194 malformed
     // member -- a #1642 collision counts as a decode failure, per
     // `EvalError::colliding_display_key`'s own delegation to
@@ -27861,7 +27947,7 @@ fn eval_until<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // that case the same way the sibling `finish_fork` call two lines down
     // already does, while still raising a genuine decode failure
     // unconditionally either way.
-    let initial = match to_owned_checked(&value) {
+    let initial = match to_owned(&value) {
         Ok(v) => v,
         Err(e) => return suppress_or_raise(e, optional),
     };
@@ -27962,10 +28048,10 @@ fn eval_while<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // #1755/#1953: to_owned_checked, not to_owned -- see `eval_until`'s
+    // #1755/#1953: to_owned, not to_owned_lossy -- see `eval_until`'s
     // identical reasoning, including the `suppress_or_raise` treatment of
     // a non-decode-failure `Err`.
-    let initial = match to_owned_checked(&value) {
+    let initial = match to_owned(&value) {
         Ok(v) => v,
         Err(e) => return suppress_or_raise(e, optional),
     };
@@ -28108,7 +28194,7 @@ fn each_repeat<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
-    let owned = match to_owned_checked(&value) {
+    let owned = match to_owned(&value) {
         Ok(v) => v,
         Err(e) if suppresses(&e, optional) => return Flow::Exhausted,
         Err(e) => return Flow::Escaped(Control::Error(e)),
@@ -28149,10 +28235,10 @@ fn eval_repeat<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // #1755/#1953: to_owned_checked, not to_owned -- see `eval_until`'s
+    // #1755/#1953: to_owned, not to_owned_lossy -- see `eval_until`'s
     // identical reasoning, including the `suppress_or_raise` treatment of
     // a non-decode-failure `Err`.
-    let owned = match to_owned_checked(&value) {
+    let owned = match to_owned(&value) {
         Ok(v) => v,
         Err(e) => return suppress_or_raise(e, optional),
     };
@@ -28408,11 +28494,11 @@ fn builtin_recurse<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ///
 /// #1953: deliberately *not* given the `suppress_or_raise` treatment its
 /// `eval_until`/`eval_while`/`eval_repeat`/`builtin_walk` siblings received
-/// for the identical `to_owned_checked` shape below -- `optional` is
+/// for the identical `to_owned` shape below -- `optional` is
 /// `_`-prefixed here because nothing in this function's body threads it at
 /// all, matching real jq's own `recurse` having no internal optional-
 /// suppression concept (any `(recurse(f))?` catch happens entirely at the
-/// outer `eval_try` boundary). Making the `to_owned_checked` error alone
+/// outer `eval_try` boundary). Making the `to_owned` error alone
 /// respect a parameter the rest of the function ignores would be a new,
 /// unprecedented partial-suppression behavior, not a consistency fix.
 fn builtin_recurse_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
@@ -28420,10 +28506,10 @@ fn builtin_recurse_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     _optional: bool,
 ) -> QueryResult<'a, W> {
-    // #1755: to_owned_checked, not to_owned -- an undecodable root value
+    // #1755: to_owned, not to_owned_lossy -- an undecodable root value
     // must raise, not silently become "" and get visited/output as if it
     // were the real value.
-    let root = match to_owned_checked(&value) {
+    let root = match to_owned(&value) {
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
@@ -28496,9 +28582,9 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     _optional: bool,
 ) -> QueryResult<'a, W> {
-    // #1755: to_owned_checked, not to_owned -- see `builtin_recurse_f`'s
+    // #1755: to_owned, not to_owned_lossy -- see `builtin_recurse_f`'s
     // identical reasoning.
-    let root = match to_owned_checked(&value) {
+    let root = match to_owned(&value) {
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
@@ -28570,11 +28656,11 @@ fn builtin_walk<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // #1755/#1953: to_owned_checked, not to_owned -- see `eval_until`'s
+    // #1755/#1953: to_owned, not to_owned_lossy -- see `eval_until`'s
     // identical reasoning (this function also finishes via `finish_fork`),
     // including the `suppress_or_raise` treatment of a non-decode-failure
     // `Err`.
-    let owned = match to_owned_checked(&value) {
+    let owned = match to_owned(&value) {
         Ok(v) => v,
         Err(e) => return suppress_or_raise(e, optional),
     };
@@ -28819,16 +28905,16 @@ fn accumulate_path_context_step<'a, W: Clone + AsRef<[u64]>>(
         // `eval_fanout` is a shared, generic helper whose *other* callers
         // (`builtin_select`, `resolve_node`'s own `Select` arm) do pass
         // cursor-producing closures, just not through this path-context
-        // machinery specifically. `to_owned`, not `to_owned_checked`, is
+        // machinery specifically. `to_owned_lossy`, not `to_owned`, is
         // therefore not proven safe by usage; if this ever needs the
         // checked twin, verify a live repro first (this file's own
         // #1953/#1972 lesson).
         QueryResult::One(v) => {
-            results.push(to_owned(&v));
+            results.push(to_owned_lossy(&v));
             None
         }
         QueryResult::Many(vs) => {
-            results.extend(vs.iter().map(to_owned));
+            results.extend(vs.iter().map(to_owned_lossy));
             None
         }
         QueryResult::None => None,
@@ -28957,10 +29043,10 @@ fn continue_rest_with_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `Many` get the identical fix per element, not just the
         // single-value `Owned`/`One` cases.
         QueryResult::Owned(v) if rest.is_empty() => QueryResult::Owned(v),
-        QueryResult::One(v) if rest.is_empty() => QueryResult::Owned(to_owned(&v)),
+        QueryResult::One(v) if rest.is_empty() => QueryResult::Owned(to_owned_lossy(&v)),
         QueryResult::ManyOwned(vs) if rest.is_empty() => owned_vec_to_result(vs),
         QueryResult::Many(vs) if rest.is_empty() => {
-            owned_vec_to_result(vs.iter().map(to_owned).collect())
+            owned_vec_to_result(vs.iter().map(to_owned_lossy).collect())
         }
         QueryResult::Owned(v) => eval_pipe_with_path_context_internal::<W, S>(
             rest,
@@ -28972,7 +29058,7 @@ fn continue_rest_with_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         ),
         QueryResult::One(v) => eval_pipe_with_path_context_internal::<W, S>(
             rest,
-            &to_owned(&v),
+            &to_owned_lossy(&v),
             root,
             file_origin,
             current_path,
@@ -28998,7 +29084,7 @@ fn continue_rest_with_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Many(vs) => {
             let mut results = Vec::new();
             for v in vs {
-                let owned_v = to_owned(&v);
+                let owned_v = to_owned_lossy(&v);
                 let step = eval_pipe_with_path_context_internal::<W, S>(
                     rest,
                     &owned_v,
@@ -29169,10 +29255,10 @@ fn pair_outputs_with_path<'a, W: Clone + AsRef<[u64]>>(
     let wrap = |v: OwnedValue| OwnedValue::Array(vec![OwnedValue::Array(path.to_vec()), v]);
     match result.materialize_cursor() {
         QueryResult::Owned(v) => QueryResult::Owned(wrap(v)),
-        QueryResult::One(v) => QueryResult::Owned(wrap(to_owned(&v))),
+        QueryResult::One(v) => QueryResult::Owned(wrap(to_owned_lossy(&v))),
         QueryResult::ManyOwned(vs) => owned_vec_to_result(vs.into_iter().map(wrap).collect()),
         QueryResult::Many(vs) => {
-            owned_vec_to_result(vs.iter().map(|v| wrap(to_owned(v))).collect())
+            owned_vec_to_result(vs.iter().map(|v| wrap(to_owned_lossy(v))).collect())
         }
         QueryResult::Partial(vs, control) => {
             QueryResult::Partial(vs.into_iter().map(wrap).collect(), control)
@@ -29209,7 +29295,7 @@ fn continue_rest_with_paths<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             continue_one_paired::<W, S>(v, rest, root, file_origin, fallback_path, optional)
         }
         QueryResult::One(v) => continue_one_paired::<W, S>(
-            to_owned(&v),
+            to_owned_lossy(&v),
             rest,
             root,
             file_origin,
@@ -29237,7 +29323,7 @@ fn continue_rest_with_paths<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let mut results = Vec::new();
             for v in vs {
                 let step = continue_one_paired::<W, S>(
-                    to_owned(&v),
+                    to_owned_lossy(&v),
                     rest,
                     root,
                     file_origin,
@@ -32055,7 +32141,7 @@ fn builtin_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let owned = match to_owned_checked(&value) {
+    let owned = match to_owned(&value) {
         Ok(owned) => owned,
         Err(e) => return QueryResult::Error(e),
     };
@@ -32063,7 +32149,7 @@ fn builtin_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// [`builtin_path`]'s body once its input is already an [`OwnedValue`] --
-/// everything this builtin does after the `to_owned_checked` above.
+/// everything this builtin does after the `to_owned` above.
 ///
 /// Split out for #1909 so the CLI's generic evaluator can reach it with the
 /// `OwnedValue` it has *already* materialized, instead of going through
@@ -32412,9 +32498,9 @@ fn builtin_tostream<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
     _optional: bool,
 ) -> QueryResult<'_, W> {
-    // #1755: to_owned_checked, not to_owned -- an undecodable value must
+    // #1755: to_owned, not to_owned_lossy -- an undecodable value must
     // raise, not silently stream events for "" in its place.
-    let owned = match to_owned_checked(&value) {
+    let owned = match to_owned(&value) {
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
@@ -32458,7 +32544,7 @@ fn builtin_fromstream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Halt(code) => return QueryResult::Halt(code),
         QueryResult::Partial(vs, control) => (vs, Some(control)),
         // #2188: `stream_outputs_checked`, not bare `collect_owned` --
-        // `collect_owned`'s `One`/`Many` arms use unchecked `to_owned`,
+        // `collect_owned`'s `One`/`Many` arms use unchecked `to_owned_lossy`,
         // silently substituting `""` for an undecodable event leaf instead
         // of raising, the same #1746-shaped bug this whole family has
         // already been fixed for elsewhere. `stream_outputs_checked` gives
@@ -32523,7 +32609,7 @@ fn builtin_truncate_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Not one of #1820's actual bugs, despite `to_owned`'s silent `""`
+    // Not one of #1820's actual bugs, despite `to_owned_lossy`'s silent `""`
     // substitution touching `depth` too: `depth` is only ever compared
     // against `path_len` (always a plain `Int`) via `compare_values`'s
     // cross-type ordering below, which -- per the comment a few lines
@@ -32532,11 +32618,11 @@ fn builtin_truncate_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `.as_f64()` either way (string/array/object always sort above a
     // number, so the branch that reads content is unreachable for them),
     // so a corrupted string standing in for `depth` produces the exact
-    // same outcome as a valid one. `to_owned_checked` doesn't just waste
+    // same outcome as a valid one. `to_owned` doesn't just waste
     // a decode nothing here needs -- like `eval_not`, it wrongly raises
     // for a *container* `depth` that merely contains an undecodable
     // string, where jq would just proceed unaffected.
-    let depth = to_owned(&value);
+    let depth = to_owned_lossy(&value);
 
     // A `Partial`'s trailing control is not intercepted here (#694): its
     // prefix of events is processed below like any other, and the control
@@ -32601,12 +32687,12 @@ fn builtin_truncate_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// Builtin: paths - all paths to values (excluding empty paths)
 /// Returns each path as a separate output (streaming), matching jq behavior
 ///
-/// #1829: `to_owned_checked`, not `to_owned` -- an undecodable object key
+/// #1829: `to_owned`, not `to_owned_lossy` -- an undecodable object key
 /// was previously dropped silently (a shrunk object, not an error), where
 /// `path(.[])`/`tojson`/`keys`/`to_entries`/`map_values` all raise or
 /// preserve it via `resolve_display_key`'s #1642 fallback spelling.
 /// `_optional` stays unused, matching `builtin_path`'s own root
-/// `to_owned_checked` call: catchability is handled uniformly one level up
+/// `to_owned` call: catchability is handled uniformly one level up
 /// by `eval_try`, which passes the *same* `optional` this function received
 /// down through `eval_single` already -- so a wrapping `paths?` suppresses
 /// a catchable result here without this function needing to consult it
@@ -32615,7 +32701,7 @@ fn builtin_paths<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
     _optional: bool,
 ) -> QueryResult<'_, W> {
-    let owned = match to_owned_checked(&value) {
+    let owned = match to_owned(&value) {
         Ok(owned) => owned,
         Err(e) => return QueryResult::Error(e),
     };
@@ -32697,13 +32783,13 @@ fn each_paths_filter<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
-    // #1829: `to_owned_checked`, not `to_owned` -- shares `builtin_paths`'s
+    // #1829: `to_owned`, not `to_owned_lossy` -- shares `builtin_paths`'s
     // own fix (an undecodable key was previously dropped silently instead
     // of raising or preserving its #1642 fallback spelling). Same
     // "eager and unconditional" placement as the root node_filter pre-check
     // just below: nothing has been pushed to `sink` yet, so this is always
     // a bare `Error`, never a `Partial`.
-    let owned = match to_owned_checked(&value) {
+    let owned = match to_owned(&value) {
         Ok(owned) => owned,
         Err(e) => return Flow::Escaped(Control::Error(e)),
     };
@@ -32854,14 +32940,14 @@ fn collect_leaf_paths(
 /// recipe's `scalars` filter excludes. See `collect_leaf_paths` and #771.
 /// Returns each path as a separate output (streaming).
 ///
-/// #1829: `to_owned_checked`, not `to_owned` -- shares `builtin_paths`'s own
+/// #1829: `to_owned`, not `to_owned_lossy` -- shares `builtin_paths`'s own
 /// fix and its reasoning for leaving `_optional` unused (see that function's
 /// doc comment).
 fn builtin_leaf_paths<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
     _optional: bool,
 ) -> QueryResult<'_, W> {
-    let owned = match to_owned_checked(&value) {
+    let owned = match to_owned(&value) {
         Ok(owned) => owned,
         Err(e) => return QueryResult::Error(e),
     };
@@ -33178,9 +33264,9 @@ fn builtin_setpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     QueryResult::Error(EvalError::path_must_be_array())
                 };
             };
-            // #1953: a non-decode-failure to_owned_checked error respects
+            // #1953: a non-decode-failure to_owned error respects
             // `optional`, the same as every other builtin refusal here.
-            let owned = match to_owned_checked(&value) {
+            let owned = match to_owned(&value) {
                 Ok(owned) => owned,
                 Err(e) => return suppress_or_raise(e, optional),
             };
@@ -34300,7 +34386,7 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Convert to owned and delete the path
-    let result = match to_owned_checked(&value) {
+    let result = match to_owned(&value) {
         Ok(result) => result,
         Err(e) => return QueryResult::Error(e),
     };
@@ -35668,20 +35754,20 @@ fn builtin_mktime<W: Clone + AsRef<[u64]>>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
-    // #1820: `scalar_decode_failure` first, not a full `to_owned_checked`
+    // #1820: `scalar_decode_failure` first, not a full `to_owned`
     // -- an undecodable top-level string used to silently become `""` via
-    // plain `to_owned` and get misreported as "not an array" instead of
+    // plain `to_owned_lossy` and get misreported as "not an array" instead of
     // raising its own decode failure (never suppressed by `?`,
     // #1247/#1620). But `get_int` below only ever extracts *numbers* from
     // the array (never a `String` arm), so a corrupted string in an
     // unread element -- e.g. a `gmtime`-shaped 8-element array's unused
     // weekday/yearday tail -- must not fail a conversion that would
     // otherwise succeed; recursively checking the whole array like
-    // `to_owned_checked` does was confirmed to regress exactly that case.
+    // `to_owned` does was confirmed to regress exactly that case.
     if let Some(e) = scalar_decode_failure(&value) {
         return QueryResult::Error(e);
     }
-    let arr = match to_owned(&value) {
+    let arr = match to_owned_lossy(&value) {
         OwnedValue::Array(a) => a,
         _ if optional => return QueryResult::None,
         _ => return QueryResult::Error(EvalError::mktime_requires_array()),
@@ -35916,7 +36002,7 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
                 // #1820: `scalar_decode_failure` first, same shape as
                 // `builtin_mktime`'s own fix above -- and for the same
-                // reason, plain `to_owned` (not `to_owned_checked`) for the
+                // reason, plain `to_owned_lossy` (not `to_owned`) for the
                 // array itself: `get_int` below only ever extracts numbers
                 // (defaulting to 0 for anything else, never a `String`
                 // arm), so a corrupted string in an element it happens not
@@ -35926,7 +36012,7 @@ fn builtin_strftime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     if let Some(e) = scalar_decode_failure(&value) {
                         return QueryResult::Error(e);
                     }
-                    match to_owned(&value) {
+                    match to_owned_lossy(&value) {
                         OwnedValue::Array(arr) => {
                             // Real jq requires the full 8-element array — weekday and
                             // yearday included — not just the 6 fields mktime needs.
@@ -37178,10 +37264,10 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // Parse as JSON
                 let index = crate::json::JsonIndex::build(&file_bytes);
                 let cursor = index.root(&file_bytes);
-                // #1755: to_owned_checked, not to_owned -- an undecodable
+                // #1755: to_owned, not to_owned_lossy -- an undecodable
                 // value in the loaded file must raise, not silently
                 // become "".
-                match to_owned_checked(&cursor.value()) {
+                match to_owned(&cursor.value()) {
                     Ok(v) => QueryResult::Owned(v),
                     Err(e) => QueryResult::Error(e),
                 }
@@ -37239,7 +37325,7 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ///
 /// #1801: raises `EvalError::decode_failure` on an undecodable string scalar
 /// instead of silently substituting `Null`, mirroring the `StandardJson`
-/// family's own `to_owned_checked`/`owned_from_standard_json_at_depth`
+/// family's own `to_owned`/`owned_from_standard_json_at_depth`
 /// (#1746/#1755/#1620). A `Mapping` field whose *key* fails to decode now
 /// keeps both the key (via its `#1642` display fallback) and its value
 /// instead of dropping the whole field — the same pattern
@@ -37371,14 +37457,14 @@ fn builtin_combinations<W: Clone + AsRef<[u64]>>(
             for elem in *elements {
                 match elem {
                     StandardJson::Array(inner) => {
-                        // #1755: to_owned_checked, not to_owned -- an
+                        // #1755: to_owned, not to_owned_lossy -- an
                         // undecodable element must raise, not silently
                         // become "" and take part in the product.
                         // #1953: a non-decode-failure error respects
                         // `optional`, the same as the sibling `_ if
                         // optional` arms in this same match.
                         let inner_values: Vec<OwnedValue> =
-                            to_owned_checked_vec_or_suppress!(inner, optional);
+                            to_owned_vec_or_suppress!(inner, optional);
                         arrays.push(inner_values);
                     }
                     _ if optional => return QueryResult::None,
@@ -37484,13 +37570,13 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 
     // Input must be an array
-    // #1755: to_owned_checked, not to_owned -- an undecodable element must
+    // #1755: to_owned, not to_owned_lossy -- an undecodable element must
     // raise, not silently become "" and take part in the product.
     let base_array: Vec<OwnedValue> = match &value {
         StandardJson::Array(elements) => {
             // #1953: a non-decode-failure error respects `optional`, the
             // same as the sibling `_ if optional` arm below.
-            to_owned_checked_vec_or_suppress!(*elements, optional)
+            to_owned_vec_or_suppress!(*elements, optional)
         }
         _ if optional => return QueryResult::None,
         _ => return QueryResult::Error(EvalError::type_error("array", type_name(&value))),
@@ -37959,7 +38045,20 @@ fn builtin_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // Same sink, same trailing-control rule (#820).
             let (taken, flow) = each_take_n::<W, S>(expr, value.clone(), optional, n);
             let satisfied = taken.len() >= n;
-            let values: Vec<OwnedValue> = taken.into_iter().map(Item::into_owned).collect();
+            // #1989: `into_owned_checked`, not `into_owned` -- these values
+            // *are* the query's output, so an undecodable string here was
+            // emitted as `""` rather than raising (`Item::into_owned`'s own
+            // doc comment already flags that gap). Parser-unreachable today
+            // (#981) but library/`query!`-reachable, which #1972 already
+            // established is worth fixing rather than deferring.
+            let values: Vec<OwnedValue> = match taken
+                .into_iter()
+                .map(Item::into_owned_checked)
+                .collect::<Result<Vec<OwnedValue>, EvalError>>()
+            {
+                Ok(values) => values,
+                Err(e) => return suppress_or_raise(e, optional),
+            };
             match flow {
                 Flow::Stopped { .. } | Flow::Exhausted => owned_vec_to_result(values),
                 Flow::Escaped(control) => {
@@ -37987,7 +38086,13 @@ fn builtin_first_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     match each_take_first::<W, S>(expr, value, optional) {
-        Ok(Some(item)) => QueryResult::Owned(item.into_owned()),
+        // #1989: `into_owned_checked` -- this value is the query's own
+        // output, so an undecodable string must raise rather than be
+        // emitted as `""` (see `builtin_limit`'s identical conversion).
+        Ok(Some(item)) => match item.into_owned_checked() {
+            Ok(v) => QueryResult::Owned(v),
+            Err(e) => suppress_or_raise(e, optional),
+        },
         Ok(None) => QueryResult::None,
         Err(control) => control_to_result(control),
     }
@@ -38007,13 +38112,20 @@ fn builtin_last_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // #1989: the same three-arm conversion `builtin_skip` needed -- these
+    // arms used bare `to_owned_lossy`, so an undecodable string in a navigated
+    // `expr` output silently became `""` instead of raising. "Keeping the
+    // two implementations in sync" (above) is exactly what this restores:
+    // `eval_last_expr` already materializes through the checked path.
     let result = eval_single::<W, S>(expr, value, optional);
     match result {
-        QueryResult::One(v) => QueryResult::Owned(to_owned(&v)),
-        QueryResult::OneCursor(c) => QueryResult::Owned(to_owned(&c.value())),
+        QueryResult::One(v) => QueryResult::Owned(to_owned_or_suppress!(&v, optional)),
+        QueryResult::OneCursor(c) => {
+            QueryResult::Owned(to_owned_or_suppress!(&c.value(), optional))
+        }
         QueryResult::Owned(v) => QueryResult::Owned(v),
         QueryResult::Many(results) => match results.into_iter().next_back() {
-            Some(last) => QueryResult::Owned(to_owned(&last)),
+            Some(last) => QueryResult::Owned(to_owned_or_suppress!(&last, optional)),
             None => QueryResult::Owned(OwnedValue::Null),
         },
         QueryResult::ManyOwned(results) => match results.into_iter().next_back() {
@@ -38302,14 +38414,15 @@ fn delpaths_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // array, so only the first entry needs checking: `delpaths([[],[0]])` and
     // `delpaths([[0],[]])` are both `null`.
     let result = match paths.first() {
-        None => to_owned_checked(value),
+        None => to_owned(value),
         Some([]) => Ok(OwnedValue::Null),
-        Some(_) => to_owned_checked(value)
-            .and_then(|v| delete_paths_sorted(v, &paths, 0, S::TAG == EvalTag::Yq)),
+        Some(_) => {
+            to_owned(value).and_then(|v| delete_paths_sorted(v, &paths, 0, S::TAG == EvalTag::Yq))
+        }
     };
     match result {
         Ok(v) => QueryResult::Owned(v),
-        // #1746 review: a decode failure from `to_owned_checked` must bypass
+        // #1746 review: a decode failure from `to_owned` must bypass
         // `optional` the same way every other converted call site does
         // (`eval_assign`/`eval_update`/`builtin_path`/`builtin_setpath`/
         // `builtin_del` all `return QueryResult::Error(e)` unconditionally
@@ -38872,9 +38985,9 @@ fn builtin_debug<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     _optional: bool,
 ) -> QueryResult<'_, W> {
-    // #1755: to_owned_checked, not to_owned -- an undecodable value must
+    // #1755: to_owned, not to_owned_lossy -- an undecodable value must
     // raise, not silently print/pass through "" in its place.
-    let owned = match to_owned_checked(&value) {
+    let owned = match to_owned(&value) {
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
@@ -38919,7 +39032,7 @@ fn builtin_debug_msg<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     _optional: bool,
 ) -> QueryResult<'a, W> {
     // #1755: see `builtin_debug`'s identical reasoning.
-    let owned = match to_owned_checked(&value) {
+    let owned = match to_owned(&value) {
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
@@ -38992,9 +39105,9 @@ fn builtin_stderr<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     _optional: bool,
 ) -> QueryResult<'_, W> {
-    // #1755: to_owned_checked, not to_owned -- an undecodable value must
+    // #1755: to_owned, not to_owned_lossy -- an undecodable value must
     // raise, not silently print/pass through "" in its place.
-    let owned = match to_owned_checked(&value) {
+    let owned = match to_owned(&value) {
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
@@ -39079,10 +39192,10 @@ fn builtin_halt_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         None => S::DEFAULT_HALT_ERROR_CODE,
     };
 
-    // #1755: to_owned_checked, not to_owned -- an undecodable value must
+    // #1755: to_owned, not to_owned_lossy -- an undecodable value must
     // raise a normal, catchable error rather than halting the process with
     // a corrupted "" message in its place.
-    let owned = match to_owned_checked(&value) {
+    let owned = match to_owned(&value) {
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
@@ -39143,10 +39256,10 @@ fn builtin_envvar<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     // Evaluate the expression to get the variable name
     //
-    // #1820: to_owned_checked, not to_owned -- `value` (`.`, the binding
+    // #1820: to_owned, not to_owned_lossy -- `value` (`.`, the binding
     // `var` is evaluated against) used to silently become `""` on an
     // undecodable string instead of raising.
-    let owned_value = match to_owned_checked(&value) {
+    let owned_value = match to_owned(&value) {
         Ok(v) => v,
         Err(e) => return QueryResult::Error(e),
     };
@@ -39309,17 +39422,17 @@ fn builtin_transpose<W: Clone + AsRef<[u64]>>(
     };
 
     // Collect all inner arrays
-    // #1755: to_owned_checked, not to_owned -- an undecodable element must
+    // #1755: to_owned, not to_owned_lossy -- an undecodable element must
     // raise, not silently become "" and take part in the transpose.
     let mut inner_arrays: Vec<Vec<OwnedValue>> = Vec::new();
     for item in elements {
         match item {
-            StandardJson::Array(inner) => match inner.map(|v| to_owned_checked(&v)).collect() {
+            StandardJson::Array(inner) => match inner.map(|v| to_owned(&v)).collect() {
                 Ok(row) => inner_arrays.push(row),
                 Err(e) => return QueryResult::Error(e),
             },
             // Non-array elements are treated as single-element arrays
-            _ => match to_owned_checked(&item) {
+            _ => match to_owned(&item) {
                 Ok(owned) => inner_arrays.push(vec![owned]),
                 Err(e) => return QueryResult::Error(e),
             },
@@ -39398,10 +39511,10 @@ fn bsearch_one_target<W: Clone + AsRef<[u64]>>(
 
     // Collect array elements.
     //
-    // #1755: to_owned_checked, not to_owned -- an undecodable element
+    // #1755: to_owned, not to_owned_lossy -- an undecodable element
     // must raise, not silently compare as "" against the search target.
     let elements: Result<Vec<OwnedValue>, EvalError> =
-        elements_iter.map(|v| to_owned_checked(&v)).collect();
+        elements_iter.map(|v| to_owned(&v)).collect();
     let elements = match elements {
         Ok(elements) => elements,
         Err(e) => return QueryResult::Error(e),
@@ -39471,22 +39584,22 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     // Evaluate the keys expression to get the array of keys.
     //
-    // #1755: to_owned_checked, not to_owned -- an undecodable keys value
+    // #1755: to_owned, not to_owned_lossy -- an undecodable keys value
     // must raise, not silently become "" (and then fail the "must be an
     // array" check with the wrong message, or worse, silently pick/omit
     // nothing correctly-named).
-    // #2001: each `to_owned_checked` below now routes through
-    // `to_owned_checked_or_suppress` -- a non-decode-failure error (a
+    // #2001: each `to_owned` below now routes through
+    // `to_owned_or_suppress` -- a non-decode-failure error (a
     // #1194 malformed-member shape) respects `optional` the same way the
     // sibling `QueryResult::None if optional`/keys-must-be-an-array arms
     // in this same match do.
     let keys_owned = match eval_single::<W, S>(keys_expr, value.clone(), optional) {
-        QueryResult::One(v) => to_owned_checked_or_suppress!(&v, optional),
+        QueryResult::One(v) => to_owned_or_suppress!(&v, optional),
         // Defensive only: `eval_single` (unlike top-level `eval`'s own
         // `Expr::Identity` special case) never actually produces
         // `OneCursor`, so this arm is unreachable in practice today --
         // kept fallible anyway rather than assuming that stays true.
-        QueryResult::OneCursor(c) => to_owned_checked_or_suppress!(&c.value(), optional),
+        QueryResult::OneCursor(c) => to_owned_or_suppress!(&c.value(), optional),
         QueryResult::Owned(v) => v,
         QueryResult::ManyOwned(v) if !v.is_empty() => v.into_iter().next().unwrap(),
         QueryResult::ManyOwned(_) => {
@@ -39500,7 +39613,7 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             return QueryResult::Error(EvalError::new("pick: keys expression produced no output"))
         }
         QueryResult::Many(v) if !v.is_empty() => {
-            to_owned_checked_or_suppress!(&v.into_iter().next().unwrap(), optional)
+            to_owned_or_suppress!(&v.into_iter().next().unwrap(), optional)
         }
         QueryResult::Many(_) => {
             return QueryResult::Error(EvalError::new("pick: keys expression produced no output"))
@@ -39598,14 +39711,14 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         return QueryResult::Error(EvalError::colliding_display_key(k));
                     }
                     if let Some((_, field)) = found {
-                        // #1755: to_owned_checked, not to_owned
+                        // #1755: to_owned, not to_owned_lossy
                         // -- an undecodable picked value must
                         // raise, not silently become "".
                         // #2001: ...or_suppress -- a #1194 malformed-member
                         // error nested inside the picked value must respect
                         // `optional`, matching this function's own
                         // `keys_owned` conversion above (#2010).
-                        let owned = to_owned_checked_or_suppress!(&field.value, optional);
+                        let owned = to_owned_or_suppress!(&field.value, optional);
                         result.insert(k.clone(), owned);
                     }
                     // If key not found, yq silently skips it
@@ -39632,11 +39745,11 @@ fn builtin_pick<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 let actual_idx = if idx < 0 { len + idx } else { idx };
 
                 if actual_idx >= 0 && actual_idx < len {
-                    // #1755: to_owned_checked, not to_owned -- an
+                    // #1755: to_owned, not to_owned_lossy -- an
                     // undecodable picked element must raise, not silently
                     // become "".
                     // #2001: ...or_suppress -- see the Object arm above.
-                    let owned = to_owned_checked_or_suppress!(&arr[actual_idx as usize], optional);
+                    let owned = to_owned_or_suppress!(&arr[actual_idx as usize], optional);
                     result.push(owned);
                 }
                 // If index out of bounds, yq silently skips it
@@ -39661,20 +39774,20 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     // Evaluate the keys expression to get the array of keys to omit.
     //
-    // #1755: to_owned_checked, not to_owned -- an undecodable keys value
+    // #1755: to_owned, not to_owned_lossy -- an undecodable keys value
     // must raise, not silently become "" (and then fail the "must be an
     // array" check with the wrong message, or worse, silently omit
     // nothing correctly-named).
-    // #2001: each `to_owned_checked` below now routes through
-    // `to_owned_checked_or_suppress` -- mirrors `pick`'s own identical fix
+    // #2001: each `to_owned` below now routes through
+    // `to_owned_or_suppress` -- mirrors `pick`'s own identical fix
     // (#2010) for this same match shape.
     let keys_owned = match eval_single::<W, S>(keys_expr, value.clone(), optional) {
-        QueryResult::One(v) => to_owned_checked_or_suppress!(&v, optional),
+        QueryResult::One(v) => to_owned_or_suppress!(&v, optional),
         // Defensive only: `eval_single` (unlike top-level `eval`'s own
         // `Expr::Identity` special case) never actually produces
         // `OneCursor`, so this arm is unreachable in practice today --
         // kept fallible anyway rather than assuming that stays true.
-        QueryResult::OneCursor(c) => to_owned_checked_or_suppress!(&c.value(), optional),
+        QueryResult::OneCursor(c) => to_owned_or_suppress!(&c.value(), optional),
         QueryResult::Owned(v) => v,
         QueryResult::ManyOwned(v) if !v.is_empty() => v.into_iter().next().unwrap(),
         QueryResult::ManyOwned(_) => {
@@ -39688,7 +39801,7 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             return QueryResult::Error(EvalError::new("omit: keys expression produced no output"))
         }
         QueryResult::Many(v) if !v.is_empty() => {
-            to_owned_checked_or_suppress!(&v.into_iter().next().unwrap(), optional)
+            to_owned_or_suppress!(&v.into_iter().next().unwrap(), optional)
         }
         QueryResult::Many(_) => {
             return QueryResult::Error(EvalError::new("omit: keys expression produced no output"))
@@ -39751,11 +39864,11 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     if !guard.check(&result, &key, is_fallback) {
                         return QueryResult::Error(EvalError::colliding_display_key(&key));
                     }
-                    // #1755: to_owned_checked, not to_owned -- an
+                    // #1755: to_owned, not to_owned_lossy -- an
                     // undecodable kept value must raise, not
                     // silently become "".
                     // #2001: ...or_suppress -- see `pick`'s identical fix.
-                    let owned = to_owned_checked_or_suppress!(&field.value, optional);
+                    let owned = to_owned_or_suppress!(&field.value, optional);
                     result.insert(key.into_owned(), owned);
                 }
             }
@@ -39778,7 +39891,7 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 .filter_map(|k| resolve_read_index(k, arr.len()))
                 .collect();
 
-            // #1755: to_owned_checked, not to_owned -- an undecodable kept
+            // #1755: to_owned, not to_owned_lossy -- an undecodable kept
             // element must raise, not silently become "".
             // #2001: routed through `suppress_or_raise` -- see
             // `eval_single`'s own `Expr::Slice` array arm above for why
@@ -39787,7 +39900,7 @@ fn builtin_omit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| !omit_indices.contains(i))
-                .map(|(_, v)| to_owned_checked(v))
+                .map(|(_, v)| to_owned(v))
                 .collect::<Result<Vec<OwnedValue>, EvalError>>()
             {
                 Ok(result) => QueryResult::Owned(OwnedValue::Array(result)),
@@ -39925,11 +40038,10 @@ fn builtin_shuffle<W: Clone + AsRef<[u64]>>(
 
     match value {
         StandardJson::Array(elements) => {
-            // #1755: to_owned_checked, not to_owned -- an undecodable
+            // #1755: to_owned, not to_owned_lossy -- an undecodable
             // element must raise, not silently become "" and get shuffled
             // in as if it were the real value.
-            let mut items: Vec<OwnedValue> = match elements.map(|e| to_owned_checked(&e)).collect()
-            {
+            let mut items: Vec<OwnedValue> = match elements.map(|e| to_owned(&e)).collect() {
                 Ok(v) => v,
                 Err(e) => return QueryResult::Error(e),
             };
@@ -39971,10 +40083,10 @@ fn builtin_pivot<W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => {
-            // #1755: to_owned_checked, not to_owned -- an undecodable
+            // #1755: to_owned, not to_owned_lossy -- an undecodable
             // element must raise, not silently become "" and get pivoted
             // in as if it were the real value.
-            let items: Vec<OwnedValue> = match elements.map(|e| to_owned_checked(&e)).collect() {
+            let items: Vec<OwnedValue> = match elements.map(|e| to_owned(&e)).collect() {
                 Ok(v) => v,
                 Err(e) => return QueryResult::Error(e),
             };
@@ -40242,7 +40354,7 @@ fn try_pattern_alternatives<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             ),
         );
 
-        // #2027: the `One`/`Many` arms' bare `to_owned` below looked like a
+        // #2027: the `One`/`Many` arms' bare `to_owned_lossy` below looked like a
         // live silent-corruption gap (the same #1746/#1755 shape fixed
         // elsewhere in this file) but is confirmed CLI-unreachable, not
         // merely untested. `eval_generic.rs`'s eager `eval_single` has no
@@ -40250,7 +40362,7 @@ fn try_pattern_alternatives<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // as-binding query reaches this function only via that module's
         // wildcard `_` bridge, which calls `to_owned_with_cursor` -- a
         // genuinely fallible, `EvalError`-raising conversion, not this
-        // file's own infallible `to_owned` -- on the *whole* ambient value
+        // file's own infallible `to_owned_lossy` -- on the *whole* ambient value
         // before `full_eval` ever hands control to `eval_as_pattern`. That
         // upstream conversion recursively decodes every string reachable
         // from the ambient value (everything `body` could possibly
@@ -40267,12 +40379,12 @@ fn try_pattern_alternatives<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // elsewhere.
         match eval_single::<W, S>(&substituted_body, value.clone(), optional).materialize_cursor() {
             QueryResult::One(v) => {
-                carried.push(to_owned(&v));
+                carried.push(to_owned_lossy(&v));
                 return Ok((carried, None));
             }
             QueryResult::OneCursor(_) => unreachable!(),
             QueryResult::Many(vs) => {
-                carried.extend(vs.iter().map(to_owned));
+                carried.extend(vs.iter().map(to_owned_lossy));
                 return Ok((carried, None));
             }
             QueryResult::Owned(v) => {
@@ -41882,7 +41994,7 @@ mod tests {
     /// `*`/`*=` merge-flag suffixes (#713). The document is still built via
     /// `JsonIndex`: arithmetic/merge operate purely on `OwnedValue` after
     /// document conversion, so JSON input exercises the same code path YAML
-    /// input would (see `eval_generic.rs`'s `to_owned` conversion).
+    /// input would (see `eval_generic.rs`'s `to_owned_at_depth` conversion).
     ///
     /// Always parses with jq extensions enabled: this macro tests
     /// *evaluator* semantics under `YqSemantics`, not the parser's default
@@ -41902,7 +42014,7 @@ mod tests {
     }
 
     /// #1755: the sort/unique/group_by/min/max family of builtins
-    /// (`eval.rs`'s own `to_owned`-based materialization, reachable only
+    /// (`eval.rs`'s own `to_owned_lossy`-based materialization, reachable only
     /// through the public `succinctly::jq::eval` library API, not the
     /// CLI's `eval_generic.rs` bridge, same as #1746's original finding)
     /// silently substituted an empty string for an undecodable element
@@ -41944,7 +42056,7 @@ mod tests {
 
     /// #1755 positive control: the sort family's normal (no decode
     /// failure) behavior is unaffected by routing through
-    /// `to_owned_checked` instead of `to_owned` -- exercised directly via
+    /// `to_owned` instead of `to_owned_lossy` -- exercised directly via
     /// this module's own library-API dispatch (not the CLI, which never
     /// reaches these functions at all, only `eval_generic.rs`'s sibling
     /// implementation) since that's the only reachable path for them.
@@ -42008,7 +42120,7 @@ mod tests {
     }
 
     /// #1932: `eval_single`'s `Expr::Slice` arm, in the
-    /// `StandardJson::Array` case, used an unchecked `to_owned` per element
+    /// `StandardJson::Array` case, used an unchecked `to_owned_lossy` per element
     /// instead of `promote_borrowed_checked` -- the same #1755 bug shape
     /// already fixed for the adjacent `StandardJson::Object` arm a few
     /// lines below, missed on the array arm at the time. Exercised via
@@ -42062,7 +42174,7 @@ mod tests {
     /// (`matches!(start, None|Some(0)) && end.is_none()`) returns the
     /// target's original borrowed, undecoded array unchanged, so this
     /// function's own consumer of that `QueryResult::One(v)` used the
-    /// unchecked `to_owned` instead of `to_owned_checked`.
+    /// unchecked `to_owned_lossy` instead of `to_owned`.
     ///
     /// Exercised via `eval.rs`'s own library-API dispatch (`query!`).
     /// `succinctly jq`/`yq`'s primary dynamic-slice dispatch is
@@ -42102,7 +42214,7 @@ mod tests {
         );
     }
 
-    /// #1953: `to_owned_checked`'s `Err` can carry a #1194 malformed-member
+    /// #1953: `to_owned`'s `Err` can carry a #1194 malformed-member
     /// error (a trailing unpaired object member, e.g. `{"a":1,"b"}`), which
     /// is not `is_decode_failure()`-tagged. Confirmed here (via a plain,
     /// un-suppressed `.c = 5` reachable straight through the CLI) that the
@@ -42117,7 +42229,7 @@ mod tests {
         );
     }
 
-    /// #1953: the seven `to_owned_checked` call sites tested individually
+    /// #1953: the seven `to_owned` call sites tested individually
     /// below all propagated this non-decode-failure error unconditionally,
     /// ignoring `optional`, before this fix -- diverging from an adjacent
     /// sibling arm at the very same boundary in every case.
@@ -42169,7 +42281,7 @@ mod tests {
     /// found by code review as a sibling site missed at the time. `end:
     /// Some(1)` (rather than the `Object` arm test's `None, None`) so the
     /// array fast-path (`start: None|Some(0) && end: None` -- an identity
-    /// slice, returned without ever calling `to_owned_checked`) isn't
+    /// slice, returned without ever calling `to_owned`) isn't
     /// taken. Checked under both semantics (code review, #2001): the arm's
     /// own lack of an `S::TAG` gate means a future edit that *adds* one
     /// could silently regress either mode while a single-mode test stayed
@@ -42205,7 +42317,7 @@ mod tests {
     /// Some(0), end: None` so the inner `eval_single` call takes the
     /// fully-open-bound fast path (returning the target's original
     /// borrowed value unconverted) and reaches this function's own
-    /// `to_owned_checked` call, not `eval_single`'s.
+    /// `to_owned` call, not `eval_single`'s.
     #[test]
     fn test_eval_slice_expr_borrowed_respects_optional_for_malformed_member_error_2001() {
         let json_bytes: &[u8] = br#"[{"x":1,"y"},2,3]"#;
@@ -42387,7 +42499,7 @@ mod tests {
     /// the value/element conversion each performs once a requested
     /// key/index actually matches -- PR #2010 migrated `pick`'s own
     /// *keys-expression* conversion (the `keys_owned` match) to
-    /// `to_owned_checked_or_suppress!` but left its two per-match value
+    /// `to_owned_or_suppress!` but left its two per-match value
     /// conversions (Object arm's `field.value`, Array arm's indexed
     /// element) on the raw unconditional pattern, and didn't touch `omit`
     /// at all -- `omit` mirrors `pick` exactly (same `keys_owned` match
@@ -42556,7 +42668,7 @@ mod tests {
     }
 
     /// #1953 continued: the `until`/`while`/`repeat`/`walk` loop family's
-    /// starting-value `to_owned_checked` sites had the same unconditional-
+    /// starting-value `to_owned` sites had the same unconditional-
     /// regardless-of-`optional` gap the seven sites above already closed.
     /// See `test_eval_single_yq_slice_respects_optional_for_malformed_member_error_1953`'s
     /// doc comment for why these are exercised via direct calls rather than
@@ -42828,7 +42940,7 @@ mod tests {
     }
 
     /// #2015: `builtin_upper_in` (`IN(s)`) hardcoded `_optional` unused and
-    /// called `to_owned_checked` unconditionally, unlike its sibling `any`/
+    /// called `to_owned` unconditionally, unlike its sibling `any`/
     /// `all` (`any_all_gen_cond`, fixed by #2001 immediately above) despite
     /// `IN(s)`'s own doc comment defining it as literally `any(s == .; .)`.
     /// Verified against real jq 1.7.1 that `IN`/`any`/`recurse` all just get
@@ -42860,7 +42972,7 @@ mod tests {
     /// #2015 code review: `test_builtin_upper_in_respects_optional_for_malformed_member_error_2015`
     /// above exercises only the *first* of `builtin_upper_in`'s two
     /// `optional`-wiring points -- its malformed root `value` makes
-    /// `to_owned_checked_or_suppress!` return before `s` (the identity
+    /// `to_owned_or_suppress!` return before `s` (the identity
     /// expression there) is ever evaluated by `eval_each_owned`, so a
     /// revert of that second call's `optional` argument back to hardcoded
     /// `false` still passes every `_2015` test above (verified by hand:
@@ -42890,7 +43002,7 @@ mod tests {
     }
 
     /// #2015: a genuine decode failure must still survive `optional` here
-    /// too -- `IN(s)`'s fix routes through `to_owned_checked_or_suppress!`,
+    /// too -- `IN(s)`'s fix routes through `to_owned_or_suppress!`,
     /// which (like every other site sharing that macro) never suppresses
     /// `is_decode_failure()`, only the #1194 malformed-member class above.
     #[test]
@@ -43018,7 +43130,7 @@ mod tests {
     }
 
     /// #2001 (code review): `builtin_pick`'s keys-expression conversion has
-    /// *three* `to_owned_checked_or_suppress` sites -- `One`, `OneCursor`
+    /// *three* `to_owned_or_suppress` sites -- `One`, `OneCursor`
     /// (parser-unreachable, not covered here), and `Many` (reached by a
     /// multi-output keys expression, which `pick`/`omit` take only the
     /// first output of). The `One`-arm test above never exercises this one.
@@ -43029,7 +43141,7 @@ mod tests {
     /// [])`: both operands there stay cursor-backed, so `eval_comma`
     /// aggregates them into `QueryResult::Many` without materializing
     /// either upfront, letting `builtin_pick`'s own `Many` arm be the first
-    /// place `to_owned_checked` runs on the malformed `.k1`. A literal
+    /// place `to_owned` runs on the malformed `.k1`. A literal
     /// operand like `[]` forces an earlier, unconditional owned-conversion
     /// inside `eval_comma` itself before `builtin_pick` ever sees a
     /// `Many`/`ManyOwned` result -- confirmed empirically: that shape
@@ -43079,7 +43191,7 @@ mod tests {
     }
 
     /// #2022: object construction's computed-key slot fed its key generator's
-    /// output through `stream_outputs` (bare `to_owned`, via `collect_owned`),
+    /// output through `stream_outputs` (bare `to_owned_lossy`, via `collect_owned`),
     /// silently substituting `""` for an undecodable key instead of raising --
     /// the same #1746/#1972 shape already fixed at the sibling call sites
     /// above, unreachable here only because `stream_outputs` (not
@@ -43202,7 +43314,7 @@ mod tests {
     /// instead of raising. Confirmed dead ends investigated alongside this:
     /// `has`/`contains`/`getpath`/`index`/`inside`/`setpath`/`delpaths`/`in`
     /// each already raise (either their own independent root-level
-    /// `to_owned_checked` happens to cover the same corrupted document, or a
+    /// `to_owned` happens to cover the same corrupted document, or a
     /// type mismatch masks it before content ever matters), and bare
     /// `limit`/`first`/`last` return lazily. Fixed via
     /// `Item::into_owned_checked`, the same helper #1976 introduced.
@@ -43227,7 +43339,7 @@ mod tests {
 
     /// #1755: the `_by` variants convert twice per item -- once for the
     /// key filter's own output (`eval_array_construction`), once for the
-    /// item itself (whole-value `to_owned_checked`). A key filter that
+    /// item itself (whole-value `to_owned`). A key filter that
     /// avoids the malformed field (`.a` on `{"a":1,"b":"\xff\xfe"}`)
     /// decodes fine, so this only reaches the *second* conversion's own
     /// `Err` arm -- distinct coverage from
@@ -43348,7 +43460,7 @@ mod tests {
     /// its type-error operand from the *whole* input object, not just the
     /// fields the key filter actually touches -- so a malformed field
     /// outside the key filter's reach (`.y` here, with the filter reading
-    /// only `.x`) used to be silently dropped by unchecked `to_owned`
+    /// only `.x`) used to be silently dropped by unchecked `to_owned_lossy`
     /// instead of raising.
     #[test]
     fn test_by_variants_object_input_raises_on_untouched_field_decode_failure_1755() {
@@ -43377,7 +43489,7 @@ mod tests {
     /// #1755: `eval_array_construction` (backs literal `[...]` array
     /// construction's homogeneous-comma case, and every `min_by`/
     /// `max_by`/`sort_by`/`group_by`/`unique_by` key computation via jq's
-    /// own `[f]` desugaring) shared the same unguarded `to_owned` bug,
+    /// own `[f]` desugaring) shared the same unguarded `to_owned_lossy` bug,
     /// found while fixing this file's sort-family siblings above --
     /// their own fix alone left this shared helper's key computation
     /// unguarded, so a decode failure on a *non-winning* comparison
@@ -43497,7 +43609,7 @@ mod tests {
     }
 
     /// #1832: `eval_comma`'s terminal-control arms (`Error`/`Break`/`Halt`/
-    /// `Partial`) shared the identical unchecked-`to_owned` promotion bug
+    /// `Partial`) shared the identical unchecked-`to_owned_lossy` promotion bug
     /// #1790 fixed for the main promotion path, just reached via
     /// `merge_owned` (now `resolve_terminal_prefix`) instead of
     /// `push_promoted`/`promote_borrowed_checked` directly -- an
@@ -43584,7 +43696,7 @@ mod tests {
     }
 
     /// #1897: `eval_index_expr`'s `KeyTargets::Borrowed` arm had the same
-    /// unchecked-`to_owned` shape as #1832 already fixed elsewhere -- an
+    /// unchecked-`to_owned_lossy` shape as #1832 already fixed elsewhere -- an
     /// undecodable value already accumulated in `out` from an earlier key
     /// must raise `EvalError::decode_failure` when a later key's own index
     /// error forces the prefix, not silently become `""`.
@@ -43727,7 +43839,7 @@ mod tests {
 
     /// #1755 positive control: valid data through each of the comparison-key
     /// family's dispatch points is unaffected by routing through
-    /// `to_owned_checked`.
+    /// `to_owned`.
     #[test]
     fn test_comparison_key_family_valid_data_unaffected_1755() {
         query!(br#""a""#, "in({\"a\":1})",
@@ -43755,7 +43867,7 @@ mod tests {
             QueryResult::Owned(v) => { assert_eq!(v, OwnedValue::Int(1)); }
         );
         query!(br#"{"a":1,"k":"a"}"#, ".[.k]",
-            QueryResult::One(v) => { assert_eq!(to_owned(&v), OwnedValue::Int(1)); }
+            QueryResult::One(v) => { assert_eq!(to_owned_lossy(&v), OwnedValue::Int(1)); }
         );
         query!(br#"{"a":[1,2,3],"n":1}"#, ".a[(.n):]",
             QueryResult::Owned(OwnedValue::Array(v)) => {
@@ -43767,7 +43879,7 @@ mod tests {
         );
         query!(br#"{"a":1,"b":2,"keys":["a","b"]}"#, ".[(.keys[])]",
             QueryResult::Many(vs) => {
-                assert_eq!(vs.iter().map(to_owned).collect::<Vec<_>>(), vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+                assert_eq!(vs.iter().map(to_owned_lossy).collect::<Vec<_>>(), vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
             }
         );
     }
@@ -43888,7 +44000,7 @@ mod tests {
 
     /// #1755 positive control: valid data through each of the "direct"
     /// bucket's dispatch points is unaffected by routing through
-    /// `to_owned_checked`.
+    /// `to_owned`.
     #[test]
     fn test_direct_misc_family_valid_data_unaffected_1755() {
         query!(br#"["a","b"]"#, "add",
@@ -43979,7 +44091,7 @@ mod tests {
 
     /// #1755: `/code-review` found `pick`/`omit`'s *keys-expression*
     /// resolution (as opposed to the picked/kept value, already fixed)
-    /// still used unchecked `to_owned` -- an undecodable string inside a
+    /// still used unchecked `to_owned_lossy` -- an undecodable string inside a
     /// dynamically-computed keys argument silently became "" instead of
     /// raising, which could then silently pick/omit the wrong
     /// (empty-string-named) field entirely rather than erroring.
@@ -44000,7 +44112,7 @@ mod tests {
         // `QueryResult::One` case above -- and `pick`/`omit` take only the
         // *first* output (`v.into_iter().next()`), so a malformed field
         // must be the first of the two to actually reach that arm's own
-        // `to_owned_checked` call.
+        // `to_owned` call.
         query!(
             &b"{\"a\":1,\"k1\":[\"\xff\xfe\"],\"k2\":[\"b\"]}"[..],
             "pick((.k1,.k2))",
@@ -44013,7 +44125,7 @@ mod tests {
         );
         // A fully-valid multi-output keys expression (`(.k1, .k2)`) still
         // reaches `keys_owned`'s `QueryResult::Many` arm and its own
-        // `to_owned_checked` success path -- distinct from the
+        // `to_owned` success path -- distinct from the
         // decode-failure case above.
         query!(
             &b"{\"a\":1,\"b\":2,\"k1\":[\"a\"],\"k2\":[\"c\"]}"[..],
@@ -44127,7 +44239,7 @@ mod tests {
     }
 
     /// #1829: `leaf_paths` shares `paths`'s own #1642/#1194 fix (both call
-    /// through the same `to_owned`-vs-`to_owned_checked` fix at their root
+    /// through the same `to_owned_lossy`-vs-`to_owned` fix at their root
     /// materialization step) -- previously silently dropped an undecodable
     /// key's path instead of raising or preserving it via its fallback
     /// spelling.
@@ -44237,7 +44349,7 @@ mod tests {
 
     /// #1755: `until`/`while`/`repeat`/`recurse(f)`/`recurse(f;cond)`/
     /// `walk`/`tostream` all convert their starting value once, upfront,
-    /// via a single `to_owned` call feeding the whole traversal -- an
+    /// via a single `to_owned_lossy` call feeding the whole traversal -- an
     /// undecodable value must raise there, not silently become `""` and
     /// get visited/output/streamed as if it were the real value. `until`/
     /// `while`/`walk` also route through `finish_fork`, whose own
@@ -44265,7 +44377,7 @@ mod tests {
 
     /// #1755 positive control: valid data through each of the recurse/walk
     /// family's dispatch points is unaffected by routing through
-    /// `to_owned_checked`.
+    /// `to_owned`.
     #[test]
     fn test_recurse_walk_family_valid_data_unaffected_1755() {
         query!(br"1", "until(.>=3; .+1)",
@@ -44302,11 +44414,11 @@ mod tests {
     }
 
     /// #1820: category 1 of the follow-up audit that found more genuine
-    /// `to_owned` instances of #1755's shape than the misc-bucket slice's
+    /// `to_owned_lossy` instances of #1755's shape than the misc-bucket slice's
     /// own named scope covered. Each case is a scalar-fallback or
     /// whole-value conversion this audit found unguarded; grouped into one
     /// test since each is a one-line repro of the identical pattern
-    /// (`scalar_decode_failure`/`to_owned_checked` now guards it) rather
+    /// (`scalar_decode_failure`/`to_owned` now guards it) rather
     /// than a materially different behavior needing its own test.
     ///
     /// `builtin_paths`/`each_paths_filter`/`builtin_leaf_paths` -- three of
@@ -44320,7 +44432,7 @@ mod tests {
     /// multi-round review found both were never actually #1755-shaped bugs
     /// in the first place (see `test_not_and_truncate_stream_depth_never_
     /// need_decoding_1820` below for why, and for the container-shaped
-    /// regression an initial `to_owned_checked`-based fix introduced).
+    /// regression an initial `to_owned`-based fix introduced).
     #[test]
     fn test_to_owned_decode_failure_sweep_1820() {
         // eval_single, Expr::Iterate arm: `.[]` on an undecodable-string
@@ -44413,8 +44525,8 @@ mod tests {
     }
 
     /// #1820: `eval_not` and `builtin_truncate_stream`'s depth conversion
-    /// were both initially "fixed" by swapping their `to_owned` for
-    /// `to_owned_checked`, matching every other site in this sweep -- but a
+    /// were both initially "fixed" by swapping their `to_owned_lossy` for
+    /// `to_owned`, matching every other site in this sweep -- but a
     /// multi-round review found neither is actually reachable through
     /// #1755's bug shape at all, and the naive swap introduced a *new*
     /// regression instead: both only ever consult a value's outer type,
@@ -44457,9 +44569,9 @@ mod tests {
     /// neither function reads at all -- e.g. a `gmtime`-shaped array's
     /// unused weekday/yearday tail -- must not fail a conversion that
     /// would otherwise succeed. An initial fix recursively decode-checked
-    /// the whole array via `to_owned_checked` and regressed exactly this;
+    /// the whole array via `to_owned` and regressed exactly this;
     /// both now use `scalar_decode_failure` (checks only the top-level
-    /// value itself) ahead of a plain, unchecked `to_owned`.
+    /// value itself) ahead of a plain, unchecked `to_owned_lossy`.
     #[test]
     fn test_mktime_strftime_ignore_undecodable_unread_tail_elements_1820() {
         // mktime only reads indices 0..=5; index 6 (an 8-element,
@@ -44920,7 +45032,7 @@ mod tests {
     /// `builtin_envvar_propagates_halt_from_variable_name_expression`).
     /// `keys` on a non-container value reaches `scalar_fallback`, which
     /// raises a decode failure straight from `input`'s own evaluation --
-    /// distinct from `to_owned_checked` materializing an already-produced
+    /// distinct from `to_owned` materializing an already-produced
     /// `One`/`Many`, which the #1902 tests above already cover.
     #[test]
     fn test_eval_reduce_and_foreach_bare_error_arms_exclude_decode_failure_1934() {
@@ -44980,16 +45092,15 @@ mod tests {
     }
 
     /// #1934 item 3: `eval_reduce`'s `input` arm treated *every*
-    /// `to_owned_checked`/`promote_borrowed_checked` failure as
+    /// `to_owned`/`promote_borrowed_checked` failure as
     /// unconditionally fatal, including a non-decode-failure error (a
     /// #1194 malformed-member error) that the sibling bare
     /// `QueryResult::Error` arm a few lines below already respects
     /// `optional` for. `{"a":1,"b"}` is a trailing unpaired object member
     /// JSON's own semi-index accepts (#1194) -- `.` (identity) surfaces it
-    /// as-is, and `to_owned_checked` raises on the full walk.
+    /// as-is, and `to_owned` raises on the full walk.
     #[test]
-    fn test_eval_reduce_input_to_owned_checked_error_respects_optional_unless_decode_failure_1934()
-    {
+    fn test_eval_reduce_input_to_owned_error_respects_optional_unless_decode_failure_1934() {
         let json: &[u8] = br#"{"a":1,"b"}"#;
         let index = JsonIndex::build(json);
         let root = index.root(json);
@@ -45025,7 +45136,7 @@ mod tests {
     }
 
     /// Sibling of the test above for the `QueryResult::Many` arm
-    /// (`promote_borrowed_checked`, not `to_owned_checked`): `.[]` always
+    /// (`promote_borrowed_checked`, not `to_owned`): `.[]` always
     /// returns `Many`, even for a single-element array, so iterating over
     /// one malformed-member object exercises the exact arm the `One`-only
     /// repro above cannot reach.
@@ -45125,7 +45236,7 @@ mod tests {
     /// `eval_pipe`'s path-context entry, `combinations`/`combinations(n)`,
     /// `debug`/`debug(msg)`/`stderr`/`halt_error`, `transpose`, `shuffle`,
     /// and `pivot` all convert their starting value (or an element of it)
-    /// via a single `to_owned` call -- an undecodable value must raise
+    /// via a single `to_owned_lossy` call -- an undecodable value must raise
     /// there, not silently become `""` and feed the rest of the builtin as
     /// if it were the real value.
     #[test]
@@ -45178,7 +45289,7 @@ mod tests {
     }
 
     /// #1755 code review: an earlier version of `any_all_f`'s own fix
-    /// eagerly `to_owned_checked`-collected every element into a `Vec`
+    /// eagerly `to_owned`-collected every element into a `Vec`
     /// before `cond` ever probed any of them, so a decode failure past
     /// the deciding element aborted a call that should have
     /// short-circuited before reaching it. Oracle-verified: `[1,
@@ -45209,7 +45320,7 @@ mod tests {
     /// promotes its whole batch from lazily-borrowed cursors to an owned
     /// `Vec` the moment any sibling forces an owned result -- an earlier
     /// version of this slice's fix left that promotion step on unchecked
-    /// `to_owned`, so `.[] | (if type == "string" then . else . + 0 end)`
+    /// `to_owned_lossy`, so `.[] | (if type == "string" then . else . + 0 end)`
     /// on `["\xff\xfe", 1]` silently returned `ManyOwned([String(""),
     /// Int(1)])` instead of raising.
     #[test]
@@ -45288,7 +45399,7 @@ mod tests {
 
     /// #1755 positive control: valid data through each of the misc
     /// bucket's dispatch points is unaffected by routing through
-    /// `to_owned_checked`.
+    /// `to_owned`.
     #[test]
     fn test_misc_bucket_valid_data_unaffected_1755() {
         query!(br#"[{"a":1},{"a":2}]"#, "INDEX(.a)",
@@ -45359,10 +45470,10 @@ mod tests {
     /// private function rather than through `+=`/etc, since both real
     /// callers (`eval_compound_assign`/`eval_alternative_assign`)
     /// immediately re-materialize the whole document via
-    /// `eval_update_multi`'s own `to_owned_checked(&input)` right after,
+    /// `eval_update_multi`'s own `to_owned(&input)` right after,
     /// masking this fix at the integration level whenever the RHS value
     /// comes from the same document (the only way it *can* come from a
-    /// `StandardJson` cursor at all -- `to_owned_checked` fails fast on
+    /// `StandardJson` cursor at all -- `to_owned` fails fast on
     /// any undecodable string anywhere in the tree it converts, so the
     /// whole-document pristine conversion independently catches it too).
     /// This test is what actually exercises the fixed line.
@@ -45547,7 +45658,7 @@ mod tests {
         );
     }
 
-    /// #2023: `item_to_owned`'s bare `to_owned` -- `fanout_arg`'s lazy sink
+    /// #2023: `item_to_owned`'s bare `to_owned_lossy` -- `fanout_arg`'s lazy sink
     /// for a generator-argument builtin's ArgFanout::All path (`test`,
     /// `match`, `capture`, `scan`, `ltrimstr`, `has`, ...) -- silently
     /// substituted an undecodable *argument* value with `""` instead of
@@ -45610,7 +45721,7 @@ mod tests {
     /// This case pins the *inner* (path) slot specifically for `setpath`:
     /// an "outer" (value) case (`setpath(["x"]; .b)`) is *not* a valid test
     /// for `setpath` specifically -- review found `builtin_setpath`'s own
-    /// body (#1953) separately runs `to_owned_checked` over the *whole*
+    /// body (#1953) separately runs `to_owned` over the *whole*
     /// ambient document before ever writing, so it already raises the same
     /// decode failure on `.b` regardless of whether this fix's own
     /// outer-slot code path does anything, passing identically with the fix
@@ -45674,7 +45785,7 @@ mod tests {
     /// `nth`'s `body` is `.[n]`, so `n=0` decodes cleanly (`1`, buffered as
     /// `pending_first`) while `n=1` indexes the undecodable array element --
     /// flushing the buffered `1` first (line ~2307, the `pending_first`
-    /// flush, itself already safe -- an `Int` never fails `to_owned_checked`)
+    /// flush, itself already safe -- an `Int` never fails `to_owned`)
     /// then reaching the `else` push at line ~2325, this fix's target.
     /// Pre-fix this gave `ManyOwned([Int(1), String("")])` (silent `""`
     /// substitution for the second, undecodable element); post-fix it raises
@@ -45760,7 +45871,7 @@ mod tests {
     }
 
     /// #2188 (found during the #1989 audit): `builtin_fromstream`'s
-    /// `collect_owned`-based fallback arm used bare `to_owned` for the
+    /// `collect_owned`-based fallback arm used bare `to_owned_lossy` for the
     /// events it collects, silently substituting `""` for an undecodable
     /// event leaf instead of raising. `{"events":[[[],"<bad>"]]}` gives
     /// `.events[]` a single tostream-shaped `[path, leaf]` event with an
@@ -46092,7 +46203,7 @@ mod tests {
             other => unreachable!("via_cursor only covers Identity/Field/Index, got {other:?}"),
         };
         match result {
-            QueryResult::One(v) => Ok(Some(to_owned(&v))),
+            QueryResult::One(v) => Ok(Some(to_owned_lossy(&v))),
             QueryResult::None => Ok(None),
             QueryResult::Error(e) => Err(e),
             other => panic!("unexpected result from via_cursor: {other:?}"),
@@ -46423,7 +46534,7 @@ mod tests {
         // the borrowed fast path is taken.
         query!(br#"{"a": 1, "b": 2}"#, ".a, .b",
             QueryResult::Many(values) => {
-                let rendered: Vec<String> = values.iter().map(|v| to_owned(v).to_json()).collect();
+                let rendered: Vec<String> = values.iter().map(|v| to_owned_lossy(v).to_json()).collect();
                 assert_eq!(rendered, ["1", "2"]);
             }
         );
@@ -46477,7 +46588,7 @@ mod tests {
     }
 
     /// #1832: `eval_fanout`'s own main promotion path (the `Owned`/
-    /// `ManyOwned` arms) had the identical unchecked-`to_owned` bug shape
+    /// `ManyOwned` arms) had the identical unchecked-`to_owned_lossy` bug shape
     /// #1755/#1790 already fixed for `eval_pipe`/`eval_comma` -- an
     /// undecodable *earlier* branch (`.a`, borrowed) never gets checked
     /// before a *later* owned branch (`1`) forces the whole batch to
@@ -47120,7 +47231,7 @@ mod tests {
     fn test_computed_index_ordinary_cross_product_unaffected_1634() {
         query!(br#"{"a":1,"b":2}"#, r#".[("a","b")]"#,
             QueryResult::Many(vs) => {
-                let values: Vec<OwnedValue> = vs.iter().map(to_owned).collect();
+                let values: Vec<OwnedValue> = vs.iter().map(to_owned_lossy).collect();
                 assert_eq!(values, vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
             }
         );
@@ -48873,7 +48984,7 @@ mod tests {
     }
 
     /// #1908 (#1820 Category 2): `prepend` -- the function backing
-    /// `try`/`catch`'s output-prefix splicing -- used unchecked `to_owned`
+    /// `try`/`catch`'s output-prefix splicing -- used unchecked `to_owned_lossy`
     /// on the catch handler's own result, silently substituting `""` for an
     /// undecodable string instead of raising `EvalError::decode_failure`.
     ///
@@ -49251,10 +49362,10 @@ mod tests {
     #[test]
     fn eval_error_msg_expr_raises_decode_failure_1907() {
         // #1907 item 1: `error(msg)`'s `Some(msg_expr)` branch used to
-        // materialize `msg` via the unchecked `to_owned`, silently
+        // materialize `msg` via the unchecked `to_owned_lossy`, silently
         // substituting `""` for an undecodable string instead of raising its
         // own decode failure -- asymmetric with bare `error` (this file's
-        // `None` arm, fixed by #1820), which already used `to_owned_checked`.
+        // `None` arm, fixed by #1820), which already used `to_owned`.
         //
         // Exercised directly through this macro's own `eval::eval` dispatch,
         // not the CLI: `Expr::Error` has no native `eval_generic::eval_single`
@@ -49291,7 +49402,7 @@ mod tests {
         // `QueryResult::Many`, not `One` -- a case the initial version of
         // this fix missed (only special-casing `One`), letting a `Many`
         // whose first element is undecodable fall through to
-        // `result_to_owned`'s own unchecked `to_owned` (#1907 review).
+        // `result_to_owned`'s own unchecked `to_owned_lossy` (#1907 review).
         // `error`'s generator-argument semantics only ever consume the
         // *first* output (see `result_to_owned_ctrl`'s doc comment), so
         // checking `Many`'s first element is the correct, matching fix.
@@ -49332,13 +49443,13 @@ mod tests {
     #[test]
     fn eval_error_msg_expr_malformed_member_raised_1907() {
         // Sibling to the decode-failure tests above, for the *other* error
-        // class `to_owned_checked` can raise: a #1194 malformed-member error
+        // class `to_owned` can raise: a #1194 malformed-member error
         // (a trailing unpaired object member JSON's own semi-index accepts,
         // e.g. `{"a":1,"b"}`) is not `is_decode_failure()`-tagged, but
-        // `to_owned_checked` raises it unconditionally at every other call
+        // `to_owned` raises it unconditionally at every other call
         // site in this file, including this function's own `None` arm below
         // -- so `error(.)` must raise it here too, not silently swallow it
-        // into `""` via an unchecked `to_owned`.
+        // into `""` via an unchecked `to_owned_lossy`.
         //
         // This does *not* assert anything about a *wrapping* `?`/`try`:
         // that suppression/catch decision belongs to `eval_try`, one level
@@ -52359,14 +52470,14 @@ mod tests {
     }
 
     /// #1755: `eval_format` -- the single materialization point every
-    /// `@format` function shares -- used unchecked `to_owned`, so an
+    /// `@format` function shares -- used unchecked `to_owned_lossy`, so an
     /// undecodable string silently formatted as if it were `""` instead of
     /// raising. Covers a representative format from each of `format_owned`'s
     /// dispatch arms: a plain stringifier (`@text`), a serializer (`@json`),
     /// a byte-transform (`@base64`), a percent-encoder (`@uri`), and a
     /// row-formatter (`@csv`) -- both on the malformed value directly and
     /// nested inside a container, since `@json`/`@csv`/etc. recurse into
-    /// containers via `to_owned_checked`'s own (already-fixed) recursion.
+    /// containers via `to_owned`'s own (already-fixed) recursion.
     #[test]
     fn test_format_raises_on_decode_failure_1755() {
         for expr in ["@text", "@json", "@base64", "@uri", "@csv", "@sh", "@html"] {
@@ -52385,7 +52496,7 @@ mod tests {
     }
 
     /// #1755 positive control: valid data through each of `eval_format`'s
-    /// dispatch arms is unaffected by routing through `to_owned_checked`.
+    /// dispatch arms is unaffected by routing through `to_owned`.
     #[test]
     fn test_format_valid_data_unaffected_1755() {
         query!(br#""hi""#, "@text",
@@ -52402,7 +52513,7 @@ mod tests {
         );
     }
 
-    /// #1755: `eval_format`'s `to_owned_checked` runs *before* any
+    /// #1755: `eval_format`'s `to_owned` runs *before* any
     /// format-specific type/shape check, so a decode failure now preempts
     /// an error that would have fired regardless of the string's content
     /// (`@csv` on an object always errors; yq's `@uri`/`@base64`/`@html`
@@ -56980,7 +57091,7 @@ mod tests {
     #[test]
     fn test_nan_math_builtins_survive_reindex_bridge_613() {
         // Companion to `test_nan_survives_reindex_bridge_472`: that fix covered
-        // `to_owned`/`length`/`tonumber`/`isnan`, but `get_float_value` and
+        // `to_owned_lossy`/`length`/`tonumber`/`isnan`, but `get_float_value` and
         // `get_number_from_result` -- which back the whole math-builtin family --
         // still read `n.as_f64()` directly with no sentinel check, so a bridged
         // NaN through any of these errored ("invalid number") instead of
@@ -64101,7 +64212,7 @@ mod tests {
     ) -> QueryResult<'a, Vec<u64>> {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
-        let input = to_owned(&cursor.value());
+        let input = to_owned_lossy(&cursor.value());
         let expr = parse(filter).unwrap();
         eval_owned_with_file_index::<Vec<u64>, JqSemantics>(&expr, &input, file_origin)
     }
@@ -65012,8 +65123,8 @@ mod tests {
         }
 
         // `One` (borrowed cursor) -- still converts to `Owned` via
-        // `to_owned`, matching what the pre-#1445 recursive path already
-        // did, just without the extra clone. `to_owned` on a
+        // `to_owned_lossy`, matching what the pre-#1445 recursive path already
+        // did, just without the extra clone. `to_owned_lossy` on a
         // cursor-borrowed number preserves the source literal (`"42"`),
         // not a plain `Int`, matching this crate's own established
         // literal-preservation convention -- confirmed via a match on
@@ -65496,8 +65607,8 @@ mod tests {
     fn test_nth_stream_number_literal_n_387() {
         // A bare `.n` field access stays a lazy StandardJson::Number cursor
         // (QueryResult::One), which already worked fine -- it never goes
-        // through to_owned()'s NumberLiteral conversion. getpath(["n"])
-        // forces materialization through to_owned(), so `n` arrives as
+        // through to_owned_lossy()'s NumberLiteral conversion. getpath(["n"])
+        // forces materialization through to_owned_lossy(), so `n` arrives as
         // QueryResult::Owned(OwnedValue::NumberLiteral(..)), which is the
         // arm that was actually broken. The n-arm match in
         // builtin_nth_stream must treat that the same as a plain Int/Float,
@@ -66414,7 +66525,7 @@ mod tests {
         }
 
         /// #1755: `builtin_load`'s JSON branch had the same silent-`""`
-        /// shape as the rest of this file's `to_owned` sites -- an
+        /// shape as the rest of this file's `to_owned_lossy` sites -- an
         /// undecodable value in the loaded file must raise, not silently
         /// substitute `""`. Uses raw bytes (not `with_temp_file`'s `&str`
         /// helper, which can't hold invalid UTF-8) written directly to a
@@ -68183,7 +68294,7 @@ mod tests {
         let n_expr = parse(".n").unwrap();
         let expr = parse(".xs[]").unwrap();
         match eval_nth_expr::<Vec<u64>, JqSemantics>(&n_expr, &expr, cursor.value(), false) {
-            QueryResult::One(v) => assert_eq!(to_owned(&v).to_json(), "20"),
+            QueryResult::One(v) => assert_eq!(to_owned_lossy(&v).to_json(), "20"),
             QueryResult::Owned(v) => assert_eq!(v.to_json(), "20"),
             other => panic!("expected the element at index 1, got {other:?}"),
         }
@@ -69293,7 +69404,7 @@ mod tests {
         );
     }
 
-    /// #1005: `eval.rs`'s own private `to_owned` is a second, independent
+    /// #1005: `eval.rs`'s own private `to_owned_lossy` is a second, independent
     /// copy of `eval_generic::to_owned`'s cursor-to-`OwnedValue` conversion
     /// — #998 guarded that one, not this one. Document-sourced input is
     /// protected transitively (already converted once via the guarded
@@ -69310,21 +69421,22 @@ mod tests {
         let json = linear_nest(MAX_VALUE_TREE_DEPTH - 1);
         let index = JsonIndex::build(json.as_bytes());
         let cursor = index.root(json.as_bytes());
-        let owned = to_owned(&cursor.value());
+        let owned = to_owned_lossy(&cursor.value());
         assert!(matches!(owned, OwnedValue::Object(_)));
 
         let json = linear_nest(MAX_VALUE_TREE_DEPTH);
         let index = JsonIndex::build(json.as_bytes());
         let cursor = index.root(json.as_bytes());
         let value = cursor.value();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| to_owned(&value)));
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| to_owned_lossy(&value)));
         assert!(
             result.is_err(),
-            "to_owned should panic at MAX_VALUE_TREE_DEPTH"
+            "to_owned_lossy should panic at MAX_VALUE_TREE_DEPTH"
         );
     }
 
-    /// #1746: this file's own private `to_owned`/`to_owned_at_depth` never
+    /// #1746: this file's own private `to_owned_lossy`/`to_owned_lossy_at_depth` never
     /// received the #1247/#1620/#1660 decode-failure raising sweep --
     /// `builtin_path`/`eval_assign`/`eval_update` all materialized the whole
     /// document through it, silently corrupting an untouched sibling field's
@@ -69389,7 +69501,7 @@ mod tests {
         }
     }
 
-    /// #1746: `map(f)`'s own `to_owned` call (`map_over`) sits on the
+    /// #1746: `map(f)`'s own `to_owned_lossy` call (`map_over`) sits on the
     /// primary result path, unlike `keys`/`.[]`, which don't materialize
     /// element values in their own arms at all (#1746 review corrected the
     /// issue's own framing there) -- `map(.)` over an array holding an
@@ -69409,7 +69521,7 @@ mod tests {
         }
     }
 
-    /// #1746: `to_entries`'s own `to_owned` call on each value is on the
+    /// #1746: `to_entries`'s own `to_owned_lossy` call on each value is on the
     /// primary result path -- an undecodable value must raise instead of
     /// silently becoming `""` in the emitted `{key, value}` entry.
     #[test]
@@ -69427,7 +69539,7 @@ mod tests {
         }
     }
 
-    /// #1746 review: `to_entries`'s *array* arm (a separate `to_owned_checked`
+    /// #1746 review: `to_entries`'s *array* arm (a separate `to_owned`
     /// call from the object arm's, covered above) needs its own repro.
     #[test]
     fn eval_rs_to_entries_array_raises_decode_failure_1746() {
@@ -69445,7 +69557,7 @@ mod tests {
     }
 
     /// #1746 review: `map_values(f)`, a sibling of `map(f)` with its own
-    /// independent `to_owned_checked` calls (object and array arms, `One`
+    /// independent `to_owned` calls (object and array arms, `One`
     /// and `Many` result shapes each) -- none of which `map(f)`'s own test
     /// above exercises. Four shapes covered here.
     #[test]
@@ -69505,7 +69617,7 @@ mod tests {
     }
 
     /// #1746 review: `path(...)` itself (`builtin_path`'s own top-level
-    /// `to_owned_checked` call) needs a direct repro -- `eval_assign`'s
+    /// `to_owned` call) needs a direct repro -- `eval_assign`'s
     /// tests above exercise `=`/`|=`, not `path()`.
     #[test]
     fn eval_rs_builtin_path_raises_decode_failure_1746() {
@@ -69524,9 +69636,9 @@ mod tests {
 
     /// #1746 review: `eval_assign`'s RHS materialization needs its own
     /// `One`/`Many` shape coverage -- the primary repro test above assigns
-    /// a plain literal (`Owned`, no `to_owned_checked` call at all on the
+    /// a plain literal (`Owned`, no `to_owned` call at all on the
     /// RHS side); assigning a borrowed cursor value exercises the RHS-side
-    /// `to_owned_checked` calls specifically.
+    /// `to_owned` calls specifically.
     #[test]
     fn eval_rs_eval_assign_rhs_raises_decode_failure_1746() {
         let json: &[u8] = br#"{"a":1,"b":"\ud800"}"#;
@@ -69550,7 +69662,7 @@ mod tests {
         }
     }
 
-    /// #1746 review: `yq_assign_noop_check`'s own `to_owned_checked` call
+    /// #1746 review: `yq_assign_noop_check`'s own `to_owned` call
     /// (only reached in yq mode with a static path -- jq mode always
     /// short-circuits to `NotChecked` before ever calling it) and
     /// `eval_assign`'s propagation of its `Err`.
@@ -69577,7 +69689,7 @@ mod tests {
     /// either of its two callers (`eval_compound_assign`/
     /// `eval_alternative_assign`): both always call `eval_update_multi`
     /// immediately afterward on the *same, unmodified* input, and that
-    /// function's own `to_owned_checked(&input)` re-materializes and
+    /// function's own `to_owned(&input)` re-materializes and
     /// decode-checks the whole document before any RHS value is ever
     /// used. This pins that masking -- no jq-constructible input can make
     /// a hypothetical RHS-side bug independently observable here, since
@@ -69677,7 +69789,7 @@ mod tests {
     /// code, contrary to this fix's own original claim -- it's reachable
     /// through any pre-existing decode-failure-raising builtin used inside a
     /// path expression's own bare `?`, entirely independent of
-    /// `to_owned_checked`. Confirmed live (review): before this fix,
+    /// `to_owned`. Confirmed live (review): before this fix,
     /// `path(.a | tonumber?)` on `{"a": "\ud800"}` silently suppressed
     /// `tonumber`'s own decode-failure raise (`QueryResult::None`); after,
     /// it correctly propagates uncaught, matching the sibling `Expr::Try`
@@ -69700,7 +69812,7 @@ mod tests {
     }
 
     /// #1746 review: `delpaths_one` must bypass `optional` for a decode
-    /// failure from `to_owned_checked`, matching every other converted call
+    /// failure from `to_owned`, matching every other converted call
     /// site (`eval_assign`/`eval_update`/`builtin_path`/`builtin_setpath`/
     /// `builtin_del` all propagate it unconditionally). Live-unreachable
     /// today via any real jq/yq syntax (found by review, not a live repro),
@@ -69722,22 +69834,22 @@ mod tests {
         }
     }
 
-    /// #1734: `to_owned_checked_at_depth`'s `Object` arm dropped an
+    /// #1734: `to_owned_at_depth`'s `Object` arm dropped an
     /// undecodable key's whole field from the materialized map instead of
     /// preserving it -- live-reachable via `sort` alone (`builtin_sort`
-    /// was already migrated to `to_owned_checked` by #1755's own prior
+    /// was already migrated to `to_owned` by #1755's own prior
     /// work): confirmed via the library API that `[{<undecodable key>:
     /// 1}] | sort` used to return `Owned(Array([Object({})]))`, silently
     /// losing the field.
     ///
     /// The fix is preserve-via-lossy-decode, *not* raise: `eval_generic.rs`'s
-    /// sibling `to_owned` established (#1642, `key_display_string_kind`)
+    /// sibling `to_owned_lossy` established (#1642, `key_display_string_kind`)
     /// that an undecodable *key* is preserved through its raw source span,
     /// matching `length`/`keys_unsorted`/`.` -- #1247 originally raised
     /// here too, and #1642 deliberately relaxed that. Only an undecodable
     /// *value* still raises (the arm just above this one, unchanged).
     #[test]
-    fn eval_rs_to_owned_checked_object_key_decode_failure_preserved_1734() {
+    fn eval_rs_to_owned_object_key_decode_failure_preserved_1734() {
         let json: &[u8] = b"[{\"\xff\xfe\": 1}]";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
@@ -69772,7 +69884,7 @@ mod tests {
     /// case. Distinct from the *decode-failure* axis above: this key is a
     /// valid JSON token, just not a string at all.
     #[test]
-    fn eval_rs_to_owned_checked_structural_key_raises_1734() {
+    fn eval_rs_to_owned_structural_key_raises_1734() {
         let json: &[u8] = b"[{123:1}]";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
@@ -69789,10 +69901,10 @@ mod tests {
     /// lossy-decoded fallback spellings collide must raise, not let the
     /// second silently overwrite the first in `map` -- `resolve_display_key`'s
     /// `DisplayKeyGuard` (#1642) exists specifically for this, and this
-    /// fix is the first thing to give `to_owned_checked_at_depth` a guard
+    /// fix is the first thing to give `to_owned_at_depth` a guard
     /// instance to actually engage it with.
     #[test]
-    fn eval_rs_to_owned_checked_object_key_collision_raises_1734() {
+    fn eval_rs_to_owned_object_key_collision_raises_1734() {
         let json: &[u8] = b"[{\"\xff\xfe\": 1, \"\xff\xff\": 2}]";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
@@ -69818,7 +69930,7 @@ mod tests {
     /// exactly where the earlier `for`-loop version silently dropped the
     /// dangling key instead of raising.
     #[test]
-    fn eval_rs_to_owned_checked_trailing_unpaired_member_raises_1734() {
+    fn eval_rs_to_owned_trailing_unpaired_member_raises_1734() {
         let json: &[u8] = br#"[{"a":1,"b"}]"#;
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
@@ -69832,7 +69944,7 @@ mod tests {
     }
 
     /// #1746 review: the success (`Ok`) arm of the `One`/`Many`
-    /// `to_owned_checked` match blocks added by this fix needs its own
+    /// `to_owned` match blocks added by this fix needs its own
     /// coverage -- every other new test here constructs a failure. Clean
     /// input through the same shapes must still produce the ordinary,
     /// uncorrupted result.
@@ -70211,7 +70323,7 @@ mod tests {
 
     /// #1025: `collect_leaf_paths` (backs `leaf_paths`) had no depth guard
     /// of its own -- previously protected only transitively (its callers
-    /// already run the guarded `to_owned` first), a fragile invariant
+    /// already run the guarded `to_owned_lossy` first), a fragile invariant
     /// rather than an independent guard.
     #[test]
     fn collect_leaf_paths_panics_past_nesting_depth_limit_1025() {
@@ -71991,7 +72103,7 @@ mod tests {
     }
 
     /// #1989: `builtin_skip`'s three output-conversion arms (`One`,
-    /// `OneCursor`, `Many`) all used bare `to_owned`, with no
+    /// `OneCursor`, `Many`) all used bare `to_owned_lossy`, with no
     /// decode-failure guard at all -- unlike its sibling `n`-classification
     /// arms above, which already error correctly. An undecodable string in
     /// `expr`'s real output silently became garbage instead of raising.
@@ -72020,6 +72132,278 @@ mod tests {
             &b"\"\xff\xfe\""[..],
             "skip(0; .)",
             QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+    }
+
+    /// #1989 cluster 1: `fanout_two_args`'s eager (non-`ArgFanout::All`,
+    /// i.e. yq-gated) path folded both argument slots through the unchecked
+    /// `stream_outputs`, so an undecodable argument silently materialized as
+    /// `""` and was then *used* -- exactly the bug shape #2023 already fixed
+    /// at `fanout_arg`'s own eager path and left behind here. Pre-fix,
+    /// `setpath(.a; 1)` on an undecodable `.a` reported the ordinary
+    /// (`?`-suppressible) `Path must be specified as an array` type error,
+    /// having decided that on a value the document never held.
+    #[test]
+    fn test_fanout_two_args_raises_on_argument_decode_failure_1989() {
+        // Inner slot (the path): `.a` is the undecodable argument.
+        yq_query!(
+            &b"{\"a\":\"\xff\xfe\"}"[..],
+            "setpath(.a; 1)",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        // Outer slot (the value): same document, argument in the other
+        // position.
+        yq_query!(
+            &b"{\"a\":\"\xff\xfe\"}"[..],
+            "setpath([\"x\"]; .a)",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        // A decode failure is never suppressed by `?` (#1247/#1620).
+        yq_query!(
+            &b"{\"a\":\"\xff\xfe\"}"[..],
+            "(setpath(.a; 1))?",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        // Positive control: decodable arguments still work.
+        yq_query!(
+            br#"{"a":"x"}"#,
+            "setpath([.a]; 1)",
+            QueryResult::Owned(OwnedValue::Object(map)) => {
+                assert_eq!(map.get("x"), Some(&OwnedValue::Int(1)));
+            }
+        );
+    }
+
+    /// #1989 cluster 1, the other half:
+    /// `fanout_regex_pattern_with_collected_flags` evaluated its `flags`
+    /// slot through the unchecked `stream_outputs` too, so an undecodable
+    /// flags value became `""` -- i.e. "no flags at all" -- and the call
+    /// carried on with the wrong match semantics instead of raising.
+    ///
+    /// `flags_expr` is evaluated against `splits`' own *input*, so the
+    /// input has to be a non-string container for the flags slot to be the
+    /// only undecodable thing in the call -- with a string input, `body`'s
+    /// own subject decode raises the identical error first and the two
+    /// spellings are indistinguishable. An array input makes the difference
+    /// observable: pre-fix the flags value silently became `""` and the
+    /// call died on `body`'s ordinary `cannot be matched` *type* error;
+    /// post-fix the decode failure is reported instead.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_collected_flags_argument_decode_failure_raises_1989() {
+        query!(
+            &b"[\"x\",\"\xff\xfe\"]"[..],
+            "splits(\",\"; .[1])",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(
+            &b"[\"x\",\"\xff\xfe\"]"[..],
+            "(splits(\",\"; .[1]))?",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        // Positive control: a decodable flags value still reports the
+        // ordinary type error for the non-string input.
+        query!(
+            br#"["x","i"]"#,
+            "splits(\",\"; .[1])",
+            QueryResult::Error(e) => assert!(!e.is_decode_failure(), "{}", e.message)
+        );
+        // Positive control: a real split still works.
+        query!(
+            br#""a,b""#,
+            "[splits(\",\"; \"\")]",
+            QueryResult::Owned(OwnedValue::Array(vs)) => assert_eq!(vs.len(), 2)
+        );
+    }
+
+    /// #1989 cluster 2: `any`/`all` (bare and `cond`-taking) route their yq
+    /// arms through `scalar_fallback`, but jq mode's bare `_` wildcard --
+    /// which also catches `String` -- did not, and a `_ if optional` arm sat
+    /// in front of it. So an undecodable string input was either swallowed
+    /// outright by `?` or misreported as `Cannot iterate over string ("")`,
+    /// naming an empty spelling that is the unchecked conversion's own
+    /// substitute rather than anything the document held.
+    #[test]
+    fn test_any_all_raise_on_input_decode_failure_1989() {
+        for filter in ["any", "all", "any(.)", "all(.)"] {
+            query!(
+                &b"\"\xff\xfe\""[..],
+                filter,
+                QueryResult::Error(e) if e.is_decode_failure() => {}
+            );
+            // Never suppressed by `?` (#1247/#1620).
+            let optional_filter = alloc::format!("({filter})?");
+            query!(
+                &b"\"\xff\xfe\""[..],
+                optional_filter.as_str(),
+                QueryResult::Error(e) if e.is_decode_failure() => {}
+            );
+        }
+        // Positive controls: an ordinary non-iterable input still reports
+        // the plain (suppressible) type error, and containers still work.
+        query!(
+            br"42",
+            "any",
+            QueryResult::Error(e) => assert!(!e.is_decode_failure(), "{}", e.message)
+        );
+        query!(br"42", "(any)?", QueryResult::None => {});
+        query!(
+            br"[false, true]",
+            "any",
+            QueryResult::Owned(OwnedValue::Bool(b)) => assert!(b)
+        );
+    }
+
+    /// #1989 cluster 3: `builtin_last_stream`'s own doc comment says it
+    /// exists "to keep the two implementations in sync" with
+    /// `eval_last_expr`, but its three borrowed-output arms still used bare
+    /// `to_owned_lossy` -- the exact shape this issue already converted in its
+    /// sibling `builtin_skip`. Reachable only by direct evaluation (#1986),
+    /// so this calls the function the way
+    /// `builtin_last_stream_propagates_bare_halt` already does.
+    #[test]
+    fn test_builtin_last_stream_raises_on_output_decode_failure_1989() {
+        // `One` arm.
+        let json_bytes: &[u8] = &b"{\"a\":\"\xff\xfe\"}"[..];
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let expr = parse(".a").unwrap();
+        match builtin_last_stream::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure(), "{}", e.message),
+            other => panic!("expected a decode failure, got {other:?}"),
+        }
+        // A decode failure is never suppressed by `optional` (#1620).
+        match builtin_last_stream::<Vec<u64>, JqSemantics>(&expr, cursor.value(), true) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure(), "{}", e.message),
+            other => panic!("expected a decode failure, got {other:?}"),
+        }
+        // `Many` arm: the *last* output is the undecodable one.
+        let many_bytes: &[u8] = &b"[\"good\",\"\xff\xfe\"]"[..];
+        let many_index = JsonIndex::build(many_bytes);
+        let many_cursor = many_index.root(many_bytes);
+        let many_expr = parse(".[]").unwrap();
+        match builtin_last_stream::<Vec<u64>, JqSemantics>(&many_expr, many_cursor.value(), false) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure(), "{}", e.message),
+            other => panic!("expected a decode failure, got {other:?}"),
+        }
+        // Positive control: valid data is unaffected.
+        let ok_bytes: &[u8] = br#"["good","also-good"]"#;
+        let ok_index = JsonIndex::build(ok_bytes);
+        let ok_cursor = ok_index.root(ok_bytes);
+        match builtin_last_stream::<Vec<u64>, JqSemantics>(&many_expr, ok_cursor.value(), false) {
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(&*s, "also-good"),
+            other => panic!("expected the last string, got {other:?}"),
+        }
+    }
+
+    /// #1989 cluster 4: `builtin_limit` and `builtin_first_stream` emit
+    /// `Item::into_owned`'s result as the query's *own output*, so the gap
+    /// that function's doc comment already documents was a live
+    /// wrong-data bug at those two of its seven call sites. Both are
+    /// parser-unreachable (#981/#1986) but library-reachable, which #1972
+    /// already established is worth fixing rather than deferring.
+    #[test]
+    fn test_limit_and_first_stream_raise_on_output_decode_failure_1989() {
+        let json_bytes: &[u8] = &b"[\"good\",\"\xff\xfe\"]"[..];
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let iterate = parse(".[]").unwrap();
+        let two = parse("2").unwrap();
+
+        // `builtin_limit`: the second taken item is undecodable.
+        match builtin_limit::<Vec<u64>, JqSemantics>(&two, &iterate, cursor.value(), false) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure(), "{}", e.message),
+            other => panic!("expected a decode failure, got {other:?}"),
+        }
+        // Never suppressed by `optional` (#1620).
+        match builtin_limit::<Vec<u64>, JqSemantics>(&two, &iterate, cursor.value(), true) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure(), "{}", e.message),
+            other => panic!("expected a decode failure, got {other:?}"),
+        }
+        // `builtin_first_stream`: the *first* output is the undecodable one.
+        let first_bytes: &[u8] = &b"[\"\xff\xfe\",\"good\"]"[..];
+        let first_index = JsonIndex::build(first_bytes);
+        let first_cursor = first_index.root(first_bytes);
+        match builtin_first_stream::<Vec<u64>, JqSemantics>(&iterate, first_cursor.value(), false) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure(), "{}", e.message),
+            other => panic!("expected a decode failure, got {other:?}"),
+        }
+        // Positive controls: valid data is unaffected on both.
+        let ok_bytes: &[u8] = br#"["good","also-good"]"#;
+        let ok_index = JsonIndex::build(ok_bytes);
+        let ok_cursor = ok_index.root(ok_bytes);
+        match builtin_limit::<Vec<u64>, JqSemantics>(&two, &iterate, ok_cursor.value(), false) {
+            QueryResult::ManyOwned(vs) => assert_eq!(vs.len(), 2),
+            other => panic!("expected two outputs, got {other:?}"),
+        }
+        match builtin_first_stream::<Vec<u64>, JqSemantics>(&iterate, ok_cursor.value(), false) {
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(&*s, "good"),
+            other => panic!("expected the first string, got {other:?}"),
+        }
+    }
+
+    /// #1989 cluster 5: unary minus consumes its operand, so
+    /// `negate_fanout_core`'s unchecked `push_owned_values` turned an
+    /// undecodable operand into `""` and then fell into `arith_negate`'s own
+    /// type error, which *renders* the value -- reporting `string ("")
+    /// cannot be negated`, a catchable, `?`-suppressible error naming
+    /// content the document never held.
+    #[test]
+    fn test_negate_raises_on_operand_decode_failure_1989() {
+        query!(
+            &b"{\"a\":\"\xff\xfe\"}"[..],
+            "-.a",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(
+            &b"{\"a\":\"\xff\xfe\"}"[..],
+            "(-.a)?",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        // Positive controls: an ordinary non-negatable operand still
+        // reports the plain (suppressible) type error, and numbers negate.
+        query!(
+            br#"{"a":"x"}"#,
+            "-.a",
+            QueryResult::Error(e) => assert!(!e.is_decode_failure(), "{}", e.message)
+        );
+        query!(br#"{"a":"x"}"#, "(-.a)?", QueryResult::None => {});
+        query!(
+            br#"{"a":3}"#,
+            "-.a",
+            QueryResult::Owned(v) => assert_eq!(v.to_json(), "-3")
+        );
+    }
+
+    /// #1989 cluster 6: an undecodable *element* of `implode`'s input array
+    /// was masked as `"" can't be imploded, unicode codepoint needs to be
+    /// numeric` -- again naming the unchecked conversion's substitute rather
+    /// than the document -- and suppressed outright under `?`. Mirrors
+    /// #1755's own per-element conversion in the sort family.
+    #[test]
+    fn test_implode_raises_on_element_decode_failure_1989() {
+        query!(
+            &b"[65, \"\xff\xfe\"]"[..],
+            "implode",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(
+            &b"[65, \"\xff\xfe\"]"[..],
+            "(implode)?",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        // Positive controls: an ordinary non-numeric element still reports
+        // the plain (suppressible) type error, and valid input implodes.
+        query!(
+            br#"[65, "x"]"#,
+            "implode",
+            QueryResult::Error(e) => assert!(!e.is_decode_failure(), "{}", e.message)
+        );
+        query!(br#"[65, "x"]"#, "(implode)?", QueryResult::None => {});
+        query!(
+            br"[72, 105]",
+            "implode",
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(&*s, "Hi")
         );
     }
 }

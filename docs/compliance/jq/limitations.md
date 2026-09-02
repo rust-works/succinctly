@@ -1100,28 +1100,30 @@ for the same "cannot rewind a byte-at-a-time writer" reason).
 
 **Partly covered: `succinctly::jq::eval`'s own separate evaluator.** `src/jq/eval.rs` defines
 a second, independent `pub fn eval` — the function `succinctly::jq::eval` actually re-exports,
-and the one used in `src/jq/mod.rs`'s own module-doc example — with its own separate, unchecked
-`to_owned`/`effective_len`/`effective_fields`. Two different checks are in play, and their
-coverage differs:
+and the one used in `src/jq/mod.rs`'s own module-doc example — with its own separate
+`to_owned`/`to_owned_lossy`/`effective_len`/`effective_fields` family (#1989 renamed the
+checked conversion to the short `to_owned` and the lossy one to `to_owned_lossy`, so that a
+bare `to_owned` at a new call site is the checked default; the names below are the current
+ones). Two different checks are in play, and their coverage differs:
 
 - **The #1194/#1642 decode-failure and structural-key policy** already reaches most of this
-  file's materializing builtins via `to_owned_checked`/`to_owned_checked_at_depth` (`in(xs)`,
+  file's materializing builtins via `to_owned`/`to_owned_at_depth` (`in(xs)`,
   `ltrimstr`/`rtrimstr`, the sort family, `min`/`max`/`unique`/`group_by`, `add`, `join`,
   `flatten`, and every assignment RHS, among others) — not the wholesale gap the previous
   revision of this paragraph implied.
 - **#1902 widened this to `. as $var`/`reduce`/`foreach`.** Their bound/INIT/input value and
-  body-output conversions switched from the unchecked `to_owned`/`promote_borrowed` to
-  `to_owned_checked`/`promote_borrowed_checked` — so a #1194 malformed member or #1642
+  body-output conversions switched from the lossy `to_owned_lossy`/`promote_borrowed` to
+  `to_owned`/`promote_borrowed_checked` — so a #1194 malformed member or #1642
   collision key that used to be silently dropped (`reduce . as $x (0; .+1)` on `{"a":1,"b"}`
   used to succeed with `1`) now raises there too, same as the builtins listed above. Not a new
-  divergence unique to #1902: this is `to_owned_checked`'s own established contract from
+  divergence unique to #1902: this is `to_owned`'s own established contract from
   #1755 onward, at three call sites this one just hadn't named yet (documented here per
-  #1934 item 6, which also closed a related gap: five bare, non-`to_owned_checked`
+  #1934 item 6, which also closed a related gap: five bare, unchecked
   `Error`/`Partial` arms across these same three functions' `input`/INIT streams didn't
   exclude a genuine decode failure from `optional`'s suppression the way `finish_fork`
   already does — an internal-consistency fix, not a further widening of this policy).
 - **#2188 fixed `fromstream(f)`'s own event-collecting fallback.** `collect_owned`'s
-  `One`/`Many` arms use unchecked `to_owned`, so `builtin_fromstream`'s
+  `One`/`Many` arms use the lossy `to_owned_lossy`, so `builtin_fromstream`'s
   `result.collect_owned()` fallback silently substituted `""` for an undecodable event leaf
   instead of raising — found via a research audit for #1989 that classified every bare
   `to_owned(` call site in this file. Fixed by routing through the pre-existing
@@ -1134,7 +1136,7 @@ coverage differs:
   path length in jq's ordering — so every event is unconditionally dropped before a corrupted
   leaf could reach output.
 - **The #1677 malformed-`,`/`:`-delimiter check is the narrower gap.**
-  `to_owned_checked_at_depth` itself never calls `key_delimiter_ok`/`value_delimiter_ok`, so
+  `to_owned_at_depth` itself never calls `key_delimiter_ok`/`value_delimiter_ok`, so
   every builtin routed through it still misses this one check. `Builtin::Keys` (`keys`/
   `keys_unsorted`, #1829/#1835) and `to_entries` (#1829) are the exceptions so far: `keys`/
   `keys_unsorted` delegate to `effective_keys` (`document.rs`) — the same `DistinctKeyCursors`

@@ -1812,8 +1812,8 @@ const REINDEX_LITERAL_LEN_CAP: usize = 256;
 
 /// Whether `eval_on_owned`'s reindex bridge -- serialize with
 /// [`OwnedValue::to_json_for_reindex`], `JsonIndex::build`, then
-/// `to_owned_checked` back on the far side -- is a **semantic identity** on
-/// `value`, so skipping it cannot change what the evaluator downstream sees.
+/// `owned_from_standard_json` back on the far side -- is a **semantic identity**
+/// on `value`, so skipping it cannot change what the evaluator downstream sees.
 ///
 /// #1909: the path-context arms below hand `eval.rs` the `OwnedValue` they
 /// already built instead of round-tripping it, which is only sound where the
@@ -8220,7 +8220,7 @@ fn slice_one_generic<S: EvalSemantics, V: DocumentValue>(
         // the `eval_generic` twin of `eval.rs`'s own `eval_single`
         // literal-bounds `Expr::Slice` array arm, which had the identical
         // gap this same PR fixed (see that arm's own #2001 comment). Can't
-        // reuse `eval.rs`'s `suppress_or_raise`/`to_owned_checked_or_suppress!`
+        // reuse `eval.rs`'s `suppress_or_raise`/`to_owned_or_suppress!`
         // directly: different result type (`GenericResult` vs
         // `QueryResult`), so the equivalent check is inlined instead.
         return match to_owned_all(items[range].iter()) {
@@ -8570,9 +8570,11 @@ fn key_elements_generic<S: EvalSemantics, V: DocumentValue>(
         let k = match key {
             Some(f) => {
                 // #1755's rule for the `_by` forms. `eval::builtin_sort_by`/
-                // `unique_by`/`min_by`/`max_by` each `to_owned_checked` the
-                // *element* as well as computing its key, so an undecodable
-                // element raises rather than silently sorting in as `""`.
+                // `unique_by`/`min_by`/`max_by` each `to_owned` (`eval.rs`'s
+                // own checked conversion, renamed from `to_owned_checked` by
+                // #1989) the *element* as well as computing its key, so an
+                // undecodable element raises rather than silently sorting in
+                // as `""`.
                 // Omitting that here was a live regression, not a theoretical
                 // one: on `[{"a":2,"s":"\ud800"},{"a":1,"s":"ok"}]`,
                 // `sort_by(.a) | length` answered 2 where `main` raised --
@@ -10314,8 +10316,8 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         // `_` fallback below charged it a whole-document materialize +
         // re-serialize + re-index round trip *and* a second materialize
         // inside `eval::builtin_path` itself. `builtin_path_on_owned` is that
-        // function with its own `to_owned_checked` lifted out, so the tree
-        // built here is the only one -- taken only where the round trip it
+        // function with its own `to_owned` lifted out, so the tree built here
+        // is the only one -- taken only where the round trip it
         // replaces was a semantic no-op, and falling back to that round trip
         // verbatim otherwise. See `reindex_bridge_is_identity`, and the
         // `Expr::Pipe` arm above for why `optional` isn't threaded in.
@@ -10541,8 +10543,8 @@ mod tests {
     use super::*;
 
     /// #1909: [`reindex_bridge_is_identity`] claims to describe exactly when
-    /// `eval_on_owned`'s serialize + `JsonIndex::build` + `to_owned_checked`
-    /// round trip leaves a value unchanged — the whole basis for the
+    /// `eval_on_owned`'s serialize + `JsonIndex::build` +
+    /// `owned_from_standard_json` round trip leaves a value unchanged — the whole basis for the
     /// path-context arms skipping that round trip. A predicate that says
     /// "identity" about a value the bridge actually rewrites is a silent
     /// correctness bug, so assert the two against each other directly rather
@@ -10728,8 +10730,8 @@ mod tests {
 
     /// The real thing `reindex_bridge_is_identity` predicts: run `value`
     /// through `eval_on_owned`'s exact bridge (`to_json_for_reindex`,
-    /// `JsonIndex::build`, `to_owned_checked` via `owned_from_standard_json`)
-    /// and report whether it came back unchanged.
+    /// `JsonIndex::build`, `owned_from_standard_json`) and report whether it
+    /// came back unchanged.
     fn round_trips_unchanged<S: EvalSemantics>(value: &OwnedValue) -> bool {
         use crate::json::JsonIndex;
         let json = value.to_json_for_reindex::<S>();
