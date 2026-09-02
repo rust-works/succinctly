@@ -18431,6 +18431,40 @@ fn test_map_identity_reports_clean_error_on_adversarial_nesting_1793() -> Result
     Ok(())
 }
 
+/// #2066 review: a `LazySeq`-backed builtin (`map`/`reverse`/`sort_by`/
+/// `unique_by`/...) must stay atomic on malformed content the same way it
+/// already was on adversarial nesting depth (the test above) -- nothing on
+/// stdout, one clean diagnostic on stderr, matching `materialize_atomic`'s
+/// own "real jq's array construction is all-or-nothing" contract. An
+/// earlier revision of #2066's fix (routing a drained cursor straight into
+/// `JqValue::Cursor` after only a depth check, not the fuller
+/// `to_owned_cursor` validation `materialize_atomic` used to run per
+/// element) printed a garbled `[1,{"bad":` prefix to stdout before
+/// reporting the error, because delimiter/malformed-member validation had
+/// moved entirely to `print_json`'s own cursor writer, which runs *while*
+/// writing rather than before it. `xyz123` is a bare, unquoted token --
+/// not a valid JSON value at all -- accepted structurally by the semi-index
+/// (per this codebase's own semi-indexing/minimal-validation architecture)
+/// but rejected once actually converted, the same class of leniency gap
+/// `validate_json_delimiters` exists to close elsewhere in this file.
+#[test]
+fn test_lazyseq_builtins_stay_atomic_on_malformed_content_2066() -> Result<()> {
+    for (filter, input) in [
+        ("map(.)", r#"[1, {"bad": xyz123}]"#),
+        ("reverse", r#"[{"bad": xyz123}, 1]"#),
+        ("unique_by(.)", r#"[1, {"bad": xyz123}]"#),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 5, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout, "", "{filter}: stdout: {stdout:?}");
+        assert!(
+            stderr.contains("unexpected character"),
+            "{filter}: stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #1793 sibling case: `join`, like `sort`, has no native lazy fast path in
 /// `eval_builtin` and falls to the same generic materializing bridge.
 #[test]
