@@ -43,8 +43,8 @@ use super::eval::{
     is_retryable_stop, literal_to_owned, needs_path_context, numeric_key_to_array_index,
     numeric_key_to_index, owned_bound_to_i64, owned_to_string, slice_object_as_yq_children,
     slice_owned_value_read, substitute_bound_var, substitute_vars, suppresses, tonumber_from_str,
-    vec_with_capacity, Control, Demand, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics,
-    LimitN, PathTrail, QueryResult, YqSemantics,
+    try_reserve_product, vec_with_capacity, Control, Demand, EvalError, EvalSemantics, EvalTag,
+    Flow, JqSemantics, LimitN, PathTrail, QueryResult, YqSemantics,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -8144,23 +8144,26 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
     // own match arm above), so this site -- not `eval::eval_slice_expr`'s
     // sibling -- is what a real `succinctly jq`/`succinctly yq` invocation
     // hits.
-    let mut out: Vec<OwnedValue> = Vec::new();
-
+    //
     // `starts.len() * ends.len()` is still fully known before the loop --
-    // only the per-pair target count varies -- so reserve that much upfront
-    // as a baseline (the common case is exactly one output per pair),
-    // recovering the single upfront allocation the pre-#2143 code made for
-    // that case instead of paying amortized-doubling reallocation/copy
-    // costs on every slice query. An overflowing product just skips the
-    // hint and falls through to the per-pair `try_reserve` calls below,
-    // which still refuse cleanly on their own once actually unallocatable
-    // -- `out` is empty at this point regardless, so there's nothing this
-    // hint could lose by skipping it.
-    if let Some(pairs) = starts.len().checked_mul(ends.len()) {
-        if out.try_reserve(pairs).is_err() {
-            return GenericResult::Error(cannot_reserve_cross_product(&[starts.len(), ends.len()]));
-        }
-    }
+    // only the per-pair target count varies -- so `try_reserve_product`
+    // reserves that much upfront as a baseline (the common case is exactly
+    // one output per pair), recovering the single upfront allocation the
+    // pre-#2143 code made for that case instead of paying amortized-
+    // doubling reallocation/copy costs on every slice query; both `starts`
+    // and `ends` are already known non-empty here (the `is_empty` checks
+    // above), so this never takes the zero-factor fast-return arm. See
+    // `eval::eval_slice_expr`'s identical comment for why this reuses the
+    // existing helper rather than a bespoke inline check: it keeps the
+    // refusal path covered by that function's own existing unit tests
+    // instead of adding new, practically-untestable ones (constructing
+    // real `starts`/`ends` generator output long enough to organically
+    // overflow this product would first exhaust memory building the
+    // *inputs*, long before this reservation could ever run).
+    let mut out: Vec<OwnedValue> = match try_reserve_product(&[starts.len(), ends.len()]) {
+        Ok(out) => out,
+        Err(e) => return GenericResult::Error(e),
+    };
 
     // The shared exit every escape arm below funnels through, so folding
     // the running `out` in as a `Partial` prefix can't drift between arms

@@ -16569,25 +16569,25 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // (see `eval_single`'s `Expr::Slice` arm), so there is nothing to
     // borrow except its rare whole-value fast paths, which `to_owned_lossy`
     // below just copies out of.
-    let mut out: Vec<OwnedValue> = Vec::new();
-
+    //
     // `starts.len() * ends.len()` is still fully known before the loop --
-    // only the per-pair target count varies -- so reserve that much upfront
-    // as a baseline (the common case is exactly one output per pair),
-    // recovering the single upfront allocation the pre-#2143 code made for
-    // that case instead of paying amortized-doubling reallocation/copy
-    // costs on every slice query. `checked_mul` rather than
-    // `try_reserve_product` (which would also fold in a `targets.len()`
-    // this point doesn't have yet): an overflowing product here just skips
-    // the hint and falls through to the per-pair `try_reserve` calls below,
-    // which still refuse cleanly on their own once actually unallocatable
-    // -- `out` is empty at this point regardless, so there's nothing this
-    // hint could lose by skipping it.
-    if let Some(pairs) = starts.len().checked_mul(ends.len()) {
-        if out.try_reserve(pairs).is_err() {
-            return QueryResult::Error(cannot_reserve_cross_product(&[starts.len(), ends.len()]));
-        }
-    }
+    // only the per-pair target count varies -- so `try_reserve_product`
+    // reserves that much upfront as a baseline (the common case is exactly
+    // one output per pair), recovering the single upfront allocation the
+    // pre-#2143 code made for that case instead of paying amortized-
+    // doubling reallocation/copy costs on every slice query; both `starts`
+    // and `ends` are already known non-empty here (the `is_empty` checks
+    // above), so this never takes the zero-factor fast-return arm. Reusing
+    // the existing helper -- rather than a bespoke `checked_mul` inline --
+    // keeps this refusal path covered by that function's own existing unit
+    // tests instead of adding new, practically-untestable ones of its own:
+    // constructing real `starts`/`ends` generator output long enough to
+    // organically overflow this product would first exhaust memory
+    // building the *inputs*, long before this reservation could ever run.
+    let mut out: Vec<OwnedValue> = match try_reserve_product(&[starts.len(), ends.len()]) {
+        Ok(out) => out,
+        Err(e) => return QueryResult::Error(e),
+    };
 
     // The shared exit every escape arm below funnels through, so folding
     // the running `out` in as a `Partial` prefix can't drift between arms

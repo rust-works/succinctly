@@ -1275,14 +1275,20 @@ computable), so each also reserves incrementally per key/pair via `Vec::try_rese
 against `cannot_reserve_cross_product`'s identical error, regardless of the target's own
 length. The two functions differ on what's reserved *before* that incremental loop even
 starts: `eval_index_expr` reserves nothing upfront (purely incremental from an empty
-`Vec`), while `eval_slice_expr` reserves a `starts.len() * ends.len()` baseline first —
-both factors are still fully known before the loop, so this recovers a single allocation
-for the common one-output-per-pair case instead of paying amortized-doubling
-reallocation/copy costs on every slice query; an overflowing product just skips the hint
-and falls through to the purely-incremental path, same as `eval_index_expr` always takes.
-The refusal guarantee this section describes is unchanged by any of this — every push
-remains behind a fallible reservation, so the failure mode stays "clean refusal," never a
-panic — only the moment(s) a check runs and the factor(s) named in the error message
+`Vec`), while `eval_slice_expr` reserves a `starts.len() * ends.len()` baseline first, via
+the same `try_reserve_product` helper this section already describes (both factors are
+already known non-empty by this point, so it never takes that helper's own zero-factor
+fast return) — both factors are still fully known before the loop, so this recovers a
+single allocation for the common one-output-per-pair case instead of paying
+amortized-doubling reallocation/copy costs on every slice query, and reuses
+`try_reserve_product`'s existing overflow/refusal handling and its existing unit test
+coverage for both, rather than adding a parallel, practically-untestable check of its own
+(a `starts * ends` pair count large enough to organically overflow this product would
+first exhaust memory building the `starts`/`ends` bound streams themselves, long before
+this reservation could ever run). The refusal guarantee this section describes is
+unchanged by any of this — every push remains behind a fallible reservation, so the
+failure mode stays "clean refusal," never a panic — only the moment(s) a check runs and
+the factor(s) named in the error message
 changed. `resolve_index_expr`/`resolve_slice_expr` (the `path()`/write-path siblings,
 target still evaluated once — tracked separately as #2139) are the two sites that still
 call `try_reserve_product` directly with the original multi-factor product.
