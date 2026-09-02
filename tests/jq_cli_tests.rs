@@ -26461,6 +26461,18 @@ fn test_getpath_generator_path_shares_one_materialization_2053() -> Result<()> {
     Ok(())
 }
 
+/// #2053: `getpath_walk_owned`'s own non-array-path guard, reached through
+/// the native bypass arm (an all-`Int` document is `reindex_bridge_is_identity`)
+/// -- `?` suppresses a malformed (non-array) path argument the same way it
+/// suppresses any other `getpath` error. Verified against jq 1.7.1.
+#[test]
+fn test_getpath_non_array_path_suppressed_by_optional_2053() -> Result<()> {
+    let (stdout, code) = run_jq_stdin(r#"getpath("x")?"#, r#"{"a":1}"#, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "");
+    Ok(())
+}
+
 /// #1531: a generator argument must be pulled lazily, so `body` runs against
 /// argument value N *before* value N+1 is evaluated. Once `body` fails, jq
 /// never evaluates the rest of the argument -- side effects included.
