@@ -502,6 +502,49 @@ python3 scripts/ab-cli.py --before ./succ-before --after ./succ-after --tool jq 
     indent (silent data loss). All were verified against the pinned yq v4.53.3 and are now
     covered by `tests/data/yq-golden/cases/map_*`.
 
+- Slice 3, jq side (CLI streaming-output integration for `succinctly jq` itself):
+  [#1576](https://github.com/rust-works/succinctly/issues/1576) — **landed**. Deliberately
+  deferred out of #757 (yq had no correctness gap to force the jq side; JSON has no
+  comments/anchors/style for the DOM path to drop, so the payoff here is throughput only).
+  `JsonCursor` gained a pretty/sort-capable recursive writer and `stream_sequence_json`
+  support (mirroring what #757 gave `YamlCursor`), plus a new `JsonConvention` enum
+  (`src/jq/document.rs`) so the shared streaming machinery can select jq's own number/escape/
+  duplicate-key conventions instead of yq's, which it previously hardcoded.
+  - **Atomicity is stricter for jq than for yq.** #2066 (postdates this issue's own text) had
+    already fixed a jq-specific regression where `map(.)` on `[1, {"bad": xyz123}]` printed a
+    garbled `[1,{"bad":` prefix before erroring — real jq's array construction is all-or-
+    nothing. `JsonCursor::stream_json` now buffers each top-level value locally before writing
+    it to the real output, restoring that guarantee for the new cursor-streaming path; yq's own
+    identical cursor path is unaffected and keeps its already-accepted partial-prefix-on-error
+    trade (#1641/#1679).
+  - **Malformed input is handled by falling back, not by full parity.** Real jq's existing
+    `print_json`/`to_owned_cursor`/`DisplayKeyGuard` stack has years of issue-specific,
+    sometimes deliberately inconsistent malformed-input behavior. Rather than re-deriving all
+    of it in the new writer, `jq_runner.rs`'s fast path detects malformation and falls back to
+    the already-correct general path, restricted by a new `m2_json_fallback_safe` predicate to
+    AST shapes where that fallback is provably safe (excludes `.[]`/`Iterate`, `select`,
+    computed `IndexExpr`, and `keys_unsorted`, which either permit multiple top-level results
+    or go through a separate, unverified writer).
+  - **Benchmarked** (interleaved A/B, `scripts/ab-cli.py`, 2/10/20 MB corpora, output-identity
+    gated against both `succ-base`/`succ-head` and the pinned `/usr/bin/jq` 1.7.1, 2026-09-02):
+    `map(.)`/`sort_by`/`reverse` (the queries that render every element) are **1.4-2.0x faster**
+    on both Apple M4 Pro and AMD Ryzen 9 7950X, flat across the size ladder (a constant-factor
+    win from removing the per-element `OwnedValue` allocation, not an algorithmic one).
+    `unique_by`/`min_by`/`max_by` reach the same fast path but show no measurable win, since
+    their cost is dominated by scanning/comparing every element, not by rendering the result.
+    `keys_unsorted | map(.)` is neutral (excluded from the fast path, see above). **A real,
+    reproducible regression surfaced on large-array plain-field access** (`.data`, a
+    2238-element array): +2.3-3.0% on M4 Pro, +7.3-11.4% on the 7950X, both clearing the A/B
+    noise floor (control range roughly ±2-3%) — the new per-value buffering (needed for the
+    atomicity fix above) costs a memory copy on a large single-result value that the old path
+    didn't pay, with no rendering-throughput win to offset it since there's only one such
+    value, not many. The buffering itself isn't optional -- real jq parses the whole document
+    before printing anything, so even a single-result query like `.data` needs the same
+    zero-partial-output guarantee if a later structural error exists deeper in that value, the
+    same reasoning as the `LazySeq` case, just for one value instead of many. Not fixed in this
+    change; a cheaper implementation of that same guarantee (e.g. a size-based fast path, or
+    validating before writing instead of buffering while writing) is a reasonable follow-up.
+
 ## Critical files
 
 - `src/jq/eval_generic.rs` — `GenericResult` enum, `LazyKeys`/`LazyIndexRange` variants, the
