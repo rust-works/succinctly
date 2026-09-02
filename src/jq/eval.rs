@@ -54139,6 +54139,29 @@ mod tests {
         );
     }
 
+    /// #2015 code review: this fix's own `optional`-threading discipline is
+    /// shared, unconditional code (`builtin_upper_in`/`builtin_upper_in_src`
+    /// have no `S::TAG` branch), but the original PR's own tests were all
+    /// `query!` (jq-mode) -- per this repo's own "a jq-scoped fix to a
+    /// shared builtin needs a dual-mode check" rule, pin the yq-mode
+    /// counterpart here too. `IN`/`IN(src;s)` are gated behind
+    /// `--jq-extensions` for the real CLI, but `yq_query!` always parses
+    /// with extensions enabled (`ParserMode::Yq`, `true`), so this exercises
+    /// the same `YqSemantics` evaluator path a real `--jq-extensions` CLI
+    /// invocation would.
+    #[test]
+    fn test_builtin_upper_in_and_src_suppress_ordinary_error_under_optional_yq_2015() {
+        yq_query!(br"1", r#"IN(error("boom"))?"#,
+            QueryResult::None => {}
+        );
+        yq_query!(br"1", r#"IN(1; error("boom"))?"#,
+            QueryResult::None => {}
+        );
+        yq_query!(br"1", r#"IN(error("boom"); 1)?"#,
+            QueryResult::None => {}
+        );
+    }
+
     /// #910: an earlier match short-circuits before a *later* candidate's
     /// error is ever consulted -- confirmed against real jq 1.7.1,
     /// `IN(2, error("boom"))` on `2` is `true`, not an error. When no
