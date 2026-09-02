@@ -1575,11 +1575,17 @@ fn stream_outputs<W: Clone + AsRef<[u64]>>(
 /// cannot preserve; `eval_foreach`'s INIT `Halt` arm must win unconditionally
 /// over an already-pending `input_control`, which this fold's uniform
 /// `Option::or` reconciliation downstream would get backwards). Verified by
-/// hand, not assumed, that the four sites this *is* applied to have no such
-/// wrinkle: each already routes an empty converted prefix through
+/// hand, not assumed, that the *bound-value-materialization* sites this
+/// consolidation targets (`eval_as`, `eval_reduce`'s INIT, `eval_as_pattern`,
+/// plus one more) have no such wrinkle: each already routes an empty
+/// converted prefix through
 /// [`owned_vec_to_result`]/[`partial`]/[`finish_fork`], which already
 /// collapse to the exact same `QueryResult` the hand-rolled early return
-/// upstream produced.
+/// upstream produced. Since consolidated, this function has also picked up
+/// unrelated one-shot generator-conversion callers with no such ordering
+/// concern at all (object construction's key/value slots and jq-mode string
+/// interpolation, #2022; `fanout_arg`, #2023) -- the count above is about
+/// this one bound-value shape specifically, not a total call-site census.
 fn stream_outputs_checked<W: Clone + AsRef<[u64]>>(
     result: QueryResult<'_, W>,
 ) -> (Vec<OwnedValue>, Option<Control>) {
@@ -43676,6 +43682,27 @@ mod tests {
             QueryResult::Owned(OwnedValue::Object(map)) => {
                 assert_eq!(map.get("k"), Some(&OwnedValue::String("ok".into())));
             }
+        );
+    }
+
+    /// #2022 sibling: `build_object_entries` is shared, unconditional code --
+    /// no `EvalTag` gate -- so the fix applies equally in yq mode. Same
+    /// library-API-only caveat as the jq-mode tests above: this decode
+    /// failure shape has no real-syntax reachable analog to check against a
+    /// live oracle (raw invalid UTF-8 is rejected at YAML parse time, before
+    /// evaluation ever runs), so this only confirms the fix is applied
+    /// uniformly across both `EvalSemantics`, not a jq/yq-parity claim.
+    #[test]
+    fn test_yq_object_construction_raises_on_decode_failure_2022() {
+        yq_query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            "{(.a): 1}",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        yq_query!(
+            b"{\"a\": \"\xff\xfe\"}",
+            "{\"k\": .a}",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
         );
     }
 

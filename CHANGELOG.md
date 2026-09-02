@@ -9,18 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Object construction's key/value slots and jq-mode string interpolation no
-  longer silently substitute `""` for an undecodable string** (#2022): all
-  three fed their generator's output through `stream_outputs` (bare
-  `to_owned`, via `collect_owned`) instead of the already-existing
-  `stream_outputs_checked`, so `{(.a): 1}`/`{"k": .a}`/`"\(.a)"` on an
-  undecodable `.a` silently produced `{"":1}`/`{"k":""}`/`""` instead of
-  raising — the same #1746/#1972 bug shape this codebase has closed at ~15-20
-  other call sites (#1934's tracked lineage), just not yet at these three.
-  Found during #1989's classification pass. Two related call sites
-  (`fanout_arg`/`fanout_two_args`'s own argument materialization) were
-  investigated but left unfixed pending their own dedicated verification —
-  see #2165.
+- **`succinctly::jq::eval`'s object-construction key/value slots and jq-mode
+  string interpolation no longer silently substitute `""` for an undecodable
+  string** (#2022): all three fed their generator's output through
+  `stream_outputs` (bare `to_owned`, via `collect_owned`) instead of the
+  already-existing `stream_outputs_checked`, so `{(.a): 1}`/`{"k": .a}`/
+  `"\(.a)"` on an undecodable `.a` silently produced `{"":1}`/`{"k":""}`/`""`
+  instead of raising — the same #1746/#1972 bug shape this codebase has
+  closed at ~15-20 other call sites (#1934's tracked lineage), just not yet
+  at these three. Found during #1989's classification pass.
+
+  Reachable only through the public `succinctly::jq::eval` library API, the
+  same as #1755's original finding for this bug family — the bundled CLI is
+  unaffected either way: `Expr::Object`/`Expr::StringInterpolation` have no
+  dedicated arm in `eval_generic.rs` (the CLI's own bridge), so both fall to
+  its wildcard arm, which already runs the *entire current value* through a
+  checked conversion before this function is ever reached, regardless of
+  whether the undecodable field is one the query actually touches.
+
+  A related call site, `fanout_two_args`'s own argument materialization, was
+  investigated but left unfixed pending its own dedicated verification — see
+  #2165 (also corrects an earlier belief that `fanout_arg` was still open;
+  it was already fixed by #2023).
 
 - **Self-recursive and branching user-defined `def`s now evaluate** (#1371). `def
   sum_to(n): if n == 0 then 0 else n + sum_to(n-1) end; sum_to(100)` returns `5050`, and
