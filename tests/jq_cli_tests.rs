@@ -31633,10 +31633,20 @@ fn test_index_expr_one_empty_key_does_not_short_circuit_others_2032() -> Result<
 /// CLI-unreachable in general, though -- `succinctly yq` reaches it via
 /// `yq_runner.rs`'s `evaluate_input` (`jq::eval::<Vec<u64>,
 /// YqSemantics>(expr, cursor)`, at least 8 call sites, triggered by e.g.
-/// `-n`/`-R`/`--slurp`), so its sibling fix is covered there both by that
-/// live yq-mode path and by `eval.rs`'s own in-process `#[cfg(test)]` unit
-/// tests on pure targets, e.g.
-/// `test_computed_index_ordinary_cross_product_unaffected_1634`.
+/// `-n`/`-R`/`--slurp`). That path can't extend regression coverage to
+/// *this* stateful-target mechanism specifically, though: `input`/`inputs`
+/// are rejected at parse time in yq mode (`parser.rs`'s
+/// `reject_in_yq_mode("input")`, live-verified: `succinctly yq -n
+/// '[(input)[("a","b")]]'` -> "input is not supported in yq mode"), so the
+/// yq-mode path only proves `eval::eval_index_expr` is CLI-reachable on
+/// *pure* targets -- the same category `eval.rs`'s own in-process
+/// `#[cfg(test)]` unit tests already cover (e.g.
+/// `test_computed_index_ordinary_cross_product_unaffected_1634`), not a
+/// second, independent source of coverage for the stateful re-evaluation
+/// bug this test itself pins. That bug's only coverage remains this test
+/// (via `eval_generic::eval_index_expr`, live over `succinctly jq`) plus
+/// `eval.rs`'s own in-process unit tests -- unchanged from before this
+/// comment was corrected.
 /// Verified against jq 1.7.1: both emit `[1,4]` (key `"a"` re-reads `input`
 /// to get `{"a":1,"b":2}` -> `.a` = 1; key `"b"` re-reads `input` again to
 /// get `{"a":3,"b":4}` -> `.b` = 4).
