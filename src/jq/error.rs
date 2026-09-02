@@ -214,6 +214,23 @@ impl From<EvalEscape> for Control {
 const DUMP_BUDGET: usize = 14;
 const DUMP_KEEP: usize = 11;
 
+/// #2179: the `path()`-family "Invalid path expression..." messages don't
+/// share `DUMP_BUDGET`/`DUMP_KEEP` with the `<type> (<dump>)`-shaped ones
+/// above -- confirmed by reading jq 1.7.1's C source (`execute.c`), not
+/// assumed: `PATH_END`'s `Invalid path expression with result %s` and the
+/// `INDEX`/`EACH` "near attempt to..." messages all call
+/// `jv_dump_string_trunc` with `char errbuf[30]` (`objbuf[30]` for
+/// `near_access`'s *container* argument specifically -- its *element*/key
+/// argument still uses `char keybuf[15]`, i.e. the narrow `DUMP_KEEP` above,
+/// unchanged). `errbuf[30]` gives `DUMP_BUDGET_WIDE` = 29, `DUMP_KEEP_WIDE`
+/// = 26 by the identical `bufsize - 1`/`bufsize - 4` arithmetic
+/// `jv_dump_string_trunc` uses for every buffer size. Live-verified against
+/// the pinned jq 1.7.1 oracle for all three message shapes (a 26-byte-kept
+/// dump for the wide ones, an unchanged 11-byte-kept dump for
+/// `near_access`'s own element argument).
+const DUMP_BUDGET_WIDE: usize = 29;
+const DUMP_KEEP_WIDE: usize = 26;
+
 /// A value's JSON dump, truncated the way jq truncates it.
 ///
 /// Unlike jq — which builds the entire dump with `jv_dump_string` and then
@@ -253,7 +270,30 @@ fn dump_truncated(value: &OwnedValue) -> String {
 /// formatter is needed, only a dispatch. Both modes still share the same
 /// truncation budget and boundary-snapping behavior below.
 fn dump_truncated_with(tag: EvalTag, value: &OwnedValue) -> String {
-    let mut sink = PreviewSink::new(DUMP_BUDGET);
+    dump_truncated_at(tag, value, DUMP_BUDGET, DUMP_KEEP)
+}
+
+/// #2179's wide sibling of [`dump_truncated`], for the `path()`-family
+/// "Invalid path expression..." messages -- jq-pinned shim (#1055), same
+/// shape and same eventual `S::TAG` migration as [`dump_truncated`] itself.
+fn dump_truncated_wide(value: &OwnedValue) -> String {
+    dump_truncated_wide_with(EvalTag::Jq, value)
+}
+
+/// Mode-aware sibling of [`dump_truncated_wide`] (#1055): see
+/// [`dump_truncated_with`]'s doc comment -- the same dispatch, just at
+/// [`DUMP_BUDGET_WIDE`]/[`DUMP_KEEP_WIDE`] instead.
+fn dump_truncated_wide_with(tag: EvalTag, value: &OwnedValue) -> String {
+    dump_truncated_at(tag, value, DUMP_BUDGET_WIDE, DUMP_KEEP_WIDE)
+}
+
+/// The truncation logic [`dump_truncated_with`]/[`dump_truncated_wide_with`]
+/// share, parameterized on the `(budget, keep)` pair jq's own
+/// `jv_dump_string_trunc` derives from its caller's buffer size (`bufsize -
+/// 1`/`bufsize - 4` respectively -- see [`DUMP_KEEP_WIDE`]'s own doc
+/// comment for the arithmetic).
+fn dump_truncated_at(tag: EvalTag, value: &OwnedValue, budget: usize, keep: usize) -> String {
+    let mut sink = PreviewSink::new(budget);
     // The sink stops the writer once the dump is known to exceed the budget;
     // writing into a `String` cannot fail for any other reason, so the returned
     // `Result` carries nothing `sink.overflowed` has not already recorded.
@@ -261,7 +301,7 @@ fn dump_truncated_with(tag: EvalTag, value: &OwnedValue) -> String {
     if !sink.overflowed {
         return sink.buf;
     }
-    sink.truncate_to(DUMP_KEEP);
+    sink.truncate_to(keep);
     sink.buf.push_str("...");
     sink.buf
 }
@@ -961,15 +1001,17 @@ impl EvalError {
     /// than one jq recognises but leaves unresolved. Unlike the `describe`-
     /// shaped messages above, jq embeds the bare dump here, not
     /// `<type> (<dump>)`: `path(1)` reports `result 1`, not
-    /// `result number (1)`. The dump is truncated the same way every other
-    /// embedded value is (jq's shared `jv_dump_string_trunc`), so a long
-    /// result still previews to `DUMP_KEEP` bytes.
+    /// `result number (1)`. #2179: this message's dump does *not* share
+    /// `DUMP_KEEP`/`DUMP_BUDGET` with the `describe`-shaped ones -- jq's own
+    /// `PATH_END` case uses a wider `char errbuf[30]`, not the `errbuf[15]`
+    /// those use, giving `DUMP_KEEP_WIDE` (26 bytes) here instead (see that
+    /// constant's own doc comment).
     pub fn invalid_path_expression(value: &OwnedValue) -> Self {
         Self::with_kind(
             format!(
                 "{}{}",
                 Self::INVALID_PATH_EXPRESSION_PREFIX,
-                dump_truncated(value)
+                dump_truncated_wide(value)
             ),
             ErrorKind::InvalidPathExpression,
         )
@@ -998,6 +1040,13 @@ impl EvalError {
     /// constructor deliberately does *not* participate in
     /// [`Self::is_invalid_path_expression`] — only in that narrower,
     /// position-sensitive check.
+    ///
+    /// #2179: `element`/`container` are truncated at *different* widths, not
+    /// the same one -- jq's own `INDEX`/`INDEX_OPT` case truncates the key
+    /// (`element`) with `char keybuf[15]` (the narrow, shared `DUMP_KEEP`,
+    /// unchanged) but the container with its own `char objbuf[30]`
+    /// (`DUMP_KEEP_WIDE`, the same wide constant [`Self::invalid_path_expression`]
+    /// uses), confirmed against jq 1.7.1's C source and live-verified.
     pub fn invalid_path_expression_near_access(
         element: &OwnedValue,
         container: &OwnedValue,
@@ -1007,7 +1056,7 @@ impl EvalError {
                 "{}{} of {}",
                 Self::UNTRACKED_NAVIGATION_ACCESS_PREFIX,
                 dump_truncated(element),
-                dump_truncated(container)
+                dump_truncated_wide(container)
             ),
             ErrorKind::UntrackedNavigation,
         )
@@ -1027,12 +1076,17 @@ impl EvalError {
     /// `path(try (.a, error(5)) catch .[])` on a caught scalar `5` reports
     /// "near attempt to iterate through 5", never "Cannot iterate over
     /// number").
+    ///
+    /// #2179: `container` uses the same wide truncation as
+    /// [`Self::invalid_path_expression_near_access`]'s own container -- jq's
+    /// `EACH`/`EACH_OPT` case truncates with `char errbuf[30]`, confirmed
+    /// against jq 1.7.1's C source and live-verified.
     pub fn invalid_path_expression_near_iterate(container: &OwnedValue) -> Self {
         Self::with_kind(
             format!(
                 "{}{}",
                 Self::UNTRACKED_NAVIGATION_ITERATE_PREFIX,
-                dump_truncated(container)
+                dump_truncated_wide(container)
             ),
             ErrorKind::UntrackedNavigation,
         )
@@ -1610,15 +1664,60 @@ mod tests {
         );
     }
 
-    /// Long results are truncated the same way every other embedded value is:
-    /// 11 bytes of the dump (opening quote plus 10 characters here) then `...`.
+    /// #2179: long results are truncated wider than every other embedded
+    /// value (`DUMP_KEEP_WIDE` = 26 bytes, not the shared `DUMP_KEEP` = 11) —
+    /// jq's own `PATH_END` case uses `char errbuf[30]`, not `errbuf[15]`,
+    /// confirmed against jq 1.7.1's C source and live-verified: 26 bytes of
+    /// the dump (opening quote plus 25 characters here) then `...`.
     #[test]
     fn invalid_path_expression_truncates_a_long_result() {
-        let long = "a".repeat(20);
-        let kept: String = "a".repeat(10);
+        let long = "a".repeat(40);
+        let kept: String = "a".repeat(25);
         assert_eq!(
             EvalError::invalid_path_expression(&s(&long)).message,
             format!("Invalid path expression with result \"{kept}...")
+        );
+    }
+
+    /// #2179: `invalid_path_expression_near_access`'s `container` argument
+    /// uses the same wide (26-byte) truncation as `invalid_path_expression`
+    /// above -- jq's `INDEX`/`INDEX_OPT` case truncates it with
+    /// `char objbuf[30]`, not `errbuf[15]`.
+    #[test]
+    fn invalid_path_expression_near_access_truncates_a_long_container() {
+        let long = "a".repeat(40);
+        let kept: String = "a".repeat(25);
+        assert_eq!(
+            EvalError::invalid_path_expression_near_access(&OwnedValue::Int(1), &s(&long)).message,
+            format!("Invalid path expression near attempt to access element 1 of \"{kept}...")
+        );
+    }
+
+    /// #2179: unlike its own sibling `container` argument, `element` keeps
+    /// the narrow (11-byte) truncation -- jq's `INDEX`/`INDEX_OPT` case
+    /// truncates it with `char keybuf[15]`, the same width every
+    /// `describe`-shaped message uses.
+    #[test]
+    fn invalid_path_expression_near_access_element_stays_narrow() {
+        let long = "a".repeat(20);
+        let kept: String = "a".repeat(10);
+        assert_eq!(
+            EvalError::invalid_path_expression_near_access(&s(&long), &OwnedValue::Int(1)).message,
+            format!("Invalid path expression near attempt to access element \"{kept}... of 1")
+        );
+    }
+
+    /// #2179: `invalid_path_expression_near_iterate`'s `container` argument
+    /// uses the same wide (26-byte) truncation as the two constructors
+    /// above -- jq's `EACH`/`EACH_OPT` case truncates it with
+    /// `char errbuf[30]`, not `errbuf[15]`.
+    #[test]
+    fn invalid_path_expression_near_iterate_truncates_a_long_container() {
+        let long = "a".repeat(40);
+        let kept: String = "a".repeat(25);
+        assert_eq!(
+            EvalError::invalid_path_expression_near_iterate(&s(&long)).message,
+            format!("Invalid path expression near attempt to iterate through \"{kept}...")
         );
     }
 
