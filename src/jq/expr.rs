@@ -570,12 +570,12 @@ pub enum Expr {
 /// carrying the old node's, since a cache keyed on arguments that just
 /// changed is exactly a stale one.
 ///
-/// Write-once by design (see [`Self::get_or_try_init`]/[`Self::get_or_init`]
-/// below) — safe *only* because `DefCall.frames` is a plain field, frozen
-/// once by whichever `install_def_calls` pass built this specific node, and
-/// never re-read from ambient state at call time. [`Expr::FuncDef`]'s own
-/// cache (#2094) needs a different shape for exactly that reason: see
-/// [`FuncDefBound`]'s own doc comment.
+/// Write-once by design (see [`Self::get_or_try_init`] below) — safe *only*
+/// because `DefCall.frames` is a plain field, frozen once by whichever
+/// `install_def_calls` pass built this specific node, and never re-read from
+/// ambient state at call time. [`Expr::FuncDef`]'s own cache (#2094) needs a
+/// different shape for exactly that reason: see [`FuncDefBound`]'s own doc
+/// comment.
 #[derive(Clone, Default)]
 pub struct BoundBody(core::cell::OnceCell<Rc<Expr>>);
 
@@ -620,9 +620,9 @@ impl core::fmt::Debug for BoundBody {
 ///
 /// Computed on first evaluation and reused afterwards -- unlike
 /// [`BoundBody`], keyed additionally by the ambient frame depth
-/// ([`super::eval::ambient_frame_depth`]) it was computed at, and
-/// recomputed (not just left stale) whenever that depth differs from what
-/// produced the cached answer.
+/// (`eval::ambient_frame_depth`, private to that module) it was computed
+/// at, and recomputed (not just left stale) whenever that depth differs
+/// from what produced the cached answer.
 ///
 /// The naive `OnceCell`-style write-once cache `BoundBody` uses is unsound
 /// here: installing a `def` bakes the *current* ambient depth into every
