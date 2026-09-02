@@ -25138,22 +25138,61 @@ fn resolve_seq<'a, S: EvalSemantics>(
         // `Keep::First`, #987's "stop a generator after its first output"
         // rule) — correct only for the position nothing else in this
         // `resolve_seq` call follows. An earlier stage here is not that
-        // position whenever a later stage or a non-empty `tail` still has
-        // to run: a `select`/filter downstream may reject that stage's
-        // first output and only accept a later one (`paths | select(length
-        // == 2) | .foo` needs `paths`'s *second* output, since its first
-        // is rejected), so truncating the generator to one value before
-        // the filter ever runs can turn a genuine "later output survives"
-        // pipe into a wrongly-empty result, or a wrongly-silent one — #1872's
-        // `resolve_fold_source` already established the fix for its own
-        // "needs every output" case (`Keep::AtMost(usize::MAX)`, not
-        // `Keep::First`); this reuses the identical value for the identical
-        // reason. Only `resolve_leaf`'s general non-primitive case actually
-        // reads `keep` at all (its own doc comment), so this widening is a
-        // no-op for every other arm (`Select` included, which ignores
-        // `keep` entirely) and only changes behavior for a bare generator
-        // builtin (`paths`, `range`, `keys`, ...) reached mid-pipe.
-        let stage_keep = if stage_index == last_dynamic && tail.is_empty() {
+        // position whenever a *later stage in this same fan-out loop*
+        // still has to run: a `select`/filter downstream may reject that
+        // stage's first output and only accept a later one (`paths |
+        // select(length == 2) | .foo` needs `paths`'s *second* output,
+        // since its first is rejected), so truncating the generator to one
+        // value before the filter ever runs can turn a genuine "later
+        // output survives" pipe into a wrongly-empty result, or a
+        // wrongly-silent one — #1872's `resolve_fold_source` already
+        // established the fix for its own "needs every output" case
+        // (`Keep::AtMost(usize::MAX)`, not `Keep::First`); this reuses the
+        // identical value for the identical reason. Only `resolve_leaf`'s
+        // general non-primitive case actually reads `keep` at all (its own
+        // doc comment), so this widening is a no-op for every other arm
+        // (`Select` included, which ignores `keep` entirely) and only
+        // changes behavior for a bare generator builtin (`paths`, `range`,
+        // `keys`, ...) reached mid-pipe.
+        //
+        // `tail` (this call's own *static* trailing components — `Field`/
+        // `Index`/`Slice`, never `Select` or anything else that can reject
+        // — see `push_path_components`/`needs_path_prepass`) is deliberately
+        // NOT part of this condition, unlike an earlier version of this fix
+        // (#2050 code review): a static component can only either succeed
+        // with exactly one output or *error*, and an uncaught error aborts
+        // the whole evaluation rather than making jq backtrack and try an
+        // earlier stage's next candidate (confirmed live: `path(range(3) |
+        // debug | .a)` calls `debug` exactly once, on `0`, then raises —
+        // `1`/`2` are never even asked for, so `.a` being unconditionally
+        // erroring on a number is not a reason to widen `range`'s own
+        // `keep`). Gating on `tail.is_empty()` too made the truly-last
+        // fan-out stage (whatever precedes a non-empty static tail) widen
+        // unconditionally — silently reintroducing #987's regression
+        // (`path(paths | .a)`/`path(range(1_000_000) | .a)` fully
+        // materializing their generator before the static tail ever runs)
+        // for the overwhelmingly common "one dynamic stage, then a plain
+        // field/index" shape. `stage_index == last_dynamic` alone is sound
+        // regardless of `tail`'s contents: #2050's own repro still widens
+        // correctly, because `select` there occupies `last_dynamic` itself
+        // (not `paths`), so `paths` (`stage_index` 0 of 1) is unaffected by
+        // this change.
+        //
+        // A residual, narrower divergence remains for a *non-rejecting*
+        // builtin (`debug`, `stderr`, ...) sitting between two genuine
+        // fan-out stages with no filter between them (`path(range(3) |
+        // debug | .a)`): `debug` itself, now at `last_dynamic`, correctly
+        // gets the real `keep` regardless of `tail` — but `range` (an
+        // *earlier* fan-out-loop stage) still widens, because nothing here
+        // proves `debug` cannot reject a candidate the way `select` can.
+        // Live-verified this is not merely cosmetic: `path(range(1_000_000)
+        // | debug | .a)` calls `debug` 100,000 times here (a
+        // `RECURSE_MAX_ITEMS`-style cap, not the full million) against
+        // jq's own single call. Distinguishing "can this later stage ever
+        // reject" from "is this just the last static-tail-adjacent stage"
+        // needs a real reachable-rejection analysis this fix does not
+        // attempt — tracked as #2178 rather than folded in here.
+        let stage_keep = if stage_index == last_dynamic {
             keep
         } else {
             Keep::AtMost(usize::MAX)

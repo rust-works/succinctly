@@ -25452,6 +25452,31 @@ fn test_paths_filter_laziness_reaches_del_and_assign_987() -> Result<()> {
     Ok(())
 }
 
+/// #2050 code review: `resolve_seq`'s original fix widened a fan-out
+/// stage's `keep` to "need every output" whenever its own trailing `tail`
+/// (a purely static `Field`/`Index`/`Slice` suffix, never a `select`) was
+/// non-empty -- not just when a genuinely rejecting stage followed it in
+/// the same loop. That silently reintroduced #987's own regression for the
+/// overwhelmingly common "one dynamic stage, then a plain field/index"
+/// shape: `range(3)` was fully materialized (side effects included) before
+/// the static `.a` tail ever ran, even though jq itself only ever visits
+/// `range`'s first output (a static tail either succeeds once or errors --
+/// an error aborts the whole computation rather than making jq backtrack
+/// for `range`'s next candidate). Confirmed against jq 1.7.1: `stderr`
+/// fires exactly once (`0`), not three times.
+#[test]
+fn test_path_single_dynamic_stage_static_tail_does_not_over_materialize_2050() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "path(range(3) | (stderr, .a))"], Some("null"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(
+        stderr.trim_end(),
+        "0jq: error (at <stdin>:0): Invalid path expression with result 0"
+    );
+    Ok(())
+}
+
 /// The same eagerness applied to `input`/`inputs` destroys data.
 ///
 /// `input`/`inputs` pop from the process-global queue that the CLI's own
