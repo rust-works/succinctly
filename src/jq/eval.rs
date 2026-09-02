@@ -7173,7 +7173,7 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 fn builtin_upper_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     s: &Expr,
     value: StandardJson<'a, W>,
-    _optional: bool,
+    optional: bool,
 ) -> QueryResult<'a, W> {
     // #932: `IN(s)` is jq's `any(s == .; .)`, so it stops at the first equal
     // candidate rather than evaluating every one and then testing the
@@ -7186,13 +7186,23 @@ fn builtin_upper_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // review) rather than silently falling back to widening equality.
     //
     // #1755: to_owned_checked, not to_owned -- an undecodable input must
-    // raise, not silently compare as "".
-    let current = match to_owned_checked(&value) {
-        Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
-    };
+    // raise, not silently compare as "". #2015: `..._or_suppress`, not
+    // unconditional `to_owned_checked` -- `IN(s)` is literally `any(s ==
+    // .; .)` (see this function's own doc comment), and `any`/`all`'s own
+    // `any_all_gen_cond` already treats a non-decode-failure error here as
+    // respecting `optional` (#2001); hardcoding this one sibling builtin to
+    // always raise was an accidental miss at #2001 time, not a deliberate
+    // divergence -- there is no doc comment anywhere claiming `IN(s)` has a
+    // principled reason to differ from `any`/`all`'s own already-fixed
+    // behavior (contrast `builtin_recurse_f`'s own doc comment, which does
+    // give one for *its* unused `optional`).
+    let current = to_owned_checked_or_suppress!(&value, optional);
     let mut found = false;
-    let flow = eval_each_owned::<S>(s, &current, false, &mut |candidate| {
+    // #2015: `optional`, not hardcoded `false` -- `s`'s own generator
+    // errors are `any_all_gen_cond`'s `gen` in `IN(s)`'s own `any(s ==
+    // .; .)` terms, and that sibling already threads the real ambient
+    // `optional` into its own `gen` evaluation for exactly this reason.
+    let flow = eval_each_owned::<S>(s, &current, optional, &mut |candidate| {
         if owned_value_eq::<S>(&candidate, &current) {
             found = true;
             Demand::Stop
@@ -7255,14 +7265,25 @@ fn builtin_upper_in_src<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     src: &Expr,
     s: &Expr,
     value: StandardJson<'a, W>,
-    _optional: bool,
+    optional: bool,
 ) -> QueryResult<'a, W> {
     let gen = Expr::Compare {
         op: CompareOp::Eq,
         left: Box::new(src.clone()),
         right: Box::new(s.clone()),
     };
-    any_all_gen_cond::<W, S>(&gen, &Expr::Identity, value, false, true)
+    // #2015: forward the real ambient `optional`, not hardcoded `false` --
+    // `any_all_gen_cond`'s own `optional` parameter is live and used
+    // throughout its body (#2001; see its doc comment on the root-value
+    // conversion above), and `builtin_any_cond`/`builtin_all_cond` (the
+    // `any`/`all` builtins this function's own doc comment says `IN(src;
+    // s)` delegates its fanout machinery to) both forward their real
+    // ambient `optional` unmodified. Hardcoding `false` here silently
+    // dropped that consistency for this one caller; there is no doc
+    // comment anywhere claiming `IN(src; s)` has a principled reason to
+    // differ (contrast `builtin_recurse_f`'s doc comment, which gives one
+    // for *its* unused `optional`).
+    any_all_gen_cond::<W, S>(&gen, &Expr::Identity, value, optional, true)
 }
 
 /// Builtin: select(condition)
@@ -43745,6 +43766,104 @@ mod tests {
         }
     }
 
+    /// #2015: `builtin_upper_in` (`IN(s)`) hardcoded `_optional` unused and
+    /// called `to_owned_checked` unconditionally, unlike its sibling `any`/
+    /// `all` (`any_all_gen_cond`, fixed by #2001 immediately above) despite
+    /// `IN(s)`'s own doc comment defining it as literally `any(s == .; .)`.
+    /// Verified against real jq 1.7.1 that `IN`/`any`/`recurse` all just get
+    /// caught uniformly by the outer `?` for an *ordinary* raised error --
+    /// real jq gives no signal distinguishing "principled exemption" from
+    /// "accidental gap" here, since jq's own builtins have no internal
+    /// suppression concept at all (`?`/`try` always catches from the
+    /// outside). The distinguishing test in *this* codebase is `optional`'s
+    /// own doc-comment-promised, live-and-used-elsewhere criterion
+    /// (`suppress_or_raise`'s doc comment) -- `IN(s)` has no comment
+    /// claiming a principled reason to differ from `any`/`all`, unlike
+    /// `builtin_recurse_f`'s. See #2015 for the full investigation.
+    #[test]
+    fn test_builtin_upper_in_respects_optional_for_malformed_member_error_2015() {
+        let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let s_expr = Expr::Identity;
+        match builtin_upper_in::<Vec<u64>, JqSemantics>(&s_expr, cursor.value(), true) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match builtin_upper_in::<Vec<u64>, JqSemantics>(&s_expr, cursor.value(), false) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// #2015: a genuine decode failure must still survive `optional` here
+    /// too -- `IN(s)`'s fix routes through `to_owned_checked_or_suppress!`,
+    /// which (like every other site sharing that macro) never suppresses
+    /// `is_decode_failure()`, only the #1194 malformed-member class above.
+    #[test]
+    fn test_builtin_upper_in_decode_failure_survives_optional_2015() {
+        let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
+        let index = JsonIndex::build(decode_failure_bytes);
+        let cursor = index.root(decode_failure_bytes);
+        let s_expr = Expr::Identity;
+        match builtin_upper_in::<Vec<u64>, JqSemantics>(&s_expr, cursor.value(), true) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure()),
+            other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
+        }
+    }
+
+    /// #2015: `builtin_upper_in_src` (`IN(src; s)`) had the identical gap --
+    /// it hardcoded `false` into its `any_all_gen_cond` call regardless of
+    /// its own (unused, `_`-prefixed) `optional` parameter. See
+    /// `test_builtin_upper_in_respects_optional_for_malformed_member_error_2015`'s
+    /// doc comment for the full reasoning.
+    #[test]
+    fn test_builtin_upper_in_src_respects_optional_for_malformed_member_error_2015() {
+        let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let src_expr = Expr::Identity;
+        let s_expr = Expr::Identity;
+        match builtin_upper_in_src::<Vec<u64>, JqSemantics>(
+            &src_expr,
+            &s_expr,
+            cursor.value(),
+            true,
+        ) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match builtin_upper_in_src::<Vec<u64>, JqSemantics>(
+            &src_expr,
+            &s_expr,
+            cursor.value(),
+            false,
+        ) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// #2015: a genuine decode failure must still survive `optional` for
+    /// `IN(src; s)` too, same reasoning as `IN(s)`'s matching test above.
+    #[test]
+    fn test_builtin_upper_in_src_decode_failure_survives_optional_2015() {
+        let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
+        let index = JsonIndex::build(decode_failure_bytes);
+        let cursor = index.root(decode_failure_bytes);
+        let src_expr = Expr::Identity;
+        let s_expr = Expr::Identity;
+        match builtin_upper_in_src::<Vec<u64>, JqSemantics>(
+            &src_expr,
+            &s_expr,
+            cursor.value(),
+            true,
+        ) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure()),
+            other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
+        }
+    }
+
     /// #2001: `builtin_contains`'s own root-value conversion had the same
     /// gap. See
     /// `test_eval_single_yq_slice_respects_optional_for_malformed_member_error_1953`'s
@@ -54121,6 +54240,31 @@ mod tests {
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "boom");
             }
+        );
+    }
+
+    /// #2015: `?` suppresses an ordinary raised error from `IN`/`IN(src;
+    /// s)` the same way it does for every other jq construct -- confirmed
+    /// live against real jq 1.7.1: `1 | IN(error("boom"))?` and
+    /// `1 | IN(error("boom"); 1)?`/`1 | IN(1; error("boom"))?` are all
+    /// empty (`[]` under `[...]`), not an error, same as
+    /// `[1,2] | recurse(error("x"))?`'s partial-then-suppressed shape and
+    /// `1 | any(error("x"); .)?`'s empty shape. This was already correct
+    /// before the #2015 fix (the outer `Expr::Optional`/`eval_try` boundary
+    /// catches an ordinary `Error` regardless of what a callee does with
+    /// its own `optional` parameter internally, same as every #1953/#2001
+    /// site) -- pinned here so it stays correct now that `optional` is also
+    /// threaded internally.
+    #[test]
+    fn test_builtin_upper_in_and_src_suppress_ordinary_error_under_optional_2015() {
+        query!(br"1", r#"IN(error("boom"))?"#,
+            QueryResult::None => {}
+        );
+        query!(br"1", r#"IN(1; error("boom"))?"#,
+            QueryResult::None => {}
+        );
+        query!(br"1", r#"IN(error("boom"); 1)?"#,
+            QueryResult::None => {}
         );
     }
 

@@ -28,6 +28,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`IN(s)`/`IN(src; s)` now forward the real ambient `optional` instead of
+  hardcoding `false`** (#2015). Both builtins are defined in terms of
+  `any(...)` (`IN(s)` is `any(s == .; .)`, `IN(src; s)` is
+  `any(src == s; .)`), and `any`/`all`'s own shared implementation,
+  `any_all_gen_cond`, already threads a live, used `optional` parameter
+  through its root-value conversion and its generator's own error handling
+  (#2001) — but `builtin_upper_in`/`builtin_upper_in_src` never picked up
+  the matching update: the former called `to_owned_checked` unconditionally
+  (its own `optional` parameter was `_`-prefixed and unused), and the latter
+  passed a literal `false` into `any_all_gen_cond` regardless of its own
+  (also unused) `optional` parameter.
+
+  Found during review of issue #2015, which asked whether this was a
+  genuine gap or a principled exemption matching `builtin_recurse_f`'s own
+  (real jq's `recurse` has no internal optional-suppression concept, so its
+  `optional` is deliberately left unused — see that function's own doc
+  comment). It is not: unlike `recurse`, `IN`'s own doc comments describe it
+  as delegating its fanout machinery to the *already-correct* `any`/`all`
+  implementation, and no comment anywhere claimed a principled reason for
+  `IN` to diverge from that sibling. Confirmed live against jq 1.7.1 that
+  `IN`, `any`, and `recurse` all get caught uniformly by the outer `?` for
+  an *ordinary* raised error (real jq has no internal suppression concept
+  for any of the three, so it gives no signal either way); the actual
+  distinguishing gap is entirely internal to this codebase's
+  `optional`-threading discipline, in the same family as #1953/#2001/#2010.
+
+  Not reachable via any live `?`/`try` syntax today — like every one of
+  #2001's five sites, `Expr::Optional`'s own dispatch evaluates its inner
+  expression with the *ambient* `optional` and lets the outer `eval_try`
+  catch the result independently of what the callee does internally, so
+  this closes an internal-consistency gap (and a possible future-caller
+  trap) rather than a user-observable regression. A genuine decode failure
+  (invalid UTF-8) is unaffected either way — that class is never suppressed
+  by `optional`, with or without this fix.
+
 - **A rejecting `select(...)` after a generator builtin (`paths`, `range`, ...)
   no longer swallows a surviving branch's own path-validity check** (#2050).
   Inside a path expression, when `select(...)` rejected at least one branch a
