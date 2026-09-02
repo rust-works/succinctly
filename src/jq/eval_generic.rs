@@ -46,6 +46,8 @@ use super::eval::{
     vec_with_capacity, Control, Demand, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics,
     LimitN, QueryResult, YqSemantics,
 };
+#[cfg(test)]
+use super::expr::BoundBody;
 use super::expr::{Builtin, CompareOp, Expr, FormatType, Pattern};
 use super::slice::{slice_str, SliceBounds};
 use super::value::{owned_value_eq, NumberRepr, OwnedValue};
@@ -5725,9 +5727,10 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             params,
             body,
             then,
+            bound,
         } => {
-            let bound_then = bind_def(name, params, body, then);
-            eval_each_generic::<S, V>(&bound_then, value, optional, cursor, sink)
+            let bound_then = bind_def(name, params, body, then, bound);
+            eval_each_generic::<S, V>(bound_then, value, optional, cursor, sink)
         }
 
         // #1371: mirrors `eval.rs`'s own `DefCall`/`Shared` pair -- see there
@@ -18100,15 +18103,17 @@ mod tests {
             params,
             body,
             then,
+            ..
         } = parse("def f: f; f").unwrap()
         else {
             panic!("expected a top-level FuncDef");
         };
 
         let _guard = enter_def_call_frame(crate::jq::eval::MAX_EVAL_FRAMES);
-        let defcall = bind_def(&name, &params, &body, &then);
+        let cache = BoundBody::default();
+        let defcall = bind_def(&name, &params, &body, &then, &cache);
         assert!(
-            matches!(&defcall, Expr::DefCall { frames, .. } if *frames == crate::jq::eval::MAX_EVAL_FRAMES),
+            matches!(&**defcall, Expr::DefCall { frames, .. } if *frames == crate::jq::eval::MAX_EVAL_FRAMES),
             "expected bind_def to seed frames from the ambient depth"
         );
 
@@ -18117,8 +18122,7 @@ mod tests {
         let cursor = index.root(json);
 
         let mut on_value = |_item: GenericResult<_>| true;
-        let control =
-            eval_each_with_cursor_using::<JqSemantics, _>(&defcall, cursor, &mut on_value);
+        let control = eval_each_with_cursor_using::<JqSemantics, _>(defcall, cursor, &mut on_value);
 
         match control {
             Some(Control::Error(err)) => assert!(

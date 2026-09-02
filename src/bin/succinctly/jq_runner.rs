@@ -17,8 +17,8 @@ use succinctly::jq::eval_generic::{
 };
 use succinctly::jq::walk::map_builtin_subexprs;
 use succinctly::jq::{
-    self, format_number_jq_compat, nonfinite_display_string, EvalError, Expr, JqSemantics, JqValue,
-    OwnedValue, Program, UnresolvedCall, MAX_VALUE_TREE_DEPTH,
+    self, format_number_jq_compat, nonfinite_display_string, BoundBody, EvalError, Expr,
+    JqSemantics, JqValue, OwnedValue, Program, UnresolvedCall, MAX_VALUE_TREE_DEPTH,
 };
 use succinctly::json::light::{preceding_gap_ok, JsonCursor, StandardJson};
 use succinctly::json::validate::{self, ValidationError};
@@ -158,6 +158,7 @@ impl ModuleLoader {
                 params,
                 body: Box::new(body),
                 then: Box::new(expr),
+                bound: BoundBody::default(),
             };
         }
 
@@ -171,6 +172,7 @@ impl ModuleLoader {
                     params,
                     body: Box::new(body),
                     then: Box::new(expr),
+                    bound: BoundBody::default(),
                 };
             }
         }
@@ -189,6 +191,7 @@ impl ModuleLoader {
                     params,
                     body: Box::new(body),
                     then: Box::new(expr),
+                    bound: BoundBody::default(),
                 };
             }
         }
@@ -258,11 +261,13 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
             params,
             body,
             then,
+            ..
         } => Expr::FuncDef {
             name,
             params,
             body: Box::new(rewrite_namespaced_calls(*body)),
             then: Box::new(rewrite_namespaced_calls(*then)),
+            bound: BoundBody::default(),
         },
         Expr::Arithmetic { op, left, right } => Expr::Arithmetic {
             op,
@@ -470,6 +475,7 @@ fn extract_func_defs(expr: &Expr) -> Vec<(String, Vec<String>, Expr)> {
             params,
             body,
             then,
+            ..
         } = expr
         {
             defs.push((name.clone(), params.clone(), (**body).clone()));

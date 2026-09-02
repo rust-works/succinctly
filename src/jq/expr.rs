@@ -411,6 +411,14 @@ pub enum Expr {
         body: Box<Self>,
         /// Expression where this function is in scope
         then: Box<Self>,
+        /// `then`, with this def's own calls installed -- computed on first
+        /// evaluation of this node and reused afterwards (#2094), the same
+        /// way `DefCall`'s own `bound` field works. Every substitution pass
+        /// that rebuilds this node's `body`/`then`/`params` must reset this
+        /// to `BoundBody::default()`; a pass that merely clones the node
+        /// through unchanged (nothing here was substituted into) may carry
+        /// the cached value along.
+        bound: BoundBody,
     },
 
     /// Function call: `name` or `name(args)`
@@ -579,6 +587,15 @@ impl BoundBody {
         }
         let bound = bind()?;
         Ok(self.0.get_or_init(|| bound))
+    }
+
+    /// The bound body, computing it with an infallible `bind` on first call.
+    ///
+    /// For a cache site whose `bind` can never fail (#2094's `FuncDef`
+    /// installation, unlike `DefCall`'s own recursion-depth-guarded bind) --
+    /// see [`Self::get_or_try_init`] for the fallible counterpart.
+    pub fn get_or_init(&self, bind: impl FnOnce() -> Rc<Expr>) -> &Rc<Expr> {
+        self.0.get_or_init(bind)
     }
 }
 

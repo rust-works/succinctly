@@ -514,6 +514,7 @@ fn check(expr: &Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
             params,
             body,
             then,
+            ..
         } => {
             let outer = scope.len();
             scope.push((name.clone(), params.len()));

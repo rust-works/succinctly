@@ -21,6 +21,8 @@
 
 use alloc::boxed::Box;
 
+#[cfg(test)]
+use super::BoundBody;
 use super::{Builtin, Expr, ObjectKey, StringPart};
 
 /// The sub-expressions a [`Builtin`] owns, in source order.
@@ -924,6 +926,7 @@ mod tests {
             params: Vec::new(),
             body: Box::new(Expr::Builtin(Builtin::Input)),
             then: Box::new(program.expr),
+            bound: BoundBody::default(),
         };
         assert!(uses_input_builtins(&expanded));
     }
