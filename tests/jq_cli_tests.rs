@@ -8705,6 +8705,73 @@ fn test_optional_ambient_no_longer_suppresses_rest_error_2073() -> Result<()> {
     Ok(())
 }
 
+/// #2073 side effect, characterized rather than fixed: isolating `inner`
+/// unconditionally changes what a path-context `rest` sees after a
+/// *missing* field -- a shape with no error in it anywhere, so nothing about
+/// `?`'s own suppression applies.
+///
+/// `Expr::Field`'s missing-key arm returns `QueryResult::Owned(Null)`
+/// without running `rest` and without threading the `new_path` it just
+/// built. Under the old combined-with-`rest` route that early return
+/// swallowed the whole downstream pipe, so `| key` never ran and `.zz`'s own
+/// `null` leaked out as the final output. Under isolation the probe never
+/// runs either, so `split_probe_pair` takes its fallback branch and `rest`
+/// continues from the *stale*, pre-`inner` path -- reporting the parent's
+/// key.
+///
+/// Both answers are wrong: `path(.b.zz)` is `["b","zz"]` in succinctly and
+/// in real jq 1.7.1 alike, so `"zz"` is what all of these should say. The
+/// value pinned below is the one that makes `?` agree with the five sibling
+/// isolating constructs, which have reported the stale key since #1409 and
+/// are unaffected by #2073 -- checked here alongside it so a future fix for
+/// #2213 moves all six together or fails loudly.
+#[test]
+fn test_optional_missing_field_reports_stale_path_like_its_siblings_2213() -> Result<()> {
+    let input = r#"{"b":{"x":1}}"#;
+
+    // The `?` case #2073 moved: `null` (rest skipped) before, the stale
+    // parent key now.
+    let (stdout, _, code) = run_jq_full(&["-c", ".b | (.zz)? | key"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "\"b\"\n");
+
+    // `rest` genuinely runs now, where the old route dropped it entirely --
+    // the second output is what proves it, not just the changed first one.
+    let (stdout, _, code) = run_jq_full(&["-c", ".b | (.zz)? | (key, 1)"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "\"b\"\n1\n");
+
+    // The five sibling isolating constructs, unchanged by #2073 and already
+    // reporting the same stale key on `main`. A fix for #2213 should move
+    // every one of these to `"zz"` at once.
+    for query in [
+        ".b | (try .zz) | key",
+        ".b | (try .zz catch \"c\") | key",
+        ".b | (label $o | .zz) | key",
+        ".b | (if true then .zz else empty end) | key",
+        ".b | (first(.zz)) | key",
+    ] {
+        let (stdout, _, code) = run_jq_full(&["-c", query], Some(input))?;
+        assert_eq!(code, 0, "query: {query}");
+        assert_eq!(stdout, "\"b\"\n", "query: {query}");
+    }
+
+    // The plain pipe keeps the *other* wrong answer -- `.zz`'s own `null`,
+    // with `| key` never having run. Pinned so #2213's fix has to address
+    // this spelling too, not just the isolating ones.
+    let (stdout, _, code) = run_jq_full(&["-c", ".b | .zz | key"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "null\n");
+
+    // What all seven should agree on, and the reason `"zz"` is the target:
+    // the path itself is right, and matches real jq 1.7.1.
+    let (stdout, _, code) = run_jq_full(&["-c", "[path(.b.zz)]"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[[\"b\",\"zz\"]]\n");
+
+    Ok(())
+}
+
 /// `?` on a bare bracket guards only the final index/slice step, never the
 /// bracket's own key/bounds sub-expression -- in path-context evaluation too
 /// (#1410).
