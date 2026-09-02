@@ -7475,6 +7475,25 @@ mod tests {
         );
     }
 
+    /// #2211: the sibling half of the object check above -- a missing comma
+    /// between two real *fields* (rather than a missing colon after one
+    /// key) is caught by the second field's own `key_cursor()` delimiter
+    /// check, not the first field's `value_cursor()` one.
+    #[test]
+    fn test_standard_json_to_jq_value_raises_on_missing_comma_between_object_fields_2211() {
+        let json: &[u8] = b"{\"a\":1 \"b\":2}";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let err = standard_json_to_jq_value(value, &cursor)
+            .expect_err("a missing comma between two real fields is not JSON");
+        assert!(
+            err.message.contains("Invalid JSON text"),
+            "message: {}",
+            err.message
+        );
+    }
+
     /// #2211: well-formed multi-element arrays/objects are unaffected by
     /// the new between-elements delimiter check above --
     /// `test_standard_json_to_jq_value_succeeds_on_valid_input_1192`'s own
