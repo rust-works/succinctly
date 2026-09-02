@@ -17908,6 +17908,16 @@ fn test_wide_recursive_comma_neither_crashes_nor_false_positives_2135() -> Resul
 /// with no recursive `def` inside never creates a `DefCall`, so nothing here
 /// is ever checked against `MAX_EVAL_FRAMES` regardless of width. Matches
 /// real jq 1.7.1 byte for byte on all three (confirmed live).
+///
+/// Filters are passed via `-f <file>`, not as a raw argv element (#2135 CI
+/// fix): a 41,000+-component filter string comfortably clears Linux's
+/// `ARG_MAX` for a single argument in isolation, but this crate's own test
+/// harness execs the binary through a `Command` whose *total* argv/environment
+/// footprint (inherited env included) counts against the same kernel limit --
+/// large enough here to trip `execve`'s "Argument list too long" on Linux CI
+/// (macOS's much larger `ARG_MAX` let this pass locally). `-f`/a temp file
+/// sidesteps the limit entirely, matching this file's own existing
+/// `test_from_file` pattern.
 #[test]
 fn test_wide_non_recursive_literals_and_pipes_unaffected_2135() -> Result<()> {
     let array = format!(
@@ -17917,7 +17927,12 @@ fn test_wide_non_recursive_literals_and_pipes_unaffected_2135() -> Result<()> {
             .collect::<Vec<_>>()
             .join(",")
     );
-    let (stdout, stderr, code) = run_jq_full(&["-c", &array], Some("null"))?;
+    let mut array_file = NamedTempFile::new()?;
+    write!(array_file, "{array}")?;
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "-f", array_file.path().to_str().unwrap()],
+        Some("null"),
+    )?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout.trim_end(), "100000");
 
@@ -17928,14 +17943,24 @@ fn test_wide_non_recursive_literals_and_pipes_unaffected_2135() -> Result<()> {
             .collect::<Vec<_>>()
             .join(",")
     );
-    let (stdout, stderr, code) = run_jq_full(&["-c", &object], Some("null"))?;
+    let mut object_file = NamedTempFile::new()?;
+    write!(object_file, "{object}")?;
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "-f", object_file.path().to_str().unwrap()],
+        Some("null"),
+    )?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout.trim_end(), "50000");
 
     let pipe = std::iter::repeat_n(".", 50_000)
         .collect::<Vec<_>>()
         .join(" | ");
-    let (stdout, stderr, code) = run_jq_full(&["-c", &pipe], Some("42"))?;
+    let mut pipe_file = NamedTempFile::new()?;
+    write!(pipe_file, "{pipe}")?;
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "-f", pipe_file.path().to_str().unwrap()],
+        Some("42"),
+    )?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout.trim_end(), "42");
     Ok(())
@@ -17966,13 +17991,24 @@ fn test_wide_non_recursive_literals_and_pipes_unaffected_2135() -> Result<()> {
 /// answer to match at all -- the width is chosen instead to comfortably
 /// clear this crate's own 40,000-frame ceiling, which is exactly the point
 /// being pinned.
+///
+/// Filters are passed via `-f <file>`, not as a raw argv element (#2135 CI
+/// fix) -- see `test_wide_non_recursive_literals_and_pipes_unaffected_2135`'s
+/// own doc comment for why a filter this size trips Linux's `ARG_MAX` for
+/// this harness's `Command` even though it passed locally on macOS.
 #[test]
 fn test_wide_non_recursive_pipe_and_object_do_not_false_positive_2135() -> Result<()> {
     let chain = std::iter::repeat_n(".", 41_000)
         .collect::<Vec<_>>()
         .join(" | ");
+
     let query = format!("def f: . + 1; ({chain} | f)");
-    let (stdout, stderr, code) = run_jq_full(&["-c", &query], Some("1"))?;
+    let mut query_file = NamedTempFile::new()?;
+    write!(query_file, "{query}")?;
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "-f", query_file.path().to_str().unwrap()],
+        Some("1"),
+    )?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout.trim_end(), "2");
 
@@ -17983,7 +18019,12 @@ fn test_wide_non_recursive_pipe_and_object_do_not_false_positive_2135() -> Resul
     // charge silently defeated -- see `sibling_frame_charge`'s own doc
     // comment for the full account).
     let query = format!("def f: . + 1; {chain} | f");
-    let (stdout, stderr, code) = run_jq_full(&["-c", &query], Some("1"))?;
+    let mut query_file = NamedTempFile::new()?;
+    write!(query_file, "{query}")?;
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "-f", query_file.path().to_str().unwrap()],
+        Some("1"),
+    )?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout.trim_end(), "2");
 
@@ -17992,7 +18033,12 @@ fn test_wide_non_recursive_pipe_and_object_do_not_false_positive_2135() -> Resul
         .collect::<Vec<_>>()
         .join(",");
     let query = format!(r#"def f: . + 1; ({{{entries},"r":f}}) | .r"#);
-    let (stdout, stderr, code) = run_jq_full(&["-c", &query], Some("1"))?;
+    let mut query_file = NamedTempFile::new()?;
+    write!(query_file, "{query}")?;
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "-f", query_file.path().to_str().unwrap()],
+        Some("1"),
+    )?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout.trim_end(), "2");
     Ok(())
