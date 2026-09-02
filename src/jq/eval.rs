@@ -41837,6 +41837,37 @@ pub(crate) fn is_pure_chain_link(expr: &Expr) -> bool {
 /// Real jq does not manage this on the same input -- `def deep: [deep]; deep`
 /// dies there with `cannot allocate memory`, exit 134 (confirmed live) -- so
 /// erroring instead is a divergence in the only direction ADR-0018 permits.
+///
+/// **Sibling breadth counts too, not just nesting (#2135).** The charging
+/// above was originally described only through *nesting* -- an expression
+/// descending into another, like array-wrapping `[[[X]]]`. A *wide, flat*
+/// sibling list (many elements in one `Expr::Pipe` or `Expr::Object`) turned
+/// out to carry the same kind of live native cost per recursive level, for
+/// the same reason: `eval_pipe`'s own recursion into a later pipe stage, and
+/// `build_object_entries`'s own recursion into a later object entry, are
+/// each not guaranteed to be tail-call-eliminated, so reaching sibling `i`
+/// holds siblings `0..i` live on the stack. `install_def_calls` charges pipe
+/// and object sibling `i` (0-indexed) `frames + i + 1` for exactly that
+/// reason -- confirmed necessary live: a 200-wide pipe (or 200-entry object)
+/// wrapping a recursive call in its last position crashed with a real stack
+/// overflow at 1,500 recursive levels under the old flat `frames + 1`
+/// charge, which never grew past a handful of units regardless of width and
+/// so never tripped this guard. `Expr::Comma` looks like the same shape but
+/// is not: `eval_comma` is a flat loop over its siblings, not a per-sibling
+/// self-recursive call chain, so it stayed on the flat charge -- confirmed
+/// by rebuilding the same repro through `Comma`/`last` instead of `Pipe`,
+/// which neither crashes nor trips the guard at 20x the width*depth product
+/// that crashes through `Pipe`. See `install_def_calls`'s own `Expr::Pipe`/
+/// `Expr::Comma`/`Expr::Object` arms for the full account.
+///
+/// Re-bisected after that fix, same 256 MB release profile: a 200-wide pipe
+/// wrapping a recursive call crashed (pre-fix) between depth 1,220 and 1,225
+/// -- the guard now fires at depth 197, better than 6x margin. A 5,000-wide
+/// pipe crashed between depth 50 and 51; the guard now fires at depth 8,
+/// also better than 6x. A 1,000-wide pipe crashed between depth 250 and 255;
+/// the guard now fires at depth 40, again better than 6x -- consistent
+/// across an order of magnitude of width, so `MAX_EVAL_FRAMES` itself did
+/// not need to change, only the per-sibling charge.
 pub(crate) const MAX_EVAL_FRAMES: u32 = 40_000;
 
 /// Evaluate one call to a user-defined function (#1371).
@@ -42074,6 +42105,65 @@ pub(crate) fn install_def_calls(expr: &Expr, def: &Rc<FuncDefData>, frames: u32)
             // node before it has been evaluated).
             bound: BoundBody::default(),
         },
+        // #2135: `eval_pipe` (`src/jq/eval.rs`) recurses once per pipe stage
+        // before it reaches a later sibling -- `eval_single(first, ...)` for
+        // stage 0 costs nothing extra, but reaching stage `i` costs `i`
+        // further `eval_pipe` frames still live on the native stack while
+        // control descends into it (the `QueryResult::One(v) =>
+        // eval_pipe::<W, S>(rest, v, optional)` arm is not guaranteed to be
+        // eliminated as a real tail call). That is exactly the mechanism
+        // `MAX_EVAL_FRAMES`'s own doc comment already names for *nesting*
+        // ("how much structure each one holds live across its own recursive
+        // call") -- just uncounted here for sibling breadth. The flat
+        // `frames + 1` every sibling used to get regardless of width or
+        // position undercounted this: a 200-wide pipe wrapping a recursive
+        // `deep(m-1)` call in its last position charged that call the same
+        // single `+1` a 2-wide pipe would, so `MAX_EVAL_FRAMES` (checked
+        // against the undercounted total) never fired and `deep(1500)`
+        // overflowed the real native stack instead (confirmed live, #2135).
+        //
+        // Charging sibling `i` (0-indexed) `frames + i + 1` instead prices a
+        // sibling near the end of a wide pipe the same as an equally-deep
+        // nested wrapping would be, while a sibling near the front --
+        // genuinely cheap in `eval_pipe`'s own recursion, since reaching it
+        // needs no extra frames at all -- stays cheap here too. An ordinary
+        // long *non-recursive* pipe (`.a | .b | .c | ...`, the common
+        // generated/templated-filter shape) is unaffected either way:
+        // nothing here is ever checked against `MAX_EVAL_FRAMES` until a
+        // `DefCall` is actually reached, and a pipe with no recursive call
+        // inside never creates one, regardless of how wide it is.
+        Expr::Pipe(exprs) => Expr::Pipe(
+            exprs
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    install_def_calls(e, def, frames.saturating_add(i as u32).saturating_add(1))
+                })
+                .collect(),
+        ),
+        // #2135: `Expr::Comma` looks like it should share `Pipe`'s gap above
+        // -- same `Vec<Expr>` sibling shape -- but does not. `eval_comma`
+        // (`src/jq/eval.rs`) is a flat `for expr in exprs` loop over its
+        // siblings, not a per-sibling self-recursive call chain: evaluating
+        // comma element `i` runs and returns within that same loop iteration,
+        // so elements `0..i` are never held live on the native stack while
+        // element `i` runs, no matter how wide the comma is. Confirmed by
+        // direct experiment, not just by reading the loop: rebuilding the
+        // #2135 repro shape with `last((1, 1, ..., 1, deep(m-1)))` (200
+        // ones) in place of the piped chain does not crash at the same
+        // (width=200, depth=1500) that overflows the stack through `Pipe`,
+        // nor even at (width=2000, depth=3000) -- a width*depth product 20x
+        // past `Pipe`'s own measured crash floor (~250,000-300,000). Left on
+        // the ordinary flat `frames + 1` charge below, via the generic
+        // fallthrough arm.
+        //
+        // `Expr::Object` turned out to need the opposite verdict --
+        // `build_object_entries` (`src/jq/eval.rs`) *is* self-recursive per
+        // entry (an entry's own recursive call sits before an `acc.pop()`
+        // cleanup step, so it cannot be tail-call-eliminated), and a
+        // 200-entry object literal wrapping the same recursive call crashes
+        // exactly like `Pipe` does, at the same shape. See its own arm below.
+        //
         // Reached for a different function name entirely, or (#1376)
         // a same-name call whose arity doesn't match this occurrence
         // -- either way, not this pass's call to resolve, so just
@@ -42083,6 +42173,36 @@ pub(crate) fn install_def_calls(expr: &Expr, def: &Rc<FuncDefData>, frames: u32)
         // comment for the full variant-by-variant justification, including
         // the arms above that stay explicit here instead of ever reaching
         // it.
+        //
+        // #2135: `Expr::Object` is pulled out of that shared fallthrough for
+        // the same reason `Pipe` above is -- see the `Comma` doc comment
+        // above for why it, alone among the three `Vec`-shaped siblings
+        // here, needed no change. Charged the same way as `Pipe`: entry `i`
+        // (0-indexed)'s key and value both see `frames + i + 1`, so an entry
+        // near the end of a wide object literal is priced like an
+        // equally-deep nested wrapping, while the ordinary case -- a handful
+        // of keys, or a very wide but non-recursive object literal -- is
+        // unaffected, since nothing is checked against `MAX_EVAL_FRAMES`
+        // until a `DefCall` is actually reached inside one of the entries.
+        Expr::Object(entries) => Expr::Object(
+            entries
+                .iter()
+                .enumerate()
+                .map(|(i, entry)| {
+                    let charged = frames.saturating_add(i as u32).saturating_add(1);
+                    let key = match &entry.key {
+                        ObjectKey::Literal(s) => ObjectKey::Literal(s.clone()),
+                        ObjectKey::Expr(e) => {
+                            ObjectKey::Expr(Box::new(install_def_calls(e, def, charged)))
+                        }
+                    };
+                    ObjectEntry {
+                        key,
+                        value: install_def_calls(&entry.value, def, charged),
+                    }
+                })
+                .collect(),
+        ),
         _ => map_subexprs(expr, &mut |sub| install_def_calls(sub, def, frames + 1)),
     }
 }
