@@ -31,7 +31,7 @@ use super::document::{
     effective_keys, effective_len_checked, key_delimiter_ok, key_display_string,
     key_display_string_kind, key_is_malformed, resolve_display_key, value_delimiter_ok,
     DisplayKeyGuard, DistinctKeyCursors, DocumentCursor, DocumentElements, DocumentFields,
-    DocumentValue, IndentSpec,
+    DocumentValue, IndentSpec, JsonConvention,
 };
 use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, bind_def, bind_def_call,
@@ -2754,6 +2754,10 @@ impl<V: DocumentValue> GenericResult<V> {
     /// for cursor-based results. For owned results, uses the StreamableValue impl.
     /// - `indent`: indentation width/unit (`IndentSpec::COMPACT` for compact)
     /// - `sort_keys`: sort mapping/object keys before writing (`-S`/`--sort-keys`)
+    /// - `numbers`: which value-formatting convention to use (#1576) — see
+    ///   [`JsonConvention`]'s own doc comment. `yq_runner.rs` always passes
+    ///   `Preserve`; `jq_runner.rs`'s own M2 fast path passes `JqCompat`
+    ///   unless `--preserve-input` is set.
     ///
     /// Returns the number of values streamed and whether the last was falsy.
     pub fn stream_json<W: core::fmt::Write>(
@@ -2761,6 +2765,7 @@ impl<V: DocumentValue> GenericResult<V> {
         out: &mut W,
         indent: IndentSpec,
         sort_keys: bool,
+        numbers: JsonConvention,
         mut on_value: impl FnMut(&mut W) -> core::fmt::Result,
     ) -> Result<crate::jq::stream::StreamStats, core::fmt::Error> {
         use crate::jq::stream::{StreamStats, StreamableValue};
@@ -2776,7 +2781,7 @@ impl<V: DocumentValue> GenericResult<V> {
                 let Some(owned) = owned_or_stream_error(to_owned(v), &mut stats) else {
                     return Ok(stats);
                 };
-                owned.stream_json(out, indent, sort_keys)?;
+                owned.stream_json(out, indent, sort_keys, numbers)?;
                 on_value(out)?;
                 stats.count = 1;
                 stats.last_was_falsy = owned.is_falsy();
@@ -2784,7 +2789,7 @@ impl<V: DocumentValue> GenericResult<V> {
             }
             Self::OneCursor(c) => {
                 // Stream directly from cursor using DocumentCursor trait
-                if let Err(e) = c.stream_json(out, indent, sort_keys) {
+                if let Err(e) = c.stream_json(out, indent, sort_keys, numbers) {
                     absorb_stream_failure(e, &mut stats)?;
                     return Ok(stats);
                 }
@@ -2803,7 +2808,7 @@ impl<V: DocumentValue> GenericResult<V> {
                         stats.count = i;
                         return Ok(stats);
                     };
-                    owned.stream_json(out, indent, sort_keys)?;
+                    owned.stream_json(out, indent, sort_keys, numbers)?;
                     on_value(out)?;
                     stats.last_was_falsy = owned.is_falsy();
                     stats.any_truthy |= !stats.last_was_falsy;
@@ -2825,7 +2830,7 @@ impl<V: DocumentValue> GenericResult<V> {
                     ) else {
                         return Ok(stats);
                     };
-                    owned.stream_json(out, indent, sort_keys)?;
+                    owned.stream_json(out, indent, sort_keys, numbers)?;
                 } else {
                     // Genuinely lazy (#685): each key is pulled from
                     // `fields` and written straight to `out` as it's
@@ -2891,9 +2896,9 @@ impl<V: DocumentValue> GenericResult<V> {
                 Ok(items) => {
                     let owned = match sequence_streamable_cursors(&items) {
                         Some(cursors) => {
-                            if let Err(e) =
-                                V::Cursor::stream_sequence_json(&cursors, out, indent, sort_keys)
-                            {
+                            if let Err(e) = V::Cursor::stream_sequence_json(
+                                &cursors, out, indent, sort_keys, numbers,
+                            ) {
                                 absorb_stream_failure(e, &mut stats)?;
                                 return Ok(stats);
                             }
@@ -2905,7 +2910,8 @@ impl<V: DocumentValue> GenericResult<V> {
                             .collect::<Result<Vec<_>, _>>()
                         {
                             Ok(items) => {
-                                OwnedValue::Array(items).stream_json(out, indent, sort_keys)?;
+                                OwnedValue::Array(items)
+                                    .stream_json(out, indent, sort_keys, numbers)?;
                                 true
                             }
                             Err(e) => {
@@ -2937,7 +2943,7 @@ impl<V: DocumentValue> GenericResult<V> {
                     // `count` is how many results actually reached `out`, not
                     // how many were asked for -- same contract as `Many`'s own
                     // mid-stream failure above (#400/#494, #1247, #1615).
-                    if let Err(e) = c.stream_json(out, indent, sort_keys) {
+                    if let Err(e) = c.stream_json(out, indent, sort_keys, numbers) {
                         absorb_stream_failure(e, &mut stats)?;
                         stats.count = i;
                         return Ok(stats);
@@ -2958,7 +2964,7 @@ impl<V: DocumentValue> GenericResult<V> {
                 stats.error = Some(stream_error(e));
             }
             Self::Owned(o) => {
-                o.stream_json(out, indent, sort_keys)?;
+                o.stream_json(out, indent, sort_keys, numbers)?;
                 on_value(out)?;
                 stats.count = 1;
                 stats.last_was_falsy = o.is_falsy();
@@ -2966,7 +2972,7 @@ impl<V: DocumentValue> GenericResult<V> {
             }
             Self::ManyOwned(os) => {
                 for o in os {
-                    o.stream_json(out, indent, sort_keys)?;
+                    o.stream_json(out, indent, sort_keys, numbers)?;
                     on_value(out)?;
                     stats.last_was_falsy = o.is_falsy();
                     stats.any_truthy |= !stats.last_was_falsy;
@@ -2987,7 +2993,7 @@ impl<V: DocumentValue> GenericResult<V> {
             // outputs already produced no longer vanish behind the failure.
             Self::Partial(os, control) => {
                 for o in os {
-                    o.stream_json(out, indent, sort_keys)?;
+                    o.stream_json(out, indent, sort_keys, numbers)?;
                     on_value(out)?;
                     stats.last_was_falsy = o.is_falsy();
                     stats.any_truthy |= !stats.last_was_falsy;
@@ -11564,13 +11570,25 @@ mod tests {
 
         let mut compact_json = String::new();
         result
-            .stream_json(&mut compact_json, IndentSpec::COMPACT, false, |_| Ok(()))
+            .stream_json(
+                &mut compact_json,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(compact_json, "[0,1,2]");
 
         let mut indented_json = String::new();
         result
-            .stream_json(&mut indented_json, IndentSpec::spaces(2), false, |_| Ok(()))
+            .stream_json(
+                &mut indented_json,
+                IndentSpec::spaces(2),
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(indented_json, "[\n  0,\n  1,\n  2\n]");
 
@@ -11597,6 +11615,7 @@ mod tests {
                 &mut empty_json_out,
                 IndentSpec::spaces(2),
                 false,
+                JsonConvention::Preserve,
                 |_| Ok(()),
             )
             .unwrap();
@@ -12497,7 +12516,13 @@ mod tests {
         let result = eval(&expr, value);
         let mut out = String::new();
         let stats = result
-            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .stream_json(
+                &mut out,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(out, "");
         assert!(stats.error.is_some());
@@ -12528,7 +12553,13 @@ mod tests {
         let result = eval(&expr, value);
         let mut out = String::new();
         result
-            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .stream_json(
+                &mut out,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(out, "");
     }
@@ -13930,13 +13961,25 @@ mod tests {
 
         let mut out = String::new();
         result
-            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .stream_json(
+                &mut out,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(out, r#"["b","a","c"]"#);
 
         let mut out = String::new();
         result
-            .stream_json(&mut out, IndentSpec::spaces(2), false, |_| Ok(()))
+            .stream_json(
+                &mut out,
+                IndentSpec::spaces(2),
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(out, "[\n  \"b\",\n  \"a\",\n  \"c\"\n]");
 
@@ -13977,7 +14020,13 @@ mod tests {
 
         let mut out = String::new();
         result
-            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .stream_json(
+                &mut out,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(out, r#"["b","a","c"]"#);
 
@@ -14621,8 +14670,14 @@ mod tests {
         // stream_json / stream_yaml exercise every variant's match arm.
         for r in &results {
             let mut j = String::new();
-            r.stream_json(&mut j, IndentSpec::COMPACT, false, |_| Ok(()))
-                .unwrap();
+            r.stream_json(
+                &mut j,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
+            .unwrap();
             let mut y = String::new();
             r.stream_yaml(&mut y, IndentSpec::spaces(2), false, |_| Ok(()))
                 .unwrap();
@@ -14630,7 +14685,13 @@ mod tests {
         // Spot-check the owned and error stream output.
         let mut owned_json = String::new();
         results[2]
-            .stream_json(&mut owned_json, IndentSpec::COMPACT, false, |_| Ok(()))
+            .stream_json(
+                &mut owned_json,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(owned_json, "5");
         // An error writes nothing to `out` — `out` is stdout, and a diagnostic
@@ -14638,7 +14699,13 @@ mod tests {
         // `stats.error` instead, for the caller to print to stderr (#355).
         let mut err_json = String::new();
         let err_stats = results[5]
-            .stream_json(&mut err_json, IndentSpec::COMPACT, false, |_| Ok(()))
+            .stream_json(
+                &mut err_json,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(err_json, "", "diagnostics must never reach stdout");
         assert_eq!(
@@ -14661,7 +14728,13 @@ mod tests {
         // stays off stdout.
         let mut brk = String::new();
         let brk_stats = results[6]
-            .stream_json(&mut brk, IndentSpec::COMPACT, false, |_| Ok(()))
+            .stream_json(
+                &mut brk,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(brk, "");
         assert!(brk_stats
@@ -14675,10 +14748,16 @@ mod tests {
         let mut partial_json = String::new();
         let mut seen = 0usize;
         let partial_stats = results[7]
-            .stream_json(&mut partial_json, IndentSpec::COMPACT, false, |_| {
-                seen += 1;
-                Ok(())
-            })
+            .stream_json(
+                &mut partial_json,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+                |_| {
+                    seen += 1;
+                    Ok(())
+                },
+            )
             .unwrap();
         assert_eq!(partial_json, "12");
         assert_eq!(seen, 2, "on_value runs once per streamed prefix value");
@@ -14707,7 +14786,13 @@ mod tests {
         // diagnostic the bare `Break` arm does, after its prefix.
         let mut partial_brk = String::new();
         let brk_stats = results[8]
-            .stream_json(&mut partial_brk, IndentSpec::COMPACT, false, |_| Ok(()))
+            .stream_json(
+                &mut partial_brk,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(partial_brk, "3");
         assert!(brk_stats
@@ -14811,7 +14896,13 @@ mod tests {
         assert!(result.is_single_cursor());
         let mut j = String::new();
         result
-            .stream_json(&mut j, IndentSpec::COMPACT, false, |_| Ok(()))
+            .stream_json(
+                &mut j,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(j, "1");
         let mut y = String::new();
@@ -14824,21 +14915,28 @@ mod tests {
     }
 
     #[test]
-    fn test_json_cursor_stream_json_rejects_pretty_indent() {
-        // JsonCursor::stream_json only supports compact (indent_spaces == 0)
-        // output; indented JSON->JSON cursor streaming isn't implemented, so
-        // callers must fall back to the DOM path (#442). Exercised through
-        // the generic OneCursor arm, same as the compact case above.
-        let json = br#"{"a": 1}"#;
+    fn test_json_cursor_stream_json_pretty_indent_1576() {
+        // #1576: JsonCursor::stream_json now supports indented (pretty)
+        // JSON->JSON cursor streaming too, exercised through the generic
+        // OneCursor arm, same as the compact case above -- it no longer
+        // falls back to the DOM path (#442) for this.
+        let json = br#"{"a": {"b": 1}}"#;
         let index = JsonIndex::build(json);
         let expr = crate::jq::parse("at_offset(6)").unwrap();
 
         let result = eval_with_cursor(&expr, index.root(json));
         assert!(result.is_single_cursor());
         let mut j = String::new();
-        assert!(result
-            .stream_json(&mut j, IndentSpec::spaces(2), false, |_| Ok(()))
-            .is_err());
+        result
+            .stream_json(
+                &mut j,
+                IndentSpec::spaces(2),
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(j, "{\n  \"b\": 1\n}");
     }
 
     #[test]
@@ -14858,7 +14956,13 @@ mod tests {
         assert!(result.is_single_cursor());
         let mut j = String::new();
         result
-            .stream_json(&mut j, IndentSpec::COMPACT, false, |_| Ok(()))
+            .stream_json(
+                &mut j,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(j, "1");
         let mut y = String::new();
@@ -15047,7 +15151,13 @@ mod tests {
         assert!(result.is_single_cursor());
         let mut out = String::new();
         result
-            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .stream_json(
+                &mut out,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(out, r#"{"a":1,"a":2}"#);
     }
@@ -15063,7 +15173,13 @@ mod tests {
         assert!(result.is_single_cursor());
         let mut out = String::new();
         result
-            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .stream_json(
+                &mut out,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(out, r#"{"b":3,"b":4}"#);
     }
@@ -15087,7 +15203,13 @@ mod tests {
         assert!(result.is_single_cursor());
         let mut out = String::new();
         result
-            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .stream_json(
+                &mut out,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(out, r#"{"a":1,"a":2}"#);
     }
@@ -15106,7 +15228,13 @@ mod tests {
         assert!(result.is_single_cursor());
         let mut out = String::new();
         result
-            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .stream_json(
+                &mut out,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(out, r#"{"b":3,"b":4}"#);
     }
@@ -15148,7 +15276,13 @@ mod tests {
         assert!(first.is_single_cursor());
         let mut out = String::new();
         first
-            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .stream_json(
+                &mut out,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(out, r#"{"a":1,"a":2}"#);
 
@@ -15198,7 +15332,13 @@ mod tests {
 
         let mut json_out = String::new();
         result
-            .stream_json(&mut json_out, IndentSpec::COMPACT, true, |_| Ok(()))
+            .stream_json(
+                &mut json_out,
+                IndentSpec::COMPACT,
+                true,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(json_out, r#"{"a":2,"b":1}"#);
 
@@ -15220,9 +15360,13 @@ mod tests {
 
         let mut json_out = String::new();
         result
-            .stream_json(&mut json_out, IndentSpec::COMPACT, true, |w| {
-                core::fmt::Write::write_str(w, ";")
-            })
+            .stream_json(
+                &mut json_out,
+                IndentSpec::COMPACT,
+                true,
+                JsonConvention::Preserve,
+                |w| core::fmt::Write::write_str(w, ";"),
+            )
             .unwrap();
         assert_eq!(json_out, r#"{"a":2,"b":1};{"a":2,"b":1};"#);
 
@@ -15400,7 +15544,13 @@ mod tests {
         assert!(result.is_single_cursor());
         let mut out = String::new();
         result
-            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .stream_json(
+                &mut out,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(out, r#"{"a":1,"a":2}"#);
     }
@@ -16918,7 +17068,13 @@ mod tests {
         let result = eval(&expr, value.clone());
         let mut out = String::new();
         let stats = result
-            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .stream_json(
+                &mut out,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(out, "[2,3,4]");
         assert_eq!(stats.count, 1);
@@ -16936,7 +17092,13 @@ mod tests {
         let result = eval(&expr, value.clone());
         let mut out = String::new();
         let stats = result
-            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .stream_json(
+                &mut out,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(out, "");
         assert_eq!(stats.count, 0);
@@ -17681,7 +17843,13 @@ mod tests {
         assert!(matches!(one, GenericResult::One(_)), "{one:?}");
         let mut out = String::new();
         let stats = one
-            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .stream_json(
+                &mut out,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(out, "", "a decode failure must never reach stdout");
         assert!(stats.error.is_some());
@@ -17699,7 +17867,13 @@ mod tests {
         assert!(matches!(many, GenericResult::Many(_)), "{many:?}");
         let mut out = String::new();
         let stats = many
-            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .stream_json(
+                &mut out,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(out, "");
         assert!(stats.error.is_some());
@@ -17734,7 +17908,13 @@ mod tests {
 
         let mut out = String::new();
         let stats = result
-            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .stream_json(
+                &mut out,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
             .unwrap();
         assert!(stats.error.is_none(), "{:?}", stats.error);
         assert_eq!(out, "[\"\u{FFFD}\u{FFFD}\"]");
@@ -17767,7 +17947,13 @@ mod tests {
 
         let mut out = String::new();
         let stats = result
-            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .stream_json(
+                &mut out,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
             .unwrap();
         assert!(stats.error.is_some());
         assert_eq!(out, "");
@@ -17801,7 +17987,13 @@ mod tests {
 
         let mut out = String::new();
         let stats = result
-            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .stream_json(
+                &mut out,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
             .unwrap();
         assert!(stats.error.is_some());
         assert_eq!(out, "[]");
@@ -17834,13 +18026,62 @@ mod tests {
 
     /// `stream_json`'s `LazySeq` arm falls back to materializing each
     /// `LazyElem` via `lazy_elem_to_owned` whenever
-    /// `sequence_streamable_cursors` answers `None` -- unconditional for
-    /// JSON, since `JsonCursor` never overrides
-    /// `supports_sequence_streaming` (stays the trait default `false`). A
-    /// plain `map(.)` over an array containing an undecodable element is
-    /// CLI-reachable (`sjq 'map(.)'`) and takes exactly this path.
+    /// `sequence_streamable_cursors` answers `None` -- for JSON, since #1576,
+    /// that means at least one drained item is `LazyElem::Owned` rather than
+    /// `LazyElem::Cursor` (`JsonCursor::supports_sequence_streaming` is now
+    /// `true`, mirroring `YamlCursor`'s own #757 answer), exactly the same
+    /// condition the YAML sibling test below documents. `map(.x)` over
+    /// `[{"x": <undecodable>}, null]` produces exactly that mix: `.x` on the
+    /// object element stays a lazy `OneCursor` (into `LazyElem::Cursor`),
+    /// while `.x` on `null` returns `GenericResult::Owned(Null)` (jq's
+    /// "field access on null is null" rule, into `LazyElem::Owned`) without
+    /// ever decoding anything -- forcing the fallback to run, which is
+    /// atomic by construction (`lazy_elem_to_owned` collects every element
+    /// into one `Result<Vec<_>, _>` before `stream_json` is ever called on
+    /// the result, so a decode failure anywhere means nothing reaches `out`
+    /// at all). A *plain* `map(.)` no longer reaches this arm at all -- see
+    /// `test_stream_json_lazyseq_cursor_path_keeps_partial_prefix_1576`
+    /// just below for that path's own (different, already-accepted)
+    /// contract.
     #[test]
     fn test_stream_json_lazyseq_fallback_reports_decode_failure_1247() {
+        let json: &[u8] = b"[{\"x\": \"\xff\xfe\"}, null]";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let result = eval_with_cursor(&crate::jq::parse("map(.x)").unwrap(), cursor);
+        assert!(matches!(result, GenericResult::LazySeq(_)));
+
+        let mut out = String::new();
+        let stats = result
+            .stream_json(
+                &mut out,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(out, "");
+        assert!(stats.error.is_some());
+    }
+
+    /// The cursor-streaming counterpart of the fallback test just above
+    /// (#1576): a plain `map(.)` over `["\xff\xfe"]` is now all-`Cursor`
+    /// (identity never produces an `Owned` element), so
+    /// `sequence_streamable_cursors` answers `Some` and this renders
+    /// through `JsonCursor::stream_sequence_json` instead of the atomic
+    /// fallback. That writer streams each element to `out` as it goes, the
+    /// same non-atomic, keep-the-prefix-and-diagnose trade
+    /// `stream_maybe_colored`'s own doc comment documents for YAML's
+    /// identical cursor path (#1641/#1679) -- `[` is already written by the
+    /// time the one element's decode failure is discovered, and it stays
+    /// written rather than being retroactively unwritten. This pins that
+    /// this is the deliberate, accepted contract for the cursor path (not a
+    /// regression to notice and "fix" later): whole-array atomicity is a
+    /// property of the *fallback* arm specifically, not of `stream_json`'s
+    /// `LazySeq` handling as a whole.
+    #[test]
+    fn test_stream_json_lazyseq_cursor_path_keeps_partial_prefix_1576() {
         let json: &[u8] = b"[\"\xff\xfe\"]";
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
@@ -17849,9 +18090,15 @@ mod tests {
 
         let mut out = String::new();
         let stats = result
-            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .stream_json(
+                &mut out,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
             .unwrap();
-        assert_eq!(out, "");
+        assert_eq!(out, "[", "the opening bracket stays written on failure");
         assert!(stats.error.is_some());
     }
 
@@ -18286,7 +18533,20 @@ mod tests {
             );
             let mut out = String::new();
             result
-                .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+                .stream_json(
+                    &mut out,
+                    IndentSpec::COMPACT,
+                    false,
+                    // `eval_with_cursor` above is jq semantics (see its own
+                    // doc comment), which is what this test's expected
+                    // `want` strings assume: duplicate object keys collapse
+                    // (#1576's `JsonConvention::JqCompat` is what carries
+                    // `EvalSemantics::COLLAPSE_DUPLICATE_KEYS` into this
+                    // cursor-streaming writer -- see that enum's own doc
+                    // comment).
+                    JsonConvention::JqCompat,
+                    |_| Ok(()),
+                )
                 .unwrap();
             assert_eq!(out, want, "{filter}");
         }
@@ -18309,7 +18569,13 @@ mod tests {
             assert!(result.is_single_cursor(), "{filter}");
             let mut out = String::new();
             result
-                .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+                .stream_json(
+                    &mut out,
+                    IndentSpec::COMPACT,
+                    false,
+                    JsonConvention::Preserve,
+                    |_| Ok(()),
+                )
                 .unwrap();
             assert_eq!(out, want, "{filter}");
         }
@@ -18333,7 +18599,13 @@ mod tests {
         );
         let mut out = String::new();
         result
-            .stream_json(&mut out, IndentSpec::COMPACT, false, |_| Ok(()))
+            .stream_json(
+                &mut out,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(out, r#"{"a":1,"a":2}{"b":3,"b":4}"#);
 

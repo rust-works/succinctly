@@ -10,20 +10,24 @@ use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use succinctly::dsv::{build_index as build_dsv_index, DsvConfig, DsvRows};
-use succinctly::jq::document::{effective_keys, key_hash, DistinctKeyCursors};
+use succinctly::jq::document::{
+    effective_keys, key_hash, DistinctKeyCursors, IndentSpec, JsonConvention,
+};
 use succinctly::jq::eval_generic::{
     check_nesting_depth, eval_with_cursor, to_owned as generic_to_owned, to_owned_cursor,
     GenericResult, LazyElem, MAX_NESTING_DEPTH,
 };
 use succinctly::jq::walk::map_builtin_subexprs;
 use succinctly::jq::{
-    self, format_number_jq_compat, nonfinite_display_string, EvalError, Expr, FuncDefBound,
-    JqSemantics, JqValue, OwnedValue, Program, UnresolvedCall, MAX_VALUE_TREE_DEPTH,
+    self, format_number_jq_compat, nonfinite_display_string, Builtin, EvalError, Expr,
+    FuncDefBound, JqSemantics, JqValue, OwnedValue, Program, StreamStats, UnresolvedCall,
+    MAX_VALUE_TREE_DEPTH,
 };
 use succinctly::json::light::{preceding_gap_ok, JsonCursor, StandardJson};
 use succinctly::json::validate::{self, ValidationError};
 use succinctly::json::JsonIndex;
 
+use super::m2_gate::can_use_m2_streaming;
 use super::JqCommand;
 use crate::output::{
     self, escape_json_string, escape_json_string_ascii, exit_codes, flush_then_err, ColorScheme,
@@ -869,6 +873,17 @@ impl std::fmt::Display for MalformedJsonError {
 
 impl std::error::Error for MalformedJsonError {}
 
+/// Adapter to use `std::io::Write` with `core::fmt::Write` methods, for the
+/// M2 fast path's non-`LazySeq` writes (#1576) -- mirrors `yq_runner.rs`'s
+/// identical local type.
+struct FmtWriter<W>(W);
+
+impl<W: Write> core::fmt::Write for FmtWriter<W> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.0.write_all(s.as_bytes()).map_err(|_| core::fmt::Error)
+    }
+}
+
 /// Write one result and route a failure into jq's own diagnostic
 /// channel, or propagate it as a genuine I/O/internal failure -- the same
 /// `MalformedJsonError`-downcast dance `run_jq`'s own result-emission
@@ -1240,6 +1255,75 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     // Configure output
     let output_config = OutputConfig::from_args(&args);
 
+    // #1576: the jq-side M2 fast path -- `can_use_m2_streaming` (shared
+    // with `yq_runner.rs`, `m2_gate.rs`) is the AST-shape half of the gate;
+    // the flag exclusions below are its own, scoped narrower than yq's for
+    // this first slice. `-S`/color/ascii/`--unbuffered` aren't excluded
+    // because the underlying writer can't do them (it can: `JsonCursor`'s
+    // new writer honors `sort_keys`, and `-C`/`-a`/`--unbuffered` are
+    // orthogonal) -- they're excluded because this path only ever runs
+    // nested inside `can_use_lazy_path`'s own file-reading loop below,
+    // which already excludes `sort_keys`/`color_output`/`ascii_output` for
+    // reasons unrelated to this issue; breaking those out into their own
+    // top-level branch (duplicating that loop's file/multi-document/
+    // line-counting machinery) is a well-scoped, low-risk follow-up rather
+    // than something this change needs to do in one PR. `-r`/`-j`/
+    // `--raw-output0` are excluded because no M2 JSON streamer here
+    // implements raw-string unquoting, matching `yq_runner.rs`'s own
+    // identical exclusion (#1715); `--unbuffered` because this path's own
+    // per-document write doesn't replicate `write_terminator`'s per-value
+    // flush. Named variables (`--arg`/`--argjson`) are excluded because
+    // `eval_with_cursor` only takes an expression and a cursor, with no
+    // variable-binding context threaded through the way the DOM path's
+    // `context.named` machinery provides.
+    //
+    // `m2_json_fallback_safe` narrows `can_use_m2_streaming`'s own AST
+    // whitelist further, jq-only (yq's own gate in `yq_runner.rs` is
+    // unaffected): only an expression guaranteed to produce *at most one*
+    // top-level result may take this path, because `evaluate_m2_fast_path`
+    // falls back to the general path on any detected malformation rather
+    // than trying to replicate jq's own issue-by-issue-tuned malformed-
+    // input behavior (see that function's own doc comment) -- safe only
+    // when nothing has been written to `out` yet for *this* document. For
+    // `.[]`/`Iterate` (excluded here) or `select` with a fan-out `cond`
+    // (also excluded, conservatively), a later result's failure could
+    // follow already-written earlier ones, and falling back would
+    // duplicate them.
+    let can_json_fast_path = can_use_m2_streaming(&expr)
+        && m2_json_fallback_safe(&expr)
+        && !output_config.raw_output
+        && !output_config.join_output
+        && !output_config.raw_output0
+        && !output_config.unbuffered
+        && context.named.is_empty();
+
+    // Indent width/unit for the fast path's streamer -- built directly from
+    // `args`, not `output_config.indent_string` (a pre-rendered string),
+    // mirroring `yq_runner.rs`'s own M2 setup and its own reasoning: a
+    // streamer needs the semantic width/unit pair, not rendered text.
+    // Priority matches `OutputConfig::from_args`'s `indent_string`
+    // construction exactly (tab > explicit `--indent N` > `-c` > default 2).
+    let json_indent = if args.tab {
+        IndentSpec {
+            width: 1,
+            unit: '\t',
+        }
+    } else if let Some(n) = args.indent {
+        IndentSpec::spaces(n as usize)
+    } else if args.compact_output {
+        IndentSpec::COMPACT
+    } else {
+        IndentSpec::spaces(2)
+    };
+    // `output_config.jq_compat` already encodes the same
+    // `--preserve-input`/`SUCCINCTLY_PRESERVE_INPUT=1` priority `JsonConvention`
+    // needs (`OutputConfig::from_args`'s own doc comment).
+    let json_numbers = if output_config.jq_compat {
+        JsonConvention::JqCompat
+    } else {
+        JsonConvention::Preserve
+    };
+
     // Set up output writer
     let stdout = std::io::stdout();
     let mut out = LoudFlushWriter::new(stdout.lock());
@@ -1477,6 +1561,64 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                 // jq names the line the input value ends on, counted in the
                 // whole file rather than in this value's slice.
                 let at = InputLocation::at(filename.as_deref(), line_counter.advance_to(end));
+
+                // #1576: the M2 fast path, mirroring `yq_runner.rs`'s own
+                // (`can_use_m2_streaming`/`GenericResult::stream_json`) but
+                // scoped to jq's own atomicity contract for array
+                // construction (see `evaluate_m2_fast_path`'s own doc
+                // comment for why `map`/`sort`/etc. buffer while plain
+                // navigation streams straight to `out`). Wrapped in the
+                // same `catch_unwind` as the general path below, for the
+                // same #1793 reason -- `eval_with_cursor`'s own fallback
+                // arms (`LazyKeys`'s sorted branch, `sequence_streamable_
+                // cursors`'s `None` fallback) can still reach
+                // `to_owned_cursor_at_depth`'s panic guard.
+                if can_json_fast_path {
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        evaluate_m2_fast_path(
+                            json_bytes,
+                            &expr,
+                            &index,
+                            &mut sink,
+                            &mut out,
+                            json_indent,
+                            args.sort_keys,
+                            json_numbers,
+                            args.exit_status,
+                            &mut had_output,
+                            &mut last_output,
+                        )
+                    }));
+                    // `Ok(true)`: written (or halted), move on to the next
+                    // document. `Ok(false)`: this document was malformed --
+                    // `evaluate_m2_fast_path`'s own doc comment explains why
+                    // nothing was written and why falling through to the
+                    // general path below (rather than reporting from here)
+                    // is the right way to handle it (#1576 review). The
+                    // panic arm is unrelated to that distinction -- an
+                    // adversarial-depth panic is already fully handled here,
+                    // same as before this fast path existed.
+                    let handled = match outcome {
+                        Ok(handled) => handled?,
+                        Err(payload) => {
+                            let Some(message) = nesting_depth_panic_message(&*payload) else {
+                                std::panic::resume_unwind(payload);
+                            };
+                            sink.report(DiagStyle::Jq, &EvalError::new(message), &at);
+                            true
+                        }
+                    };
+                    if let Some(code) = sink.halted() {
+                        out.flush()?;
+                        return Ok(code);
+                    }
+                    if handled {
+                        continue;
+                    }
+                    // Else: fall through to the general path just below,
+                    // for this one document only.
+                }
+
                 // A builtin with no native lazy fast path (`sort`, `join`,
                 // ...) falls back to a full `to_owned_cursor` materialization
                 // of whatever value it's handed -- for a bare `sort`/`join`
@@ -4417,6 +4559,212 @@ fn evaluate_bytes_lazy<'a>(
     // Use eval_with_cursor to preserve cursor context for position-based navigation
     let result = eval_with_cursor(expr, cursor);
     generic_result_to_jq_values(result, cursor, at, sink)
+}
+
+/// Writes the newline jq puts after every top-level output value. Generic
+/// over `W: core::fmt::Write` so the same function works as
+/// `GenericResult::stream_json`'s `on_value` callback whether the concrete
+/// writer is a `String` buffer or an `FmtWriter` (#1576) -- a closure value
+/// has one fixed concrete signature, which the two call sites below don't
+/// share.
+fn write_result_newline<W: core::fmt::Write>(w: &mut W) -> core::fmt::Result {
+    w.write_char('\n')
+}
+
+/// Whether `expr` is guaranteed to produce *at most one* top-level result
+/// (#1576) -- the extra condition `can_json_fast_path` requires on top of
+/// `can_use_m2_streaming`'s own AST whitelist, jq-only. See
+/// `evaluate_m2_fast_path`'s own doc comment for why this matters: that
+/// function falls back to the general path on any detected malformation,
+/// which is only safe when a *later* result's failure can't follow
+/// already-written earlier ones.
+///
+/// `Expr::Iterate` (`.[]`) and `Builtin::Select` are the two exclusions --
+/// the base whitelist's own only multi-result-capable shapes (a fanning
+/// `cond` can republish `select`'s input more than once). Everything else
+/// admitted by `can_use_m2_streaming` produces exactly one result by
+/// construction: `map`/`sort`/`sort_by`/`unique`/`unique_by`/`reverse`/
+/// `keys_unsorted` each build one array; `min`/`min_by`/`max`/`max_by`
+/// pick one value; `first`/`last`/`nth` bound themselves to one result
+/// (or none) regardless of what their own body could otherwise yield --
+/// including a body containing `.[]`, which is why those three don't
+/// recurse into their inner expression here at all, unlike
+/// `can_use_m2_streaming`'s own recursion for the same shapes (that
+/// recursion answers a different question: whether the inner shape can
+/// stream a cursor at all, not how many results the outer wrapper emits).
+fn m2_json_fallback_safe(expr: &Expr) -> bool {
+    match expr {
+        Expr::Iterate => false,
+        Expr::Builtin(Builtin::Select(_)) => false,
+        Expr::Pipe(exprs) => exprs.iter().all(m2_json_fallback_safe),
+        Expr::Optional(inner) | Expr::Paren(inner) => m2_json_fallback_safe(inner),
+        Expr::FirstExpr(_)
+        | Expr::LastExpr(_)
+        | Expr::NthExpr { .. }
+        | Expr::Builtin(
+            Builtin::FirstStream(_) | Builtin::LastStream(_) | Builtin::NthStream(_, _),
+        ) => true,
+        // `limit(n; ...)` can yield up to `n` results, unlike `first`/
+        // `last`/`nth` above -- `Expr::Limit` isn't safe here even though
+        // `can_use_m2_streaming` allows it.
+        Expr::Limit { .. } => false,
+        // `IndexExpr` (a computed index, `.[expr]`) is excluded, unlike
+        // `Index` (a fixed literal index) -- confirmed live (#1576 review)
+        // that a computed index target/key can itself raise mid-stream
+        // after already producing output (`test_computed_index_*_streams_
+        // prefix_*` in `tests/jq_cli_tests.rs`), which falling back on
+        // would duplicate the already-written prefix rather than replace
+        // it. `can_use_m2_streaming` still allows it for yq, whose own
+        // gate doesn't fall back on error at all.
+        Expr::Identity | Expr::Field(_) | Expr::Index { .. } => true,
+        Expr::Builtin(
+            Builtin::Sort
+            | Builtin::SortBy(_)
+            | Builtin::Unique
+            | Builtin::UniqueBy(_)
+            | Builtin::Min
+            | Builtin::MinBy(_)
+            | Builtin::Max
+            | Builtin::MaxBy(_)
+            | Builtin::Reverse,
+        ) => true,
+        Expr::Builtin(Builtin::Map(_)) => true,
+        // `keys_unsorted` (`GenericResult::LazyKeys`) writes through
+        // `stream_lazy_keys_json` (`src/jq/stream.rs`), a separate writer
+        // from `JsonCursor::stream_json`'s buffering (#1576 review) --
+        // confirmed live that it doesn't yet detect a malformed key the
+        // way `stream_json_pretty`'s object arm does (`keys_unsorted` on
+        // `{invalid}` silently answers `[]` instead of erroring), so its
+        // own fallback-safety hasn't been established. Excluding it here
+        // routes it to the general path unconditionally, not just on a
+        // detected error -- a well-scoped follow-up, not something this
+        // change needs to fix.
+        Expr::Builtin(Builtin::KeysUnsorted) => false,
+        _ => false,
+    }
+}
+
+/// Evaluate one JSON document through the M2 fast path (#1576): stream
+/// straight from `GenericResult`'s cursors instead of the materializing
+/// `generic_result_to_jq_values`/`print_json` stack `evaluate_bytes_lazy`/
+/// `evaluate_bytes_streaming` feed. Only reached when the caller's own
+/// `can_json_fast_path` (AST shape + flags) already holds -- which,
+/// crucially, only admits expressions [`m2_json_fallback_safe`] confirms
+/// produce *at most one* top-level result (`map`/`sort`/etc., plain
+/// navigation, `keys_unsorted`, `first`/`last`/`nth` -- never `.[]`/
+/// `Iterate` or `select`, which can yield several).
+///
+/// Returns `Ok(true)` when the result was written (or a genuine `halt`/
+/// `halt_error` was requested) and the caller should move to the next
+/// document; `Ok(false)` when this path detected a malformed/undecodable
+/// document and deliberately wrote *nothing*, so the caller should fall
+/// back to the general `evaluate_bytes_lazy`/`evaluate_bytes_streaming`
+/// path for this one document instead of reporting from here.
+///
+/// **Why fall back rather than report directly** (#1576 review): jq's own
+/// `print_json`/`to_owned_cursor`/`DistinctKeyCursors` stack has
+/// accumulated years of issue-specific, sometimes deliberately
+/// *inconsistent* malformed-input handling (#1641 wants a truncated
+/// partial prefix for a bad *value*; #1676 wants zero output for a bad
+/// *delimiter*; #1642's `DisplayKeyGuard` catches a narrower colliding-
+/// decode-failure-key case none of this writer's checks replicate) --
+/// re-deriving every one of those exactly in this new writer is its own,
+/// separately-scoped effort. Falling back to the already-correct general
+/// path for the rare malformed case keeps this fast path's own contract
+/// simple (validate then write, or write nothing) while still getting
+/// every one of those existing behaviors for free, at the cost of
+/// re-evaluating the one malformed document twice.
+///
+/// **Atomicity for the happy path** (#2066): real jq's array construction
+/// is all-or-nothing -- `[1,2,"x"]|map(.+1)` prints nothing to stdout,
+/// only the stderr diagnostic, verified against the regression that fix
+/// closed (`map(.)` on `[1, {"bad": xyz123}]` used to print a garbled
+/// `[1,{"bad":` prefix before erroring). `GenericResult::stream_json`'s
+/// `LazySeq` arm streams from cursors as it goes, which is fine for yq --
+/// its own cursor-streaming path already accepts a partial prefix on a
+/// later element's decode failure as a settled trade
+/// (`stream_maybe_colored`'s own doc comment, #1641/#1679) -- so this
+/// buffers a `LazySeq` result locally and only copies it to `out` (or
+/// falls back) once fully resolved. The non-`LazySeq` branch is safe
+/// *without* its own buffer here for the same reason: `m2_json_fallback_
+/// safe` guarantees at most one top-level result, and `JsonCursor::
+/// stream_json` (`src/json/light.rs`) already buffers internally per
+/// value for exactly this reason, so nothing reaches `out` (the real
+/// writer, not the `FmtWriter` wrapping it) until that one result is
+/// known good.
+#[allow(clippy::too_many_arguments)] // one caller, one gate (`can_json_fast_path`); a struct would hide the 1:1 relationship each param has to a specific CLI flag.
+fn evaluate_m2_fast_path<W: Write>(
+    json_bytes: &[u8],
+    expr: &jq::Expr,
+    index: &JsonIndex,
+    sink: &mut ErrorSink,
+    out: &mut W,
+    indent: IndentSpec,
+    sort_keys: bool,
+    numbers: JsonConvention,
+    exit_status: bool,
+    had_output: &mut bool,
+    last_output: &mut Option<OwnedValue>,
+) -> Result<bool> {
+    let cursor = index.root(json_bytes);
+    let result = eval_with_cursor(expr, cursor);
+
+    // `stats.last_was_falsy` (not the value itself) is all `-e`'s own check
+    // downstream ever reads out of `last_output` (`matches!(last,
+    // OwnedValue::Null | OwnedValue::Bool(false))`) -- `Bool(false)` is a
+    // faithful stand-in for "the real last value was falsy" regardless of
+    // whether that value was actually `null` or `false`, and `Bool(true)`
+    // likewise for "was truthy", regardless of the real value's own type.
+    let record_exit_status = |last_output: &mut Option<OwnedValue>, stats: &StreamStats| {
+        if exit_status && stats.count > 0 {
+            *last_output = Some(OwnedValue::Bool(!stats.last_was_falsy));
+        }
+    };
+
+    if matches!(result, GenericResult::LazySeq(_)) {
+        let mut buf = String::new();
+        let stats = result
+            .stream_json(&mut buf, indent, sort_keys, numbers, write_result_newline)
+            .map_err(|_| anyhow::anyhow!("write error"))?;
+        if let Some(code) = stats.halt {
+            sink.request_halt(code);
+            return Ok(true);
+        }
+        if stats.error.is_some() {
+            return Ok(false);
+        }
+        *had_output = *had_output || stats.count > 0;
+        record_exit_status(last_output, &stats);
+        out.write_all(buf.as_bytes())?;
+        Ok(true)
+    } else {
+        let mut writer = FmtWriter(out);
+        let stats = result
+            .stream_json(
+                &mut writer,
+                indent,
+                sort_keys,
+                numbers,
+                write_result_newline,
+            )
+            .map_err(|_| anyhow::anyhow!("write error"))?;
+        if let Some(code) = stats.halt {
+            sink.request_halt(code);
+            return Ok(true);
+        }
+        // `m2_json_fallback_safe` guarantees at most one top-level result
+        // for every expression that reaches this branch, and
+        // `JsonCursor::stream_json` buffers that one result internally
+        // before ever touching `writer`/`out` -- so an error here means
+        // nothing has reached `out` yet, same as the `LazySeq` branch
+        // above, and falling back is equally safe.
+        if stats.error.is_some() {
+            return Ok(false);
+        }
+        *had_output = *had_output || stats.count > 0;
+        record_exit_status(last_output, &stats);
+        Ok(true)
+    }
 }
 
 /// Evaluate against raw JSON bytes, handing each output to `on_value` the

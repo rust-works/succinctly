@@ -6014,6 +6014,7 @@ impl core::fmt::Display for YamlNumberError {
 use crate::jq::assert_depth;
 use crate::jq::document::{
     DocumentCursor, DocumentElements, DocumentField, DocumentFields, DocumentValue, IndentSpec,
+    JsonConvention,
 };
 use crate::jq::stream::{StreamFailure, StreamResult};
 use crate::jq::EvalError;
@@ -6194,12 +6195,17 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
         YamlCursor::cursor_at_position(self, line, col)
     }
 
+    /// `numbers` (#1576) is ignored: YAML's own JSON-target writer has no
+    /// jq/yq convention split of its own -- `yq_runner.rs` (the only caller)
+    /// always passes `JsonConvention::Preserve`, matching this cursor's
+    /// unconditional behavior before that parameter existed.
     #[inline]
     fn stream_json<Out: core::fmt::Write>(
         &self,
         out: &mut Out,
         indent: IndentSpec,
         sort_keys: bool,
+        _numbers: JsonConvention,
     ) -> StreamResult {
         YamlCursor::stream_json(self, out, indent, sort_keys)
     }
@@ -6232,12 +6238,15 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
         true
     }
 
+    /// `numbers` (#1576) is ignored -- see this trait's `stream_json` impl
+    /// above for why.
     #[inline]
     fn stream_sequence_json<Out: core::fmt::Write>(
         cursors: &[Self],
         out: &mut Out,
         indent: IndentSpec,
         sort_keys: bool,
+        _numbers: JsonConvention,
     ) -> StreamResult {
         stream_json_sequence(
             resolved_sequence_cursors(cursors),

@@ -11,7 +11,7 @@ use std::path::Path;
 
 use succinctly::jq::document::{
     effective_keys, key_delimiter_ok, resolve_display_key, value_delimiter_ok, DisplayKeyGuard,
-    DocumentCursor, DocumentElements, DocumentFields, DocumentValue, IndentSpec,
+    DocumentCursor, DocumentElements, DocumentFields, DocumentValue, IndentSpec, JsonConvention,
 };
 use succinctly::jq::escape::AsciiEscapeWriter;
 use succinctly::jq::eval_generic::{
@@ -29,6 +29,7 @@ use succinctly::yaml::{
     stream_json_sequence, stream_yaml_sequence, YamlCursor, YamlIndex, YamlValue,
 };
 
+use super::m2_gate::can_use_m2_streaming;
 use super::{FrontMatterMode, InputFormat, OutputFormat, YqCommand};
 use crate::front_matter;
 use crate::output::{
@@ -3729,150 +3730,6 @@ fn build_args_var(context: &EvalContext) -> OwnedValue {
     OwnedValue::Object(args_obj)
 }
 
-/// Check if an expression can use M2 streaming path.
-///
-/// M2 streaming is used for simple navigation expressions that produce
-/// cursor results without requiring OwnedValue construction:
-/// - Identity: `.`
-/// - Field access: `.field`
-/// - Index access: `.[0]`, `.[-1]`
-/// - Iteration: `.[]`
-/// - Chained navigation: `.field[0].name`
-/// - Optional variants: `.field?`, `.[0]?`, `.[]?`
-/// - `keys_unsorted` (streams lazily via `GenericResult::LazyKeys { sorted: false, .. }`, #685)
-///
-/// Expressions that require OwnedValue construction cannot use M2:
-/// - Builtins like `length`, `keys` (sorted), `map`
-/// - Array/object construction: `[...]`, `{...}`
-/// - Arithmetic, comparison, and logic operators
-/// - String interpolation
-/// - Variables and function calls
-fn can_use_m2_streaming(expr: &Expr) -> bool {
-    match expr {
-        // Core M2 expressions
-        Expr::Identity => true,
-        Expr::Field(_) => true,
-        Expr::Index { .. } => true,
-        Expr::Iterate => true,
-
-        // Chained navigation
-        Expr::Pipe(exprs) => exprs.iter().all(can_use_m2_streaming),
-
-        // Optional variants
-        Expr::Optional(inner) => can_use_m2_streaming(inner),
-
-        // Parentheses don't affect streamability
-        Expr::Paren(inner) => can_use_m2_streaming(inner),
-
-        // first(f)/last(f) (both AST spellings the parser produces, see
-        // `Expr::FirstExpr`/`LastExpr` doc comments) thread a cursor through
-        // natively in `eval_generic.rs` (#607) *only when `f` itself does* --
-        // `first(.[])` streams a `GenericResult` cursor exactly like plain
-        // navigation, but `first(.a * 1e100)` still has to materialize an
-        // `OwnedValue::Float` from the arithmetic, which then needs the DOM
-        // path's yq-mode scientific-notation formatting (#997) rather than
-        // the M2 fast writers in `src/jq/stream.rs`, which don't have it.
-        // Recursing here (like `Pipe`/`Optional`/`Paren` above) restricts the
-        // fast path to exactly the inner shapes it can actually stream a
-        // cursor for. Streaming through `eval_with_cursor_using` for the
-        // eligible cases (rather than `evaluate_yaml_cursor`'s unconditional
-        // `to_owned()` DOM path) is also what keeps duplicate mapping keys
-        // intact for these shapes, matching `.[0]` on the same input (#631).
-        Expr::FirstExpr(inner) | Expr::LastExpr(inner) => can_use_m2_streaming(inner),
-        Expr::Builtin(Builtin::FirstStream(inner) | Builtin::LastStream(inner)) => {
-            can_use_m2_streaming(inner)
-        }
-
-        // Same reasoning as `FirstExpr`/`LastExpr` above, now that #1607
-        // gave `Expr::Limit`/`Builtin::NthStream` (the arm real
-        // `nth(n; expr)` calls reach) their own native, cursor-threading
-        // arms in `eval_generic.rs`: `limit(3; .[])`/`nth(0; .[])` stream a
-        // `GenericResult` cursor exactly like plain navigation when `expr`
-        // itself does, so route them through `eval_with_cursor_using`
-        // here too rather than `evaluate_yaml_cursor`'s unconditional
-        // `to_owned()` DOM path -- otherwise #1607's own fix is discarded
-        // one layer up: a correctly cursor-preserving `GenericResult`
-        // still gets flattened into an `IndexMap`-backed `OwnedValue` the
-        // moment `evaluate_yaml_cursor` materializes it for output,
-        // silently re-losing a duplicate key *inside* the captured item
-        // (not the `limit`/`nth` walk itself, which #1607 already fixed
-        // regardless of this gate). `n` is never recursed into: it's
-        // always evaluated as a single control value, never streamed.
-        Expr::Limit { n: _, expr }
-        | Expr::NthExpr { n: _, expr }
-        | Expr::Builtin(Builtin::NthStream(_, expr)) => can_use_m2_streaming(expr),
-        Expr::IndexExpr { .. } => true,
-
-        // `select(...)` never changes position - a truthy output is always
-        // the input node unchanged - and `eval_generic.rs`'s own
-        // `Builtin::Select` arm already forwards the incoming cursor as-is
-        // (`OneCursor`/`ManyCursor`) rather than rebuilding a value. Routing
-        // it here rather than through `evaluate_yaml_cursor`'s unconditional
-        // `to_owned()` DOM path is what keeps duplicate mapping keys (and
-        // their comments) intact, matching `FirstExpr`/`LastExpr` above
-        // (#631) and `-S`/`--tab` (#733) - `select()` had the same latent
-        // gap (#796).
-        Expr::Builtin(Builtin::Select(_)) => true,
-
-        // #1687: `sort`/`sort_by`/`unique`/`unique_by`/`reverse` now answer a
-        // `GenericResult::LazySeq` over their input's own element cursors,
-        // and `min`/`min_by`/`max`/`max_by` a bare `OneCursor` -- the same
-        // shapes `map`/`first` above already stream. Without an arm here the
-        // fix is discarded one layer up, exactly as #1607's was before its
-        // review caught it: `evaluate_yaml_cursor`'s unconditional
-        // `to_owned()` DOM path flattens the cursor-preserving result back
-        // into an `IndexMap`-backed `OwnedValue` at output time, silently
-        // re-collapsing the duplicate mapping key inside a moved element.
-        //
-        // The key filter is never recursed into: it only ever produces a
-        // comparison key, which is an `OwnedValue` regardless and never
-        // reaches the output. What *is* streamed is the element the key
-        // selected, and that is always a document node.
-        Expr::Builtin(
-            Builtin::Sort
-            | Builtin::SortBy(_)
-            | Builtin::Unique
-            | Builtin::UniqueBy(_)
-            | Builtin::Min
-            | Builtin::MinBy(_)
-            | Builtin::Max
-            | Builtin::MaxBy(_)
-            | Builtin::Reverse,
-        ) => true,
-
-        // `keys_unsorted` on a mapping produces `GenericResult::LazyKeys { sorted: false, .. }`,
-        // which `GenericResult::stream_json`/`stream_yaml` now stream directly
-        // from the field cursor (#685) instead of materializing a `Vec<String>`
-        // first. On an array input it already returns `GenericResult::Owned`
-        // cheaply, so this only changes routing for the mapping case.
-        Expr::Builtin(Builtin::KeysUnsorted) => true,
-
-        // `map(f)` on a container produces `GenericResult::LazySeq` (#724,
-        // #725), which `GenericResult::stream_json`/`stream_yaml` now render
-        // one element at a time from each element's own live cursor (#757)
-        // rather than through an `OwnedValue::Array`. That is both the
-        // performance point and a fidelity fix: routing `map` through the DOM
-        // path collapsed duplicate mapping keys and dropped comments,
-        // anchors/aliases and flow style, all of which real yq keeps
-        // (verified live against v4.53.3 — `map(.)` on `- a: 1`/`  a: 2`
-        // prints both keys there, and on `- {a: 1, b: 2}` keeps flow style).
-        // `.[]` on the same inputs already matched, because it already
-        // streamed.
-        //
-        // Recursing into `f` rather than answering a flat `true` follows
-        // `FirstExpr`/`LastExpr` above, for the same reason: a *computing*
-        // body materializes an `OwnedValue::Float` that needs the DOM path's
-        // yq-mode scientific-notation/decimal-point formatting (#997, #949,
-        // #1090), which the M2 streamers don't have. So `map(.)`,
-        // `map(.name)`, `map(.a.b)` and `map(select(...))` stream; `map(.+1)`
-        // and `map(length)` keep the DOM path exactly as before.
-        Expr::Builtin(Builtin::Map(f)) => can_use_m2_streaming(f),
-
-        // Everything else requires OwnedValue
-        _ => false,
-    }
-}
-
 /// Whether `expr` mentions the `split_doc` builtin anywhere.
 ///
 /// Decides whether output uses per-result document separators.
@@ -4543,7 +4400,28 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         |s, _boundaries| output::colorize_json(s, &ColorScheme::default()),
                         |sink| {
                             json_ascii!($output_config.ascii_output, sink, |out| {
-                                $cursor.stream_json(out, json_indent, sort_keys)
+                                // Explicit `DocumentCursor::stream_json(...)`
+                                // (not `$cursor.stream_json(...)`): this
+                                // macro body is shared by both `YamlCursor`
+                                // and `JsonCursor` call sites, and only
+                                // `YamlCursor` has an *inherent* method of
+                                // this name (its own public
+                                // `YamlCursor::stream_json`, unrelated to
+                                // #1576's `JsonConvention` parameter) --
+                                // inherent methods win method-call-syntax
+                                // resolution over the trait unconditionally,
+                                // so `$cursor.stream_json(...)` would silently
+                                // pick a different, 3-argument method there.
+                                // The explicit trait call always reaches
+                                // `DocumentCursor::stream_json` for both
+                                // cursor types.
+                                DocumentCursor::stream_json(
+                                    &$cursor,
+                                    out,
+                                    json_indent,
+                                    sort_keys,
+                                    JsonConvention::Preserve,
+                                )
                             })
                         },
                     )?;
@@ -4570,36 +4448,42 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         |sink| {
                             json_ascii!($output_config.ascii_output, sink, |out| {
                                 result
-                                    .stream_json(out, json_indent, sort_keys, |w| {
-                                        // #1709: `--color`'s `Buffered` mode
-                                        // needs the raw terminator byte
-                                        // written straight into its buffer
-                                        // (JSON's own colorizer re-lexes
-                                        // that unmodified, unlike YAML's
-                                        // boundary-based one -- see
-                                        // `stream_maybe_colored`'s own
-                                        // comment on this). `write_result_
-                                        // terminator` would silently drop
-                                        // it there. Every other mode
-                                        // (`Direct`, `NulChecked`) is
-                                        // unaffected either way -- `Direct`'s
-                                        // own arm is exactly `terminator.
-                                        // write_fmt(self)`, and `NulChecked`
-                                        // needs the dispatch to trigger its
-                                        // per-result flush. `dispatch_
-                                        // result_terminator` (not
-                                        // `write_result_terminator`
-                                        // directly) since `--ascii-output`
-                                        // wraps `w` in `AsciiEscapeWriter`
-                                        // here, which has no
-                                        // `ColorSink`-specific methods of
-                                        // its own.
-                                        if $use_color {
-                                            terminator.write_fmt(w)
-                                        } else {
-                                            w.dispatch_result_terminator(terminator)
-                                        }
-                                    })
+                                    .stream_json(
+                                        out,
+                                        json_indent,
+                                        sort_keys,
+                                        JsonConvention::Preserve,
+                                        |w| {
+                                            // #1709: `--color`'s `Buffered` mode
+                                            // needs the raw terminator byte
+                                            // written straight into its buffer
+                                            // (JSON's own colorizer re-lexes
+                                            // that unmodified, unlike YAML's
+                                            // boundary-based one -- see
+                                            // `stream_maybe_colored`'s own
+                                            // comment on this). `write_result_
+                                            // terminator` would silently drop
+                                            // it there. Every other mode
+                                            // (`Direct`, `NulChecked`) is
+                                            // unaffected either way -- `Direct`'s
+                                            // own arm is exactly `terminator.
+                                            // write_fmt(self)`, and `NulChecked`
+                                            // needs the dispatch to trigger its
+                                            // per-result flush. `dispatch_
+                                            // result_terminator` (not
+                                            // `write_result_terminator`
+                                            // directly) since `--ascii-output`
+                                            // wraps `w` in `AsciiEscapeWriter`
+                                            // here, which has no
+                                            // `ColorSink`-specific methods of
+                                            // its own.
+                                            if $use_color {
+                                                terminator.write_fmt(w)
+                                            } else {
+                                                w.dispatch_result_terminator(terminator)
+                                            }
+                                        },
+                                    )
                                     .map_err(StreamFailure::from)
                             })
                         },

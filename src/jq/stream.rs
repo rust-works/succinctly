@@ -23,7 +23,9 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use super::document::{key_display_string, DistinctKeyCursors, DocumentFields, IndentSpec};
+use super::document::{
+    key_display_string, DistinctKeyCursors, DocumentFields, IndentSpec, JsonConvention,
+};
 use super::error::EvalError;
 use super::escape::{write_json_body_jq, write_json_body_yq};
 use super::value::{
@@ -42,12 +44,15 @@ pub trait StreamableValue {
     ///
     /// The output should be valid JSON without trailing newlines or separators.
     /// `indent` selects width/unit (`IndentSpec::COMPACT` for compact output);
-    /// `sort_keys` sorts object keys before writing (`-S`/`--sort-keys`).
+    /// `sort_keys` sorts object keys before writing (`-S`/`--sort-keys`);
+    /// `numbers` selects the finite-number-literal/escaping convention
+    /// (#1576) — see [`JsonConvention`]'s own doc comment.
     fn stream_json<W: core::fmt::Write>(
         &self,
         out: &mut W,
         indent: IndentSpec,
         sort_keys: bool,
+        numbers: JsonConvention,
     ) -> core::fmt::Result;
 
     /// Stream this value as YAML to the output.
@@ -180,8 +185,21 @@ impl StreamableValue for OwnedValue {
         out: &mut W,
         indent: IndentSpec,
         sort_keys: bool,
+        numbers: JsonConvention,
     ) -> core::fmt::Result {
-        stream_owned_value_json(self, out, 0, indent.width, indent.unit, sort_keys)
+        match numbers {
+            JsonConvention::Preserve => {
+                stream_owned_value_json(self, out, 0, indent.width, indent.unit, sort_keys)
+            }
+            JsonConvention::JqCompat => stream_owned_value_json_jq_output(
+                self,
+                out,
+                0,
+                indent.width,
+                indent.unit,
+                sort_keys,
+            ),
+        }
     }
 
     fn stream_yaml<W: core::fmt::Write>(
@@ -312,6 +330,43 @@ pub fn stream_owned_value_json_jq<W: core::fmt::Write>(
         jq_bare_float_display,
         |negative| infinite_float_preview_text(negative).to_string(),
         preview_infinite_literal,
+        format_number_jq_compat,
+    )
+}
+
+/// Stream an OwnedValue as JSON, escaping strings and canonicalizing number
+/// literals the way real jq's own *output* does (#1576) — as opposed to
+/// [`stream_owned_value_json_jq`] above, which is jq's error-message-preview
+/// convention (always compact, and infinite values render jq's own preview
+/// text rather than RFC 8259's `null`).
+///
+/// Shares [`stream_owned_value_json_jq`]'s escape table (`write_json_body_jq`)
+/// and finite-number canonicalization (`format_number_jq_compat`) — both
+/// already proven correct against real jq via the jq CLI's existing
+/// non-streaming `print_json`/`escape_json_string` path
+/// (`src/bin/succinctly/output.rs`) — but pairs them with real output's
+/// infinite-value rule (`null`, not a preview) and threads `current_indent`/
+/// `indent_spaces`/`sort_keys` through instead of hardcoding compact/false,
+/// so this can pretty-print and honor `-S` the way genuine output must.
+pub(crate) fn stream_owned_value_json_jq_output<W: core::fmt::Write>(
+    value: &OwnedValue,
+    out: &mut W,
+    current_indent: usize,
+    indent_spaces: usize,
+    unit: char,
+    sort_keys: bool,
+) -> core::fmt::Result {
+    stream_owned_value_json_with(
+        value,
+        out,
+        current_indent,
+        indent_spaces,
+        unit,
+        sort_keys,
+        write_json_body_jq,
+        jq_bare_float_display,
+        real_output_infinite_float,
+        real_output_infinite_literal,
         format_number_jq_compat,
     )
 }
@@ -1141,7 +1196,12 @@ mod tests {
     fn test_stream_null() {
         let mut buf = String::new();
         OwnedValue::Null
-            .stream_json(&mut buf, IndentSpec::COMPACT, false)
+            .stream_json(
+                &mut buf,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+            )
             .unwrap();
         assert_eq!(buf, "null");
     }
@@ -1167,13 +1227,23 @@ mod tests {
     fn test_stream_bool() {
         let mut buf = String::new();
         OwnedValue::Bool(true)
-            .stream_json(&mut buf, IndentSpec::COMPACT, false)
+            .stream_json(
+                &mut buf,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+            )
             .unwrap();
         assert_eq!(buf, "true");
 
         buf.clear();
         OwnedValue::Bool(false)
-            .stream_json(&mut buf, IndentSpec::COMPACT, false)
+            .stream_json(
+                &mut buf,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+            )
             .unwrap();
         assert_eq!(buf, "false");
     }
@@ -1182,13 +1252,23 @@ mod tests {
     fn test_stream_int() {
         let mut buf = String::new();
         OwnedValue::Int(42)
-            .stream_json(&mut buf, IndentSpec::COMPACT, false)
+            .stream_json(
+                &mut buf,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+            )
             .unwrap();
         assert_eq!(buf, "42");
 
         buf.clear();
         OwnedValue::Int(-123)
-            .stream_json(&mut buf, IndentSpec::COMPACT, false)
+            .stream_json(
+                &mut buf,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+            )
             .unwrap();
         assert_eq!(buf, "-123");
     }
@@ -1197,7 +1277,12 @@ mod tests {
     fn test_stream_float() {
         let mut buf = String::new();
         OwnedValue::Float(3.125)
-            .stream_json(&mut buf, IndentSpec::COMPACT, false)
+            .stream_json(
+                &mut buf,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+            )
             .unwrap();
         assert_eq!(buf, "3.125");
     }
@@ -1434,19 +1519,34 @@ mod tests {
     fn test_stream_json_whole_float_keeps_decimal_point() {
         let mut buf = String::new();
         OwnedValue::Float(1.0)
-            .stream_json(&mut buf, IndentSpec::COMPACT, false)
+            .stream_json(
+                &mut buf,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+            )
             .unwrap();
         assert_eq!(buf, "1.0");
 
         buf.clear();
         OwnedValue::Float(-0.0)
-            .stream_json(&mut buf, IndentSpec::COMPACT, false)
+            .stream_json(
+                &mut buf,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+            )
             .unwrap();
         assert_eq!(buf, "-0.0");
 
         buf.clear();
         OwnedValue::Array(vec![OwnedValue::Float(1.0), OwnedValue::Float(2.5)])
-            .stream_json(&mut buf, IndentSpec::COMPACT, false)
+            .stream_json(
+                &mut buf,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+            )
             .unwrap();
         assert_eq!(buf, "[1.0,2.5]");
     }
@@ -1522,7 +1622,12 @@ mod tests {
     fn test_stream_json_number_literal() {
         let mut buf = String::new();
         OwnedValue::NumberLiteral(NumberRepr::Float(1.2e3), "1.2e3".into())
-            .stream_json(&mut buf, IndentSpec::COMPACT, false)
+            .stream_json(
+                &mut buf,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+            )
             .unwrap();
         assert_eq!(buf, "1.2e3");
     }
@@ -1534,13 +1639,23 @@ mod tests {
         // non-finite Float does, not fall through to `format_number_jq_compat`.
         let mut buf = String::new();
         OwnedValue::NumberLiteral(NumberRepr::Float(f64::NAN), "nan".into())
-            .stream_json(&mut buf, IndentSpec::COMPACT, false)
+            .stream_json(
+                &mut buf,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+            )
             .unwrap();
         assert_eq!(buf, "null");
 
         buf.clear();
         OwnedValue::NumberLiteral(NumberRepr::Float(f64::INFINITY), "1e400".into())
-            .stream_json(&mut buf, IndentSpec::COMPACT, false)
+            .stream_json(
+                &mut buf,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+            )
             .unwrap();
         assert_eq!(buf, "null");
     }
@@ -1648,7 +1763,12 @@ mod tests {
     fn test_stream_string() {
         let mut buf = String::new();
         OwnedValue::String("hello".to_string())
-            .stream_json(&mut buf, IndentSpec::COMPACT, false)
+            .stream_json(
+                &mut buf,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+            )
             .unwrap();
         assert_eq!(buf, "\"hello\"");
     }
@@ -1657,19 +1777,34 @@ mod tests {
     fn test_stream_string_escaping() {
         let mut buf = String::new();
         OwnedValue::String("hello\nworld".to_string())
-            .stream_json(&mut buf, IndentSpec::COMPACT, false)
+            .stream_json(
+                &mut buf,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+            )
             .unwrap();
         assert_eq!(buf, "\"hello\\nworld\"");
 
         buf.clear();
         OwnedValue::String("tab\there".to_string())
-            .stream_json(&mut buf, IndentSpec::COMPACT, false)
+            .stream_json(
+                &mut buf,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+            )
             .unwrap();
         assert_eq!(buf, "\"tab\\there\"");
 
         buf.clear();
         OwnedValue::String("quote\"here".to_string())
-            .stream_json(&mut buf, IndentSpec::COMPACT, false)
+            .stream_json(
+                &mut buf,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+            )
             .unwrap();
         assert_eq!(buf, "\"quote\\\"here\"");
     }
@@ -1682,7 +1817,12 @@ mod tests {
             OwnedValue::Int(2),
             OwnedValue::Int(3),
         ])
-        .stream_json(&mut buf, IndentSpec::COMPACT, false)
+        .stream_json(
+            &mut buf,
+            IndentSpec::COMPACT,
+            false,
+            JsonConvention::Preserve,
+        )
         .unwrap();
         assert_eq!(buf, "[1,2,3]");
     }
@@ -1694,7 +1834,12 @@ mod tests {
         map.insert("name".to_string(), OwnedValue::String("Alice".to_string()));
         map.insert("age".to_string(), OwnedValue::Int(30));
         OwnedValue::Object(map)
-            .stream_json(&mut buf, IndentSpec::COMPACT, false)
+            .stream_json(
+                &mut buf,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+            )
             .unwrap();
         assert_eq!(buf, "{\"name\":\"Alice\",\"age\":30}");
     }
@@ -1714,7 +1859,12 @@ mod tests {
             OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
         );
         OwnedValue::Object(outer)
-            .stream_json(&mut buf, IndentSpec::spaces(2), false)
+            .stream_json(
+                &mut buf,
+                IndentSpec::spaces(2),
+                false,
+                JsonConvention::Preserve,
+            )
             .unwrap();
         assert_eq!(
             buf,
@@ -1747,7 +1897,12 @@ mod tests {
         let mut map = IndexMap::new();
         map.insert("a".to_string(), OwnedValue::String("boom".to_string()));
         let mut out = FailOnMarker { marker: "boom" };
-        let result = OwnedValue::Object(map).stream_json(&mut out, IndentSpec::spaces(2), false);
+        let result = OwnedValue::Object(map).stream_json(
+            &mut out,
+            IndentSpec::spaces(2),
+            false,
+            JsonConvention::Preserve,
+        );
         assert!(result.is_err());
     }
 
@@ -1801,7 +1956,12 @@ mod tests {
             calls: 0,
             fail_after: 5,
         };
-        let result = OwnedValue::Object(map).stream_json(&mut out, IndentSpec::COMPACT, false);
+        let result = OwnedValue::Object(map).stream_json(
+            &mut out,
+            IndentSpec::COMPACT,
+            false,
+            JsonConvention::Preserve,
+        );
         assert!(result.is_err());
         assert!(out.calls <= 20, "calls: {}", out.calls);
     }
@@ -1825,7 +1985,12 @@ mod tests {
             calls: 0,
             fail_after: 5,
         };
-        let result = OwnedValue::Object(map).stream_json(&mut out, IndentSpec::COMPACT, true);
+        let result = OwnedValue::Object(map).stream_json(
+            &mut out,
+            IndentSpec::COMPACT,
+            true,
+            JsonConvention::Preserve,
+        );
         assert!(result.is_err());
         assert!(out.calls <= 20, "calls: {}", out.calls);
     }
@@ -1843,7 +2008,12 @@ mod tests {
         map.insert("a".to_string(), OwnedValue::Int(2));
         let mut buf = String::new();
         OwnedValue::Object(map)
-            .stream_json(&mut buf, IndentSpec::COMPACT, true)
+            .stream_json(
+                &mut buf,
+                IndentSpec::COMPACT,
+                true,
+                JsonConvention::Preserve,
+            )
             .unwrap();
         assert_eq!(buf, "{\"a\":2,\"b\":1}");
     }
@@ -1947,14 +2117,24 @@ mod tests {
         let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
         let mut buf = String::new();
         under
-            .stream_json(&mut buf, IndentSpec::COMPACT, false)
+            .stream_json(
+                &mut buf,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+            )
             .unwrap();
         assert!(!buf.is_empty());
 
         let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut buf = String::new();
-            over.stream_json(&mut buf, IndentSpec::COMPACT, false)
+            over.stream_json(
+                &mut buf,
+                IndentSpec::COMPACT,
+                false,
+                JsonConvention::Preserve,
+            )
         }));
         assert!(
             result.is_err(),
