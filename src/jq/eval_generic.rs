@@ -43,8 +43,8 @@ use super::eval::{
     is_retryable_stop, literal_to_owned, needs_path_context, numeric_key_to_array_index,
     numeric_key_to_index, owned_bound_to_i64, owned_to_string, slice_object_as_yq_children,
     slice_owned_value_read, substitute_bound_var, substitute_vars, suppresses, tonumber_from_str,
-    try_reserve_product, vec_with_capacity, Control, Demand, EvalError, EvalSemantics, EvalTag,
-    Flow, JqSemantics, LimitN, PathTrail, QueryResult, YqSemantics,
+    vec_with_capacity, Control, Demand, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics,
+    LimitN, PathTrail, QueryResult, YqSemantics,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -8048,6 +8048,20 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
 /// immediately above — `start`/`end` are evaluated first (outermost) against
 /// the original value/cursor, not the target's output, and an empty bound
 /// stream short-circuits before the target is evaluated at all. See #615.
+///
+/// #2143: `target` (`E`) is now re-evaluated fresh for every `(s, e)` pair
+/// rather than once overall, mirroring #2032/#2142's identical fix for
+/// `eval_index_expr` one nesting level deeper — jq's own
+/// `S as $s | T as $t | E | .[$s:$t]` desugaring puts `E` inside both
+/// bindings, so a side effect in `E` (`stderr`, `input`) must fire once per
+/// `(s, e)` pair, not once total (verified against jq 1.7.1: `[10,20,30] |
+/// [(stderr)[(0,1):(2,3)]]` writes `[10,20,30]` to stderr four times, once
+/// per pair). `target`'s own escape (`Error`/`Break`/`Halt`/`Partial`) can
+/// now fire after earlier pairs already contributed real output, so it
+/// folds the running `out` in as a `Partial` prefix instead of discarding
+/// it — the "target's own `Partial` arm discards its prefix, unreachable in
+/// practice" note this comment used to carry no longer applies now that the
+/// arm runs inside the loop.
 fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
     target: &Expr,
     start: &Option<Box<Expr>>,
@@ -8074,13 +8088,6 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
     // `end` itself is computed once here (not re-run per `s`), which is
     // still correct: it depends only on `value`, not `s`, so its own
     // (prefix, escape) pair is identical on every notional re-run.
-    //
-    // Not addressed here (pre-existing, separate from this fix): `target`'s
-    // own `Partial` arm below still discards its prefix outright rather than
-    // threading it through with the same truncation `target_escape` would
-    // need against `ends`, mirroring `resolve_slice_expr`'s own 3-way rule
-    // -- unreachable in practice today, since that arm already returns
-    // before the loop below can run at all.
     let (starts, starts_escape) =
         match eval_slice_bound::<S, V>(start, value.clone(), cursor, f64::floor) {
             Ok(v) => v,
@@ -8114,65 +8121,64 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
         Borrowed(Vec<V>),
         Owned(Vec<OwnedValue>),
     }
-    impl<V> Targets<V> {
-        fn len(&self) -> usize {
-            match self {
-                Self::Borrowed(ts) => ts.len(),
-                Self::Owned(ts) => ts.len(),
-            }
-        }
-    }
-    let targets = match eval_single::<S, V>(target, value, false, cursor) {
-        GenericResult::Error(e) => return GenericResult::Error(e),
-        GenericResult::Break(label) => return GenericResult::Break(label),
-        // Same reasoning as `eval_index_expr`'s target match: kept out of
-        // the `owned @ (...)` group below so a halted target stream isn't
-        // quietly swallowed into an empty `Vec` by `collect_owned()`.
-        GenericResult::Halt(code) => return GenericResult::Halt(code),
-        GenericResult::None => return GenericResult::None,
-        // Same conservative Error/Break-only handling as `eval_index_expr`'s
-        // target Partial arm above.
-        GenericResult::Partial(_, Control::Error(e)) => return GenericResult::Error(e),
-        GenericResult::Partial(_, Control::Break(label)) => return GenericResult::Break(label),
-        GenericResult::Partial(_, Control::Halt(code)) => return GenericResult::Halt(code),
-        GenericResult::One(v) => Targets::Borrowed(vec![v]),
-        GenericResult::Many(vs) => Targets::Borrowed(vs),
-        GenericResult::OneCursor(c) => Targets::Borrowed(vec![c.value()]),
-        GenericResult::ManyCursor(cs) => {
-            Targets::Borrowed(cs.iter().map(DocumentCursor::value).collect())
-        }
-        // See `eval_index_expr`'s identical arm for the accepted, pre-existing
-        // error-swallowing note that also applies to `LazySeq` here.
-        owned @ (GenericResult::Owned(_)
-        | GenericResult::ManyOwned(_)
-        | GenericResult::LazyKeys { .. }
-        | GenericResult::LazyIndexRange(_)
-        | GenericResult::LazySeq(_)) => Targets::Owned(owned_or_err!(owned.collect_owned())),
-    };
 
-    // Start outer, end middle, target inner. The result is always owned:
+    // Start outer, end middle, target inner (#2143: target is now
+    // re-evaluated once per (s, e) pair, so it is genuinely the innermost
+    // stage, not just looped as if it were). The result is always owned:
     // slicing constructs a fresh array/string, same invariant as
-    // `eval::eval_slice_expr`.
-    //
-    // All three factors (#1634 review): the loop below is genuinely S
-    // outer / E middle / T inner, so `starts.len() * ends.len()` alone
-    // under-reserves whenever the target itself has more than one output
-    // -- an unguarded `Vec::with_capacity` product of two or three such
-    // generator-controlled lengths can also panic/abort the process on
-    // overflow or a genuine allocation failure. This is the actual
-    // dispatch path for an ordinary `.[$s:$e]` CLI read (see the comment
-    // on `Expr::SliceExpr`'s own match arm above), so this site -- not
+    // `eval::eval_slice_expr`. Reserved per-pair below rather than as one
+    // upfront `starts.len() * ends.len() * targets.len()` product (#1634's
+    // original concern still applies -- an unguarded product of
+    // generator-controlled lengths can panic/abort on overflow -- but the
+    // target's own length can now vary per pair, so a single upfront
+    // product is no longer computable). This is the actual dispatch path
+    // for an ordinary `.[$s:$e]` CLI read (see the comment on
+    // `Expr::SliceExpr`'s own match arm above), so this site -- not
     // `eval::eval_slice_expr`'s sibling -- is what a real `succinctly
     // jq`/`succinctly yq` invocation hits.
-    let mut out: Vec<OwnedValue> = owned_or_err!(try_reserve_product(&[
-        starts.len(),
-        ends.len(),
-        targets.len()
-    ]));
-    match &targets {
-        Targets::Borrowed(ts) => {
-            for s in starts {
-                for e in &ends {
+    let mut out: Vec<OwnedValue> = Vec::new();
+
+    for s in starts {
+        for e in &ends {
+            let targets = match eval_single::<S, V>(target, value.clone(), false, cursor) {
+                GenericResult::Error(e) => return partial_generic(out, Control::Error(e)),
+                GenericResult::Break(label) => return partial_generic(out, Control::Break(label)),
+                GenericResult::Halt(code) => return partial_generic(out, Control::Halt(code)),
+                // Zero outputs for *this* (s, e) pair contributes nothing to
+                // it -- not a whole-function short-circuit, now that E's own
+                // output count can vary across pairs (mirrors
+                // `eval_index_expr`'s identical per-key treatment).
+                GenericResult::None => continue,
+                // Same conservative Error/Break/Halt-only handling as
+                // `eval_index_expr`'s target `Partial` arm, now folding the
+                // running `out` in as the prefix instead of discarding it.
+                GenericResult::Partial(_, control) => return partial_generic(out, control),
+                GenericResult::One(v) => Targets::Borrowed(vec![v]),
+                GenericResult::Many(vs) => Targets::Borrowed(vs),
+                GenericResult::OneCursor(c) => Targets::Borrowed(vec![c.value()]),
+                GenericResult::ManyCursor(cs) => {
+                    Targets::Borrowed(cs.iter().map(DocumentCursor::value).collect())
+                }
+                // See `eval_index_expr`'s identical arm for the accepted,
+                // pre-existing error-swallowing note that also applies to
+                // `LazySeq` here.
+                owned @ (GenericResult::Owned(_)
+                | GenericResult::ManyOwned(_)
+                | GenericResult::LazyKeys { .. }
+                | GenericResult::LazyIndexRange(_)
+                | GenericResult::LazySeq(_)) => match owned.collect_owned() {
+                    Ok(vs) => Targets::Owned(vs),
+                    Err(err) => return partial_generic(out, Control::Error(err)),
+                },
+            };
+            match &targets {
+                Targets::Borrowed(ts) => {
+                    if out.try_reserve(ts.len()).is_err() {
+                        return partial_generic(
+                            out,
+                            Control::Error(cannot_reserve_cross_product(&[ts.len()])),
+                        );
+                    }
                     for t in ts {
                         match slice_one_generic::<S, V>(t.clone(), *s, *e, optional) {
                             GenericResult::Owned(v) => out.push(v),
@@ -8182,11 +8188,13 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
                         }
                     }
                 }
-            }
-        }
-        Targets::Owned(ts) => {
-            for s in starts {
-                for e in &ends {
+                Targets::Owned(ts) => {
+                    if out.try_reserve(ts.len()).is_err() {
+                        return partial_generic(
+                            out,
+                            Control::Error(cannot_reserve_cross_product(&[ts.len()])),
+                        );
+                    }
                     for t in ts {
                         match slice_owned_value_read::<S>(t, *s, *e, optional) {
                             Ok(Some(v)) => out.push(v),

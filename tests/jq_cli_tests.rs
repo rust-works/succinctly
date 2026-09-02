@@ -31671,6 +31671,95 @@ fn test_index_expr_native_to_owned_flip_mid_key_reserves_2032() -> Result<()> {
     Ok(())
 }
 
+/// #2143: `E[S:T]` compiles as `S as $s | T as $t | E | .[$s:$t]` -- `E` is
+/// re-evaluated once per `(s, t)` pair the bound generators produce, not
+/// once total. `succinctly` used to cache `E`'s result and loop the
+/// `(s, t)` pairs over it, firing a side effect in `E` once overall instead
+/// of once per pair. Counted by occurrence, not by line (`stderr` writes no
+/// trailing newline). Verified against jq 1.7.1.
+///
+/// This is `eval_generic::eval_slice_expr`'s own fix -- the function an
+/// ordinary CLI `.[$s:$t]` read actually reaches (confirmed empirically,
+/// same as #2032's sibling: `eval::eval_slice_expr`'s identical fix is
+/// reached only through certain fallback shapes, not this file's own
+/// stdin-fed queries).
+#[test]
+fn test_slice_expr_target_reevaluated_once_per_pair_2143() -> Result<()> {
+    for (input, filter, want_stderr, why) in [
+        (
+            "[[10,20],[30,40]]",
+            "[(.[] | stderr)[(0,1):(1,2)]]",
+            "[10,20][30,40][10,20][30,40][10,20][30,40][10,20][30,40]",
+            "the issue's own repro: two starts x two ends = four pairs, \
+             target re-runs once per pair",
+        ),
+        (
+            "[10,20,30]",
+            "[(. | stderr)[0:(1,2,3)]]",
+            "[10,20,30][10,20,30][10,20,30]",
+            "a single start bound still re-runs the target once per end \
+             value, not just once overall",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "{why} -- stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stderr, want_stderr, "{why}");
+    }
+    Ok(())
+}
+
+/// #2143 sibling: a pair whose target evaluation is genuinely empty must
+/// not short-circuit the *remaining* pairs -- each pair's target is now
+/// independent, unlike the old once-overall evaluation, where an empty
+/// target for any one pair made every pair look empty. `inputs` (an impure,
+/// stateful generator) is what makes the target vary per re-evaluation
+/// here: for pair `(0,1)` it drains the one remaining stdin line
+/// (`[10,20]`) and yields it, so `.[0:1]` produces `[10]`; re-evaluating
+/// `inputs` for pair `(1,2)` finds the stream already exhausted and yields
+/// nothing at all (not an error -- a target that legitimately produces zero
+/// values for that pair), so that pair contributes nothing to the output.
+/// Verified against jq 1.7.1 (`jq -n 'inputs[(0,1):(1,2)]'` also emits only
+/// `[10]`).
+#[test]
+fn test_slice_expr_one_empty_pair_does_not_short_circuit_others_2143() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "-n", "inputs[(0,1):(1,2)]"], Some("[10,20]\n"))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[10]\n");
+    Ok(())
+}
+
+/// #2143 sibling: a second impure-target regression alongside the `stderr`
+/// cases above, this time via `input` (a stateful generator that consumes
+/// from the CLI's document stream) rather than a side-channel write --
+/// `.[$s:$t]`'s target must be *re-read* from the stream once per pair, not
+/// read once and reused. `run_jq_full` execs the real CLI subprocess, which
+/// always dispatches through `eval_generic::eval_slice_expr`
+/// (`eval::eval_slice_expr` has no CLI-reachable path at all -- it's a
+/// separate, pure-in-process library entry point with no `input`/`inputs`
+/// builtin and no observable side-effect mechanism in its own unit tests,
+/// so its sibling fix is covered there only by reachability/regression
+/// tests on pure targets, e.g.
+/// `test_computed_slice_ordinary_cross_product_unaffected_2143` in
+/// `src/jq/eval.rs`).
+///
+/// Verified against jq 1.7.1: emits `[1,2]` then `[4,5,6]` (pair `(0,2)`
+/// re-reads `input` to get `[1,2,3]` -> `.[0:2]` = `[1,2]`; pair `(0,3)`
+/// re-reads `input` again to get `[4,5,6]` -> `.[0:3]` = `[4,5,6]`), then a
+/// third `input` read past the two provided lines raises, and the prior
+/// two successfully-produced values still print first (real jq streams
+/// top-level output progressively; succinctly matches via `Partial`).
+#[test]
+fn test_slice_expr_eval_rs_dispatch_target_reevaluated_per_pair_2143() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "-n", "(input)[(0,1):(2,3)]"],
+        Some("[1,2,3]\n[4,5,6]\n"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[1,2]\n[4,5,6]\n");
+    Ok(())
+}
+
 /// #2031's own primary repro: `SOURCE` (`.a`) is itself a genuine path
 /// expression, so real jq's single shared path register moves onto `.a`'s
 /// own position as a side effect of evaluating it -- and UPDATE's own

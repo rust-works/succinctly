@@ -16510,6 +16510,12 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// `null | .[("x"):2]?` both still raise, matching a literal computed key
 /// (`.[.k]?` still raises on a string target) rather than
 /// `key_to_path_component`'s optional-gated type check.
+///
+/// #2143: `target` (`E`) is re-evaluated fresh for every `(s, e)` pair
+/// rather than once overall, mirroring #2032/#2142's identical fix for
+/// `eval_index_expr` one nesting level deeper — see
+/// `eval_generic::eval_slice_expr`'s own copy of this comment for the full
+/// rationale and live-verified repro; not repeated here.
 fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     target: &Expr,
     start: &Option<Box<Expr>>,
@@ -16546,57 +16552,60 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let starts_len = if ends_escaped { 1 } else { starts.len() };
     let starts = &starts[..starts_len];
 
-    let targets = eval_single::<W, S>(target, value, false).materialize_cursor();
-
     // Borrowed and owned targets are kept apart so the common (borrowed) case
     // never materializes the document — mirrors `eval_index_expr`.
     enum Targets<'a, W> {
         Borrowed(Vec<StandardJson<'a, W>>),
         Owned(Vec<OwnedValue>),
     }
-    impl<W> Targets<'_, W> {
-        fn len(&self) -> usize {
-            match self {
-                Self::Borrowed(ts) => ts.len(),
-                Self::Owned(ts) => ts.len(),
-            }
-        }
-    }
-    let targets = match targets {
-        QueryResult::One(v) => Targets::Borrowed(vec![v]),
-        QueryResult::Many(vs) => Targets::Borrowed(vs),
-        QueryResult::Owned(v) => Targets::Owned(vec![v]),
-        QueryResult::ManyOwned(vs) => Targets::Owned(vs),
-        QueryResult::None => return QueryResult::None,
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        QueryResult::Break(label) => return QueryResult::Break(label),
-        QueryResult::Halt(code) => return QueryResult::Halt(code),
-        QueryResult::OneCursor(_) => unreachable!("materialize_cursor should have converted this"),
-        QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
-        QueryResult::Partial(_, Control::Break(label)) => return QueryResult::Break(label),
-        QueryResult::Partial(_, Control::Halt(code)) => return QueryResult::Halt(code),
-    };
 
-    // S outer, T middle, E inner (point 2 above). The result is always
-    // owned: slicing constructs a new array/string (see `eval_single`'s
-    // `Expr::Slice` arm), so there is nothing to borrow except its rare
-    // whole-value fast paths, which `to_owned_lossy` below just copies out of.
-    //
-    // All three factors, not just `starts.len() * ends.len()`: the loop
-    // below is genuinely S outer / T middle / E inner, so the true upper
-    // bound includes the target count too (#1634 review) -- an
-    // under-reservation here wouldn't overflow on its own, but it would
-    // leave the eventual `Vec::push` growth past this capacity unguarded
-    // for exactly the same crash class this function exists to close.
-    let mut out: Vec<OwnedValue> =
-        match try_reserve_product(&[starts.len(), ends.len(), targets.len()]) {
-            Ok(out) => out,
-            Err(e) => return QueryResult::Error(e),
-        };
-    match &targets {
-        Targets::Borrowed(ts) => {
-            for s in starts {
-                for e in &ends {
+    // S outer, T middle, E inner (point 2 above), with E now genuinely
+    // re-evaluated once per (s, e) pair rather than once overall (#2143).
+    // The result is always owned: slicing constructs a new array/string
+    // (see `eval_single`'s `Expr::Slice` arm), so there is nothing to
+    // borrow except its rare whole-value fast paths, which `to_owned_lossy`
+    // below just copies out of. Reserved per-pair below rather than as one
+    // upfront `starts.len() * ends.len() * targets.len()` product (#1634's
+    // original concern still applies -- an unguarded product of
+    // generator-controlled lengths can panic/abort on overflow -- but the
+    // target's own length can now vary per pair, so a single upfront
+    // product is no longer computable).
+    let mut out: Vec<OwnedValue> = Vec::new();
+
+    for s in starts {
+        for e in &ends {
+            let targets = eval_single::<W, S>(target, value.clone(), false).materialize_cursor();
+            let targets = match targets {
+                QueryResult::One(v) => Targets::Borrowed(vec![v]),
+                QueryResult::Many(vs) => Targets::Borrowed(vs),
+                QueryResult::Owned(v) => Targets::Owned(vec![v]),
+                QueryResult::ManyOwned(vs) => Targets::Owned(vs),
+                // Zero outputs for *this* (s, e) pair contributes nothing to
+                // it -- not a whole-function short-circuit, now that E's own
+                // output count can vary across pairs (mirrors
+                // `eval_index_expr`'s identical per-key treatment).
+                QueryResult::None => continue,
+                QueryResult::Error(err) => return partial(out, Control::Error(err)),
+                QueryResult::Break(label) => return partial(out, Control::Break(label)),
+                QueryResult::Halt(code) => return partial(out, Control::Halt(code)),
+                QueryResult::OneCursor(_) => {
+                    unreachable!("materialize_cursor should have converted this")
+                }
+                // Same conservative Error/Break/Halt-only handling as
+                // before, now folding the running `out` in as the prefix
+                // instead of discarding it (unreachable before this fix,
+                // since `out` was always empty at this point -- E was
+                // evaluated before the loop could produce anything).
+                QueryResult::Partial(_, control) => return partial(out, control),
+            };
+            match &targets {
+                Targets::Borrowed(ts) => {
+                    if out.try_reserve(ts.len()).is_err() {
+                        return partial(
+                            out,
+                            Control::Error(cannot_reserve_cross_product(&[ts.len()])),
+                        );
+                    }
                     let slice_expr = Expr::Slice {
                         start: *s,
                         end: *e,
@@ -16628,11 +16637,13 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         }
                     }
                 }
-            }
-        }
-        Targets::Owned(ts) => {
-            for s in starts {
-                for e in &ends {
+                Targets::Owned(ts) => {
+                    if out.try_reserve(ts.len()).is_err() {
+                        return partial(
+                            out,
+                            Control::Error(cannot_reserve_cross_product(&[ts.len()])),
+                        );
+                    }
                     for t in ts {
                         match slice_owned_value_read::<S>(t, *s, *e, optional) {
                             Ok(Some(v)) => out.push(v),
@@ -49986,18 +49997,51 @@ mod tests {
     /// so each arm does a per-key `Vec::try_reserve` against
     /// `cannot_reserve_cross_product`'s own error instead of one upfront
     /// product reservation; see that fix's own comments on each arm for the
-    /// current mechanism. `eval_slice_expr`/`resolve_index_expr`/
-    /// `resolve_slice_expr` (target evaluated once, unaffected by #2032)
-    /// still call `try_reserve_product` directly and are covered by the
-    /// direct unit tests above and the CLI-level path/slice tests elsewhere
-    /// in this file, e.g. `test_path_...`/`test_slice_...` cases exercising
-    /// `.[$s:$e]` and `path(...)`.
+    /// current mechanism. `eval_slice_expr` moved to the identical per-pair
+    /// `Vec::try_reserve` scheme in #2143, for the same reason (the target's
+    /// length can now vary per `(s, e)` pair). `resolve_index_expr`/
+    /// `resolve_slice_expr` (the `path()`/write-path siblings, target still
+    /// evaluated once -- out of scope for both #2032 and #2143, tracked
+    /// separately as #2139) still call `try_reserve_product` directly and
+    /// are covered by the direct unit tests above and the CLI-level
+    /// path/slice tests elsewhere in this file, e.g.
+    /// `test_path_...`/`test_slice_...` cases exercising `.[$s:$e]` and
+    /// `path(...)`.
     #[test]
     fn test_computed_index_ordinary_cross_product_unaffected_1634() {
         query!(br#"{"a":1,"b":2}"#, r#".[("a","b")]"#,
             QueryResult::Many(vs) => {
                 let values: Vec<OwnedValue> = vs.iter().map(to_owned_lossy).collect();
                 assert_eq!(values, vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+            }
+        );
+    }
+
+    /// #2143: `eval::eval_slice_expr` (the DOM route reached through the
+    /// public `succinctly::jq::eval` library API -- see this file's
+    /// `eval_index_expr`/#2032 test group above for why the CLI itself
+    /// dispatches through `eval_generic.rs`'s sibling instead) still
+    /// produces the exact same *values* after being restructured to
+    /// re-evaluate its target once per `(s, e)` pair -- this function has
+    /// no side-effecting builtin reachable through this harness, so value
+    /// agreement is what's left to pin here; the CLI-level
+    /// `test_slice_expr_target_reevaluated_once_per_pair_2143` (in
+    /// `tests/jq_cli_tests.rs`) covers the actual re-evaluation-count fix
+    /// via `stderr`. Doubles as this function's own #1634-style
+    /// cross-product regression check, now that a single upfront
+    /// `starts.len() * ends.len() * targets.len()` reservation no longer
+    /// exists to test. Verified against jq 1.7.1 (see this function's own
+    /// doc comment, point 2, for the identical worked example).
+    #[test]
+    fn test_computed_slice_ordinary_cross_product_unaffected_2143() {
+        query!(br"[1,2,3,4,5]", r".[(0,1):(3,4)]",
+            QueryResult::ManyOwned(vs) => {
+                assert_eq!(vs, vec![
+                    OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3)]),
+                    OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3), OwnedValue::Int(4)]),
+                    OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Int(3)]),
+                    OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Int(3), OwnedValue::Int(4)]),
+                ]);
             }
         );
     }
