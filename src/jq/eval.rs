@@ -27232,17 +27232,26 @@ fn eval_owned_pure<S: EvalSemantics>(
                 Err(e) => Some(Err(e)),
             }
         }
-        // `eval_compare` -> `eval_binary_fanout` with two single-output
-        // operands is exactly one (left, right) pairing, and its `combine` is
-        // `apply_compare_op` — the shared operator semantics this reuses
-        // directly. Left is the outer generator there, so a left-side error
-        // wins over a right-side one; short-circuiting on it here matches.
+        // `eval_compare` -> `eval_binary_fanout` -> `binary_fanout_each`:
+        // **right is the outer generator, left the inner one** (jq nests a
+        // binary op's operands rightmost-outermost, the same convention
+        // `builtin_pow`'s/`builtin_setpath`'s own doc comments name for
+        // their own two-argument fanouts) — so a right-side error wins over
+        // a left-side one whenever both operands would fail, since right is
+        // attempted first and left is never reached if it does. An earlier
+        // version of this arm evaluated left before right and got this
+        // backwards; caught live against the pinned oracle (`/usr/bin/jq`
+        // 1.7.1): `{"a":"str","c":1} | del(.. | select(.a.b == .c.d))`
+        // reports `Cannot index number with string "d"` (`.c.d`, the right
+        // operand) in both real jq and this file's own slow path, not
+        // `.a.b`'s message — pinned by
+        // `compare_condition_reports_the_right_operands_error_first_2048`.
         Expr::Compare { op, left, right } => {
-            let l = match eval_owned_pure::<S>(left, input)? {
+            let r = match eval_owned_pure::<S>(right, input)? {
                 Ok(v) => v,
                 Err(e) => return Some(Err(e)),
             };
-            let r = match eval_owned_pure::<S>(right, input)? {
+            let l = match eval_owned_pure::<S>(left, input)? {
                 Ok(v) => v,
                 Err(e) => return Some(Err(e)),
             };
@@ -46938,6 +46947,49 @@ mod tests {
                 OwnedValue::Bool(expected)
             );
         }
+    }
+
+    /// #2048 review: a `Compare` whose *both* operands would independently
+    /// fail must surface the *right* operand's error, matching
+    /// `binary_fanout_each`'s real ordering (right is the outer generator,
+    /// left the inner one, per `builtin_pow`'s/`builtin_setpath`'s own doc
+    /// comments on that same rightmost-outermost convention) -- an earlier
+    /// version of `eval_owned_pure`'s `Expr::Compare` arm evaluated left
+    /// first and got this backwards, caught live against the pinned oracle:
+    /// `{"a":"str","c":1} | del(.. | select(.a.b == .c.d))` answers
+    /// `Cannot index number with string "d"` (`.c.d`, the right operand's
+    /// error) in `/usr/bin/jq` 1.7.1, not `.a.b`'s.
+    #[test]
+    fn compare_condition_reports_the_right_operands_error_first_2048() {
+        let cond = parse(".a.b == .c.d").unwrap();
+        assert!(is_owned_pure_composite(&cond));
+        let mut value = indexmap::IndexMap::new();
+        value.insert("a".to_string(), OwnedValue::String("str".to_string()));
+        value.insert("c".to_string(), OwnedValue::Int(1));
+        let value = OwnedValue::Object(value);
+
+        let err = eval_owned_pure::<JqSemantics>(&cond, &value)
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.message.contains("Cannot index number"),
+            "expected the right operand's (`.c.d`) error to win, got: {}",
+            err.message
+        );
+        // The fast path must agree with the reindex bridge here too, not
+        // just on the value it returns when both succeed.
+        match eval_owned_input_reindexed::<Vec<u64>, JqSemantics>(&cond, &value, false) {
+            QueryResult::Error(bridge_err) => assert_eq!(err.message, bridge_err.message),
+            other => panic!("expected the bridge to also raise, got: {other:?}"),
+        }
+        // End-to-end: the whole query, through `resolve_node`'s own
+        // `select` arm, reports the same thing -- this is the shape the
+        // divergence was actually found in, not just the bare condition.
+        query!(
+            br#"{"a":"str","c":1}"#,
+            r"del(.. | select(.a.b == .c.d))",
+            QueryResult::Error(e) => assert!(e.message.contains("Cannot index number"), "{}", e.message)
+        );
     }
 
     /// #2048, behavioural half of the over-eager guard: a `select` condition

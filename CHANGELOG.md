@@ -219,6 +219,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   test (which read all three numeric representations identically), never
   as an expression's own escaping result.
 
+  A dedicated code review then caught a second, more subtle representation
+  bug before merge: the fast path's `Expr::Compare` arm evaluated its left
+  operand before its right one, backwards from
+  `binary_fanout_each`'s real ordering (right is the outer generator, left
+  the inner one — the same rightmost-outermost convention
+  `builtin_pow`/`builtin_setpath` already document for their own
+  two-argument fanouts). Observable whenever *both* operands would
+  independently fail: `{"a":"str","c":1} | del(.. | select(.a.b == .c.d))`
+  reported `.a.b`'s error instead of `.c.d`'s, live-verified against
+  `/usr/bin/jq` 1.7.1 as a real divergence, not just an internal
+  inconsistency. Fixed by evaluating right before left, matching the slow
+  path; pinned by
+  `compare_condition_reports_the_right_operands_error_first_2048`. Four
+  smaller, non-blocking observations from the same review (a per-branch
+  recompute cost, a duplicated purity predicate, and two low-severity
+  readability/architecture notes) are split out to #2201.
+
 ### Fixed
 
 - **`IN(s)`/`IN(src; s)` now forward the real ambient `optional` instead of
