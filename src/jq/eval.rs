@@ -31176,6 +31176,422 @@ fn eval_expr_needing_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>
     }
 }
 
+/// Classify a `QueryResult` already restricted to the
+/// `Owned|ManyOwned|None|Error|Break|Halt|Partial` set -- as every
+/// path-context evaluator function in this file produces -- into its output
+/// values plus an optional trailing escape. Shared by the key-materialization
+/// step in [`eval_index_expr_with_path_context`] and the bound-materialization
+/// step in [`eval_slice_bound_with_path_context`] (#2100), one definition
+/// instead of two independently hand-copied match blocks (CLAUDE.md:
+/// "duplicated predicates diverge silently", #106).
+///
+/// `Expr::Foreach`/`Expr::Reduce`'s own path-context arms still hand-roll
+/// this classification rather than calling here -- deliberately, for now:
+/// they diverge on the *bare* `Error`/`Break` variants, which they route
+/// through `suppress_or_raise`/`finish_fork` instead of folding into the
+/// escape slot, so converting them is a policy change rather than a
+/// cleanup. Tracked as #2216.
+fn drain_path_context_stream<W: Clone + AsRef<[u64]>>(
+    result: QueryResult<'_, W>,
+) -> (Vec<OwnedValue>, Option<Control>) {
+    match result {
+        QueryResult::Owned(v) => (vec![v], None),
+        QueryResult::ManyOwned(vs) => (vs, None),
+        QueryResult::None => (Vec::new(), None),
+        QueryResult::Error(e) => (Vec::new(), Some(Control::Error(e))),
+        QueryResult::Break(label) => (Vec::new(), Some(Control::Break(label))),
+        QueryResult::Halt(code) => (Vec::new(), Some(Control::Halt(code))),
+        QueryResult::Partial(vs, control) => (vs, Some(control)),
+        QueryResult::One(_) | QueryResult::Many(_) | QueryResult::OneCursor(_) => unreachable!(
+            "eval_expr_needing_path_context only ever produces \
+             Owned/ManyOwned/None/Error/Break/Halt/Partial"
+        ),
+    }
+}
+
+/// [`eval_index_expr`]'s path-context twin (#2100): reproduces its five
+/// documented properties (keys evaluated first at `optional: false`; target
+/// re-run fresh per key, #2032; `optional` reaching only `index_one_owned`;
+/// a later key's index error outranking an earlier key's `pending_halt`,
+/// #791/#400/#494/#1897) while additionally extending `current_path` by
+/// each resolved key before continuing `rest` -- the piece the plain
+/// evaluator has no notion of at all, which is what let `key`/`parent`/
+/// `file_index` silently stub or lose position across a computed bracket.
+///
+/// `key` is evaluated against `value`/`current_path` unchanged -- it's a
+/// sibling of `target`, not nested under it (`eval_index_expr`'s own doc
+/// comment, point 1). `target`'s own resolved *path* only needs computing
+/// when `rest` actually consumes it (`paired`, mirroring `Expr::Limit`'s own
+/// gate) -- probed via [`probe_stages`]/[`split_probe_pair`], the
+/// established idiom this file already uses for `Limit`/`FirstExpr`/
+/// `LastExpr`/`If`/`Try`/`Label`/`FuncDef`.
+///
+/// `bracket_optional` feeds only `index_one_owned`; `rest_optional` feeds
+/// only `rest`'s own continuation -- kept distinct so the `Expr::Optional`
+/// carve-out below can force the former to `true` without `rest` inheriting
+/// the bracket's own suppression (the unchanged rule #1410's own arm already
+/// established).
+#[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors every path-context sibling in this file
+fn eval_index_expr_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    target: &Expr,
+    key: &Expr,
+    rest: &[Expr],
+    value: &OwnedValue,
+    root: &OwnedValue,
+    file_origin: Option<&[usize]>,
+    current_path: &[OwnedValue],
+    bracket_optional: bool,
+    rest_optional: bool,
+) -> QueryResult<'a, W> {
+    // (1)/(3): keys first, at `optional: false`, against `value`'s own
+    // position -- current_path unchanged.
+    let key_result =
+        eval_expr_needing_path_context::<W, S>(key, value, root, file_origin, current_path, false);
+    let (keys, pending_halt): (Vec<OwnedValue>, Option<i32>) =
+        match drain_path_context_stream(key_result) {
+            (_, Some(Control::Error(e))) => return QueryResult::Error(e),
+            (_, Some(Control::Break(label))) => return QueryResult::Break(label),
+            // #791: keys already yielded before a halt still owe output.
+            (vs, Some(Control::Halt(code))) => (vs, Some(code)),
+            (vs, None) => (vs, None),
+        };
+    if keys.is_empty() {
+        // NOT `QueryResult::None`, the spelling `eval_index_expr` uses here.
+        // That function's own comment justifies the bare `None` with
+        // "`partial`'s invariant (a non-empty prefix by construction) means
+        // this is only reachable with `pending_halt` unset" -- true *there*,
+        // where a bare `QueryResult::Halt` returns from its own match arm
+        // before this check and only the `Partial(vs, Halt)` shape (whose
+        // `vs` is non-empty by construction) can set `pending_halt`. That
+        // invariant does not survive the port: `drain_path_context_stream`
+        // deliberately folds bare `Halt` and `Partial(_, Halt)` into one
+        // `(vs, Some(code))` arm, so an *empty* key stream can now arrive
+        // here carrying a live halt (`.[halt]`, `.[halt_error]`). Returning
+        // `None` swallowed it -- `[.a | .[halt_error] | key]` printed `[]`
+        // and exited 0 where the plain evaluator exits 5 with no stdout.
+        // `partial` collapses an empty prefix back to the bare
+        // `Halt`/`Error`/`Break`, which is exactly what the slice twin
+        // below already relies on for its own empty-bound short-circuits.
+        return match pending_halt {
+            Some(code) => partial(Vec::new(), Control::Halt(code)),
+            None => QueryResult::None,
+        };
+    }
+
+    let paired = !rest.is_empty() && rest.iter().any(needs_path_context);
+    let mut results: Vec<OwnedValue> = Vec::new();
+
+    for k in &keys {
+        // (2): target re-run fresh per key (#2032), always at `optional:
+        // false` regardless of `bracket_optional`.
+        let target_result = eval_stage_with_path_context::<W, S>(
+            target,
+            &probe_stages(paired),
+            value,
+            root,
+            file_origin,
+            current_path,
+            false,
+        );
+        let target_outputs = match target_result {
+            QueryResult::Owned(v) => vec![v],
+            QueryResult::ManyOwned(vs) => vs,
+            // Zero outputs for *this* key contributes nothing -- not every
+            // other key is empty too (#2032).
+            QueryResult::None => continue,
+            // Any target-level escape discards *this key's own* target
+            // output and escapes immediately with whatever earlier keys
+            // already accumulated -- matches `eval_index_expr`'s own
+            // `escape_with_prefix!` arms exactly.
+            QueryResult::Error(e) => {
+                return partial(core::mem::take(&mut results), Control::Error(e));
+            }
+            QueryResult::Break(label) => {
+                return partial(core::mem::take(&mut results), Control::Break(label));
+            }
+            QueryResult::Halt(code) => {
+                return partial(core::mem::take(&mut results), Control::Halt(code));
+            }
+            QueryResult::Partial(_, control) => {
+                return partial(core::mem::take(&mut results), control);
+            }
+            QueryResult::One(_) | QueryResult::Many(_) | QueryResult::OneCursor(_) => unreachable!(
+                "eval_stage_with_path_context only ever produces \
+                 Owned/ManyOwned/None/Error/Break/Halt/Partial"
+            ),
+        };
+
+        for probed in target_outputs {
+            // `Some` exactly when `paired` -- so the probe split and the
+            // key push below are one branch, and the unpaired case borrows
+            // the ambient `current_path` instead of copying it. The copy it
+            // replaces was charged per (key, target output) and never read
+            // as anything but `current_path` itself.
+            let (target_path, t) = if paired {
+                let (path, value) = split_probe_pair(probed, current_path);
+                (Some(path), value)
+            } else {
+                (None, probed)
+            };
+            match index_one_owned(&t, k, bracket_optional) {
+                Ok(Some(v)) => {
+                    let new_path = target_path.map(|mut path| {
+                        path.push(k.clone());
+                        path
+                    });
+                    let step = eval_pipe_with_path_context_internal::<W, S>(
+                        rest,
+                        &v,
+                        root,
+                        file_origin,
+                        new_path.as_deref().unwrap_or(current_path),
+                        rest_optional,
+                    );
+                    if let Some(stop) = accumulate_path_context_step(&mut results, step) {
+                        return stop;
+                    }
+                }
+                Ok(None) => {}
+                // (4): a later key's index error outranks an earlier key's
+                // still-pending halt -- discard it, keeping the prefix
+                // accumulated across every earlier key/output.
+                Err(e) => return partial(core::mem::take(&mut results), Control::Error(e)),
+            }
+        }
+    }
+
+    match pending_halt {
+        // #1897: same fix the plain evaluator already applies here.
+        Some(code) => partial(results, Control::Halt(code)),
+        None => owned_vec_to_result(results),
+    }
+}
+
+/// One resolved slice bound: its raw value (as `key`/`parent` etc. would
+/// see it) paired with the rounded `i64` [`slice_owned_value_read`] actually
+/// indexes with. Distinct from [`ResolvedSliceBound`] (`(Option<i64>,
+/// Option<NumberKey>)`), the path-*mode* resolver's own already-classified
+/// pair -- this one keeps the pre-classification raw value instead, since
+/// `numeric_slice_bound_key` still needs to run on it here.
+type RawSliceBound = (OwnedValue, Option<i64>);
+
+/// [`eval_slice_bound`]'s path-context twin (#2100): resolves one slice
+/// bound (`start` or `end`) against `value`/`current_path` via
+/// [`eval_expr_needing_path_context`] instead of the plain evaluator, then
+/// reuses [`owned_bound_to_i64`] for the identical floor/ceil-and-classify
+/// step so the two can't independently drift on what counts as a valid
+/// bound (#106). Also keeps each resolved bound's *raw* value alongside its
+/// rounded `i64` -- needed by `numeric_slice_bound_key`/`slice_component_value`
+/// to build the resulting path component the same way `walk_path`/
+/// `navigation_element` already do for a *literal* slice (#1326's own
+/// representation).
+fn eval_slice_bound_with_path_context<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    bound: &Option<Box<Expr>>,
+    value: &OwnedValue,
+    root: &OwnedValue,
+    file_origin: Option<&[usize]>,
+    current_path: &[OwnedValue],
+    round: fn(f64) -> f64,
+) -> Result<(Vec<RawSliceBound>, Option<Control>), Control> {
+    let Some(expr) = bound else {
+        return Ok((vec![(OwnedValue::Null, None)], None));
+    };
+    let result =
+        eval_expr_needing_path_context::<W, S>(expr, value, root, file_origin, current_path, false);
+    let (raw, escape) = drain_path_context_stream(result);
+    let converted = raw
+        .into_iter()
+        .map(|v| {
+            owned_bound_to_i64(&v, round)
+                .map(|i| (v, i))
+                .map_err(Control::Error)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((converted, escape))
+}
+
+/// [`eval_slice_expr`]'s path-context twin (#2100): reproduces its actual
+/// coded shape exactly (`S` outer / `T` middle / `E`=target inner; target
+/// evaluated *once* for the whole `(s,e)` cross-product, not once per pair
+/// -- confirmed by reading `eval_slice_expr` itself, not its own doc
+/// comment's more aspirational "E inner" phrasing) with path threading
+/// added: each successful `(s, e, target-output)` triple extends
+/// `current_path` by a `{"start":s,"end":e}` component -- built via the
+/// same `slice_component_value`/`numeric_slice_bound_key` pair `walk_path`/
+/// `navigation_element` already use for the *literal* slice case (#1326) --
+/// before continuing `rest`.
+///
+/// **This arm has no literal-slice counterpart, and that asymmetry is
+/// visible.** `eval_pipe_with_path_context_internal` has arms for
+/// `Expr::Identity`/`Field`/`Index`/`Iterate` but none for a literal
+/// `Expr::Slice`, which still falls to the catch-all and leaves
+/// `current_path` unextended. Before #2100 both spellings agreed (both
+/// lost the component); now the computed one is right -- it matches the
+/// `{"start":..,"end":..}` component `walk_path`/`path(.a[0:3])` already
+/// produce -- and the literal one is the outlier, so which answer you get
+/// depends on whether the parser happened to fold the bounds:
+///
+/// ```text
+/// .a | .[0:3]         | path  =>  ["a"]                          (folded to Expr::Slice)
+/// .a | .[(0,1):(3)]   | path  =>  ["a",{"start":0,"end":3}], ...  (stays Expr::SliceExpr)
+/// .a | .[(1.7):(2.2)] | path  =>  ["a",{"start":1.7,"end":2.2}]   (floats don't fold)
+/// ```
+///
+/// Fixing the literal arm is the follow-up (#2215) rather than part of
+/// this change: it belongs next to `Field`/`Index` in the pipe evaluator,
+/// not here, and unlike them it has no owned-value navigation helper to
+/// reuse yet.
+///
+/// A mid-loop `Err` from [`slice_owned_value_read`] discards whatever this
+/// call already accumulated and returns the bare error immediately --
+/// matching `eval_slice_expr`'s own `return e.into()`/`return
+/// QueryResult::Error(e)` arms exactly. This is *not* symmetric with
+/// [`eval_index_expr_with_path_context`]'s own keep-the-prefix behavior on a
+/// mid-loop error; that asymmetry already exists between the two plain
+/// evaluators and this fix preserves it rather than papering over it.
+#[allow(clippy::too_many_arguments)]
+fn eval_slice_expr_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    target: &Expr,
+    start: &Option<Box<Expr>>,
+    end: &Option<Box<Expr>>,
+    rest: &[Expr],
+    value: &OwnedValue,
+    root: &OwnedValue,
+    file_origin: Option<&[usize]>,
+    current_path: &[OwnedValue],
+    bracket_optional: bool,
+    rest_optional: bool,
+) -> QueryResult<'a, W> {
+    let (starts, starts_escape) = match eval_slice_bound_with_path_context::<W, S>(
+        start,
+        value,
+        root,
+        file_origin,
+        current_path,
+        f64::floor,
+    ) {
+        Ok(v) => v,
+        Err(control) => return partial(Vec::new(), control),
+    };
+    if starts.is_empty() {
+        return match starts_escape {
+            None => QueryResult::None,
+            Some(control) => partial(Vec::new(), control),
+        };
+    }
+    let (ends, ends_escape) = match eval_slice_bound_with_path_context::<W, S>(
+        end,
+        value,
+        root,
+        file_origin,
+        current_path,
+        f64::ceil,
+    ) {
+        Ok(v) => v,
+        Err(control) => return partial(Vec::new(), control),
+    };
+    let ends_escaped = ends_escape.is_some();
+    let bounds_escape = ends_escape.or(starts_escape);
+    if ends.is_empty() {
+        return match bounds_escape {
+            None => QueryResult::None,
+            Some(control) => partial(Vec::new(), control),
+        };
+    }
+    let starts_len = if ends_escaped { 1 } else { starts.len() };
+    let starts = &starts[..starts_len];
+
+    let paired = !rest.is_empty() && rest.iter().any(needs_path_context);
+    let target_result = eval_stage_with_path_context::<W, S>(
+        target,
+        &probe_stages(paired),
+        value,
+        root,
+        file_origin,
+        current_path,
+        false,
+    );
+    let target_outputs = match target_result {
+        QueryResult::Owned(v) => vec![v],
+        QueryResult::ManyOwned(vs) => vs,
+        QueryResult::None => return QueryResult::None,
+        QueryResult::Error(e) => return QueryResult::Error(e),
+        QueryResult::Break(label) => return QueryResult::Break(label),
+        QueryResult::Halt(code) => return QueryResult::Halt(code),
+        QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
+        QueryResult::Partial(_, Control::Break(label)) => return QueryResult::Break(label),
+        QueryResult::Partial(_, Control::Halt(code)) => return QueryResult::Halt(code),
+        QueryResult::One(_) | QueryResult::Many(_) | QueryResult::OneCursor(_) => unreachable!(
+            "eval_stage_with_path_context only ever produces \
+             Owned/ManyOwned/None/Error/Break/Halt/Partial"
+        ),
+    };
+    // `Some` exactly when `paired`, for the same reason
+    // [`eval_index_expr_with_path_context`] pairs its own target outputs
+    // that way: the unpaired case has no per-output path to carry, so it
+    // borrows the ambient `current_path` rather than copying it once per
+    // target output and then again per `(s, e, t)` triple below.
+    let target_pairs: Vec<(Option<Vec<OwnedValue>>, OwnedValue)> = target_outputs
+        .into_iter()
+        .map(|probed| {
+            if paired {
+                let (path, value) = split_probe_pair(probed, current_path);
+                (Some(path), value)
+            } else {
+                (None, probed)
+            }
+        })
+        .collect();
+
+    let mut results: Vec<OwnedValue> = Vec::new();
+    for (s_raw, s) in starts {
+        for (e_raw, e) in &ends {
+            for (target_path, t) in &target_pairs {
+                match slice_owned_value_read::<S>(t, *s, *e, bracket_optional) {
+                    Ok(Some(v)) => {
+                        // The clone is genuinely needed in the paired case
+                        // -- `target_pairs` is reused across every `(s, e)`
+                        // pair, so the component can't be pushed in place --
+                        // but it is now charged only where something reads
+                        // it, not to the whole `S x E x T` product.
+                        let new_path = target_path.as_ref().map(|path| {
+                            let mut path = path.clone();
+                            path.push(slice_component_value(
+                                *s,
+                                numeric_slice_bound_key(s_raw).as_ref(),
+                                *e,
+                                numeric_slice_bound_key(e_raw).as_ref(),
+                            ));
+                            path
+                        });
+                        let step = eval_pipe_with_path_context_internal::<W, S>(
+                            rest,
+                            &v,
+                            root,
+                            file_origin,
+                            new_path.as_deref().unwrap_or(current_path),
+                            rest_optional,
+                        );
+                        if let Some(stop) = accumulate_path_context_step(&mut results, step) {
+                            return stop;
+                        }
+                    }
+                    Ok(None) => {}
+                    // Matches `eval_slice_expr`'s own mid-loop `Err` arms:
+                    // discards whatever this call already accumulated,
+                    // rather than `eval_index_expr`'s keep-the-prefix rule
+                    // -- see this function's own doc comment.
+                    Err(e) => return QueryResult::Error(e),
+                }
+            }
+        }
+    }
+    match bounds_escape {
+        None => owned_vec_to_result(results),
+        Some(control) => partial(results, control),
+    }
+}
+
 /// Internal helper that also tracks the root value for parent navigation,
 /// and (for `--eval-all`, #715) an optional origin-file-index side table
 /// keyed by top-level array position, resolving `file_index`/`fileIndex`/`fi`.
@@ -31649,19 +32065,48 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // rather than being caught, matching `eval_index_expr`'s own
         // `QueryResult::Break(label) => return ...` and `eval_single`'s
         // carve-out, which never wraps this shape in `eval_try`.
+        //
+        // #2100: calling `eval_index_expr_with_path_context`/
+        // `eval_slice_expr_with_path_context` directly -- instead of the
+        // plain `eval_owned_input` + a separate `continue_rest_with_context`
+        // this arm used before -- is what threads path context through a
+        // *successful* `?`-guarded bracket too: `rest` now continues from
+        // each output's own resolved path, not one ambient, never-extended
+        // `current_path`. `bracket_optional: true` is this arm's own `?`
+        // (unchanged rule: covers only the final index/slice step);
+        // `rest_optional: optional` is the ambient value already in scope
+        // here, never the forced `true` above -- `rest` must not inherit
+        // this bracket's own suppression.
         Expr::Optional(inner)
             if matches!(**inner, Expr::IndexExpr { .. } | Expr::SliceExpr { .. }) =>
         {
-            match eval_owned_input::<W, S>(inner, value, true) {
-                QueryResult::None => QueryResult::None,
-                result => continue_rest_with_context::<W, S>(
-                    result,
+            match &**inner {
+                Expr::IndexExpr { target, key } => eval_index_expr_with_path_context::<W, S>(
+                    target,
+                    key,
                     rest,
+                    value,
                     root,
                     file_origin,
                     current_path,
+                    true,
                     optional,
                 ),
+                Expr::SliceExpr { target, start, end } => {
+                    eval_slice_expr_with_path_context::<W, S>(
+                        target,
+                        start,
+                        end,
+                        rest,
+                        value,
+                        root,
+                        file_origin,
+                        current_path,
+                        true,
+                        optional,
+                    )
+                }
+                _ => unreachable!("matches! guard above restricts inner to IndexExpr|SliceExpr"),
             }
         }
         // This node *is* the `?`. Isolates `inner` with `optional` forced to
@@ -32100,6 +32545,42 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 optional,
             )
         }
+        // `.[K]`/`.[S:T]` (computed key/bounds), no `?` -- #2100. Unlike the
+        // literal `Expr::Index`/`Expr::Slice` arms, this must be
+        // unconditional: `needs_path_context(target)||needs_path_context(key)`
+        // can be `false` while a *sibling* `key`/`parent`/`file_index` in
+        // `rest` still routed the whole pipe here (`.a | .["" + "b"] | key`)
+        // -- what matters is whether `rest` needs the resulting path, not
+        // whether this bracket's own sub-expressions do.
+        // `eval_index_expr_with_path_context`'s/`eval_slice_expr_with_path_
+        // context`'s own internal `paired` gate (mirroring `Expr::Limit`'s)
+        // is what keeps a `rest`-doesn't-care case cheap. `bracket_optional`
+        // and `rest_optional` are both the same ambient `optional` here --
+        // there's no local `?` to separate them (see the `Expr::Optional`
+        // carve-out above for the case where there is one).
+        Expr::IndexExpr { target, key } => eval_index_expr_with_path_context::<W, S>(
+            target,
+            key,
+            rest,
+            value,
+            root,
+            file_origin,
+            current_path,
+            optional,
+            optional,
+        ),
+        Expr::SliceExpr { target, start, end } => eval_slice_expr_with_path_context::<W, S>(
+            target,
+            start,
+            end,
+            rest,
+            value,
+            root,
+            file_origin,
+            current_path,
+            optional,
+            optional,
+        ),
         // `[key]`/`[parent]`/`[file_index]` (#1302): the generic
         // `Expr::Array` arm below builds the array via `eval_owned_expr_opt`
         // -- the plain, context-less evaluator -- so a `key`/`parent`/
