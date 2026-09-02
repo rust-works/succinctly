@@ -32407,6 +32407,26 @@ fn test_slice_expr_ordinary_cross_product_unaffected_2225() -> Result<()> {
     Ok(())
 }
 
+/// #2225 (review): `-n`/`--null-input` routes through `eval::eval_slice_expr`
+/// (this file's other tests all hit `eval_generic::eval_slice_expr` via the
+/// ordinary stdin-fed cursor path) -- confirming the fix reaches *both*
+/// real dispatch paths, not just the one the rest of this cluster happens
+/// to exercise. `input as $a | ...` binds the array explicitly since `-n`
+/// leaves `.` as `null`; `stderr` proves re-evaluation the same way as the
+/// stdin-fed sibling test above. Verified against jq 1.7.1 (identical
+/// output).
+#[test]
+fn test_slice_expr_end_bound_reevaluated_under_null_input_2225() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-nc", "input as $a | $a[(0,1):(stderr|2)]"],
+        Some("[10,20,30]\n"),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[10,20]\n[20]\n");
+    assert_eq!(stderr, "nullnull");
+    Ok(())
+}
+
 /// #2031's own primary repro: `SOURCE` (`.a`) is itself a genuine path
 /// expression, so real jq's single shared path register moves onto `.a`'s
 /// own position as a side effect of evaluating it -- and UPDATE's own

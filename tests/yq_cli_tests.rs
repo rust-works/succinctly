@@ -1437,6 +1437,27 @@ fn test_yq_mode_zero_arity_wrong_arity_call_unaffected_by_2110() -> Result<()> {
     Ok(())
 }
 
+/// #2225 (review): the read-mode fix reaches yq mode too, not just jq mode
+/// -- `stderr` fires twice, once per start value, confirming `end` is
+/// re-evaluated fresh per `s` through `eval_generic::eval_slice_expr`
+/// regardless of which mode dispatches into it. Real yq's own grammar
+/// can't reproduce this repro's exact shape (its lexer rejects multi-
+/// valued slice bounds outright, and `input` needs `--jq-extensions`), so
+/// this is pinned against succinctly's own (already jq-oracle-verified via
+/// the sibling jq-mode tests) behavior, not a fresh oracle comparison.
+#[test]
+fn test_yq_mode_slice_expr_end_bound_reevaluated_once_per_start_2225() -> Result<()> {
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(
+        "[.a[(0,1):(stderr|2)]]",
+        "a: [10,20,30]\n",
+        &["-o", "json", "-I", "0"],
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[[10,20],[20]]");
+    assert_eq!(stderr, "{\"a\":[10,20,30]}{\"a\":[10,20,30]}");
+    Ok(())
+}
+
 /// #1512/#1650/#1714: the CLI flag actually reaches the parser --
 /// `--jq-extensions` makes the same filters succeed end to end through the
 /// real `succinctly yq` binary, not just through the parser's own unit
