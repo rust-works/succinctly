@@ -45688,31 +45688,69 @@ mod tests {
         );
     }
 
+    /// #2023 coverage: the test above only ever sees a decode failure on
+    /// the *first* generator value, never exercising the `pending_first`
+    /// flush this arm has to do first when a *later* value fails instead
+    /// (the exact shape `body`'s own escape arm just below already flushes
+    /// for). `has((.a, .b))` on `{"a":"x","b":"<bad>"}` puts a real key
+    /// first (`.a`, buffered as `pending_first`) and the undecodable one
+    /// second (`.b`) -- `.a`'s own successful `has("x")` (`false`, no such
+    /// field) is flushed into the output prefix before the trailing decode
+    /// failure, matching jq's own partial-output-then-error generator
+    /// semantics (the same shape `first(1, error("x"))` = `1` elsewhere in
+    /// this file relies on).
+    #[test]
+    fn test_fanout_arg_item_to_owned_flushes_pending_first_before_raising_2023() {
+        query!(
+            b"{\"a\":\"x\",\"b\":\"\xff\xfe\"}",
+            r"has((.a, .b))",
+            QueryResult::Partial(vs, Control::Error(e)) if e.is_decode_failure() => {
+                assert_eq!(vs, vec![OwnedValue::Bool(false)]);
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+    }
+
     /// #2023 code review: `fanout_two_args_lazy` (used by two-generator
     /// builtins, e.g. `setpath(path; value)`) has its own, independent pair
     /// of `item_to_owned` call sites -- outer and inner -- needing the
     /// identical fix.
     ///
-    /// Only the *inner* (path) slot is pinned here: an "outer" (value) case
-    /// (`setpath(["x"]; .b)`) is *not* a valid test for `setpath`
-    /// specifically -- review found `builtin_setpath`'s own body (#1953)
-    /// separately runs `to_owned_checked` over the *whole* ambient document
-    /// before ever writing, so it already raises the same decode failure on
-    /// `.b` regardless of whether this fix's own outer-slot code path does
-    /// anything, passing identically with the fix reverted. `setpath`'s
-    /// ambient is the whole document being modified, so there is no
-    /// `setpath`-based construction that isolates the outer slot the way
-    /// the inner one below is isolated. The outer and inner closures are
-    /// otherwise structurally identical (same match arms, same
-    /// escape-then-stop shape, differing only in which generator/variable
-    /// they close over -- verified by code review), so this one case gives
-    /// real coverage of the shared shape without a misleading "confirmed"
-    /// claim for a case that wasn't actually isolated.
+    /// This case pins the *inner* (path) slot specifically for `setpath`:
+    /// an "outer" (value) case (`setpath(["x"]; .b)`) is *not* a valid test
+    /// for `setpath` specifically -- review found `builtin_setpath`'s own
+    /// body (#1953) separately runs `to_owned_checked` over the *whole*
+    /// ambient document before ever writing, so it already raises the same
+    /// decode failure on `.b` regardless of whether this fix's own
+    /// outer-slot code path does anything, passing identically with the fix
+    /// reverted. `setpath`'s ambient is the whole document being modified,
+    /// so there is no `setpath`-based construction that isolates the outer
+    /// slot the way this one isolates the inner slot. See the test below
+    /// for the outer slot, isolated via a different builtin instead.
     #[test]
     fn test_fanout_two_args_lazy_item_to_owned_raises_decode_failure_2023() {
         query!(
             b"{\"a\":1,\"b\":\"\xff\xfe\"}",
             r"setpath(.b; 5)",
+            QueryResult::Error(e) if e.is_decode_failure() => {
+                assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
+            }
+        );
+    }
+
+    /// #2023 coverage: the outer slot of `fanout_two_args_lazy`, isolated
+    /// via `pow(base; exp)` rather than `setpath` -- `pow`'s ambient is
+    /// only ever read as a *number* (`math_operand`), never string-decoded,
+    /// so there's no whole-ambient confound like `setpath`'s own body has
+    /// (see the test above). `pow`'s own internal nesting puts `exp` as the
+    /// *outer* generator (live-verified against jq 1.7.1: `[pow((2,3);
+    /// (2,3))]` is `[4,9,8,27]`, exponent varying slowest), so `pow(1; .b)`
+    /// puts the undecodable value in the outer slot.
+    #[test]
+    fn test_fanout_two_args_lazy_outer_slot_item_to_owned_raises_decode_failure_2023() {
+        query!(
+            b"{\"a\":1,\"b\":\"\xff\xfe\"}",
+            r"pow(1; .b)",
             QueryResult::Error(e) if e.is_decode_failure() => {
                 assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
             }
