@@ -19582,27 +19582,25 @@ fn update_path<S: EvalSemantics>(
     optional: bool,
     scalar_noop: bool,
 ) -> Result<bool, EvalEscape> {
-    // #1428 is a jq-mode divergence, and deliberately stays one: real yq
-    // *wants* the chain a suppressed write leaves behind (`null | .a[] = 99`
-    // is `{"a": []}` there, #1181), so undoing it in yq mode would trade one
-    // divergence for another. `set_path`'s sibling guard needs no such flag --
-    // it probes the real tail, and yq's own `null`-to-`[]` autovivify makes
-    // that probe come back non-`Null`, so it falls through on its own.
-    let undo_stranded = S::TAG != EvalTag::Yq;
     // yq's slice-write container no-op (#1142) is unconditional on the
     // operator, unlike `scalar_noop` (a caller-gated parameter, `false` for
     // `-=`/`*=`) -- so it only needs `S::TAG`, not threading through every
     // recursive call. Bound once here rather than recomputed inline at each
     // `Expr::Slice` arm below, so the two can't drift out of sync.
+    //
+    // `update_path`'s own `Expr::Pipe` arm used to compute a matching
+    // `undo_stranded` here too, for its mid-chain `Field`/`Index` arms'
+    // #1428 stranded-autoviv undo -- moved into [`update_path_steps`] with
+    // that arm (#2115), which is the only place left that needs it.
     let container_noop = S::TAG == EvalTag::Yq;
     // #1181/#1232's yq-mode scalar-target no-op, bound once for the same
     // reason as `container_noop` above rather than repeated at each of this
-    // function's six `Field`/`Index`/`Iterate` arms (three terminal, three
-    // in the `Pipe` arm's own mid-chain duplicate). Safe to compute before
-    // any arm runs: every arm's own `autovivify_object`/`autovivify_array`
-    // call only ever converts a `Null` `root` into an (empty) container,
-    // and `is_yq_field_index_noop_scalar` already excludes `Null`, so the
-    // answer is identical whether checked before or after autovivification.
+    // function's three terminal `Field`/`Index`/`Iterate` arms. Safe to
+    // compute before any arm runs: every arm's own
+    // `autovivify_object`/`autovivify_array` call only ever converts a
+    // `Null` `root` into an (empty) container, and
+    // `is_yq_field_index_noop_scalar` already excludes `Null`, so the answer
+    // is identical whether checked before or after autovivification.
     let noop_scalar = S::TAG == EvalTag::Yq && is_yq_field_index_noop_scalar(root);
     match path_expr {
         Expr::Identity => {
@@ -19870,230 +19868,7 @@ fn update_path<S: EvalSemantics>(
             }
         }
         Expr::Pipe(exprs) if !exprs.is_empty() => {
-            // Chain: navigate and update
-            if exprs.len() == 1 {
-                update_path::<S>(root, &exprs[0], filter_expr, optional, scalar_noop)
-            } else {
-                // Navigate to the penultimate path, then update the last.
-                // `here` is whether *this step* may fail quietly; `optional`
-                // keeps travelling to `rest`, which carries its own wrappers.
-                let (first, first_optional) = unwrap_path_component(&exprs[0]);
-                let here = optional || first_optional;
-                let rest = Expr::Pipe(exprs[1..].to_vec());
-
-                match first {
-                    Expr::Field(name) => {
-                        // #1428: the same guard `set_path_steps` applies on
-                        // the `=` side, and now the same shape too. `set_path`
-                        // used to *probe* a detached `Null` up front instead,
-                        // because its parent chain was built inside
-                        // `get_path_mut`'s loop, which cannot be walked back
-                        // up; #1429 replaced that loop with a peel-and-recurse
-                        // walker, so both sides now simply undo the slot from
-                        // the frame that created it. Probing would be wrong on
-                        // this side anyway: `filter_expr` is a *filter*, and
-                        // running it once to decide and again for real would
-                        // double any side effect it has.
-                        //
-                        // A mid-chain slot left `Null` by the recursion was
-                        // never written: every component that can follow one
-                        // (`Field`/`Index`/`Iterate`/`Slice`) leaves a
-                        // container behind when it does write, and a bare
-                        // `.a |= null` is a *terminal* `Field`, handled by
-                        // the arm below rather than here.
-                        let root_was_null = matches!(root, OwnedValue::Null);
-                        autovivify_object(root);
-                        if let OwnedValue::Object(map) = root {
-                            let created = !map.contains_key(name);
-                            let (result, stranded) = {
-                                let current = map.entry(name.clone()).or_insert(OwnedValue::Null);
-                                let result = update_path::<S>(
-                                    current,
-                                    &rest,
-                                    filter_expr,
-                                    optional,
-                                    scalar_noop,
-                                );
-                                // `reaches_iterate`: only an iterate can
-                                // decline to write over the `Null` just
-                                // created, so only there does "still `Null`"
-                                // mean "never written". Without it, a
-                                // legitimate `null` write (`(.a|.) |= null`)
-                                // is undone. OR'd with `result == Ok(false)`
-                                // (#1877/#1894): the more precise signal from
-                                // an update filter that genuinely produced no
-                                // output anywhere in `rest` (e.g. a nested
-                                // slice's own `|= empty`, which `reaches_
-                                // iterate` doesn't recognize at all since no
-                                // `Iterate` is involved) -- both answer the
-                                // same question, "was anything really
-                                // written," just via different evidence.
-                                //
-                                // Neither clause subsumes the other: this
-                                // function's own `Iterate` arms (both the
-                                // terminal one and the mid-chain copy just
-                                // below) always report `Ok(true)` for an
-                                // `Array`/`Object` root regardless of how
-                                // many elements they actually touch,
-                                // including zero -- so an iterate over a
-                                // freshly-created empty container never
-                                // registers as `Ok(false)`, and
-                                // `reaches_iterate` stays the only signal
-                                // that catches it.
-                                let stranded = slot_was_stranded(
-                                    created,
-                                    undo_stranded,
-                                    reaches_iterate(&rest) || matches!(result, Ok(false)),
-                                    &result,
-                                    current,
-                                );
-                                (result, stranded)
-                            };
-                            if stranded {
-                                map.shift_remove(name);
-                                if root_was_null && map.is_empty() {
-                                    *root = OwnedValue::Null;
-                                }
-                            }
-                            result
-                        } else if here
-                            // #1232: this mid-chain arm is a separately-
-                            // maintained copy of the terminal `Expr::Field`
-                            // arm above, which already gained the #1181
-                            // no-op check -- applied here too so a scalar hit
-                            // *before* the last path component (`.a.b |= 99`
-                            // on a scalar root) no-ops instead of erroring.
-                            || noop_scalar
-                        {
-                            Ok(false)
-                        } else {
-                            Err(
-                                EvalError::cannot_index_with_field(owned_type_name(root), name)
-                                    .into(),
-                            )
-                        }
-                    }
-                    Expr::Index { idx, .. } => {
-                        // #1428: see the `Field` arm above. `write_index` pads
-                        // with `Null`s to reach a positive out-of-range index,
-                        // so the undo restores the original length rather than
-                        // removing a single slot.
-                        let root_was_null = matches!(root, OwnedValue::Null);
-                        autovivify_array(root);
-                        if let OwnedValue::Array(arr) = root {
-                            let original_len = arr.len();
-                            let (result, stranded) = {
-                                let current = write_index(arr, *idx)?;
-                                let result = update_path::<S>(
-                                    current,
-                                    &rest,
-                                    filter_expr,
-                                    optional,
-                                    scalar_noop,
-                                );
-                                // See the `Field` arm above, including the
-                                // `Ok(false)` OR-clause (#1877/#1894).
-                                let stranded = slot_was_stranded(
-                                    true,
-                                    undo_stranded,
-                                    reaches_iterate(&rest) || matches!(result, Ok(false)),
-                                    &result,
-                                    current,
-                                );
-                                (result, stranded)
-                            };
-                            if stranded && arr.len() > original_len {
-                                arr.truncate(original_len);
-                                if root_was_null && arr.is_empty() {
-                                    *root = OwnedValue::Null;
-                                }
-                            }
-                            result
-                        } else if here || noop_scalar {
-                            Ok(false)
-                        } else {
-                            Err(
-                                EvalError::cannot_index_with_type(owned_type_name(root), "number")
-                                    .into(),
-                            )
-                        }
-                    }
-                    Expr::Iterate => {
-                        // #1919: same yq-only null-to-`[]` autovivify as the
-                        // terminal `Expr::Iterate` arm above (#1181) -- that
-                        // arm runs for `.[] |= f`, this one for a mid-chain
-                        // `.a[].b |= f`, and only the terminal one had the
-                        // call. Gated on `S::TAG`, not `here`/`scalar_noop`,
-                        // matching every other #1181 check in this function.
-                        if S::TAG == EvalTag::Yq {
-                            autovivify_array(root);
-                        }
-                        // `Ok(true)` however many slots were actually
-                        // touched, including none -- see the `Field` arm's
-                        // "neither clause subsumes the other" note above for
-                        // why the stranded check needs `reaches_iterate`
-                        // rather than this answer.
-                        let fanned = for_each_container_slot(root, |slot| {
-                            update_path::<S>(slot, &rest, filter_expr, optional, scalar_noop)
-                                .map(|_| ())
-                        });
-                        match fanned {
-                            Some(result) => result.map(|()| true),
-                            None if here || noop_scalar => Ok(false),
-                            None => Err(EvalError::cannot_iterate_with(S::TAG, root).into()),
-                        }
-                    }
-                    // `resolve_node`'s `?` arm emits `Optional(Pipe([…]))`
-                    // when a branch resolved to more than one component, so
-                    // unwrapping can expose a nested pipe. Splice it in rather
-                    // than recursing on it alone, which would strand `rest`.
-                    // See `splice_optional_group`'s doc comment for why this
-                    // passes `optional`, not `here`, as the baseline (#1294).
-                    Expr::Pipe(inner) => {
-                        let spliced = splice_optional_group(inner, &exprs[1..], here);
-                        update_path::<S>(
-                            root,
-                            &Expr::Pipe(spliced),
-                            filter_expr,
-                            optional,
-                            scalar_noop,
-                        )
-                    }
-                    // The chain continues *inside* the slice, so the update
-                    // runs against the sub-array and is spliced back:
-                    // `[1,2,3,4] | .[1:3][] |= .*10` is `[1,20,30,4]`.
-                    //
-                    // yq mode: same container no-op as the terminal
-                    // `Expr::Slice` arm below (#1142) -- `container_noop`
-                    // is unconditional on the operator (unlike
-                    // `scalar_noop`, gated by the caller to exclude
-                    // `-=`/`*=`), since real yq no-ops a container slice
-                    // target for every operator, live-verified
-                    // (`.a[1:3][] |= . * 10` on `a: [1,2,3,4]` stays
-                    // unchanged).
-                    Expr::Slice { start, end, .. } => {
-                        through_slice(
-                            root,
-                            *start,
-                            *end,
-                            SliceEditFlags {
-                                optional: here,
-                                scalar_noop,
-                                container_noop,
-                                // #1428: computed, not hardcoded `false` --
-                                // mirroring `set_path`'s own slice arm. When
-                                // `rest` is effectively `Identity` the filter
-                                // applies straight to the slice, so this call
-                                // *is* the write and a resulting `Null` must
-                                // still raise (`(.a[0:1]|.) |= null`).
-                                terminal_write: is_effectively_identity(&rest),
-                            },
-                            |sub| update_path::<S>(sub, &rest, filter_expr, optional, scalar_noop),
-                        )
-                    }
-                    _ => update_path::<S>(root, first, filter_expr, here, scalar_noop),
-                }
-            }
+            update_path_steps::<S>(root, exprs, filter_expr, optional, scalar_noop)
         }
         Expr::Optional(inner) => update_path::<S>(root, inner, filter_expr, true, scalar_noop),
         // `(EXPR)` at the top of a resolved path (e.g. `(.[0:1]) |= 99`) —
@@ -20132,6 +19907,321 @@ fn update_path<S: EvalSemantics>(
         }
         _ => Err(EvalError::new("cannot use expression as update target").into()),
     }
+}
+
+/// Walk a flat run of `update_path`'s own chain components -- `Field`/
+/// `Index`/`Iterate`/`Slice`, an occasional spliced `Pipe` from an
+/// `Optional` group, each possibly `?`-wrapped -- applying `filter_expr` at
+/// the terminal position (#2115).
+///
+/// Replaces `update_path`'s old `Expr::Pipe` arm, which rebuilt
+/// `Expr::Pipe(exprs[1..].to_vec())` and recursed once per component: a
+/// sufficiently long flat chain (`.k0.k1…kN |= 9`) put one native stack frame
+/// on every component and one `O(d)` clone on top, `O(d^2)` overall, and blew
+/// the stack outright at a few hundred thousand components.
+///
+/// `set_path_steps` solved the identical-looking problem for `=` (#1429) by
+/// noting that a step whose remaining chain holds no `Iterate` can never
+/// strand (#1428) and so needs no frame at all. That reasoning does *not*
+/// carry over unchanged here: `=`'s right-hand side is an already-materialized
+/// value with no "produced nothing" concept, where `|=`'s is a *filter*
+/// (#1877/#1894) that can report `Ok(false)` from the terminal position no
+/// matter how deep it is, with no `Iterate` in sight (`null | .a.b.c |= empty`
+/// unwinds all three freshly-autovivified levels). `slot_was_stranded`'s
+/// `created` gate is what actually saves this: it is `false` -- so stranding
+/// is structurally impossible -- exactly when a step navigates into a slot
+/// that already existed, *regardless* of `Iterate`/`Ok(false)`, since the
+/// whole `&&` chain short-circuits. Those steps are peeled forward with no
+/// frame, the same way `set_path_steps` peels its own no-`Iterate`-ahead
+/// prefix.
+///
+/// A step that instead has to autovivify (`created`/"grew" true) can strand
+/// -- but once one does, autovivifying `Null` always succeeds and always
+/// produces an *empty* container, so every `Field`/`Index` step after it is
+/// unconditionally fresh too, all the way to the first `Iterate`/`Slice`/
+/// anything else (or the end of the chain). The whole maximal run of them is
+/// therefore either kept together or undone together: collected in one
+/// forward scan ([`fresh_run_len`]), the filter is applied exactly once
+/// against a detached `Null` standing in for the run's eventual leaf, and the
+/// result is wrapped back up in a single non-recursive loop ([`wrap_fresh`])
+/// rather than one native frame per level.
+///
+/// The only remaining recursion is one call per `Iterate`/`Slice`/spliced
+/// `Pipe` component -- the same shapes `set_path_steps` still recurses for --
+/// bounded by how many of *those* appear in the path, not by its total
+/// length; genuinely adversarial nesting there is bounded elsewhere (a fanned
+/// `Iterate` needs real container elements to recurse over, and actual data
+/// depth is already capped by `MAX_VALUE_TREE_DEPTH`).
+fn update_path_steps<S: EvalSemantics>(
+    root: &mut OwnedValue,
+    steps: &[Expr],
+    filter_expr: &Expr,
+    optional: bool,
+    scalar_noop: bool,
+) -> Result<bool, EvalEscape> {
+    // `undo_stranded`: #1428 is a jq-mode divergence, and deliberately stays
+    // one -- real yq *wants* the chain a suppressed write leaves behind
+    // (`null | .a[] = 99` is `{"a": []}` there, #1181), so undoing it in yq
+    // mode would trade one divergence for another.
+    //
+    // `container_noop`: yq's slice-write container no-op (#1142) is
+    // unconditional on the operator, unlike `scalar_noop` (a caller-gated
+    // parameter, `false` for `-=`/`*=`) -- so it only needs `S::TAG`, not
+    // threading through every recursive call.
+    //
+    // Both bound once here, unlike `noop_scalar` below (recomputed every
+    // loop iteration, since it depends on `root`): neither depends on
+    // anything that changes as the walk descends.
+    let undo_stranded = S::TAG != EvalTag::Yq;
+    let container_noop = S::TAG == EvalTag::Yq;
+
+    let mut root = root;
+    let mut steps = steps;
+    loop {
+        let (first, rest) = match steps {
+            // Only ever reached via the fresh-run shortcut below, standing in
+            // for a chain whose leaf position is `Expr::Identity` -- mirrors
+            // `update_path`'s own terminal `Expr::Identity` arm exactly.
+            [] => {
+                let outputs = eval_owned_multi_first::<S>(filter_expr, root)?;
+                let wrote = !outputs.is_empty();
+                *root = outputs.into_iter().next().unwrap_or(OwnedValue::Null);
+                return Ok(wrote);
+            }
+            [last] => return update_path::<S>(root, last, filter_expr, optional, scalar_noop),
+            [first, rest @ ..] => (first, rest),
+        };
+
+        let (component, first_optional) = unwrap_path_component(first);
+        let here = optional || first_optional;
+        let noop_scalar = S::TAG == EvalTag::Yq && is_yq_field_index_noop_scalar(root);
+
+        match component {
+            Expr::Field(name) => {
+                let root_was_null = matches!(root, OwnedValue::Null);
+                autovivify_object(root);
+                // Narrow, single-use `map` borrows throughout this arm
+                // (rather than one borrow spanning the whole arm) so the
+                // reborrow of `root` in the "already exists" branch below,
+                // and the direct writes to `*root` further down, never have
+                // to coexist with a still-live `map` borrow in the borrow
+                // checker's eyes.
+                let already_exists = match &*root {
+                    OwnedValue::Object(map) => map.contains_key(name),
+                    _ if here
+                        // #1232: mirrors `update_path`'s own terminal
+                        // `Expr::Field` arm's #1181 no-op check.
+                        || noop_scalar =>
+                    {
+                        return Ok(false);
+                    }
+                    _ => {
+                        return Err(EvalError::cannot_index_with_field(
+                            owned_type_name(root),
+                            name,
+                        )
+                        .into());
+                    }
+                };
+                if already_exists {
+                    // #1428: `slot_was_stranded`'s `created` gate is `false`
+                    // here, so this step can never strand no matter what the
+                    // rest of the chain does -- nothing to come back for, so
+                    // peel forward with no frame (mirrors `set_path_steps`'s
+                    // own reasoning for `=`, generalized from "no `Iterate`
+                    // ahead" to "this exact slot already existed").
+                    let OwnedValue::Object(map) = root else {
+                        unreachable!("already_exists only set true for an Object root")
+                    };
+                    root = map.entry(name.clone()).or_insert(OwnedValue::Null);
+                    steps = rest;
+                    continue;
+                }
+                // Fresh: collect the maximal run of further `Field`/`Index`
+                // steps (guaranteed fresh too, see this function's doc
+                // comment), apply the filter once against a detached leaf,
+                // and build (or skip) the whole run in one pass -- no frame
+                // per level.
+                let run_len = 1 + fresh_run_len(rest);
+                let (fresh, remainder) = steps.split_at(run_len);
+                let mut scratch = OwnedValue::Null;
+                let wrote = update_path_steps::<S>(
+                    &mut scratch,
+                    remainder,
+                    filter_expr,
+                    optional,
+                    scalar_noop,
+                )?;
+                if !wrote && undo_stranded {
+                    // Nothing was ever really written -- leave the object
+                    // exactly as it was, and collapse it back to `Null` too
+                    // if it only existed for this write in the first place
+                    // (mirrors `set_path_steps`'s own `root_was_null` check).
+                    let OwnedValue::Object(map) = &*root else {
+                        unreachable!("already_exists only set false for an Object root")
+                    };
+                    if root_was_null && map.is_empty() {
+                        *root = OwnedValue::Null;
+                    }
+                    return Ok(wrote);
+                }
+                let value = wrap_fresh(&fresh[1..], scratch)?;
+                let OwnedValue::Object(map) = root else {
+                    unreachable!("already_exists only set false for an Object root")
+                };
+                map.insert(name.clone(), value);
+                return Ok(wrote);
+            }
+            Expr::Index { idx, .. } => {
+                let root_was_null = matches!(root, OwnedValue::Null);
+                autovivify_array(root);
+                // Same resolution `write_index` itself performs before
+                // padding -- read-only here so the "already exists" case
+                // below can reborrow the array directly instead of going
+                // through `write_index`'s own padding path for no reason.
+                // See the `Field` arm above for why each `arr`/`map` borrow
+                // in this arm is scoped as narrowly as possible.
+                let actual_idx = match &*root {
+                    OwnedValue::Array(arr) => {
+                        resolve_setpath_index(&OwnedValue::Int(*idx), arr.len())?
+                    }
+                    _ if here || noop_scalar => return Ok(false),
+                    _ => {
+                        return Err(EvalError::cannot_index_with_type(
+                            owned_type_name(root),
+                            "number",
+                        )
+                        .into());
+                    }
+                };
+                {
+                    let OwnedValue::Array(arr) = &*root else {
+                        unreachable!("actual_idx was only resolved for an Array root")
+                    };
+                    if actual_idx < arr.len() {
+                        let OwnedValue::Array(arr) = root else {
+                            unreachable!("actual_idx was only resolved for an Array root")
+                        };
+                        root = &mut arr[actual_idx];
+                        steps = rest;
+                        continue;
+                    }
+                }
+                let run_len = 1 + fresh_run_len(rest);
+                let (fresh, remainder) = steps.split_at(run_len);
+                let mut scratch = OwnedValue::Null;
+                let wrote = update_path_steps::<S>(
+                    &mut scratch,
+                    remainder,
+                    filter_expr,
+                    optional,
+                    scalar_noop,
+                )?;
+                if !wrote && undo_stranded {
+                    let OwnedValue::Array(arr) = &*root else {
+                        unreachable!("actual_idx was only resolved for an Array root")
+                    };
+                    if root_was_null && arr.is_empty() {
+                        *root = OwnedValue::Null;
+                    }
+                    return Ok(wrote);
+                }
+                let value = wrap_fresh(&fresh[1..], scratch)?;
+                let OwnedValue::Array(arr) = root else {
+                    unreachable!("actual_idx was only resolved for an Array root")
+                };
+                *write_index(arr, *idx)? = value;
+                return Ok(wrote);
+            }
+            Expr::Iterate => {
+                if S::TAG == EvalTag::Yq {
+                    autovivify_array(root);
+                }
+                let fanned = for_each_container_slot(root, |slot| {
+                    update_path_steps::<S>(slot, rest, filter_expr, optional, scalar_noop)
+                        .map(|_| ())
+                });
+                return match fanned {
+                    Some(result) => result.map(|()| true),
+                    None if here || noop_scalar => Ok(false),
+                    None => Err(EvalError::cannot_iterate_with(S::TAG, root).into()),
+                };
+            }
+            // `resolve_node`'s `?` arm emits `Optional(Pipe([…]))` when a
+            // branch resolved to more than one component -- splice it in
+            // rather than recursing on it alone, which would strand `rest`.
+            Expr::Pipe(inner) => {
+                let spliced = splice_optional_group(inner, rest, here);
+                return update_path_steps::<S>(root, &spliced, filter_expr, optional, scalar_noop);
+            }
+            Expr::Slice { start, end, .. } => {
+                return through_slice(
+                    root,
+                    *start,
+                    *end,
+                    SliceEditFlags {
+                        optional: here,
+                        scalar_noop,
+                        container_noop,
+                        // #1428: mirrors `is_effectively_identity(&rest)`
+                        // against an `Expr::Pipe(rest)` -- unwrapping that
+                        // arm inline against the slice `rest` directly, with
+                        // no need to allocate the `Pipe` just to check it.
+                        terminal_write: rest.iter().all(is_effectively_identity),
+                    },
+                    |sub| update_path_steps::<S>(sub, rest, filter_expr, optional, scalar_noop),
+                );
+            }
+            _ => return update_path::<S>(root, first, filter_expr, here, scalar_noop),
+        }
+    }
+}
+
+/// How many of `steps`' leading components are `Field`/`Index` (through any
+/// `Optional`/`Paren` wrapping) -- the length of the run [`update_path_steps`]
+/// can still safely treat as "guaranteed fresh" once it has already found the
+/// one immediately before `steps` to be fresh itself. Stops at the first
+/// `Iterate`/`Slice`/anything else, or at the end of `steps`.
+fn fresh_run_len(steps: &[Expr]) -> usize {
+    steps
+        .iter()
+        .take_while(|e| {
+            matches!(
+                unwrap_path_component(e).0,
+                Expr::Field(_) | Expr::Index { .. }
+            )
+        })
+        .count()
+}
+
+/// Wrap `value` in one freshly-built container per component of `steps`,
+/// innermost first -- the non-recursive counterpart of the per-level
+/// autovivification [`update_path_steps`]'s fresh-run shortcut replaces.
+///
+/// Delegates the actual array padding to [`write_index`] against a freshly
+/// allocated (and therefore always-empty) `Vec`, rather than re-deriving its
+/// bounds/error handling here, so a negative index reports the exact same
+/// error a live `write_index` call would.
+fn wrap_fresh(steps: &[Expr], value: OwnedValue) -> Result<OwnedValue, EvalError> {
+    let mut value = value;
+    for step in steps.iter().rev() {
+        let (component, _optional) = unwrap_path_component(step);
+        value = match component {
+            Expr::Field(name) => {
+                let mut map = IndexMap::new();
+                map.insert(name.clone(), value);
+                OwnedValue::Object(map)
+            }
+            Expr::Index { idx, .. } => {
+                let mut arr = Vec::new();
+                *write_index(&mut arr, *idx)? = value;
+                OwnedValue::Array(arr)
+            }
+            // `fresh_run_len` only ever collects `Field`/`Index` components.
+            _ => unreachable!("wrap_fresh only ever walks a fresh Field/Index run"),
+        };
+    }
+    Ok(value)
 }
 
 /// Get the type name for an owned value.
@@ -34583,12 +34673,12 @@ fn flatten_delete_path(expr: &Expr, optional: bool, out: &mut Vec<DeleteStep>) {
 /// [`delete_at_path`]'s chain-walk. Same contract: errors propagate, the
 /// rebuilt `null` is discarded, the container is untouched.
 fn delete_at_path_through_absent(
-    rest: &Expr,
+    rest: &[Expr],
     optional: bool,
     yq_mode: bool,
 ) -> Result<(), EvalError> {
     let mut absent = OwnedValue::Null;
-    delete_at_path(&mut absent, rest, optional, yq_mode)
+    delete_path_steps(&mut absent, rest, optional, yq_mode)
 }
 
 /// One array-level step of a `del` path: a bare index, or a slice.
@@ -35786,317 +35876,7 @@ fn delete_at_path(
                 "object",
             )),
         },
-        Expr::Pipe(exprs) if !exprs.is_empty() => {
-            // Chain: navigate and delete at the last path
-            if exprs.len() == 1 {
-                delete_at_path(root, &exprs[0], optional, yq_mode)
-            } else {
-                // Same unwrap as `update_path`'s chain arm: a resolved
-                // component can still be wrapped in `?`, and matching the
-                // wrapper as an unknown component used to fall through to the
-                // catch-all below, which deletes at *this* position and
-                // strands the rest of the path — `del(recurse | objects |
-                // .[.k]?)` removing the whole parent instead of one key.
-                let (first, first_optional) = unwrap_path_component(&exprs[0]);
-                let here = optional || first_optional;
-                let rest = Expr::Pipe(exprs[1..].to_vec());
-
-                match first {
-                    Expr::Field(name) => match root {
-                        OwnedValue::Object(map) => match map.get_mut(name) {
-                            Some(current) => delete_at_path(current, &rest, optional, yq_mode),
-                            // Same "reads as `null`, keep walking" rule as
-                            // `delete_trie_object`'s missing-field arm
-                            // (#527): `del(.a.b.c)` is a no-op, `del(.a.b[])`
-                            // still raises. `here` no longer gates this — a
-                            // `?` on the missing step does not suppress what
-                            // the tail itself raises, and the walk into a
-                            // throwaway `null` cannot create the key.
-                            None => delete_at_path_through_absent(&rest, optional, yq_mode),
-                        },
-                        // `null` tolerates any key — `null | del(.a.b)` and
-                        // `{"x":null} | del(.x.a)` are both no-ops (#476) —
-                        // but only for *this* step. Returning here handed the
-                        // exemption to the whole rest of the chain, `.[]`
-                        // included, so `{"x":null} | del(.x.a[])` no-op'd
-                        // where jq raises `Cannot iterate over null (null)`
-                        // (#527).
-                        OwnedValue::Null => delete_at_path_through_absent(&rest, optional, yq_mode),
-                        _ if here => Ok(()),
-                        // #2106: a mid-chain field step into a genuine
-                        // scalar no-ops the whole remaining chain in yq
-                        // mode (`2.5 | del(.[("k0","k1")].b)` stays `2.5`)
-                        // — there is nothing left to navigate into, so
-                        // `rest` is moot, same as the terminal `Field` arm
-                        // above.
-                        _ if yq_mode && is_yq_field_index_noop_scalar(root) => Ok(()),
-                        _ => Err(EvalError::cannot_index_with_field(
-                            owned_type_name(root),
-                            name,
-                        )),
-                    },
-                    Expr::Index { idx, .. } => match root {
-                        OwnedValue::Array(arr) => {
-                            match resolve_read_index(&OwnedValue::Int(*idx), arr.len()) {
-                                Some(actual_idx) => {
-                                    delete_at_path(&mut arr[actual_idx], &rest, optional, yq_mode)
-                                }
-                                None => {
-                                    // An out-of-range index resolves to
-                                    // null, and deleting further into null
-                                    // is a no-op for most tails, `?` or not
-                                    // (#477) — but not `[]`, which still
-                                    // raises `Cannot iterate over null
-                                    // (null)` (#527/#529).
-                                    delete_at_path_through_absent(&rest, optional, yq_mode)
-                                }
-                            }
-                        }
-                        // Same per-step `null` exemption as the `Field` case
-                        // above — `null | del(.[0].a)` is a no-op (#476),
-                        // `null | del(.[0][])` still raises (#527).
-                        OwnedValue::Null => delete_at_path_through_absent(&rest, optional, yq_mode),
-                        _ if here => Ok(()),
-                        // #2106: same mid-chain scalar no-op as `Field`
-                        // above, for an index step.
-                        _ if yq_mode && is_yq_field_index_noop_scalar(root) => Ok(()),
-                        _ => Err(EvalError::cannot_index_with_type(
-                            owned_type_name(root),
-                            "number",
-                        )),
-                    },
-                    Expr::Iterate => match root {
-                        OwnedValue::Array(arr) => {
-                            // #1182: yq's chained-scalar-slice del() rule
-                            // (#1116, generalized by #1219 to a whole
-                            // trailing slice-run) can't be applied upfront
-                            // for this shape -- the caller's own
-                            // classification (see the mode-guard comment
-                            // above) only runs once, before this walk even
-                            // starts, and its `navigate_read_only`
-                            // prefix-peek has no way to look *through* an
-                            // as-yet-unresolved `.[]` to find each
-                            // element's own scalar target. So the rule is
-                            // re-classified here, once per element, against
-                            // `rest` (the path remaining after this `.[]`).
-                            //
-                            // `DropParent(Expr::Identity)` is a distinct
-                            // signal from any other rewrite: it means the
-                            // *element itself* is the scalar the trailing
-                            // slice-run would have targeted (`.[]` directly
-                            // followed by the run, no `Field`/`Index`
-                            // between -- `true` for `empty_prefix_is_
-                            // identity`, unlike the top-level callers).
-                            // There is no parent key to drop one level down
-                            // from an `&mut` reference into this array slot
-                            // -- `delete_at_path`'s own `Expr::Identity` arm
-                            // would just null the element in place, not
-                            // remove it, so this element's index is queued
-                            // for removal from `arr` itself after the loop
-                            // instead of being recursed into.
-                            //
-                            // #1219: `Noop` (`rest` is a chained slice-run
-                            // followed by something that isn't itself
-                            // another trailing slice, e.g. `.a[][1:3][0]`)
-                            // leaves this element completely untouched
-                            // (neither removed nor recursed into),
-                            // live-verified.
-                            let mut remove_indices = Vec::new();
-                            for (i, elem) in arr.iter_mut().enumerate() {
-                                let outcome = if yq_mode {
-                                    yq_del_slice_outcome(&rest, elem, true)
-                                } else {
-                                    YqDelSliceOutcome::NotApplicable
-                                };
-                                match outcome {
-                                    YqDelSliceOutcome::DropParent(Expr::Identity) => {
-                                        remove_indices.push(i);
-                                    }
-                                    YqDelSliceOutcome::DropParent(ref target) => {
-                                        delete_at_path(elem, target, optional, yq_mode)?;
-                                    }
-                                    YqDelSliceOutcome::Noop => {
-                                        // Leave this element untouched.
-                                    }
-                                    YqDelSliceOutcome::NotApplicable => {
-                                        delete_at_path(elem, &rest, optional, yq_mode)?;
-                                    }
-                                }
-                            }
-                            for i in remove_indices.into_iter().rev() {
-                                arr.remove(i);
-                            }
-                            Ok(())
-                        }
-                        OwnedValue::Object(map) => {
-                            // Same per-element re-classification, elem-is-
-                            // target removal, and #1219 no-op as the array
-                            // arm above.
-                            let mut remove_keys = Vec::new();
-                            for (key, value) in map.iter_mut() {
-                                let outcome = if yq_mode {
-                                    yq_del_slice_outcome(&rest, value, true)
-                                } else {
-                                    YqDelSliceOutcome::NotApplicable
-                                };
-                                match outcome {
-                                    YqDelSliceOutcome::DropParent(Expr::Identity) => {
-                                        remove_keys.push(key.clone());
-                                    }
-                                    YqDelSliceOutcome::DropParent(ref target) => {
-                                        delete_at_path(value, target, optional, yq_mode)?;
-                                    }
-                                    YqDelSliceOutcome::Noop => {
-                                        // Leave this entry untouched.
-                                    }
-                                    YqDelSliceOutcome::NotApplicable => {
-                                        delete_at_path(value, &rest, optional, yq_mode)?;
-                                    }
-                                }
-                            }
-                            for key in remove_keys {
-                                map.shift_remove(&key);
-                            }
-                            Ok(())
-                        }
-                        _ if here => Ok(()),
-                        _ => Err(EvalError::cannot_iterate_with(
-                            if yq_mode { EvalTag::Yq } else { EvalTag::Jq },
-                            root,
-                        )),
-                    },
-                    // A nested pipe from `Optional(Pipe([…]))` — splice, do
-                    // not recurse on it alone, or `rest` is stranded. See
-                    // `splice_optional_group`'s doc comment for why this
-                    // passes `optional`, not `here`, as the baseline (#1294).
-                    Expr::Pipe(inner) => {
-                        let spliced = splice_optional_group(inner, &exprs[1..], here);
-                        delete_at_path(root, &Expr::Pipe(spliced), optional, yq_mode)
-                    }
-                    // The chain continues *inside* the slice, so the delete
-                    // happens in the sub-array and the remainder is spliced
-                    // back: `[1,[2],[3]] | del(.[1:3][0])` is `[1,[3]]`, not
-                    // the whole range dropped.
-                    // `null` has no elements to descend into, matching the
-                    // top-level `Expr::Slice` arm's `Null` case above
-                    // (#476) — `null | del(.[0:2].a)` is a no-op, while
-                    // `null | del(.[0:2][])` still raises from the tail
-                    // (#527). This is deliberately not pushed into
-                    // `through_slice` itself: that helper is shared with
-                    // `=`/`|=` assignment, where a slice write auto-vivifies
-                    // `null` instead of no-op'ing (a separate, documented
-                    // divergence — see docs/compliance/jq/limitations.md).
-                    Expr::Slice { .. } if matches!(root, OwnedValue::Null) => {
-                        delete_at_path_through_absent(&rest, optional, yq_mode)
-                    }
-                    // `scalar_noop`/`container_noop: false` — del()'s own
-                    // yq rules (#1116/#1162, now type-uniform) are handled
-                    // by del()'s own separate mechanisms, not
-                    // `through_slice`'s built-in no-op (see
-                    // `yq_del_slice_outcome` for the case this
-                    // covers -- the slice is the *last* path component).
-                    // This arm only fires when there's more path *after*
-                    // the slice (`.[1:3][0]`), which isn't that shape — in
-                    // jq mode it correctly descends into the sliced
-                    // sub-range and deletes within it, matching real jq
-                    // (which has no chained-slice-parent-drop rule at all).
-                    //
-                    // In yq mode, #1219 makes this arm provably unreachable
-                    // for the common case: every entry point that can
-                    // construct a `rest`/`path` ending in "a slice with more
-                    // path after it" -- `builtin_del`'s single-path and
-                    // multi-path/comma branches, `rewrite_yq_del_comma_
-                    // branches`, and this very `Expr::Iterate` arm's own
-                    // per-element re-classification above -- calls
-                    // `yq_del_slice_outcome` first and either rewrites to a
-                    // slice-free target or no-ops before ever reaching here.
-                    // Confirmed empirically (not just by this reasoning): a
-                    // temporary probe on this exact arm, gated on `yq_mode`,
-                    // never fired across the full test suite or any of the
-                    // nested-`Pipe`/`Paren` shapes #1219 fixed. Kept as a
-                    // real match arm (not a `debug_assert!(!yq_mode)`)
-                    // because jq mode still legitimately reaches it, and
-                    // because a *computed* key resolving to a slice-headed
-                    // shape `yq_del_slice_outcome` doesn't yet cover would
-                    // fail closed here (a normal walk) rather than
-                    // panicking -- which is exactly why `terminal_write:
-                    // yq_mode` below still matters for that residual case.
-                    //
-                    // `terminal_write: yq_mode` (#1321 code review): a
-                    // string target reached through this still-possible
-                    // fallback path is the *same* #1219 divergence, just for
-                    // a scalar rather than a container -- yq silently
-                    // no-ops it (confirmed live, `del(.a[0:1].b)` on
-                    // `a: hello` leaves `a: hello` untouched), which this PR
-                    // doesn't attempt to fix. Forcing `terminal_write: true`
-                    // in yq mode keeps `through_slice`'s String arm ending
-                    // in its refusal here -- the same wrong-but-unchanged
-                    // "Cannot update string slices" message yq mode already
-                    // raised before this PR -- instead of trading it for a
-                    // *different* wrong message ("Cannot index string with
-                    // string \"b\"") that would make this string case look
-                    // fixed relative to #1219's own array/object case when
-                    // it isn't. jq mode is unaffected either way.
-                    //
-                    // #1876/#1883 code review: that arm now runs `edit`
-                    // (here, `delete_at_path(sub, &rest, ...)`, a real
-                    // recursive delete against the throwaway substring, not
-                    // a no-op) before reaching this refusal, where it used
-                    // to refuse unconditionally without calling `edit` at
-                    // all. A live-verified sweep (`del(.[][0:1].c)`,
-                    // `del(.[][0:1][0])`, `del(.[][0:1][])`,
-                    // `del(.[][0:1][2:3])`, `del(.[][0:1][2:3].c)`, computed
-                    // bounds) found no shape that reaches this call site
-                    // with `rest` still pending and a String `sub` --
-                    // `yq_del_slice_outcome`'s four outcomes either bypass
-                    // `through_slice` entirely (`Noop`, `DropParent`) or
-                    // recurse into `delete_at_path` with a prefix that
-                    // fails before ever reaching a trailing slice -- so
-                    // `edit` here is believed to always no-op/error before
-                    // producing an observable difference, not proven
-                    // structurally impossible. A future change to
-                    // `yq_del_slice_outcome` that makes this reachable
-                    // should re-verify that belief still holds.
-                    //
-                    // `container_noop: false` unconditionally (#1873 code
-                    // review): unlike `set_path`/`update_path`'s call sites,
-                    // which thread `S::TAG == EvalTag::Yq` so `through_slice`
-                    // can tell the two modes apart, this one hardcodes
-                    // `false` for both -- currently inert only because the
-                    // guarded arm above (`if matches!(root, OwnedValue::
-                    // Null)`) always intercepts a literal-`Null` root before
-                    // the match ever reaches here, in both modes, so
-                    // `through_slice`'s own `Null` arm (gated `!container_
-                    // noop`, and since #1873 also `!terminal_write`) is
-                    // unreachable from this call site regardless of what
-                    // `container_noop` says. A future change to that
-                    // preceding guard's condition, or to this match's arm
-                    // order, would silently let jq-mode `del()` start
-                    // auto-vivifying a `null` slice target through #1873's
-                    // arm -- a semantics never oracle-verified for `del()`
-                    // -- with nothing here to catch it.
-                    Expr::Slice { start, end, .. } => {
-                        through_slice(
-                            root,
-                            *start,
-                            *end,
-                            SliceEditFlags {
-                                optional: here,
-                                scalar_noop: false,
-                                container_noop: false,
-                                terminal_write: yq_mode,
-                            },
-                            // `del()` has its own, already-correct deletion
-                            // mechanism with no `|= empty` concept (#1877/
-                            // #1894, see `always_wrote`).
-                            |sub| always_wrote(delete_at_path(sub, &rest, optional, yq_mode)),
-                        )
-                        .map(|_| ())
-                    }
-                    _ => delete_at_path(root, first, here, yq_mode),
-                }
-            }
-        }
+        Expr::Pipe(exprs) if !exprs.is_empty() => delete_path_steps(root, exprs, optional, yq_mode),
         Expr::Optional(inner) => delete_at_path(root, inner, true, yq_mode),
         // `(EXPR)` at the top of a resolved delete target (e.g.
         // `del((.a))`) -- mirrors `update_path`'s identical `Expr::Paren`
@@ -36117,6 +35897,299 @@ fn delete_at_path(
             "internal error: unresolved computed slice in delete path",
         )),
         _ => Err(EvalError::new("cannot use expression as delete target")),
+    }
+}
+
+/// Walk a flat run of `delete_at_path`'s own chain components -- `Field`/
+/// `Index`/`Iterate`/`Slice`, an occasional spliced `Pipe` from an
+/// `Optional` group, each possibly `?`-wrapped -- deleting at the terminal
+/// position (#2115).
+///
+/// Replaces `delete_at_path`'s old `Expr::Pipe` arm, which rebuilt
+/// `Expr::Pipe(exprs[1..].to_vec())` and recursed once per component, the
+/// same stack-depth/`O(d^2)`-clone problem [`update_path_steps`]'s own doc
+/// comment describes for `|=`. `del()` has none of `|=`'s stranded-undo
+/// complexity to begin with (#476/#477: a step that reaches `null` or an
+/// out-of-range index deletes nothing, because there is nothing there to
+/// have created in the first place), so every `Field`/`Index` mid-chain step
+/// here is *pure tail recursion* -- it does no work at all after its own
+/// recursive call returns. That flattens unconditionally, with no
+/// `set_path_steps`-style "already exists vs. fresh" split: just reassign
+/// `root` to the child slot and loop.
+///
+/// The remaining recursion (`Iterate`'s per-element fan-out, a `Slice`'s
+/// splice-back, a spliced `Pipe` from an `Optional` group) is bounded by how
+/// many such components appear in the path, not by its total length, mirroring
+/// [`update_path_steps`].
+fn delete_path_steps(
+    root: &mut OwnedValue,
+    steps: &[Expr],
+    optional: bool,
+    yq_mode: bool,
+) -> Result<(), EvalError> {
+    let mut root = root;
+    let mut steps = steps;
+    loop {
+        let (first, rest) = match steps {
+            // Defensive only: every caller passes a non-empty slice (the
+            // `Expr::Pipe` guard requires `exprs.len() >= 1`, and no
+            // recursive call below ever hands back an empty one either), but
+            // mirrors `delete_at_path`'s own terminal `Expr::Identity` arm if
+            // it somehow were.
+            [] => {
+                *root = OwnedValue::Null;
+                return Ok(());
+            }
+            [last] => return delete_at_path(root, last, optional, yq_mode),
+            [first, rest @ ..] => (first, rest),
+        };
+
+        // Same unwrap as `update_path_steps`: a resolved component can still
+        // be wrapped in `?`, and matching the wrapper as an unknown component
+        // would fall through to the catch-all below, which deletes at *this*
+        // position and strands the rest of the path — `del(recurse | objects
+        // | .[.k]?)` removing the whole parent instead of one key.
+        let (component, first_optional) = unwrap_path_component(first);
+        let here = optional || first_optional;
+
+        match component {
+            Expr::Field(name) => match root {
+                OwnedValue::Object(map) => {
+                    // Pure tail recursion (no undo, nothing created) --
+                    // reassign `root` and loop instead of recursing.
+                    if let Some(current) = map.get_mut(name) {
+                        root = current;
+                        steps = rest;
+                        continue;
+                    }
+                    // Same "reads as `null`, keep walking" rule as
+                    // `delete_trie_object`'s missing-field arm (#527):
+                    // `del(.a.b.c)` is a no-op, `del(.a.b[])` still raises.
+                    // `here` no longer gates this — a `?` on the missing step
+                    // does not suppress what the tail itself raises, and the
+                    // walk into a throwaway `null` cannot create the key.
+                    return delete_at_path_through_absent(rest, optional, yq_mode);
+                }
+                // `null` tolerates any key — `null | del(.a.b)` and
+                // `{"x":null} | del(.x.a)` are both no-ops (#476) — but only
+                // for *this* step. Falling through here (rather than
+                // stopping) hands the exemption to the whole rest of the
+                // chain, `.[]` included, so `{"x":null} | del(.x.a[])`
+                // no-op'd where jq raises `Cannot iterate over null (null)`
+                // (#527) -- `rest` still has to be walked, just against the
+                // same still-`null` `root`, which is why this loops in place
+                // instead of recursing: unlike the missing-key arm just
+                // above, there is already a live slot to keep pointing at
+                // (it holds `null` and can never become anything else via a
+                // `del()`), so no detached scratch is needed at all.
+                OwnedValue::Null => {
+                    steps = rest;
+                    continue;
+                }
+                _ if here => return Ok(()),
+                // #2106: a mid-chain field step into a genuine scalar no-ops
+                // the whole remaining chain in yq mode (`2.5 |
+                // del(.[("k0","k1")].b)` stays `2.5`) — there is nothing left
+                // to navigate into, so `rest` is moot, same as the terminal
+                // `Field` arm above.
+                _ if yq_mode && is_yq_field_index_noop_scalar(root) => return Ok(()),
+                _ => {
+                    return Err(EvalError::cannot_index_with_field(
+                        owned_type_name(root),
+                        name,
+                    ))
+                }
+            },
+            Expr::Index { idx, .. } => match root {
+                OwnedValue::Array(arr) => {
+                    match resolve_read_index(&OwnedValue::Int(*idx), arr.len()) {
+                        Some(actual_idx) => {
+                            root = &mut arr[actual_idx];
+                            steps = rest;
+                            continue;
+                        }
+                        None => {
+                            // An out-of-range index resolves to null, and
+                            // deleting further into null is a no-op for most
+                            // tails, `?` or not (#477) — but not `[]`, which
+                            // still raises `Cannot iterate over null (null)`
+                            // (#527/#529).
+                            return delete_at_path_through_absent(rest, optional, yq_mode);
+                        }
+                    }
+                }
+                // Same per-step `null` exemption as the `Field` case above —
+                // `null | del(.[0].a)` is a no-op (#476), `null |
+                // del(.[0][])` still raises (#527) -- loops in place for the
+                // same reason.
+                OwnedValue::Null => {
+                    steps = rest;
+                    continue;
+                }
+                _ if here => return Ok(()),
+                // #2106: same mid-chain scalar no-op as `Field` above, for an
+                // index step.
+                _ if yq_mode && is_yq_field_index_noop_scalar(root) => return Ok(()),
+                _ => {
+                    return Err(EvalError::cannot_index_with_type(
+                        owned_type_name(root),
+                        "number",
+                    ))
+                }
+            },
+            Expr::Iterate => {
+                // `rest` is turned into an `Expr::Pipe` at most once here
+                // (only in yq mode, only per `Iterate` occurrence, not per
+                // element) for `yq_del_slice_outcome`'s own `&Expr` signature
+                // -- mirrors the original per-level code's identical
+                // one-time `rest` clone, just narrowed to where it's actually
+                // needed instead of built for every arm.
+                let rest_pipe = yq_mode.then(|| Expr::Pipe(rest.to_vec()));
+                return match root {
+                    OwnedValue::Array(arr) => {
+                        // #1182: yq's chained-scalar-slice del() rule (#1116,
+                        // generalized by #1219 to a whole trailing slice-run)
+                        // can't be applied upfront for this shape -- the
+                        // caller's own classification (see the mode-guard
+                        // comment above) only runs once, before this walk
+                        // even starts, and its `navigate_read_only`
+                        // prefix-peek has no way to look *through* an
+                        // as-yet-unresolved `.[]` to find each element's own
+                        // scalar target. So the rule is re-classified here,
+                        // once per element, against `rest` (the path
+                        // remaining after this `.[]`).
+                        //
+                        // `DropParent(Expr::Identity)` is a distinct signal
+                        // from any other rewrite: it means the *element
+                        // itself* is the scalar the trailing slice-run would
+                        // have targeted (`.[]` directly followed by the run,
+                        // no `Field`/`Index` between -- `true` for
+                        // `empty_prefix_is_identity`, unlike the top-level
+                        // callers). There is no parent key to drop one level
+                        // down from an `&mut` reference into this array slot
+                        // -- `delete_at_path`'s own `Expr::Identity` arm
+                        // would just null the element in place, not remove
+                        // it, so this element's index is queued for removal
+                        // from `arr` itself after the loop instead of being
+                        // recursed into.
+                        //
+                        // #1219: `Noop` (`rest` is a chained slice-run
+                        // followed by something that isn't itself another
+                        // trailing slice, e.g. `.a[][1:3][0]`) leaves this
+                        // element completely untouched (neither removed nor
+                        // recursed into), live-verified.
+                        let mut remove_indices = Vec::new();
+                        for (i, elem) in arr.iter_mut().enumerate() {
+                            let outcome = match &rest_pipe {
+                                Some(rp) => yq_del_slice_outcome(rp, elem, true),
+                                None => YqDelSliceOutcome::NotApplicable,
+                            };
+                            match outcome {
+                                YqDelSliceOutcome::DropParent(Expr::Identity) => {
+                                    remove_indices.push(i);
+                                }
+                                YqDelSliceOutcome::DropParent(ref target) => {
+                                    delete_at_path(elem, target, optional, yq_mode)?;
+                                }
+                                YqDelSliceOutcome::Noop => {
+                                    // Leave this element untouched.
+                                }
+                                YqDelSliceOutcome::NotApplicable => {
+                                    delete_path_steps(elem, rest, optional, yq_mode)?;
+                                }
+                            }
+                        }
+                        for i in remove_indices.into_iter().rev() {
+                            arr.remove(i);
+                        }
+                        Ok(())
+                    }
+                    OwnedValue::Object(map) => {
+                        // Same per-element re-classification, elem-is-target
+                        // removal, and #1219 no-op as the array arm above.
+                        let mut remove_keys = Vec::new();
+                        for (key, value) in map.iter_mut() {
+                            let outcome = match &rest_pipe {
+                                Some(rp) => yq_del_slice_outcome(rp, value, true),
+                                None => YqDelSliceOutcome::NotApplicable,
+                            };
+                            match outcome {
+                                YqDelSliceOutcome::DropParent(Expr::Identity) => {
+                                    remove_keys.push(key.clone());
+                                }
+                                YqDelSliceOutcome::DropParent(ref target) => {
+                                    delete_at_path(value, target, optional, yq_mode)?;
+                                }
+                                YqDelSliceOutcome::Noop => {
+                                    // Leave this entry untouched.
+                                }
+                                YqDelSliceOutcome::NotApplicable => {
+                                    delete_path_steps(value, rest, optional, yq_mode)?;
+                                }
+                            }
+                        }
+                        for key in remove_keys {
+                            map.shift_remove(&key);
+                        }
+                        Ok(())
+                    }
+                    _ if here => Ok(()),
+                    _ => Err(EvalError::cannot_iterate_with(
+                        if yq_mode { EvalTag::Yq } else { EvalTag::Jq },
+                        root,
+                    )),
+                };
+            }
+            // A nested pipe from `Optional(Pipe([…]))` — splice, do not
+            // recurse on it alone, or `rest` is stranded. See
+            // `splice_optional_group`'s doc comment for why this passes
+            // `optional`, not `here`, as the baseline (#1294).
+            Expr::Pipe(inner) => {
+                let spliced = splice_optional_group(inner, rest, here);
+                return delete_path_steps(root, &spliced, optional, yq_mode);
+            }
+            // The chain continues *inside* the slice, so the delete happens
+            // in the sub-array and the remainder is spliced back:
+            // `[1,[2],[3]] | del(.[1:3][0])` is `[1,[3]]`, not the whole
+            // range dropped.
+            // `null` has no elements to descend into, matching the top-level
+            // `Expr::Slice` arm's `Null` case above (#476) — `null |
+            // del(.[0:2].a)` is a no-op, while `null | del(.[0:2][])` still
+            // raises from the tail (#527). This is deliberately not pushed
+            // into `through_slice` itself: that helper is shared with
+            // `=`/`|=` assignment, where a slice write auto-vivifies `null`
+            // instead of no-op'ing (a separate, documented divergence — see
+            // docs/compliance/jq/limitations.md).
+            Expr::Slice { .. } if matches!(root, OwnedValue::Null) => {
+                // Loops in place rather than recursing -- same reasoning as
+                // the `Field`/`Index` arms' own `Null` case above: `root`
+                // already points at a live `null` slot that can never become
+                // anything else via a `del()`, so there is no need for a
+                // detached scratch.
+                steps = rest;
+                continue;
+            }
+            // See `delete_at_path`'s own doc history for this arm (#1116/
+            // #1162/#1219/#1321/#1873/#1876/#1883 code review) -- unchanged
+            // reasoning, just recursing into `delete_path_steps` on a slice
+            // instead of `delete_at_path` on a rebuilt `Expr::Pipe`.
+            Expr::Slice { start, end, .. } => {
+                return through_slice(
+                    root,
+                    *start,
+                    *end,
+                    SliceEditFlags {
+                        optional: here,
+                        scalar_noop: false,
+                        container_noop: false,
+                        terminal_write: yq_mode,
+                    },
+                    |sub| always_wrote(delete_path_steps(sub, rest, optional, yq_mode)),
+                )
+                .map(|_| ());
+            }
+            _ => return delete_at_path(root, first, here, yq_mode),
+        }
     }
 }
 
@@ -65344,12 +65417,24 @@ mod tests {
     /// `test_deep_flat_assign_chain_exits_cleanly_not_stack_overflow_1429`
     /// in tests/jq_cli_tests.rs, at 200,000 components.
     ///
-    /// What is left here is the agreement check, and the depths are still
-    /// measured rather than guessed: `|=` -- untouched by #1429, and
-    /// recursive per component -- already aborts in a *debug* build (larger
-    /// frames, 2 MiB test-thread stack) somewhere between 128 and 192, so the
-    /// two operators are pinned at 256 and 128 rather than at a shared depth
-    /// that would silently be `|=`'s pre-existing ceiling.
+    /// `|=` was, at the time this test was written, recursive per component
+    /// with no flattening of its own -- it aborted in a *debug* build
+    /// (larger frames, 2 MiB test-thread stack) somewhere between 128 and
+    /// 192 components, well short of `=`'s own 256-deep pin here, which is
+    /// why the two operators used to be checked at *different* depths (256
+    /// vs. 128) rather than a shared one that would have silently been
+    /// `|=`'s lower ceiling.
+    ///
+    /// #2115 gave `update_path` the same treatment: `update_path_steps` now
+    /// collects a maximal run of steps that must all autovivify together and
+    /// applies the update filter once against a detached leaf, rather than
+    /// recursing per component -- see
+    /// `test_deep_flat_update_chain_exits_cleanly_not_stack_overflow_2115`
+    /// (tests/jq_cli_tests.rs) for the end-to-end proof, at 1,000,000
+    /// components in a *debug* build. Both operators now share the same
+    /// depth here: `|=`'s old ceiling was a property of the removed
+    /// per-component recursion, not of anything this agreement check itself
+    /// needs to keep testing separately.
     #[test]
     fn test_assign_deep_chain_agrees_with_the_update_walker_1429() {
         fn chain(depth: usize) -> (String, String) {
@@ -65362,13 +65447,6 @@ mod tests {
         }
 
         let (path, expected) = chain(256);
-        let set = format!("{path} = 9");
-        assert_outcomes(&[(b"null", set.as_str(), Ok(expected.as_str()))]);
-
-        // Shallower, so `|=`'s own deeper recursion still fits: the point
-        // here is that both operators build the identical document, not how
-        // far each can go.
-        let (path, expected) = chain(128);
         let set = format!("{path} = 9");
         let update = format!("{path} |= 9");
         assert_outcomes(&[

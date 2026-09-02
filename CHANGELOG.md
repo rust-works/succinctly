@@ -289,6 +289,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`|=`/`+=`/other compound assignment operators, and `del()`, could crash the process on a
+  sufficiently long chained path** (`.k0.k1.k2...` or `del(.k0.k1.k2...)`, #2115) — a
+  sufficiently long chain put one native stack frame on every path component, `SIGKILL` at
+  500,000 components in a release build, a real `fatal runtime error: stack overflow` between
+  roughly 128 and 192 in a debug build. `update_path`'s `Expr::Pipe` arm used to rebuild
+  `Expr::Pipe(exprs[1..].to_vec())` and recurse once per component, the same shape #1429/#2105
+  already fixed for `=`'s own walker (`set_path_steps`) — but `=`'s fix doesn't transfer
+  unchanged: `|=` applies a *filter* at the leaf, which can report "produced nothing"
+  (#1877/#1894) from the terminal position no matter how deep it is, with no `Iterate` in sight
+  (`null | .a.b.c |= empty` unwinds every freshly-autovivified level), where `=`'s
+  already-materialized right-hand side has no such concept and only ever needs to unwind
+  behind an `Iterate`. The new `update_path_steps` (`src/jq/eval.rs`) peels a step that
+  navigates into an already-existing slot with no frame at all (structurally can never strand,
+  matching `slot_was_stranded`'s own `created` gate) and, once a step has to autovivify,
+  collects the *whole* maximal run of further steps that must autovivify too (autovivifying
+  `Null` always succeeds and always produces an empty container, so nothing beneath it could
+  already exist either), applies the update filter exactly once against a detached leaf
+  standing in for that whole run, and builds or discards the result in one non-recursive loop.
+  `delete_at_path` had no stranded-undo complexity to begin with (a step reaching `null` or an
+  out-of-range index deletes nothing, #476/#477) — its new `delete_path_steps` reassigns `root`
+  to the child slot and loops unconditionally, including through a chain of `null`s (a `null`
+  slot can never gain a key, so there is nothing to detach a scratch value for either). Neither
+  walker rebuilds an `Expr::Pipe` per step any more, incidentally also dropping the O(d²)
+  clone cost `set_path_steps`'s own fix already removed on the `=` side. Both are otherwise
+  behavior-preserving: the full existing test suite passes unchanged, confirmed byte-identical
+  against `/usr/bin/jq` 1.7.1 and `yq` v4.53.3 across nested/computed/sliced/comma/`?`-suppressed
+  paths, and a chain of 1,000,000 components no longer crashes in either a release or a debug
+  build (`test_deep_flat_update_chain_exits_cleanly_not_stack_overflow_2115`,
+  `test_deep_flat_delete_chain_exits_cleanly_not_stack_overflow_2115`,
+  `test_deep_flat_delete_chain_through_absent_first_key_exits_cleanly_2115`, all in
+  `tests/jq_cli_tests.rs`).
+
 - **A recursive `def` whose body is a wide, flat pipe or object literal could abort the
   process with a real native stack overflow instead of raising `MAX_EVAL_FRAMES`'s catchable
   error** (#2135). `install_def_calls`'s frame-charging model (#1371/#2080) only accumulated
