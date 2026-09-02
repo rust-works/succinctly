@@ -30108,14 +30108,25 @@ fn accumulate_path_context_step<'a, W: Clone + AsRef<[u64]>>(
 ///
 /// **`optional` is currently always `false` at every call site reachable from
 /// the path-context evaluator (#2212).** #2073 removed `Expr::Optional`'s
-/// combined-with-`rest` fallback, which was the last thing that produced an
-/// `optional == true` in there, so the three cells below that consult it are
-/// live only through this function's own unit test
-/// (`test_catch_error_under_optional_full_truth_table_1888`) -- which is
-/// therefore the sole load-bearing test for the truth table, not a
-/// belt-and-braces duplicate of an end-to-end one. Whether to delete the
-/// parameter or keep it as defence in depth is #2212's call; until then, do
-/// not cite these cells as evidence of live behaviour.
+/// combined-with-`rest` fallback -- the only route that ever forced a `true`
+/// into `eval_stage_with_path_context`'s own `optional` parameter -- so the
+/// three cells below that consult it (`(true, true)` and `(false, true)`,
+/// plus the bare `Error(e)` arm above) are live only through this function's
+/// own unit test (`test_catch_error_under_optional_full_truth_table_1888`);
+/// #1826's and #1869's own end-to-end tests now reach the `optional ==
+/// false` branch instead, either through #2073's new hard-error behaviour or
+/// through `Expr::Optional`'s own structural catch. Treat the unit test as
+/// this function's spec for the `optional == true` column, not just a
+/// regression pin against a shape no live query can trigger today. Confirmed
+/// two independent ways: an `assert!(!optional, ...)` probe at
+/// `eval_stage_with_path_context`'s own entry point fires zero times across
+/// the full suite (5 times on pre-#2073 `main`), and `llvm-cov`'s
+/// patch-coverage diff on the #2073 PR itself reported these lines losing
+/// coverage on otherwise-unchanged code. #2212 chose to leave `optional` in
+/// place rather than remove it -- deleting it from this function's signature
+/// (and every caller's in turn) would ripple well beyond this one function,
+/// and a future path-context arm could legitimately reintroduce a real
+/// producer of `true` the same way #2073's fallback used to be one.
 ///
 /// The prefix lives *inside* the matched `Partial` pattern, not in a
 /// separately-passed accumulator: `accumulate_path_context_step` already
@@ -30124,29 +30135,6 @@ fn accumulate_path_context_step<'a, W: Clone + AsRef<[u64]>>(
 /// time a caller's loop breaks, its own `results` binding is already empty
 /// -- reusing it here instead of the pattern's own `prefix` would silently
 /// keep nothing.
-/// #2212: every caller of this function lives inside the path-context
-/// evaluator's own call graph, and `optional` reaches every one of them
-/// through a chain that bottoms out at `eval_stage_with_path_context`'s own
-/// `optional` parameter. #2073 removed `Expr::Optional`'s combined-with-
-/// `rest` fallback there -- the only route that ever forced a `true` into
-/// that parameter -- so `optional` is `false` at every one of this
-/// function's call sites today, making the `optional == true` cells below
-/// (`(true, true)` and `(false, true)`, plus the bare `Error(e)` arm above)
-/// currently unreachable. Confirmed two independent ways (#2212): an
-/// `assert!(!optional, ...)` probe at `eval_stage_with_path_context`'s own
-/// entry point fires zero times across the full suite (it fires 5 times on
-/// pre-#2073 `main`), and `llvm-cov`'s patch-coverage diff on the #2073 PR
-/// itself reported these lines losing coverage on otherwise-unchanged code.
-/// Left in place rather than removed -- deleting `optional` from this
-/// function's signature (and from every caller's own signature in turn)
-/// would ripple well beyond this one function, and a future path-context
-/// arm could legitimately reintroduce a real producer of `true` the same
-/// way #2073's fallback used to be one. `test_catch_error_under_optional_full_truth_table_1888`
-/// is the sole test exercising these cells now that #1826/#1869/#1964's own
-/// end-to-end tests reach the `optional == false` branch either through
-/// #2073's new hard-error behavior or through `Expr::Optional`'s own
-/// structural catch instead -- treat it as this function's spec for the
-/// `optional == true` column, not just a regression pin.
 fn catch_error_under_optional<W>(
     stopped: QueryResult<'_, W>,
     optional: bool,
@@ -31763,6 +31751,9 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Err(_) if optional => return QueryResult::None,
                 Err(e) => return QueryResult::Error(e),
             },
+            // Same `optional`, same evidence, same #2212 conclusion as the
+            // arm just above -- currently unreachable with `optional ==
+            // true`, see `catch_error_under_optional`'s doc comment.
             Err(EvalEscape::Error(_)) if optional => return QueryResult::None,
             Err(escape) => return escape.into(),
         };
