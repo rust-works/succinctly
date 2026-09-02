@@ -606,10 +606,8 @@ pub fn any_subexpr(expr: &Expr, pred: &mut dyn FnMut(&Expr) -> bool) -> bool {
         // Leaves: nothing nested to descend into.
         Expr::Identity
         | Expr::Field(_)
-        | Expr::Index(_)
-        | Expr::IndexNumber { .. }
+        | Expr::Index { .. }
         | Expr::Slice { .. }
-        | Expr::SliceNumber { .. }
         | Expr::Iterate
         | Expr::Literal(_)
         | Expr::RecursiveDescent

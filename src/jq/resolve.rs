@@ -411,10 +411,8 @@ fn check(expr: &Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
         // own grouping so the two stay comparable arm for arm.
         Expr::Identity
         | Expr::Field(_)
-        | Expr::Index(_)
-        | Expr::IndexNumber { .. }
+        | Expr::Index { .. }
         | Expr::Slice { .. }
-        | Expr::SliceNumber { .. }
         | Expr::Iterate
         | Expr::Literal(_)
         | Expr::RecursiveDescent

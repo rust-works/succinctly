@@ -1,27 +1,30 @@
-//! #1827: end-to-end behavioral equivalence between `Expr::Index`/`Expr::Slice`
-//! and their float-spelling-preserving siblings `Expr::IndexNumber`/
-//! `Expr::SliceNumber` (`src/jq/expr.rs`).
+//! #1827: end-to-end behavioral equivalence between an integer-spelled and
+//! a float-spelled static path component (`Expr::Index`/`Expr::Slice`,
+//! `src/jq/expr.rs`).
 //!
-//! `.[1]` folds to `Expr::Index(1)`; `.[1.0]` (same integer value, float
-//! spelling) folds to `Expr::IndexNumber { idx: 1, .. }` instead, so
-//! `path()` can report the component's own source spelling (#1088, #1326).
-//! The two must behave identically for navigation — reading, `del`,
-//! `setpath`/`=`/`|=`, `getpath` — with `path()`'s own component rendering
-//! the only place they're allowed to differ.
+//! `.[1]` folds to `Expr::Index { idx: 1, key: None }`; `.[1.0]` (same
+//! integer value, float spelling) folds to the same variant with `key`
+//! populated, so `path()` can report the component's own source spelling
+//! (#1088, #1326). The two must behave identically for navigation —
+//! reading, `del`, `setpath`/`=`/`|=`, `getpath` — with `path()`'s own
+//! component rendering the only place they're allowed to differ.
 //!
-//! This is the regression class #1088/#1326 already hit once:
-//! `delete_expr_array_paths`'s error-construction match had no
-//! `Expr::IndexNumber` arm at all from #1088 until #1326 added one as a
-//! byproduct, so a float-spelled index reaching it would have panicked via
-//! `unreachable!()`. `src/jq/eval.rs` has ~30 sites that pattern-match on
-//! this pair (or its `Slice`/`SliceNumber` sibling) — most via the shared
-//! predicates or an `Expr::Index(idx) | Expr::IndexNumber { idx, .. }`
-//! or-pattern, but nothing enforces that a *new* site does so, or that a
-//! *third* paired variant joining either family gets taught to every one of
-//! them. Running real filters through the full evaluator, as this file
-//! does, is what would have caught the #1088/#1326 gap: a missing arm
-//! panics or errors differently, not just "the wrong predicate returns
-//! false".
+//! This is the regression class #1088/#1326 already hit once. Each spelling
+//! used to be its *own* variant (`Expr::IndexNumber` beside `Expr::Index`,
+//! `Expr::SliceNumber` beside `Expr::Slice`), so every site had to spell
+//! out both members of the pair — and `delete_expr_array_paths`'s
+//! error-construction match had no `IndexNumber` arm at all from #1088
+//! until #1326 added one as a byproduct, so a float-spelled index reaching
+//! it would have panicked via `unreachable!()`.
+//!
+//! #1401 folded the keys onto the surviving variants, which makes a missing
+//! *sibling* arm unrepresentable — one variant per family, so the compiler
+//! sees every site. What this file still covers is the property that
+//! motivated the pairs in the first place, and that no type can enforce:
+//! that the two spellings actually reach the same behavior end to end,
+//! through the full evaluator, at every dispatch site a real filter can
+//! drive. A site that keyed off the spelling rather than `idx` would still
+//! be caught here.
 //!
 //! Every expectation below is pinned against jq-1.7.1 (the version in
 //! `tests/data/jq-golden/JQ_VERSION`).

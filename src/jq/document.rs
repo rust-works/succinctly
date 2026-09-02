@@ -1693,7 +1693,7 @@ pub fn collapsed_fields<F: DocumentFields>(
 
 /// [`collapsed_fields`], but skipped outright when the mode doesn't
 /// collapse (yq) -- the single guard the two positional `LazyKeys` arms
-/// (`Index`/`IndexNumber`, `Last`) both need before they can answer.
+/// (`Index`, `Last`) both need before they can answer.
 pub fn collapsed_fields_if<F: DocumentFields>(
     fields: &F,
     collapse: bool,

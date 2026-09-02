@@ -3752,7 +3752,7 @@ fn can_use_m2_streaming(expr: &Expr) -> bool {
         // Core M2 expressions
         Expr::Identity => true,
         Expr::Field(_) => true,
-        Expr::Index(_) | Expr::IndexNumber { .. } => true,
+        Expr::Index { .. } => true,
         Expr::Iterate => true,
 
         // Chained navigation
@@ -6542,7 +6542,7 @@ mod tests {
         // .users | .[0] | .name
         let expr = Expr::Pipe(vec![
             Expr::Field("users".to_string()),
-            Expr::Index(0),
+            Expr::index(0),
             Expr::Field("name".to_string()),
         ]);
         let results = eval_yaml(yaml, &expr);

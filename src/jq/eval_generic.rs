@@ -3891,12 +3891,10 @@ fn fold_lazy_keys_stage<S: EvalSemantics, V: DocumentValue>(
         // away, which is why the arm below still probes
         // (#1599 -- #1514 moved the probe off the guard, but
         // left this spelling paying it).
-        Expr::Index(idx) | Expr::IndexNumber { idx, .. } if !sorted && *idx == 0 => {
-            match fields.uncons_key() {
-                Some((_, key_cursor, _)) => GenericResult::OneCursor(key_cursor),
-                None => GenericResult::Owned(OwnedValue::Null),
-            }
-        }
+        Expr::Index { idx, .. } if !sorted && *idx == 0 => match fields.uncons_key() {
+            Some((_, key_cursor, _)) => GenericResult::OneCursor(key_cursor),
+            None => GenericResult::Owned(OwnedValue::Null),
+        },
         // #1629: a negative index always has to walk the whole object
         // anyway (to normalize against its length), so the #1194 check
         // rides along for free -- same reasoning as `Expr::Iterate` above,
@@ -3909,7 +3907,7 @@ fn fold_lazy_keys_stage<S: EvalSemantics, V: DocumentValue>(
         // bad member (verified live against pinned jq 1.7.1:
         // `{"a":1,"b":2,123:3} | keys_unsorted[0]` raises the same parse
         // error as `keys_unsorted[2]` would).
-        Expr::Index(idx) | Expr::IndexNumber { idx, .. } if !sorted && *idx < 0 => {
+        Expr::Index { idx, .. } if !sorted && *idx < 0 => {
             match distinct_key_cursors_checked::<V>(&fields, collapse) {
                 Ok(cursors) => {
                     let target = usize::try_from(cursors.len() as i64 + idx).ok();
@@ -3930,7 +3928,7 @@ fn fold_lazy_keys_stage<S: EvalSemantics, V: DocumentValue>(
         // unchecked, same as `Builtin::First`/`.[0]` below -- see #1629's
         // own accounting of this tradeoff (its "Option 1") and
         // `docs/compliance/jq/limitations.md`.
-        Expr::Index(idx) | Expr::IndexNumber { idx, .. } if !sorted => {
+        Expr::Index { idx, .. } if !sorted => {
             let collapsed = collapsed_fields_if(&fields, collapse);
             if let Some(eff) = collapsed {
                 match eff.into_iter().nth(*idx as usize) {
@@ -4047,7 +4045,7 @@ fn fold_lazy_index_range_stage<S: EvalSemantics, V: DocumentValue>(
                 GenericResult::ManyOwned((0..len).map(|i| OwnedValue::Int(i as i64)).collect())
             }
         }
-        Expr::Index(idx) | Expr::IndexNumber { idx, .. } => {
+        Expr::Index { idx, .. } => {
             // Same normalization/OOB-is-null semantics as
             // `LazyKeys`'s `Expr::Index` arm above.
             let target = if *idx < 0 {
@@ -4094,7 +4092,7 @@ fn fold_lazy_index_range_stage<S: EvalSemantics, V: DocumentValue>(
 /// arm (#1565); see [`fold_lazy_keys_stage`]'s own doc comment for why this
 /// split exists. `fold_pipe_stages_sink` intercepts `Expr::Iterate` before
 /// ever calling this function, but every *other* stage shape here --
-/// including `Expr::Builtin(Builtin::First) | Expr::Index(0)`'s own
+/// including `Expr::Builtin(Builtin::First) | Expr::index(0)`'s own
 /// pull-one-and-stop fast path -- is identical between the eager and
 /// demand-aware callers, since none of them fan out beyond the single `seq`
 /// they were already holding.
@@ -4195,7 +4193,23 @@ fn fold_lazy_seq_stage<S: EvalSemantics, V: DocumentValue>(
         // don't affect the requested output, and an error on
         // a skipped element is one such element. Pinned by
         // `test_generic_lazy_seq_first_after_map_skips_later_error_725`.
-        Expr::Builtin(Builtin::First) | Expr::Index(0) => match seq.next() {
+        // #1401: `key: None` rather than `..` on purpose -- this arm is
+        // deliberately restricted to the *integer* spelling of `.[0]`.
+        //
+        // The fold that merged `IndexNumber` into `Index` would otherwise
+        // silently widen it: pre-fold this read `Expr::Index(0)`, which a
+        // float-spelled `.[0.0]` could not match, so `.[0.0]` fell through
+        // to the eager evaluator and *did* raise the later element's error
+        // (matching jq 1.7.1). Taking this path instead would suppress it,
+        // spreading the deliberate-but-divergent #725 skip to one more
+        // spelling -- the wrong direction under ADR-0018, which permits a
+        // divergence only where matching jq is impossible.
+        //
+        // That leaves `.[0]` and `.[0.0]` genuinely disagreeing here, which
+        // is the drift class #1401/#1827 exist to surface rather than one
+        // this refactor should quietly resolve either way -- filed as #2174.
+        // The real fix is to stop diverging on #725, not to diverge twice.
+        Expr::Builtin(Builtin::First) | Expr::Index { idx: 0, key: None } => match seq.next() {
             None => GenericResult::Owned(OwnedValue::Null),
             Some(Ok(LazyElem::Cursor(c))) => GenericResult::OneCursor(c),
             Some(Ok(LazyElem::Owned(o))) => GenericResult::Owned(o),
@@ -4849,7 +4863,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             }
         }
 
-        Expr::Index(idx) | Expr::IndexNumber { idx, .. } => {
+        Expr::Index { idx, .. } => {
             if let Some(elements) = value.as_array() {
                 let len = elements.len();
                 let actual_idx = if *idx < 0 {
@@ -4874,7 +4888,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 // No `optional`-guarded arm here (unlike `index_one_generic`,
                 // the computed-key sibling this literal `.[N]` form doesn't
                 // share code with): `.[N]?` parses straight to
-                // `Expr::Optional(Expr::Index(N))`, which isn't
+                // `Expr::Optional(Expr::index(N))`, which isn't
                 // `IndexExpr`/`SliceExpr`, so #693's dispatch never forces
                 // `optional = true` into this arm — it evaluates `Expr::
                 // Index` at the ambient `optional` (normally `false`) and
@@ -8681,7 +8695,7 @@ fn path_expr_is_cursor_navigable(expr: &Expr) -> bool {
         // A negative index needs no array length: `path(.[-1])` is `[-1]`
         // verbatim in both jq and succinctly today (verified live), so the
         // sign costs nothing here.
-        Expr::Index(_) | Expr::IndexNumber { .. } => true,
+        Expr::Index { .. } => true,
         Expr::Paren(inner) | Expr::Optional(inner) => path_expr_is_cursor_navigable(inner),
         Expr::Pipe(exprs) | Expr::Comma(exprs) => exprs.iter().all(path_expr_is_cursor_navigable),
         _ => false,
@@ -8854,16 +8868,18 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
             out.push((p, next));
             Ok(())
         }
-        Expr::Index(_) | Expr::IndexNumber { .. } => {
+        Expr::Index { idx, key } => {
             // The component is reported with its own source spelling
-            // (`path(.[2.0])` is `[2.0]`, not `[2]` -- #1088), which only
-            // `IndexNumber` carries. `index_component_value` is `eval.rs`'s
-            // own renderer for exactly this, shared rather than re-derived.
-            let (idx, key) = match expr {
-                Expr::Index(i) => (*i, None),
-                Expr::IndexNumber { idx, key } => (*idx, Some(key)),
-                _ => unreachable!("guarded by the match arm above"),
-            };
+            // (`path(.[2.0])` is `[2.0]`, not `[2]` -- #1088), carried by
+            // `key` when the literal had one. `index_component_value` is
+            // `eval.rs`'s own renderer for exactly this, shared rather than
+            // re-derived.
+            //
+            // #1401: `idx`/`key` bind straight from the arm. While this was
+            // a *pair* of variants the arm could not bind them, so it
+            // re-matched over both with an `unreachable!()` fallback -- the
+            // same shape that let a missing arm slip through twice.
+            let (idx, key) = (*idx, key.as_ref());
             let next = match node {
                 PathNode::Absent => PathNode::Absent,
                 PathNode::At(c) => {
@@ -9022,7 +9038,7 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
 fn path_context_is_cursor_walkable(expr: &Expr) -> bool {
     match expr {
         Expr::Identity | Expr::Iterate | Expr::Field(_) => true,
-        Expr::Index(_) | Expr::IndexNumber { .. } => true,
+        Expr::Index { .. } => true,
         Expr::Paren(inner) | Expr::Array(inner) => path_context_is_cursor_walkable(inner),
         Expr::Pipe(exprs) | Expr::Comma(exprs) => exprs.iter().all(path_context_is_cursor_walkable),
         Expr::Builtin(Builtin::PathNoArg | Builtin::Key | Builtin::Parent) => true,
@@ -9202,7 +9218,7 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             Ok(())
         }
         Expr::Paren(inner) => path_context_step_generic::<S, V>(inner, pos, out),
-        Expr::Field(_) | Expr::Index(_) | Expr::IndexNumber { .. } | Expr::Iterate => {
+        Expr::Field(_) | Expr::Index { .. } | Expr::Iterate => {
             let mut heads = Vec::new();
             // `true`, not `S::COLLAPSE_DUPLICATE_KEYS`: the bridge this
             // replaces materializes the document into an
@@ -11024,7 +11040,7 @@ mod tests {
         let cursor = index.root(json);
         let value = cursor.value();
 
-        let result = eval(&Expr::Index(1), value);
+        let result = eval(&Expr::index(1), value);
         let owned = result.into_owned().unwrap().unwrap();
 
         assert_eq!(owned, OwnedValue::Int(2));
@@ -12345,7 +12361,7 @@ mod tests {
     #[test]
     fn test_generic_lazy_seq_first_after_map_skips_later_error_725() {
         // Accepted, deliberate divergence from real jq (see the
-        // `Expr::Builtin(Builtin::First) | Expr::Index(0)` arm's own doc
+        // `Expr::Builtin(Builtin::First) | Expr::index(0)` arm's own doc
         // comment above `eval_single`'s `Pipe` fold): real jq's `map`
         // eagerly builds the whole array first, so `map(f)|first` errors if
         // *any* element fails, even ones past the first. `first`/`.[0]`'s
@@ -12563,7 +12579,7 @@ mod tests {
         // .users | .[0] | .name
         let expr = Expr::Pipe(vec![
             Expr::Field("users".to_string()),
-            Expr::Index(0),
+            Expr::index(0),
             Expr::Field("name".to_string()),
         ]);
 
@@ -13025,7 +13041,7 @@ mod tests {
             .expect("YAML document should have content");
         let value = seq_cursor.value();
 
-        let result = eval(&Expr::Index(1), value);
+        let result = eval(&Expr::index(1), value);
         let owned = result.into_owned().unwrap().unwrap();
 
         assert_eq!(owned, OwnedValue::Int(2));
@@ -13901,7 +13917,7 @@ mod tests {
         // .users | .[0] | .name
         let expr = Expr::Pipe(vec![
             Expr::Field("users".to_string()),
-            Expr::Index(0),
+            Expr::index(0),
             Expr::Field("name".to_string()),
         ]);
 
