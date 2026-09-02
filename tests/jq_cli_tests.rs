@@ -7801,79 +7801,86 @@ fn test_array_wrapped_path_context_builtin_optional_is_atomic_1302() -> Result<(
     Ok(())
 }
 
-/// #1826: `Builtin::Map(f)`'s path-context arm claimed the same
-/// array-construction atomicity `Expr::Array`'s arm above earns via #1302's
-/// fix, but never actually got it -- it passed the *ambient* `optional`
-/// straight into each element's own evaluation instead of forcing `false`
-/// and self-catching. An ambient `optional` (from an earlier `?` in the
-/// same pipe, still threaded downstream per this evaluator's model -- see
-/// `test_optional_dispatch_catches_atomically_not_broadcast_1335` below)
-/// let a genuine per-element error self-swallow into "no output for this
-/// element" before the array-level atomicity match ever saw it, silently
-/// *skipping* the erroring element instead of discarding the whole `map()`
-/// -- confirmed live pre-fix: `(.a)? | map(if key==1 then error("boom")
-/// else key end)` on `{"a":[1,2,3]}` produced `[0,2]`, where the
-/// structurally-identical `(.a)? | [.[] | if key==1 then error("boom") else
-/// key end]` already correctly produced nothing. Unlike #1302's own
-/// direct-`?`-on-the-construction repro, this one needs the *ambient*
-/// form (`?` on an earlier stage, `map(...)` unwrapped in `rest`) --
-/// `.a | map(...)?` (mirroring #1302's own test shape) does not reach the
-/// buggy code path at all, since that shape's `?` isolates with its own
-/// forced `false` via a different (already-correct) dispatch.
+/// #1826 originally found that `Builtin::Map(f)`'s path-context arm claimed
+/// the same array-construction atomicity `Expr::Array`'s arm above earns via
+/// #1302's fix, but never actually got it -- it passed the *ambient*
+/// `optional` straight into each element's own evaluation instead of
+/// forcing `false` and self-catching. Pre-#1826 that let a genuine
+/// per-element error self-swallow into "no output for this element" before
+/// the array-level atomicity match ever saw it, silently *skipping* the
+/// erroring element instead of discarding the whole `map()` -- confirmed
+/// live pre-fix: `(.a)? | map(if key==1 then error("boom") else key end)`
+/// on `{"a":[1,2,3]}` produced `[0,2]`.
+///
+/// #2073 then closed the wider gap #1826's own fix was built on top of: an
+/// ambient `optional` from an earlier `?` in the same pipe no longer
+/// threads into `rest`'s evaluation at all (`Expr::Optional`'s arm now
+/// isolates and catches `?`'s own `inner` unconditionally, exactly like
+/// `Try`/`Label`). So every "ambient `?`" case below no longer reaches
+/// `map`'s atomicity match under a suppressing `optional` in the first
+/// place -- `map`'s error now escapes as an ordinary hard error, same as
+/// the pre-existing "no ambient `?`" case already covered here. `map(f)`'s
+/// own atomicity (the #1302/#1826 fix this test originally pinned) still
+/// applies to its *direct*-attach shape, `map(...)?`, unaffected by #2073 --
+/// covered by `test_optional_dispatch_catches_atomically_not_broadcast_1335`
+/// below.
 #[test]
 fn test_map_path_context_builtin_optional_is_atomic_1826() -> Result<()> {
-    // Array target: the erroring element must discard the whole map, not
-    // just itself.
-    let (stdout, _, code) = run_jq_full(
+    // Array target: an earlier, unrelated `?` must not suppress `map`'s own
+    // error.
+    let (stdout, stderr, code) = run_jq_full(
         &[
             "-c",
             "(.a)? | map(if key==1 then error(\"boom\") else key end)",
         ],
         Some(r#"{"a":[1,2,3]}"#),
     )?;
-    assert_eq!(code, 0);
+    assert_eq!(code, 5);
     assert_eq!(stdout, "");
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
 
-    // Object target: same atomicity, `key` reporting the string key instead
-    // of an index.
-    let (stdout, _, code) = run_jq_full(
+    // Object target: same shape, `key` reporting the string key instead of
+    // an index.
+    let (stdout, stderr, code) = run_jq_full(
         &[
             "-c",
             "(.a)? | map(if key==\"y\" then error(\"boom\") else key end)",
         ],
         Some(r#"{"a":{"x":1,"y":2}}"#),
     )?;
-    assert_eq!(code, 0);
+    assert_eq!(code, 5);
     assert_eq!(stdout, "");
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
 
     // The *first* element/entry erroring, not a later one: code review
     // caught that `partial()` (#400/#494) collapses an *empty* accumulated
     // prefix to a bare `Error`, not `Partial(_, Error)` -- a first-fix draft
     // matched only the `Partial` shape here, so this exact case (nothing
-    // accumulated yet when the error hits) fell through unguarded and still
-    // hard-errored instead of producing no output.
-    let (stdout, _, code) = run_jq_full(
+    // accumulated yet when the error hits) fell through unguarded.
+    let (stdout, stderr, code) = run_jq_full(
         &[
             "-c",
             "(.a)? | map(if key==0 then error(\"boom\") else key end)",
         ],
         Some(r#"{"a":[1,2,3]}"#),
     )?;
-    assert_eq!(code, 0);
+    assert_eq!(code, 5);
     assert_eq!(stdout, "");
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
 
-    let (stdout, _, code) = run_jq_full(
+    let (stdout, stderr, code) = run_jq_full(
         &[
             "-c",
             "(.a)? | map(if key==\"x\" then error(\"boom\") else key end)",
         ],
         Some(r#"{"a":{"x":1,"y":2}}"#),
     )?;
-    assert_eq!(code, 0);
+    assert_eq!(code, 5);
     assert_eq!(stdout, "");
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
 
-    // Without any ambient `?`, the same query still hard-errors -- the fix
-    // must not accidentally make every error inside `map()` vanish.
+    // Without any ambient `?`, the same query still hard-errors -- unchanged
+    // baseline this must agree with.
     let (_stdout, stderr, code) = run_jq_full(
         &[
             "-c",
@@ -7884,8 +7891,8 @@ fn test_map_path_context_builtin_optional_is_atomic_1826() -> Result<()> {
     assert_eq!(code, 5);
     assert!(stderr.contains("boom"), "stderr: {stderr}");
 
-    // Sibling positive case: a `map()` that never errors is unaffected by
-    // the ambient `optional`, and `rest` after it still runs normally.
+    // Sibling positive case: a `map()` that never errors is unaffected, and
+    // `rest` after it still runs normally.
     let (stdout, _, code) = run_jq_full(
         &["-c", "(.a)? | map(key) | length"],
         Some(r#"{"a":[1,2,3]}"#),
@@ -7896,59 +7903,69 @@ fn test_map_path_context_builtin_optional_is_atomic_1826() -> Result<()> {
     Ok(())
 }
 
-/// #1869: the identical bug class as #1826/#1302, but for `Expr::Iterate`'s
-/// own path-context arm (bare `.[]`, not `map(f)`). Confirmed live pre-fix:
-/// `(.a)? | .[] | if key==1 then error("boom") else key end` on
-/// `{"a":[1,2,3]}` produced `0`/`2` -- the erroring element (1) silently
-/// *skipped* rather than aborting the traversal, since the ambient
+/// #1869 originally found the identical bug class as #1826/#1302, but for
+/// `Expr::Iterate`'s own path-context arm (bare `.[]`, not `map(f)`).
+/// Confirmed live pre-fix: `(.a)? | .[] | if key==1 then error("boom") else
+/// key end` on `{"a":[1,2,3]}` produced `0`/`2` -- the erroring element (1)
+/// silently *skipped* rather than aborting the traversal, since the ambient
 /// `optional` reached each element's own recursive evaluation instead of
 /// being forced to `false` and self-caught at this arm's own level.
 ///
-/// Unlike `Array`/`Map`, `Iterate` is not a constructor -- there's no
-/// atomic in-progress collection to discard wholesale, so the fix keeps
-/// whatever prefix was already produced before the error (real jq's own
-/// `(1, 2, error("x"))?`-style "keep everything before the catch" model,
-/// #1335) rather than discarding it to nothing the way `map()`'s own fix
-/// does.
+/// #2073 then closed the wider gap #1869's own fix was built on top of: an
+/// ambient `optional` from an earlier `?` in the same pipe no longer
+/// threads into `rest`'s evaluation at all (`Expr::Optional`'s arm now
+/// isolates and catches `?`'s own `inner` unconditionally, exactly like
+/// `Try`/`Label`). So every "ambient `?`" case below no longer suppresses
+/// `.[]`'s error at all -- it now escapes as an ordinary hard error, same as
+/// the pre-existing "no ambient `?`" case already covered here. The
+/// *prefix-keeping* half of #1869's fix (unlike `Array`/`Map`, `Iterate` is
+/// not a constructor, so there's no atomic in-progress collection to
+/// discard wholesale) is unaffected by #2073 and still holds: real jq's own
+/// `(1, 2, error("x"))?`-style "keep everything before the catch" model
+/// applies just the same whether the error is ultimately caught by an
+/// enclosing `?` (uncommon here now) or escapes uncaught (every case below).
 #[test]
 fn test_iterate_path_context_ambient_optional_keeps_prefix_not_skip_1869() -> Result<()> {
     // Array target: element 0 succeeds and is kept; element 1 errors and
-    // stops the traversal (element 2 must never run) -- not "skip 1, keep
-    // going to 2".
-    let (stdout, _, code) = run_jq_full(
+    // aborts the traversal (element 2 must never run) -- not "skip 1, keep
+    // going to 2". An earlier, unrelated `?` does not suppress this error.
+    let (stdout, stderr, code) = run_jq_full(
         &[
             "-c",
             "(.a)? | .[] | if key==1 then error(\"boom\") else key end",
         ],
         Some(r#"{"a":[1,2,3]}"#),
     )?;
-    assert_eq!(code, 0);
+    assert_eq!(code, 5);
     assert_eq!(stdout, "0\n");
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
 
     // Object target: same shape, `key` reporting the string key.
-    let (stdout, _, code) = run_jq_full(
+    let (stdout, stderr, code) = run_jq_full(
         &[
             "-c",
             "(.a)? | .[] | if key==\"y\" then error(\"boom\") else key end",
         ],
         Some(r#"{"a":{"x":1,"y":2,"z":3}}"#),
     )?;
-    assert_eq!(code, 0);
+    assert_eq!(code, 5);
     assert_eq!(stdout, "\"x\"\n");
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
 
     // The *first* element/entry erroring: `partial()` (#400/#494) collapses
-    // an empty accumulated prefix to a bare `Error`, which this arm's own
-    // `if optional` gate must still catch (not just the `Partial` shape) --
-    // #1826's review caught the same gap for `map()`.
-    let (stdout, _, code) = run_jq_full(
+    // an empty accumulated prefix to a bare `Error`, which this arm must
+    // still propagate correctly (not just the `Partial` shape) -- #1826's
+    // review caught the analogous gap for `map()`.
+    let (stdout, stderr, code) = run_jq_full(
         &[
             "-c",
             "(.a)? | .[] | if key==0 then error(\"boom\") else key end",
         ],
         Some(r#"{"a":[1,2,3]}"#),
     )?;
-    assert_eq!(code, 0);
+    assert_eq!(code, 5);
     assert_eq!(stdout, "");
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
 
     // Without any ambient `?`, the same query still hard-errors, keeping
     // the pre-error prefix on stdout -- matches real jq's own equivalent
@@ -8235,10 +8252,17 @@ fn test_string_interpolation_path_context_fanout_continues_rest_1403() -> Result
 
     // `?` wraps only the interpolation, with a downstream `| key` still
     // needing path context -- routes through the general `Expr::Optional`
-    // arm's *other* branch (rest non-empty, needs path context), which
-    // flattens and threads `optional=true` straight into this arm instead
-    // of catching externally the way the tail-position `?` cases above do.
-    // Exercises this arm's own `optional`-gated catch directly.
+    // arm's `paired` branch (#2073): the interpolation is isolated and
+    // evaluated with `optional` forced to `false`, so its own `if optional`
+    // swallow-gate (`StringInterpolation`'s own arm) no longer fires -- the
+    // interior error now escapes as a `Partial(out, Error)` instead, caught
+    // structurally by `Expr::Optional`'s own arm one level up (not by an
+    // ambient `optional` reaching this arm's internal gate, the pre-#2073
+    // mechanism). Same already-built prefix (`out`) either way, still paired
+    // with the *fresh, empty* path a built string always continues `rest`
+    // from (`continue_rest_with_fresh_root` -- a string is not a document
+    // node), so `key` after the `?` still resolves against that empty path
+    // and still yields `null`, matching the tail-position `?` cases above.
     let (stdout, _, code) = run_jq_full(
         &["-c", ".a | (\"\\(key, error(\"boom\"))\")? | key"],
         Some(r#"{"a":1}"#),
@@ -8529,6 +8553,31 @@ fn test_optional_wrapped_navigation_still_threads_path_into_rest_1335() -> Resul
     let (stdout, _, code) = run_jq_full(&["-c", ".a | .[] | key"], Some(r#"{"a":[10,20,30]}"#))?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "0\n1\n2");
+
+    Ok(())
+}
+
+/// #2073's own repro: `?` must suppress only the expression it directly
+/// wraps, never a *later* pipe stage's own error -- even when that later
+/// stage needs path context, the one case `Expr::Optional`'s arm got wrong.
+/// Before the fix, `rest` needing path context (here, `key`) routed through
+/// a combined-with-`rest` fallback under a forced `optional=true`, so
+/// `error("boom")` -- several stages downstream of the `?`, and entirely
+/// unrelated to it -- self-swallowed via `Comma`'s own `if optional` check:
+/// confirmed live pre-fix this printed `0` and exited 0. Real jq prints `0`
+/// then hard-errors, exit 5 (`?` only wraps `(.[])`, not the comma after
+/// it) -- matching `test_optional_wrapped_navigation_still_threads_path_into_rest_1335`
+/// above, which pins that the *path threading* this fix depends on
+/// (`path_probe_stage`, #1409) still works for this exact shape.
+#[test]
+fn test_optional_ambient_no_longer_suppresses_rest_error_2073() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", ".a | (.[])? | (key, error(\"boom\"))"],
+        Some(r#"{"a":[1,2,3]}"#),
+    )?;
+    assert_eq!(code, 5);
+    assert_eq!(stdout, "0\n");
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
 
     Ok(())
 }
@@ -14025,17 +14074,18 @@ fn test_parent_n_argument_still_swallows_ordinary_error_under_optional() -> Resu
 }
 
 /// Same swallow as the test above, but with a trailing `| key` that still
-/// needs path context, so `optional=true` threads straight into `ParentN`'s
-/// own `n` evaluation (`eval_owned_expr_opt`) instead of being caught by an
-/// external `Expr::Optional` wrapper (the `rest.is_empty()` case the test
-/// above exercises). `error(...)`'s own evaluation (`eval_error`) already
-/// self-swallows to `QueryResult::None` whenever the ambient `optional` is
-/// true -- before the error ever reaches `eval_owned_expr_opt`'s own
-/// `Err(EvalEscape::Error(_)) if optional` guard -- so this still confirms
-/// the observable swallow-through-rest behavior, even though (per
-/// investigation) that specific guard line appears unreachable today: no
-/// error-raising path in this evaluator currently propagates an `Err` all
-/// the way up while `optional` is `true`.
+/// needs path context. Before #2073, `optional=true` threaded straight into
+/// `ParentN`'s own `n` evaluation (`eval_owned_expr_opt`) via this arm's old
+/// combined-with-`rest` fallback, rather than being caught by an isolated
+/// `Expr::Optional` wrapper (the `rest.is_empty()` case the test above
+/// exercises). #2073 removed that fallback -- `Expr::Optional` now isolates
+/// `inner` (`parent(has(error("x")))`) unconditionally with `optional`
+/// forced `false`, so the error inside it escapes as a genuine `Err`/
+/// `QueryResult::Error` and is caught structurally by `Expr::Optional`'s own
+/// arm instead, one level up from `ParentN`'s own match. The observable
+/// result is unchanged (still empty output, no error) since the error
+/// originates *inside* what the `?` directly wraps either way -- only the
+/// mechanism moved.
 #[test]
 fn test_parent_n_argument_error_swallow_threaded_through_rest() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -22402,13 +22452,18 @@ fn test_path_context_parent_n_argument_wrong_type_optional_1280() -> Result<()> 
     Ok(())
 }
 
-/// Same `Ok(Some(_)) if optional` swallow as the test above, but reached
-/// via `Expr::Optional`'s *other* routing branch: `key` after the `?`
-/// still needs path context, so `optional=true` threads straight into
-/// `ParentN`'s own match instead of being caught by an external wrapper
-/// (mirrors `test_string_interpolation_path_context_fanout_continues_rest_1403`'s
+/// Same `Ok(Some(_)) if optional` swallow as the test above, but reached via
+/// `Expr::Optional`'s `paired` routing (`key` after the `?` needs path
+/// context). Before #2073 this arm's old combined-with-`rest` fallback
+/// threaded `optional=true` straight into `ParentN`'s own match; #2073
+/// removed that fallback, so `ParentN`'s `n` argument now evaluates with
+/// `optional` forced `false` and its type mismatch escapes as a genuine
+/// error instead, caught structurally by `Expr::Optional`'s own arm one
+/// level up (mirrors
+/// `test_string_interpolation_path_context_fanout_continues_rest_1403`'s
 /// identical `? | key`-shaped case for the sibling `StringInterpolation`
-/// arm).
+/// arm). Same observable swallow-to-empty either way, since the type
+/// mismatch is inside what the `?` directly wraps.
 #[test]
 fn test_path_context_parent_n_argument_wrong_type_optional_threaded_through_rest_1280() -> Result<()>
 {
