@@ -20057,6 +20057,12 @@ fn update_path_steps<S: EvalSemantics>(
                     // exactly as it was, and collapse it back to `Null` too
                     // if it only existed for this write in the first place
                     // (mirrors `set_path_steps`'s own `root_was_null` check).
+                    //
+                    // `wrap_fresh` is never called on this path -- deliberate,
+                    // not just "no work needed": see its own doc comment for
+                    // why skipping it here is what makes a bad `Index` inside
+                    // `fresh` (out-of-range/negative) go unchecked, matching
+                    // real jq (#2115 code review, PR #2238).
                     let OwnedValue::Object(map) = &*root else {
                         unreachable!("already_exists only set false for an Object root")
                     };
@@ -20118,6 +20124,11 @@ fn update_path_steps<S: EvalSemantics>(
                     scalar_noop,
                 )?;
                 if !wrote && undo_stranded {
+                    // See the `Field` arm's matching comment above:
+                    // `wrap_fresh` is never called on this path either, and
+                    // that is what defers/skips any `Index` bounds check
+                    // inside `fresh` -- see `wrap_fresh`'s own doc comment
+                    // (#2115 code review, PR #2238).
                     let OwnedValue::Array(arr) = &*root else {
                         unreachable!("actual_idx was only resolved for an Array root")
                     };
@@ -20202,6 +20213,34 @@ fn fresh_run_len(steps: &[Expr]) -> usize {
 /// allocated (and therefore always-empty) `Vec`, rather than re-deriving its
 /// bounds/error handling here, so a negative index reports the exact same
 /// error a live `write_index` call would.
+///
+/// This is the *only* place an `Index` inside a fresh run is ever
+/// bounds-checked (#2115 code review, PR #2238): both of `update_path_steps`'
+/// call sites skip calling this function entirely on the `!wrote &&
+/// undo_stranded` collapse path, so an out-of-range/negative index that
+/// would have errored here is simply never checked at all when the update
+/// filter that would have used it produces no output. That is deliberate,
+/// not an oversight -- it is jq's own real model for a write-time check,
+/// generalized from the single terminal position (already documented on
+/// `update_path`'s own terminal `Expr::Index` arm, #1916) to an entire
+/// autovivified run: real jq resolves an index leniently for *reading* and
+/// only applies the write-time bounds check once a real value is actually
+/// about to land, so `null | .a[-1][1] |= empty` is `null` in real jq (no
+/// error) even though the same filter with a real write
+/// (`.a[-1][1] |= 9`) does raise "Out of bounds negative array index".
+/// Confirmed live against jq 1.7.1: this fix's own deferred timing matches
+/// that model exactly for a run reached via an *earlier* fresh `Field`/
+/// `Index` step -- see
+/// `test_update_index_bounds_check_deferred_behind_fresh_run_collapse_2115`.
+///
+/// A still-eager check remains for whichever `Index` is dispatched
+/// *directly* by `update_path_steps`' own main loop (its `resolve_setpath_index`
+/// call has to run unconditionally there, to decide fresh-vs-already-exists
+/// in the first place) -- so a *leading* out-of-range/negative index, with
+/// no preceding fresh step to sweep it into this function, still errors
+/// eagerly today (`null | .[-1][1] |= empty` still raises, unlike
+/// `null | .a[-1][1] |= empty`), matching this fix's own pre-existing
+/// behavior for that narrower shape rather than newly diverging from it.
 fn wrap_fresh(steps: &[Expr], value: OwnedValue) -> Result<OwnedValue, EvalError> {
     let mut value = value;
     for step in steps.iter().rev() {
@@ -65561,6 +65600,45 @@ mod tests {
             (
                 br#"{"a":[1,2]}"#,
                 ".a[-5].b |= 9",
+                Err("Out of bounds negative array index"),
+            ),
+        ]);
+    }
+
+    /// #2115 code review (PR #2238): the fresh-run collapse never calls
+    /// `wrap_fresh` when the update filter produces no output, so a bad
+    /// (out-of-range/negative) `Index` *inside* the run -- swept into an
+    /// earlier fresh `Field`/`Index` step's collection, never dispatched by
+    /// `update_path_steps`' own main loop -- is never bounds-checked at all,
+    /// rather than erroring. Confirmed to be an *improvement*, not a
+    /// regression: real jq (1.7.1) genuinely defers this exact check behind
+    /// whether the update filter writes, for a freshly-autovivified index,
+    /// the same way its own terminal `Expr::Index` arm already does
+    /// (`update_path`'s #1916 doc comment) -- `null | .a[-1][1] |= empty` is
+    /// `null` in real jq, live-verified, where the pre-#2115 recursive
+    /// walker (which called `write_index` unconditionally for every `Index`
+    /// component regardless of the eventual write outcome) raised "Out of
+    /// bounds negative array index" instead. `wrap_fresh`'s own doc comment
+    /// has the full mechanism and the one remaining case this fix does *not*
+    /// close (a *leading* `Index`, with no preceding fresh step, still
+    /// checks eagerly -- unaffected by this fix either way).
+    ///
+    /// yq mode is unaffected: `undo_stranded` (`S::TAG != EvalTag::Yq`) is
+    /// `false` there, so yq mode always falls through to `wrap_fresh`,
+    /// matching real yq's own stricter (always-eager) requirement.
+    #[test]
+    fn test_update_index_bounds_check_deferred_behind_fresh_run_collapse_2115() {
+        assert_outcomes(&[
+            // The confirmed improvement: no error, matching real jq.
+            (b"null", ".a[-1][1] |= empty", Ok("null")),
+            (b"null", ".a[-1][1] |= select(false)", Ok("null")),
+            // The adjacent real-write case still validates -- the deferral
+            // is specifically about *whether* to check, gated on `wrote`,
+            // never about silently accepting a bad index that is actually
+            // used.
+            (
+                b"null",
+                ".a[-1][1] |= 9",
                 Err("Out of bounds negative array index"),
             ),
         ]);
