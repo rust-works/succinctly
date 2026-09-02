@@ -19686,6 +19686,31 @@ fn test_jq_valid_multi_value_stream_unaffected_1171() -> Result<()> {
     Ok(())
 }
 
+/// #2220: a trailing-dot mantissa immediately before an exponent marker
+/// (`1.e999`) must keep its source spelling, the same way the leading-dot
+/// (#1171) and leading-zero (#1149) cases above do -- `from_number_bytes`
+/// previously had no escape for this shape, so it fell through to a lossy
+/// `f64` parse: an out-of-range exponent silently clamped to the
+/// `JqSemantics` infinity stand-in instead of the exact literal jq itself
+/// prints. Verified against the pinned oracle (`/usr/bin/jq`, jq-1.7.1);
+/// the issue's own repro table, every row.
+#[test]
+fn test_jq_trailing_dot_before_exponent_preserves_exact_literal_2220() -> Result<()> {
+    for (input, expected) in [
+        ("[1.]", "[1]"),
+        ("[1.5e3]", "[1.5E+3]"),
+        ("[1.e999]", "[1E+999]"),
+        ("[-1.e999]", "[-1E+999]"),
+        ("[1.e-999]", "[1E-999]"),
+    ] {
+        let (out, stderr, code) = run_jq_full(&["-c", "."], Some(input))?;
+        assert_eq!(code, 0, "input {input:?}: stderr {stderr:?}");
+        assert_eq!(out.trim(), expected, "input {input:?}");
+    }
+
+    Ok(())
+}
+
 /// A top-level token that only *looks* number-shaped but has no digit
 /// anywhere in its mantissa (`-e5`: `-` then `e5`, no digit before the
 /// exponent marker) must error, not silently materialize as `null` --
