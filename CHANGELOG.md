@@ -289,6 +289,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`evaluate_bytes_lazy` (the default CLI path for a non-cursor-transparent jq filter --
+  `if`/arithmetic/function calls/anything `expr_is_cursor_transparent` answers `false` for)
+  silently accepted a stray `,` inside an apparently-empty array/object, anywhere in the
+  document** (#2211): `{"a": [,]}" | if true then . else . end` printed `{"a":[]}` at exit 0,
+  where real jq and every other reading path in this codebase (the M2 fast path, the general
+  streaming path, and the `-S`/`--slurp`/`-C` fully-materializing path) already reject it —
+  confirmed against `/usr/bin/jq` 1.7.1. Root cause: `eval_generic::to_owned_cursor_at_depth`'s
+  array/object loops (the materializing conversion `eval_single`'s fallback arm uses for every
+  expression it doesn't natively match) only ever validate the delimiter *preceding a real
+  child* (#1677's `key_delimiter_ok`/`value_delimiter_ok`/`preceding_delimiter_ok` family) —
+  when the walk produces zero real children at all, none of those checks ever run, so the
+  container's own opening-to-closing gap was never inspected. Fixed with a new
+  `DocumentCursor::container_gap_ok` method (default `true` for every format but JSON, same
+  convention as `preceding_delimiter_ok`), whose JSON override reuses the exact same
+  `trailing_gap_ok` primitive `src/json/light.rs`'s `stream_json`/`stream_json_pretty` and
+  `src/bin/succinctly/jq_runner.rs`'s `print_json` already use for their own #1676 fix — one
+  gap-scanning definition, now three call sites instead of two. Verified no behavior change on
+  well-formed input (full existing suite plus a 100 KB generated-JSON differential sweep against
+  `/usr/bin/jq` 1.7.1, byte-identical) and that the fix reaches every nesting depth, not just the
+  top level (`to_owned_cursor_at_depth` recurses via cursor at every container level). A related
+  but distinct shape — a trailing comma after a *real* scalar last child (`[1,]`, `{"a":1,}`),
+  needing the last child's own text-end position rather than the container's opening position —
+  is a known, still-open gap on this same path, filed as #2243 and pinned by
+  `test_jq_lazy_path_trailing_comma_after_scalar_last_child_still_a_known_gap_2243` rather than
+  left silently uncovered.
+
 - **`|=`/`+=`/other compound assignment operators, and `del()`, could crash the process on a
   sufficiently long chained path** (`.k0.k1.k2...` or `del(.k0.k1.k2...)`, #2115) — a
   sufficiently long chain put one native stack frame on every path component, `SIGKILL` at
