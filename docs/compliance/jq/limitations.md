@@ -512,42 +512,63 @@ used to be a third, narrower gap, found reviewing
 `resolve_reduce`/`resolve_foreach` arms to `resolve_node` (`src/jq/eval.rs`) modeling jq's
 own `(path, value_at_path)` register, derived empirically since real jq has no fold-specific
 path machinery at all (`reduce`/`foreach` are sugar over the same variable-binding primitive
-every other construct uses). Three narrower shapes remain open, **all of them refuse-only**
-— succinctly declines a filter jq accepts, visibly (exit 5) and without touching any
-document. There used to be a fourth that ran the other way, accepting a filter jq rejects so
+every other construct uses). Three narrower shapes were tracked below; #2046 closed the
+headline example of the first, leaving a smaller residue in its place. Every remaining piece
+across all three is **refuse-only** — succinctly declines a filter jq accepts, visibly
+(exit 5) and without touching any document. There used to be a fourth that ran the other
+way, accepting a filter jq rejects so
 that `=`/`|=`/`del()` wrote where jq raises;
 [#1466](https://github.com/rust-works/succinctly/issues/1466) closed it, and shape #3 below
 is the price it paid. Refusing is the safe direction: [#985](https://github.com/rust-works/succinctly/issues/985)
 is the revert that established what the other one costs.
 
-1. **Variable-rooted navigation off a mismatched accumulator** —
-   `path(. as $x \| foreach (1,2) as $i (0; $x.a; .b))` on `{"a":{"b":1},"c":2}` is
-   `["a","b"]` ×2 in jq; succinctly refuses.
+1. **Variable-rooted navigation off a mismatched accumulator** — **closed by
+   [#2046](https://github.com/rust-works/succinctly/issues/2046)** for the shape that gave
+   this entry its name: `path(. as $x \| foreach (1,2) as $i (0; $x.a; .b))` on
+   `{"a":{"b":1},"c":2}` now answers `["a","b"]` ×2, matching jq, instead of refusing.
 
-   The *plain-pipe* half of this shape is closed.
+   The *plain-pipe* half of this shape closed first.
    [#1573](https://github.com/rust-works/succinctly/issues/1573) established that jq carries
    a `(path, value_at_path)` **register** which only navigation advances — a literal never
    moves it, so a `$var` frozen from where it still points steps back onto it — and
-   `resolve_seq` now threads that register (`PathBranch::register`,
-   `reestablishes_register`, `src/jq/eval.rs`). `path(. as $x \| 5 \| $x.a)` on `{"a":1}`,
-   which this list previously recorded as refusing, answers `["a"]` like jq.
+   `resolve_seq` threads that register (`PathBranch::register`,
+   `reestablishes_register`, `src/jq/eval.rs`). `path(. as $x \| 5 \| $x.a)` on `{"a":1}`
+   answers `["a"]` like jq. [`FoldRegister`](../../../src/jq/eval.rs) (the fold's *own*
+   register) had no way to reach that same mechanism, because it is seeded from *outside*
+   any one `resolve_seq` call — `FoldRegister::resolve` had nothing to hand `resolve_seq` to
+   seed its first stage from. #2046 added exactly that: `resolve_seq` takes an extra
+   `register: Option<&'a OwnedValue>` parameter, consulted only when seeding its own fan-out
+   loop's first branch (mirroring how it already seeds `trackable`/`snapshot`), and
+   `FoldRegister::resolve` supplies `self.value` there whenever `UPDATE`/`EXTRACT` is (under
+   any wrapping `Paren`) an `Expr::Pipe` — the shape `$x.a`, `$x.a.b`, `$x[0]`, `5 \| $x.a`,
+   ... all parse into. Once seeded, the *existing*, already-oracle-verified stage-to-stage
+   carrying (`reestablishes_register`/`carry_register`, both from #1573/#2041/#2044) takes
+   over unchanged — #2046 adds a new *source* for the carried register, not a new rule for
+   recognising it. A bare `$var` with nothing chained after it needed none of this: it was
+   already reestablishing directly through `FoldRegister::relocate`'s own `identical()` check.
 
-   What remains here is that [`FoldRegister`](../../../src/jq/eval.rs) does not seed *its*
-   register into the resolution of its own `UPDATE`/`EXTRACT`: the accumulator (`0`) is
-   resolved with tracking already off and no register to compare against, so `$x.a` cannot
-   re-establish the way it does in a plain pipe. Closing it means threading the register
-   into `resolve_node`/`resolve_leaf` as a parameter rather than carrying it on the branch,
-   which is a materially larger change across that function's ~20-call-site dispatch graph.
+   **Scope limit, deliberately not closed**: the register is threaded only as far as
+   `resolve_seq`'s own seed — a `$var` reference nested *inside* `if`/`try`/`select`/an
+   alternative/a construction at UPDATE or EXTRACT's own top level still refuses, because
+   `resolve_node`'s own recursive dispatch (the ~20-call-site graph the original design note
+   here estimated threading through) was deliberately left untouched. Confirmed live:
+   `path(. as $x \| foreach (1) as $i (0; if true then $x.a else 1 end; .))` on
+   `{"a":{"b":1},"c":2}` is `["a"]` in jq; succinctly still refuses. Widening this further
+   would mean the fuller ~20-call-site threading the original note described, with its own
+   oracle matrix per arm — left for a follow-up rather than attempted alongside the
+   already-substantial change above.
 
    The register is also carried **only across stages this resolver can prove did not move
-   it** (`cannot_move_register`, `src/jq/eval.rs`). jq's register advances on any `INDEX`
-   its own bytecode executes, which includes the ones hidden inside a jq-*defined* builtin
-   (`first` is `.[0]`, `add` is `reduce .[] as $x ...`) or a user function body — stages
-   that reach the resolver as one opaque computed value. Assuming those left the register
-   alone made `path(. as $x \| ([.a]\|first) \| $x)` answer `[]` where jq refuses, and
-   `=`/`|=`/`del()` then wrote through the fabricated path, so the allowlist is deliberately
-   narrow and everything outside it drops the register. Three shapes jq answers therefore
-   refuse here: a construction or interpolation that itself navigates
+   it** (`cannot_move_register`, `src/jq/eval.rs`) — the same allowlist now gates both
+   `resolve_seq`'s plain-pipe carrying *and* #2046's fold-seeded carrying, since both reach
+   the identical stage-to-stage machinery. jq's register advances on any `INDEX` its own
+   bytecode executes, which includes the ones hidden inside a jq-*defined* builtin (`first`
+   is `.[0]`, `add` is `reduce .[] as $x ...`) or a user function body — stages that reach
+   the resolver as one opaque computed value. Assuming those left the register alone made
+   `path(. as $x \| ([.a]\|first) \| $x)` answer `[]` where jq refuses, and `=`/`|=`/`del()`
+   then wrote through the fabricated path, so the allowlist is deliberately narrow and
+   everything outside it drops the register. Three shapes jq answers therefore refuse here:
+   a construction or interpolation that itself navigates
    (`path(. as $x \| [.a] \| $x)`, `{k:.a}`, `"\(.a)"` — excluded because jq *also* raises
    for a `.a` applied to a computed value, which this resolver never sees inside a
    construction: `path(. as $x \| {k:.a} \| [.a] \| $x)` raises in jq on the second `.a`),
@@ -574,6 +595,25 @@ is the revert that established what the other one costs.
    answer would become) rather than merely refuse, which is the direction ADR-0018 never
    permits. Refuse-only for yq mode remains pre-existing and tracked the same way the three
    shapes above are.
+
+   **#2046 review finding, also closed**: `FoldRegister::advance` — which builds `foreach`'s
+   per-step `EXTRACT` register from `UPDATE`'s own output — carried its *pre-UPDATE* register
+   forward unconditionally whenever `UPDATE`'s own branch ended untracked, without checking
+   whether `UPDATE`'s own expression could have moved jq's real register along the way. That
+   was already live on `main`, reachable through `FoldRegister::relocate`'s pre-existing
+   `identical()` check without needing #2046's own new register-seeding at all — differential
+   fuzzing found it independently on a pre-#2046 build (1, 3 and 4 fabrications across three
+   4,000-shape seeds, always the same shape): `path(. as $x \| foreach (1,2,3) as $k (null;
+   try $x.c catch 1; select(true) \| $x))` on `{"a":"s","c":"s"}` printed `[]` three times
+   where jq raises "Invalid path expression with result {\"a\":\"s\",\"c\":\"s\"}" — `try
+   $x.c catch 1` attempts (and jq's real bytecode executes) a genuine `INDEX` on `$x` before
+   the error is caught, which moves jq's real `value_at_path` regardless of the `catch`.
+   Fixed by gating `advance`'s carry-forward on `cannot_move_register(update_expr)`, the same
+   allowlist described above — bundled with #2046 rather than filed separately since it sits
+   in the exact function #2046's own fix required understanding in full, and #2046's own
+   verification requirement (a direction-classified differential fuzz showing zero new
+   accept-where-jq-refuses cases) would not have been satisfiable while leaving a *known*
+   instance of exactly that class in the same subsystem.
 
    Separately, a variable bound from a *navigated* position (`.a as $y`) still carries no
    marker at all, because `substitute_var_tracked` remains gated on

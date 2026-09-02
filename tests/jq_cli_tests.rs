@@ -30896,3 +30896,162 @@ fn test_reduce_source_navigation_does_not_clobber_persistent_register_2031() -> 
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
     Ok(())
 }
+
+/// #2046's own primary repro: `FoldRegister` knew where its own register
+/// was but never exposed it to UPDATE/EXTRACT's own resolution -- `$x`
+/// (bound *outside* the fold, via `. as $x`) is substituted in as
+/// `Expr::TrackedVar`, but `$x.a`'s own `.a` step had no register to
+/// reestablish against, so it raised `#843`'s "near attempt" error instead
+/// of navigating. The equivalent plain pipe already worked since #2041
+/// (`path(. as $x | 5 | $x.a)` is `["a"]`); this is the fold-specific half.
+/// Verified against jq 1.7.1: `["a","b"]` printed twice (one per `foreach`
+/// element), exit 0.
+#[test]
+fn test_foreach_update_reestablishes_outer_bound_register_2046() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(. as $x | foreach (1,2) as $i (0; $x.a; .b))"],
+        Some(r#"{"a":{"b":1},"c":2}"#),
+    )?;
+    assert_eq!(
+        stdout, "[\"a\",\"b\"]\n[\"a\",\"b\"]\n",
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #2046 negative control: a *bare* `$x` (nothing chained after it)
+/// referenced inside a fold's UPDATE already resolved correctly before
+/// #2046, via `FoldRegister::relocate`'s own direct `identical()` check --
+/// this guards that #2046's new `resolve_seq`-based dispatch for `$x.a`-
+/// style chains didn't regress that pre-existing, unrelated path. Verified
+/// against jq 1.7.1: `[]` printed twice, exit 0 (the register never leaves
+/// the document root, since `INIT = 0` is a literal and `$x` itself is the
+/// whole document).
+#[test]
+fn test_foreach_bare_trackedvar_inside_fold_still_tracks_2046() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(. as $x | foreach (1,2) as $i (0; $x))"],
+        Some(r#"{"a":{"b":1},"c":2}"#),
+    )?;
+    assert_eq!(stdout, "[]\n[]\n", "stderr: {stderr:?}");
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #2046 negative control, the dangerous direction: `SOURCE`'s own
+/// navigation (`.a` then `.c`) moves the fold's persistent register onto
+/// `.c`'s own position each iteration -- `$x` is still frozen at the
+/// document *root*, a value that is structurally equal to neither `.a` nor
+/// `.c`'s own subtree here, so nothing should reestablish. This is the
+/// fold-context analogue of #2041's own `path(.a as $y | .c | $y)`
+/// counter-example (equal *value*, different *node*, refused by real jq
+/// because `jv_identical` is pointer identity, not structural equality) --
+/// #2046 must not widen acceptance into that same accept-where-jq-refuses
+/// class just because it now threads a register through `resolve_seq` for
+/// fold UPDATE/EXTRACT. Verified against jq 1.7.1: raises "Invalid path
+/// expression with result {"a":{"b":1},"c":{"b":1}}", exit 5 -- the
+/// assertion below only checks the message's first 11 bytes since
+/// succinctly's own `dump_truncated` (`DUMP_KEEP`, `src/jq/error.rs`)
+/// truncates this particular message shape far sooner than real jq does
+/// (a separate, pre-existing wording-length gap unrelated to this fix,
+/// filed as #2179).
+#[test]
+fn test_foreach_extract_equal_value_different_node_still_refuses_2046() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(. as $x | foreach (1,2) as $i (.a; .c; $x))"],
+        Some(r#"{"a":{"b":1},"c":{"b":1}}"#),
+    )?;
+    assert_eq!(stdout, "", "must not emit a path: stderr: {stderr:?}");
+    assert!(
+        stderr.contains(r#"Invalid path expression with result {"a":{"b":1"#),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #2046's `reduce` companion to the primary `foreach` repro: `reduce`'s
+/// own persistent register moves onto `.a`'s own path after the first
+/// iteration's `$x.a` navigates there (the accumulator becomes `{"b":1}`,
+/// itself now sitting *at* the register), so the *second* iteration's
+/// `$x.a` compares the frozen `$x` (still the whole document root) against
+/// the *current* register position (`.a`, value `{"b":1}`) -- not equal,
+/// so it correctly raises rather than reestablishing a second time. This
+/// pins the distinction between `FoldRegister::resolve`'s injected
+/// register (`self.value`, fixed at INIT time) and `resolve_leaf`'s own
+/// ambient-value recording (the accumulator's *current* position, used
+/// whenever the incoming step is already `tr == true`) -- #2046's fix
+/// composes with the existing per-step mechanism instead of overriding it.
+/// Verified against jq 1.7.1: raises "Invalid path expression with result
+/// {\"b\":1}" on the second iteration, exit 5.
+#[test]
+fn test_reduce_second_iteration_register_moved_by_first_still_refuses_2046() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(. as $x | reduce (1,2) as $i (0; $x.a))"],
+        Some(r#"{"a":{"b":1},"c":2}"#),
+    )?;
+    assert_eq!(stdout, "", "must not emit a path: stderr: {stderr:?}");
+    assert!(
+        stderr.contains(r#"Invalid path expression with result {"b":1}"#),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #2046 write-side companion: once `path()` can resolve `$x.a` inside a
+/// fold's UPDATE, `=`/`|=`/`del()` all route through the same resolver, so
+/// this exercises the actual document write rather than just `path()`'s
+/// own report. Verified against jq 1.7.1: `{"a":{"b":99},"c":2}`, exit 0.
+#[test]
+fn test_foreach_update_reestablished_register_supports_a_write_2046() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "(. as $x | foreach (1,2) as $i (0; $x.a; .b)) = 99"],
+        Some(r#"{"a":{"b":1},"c":2}"#),
+    )?;
+    assert_eq!(stdout, "{\"a\":{\"b\":99},\"c\":2}\n", "stderr: {stderr:?}");
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #2046 review finding, closed alongside the primary fix (not a
+/// consequence of it): an UPDATE branch ending *untracked* is not the same
+/// thing as an UPDATE that never navigated -- `try $x.c catch 1` attempts
+/// (and jq's real bytecode executes) a genuine `INDEX` on `$x` before the
+/// error is caught, which moves jq's real `value_at_path` regardless of the
+/// `catch`. `FoldRegister::advance` used to carry the pre-UPDATE register
+/// forward unconditionally whenever UPDATE's own branch was untracked --
+/// already reachable on `main` *before* #2046, through
+/// `FoldRegister::relocate`'s own pre-existing `identical()` check (no
+/// register-seeding from #2046 required): the differential fuzzer this
+/// issue's own verification requires found this exact shape fabricating on
+/// a pre-#2046 build across three separate 4,000-shape seeds (1, 3 and 4
+/// occurrences respectively), always this same root cause. Fixed by gating
+/// `advance`'s carry-forward on `cannot_move_register(update_expr)`, the
+/// same oracle-verified allowlist `resolve_seq`'s own stage-to-stage
+/// carrying already uses. Verified against jq 1.7.1: raises "Invalid path
+/// expression with result {"a":"s","c":"s"}", exit 5 -- `main` (both
+/// before and after #2046's own register-seeding change, absent this
+/// guard) printed `[]` three times, exit 0. The assertion below only
+/// checks the message's first 11 bytes since succinctly's own
+/// `dump_truncated` (`DUMP_KEEP`, `src/jq/error.rs`) truncates this
+/// particular message shape far sooner than real jq does (a separate,
+/// pre-existing wording-length gap unrelated to this fix, filed as #2179).
+#[test]
+fn test_foreach_advance_does_not_carry_register_past_a_caught_navigation_2046() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "path(. as $x | foreach (1,2,3) as $k (null; try $x.c catch 1; select(true) | $x))",
+        ],
+        Some(r#"{"a":"s","c":"s"}"#),
+    )?;
+    assert_eq!(stdout, "", "must not emit a path: stderr: {stderr:?}");
+    assert!(
+        stderr.contains(r#"Invalid path expression with result {"a":"s","c"#),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    Ok(())
+}

@@ -20704,7 +20704,9 @@ fn resolve_node<'a, S: EvalSemantics>(
     keep: Keep,
 ) -> PathResolveResult<'a> {
     match expr {
-        Expr::Pipe(exprs) => resolve_seq::<S>(exprs, value, trackable, snapshot, keep),
+        // `None`: an ordinary pipe has no externally-known register to
+        // inject (#2046) — see `resolve_seq`'s own doc comment.
+        Expr::Pipe(exprs) => resolve_seq::<S>(exprs, value, trackable, snapshot, keep, None),
         Expr::Paren(inner) => resolve_node::<S>(inner, value, trackable, snapshot, keep),
 
         // #1371: `path(f)` has to see *through* a call to whatever its body
@@ -22722,6 +22724,31 @@ impl FoldRegister {
     /// `relocate` (a freshly-built object, no snapshot, no path) could
     /// still make this step's own bare `.` look genuinely trackable,
     /// reopening #1466's bug class through this second call site.
+    ///
+    /// **#2046**: when `expr` is (under any wrapping `Paren`) an
+    /// `Expr::Pipe`, this dispatches straight to [`resolve_seq`] with
+    /// `self.value` threaded in as its externally-known register — rather
+    /// than through the ordinary `resolve_against_cow`/`resolve_node`
+    /// route, which has no parameter for one at all. That register is what
+    /// lets a `$var` bound *outside* this fold (substituted in as
+    /// `Expr::TrackedVar`, wherever it appears in UPDATE/EXTRACT) still
+    /// navigate — `path(. as $x | reduce (1) as $i (0; $x.a))` needs `.a`
+    /// to reestablish against `self.value`, the fold's own persistent
+    /// register, not the transient accumulator `tr`/`snapshot` already
+    /// describe. `tr` alone cannot express this: it says whether the
+    /// accumulator *itself* is currently sitting at the register, which
+    /// `INIT = 0` here already answered `false` — exactly the case
+    /// [`resolve_seq`]'s own carried-register mechanism (#1573/#2041)
+    /// exists to recover from, just never wired to a fold's register until
+    /// now. A bare `$var` (no chain after it) needs none of this: it
+    /// resolves to a single untracked, snapshot-marked branch that
+    /// `relocate`'s own `identical()` check below already recognises
+    /// directly, register or not. Every other shape a `$var` might be
+    /// nested inside here — `if`/`try`/`select`/a construction/... — falls
+    /// to the unmodified `resolve_node` call, exactly as before #2046: a
+    /// known, syntactic scope limit (not every arm of `resolve_node`
+    /// threads this register), costing a refusal rather than risking a
+    /// wrong acceptance. See issue #2046.
     fn resolve<'a, S: EvalSemantics>(
         &self,
         expr: &Expr,
@@ -22731,7 +22758,32 @@ impl FoldRegister {
         keep: Keep,
     ) -> PathResolveResult<'a> {
         let tr = self.trackable && at_register;
-        match resolve_against_cow::<S>(expr, Cow::Owned(input), tr, snapshot, keep) {
+        let resolved = if let Expr::Pipe(exprs) = unwrap_paren(expr) {
+            resolve_seq::<S>(
+                exprs,
+                &input,
+                tr,
+                snapshot,
+                keep,
+                self.trackable.then_some(&self.value),
+            )
+        } else {
+            resolve_node::<S>(expr, &input, tr, snapshot, keep)
+        };
+        let owned = match resolved {
+            Ok(branches) => Ok(branches
+                .into_iter()
+                .map(PathBranch::into_owned_value)
+                .collect()),
+            Err((prefix, e)) => Err((
+                prefix
+                    .into_iter()
+                    .map(PathBranch::into_owned_value)
+                    .collect(),
+                e,
+            )),
+        };
+        match owned {
             Ok(branches) => Ok(self.relocate(branches)),
             Err((prefix, e)) => Err((self.relocate(prefix), e)),
         }
@@ -22785,26 +22837,71 @@ impl FoldRegister {
     /// "re-entry" boundary between them, unlike the reset between source
     /// elements — see this type's own doc comment).
     ///
-    /// An untracked UPDATE branch leaves the register unchanged (not
-    /// reset to untracked) — a computed UPDATE result doesn't erase where
-    /// the register already was, mirroring `enter`'s identical "computed
-    /// doesn't move the register" rule for INIT. Confirmed live:
-    /// `path(. as $x | foreach (1) as $i (0; 5; $x))` is `[]` — UPDATE=`5`
-    /// never navigates, so the register EXTRACT sees is still wherever it
-    /// was before UPDATE ran (the document root, from `enter`'s untracked
-    /// branch), letting `$x` (bound from that same root) match.
-    fn advance(&self, branch: &PathBranch<'_>) -> Self {
+    /// An untracked UPDATE branch *whose own expression is provably unable
+    /// to have moved jq's register* ([`cannot_move_register`]) leaves the
+    /// register unchanged (not reset to untracked) — a computed UPDATE
+    /// result doesn't erase where the register already was, mirroring
+    /// `enter`'s identical "computed doesn't move the register" rule for
+    /// INIT. Confirmed live: `path(. as $x | foreach (1) as $i (0; 5;
+    /// $x))` is `[]` — UPDATE=`5` never navigates, so the register EXTRACT
+    /// sees is still wherever it was before UPDATE ran (the document root,
+    /// from `enter`'s untracked branch), letting `$x` (bound from that same
+    /// root) match.
+    ///
+    /// **#2046 review finding — pre-existing on `main`, not a consequence of
+    /// #2046's own change**: an untracked UPDATE branch is not the same
+    /// thing as an UPDATE that never navigated — `try $x.c catch 1` ends
+    /// untracked (the `catch` branch, a plain literal) but its own body did
+    /// attempt (and jq's real bytecode did execute) a genuine `INDEX` on
+    /// `$x` before the error was caught, which moves jq's real
+    /// `value_at_path` regardless of the `catch`. Before this gate, this
+    /// function carried `self` (wherever the register was *before* UPDATE
+    /// ran) forward unconditionally whenever `branch` was untracked, and
+    /// that was already reachable through [`FoldRegister::relocate`]'s own
+    /// pre-existing `identical()` check — which consults exactly `self`
+    /// (this type's own `value`/`trackable`, i.e. `advance`'s own return
+    /// value threaded in as `extract_reg`) once EXTRACT's own resolution
+    /// finishes, with no dependency on #2046's own `resolve_seq` register
+    /// injection at all. Differential fuzzing against jq 1.7.1, run against
+    /// a build *without* #2046's own change as a baseline check, still
+    /// found it: `path(. as $x | foreach (1,2,3) as $k (null; try $x.c
+    /// catch 1; select(true) | $x))` on `{"a":"s","c":"s"}` answered `[]`
+    /// three times here where jq raises "Invalid path expression with
+    /// result {...}" (`select(true)` also drops the register itself,
+    /// `cannot_move_register(Select)` being `false`, but the fabrication
+    /// originates one step earlier, at this function, independent of that).
+    /// Reusing [`cannot_move_register`] — already the exact, oracle-verified
+    /// allowlist [`resolve_seq`]'s own stage-to-stage carrying uses for this
+    /// identical question — is what closes it: only a
+    /// syntactically-provable-safe UPDATE (a literal, `$var`, arithmetic
+    /// over safe operands, ...) still carries `self` forward; anything else
+    /// (including a `try`/`select`/`reduce`/call that *might* have
+    /// navigated, caught or not) loses the register entirely. Losing it
+    /// only costs a refusal; keeping it risks the accept-where-jq-refuses
+    /// class #1466 closed. Bundled with #2046 rather than filed separately:
+    /// it lives in the exact function #2046's own fix required
+    /// understanding in full, and #2046's own verification requirement (a
+    /// direction-classified differential fuzz showing zero
+    /// accept-where-jq-refuses cases) is not satisfiable while a known
+    /// instance of that exact class sits live in the same subsystem.
+    fn advance(&self, branch: &PathBranch<'_>, update_expr: &Expr) -> Self {
         if branch.trackable {
             Self {
                 path: Rc::clone(&branch.path),
                 value: branch.value.clone().into_owned(),
                 trackable: true,
             }
-        } else {
+        } else if cannot_move_register(update_expr) {
             Self {
                 path: Rc::clone(&self.path),
                 value: self.value.clone(),
                 trackable: self.trackable,
+            }
+        } else {
+            Self {
+                path: PathPrefix::root(),
+                value: OwnedValue::Null,
+                trackable: false,
             }
         }
     }
@@ -23415,7 +23512,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                         aborted = Some(control);
                         break 'input;
                     }
-                    let extract_reg = active_reg.advance(update_branch);
+                    let extract_reg = active_reg.advance(update_branch, substituted_update);
                     // `update_branch` is itself already relocated (it's
                     // `active_reg.resolve()`'s own output above), and
                     // `advance()` built `extract_reg` from this same
@@ -25005,12 +25102,30 @@ fn carry_register<'a>(
 /// *its* position, which is the document root only when it sits at the top of
 /// the path. `path(.x | .a[.k])` resolves `.k` against `.x`, giving
 /// `["x","a","a"]`.
+///
+/// `register` (#2046) is an *externally known* path register, distinct from
+/// the one this function's own fan-out loop already carries stage-to-stage
+/// via each [`PathBranch`]'s own `register` field (#1573/#2041) — this
+/// parameter is what seeds that mechanism in the first place, for the one
+/// caller that has a register from *outside* this call to inject:
+/// [`FoldRegister::resolve`], which has no other way to make a fold's own
+/// persistent register visible to a `$var` reference chained inside
+/// UPDATE/EXTRACT (`. as $x | reduce ... (0; $x.a; ...)` — see that
+/// function's own doc comment). `resolve_node`'s ordinary `Expr::Pipe` arm
+/// passes `None`: an ordinary pipe has no such outside register, only
+/// whatever it establishes for itself.
+///
+/// Only ever consulted at the seed branch below, mirroring `trackable`/
+/// `snapshot`: once seeded, `reestablishes_register`/`carry_register`'s
+/// already-tested stage-to-stage rules take over unchanged, so this adds one
+/// new *source* for the carried register, not a new rule for recognising it.
 fn resolve_seq<'a, S: EvalSemantics>(
     exprs: &[Expr],
     value: &'a OwnedValue,
     trackable: bool,
     snapshot: bool,
     keep: Keep,
+    register: Option<&'a OwnedValue>,
 ) -> PathResolveResult<'a> {
     let mut flat = Vec::new();
     for e in exprs {
@@ -25114,12 +25229,26 @@ fn resolve_seq<'a, S: EvalSemantics>(
     // The seed also inherits this call's own ambient `snapshot` (#1591), for
     // the identical reason it inherits `trackable`: it is `value` itself,
     // unchanged, before the first stage below ever runs.
+    //
+    // `register` (#2046) is attached the same way `PathBranch::with_register`
+    // always requires: only while `!trackable`, since a trackable seed's
+    // register is its own value at its own path and needs no second copy —
+    // `with_register` would otherwise `debug_assert!`. This is the one spot
+    // an externally-supplied register (from `FoldRegister::resolve`) enters
+    // the stage-to-stage carrying mechanism below; every subsequent stage
+    // reads it as `carried_register`, exactly as it already would for a
+    // register `resolve_leaf` established from inside this same call.
     let mut branches: Vec<PathBranch<'a>> = vec![PathBranch::passthrough(
         PathPrefix::root(),
         Cow::Borrowed(value),
         trackable,
         snapshot,
-    )];
+    )
+    .with_register(if trackable {
+        None
+    } else {
+        register.map(Cow::Borrowed)
+    })];
     // Set the first time any stage's branch escapes, and overwritten by any
     // later stage's own escape (#1013) — mirroring the pre-existing "a later
     // step's own failure outranks an earlier deferred one" rule this
@@ -72408,25 +72537,25 @@ mod tests {
     /// `trackable`), so nothing ever exercised what happens when `f`
     /// *itself* fails to navigate from one. Both sides still refuse (exit
     /// 5, no output either way — `reduce` only ever emits its final
-    /// accumulator, so there is no partial prefix to lose either) — only
-    /// the wording differs. jq reports the ordinary `#530` "with result"
-    /// message naming the value `f` produced (`1`, from `.a` on `$x`'s
-    /// value), where succinctly reports `#843`'s "near attempt to access
-    /// element" message instead, since `resolve_leaf`'s own untracked-Field
-    /// guard fires before `resolve_recurse`'s per-node `trackable`
-    /// propagation is ever consulted. Left as a follow-up rather than
-    /// chased here: both messages already say "refused," so there is no
-    /// silent-acceptance risk, only a wording mismatch in an edge case that
-    /// needed this fix's own guard change to become reachable at all.
+    /// accumulator, so there is no partial prefix to lose either).
+    ///
+    /// **Closed by #2046**, incidentally rather than deliberately: `$x |
+    /// recurse(.a?)` is `Expr::Pipe([TrackedVar, RecurseF(...)])`, exactly
+    /// the shape `FoldRegister::resolve` now threads its register into (see
+    /// that function's own doc comment). `$x` reestablishes against the
+    /// fold's register (the document root), so `recurse(.a?)` now runs with
+    /// genuine `trackable: true` instead of hitting `resolve_leaf`'s
+    /// untracked-`Field` guard before `resolve_recurse` is ever reached —
+    /// and *that* is what produces jq's own `#530` "with result 1" wording
+    /// (`.a` on `$x`'s value, `1`, is not itself a further path-shaped
+    /// value) instead of `#843`'s "near attempt" message. Confirmed live
+    /// against jq 1.7.1: byte-identical message and exit code.
     #[test]
     fn test_resolve_recurse_field_navigation_into_snapshot_wording_gap_1591() {
         query!(br#"{"a":1}"#,
             "path(. as $x | reduce (1) as $i (0; $x | recurse(.a?)))",
             QueryResult::Error(e) => {
-                assert_eq!(
-                    e.message,
-                    r#"Invalid path expression near attempt to access element "a" of {"a":1}"#
-                );
+                assert_eq!(e.message, r"Invalid path expression with result 1");
             }
         );
     }
