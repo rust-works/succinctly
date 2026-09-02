@@ -34082,6 +34082,39 @@ fn get_value_at_path(value: &OwnedValue, path: &[OwnedValue]) -> Option<OwnedVal
             arr.get(index)
                 .and_then(|v| get_value_at_path(v, &path[1..]))
         }
+        // A slice path component, `{"start":s,"end":e}` (#2215) -- re-slices
+        // the container the same way `builtin_getpath`'s own Array/String/
+        // yq-Object arms do, via the same shared `SliceBounds` this file
+        // already uses everywhere else a runtime descriptor is resolved, so
+        // ancestor re-derivation can't disagree with what was actually
+        // sliced. Without this, `parent`/`parent(n)` landed on a path that
+        // passed through a slice fabricated an empty object instead of
+        // re-deriving the real ancestor.
+        //
+        // The yq-Object arm below isn't gated on `S::TAG == EvalTag::Yq`
+        // the way `builtin_getpath`'s own is: this function has no `S`
+        // parameter, and doesn't need one here -- in jq mode a slice can
+        // never successfully read an *object* target in the first place
+        // (`slice_owned_value_read` errors there), so no path this function
+        // is ever called with can pair a slice-descriptor component with an
+        // object-shaped value unless that slice really was taken in yq
+        // mode.
+        (OwnedValue::Object(desc), OwnedValue::Array(arr)) => {
+            let bounds = SliceBounds::from_descriptor(desc).ok()?;
+            let sliced = OwnedValue::Array(arr[bounds.resolve(arr.len())].to_vec());
+            get_value_at_path(&sliced, &path[1..])
+        }
+        (OwnedValue::Object(desc), OwnedValue::String(s)) => {
+            let bounds = SliceBounds::from_descriptor(desc).ok()?;
+            let range = bounds.resolve(s.chars().count());
+            let sliced = OwnedValue::String(slice::slice_str(s, range));
+            get_value_at_path(&sliced, &path[1..])
+        }
+        (OwnedValue::Object(desc), OwnedValue::Object(map)) => {
+            let bounds = SliceBounds::from_descriptor(desc).ok()?;
+            let sliced = slice_object_children_at(map, bounds.resolve_object_children(map.len()));
+            get_value_at_path(&sliced, &path[1..])
+        }
         _ => None,
     }
 }
