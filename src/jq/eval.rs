@@ -2239,8 +2239,17 @@ where
     B: FnMut(OwnedValue) -> QueryResult<'a, W>,
 {
     if !matches!(fanout, ArgFanout::All) {
+        // #2023: `stream_outputs_checked`, not `stream_outputs` -- this
+        // eager path (every non-`All` gate, i.e. every yq-mode builtin
+        // routed through `ArgFanout::yq_native`/`reject_many_in_yq`/etc.)
+        // shares the identical #1746-shaped bug the `All` lazy sink above
+        // was fixed for: `stream_outputs`'s own fold uses unchecked
+        // `to_owned` via `QueryResult::collect_owned`, silently substituting
+        // `""` for an undecodable argument instead of raising. Confirmed
+        // live: `succinctly yq 'has(.b)'` on an undecodable `.b` answered
+        // `false` instead of raising, pre-fix.
         let (mut args, trailing) =
-            stream_outputs(eval_single::<W, S>(arg_expr, value.clone(), optional));
+            stream_outputs_checked(eval_single::<W, S>(arg_expr, value.clone(), optional));
         if clear_values_when_yq_argument_escaped(&mut args, &trailing) {
             // Fall through with no values: the `match trailing` below turns
             // the escape into a bare `Error`/`Break`/`Halt`.
@@ -2280,7 +2289,7 @@ where
         // #1746-shaped bug, in this lazy sink specifically). Same
         // flush-then-stop shape as `body`'s own escape below -- a buffered
         // first result must be flushed ahead of this control too.
-        let owned = match item_to_owned_checked(item) {
+        let owned = match item.into_owned_checked() {
             Ok(v) => v,
             Err(e) => {
                 if let Some(previous) = pending_first.take() {
@@ -2499,9 +2508,18 @@ fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Convert one [`Item`] delivered by [`eval_each`] into the owned value a
-/// fan-out `body` takes. The borrowed arm is what `stream_outputs`'
-/// `collect_owned` did in the eager path, hoisted so both lazy drivers
-/// share one definition.
+/// fan-out `body` takes, **silently substituting `""` for an undecodable
+/// borrowed string instead of raising** (the #1746 bug shape).
+///
+/// **Safe only where the decoded value's content is never read** -- the
+/// only remaining callers are `eval_range`'s `from`/`to`/`step`
+/// conversions, which immediately classify the result as Int/Float-vs-error
+/// via `range_num` and never inspect a decoded string's actual bytes (#2023
+/// audit). Every other caller that reads the decoded value as real data was
+/// migrated to [`Item::into_owned_checked`] by #2023 (`fanout_arg`'s and
+/// `fanout_two_args_lazy`'s own generator-argument sinks -- this function's
+/// prior callers). A new caller that reads string content must use
+/// `into_owned_checked` instead, not this function.
 fn item_to_owned<W: Clone + AsRef<[u64]>>(item: Item<'_, W>) -> OwnedValue {
     match item {
         Item::Owned(v) => v,
@@ -2509,19 +2527,21 @@ fn item_to_owned<W: Clone + AsRef<[u64]>>(item: Item<'_, W>) -> OwnedValue {
     }
 }
 
-/// [`to_owned_checked`]-backed twin of [`item_to_owned`] (#2023): raises a
-/// decode failure instead of silently substituting `""` for an undecodable
-/// `Item::Borrowed` string -- the same #1746 bug shape, here in
-/// `fanout_arg`'s lazy generator-argument sink. `Item::Owned` is already
-/// materialized (came from a variable binding or a computed value, not a
-/// fresh document decode), so there's nothing to check there, same as
-/// `item_to_owned`'s own `Owned` arm.
-fn item_to_owned_checked<W: Clone + AsRef<[u64]>>(
+/// Decode one [`fanout_two_args_lazy`] generator item, recording a decode
+/// failure as `escape` and signalling the caller to stop the pull (#2023
+/// code review) -- shared by that function's outer and inner closures,
+/// which were otherwise identical 7-line copies of this match differing
+/// only in which generator's item they decoded.
+fn checked_or_stop<W: Clone + AsRef<[u64]>>(
     item: Item<'_, W>,
-) -> Result<OwnedValue, EvalError> {
-    match item {
-        Item::Owned(v) => Ok(v),
-        Item::Borrowed(v) => to_owned_checked(&v),
+    escape: &mut Option<Control>,
+) -> Result<OwnedValue, Demand> {
+    match item.into_owned_checked() {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            *escape = Some(Control::Error(e));
+            Err(Demand::Stop)
+        }
     }
 }
 
@@ -2548,20 +2568,14 @@ where
     let outer_flow = eval_each::<W, S>(outer, value.clone(), optional, &mut |outer_item| {
         // #2023: same decode-failure raise as `fanout_arg`'s own lazy sink,
         // for both generators here.
-        let o = match item_to_owned_checked(outer_item) {
+        let o = match checked_or_stop(outer_item, &mut escape) {
             Ok(v) => v,
-            Err(e) => {
-                escape = Some(Control::Error(e));
-                return Demand::Stop;
-            }
+            Err(demand) => return demand,
         };
         let inner_flow = eval_each::<W, S>(inner, value.clone(), optional, &mut |inner_item| {
-            let i = match item_to_owned_checked(inner_item) {
+            let i = match checked_or_stop(inner_item, &mut escape) {
                 Ok(v) => v,
-                Err(e) => {
-                    escape = Some(Control::Error(e));
-                    return Demand::Stop;
-                }
+                Err(demand) => return demand,
             };
             match push_owned_values(body(o.clone(), i), &mut out) {
                 Some(control) => {
@@ -45677,29 +45691,47 @@ mod tests {
     /// #2023 code review: `fanout_two_args_lazy` (used by two-generator
     /// builtins, e.g. `setpath(path; value)`) has its own, independent pair
     /// of `item_to_owned` call sites -- outer and inner -- needing the
-    /// identical fix. `setpath`'s ambient is the whole document being
-    /// modified, never itself string-decode-checked (unlike `test`'s
-    /// ambient -- see the test above), isolating each generator's own
-    /// decode failure cleanly. Both generators navigate a direct sibling
-    /// field (`.b`), not a `$var` binding. Confirmed pre-fix: the outer
-    /// (value) case silently succeeded (`{"x":""}` written); the inner
-    /// (path) case silently corrupted the path to `""`, surfacing as the
-    /// unrelated "Path must be specified as an array" instead of a decode
-    /// failure -- neither raised the correct error.
+    /// identical fix.
+    ///
+    /// Only the *inner* (path) slot is pinned here: an "outer" (value) case
+    /// (`setpath(["x"]; .b)`) is *not* a valid test for `setpath`
+    /// specifically -- review found `builtin_setpath`'s own body (#1953)
+    /// separately runs `to_owned_checked` over the *whole* ambient document
+    /// before ever writing, so it already raises the same decode failure on
+    /// `.b` regardless of whether this fix's own outer-slot code path does
+    /// anything, passing identically with the fix reverted. `setpath`'s
+    /// ambient is the whole document being modified, so there is no
+    /// `setpath`-based construction that isolates the outer slot the way
+    /// the inner one below is isolated. The outer and inner closures are
+    /// otherwise structurally identical (same match arms, same
+    /// escape-then-stop shape, differing only in which generator/variable
+    /// they close over -- verified by code review), so this one case gives
+    /// real coverage of the shared shape without a misleading "confirmed"
+    /// claim for a case that wasn't actually isolated.
     #[test]
     fn test_fanout_two_args_lazy_item_to_owned_raises_decode_failure_2023() {
-        // Outer (value) generator's own decode failure.
         query!(
             b"{\"a\":1,\"b\":\"\xff\xfe\"}",
-            r#"setpath(["x"]; .b)"#,
+            r"setpath(.b; 5)",
             QueryResult::Error(e) if e.is_decode_failure() => {
                 assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
             }
         );
-        // Inner (path) generator's own decode failure.
-        query!(
+    }
+
+    /// #2023 code review: the `has(.b)` repro above only exercises jq mode
+    /// (`fanout_arg`'s `ArgFanout::All` path). yq mode routes `has` through
+    /// `ArgFanout::yq_native` = `FirstOnly` (not `All`), the *eager* branch
+    /// at the top of `fanout_arg` -- a second, independent gap review found:
+    /// that branch used unchecked `stream_outputs`/`collect_owned` and had
+    /// the identical bug, live-confirmed via `succinctly yq 'has(.b)'`
+    /// answering `false` instead of raising, pre-fix. Fixed by routing that
+    /// branch through `stream_outputs_checked` too.
+    #[test]
+    fn test_fanout_arg_eager_branch_item_to_owned_raises_decode_failure_yq_2023() {
+        yq_query!(
             b"{\"a\":1,\"b\":\"\xff\xfe\"}",
-            r"setpath(.b; 5)",
+            r"has(.b)",
             QueryResult::Error(e) if e.is_decode_failure() => {
                 assert!(e.message.contains("invalid UTF-8"), "message: {}", e.message);
             }
