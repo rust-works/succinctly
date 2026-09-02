@@ -2357,7 +2357,12 @@ fn push_generic_truthiness<V: DocumentValue>(
             if let Some(control) = push_generic_truthiness_cursor_error(&c, 0) {
                 return Some(control);
             }
-            out.push(!c.is_falsy());
+            // `select`'s condition truthiness is about the real value, not
+            // about what a later `-e`/JSON-output convention would sanitize
+            // it to -- `Preserve` keeps a malformed number truthy here the
+            // same way it always has (see `StreamableValue::is_falsy`'s own
+            // doc comment for the convention this parameter selects).
+            out.push(!c.is_falsy(JsonConvention::Preserve));
         }
         GenericResult::Many(vs) => {
             for v in &vs {
@@ -2369,7 +2374,7 @@ fn push_generic_truthiness<V: DocumentValue>(
                 if let Some(control) = push_generic_truthiness_cursor_error(c, 0) {
                     return Some(control);
                 }
-                out.push(!c.is_falsy());
+                out.push(!c.is_falsy(JsonConvention::Preserve));
             }
         }
         // A lazy keys array, materialized or not, sorted or not, is
@@ -2784,7 +2789,7 @@ impl<V: DocumentValue> GenericResult<V> {
                 owned.stream_json(out, indent, sort_keys, numbers)?;
                 on_value(out)?;
                 stats.count = 1;
-                stats.last_was_falsy = owned.is_falsy();
+                stats.last_was_falsy = owned.is_falsy(numbers);
                 stats.any_truthy = !stats.last_was_falsy;
             }
             Self::OneCursor(c) => {
@@ -2795,7 +2800,7 @@ impl<V: DocumentValue> GenericResult<V> {
                 }
                 on_value(out)?;
                 stats.count = 1;
-                stats.last_was_falsy = c.is_falsy();
+                stats.last_was_falsy = c.is_falsy(numbers);
                 stats.any_truthy = !stats.last_was_falsy;
             }
             Self::Many(vs) => {
@@ -2810,7 +2815,7 @@ impl<V: DocumentValue> GenericResult<V> {
                     };
                     owned.stream_json(out, indent, sort_keys, numbers)?;
                     on_value(out)?;
-                    stats.last_was_falsy = owned.is_falsy();
+                    stats.last_was_falsy = owned.is_falsy(numbers);
                     stats.any_truthy |= !stats.last_was_falsy;
                 }
                 stats.count = vs.len();
@@ -2949,7 +2954,7 @@ impl<V: DocumentValue> GenericResult<V> {
                         return Ok(stats);
                     }
                     on_value(out)?;
-                    stats.last_was_falsy = c.is_falsy();
+                    stats.last_was_falsy = c.is_falsy(numbers);
                     stats.any_truthy |= !stats.last_was_falsy;
                 }
                 stats.count = cs.len();
@@ -2967,14 +2972,14 @@ impl<V: DocumentValue> GenericResult<V> {
                 o.stream_json(out, indent, sort_keys, numbers)?;
                 on_value(out)?;
                 stats.count = 1;
-                stats.last_was_falsy = o.is_falsy();
+                stats.last_was_falsy = o.is_falsy(numbers);
                 stats.any_truthy = !stats.last_was_falsy;
             }
             Self::ManyOwned(os) => {
                 for o in os {
                     o.stream_json(out, indent, sort_keys, numbers)?;
                     on_value(out)?;
-                    stats.last_was_falsy = o.is_falsy();
+                    stats.last_was_falsy = o.is_falsy(numbers);
                     stats.any_truthy |= !stats.last_was_falsy;
                 }
                 stats.count = os.len();
@@ -2995,7 +3000,7 @@ impl<V: DocumentValue> GenericResult<V> {
                 for o in os {
                     o.stream_json(out, indent, sort_keys, numbers)?;
                     on_value(out)?;
-                    stats.last_was_falsy = o.is_falsy();
+                    stats.last_was_falsy = o.is_falsy(numbers);
                     stats.any_truthy |= !stats.last_was_falsy;
                 }
                 stats.count = os.len();
@@ -3041,7 +3046,7 @@ impl<V: DocumentValue> GenericResult<V> {
                 owned.stream_yaml(out, indent, sort_keys)?;
                 on_value(out)?;
                 stats.count = 1;
-                stats.last_was_falsy = owned.is_falsy();
+                stats.last_was_falsy = owned.is_falsy(JsonConvention::Preserve);
                 stats.any_truthy = !stats.last_was_falsy;
             }
             Self::OneCursor(c) => {
@@ -3056,7 +3061,7 @@ impl<V: DocumentValue> GenericResult<V> {
                 }
                 on_value(out)?;
                 stats.count = 1;
-                stats.last_was_falsy = c.is_falsy();
+                stats.last_was_falsy = c.is_falsy(JsonConvention::Preserve);
                 stats.any_truthy = !stats.last_was_falsy;
             }
             Self::Many(vs) => {
@@ -3071,7 +3076,7 @@ impl<V: DocumentValue> GenericResult<V> {
                     };
                     owned.stream_yaml(out, indent, sort_keys)?;
                     on_value(out)?;
-                    stats.last_was_falsy = owned.is_falsy();
+                    stats.last_was_falsy = owned.is_falsy(JsonConvention::Preserve);
                     stats.any_truthy |= !stats.last_was_falsy;
                 }
                 stats.count = vs.len();
@@ -3087,7 +3092,7 @@ impl<V: DocumentValue> GenericResult<V> {
                         return Ok(stats);
                     }
                     on_value(out)?;
-                    stats.last_was_falsy = c.is_falsy();
+                    stats.last_was_falsy = c.is_falsy(JsonConvention::Preserve);
                     stats.any_truthy |= !stats.last_was_falsy;
                 }
                 stats.count = cs.len();
@@ -3192,14 +3197,14 @@ impl<V: DocumentValue> GenericResult<V> {
                 o.stream_yaml(out, indent, sort_keys)?;
                 on_value(out)?;
                 stats.count = 1;
-                stats.last_was_falsy = o.is_falsy();
+                stats.last_was_falsy = o.is_falsy(JsonConvention::Preserve);
                 stats.any_truthy = !stats.last_was_falsy;
             }
             Self::ManyOwned(os) => {
                 for o in os {
                     o.stream_yaml(out, indent, sort_keys)?;
                     on_value(out)?;
-                    stats.last_was_falsy = o.is_falsy();
+                    stats.last_was_falsy = o.is_falsy(JsonConvention::Preserve);
                     stats.any_truthy |= !stats.last_was_falsy;
                 }
                 stats.count = os.len();
@@ -3219,7 +3224,7 @@ impl<V: DocumentValue> GenericResult<V> {
                 for o in os {
                     o.stream_yaml(out, indent, sort_keys)?;
                     on_value(out)?;
-                    stats.last_was_falsy = o.is_falsy();
+                    stats.last_was_falsy = o.is_falsy(JsonConvention::Preserve);
                     stats.any_truthy |= !stats.last_was_falsy;
                 }
                 stats.count = os.len();

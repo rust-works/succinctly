@@ -4292,7 +4292,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         // Streaming skips evaluation, so inspect the document
                         // value directly to keep `-e` falsy tracking (#178).
                         if args.exit_status {
-                            any_truthy |= !$cursor.is_falsy();
+                            any_truthy |= !$cursor.is_falsy(JsonConvention::Preserve);
                         }
                     }
                 } else {
@@ -4433,7 +4433,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         // Streaming skips evaluation, so inspect the document
                         // value directly to keep `-e` falsy tracking (#178).
                         if args.exit_status {
-                            any_truthy |= !$cursor.is_falsy();
+                            any_truthy |= !$cursor.is_falsy(JsonConvention::Preserve);
                         }
                     }
                 } else {
@@ -4609,7 +4609,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                 // `root` is the virtual document sequence; falsiness
                                 // lives on the actual document value (#178).
                                 if args.exit_status {
-                                    any_truthy |= root.first_child().is_some_and(|c| !c.is_falsy());
+                                    any_truthy |= root
+                                        .first_child()
+                                        .is_some_and(|c| !c.is_falsy(JsonConvention::Preserve));
                                 }
                             }
                         } else {
@@ -4757,8 +4759,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                     // falsiness lives on the actual document
                                     // value (#178).
                                     if args.exit_status {
-                                        any_truthy |=
-                                            root.first_child().is_some_and(|c| !c.is_falsy());
+                                        any_truthy |= root
+                                            .first_child()
+                                            .is_some_and(|c| !c.is_falsy(JsonConvention::Preserve));
                                     }
                                 }
                             } else {
@@ -5476,8 +5479,9 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                                     }
                                     write_terminator(&mut buf_writer, &output_config)?;
                                     if args.exit_status {
-                                        any_truthy |=
-                                            root.first_child().is_some_and(|c| !c.is_falsy());
+                                        any_truthy |= root
+                                            .first_child()
+                                            .is_some_and(|c| !c.is_falsy(JsonConvention::Preserve));
                                     }
                                 } else if let Some(doc_cursor) = root.first_child() {
                                     stream_cursor!(

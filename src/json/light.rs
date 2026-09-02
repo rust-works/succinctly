@@ -2129,7 +2129,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
     /// `Preserve` still takes the cheap verbatim-echo path below (a raw copy
     /// beats re-walking the tree, and it's already atomic: one `write_str`
     /// call, nothing to buffer), everything else recurses through
-    /// [`stream_json_pretty`]. `JqCompat` always recurses, even when
+    /// `stream_json_pretty`. `JqCompat` always recurses, even when
     /// compact: reformatting a number literal (`format_number_jq_compat`)
     /// is a per-node decision the whole-value echo can't make, regardless
     /// of indentation.
@@ -2223,30 +2223,25 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
         stream_json_as_yaml(out, self.value(), 0, indent.width)
     }
 
-    /// Known gap (#1576 review, not fixed in this change): a structurally
-    /// invalid number (`1.2.3`) that `write_json_number`
-    /// (`JsonConvention::JqCompat`) sanitizes to `null` in *output* is not
-    /// reported as falsy *here*, since this checks `self.value()`'s own
-    /// source type (`StandardJson::Number`, not `Null`) with no access to
-    /// which `JsonConvention` the caller is about to render it under --
-    /// `--preserve-input`/`Preserve` echoes the same value unsanitized
-    /// (still a `Number`, correctly truthy), so this can't simply treat
-    /// every invalid number as falsy unconditionally either. `-e` on `.a`
-    /// over `{"a": 1.2.3}` therefore exits 0 via this cursor-streaming
-    /// path where the older `to_owned`-based materializing path (still
-    /// used whenever `can_json_fast_path` excludes a query, e.g. `-S`)
-    /// already correctly exits 1 -- an internal inconsistency between the
-    /// two paths, not a new divergence from real jq (which hard-rejects
-    /// `1.2.3` as a parse error, already a separate, documented gap, #966).
-    /// Fixing it properly needs `JsonConvention` threaded into
-    /// `is_falsy`'s signature, a wider, cross-cutting change affecting
-    /// `YamlCursor` too for a narrow combination (`-e` + a malformed
-    /// number + default `jq_compat`); tracked as a follow-up rather than
-    /// folded into this change.
+    /// #966 follow-up (#1576 review): a structurally invalid number
+    /// (`1.2.3`) that `write_json_number` (`JsonConvention::JqCompat`)
+    /// sanitizes to `null` in *output* must also report falsy *here* under
+    /// that same convention, or `-e` on `.a` over `{"a": 1.2.3}` would exit
+    /// 0 despite the printed `null` -- inconsistent with the older
+    /// `to_owned`-based materializing path (still used whenever
+    /// `can_json_fast_path` excludes a query, e.g. `-S`), which already
+    /// correctly exits 1. `--preserve-input`/`Preserve` echoes the same
+    /// span unsanitized (still nominally a `Number`), so it stays truthy
+    /// there -- only `JqCompat` treats a malformed number as falsy.
     #[inline]
-    fn is_falsy(&self) -> bool {
-        // A value is falsy if it's null or false
-        matches!(self.value(), StandardJson::Null | StandardJson::Bool(false))
+    fn is_falsy(&self, numbers: JsonConvention) -> bool {
+        match self.value() {
+            StandardJson::Null | StandardJson::Bool(false) => true,
+            StandardJson::Number(_) => {
+                numbers == JsonConvention::JqCompat && self.value().number_literal().is_none()
+            }
+            _ => false,
+        }
     }
 
     /// #1576: `JsonCursor` now implements both `stream_sequence_*` methods

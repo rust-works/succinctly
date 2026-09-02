@@ -538,9 +538,14 @@ pub trait DocumentCursor: Sized + Copy + Clone {
 
     /// Check if the value at this cursor is falsy (null or false).
     ///
-    /// Used for `--exit-status` flag handling without requiring full materialization.
-    /// Default implementation returns false (conservative assumption).
-    fn is_falsy(&self) -> bool {
+    /// Used for `--exit-status` flag handling without requiring full
+    /// materialization. Default implementation returns false (conservative
+    /// assumption). `numbers` is the same convention `stream_json` renders
+    /// under (#966 follow-up, review of #1576) -- see
+    /// [`StreamableValue::is_falsy`](crate::jq::stream::StreamableValue::is_falsy)'s
+    /// own doc comment for why a cursor's falsiness can depend on it.
+    fn is_falsy(&self, numbers: JsonConvention) -> bool {
+        let _ = numbers;
         false
     }
 }
