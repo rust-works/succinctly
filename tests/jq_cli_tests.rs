@@ -14057,6 +14057,72 @@ fn test_resolve_slice_expr_target_escape_still_surfaces_in_final_result_2245() -
     Ok(())
 }
 
+/// #2245 (found in review of this fix's own first draft): `target`
+/// escaping forced `ends_limit` to `1` for every subsequent `s`, including
+/// one whose freshly-evaluated `ends` for *that* `s` turned out completely
+/// empty -- `&ends[..1]` on a zero-length slice panicked. Fixed by
+/// resolving `target` lazily (triggered only by the first `s` whose own
+/// `T` is genuinely non-empty), so a `target_escape` can only ever be
+/// discovered on an `s` that already has a non-empty `ends` in hand.
+#[test]
+fn test_resolve_slice_expr_target_escape_does_not_panic_on_empty_later_ends_2245() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(
+        &[
+            "-c",
+            r#"path((select((true,error("target_err"))))[(0,1):empty])"#,
+        ],
+        Some("[10,20,30]"),
+    )?;
+    assert_eq!(code, 0);
+    assert!(stdout.trim().is_empty());
+
+    Ok(())
+}
+
+/// #2245 (found in review of this fix's own first draft): within one `s`
+/// iteration, `end`'s own trailing escape was checked *before* `target`'s,
+/// so when both escaped in the same iteration the lower-priority `end`
+/// error surfaced instead of the higher-priority `target` error, inverting
+/// the documented `target` > `end` > `start` rule. Fixed by checking
+/// `target_escape` first.
+#[test]
+fn test_resolve_slice_expr_target_escape_outranks_end_escape_same_iteration_2245() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"path((select((true,error("target_err"))))[(0,1):(2,error("end_err"))])"#,
+        ],
+        Some("[10,20,30]"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[{\"start\":0,\"end\":2}]\n");
+    assert!(stderr.contains("target_err"), "stderr: {stderr:?}");
+    assert!(!stderr.contains("end_err"), "stderr: {stderr:?}");
+
+    Ok(())
+}
+
+/// #2245 (found in review of this fix's own first draft): `target` was
+/// evaluated unconditionally before checking whether `end` (`T`) would
+/// ever produce a value for any `s`, so a target with a real side effect
+/// fired even when jq's own `S as $s | T as $t | E | .[$s:$t]` nesting
+/// would never reach `E` at all. Fixed by deferring `target`'s resolution
+/// until the first `s` whose own `T` is genuinely non-empty.
+#[test]
+fn test_resolve_slice_expr_target_not_evaluated_when_end_always_empty_2245() -> Result<()> {
+    let (_, stderr, code) = run_jq_full(
+        &["-c", r"(.|stderr)[(0,1):(empty)] = 99"],
+        Some("[10,20,30]"),
+    )?;
+    assert_eq!(code, 0);
+    assert!(
+        stderr.is_empty(),
+        "target's stderr side effect should never fire: stderr: {stderr:?}"
+    );
+
+    Ok(())
+}
+
 #[test]
 fn test_walk_propagates_halt_from_f() -> Result<()> {
     // `walk_impl` applies `f` via `eval_owned_expr_fork` at every level
