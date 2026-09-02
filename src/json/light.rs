@@ -2359,11 +2359,27 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
                 // reflect (matches `from_number_bytes`'s own leading-dot
                 // and leading-zero handling, both of which store the
                 // original text for the same reason).
-                if let Some(stripped) = crate::json::validate::strip_redundant_leading_zeros(bytes)
-                {
-                    if crate::json::validate::is_valid_number(&stripped) {
+                let zero_stripped = crate::json::validate::strip_redundant_leading_zeros(bytes);
+                if let Some(stripped) = &zero_stripped {
+                    if crate::json::validate::is_valid_number(stripped) {
                         return core::str::from_utf8(bytes).ok().map(Cow::Borrowed);
                     }
+                }
+                // Real jq's own number reader also tolerates a trailing
+                // `.` immediately before an exponent marker (`1.e999` ->
+                // `1.0e999`) -- same leniency as
+                // `OwnedValue::from_number_bytes`'s own trailing-dot
+                // handling (#2220, shared gate via
+                // `has_trailing_dot_before_exponent`). Checked against the
+                // leading-zero-stripped form above (when one exists), not
+                // always `bytes` itself, so the two escapes compose: a
+                // token can have both a redundant leading zero *and* a
+                // trailing dot before its exponent at once (`007.e999`).
+                // Returns the *original* `bytes`, matching every other
+                // escape in this function and in `from_number_bytes`.
+                let base = zero_stripped.as_deref().unwrap_or(bytes);
+                if crate::json::validate::has_trailing_dot_before_exponent(base) {
+                    return core::str::from_utf8(bytes).ok().map(Cow::Borrowed);
                 }
                 // The semi-index scanner accepts number *spans* more
                 // leniently than RFC 8259 beyond just a leading zero
