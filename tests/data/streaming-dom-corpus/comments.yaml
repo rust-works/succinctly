@@ -1,0 +1,4 @@
+# leading comment
+a: 1  # trailing comment
+# standalone comment
+b: 2

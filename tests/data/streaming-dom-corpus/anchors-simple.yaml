@@ -1,0 +1,4 @@
+base: &anchor
+  x: 1
+  y: 2
+derived: *anchor
