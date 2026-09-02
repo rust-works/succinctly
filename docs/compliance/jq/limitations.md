@@ -1267,18 +1267,25 @@ results one at a time instead of pre-allocating a single buffer, so it just keep
 output rather than answering promptly or refusing.
 
 Both `eval_index_expr` arms (#2032/#2142) and, since #2143, `eval_slice_expr` (in both
-files) have since moved off that single upfront product: their own target (the left side
-of `.[$keys]`/`.[$s:$e]`) is now re-evaluated once per key/`(s, e)` pair rather than once
-overall (see this doc's own no-longer-applicable earlier framing corrected — target length
-can vary per key/pair now, so one upfront product is no longer even computable), so each
-reserves incrementally instead, via a per-key/-pair `Vec::try_reserve` against
-`cannot_reserve_cross_product`'s identical error. The refusal guarantee this section
-describes is unchanged by that restructuring — every push remains behind a fallible
-reservation, so the failure mode stays "clean refusal," never a panic — only the moment the
-check runs (once upfront vs. incrementally per key/pair) and the factor(s) named in the
-error message changed. `resolve_index_expr`/`resolve_slice_expr` (the `path()`/write-path
-siblings, target still evaluated once — tracked separately as #2139) are the two sites that
-still call `try_reserve_product` directly with the original multi-factor product.
+files) have since moved off that single *full* upfront product: their own target (the
+left side of `.[$keys]`/`.[$s:$e]`) is now re-evaluated once per key/`(s, e)` pair rather
+than once overall (see this doc's own no-longer-applicable earlier framing corrected —
+target length can vary per key/pair now, so a product including it is no longer even
+computable), so each also reserves incrementally per key/pair via `Vec::try_reserve`
+against `cannot_reserve_cross_product`'s identical error, regardless of the target's own
+length. The two functions differ on what's reserved *before* that incremental loop even
+starts: `eval_index_expr` reserves nothing upfront (purely incremental from an empty
+`Vec`), while `eval_slice_expr` reserves a `starts.len() * ends.len()` baseline first —
+both factors are still fully known before the loop, so this recovers a single allocation
+for the common one-output-per-pair case instead of paying amortized-doubling
+reallocation/copy costs on every slice query; an overflowing product just skips the hint
+and falls through to the purely-incremental path, same as `eval_index_expr` always takes.
+The refusal guarantee this section describes is unchanged by any of this — every push
+remains behind a fallible reservation, so the failure mode stays "clean refusal," never a
+panic — only the moment(s) a check runs and the factor(s) named in the error message
+changed. `resolve_index_expr`/`resolve_slice_expr` (the `path()`/write-path siblings,
+target still evaluated once — tracked separately as #2139) are the two sites that still
+call `try_reserve_product` directly with the original multi-factor product.
 
 Unlike `s * n` above, this is symmetric across both modes rather than a yq-specific
 divergence to record — but not because a live check for a yq-side cap came back empty.
