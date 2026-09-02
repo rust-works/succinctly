@@ -26943,23 +26943,23 @@ fn eval_owned_fast_path<S: EvalSemantics>(
         // this ever runs) would otherwise fall through to the general
         // evaluator below, which round-trips the *whole* accumulator
         // through `to_json_for_reindex` + `JsonIndex::build` every single
-        // step -- O(current size) of avoidable serialize/parse work per
-        // step, compounding into O(n^2) over a growing accumulator.
+        // step. This arm skips that round-trip, but still clones `input`
+        // (the `&OwnedValue` signature below leaves no other option), so
+        // it only shrinks the constant factor -- the fold remains O(n^2)
+        // over a growing accumulator; see #2157 and
+        // docs/compliance/jq/limitations.md.
         Expr::Arithmetic { op, left, right } if matches!(left.as_ref(), Expr::Identity) => {
-            match right.as_ref() {
-                Expr::Literal(lit) => {
-                    match arith_combine::<S>(*op, input.clone(), literal_to_owned(lit)) {
-                        Ok(v) => Some(Ok(Some(v))),
-                        // Matches the `Field`/`Index` arms' own convention
-                        // above: a per-step `?` (`optional`, threaded down
-                        // from the fold construct's own trailing `?`)
-                        // suppresses this step's error to `None` rather
-                        // than propagating it.
-                        Err(_) if optional => Some(Ok(None)),
-                        Err(e) => Some(Err(e)),
-                    }
-                }
-                _ => None,
+            let Expr::Literal(lit) = right.as_ref() else {
+                return None;
+            };
+            match arith_combine::<S>(*op, input.clone(), literal_to_owned(lit)) {
+                Ok(v) => Some(Ok(Some(v))),
+                // Suppress to `None` under `optional` (the fold construct's
+                // own trailing `?`) rather than propagating, same rule
+                // `eval_arithmetic`'s general-path handling of `optional`
+                // applies for this shape.
+                Err(_) if optional => Some(Ok(None)),
+                Err(e) => Some(Err(e)),
             }
         }
         Expr::Field(name) => Some(match input {

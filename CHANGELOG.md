@@ -151,22 +151,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path rather than assumed to carry over unchanged.
 
 - **`reduce`/`foreach`'s bare string/number-accumulating UPDATE body
-  (`. + <literal>`) no longer runs in O(n²)** (#2086): `substitute_vars`
-  folds a fold's `$x` into a `Literal` node before the loop runs, so
-  `reduce EXPR as $x (INIT; . + $x)`-shaped bodies reduce to a bare
-  `Expr::Arithmetic{Identity, Literal}` — a shape `eval_owned_fast_path`
-  didn't cover, so every step fell through to the general evaluator's
-  `to_json_for_reindex` + `JsonIndex::build` round-trip over the *whole*
-  current accumulator. `reduce range(N) as $x (""; . + "x")` measured
-  ~7.8s at `N=99999` (`REDUCE_FOREACH_MAX_STEPS`'s own ceiling); real jq
-  answers in ~0.02s at that scale. Fixed by extending
+  (`. + <literal>`) is now ~45x faster (still O(n²) — see below)** (#2086):
+  `substitute_vars` folds a fold's `$x` into a `Literal` node before the
+  loop runs, so `reduce EXPR as $x (INIT; . + $x)`-shaped bodies reduce to
+  a bare `Expr::Arithmetic{Identity, Literal}` — a shape
+  `eval_owned_fast_path` didn't cover, so every step fell through to the
+  general evaluator's `to_json_for_reindex` + `JsonIndex::build` round-trip
+  over the *whole* current accumulator. `reduce range(N) as $x (""; . +
+  "x")` measured ~7.8s at `N=99999` (`REDUCE_FOREACH_MAX_STEPS`'s own
+  ceiling); real jq answers in ~0.02s at that scale. Fixed by extending
   `eval_owned_fast_path` to answer `. + <literal>` directly against the
   `OwnedValue` tree, reusing the same `arith_combine` dispatch every other
   arithmetic call site already shares — measured ~0.17s at the same
-  `N=99999` after the fix, ~45x faster. Array/object-accumulating shapes
-  (`. + [$x]`) are not covered by this fix (measured *worse* than the
-  string case, ~36s at just 25,000 elements) — tracked separately as
-  #2152.
+  `N=99999` after the fix, ~45x faster. **This removes the JSON
+  round-trip's cost, not the fold's own quadratic shape**: the new arm
+  still clones the whole accumulator (`input.clone()`) every step before
+  handing it to `arith_combine`, and `String`/`Vec` clones allocate at
+  exact capacity, so the very next append reallocates a second time
+  anyway — two O(current-size) copies per step either way, just memcpy
+  instead of serialize/parse. Measured post-fix scaling curve (interleaved
+  runs, net of process-startup floor): N=6,250 → 1.89ms, 12,500 → 4.74ms,
+  25,000 → 13.53ms, 50,000 → 35.24ms, 99,999 → 133.58ms — per-step cost
+  keeps rising (0.30µs → 1.34µs across that range) and the last doubling
+  costs ~3.8x, both the signature of O(n²), not O(n) (which would show
+  flat per-step cost and a ~2x doubling ratio). A true linear fix needs
+  the fold's already-fully-owned accumulator state passed *by value* into
+  arithmetic so `arith_add`'s existing in-place `push_str`/`extend` can
+  reuse capacity instead of being hand a fresh clone every step — out of
+  scope here since `eval_owned_fast_path` is shared by 3 call sites
+  (`eval_each_owned`, `eval_owned_expr_full`, `eval_owned_input`) that all
+  need `input` back on the fallback branch; tracked as #2157.
+  Array/object-accumulating shapes (`. + [$x]`) are not covered by this
+  fix at all (measured *worse* than the string case, ~36s at just 25,000
+  elements) — tracked separately as #2152.
 
 - **A decode failure (invalid UTF-8, or a structurally malformed value) now
   raises instead of silently materializing as `null`, `""`, or a dropped

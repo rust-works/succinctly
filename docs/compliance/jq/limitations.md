@@ -2313,14 +2313,53 @@ wasn't one of `eval_owned_fast_path`'s covered shapes), where real jq answers
 the identical query in apparently-linear time (`jq -cn '[range(N)] | length'`-scale
 cost, confirmed live: N=50,000/100,000/1,000,000 measure 0.01s/0.02s/0.15s
 against jq 1.7.1, vs. succinctly's original 1.9s/7.8s at just the first two of
-those). [#2086](https://github.com/rust-works/succinctly/issues/2086) closed
-this for exactly this bare shape (`. + <literal>`, `$x` already folded into a
-`Literal` by `substitute_vars` before the fold runs) by extending
-`eval_owned_fast_path` to answer it directly against the `OwnedValue` tree,
-reusing the same `arith_combine` dispatch every other arithmetic call site
-already shares -- measured directly at `REDUCE_FOREACH_MAX_STEPS` (`100000`)
-after that fix: ~0.17s, down from ~7.8s. Array/object-accumulating shapes
-(`reduce ... as $x ([]; . + [$x])`) are **not** covered by that fix -- after
+those). [#2086](https://github.com/rust-works/succinctly/issues/2086) fixed
+the specific mechanism named above (the JSON round-trip) for exactly this
+bare shape (`. + <literal>`, `$x` already folded into a `Literal` by
+`substitute_vars` before the fold runs) by extending `eval_owned_fast_path`
+to answer it directly against the `OwnedValue` tree, reusing the same
+`arith_combine` dispatch every other arithmetic call site already shares --
+measured directly at `REDUCE_FOREACH_MAX_STEPS` (`100000`) after that fix:
+~0.17s, down from ~7.8s, a ~45x constant-factor win.
+
+**This is not an asymptotic fix -- the fold remains O(n²) after #2086,
+just with a much smaller constant.** The new arm still calls `input.clone()`
+on the whole accumulator every step before handing it to `arith_combine`
+(`eval_owned_fast_path`'s `&OwnedValue` signature leaves no other option),
+and `String`/`Vec::clone()` allocates at exact capacity with no spare
+headroom, so the very next `push_str`/`extend` inside `arith_add`
+reallocates a second time regardless -- two O(current-size) copies per
+step either way, just memcpy instead of serialize/parse. Measured post-fix
+scaling curve (interleaved runs, net of process-startup floor,
+`reduce range(N) as $x (""; . + "x") | length`):
+
+| N | net time | time/N |
+|---|---|---|
+| 6,250 | 1.89ms | 0.30µs |
+| 12,500 | 4.74ms | 0.38µs |
+| 25,000 | 13.53ms | 0.54µs |
+| 50,000 | 35.24ms | 0.71µs |
+| 99,999 | 133.58ms | 1.34µs |
+
+Per-step cost keeps rising (0.30µs -> 1.34µs, a 4.4x increase over a 16x
+range of N) and the last doubling (50,000 -> 99,999) costs ~3.8x -- both
+the signature of O(n²), not O(n) (which would show flat per-step cost and a
+~2x doubling ratio). Pushing further past `REDUCE_FOREACH_MAX_STEPS` (via
+array input rather than `range()`, which has its own separate cap) confirms
+the trend continues: 100,000 -> 200,000 -> 300,000 -> 400,000 elements
+measured 0.15s -> 0.47s -> 1.07s -> 2.9s, a ~19x wall-clock increase for a
+4x increase in N. A true O(n) fix needs the fold's already-fully-owned
+accumulator state (confirmed unaliased at the one call site that matters,
+`try_reduce_step_alternatives`) passed *by value* into arithmetic so
+`arith_add`'s existing in-place `push_str`/`extend` can reuse capacity
+instead of being handed a fresh clone every step -- out of scope for #2086
+since `eval_owned_fast_path` is shared by 3 call sites (`eval_each_owned`,
+`eval_owned_expr_full`, `eval_owned_input`) that all need `input` back on
+the fallback branch, not just the one new arm; tracked as
+[#2157](https://github.com/rust-works/succinctly/issues/2157).
+
+Array/object-accumulating shapes (`reduce ... as $x ([]; . + [$x])`) are
+**not** covered by #2086's fix at all -- after
 substitution the right-hand side is an `Expr::Array`/`Expr::Object`
 construction wrapping a `Literal`, not a bare `Literal` itself, so it still
 falls through to the same slow path, and measures *worse* than the string
@@ -2382,9 +2421,10 @@ shape `eval_owned_fast_path` doesn't cover): `[0,""] | until(.[0] >= N;
 [.[0]+1, .[1] + "x"]) | .[1] | length` measures ~15-16s at N approaching the
 new `100000` ceiling in this build, against real jq's own apparently-linear
 ~0.1-0.2s at the same N (confirmed live). #2086's fix (see the previous
-section) closed this for `reduce`/`foreach`'s *bare* accumulator shape
-(`. + <literal>`), which brought that analogous `reduce` figure down from
-~7.8s to ~0.17s -- but this `until`/`while` repro's own state is
+section -- a constant-factor win, not an asymptotic one; #2157 tracks the
+remaining O(n²) shape) brought that analogous `reduce` figure down from
+~7.8s to ~0.17s for `reduce`/`foreach`'s *bare* accumulator shape
+(`. + <literal>`) -- but this `until`/`while` repro's own state is
 array-wrapped (`[.[0]+1, .[1] + "x"]`, since a loop needs a counter *and* an
 accumulator, unlike `reduce`/`foreach`'s cleanly separate INIT-vs-`$x`
 shape), so neither inner arithmetic's left operand is the bare `.`
