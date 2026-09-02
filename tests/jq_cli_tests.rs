@@ -26364,6 +26364,103 @@ fn test_jq_getpath_fanout_all_outputs_still_resolve_1532() -> Result<()> {
     Ok(())
 }
 
+/// #2053: `eval_generic.rs`'s new native `Builtin::GetPath` bypass arm still
+/// materializes and validates the whole document exactly once before ever
+/// walking a path -- the same rule `test_path_still_raises_on_an_
+/// undecodable_sibling_2061` pins for `path()`. `getpath(["d"])` never
+/// reaches `.a`, but a `\uXXXX`-family decode failure anywhere in the
+/// document still raises, matching real jq's own eager whole-document parse
+/// (#1755/#1953) -- unlike plain navigation (`.d`, `keys`, `length`), which
+/// only decode what they touch and succeed on this same document. This is
+/// the whole-document validity gate the issue's fix explicitly could not
+/// drop: a naive cursor walk straight to `.d` would silently accept a
+/// document both real jq and `main` currently reject.
+#[test]
+fn test_getpath_still_raises_on_an_undecodable_sibling_2053() -> Result<()> {
+    for bad in [r"\ud800", r"\uZZZZ", r"\x", r"\u12"] {
+        let input = format!("{{\"a\":\"{bad}\",\"d\":5}}");
+        let (stdout, stderr, code) = run_jq_stdin_streams("getpath([\"d\"])", &input, &["-c"])?;
+        assert_eq!(code, 5, "{bad}: stdout {stdout:?} stderr {stderr:?}");
+        assert_eq!(stdout, "", "{bad}");
+    }
+
+    // The raise above is `getpath`-specific, not a blanket rejection of the
+    // document -- plain navigation over the same input still succeeds.
+    let (stdout, code) = run_jq_stdin(".d", r#"{"a":"\ud800","d":5}"#, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "5");
+
+    Ok(())
+}
+
+/// #2053, constraint 2 from the issue that split this fix off from #1909:
+/// `path_expr` must be evaluated exactly once, on *both* branches
+/// `eval_generic.rs`'s new native `Builtin::GetPath` arm can take -- the
+/// `reindex_bridge_is_identity`-gated bypass, and the pre-existing
+/// reindex-round-trip fallback kept for its numeric edge cases. A withdrawn
+/// earlier attempt at this fix (PR #2045) probed `path_expr`'s output shape
+/// and, on a shape it didn't recognise, discarded the probe and fell back to
+/// evaluating the whole unmodified expression a second time -- firing any
+/// side effect inside it twice (`getpath(("a"|stderr))` printed `aa` instead
+/// of jq's `a`). `MARK2053|stderr` plays that same role here: it must appear
+/// on stderr exactly once, matching real jq, regardless of which branch
+/// answers the call.
+#[test]
+fn test_getpath_path_expr_evaluated_exactly_once_2053() -> Result<()> {
+    // Bypass branch: every value in the document is a bare `Int`, so
+    // `reindex_bridge_is_identity` admits it and the new native arm answers
+    // the call directly.
+    let (stdout, stderr, code) =
+        run_jq_stdin_streams(r#"getpath(("MARK2053"|stderr))"#, r#"{"a":1}"#, &["-c"])?;
+    assert_eq!(code, 5, "stdout {stdout:?} stderr {stderr:?}");
+    assert_eq!(stderr.matches("MARK2053").count(), 1, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("Path must be specified as an array"),
+        "stderr: {stderr:?}"
+    );
+
+    // Fallback branch: a `NumberLiteral` past `REINDEX_LITERAL_LEN_CAP`
+    // (256 chars) anywhere in the document makes `reindex_bridge_is_identity`
+    // return `false`, sending this call through the pre-existing
+    // reindex-round-trip path (`eval_on_owned` -> `eval::builtin_getpath` ->
+    // `fanout_arg`) instead -- the other place this property has to hold,
+    // since that path's own single evaluation of `path_expr` was left
+    // untouched by this fix.
+    let long_literal = "0.".to_string() + &"0".repeat(300) + "1";
+    let input = format!(r#"{{"a":1,"big":{long_literal}}}"#);
+    let (stdout, stderr, code) =
+        run_jq_stdin_streams(r#"getpath(("MARK2053"|stderr))"#, &input, &["-c"])?;
+    assert_eq!(code, 5, "stdout {stdout:?} stderr {stderr:?}");
+    assert_eq!(stderr.matches("MARK2053").count(), 1, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("Path must be specified as an array"),
+        "stderr: {stderr:?}"
+    );
+
+    Ok(())
+}
+
+/// #2053: a generator path (`getpath((["a"],["b"],["a"]))`) resolves every
+/// branch correctly off the *same* materialized root -- the native bypass
+/// arm's `owned: &OwnedValue` is shared (borrowed via `Cow`, never mutated)
+/// across every one of `fanout_arg_generic`'s per-path calls into
+/// `eval::getpath_walk_owned`, rather than re-materialized per path the way
+/// `eval::getpath_one_path` used to. Revisiting the same path twice (`["a"]`
+/// here) is a regression check for that sharing: nothing about walking it
+/// once should leave the shared root in a state where walking it again
+/// produces something different.
+#[test]
+fn test_getpath_generator_path_shares_one_materialization_2053() -> Result<()> {
+    let (stdout, code) = run_jq_stdin(
+        r#"[getpath((["a"],["b"],["a"]))]"#,
+        r#"{"a":{"x":1},"b":2}"#,
+        &["-c"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"[{"x":1},2,{"x":1}]"#);
+    Ok(())
+}
+
 /// #1531: a generator argument must be pulled lazily, so `body` runs against
 /// argument value N *before* value N+1 is evaluated. Once `body` fails, jq
 /// never evaluates the rest of the argument -- side effects included.

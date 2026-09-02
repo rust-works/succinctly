@@ -12843,6 +12843,46 @@ fn getpath_one_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     path_owned: OwnedValue,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // #1755/#1953: to_owned, not to_owned_lossy -- an undecodable root
+    // value must raise, not silently become "" and get walked as if it were
+    // the real value. A genuine decode failure (a #1642 collision counts as
+    // one) is unconditional regardless of `optional` (that flag only
+    // governs the path-shape check below, never a decode failure); a #1194
+    // malformed-member error is ordinary like any other and
+    // `suppress_or_raise` lets `optional` suppress it instead.
+    let root = match to_owned(value) {
+        Ok(v) => v,
+        Err(e) => return suppress_or_raise(e, optional),
+    };
+    getpath_walk_owned::<W, S>(&root, path_owned, optional)
+}
+
+/// [`getpath_one_path`]'s walk once its root value is already resolved and
+/// decode-validated -- everything that function does after its own
+/// `to_owned` call.
+///
+/// Split out for #2053 so `eval_generic`'s generic evaluator can reach it
+/// with the `OwnedValue` it has *already* materialized (its own validity
+/// gate, #1755/#1953 -- see that call site's own comment for why it cannot
+/// be skipped), instead of going through `eval_generic::eval_on_owned`'s
+/// reindex bridge (serialize to JSON, `JsonIndex::build`, re-enter `eval`,
+/// `to_owned` a *second* time here) only to decode the very same
+/// document over again. Mirrors [`builtin_path_on_owned`]'s identical
+/// relationship to `builtin_path`.
+///
+/// `root` is only ever read, never mutated, so the walk borrows through
+/// every step instead of cloning the whole tree up front — the only clone
+/// paid at each step is the child actually reached, exactly as the original
+/// single-function version already did once its first move-in from
+/// `to_owned` was spent. That is what lets a generator path
+/// (`getpath((["a"],["b"]))`) call this once per resolved path against one
+/// shared `root: &OwnedValue`, instead of re-materializing the document per
+/// call the way `getpath_one_path` used to.
+pub(crate) fn getpath_walk_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    root: &OwnedValue,
+    path_owned: OwnedValue,
+    optional: bool,
+) -> QueryResult<'a, W> {
     let OwnedValue::Array(path) = path_owned else {
         return if optional {
             QueryResult::None
@@ -12851,33 +12891,25 @@ fn getpath_one_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         };
     };
 
-    // #1755/#1953: to_owned, not to_owned_lossy -- an undecodable root
-    // value must raise, not silently become "" and get walked as if it were
-    // the real value. A genuine decode failure (a #1642 collision counts as
-    // one) is unconditional regardless of `optional` (that flag only
-    // governs the path-shape check above, never a decode failure); a #1194
-    // malformed-member error is ordinary like any other and
-    // `suppress_or_raise` lets `optional` suppress it instead.
-    let mut current = match to_owned(value) {
-        Ok(v) => v,
-        Err(e) => return suppress_or_raise(e, optional),
-    };
+    let mut current: Cow<'_, OwnedValue> = Cow::Borrowed(root);
 
     for segment in path {
-        match (&current, &segment) {
+        match (current.as_ref(), &segment) {
             // jq: null | getpath(["a"]) => null
             (OwnedValue::Null, _) => {
                 return QueryResult::Owned(OwnedValue::Null);
             }
             (OwnedValue::Object(obj), OwnedValue::String(key)) => {
-                current = obj.get(key).cloned().unwrap_or(OwnedValue::Null);
+                current = Cow::Owned(obj.get(key).cloned().unwrap_or(OwnedValue::Null));
             }
             (
                 OwnedValue::Array(arr),
                 OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..),
             ) => {
-                current = resolve_read_index(&segment, arr.len())
-                    .map_or(OwnedValue::Null, |i| arr[i].clone());
+                current = Cow::Owned(
+                    resolve_read_index(&segment, arr.len())
+                        .map_or(OwnedValue::Null, |i| arr[i].clone()),
+                );
             }
             // An object segment is jq's slice, `{"start":s,"end":e}`. jq
             // checks the *container* first — an object or a scalar reports
@@ -12889,7 +12921,7 @@ fn getpath_one_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     Err(_) if optional => return QueryResult::None,
                     Err(e) => return e.into(),
                 };
-                current = OwnedValue::Array(arr[range].to_vec());
+                current = Cow::Owned(OwnedValue::Array(arr[range].to_vec()));
             }
             (OwnedValue::String(s), OwnedValue::Object(desc)) => {
                 let range = match SliceBounds::from_descriptor(desc) {
@@ -12897,7 +12929,7 @@ fn getpath_one_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     Err(_) if optional => return QueryResult::None,
                     Err(e) => return e.into(),
                 };
-                current = OwnedValue::String(slice::slice_str(s, range));
+                current = Cow::Owned(OwnedValue::String(slice::slice_str(s, range)));
             }
             // yq mode only (#1102): completes the `getpath(path(x)) == x`
             // round trip for an object-slice descriptor -- without this,
@@ -12913,7 +12945,7 @@ fn getpath_one_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     Err(_) if optional => return QueryResult::None,
                     Err(e) => return e.into(),
                 };
-                current = slice_object_children_at(map, range);
+                current = Cow::Owned(slice_object_children_at(map, range));
             }
             _ if optional => return QueryResult::None,
             _ => {
@@ -12922,7 +12954,7 @@ fn getpath_one_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
     }
 
-    QueryResult::Owned(current)
+    QueryResult::Owned(current.into_owned())
 }
 
 // =============================================================================
