@@ -293,25 +293,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `if`/arithmetic/function calls/anything `expr_is_cursor_transparent` answers `false` for)
   silently accepted a stray `,` inside an apparently-empty array/object, anywhere in the
   document** (#2211): `{"a": [,]}" | if true then . else . end` printed `{"a":[]}` at exit 0,
-  where real jq and every other reading path in this codebase (the M2 fast path, the general
-  streaming path, and the `-S`/`--slurp`/`-C` fully-materializing path) already reject it —
-  confirmed against `/usr/bin/jq` 1.7.1. Root cause: `eval_generic::to_owned_cursor_at_depth`'s
-  array/object loops (the materializing conversion `eval_single`'s fallback arm uses for every
-  expression it doesn't natively match) only ever validate the delimiter *preceding a real
-  child* (#1677's `key_delimiter_ok`/`value_delimiter_ok`/`preceding_delimiter_ok` family) —
-  when the walk produces zero real children at all, none of those checks ever run, so the
-  container's own opening-to-closing gap was never inspected. Fixed with a new
-  `DocumentCursor::container_gap_ok` method (default `true` for every format but JSON, same
-  convention as `preceding_delimiter_ok`), whose JSON override reuses the exact same
-  `trailing_gap_ok` primitive `src/json/light.rs`'s `stream_json`/`stream_json_pretty` and
-  `src/bin/succinctly/jq_runner.rs`'s `print_json` already use for their own #1676 fix — one
-  gap-scanning definition, now three call sites instead of two. Verified no behavior change on
-  well-formed input (full existing suite plus a 100 KB generated-JSON differential sweep against
-  `/usr/bin/jq` 1.7.1, byte-identical) and that the fix reaches every nesting depth, not just the
-  top level (`to_owned_cursor_at_depth` recurses via cursor at every container level). A related
-  but distinct shape — a trailing comma after a *real* scalar last child (`[1,]`, `{"a":1,}`),
+  where real jq already rejects it — confirmed against `/usr/bin/jq` 1.7.1. Root cause:
+  `eval_generic::to_owned_cursor_at_depth`'s array/object loops (the materializing conversion
+  `eval_single`'s fallback arm uses for every expression it doesn't natively match) only ever
+  validate the delimiter *preceding a real child* (#1677's `key_delimiter_ok`/
+  `value_delimiter_ok`/`preceding_delimiter_ok` family) — when the walk produces zero real
+  children at all, none of those checks ever run, so the container's own opening-to-closing gap
+  was never inspected. Fixed with a new `DocumentCursor::container_gap_ok` method (default
+  `true` for every format but JSON, same convention as `preceding_delimiter_ok`), whose JSON
+  override reuses the exact same `trailing_gap_ok` primitive `src/json/light.rs`'s
+  `stream_json`/`stream_json_pretty` and `src/bin/succinctly/jq_runner.rs`'s `print_json`
+  already use for their own #1676 fix.
+
+  Code review on the resulting PR (#2246) found two more independent materializers with the
+  identical gap, the same "one fix, one sibling missed" shape this codebase has hit before
+  (`cursor_to_owned_at_depth`'s own doc comment already references #998/#1021 for exactly this
+  pattern): `jq::lazy::cursor_to_owned_at_depth` (backing `JqValue::materialize`/`into_owned`,
+  reached whenever `-e`/`--exit-status` forces materialization) and
+  `jq_runner::standard_json_to_jq_value` (backing the top-level `GenericResult::One`/`Many`
+  conversion) *both* validated nothing at all for their own `Array` arms — not even the older
+  #1677 missing/doubled-comma-*between two real children* check, which
+  `cursor_to_owned_at_depth`'s own `Object` arm neighbor already had (#1956) and
+  `standard_json_to_jq_value`'s `Object` arm never did either. Neither gap was previously
+  reachable as a live differential against real jq: whatever either function converts is still
+  printed via `write_output_jq_value`/`print_json` immediately afterward regardless of what
+  `-e`'s own materialize() call found, and `print_json`'s independent, pre-existing #1643/#1676
+  checks re-validate the same document on the way out — confirmed live against the pre-fix
+  binary (`git stash`) that every CLI-reachable repro tried still correctly rejected malformed
+  input purely through that redundant check. Both are fixed now regardless, each reusing the
+  same per-child `preceding_delimiter_ok`/`preceding_gap_ok` check the array/object arms that
+  already had it use — a future refactor that ever removes the masking check in `print_json`
+  would otherwise have silently reintroduced this bug with nothing here to catch it.
+  `cursor_to_owned_at_depth`'s `Array`/`Object` arms also gained `container_gap_ok`, the same
+  empty-container check as `to_owned_cursor_at_depth` above (it has its own container cursor to
+  check against); `standard_json_to_jq_value`'s arms do not gain an equivalent empty-container
+  check — by construction, `GenericResult::One`/`Many` are only ever produced when *this specific
+  node's* own cursor position is not being tracked (see `Expr::Identity`'s own doc comment in
+  `eval_generic.rs`), so there is no container-level position here to check safely; each real
+  child's own cursor is unaffected by that and still gets its own check. Both additions are
+  covered by direct unit tests calling these functions in isolation (bypassing `print_json`'s
+  masking entirely) rather than CLI-level tests, which cannot distinguish the fix from the
+  pre-existing redundant check — confirmed each new test fails against the pre-fix function body
+  and passes against the fixed one.
+
+  Verified no behavior change on well-formed input (full existing suite, unit tests for all
+  three fixed functions, plus a 100 KB generated-JSON differential sweep against `/usr/bin/jq`
+  1.7.1, byte-identical) and that the primary fix reaches every nesting depth, not just the top
+  level (`to_owned_cursor_at_depth` recurses via cursor at every container level). A related but
+  distinct shape — a trailing comma after a *real* scalar last child (`[1,]`, `{"a":1,}`),
   needing the last child's own text-end position rather than the container's opening position —
-  is a known, still-open gap on this same path, filed as #2243 and pinned by
+  is a known, still-open gap on all three of these paths, filed as #2243 and pinned by
   `test_jq_lazy_path_trailing_comma_after_scalar_last_child_still_a_known_gap_2243` rather than
   left silently uncovered.
 
