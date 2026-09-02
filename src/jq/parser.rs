@@ -1397,18 +1397,25 @@ impl<'a> Parser<'a> {
 
             // Keywords: null, true, false, not, if, try, error, reduce, foreach, etc.
             Some(c) if c.is_alphabetic() => {
+                let keyword_start = self.pos;
                 if self.matches_keyword("null") {
                     self.consume_keyword("null");
-                    Ok(Expr::Literal(Literal::Null))
+                    self.zero_arity_or_wrong_arity_call(keyword_start, Expr::Literal(Literal::Null))
                 } else if self.matches_keyword("true") {
                     self.consume_keyword("true");
-                    Ok(Expr::Literal(Literal::Bool(true)))
+                    self.zero_arity_or_wrong_arity_call(
+                        keyword_start,
+                        Expr::Literal(Literal::Bool(true)),
+                    )
                 } else if self.matches_keyword("false") {
                     self.consume_keyword("false");
-                    Ok(Expr::Literal(Literal::Bool(false)))
+                    self.zero_arity_or_wrong_arity_call(
+                        keyword_start,
+                        Expr::Literal(Literal::Bool(false)),
+                    )
                 } else if self.matches_keyword("not") {
                     self.consume_keyword("not");
-                    Ok(Expr::Not)
+                    self.zero_arity_or_wrong_arity_call(keyword_start, Expr::Not)
                 } else if self.matches_keyword("if") {
                     self.parse_if_expr()
                 } else if self.matches_keyword("try") {
@@ -1443,8 +1450,14 @@ impl<'a> Parser<'a> {
                 } else if self.matches_keyword("break") {
                     self.parse_break_expr()
                 } else if let Some(builtin) = self.try_parse_builtin()? {
-                    // Allow postfix operations after builtins (e.g., env.PATH, keys[0])
-                    self.parse_postfix(Expr::Builtin(builtin))
+                    // #2110: a following `(` means this was actually a
+                    // wrong-arity call, not a bare builtin reference --
+                    // `zero_arity_or_wrong_arity_call` rewinds and re-parses
+                    // it as one instead of falling into `parse_postfix`,
+                    // which would just reject the `(` as a stray token.
+                    self.zero_arity_or_wrong_arity_call(keyword_start, Expr::Builtin(builtin))
+                        // Allow postfix operations after builtins (e.g., env.PATH, keys[0])
+                        .and_then(|expr| self.parse_postfix(expr))
                 } else {
                     // Phase 9: Try to parse as function call
                     self.parse_func_call_or_error()
@@ -2261,6 +2274,41 @@ impl<'a> Parser<'a> {
         };
 
         Ok(Expr::Format(format_type))
+    }
+
+    /// A zero-arity keyword (`null`/`true`/`false`/`not`, or anything
+    /// [`try_parse_builtin`] recognizes) immediately followed by `(` is a
+    /// wrong-arity call, not a stray token -- real jq resolves it at compile
+    /// time via name/arity resolution ("`length/1 is not defined`", the same
+    /// class #1473/#2037 already give a genuinely-undefined name), not as a
+    /// raw parser rejection of the `(` (#2110). Whitespace before `(` is
+    /// allowed too, matching real jq (`length (1)` errors identically to
+    /// `length(1)`).
+    ///
+    /// `start_pos` must be the position *before* the keyword was consumed:
+    /// on a hit, this rewinds there and re-parses the same text through
+    /// [`Self::parse_func_call_or_error`], which treats it as an ordinary
+    /// (name, args) call for the resolver to reject by arity -- exactly as
+    /// if the keyword recognizer had never matched at all. `if`-style syntax
+    /// keywords are not `Expr::FuncCall`-shaped in real jq either (`if(1)`
+    /// is a genuine syntax error there, not `if/1 is not defined`), so only
+    /// call this from a site that already recognized a true zero-arity
+    /// *builtin* or literal (`null`/`true`/`false`/`not`, or anything
+    /// [`try_parse_builtin`] recognizes) -- never from `if`/`try`/`reduce`/
+    /// `def`/etc.
+    ///
+    /// [`try_parse_builtin`]: Self::try_parse_builtin
+    fn zero_arity_or_wrong_arity_call(
+        &mut self,
+        start_pos: usize,
+        parsed: Expr,
+    ) -> Result<Expr, ParseError> {
+        self.skip_ws();
+        if self.peek() == Some('(') {
+            self.pos = start_pos;
+            return self.parse_func_call_or_error();
+        }
+        Ok(parsed)
     }
 
     /// Try to parse a builtin function.
