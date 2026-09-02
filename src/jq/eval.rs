@@ -40544,16 +40544,32 @@ fn bsearch_one_target<W: Clone + AsRef<[u64]>>(
 // Object functions
 
 /// Builtin: modulemeta - get module metadata for the input module name.
-/// Arity 0, matching real jq (#2035) -- but the stub below always returns
-/// `null` rather than erroring the way real jq's `modulemeta` always does;
-/// that runtime-behavior gap is pre-existing, recorded in
-/// docs/compliance/jq/limitations.md, and tracked in #2111.
+/// Arity 0, matching real jq (#2035). succinctly has no real module system to
+/// describe, and real jq's `modulemeta` is not a no-op even so -- it always
+/// errors: a type-check error if `.` isn't a string, otherwise a
+/// module-not-found error citing the name, since there is never a module to
+/// actually resolve in this repo's single-file CLI/library context.
+/// Verified live against jq 1.7.1: every input type errors, exit 5 --
+/// `null`/`123`/`true`/`[]`/`{}` all give "modulemeta input module name must
+/// be a string", any string (including `""`) gives "module not found: <name
+/// verbatim>". Both arms are ordinary `error(...)`-shaped and suppressible by
+/// `?`, unlike a decode failure (#1620) -- confirmed live,
+/// `("foo","null") | modulemeta?` produces no output, exit 0 (#2111).
 fn builtin_modulemeta<W: Clone + AsRef<[u64]>>(
-    _value: StandardJson<'_, W>,
-    _optional: bool,
+    value: StandardJson<'_, W>,
+    optional: bool,
 ) -> QueryResult<'_, W> {
-    // Return null as we don't support modules
-    QueryResult::Owned(OwnedValue::Null)
+    match &value {
+        StandardJson::String(s) => match s.as_str() {
+            Ok(_) if optional => QueryResult::None,
+            Ok(name) => QueryResult::Error(EvalError::new(format!("module not found: {name}"))),
+            Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
+        },
+        _ if optional => QueryResult::None,
+        _ => QueryResult::Error(EvalError::new(
+            "modulemeta input module name must be a string",
+        )),
+    }
 }
 
 /// Builtin: pick(keys) - select only specified keys from object/array (yq)
@@ -61105,9 +61121,32 @@ mod tests {
     }
 
     #[test]
-    fn test_modulemeta() {
-        // modulemeta is arity 0 in real jq (#2035); returns null (stub).
-        query!(b"null", "modulemeta", QueryResult::Owned(OwnedValue::Null) => {});
+    fn test_modulemeta_2111() {
+        // modulemeta is arity 0 in real jq (#2035). Real jq's modulemeta is
+        // not a no-op: a non-string `.` is a type-check error, verified live
+        // against jq 1.7.1.
+        query!(b"null", "modulemeta", QueryResult::Error(e) => {
+            assert_eq!(e.message, "modulemeta input module name must be a string");
+        });
+        query!(b"123", "modulemeta", QueryResult::Error(e) => {
+            assert_eq!(e.message, "modulemeta input module name must be a string");
+        });
+        // A string `.` always errors "module not found" -- there is never a
+        // real module to resolve in this repo's CLI/library context.
+        query!(br#""foo""#, "modulemeta", QueryResult::Error(e) => {
+            assert_eq!(e.message, "module not found: foo");
+        });
+        // Empty string still hits the module-not-found arm, not the
+        // type-check one -- verified live (`"" | jq modulemeta` -> "module
+        // not found: ", not a type error).
+        query!(br#""""#, "modulemeta", QueryResult::Error(e) => {
+            assert_eq!(e.message, "module not found: ");
+        });
+        // Both error shapes are ordinary, `?`-suppressible errors, unlike a
+        // decode failure (#1620) -- verified live, `modulemeta?` on either
+        // input produces no output rather than propagating.
+        query!(b"null", "modulemeta?", QueryResult::None => {});
+        query!(br#""foo""#, "modulemeta?", QueryResult::None => {});
     }
 
     #[test]

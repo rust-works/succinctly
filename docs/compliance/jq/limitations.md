@@ -28,14 +28,14 @@ For jq *feature* coverage rather than error wording, see
 
 ## Summary
 
-Measured against jq-1.7.1 over the 221 probes in
+Measured against jq-1.7.1 over the 223 probes in
 [`tests/data/jq-error-probes.tsv`](../../../tests/data/jq-error-probes.tsv), through
 **both** evaluators — the full one (`src/jq/eval.rs`) and the generic one
 (`src/jq/eval_generic.rs`, which the CLI uses):
 
 | Dimension                                    | Result              | Meaning                                                |
 |----------------------------------------------|---------------------|--------------------------------------------------------|
-| **Message text** (both evaluators, verbatim) | **219/221 = 99.1%** | Byte-identical to jq                                   |
+| **Message text** (both evaluators, verbatim) | **221/223 = 99.1%** | Byte-identical to jq                                   |
 | **Wording divergences**                      | **2**               | Both evaluators raise, but word it differently from jq |
 | **Behaviour / parser gaps**                  | **0**               | succinctly does not raise the error at all             |
 
@@ -2762,33 +2762,6 @@ still array-collapses `n` to `[1,2]`, then errors on the wrong type -- a
 narrower, lower-traffic case than the three arms fixed above, not attempted
 here). Full fan-out for it, if ever needed, remains out of scope per
 #1522's design doc.
-
-### `modulemeta` never errors, unlike real jq -- no carve-out; tracked in #2111
-
-Real jq's `modulemeta` is not a pure no-op: it reads `.` as a module name and always
-errors, since there is no module for it to actually find in ordinary use --
-non-string input gets a type error, any string gets "not found":
-
-```console
-$ echo 'null' | jq 'modulemeta'
-jq: error (at <stdin>:1): modulemeta input module name must be a string   # exit 5
-$ echo '"foo"' | jq 'modulemeta'
-jq: error (at <stdin>:1): module not found: foo                          # exit 5
-$ echo 'null' | succinctly jq 'modulemeta'
-null                                                                      # exit 0
-$ echo '"foo"' | succinctly jq 'modulemeta'
-null                                                                      # exit 0
-```
-
-`builtin_modulemeta` (`src/jq/eval.rs`) unconditionally returns `null` and ignores its
-input entirely -- a stub comment ("we don't support modules") that predates
-[#2035](https://github.com/rust-works/succinctly/issues/2035), which fixed only the
-builtin's *arity* (the parser previously demanded `modulemeta(name)`, inverted from
-jq's actual `modulemeta/0`) and did not touch this runtime behavior. None of ADR-0018's
-four permitted conditions cover it -- matching jq's error here would corrupt nothing,
-discard no write, and cannot crash the process -- so per rule 4 it is recorded here as a
-still-open gap rather than an accepted-forever divergence. Tracked in
-[#2111](https://github.com/rust-works/succinctly/issues/2111).
 
 ### `range`'s own accumulation cap (#2089): a resource-exhaustion guard, now raising instead of silently truncating
 

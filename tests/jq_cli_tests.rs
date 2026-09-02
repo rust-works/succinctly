@@ -29799,11 +29799,7 @@ fn test_unimplemented_jq_builtin_still_errors_when_reached_1473() -> Result<()> 
 /// a paren'd argument) -- succinctly's parser previously demanded
 /// `modulemeta(...)`, inverted from jq's actual grammar. The arity/parse
 /// dimension below is confirmed against the pinned oracle (`/usr/bin/jq`,
-/// jq-1.7.1) (#2035). The second assertion pins succinctly's current stub
-/// behavior (always `null`), not oracle-matched output -- real jq's
-/// `modulemeta` always errors instead (see
-/// docs/compliance/jq/limitations.md and #2111, which tracks closing that
-/// separate, pre-existing gap).
+/// jq-1.7.1) (#2035).
 #[test]
 fn test_modulemeta_is_arity_zero_2035() -> Result<()> {
     // Bare `modulemeta`, no parens, must parse -- matching `if false then
@@ -29814,11 +29810,38 @@ fn test_modulemeta_is_arity_zero_2035() -> Result<()> {
     assert_eq!(code, 0, "stderr: {stderr:?}");
     assert_eq!(stdout.trim_end(), "1");
 
-    // Reached, bare `modulemeta` does not error -- succinctly's stub
-    // (#2111, not real jq's own behavior, which always errors).
-    let (stdout, stderr, code) = run_jq_full(&["-nc", "modulemeta"], None)?;
+    Ok(())
+}
+
+/// Real jq's `modulemeta` is not a pure no-op: it always errors, since there
+/// is never a real module to resolve in this repo's single-file CLI/library
+/// context -- a type-check error for non-string `.`, otherwise "module not
+/// found" citing the name. `builtin_modulemeta` (`src/jq/eval.rs`) used to
+/// unconditionally return `null`, ignoring `.` entirely; both cases now
+/// raise, matching the pinned oracle (`/usr/bin/jq`, jq-1.7.1) byte for byte
+/// (#2111).
+#[test]
+fn test_modulemeta_always_errors_like_jq_2111() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "modulemeta"], Some("null"))?;
+    assert_eq!(stdout, "", "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("modulemeta input module name must be a string"),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5);
+
+    let (stdout, stderr, code) = run_jq_full(&["-c", "modulemeta"], Some(r#""foo""#))?;
+    assert_eq!(stdout, "", "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("module not found: foo"),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5);
+
+    // `?` suppresses both -- ordinary errors, not decode failures (#1620).
+    let (stdout, stderr, code) = run_jq_full(&["-c", "modulemeta?"], Some("null"))?;
+    assert_eq!(stdout, "", "stderr: {stderr:?}");
     assert_eq!(code, 0, "stderr: {stderr:?}");
-    assert_eq!(stdout.trim_end(), "null");
 
     Ok(())
 }

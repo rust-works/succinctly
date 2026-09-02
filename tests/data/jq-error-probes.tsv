@@ -363,3 +363,7 @@ infinite_preview	scan(infinite)	"x"
 neg_infinite_preview	scan(-infinite)	"x"
 nan_preview	scan(nan)	"x"
 arithmetic_overflow_preview	scan(1e300*1e300)	"x"
+
+# ── modulemeta always errors: type-check or module-not-found (#2111) ───────
+modulemeta_non_string	modulemeta	null
+modulemeta_not_found	modulemeta	"foo"
