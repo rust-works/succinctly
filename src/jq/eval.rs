@@ -33052,12 +33052,14 @@ fn builtin_truncate_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #2188 audit: unlike `builtin_fromstream`'s identical shape, bare
         // `collect_owned` here is safe by construction, not just untested --
         // `stream_expr` is evaluated against this same `value`, which also
-        // becomes `depth` a few lines up. Any `value` complex enough for
-        // `stream_expr` to reach a nested undecodable string through it is
-        // necessarily a container (object/array), and a container always
-        // sorts above any `Int` path length in jq's ordering (`compare_values`
+        // becomes `depth` a few lines up. `value` itself being an undecodable
+        // `String` is not `depth`'s only non-scalar-in-effect case either:
+        // whether `value` is a container reachable via a nested field/index,
+        // or is directly the undecodable string, `depth` ends up either a
+        // container or a `String` -- and a `String`/container both always
+        // sort above any `Int` path length in jq's ordering (`compare_values`
         // just below) -- so `path_len > depth` is provably false for every
-        // event whenever `depth` is non-scalar, meaning every event is
+        // event whenever `depth` is non-numeric, meaning every event is
         // dropped before an undecodable leaf's silently-substituted `""`
         // could ever reach `outputs`. `stream_expr` has no other source of
         // document-backed (as opposed to literal/computed) content to draw
