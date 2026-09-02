@@ -55,6 +55,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   invariant, flagged in `map_subexprs`'s own doc comment for follow-up
   rather than silently changed here.
 
+- **`BoundBody::get_or_try_init` now uses `OnceCell::set` instead of
+  `get_or_init` to populate its cache** (#2092, finding #6). In this
+  single-threaded, non-reentrant-by-design cache, the cell cannot
+  legitimately already hold a value by the time `bind` finishes — `set`
+  makes that invariant self-checking (a panic if it's ever violated)
+  instead of `get_or_init`'s silent "discard my freshly-bound value, return
+  whatever's already there." No behavior change on any currently-reachable
+  path.
+
+  #2092's other finding in this area — a duplicated `Shared`/`DefCall`
+  passthrough block between `substitute_func_param` and
+  `substitute_var_impl` (finding #5) — turned out to already be resolved as
+  a side effect of #2095's `map_subexprs` refactor above: both functions'
+  `DefCall` arms now fall through to `map_subexprs`'s single shared default
+  arm rather than each carrying their own copy, closing the exact
+  `bound`-reset drift risk finding #5 described. Only the one-line
+  `Expr::Shared` arm remains duplicated between them, which #2095's own doc
+  comment explains is deliberately kept explicit in each caller rather than
+  folded. #2092's four remaining findings (##1-4) are real algorithmic
+  inefficiencies on the `def` recursive-call hot path, but each needs
+  interleaved hardware A/B benchmark evidence before landing per this
+  project's benchmarking discipline — split out to #2194 rather than
+  bundled into this refactor-only change.
+
 ### Fixed
 
 - **`IN(s)`/`IN(src; s)` now forward the real ambient `optional` instead of
