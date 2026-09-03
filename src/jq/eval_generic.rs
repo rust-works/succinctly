@@ -7871,7 +7871,17 @@ fn index_one_generic<S: EvalSemantics, V: DocumentValue>(
             // and NaN has no index at all — also null.
             let idx = numeric_key_to_index(key);
             if let Some(elements) = target.as_array() {
-                let len = elements.len();
+                // #2261: `len_checked`, not the bare `len()` -- this
+                // resolves *any* index (`E[K]`, e.g. `.[0,1]`, `.[$i]`),
+                // not just a negative one, so the length walk (needed to
+                // normalize a negative index and to raise yq's own
+                // out-of-range error below) already happens unconditionally
+                // on every call, same reasoning as the literal-index
+                // sibling arm in `eval_single`'s own `Expr::Index`.
+                let len = match elements.len_checked() {
+                    Ok(len) => len,
+                    Err(err) => return GenericResult::Error(err),
+                };
                 let resolved = idx.map(|idx| if idx < 0 { len as i64 + idx } else { idx });
                 // yq mode only (#2254): same rule as `eval_single`'s
                 // `Expr::Index` arm above -- a negative index still
@@ -8815,17 +8825,34 @@ fn eval_has_one_key<S: EvalSemantics, V: DocumentValue>(
         return GenericResult::Owned(OwnedValue::Bool(false));
     }
     match (&key_owned, value.as_object(), value.as_array()) {
-        (OwnedValue::String(key), Some(fields), _) => {
-            GenericResult::Owned(OwnedValue::Bool(fields.contains(key)))
-        }
+        // #2261: `contains_checked`, not the bare `contains` -- catches a
+        // trailing stray comma (`{"a":1,} | has("a")`), a #1194 unpaired
+        // tail, and a #1677 delimiter fault, none of which `contains`
+        // itself ever checked. See `contains_checked`'s own doc comment
+        // for why this walks to completion (a real cost increase for the
+        // "key found early" case) rather than riding an already-mandatory
+        // walk for free like every other #2261 fix.
+        (OwnedValue::String(key), Some(fields), _) => match fields.contains_checked(key) {
+            Ok(found) => GenericResult::Owned(OwnedValue::Bool(found)),
+            Err(err) => GenericResult::Error(err),
+        },
         (
             OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..),
             _,
             Some(elements),
         ) => {
+            // #2261: `len_checked`, not the bare `len()` -- `elements.len()`
+            // already needed the whole array's cursor walk (`in_bounds`
+            // reads only the count, never a value), so the #1677/#2261 gap
+            // checks ride along for free, same reasoning as
+            // `Expr::Index`'s own array arm in `eval_single`.
+            let len = match elements.len_checked() {
+                Ok(len) => len,
+                Err(err) => return GenericResult::Error(err),
+            };
             let in_bounds = match numeric_key_to_array_index::<S>(&key_owned) {
                 None => false,
-                Some(idx) => index_in_array_bounds::<S>(idx, elements.len() as i64),
+                Some(idx) => index_in_array_bounds::<S>(idx, len as i64),
             };
             GenericResult::Owned(OwnedValue::Bool(in_bounds))
         }
@@ -9307,7 +9334,15 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
                     }
                     Ok(())
                 } else if let Some(elements) = v.as_array() {
-                    for (i, ec) in elements.collect_cursors().into_iter().enumerate() {
+                    // #2261 (systematic sweep): `collect_cursors_checked`,
+                    // not the unchecked `collect_cursors` this arm used --
+                    // the object arm just above already routes through the
+                    // checked `effective_fields_checked`; this array
+                    // sibling had drifted onto the wrong one, so
+                    // `[path(.[])]` on `[1,2,3,]` silently answered
+                    // `[[0],[1],[2]]` instead of raising like every other
+                    // `.[]` consumer already does.
+                    for (i, ec) in elements.collect_cursors_checked()?.into_iter().enumerate() {
                         out.push((
                             PathTrail::extend(path, OwnedValue::Int(i as i64)),
                             PathNode::At(ec),
@@ -10072,8 +10107,13 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 use rand_chacha::ChaCha8Rng;
 
                 if let Some(elements) = value.as_array() {
-                    let mut values: Vec<OwnedValue> =
-                        owned_or_err!(to_owned_all_cursors(&elements.collect_cursors()));
+                    // #2261 (systematic sweep): `collect_cursors_checked`,
+                    // not the unchecked `collect_cursors` this arm used --
+                    // this walk already materializes every element via
+                    // `to_owned_all_cursors` regardless, so the #1677/#2261
+                    // gap checks ride along for free.
+                    let cursors = owned_or_err!(elements.collect_cursors_checked());
+                    let mut values: Vec<OwnedValue> = owned_or_err!(to_owned_all_cursors(&cursors));
                     let mut rng = ChaCha8Rng::from_rng(&mut rand::rng());
                     values.shuffle(&mut rng);
                     GenericResult::Owned(OwnedValue::Array(values))
@@ -10094,8 +10134,11 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 
         Builtin::Pivot => {
             if let Some(elements) = value.as_array() {
-                let items: Vec<OwnedValue> =
-                    owned_or_err!(to_owned_all_cursors(&elements.collect_cursors()));
+                // #2261 (systematic sweep): same `collect_cursors_checked`
+                // fix as `Shuffle` just above -- free here too, for the
+                // same reason.
+                let cursors = owned_or_err!(elements.collect_cursors_checked());
+                let items: Vec<OwnedValue> = owned_or_err!(to_owned_all_cursors(&cursors));
                 if items.is_empty() {
                     return GenericResult::Owned(OwnedValue::Array(vec![]));
                 }
@@ -10261,7 +10304,17 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 // lazy (#684) — don't materialize a `Vec<OwnedValue::Int>`
                 // yet; `length`, `.[]`, `.[n]`, `first`, and `last` can all
                 // answer directly from `len` (see the `Pipe` dispatch below).
-                GenericResult::LazyIndexRange(elements.len())
+                //
+                // #2261: `len_checked`, not the bare `len()` -- this call
+                // already walks the whole array to answer `len` (same as
+                // `Builtin::Length`'s own array arm), so the #1677/#2261
+                // gap checks ride along for free, and `[1,2,3,] | keys`
+                // now agrees with real jq (parse error) instead of
+                // silently returning `[0,1,2]`.
+                match elements.len_checked() {
+                    Ok(len) => GenericResult::LazyIndexRange(len),
+                    Err(err) => GenericResult::Error(err),
+                }
             } else {
                 decode_failure_or(&value, optional, || {
                     GenericResult::Error(EvalError::has_no_keys(&to_owned_for_diagnostic(
@@ -10284,8 +10337,13 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     collapse: S::COLLAPSE_DUPLICATE_KEYS,
                 }
             } else if let Some(elements) = value.as_array() {
-                // Same laziness as the array branch of `Keys` above (#684).
-                GenericResult::LazyIndexRange(elements.len())
+                // Same laziness as the array branch of `Keys` above (#684),
+                // and the same #2261 fix: `len_checked` rides the same
+                // already-mandatory walk.
+                match elements.len_checked() {
+                    Ok(len) => GenericResult::LazyIndexRange(len),
+                    Err(err) => GenericResult::Error(err),
+                }
             } else {
                 decode_failure_or(&value, optional, || {
                     GenericResult::Error(EvalError::has_no_keys(&to_owned_for_diagnostic(
@@ -10523,7 +10581,16 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         Builtin::Last => {
             // jq: last == .[-1], so [] and null both yield null
             if let Some(elements) = value.as_array() {
-                let len = elements.len();
+                // #2261: `len_checked`, not the bare `len()` -- unlike
+                // `Builtin::First` just above (genuinely O(1) via
+                // `get_cursor(0)`, left unchecked per #1629's precedent),
+                // `last` already has to walk the whole array to find its
+                // own length, so the #1677/#2261 gap checks ride along for
+                // free on that same mandatory walk.
+                let len = match elements.len_checked() {
+                    Ok(len) => len,
+                    Err(err) => return GenericResult::Error(err),
+                };
                 match len.checked_sub(1).and_then(|i| elements.get_cursor(i)) {
                     Some(c) => GenericResult::OneCursor(c),
                     None => GenericResult::Owned(OwnedValue::Null),
@@ -10591,7 +10658,11 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 );
             }
             if let Some(elements) = value.as_array() {
-                let mut cursors = elements.collect_cursors();
+                // #2261 (systematic sweep): `collect_cursors_checked`, not
+                // the unchecked `collect_cursors` this arm used -- this
+                // walk already resolves every element's cursor to reverse
+                // them, so the #1677/#2261 gap checks ride along for free.
+                let mut cursors = owned_or_err!(elements.collect_cursors_checked());
                 cursors.reverse();
                 GenericResult::LazySeq(Box::new(LazySeq::from_cursors(cursors)))
             } else if optional {
@@ -10636,24 +10707,25 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 _ => None,
             };
             let dedup = matches!(builtin, Builtin::Unique | Builtin::UniqueBy(_));
-            sort_family_array_generic::<S, _>(
-                elements.collect_cursors(),
-                key,
-                optional,
-                |mut keyed| {
-                    sort_keyed_elements::<V>(&mut keyed);
-                    if dedup {
-                        // `owned_value_eq::<S>`, not `compare_values(..) ==
-                        // Equal`: the sort above stays widening, but two
-                        // elements only count as duplicates under `==`'s own
-                        // yq-mode strict Int/Float distinction (#950). Same
-                        // choice `eval::builtin_unique` makes, reused rather
-                        // than re-derived.
-                        keyed.dedup_by(|(a, _), (b, _)| owned_value_eq::<S>(a, b));
-                    }
-                    keyed.into_iter().map(|(_, cursor)| cursor).collect()
-                },
-            )
+            // #2261 (systematic sweep): `collect_cursors_checked`, not the
+            // unchecked `collect_cursors` this arm used -- every one of
+            // these builtins already resolves each element's cursor to
+            // sort/dedup them, so the #1677/#2261 gap checks ride along
+            // for free.
+            let cursors = owned_or_err!(elements.collect_cursors_checked());
+            sort_family_array_generic::<S, _>(cursors, key, optional, |mut keyed| {
+                sort_keyed_elements::<V>(&mut keyed);
+                if dedup {
+                    // `owned_value_eq::<S>`, not `compare_values(..) ==
+                    // Equal`: the sort above stays widening, but two
+                    // elements only count as duplicates under `==`'s own
+                    // yq-mode strict Int/Float distinction (#950). Same
+                    // choice `eval::builtin_unique` makes, reused rather
+                    // than re-derived.
+                    keyed.dedup_by(|(a, _), (b, _)| owned_value_eq::<S>(a, b));
+                }
+                keyed.into_iter().map(|(_, cursor)| cursor).collect()
+            })
         }
 
         // The single-element half of the same family. `min`/`max` answer one
@@ -10672,7 +10744,12 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     optional,
                 );
             };
-            let cursors = elements.collect_cursors();
+            // #2261 (systematic sweep): `collect_cursors_checked`, not the
+            // unchecked `collect_cursors` this arm used -- every one of
+            // these builtins already resolves each element's cursor to
+            // compare them, so the #1677/#2261 gap checks ride along for
+            // free.
+            let cursors = owned_or_err!(elements.collect_cursors_checked());
             // jq answers `null` for an empty array, for all four spellings.
             if cursors.is_empty() {
                 return GenericResult::Owned(OwnedValue::Null);
