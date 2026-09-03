@@ -3816,9 +3816,7 @@ fn each_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // identical arm too -- reached from e.g. `any(.a[-5]?; .)`, whose
         // generator argument runs through this function via `eval_each`'s
         // own `Expr::Optional` dispatch.
-        Flow::Escaped(Control::Error(e))
-            if e.is_decode_failure() || e.is_yq_negative_index_error() =>
-        {
+        Flow::Escaped(Control::Error(e)) if e.is_uncatchable_at_value_position() => {
             Flow::Escaped(Control::Error(e))
         }
         Flow::Escaped(Control::Error(e)) => match catch {
@@ -6420,9 +6418,7 @@ fn eval_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // there too keeps one consistent "never caught" rule rather than
         // one that depends on whether a catch handler happens to be
         // present.
-        QueryResult::Error(e) if e.is_decode_failure() || e.is_yq_negative_index_error() => {
-            QueryResult::Error(e)
-        }
+        QueryResult::Error(e) if e.is_uncatchable_at_value_position() => QueryResult::Error(e),
         // If error, use catch handler or return nothing. jq runs the handler
         // with the *raised value* as its input, not the original input, so
         // `try error("boom") catch .` yields "boom".
@@ -6442,9 +6438,7 @@ fn eval_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Same #1620 decode-failure exclusion as the bare `Error` arm above
         // -- a `Partial` ending in a decode failure must still propagate
         // uncaught, not run the catch handler.
-        QueryResult::Partial(prefix, Control::Error(e))
-            if e.is_decode_failure() || e.is_yq_negative_index_error() =>
-        {
+        QueryResult::Partial(prefix, Control::Error(e)) if e.is_uncatchable_at_value_position() => {
             QueryResult::Partial(prefix, Control::Error(e))
         }
         // The body produced some outputs before erroring (#400): emit them
@@ -32127,30 +32121,6 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
     )
 }
 
-/// Which errors survive `eval_stage_with_path_context`'s own
-/// `Expr::Optional`/`Expr::Try` dispatch unconditionally -- deliberately
-/// narrower than [`EvalError::is_uncatchable`], which also includes
-/// `is_invalid_path_expression()`. That inclusion is correct for
-/// `resolve_node`'s own path-tracking resolver (`path()`/`getpath`'s own
-/// walker), but wrong here: `eval_stage_with_path_context` runs whenever
-/// *any* sibling elsewhere in the same pipe needs path context
-/// (`key`/`parent`/`file_index`/`path`), not only when the branch actually
-/// being dispatched is itself a path expression -- so an ordinary
-/// `path(1)` call reached through here (because an unrelated `key` sits
-/// elsewhere in the pipe) must stay catchable the same way it is at
-/// top-level/value position. Confirmed live against jq 1.7.1: `.a | (try
-/// path(1) catch "x"), key` gives `"x"` then `null` in real jq;
-/// `is_uncatchable()`'s own broader check made this arm's `try`/`catch`
-/// wrongly escape uncaught instead (found by code review on #2289, after
-/// #2227 had already introduced the same over-broadening one arm up, in
-/// `Expr::Optional`). Matches the same exclusion
-/// `eval_try`/`each_try`/`try_single_generic`/`each_try_generic` already
-/// apply at pure value position -- see [`EvalError::is_uncatchable`]'s own
-/// doc comment for why those four stay narrower too.
-fn path_context_stage_uncatchable(e: &EvalError) -> bool {
-    e.is_decode_failure() || e.is_yq_negative_index_error()
-}
-
 /// One pipe stage, plus the stages that follow it, threaded by borrow.
 ///
 /// Split out of `eval_pipe_with_path_context_internal` (#1510) so the arms
@@ -32793,25 +32763,34 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let caught = match inner_result {
                 // #2254/#2289 review: an uncatchable error (a yq
                 // negative-index raise or a decode failure --
-                // `path_context_stage_uncatchable`'s own doc comment has
-                // the full rationale for why this is narrower than
-                // `is_uncatchable()`) must survive this bare `?` the same
-                // way `resolve_node`'s own `Expr::Optional` arm already
+                // `EvalError::is_uncatchable_at_value_position`'s own doc
+                // comment has the full rationale for why this is narrower
+                // than `is_uncatchable()`) must survive this bare `?` the
+                // same way `resolve_node`'s own `Expr::Optional` arm already
                 // guarantees for path-tracking evaluation -- confirmed live
                 // that `.a[-5]? | key` wrongly swallowed the error and
-                // exited 0 with no output before this guard existed. The
-                // uncatchable case falls through to `other => other` below,
-                // unchanged. `Break` has no error payload to check and
-                // stays unconditionally caught here, matching
-                // `eval_try`/`each_try`'s own bare-`?` semantics (#562).
-                QueryResult::Error(e) if !path_context_stage_uncatchable(&e) => QueryResult::None,
-                QueryResult::Break(_) => QueryResult::None,
+                // exited 0 with no output before this guard existed.
+                // Structured to mirror `eval_try`'s own identical arm
+                // (`is_decode_failure()`-only there, #1620) rather than
+                // `resolve_node`'s negated-guard-plus-catch-all shape: this
+                // arm and `Expr::Try`'s below share the same `QueryResult`
+                // representation `eval_try` does, `resolve_node`'s own
+                // `Result<_, (prefix, EvalEscape)>` doesn't. `Break` has no
+                // error payload to check and stays unconditionally caught
+                // here, matching `eval_try`/`each_try`'s own bare-`?`
+                // semantics (#562).
+                QueryResult::Error(e) if e.is_uncatchable_at_value_position() => {
+                    QueryResult::Error(e)
+                }
+                QueryResult::Error(_) | QueryResult::Break(_) => QueryResult::None,
                 QueryResult::Partial(prefix, Control::Error(e))
-                    if !path_context_stage_uncatchable(&e) =>
+                    if e.is_uncatchable_at_value_position() =>
                 {
+                    QueryResult::Partial(prefix, Control::Error(e))
+                }
+                QueryResult::Partial(prefix, Control::Error(_) | Control::Break(_)) => {
                     owned_vec_to_result(prefix)
                 }
-                QueryResult::Partial(prefix, Control::Break(_)) => owned_vec_to_result(prefix),
                 other => other,
             };
             if rest.is_empty() {
@@ -34266,9 +34245,11 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // Each output continues `rest` from its own path, not this
             // arm's ambient one -- see `path_probe_stage` (#1409).
             let paired = !rest.is_empty() && rest.iter().any(needs_path_context);
-            // One probe for the whole arm, shared by the body and by
-            // whichever catch handler runs -- the closure this replaces
-            // deep-cloned its argument on each of up to five calls (#1510).
+            // Probe for the try body only -- each catch-handler call below
+            // builds its own single-expression slice from `catch_expr`
+            // directly instead, so this isn't shared the way an earlier
+            // version of this comment claimed (review, #2289). Avoids
+            // deep-cloning the body on each of up to five calls (#1510).
             let probe = probe_stages(paired);
             // Evaluate the try body (and catch handler) through the
             // path-context evaluator too, so `try select(file_index == 1)
@@ -34298,33 +34279,35 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let try_result = match result {
                 // #2270/#2289 review: an uncatchable error (a decode
                 // failure or a yq negative-index raise --
-                // `path_context_stage_uncatchable`'s own doc comment has
-                // the full rationale for why this is narrower than
-                // `is_uncatchable()`) must survive `try`/`catch` here the
-                // same way `resolve_node`'s own `Expr::Try` arm already
-                // guarantees for path-tracking evaluation, and the same
-                // way this function's own `Expr::Optional` arm does
-                // (#2227) -- confirmed live that
-                // `(try .[0].a[-5] catch "c"), file_index` under
-                // `--eval-all` wrongly ran the catch handler before this
-                // guard existed. The uncatchable case falls through to
-                // `other => other` below, unchanged.
-                QueryResult::Error(e) if !path_context_stage_uncatchable(&e) => {
-                    match catch.as_deref() {
-                        Some(catch_expr) => pair_outputs_with_path::<W>(
-                            eval_pipe_with_path_context_internal::<W, S>(
-                                core::slice::from_ref(catch_expr),
-                                &e.payload(),
-                                root,
-                                file_origin,
-                                current_path,
-                                optional,
-                            ),
-                            paired.then_some(current_path),
-                        ),
-                        None => QueryResult::None,
-                    }
+                // `EvalError::is_uncatchable_at_value_position`'s own doc
+                // comment has the full rationale for why this is narrower
+                // than `is_uncatchable()`) must survive `try`/`catch` here
+                // the same way `resolve_node`'s own `Expr::Try` arm already
+                // guarantees for path-tracking evaluation, and the same way
+                // this function's own `Expr::Optional` arm does (#2227) --
+                // confirmed live that `(try .[0].a[-5] catch "c"),
+                // file_index` under `--eval-all` wrongly ran the catch
+                // handler before this guard existed. Structured to mirror
+                // `eval_try`'s own identical arm (positive guard, explicit
+                // early return) rather than a negated-guard-plus-catch-all
+                // shape, matching `Expr::Optional`'s own arm just above.
+                QueryResult::Error(e) if e.is_uncatchable_at_value_position() => {
+                    QueryResult::Error(e)
                 }
+                QueryResult::Error(e) => match catch.as_deref() {
+                    Some(catch_expr) => pair_outputs_with_path::<W>(
+                        eval_pipe_with_path_context_internal::<W, S>(
+                            core::slice::from_ref(catch_expr),
+                            &e.payload(),
+                            root,
+                            file_origin,
+                            current_path,
+                            optional,
+                        ),
+                        paired.then_some(current_path),
+                    ),
+                    None => QueryResult::None,
+                },
                 QueryResult::Break(_) => match catch.as_deref() {
                     Some(catch_expr) => pair_outputs_with_path::<W>(
                         eval_pipe_with_path_context_internal::<W, S>(
@@ -34340,8 +34323,11 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     None => QueryResult::None,
                 },
                 QueryResult::Partial(prefix, Control::Error(e))
-                    if !path_context_stage_uncatchable(&e) =>
+                    if e.is_uncatchable_at_value_position() =>
                 {
+                    QueryResult::Partial(prefix, Control::Error(e))
+                }
+                QueryResult::Partial(prefix, Control::Error(e)) => {
                     let handled = match catch.as_deref() {
                         Some(catch_expr) => pair_outputs_with_path::<W>(
                             eval_pipe_with_path_context_internal::<W, S>(

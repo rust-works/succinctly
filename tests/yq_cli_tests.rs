@@ -28882,10 +28882,16 @@ fn test_negative_index_out_of_range_survives_try_catch_partial_prefix_2270() -> 
 /// `path(<non-path-expr>)` call reached through here (because an unrelated
 /// `key`/`file_index` sits elsewhere in the pipe) must stay catchable the
 /// same way it is at top-level/value position. Confirmed live against jq
-/// 1.7.1: `.a | (try path(1) catch "x"), key` gives `"x"` then `"a"` there;
-/// `is_uncatchable()`'s own broader check (which includes
+/// 1.7.1 that bare `.a | try path(1) catch "x"` (no `key` sibling) gives
+/// `"x"` there -- `key` is a succinctly-only path-context extension real
+/// jq's own lexer rejects outright (`key/0 is not defined`), so the query
+/// this test actually runs has no real-jq equivalent to check against; it
+/// pins succinctly's own internal consistency instead (the unrelated `key`
+/// sibling must not change what `try path(1) catch "x"` alone already
+/// does). `is_uncatchable()`'s own broader check (which includes
 /// `is_invalid_path_expression()`) made both this arm and its `Expr::Optional`
-/// sibling wrongly let the error escape uncaught instead, before this fix.
+/// sibling wrongly let the error escape uncaught once `key` forced
+/// path-context dispatch, before this fix.
 #[test]
 fn test_invalid_path_expression_stays_catchable_under_path_context_dispatch_2289() -> Result<()> {
     let (out, stderr, code) =
