@@ -1708,7 +1708,7 @@ and differently-shaped problem than this section's own fixes):
 - **`src/jq/eval.rs`'s parallel evaluator** -- a second, independently-tested
   evaluator behind the crate's public `jq::eval`/`jq::eval_lenient`/
   `jq::eval_owned_with_file_index` entry points (see
-  `tests/jq_evaluator_parity_tests.rs`), not `eval_generic.rs`, backs `has(key)`
+  `tests/jq_evaluator_parity_tests.rs`), not `eval_generic.rs`, backed `has(key)`
   (object arm, a raw `.any()` with zero gap checks), `length` (array arm
   `.count()`, object arm bare `effective_len`), and `keys`/`keys_unsorted`
   (array arm `.count()`) -- the identical unchecked shape this whole issue
@@ -1729,9 +1729,30 @@ and differently-shaped problem than this section's own fixes):
   already established for `to_owned_with_comments_at_depth` above -- a caller
   of the public library API who builds their own cursor directly from raw,
   unvalidated document bytes (bypassing both CLIs' own materialization step)
-  would still observe the gap. Recommended as its own follow-up issue
-  (tracking `eval.rs`/`eval_generic.rs` parity for the whole #2261 family), not
-  folded in here.
+  would still observe the gap.
+
+  **Fixed by #2293**: `has_one_key`'s object arm now uses `contains_checked`
+  (also closing the #2288 non-string-key gap item 3 below used to track
+  separately -- `contains_checked` already checks for that as part of its
+  own walk), its array arm and `builtin_length`/`builtin_keys`'s array arms
+  now use `len_checked`, and `builtin_length`'s object arm now uses
+  `effective_len_checked`. Parity pinned in
+  `tests/jq_evaluator_parity_tests.rs`'s
+  `test_parity_eval_rs_trailing_comma_sibling_gaps_2293`. Still inert for
+  both CLIs today, same reachability analysis as above -- real only for a
+  library consumer building a cursor directly from raw bytes. The broader
+  "systematic sweep of the rest of `eval.rs`" #2293's own issue also
+  suggested (dozens of further `StandardJson::Array`/`StandardJson::Object`
+  match sites in that file, most already covered by other routes) remains
+  unaddressed and would need its own follow-up issue if pursued.
+
+  Writing that parity test also surfaced a further, unrelated, **live and
+  CLI-reachable** bug shared by *both* evaluators: `{"a":1,} | length` in jq
+  mode (`collapse: true`) silently returns `1` instead of raising --
+  `effective_len_checked`'s `census` path never calls `trailing_gap_ok` at
+  all, unlike every sibling helper in this file. Filed as #2307; not fixed
+  by #2293, which only brings `eval.rs` in line with `eval_generic.rs`'s
+  *existing* behavior, not fixes a bug both evaluators already shared.
 
 Two further leads from the same sweep were investigated and **not**
 reproduced live (so not reported as confirmed bugs, only as ruled out):
@@ -1820,12 +1841,14 @@ existing, already-proven checks within the same file -- not the broader, riskier
 `eval.rs`-wide sweep #2293 recommends as its own issue.
 
 **3. `eval.rs`'s own `has_one_key` (its object arm, a raw `.any()` with zero gap checks)
-shares this same #2288 non-string-key gap** -- already tracked as part of #2293's own
+shared this same #2288 non-string-key gap** -- tracked as part of #2293's own
 "`eval.rs`'s parallel evaluator" umbrella finding (filed alongside `builtin_length`/
 `builtin_keys`'s identical shape during #2261's own round-2 review), not a new discovery
-here. Same reachability analysis applies: `succinctly yq`'s one call site into `eval.rs`
-only ever sees an already-materialized, pre-validated `OwnedValue`, so this is inert for
-both CLIs today. Not re-filed as a separate issue; see #2293 for the tracking.
+here. **Fixed by #2293**: the object arm now uses `contains_checked`, which already
+performs this exact check as part of its own walk, so no separate fix was needed here
+beyond switching helpers. Same reachability analysis applies: `succinctly yq`'s one call
+site into `eval.rs` only ever sees an already-materialized, pre-validated `OwnedValue`, so
+this remains inert for both CLIs today, same as the rest of #2293's fix.
 
 ## Refusing an allocation jq does not survive
 

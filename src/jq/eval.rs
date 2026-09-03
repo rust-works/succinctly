@@ -39,9 +39,10 @@ use std::rc::Rc;
 use indexmap::IndexMap;
 
 use super::document::{
-    effective_fields, effective_fields_checked, effective_keys, effective_len, key_delimiter_ok,
-    key_display_string, key_display_string_kind, resolve_display_key, trailing_element_gap_ok,
-    value_delimiter_ok, DisplayKeyGuard, DocumentCursor, DocumentElements, DocumentFields,
+    effective_fields, effective_fields_checked, effective_keys, effective_len_checked,
+    key_delimiter_ok, key_display_string, key_display_string_kind, resolve_display_key,
+    trailing_element_gap_ok, value_delimiter_ok, DisplayKeyGuard, DocumentCursor, DocumentElements,
+    DocumentFields,
 };
 use super::slice::{self, SliceBounds};
 use super::walk::{any_subexpr, map_builtin_subexprs, map_subexprs};
@@ -7074,14 +7075,25 @@ fn builtin_length<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Ok(cow) => QueryResult::Owned(OwnedValue::Int(cow.chars().count() as i64)),
             Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
         },
-        StandardJson::Array(elements) => {
-            QueryResult::Owned(OwnedValue::Int((*elements).count() as i64))
-        }
+        // #2293: `len_checked`, not the bare `count()` -- the same
+        // #1677/#2261 gap checks `eval_generic.rs`'s own `Length` arm
+        // closed for this exact shape (#2291). Currently unreachable from
+        // either shipped CLI (see this fix's issue for why), but a real
+        // gap for a library consumer of `jq::eval*` navigating raw,
+        // unvalidated document bytes directly.
+        StandardJson::Array(elements) => match (*elements).len_checked() {
+            Ok(len) => QueryResult::Owned(OwnedValue::Int(len as i64)),
+            Err(e) => QueryResult::Error(e),
+        },
         // Distinct keys in jq mode (#1385); every occurrence in yq mode.
-        StandardJson::Object(fields) => QueryResult::Owned(OwnedValue::Int(effective_len(
-            fields,
-            S::COLLAPSE_DUPLICATE_KEYS,
-        ) as i64)),
+        // #2293: `effective_len_checked`, not the bare `effective_len` --
+        // same reasoning as the array arm above.
+        StandardJson::Object(fields) => {
+            match effective_len_checked(fields, S::COLLAPSE_DUPLICATE_KEYS) {
+                Ok(len) => QueryResult::Owned(OwnedValue::Int(len as i64)),
+                Err(e) => QueryResult::Error(e),
+            }
+        }
         StandardJson::Number(n) => {
             // Length of a number is its absolute value.
             // checked_abs: i64::MIN has no i64 absolute value; use f64
@@ -7175,7 +7187,13 @@ fn builtin_keys<W: Clone + AsRef<[u64]>>(
         }
         StandardJson::Array(elements) => {
             // For arrays, keys returns indices [0, 1, 2, ...]
-            let len = elements.count();
+            // #2293: `len_checked`, not the bare `count()` -- same
+            // #1677/#2261 gap `eval_generic.rs`'s own `Keys` array arm
+            // already closed (#2291).
+            let len = match elements.len_checked() {
+                Ok(len) => len,
+                Err(e) => return QueryResult::Error(e),
+            };
             let arr: Vec<OwnedValue> = (0..len).map(|i| OwnedValue::Int(i as i64)).collect();
             QueryResult::Owned(OwnedValue::Array(arr))
         }
@@ -7225,16 +7243,16 @@ fn has_one_key<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // jq: null | has("key") => false
         (StandardJson::Null, _) => QueryResult::Owned(OwnedValue::Bool(false)),
         // Object has string key
+        // #2293: `contains_checked`, not a raw `.any()` walk -- the same
+        // #1194/#1677/#2261 gap checks `eval_generic.rs`'s own
+        // `eval_has_one_key` object arm already closed (#2291). See
+        // `contains_checked`'s own doc comment (`document.rs`) for the
+        // early-exit-on-match trade this inherits.
         (StandardJson::Object(fields), OwnedValue::String(key)) => {
-            let found = (*fields).clone().any(|f| {
-                if let StandardJson::String(k) = f.key() {
-                    if let Ok(cow) = k.as_str() {
-                        return cow.as_ref() == key;
-                    }
-                }
-                false
-            });
-            QueryResult::Owned(OwnedValue::Bool(found))
+            match fields.contains_checked(key) {
+                Ok(found) => QueryResult::Owned(OwnedValue::Bool(found)),
+                Err(e) => QueryResult::Error(e),
+            }
         }
         // Array has index - jq returns false for negative, yq returns true if
         // in range. Any numeric key type is accepted here, not just Int --
@@ -7257,8 +7275,14 @@ fn has_one_key<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // matching the `Some` arm's own `len` computation being
                 // needed at all.
                 None => false,
+                // #2293: `len_checked`, not the bare `count()` -- same
+                // #1677/#2261 gap `eval_generic.rs`'s own
+                // `eval_has_one_key` array arm already closed (#2291).
                 Some(idx) => {
-                    let len = (*elements).count() as i64;
+                    let len = match (*elements).len_checked() {
+                        Ok(len) => len as i64,
+                        Err(e) => return QueryResult::Error(e),
+                    };
                     index_in_array_bounds::<S>(idx, len)
                 }
             };
