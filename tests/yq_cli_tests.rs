@@ -1798,6 +1798,96 @@ fn test_input_format_json_bridge_raises_on_malformed_delimiter_1975() -> Result<
     Ok(())
 }
 
+/// #2276 code review on #2262's own PR: `--slurp`'s and `--inplace`'s own M2
+/// streaming fast paths (`can_slurp_fast_path`/`can_inplace_fast_path` in
+/// `yq_runner.rs`) parse a plain identity (`--slurp`) or M2-streamable
+/// (`--inplace`) filter's JSON-sourced input via `YamlIndex`/
+/// `mark_json_sourced` instead of `parse_input`'s `to_owned_canonicalizing_
+/// numbers_at_depth` bridge (#2262's own fix) -- and `YamlIndex`'s
+/// flow-sequence grammar legitimately allows a trailing `,`, so none of
+/// #2262's new checks were ever reached on that route. Confirmed live
+/// before this fix: `--slurp --input-format json -o json '.'` on `[1,]`
+/// returned `[[1]]` at exit 0 (`.[0]`, which #2262's own tests used, forces
+/// the DOM path instead and was already correct -- this is specifically the
+/// plain-identity gap those tests didn't cover).
+#[test]
+fn test_yq_slurp_fast_path_rejects_trailing_comma_2276() -> Result<()> {
+    let (_output, stderr, code) = run_yq_stdin_with_stderr(
+        ".",
+        "[1,]",
+        &["--slurp", "--input-format", "json", "-o", "json"],
+    )?;
+    assert_eq!(code, 1, "stderr: {stderr}");
+    assert!(
+        stderr.contains("Invalid JSON text"),
+        "expected an 'Invalid JSON text' error, got: {stderr}"
+    );
+
+    // Well-formed data still takes the fast path and is unaffected.
+    let (output, code) = run_yq_stdin(
+        ".",
+        "[1,2,3]",
+        &["--slurp", "--input-format", "json", "-o", "json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[[1,2,3]]");
+
+    Ok(())
+}
+
+/// #2276: `--inplace`'s own sibling of the fast-path gap above -- and the
+/// higher-stakes one, since a false accept here rewrites the user's file
+/// with a "healed" interpretation of a document real yq refuses to touch
+/// at all. Confirmed live before this fix: `succinctly yq -i '.'
+/// --input-format json` on `[1,]` exited 0 and rewrote the file to `- 1`
+/// (YAML output, `-o` defaults to `auto`) instead of leaving it untouched.
+#[test]
+fn test_yq_inplace_fast_path_rejects_trailing_comma_leaves_file_untouched_2276() -> Result<()> {
+    let json = "[1,]";
+    let mut input_file = NamedTempFile::new()?;
+    write!(input_file, "{json}")?;
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .args(["--input-format", "json"])
+        .arg(".")
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        !output.status.success(),
+        "--inplace should raise, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Invalid JSON text"),
+        "expected an 'Invalid JSON text' error, got: {stderr}"
+    );
+    let file_contents = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(
+        file_contents, json,
+        "a raised --inplace write must leave the file byte-for-byte untouched"
+    );
+
+    // Well-formed data still takes the fast path, is unaffected, and the
+    // file really is rewritten (unlike the raised case above).
+    let mut ok_file = NamedTempFile::new()?;
+    write!(ok_file, "[1,2,3]")?;
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .args(["--input-format", "json", "-o", "json", "-I=0"])
+        .arg(".")
+        .arg(ok_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(output.status.success());
+    let file_contents = std::fs::read_to_string(ok_file.path())?;
+    assert_eq!(file_contents.trim(), "[1,2,3]");
+
+    Ok(())
+}
+
 /// #1749 sibling: `DisplayKeyGuard::check`'s own contract is "a fallback
 /// spelling on *either side* of the collision is refused" (`document.rs`'s
 /// own doc comment) -- not just fallback-vs-fallback. Pins both orders: a
@@ -16794,22 +16884,32 @@ fn test_json_input_rejects_adversarial_nesting_via_pretty_print_1398() -> Result
     Ok(())
 }
 
-/// #996's `can_slurp_fast_path` also dropped its own `!any_input_is_json`
-/// gate, so `--slurp`'s default (YAML) output now routes adversarially
-/// deep JSON input through `YamlIndex::build`'s parse-time depth-128
-/// guard too, same as identity above -- pinned separately since
-/// `can_slurp_fast_path`/`is_m2_streamable` are independent gates with
-/// their own call sites, not a shared code path that the identity test
-/// above would also exercise.
+/// #996's `can_slurp_fast_path` dropped its own `!any_input_is_json` gate,
+/// routing `--slurp`'s default (YAML) output through `YamlIndex::build`'s
+/// parse-time depth-128 guard for adversarially deep JSON input, same as
+/// identity above -- but #2276 (found reviewing #2262) reinstated that
+/// gate: `--slurp`'s M2 fast path never validated JSON input for a
+/// malformed stray/trailing `,` at all (`YamlIndex`'s flow-sequence
+/// grammar legitimately allows one), which for `--inplace` was a real,
+/// silent-data-loss bug (a false accept rewrites the file). `--slurp` with
+/// JSON-sourced input now falls back to `parse_input`'s `JsonIndex`-based
+/// DOM path unconditionally, same as `--eval-all` always has (see
+/// `test_json_input_rejects_adversarial_nesting_via_eval_all_998` just
+/// above, which this test now matches exactly instead of the M2 path's own
+/// depth-128 guard): a raw panic (exit 101, conversion-time 256 guard)
+/// rather than a clean parse-time error (exit 1, 128) -- a real, accepted
+/// trade-off, not an oversight: `--eval-all` already panics on this exact
+/// input today, so `--slurp` reaching the identical, already-shipped
+/// behavior is not a new class of risk, just a wider door to it.
 #[test]
 fn test_json_input_rejects_adversarial_nesting_via_slurp_996() -> Result<()> {
     let depth = 500;
     let input = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
     let (_stdout, stderr, code) =
         run_yq_stdin_with_stderr(".", &input, &["--input-format", "json", "--slurp"])?;
-    assert_eq!(code, 1, "stderr: {stderr:?}");
+    assert_eq!(code, 101, "stderr: {stderr:?}");
     assert!(
-        stderr.contains("nesting depth exceeds limit of 128"),
+        stderr.contains("nesting depth exceeds limit of 256"),
         "stderr: {stderr:?}"
     );
     Ok(())
