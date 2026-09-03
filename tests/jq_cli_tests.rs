@@ -22181,6 +22181,226 @@ fn test_jq_lazy_path_trailing_comma_after_container_last_child_still_a_known_gap
     Ok(())
 }
 
+/// #2261: the *cursor-transparent* fast paths never reached #2243's fix at
+/// all -- they route through `eval_generic.rs`'s own native arms
+/// (`each_lazy_array_iterate_sink`/`collect_cursors_checked` for `.[]`,
+/// `DistinctKeyCursors`-based walks for `keys`/`keys_unsorted`/`keys_unsorted[]`/
+/// `keys_unsorted | last`/`keys_unsorted[-1]`, `JsonFields::find_cursor` for
+/// bare `.a`, `DocumentElements::len_checked` for `length`/`.[0]`), never
+/// through `to_owned_cursor_at_depth`. Confirmed live against `/usr/bin/jq`
+/// 1.7.1: every one of these is a parse error (exit 5) on a trailing stray
+/// comma after a real last element/field, for both the array (`[1,]`) and
+/// object (`{"a":1,}`) shapes.
+///
+/// Every query here writes *nothing* to stdout before the error --
+/// `length`/`to_entries`/`keys`/`.a`/`keys_unsorted | last`/
+/// `keys_unsorted[-1]`/`keys_unsorted[]` all resolve to a single owned
+/// result or a fully-collected `Vec` before anything is printed, so a
+/// mid-walk failure never leaks a partial value. `.[]` and bare
+/// `keys_unsorted` are exercised separately below -- both are genuinely
+/// *streaming* writers that can (and, on this exact input, do) emit a
+/// real prefix before discovering the terminal fault, the same
+/// established "partial output before an error surfaces" shape already
+/// pinned for `limit(3;.[])` on `[1,2,,4]`
+/// (`docs/compliance/jq/limitations.md`'s "truncating consumer of a plain
+/// array `.[]`" section) -- not a new divergence this fix introduces.
+#[test]
+fn test_jq_cursor_transparent_fast_paths_reject_trailing_comma_2261() -> Result<()> {
+    for (input, query) in [
+        (r"[1,]", "length"),
+        (r"[1,]", "to_entries"),
+        (r#"{"a":1,}"#, "keys"),
+        (r#"{"a":1,}"#, "keys_unsorted[]"),
+        (r#"{"a":1,}"#, "keys_unsorted | last"),
+        (r#"{"a":1,}"#, "keys_unsorted[-1]"),
+        (r#"{"a":1,}"#, "to_entries"),
+        (r#"{"a":1,}"#, ".a"),
+        (r#"{"a":1,}"#, ".nonexistent"),
+    ] {
+        let (out, stderr, code) = run_jq_full(&["-c", query], Some(input))?;
+        assert_eq!(
+            code, 5,
+            "input={input} query={query}: out: {out:?}, stderr: {stderr:?}"
+        );
+        assert!(
+            out.trim().is_empty(),
+            "input={input} query={query}: unexpected output {out:?}"
+        );
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "input={input} query={query}: stderr: {stderr:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// #2261: `.[]` over `[1,]` -- the demand-aware `each_lazy_array_iterate_sink`
+/// (and the eager `collect_cursors_checked` it shares its check with)
+/// writes the one real element it already confirmed good (`1`) as it
+/// streams, then discovers the trailing stray comma only once the walk
+/// exhausts and errors -- so, unlike every query in the test above, real
+/// output reaches stdout ahead of the exit-5 diagnostic. Real jq, whose
+/// parser is atomic, never gets this far and prints nothing at all. This
+/// is the identical, already-documented divergence
+/// `limit(3;.[])` on `[1,2,,4]` pins (prints `1`, `2`, *then* errors) --
+/// not new here, just landing on the container's real last element instead
+/// of a bound the consumer stopped short of.
+#[test]
+fn test_jq_lazy_array_iterate_trailing_comma_streams_confirmed_prefix_first_2261() -> Result<()> {
+    let (out, stderr, code) = run_jq_full(&["-c", ".[]"], Some(r"[1,]"))?;
+    assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
+    assert_eq!(out.trim(), "1", "the one real element should still stream");
+    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #2261: bare `keys_unsorted` over `{"a":1,}` -- the CLI's own
+/// `JqValue::LazyKeysArray` writer (`jq_runner.rs`) streams straight to
+/// stdout with no `Vec<String>`/rewind buffer (#685), and the same
+/// `bail_if_keys_malformed` check this fix extended only runs once that
+/// walk exhausts -- so it can leave a truncated `[` behind, exactly as its
+/// own doc comment already documents for the #1194/#1677 faults it caught
+/// before this fix (a non-string key, a missing/doubled `,`/`:`). This is
+/// that same, pre-existing trade extended to the new trailing-comma fault,
+/// not a new one.
+#[test]
+fn test_jq_lazy_keys_array_trailing_comma_leaves_truncated_bracket_2261() -> Result<()> {
+    let (out, stderr, code) = run_jq_full(&["-c", "keys_unsorted"], Some(r#"{"a":1,}"#))?;
+    assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
+    assert_eq!(
+        out, r#"["a""#,
+        "truncated bracket should still reach stdout"
+    );
+    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #2261: unlike the array-index case, `keys_unsorted[0]`/`.[0]`-on-an-
+/// object's own #1629 precedent, positive *array* index access (`.[0]`,
+/// `Expr::Index` in `eval_generic.rs`) turns out **not** to be the O(1)
+/// lookup that precedent -- and this issue's own description -- assumed:
+/// resolving *any* array index, positive or negative, already calls
+/// `len()` first (to normalize a negative index, and to raise yq's own
+/// out-of-range error), so switching that call to `len_checked` closes
+/// this gap for free rather than leaving it open. Verified live against
+/// jq 1.7.1's own exit 5 on this exact input -- code review of this
+/// fix's first draft wrongly assumed this one had to stay a documented
+/// limitation like `keys_unsorted[0]` below; re-reading `Expr::Index`'s
+/// own body before accepting that assumption is what caught it.
+#[test]
+fn test_jq_array_positive_index_trailing_comma_fixed_2261() -> Result<()> {
+    let (out, stderr, code) = run_jq_full(&["-c", ".[0]"], Some(r"[1,]"))?;
+    assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
+    assert!(out.trim().is_empty(), "unexpected output {out:?}");
+    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #2261: `keys_unsorted[0]` (a positive index into an object's *key*
+/// list) is a deliberately left-open gap, matching #1629's own established
+/// "would cost strictly more than the answer" reasoning for the identical
+/// shape (`fold_lazy_keys_stage`'s `Expr::Index { idx: 0, .. }` arm reads
+/// only `fields.uncons_key()`'s first field, never walking the rest of the
+/// object) -- the one case in this issue where the object counterpart of
+/// an array fast path genuinely differs from its array twin above, rather
+/// than merely mirroring it. See `docs/compliance/jq/limitations.md`'s own
+/// `#2261` section for the full accounting.
+#[test]
+fn test_jq_keys_unsorted_positive_index_trailing_comma_remains_a_known_gap_2261() -> Result<()> {
+    let (out, stderr, code) = run_jq_full(&["-c", "keys_unsorted[0]"], Some(r#"{"a":1,}"#))?;
+    assert_eq!(code, 0, "known gap: out: {out:?}, stderr: {stderr:?}");
+    assert_eq!(out.trim(), "\"a\"", "known gap: unexpected output");
+    Ok(())
+}
+
+/// #2261: the #2211 sibling shape -- a stray `,` with *zero* real
+/// elements/fields (`[,]`, `{,}`) -- remains unreachable through the same
+/// fast paths above, for the same reason #2211's own `container_gap_ok`
+/// stays unreachable through `to_owned_at_depth`'s cursor-less callers
+/// (#2262's own documented residual): none of these paths ever receive a
+/// cursor to the *container itself*, only to its children -- and an
+/// apparently-empty container has none. `.a`/`.[0]` are excluded here: both
+/// still raise, but for an unrelated reason (indexing an array with a
+/// string key / an object with a number), not the delimiter check this
+/// test is about.
+#[test]
+fn test_jq_cursor_transparent_fast_paths_empty_container_stray_comma_remains_a_known_gap_2261(
+) -> Result<()> {
+    for (input, query, expected) in [
+        ("[,]", ".[]", ""),
+        ("[,]", "length", "0"),
+        ("{,}", "keys", "[]"),
+        ("{,}", "keys_unsorted", "[]"),
+        ("{,}", "to_entries", "[]"),
+        ("{,}", ".a", "null"),
+    ] {
+        let (out, stderr, code) = run_jq_full(&["-c", query], Some(input))?;
+        assert_eq!(
+            code, 0,
+            "input={input} query={query}: known gap, expected exit 0: stderr: {stderr:?}"
+        );
+        assert_eq!(
+            out.trim(),
+            expected,
+            "input={input} query={query}: known gap"
+        );
+    }
+
+    Ok(())
+}
+
+/// #2261: well-formed documents (including empty containers, a duplicate
+/// key under jq's default collapse rule, and a multi-element/multi-field
+/// container) are unaffected by every new check above -- the same
+/// "verify no behavioral change" pairing #2211/#2243/#2262 each carry
+/// alongside their own positive repro.
+#[test]
+fn test_jq_cursor_transparent_fast_paths_wellformed_unaffected_2261() -> Result<()> {
+    for (input, query, expected) in [
+        ("[1,2,3]", ".[]", "1\n2\n3"),
+        ("[1,2,3]", "length", "3"),
+        ("[1,2,3]", ".[0]", "1"),
+        ("[1,2,3]", ".[-1]", "3"),
+        ("[]", "length", "0"),
+        ("[]", ".[]", ""),
+        (r#"{"a":1,"b":2}"#, "keys", r#"["a","b"]"#),
+        (r#"{"a":1,"b":2}"#, "keys_unsorted", r#"["a","b"]"#),
+        (r#"{"a":1,"b":2}"#, "keys_unsorted[]", "\"a\"\n\"b\""),
+        (r#"{"a":1,"b":2}"#, "keys_unsorted | last", "\"b\""),
+        (r#"{"a":1,"b":2}"#, "keys_unsorted[-1]", "\"b\""),
+        (r#"{"a":1,"b":2}"#, "keys_unsorted[0]", "\"a\""),
+        (
+            r#"{"a":1,"b":2}"#,
+            "to_entries",
+            r#"[{"key":"a","value":1},{"key":"b","value":2}]"#,
+        ),
+        (r#"{"a":1,"b":2}"#, ".a", "1"),
+        ("{}", "keys", "[]"),
+        // A duplicate key, jq's default collapse rule ("first position,
+        // last value") -- the #2261 fix must retain the object's real
+        // *textual* last field for the trailing-gap check, not whichever
+        // key the collapsed/sorted output happens to list last (#2261 code
+        // review: an earlier version of this fix checked the gap after the
+        // wrong field here and would have wrongly rejected this well-formed
+        // input).
+        (r#"{"a":1,"b":2,"a":3}"#, "keys", r#"["a","b"]"#),
+        (r#"{"a":1,"b":2,"a":3}"#, "keys_unsorted", r#"["a","b"]"#),
+        (
+            r#"{"a":1,"b":2,"a":3}"#,
+            "to_entries",
+            r#"[{"key":"a","value":3},{"key":"b","value":2}]"#,
+        ),
+        (r#"{"a":1,"b":2,"a":3}"#, ".a", "3"),
+    ] {
+        let (out, stderr, code) = run_jq_full(&["-c", query], Some(input))?;
+        assert_eq!(code, 0, "input={input} query={query}: stderr: {stderr:?}");
+        assert_eq!(out.trim(), expected, "input={input} query={query}");
+    }
+
+    Ok(())
+}
+
 /// #1643 follow-up: `-S`/`-C`/`--slurp` bypass `print_json` entirely --
 /// they materialize via `parse_json_stream`'s fallback (which backs the
 /// "original" input path `-S`/`-C`/`--slurp` force), reaching
