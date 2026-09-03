@@ -1140,19 +1140,32 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
     /// (needed for `line`/`column`) doesn't require re-navigating.
     ///
     /// `Err` when the *winning* occurrence's own `,`/`:` delimiters are
-    /// malformed (#1677), or when *any* sibling's key isn't even
-    /// string-shaped at all (#1995) -- a targeted lookup like `.a` never
-    /// walks every sibling the way `.[]`/`length`/`keys` do, so it needs
-    /// its own check for both. A non-string key (`{"a":1,123:2}`) is real
-    /// jq's own parse-time rejection ("Object keys must be strings"),
-    /// unconditional on the document as a whole -- unlike the `,`/`:` gap
-    /// check below, checked as each candidate is found (not deferred to
-    /// the winner alone): the document is malformed the moment *any*
-    /// member's key isn't a string, whether or not that member is the one
-    /// this lookup would otherwise have returned. Same shared
-    /// `key_is_malformed`/[`DocumentFields::malformed_member_error`]
-    /// pair as [`find`](Self::find) uses for this, not a second copy of
-    /// the check (#106).
+    /// malformed (#1677), when *any* sibling's key isn't even string-shaped
+    /// at all (#1995), or when there's a trailing stray comma after the
+    /// object's real last field (`{"a":1,}`, #2261) -- a targeted lookup
+    /// like `.a` never walks every sibling the way `.[]`/`length`/`keys` do,
+    /// so it needs its own checks for all three. A non-string key
+    /// (`{"a":1,123:2}`) is real jq's own parse-time rejection ("Object keys
+    /// must be strings"), unconditional on the document as a whole -- unlike
+    /// the `,`/`:` gap check for the winner, checked as each candidate is
+    /// found (not deferred to the winner alone): the document is malformed
+    /// the moment *any* member's key isn't a string, whether or not that
+    /// member is the one this lookup would otherwise have returned. Same
+    /// shared `key_is_malformed`/[`DocumentFields::malformed_member_error`]
+    /// pair as [`find`](Self::find) uses for this, not a second copy of the
+    /// check (#106).
+    ///
+    /// **Not actually O(1)**, despite being a targeted single-field lookup:
+    /// last-duplicate-key-wins means every candidate could still be
+    /// superseded by a later one, so the `while` loop below always walks
+    /// every field regardless of `name` or where a match sits (#2261 code
+    /// review, verifying the O(1) assumption this function's doc comment
+    /// never actually claimed but a caller could reasonably have inferred
+    /// from "targeted lookup"). That means checking a trailing stray comma
+    /// after the object's real last field here is free -- this walk already
+    /// reaches it, for `.a` and `.nonexistent` alike (real jq can't even
+    /// parse `{"a":1,}` to begin with, so it rejects *every* field access
+    /// into it, matching field or not).
     pub fn find_cursor(&self, name: &str) -> Result<Option<JsonCursor<'a, W>>, EvalError>
     where
         W: Clone,
@@ -1161,6 +1174,10 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
         // (key's own text start, value cursor, is this field the object's
         // first) for the winning candidate seen so far.
         let mut winner: Option<(usize, JsonCursor<'a, W>, bool)> = None;
+        // #2261: the textually last field's own value cursor, in raw
+        // document order -- independent of `winner`, which a later
+        // non-matching field must not disturb.
+        let mut last_value_cursor: Option<JsonCursor<'a, W>> = None;
         let mut index = 0usize;
         while let Some((field, rest)) = fields.uncons() {
             let key = field.key();
@@ -1173,22 +1190,30 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
                     winner = Some((key.start(), field.value_cursor(), index == 0));
                 }
             }
+            last_value_cursor = Some(field.value_cursor());
             fields = rest;
             index += 1;
         }
-        let Some((key_start, value_cursor, is_first)) = winner else {
-            return Ok(None);
-        };
-        let comma_expected = if is_first { None } else { Some(b',') };
-        if !preceding_gap_ok(value_cursor.text(), key_start, comma_expected) {
-            return Err(EvalError::malformed_json_text(value_cursor.text()));
-        }
-        if let Some(value_start) = value_cursor.text_position() {
-            if !preceding_gap_ok(value_cursor.text(), value_start, Some(b':')) {
+        if let Some((key_start, value_cursor, is_first)) = winner {
+            let comma_expected = if is_first { None } else { Some(b',') };
+            if !preceding_gap_ok(value_cursor.text(), key_start, comma_expected) {
                 return Err(EvalError::malformed_json_text(value_cursor.text()));
             }
+            if let Some(value_start) = value_cursor.text_position() {
+                if !preceding_gap_ok(value_cursor.text(), value_start, Some(b':')) {
+                    return Err(EvalError::malformed_json_text(value_cursor.text()));
+                }
+            }
         }
-        Ok(Some(value_cursor))
+        // #2261: trailing stray comma after the object's real last field
+        // (`{"a":1,}`), checked regardless of whether `name` matched
+        // anything -- see this function's own doc comment above.
+        if let Some(last) = last_value_cursor {
+            if !trailing_element_gap_ok(&last, b'}') {
+                return Err(EvalError::malformed_json_text(last.text()));
+            }
+        }
+        Ok(winner.map(|(_, value_cursor, _)| value_cursor))
     }
 }
 
@@ -1945,8 +1970,8 @@ pub type BorrowedJsonCursor<'a> = JsonCursor<'a, &'a [u64]>;
 // ============================================================================
 
 use crate::jq::document::{
-    effective_fields_checked, key_is_malformed, DocumentCursor, DocumentElements, DocumentField,
-    DocumentFields, DocumentValue, IndentSpec, JsonConvention,
+    effective_fields_checked, key_is_malformed, trailing_element_gap_ok, DocumentCursor,
+    DocumentElements, DocumentField, DocumentFields, DocumentValue, IndentSpec, JsonConvention,
 };
 use crate::jq::escape::{write_json_body_jq, write_json_body_yq};
 use crate::jq::stream::{StreamFailure, StreamResult};
@@ -4205,6 +4230,81 @@ mod tests {
             err.to_string().contains("expected string key"),
             "unexpected error: {err}"
         );
+    }
+
+    /// #2261: `find_cursor` walks every field regardless of `name` (it must,
+    /// to honour last-duplicate-key-wins), so a trailing stray comma after
+    /// the object's real last field (`{"a":1,}`) is caught here too --
+    /// whether or not `name` matches anything, matching real jq's own
+    /// behavior (a malformed document can't be parsed at all, so *every*
+    /// field access into it raises).
+    #[test]
+    fn test_find_cursor_rejects_trailing_comma_after_real_last_field_2261() {
+        let json = br#"{"a":1,}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let StandardJson::Object(fields) = root.value() else {
+            panic!("expected object");
+        };
+        for name in ["a", "nonexistent"] {
+            let err = fields
+                .find_cursor(name)
+                .expect_err(&format!("{name}: trailing comma should raise"));
+            assert!(
+                err.message.contains("Invalid JSON text"),
+                "{name}: message: {}",
+                err.message
+            );
+        }
+    }
+
+    /// #2261: unlike the single-real-field case above, a duplicate key
+    /// followed by a trailing stray comma (`{"a":1,"b":2,"a":3,}`) must
+    /// still raise -- `find_cursor`'s own winning-occurrence resolution
+    /// (last-duplicate-key-wins) and the #2261 trailing-gap check are two
+    /// independent questions the walk answers from the same pass, and a
+    /// non-matching key's own gap must not stop the walk before it reaches
+    /// the object's real last field.
+    #[test]
+    fn test_find_cursor_rejects_trailing_comma_with_duplicate_key_2261() {
+        let json = br#"{"a":1,"b":2,"a":3,}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let StandardJson::Object(fields) = root.value() else {
+            panic!("expected object");
+        };
+        for name in ["a", "b"] {
+            let err = fields
+                .find_cursor(name)
+                .expect_err(&format!("{name}: trailing comma should raise"));
+            assert!(
+                err.message.contains("Invalid JSON text"),
+                "{name}: message: {}",
+                err.message
+            );
+        }
+    }
+
+    /// #2261: well-formed objects (including a duplicate key, so the
+    /// winning-occurrence resolution above is exercised alongside the new
+    /// trailing-gap check) are unaffected.
+    #[test]
+    fn test_find_cursor_wellformed_unaffected_by_trailing_comma_check_2261() {
+        for json in [
+            br#"{"a":1}"#.as_slice(),
+            br#"{"a":1,"b":2}"#.as_slice(),
+            br#"{"a":1,"b":2,"a":3}"#.as_slice(),
+        ] {
+            let index = JsonIndex::build(json);
+            let root = index.root(json);
+            let StandardJson::Object(fields) = root.value() else {
+                panic!("{json:?}: expected object");
+            };
+            let cursor = fields
+                .find_cursor("a")
+                .unwrap_or_else(|e| panic!("{json:?}: {e:?}"));
+            assert!(cursor.is_some(), "{json:?}: expected to find `a`");
+        }
     }
 
     #[test]
