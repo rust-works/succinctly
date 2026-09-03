@@ -1738,10 +1738,23 @@ computed bracket key piped into a path-context builtin, respectively) had the id
 gate-on-`optional` bug and are fixed the same way. This keeps the error unsuppressible the
 same way `is_decode_failure` already does for a decode failure.
 
-A few more independent copies of the same arithmetic remain unfixed, in lower-traffic
-call sites: `path()`'s own walker, `pick(paths)`, `reduce`/`foreach`'s lazy-fold index
-handling, and `getpath`'s own path-array walk (jq-only syntax, so this only matters under
-`--jq-extensions`) -- filed as [#2264](https://github.com/rust-works/succinctly/issues/2264).
+A few more independent copies of the same arithmetic were found, in lower-traffic call
+sites, and tracked as [#2264](https://github.com/rust-works/succinctly/issues/2264).
+Reverification there found `pick(paths)` already matches real yq exactly (both the
+expression form and the array-literal-keys form), not a gap after all. `keys`/
+`keys_unsorted`'s own lazy `.[n]` fast path (`fold_lazy_keys_stage` for object keys,
+`fold_lazy_index_range_stage` for array keys, `src/jq/eval_generic.rs`) *was* a real,
+live-confirmed gap -- `keys[-5]`/`keys_unsorted[-5]` silently answered `null` instead of
+raising, since each already walks (or already knows) the whole container's length to
+resolve a negative index at all, so the check now rides along for free, the same shape
+as every other fix in this section. Three more copies remain genuinely unverified --
+`path()`'s own walker (`navigate_static_component`, `src/jq/eval.rs`; real yq's `path()`
+turns out to reject essentially any bracket-index argument outright, regardless of sign,
+so what "fixed" even means here needs its own grammar investigation first),
+`get_value_at_path` (`src/jq/eval.rs`), and `getpath`'s own path-array walk
+(`resolve_read_index`/`getpath_walk_owned`, `src/jq/eval.rs`; jq-only syntax, so this
+only matters under `--jq-extensions`) -- filed as
+[#2335](https://github.com/rust-works/succinctly/issues/2335).
 `del()`/`delpaths()` silently no-op on this shape instead of raising at all (more severe than
 a suppression gap -- a missing error, not a differently-worded one) -- filed separately as
 [#2268](https://github.com/rust-works/succinctly/issues/2268). `eval_stage_with_path_context`'s
