@@ -863,7 +863,15 @@ pub trait DocumentFields: Sized + Clone {
     fn uncons(&self) -> Option<(DocumentField<Self::Value, Self::Cursor>, Self)>;
 
     /// Find a field by name.
-    fn find(&self, name: &str) -> Option<Self::Value>;
+    ///
+    /// `Err` on the same terms [`find_cursor`](Self::find_cursor) already
+    /// documents for its own `Result` (#1995 review): widened to match, so
+    /// a caller reached through this trait method rather than a format's
+    /// own inherent `find` can't silently miss a malformed-key error a
+    /// format's implementation raises -- structurally, not just by
+    /// convention. YAML's own implementation always answers `Ok` (its
+    /// grammar has no equivalent "keys must be strings" rule to enforce).
+    fn find(&self, name: &str) -> Result<Option<Self::Value>, EvalError>;
 
     /// Find a field by name and return a cursor to its value.
     ///
@@ -885,6 +893,13 @@ pub trait DocumentFields: Sized + Clone {
     /// overrides this to check after resolving which occurrence wins, not
     /// during the search); every other format's default answers `Ok` via
     /// [`DocumentCursor::preceding_delimiter_ok`]'s own no-op default.
+    ///
+    /// Also `Err` when *any* sibling's key isn't string-shaped at all
+    /// (#1995, JSON only -- unlike the `,`/`:` check above, this one is
+    /// checked as each candidate is found during the search, not deferred
+    /// to the winner alone, since the document is malformed the moment any
+    /// member's key isn't a string, whether or not that member is the one
+    /// this lookup would otherwise have returned).
     fn find_cursor(&self, name: &str) -> Result<Option<Self::Cursor>, EvalError>;
 
     /// Whether any field has this key -- existence only, no particular

@@ -1096,27 +1096,37 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
     /// comment) -- real jq rejects a non-string object key at parse time,
     /// unconditional on the document as a whole, so this checks every
     /// candidate as it's found rather than deferring to whichever one (if
-    /// any) would otherwise have won.
-    pub fn find(&self, name: &str) -> Result<Option<StandardJson<'a, W>>, EvalError> {
+    /// any) would otherwise have won. Uses the same `key_is_malformed`/
+    /// [`DocumentFields::malformed_member_error`] pair `#1194`'s own shared
+    /// walks already use for this exact question, rather than a second,
+    /// hand-rolled `match` on `StandardJson::String` -- one definition of
+    /// "malformed key", not two that could silently diverge (#106).
+    pub fn find(&self, name: &str) -> Result<Option<StandardJson<'a, W>>, EvalError>
+    where
+        W: Clone,
+    {
         let mut fields = *self;
         let mut result = None;
         while let Some((field, rest)) = fields.uncons() {
-            match field.key() {
-                StandardJson::String(key) => {
-                    // An undecodable key (invalid UTF-8, an invalid escape, an
-                    // invalid `\u` codepoint) is *skipped*, not treated as the
-                    // end of the search. This `?` used to return from `find`
-                    // itself, so a single such key hid every field after it from
-                    // lookup -- `.b` answered `null` on `{"\ud800":1,"b":2}` --
-                    // while `keys`/`length`, which don't decode, still reported
-                    // them (#1247). Surfacing the decode failure as a real
-                    // `EvalError` is tracked separately; this only stops one bad
-                    // key destroying valid results.
-                    if key.as_str().is_ok_and(|k| k == name) {
-                        result = Some(field.value());
-                    }
+            let key = field.key();
+            if key_is_malformed(&key) {
+                return Err(fields.malformed_member_error());
+            }
+            // An undecodable key (invalid UTF-8, an invalid escape, an
+            // invalid `\u` codepoint) is *skipped*, not treated as the
+            // end of the search. This `?` used to return from `find`
+            // itself, so a single such key hid every field after it from
+            // lookup -- `.b` answered `null` on `{"\ud800":1,"b":2}` --
+            // while `keys`/`length`, which don't decode, still reported
+            // them (#1247). Surfacing the decode failure as a real
+            // `EvalError` is tracked separately (see `key_is_malformed`'s
+            // own doc comment for why this case, unlike #1995's, is
+            // deliberately *not* what it answers `true` for); this only
+            // stops one bad key destroying valid results.
+            if let StandardJson::String(key) = key {
+                if key.as_str().is_ok_and(|k| k == name) {
+                    result = Some(field.value());
                 }
-                _ => return Err(EvalError::malformed_json_text(field.key_cursor().text())),
             }
             fields = rest;
         }
@@ -1139,22 +1149,29 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
     /// check below, checked as each candidate is found (not deferred to
     /// the winner alone): the document is malformed the moment *any*
     /// member's key isn't a string, whether or not that member is the one
-    /// this lookup would otherwise have returned.
-    pub fn find_cursor(&self, name: &str) -> Result<Option<JsonCursor<'a, W>>, EvalError> {
+    /// this lookup would otherwise have returned. Same shared
+    /// `key_is_malformed`/[`DocumentFields::malformed_member_error`]
+    /// pair as [`find`](Self::find) uses for this, not a second copy of
+    /// the check (#106).
+    pub fn find_cursor(&self, name: &str) -> Result<Option<JsonCursor<'a, W>>, EvalError>
+    where
+        W: Clone,
+    {
         let mut fields = *self;
         // (key's own text start, value cursor, is this field the object's
         // first) for the winning candidate seen so far.
         let mut winner: Option<(usize, JsonCursor<'a, W>, bool)> = None;
         let mut index = 0usize;
         while let Some((field, rest)) = fields.uncons() {
-            match field.key() {
-                StandardJson::String(key) => {
-                    // Same undecodable-key skip as `find` above (#1247).
-                    if key.as_str().is_ok_and(|k| k == name) {
-                        winner = Some((key.start(), field.value_cursor(), index == 0));
-                    }
+            let key = field.key();
+            if key_is_malformed(&key) {
+                return Err(fields.malformed_member_error());
+            }
+            // Same undecodable-key skip as `find` above (#1247).
+            if let StandardJson::String(key) = key {
+                if key.as_str().is_ok_and(|k| k == name) {
+                    winner = Some((key.start(), field.value_cursor(), index == 0));
                 }
-                _ => return Err(EvalError::malformed_json_text(field.key_cursor().text())),
             }
             fields = rest;
             index += 1;
@@ -1928,8 +1945,8 @@ pub type BorrowedJsonCursor<'a> = JsonCursor<'a, &'a [u64]>;
 // ============================================================================
 
 use crate::jq::document::{
-    effective_fields_checked, DocumentCursor, DocumentElements, DocumentField, DocumentFields,
-    DocumentValue, IndentSpec, JsonConvention,
+    effective_fields_checked, key_is_malformed, DocumentCursor, DocumentElements, DocumentField,
+    DocumentFields, DocumentValue, IndentSpec, JsonConvention,
 };
 use crate::jq::escape::{write_json_body_jq, write_json_body_yq};
 use crate::jq::stream::{StreamFailure, StreamResult};
@@ -2595,19 +2612,8 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentFields for JsonFields<'a, W> {
         Some((field.key(), field.key_cursor(), rest))
     }
 
-    // #1995: `DocumentFields::find` (unlike its own `find_cursor` sibling,
-    // just below) has no `Result` in its trait signature to report a
-    // non-string sibling key through -- not something this one impl block
-    // can widen, since it's a trait-wide contract every format's own
-    // implementation shares. Not a live gap in practice: this trait
-    // method's only real (non-test, non-doctest) caller anywhere in the
-    // crate is `JsonFields::find` itself, one line below -- every actual
-    // production call site (`eval.rs`'s own `find_field`) reaches the
-    // *inherent* `JsonFields::find` (already `Result`-returning, per its
-    // own #1995 fix) directly, never through this trait dispatch, so
-    // folding an error into `None` here costs nothing observable today.
-    fn find(&self, name: &str) -> Option<Self::Value> {
-        JsonFields::find(self, name).ok().flatten()
+    fn find(&self, name: &str) -> Result<Option<Self::Value>, EvalError> {
+        JsonFields::find(self, name)
     }
 
     fn find_cursor(&self, name: &str) -> Result<Option<Self::Cursor>, EvalError> {

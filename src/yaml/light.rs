@@ -6697,8 +6697,12 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentFields for YamlFields<'a, W> {
         Some((field.key(), field.key_cursor(), rest))
     }
 
-    fn find(&self, name: &str) -> Option<Self::Value> {
-        YamlFields::find(self, name)
+    // #1995: `Ok` unconditionally -- YAML's grammar has no equivalent
+    // "keys must be strings" rule to enforce (unlike JSON's own
+    // `DocumentFields::find` impl, `src/json/light.rs`), so there is
+    // nothing for this format's own `find` to ever raise.
+    fn find(&self, name: &str) -> Result<Option<Self::Value>, EvalError> {
+        Ok(YamlFields::find(self, name))
     }
 
     fn find_cursor(&self, name: &str) -> Result<Option<Self::Cursor>, EvalError> {
