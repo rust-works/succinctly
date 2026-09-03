@@ -20215,6 +20215,23 @@ fn update_path_steps<S: EvalSemantics>(
                     |sub| update_path_steps::<S>(sub, rest, filter_expr, optional, scalar_noop),
                 );
             }
+            // #2241: a *mid-chain* bare `.` (`.a | . | .b`) is a transparent
+            // pass-through, same as everywhere else in this file that walks
+            // a path component list (`push_path_components`'s own `Expr::
+            // Identity => {}`, dropping it entirely rather than treating it
+            // as a component). Falling to the catch-all below sent it
+            // through `update_path`'s own *terminal* `Expr::Identity` arm
+            // instead -- correct only when Identity is genuinely the last
+            // step (the `[] => ...`/`[last] => ...` arms above already
+            // cover that shape) -- which applies `filter_expr` right there
+            // and returns, silently discarding `rest` (`.b`) rather than
+            // continuing the walk through it. Confirmed against jq 1.7.1:
+            // `{"a":{"b":1}} | (.a | . | .b) |= 99` is `{"a":{"b":99}}`,
+            // not `{"a":99}`.
+            Expr::Identity => {
+                steps = rest;
+                continue;
+            }
             _ => return update_path::<S>(root, first, filter_expr, here, scalar_noop),
         }
     }
@@ -36894,6 +36911,19 @@ fn delete_path_steps(
                     |sub| always_wrote(delete_path_steps(sub, rest, optional, yq_mode)),
                 )
                 .map(|_| ());
+            }
+            // #2241: same fix as `update_path_steps`'s identical arm -- a
+            // mid-chain bare `.` (`del(.a | . | .b)`) is a transparent
+            // pass-through, not a delete target in its own right. Falling
+            // to the catch-all below sent it through `delete_at_path`'s own
+            // *terminal* `Expr::Identity` arm instead, which replaces the
+            // whole current position with `null` and returns -- silently
+            // discarding `rest` (`.b`). Confirmed against jq 1.7.1:
+            // `{"a":{"b":1}} | del(.a | . | .b)` is `{"a":{}}`, not
+            // `{"a":null}`.
+            Expr::Identity => {
+                steps = rest;
+                continue;
             }
             _ => return delete_at_path(root, first, here, yq_mode),
         }
