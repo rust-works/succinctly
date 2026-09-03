@@ -16790,15 +16790,49 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::OneCursor(_) => {
                 unreachable!("materialize_cursor should have converted this")
             }
-            // Same conservative treatment the old once-for-all-keys
-            // evaluation already gave a target's own mid-stream escape:
-            // discard whatever this key's own target generator produced
-            // before its escape (never part of the indexed output either
-            // way, since indexing an escaped generator's partial prefix
-            // isn't a jq behavior at all), but now fold the *running*
-            // prefix from every earlier key in, instead of assuming it was
-            // empty.
-            QueryResult::Partial(_, control) => escape_with_prefix!(control),
+            // #2226: `target`'s own generator produced `vs` before its own
+            // mid-stream escape -- real jq's key-outer/target-inner model
+            // indexes each already-produced value by `k` as it flows out,
+            // the same per-value operation the `Owned`/`Borrowed` arms
+            // below already apply to a *successful* target result, so
+            // indexing an escaped generator's own partial prefix *is* real
+            // jq behavior (confirmed live: `0 as $k | ([1,2],[3,4],
+            // error("x"))[$k]` prints `1` then `3` before raising).
+            // Mirrors `KeyTargets::Owned`'s own loop below exactly (this
+            // prefix is already `Vec<OwnedValue>`, the same shape `Owned`
+            // handles, `yq_negative_index_error` check included): an
+            // indexing failure on an earlier-produced value fires before
+            // `target`'s own later escape ever would in the real generator
+            // order, so it outranks `control` here the same way a later
+            // key's index error already outranks an earlier key's pending
+            // halt in the `Owned`/`Borrowed` arms; only once every value in
+            // `vs` indexes cleanly does `control` -- `target`'s own
+            // termination -- get to fire.
+            QueryResult::Partial(vs, control) => {
+                if owned.is_none() {
+                    owned = Some(
+                        match promote_borrowed_checked(core::mem::take(&mut borrowed)) {
+                            Ok(v) => v,
+                            Err((prefix, e)) => return partial(prefix, Control::Error(e)),
+                        },
+                    );
+                }
+                let acc = owned.as_mut().expect("just ensured Some");
+                if acc.try_reserve(vs.len()).is_err() {
+                    escape_with_prefix!(Control::Error(cannot_reserve_cross_product(&[vs.len()])));
+                }
+                for t in &vs {
+                    if let Some(e) = yq_negative_index_error::<S>(t, k) {
+                        escape_with_prefix!(Control::Error(e));
+                    }
+                    match index_one_owned(t, k, optional) {
+                        Ok(Some(v)) => owned.as_mut().expect("still Some").push(v),
+                        Ok(None) => {}
+                        Err(e) => escape_with_prefix!(Control::Error(e)),
+                    }
+                }
+                escape_with_prefix!(control)
+            }
         };
         match key_targets {
             KeyTargets::Borrowed(ts) => {
@@ -17043,12 +17077,42 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 QueryResult::OneCursor(_) => {
                     unreachable!("materialize_cursor should have converted this")
                 }
-                // Same conservative Error/Break/Halt-only handling as
-                // before, now folding the running `out` in as the prefix
-                // instead of discarding it (unreachable before this fix,
-                // since `out` was always empty at this point -- E was
-                // evaluated before the loop could produce anything).
-                QueryResult::Partial(_, control) => escape!(control),
+                // #2226: `target`'s (E's) own generator produced `vs`
+                // before its own mid-stream escape -- real jq's
+                // S-outer/T-middle/E-inner model slices each
+                // already-produced value as it flows out, the same
+                // per-value operation `Targets::Owned`'s own loop below
+                // already applies to a *successful* target result.
+                // Mirrors that loop exactly (this prefix is already
+                // `Vec<OwnedValue>`, the same shape `Owned` handles): a
+                // slicing failure on an earlier-produced value fires
+                // before `target`'s own later escape ever would in the
+                // real generator order, so it outranks `control` here the
+                // same way a later target's slice error already outranks
+                // an earlier one's pending halt in the `Borrowed`/`Owned`
+                // arms below; only once every value in `vs` slices
+                // cleanly does `control` -- `target`'s own termination --
+                // get to fire. Confirmed live: `[1,2,3,4] |
+                // (.,5,error("x"))[1:3]` prints `[2,3]` (sliced from `.`,
+                // this arm's own loop) then raises "Cannot index number
+                // with object" -- `5`'s own slice attempt *does* run (it's
+                // the second value in `vs`, since `target` materializes
+                // every value it produced up through its own escape) and
+                // its failure outranks the original `x` from `control`,
+                // exactly the precedent this arm's own doc comment states.
+                QueryResult::Partial(vs, control) => {
+                    if out.try_reserve(vs.len()).is_err() {
+                        escape!(Control::Error(cannot_reserve_cross_product(&[vs.len()])));
+                    }
+                    for t in &vs {
+                        match slice_owned_value_read::<S>(t, *s, *e, optional) {
+                            Ok(Some(v)) => out.push(v),
+                            Ok(None) => {}
+                            Err(e) => escape!(Control::Error(e)),
+                        }
+                    }
+                    escape!(control)
+                }
             };
             match &targets {
                 Targets::Borrowed(ts) => {
@@ -52713,6 +52777,44 @@ mod tests {
         );
     }
 
+    /// #2226: `eval_index_expr`'s target-evaluation `Partial` arm used to
+    /// discard `E`'s own already-produced prefix (`_`) and keep only the
+    /// escaping `control`. `0 as $k | ([1,2],[3,4],error("x"))[$k]` makes
+    /// `E` itself the multi-output `([1,2],[3,4],error("x"))` generator: its
+    /// first two branches each index cleanly at `$k`=0 (`1`, then `3`)
+    /// before the third branch errors. Verified against jq 1.7.1: `echo
+    /// null | jq -c '0 as $k | ([1,2],[3,4],error("x"))[$k]'` prints `1`
+    /// then `3` before raising.
+    #[test]
+    fn test_index_expr_target_own_partial_prefix_preserved_2226() {
+        query!(b"null", r#"0 as $k | ([1,2],[3,4],error("x"))[$k]"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::Int(1), OwnedValue::Int(3)]);
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    /// #2226 sibling: the same target-own-prefix fix for `eval_slice_expr`.
+    /// `([1,2],[3,4],error("x"))[(0,1)-1:(1,2)-0]` simplifies to a plain
+    /// `[0:1]` slice per `(s, e)` pair below, but the point is `E` itself
+    /// (the `([1,2],[3,4],error("x"))` target) producing two clean slices
+    /// before erroring on its third branch. Verified against jq 1.7.1: `echo
+    /// null | jq -c '([1,2],[3,4],error("x"))[0:1]'` prints `[1]` then
+    /// `[3]` before raising.
+    #[test]
+    fn test_slice_expr_target_own_partial_prefix_preserved_2226() {
+        query!(b"null", r#"([1,2],[3,4],error("x"))[0:1]"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![
+                    OwnedValue::Array(vec![OwnedValue::Int(1)]),
+                    OwnedValue::Array(vec![OwnedValue::Int(3)]),
+                ]);
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
     #[test]
     fn test_yq_merge_flags() {
         // Unflagged array `*`/`*=` is yq-only: rhs replaces lhs wholesale,
@@ -53983,17 +54085,27 @@ mod tests {
             // before failing, the same as jq 1.7.1. See
             // `partial_prefix_survives_the_stream_forwarding_constructs`
             // for its coverage.
+            //
+            // `(.[0],(.[1],error("x")))[(0+0)]` *used* to be listed here
+            // too, but #2226 fixed `eval_index_expr`'s *target* `Partial`
+            // arm to apply the per-key index to each already-produced value
+            // instead of discarding them — it now agrees with jq 1.7.1
+            // exactly. See `partial_prefix_survives_the_stream_forwarding_
+            // constructs` for its coverage.
+            //
+            // `.[(1,error("x"))]` stays here: unlike the case above, the
+            // *key* stream `(1,error("x"))` is the multi-output generator
+            // here, not the target (`.` is a single value) — a distinct,
+            // still-open gap in the *keys*-evaluation `Partial` arm
+            // (conservatively documented in `eval_index_expr`'s own body as
+            // "not part of #400/#494's verified semantics"), out of #2226's
+            // scope (which is about `E`'s own prefix, not `K`'s) and tracked
+            // separately.
             (
                 b"[10,20,30]",
                 r#".[(1,error("x"))]"#,
                 "x",
                 "jq 1.7.1 prints 20, then fails",
-            ),
-            (
-                b"[[7],[8]]",
-                r#"(.[0],(.[1],error("x")))[(0+0)]"#,
-                "x",
-                "jq 1.7.1 prints 7 and 8, then fails",
             ),
             // `map_values` keeps only each key's first output, so jq 1.7.1
             // never reaches the error at all and exits 0.
@@ -54028,10 +54140,9 @@ mod tests {
             (b"null", "[1,(2,break $out),3]"),
             (b"[1,2]", "map((.,break $out))"),
             (br#"{"a":1}"#, "with_entries((.,break $out))"),
-            // `select`/`if`, string interpolation: see the comment in
-            // `atomic` above.
+            // `select`/`if`, string interpolation, target-generator index/
+            // slice: see the comment in `atomic` above.
             (b"[10,20,30]", ".[(1,break $out)]"),
-            (b"[[7],[8]]", "(.[0],(.[1],break $out))[(0+0)]"),
             (br#"{"a":1}"#, "map_values((.,break $out))"),
             (b"[1,2]", "map_values((.,break $out))"),
             (b"null", "reduce (1,2,break $out) as $v (0;.+$v)"),
@@ -54231,6 +54342,50 @@ mod tests {
             QueryResult::Partial(vs, Control::Error(e)) => {
                 assert_eq!(prefix_json(&vs), [r#""1-3""#]);
                 assert_eq!(e.message, "x");
+            }
+        );
+
+        // #2226: `(.[0],(.[1],error("x")))[(0+0)]` *used* to be listed in
+        // `partial_in_value_position_collapses_to_its_control`'s `atomic`
+        // table (labelled as a documented divergence from jq 1.7.1, which
+        // the old comment already recorded as printing `7` and `8` then
+        // failing); `eval_index_expr`'s *target* `Partial` arm now applies
+        // the per-key index to each already-produced value instead of
+        // discarding them, so it now agrees with jq 1.7.1 exactly. (The
+        // sibling shape `.[(1,error("x"))]`, where the *key* stream is the
+        // generator instead, stays in `atomic` -- that's a distinct,
+        // still-open gap outside this issue's scope; see the comment there.)
+        query!(b"[[7],[8]]", r#"(.[0],(.[1],error("x")))[(0+0)]"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["7", "8"]);
+                assert_eq!(e.message, "x");
+            }
+        );
+        query!(b"[[7],[8]]", r"(.[0],(.[1],break $out))[(0+0)]",
+            QueryResult::Partial(vs, Control::Break(label)) => {
+                assert_eq!(prefix_json(&vs), ["7", "8"]);
+                assert_eq!(label, "out");
+            }
+        );
+
+        // #2226 sibling: `eval_slice_expr`'s identical fix. Verified against
+        // jq 1.7.1: `label $out | (1,2,break $out)[(0+0):(2+0)]` and
+        // `(1,2,error("boom"))[(0+0):(2+0)]` both raise "Cannot index
+        // number with object" on the target's own first produced value
+        // (`1`) -- slicing a number is never valid, so the target's break/
+        // error is never even reached. This also corrects
+        // `test_computed_slice_bounds_read_mode`'s prior (unverified)
+        // expectation that these silently produced no output/echoed
+        // "boom" -- the old code's target-`Partial` arm never attempted to
+        // slice the prefix at all, so it never discovered this error either.
+        query!(b"null", r"label $out | (1,2,break $out)[(0+0):(2+0)]",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot index number with object");
+            }
+        );
+        query!(b"null", r#"(1,2,error("boom"))[(0+0):(2+0)]"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot index number with object");
             }
         );
     }
@@ -68746,21 +68901,30 @@ mod tests {
             ),
             // A target with no output at all.
             (b"null", "empty[(0+0):(2+0)]", Ok("")),
-            // A target that breaks out of an enclosing label — the whole
-            // slice contributes nothing, same as `IndexExpr`'s identically
-            // conservative target handling (see `eval_index_expr`'s key
-            // stream, which this mirrors).
+            // A target that breaks out of an enclosing label with no prior
+            // output at all — the whole slice contributes nothing.
             (b"null", "label $out | (break $out)[(0+0):(2+0)]", Ok("")),
+            // #2226 (corrected — see `partial_prefix_survives_the_stream_
+            // forwarding_constructs` for the `Partial`-preserving coverage
+            // of this fix): a target whose stream produces values before
+            // breaking/erroring now actually attempts to slice each one,
+            // same as any other target stream. Slicing a *number* is never
+            // valid in jq, so both raise "Cannot index number with object"
+            // on the target's first produced value (`1`) before its
+            // break/error is ever reached — this test harness's `outcome()`
+            // only distinguishes `Ok`/`Err`, so both read as `Err` here
+            // regardless of which control the target would otherwise have
+            // carried. Verified against jq 1.7.1: both raise the same way.
             (
                 b"null",
                 "label $out | (1,2,break $out)[(0+0):(2+0)]",
-                Ok(""),
+                Err("Cannot index number with object"),
             ),
-            // A target whose stream errors part-way through: the error wins,
-            // and (like the break case above) the values already produced
-            // are not carried forward — the same conservative trade-off
-            // `eval_index_expr` already makes for its key/target streams.
-            (b"null", "(1,2,error(\"boom\"))[(0+0):(2+0)]", Err("boom")),
+            (
+                b"null",
+                "(1,2,error(\"boom\"))[(0+0):(2+0)]",
+                Err("Cannot index number with object"),
+            ),
             // Owned targets of every slice-able kind, plus the two ways an
             // unsliceable one is refused.
             (b"null", "(null)[(0+0):(2+0)]", Ok("null")),

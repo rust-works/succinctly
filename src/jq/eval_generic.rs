@@ -8197,13 +8197,37 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
             // the old once-for-all-keys evaluation, this no longer implies
             // every other key is empty too).
             GenericResult::None => continue,
-            // Same conservative treatment the old once-for-all-keys
-            // evaluation already gave a target's own mid-stream escape:
-            // discard this key's own target prefix (never part of the
-            // indexed output either way), but now fold the *running*
-            // prefix from every earlier key in, instead of assuming it was
-            // empty.
-            GenericResult::Partial(_, control) => escape_generic!(control),
+            // #2226: `target`'s own generator produced `vs` before its own
+            // mid-stream escape -- real jq's key-outer/target-inner model
+            // indexes each already-produced value by `k` as it flows out,
+            // the same per-value operation the `Owned`/`Native` arms below
+            // already apply to a *successful* target result, so those
+            // values are not "never part of the indexed output either
+            // way" the way the old comment here assumed; only `target`'s
+            // own escape stops it from producing more. Mirrors
+            // `KeyTargets::Owned`'s own loop below exactly (this prefix is
+            // already `Vec<OwnedValue>`, the same shape `Owned` handles):
+            // an indexing failure on an earlier-produced value fires
+            // before `target`'s own later escape ever would in the real
+            // generator order, so it outranks `control` here the same way
+            // a later key's index error already outranks an earlier key's
+            // pending halt in the `Owned`/`Native` arms; only once every
+            // value in `vs` indexes cleanly does `control` -- `target`'s
+            // own termination -- get to fire.
+            GenericResult::Partial(vs, control) => {
+                ensure_owned!();
+                if owned.try_reserve(vs.len()).is_err() {
+                    escape_generic!(Control::Error(cannot_reserve_cross_product(&[vs.len()])));
+                }
+                for t in &vs {
+                    match index_owned_by_key(t, k, optional) {
+                        Ok(Some(v)) => owned.push(v),
+                        Ok(None) => {}
+                        Err(e) => escape_generic!(Control::Error(e)),
+                    }
+                }
+                escape_generic!(control)
+            }
             GenericResult::One(v) => KeyTargets::Native(vec![v]),
             GenericResult::Many(vs) => KeyTargets::Native(vs),
             GenericResult::OneCursor(c) => KeyTargets::Native(vec![c.value()]),
@@ -8507,10 +8531,26 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
                 // output count can vary across pairs (mirrors
                 // `eval_index_expr`'s identical per-key treatment).
                 GenericResult::None => continue,
-                // Same conservative Error/Break/Halt-only handling as
-                // `eval_index_expr`'s target `Partial` arm, now folding the
-                // running `out` in as the prefix instead of discarding it.
-                GenericResult::Partial(_, control) => escape!(control),
+                // #2226: this (s, e) pair's own target generator may have
+                // produced some values before escaping (a break/halt/error
+                // partway through its own stream) -- apply the slice to each
+                // of those already-produced values and fold them into `out`
+                // before escaping, mirroring `eval_index_expr`'s identical
+                // fix for its own target `Partial` arm, rather than
+                // discarding them.
+                GenericResult::Partial(vs, control) => {
+                    if out.try_reserve(vs.len()).is_err() {
+                        escape!(Control::Error(cannot_reserve_cross_product(&[vs.len()])));
+                    }
+                    for t in &vs {
+                        match slice_owned_value_read::<S>(t, *s, *e, optional) {
+                            Ok(Some(v)) => out.push(v),
+                            Ok(None) => {}
+                            Err(e) => escape!(Control::Error(e)),
+                        }
+                    }
+                    escape!(control)
+                }
                 GenericResult::One(v) => Targets::Borrowed(vec![v]),
                 GenericResult::Many(vs) => Targets::Borrowed(vs),
                 GenericResult::OneCursor(c) => Targets::Borrowed(vec![c.value()]),
@@ -17031,37 +17071,36 @@ mod tests {
             summarize(b"5", r#"select((true,error("x")))?"#),
             Summary::Values(vec!["5".to_string()])
         );
-    }
 
-    #[test]
-    fn generic_value_position_partial_collapses_to_its_control() {
-        // Computed indexing and `select` each consult their operand once, so
-        // a `Partial` there is reduced the same way a multi-output operand
-        // already is. Comparison used to share this reduction too, but now
-        // forks over every output instead (#768) — see
-        // `generic_compare_partial_operand_keeps_prefix_768` below.
-
-        // A computed *target* that is a `Partial` surfaces the control alone.
-        // (jq 1.7.1 prints 7 and 8 first; pinned here, not endorsed.)
+        // #2226: a computed *target* that is itself a multi-output generator
+        // and is `Partial` used to surface the control alone, discarding
+        // whatever `E` had already produced this key/pair — pinned in a
+        // dedicated `generic_value_position_partial_collapses_to_its_control`
+        // test, not endorsed, before the fix. `eval_index_expr`'s/
+        // `eval_slice_expr`'s target `Partial` arm now applies the per-key
+        // index/slice to each already-produced value instead, matching jq
+        // 1.7.1 exactly (`(.[0],(.[1],error("x")))[(0+0)]` prints `7` then
+        // `8` before failing; the slice sibling below prints `[7]` then
+        // `[8]`, since `.[0]`/`.[1]` here are the one-element arrays `[7]`/
+        // `[8]`, not the bare numbers).
         assert_eq!(
             summarize(b"[[7],[8]]", r#"(.[0],(.[1],error("x")))[(0+0)]"#),
-            Summary::Error("x".to_string())
+            partial_err(&["7", "8"], "x")
         );
         assert_eq!(
             summarize(b"[[7],[8]]", "(.[0],(.[1],break $out))[(0+0)]"),
-            Summary::Break("out".to_string())
+            partial_break(&["7", "8"])
         );
-
         // Computed slicing (#615) shares the same target-position `Partial`
-        // reduction as computed indexing above — one bound (`(0+0)`) is
-        // enough to force `eval_slice_expr`'s fast path.
+        // fix as computed indexing above — one bound (`(0+0)`) is enough to
+        // force `eval_slice_expr`'s fast path.
         assert_eq!(
             summarize(b"[[7],[8]]", r#"(.[0],(.[1],error("x")))[(0+0):2]"#),
-            Summary::Error("x".to_string())
+            partial_err(&["[7]", "[8]"], "x")
         );
         assert_eq!(
             summarize(b"[[7],[8]]", "(.[0],(.[1],break $out))[(0+0):2]"),
-            Summary::Break("out".to_string())
+            partial_break(&["[7]", "[8]"])
         );
     }
 
