@@ -10883,16 +10883,25 @@ fn test_eval_index_expr_target_direct_halt_reached_through_group_by_key_fn() -> 
 
 #[test]
 fn test_eval_index_expr_target_partial_halt_reached_through_group_by_key_fn() -> Result<()> {
-    // `eval_index_expr`'s target-materialization match, `Partial(_,
+    // `eval_index_expr`'s target-materialization match, `Partial(vs,
     // Control::Halt(code))` arm: the target (`1,2,halt`) produces two real
-    // outputs before halting -- conservatively treated the same as a direct
-    // halt (the already-produced prefix is discarded, matching the key
-    // stream's own conservative `Error`/`Break` treatment right above it in
-    // the source). Verified against jq 1.7.1: `jq -c 'group_by((1,2,halt)[.])'`
-    // on `[5]` exits 0 with no output.
+    // outputs (`1`, `2`) before halting. #2226 now applies the per-key index
+    // to each before propagating the held control -- indexing `1` by key `.`
+    // (`5`, a number) is never valid regardless of what `.` resolves to, so
+    // that index attempt raises before `halt` is ever reached. Corrected
+    // from this test's own prior (unverified) expectation that it exits 0
+    // with no output: live-checked against jq 1.7.1, `jq -c
+    // 'group_by((1,2,halt)[.])'` on `[5]` actually raises "Cannot index
+    // number with number" too -- the old succinctly behavior (discard the
+    // prefix outright, never attempt the index) was the one exiting 0, not
+    // real jq.
     let (stdout, stderr, code) = run_jq_full(&["-c", "group_by((1,2,halt)[.])"], Some("[5]"))?;
-    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("Cannot index number with number"),
+        "stderr: {stderr:?}"
+    );
     Ok(())
 }
 
@@ -10963,16 +10972,23 @@ fn test_eval_slice_expr_target_halt_reached_through_group_by_key_fn() -> Result<
 
 #[test]
 fn test_eval_slice_expr_target_partial_halt_reached_through_group_by_key_fn() -> Result<()> {
-    // `eval_slice_expr`'s target-materialization match, `Partial(_,
+    // `eval_slice_expr`'s target-materialization match, `Partial(vs,
     // Control::Halt(code))` arm -- the `eval_slice_expr` sibling of
     // `test_eval_index_expr_target_partial_halt_reached_through_group_by_key_fn`.
-    // The target (`1,2,halt`) produces two real outputs before halting;
-    // like the index-expr case, the already-produced prefix is discarded
-    // rather than sliced. Verified against jq 1.7.1: `jq -c
-    // 'group_by((1,2,halt)[0:.])'` on `[5]` exits 0 with no output.
+    // The target (`1,2,halt`) produces two real outputs (`1`, `2`) before
+    // halting; #2226 now attempts to slice each before propagating the held
+    // control -- slicing a *number* is never valid in jq, so slicing `1`
+    // raises before `halt` is ever reached. Corrected from this test's own
+    // prior (unverified) expectation that it exits 0 with no output:
+    // live-checked against jq 1.7.1, `jq -c 'group_by((1,2,halt)[0:.])'` on
+    // `[5]` actually raises "Cannot index number with object" too.
     let (stdout, stderr, code) = run_jq_full(&["-c", "group_by((1,2,halt)[0:.])"], Some("[5]"))?;
-    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("Cannot index number with object"),
+        "stderr: {stderr:?}"
+    );
     Ok(())
 }
 
@@ -11963,26 +11979,20 @@ fn test_eval_index_expr_target_propagates_direct_halt() -> Result<()> {
 }
 
 #[test]
-fn test_eval_index_expr_target_partial_halt_discards_prefix() -> Result<()> {
-    // `eval_index_expr`'s target-side `QueryResult::Partial(_, Control::
-    // Halt(code))` arm: unlike the *key*-side `pending_halt` handling
-    // (#791, see `test_eval_index_expr_owned_target_flushes_prior_keys_
-    // before_halting`), the *target* side has no equivalent bookkeeping --
-    // it is the same conservative treatment this function's own doc
-    // comment gives the target's `Error`/`Break` arms right above it
-    // ("conservatively matching the existing Error/Break arms rather than
-    // inventing new partial-key behavior"), just extended uniformly to
-    // `Halt`. The already-produced target values (`[1,2]` and `[3,4]`, the
-    // first two comma operands, evaluated before the third one halts) are
-    // discarded rather than flushed -- a real, pre-existing divergence from
-    // jq 1.7.1, which streams `1` then `3` (`[1,2][0]` then `[3,4][0]`)
-    // before halting: `([1,2],[3,4],halt_error(6))[(0,0)]` on real jq exits
-    // 6 with stdout "1\n3\n"; succinctly exits 6 with no output at all,
-    // since it evaluates the whole target stream up front rather than
-    // interleaving it with indexing.
+fn test_eval_index_expr_target_partial_halt_no_longer_discards_prefix_2226() -> Result<()> {
+    // `eval_index_expr`'s target-side `QueryResult::Partial(vs, control)`
+    // arm (`control` including `Control::Halt`, not just `Error`/`Break`):
+    // this test used to pin a real, documented divergence from jq 1.7.1 --
+    // the already-produced target values (`[1,2]` and `[3,4]`, the first
+    // two comma operands, evaluated before the third one halts) were
+    // discarded rather than indexed and flushed. #2226 fixed the target
+    // `Partial` arm to apply the per-key index to each already-produced
+    // value first, uniformly for every held control including `Halt`, so
+    // this now matches jq 1.7.1 exactly: `([1,2],[3,4],halt_error(6))[(0,0)]`
+    // streams `1` then `3` (`[1,2][0]` then `[3,4][0]`) before exiting 6.
     let (stdout, stderr, code) = run_jq_full(&["-n", "([1,2],[3,4],halt_error(6))[(0,0)]"], None)?;
     assert_eq!(code, 6, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "");
+    assert_eq!(stdout, "1\n3\n");
     Ok(())
 }
 
@@ -12050,21 +12060,24 @@ fn test_eval_slice_expr_target_propagates_direct_halt() -> Result<()> {
 }
 
 #[test]
-fn test_eval_slice_expr_target_partial_halt_discards_prefix() -> Result<()> {
-    // `eval_slice_expr`'s target-side `QueryResult::Partial(_, Control::
-    // Halt(code))` arm: the same conservative "discard the already-
-    // produced prefix" treatment `eval_index_expr`'s analogous target-side
-    // arm has (see `test_eval_index_expr_target_partial_halt_discards_
-    // prefix`), and the same real divergence from jq 1.7.1 follows: real
-    // jq streams `[1,2]` then `[4,5]` (slicing each of the two arrays
-    // before the third comma operand halts) before exiting 6, while
-    // succinctly evaluates the whole target stream up front, sees it end
-    // in `Partial(_, Halt(6))`, and discards the buffered `[1,2,3]`/
-    // `[4,5,6]` entirely -- exit 6, no output at all.
-    let (stdout, stderr, code) =
-        run_jq_full(&["-n", "([1,2,3],[4,5,6],halt_error(6))[(1-1):2]"], None)?;
+fn test_eval_slice_expr_target_partial_halt_no_longer_discards_prefix_2226() -> Result<()> {
+    // `eval_slice_expr`'s target-side `QueryResult::Partial(vs, control)`
+    // arm (the `eval_slice_expr` sibling of
+    // `test_eval_index_expr_target_partial_halt_no_longer_discards_prefix_2226`):
+    // this test used to pin a real, documented divergence from jq 1.7.1 --
+    // succinctly evaluated the whole target stream up front, saw it end in
+    // `Partial(_, Halt(6))`, and discarded the buffered `[1,2,3]`/`[4,5,6]`
+    // entirely. #2226 fixed the target `Partial` arm to slice each
+    // already-produced value first, uniformly for every held control
+    // including `Halt`, so this now matches jq 1.7.1 exactly: real jq
+    // streams `[1,2]` then `[4,5]` (slicing each of the two arrays before
+    // the third comma operand halts) before exiting 6.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "-n", "([1,2,3],[4,5,6],halt_error(6))[(1-1):2]"],
+        None,
+    )?;
     assert_eq!(code, 6, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "");
+    assert_eq!(stdout, "[1,2]\n[4,5]\n");
     Ok(())
 }
 
@@ -34813,6 +34826,46 @@ fn test_slice_expr_one_empty_pair_does_not_short_circuit_others_2143() -> Result
         run_jq_full(&["-c", "-n", "inputs[(0,1):(1,2)]"], Some("[10,20]\n"))?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "[10]\n");
+    Ok(())
+}
+
+/// #2226: `eval_generic::eval_index_expr`'s target-evaluation `Partial` arm
+/// used to discard `E`'s own already-produced prefix and keep only the
+/// escaping control. `([1,2],[3,4],error("x"))[(0,1)]` makes both the key
+/// (`(0,1)`, a bare computed generator with no `as`-binding, so this
+/// dispatches through `eval_generic.rs` rather than `eval.rs`'s sibling)
+/// *and* the target multi-output: `E`'s first two branches each index
+/// cleanly at key `0` (`1`, then `3`) before the third branch errors.
+/// Verified against jq 1.7.1: `echo null | jq -c
+/// '([1,2],[3,4],error("x"))[(0,1)]'` prints `1` then `3` before raising.
+#[test]
+fn test_index_expr_cli_dispatch_target_own_partial_prefix_preserved_2226() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "([1,2],[3,4],error(\"x\"))[(0,1)]"], Some("null"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "1\n3\n");
+    assert!(stderr.contains('x'), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #2226 sibling: the same target-own-prefix fix for
+/// `eval_generic::eval_slice_expr` -- the issue's own canonical repro.
+/// `(0,1):(1,2)` are bare computed bounds (no `as`-binding), so this
+/// dispatches through `eval_generic.rs` rather than `eval.rs`'s sibling
+/// (see `test_slice_expr_eval_rs_dispatch_target_reevaluated_per_pair_2143`
+/// above for the `eval.rs`-reaching counterpart shape via `input`). Verified
+/// against jq 1.7.1: `echo null | jq -c
+/// '([1,2],[3,4],error("x"))[(0,1):(1,2)]'` prints `[1]` then `[3]` before
+/// raising.
+#[test]
+fn test_slice_expr_cli_dispatch_target_own_partial_prefix_preserved_2226() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "([1,2],[3,4],error(\"x\"))[(0,1):(1,2)]"],
+        Some("null"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[1]\n[3]\n");
+    assert!(stderr.contains('x'), "stderr: {stderr:?}");
     Ok(())
 }
 
