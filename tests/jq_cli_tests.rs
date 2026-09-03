@@ -18293,6 +18293,49 @@ fn test_resolve_node_alternative_falsy_literal_interacts_correctly_with_untracke
     Ok(())
 }
 
+/// #2272: `navigation_element` fell into its own `_ => None` catch-all for
+/// an `Expr::Optional`-wrapped component (`E[K]?`'s own `resolve_index_expr`
+/// call site still builds `Expr::Optional(Field(...))`/`Expr::Optional(
+/// Index{..})`/`Expr::Optional(Slice{..})` components, since `?`'s wrapper
+/// isn't stripped until later, write-side (#498)) -- so `resolve_static_tail`
+/// fell back to the generic `#530` "with result" wording instead of #843's
+/// "near attempt to access element K of V" whenever a trailing `?` was
+/// involved. Verified live against jq 1.7.1 for every assertion below.
+#[test]
+fn test_navigation_element_unwraps_optional_component_2272() -> Result<()> {
+    // Field access through a computed-key index expression.
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"path((.,5)[("a")]?)"#], Some("null"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n");
+    assert!(
+        stderr.contains(r#"near attempt to access element "a" of 5"#),
+        "stderr: {stderr:?}"
+    );
+
+    // Slice access, same shape.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "path((.,5)[(0):(2)]?)"], Some("null"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[{\"start\":0,\"end\":2}]\n");
+    assert!(
+        stderr.contains(r#"near attempt to access element {"start":0,... of 5"#),
+        "stderr: {stderr:?}"
+    );
+
+    // The bare postfix `?` cases (`.field?`) already correctly hit
+    // `is_untracked_navigation_error`'s own carve-out before this fix and
+    // must stay unaffected -- pinned here so a future change to
+    // `navigation_element` can't quietly re-break this sibling shape.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "path(try (.a, error(5)) catch .b?)"], Some("null"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains(r#"near attempt to access element "b" of 5"#),
+        "stderr: {stderr:?}"
+    );
+
+    Ok(())
+}
+
 // ============================================================================
 // #1023: resolve_node's Select/If arms both hand-rolled the identical
 // "evaluate cond via eval_owned_multi_keep_partial, fork per output's
