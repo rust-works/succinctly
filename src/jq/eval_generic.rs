@@ -10738,7 +10738,18 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         Builtin::Empty => GenericResult::None,
 
         Builtin::ToString => {
-            let owned = owned_or_err!(to_owned_with_cursor(&value, cursor));
+            // #2231: consult `optional` here rather than the bare
+            // `owned_or_err!` -- the `eval.rs` twin of this arm
+            // (`builtin_tostring`, #2184) already does, and this file's own
+            // `owned_or_err!` unconditionally errors regardless of
+            // `optional`, ignoring it the same way `eval.rs`'s pre-#2184
+            // sites did. Same non-live-reachable defensive-consistency
+            // class as the rest of this lineage.
+            let owned = match to_owned_with_cursor(&value, cursor) {
+                Ok(v) => v,
+                Err(e) if suppresses(&e, optional) => return GenericResult::None,
+                Err(e) => return GenericResult::Error(e),
+            };
             GenericResult::Owned(OwnedValue::String(owned_to_string::<S>(&owned)))
         }
 
@@ -10891,7 +10902,20 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 
         // For other builtins, fall back to full evaluator via JSON
         _ => {
-            let owned = owned_or_err!(to_owned_with_cursor(&value, cursor));
+            // #2231: consult `optional` on this bridging conversion too --
+            // same reasoning as the `ToString` arm above. Every builtin
+            // this arm reaches (`ToJson`/`UpperIndex`/`UpperIndexStream`/
+            // `ToJsonStream`/`ToStream`) is #2184-fixed on its `eval.rs`
+            // side to respect `optional` internally, but this outer
+            // materialization ran unconditionally ahead of ever reaching
+            // that -- an inconsistency with no live-reachable effect today
+            // (`eval_try` already suppresses one level up), not a behavior
+            // change for any query parseable today.
+            let owned = match to_owned_with_cursor(&value, cursor) {
+                Ok(v) => v,
+                Err(e) if suppresses(&e, optional) => return GenericResult::None,
+                Err(e) => return GenericResult::Error(e),
+            };
             eval_on_owned::<S, _>(&Expr::Builtin(builtin.clone()), owned, optional)
         }
     }
@@ -11177,6 +11201,68 @@ mod tests {
                 OwnedValue::from_number_literal("1")
             )]))
         );
+    }
+
+    /// #2231 finding 3: `Builtin::ToString`'s own dedicated arm and the
+    /// catch-all wildcard fallback arm both raised an ordinary #1194
+    /// malformed-member error unconditionally, ignoring `optional` --
+    /// the `eval_generic.rs` twin of `eval.rs`'s `builtin_tostring`
+    /// (#2184) and findings 1-3's other `eval.rs` sites. Called directly
+    /// through `eval_builtin`, not through `eval`/`?`, for the same reason
+    /// `eval.rs`'s own #2184/#2231 tests do: `Expr::Optional`'s outer catch
+    /// already normalizes the observable result regardless of what this
+    /// arm does internally, so only a direct call distinguishes fixed from
+    /// unfixed.
+    #[test]
+    fn test_generic_tostring_and_wildcard_respect_optional_2231() {
+        use crate::json::JsonIndex;
+        let json: &[u8] = br#"{"a":1,"b"}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        match eval_builtin::<JqSemantics, _>(&Builtin::ToString, value.clone(), true, Some(cursor))
+        {
+            GenericResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match eval_builtin::<JqSemantics, _>(&Builtin::ToString, value.clone(), false, Some(cursor))
+        {
+            GenericResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        // The catch-all wildcard arm, reached via a builtin with no
+        // dedicated arm of its own (e.g. `ToJson`).
+        match eval_builtin::<JqSemantics, _>(&Builtin::ToJson, value.clone(), true, Some(cursor)) {
+            GenericResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match eval_builtin::<JqSemantics, _>(&Builtin::ToJson, value, false, Some(cursor)) {
+            GenericResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// #2231 finding 3: a genuine decode failure must still survive
+    /// `optional` for both arms above -- same rule #2184's own sites keep.
+    #[test]
+    fn test_generic_tostring_and_wildcard_decode_failure_survives_optional_2231() {
+        use crate::json::JsonIndex;
+        let json: &[u8] = &b"\"\xff\xfe\""[..];
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+
+        match eval_builtin::<JqSemantics, _>(&Builtin::ToString, value.clone(), true, Some(cursor))
+        {
+            GenericResult::Error(e) => assert!(e.is_decode_failure()),
+            other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
+        }
+        match eval_builtin::<JqSemantics, _>(&Builtin::ToJson, value, true, Some(cursor)) {
+            GenericResult::Error(e) => assert!(e.is_decode_failure()),
+            other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
+        }
     }
 
     /// #1620: `?` must not suppress a decode failure -- `Expr::Optional`'s
