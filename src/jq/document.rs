@@ -1015,21 +1015,29 @@ pub trait DocumentFields: Sized + Clone {
         while let Some((key, key_cursor, rest)) = fields.uncons_key() {
             // #1677/#2288: cheap per-key checks, riding the walk `contains`
             // already makes regardless of early exit -- no extra cost,
-            // early-exit or not. `key_is_malformed` (#1194/#1995) catches a
-            // key the format's grammar never allowed at all (a non-string
+            // early-exit or not. `display` being `None` (#1194/#1995) means
+            // a key the format's grammar never allowed at all (a non-string
             // JSON key); the delimiter checks catch a missing/doubled
             // `,`/`:` around a key that *is* well-shaped. Both only cover
             // keys actually visited before a match -- see this method's own
             // doc comment for why a malformed key strictly *after* the
             // match is a documented, accepted gap, not something this walk
             // closes.
-            if key_is_malformed(&key)
+            //
+            // `key_display_string_kind` once, not `key_is_malformed` (#1194
+            // check) plus a separate `key_display_string` (match check) --
+            // `key_is_malformed(k) == key_display_string_kind(k).is_none()`
+            // by construction (code review on this fix caught the
+            // redundant second decode pass a naive two-call version would
+            // pay for every key, every `has()` call).
+            let display = key_display_string_kind(&key);
+            if display.is_none()
                 || !key_delimiter_ok::<Self>(&key, &key_cursor, is_first)
                 || !key_only_value_delimiter_ok::<Self>(&key, &key_cursor)
             {
                 return Err(self.malformed_member_error());
             }
-            if key_display_string(&key).is_some_and(|k| k.as_ref() == name) {
+            if display.is_some_and(|(k, _is_fallback)| k.as_ref() == name) {
                 // #2261: free exactly when the match is also the last
                 // field -- see this method's own doc comment for why a
                 // match elsewhere accepts the documented early-exit trade
