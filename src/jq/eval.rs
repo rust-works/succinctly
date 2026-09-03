@@ -46926,6 +46926,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_any_all_cond_ordinary_error_folds_probe_escape_2204() {
+        // #2204 review: patch coverage flagged `any_all_gen_cond`'s own
+        // `probe_escape`-folding line as untested by this fix's own
+        // consolidation -- every pre-existing test above raises through
+        // `gen`'s own decode failure, never through `cond` itself, so
+        // `probe_escape` was never actually set to `Some` and folded into
+        // `Flow::Escaped`. `cond` raising an ordinary (non-decode-failure)
+        // error is that exact path. Confirmed live against jq 1.7.1:
+        // `[any(1,2,3; error("boom"))]`/`[all(1,2,3; error("boom"))]` both
+        // raise "boom" immediately -- `cond` on the very first element
+        // already escapes, so neither ever reaches a second.
+        query!(br"null", r#"any(1,2,3; error("boom"))"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "boom");
+            }
+        );
+        query!(br"null", r#"all(1,2,3; error("boom"))"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "boom");
+            }
+        );
+    }
+
     /// #2015: `builtin_upper_in` (`IN(s)`) hardcoded `_optional` unused and
     /// called `to_owned` unconditionally, unlike its sibling `any`/
     /// `all` (`any_all_gen_cond`, fixed by #2001 immediately above) despite
