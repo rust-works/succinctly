@@ -21617,18 +21617,21 @@ fn test_malformed_json_error_never_suppressed_2286() -> Result<()> {
 }
 
 /// #2286/#1995: the non-string-sibling-key shape from #1995's own repro
-/// (`{"a":1,123:2}`) is confounded across two distinct, separately-scoped
-/// bugs -- worth pinning both halves so a future reader doesn't conflate
-/// them. `.a?` alone never even reaches `malformed_json_text`: `Expr::
-/// Field`'s fast path looks up `.a` directly without validating sibling
-/// keys at all (#1995's own still-open bug, unrelated to this issue,
-/// tracked separately -- wrongly succeeds with `1` here, not "wrongly
-/// suppressed"). `keys?`/`to_entries?` instead walk every member (they
-/// are not simple field lookups), reaching `malformed_json_text` via
-/// `malformed_member_error` regardless of which field is asked for --
-/// that shape is squarely in #2286's own scope, and now correctly raises
-/// unconditionally, matching real jq 1.7.1 (`Object keys must be
-/// strings`, exit 5, no output).
+/// (`{"a":1,123:2}`) was originally confounded across two distinct,
+/// separately-scoped bugs, worth pinning as two halves so a future reader
+/// doesn't conflate them -- even though both halves now raise, having
+/// closed independently and for different reasons. `.a?` alone used to
+/// never even reach `malformed_json_text`: `Expr::Field`'s fast path
+/// looked up `.a` directly without validating sibling keys at all. That was
+/// #1995's own bug, not this issue's, and is now fixed by #1995 itself
+/// (`.field`'s fast path rejects a non-string sibling object key) -- a
+/// separate PR, merged independently of #2286. `keys?`/`to_entries?`
+/// instead walk every member (they are not simple field lookups), reaching
+/// `malformed_json_text` via `malformed_member_error` regardless of which
+/// field is asked for -- that shape is squarely in #2286's own scope, and
+/// correctly raises unconditionally, matching real jq 1.7.1 (`Object keys
+/// must be strings`, exit 5, no output). Both are asserted here so a
+/// regression in either fix's own scope still fails this test.
 ///
 /// `.a? // "outer"` (an earlier draft of this test) is *not* a valid
 /// vehicle for this: `//`'s own semantics only substitute for a
@@ -21640,15 +21643,9 @@ fn test_malformed_json_error_never_suppressed_2286() -> Result<()> {
 fn test_malformed_json_error_never_suppressed_on_generic_bridge_2286() -> Result<()> {
     let non_string_sibling_key: &str = r#"{"a":1,123:2}"#;
 
-    // #1995's own bug, not this issue's -- pinned here as the contrast.
-    let (stdout, _stderr, code) = run_jq_full(&["-c", ".a?"], Some(non_string_sibling_key))?;
-    assert_eq!(code, 0, "stdout: {stdout:?}");
-    assert_eq!(stdout, "1\n");
-
-    // This issue's own scope: a whole-object walk reaches
-    // malformed_member_error/malformed_json_text, which must now raise
-    // unconditionally even under a trailing `?`.
-    for expr in ["keys?", "to_entries?"] {
+    // #1995's own fast-path fix, not this issue's -- pinned here as the
+    // contrast, now also uncatchable.
+    for expr in [".a?", "keys?", "to_entries?"] {
         let (stdout, stderr, code) = run_jq_full(&["-c", expr], Some(non_string_sibling_key))?;
         assert_eq!(code, 5, "{expr}: stdout: {stdout:?} stderr: {stderr:?}");
         assert!(stdout.is_empty(), "{expr}: stdout: {stdout:?}");
@@ -21780,23 +21777,30 @@ fn test_jq_malformed_object_non_string_key_raises_everywhere_1194() -> Result<()
     Ok(())
 }
 
-/// #1995 review: a known, pre-existing, and *separate* gap this fix does
-/// not close -- `?` wrongly suppresses a malformed-JSON error that real jq
-/// raises unconditionally (a parse error precedes every filter, `?`
-/// included). Confirmed this predates #1995 entirely and isn't specific to
-/// a non-string key: `{"a" 1}` (#1677's own missing-`:` shape) is
-/// suppressed by `.a?` here identically, and real jq rejects both
-/// unconditionally (`jq -c '.a?'` on either input is still a parse error,
-/// exit 5). Pinned here rather than left untested per this project's own
-/// convention -- see #2286's own filed follow-up for the fix.
+/// #1995 review named this a known, pre-existing, and *separate* gap that
+/// PR did not close -- `?` wrongly suppressing a malformed-JSON error that
+/// real jq raises unconditionally (a parse error precedes every filter, `?`
+/// included) -- and filed #2286 as its own follow-up to close it. #2286 has
+/// since done so: both shapes now raise unconditionally, matching real jq
+/// (`jq -c '.a?'` on either input is a parse error, exit 5). Kept under its
+/// original name (with the reversal recorded here) so the history stays
+/// visible, the same convention `test_malformed_member_error_is_not_a_decode_failure_1953`
+/// established. `{"a" 1}` (#1677's own missing-`:` shape) is included
+/// alongside the non-string-key shape since both were confirmed to predate
+/// #1995 and share the same fix.
 #[test]
 fn test_optional_wrongly_suppresses_malformed_json_error_known_gap_1995() -> Result<()> {
     for input in [r#"{"a":1,123:2}"#, r#"{"a" 1}"#] {
         let (out, stderr, code) = run_jq_full(&["-c", ".a?"], Some(input))?;
-        // jq 1.7.1 raises unconditionally (exit 5) for both; this is the
-        // known gap -- `?` currently swallows it (exit 0, no output).
-        assert_eq!(code, 0, "input {input:?}: out: {out:?}, stderr: {stderr:?}");
+        // jq 1.7.1 raises unconditionally (exit 5) for both, and #2286
+        // closed the gap that used to let `?` swallow it (exit 0, no
+        // output) here too.
+        assert_eq!(code, 5, "input {input:?}: out: {out:?}, stderr: {stderr:?}");
         assert!(out.trim().is_empty(), "input {input:?}: out: {out:?}");
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "input {input:?}: stderr: {stderr:?}"
+        );
     }
 
     Ok(())
