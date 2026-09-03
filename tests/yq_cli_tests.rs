@@ -29194,3 +29194,38 @@ fn test_del_and_delpaths_negative_index_unaffected_in_jq_mode_2268() -> Result<(
 
     Ok(())
 }
+
+/// #2226 review finding: `eval_generic::eval_index_expr`'s target `Partial`
+/// fix (the actual CLI-dispatch path a real `.[$keys]` read hits) is
+/// jq-only. Real yq does not stream a target's own escaped generator's
+/// prefix at all -- verified live against yq v4.53.3:
+/// `([1,2],[3,4],error("x"))[(0,1)]` prints only `Error: x`, no prefix.
+/// Confirms the pre-#2226 conservative discard survives in yq mode.
+#[test]
+fn test_index_expr_target_partial_prefix_still_discarded_in_yq_mode_2226() -> Result<()> {
+    let (out, stderr, code) = run_yq_stdin_with_stderr(
+        "([1,2],[3,4],error(\"x\"))[(0,1)]",
+        "null\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 1, "out: {out:?} stderr: {stderr:?}");
+    assert_eq!(out, "");
+    assert_eq!(stderr.trim(), "Error: x");
+    Ok(())
+}
+
+/// #2226 sibling: the identical yq-mode carve-out for
+/// `eval_generic::eval_slice_expr`. Verified live against yq v4.53.3:
+/// `([1,2],[3,4],error("x"))[(0,1):(1,2)]` prints only `Error: x`.
+#[test]
+fn test_slice_expr_target_partial_prefix_still_discarded_in_yq_mode_2226() -> Result<()> {
+    let (out, stderr, code) = run_yq_stdin_with_stderr(
+        "([1,2],[3,4],error(\"x\"))[(0,1):(1,2)]",
+        "null\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 1, "out: {out:?} stderr: {stderr:?}");
+    assert_eq!(out, "");
+    assert_eq!(stderr.trim(), "Error: x");
+    Ok(())
+}
