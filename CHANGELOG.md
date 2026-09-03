@@ -289,6 +289,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`succinctly yq --slurp`/`--eval-all`/`--inplace --input-format json` silently accepted a
+  trailing stray `,` after a real last array/object child** (#2262): `echo '[1,]' | succinctly
+  yq --slurp --input-format json -o json '.[0]'` printed `1` at exit 0, where real yq (v4.53.3)
+  rejects the document outright. This was one of (at least) four independent materializers
+  that each walk a JSON object/array and build an `OwnedValue`, checking for malformed comma
+  placement as they go — `eval_generic::to_owned_cursor_at_depth` got both #2211's
+  `container_gap_ok` (a stray `,` with *zero* real children, `[,]`/`{,}`) and #2243's
+  `trailing_element_gap_ok` (a stray `,` *after* a real last child, `[1,]`/`{"a":1,}`); the
+  other three — `eval.rs`'s own `to_owned_at_depth` (the materializer behind this crate's
+  documented public library API), `eval_generic.rs`'s cursor-less `to_owned_at_depth` sibling
+  (distinct from the cursor-carrying one above, reached from `GenericResult::One`/`Many`
+  whenever a value materializes without a live cursor), and `yq_runner.rs`'s
+  `to_owned_canonicalizing_numbers_at_depth` (the CLI-reachable one, above) — never received
+  either fix. Fixed all three by reusing the same `DocumentCursor::trailing_element_gap_ok`
+  primitive (moved from a private copy in `eval_generic.rs` into `document.rs` as `pub`, so
+  all three plus the already-fixed original share one definition instead of drifting into
+  four hand-copied ones) — each arm now retains its last real child's own cursor (already
+  available via `uncons`/`uncons_cursor`) and checks it after the loop. `container_gap_ok`
+  (`[,]`/`{,}`) remains a known, deliberately unclosed gap in all three: unlike
+  `to_owned_cursor_at_depth`, none of them is ever given a cursor for the *container itself*
+  (only a bare `value: &V`), so once a container's child walk is exhausted there is no cursor
+  left to find its opening bracket from — the same limitation #2211 already documented for
+  `jq_runner::standard_json_to_jq_value`'s identical value-only shape. `eval.rs`'s
+  `to_owned_at_depth` also gained #1677's malformed-`,`/`:` delimiter check, which it had none
+  of at all. Neither `eval.rs`'s nor `eval_generic.rs`'s cursor-less fix is independently
+  reachable through the shipped CLI with raw untrusted text (every production caller
+  re-serializes an already-materialized `OwnedValue` first) — both are library-API-only
+  completeness fixes, pinned by direct unit tests calling the function itself.
+
 - **`del(EXPR | .)` -- a `del()` path whose *last* component is a bare `.` reached after
   navigating through a real `Field`/`Index`/`Iterate` step -- nulled the targeted slot in place
   instead of removing it from its parent container** (#2256), diverging from both real jq and
