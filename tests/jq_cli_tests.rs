@@ -29985,50 +29985,32 @@ fn test_eval_rs_only_sites_still_correct_2280() -> Result<()> {
     Ok(())
 }
 
-/// #2327: `builtin_del` (`eval.rs`), `builtin_envvar` (`eval.rs`),
-/// `builtin_transpose` (`eval.rs`), `builtin_group_by`/`unique_by`/`sort_by`'s
-/// own per-item conversion (`eval.rs`), and `builtin_halt_error` (`eval.rs`)
-/// all consulted `optional` for real now (routed through
-/// `to_owned_or_suppress!`/`suppress_or_raise` instead of a bare
-/// `to_owned`/`QueryResult::Error` match) -- following #2280's exact
+/// #2327: `eval_generic.rs`'s `Reverse`/`Sort`/`SortBy`/`Unique`/`UniqueBy`/
+/// `Min`/`MinBy`/`Max`/`MaxBy` family now consults `optional` for real
+/// (routed through `owned_or_suppress!` instead of `owned_or_err!`) on its
+/// own `collect_cursors_checked` materialization -- following #2280's exact
 /// precedent, itself following #2231's.
 ///
-/// `builtin_del`'s own case is the sharpest: its doc comment already
-/// promised this exact suppression ("any resulting error is caught right
-/// here, turning the whole call's output into empty when `optional` is
-/// set") without the code actually doing it.
+/// This is the one #2327 site with genuine CLI-level coverage: these are
+/// the arms `succinctly jq`'s default dispatch actually reaches for a plain
+/// array input (confirmed by `test_jq_collect_cursors_checked_sibling_
+/// paths_reject_trailing_comma_2261`'s own fixture, reused here with a
+/// trailing `?` added). Every *other* function this PR touches is fixed but
+/// not independently CLI-testable this way -- see
+/// `test_eval_rs_sites_produce_correct_output_2327`'s own doc comment for
+/// why, and why that matters.
 ///
-/// Pins that this is defensive, not a behavior change: a document-wide
-/// decode failure (`\ud800`) still raises -- uncatchable, per #2286 tagging
-/// every one of these materializations' error paths `is_decode_failure()`
-/// -- through a bare call and a trailing `?`.
+/// Pins that this is defensive, not a behavior change:
+/// `collect_cursors_checked`'s only error (a malformed element *gap* --
+/// trailing comma, not a value decode failure) is `is_decode_failure()`-
+/// tagged per #2286, so it still raises -- uncatchable -- through both a
+/// bare call and a trailing `?`. Asserts the same `stderr` content
+/// `test_jq_collect_cursors_checked_sibling_paths_reject_trailing_comma_2261`
+/// does, not just the exit code, so a future change to a *different*,
+/// non-decode-failure error class that happens to also exit 5 would still
+/// be caught here.
 #[test]
 fn test_optional_ignored_sites_2327() -> Result<()> {
-    for (filter, doc) in [
-        ("del(.d)", r#"{"a":"\ud800","d":5}"#),
-        ("env.HOME", r#"{"a":"\ud800"}"#),
-        ("transpose", r#"[[1,"\ud800"],[2,3]]"#),
-        ("group_by(.a)", r#"[{"a":1,"b":"\ud800"},{"a":2}]"#),
-        ("unique_by(.a)", r#"[{"a":1,"b":"\ud800"},{"a":2}]"#),
-        ("sort_by(.a)", r#"[{"a":1,"b":"\ud800"},{"a":2}]"#),
-        ("halt_error", r#"{"a":"\ud800"}"#),
-    ] {
-        for suffix in ["", "?"] {
-            let full_filter = format!("{filter}{suffix}");
-            let (stdout, stderr, code) = run_jq_stdin_streams(&full_filter, doc, &["-c"])?;
-            assert_eq!(
-                code, 5,
-                "{full_filter}: stdout {stdout:?} stderr {stderr:?}"
-            );
-            assert_eq!(stdout, "", "{full_filter}: stderr {stderr:?}");
-        }
-    }
-
-    // The `Reverse`/`Sort`/`SortBy`/`Unique`/`UniqueBy`/`Min`/`MinBy`/`Max`/
-    // `MaxBy` family's own `collect_cursors_checked` error class is a
-    // malformed element *gap* (trailing comma), not a value decode failure
-    // -- matching `test_jq_collect_cursors_checked_sibling_paths_reject_
-    // trailing_comma_2261`'s own fixture (`[1,2,3,]`).
     for filter in [
         "reverse",
         "sort",
@@ -30048,20 +30030,90 @@ fn test_optional_ignored_sites_2327() -> Result<()> {
                 "{full_filter}: stdout {stdout:?} stderr {stderr:?}"
             );
             assert_eq!(stdout, "", "{full_filter}: stderr {stderr:?}");
+            assert!(
+                stderr.contains("Invalid JSON text"),
+                "{full_filter}: stderr {stderr:?}"
+            );
         }
     }
+    Ok(())
+}
 
-    // Not a blanket rejection: the same builtins on a decodable document
-    // still succeed.
-    let (stdout, code) = run_jq_stdin("del(.a)", r#"{"a":1,"d":5}"#, &["-c"])?;
-    assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), r#"{"d":5}"#);
-    let (stdout, code) = run_jq_stdin("transpose", "[[1,2],[3,4]]", &["-c"])?;
-    assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "[[1,3],[2,4]]");
-    let (stdout, code) = run_jq_stdin("group_by(.a)", r#"[{"a":1},{"a":2}]"#, &["-c"])?;
-    assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), r#"[[{"a":1}],[{"a":2}]]"#);
+/// #2327's remaining fixed sites -- `builtin_del`, `builtin_transpose`,
+/// `builtin_group_by`/`unique_by`/`sort_by`'s per-item conversion,
+/// `builtin_halt_error`, `builtin_min`/`max`/`min_by`/`max_by`,
+/// `builtin_reverse`/`unique`/`sort`, `builtin_flatten` (all `eval.rs`), and
+/// `eval_generic.rs`'s `bridge_to_full_evaluator`/`_flow` -- have **no CLI
+/// path that can observe a live behavior difference**, discovered during
+/// this PR's own code review the same way #2280's round 1 was caught: a
+/// naive test using a whole-document decode failure (`\ud800`) passed for
+/// all of them, but for the wrong reason.
+///
+/// `eval_generic.rs`'s own dispatch is the CLI's real entry point
+/// (`jq_runner.rs`/`yq_runner.rs` never call `eval.rs`'s `eval()` directly).
+/// Every one of these `eval.rs` functions is reached from there only
+/// through a reindex-bridge mechanism -- the `eval_builtin` `_` catch-all
+/// arm (`del`/`transpose`/`group_by`/`halt_error`, which have no native
+/// `eval_generic.rs` arm at all), or `bridge_to_full_evaluator`/a native
+/// arm's own inlined equivalent (`min`/`max`/`min_by`/`max_by`/`reverse`/
+/// `unique`/`sort`/`sort_by`/`unique_by`, whose `eval_generic.rs` siblings
+/// already have a native arm and only bridge on non-array/non-cursor-safe
+/// input) -- and *every one* of those bridges calls `to_owned_with_cursor`
+/// on the *whole* value **before** ever re-entering `eval.rs`, exactly the
+/// same "already fully decoded once, cannot fail a second time" situation
+/// `builtin_path`'s own fix documents in `test_eval_rs_only_sites_still_
+/// correct_2280`. Confirmed for `builtin_del` specifically with temporary
+/// debug instrumentation during review (removed before this push): its
+/// fixed line never runs for a `\ud800` document, because the bridge's own
+/// (already-`#2231`-fixed) materialization raises first.
+///
+/// `builtin_envvar` is a step further: it is not merely bridge-intercepted,
+/// it is **unreachable through any parsed CLI syntax at all** --
+/// `env.VAR`/`$ENV.VAR` resolve through a different code path entirely, a
+/// fact this codebase already documented before this PR
+/// (`test_builtin_envvar_raises_on_decode_failure_1820`'s own comment). Not
+/// included below for that reason; its fix is exercised solely by that
+/// pre-existing direct-call unit test, unchanged by this PR.
+///
+/// So this test cannot pin a suppress-vs-raise difference for any of these
+/// sites, the same limitation `test_eval_rs_only_sites_still_correct_2280`
+/// already accepted for `builtin_path`/`eval_format`. What it pins instead:
+/// the macro-swap refactor didn't change the *success* path's output.
+#[test]
+fn test_eval_rs_sites_produce_correct_output_2327() -> Result<()> {
+    for (filter, doc, expected) in [
+        ("del(.a)", r#"{"a":1,"d":5}"#, r#"{"d":5}"#),
+        ("transpose", "[[1,2],[3,4]]", "[[1,3],[2,4]]"),
+        (
+            "group_by(.a)",
+            r#"[{"a":1},{"a":2}]"#,
+            r#"[[{"a":1}],[{"a":2}]]"#,
+        ),
+        ("unique_by(.a)", r#"[{"a":1},{"a":1}]"#, r#"[{"a":1}]"#),
+        (
+            "sort_by(.a)",
+            r#"[{"a":2},{"a":1}]"#,
+            r#"[{"a":1},{"a":2}]"#,
+        ),
+        ("min", "[3,1,2]", "1"),
+        ("max", "[3,1,2]", "3"),
+        ("min_by(.a)", r#"[{"a":3},{"a":1}]"#, r#"{"a":1}"#),
+        ("max_by(.a)", r#"[{"a":3},{"a":1}]"#, r#"{"a":3}"#),
+        ("reverse", "[1,2,3]", "[3,2,1]"),
+        ("unique", "[3,1,1,2]", "[1,2,3]"),
+        ("sort", "[3,1,2]", "[1,2,3]"),
+        ("flatten", "[[1,2],[3]]", "[1,2,3]"),
+    ] {
+        let (stdout, code) = run_jq_stdin(filter, doc, &["-c"])?;
+        assert_eq!(code, 0, "{filter}: doc {doc}");
+        assert_eq!(stdout.trim(), expected, "{filter}: doc {doc}");
+    }
+
+    // `halt_error` doesn't fit the table above (it writes to stderr and
+    // halts rather than returning a value) -- checked separately.
+    let (stdout, stderr, code) = run_jq_stdin_streams("halt_error", r#""boom""#, &["-c"])?;
+    assert_eq!(code, 5, "stdout {stdout:?} stderr {stderr:?}");
+    assert_eq!(stderr.trim(), "boom");
 
     Ok(())
 }

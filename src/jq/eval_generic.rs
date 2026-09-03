@@ -1917,11 +1917,21 @@ fn bridge_to_full_evaluator<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     optional: bool,
 ) -> GenericResult<V> {
-    // Spelled as a `match` rather than `owned_or_err!`: this function sits
-    // above that macro's own definition point in the file, and `macro_rules!`
-    // is only in scope textually after it.
+    // Spelled as a `match` rather than `owned_or_suppress!`: this function
+    // sits above that macro's own definition point in the file, and
+    // `macro_rules!` is only in scope textually after it -- inlines the
+    // same `suppresses`-gated logic instead.
+    //
+    // #2327: consults `optional` via `suppresses`, not an unconditional
+    // `GenericResult::Error` -- `optional` is passed to `eval_on_owned` on
+    // the success arm right below, so ignoring it on the error arm was the
+    // same asymmetry #2280/#2327's other sites fixed elsewhere. Defensive
+    // today: `to_owned_with_cursor`'s only error paths are
+    // `is_decode_failure()`-tagged, never suppressed regardless of
+    // `optional`.
     match to_owned_with_cursor(&value, cursor) {
         Ok(owned) => eval_on_owned::<S, V>(expr, owned, optional),
+        Err(e) if suppresses(&e, optional) => GenericResult::None,
         Err(e) => GenericResult::Error(e),
     }
 }
@@ -1939,8 +1949,13 @@ fn bridge_to_full_evaluator_flow<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Flow {
+    // #2327: consults `optional` via `suppresses`, matching
+    // `bridge_to_full_evaluator`'s own sibling fix above -- a suppressed
+    // error produces zero items (the sink is never called), same as
+    // `GenericResult::None`'s sink-free semantics elsewhere in this file.
     match to_owned_with_cursor(&value, cursor) {
         Ok(owned) => drain_result_generic(eval_on_owned::<S, V>(expr, owned, optional), sink),
+        Err(e) if suppresses(&e, optional) => Flow::Exhausted,
         Err(e) => Flow::Escaped(Control::Error(e)),
     }
 }
