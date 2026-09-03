@@ -7,8 +7,10 @@
 // every known instance of the unguarded-product-allocation bug shape
 // (#1017/#1612/#1634/#1669) has been in this file. Use
 // `vec_with_capacity`/`string_with_capacity` for a legitimate
-// single-length site, `try_reserve_product`/`try_reserve_product_labeled`
-// for an actual product of lengths.
+// single-length site, `try_reserve_product_labeled` for an actual product
+// of independently-controlled lengths (per-item `Vec::try_reserve` where
+// one of the factors can vary per outer-loop iteration, #2032/#2143/
+// #2139/#2245).
 #![warn(clippy::disallowed_methods)]
 
 #[cfg(not(test))]
@@ -16073,21 +16075,40 @@ pub(crate) fn index_one_owned(
 /// gives an unrepresentable or unallocatable length (#1634, same
 /// technique #1612/#1017 already established for this bug class:
 /// `arith_mul`'s string-repeat guard, `pad_with_nulls`'s array-grow
-/// guard). Every computed-index cross-product site in this file and in
-/// `eval_generic.rs` (`.[$keys]`/`.[$s:$e]`, value- and `path()`-position,
-/// native and generic-cursor evaluators alike — 7 call sites total)
-/// reduces to "how many output slots could this generator combination
-/// produce, at most" — a `keys.len() * ts.len()`-style product of
-/// generator- or document-controlled lengths that used to be handed
-/// straight to an infallible `Vec::with_capacity`. `keys`/`ts`/`starts`/
-/// `ends`/`target_branches` are each already-materialized `Vec`s by the
-/// time any of these call sites runs, so unlike #1612's `s.len() * n` (a
-/// single scalar read straight from the document), there is no cheap,
-/// portable way to force `try_reserve_exact`'s own failure path in an
-/// end-to-end test here without exhausting real memory first — this
-/// function's own unit tests instead call it directly with synthetic
-/// large factors, bypassing the (expensive or outright infeasible)
-/// generator materialization a live repro of comparable scale would need.
+/// guard). `err` supplies the caller's own `EvalError` message in place of
+/// a hardcoded one -- shared with [`cartesian_product`], whose own call
+/// sites (`combinations`) never index anything, so `cannot_reserve_cross_
+/// product`'s "computed-index expansion" wording would mislead there
+/// (#1721); `factors` there is unrelated to any key/target below.
+///
+/// Every one of this file's and `eval_generic.rs`'s own computed-index
+/// cross-product sites (`.[$keys]`/`.[$s:$e]`, value- and `path()`-
+/// position, native and generic-cursor evaluators alike -- `resolve_index_
+/// expr`/`resolve_slice_expr` were the last two, migrated to a per-key/
+/// per-pair `Vec::try_reserve` by #2139/#2245 respectively, mirroring
+/// #2032/#2143's identical earlier migration of their value-mode
+/// siblings) used to call this directly via a thin `try_reserve_product`
+/// wrapper (`try_reserve_product_labeled(factors, cannot_reserve_cross_
+/// product)`), reducing "how many output slots could this generator
+/// combination produce, at most" to a `keys.len() * ts.len()`-style
+/// product of generator- or document-controlled lengths, upfront, before
+/// any output was produced. Once a target's own length could vary per
+/// key/pair, that single upfront reservation stopped being computable at
+/// all, and each site moved to reserving per-item instead -- removing
+/// `try_reserve_product`'s last caller (#2139) once #2245 had already
+/// removed the other. This function remains for [`cartesian_product`],
+/// whose factors (its own multiple input lists) are still fixed for the
+/// whole call, unlike a per-key target's.
+///
+/// `keys`/`ts`/`starts`/`ends`/`target_branches` are each already-
+/// materialized `Vec`s by the time any of the former call sites ran, so
+/// unlike #1612's `s.len() * n` (a single scalar read straight from the
+/// document), there is no cheap, portable way to force `try_reserve_
+/// exact`'s own failure path in an end-to-end test without exhausting
+/// real memory first -- this function's own unit tests instead call it
+/// directly with synthetic large factors, bypassing the (expensive or
+/// outright infeasible) generator materialization a live repro of
+/// comparable scale would need.
 ///
 /// Every factor is checked in plain `usize` via a `checked_mul` chain,
 /// with an upfront short-circuit for a zero factor. Widening to `u128`
@@ -16139,15 +16160,6 @@ pub(crate) fn index_one_owned(
 /// sourced* array of literal keys (rather than a generator) could still
 /// reach comparable scale in principle; that variant wasn't pursued
 /// further within this issue's scope.
-pub(crate) fn try_reserve_product<T>(factors: &[usize]) -> Result<Vec<T>, EvalError> {
-    try_reserve_product_labeled(factors, cannot_reserve_cross_product)
-}
-
-/// [`try_reserve_product`], but with the caller's own `EvalError` message
-/// instead of `cannot_reserve_cross_product`'s "computed-index expansion"
-/// wording -- shared with [`cartesian_product`], whose own call sites
-/// (`combinations`) never index anything, so that message would mislead
-/// there (#1721).
 fn try_reserve_product_labeled<T>(
     factors: &[usize],
     err: impl Fn(&[usize]) -> EvalError,
@@ -16193,8 +16205,8 @@ fn format_product(factors: &[usize]) -> String {
 /// cross-product allocation (the #1017/#1612/#1634/#1669 bug shape)
 /// stands out as a disallowed raw call instead of blending in among the
 /// many legitimate single-length sites here; call this for the legitimate
-/// case, or [`try_reserve_product`]/[`try_reserve_product_labeled`] for an
-/// actual product of lengths (#1670).
+/// case, or [`try_reserve_product_labeled`] for an actual product of
+/// fixed-for-the-whole-call lengths (#1670).
 #[allow(clippy::disallowed_methods)]
 pub(crate) fn vec_with_capacity<T>(len: usize) -> Vec<T> {
     Vec::with_capacity(len)
@@ -24960,125 +24972,126 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
             EvalError::invalid_path_expression_near_access(&keys[0], value).into(),
         ));
     }
-    // Keeps `target`'s own partial prefix too, not just `key`'s (#896
-    // review): `target` can itself now be one of #896's 4 fixed sites
-    // (`select`, `if`, `getpath`, a nested computed index), so its own
-    // `Err` can carry a non-empty prefix that still needs indexing by
-    // `keys` rather than being returned unindexed. Confirmed against jq
-    // 1.7.1: `path(select((true, error("t")))[("x", error("k"))])` on
-    // `{"a":1,"x":9}` prints `["x"]` (the already-produced `select` branch,
-    // indexed by `"x"`) before raising `t` — `key`'s own deferred escape
-    // (`k`) is never reached, since jq's `K as $k | E | .[$k]` compilation
-    // (this function's own doc comment) evaluates `E`'s whole generator,
-    // escape included, before ever asking `K`'s generator for its next
-    // value — so `target_escape` takes priority over `key_escape` below.
-    // Ambient snapshot for `target`'s own resolution is irrelevant here —
-    // `E[K]` genuinely indexes into whatever `E` resolves to, and every use
-    // of `target_branches` below reads only `.value`/`.trackable`, never
-    // `.snapshot` (this function's own output is unconditionally
-    // `PathBranch::new`'s hardcoded `false`, since indexing always breaks
-    // the frozen-pointer identity regardless of ambient) — so `false` here
-    // is provably unobservable, not a real decision (#1591).
-    let (target_branches, target_escape) =
-        match resolve_node::<S>(target, value, trackable, false, keep) {
+
+    // jq compiles `E[K]` as `K as $k | E | .[$k]` — key outer, target
+    // inner. `target` (`E`) is genuinely re-evaluated once per key here
+    // (#2139, mirroring #2032's identical fix for the value-mode sibling,
+    // `eval_index_expr`): a side effect inside `E` (`stderr`, `input`, ...)
+    // fires once per key, not once total, and each key's own output count
+    // is independent -- confirmed live against jq 1.7.1: `[(.[] | stderr)
+    // [("a","b")]?]` on `[1,2]` writes `1212` to stderr (target's own
+    // `1, 2` stream evaluated twice, once per key), where the pre-#2139
+    // once-for-all-keys evaluation only wrote `12`.
+    //
+    // The two structural "is this target trackable" checks (#843/#986)
+    // still only need to fire once -- `target`'s trackability is a
+    // property of its own AST shape plus the ambient `trackable`/`keep`
+    // context, not of any particular key or of `target`'s resolved
+    // *value*, so re-evaluating `target` for a later key can't change the
+    // verdict the first key's resolution already established. They're
+    // gated on the first key's own resolution (not run unconditionally
+    // before the loop the way the old once-for-all-keys code could)
+    // because `target` may not be side-effect-free to resolve at all
+    // (#2234 made `stderr`/`debug` trackable passthroughs) -- checking
+    // once inline, using the exact `branches` that key's own indexing will
+    // go on to use, avoids resolving `target` a second, redundant time for
+    // that key just to run the check.
+    let mut target_escape: Option<EvalEscape> = None;
+    let mut checked_trackability = false;
+    let mut out: Vec<PathBranch<'a>> = Vec::new();
+
+    // The shared exit every escape arm below funnels through, so folding
+    // the running `out` in as a `Partial`-equivalent prefix can't drift
+    // between arms -- mirrors #2245's identical `escape!` macro in
+    // `resolve_slice_expr`.
+    macro_rules! escape {
+        ($control:expr) => {
+            return Err((out, $control))
+        };
+    }
+
+    'outer: for k in &keys {
+        // Keeps `target`'s own partial prefix too, not just `key`'s (#896
+        // review): `target` can itself be one of #896's 4 fixed sites
+        // (`select`, `if`, `getpath`, a nested computed index), so its own
+        // `Err` can carry a non-empty prefix that still needs indexing by
+        // this key rather than being returned unindexed. Confirmed against
+        // jq 1.7.1: `path(select((true, error("t")))[("x", error("k"))])`
+        // on `{"a":1,"x":9}` prints `["x"]` (the already-produced `select`
+        // branch, indexed by `"x"`) before raising `t` — `key`'s own
+        // deferred escape (`k`) is never reached, since jq's `K as $k | E
+        // | .[$k]` compilation evaluates `E`'s whole generator, escape
+        // included, before ever asking `K`'s generator for its next value
+        // — so `target_escape` takes priority over `key_escape` below.
+        // Ambient snapshot for `target`'s own resolution is irrelevant here
+        // — `E[K]` genuinely indexes into whatever `E` resolves to, and
+        // every use of `branches` below reads only `.value`/`.trackable`,
+        // never `.snapshot` (this function's own output is unconditionally
+        // `PathBranch::new`'s hardcoded `false`, since indexing always
+        // breaks the frozen-pointer identity regardless of ambient) — so
+        // `false` here is provably unobservable, not a real decision
+        // (#1591).
+        let (branches, this_escape) = match resolve_node::<S>(target, value, trackable, false, keep)
+        {
             Ok(branches) => (branches, None),
             Err((prefix, e)) => (prefix, Some(e)),
         };
-    // #843: `target` can also resolve successfully with `trackable: false`
-    // through `Builtin::GetPath`'s own deliberate exemption (real jq lets
-    // `getpath(P)` navigate an untracked value, matching how a literal
-    // path argument is trusted regardless of provenance) — but that
-    // exemption is narrowly for `getpath`'s *own* indexing, not a
-    // certificate of trackability for whatever comes after it. Without
-    // this check, `catch (getpath(["other"])[0]) = "HACKED"` silently
-    // wrote into the real document instead of raising "near attempt to
-    // access element 0 of [...]" the way jq does — found in review.
-    if !trackable {
-        if let Some(PathBranch {
-            value: first_value, ..
-        }) = target_branches.first()
-        {
-            return Err((
-                Vec::new(),
-                EvalError::invalid_path_expression_near_access(&keys[0], first_value).into(),
-            ));
-        }
-    }
-    // #986: the same check, for a `target` that resolved fine but is itself
-    // untracked — `(1 | .) [K]`, where the pipe's own literal deferred here
-    // rather than raising. `trackable` above is the *caller's* context; this
-    // is the target's own. Both produce jq's "near attempt" wording, naming
-    // the first key as the navigation that failed.
-    if let Some(PathBranch {
-        value: first_value, ..
-    }) = target_branches.iter().find(|b| !b.trackable)
-    {
-        return Err((
-            Vec::new(),
-            EvalError::invalid_path_expression_near_access(&keys[0], first_value).into(),
-        ));
-    }
 
-    // `out` accumulates in the exact order jq streams (key outer, target
-    // inner — see the doc comment above), so a failure partway through
-    // returns it as-is: everything already pushed before the failing
-    // key/target combination, matching jq's own never-un-emit streaming
-    // (#530's sibling fix).
-    //
-    // jq compiles `E[K]` as `K as $k | E | .[$k]` — target inner, key outer
-    // — so when `target` itself escapes, that escape fires while jq is
-    // still inside the *first* key's iteration; the key generator is never
-    // resumed for a second key. `target_branches` above was computed once,
-    // outside this loop, so restricting `keys` to its first element when
-    // `target` escaped is what keeps this function's `Err` prefix equal to
-    // jq's own pre-escape stream, rather than the full key × target cross
-    // product jq's generator would never actually produce. Confirmed
-    // against jq 1.7.1: `path(select((true,error("t")))[("x","y")])` on
-    // `{"x":9,"y":8}` prints only `["x"]` before raising `t` — `["y"]` is a
-    // branch jq's generator never reaches. Emitting it made this prefix
-    // longer than jq's, invisible to `path()`'s own streaming consumer
-    // (which prints it either way, escape or not) but unsound for any
-    // consumer that truncates the prefix and drops the escape (`first`/
-    // `limit`, #972) — this exact overshoot is what got PR #985 reverted:
-    // `del(limit(2; select((true,error("t")))[("x","y")]))` silently
-    // deleted both keys instead of raising, because the untruncated prefix
-    // (length 2) satisfied `limit(2)`.
-    let keys: &[OwnedValue] = if target_escape.is_some() {
-        &keys[..1]
-    } else {
-        &keys[..]
-    };
-    // A capacity failure here bypasses `target_escape`/`key_escape` --
-    // deliberately, and for the same reason as `eval_index_expr`'s
-    // identical arm: this fires before the loop below produces anything,
-    // so `out` (the `Err` tuple's own prefix) is always empty regardless,
-    // and a fresh error at this point takes the same priority a mid-loop
-    // `index_one_owned` failure already does (`return Err((out, e.into()))`
-    // below, which likewise doesn't fold in either escape).
-    //
-    // `optional` is *not* extended to a capacity failure either: this
-    // function's own doc comment scopes the `?`/non-`?` difference to
-    // exactly one thing -- "what happens when the resolved key cannot be
-    // applied to the container it reached" (i.e. `key_to_path_component`/
-    // `index_one_owned`'s own per-pair failure below) -- and says
-    // "everything else is shared" between the two spellings. A capacity
-    // failure is not that one named exception, so it stays shared: the
-    // same hard error either way, matching key/target evaluation failures
-    // (also outside the named exception) and `eval_index_expr`'s identical
-    // arm, whose own doc comment is even more explicit that `optional`
-    // "reaches `index_one` and nothing else".
-    let mut out = match try_reserve_product(&[keys.len(), target_branches.len()]) {
-        Ok(out) => out,
-        Err(e) => return Err((Vec::new(), e.into())),
-    };
-    for k in keys {
+        if !checked_trackability {
+            checked_trackability = true;
+            // #843: `target` can also resolve successfully with
+            // `trackable: false` through `Builtin::GetPath`'s own
+            // deliberate exemption (real jq lets `getpath(P)` navigate an
+            // untracked value, matching how a literal path argument is
+            // trusted regardless of provenance) — but that exemption is
+            // narrowly for `getpath`'s *own* indexing, not a certificate
+            // of trackability for whatever comes after it. Without this
+            // check, `catch (getpath(["other"])[0]) = "HACKED"` silently
+            // wrote into the real document instead of raising "near
+            // attempt to access element 0 of [...]" the way jq does —
+            // found in review.
+            if !trackable {
+                if let Some(PathBranch {
+                    value: first_value, ..
+                }) = branches.first()
+                {
+                    escape!(
+                        EvalError::invalid_path_expression_near_access(&keys[0], first_value)
+                            .into()
+                    );
+                }
+            }
+            // #986: the same check, for a `target` that resolved fine but
+            // is itself untracked — `(1 | .) [K]`, where the pipe's own
+            // literal deferred here rather than raising. `trackable` above
+            // is the *caller's* context; this is the target's own. Both
+            // produce jq's "near attempt" wording, naming the first key as
+            // the navigation that failed.
+            if let Some(PathBranch {
+                value: first_value, ..
+            }) = branches.iter().find(|b| !b.trackable)
+            {
+                escape!(
+                    EvalError::invalid_path_expression_near_access(&keys[0], first_value).into()
+                );
+            }
+        }
+
+        // Reserved once per key, ahead of that key's own indexing loop,
+        // rather than once for the whole `keys x target` product up front
+        // -- `target`'s own length can vary per key now (#2139, mirroring
+        // `eval_index_expr`'s identical #2032 change).
+        if out.try_reserve(branches.len()).is_err() {
+            escape!(cannot_reserve_cross_product(&[branches.len()]).into());
+        }
+
         for PathBranch {
             path: components,
             value: target_value,
             // Every untracked target branch was already rejected by the
             // check above, so anything reaching here is tracked.
             ..
-        } in &target_branches
+        } in &branches
         {
             // A NaN key names no element for a write to land on, so `?` does not
             // save it — but only where a number addresses an element at all. On
@@ -25096,16 +25109,13 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
                     OwnedValue::Array(_) | OwnedValue::Null
                 )
             {
-                return Err((
-                    out,
-                    EvalError::new("Cannot set array element at NaN index").into(),
-                ));
+                escape!(EvalError::new("Cannot set array element at NaN index").into());
             }
             let scalar_noop = S::TAG == EvalTag::Yq && is_yq_field_index_noop_scalar(target_value);
             let component = match key_to_path_component(k, target_value, scalar_noop) {
                 Ok(component) => component,
                 Err(_) if optional => continue,
-                Err(e) => return Err((out, e.into())),
+                Err(e) => escape!(e.into()),
             };
             // yq's scalar-target no-op (#1181): `key_to_path_component` above
             // already turned this into a placeholder write that no-ops at
@@ -25133,7 +25143,7 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
                 Cow::Owned(match index_one_owned(target_value, k, false) {
                     Ok(v) => v.expect("non-optional index yields a value or errors"),
                     Err(_) if optional => continue,
-                    Err(e) => return Err((out, e.into())),
+                    Err(e) => escape!(e.into()),
                 })
             };
             // `resolve_dynamic_indexes` strips the `Expr::Optional` wrapper
@@ -25152,10 +25162,22 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
             // Untracked targets were rejected above.
             out.push(PathBranch::new(path, next_value, true));
         }
+
+        // jq compiles `E[K]` as `K as $k | E | .[$k]` — target inner, key
+        // outer — so when `target` itself escapes, that escape fires
+        // while jq is still inside *this* key's iteration; the key
+        // generator is never resumed for a later key, regardless of which
+        // key `target` escaped on. Confirmed against jq 1.7.1:
+        // `path(select((true,error("t")))[("x","y")])` on `{"x":9,"y":8}`
+        // prints only `["x"]` before raising `t` — `["y"]` is a branch
+        // jq's generator never reaches.
+        if let Some(control) = this_escape {
+            target_escape = Some(control);
+            break 'outer;
+        }
     }
-    // `target_escape` first: see the comment on `target_branches`'s own
-    // computation above for why jq's evaluation order surfaces it ahead of
-    // `key_escape`.
+    // `target_escape` first: see the comment above for why jq's evaluation
+    // order surfaces it ahead of `key_escape`.
     path_result(out, target_escape.or(key_escape))
 }
 
@@ -39470,11 +39492,10 @@ fn cartesian_product(arrays: &[Vec<OwnedValue>]) -> Result<Vec<OwnedValue>, Eval
     }
 
     let lens: Vec<usize> = arrays.iter().map(Vec::len).collect();
-    // `try_reserve_product_labeled`, not the plain `try_reserve_product`
-    // every other cross-product call site uses: that one's own message
-    // names ".[$keys]"-style computed indexing, which describes none of
-    // this builtin's own call sites (#1721) -- `combinations` never
-    // indexes anything.
+    // `cannot_allocate_cartesian_product`'s own message, not `cannot_
+    // reserve_cross_product`'s: that one names ".[$keys]"-style computed
+    // indexing, which describes none of this builtin's own call sites
+    // (#1721) -- `combinations` never indexes anything.
     let mut results = try_reserve_product_labeled(&lens, cannot_allocate_cartesian_product)?;
 
     mixed_radix_combinations(
@@ -50767,19 +50788,20 @@ mod tests {
 
     /// #1634: unlike #1612's `s.len() * n` (a single scalar read straight
     /// from the document, cheap to make astronomically large via a huge
-    /// `NumberLiteral`), each of `try_reserve_product`'s factors here is a
-    /// real `Vec::len()` -- there is no way to make one huge without
-    /// actually materializing that many elements first, which for a
-    /// factor large enough to overflow `usize`/`isize` on its own is
+    /// `NumberLiteral`), each of `try_reserve_product_labeled`'s factors
+    /// here is a real `Vec::len()` -- there is no way to make one huge
+    /// without actually materializing that many elements first, which for
+    /// a factor large enough to overflow `usize`/`isize` on its own is
     /// infeasible to do in a test. Calls the guard directly with synthetic
     /// large factors instead, bypassing the generator materialization a
     /// live repro of comparable scale would need (see the doc comment on
-    /// `try_reserve_product` itself for why).
+    /// `try_reserve_product_labeled` itself for why).
     #[test]
     fn test_try_reserve_product_refuses_usize_overflow_1634() {
         // `usize::MAX * 2` (widened to `u128` first) doesn't fit back into
         // `usize` at all.
-        let result: Result<Vec<OwnedValue>, EvalError> = try_reserve_product(&[usize::MAX, 2]);
+        let result: Result<Vec<OwnedValue>, EvalError> =
+            try_reserve_product_labeled(&[usize::MAX, 2], cannot_reserve_cross_product);
         assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
@@ -50801,7 +50823,8 @@ mod tests {
         // multiplied by `size_of::<OwnedValue>()`) overflows `isize::MAX`
         // on both 32- and 64-bit targets.
         let factor = usize::MAX / 4;
-        let result: Result<Vec<OwnedValue>, EvalError> = try_reserve_product(&[factor, 2]);
+        let result: Result<Vec<OwnedValue>, EvalError> =
+            try_reserve_product_labeled(&[factor, 2], cannot_reserve_cross_product);
         assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
@@ -50815,8 +50838,9 @@ mod tests {
     /// sites' own arity.
     #[test]
     fn test_try_reserve_product_zero_factor_short_circuits_even_after_an_overflowing_pair_1634() {
-        let out: Vec<OwnedValue> = try_reserve_product(&[usize::MAX, 2, 0])
-            .expect("a true product of 0 must succeed regardless of factor order");
+        let out: Vec<OwnedValue> =
+            try_reserve_product_labeled(&[usize::MAX, 2, 0], cannot_reserve_cross_product)
+                .expect("a true product of 0 must succeed regardless of factor order");
         assert!(out.is_empty());
     }
 
@@ -50827,7 +50851,8 @@ mod tests {
     #[test]
     fn test_try_reserve_product_succeeds_for_ordinary_sizes_1634() {
         let out: Vec<OwnedValue> =
-            try_reserve_product(&[10, 20]).expect("a 10*20 product must not refuse");
+            try_reserve_product_labeled(&[10, 20], cannot_reserve_cross_product)
+                .expect("a 10*20 product must not refuse");
         assert!(out.capacity() >= 200, "capacity: {}", out.capacity());
         assert!(out.is_empty());
     }
@@ -50836,19 +50861,23 @@ mod tests {
     /// real `.[$keys]` query and doesn't change output for a size that
     /// previously worked (the value-position, `KeyTargets::Borrowed` arm of
     /// `eval.rs`'s own `eval_index_expr`). Since #2032, `eval_index_expr`'s
-    /// two arms (here and in `eval_generic.rs`'s own sibling) no longer call
-    /// `try_reserve_product` directly -- target length varies per key now,
-    /// so each arm does a per-key `Vec::try_reserve` against
-    /// `cannot_reserve_cross_product`'s own error instead of one upfront
-    /// product reservation; see that fix's own comments on each arm for the
-    /// current mechanism. `eval_slice_expr` moved to the identical per-pair
-    /// `Vec::try_reserve` scheme in #2143, for the same reason (the target's
-    /// length can now vary per `(s, e)` pair). `resolve_index_expr`/
-    /// `resolve_slice_expr` (the `path()`/write-path siblings, target still
-    /// evaluated once -- out of scope for both #2032 and #2143, tracked
-    /// separately as #2139) still call `try_reserve_product` directly and
-    /// are covered by the direct unit tests above and the CLI-level
-    /// path/slice tests elsewhere in this file, e.g.
+    /// two arms (here and in `eval_generic.rs`'s own sibling) no longer
+    /// call this directly -- target length varies per key now, so each arm
+    /// does a per-key `Vec::try_reserve` against `cannot_reserve_cross_
+    /// product`'s own error instead of one upfront product reservation;
+    /// see that fix's own comments on each arm for the current mechanism.
+    /// `eval_slice_expr` moved to the identical per-pair `Vec::try_reserve`
+    /// scheme in #2143. `resolve_index_expr`/`resolve_slice_expr` (the
+    /// `path()`/write-path siblings) were the last two holdouts still
+    /// reserving a single product upfront -- migrated to the identical
+    /// per-key/per-pair scheme by #2139/#2245 respectively, at which point
+    /// the thin `try_reserve_product` wrapper these tests originally called
+    /// had no remaining production caller and was removed, leaving
+    /// `try_reserve_product_labeled` (still used by `cartesian_product`,
+    /// whose own factors genuinely are fixed for the whole call) as the
+    /// sole surviving general implementation these tests now call
+    /// directly. Coverage for the guard's *reachability* now lives in the
+    /// CLI-level path/slice tests elsewhere in this file, e.g.
     /// `test_path_...`/`test_slice_...` cases exercising `.[$s:$e]` and
     /// `path(...)`.
     #[test]

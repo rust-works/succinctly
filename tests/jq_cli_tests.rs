@@ -13349,6 +13349,40 @@ fn test_resolve_index_expr_prefix_matches_jq_when_target_escapes_972() -> Result
     Ok(())
 }
 
+/// #2139: `resolve_index_expr` (the `path()`/`=`/`|=`/`del()` write-path
+/// resolver for `E[K]`) evaluated `target` (`E`) exactly once overall and
+/// reused it across every key, unlike jq's own `K as $k | E | .[$k]`
+/// compilation, which re-runs `E` fresh for every key -- the identical bug
+/// #2032 already fixed for the value-mode sibling, `eval_index_expr`.
+/// Verified live against jq 1.7.1 for every assertion below.
+#[test]
+fn test_resolve_index_expr_reevaluates_target_per_key_2139() -> Result<()> {
+    // A target with a real side effect (`stderr`) fires once per key, not
+    // once total: 2 keys x `.[] | stderr`'s own 2-value stream = 4 writes.
+    let (_, stderr, code) = run_jq_full(
+        &["-c", r#"path((.[] | stderr)[("a","b")]?)"#],
+        Some("[1,2]"),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stderr, "1212");
+
+    // Same side-effect-cadence fix through the write path itself, not just
+    // `path()`: `debug` (trackable since #2234, same as `stderr` above)
+    // fires once per key on an ordinary assignment.
+    let (_, stderr, code) = run_jq_full(
+        &["-c", r#"(.a | debug)[("x","y")] = 99"#],
+        Some(r#"{"a":{"x":1,"y":2}}"#),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(
+        stderr.matches("[\"DEBUG:\",{\"x\":1,\"y\":2}]").count(),
+        2,
+        "stderr: {stderr:?}"
+    );
+
+    Ok(())
+}
+
 /// #972 Guard A: the exact shape that got PR #985 reverted for silent data
 /// corruption on the write side. Before the Stage 1 precursor fix above,
 /// `resolve_index_expr`'s untruncated `Err` prefix for
