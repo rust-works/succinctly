@@ -33273,12 +33273,26 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 QueryResult::Owned(v) => vec![v],
                 QueryResult::ManyOwned(vs) => vs,
                 QueryResult::None => vec![],
+                // #2292 review: an uncatchable error (a decode failure or a
+                // yq negative-index raise -- see
+                // `EvalError::is_uncatchable_at_value_position`'s own doc
+                // comment) must survive this arm's own `optional` swallow
+                // unconditionally, the same way `Expr::Optional`/
+                // `Expr::Try`'s arms above already do (#2270/#2289).
+                // Currently inert either way -- `optional` is proven always
+                // `false` at this function's own entry (see this function's
+                // own doc comment) -- but kept as the same defensive parity
+                // #2270/#2289 established for the sibling arms, against a
+                // future change reintroducing a `true`-producer.
+                QueryResult::Error(e) if e.is_uncatchable_at_value_position() => {
+                    return QueryResult::Error(e);
+                }
                 // #2212/#2227: currently unreachable with `optional ==
                 // true` (see this function's own doc comment) --
                 // `inner_result`'s own ambient `false` a few lines up
                 // doesn't affect what this arm reads, `optional` here is
                 // still the function's own top-level parameter.
-                QueryResult::Error(_) | QueryResult::Partial(_, Control::Error(_)) if optional => {
+                QueryResult::Error(_) if optional => {
                     return QueryResult::None;
                 }
                 QueryResult::Error(e) => return QueryResult::Error(e),
@@ -33288,6 +33302,14 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // identical reasoning): a control signal after some output
                 // still abandons the whole array rather than keeping a
                 // partial one.
+                QueryResult::Partial(_, Control::Error(e))
+                    if e.is_uncatchable_at_value_position() =>
+                {
+                    return QueryResult::Error(e);
+                }
+                QueryResult::Partial(_, Control::Error(_)) if optional => {
+                    return QueryResult::None;
+                }
                 QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
                 QueryResult::Partial(_, Control::Break(label)) => return QueryResult::Break(label),
                 QueryResult::Partial(_, Control::Halt(code)) => return QueryResult::Halt(code),
@@ -33353,16 +33375,34 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                             vs.first().map(owned_to_string::<S>).unwrap_or_default()
                         }
                         QueryResult::None => String::new(),
+                        // #2292 review: an uncatchable error (a decode
+                        // failure or a yq negative-index raise) must
+                        // survive this arm's own `optional` swallow
+                        // unconditionally, the same way `Expr::Optional`/
+                        // `Expr::Try`'s arms and the `Array` arm above
+                        // already do (#2270/#2289/#2292). Currently inert
+                        // either way -- `optional` is proven always `false`
+                        // at this function's own entry -- kept for the same
+                        // defensive parity.
+                        QueryResult::Error(e) if e.is_uncatchable_at_value_position() => {
+                            return QueryResult::Error(e);
+                        }
                         // #2212/#2227: currently unreachable with `optional
                         // == true` (see this function's own doc comment).
-                        QueryResult::Error(_) | QueryResult::Partial(_, Control::Error(_))
-                            if optional =>
-                        {
+                        QueryResult::Error(_) if optional => {
                             return QueryResult::None;
                         }
                         QueryResult::Error(e) => return QueryResult::Error(e),
                         QueryResult::Break(label) => return QueryResult::Break(label),
                         QueryResult::Halt(code) => return QueryResult::Halt(code),
+                        QueryResult::Partial(_, Control::Error(e))
+                            if e.is_uncatchable_at_value_position() =>
+                        {
+                            return QueryResult::Error(e);
+                        }
+                        QueryResult::Partial(_, Control::Error(_)) if optional => {
+                            return QueryResult::None;
+                        }
                         QueryResult::Partial(_, Control::Error(e)) => {
                             return QueryResult::Error(e);
                         }
@@ -33410,6 +33450,14 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // `{"a":1}`, not `[1,error("x")]?`'s empty result.
                 // `Break`/`Halt` are never caught by `?`, matching every
                 // other `?` site in this file.
+                // #2292 review: an uncatchable error must survive this
+                // arm's own `optional` swallow unconditionally too, same as
+                // every other site this issue and #2270/#2289 touch --
+                // falls through to `Err(control) => partial(...)` below,
+                // preserving whatever prefix `out` already holds.
+                Err(Control::Error(e)) if e.is_uncatchable_at_value_position() => {
+                    partial(out, Control::Error(e))
+                }
                 // #2212/#2227: currently unreachable with `optional ==
                 // true` in *this* (path-context) evaluator (see this
                 // function's own doc comment) -- the jq 1.7.1-verified
@@ -40998,8 +41046,14 @@ fn delpaths_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // (`eval_assign`/`eval_update`/`builtin_path`/`builtin_setpath`/
         // `builtin_del` all `return QueryResult::Error(e)` unconditionally
         // for it) -- `delete_paths_sorted`'s own ordinary errors are
-        // unaffected, since `is_uncatchable()` is `false` for those.
-        Err(e) if optional && !e.is_uncatchable() => QueryResult::None,
+        // unaffected, since `is_uncatchable_at_value_position()` is `false`
+        // for those. This is a value-position `?` dispatch point (unlike
+        // `resolve_node`'s own path-tracking one), so it uses the same
+        // narrower predicate `eval_try`/`each_try`/`try_single_generic`/
+        // `each_try_generic` do (review, #2292) -- behavior-identical to
+        // the broader `is_uncatchable()` this used before, since
+        // `is_invalid_path_expression()` is never actually raised here.
+        Err(e) if optional && !e.is_uncatchable_at_value_position() => QueryResult::None,
         Err(e) => e.into(),
     }
 }
