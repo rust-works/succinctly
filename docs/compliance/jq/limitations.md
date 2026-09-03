@@ -3155,13 +3155,45 @@ since `eval_owned_fast_path` is shared by 3 call sites (`eval_each_owned`,
 the fallback branch, not just the one new arm; tracked as
 [#2157](https://github.com/rust-works/succinctly/issues/2157).
 
-Array/object-accumulating shapes (`reduce ... as $x ([]; . + [$x])`) are
-**not** covered by #2086's fix at all -- after
-substitution the right-hand side is an `Expr::Array`/`Expr::Object`
-construction wrapping a `Literal`, not a bare `Literal` itself, so it still
-falls through to the same slow path, and measures *worse* than the string
-case ever did (~36s at just 25,000 elements); tracked separately as
-[#2152](https://github.com/rust-works/succinctly/issues/2152). A precomputed fanout-product bound
+Array/object-accumulating shapes (`reduce ... as $x ([]; . + [$x])`) were
+**not** covered by #2086's fix at all -- after substitution the right-hand
+side is an `Expr::Array`/`Expr::Object` construction wrapping a `Literal`,
+not a bare `Literal` itself, so it fell through to the same slow path, and
+measured *worse* than the string case ever did (~36s at just 25,000
+elements). Closed by [#2152](https://github.com/rust-works/succinctly/issues/2152)'s
+`literal_shaped_expr_to_owned` (`eval.rs`), which extends the same
+`eval_owned_fast_path` arm to recognize an `Expr::Array`/`Expr::Object`
+right-hand side whose every leaf is itself a `Literal` (or, for a dynamic
+object key, resolves to one), converting it to an `OwnedValue` directly the
+same way `literal_to_owned` already does for the scalar case, then reusing
+`arith_combine` exactly as #2086's own arm does -- no new arithmetic
+semantics, only a new way to build the operand. Same "constant factor, not
+asymptotic" caveat as #2086's own fix above applies here too (still calls
+`input.clone()` per step, #2157's own residual is unchanged) -- measured
+directly: 25,000-element array accumulation dropped from ~38.8s to ~6.0-6.6s
+(~6x), and the analogous object-accumulator idiom
+(`reduce ... as $x ({}; . + {($x): v})`) went from *not completing inside
+60s* to ~6.3s at the same N. Interleaved A/B at two sizes confirms the same
+quadratic shape survives at a smaller constant, matching #2157's own
+finding for the string case (5,000: ~1.36s -> ~0.25s, 10,000: ~5.77s ->
+~0.91s -- before roughly quadruples per doubling of N, after roughly
+triples).
+
+**One correction to the AST shape this issue's own text guessed, confirmed
+live via a debug probe against the real repro rather than assumed**: a
+*single*-element array literal like `[$x]` does **not** wrap its substituted
+element in `Expr::Comma` -- `parse_array_construction` only introduces a
+`Comma` node when an actual `,` token is present inside `[...]`, so `[$x]`
+parses as `Expr::Array(Box::new(Expr::Var("x")))`, and after `substitute_var`
+folds `$x` into a `Literal` the shape is
+`Expr::Array(Box::new(Expr::Literal(...)))` -- a *bare* `Literal` directly
+inside `Array`, not `Expr::Array(Box::new(Expr::Comma(vec![Expr::Literal(...)])))`
+as this issue's own "Suggested fix direction" section stated. `literal_shaped_expr_to_owned`
+handles both shapes (a bare non-`Comma` inner expression, and an actual
+multi-element `Comma`), confirmed by a dedicated unit test
+(`test_2152_literal_shaped_expr_to_owned_single_element_array_has_no_comma_wrapper`)
+rather than relying on the single repro's own AST happening to exercise the
+right arm. A precomputed fanout-product bound
 (INIT-fork count x element count, both known before either loop starts)
 would not avoid this either way -- for the single-INIT-fork case #2079
 reports, fork count is 1, so the product collapses to the element count and

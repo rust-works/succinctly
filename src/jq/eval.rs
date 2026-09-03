@@ -28017,6 +28017,69 @@ pub(crate) fn eval_reduce_with_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemant
 /// comment (`eval_generic.rs`) for the exact limitation (only the
 /// immediately-next bare `tostring` is covered) and #1134, which tracks
 /// the general fix neither sibling attempts.
+/// Converts `expr` to an `OwnedValue` directly, without the general
+/// evaluator, succeeding only when every leaf `expr` reaches is already an
+/// `Expr::Literal` -- the exact shape `substitute_var`'s `Expr::Var` arm
+/// (via `owned_to_expr_at_depth`) leaves behind when a `reduce`/`foreach`
+/// UPDATE body's bound variable sits inside an array/object accumulator
+/// literal (`. + [$x]`, `. + {($x): true}`, #2152). Returns `None` for
+/// anything else, so [`eval_owned_fast_path`]'s own caller falls back to
+/// the general evaluator unchanged -- this never has to recognize every
+/// possible shape, only the ones substitution can actually produce.
+///
+/// Confirmed live (not assumed from #2152's own text, which guessed a
+/// different, incorrect AST shape): `[$x]` parses as
+/// `Expr::Array(Box::new(Expr::Var("x")))` -- `parse_array_construction`
+/// only wraps its inner expression in `Expr::Comma` when an actual `,`
+/// token is present, so a *single*-element array's inner expression is
+/// substituted directly, with no `Comma` wrapper at all
+/// (`Expr::Array(Box::new(Expr::Literal(...)))` post-substitution, not
+/// `Expr::Array(Box::new(Expr::Comma(vec![Expr::Literal(...)])))`) --
+/// handled here via the recursive call on `inner` directly for any shape
+/// other than `Comma`, rather than assuming every array has one.
+///
+/// Object keys: a static key (`ObjectKey::Literal`) needs no conversion; a
+/// dynamic key (`ObjectKey::Expr`, `{($x): ...}`) is handled the same
+/// recursive way and must itself resolve to `OwnedValue::String` (jq's own
+/// rule for what a computed object key may be) or this returns `None`.
+/// Duplicate keys are collected in entry order and folded via
+/// `IndexMap`'s own `FromIterator`, matching `eval_object_construction`'s
+/// identical `acc.into_iter().collect::<IndexMap<_, _>>()` -- same
+/// later-value-wins, first-position-kept semantics, not reimplemented.
+fn literal_shaped_expr_to_owned(expr: &Expr) -> Option<OwnedValue> {
+    match expr {
+        Expr::Literal(lit) => Some(literal_to_owned(lit)),
+        Expr::Array(inner) => match inner.as_ref() {
+            Expr::Builtin(Builtin::Empty) => Some(OwnedValue::Array(Vec::new())),
+            Expr::Comma(items) => {
+                let mut out = vec_with_capacity(items.len());
+                for item in items {
+                    out.push(literal_shaped_expr_to_owned(item)?);
+                }
+                Some(OwnedValue::Array(out))
+            }
+            single => Some(OwnedValue::Array(vec![literal_shaped_expr_to_owned(
+                single,
+            )?])),
+        },
+        Expr::Object(entries) => {
+            let mut out = vec_with_capacity(entries.len());
+            for entry in entries {
+                let key = match &entry.key {
+                    ObjectKey::Literal(s) => s.clone(),
+                    ObjectKey::Expr(e) => match literal_shaped_expr_to_owned(e)? {
+                        OwnedValue::String(s) => s,
+                        _ => return None,
+                    },
+                };
+                out.push((key, literal_shaped_expr_to_owned(&entry.value)?));
+            }
+            Some(OwnedValue::Object(out.into_iter().collect()))
+        }
+        _ => None,
+    }
+}
+
 fn eval_owned_fast_path<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
@@ -28047,11 +28110,14 @@ fn eval_owned_fast_path<S: EvalSemantics>(
         // it only shrinks the constant factor -- the fold remains O(n^2)
         // over a growing accumulator; see #2157 and
         // docs/compliance/jq/limitations.md.
+        //
+        // #2152: extended from a bare `Expr::Literal` `right` to any shape
+        // [`literal_shaped_expr_to_owned`] recognizes -- the array/object
+        // accumulator idioms (`. + [$x]`, `. + {($x): true}`) that #2086's
+        // own body flagged as unmeasured and out of scope at the time.
         Expr::Arithmetic { op, left, right } if matches!(left.as_ref(), Expr::Identity) => {
-            let Expr::Literal(lit) = right.as_ref() else {
-                return None;
-            };
-            match arith_combine::<S>(*op, input.clone(), literal_to_owned(lit)) {
+            let rhs = literal_shaped_expr_to_owned(right.as_ref())?;
+            match arith_combine::<S>(*op, input.clone(), rhs) {
                 Ok(v) => Some(Ok(Some(v))),
                 // Mirrors the `Field`/`Index` arms' own `_ if optional`
                 // convention below, so a caller that ever does reach this
@@ -60903,6 +60969,117 @@ mod tests {
         assert_eq!(
             outputs(b"null", r#"(reduce range(3) as $x (1; . + "a"))?"#),
             Vec::<&str>::new()
+        );
+    }
+
+    #[test]
+    fn test_2152_array_object_accumulator_fast_path_matches_general_evaluator() {
+        // #2152: extends #2086's fast-path arm from a bare `Expr::Literal`
+        // `right` to any shape `literal_shaped_expr_to_owned` recognizes --
+        // the array/object accumulator idioms (`. + [$x]`, `. + {($x):
+        // v}`) #2086's own body flagged as unmeasured. Every case here is
+        // confirmed live against jq 1.7.1 to still agree byte-for-byte with
+        // the general evaluator's answer.
+        assert_eq!(
+            outputs(b"null", r"reduce (1,2,3) as $x ([]; . + [$x])"),
+            ["[1,2,3]"]
+        );
+        assert_eq!(
+            outputs(b"null", r#"reduce ("a","b") as $x ([9]; . + [$x, "sep"])"#),
+            [r#"[9,"a","sep","b","sep"]"#]
+        );
+        assert_eq!(
+            outputs(b"null", r"reduce (1,2) as $x ([]; . + [[$x]])"),
+            ["[[1],[2]]"]
+        );
+        assert_eq!(
+            outputs(
+                b"null",
+                r#"reduce ("a","b","a") as $x ({}; . + {($x): true})"#
+            ),
+            [r#"{"a":true,"b":true}"#]
+        );
+        assert_eq!(
+            outputs(b"null", r"reduce (1,2) as $x ({}; . + {count: $x})"),
+            [r#"{"count":2}"#]
+        );
+    }
+
+    #[test]
+    fn test_2152_array_object_accumulator_fast_path_type_error_respects_optional() {
+        // #2152: same convention as #2086's own sibling test above, now
+        // exercised for the array/object RHS shapes this issue adds.
+        // Confirmed live against jq 1.7.1: unsuppressed errors, suppressed
+        // emits nothing.
+        query!(b"\"str\"", r"reduce (1,2) as $x (.; . + [$x])",
+            QueryResult::Error(e) => {
+                assert!(e.message.contains("cannot be added"));
+            }
+        );
+        assert_eq!(
+            outputs(b"\"str\"", r"(reduce (1,2) as $x (.; . + [$x]))?"),
+            Vec::<&str>::new()
+        );
+    }
+
+    #[test]
+    fn test_2152_literal_shaped_expr_to_owned_single_element_array_has_no_comma_wrapper() {
+        // #2152 review: pins the exact AST shape confirmed live (a debug
+        // probe against the real repro), correcting this issue's own
+        // stated hypothesis (`Expr::Array(Expr::Comma([Literal(...)]))`) --
+        // `parse_array_construction` only wraps its inner expression in
+        // `Expr::Comma` when an actual `,` token is present, so a single
+        // substituted element leaves a *bare* `Expr::Literal` directly
+        // inside `Expr::Array`, with no `Comma` in between. Both shapes
+        // are exercised so a future change to either the parser's or
+        // `literal_shaped_expr_to_owned`'s own assumption is caught here
+        // rather than only showing up as a silent fast-path miss.
+        let bare = Expr::Array(Box::new(Expr::Literal(Literal::Int(1))));
+        assert_eq!(
+            literal_shaped_expr_to_owned(&bare),
+            Some(OwnedValue::Array(vec![OwnedValue::Int(1)]))
+        );
+        let comma = Expr::Array(Box::new(Expr::Comma(vec![
+            Expr::Literal(Literal::Int(1)),
+            Expr::Literal(Literal::Int(2)),
+        ])));
+        assert_eq!(
+            literal_shaped_expr_to_owned(&comma),
+            Some(OwnedValue::Array(vec![
+                OwnedValue::Int(1),
+                OwnedValue::Int(2)
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_2152_literal_shaped_expr_to_owned_falls_back_on_non_literal_leaf() {
+        // A shape this function doesn't recognize (a field access mixed
+        // into an otherwise-literal array/object) must return `None`, not
+        // a wrong/partial value -- the caller's whole point in checking
+        // for `None` is to fall back to the general evaluator safely.
+        assert_eq!(
+            literal_shaped_expr_to_owned(&Expr::Array(Box::new(Expr::Comma(vec![
+                Expr::Literal(Literal::Int(1)),
+                Expr::Field("foo".to_string()),
+            ])))),
+            None
+        );
+        assert_eq!(
+            literal_shaped_expr_to_owned(&Expr::Object(vec![ObjectEntry {
+                key: ObjectKey::Literal("a".to_string()),
+                value: Expr::Field("foo".to_string()),
+            }])),
+            None
+        );
+        // A dynamic key that doesn't resolve to a string is also rejected,
+        // matching jq's own "object keys must be strings" rule.
+        assert_eq!(
+            literal_shaped_expr_to_owned(&Expr::Object(vec![ObjectEntry {
+                key: ObjectKey::Expr(Box::new(Expr::Literal(Literal::Int(1)))),
+                value: Expr::Literal(Literal::Bool(true)),
+            }])),
+            None
         );
     }
 
