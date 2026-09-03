@@ -1823,7 +1823,7 @@ fn test_yq_slurp_fast_path_rejects_trailing_comma_2276() -> Result<()> {
         "expected an 'Invalid JSON text' error, got: {stderr}"
     );
 
-    // Well-formed data still takes the fast path and is unaffected.
+    // Ordinary well-formed data still round-trips correctly.
     let (output, code) = run_yq_stdin(
         ".",
         "[1,2,3]",
@@ -1831,6 +1831,35 @@ fn test_yq_slurp_fast_path_rejects_trailing_comma_2276() -> Result<()> {
     )?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), "[[1,2,3]]");
+
+    // #2276 review: "still round-trips correctly" above can't tell "the M2
+    // fast path ran" apart from "silently fell back to the DOM path and it
+    // happened to produce the same bytes" -- `[1,2,3]` alone is identical
+    // either way. A *duplicate* mapping key can distinguish them: only the
+    // M2 fast path preserves one (the DOM fallback's `OwnedValue::Object`
+    // is `IndexMap`-backed and collapses it to the last value, #442/#1343).
+    // `any_input_is_json` (`yq_runner.rs`) is a blanket, content-independent
+    // gate -- it declines the fast path for *every* `--input-format json`
+    // `--slurp` invocation, well-formed or not, not just the malformed ones
+    // this test's first half exercises -- so this must observe the
+    // duplicate *collapsing*, proving the DOM fallback is what actually
+    // ran, not the other way around. This is the documented, accepted
+    // "known cost" of the conservative fix (CHANGELOG.md, #1343): pinned
+    // here as a regression guard against the fast path being silently
+    // (and incorrectly) reintroduced for JSON input without re-closing
+    // the comma-gap/depth holes it would reopen.
+    let (output, code) = run_yq_stdin(
+        ".",
+        r#"{"a":1,"a":2}"#,
+        &["--slurp", "--input-format", "json", "-o", "json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output.trim(),
+        r#"[{"a":2}]"#,
+        "the duplicate key collapsing proves the DOM fallback ran, not \
+         the M2 fast path -- matching this fix's documented, accepted cost"
+    );
 
     Ok(())
 }
@@ -1869,8 +1898,8 @@ fn test_yq_inplace_fast_path_rejects_trailing_comma_leaves_file_untouched_2276()
         "a raised --inplace write must leave the file byte-for-byte untouched"
     );
 
-    // Well-formed data still takes the fast path, is unaffected, and the
-    // file really is rewritten (unlike the raised case above).
+    // Well-formed data still works correctly, and the file really is
+    // rewritten (unlike the raised case above).
     let mut ok_file = NamedTempFile::new()?;
     write!(ok_file, "[1,2,3]")?;
     let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
@@ -1884,6 +1913,94 @@ fn test_yq_inplace_fast_path_rejects_trailing_comma_leaves_file_untouched_2276()
     assert!(output.status.success());
     let file_contents = std::fs::read_to_string(ok_file.path())?;
     assert_eq!(file_contents.trim(), "[1,2,3]");
+
+    // #2276 review: same reasoning as
+    // `test_yq_slurp_fast_path_rejects_trailing_comma_2276`'s identical
+    // check -- `[1,2,3]` above can't distinguish "the M2 fast path ran"
+    // from "silently fell back to the DOM path and it happened to produce
+    // the same bytes." A duplicate mapping key can: `any_input_is_json` is
+    // a blanket, content-independent gate, so it declines the fast path
+    // for *every* `--input-format json` `--inplace` invocation, well-formed
+    // or not -- this must observe the duplicate *collapsing*, proving the
+    // DOM fallback ran. Documented, accepted cost (CHANGELOG.md, #1343);
+    // pinned as a regression guard against the fast path being silently
+    // reintroduced without re-closing the comma-gap/depth holes above.
+    let mut dup_file = NamedTempFile::new()?;
+    write!(dup_file, r#"{{"a":1,"a":2}}"#)?;
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .args(["--input-format", "json", "-o", "json", "-I=0"])
+        .arg(".")
+        .arg(dup_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(output.status.success());
+    let file_contents = std::fs::read_to_string(dup_file.path())?;
+    assert_eq!(
+        file_contents.trim(),
+        r#"{"a":2}"#,
+        "the duplicate key collapsing proves the DOM fallback ran, not \
+         the M2 fast path -- matching this fix's documented, accepted cost"
+    );
+
+    Ok(())
+}
+
+/// #2276 review: `any_input_is_json` is one run-wide boolean, not a
+/// per-file switch (see its own doc comment in `yq_runner.rs` for why a
+/// per-file version wasn't attempted here) -- so a single JSON-sourced
+/// file anywhere in a multi-file `--inplace` invocation declines the M2
+/// fast path for *every* file in that run, including a genuinely YAML
+/// file that would have been perfectly safe on its own. Pinned as a known,
+/// deliberately-accepted collateral cost rather than left to be discovered
+/// by a future regression report: `a.yaml`'s own duplicate mapping key
+/// (`a: 1`/`a: 2`) survives `succinctly yq -i '.' a.yaml` in isolation
+/// (M2 fast path, #442/#1343's own guarantee), but collapses to the last
+/// value once `b.json` is added to the same invocation and forces the
+/// whole run onto the DOM fallback.
+#[test]
+fn test_yq_inplace_mixed_yaml_json_files_collapses_yaml_duplicate_keys_too_2276() -> Result<()> {
+    let dir = TempDir::new()?;
+    let yaml_file = dir.path().join("a.yaml");
+    let json_file = dir.path().join("b.json");
+    std::fs::write(&yaml_file, "a: 1\na: 2\n")?;
+    std::fs::write(&json_file, "{\"b\":1,\"b\":2}")?;
+
+    // Baseline: `a.yaml` alone keeps both duplicate values via the M2 fast
+    // path -- confirms the "collateral" framing (it really was safe alone).
+    let solo_yaml = dir.path().join("solo.yaml");
+    std::fs::write(&solo_yaml, "a: 1\na: 2\n")?;
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg(".")
+        .arg(&solo_yaml)
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(output.status.success());
+    assert_eq!(
+        std::fs::read_to_string(&solo_yaml)?,
+        "a: 1\na: 2\n",
+        "a.yaml alone must keep both duplicate values (M2 fast path)"
+    );
+
+    // Together with a JSON source, the same YAML file's duplicates collapse.
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("-i")
+        .arg(".")
+        .arg(&yaml_file)
+        .arg(&json_file)
+        .stdin(Stdio::null())
+        .output()?;
+    assert!(output.status.success());
+    assert_eq!(
+        std::fs::read_to_string(&yaml_file)?,
+        "a: 2\n",
+        "a known, accepted collateral cost -- update this alongside \
+         yq_runner.rs's own doc comment if a per-file switch closes it later"
+    );
 
     Ok(())
 }
@@ -16891,27 +17008,111 @@ fn test_json_input_rejects_adversarial_nesting_via_pretty_print_1398() -> Result
 /// gate: `--slurp`'s M2 fast path never validated JSON input for a
 /// malformed stray/trailing `,` at all (`YamlIndex`'s flow-sequence
 /// grammar legitimately allows one), which for `--inplace` was a real,
-/// silent-data-loss bug (a false accept rewrites the file). `--slurp` with
-/// JSON-sourced input now falls back to `parse_input`'s `JsonIndex`-based
-/// DOM path unconditionally, same as `--eval-all` always has (see
-/// `test_json_input_rejects_adversarial_nesting_via_eval_all_998` just
-/// above, which this test now matches exactly instead of the M2 path's own
-/// depth-128 guard): a raw panic (exit 101, conversion-time 256 guard)
-/// rather than a clean parse-time error (exit 1, 128) -- a real, accepted
-/// trade-off, not an oversight: `--eval-all` already panics on this exact
-/// input today, so `--slurp` reaching the identical, already-shipped
-/// behavior is not a new class of risk, just a wider door to it.
+/// silent-data-loss bug (a false accept rewrites the file).
+///
+/// `--slurp` with JSON-sourced input now falls back to `parse_input`'s
+/// `JsonIndex`-based DOM path unconditionally -- which on its own would
+/// have *silently loosened* depth validation from the M2 path's 128-deep
+/// parse-time guard to `to_owned_canonicalizing_numbers_at_depth`'s own
+/// looser, panicking 256-deep one (confirmed live in an earlier, since-
+/// corrected revision of this fix: depth 500 exited 101 with "nesting
+/// depth exceeds limit of 256", *silently accepting* depth 129-255 that
+/// used to be rejected outright). `parse_input_m2_parity`'s own depth-128
+/// pre-check (added specifically for `--slurp`'s and `--inplace`'s DOM
+/// fallback, not `--eval-all`'s -- see that function's own doc comment)
+/// closes this ahead of the DOM path ever running, so this test now
+/// matches the *original*, pre-#2276 `--slurp` behavior exactly: a clean
+/// parse-time-equivalent error (exit 1, "128"), not `--eval-all`'s own
+/// panic (exit 101, "256") -- see
+/// `test_yq_slurp_inplace_json_depth_matches_m2_parse_time_limit_2276` for
+/// the full boundary sweep this pins one more value of.
 #[test]
 fn test_json_input_rejects_adversarial_nesting_via_slurp_996() -> Result<()> {
     let depth = 500;
     let input = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
     let (_stdout, stderr, code) =
         run_yq_stdin_with_stderr(".", &input, &["--input-format", "json", "--slurp"])?;
-    assert_eq!(code, 101, "stderr: {stderr:?}");
+    assert_eq!(code, 1, "stderr: {stderr:?}");
     assert!(
-        stderr.contains("nesting depth exceeds limit of 256"),
+        stderr.contains("nesting depth exceeds limit of 128"),
         "stderr: {stderr:?}"
     );
+    Ok(())
+}
+
+/// #2276 code review, critical finding: verifies the exact
+/// accept/reject boundary `parse_input_m2_parity`'s depth pre-check
+/// (`yq_runner.rs`) must land on for `--slurp`'s and `--inplace`'s own DOM
+/// fallback -- 128 levels of plain `[...]` nesting accepted, 129 rejected,
+/// matching `YamlIndex`'s own parse-time guard (`src/yaml/parser.rs`)
+/// exactly, confirmed directly against a pre-#2276 build rather than
+/// assumed from the guard's own name: `nesting_depth` there is checked
+/// *before* incrementing, so it reaches 127 (not 128) on the innermost of
+/// 128 nested `[`s, and only the 129th `[` sees `nesting_depth == 128` and
+/// fails. An earlier revision of this same depth-check got exactly this
+/// off by one (checking every node, including the leaf scalar, against the
+/// limit -- rejecting 128 when it should have accepted it) -- caught by
+/// diffing against a pre-#2276 build at every boundary value rather than
+/// trusting the fix's own self-consistency, which is what this test now
+/// pins permanently. Both directions (127/128 accept, 129 reject) and both
+/// flags (`--slurp`, `--inplace`) are checked, since either flag alone or
+/// either direction alone would have missed this exact bug when it was
+/// live.
+#[test]
+fn test_yq_slurp_inplace_json_depth_matches_m2_parse_time_limit_2276() -> Result<()> {
+    let nested = |depth: usize| format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+
+    for (depth, should_reject) in [(127, false), (128, false), (129, true)] {
+        let input = nested(depth);
+
+        let (_stdout, stderr, code) = run_yq_stdin_with_stderr(
+            ".",
+            &input,
+            &["--slurp", "--input-format", "json", "-o", "json"],
+        )?;
+        if should_reject {
+            assert_eq!(code, 1, "--slurp depth={depth}: stderr: {stderr}");
+            assert!(
+                stderr.contains("nesting depth exceeds limit of 128"),
+                "--slurp depth={depth}: stderr: {stderr}"
+            );
+        } else {
+            assert_eq!(code, 0, "--slurp depth={depth}: stderr: {stderr}");
+        }
+
+        let mut file = NamedTempFile::new()?;
+        write!(file, "{input}")?;
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .arg("yq")
+            .arg("-i")
+            .args(["--input-format", "json"])
+            .arg(".")
+            .arg(file.path())
+            .stdin(Stdio::null())
+            .output()?;
+        let stderr = String::from_utf8(output.stderr)?;
+        if should_reject {
+            assert!(
+                !output.status.success(),
+                "--inplace depth={depth}: stderr: {stderr}"
+            );
+            assert!(
+                stderr.contains("nesting depth exceeds limit of 128"),
+                "--inplace depth={depth}: stderr: {stderr}"
+            );
+            let file_contents = std::fs::read_to_string(file.path())?;
+            assert_eq!(
+                file_contents, input,
+                "--inplace depth={depth}: a raised write must leave the file untouched"
+            );
+        } else {
+            assert!(
+                output.status.success(),
+                "--inplace depth={depth}: stderr: {stderr}"
+            );
+        }
+    }
+
     Ok(())
 }
 

@@ -21,9 +21,10 @@ use succinctly::jq::eval_generic::{
 };
 use succinctly::jq::stream::StreamFailure;
 use succinctly::jq::{
-    self, assert_value_tree_depth, nonfinite_display_string, sync_aliased_paths, Builtin,
-    EvalError, Expr, NumberRepr, OwnedValue, QueryResult, YqSemantics,
+    self, assert_value_tree_depth, nesting_depth_exceeded_message, nonfinite_display_string,
+    sync_aliased_paths, Builtin, EvalError, Expr, NumberRepr, OwnedValue, QueryResult, YqSemantics,
 };
+use succinctly::json::light::JsonCursor;
 use succinctly::json::JsonIndex;
 use succinctly::yaml::{
     format_float_yq_yaml, format_float_yq_yaml_nested, resolve_plain, resolve_tagged,
@@ -1238,6 +1239,87 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
         // by number canonicalization.
         OwnedValue::Null
     })
+}
+
+/// The parse-time nesting-depth ceiling `YamlIndex`'s own parser enforces
+/// (`src/yaml/parser.rs`'s `MAX_NESTING_DEPTH`) -- kept here as a
+/// same-named literal rather than importing that private constant, since
+/// this check's only job is parity with what the M2 fast path *would have*
+/// rejected, not a shared source of truth the parser itself depends on.
+const M2_PARSE_TIME_DEPTH_LIMIT: usize = 128;
+
+/// #2276: whether `cursor`'s subtree nests to `M2_PARSE_TIME_DEPTH_LIMIT`
+/// levels or deeper -- a pure BP-navigation walk (`first_child`/
+/// `next_sibling`/`is_container`, never `.value()`) so it costs nothing
+/// beyond pointer-chasing, no scalar decoding, for well-formed input.
+///
+/// `--slurp`'s and `--inplace`'s own DOM fallback (`parse_input`, reached
+/// exactly when their M2 fast path declines JSON-sourced input, #2276)
+/// must reject nesting at least as strictly as the M2 fast path it
+/// replaces did -- `YamlIndex::build`'s own parser enforced
+/// `M2_PARSE_TIME_DEPTH_LIMIT` at *parse* time, before this fallback
+/// existed for JSON input at all. `to_owned_canonicalizing_numbers_at_depth`'s
+/// own guard (`assert_nesting_depth`, 256, a panic) is a *different*,
+/// looser ceiling for a *different* reason -- stack-overflow safety for
+/// the conversion step itself, not fidelity with what the fast path used
+/// to reject -- so without this check, depth 129-255 would silently go
+/// from "rejected at parse time" (the fast path) to "silently accepted"
+/// (this fallback) purely because the fast path was declined for a
+/// malformed-comma reason unrelated to depth. Confirmed live before this
+/// fix: 150 levels of `[...]` via `--slurp --input-format json` printed
+/// the full nested structure at exit 0, where the pre-#2276 binary
+/// (still unconditionally on the M2/`YamlIndex` path) correctly rejected
+/// it at exit 1.
+///
+/// Deliberately a *separate* check, not folded into `parse_input`/
+/// `to_owned_canonicalizing_numbers_at_depth` themselves: `--eval-all`
+/// shares that same function but has no M2 fast path of its own to have
+/// declined, so it never had this 128-deep guarantee to begin with --
+/// tightening it there would be an unrelated, unasked-for behavior change
+/// to an already-established (if unfortunate) precedent, not a fix for
+/// anything `--eval-all` regressed. See
+/// [`parse_input_m2_parity`](self::parse_input_m2_parity), this check's
+/// only caller, for where it's actually wired in.
+///
+/// `depth` counts *containers only* (`[`/`{`), matching `YamlIndex`'s own
+/// `enter_nested`, which is called once per opened `[`/`{` and never for a
+/// leaf scalar -- a leaf never itself constitutes a nesting level. Getting
+/// this off by one either way changes the accepted/rejected boundary: 128
+/// levels of plain `[...]` nesting is accepted by `YamlIndex` (`nesting_
+/// depth` reaches 127 on the innermost `[`, checked before incrementing),
+/// only 129+ is rejected -- confirmed against the pre-#2276 binary
+/// (still unconditionally on `YamlIndex` for this input) directly, not
+/// assumed from the constant's name alone.
+fn json_nested_past_m2_limit<W: AsRef<[u64]>>(cursor: JsonCursor<'_, W>, depth: usize) -> bool {
+    if !cursor.is_container() {
+        return false;
+    }
+    if depth >= M2_PARSE_TIME_DEPTH_LIMIT {
+        return true;
+    }
+    let mut child = cursor.first_child();
+    while let Some(c) = child {
+        if json_nested_past_m2_limit(c, depth + 1) {
+            return true;
+        }
+        child = c.next_sibling();
+    }
+    false
+}
+
+/// [`parse_input`], preceded by [`json_nested_past_m2_limit`]'s depth check
+/// for JSON-sourced input -- see that function's own doc comment for why.
+/// Used by `--slurp`'s and `--inplace`'s own DOM-fallback call sites only;
+/// `--eval-all`'s call site uses plain `parse_input` (see the same doc
+/// comment for why it's deliberately excluded).
+fn parse_input_m2_parity(bytes: &[u8], format: InputFormat) -> Result<Vec<OwnedValue>> {
+    if format == InputFormat::Json {
+        let index = JsonIndex::build(bytes);
+        if json_nested_past_m2_limit(index.root(bytes), 0) {
+            anyhow::bail!(nesting_depth_exceeded_message(M2_PARSE_TIME_DEPTH_LIMIT));
+        }
+    }
+    parse_input(bytes, format)
 }
 
 /// Parse input bytes according to the specified format.
@@ -4142,7 +4224,28 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // disables the relevant fast path for *every* source in the run, not
     // just the JSON one(s), since `can_inplace_fast_path`/
     // `can_slurp_fast_path` are single, run-wide booleans with no
-    // per-file M2-vs-DOM switch to hook into instead.
+    // per-file M2-vs-DOM switch to hook into instead. A per-file switch
+    // was not attempted (#2276 review): each of `can_inplace_fast_path`'s/
+    // `can_slurp_fast_path`'s two branches is its own, separately-parsed
+    // loop over `input_files`/`input_sources` (M2 branch vs. DOM branch),
+    // decided once before either loop starts -- routing *within* one file
+    // at a time, rather than picking one branch for the whole run, would
+    // mean restructuring both loops into one that decides per file, a
+    // materially larger change than this fix's own scope for a collateral
+    // cost real yq itself has no equivalent to weigh against (it has no
+    // M2-style fast path to decline in the first place).
+    //
+    // **The concrete cost, spelled out rather than left implicit**:
+    // `succinctly yq -i '.' a.yaml b.json`, where `a.yaml` alone
+    // (genuinely YAML, well-formed) is safe on the M2 fast path and
+    // `b.json` is what forces this whole run onto the DOM fallback --
+    // `a.yaml`'s own duplicate mapping keys (`a: 1` / `a: 2`, both
+    // present) now silently collapse to the last value (`a: 2`) too, the
+    // exact #442/#1343 loss the M2 fast path exists to avoid, even though
+    // `a.yaml` in isolation (`succinctly yq -i '.' a.yaml`, no JSON file
+    // in the same invocation) would not lose them. Confirmed live and
+    // pinned by
+    // `test_yq_inplace_mixed_yaml_json_files_collapses_yaml_duplicate_keys_too_2276`.
     let any_input_is_json = if input_files.is_empty() {
         resolve_input_format(args.input_format, None) == InputFormat::Json
     } else {
@@ -4150,6 +4253,20 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             resolve_input_format(args.input_format, Some(Path::new(f))) == InputFormat::Json
         })
     };
+    // #2276 review: one shared term for the three JSON-declining gates
+    // below (`can_inplace_json_fast_path`/`can_inplace_yaml_fast_path`/
+    // `can_slurp_fast_path`) to `&&` in, rather than `&& !any_input_is_json`
+    // copy-pasted into each one separately -- this crate's own "duplicated
+    // predicates diverge silently" lesson (#106: three copies of one
+    // predicate, one of them quadratic) applies just as much to a boolean
+    // gate as to an algorithm: a future change to what "safe for this fast
+    // path" means only needs one edit here instead of three kept in sync
+    // by hand. Positively named (unlike `any_input_is_json` itself, which
+    // reads naturally as `!any_input_is_json` at its own two other call
+    // sites -- `is_m2_streamable`'s doc comment and `mark_json_sourced`'s
+    // conditionals -- but awkwardly as a double negative at every gate
+    // below).
+    let fast_path_json_comma_safe = !any_input_is_json;
     // pretty_print isn't implemented by the cursor streamers, so it still
     // falls back to the DOM path, unchanged, rather than silently ignoring
     // the flag the way compact mode already does today. `sort_keys` and
@@ -4255,13 +4372,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // DOM path either.
     // Shares `can_json_fast_path`'s `can_stream_json_output_style` above.
     //
-    // `!any_input_is_json` (#2276, see its own doc comment above): unlike
-    // `can_json_fast_path`/`can_yaml_fast_path`, this gate's `else` arm is
-    // `parse_input` -- the DOM bridge #2262 fixed -- so declining it for
+    // `fast_path_json_comma_safe` (#2276, see its own doc comment above):
+    // unlike `can_json_fast_path`/`can_yaml_fast_path`, this gate's `else`
+    // arm is `parse_input_m2_parity` -- the DOM bridge #2262 fixed, now
+    // depth-checked to match too (#2276 review) -- so declining it for
     // JSON-sourced input actually closes the comma-gap validation hole
     // rather than just moving it to an equally-unvalidated fallback.
     let can_inplace_json_fast_path = is_m2_streamable
-        && !any_input_is_json
+        && fast_path_json_comma_safe
         && can_stream_json_output_style
         && output_config.output_format == OutputFormat::Json
         && !args.null_input
@@ -4270,7 +4388,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         && args.front_matter.is_none()
         && context.named.is_empty();
     let can_inplace_yaml_fast_path = is_m2_streamable
-        && !any_input_is_json
+        && fast_path_json_comma_safe
         && (output_config.compact || can_stream_pretty_or_colored)
         && output_config.output_format == OutputFormat::Yaml
         && !args.null_input
@@ -4297,12 +4415,12 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // once the escaping moved to the sink. This route's own `json_ascii!`
     // wrap is on its `stream_json_sequence` call below.
     //
-    // `!any_input_is_json` (#2276, see `any_input_is_json`'s own doc comment
-    // above): same reasoning as `can_inplace_fast_path`'s identical addition
-    // -- this gate's `else` arm is `parse_input` too, so declining here for
-    // JSON-sourced input actually closes the comma-gap hole.
+    // `fast_path_json_comma_safe` (#2276, see its own doc comment above):
+    // same reasoning as `can_inplace_fast_path`'s identical addition --
+    // this gate's `else` arm is `parse_input_m2_parity` too, so declining
+    // here for JSON-sourced input actually closes the comma-gap hole.
     let can_slurp_fast_path = is_identity
-        && !any_input_is_json
+        && fast_path_json_comma_safe
         && match output_config.output_format {
             OutputFormat::Json => can_stream_json_output_style,
             OutputFormat::Yaml => can_stream_pretty_or_colored,
@@ -5406,7 +5524,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             // Parse all inputs and collect documents
             let mut global_doc_index: usize = 0;
             for (bytes, format, _) in &input_sources {
-                let inputs = parse_input(bytes, *format)?;
+                // #2276: `parse_input_m2_parity`, not plain `parse_input` --
+                // this is `--slurp`'s own DOM fallback, reached exactly
+                // when its M2 fast path declines JSON-sourced input.
+                let inputs = parse_input_m2_parity(bytes, *format)?;
                 for input in inputs {
                     // Apply --doc filter if specified
                     if let Some(target_doc) = args.document {
@@ -5641,7 +5762,10 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 // already reflects whether any real output happened.
                 !output_buffer.is_empty()
             } else {
-                let inputs = parse_input(&input_bytes, format)?;
+                // #2276: `parse_input_m2_parity`, not plain `parse_input` --
+                // this is `--inplace`'s own DOM fallback, reached exactly
+                // when its M2 fast path declines JSON-sourced input.
+                let inputs = parse_input_m2_parity(&input_bytes, format)?;
 
                 let mut buf_writer = BufWriter::new(&mut output_buffer);
                 // Count matching docs for multi-doc separator logic
