@@ -1706,11 +1706,21 @@ handling, and `getpath`'s own path-array walk (jq-only syntax, so this only matt
 `--jq-extensions`) -- filed as [#2264](https://github.com/rust-works/succinctly/issues/2264).
 `del()`/`delpaths()` silently no-op on this shape instead of raising at all (more severe than
 a suppression gap -- a missing error, not a differently-worded one) -- filed separately as
-[#2268](https://github.com/rust-works/succinctly/issues/2268). And
-`eval_stage_with_path_context`'s own `Expr::Try`/`Expr::Optional` arms (`--eval-all` combined
-with a path-context-triggering builtin like `file_index`) have no uncatchable-error guard at
-all, for any error class, not just this one -- filed as
-[#2270](https://github.com/rust-works/succinctly/issues/2270).
+[#2268](https://github.com/rust-works/succinctly/issues/2268). `eval_stage_with_path_context`'s
+own `Expr::Optional`/`Expr::Try` arms (`--eval-all` combined with a path-context-triggering
+builtin like `file_index`) had no uncatchable-error guard at all -- filed and fixed as
+[#2270](https://github.com/rust-works/succinctly/issues/2270), whose own review found the
+first attempt (`EvalError::is_uncatchable()`, matching `resolve_node`'s own path-tracking
+resolver) was itself too broad for this specific function: `is_uncatchable()` also covers
+`is_invalid_path_expression()`, correct for `resolve_node` but not for
+`eval_stage_with_path_context`, which runs whenever *any* sibling in the same pipe needs path
+context, not only when the branch actually being evaluated is itself a path expression --
+confirmed live that `.a | (try path(1) catch "x"), key` wrongly let the error escape uncaught
+purely because of the unrelated `key` sibling, where real jq (and `try path(1) catch "x"`
+alone, without that sibling) always catches it. Fixed with a narrower, function-local
+predicate (`path_context_stage_uncatchable`, `src/jq/eval.rs`) matching the same
+`is_decode_failure() || is_yq_negative_index_error()` exclusion `eval_try`/`each_try`/
+`try_single_generic`/`each_try_generic` already apply at pure value position.
 
 ### Other categories
 
