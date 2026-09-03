@@ -8204,18 +8204,51 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
             // already apply to a *successful* target result, so those
             // values are not "never part of the indexed output either
             // way" the way the old comment here assumed; only `target`'s
-            // own escape stops it from producing more. Mirrors
-            // `KeyTargets::Owned`'s own loop below exactly (this prefix is
-            // already `Vec<OwnedValue>`, the same shape `Owned` handles):
-            // an indexing failure on an earlier-produced value fires
-            // before `target`'s own later escape ever would in the real
-            // generator order, so it outranks `control` here the same way
-            // a later key's index error already outranks an earlier key's
-            // pending halt in the `Owned`/`Native` arms; only once every
-            // value in `vs` indexes cleanly does `control` -- `target`'s
-            // own termination -- get to fire.
+            // own escape stops it from producing more. This is jq-only
+            // (review finding): real yq does not stream a target's own
+            // escaped generator's prefix at all -- live-verified against yq
+            // v4.53.3, `([1,2],[3,4],error("x"))[(0,1)]` prints only
+            // `Error: x`, no prefix -- so yq mode keeps the old
+            // conservative discard here (matches ADR-0018's "the mode
+            // decides" rule; see `eval::eval_index_expr`'s identical gate).
+            //
+            // Mirrors `KeyTargets::Owned`'s own loop below exactly (this
+            // prefix is already `Vec<OwnedValue>`, the same shape `Owned`
+            // handles): an indexing failure on an earlier-produced value
+            // fires before `target`'s own later escape ever would in the
+            // real generator order, so it outranks `control` here the same
+            // way a later key's index error already outranks an earlier
+            // key's pending halt in the `Owned`/`Native` arms; only once
+            // every value in `vs` indexes cleanly does `control` --
+            // `target`'s own termination -- get to fire.
+            //
+            // Does *not* reuse `ensure_owned!()`: that macro's own
+            // `owned_or_err!`-based promotion bare-returns
+            // `GenericResult::Error` on a decode failure, unconditionally
+            // discarding whatever `control` this arm is holding --
+            // including an uncatchable `Halt`, which `escape_generic!`
+            // above this loop already goes out of its way to preserve
+            // through the identical promotion step. Inlined here instead,
+            // mirroring `escape_generic!`'s own Halt-survives rule exactly
+            // rather than reintroducing the bug it was written to avoid.
             GenericResult::Partial(vs, control) => {
-                ensure_owned!();
+                if S::TAG == EvalTag::Yq {
+                    escape_generic!(control);
+                }
+                if !any_owned {
+                    any_owned = true;
+                    owned = match to_owned_all_cursors(&cursors) {
+                        Ok(vs) => vs,
+                        Err(e) => {
+                            let control = match control {
+                                Control::Halt(code) => Control::Halt(code),
+                                Control::Error(_) | Control::Break(_) => Control::Error(e),
+                            };
+                            return partial_generic(Vec::new(), control);
+                        }
+                    };
+                    cursors.clear();
+                }
                 if owned.try_reserve(vs.len()).is_err() {
                     escape_generic!(Control::Error(cannot_reserve_cross_product(&[vs.len()])));
                 }
@@ -8420,18 +8453,16 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
 /// used to be evaluated once, before the loop could produce anything), so
 /// there was nothing to lose by discarding it there; now there can be. The
 /// per-target slice-application escape one level in got the identical
-/// cross-pair fix for the identical reason (review). Left deliberately
-/// unaddressed, matching `eval_index_expr`'s own identical, pre-existing
-/// gap (confirmed live on `main`, not introduced or worsened by this fix):
-/// a `Partial(prefix, control)` result still discards `prefix` itself —
-/// the values `E`'s *own* generator produced before erroring *within* one
-/// (s, e) pair (as opposed to the cross-pair `out` this fix does thread
-/// through) — e.g. `E = ([1,2],[3,4],error("x"))` loses the `[1]`/`[3]`
-/// slices it should still emit before raising `x`. Real fix needs applying
-/// the pair's own slice/index operation to each of `prefix`'s values before
-/// folding them into `out`, not just discarding `prefix`; tracked
-/// separately (issue filed alongside this fix) since it's a pre-existing
-/// gap shared with `eval_index_expr`, not something #2143 introduces.
+/// cross-pair fix for the identical reason (review). #2226 later closed the
+/// sibling gap this comment used to describe as left deliberately
+/// unaddressed here: a `Partial(prefix, control)` target result no longer
+/// just discards `prefix` — the values `E`'s *own* generator produced
+/// before erroring *within* one (s, e) pair (as opposed to the cross-pair
+/// `out` this fix already threads through) are now sliced and folded into
+/// `out` too, in jq mode (real yq does not stream this prefix at all; see
+/// the `Partial` arm's own comment for the live-verified yq-mode carve-out)
+/// — e.g. `E = ([1,2],[3,4],error("x"))` now emits the `[1]`/`[3]` slices
+/// before raising `x`, matching jq 1.7.1.
 ///
 /// #2225: `T` (`end`) is *also* now re-evaluated fresh for every `s`, not
 /// once overall as an earlier revision of this doc comment claimed ("its
@@ -8537,8 +8568,16 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
                 // of those already-produced values and fold them into `out`
                 // before escaping, mirroring `eval_index_expr`'s identical
                 // fix for its own target `Partial` arm, rather than
-                // discarding them.
+                // discarding them. jq-only (review finding, same gate as
+                // `eval_index_expr` above): real yq does not stream a
+                // target's own escaped generator's prefix -- live-verified
+                // against yq v4.53.3, `([1,2],[3,4],error("x"))[(0,1):(1,2)]`
+                // prints only `Error: x`. yq mode keeps the old conservative
+                // discard.
                 GenericResult::Partial(vs, control) => {
+                    if S::TAG == EvalTag::Yq {
+                        escape!(control);
+                    }
                     if out.try_reserve(vs.len()).is_err() {
                         escape!(Control::Error(cannot_reserve_cross_product(&[vs.len()])));
                     }

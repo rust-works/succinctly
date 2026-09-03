@@ -16797,10 +16797,21 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // below already apply to a *successful* target result, so
             // indexing an escaped generator's own partial prefix *is* real
             // jq behavior (confirmed live: `0 as $k | ([1,2],[3,4],
-            // error("x"))[$k]` prints `1` then `3` before raising).
+            // error("x"))[$k]` prints `1` then `3` before raising). This is
+            // jq-only (review finding): real yq does *not* stream a target's
+            // own escaped generator's prefix at all -- live-verified against
+            // yq v4.53.3, `0 as $k | ([1,2],[3,4],error("x"))[$k]` prints
+            // only `Error: x`, no prefix -- so yq mode keeps the old
+            // conservative discard here, exactly like the Error/Break/Halt
+            // arms above (matches ADR-0018's "the mode decides" rule; the
+            // pre-#2226 code's discard-everything behavior happened to
+            // already agree with real yq here, which this gate now
+            // preserves deliberately instead of by accident).
+            //
             // Mirrors `KeyTargets::Owned`'s own loop below exactly (this
             // prefix is already `Vec<OwnedValue>`, the same shape `Owned`
-            // handles, `yq_negative_index_error` check included): an
+            // handles, `yq_negative_index_error` check included -- always a
+            // no-op past the gate above, kept for structural parity): an
             // indexing failure on an earlier-produced value fires before
             // `target`'s own later escape ever would in the real generator
             // order, so it outranks `control` here the same way a later
@@ -16809,11 +16820,30 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // `vs` indexes cleanly does `control` -- `target`'s own
             // termination -- get to fire.
             QueryResult::Partial(vs, control) => {
+                if S::TAG == EvalTag::Yq {
+                    escape_with_prefix!(control);
+                }
                 if owned.is_none() {
                     owned = Some(
                         match promote_borrowed_checked(core::mem::take(&mut borrowed)) {
                             Ok(v) => v,
-                            Err((prefix, e)) => return partial(prefix, Control::Error(e)),
+                            // An earlier key's own undecodable value predates
+                            // this key's target generator in real evaluation
+                            // order, so it outranks `control` too -- except
+                            // when `control` is an uncatchable `Halt`, which
+                            // must survive a promotion failure untouched,
+                            // same rule `resolve_terminal_prefix` enforces
+                            // for every other escape in this function (#987/
+                            // #1832); `vs` is never attempted here either
+                            // way, matching that helper's own `extra` never
+                            // being touched on its `Err` branch.
+                            Err((prefix, e)) => {
+                                let control = match control {
+                                    Control::Halt(_) => control,
+                                    Control::Error(_) | Control::Break(_) => Control::Error(e),
+                                };
+                                return partial(prefix, control);
+                            }
                         },
                     );
                 }
@@ -16983,11 +17013,12 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// rather than once overall, mirroring #2032/#2142's identical fix for
 /// `eval_index_expr` one nesting level deeper — see
 /// `eval_generic::eval_slice_expr`'s own copy of this comment for the full
-/// rationale, live-verified repro, and the "cross-pair `out` vs. `target`'s
-/// own within-pair `Partial` prefix" distinction (not repeated here) that
-/// this file's copy folds `out` in for but deliberately still doesn't
-/// address the latter — same pre-existing, unaddressed gap
-/// `eval_index_expr` already carries.
+/// rationale and live-verified repro. #2226 later closed the "cross-pair
+/// `out` vs. `target`'s own within-pair `Partial` prefix" gap this comment
+/// used to describe as unaddressed: `out` now folds in `target`'s own
+/// already-produced values too (jq mode only — see the `Partial` arm's own
+/// comment below for the yq-mode carve-out), not just the cross-pair
+/// accumulator.
 fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     target: &Expr,
     start: &Option<Box<Expr>>,
@@ -17092,15 +17123,31 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // an earlier one's pending halt in the `Borrowed`/`Owned`
                 // arms below; only once every value in `vs` slices
                 // cleanly does `control` -- `target`'s own termination --
-                // get to fire. Confirmed live: `[1,2,3,4] |
-                // (.,5,error("x"))[1:3]` prints `[2,3]` (sliced from `.`,
-                // this arm's own loop) then raises "Cannot index number
-                // with object" -- `5`'s own slice attempt *does* run (it's
-                // the second value in `vs`, since `target` materializes
-                // every value it produced up through its own escape) and
-                // its failure outranks the original `x` from `control`,
-                // exactly the precedent this arm's own doc comment states.
+                // get to fire. Confirmed live (review finding: bounds must
+                // stay non-foldable, `1:3` collapses to the static
+                // `Expr::Slice` fast path per #1326 and never reaches this
+                // function at all -- reached here instead via an `as`-bound
+                // pair, which forces this file's `eval_slice_expr` rather
+                // than `eval_generic.rs`'s CLI-dispatch sibling): `[1,2,3,4]
+                // | 1 as $s | 3 as $e | (.,5,error("x"))[$s:$e]` prints
+                // `[2,3]` (sliced from `.`, this arm's own loop) then raises
+                // "Cannot index number with object" -- `5`'s own slice
+                // attempt *does* run (it's the second value in `vs`, since
+                // `target` materializes every value it produced up through
+                // its own escape) and its failure outranks the original `x`
+                // from `control`, exactly the precedent this arm's own doc
+                // comment states.
+                //
+                // jq-only (review finding, same as `eval_index_expr`'s
+                // identical gate): real yq does not stream a target's own
+                // escaped generator's prefix -- live-verified against yq
+                // v4.53.3, `([1,2],[3,4],error("x"))[(0,1):(1,2)]` prints
+                // only `Error: x`. yq mode keeps the old conservative
+                // discard.
                 QueryResult::Partial(vs, control) => {
+                    if S::TAG == EvalTag::Yq {
+                        escape!(control);
+                    }
                     if out.try_reserve(vs.len()).is_err() {
                         escape!(Control::Error(cannot_reserve_cross_product(&[vs.len()])));
                     }
@@ -32105,9 +32152,10 @@ fn eval_index_expr_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemanti
             // Zero outputs for *this* key contributes nothing -- not every
             // other key is empty too (#2032).
             QueryResult::None => continue,
-            // Any target-level escape discards *this key's own* target
-            // output and escapes immediately with whatever earlier keys
-            // already accumulated -- matches `eval_index_expr`'s own
+            // A direct target-level escape (no output at all from this
+            // key's own target) discards *this key's own* target output and
+            // escapes immediately with whatever earlier keys already
+            // accumulated -- matches `eval_index_expr`'s own
             // `escape_with_prefix!` arms exactly.
             QueryResult::Error(e) => {
                 return partial(core::mem::take(&mut results), Control::Error(e));
@@ -32118,6 +32166,15 @@ fn eval_index_expr_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemanti
             QueryResult::Halt(code) => {
                 return partial(core::mem::take(&mut results), Control::Halt(code));
             }
+            // Unlike the arms above, this one no longer matches
+            // `eval_index_expr`'s own identical arm (#2226 review finding):
+            // `_` here still discards the target's own already-produced
+            // values before its own mid-stream escape, the exact bug #2226
+            // fixed for `eval_index_expr`'s value-mode counterpart. Left
+            // unaddressed here -- this path-context evaluator backs
+            // assignment/`del()`/`path()` through a computed key, not plain
+            // reads, and #2226's own scope was the plain-read evaluators
+            // only; tracked as a follow-up.
             QueryResult::Partial(_, control) => {
                 return partial(core::mem::take(&mut results), control);
             }
@@ -32439,7 +32496,8 @@ fn eval_slice_expr_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemanti
                 // `eval_index_expr_with_path_context`'s identical
                 // per-key/per-pair treatment).
                 QueryResult::None => continue,
-                // Any target-level escape discards *this pair's* own target
+                // A direct target-level escape (no output at all from this
+                // pair's own target) discards *this pair's* own target
                 // output and escapes immediately with whatever earlier
                 // pairs already accumulated.
                 QueryResult::Error(e) => {
@@ -32451,6 +32509,12 @@ fn eval_slice_expr_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemanti
                 QueryResult::Halt(code) => {
                     return partial(core::mem::take(&mut results), Control::Halt(code));
                 }
+                // `_` here still discards the target's own already-produced
+                // values before its own mid-stream escape -- the identical,
+                // still-open gap `eval_index_expr_with_path_context`'s own
+                // sibling arm now documents (#2226 review finding); see that
+                // comment for why this path-context evaluator was left out
+                // of #2226's own scope.
                 QueryResult::Partial(_, control) => {
                     return partial(core::mem::take(&mut results), control);
                 }
@@ -52796,20 +52860,52 @@ mod tests {
     }
 
     /// #2226 sibling: the same target-own-prefix fix for `eval_slice_expr`.
-    /// `([1,2],[3,4],error("x"))[(0,1)-1:(1,2)-0]` simplifies to a plain
-    /// `[0:1]` slice per `(s, e)` pair below, but the point is `E` itself
-    /// (the `([1,2],[3,4],error("x"))` target) producing two clean slices
-    /// before erroring on its third branch. Verified against jq 1.7.1: `echo
-    /// null | jq -c '([1,2],[3,4],error("x"))[0:1]'` prints `[1]` then
-    /// `[3]` before raising.
+    /// Both bounds are `(N+0)` rather than bare literals -- a slice whose
+    /// bounds both fully fold to constants never reaches `eval_slice_expr`
+    /// at all (`Expr::SliceExpr`'s own doc comment, #1326): the parser
+    /// keeps producing the static `Expr::Slice` fast path instead, which
+    /// this function's own `[0:1]`-bounds predecessor of this test
+    /// (correctness-equivalent, but silently exercising the unrelated,
+    /// already-fixed-pre-#2226 `eval_pipe`/`pipe_owned_prefix` machinery
+    /// instead of this fix -- review finding) accidentally did. `E`
+    /// (the `([1,2],[3,4],error("x"))` target) still produces two clean
+    /// slices before erroring on its third branch. Verified against jq
+    /// 1.7.1: `echo null | jq -c '([1,2],[3,4],error("x"))[(0+0):(1+0)]'`
+    /// prints `[1]` then `[3]` before raising.
     #[test]
     fn test_slice_expr_target_own_partial_prefix_preserved_2226() {
-        query!(b"null", r#"([1,2],[3,4],error("x"))[0:1]"#,
+        query!(b"null", r#"([1,2],[3,4],error("x"))[(0+0):(1+0)]"#,
             QueryResult::Partial(vs, Control::Error(e)) => {
                 assert_eq!(vs, vec![
                     OwnedValue::Array(vec![OwnedValue::Int(1)]),
                     OwnedValue::Array(vec![OwnedValue::Int(3)]),
                 ]);
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    /// #2226 review finding: the fix above is jq-only. Real yq does not
+    /// stream a target's own escaped generator's prefix at all -- verified
+    /// live against yq v4.53.3: `([1,2],[3,4],error("x"))[(0+0)]` prints
+    /// only `Error: x`, no prefix. yq mode must keep the pre-#2226
+    /// conservative discard here.
+    #[test]
+    fn test_index_expr_target_partial_prefix_still_discarded_in_yq_mode_2226() {
+        yq_query!(b"null", r#"([1,2],[3,4],error("x"))[(0+0)]"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    /// #2226 sibling: the identical yq-mode carve-out for `eval_slice_expr`.
+    /// Verified live against yq v4.53.3:
+    /// `([1,2],[3,4],error("x"))[(0+0):(1+0)]` prints only `Error: x`.
+    #[test]
+    fn test_slice_expr_target_partial_prefix_still_discarded_in_yq_mode_2226() {
+        yq_query!(b"null", r#"([1,2],[3,4],error("x"))[(0+0):(1+0)]"#,
+            QueryResult::Error(e) => {
                 assert_eq!(e.message, "x");
             }
         );
