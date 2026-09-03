@@ -1428,6 +1428,78 @@ mod tests {
         assert_eq!(yaml_block, "- b");
     }
 
+    /// #2261: a trailing stray comma after a real last key (`{"a":1,}`) --
+    /// caught by `trailing_gap_ok` rather than `is_malformed()`, the same
+    /// "ask only once the walk is done" contract as the #1679 tests above.
+    ///
+    /// **Not reachable from either shipped CLI today**, the same "library-
+    /// API-only completeness fix" shape `test_stream_lazy_keys_honors_
+    /// collapse_1514` already documents for this function: `succinctly jq`
+    /// excludes bare `Builtin::KeysUnsorted` from its own M2 fast-path gate
+    /// unconditionally (`m2_json_fallback_safe`, `jq_runner.rs`, since
+    /// #1679 -- this writer's own malformed-key detection wasn't
+    /// established when that gate was written), so this function is never
+    /// invoked from `succinctly jq` regardless of AST shape; `succinctly
+    /// yq --input-format json` has no such exclusion and does reach this
+    /// function, but only with YAML-sourced `fields` (JSON parses through
+    /// `YamlIndex` there, per #1975/#2262), whose own `trailing_gap_ok`
+    /// always answers `true` by design (YAML's flow-mapping grammar
+    /// legitimately allows a trailing `,`) -- so a genuinely JSON-sourced
+    /// `fields` never reaches this function from either CLI as things
+    /// stand today. Pinned directly here, calling the function itself,
+    /// exactly as #1514's own review already established the precedent for
+    /// doing when a fix to this function outruns what any CLI path
+    /// currently exercises.
+    #[test]
+    fn test_stream_lazy_keys_raises_on_trailing_comma_2261() {
+        use crate::json::light::{JsonIndex, StandardJson};
+
+        let json = br#"{"a":1,}"#;
+        let index = JsonIndex::build(json);
+        let StandardJson::Object(fields) = index.root(json).value() else {
+            panic!("expected object");
+        };
+
+        let mut json_out = String::new();
+        let mut err = None;
+        stream_lazy_keys_json(&fields, true, &mut json_out, IndentSpec::COMPACT, &mut err).unwrap();
+        let e = err.expect("a trailing stray comma is not JSON");
+        assert!(e.message.contains("Invalid JSON text"), "{e:?}");
+        assert_eq!(
+            json_out, r#"["a"]"#,
+            "the one real key written before the fault stays written, closing bracket \
+             included -- unlike jq_runner.rs's own `JqValue::LazyKeysArray` writer, this \
+             function always finishes the bracket and lets `error` (not a truncated `[`) \
+             signal the fault to its caller, matching test_stream_lazy_keys_raises_on_non_\
+             string_key_1679's identical convention"
+        );
+    }
+
+    /// #2261: the well-formed sibling of the test above -- a genuine `{}`
+    /// and an ordinary multi-key object are both unaffected by the new
+    /// check.
+    #[test]
+    fn test_stream_lazy_keys_wellformed_unaffected_by_trailing_comma_check_2261() {
+        use crate::json::light::{JsonIndex, StandardJson};
+
+        for (json, expected) in [
+            (&b"{}"[..], "[]"),
+            (&b"{\"a\":1}"[..], r#"["a"]"#),
+            (&b"{\"a\":1,\"b\":2}"[..], r#"["a","b"]"#),
+        ] {
+            let index = JsonIndex::build(json);
+            let StandardJson::Object(fields) = index.root(json).value() else {
+                panic!("{json:?}: expected object");
+            };
+            let mut json_out = String::new();
+            let mut err = None;
+            stream_lazy_keys_json(&fields, true, &mut json_out, IndentSpec::COMPACT, &mut err)
+                .unwrap();
+            assert!(err.is_none(), "{json:?}: {err:?}");
+            assert_eq!(json_out, expected, "{json:?}");
+        }
+    }
+
     /// #1679: the unpaired-tail sibling of the test above -- an object whose
     /// last child has no value to pair with. Only
     /// [`DistinctKeyCursors::ended_unpaired`] (meaningful once the walk is

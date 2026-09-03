@@ -22424,18 +22424,26 @@ fn test_jq_length_and_index_leading_comma_gap_still_raises_2261() -> Result<()> 
     Ok(())
 }
 
-/// #2261: `stream_lazy_keys_json` (`src/jq/stream.rs`) is a *different*
-/// writer from the bare-`keys_unsorted` one pinned above
-/// (`test_jq_lazy_keys_array_trailing_comma_leaves_truncated_bracket_2261`)
-/// -- it backs `keys_unsorted[]` reached through the M2 streaming path
-/// (`jq_runner.rs`'s `expr_is_cursor_transparent`, which admits
-/// `.x | keys_unsorted[]`: the pipe's first stage `.x` already descends off
-/// the root, so nothing after it needs to be root-safe). Confirmed this is
-/// really a different code path -- not just the same check reached twice --
-/// by grepping the touched-line coverage report for this exact line before
-/// adding the test.
+/// #2261: `.x | keys_unsorted[]` is a *different* code path from bare
+/// `keys_unsorted[]` (pinned as part of
+/// `test_jq_cursor_transparent_fast_paths_reject_trailing_comma_2261`
+/// above): a bare `keys_unsorted[]` isn't cursor-transparent
+/// (`Builtin::KeysUnsorted` alone isn't root-safe) and takes the eager
+/// route (`fold_lazy_keys_stage`/`distinct_key_cursors_checked`), but once
+/// a pipe's first stage already descends off the root (`.x`, `Expr::Field`,
+/// one of `expr_descends`'s own matched shapes), `jq_runner.rs`'s
+/// `expr_is_cursor_transparent` admits everything after it unconditionally
+/// -- so this reaches the *demand-aware* sink
+/// (`each_lazy_keys_iterate_sink`, driven through `eval_each_with_cursor`)
+/// instead. Confirmed this is a genuinely different route (a code-review
+/// correction on this fix's first draft, which had wrongly attributed this
+/// test to `stream_lazy_keys_json` in `src/jq/stream.rs` -- that writer
+/// turns out to be excluded from `succinctly jq`'s own M2 output gate
+/// entirely, `m2_json_fallback_safe`, and is pinned separately, by direct
+/// unit test, in `src/jq/stream.rs` itself) by disabling each candidate
+/// check in turn and re-running this exact query.
 #[test]
-fn test_jq_m2_streaming_keys_unsorted_after_descend_rejects_trailing_comma_2261() -> Result<()> {
+fn test_jq_descended_pipe_prefix_reaches_demand_aware_keys_sink_2261() -> Result<()> {
     let (out, stderr, code) =
         run_jq_full(&["-c", ".x | keys_unsorted[]"], Some(r#"{"x":{"a":1,}}"#))?;
     assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
