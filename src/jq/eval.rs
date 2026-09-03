@@ -22836,6 +22836,24 @@ fn resolve_iterate_bounded<S: EvalSemantics>(
 /// hand-rolled here). `None` for `Identity` and anything else — `Identity`
 /// performs no navigation at all, so both call sites deliberately route it
 /// to the ordinary `#530` "with result" check instead.
+///
+/// #2272: `Expr::Optional` unwraps to its inner shape rather than falling
+/// into the `_ => None` catch-all -- a component here can carry a `?` from
+/// its own source spelling (`E[K]?`'s `resolve_index_expr` call still
+/// builds `Expr::Optional(Field(...))`/`Expr::Optional(Index{...})`/
+/// `Expr::Optional(Slice{...})` components even though *this* function's
+/// own caller, `resolve_static_tail`, is asking the #530-vs-#843 question
+/// one level below where `?` gets stripped for the write path (#498) --
+/// this read-path check runs before that stripping ever happens). Without
+/// this arm, any optional index/slice/field access into an untracked value
+/// fell back to the generic "with result" wording instead of #843's own
+/// more specific "near attempt to access element K of V", losing exactly
+/// the key/index/slice being attempted. Confirmed live against jq 1.7.1:
+/// `path((.,5)[("a")]?)` raises "near attempt to access element \"a\" of
+/// 5", not jq's generic wording -- `?` here only covers the *indexing*
+/// failure (#530 is documented never to be one), so this is purely a
+/// missing-shape gap in the message construction, not an optional-
+/// suppression question.
 fn navigation_element(component: &Expr) -> Option<OwnedValue> {
     match component {
         Expr::Field(name) => Some(OwnedValue::String(name.clone())),
@@ -22851,6 +22869,7 @@ fn navigation_element(component: &Expr) -> Option<OwnedValue> {
             *end,
             end_key.as_ref(),
         )),
+        Expr::Optional(inner) => navigation_element(inner),
         _ => None,
     }
 }
