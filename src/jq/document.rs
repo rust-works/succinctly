@@ -262,6 +262,38 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         true
     }
 
+    /// Whether nothing but whitespace separates `gap_start` (a container's
+    /// *last real child's* own already-resolved span end, via
+    /// [`DocumentValue::scalar_text_end`]) from `close_char` (`]`/`}`) --
+    /// #2243, the sibling of [`container_gap_ok`](Self::container_gap_ok)
+    /// for a container whose child walk produced at least one real child.
+    ///
+    /// `container_gap_ok` only ever fires when the walk produced **zero**
+    /// children (`[,]`, `{,}`) -- it has nothing to compare a *trailing*
+    /// stray comma after a genuine last child (`[1,]`, `{"a":1,}`) against,
+    /// since it derives the gap from its own `text_position()` (the
+    /// container's *opening* delimiter), not the last child's end. This
+    /// closes that gap the same way `crate::json::light`'s own
+    /// `trailing_gap_ok` already does for the CLI's cursor-native writers
+    /// (#1676) -- one gap-scanning primitive, this one more entry point
+    /// shaped for what `eval_generic::to_owned_cursor_at_depth` already has
+    /// in hand (a resolved last-child cursor and its own decoded value).
+    ///
+    /// Called on the *last child's* cursor, not the container's -- unlike
+    /// `container_gap_ok`, the gap start here is a value the caller already
+    /// resolved (never re-derivable from `self` alone the way an empty
+    /// container's own opening position is), so `self` only needs to expose
+    /// whatever the underlying format needs to scan forward from it (JSON:
+    /// the shared source buffer).
+    ///
+    /// The default answers `true` unconditionally, same reasoning as
+    /// [`container_gap_ok`](Self::container_gap_ok): every format but JSON
+    /// validates this while parsing.
+    fn trailing_element_gap_ok(&self, gap_start: usize, close_char: u8) -> bool {
+        let _ = (gap_start, close_char);
+        true
+    }
+
     /// Whether the value immediately following this key (at `key_end`, the
     /// key's own already-known span end) is preceded by exactly one `:`
     /// (#1677) -- the forward-scan twin of
@@ -718,6 +750,34 @@ pub trait DocumentValue: Sized + Clone {
     /// this is used for -- a key is never a `Number` on a well-formed
     /// document, and #1194's own check already refuses one that is.
     fn text_end(&self) -> Option<usize> {
+        None
+    }
+
+    /// The byte position immediately past this value's own text span, given
+    /// `start` (this value's own already-resolved opening position, e.g.
+    /// [`DocumentCursor::text_position`]) -- #2243, the trait-level
+    /// generalization of `crate::json::light`'s own free-function
+    /// `scalar_end_pos`, which this and that function's remaining callers
+    /// (`stream_json_pretty`) both now share one definition for.
+    ///
+    /// Unlike [`text_end`](Self::text_end), this takes `start` explicitly
+    /// rather than assuming the value carries its own position: `Bool`/
+    /// `Null` need one to answer at all (JSON's own `StandardJson::Bool`/
+    /// `::Null` variants carry no position, only their two/four/five-byte
+    /// spelling once a start is known), and `String`/`Number` -- which do
+    /// carry their own position -- still accept `start` for a uniform
+    /// signature rather than a third arm just for them.
+    ///
+    /// `None` for a container (`Array`/`Object`) is deliberate, not a gap:
+    /// a container's own last child may have arbitrary trailing whitespace
+    /// before its closing bracket, so its end position is only knowable via
+    /// a real cursor lookup at that depth, not derivable from `start` alone
+    /// -- callers checking a trailing gap treat `None` here as "can't
+    /// determine, skip" (matching `scalar_end_pos`'s own original doc
+    /// comment). Defaults to `None`; JSON overrides it for every scalar
+    /// variant.
+    fn scalar_text_end(&self, start: usize) -> Option<usize> {
+        let _ = start;
         None
     }
 
