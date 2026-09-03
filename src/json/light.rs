@@ -4376,6 +4376,27 @@ mod tests {
         );
     }
 
+    /// #2288: the sibling gap on the *other* side of the winning
+    /// occurrence's key -- a missing `,` before a non-first key (as
+    /// opposed to the missing `:` after it, tested above).
+    #[test]
+    fn test_find_rejects_missing_comma_before_winning_key_2288() {
+        let json = br#"{"a":1"b":2}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let StandardJson::Object(fields) = root.value() else {
+            panic!("expected object");
+        };
+        let err = fields
+            .find("b")
+            .expect_err("missing comma before a non-first key should raise");
+        assert!(
+            err.message.contains("Invalid JSON text"),
+            "message: {}",
+            err.message
+        );
+    }
+
     /// #2288: same shape, but the winning occurrence is a *later* duplicate
     /// -- `find`'s last-duplicate-key-wins resolution must still validate
     /// only the actual winner's own delimiters, not an earlier, superseded
