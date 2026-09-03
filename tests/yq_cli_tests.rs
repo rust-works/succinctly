@@ -28797,6 +28797,59 @@ fn test_negative_index_out_of_range_survives_try_catch_under_eval_all_2270() -> 
     Ok(())
 }
 
+/// #2270 review: the `Partial(prefix, Control::Error(e))` arm this fix
+/// touches (not just the bare `Error(e)` one the test above exercises) --
+/// a `try` body that produces some output *before* raising the
+/// negative-index error must keep that output on stdout while the error
+/// still survives to stderr uncaught, matching `Partial`'s own #400/#494
+/// prefix-preservation contract everywhere else in this codebase.
+#[test]
+fn test_negative_index_out_of_range_survives_try_catch_partial_prefix_2270() -> Result<()> {
+    let multi_doc = "a: [1, 2]\n---\na: [3, 4]\n";
+
+    let (out, stderr, code) = run_yq_stdin_with_stderr(
+        ".[0].a | (try (1, .[-5]) catch \"c\") | key",
+        multi_doc,
+        &["-o", "json", "--eval-all"],
+    )?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(out.trim(), "null");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+
+    Ok(())
+}
+
+/// #2289 review: `eval_stage_with_path_context`'s `Expr::Optional`/
+/// `Expr::Try` arms must NOT treat `EvalError::is_invalid_path_expression()`
+/// as uncatchable the way `resolve_node`'s own path-tracking resolver
+/// correctly does -- this function runs whenever *any* sibling elsewhere in
+/// the same pipe needs path context, not only when the branch actually
+/// being dispatched is itself a path expression, so an ordinary
+/// `path(<non-path-expr>)` call reached through here (because an unrelated
+/// `key`/`file_index` sits elsewhere in the pipe) must stay catchable the
+/// same way it is at top-level/value position. Confirmed live against jq
+/// 1.7.1: `.a | (try path(1) catch "x"), key` gives `"x"` then `"a"` there;
+/// `is_uncatchable()`'s own broader check (which includes
+/// `is_invalid_path_expression()`) made both this arm and its `Expr::Optional`
+/// sibling wrongly let the error escape uncaught instead, before this fix.
+#[test]
+fn test_invalid_path_expression_stays_catchable_under_path_context_dispatch_2289() -> Result<()> {
+    let (out, stderr, code) =
+        run_jq_stdin_with_stderr(".a | (try path(1) catch \"x\"), key", "{\"a\":1}", &["-c"])?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(out.trim(), "\"x\"\n\"a\"");
+
+    let (out, stderr, code) =
+        run_jq_stdin_with_stderr(".a | (path(1)?), key", "{\"a\":1}", &["-c"])?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(out.trim(), "\"a\"");
+
+    Ok(())
+}
+
 /// #2254's jq-mode control: jq has no equivalent of this yq-only rule, so
 /// jq mode must be entirely unaffected by the fix -- every case above
 /// answers `null`, never raises.
