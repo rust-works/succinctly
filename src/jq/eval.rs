@@ -36770,6 +36770,47 @@ fn delete_at_path(
     }
 }
 
+/// Detect whether `steps` -- a suffix of `delete_path_steps`'s own flat
+/// component list -- does nothing at all but resolve to a bare trailing `.`:
+/// no `Field`/`Index`/`Iterate`/`Slice` anywhere in it, just `Identity`
+/// itself, `?`/`()` wrappers around it, and spliced `Pipe` groups (from a
+/// resolved `Optional(Pipe([..]))`) that themselves reduce the same way.
+/// Returns `Some(combined_optional)` when `steps` is exactly such a chain
+/// (`[Identity]`, `[Identity, Identity]`, `[Optional(Identity)]`,
+/// `[Optional(Paren(Identity))]`, ...), `None` the moment it finds a real
+/// navigation step left to do.
+///
+/// Used by [`delete_path_steps`] (#2256) to recognize a *terminal* bare `.`
+/// reached through a real `Field`/`Index`/`Iterate`/`Slice` step -- e.g.
+/// `del(.a | .)`, `del(.a | . | .)`, `del(.a | (.)?)` -- *before* navigating
+/// into the value that step names. Once `root` is reassigned into that
+/// child slot (the loop's usual "reassign and continue" move, mirroring
+/// [`update_path_steps`]), there is no way back to the map/array that holds
+/// it, so `delete_at_path`'s own `Expr::Identity` arm would null the child
+/// in place instead of removing it from its parent -- the same problem
+/// [`YqDelSliceOutcome::DropParent`]'s doc comment describes for a slice
+/// run, generalized to a plain trailing `.` and to every step kind, not just
+/// yq mode's own chained-scalar-slice case inside `Expr::Iterate`.
+fn trailing_identity_optional(steps: &[Expr], optional: bool) -> Option<bool> {
+    let (first, rest) = match steps {
+        [] => return Some(optional),
+        [first, rest @ ..] => (first, rest),
+    };
+    let (component, first_optional) = unwrap_path_component(first);
+    let optional = optional || first_optional;
+    match component {
+        Expr::Identity => trailing_identity_optional(rest, optional),
+        // Splice, exactly like `delete_path_steps`'s own `Expr::Pipe` arm --
+        // the group's contents (not just what follows it) have to collapse
+        // to nothing but identity too for the whole thing to count.
+        Expr::Pipe(inner) if !inner.is_empty() => {
+            let spliced = splice_optional_group(inner, rest, optional);
+            trailing_identity_optional(&spliced, optional)
+        }
+        _ => None,
+    }
+}
+
 /// Walk a flat run of `delete_at_path`'s own chain components -- `Field`/
 /// `Index`/`Iterate`/`Slice`, an occasional spliced `Pipe` from an
 /// `Optional` group, each possibly `?`-wrapped -- deleting at the terminal
@@ -36821,6 +36862,40 @@ fn delete_path_steps(
         // | .[.k]?)` removing the whole parent instead of one key.
         let (component, first_optional) = unwrap_path_component(first);
         let here = optional || first_optional;
+
+        // #2256: `component` is a real navigation step about to reassign
+        // `root` into whatever it names (a field's value, an array
+        // element, an iterated element, a slice). If everything left after
+        // it (`rest`) is nothing but a trailing bare `.` -- however deep
+        // (`del(.a | .)`, `del(.a | . | .)`, `del(.a | (.)?)`) -- deleting
+        // through it means removing *this* slot from its own parent, the
+        // same outcome `del(.a)` alone produces, not navigating in and
+        // letting `delete_at_path`'s `Expr::Identity` arm null the child in
+        // place once there is no way back to `root`'s current container.
+        // `root` here still *is* that container (nothing has been
+        // navigated into yet this iteration), so delegating straight to
+        // `delete_at_path` for `component` alone -- exactly as if `rest`
+        // were not there -- deletes at the right position, reusing the
+        // exact same terminal-arm logic (`shift_remove`/`arr.remove`/
+        // `arr.clear`/`map.clear`/`arr.drain`) that a literal terminal
+        // `Field`/`Index`/`Iterate`/`Slice` step already uses.
+        //
+        // `Expr::Identity`/`Expr::Pipe` components are deliberately excluded
+        // from this check (matched separately below, unchanged): an
+        // `Identity` here is itself a mid-chain pass-through (#2241) whose
+        // own `rest` this same check already examined one iteration earlier
+        // (see `trailing_identity_optional`'s doc comment) -- it cannot
+        // newly collapse now without having collapsed then, so it never
+        // needed to fire here. A `Pipe` group's own contents have not been
+        // spliced with `rest` yet; checking `rest` alone here, ahead of that
+        // splice, would strand whatever real work the group still has left.
+        if matches!(
+            component,
+            Expr::Field(_) | Expr::Index { .. } | Expr::Iterate | Expr::Slice { .. }
+        ) && trailing_identity_optional(rest, false).is_some()
+        {
+            return delete_at_path(root, component, here, yq_mode);
+        }
 
         match component {
             Expr::Field(name) => match root {
@@ -67155,6 +67230,116 @@ mod tests {
                 };
                 assert!(!second.contains_key("b"), "del() left the key behind");
             }
+        );
+    }
+
+    /// #2256: `del(EXPR | .)` -- a `del()` path whose *last* component is a
+    /// bare `.` reached through a real `Field`/`Index`/`Iterate` step --
+    /// used to null the targeted slot in place (`delete_at_path`'s own
+    /// terminal `Expr::Identity` arm, reached once `root` had already been
+    /// reassigned into the child and there was no way back to its parent)
+    /// instead of removing it from its parent container. Every case here
+    /// was confirmed live against jq 1.7.1 before the fix (the `null`-in-
+    /// place output) and after (matching jq exactly).
+    #[test]
+    fn test_del_terminal_bare_identity_removes_from_parent_2256() {
+        assert_outcomes(&[
+            // A single real step then a bare `.`.
+            (br#"{"a":{"b":1,"c":2}}"#, "del(.a | .)", Ok("{}")),
+            (br#"{"a":[1,2,3]}"#, "del(.a[0] | .)", Ok(r#"{"a":[2,3]}"#)),
+            // Multiple real steps then a bare `.` -- `root` was navigated
+            // through more than one `Field`/`Index` step before reaching
+            // the trailing `.`.
+            (
+                br#"{"a":{"b":{"c":1}}}"#,
+                "del(.a.b | .)",
+                Ok(r#"{"a":{}}"#),
+            ),
+            (
+                br#"{"a":[{"b":1}]}"#,
+                "del(.a[0].b | .)",
+                Ok(r#"{"a":[{}]}"#),
+            ),
+            // Through `Iterate` -- every element is removed from its own
+            // array/object, not nulled in place.
+            (br#"[{"x":1},{"x":2}]"#, "del(.[] | .)", Ok("[]")),
+            (br#"{"a":1,"b":2}"#, "del(.[] | .)", Ok("{}")),
+            // A mid-chain bare `.` (#2241) immediately followed by a
+            // *second* trailing bare `.` -- the mid-chain pass-through must
+            // not stop this from being recognized as an all-the-way-through
+            // trailing-identity chain.
+            (br#"{"a":{"b":1,"c":2}}"#, "del(.a | . | .)", Ok("{}")),
+            // `Optional`/`Paren`-wrapped trailing identity.
+            (br#"{"a":5}"#, "del(.a | (.)?)", Ok("{}")),
+            (br#"{"a":5}"#, "del(.a | (.))", Ok("{}")),
+            // `del(.)` alone is genuinely top-level (no parent to remove
+            // from at all) and must keep nulling the whole document.
+            (br#"{"a":1}"#, "del(.)", Ok("null")),
+            // `del(. | .)` never navigates through any real step either
+            // (both sides of the pipe are bare `.`), so it must also still
+            // null the whole document, exactly like `del(.)` alone.
+            (br#"{"a":1}"#, "del(. | .)", Ok("null")),
+            // A mid-chain bare `.` followed by *real* further navigation
+            // (#2241's own case) is unaffected: the trailing component
+            // isn't a bare `.`, so this must still peel just `.b`, not
+            // remove `.a` wholesale.
+            (br#"{"a":{"b":1}}"#, "del(.a | . | .b)", Ok(r#"{"a":{}}"#)),
+            // An ordinary terminal `Field`/`Index` step (no trailing `.` at
+            // all) is unaffected either.
+            (
+                br#"{"a":{"b":1,"c":2}}"#,
+                "del(.a.b)",
+                Ok(r#"{"a":{"c":2}}"#),
+            ),
+            (br#"{"a":{"b":1,"c":2}}"#, "del(.a)", Ok("{}")),
+        ]);
+    }
+
+    /// #2256 in yq mode: the same terminal-bare-`.` bug reproduced with
+    /// `YqSemantics`, confirmed live against yq v4.53.3 before the fix.
+    #[test]
+    fn test_del_terminal_bare_identity_removes_from_parent_yq_mode_2256() {
+        yq_query!(br#"{"a":{"b":1,"c":2}}"#, r"del(.a | .)",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert!(obj.is_empty(), "expected {{}}, got {obj:?}");
+            }
+        );
+        yq_query!(br#"{"a":[1,2,3]}"#, r"del(.a[0] | .)",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(
+                    obj.get("a"),
+                    Some(&OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Int(3)]))
+                );
+            }
+        );
+        yq_query!(br#"{"a":{"b":{"c":1}}}"#, r"del(.a.b | .)",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                let OwnedValue::Object(a) = obj.get("a").unwrap() else {
+                    panic!("expected object");
+                };
+                assert!(a.is_empty(), "expected .a == {{}}, got {a:?}");
+            }
+        );
+        // Through `Iterate` in yq mode -- confirmed *not* already covered
+        // by `yq_del_slice_outcome`'s own `DropParent(Expr::Identity)`
+        // mechanism (that classification only fires for a chained scalar
+        // *slice*, live-verified to still null every element for this
+        // plain `.[] | .` shape pre-fix).
+        yq_query!(br#"[{"x":1},{"x":2}]"#, r"del(.[] | .)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert!(arr.is_empty(), "expected [], got {arr:?}");
+            }
+        );
+        yq_query!(br#"{"a":1,"b":2}"#, r"del(.[] | .)",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert!(obj.is_empty(), "expected {{}}, got {obj:?}");
+            }
+        );
+        // `del(.)` alone stays yq's own root-delete rule (#1702: emits
+        // nothing at all, not `null`) -- unaffected by this fix either way,
+        // covered here only to pin that this fix didn't disturb it.
+        yq_query!(br#"{"a":1}"#, r"del(.)",
+            QueryResult::None => {}
         );
     }
 
