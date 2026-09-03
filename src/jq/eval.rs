@@ -12992,9 +12992,16 @@ fn builtin_fromjsonstream<W: Clone + AsRef<[u64]>>(
             // array straight through as real output, so an undecodable
             // string inside it used to silently become `""` instead of
             // raising.
+            //
+            // #2231: `suppress_or_raise`, not a bare `Err(e) =>
+            // QueryResult::Error(e)` -- this arm ignored `optional` where
+            // its own scalar-fallback sibling below already consults it,
+            // an inconsistency with no live-reachable effect today (same
+            // `eval_try`-catches-it-one-level-up reasoning as the rest of
+            // this lineage) but worth closing for its own sake.
             match to_owned(&value) {
                 Ok(v) => QueryResult::Owned(v),
-                Err(e) => QueryResult::Error(e),
+                Err(e) => suppress_or_raise(e, optional),
             }
         }
         // #1820: the Array arm above already raises on a corrupted
@@ -41367,14 +41374,22 @@ fn write_debug_line<S: EvalSemantics>(value: &OwnedValue) {
 /// unchanged.
 fn builtin_debug<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
-    _optional: bool,
+    optional: bool,
 ) -> QueryResult<'_, W> {
     // #1755: to_owned, not to_owned_lossy -- an undecodable value must
     // raise, not silently print/pass through "" in its place.
-    let owned = match to_owned(&value) {
-        Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
-    };
+    //
+    // #2231: `to_owned_or_suppress!`, not a bare `to_owned` match -- `optional`
+    // was previously unused here, so a #1194 malformed-member error (the
+    // non-decode-failure axis `to_owned` can also raise) escaped as an
+    // ordinary, catchable `Error` even under `debug?`/`try debug`. Not
+    // live-reachable today by the same reasoning #2184's own sites weren't
+    // (`eval_try`'s outer catch already suppresses it regardless, verified
+    // for the `try...catch` shape too by
+    // `test_try_catch_handler_still_runs_under_outer_optional_2231`) -- this
+    // is the same defensive-consistency fix, not a behavior change for any
+    // query parseable today.
+    let owned = to_owned_or_suppress!(&value, optional);
     write_debug_line::<S>(&owned);
     QueryResult::Owned(owned)
 }
@@ -41413,13 +41428,11 @@ fn builtin_debug<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 fn builtin_debug_msg<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     msg: &Expr,
     value: StandardJson<'a, W>,
-    _optional: bool,
+    optional: bool,
 ) -> QueryResult<'a, W> {
-    // #1755: see `builtin_debug`'s identical reasoning.
-    let owned = match to_owned(&value) {
-        Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
-    };
+    // #1755/#2231: see `builtin_debug`'s identical reasoning for both the
+    // raise-on-decode-failure rule and the `to_owned_or_suppress!` swap.
+    let owned = to_owned_or_suppress!(&value, optional);
     let flow = eval_each_owned::<S>(msg, &owned, false, &mut |msg_value| {
         write_debug_line::<S>(&msg_value);
         Demand::Continue
@@ -41487,14 +41500,11 @@ fn builtin_halt<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
 /// here alone would be inconsistent — tracked as a separate concern.
 fn builtin_stderr<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
-    _optional: bool,
+    optional: bool,
 ) -> QueryResult<'_, W> {
-    // #1755: to_owned, not to_owned_lossy -- an undecodable value must
-    // raise, not silently print/pass through "" in its place.
-    let owned = match to_owned(&value) {
-        Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
-    };
+    // #1755/#2231: see `builtin_debug`'s identical reasoning for both the
+    // raise-on-decode-failure rule and the `to_owned_or_suppress!` swap.
+    let owned = to_owned_or_suppress!(&value, optional);
     write_stderr_value::<S>(&owned);
     QueryResult::Owned(owned)
 }
@@ -76809,6 +76819,147 @@ mod tests {
             "any",
             QueryResult::Owned(OwnedValue::Bool(b)) => assert!(b)
         );
+    }
+
+    /// #2231 finding 4: `builtin_paths`'s own doc comment argues its unused
+    /// `optional` is a *principled* exemption -- "catchability is handled
+    /// uniformly one level up by `eval_try`" -- but that argument was only
+    /// ever verified for a bare `builtin?`, never for `try builtin catch
+    /// handler` wrapped in its own outer `?` (`(try builtin catch H)?`).
+    /// The worry: `eval_try` passes the *same* `optional` it receives
+    /// straight down into evaluating its own `expr` (`eval_single::<W,
+    /// S>(expr, value, optional)`), so if an outer `?` sets `optional=true`
+    /// for the whole `try...catch` node, a leaf builtin that itself
+    /// consults `optional` (the #2184/#2015 fix shape) could self-suppress
+    /// into `QueryResult::None` *before* ever raising an `Error` --
+    /// bypassing `eval_try`'s own `Error => catch` arm entirely, so `H`
+    /// would silently never run. Verified here that this does **not**
+    /// happen: `tostring` (already #2184-fixed to consult `optional`) on a
+    /// #1194 malformed-member object (`{"a":1,"b"}`, an odd/unpaired last
+    /// member -- the non-decode-failure axis `suppresses()` actually makes
+    /// suppressible, unlike a decode failure) still runs the catch handler
+    /// under an outer `?`. So `builtin_paths`'s reasoning generalizes: the
+    /// whole #1194→#2184 lineage's remaining sites (this issue's findings
+    /// 1-3) are confirmed genuinely non-live-reachable defensive
+    /// consistency, not a latent `try`/`catch` bypass.
+    #[test]
+    fn test_try_catch_handler_still_runs_under_outer_optional_2231() {
+        // Bare, unwrapped: raises the ordinary (suppressible) #1194 error.
+        query!(
+            br#"{"a":1,"b"}"#,
+            "tostring",
+            QueryResult::Error(e) => assert!(!e.is_decode_failure(), "{}", e.message)
+        );
+        // `?` alone: suppressed to nothing, per #2184.
+        query!(br#"{"a":1,"b"}"#, "tostring?", QueryResult::None => {});
+        // `try ... catch H`, no outer `?`: H runs.
+        query!(
+            br#"{"a":1,"b"}"#,
+            r#"try tostring catch "CAUGHT""#,
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(&*s, "CAUGHT")
+        );
+        // The case finding 4 worried about: `try ... catch H` wrapped in its
+        // own outer `?`. `H` must still run -- `tostring`'s own internal
+        // suppression must not fire ahead of `eval_try`'s catch dispatch.
+        query!(
+            br#"{"a":1,"b"}"#,
+            r#"(try tostring catch "CAUGHT")?"#,
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(&*s, "CAUGHT")
+        );
+    }
+
+    /// #2231 findings 1-3: `debug`/`debug(msg)`/`stderr`'s own `_optional`
+    /// (`eval.rs`) and `fromjsonstream`'s Array arm (`eval.rs`) all raised
+    /// an ordinary, suppressible #1194 malformed-member error
+    /// unconditionally, ignoring `optional` where #2184/#2015 already fixed
+    /// the rest of this lineage's sites.
+    ///
+    /// Called directly, like every `#2184`/`#2015` test above -- going
+    /// through `?`/`try` can't distinguish fixed from unfixed here, since
+    /// `eval_try`'s own outer catch already normalizes the *observable*
+    /// result to `None` either way (confirmed by
+    /// `test_try_catch_handler_still_runs_under_outer_optional_2231`,
+    /// finding 4). This test pins the leaf's own `optional`-consulting
+    /// behavior, which #843/#1953's "one level up" defense makes non-live-
+    /// reachable today but still worth keeping correct in its own right.
+    #[test]
+    fn test_debug_stderr_fromjsonstream_respect_optional_2231() {
+        let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+
+        match builtin_debug::<Vec<u64>, JqSemantics>(cursor.value(), true) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match builtin_debug::<Vec<u64>, JqSemantics>(cursor.value(), false) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        match builtin_stderr::<Vec<u64>, JqSemantics>(cursor.value(), true) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match builtin_stderr::<Vec<u64>, JqSemantics>(cursor.value(), false) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        let msg = Expr::Identity;
+        match builtin_debug_msg::<Vec<u64>, JqSemantics>(&msg, cursor.value(), true) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match builtin_debug_msg::<Vec<u64>, JqSemantics>(&msg, cursor.value(), false) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        // `fromjsonstream`'s Array arm, same malformed member one level down.
+        let array_bytes: &[u8] = br#"[{"a":1,"b"}]"#;
+        let array_index = JsonIndex::build(array_bytes);
+        let array_cursor = array_index.root(array_bytes);
+        match builtin_fromjsonstream::<Vec<u64>>(array_cursor.value(), true) {
+            QueryResult::None => {}
+            other => panic!("expected None, got {other:?}"),
+        }
+        match builtin_fromjsonstream::<Vec<u64>>(array_cursor.value(), false) {
+            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// #2231 findings 1-3: a genuine decode failure must still survive
+    /// `optional` for all four sites above -- same rule #2184's own decode-
+    /// failure-survival tests pin for their six sites.
+    #[test]
+    fn test_debug_stderr_fromjsonstream_decode_failure_survives_optional_2231() {
+        let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
+        let index = JsonIndex::build(decode_failure_bytes);
+        let cursor = index.root(decode_failure_bytes);
+
+        match builtin_debug::<Vec<u64>, JqSemantics>(cursor.value(), true) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure()),
+            other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
+        }
+        match builtin_stderr::<Vec<u64>, JqSemantics>(cursor.value(), true) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure()),
+            other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
+        }
+        let msg = Expr::Identity;
+        match builtin_debug_msg::<Vec<u64>, JqSemantics>(&msg, cursor.value(), true) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure()),
+            other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
+        }
+
+        let array_bytes: &[u8] = &b"[\"\xff\xfe\"]"[..];
+        let array_index = JsonIndex::build(array_bytes);
+        let array_cursor = array_index.root(array_bytes);
+        match builtin_fromjsonstream::<Vec<u64>>(array_cursor.value(), true) {
+            QueryResult::Error(e) => assert!(e.is_decode_failure()),
+            other => panic!("expected a decode failure to survive `optional`, got: {other:?}"),
+        }
     }
 
     /// #1989 cluster 3: `builtin_last_stream`'s own doc comment says it
