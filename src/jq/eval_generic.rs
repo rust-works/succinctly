@@ -19299,4 +19299,52 @@ mod tests {
         assert!(control.is_none(), "control: {control:?}");
         assert_eq!(count, 3);
     }
+
+    /// #2261: a trailing stray comma after a real last key (`{"a":1,}`) is
+    /// the same "only checked on exhaustion" shape #1653 already pins above
+    /// for `ended_unpaired`/`delimiter_fault`, extended to
+    /// `DistinctKeyCursors::trailing_gap_ok`. Every real key still reaches
+    /// the sink first (the same "prefix before the fault" contract).
+    #[test]
+    fn each_lazy_keys_iterate_sink_raises_on_trailing_comma_at_exhaustion_2261() {
+        let (count, control) = drive_each(br#"{"a":1,}"#, "keys_unsorted[]");
+        match control {
+            Some(Control::Error(err)) => assert!(
+                err.message.contains("Invalid JSON text"),
+                "message: {}",
+                err.message
+            ),
+            other => panic!("expected Control::Error, got {other:?}"),
+        }
+        assert_eq!(count, 1, "the one real key before the fault");
+    }
+
+    /// #2261: the identical shape, but with a duplicate key ahead of the
+    /// trailing comma (`{"a":1,"b":2,"a":3,}`) -- pins that
+    /// `last_key_cursor` survives a confirmed collapse and still points at
+    /// the object's *textually* last field, not whichever key the
+    /// collapsed walk happened to yield last.
+    #[test]
+    fn each_lazy_keys_iterate_sink_raises_on_trailing_comma_with_duplicate_key_2261() {
+        let (count, control) = drive_each(br#"{"a":1,"b":2,"a":3,}"#, "keys_unsorted[]");
+        match control {
+            Some(Control::Error(err)) => assert!(
+                err.message.contains("Invalid JSON text"),
+                "message: {}",
+                err.message
+            ),
+            other => panic!("expected Control::Error, got {other:?}"),
+        }
+        assert_eq!(count, 2, "both distinct keys before the fault");
+    }
+
+    /// #2261's own early-exit exemption, mirroring #1770's above: a
+    /// truncating consumer never reaches the tail, so it never sees the
+    /// trailing comma either.
+    #[test]
+    fn each_lazy_keys_iterate_sink_early_exit_still_skips_the_trailing_comma_2261() {
+        let (count, control) = drive_each(br#"{"a":1,}"#, "first(keys_unsorted[])");
+        assert!(control.is_none(), "control: {control:?}");
+        assert_eq!(count, 1);
+    }
 }
