@@ -1219,6 +1219,22 @@ fn test_parity_eval_rs_trailing_comma_sibling_gaps_2293() {
     }
 }
 
+/// #2313: `eval.rs`'s `builtin_keys` hardcoded `collapse: false`, no
+/// `S: EvalSemantics` parameter to derive a mode-correct value from --
+/// disagreeing with `eval_generic.rs`'s own `Builtin::Keys`/
+/// `Builtin::KeysUnsorted`, which already collapse via
+/// `S::COLLAPSE_DUPLICATE_KEYS` (`true` in jq mode, matching real jq
+/// 1.7.1: `{"a":1,"a":2} | keys_unsorted` is `["a"]`, confirmed live).
+/// `full_outputs` used `JqSemantics`, so this drift was live for any
+/// library consumer of `jq::eval*` on jq-mode duplicate-key input, not
+/// merely a defensive gap.
+#[test]
+fn test_parity_builtin_keys_collapses_duplicate_keys_2313() {
+    assert_parity(br#"{"a":1,"a":2}"#, "keys");
+    assert_parity(br#"{"a":1,"a":2}"#, "keys_unsorted");
+    assert_parity(br#"{"a":1,"a":2,"b":3,"a":4}"#, "keys_unsorted");
+}
+
 /// `assert_parity` compares only *successful* outputs: `collect_owned`'s
 /// `Error(_) => vec![]` arm swallows the error, so two evaluators that raise
 /// different messages -- or one that raises where the other doesn't -- both
