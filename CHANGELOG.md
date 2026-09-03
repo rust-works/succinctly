@@ -289,6 +289,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`--argjson`/`--jsonargs` rejected a leading-dot (`.5`, #1171) or trailing-dot-before-
+  exponent (`1.e5`, #2220) number literal outright, where real jq's own number parser
+  accepts both** (#2240 Gap 2): a `--argjson`/`--jsonargs` value needing either leniency
+  failed `serde_json`'s strict validation gate with no retry, unlike plain document input
+  (which already tolerates both). Fixed via a new `normalize_dot_leniency` sibling to
+  #1094's own `normalize_leading_zero_numbers`, composed into the same
+  `normalize_json_leniently` retry pass shared by `--argjson`'s validator, `--seq`'s own
+  per-value check, and yq mode's own `--argjson` — so all three pick up the fix at once,
+  and a value needing more than one leniency at once (e.g. `007.e5`) still gets all of
+  them, matching #2012's own "compose, don't chain independent retries" precedent. A
+  bare `.`/`-.` with digits on *neither* side is still correctly rejected — not a number
+  under any leniency, real jq included — caught by review before merge, since a first
+  draft unconditionally synthesized `0`s around any dot it saw, silently "fixing" a
+  genuinely malformed bare `.` into the valid number `0.0`.
+  Gap 1 in the same issue (an array-navigated `tostring`/`@json` losing an
+  overflow-literal's exact spelling) was investigated and found **not reproducible** on
+  current `main` — both the root-level and array-navigated paths already agree, deferring
+  identically to #1083/#1075's own earlier, deliberate policy of never preserving an
+  infinite-magnitude `NumberLiteral`'s spelling in jq mode (the reindex bridge's own
+  `1e999`/`-1e999` smuggling sentinel for a genuinely *computed* infinity is
+  bit-for-bit indistinguishable from a real document literal of the same spelling once
+  round-tripped, so reformatting either would risk mislabeling the other) — the issue's
+  own "root-level path already matches" claim appears to have been stale by the time this
+  was picked up.
 - **`del()`/`delpaths()` silently no-op on a negative out-of-range array index instead of
   raising** (#2268): #2254 already fixed every ordinary *read* (`.a[-N]`) to raise real yq's
   own "index [N] out of range" error, but `del()`/`delpaths()` shared the identical gap with a

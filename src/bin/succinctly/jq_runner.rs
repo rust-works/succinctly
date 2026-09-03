@@ -3094,13 +3094,14 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
 }
 
 /// Apply every leniency real jq allows that `serde_json`'s own validation
-/// doesn't (#1094's leading zero, #2012's lone low surrogate) in one
-/// composed pass, so a value needing more than one at once still gets all
-/// of them -- code review on #2012: `parse_json_value` and its `--seq`
-/// counterpart `seq_value_is_valid` each once applied the two
-/// normalizations independently against the untouched original, which
-/// missed exactly the value-needs-both case (`[007,"\udc00"]`). A no-op
-/// on text neither normalizer finds anything to fix in.
+/// doesn't (#1094's leading zero, #2012's lone low surrogate, #2240's
+/// leading/trailing decimal point) in one composed pass, so a value
+/// needing more than one at once still gets all of them -- code review on
+/// #2012: `parse_json_value` and its `--seq` counterpart `seq_value_is_valid`
+/// each once applied the two normalizations independently against the
+/// untouched original, which missed exactly the value-needs-both case
+/// (`[007,"\udc00"]`). A no-op on text neither normalizer finds anything to
+/// fix in.
 ///
 /// This grows one normalizer per leniency rather than trusting a grammar
 /// that already agrees with this crate's own decoder -- `parse_json_stream`
@@ -3109,8 +3110,11 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
 /// getting every leniency for free with no per-case enumeration), at the
 /// cost of losing `validate_json_str`'s magnitude-overflow rejection
 /// (`1e400`, #1095) that motivated using `serde_json::Value` here in the
-/// first place. Worth revisiting if a third leniency shows up (#2012 code
-/// review, altitude angle).
+/// first place. #2240 is the "third leniency" this doc comment used to say
+/// would be worth revisiting for (#2012 code review, altitude angle) --
+/// still grown as one more composed normalizer rather than switching
+/// shapes, since the alternative's own cost (losing the overflow rejection)
+/// hasn't changed.
 ///
 /// `pub(crate)`: as of #2051, called from three sites total --
 /// `parse_json_value` and `seq_value_is_valid` in this file, plus
@@ -3122,7 +3126,7 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
 /// the same input the way they did between #1094/#2012 landing here and
 /// yq's copy not getting either fix.
 pub(crate) fn normalize_json_leniently(s: &str) -> String {
-    normalize_lone_low_surrogates(&normalize_leading_zero_numbers(s))
+    normalize_lone_low_surrogates(&normalize_dot_leniency(&normalize_leading_zero_numbers(s)))
 }
 
 /// Whether `bytes[i..]` starts with a JSON `\uXXXX` escape -- if so, its
@@ -3409,6 +3413,127 @@ fn normalize_leading_zero_numbers(s: &str) -> String {
         i += 1;
     }
     String::from_utf8(out).expect("only ever copies s's own bytes verbatim or drops leading ASCII '0' digits, never splits a multi-byte sequence")
+}
+
+/// Repair the two other number-token leniencies real jq's own parser
+/// accepts that strict RFC 8259 JSON (`serde_json`) doesn't (#2240, a
+/// follow-up to #1094's leading-zero fix above, found while verifying
+/// #2220): a **leading** decimal point with no integer digit before it
+/// (`.5` -> `0.5`, `-.5` -> `-0.5`, #1171), and a **trailing** decimal
+/// point with no fraction digit after it, whether or not an exponent
+/// follows (`1.` -> `1.0`, `1.e5` -> `1.0e5`, #2220). Both are already
+/// tolerated on the crate's own document-input path (`json::light`'s
+/// number decoder); this repairs just the `--argjson`/`--jsonargs`
+/// validation-retry gap, the same shape #1094 already closed for leading
+/// zeros.
+///
+/// Written as its own scan rather than reusing [`find_number_end`]: that
+/// function's own doc comment explicitly documents it never sees a bare
+/// leading `.` (its caller only invokes it when the byte at `pos` is `-`
+/// or an ASCII digit) and has no way to report "the fraction had zero
+/// digits" separately from "there was no fraction at all" -- both
+/// properties this repair needs. A fifth independent number-token scanner
+/// in this crate (#1218's own survey already counted four before this
+/// one), consistent with that issue's own conclusion that blanket
+/// consolidation needs its own design pass rather than forcing one more
+/// caller's genuinely different grammar onto an existing scanner.
+fn normalize_dot_leniency(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' {
+            let end = find_string_end(bytes, i).unwrap_or(bytes.len());
+            out.extend_from_slice(&bytes[i..end]);
+            i = end;
+            continue;
+        }
+        // A lenient number token starts at `i` iff, past an optional sign,
+        // the next byte is a digit (an ordinary token) or `.` itself (the
+        // leading-dot leniency) -- for any other `b` (including a bare `-`
+        // with no digit or dot after it, e.g. `[-,1]`) this is false and
+        // the byte is copied through unexamined below, same as
+        // `normalize_leading_zero_numbers`'s "bare `-`" case.
+        let sign_len = usize::from(b == b'-');
+        let after_sign = i + sign_len;
+        let starts_number = after_sign < bytes.len()
+            && (bytes[after_sign].is_ascii_digit() || bytes[after_sign] == b'.');
+        if !starts_number {
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        // Scan the full token first, without writing anything -- a `.`
+        // with digits on *neither* side (a bare `.`, or `-.` alone) is not
+        // a number at all, real jq's own leniency included, and must be
+        // left untouched for `serde_json`'s retried validation to reject
+        // exactly as before (confirmed live: `--argjson x '.'` still
+        // raises in real jq; an earlier draft here that wrote `0`/`.`/`0`
+        // unconditionally as int/dot/frac were each seen "fixed" a bare
+        // `.` into `0.0`, silently accepting genuinely invalid input).
+        let start = i;
+        let mut scan = after_sign;
+        let int_start = scan;
+        while scan < bytes.len() && bytes[scan].is_ascii_digit() {
+            scan += 1;
+        }
+        let has_int_digits = scan > int_start;
+        let has_dot = scan < bytes.len() && bytes[scan] == b'.';
+        let frac_start = if has_dot { scan + 1 } else { scan };
+        let mut frac_end = frac_start;
+        if has_dot {
+            while frac_end < bytes.len() && bytes[frac_end].is_ascii_digit() {
+                frac_end += 1;
+            }
+        }
+        let has_frac_digits = frac_end > frac_start;
+        // `has_int_digits` or `has_dot` is always true here (`starts_number`
+        // above already confirmed `bytes[after_sign]` is a digit or `.`,
+        // and this scan reaches `bytes[after_sign]` unconditionally as
+        // either the first digit consumed or the dot itself).
+        if !has_int_digits && !has_frac_digits {
+            // Bare `.`/`-.`: not a number under any leniency. Copy just
+            // the sign/dot byte and let the next iteration(s) handle
+            // whatever follows on their own terms.
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        out.extend_from_slice(&bytes[start..scan]);
+        if !has_int_digits {
+            // Leading-dot case (#1171).
+            out.push(b'0');
+        }
+        if has_dot {
+            out.push(b'.');
+            if has_frac_digits {
+                out.extend_from_slice(&bytes[frac_start..frac_end]);
+            } else {
+                // Trailing-dot case (#2220): no fraction digit before the
+                // token ends or an exponent begins.
+                out.push(b'0');
+            }
+        }
+        let mut exp_scan = frac_end;
+        // Exponent, if any -- copied verbatim, including a dangling marker
+        // with no digits after it (`1e`), the same leniency
+        // `find_number_end` extends and leaves for `serde_json`'s
+        // re-validation to reject on its own terms.
+        if exp_scan < bytes.len() && (bytes[exp_scan] == b'e' || bytes[exp_scan] == b'E') {
+            let exp_start = exp_scan;
+            exp_scan += 1;
+            if exp_scan < bytes.len() && (bytes[exp_scan] == b'+' || bytes[exp_scan] == b'-') {
+                exp_scan += 1;
+            }
+            while exp_scan < bytes.len() && bytes[exp_scan].is_ascii_digit() {
+                exp_scan += 1;
+            }
+            out.extend_from_slice(&bytes[exp_start..exp_scan]);
+        }
+        i = exp_scan;
+    }
+    String::from_utf8(out).expect("only ever copies s's own bytes verbatim or inserts an ASCII '0' around an existing '.', never splits a multi-byte sequence")
 }
 
 /// Parse a JSON stream (multiple JSON values) from a string. Backs both

@@ -806,6 +806,105 @@ fn test_argjson_negative_leading_zero_when_nested_1094() -> Result<()> {
     Ok(())
 }
 
+// -----------------------------------------------------------------------
+// #2240 (Gap 2): `--argjson`/`--jsonargs` now tolerate the same
+// leading-dot (`.5`, #1171) and trailing-dot-before-exponent (`1.e5`,
+// #2220) leniencies real jq's own number parser already accepts, via a
+// new `normalize_dot_leniency` sibling to `normalize_leading_zero_numbers`
+// (both composed together in `normalize_json_leniently`). All cases
+// live-verified against jq 1.7.1.
+// -----------------------------------------------------------------------
+
+/// The issue's own leading-dot repro, positive and negative.
+#[test]
+fn test_argjson_tolerates_leading_dot_2240() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-n", "--argjson", "n", ".5", "$n"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "0.5");
+
+    let (stdout, _, code) = run_jq_full(&["-n", "--argjson", "n", "-.5", "$n"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "-0.5");
+    Ok(())
+}
+
+/// The issue's own trailing-dot-before-exponent repro, plus the bare
+/// trailing-dot (no exponent) and signed-exponent variants.
+#[test]
+fn test_argjson_tolerates_trailing_dot_before_exponent_2240() -> Result<()> {
+    for (value, expected) in [
+        ("1.e5", "1E+5"),
+        ("-1.e5", "-1E+5"),
+        ("1.e-5", "0.00001"),
+        ("1.", "1"),
+    ] {
+        let (stdout, _, code) = run_jq_full(&["-n", "--argjson", "n", value, "$n"], None)?;
+        assert_eq!(code, 0, "value {value:?}");
+        assert_eq!(stdout.trim_end(), expected, "value {value:?}");
+    }
+    Ok(())
+}
+
+/// A value needing *both* the leading-zero (#1094) and trailing-dot
+/// (#2240) leniency at once, the same "needs more than one normalizer"
+/// shape #2012's own review caught for the leading-zero/low-surrogate
+/// pair -- confirms the three normalizers still compose correctly now
+/// that there are three of them.
+#[test]
+fn test_argjson_leading_zero_and_trailing_dot_combined_2240() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-n", "--argjson", "n", "007.e5", "$n"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "7E+5");
+    Ok(())
+}
+
+/// A leading/trailing dot leniency nested inside an array, not just a
+/// bare top-level scalar -- mirrors `test_argjson_leading_zero_tolerated_when_nested_1094`.
+#[test]
+fn test_argjson_dot_leniency_tolerated_when_nested_2240() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-cn", "--argjson", "n", "[.5, 1.e5]", "$n"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "[0.5,1E+5]");
+    Ok(())
+}
+
+/// Regression guard (found by review before merge): a bare `.` or `-.`
+/// with digits on *neither* side is not a number under any leniency --
+/// real jq still rejects it outright, and an earlier draft here
+/// unconditionally synthesized `0`s around whatever dot it saw, which
+/// wrongly "fixed" a bare `.` into the valid number `0.0` and let this
+/// genuinely malformed input silently materialize instead of erroring.
+#[test]
+fn test_argjson_bare_dot_rejected_not_fabricated_into_zero_2240() -> Result<()> {
+    for value in [".", "-."] {
+        let (_, _, code) = run_jq_full(&["-n", "--argjson", "n", value, "$n"], None)?;
+        assert_ne!(code, 0, "value {value:?}");
+    }
+    Ok(())
+}
+
+/// Digits that merely *look* like a leading/trailing-dot number, but are
+/// actually inside a string, are left completely untouched -- mirrors
+/// `test_argjson_leading_zero_inside_string_or_key_untouched_1094`.
+#[test]
+fn test_argjson_dot_leniency_inside_string_untouched_2240() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-n", "--argjson", "n", r#""a.5b""#, "$n"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), r#""a.5b""#);
+    Ok(())
+}
+
+/// A normal number with no leading/trailing dot at all is completely
+/// unaffected -- confirms the fast path (strict validation succeeds on
+/// the first try) isn't disturbed by this fix.
+#[test]
+fn test_argjson_normal_number_unaffected_by_dot_leniency_2240() -> Result<()> {
+    let (stdout, _, code) = run_jq_full(&["-n", "--argjson", "n", "1.5", "$n"], None)?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1.5");
+    Ok(())
+}
+
 // --- #1150: clap rejected any negative-number (or other hyphen-prefixed)
 // --argjson/--arg/--slurpfile/--rawfile VALUE before it ever reached this
 // crate's own JSON-content validation -- fixed via `allow_hyphen_values`
