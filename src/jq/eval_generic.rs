@@ -151,45 +151,110 @@ pub fn check_nesting_depth(depth: usize) -> Result<(), EvalError> {
     }
 }
 
-/// Depth-only sibling of `to_owned_at_depth` (#2299).
+/// Checked sibling of [`to_owned`] (#2299): identical materialization
+/// logic, `check_nesting_depth` (catchable) in place of
+/// `assert_nesting_depth` (panic).
 ///
-/// Walks the identical object/array recursion shape, but only to answer
-/// whether `to_owned` would panic on this value -- no materialization, no
-/// key decoding, no delimiter validation. For a caller that already holds
-/// a `V`-typed filter-output value (not raw input bytes, so
-/// `jq_runner.rs`'s own `validate_json_delimiters`/`check_nesting_depth`
-/// pairing doesn't apply) and needs `to_owned`'s hot-path panic converted
-/// into a catchable error at one specific CLI-output boundary, without
-/// taking on a second, fuller copy of `to_owned_at_depth`'s own
-/// materialization logic (the far heavier route `yq_runner.rs`'s
-/// `to_owned_canonicalizing_numbers_at_depth` takes, justified there by the
-/// genuinely different number-canonicalizing work it also does -- this
-/// caller needs nothing else).
-///
-/// `--slurp`'s own re-wrapping of its whole input in one more array level
-/// (`materialize_stream_item`'s only caller today) means a value that
-/// reaches here can be one level deeper than whatever originally cleared
-/// `check_nesting_depth`'s own input-parsing guard, so this cannot assume
-/// the value is already known-shallow and skip the walk.
-pub fn check_value_nesting_depth<V: DocumentValue>(
+/// For the one call site (`materialize_stream_item`'s CLI-output boundary,
+/// `jq_runner.rs`) that isn't the evaluator's own hot-path recursion and
+/// already threads a `Result` to receive a clean error on instead of a
+/// panic. A fused, single-walk duplicate rather than a lightweight
+/// depth-only pre-check run ahead of `to_owned` (an earlier revision of
+/// this fix took that approach): `materialize_stream_item` is reached by
+/// every ordinary `succinctly jq` invocation's default per-document output
+/// path, not just `--slurp` -- a pre-check would silently double the
+/// materialization cost of every `.`-style query, this codebase's single
+/// most benchmarked shape (see this crate's own `CLAUDE.md` performance
+/// tables), for the sake of a guard that only ever fires past 256 levels
+/// of nesting. Mirrors `yq_runner.rs`'s own
+/// `to_owned_canonicalizing_numbers_at_depth`, the established precedent
+/// for this exact "same recursion shape, panic swapped for a checked
+/// guard" duplication -- accepting the same drift risk that precedent
+/// already accepts, in exchange for the same zero-added-walk cost.
+pub fn to_owned_checked<V: DocumentValue>(value: &V) -> Result<OwnedValue, EvalError> {
+    to_owned_checked_at_depth(value, 0)
+}
+
+fn to_owned_checked_at_depth<V: DocumentValue>(
     value: &V,
     depth: usize,
-) -> Result<(), EvalError> {
+) -> Result<OwnedValue, EvalError> {
     check_nesting_depth(depth)?;
     if let Some(fields) = value.as_object() {
+        let mut map = IndexMap::new();
+        let mut guard = DisplayKeyGuard::default();
         let mut f = fields;
+        let mut is_first = true;
+        let mut last_field: Option<V::Cursor> = None;
         while let Some((field, rest)) = f.uncons() {
-            check_value_nesting_depth(&field.value, depth + 1)?;
+            let Some(key) = resolve_display_key(&field.key, &map, &mut guard)? else {
+                return Err(f.malformed_member_error());
+            };
+            if !key_delimiter_ok::<V::Fields>(&field.key, &field.key_cursor, is_first)
+                || !value_delimiter_ok::<V::Fields>(Some(&field.value), &field.value_cursor)
+            {
+                return Err(f.malformed_member_error());
+            }
+            map.insert(key, to_owned_checked_at_depth(&field.value, depth + 1)?);
+            last_field = Some(field.value_cursor);
             f = rest;
+            is_first = false;
         }
+        if f.ends_unpaired() {
+            return Err(f.malformed_member_error());
+        }
+        if let Some(last) = &last_field {
+            if !trailing_element_gap_ok(last, b'}') {
+                return Err(last.malformed_delimiter_error());
+            }
+        }
+        Ok(OwnedValue::Object(map))
     } else if let Some(elements) = value.as_array() {
+        let mut items = Vec::new();
         let mut elems = elements;
+        let mut is_first = true;
+        let mut last_elem: Option<V::Cursor> = None;
         while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
-            check_value_nesting_depth(&elem_cursor.value(), depth + 1)?;
+            if let Some(pos) = elem_cursor.text_position() {
+                let expected = if is_first { None } else { Some(b',') };
+                if !elem_cursor.preceding_delimiter_ok(pos, expected) {
+                    return Err(elem_cursor.malformed_delimiter_error());
+                }
+            }
+            items.push(to_owned_checked_at_depth(&elem_cursor.value(), depth + 1)?);
+            last_elem = Some(elem_cursor);
             elems = rest;
+            is_first = false;
         }
+        if let Some(last) = &last_elem {
+            if !trailing_element_gap_ok(last, b']') {
+                return Err(last.malformed_delimiter_error());
+            }
+        }
+        Ok(OwnedValue::Array(items))
+    } else if value.is_null() {
+        Ok(OwnedValue::Null)
+    } else if let Some(b) = value.as_bool() {
+        Ok(OwnedValue::Bool(b))
+    } else if let Some(literal) = value.number_literal() {
+        Ok(OwnedValue::from_number_literal(&literal))
+    } else if let Some(i) = value.as_i64() {
+        Ok(OwnedValue::Int(i))
+    } else if let Some(f) = value.as_f64() {
+        Ok(OwnedValue::Float(f))
+    } else if let Some(s) = value.as_str() {
+        Ok(OwnedValue::String(s.into_owned()))
+    } else if let Some(reason) = value.string_decode_error() {
+        Err(EvalError::decode_failure(reason))
+    } else if value.is_error() {
+        Err(EvalError::decode_failure(
+            value
+                .error_message()
+                .unwrap_or("malformed value in document"),
+        ))
+    } else {
+        Ok(OwnedValue::Null)
     }
-    Ok(())
 }
 
 /// Convert a DocumentValue to an OwnedValue.
@@ -11450,6 +11515,82 @@ mod tests {
                 OwnedValue::from_number_literal("1")
             )]))
         );
+    }
+
+    /// #2299 code review: `to_owned_checked_at_depth`'s recursion shape must
+    /// answer the depth question identically to `to_owned_at_depth`'s own
+    /// panicking guard, on both branches it mirrors. This pins the array
+    /// branch: `to_owned` panics on 256-deep nesting (the guard this
+    /// function stands in for), `to_owned_checked` reports a clean error
+    /// instead, at the exact same boundary.
+    #[test]
+    fn test_to_owned_checked_reports_clean_error_past_nesting_limit_2299() {
+        use crate::json::JsonIndex;
+        let json = format!("{}1{}", "[".repeat(256), "]".repeat(256));
+        let json = json.as_bytes();
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let err =
+            to_owned_checked(&value).expect_err("256 levels of array nesting exceeds the limit");
+        assert!(
+            err.message.contains("nesting depth exceeds limit of 256"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    /// Companion to the test above: legitimately-nested input well under
+    /// the limit must still materialize normally through the checked path.
+    #[test]
+    fn test_to_owned_checked_accepts_nesting_under_limit_2299() {
+        use crate::json::JsonIndex;
+        let json = format!("{}1{}", "[".repeat(100), "]".repeat(100));
+        let json = json.as_bytes();
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        to_owned_checked(&value).expect("100 levels of array nesting is well under the limit");
+    }
+
+    /// #2299 code review: the array branch alone doesn't exercise
+    /// `to_owned_checked_at_depth`'s object branch (`as_object`/`uncons`,
+    /// recursing on `field.value`) -- a future edit that only breaks that
+    /// branch (e.g. recursing on `field.key` instead, or dropping
+    /// `depth + 1`) would pass every other test in this file, since none of
+    /// them build a deeply *object*-nested document. Pinned here with the
+    /// object-shaped analog of the two tests above.
+    #[test]
+    fn test_to_owned_checked_object_branch_reports_clean_error_past_nesting_limit_2299() {
+        use crate::json::JsonIndex;
+        let json = format!("{}1{}", "{\"a\":".repeat(256), "}".repeat(256));
+        let json = json.as_bytes();
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let err =
+            to_owned_checked(&value).expect_err("256 levels of object nesting exceeds the limit");
+        assert!(
+            err.message.contains("nesting depth exceeds limit of 256"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    /// Object-branch companion to the under-limit array test above.
+    #[test]
+    fn test_to_owned_checked_object_branch_accepts_nesting_under_limit_2299() {
+        use crate::json::JsonIndex;
+        let json = format!("{}1{}", "{\"a\":".repeat(100), "}".repeat(100));
+        let json = json.as_bytes();
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let owned =
+            to_owned_checked(&value).expect("100 levels of object nesting is well under the limit");
+        // Not just "didn't error" -- confirm the object branch actually
+        // materialized real content, not an early-exit stub.
+        assert!(matches!(owned, OwnedValue::Object(_)));
     }
 
     /// #2231 finding 3: `Builtin::ToString`'s own dedicated arm and the
