@@ -3761,15 +3761,23 @@ fn colorize_yaml(yaml: &str, terminator: Terminator, boundaries: &[usize]) -> St
 ///
 /// On the initial strict parse's failure, retries against
 /// `jq_runner::normalize_json_leniently`'s output (#1094's leading zero,
-/// #2012's lone low surrogate) -- the same two leniencies `succinctly jq`'s
-/// own `--argjson` already accepts (yq mode has no `--jsonargs` at all, see
-/// `build_args_var` below), shared from one definition rather than a
-/// second, independently-maintained copy (#2051: before this, the two
-/// modes had silently drifted apart on this exact input). Reparsing the
-/// *normalized* text directly (not the original, unlike `jq_runner`'s
-/// retry) is sufficient here precisely because this function already
-/// discards number fidelity -- there is no original spelling left to
-/// preserve. That includes *magnitude*, not just cosmetic spelling, for an
+/// #2012's lone low surrogate, #2240's leading/trailing decimal point) --
+/// the same leniencies `succinctly jq`'s own `--argjson` already accepts
+/// (yq mode has no `--jsonargs` at all, see `build_args_var` below), shared
+/// from one definition rather than a second, independently-maintained copy
+/// (#2051: before this, the two modes had silently drifted apart on this
+/// exact input). Reparsing the *normalized* text directly (not the
+/// original, unlike `jq_runner`'s own retry) is sufficient here precisely
+/// because this function already discards number fidelity -- there is no
+/// original spelling left to preserve. This is also exactly what made this
+/// function the one place #2240's own composition-order bug was reachable:
+/// `normalize_json_leniently` composing `normalize_dot_leniency` after,
+/// rather than before, `normalize_leading_zero_numbers` corrupted `.05`
+/// into `.5` before this function ever saw it, silently materializing
+/// `0.5` -- ten times too large -- since this function reparses that
+/// corrupted copy directly. `jq_runner::parse_json_value` never observed
+/// the same corruption, since it always materializes the *original* `s`
+/// regardless of what the normalized copy says. That includes *magnitude*, not just cosmetic spelling, for an
 /// integer too large for `f64` to represent exactly: stripping a leading
 /// zero from `0099999999999999999999999` now reaches the same lossy
 /// `serde_json_to_owned` path a plain `99999999999999999999999` (no

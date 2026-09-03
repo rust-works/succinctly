@@ -327,6 +327,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kept rather than risking silent data corruption for a shape #2220's own scope
   (trailing-dot-*before-exponent*) never actually asked for.
 
+  A third review round found a **critical** bug the second round's fix introduced:
+  `succinctly yq --argjson x '.05' '.b = $x'` returned `0.5` — ten times too large.
+  `normalize_json_leniently` composed `normalize_dot_leniency` *after*
+  `normalize_leading_zero_numbers`, whose own number-token-start detection can't see a
+  preceding dot — fed `.05` first, it starts a fresh scan right at the `0` after the dot
+  and mistakes the fraction's own leading zero for a redundant *integer* leading zero,
+  stripping it (`.05` → `.5`) before the dot-leniency pass ever runs. Invisible to jq
+  mode's own tests, since `jq_runner.rs`'s own `parse_json_value` only uses the normalized
+  text as a validation gate and always materializes the *original* text — but
+  `yq_runner.rs`'s own `parse_json_value` reparses the *normalized* text directly as the
+  value (by design, since yq's `--argjson` already discards number fidelity), making it
+  the one place this composition-order bug was reachable. Fixed by reordering the
+  composition: `normalize_dot_leniency` now runs *before*
+  `normalize_leading_zero_numbers`, so a leading-dot token already has its synthesized `0`
+  in front by the time the zero-stripper runs, and its integer part is never empty for the
+  stripper to misinterpret. Verified with 500+ adversarial combinations of all three
+  leniencies, in both jq and yq mode, across `--argjson`/`--jsonargs`/`--seq`.
+
   Gap 1 in the same issue (an array-navigated `tostring`/`@json` losing an
   overflow-literal's exact spelling) was investigated and found **not reproducible** on
   current `main` — both the root-level and array-navigated paths already agree, deferring

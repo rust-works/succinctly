@@ -1401,6 +1401,24 @@ fn test_seq_composes_leading_zero_and_low_surrogate_fixes_2012() -> Result<()> {
     Ok(())
 }
 
+/// #2240: `--seq` shares the same leading/trailing-dot leniency
+/// `--argjson`/`--jsonargs` gained, through the identical
+/// `seq_value_is_valid`/`normalize_json_leniently` path #2012's own tests
+/// above already exercise for the other two leniencies. Also composes with
+/// a leading zero in the same value (`.05` sharing a record with `007`),
+/// mirroring the #2012 composed-fix regression guard just above.
+#[test]
+fn test_seq_accepts_dot_leniency_2240() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["--seq", "-c", "."], Some("\x1e.05\n"))?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim_end(), "\x1e0.05", "stdout: {stdout:?}");
+
+    let (stdout, stderr, code) = run_jq_full(&["--seq", "-c", "."], Some("\x1e007.e5\n"))?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim_end(), "\x1e7E+5", "stdout: {stdout:?}");
+    Ok(())
+}
+
 /// A hyphen-prefixed `--slurpfile`/`--rawfile` FILE value must reach this
 /// crate's own file-open logic, not get rejected by clap as an unknown
 /// flag first (#1150, same `allow_hyphen_values` fix as `--arg`/
