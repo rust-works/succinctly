@@ -1744,6 +1744,67 @@ against each (`{"a":[1,2,3,]} | if .a then ... end`;
 something upstream of either function already validates for the shapes
 tried. Not chased further given no live reproduction.
 
+## `has(key)`/`contains()` and `find()` get two more pre-existing gaps closed (#2288)
+
+Code review of #1995/PR #2287 found two further, unrelated gaps, both predating that PR:
+
+**1. `has(key)`/`contains()` didn't raise on a non-string sibling key at all** (not the
+trailing-comma shape #2261 above fixes -- a genuinely different malformed-JSON class,
+#1194/#1995's own `key_is_malformed`):
+
+```
+$ echo '{"a":1,123:2}' | jq  -c 'has("a")'   # parse error, exit 5
+$ echo '{"a":1,123:2}' | sjq -c 'has("a")'   # true, exit 0 -- was WRONG before this fix
+```
+
+Fixed the same way #2261's own `has(key)` fix was shaped: `contains_checked`'s existing
+per-key walk (already checking `,`/`:` delimiters for #1677) now also checks
+`key_is_malformed` on every key it visits -- free, since it's the identical walk, not an
+added pass. That "visits" qualifier matters: **a malformed key strictly *after* the match
+is the same class of accepted early-exit gap #2261 already established for the trailing
+comma**, and for the identical reason -- there is no O(1) shortcut from the matched key's
+own cursor to "is there a malformed key anywhere else in this object," unlike the trailing
+gap (a single, fixed, cheaply-reachable position). Closing it in general would mean
+walking to the object's true end on every `has()` call, the exact ~4x regression #2261's
+own `has(key)` fix (documented above) already measured and rejected.
+
+```
+$ echo '{123:1,"a":2}' | jq  -c 'has("a")'   # parse error, exit 5
+$ echo '{123:1,"a":2}' | sjq -c 'has("a")'   # parse error, exit 5 -- fixed: bad key visited before the match
+$ echo '{"a":1,123:2}' | jq  -c 'has("a")'   # parse error, exit 5
+$ echo '{"a":1,123:2}' | sjq -c 'has("a")'   # true, exit 0 -- still a known gap: bad key visited after the match
+$ echo '{"z":1,123:2}' | sjq -c 'has("a")'   # parse error, exit 5 -- no match, so the walk reaches 123 regardless
+```
+
+So this issue's own headline repro (`{"a":1,123:2} | has("a")`) is **not** fully closed --
+only the general class (a non-string key existing at all) is now caught in every case
+except "the match itself happens to come first." Recorded here rather than left as an
+unstated side effect of the fix, matching how #2261's own `has(key)` fix above documents
+its identical trade-off.
+
+**2. `JsonFields::find` (unlike its `find_cursor` sibling) had no #1677 delimiter check at
+all** -- a missing `:` before the winning occurrence's value used to slip through
+silently (`find("a")` on `{"a" 1}` returned `Ok(Some(1))` with no error, where
+`find_cursor("a")` on the identical document already correctly raised). Fixed by deferring
+the same `preceding_gap_ok` check `find_cursor` already runs to the actual winning
+occurrence (last-duplicate-key-wins), reusing the exact check rather than re-deriving it
+(#106).
+
+**Confirmed not reachable from either shipped CLI**, the identical "library-API-only, inert
+for genuine JSON input via either CLI" shape #2293 already established for `eval.rs`'s
+whole parallel evaluator: `find`'s only production caller is `eval.rs`'s `find_field`/
+`index_object_by_name` (`.field` navigation in that evaluator), and `eval.rs` itself is
+only ever reached, from either CLI, via `succinctly yq`'s `evaluate_input`/
+`eval_owned_with_file_index` -- both of which hand it a cursor re-serialized from an
+already-materialized `OwnedValue`, which can never contain a missing `:` regardless of
+query (confirmed live: `succinctly yq --input-format json --slurp/--eval-all` on
+`{"a" 1}` already raises during the initial parse, before `find` is ever reached). Real
+only for a library consumer building their own cursor directly from raw, unvalidated
+document bytes. Fixed anyway (unlike #2293's own eval.rs gaps, left as a follow-up) because
+the change is narrow, mechanical, and reuses an existing, already-proven check within the
+same file -- not the broader, riskier `eval.rs`-wide sweep #2293 recommends as its own
+issue.
+
 ## Refusing an allocation jq does not survive
 
 `setpath` takes its array index from the document, so the array it pads is sized by the

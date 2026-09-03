@@ -289,6 +289,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`has(key)`/`contains()` on objects didn't raise on a non-string sibling key
+  (`{"a":1,123:2}`), and `JsonFields::find` (unlike its `find_cursor` sibling) had no #1677
+  `,`/`:` delimiter check at all** (#2288, found reviewing #1995/PR #2287): `has(key)`'s
+  `DocumentFields::contains_checked` (already checking `,`/`:` delimiters and #2261's own
+  trailing-comma gap) now also checks `key_is_malformed` on every key it visits during its
+  existing early-exit walk — free, riding the same walk, but only for keys visited *before*
+  a match (the identical #2261-established "early exit legitimately misses a later fault"
+  trade, since there's no O(1) shortcut to "is there a malformed key anywhere else in this
+  object" the way there is for the trailing gap's single fixed position); see
+  `docs/compliance/jq/limitations.md` for the full accounting, including this issue's own
+  headline repro (`{"a":1,123:2} | has("a")`) remaining a documented, accepted gap. `find`
+  gained the same deferred-to-the-winner `,`/`:` check `find_cursor` already had, reusing it
+  rather than re-deriving it — confirmed not reachable from either shipped CLI today (same
+  "library-API-only" shape as #2293's `eval.rs` gaps), fixed anyway since it's narrow,
+  mechanical, and reuses an existing, already-proven check within the same file.
 - **`succinctly jq`'s most common query idioms -- `.[]`, `keys`/`keys_unsorted`, bare `.a`
   field access, `length`, `.[0]` -- silently accepted a trailing stray `,` after a real last
   array/object child** (#2261): `echo '[1,]' | succinctly jq -c '.[]'` printed `1` at exit 0,

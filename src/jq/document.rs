@@ -988,6 +988,22 @@ pub trait DocumentFields: Sized + Clone {
     /// gaps `contains` never checked at all, not the separate, already-
     /// accepted "isn't full behavioral parity with `keys`" divergence
     /// `contains`'s own doc comment describes.
+    ///
+    /// **#2288: a non-string sibling key (`{"a":1,123:2}`, #1194/#1995's own
+    /// `key_is_malformed`) is caught only when visited *before* the match**
+    /// -- exactly the same early-exit trade as the trailing-comma case
+    /// above, and for the identical reason: detecting a non-string key
+    /// *anywhere* in the object (not just at a fixed, cheaply-reachable
+    /// position like "the object's real last field") has no O(1) shortcut
+    /// from the matched key's own cursor, so catching one strictly *after*
+    /// the match would mean walking past the match regardless -- the exact
+    /// cost #1739 exists to avoid. `{"a":1,123:2} | has("a")` (this issue's
+    /// own headline repro) therefore still answers `true` rather than
+    /// raising, since "a" is visited *before* 123 ever is; `{123:1,"a":2} |
+    /// has("a")` does now correctly raise, since 123 is visited first. A
+    /// non-match still walks to the object's true end regardless (the
+    /// existing shape `contains` itself already has), so every sibling key
+    /// is checked there, match-position dependence and all.
     fn contains_checked(&self, name: &str) -> Result<bool, EvalError> {
         let mut fields = self.clone();
         let mut is_first = true;
@@ -997,10 +1013,18 @@ pub trait DocumentFields: Sized + Clone {
         // check is free, unlike the early-exit match path above.
         let mut last_key_cursor: Option<Self::Cursor> = None;
         while let Some((key, key_cursor, rest)) = fields.uncons_key() {
-            // #1677: cheap per-key checks, riding the walk `contains`
+            // #1677/#2288: cheap per-key checks, riding the walk `contains`
             // already makes regardless of early exit -- no extra cost,
-            // early-exit or not.
-            if !key_delimiter_ok::<Self>(&key, &key_cursor, is_first)
+            // early-exit or not. `key_is_malformed` (#1194/#1995) catches a
+            // key the format's grammar never allowed at all (a non-string
+            // JSON key); the delimiter checks catch a missing/doubled
+            // `,`/`:` around a key that *is* well-shaped. Both only cover
+            // keys actually visited before a match -- see this method's own
+            // doc comment for why a malformed key strictly *after* the
+            // match is a documented, accepted gap, not something this walk
+            // closes.
+            if key_is_malformed(&key)
+                || !key_delimiter_ok::<Self>(&key, &key_cursor, is_first)
                 || !key_only_value_delimiter_ok::<Self>(&key, &key_cursor)
             {
                 return Err(self.malformed_member_error());

@@ -1101,12 +1101,30 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
     /// walks already use for this exact question, rather than a second,
     /// hand-rolled `match` on `StandardJson::String` -- one definition of
     /// "malformed key", not two that could silently diverge (#106).
+    ///
+    /// `Err` too when the *winning* occurrence's own `,`/`:` delimiters are
+    /// malformed (#1677/#2288) -- unlike the non-string-key check just
+    /// above, deferred to the end rather than checked as each candidate is
+    /// found: only the field that actually wins (the *last* matching
+    /// occurrence) should be validated this way, since an earlier
+    /// same-named field's own delimiter gap is moot once a later one
+    /// supersedes it. Exactly [`find_cursor`](Self::find_cursor)'s own
+    /// check, reused rather than re-derived (#106) -- `find` predates
+    /// `find_cursor` and was missing it entirely until #2288 found the gap
+    /// via `find_cursor`'s own inherent walk-through duplicate-key
+    /// resolution, which `find`'s simpler last-write-wins loop doesn't
+    /// share, so the check has to be threaded through separately here
+    /// rather than shared by construction.
     pub fn find(&self, name: &str) -> Result<Option<StandardJson<'a, W>>, EvalError>
     where
         W: Clone,
     {
         let mut fields = *self;
-        let mut result = None;
+        // (key's own text start, winning field, is this field the object's
+        // first) -- same bookkeeping `find_cursor` keeps, needed so the
+        // deferred `,`/`:` check below validates only the actual winner.
+        let mut winner: Option<(usize, JsonField<'a, W>, bool)> = None;
+        let mut index = 0usize;
         while let Some((field, rest)) = fields.uncons() {
             let key = field.key();
             if key_is_malformed(&key) {
@@ -1123,14 +1141,27 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
             // own doc comment for why this case, unlike #1995's, is
             // deliberately *not* what it answers `true` for); this only
             // stops one bad key destroying valid results.
-            if let StandardJson::String(key) = key {
-                if key.as_str().is_ok_and(|k| k == name) {
-                    result = Some(field.value());
+            if let StandardJson::String(key_str) = key {
+                if key_str.as_str().is_ok_and(|k| k == name) {
+                    winner = Some((key_str.start(), field, index == 0));
                 }
             }
             fields = rest;
+            index += 1;
         }
-        Ok(result)
+        if let Some((key_start, field, is_first)) = winner {
+            let value_cursor = field.value_cursor();
+            let comma_expected = if is_first { None } else { Some(b',') };
+            if !preceding_gap_ok(value_cursor.text(), key_start, comma_expected) {
+                return Err(EvalError::malformed_json_text(value_cursor.text()));
+            }
+            if let Some(value_start) = value_cursor.text_position() {
+                if !preceding_gap_ok(value_cursor.text(), value_start, Some(b':')) {
+                    return Err(EvalError::malformed_json_text(value_cursor.text()));
+                }
+            }
+        }
+        Ok(winner.map(|(_, field, _)| field.value()))
     }
 
     /// Find a field by name and return a cursor to its value.
@@ -4304,6 +4335,71 @@ mod tests {
                 .find_cursor("a")
                 .unwrap_or_else(|e| panic!("{json:?}: {e:?}"));
             assert!(cursor.is_some(), "{json:?}: expected to find `a`");
+        }
+    }
+
+    /// #2288: `find` (unlike `find_cursor`, already fixed for this shape)
+    /// had no #1677 delimiter check at all -- a missing `:` before the
+    /// winning occurrence's value used to slip through silently.
+    #[test]
+    fn test_find_rejects_missing_colon_before_winning_value_2288() {
+        let json = br#"{"a" 1}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let StandardJson::Object(fields) = root.value() else {
+            panic!("expected object");
+        };
+        let err = fields
+            .find("a")
+            .expect_err("missing colon before value should raise");
+        assert!(
+            err.message.contains("Invalid JSON text"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    /// #2288: same shape, but the winning occurrence is a *later* duplicate
+    /// -- `find`'s last-duplicate-key-wins resolution must still validate
+    /// only the actual winner's own delimiters, not an earlier, superseded
+    /// occurrence's (which may be perfectly well-formed).
+    #[test]
+    fn test_find_rejects_missing_colon_on_winning_duplicate_2288() {
+        let json = br#"{"a":1,"a" 2}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let StandardJson::Object(fields) = root.value() else {
+            panic!("expected object");
+        };
+        let err = fields
+            .find("a")
+            .expect_err("missing colon on the winning duplicate should raise");
+        assert!(
+            err.message.contains("Invalid JSON text"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    /// #2288: well-formed objects (including a duplicate key, exercising
+    /// the same winning-occurrence resolution as the tests above) are
+    /// unaffected by the new delimiter check.
+    #[test]
+    fn test_find_wellformed_unaffected_by_delimiter_check_2288() {
+        for json in [
+            br#"{"a":1}"#.as_slice(),
+            br#"{"a":1,"b":2}"#.as_slice(),
+            br#"{"a":1,"b":2,"a":3}"#.as_slice(),
+        ] {
+            let index = JsonIndex::build(json);
+            let root = index.root(json);
+            let StandardJson::Object(fields) = root.value() else {
+                panic!("{json:?}: expected object");
+            };
+            let value = fields
+                .find("a")
+                .unwrap_or_else(|e| panic!("{json:?}: {e:?}"));
+            assert!(value.is_some(), "{json:?}: expected to find `a`");
         }
     }
 

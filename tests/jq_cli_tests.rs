@@ -22568,6 +22568,40 @@ fn test_jq_len_checked_and_collect_cursors_checked_siblings_wellformed_unaffecte
     Ok(())
 }
 
+/// #2288: `has(key)` on objects now also raises on a non-string sibling key
+/// (#1194/#1995's `key_is_malformed`), but -- like the #2261 trailing-comma
+/// check above -- only when that key is visited *before* the match, riding
+/// `contains_checked`'s existing per-key walk for free rather than paying
+/// for a full scan on every call (see `contains_checked`'s own doc comment
+/// for the ~4x-regression measurement that rules out an unconditional full
+/// scan). A malformed key strictly *after* the match is the same class of
+/// documented, accepted early-exit gap #2261 already established for the
+/// trailing comma -- pinned here rather than left as an unstated limitation
+/// of the fix.
+#[test]
+fn test_jq_has_object_rejects_nonstring_key_before_match_2288() -> Result<()> {
+    // Malformed key visited *before* the match -- caught, free.
+    let (out, stderr, code) = run_jq_full(&["-c", "has(\"a\")"], Some(r#"{123:1,"a":2}"#))?;
+    assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
+    assert!(out.trim().is_empty(), "unexpected output {out:?}");
+    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+
+    // Malformed key visited *after* the match -- documented, accepted gap:
+    // real jq raises here too (it can't parse the document at all), but
+    // catching it would mean walking past every early match, every time.
+    let (out, stderr, code) = run_jq_full(&["-c", "has(\"a\")"], Some(r#"{"a":1,123:2}"#))?;
+    assert_eq!(code, 0, "known gap: out: {out:?}, stderr: {stderr:?}");
+    assert_eq!(out.trim(), "true", "known gap: unexpected output");
+
+    // No match at all -- the walk already reaches the malformed key
+    // regardless of where it sits, so this always raises.
+    let (out, stderr, code) = run_jq_full(&["-c", "has(\"z\")"], Some(r#"{"a":1,123:2}"#))?;
+    assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
+    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+
+    Ok(())
+}
+
 /// #2261: `len_checked`/`Expr::Index`'s own #1677 *leading*-gap check (a
 /// malformed comma *between* two real elements, `[1,,3]`) is the sibling
 /// case to this issue's own trailing-comma repro, and shares the same new
