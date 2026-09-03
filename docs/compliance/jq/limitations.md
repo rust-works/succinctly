@@ -1782,13 +1782,27 @@ except "the match itself happens to come first." Recorded here rather than left 
 unstated side effect of the fix, matching how #2261's own `has(key)` fix above documents
 its identical trade-off.
 
-**2. `JsonFields::find` (unlike its `find_cursor` sibling) had no #1677 delimiter check at
-all** -- a missing `:` before the winning occurrence's value used to slip through
-silently (`find("a")` on `{"a" 1}` returned `Ok(Some(1))` with no error, where
-`find_cursor("a")` on the identical document already correctly raised). Fixed by deferring
-the same `preceding_gap_ok` check `find_cursor` already runs to the actual winning
-occurrence (last-duplicate-key-wins), reusing the exact check rather than re-deriving it
-(#106).
+Code review on this fix also caught that the naive shape (a separate `key_is_malformed`
+call alongside the pre-existing `key_display_string` call) paid for **two** independent
+key decodes per key -- `key_is_malformed(k) == key_display_string_kind(k).is_none()` by
+construction, so the fix calls `key_display_string_kind` once and derives both "is this key
+malformed" and "does it match `name`" from that single result, rather than adding a second
+decode pass on top of the one `contains`/`contains_checked` already paid.
+
+**2. `JsonFields::find` (unlike its `find_cursor` sibling) had neither the #1677 delimiter
+check nor the #2261 trailing-comma check at all** -- a missing `:` before the winning
+occurrence's value, or a trailing stray comma after the object's real last field, both used
+to slip through silently (`find("a")` on `{"a" 1}` returned `Ok(Some(1))` with no error,
+and `find("a")` on `{"a":1,}` also returned `Ok(Some(1))`, where `find_cursor` on the
+identical documents already correctly raised for both). Fixed by threading the same
+`preceding_gap_ok`/`trailing_element_gap_ok` checks `find_cursor` already runs -- the
+`,`/`:` check deferred to the actual winning occurrence (last-duplicate-key-wins), the
+trailing-comma check unconditional on whether `name` matched anything, exactly mirroring
+`find_cursor`'s own two checks and reusing them rather than re-deriving either (#106). A
+first draft of this PR ported only the `,`/`:` check and missed the trailing-comma one
+entirely -- a second code-review round on this same PR caught the residual asymmetry
+between two functions this file's own doc comments describe as sharing "the same
+last-duplicate-key-wins semantics."
 
 **Confirmed not reachable from either shipped CLI**, the identical "library-API-only, inert
 for genuine JSON input via either CLI" shape #2293 already established for `eval.rs`'s
@@ -1796,14 +1810,22 @@ whole parallel evaluator: `find`'s only production caller is `eval.rs`'s `find_f
 `index_object_by_name` (`.field` navigation in that evaluator), and `eval.rs` itself is
 only ever reached, from either CLI, via `succinctly yq`'s `evaluate_input`/
 `eval_owned_with_file_index` -- both of which hand it a cursor re-serialized from an
-already-materialized `OwnedValue`, which can never contain a missing `:` regardless of
-query (confirmed live: `succinctly yq --input-format json --slurp/--eval-all` on
-`{"a" 1}` already raises during the initial parse, before `find` is ever reached). Real
-only for a library consumer building their own cursor directly from raw, unvalidated
-document bytes. Fixed anyway (unlike #2293's own eval.rs gaps, left as a follow-up) because
-the change is narrow, mechanical, and reuses an existing, already-proven check within the
-same file -- not the broader, riskier `eval.rs`-wide sweep #2293 recommends as its own
-issue.
+already-materialized `OwnedValue`, which can never contain a missing `:` or a stray
+trailing `,` regardless of query (confirmed live: `succinctly yq --input-format json
+--slurp/--eval-all` on both `{"a" 1}` and `{"a":1,}` already raise during the initial
+parse, before `find` is ever reached). Real only for a library consumer building their own
+cursor directly from raw, unvalidated document bytes. Fixed anyway (unlike #2293's own
+`eval.rs` gaps, left as a follow-up) because the change is narrow, mechanical, and reuses
+existing, already-proven checks within the same file -- not the broader, riskier
+`eval.rs`-wide sweep #2293 recommends as its own issue.
+
+**3. `eval.rs`'s own `has_one_key` (its object arm, a raw `.any()` with zero gap checks)
+shares this same #2288 non-string-key gap** -- already tracked as part of #2293's own
+"`eval.rs`'s parallel evaluator" umbrella finding (filed alongside `builtin_length`/
+`builtin_keys`'s identical shape during #2261's own round-2 review), not a new discovery
+here. Same reachability analysis applies: `succinctly yq`'s one call site into `eval.rs`
+only ever sees an already-materialized, pre-validated `OwnedValue`, so this is inert for
+both CLIs today. Not re-filed as a separate issue; see #2293 for the tracking.
 
 ## Refusing an allocation jq does not survive
 

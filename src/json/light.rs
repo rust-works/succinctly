@@ -1103,17 +1103,20 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
     /// "malformed key", not two that could silently diverge (#106).
     ///
     /// `Err` too when the *winning* occurrence's own `,`/`:` delimiters are
-    /// malformed (#1677/#2288) -- unlike the non-string-key check just
-    /// above, deferred to the end rather than checked as each candidate is
-    /// found: only the field that actually wins (the *last* matching
-    /// occurrence) should be validated this way, since an earlier
-    /// same-named field's own delimiter gap is moot once a later one
-    /// supersedes it. Exactly [`find_cursor`](Self::find_cursor)'s own
-    /// check, reused rather than re-derived (#106) -- `find` predates
-    /// `find_cursor` and was missing it entirely until #2288 found the gap
-    /// via `find_cursor`'s own inherent walk-through duplicate-key
+    /// malformed (#1677/#2288), or when there's a trailing stray comma
+    /// after the object's real last field (`{"a":1,}`, #2261/#2288) --
+    /// unlike the non-string-key check just above, both deferred to the
+    /// end rather than checked as each candidate is found: only the field
+    /// that actually wins (the *last* matching occurrence) needs its own
+    /// `,`/`:` validated, since an earlier same-named field's own delimiter
+    /// gap is moot once a later one supersedes it; the trailing-comma check
+    /// is unconditional on whether `name` matched anything, same as every
+    /// other #2261 fix. Exactly [`find_cursor`](Self::find_cursor)'s own
+    /// checks, reused rather than re-derived (#106) -- `find` predates
+    /// `find_cursor` and was missing both entirely until #2288 found the
+    /// gap via `find_cursor`'s own inherent walk-through duplicate-key
     /// resolution, which `find`'s simpler last-write-wins loop doesn't
-    /// share, so the check has to be threaded through separately here
+    /// share, so the checks have to be threaded through separately here
     /// rather than shared by construction.
     pub fn find(&self, name: &str) -> Result<Option<StandardJson<'a, W>>, EvalError>
     where
@@ -1124,6 +1127,11 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
         // first) -- same bookkeeping `find_cursor` keeps, needed so the
         // deferred `,`/`:` check below validates only the actual winner.
         let mut winner: Option<(usize, JsonField<'a, W>, bool)> = None;
+        // #2261/#2288: the textually last field's own value cursor, in raw
+        // document order -- independent of `winner`, which a later
+        // non-matching field must not disturb. Same bookkeeping
+        // `find_cursor` keeps.
+        let mut last_value_cursor: Option<JsonCursor<'a, W>> = None;
         let mut index = 0usize;
         while let Some((field, rest)) = fields.uncons() {
             let key = field.key();
@@ -1146,6 +1154,7 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
                     winner = Some((key_str.start(), field, index == 0));
                 }
             }
+            last_value_cursor = Some(field.value_cursor());
             fields = rest;
             index += 1;
         }
@@ -1159,6 +1168,14 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
                 if !preceding_gap_ok(value_cursor.text(), value_start, Some(b':')) {
                     return Err(EvalError::malformed_json_text(value_cursor.text()));
                 }
+            }
+        }
+        // #2261/#2288: trailing stray comma after the object's real last
+        // field, checked regardless of whether `name` matched anything --
+        // see this function's own doc comment above.
+        if let Some(last) = last_value_cursor {
+            if !trailing_element_gap_ok(&last, b'}') {
+                return Err(EvalError::malformed_json_text(last.text()));
             }
         }
         Ok(winner.map(|(_, field, _)| field.value()))
@@ -4381,9 +4398,56 @@ mod tests {
         );
     }
 
+    /// #2288: the mirror image of the two tests above -- an *earlier*,
+    /// non-winning duplicate's own missing colon must be ignored once a
+    /// later, well-formed occurrence supersedes it. Pins the doc comment's
+    /// own key claim ("an earlier same-named field's own delimiter gap is
+    /// moot once a later one supersedes it") in the direction the other
+    /// two tests don't cover.
+    #[test]
+    fn test_find_ignores_missing_colon_on_superseded_earlier_duplicate_2288() {
+        let json = br#"{"a" 1,"a":2}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let StandardJson::Object(fields) = root.value() else {
+            panic!("expected object");
+        };
+        let value = fields
+            .find("a")
+            .unwrap_or_else(|e| panic!("superseded duplicate's own gap should be ignored: {e:?}"));
+        match value {
+            Some(StandardJson::Number(n)) => assert_eq!(n.as_i64().unwrap(), 2),
+            other => panic!("expected the winning duplicate's value 2, got {other:?}"),
+        }
+    }
+
+    /// #2288: `find` (unlike `find_cursor`, already fixed for this shape by
+    /// #2261) had no trailing-stray-comma check either -- a trailing `,`
+    /// after the object's real last field used to slip through silently,
+    /// whether or not `name` matched anything.
+    #[test]
+    fn test_find_rejects_trailing_comma_after_real_last_field_2288() {
+        let json = br#"{"a":1,}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let StandardJson::Object(fields) = root.value() else {
+            panic!("expected object");
+        };
+        for name in ["a", "nonexistent"] {
+            let err = fields
+                .find(name)
+                .expect_err(&format!("{name}: trailing comma should raise"));
+            assert!(
+                err.message.contains("Invalid JSON text"),
+                "{name}: message: {}",
+                err.message
+            );
+        }
+    }
+
     /// #2288: well-formed objects (including a duplicate key, exercising
     /// the same winning-occurrence resolution as the tests above) are
-    /// unaffected by the new delimiter check.
+    /// unaffected by the new delimiter and trailing-comma checks.
     #[test]
     fn test_find_wellformed_unaffected_by_delimiter_check_2288() {
         for json in [
