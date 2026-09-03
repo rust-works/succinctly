@@ -30642,6 +30642,49 @@ fn test_slice_update_with_identity_tail_still_raises_1428() -> Result<()> {
     Ok(())
 }
 
+/// #2241: a *mid-chain* bare `.` in a write path (`|=`/`del()`) is a
+/// transparent pass-through, not a delete/update target in its own right --
+/// `update_path_steps`/`delete_path_steps` both fell to a catch-all that
+/// routed it into `update_path`/`delete_at_path`'s own *terminal*
+/// `Expr::Identity` arm instead, silently discarding everything after it in
+/// the chain. Verified against jq 1.7.1 for every assertion below.
+#[test]
+fn test_mid_chain_identity_does_not_discard_rest_of_write_path_2241() -> Result<()> {
+    // `|=`: the issue's own repro.
+    let (stdout, _, code) = run_jq_full(&["-c", "(.a | . | .b) |= 99"], Some(r#"{"a":{"b":1}}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"{"a":{"b":99}}"#);
+
+    // `del()`: the same shape.
+    let (stdout, _, code) = run_jq_full(&["-c", "del(.a | . | .b)"], Some(r#"{"a":{"b":1}}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"{"a":{}}"#);
+
+    // A compound operator (`+=`) routes through the identical `update_path`
+    // machinery as `|=`.
+    let (stdout, _, code) = run_jq_full(&["-c", "(.a | . | .b) += 10"], Some(r#"{"a":{"b":1}}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"{"a":{"b":11}}"#);
+
+    // Two identities in a row, and an identity immediately followed by
+    // `.[]` -- each exercises a different next-step shape after the
+    // pass-through.
+    let (stdout, _, code) =
+        run_jq_full(&["-c", "(.a | . | . | .b) |= 99"], Some(r#"{"a":{"b":1}}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"{"a":{"b":99}}"#);
+
+    let (stdout, _, code) = run_jq_full(&["-c", "(.a | . | .[]) |= 99"], Some(r#"{"a":[1,2,3]}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"{"a":[99,99,99]}"#);
+
+    let (stdout, _, code) = run_jq_full(&["-c", "del(.a | . | .[1])"], Some(r#"{"a":[1,2,3]}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"{"a":[1,3]}"#);
+
+    Ok(())
+}
+
 /// #1876/#1883: `through_slice`'s `OwnedValue::String` *terminal-write* arm
 /// used to refuse with the generic `Cannot update string slices` message
 /// immediately, without ever running the update filter -- unlike its

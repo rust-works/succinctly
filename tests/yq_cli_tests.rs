@@ -12202,6 +12202,28 @@ fn test_literal_slice_parent_ancestor_resolves_yq_2215() -> Result<()> {
 }
 
 /// yq-mode counterpart to `jq_cli_tests.rs`'s
+/// `test_mid_chain_identity_does_not_discard_rest_of_write_path_2241` --
+/// `update_path_steps`/`delete_path_steps` are shared, mode-blind evaluator
+/// code, so this confirms the fix reaches yq's own `|=`/`del()` dispatch
+/// too, not just jq's. Verified against real yq v4.53.3.
+#[test]
+fn test_mid_chain_identity_does_not_discard_rest_of_write_path_yq_2241() -> Result<()> {
+    let (output, code) = run_yq_stdin(
+        "(.a | . | .b) |= 99",
+        "a:\n  b: 1\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"a":{"b":99}}"#);
+
+    let (output, code) = run_yq_stdin("del(.a | . | .b)", "a:\n  b: 1\n", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"a":{}}"#);
+
+    Ok(())
+}
+
+/// yq-mode counterpart to `jq_cli_tests.rs`'s
 /// `test_string_interpolation_path_context_builtins_1334`/
 /// `test_func_def_path_context_builtins_1306` -- both new
 /// `needs_path_context`/`eval_pipe_with_path_context_internal` arms
