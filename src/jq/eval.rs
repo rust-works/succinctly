@@ -60875,6 +60875,15 @@ mod tests {
             outputs(b"null", r"reduce (1,2) as $x ({}; . + {count: $x})"),
             [r#"{"count":2}"#]
         );
+        // Coverage: the `Expr::Builtin(Builtin::Empty)` arm (an empty
+        // array literal, `[]`, `owned_to_expr`'s own empty-array shape and
+        // also directly parseable) is only reached via a genuinely empty
+        // `[...]` on the right of `+` -- every other case above has at
+        // least one element.
+        assert_eq!(
+            outputs(b"null", r"reduce (1,2) as $x ([1]; . + [])"),
+            ["[1]"]
+        );
     }
 
     #[test]
@@ -60938,6 +60947,16 @@ mod tests {
                 ]))),
                 0
             ),
+            None
+        );
+        // Same rejection, but through the *bare* (non-`Comma`) single-child
+        // array arm rather than the `Comma`-items loop above -- `[.foo]`
+        // parses as `Expr::Array(Box::new(Expr::Field("foo")))`, with no
+        // `Comma` wrapper (same shape a single substituted element takes,
+        // see the sibling AST-shape test), so this exercises that arm's
+        // own `?` failure path independently of the multi-element one.
+        assert_eq!(
+            literal_shaped_expr_to_owned(&Expr::Array(Box::new(Expr::Field("foo".to_string()))), 0),
             None
         );
         assert_eq!(
