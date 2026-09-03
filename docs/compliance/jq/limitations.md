@@ -1746,6 +1746,23 @@ and differently-shaped problem than this section's own fixes):
   match sites in that file, most already covered by other routes) remains
   unaddressed and would need its own follow-up issue if pursued.
 
+  Round-2 code review on #2311 found two more real gaps, neither folded into
+  that PR: `has_one_key`'s array arm called `numeric_key_to_array_index`
+  *before* `len_checked`, short-circuiting to `Bool(false)` on `None` (a NaN
+  key in jq mode, any Float key in yq mode) without ever running the gap
+  check -- fixed in #2311 itself by reordering to match `eval_generic.rs`'s
+  own unconditional-`len_checked`-first shape exactly. Two further siblings
+  sharing the identical unchecked-`.count()` shape were found but
+  deliberately left unfixed: `count_elements` (backs
+  `get_element_at_index`'s negative-index resolution, `.foo[-1]`) needs a
+  genuine new error-type design (its `Result<_, usize>` return already
+  carries a distinct, meaningful "negative still negative" signal, #2254 --
+  not a drop-in swap like the others), filed as #2312; and `builtin_keys`
+  never collapses duplicate keys in *either* mode (it has no
+  `S: EvalSemantics` parameter to derive `S::COLLAPSE_DUPLICATE_KEYS` from,
+  unlike `eval_generic.rs`'s own `Keys`/`KeysUnsorted` arms), filed as
+  #2313.
+
   Writing that parity test also surfaced a further, unrelated, **live and
   CLI-reachable** bug shared by *both* evaluators: `{"a":1,} | length` in jq
   mode (`collapse: true`) silently returns `1` instead of raising --

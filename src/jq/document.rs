@@ -2494,9 +2494,11 @@ pub fn effective_len<F: DocumentFields>(fields: &F, collapse: bool) -> usize {
 /// covered only the first spelling, leaving `{invalid} | length` erroring
 /// while `{invalid} | keys | length` answered `0`.
 ///
-/// [`effective_len`] itself stays infallible for the two `eval.rs`-side
-/// callers, which reach `length` through the other evaluator and answer for
-/// an already-materialized value.
+/// [`effective_len`] itself stays infallible for its one remaining caller,
+/// `lazy.rs`'s `JqValue::length` (`LazyKeysArray` arm) -- `eval.rs`'s own
+/// `builtin_length` used to be a second infallible caller, but #2293
+/// switched it to this checked sibling, closing the same #2261
+/// trailing-comma gap `eval_generic.rs`'s own `length` arm already had.
 pub fn effective_len_checked<F: DocumentFields>(
     fields: &F,
     collapse: bool,

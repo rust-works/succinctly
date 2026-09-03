@@ -1197,6 +1197,13 @@ fn test_parity_has_native_arm_1739() {
 /// the shared `document.rs` helper both evaluators call, not an eval.rs/
 /// eval_generic.rs parity drift -- out of this fix's scope; filed as
 /// #2307.
+///
+/// `has(nan)` pins round-2 review's own finding: the array arm's first
+/// draft called `numeric_key_to_array_index` *before* `len_checked`,
+/// short-circuiting to `Bool(false)` on `None` (a NaN key in jq mode)
+/// without ever running the gap check -- `eval_generic.rs`'s own
+/// `eval_has_one_key` calls `len_checked` unconditionally first. Fixed to
+/// match that order exactly.
 #[test]
 fn test_parity_eval_rs_trailing_comma_sibling_gaps_2293() {
     for (json, filter) in [
@@ -1205,6 +1212,7 @@ fn test_parity_eval_rs_trailing_comma_sibling_gaps_2293() {
         (br"[1,2,3,]", "keys"),
         (br"[1,2,3,]", "keys_unsorted"),
         (br"[1,2,3,]", "has(0)"),
+        (br"[1,2,3,]", "has(nan)"),
         (br#"{"a":1,}"#, r#"has("a")"#),
     ] {
         assert_error_parity(json, filter);
