@@ -514,10 +514,30 @@ plain nesting when `YamlIndex` itself accepts it — its own `nesting_depth` cou
 also means `--slurp`/`--inplace` no longer reach `assert_nesting_depth`'s 256-deep panic at all
 (previously reachable, and — for the few minutes the buggy fix stood — silently *more*
 reachable, through this same fallback); `--eval-all`'s own, unrelated, pre-existing instance of
-that exact panic is unaffected by any of this and is now tracked as
+that exact panic was unaffected by any of this and was tracked separately as
 [#2282](https://github.com/rust-works/succinctly/issues/2282), per this project's own #1098
 precedent that a CLI-reachable panic on untrusted input is a real robustness concern worth a
-tracking issue even when not newly introduced.
+tracking issue even when not newly introduced. Closed at the panic's own source:
+`to_owned_canonicalizing_numbers_at_depth` (`yq_runner.rs`) now calls `check_nesting_depth`
+(`eval_generic.rs`, #1818's existing catchable sibling of `assert_nesting_depth`) instead of
+the panicking guard directly — the same panic-to-`Result` conversion `jq_runner.rs`'s
+`json_bytes_to_owned_value_checked` already made for jq mode's own analogous pre-filter parse
+path (#1818), for the identical reason: this call sits ahead of any user filter evaluation,
+parsing raw external JSON text for `--slurp`/`--eval-all`/`--inplace`, not inside the
+evaluator's own hot recursion where a panic is deliberately kept uncatchable. An earlier
+revision of this fix instead added a second, parallel pre-check walk ahead of `--eval-all`'s
+own call site (mirroring `parse_input_m2_parity`'s shape) — reworked during review in favor of
+fixing the guard directly: the parallel-walk approach needed its own, different
+depth-counting convention to match `assert_nesting_depth`'s real per-node semantics (which
+checks *every* visited value, leaf included, unlike `parse_input_m2_parity`'s container-only
+count), got that convention wrong on the first attempt (silently under-rejecting a
+leaf-terminated subtree by one level — 256 levels of `[...]` wrapped around a scalar leaf still
+panicked even after a naive generalization of the M2-parity walk was in place), duplicated
+~130 lines of tree-walking logic that fixing the guard's own call site avoids entirely, and
+risked a fidelity mismatch of its own on structurally malformed input (a non-string object key
+containing deep nesting would have been walked by the pre-check but never reached by the real
+evaluator, which rejects a non-string key immediately without descending into it) — all
+avoided by converting the panic at its source instead of predicting it from a second walk.
 
 **Known cost: `--inplace`/`--slurp` with well-formed, duplicate-keyed JSON input still
 collapses those duplicates** (`{"a":1,"a":2}` → `{"a":2}`) — `any_input_is_json` is a blanket,

@@ -16995,20 +16995,17 @@ fn test_json_input_rejects_adversarial_nesting_via_eval_all_998() -> Result<()> 
     Ok(())
 }
 
-/// #2282 review: pins the exact off-by-one this fix's own review caught --
-/// `parse_input_eval_all`'s pre-check must reject nesting at exactly the
-/// same boundary `to_owned_canonicalizing_numbers_at_depth`'s
-/// `assert_nesting_depth` panic would, not one level looser. A
-/// container-only depth count (`json_nested_past_depth_limit`'s
-/// `count_leaves = false` convention, correct for the *M2-parity* 128
-/// guard elsewhere in this file) under-counts a leaf-terminated subtree by
-/// one level relative to that panic: 256 levels of `[...]` wrapped around
-/// a scalar leaf reaches `assert_nesting_depth(256)` (256 `>=` 256, panics)
-/// but a container-only count of the same input only reaches 256 at the
-/// outermost container, one short of its own would-be 257 rejection
-/// threshold. Confirmed live before the `count_leaves` fix: this exact
-/// input panicked (exit 101) even after `parse_input_eval_all`'s
-/// container-only pre-check had already run and declined to reject it.
+/// #2282: pins the exact boundary `check_nesting_depth` now enforces
+/// (catchably) at `to_owned_canonicalizing_numbers_at_depth`'s own call
+/// site -- 256 levels of `[...]` wrapped around a scalar leaf reaches
+/// `check_nesting_depth(256)` (256 `>=` `MAX_NESTING_DEPTH`, errors). An
+/// earlier revision of this fix used a separate, container-only-counting
+/// pre-check walk instead of fixing the guard itself, and that walk
+/// under-counted a leaf-terminated subtree by one level relative to the
+/// real guard's own per-node counting -- confirmed live at the time: this
+/// exact input still panicked (exit 101) even with that pre-check already
+/// run and declined to reject it. Kept as a regression test for the
+/// boundary itself, independent of which mechanism enforces it.
 #[test]
 fn test_json_eval_all_rejects_scalar_terminated_nesting_at_exact_boundary_2282() -> Result<()> {
     let depth = 256;
