@@ -9428,19 +9428,19 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
                 // `Vec<OwnedValue>` (see `PathTrail::from_slice`'s own doc
                 // comment for why), so it flattens back out here.
                 let path = path.to_vec();
-                // An absent node is where the bridge and this walk genuinely
-                // disagree, so it is handed back rather than answered.
-                //
-                // The bridge *loses* path context through a missing field --
-                // `{} | .a | key` is `null` there -- and *raises* on an
-                // out-of-bounds index, where plain `.[0]` on `[]` does not.
-                // Real yq does neither: it answers `"a"`, and it
-                // auto-vivifies the missing node (`{} | .a | parent` is
-                // `{"a":null}`, `[] | .[0] | key` is `0`), all confirmed
-                // against v4.53.3. Continuing the walk here would silently
-                // change all three into a fourth answer inside a performance
-                // change, so absent positions stay on the bridge and keep
-                // today's behaviour exactly. Filed separately.
+                // An absent node still bails to the bridge, even though
+                // #2213 fixed the bridge's own `key`/`path` answers to match
+                // real yq (`{} | .a | key` is `"a"`, `[] | .[0] | key` is
+                // `0`, both confirmed against v4.53.3) rather than the
+                // stale `null`/raise this comment used to describe. `parent`
+                // is why the walk still can't continue on its own: real yq
+                // auto-vivifies the missing node into `parent`'s return
+                // value (`{} | .a | parent` is `{"a":null}`), and this
+                // walk's `PathContextPos::node` has nowhere to hold a
+                // synthesized value -- only real document nodes. #2146
+                // (defect 3, still open) is the design question that would
+                // let this stop bailing for the cases that don't touch
+                // `parent`.
                 let PathNode::At(node) = node else {
                     return Err(PathContextAbort::Unsupported);
                 };
