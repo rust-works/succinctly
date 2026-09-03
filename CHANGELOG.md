@@ -294,9 +294,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   code review): `eval_generic.rs`'s `Expr::Format` arm (gating every `@format` builtin —
   `@json`, `@csv`, `@tsv`, `@dsv`, `@uri`, `@html`, `@base64`, `@sh`, `@yaml`, `@props`,
   `@text` — for the CLI's default dispatch), its `Builtin::Path`/`Builtin::GetPath` arms,
-  and `eval.rs`'s own `eval_format`/`builtin_path` (reached via the public
-  `succinctly::jq::eval::eval` library API, and via the CLI whenever `eval_generic.rs`'s
-  own fallback re-enters the full evaluator for a non-identity value) all raised an
+  `eval.rs`'s own `builtin_path` (reached via the public `succinctly::jq::eval::eval`
+  library API, and via the CLI whenever `eval_generic.rs`'s own fallback re-enters the full
+  evaluator for a non-identity value — e.g. a document-sourced number literal longer than
+  256 digits), and `eval.rs`'s own `eval_format` (library-API-only: unlike `builtin_path`,
+  `eval_generic.rs`'s reindex-bridge helper short-circuits every `Expr::Format` before it
+  can reach this evaluator at all, so this site is never reached from the CLI) all raised an
   unconditional error from their own materialization instead of consulting `optional` the
   #2184/#2015/#2231 lineage's shared macros (`to_owned_or_suppress!`/`owned_or_suppress!`)
   already provide. `GetPath`'s arm was a particularly sharp inconsistency: its own comment
@@ -316,6 +319,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Builtin::Path` fallback line it claimed to pin. All three were fixed and the test
   corrected to use a non-cursor-navigable path expression (confirmed with temporary debug
   instrumentation during review that this reaches the intended line).
+
+  A third review round then found the CHANGELOG's own claim that `eval.rs`'s `eval_format`
+  is CLI-reachable via the reindex bridge (the same way `builtin_path` is) was itself
+  wrong: `eval_generic.rs`'s `eval_on_owned` short-circuits any `Expr::Format` before it
+  can reach `eval.rs`'s evaluator at all (the same round trip `format_owned`'s own doc
+  comment already explains avoiding, #124), so `eval_format` is genuinely reachable only
+  via the public library API. The fix itself was already correct either way (still
+  defensive); only the reachability claim in its comment and this entry needed correcting.
+  A parallel sweep from that same round found several more sites sharing this issue's
+  exact pattern outside its own three named findings (`builtin_del`, the
+  `Reverse`/`Sort`/`Unique`/`Min`/`Max` family, `builtin_envvar`, `builtin_transpose`, and
+  a few lower-confidence candidates) — out of scope for this PR, filed as #2327 instead of
+  expanded here.
 
   Like #2231's own findings 1-3, this is defensive rather than a live behavior change
   today: #2286 tagged every error path these materializations can produce (string decode
