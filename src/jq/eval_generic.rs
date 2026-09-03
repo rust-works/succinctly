@@ -29,9 +29,9 @@ use indexmap::IndexMap;
 use super::document::{
     collapsed_fields, collapsed_fields_if, effective_fields, effective_fields_checked,
     effective_keys, effective_len_checked, key_delimiter_ok, key_display_string,
-    key_display_string_kind, key_is_malformed, resolve_display_key, value_delimiter_ok,
-    DisplayKeyGuard, DistinctKeyCursors, DocumentCursor, DocumentElements, DocumentFields,
-    DocumentValue, IndentSpec, JsonConvention,
+    key_display_string_kind, key_is_malformed, resolve_display_key, trailing_element_gap_ok,
+    value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors, DocumentCursor, DocumentElements,
+    DocumentFields, DocumentValue, IndentSpec, JsonConvention,
 };
 use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, bind_def, bind_def_call,
@@ -217,6 +217,11 @@ fn to_owned_at_depth<V: DocumentValue>(value: &V, depth: usize) -> Result<OwnedV
         let mut guard = DisplayKeyGuard::default();
         let mut f = fields;
         let mut is_first = true;
+        // #2262: the last real field's own cursor, retained past the loop
+        // so the trailing-gap check below (a stray `,` *after* a real last
+        // field, `{"a":1,}`) has something to check from -- mirrors
+        // `to_owned_cursor_at_depth`'s own `last_field` (#2243).
+        let mut last_field: Option<V::Cursor> = None;
         while let Some((field, rest)) = f.uncons() {
             // A key that will not *decode* (#1247/#1385) is preserved via
             // its raw source span rather than raised on (#1642), matching
@@ -238,6 +243,7 @@ fn to_owned_at_depth<V: DocumentValue>(value: &V, depth: usize) -> Result<OwnedV
                 return Err(f.malformed_member_error());
             }
             map.insert(key, to_owned_at_depth(&field.value, depth + 1)?);
+            last_field = Some(field.value_cursor);
             f = rest;
             is_first = false;
         }
@@ -248,11 +254,29 @@ fn to_owned_at_depth<V: DocumentValue>(value: &V, depth: usize) -> Result<OwnedV
         if f.ends_unpaired() {
             return Err(f.malformed_member_error());
         }
+        // #2262: #2211's `container_gap_ok` (a stray `,` with zero real
+        // fields, `{,}`) needs the *container's own* cursor to find its
+        // opening `{` -- this function only ever receives a bare `value: &V`
+        // (never a cursor for the container itself, unlike
+        // `to_owned_cursor_at_depth`'s `cursor` parameter), and once `f` is
+        // exhausted there is no way to reconstruct one. Same limitation
+        // #2211 already documented for `jq_runner::standard_json_to_jq_value`'s
+        // identical "value only, no container position" shape -- `{,}`
+        // remains unchecked here for that reason. #2243's
+        // `trailing_element_gap_ok` *is* checkable, though: it only needs
+        // the last real field's own cursor, retained above.
+        if let Some(last) = &last_field {
+            if !trailing_element_gap_ok(last, b'}') {
+                return Err(last.malformed_delimiter_error());
+            }
+        }
         Ok(OwnedValue::Object(map))
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();
         let mut elems = elements;
         let mut is_first = true;
+        // #2262: same reasoning as the object arm's own `last_field` above.
+        let mut last_elem: Option<V::Cursor> = None;
         while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
             // #1677: no bare-value walk over `DocumentElements` carries a
             // position, so this switches to the cursor-yielding sibling of
@@ -265,8 +289,17 @@ fn to_owned_at_depth<V: DocumentValue>(value: &V, depth: usize) -> Result<OwnedV
                 }
             }
             items.push(to_owned_at_depth(&elem_cursor.value(), depth + 1)?);
+            last_elem = Some(elem_cursor);
             elems = rest;
             is_first = false;
+        }
+        // #2262: same reasoning as the object arm's own check above --
+        // `[,]` remains unchecked here (no container cursor available),
+        // but `[1,]` is, via the last real element's own cursor.
+        if let Some(last) = &last_elem {
+            if !trailing_element_gap_ok(last, b']') {
+                return Err(last.malformed_delimiter_error());
+            }
         }
         Ok(OwnedValue::Array(items))
     // Then check scalars in order of specificity
@@ -349,36 +382,6 @@ pub fn to_owned_all_cursors<'a, C: DocumentCursor + 'a>(
     cursors: impl IntoIterator<Item = &'a C>,
 ) -> Result<Vec<OwnedValue>, EvalError> {
     cursors.into_iter().map(to_owned_cursor).collect()
-}
-
-/// #2243: whether a trailing stray `,` (`[1,]`, `{"a":1,}`) sits between a
-/// container's *last real child* (`last_cursor`) and `close_char` -- shared
-/// by [`to_owned_cursor_at_depth`]'s object and array arms, one definition
-/// instead of two hand-copied ones (this crate's own "duplicated predicates
-/// diverge silently" lesson).
-///
-/// Takes only the cursor, not an already-resolved value: [`DocumentValue::
-/// scalar_text_end`] unconditionally answers `None` for a container-typed
-/// child (see its own doc comment), so resolving one here first -- via
-/// `is_container()`, cheap and already required by every [`DocumentCursor`]
-/// impl -- skips a `.value()` call this check could never use anyway,
-/// rather than decoding it and immediately discarding the result.
-///
-/// `None` from either remaining half of the lookup -- no resolvable start
-/// position, or (for a scalar child) no derivable end position -- answers
-/// `true` (nothing to flag), the same "can't determine, skip" convention
-/// every sibling gap check in this file already follows.
-fn trailing_element_gap_ok<C: DocumentCursor>(last_cursor: &C, close_char: u8) -> bool {
-    if last_cursor.is_container() {
-        return true;
-    }
-    match last_cursor.text_position() {
-        Some(start) => match last_cursor.value().scalar_text_end(start) {
-            Some(end) => last_cursor.trailing_element_gap_ok(end, close_char),
-            None => true,
-        },
-        None => true,
-    }
 }
 
 fn to_owned_cursor_at_depth<C: DocumentCursor>(
@@ -18712,6 +18715,112 @@ mod tests {
             );
         }
         assert_eq!(value_err.message, cursor_err.message);
+    }
+
+    /// #2262: `to_owned_at_depth` (the cursor-less sibling `GenericResult::
+    /// One`/`Many` reach whenever a value materializes without a live
+    /// cursor) never checked for a trailing stray `,` after a real last
+    /// child at all, unlike `to_owned_cursor_at_depth` (#2243). Both
+    /// conversions now agree, mirroring
+    /// `test_both_owned_conversions_raise_on_missing_delimiter_1677`'s same
+    /// same-document, same-cause pattern for this delimiter class instead.
+    #[test]
+    fn test_both_owned_conversions_raise_on_trailing_comma_2262() {
+        for json in [b"[1,]".as_slice(), br#"{"a":1,}"#.as_slice()] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+
+            let value_err = match to_owned(&cursor.value()) {
+                Err(e) => e,
+                Ok(v) => panic!(
+                    "{json:?}: a trailing comma after a real last child is not JSON, got {v:?}"
+                ),
+            };
+            let cursor_err = match to_owned_cursor(&cursor) {
+                Err(e) => e,
+                Ok(v) => panic!("{json:?}: the cursor domain must agree, got {v:?}"),
+            };
+
+            for err in [&value_err, &cursor_err] {
+                assert!(
+                    err.message.contains("Invalid JSON text"),
+                    "{json:?}: message: {}",
+                    err.message
+                );
+            }
+            assert_eq!(
+                value_err.message, cursor_err.message,
+                "{json:?}: one document, one cause"
+            );
+        }
+    }
+
+    /// #2262: unlike the trailing-comma case above, a stray `,` with *zero*
+    /// real children (`[,]`, `{,}`) is a known, deliberately unclosed gap
+    /// for `to_owned`/`to_owned_at_depth` specifically -- #2211's
+    /// `container_gap_ok` needs a cursor to the *container itself* to find
+    /// its opening bracket, and this cursor-less conversion is only ever
+    /// given a bare `value: &V`, never a cursor for the container (only
+    /// per-child cursors, once a child actually exists to hold one). Once
+    /// the child walk is exhausted there is nothing left to check against.
+    /// `to_owned_cursor` -- which *is* given the container's own cursor --
+    /// already closed this via #2211 and continues to reject both shapes,
+    /// so the two conversions deliberately disagree here. This pins that
+    /// disagreement as the documented, still-open half of #2262 rather
+    /// than leaving it silently uncovered.
+    #[test]
+    fn test_to_owned_stray_comma_in_empty_container_remains_a_known_gap_2262() {
+        for json in [b"[,]".as_slice(), b"{,}".as_slice()] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+
+            if let Err(e) = to_owned(&cursor.value()) {
+                panic!("{json:?}: known gap -- silently accepted, got error {e:?}");
+            }
+            if let Ok(v) = to_owned_cursor(&cursor) {
+                panic!("{json:?}: the cursor domain already rejects this, got {v:?}");
+            }
+        }
+    }
+
+    /// #2262: well-formed arrays/objects (including a multi-element array
+    /// and a multi-field object, so both the "at least one real child, no
+    /// trailing gap" branch and the untouched empty-container branch are
+    /// each pinned) are unaffected by the new trailing-comma check above.
+    #[test]
+    fn test_to_owned_wellformed_containers_unaffected_by_trailing_comma_check_2262() {
+        for (json, expected) in [
+            (b"[]".as_slice(), OwnedValue::Array(vec![])),
+            (b"{}".as_slice(), OwnedValue::Object(IndexMap::new())),
+            (
+                b"[1,2,3]".as_slice(),
+                OwnedValue::Array(vec![
+                    OwnedValue::from_number_literal("1"),
+                    OwnedValue::from_number_literal("2"),
+                    OwnedValue::from_number_literal("3"),
+                ]),
+            ),
+            (
+                br#"{"a":1,"b":2}"#.as_slice(),
+                OwnedValue::Object(IndexMap::from([
+                    ("a".to_string(), OwnedValue::from_number_literal("1")),
+                    ("b".to_string(), OwnedValue::from_number_literal("2")),
+                ])),
+            ),
+        ] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            assert_eq!(
+                to_owned(&cursor.value()).unwrap(),
+                expected,
+                "{json:?}: to_owned"
+            );
+            assert_eq!(
+                to_owned_cursor(&cursor).unwrap(),
+                expected,
+                "{json:?}: to_owned_cursor must agree"
+            );
+        }
     }
 
     /// #1687: the sort family's array-valued results (`sort`, `sort_by`,
