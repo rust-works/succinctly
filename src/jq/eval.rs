@@ -24947,6 +24947,35 @@ fn is_passthrough_target(target: &Expr) -> bool {
     components.is_empty()
 }
 
+/// The shared "#843 (the caller's own trackability context) OR #986 (this
+/// specific branch's own untrackability)" check both [`resolve_index_expr`]
+/// and [`resolve_slice_expr`] run against each of `target`'s resolved
+/// branches, immediately before that branch is navigated further (indexed
+/// or sliced) -- #2248. One shared definition, not two hand-copied call
+/// sites, so the two can't drift apart (this file's own "duplicated
+/// predicates diverge silently" lesson, #106).
+///
+/// Checked per branch, not as an upfront whole-list scan: a branch that
+/// already resolved and indexed/sliced cleanly before an untrackable one
+/// later in the list must still contribute to the escape's own `out`
+/// prefix, matching real jq's per-branch generator semantics rather than
+/// discarding the whole list wholesale. `near` is the value naming the
+/// navigation attempt in jq's error wording (the key for `resolve_index_expr`,
+/// the slice bounds for `resolve_slice_expr`); `target_value` is this
+/// branch's own value, jq's "container" in that same wording.
+fn untrackable_branch_escape(
+    trackable: bool,
+    branch_trackable: bool,
+    near: &OwnedValue,
+    target_value: &OwnedValue,
+) -> Option<EvalEscape> {
+    if trackable && branch_trackable {
+        None
+    } else {
+        Some(EvalError::invalid_path_expression_near_access(near, target_value).into())
+    }
+}
+
 /// Resolve `E[K]` in path context, with or without a trailing `?`.
 ///
 /// The two spellings differ in one thing only: what happens when the resolved
@@ -25081,27 +25110,6 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
         // value, not a fixed `keys[0]` — jq's own error names whichever
         // key was actually being navigated when the untracked branch was
         // reached.
-        if !trackable {
-            if let Some(PathBranch {
-                value: first_value, ..
-            }) = branches.first()
-            {
-                escape!(EvalError::invalid_path_expression_near_access(k, first_value).into());
-            }
-        }
-        // #986: the same check, for a `target` that resolved fine but is
-        // itself untracked — `(1 | .) [K]`, where the pipe's own literal
-        // deferred here rather than raising. `trackable` above is the
-        // *caller's* context; this is the target's own. Both produce jq's
-        // "near attempt" wording, naming this key as the navigation that
-        // failed.
-        if let Some(PathBranch {
-            value: first_value, ..
-        }) = branches.iter().find(|b| !b.trackable)
-        {
-            escape!(EvalError::invalid_path_expression_near_access(k, first_value).into());
-        }
-
         // Reserved once per key, ahead of that key's own indexing loop,
         // rather than once for the whole `keys x target` product up front
         // -- `target`'s own length can vary per key now (#2139, mirroring
@@ -25120,11 +25128,28 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
         for PathBranch {
             path: components,
             value: target_value,
-            // Every untracked target branch was already rejected by the
-            // check above, so anything reaching here is tracked.
+            trackable: branch_trackable,
             ..
         } in &branches
         {
+            // #843/#986 (#2248 review): checked per branch, right before
+            // that branch is indexed, not as an upfront `branches.first()`/
+            // `.find()` scan before this loop starts. An upfront scan
+            // escaped on *any* untrackable branch anywhere in the list,
+            // discarding every trackable branch that came before it in
+            // `out` -- confirmed live as a real output-loss bug: `path((.,5)
+            // [(0,error("mid"))])` on jq 1.7.1 prints `[0]` (the `.`
+            // branch's own successful index) before raising `mid`; the
+            // upfront scan here produced no stdout at all, since the `5`
+            // branch's untrackability was noticed before `.`'s own
+            // already-successful indexing was ever pushed to `out`. See
+            // `untrackable_branch_escape`'s own doc comment for why the two
+            // conditions stay merged.
+            if let Some(control) =
+                untrackable_branch_escape(trackable, *branch_trackable, k, target_value)
+            {
+                escape!(control);
+            }
             // A NaN key names no element for a write to land on, so `?` does not
             // save it — but only where a number addresses an element at all. On
             // an object the failure is the ordinary `Cannot index object with
@@ -25386,41 +25411,6 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
                 )
                 .into());
             }
-            // #843: `resolve_index_expr`'s sibling `getpath`-laundering
-            // check — `target` can also resolve successfully with
-            // `trackable: false` through `Builtin::GetPath`'s deliberate
-            // exemption, which doesn't certify what comes after it as
-            // trackable. Without this, `catch (getpath(["other"])[0:2]) =
-            // [...]` silently wrote into the real document instead of
-            // raising — found in review.
-            // #986: `!b.trackable` is the same question asked of the
-            // target's own branches rather than the caller's context —
-            // `(1 | .)[0:2]`, where the pipe's literal deferred here
-            // instead of raising. Kept as one condition with `!trackable`
-            // so the two can't drift: this file's own "duplicated
-            // predicates diverge silently" lesson (#106).
-            //
-            // Re-checked on *every* pair's own freshly-resolved
-            // `branches`, not just the first (#2249, mirroring #2139's
-            // own review finding for `resolve_index_expr`): `target`'s
-            // trackability can differ per pair once `target` is genuinely
-            // re-evaluated per pair, if its own AST has a runtime branch
-            // (`if`/`select`/`try`-`catch`) whose taken arm a stateful
-            // condition (`input`, ...) steers differently across pairs.
-            // Latching a single verdict from the first pair would let a
-            // later pair's genuinely untracked branch through unchecked
-            // -- confirmed as a real data-corruption bug for
-            // `resolve_index_expr`'s own first draft of #2139.
-            if let Some(PathBranch {
-                value: first_value, ..
-            }) = branches.iter().find(|b| !trackable || !b.trackable)
-            {
-                escape!(EvalError::invalid_path_expression_near_access(
-                    &slice_component_value(*s, s_key.as_ref(), *e, e_key.as_ref()),
-                    first_value,
-                )
-                .into());
-            }
             // Keeps `target`'s own partial prefix, not just discarding it
             // via `?`, the same fix #896's review applied to
             // `resolve_index_expr`'s sibling target-resolution step (found
@@ -25451,11 +25441,36 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
             for PathBranch {
                 path: components,
                 value: target_value,
-                // As in `resolve_index_expr`: the check above already
-                // rejected every untracked target branch.
+                trackable: branch_trackable,
                 ..
             } in &branches
             {
+                // #843/#986 (#2248 review): checked per branch, right
+                // before that branch is sliced, not as an upfront
+                // `.find()` scan before this loop starts. An upfront scan
+                // escaped on *any* untrackable branch anywhere in the
+                // list, discarding every trackable branch that came
+                // before it in `out` -- confirmed live as a real
+                // output-loss bug, mirroring `resolve_index_expr`'s
+                // identical one: `path((.,5)[(0,1):(2,error("mid"))])` on
+                // jq 1.7.1 prints `[{"start":0,"end":2}]` (the `.`
+                // branch's own successful slice) before raising `mid`;
+                // the upfront scan here produced no stdout at all.
+                // Re-checked on *every* pair's own freshly-resolved
+                // `branches` (#2249: `target` is no longer cached across
+                // pairs at all, so there is nothing to skip re-checking --
+                // unlike this same review's finding for #2245-era cached
+                // `target_branches`, which #2249 has since replaced with
+                // per-pair re-resolution). See `untrackable_branch_escape`'s
+                // own doc comment for why the two conditions stay merged.
+                if let Some(control) = untrackable_branch_escape(
+                    trackable,
+                    *branch_trackable,
+                    &slice_component_value(*s, s_key.as_ref(), *e, e_key.as_ref()),
+                    target_value,
+                ) {
+                    escape!(control);
+                }
                 // `false`, not `optional`: the failure has to arrive as an
                 // error for the two spellings to be told apart here, same
                 // as `resolve_index_expr`'s `index_one_owned` call.
