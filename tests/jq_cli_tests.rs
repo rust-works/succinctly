@@ -22401,6 +22401,49 @@ fn test_jq_cursor_transparent_fast_paths_wellformed_unaffected_2261() -> Result<
     Ok(())
 }
 
+/// #2261: `len_checked`/`Expr::Index`'s own #1677 *leading*-gap check (a
+/// malformed comma *between* two real elements, `[1,,3]`) is the sibling
+/// case to this issue's own trailing-comma repro, and shares the same new
+/// code path (`length`/`.[0]` no longer call the bare, unchecked `len()`).
+/// Pins that the leading-gap arm still raises through both builtins now
+/// that they route through `len_checked`.
+#[test]
+fn test_jq_length_and_index_leading_comma_gap_still_raises_2261() -> Result<()> {
+    for query in ["length", ".[0]"] {
+        let (out, stderr, code) = run_jq_full(&["-c", query], Some(r"[1,,3]"))?;
+        assert_eq!(code, 5, "query={query}: out: {out:?}, stderr: {stderr:?}");
+        assert!(
+            out.trim().is_empty(),
+            "query={query}: unexpected output {out:?}"
+        );
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "query={query}: stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #2261: `stream_lazy_keys_json` (`src/jq/stream.rs`) is a *different*
+/// writer from the bare-`keys_unsorted` one pinned above
+/// (`test_jq_lazy_keys_array_trailing_comma_leaves_truncated_bracket_2261`)
+/// -- it backs `keys_unsorted[]` reached through the M2 streaming path
+/// (`jq_runner.rs`'s `expr_is_cursor_transparent`, which admits
+/// `.x | keys_unsorted[]`: the pipe's first stage `.x` already descends off
+/// the root, so nothing after it needs to be root-safe). Confirmed this is
+/// really a different code path -- not just the same check reached twice --
+/// by grepping the touched-line coverage report for this exact line before
+/// adding the test.
+#[test]
+fn test_jq_m2_streaming_keys_unsorted_after_descend_rejects_trailing_comma_2261() -> Result<()> {
+    let (out, stderr, code) =
+        run_jq_full(&["-c", ".x | keys_unsorted[]"], Some(r#"{"x":{"a":1,}}"#))?;
+    assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
+    assert_eq!(out.trim(), "\"a\"", "the one real key should still stream");
+    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+    Ok(())
+}
+
 /// #1643 follow-up: `-S`/`-C`/`--slurp` bypass `print_json` entirely --
 /// they materialize via `parse_json_stream`'s fallback (which backs the
 /// "original" input path `-S`/`-C`/`--slurp` force), reaching
