@@ -39,9 +39,9 @@ use std::rc::Rc;
 use indexmap::IndexMap;
 
 use super::document::{
-    effective_fields, effective_fields_checked, effective_keys, effective_len, key_display_string,
-    key_display_string_kind, resolve_display_key, DisplayKeyGuard, DocumentElements,
-    DocumentFields,
+    effective_fields, effective_fields_checked, effective_keys, effective_len, key_delimiter_ok,
+    key_display_string, key_display_string_kind, resolve_display_key, trailing_element_gap_ok,
+    value_delimiter_ok, DisplayKeyGuard, DocumentCursor, DocumentElements, DocumentFields,
 };
 use super::slice::{self, SliceBounds};
 use super::walk::{any_subexpr, map_builtin_subexprs, map_subexprs};
@@ -613,8 +613,21 @@ fn to_owned_lossy_at_depth<W: Clone + AsRef<[u64]>>(
 /// soundness rule.
 ///
 /// Mirrors `eval_generic::to_owned_at_depth`'s already-fixed shape
-/// (#1247/#1620/#1660), which this private, `StandardJson`-specific copy
-/// originally never received.
+/// (#1247/#1620/#1660/#1677/#2243), which this private, `StandardJson`-
+/// specific copy originally never received in full -- #2262 found this
+/// function still missing #1677's malformed-`,`/`:` delimiter check and
+/// #2243's trailing-comma-after-a-real-last-child check entirely (not
+/// independently reachable through the shipped CLI with raw untrusted
+/// text -- every production caller re-serializes an already-materialized
+/// `OwnedValue` before this function ever runs on it -- but a real gap for
+/// a direct library caller of the public `succinctly::jq::eval` entry
+/// point). #2211's `container_gap_ok` (a stray `,` with *zero* real
+/// children, `[,]`/`{,}`) is not addable here: unlike
+/// `to_owned_cursor_at_depth`, this function is never given a cursor for
+/// the *container itself* (only `value: &StandardJson<'_, W>`), so once a
+/// container's child walk is exhausted there is no cursor left to find its
+/// opening bracket from -- the same limitation #2211 already documented for
+/// `jq_runner::standard_json_to_jq_value`'s identical value-only shape.
 ///
 /// A decode failure raised here is never suppressed by `?` — see
 /// [`suppresses`], and [`to_owned_or_suppress`] for the call-site idiom
@@ -650,9 +663,36 @@ fn to_owned_at_depth<W: Clone + AsRef<[u64]>>(
             Err(e) => return Err(EvalError::decode_failure(e.message())),
         },
         StandardJson::Array(elements) => {
-            let items: Vec<OwnedValue> = (*elements)
-                .map(|e| to_owned_at_depth(&e, depth + 1))
-                .collect::<Result<_, _>>()?;
+            let mut items = Vec::new();
+            let mut elems = *elements;
+            let mut is_first = true;
+            // #2262: last real element's own cursor, retained past the loop
+            // so the trailing-gap check below (`[1,]`) has something to
+            // check from -- mirrors `eval_generic::to_owned_cursor_at_depth`'s
+            // own `last_elem` (#2243).
+            let mut last_elem: Option<JsonCursor<'_, W>> = None;
+            while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
+                // #1677/#2262: same gap check as
+                // `eval_generic::to_owned_at_depth`'s array loop -- this
+                // function had none of it before #2262.
+                if !elem_cursor.element_gap_ok(is_first) {
+                    return Err(elem_cursor.malformed_delimiter_error());
+                }
+                items.push(to_owned_at_depth(&elem_cursor.value(), depth + 1)?);
+                last_elem = Some(elem_cursor);
+                elems = rest;
+                is_first = false;
+            }
+            // #2262: see this function's own doc comment above -- `[,]`
+            // (#2211's `container_gap_ok`) can't be checked here, no
+            // container cursor is ever in hand. `[1,]` (#2243) can: it
+            // only needs the last real element's own cursor, retained
+            // above.
+            if let Some(last) = &last_elem {
+                if !trailing_element_gap_ok(last, b']') {
+                    return Err(last.malformed_delimiter_error());
+                }
+            }
             OwnedValue::Array(items)
         }
         StandardJson::Object(fields) => {
@@ -668,6 +708,10 @@ fn to_owned_at_depth<W: Clone + AsRef<[u64]>>(
             // from). Mirrors `eval_generic::to_owned_at_depth`'s own walk
             // shape for exactly this reason.
             let mut f = *fields;
+            let mut is_first = true;
+            // #2262: same reasoning as the array arm's own `last_elem`
+            // above.
+            let mut last_field: Option<JsonCursor<'_, W>> = None;
             while let Some((field, rest)) = f.uncons() {
                 let key_val = field.key();
                 // `resolve_display_key` covers both key axes in one call
@@ -683,11 +727,30 @@ fn to_owned_at_depth<W: Clone + AsRef<[u64]>>(
                 let Some(key) = resolve_display_key(&key_val, &map, &mut guard)? else {
                     return Err(f.malformed_member_error());
                 };
+                // #1677/#2262: same delimiter checks as
+                // `eval_generic::to_owned_at_depth`'s object loop -- this
+                // function had none of it before #2262.
+                if !key_delimiter_ok::<JsonFields<'_, W>>(&key_val, &field.key_cursor(), is_first)
+                    || !value_delimiter_ok::<JsonFields<'_, W>>(
+                        Some(&field.value()),
+                        &field.value_cursor(),
+                    )
+                {
+                    return Err(f.malformed_member_error());
+                }
                 map.insert(key, to_owned_at_depth(&field.value(), depth + 1)?);
+                last_field = Some(field.value_cursor());
                 f = rest;
+                is_first = false;
             }
             if f.ends_unpaired() {
                 return Err(f.malformed_member_error());
+            }
+            // #2262: same reasoning as the array arm's own check above.
+            if let Some(last) = &last_field {
+                if !trailing_element_gap_ok(last, b'}') {
+                    return Err(last.malformed_delimiter_error());
+                }
             }
             OwnedValue::Object(map)
         }
@@ -54335,6 +54398,116 @@ mod tests {
         query!(doc, "keys",
             QueryResult::Error(_) => {}
         );
+    }
+
+    /// #2262: this crate's own `to_owned_at_depth` -- the materializer
+    /// behind the documented public library API (`succinctly::jq::eval`) --
+    /// had none of #1677's malformed-`,`/`:` delimiter check at all before
+    /// this fix, unlike `eval_generic::to_owned_at_depth`'s already-fixed
+    /// sibling it otherwise mirrors. Not independently reachable through
+    /// the shipped CLI (every production caller re-serializes an
+    /// already-materialized `OwnedValue` first), so this is a direct unit
+    /// test of the function itself, the only way to exercise the gap in
+    /// isolation -- same reasoning as
+    /// `test_nonreserializing_builtins_raise_on_missing_delimiter_1677`
+    /// (`eval_generic.rs`) and #2211's own `materialize_raises_on_...`
+    /// tests for their identical library-API-only findings.
+    #[test]
+    fn test_to_owned_raises_on_missing_delimiter_2262() {
+        for json in [b"[1 2, 3]".as_slice(), br#"{"a" 1, "b": 2}"#.as_slice()] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let err = match to_owned(&cursor.value()) {
+                Err(e) => e,
+                Ok(v) => panic!("{json:?}: a malformed delimiter is not JSON, got {v:?}"),
+            };
+            assert!(
+                err.message.contains("Invalid JSON text"),
+                "{json:?}: message: {}",
+                err.message
+            );
+        }
+    }
+
+    /// #2262: same function, #2243's trailing-stray-`,`-after-a-real-last-
+    /// child check (`[1,]`, `{"a":1,}`) -- also entirely missing before
+    /// this fix. Confirmed live before the fix (matching the issue's own
+    /// repro): `to_owned(&cursor.value())` on `[1,]` returned
+    /// `Ok(Array([Int(1)]))` at no error, where real jq 1.7.1 rejects the
+    /// document outright.
+    #[test]
+    fn test_to_owned_raises_on_trailing_comma_after_real_last_child_2262() {
+        for json in [b"[1,]".as_slice(), br#"{"a":1,}"#.as_slice()] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let err = match to_owned(&cursor.value()) {
+                Err(e) => e,
+                Ok(v) => panic!(
+                    "{json:?}: a trailing comma after a real last child is not JSON, got {v:?}"
+                ),
+            };
+            assert!(
+                err.message.contains("Invalid JSON text"),
+                "{json:?}: message: {}",
+                err.message
+            );
+        }
+    }
+
+    /// #2262: unlike the trailing-comma case above, a stray `,` with *zero*
+    /// real children (`[,]`, `{,}`) remains a known, deliberately unclosed
+    /// gap -- #2211's `container_gap_ok` needs a cursor to the *container
+    /// itself* to find its opening bracket, and this function is only ever
+    /// given a bare `value: &StandardJson<'_, W>`, never a cursor for the
+    /// container (unlike `eval_generic::to_owned_cursor_at_depth`'s own
+    /// `cursor` parameter). Once the child walk is exhausted there is no
+    /// cursor left to check against -- the same limitation #2211 already
+    /// documented for `jq_runner::standard_json_to_jq_value`'s identical
+    /// value-only shape. This pins the disagreement rather than leaving it
+    /// silently uncovered.
+    #[test]
+    fn test_to_owned_stray_comma_in_empty_container_remains_a_known_gap_2262() {
+        for json in [b"[,]".as_slice(), b"{,}".as_slice()] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            if let Err(e) = to_owned(&cursor.value()) {
+                panic!("{json:?}: known gap -- silently accepted, got error {e:?}");
+            }
+        }
+    }
+
+    /// #2262: well-formed arrays/objects (including a multi-element array
+    /// and a multi-field object) are unaffected by the two new checks
+    /// above.
+    #[test]
+    fn test_to_owned_wellformed_containers_unaffected_2262() {
+        for (json, expected) in [
+            (b"[]".as_slice(), OwnedValue::Array(vec![])),
+            (b"{}".as_slice(), OwnedValue::Object(IndexMap::new())),
+            (
+                b"[1,2,3]".as_slice(),
+                OwnedValue::Array(vec![
+                    OwnedValue::from_number_literal("1"),
+                    OwnedValue::from_number_literal("2"),
+                    OwnedValue::from_number_literal("3"),
+                ]),
+            ),
+            (
+                br#"{"a":1,"b":2}"#.as_slice(),
+                OwnedValue::Object(IndexMap::from([
+                    ("a".to_string(), OwnedValue::from_number_literal("1")),
+                    ("b".to_string(), OwnedValue::from_number_literal("2")),
+                ])),
+            ),
+        ] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            assert_eq!(
+                to_owned(&cursor.value()).unwrap(),
+                expected,
+                "{json:?}: to_owned"
+            );
+        }
     }
 
     /// Code review, #1829/#1835: the object arm's new error paths (#1194,
