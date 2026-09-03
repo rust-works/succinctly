@@ -29998,6 +29998,87 @@ fn test_eval_rs_only_sites_still_correct_2280() -> Result<()> {
     Ok(())
 }
 
+/// #2327: `builtin_del` (`eval.rs`), `builtin_envvar` (`eval.rs`),
+/// `builtin_transpose` (`eval.rs`), `builtin_group_by`/`unique_by`/`sort_by`'s
+/// own per-item conversion (`eval.rs`), and `builtin_halt_error` (`eval.rs`)
+/// all consulted `optional` for real now (routed through
+/// `to_owned_or_suppress!`/`suppress_or_raise` instead of a bare
+/// `to_owned`/`QueryResult::Error` match) -- following #2280's exact
+/// precedent, itself following #2231's.
+///
+/// `builtin_del`'s own case is the sharpest: its doc comment already
+/// promised this exact suppression ("any resulting error is caught right
+/// here, turning the whole call's output into empty when `optional` is
+/// set") without the code actually doing it.
+///
+/// Pins that this is defensive, not a behavior change: a document-wide
+/// decode failure (`\ud800`) still raises -- uncatchable, per #2286 tagging
+/// every one of these materializations' error paths `is_decode_failure()`
+/// -- through a bare call and a trailing `?`.
+#[test]
+fn test_optional_ignored_sites_2327() -> Result<()> {
+    for (filter, doc) in [
+        ("del(.d)", r#"{"a":"\ud800","d":5}"#),
+        ("env.HOME", r#"{"a":"\ud800"}"#),
+        ("transpose", r#"[[1,"\ud800"],[2,3]]"#),
+        ("group_by(.a)", r#"[{"a":1,"b":"\ud800"},{"a":2}]"#),
+        ("unique_by(.a)", r#"[{"a":1,"b":"\ud800"},{"a":2}]"#),
+        ("sort_by(.a)", r#"[{"a":1,"b":"\ud800"},{"a":2}]"#),
+        ("halt_error", r#"{"a":"\ud800"}"#),
+    ] {
+        for suffix in ["", "?"] {
+            let full_filter = format!("{filter}{suffix}");
+            let (stdout, stderr, code) = run_jq_stdin_streams(&full_filter, doc, &["-c"])?;
+            assert_eq!(
+                code, 5,
+                "{full_filter}: stdout {stdout:?} stderr {stderr:?}"
+            );
+            assert_eq!(stdout, "", "{full_filter}: stderr {stderr:?}");
+        }
+    }
+
+    // The `Reverse`/`Sort`/`SortBy`/`Unique`/`UniqueBy`/`Min`/`MinBy`/`Max`/
+    // `MaxBy` family's own `collect_cursors_checked` error class is a
+    // malformed element *gap* (trailing comma), not a value decode failure
+    // -- matching `test_jq_collect_cursors_checked_sibling_paths_reject_
+    // trailing_comma_2261`'s own fixture (`[1,2,3,]`).
+    for filter in [
+        "reverse",
+        "sort",
+        "unique",
+        "min",
+        "max",
+        "sort_by(.)",
+        "unique_by(.)",
+        "min_by(.)",
+        "max_by(.)",
+    ] {
+        for suffix in ["", "?"] {
+            let full_filter = format!("{filter}{suffix}");
+            let (stdout, stderr, code) = run_jq_stdin_streams(&full_filter, "[1,2,3,]", &["-c"])?;
+            assert_eq!(
+                code, 5,
+                "{full_filter}: stdout {stdout:?} stderr {stderr:?}"
+            );
+            assert_eq!(stdout, "", "{full_filter}: stderr {stderr:?}");
+        }
+    }
+
+    // Not a blanket rejection: the same builtins on a decodable document
+    // still succeed.
+    let (stdout, code) = run_jq_stdin("del(.a)", r#"{"a":1,"d":5}"#, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"{"d":5}"#);
+    let (stdout, code) = run_jq_stdin("transpose", "[[1,2],[3,4]]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[[1,3],[2,4]]");
+    let (stdout, code) = run_jq_stdin("group_by(.a)", r#"[{"a":1},{"a":2}]"#, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"[[{"a":1}],[{"a":2}]]"#);
+
+    Ok(())
+}
+
 /// #2053, constraint 2 from the issue that split this fix off from #1909:
 /// `path_expr` must be evaluated exactly once, on *both* branches
 /// `eval_generic.rs`'s new native `Builtin::GetPath` arm can take -- the

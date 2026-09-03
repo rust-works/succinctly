@@ -289,6 +289,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Six more sites ignored `optional`, continuing the #2231/#2280 lineage** (#2327,
+  follow-up from #2280's own code review): `eval.rs`'s `builtin_del` (its own doc comment
+  already promised "any resulting error is caught right here, turning the whole call's
+  output into empty when `optional` is set" — the code wasn't honoring it for this
+  particular materialization), `builtin_envvar`, `builtin_transpose`,
+  `builtin_group_by`/`unique_by`/`sort_by`'s shared per-item conversion, and
+  `builtin_halt_error`, plus `eval_generic.rs`'s `Reverse`/`Sort`/`SortBy`/`Unique`/
+  `UniqueBy`/`Min`/`MinBy`/`Max`/`MaxBy` family (`collect_cursors_checked`). All now route
+  through `to_owned_or_suppress!`/`owned_or_suppress!`/`suppress_or_raise` instead of a
+  bare match, matching every site had a genuinely live `optional` consulted elsewhere in
+  the same function — verified per-site before fixing, to rule out the false positives
+  that pattern otherwise produces.
+
+  Same defensive character as #2280's own sites: every error path these materializations
+  can produce (string decode failure, #1194 malformed member/delimiter/element-gap) is
+  `is_decode_failure()`-tagged since #2286, so `suppresses()` is unconditionally `false`
+  regardless of `optional` — verified live (`test_optional_ignored_sites_2327`,
+  `tests/jq_cli_tests.rs`) for all seven fixed shapes, including the `Reverse`/`Sort`/…
+  family's distinct trailing-comma error class (`[1,2,3,]`, matching
+  `test_jq_collect_cursors_checked_sibling_paths_reject_trailing_comma_2261`'s own
+  fixture).
+
+  `eval.rs`'s `eval_array_construction` (#2327's own "plausible, higher-impact" candidate)
+  was investigated and deliberately left unchanged: unlike the sites above, its own
+  surrounding code has no local precedent of consulting `optional` to suppress *this*
+  function's own error — `optional` there is only ever forwarded into the inner
+  expression's evaluation, and the function's own comment states array construction is
+  atomic in jq ("a `Partial` inner stream just surfaces its control, same as a bare one"),
+  i.e. every error always propagates regardless of `optional`. Applying the same macro
+  swap here would still be a no-op today (same `is_decode_failure()` reasoning), but
+  unlike the confirmed sites it isn't clearly *correcting an inconsistency the surrounding
+  code already established* — so it was left alone rather than changed on pattern-match
+  alone.
+
 - **Five sites ignored `optional`, an asymmetry #2231 already fixed for
   `debug`/`stderr`/`tostring`/its catch-all fallback** (#2280, follow-up from #2231's own
   code review): `eval_generic.rs`'s `Expr::Format` arm (gating every `@format` builtin —

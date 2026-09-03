@@ -9730,9 +9730,18 @@ fn builtin_group_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 };
                 // #1755: to_owned, not to_owned_lossy -- an undecodable
                 // string element must raise, not silently sort in as "".
+                //
+                // #2327: suppress_or_raise, not a bare `QueryResult::Error`
+                // -- `optional` is genuinely consulted elsewhere in this
+                // function (the non-array value-shape arms below), so
+                // ignoring it here was the same asymmetry #2280 fixed for
+                // Format/Path/GetPath. Defensive today, not a live behavior
+                // change: `to_owned`'s only error path is
+                // `is_decode_failure()`-tagged, which `suppress_or_raise`
+                // never suppresses regardless of `optional`.
                 let owned_item = match to_owned(&item) {
                     Ok(v) => v,
-                    Err(e) => return QueryResult::Error(e),
+                    Err(e) => return suppress_or_raise(e, optional),
                 };
                 keyed.push((key, owned_item));
             }
@@ -9894,9 +9903,18 @@ fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 };
                 // #1755: to_owned, not to_owned_lossy -- an undecodable
                 // string element must raise, not silently sort in as "".
+                //
+                // #2327: suppress_or_raise, not a bare `QueryResult::Error`
+                // -- `optional` is genuinely consulted elsewhere in this
+                // function (the non-array value-shape arms below), so
+                // ignoring it here was the same asymmetry #2280 fixed for
+                // Format/Path/GetPath. Defensive today, not a live behavior
+                // change: `to_owned`'s only error path is
+                // `is_decode_failure()`-tagged, which `suppress_or_raise`
+                // never suppresses regardless of `optional`.
                 let owned_item = match to_owned(&item) {
                     Ok(v) => v,
-                    Err(e) => return QueryResult::Error(e),
+                    Err(e) => return suppress_or_raise(e, optional),
                 };
                 keyed.push((key, owned_item));
             }
@@ -9989,9 +10007,18 @@ fn builtin_sort_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 };
                 // #1755: to_owned, not to_owned_lossy -- an undecodable
                 // string element must raise, not silently sort in as "".
+                //
+                // #2327: suppress_or_raise, not a bare `QueryResult::Error`
+                // -- `optional` is genuinely consulted elsewhere in this
+                // function (the non-array value-shape arms below), so
+                // ignoring it here was the same asymmetry #2280 fixed for
+                // Format/Path/GetPath. Defensive today, not a live behavior
+                // change: `to_owned`'s only error path is
+                // `is_decode_failure()`-tagged, which `suppress_or_raise`
+                // never suppresses regardless of `optional`.
                 let owned_item = match to_owned(&item) {
                     Ok(v) => v,
-                    Err(e) => return QueryResult::Error(e),
+                    Err(e) => return suppress_or_raise(e, optional),
                 };
                 keyed.push((key, owned_item));
             }
@@ -37556,12 +37583,11 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Convert to owned and delete the path
-    let result = match to_owned(&value) {
-        Ok(result) => result,
-        Err(e) => return QueryResult::Error(e),
-    };
-
+    // #2327: to_owned_or_suppress!, not a bare match -- this function's own
+    // comment below already promises "any resulting error is caught right
+    // here, turning the whole call's output into empty when `optional` is
+    // set", which this first materialization wasn't honoring.
+    //
     // `optional` here is `del(...)`'s *own* `?` (`del(.a)?`), i.e. jq's
     // `try del(.a) catch empty` around the whole call — not a per-step
     // tolerance. It must never reach the walkers below as their starting
@@ -37573,6 +37599,7 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // path (`del(.a?)`) is unaffected — it's already a distinct
     // `Expr::Optional` node baked into `path_expr`, which the walkers still
     // honor on their own.
+    let result = to_owned_or_suppress!(&value, optional);
 
     // yq's comma-grouped chained-slice del() pre-rewrite (#1223):
     // `resolve_dynamic_indexes`'s own generic navigation raises a hard type
@@ -42708,9 +42735,16 @@ fn builtin_halt_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // #1755: to_owned, not to_owned_lossy -- an undecodable value must
     // raise a normal, catchable error rather than halting the process with
     // a corrupted "" message in its place.
+    //
+    // #2327: suppress_or_raise, not a bare `QueryResult::Error` -- `optional`
+    // is genuinely consulted earlier in this function (threaded into
+    // `each_take_first` for the code-expr), so ignoring it here was the same
+    // asymmetry #2280 fixed for Format/Path/GetPath. Defensive today: this
+    // materialization's only error path is `is_decode_failure()`-tagged,
+    // which is never suppressed regardless of `optional` either way.
     let owned = match to_owned(&value) {
         Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return suppress_or_raise(e, optional),
     };
     match &owned {
         OwnedValue::Null => {}
@@ -42772,10 +42806,12 @@ fn builtin_envvar<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // #1820: to_owned, not to_owned_lossy -- `value` (`.`, the binding
     // `var` is evaluated against) used to silently become `""` on an
     // undecodable string instead of raising.
-    let owned_value = match to_owned(&value) {
-        Ok(v) => v,
-        Err(e) => return QueryResult::Error(e),
-    };
+    //
+    // #2327: to_owned_or_suppress!, not a bare match -- `optional` is
+    // consulted twice below (the non-string-name fallback and the
+    // variable-not-set case), so ignoring it here was the same asymmetry
+    // #2280 fixed for Format/Path/GetPath.
+    let owned_value = to_owned_or_suppress!(&value, optional);
     let var_result = eval_owned_expr_ctrl_full::<S>(var, &owned_value, optional);
     let (var_name, trailing) = match var_result {
         Ok((OwnedValue::String(s), trailing)) => (s, trailing),
@@ -42937,17 +42973,22 @@ fn builtin_transpose<W: Clone + AsRef<[u64]>>(
     // Collect all inner arrays
     // #1755: to_owned, not to_owned_lossy -- an undecodable element must
     // raise, not silently become "" and take part in the transpose.
+    //
+    // #2327: suppress_or_raise, not a bare `QueryResult::Error(e)` -- the
+    // top-level non-array check above already consults `optional`, so
+    // ignoring it for these two element-level materializations was the same
+    // asymmetry #2280 fixed for Format/Path/GetPath.
     let mut inner_arrays: Vec<Vec<OwnedValue>> = Vec::new();
     for item in elements {
         match item {
             StandardJson::Array(inner) => match inner.map(|v| to_owned(&v)).collect() {
                 Ok(row) => inner_arrays.push(row),
-                Err(e) => return QueryResult::Error(e),
+                Err(e) => return suppress_or_raise(e, optional),
             },
             // Non-array elements are treated as single-element arrays
             _ => match to_owned(&item) {
                 Ok(owned) => inner_arrays.push(vec![owned]),
-                Err(e) => return QueryResult::Error(e),
+                Err(e) => return suppress_or_raise(e, optional),
             },
         }
     }
