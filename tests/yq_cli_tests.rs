@@ -8851,21 +8851,23 @@ fn test_from_file_with_stdin() -> Result<()> {
     let mut filter_file = NamedTempFile::new()?;
     writeln!(filter_file, ".name")?;
 
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .arg("yq")
-        .arg("--from-file")
-        .arg(filter_file.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    // #2054: bespoke `spawn_with_signal_retry` call, not one of the
+    // filter-string helpers above -- `--from-file <path>` has no filter
+    // positional at all. See `run_yq_stdin`'s own #2016 doc comment for why
+    // this can't be a hand-rolled `spawn()` + `write_all(...)?` +
+    // `wait_with_output()` sequence. `build` has no `'static` bound (called
+    // locally, in a loop), so it borrows `filter_file` directly rather than
+    // cloning its path first.
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_succinctly"));
+            command.arg("yq").arg("--from-file").arg(filter_file.path());
+            command
+        },
+        Some(b"name: Bob\n"),
+    )?;
 
-    if let Some(mut stdin) = cmd.stdin.take() {
-        stdin.write_all(b"name: Bob\n")?;
-    }
-
-    let output = cmd.wait_with_output()?;
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(code, 0);
     assert_eq!(String::from_utf8(output.stdout)?, "Bob\n");
     Ok(())
 }
@@ -9107,38 +9109,17 @@ fn test_exit_status_empty_input_exits_one() -> Result<()> {
 #[test]
 fn test_exit_status_prints_no_matches_found_to_stderr() -> Result<()> {
     // Match yq's exact stderr message; stdout still carries the falsy value.
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args(["yq", "-e", "-I", "0", "."])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    if let Some(mut stdin) = cmd.stdin.take() {
-        stdin.write_all(b"false")?;
-    }
-    let output = cmd.wait_with_output()?;
-    assert_eq!(output.status.code(), Some(1));
-    assert_eq!(
-        String::from_utf8(output.stderr)?.trim(),
-        "Error: no matches found"
-    );
+    let (_out, stderr, code) = run_yq_stdin_with_stderr(".", "false", &["-e", "-I", "0"])?;
+    assert_eq!(code, 1);
+    assert_eq!(stderr.trim(), "Error: no matches found");
     Ok(())
 }
 
 #[test]
 fn test_exit_status_no_stderr_message_when_truthy() -> Result<()> {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args(["yq", "-e", "-I", "0", "."])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    if let Some(mut stdin) = cmd.stdin.take() {
-        stdin.write_all(b"true")?;
-    }
-    let output = cmd.wait_with_output()?;
-    assert_eq!(output.status.code(), Some(0));
-    assert_eq!(String::from_utf8(output.stderr)?.trim(), "");
+    let (_out, stderr, code) = run_yq_stdin_with_stderr(".", "true", &["-e", "-I", "0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stderr.trim(), "");
     Ok(())
 }
 
@@ -11537,18 +11518,9 @@ fn test_yq_last_of_an_empty_stream_is_null_1521() -> Result<()> {
 /// behavior either way -- a small in-range float still round-trips exactly.
 #[test]
 fn test_jq_mode_computed_float_formatting_unaffected_by_997() -> Result<()> {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .args(["jq", "-c", ".a * 1"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    if let Some(mut stdin) = cmd.stdin.take() {
-        stdin.write_all(br#"{"a": 1.5}"#)?;
-    }
-    let output = cmd.wait_with_output()?;
-    assert_eq!(output.status.code(), Some(0));
-    assert_eq!(String::from_utf8(output.stdout)?.trim(), "1.5");
+    let (out, _stderr, code) = run_jq_stdin_with_stderr(".a * 1", r#"{"a": 1.5}"#, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "1.5");
     Ok(())
 }
 
@@ -17508,20 +17480,9 @@ fn test_yq_tostring_computed_float_within_threshold_stays_decimal_1054() -> Resu
 /// leaked from the yq-only branch into jq mode.
 #[test]
 fn test_jq_tostring_computed_float_unaffected_1054() -> Result<()> {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
-    cmd.arg("jq")
-        .args(["-r", "(1e10 * 2) | tostring"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd.spawn()?;
-    child.stdin.take().unwrap().write_all(b"1")?;
-    let output = child.wait_with_output()?;
-    assert_eq!(output.status.code(), Some(0));
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout).trim_end(),
-        "20000000000"
-    );
+    let (out, _stderr, code) = run_jq_stdin_with_stderr("(1e10 * 2) | tostring", "1", &["-r"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim_end(), "20000000000");
     Ok(())
 }
 
@@ -18133,20 +18094,8 @@ fn test_yq_sub_3arg_zero_width_pattern_interaction_1122() -> Result<()> {
 /// stay untouched by this yq-only fix -- confirmed against jq 1.7.1.
 #[test]
 fn test_jq_sub_3arg_unaffected_by_1122() -> Result<()> {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .arg("jq")
-        .arg("-c")
-        .arg(r#""AAA" | sub("a";"X";"i")"#)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    if let Some(mut stdin) = cmd.stdin.take() {
-        stdin.write_all(b"null")?;
-    }
-    let output = cmd.wait_with_output()?;
-    let code = exit_code_or_signal_death(output.status, &output.stderr)?;
-    let stdout = String::from_utf8(output.stdout)?;
+    let (stdout, _stderr, code) =
+        run_jq_stdin_with_stderr(r#""AAA" | sub("a";"X";"i")"#, "null", &["-c"])?;
     assert_eq!(code, 0, "stdout: {stdout:?}");
     assert_eq!(stdout.trim_end(), "\"XAA\"");
     Ok(())
@@ -18967,17 +18916,9 @@ fn test_slice_assign_through_field_after_slice_still_errors_1142() -> Result<()>
 /// splicing the write-through result into the array, matching real jq.
 #[test]
 fn test_slice_compound_add_array_target_jq_mode_unaffected_1142() -> Result<()> {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
-    cmd.arg("jq").arg("-c").arg(".[0:2] += [99]");
-    let mut child = cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    child.stdin.take().unwrap().write_all(b"[1,2,3]")?;
-    let output = child.wait_with_output()?;
-    assert_eq!(output.status.code(), Some(0));
-    assert_eq!(String::from_utf8(output.stdout)?.trim(), "[1,2,99,3]");
+    let (out, _stderr, code) = run_jq_stdin_with_stderr(".[0:2] += [99]", "[1,2,3]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[1,2,99,3]");
     Ok(())
 }
 
@@ -19139,21 +19080,11 @@ fn test_yq_field_index_assign_container_root_unaffected_1181() -> Result<()> {
 #[test]
 fn test_field_index_assign_scalar_jq_mode_unaffected_1181() -> Result<()> {
     for filter in [".a = 99", ".[0] = 99", "0 as $k | .[$k] = 99", ".a -= 1"] {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
-        cmd.arg("jq").arg(filter);
-        let mut child = cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        child.stdin.take().unwrap().write_all(b"5")?;
-        let output = child.wait_with_output()?;
+        let (_out, stderr, code) = run_jq_stdin_with_stderr(filter, "5", &[])?;
         assert_ne!(
-            output.status.code(),
-            Some(0),
+            code, 0,
             "filter {filter:?} unexpectedly succeeded in jq mode"
         );
-        let stderr = String::from_utf8(output.stderr)?;
         assert!(
             stderr.contains("Cannot index number"),
             "filter {filter:?} stderr: {stderr:?}"
@@ -19279,23 +19210,11 @@ fn test_yq_iterate_pipe_chain_null_autovivifies_under_update_assign_1919() -> Re
 
     // jq mode is unaffected: no null-autovivify rule for Iterate at all,
     // matching real jq.
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
-    cmd.arg("jq").arg(".a[].b |= 5");
-    let mut child = cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    child.stdin.take().unwrap().write_all(br#"{"a":null}"#)?;
-    let output = child.wait_with_output()?;
+    let (_out, stderr, code) = run_jq_stdin_with_stderr(".a[].b |= 5", r#"{"a":null}"#, &[])?;
+    assert_ne!(code, 0, "jq mode should still raise: stderr {stderr:?}");
     assert!(
-        !output.status.success(),
-        "jq mode should still raise: {output:?}"
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("Cannot iterate over null"),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+        stderr.contains("Cannot iterate over null"),
+        "stderr: {stderr}"
     );
     Ok(())
 }
@@ -19316,21 +19235,8 @@ fn test_yq_iterate_assign_container_target_unaffected_1181() -> Result<()> {
 #[test]
 fn test_yq_iterate_assign_scalar_jq_mode_unaffected_1181() -> Result<()> {
     for input in ["5", "null"] {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
-        cmd.arg("jq").arg(".[] = 99");
-        let mut child = cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        child.stdin.take().unwrap().write_all(input.as_bytes())?;
-        let output = child.wait_with_output()?;
-        assert_ne!(
-            output.status.code(),
-            Some(0),
-            "input {input:?} unexpectedly succeeded in jq mode"
-        );
-        let stderr = String::from_utf8(output.stderr)?;
+        let (_out, stderr, code) = run_jq_stdin_with_stderr(".[] = 99", input, &[])?;
+        assert_ne!(code, 0, "input {input:?} unexpectedly succeeded in jq mode");
         assert!(
             stderr.contains("Cannot iterate"),
             "input {input:?} stderr: {stderr:?}"
@@ -19948,29 +19854,10 @@ fn test_yq_base64d_container_stringifies_to_empty_1109() -> Result<()> {
 /// erroring on every non-string scalar, exactly as before.
 #[test]
 fn test_jq_urid_base64d_still_reject_non_string_1109() -> Result<()> {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
-    cmd.arg("jq").arg("@urid");
-    let mut child = cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    child.stdin.take().unwrap().write_all(b"42")?;
-    let output = child.wait_with_output()?;
-    let code = exit_code_or_signal_death(output.status, &output.stderr)?;
-    assert_ne!(code, 0);
-
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
-    cmd.arg("jq").arg("@base64d");
-    let mut child = cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    child.stdin.take().unwrap().write_all(b"42")?;
-    let output = child.wait_with_output()?;
-    let code = exit_code_or_signal_death(output.status, &output.stderr)?;
-    assert_ne!(code, 0);
+    for filter in ["@urid", "@base64d"] {
+        let (_out, _stderr, code) = run_jq_stdin_with_stderr(filter, "42", &[])?;
+        assert_ne!(code, 0, "filter {filter:?} unexpectedly succeeded");
+    }
     Ok(())
 }
 
@@ -22681,18 +22568,9 @@ fn test_slice_assign_computed_bound_unaffected_targets_1117() -> Result<()> {
 /// still errors there, matching real jq exactly.
 #[test]
 fn test_slice_assign_scalar_computed_bound_jq_mode_unaffected_1117() -> Result<()> {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
-    cmd.arg("jq")
-        .arg("-c")
-        .arg("0 as $a | 1 as $b | .[$a:$b] = 99");
-    let mut child = cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    child.stdin.take().unwrap().write_all(b"5")?;
-    let output = child.wait_with_output()?;
-    assert_ne!(output.status.code(), Some(0));
+    let (_out, _stderr, code) =
+        run_jq_stdin_with_stderr("0 as $a | 1 as $b | .[$a:$b] = 99", "5", &["-c"])?;
+    assert_ne!(code, 0);
     Ok(())
 }
 
@@ -22766,16 +22644,7 @@ fn test_yq_base64d_rejects_embedded_whitespace_1123() -> Result<()> {
 /// errors in jq 1.7.1).
 #[test]
 fn test_jq_base64d_does_not_trim_whitespace_1123() -> Result<()> {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"));
-    cmd.arg("jq").arg("@base64d");
-    let mut child = cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    child.stdin.take().unwrap().write_all(br#"" aGVsbG8=""#)?;
-    let output = child.wait_with_output()?;
-    let code = exit_code_or_signal_death(output.status, &output.stderr)?;
+    let (_out, _stderr, code) = run_jq_stdin_with_stderr("@base64d", r#"" aGVsbG8=""#, &[])?;
     assert_ne!(code, 0);
     Ok(())
 }
@@ -24767,18 +24636,9 @@ fn test_yq_splits_extension_keeps_jq_style_zero_width_1255() -> Result<()> {
 /// completely untouched by this yq-only fix.
 #[test]
 fn test_jq_gsub_zero_width_unaffected_by_1255() -> Result<()> {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .arg("jq")
-        .arg("-c")
-        .arg(r#""bab" | gsub("a*";"X")"#)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
-    if let Some(mut stdin) = cmd.stdin.take() {
-        stdin.write_all(b"null")?;
-    }
-    let output = cmd.wait_with_output()?;
-    let stdout = String::from_utf8(output.stdout)?;
+    let (stdout, _stderr, code) =
+        run_jq_stdin_with_stderr(r#""bab" | gsub("a*";"X")"#, "null", &["-c"])?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
     assert_eq!(stdout.trim(), r#""XbXXbX""#);
     Ok(())
 }
