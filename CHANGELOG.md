@@ -289,6 +289,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Three more sites ignored `optional`, an asymmetry #2231 already fixed for
+  `debug`/`stderr`/`tostring`/its catch-all fallback** (#2280, follow-up from #2231's own
+  code review): `eval_format` (`src/jq/eval.rs`, gating every `@format` builtin —
+  `@json`, `@csv`, `@tsv`, `@dsv`, `@uri`, `@html`, `@base64`, `@sh`, `@yaml`, `@props`,
+  `@text`) and `eval_generic.rs`'s `Builtin::Path`/`Builtin::GetPath` arms all raised an
+  unconditional error from their own materialization instead of consulting `optional` the
+  #2184/#2015/#2231 lineage's shared macros (`to_owned_or_suppress!`/`owned_or_suppress!`)
+  already provide. `GetPath`'s arm was a particularly sharp inconsistency: its own comment
+  already documents threading `optional` "for real" into `getpath_walk_owned`'s per-step
+  decision, while the initial materialization two lines above stayed on the unconditional
+  macro.
+
+  Like #2231's own findings 1-3, this is defensive rather than a live behavior change
+  today: #2286 tagged every error path these materializations can produce (string decode
+  failure, #1194 malformed member/delimiter)
+  `is_decode_failure()`, and `suppresses(e, optional) = optional && !e.is_decode_failure()`
+  is unconditionally `false` for all of them regardless of `optional` — verified live
+  (`test_optional_ignored_sites_2280`, `tests/jq_cli_tests.rs`), mirroring
+  `test_try_catch_handler_still_runs_under_outer_optional_2231`'s own methodology. Still
+  correct to fix: the macro swap also keeps propagating a genuine decode failure
+  unchanged, and removes the dependency on this reachability analysis staying true if a
+  future error class is ever routed through the same call.
+
+  A fourth review finding — ~85 raw `to_owned(&…)` calls in `eval.rs` and ~12 raw
+  `to_owned_with_cursor(` calls in `eval_generic.rs` still don't route through these
+  macros, with no structural guard (rename, lint, CI grep) to stop the pattern
+  recurring — was left as a judgment call rather than acted on here: the #2286
+  convergence above means most of that remaining surface is likely already
+  decode-failure-only too, lowering the urgency a Low-severity, non-live-reachable
+  defensive-consistency issue justifies for a new CI enforcement mechanism. Noted on the
+  issue for whoever picks up the next installment of this lineage.
+
 - **`--argjson`/`--jsonargs` rejected a leading-dot (`.5`, #1171) or trailing-dot-before-
   exponent (`1.e5`, #2220) number literal outright, where real jq's own number parser
   accepts both** (#2240 Gap 2): a `--argjson`/`--jsonargs` value needing either leniency

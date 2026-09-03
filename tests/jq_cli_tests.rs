@@ -29895,6 +29895,58 @@ fn test_getpath_still_raises_on_an_undecodable_sibling_2053() -> Result<()> {
     Ok(())
 }
 
+/// #2280: `eval_format` (every `@format` builtin), and `Builtin::Path`/
+/// `Builtin::GetPath`'s own materialization fallback, all consulted
+/// `optional` for real now (routed through `to_owned_or_suppress!`/
+/// `owned_or_suppress!` instead of a bare `to_owned`/`owned_or_err!` match)
+/// -- following #2231's exact precedent for `debug`/`stderr`/`tostring`/the
+/// catch-all fallback.
+///
+/// Pins that this is defensive, not a behavior change: a document-wide
+/// decode failure (`\ud800`, matching `test_getpath_still_raises_on_an_
+/// undecodable_sibling_2053`'s own repro) still raises -- uncatchable, per
+/// #2286 tagging every one of these materializations' error paths
+/// `is_decode_failure()` -- through a bare call, a trailing `?`, and a
+/// `try`/`catch` wrapped in its own outer `?` (the exact shape #2231's
+/// `test_try_catch_handler_still_runs_under_outer_optional_2231` uses to
+/// rule out a leaf silently self-suppressing ahead of an enclosing catch).
+#[test]
+fn test_optional_ignored_sites_2280() -> Result<()> {
+    let doc = r#"{"a":"\ud800","d":5}"#;
+    for filter in [
+        r".a | @json",
+        r".a | @json?",
+        r#"(try (.a | @json) catch "CAUGHT")?"#,
+        "path(.a)",
+        "path(.a)?",
+        r#"(try path(.a) catch "CAUGHT")?"#,
+        r#"getpath(["a"])"#,
+        r#"getpath(["a"])?"#,
+        r#"(try getpath(["a"]) catch "CAUGHT")?"#,
+    ] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
+        assert_eq!(code, 5, "{filter}: stdout {stdout:?} stderr {stderr:?}");
+        assert_eq!(stdout, "", "{filter}: stderr {stderr:?}");
+    }
+
+    // `@json` is not a blanket rejection of the whole document -- unlike
+    // `path`/`getpath` (whose own whole-document validity gate is pinned by
+    // `test_path_still_raises_on_an_undecodable_sibling_2061`/
+    // `test_getpath_still_raises_on_an_undecodable_sibling_2053`, and still
+    // raises on the decodable `.d` field below, same as those two), `@json`
+    // materializes only the already-navigated sub-cursor, so `.d | @json`
+    // succeeds on this same document even though `.a` is undecodable.
+    let (stdout, code) = run_jq_stdin(".d | @json", doc, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "\"5\"");
+    let (_, _, code) = run_jq_stdin_streams("path(.d)", doc, &["-c"])?;
+    assert_eq!(code, 5, "path()'s whole-document gate should still fire");
+    let (_, _, code) = run_jq_stdin_streams(r#"getpath(["d"])"#, doc, &["-c"])?;
+    assert_eq!(code, 5, "getpath()'s whole-document gate should still fire");
+
+    Ok(())
+}
+
 /// #2053, constraint 2 from the issue that split this fix off from #1909:
 /// `path_expr` must be evaluated exactly once, on *both* branches
 /// `eval_generic.rs`'s new native `Builtin::GetPath` arm can take -- the

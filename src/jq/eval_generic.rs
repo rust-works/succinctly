@@ -10974,7 +10974,19 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     Err(e) => partial_generic(out, Control::Error(e)),
                 };
             }
-            let owned = owned_or_err!(to_owned_with_cursor(&value, cursor));
+            // #2280: owned_or_suppress!, not owned_or_err! -- `optional` is a
+            // live parameter of this arm (threaded into `eval_on_owned`
+            // below), so ignoring it in this materialization specifically
+            // was a real asymmetry, matching the sibling fix already applied
+            // to `Builtin::ToString`'s arm and its catch-all fallback (#2231).
+            //
+            // Defensive, not a live behavior change today, for the same
+            // reason #2231's own findings 1-3 became defensive after #2286:
+            // this materialization's only error paths are all
+            // `is_decode_failure()`-tagged now, so `suppresses()` is always
+            // `false` here regardless of `optional` -- verified live, see
+            // `test_optional_ignored_sites_2280`.
+            let owned = owned_or_suppress!(to_owned_with_cursor(&value, cursor), optional);
             if reindex_bridge_is_identity(&owned) {
                 return query_result_to_generic::<V>(crate::jq::eval::builtin_path_on_owned::<
                     Vec<u64>,
@@ -11034,7 +11046,14 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         // dependency on that reachability analysis staying true, so it
         // stays -- but it is defensive, not currently load-bearing.
         Builtin::GetPath(path_expr) => {
-            let owned = owned_or_err!(to_owned_with_cursor(&value, cursor));
+            // #2280: owned_or_suppress!, not owned_or_err! -- this arm's own
+            // walk below already threads `optional` "for real" into
+            // `getpath_walk_owned`'s per-step suppress/raise decision, so
+            // leaving the initial materialization unconditional was an
+            // inconsistency inside the very arm whose comment documents the
+            // opposite intent. Defensive today for the same #2286 reason as
+            // the `Path` arm above -- see `test_optional_ignored_sites_2280`.
+            let owned = owned_or_suppress!(to_owned_with_cursor(&value, cursor), optional);
             if reindex_bridge_is_identity(&owned) {
                 return fanout_arg_generic::<S, V, _>(
                     path_expr,
