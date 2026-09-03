@@ -22290,10 +22290,19 @@ fn test_1116_chained_scalar_slice_del_navigator_type_mismatches_unaffected() -> 
 /// is unaffected.
 #[test]
 fn test_1116_chained_scalar_slice_del_navigator_out_of_bounds_unaffected() -> Result<()> {
+    // #2314: this used to assert the whole delete was a no-op ("out of
+    // bounds unaffected"), but that predates #2305/#2314's discovery that
+    // real yq extends an array on a positive out-of-range *index* step even
+    // when everything after it turns out to be a no-op through the `null`
+    // it created (`.b[0:1]` on a fresh `null` is itself a no-op, same as
+    // `.b`/`.[0:1]` each are individually) — the extension has already
+    // mutated `.a` by the time the walk reaches that null tail. Confirmed
+    // live against yq v4.53.3: index 99 extends `.a` to length 100.
     let input = r#"{"a":[{"b":5}]}"#;
     let (out, code) = run_yq_stdin("del(.a[99].b[0:1])", input, &["-o=json", "-I=0"])?;
     assert_eq!(code, 0);
-    assert_eq!(out.trim(), input);
+    let expected = format!(r#"{{"a":[{{"b":5}}{}]}}"#, ",null".repeat(99));
+    assert_eq!(out.trim(), expected);
     Ok(())
 }
 

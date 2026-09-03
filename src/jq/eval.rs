@@ -36193,9 +36193,25 @@ fn delete_paths_under(
                 if let Some(err) = yq_negative_index_error_for_len(yq_mode, key, arr.len()) {
                     return Err(err);
                 }
-                if let Some(index) = resolve_read_index(key, arr.len()) {
-                    let old = core::mem::replace(&mut arr[index], OwnedValue::Null);
-                    arr[index] = delete_paths_sorted(old, paths, start, yq_mode)?;
+                // #2314: same mid-chain extension as `delete_path_steps`'s
+                // own `Expr::Index` arm below -- a positive out-of-range
+                // index still needs to exist so the rest of `paths` can
+                // recurse into it (`index + 1`, `pad_with_nulls`'s own
+                // contract), not skipped as #2305's terminal case is.
+                // `delpaths`' path components are concrete keys, never a
+                // `.[]` wildcard, so there is no auto-vivify-to-`[]` nuance
+                // to mirror here -- the recursive `delete_paths_sorted` call
+                // below only ever sees a `String`/numeric next key.
+                match resolve_delete_index(key, arr.len()) {
+                    DeleteIndexResolution::InRange(index) => {
+                        let old = core::mem::replace(&mut arr[index], OwnedValue::Null);
+                        arr[index] = delete_paths_sorted(old, paths, start, yq_mode)?;
+                    }
+                    DeleteIndexResolution::PositiveOutOfRange(index) if yq_mode => {
+                        pad_with_nulls(&mut arr, index)?;
+                        arr[index] = delete_paths_sorted(OwnedValue::Null, paths, start, yq_mode)?;
+                    }
+                    DeleteIndexResolution::PositiveOutOfRange(_) | DeleteIndexResolution::Skip => {}
                 }
                 Ok(OwnedValue::Array(arr))
             }
@@ -37142,9 +37158,25 @@ fn delete_trie_array(
                     if let Some(err) = yq_negative_index_error_for_len(yq_mode, &key, arr.len()) {
                         return Err(err);
                     }
-                    match resolve_read_index(&key, arr.len()) {
-                        Some(actual) => {
+                    // #2314: same mid-chain extension as `delete_path_steps`'s
+                    // own `Expr::Index` arm -- a positive out-of-range index
+                    // still needs to exist so the rest of this branch's own
+                    // subtree can recurse into it. A bare `.[]` can never be
+                    // `child`'s own step here (comma-grouped `del()` paths
+                    // fan a mid-chain `.[]` out against the real document
+                    // before the trie is built -- see `Expr::Iterate`'s own
+                    // arm in `DeleteTrieBuilder::child_of` -- so unlike
+                    // `delete_path_steps` there is no auto-vivify-to-`[]`
+                    // case to mirror here).
+                    match resolve_delete_index(&key, arr.len()) {
+                        DeleteIndexResolution::InRange(actual) => {
                             let target = &mut arr[actual];
+                            let old = core::mem::replace(target, OwnedValue::Null);
+                            *target = delete_trie_apply(old, trie, child, yq_mode)?;
+                        }
+                        DeleteIndexResolution::PositiveOutOfRange(index) if yq_mode => {
+                            pad_with_nulls(arr, index)?;
+                            let target = &mut arr[index];
                             let old = core::mem::replace(target, OwnedValue::Null);
                             *target = delete_trie_apply(old, trie, child, yq_mode)?;
                         }
@@ -37152,7 +37184,8 @@ fn delete_trie_array(
                         // through, so `delpaths` silently skips the step
                         // itself, `?` or not (#477) — but the tail still
                         // decides (#527/#529).
-                        None => delete_trie_through_absent(trie, child)?,
+                        DeleteIndexResolution::PositiveOutOfRange(_)
+                        | DeleteIndexResolution::Skip => delete_trie_through_absent(trie, child)?,
                     }
                 }
                 // Deleting *through* a slice deletes inside the sub-array and
@@ -37878,13 +37911,42 @@ fn delete_path_steps(
                     if let Some(err) = yq_negative_index_error_for_len(yq_mode, &key, arr.len()) {
                         return Err(err);
                     }
-                    match resolve_read_index(&key, arr.len()) {
-                        Some(actual_idx) => {
+                    match resolve_delete_index(&key, arr.len()) {
+                        DeleteIndexResolution::InRange(actual_idx) => {
                             root = &mut arr[actual_idx];
                             steps = rest;
                             continue;
                         }
-                        None => {
+                        // #2314: a positive out-of-range mid-chain index
+                        // still needs to *exist* -- unlike #2305's terminal
+                        // case, there is more path left to navigate into, so
+                        // this uses `pad_with_nulls`'s own `index + 1`
+                        // contract (same as `setpath`) rather than
+                        // `extend_array_with_nulls_for_delete`'s `target_len`
+                        // one. Confirmed live (yq v4.53.3): `[1,2] |
+                        // del(.[5].a)` is `[1,2,null,null,null,null]`.
+                        DeleteIndexResolution::PositiveOutOfRange(index) if yq_mode => {
+                            pad_with_nulls(arr, index)?;
+                            // The freshly padded slot is `null`, which
+                            // `.[]` never tolerates (#527) -- but real yq
+                            // auto-vivifies it to `[]` instead when `.[]`
+                            // is the very next step, the same way
+                            // `setpath` auto-vivifies a `null` into
+                            // whatever container its own next step needs.
+                            // Confirmed live: `[1,2] | del(.[5][])` is
+                            // `[1,2,null,null,null,[]]`, not an error.
+                            if matches!(
+                                rest.first().map(|s| unwrap_path_component(s).0),
+                                Some(Expr::Iterate)
+                            ) {
+                                arr[index] = OwnedValue::Array(Vec::new());
+                            }
+                            root = &mut arr[index];
+                            steps = rest;
+                            continue;
+                        }
+                        DeleteIndexResolution::PositiveOutOfRange(_)
+                        | DeleteIndexResolution::Skip => {
                             // An out-of-range index resolves to null, and
                             // deleting further into null is a no-op for most
                             // tails, `?` or not (#477) — but not `[]`, which
@@ -68958,6 +69020,106 @@ mod tests {
         yq_query!(br"[1,2,3]", r"delpaths([[0],[5]])",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr, vec![OwnedValue::Int(2), OwnedValue::Int(3)]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_del_mid_chain_positive_out_of_range_index_extends_with_null_yq_mode_2314() {
+        // #2314: #2305's follow-up -- a positive out-of-range index that is
+        // *not* the terminal delete step still needs to exist, so the rest
+        // of the path (`.a` here) has something to navigate into. Unlike
+        // #2305's own `target_len` rule, the extension target is
+        // `index + 1` (`pad_with_nulls`'s own contract, same as `setpath`),
+        // since the index itself must be valid, not just the gap before it.
+        // Confirmed live against yq v4.53.3: `[1,2] | del(.[5].a)` is
+        // `[1,2,null,null,null,null]`.
+        yq_query!(br"[1,2]", r"del(.[5].a)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(
+                    arr,
+                    vec![
+                        OwnedValue::Int(1), OwnedValue::Int(2),
+                        OwnedValue::Null, OwnedValue::Null, OwnedValue::Null, OwnedValue::Null,
+                    ]
+                );
+            }
+        );
+        // Same shape via `delete_trie_array`'s own comma-grouped path
+        // (`delete_path_steps` above is the non-comma AST walk; a
+        // `del(.a, .b)`-shaped call routes through the trie instead) --
+        // confirmed live to produce the identical result.
+        yq_query!(br"[1,2]", r"del(.[5].a, .[0])",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(
+                    arr,
+                    vec![
+                        OwnedValue::Int(2),
+                        OwnedValue::Null, OwnedValue::Null, OwnedValue::Null, OwnedValue::Null,
+                    ]
+                );
+            }
+        );
+        // jq has no such rule -- mid-chain stays a plain no-op, same as
+        // #2305's terminal case.
+        query!(br"[1,2]", r"del(.[5].a)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+            }
+        );
+        // A negative out-of-range index still raises (#2268), unaffected by
+        // this fix -- that check runs before `resolve_delete_index` is ever
+        // consulted.
+        yq_query!(br"[1,2]", r"del(.[-5].a)",
+            QueryResult::Error(e) => {
+                assert!(e.message.contains("out of range"), "message: {}", e.message);
+            }
+        );
+    }
+
+    #[test]
+    fn test_del_mid_chain_positive_out_of_range_index_iterate_vivifies_array_yq_mode_2314() {
+        // #2314: `.[]` immediately after the newly-created slot is the one
+        // case that can't stay `null` -- `.[]` never tolerates a `null` root
+        // (#527), so the padded slot is auto-vivified straight to `[]`
+        // instead, the same way `setpath` auto-vivifies `null` into
+        // whatever container its own next step needs. Confirmed live
+        // against yq v4.53.3: `[1,2] | del(.[5][])` is
+        // `[1,2,null,null,null,[]]`, not an error.
+        yq_query!(br"[1,2]", r"del(.[5][])",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(
+                    arr,
+                    vec![
+                        OwnedValue::Int(1), OwnedValue::Int(2),
+                        OwnedValue::Null, OwnedValue::Null, OwnedValue::Null,
+                        OwnedValue::Array(vec![]),
+                    ]
+                );
+            }
+        );
+    }
+
+    #[test]
+    fn test_delpaths_mid_chain_positive_out_of_range_index_extends_with_null_yq_mode_2314() {
+        // #2314: `delpaths`' own array-key recursion arm shares the same
+        // mid-chain extension -- confirmed live, byte-for-byte the same
+        // result as `del(.[5].a)` above.
+        yq_query!(br"[1,2]", r#"delpaths([[5,"a"]])"#,
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(
+                    arr,
+                    vec![
+                        OwnedValue::Int(1), OwnedValue::Int(2),
+                        OwnedValue::Null, OwnedValue::Null, OwnedValue::Null, OwnedValue::Null,
+                    ]
+                );
+            }
+        );
+        // jq stays a no-op, same as #2305's terminal case.
+        query!(br"[1,2]", r#"delpaths([[5,"a"]])"#,
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
             }
         );
     }
