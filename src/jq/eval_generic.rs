@@ -10627,7 +10627,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                             Vec<u64>,
                             S,
                         >(
-                            &owned, path_owned, optional
+                            &owned, &path_owned, optional
                         ))
                     },
                 );

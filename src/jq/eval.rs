@@ -13041,7 +13041,7 @@ fn getpath_one_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(v) => v,
         Err(e) => return suppress_or_raise(e, optional),
     };
-    getpath_walk_owned::<W, S>(&root, path_owned, optional)
+    getpath_walk_owned::<W, S>(&root, &path_owned, optional)
 }
 
 /// [`getpath_one_path`]'s walk once its root value is already resolved and
@@ -13067,10 +13067,10 @@ fn getpath_one_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// call the way `getpath_one_path` used to.
 pub(crate) fn getpath_walk_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     root: &OwnedValue,
-    path_owned: OwnedValue,
+    path: &OwnedValue,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let OwnedValue::Array(path) = path_owned else {
+    let OwnedValue::Array(path) = path else {
         return if optional {
             QueryResult::None
         } else {
@@ -13081,7 +13081,7 @@ pub(crate) fn getpath_walk_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut current: Cow<'_, OwnedValue> = Cow::Borrowed(root);
 
     for segment in path {
-        match (current.as_ref(), &segment) {
+        match (current.as_ref(), segment) {
             // jq: null | getpath(["a"]) => null
             (OwnedValue::Null, _) => {
                 return QueryResult::Owned(OwnedValue::Null);
@@ -13094,7 +13094,7 @@ pub(crate) fn getpath_walk_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..),
             ) => {
                 current = Cow::Owned(
-                    resolve_read_index(&segment, arr.len())
+                    resolve_read_index(segment, arr.len())
                         .map_or(OwnedValue::Null, |i| arr[i].clone()),
                 );
             }
@@ -13136,7 +13136,7 @@ pub(crate) fn getpath_walk_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
             _ if optional => return QueryResult::None,
             _ => {
-                return QueryResult::Error(EvalError::cannot_index(current.type_name(), &segment));
+                return QueryResult::Error(EvalError::cannot_index(current.type_name(), segment));
             }
         }
     }
@@ -31462,35 +31462,24 @@ fn eval_index_expr_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemanti
 /// of a `getpath(...)` silently see a stale, unchanged position regardless of
 /// whether the requested key existed.
 ///
-/// `new_path` is the resolved path argument *verbatim*, not `current_path`
-/// extended by it: live-verified against *real jq 1.7.1* that
-/// `path(getpath(...))` always answers the argument array exactly,
-/// discarding whatever ambient position `path()` was itself called from
-/// (`{"x":{"y":{"a":1}}} | .x.y | path(getpath(["a"]))` is `["a"]`, not
-/// `["x","y","a"]`) -- `getpath` is a primitive jq's own path-tracking
-/// recognizes natively, unlike `.a.b`-style navigation, which derives its
-/// path by accumulation. `key`/`parent`/`file_index` (no jq oracle, but
-/// defined to agree with real jq's `path()` answer wherever one exists,
-/// same principle #2213 already established) follow suit for internal
-/// consistency. Note this is *real* jq's own `path()`, not succinctly's own
-/// `path()` builtin (a separate walker, `walk_path`/`navigate_static_
-/// component`) -- that one has its own, pre-existing, unrelated divergence
-/// here (#2257).
-///
-/// One known, deliberately unmatched gap: a slice-descriptor segment inside
-/// the path array (`getpath([{"start":1,"end":3}])`, the shape
-/// `path(.[1:3])` itself produces) computes its *value* successfully in both
-/// jq and here, but real jq's own `path(getpath([...]))` raises `Cannot
-/// index array with object` for that same segment -- `path()` apparently
-/// re-derives the argument step-by-step for at least this shape rather than
-/// truly echoing it verbatim, and that internal re-derivation doesn't
-/// recognize a slice descriptor the way direct `.[1:3]` syntax does. This
-/// implementation still reports the descriptor verbatim rather than
-/// reproducing that error, since jq's own inconsistency here (value
-/// succeeds, `path()` doesn't) has no clean single answer to copy and the
-/// shape is rare in practice (a slice descriptor is something `path(.[a:b])`
-/// produces, not something a caller usually writes by hand into `getpath`'s
-/// argument).
+/// `new_path` is `current_path` extended by the resolved path argument's own
+/// components, exactly like every other arm in this function (`Field`
+/// pushes one name, `Index` pushes one component, ...) -- *not* the argument
+/// reported verbatim in place of `current_path`. Live-verified against real
+/// jq 1.7.1 with the ambient navigation genuinely inside `path()`'s own
+/// tracking scope, not outside it: `{"a":{"b":{"c":1}}} | path(.a.b |
+/// getpath(["c"]))` is `["a","b","c"]`, and `getpath([])` is a true no-op
+/// (`path(.a | getpath([]))` is `["a"]`, unchanged). An earlier version of
+/// this comment cited `.x.y | path(getpath(["a"]))` (`["a"]`, not
+/// `["x","y","a"]`) as evidence for "verbatim" -- that reads as verbatim
+/// only because `.x.y` sits *outside* `path()`'s own argument there, so
+/// `path()`'s own tracking starts fresh at `[]` right where `getpath` is
+/// reached and the two theories coincide (`[] ++ P == P`); it says nothing
+/// about extend vs. replace once there's a real prefix *inside* the same
+/// `path()` scope, which the corrected test above settles. `key`/`parent`/
+/// `file_index` (no jq oracle, but defined to agree with real jq's `path()`
+/// answer wherever one exists, same principle #2213 already established)
+/// follow suit for internal consistency.
 ///
 /// One ambient `optional` throughout, unlike
 /// [`eval_index_expr_with_path_context`]'s `bracket_optional`/
@@ -31498,10 +31487,24 @@ fn eval_index_expr_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemanti
 /// #1410 carve-out (`?` on `.foo[key]` guards the final index step alone,
 /// never the key sub-expression). `getpath(...)` is an ordinary builtin
 /// call, not bracket syntax, so ordinary `?` semantics apply uniformly: the
-/// same `optional` gates the path argument's own evaluation (matching
-/// `fanout_arg`'s identical `eval_single::<W, S>(arg_expr, value.clone(),
-/// optional)` call for the plain evaluator's own `builtin_getpath`), the
-/// walk's own type-mismatch errors, and `rest`'s continuation.
+/// same `optional` gates the path argument's own evaluation, the walk's own
+/// type-mismatch errors, and `rest`'s continuation.
+///
+/// Known gap, not fixed here: a later output of a *multi-output* path
+/// argument still runs (side effects included) even after an earlier
+/// output's own walk has already failed, where real jq (via
+/// `builtin_getpath`'s own `fanout_arg`/`eval_each`-based lazy pull) stops
+/// pulling the argument generator the instant a walk fails. This function
+/// still evaluates the whole path-argument generator up front rather than
+/// interleaving it with each walk, since doing so needs a genuinely lazy,
+/// per-output sink in the `OwnedValue`/path-context domain that doesn't
+/// exist yet (`eval_each`, which `fanout_arg` uses for this, is
+/// `StandardJson`-only). Filed as #2259. Already-yielded path-argument
+/// outputs are not silently dropped, though: an `Error`/`Break`/`Halt` from
+/// the path-argument generator itself is walked and folded into `results`
+/// like any other output before the escape fires, via the same
+/// `pending_escape`/loop-after-drain shape used below for a walk-time
+/// escape.
 fn eval_getpath_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     path_expr: &Expr,
     rest: &[Expr],
@@ -31519,17 +31522,17 @@ fn eval_getpath_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>
         current_path,
         optional,
     );
-    let (paths, pending_halt): (Vec<OwnedValue>, Option<i32>) =
-        match drain_path_context_stream(path_result) {
-            (_, Some(Control::Error(e))) => return QueryResult::Error(e),
-            (_, Some(Control::Break(label))) => return QueryResult::Break(label),
-            // #791: paths already yielded before a halt still owe output.
-            (vs, Some(Control::Halt(code))) => (vs, Some(code)),
-            (vs, None) => (vs, None),
-        };
+    // Every already-yielded path-argument output is walked below regardless
+    // of how the generator itself finished, so `Error`/`Break` are captured
+    // here rather than returned immediately -- unlike a bare
+    // `drain_path_context_stream` classification, which would discard `vs`
+    // on those two arms (#400/#494's own convention says a genuine escape
+    // still owes whatever output preceded it).
+    let (paths, pending_escape): (Vec<OwnedValue>, Option<Control>) =
+        drain_path_context_stream(path_result);
     if paths.is_empty() {
-        return match pending_halt {
-            Some(code) => partial(Vec::new(), Control::Halt(code)),
+        return match pending_escape {
+            Some(control) => partial(Vec::new(), control),
             None => QueryResult::None,
         };
     }
@@ -31539,16 +31542,20 @@ fn eval_getpath_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>
         // `getpath_walk_owned` owns both the "must be an array"
         // (`path_must_be_array`) check and the walk itself, so a
         // non-array `p` reaches `Error`/`None` there without this loop
-        // needing its own copy of that check.
-        match getpath_walk_owned::<W, S>(value, p.clone(), optional) {
+        // needing its own copy of that check. Takes `p` by reference, so
+        // `p` is still available below to build `new_path` without a
+        // clone.
+        match getpath_walk_owned::<W, S>(value, &p, optional) {
             QueryResult::Owned(v) => {
-                let OwnedValue::Array(new_path) = p else {
+                let OwnedValue::Array(components) = p else {
                     unreachable!(
                         "getpath_walk_owned only reaches Owned once its own \
                          path_must_be_array check has already confirmed `p` \
                          is an array"
                     )
                 };
+                let mut new_path = current_path.to_vec();
+                new_path.extend(components);
                 let step = eval_pipe_with_path_context_internal::<W, S>(
                     rest,
                     &v,
@@ -31569,8 +31576,8 @@ fn eval_getpath_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>
         }
     }
 
-    match pending_halt {
-        Some(code) => partial(results, Control::Halt(code)),
+    match pending_escape {
+        Some(control) => partial(results, control),
         None => owned_vec_to_result(results),
     }
 }
