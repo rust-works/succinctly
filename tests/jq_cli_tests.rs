@@ -21678,6 +21678,14 @@ fn test_jq_malformed_object_non_string_key_raises_everywhere_1194() -> Result<()
         &["-c", "-S", "."][..], // --sort-keys: ditto
         &["-c", "-a", "."][..], // --ascii-output: ditto
         &["-c", "., ."][..],    // loses its cursor to `Many`
+        // #1995: `.b`, the targeted field-lookup fast path
+        // (`JsonFields::find_cursor`) -- the one route this list left
+        // uncovered when this test was first written. Confirmed live
+        // against jq 1.7.1 that this exact gap existed: `succinctly jq -c
+        // '.b'` on this input silently answered `2` instead of raising,
+        // even though every filter above already raised on the same
+        // document.
+        &["-c", ".b"][..],
     ] {
         let (out, stderr, code) = run_jq_full(args, Some(input))?;
         assert_eq!(code, 5, "{args:?}: out: {out:?}, stderr: {stderr:?}");
@@ -21691,6 +21699,28 @@ fn test_jq_malformed_object_non_string_key_raises_everywhere_1194() -> Result<()
             stderr.contains("expected string key"),
             "{args:?}: stderr: {stderr:?}"
         );
+    }
+
+    Ok(())
+}
+
+/// #1995 review: a known, pre-existing, and *separate* gap this fix does
+/// not close -- `?` wrongly suppresses a malformed-JSON error that real jq
+/// raises unconditionally (a parse error precedes every filter, `?`
+/// included). Confirmed this predates #1995 entirely and isn't specific to
+/// a non-string key: `{"a" 1}` (#1677's own missing-`:` shape) is
+/// suppressed by `.a?` here identically, and real jq rejects both
+/// unconditionally (`jq -c '.a?'` on either input is still a parse error,
+/// exit 5). Pinned here rather than left untested per this project's own
+/// convention -- see #2286's own filed follow-up for the fix.
+#[test]
+fn test_optional_wrongly_suppresses_malformed_json_error_known_gap_1995() -> Result<()> {
+    for input in [r#"{"a":1,123:2}"#, r#"{"a" 1}"#] {
+        let (out, stderr, code) = run_jq_full(&["-c", ".a?"], Some(input))?;
+        // jq 1.7.1 raises unconditionally (exit 5) for both; this is the
+        // known gap -- `?` currently swallows it (exit 0, no output).
+        assert_eq!(code, 0, "input {input:?}: out: {out:?}, stderr: {stderr:?}");
+        assert!(out.trim().is_empty(), "input {input:?}: out: {out:?}");
     }
 
     Ok(())

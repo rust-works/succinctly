@@ -15944,7 +15944,7 @@ fn eval_owned_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 fn find_field<'a, W: Clone + AsRef<[u64]>>(
     fields: JsonFields<'a, W>,
     name: &str,
-) -> Option<StandardJson<'a, W>> {
+) -> Result<Option<StandardJson<'a, W>>, EvalError> {
     fields.find(name)
 }
 
@@ -15961,10 +15961,15 @@ fn index_object_by_name<'a, W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     match value {
+        // #1995: a non-string sibling key (`fields.find`'s own `Err`) is a
+        // hard parse-time error in real jq, never suppressed by `optional`
+        // -- same precedence as every other malformed-JSON `Err` this file
+        // surfaces unconditionally.
         StandardJson::Object(fields) => match find_field::<W>(fields, name) {
-            Some(v) => QueryResult::One(v),
+            Ok(Some(v)) => QueryResult::One(v),
             // jq returns null for missing fields on objects (not an error)
-            None => QueryResult::One(StandardJson::Null),
+            Ok(None) => QueryResult::One(StandardJson::Null),
+            Err(e) => QueryResult::Error(e),
         },
         // jq returns null for field access on null
         StandardJson::Null => QueryResult::One(StandardJson::Null),

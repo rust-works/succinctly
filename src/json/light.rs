@@ -31,7 +31,7 @@
 //! let root = index.root(json);
 //!
 //! if let StandardJson::Object(fields) = root.value() {
-//!     if let Some(name) = fields.find("name") {
+//!     if let Some(name) = fields.find("name").unwrap() {
 //!         if let StandardJson::String(s) = name {
 //!             assert_eq!(&*s.as_str().unwrap(), "Alice");
 //!         }
@@ -1090,27 +1090,37 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
     /// `YamlFields::find` already applies for YAML's own last-duplicate-
     /// key-wins semantics (#174), just the opposite of YAML's genuine-
     /// duplicates preservation elsewhere (`to_entries`, #443).
-    pub fn find(&self, name: &str) -> Option<StandardJson<'a, W>> {
+    ///
+    /// `Err` when *any* sibling's key isn't string-shaped at all (#1995,
+    /// same reasoning as [`find_cursor`](Self::find_cursor)'s own doc
+    /// comment) -- real jq rejects a non-string object key at parse time,
+    /// unconditional on the document as a whole, so this checks every
+    /// candidate as it's found rather than deferring to whichever one (if
+    /// any) would otherwise have won.
+    pub fn find(&self, name: &str) -> Result<Option<StandardJson<'a, W>>, EvalError> {
         let mut fields = *self;
         let mut result = None;
         while let Some((field, rest)) = fields.uncons() {
-            if let StandardJson::String(key) = field.key() {
-                // An undecodable key (invalid UTF-8, an invalid escape, an
-                // invalid `\u` codepoint) is *skipped*, not treated as the
-                // end of the search. This `?` used to return from `find`
-                // itself, so a single such key hid every field after it from
-                // lookup -- `.b` answered `null` on `{"\ud800":1,"b":2}` --
-                // while `keys`/`length`, which don't decode, still reported
-                // them (#1247). Surfacing the decode failure as a real
-                // `EvalError` is tracked separately; this only stops one bad
-                // key destroying valid results.
-                if key.as_str().is_ok_and(|k| k == name) {
-                    result = Some(field.value());
+            match field.key() {
+                StandardJson::String(key) => {
+                    // An undecodable key (invalid UTF-8, an invalid escape, an
+                    // invalid `\u` codepoint) is *skipped*, not treated as the
+                    // end of the search. This `?` used to return from `find`
+                    // itself, so a single such key hid every field after it from
+                    // lookup -- `.b` answered `null` on `{"\ud800":1,"b":2}` --
+                    // while `keys`/`length`, which don't decode, still reported
+                    // them (#1247). Surfacing the decode failure as a real
+                    // `EvalError` is tracked separately; this only stops one bad
+                    // key destroying valid results.
+                    if key.as_str().is_ok_and(|k| k == name) {
+                        result = Some(field.value());
+                    }
                 }
+                _ => return Err(EvalError::malformed_json_text(field.key_cursor().text())),
             }
             fields = rest;
         }
-        result
+        Ok(result)
     }
 
     /// Find a field by name and return a cursor to its value.
@@ -1120,12 +1130,16 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
     /// (needed for `line`/`column`) doesn't require re-navigating.
     ///
     /// `Err` when the *winning* occurrence's own `,`/`:` delimiters are
-    /// malformed (#1677) -- a targeted lookup like `.a` never walks every
-    /// sibling the way `.[]`/`length`/`keys` do, so it needs its own check.
-    /// Deferred to the end rather than checked as each candidate is found:
-    /// only the field that actually wins (the *last* matching occurrence)
-    /// should be validated, since an earlier same-named field's own gap is
-    /// moot once a later one supersedes it.
+    /// malformed (#1677), or when *any* sibling's key isn't even
+    /// string-shaped at all (#1995) -- a targeted lookup like `.a` never
+    /// walks every sibling the way `.[]`/`length`/`keys` do, so it needs
+    /// its own check for both. A non-string key (`{"a":1,123:2}`) is real
+    /// jq's own parse-time rejection ("Object keys must be strings"),
+    /// unconditional on the document as a whole -- unlike the `,`/`:` gap
+    /// check below, checked as each candidate is found (not deferred to
+    /// the winner alone): the document is malformed the moment *any*
+    /// member's key isn't a string, whether or not that member is the one
+    /// this lookup would otherwise have returned.
     pub fn find_cursor(&self, name: &str) -> Result<Option<JsonCursor<'a, W>>, EvalError> {
         let mut fields = *self;
         // (key's own text start, value cursor, is this field the object's
@@ -1133,11 +1147,14 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
         let mut winner: Option<(usize, JsonCursor<'a, W>, bool)> = None;
         let mut index = 0usize;
         while let Some((field, rest)) = fields.uncons() {
-            if let StandardJson::String(key) = field.key() {
-                // Same undecodable-key skip as `find` above (#1247).
-                if key.as_str().is_ok_and(|k| k == name) {
-                    winner = Some((key.start(), field.value_cursor(), index == 0));
+            match field.key() {
+                StandardJson::String(key) => {
+                    // Same undecodable-key skip as `find` above (#1247).
+                    if key.as_str().is_ok_and(|k| k == name) {
+                        winner = Some((key.start(), field.value_cursor(), index == 0));
+                    }
                 }
+                _ => return Err(EvalError::malformed_json_text(field.key_cursor().text())),
             }
             fields = rest;
             index += 1;
@@ -1189,7 +1206,13 @@ impl<W> Clone for JsonField<'_, W> {
 impl<W> Copy for JsonField<'_, W> {}
 
 impl<'a, W: AsRef<[u64]>> JsonField<'a, W> {
-    /// Get the field key (always a string).
+    /// Get the field key.
+    ///
+    /// A well-formed JSON object's key is always a string, but this
+    /// method doesn't itself enforce that (#1995) -- a lazily-indexed
+    /// document can present a non-string key (`{"a":1,123:2}`), which
+    /// real jq rejects at parse time. Callers that need this distinction
+    /// (`find`/`find_cursor`, both in this file) check for it explicitly.
     #[inline]
     pub fn key(&self) -> StandardJson<'a, W> {
         self.key_cursor.value()
@@ -2572,8 +2595,19 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentFields for JsonFields<'a, W> {
         Some((field.key(), field.key_cursor(), rest))
     }
 
+    // #1995: `DocumentFields::find` (unlike its own `find_cursor` sibling,
+    // just below) has no `Result` in its trait signature to report a
+    // non-string sibling key through -- not something this one impl block
+    // can widen, since it's a trait-wide contract every format's own
+    // implementation shares. Not a live gap in practice: this trait
+    // method's only real (non-test, non-doctest) caller anywhere in the
+    // crate is `JsonFields::find` itself, one line below -- every actual
+    // production call site (`eval.rs`'s own `find_field`) reaches the
+    // *inherent* `JsonFields::find` (already `Result`-returning, per its
+    // own #1995 fix) directly, never through this trait dispatch, so
+    // folding an error into `None` here costs nothing observable today.
     fn find(&self, name: &str) -> Option<Self::Value> {
-        JsonFields::find(self, name)
+        JsonFields::find(self, name).ok().flatten()
     }
 
     fn find_cursor(&self, name: &str) -> Result<Option<Self::Cursor>, EvalError> {
@@ -4058,25 +4092,25 @@ mod tests {
         match root.value() {
             StandardJson::Object(fields) => {
                 // Find existing field
-                match fields.find("age") {
+                match fields.find("age").unwrap() {
                     Some(StandardJson::Number(n)) => assert_eq!(n.as_i64().unwrap(), 25),
                     _ => panic!("expected number"),
                 }
 
                 // Find first field
-                match fields.find("name") {
+                match fields.find("name").unwrap() {
                     Some(StandardJson::String(s)) => assert_eq!(s.as_str().unwrap(), "Charlie"),
                     _ => panic!("expected string"),
                 }
 
                 // Find last field
-                match fields.find("city") {
+                match fields.find("city").unwrap() {
                     Some(StandardJson::String(s)) => assert_eq!(s.as_str().unwrap(), "NYC"),
                     _ => panic!("expected string"),
                 }
 
                 // Non-existent field
-                assert!(fields.find("missing").is_none());
+                assert!(fields.find("missing").unwrap().is_none());
             }
             _ => panic!("expected object"),
         }
@@ -4094,7 +4128,7 @@ mod tests {
 
         match root.value() {
             StandardJson::Object(fields) => {
-                match fields.find("a") {
+                match fields.find("a").unwrap() {
                     Some(StandardJson::Number(n)) => assert_eq!(n.as_i64().unwrap(), 3),
                     other => panic!("expected number 3, got {other:?}"),
                 }
@@ -4129,7 +4163,7 @@ mod tests {
             let StandardJson::Object(fields) = root.value() else {
                 panic!("expected object");
             };
-            match fields.find("b") {
+            match fields.find("b").unwrap() {
                 Some(StandardJson::Number(n)) => assert_eq!(n.as_i64().unwrap(), 2),
                 other => panic!("expected number 2, got {other:?}"),
             }
@@ -4230,13 +4264,15 @@ mod tests {
         let root = index.root(json);
 
         match root.value() {
-            StandardJson::Object(fields) => match fields.find("person") {
-                Some(StandardJson::Object(inner_fields)) => match inner_fields.find("name") {
-                    Some(StandardJson::String(s)) => {
-                        assert_eq!(s.as_str().unwrap(), "Dave");
+            StandardJson::Object(fields) => match fields.find("person").unwrap() {
+                Some(StandardJson::Object(inner_fields)) => {
+                    match inner_fields.find("name").unwrap() {
+                        Some(StandardJson::String(s)) => {
+                            assert_eq!(s.as_str().unwrap(), "Dave");
+                        }
+                        _ => panic!("expected string"),
                     }
-                    _ => panic!("expected string"),
-                },
+                }
                 _ => panic!("expected nested object"),
             },
             _ => panic!("expected object"),
@@ -4253,7 +4289,7 @@ mod tests {
             StandardJson::Array(elements) => {
                 // First object
                 match elements.get(0) {
-                    Some(StandardJson::Object(fields)) => match fields.find("a") {
+                    Some(StandardJson::Object(fields)) => match fields.find("a").unwrap() {
                         Some(StandardJson::Number(n)) => assert_eq!(n.as_i64().unwrap(), 1),
                         _ => panic!("expected number"),
                     },
@@ -4262,7 +4298,7 @@ mod tests {
 
                 // Second object
                 match elements.get(1) {
-                    Some(StandardJson::Object(fields)) => match fields.find("b") {
+                    Some(StandardJson::Object(fields)) => match fields.find("b").unwrap() {
                         Some(StandardJson::Number(n)) => assert_eq!(n.as_i64().unwrap(), 2),
                         _ => panic!("expected number"),
                     },
