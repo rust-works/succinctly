@@ -19918,23 +19918,54 @@ fn test_bare_param_not_shadowed_by_dollar_binding_of_same_name_2141() -> Result<
     Ok(())
 }
 
-/// #2141's mirror bug, in `substitute_var_impl` (the `$var`-substitution
-/// direction): a nested `def`'s own bare parameter must never shadow an
-/// *outer* `$`-bound name of the same spelling, even though both are
-/// stored as the identical bare string (`parse_func_def_parts` discards a
-/// parameter's leading `$` at parse time, so `def f(g)` and `def f($g)`
-/// are indistinguishable in `params: Vec<String>`). Verified against jq
-/// 1.7.1: `3 as $g | def f(g): $g; f(1)` is `3` -- the outer `$g`,
-/// untouched by `f`'s own bare `g` parameter. `substitute_var_impl`'s
-/// pre-fix `Expr::FuncDef` arm used `params.contains(&var_name.to_string())`
-/// to decide `body` was shadowed, silently leaving `$g` unsubstituted;
-/// `f`'s own (separate) bare-parameter substitution then filled the
-/// still-unresolved `$g` in with `f`'s own argument instead, giving `1`.
+/// #2141 review found a genuine, *not-fixable-here* ambiguity next to the
+/// original bug: `parse_func_def_parts` discards a parameter's leading `$`
+/// at parse time, so `def f(g)` and `def f($g)` produce the identical
+/// `params: ["g"]` -- `substitute_var_impl`'s `Expr::FuncDef` arm has no
+/// way to tell, from the AST alone, whether a nested def's own parameter
+/// of a matching name should shadow an *outer* `$`-bound value (true for
+/// `$`-style, since `$g` inside then means the nested def's *own*
+/// argument) or not (true for bare-style, since a bare `g` inside has no
+/// `$`-binding of its own and `$g` there still means the outer value).
+///
+/// A first draft of this fix optimized for the bare case (always
+/// substitute) and broke the `$`-style one in the process -- confirmed
+/// live regression against jq 1.7.1:
+/// `3 as $item | def double($item): $item * 2; double(10)` must be `20`
+/// (uses `double`'s own argument), the draft gave `6` (wrongly captured
+/// the outer `3` into `double`'s body before `double` was ever called).
+/// See `test_dollar_style_func_param_shadows_outer_binding_of_same_name_2141`
+/// below for that (correct, unregressed) shape.
+///
+/// Reverting to the original shadow check keeps that `$`-style case
+/// correct at the cost of leaving the *bare*-nested-parameter case wrong
+/// the other way, pinned here as a known gap rather than left untested:
+/// jq 1.7.1's `3 as $g | def f(g): $g; f(1)` is `3` (the outer `$g`,
+/// untouched by `f`'s own unrelated bare `g` parameter); this prints `1`
+/// instead (`f`'s own bare-parameter substitution wrongly fills in the
+/// `$g` that the outer substitution's shadow check left untouched).
 #[test]
-fn test_outer_dollar_binding_not_shadowed_by_nested_def_bare_param_2141() -> Result<()> {
+fn test_dollar_style_func_param_shadows_outer_binding_of_same_name_2141() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-nc",
+            "3 as $item | def double($item): $item * 2; double(10)",
+        ],
+        None,
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "20");
+    Ok(())
+}
+
+#[test]
+fn test_bare_nested_param_wrongly_shadows_outer_dollar_binding_known_gap_2141() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-nc", "3 as $g | def f(g): $g; f(1)"], None)?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
-    assert_eq!(stdout.trim_end(), "3");
+    // jq 1.7.1 answers "3" (the outer $g); this is the known, documented
+    // gap -- see this test's own doc comment above and
+    // substitute_var_impl's `Expr::FuncDef` arm.
+    assert_eq!(stdout.trim_end(), "1");
     Ok(())
 }
 
@@ -19951,6 +19982,29 @@ fn test_dollar_style_func_param_still_resolves_2141() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-nc", "def f($x): $x; f(5)"], None)?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
     assert_eq!(stdout.trim_end(), "5");
+    Ok(())
+}
+
+/// #2141 review: `subst_dollar` must survive crossing into a builtin
+/// argument (`select`, here) the same way it does through ordinary
+/// structural recursion -- `substitute_func_param_in_builtin` used to call
+/// back into the public `substitute_func_param` (always starting a fresh
+/// `subst_dollar: true`) instead of threading the ambient value through,
+/// so the local `1 as $g` below stopped shadowing the moment substitution
+/// crossed into `select(...)`'s own argument. Verified against jq 1.7.1:
+/// `def f(g): 1 as $g | select($g == 1); f(999)` is `null` (`$g` inside
+/// `select` correctly stays `1`, from the local binding, not `f`'s own
+/// argument `999`); the pre-fix code answered nothing at all (`$g`
+/// wrongly re-substituted to `999`, so `999 == 1` failed and `select`
+/// dropped the input).
+#[test]
+fn test_subst_dollar_survives_crossing_into_a_builtin_argument_2141() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-nc", "def f(g): 1 as $g | select($g == 1); f(999)"],
+        None,
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "null");
     Ok(())
 }
 

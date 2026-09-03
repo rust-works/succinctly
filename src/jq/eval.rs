@@ -27364,29 +27364,43 @@ fn substitute_var_impl(
             then,
             ..
         } => {
-            // #2141: `params` are always *bare* function-parameter names;
-            // `var_name` is always `$`-bound. jq keeps the two in entirely
-            // separate namespaces, so a nested `def`'s own bare parameter
-            // can never shadow an outer `$`-bound name, even when the two
-            // spellings happen to share a string -- `body` is therefore
-            // always substituted, same as `then` already was. Confirmed
-            // live against jq 1.7.1: `3 as $g | def f(g): $g; f(1)` is `3`
-            // (the outer `$g`, untouched by `f`'s own bare `g` parameter);
-            // the old `params.contains(&var_name.to_string())` check
-            // wrongly left `body` unsubstituted here, and `f`'s own
-            // *separate* bare-parameter substitution then (wrongly, per
-            // `substitute_func_param`'s own #2141 fix above) filled the
-            // still-unsubstituted `$g` in with `f`'s argument instead,
-            // giving `1`.
+            // #2141 review: deliberately NOT changed to always substitute
+            // `body` (an earlier draft of this fix did, reasoning that
+            // `params` are bare and `var_name` is `$`-bound, so a bare
+            // nested parameter can never shadow an outer `$`-bound name).
+            // That reasoning is correct for a *bare* nested parameter
+            // (`def f(g): $g` -- `$g` inside should resolve to the outer
+            // binding) but wrong for a `$`-style one (`def f($g): $g` --
+            // `$g` inside is `f`'s *own* parameter, and must NOT be
+            // pre-filled with the outer value before `f` is ever called,
+            // or `f`'s own later argument substitution has nothing left to
+            // replace): `parse_func_def_parts` discards a parameter's
+            // leading `$` at parse time, so `params: Vec<String>` cannot
+            // tell the two cases apart, and this function has no way to
+            // pick the right answer for both from the AST alone. Confirmed
+            // live against jq 1.7.1 that the "always substitute" draft
+            // broke the `$`-style case: `3 as $g | def f($g): $g; f(1)`
+            // must be `1` (matches this un-reverted code); the draft gave
+            // `3` instead (the outer value, captured before `f` even ran).
+            // Keeping the pre-existing shadow check means the *bare*-nested-
+            // parameter case remains wrong the other way (`3 as $g | def
+            // f(g): $g; f(1)` is `3` on jq, `1` here) -- a real, known gap,
+            // tracked separately (#2141 follow-up) rather than "fixed" into
+            // a worse regression on the more common `$`-style shape.
+            let shadowed = params.contains(&var_name.to_string());
             Expr::FuncDef {
                 name: name.clone(),
                 params: params.clone(),
-                body: Box::new(substitute_var_impl(
-                    body,
-                    var_name,
-                    replacement,
-                    mark_trackable,
-                )),
+                body: if shadowed {
+                    body.clone()
+                } else {
+                    Box::new(substitute_var_impl(
+                        body,
+                        var_name,
+                        replacement,
+                        mark_trackable,
+                    ))
+                },
                 then: Box::new(substitute_var_impl(
                     then,
                     var_name,
@@ -43955,7 +43969,12 @@ fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, subst_dollar
         // comment (`src/jq/walk.rs`) on its `Expr::Error` arm for why this is
         // preserved as a likely latent gap rather than fixed here.
         Expr::Error(msg) => Expr::Error(msg.clone()),
-        Expr::Builtin(b) => Expr::Builtin(substitute_func_param_in_builtin(b, param, arg)),
+        Expr::Builtin(b) => Expr::Builtin(substitute_func_param_in_builtin(
+            b,
+            param,
+            arg,
+            subst_dollar,
+        )),
         // #2141: unlike the pre-fix code, `expr`/`input`/`init` (evaluated
         // in the *outer* scope) always keep the ambient `subst_dollar`, and
         // `body`/`update`/`extract` (the bound-scope child) only ever clear
@@ -44035,11 +44054,20 @@ fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, subst_dollar
             // not to `param`'s substituted argument.
             let then_shadowed = name == param && params.is_empty();
             // A nested def's own parameter list shadows `param` within its
-            // own body the same way an outer `as $param` would -- both the
-            // bare and (per #2141, since the parser never distinguishes
-            // them) `$`-prefixed spellings, so `subst_dollar` isn't
-            // separately threaded here; `subst_unless_shadowed` stops all
-            // substitution for `body` outright when shadowed.
+            // own body -- correct when the nested parameter is bare
+            // (`def h(param): ...`, the same namespace as `param` itself),
+            // but pre-existing and unfixed here (#2141 review): a *bare*
+            // `param` can never carry an outer `$param` reference's own
+            // value into a nested def whose OWN parameter is `$`-style
+            // (`def h($param): $param` inside `f(param)`'s own body still
+            // needs `f`'s outer `$param`, since `h`'s `$param` is `h`'s
+            // own, unrelated binding) -- `params` can't tell the two
+            // spellings apart (`parse_func_def_parts` discards `$` at
+            // parse time), so this blanket check over-shadows the `$`-style
+            // case identically to `substitute_var_impl`'s own `FuncDef` arm
+            // (see that arm's doc comment for the live-verified repro and
+            // why neither direction can be made fully correct without a
+            // parser change).
             let body_shadowed = params.contains(&param.to_string());
             Expr::FuncDef {
                 name: name.clone(),
@@ -44106,8 +44134,26 @@ fn install_def_calls_in_builtin(
 }
 
 /// Substitute function parameter in a builtin expression.
-fn substitute_func_param_in_builtin(builtin: &Builtin, param: &str, arg: &Expr) -> Builtin {
-    map_builtin_subexprs(builtin, &mut |e| substitute_func_param(e, param, arg))
+///
+/// #2141 review: takes `subst_dollar` rather than calling the public
+/// [`substitute_func_param`] (which always starts a fresh `true`) --
+/// a builtin argument is ordinary structural nesting, not a
+/// substitution-scope boundary, so the ambient `subst_dollar` an
+/// enclosing `As`/`Reduce`/`Foreach`/`AsPattern` binder may have already
+/// cleared must carry into it. Confirmed live: without this,
+/// `def f(g): 1 as $g | select($g == 1); f(999)` answered nothing
+/// (`select`'s own `$g` was wrongly re-substituted with `f`'s argument,
+/// `999`, instead of staying `1` from the enclosing `1 as $g`) where jq
+/// 1.7.1 answers `null`.
+fn substitute_func_param_in_builtin(
+    builtin: &Builtin,
+    param: &str,
+    arg: &Expr,
+    subst_dollar: bool,
+) -> Builtin {
+    map_builtin_subexprs(builtin, &mut |e| {
+        substitute_func_param_impl(e, param, arg, subst_dollar)
+    })
 }
 
 /// Evaluate a function call to an undefined function.
