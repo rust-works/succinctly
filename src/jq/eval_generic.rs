@@ -11402,12 +11402,19 @@ mod tests {
     /// catch-all wildcard fallback arm both raised an ordinary #1194
     /// malformed-member error unconditionally, ignoring `optional` --
     /// the `eval_generic.rs` twin of `eval.rs`'s `builtin_tostring`
-    /// (#2184) and findings 1-3's other `eval.rs` sites. Called directly
-    /// through `eval_builtin`, not through `eval`/`?`, for the same reason
-    /// `eval.rs`'s own #2184/#2231 tests do: `Expr::Optional`'s outer catch
-    /// already normalizes the observable result regardless of what this
-    /// arm does internally, so only a direct call distinguishes fixed from
-    /// unfixed.
+    /// (#2184) and findings 1-3's other `eval.rs` sites -- true when #2231
+    /// landed.
+    ///
+    /// #2286 has since tagged #1194 malformed-member/delimiter errors
+    /// `is_decode_failure()`, making both sites' `optional`-consulting a
+    /// no-op for this specific error class -- see
+    /// `test_debug_stderr_fromjsonstream_respect_optional_2231`'s own
+    /// revised doc comment (`eval.rs`) for the full reasoning, which
+    /// applies identically here. Still called directly through
+    /// `eval_builtin`, not through `eval`/`?`: that distinction no longer
+    /// matters for *this* error class (uncatchable at every level either
+    /// way now), but stays for consistency with the sibling decode-failure
+    /// test just below, which does still need it.
     #[test]
     fn test_generic_tostring_and_wildcard_respect_optional_2231() {
         use crate::json::JsonIndex;
@@ -11416,26 +11423,38 @@ mod tests {
         let cursor = index.root(json);
         let value = cursor.value();
 
-        match eval_builtin::<JqSemantics, _>(&Builtin::ToString, value.clone(), true, Some(cursor))
-        {
-            GenericResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match eval_builtin::<JqSemantics, _>(&Builtin::ToString, value.clone(), false, Some(cursor))
-        {
-            GenericResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match eval_builtin::<JqSemantics, _>(
+                &Builtin::ToString,
+                value.clone(),
+                optional,
+                Some(cursor),
+            ) {
+                GenericResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
 
         // The catch-all wildcard arm, reached via a builtin with no
         // dedicated arm of its own (e.g. `ToJson`).
-        match eval_builtin::<JqSemantics, _>(&Builtin::ToJson, value.clone(), true, Some(cursor)) {
-            GenericResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match eval_builtin::<JqSemantics, _>(&Builtin::ToJson, value, false, Some(cursor)) {
-            GenericResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match eval_builtin::<JqSemantics, _>(
+                &Builtin::ToJson,
+                value.clone(),
+                optional,
+                Some(cursor),
+            ) {
+                GenericResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
     }
 

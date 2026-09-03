@@ -21585,6 +21585,82 @@ fn test_jq_malformed_json_text_falls_back_when_validator_disagrees_1194() -> Res
     Ok(())
 }
 
+/// #2286: `EvalError::malformed_json_text` (and its `malformed_member_error`/
+/// `malformed_delimiter_error`/`malformed_element_error` callers) used to
+/// construct an ordinary, `?`-suppressible `Error` -- real jq's equivalent
+/// failure is a *parse* error, raised before any filter (`?` included) ever
+/// runs. Verified live against jq 1.7.1: all three shapes below exit 5
+/// unconditionally there (`.a?`, `try .a catch H`, and `(try .a catch H)?`
+/// -- the last one specifically closing the gap this issue's finding-4-style
+/// worry would raise: an outer `?` must not let this error's now-uncatchable
+/// classification skip the inner `catch` handler either, since jq's own
+/// parse-time failure happens before *any* of `.a?`/`try`/`catch` are
+/// reached at all, catch handler included).
+#[test]
+fn test_malformed_json_error_never_suppressed_2286() -> Result<()> {
+    let malformed_pairing: &str = r#"{"a" 1}"#;
+
+    for expr in [
+        ".a?",
+        "try .a catch \"caught\"",
+        "(try .a catch \"caught\")?",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", expr], Some(malformed_pairing))?;
+        assert_eq!(code, 5, "{expr}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "{expr}: stderr: {stderr:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// #2286/#1995: the non-string-sibling-key shape from #1995's own repro
+/// (`{"a":1,123:2}`) is confounded across two distinct, separately-scoped
+/// bugs -- worth pinning both halves so a future reader doesn't conflate
+/// them. `.a?` alone never even reaches `malformed_json_text`: `Expr::
+/// Field`'s fast path looks up `.a` directly without validating sibling
+/// keys at all (#1995's own still-open bug, unrelated to this issue,
+/// tracked separately -- wrongly succeeds with `1` here, not "wrongly
+/// suppressed"). `keys?`/`to_entries?` instead walk every member (they
+/// are not simple field lookups), reaching `malformed_json_text` via
+/// `malformed_member_error` regardless of which field is asked for --
+/// that shape is squarely in #2286's own scope, and now correctly raises
+/// unconditionally, matching real jq 1.7.1 (`Object keys must be
+/// strings`, exit 5, no output).
+///
+/// `.a? // "outer"` (an earlier draft of this test) is *not* a valid
+/// vehicle for this: `//`'s own semantics only substitute for a
+/// falsy/absent *output*, never for a raised error, regardless of that
+/// error's catchability tag (`eval_alternative`'s own doc comment) -- so
+/// it stayed exit 5 identically whether or not the fix was applied,
+/// silently testing nothing about this issue's own scope.
+#[test]
+fn test_malformed_json_error_never_suppressed_on_generic_bridge_2286() -> Result<()> {
+    let non_string_sibling_key: &str = r#"{"a":1,123:2}"#;
+
+    // #1995's own bug, not this issue's -- pinned here as the contrast.
+    let (stdout, _stderr, code) = run_jq_full(&["-c", ".a?"], Some(non_string_sibling_key))?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout, "1\n");
+
+    // This issue's own scope: a whole-object walk reaches
+    // malformed_member_error/malformed_json_text, which must now raise
+    // unconditionally even under a trailing `?`.
+    for expr in ["keys?", "to_entries?"] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", expr], Some(non_string_sibling_key))?;
+        assert_eq!(code, 5, "{expr}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert!(stdout.is_empty(), "{expr}: stdout: {stdout:?}");
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "{expr}: stderr: {stderr:?}"
+        );
+    }
+
+    Ok(())
+}
+
 /// #1194: nothing partial reaches stdout for a malformed top-level object
 /// on the identity path.
 ///
@@ -22898,12 +22974,17 @@ fn test_jq_keys_unsorted_last_raises_on_missing_delimiter_1956() -> Result<()> {
     assert!(out.trim().is_empty(), "unexpected output {out:?}");
     assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
 
+    // #2286: this #1194/#1677 error is now `is_decode_failure()`-tagged,
+    // so `try...catch` no longer reaches its handler either -- matching
+    // real jq's own unconditional parse-error behavior here (live-verified
+    // against jq 1.7.1: still exits 5, never producing `"c"`).
     let (out, stderr, code) = run_jq_full(
         &["-c", r#"try (keys_unsorted | last) catch "c""#],
         Some(doc),
     )?;
-    assert_eq!(code, 0, "stderr: {stderr:?}");
-    assert_eq!(out.trim(), "\"c\"", "out: {out:?}");
+    assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
+    assert!(out.trim().is_empty(), "unexpected output {out:?}");
+    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
 
     // Well-formed data is unaffected.
     let (out, stderr, code) =
@@ -22929,12 +23010,16 @@ fn test_jq_keys_unsorted_map_raises_on_missing_delimiter_1956() -> Result<()> {
     assert!(out.trim().is_empty(), "unexpected output {out:?}");
     assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
 
+    // #2286: same revision as the sibling `last` test above -- this error
+    // is now `is_decode_failure()`-tagged, so `try...catch` no longer
+    // reaches its handler either.
     let (out, stderr, code) = run_jq_full(
         &["-c", r#"try (keys_unsorted | map(.)) catch "c""#],
         Some(doc),
     )?;
-    assert_eq!(code, 0, "stderr: {stderr:?}");
-    assert_eq!(out.trim(), "\"c\"", "out: {out:?}");
+    assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
+    assert!(out.trim().is_empty(), "unexpected output {out:?}");
+    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
 
     // Well-formed data is unaffected.
     let (out, stderr, code) =
@@ -30151,22 +30236,43 @@ fn test_ordinary_type_error_still_suppressed_and_caught_1620() {
 /// catchability-aware dispatch -- no catchability check at all. A #1194
 /// malformed (non-string) object key raised there uncaught, even though
 /// `?` (which does have a native, catchability-aware `Expr::Optional` arm)
-/// already suppressed the identical error correctly. Confirmed live
-/// against unmodified `main` before this fix: `sort?` on `{123: 1}`
-/// succeeded silently while `try (1+1) catch "x"` raised uncaught, exit 5.
+/// already suppressed the identical error correctly. True when #1812
+/// landed: `sort?` on `{123: 1}` succeeded silently while `try (1+1) catch
+/// "x"` raised uncaught, exit 5 (`sort` reaching the malformed key as part
+/// of its own reordering walk; `1+1` not touching `.` at all, catching a
+/// failure from `Expr::Try`'s own ambient-materialization side effect
+/// rather than anything in its own body).
+///
+/// #2286 revises what "genuinely catchable" means for this specific key:
+/// live-verified that real jq treats a document-level #1194 fault as an
+/// unconditional parse error for *every* query on that document, including
+/// ones that never reference the malformed region at all (`sort?`, `1+1`)
+/// -- jq's parser rejects the whole document before any filter runs. Once
+/// #2286 tagged this error `is_decode_failure()`, succinctly's own
+/// behavior converged on that: all three shapes below now correctly exit 5
+/// uncaught, matching jq exactly (an *improvement* on #1812's own
+/// oracle-fidelity, not a regression -- #1812 never claimed `sort?`
+/// silently succeeding was correct, only that it was inconsistent with the
+/// `try` case).
 #[test]
 fn test_try_catch_contains_a_genuinely_catchable_malformed_key_error_1812() -> Result<()> {
     let doc = "{123: 1}";
 
     let (stdout, stderr, code) = run_jq_full(&["-c", "sort?"], Some(doc))?;
-    assert_eq!((stdout.as_str(), code), ("", 0), "stderr: {stderr}");
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr}");
+    assert!(stdout.trim().is_empty(), "stdout: {stdout:?}");
+    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr}");
 
     let (stdout, stderr, code) = run_jq_full(&["-c", r#"try (1+1) catch "x""#], Some(doc))?;
-    assert_eq!((stdout.as_str(), code), ("\"x\"\n", 0), "stderr: {stderr}");
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr}");
+    assert!(stdout.trim().is_empty(), "stdout: {stdout:?}");
+    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr}");
 
-    // Bare `try`, no `catch` handler: suppresses to no output, same as `?`.
+    // Bare `try`, no `catch` handler: still raises, same as the two above.
     let (stdout, stderr, code) = run_jq_full(&["-c", "try (1+1)"], Some(doc))?;
-    assert_eq!((stdout.as_str(), code), ("", 0), "stderr: {stderr}");
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr}");
+    assert!(stdout.trim().is_empty(), "stdout: {stdout:?}");
+    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr}");
 
     Ok(())
 }
@@ -30240,13 +30346,24 @@ fn test_try_catch_forces_and_catches_a_lazyseq_failure_1812() -> Result<()> {
 /// `keys`/`keys_unsorted` on an object stay lazy until something actually
 /// materializes them, so a #1194 malformed (non-string) key raised only
 /// once that later, boundary-less materialization happened, escaping `?`/
-/// `try` entirely. `sort?`/`try (sort) catch` on the identical document
-/// already worked (`sort` has no lazy fast path, so it materializes and
-/// fails inside the boundary's own dispatch) -- this pins `keys_unsorted`/
-/// `keys` (the `sorted: true` path through the same `LazyKeys` variant) to
-/// the same already-correct behavior. Confirmed live against unmodified
-/// `main` before this fix: both `keys_unsorted?` and
-/// `try (keys_unsorted) catch "c"` raised uncaught, exit 5.
+/// `try` entirely. True when #1936 landed: `sort?`/`try (sort) catch` on
+/// the identical document already worked (`sort` has no lazy fast path, so
+/// it materializes and fails inside the boundary's own dispatch) --
+/// `keys_unsorted?`/`try (keys_unsorted) catch "c"` raised uncaught before
+/// this fix, exit 5, while `sort?` correctly suppressed.
+///
+/// #2286 revises what "caught" means here the same way it did for #1812's
+/// sibling test just above: real jq treats a #1194 fault as an
+/// unconditional parse error for the whole document, so none of the five
+/// shapes below are actually catchable in real jq either (all verified
+/// live to exit 5). #2286 tags this error `is_decode_failure()`, so
+/// succinctly now agrees -- `sort?`/`keys?`/`keys_unsorted?` all raise
+/// instead of suppressing, and the two `catch` shapes raise instead of
+/// running their handler. This still exercises #1936's own fix (the
+/// `LazyKeys` boundary is what makes the error reach `eval_try` at all,
+/// where it's now excluded rather than dispatched to `catch`) -- it just
+/// no longer demonstrates catchability, since nothing in this error class
+/// is catchable anymore.
 #[test]
 fn test_optional_and_try_catch_force_and_catch_a_lazykeys_malformed_key_1936() -> Result<()> {
     let doc = "{123: 1}";
@@ -30254,9 +30371,10 @@ fn test_optional_and_try_catch_force_and_catch_a_lazykeys_malformed_key_1936() -
     for filter in ["sort?", "keys?", "keys_unsorted?"] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))
             .unwrap_or_else(|e| panic!("`{filter}` failed to run: {e}"));
-        assert_eq!(
-            (stdout.as_str(), code),
-            ("", 0),
+        assert_eq!(code, 5, "`{filter}` -- stdout: {stdout:?} stderr: {stderr}");
+        assert!(stdout.trim().is_empty(), "`{filter}` -- stdout: {stdout:?}");
+        assert!(
+            stderr.contains("Invalid JSON text"),
             "`{filter}` -- stderr: {stderr}"
         );
     }
@@ -30267,9 +30385,10 @@ fn test_optional_and_try_catch_force_and_catch_a_lazykeys_malformed_key_1936() -
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))
             .unwrap_or_else(|e| panic!("`{filter}` failed to run: {e}"));
-        assert_eq!(
-            (stdout.as_str(), code),
-            ("\"c\"\n", 0),
+        assert_eq!(code, 5, "`{filter}` -- stdout: {stdout:?} stderr: {stderr}");
+        assert!(stdout.trim().is_empty(), "`{filter}` -- stdout: {stdout:?}");
+        assert!(
+            stderr.contains("Invalid JSON text"),
             "`{filter}` -- stderr: {stderr}"
         );
     }
@@ -30319,27 +30438,44 @@ fn test_optional_and_try_catch_unaffected_by_lazykeys_lazyindexrange_forcing_193
 /// `each_try_generic` to force the identical `try_single_generic` check
 /// synchronously, before the boundary can close, via a side-channel `Control`
 /// captured across the push (`check_lazy_item_for_try`).
+///
+/// #2286 revises the `LazyKeys`/`{123: 1}` assertions the same way it did
+/// for #1936's own test: real jq treats this document as an unconditional
+/// parse error regardless of `first`/`limit` wrapping (all four shapes
+/// below verified live to exit 5), and #2286 tags the error
+/// `is_decode_failure()` to match -- neither `?` nor `catch` reaches it
+/// now. The `error("x")` case just below is unaffected: that's an
+/// ordinary, unrelated error `#2286` never touches, still correctly caught.
 #[test]
 fn test_first_limit_wrapped_optional_try_catch_suppresses_and_catches_1948() -> Result<()> {
     // LazyKeys (#1936's own target), one push-model layer further out --
-    // `?`-suppression: exit 0, empty stdout, no catch handler runs.
+    // now raises unconditionally, matching real jq's own parse-error
+    // behavior for this document.
     for filter in ["first(keys_unsorted?)", "limit(1; keys_unsorted?)"] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("{123: 1}"))
             .unwrap_or_else(|e| panic!("`{filter}` failed to run: {e}"));
-        assert_eq!(code, 0, "`{filter}` should suppress\nstderr: {stderr}");
+        assert_eq!(code, 5, "`{filter}` -- stdout: {stdout:?} stderr: {stderr}");
         assert!(stdout.trim().is_empty(), "`{filter}` -- stdout: {stdout}");
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "`{filter}` -- stderr: {stderr}"
+        );
     }
 
-    // Same LazyKeys fault, `try`/`catch` this time: exit 0, catch handler's
-    // own output reaches stdout.
+    // Same LazyKeys fault, `try`/`catch` this time: now raises unconditionally
+    // too, the handler never runs.
     for filter in [
         r#"first(try (keys) catch "c")"#,
         r#"first(try (keys_unsorted) catch "c")"#,
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("{123: 1}"))
             .unwrap_or_else(|e| panic!("`{filter}` failed to run: {e}"));
-        assert_eq!(code, 0, "`{filter}` should catch\nstderr: {stderr}");
-        assert_eq!(stdout.trim(), "\"c\"", "`{filter}` -- stdout: {stdout}");
+        assert_eq!(code, 5, "`{filter}` -- stdout: {stdout:?} stderr: {stderr}");
+        assert!(stdout.trim().is_empty(), "`{filter}` -- stdout: {stdout}");
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "`{filter}` -- stderr: {stderr}"
+        );
     }
 
     // LazySeq (#1812's own target), predating #1936/#1948 entirely.

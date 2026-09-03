@@ -1163,11 +1163,17 @@ impl EvalError {
     }
 
     /// A decode failure while materializing a lazily-indexed document value
-    /// (#1247): invalid UTF-8, an unrecoverable escape, or a malformed
-    /// number literal. Unlike an ordinary type-mismatch error, this must
-    /// never be suppressed by `?` or caught by `try`/`catch` (#1620) — jq's
-    /// own equivalent is a parse-time rejection no program could ever catch
-    /// either.
+    /// (#1247): invalid UTF-8, an unrecoverable escape, a malformed number
+    /// literal, or (#2286) a document the semi-index accepted structurally
+    /// but that a strict re-validation then found isn't actually valid
+    /// JSON (`EvalError::malformed_json_text` and its
+    /// `malformed_member_error`/`malformed_delimiter_error`/
+    /// `malformed_element_error` callers). Unlike an ordinary
+    /// type-mismatch error, this must never be suppressed by `?` or caught
+    /// by `try`/`catch` (#1620) — jq's own equivalent is a parse-time
+    /// rejection no program could ever catch either, and that holds
+    /// equally for a malformed document (jq never gets past parsing it at
+    /// all) as it does for a single undecodable string.
     pub fn decode_failure(reason: impl Into<String>) -> Self {
         Self::with_kind(reason, ErrorKind::DecodeFailure)
     }
@@ -1464,13 +1470,25 @@ impl EvalError {
     /// relative to this document's own slice, while the caller reports a
     /// location counted in the whole file. Carrying both would print two
     /// numbers that disagree.
+    ///
+    /// #2286: tagged [`ErrorKind::DecodeFailure`] via [`Self::decode_failure`],
+    /// not the plain [`Self::new`] this used to call. Real jq's equivalent
+    /// failure is a *parse* error, raised before any filter — `?` included —
+    /// ever runs; a trailing `?` was wrongly suppressing it (confirmed live
+    /// against jq 1.7.1: `echo '{"a" 1}' | jq -c '.a?'` still exits 5). Every
+    /// caller of this constructor (`JsonFields::malformed_member_error`,
+    /// `JsonElements::malformed_element_error`, `JsonCursor::
+    /// malformed_delimiter_error`) inherits the fix through this one shared
+    /// site, matching the "one classification, checked everywhere via a
+    /// single predicate" architecture [`Self::is_decode_failure`]'s own doc
+    /// comment already established for #1840.
     pub fn malformed_json_text(text: &[u8]) -> Self {
         match crate::json::validate::validate(text) {
-            Err(err) => Self::new(format!("Invalid JSON text: {}", err.kind)),
+            Err(err) => Self::decode_failure(format!("Invalid JSON text: {}", err.kind)),
             // The validator disagreeing with the indexer means the two have
             // drifted apart. Report the generic form rather than claim the
             // document is fine when a swallow point has already fired.
-            Ok(()) => Self::new("Invalid JSON text"),
+            Ok(()) => Self::decode_failure("Invalid JSON text"),
         }
     }
 

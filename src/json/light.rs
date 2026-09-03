@@ -2712,7 +2712,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentFields for JsonFields<'a, W> {
     fn malformed_member_error(&self) -> EvalError {
         match self.key_cursor {
             Some(cursor) => EvalError::malformed_json_text(cursor.text()),
-            None => EvalError::new("Invalid JSON text"),
+            // #2286: decode_failure, not new -- same always-uncatchable tag
+            // the cursor-present arm gets via malformed_json_text, so this
+            // fallback doesn't quietly reintroduce the gap for the one case
+            // (empty list, no cursor to read) that skips it.
+            None => EvalError::decode_failure("Invalid JSON text"),
         }
     }
 
@@ -2750,7 +2754,9 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentElements for JsonElements<'a, W> {
     fn malformed_element_error(&self) -> EvalError {
         match self.element_cursor {
             Some(cursor) => EvalError::malformed_json_text(cursor.text()),
-            None => EvalError::new("Invalid JSON text"),
+            // #2286: same fallback fix as JsonFields::malformed_member_error
+            // above.
+            None => EvalError::decode_failure("Invalid JSON text"),
         }
     }
 }

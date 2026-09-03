@@ -45629,18 +45629,27 @@ mod tests {
         );
     }
 
-    /// #1953: `to_owned`'s `Err` can carry a #1194 malformed-member
-    /// error (a trailing unpaired object member, e.g. `{"a":1,"b"}`), which
-    /// is not `is_decode_failure()`-tagged. Confirmed here (via a plain,
-    /// un-suppressed `.c = 5` reachable straight through the CLI) that the
-    /// raised error is indeed not a decode failure -- the premise the rest
-    /// of this fix rests on.
+    /// #1953 named this test for the premise it rested on: `to_owned`'s
+    /// `Err` can carry a #1194 malformed-member error (a trailing unpaired
+    /// object member, e.g. `{"a":1,"b"}`), which #1953 assumed was not
+    /// `is_decode_failure()`-tagged and should respect `optional` like an
+    /// ordinary error. #2286 found that premise itself was never actually
+    /// checked against the real jq oracle for the one question that
+    /// matters -- catchability -- and live-verified the opposite: real jq
+    /// treats this shape as an unconditional *parse* error, never reaching
+    /// any filter, `?`/`try`/`catch` included (`echo '{"a":1,"b"}' | jq -c
+    /// '.c = 5'` exits 5 with `parse error: Objects must consist of
+    /// key:value pairs`, and stays exit 5 under every wrapping this file's
+    /// own #2286 tests below try). #2286 tags this error class
+    /// `is_decode_failure()` to match, which is what this test -- kept
+    /// under its original name so the history of the reversal stays
+    /// visible -- now confirms instead.
     #[test]
     fn test_malformed_member_error_is_not_a_decode_failure_1953() {
         query!(
             br#"{"a":1,"b"}"#,
             ".c = 5",
-            QueryResult::Error(e) => assert!(!e.is_decode_failure())
+            QueryResult::Error(e) => assert!(e.is_decode_failure(), "expected a decode failure, got: {e:?}")
         );
     }
 
@@ -45679,13 +45688,15 @@ mod tests {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let slice_expr = Expr::slice(None, None);
-        match eval_single::<Vec<u64>, YqSemantics>(&slice_expr, cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match eval_single::<Vec<u64>, YqSemantics>(&slice_expr, cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match eval_single::<Vec<u64>, YqSemantics>(&slice_expr, cursor.value(), optional) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
     }
 
@@ -45707,21 +45718,25 @@ mod tests {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let slice_expr = Expr::slice(None, Some(1));
-        match eval_single::<Vec<u64>, JqSemantics>(&slice_expr, cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
+        for optional in [true, false] {
+            match eval_single::<Vec<u64>, JqSemantics>(&slice_expr, cursor.value(), optional) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
-        match eval_single::<Vec<u64>, JqSemantics>(&slice_expr, cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
-        }
-        match eval_single::<Vec<u64>, YqSemantics>(&slice_expr, cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match eval_single::<Vec<u64>, YqSemantics>(&slice_expr, cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match eval_single::<Vec<u64>, YqSemantics>(&slice_expr, cursor.value(), optional) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
     }
 
@@ -45741,25 +45756,37 @@ mod tests {
         let target = Expr::Identity;
         let start = Some(Box::new(Expr::Literal(Literal::Int(0))));
         let end = None;
-        match eval_slice_expr::<Vec<u64>, JqSemantics>(&target, &start, &end, cursor.value(), true)
-        {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
+        for optional in [true, false] {
+            match eval_slice_expr::<Vec<u64>, JqSemantics>(
+                &target,
+                &start,
+                &end,
+                cursor.value(),
+                optional,
+            ) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
-        match eval_slice_expr::<Vec<u64>, JqSemantics>(&target, &start, &end, cursor.value(), false)
-        {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
-        }
-        match eval_slice_expr::<Vec<u64>, YqSemantics>(&target, &start, &end, cursor.value(), true)
-        {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match eval_slice_expr::<Vec<u64>, YqSemantics>(&target, &start, &end, cursor.value(), false)
-        {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match eval_slice_expr::<Vec<u64>, YqSemantics>(
+                &target,
+                &start,
+                &end,
+                cursor.value(),
+                optional,
+            ) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
     }
 
@@ -45776,13 +45803,20 @@ mod tests {
         let cursor = index.root(json_bytes);
         let path_expr = Expr::Identity;
         let value_expr = Expr::Literal(Literal::Int(5));
-        match eval_assign::<Vec<u64>, JqSemantics>(&path_expr, &value_expr, cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match eval_assign::<Vec<u64>, JqSemantics>(&path_expr, &value_expr, cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match eval_assign::<Vec<u64>, JqSemantics>(
+                &path_expr,
+                &value_expr,
+                cursor.value(),
+                optional,
+            ) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
     }
 
@@ -45794,25 +45828,21 @@ mod tests {
         let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
-        match eval_update::<Vec<u64>, JqSemantics>(
-            &Expr::Identity,
-            &Expr::Identity,
-            cursor.value(),
-            true,
-            true,
-        ) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match eval_update::<Vec<u64>, JqSemantics>(
-            &Expr::Identity,
-            &Expr::Identity,
-            cursor.value(),
-            false,
-            true,
-        ) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match eval_update::<Vec<u64>, JqSemantics>(
+                &Expr::Identity,
+                &Expr::Identity,
+                cursor.value(),
+                optional,
+                true,
+            ) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
     }
 
@@ -45828,25 +45858,21 @@ mod tests {
         let cursor = index.root(json_bytes);
         let path_expr = Expr::Identity;
         let value_expr = Expr::Literal(Literal::Int(1));
-        match eval_compound_assign::<Vec<u64>, JqSemantics>(
-            AssignOp::Add,
-            &path_expr,
-            &value_expr,
-            cursor.value(),
-            true,
-        ) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match eval_compound_assign::<Vec<u64>, JqSemantics>(
-            AssignOp::Add,
-            &path_expr,
-            &value_expr,
-            cursor.value(),
-            false,
-        ) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match eval_compound_assign::<Vec<u64>, JqSemantics>(
+                AssignOp::Add,
+                &path_expr,
+                &value_expr,
+                cursor.value(),
+                optional,
+            ) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
     }
 
@@ -45860,15 +45886,20 @@ mod tests {
         let cursor = index.root(json_bytes);
         let path_expr = parse(r#"["c"]"#).unwrap();
         let val_expr = Expr::Literal(Literal::Int(5));
-        match builtin_setpath::<Vec<u64>, JqSemantics>(&path_expr, &val_expr, cursor.value(), true)
-        {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match builtin_setpath::<Vec<u64>, JqSemantics>(&path_expr, &val_expr, cursor.value(), false)
-        {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match builtin_setpath::<Vec<u64>, JqSemantics>(
+                &path_expr,
+                &val_expr,
+                cursor.value(),
+                optional,
+            ) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
     }
 
@@ -45881,13 +45912,15 @@ mod tests {
         let json_bytes: &[u8] = br#"[[{"a":1,"b"}]]"#;
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
-        match builtin_combinations::<Vec<u64>>(cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match builtin_combinations::<Vec<u64>>(cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match builtin_combinations::<Vec<u64>>(cursor.value(), optional) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
     }
 
@@ -45900,13 +45933,16 @@ mod tests {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let n_expr = Expr::Literal(Literal::Int(1));
-        match builtin_combinations_n::<Vec<u64>, JqSemantics>(&n_expr, cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match builtin_combinations_n::<Vec<u64>, JqSemantics>(&n_expr, cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match builtin_combinations_n::<Vec<u64>, JqSemantics>(&n_expr, cursor.value(), optional)
+            {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
     }
 
@@ -45956,8 +45992,10 @@ mod tests {
                 ),
             ] {
                 match got {
-                    QueryResult::None if optional => {}
-                    QueryResult::Error(e) if !optional => assert!(!e.is_decode_failure()),
+                    QueryResult::Error(e) => assert!(
+                        e.is_decode_failure(),
+                        "mode={mode} optional={optional}: expected decode failure, got: {e:?}"
+                    ),
                     other => panic!("mode={mode} optional={optional}: unexpected {other:?}"),
                 }
             }
@@ -45984,8 +46022,10 @@ mod tests {
                 ),
             ] {
                 match got {
-                    QueryResult::None if optional => {}
-                    QueryResult::Error(e) if !optional => assert!(!e.is_decode_failure()),
+                    QueryResult::Error(e) => assert!(
+                        e.is_decode_failure(),
+                        "mode={mode} optional={optional}: expected decode failure, got: {e:?}"
+                    ),
                     other => panic!("mode={mode} optional={optional}: unexpected {other:?}"),
                 }
             }
@@ -46015,8 +46055,10 @@ mod tests {
                 ),
             ] {
                 match got {
-                    QueryResult::None if optional => {}
-                    QueryResult::Error(e) if !optional => assert!(!e.is_decode_failure()),
+                    QueryResult::Error(e) => assert!(
+                        e.is_decode_failure(),
+                        "mode={mode} optional={optional}: expected decode failure, got: {e:?}"
+                    ),
                     other => panic!("mode={mode} optional={optional}: unexpected {other:?}"),
                 }
             }
@@ -46045,8 +46087,10 @@ mod tests {
                 ),
             ] {
                 match got {
-                    QueryResult::None if optional => {}
-                    QueryResult::Error(e) if !optional => assert!(!e.is_decode_failure()),
+                    QueryResult::Error(e) => assert!(
+                        e.is_decode_failure(),
+                        "mode={mode} optional={optional}: expected decode failure, got: {e:?}"
+                    ),
                     other => panic!("mode={mode} optional={optional}: unexpected {other:?}"),
                 }
             }
@@ -46074,8 +46118,10 @@ mod tests {
                 ),
             ] {
                 match got {
-                    QueryResult::None if optional => {}
-                    QueryResult::Error(e) if !optional => assert!(!e.is_decode_failure()),
+                    QueryResult::Error(e) => assert!(
+                        e.is_decode_failure(),
+                        "mode={mode} optional={optional}: expected decode failure, got: {e:?}"
+                    ),
                     other => panic!("mode={mode} optional={optional}: unexpected {other:?}"),
                 }
             }
@@ -46106,13 +46152,15 @@ mod tests {
         let cursor = index.root(json_bytes);
         let cond = Expr::Literal(Literal::Bool(true));
         let update = Expr::Identity;
-        match eval_until::<Vec<u64>, JqSemantics>(&cond, &update, cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match eval_until::<Vec<u64>, JqSemantics>(&cond, &update, cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match eval_until::<Vec<u64>, JqSemantics>(&cond, &update, cursor.value(), optional) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
 
         let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
@@ -46134,13 +46182,15 @@ mod tests {
         let cursor = index.root(json_bytes);
         let cond = Expr::Literal(Literal::Bool(false));
         let update = Expr::Identity;
-        match eval_while::<Vec<u64>, JqSemantics>(&cond, &update, cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match eval_while::<Vec<u64>, JqSemantics>(&cond, &update, cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match eval_while::<Vec<u64>, JqSemantics>(&cond, &update, cursor.value(), optional) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
 
         let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
@@ -46161,13 +46211,15 @@ mod tests {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let expr = Expr::Identity;
-        match eval_repeat::<Vec<u64>, JqSemantics>(&expr, cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match eval_repeat::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match eval_repeat::<Vec<u64>, JqSemantics>(&expr, cursor.value(), optional) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
 
         let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
@@ -46188,13 +46240,15 @@ mod tests {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let f = Expr::Identity;
-        match builtin_walk::<Vec<u64>, JqSemantics>(&f, cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match builtin_walk::<Vec<u64>, JqSemantics>(&f, cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match builtin_walk::<Vec<u64>, JqSemantics>(&f, cursor.value(), optional) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
 
         let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
@@ -46219,13 +46273,15 @@ mod tests {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let path_expr = Expr::Array(Box::new(Expr::Literal(Literal::String("a".into()))));
-        match builtin_getpath::<Vec<u64>, JqSemantics>(&path_expr, cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match builtin_getpath::<Vec<u64>, JqSemantics>(&path_expr, cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match builtin_getpath::<Vec<u64>, JqSemantics>(&path_expr, cursor.value(), optional) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
 
         let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
@@ -46247,13 +46303,15 @@ mod tests {
         let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
-        match eval_error::<Vec<u64>, JqSemantics>(None, cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match eval_error::<Vec<u64>, JqSemantics>(None, cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match eval_error::<Vec<u64>, JqSemantics>(None, cursor.value(), optional) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
 
         let decode_failure_bytes: &[u8] = &b"\"\xff\xfe\""[..];
@@ -46274,13 +46332,15 @@ mod tests {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let msg_expr = Expr::Identity;
-        match eval_error::<Vec<u64>, JqSemantics>(Some(&msg_expr), cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match eval_error::<Vec<u64>, JqSemantics>(Some(&msg_expr), cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match eval_error::<Vec<u64>, JqSemantics>(Some(&msg_expr), cursor.value(), optional) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
 
         // `msg_expr`'s own output (not the root value here -- `Identity`
@@ -46307,13 +46367,15 @@ mod tests {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let obj_expr = parse("[]").unwrap();
-        match builtin_in::<Vec<u64>, JqSemantics>(&obj_expr, cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match builtin_in::<Vec<u64>, JqSemantics>(&obj_expr, cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match builtin_in::<Vec<u64>, JqSemantics>(&obj_expr, cursor.value(), optional) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
     }
 
@@ -46332,25 +46394,21 @@ mod tests {
         let cursor = index.root(json_bytes);
         let gen_expr = Expr::Identity;
         let cond_expr = Expr::Literal(Literal::Bool(true));
-        match any_all_gen_cond::<Vec<u64>, JqSemantics>(
-            &gen_expr,
-            &cond_expr,
-            cursor.value(),
-            true,
-            true,
-        ) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match any_all_gen_cond::<Vec<u64>, JqSemantics>(
-            &gen_expr,
-            &cond_expr,
-            cursor.value(),
-            false,
-            true,
-        ) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match any_all_gen_cond::<Vec<u64>, JqSemantics>(
+                &gen_expr,
+                &cond_expr,
+                cursor.value(),
+                optional,
+                true,
+            ) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
     }
 
@@ -46374,13 +46432,15 @@ mod tests {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let s_expr = Expr::Identity;
-        match builtin_upper_in::<Vec<u64>, JqSemantics>(&s_expr, cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match builtin_upper_in::<Vec<u64>, JqSemantics>(&s_expr, cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match builtin_upper_in::<Vec<u64>, JqSemantics>(&s_expr, cursor.value(), optional) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
     }
 
@@ -46444,23 +46504,20 @@ mod tests {
         let cursor = index.root(json_bytes);
         let src_expr = Expr::Identity;
         let s_expr = Expr::Identity;
-        match builtin_upper_in_src::<Vec<u64>, JqSemantics>(
-            &src_expr,
-            &s_expr,
-            cursor.value(),
-            true,
-        ) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match builtin_upper_in_src::<Vec<u64>, JqSemantics>(
-            &src_expr,
-            &s_expr,
-            cursor.value(),
-            false,
-        ) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match builtin_upper_in_src::<Vec<u64>, JqSemantics>(
+                &src_expr,
+                &s_expr,
+                cursor.value(),
+                optional,
+            ) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
     }
 
@@ -46494,13 +46551,15 @@ mod tests {
         let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
-        match builtin_tostring::<Vec<u64>, JqSemantics>(cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match builtin_tostring::<Vec<u64>, JqSemantics>(cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match builtin_tostring::<Vec<u64>, JqSemantics>(cursor.value(), optional) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
     }
 
@@ -46526,13 +46585,15 @@ mod tests {
         let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
-        match builtin_tojson::<Vec<u64>, JqSemantics>(cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match builtin_tojson::<Vec<u64>, JqSemantics>(cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match builtin_tojson::<Vec<u64>, JqSemantics>(cursor.value(), optional) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
     }
 
@@ -46559,13 +46620,16 @@ mod tests {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let idx_expr = Expr::field("a");
-        match builtin_upper_index::<Vec<u64>, JqSemantics>(&idx_expr, cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match builtin_upper_index::<Vec<u64>, JqSemantics>(&idx_expr, cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match builtin_upper_index::<Vec<u64>, JqSemantics>(&idx_expr, cursor.value(), optional)
+            {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
     }
 
@@ -46594,23 +46658,20 @@ mod tests {
         let cursor = index.root(json_bytes);
         let stream_expr = Expr::Identity;
         let idx_expr = Expr::field("a");
-        match builtin_upper_index_stream::<Vec<u64>, JqSemantics>(
-            &stream_expr,
-            &idx_expr,
-            cursor.value(),
-            true,
-        ) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match builtin_upper_index_stream::<Vec<u64>, JqSemantics>(
-            &stream_expr,
-            &idx_expr,
-            cursor.value(),
-            false,
-        ) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match builtin_upper_index_stream::<Vec<u64>, JqSemantics>(
+                &stream_expr,
+                &idx_expr,
+                cursor.value(),
+                optional,
+            ) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
     }
 
@@ -46642,13 +46703,15 @@ mod tests {
         let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
-        match builtin_tojsonstream::<Vec<u64>>(cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match builtin_tojsonstream::<Vec<u64>>(cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match builtin_tojsonstream::<Vec<u64>>(cursor.value(), optional) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
     }
 
@@ -46673,13 +46736,15 @@ mod tests {
         let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
-        match builtin_tostream::<Vec<u64>>(cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match builtin_tostream::<Vec<u64>>(cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match builtin_tostream::<Vec<u64>>(cursor.value(), optional) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
     }
 
@@ -46706,13 +46771,15 @@ mod tests {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let b_expr = Expr::Literal(Literal::String(String::new()));
-        match builtin_contains::<Vec<u64>, JqSemantics>(&b_expr, cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match builtin_contains::<Vec<u64>, JqSemantics>(&b_expr, cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match builtin_contains::<Vec<u64>, JqSemantics>(&b_expr, cursor.value(), optional) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
     }
 
@@ -46726,13 +46793,15 @@ mod tests {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let b_expr = Expr::Literal(Literal::String(String::new()));
-        match builtin_inside::<Vec<u64>, JqSemantics>(&b_expr, cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match builtin_inside::<Vec<u64>, JqSemantics>(&b_expr, cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match builtin_inside::<Vec<u64>, JqSemantics>(&b_expr, cursor.value(), optional) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
     }
 
@@ -46894,13 +46963,15 @@ mod tests {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let keys_expr = Expr::Identity;
-        match builtin_pick::<Vec<u64>, JqSemantics>(&keys_expr, cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match builtin_pick::<Vec<u64>, JqSemantics>(&keys_expr, cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match builtin_pick::<Vec<u64>, JqSemantics>(&keys_expr, cursor.value(), optional) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
     }
 
@@ -46928,13 +46999,15 @@ mod tests {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let keys_expr = parse("(.k1,.k2)").unwrap();
-        match builtin_pick::<Vec<u64>, JqSemantics>(&keys_expr, cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match builtin_pick::<Vec<u64>, JqSemantics>(&keys_expr, cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match builtin_pick::<Vec<u64>, JqSemantics>(&keys_expr, cursor.value(), optional) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
     }
 
@@ -48054,18 +48127,26 @@ mod tests {
         );
     }
 
-    /// #1829 code review: `pick`/`omit(...)?` must suppress the new
-    /// malformed-key errors via the outer `Expr::Optional` catch, matching
-    /// `keys?`/`to_entries?`/`map_values(...)?`'s already-tested convention
-    /// -- flagged as a coverage gap (no runtime bug; both already behaved
-    /// correctly) since `pick`/`omit` were the only two of the five #1829
-    /// builtins in this slice without a dedicated test pinning it.
+    /// #1829 code review, revised by #2286: `pick`/`omit(...)?` on a
+    /// malformed-key document now raise unconditionally rather than
+    /// suppressing via the outer `Expr::Optional` catch, matching
+    /// `keys?`/`to_entries?`/`map_values(...)?`'s own #2286 revision --
+    /// real jq's equivalent is a parse error no filter (`?` included) ever
+    /// reaches.
     #[test]
     fn test_builtin_pick_omit_optional_suppresses_malformed_key_errors_1829() {
-        query!(br#"{"a":1,"b"}"#, "pick([\"a\"])?", QueryResult::None => {});
-        query!(br#"{"a":1,"b"}"#, "omit([\"a\"])?", QueryResult::None => {});
-        query!(br#"{"a" 1, "b": 2}"#, "pick([\"b\"])?", QueryResult::None => {});
-        query!(br#"{"a" 1, "b": 2}"#, "omit([\"b\"])?", QueryResult::None => {});
+        for (doc, expr) in [
+            (&br#"{"a":1,"b"}"#[..], "pick([\"a\"])?"),
+            (&br#"{"a":1,"b"}"#[..], "omit([\"a\"])?"),
+            (&br#"{"a" 1, "b": 2}"#[..], "pick([\"b\"])?"),
+            (&br#"{"a" 1, "b": 2}"#[..], "omit([\"b\"])?"),
+        ] {
+            query!(doc, expr,
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+            );
+        }
     }
 
     /// #1829 code review: the object arm's `effective_fields_checked`
@@ -48866,14 +48947,14 @@ mod tests {
         }
     }
 
-    /// #1934 item 3: `eval_reduce`'s `input` arm treated *every*
-    /// `to_owned`/`promote_borrowed_checked` failure as
-    /// unconditionally fatal, including a non-decode-failure error (a
-    /// #1194 malformed-member error) that the sibling bare
-    /// `QueryResult::Error` arm a few lines below already respects
-    /// `optional` for. `{"a":1,"b"}` is a trailing unpaired object member
-    /// JSON's own semi-index accepts (#1194) -- `.` (identity) surfaces it
-    /// as-is, and `to_owned` raises on the full walk.
+    /// #1934 item 3 (revised by #2286): `eval_reduce`'s `input` arm treats
+    /// every `to_owned`/`promote_borrowed_checked` failure as
+    /// unconditionally fatal -- including a #1194 malformed-member error
+    /// (`{"a":1,"b"}`, a trailing unpaired object member JSON's own
+    /// semi-index accepts), which #2286 tagged `is_decode_failure()` so it
+    /// is now *never* suppressed by `optional` either, matching real jq's
+    /// own "parse error before any filter runs" semantics. `.` (identity)
+    /// surfaces it as-is, and `to_owned` raises on the full walk.
     #[test]
     fn test_eval_reduce_input_to_owned_error_respects_optional_unless_decode_failure_1934() {
         let json: &[u8] = br#"{"a":1,"b"}"#;
@@ -48883,30 +48964,22 @@ mod tests {
         let init_expr = parse("0").unwrap();
         let update_expr = parse(". + 1").unwrap();
 
-        match eval_reduce::<Vec<u64>, JqSemantics>(
-            &identity,
-            &[],
-            &init_expr,
-            &update_expr,
-            root.value(),
-            true,
-        ) {
-            QueryResult::None => {}
-            other => panic!("expected suppression under optional, got: {other:?}"),
-        }
-
-        // Same repro, `optional = false`: still raises, matching the
-        // sibling bare-error arm's own contract.
-        match eval_reduce::<Vec<u64>, JqSemantics>(
-            &identity,
-            &[],
-            &init_expr,
-            &update_expr,
-            root.value(),
-            false,
-        ) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected an unsuppressed error, got: {other:?}"),
+        for optional in [true, false] {
+            match eval_reduce::<Vec<u64>, JqSemantics>(
+                &identity,
+                &[],
+                &init_expr,
+                &update_expr,
+                root.value(),
+                optional,
+            ) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
     }
 
@@ -48925,28 +48998,22 @@ mod tests {
         let init_expr = parse("0").unwrap();
         let update_expr = parse(". + 1").unwrap();
 
-        match eval_reduce::<Vec<u64>, JqSemantics>(
-            &iterate_expr,
-            &[],
-            &init_expr,
-            &update_expr,
-            root.value(),
-            true,
-        ) {
-            QueryResult::None => {}
-            other => panic!("expected suppression under optional, got: {other:?}"),
-        }
-
-        match eval_reduce::<Vec<u64>, JqSemantics>(
-            &iterate_expr,
-            &[],
-            &init_expr,
-            &update_expr,
-            root.value(),
-            false,
-        ) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected an unsuppressed error, got: {other:?}"),
+        for optional in [true, false] {
+            match eval_reduce::<Vec<u64>, JqSemantics>(
+                &iterate_expr,
+                &[],
+                &init_expr,
+                &update_expr,
+                root.value(),
+                optional,
+            ) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
     }
 
@@ -53958,47 +54025,35 @@ mod tests {
 
     #[test]
     fn eval_error_msg_expr_malformed_member_reaches_an_enclosing_catch_1907() {
-        // A more discriminating sibling of the plain-raise test below: `?`
-        // and `try`/`catch` suppression is `eval_try`'s own decision, made
-        // *after* inspecting whatever this function returns -- for a bare
-        // `?` (no catch handler), `eval_try` discards any non-decode-failure
-        // `Error` to `None` regardless of how it got there, so that shape
-        // can't tell an internally-self-suppressing `eval_error` apart from
-        // one that raises and lets `eval_try` decide. Wrapping a *real*
-        // catch handler inside the `?` can: with `optional` forced `true` by
-        // the outer `?`, the inner `eval_try`'s `catch = Some(...)` arm only
-        // ever runs if this function actually returns `Error(e)` rather than
-        // self-suppressing to `None` first. Confirmed this reaches the
-        // handler with the fix, and would return bare `None` (skipping the
-        // handler entirely) without it.
+        // #2286 revises this test's own premise: a #1194 malformed-member
+        // error is now `is_decode_failure()`-tagged, so `eval_try`'s
+        // unconditional-propagate arm fires *before* the `catch = Some(...)`
+        // dispatch this test used to exercise -- the handler is bypassed
+        // entirely now, matching real jq's own "parse error, never reaches
+        // any filter including a catch handler" behavior (confirmed live:
+        // `echo '{"a":1,"b"}' | jq -c '(try error(.) catch "caught")?'`
+        // still raises `parse error: Objects must consist of key:value
+        // pairs`, never producing `"caught"`).
         query!(br#"{"a":1,"b"}"#, r#"(try error(.) catch "caught")?"#,
-            QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "caught");
+            QueryResult::Error(e) => {
+                assert!(e.is_decode_failure(), "expected a decode failure, got: {e:?}");
             }
         );
     }
 
     #[test]
     fn eval_error_msg_expr_malformed_member_raised_1907() {
-        // Sibling to the decode-failure tests above, for the *other* error
-        // class `to_owned` can raise: a #1194 malformed-member error
-        // (a trailing unpaired object member JSON's own semi-index accepts,
-        // e.g. `{"a":1,"b"}`) is not `is_decode_failure()`-tagged, but
-        // `to_owned` raises it unconditionally at every other call
-        // site in this file, including this function's own `None` arm below
-        // -- so `error(.)` must raise it here too, not silently swallow it
-        // into `""` via an unchecked `to_owned_lossy`.
-        //
-        // This does *not* assert anything about a *wrapping* `?`/`try`:
-        // that suppression/catch decision belongs to `eval_try`, one level
-        // up, whose own `is_decode_failure()`-only exclusion is a separate,
-        // pre-existing gap (closely related to #1907's own item 3) outside
-        // this fix's scope -- `eval_try` re-decides uniformly from the
-        // `Error` this function returns, regardless of *how* this function
-        // arrived at it.
+        // #2286: a #1194 malformed-member error (a trailing unpaired object
+        // member JSON's own semi-index accepts, e.g. `{"a":1,"b"}`) is now
+        // `is_decode_failure()`-tagged -- `to_owned` still raises it
+        // unconditionally at every call site in this file, including this
+        // function's own `None` arm below, but the tag now also makes
+        // `eval_try` propagate it unconditionally rather than treating it
+        // as an ordinary, `?`-suppressible/`catch`-able error. See the
+        // sibling test just above for the `?`/`try`/`catch` half of this.
         query!(br#"{"a":1,"b"}"#, "error(.)",
             QueryResult::Error(e) => {
-                assert!(!e.is_decode_failure());
+                assert!(e.is_decode_failure(), "expected a decode failure, got: {e:?}");
             }
         );
     }
@@ -54410,18 +54465,21 @@ mod tests {
     /// #1829's other axis: a structurally non-string/unpaired key (#1194,
     /// `{"a":1,"b"}`) must raise for `keys`/`keys_unsorted` too, matching
     /// `path(.[])`/`tojson` -- previously silently dropped instead (`["a"]`
-    /// rather than an error).
+    /// rather than an error). #2286: this is `is_decode_failure()`-tagged
+    /// now, not the ordinary-error class this test originally expected.
     #[test]
     fn test_builtin_keys_raises_on_structurally_malformed_key_1829() {
         let doc: &[u8] = br#"{"a":1,"b"}"#;
 
         query!(doc, "keys_unsorted",
             QueryResult::Error(e) => {
-                assert!(!e.is_decode_failure(), "message: {}", e.message);
+                assert!(e.is_decode_failure(), "expected decode failure, message: {}", e.message);
             }
         );
         query!(doc, "keys",
-            QueryResult::Error(_) => {}
+            QueryResult::Error(e) => {
+                assert!(e.is_decode_failure(), "expected decode failure, message: {}", e.message);
+            }
         );
     }
 
@@ -54559,20 +54617,27 @@ mod tests {
         }
     }
 
-    /// Code review, #1829/#1835: the object arm's new error paths (#1194,
-    /// #1677) return `QueryResult::Error` directly, with no `optional`
-    /// check of their own -- unlike this same function's scalar/array
-    /// `_ if optional => QueryResult::None` fallthrough. Not a gap: `keys?`/
-    /// `keys_unsorted?` always parses to `Expr::Optional`, whose own
-    /// `eval_try` unconditionally catches an ordinary `QueryResult::Error`
-    /// (mirrors `builtin_length`'s identical scalar-arm shape, already
-    /// established elsewhere in this file). Pinned here since neither
-    /// prior #1829 test exercises `?` at all.
+    /// Code review, #1829/#1835, revised by #2286: the object arm's new
+    /// error paths (#1194, #1677) return `QueryResult::Error` directly,
+    /// with no `optional` check of their own -- unlike this same
+    /// function's scalar/array `_ if optional => QueryResult::None`
+    /// fallthrough. #1829 assumed this meant `keys?`/`keys_unsorted?`
+    /// suppress it uniformly via `eval_try`'s ordinary-error catch; #2286
+    /// tags this error class `is_decode_failure()` instead, matching real
+    /// jq's own unconditional-parse-error behavior for both shapes below
+    /// (live-verified: `keys?` on either document still exits 5 in jq
+    /// 1.7.1). Pinned here since neither prior #1829 test exercises `?` at
+    /// all.
     #[test]
     fn test_builtin_keys_optional_suppresses_malformed_key_errors_1829() {
         for expr in ["keys?", "keys_unsorted?"] {
-            query!(br#"{"a":1,"b"}"#, expr, QueryResult::None => {});
-            query!(br#"{"a" 1, "b": 2}"#, expr, QueryResult::None => {});
+            for doc in [&br#"{"a":1,"b"}"#[..], &br#"{"a" 1, "b": 2}"#[..]] {
+                query!(doc, expr,
+                    QueryResult::Error(e) => {
+                        assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                    }
+                );
+            }
         }
     }
 
@@ -54982,13 +55047,24 @@ mod tests {
         );
     }
 
-    /// Code review precedent from #1835/#1848/#1829: `map_values?` must
-    /// still suppress both error axes via the outer `Expr::Optional` catch.
+    /// Code review precedent from #1835/#1848/#1829, revised by #2286:
+    /// `map_values?` on either malformed-document axis now raises
+    /// unconditionally rather than suppressing via the outer
+    /// `Expr::Optional` catch (live-verified against jq 1.7.1: all three
+    /// shapes below still exit 5 under `?`).
     #[test]
     fn test_builtin_map_values_optional_suppresses_malformed_key_errors_1829() {
-        query!(br#"{"a":1,"b"}"#, "map_values(.+1)?", QueryResult::None => {});
-        query!(br#"{"a" 1, "b": 2}"#, "map_values(.+1)?", QueryResult::None => {});
-        query!(br"[1 2, 3]", "map_values(.+1)?", QueryResult::None => {});
+        for (doc, expr) in [
+            (&br#"{"a":1,"b"}"#[..], "map_values(.+1)?"),
+            (&br#"{"a" 1, "b": 2}"#[..], "map_values(.+1)?"),
+            (&br"[1 2, 3]"[..], "map_values(.+1)?"),
+        ] {
+            query!(doc, expr,
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+            );
+        }
     }
 
     /// Code review, #1829: a duplicate object key must be collapsed to its
@@ -56358,12 +56434,19 @@ mod tests {
         );
     }
 
-    /// Code review precedent from #1835/#1829: `to_entries?` must still
-    /// suppress both error axes via the outer `Expr::Optional` catch.
+    /// Code review precedent from #1835/#1829, revised by #2286:
+    /// `to_entries?` on either malformed-document axis now raises
+    /// unconditionally instead of suppressing via the outer
+    /// `Expr::Optional` catch.
     #[test]
     fn test_builtin_to_entries_optional_suppresses_malformed_key_errors_1829() {
-        query!(br#"{"a":1,"b"}"#, "to_entries?", QueryResult::None => {});
-        query!(br#"{"a" 1, "b": 2}"#, "to_entries?", QueryResult::None => {});
+        for doc in [&br#"{"a":1,"b"}"#[..], &br#"{"a" 1, "b": 2}"#[..]] {
+            query!(doc, "to_entries?",
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+            );
+        }
     }
 
     #[test]
@@ -77241,27 +77324,42 @@ mod tests {
     /// consistency, not a latent `try`/`catch` bypass.
     #[test]
     fn test_try_catch_handler_still_runs_under_outer_optional_2231() {
-        // Bare, unwrapped: raises the ordinary (suppressible) #1194 error.
+        // #2286 revises this test: `{"a":1,"b"}`'s #1194 malformed-member
+        // error is now `is_decode_failure()`-tagged, which closes off the
+        // *only* concrete vehicle this test had for finding 4's scenario --
+        // `to_owned_at_depth`'s remaining error paths (string decode
+        // failure, #1642 key collision, #1194 malformed member/delimiter)
+        // are now uniformly decode failures, so no `to_owned`-sourced error
+        // can demonstrate "a leaf's own internal optional-consulting
+        // self-suppresses ahead of an enclosing catch" anymore -- there is
+        // no longer a non-decode-failure error class left for such a leaf
+        // to conditionally suppress. `eval_try`'s own mechanism (passing
+        // the same `optional` it receives straight into evaluating `expr`)
+        // is unchanged and still exercised by every decode-failure-survives
+        // test in this file; what changed is that #1194 joined that
+        // uncatchable class instead of remaining a live example of the
+        // *other* one. This test now just pins the resulting behavior
+        // directly: uncatchable at every level, `catch` handler included,
+        // matching real jq's own unconditional parse error.
         query!(
             br#"{"a":1,"b"}"#,
             "tostring",
-            QueryResult::Error(e) => assert!(!e.is_decode_failure(), "{}", e.message)
+            QueryResult::Error(e) => assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}")
         );
-        // `?` alone: suppressed to nothing, per #2184.
-        query!(br#"{"a":1,"b"}"#, "tostring?", QueryResult::None => {});
-        // `try ... catch H`, no outer `?`: H runs.
+        query!(
+            br#"{"a":1,"b"}"#,
+            "tostring?",
+            QueryResult::Error(e) => assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}")
+        );
         query!(
             br#"{"a":1,"b"}"#,
             r#"try tostring catch "CAUGHT""#,
-            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(&*s, "CAUGHT")
+            QueryResult::Error(e) => assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}")
         );
-        // The case finding 4 worried about: `try ... catch H` wrapped in its
-        // own outer `?`. `H` must still run -- `tostring`'s own internal
-        // suppression must not fire ahead of `eval_try`'s catch dispatch.
         query!(
             br#"{"a":1,"b"}"#,
             r#"(try tostring catch "CAUGHT")?"#,
-            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(&*s, "CAUGHT")
+            QueryResult::Error(e) => assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}")
         );
     }
 
@@ -77269,61 +77367,75 @@ mod tests {
     /// (`eval.rs`) and `fromjsonstream`'s Array arm (`eval.rs`) all raised
     /// an ordinary, suppressible #1194 malformed-member error
     /// unconditionally, ignoring `optional` where #2184/#2015 already fixed
-    /// the rest of this lineage's sites.
+    /// the rest of this lineage's sites -- true when #2231 landed.
     ///
-    /// Called directly, like every `#2184`/`#2015` test above -- going
-    /// through `?`/`try` can't distinguish fixed from unfixed here, since
-    /// `eval_try`'s own outer catch already normalizes the *observable*
-    /// result to `None` either way (confirmed by
-    /// `test_try_catch_handler_still_runs_under_outer_optional_2231`,
-    /// finding 4). This test pins the leaf's own `optional`-consulting
-    /// behavior, which #843/#1953's "one level up" defense makes non-live-
-    /// reachable today but still worth keeping correct in its own right.
+    /// #2286 has since tagged #1194 malformed-member/delimiter errors
+    /// `is_decode_failure()`, which makes every one of these four sites'
+    /// `optional`-consulting a no-op for this specific error class:
+    /// `suppresses(e, optional) = optional && !e.is_decode_failure()` is
+    /// now unconditionally `false` here regardless of what `optional`
+    /// actually is, since `to_owned`/`to_owned_at_depth` has no remaining
+    /// error path that *isn't* a decode failure. The fix these four sites
+    /// made is still correct (a decode failure must never be suppressed,
+    /// which is exactly what they now do) -- it just no longer depends on
+    /// `optional`'s value to be correct, the way #1194 originally seemed to
+    /// require. Not a regression to "fix" back: `to_owned_or_suppress!`/
+    /// `owned_or_suppress!` still correctly propagate a genuine decode
+    /// failure when `optional` really is meaningful for some *other* error
+    /// class a future caller might route through the same macro.
     #[test]
     fn test_debug_stderr_fromjsonstream_respect_optional_2231() {
         let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
 
-        match builtin_debug::<Vec<u64>, JqSemantics>(cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match builtin_debug::<Vec<u64>, JqSemantics>(cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match builtin_debug::<Vec<u64>, JqSemantics>(cursor.value(), optional) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
 
-        match builtin_stderr::<Vec<u64>, JqSemantics>(cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match builtin_stderr::<Vec<u64>, JqSemantics>(cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match builtin_stderr::<Vec<u64>, JqSemantics>(cursor.value(), optional) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
 
         let msg = Expr::Identity;
-        match builtin_debug_msg::<Vec<u64>, JqSemantics>(&msg, cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match builtin_debug_msg::<Vec<u64>, JqSemantics>(&msg, cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match builtin_debug_msg::<Vec<u64>, JqSemantics>(&msg, cursor.value(), optional) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
 
         // `fromjsonstream`'s Array arm, same malformed member one level down.
         let array_bytes: &[u8] = br#"[{"a":1,"b"}]"#;
         let array_index = JsonIndex::build(array_bytes);
         let array_cursor = array_index.root(array_bytes);
-        match builtin_fromjsonstream::<Vec<u64>>(array_cursor.value(), true) {
-            QueryResult::None => {}
-            other => panic!("expected None, got {other:?}"),
-        }
-        match builtin_fromjsonstream::<Vec<u64>>(array_cursor.value(), false) {
-            QueryResult::Error(e) => assert!(!e.is_decode_failure()),
-            other => panic!("expected Error, got {other:?}"),
+        for optional in [true, false] {
+            match builtin_fromjsonstream::<Vec<u64>>(array_cursor.value(), optional) {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
         }
     }
 

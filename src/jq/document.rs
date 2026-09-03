@@ -228,7 +228,11 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// [`DocumentFields::malformed_member_error`] -- it exists to keep a
     /// future format honest rather than to be seen.
     fn malformed_delimiter_error(&self) -> EvalError {
-        EvalError::new("Invalid document text: malformed delimiter")
+        // #2286: decode_failure, not new -- matches JsonCursor's own
+        // override, so a future format inheriting this default doesn't
+        // reintroduce the "? wrongly suppresses a parse-time-equivalent
+        // error" gap that fix closed.
+        EvalError::decode_failure("Invalid document text: malformed delimiter")
     }
 
     /// Whether an array/object cursor whose child walk produced **zero**
@@ -1114,7 +1118,9 @@ pub trait DocumentFields: Sized + Clone {
     /// stringifies -- so it exists to keep a future format honest rather than
     /// to be seen.
     fn malformed_member_error(&self) -> EvalError {
-        EvalError::new("Invalid document text: malformed object member")
+        // #2286: decode_failure, not new -- see malformed_delimiter_error's
+        // identical reasoning just above.
+        EvalError::decode_failure("Invalid document text: malformed object member")
     }
 
     /// Walk one field, materializing only its key.
@@ -2675,7 +2681,9 @@ pub trait DocumentElements: Sized + Copy + Clone {
     /// The default is unreachable for every format shipped today, same
     /// reasoning as that method's own default.
     fn malformed_element_error(&self) -> EvalError {
-        EvalError::new("Invalid document text: malformed array element")
+        // #2286: decode_failure, not new -- see malformed_delimiter_error's
+        // identical reasoning above.
+        EvalError::decode_failure("Invalid document text: malformed array element")
     }
 
     /// [`collect_cursors`](Self::collect_cursors), refusing an element
