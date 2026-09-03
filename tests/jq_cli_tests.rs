@@ -22558,6 +22558,50 @@ fn test_jq_len_checked_sibling_paths_reject_trailing_comma_2261() -> Result<()> 
     Ok(())
 }
 
+/// #2307: `length` on an object never checked the #2261 trailing-comma gap
+/// at all -- unlike every sibling in this file, `census` (jq mode,
+/// `collapse: true`, reached via `effective_len_checked`) and `checked_len`
+/// (yq mode, `collapse: false`) both walked every key/delimiter pair but
+/// never consulted `trailing_gap_ok` for the object's own real last field.
+/// `{"a":1,} | length` silently answered `1` instead of raising. Verified
+/// live against `/usr/bin/jq` 1.7.1 (`jq: parse error: Expected another
+/// key-value pair`). Reproduces with any number of preceding fields, not
+/// just the single-field case.
+#[test]
+fn test_jq_length_object_rejects_trailing_comma_2307() -> Result<()> {
+    for (input, query) in [(r#"{"a":1,}"#, "length"), (r#"{"a":1,"b":2,}"#, "length")] {
+        let (out, stderr, code) = run_jq_full(&["-c", query], Some(input))?;
+        assert_eq!(
+            code, 5,
+            "input={input} query={query}: out: {out:?}, stderr: {stderr:?}"
+        );
+        assert!(
+            out.trim().is_empty(),
+            "input={input} query={query}: unexpected output {out:?}"
+        );
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "input={input} query={query}: stderr: {stderr:?}"
+        );
+    }
+
+    // Well-formed input (including a duplicate key, which jq mode's
+    // `collapse: true` path resolves via a different branch of `census`
+    // than the single-field case above) must still answer correctly --
+    // this fix must not turn a valid document malformed.
+    for (input, expected) in [
+        (r#"{"a":1}"#, "1"),
+        (r#"{"a":1,"b":2}"#, "2"),
+        (r#"{"a":1,"a":2}"#, "1"),
+    ] {
+        let (out, _stderr, code) = run_jq_full(&["-c", "length"], Some(input))?;
+        assert_eq!(code, 0, "input={input}: unexpected failure");
+        assert_eq!(out.trim(), expected, "input={input}");
+    }
+
+    Ok(())
+}
+
 /// #2261 follow-up: a systematic sweep for every other unchecked
 /// `DocumentElements::collect_cursors`/`.len()` call site in
 /// `eval_generic.rs`/`document.rs` (prompted by the five paths above)

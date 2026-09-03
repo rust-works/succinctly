@@ -1836,6 +1836,7 @@ fn census<F: DocumentFields>(fields: &F) -> KeyCensus {
     let mut malformed = false;
     let mut walk = fields.clone();
     let mut is_first = true;
+    let mut last_key_cursor: Option<F::Cursor> = None;
     while let Some((key, cursor, rest)) = walk.uncons_key() {
         // #1677: both checks are free here -- comma-before-key reuses
         // `key`'s own decode, and colon-before-value scans forward from
@@ -1856,12 +1857,29 @@ fn census<F: DocumentFields>(fields: &F) -> KeyCensus {
                 malformed |= key_is_malformed(&key);
             }
         }
+        last_key_cursor = Some(cursor);
         walk = rest;
         is_first = false;
     }
     // `walk` is the list this loop *finished* on, the only list
     // `ends_unpaired` answers for (#1194), and asking it is O(1).
     malformed |= walk.ends_unpaired();
+    // #2307: trailing stray comma after a real last field (`{"a":1,}`) --
+    // `census` never checked this at all, unlike every sibling walk in this
+    // file (`effective_keys`'s `DistinctKeyCursors::trailing_gap_ok`,
+    // `DocumentElements::len_checked`'s own array counterpart). `walk`
+    // finished naturally, so `last_key_cursor` is genuinely the object's
+    // last field -- its value's own `next_sibling()` hop is the same O(1)
+    // move `contains_checked` already uses, mirroring `len_checked`'s
+    // unconditional post-loop check (no "is this really last" guard
+    // needed there either, for the identical reason).
+    if let Some(last) = &last_key_cursor {
+        if let Some(value_cursor) = last.next_sibling() {
+            if !trailing_element_gap_ok(&value_cursor, b'}') {
+                malformed = true;
+            }
+        }
+    }
     hashes.sort_unstable();
     let (shared, distinct_hashes) = shared_hashes(&hashes);
     if shared.is_empty() {
@@ -2523,6 +2541,7 @@ fn checked_len<F: DocumentFields>(fields: &F) -> Result<usize, EvalError> {
     let mut count = 0usize;
     let mut walk = fields.clone();
     let mut is_first = true;
+    let mut last_key_cursor: Option<F::Cursor> = None;
     while let Some((key, cursor, rest)) = walk.uncons_key() {
         if key_is_malformed(&key) {
             return Err(walk.malformed_member_error());
@@ -2534,11 +2553,21 @@ fn checked_len<F: DocumentFields>(fields: &F) -> Result<usize, EvalError> {
             return Err(walk.malformed_member_error());
         }
         count += 1;
+        last_key_cursor = Some(cursor);
         walk = rest;
         is_first = false;
     }
     if walk.ends_unpaired() {
         return Err(walk.malformed_member_error());
+    }
+    // #2307: trailing stray comma after a real last field (`{"a":1,}`) --
+    // same gap, same fix as `census` above.
+    if let Some(last) = &last_key_cursor {
+        if let Some(value_cursor) = last.next_sibling() {
+            if !trailing_element_gap_ok(&value_cursor, b'}') {
+                return Err(fields.malformed_member_error());
+            }
+        }
     }
     Ok(count)
 }

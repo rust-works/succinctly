@@ -1666,6 +1666,46 @@ fn test_input_format_json_bridge_preserves_decode_failure_key_1642() -> Result<(
     Ok(())
 }
 
+/// #2307: `length` on an object never checked the #2261 trailing-comma gap
+/// in yq mode (`collapse: false`, `checked_len`) either -- the identical
+/// gap #2307's jq-mode fix (`jq_cli_tests.rs`'s
+/// `test_jq_length_object_rejects_trailing_comma_2307`) closes for
+/// `census`. `.[0]`, not bare `length`: `--slurp` wraps the input in an
+/// array, so an un-prefixed `length` would silently answer the array's own
+/// element count (always `1` here) rather than exercising the object's own
+/// field count at all.
+#[test]
+fn test_yq_length_object_rejects_trailing_comma_2307() -> Result<()> {
+    for input in [r#"{"a":1,}"#, r#"{"a":1,"b":2,}"#] {
+        let (out, stderr, code) = run_yq_stdin_with_stderr(
+            ".[0] | length",
+            input,
+            &["--input-format", "json", "--slurp"],
+        )?;
+        assert_eq!(code, 1, "input={input}: out: {out:?}, stderr: {stderr:?}");
+        assert!(
+            out.trim().is_empty(),
+            "input={input}: unexpected output {out:?}"
+        );
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "input={input}: stderr: {stderr:?}"
+        );
+    }
+
+    for (input, expected) in [(r#"{"a":1}"#, "1"), (r#"{"a":1,"b":2}"#, "2")] {
+        let (output, code) = run_yq_stdin(
+            ".[0] | length",
+            input,
+            &["--input-format", "json", "--slurp"],
+        )?;
+        assert_eq!(code, 0, "input={input}");
+        assert_eq!(output.trim(), expected, "input={input}");
+    }
+
+    Ok(())
+}
+
 /// #1738: the `--input-format json` bridge's own `DisplayKeyGuard` check
 /// was missing entirely -- unlike every other `to_owned`-shaped
 /// materializer (#1642) -- so a decode-failure key colliding with another
