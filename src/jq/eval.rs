@@ -16837,6 +16837,25 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                             // #1832); `vs` is never attempted here either
                             // way, matching that helper's own `extra` never
                             // being touched on its `Err` branch.
+                            //
+                            // Not live-repro-tested (review): `target` is one
+                            // fixed expression re-evaluated fresh per key
+                            // against the same document, so whether a given
+                            // key's evaluation is a clean success (populating
+                            // `borrowed`) or a `Partial` (reaching this arm)
+                            // is a deterministic function of `(target, value)`
+                            // alone, not of which key is current -- an
+                            // *earlier* key populating `borrowed` and a
+                            // *later* key hitting this arm therefore requires
+                            // `target` itself to behave non-deterministically
+                            // across the two calls. The one stateful builtin
+                            // that could do that, `input`, always returns an
+                            // owned value (`builtin_input`'s own
+                            // `owned_vec_to_result`), so it can never
+                            // populate `borrowed` in the first place. Kept
+                            // anyway, matching `resolve_terminal_prefix`'s
+                            // own identical defensive handling, in case a
+                            // future stateful mechanism changes this.
                             Err((prefix, e)) => {
                                 let control = match control {
                                     Control::Halt(_) => control,
@@ -52859,6 +52878,23 @@ mod tests {
         );
     }
 
+    /// #2226 review (patch coverage): the target's own `Partial` arm's
+    /// `Ok(None)` sub-case -- an earlier-produced value that legitimately
+    /// isn't indexable, suppressed by `optional` rather than erroring
+    /// (`true` here; `?` only gates *this* per-value type mismatch, not
+    /// `target`'s own trailing `error("x")`). Verified against jq 1.7.1:
+    /// `0 as $k | (true, [7], error("x"))[$k]?` prints `7` then still
+    /// raises `x`.
+    #[test]
+    fn test_index_expr_target_own_partial_prefix_ok_none_suppressed_by_optional_2226() {
+        query!(b"null", r#"0 as $k | (true, [7], error("x"))[$k]?"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::Int(7)]);
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
     /// #2226 sibling: the same target-own-prefix fix for `eval_slice_expr`.
     /// Both bounds are `(N+0)` rather than bare literals -- a slice whose
     /// bounds both fully fold to constants never reaches `eval_slice_expr`
@@ -52880,6 +52916,23 @@ mod tests {
                     OwnedValue::Array(vec![OwnedValue::Int(1)]),
                     OwnedValue::Array(vec![OwnedValue::Int(3)]),
                 ]);
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    /// #2226 review (patch coverage): the target's own `Partial` arm's
+    /// `Ok(None)` sub-case -- an earlier-produced value that legitimately
+    /// isn't sliceable, suppressed by `optional` rather than erroring (`1`
+    /// is a number here, `[7]` an array; `?` only gates *this* per-value
+    /// type mismatch, not `target`'s own trailing `error("x")`). Verified
+    /// against jq 1.7.1: `(1, [7], error("x"))[(0+0):(1+0)]?` prints `[7]`
+    /// then still raises `x`.
+    #[test]
+    fn test_slice_expr_target_own_partial_prefix_ok_none_suppressed_by_optional_2226() {
+        query!(b"null", r#"(1, [7], error("x"))[(0+0):(1+0)]?"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::Array(vec![OwnedValue::Int(7)])]);
                 assert_eq!(e.message, "x");
             }
         );
