@@ -1727,6 +1727,49 @@ consolidating what `eval_try`/`each_try`/`try_single_generic`/`each_try_generic`
 `eval_generic.rs`) already hand-copied inline at six sites onto one shared definition,
 matching this function's own two new call sites too.
 
+### `del()`/`delpaths()` on a negative out-of-range index now raise too (#2268)
+
+[#2268](https://github.com/rust-works/succinctly/issues/2268). #2254 above fixed every
+*ordinary read* (`.a[-N]`); `del()`/`delpaths()` had the identical gap but a more severe
+symptom -- not a differently-worded error, but silently no-op (exit 0, document unchanged)
+where real yq aborts the whole operation:
+
+```bash
+$ echo '{"a":[1,2]}' | yq -o=json 'del(.a[-5])'          # Error: index [-5] out of range, array size is 2
+$ echo '{"a":[1,2]}' | succinctly yq 'del(.a[-5])' -o json  # {"a":[1,2]} -- WRONG, before this fix
+```
+
+Three independent array arms shared the gap, none `EvalSemantics`-aware (all three take a
+plain `yq_mode: bool`, not generic `S`, so the fix reuses a new `bool`-based sibling of
+`yq_negative_index_check`/`yq_negative_index_error` rather than threading `S` through the
+whole delete-path recursion): `delete_at_path`'s own `Expr::Index` array arm (`del()`'s
+literal-index dispatch), `delete_paths_under`'s array arm (`delpaths()`'s mid-path
+navigation, e.g. `delpaths([["a",-5]])`), and `delete_keys`'s array arm (`delpaths()`'s
+terminal per-container batch, e.g. `delpaths([[-5]])`). Unlike the read-side fix, this one is
+**not** suppressible by an earlier `?` in the path chain -- confirmed live, `del(.a?[-5])`
+still raises the identical error in real yq, matching `del()`'s own `optional` parameter's
+established scope (a `?`/type-mismatch suppression, never extended to this new check).
+
+**One residual divergence, not chased here**: when a negative-out-of-range index is grouped
+in the *same* `delpaths()` call as an earlier deletion on the same array, real yq's own error
+reports the array's size *after* that earlier deletion already happened -- confirmed live,
+`delpaths([[0],[-5]])` on a 2-element array reports "array size is 1", not 2, meaning real
+yq's own `delpaths` resolves indices *sequentially*, not against the array's length on entry.
+`delete_keys`'s own batch invariant is the opposite by design (every key resolves against the
+length the array had on entry, which is what makes an overlapping range union rather than
+compound, per its own doc comment) -- matching real yq's sequential resolution here would mean
+abandoning that invariant, a materially larger change than this fix's own scope. Still
+correctly *raises* either way; only the reported array-size number can differ, and only in
+this one multi-key-same-array shape.
+
+**A separate, unrelated divergence found investigating this one, not fixed here**: real yq's
+`del()` on a *positive* out-of-range index doesn't no-op the way jq does -- it extends the
+array with `null`s up to that position (`del(.[5])` on `[1,2]` yields a 6-element array with 4
+trailing nulls in real yq, confirmed live), where succinctly (matching jq) leaves the array
+unchanged. Filed separately as
+[#2305](https://github.com/rust-works/succinctly/issues/2305), since it's about a positive
+index and has nothing to do with #2268's own negative-index scope.
+
 ### Other categories
 
 Float and number formatting ([#1071](https://github.com/rust-works/succinctly/issues/1071),

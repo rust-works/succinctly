@@ -16150,26 +16150,69 @@ fn index_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
-/// yq mode only (#2254): `Some(error)` iff `resolved` is still negative --
-/// real yq raises here (`index_array_by_position`'s own doc comment has the
-/// full rationale). `idx`/`len` are only for the error's own message, which
-/// reports the argument as written, not the arithmetic.
+/// Core of [`yq_negative_index_check`]: `Some(error)` iff `yq_mode` and
+/// `resolved` is still negative -- real yq raises here
+/// (`index_array_by_position`'s own doc comment has the full rationale).
+/// `idx`/`len` are only for the error's own message, which reports the
+/// argument as written, not the arithmetic.
 ///
-/// The `i64`/`usize`-only signature (not `OwnedValue`) is deliberate: both
-/// this function's own `OwnedValue`-domain callers ([`yq_negative_index_error`]
+/// Takes a plain `bool` rather than `S: EvalSemantics`, unlike every other
+/// caller of this rule: `delete_at_path`/`delete_paths_under`/`delete_keys`
+/// (#2268's own fix) resolve yq-mode-ness as a plain `yq_mode: bool` already
+/// threaded through the whole delete-path machinery, not `S` -- see
+/// [`yq_negative_index_error_for_len`] below, the shared entry point both
+/// that `bool`-based machinery and this function's own `S`-generic callers
+/// route through, so the boundary condition and error text live in exactly
+/// one place either way.
+fn yq_negative_index_check_core(
+    yq_mode: bool,
+    idx: i64,
+    resolved: i64,
+    len: usize,
+) -> Option<EvalError> {
+    if !yq_mode {
+        return None;
+    }
+    (resolved < 0).then(|| EvalError::yq_negative_index_out_of_range(idx, len))
+}
+
+/// [`yq_negative_index_check_core`], `S: EvalSemantics`-generic -- the
+/// `i64`/`usize`-only signature (not `OwnedValue`) is deliberate: both this
+/// function's own `OwnedValue`-domain callers ([`yq_negative_index_error`]
 /// below) and `eval_generic.rs`'s two independent numeric-index arms (which
 /// already reduce to plain integers before their own indexing decision)
-/// reach the identical rule through it, so the boundary condition and error
-/// text live in exactly one place.
+/// reach the identical rule through it.
 pub(crate) fn yq_negative_index_check<S: EvalSemantics>(
     idx: i64,
     resolved: i64,
     len: usize,
 ) -> Option<EvalError> {
-    if S::TAG != EvalTag::Yq {
-        return None;
-    }
-    (resolved < 0).then(|| EvalError::yq_negative_index_out_of_range(idx, len))
+    yq_negative_index_check_core(S::TAG == EvalTag::Yq, idx, resolved, len)
+}
+
+/// [`yq_negative_index_check_core`] for the common shape: an array of length
+/// `len`, indexed by a key that might be a negative numeric index. `None`
+/// covers every case that isn't this one (jq mode, a non-numeric key, an
+/// in-bounds or positive-direction index) uniformly, so a caller checks this
+/// once and falls through to its own ordinary null/error handling otherwise.
+///
+/// #2268: shared by `delete_at_path`/`delete_paths_under`/`delete_keys`,
+/// which resolve `yq_mode` as a plain `bool` rather than carrying `S`
+/// through the whole delete-path recursion -- deliberately taking `len`
+/// rather than a whole `target: &OwnedValue` the way
+/// [`yq_negative_index_error`] does, since every one of those three call
+/// sites has already matched its target down to `OwnedValue::Array` (and in
+/// two cases, already borrowed it mutably) by the time this runs, so
+/// re-deriving "is this an array" from a fresh `&OwnedValue` would be
+/// redundant, not simpler.
+fn yq_negative_index_error_for_len(
+    yq_mode: bool,
+    key: &OwnedValue,
+    len: usize,
+) -> Option<EvalError> {
+    let idx = numeric_key_to_index(key)?;
+    let resolved = if idx < 0 { len as i64 + idx } else { idx };
+    yq_negative_index_check_core(yq_mode, idx, resolved, len)
 }
 
 /// [`yq_negative_index_check`] for the common `OwnedValue`-domain shape: a
@@ -16180,11 +16223,12 @@ pub(crate) fn yq_negative_index_check<S: EvalSemantics>(
 /// own ordinary null/error handling otherwise -- deliberately *not*
 /// threaded into [`index_one_owned`] itself, since that function's own
 /// callers include write-path resolvers (`resolve_node`/`resolve_index_expr`,
-/// `write_index`) that currently have their own gaps here too (`del()`/
-/// `delpaths()` silently no-op instead of raising, tracked separately as
-/// #2268; assignment raises jq's own differently-worded message instead of
-/// yq's, noted in that same issue) -- real, separate bugs, not yet fixed,
-/// rather than folded into this read-only helper's contract.
+/// `write_index`) that currently have their own gaps here too (assignment
+/// raises jq's own differently-worded message instead of yq's, noted in
+/// #2268) -- a real, separate bug, not yet fixed, rather than folded into
+/// this read-only helper's contract. `del()`/`delpaths()`'s own gap #2268
+/// also found is fixed via [`yq_negative_index_error_for_len`] above, not
+/// this function -- see that one's own doc comment for why.
 fn yq_negative_index_error<S: EvalSemantics>(
     target: &OwnedValue,
     key: &OwnedValue,
@@ -16192,13 +16236,7 @@ fn yq_negative_index_error<S: EvalSemantics>(
     let OwnedValue::Array(items) = target else {
         return None;
     };
-    let idx = numeric_key_to_index(key)?;
-    let resolved = if idx < 0 {
-        items.len() as i64 + idx
-    } else {
-        idx
-    };
-    yq_negative_index_check::<S>(idx, resolved, items.len())
+    yq_negative_index_error_for_len(S::TAG == EvalTag::Yq, key, items.len())
 }
 
 /// [`index_one`] for a target that is already an owned value, as when the
@@ -35937,6 +35975,14 @@ fn delete_paths_under(
                 Ok(OwnedValue::Array(arr))
             }
             OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
+                // #2268: real yq raises here too -- confirmed live,
+                // `delpaths([["a",-5]])` on `{"a":[1,2]}` raises the same
+                // "index [-5] out of range" a terminal `delpaths([[-5]])`
+                // does, not just `del()`'s own equivalent (`delete_at_path`,
+                // fixed alongside this).
+                if let Some(err) = yq_negative_index_error_for_len(yq_mode, key, arr.len()) {
+                    return Err(err);
+                }
                 if let Some(index) = resolve_read_index(key, arr.len()) {
                     let old = core::mem::replace(&mut arr[index], OwnedValue::Null);
                     arr[index] = delete_paths_sorted(old, paths, start, yq_mode)?;
@@ -36020,6 +36066,28 @@ fn delete_keys(
                         indices.extend(SliceBounds::from_descriptor(desc)?.resolve(arr.len()));
                     }
                     OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
+                        // #2268: real yq raises on a negative out-of-range
+                        // index here too. Resolved against `arr.len()` (the
+                        // length on entry, this function's own established
+                        // batch invariant -- see its own doc comment) rather
+                        // than a shrinking length as each key is processed:
+                        // confirmed live that real yq's own error message
+                        // reports the *already-shrunk* size when grouped
+                        // with an earlier same-array deletion
+                        // (`delpaths([[0],[-5]])` on a 2-element array
+                        // reports "array size is 1", not 2) -- a real,
+                        // narrower divergence this fix does not chase, since
+                        // matching it would mean abandoning the batch
+                        // invariant this function's every other property
+                        // (overlapping-range union, not compound) already
+                        // depends on. Still correctly *raises* either way,
+                        // which is this issue's own actual scope; only the
+                        // reported array-size number can differ in this one
+                        // multi-key-same-array shape.
+                        if let Some(err) = yq_negative_index_error_for_len(yq_mode, key, arr.len())
+                        {
+                            return Err(err);
+                        }
                         if let Some(idx) = resolve_read_index(key, arr.len()) {
                             indices.push(idx);
                         }
@@ -37243,7 +37311,16 @@ fn delete_at_path(
         },
         Expr::Index { idx, .. } => match root {
             OwnedValue::Array(arr) => {
-                if let Some(actual_idx) = resolve_read_index(&OwnedValue::Int(*idx), arr.len()) {
+                let key = OwnedValue::Int(*idx);
+                // #2268: real yq raises on a negative index whose magnitude
+                // still exceeds the array length after resolving against it
+                // -- checked before the silent-skip fallback below, which
+                // still applies to jq mode and to yq's own ordinary
+                // positive-out-of-range case (#477).
+                if let Some(err) = yq_negative_index_error_for_len(yq_mode, &key, arr.len()) {
+                    return Err(err);
+                }
+                if let Some(actual_idx) = resolve_read_index(&key, arr.len()) {
                     arr.remove(actual_idx);
                 }
                 // An out-of-range index names nothing to delete — jq's
