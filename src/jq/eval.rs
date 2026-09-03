@@ -34859,10 +34859,17 @@ fn builtin_path<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    let owned = match to_owned(&value) {
-        Ok(owned) => owned,
-        Err(e) => return QueryResult::Error(e),
-    };
+    // #2280: to_owned_or_suppress!, not a bare match -- `optional` is passed
+    // to `builtin_path_on_owned` on the next line, so ignoring it here was
+    // the same asymmetry as this issue's other sites. Sibling to
+    // `getpath_one_path`'s identical materialization, which already
+    // consulted `optional` via `suppress_or_raise` -- this function was the
+    // one place the pattern hadn't been carried over. Reachable both via the
+    // public `succinctly::jq::eval::eval` library API and, via the CLI,
+    // whenever `eval_generic.rs`'s `Builtin::Path` fallback re-enters the
+    // full evaluator for a non-`reindex_bridge_is_identity` value (a `Float`
+    // anywhere in the document).
+    let owned = to_owned_or_suppress!(&value, optional);
     builtin_path_on_owned::<W, S>(expr, &owned, optional)
 }
 

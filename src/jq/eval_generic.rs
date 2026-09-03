@@ -5454,9 +5454,19 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // Formats are pure functions of the value, so evaluate them here rather
         // than falling through to the catch-all, which would serialize the
         // value to JSON and rebuild a `JsonIndex` for every one (#124).
+        //
+        // #2280: owned_or_suppress!, not owned_or_err! -- `optional` is
+        // passed to `format_result` on this very line, so ignoring it in the
+        // materialization one line above was a real asymmetry. This is the
+        // arm the CLI's own default jq/yq dispatch actually reaches for
+        // every `@format` builtin (`jq_runner.rs`/`yq_runner.rs` route
+        // through `eval_generic`, never `eval.rs`'s own sibling
+        // `eval_format`) -- found by code review to have been missed by
+        // this issue's first pass, which fixed `eval_format` without
+        // noticing it isn't on the path ordinary CLI usage takes.
         Expr::Format(format_type) => format_result::<S, _>(
             format_type,
-            &owned_or_err!(to_owned_with_cursor(&value, cursor)),
+            &owned_or_suppress!(to_owned_with_cursor(&value, cursor), optional),
             optional,
         ),
 
