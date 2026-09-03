@@ -1483,14 +1483,32 @@ Eight independent implementations of the same resolve-index arithmetic across
 `src/jq/eval.rs` and `src/jq/eval_generic.rs` treated "index doesn't resolve" as one outcome
 with no `EvalSemantics`-based dispatch on sign -- fixed for every ordinary `.a[-N]`/`.a[$n]`
 read, both the literal and computed-index forms, through both jq's primary CLI dispatch
-(`eval_generic.rs`) and the library-route/path-context evaluator (`eval.rs`). Suppressible by
-`optional` like any other read-time indexing error here -- real yq's own lexer doesn't even
-accept `?` after a bracket index in this position, so there's no oracle to match either way.
+(`eval_generic.rs`) and the library-route/path-context evaluator (`eval.rs`). Unlike every
+other read-time indexing error here, `optional` does *not* suppress it: confirmed live that
+real yq's own lexer accepts `?` after a bare bracket index (`.a[-5]?` parses fine; only the
+*parenthesized* form, `(.a[-5])?`, is lexer-rejected, an unrelated construct) and the error
+still raises through it (`.a[-5]?` on `[1,2]` still exits 1 with the same message in real
+yq). `EvalError::is_yq_negative_index_error` is consulted by every `?`/`try` dispatch point
+on the read side -- `eval_try`/`each_try` in `eval.rs`, `try_single_generic`/
+`each_try_generic` in `eval_generic.rs` (the generator-argument pair matters separately from
+the single-value pair: `any(.a[-5]?; .)` runs its generator argument through `each_try`, not
+`eval_try`, and was found still swallowing the error until this same sweep covered it too) --
+and via `EvalError::is_uncatchable`, extended to include it, at `resolve_node`'s own
+`Expr::Try`/`Expr::Optional` pair (`eval.rs`) for `path()`/`getpath`'s path-tracking context.
+This keeps it unsuppressible the same way `is_decode_failure` already does for a decode
+failure.
 
 A few more independent copies of the same arithmetic remain unfixed, in lower-traffic
 call sites: `path()`'s own walker, `pick(paths)`, `reduce`/`foreach`'s lazy-fold index
 handling, and `getpath`'s own path-array walk (jq-only syntax, so this only matters under
 `--jq-extensions`) -- filed as [#2264](https://github.com/rust-works/succinctly/issues/2264).
+`del()`/`delpaths()` silently no-op on this shape instead of raising at all (more severe than
+a suppression gap -- a missing error, not a differently-worded one) -- filed separately as
+[#2268](https://github.com/rust-works/succinctly/issues/2268). And
+`eval_stage_with_path_context`'s own `Expr::Try`/`Expr::Optional` arms (`--eval-all` combined
+with a path-context-triggering builtin like `file_index`) have no uncatchable-error guard at
+all, for any error class, not just this one -- filed as
+[#2270](https://github.com/rust-works/succinctly/issues/2270).
 
 ### Other categories
 

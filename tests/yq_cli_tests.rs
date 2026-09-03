@@ -28255,13 +28255,17 @@ fn test_negative_index_out_of_range_raises_2254() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(out.trim(), "null");
 
-    // `optional` suppresses it, matching every other read-time indexing
-    // error in this codebase -- real yq's own lexer doesn't accept `?` after
-    // a bracket index here, so there is no oracle answer to match either
-    // way; this is succinctly's own consistent default.
-    let (out, code) = run_yq_stdin(".a[-5]?", "a: [1, 2]\n", &["-o", "json"])?;
-    assert_eq!(code, 0);
-    assert_eq!(out.trim(), "");
+    // `optional` does *not* suppress it -- confirmed live that real yq's own
+    // lexer accepts `?` after a bare bracket index (`.a[-5]?` parses fine;
+    // only the *parenthesized* form, `(.a[-5])?`, is lexer-rejected, an
+    // unrelated construct) and the error still raises through it. See
+    // `EvalError::is_yq_negative_index_error`'s own doc comment.
+    let (out, stderr, code) = run_yq_stdin_with_stderr(".a[-5]?", "a: [1, 2]\n", &["-o", "json"])?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
 
     // `--jq-extensions`' path-context bridge (`key`/`parent`/...) reaches
     // the same fix, both spellings.
@@ -28280,6 +28284,74 @@ fn test_negative_index_out_of_range_raises_2254() -> Result<()> {
         "a: [1, 2]\n",
         &["--jq-extensions", "-o", "json"],
     )?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+
+    Ok(())
+}
+
+/// #2254: unlike a decode failure's own precedent (`is_decode_failure`),
+/// there's no real yq `try`/`catch` syntax to check this against directly --
+/// real yq's lexer rejects `try`/`catch` outright (confirmed live against
+/// v4.53.3: `Error: 1:1: lexer: invalid input text "try ..."`). This pins
+/// that succinctly's own `eval_try`/`try_single_generic` bypass
+/// (`EvalError::is_yq_negative_index_error`) still raises through an
+/// explicit catch handler, not just a bare `?` (already covered above) --
+/// exercising both dispatch paths this issue's fix touches: the
+/// library-route/path-context evaluator (`eval.rs`'s `eval_try`) via
+/// `--slurp`, and the ordinary CLI dispatch (`eval_generic.rs`'s
+/// `try_single_generic`).
+#[test]
+fn test_negative_index_out_of_range_survives_try_catch_2254() -> Result<()> {
+    let (out, stderr, code) =
+        run_yq_stdin_with_stderr("try .a[-5] catch \"c\"", "a: [1, 2]\n", &["-o", "json"])?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+
+    // `--slurp` wraps the whole input in an array, so `.[0]` unwraps back to
+    // the single slurped document before indexing into it.
+    let (out, stderr, code) = run_yq_stdin_with_stderr(
+        "try .[0].a[-5] catch \"c\"",
+        "a: [1, 2]\n",
+        &["-o", "json", "--slurp"],
+    )?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+
+    Ok(())
+}
+
+/// #2254 review follow-up: `any(f; cond)`/`all(f; cond)` evaluate their
+/// generator argument `f` through a *different* dispatch than a plain `?`/
+/// `try` (`each_try`/`each_try_generic`'s own sink-based generator path, not
+/// `eval_try`/`try_single_generic`'s single-value one) -- confirmed live
+/// this was a real, separate gap: before the fix, `any(.a[-5]?; .)` wrongly
+/// answered `false` (the suppressed generator produced zero outputs, which
+/// `any` over zero elements legitimately treats as `false`) instead of
+/// raising. Also pins `eval_owned_fast_path`'s own negative-index check
+/// (reached from `eval_each_owned`, `any`/`all`'s own generator-argument
+/// evaluator), which had the same now-removed `optional`-suppression gap.
+#[test]
+fn test_negative_index_out_of_range_survives_any_all_generator_2254() -> Result<()> {
+    let (out, stderr, code) =
+        run_yq_stdin_with_stderr("any(.a[-5]?; .)", "a: [1, 2]\n", &["-o", "json"])?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+
+    let (out, stderr, code) =
+        run_yq_stdin_with_stderr("all(.a[-5]?; .)", "a: [1, 2]\n", &["-o", "json"])?;
     assert_eq!(code, 1, "out: {out:?}");
     assert_eq!(
         stderr.trim(),
