@@ -19897,6 +19897,63 @@ fn test_func_def_arity_overload_unmatched_arity_still_errors_1376() -> Result<()
     Ok(())
 }
 
+/// #2141: a bare function parameter and a `$`-bound name in the same
+/// spelling live in separate jq namespaces -- a local `1 as $g` inside
+/// `f`'s body must shadow only the inner `$g` reference, never the
+/// unrelated bare `g` (the parameter itself). Verified against jq 1.7.1:
+/// `def f(g): 1 as $g | $g + g; 10 as $g | f($g)` is `11` (inner `$g`
+/// evaluates to `1`, bare `g` substituted with the caller's own `$g`, 10).
+/// `substitute_func_param`'s pre-fix `Expr::As { var, .. } if var == param`
+/// shadow check wrongly treated the two as the same namespace and left the
+/// whole body unsubstituted, so the bare `g` stayed as an unresolved
+/// zero-arg call and raised "undefined function: g/0" instead.
+#[test]
+fn test_bare_param_not_shadowed_by_dollar_binding_of_same_name_2141() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-nc", "def f(g): 1 as $g | $g + g; 10 as $g | f($g)"],
+        None,
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "11");
+    Ok(())
+}
+
+/// #2141's mirror bug, in `substitute_var_impl` (the `$var`-substitution
+/// direction): a nested `def`'s own bare parameter must never shadow an
+/// *outer* `$`-bound name of the same spelling, even though both are
+/// stored as the identical bare string (`parse_func_def_parts` discards a
+/// parameter's leading `$` at parse time, so `def f(g)` and `def f($g)`
+/// are indistinguishable in `params: Vec<String>`). Verified against jq
+/// 1.7.1: `3 as $g | def f(g): $g; f(1)` is `3` -- the outer `$g`,
+/// untouched by `f`'s own bare `g` parameter. `substitute_var_impl`'s
+/// pre-fix `Expr::FuncDef` arm used `params.contains(&var_name.to_string())`
+/// to decide `body` was shadowed, silently leaving `$g` unsubstituted;
+/// `f`'s own (separate) bare-parameter substitution then filled the
+/// still-unresolved `$g` in with `f`'s own argument instead, giving `1`.
+#[test]
+fn test_outer_dollar_binding_not_shadowed_by_nested_def_bare_param_2141() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "3 as $g | def f(g): $g; f(1)"], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "3");
+    Ok(())
+}
+
+/// #2141 review: a `$`-style function parameter's own `$name` reference
+/// inside the body still resolves via `substitute_func_param`'s
+/// `subst_dollar`-gated `Expr::Var` arm -- the *only* binding mechanism it
+/// has, since the parser discards the parameter's leading `$` (same fact
+/// as the two tests above). Confirms the #2141 fix didn't regress this
+/// pre-existing, already-covered case (`test_as_pattern_alt_substituted_as_func_param_bind_expr_720`
+/// above already covers the `?//`-pattern shape; this pins the simplest
+/// possible one). Verified against jq 1.7.1.
+#[test]
+fn test_dollar_style_func_param_still_resolves_2141() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "def f($x): $x; f(5)"], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "5");
+    Ok(())
+}
+
 /// #1376: a three-way arity overload (0, 1, and 2 arguments), each
 /// remaining independently callable. Oracle-verified against jq 1.7.1.
 #[test]

@@ -605,16 +605,26 @@ pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr)
 ///   shadowed by a `$var`/pattern binder) and recurses into every child
 ///   unconditionally -- exactly this function's own arm below. Both
 ///   `substitute_var_impl` and `substitute_func_param` must *not* recurse
-///   into the bound-scope child when their own binder shadows the name being
-///   substituted, so both intercept these variants with their own guarded
-///   arm first and never reach this function for them.
-/// - `Expr::Var`/`Expr::FuncCall`: `install_def_calls` (for `Var`) and
-///   `substitute_var_impl` (for `FuncCall`) have no special case at all --
-///   exactly this function's leaf-clone / clone-name-and-map-args arms.
+///   into the bound-scope child when it's shadowed, so both intercept these
+///   variants with their own guarded arm first and never reach this
+///   function for them -- but the two mean something different by
+///   "shadowed" (#2141): `substitute_var_impl`'s `var_name` is always
+///   `$`-bound, so a same-named `$`-binder genuinely shadows it, stopping
+///   *all* substitution into that child. `substitute_func_param`'s `param`
+///   is always a *bare* parameter name -- a same-named `$`-binder can only
+///   ever shadow a `$param` *reference* that parameter's own body might
+///   contain (the one binding mechanism a `$`-style def parameter has,
+///   since the parser discards its `$` at parse time), never a bare
+///   `param` reference, which lives in a wholly separate namespace and is
+///   substituted into that same child regardless. See `substitute_func_param`'s
+///   own doc comment (`src/jq/eval.rs`) for the live jq 1.7.1 confirmation.
+/// - `Expr::Var`/`Expr::FuncCall`: `install_def_calls` (for `Var`) has no
+///   special case at all -- exactly this function's leaf-clone arm.
 ///   `substitute_var_impl`/`substitute_func_param` (for `Var`) and
 ///   `install_def_calls`/`substitute_func_param` (for `FuncCall`) intercept
 ///   the name/arity match explicitly and fall through to this function only
-///   for the non-matching case.
+///   for the non-matching case -- `substitute_func_param` intercepts `Var`
+///   too, per the previous bullet, gated the same way.
 /// - `Expr::DefCall`: shared verbatim by `substitute_var_impl` and
 ///   `substitute_func_param` (`def` opaque, `frames` unchanged, `args`
 ///   walked, `bound` reset -- see the arm below). `install_def_calls` needs a
@@ -644,10 +654,14 @@ pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr)
 ///   *whether* something is shadowed but in what "shadowed" even means
 ///   (`install_def_calls`: same name and arity, and the fully-shadowed
 ///   branch clones the whole node, preserving its cache; `substitute_func_param`:
-///   two independent conditions, one for `body` and one for `then`;
-///   `substitute_var_impl`: one condition, for `body` only, with `then`
-///   always recursed) -- no shared unconditional shape exists to fall back
-///   to, so all three keep their own complete arm and never reach this
+///   two independent conditions, one for `body` (a nested `def`'s own bare
+///   parameters) and one for `then` (a nested zero-arity `def` of the same
+///   name); `substitute_var_impl`: no shadow condition at all -- a nested
+///   `def`'s bare parameters live in a separate namespace from the `$`-bound
+///   name being substituted (#2141) and can never shadow it, so `body` and
+///   `then` are both always recursed) -- no shared unconditional shape
+///   exists to fall back to, so all three keep their own complete arm and
+///   never reach this
 ///   function's own arm for it.
 ///
 /// The five arms named above (`Shared`, `Error`, `Builtin`, `FuncDef`, and
