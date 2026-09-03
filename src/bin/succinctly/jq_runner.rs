@@ -3420,12 +3420,32 @@ fn normalize_leading_zero_numbers(s: &str) -> String {
 /// follow-up to #1094's leading-zero fix above, found while verifying
 /// #2220): a **leading** decimal point with no integer digit before it
 /// (`.5` -> `0.5`, `-.5` -> `-0.5`, #1171), and a **trailing** decimal
-/// point with no fraction digit after it, whether or not an exponent
-/// follows (`1.` -> `1.0`, `1.e5` -> `1.0e5`, #2220). Both are already
-/// tolerated on the crate's own document-input path (`json::light`'s
-/// number decoder); this repairs just the `--argjson`/`--jsonargs`
-/// validation-retry gap, the same shape #1094 already closed for leading
-/// zeros.
+/// point immediately before an exponent marker, with no fraction digit
+/// between them (`1.e5` -> `1.0e5`, #2220). Both are already tolerated on
+/// the crate's own document-input path (`json::light`'s number decoder,
+/// via `has_leading_dot`/`has_trailing_dot_before_exponent`); this repairs
+/// just the `--argjson`/`--jsonargs` validation-retry gap, the same shape
+/// #1094 already closed for leading zeros.
+///
+/// Deliberately **not** a bare trailing `.` with nothing after it at all
+/// (`1.`, no exponent) -- narrower than #2240's own issue text first
+/// suggested, and narrower than an earlier draft of this function, which
+/// treated `1.`/`1.e5` identically. `has_trailing_dot_before_exponent`
+/// itself only recognizes the exponent-adjacent shape (checked live: it
+/// returns `false` for a bare `1.`), so accepting the bare form here would
+/// let it through this validation-retry gate only to hit
+/// `number_literal()`'s/`from_number_bytes`'s shared, *pre-existing*
+/// large-integer-precision bug on the other side (`99999999999999999.`
+/// materializing as `100000000000000000`, confirmed live via plain
+/// document input too, not something either shares an escape for --
+/// `from_number_bytes`'s own doc comment already documents this as
+/// deliberately unfixed, correct only for a *small* value where the lossy
+/// `f64` fallback happens to round-trip losslessly). Before this narrowing,
+/// `--argjson` traded a clean rejection of that shape for a silently wrong
+/// value -- caught by code review before merge. `1.` alone is therefore
+/// still rejected via `--argjson`, matching this crate's pre-#2240 behavior
+/// for it exactly; #2220's own scope (trailing-dot-*before-exponent*) is
+/// unaffected either way.
 ///
 /// Written as its own scan rather than reusing [`find_number_end`]: that
 /// function's own doc comment explicitly documents it never sees a bare
@@ -3488,6 +3508,8 @@ fn normalize_dot_leniency(s: &str) -> String {
             }
         }
         let has_frac_digits = frac_end > frac_start;
+        let exponent_follows =
+            frac_end < bytes.len() && (bytes[frac_end] == b'e' || bytes[frac_end] == b'E');
         // `has_int_digits` or `has_dot` is always true here (`starts_number`
         // above already confirmed `bytes[after_sign]` is a digit or `.`,
         // and this scan reaches `bytes[after_sign]` unconditionally as
@@ -3500,6 +3522,16 @@ fn normalize_dot_leniency(s: &str) -> String {
             i += 1;
             continue;
         }
+        if has_dot && !has_frac_digits && !exponent_follows {
+            // Bare trailing `.` with nothing after it at all (`1.`), out of
+            // this function's own narrowed scope -- see its doc comment for
+            // why. Copy the digits and dot verbatim, unfixed, so the
+            // retried validation still rejects this shape exactly as
+            // before #2240.
+            out.extend_from_slice(&bytes[start..frac_start]);
+            i = frac_start;
+            continue;
+        }
         out.extend_from_slice(&bytes[start..scan]);
         if !has_int_digits {
             // Leading-dot case (#1171).
@@ -3510,8 +3542,11 @@ fn normalize_dot_leniency(s: &str) -> String {
             if has_frac_digits {
                 out.extend_from_slice(&bytes[frac_start..frac_end]);
             } else {
-                // Trailing-dot case (#2220): no fraction digit before the
-                // token ends or an exponent begins.
+                // Trailing-dot-before-exponent case (#2220): no fraction
+                // digit between the dot and the exponent marker --
+                // `exponent_follows` is guaranteed true here, the bare
+                // (no-exponent) form having already been filtered out
+                // above.
                 out.push(b'0');
             }
         }

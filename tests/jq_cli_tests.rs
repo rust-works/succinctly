@@ -808,39 +808,72 @@ fn test_argjson_negative_leading_zero_when_nested_1094() -> Result<()> {
 
 // -----------------------------------------------------------------------
 // #2240 (Gap 2): `--argjson`/`--jsonargs` now tolerate the same
-// leading-dot (`.5`, #1171) and trailing-dot-before-exponent (`1.e5`,
+// leading-dot (`.5`, #1171) and trailing-dot-*before-exponent* (`1.e5`,
 // #2220) leniencies real jq's own number parser already accepts, via a
 // new `normalize_dot_leniency` sibling to `normalize_leading_zero_numbers`
 // (both composed together in `normalize_json_leniently`). All cases
 // live-verified against jq 1.7.1.
+//
+// Deliberately **not** a bare trailing `.` with no exponent (`1.`) --
+// `normalize_dot_leniency`'s own doc comment explains why: accepting it
+// would route to `number_literal()`/`from_number_bytes`'s shared,
+// pre-existing large-integer-precision bug (confirmed live via plain
+// document input too, not something added or fixed by this issue),
+// trading a clean rejection for a silently wrong value. `1.` stays
+// rejected via `--argjson`, matching pre-#2240 behavior exactly.
 // -----------------------------------------------------------------------
 
-/// The issue's own leading-dot repro, positive and negative.
+/// The issue's own leading-dot repro, positive and negative, plus values
+/// exercising `number_literal()`'s own new leading-dot escape
+/// (`src/json/light.rs`) with real precision/formatting at stake --
+/// code review found a first draft accepted these via `--argjson`'s
+/// validation retry but then silently lost precision materializing them
+/// through the *original* (un-normalized) text, since only
+/// `OwnedValue::from_number_bytes` had the matching escape at the time,
+/// not `number_literal()` (the generic evaluator's own materializer,
+/// which `--argjson` reaches).
 #[test]
 fn test_argjson_tolerates_leading_dot_2240() -> Result<()> {
-    let (stdout, _, code) = run_jq_full(&["-n", "--argjson", "n", ".5", "$n"], None)?;
-    assert_eq!(code, 0);
-    assert_eq!(stdout.trim_end(), "0.5");
-
-    let (stdout, _, code) = run_jq_full(&["-n", "--argjson", "n", "-.5", "$n"], None)?;
-    assert_eq!(code, 0);
-    assert_eq!(stdout.trim_end(), "-0.5");
-    Ok(())
-}
-
-/// The issue's own trailing-dot-before-exponent repro, plus the bare
-/// trailing-dot (no exponent) and signed-exponent variants.
-#[test]
-fn test_argjson_tolerates_trailing_dot_before_exponent_2240() -> Result<()> {
     for (value, expected) in [
-        ("1.e5", "1E+5"),
-        ("-1.e5", "-1E+5"),
-        ("1.e-5", "0.00001"),
-        ("1.", "1"),
+        (".5", "0.5"),
+        ("-.5", "-0.5"),
+        (".9999999999999999999999", "0.9999999999999999999999"),
+        (".100", "0.100"),
+        (".0", "0.0"),
     ] {
         let (stdout, _, code) = run_jq_full(&["-n", "--argjson", "n", value, "$n"], None)?;
         assert_eq!(code, 0, "value {value:?}");
         assert_eq!(stdout.trim_end(), expected, "value {value:?}");
+    }
+    Ok(())
+}
+
+/// The issue's own trailing-dot-before-exponent repro, plus the
+/// signed-exponent variant. The bare (no-exponent) form is covered
+/// separately below, since it's deliberately still rejected.
+#[test]
+fn test_argjson_tolerates_trailing_dot_before_exponent_2240() -> Result<()> {
+    for (value, expected) in [("1.e5", "1E+5"), ("-1.e5", "-1E+5"), ("1.e-5", "0.00001")] {
+        let (stdout, _, code) = run_jq_full(&["-n", "--argjson", "n", value, "$n"], None)?;
+        assert_eq!(code, 0, "value {value:?}");
+        assert_eq!(stdout.trim_end(), expected, "value {value:?}");
+    }
+    Ok(())
+}
+
+/// Regression guard (found by review before merge, round 2): a bare
+/// trailing `.` with no exponent at all is deliberately *not* accepted by
+/// this fix, unlike an earlier draft that treated it the same as the
+/// exponent-adjacent form -- see `normalize_dot_leniency`'s own doc
+/// comment for the precision-loss reasoning. Real jq itself *does* accept
+/// `1.` (giving `1`), so this is a known, deliberate, narrower-than-jq
+/// divergence, not a match -- pinned here as the accepted trade-off
+/// rather than left as an unstated side effect of the narrowing.
+#[test]
+fn test_argjson_bare_trailing_dot_still_rejected_2240() -> Result<()> {
+    for value in ["1.", "99999999999999999."] {
+        let (_, _, code) = run_jq_full(&["-n", "--argjson", "n", value, "$n"], None)?;
+        assert_ne!(code, 0, "value {value:?}");
     }
     Ok(())
 }

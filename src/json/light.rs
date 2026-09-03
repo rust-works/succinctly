@@ -2498,6 +2498,24 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
                 // reflect (matches `from_number_bytes`'s own leading-dot
                 // and leading-zero handling, both of which store the
                 // original text for the same reason).
+                // Real jq's own number reader also accepts a leading `.`
+                // (with or without a preceding `-`) when at least one digit
+                // follows (`.5` -> `0.5`, `-.5` -> `-0.5`, #1171) -- same
+                // leniency as `OwnedValue::from_number_bytes`'s own
+                // leading-dot handling, shared gate via `has_leading_dot`.
+                // Checked before the leading-zero-strip escape below (no
+                // int digits to strip in the first place for a leading-dot
+                // token, so the two never compose the way the leading-zero
+                // and trailing-dot escapes do) -- missing entirely until
+                // #2240's own code review found it: `--argjson` navigating
+                // through this generic-evaluator path (not
+                // `from_number_bytes`'s own primary document-input path)
+                // silently lost precision on a leading-dot literal instead
+                // of preserving its spelling, once #2240's own fix let
+                // `--argjson` accept one in the first place.
+                if crate::json::validate::has_leading_dot(bytes) {
+                    return core::str::from_utf8(bytes).ok().map(Cow::Borrowed);
+                }
                 let zero_stripped = crate::json::validate::strip_redundant_leading_zeros(bytes);
                 if let Some(stripped) = &zero_stripped {
                     if crate::json::validate::is_valid_number(stripped) {

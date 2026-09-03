@@ -897,6 +897,51 @@ pub fn has_trailing_dot_before_exponent(bytes: &[u8]) -> bool {
     is_valid_number(&fixed)
 }
 
+/// Whether `bytes` becomes valid RFC 8259 number syntax after inserting a
+/// single `0` right after an optional leading `-` and before a leading `.`
+/// (`.5` -> `0.5`, `-.5` -> `-0.5`).
+///
+/// Real jq's own number reader accepts a leading `.` (with or without a
+/// preceding `-`) when at least one digit follows -- not valid per strict
+/// RFC 8259, but a real jq-accepted spelling this crate's own document-input
+/// scanners recognize as a number span (`number_literal_end`, #1171).
+/// Shared for the identical reason [`has_trailing_dot_before_exponent`]
+/// above is: two independent "recover a lenient-but-invalid number's own
+/// literal spelling" call sites need it
+/// ([`OwnedValue::from_number_bytes`](crate::jq::OwnedValue::from_number_bytes)
+/// and [`crate::json::light`]'s `DocumentValue::number_literal`
+/// implementation) -- previously duplicated inline at the first of those
+/// two, and missing entirely from the second, which is what let a
+/// leading-dot literal reached through the generic evaluator's own
+/// materialization (not just the primary document-input path
+/// `from_number_bytes` backs) silently lose precision instead of
+/// preserving its source spelling (#2240 code review: `--argjson x
+/// '.9999999999999999999999'` returned `1`, not jq's own
+/// `0.9999999999999999999999`, once #2240's own fix let `--argjson`
+/// accept a leading-dot literal in the first place rather than rejecting
+/// it outright).
+///
+/// Returns `bool`, not the fixed-up candidate, for the identical reason
+/// [`has_trailing_dot_before_exponent`] does: both callers always
+/// materialize the *original* `bytes` on success, never this function's
+/// own inserted-`0` candidate.
+#[must_use]
+pub fn has_leading_dot(bytes: &[u8]) -> bool {
+    let dot_pos = match bytes.first() {
+        Some(b'.') => Some(0),
+        Some(b'-') if bytes.get(1) == Some(&b'.') => Some(1),
+        _ => None,
+    };
+    let Some(prefix_len) = dot_pos else {
+        return false;
+    };
+    let mut fixed = Vec::with_capacity(bytes.len() + 1);
+    fixed.extend_from_slice(&bytes[..prefix_len]);
+    fixed.push(b'0');
+    fixed.extend_from_slice(&bytes[prefix_len..]);
+    is_valid_number(&fixed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -303,6 +303,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under any leniency, real jq included — caught by review before merge, since a first
   draft unconditionally synthesized `0`s around any dot it saw, silently "fixing" a
   genuinely malformed bare `.` into the valid number `0.0`.
+
+  A second review round caught a more serious issue with that first draft: accepting a
+  leading-dot literal via `--argjson`'s validation retry, then materializing it from the
+  *original* text, silently lost precision (`--argjson x '.9999999999999999999999'`
+  returned `1`, not jq's own `0.9999999999999999999999`) — `OwnedValue::from_number_bytes`
+  (the primary document-input decoder) already had a leading-dot escape from #1171, but
+  `StandardJson::number_literal()` (the generic evaluator's own materializer, which
+  `--argjson` reaches) never did, so it fell through to a lossy `f64` parse. Fixed by
+  extracting the escape into a new shared `has_leading_dot` helper
+  (`src/json/validate.rs`, alongside the existing `has_trailing_dot_before_exponent`) and
+  adding it to `number_literal()` too — as a side effect, this also fixes the identical
+  precision loss for plain document input routed through any real query
+  (`'.9999999999999999999999' | if true then . else empty end'` reproduced the same bug
+  pre-fix, unrelated to `--argjson`). The same round narrowed `normalize_dot_leniency`'s
+  own trailing-dot acceptance to the exponent-adjacent shape only (`1.e5`), *not* a bare
+  trailing dot with nothing after it (`1.`) — accepting the bare form would trade a clean
+  rejection for a different silent-corruption bug, a large-integer-precision gap
+  `from_number_bytes`/`number_literal()` share and leave deliberately unfixed (confirmed
+  pre-existing via plain document input too: `99999999999999999.` already materializes as
+  `100000000000000000` on `main`). `1.` therefore still rejects via `--argjson`, a narrower
+  divergence from real jq (which accepts it) than #2240's own issue text first suggested,
+  kept rather than risking silent data corruption for a shape #2220's own scope
+  (trailing-dot-*before-exponent*) never actually asked for.
+
   Gap 1 in the same issue (an array-navigated `tostring`/`@json` losing an
   overflow-literal's exact spelling) was investigated and found **not reproducible** on
   current `main` — both the root-level and array-navigated paths already agree, deferring
