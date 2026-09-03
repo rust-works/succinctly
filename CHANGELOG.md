@@ -289,6 +289,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`del()`/`delpaths()` silently no-op on a negative out-of-range array index instead of
+  raising** (#2268): #2254 already fixed every ordinary *read* (`.a[-N]`) to raise real yq's
+  own "index [N] out of range" error, but `del()`/`delpaths()` shared the identical gap with a
+  more severe symptom — not a differently-worded error, but no error at all (exit 0, document
+  unchanged), where real yq aborts the write. Three independent array arms shared it
+  (`delete_at_path`'s `del()` dispatch, `delete_paths_under`'s `delpaths()` mid-path
+  navigation, `delete_keys`'s `delpaths()` terminal batch), fixed via a new `bool`-based
+  sibling of #2254's own `yq_negative_index_check`/`yq_negative_index_error` helpers (these
+  three take a plain `yq_mode: bool`, not `S: EvalSemantics`). Unlike the read-side fix, not
+  suppressible by an earlier `?` in the path chain — confirmed live, real yq's own
+  `del(.a?[-5])` still raises. One residual divergence documented, not chased: when grouped
+  with an earlier same-array deletion in one `delpaths()` call, real yq's own error reports
+  the array's *already-shrunk* size (sequential resolution), where this crate's own
+  `delete_keys` deliberately resolves every key against the array's length on entry (the
+  invariant that makes an overlapping range union rather than compound) — still correctly
+  raises either way, only the reported number can differ, and only in that one
+  multi-key-same-array shape. Also surfaced, and filed separately as #2305 (out of this
+  issue's negative-index scope): real yq's `del()` on a *positive* out-of-range index extends
+  the array with nulls instead of no-op, which succinctly (matching jq) doesn't reproduce.
 - **`has(key)`/`contains()` on objects didn't raise on a non-string sibling key
   (`{"a":1,123:2}`), and `JsonFields::find` (unlike its `find_cursor` sibling) had neither
   the #1677 `,`/`:` delimiter check nor the #2261 trailing-comma check at all** (#2288,

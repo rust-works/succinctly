@@ -28922,3 +28922,108 @@ fn test_negative_index_out_of_range_unaffected_in_jq_mode_2254() -> Result<()> {
 
     Ok(())
 }
+
+/// #2268: `del()` on a negative out-of-range array index used to silently
+/// no-op (returning the document unchanged, exit 0) instead of raising the
+/// same "index [N] out of range" error #2254 already gave ordinary reads.
+/// Confirmed live against yq v4.53.3.
+#[test]
+fn test_del_negative_index_out_of_range_raises_2268() -> Result<()> {
+    let (out, stderr, code) =
+        run_yq_stdin_with_stderr("del(.a[-5])", "a: [1, 2]\n", &["-o", "json"])?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+
+    // Real yq still raises even with a `?` earlier in the path chain --
+    // confirmed live, `del(.a?[-5])` raises the identical error.
+    let (out, stderr, code) =
+        run_yq_stdin_with_stderr("del(.a?[-5])", "a: [1, 2]\n", &["-o", "json"])?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+
+    // In-bounds negative wraparound is unaffected.
+    let (out, code) = run_yq_stdin("del(.a[-1])", "a: [1, 2]\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "{\"a\":[1]}");
+
+    Ok(())
+}
+
+/// #2268: `delpaths()`'s own array arms (`delete_paths_under`'s mid-path
+/// navigation, `delete_keys`'s terminal batch) share the identical gap --
+/// both confirmed live to silently no-op before this fix.
+#[test]
+fn test_delpaths_negative_index_out_of_range_raises_2268() -> Result<()> {
+    // Terminal component (`delete_keys`).
+    let (out, stderr, code) =
+        run_yq_stdin_with_stderr("delpaths([[-5]])", "- 1\n- 2\n", &["-o", "json"])?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+
+    // Mid-path component (`delete_paths_under`).
+    let (out, stderr, code) =
+        run_yq_stdin_with_stderr("delpaths([[\"a\",-5]])", "a: [1, 2]\n", &["-o", "json"])?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+
+    // In-bounds, well-formed deletion is unaffected.
+    let (out, code) = run_yq_stdin("delpaths([[0]])", "- 1\n- 2\n- 3\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[2,3]");
+
+    Ok(())
+}
+
+/// #2268: a documented, accepted residual divergence -- when a
+/// negative-out-of-range index is grouped in the *same* `delpaths()` call
+/// as an earlier deletion on the same array, real yq's own error reports
+/// the array's size *after* that earlier deletion already happened
+/// (confirmed live, v4.53.3: `delpaths([[0],[-5]])` on a 2-element array
+/// reports "array size is 1", not 2). `delete_keys`'s own batch invariant
+/// -- every key resolves against the length the array had on *entry*, not
+/// a shrinking length as each is processed, which is what makes an
+/// overlapping range union rather than compound -- means this crate always
+/// reports the *entry* length instead. Still correctly raises, which is
+/// this issue's own actual scope; only the reported number can differ in
+/// this one multi-key-same-array shape, not pinned against real yq itself.
+#[test]
+fn test_delpaths_grouped_negative_index_reports_entry_length_2268() -> Result<()> {
+    let (out, stderr, code) =
+        run_yq_stdin_with_stderr("delpaths([[0],[-5]])", "- 1\n- 2\n", &["-o", "json"])?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+
+    Ok(())
+}
+
+/// #2268's jq-mode control: jq has no such rule -- both `del()` and
+/// `delpaths()` stay a silent no-op on a negative out-of-range index in jq
+/// mode, matching #477's own established precedent.
+#[test]
+fn test_del_and_delpaths_negative_index_unaffected_in_jq_mode_2268() -> Result<()> {
+    let (out, stderr, code) = run_jq_stdin_with_stderr("del(.a[-5])", "{\"a\":[1,2]}", &["-c"])?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(out.trim(), "{\"a\":[1,2]}");
+
+    let (out, stderr, code) =
+        run_jq_stdin_with_stderr("delpaths([[\"a\",-5]])", "{\"a\":[1,2]}", &["-c"])?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(out.trim(), "{\"a\":[1,2]}");
+
+    Ok(())
+}
