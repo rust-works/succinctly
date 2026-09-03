@@ -352,23 +352,28 @@ pub fn to_owned_all_cursors<'a, C: DocumentCursor + 'a>(
 }
 
 /// #2243: whether a trailing stray `,` (`[1,]`, `{"a":1,}`) sits between a
-/// container's *last real child* (`last_cursor`/`last_value`) and
-/// `close_char` -- shared by [`to_owned_cursor_at_depth`]'s object and
-/// array arms, one definition instead of two hand-copied ones (this
-/// crate's own "duplicated predicates diverge silently" lesson).
+/// container's *last real child* (`last_cursor`) and `close_char` -- shared
+/// by [`to_owned_cursor_at_depth`]'s object and array arms, one definition
+/// instead of two hand-copied ones (this crate's own "duplicated predicates
+/// diverge silently" lesson).
 ///
-/// `None` from either half of the lookup -- no resolvable start position,
-/// or a container-typed child whose own end isn't derivable from its start
-/// alone (see [`DocumentValue::scalar_text_end`]'s own doc comment) --
-/// answers `true` (nothing to flag), the same "can't determine, skip"
-/// convention every sibling gap check in this file already follows.
-fn trailing_element_gap_ok<C: DocumentCursor>(
-    last_cursor: &C,
-    last_value: &C::Value,
-    close_char: u8,
-) -> bool {
+/// Takes only the cursor, not an already-resolved value: [`DocumentValue::
+/// scalar_text_end`] unconditionally answers `None` for a container-typed
+/// child (see its own doc comment), so resolving one here first -- via
+/// `is_container()`, cheap and already required by every [`DocumentCursor`]
+/// impl -- skips a `.value()` call this check could never use anyway,
+/// rather than decoding it and immediately discarding the result.
+///
+/// `None` from either remaining half of the lookup -- no resolvable start
+/// position, or (for a scalar child) no derivable end position -- answers
+/// `true` (nothing to flag), the same "can't determine, skip" convention
+/// every sibling gap check in this file already follows.
+fn trailing_element_gap_ok<C: DocumentCursor>(last_cursor: &C, close_char: u8) -> bool {
+    if last_cursor.is_container() {
+        return true;
+    }
     match last_cursor.text_position() {
-        Some(start) => match last_value.scalar_text_end(start) {
+        Some(start) => match last_cursor.value().scalar_text_end(start) {
             Some(end) => last_cursor.trailing_element_gap_ok(end, close_char),
             None => true,
         },
@@ -387,12 +392,15 @@ fn to_owned_cursor_at_depth<C: DocumentCursor>(
         let mut guard = DisplayKeyGuard::default();
         let mut f = fields;
         let mut is_first = true;
-        // #2243: the last real field's own value+cursor, retained past the
-        // loop so the trailing-gap check below (a stray `,` *after* a real
-        // last field, `{"a":1,}`) has something to check from -- distinct
-        // from #2211's `map.is_empty()` check just below, which only ever
-        // catches a stray `,` with no real field at all (`{,}`).
-        let mut last_field: Option<(C::Value, C)> = None;
+        // #2243: the last real field's own cursor, retained past the loop so
+        // the trailing-gap check below (a stray `,` *after* a real last
+        // field, `{"a":1,}`) has something to check from -- distinct from
+        // #2211's `map.is_empty()` check just below, which only ever catches
+        // a stray `,` with no real field at all (`{,}`). Mirrors the array
+        // arm's own `last_elem`: only the cursor is kept, and
+        // `trailing_element_gap_ok` resolves a value from it (if it even
+        // needs to) once, after the loop, not per field.
+        let mut last_field: Option<C> = None;
         while let Some((field, rest)) = f.uncons() {
             // Same key handling as `to_owned_at_depth` above, same reasons --
             // these two conversions are copies of each other and a fix that
@@ -416,7 +424,7 @@ fn to_owned_cursor_at_depth<C: DocumentCursor>(
                 key,
                 to_owned_cursor_at_depth(&field.value_cursor, depth + 1)?,
             );
-            last_field = Some((field.value.clone(), field.value_cursor));
+            last_field = Some(field.value_cursor);
             f = rest;
             is_first = false;
         }
@@ -434,9 +442,8 @@ fn to_owned_cursor_at_depth<C: DocumentCursor>(
                 return Err(cursor.malformed_delimiter_error());
             }
         } else {
-            let (value, value_cursor) =
-                last_field.expect("map non-empty implies a real field was inserted");
-            if !trailing_element_gap_ok(&value_cursor, &value, b'}') {
+            let value_cursor = last_field.expect("map non-empty implies a real field was inserted");
+            if !trailing_element_gap_ok(&value_cursor, b'}') {
                 return Err(cursor.malformed_delimiter_error());
             }
         }
@@ -468,8 +475,7 @@ fn to_owned_cursor_at_depth<C: DocumentCursor>(
             }
         } else {
             let last = last_elem.expect("items non-empty implies a real element was pushed");
-            let last_value = last.value();
-            if !trailing_element_gap_ok(&last, &last_value, b']') {
+            if !trailing_element_gap_ok(&last, b']') {
                 return Err(cursor.malformed_delimiter_error());
             }
         }
