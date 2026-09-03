@@ -25293,6 +25293,18 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
     // larger architectural question (interleaving resolution with write
     // application) rather than folded into this fix.
     //
+    // A second, separate side-effect-ordering gap exists too (also #2267,
+    // predating this fix -- not introduced or widened by it): `ends` above
+    // is still resolved eagerly in full for a given `s` before `target` is
+    // ever reached, where real jq interleaves `T`'s and `E`'s own side
+    // effects per pair. Confirmed live:
+    // `path((.|debug("target"))[0:((1|debug("t1")),(2|debug("t2")))])`
+    // prints `t1, target, t2, target` on real jq but `t1, t2, target,
+    // target` here (all of `T`'s side effects for this `s` fire before any
+    // of `E`'s). Listed here rather than left undocumented so this
+    // comment doesn't read as a complete account of every eager-vs-lazy
+    // gap in this function.
+    //
     // No upfront `starts.len() * ends.len() * target.len()` reservation
     // baseline (#2245, mirroring #2225): none of `ends.len()`, `target`'s
     // own branch count is known before the loop starts. The per-pair
@@ -25310,6 +25322,18 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
             return Err((out, $control))
         };
     }
+
+    // #843: same rule as `resolve_index_expr` above, for a slice's bounds
+    // instead of an index's key -- computed once, not per pair (review):
+    // a pure static-AST-shape check on `target`/`trackable` (this
+    // function's own parameters, not anything the loop below produces),
+    // so its outcome is fixed for the whole call. `resolve_index_expr`'s
+    // own sibling check gets this for free by sitting entirely outside
+    // its loop; this one still has to wait for the first genuine `(s, t)`
+    // pair to name the offending slice in its error message, so the bool
+    // is hoisted here (one AST walk total) while the actual `escape!`
+    // stays inside the loop where `s`/`e` are in scope.
+    let target_is_passthrough = !trackable && is_passthrough_target(target);
 
     'outer: for (s, s_key) in &starts {
         // `T` (`end`) evaluated fresh for this `s`, not once overall
@@ -25355,14 +25379,7 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
                     Ok(branches) => (branches, None),
                     Err((prefix, e)) => (prefix, Some(e)),
                 };
-            // #843: same rule as `resolve_index_expr` above, for a slice's
-            // bounds instead of an index's key. Purely a static shape
-            // check on `target` itself -- its own outcome can't vary
-            // across pairs -- but re-checked here anyway (cheap: no
-            // evaluation) rather than hoisted out, so it stays co-located
-            // with the pair-dependent check right below it instead of
-            // needing its own separate one-time gate.
-            if !trackable && is_passthrough_target(target) {
+            if target_is_passthrough {
                 escape!(EvalError::invalid_path_expression_near_access(
                     &slice_component_value(*s, s_key.as_ref(), *e, e_key.as_ref()),
                     value,
