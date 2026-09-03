@@ -289,6 +289,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`del(EXPR | .)` -- a `del()` path whose *last* component is a bare `.` reached after
+  navigating through a real `Field`/`Index`/`Iterate` step -- nulled the targeted slot in place
+  instead of removing it from its parent container** (#2256), diverging from both real jq and
+  real yq: `{"a":{"b":1,"c":2}} | del(.a | .)` gave `{"a":null}` where jq 1.7.1 gives `{}`, and
+  `{"a":[1,2,3]} | del(.a[0] | .)` gave `{"a":[null,2,3]}` where jq gives `{"a":[2,3]}` --
+  reproduced the same way through `Iterate` (`del(.[] | .)`) and in yq mode. Root cause:
+  `delete_path_steps`'s main loop reassigns `root` into the child slot a `Field`/`Index` step
+  names and loops, so by the time a trailing bare `.` is reached, `root` no longer has a way
+  back to the map/array that held it -- `delete_at_path`'s own `Expr::Identity` arm (correct
+  for a genuine top-level `del(.)`, where there truly is no parent) then just nulls the child in
+  place instead. Fixed with a new `trailing_identity_optional` lookahead: before navigating into
+  a `Field`/`Index`/`Iterate`/`Slice` step's target, check whether everything left in the path
+  (`rest`) reduces to nothing but a trailing `.` -- any number of `.`/`(.)`/`(.)?` wrappers deep
+  -- and if so, delete at the *current* position (`root` is still the parent there) instead of
+  navigating in at all, reusing `delete_at_path`'s own terminal-arm logic
+  (`shift_remove`/`arr.remove`/`arr.clear`/`map.clear`/`arr.drain`) rather than duplicating it.
+  `Iterate` needed this fix in *both* jq and yq mode -- yq's existing
+  `YqDelSliceOutcome::DropParent(Expr::Identity)` mechanism only classifies a chained scalar
+  *slice* per element and doesn't fire for a plain trailing `.` at all, confirmed still nulling
+  every element pre-fix. `del(.)` alone (the genuine top-level case, never routed through
+  `delete_path_steps`) is unaffected and still nulls the whole document, as does the
+  no-real-navigation edge case `del(. | .)`.
+
 - **`evaluate_bytes_lazy` (the default CLI path for a non-cursor-transparent jq filter --
   `if`/arithmetic/function calls/anything `expr_is_cursor_transparent` answers `false` for)
   silently accepted a stray `,` inside an apparently-empty array/object, anywhere in the
