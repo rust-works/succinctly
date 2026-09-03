@@ -1739,11 +1739,15 @@ $ echo '{"a":[1,2]}' | yq -o=json 'del(.a[-5])'          # Error: index [-5] out
 $ echo '{"a":[1,2]}' | succinctly yq 'del(.a[-5])' -o json  # {"a":[1,2]} -- WRONG, before this fix
 ```
 
-Three independent array arms shared the gap, none `EvalSemantics`-aware (all three take a
+Five independent array arms shared the gap, none `EvalSemantics`-aware (all five take a
 plain `yq_mode: bool`, not generic `S`, so the fix reuses a new `bool`-based sibling of
 `yq_negative_index_check`/`yq_negative_index_error` rather than threading `S` through the
 whole delete-path recursion): `delete_at_path`'s own `Expr::Index` array arm (`del()`'s
-literal-index dispatch), `delete_paths_under`'s array arm (`delpaths()`'s mid-path
+single-step literal-index dispatch), `delete_path_steps`'s own mid-chain `Expr::Index` arm
+(a pipe-chained `del()` path, e.g. `del(.a[-5].x)` -- missed in the first pass, found by code
+review), `delete_trie_array`'s own `ArrayStep::Index` arm (a comma-grouped `del()` path, e.g.
+`del(.a[-5].x, .c)`, which real yq aborts *entirely* on -- `.c` is not deleted either -- also
+missed in the first pass), `delete_paths_under`'s array arm (`delpaths()`'s mid-path
 navigation, e.g. `delpaths([["a",-5]])`), and `delete_keys`'s array arm (`delpaths()`'s
 terminal per-container batch, e.g. `delpaths([[-5]])`). Unlike the read-side fix, this one is
 **not** suppressible by an earlier `?` in the path chain -- confirmed live, `del(.a?[-5])`
@@ -1764,9 +1768,9 @@ this one multi-key-same-array shape.
 
 **A separate, unrelated divergence found investigating this one, not fixed here**: real yq's
 `del()` on a *positive* out-of-range index doesn't no-op the way jq does -- it extends the
-array with `null`s up to that position (`del(.[5])` on `[1,2]` yields a 6-element array with 4
-trailing nulls in real yq, confirmed live), where succinctly (matching jq) leaves the array
-unchanged. Filed separately as
+array with `null`s up to (not including) that position (`del(.[5])` on `[1,2]` yields a
+5-element array, `[1,2,null,null,null]`, in real yq, confirmed live), where succinctly
+(matching jq) leaves the array unchanged. Filed separately as
 [#2305](https://github.com/rust-works/succinctly/issues/2305), since it's about a positive
 index and has nothing to do with #2268's own negative-index scope.
 
