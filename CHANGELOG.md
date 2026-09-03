@@ -289,6 +289,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`succinctly jq`'s most common query idioms -- `.[]`, `keys`/`keys_unsorted`, bare `.a`
+  field access, `length`, `.[0]` -- silently accepted a trailing stray `,` after a real last
+  array/object child** (#2261): `echo '[1,]' | succinctly jq -c '.[]'` printed `1` at exit 0,
+  where real jq (1.7.1) rejects the document outright with a parse error (exit 5). #2243 had
+  already closed this exact shape for `to_owned_cursor_at_depth`, but that materializer only
+  backs the *non-cursor-transparent* route (`if`/arithmetic/function calls) — every idiom
+  above takes its own native, cursor-carrying arm in `eval_generic.rs` that never calls it.
+  Closed for `.[]` (`each_lazy_array_iterate_sink`/`DocumentElements::collect_cursors_checked`,
+  which already walked every element's cursor for #1677's leading-gap check and now retain the
+  last one to check the trailing gap too), `length`/`.[0]` on arrays (a new
+  `DocumentElements::len_checked`, since resolving *any* array index — not just a negative one
+  — already calls `.len()` to normalize/bounds-check it, so the check rides along for free on
+  every index, reversing this issue's own assumption that `.[0]` had to stay an O(1)-lookup
+  exception), `keys`/`keys_unsorted` in every shape (bare, `keys[]`, `keys_unsorted[]`,
+  `keys_unsorted | last`, a negative `keys_unsorted[n]` — all via a new
+  `DistinctKeyCursors::trailing_gap_ok`, which needed care to track the object's *textually*
+  last field across a confirmed duplicate-key collapse rather than whichever key the
+  collapsed/sorted output lists last), bare `.a`/`.nonexistent` field access
+  (`JsonFields::find_cursor`, which — contrary to this issue's own "genuine O(1) lookup"
+  description — already walks every field regardless of `name` to honor last-duplicate-
+  key-wins, so the check is free there too), and `to_entries` on both arrays and objects (a
+  new `effective_fields_with_raw_last`, since `to_entries`'s own collapsed field list can list
+  a different field last than the raw walk once a duplicate key collapses). Left open, and
+  documented in `docs/compliance/jq/limitations.md`: `keys_unsorted[0]` (a genuine O(1)
+  positional lookup into an object's key list, matching #1629's own established
+  "would cost strictly more than the answer" precedent), `length` on objects (`{"a":1,}|
+  length`, not one of this issue's own repros — its walk deliberately never resolves any
+  field's value, by design, since #1514), and #2211's own sibling shape (`[,]`/`{,}`, a stray
+  `,` with *zero* real children) through every path above, none of which is ever handed a
+  cursor to the container itself. `.[]` and a bare `keys_unsorted` are the two genuinely
+  streaming writers among these fixes and can (like the pre-existing, already-documented
+  `limit(3;.[])` case) still write a confirmed-good prefix to stdout before the trailing fault
+  surfaces — not a new divergence, the same one already pinned for a truncating `.[]`
+  consumer.
+
 - **`succinctly yq --slurp`/`--eval-all`/`--inplace --input-format json` silently accepted a
   trailing stray `,` after a real last array/object child** (#2262): `echo '[1,]' | succinctly
   yq --slurp --input-format json -o json '.[0]'` printed `1` at exit 0, where real yq (v4.53.3)

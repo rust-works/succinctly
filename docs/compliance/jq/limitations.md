@@ -1273,12 +1273,16 @@ untested.
 follow-ups rather than folded in here** (same "one materializer at a time"
 practice #2243's own issue text cites for not folding into #2211):
 
-- **#2261**: every *cursor-transparent* fast path -- `.[]`, `keys`/
-  `keys_unsorted`/`to_entries`, bare `.a`/`.[0]`/`.["a"]` field/index access,
-  `length` -- takes a route through `eval_generic.rs` that never reaches
-  `to_owned_cursor_at_depth` at all, so this fix does not reach jq's most
+- **#2261 (fixed, mostly)**: every *cursor-transparent* fast path -- `.[]`,
+  `keys`/`keys_unsorted`/`to_entries`, bare `.a`/`.[0]` field/index access,
+  `length` -- took a route through `eval_generic.rs` that never reached
+  `to_owned_cursor_at_depth` at all, so this fix did not reach jq's most
   common query idioms; only the non-cursor-transparent shape #2243's own
-  repro uses (`if`/arithmetic/function calls) is covered.
+  repro uses (`if`/arithmetic/function calls) was covered. #2261 closed
+  this for every one of those idioms except a genuinely O(1) object-key
+  lookup (`keys_unsorted[0]`) -- see its own section below for the full
+  accounting, including a case (`.[0]`/`Expr::Index` on an array) this
+  issue's own repro assumed would stay open but turned out to be free.
 - **#2262 (fixed)**: the three sibling materializers named above --
   `eval.rs`'s own `to_owned_at_depth` (behind this crate's documented public
   `eval()` API), `eval_generic.rs`'s own cursor-less `to_owned_at_depth`, and
@@ -1327,6 +1331,216 @@ practice #2243's own issue text cites for not folding into #2211):
   `trailing_gap_ok`/`scalar_end_pos` pair rather than the new trait methods --
   a cleanup, not a behavior gap, but the same "duplicated predicates diverge
   silently" shape (#106) this fix was written to reduce, not add to.
+
+## The trailing-comma check reaches jq's own most common idioms (#2261)
+
+#2243 closed the trailing-stray-comma-after-a-real-last-child shape (`[1,]`,
+`{"a":1,}`) for `to_owned_cursor_at_depth` -- but that materializer backs
+only the *non-cursor-transparent* route (`if`/arithmetic/function calls).
+The far more common idioms -- `.[]`, `keys`/`keys_unsorted`/`to_entries`,
+bare `.a`, `length`, `.[0]` -- each take their own native, cursor-carrying
+arm in `eval_generic.rs` and never call it at all:
+
+```
+$ echo '[1,]'     | jq  -c '.[]'          # parse error, exit 5
+$ echo '[1,]'     | sjq -c '.[]'          # exit 5 now (was: 1, exit 0)
+$ echo '[1,]'     | jq  -c 'length'       # parse error, exit 5
+$ echo '[1,]'     | sjq -c 'length'       # exit 5 now (was: 1, exit 0)
+$ echo '[1,]'     | jq  -c '.[0]'         # parse error, exit 5
+$ echo '[1,]'     | sjq -c '.[0]'         # exit 5 now (was: 1, exit 0)
+$ echo '{"a":1,}' | jq  -c 'keys'         # parse error, exit 5
+$ echo '{"a":1,}' | sjq -c 'keys'         # exit 5 now (was: ["a"], exit 0)
+$ echo '{"a":1,}' | jq  -c '.a'           # parse error, exit 5
+$ echo '{"a":1,}' | sjq -c '.a'           # exit 5 now (was: 1, exit 0)
+```
+
+**Every one of these turned out to be free or near-free**, riding a walk the
+arm already had to perform for an unrelated reason -- with exactly one
+deliberate exception. The full per-path accounting:
+
+**`.[]` (arrays).** Both the demand-aware `each_lazy_array_iterate_sink`
+(`eval_generic.rs`, #1597) and the eager `DocumentElements::collect_cursors_checked`
+(`document.rs`, #1677) already walk every element's own cursor to check its
+*leading* `,` -- retaining the last cursor seen and checking
+`trailing_element_gap_ok` once after the loop exhausts costs nothing new.
+`each_lazy_array_iterate_sink`'s own pre-existing early-exit divergence
+(#1629-shaped: a truncating consumer like `first(.[])` never walks past its
+own stopping point) still applies unchanged -- the new check runs only on
+`Flow::Exhausted`, the same gate `is_malformed`-style checks elsewhere in
+this file already use.
+
+**`length` (arrays) and `.[0]`/`Expr::Index` (arrays).** A new
+`DocumentElements::len_checked` (the array counterpart of the object side's
+long-standing `effective_len_checked`) walks with `uncons_cursor` instead of
+`len`'s plain `uncons`, checking the same #1677 leading-gap plus the new
+trailing one, and `Builtin::Length`'s array arm now calls it. `.[0]`
+(`Expr::Index` in `eval_generic.rs`) turned out to need the identical fix,
+for a reason this issue's own description did not anticipate: resolving
+*any* array index -- positive or negative -- already calls `.len()` first
+(to normalize a negative index against the array's length, and to raise
+yq's own out-of-range error), so switching that call to `len_checked` closes
+the gap on every index, not just negative ones. **This reverses the
+plan the rest of this section still follows for the object-key
+counterpart below** (`keys_unsorted[0]`, which really is O(1) and stays
+open) -- the array case looked like the same shape from the issue text
+alone, and only reading `Expr::Index`'s own body (not the issue's
+characterization of it) surfaced that `len()` was already unconditional.
+
+**`keys`/`keys_unsorted` (objects, both bare and piped: `keys[]`,
+`keys_unsorted[]`, `keys_unsorted | last`, a negative `keys_unsorted[n]`).**
+Every one of these walks `DistinctKeyCursors` (`document.rs`), which now
+tracks `last_key_cursor` -- the textually last field's own *key* cursor, in
+raw document order -- alongside its existing `ended_unpaired`/
+`delimiter_fault` bookkeeping, and exposes it via a new
+`DistinctKeyCursors::trailing_gap_ok(close_char)`. The check itself needs
+the last field's *value* cursor, not its key cursor, to compare against
+`}` -- resolved via `key_cursor.next_sibling()`, an O(1) BP hop mirroring
+how `JsonFields::uncons` itself derives a value cursor from a key cursor
+(`let value_cursor = key_cursor.next_sibling()?;`), run once here rather
+than during the walk.
+
+This needed real care around a duplicate key under jq's default collapse
+rule ("first position, last value"). `DistinctKeyCursors`' own *yielded*
+order is first-occurrence order, which for `{"a":1,"b":2,"a":3}` is `a`
+(now carrying the *second* `a`'s cursor, once collapse detects and
+resolves the repeat), then `b` -- so naively tracking "the last cursor this
+loop yielded" would land on `b`'s value (`2`), and checking the gap after
+it against `}` would see the perfectly ordinary `,"a":3}` that follows and
+wrongly reject this well-formed document. The actual fix: `next()`'s
+non-collapsed branch updates `last_key_cursor` on every raw field it
+examines, in document order; the moment a repeat is confirmed,
+`collapse_confirmed_repeat`'s own from-scratch re-walk (which already
+covers the whole object, needed anyway to build the exact collapsed list)
+hands back its own `last_key_cursor` too, and `next()` overwrites with
+that authoritative answer rather than whatever the raw walk had reached so
+far. An earlier version of this fix (caught reviewing this same issue,
+before it shipped) used the naive "last yielded" cursor and would have
+regressed exactly this case -- pinned by
+`test_jq_cursor_transparent_fast_paths_wellformed_unaffected_2261`'s own
+duplicate-key rows in [tests/jq_cli_tests.rs](../../../tests/jq_cli_tests.rs).
+
+The bare-`keys`/`keys_unsorted` materializer (`document.rs::effective_keys`,
+which already walks `DistinctKeyCursors` for an unrelated reason -- decoding
+every key's display spelling) and three CLI-level writers each needed their
+own one-line addition once `DistinctKeyCursors::trailing_gap_ok` existed:
+`stream_lazy_keys_json` (`src/jq/stream.rs`, the M2 streaming writer for
+`keys_unsorted[]`-shaped queries with a further pipe stage `stream_json`
+can inline), `bail_if_keys_malformed` (`jq_runner.rs`, the CLI's own
+`JqValue::LazyKeysArray` writer behind a *bare* `keys_unsorted`), and
+`eval_generic.rs`'s own `walk_distinct_keys_checked`/`Expr::Builtin(Builtin::Last)`
+arm (covering `keys_unsorted[]`/`keys_unsorted[-1]` and `keys_unsorted |
+last` respectively, reached through `eval_single`'s eager path since
+`keys_unsorted` alone is not one of `jq_runner.rs`'s own
+`expr_is_cursor_transparent` shapes).
+
+**Bare `.a`/`.nonexistent` field access (`JsonFields::find_cursor`,
+`src/json/light.rs`).** This issue's own text characterized this as a
+genuine O(1) lookup, the same shape #1629 already established should stay
+unchecked for cost reasons -- **verifying that assumption rather than
+trusting it found it was wrong**. `find_cursor` must resolve
+last-duplicate-key-wins semantics (#1251), so its `while` loop always walks
+every field in the object regardless of `name` or where a match sits --
+never returning early on a match, because a later same-named field could
+still supersede it. That means it is already paying the O(n) cost this
+issue assumed only `.[]`/`keys`/`length` paid, and the trailing-gap check
+rides along for free: track the last field's value cursor (regardless of
+match), check it once after the loop, and raise for `.a` *and*
+`.nonexistent` alike on `{"a":1,}` -- matching real jq, which can't parse
+the document at all, so every field access into it raises, not just the
+ones that happen to touch a real key.
+
+**`to_entries` (both arrays and objects).** The array arm already used
+`collect_cursors_checked` and so was fixed for free by that function's own
+change above. The object arm needed one more piece: it already resolves
+every field's value cursor (`to_owned_cursor` is called on each one
+regardless), so retaining the last one costs nothing -- but it iterates the
+*already-collapsed* list `effective_fields` returns, which (per the
+`keys`/`keys_unsorted` account above) can list a different, earlier field
+last once a duplicate key collapses. A new `effective_fields_with_raw_last`
+(`document.rs`) hands back the *raw, pre-collapse* walk's own last field's
+cursor alongside the (possibly reordered) collapsed list `to_entries`
+still iterates to build its output -- free, since `all_fields()`'s `Vec`
+already exists in raw document order before any collapsing runs, so
+reading its last element costs nothing beyond the call already made.
+
+### What stayed open, and why (the genuine O(1) exception)
+
+**`keys_unsorted[0]`** (a *positive* index into an object's key list,
+`fold_lazy_keys_stage`'s `Expr::Index { idx: 0, .. }` arm) is the one case
+in this issue that really does match #1629's own "would cost strictly more
+than the answer" reasoning: it reads only `fields.uncons_key()`'s first
+field and returns, never touching the rest of the object -- the same
+positional-access shape #1629 itself already left unchecked for
+`Builtin::First`/a positive `Expr::Index` on `LazyKeys`, for the identical
+reason (checking would mean walking the whole object purely to validate
+it, undoing the point of the O(1) lookup). Confirmed still open, and
+pinned rather than silently left uncovered, by
+`test_jq_keys_unsorted_positive_index_trailing_comma_remains_a_known_gap_2261`
+in [tests/jq_cli_tests.rs](../../../tests/jq_cli_tests.rs).
+
+**#2211's own sibling shape (`[,]`, `{,}` -- a stray comma with *zero* real
+elements/fields) remains open through every path this section fixed**, for
+the same reason it remains open through `to_owned_at_depth`'s cursor-less
+callers (#2262's own account above): `container_gap_ok` needs a cursor to
+the *container itself* to find its opening bracket, and none of
+`each_lazy_array_iterate_sink`/`collect_cursors_checked`/`len_checked`
+(elements only), `effective_fields_checked`/`effective_keys`/
+`DistinctKeyCursors`/`find_cursor` (fields only) ever receive one -- only
+per-child cursors, once a child exists to hold one. One path in this set
+*does* have a container cursor sitting unused at its call site:
+`eval_each_generic`'s `Expr::Iterate` arm already threads `cursor:
+Option<V::Cursor>` through to `each_lazy_array_iterate_sink`'s call site
+but doesn't pass it in. Deliberately not wired up here -- doing so would
+mean widening a hot-path function's signature and its one call site for a
+case outside this issue's own five repros, a scoped follow-up rather than
+opportunistic scope creep. Pinned as still open by
+`test_jq_cursor_transparent_fast_paths_empty_container_stray_comma_remains_a_known_gap_2261`.
+
+**`length` (objects).** Not one of this issue's own five repros, but
+checked for consistency: `{"a":1,}| length` also stays open. `length`'s
+object arm (`effective_len_checked` → `census`, `document.rs`) walks with
+`uncons_key` specifically to avoid resolving any field's *value* at all
+(#1514: "a key-only walk pays for one `key()` and no `value()`" --
+`census`/`checked_len` never call `field.value_cursor()`, unlike every
+fixed path above). Retrofitting the trailing-value check here would need
+the last field's value cursor, which this walk deliberately never
+resolves -- adding it would either (a) always resolve one extra value
+cursor from a field that might not even be the last one until the walk
+finishes (a real, if small, per-call cost the #1514 design specifically
+avoids paying), or (b) require a broader trait-level change to expose a
+"free" value cursor per key-only step, which is a larger architectural
+change than a single-issue scope justifies. Left open, matching this
+same "would cost more than length's own answer" reasoning `#1629`
+established for the object's own positional-index case above.
+
+### Partial output before the error, on the two genuinely streaming writers
+
+Two of the newly-checked paths can write real, already-confirmed-good
+output to stdout before the trailing-comma fault surfaces -- not a new
+divergence, but the same one already pinned for `limit(3;.[])` on
+`[1,2,,4]` (see "A truncating consumer of a plain array `.[]` skips a
+malformed comma it never needed", above): a streaming writer emits each
+element/key as it confirms it, and only learns about a trailing fault once
+the walk exhausts.
+
+```
+$ echo '[1,]'     | jq  -c '.[]'            # (parses nothing) exit 5
+$ echo '[1,]'     | sjq -c '.[]'            # 1, then error, exit 5
+$ echo '{"a":1,}' | jq  -c 'keys_unsorted'   # (parses nothing) exit 5
+$ echo '{"a":1,}' | sjq -c 'keys_unsorted'   # ["a" (no closing bracket), then error, exit 5
+```
+
+Real jq's parser is atomic (whole-document parse before any evaluation, so
+a malformed document produces no output at all); succinctly's semi-index
+validates incrementally as each element/writer step confirms itself good.
+Pinned by
+`test_jq_lazy_array_iterate_trailing_comma_streams_confirmed_prefix_first_2261`
+and
+`test_jq_lazy_keys_array_trailing_comma_leaves_truncated_bracket_2261`.
+Every other path this section fixed (`length`, `to_entries`, `keys`, `.a`,
+`keys_unsorted[]`/`| last`/`[-1]`) resolves to a single owned result or a
+fully-collected `Vec` before printing anything, so a mid-walk failure there
+never leaks a partial value.
 
 ## Refusing an allocation jq does not survive
 
