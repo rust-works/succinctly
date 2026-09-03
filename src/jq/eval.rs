@@ -28019,13 +28019,16 @@ pub(crate) fn eval_reduce_with_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemant
 /// the general fix neither sibling attempts.
 /// Converts `expr` to an `OwnedValue` directly, without the general
 /// evaluator, succeeding only when every leaf `expr` reaches is already an
-/// `Expr::Literal` -- the exact shape `substitute_var`'s `Expr::Var` arm
-/// (via `owned_to_expr_at_depth`) leaves behind when a `reduce`/`foreach`
-/// UPDATE body's bound variable sits inside an array/object accumulator
-/// literal (`. + [$x]`, `. + {($x): true}`, #2152). Returns `None` for
-/// anything else, so [`eval_owned_fast_path`]'s own caller falls back to
-/// the general evaluator unchanged -- this never has to recognize every
-/// possible shape, only the ones substitution can actually produce.
+/// `Expr::Literal` -- the shape `substitute_var`'s `Expr::Var` arm (via
+/// `owned_to_expr_at_depth`) leaves behind when a `reduce`/`foreach`
+/// UPDATE body's bound variable sits *directly* inside an array/object
+/// accumulator literal (`. + [$x]`, `. + {($x): true}`, #2152). Returns
+/// `None` for anything else -- notably, a leaf that is itself computed
+/// rather than merely placed (`. + [$x + 1]`, `Expr::Arithmetic`, not
+/// `Expr::Literal`) is not recognized and falls back to the general
+/// evaluator unchanged, same as [`eval_owned_fast_path`]'s own caller does
+/// for any other unrecognized shape -- this function's job is narrow
+/// (literal-tree conversion only), not "every way `$x` might appear".
 ///
 /// Confirmed live (not assumed from #2152's own text, which guessed a
 /// different, incorrect AST shape): `[$x]` parses as
@@ -28046,7 +28049,17 @@ pub(crate) fn eval_reduce_with_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemant
 /// `IndexMap`'s own `FromIterator`, matching `eval_object_construction`'s
 /// identical `acc.into_iter().collect::<IndexMap<_, _>>()` -- same
 /// later-value-wins, first-position-kept semantics, not reimplemented.
-fn literal_shaped_expr_to_owned(expr: &Expr) -> Option<OwnedValue> {
+///
+/// `depth`/`assert_value_tree_depth` (#2152 review): this walks exactly
+/// the `Expr::Array`/`Expr::Object` shapes `owned_to_expr_at_depth` builds
+/// (#1025's own guard against unbounded recursion when splicing a value
+/// back into the AST) -- not currently reachable past that ceiling, since
+/// every input either comes from that same guarded splice or from
+/// `MAX_EXPR_DEPTH`-bounded parsed source, but guarded explicitly anyway
+/// to match every other recursive `Expr`/`OwnedValue`-tree walker in this
+/// file rather than relying on an upstream bound staying in place.
+fn literal_shaped_expr_to_owned(expr: &Expr, depth: usize) -> Option<OwnedValue> {
+    assert_value_tree_depth(depth);
     match expr {
         Expr::Literal(lit) => Some(literal_to_owned(lit)),
         Expr::Array(inner) => match inner.as_ref() {
@@ -28054,12 +28067,13 @@ fn literal_shaped_expr_to_owned(expr: &Expr) -> Option<OwnedValue> {
             Expr::Comma(items) => {
                 let mut out = vec_with_capacity(items.len());
                 for item in items {
-                    out.push(literal_shaped_expr_to_owned(item)?);
+                    out.push(literal_shaped_expr_to_owned(item, depth + 1)?);
                 }
                 Some(OwnedValue::Array(out))
             }
             single => Some(OwnedValue::Array(vec![literal_shaped_expr_to_owned(
                 single,
+                depth + 1,
             )?])),
         },
         Expr::Object(entries) => {
@@ -28067,12 +28081,12 @@ fn literal_shaped_expr_to_owned(expr: &Expr) -> Option<OwnedValue> {
             for entry in entries {
                 let key = match &entry.key {
                     ObjectKey::Literal(s) => s.clone(),
-                    ObjectKey::Expr(e) => match literal_shaped_expr_to_owned(e)? {
+                    ObjectKey::Expr(e) => match literal_shaped_expr_to_owned(e, depth + 1)? {
                         OwnedValue::String(s) => s,
                         _ => return None,
                     },
                 };
-                out.push((key, literal_shaped_expr_to_owned(&entry.value)?));
+                out.push((key, literal_shaped_expr_to_owned(&entry.value, depth + 1)?));
             }
             Some(OwnedValue::Object(out.into_iter().collect()))
         }
@@ -28116,7 +28130,7 @@ fn eval_owned_fast_path<S: EvalSemantics>(
         // accumulator idioms (`. + [$x]`, `. + {($x): true}`) that #2086's
         // own body flagged as unmeasured and out of scope at the time.
         Expr::Arithmetic { op, left, right } if matches!(left.as_ref(), Expr::Identity) => {
-            let rhs = literal_shaped_expr_to_owned(right.as_ref())?;
+            let rhs = literal_shaped_expr_to_owned(right.as_ref(), 0)?;
             match arith_combine::<S>(*op, input.clone(), rhs) {
                 Ok(v) => Some(Ok(Some(v))),
                 // Mirrors the `Field`/`Index` arms' own `_ if optional`
@@ -61036,7 +61050,7 @@ mod tests {
         // rather than only showing up as a silent fast-path miss.
         let bare = Expr::Array(Box::new(Expr::Literal(Literal::Int(1))));
         assert_eq!(
-            literal_shaped_expr_to_owned(&bare),
+            literal_shaped_expr_to_owned(&bare, 0),
             Some(OwnedValue::Array(vec![OwnedValue::Int(1)]))
         );
         let comma = Expr::Array(Box::new(Expr::Comma(vec![
@@ -61044,7 +61058,7 @@ mod tests {
             Expr::Literal(Literal::Int(2)),
         ])));
         assert_eq!(
-            literal_shaped_expr_to_owned(&comma),
+            literal_shaped_expr_to_owned(&comma, 0),
             Some(OwnedValue::Array(vec![
                 OwnedValue::Int(1),
                 OwnedValue::Int(2)
@@ -61059,27 +61073,74 @@ mod tests {
         // a wrong/partial value -- the caller's whole point in checking
         // for `None` is to fall back to the general evaluator safely.
         assert_eq!(
-            literal_shaped_expr_to_owned(&Expr::Array(Box::new(Expr::Comma(vec![
-                Expr::Literal(Literal::Int(1)),
-                Expr::Field("foo".to_string()),
-            ])))),
+            literal_shaped_expr_to_owned(
+                &Expr::Array(Box::new(Expr::Comma(vec![
+                    Expr::Literal(Literal::Int(1)),
+                    Expr::Field("foo".to_string()),
+                ]))),
+                0
+            ),
             None
         );
         assert_eq!(
-            literal_shaped_expr_to_owned(&Expr::Object(vec![ObjectEntry {
-                key: ObjectKey::Literal("a".to_string()),
-                value: Expr::Field("foo".to_string()),
-            }])),
+            literal_shaped_expr_to_owned(
+                &Expr::Object(vec![ObjectEntry {
+                    key: ObjectKey::Literal("a".to_string()),
+                    value: Expr::Field("foo".to_string()),
+                }]),
+                0
+            ),
             None
         );
         // A dynamic key that doesn't resolve to a string is also rejected,
         // matching jq's own "object keys must be strings" rule.
         assert_eq!(
-            literal_shaped_expr_to_owned(&Expr::Object(vec![ObjectEntry {
-                key: ObjectKey::Expr(Box::new(Expr::Literal(Literal::Int(1)))),
-                value: Expr::Literal(Literal::Bool(true)),
-            }])),
+            literal_shaped_expr_to_owned(
+                &Expr::Object(vec![ObjectEntry {
+                    key: ObjectKey::Expr(Box::new(Expr::Literal(Literal::Int(1)))),
+                    value: Expr::Literal(Literal::Bool(true)),
+                }]),
+                0
+            ),
             None
+        );
+    }
+
+    /// `Expr::Array`-nesting analog of `linear_array_nest` (`OwnedValue`),
+    /// one level per `Expr::Array` wrapping a bare `Expr::Literal(Int(0))`
+    /// innermost.
+    fn linear_expr_array_nest(depth: usize) -> Expr {
+        let mut e = Expr::Literal(Literal::Int(0));
+        for _ in 0..depth {
+            e = Expr::Array(Box::new(e));
+        }
+        e
+    }
+
+    #[test]
+    fn test_2152_literal_shaped_expr_to_owned_panics_past_nesting_depth_limit() {
+        // #2152 review: `literal_shaped_expr_to_owned` walks exactly the
+        // `Expr::Array`/`Expr::Object` shapes `owned_to_expr_at_depth`
+        // builds (#1025's own guarded splice), but had no depth guard of
+        // its own -- unlike every other recursive `Expr`/`OwnedValue`-tree
+        // walker in this file. Not reachable past `MAX_VALUE_TREE_DEPTH`
+        // in practice (bounded transitively by `MAX_EXPR_DEPTH`/
+        // `owned_to_expr_at_depth`'s own guard), but pinned directly here
+        // anyway so a future call site that feeds this function an
+        // unbounded tree fails loudly instead of risking an uncatchable
+        // stack overflow.
+        use crate::jq::value::MAX_VALUE_TREE_DEPTH;
+
+        let under = linear_expr_array_nest(MAX_VALUE_TREE_DEPTH - 1);
+        assert!(literal_shaped_expr_to_owned(&under, 0).is_some());
+
+        let over = linear_expr_array_nest(MAX_VALUE_TREE_DEPTH);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            literal_shaped_expr_to_owned(&over, 0)
+        }));
+        assert!(
+            result.is_err(),
+            "literal_shaped_expr_to_owned should panic at MAX_VALUE_TREE_DEPTH"
         );
     }
 
