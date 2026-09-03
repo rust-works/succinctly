@@ -25247,38 +25247,58 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
     }
 
     // jq compiles `E[S:T]` as `S as $s | T as $t | E | .[$s:$t]` — `S`
-    // outer, `T` middle, `E` innermost, and `E` is reached *only* once a
+    // outer, `T` middle, `E` innermost. `E` is reached *only* once a
     // genuine `(s, t)` pair exists (review, #2245): a target with a real
     // side effect (`stderr`, `debug`, `input`) never fires it at all when
     // `T` turns out empty for every `s` -- confirmed live against jq 1.7.1:
-    // `(.|stderr)[(0,1):(empty)] = 99` writes nothing to stderr. So
-    // `target` can no longer be resolved unconditionally up front the way
-    // a first draft of this fix did (and the way this function did before
-    // #2245 too, gated only on the old, once-computed-overall `ends` being
-    // non-empty) -- it has to be evaluated lazily, triggered by the first
-    // `s` whose own `T` actually produces a value.
+    // `(.|stderr)[(0,1):(empty)] = 99` writes nothing to stderr. And `E` is
+    // genuinely re-resolved fresh for *every* `(s, t)` pair (#2249,
+    // mirroring #2139's identical fix for `resolve_index_expr`'s `E[K]`
+    // and #2143's for the value-mode sibling, `eval_slice_expr`): confirmed
+    // live that real jq fires `stderr` once per `(s, t)` pair (4 times for
+    // a 2x2 cross product, `[path((.|stderr)[(0,1):(2,3)])]`), where the
+    // pre-#2249 once-reached-then-reused evaluation only fired it once.
     //
-    // **Residual, known gap, not fixed here**: once reached, `target` is
-    // resolved exactly once and reused for every later `(s, t)` pair, not
-    // re-evaluated fresh per pair the way `E` in [`eval_slice_expr`]'s
-    // value-mode sibling is (#2143). For a *trackable, side-effect-free*
-    // target (`.`, `.foo`, a computed index) that's unobservable. For one
-    // with real side effects it isn't: confirmed live that real jq fires
-    // `stderr` once per `(s, t)` pair (4 times for a 2x2 cross product,
-    // `[path((.|stderr)[(0,1):(2,3)])]`), where this reuses a single
-    // evaluation across all of them. Fully matching jq here would need
-    // `target` re-resolved inside the `e` loop below instead of cached
-    // across `s` iterations -- its own pass, not folded into this PR (see
-    // the follow-up filed alongside this fix).
-    let mut target_branches: Option<Vec<PathBranch<'a>>> = None;
-    let mut target_escape: Option<EvalEscape> = None;
-
-    // No upfront `starts.len() * ends.len() * target_branches.len()`
-    // reservation baseline (#2245, mirroring #2225): neither `ends.len()`
-    // nor `target_branches.len()` is known before the loop starts. The
-    // per-pair `try_reserve` call inside the loop still protects every
-    // real allocation; only the upfront-baseline optimization is gone, not
-    // the overflow protection itself.
+    // The two structural "is this target trackable" checks (#843/#986)
+    // below now run on *every* pair's own freshly-resolved `branches`, not
+    // just the first -- same reasoning #2139's own review already
+    // established for `resolve_index_expr`: `target`'s trackability isn't
+    // purely a function of its own static AST shape once that AST contains
+    // a runtime branch (`if`/`select`/`try`-`catch`) whose taken arm can
+    // differ per call, and it can differ per call precisely because
+    // `target` is now genuinely re-evaluated per pair -- a stateful
+    // condition (`input`, ...) could steer an earlier pair into a
+    // trackable arm and a later pair into an untracked one. Checking only
+    // the first pair's resolution and latching a verdict would let a
+    // later pair's genuinely untracked branch through unchecked, the same
+    // real data-corruption shape #2139's own first draft had.
+    //
+    // **Residual, known gap, not fixed here (#2267)**: every pair is still
+    // resolved eagerly into `out` before any caller (`set_path`/
+    // `eval_update`) applies a single write, unlike jq's own lazy `reduce
+    // path(...) as $p (.; setpath($p; ...))`, which pulls one path at a
+    // time and stops the moment a write fails to validate -- so a
+    // downstream write failure on an early pair can't retroactively
+    // "undo" a later pair's own side effects the way jq's short-circuit
+    // does. Confirmed live: `(.|stderr)[(0,1):(2,3)] = 99` (assigning a
+    // non-array to a slice, which `setpath` always rejects) fires
+    // `stderr` once on real jq (fails before the 2nd pair is ever
+    // resolved) but all 4 times here (every pair already resolved, side
+    // effects included, before the write-time type check ever runs).
+    // `del()`/`|=` have no equivalent write-time short-circuit and match
+    // jq's per-pair count exactly either way -- this is specific to a
+    // write operator whose downstream application can itself fail
+    // partway through a multi-pair batch, not a general property of this
+    // fix. See #2267 for the full analysis and why it's a separate,
+    // larger architectural question (interleaving resolution with write
+    // application) rather than folded into this fix.
+    //
+    // No upfront `starts.len() * ends.len() * target.len()` reservation
+    // baseline (#2245, mirroring #2225): none of `ends.len()`, `target`'s
+    // own branch count is known before the loop starts. The per-pair
+    // `try_reserve` call inside the loop still protects every real
+    // allocation; only the upfront-baseline optimization is gone, not the
+    // overflow protection itself.
     let mut out: Vec<PathBranch<'a>> = Vec::new();
 
     // The shared exit every escape arm below funnels through, so folding
@@ -25315,24 +25335,36 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
             continue 'outer;
         }
 
-        // First genuine `(s, t)` pair reached for the whole function --
-        // resolve `target` now, exactly once, and run the two structural
-        // "is this even a valid location" checks using this pair to name
-        // the offending slice in their error message (#843/#986,
-        // pre-existing; only the *timing* of `end`'s value here is new to
-        // #2245). Every later `s` skips straight past this block, reusing
-        // the same `target_branches`/`target_escape`.
-        if target_branches.is_none() {
-            let (branches, escape) = match resolve_node::<S>(target, value, trackable, false, keep)
-            {
-                Ok(branches) => (branches, None),
-                Err((prefix, e)) => (prefix, Some(e)),
-            };
+        // `target` (`E`) is re-resolved fresh for every `(s, t)` pair
+        // (#2249), one level deeper than `end`'s own per-`s` freshness
+        // (#2245) -- mirroring `resolve_index_expr`'s identical per-key
+        // re-resolution (#2139) and `eval_slice_expr`'s per-pair one
+        // (#2143). `target_escape` is scoped to this `s`, not the whole
+        // function: once a pair's own resolution escapes, no further pair
+        // -- from this `s` or any later one -- is ever tried (jq's own
+        // nested-generator semantics), so this `s`'s inner loop stops
+        // immediately and the escape is raised right after it, before a
+        // later `s` could ever reset this to `None` again. Confirmed
+        // against jq 1.7.1: `path((select((true,error("t"))))[(0,1):(2,3)])`
+        // on `[10,20,30]` prints only `[{"start":0,"end":2}]` before
+        // raising `t`.
+        let mut target_escape: Option<EvalEscape> = None;
+        for (e, e_key) in &ends {
+            let (branches, this_escape) =
+                match resolve_node::<S>(target, value, trackable, false, keep) {
+                    Ok(branches) => (branches, None),
+                    Err((prefix, e)) => (prefix, Some(e)),
+                };
             // #843: same rule as `resolve_index_expr` above, for a slice's
-            // bounds instead of an index's key.
+            // bounds instead of an index's key. Purely a static shape
+            // check on `target` itself -- its own outcome can't vary
+            // across pairs -- but re-checked here anyway (cheap: no
+            // evaluation) rather than hoisted out, so it stays co-located
+            // with the pair-dependent check right below it instead of
+            // needing its own separate one-time gate.
             if !trackable && is_passthrough_target(target) {
                 escape!(EvalError::invalid_path_expression_near_access(
-                    &slice_component_value(*s, s_key.as_ref(), ends[0].0, ends[0].1.as_ref()),
+                    &slice_component_value(*s, s_key.as_ref(), *e, e_key.as_ref()),
                     value,
                 )
                 .into());
@@ -25350,12 +25382,24 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
             // instead of raising. Kept as one condition with `!trackable`
             // so the two can't drift: this file's own "duplicated
             // predicates diverge silently" lesson (#106).
+            //
+            // Re-checked on *every* pair's own freshly-resolved
+            // `branches`, not just the first (#2249, mirroring #2139's
+            // own review finding for `resolve_index_expr`): `target`'s
+            // trackability can differ per pair once `target` is genuinely
+            // re-evaluated per pair, if its own AST has a runtime branch
+            // (`if`/`select`/`try`-`catch`) whose taken arm a stateful
+            // condition (`input`, ...) steers differently across pairs.
+            // Latching a single verdict from the first pair would let a
+            // later pair's genuinely untracked branch through unchecked
+            // -- confirmed as a real data-corruption bug for
+            // `resolve_index_expr`'s own first draft of #2139.
             if let Some(PathBranch {
                 value: first_value, ..
             }) = branches.iter().find(|b| !trackable || !b.trackable)
             {
                 escape!(EvalError::invalid_path_expression_near_access(
-                    &slice_component_value(*s, s_key.as_ref(), ends[0].0, ends[0].1.as_ref()),
+                    &slice_component_value(*s, s_key.as_ref(), *e, e_key.as_ref()),
                     first_value,
                 )
                 .into());
@@ -25372,23 +25416,6 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
             // `[10,20,30]` prints `[{"start":1,"end":2}]` (the
             // already-produced `select` branch, sliced) before raising
             // `t`.
-            target_branches = Some(branches);
-            target_escape = escape;
-        }
-        let branches = target_branches.as_ref().expect("just set above");
-
-        // `target`'s own escape (if it just fired above) caps this `s`'s
-        // own `T` stream to a single pair -- `target` escaping inside the
-        // very first `(s, t)` pair means no further pair, from this `s` or
-        // any later one, is ever tried. Confirmed against jq 1.7.1:
-        // `path((select((true,error("t"))))[(0,1):(2,3)])` on `[10,20,30]`
-        // prints only `[{"start":0,"end":2}]` before raising `t`.
-        let ends_limit = if target_escape.is_some() {
-            1
-        } else {
-            ends.len()
-        };
-        for (e, e_key) in &ends[..ends_limit] {
             if out.try_reserve(branches.len()).is_err() {
                 escape!(cannot_reserve_cross_product(&[branches.len()]).into());
             }
@@ -25410,7 +25437,7 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
                 // As in `resolve_index_expr`: the check above already
                 // rejected every untracked target branch.
                 ..
-            } in branches
+            } in &branches
             {
                 // `false`, not `optional`: the failure has to arrive as an
                 // error for the two spellings to be told apart here, same
@@ -25451,6 +25478,10 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
                 // Untracked targets were rejected above.
                 out.push(PathBranch::new(path, Cow::Owned(next_value), true));
             }
+            if let Some(control) = this_escape {
+                target_escape = Some(control);
+                break;
+            }
         }
         // Priority within this iteration is `target` > `end` (#1517;
         // `start`'s own trailing escape is handled once, after the whole
@@ -25464,7 +25495,7 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
         // escape -- `target`'s escape, reached while producing the very
         // first output, aborts before `end`'s generator is ever resumed
         // to reach its own.
-        if let Some(control) = target_escape.take() {
+        if let Some(control) = target_escape {
             escape!(control);
         }
         if let Some(control) = ends_escape {

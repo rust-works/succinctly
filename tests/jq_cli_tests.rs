@@ -14263,6 +14263,72 @@ fn test_resolve_slice_bound_type_error_still_drops_valid_prefix_1517_known_gap()
     Ok(())
 }
 
+/// #2249: `resolve_slice_expr` (the `path()`/`=`/`del()` write-path
+/// resolver for `E[S:T]`) resolved `target` (`E`) exactly once overall
+/// (once reached, per #2245) and reused it for every later `(s, t)` pair,
+/// unlike jq's own `S as $s | T as $t | E | .[$s:$t]` compilation, which
+/// re-runs `E` fresh for every pair -- the identical bug #2139 already
+/// fixed for the path-mode sibling, `resolve_index_expr`'s `E[K]`, and
+/// #2143 fixed for the value-mode sibling, `eval_slice_expr`. Verified
+/// live against jq 1.7.1 for every assertion below.
+#[test]
+fn test_resolve_slice_expr_reevaluates_target_per_pair_2249() -> Result<()> {
+    // A target with a real side effect (`stderr`) fires once per `(s, t)`
+    // pair, not once total: 2 starts x 2 ends = 4 pairs, 4 writes.
+    let (_, stderr, code) = run_jq_full(
+        &["-c", "[path((.|stderr)[(0,1):(2,3)])]"],
+        Some("[10,20,30]"),
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stderr, "[10,20,30][10,20,30][10,20,30][10,20,30]");
+
+    // Same side-effect-cadence fix through the write path itself, not just
+    // `path()`: `del()` fires once per pair too, on the identical
+    // 2x2 cross product.
+    let (_, stderr, code) =
+        run_jq_full(&["-c", "del((.|stderr)[(0,1):(2,3)])"], Some("[10,20,30]"))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stderr, "[10,20,30][10,20,30][10,20,30][10,20,30]");
+
+    Ok(())
+}
+
+/// #2249 (found in this fix's own review, mirroring #2139's identical
+/// finding for `resolve_index_expr`): the #843/#986 "is target trackable"
+/// checks must run on *every* pair's own freshly-resolved branches, not
+/// just the first -- a first draft of this fix latched a "trackable,
+/// don't check again" verdict off the first pair's resolution, on the
+/// mistaken assumption that trackability is purely a function of
+/// `target`'s static AST shape. It isn't, whenever that AST contains a
+/// runtime branch (here, `if`) whose taken arm depends on state that
+/// genuinely differs per pair (`input`, read once per pair by design,
+/// #2249's whole point): an earlier pair landing on a trackable arm must
+/// not exempt a later pair that lands on an untracked one. Verified live
+/// against jq 1.7.1: the untracked branch on the second pair must still
+/// raise "Invalid path expression", not silently write `[99, 99]` into
+/// the document the way this fix's own unfixed baseline does.
+#[test]
+fn test_resolve_slice_expr_checks_trackability_every_pair_2249() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-nc",
+            r#"[1,2,3] | ((if (input) then . else ({"x":1}|.) end)[(0,1):(2|.)] = [99])"#,
+        ],
+        Some("true\nfalse\n"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stdout.is_empty(),
+        "document must not be written: {stdout:?}"
+    );
+    assert!(
+        stderr.contains("Invalid path expression"),
+        "stderr: {stderr:?}"
+    );
+
+    Ok(())
+}
+
 /// #2245: `resolve_slice_expr` (the `path()`/`=`/`del()` write-path
 /// resolver for `E[S:T]`) evaluated `T` (`end`) exactly once overall,
 /// reused across every `S` value -- the identical bug #2225/PR #2244 fixed
