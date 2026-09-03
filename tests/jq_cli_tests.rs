@@ -8975,10 +8975,11 @@ fn test_optional_index_key_error_escapes_path_context_1410() -> Result<()> {
 /// `key`/`parent`/`path`, not resume `rest` at the unchanged ambient
 /// position the way the generic `Expr::Builtin(_)` catch-all did.
 ///
-/// The reported path is the resolved argument *verbatim*, not
-/// `current_path` extended by it -- matches real jq 1.7.1's own
-/// `path(getpath(...))`, which discards whatever ambient position `path()`
-/// was itself called from.
+/// The reported path is `current_path` extended by the resolved argument's
+/// own components -- matches real jq 1.7.1's own `path(getpath(...))` when
+/// the ambient navigation is genuinely inside the same `path()` scope (not
+/// discarded, an earlier, insufficiently general oracle check's mistake --
+/// see this function's own doc comment for the corrected reasoning).
 #[test]
 fn test_getpath_extends_path_context_2253() -> Result<()> {
     let input = r#"{"a":{"x":1}}"#;
@@ -8994,14 +8995,33 @@ fn test_getpath_extends_path_context_2253() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(stdout, "\"x\"\n");
 
-    // `parent` is consistent with the verbatim-path rule (real jq 1.7.1's
-    // own `path(getpath(...))` discards the ambient prefix, per this
-    // function's own doc comment -- not succinctly's `path()` builtin,
-    // which has a separate, pre-existing divergence here unrelated to this
-    // fix, see #2257): one level up from `["zz"]` is the root, not `.a`.
+    // `parent` extends the ambient path rather than replacing it: one level
+    // up from `["a","zz"]` is `.a`'s own value, matching real jq's
+    // `path(.a | getpath(["zz"]))` == `["a","zz"]`.
     let (stdout, _, code) = run_jq_full(&["-c", ".a | getpath([\"zz\"]) | parent"], Some(input))?;
     assert_eq!(code, 0);
-    assert_eq!(stdout, "{\"a\":{\"x\":1}}\n");
+    assert_eq!(stdout, "{\"x\":1}\n");
+
+    // `getpath([])` is a true no-op on the path: `key` after it still
+    // reports `.a`'s own key, not a reset position.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | getpath([]) | key"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "\"a\"\n");
+
+    // Chained getpath calls extend cumulatively rather than each one
+    // resetting the path to its own argument.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a.b | getpath([\"c\",\"d\"]) | key"],
+        Some(r#"{"a":{"b":{"c":{"d":1}}}}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "\"d\"\n");
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "[path(.a.b | getpath([\"c\",\"d\"]))]"],
+        Some(r#"{"a":{"b":{"c":{"d":1}}}}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[[\"a\",\"b\",\"c\",\"d\"]]\n");
 
     Ok(())
 }
@@ -9093,6 +9113,18 @@ fn test_getpath_path_context_escape_priority_2253() -> Result<()> {
         stderr.contains("Cannot index number with string"),
         "{stderr}"
     );
+
+    // Same rule when the *path-argument generator itself* escapes, not just
+    // a later resolved path's own walk: the first alternative's output is
+    // walked and folded into the result before the generator's own error
+    // propagates, rather than being silently dropped.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "getpath(([\"a\"], error(\"boom\"))) | key"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 5, "stderr: {stderr}");
+    assert_eq!(stdout, "\"a\"\n");
+    assert!(stderr.contains("boom"), "{stderr}");
 
     Ok(())
 }
