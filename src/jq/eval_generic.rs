@@ -9015,6 +9015,19 @@ fn path_node_type_name<V: DocumentValue>(node: &PathNode<V>) -> &'static str {
 /// Error texts are taken from the same constructors the materializing path
 /// uses, so the two agree exactly -- verified live against every shape in
 /// `test_path_cursor_native_matches_the_materializing_path_2061`.
+///
+/// #2147: this walk passes `S::COLLAPSE_DUPLICATE_KEYS` (the mode's own
+/// rule) to the shared `path_step_generic`, where
+/// [`path_context_step_generic`]'s own `key`/`path`/`parent` walk below
+/// passes `true` unconditionally -- a deliberate divergence, not an
+/// oversight. `path(f)` has no yq oracle at all (real yq rejects it as a
+/// parse error; `path(f)` is a jq builtin succinctly exposes as an
+/// extension there, so ADR-0018's divergence rule doesn't apply), where
+/// `[.[] | key]` does (`{"a":1,"a":2} | [.[] | key]` is `["a"]` in real yq
+/// v4.53.3, matching `path_context_step_generic`'s `true`). See that
+/// function's own doc comment for the full reasoning, and
+/// [docs/compliance/yq/limitations.md](../../docs/compliance/yq/limitations.md)'s
+/// "Duplicate mapping keys" section for the oracle evidence.
 fn path_walk_generic<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     node: &PathNode<V>,
@@ -9534,8 +9547,13 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             // `OwnedValue::Object(IndexMap<String, _>)`, which collapses a
             // repeated key structurally in *both* modes, and real yq agrees
             // (`{"a":1,"a":2} | [.[] | key]` is `["a"]` in v4.53.3).
-            // `path()`'s own walk keeps the mode's flag, because it is not
-            // replacing a materialization.
+            // `path()`'s own walk ([`path_walk_generic`], #2147) keeps the
+            // mode's flag instead, because it is not replacing a
+            // materialization and has no yq oracle to match in the first
+            // place (`path(f)` is a jq-only extension there) -- a
+            // deliberate divergence between the two walks, not an
+            // oversight; see that function's doc comment for the full
+            // cross-reference.
             let stepped = path_step_generic::<S, V>(
                 expr,
                 &PathNode::At(pos.node),

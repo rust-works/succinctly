@@ -646,6 +646,29 @@ would still not close the gap (the irregular per-level part is unmodeled by both
 every non-default `-I` width, not just `-I0`), so this remains open rather than folded into
 #1575's fix.
 
+**One more deliberate divergence, this time between two `succinctly`-internal walks rather
+than against real yq**: `path(f)`
+([`path_walk_generic`](../../../src/jq/eval_generic.rs), #2075) and `key`/`path`/`parent`
+([`path_context_step_generic`](../../../src/jq/eval_generic.rs), #2061) both delegate to the
+same shared `path_step_generic`, but pass it different duplicate-key collapse flags —
+[#2147](https://github.com/rust-works/succinctly/issues/2147) recorded why, since the two
+call sites sit ~500 lines apart and the mismatch reads as an oversight without this:
+
+```bash
+$ printf '{"a":1,"a":2}' | succinctly yq -o=json -I=0 '[path(.[])]'   # [["a"],["a"]]
+$ printf '{"a":1,"a":2}' | succinctly yq -o=json -I=0 '[.[] | key]'   # ["a"]
+```
+
+`key`/`path`/`parent` pass `true` unconditionally because they replace a bridge that used to
+materialize into an `IndexMap` (which collapses structurally in both modes) — real yq agrees
+(`["a"]` in v4.53.3). `path(f)` passes `S::COLLAPSE_DUPLICATE_KEYS` (the mode's own rule)
+instead, because it isn't replacing a materialization and has **no yq oracle at all**: real
+yq's `path` is the no-argument form only, so `path(f)` is a jq builtin succinctly exposes as
+an extension in yq mode, exempt from ADR-0018's divergence rule. In jq mode both walks agree
+with real jq 1.7.1 (`[["a"]]`). So the two flags are a recorded choice, not a bug — this
+entry (plus the cross-referencing doc comments on both functions) is what keeps a future
+reader from "fixing" the mismatch into a real divergence.
+
 ### Stacked compact block-sequence items — one narrow, pre-existing width anomaly
 
 [#1485](https://github.com/rust-works/succinctly/issues/1485) fixed the general rule for a
