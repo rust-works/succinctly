@@ -7174,6 +7174,27 @@ fn builtin_keys<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // live: `{"a":1,"a":2} | keys_unsorted` is `["a"]`), matching
             // `eval_generic.rs`'s already-shipped `Builtin::Keys`/
             // `Builtin::KeysUnsorted` siblings.
+            //
+            // Code review, #2320: `succinctly jq` never reaches this
+            // function at all (routes exclusively through
+            // `eval_generic.rs`), but `succinctly yq`'s `evaluate_input`/
+            // `--eval-all` genuinely do call `jq::eval`/
+            // `eval_owned_with_file_index` directly with `YqSemantics` --
+            // not merely a hypothetical library-only concern the way an
+            // earlier version of this comment claimed. The bug this fix
+            // closes was never externally observable through that path
+            // specifically, though: `YqSemantics::COLLAPSE_DUPLICATE_KEYS`
+            // was already `false` (the old hardcoded value), and yq's own
+            // YAML-to-`OwnedValue` materialization already collapses a
+            // duplicate mapping key before this function ever sees it
+            // (confirmed live, pre- and post-fix binaries agree:
+            // `succinctly yq --slurp '.[0] | keys_unsorted'` on `a: 1\na:
+            // 2` is `["a"]` either way). The behavior this fix actually
+            // changes -- jq mode now collapsing -- is reachable only from
+            // a library caller of `jq::eval::<_, JqSemantics>`/
+            // `jq::eval_lenient`/`eval_owned_with_file_index` directly,
+            // since neither shipped CLI ever supplies `JqSemantics` to
+            // this function.
             let mut keys = match effective_keys(&fields, S::COLLAPSE_DUPLICATE_KEYS) {
                 Ok(keys) => keys,
                 Err(e) => return QueryResult::Error(e),

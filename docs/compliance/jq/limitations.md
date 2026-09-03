@@ -1769,10 +1769,12 @@ and differently-shaped problem than this section's own fixes):
   genuine new error-type design (its `Result<_, usize>` return already
   carries a distinct, meaningful "negative still negative" signal, #2254 --
   not a drop-in swap like the others), filed as #2312; and `builtin_keys`
-  never collapses duplicate keys in *either* mode (it has no
+  used to never collapse duplicate keys in *either* mode (it had no
   `S: EvalSemantics` parameter to derive `S::COLLAPSE_DUPLICATE_KEYS` from,
-  unlike `eval_generic.rs`'s own `Keys`/`KeysUnsorted` arms), filed as
-  #2313.
+  unlike `eval_generic.rs`'s own `Keys`/`KeysUnsorted` arms) -- filed as
+  #2313 and fixed there, by adding that parameter and its one call site's
+  turbofish. `eval.rs`'s copy of `keys`/`keys_unsorted` now agrees with
+  `eval_generic.rs`'s on this shape in both modes.
 
   Writing that parity test also surfaced a further, unrelated, **live and
   CLI-reachable** bug shared by *both* evaluators: `{"a":1,} | length` in jq
