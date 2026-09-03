@@ -318,6 +318,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-serializes an already-materialized `OwnedValue` first) — both are library-API-only
   completeness fixes, pinned by direct unit tests calling the function itself.
 
+  **Code review on this same fix (#2276) found the CLI fix above was reachable only through a
+  filter that forces the DOM path (`.[0]`), not `--slurp`'s/`--inplace`'s own M2 streaming fast
+  path for a plain identity/M2-streamable filter** — which parses via `YamlIndex`/
+  `mark_json_sourced` instead (JSON is a syntactic subset of YAML's flow grammar), bypassing
+  `to_owned_canonicalizing_numbers_at_depth` and its new checks entirely, since that grammar
+  legitimately allows a trailing `,`. For `--inplace` this was silent data loss, not just wrong
+  output: `printf '[1,]' > f.json && succinctly yq -i --input-format json '.' f.json` rewrote
+  the file to `- 1` at exit 0, where real yq refuses and leaves it byte-for-byte untouched.
+  Fixed conservatively (declining M2 for JSON-sourced input, matching the exact run-wide
+  `any_input_is_json` gate #978 originally introduced and #996 later removed for a different
+  reason) rather than by extending `YamlCursor`'s own comma-validation, which would need much
+  broader new test coverage to be confident is airtight — both `--slurp`'s and `--inplace`'s
+  own `else` arm already correctly reject the same input via this same fixed materializer, so
+  no further changes were needed there. Known cost: `--slurp`/`--inplace` with well-formed,
+  *duplicate-keyed* JSON input collapses those duplicates again (the exact #996 regression this
+  same gate caused before #996 fixed it at the source for the plain stdout M2 path, left
+  untouched here) — accepted deliberately, and already tracked as a known DOM-path limitation
+  (#1343). The plain stdout M2 path (no `--slurp`/`--inplace`) has the identical underlying
+  validation gap but was left alone: its own fallback (`evaluate_yaml_direct_filtered`) shares
+  the same gap, so declining that fast path would cost performance with no correctness gain —
+  a real, broader, non-destructive sibling issue, tracked separately rather than folded in here.
+
 - **`del(EXPR | .)` -- a `del()` path whose *last* component is a bare `.` reached after
   navigating through a real `Field`/`Index`/`Iterate` step -- nulled the targeted slot in place
   instead of removing it from its parent container** (#2256), diverging from both real jq and

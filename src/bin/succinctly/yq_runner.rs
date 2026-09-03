@@ -4083,6 +4083,73 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // input at all: it now gets *both* correct numbers and duplicate-key
     // preservation, matching real yq on both counts.
     let is_m2_streamable = can_use_m2_streaming(&program.expr);
+    // #2276 code review (found live against this exact binary, on top of
+    // #2262): `any_input_is_json` -- the same run-wide boolean #978
+    // introduced and #996 later removed from `is_m2_streamable` above --
+    // is reintroduced here, narrower this time: it gates only
+    // `can_inplace_json_fast_path`/`can_inplace_yaml_fast_path` and
+    // `can_slurp_fast_path` below, not `is_m2_streamable` itself (so the
+    // plain stdout M2 path, `can_json_fast_path`/`can_yaml_fast_path`, is
+    // untouched -- see why below).
+    //
+    // Neither M2 fast-path streamer (nor `YamlIndex`'s underlying
+    // flow-sequence/flow-mapping grammar, which legitimately allows a
+    // trailing `,` -- unlike JSON's) validates for a malformed stray/
+    // trailing `,` the way `#2262`'s now-fixed
+    // `to_owned_canonicalizing_numbers_at_depth` (the `--slurp`/
+    // `--eval-all`/`--inplace` DOM bridge) does. Confirmed live before
+    // this fix, both destructive and non-destructive:
+    // ```console
+    // $ printf '[1,]' > f.json && succinctly yq -i --input-format json '.' f.json; cat f.json
+    // - 1                                              # WRONG -- file rewritten with a "healed" value
+    // $ echo '[1,]' | succinctly yq --slurp --input-format json -o json '.'
+    // [[1]]                                             # WRONG -- exit 0, no error
+    // ```
+    // real yq (`-i`) refuses and leaves the file byte-for-byte untouched;
+    // `eval-all -p json` similarly rejects the array case outright.
+    //
+    // `#2262`'s own fix reaches only the *DOM* bridge
+    // (`to_owned_canonicalizing_numbers_at_depth`) -- reached by
+    // `--slurp`/`--inplace` only when `can_slurp_fast_path`/
+    // `can_inplace_fast_path` is `false`, confirmed live: declining the
+    // fast path for `--inplace` already routes through `parse_input`
+    // (this same function) via the `else` arm a few hundred lines below,
+    // and `--slurp`'s own `else` arm does too -- both correctly reject a
+    // malformed document today when forced onto that arm by a
+    // non-M2-streamable filter (`. + []`, `.[0]`). Declining the *fast*
+    // path specifically for JSON-sourced input therefore closes this gap
+    // completely for both, with no further changes needed to either
+    // `else` arm.
+    //
+    // The plain stdout path (`can_json_fast_path`/`can_yaml_fast_path`)
+    // is deliberately NOT gated by this: its own `else` arm is
+    // `evaluate_yaml_direct_filtered` (`#1398`'s cursor-native evaluator,
+    // used for every ordinary `succinctly yq --input-format json` filter
+    // regardless of M2 eligibility, not just non-m2-streamable ones) --
+    // which routes JSON through the identical `YamlIndex`/
+    // `mark_json_sourced` flow-grammar path and has the *same* gap
+    // (confirmed live: `succinctly yq --input-format json -o json '.[0]'`
+    // on `[1,]` also wrongly returns `1` at exit 0, with no `--slurp`/
+    // `--inplace` involved at all). Declining `can_json_fast_path`/
+    // `can_yaml_fast_path` here would cost M2's performance for JSON
+    // input with zero correctness gain, since the fallback shares the
+    // identical validation gap -- a real, pre-existing issue, broader
+    // than and independent of `#2276`'s `--slurp`/`--inplace` finding,
+    // filed separately rather than folded in here.
+    //
+    // Conservative for a mixed-format multi-file `--inplace`/`--slurp`
+    // invocation, same trade-off #978's original version accepted: this
+    // disables the relevant fast path for *every* source in the run, not
+    // just the JSON one(s), since `can_inplace_fast_path`/
+    // `can_slurp_fast_path` are single, run-wide booleans with no
+    // per-file M2-vs-DOM switch to hook into instead.
+    let any_input_is_json = if input_files.is_empty() {
+        resolve_input_format(args.input_format, None) == InputFormat::Json
+    } else {
+        input_files.iter().any(|f| {
+            resolve_input_format(args.input_format, Some(Path::new(f))) == InputFormat::Json
+        })
+    };
     // pretty_print isn't implemented by the cursor streamers, so it still
     // falls back to the DOM path, unchanged, rather than silently ignoring
     // the flag the way compact mode already does today. `sort_keys` and
@@ -4187,7 +4254,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // disk, but no longer forces a fallback to the duplicate-key-collapsing
     // DOM path either.
     // Shares `can_json_fast_path`'s `can_stream_json_output_style` above.
+    //
+    // `!any_input_is_json` (#2276, see its own doc comment above): unlike
+    // `can_json_fast_path`/`can_yaml_fast_path`, this gate's `else` arm is
+    // `parse_input` -- the DOM bridge #2262 fixed -- so declining it for
+    // JSON-sourced input actually closes the comma-gap validation hole
+    // rather than just moving it to an equally-unvalidated fallback.
     let can_inplace_json_fast_path = is_m2_streamable
+        && !any_input_is_json
         && can_stream_json_output_style
         && output_config.output_format == OutputFormat::Json
         && !args.null_input
@@ -4196,6 +4270,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         && args.front_matter.is_none()
         && context.named.is_empty();
     let can_inplace_yaml_fast_path = is_m2_streamable
+        && !any_input_is_json
         && (output_config.compact || can_stream_pretty_or_colored)
         && output_config.output_format == OutputFormat::Yaml
         && !args.null_input
@@ -4221,7 +4296,13 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // existed, and #1700 then removed the flag from the predicate entirely
     // once the escaping moved to the sink. This route's own `json_ascii!`
     // wrap is on its `stream_json_sequence` call below.
+    //
+    // `!any_input_is_json` (#2276, see `any_input_is_json`'s own doc comment
+    // above): same reasoning as `can_inplace_fast_path`'s identical addition
+    // -- this gate's `else` arm is `parse_input` too, so declining here for
+    // JSON-sourced input actually closes the comma-gap hole.
     let can_slurp_fast_path = is_identity
+        && !any_input_is_json
         && match output_config.output_format {
             OutputFormat::Json => can_stream_json_output_style,
             OutputFormat::Yaml => can_stream_pretty_or_colored,
@@ -5193,12 +5274,15 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             // `Vec` unless their backing bytes/index all outlive that `Vec`.
             let mut parsed_sources: Vec<(Vec<u8>, YamlIndex<Vec<u64>>)> =
                 Vec::with_capacity(input_sources.len());
-            for (bytes, format, _) in input_sources {
-                let mut index = YamlIndex::build(&bytes)
+            for (bytes, _format, _) in input_sources {
+                // #2276: no `mark_json_sourced()` call here anymore --
+                // `can_slurp_fast_path` now requires `!any_input_is_json`
+                // (see its own doc comment), so every source reaching this
+                // branch is genuine YAML; `_format` is unused here for that
+                // reason (still threaded through so the loop's tuple shape
+                // matches `input_sources`'s own type unchanged).
+                let index = YamlIndex::build(&bytes)
                     .map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
-                if format == InputFormat::Json {
-                    index.mark_json_sourced();
-                }
                 parsed_sources.push((bytes, index));
             }
 
@@ -5427,11 +5511,13 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 // directly into this file's buffer, skipping the OwnedValue
                 // DOM (and its IndexMap, which cannot represent duplicate
                 // mapping keys) the same way the stdout M2 path above does.
-                let mut index = YamlIndex::build(&input_bytes)
+                //
+                // #2276: no `mark_json_sourced()` call here anymore --
+                // `can_inplace_fast_path` now requires `!any_input_is_json`
+                // (see its own doc comment), so `format` is never `Json`
+                // for any file reaching this branch.
+                let index = YamlIndex::build(&input_bytes)
                     .map_err(|e| anyhow::anyhow!("YAML parse error in {file_path}: {e}"))?;
-                if format == InputFormat::Json {
-                    index.mark_json_sourced();
-                }
                 let root = index.root(&input_bytes);
 
                 {

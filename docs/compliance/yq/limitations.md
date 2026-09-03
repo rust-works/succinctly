@@ -444,6 +444,63 @@ $ echo '[1,]' | yq -p json '.[0]'
 json: null unexpected end of JSON input                                    # real yq agrees
 ```
 
+**Code review on #2262's own PR found the fix above was reachable only for a filter
+that forces the DOM path — `.[0]` above, matching this issue's own test suite, not the far
+more common plain identity (`.`)** — filed and fixed as
+[#2276](https://github.com/rust-works/succinctly/issues/2276). `--slurp` and `--inplace` each
+have their own M2 streaming fast path for a plain identity (`--slurp`) or M2-streamable
+(`--inplace`) filter that bypasses `to_owned_canonicalizing_numbers_at_depth` entirely,
+parsing via `YamlIndex::build`/`mark_json_sourced` instead (JSON is a syntactic subset of
+YAML's flow grammar, and #996 already routes JSON through it for M2 streaming's own
+duplicate-key/number-formatting reasons) — whose flow-sequence grammar *legitimately* allows
+a trailing `,`, so none of #2262's new checks were ever reached on that route. For
+`--inplace` this is not just wrong output — it is silent, incorrect data loss:
+
+```console
+$ printf '[1,]' > f.json && succinctly yq -i --input-format json '.' f.json; echo $?; cat f.json
+0
+- 1                                                          # WRONG -- file rewritten with a "healed" value
+$ printf '[1,]' > f2.json && yq -i -p json '.' f2.json; echo $?; cat f2.json
+Error: bad file 'f2.json': json: null unexpected end of JSON input
+1
+[1,]                                                         # real yq refuses, file untouched
+```
+
+Fixed conservatively rather than by extending `YamlCursor`'s own `DocumentCursor` trait
+methods to validate commas when JSON-sourced (a more surgical fix that would keep M2's
+performance for this case too, but needs new test coverage across a much larger, shared
+surface — every `YamlCursor` consumer, not just these two gates — to be confident it is
+airtight): `any_input_is_json` (reusing #978's own original run-wide boolean, briefly removed
+by #996 once #996 fixed *its* own reason for needing it) now gates
+`can_inplace_json_fast_path`/`can_inplace_yaml_fast_path` and `can_slurp_fast_path`
+specifically, declining the fast path for JSON-sourced input so both routes fall back to
+their own `else` arm — `parse_input`, i.e. this now-fixed materializer — rather than silently
+accepting a malformed document. Confirmed live that both `else` arms already rejected the
+same input correctly before this fix (reached via a non-M2-streamable filter, `. + []`/
+`.[0]`), so declining the fast path needed no further changes to either fallback.
+
+**Known cost: `--inplace`/`--slurp` with well-formed, duplicate-keyed JSON input now
+collapses those duplicates again** (`{"a":1,"a":2}` → `{"a":2}`), the exact #996 regression
+this same gate caused before #996 fixed it at the source for the *other* three JSON M2 gates
+(`can_json_fast_path`/`can_yaml_fast_path`, the plain stdout path, both left untouched by this
+fix — see below). Accepted deliberately: `--inplace` mutating a file on a false accept is a
+correctness/data-safety concern; a collapsed duplicate key on *well-formed* input is a
+narrower, already-tracked one ([#1343](https://github.com/rust-works/succinctly/issues/1343),
+"the DOM fallback for `--slurp`/`--eval-all`/`--inplace` still collapses duplicate keys for
+both formats" — already true before this fix for any filter forcing that fallback; this fix
+just widens which filters do).
+
+**The plain stdout fast path (`can_json_fast_path`/`can_yaml_fast_path`, no `--slurp`/
+`--inplace`) has the identical underlying gap and was deliberately left alone**, confirmed
+live: `succinctly yq --input-format json -o json '.[0]'` on `[1,]` also wrongly returns `1` at
+exit 0, with neither flag involved. Its own `else` arm is not this materializer at all, but
+`evaluate_yaml_direct_filtered` (#1398's cursor-native evaluator, used for *every* ordinary
+`--input-format json` filter regardless of M2 eligibility) — which routes through the same
+`YamlIndex`/`mark_json_sourced` flow-grammar path and shares the identical gap, so declining
+the fast path here would cost M2's performance for JSON input with no correctness gain. This
+is a real, broader, non-destructive sibling gap — tracked as a further follow-up rather than
+folded into #2276.
+
 **A pre-existing divergence this widens by one case, not a new one.** Real yq's own
 `-p json`/`eval-all -p json --input-format json` path (confirmed live against v4.53.3) is far
 more lenient about a comma or colon inside a JSON *object* than #1975's own delimiter checks

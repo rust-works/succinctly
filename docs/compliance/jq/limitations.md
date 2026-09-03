@@ -1279,13 +1279,39 @@ practice #2243's own issue text cites for not folding into #2211):
   `to_owned_cursor_at_depth` at all, so this fix does not reach jq's most
   common query idioms; only the non-cursor-transparent shape #2243's own
   repro uses (`if`/arithmetic/function calls) is covered.
-- **#2262**: three sibling materializers -- `eval.rs`'s own `to_owned_at_depth`
-  (behind this crate's documented public `eval()` API), `eval_generic.rs`'s
-  own cursor-less `to_owned_at_depth`, and `yq_runner.rs`'s
-  `to_owned_canonicalizing_numbers_at_depth` (behind `succinctly yq --slurp`/
-  `--eval-all`/`--inplace --input-format json`, live and CLI-reachable) --
-  still lack #2211's and #2243's checks the same way #1975 found they lacked
-  #1677's.
+- **#2262 (fixed)**: the three sibling materializers named above --
+  `eval.rs`'s own `to_owned_at_depth` (behind this crate's documented public
+  `eval()` API), `eval_generic.rs`'s own cursor-less `to_owned_at_depth`, and
+  `yq_runner.rs`'s `to_owned_canonicalizing_numbers_at_depth` (behind
+  `succinctly yq --slurp`/`--eval-all`/`--inplace --input-format json`) --
+  now all share #2243's `DocumentCursor::trailing_element_gap_ok` (moved to
+  `document.rs` as `pub` for this) via the same "retain the last real
+  child's own cursor, check it after the loop" shape #2211/#2243 already
+  established, closing the trailing-comma case (`[1,]`, `{"a":1,}`) for all
+  three. #2211's `container_gap_ok` (`[,]`, `{,}`) remains open in all
+  three, and is expected to stay that way: unlike `to_owned_cursor_at_depth`,
+  none of the three is ever given a cursor for the *container itself* --
+  only a bare `value`, so once a container's child walk is exhausted there
+  is nothing left to find its opening bracket from. `eval.rs`'s and
+  `eval_generic.rs`'s cursor-less `to_owned_at_depth` are both library-API-
+  only (not reachable through the shipped CLI with raw untrusted text);
+  `yq_runner.rs`'s was live and CLI-reachable, and review of its own fix
+  (filed as #2276) found the *fast-path* routes `--slurp`/`--inplace` each
+  have for a plain identity/M2-streamable filter bypass this materializer
+  entirely (they parse via `YamlIndex`/`mark_json_sourced` instead, whose
+  flow-sequence grammar legitimately allows a trailing `,`) -- confirmed
+  live as a real, `--inplace`-destructive gap (`succinctly yq -i '.'` on
+  `[1,]` rewrote the file instead of refusing), closed by declining those
+  two fast paths entirely for JSON-sourced input (`any_input_is_json` in
+  `yq_runner.rs`), since their own `else` arm already routes back through
+  this now-fixed materializer. The *plain* stdout fast path
+  (`can_json_fast_path`/`can_yaml_fast_path`) has the identical underlying
+  gap but was left alone: its own `else` arm is `evaluate_yaml_direct_filtered`
+  (#1398's cursor-native evaluator, used for *every* ordinary
+  `--input-format json` filter, not just fast-path-eligible ones), which
+  shares the same validation hole, so declining the fast path there would
+  cost M2's performance with no correctness gain -- tracked as a further,
+  broader follow-up rather than folded into #2276.
 - **#2263**: `jq_runner.rs` still carries its own independent, hand-copied
   `trailing_gap_ok`/`scalar_end_pos` pair rather than the new trait methods --
   a cleanup, not a behavior gap, but the same "duplicated predicates diverge
