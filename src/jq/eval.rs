@@ -4738,6 +4738,48 @@ fn take_stopping_items_to_result<W: Clone + AsRef<[u64]>>(
     }
 }
 
+/// Shared resolution of [`builtin_upper_in`]'s and [`any_all_gen_cond`]'s
+/// identical count-of-matches shape into a [`QueryResult`] (#2204),
+/// mirroring [`take_stopping_items_to_result`]'s own precedent just above
+/// for the identical duplication risk ("so their call sites cannot drift
+/// on the dropped-versus-raised trailing-control rule").
+///
+/// `count` decisive elements (each already a genuine match) become
+/// `true_val` repeated; on `Flow::Exhausted`, one more `false_val` (the
+/// "no match found" identity element) is appended to however many `count`
+/// already produced -- a `?//` chain can make an earlier alternative's
+/// match and the final alternative's own exhaustion coexist in the same
+/// output (`IN`'s and `any`/`all`'s own doc comments each give a
+/// live-confirmed example). `Flow::Stopped { .. }` answers with `count`
+/// alone, no identity element appended -- a sink that stopped early
+/// already found its decisive answer. `Flow::Escaped` keeps `count`'s
+/// answers as a `Partial` prefix ahead of the raised control (via
+/// [`partial`], which itself collapses to a bare error/break/halt when
+/// `count` is zero).
+///
+/// Callers whose sink can escape through an *out-of-band* channel (not
+/// `Flow` itself -- `any_all_gen_cond`'s own `probe_escape`, set when
+/// `cond` itself raises rather than `gen`) fold that into `flow` before
+/// calling this: `Flow::Stopped { .. }` paired with a real out-of-band
+/// escape becomes `Flow::Escaped` first, so this function only ever needs
+/// to reason about one escape channel, not two.
+fn counted_bool_flow_to_result<'a, W: Clone + AsRef<[u64]>>(
+    count: usize,
+    true_val: bool,
+    false_val: bool,
+    flow: Flow,
+) -> QueryResult<'a, W> {
+    let mut out = vec![OwnedValue::Bool(true_val); count];
+    match flow {
+        Flow::Exhausted => {
+            out.push(OwnedValue::Bool(false_val));
+            owned_vec_to_result(out)
+        }
+        Flow::Stopped { .. } => owned_vec_to_result(out),
+        Flow::Escaped(control) => partial(out, control),
+    }
+}
+
 /// Pull at most `n` outputs, then stop the generator — jq's `limit`.
 ///
 /// Returns the items alongside the terminating [`Flow`], because `limit`'s
@@ -7522,23 +7564,11 @@ fn builtin_upper_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Demand::Continue
         }
     });
-    let mut out = vec![OwnedValue::Bool(true); found];
-    match flow {
-        Flow::Exhausted => {
-            out.push(OwnedValue::Bool(false));
-            owned_vec_to_result(out)
-        }
-        // Non-empty by construction: this sink only stops on a match. See
-        // `any_all_gen_cond`'s equivalent arm.
-        Flow::Stopped { .. } => owned_vec_to_result(out),
-        Flow::Escaped(control) => {
-            if out.is_empty() {
-                control_to_result(control)
-            } else {
-                QueryResult::Partial(out, control)
-            }
-        }
-    }
+    // #2204: shared with `any_all_gen_cond`'s identical shape via
+    // `counted_bool_flow_to_result` -- this sink has no out-of-band escape
+    // channel of its own (`owned_value_eq` never errors), so `flow` is
+    // passed through unchanged.
+    counted_bool_flow_to_result(found, true, false, flow)
 }
 
 /// Builtin: `IN(src; s)` - true if any output of `src` equals any output of
@@ -8217,40 +8247,38 @@ fn any_all_gen_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         },
     );
 
-    let mut out = vec![OwnedValue::Bool(target_truthy); matches];
-    match flow {
-        // `gen` exhausted: the identity element (`false` for `any`, `true` for
-        // `all`) is appended to however many decisive answers already fired.
-        // Normally `matches` is 0 here and this is the sole answer; a `?//`
-        // chain whose last alternative runs dry after an earlier one decided
-        // yields both (`[any([1] as [$x] ?// $x | ($x == 1); .)]` is
-        // `[true,false]`, confirmed live against jq 1.7.1).
-        //
-        // A stale `probe_escape` from an earlier, retried-past attempt is
-        // deliberately not consulted here: reaching `Exhausted` at all means
-        // the *terminal* attempt ran clean to completion, so whatever an
-        // earlier attempt's `cond` did is moot -- jq itself never surfaces
-        // it either.
-        Flow::Exhausted => {
-            out.push(OwnedValue::Bool(!target_truthy));
-            owned_vec_to_result(out)
-        }
-        // #1519: `probe_escape` is consulted here, and only here -- not
-        // unconditionally before this match, which is what let a stale
-        // escape from an already-retried-past attempt outrun a later
-        // attempt's real answer (see this function's own doc comment above).
-        // By construction the sink's own last call before this `Stopped`
-        // either bumped `matches` and cleared `probe_escape`, or set
-        // `probe_escape` and nothing else -- so whichever is set here
-        // reflects only the terminal attempt, never an earlier one.
-        Flow::Stopped { .. } => match probe_escape {
-            Some(control) => partial(out, control),
-            None => owned_vec_to_result(out),
-        },
-        // No earlier output matched, so `gen`'s own terminator is the only
-        // verdict left -- oracle-verified: `IN(3, error("boom"))` on `2` raises.
-        Flow::Escaped(control) => partial(out, control),
-    }
+    // #1519: `probe_escape` is folded into `flow` here, and only here --
+    // not consulted unconditionally, which is what let a stale escape from
+    // an already-retried-past attempt outrun a later attempt's real answer
+    // (a `?//` chain can carry this sink through several attempts). By
+    // construction the sink's own last call before a `Stopped` either
+    // bumped `matches` and cleared `probe_escape`, or set `probe_escape`
+    // and nothing else -- so whichever is set here reflects only the
+    // terminal attempt, never an earlier one. `Exhausted` deliberately
+    // does *not* fold `probe_escape` in: reaching it at all means the
+    // *terminal* attempt ran clean to completion, so whatever an earlier
+    // attempt's `cond` did is moot -- jq itself never surfaces it either.
+    //
+    // #2204: this fold is what lets `any_all_gen_cond` share
+    // `counted_bool_flow_to_result` with `builtin_upper_in`'s identical
+    // count-of-matches shape despite having a second, out-of-band escape
+    // channel (`cond`'s own errors) that `IN(s)`'s sink structurally
+    // cannot produce -- folding it into `Flow::Escaped` first means the
+    // shared function only ever has to reason about one escape channel.
+    let effective_flow = match (flow, probe_escape) {
+        (Flow::Stopped { .. }, Some(control)) => Flow::Escaped(control),
+        (flow, _) => flow,
+    };
+    // `gen` exhausted with no fold above: the identity element (`false`
+    // for `any`, `true` for `all`) is appended to however many decisive
+    // answers already fired. Normally `matches` is 0 here and this is the
+    // sole answer; a `?//` chain whose last alternative runs dry after an
+    // earlier one decided yields both (`[any([1] as [$x] ?// $x | ($x ==
+    // 1); .)]` is `[true,false]`, confirmed live against jq 1.7.1). No
+    // earlier `gen` output matched on `Escaped`, so `gen`'s own terminator
+    // is the only verdict left -- oracle-verified: `IN(3, error("boom"))`
+    // on `2` raises.
+    counted_bool_flow_to_result(matches, target_truthy, !target_truthy, effective_flow)
 }
 
 /// Builtin: `any(gen; cond)` - true if cond is truthy for any output of gen.
