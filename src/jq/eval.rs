@@ -12643,11 +12643,14 @@ fn builtin_implode<W: Clone + AsRef<[u64]>>(
             QueryResult::Owned(OwnedValue::String(result))
         }
         // #2196: `scalar_fallback`, mirroring this function's own
-        // element-level arms above (#1989) -- an undecodable top-level
-        // string wasn't reachable when this arm was last touched (there
-        // was no #1755 precedent yet to apply), but a future caller
-        // shouldn't have to rediscover that this arm needs the same
-        // decode-failure-before-`optional` discipline.
+        // element-level arms above (#1989) -- a real behavior change, not
+        // a no-op: an undecodable top-level string used to be silently
+        // suppressed under `optional` (the pre-#1989 `_ if optional =>
+        // None` shape this arm still had), and now raises unconditionally
+        // instead, the same "decode failure bypasses optional" rule
+        // #1755/#1972/#1989 already established at every other site in
+        // this file. Pinned by
+        // `test_implode_raises_on_top_level_decode_failure_2196`.
         _ => scalar_fallback(&value, optional, || {
             EvalError::new("implode input must be an array")
         }),
@@ -40649,10 +40652,15 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // #2196: `stream_outputs_checked`, not the bare unchecked twin -- the
     // last document-value-fed `stream_outputs` call site in this file left
     // over after #1989 converted `fanout_two_args`'s two and
-    // `fanout_regex_pattern_with_collected_flags`'s one. `range_num` below
-    // classifies `n_values` by variant and reports a fixed, content-free
-    // error either way today, but this closes the shape for consistency
-    // before a future change to that message could turn it into a live gap.
+    // `fanout_regex_pattern_with_collected_flags`'s one. A real behavior
+    // change, not a no-op: when *collection* itself succeeds, `range_num`
+    // below still classifies `n_values` by variant and reports the same
+    // fixed, content-free "not numeric" error either way -- but an
+    // undecodable `n_expr` output now surfaces via `trailing` below,
+    // unconditionally, before `range_num` (or `optional`) ever runs, where
+    // it used to be silently lossy-substituted and only then reach
+    // `range_num`'s ordinary, `optional`-suppressible type error. Pinned by
+    // `test_builtin_combinations_n_raises_on_undecodable_n_expr_2196`.
     let (n_values, trailing) =
         stream_outputs_checked(eval_single::<W, S>(n_expr, value.clone(), optional));
 
@@ -41320,7 +41328,7 @@ fn builtin_nth_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
 
             // Same sink as `eval_nth_expr`, differing only in always materializing
-            // its answer (#820). #1972: `into_owned_checked`, not `into_owned` --
+            // its answer (#820). #1972: `into_owned`, not `into_owned_lossy` --
             // an undecodable borrowed output must raise `decode_failure`, not
             // silently materialize as "" the way a bare `nth(n; g)` used to
             // (confirmed live: `eval_nth_expr`'s own `Expr::NthExpr` sibling
@@ -46586,6 +46594,35 @@ mod tests {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let n_expr = Expr::Literal(Literal::Int(1));
+        for optional in [true, false] {
+            match builtin_combinations_n::<Vec<u64>, JqSemantics>(&n_expr, cursor.value(), optional)
+            {
+                QueryResult::Error(e) => {
+                    assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                }
+                other => panic!(
+                    "expected a decode failure regardless of optional={optional}, got: {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// #2196 review: `builtin_combinations_n`'s switch from unchecked
+    /// `stream_outputs` to `stream_outputs_checked` (closing this file's
+    /// last document-value-fed unchecked call site) means an undecodable
+    /// `n_expr` output -- not just a structurally malformed *document*, the
+    /// shape the test above covers -- now raises too, unconditionally, the
+    /// same "decode failure bypasses optional" rule this file's other
+    /// `stream_outputs_checked` sites already follow. `n_expr` evaluates to
+    /// a plain undecodable string, so `range_num` (which would otherwise
+    /// classify it as a content-free "not numeric" type error, suppressible
+    /// under `optional`) never gets the chance to run at all.
+    #[test]
+    fn test_builtin_combinations_n_raises_on_undecodable_n_expr_2196() {
+        let json_bytes: &[u8] = b"{\"a\": \"\xff\xfe\"}";
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let n_expr = parse(".a").unwrap();
         for optional in [true, false] {
             match builtin_combinations_n::<Vec<u64>, JqSemantics>(&n_expr, cursor.value(), optional)
             {
@@ -78726,5 +78763,37 @@ mod tests {
             "implode",
             QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(&*s, "Hi")
         );
+    }
+
+    /// #2196 review: `builtin_implode`'s top-level non-array arm switching
+    /// to `scalar_fallback` is a genuine behavior change for an undecodable
+    /// top-level *string*, not the no-op an earlier draft of this fix
+    /// claimed -- `scalar_decode_failure` now fires before `optional` is
+    /// ever consulted, so `implode?` on an undecodable string now raises
+    /// `decode_failure` unconditionally, where it used to silently answer
+    /// `QueryResult::None` (the pre-#1989 shape this arm still had). Same
+    /// "decode failure bypasses optional" rule as
+    /// `test_implode_raises_on_element_decode_failure_1989` above, just at
+    /// the top level instead of per-element.
+    #[test]
+    fn test_implode_raises_on_top_level_decode_failure_2196() {
+        query!(
+            &b"\"\xff\xfe\""[..],
+            "implode",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        query!(
+            &b"\"\xff\xfe\""[..],
+            "(implode)?",
+            QueryResult::Error(e) if e.is_decode_failure() => {}
+        );
+        // Positive control: an ordinary non-array, non-string top-level
+        // value still reports the plain (suppressible) type error.
+        query!(
+            br"5",
+            "implode",
+            QueryResult::Error(e) => assert!(!e.is_decode_failure(), "{}", e.message)
+        );
+        query!(br"5", "(implode)?", QueryResult::None => {});
     }
 }
