@@ -1174,6 +1174,43 @@ fn test_parity_has_native_arm_1739() {
     assert_parity(br#"{"a":1,"b":2}"#, r#"[has(("a","z"))]"#);
 }
 
+/// #2293: `eval.rs`'s `has_one_key`/`builtin_length`/`builtin_keys` had the
+/// same missing #1677/#2261 trailing-comma/malformed-member gap checks that
+/// `eval_generic.rs`'s own siblings already closed (#2291) -- unreachable
+/// from either shipped CLI today (both route through `eval_generic.rs`
+/// exclusively, and `succinctly yq`'s `eval.rs` call site only ever
+/// re-serializes an already-validated `OwnedValue`), but a real gap for a
+/// library consumer of `jq::eval*` building a cursor directly from raw,
+/// unvalidated bytes -- exactly what `full_outputs`/`assert_error_parity`
+/// do here, bypassing the CLI's own upfront checks entirely. Every input
+/// mirrors an existing `eval_generic.rs`-side CLI repro (`jq_cli_tests.rs`'s
+/// `test_jq_cursor_transparent_fast_paths_reject_trailing_comma_2261`/
+/// `test_jq_len_checked_sibling_paths_reject_trailing_comma_2261`), so both
+/// evaluators must now raise with the same message.
+///
+/// Deliberately excludes `{"a":1,} | length` (jq mode, `collapse: true`):
+/// found live while writing this test that `effective_len_checked`'s
+/// `census` path never calls `trailing_gap_ok` at all, so *both*
+/// evaluators already agree today -- on the wrong answer (`1`, not a
+/// raise; confirmed against `/usr/bin/jq` 1.7.1, which raises `Expected
+/// another key-value pair`). That's a real, live, CLI-reachable bug in
+/// the shared `document.rs` helper both evaluators call, not an eval.rs/
+/// eval_generic.rs parity drift -- out of this fix's scope; filed as
+/// #2307.
+#[test]
+fn test_parity_eval_rs_trailing_comma_sibling_gaps_2293() {
+    for (json, filter) in [
+        (br"[1,]".as_slice(), "length"),
+        (br"[1,2,3,]", "length"),
+        (br"[1,2,3,]", "keys"),
+        (br"[1,2,3,]", "keys_unsorted"),
+        (br"[1,2,3,]", "has(0)"),
+        (br#"{"a":1,}"#, r#"has("a")"#),
+    ] {
+        assert_error_parity(json, filter);
+    }
+}
+
 /// `assert_parity` compares only *successful* outputs: `collect_owned`'s
 /// `Error(_) => vec![]` arm swallows the error, so two evaluators that raise
 /// different messages -- or one that raises where the other doesn't -- both
