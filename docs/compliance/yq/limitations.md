@@ -1937,18 +1937,56 @@ all (`{"x":null} | delpaths([["x",2]])` stays `{"x":null}` -- this rule is speci
 such rule exists there at all: `null | del(.[2])` stays `null`, `null | del(.[])` still
 raises "Cannot iterate over null").
 
-**Also extended to `del()`'s comma-grouped form.** `delete_trie_array`'s own null-skip
-branch shares the identical vivify rule (`delete_trie_object`'s sibling branch does not —
-`Field` steps never vivify, per the scope above): confirmed live,
-`{"x":null,"y":1} | del(.x[2], .y)` is `{"x":[null,null]}`, with `.y` still deleting
-independently either way. Vivifying is safe even when the only array-level step is a
-`Slice` (no `Index` at all) — a slice range against a freshly empty array is itself a
-harmless no-op, so there was no need to distinguish which step kind triggered the vivify.
-One surprising, *already-correct, pre-existing and unrelated* behavior worth flagging so
-a future reader doesn't mistake it for this fix's own doing:
-`{"x":null,"y":1} | del(.x[0:2], .y)` is `{}` in real yq — not just `x` cleared, `y` gone
-too — reproduced identically by `succinctly yq` both before and after this fix, via the
-pre-existing #1116/#1219 chained-slice-parent-drop rule elsewhere in this same trie walk.
+**Vivify eligibility tracks provenance, not just "is `root` currently `null`."** A `null`
+reached by *tolerating* a `Field`/`Slice` step against it (#476/#527's own established
+exemption) is not vivify-eligible for whatever comes after, even when it sits in an
+otherwise-real slot -- confirmed live, `{"x":null} | del(.x[2])` (Field *found* the real
+key `"x"`) vivifies, but `[1,2] | del(.[5].missing[2])` (`.[5]` itself is a real
+#2314-padded slot, but `.missing` only *tolerates* that slot's `null` rather than finding
+a real key on it) does not: `[1,2,null,null,null,null]`, not
+`[...,[null,null]]`. Both `delete_at_path` and `delete_path_steps` thread an extra
+`real_slot: bool` parameter through every recursive call to track this -- `true` from the
+document root or any real navigation (a found object key, an in-range or #2314-padded
+array element), flipped to `false` by a `Field`/`Slice` step's own null-tolerant arm, and
+never flipped back except by this fix's own vivify. `delete_at_path_through_absent`'s own
+synthetic scratch value is a related but separate case: its whole contract is "the
+container is untouched" (a missing field never materializes), so it now hardcodes both
+`yq_mode` and `real_slot` to `false` for its own recursive walk, matching
+`delete_trie_through_absent`'s already-established pattern -- confirmed live,
+`{} | del(.missing[-1])` stays `{}`, not the out-of-range error a wrongly-vivified scratch
+would raise.
+
+**Also extended to `del()`'s comma-grouped form**, with one additional gate.
+`delete_trie_array`'s own null-skip branch shares the same vivify rule
+(`delete_trie_object`'s sibling branch does not — `Field` steps never vivify, per the
+scope above): confirmed live, `{"x":null,"y":1} | del(.x[2], .y)` is
+`{"x":[null,null]}`, with `.y` still deleting independently either way. Vivifying is safe
+even when the only array-level step is a `Slice` (no `Index` at all) — a slice range
+against a freshly empty array is itself a harmless no-op — or when one terminal index
+shares a node with one *continuation* (`null | del(.[2], .[3].a)` is
+`[null,null,null]`, order-independent, confirmed live both ways). One surprising,
+*already-correct, pre-existing and unrelated* behavior worth flagging so a future reader
+doesn't mistake it for this fix's own doing: `{"x":null,"y":1} | del(.x[0:2], .y)` is
+`{}` in real yq — not just `x` cleared, `y` gone too — reproduced identically by
+`succinctly yq` both before and after this fix, via the pre-existing #1116/#1219
+chained-slice-parent-drop rule elsewhere in this same trie walk.
+
+**Gated off when 2+ *terminal* indices share one node.** `delete_keys`'s own #2305/#2306
+gate only extends a single-key batch — real yq's own multi-key extension is
+order-*dependent* (confirmed live: `null | del(.[2],.[3])` and `null | del(.[3],.[2])`
+both give `[null,null]` here, but #2306's own filed example, a mixed in-range/out-of-range
+batch, does differ by order — a materially larger, already-deferred piece of work).
+Vivifying `delete_trie_array`'s source unconditionally regardless of this gate would trade
+one wrong answer (staying `null`, the pre-existing gap) for a *different* wrong one (`[]`,
+since `delete_keys` still refuses the 2+-key batch, just now against an already-empty
+array) rather than reproducing real yq's actual multi-key answer — a new, previously
+uncharacterized divergence shape this fix should not introduce. `terminal_index_count =
+node.indices.len() - node.index_groups.len()` (total array-level steps at this node minus
+the ones that have their own children, i.e. continuations) distinguishes this from the
+mixed terminal+continuation case above, which is a different shape and already correct:
+vivify only fires when `terminal_index_count <= 1`. Confirmed live both orderings give the
+same (still-`null`, not-yet-fixed) answer, so this gate doesn't itself introduce any new
+order-dependence of its own.
 
 This fix does not reach the comma-grouped **`.[]` fan-out** gap #2324 tracks separately —
 that one fails earlier, in the read-based validation that builds the trie in the first
