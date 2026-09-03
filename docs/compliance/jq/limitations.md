@@ -1421,17 +1421,47 @@ duplicate-key rows in [tests/jq_cli_tests.rs](../../../tests/jq_cli_tests.rs).
 
 The bare-`keys`/`keys_unsorted` materializer (`document.rs::effective_keys`,
 which already walks `DistinctKeyCursors` for an unrelated reason -- decoding
-every key's display spelling) and three CLI-level writers each needed their
-own one-line addition once `DistinctKeyCursors::trailing_gap_ok` existed:
-`stream_lazy_keys_json` (`src/jq/stream.rs`, the M2 streaming writer for
-`keys_unsorted[]`-shaped queries with a further pipe stage `stream_json`
-can inline), `bail_if_keys_malformed` (`jq_runner.rs`, the CLI's own
-`JqValue::LazyKeysArray` writer behind a *bare* `keys_unsorted`), and
-`eval_generic.rs`'s own `walk_distinct_keys_checked`/`Expr::Builtin(Builtin::Last)`
-arm (covering `keys_unsorted[]`/`keys_unsorted[-1]` and `keys_unsorted |
-last` respectively, reached through `eval_single`'s eager path since
-`keys_unsorted` alone is not one of `jq_runner.rs`'s own
-`expr_is_cursor_transparent` shapes).
+every key's display spelling) and several call sites each needed their own
+one-line addition once `DistinctKeyCursors::trailing_gap_ok` existed:
+`bail_if_keys_malformed` (`jq_runner.rs`, the CLI's own `JqValue::LazyKeysArray`
+writer behind a *bare* `keys_unsorted`), `eval_generic.rs`'s own
+`walk_distinct_keys_checked`/`Expr::Builtin(Builtin::Last)` arm (covering
+`keys_unsorted[]`/`keys_unsorted[-1]` and `keys_unsorted | last` respectively,
+reached through `eval_single`'s eager path since `keys_unsorted` alone is not
+one of `jq_runner.rs`'s own `expr_is_cursor_transparent` shapes), and
+`each_lazy_keys_iterate_sink`'s own `!sorted` branch (the demand-aware sink,
+reached once a pipe's *first* stage already descends off the root --
+`.x | keys_unsorted[]`, where `.x`'s own `Expr::Field` shape is one of
+`expr_descends`'s matched cases, so `expr_is_cursor_transparent` admits
+everything after it unconditionally, taking the M2/`eval_each_with_cursor`
+route instead of the eager one).
+
+`stream_lazy_keys_json` (`src/jq/stream.rs`) also received the same
+one-line addition, but **turns out not to be reachable from either shipped
+CLI today, the identical shape `test_stream_lazy_keys_honors_collapse_1514`'s
+own review already established for this exact function**: `succinctly jq`
+excludes bare `Builtin::KeysUnsorted` from its own M2 *output* gate
+unconditionally (`m2_json_fallback_safe`, `jq_runner.rs` -- a *different*
+gate from `expr_is_cursor_transparent` above, which only controls eager-vs-
+demand-aware *evaluation*, not which writer prints the result), regardless of
+AST shape, so this function is never invoked from `succinctly jq` at all.
+`succinctly yq --input-format json` has no such exclusion and does reach
+this function, but only with YAML-sourced `fields` (JSON parses through
+`YamlIndex` there, per #1975/#2262's own account), whose `trailing_gap_ok`
+always answers `true` by design (YAML's flow-mapping grammar legitimately
+allows a trailing `,`) -- so a genuinely JSON-sourced `fields` never reaches
+this function from either CLI as things stand today. A first draft of this
+fix's own test suite wrongly attributed a CLI-level test
+(`.x | keys_unsorted[]`) to this function; code review, disabling each
+candidate check in turn and re-running the exact query, found it actually
+exercises `each_lazy_keys_iterate_sink` above instead -- retitled as
+`test_jq_descended_pipe_prefix_reaches_demand_aware_keys_sink_2261` in
+[tests/jq_cli_tests.rs](../../../tests/jq_cli_tests.rs), and
+`stream_lazy_keys_json`'s own fix is pinned instead by two direct unit tests
+in `src/jq/stream.rs` itself (`test_stream_lazy_keys_raises_on_trailing_comma_2261`/
+`test_stream_lazy_keys_wellformed_unaffected_by_trailing_comma_check_2261`),
+calling the function the same way `test_stream_lazy_keys_honors_collapse_1514`
+already does.
 
 **Bare `.a`/`.nonexistent` field access (`JsonFields::find_cursor`,
 `src/json/light.rs`).** This issue's own text characterized this as a
