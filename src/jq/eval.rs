@@ -30666,11 +30666,13 @@ fn accumulate_path_context_step<'a, W: Clone + AsRef<[u64]>>(
 ///
 /// **#2302: an uncatchable-at-value-position error (#2254) is never
 /// swallowed by `optional`, in either the bare-`Error` or `Partial` shape**
-/// -- checked before the table below runs, by recursing once with
-/// `optional` forced to `false` (still respecting `atomic`'s own
-/// discard-prefix-or-keep-it distinction). PR #2300's review found this
-/// function had no such carve-out at all, unlike every other
-/// `optional`-consulting site since #2270/#2289/#2292 -- inert today for
+/// -- each arm gates on `optional && !e.is_uncatchable_at_value_position()`
+/// instead of bare `optional` (still respecting `atomic`'s own
+/// discard-prefix-or-keep-it distinction), matching this file's own
+/// identical guard elsewhere and `eval_try`'s own uncatchable arms above.
+/// PR #2300's review found this function had no such carve-out at all,
+/// unlike every other `optional`-consulting site since #2270/#2289/#2292 --
+/// inert today for
 /// the same reason the paragraph below explains (`optional` is currently
 /// always `false` here), but two of this function's five call sites
 /// (`Expr::Iterate`, `Builtin::Map`) are live on every `.[]`/`map(f)` call,
@@ -30713,38 +30715,25 @@ fn catch_error_under_optional<W>(
     optional: bool,
     atomic: bool,
 ) -> QueryResult<'_, W> {
-    // #2302: an uncatchable-at-value-position error (#2254's decode
-    // failure / yq negative-index raise) must never be silently dropped
-    // by `optional`'s swallow, matching every other optional-consulting
-    // site since #2270/#2289/#2292 -- `eval_try`'s own `is_uncatchable_
-    // at_value_position()` arms (above) are the model this follows: treat
-    // the error as though `optional` were `false`, which still respects
-    // `atomic`'s own discard-prefix-or-keep-it distinction (an atomic
-    // array construction still discards its prefix on an uncatchable
-    // error, exactly as it already does for `(true, false)`'s ordinary
-    // case; a non-atomic generator still keeps and propagates it, exactly
-    // as `(false, false)` already does) by recursing once with `optional`
-    // forced. Single choke point for all five call sites this function
-    // has (`continue_rest_with_context`/`_with_paths`/`_with_fresh_root`'s
-    // own `Partial` arms, `Expr::Iterate`, `Builtin::Map`) rather than
-    // hand-copying the guard into each one.
-    if optional {
-        let uncatchable = match &stopped {
-            QueryResult::Error(e) => e.is_uncatchable_at_value_position(),
-            QueryResult::Partial(_, Control::Error(e)) => e.is_uncatchable_at_value_position(),
-            _ => false,
-        };
-        if uncatchable {
-            return catch_error_under_optional(stopped, false, atomic);
-        }
-    }
     match stopped {
         // `atomic` only has a prefix to discard-or-keep once one was
         // actually accumulated (the `Partial` arm below); a bare `Error`
         // (`partial()`'s own empty-prefix collapse, #400/#494) has nothing
         // for `atomic` to affect either way.
+        //
+        // #2302: `optional && !e.is_uncatchable_at_value_position()`, not
+        // bare `optional` -- an uncatchable-at-value-position error
+        // (#2254's decode failure / yq negative-index raise) must never be
+        // silently dropped by `optional`'s swallow here, matching every
+        // other optional-consulting site since #2270/#2289/#2292 and the
+        // identical guard already used at this file's own `Err(e) if
+        // optional && !e.is_uncatchable_at_value_position()` site. Single
+        // choke point for all five call sites this function has
+        // (`continue_rest_with_context`/`_with_paths`/`_with_fresh_root`'s
+        // own `Partial` arms, `Expr::Iterate`, `Builtin::Map`) rather than
+        // hand-copying the guard into each one.
         QueryResult::Error(e) => {
-            if optional {
+            if optional && !e.is_uncatchable_at_value_position() {
                 QueryResult::None
             } else {
                 QueryResult::Error(e)
@@ -30754,12 +30743,23 @@ fn catch_error_under_optional<W>(
         // rather than nested conditionals so each is visible at a glance:
         // `atomic` decides whether `prefix` survives at all; `optional`
         // decides whether the survival (or lack of one) also raises.
-        QueryResult::Partial(prefix, Control::Error(e)) => match (atomic, optional) {
-            (true, true) => QueryResult::None,
-            (true, false) => QueryResult::Error(e),
-            (false, true) => owned_vec_to_result(prefix),
-            (false, false) => QueryResult::Partial(prefix, Control::Error(e)),
-        },
+        //
+        // #2302: `optional` is shadowed by the same uncatchable carve-out
+        // as the bare-`Error` arm above before it ever reaches the table,
+        // so an uncatchable error always lands in the `(atomic, false)`
+        // column -- discarding its prefix for an atomic array
+        // construction exactly as an ordinary non-optional error already
+        // does, keeping and propagating it for a non-atomic generator
+        // exactly as an ordinary non-optional error already does.
+        QueryResult::Partial(prefix, Control::Error(e)) => {
+            let optional = optional && !e.is_uncatchable_at_value_position();
+            match (atomic, optional) {
+                (true, true) => QueryResult::None,
+                (true, false) => QueryResult::Error(e),
+                (false, true) => owned_vec_to_result(prefix),
+                (false, false) => QueryResult::Partial(prefix, Control::Error(e)),
+            }
+        }
         QueryResult::Partial(_, Control::Break(label)) if atomic => QueryResult::Break(label),
         QueryResult::Partial(_, Control::Halt(code)) if atomic => QueryResult::Halt(code),
         other => other,
