@@ -1705,6 +1705,34 @@ and differently-shaped problem than this section's own fixes):
   required, but for a colder, more central path. Recommended as its own,
   separate follow-up issue.
 
+- **`src/jq/eval.rs`'s parallel evaluator** -- a second, independently-tested
+  evaluator behind the crate's public `jq::eval`/`jq::eval_lenient`/
+  `jq::eval_owned_with_file_index` entry points (see
+  `tests/jq_evaluator_parity_tests.rs`), not `eval_generic.rs`, backs `has(key)`
+  (object arm, a raw `.any()` with zero gap checks), `length` (array arm
+  `.count()`, object arm bare `effective_len`), and `keys`/`keys_unsorted`
+  (array arm `.count()`) -- the identical unchecked shape this whole issue
+  chain fixes elsewhere, confirmed by code review on this PR (round 2).
+  **Confirmed not reachable from either shipped CLI**: `succinctly jq`'s
+  `jq_runner.rs` never calls into `eval.rs` at all (only `eval_generic.rs`);
+  `succinctly yq`'s one call site (`yq_runner.rs`'s `evaluate_input`, and
+  `eval_owned_with_file_index` for `--eval-all`) always hands `eval.rs` a
+  cursor built by re-serializing an *already-materialized* `OwnedValue`
+  (`to_json_for_reindex`) into a fresh index -- a value that reached that
+  point only by surviving the CLI's own (already-fixed) parse/materialize
+  step, so the re-serialized text this function actually navigates can never
+  contain a stray trailing comma regardless of query. Verified live: `succinctly
+  yq --input-format json --slurp/--eval-all` on both a top-level and a nested
+  `[1,2,3,] | has(0)`/`length`/`keys` already raises correctly, before
+  `eval.rs`'s own unchecked arms are ever reached. The identical
+  "library-API-only, inert for genuine JSON input via either CLI" shape
+  already established for `to_owned_with_comments_at_depth` above -- a caller
+  of the public library API who builds their own cursor directly from raw,
+  unvalidated document bytes (bypassing both CLIs' own materialization step)
+  would still observe the gap. Recommended as its own follow-up issue
+  (tracking `eval.rs`/`eval_generic.rs` parity for the whole #2261 family), not
+  folded in here.
+
 Two further leads from the same sweep were investigated and **not**
 reproduced live (so not reported as confirmed bugs, only as ruled out):
 `push_generic_truthiness_cursor_error` (`if COND then ... end` on a
