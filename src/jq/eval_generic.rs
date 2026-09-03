@@ -9547,13 +9547,12 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             // `OwnedValue::Object(IndexMap<String, _>)`, which collapses a
             // repeated key structurally in *both* modes, and real yq agrees
             // (`{"a":1,"a":2} | [.[] | key]` is `["a"]` in v4.53.3).
-            // `path()`'s own walk ([`path_walk_generic`], #2147) keeps the
-            // mode's flag instead, because it is not replacing a
-            // materialization and has no yq oracle to match in the first
-            // place (`path(f)` is a jq-only extension there) -- a
-            // deliberate divergence between the two walks, not an
-            // oversight; see that function's doc comment for the full
-            // cross-reference.
+            // `path()`'s own walk ([`path_walk_generic`]) keeps the mode's
+            // flag instead, because it is not replacing a materialization
+            // and has no yq oracle to match in the first place (`path(f)`
+            // is a jq-only extension there) -- a deliberate divergence
+            // between the two walks, recorded as #2147, not an oversight;
+            // see that function's doc comment for the full cross-reference.
             let stepped = path_step_generic::<S, V>(
                 expr,
                 &PathNode::At(pos.node),
