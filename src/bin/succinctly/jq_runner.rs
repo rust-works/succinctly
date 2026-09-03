@@ -3125,8 +3125,32 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
 /// this one function keeps the two CLI modes from silently re-diverging on
 /// the same input the way they did between #1094/#2012 landing here and
 /// yq's copy not getting either fix.
+///
+/// `normalize_dot_leniency` runs *before* `normalize_leading_zero_numbers`,
+/// not after -- #2240 code review found this order matters, not just a
+/// style choice: `normalize_leading_zero_numbers`'s own number-token-start
+/// detection (`b == '-' || b.is_ascii_digit()`) has no way to see a
+/// *preceding* dot, so fed a leading-dot literal first, it starts a fresh
+/// scan right after the dot and can mistake a fraction's own leading zero
+/// for a redundant *integer* leading zero to strip -- `.05` corrupted to
+/// `.5` (dropping a real digit, not a redundant one), which
+/// `normalize_dot_leniency` would then only compound by prefixing `0.5`
+/// instead of the correct `0.05`. Harmless for `jq_runner::parse_json_value`
+/// (which only uses the normalized text as a validation gate and always
+/// materializes the *original* `s` afterward, confirmed live:
+/// `--argjson x '.05'` already answered `0.05` correctly even with the
+/// wrong order) but a real, silent 10x-magnitude corruption for
+/// `yq_runner::parse_json_value`, which -- unlike its jq-mode counterpart
+/// -- reparses the *normalized* text directly as the value itself (that
+/// function's own doc comment explains why: yq's `--argjson` already
+/// discards number fidelity by design, so there is no separate original
+/// spelling to fall back to). Running the dot leniency first avoids ever
+/// handing `normalize_leading_zero_numbers` a fraction digit run to
+/// mistake for an integer one: by the time it runs, a leading-dot token
+/// already has its synthesized `0` in front, so the token's own integer
+/// part is never empty.
 pub(crate) fn normalize_json_leniently(s: &str) -> String {
-    normalize_lone_low_surrogates(&normalize_dot_leniency(&normalize_leading_zero_numbers(s)))
+    normalize_lone_low_surrogates(&normalize_leading_zero_numbers(&normalize_dot_leniency(s)))
 }
 
 /// Whether `bytes[i..]` starts with a JSON `\uXXXX` escape -- if so, its
@@ -3494,11 +3518,10 @@ fn normalize_dot_leniency(s: &str) -> String {
         // `.` into `0.0`, silently accepting genuinely invalid input).
         let start = i;
         let mut scan = after_sign;
-        let int_start = scan;
         while scan < bytes.len() && bytes[scan].is_ascii_digit() {
             scan += 1;
         }
-        let has_int_digits = scan > int_start;
+        let has_int_digits = scan > after_sign;
         let has_dot = scan < bytes.len() && bytes[scan] == b'.';
         let frac_start = if has_dot { scan + 1 } else { scan };
         let mut frac_end = frac_start;

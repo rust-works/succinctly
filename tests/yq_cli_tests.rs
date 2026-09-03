@@ -9405,6 +9405,51 @@ fn test_argjson_shares_jq_leniency_2051() -> Result<()> {
     Ok(())
 }
 
+/// #2240: `succinctly yq --argjson` shares jq mode's new leading/trailing-
+/// dot leniency the same way #2051 above established for leading-zero/
+/// low-surrogate -- both call `normalize_json_leniently`.
+///
+/// Unlike `jq_runner::parse_json_value` (which only uses the normalized
+/// text as a validation gate and always materializes the *original* text
+/// afterward), `yq_runner::parse_json_value` reparses the *normalized*
+/// text directly as the value -- so a fraction digit beginning with `0`
+/// (`.05`, `.007`) is exactly the shape that would have caught a
+/// composition-order bug code review found and fixed before merge:
+/// running the leading-zero normalizer *before* the dot-leniency one let
+/// it mistake `.05`'s own fraction-leading zero for a redundant *integer*
+/// leading zero and strip it, corrupting `.05` into `.5` before the
+/// dot-leniency pass ever saw it -- a silent 10x magnitude error
+/// (`.05` -> `0.5`) that jq mode's own tests (`tests/jq_cli_tests.rs`)
+/// couldn't have caught, since jq mode never reparses the normalized
+/// text as the value in the first place.
+#[test]
+fn test_argjson_shares_jq_dot_leniency_2240() -> Result<()> {
+    for (value, expected) in [
+        (".5", r#"{"n":0.5}"#),
+        (".05", r#"{"n":0.05}"#),
+        (".007", r#"{"n":0.007}"#),
+        ("-.05", r#"{"n":-0.05}"#),
+        ("1.e5", r#"{"n":100000.0}"#),
+        ("007.e5", r#"{"n":700000.0}"#),
+    ] {
+        let (output, code) = run_yq_stdin(
+            ".n = $n",
+            "{}",
+            &["--argjson", "n", value, "-o=json", "-I=0"],
+        )?;
+        assert_eq!(code, 0, "value {value:?}");
+        assert_eq!(output.trim(), expected, "value {value:?}");
+    }
+
+    // A bare trailing dot (no exponent) is deliberately still rejected,
+    // matching jq mode's own narrower-than-real-jq scope (see
+    // `normalize_dot_leniency`'s own doc comment).
+    let (_, code) = run_yq_stdin(".n = $n", "{}", &["--argjson", "n", "1.", "-o=json"])?;
+    assert_ne!(code, 0);
+
+    Ok(())
+}
+
 #[test]
 fn test_arg_hyphen_prefixed_string_value_1150() -> Result<()> {
     let (output, code) = run_yq_stdin("$n", "a: 1", &["--arg", "n", "-hello"])?;
