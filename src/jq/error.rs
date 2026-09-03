@@ -863,6 +863,27 @@ impl EvalError {
         Self::new("from entries only runs against arrays")
     }
 
+    /// `index [N] out of range, array size is M` (#2254).
+    ///
+    /// Real yq's own wording for a negative array index whose magnitude
+    /// still exceeds the array length after resolving against it -- unlike
+    /// jq, which treats this the same as a positive out-of-range index
+    /// (`null`, not an error). Confirmed live against yq v4.53.3:
+    /// `[1,2] | .[-3]` raises this, `[1,2] | .[-1]`/`.[-2]` (in-bounds
+    /// wraparound) don't, and `[1,2] | .[5]` (positive OOB) is `null`, not
+    /// an error -- the asymmetry is specific to the negative-magnitude
+    /// case. `N` here is the original, unresolved index (`-3`, not the
+    /// still-negative sum) -- real yq's own message reports the argument as
+    /// written, not the arithmetic. Suppressible by `optional` like any
+    /// other read-time indexing error -- real yq's own lexer doesn't even
+    /// accept `?` after a bracket index in this position, so there's no
+    /// oracle to match either way, and matching this codebase's own
+    /// established default for ordinary indexing errors is simpler than
+    /// carving out a special unsuppressible case with no oracle behind it.
+    pub fn yq_negative_index_out_of_range(index: i64, len: usize) -> Self {
+        Self::new(format!("index [{index}] out of range, array size is {len}"))
+    }
+
     /// `strptime/1 requires string inputs and arguments` (#929).
     ///
     /// jq's C implementation validates `strptime`'s input *and* format

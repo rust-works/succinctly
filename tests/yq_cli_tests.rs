@@ -28209,3 +28209,98 @@ fn test_stderr_path_passthrough_reaches_yq_mode_2234() -> Result<()> {
     assert_eq!(out.trim(), "{\n  \"a\": 2\n}");
     Ok(())
 }
+
+/// #2254: a negative array index whose magnitude still exceeds the array
+/// length raises in real yq v4.53.3 (`index [N] out of range, array size is
+/// M`), where jq -- and yq's own positive-out-of-range case -- both treat it
+/// as `null`, not an error. `resolve_read_index`/`index_one`/
+/// `index_one_owned` and their several independently-implemented siblings
+/// across this codebase (`get_element_at_index`, `eval_single`'s own
+/// `Expr::Index` arm in `eval_generic.rs`, `index_one_generic`,
+/// `eval_owned_fast_path`) all treated "index doesn't resolve" as one
+/// outcome with no mode dispatch on sign -- fixed at each read call site
+/// this issue's own investigation found, covering both the literal-index and
+/// computed-index (`.[$k]`) forms, and both jq's ordinary CLI dispatch
+/// (`eval_generic.rs`) and the library-route/path-context evaluator
+/// (`eval.rs`).
+#[test]
+fn test_negative_index_out_of_range_raises_2254() -> Result<()> {
+    // Literal index, ordinary CLI dispatch (`eval_generic.rs`).
+    let (out, stderr, code) = run_yq_stdin_with_stderr(".a[-5]", "a: [1, 2]\n", &["-o", "json"])?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+
+    // Computed index, ordinary CLI dispatch (`index_one_generic`).
+    let (out, stderr, code) = run_yq_stdin_with_stderr(".a[(-5)]", "a: [1, 2]\n", &["-o", "json"])?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+
+    // In-bounds negative wraparound is unaffected, both spellings.
+    let (out, code) = run_yq_stdin(".a[-1]", "a: [1, 2]\n", &["-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "2");
+    let (out, code) = run_yq_stdin(".a[(-1)]", "a: [1, 2]\n", &["-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "2");
+
+    // Positive out-of-range is unaffected -- `null`, not an error, in both
+    // jq and yq.
+    let (out, code) = run_yq_stdin(".a[5]", "a: [1, 2]\n", &["-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "null");
+
+    // `optional` suppresses it, matching every other read-time indexing
+    // error in this codebase -- real yq's own lexer doesn't accept `?` after
+    // a bracket index here, so there is no oracle answer to match either
+    // way; this is succinctly's own consistent default.
+    let (out, code) = run_yq_stdin(".a[-5]?", "a: [1, 2]\n", &["-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "");
+
+    // `--jq-extensions`' path-context bridge (`key`/`parent`/...) reaches
+    // the same fix, both spellings.
+    let (out, stderr, code) = run_yq_stdin_with_stderr(
+        ".a | (.[-5]) | key",
+        "a: [1, 2]\n",
+        &["--jq-extensions", "-o", "json"],
+    )?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+    let (out, stderr, code) = run_yq_stdin_with_stderr(
+        ".a | (.[(-5)]) | key",
+        "a: [1, 2]\n",
+        &["--jq-extensions", "-o", "json"],
+    )?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+
+    Ok(())
+}
+
+/// #2254's jq-mode control: jq has no equivalent of this yq-only rule, so
+/// jq mode must be entirely unaffected by the fix -- every case above
+/// answers `null`, never raises.
+#[test]
+fn test_negative_index_out_of_range_unaffected_in_jq_mode_2254() -> Result<()> {
+    let (out, stderr, code) = run_jq_stdin_with_stderr(".a[-5]", "{\"a\":[1,2]}", &["-c"])?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(out.trim(), "null");
+
+    let (out, stderr, code) = run_jq_stdin_with_stderr(".a[(-5)]", "{\"a\":[1,2]}", &["-c"])?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(out.trim(), "null");
+
+    Ok(())
+}
