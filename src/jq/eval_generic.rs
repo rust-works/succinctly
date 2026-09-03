@@ -27,11 +27,11 @@ use std::rc::Rc;
 use indexmap::IndexMap;
 
 use super::document::{
-    collapsed_fields, collapsed_fields_if, effective_fields, effective_fields_checked,
-    effective_keys, effective_len_checked, key_delimiter_ok, key_display_string,
-    key_display_string_kind, key_is_malformed, resolve_display_key, trailing_element_gap_ok,
-    value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors, DocumentCursor, DocumentElements,
-    DocumentFields, DocumentValue, IndentSpec, JsonConvention,
+    collapsed_fields, collapsed_fields_if, effective_fields_checked,
+    effective_fields_with_raw_last, effective_keys, effective_len_checked, key_delimiter_ok,
+    key_display_string, key_display_string_kind, key_is_malformed, resolve_display_key,
+    trailing_element_gap_ok, value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors,
+    DocumentCursor, DocumentElements, DocumentFields, DocumentValue, IndentSpec, JsonConvention,
 };
 use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, bind_def, bind_def_call,
@@ -1092,6 +1092,15 @@ fn walk_distinct_keys_checked<V: DocumentValue>(
         on_cursor(cursor);
     }
     if cursors.is_malformed() {
+        return Err(fields.malformed_member_error());
+    }
+    // #2261: trailing stray comma after a real last key (`{"a":1,}`) --
+    // `cursors` already retained the last key cursor this walk saw, so this
+    // is one more O(1) `next_sibling()` hop, not a further walk. Covers
+    // both callers: `distinct_key_cursors_checked` (`keys_unsorted[]`, a
+    // negative `keys_unsorted[n]`) and `keys_are_well_formed`
+    // (`try_single_generic`'s `LazyKeys` probe).
+    if !cursors.trailing_gap_ok(b'}') {
         return Err(fields.malformed_member_error());
     }
     Ok(())
@@ -4104,6 +4113,14 @@ fn fold_lazy_keys_stage<S: EvalSemantics, V: DocumentValue>(
             if cursors.is_malformed() {
                 return GenericResult::Error(fields.malformed_member_error());
             }
+            // #2261: same trailing-comma check those two siblings now run
+            // too -- this arm already walks the whole object regardless
+            // (there is no way to find "the last key" without reaching the
+            // end), so it rides along for free, same reasoning as the rest
+            // of this arm's own #1956 fix.
+            if !cursors.trailing_gap_ok(b'}') {
+                return GenericResult::Error(fields.malformed_member_error());
+            }
             match last_cursor {
                 Some(c) => GenericResult::OneCursor(c),
                 None => GenericResult::Owned(OwnedValue::Null),
@@ -4513,11 +4530,25 @@ fn each_lazy_keys_iterate_sink<S: EvalSemantics, V: DocumentValue>(
         // the tail, and charging it for one would restore exactly the whole-
         // object probe such a consumer exists to avoid (#1514/#1599) --
         // which is the divergence #1770 accepted, scoped to early exit.
-        if matches!(flow, Flow::Exhausted) && cursors.is_malformed() {
-            return drain_result_generic(
-                GenericResult::Error(cursors.malformed_member_error()),
-                sink,
-            );
+        if matches!(flow, Flow::Exhausted) {
+            if cursors.is_malformed() {
+                return drain_result_generic(
+                    GenericResult::Error(cursors.malformed_member_error()),
+                    sink,
+                );
+            }
+            // #2261: trailing stray comma after a real last key
+            // (`{"a":1,}`) -- `cursors` already retained the last key
+            // cursor this walk saw (`DistinctKeyCursors::last_key_cursor`),
+            // so this is one more O(1) `next_sibling()` hop, not a further
+            // walk. Same early-exit exemption as the `is_malformed()` check
+            // just above.
+            if !cursors.trailing_gap_ok(b'}') {
+                return drain_result_generic(
+                    GenericResult::Error(cursors.malformed_member_error()),
+                    sink,
+                );
+            }
         }
         return flow;
     }
@@ -4611,16 +4642,25 @@ fn each_lazy_seq_iterate_sink<S: EvalSemantics, V: DocumentValue>(
 /// that would find it never runs past what was asked for. `first(.[])` on
 /// `[1,,3]` still raises correctly (the fault is on the very first element
 /// examined); `first(.[])` on a well-formed `1` followed by a *later*
-/// malformed gap does not see it. Every eager caller of
+/// malformed gap does not see it -- including the #2261 trailing-comma
+/// shape below (`[1,]`), which by definition only shows up once the walk
+/// reaches the container's real last element. Every eager caller of
 /// `collect_cursors_checked` (`.[]` reached through the rest of the
-/// evaluator, `to_entries`) is unaffected -- only this demand-aware path
-/// takes the trade. Recorded in `docs/compliance/jq/limitations.md`.
+/// evaluator, `to_entries`) does see it (#2261 closed that gap in
+/// `collect_cursors_checked` itself) -- only this demand-aware path takes
+/// the early-exit trade. Recorded in `docs/compliance/jq/limitations.md`.
 fn each_lazy_array_iterate_sink<V: DocumentValue>(
     elements: V::Elements,
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Flow {
     let mut elems = elements;
     let mut is_first = true;
+    // #2261: the last real element's own cursor, retained past the loop so
+    // the trailing-gap check below (a stray `,` *after* a real last
+    // element, `[1,]`) has something to check from once the walk exhausts
+    // -- mirrors `to_owned_cursor_at_depth`'s own `last_elem` (#2243) and
+    // `collect_cursors_checked`'s identical addition (#2261).
+    let mut last_cursor: Option<V::Cursor> = None;
     while let Some((cursor, next)) = elems.uncons_cursor() {
         if !cursor.element_gap_ok(is_first) {
             // `elements.malformed_element_error()`, not `elems` (the
@@ -4635,8 +4675,16 @@ fn each_lazy_array_iterate_sink<V: DocumentValue>(
         }
         is_first = false;
         elems = next;
+        last_cursor = Some(cursor);
         if sink(GenericItem::OneCursor(cursor)) == Demand::Stop {
             return Flow::Stopped { pending: None };
+        }
+    }
+    // #2261: only on exhaustion -- see this function's own doc comment
+    // above for why an early-stopped consumer never reaches this check.
+    if let Some(last) = last_cursor {
+        if !trailing_element_gap_ok(&last, b']') {
+            return Flow::Escaped(Control::Error(elements.malformed_element_error()));
         }
     }
     Flow::Exhausted
@@ -4985,7 +5033,20 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
 
         Expr::Index { idx, .. } => {
             if let Some(elements) = value.as_array() {
-                let len = elements.len();
+                // #2261: `_checked`, not the bare `len()` this used to call
+                // -- free here, unlike a *positive*-only lookup elsewhere
+                // in this evaluator (`Expr::Iterate`'s sorted-key positive-
+                // index arm, #1629's own precedent for "would cost strictly
+                // more than the answer"): resolving *any* index here,
+                // negative or positive, already walks the whole array via
+                // `len()` first (to normalize a negative index and to raise
+                // yq's own out-of-range error), so the trailing/leading gap
+                // checks ride along for free on every call, not just the
+                // negative-index ones.
+                let len = match elements.len_checked() {
+                    Ok(len) => len,
+                    Err(err) => return GenericResult::Error(err),
+                };
                 let resolved = if *idx < 0 { len as i64 + idx } else { *idx };
                 // yq mode only (#2254): a negative index still negative
                 // after resolving against the length raises in real yq --
@@ -10135,7 +10196,17 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             } else if let Some(s) = value.as_str() {
                 GenericResult::Owned(OwnedValue::Int(s.chars().count() as i64))
             } else if let Some(elements) = value.as_array() {
-                GenericResult::Owned(OwnedValue::Int(elements.len() as i64))
+                // #2261: `_checked` refuses a trailing stray comma after a
+                // real last element (`[1,]`) -- the array counterpart of
+                // `effective_len_checked` just below, walking with
+                // `uncons_cursor` (needed for the check's own position,
+                // `len`'s plain `uncons` doesn't carry one) but keeping no
+                // `Vec`, same reasoning as `collect_cursors_checked`'s own
+                // O(1)-space sibling `len_checked`.
+                match elements.len_checked() {
+                    Ok(len) => GenericResult::Owned(OwnedValue::Int(len as i64)),
+                    Err(err) => GenericResult::Error(err),
+                }
             } else if let Some(fields) = value.as_object() {
                 // #1194: `effective_len` counts a member whose key never
                 // stringifies (`census`'s `unkeyed`), so `length` answered 1
@@ -10281,7 +10352,16 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 }
                 // A loop for the same reason as the array arm above.
                 let mut entries: Vec<OwnedValue> = Vec::new();
-                for field in effective_fields(&fields, S::COLLAPSE_DUPLICATE_KEYS) {
+                // #2261: the *raw, pre-collapse* walk's own textually last
+                // field's value cursor -- not derivable from the collapsed
+                // list this loop iterates below, whose own last element can
+                // be a different, earlier-in-source field once a repeated
+                // key collapses (see `effective_fields_with_raw_last`'s own
+                // doc comment for why, and the well-formed case this would
+                // otherwise wrongly reject).
+                let (effective, last_value_cursor) =
+                    effective_fields_with_raw_last(&fields, S::COLLAPSE_DUPLICATE_KEYS);
+                for field in effective {
                     // A key that will not *decode* is preserved via its raw
                     // source span rather than raised on (#1247/#1642),
                     // matching `length`/`keys_unsorted`/`.`. `continue` here
@@ -10313,6 +10393,13 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                         owned_or_err!(to_owned_cursor(&field.value_cursor)),
                     );
                     entries.push(OwnedValue::Object(entry));
+                }
+                // #2261: trailing stray comma after a real last field
+                // (`{"a":1,}`).
+                if let Some(last) = last_value_cursor {
+                    if !trailing_element_gap_ok(&last, b'}') {
+                        return GenericResult::Error(fields.malformed_member_error());
+                    }
                 }
                 GenericResult::Owned(OwnedValue::Array(entries))
             } else {
@@ -11762,11 +11849,12 @@ mod tests {
     fn test_lazyseq_size_is_pinned_1973() {
         assert_eq!(
             core::mem::size_of::<LazySeq<crate::yaml::YamlValue<'_, Vec<u64>>>>(),
-            184,
+            216,
             "LazySeq<YamlValue>'s size changed -- if it grew, a new unboxed-wide field \
              snuck onto LazySeq/LazySource/DistinctKeyCursors (investigate before \
              accepting); if it shrank, DistinctKeyCursors shrank further -- update this \
-             pinned value to match"
+             pinned value to match. 184 -> 216 (#2261) is accounted for: \
+             `DistinctKeyCursors::last_key_cursor` below grew by one cursor's worth."
         );
     }
 
@@ -11784,6 +11872,14 @@ mod tests {
     /// in code review before this landed). `rest`/`all`'s own two full
     /// field-cursor copies remain unboxed and out of scope here too
     /// (#1973's own "why deferred" section).
+    ///
+    /// 152 -> 184 (#2261): `last_key_cursor: Option<F::Cursor>` is a new
+    /// field, deliberately unboxed and updated on *every* non-collapsed
+    /// iteration (the #2261 trailing-comma-after-real-last-key check needs
+    /// it once the walk exhausts) -- the same "common path, not rare path"
+    /// reasoning `seen` above already established, not the mistake this
+    /// test exists to catch. Reviewed and accepted, not merely updated to
+    /// match.
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn test_distinct_key_cursors_size_is_pinned_1973() {
@@ -11791,7 +11887,7 @@ mod tests {
             core::mem::size_of::<
                 crate::jq::document::DistinctKeyCursors<crate::yaml::YamlFields<'_, Vec<u64>>>,
             >(),
-            152,
+            184,
             "DistinctKeyCursors<YamlFields>'s size changed -- if it grew, a new field \
              landed unboxed on the rare-path (seen/collapsed) or copied cursor (rest/all) \
              members (investigate before accepting); if it shrank, update this pinned \

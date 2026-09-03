@@ -1814,14 +1814,46 @@ pub fn effective_fields<F: DocumentFields>(
     fields: &F,
     collapse: bool,
 ) -> Vec<DocumentField<F::Value, F::Cursor>> {
-    if !collapse {
-        return fields.all_fields();
-    }
+    effective_fields_with_raw_last(fields, collapse).0
+}
+
+/// [`effective_fields`], additionally handing back the raw last field's cursor (#2261).
+///
+/// The extra value is the *raw, pre-collapse* walk's own textually last
+/// field's value cursor -- for a caller that (like `Builtin::ToEntries`'s
+/// object arm) wants to check a trailing stray comma (`{"a":1,}`) against
+/// the object's real last field.
+///
+/// **Not** `effective_fields(...).last()`: collapsing is "first position,
+/// last value" (see `collapse_repeated`'s own doc comment) -- the
+/// returned `Vec`'s own *order* still reflects first-occurrence position,
+/// so its last element is whichever key's first occurrence happens to
+/// sort last among survivors, not whichever field sits last in the source
+/// text. `{"a":1,"b":2,"a":3}` collapses to `[("a", value 3), ("b", value
+/// 2)]` in that order -- "b" last, even though "a"'s second occurrence is
+/// the real last field before `}`. Checking the collapsed list's own last
+/// entry there would scan the gap after `2`, see the perfectly ordinary
+/// `,"a":3}` that follows it, and wrongly refuse a well-formed document
+/// (the same mistake `DistinctKeyCursors::last_key_cursor`'s own doc
+/// comment already describes and fixes for `keys`/`keys_unsorted`).
+///
+/// Free: `all_fields()`'s own `Vec` already exists in raw document order
+/// before any collapsing runs, so reading its last element costs nothing
+/// beyond the call this function already makes.
+#[allow(clippy::type_complexity)] // STYLE-0004: mirrors effective_fields_checked's own Vec<DocumentField<..>>, plus the raw-last cursor; a named alias would add indirection for one extra wrapper.
+pub fn effective_fields_with_raw_last<F: DocumentFields>(
+    fields: &F,
+    collapse: bool,
+) -> (Vec<DocumentField<F::Value, F::Cursor>>, Option<F::Cursor>) {
     let all = fields.all_fields();
+    let raw_last = all.last().map(|f| f.value_cursor);
+    if !collapse {
+        return (all, raw_last);
+    }
     if keys_repeat(&all) {
-        collapse_repeated(all)
+        (collapse_repeated(all), raw_last)
     } else {
-        all
+        (all, raw_last)
     }
 }
 
@@ -1845,6 +1877,13 @@ pub fn effective_fields_checked<F: DocumentFields>(
     let mut out = Vec::new();
     let mut walk = fields.clone();
     let mut is_first = true;
+    // #2261: the raw walk's own textually-last field, retained regardless of
+    // any later collapse -- collapsing a repeated key onto its first
+    // occurrence changes which *entries* `out` keeps, never where the
+    // object's own closing `}` sits in the source text, so the trailing-gap
+    // check below must run against the walk's real last field, not
+    // whatever `out` holds once collapsing (if any) has run.
+    let mut last_value_cursor: Option<F::Cursor> = None;
     while let Some((field, rest)) = walk.uncons() {
         if key_is_malformed(&field.key) {
             return Err(walk.malformed_member_error());
@@ -1856,12 +1895,24 @@ pub fn effective_fields_checked<F: DocumentFields>(
         {
             return Err(walk.malformed_member_error());
         }
+        last_value_cursor = Some(field.value_cursor);
         out.push(field);
         walk = rest;
         is_first = false;
     }
     if walk.ends_unpaired() {
         return Err(walk.malformed_member_error());
+    }
+    // #2261: trailing stray comma after a real last field (`{"a":1,}`) --
+    // free here too, same reasoning as the #1677 checks above: this walk
+    // already resolved every field's value cursor, `last_value_cursor`
+    // included. No container cursor is available here to also check the
+    // zero-field stray-comma shape (`{,}`, #2211) -- same documented
+    // limitation as `to_owned_at_depth`'s own value-only callers.
+    if let Some(last) = last_value_cursor {
+        if !trailing_element_gap_ok(&last, b'}') {
+            return Err(walk.malformed_member_error());
+        }
     }
     if collapse && keys_repeat(&out) {
         out = collapse_repeated(out);
@@ -1978,6 +2029,22 @@ pub struct DistinctKeyCursors<F: DocumentFields> {
     /// [`ended_unpaired`](Self::ended_unpaired), and for the same reason:
     /// answering up front would cost a second walk.
     delimiter_fault: bool,
+    /// The textually **last** field's own key cursor, in raw document
+    /// order -- independent of which key this walk actually *yielded*
+    /// last, which under a confirmed collapse (#1385) is whichever key's
+    /// first occurrence happens to sort last among survivors, not
+    /// whichever field sits last in the source text (#2261).
+    ///
+    /// Updated on every field the raw `self.rest`-based walk examines
+    /// (before this walk has proved a repeat exists), and overwritten
+    /// wholesale from [`ConfirmedRepeat::last_key_cursor`] the moment a
+    /// repeat *is* confirmed -- that re-walk covers the whole object from
+    /// its own start, so its answer is already final and needs no further
+    /// updates from the collapsed-list branch afterwards (which never
+    /// touches `self.rest` again). A hash collision with no real repeat
+    /// leaves `self.rest` in charge again, and this field simply keeps
+    /// updating as normal until the true end.
+    last_key_cursor: Option<F::Cursor>,
 }
 
 impl<F: DocumentFields> DistinctKeyCursors<F> {
@@ -1993,6 +2060,7 @@ impl<F: DocumentFields> DistinctKeyCursors<F> {
             ended_unpaired: false,
             walked: 0,
             delimiter_fault: false,
+            last_key_cursor: None,
         }
     }
 
@@ -2039,6 +2107,32 @@ impl<F: DocumentFields> DistinctKeyCursors<F> {
     pub fn malformed_member_error(&self) -> EvalError {
         self.all.malformed_member_error()
     }
+
+    /// Whether a trailing stray `,` (`{"a":1,}`) sits between the object's
+    /// textually last field's own value and `close_char` (`}`) -- #2261.
+    ///
+    /// **Only meaningful once the iterator is exhausted and
+    /// [`is_malformed`](Self::is_malformed) has already answered `false`**,
+    /// the same contract [`ended_unpaired`](Self::ended_unpaired)/
+    /// [`delimiter_fault`](Self::delimiter_fault) share -- an object this
+    /// walk never actually finished walking (an early-stopped consumer, or
+    /// one this same walk already flagged malformed for an unrelated
+    /// reason) has no reliable "last field" answer to check yet.
+    ///
+    /// `last_key_cursor` (this struct's own private field) tracks the key; the value
+    /// this check needs sits at that key's own `next_sibling()` -- an O(1)
+    /// BP hop mirroring how every [`DocumentFields::uncons`] impl derives a
+    /// field's value cursor from its key cursor in the first place (see
+    /// `JsonFields::uncons`), run once here rather than during the walk.
+    /// `None` (an empty object, or a format whose cursor carries no
+    /// position) answers `true` -- nothing to flag, same "can't determine,
+    /// skip" convention every sibling gap check in this module follows.
+    pub fn trailing_gap_ok(&self, close_char: u8) -> bool {
+        match self.last_key_cursor.and_then(|c| c.next_sibling()) {
+            Some(value_cursor) => trailing_element_gap_ok(&value_cursor, close_char),
+            None => true,
+        }
+    }
 }
 
 impl<F: DocumentFields> Iterator for DistinctKeyCursors<F> {
@@ -2062,6 +2156,12 @@ impl<F: DocumentFields> Iterator for DistinctKeyCursors<F> {
             return None;
         };
         self.rest = tail;
+        // #2261: recorded for every field this raw walk examines, in
+        // document order -- overwritten wholesale below the moment a
+        // repeat is confirmed, from a re-walk that already knows the true
+        // answer regardless of where in the object *this* walk currently
+        // stands.
+        self.last_key_cursor = Some(key_cursor);
         // #1677: checked for every field examined, in raw document order,
         // before any collapse decision -- a comma/colon fault must surface
         // even for a field a later duplicate ends up collapsing away.
@@ -2078,6 +2178,16 @@ impl<F: DocumentFields> Iterator for DistinctKeyCursors<F> {
             .is_some_and(|seen| key_hash_of(&key).is_some_and(|hash| seen.insert(hash)));
         if repeat {
             let confirmed = collapse_confirmed_repeat(&self.all);
+            // #2261: `confirmed`'s own walk starts from `self.all` (the
+            // object's very beginning) and runs to its true end regardless
+            // of collapsing, so its answer is authoritative -- unlike
+            // `self.rest`'s own remaining walk, which (on a genuine
+            // collapse, just below) stops advancing once this arm switches
+            // to serving the pre-resolved `collapsed` list instead, and so
+            // would otherwise leave `last_key_cursor` stuck on whichever
+            // field happened to trigger this detection rather than the
+            // object's real last one.
+            self.last_key_cursor = confirmed.last_key_cursor;
             // Recorded here as well as at exhaustion above: on the
             // collapsing branch below `rest` stops mid-object and never
             // reaches the `None` arm, so that arm would never see the
@@ -2126,10 +2236,18 @@ fn collapse_confirmed_repeat<F: DocumentFields>(fields: &F) -> ConfirmedRepeat<F
     let mut out: Vec<(F::Value, F::Cursor)> = Vec::new();
     let mut total = 0usize;
     let mut delimiter_fault = false;
+    let mut last_key_cursor: Option<F::Cursor> = None;
     let mut walk = fields.clone();
     let mut is_first = true;
     while let Some((key, key_cursor, rest)) = walk.uncons_key() {
         total += 1;
+        // #2261: recorded in raw document order regardless of which slot
+        // this key ends up collapsing into -- the caller needs the
+        // object's real last field, not whichever key this walk last
+        // *inserted or updated* in `out` (order that already differs from
+        // document order once collapsing runs, see `DistinctKeyCursors`'s
+        // own `last_key_cursor` doc comment).
+        last_key_cursor = Some(key_cursor);
         // #1677: re-walks the whole object from the start, so this repeats
         // a check `DistinctKeyCursors::next` already ran on fields before
         // the repeat was confirmed -- negligible next to this function's
@@ -2162,6 +2280,7 @@ fn collapse_confirmed_repeat<F: DocumentFields>(fields: &F) -> ConfirmedRepeat<F
         delimiter_fault,
         keys: out,
         total,
+        last_key_cursor,
     }
 }
 
@@ -2181,6 +2300,11 @@ struct ConfirmedRepeat<F: DocumentFields> {
     ends_unpaired: bool,
     /// Whether any field had a malformed `,`/`:` delimiter (#1677).
     delimiter_fault: bool,
+    /// The textually last field's own key cursor (#2261) -- see
+    /// [`DistinctKeyCursors::last_key_cursor`]'s own doc comment for why
+    /// this must come from this whole-object re-walk rather than from
+    /// whichever key `keys`/`out` above last inserted or updated.
+    last_key_cursor: Option<F::Cursor>,
 }
 
 /// Collapse fields known to contain at least one repeated key.
@@ -2315,6 +2439,13 @@ pub fn effective_keys<F: DocumentFields>(
     if cursors.is_malformed() {
         return Err(fields.malformed_member_error());
     }
+    // #2261: trailing stray comma after a real last key (`{"a":1,}`) --
+    // `DistinctKeyCursors::trailing_gap_ok` resolves it from the key cursor
+    // this walk already retained, an O(1) `next_sibling()` hop rather than
+    // a further walk.
+    if !cursors.trailing_gap_ok(b'}') {
+        return Err(fields.malformed_member_error());
+    }
     Ok(keys)
 }
 
@@ -2442,7 +2573,52 @@ pub trait DocumentElements: Sized + Copy + Clone {
             elems = rest;
             is_first = false;
         }
+        // #2261: trailing stray comma after a real last element (`[1,]`) --
+        // free here since this walk already resolved every element's own
+        // cursor; mirrors `to_owned_cursor_at_depth`'s own `last_elem` check
+        // (#2243) rather than duplicating its logic. `collect_cursors_checked`
+        // has no container cursor to check the *zero-element* stray-comma
+        // shape (`[,]`, #2211) against -- same documented limitation as
+        // `to_owned_at_depth`'s own value-only callers.
+        if let Some(last) = cursors.last() {
+            if !trailing_element_gap_ok(last, b']') {
+                return Err(self.malformed_element_error());
+            }
+        }
         Ok(cursors)
+    }
+
+    /// [`DocumentElements::len`], refusing a trailing stray `,` after a real
+    /// last element (`[1,]`, #2261) as it walks -- the array counterpart of
+    /// [`effective_len_checked`]'s object case.
+    ///
+    /// Walks with `uncons_cursor` rather than `len`'s own `uncons`: the
+    /// check needs each element's own position, which only the cursor
+    /// carries (`len`'s plain `Value` does not). Keeps no `Vec` unlike
+    /// [`collect_cursors_checked`](Self::collect_cursors_checked) -- `length`
+    /// only ever wanted the count, and collecting one would be a pure
+    /// O(n)-space cost for an O(1)-space answer, the same reasoning
+    /// `Builtin::Last`'s own inline walk already applies (#1629).
+    fn len_checked(&self) -> Result<usize, EvalError> {
+        let mut count = 0usize;
+        let mut elems = *self;
+        let mut is_first = true;
+        let mut last: Option<Self::Cursor> = None;
+        while let Some((cursor, rest)) = elems.uncons_cursor() {
+            if !cursor.element_gap_ok(is_first) {
+                return Err(self.malformed_element_error());
+            }
+            count += 1;
+            last = Some(cursor);
+            elems = rest;
+            is_first = false;
+        }
+        if let Some(last) = last {
+            if !trailing_element_gap_ok(&last, b']') {
+                return Err(self.malformed_element_error());
+            }
+        }
+        Ok(count)
     }
 }
 

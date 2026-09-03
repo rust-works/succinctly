@@ -705,6 +705,12 @@ pub fn stream_lazy_keys_json<W: core::fmt::Write, F: DocumentFields>(
     if error.is_none() && cursors.is_malformed() {
         *error = Some(fields.malformed_member_error());
     }
+    // #2261: trailing stray comma after a real last key (`{"a":1,}`) --
+    // `cursors` already retained the last key cursor this walk saw, so this
+    // is one more O(1) `next_sibling()` hop, not a further walk.
+    if error.is_none() && !cursors.trailing_gap_ok(b'}') {
+        *error = Some(fields.malformed_member_error());
+    }
     if indent.width > 0 {
         out.write_char('\n')?;
     }

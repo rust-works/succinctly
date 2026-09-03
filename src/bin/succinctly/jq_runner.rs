@@ -852,11 +852,18 @@ fn identity_exit_status_value(json_bytes: &[u8]) -> OwnedValue {
 /// so either fault surfaces only here, potentially behind an
 /// already-written partial `[`/array -- see `JqValue::LazyKeysArray`'s own
 /// doc comment for why that trade is accepted.
+///
+/// #2261: also checks [`DistinctKeyCursors::trailing_gap_ok`] -- a trailing
+/// stray `,` after the object's own real last key (`{"a":1,}`), same "ask
+/// only once the walk is done" contract, same O(1) `next_sibling()` cost.
 fn bail_if_keys_malformed<F: succinctly::jq::document::DocumentFields>(
     keys: &DistinctKeyCursors<F>,
     doc_text: Option<&[u8]>,
 ) -> Result<()> {
-    match (keys.is_malformed(), doc_text) {
+    match (
+        (keys.is_malformed() || !keys.trailing_gap_ok(b'}')),
+        doc_text,
+    ) {
         (true, Some(text)) => Err(MalformedJsonError(EvalError::malformed_json_text(text)).into()),
         _ => Ok(()),
     }
