@@ -10787,7 +10787,15 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 // the unchecked `collect_cursors` this arm used -- this
                 // walk already resolves every element's cursor to reverse
                 // them, so the #1677/#2261 gap checks ride along for free.
-                let mut cursors = owned_or_err!(elements.collect_cursors_checked());
+                //
+                // #2327: owned_or_suppress!, not owned_or_err! -- `optional`
+                // is consulted one arm below (the non-array fallback), so
+                // ignoring it here was the same asymmetry #2280 fixed for
+                // Format/Path/GetPath. Defensive today, not a live behavior
+                // change: `collect_cursors_checked`'s only error
+                // (`malformed_element_error`) is `is_decode_failure()`-tagged
+                // since #2286.
+                let mut cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
                 cursors.reverse();
                 GenericResult::LazySeq(Box::new(LazySeq::from_cursors(cursors)))
             } else if optional {
@@ -10837,7 +10845,13 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // these builtins already resolves each element's cursor to
             // sort/dedup them, so the #1677/#2261 gap checks ride along
             // for free.
-            let cursors = owned_or_err!(elements.collect_cursors_checked());
+            //
+            // #2327: owned_or_suppress!, not owned_or_err! -- `optional` is
+            // passed to `sort_family_array_generic` on the very next line,
+            // so ignoring it here was the same asymmetry #2280 fixed for
+            // Format/Path/GetPath. Defensive today (see `Reverse`'s sibling
+            // comment above for why).
+            let cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
             sort_family_array_generic::<S, _>(cursors, key, optional, |mut keyed| {
                 sort_keyed_elements::<V>(&mut keyed);
                 if dedup {
@@ -10874,7 +10888,13 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // these builtins already resolves each element's cursor to
             // compare them, so the #1677/#2261 gap checks ride along for
             // free.
-            let cursors = owned_or_err!(elements.collect_cursors_checked());
+            //
+            // #2327: owned_or_suppress!, not owned_or_err! -- `optional` is
+            // passed to `key_elements_generic` a few lines below, so
+            // ignoring it here was the same asymmetry #2280 fixed for
+            // Format/Path/GetPath. Defensive today (see `Reverse`'s sibling
+            // comment above for why).
+            let cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
             // jq answers `null` for an empty array, for all four spellings.
             if cursors.is_empty() {
                 return GenericResult::Owned(OwnedValue::Null);
