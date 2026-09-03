@@ -36459,13 +36459,23 @@ fn flatten_delete_path(expr: &Expr, optional: bool, out: &mut Vec<DeleteStep>) {
 /// [`delete_trie_through_absent`]'s single-path counterpart, for
 /// [`delete_at_path`]'s chain-walk. Same contract: errors propagate, the
 /// rebuilt `null` is discarded, the container is untouched.
-fn delete_at_path_through_absent(
-    rest: &[Expr],
-    optional: bool,
-    yq_mode: bool,
-) -> Result<(), EvalError> {
+///
+/// #2323: hardcodes `yq_mode = false` and `real_slot = false` for the
+/// recursive walk, matching `delete_trie_through_absent`'s own established
+/// pattern (and for the identical reason its doc comment gives: the value
+/// is always a synthetic `Null` no caller ever reads back, so there is
+/// nothing here for the vivify-to-`[]` fix to usefully apply to). Before
+/// this fix that didn't matter -- #2305/#2314's own array-extension logic
+/// lives entirely inside the `Array` arm, unreachable from a bare `Null` --
+/// but #2323's own vivify *is* reachable from `Null`, and running it here
+/// would mutate the throwaway `absent` into an array before an out-of-range
+/// index against *that* raises an error real yq never raises for this
+/// shape: confirmed live, `{} | del(.missing[-1])` is `{}` (a clean no-op,
+/// the missing field never materializes), not the `-1`-out-of-range error
+/// vivifying `absent` first would incorrectly produce.
+fn delete_at_path_through_absent(rest: &[Expr], optional: bool) -> Result<(), EvalError> {
     let mut absent = OwnedValue::Null;
-    delete_path_steps(&mut absent, rest, optional, yq_mode)
+    delete_path_steps(&mut absent, rest, optional, false, false)
 }
 
 /// One array-level step of a `del` path: a bare index, or a slice.
@@ -37104,14 +37114,32 @@ fn delete_trie_array(
     // confirmed live, `{"x":null,"y":1} | del(.x[2], .y)` is
     // `{"x":[null,null]}` (`.y` still deletes independently either way).
     // Vivifying unconditionally rather than only for an `ArrayStep::Index`
-    // node is safe for a `Slice`-only node too: a slice range against a
-    // freshly empty array is itself already a harmless no-op (confirmed
-    // live against a mixed `del(.x[2], .x[0:1], .y)` node), so there is no
-    // need to distinguish which step kind triggered the vivify. jq has no
-    // such rule, so this is yq-mode only, matching every other arm of this
-    // fix -- jq mode falls through to the pre-existing `null`-tolerant
-    // walk-through-absent behavior unchanged.
-    if yq_mode && matches!(value, OwnedValue::Null) {
+    // node is safe for a `Slice`-only node, or a node mixing one terminal
+    // index with a continuation, too: a slice range against a freshly
+    // empty array is itself already a harmless no-op (confirmed live
+    // against a mixed `del(.x[2], .x[0:1], .y)` node), and
+    // `null | del(.[2], .[3].a)` (one terminal index alongside one
+    // continuation at the same node) correctly vivifies to
+    // `[null,null,null]`, order-independent, confirmed live both ways.
+    //
+    // **Not** safe, and deliberately excluded, when 2+ *terminal* indices
+    // share this node: `delete_keys`'s own `keys.len() == 1` gate (#2305/
+    // #2306's own documented scope, unrelated to this fix) already refuses
+    // to extend a multi-key batch, because real yq's own multi-key
+    // extension is order-*dependent* in a way a single `retain` pass can't
+    // replicate -- vivifying the source here regardless would silently
+    // trade one wrong answer (staying `null`) for a different, newly wrong
+    // one (`[]`, since `delete_keys` still refuses the 2+-key batch, just
+    // now against an already-empty array instead of `null`) rather than
+    // reproducing real yq's actual `[null,null]`-shaped answer. Counting
+    // `index_groups` (continuations) out of the total is what tells "2+
+    // terminal keys, #2306's own gap" apart from "1 terminal key plus a
+    // continuation," which is not the same shape and is already correct
+    // above. jq has no vivify rule at all, so this whole check is yq-mode
+    // only -- jq mode always falls through to the pre-existing
+    // `null`-tolerant walk-through-absent behavior below, unchanged.
+    let terminal_index_count = node.indices.len() - node.index_groups.len();
+    if yq_mode && terminal_index_count <= 1 && matches!(value, OwnedValue::Null) {
         value = OwnedValue::Array(Vec::new());
     } else if matches!(value, OwnedValue::Null) {
         // Same per-step `null` exemption as `delete_trie_object` — applies
@@ -37591,7 +37619,13 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 _ => {}
             }
         }
-        if let Err(e) = delete_at_path(&mut result, effective_path, false, S::TAG == EvalTag::Yq) {
+        if let Err(e) = delete_at_path(
+            &mut result,
+            effective_path,
+            false,
+            S::TAG == EvalTag::Yq,
+            true,
+        ) {
             return if optional {
                 QueryResult::None
             } else {
@@ -37621,6 +37655,16 @@ fn delete_at_path(
     path_expr: &Expr,
     optional: bool,
     yq_mode: bool,
+    // #2323: whether `root` is a genuinely resolved slot (the document
+    // itself, a found object key, an in-range/#2314-padded array element) as
+    // opposed to a `null` reached by *tolerating* a step against one (a
+    // `Field`/`Slice` applied to an already-`null` root, #476) -- only the
+    // former is eligible for this fix's own `Index`/`Iterate` vivify-to-`[]`
+    // treatment. See `delete_path_steps`'s own doc comment for the full
+    // rationale and the confirmed-live case this distinguishes
+    // (`{"x":null} | del(.x[2])` vivifies; `[1,2] | del(.[5].missing[2])`
+    // does not, even though both reach an `Index` step against a `null`).
+    real_slot: bool,
 ) -> Result<(), EvalError> {
     match path_expr {
         Expr::Identity => {
@@ -37658,8 +37702,9 @@ fn delete_at_path(
             // way the scalar-noop arms further down do. Once vivified, the
             // existing `OwnedValue::Array` arm's own #2305/#2314 extension
             // logic applies unchanged -- an empty array is just another
-            // array to resolve the index against.
-            if yq_mode && matches!(root, OwnedValue::Null) {
+            // array to resolve the index against. Gated on `real_slot` too
+            // -- see this function's own doc comment.
+            if yq_mode && real_slot && matches!(root, OwnedValue::Null) {
                 *root = OwnedValue::Array(Vec::new());
             }
             match root {
@@ -37714,8 +37759,8 @@ fn delete_at_path(
             // as the `Index` arm above -- `null | del(.[])` is `[]` in real
             // yq, not an error, so vivifying first and falling into the
             // `Array` arm below (clearing an already-empty array is itself
-            // a no-op) produces exactly that.
-            if yq_mode && matches!(root, OwnedValue::Null) {
+            // a no-op) produces exactly that. Gated on `real_slot` too.
+            if yq_mode && real_slot && matches!(root, OwnedValue::Null) {
                 *root = OwnedValue::Array(Vec::new());
             }
             match root {
@@ -37760,8 +37805,10 @@ fn delete_at_path(
                 "object",
             )),
         },
-        Expr::Pipe(exprs) if !exprs.is_empty() => delete_path_steps(root, exprs, optional, yq_mode),
-        Expr::Optional(inner) => delete_at_path(root, inner, true, yq_mode),
+        Expr::Pipe(exprs) if !exprs.is_empty() => {
+            delete_path_steps(root, exprs, optional, yq_mode, real_slot)
+        }
+        Expr::Optional(inner) => delete_at_path(root, inner, true, yq_mode, real_slot),
         // `(EXPR)` at the top of a resolved delete target (e.g.
         // `del((.a))`) -- mirrors `update_path`'s identical `Expr::Paren`
         // arm (#1116; passes `optional` through unchanged, unlike the
@@ -37769,7 +37816,7 @@ fn delete_at_path(
         // `delete_at_path` was missing entirely until now (#1153): any
         // parenthesized `del()` target failed with "cannot use expression
         // as delete target", whether or not a slice was involved.
-        Expr::Paren(inner) => delete_at_path(root, inner, optional, yq_mode),
+        Expr::Paren(inner) => delete_at_path(root, inner, optional, yq_mode, real_slot),
         // Unreachable: `resolve_dynamic_indexes` rewrites every computed key
         // into a static component before this runs. Explicit rather than left
         // to the catch-all so a missed install point fails loudly here instead
@@ -37863,9 +37910,30 @@ fn delete_path_steps(
     steps: &[Expr],
     optional: bool,
     yq_mode: bool,
+    // #2323: tracks whether `root` is currently a genuinely resolved slot,
+    // as opposed to a `null` reached only by *tolerating* a step against one
+    // (`Field`/`Slice` on `null`, #476/#527's established null-tolerance).
+    // Only the former is eligible for the `Index`/`Iterate` vivify-to-`[]`
+    // rule this fix adds -- the two read identically as "root is currently
+    // `null`" but real yq treats them differently, confirmed live:
+    // `{"x":null} | del(.x[2])` (Field *found* the real key `"x"`, value
+    // happens to be `null`) is `{"x":[null,null]}`, but
+    // `[1,2] | del(.[5].missing[2])` (Field `"missing"` tolerated a `null`
+    // it was applied *to*, #476 -- `.[5]` itself padded to a real `null`
+    // slot first, #2314, but `.missing` is not a real lookup on it) is
+    // `[1,2,null,null,null,null]`, not `[...,[null,null]]`. Starts `true`
+    // (every caller either passes the real document or an already-resolved
+    // container element -- see each call site) and flips to `false`
+    // whenever a `Field`/`Slice` step's own null-tolerant arm fires below,
+    // staying `false` from then on (there is no way back to a real slot
+    // once stuck walking a tolerated `null`, since every further step just
+    // tolerates it again) until #2323's own vivify -- gated on this flag --
+    // turns it back into a real (if empty) array.
+    real_slot: bool,
 ) -> Result<(), EvalError> {
     let mut root = root;
     let mut steps = steps;
+    let mut real_slot = real_slot;
     loop {
         let (first, rest) = match steps {
             // Defensive only: every caller passes a non-empty slice (the
@@ -37877,7 +37945,7 @@ fn delete_path_steps(
                 *root = OwnedValue::Null;
                 return Ok(());
             }
-            [last] => return delete_at_path(root, last, optional, yq_mode),
+            [last] => return delete_at_path(root, last, optional, yq_mode, real_slot),
             [first, rest @ ..] => (first, rest),
         };
 
@@ -37920,17 +37988,20 @@ fn delete_path_steps(
             Expr::Field(_) | Expr::Index { .. } | Expr::Iterate | Expr::Slice { .. }
         ) && trailing_identity_optional(rest, false).is_some()
         {
-            return delete_at_path(root, component, here, yq_mode);
+            return delete_at_path(root, component, here, yq_mode, real_slot);
         }
 
         match component {
             Expr::Field(name) => match root {
                 OwnedValue::Object(map) => {
                     // Pure tail recursion (no undo, nothing created) --
-                    // reassign `root` and loop instead of recursing.
+                    // reassign `root` and loop instead of recursing. A real
+                    // found key, so #2323's own vivify stays eligible for
+                    // whatever comes next.
                     if let Some(current) = map.get_mut(name) {
                         root = current;
                         steps = rest;
+                        real_slot = true;
                         continue;
                     }
                     // Same "reads as `null`, keep walking" rule as
@@ -37939,7 +38010,7 @@ fn delete_path_steps(
                     // `here` no longer gates this — a `?` on the missing step
                     // does not suppress what the tail itself raises, and the
                     // walk into a throwaway `null` cannot create the key.
-                    return delete_at_path_through_absent(rest, optional, yq_mode);
+                    return delete_at_path_through_absent(rest, optional);
                 }
                 // `null` tolerates any key — `null | del(.a.b)` and
                 // `{"x":null} | del(.x.a)` are both no-ops (#476) — but only
@@ -37953,8 +38024,16 @@ fn delete_path_steps(
                 // above, there is already a live slot to keep pointing at
                 // (it holds `null` and can never become anything else via a
                 // `del()`), so no detached scratch is needed at all.
+                //
+                // #2323: this *is* the null-tolerant case the new `real_slot`
+                // flag exists to mark -- `.a` was applied to an already-`null`
+                // root, not looked up on a real object, so whatever comes
+                // next is no longer vivify-eligible (confirmed live,
+                // `[1,2] | del(.[5].missing[2])` does not vivify `.missing`
+                // even though `.[5]` itself was a real #2314-padded slot).
                 OwnedValue::Null => {
                     steps = rest;
+                    real_slot = false;
                     continue;
                 }
                 _ if here => return Ok(()),
@@ -37986,6 +38065,7 @@ fn delete_path_steps(
                         DeleteIndexResolution::InRange(actual_idx) => {
                             root = &mut arr[actual_idx];
                             steps = rest;
+                            real_slot = true;
                             continue;
                         }
                         // #2314: a positive out-of-range mid-chain index
@@ -38004,9 +38084,12 @@ fn delete_path_steps(
                             // generically by this same loop's own
                             // `OwnedValue::Null` arms below, once it
                             // re-matches on the next iteration -- no need
-                            // to special-case the next component here.
+                            // to special-case the next component here. It's
+                            // a freshly *padded*, real slot, so #2323's own
+                            // vivify stays eligible.
                             root = &mut arr[index];
                             steps = rest;
+                            real_slot = true;
                             continue;
                         }
                         DeleteIndexResolution::PositiveOutOfRange(_)
@@ -38016,7 +38099,7 @@ fn delete_path_steps(
                             // tails, `?` or not (#477) — but not `[]`, which
                             // still raises `Cannot iterate over null (null)`
                             // (#527/#529).
-                            return delete_at_path_through_absent(rest, optional, yq_mode);
+                            return delete_at_path_through_absent(rest, optional);
                         }
                     }
                 }
@@ -38032,16 +38115,23 @@ fn delete_path_steps(
                 // each level: confirmed live, `[1,2,null,[null,null,null]]`,
                 // not `[1,2,null,null]`. jq has no such rule at all, so this
                 // is yq-mode only — jq keeps the plain "null | del(.[0].a)
-                // is a no-op" reading (#476).
-                OwnedValue::Null if yq_mode => {
+                // is a no-op" reading (#476). Gated on `real_slot` too (see
+                // this function's own doc comment): confirmed live,
+                // `[1,2] | del(.[5].missing[2])` -- `.missing` tolerated a
+                // `null` rather than finding a real key on one -- does not
+                // vivify here even though `real_slot` was true one step
+                // earlier for `.[5]` itself.
+                OwnedValue::Null if yq_mode && real_slot => {
                     *root = OwnedValue::Array(Vec::new());
                     continue;
                 }
                 // Same per-step `null` exemption as the `Field` case above —
                 // `null | del(.[0].a)` is a no-op (#476) -- loops in place
-                // for the same reason.
+                // for the same reason. Also reached in yq mode whenever
+                // `real_slot` is false (the vivify arm above didn't fire).
                 OwnedValue::Null => {
                     steps = rest;
+                    real_slot = false;
                     continue;
                 }
                 _ if here => return Ok(()),
@@ -38066,8 +38156,9 @@ fn delete_path_steps(
                 // produces. jq has no such rule (`null | del(.[])` still
                 // raises there), so this is gated to yq mode only, and runs
                 // ahead of the per-element re-classification below rather
-                // than through it.
-                if yq_mode && matches!(root, OwnedValue::Null) {
+                // than through it. Gated on `real_slot` too -- see this
+                // function's own doc comment.
+                if yq_mode && real_slot && matches!(root, OwnedValue::Null) {
                     *root = OwnedValue::Array(Vec::new());
                 }
                 // `rest` is turned into an `Expr::Pipe` at most once here
@@ -38121,13 +38212,13 @@ fn delete_path_steps(
                                     remove_indices.push(i);
                                 }
                                 YqDelSliceOutcome::DropParent(ref target) => {
-                                    delete_at_path(elem, target, optional, yq_mode)?;
+                                    delete_at_path(elem, target, optional, yq_mode, true)?;
                                 }
                                 YqDelSliceOutcome::Noop => {
                                     // Leave this element untouched.
                                 }
                                 YqDelSliceOutcome::NotApplicable => {
-                                    delete_path_steps(elem, rest, optional, yq_mode)?;
+                                    delete_path_steps(elem, rest, optional, yq_mode, true)?;
                                 }
                             }
                         }
@@ -38150,13 +38241,13 @@ fn delete_path_steps(
                                     remove_keys.push(key.clone());
                                 }
                                 YqDelSliceOutcome::DropParent(ref target) => {
-                                    delete_at_path(value, target, optional, yq_mode)?;
+                                    delete_at_path(value, target, optional, yq_mode, true)?;
                                 }
                                 YqDelSliceOutcome::Noop => {
                                     // Leave this entry untouched.
                                 }
                                 YqDelSliceOutcome::NotApplicable => {
-                                    delete_path_steps(value, rest, optional, yq_mode)?;
+                                    delete_path_steps(value, rest, optional, yq_mode, true)?;
                                 }
                             }
                         }
@@ -38178,7 +38269,7 @@ fn delete_path_steps(
             // `optional`, not `here`, as the baseline (#1294).
             Expr::Pipe(inner) => {
                 let spliced = splice_optional_group(inner, rest, here);
-                return delete_path_steps(root, &spliced, optional, yq_mode);
+                return delete_path_steps(root, &spliced, optional, yq_mode, real_slot);
             }
             // The chain continues *inside* the slice, so the delete happens
             // in the sub-array and the remainder is spliced back:
@@ -38197,8 +38288,12 @@ fn delete_path_steps(
                 // the `Field`/`Index` arms' own `Null` case above: `root`
                 // already points at a live `null` slot that can never become
                 // anything else via a `del()`, so there is no need for a
-                // detached scratch.
+                // detached scratch. #2323: a `Slice` never itself vivifies
+                // (confirmed live, `null | del(.[0:2])` stays `null` in real
+                // yq too, matching jq) -- also a null-tolerant pass-through,
+                // same as `Field`'s.
                 steps = rest;
+                real_slot = false;
                 continue;
             }
             // See `delete_at_path`'s own doc history for this arm (#1116/
@@ -38216,7 +38311,7 @@ fn delete_path_steps(
                         container_noop: false,
                         terminal_write: yq_mode,
                     },
-                    |sub| always_wrote(delete_path_steps(sub, rest, optional, yq_mode)),
+                    |sub| always_wrote(delete_path_steps(sub, rest, optional, yq_mode, true)),
                 )
                 .map(|_| ());
             }
@@ -38233,7 +38328,7 @@ fn delete_path_steps(
                 steps = rest;
                 continue;
             }
-            _ => return delete_at_path(root, first, here, yq_mode),
+            _ => return delete_at_path(root, first, here, yq_mode, real_slot),
         }
     }
 }
@@ -69387,6 +69482,107 @@ mod tests {
     }
 
     #[test]
+    fn test_del_through_absent_field_never_vivifies_yq_mode_2323() {
+        // #2323 review: `delete_at_path_through_absent`'s own synthetic
+        // scratch value must never be eligible for this fix's vivify --
+        // its whole contract is "the container is untouched," so a missing
+        // field must never *become* a real array just because the walk
+        // through it happened to reach an Index/Iterate step. Confirmed
+        // live: `{} | del(.missing[-1])` is `{}`, not the `-1`-out-of-range
+        // error a vivified-then-negative-indexed scratch would raise
+        // (negative indices are checked *before* the vivify's own
+        // out-of-range resolution, so this specifically pins that the
+        // negative-index check itself never fires against the scratch).
+        yq_query!(br"{}", r"del(.missing[-1])",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert!(obj.is_empty(), "expected {{}}, got {obj:?}");
+            }
+        );
+        yq_query!(br"{}", r"del(.missing[2])",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert!(obj.is_empty(), "expected {{}}, got {obj:?}");
+            }
+        );
+    }
+
+    #[test]
+    fn test_del_field_tolerated_null_disables_vivify_for_later_index_yq_mode_2323() {
+        // #2323 review: the vivify rule tracks *provenance*, not just
+        // "is root currently null" -- a `null` reached by *tolerating* a
+        // `Field`/`Slice` step against it (#476/#527's established
+        // null-exemption) is not vivify-eligible for whatever comes next,
+        // even when that `null` sits in an otherwise-real, already-padded
+        // array slot. Confirmed live: `[1,2] | del(.[5].missing[2])` is
+        // `[1,2,null,null,null,null]` -- `.[5]` itself is a real #2314-padded
+        // slot (vivify-eligible), but `.missing` tolerates that slot's
+        // `null` (#476, not a real key lookup), which disables the `[2]`
+        // step's own vivify -- unlike `[1,2] | del(.[5][2])` (no `Field` in
+        // between), which *does* vivify (covered by the chained test
+        // above). The negative-index sibling shares the same fix (the
+        // negative-index check would otherwise fire against a wrongly
+        // vivified array).
+        yq_query!(br"[1,2]", r"del(.[5].missing[2])",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(
+                    arr,
+                    vec![
+                        OwnedValue::Int(1), OwnedValue::Int(2),
+                        OwnedValue::Null, OwnedValue::Null, OwnedValue::Null, OwnedValue::Null,
+                    ]
+                );
+            }
+        );
+        yq_query!(br"[1,2]", r"del(.[5].missing[-1])",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(
+                    arr,
+                    vec![
+                        OwnedValue::Int(1), OwnedValue::Int(2),
+                        OwnedValue::Null, OwnedValue::Null, OwnedValue::Null, OwnedValue::Null,
+                    ]
+                );
+            }
+        );
+        // A bare `null | del(.a[2])` is the same shape without any padding
+        // noise -- `.a` tolerates the top-level `null`, disabling `[2]`'s
+        // own vivify.
+        yq_query!(br"null", r"del(.a[2])",
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
+    }
+
+    #[test]
+    fn test_del_comma_grouped_multi_terminal_key_stays_no_op_yq_mode_2323() {
+        // #2323 review: `delete_keys`'s own #2305/#2306 gate only extends a
+        // *single*-key batch (real yq's own multi-key extension is
+        // order-dependent, not replicable by this function's one-pass
+        // `retain` model -- #2306's own documented, deliberately deferred
+        // scope). Vivifying the comma-grouped trie's source unconditionally
+        // would trade the *pre-existing* "stays null" gap for a *new*,
+        // undocumented "vivifies to `[]` but the batch never actually
+        // extends" gap instead -- this pins that the fix stays at the
+        // pre-existing (not new) shape when 2+ terminal indices share one
+        // node. Confirmed live, order-independent: real yq answers
+        // `[null,null]` here (its own actual multi-key algorithm, #2306's
+        // scope, not replicated by this fix), and both `succinctly` orderings
+        // agree with each other even though neither matches real yq yet.
+        yq_query!(br"null", r"del(.[2],.[3])",
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
+        yq_query!(br"null", r"del(.[3],.[2])",
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
+        // One terminal index alongside one *continuation* at the same node
+        // is a different shape -- not 2+ terminal keys sharing a
+        // `delete_keys` batch -- and already vivifies correctly either way.
+        yq_query!(br"null", r"del(.[2], .[3].a)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Null, OwnedValue::Null, OwnedValue::Null]);
+            }
+        );
+    }
+
+    #[test]
     fn test_del_through_a_missing_field_walks_the_rest_against_null() {
         // #527: a field the object doesn't have reads as `null`, and jq keeps
         // walking the rest of the path against that `null` rather than
@@ -73320,7 +73516,7 @@ mod tests {
         #[test]
         fn test_delete_at_path_refuses_an_unresolved_key() {
             let mut root = OwnedValue::Null;
-            let err = delete_at_path(&mut root, &unresolved(), false, false).unwrap_err();
+            let err = delete_at_path(&mut root, &unresolved(), false, false, true).unwrap_err();
             assert_eq!(
                 err.message,
                 "internal error: unresolved computed index in delete path"
@@ -73437,7 +73633,7 @@ mod tests {
         #[test]
         fn test_delete_at_path_refuses_an_unresolved_slice() {
             let mut root = OwnedValue::Null;
-            let err = delete_at_path(&mut root, &unresolved(), false, false).unwrap_err();
+            let err = delete_at_path(&mut root, &unresolved(), false, false, true).unwrap_err();
             assert_eq!(
                 err.message,
                 "internal error: unresolved computed slice in delete path"
