@@ -13659,6 +13659,29 @@ fn test_resolve_index_expr_checks_trackability_every_key_2139() -> Result<()> {
     Ok(())
 }
 
+/// #2248 (found during #2245's own live-oracle verification): the #843/#986
+/// "is target trackable" check used to scan `target`'s whole branch list
+/// *before* any of them were indexed, so hitting an untrackable branch
+/// anywhere in that list discarded every trackable branch that came before
+/// it -- even ones already known to resolve cleanly. Fixed by checking each
+/// branch's trackability right before indexing it, so branches ahead of the
+/// untrackable one still contribute to the output prefix. Verified against
+/// jq 1.7.1: `path((.,5)[(0,error("mid"))])` on `null` prints `[0]` (the `.`
+/// branch's own successful index) before raising "Invalid path expression".
+#[test]
+fn test_resolve_index_expr_untrackable_branch_keeps_earlier_prefix_2248() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"path((.,5)[(0,error("mid"))])"#], Some("null"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[0]\n");
+    assert!(
+        stderr.contains("Invalid path expression"),
+        "stderr: {stderr:?}"
+    );
+
+    Ok(())
+}
+
 /// #972 Guard A: the exact shape that got PR #985 reverted for silent data
 /// corruption on the write side. Before the Stage 1 precursor fix above,
 /// `resolve_index_expr`'s untruncated `Err` prefix for
@@ -14508,6 +14531,27 @@ fn test_resolve_slice_expr_target_not_evaluated_when_end_always_empty_2245() -> 
     assert!(
         stderr.is_empty(),
         "target's stderr side effect should never fire: stderr: {stderr:?}"
+    );
+
+    Ok(())
+}
+
+/// #2248, `resolve_slice_expr`'s identical sibling to
+/// `resolve_index_expr`'s own fix above. Verified against jq 1.7.1:
+/// `path((.,5)[(0,1):(2,error("mid"))])` on `null` prints
+/// `[{"start":0,"end":2}]` (the `.` branch's own successful slice) before
+/// raising "Invalid path expression".
+#[test]
+fn test_resolve_slice_expr_untrackable_branch_keeps_earlier_prefix_2248() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path((.,5)[(0,1):(2,error("mid"))])"#],
+        Some("null"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[{\"start\":0,\"end\":2}]\n");
+    assert!(
+        stderr.contains("Invalid path expression"),
+        "stderr: {stderr:?}"
     );
 
     Ok(())
