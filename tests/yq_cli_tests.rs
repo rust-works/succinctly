@@ -28361,6 +28361,104 @@ fn test_negative_index_out_of_range_survives_any_all_generator_2254() -> Result<
     Ok(())
 }
 
+/// #2254 review follow-up: three more independent `optional`-suppression
+/// gaps found by a full review round, all in `eval.rs`'s path-context/
+/// library-route evaluator, none exercised by any test above (which only
+/// combine `?` with plain value-position output, never a path-context
+/// builtin like `key`, nor a computed index against an *owned* -- not
+/// cursor-backed -- array target under `--slurp`). Each repro pairs the
+/// suppressed-`?` query with its non-`?` control to pin that `?` is a
+/// true no-op here, not merely "less wrong."
+#[test]
+fn test_negative_index_out_of_range_survives_path_context_2254() -> Result<()> {
+    // A literal negative index wrapped in bare `?`, piped into a
+    // path-context builtin (`key`) -- this doesn't match the dedicated
+    // `Expr::Optional(IndexExpr | SliceExpr)` bracket-bypass arm (that's a
+    // different AST shape), so it falls to `eval_stage_with_path_context`'s
+    // *general* `Expr::Optional` arm, which unconditionally swallowed any
+    // error before this fix (`.a[-5]? | key` wrongly exited 0 with no
+    // output).
+    let (out, stderr, code) =
+        run_yq_stdin_with_stderr(".a[-5]? | key", "a: [1, 2]\n", &["-o", "json"])?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+    let (out, stderr, code) =
+        run_yq_stdin_with_stderr(".a[-5] | key", "a: [1, 2]\n", &["-o", "json"])?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+
+    // A genuinely computed (non-foldable) negative index, piped into `key`
+    // -- routes through the dedicated bracket-bypass arm and
+    // `eval_index_expr_with_path_context`'s own `bracket_optional` check,
+    // which also wrongly gated on it before this fix.
+    let (out, stderr, code) =
+        run_yq_stdin_with_stderr(".a[(1*-5)]? | key", "a: [1, 2]\n", &["-o", "json"])?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+    let (out, stderr, code) =
+        run_yq_stdin_with_stderr(".a[(1*-5)] | key", "a: [1, 2]\n", &["-o", "json"])?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+
+    // In-bounds negative wraparound and positive out-of-range are both
+    // unaffected by the fix -- `?` is still a true no-op for either, not
+    // just for the error case.
+    let (out, code) = run_yq_stdin(".a[-1]? | key", "a: [1, 2]\n", &["-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "-1");
+    let (out, code) = run_yq_stdin(".a[5]? | key", "a: [1, 2]\n", &["-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "5");
+
+    Ok(())
+}
+
+/// #2254 review follow-up: `--slurp` routes the whole query through
+/// `eval.rs`'s plain (non-path-context) evaluator, whose `eval_index_expr`
+/// dispatches a computed key against an *owned* (already-materialized, not
+/// cursor-backed) array target through a separate `KeyTargets::Owned` loop
+/// -- distinct from the ordinary `KeyTargets::Borrowed` loop most computed
+/// indexing goes through, and the one place this sweep found still gating
+/// on `optional` for a value-position (no path-context builtin needed)
+/// query.
+#[test]
+fn test_negative_index_out_of_range_survives_owned_target_computed_index_2254() -> Result<()> {
+    let (out, stderr, code) = run_yq_stdin_with_stderr(
+        "([1,2]+[])[(1*-5)]?",
+        "a: [1, 2]\n",
+        &["-o", "json", "--slurp"],
+    )?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+    let (out, stderr, code) = run_yq_stdin_with_stderr(
+        "([1,2]+[])[(1*-5)]",
+        "a: [1, 2]\n",
+        &["-o", "json", "--slurp"],
+    )?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+
+    Ok(())
+}
+
 /// #2254's jq-mode control: jq has no equivalent of this yq-only rule, so
 /// jq mode must be entirely unaffected by the fix -- every case above
 /// answers `null`, never raises.

@@ -15909,11 +15909,11 @@ fn index_object_by_name<'a, W: Clone + AsRef<[u64]>>(
 /// yq mode only (#2254): a negative index whose magnitude still exceeds the
 /// array length after resolving against it raises in real yq
 /// (`yq_negative_index_out_of_range`), where jq treats it the same as a
-/// positive out-of-range index (`null`). `optional` suppresses it like any
-/// other read-time indexing error here -- real yq's own lexer doesn't even
-/// accept `?` after a bracket index in this position, so there's no oracle
-/// answer to match either way; treating it like every other indexing error
-/// in this function is the simpler, more consistent default.
+/// positive out-of-range index (`null`). Unlike every other indexing error
+/// in this function, `optional` does *not* suppress it -- see that
+/// constructor's own doc comment for the live-confirmed oracle behavior and
+/// `EvalError::is_yq_negative_index_error`, consulted by every `?`/`try`
+/// dispatch point on the read side to keep it that way.
 #[inline]
 fn index_array_by_position<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
@@ -16584,14 +16584,18 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     escape_with_prefix!(Control::Error(cannot_reserve_cross_product(&[ts.len()])));
                 }
                 for t in &ts {
-                    // #2254: checked ahead of `index_one_owned`, which has
-                    // no notion of this yq-only rule -- see
+                    // #2254 review: checked ahead of `index_one_owned`,
+                    // which has no notion of this yq-only rule -- see
                     // `yq_negative_index_error`'s own doc comment for why
                     // it isn't threaded into that function instead.
+                    // Unconditional, not gated on `optional` -- the sibling
+                    // `Borrowed` loop above is already unconditional here
+                    // (via `index_one` -> `index_array_by_position`), and
+                    // this arm silently diverging from it under `optional`
+                    // was a real, live-reproducible bug this same review
+                    // caught (`--slurp` with a computed key against an
+                    // owned/constructed array target).
                     if let Some(e) = yq_negative_index_error::<S>(t, k) {
-                        if optional {
-                            continue;
-                        }
                         escape_with_prefix!(Control::Error(e));
                     }
                     match index_one_owned(t, k, optional) {
@@ -31537,13 +31541,13 @@ fn eval_index_expr_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemanti
             } else {
                 (None, probed)
             };
-            // #2254: same check as `eval_index_expr`'s own computed-key
-            // loop, ahead of `index_one_owned`, which has no notion of this
-            // yq-only rule.
+            // #2254 review: same check as `eval_index_expr`'s own
+            // computed-key loop, ahead of `index_one_owned`, which has no
+            // notion of this yq-only rule. Unconditional, not gated on
+            // `bracket_optional` -- same live-reproducible suppression bug
+            // as that sibling loop, for the path-context/computed-index
+            // combination (`.a[(EXPR)]? | key`).
             if let Some(e) = yq_negative_index_error::<S>(&t, k) {
-                if bracket_optional {
-                    continue;
-                }
                 return partial(core::mem::take(&mut results), Control::Error(e));
             }
             match index_one_owned(&t, k, bracket_optional) {
@@ -32181,17 +32185,19 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // yq mode only (#2254): real yq raises on a negative index
                 // whose magnitude still exceeds the array length, where jq
                 // (and yq's own positive-OOB case) both agree on `null` --
-                // `optional` suppresses it like every other negative-index
-                // call site this same fix touches.
-                if *idx < 0 && S::TAG == EvalTag::Yq && arr.len() as i64 + idx < 0 {
-                    return if optional {
-                        QueryResult::None
-                    } else {
-                        QueryResult::Error(EvalError::yq_negative_index_out_of_range(
-                            *idx,
-                            arr.len(),
-                        ))
-                    };
+                // unconditional, not suppressed by `optional` (review: this
+                // arm used to gate on it, a real, live-reproducible bug --
+                // see `EvalError::yq_negative_index_out_of_range`'s own doc
+                // comment). Routed through the shared `yq_negative_index_check`
+                // helper rather than a hand-rolled duplicate of its
+                // condition, matching every other fixed call site.
+                let resolved = if *idx < 0 {
+                    arr.len() as i64 + idx
+                } else {
+                    *idx
+                };
+                if let Some(e) = yq_negative_index_check::<S>(*idx, resolved, arr.len()) {
+                    return QueryResult::Error(e);
                 }
                 return continue_rest_with_borrowed_value::<W, S>(
                     &OwnedValue::Null,
@@ -32554,7 +32560,21 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 false,
             );
             let caught = match inner_result {
+                // #2254 review: an uncatchable error (a yq negative-index
+                // raise, a decode failure, an invalid-path-expression
+                // complaint) must survive this bare `?` the same way
+                // `resolve_node`'s own `Expr::Optional` arm already
+                // guarantees for path-tracking evaluation -- confirmed live
+                // that `.a[-5]? | key` wrongly swallowed the error and
+                // exited 0 with no output before this guard existed. `Break`
+                // has no error payload to check and stays unconditionally
+                // caught here, matching `eval_try`/`each_try`'s own bare-`?`
+                // semantics (#562).
+                QueryResult::Error(e) if e.is_uncatchable() => QueryResult::Error(e),
                 QueryResult::Error(_) | QueryResult::Break(_) => QueryResult::None,
+                QueryResult::Partial(prefix, Control::Error(e)) if e.is_uncatchable() => {
+                    QueryResult::Partial(prefix, Control::Error(e))
+                }
                 QueryResult::Partial(prefix, Control::Error(_) | Control::Break(_)) => {
                     owned_vec_to_result(prefix)
                 }

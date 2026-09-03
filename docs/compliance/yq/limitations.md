@@ -1494,9 +1494,16 @@ on the read side -- `eval_try`/`each_try` in `eval.rs`, `try_single_generic`/
 the single-value pair: `any(.a[-5]?; .)` runs its generator argument through `each_try`, not
 `eval_try`, and was found still swallowing the error until this same sweep covered it too) --
 and via `EvalError::is_uncatchable`, extended to include it, at `resolve_node`'s own
-`Expr::Try`/`Expr::Optional` pair (`eval.rs`) for `path()`/`getpath`'s path-tracking context.
-This keeps it unsuppressible the same way `is_decode_failure` already does for a decode
-failure.
+`Expr::Try`/`Expr::Optional` pair (`eval.rs`) for `path()`/`getpath`'s path-tracking context,
+and at `eval_stage_with_path_context`'s own general `Expr::Optional` arm (`eval.rs`), which
+governs a bare `?` combined with a path-context-triggering builtin elsewhere in the same
+pipe (`key`/`parent`/`file_index`) -- confirmed live that `.a[-5]? | key` wrongly exited 0
+with no output before this arm was covered too. Two further computed-index call sites
+(`eval_index_expr`'s and `eval_index_expr_with_path_context`'s own `Owned`-target loops --
+reached via `--slurp` against a constructed rather than cursor-backed array, and via a
+computed bracket key piped into a path-context builtin, respectively) had the identical
+gate-on-`optional` bug and are fixed the same way. This keeps the error unsuppressible the
+same way `is_decode_failure` already does for a decode failure.
 
 A few more independent copies of the same arithmetic remain unfixed, in lower-traffic
 call sites: `path()`'s own walker, `pick(paths)`, `reduce`/`foreach`'s lazy-fold index
