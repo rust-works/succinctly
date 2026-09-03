@@ -28955,6 +28955,55 @@ fn test_del_negative_index_out_of_range_raises_2268() -> Result<()> {
     Ok(())
 }
 
+/// #2268 (round 2, code review): `delete_path_steps`'s own mid-chain
+/// `Expr::Index` arm -- used for a pipe-chained `del()` path like
+/// `del(.a[-5].x)`, distinct from `delete_at_path`'s single-step dispatch
+/// above -- shared the identical gap. Confirmed live before this fix.
+#[test]
+fn test_del_negative_index_out_of_range_raises_mid_chain_2268() -> Result<()> {
+    let (out, stderr, code) =
+        run_yq_stdin_with_stderr("del(.a[-5].x)", "a: [1, 2]\nb: 3\n", &["-o", "json"])?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+
+    // Well-formed mid-chain deletion is unaffected.
+    let (out, code) = run_yq_stdin(
+        "del(.a[0].x)",
+        "a:\n  - x: 1\n    y: 2\n",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "{\"a\":[{\"y\":2}]}");
+
+    Ok(())
+}
+
+/// #2268 (round 2, code review): `delete_trie_array`'s own `ArrayStep::Index`
+/// mid-navigation arm -- comma-grouped `del()` paths like
+/// `del(.a[-5].x, .c)` -- shared the identical gap, and real yq aborts the
+/// *whole* comma-grouped call on it (`.c` is not deleted either). Confirmed
+/// live before this fix.
+#[test]
+fn test_del_negative_index_out_of_range_raises_comma_grouped_2268() -> Result<()> {
+    let (out, stderr, code) =
+        run_yq_stdin_with_stderr("del(.a[-5].x, .c)", "a: [1, 2]\nc: 3\n", &["-o", "json"])?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+
+    // Well-formed comma-grouped deletion is unaffected.
+    let (out, code) = run_yq_stdin("del(.a[0], .c)", "a: [1, 2]\nc: 3\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "{\"a\":[2]}");
+
+    Ok(())
+}
+
 /// #2268: `delpaths()`'s own array arms (`delete_paths_under`'s mid-path
 /// navigation, `delete_keys`'s terminal batch) share the identical gap --
 /// both confirmed live to silently no-op before this fix.

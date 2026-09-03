@@ -36892,7 +36892,16 @@ fn delete_trie_array(
                 .expect("index_groups holds live indices indices");
             match step {
                 ArrayStep::Index(idx) => {
-                    match resolve_read_index(&OwnedValue::Int(*idx), arr.len()) {
+                    let key = OwnedValue::Int(*idx);
+                    // #2268: real yq raises here too -- confirmed live,
+                    // `del(.a[-5].x, .c)` on `{"a":[1,2],"c":3}` raises the
+                    // same "index [-5] out of range" a single-path
+                    // `del(.a[-5])` does, and aborts the *whole* comma-
+                    // grouped call (`.c` is not deleted either).
+                    if let Some(err) = yq_negative_index_error_for_len(yq_mode, &key, arr.len()) {
+                        return Err(err);
+                    }
+                    match resolve_read_index(&key, arr.len()) {
                         Some(actual) => {
                             let target = &mut arr[actual];
                             let old = core::mem::replace(target, OwnedValue::Null);
@@ -36921,11 +36930,12 @@ fn delete_trie_array(
         }
     }
 
-    // Terminal indices go through `delete_keys`, which already silently drops
-    // an index that names nothing — including an out-of-range one, `?` or not
-    // (#415/#477) — and resolves every negative index against the length the
-    // array had on entry, in one batch, so overlapping ranges union rather
-    // than compound (#424).
+    // Terminal indices go through `delete_keys`, which silently drops an
+    // index that names nothing in jq mode (or a positive-out-of-range one in
+    // any mode), `?` or not (#415/#477) — but raises on a negative
+    // out-of-range one in yq mode instead (#2268) — and resolves every
+    // negative index against the length the array had on entry, in one
+    // batch, so overlapping ranges union rather than compound (#424).
     let doomed: Vec<OwnedValue> = node
         .indices
         .iter()
@@ -37596,7 +37606,16 @@ fn delete_path_steps(
             },
             Expr::Index { idx, .. } => match root {
                 OwnedValue::Array(arr) => {
-                    match resolve_read_index(&OwnedValue::Int(*idx), arr.len()) {
+                    let key = OwnedValue::Int(*idx);
+                    // #2268: real yq raises here too, mid-chain -- confirmed
+                    // live, `del(.a[-5].x)` on `{"a":[1,2]}` raises the same
+                    // "index [-5] out of range" a terminal `del(.a[-5])`
+                    // does, not just `delete_at_path`'s own single-step
+                    // equivalent (fixed alongside this).
+                    if let Some(err) = yq_negative_index_error_for_len(yq_mode, &key, arr.len()) {
+                        return Err(err);
+                    }
+                    match resolve_read_index(&key, arr.len()) {
                         Some(actual_idx) => {
                             root = &mut arr[actual_idx];
                             steps = rest;

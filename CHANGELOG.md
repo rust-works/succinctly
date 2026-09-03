@@ -293,11 +293,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   raising** (#2268): #2254 already fixed every ordinary *read* (`.a[-N]`) to raise real yq's
   own "index [N] out of range" error, but `del()`/`delpaths()` shared the identical gap with a
   more severe symptom — not a differently-worded error, but no error at all (exit 0, document
-  unchanged), where real yq aborts the write. Three independent array arms shared it
-  (`delete_at_path`'s `del()` dispatch, `delete_paths_under`'s `delpaths()` mid-path
-  navigation, `delete_keys`'s `delpaths()` terminal batch), fixed via a new `bool`-based
-  sibling of #2254's own `yq_negative_index_check`/`yq_negative_index_error` helpers (these
-  three take a plain `yq_mode: bool`, not `S: EvalSemantics`). Unlike the read-side fix, not
+  unchanged), where real yq aborts the write. Five independent array arms shared it
+  (`delete_at_path`'s single-step `del()` dispatch, `delete_path_steps`'s mid-chain `del()`
+  equivalent for a pipe-chained path like `del(.a[-5].x)`, `delete_trie_array`'s equivalent for
+  a comma-grouped path like `del(.a[-5].x, .c)` — code review found the latter two, missed in
+  the first pass — plus `delpaths()`'s own `delete_paths_under` mid-path navigation and
+  `delete_keys` terminal batch), fixed via a new `bool`-based sibling of #2254's own
+  `yq_negative_index_check`/`yq_negative_index_error` helpers (all five take a plain
+  `yq_mode: bool`, not `S: EvalSemantics`). Unlike the read-side fix, not
   suppressible by an earlier `?` in the path chain — confirmed live, real yq's own
   `del(.a?[-5])` still raises. One residual divergence documented, not chased: when grouped
   with an earlier same-array deletion in one `delpaths()` call, real yq's own error reports
