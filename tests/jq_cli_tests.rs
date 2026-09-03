@@ -22957,6 +22957,41 @@ fn test_jq_missing_delimiter_raises_through_nonreserializing_filters_1677() -> R
     Ok(())
 }
 
+/// #2210: `evaluate_bytes_streaming`'s general path (the non-M2,
+/// non-`-S` route, reached once M2's own fast path declines a malformed
+/// document -- `{"a": [,]}`'s stray comma inside a nested empty container is
+/// exactly the shape M2 now correctly declines rather than silently
+/// accepting) walks into `.a`'s value and writes `{"a":` before discovering
+/// the fault, leaking that prefix to stdout ahead of the error. Confirmed
+/// this is the *same* documented, deliberate trade-off
+/// `docs/compliance/jq/limitations.md`'s "A fault found by walking to it
+/// leaves the prefix on stdout" section already pins for `[1,,3] | .[]`
+/// (`test_jq_missing_delimiter_raises_through_nonreserializing_filters_1677`
+/// above), not a new inconsistency needing its own fix -- both paths reach
+/// the fault only by walking to it, which is the cost semi-indexing exists
+/// to avoid paying up front. This was unreachable through this exact input
+/// shape before #1576's own M2 nested-empty-container fix started correctly
+/// declining it (M2 used to silently accept `{"a": [,]}` as `{"a":[]}`,
+/// exit 0, never falling back here at all).
+#[test]
+fn test_jq_general_streaming_path_leaks_prefix_before_nested_comma_fault_2210() -> Result<()> {
+    let (out, stderr, code) = run_jq_full(&["-c", "."], Some(r#"{"a": [,]}"#))?;
+    assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
+    assert_eq!(out, "{\"a\":", "unexpected output {out:?}");
+    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+
+    // `-S` forces the fully materializing path, which validates before
+    // printing anything -- confirms the two paths' outputs genuinely
+    // differ only in the accepted prefix, not in whether the fault is
+    // caught at all.
+    let (out, stderr, code) = run_jq_full(&["-c", "-S", "."], Some(r#"{"a": [,]}"#))?;
+    assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
+    assert!(out.is_empty(), "unexpected output {out:?}");
+    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+
+    Ok(())
+}
+
 /// #1677: a plain field access that doesn't need to reach a leaf's own
 /// container -- `.a` where `.a` is itself a scalar with a malformed
 /// delimiter -- raises too. Unlike the nested case
