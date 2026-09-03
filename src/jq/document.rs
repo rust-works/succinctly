@@ -1065,14 +1065,11 @@ pub trait DocumentFields: Sized + Clone {
         }
         // #2261: no match found anywhere, so this walk already reached the
         // object's true end -- the trailing-gap check is free here, same
-        // as every other #2261 fix, via the same `next_sibling()` hop
-        // `DistinctKeyCursors::trailing_gap_ok` uses.
-        if let Some(key_cursor) = last_key_cursor {
-            if let Some(value_cursor) = key_cursor.next_sibling() {
-                if !trailing_element_gap_ok(&value_cursor, b'}') {
-                    return Err(self.malformed_member_error());
-                }
-            }
+        // as every other #2261 fix, via `last_field_trailing_gap_ok`
+        // (#2307), consolidating what used to be a fourth inline copy of
+        // this same hop-then-check shape.
+        if !last_field_trailing_gap_ok(last_key_cursor, b'}') {
+            return Err(self.malformed_member_error());
         }
         Ok(false)
     }
@@ -1563,6 +1560,34 @@ pub fn trailing_element_gap_ok<C: DocumentCursor>(last_cursor: &C, close_char: u
     }
 }
 
+/// [`trailing_element_gap_ok`], for a key-only object walk that has
+/// tracked only the last field's *key* cursor (`census`, `checked_len`,
+/// `contains_checked`'s exhaustion path, [`DistinctKeyCursors`]'s own
+/// field of the same name) rather than its value.
+///
+/// `last_key_cursor` is `None` for an empty object or a walk that never
+/// reached a true last key; either way this answers `true` -- nothing to
+/// flag, the same "can't determine, skip" convention every sibling gap
+/// check in this module follows. Otherwise hops to the key's value via
+/// `next_sibling()` -- an O(1) BP hop mirroring how every
+/// [`DocumentFields::uncons`] impl already derives a field's value cursor
+/// from its key cursor -- and defers to [`trailing_element_gap_ok`],
+/// inheriting its own container-typed-last-child residual gap (#2243).
+///
+/// Four call sites duplicated this exact hop-then-check inline before
+/// consolidating here (code review, #2307): [`DistinctKeyCursors`]'s own
+/// `trailing_gap_ok`, `contains_checked`'s exhaustion path, and `census`/
+/// `checked_len`'s post-loop checks below.
+pub(crate) fn last_field_trailing_gap_ok<C: DocumentCursor>(
+    last_key_cursor: Option<C>,
+    close_char: u8,
+) -> bool {
+    match last_key_cursor.and_then(|c| c.next_sibling()) {
+        Some(value_cursor) => trailing_element_gap_ok(&value_cursor, close_char),
+        None => true,
+    }
+}
+
 /// [`value_delimiter_ok`], for a key-only walk (`census`, `checked_len`,
 /// [`DistinctKeyCursors`]) that has not resolved a value cursor at all.
 ///
@@ -1866,20 +1891,11 @@ fn census<F: DocumentFields>(fields: &F) -> KeyCensus {
     malformed |= walk.ends_unpaired();
     // #2307: trailing stray comma after a real last field (`{"a":1,}`) --
     // `census` never checked this at all, unlike every sibling walk in this
-    // file (`effective_keys`'s `DistinctKeyCursors::trailing_gap_ok`,
-    // `DocumentElements::len_checked`'s own array counterpart). `walk`
-    // finished naturally, so `last_key_cursor` is genuinely the object's
-    // last field -- its value's own `next_sibling()` hop is the same O(1)
-    // move `contains_checked` already uses, mirroring `len_checked`'s
-    // unconditional post-loop check (no "is this really last" guard
-    // needed there either, for the identical reason).
-    if let Some(last) = &last_key_cursor {
-        if let Some(value_cursor) = last.next_sibling() {
-            if !trailing_element_gap_ok(&value_cursor, b'}') {
-                malformed = true;
-            }
-        }
-    }
+    // file. `walk` finished naturally, so `last_key_cursor` is genuinely
+    // the object's last field; see `last_field_trailing_gap_ok`'s own doc
+    // comment for the O(1) hop and the container-typed-last-child residual
+    // gap (#2243) this inherits.
+    malformed |= !last_field_trailing_gap_ok(last_key_cursor, b'}');
     hashes.sort_unstable();
     let (shared, distinct_hashes) = shared_hashes(&hashes);
     if shared.is_empty() {
@@ -2270,19 +2286,11 @@ impl<F: DocumentFields> DistinctKeyCursors<F> {
     /// one this same walk already flagged malformed for an unrelated
     /// reason) has no reliable "last field" answer to check yet.
     ///
-    /// `last_key_cursor` (this struct's own private field) tracks the key; the value
-    /// this check needs sits at that key's own `next_sibling()` -- an O(1)
-    /// BP hop mirroring how every [`DocumentFields::uncons`] impl derives a
-    /// field's value cursor from its key cursor in the first place (see
-    /// `JsonFields::uncons`), run once here rather than during the walk.
-    /// `None` (an empty object, or a format whose cursor carries no
-    /// position) answers `true` -- nothing to flag, same "can't determine,
-    /// skip" convention every sibling gap check in this module follows.
+    /// `last_key_cursor` (this struct's own private field) tracks the key;
+    /// see `last_field_trailing_gap_ok` (#2307) for how the value cursor
+    /// this check needs is derived from it.
     pub fn trailing_gap_ok(&self, close_char: u8) -> bool {
-        match self.last_key_cursor.and_then(|c| c.next_sibling()) {
-            Some(value_cursor) => trailing_element_gap_ok(&value_cursor, close_char),
-            None => true,
-        }
+        last_field_trailing_gap_ok(self.last_key_cursor, close_char)
     }
 }
 
@@ -2561,13 +2569,16 @@ fn checked_len<F: DocumentFields>(fields: &F) -> Result<usize, EvalError> {
         return Err(walk.malformed_member_error());
     }
     // #2307: trailing stray comma after a real last field (`{"a":1,}`) --
-    // same gap, same fix as `census` above.
-    if let Some(last) = &last_key_cursor {
-        if let Some(value_cursor) = last.next_sibling() {
-            if !trailing_element_gap_ok(&value_cursor, b'}') {
-                return Err(fields.malformed_member_error());
-            }
-        }
+    // same gap, same fix as `census` above; see `last_field_trailing_gap_ok`.
+    // `fields`, not `walk` (unlike every error return above): `walk`'s own
+    // `key_cursor` is already `None` here (the walk just exhausted), which
+    // would fall back to `malformed_member_error`'s generic "Invalid JSON
+    // text" wording instead of the specific, re-validated message `fields`
+    // (still holding its original cursor) produces -- `JsonFields::text()`
+    // reads the whole document regardless of position, so this costs
+    // nothing, only picks the more precise of two equally-cheap cursors.
+    if !last_field_trailing_gap_ok(last_key_cursor, b'}') {
+        return Err(fields.malformed_member_error());
     }
     Ok(count)
 }

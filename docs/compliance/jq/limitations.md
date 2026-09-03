@@ -1526,22 +1526,33 @@ case outside this issue's own five repros, a scoped follow-up rather than
 opportunistic scope creep. Pinned as still open by
 `test_jq_cursor_transparent_fast_paths_empty_container_stray_comma_remains_a_known_gap_2261`.
 
-**`length` (objects).** Not one of this issue's own five repros, but
-checked for consistency: `{"a":1,}| length` also stays open. `length`'s
-object arm (`effective_len_checked` → `census`, `document.rs`) walks with
-`uncons_key` specifically to avoid resolving any field's *value* at all
-(#1514: "a key-only walk pays for one `key()` and no `value()`" --
-`census`/`checked_len` never call `field.value_cursor()`, unlike every
-fixed path above). Retrofitting the trailing-value check here would need
-the last field's value cursor, which this walk deliberately never
-resolves -- adding it would either (a) always resolve one extra value
-cursor from a field that might not even be the last one until the walk
-finishes (a real, if small, per-call cost the #1514 design specifically
-avoids paying), or (b) require a broader trait-level change to expose a
-"free" value cursor per key-only step, which is a larger architectural
-change than a single-issue scope justifies. Left open, matching this
-same "would cost more than length's own answer" reasoning `#1629`
-established for the object's own positional-index case above.
+**`length` (objects) -- fixed by #2307/#2311.** Not one of this issue's own
+five repros, originally left open here with reasoning that turned out to be
+wrong: this entry used to claim closing the gap would need either paying to
+resolve an extra value cursor per call, or a "larger architectural change."
+Neither was true. `census`/`checked_len` (`document.rs`) already retain the
+last-visited key's *cursor* at zero extra cost (same as
+`DistinctKeyCursors`/`contains_checked`); once the walk finishes naturally
+that cursor's own `next_sibling()` is an O(1) BP hop to its value -- the
+exact same "free" derivation `DocumentFields::uncons` already performs to
+turn a key cursor into a value cursor in the first place, not a fresh
+resolve. `{"a":1,} | length` now raises in both modes (`census`'s
+`collapse: true` path and `checked_len`'s `collapse: false` one),
+consolidated into a shared `last_field_trailing_gap_ok` helper alongside
+`DistinctKeyCursors::trailing_gap_ok`/`contains_checked`'s own identical
+hop (code review on #2311, found by mistake while writing #2293's own
+parity test -- neither PR's original scope named this).
+
+**Residual gap, inherited from `trailing_element_gap_ok` itself, not new
+here:** a trailing comma is only caught when the object's real last
+field's *value* is a scalar. When it's a container (array/object, empty or
+not), `trailing_element_gap_ok`'s own unconditional `is_container()` early
+return means no text position is ever resolved to check against -- the
+same #2243 residual every other #2261-family fix in this file already has
+(`array` `length`/`len_checked`, `has(key)`, `keys`, ...), now shared by
+object `length` too. `{"a":{"x":1},} | length` still answers `1` instead
+of raising. Pinned as still open by
+`test_jq_length_object_trailing_comma_container_last_value_still_a_known_gap_2307`.
 
 ### Partial output before the error, on the two genuinely streaming writers
 
@@ -1765,11 +1776,13 @@ and differently-shaped problem than this section's own fixes):
 
   Writing that parity test also surfaced a further, unrelated, **live and
   CLI-reachable** bug shared by *both* evaluators: `{"a":1,} | length` in jq
-  mode (`collapse: true`) silently returns `1` instead of raising --
-  `effective_len_checked`'s `census` path never calls `trailing_gap_ok` at
-  all, unlike every sibling helper in this file. Filed as #2307; not fixed
-  by #2293, which only brings `eval.rs` in line with `eval_generic.rs`'s
-  *existing* behavior, not fixes a bug both evaluators already shared.
+  mode (`collapse: true`) silently returned `1` instead of raising --
+  `effective_len_checked`'s `census` path never called `trailing_gap_ok` at
+  all, unlike every sibling helper in this file. Not fixed by #2293, which
+  only brought `eval.rs` in line with `eval_generic.rs`'s *existing*
+  behavior, not a bug both evaluators already shared -- filed and fixed
+  separately as #2307/#2316; see this doc's own "`length` (objects)"
+  entry above for the fix and its residual gap.
 
 Two further leads from the same sweep were investigated and **not**
 reproduced live (so not reported as confirmed bugs, only as ruled out):

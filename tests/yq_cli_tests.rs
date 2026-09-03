@@ -1706,6 +1706,30 @@ fn test_yq_length_object_rejects_trailing_comma_2307() -> Result<()> {
     Ok(())
 }
 
+/// #2307's own remaining, deliberately deferred gap (yq-mode twin of
+/// `jq_cli_tests.rs`'s `test_jq_length_object_trailing_comma_container_last_value_still_a_known_gap_2307`):
+/// `checked_len` shares `census`'s inherited #2243 residual --
+/// `trailing_element_gap_ok`'s unconditional `is_container()` early return
+/// -- so a trailing stray comma is only caught when the object's real last
+/// field's value is a scalar, not a container. Pinned here so a future fix
+/// for this narrower residual updates this test rather than landing
+/// uncovered.
+#[test]
+fn test_yq_length_object_trailing_comma_container_last_value_still_a_known_gap_2307() -> Result<()>
+{
+    for input in [r#"{"a":{"x":1},}"#, r#"{"a":[1,2],}"#] {
+        let (out, code) = run_yq_stdin(
+            ".[0] | length",
+            input,
+            &["--input-format", "json", "--slurp"],
+        )?;
+        assert_eq!(code, 0, "input={input}");
+        assert_eq!(out.trim(), "1", "input={input}");
+    }
+
+    Ok(())
+}
+
 /// #1738: the `--input-format json` bridge's own `DisplayKeyGuard` check
 /// was missing entirely -- unlike every other `to_owned`-shaped
 /// materializer (#1642) -- so a decode-failure key colliding with another

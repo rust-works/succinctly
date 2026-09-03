@@ -22602,6 +22602,35 @@ fn test_jq_length_object_rejects_trailing_comma_2307() -> Result<()> {
     Ok(())
 }
 
+/// #2307's own remaining, deliberately deferred gap -- inherited from
+/// `trailing_element_gap_ok`'s unconditional `is_container()` early return
+/// (the same #2243 residual `array` `length` (`len_checked`), `has(key)`,
+/// `keys`, and every other #2261-family fix in this file already has, not
+/// something new here): a trailing stray comma is only caught when the
+/// object's real last field's *value* is a scalar. When it's a container
+/// (array/object, empty or not), `census`/`checked_len` never resolve a
+/// text position to check against, so the fault slips through. Real jq
+/// rejects all four (confirmed live against `/usr/bin/jq` 1.7.1). Pinned
+/// here, same discipline as #1676's own known-gap test above, so a future
+/// fix for *this* narrower residual updates this test rather than landing
+/// uncovered.
+#[test]
+fn test_jq_length_object_trailing_comma_container_last_value_still_a_known_gap_2307() -> Result<()>
+{
+    for input in [
+        r#"{"a":{"x":1},}"#,
+        r#"{"a":[1,2],}"#,
+        r#"{"a":{},}"#,
+        r#"{"a":[],}"#,
+    ] {
+        let (out, stderr, code) = run_jq_full(&["-c", "length"], Some(input))?;
+        assert_eq!(code, 0, "input={input}: stderr: {stderr:?}");
+        assert_eq!(out.trim(), "1", "input={input}");
+    }
+
+    Ok(())
+}
+
 /// #2261 follow-up: a systematic sweep for every other unchecked
 /// `DocumentElements::collect_cursors`/`.len()` call site in
 /// `eval_generic.rs`/`document.rs` (prompted by the five paths above)
