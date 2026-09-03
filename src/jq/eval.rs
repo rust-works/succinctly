@@ -10780,6 +10780,17 @@ fn eval_format<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `@format` builtin (`@json`, `@csv`, `@tsv`, `@dsv`, `@uri`, `@html`,
     // `@base64`, `@sh`, `@yaml`, `@props`, `@text`), not just one site.
     //
+    // Unlike this issue's other four sites, this specific function is
+    // reachable ONLY via the public `succinctly::jq::eval::eval` library
+    // API, never via the CLI: `eval_generic.rs`'s own reindex-bridge helper
+    // (`eval_on_owned`) short-circuits any `Expr::Format` before it can ever
+    // re-enter this evaluator (`format_owned`'s own doc comment explains why
+    // -- avoiding a wasted JSON round trip, #124), and the CLI's default
+    // dispatch (`jq_runner.rs`/`yq_runner.rs`) never calls this module's
+    // `eval()` at all. Found and corrected during code review, which
+    // initially assumed (incorrectly) that this site shared `builtin_path`'s
+    // CLI-reachable reindex-bridge path.
+    //
     // Like #2231's own findings 1-3, this is defensive rather than a live
     // behavior change today: #2286 tagged every one of `to_owned_at_depth`'s
     // error paths (string decode failure, #1194 malformed member/delimiter)
