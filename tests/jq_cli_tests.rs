@@ -22957,22 +22957,25 @@ fn test_jq_missing_delimiter_raises_through_nonreserializing_filters_1677() -> R
     Ok(())
 }
 
-/// #2210: `evaluate_bytes_streaming`'s general path (the non-M2,
-/// non-`-S` route, reached once M2's own fast path declines a malformed
-/// document -- `{"a": [,]}`'s stray comma inside a nested empty container is
-/// exactly the shape M2 now correctly declines rather than silently
-/// accepting) walks into `.a`'s value and writes `{"a":` before discovering
-/// the fault, leaking that prefix to stdout ahead of the error. Confirmed
-/// this is the *same* documented, deliberate trade-off
+/// #2210: `{"a": [,]}` under bare `.` is the identical shape
+/// `test_jq_identity_on_malformed_array_element_errors_1641` above already
+/// pins (a fault found partway through `write_output_jq_value`'s own
+/// byte-by-byte, no-rewind write of a *single* top-level result) -- a
+/// stray comma nested inside an empty array instead of a bareword-garbage
+/// token, reaching the fault through the same writer the same way. This
+/// was unreachable through this exact shape before #1576's own M2
+/// nested-empty-container fix started correctly declining it (M2 used to
+/// silently accept `{"a": [,]}` as `{"a":[]}`, exit 0, never falling back
+/// to the general path at all). Investigated whether this specific
+/// single-result shape could be fixed by buffering the write (mirroring
+/// `evaluate_m2_fast_path`'s own identical contract for its own
+/// single-result case) rather than merely pinned as more of the same
+/// trade-off -- reverted once `test_jq_identity_on_malformed_array_
+/// element_errors_1641`'s own pre-existing assertions caught it as a
+/// regression against that already-established, deliberately tested
+/// contract, not a previously-undocumented gap. See
 /// `docs/compliance/jq/limitations.md`'s "A fault found by walking to it
-/// leaves the prefix on stdout" section already pins for `[1,,3] | .[]`
-/// (`test_jq_missing_delimiter_raises_through_nonreserializing_filters_1677`
-/// above), not a new inconsistency needing its own fix -- both paths reach
-/// the fault only by walking to it, which is the cost semi-indexing exists
-/// to avoid paying up front. This was unreachable through this exact input
-/// shape before #1576's own M2 nested-empty-container fix started correctly
-/// declining it (M2 used to silently accept `{"a": [,]}` as `{"a":[]}`,
-/// exit 0, never falling back here at all).
+/// leaves the prefix on stdout" for the full writeup.
 #[test]
 fn test_jq_general_streaming_path_leaks_prefix_before_nested_comma_fault_2210() -> Result<()> {
     let (out, stderr, code) = run_jq_full(&["-c", "."], Some(r#"{"a": [,]}"#))?;
