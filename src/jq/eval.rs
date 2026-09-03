@@ -7267,24 +7267,28 @@ fn has_one_key<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             StandardJson::Array(elements),
             OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..),
         ) => {
+            // #2293 review round 2: `len_checked` runs unconditionally
+            // *before* the `None`/`Some` dispatch below, not only inside
+            // the `Some` arm -- matching `eval_generic.rs`'s own
+            // `eval_has_one_key` array arm exactly (#2291). The #909-era
+            // comment this replaced short-circuited on `None` (a NaN key
+            // in jq mode, any Float key in yq mode) *before* ever calling
+            // `len_checked`, which silently skipped the #1677/#2261 gap
+            // check for exactly that shape -- confirmed live: `has(nan)`
+            // on `[1,2,3,]` answered `false` here while `eval_generic.rs`
+            // correctly raised. `elements` is a lazy O(n) cursor walk
+            // either way, so paying for it even when the key is later
+            // discarded is the same "ride the already-mandatory walk"
+            // trade #2261 uses everywhere else, not a new cost class.
+            let len = match (*elements).len_checked() {
+                Ok(len) => len as i64,
+                Err(e) => return QueryResult::Error(e),
+            };
             let in_bounds = match numeric_key_to_array_index::<S>(&key_owned) {
                 // NaN: a number, so the container check above still
-                // applies, but no element -- never in bounds. `elements`
-                // is a lazy O(n) cursor walk (`StandardJson::Array`, #909
-                // review), so this short-circuits before paying for it,
-                // matching the `Some` arm's own `len` computation being
-                // needed at all.
+                // applies, but no element -- never in bounds.
                 None => false,
-                // #2293: `len_checked`, not the bare `count()` -- same
-                // #1677/#2261 gap `eval_generic.rs`'s own
-                // `eval_has_one_key` array arm already closed (#2291).
-                Some(idx) => {
-                    let len = match (*elements).len_checked() {
-                        Ok(len) => len as i64,
-                        Err(e) => return QueryResult::Error(e),
-                    };
-                    index_in_array_bounds::<S>(idx, len)
-                }
+                Some(idx) => index_in_array_bounds::<S>(idx, len),
             };
             QueryResult::Owned(OwnedValue::Bool(in_bounds))
         }
