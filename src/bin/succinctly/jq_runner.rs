@@ -4229,20 +4229,24 @@ fn seq_pending_token_is_terminated(
 }
 
 /// Whether one value out of a `--seq` record is legal JSON, allowing the
-/// same leading-zero form (`007e5`) `--seq` has accepted since #1243, and
-/// the same lone-low-surrogate escape (`\uDC00`-`\uDFFF`) `--argjson`
-/// accepts since #2012 (code review: `validate::validate` -- strict RFC
-/// 8259 -- and `validate_json_str` -- `serde_json` -- both reject a lone
-/// low surrogate, so without this, a `--seq` record real jq accepts
+/// same leading-zero form (`007e5`) `--seq` has accepted since #1243, the
+/// same lone-low-surrogate escape (`\uDC00`-`\uDFFF`) `--argjson` accepts
+/// since #2012 (code review: `validate::validate` -- strict RFC 8259 --
+/// and `validate_json_str` -- `serde_json` -- both reject a lone low
+/// surrogate, so without this, a `--seq` record real jq accepts
 /// [confirmed live: `printf '\x1e"\udc00"\n' | jq --seq -c '.'` =>
 /// `"�"`, exit 0] silently vanished instead, the exact leniency gap
-/// #2012 fixed for `--argjson` reappearing one function over).
+/// #2012 fixed for `--argjson` reappearing one function over), and the
+/// same leading/trailing decimal-point forms (`.5`, `1.e5`) `--argjson`
+/// accepts since #2240 -- all three via the same shared
+/// `normalize_json_leniently`, not enumerated separately here.
 ///
 /// Normalization is needed *here* and only here: the value-building side
 /// ([`json_bytes_to_owned_value_checked`], reached once a record is judged
-/// valid) already reads `0007` as `7` and substitutes U+FFFD for a lone low
-/// surrogate on its own -- so it needs no fallback of its own for either
-/// leniency.
+/// valid) already reads `0007` as `7`, substitutes U+FFFD for a lone low
+/// surrogate, and preserves a leading/trailing-dot literal's own spelling
+/// on its own -- so it needs no fallback of its own for any of the three
+/// leniencies.
 fn seq_value_is_valid(value_text: &str) -> bool {
     if validate::validate(value_text.as_bytes()).is_ok() {
         return true;
