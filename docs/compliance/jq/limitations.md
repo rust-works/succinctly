@@ -1223,6 +1223,74 @@ check against the actual binary proves that, and is worth doing for any future b
 (or might grow) its own native `eval_generic.rs` implementation rather than falling through to
 this file via the bridge.
 
+## A trailing comma after a genuine last child, scoped to one materializer (#2243)
+
+`[1,]`/`{"a":1,}` -- a stray trailing `,` after the container's own *last real
+member*, with every member present otherwise well-formed -- is a distinct
+malformed-delimiter shape from #1677's missing/doubled `,`/`:` between two
+members above, and from #2211's `[,]`/`{,}` (a stray `,` with **no** real
+member at all). #2243 closed it for `eval_generic::to_owned_cursor_at_depth`
+(the materializer behind the `evaluate_bytes_lazy`/non-cursor-transparent
+path -- `if`/arithmetic/function calls, anything `expr_is_cursor_transparent`
+answers `false` for, same gate #2211 used) by adding
+`DocumentCursor::trailing_element_gap_ok`/`DocumentValue::scalar_text_end` to
+the shared trait system ([src/jq/document.rs](../../../src/jq/document.rs)),
+implemented for JSON by reusing the CLI printer's own existing
+`trailing_gap_ok`/`scalar_end_pos` primitives (#1676/#1576) rather than a
+third hand-copied pair:
+
+```
+$ echo '[1,]'      | jq  -c 'if true then . else . end'   # parse error, exit 5
+$ echo '[1,]'      | sjq -c 'if true then . else . end'   # exit 5 now (was: [1], exit 0)
+$ echo '{"a":1,}'  | jq  -c 'if true then . else . end'   # parse error, exit 5
+$ echo '{"a":1,}'  | sjq -c 'if true then . else . end'   # exit 5 now (was: {"a":1}, exit 0)
+```
+
+**Residual gap: a *container-typed* last child still passes through.**
+`scalar_text_end` only knows how to answer a scalar's own end position from
+its start (`start + raw_bytes().len()`, or a fixed literal length for
+`Bool`/`Null`) -- a container's own end position is not derivable from its
+start alone without a further cursor walk, so it answers `None` there by
+design, and `trailing_element_gap_ok` treats that the same as "can't
+determine, skip" (the same convention every other gap check in this family
+already follows):
+
+```
+$ echo '[1,[2,3],]'          | jq  -c '.'   # parse error, exit 5
+$ echo '[1,[2,3],]'          | sjq -c '.'   # [1,[2,3]], exit 0 -- still open
+$ echo '{"a":1,"b":[1,2],}'  | jq  -c '.'   # parse error, exit 5
+$ echo '{"a":1,"b":[1,2],}'  | sjq -c '.'   # {"a":1,"b":[1,2]}, exit 0 -- still open
+```
+
+This is not new: the cursor-transparent `.` path (`stream_json_pretty`'s own
+`scalar_end_pos`, #1676) already has the identical gap for the identical
+reason, confirmed live against `main` prior to #2243. Pinned by
+`test_jq_lazy_path_trailing_comma_after_container_last_child_still_a_known_gap_2243`
+in [tests/jq_cli_tests.rs](../../../tests/jq_cli_tests.rs) rather than left
+untested.
+
+**Much narrower reach than #1677/#2211's own checks, tracked as three
+follow-ups rather than folded in here** (same "one materializer at a time"
+practice #2243's own issue text cites for not folding into #2211):
+
+- **#2261**: every *cursor-transparent* fast path -- `.[]`, `keys`/
+  `keys_unsorted`/`to_entries`, bare `.a`/`.[0]`/`.["a"]` field/index access,
+  `length` -- takes a route through `eval_generic.rs` that never reaches
+  `to_owned_cursor_at_depth` at all, so this fix does not reach jq's most
+  common query idioms; only the non-cursor-transparent shape #2243's own
+  repro uses (`if`/arithmetic/function calls) is covered.
+- **#2262**: three sibling materializers -- `eval.rs`'s own `to_owned_at_depth`
+  (behind this crate's documented public `eval()` API), `eval_generic.rs`'s
+  own cursor-less `to_owned_at_depth`, and `yq_runner.rs`'s
+  `to_owned_canonicalizing_numbers_at_depth` (behind `succinctly yq --slurp`/
+  `--eval-all`/`--inplace --input-format json`, live and CLI-reachable) --
+  still lack #2211's and #2243's checks the same way #1975 found they lacked
+  #1677's.
+- **#2263**: `jq_runner.rs` still carries its own independent, hand-copied
+  `trailing_gap_ok`/`scalar_end_pos` pair rather than the new trait methods --
+  a cleanup, not a behavior gap, but the same "duplicated predicates diverge
+  silently" shape (#106) this fix was written to reduce, not add to.
+
 ## Refusing an allocation jq does not survive
 
 `setpath` takes its array index from the document, so the array it pads is sized by the
