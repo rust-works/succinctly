@@ -2215,6 +2215,24 @@ macro_rules! push_or_control {
     };
 }
 
+/// [`owned_or_err`]'s `optional`-consulting twin: an ordinary (non-decode-
+/// failure) error is suppressed to `GenericResult::None` when `optional` is
+/// set, matching [`super::eval::to_owned_or_suppress`]'s exact behavior for
+/// the `eval.rs` side of this same materialization (#2231, code review --
+/// this file's `Builtin::ToString` arm and its catch-all wildcard fallback
+/// each hand-rolled this three-line match independently before this macro
+/// existed, the exact "rediscovering missing at one more call site" pattern
+/// `to_owned_or_suppress`'s own doc comment already names for `eval.rs`).
+macro_rules! owned_or_suppress {
+    ($e:expr, $optional:expr) => {
+        match $e {
+            Ok(v) => v,
+            Err(e) if suppresses(&e, $optional) => return GenericResult::None,
+            Err(e) => return GenericResult::Error(e),
+        }
+    };
+}
+
 /// Append every output of a `GenericResult` stream to `out`, returning any
 /// terminating `Control` instead of collapsing to the first output the way
 /// an earlier `Expr::Compare` arm did before #768. Mirrors
@@ -10738,18 +10756,14 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         Builtin::Empty => GenericResult::None,
 
         Builtin::ToString => {
-            // #2231: consult `optional` here rather than the bare
-            // `owned_or_err!` -- the `eval.rs` twin of this arm
-            // (`builtin_tostring`, #2184) already does, and this file's own
-            // `owned_or_err!` unconditionally errors regardless of
-            // `optional`, ignoring it the same way `eval.rs`'s pre-#2184
-            // sites did. Same non-live-reachable defensive-consistency
-            // class as the rest of this lineage.
-            let owned = match to_owned_with_cursor(&value, cursor) {
-                Ok(v) => v,
-                Err(e) if suppresses(&e, optional) => return GenericResult::None,
-                Err(e) => return GenericResult::Error(e),
-            };
+            // #2231: `owned_or_suppress!`, not the bare `owned_or_err!` --
+            // the `eval.rs` twin of this arm (`builtin_tostring`, #2184)
+            // already consults `optional`, and this file's own
+            // `owned_or_err!` unconditionally errored regardless of it, the
+            // same way `eval.rs`'s pre-#2184 sites did. Same non-live-
+            // reachable defensive-consistency class as the rest of this
+            // lineage.
+            let owned = owned_or_suppress!(to_owned_with_cursor(&value, cursor), optional);
             GenericResult::Owned(OwnedValue::String(owned_to_string::<S>(&owned)))
         }
 
@@ -10900,22 +10914,21 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             }
         }
 
-        // For other builtins, fall back to full evaluator via JSON
+        // For other builtins, fall back to full evaluator via JSON. Reached
+        // by every `Builtin` variant with no dedicated arm above -- dozens,
+        // not just `ToJson`/`UpperIndex`/`UpperIndexStream`/`ToJsonStream`/
+        // `ToStream` (code review, #2231: an earlier revision of this
+        // comment named only those five, which undersells how many
+        // builtins actually funnel through here).
         _ => {
-            // #2231: consult `optional` on this bridging conversion too --
-            // same reasoning as the `ToString` arm above. Every builtin
-            // this arm reaches (`ToJson`/`UpperIndex`/`UpperIndexStream`/
-            // `ToJsonStream`/`ToStream`) is #2184-fixed on its `eval.rs`
-            // side to respect `optional` internally, but this outer
-            // materialization ran unconditionally ahead of ever reaching
-            // that -- an inconsistency with no live-reachable effect today
-            // (`eval_try` already suppresses one level up), not a behavior
-            // change for any query parseable today.
-            let owned = match to_owned_with_cursor(&value, cursor) {
-                Ok(v) => v,
-                Err(e) if suppresses(&e, optional) => return GenericResult::None,
-                Err(e) => return GenericResult::Error(e),
-            };
+            // #2231: `owned_or_suppress!`, not `owned_or_err!` -- this
+            // bridging materialization ran unconditionally regardless of
+            // `optional` before this fix, an inconsistency with no live-
+            // reachable effect today (`eval_try` already suppresses one
+            // level up) for whichever of the five #2184-fixed builtins
+            // above reach here; unverified for the rest of this arm's
+            // callers (tracked separately as #2280).
+            let owned = owned_or_suppress!(to_owned_with_cursor(&value, cursor), optional);
             eval_on_owned::<S, _>(&Expr::Builtin(builtin.clone()), owned, optional)
         }
     }
