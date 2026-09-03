@@ -30619,6 +30619,21 @@ fn accumulate_path_context_step<'a, W: Clone + AsRef<[u64]>>(
 /// hand, makes that gap structurally impossible to reintroduce at a future
 /// call site.
 ///
+/// **#2302: an uncatchable-at-value-position error (#2254) is never
+/// swallowed by `optional`, in either the bare-`Error` or `Partial` shape**
+/// -- checked before the table below runs, by recursing once with
+/// `optional` forced to `false` (still respecting `atomic`'s own
+/// discard-prefix-or-keep-it distinction). PR #2300's review found this
+/// function had no such carve-out at all, unlike every other
+/// `optional`-consulting site since #2270/#2289/#2292 -- inert today for
+/// the same reason the paragraph below explains (`optional` is currently
+/// always `false` here), but two of this function's five call sites
+/// (`Expr::Iterate`, `Builtin::Map`) are live on every `.[]`/`map(f)` call,
+/// not merely inert-until-`optional`-changes -- so a future path-context
+/// arm that legitimately reaches this machinery with `optional: true`
+/// would otherwise silently collapse a decode failure or yq negative-index
+/// error into `None`/a dropped tag instead of propagating it.
+///
 /// **`optional` is currently always `false` at every call site reachable from
 /// the path-context evaluator (#2212).** #2073 removed `Expr::Optional`'s
 /// combined-with-`rest` fallback -- the only route that ever forced a `true`
@@ -30653,6 +30668,31 @@ fn catch_error_under_optional<W>(
     optional: bool,
     atomic: bool,
 ) -> QueryResult<'_, W> {
+    // #2302: an uncatchable-at-value-position error (#2254's decode
+    // failure / yq negative-index raise) must never be silently dropped
+    // by `optional`'s swallow, matching every other optional-consulting
+    // site since #2270/#2289/#2292 -- `eval_try`'s own `is_uncatchable_
+    // at_value_position()` arms (above) are the model this follows: treat
+    // the error as though `optional` were `false`, which still respects
+    // `atomic`'s own discard-prefix-or-keep-it distinction (an atomic
+    // array construction still discards its prefix on an uncatchable
+    // error, exactly as it already does for `(true, false)`'s ordinary
+    // case; a non-atomic generator still keeps and propagates it, exactly
+    // as `(false, false)` already does) by recursing once with `optional`
+    // forced. Single choke point for all five call sites this function
+    // has (`continue_rest_with_context`/`_with_paths`/`_with_fresh_root`'s
+    // own `Partial` arms, `Expr::Iterate`, `Builtin::Map`) rather than
+    // hand-copying the guard into each one.
+    if optional {
+        let uncatchable = match &stopped {
+            QueryResult::Error(e) => e.is_uncatchable_at_value_position(),
+            QueryResult::Partial(_, Control::Error(e)) => e.is_uncatchable_at_value_position(),
+            _ => false,
+        };
+        if uncatchable {
+            return catch_error_under_optional(stopped, false, atomic);
+        }
+    }
     match stopped {
         // `atomic` only has a prefix to discard-or-keep once one was
         // actually accumulated (the `Partial` arm below); a bare `Error`
@@ -45009,6 +45049,55 @@ mod tests {
                 (vec![], "break:out".to_string())
             );
         }
+
+        // #2302: an uncatchable-at-value-position error (#2254) under
+        // `optional: true` must behave exactly as though `optional` were
+        // `false` -- still respecting `atomic`'s own discard-prefix-or-
+        // keep-it distinction -- rather than being swallowed to `None`
+        // (bare `Error`) or having its prefix silently kept with the
+        // error dropped (`Partial`, the `(false, true)` cell above). Only
+        // `optional: true` is worth asserting here: `optional: false`
+        // already takes the unmodified match below regardless of
+        // catchability, covered by the ordinary cases above.
+        let uncatchable = || EvalError::decode_failure("boom");
+        assert_eq!(
+            normalize(catch_error_under_optional::<W>(
+                QueryResult::Error(uncatchable()),
+                true,
+                true
+            )),
+            (vec![], "error:boom".to_string()),
+            "uncatchable bare Error survives optional=true regardless of atomic"
+        );
+        assert_eq!(
+            normalize(catch_error_under_optional::<W>(
+                QueryResult::Error(uncatchable()),
+                true,
+                false
+            )),
+            (vec![], "error:boom".to_string()),
+            "uncatchable bare Error survives optional=true regardless of atomic"
+        );
+        assert_eq!(
+            normalize(catch_error_under_optional::<W>(
+                QueryResult::Partial(prefix(), Control::Error(uncatchable())),
+                true,
+                true
+            )),
+            (vec![], "error:boom".to_string()),
+            "atomic + optional=true: uncatchable still discards prefix and raises, \
+             matching (atomic=true, optional=false)"
+        );
+        assert_eq!(
+            normalize(catch_error_under_optional::<W>(
+                QueryResult::Partial(prefix(), Control::Error(uncatchable())),
+                true,
+                false
+            )),
+            (prefix(), "error:boom".to_string()),
+            "non-atomic + optional=true: uncatchable still keeps prefix and raises, \
+             matching (atomic=false, optional=false)"
+        );
     }
 
     /// **The invariant the whole #820 design rests on**: with a sink that
