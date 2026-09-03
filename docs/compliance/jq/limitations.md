@@ -2859,6 +2859,19 @@ Pinned by `test_unbuffered_interleaves_stdout_and_stderr_1653`,
 `test_jq_missing_delimiter_raises_through_nonreserializing_filters_1677`
 ([tests/jq_cli_tests.rs](../../../tests/jq_cli_tests.rs)).
 
+The identical trade-off covers a *stray-comma* fault the same way it covers a *missing*
+delimiter above — `{"a": [,]}` under bare `.` writes `{"a":` before the walk reaches the
+empty array's stray comma and raises (#2210). `-S` forces the fully materializing path,
+which validates the whole document before printing anything, so it emits nothing on the
+same input — the exit code still agrees, only the prefix differs, same as every other case
+in this section. This shape was unreachable through the general (non-`-S`) path before
+#1576's own M2 fast-path fix started correctly declining a nested empty container's stray
+comma instead of silently accepting it as `[]`; only once M2 declines and falls back here
+does this path's own pre-existing, already-accepted non-atomicity apply to it for the first
+time. Pinned by
+`test_jq_general_streaming_path_leaks_prefix_before_nested_comma_fault_2210`
+([tests/jq_cli_tests.rs](../../../tests/jq_cli_tests.rs)).
+
 ## Deliberate divergences (ADR-0018 rule 4)
 
 ### A structurally malformed value doesn't abort the rest of a multi-value stream — no carve-out; this one is out of policy
