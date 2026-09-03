@@ -1466,13 +1466,12 @@ a value that isn't a snapshot of anything in the document -- a different kind of
 #2213's path-threading fix, which only ever continues with a value already known to be
 correct (`Null`, jq's own answer for what the missing/OOB read itself evaluates to).
 
-### A negative out-of-range array index (`.a[-N]`) silently returns `null` instead of raising
+### A negative out-of-range array index (`.a[-N]`) raises -- resolved for ordinary reads, a few call sites remain
 
-[#2254](https://github.com/rust-works/succinctly/issues/2254), pre-existing and unrelated to
-#2213 -- found while verifying that fix's own reach. Real yq disagrees with real jq on a
-negative index whose magnitude exceeds the array length: jq treats it the same as a positive
-out-of-range index (`null`, not an error); yq raises. A positive out-of-range index is `null`
-in both tools -- the asymmetry is specific to the negative-magnitude case:
+[#2254](https://github.com/rust-works/succinctly/issues/2254). Real yq disagrees with real
+jq on a negative index whose magnitude exceeds the array length: jq treats it the same as a
+positive out-of-range index (`null`, not an error); yq raises. A positive out-of-range index
+is `null` in both tools -- the asymmetry is specific to the negative-magnitude case:
 
 ```bash
 $ echo '{"a":[1,2]}' | yq -o=json '.a[-1]'   # 2   (in-bounds negative wraparound: fine)
@@ -1480,11 +1479,18 @@ $ echo '{"a":[1,2]}' | yq -o=json '.a[-2]'   # 1   (in-bounds: fine)
 $ echo '{"a":[1,2]}' | yq -o=json '.a[-3]'   # Error: index [-3] out of range, array size is 2
 ```
 
-`resolve_read_index`/`index_one`/`index_one_owned` (`src/jq/eval.rs`) treat "index doesn't
-resolve" as one outcome with no `EvalSemantics`-based dispatch on sign, so `succinctly yq`
-currently gives `null` for the negative-out-of-range case rather than raising -- reachable
-via the plain evaluator alone (`.a[-5]`, no path-context builtin involved), predating #2213
-entirely.
+Eight independent implementations of the same resolve-index arithmetic across
+`src/jq/eval.rs` and `src/jq/eval_generic.rs` treated "index doesn't resolve" as one outcome
+with no `EvalSemantics`-based dispatch on sign -- fixed for every ordinary `.a[-N]`/`.a[$n]`
+read, both the literal and computed-index forms, through both jq's primary CLI dispatch
+(`eval_generic.rs`) and the library-route/path-context evaluator (`eval.rs`). Suppressible by
+`optional` like any other read-time indexing error here -- real yq's own lexer doesn't even
+accept `?` after a bracket index in this position, so there's no oracle to match either way.
+
+A few more independent copies of the same arithmetic remain unfixed, in lower-traffic
+call sites: `path()`'s own walker, `pick(paths)`, `reduce`/`foreach`'s lazy-fold index
+handling, and `getpath`'s own path-array walk (jq-only syntax, so this only matters under
+`--jq-extensions`) -- filed as [#2264](https://github.com/rust-works/succinctly/issues/2264).
 
 ### Other categories
 

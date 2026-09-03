@@ -4948,12 +4948,24 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         Expr::Index { idx, .. } => {
             if let Some(elements) = value.as_array() {
                 let len = elements.len();
-                let actual_idx = if *idx < 0 {
-                    (len as i64 + idx) as usize
-                } else {
-                    *idx as usize
-                };
-                match elements.get_cursor(actual_idx) {
+                let resolved = if *idx < 0 { len as i64 + idx } else { *idx };
+                // yq mode only (#2254): a negative index still negative
+                // after resolving against the length raises in real yq,
+                // where jq treats it the same as a positive out-of-range
+                // index (`null`). Checked ahead of the cast below, which
+                // would otherwise wrap a still-negative `resolved` into a
+                // huge `usize` that `get_cursor` simply misses (`None`,
+                // same observable `null` as any other OOB read) --
+                // correct for jq mode, but not distinguishable from an
+                // ordinary miss for yq's own error.
+                if resolved < 0 && S::TAG == EvalTag::Yq {
+                    return if optional {
+                        GenericResult::None
+                    } else {
+                        GenericResult::Error(EvalError::yq_negative_index_out_of_range(*idx, len))
+                    };
+                }
+                match elements.get_cursor(resolved as usize) {
                     Some(c) => GenericResult::OneCursor(c),
                     // jq returns null for out-of-bounds array indices (positive
                     // or negative), not an error. `.[n]` and `.[n]?` both yield
@@ -7729,7 +7741,7 @@ fn items_to_generic_result<V: DocumentValue>(
 /// so the error is jq's `Cannot index <container> with <key>`, and the
 /// null-input passthrough is reached only for a valid key kind (`null | .["a"]`
 /// is `null`, `null | .[null]` errors).
-fn index_one_generic<V: DocumentValue>(
+fn index_one_generic<S: EvalSemantics, V: DocumentValue>(
     target: V,
     key: &OwnedValue,
     optional: bool,
@@ -7757,13 +7769,24 @@ fn index_one_generic<V: DocumentValue>(
             // and NaN has no index at all — also null.
             let idx = numeric_key_to_index(key);
             if let Some(elements) = target.as_array() {
-                let resolved = idx.map(|idx| {
-                    if idx < 0 {
-                        elements.len() as i64 + idx
-                    } else {
-                        idx
+                let len = elements.len();
+                let resolved = idx.map(|idx| if idx < 0 { len as i64 + idx } else { idx });
+                // yq mode only (#2254): same rule as `eval_single`'s
+                // `Expr::Index` arm above -- a negative index still
+                // negative after resolving against the length raises in
+                // real yq, where jq treats it the same as a positive
+                // out-of-range index (`null`).
+                if let (Some(idx), Some(r)) = (idx, resolved) {
+                    if r < 0 && S::TAG == EvalTag::Yq {
+                        return if optional {
+                            GenericResult::None
+                        } else {
+                            GenericResult::Error(EvalError::yq_negative_index_out_of_range(
+                                idx, len,
+                            ))
+                        };
                     }
-                });
+                }
                 match resolved
                     .and_then(|r| usize::try_from(r).ok())
                     .and_then(|i| elements.get_cursor(i))
@@ -7994,7 +8017,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                     escape_generic!(Control::Error(cannot_reserve_cross_product(&[ts.len()])));
                 }
                 for t in &ts {
-                    match index_one_generic::<V>(t.clone(), k, optional) {
+                    match index_one_generic::<S, V>(t.clone(), k, optional) {
                         GenericResult::OneCursor(c) => {
                             if any_owned {
                                 // Not `owned_or_err!`: that bare-returns and

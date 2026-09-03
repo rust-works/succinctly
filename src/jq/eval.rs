@@ -1013,7 +1013,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         Expr::Field(name) => index_object_by_name::<W>(value, name, optional),
 
-        Expr::Index { idx, .. } => index_array_by_position::<W>(value, *idx, optional),
+        Expr::Index { idx, .. } => index_array_by_position::<W, S>(value, *idx, optional),
 
         Expr::IndexExpr { target, key } => eval_index_expr::<W, S>(target, key, value, optional),
 
@@ -9361,7 +9361,7 @@ fn builtin_nth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // array case, and `fanout_arg`'s single-output fast path returns it
         // verbatim -- so `[1,2,3] | nth(0)` keeps the zero-copy path
         // `finish_result(result, None)` used to preserve here.
-        |n| index_one::<W>(value.clone(), &n, optional),
+        |n| index_one::<W, S>(value.clone(), &n, optional),
     )
 }
 
@@ -15884,17 +15884,29 @@ fn index_object_by_name<'a, W: Clone + AsRef<[u64]>>(
 
 /// Index an array by position — the shared body of `.[0]` and the numeric-key
 /// case of `.[$k]`. See [`index_object_by_name`] for why this is shared.
+///
+/// yq mode only (#2254): a negative index whose magnitude still exceeds the
+/// array length after resolving against it raises in real yq
+/// (`yq_negative_index_out_of_range`), where jq treats it the same as a
+/// positive out-of-range index (`null`). `optional` suppresses it like any
+/// other read-time indexing error here -- real yq's own lexer doesn't even
+/// accept `?` after a bracket index in this position, so there's no oracle
+/// answer to match either way; treating it like every other indexing error
+/// in this function is the simpler, more consistent default.
 #[inline]
-fn index_array_by_position<W: Clone + AsRef<[u64]>>(
+fn index_array_by_position<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     idx: i64,
     optional: bool,
 ) -> QueryResult<'_, W> {
     match value {
         StandardJson::Array(elements) => match get_element_at_index::<W>(elements, idx) {
-            Some(v) => QueryResult::One(v),
+            Ok(Some(v)) => QueryResult::One(v),
             // jq returns null for out-of-bounds array access (not an error)
-            None => QueryResult::One(StandardJson::Null),
+            Ok(None) => QueryResult::One(StandardJson::Null),
+            Err(_len) if S::TAG != EvalTag::Yq => QueryResult::One(StandardJson::Null),
+            Err(_len) if optional => QueryResult::None,
+            Err(len) => QueryResult::Error(EvalError::yq_negative_index_out_of_range(idx, len)),
         },
         // jq returns null for index on null
         StandardJson::Null => QueryResult::One(StandardJson::Null),
@@ -16004,7 +16016,7 @@ pub(crate) fn has_type_mismatch_is_permissive<S: EvalSemantics>() -> bool {
 /// The key kind is dispatched *before* the container is inspected, so the error
 /// is jq's `Cannot index <container> with <key>` rather than the generic
 /// `expected object, got …` that the static arms produce.
-fn index_one<'a, W: Clone + AsRef<[u64]>>(
+fn index_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     target: StandardJson<'a, W>,
     key: &OwnedValue,
     optional: bool,
@@ -16020,7 +16032,7 @@ fn index_one<'a, W: Clone + AsRef<[u64]>>(
             if indexable_by_number =>
         {
             match numeric_key_to_index(key) {
-                Some(idx) => index_array_by_position::<W>(target, idx, optional),
+                Some(idx) => index_array_by_position::<W, S>(target, idx, optional),
                 // NaN: a number, so the container check above still applies, but
                 // no element. jq yields null rather than erroring.
                 None => QueryResult::One(StandardJson::Null),
@@ -16029,6 +16041,33 @@ fn index_one<'a, W: Clone + AsRef<[u64]>>(
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_index(type_name(&target), key)),
     }
+}
+
+/// yq mode only (#2254): `Some(error)` iff `key` is a negative numeric index
+/// still negative after resolving against `target`'s length -- real yq
+/// raises here (`index_array_by_position`'s own doc comment has the full
+/// rationale, including why `optional` still suppresses it). `None` covers
+/// every other case (jq mode, a non-array target, a non-numeric key, an
+/// in-bounds or positive-direction index) uniformly, so a caller checks this
+/// once and falls through to its own ordinary null/error handling otherwise
+/// -- deliberately *not* threaded into [`index_one_owned`] itself, since
+/// that function's own callers include write-path resolvers
+/// (`resolve_node`/`resolve_index_expr`) that already raise their own,
+/// differently-worded negative-index error and must keep doing so
+/// unconditionally, not just for a still-negative resolved index.
+fn yq_negative_index_error<S: EvalSemantics>(
+    target: &OwnedValue,
+    key: &OwnedValue,
+) -> Option<EvalError> {
+    if S::TAG != EvalTag::Yq {
+        return None;
+    }
+    let OwnedValue::Array(items) = target else {
+        return None;
+    };
+    let idx = numeric_key_to_index(key)?;
+    (idx < 0 && items.len() as i64 + idx < 0)
+        .then(|| EvalError::yq_negative_index_out_of_range(idx, items.len()))
 }
 
 /// [`index_one`] for a target that is already an owned value, as when the
@@ -16443,7 +16482,7 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     escape_with_prefix!(Control::Error(cannot_reserve_cross_product(&[ts.len()])));
                 }
                 for t in &ts {
-                    match index_one::<W>(t.clone(), k, optional) {
+                    match index_one::<W, S>(t.clone(), k, optional) {
                         // `resolve_terminal_prefix`, not unchecked `to_owned_lossy`
                         // (#1897): an undecodable string already accumulated
                         // must raise `EvalError::decode_failure` on
@@ -16497,6 +16536,16 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     escape_with_prefix!(Control::Error(cannot_reserve_cross_product(&[ts.len()])));
                 }
                 for t in &ts {
+                    // #2254: checked ahead of `index_one_owned`, which has
+                    // no notion of this yq-only rule -- see
+                    // `yq_negative_index_error`'s own doc comment for why
+                    // it isn't threaded into that function instead.
+                    if let Some(e) = yq_negative_index_error::<S>(t, k) {
+                        if optional {
+                            continue;
+                        }
+                        escape_with_prefix!(Control::Error(e));
+                    }
                     match index_one_owned(t, k, optional) {
                         Ok(Some(v)) => owned.as_mut().expect("still Some").push(v),
                         Ok(None) => {}
@@ -17581,20 +17630,26 @@ fn slice_object_children_at(
 ///
 /// Uses `get_fast` for O(n) BP operations + O(log n) IB select,
 /// instead of `get` which does O(n) IB selects.
+///
+/// `Err(len)` is a negative index still negative after resolving against the
+/// array's length -- distinct from an ordinary miss (`Ok(None)`, the
+/// positive-direction case or an in-range-but-empty read) only so the caller
+/// can raise real yq's own error for it (#2254); jq mode's own caller treats
+/// `Err` exactly like `Ok(None)`.
 fn get_element_at_index<W: Clone + AsRef<[u64]>>(
     elements: JsonElements<'_, W>,
     idx: i64,
-) -> Option<StandardJson<'_, W>> {
+) -> Result<Option<StandardJson<'_, W>>, usize> {
     if idx >= 0 {
-        elements.get_fast(idx as usize)
+        Ok(elements.get_fast(idx as usize))
     } else {
         // Negative index: count from end
         let len = count_elements(elements);
         let positive_idx = len as i64 + idx;
         if positive_idx >= 0 {
-            elements.get_fast(positive_idx as usize)
+            Ok(elements.get_fast(positive_idx as usize))
         } else {
-            None
+            Err(len)
         }
     }
 }
@@ -27831,6 +27886,20 @@ fn eval_owned_fast_path<S: EvalSemantics>(
                 } else {
                     *idx
                 };
+                // yq mode only (#2254): same rule as `index_array_by_position`
+                // and every other call site this fix touches -- a negative
+                // index still negative after resolving against the length
+                // raises in real yq, suppressible by `optional` like any
+                // other read-time indexing error here.
+                if resolved < 0 && S::TAG == EvalTag::Yq {
+                    if optional {
+                        return Some(Ok(None));
+                    }
+                    return Some(Err(EvalError::yq_negative_index_out_of_range(
+                        *idx,
+                        items.len(),
+                    )));
+                }
                 let element = usize::try_from(resolved)
                     .ok()
                     .and_then(|i| items.get(i))
@@ -31468,6 +31537,15 @@ fn eval_index_expr_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemanti
             } else {
                 (None, probed)
             };
+            // #2254: same check as `eval_index_expr`'s own computed-key
+            // loop, ahead of `index_one_owned`, which has no notion of this
+            // yq-only rule.
+            if let Some(e) = yq_negative_index_error::<S>(&t, k) {
+                if bracket_optional {
+                    continue;
+                }
+                return partial(core::mem::take(&mut results), Control::Error(e));
+            }
             match index_one_owned(&t, k, bracket_optional) {
                 Ok(Some(v)) => {
                     let new_path = target_path.map(|mut path| {
@@ -32100,11 +32178,21 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // regardless of `optional`, rather than routing it through
                 // the error-suppression path below, which both swallowed
                 // `rest` entirely under `?` and wrongly raised without one.
-                // `resolve_read_index` doesn't distinguish sign here, but
-                // real yq does (#2254, pre-existing, unrelated to this fix):
-                // it raises on a negative index whose magnitude exceeds the
-                // array length, where jq (and yq's own positive-OOB case)
-                // both agree on `null`.
+                // yq mode only (#2254): real yq raises on a negative index
+                // whose magnitude still exceeds the array length, where jq
+                // (and yq's own positive-OOB case) both agree on `null` --
+                // `optional` suppresses it like every other negative-index
+                // call site this same fix touches.
+                if *idx < 0 && S::TAG == EvalTag::Yq && arr.len() as i64 + idx < 0 {
+                    return if optional {
+                        QueryResult::None
+                    } else {
+                        QueryResult::Error(EvalError::yq_negative_index_out_of_range(
+                            *idx,
+                            arr.len(),
+                        ))
+                    };
+                }
                 return continue_rest_with_borrowed_value::<W, S>(
                     &OwnedValue::Null,
                     rest,
@@ -49693,7 +49781,7 @@ mod tests {
             Expr::Identity => QueryResult::One(cursor.value()),
             Expr::Field(name) => index_object_by_name::<Vec<u64>>(cursor.value(), name, optional),
             Expr::Index { idx, .. } => {
-                index_array_by_position::<Vec<u64>>(cursor.value(), *idx, optional)
+                index_array_by_position::<Vec<u64>, JqSemantics>(cursor.value(), *idx, optional)
             }
             other => unreachable!("via_cursor only covers Identity/Field/Index, got {other:?}"),
         };
