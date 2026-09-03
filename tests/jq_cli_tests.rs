@@ -18321,6 +18321,35 @@ fn test_navigation_element_unwraps_optional_component_2272() -> Result<()> {
         "stderr: {stderr:?}"
     );
 
+    // Integer/negative index and an open-ended slice bound (review): the
+    // same `Expr::Optional(Index{..})`/`Expr::Optional(Slice{..})` shapes
+    // as above, but exercising `index_component_value`'s negative-index
+    // path and `slice_component_value`'s `None` end bound specifically,
+    // not just the string-key/two-sided-bound cases already covered.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "path((.,5)[(0)]?)"], Some("null"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[0]\n");
+    assert!(
+        stderr.contains("near attempt to access element 0 of 5"),
+        "stderr: {stderr:?}"
+    );
+
+    let (stdout, stderr, code) = run_jq_full(&["-c", "path((.,5)[(-1)]?)"], Some("null"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[-1]\n");
+    assert!(
+        stderr.contains("near attempt to access element -1 of 5"),
+        "stderr: {stderr:?}"
+    );
+
+    let (stdout, stderr, code) = run_jq_full(&["-c", "path((.,5)[(1):]?)"], Some("null"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[{\"start\":1,\"end\":null}]\n");
+    assert!(
+        stderr.contains(r#"near attempt to access element {"start":1,... of 5"#),
+        "stderr: {stderr:?}"
+    );
+
     // The bare postfix `?` cases (`.field?`) already correctly hit
     // `is_untracked_navigation_error`'s own carve-out before this fix and
     // must stay unaffected -- pinned here so a future change to
