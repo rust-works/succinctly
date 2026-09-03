@@ -2987,8 +2987,8 @@ fn find_literal_end(bytes: &[u8], pos: usize) -> Option<usize> {
 /// `serde::de::IgnoredAny`: `IgnoredAny` doesn't range-check numbers at
 /// all, so a magnitude-overflowing literal (`1e400`) that `Value`
 /// correctly rejects ("number out of range") would instead silently reach
-/// `json_bytes_to_owned_value` and materialize as `null` -- trading a
-/// clear error for silent data loss (#1095 review). `parse_json_stream`
+/// [`json_bytes_to_owned_value_checked`] and materialize as `null` --
+/// trading a clear error for silent data loss (#1095 review). `parse_json_stream`
 /// below doesn't call this: it validates a whole multi-value stream via
 /// `serde_json::Deserializer` instead of one value via `from_str`, a
 /// structurally different mechanism this helper can't drive.
@@ -2997,14 +2997,27 @@ fn validate_json_str(s: &str) -> serde_json::Result<()> {
 }
 
 /// Validate `s` via `validate_json_str`, then materialize the real
-/// `OwnedValue` from those same bytes via `json_bytes_to_owned_value` --
-/// the full "validate, then reparse the same span" pattern #1163 asked to
+/// `OwnedValue` from those same bytes via [`json_bytes_to_owned_value_checked`]
+/// -- the full "validate, then reparse the same span" pattern #1163 asked to
 /// share, for the call sites where the validated string and the
 /// materialized string are the same one. `parse_json_value`'s own
 /// leading-zero/low-surrogate retry (#1094/#2012) can't use this for its
 /// retry branch (it validates a *normalized* copy but must still
 /// materialize the *original* text, see its own comment), so that branch
 /// calls `validate_json_str` directly instead.
+///
+/// #2295: [`json_bytes_to_owned_value_checked`], not the bare, panicking
+/// materializer this used to call directly -- `s` is genuinely external
+/// text (`--argjson`/`--jsonargs`), and
+/// `serde_json::from_str`'s own default recursion limit (128) only
+/// *incidentally* protects the panicking `generic_to_owned` call the bare
+/// version reaches past `MAX_NESTING_DEPTH` (256); it was never a designed
+/// guard for this call site and would silently stop protecting it if
+/// `validate_json_str` were ever skipped, relaxed, or `serde_json`'s own
+/// default changed. `validate_json_delimiters`'s own `check_nesting_depth`
+/// call converts that panic into a catchable `EvalError` instead, matching
+/// the shape #2282 already fixed for `succinctly yq --eval-all`'s
+/// analogous gap.
 fn validate_and_materialize_json(
     s: &str,
 ) -> serde_json::Result<core::result::Result<OwnedValue, EvalError>> {
@@ -3013,7 +3026,7 @@ fn validate_and_materialize_json(
     // it may trigger the caller's leading-zero retry. A decode failure
     // (#1247) is not a validation failure serde could disagree about, so it
     // must not be mistaken for one -- retrying would just fail again.
-    Ok(crate::output::json_bytes_to_owned_value(s.as_bytes()))
+    Ok(json_bytes_to_owned_value_checked(s.as_bytes()))
 }
 
 /// Parse a JSON value from a string (`--argjson`/`--jsonargs`), preserving
@@ -3061,7 +3074,16 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
             // silently rewrite the value's source spelling.
             let normalized = normalize_json_leniently(s);
             if normalized != s && validate_json_str(&normalized).is_ok() {
-                return crate::output::json_bytes_to_owned_value(s.as_bytes())
+                // #2295: checked, not the bare materializer -- same
+                // reasoning as `validate_and_materialize_json`'s own call
+                // site above (`s` is external text; `normalize_json_leniently`
+                // only rewrites number/escape spelling, never container
+                // structure, so `s`'s own nesting depth is identical to
+                // `normalized`'s already-validated one -- but relying on
+                // that equivalence to skip a real depth guard here would be
+                // exactly the "incidental, fragile" protection #2295 warns
+                // against).
+                return json_bytes_to_owned_value_checked(s.as_bytes())
                     .map_err(|e| anyhow::anyhow!("Invalid JSON: {s}: {e}"));
             }
 
@@ -3397,8 +3419,8 @@ fn normalize_leading_zero_numbers(s: &str) -> String {
 /// Preserves number-literal source fidelity the same way `parse_json_value`
 /// does for `--argjson` (#1058, extended here to `--slurpfile`, #1093):
 /// `serde_json::Deserializer::byte_offset()` delimits each value's own
-/// span within the stream, and `json_bytes_to_owned_value` materializes
-/// the real result from that span.
+/// span within the stream, and [`json_bytes_to_owned_value_checked`]
+/// materializes the real result from that span.
 ///
 /// Doesn't *primarily* share span-finding with `find_json_values` (above,
 /// #1163 follow-up question), despite both walking a byte string to
@@ -3490,7 +3512,15 @@ fn parse_json_stream_strict(s: &str) -> Result<Vec<OwnedValue>> {
             // it apart from an I/O failure and report it in jq's own channel
             // at exit 5. Flattening lost that, and the run exited 1 with an
             // `Error:` prefix jq never prints (#1194).
-            crate::output::json_bytes_to_owned_value(&bytes[start..end])
+            //
+            // #2295: checked, not the bare materializer -- `serde_json`'s
+            // own `Deserializer` above already rejected anything past its
+            // default 128-deep recursion limit before this line runs, but
+            // that's the same incidental (not designed-for-this-purpose)
+            // protection #2295 found fragile elsewhere in this file --
+            // this is the primary `--slurp`/`--slurpfile` document-input
+            // path, worth the same defense-in-depth swap.
+            json_bytes_to_owned_value_checked(&bytes[start..end])
                 .map_err(|e| anyhow::Error::from(MalformedJsonError(e)))?,
         );
         prev_end = end;
@@ -3823,8 +3853,15 @@ fn parse_json_seq_with_ends(s: &str) -> Vec<(OwnedValue, usize)> {
         // this record yields -- empty for one it dropped, so there is no
         // separate "does this parse" gate here.
         for &(vs, ve) in &ranges {
-            let Ok(v) = crate::output::json_bytes_to_owned_value(&raw_segment.as_bytes()[vs..ve])
-            else {
+            // #2295: checked, not the bare materializer -- `seq_value_is_valid`
+            // (above, via `seq_record_scan`) already filters most malformed
+            // values via its own designed `validate::validate` depth guard,
+            // but reaching for the checked materializer here too costs
+            // nothing (a delimiter/depth `Err` folds into the same
+            // `else { continue }` a decode failure already takes below) and
+            // removes the reliance on that upstream guard's specific limit
+            // never drifting independently of this one.
+            let Ok(v) = json_bytes_to_owned_value_checked(&raw_segment.as_bytes()[vs..ve]) else {
                 // Parses but will not decode (#1247): dropped, exactly as
                 // the pre-#1723 path dropped it.
                 continue;
@@ -4018,8 +4055,8 @@ fn seq_pending_token_is_terminated(
 /// #2012 fixed for `--argjson` reappearing one function over).
 ///
 /// Normalization is needed *here* and only here: the value-building side
-/// (`json_bytes_to_owned_value`, reached once a record is judged valid)
-/// already reads `0007` as `7` and substitutes U+FFFD for a lone low
+/// ([`json_bytes_to_owned_value_checked`], reached once a record is judged
+/// valid) already reads `0007` as `7` and substitutes U+FFFD for a lone low
 /// surrogate on its own -- so it needs no fallback of its own for either
 /// leniency.
 fn seq_value_is_valid(value_text: &str) -> bool {
@@ -5648,13 +5685,13 @@ fn check_preceding_delimiter<W: AsRef<[u64]>>(
 /// check `print_json`'s object/array arms perform, needed again here for a
 /// caller that doesn't go through `print_json` at all.
 ///
-/// [`crate::output::json_bytes_to_owned_value`]'s own doc comment says
-/// plainly that it "performs no validation of its own" and expects the
-/// caller to have done so first; [`parse_json_stream`]'s fallback below
-/// (which backs `-S`, `-C`, and `--slurp` -- none of which route through
-/// `print_json`) was calling it directly on unvalidated bytes, so `{"a"
-/// 1}` would silently materialize as `{"a":1}` under those flags even
-/// though the default `sjq -c .` path already rejects it since #1643.
+/// The evaluator's own materializer performs no validation of its own; it
+/// expects the caller to have done so first -- [`parse_json_stream`]'s
+/// fallback below (which backs `-S`, `-C`, and `--slurp` -- none of which
+/// route through `print_json`) used to call it directly on unvalidated
+/// bytes, so `{"a" 1}` would silently materialize as `{"a":1}` under those
+/// flags even though the default `sjq -c .` path already rejects it since
+/// #1643.
 ///
 /// `depth` guards against a stack overflow on adversarially deep input the
 /// same way [`generic_to_owned`]'s own recursion does, but as a catchable
@@ -5767,13 +5804,28 @@ fn validate_json_delimiters<W: AsRef<[u64]>>(
     Ok(())
 }
 
-/// [`crate::output::json_bytes_to_owned_value`], preceded by the #1643
-/// delimiter check that function's own doc comment says its caller must
-/// supply. Used only by [`parse_json_stream`]'s fallback -- every other
-/// caller of the unchecked version re-serializes an already-validated span
-/// (`--argjson`'s retry re-validates its normalized copy against
-/// `serde_json` before ever reaching it; the primary lazy input path
-/// validates via `print_json` instead).
+/// Materializes a complete JSON document into an `OwnedValue` via the
+/// evaluator's own `generic_to_owned`, preceded by the #1643 delimiter
+/// check `bytes` must already satisfy -- `validate_json_delimiters`'s own
+/// `check_nesting_depth` call also converts `generic_to_owned`'s panicking
+/// `MAX_NESTING_DEPTH` guard into a catchable `EvalError` (#2295), so every
+/// caller here is protected against adversarially deep input by a real,
+/// designed guard rather than an unrelated library's incidental default.
+///
+/// #2295: used by every call site in this file that parses genuinely
+/// external text -- `validate_and_materialize_json` and `parse_json_value`'s
+/// leading-zero/low-surrogate retry (`--argjson`/`--jsonargs`),
+/// `parse_json_stream_strict` (the primary `--slurp`/`--slurpfile`
+/// document-input path), and the `--seq` per-record materializer. Before
+/// #2295 only `parse_json_stream`'s `find_json_values` fallback used this;
+/// every other caller reached a since-removed bare, panicking version
+/// directly (`crate::output::json_bytes_to_owned_value`, now dead code with
+/// no remaining callers -- deleted rather than left unused),
+/// protected only incidentally by whichever upstream validator happened to
+/// run first (`serde_json`'s own default 128-deep recursion limit, or
+/// `validate::validate`'s own designed guard for `--seq`) -- fragile if
+/// that upstream step were ever skipped, relaxed, or its own limit changed
+/// independently of this one.
 fn json_bytes_to_owned_value_checked(bytes: &[u8]) -> core::result::Result<OwnedValue, EvalError> {
     let index = JsonIndex::build(bytes);
     let cursor = index.root(bytes);
