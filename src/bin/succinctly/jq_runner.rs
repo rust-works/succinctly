@@ -14,8 +14,8 @@ use succinctly::jq::document::{
     effective_keys, key_hash, DistinctKeyCursors, IndentSpec, JsonConvention,
 };
 use succinctly::jq::eval_generic::{
-    check_nesting_depth, eval_with_cursor, to_owned as generic_to_owned, to_owned_cursor,
-    GenericResult, LazyElem, MAX_NESTING_DEPTH,
+    check_nesting_depth, check_value_nesting_depth, eval_with_cursor, to_owned as generic_to_owned,
+    to_owned_cursor, GenericResult, LazyElem, MAX_NESTING_DEPTH,
 };
 use succinctly::jq::walk::map_builtin_subexprs;
 use succinctly::jq::{
@@ -4386,14 +4386,29 @@ fn materialize_stream_item<V: succinctly::jq::document::DocumentValue>(
     at: &ErrorAt<'_>,
 ) -> Option<OwnedValue> {
     match result {
-        GenericResult::One(v) => {
-            sink.materialize(DiagStyle::Jq, generic_to_owned(&v), &at.resolve())
-        }
-        GenericResult::OneCursor(c) => sink.materialize(
+        // #2299: `check_value_nesting_depth` first -- `generic_to_owned`
+        // (`eval_generic::to_owned`) panics past `MAX_NESTING_DEPTH`
+        // deliberately (it's the evaluator's own hot-path recursion guard,
+        // not meant to be `try`/`catch`-able), but this is a CLI-output
+        // boundary with no filter evaluation left to protect, the same
+        // reasoning `json_bytes_to_owned_value_checked` already applies on
+        // the input side. Confirmed live: `--slurp`'s own extra array-
+        // wrapping level pushed an otherwise-safe 255-deep document one
+        // level past the ceiling here specifically, panicking (exit 101)
+        // instead of reporting a clean, catchable error.
+        GenericResult::One(v) => sink.materialize(
             DiagStyle::Jq,
-            generic_to_owned(&succinctly::jq::document::DocumentCursor::value(&c)),
+            check_value_nesting_depth(&v, 0).and_then(|()| generic_to_owned(&v)),
             &at.resolve(),
         ),
+        GenericResult::OneCursor(c) => {
+            let v = succinctly::jq::document::DocumentCursor::value(&c);
+            sink.materialize(
+                DiagStyle::Jq,
+                check_value_nesting_depth(&v, 0).and_then(|()| generic_to_owned(&v)),
+                &at.resolve(),
+            )
+        }
         GenericResult::Owned(v) => Some(v),
         // Same fallback reasoning the eager path's `LazyKeys` arm carried:
         // a fast-pathed `keys | length` never reaches this boundary, so this
