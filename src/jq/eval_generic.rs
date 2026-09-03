@@ -4897,13 +4897,11 @@ fn try_single_generic<S: EvalSemantics, V: DocumentValue>(
         // surface in yq mode; excluding it from `catch` there too keeps one
         // consistent "never caught" rule rather than one that depends on
         // whether a catch handler happens to be present.
-        GenericResult::Error(e) if e.is_decode_failure() || e.is_yq_negative_index_error() => {
-            GenericResult::Error(e)
-        }
+        GenericResult::Error(e) if e.is_uncatchable_at_value_position() => GenericResult::Error(e),
         GenericResult::Error(e) => run_catch(&e.payload()),
         GenericResult::Break(_) => run_catch(&OwnedValue::Null),
         GenericResult::Partial(prefix, Control::Error(e))
-            if e.is_decode_failure() || e.is_yq_negative_index_error() =>
+            if e.is_uncatchable_at_value_position() =>
         {
             GenericResult::Partial(prefix, Control::Error(e))
         }
@@ -4915,7 +4913,7 @@ fn try_single_generic<S: EvalSemantics, V: DocumentValue>(
         }
         GenericResult::LazySeq(seq) => match seq.materialize_atomic() {
             Ok(owned) => GenericResult::Owned(owned),
-            Err(Control::Error(e)) if e.is_decode_failure() || e.is_yq_negative_index_error() => {
+            Err(Control::Error(e)) if e.is_uncatchable_at_value_position() => {
                 GenericResult::Error(e)
             }
             Err(Control::Error(e)) => run_catch(&e.payload()),
@@ -6226,9 +6224,7 @@ fn each_try_generic<S: EvalSemantics, V: DocumentValue>(
         // `each_try`/`try_single_generic` (`src/jq/eval.rs`/this file) --
         // reached from the same `any(.a[-5]?; .)` shape those cover, via
         // this file's own generic dispatch.
-        Flow::Escaped(Control::Error(e))
-            if e.is_decode_failure() || e.is_yq_negative_index_error() =>
-        {
+        Flow::Escaped(Control::Error(e)) if e.is_uncatchable_at_value_position() => {
             Flow::Escaped(Control::Error(e))
         }
         Flow::Escaped(Control::Error(e)) => match catch {

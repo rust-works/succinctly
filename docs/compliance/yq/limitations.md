@@ -1695,12 +1695,17 @@ resolver) was itself too broad for this specific function: `is_uncatchable()` al
 `is_invalid_path_expression()`, correct for `resolve_node` but not for
 `eval_stage_with_path_context`, which runs whenever *any* sibling in the same pipe needs path
 context, not only when the branch actually being evaluated is itself a path expression --
-confirmed live that `.a | (try path(1) catch "x"), key` wrongly let the error escape uncaught
-purely because of the unrelated `key` sibling, where real jq (and `try path(1) catch "x"`
-alone, without that sibling) always catches it. Fixed with a narrower, function-local
-predicate (`path_context_stage_uncatchable`, `src/jq/eval.rs`) matching the same
-`is_decode_failure() || is_yq_negative_index_error()` exclusion `eval_try`/`each_try`/
-`try_single_generic`/`each_try_generic` already apply at pure value position.
+confirmed that `.a | (try path(1) catch "x"), key` wrongly let the error escape uncaught
+purely because of the unrelated `key` sibling. `key` is a succinctly-only path-context
+extension real jq's own lexer rejects outright, so only the isolated `try path(1) catch "x"`
+half of that claim has a real-jq oracle to check against -- confirmed live it always catches
+there; the combined query is an internal-consistency claim against succinctly's own build
+instead (the unrelated `key` sibling must not change what `try path(1) catch "x"` alone
+already does). Fixed with `EvalError::is_uncatchable_at_value_position` (`src/jq/error.rs`),
+a narrower sibling of `is_uncatchable()` that excludes `is_invalid_path_expression()` --
+consolidating what `eval_try`/`each_try`/`try_single_generic`/`each_try_generic` (`eval.rs`/
+`eval_generic.rs`) already hand-copied inline at six sites onto one shared definition,
+matching this function's own two new call sites too.
 
 ### Other categories
 

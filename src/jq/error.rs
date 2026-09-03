@@ -1261,18 +1261,43 @@ impl EvalError {
     /// check next.
     ///
     /// The value-position dispatch points (`eval_try`/`each_try`/
-    /// `try_single_generic`/`each_try_generic`) deliberately do *not* switch
-    /// to this predicate: they need `is_decode_failure() ||
-    /// is_yq_negative_index_error()` specifically, without
-    /// `is_invalid_path_expression()`, which is meaningful only in path
-    /// context (`path()`/`getpath`) and was never verified against value
-    /// position -- widening those four to this broader predicate as a side
-    /// effect of #2254 would be an untested behavior change, not this fix's
-    /// job.
+    /// `try_single_generic`/`each_try_generic`), and `eval_stage_with_path_context`'s
+    /// own `Expr::Optional`/`Expr::Try` arms (#2270/#2289), deliberately do
+    /// *not* switch to this predicate -- see
+    /// [`Self::is_uncatchable_at_value_position`], which they all call
+    /// instead, for why `is_invalid_path_expression()` doesn't belong there.
     pub fn is_uncatchable(&self) -> bool {
         self.is_invalid_path_expression()
             || self.is_decode_failure()
             || self.is_yq_negative_index_error()
+    }
+
+    /// [`Self::is_uncatchable`], narrowed to the subset that also applies at
+    /// *value* position -- a decode failure or a yq negative-index raise,
+    /// but not [`Self::is_invalid_path_expression`]. That third condition is
+    /// meaningful only in path context (`path()`/`getpath`'s own walker,
+    /// `resolve_node`) and was never verified against value position, so
+    /// widening a value-position dispatch point to the full
+    /// `is_uncatchable()` would be an untested behavior change (#2254).
+    /// Confirmed live against jq 1.7.1 that widening it is a *real* bug, not
+    /// just an untested one: `eval_stage_with_path_context`'s `Expr::Try`/
+    /// `Expr::Optional` arms briefly used the broader `is_uncatchable()`
+    /// (matching `resolve_node`'s own path-tracking-position precedent) and
+    /// it wrongly made an ordinary `path(1)` call uncatchable merely because
+    /// an unrelated sibling (`key`/`file_index`) elsewhere in the same pipe
+    /// forced this function's own dispatch to run at all --
+    /// `eval_stage_with_path_context` is itself a value-position dispatcher
+    /// for any branch that isn't actually a path expression, even though it
+    /// happens to run inside path-context plumbing (#2270 review, #2289).
+    ///
+    /// Shared by six call sites across two files, kept in agreement here
+    /// rather than each hand-copying `is_decode_failure() ||
+    /// is_yq_negative_index_error()`: `eval_try`/`each_try` (`eval.rs`),
+    /// `try_single_generic`/`each_try_generic` (`eval_generic.rs`), and
+    /// `eval_stage_with_path_context`'s own `Expr::Optional`/`Expr::Try`
+    /// arms (`eval.rs`).
+    pub fn is_uncatchable_at_value_position(&self) -> bool {
+        self.is_decode_failure() || self.is_yq_negative_index_error()
     }
 
     /// `Cannot check whether <container> has a <key type> key`.
