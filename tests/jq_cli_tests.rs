@@ -21807,21 +21807,49 @@ fn test_jq_lazy_path_wellformed_empty_containers_unaffected_2211() -> Result<()>
     Ok(())
 }
 
-/// #2211 follow-up (filed as #2243), pinned here as a known, still-open gap
-/// rather than left silently uncovered: a trailing comma after a *real*
-/// scalar last child (`[1,]`, `{"a":1,}`) is a related but distinct shape
-/// from the apparently-empty-container case this issue fixed -- catching it
-/// needs the last real child's own text-end position, which
-/// `to_owned_cursor_at_depth`'s array/object loops don't track at all (the
+/// #2211 follow-up (#2243): a trailing comma after a *real* scalar last
+/// child (`[1,]`, `{"a":1,}`) is a related but distinct shape from the
+/// apparently-empty-container case #2211 fixed -- catching it needs the
+/// last real child's own text-end position, which
+/// `to_owned_cursor_at_depth`'s array/object loops didn't track at all (the
 /// #2211 fix only needed the container's own opening-delimiter position,
-/// correct for the empty case but not this one). The cursor-transparent `.`
-/// path already gets this right via `print_json`'s `scalar_end_pos`/
-/// `trailing_gap_ok` pair (#1676); the lazy path does not yet share it. A
-/// future fix for #2243 should update this test rather than leave it
-/// silently passing on the wrong behavior.
+/// correct for the empty case but not this one). Now shares the same
+/// `scalar_end_pos`/`trailing_gap_ok` pair the cursor-transparent `.` path
+/// already used via `print_json` (#1676), generalized onto
+/// `DocumentValue::scalar_text_end`/`DocumentCursor::trailing_element_gap_ok`
+/// so both paths call one definition. Verified against jq 1.7.1: both
+/// shapes are a parse error (exit 5), matching the cursor-transparent
+/// path's own (already-correct) behavior for the same input.
 #[test]
-fn test_jq_lazy_path_trailing_comma_after_scalar_last_child_still_a_known_gap_2243() -> Result<()> {
-    for (input, expected) in [(r"[1,]", "[1]"), (r#"{"a":1,}"#, r#"{"a":1}"#)] {
+fn test_jq_lazy_path_trailing_comma_after_scalar_last_child_2243() -> Result<()> {
+    for input in [r"[1,]", r#"{"a":1,}"#] {
+        let (out, stderr, code) = run_jq_full(&["-c", "if true then . else . end"], Some(input))?;
+        assert_eq!(code, 5, "{input}: out: {out:?}, stderr: {stderr:?}");
+        assert!(out.trim().is_empty(), "{input}: unexpected output {out:?}");
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "{input}: stderr: {stderr:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// #2243: a trailing comma after a *container-typed* last child (`[1,[2,3],]`)
+/// is a deliberately deferred residual gap, not something this fix closes --
+/// a container's own end position isn't derivable from its start alone (it
+/// may have arbitrary trailing whitespace before its own closing bracket),
+/// matching `scalar_text_end`'s own documented `None`-for-container
+/// contract. Confirmed this is not a regression: the cursor-transparent `.`
+/// path (`print_json`'s own `scalar_end_pos`, #1676) has the identical gap
+/// for the same input, verified live against this exact build.
+#[test]
+fn test_jq_lazy_path_trailing_comma_after_container_last_child_still_a_known_gap_2243() -> Result<()>
+{
+    for (input, expected) in [
+        (r"[1,[2,3],]", "[1,[2,3]]"),
+        (r#"{"a":1,"b":[1,2],}"#, r#"{"a":1,"b":[1,2]}"#),
+    ] {
         let (out, stderr, code) = run_jq_full(&["-c", "if true then . else . end"], Some(input))?;
         assert_eq!(code, 0, "{input}: stderr: {stderr:?}");
         assert_eq!(out.trim(), expected, "{input}");

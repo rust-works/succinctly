@@ -2149,6 +2149,17 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
         }
     }
 
+    /// #2243: reuses the same `trailing_gap_ok` primitive
+    /// [`container_gap_ok`](Self::container_gap_ok) does, just against a
+    /// caller-supplied `gap_start` (a real last child's own end) instead of
+    /// `self`'s own opening position + 1 -- `self` is only used for its
+    /// shared `text` buffer, so any cursor from the same document answers
+    /// identically regardless of which node it happens to point at.
+    #[inline]
+    fn trailing_element_gap_ok(&self, gap_start: usize, close_char: u8) -> bool {
+        trailing_gap_ok(self.text, gap_start, close_char)
+    }
+
     #[inline]
     fn line(&self) -> usize {
         JsonCursor::line(self)
@@ -2483,6 +2494,18 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
             StandardJson::String(s) => Some(s.end()),
             _ => None,
         }
+    }
+
+    /// #2243: delegates to this module's own (now-shared) `scalar_end_pos`
+    /// free function -- every variant answers `start + its own byte length`
+    /// (`s`/`n`'s own `raw_bytes().len()` for `String`/`Number`, a fixed
+    /// 4/5/4 for `Bool(true)`/`Bool(false)`/`Null`), trusting the caller's
+    /// `start` rather than re-deriving it from `s`/`n`'s own `start()`
+    /// (which would be redundant work when `start` is already this same
+    /// value's own resolved position, the only way callers ever have one
+    /// to pass).
+    fn scalar_text_end(&self, start: usize) -> Option<usize> {
+        scalar_end_pos(start, self)
     }
 
     fn as_object(&self) -> Option<Self::Fields> {
