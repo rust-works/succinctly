@@ -37120,10 +37120,25 @@ fn delete_trie_array(
     yq_mode: bool,
 ) -> Result<OwnedValue, EvalError> {
     let node = trie.node(id);
-    // Same per-step `null` exemption as `delete_trie_object` — applies to a
-    // bare index and a slice component alike (#476), and likewise covers only
-    // this step (#527).
-    if matches!(value, OwnedValue::Null) {
+    // #2323: real yq auto-vivifies a `null` root into `[]` ahead of an
+    // array-level step here too, the comma-grouped sibling of
+    // `delete_path_steps`'s own `Expr::Index`/`Expr::Iterate` arms --
+    // confirmed live, `{"x":null,"y":1} | del(.x[2], .y)` is
+    // `{"x":[null,null]}` (`.y` still deletes independently either way).
+    // Vivifying unconditionally rather than only for an `ArrayStep::Index`
+    // node is safe for a `Slice`-only node too: a slice range against a
+    // freshly empty array is itself already a harmless no-op (confirmed
+    // live against a mixed `del(.x[2], .x[0:1], .y)` node), so there is no
+    // need to distinguish which step kind triggered the vivify. jq has no
+    // such rule, so this is yq-mode only, matching every other arm of this
+    // fix -- jq mode falls through to the pre-existing `null`-tolerant
+    // walk-through-absent behavior unchanged.
+    if yq_mode && matches!(value, OwnedValue::Null) {
+        value = OwnedValue::Array(Vec::new());
+    } else if matches!(value, OwnedValue::Null) {
+        // Same per-step `null` exemption as `delete_trie_object` — applies
+        // to a bare index and a slice component alike (#476), and likewise
+        // covers only this step (#527).
         for &slot in &node.index_groups {
             let (_, &child) = node
                 .indices
@@ -37655,52 +37670,76 @@ fn delete_at_path(
                 name,
             )),
         },
-        Expr::Index { idx, .. } => match root {
-            OwnedValue::Array(arr) => {
-                let key = OwnedValue::Int(*idx);
-                // #2268: real yq raises on a negative index whose magnitude
-                // still exceeds the array length after resolving against it
-                // -- checked before the resolution match below, which
-                // still applies to jq mode and to yq's own ordinary
-                // positive-out-of-range case (#477).
-                if let Some(err) = yq_negative_index_error_for_len(yq_mode, &key, arr.len()) {
-                    return Err(err);
-                }
-                // #2305: a positive out-of-range index needs its own,
-                // different treatment (extend, not raise) -- see
-                // `DeleteIndexResolution`'s own doc comment for the
-                // confirmed live boundary. jq has no such rule, so the
-                // extension is yq-mode only; jq mode falls through to the
-                // existing no-op below (`Skip` here only ever means NaN,
-                // since a real negative-OOB index already raised above,
-                // when it was going to).
-                match resolve_delete_index(&key, arr.len()) {
-                    DeleteIndexResolution::InRange(actual_idx) => {
-                        arr.remove(actual_idx);
-                    }
-                    DeleteIndexResolution::PositiveOutOfRange(target_len) if yq_mode => {
-                        extend_array_with_nulls_for_delete(arr, target_len)?;
-                    }
-                    // An out-of-range index names nothing to delete — jq's
-                    // delpaths silently skips it, `?` or not (#477).
-                    DeleteIndexResolution::PositiveOutOfRange(_) | DeleteIndexResolution::Skip => {}
-                }
-                Ok(())
+        Expr::Index { idx, .. } => {
+            // #2323: real yq vivifies a `null` root into `[]` ahead of an
+            // `Index`/`Iterate` step (confirmed live: `null | del(.[2])` is
+            // `[null,null]`, `?` included -- `null | del(.[2]?)` vivifies
+            // too) -- jq has no such rule (`null | del(.[2])` stays `null`
+            // in real jq), so this is yq-mode only, and runs unconditionally
+            // ahead of the match below rather than gating on `optional` the
+            // way the scalar-noop arms further down do. Once vivified, the
+            // existing `OwnedValue::Array` arm's own #2305/#2314 extension
+            // logic applies unchanged -- an empty array is just another
+            // array to resolve the index against.
+            if yq_mode && matches!(root, OwnedValue::Null) {
+                *root = OwnedValue::Array(Vec::new());
             }
-            // `null` has no elements at any index, so this is always a
-            // no-op — `null | del(.[0])` is `null` (#476).
-            OwnedValue::Null => Ok(()),
-            _ if optional => Ok(()),
-            // #2106: same scalar no-op as the `Field` arm above, for an
-            // index key (`2.5 | del(.[0])` stays `2.5` in real yq).
-            _ if yq_mode && is_yq_field_index_noop_scalar(root) => Ok(()),
-            _ => Err(EvalError::cannot_index_with_type(
-                owned_type_name(root),
-                "number",
-            )),
-        },
+            match root {
+                OwnedValue::Array(arr) => {
+                    let key = OwnedValue::Int(*idx);
+                    // #2268: real yq raises on a negative index whose magnitude
+                    // still exceeds the array length after resolving against it
+                    // -- checked before the resolution match below, which
+                    // still applies to jq mode and to yq's own ordinary
+                    // positive-out-of-range case (#477).
+                    if let Some(err) = yq_negative_index_error_for_len(yq_mode, &key, arr.len()) {
+                        return Err(err);
+                    }
+                    // #2305: a positive out-of-range index needs its own,
+                    // different treatment (extend, not raise) -- see
+                    // `DeleteIndexResolution`'s own doc comment for the
+                    // confirmed live boundary. jq has no such rule, so the
+                    // extension is yq-mode only; jq mode falls through to the
+                    // existing no-op below (`Skip` here only ever means NaN,
+                    // since a real negative-OOB index already raised above,
+                    // when it was going to).
+                    match resolve_delete_index(&key, arr.len()) {
+                        DeleteIndexResolution::InRange(actual_idx) => {
+                            arr.remove(actual_idx);
+                        }
+                        DeleteIndexResolution::PositiveOutOfRange(target_len) if yq_mode => {
+                            extend_array_with_nulls_for_delete(arr, target_len)?;
+                        }
+                        // An out-of-range index names nothing to delete — jq's
+                        // delpaths silently skips it, `?` or not (#477).
+                        DeleteIndexResolution::PositiveOutOfRange(_)
+                        | DeleteIndexResolution::Skip => {}
+                    }
+                    Ok(())
+                }
+                // Only reachable in jq mode now (yq mode vivified above) —
+                // `null` has no elements at any index, so this is a no-op —
+                // `null | del(.[0])` is `null` (#476).
+                OwnedValue::Null => Ok(()),
+                _ if optional => Ok(()),
+                // #2106: same scalar no-op as the `Field` arm above, for an
+                // index key (`2.5 | del(.[0])` stays `2.5` in real yq).
+                _ if yq_mode && is_yq_field_index_noop_scalar(root) => Ok(()),
+                _ => Err(EvalError::cannot_index_with_type(
+                    owned_type_name(root),
+                    "number",
+                )),
+            }
+        }
         Expr::Iterate => {
-            // del(.[]) removes all elements
+            // del(.[]) removes all elements. #2323: same yq-mode null-vivify
+            // as the `Index` arm above -- `null | del(.[])` is `[]` in real
+            // yq, not an error, so vivifying first and falling into the
+            // `Array` arm below (clearing an already-empty array is itself
+            // a no-op) produces exactly that.
+            if yq_mode && matches!(root, OwnedValue::Null) {
+                *root = OwnedValue::Array(Vec::new());
+            }
             match root {
                 OwnedValue::Array(arr) => {
                     arr.clear();
@@ -37981,20 +38020,13 @@ fn delete_path_steps(
                         // del(.[5].a)` is `[1,2,null,null,null,null]`.
                         DeleteIndexResolution::PositiveOutOfRange(index) if yq_mode => {
                             pad_with_nulls(arr, index)?;
-                            // The freshly padded slot is `null`, which
-                            // `.[]` never tolerates (#527) -- but real yq
-                            // auto-vivifies it to `[]` instead when `.[]`
-                            // is the very next step, the same way
-                            // `setpath` auto-vivifies a `null` into
-                            // whatever container its own next step needs.
-                            // Confirmed live: `[1,2] | del(.[5][])` is
-                            // `[1,2,null,null,null,[]]`, not an error.
-                            if matches!(
-                                rest.first().map(|s| unwrap_path_component(s).0),
-                                Some(Expr::Iterate)
-                            ) {
-                                arr[index] = OwnedValue::Array(Vec::new());
-                            }
+                            // The freshly padded slot is `null`; whatever
+                            // `rest` does with it next (including `.[]`
+                            // vivifying it to `[]`, #2323) is handled
+                            // generically by this same loop's own
+                            // `OwnedValue::Null` arms below, once it
+                            // re-matches on the next iteration -- no need
+                            // to special-case the next component here.
                             root = &mut arr[index];
                             steps = rest;
                             continue;
@@ -38010,10 +38042,26 @@ fn delete_path_steps(
                         }
                     }
                 }
+                // #2323: real yq auto-vivifies a `null` reached mid-chain
+                // into `[]` ahead of an `Index` step and re-resolves the
+                // same index against it — the mid-chain sibling of
+                // `delete_at_path`'s own terminal `Index`/`Iterate` arms.
+                // `*root` is mutated and the loop re-enters with `steps`
+                // unchanged, so the very same `component` re-matches
+                // against the freshly vivified array on the next pass —
+                // recursively, so a further out-of-range index chained onto
+                // this one (`[1,2] | del(.[3][2].a)`) extends correctly at
+                // each level: confirmed live, `[1,2,null,[null,null,null]]`,
+                // not `[1,2,null,null]`. jq has no such rule at all, so this
+                // is yq-mode only — jq keeps the plain "null | del(.[0].a)
+                // is a no-op" reading (#476).
+                OwnedValue::Null if yq_mode => {
+                    *root = OwnedValue::Array(Vec::new());
+                    continue;
+                }
                 // Same per-step `null` exemption as the `Field` case above —
-                // `null | del(.[0].a)` is a no-op (#476), `null |
-                // del(.[0][])` still raises (#527) -- loops in place for the
-                // same reason.
+                // `null | del(.[0].a)` is a no-op (#476) -- loops in place
+                // for the same reason.
                 OwnedValue::Null => {
                     steps = rest;
                     continue;
@@ -38030,6 +38078,20 @@ fn delete_path_steps(
                 }
             },
             Expr::Iterate => {
+                // #2323: same yq-mode null-vivify as the `Index` arm above
+                // — real yq auto-vivifies a mid-chain `null` into `[]`
+                // ahead of `.[]` rather than raising: confirmed live,
+                // `[1,2] | del(.[5][])` is `[1,2,null,null,null,[]]`, not
+                // "Cannot iterate over null". Falling into the `Array` arm
+                // below with a freshly empty array is itself a no-op (no
+                // elements to iterate), which is exactly the `[]` this
+                // produces. jq has no such rule (`null | del(.[])` still
+                // raises there), so this is gated to yq mode only, and runs
+                // ahead of the per-element re-classification below rather
+                // than through it.
+                if yq_mode && matches!(root, OwnedValue::Null) {
+                    *root = OwnedValue::Array(Vec::new());
+                }
                 // `rest` is turned into an `Expr::Pipe` at most once here
                 // (only in yq mode, only per `Iterate` occurrence, not per
                 // element) for `yq_del_slice_outcome`'s own `&Expr` signature
@@ -69216,6 +69278,174 @@ mod tests {
         query!(br"[1,2]", r#"delpaths([[5,"a"]])"#,
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr, vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_del_bare_null_index_vivifies_to_array_yq_mode_2323() {
+        // #2323: real yq vivifies a `null` root into `[]` ahead of an
+        // `Index`/`Iterate` step -- broader than #2314's own "a slot this
+        // fix just padded" case, and predates it: no out-of-range array
+        // extension is involved here at all, just a bare `null` document.
+        // Confirmed live: `null | del(.[2])` is `[null,null]`.
+        yq_query!(br"null", r"del(.[2])",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Null, OwnedValue::Null]);
+            }
+        );
+        // `null | del(.[])` is `[]`, not "Cannot iterate over null" --
+        // vivifying first and then clearing an already-empty array is a
+        // no-op that lands on exactly the right answer.
+        yq_query!(br"null", r"del(.[])",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert!(arr.is_empty(), "expected [], got {arr:?}");
+            }
+        );
+        // `?` does not suppress the vivify -- confirmed live,
+        // `null | del(.[2]?)` is still `[null,null]`.
+        yq_query!(br"null", r"del(.[2]?)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Null, OwnedValue::Null]);
+            }
+        );
+        // jq has no such rule at all -- both stay exactly as jq's existing
+        // established behavior (#476 no-op for Index, raise for Iterate).
+        query!(br"null", r"del(.[2])",
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
+        query!(br"null", r"del(.[])",
+            QueryResult::Error(e) => {
+                assert!(e.message.contains("Cannot iterate over null"), "message: {}", e.message);
+            }
+        );
+    }
+
+    #[test]
+    fn test_del_field_reached_null_index_vivifies_to_array_yq_mode_2323() {
+        // #2323: the same vivify rule applies to a `null` reached through a
+        // `Field` step first, not just a bare document -- confirmed live,
+        // `{"x":null} | del(.x[2])` is `{"x":[null,null]}`, and
+        // `{"x":null} | del(.x[])` is `{"x":[]}`.
+        yq_query!(br#"{"x":null}"#, r"del(.x[2])",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                let Some(OwnedValue::Array(arr)) = obj.get("x") else {
+                    panic!("expected x to be an array, got {obj:?}");
+                };
+                assert_eq!(arr, &vec![OwnedValue::Null, OwnedValue::Null]);
+            }
+        );
+        yq_query!(br#"{"x":null}"#, r"del(.x[])",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                let Some(OwnedValue::Array(arr)) = obj.get("x") else {
+                    panic!("expected x to be an array, got {obj:?}");
+                };
+                assert!(arr.is_empty(), "expected [], got {arr:?}");
+            }
+        );
+        // A `Field` step itself never vivifies, unlike `Index`/`Iterate` --
+        // confirmed live, `{"x":null} | del(.x.a)` stays `{"x":null}`.
+        yq_query!(br#"{"x":null}"#, r"del(.x.a)",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.get("x"), Some(&OwnedValue::Null));
+            }
+        );
+        // Nor does a `Slice` step -- confirmed live, `null | del(.[0:2])`
+        // stays `null` in both jq and yq.
+        yq_query!(br"null", r"del(.[0:2])",
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
+    }
+
+    #[test]
+    fn test_del_chained_out_of_range_index_vivifies_recursively_yq_mode_2323() {
+        // #2323: the vivify rule applies at every level of a chain, not
+        // just the first -- once `.[3]` pads `[1,2]` out to a `null` at
+        // index 3, `.[2]` immediately after it must *also* vivify that
+        // fresh `null` into `[]` (and pad it) rather than stopping, the way
+        // #2314's own narrower fix would have. Confirmed live:
+        // `[1,2] | del(.[3][2].a)` is `[1,2,null,[null,null,null]]`.
+        yq_query!(br"[1,2]", r"del(.[3][2].a)",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr.len(), 4);
+                assert_eq!(arr[0], OwnedValue::Int(1));
+                assert_eq!(arr[1], OwnedValue::Int(2));
+                assert_eq!(arr[2], OwnedValue::Null);
+                let OwnedValue::Array(inner) = &arr[3] else {
+                    panic!("expected arr[3] to be an array, got {:?}", arr[3]);
+                };
+                assert_eq!(inner, &vec![OwnedValue::Null, OwnedValue::Null, OwnedValue::Null]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_del_pipe_wrapped_iterate_through_padded_null_vivifies_yq_mode_2323() {
+        // #2323: `.[5] | (.[].a)` reduces to a literal `Expr::Iterate`
+        // against the padded `null` at index 5 once the existing
+        // `Expr::Pipe` splice logic runs -- so the same general
+        // `OwnedValue::Null` vivify arm this fix adds handles it without
+        // needing its own lookahead, unlike a narrower fix that only
+        // checked the very next literal component. Confirmed live:
+        // `[1,2] | del(.[5] | (.[].a))` is `[1,2,null,null,null,[]]`.
+        yq_query!(br"[1,2]", r"del(.[5] | (.[].a))",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(
+                    arr,
+                    vec![
+                        OwnedValue::Int(1), OwnedValue::Int(2),
+                        OwnedValue::Null, OwnedValue::Null, OwnedValue::Null,
+                        OwnedValue::Array(vec![]),
+                    ]
+                );
+            }
+        );
+    }
+
+    #[test]
+    fn test_del_comma_grouped_null_index_vivifies_yq_mode_2323() {
+        // #2323: the comma-grouped trie walk (`delete_trie_array`) shares
+        // the same vivify rule as the single-target AST walk -- confirmed
+        // live, `{"x":null,"y":1} | del(.x[2], .y)` is `{"x":[null,null]}`,
+        // with `.y` still deleted independently either way.
+        yq_query!(br#"{"x":null,"y":1}"#, r"del(.x[2], .y)",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert!(!obj.contains_key("y"), "expected y deleted, got {obj:?}");
+                let Some(OwnedValue::Array(arr)) = obj.get("x") else {
+                    panic!("expected x to be an array, got {obj:?}");
+                };
+                assert_eq!(arr, &vec![OwnedValue::Null, OwnedValue::Null]);
+            }
+        );
+        // A `Slice`-only node vivifying is a no-op against the freshly
+        // empty array -- but real yq's own pre-existing chained-slice-drop
+        // rule (#1116/#1219) then removes the whole `x`/`y` pair anyway,
+        // an already-correct, unrelated-to-this-fix behavior pinned here
+        // only to confirm the vivify doesn't disturb it. Confirmed live:
+        // `{"x":null,"y":1} | del(.x[0:2], .y)` is `{}`.
+        yq_query!(br#"{"x":null,"y":1}"#, r"del(.x[0:2], .y)",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert!(obj.is_empty(), "expected {{}}, got {obj:?}");
+            }
+        );
+        // jq has no such rule -- unaffected either way.
+        query!(br#"{"x":null,"y":1}"#, r"del(.x[2], .y)",
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.get("x"), Some(&OwnedValue::Null));
+                assert!(!obj.contains_key("y"));
+            }
+        );
+    }
+
+    #[test]
+    fn test_delpaths_null_index_stays_no_op_yq_mode_2323() {
+        // #2323's vivify rule is specific to `del()`'s own expression-based
+        // target -- `delpaths()`'s path-array form does not share it.
+        // Confirmed live: `{"x":null} | delpaths([["x",2]])` stays
+        // `{"x":null}`, unlike the equivalent `del(.x[2])` above.
+        yq_query!(br#"{"x":null}"#, r#"delpaths([["x",2]])"#,
+            QueryResult::Owned(OwnedValue::Object(obj)) => {
+                assert_eq!(obj.get("x"), Some(&OwnedValue::Null));
             }
         );
     }

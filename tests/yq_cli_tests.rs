@@ -21903,30 +21903,36 @@ fn test_yq_del_slice_outcome_iterate_prefix_real_container_1432() -> Result<()> 
 }
 
 /// #1432 (coverage, #1863): the same `navigate_read_only` `Iterate` arm's
-/// scalar-hit and `Null`/catch-all branches, reached via `del()`. Both are
-/// pinned as *known-divergent* -- pre-existing bugs unrelated to #1432's
-/// own fix (`navigate_read_only`'s match arms are byte-for-byte unchanged
-/// by that PR), found only while restoring this coverage, not something
-/// this PR fixes. Real yq applies the same #1181/#1232 "a scalar hit
-/// anywhere mid-chain permanently no-ops" rule `=`'s own write path (and
-/// `del()`'s slice-prefix handling elsewhere in this same file) already
-/// get right, and autovivifies `null` the same way `.a[].b = v` does --
-/// `del()`'s own `Iterate`-then-slice path does neither, raising instead.
-/// Live-verified against yq v4.53.3; reported as a follow-up on #1863.
+/// scalar-hit branch, reached via `del()`. Pinned as *known-divergent* -- a
+/// pre-existing bug unrelated to #1432's own fix (`navigate_read_only`'s
+/// match arms are byte-for-byte unchanged by that PR), found only while
+/// restoring this coverage, not something this PR fixes. Real yq applies
+/// the same #1181/#1232 "a scalar hit anywhere mid-chain permanently
+/// no-ops" rule `=`'s own write path (and `del()`'s slice-prefix handling
+/// elsewhere in this same file) already get right; `del()`'s own
+/// `Iterate`-then-slice path does not, raising instead. Live-verified
+/// against yq v4.53.3; reported as a follow-up on #1863.
+///
+/// The sibling `Null` case this test used to pin as equally divergent is
+/// fixed by #2323: `delete_path_steps`'s `Expr::Iterate` arm now vivifies a
+/// `null` root into `[]` in yq mode before matching, the same rule
+/// `delete_at_path`'s terminal arms and `setpath`'s own auto-vivify already
+/// apply -- `a: null | del(.a[].b[0:1])` is `{"a":[]}` now, matching real
+/// yq (an empty array has nothing to fan `.b[0:1]` into).
 #[test]
 fn test_yq_del_slice_outcome_iterate_prefix_scalar_and_null_1432() -> Result<()> {
-    // Scalar hit -- real yq no-ops; succinctly raises.
+    // Scalar hit -- real yq no-ops; succinctly raises. Still divergent,
+    // unaffected by #2323 (a scalar `5` is never a `null` to vivify).
     let (_out, err, code) =
         run_yq_stdin_with_stderr("del(.a[].b[0:1])", "a: 5\n", &["-o=json", "-I=0"])?;
     assert_ne!(code, 0);
     assert!(err.contains("Cannot iterate"), "err={err}");
 
-    // `Null` -- real yq autovivifies to `[]` (nothing to delete);
-    // succinctly raises.
-    let (_out, err, code) =
-        run_yq_stdin_with_stderr("del(.a[].b[0:1])", "a: null\n", &["-o=json", "-I=0"])?;
-    assert_ne!(code, 0);
-    assert!(err.contains("Cannot iterate"), "err={err}");
+    // `Null` -- real yq autovivifies to `[]` (nothing left to delete),
+    // confirmed live; #2323 closes this.
+    let (out, code) = run_yq_stdin("del(.a[].b[0:1])", "a: null\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":[]}"#);
 
     Ok(())
 }

@@ -1886,23 +1886,73 @@ gap below for when it hasn't), and `delete_paths_under`'s array-key arm (`delpat
 recursion) -- all in `src/jq/eval.rs`. `delpaths`' own path components are always concrete
 keys, never a `.[]` wildcard, so there is no `[]`-vivify case to mirror at that site.
 
-**Two residual gaps found during this fix's own review, not chased here:**
+**One residual gap found during this fix's own review, not chased here:** a
+**comma-grouped** target whose own `.[]` fan-out crosses the out-of-range index
+(`del(.[5][], .[0])`) never reaches `delete_trie_array` at all -- the read-based
+validation that enumerates concrete branches for the trie reads `.[5]` as a plain `null`
+(correct for an ordinary read) and raises iterating `.[]` over it, rather than
+extending+vivifying the way the direct, non-comma-grouped form now does. Tracked as
+[#2324](https://github.com/rust-works/succinctly/issues/2324).
 
-- A **comma-grouped** target whose own `.[]` fan-out crosses the out-of-range index
-  (`del(.[5][], .[0])`) never reaches `delete_trie_array` at all -- the read-based
-  validation that enumerates concrete branches for the trie reads `.[5]` as a plain
-  `null` (correct for an ordinary read) and raises iterating `.[]` over it, rather than
-  extending+vivifying the way the direct, non-comma-grouped form now does. Tracked as
-  [#2324](https://github.com/rust-works/succinctly/issues/2324).
-- The `[]`-vivify rule implemented here is narrowly scoped to a slot this fix *itself*
-  just padded, checked only against a literal `Expr::Iterate` as the very next step.
-  Real yq's actual rule is broader and predates this fix entirely: `null` auto-vivifies
-  into `[]` for **any** subsequent `Index`/`Iterate` del() step, freshly padded or not
-  (`null | del(.[2])` is `[null,null]` in real yq; `{"x":null} | del(.x[2])` is
-  `{"x":[null,null]}`) -- `succinctly yq` gets both wrong today, along with a
-  multi-level chain like `del(.[3][2].a)` (real yq recurses the same rule at each level;
-  this fix's own narrow check only covers one). Tracked as
-  [#2323](https://github.com/rust-works/succinctly/issues/2323).
+(A second gap found during the same review -- `null` never vivifying into `[]` ahead of
+*any* `Index`/`Iterate` del() step, not just a slot #2314 itself just padded -- is now
+closed; see the next section.)
+
+### `del()` auto-vivifies a `null` into `[]` ahead of an `Index`/`Iterate` step, matching `setpath`
+
+[#2323](https://github.com/rust-works/succinctly/issues/2323), found during #2314's own
+review. Real yq's actual null-vivify rule is broader than -- and predates -- #2314's own
+"a slot this fix just padded" case: **any** `null` a `del()` walk reaches, freshly padded
+or not, vivifies into `[]` the moment the next step is `Index` or `Iterate`, the same
+auto-vivify philosophy `=`/`|=`'s own write path already applies (`.a[].b = v` on
+`{"a":null}` is `{"a":[]}`, confirmed pre-existing precedent -- see
+`test_yq_iterate_pipe_chain_null_autovivifies_under_update_assign_1919`):
+
+```bash
+$ echo 'null' | yq -o=json 'del(.[2])'          # [null, null] -- no out-of-range extension involved at all
+$ echo 'null' | yq -o=json 'del(.[])'           # []
+$ echo '{"x":null}' | yq -o=json 'del(.x[2])'   # {"x": [null, null]}
+$ echo '[1,2]' | yq -o=json 'del(.[3][2].a)'    # [1, 2, null, [null, null, null]] -- recurses at each level
+```
+
+Applies to `del()`'s terminal form (`delete_at_path`'s own `Index`/`Iterate` arms) and its
+mid-chain form (`delete_path_steps`'s own `Index`/`Iterate` arms) alike. Both are
+implemented the same way: mutate the `null` root into `Array(Vec::new())` immediately
+before the existing container-handling match, rather than duplicating that match's own
+logic -- in `delete_path_steps`'s loop this means `continue`ing without advancing `steps`,
+so the very same path component re-matches against the freshly vivified array on the next
+pass, which is what makes the recursive `del(.[3][2].a)` case above fall out for free
+(each level's own out-of-range index re-triggers #2314's existing extension logic against
+an array that used to be `null`) without any explicit lookahead or recursion of its own.
+`?` does not suppress the vivify (`null | del(.[2]?)` still vivifies, confirmed live), and
+neither does a `Pipe`-wrapped continuation (`del(.[5] | (.[].a))` reduces to a literal
+`Expr::Iterate` against the padded `null` once the existing `Expr::Pipe` splice logic
+runs, so it is covered by the same general arm without its own check).
+
+**Does not apply to:** `Field` steps (`{"x":null} | del(.x.a)` stays `{"x":null}`,
+confirmed live -- matches `=`/`|=`'s own precedent, which likewise never vivifies for
+`Field`), `Slice` steps (`null | del(.[0:2])` stays `null`, matching jq), `delpaths()` at
+all (`{"x":null} | delpaths([["x",2]])` stays `{"x":null}` -- this rule is specific to
+`del()`'s expression-based target, not `delpaths()`'s path-array form), or jq mode (no
+such rule exists there at all: `null | del(.[2])` stays `null`, `null | del(.[])` still
+raises "Cannot iterate over null").
+
+**Also extended to `del()`'s comma-grouped form.** `delete_trie_array`'s own null-skip
+branch shares the identical vivify rule (`delete_trie_object`'s sibling branch does not —
+`Field` steps never vivify, per the scope above): confirmed live,
+`{"x":null,"y":1} | del(.x[2], .y)` is `{"x":[null,null]}`, with `.y` still deleting
+independently either way. Vivifying is safe even when the only array-level step is a
+`Slice` (no `Index` at all) — a slice range against a freshly empty array is itself a
+harmless no-op, so there was no need to distinguish which step kind triggered the vivify.
+One surprising, *already-correct, pre-existing and unrelated* behavior worth flagging so
+a future reader doesn't mistake it for this fix's own doing:
+`{"x":null,"y":1} | del(.x[0:2], .y)` is `{}` in real yq — not just `x` cleared, `y` gone
+too — reproduced identically by `succinctly yq` both before and after this fix, via the
+pre-existing #1116/#1219 chained-slice-parent-drop rule elsewhere in this same trie walk.
+
+This fix does not reach the comma-grouped **`.[]` fan-out** gap #2324 tracks separately —
+that one fails earlier, in the read-based validation that builds the trie in the first
+place, before `delete_trie_array` is ever called.
 
 ### Other categories
 
