@@ -31840,12 +31840,31 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         optional,
                     );
                 }
-                // jq returns null for missing fields on objects (not an error)
-                return QueryResult::Owned(OwnedValue::Null);
+                // jq returns null for missing fields on objects (not an
+                // error) -- continue `rest` from that `Null` at `new_path`
+                // rather than returning early (#2213): an early return here
+                // skipped `rest` entirely and left `key`/`parent` seeing the
+                // stale pre-navigation path.
+                return continue_rest_with_borrowed_value::<W, S>(
+                    &OwnedValue::Null,
+                    rest,
+                    root,
+                    file_origin,
+                    &new_path,
+                    optional,
+                );
             }
-            // jq returns null for field access on null
+            // jq returns null for field access on null, same #2213 fix as
+            // the missing-field case just above.
             if matches!(value, OwnedValue::Null) {
-                return QueryResult::Owned(OwnedValue::Null);
+                return continue_rest_with_borrowed_value::<W, S>(
+                    &OwnedValue::Null,
+                    rest,
+                    root,
+                    file_origin,
+                    &new_path,
+                    optional,
+                );
             }
             // Non-object/null: error (or None if optional)
             if optional {
@@ -31876,13 +31895,37 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         optional,
                     );
                 }
+                // jq treats an out-of-bounds array index as `null`, never an
+                // error (#2213, same fix as `Expr::Field`'s missing-key arm
+                // above) -- continue `rest` from that `Null` at `new_path`
+                // regardless of `optional`, rather than routing it through
+                // the error-suppression path below, which both swallowed
+                // `rest` entirely under `?` and wrongly raised without one.
+                return continue_rest_with_borrowed_value::<W, S>(
+                    &OwnedValue::Null,
+                    rest,
+                    root,
+                    file_origin,
+                    &new_path,
+                    optional,
+                );
+            }
+            // jq treats indexing `null` with an integer the same way
+            // (#2213): always `null`, never an error.
+            if matches!(value, OwnedValue::Null) {
+                return continue_rest_with_borrowed_value::<W, S>(
+                    &OwnedValue::Null,
+                    rest,
+                    root,
+                    file_origin,
+                    &new_path,
+                    optional,
+                );
             }
             if optional {
                 QueryResult::None
-            } else if let OwnedValue::Array(arr) = value {
-                QueryResult::Error(EvalError::index_out_of_bounds(*idx, arr.len()))
             } else {
-                // Indexing a non-array is not an out-of-bounds access; jq
+                // Indexing a non-array/non-null is a genuine type error; jq
                 // reports it as an indexing type error like `.[0]` does.
                 QueryResult::Error(EvalError::cannot_index_with_type(
                     owned_type_name(value),

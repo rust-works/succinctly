@@ -8705,45 +8705,35 @@ fn test_optional_ambient_no_longer_suppresses_rest_error_2073() -> Result<()> {
     Ok(())
 }
 
-/// #2073 side effect, characterized rather than fixed: isolating `inner`
-/// unconditionally changes what a path-context `rest` sees after a
-/// *missing* field -- a shape with no error in it anywhere, so nothing about
-/// `?`'s own suppression applies.
+/// #2213 fix: `Expr::Field`'s missing-key arm (and its sibling
+/// field-access-on-`null` arm) now fall through to the normal continuation
+/// -- `continue_rest_with_borrowed_value` with `Null` at the freshly-built
+/// `new_path` -- instead of returning `QueryResult::Owned(Null)` early.
 ///
-/// `Expr::Field`'s missing-key arm returns `QueryResult::Owned(Null)`
-/// without running `rest` and without threading the `new_path` it just
-/// built. Under the old combined-with-`rest` route that early return
-/// swallowed the whole downstream pipe, so `| key` never ran and `.zz`'s own
-/// `null` leaked out as the final output. Under isolation the probe never
-/// runs either, so `split_probe_pair` takes its fallback branch and `rest`
-/// continues from the *stale*, pre-`inner` path -- reporting the parent's
-/// key.
-///
-/// Both answers are wrong: `path(.b.zz)` is `["b","zz"]` in succinctly and
-/// in real jq 1.7.1 alike, so `"zz"` is what all of these should say. The
-/// value pinned below is the one that makes `?` agree with the five sibling
-/// isolating constructs, which have reported the stale key since #1409 and
-/// are unaffected by #2073 -- checked here alongside it so a future fix for
-/// #2213 moves all six together or fails loudly.
+/// Before the fix, the early return both skipped `rest` entirely (the plain
+/// pipe spelling) and, once isolation made `rest` run via
+/// `split_probe_pair`'s fallback branch, left it continuing from the
+/// *stale*, pre-navigation path (the six isolating-construct spellings,
+/// `?` included since #2073 joined them). All seven spellings now agree
+/// with each other and with `path(.b.zz)`.
 #[test]
-fn test_optional_missing_field_reports_stale_path_like_its_siblings_2213() -> Result<()> {
+fn test_missing_field_reports_correct_path_across_all_spellings_2213() -> Result<()> {
     let input = r#"{"b":{"x":1}}"#;
 
-    // The `?` case #2073 moved: `null` (rest skipped) before, the stale
-    // parent key now.
+    // `?`: `null` (rest skipped) pre-#2073, the stale parent key `"b"`
+    // post-#2073/pre-#2213, now the correct `"zz"`.
     let (stdout, _, code) = run_jq_full(&["-c", ".b | (.zz)? | key"], Some(input))?;
     assert_eq!(code, 0);
-    assert_eq!(stdout, "\"b\"\n");
+    assert_eq!(stdout, "\"zz\"\n");
 
-    // `rest` genuinely runs now, where the old route dropped it entirely --
-    // the second output is what proves it, not just the changed first one.
+    // `rest` genuinely runs and sees the right path for every output, not
+    // just the first.
     let (stdout, _, code) = run_jq_full(&["-c", ".b | (.zz)? | (key, 1)"], Some(input))?;
     assert_eq!(code, 0);
-    assert_eq!(stdout, "\"b\"\n1\n");
+    assert_eq!(stdout, "\"zz\"\n1\n");
 
-    // The five sibling isolating constructs, unchanged by #2073 and already
-    // reporting the same stale key on `main`. A fix for #2213 should move
-    // every one of these to `"zz"` at once.
+    // The five sibling isolating constructs, which reported the same stale
+    // key as `?` since #1409 -- all move to `"zz"` together.
     for query in [
         ".b | (try .zz) | key",
         ".b | (try .zz catch \"c\") | key",
@@ -8753,21 +8743,115 @@ fn test_optional_missing_field_reports_stale_path_like_its_siblings_2213() -> Re
     ] {
         let (stdout, _, code) = run_jq_full(&["-c", query], Some(input))?;
         assert_eq!(code, 0, "query: {query}");
-        assert_eq!(stdout, "\"b\"\n", "query: {query}");
+        assert_eq!(stdout, "\"zz\"\n", "query: {query}");
     }
 
-    // The plain pipe keeps the *other* wrong answer -- `.zz`'s own `null`,
-    // with `| key` never having run. Pinned so #2213's fix has to address
-    // this spelling too, not just the isolating ones.
+    // The plain pipe used to skip `rest` entirely (`.zz`'s own `null`
+    // leaking out as `key`'s result) -- now runs `rest` and reports `"zz"`
+    // like every other spelling.
     let (stdout, _, code) = run_jq_full(&["-c", ".b | .zz | key"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "\"zz\"\n");
+
+    // The value itself is still `null` -- the fix only corrects the path
+    // `rest` sees, not what `.zz` evaluates to.
+    let (stdout, _, code) = run_jq_full(&["-c", ".b | .zz"], Some(input))?;
     assert_eq!(code, 0);
     assert_eq!(stdout, "null\n");
 
-    // What all seven should agree on, and the reason `"zz"` is the target:
-    // the path itself is right, and matches real jq 1.7.1.
+    // What all seven now agree on, and the reason `"zz"` is the target: the
+    // path itself, matching real jq 1.7.1.
     let (stdout, _, code) = run_jq_full(&["-c", "[path(.b.zz)]"], Some(input))?;
     assert_eq!(code, 0);
     assert_eq!(stdout, "[[\"b\",\"zz\"]]\n");
+
+    Ok(())
+}
+
+/// #2213's sibling case: `Expr::Field` on a `null` value (as opposed to a
+/// missing key on an object) gets the identical fix, since jq treats both
+/// as "not an error, propagate null" the same way.
+#[test]
+fn test_field_access_on_null_reports_correct_path_2213() -> Result<()> {
+    let input = r#"{"a":null}"#;
+
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | (.zz)? | key"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "\"zz\"\n");
+
+    let (stdout, _, code) = run_jq_full(&["-c", "[path(.a.zz)]"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[[\"a\",\"zz\"]]\n");
+
+    Ok(())
+}
+
+/// #2213's `Expr::Index` fix, and its overlap with #2146: a genuine
+/// out-of-bounds array index and an index into `null` are both "not an
+/// error, propagate null" in jq (`[1,2] | .[5]` and `null | .[5]` are both
+/// `null`, never an error) -- exactly like a missing object field. The
+/// path-context arm previously routed *both* through the error-suppression
+/// branch (`QueryResult::None` under `?`, a genuine `Error` without one),
+/// which both swallowed `rest` under `?` and wrongly raised without one.
+///
+/// This table reproduces #2146's own repro rows for the non-`parent` cases
+/// (defects 1 and 2 there) and confirms they now match real yq v4.53.3's
+/// values, captured in that issue -- `parent`'s auto-vivification (#2146's
+/// defect 3) is a separate, harder problem (succinctly has no vivification
+/// machinery anywhere) and is intentionally left unfixed here.
+#[test]
+fn test_out_of_bounds_index_and_null_index_report_correct_path_2213() -> Result<()> {
+    // True out-of-bounds: array exists, index doesn't resolve.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | (.[5])? | key"], Some(r#"{"a":[1,2]}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "5\n");
+
+    // Same shape, no `?` -- used to raise (index N out of bounds); now
+    // agrees with the optional spelling, matching the plain evaluator's own
+    // `.a[5]` (`null`, no error).
+    let (stdout, _, code) = run_jq_full(&["-c", ".a[5] | key"], Some(r#"{"a":[1,2]}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "5\n");
+
+    // Negative out-of-bounds.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | (.[-5])? | key"], Some(r#"{"a":[1,2]}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "-5\n");
+
+    // Indexing `null` with an integer: also not an error.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | (.[5])? | key"], Some(r#"{"a":null}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "5\n");
+
+    // #2146's own table, the non-`parent` rows: matches real yq v4.53.3.
+    let (stdout, _, code) = run_jq_full(&["-c", ".[0] | key"], Some("[]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "0\n");
+
+    let (stdout, _, code) = run_jq_full(&["-c", ".a[5] | key"], Some(r#"{"a":[1]}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "5\n");
+
+    // Genuine type errors are unaffected: indexing a string/number with an
+    // integer, or a scalar/object with a field name, still raises.
+    let (_, stderr, code) = run_jq_full(&["-c", ".zz"], Some(r#""hi""#))?;
+    assert_eq!(code, 5);
+    assert!(
+        stderr.contains("Cannot index string with string"),
+        "{stderr}"
+    );
+
+    let (_, stderr, code) = run_jq_full(&["-c", ".[0]"], Some("5"))?;
+    assert_eq!(code, 5);
+    assert!(
+        stderr.contains("Cannot index number with number"),
+        "{stderr}"
+    );
+
+    // `?` suppresses those genuine type errors, same as before.
+    let (stdout, _, code) = run_jq_full(&["-c", "(.zz)?"], Some(r#""hi""#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "");
 
     Ok(())
 }

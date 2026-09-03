@@ -27682,15 +27682,21 @@ fn test_path_context_cursor_walk_composite_stages_2061() -> Result<()> {
 #[test]
 fn test_path_context_cursor_walk_falls_back_2061() -> Result<()> {
     for (filter, input, want) in [
-        // An absent node. The bridge *loses* path context through a missing
-        // field (`null`, not `"a"`) and *raises* on an out-of-bounds index
-        // where plain `.[0]` does not. Real yq v4.53.3 does neither -- it
-        // answers `"a"` and auto-vivifies -- so all three disagree, and the
-        // walk declines to invent a fourth answer inside a perf change.
-        (".a | key", "{}", "null"),
-        (".a.b | key", "{}", "null"),
-        (".missing | path", r#"{"a":1}"#, "null"),
-        (".a | parent", "{}", "null"),
+        // An absent node. The walk still bails here -- unaffected by #2213,
+        // which fixed only what the bridge itself answers, not whether the
+        // walk hands off to it. #2213 fixed the bridge's `key`/`path`
+        // answers to match real yq v4.53.3 (`"a"`, not the old stale
+        // `null`) by threading the path through a missing field/
+        // out-of-bounds index instead of returning early. `parent` is the
+        // one case #2213 deliberately left alone (#2146's remaining defect
+        // 3): real yq auto-vivifies the missing node into the returned
+        // parent (`{"a":null}`), which needs vivification machinery
+        // succinctly doesn't have yet, so the bridge now answers with the
+        // real, un-vivified root (`{}`) rather than the old stub `null`.
+        (".a | key", "{}", r#""a""#),
+        (".a.b | key", "{}", r#""b""#),
+        (".missing | path", r#"{"a":1}"#, r#"["missing"]"#),
+        (".a | parent", "{}", "{}"),
         // `parent` back at the root would materialize the whole document --
         // exactly what the bridge already does, and the walk would pay its
         // validity gate on top for a net loss.
@@ -27728,10 +27734,11 @@ fn test_path_context_cursor_walk_falls_back_2061() -> Result<()> {
         assert_eq!(out.trim(), want, "`{filter}` on `{input}`");
     }
 
-    // An out-of-bounds index still raises, as it does on the bridge.
+    // An out-of-bounds index used to raise on the bridge (#2213 fixed this
+    // too, matching real yq v4.53.3's `0` -- #2146's own table row).
     let (out, code) = run_yq_stdin(".[0] | key", "[]", &["-o", "json", "-I0"])?;
-    assert_eq!(code, 1, "out: {out:?}");
-    assert_eq!(out.trim(), "");
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "0");
 
     Ok(())
 }
