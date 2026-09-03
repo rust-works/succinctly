@@ -596,6 +596,44 @@ softened, and was accepted implicitly by #1975's own goal of mirroring
 JSON-via-YAML-flow routing). #2262's `{"a":1,}` addition is the same design choice applied to
 one more comma shape, not a new departure from it.
 
+**`length` on an object had the identical missing-check shape, in yq mode too, but this one
+is *not* a real-yq divergence fix** — found and fixed as
+[#2307](https://github.com/rust-works/succinctly/issues/2307)/
+[#2316](https://github.com/rust-works/succinctly/pull/2316), the yq-mode half of a fix
+`jq`'s own limitations.md documents in full (its "`length` (objects)" entry). `document.rs`'s
+`checked_len` (this mode's `collapse: false` field-count walk, shared with `census`'s jq-mode
+`collapse: true` one) never checked for a trailing stray comma after the object's real last
+field at all. The same `census`/`checked_len` code is reached from *both* routes -- the
+plain-stdout cursor-native path (`evaluate_yaml_direct_filtered`) evaluates through the same
+`eval_generic.rs` `Length` arm as `--slurp`/`--eval-all`/`--inplace`'s own DOM materialization
+bridge (`to_owned_canonicalizing_numbers_at_depth`) -- but the *cursor type* differs: the
+plain path's `YamlCursor` never overrides `trailing_element_gap_ok`/`scalar_text_end`, so this
+fix is a genuine no-op there (verified live, unchanged before/after); the DOM bridge's
+`JsonCursor` does override them, so the fix's only observable effect is on that one route --
+the same deliberately *stricter-than-real-yq* JSON grammar #1975/#2262 already established
+above:
+
+```console
+$ printf '{"a":1,}' | succinctly yq --input-format json --slurp '.[0] | length'
+1                                                            # WRONG on this bridge's own strict-JSON policy (was: silently accepted)
+$ printf '{"a":1,}' | succinctly yq --input-format json 'length'
+1                                                            # unaffected, correct -- checked_len runs but the check is a no-op on a YamlCursor
+$ printf '{"a":1,}' | yq -p json 'length'
+1                                                            # real yq is lenient here too (no --slurp equivalent exists to compare against)
+```
+
+Real yq has no oracle to check the `--slurp` bridge's own behavior against at all (it has no
+`--slurp` flag, and its one JSON-input route, `-p json`, is the same lenient one #1975 already
+chose not to mirror for other comma shapes) -- this fix is internal consistency with the DOM
+bridge's own established strictness policy, not a new real-yq-parity claim, exactly like every
+other #1975/#2262 comma check on this bridge. Only reachable via `--input-format json`: native
+YAML flow-maps *legitimately* allow a trailing comma on every route, confirmed live against
+the pinned v4.53.3 (`{a: 1,} | length` answers `1` at exit 0 there too), so this fix leaves
+YAML's own leniency untouched everywhere. Same residual gap as the jq-mode fix: a trailing
+comma before a *container*-typed last value (`{"a":[1,2],}`) still slips through on this
+bridge, inherited from `trailing_element_gap_ok`'s own unconditional container skip (#2243) --
+pinned by `test_yq_length_object_trailing_comma_container_last_value_still_a_known_gap_2307`.
+
 Pulling the other way: [#442](https://github.com/rust-works/succinctly/issues/442),
 [#478](https://github.com/rust-works/succinctly/issues/478),
 [#868](https://github.com/rust-works/succinctly/issues/868) and
