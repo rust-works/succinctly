@@ -1763,18 +1763,25 @@ and differently-shaped problem than this section's own fixes):
   key in jq mode, any Float key in yq mode) without ever running the gap
   check -- fixed in #2311 itself by reordering to match `eval_generic.rs`'s
   own unconditional-`len_checked`-first shape exactly. Two further siblings
-  sharing the identical unchecked-`.count()` shape were found but
-  deliberately left unfixed: `count_elements` (backs
-  `get_element_at_index`'s negative-index resolution, `.foo[-1]`) needs a
-  genuine new error-type design (its `Result<_, usize>` return already
-  carries a distinct, meaningful "negative still negative" signal, #2254 --
-  not a drop-in swap like the others), filed as #2312; and `builtin_keys`
-  used to never collapse duplicate keys in *either* mode (it had no
-  `S: EvalSemantics` parameter to derive `S::COLLAPSE_DUPLICATE_KEYS` from,
-  unlike `eval_generic.rs`'s own `Keys`/`KeysUnsorted` arms) -- filed as
-  #2313 and fixed there, by adding that parameter and its one call site's
-  turbofish. `eval.rs`'s copy of `keys`/`keys_unsorted` now agrees with
-  `eval_generic.rs`'s on this shape in both modes.
+  sharing the identical unchecked-`.count()` shape were found, both now
+  **fixed**: `builtin_keys` used to never collapse duplicate keys in
+  *either* mode (it had no `S: EvalSemantics` parameter to derive
+  `S::COLLAPSE_DUPLICATE_KEYS` from, unlike `eval_generic.rs`'s own
+  `Keys`/`KeysUnsorted` arms) -- filed as #2313 and fixed there, by adding
+  that parameter and its one call site's turbofish; `eval.rs`'s copy of
+  `keys`/`keys_unsorted` now agrees with `eval_generic.rs`'s on this shape
+  in both modes. `count_elements` (backs `get_element_at_index`'s index
+  resolution, `.foo[N]`/`.foo[-N]`) -- filed as #2312, fixed by
+  restructuring `get_element_at_index` to match `eval_generic.rs`'s own
+  `Expr::Index` arm exactly: `count_elements`/`len_checked()` now runs
+  unconditionally, before branching on sign (a first draft only checked
+  the negative branch, leaving `.[0]` on a malformed array unchecked --
+  found by #2312's own code review), and the negative-still-negative
+  decision (#2254) reuses the same shared `yq_negative_index_check` helper
+  `eval_generic.rs` already calls, rather than a bespoke error type.
+  Parity pinned in `test_parity_negative_index_trailing_comma_2312`
+  (negative) and `test_parity_positive_index_trailing_comma_2312`
+  (positive).
 
   Writing that parity test also surfaced a further, unrelated, **live and
   CLI-reachable** bug shared by *both* evaluators: `{"a":1,} | length` in jq

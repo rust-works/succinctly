@@ -16132,12 +16132,21 @@ fn index_array_by_position<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Ok(Some(v)) => QueryResult::One(v),
             // jq returns null for out-of-bounds array access (not an error)
             Ok(None) => QueryResult::One(StandardJson::Null),
-            Err(_len) if S::TAG != EvalTag::Yq => QueryResult::One(StandardJson::Null),
+            // #2312: a malformed array (its own `len_checked` rejected a
+            // trailing stray comma resolving the negative index) always
+            // propagates, in both modes -- never gated on `S::TAG`/
+            // `optional`, same as every other decode-failure-class error.
+            Err(NegativeIndexFault::Malformed(e)) => QueryResult::Error(e),
+            Err(NegativeIndexFault::OutOfRange(_len)) if S::TAG != EvalTag::Yq => {
+                QueryResult::One(StandardJson::Null)
+            }
             // Unconditional, not suppressed by `optional` (#2254) -- see
             // `EvalError::yq_negative_index_out_of_range`'s own doc comment
             // and the `eval_try`/`try_single_generic` bypasses that keep it
             // surviving an outer `?`/`try` too.
-            Err(len) => QueryResult::Error(EvalError::yq_negative_index_out_of_range(idx, len)),
+            Err(NegativeIndexFault::OutOfRange(len)) => {
+                QueryResult::Error(EvalError::yq_negative_index_out_of_range(idx, len))
+            }
         },
         // jq returns null for index on null
         StandardJson::Null => QueryResult::One(StandardJson::Null),
@@ -17923,37 +17932,60 @@ fn slice_object_children_at(
     OwnedValue::Array(children)
 }
 
+/// [`get_element_at_index`]'s negative-index resolution outcomes that
+/// aren't a plain hit/miss.
+///
+/// `OutOfRange(len)` is a negative index still negative after resolving
+/// against the array's length -- distinct from an ordinary miss (`Ok(None)`
+/// from the function itself, the positive-direction case or an
+/// in-range-but-empty read) only so the caller can raise real yq's own
+/// error for it (#2254); jq mode's own caller treats it exactly like
+/// `Ok(None)`. `Malformed` is the array's own `len_checked` (#1677/#2261)
+/// rejecting a trailing stray comma or other structural fault while
+/// resolving that length -- unlike `OutOfRange`, this must always
+/// propagate as an error in *both* modes, the same "decode failure never
+/// suppressed" rule `#2293`'s `has_one_key`/`builtin_length`/`builtin_keys`
+/// fix already established for this file's other `len_checked` callers.
+enum NegativeIndexFault {
+    OutOfRange(usize),
+    Malformed(EvalError),
+}
+
 /// Get element at index (supports negative indexing).
 ///
 /// Uses `get_fast` for O(n) BP operations + O(log n) IB select,
 /// instead of `get` which does O(n) IB selects.
-///
-/// `Err(len)` is a negative index still negative after resolving against the
-/// array's length -- distinct from an ordinary miss (`Ok(None)`, the
-/// positive-direction case or an in-range-but-empty read) only so the caller
-/// can raise real yq's own error for it (#2254); jq mode's own caller treats
-/// `Err` exactly like `Ok(None)`.
 fn get_element_at_index<W: Clone + AsRef<[u64]>>(
     elements: JsonElements<'_, W>,
     idx: i64,
-) -> Result<Option<StandardJson<'_, W>>, usize> {
+) -> Result<Option<StandardJson<'_, W>>, NegativeIndexFault> {
     if idx >= 0 {
         Ok(elements.get_fast(idx as usize))
     } else {
         // Negative index: count from end
-        let len = count_elements(elements);
+        let len = match count_elements(elements) {
+            Ok(len) => len,
+            Err(e) => return Err(NegativeIndexFault::Malformed(e)),
+        };
         let positive_idx = len as i64 + idx;
         if positive_idx >= 0 {
             Ok(elements.get_fast(positive_idx as usize))
         } else {
-            Err(len)
+            Err(NegativeIndexFault::OutOfRange(len))
         }
     }
 }
 
-/// Count elements in an array (consumes the iterator).
-fn count_elements<W: Clone + AsRef<[u64]>>(elements: JsonElements<'_, W>) -> usize {
-    elements.count()
+/// Count elements in an array (consumes the iterator), refusing a trailing
+/// stray comma after a real last element (#2312) -- the same #1677/#2261
+/// gap check every other array-length call site in this file already has
+/// (`DocumentElements::len_checked`), missed here because this function's
+/// only caller ([`get_element_at_index`]) needed a genuine new error shape
+/// to carry it (see [`NegativeIndexFault`]), not a drop-in swap.
+fn count_elements<W: Clone + AsRef<[u64]>>(
+    elements: JsonElements<'_, W>,
+) -> Result<usize, EvalError> {
+    elements.len_checked()
 }
 
 /// Slice elements from an array.
