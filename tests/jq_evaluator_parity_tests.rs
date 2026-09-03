@@ -1459,3 +1459,13 @@ fn test_parity_pattern_alternatives_short_circuit_over_document_1519() {
 fn test_parity_negative_index_trailing_comma_2312() {
     assert_error_parity(br"[1,2,3,]", ".[-1]");
 }
+
+/// #2312 review: a first draft of this fix only checked the negative-index
+/// branch, leaving a *positive* index (`.[0]`) on the same malformed array
+/// silently unchecked -- found live by code review. Pins both directions,
+/// matching `eval_generic.rs`'s own `Expr::Index` arm, which already
+/// checks unconditionally regardless of sign.
+#[test]
+fn test_parity_positive_index_trailing_comma_2312() {
+    assert_error_parity(br"[1,2,3,]", ".[0]");
+}
