@@ -1304,7 +1304,18 @@ practice #2243's own issue text cites for not folding into #2211):
   `[1,]` rewrote the file instead of refusing), closed by declining those
   two fast paths entirely for JSON-sourced input (`any_input_is_json` in
   `yq_runner.rs`), since their own `else` arm already routes back through
-  this now-fixed materializer. The *plain* stdout fast path
+  this now-fixed materializer. Declining the fast path this way surfaced
+  a second, independent gap in review: it silently traded `YamlIndex`'s
+  128-deep parse-time nesting guard for `to_owned_canonicalizing_numbers_
+  at_depth`'s own looser, panicking 256-deep one, so JSON nested 129-255
+  levels deep went from "rejected at parse time" to "silently accepted" --
+  closed by `parse_input_m2_parity`'s own depth-128 pre-check, verified
+  against a pre-fix build at every boundary value (127/128/129/255/256/
+  257). See [docs/compliance/yq/limitations.md](../yq/limitations.md)'s
+  own `#1975`/`#2262` section for the full account, including a
+  `YamlCursor`-trait-override approach that was tried first and found not
+  to work (M2 streams cursors directly without ever materializing through
+  the trait methods it would have added). The *plain* stdout fast path
   (`can_json_fast_path`/`can_yaml_fast_path`) has the identical underlying
   gap but was left alone: its own `else` arm is `evaluate_yaml_direct_filtered`
   (#1398's cursor-native evaluator, used for *every* ordinary

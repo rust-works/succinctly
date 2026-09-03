@@ -466,29 +466,90 @@ Error: bad file 'f2.json': json: null unexpected end of JSON input
 [1,]                                                         # real yq refuses, file untouched
 ```
 
-Fixed conservatively rather than by extending `YamlCursor`'s own `DocumentCursor` trait
-methods to validate commas when JSON-sourced (a more surgical fix that would keep M2's
-performance for this case too, but needs new test coverage across a much larger, shared
-surface — every `YamlCursor` consumer, not just these two gates — to be confident it is
-airtight): `any_input_is_json` (reusing #978's own original run-wide boolean, briefly removed
-by #996 once #996 fixed *its* own reason for needing it) now gates
-`can_inplace_json_fast_path`/`can_inplace_yaml_fast_path` and `can_slurp_fast_path`
-specifically, declining the fast path for JSON-sourced input so both routes fall back to
-their own `else` arm — `parse_input`, i.e. this now-fixed materializer — rather than silently
-accepting a malformed document. Confirmed live that both `else` arms already rejected the
-same input correctly before this fix (reached via a non-M2-streamable filter, `. + []`/
-`.[0]`), so declining the fast path needed no further changes to either fallback.
+**Two approaches were tried.** Extending `YamlCursor`'s own `DocumentCursor` trait methods
+(`container_gap_ok`/`trailing_element_gap_ok`/`preceding_delimiter_ok`) to validate commas in
+place when JSON-sourced (via the already-exposed `canonicalize_numbers()` flag) was actually
+*built* — it would have kept the same parser and its same parse-time depth guard, so no depth
+regression (below) could ever have arisen — and then confirmed live *not to work*: `--slurp`'s
+and `--inplace`'s M2 fast path streams cursor results directly
+(`stream_json_sequence`/`stream_yaml_sequence`, `YamlCursor::stream_json`/`stream_yaml`)
+without ever materializing through `to_owned_cursor_at_depth`, the only place those trait
+methods are consulted. The whole point of M2 streaming is to avoid exactly that materialization
+step, so the overrides were simply never reached by the code path that needed fixing — `echo
+'[1,]' | succinctly yq --slurp --input-format json -o json '.'` still printed `[[1]]` at exit 0
+with those overrides in place, confirmed live before reverting them.
 
-**Known cost: `--inplace`/`--slurp` with well-formed, duplicate-keyed JSON input now
-collapses those duplicates again** (`{"a":1,"a":2}` → `{"a":2}`), the exact #996 regression
-this same gate caused before #996 fixed it at the source for the *other* three JSON M2 gates
-(`can_json_fast_path`/`can_yaml_fast_path`, the plain stdout path, both left untouched by this
-fix — see below). Accepted deliberately: `--inplace` mutating a file on a false accept is a
-correctness/data-safety concern; a collapsed duplicate key on *well-formed* input is a
-narrower, already-tracked one ([#1343](https://github.com/rust-works/succinctly/issues/1343),
-"the DOM fallback for `--slurp`/`--eval-all`/`--inplace` still collapses duplicate keys for
-both formats" — already true before this fix for any filter forcing that fallback; this fix
-just widens which filters do).
+Reverted in favor of declining the fast path instead: `any_input_is_json` (reusing #978's own
+original run-wide boolean, briefly removed by #996 once #996 fixed *its* own reason for needing
+it) now gates `can_inplace_json_fast_path`/`can_inplace_yaml_fast_path` and
+`can_slurp_fast_path` specifically (factored into one `fast_path_json_comma_safe` term rather
+than `&& !any_input_is_json` copy-pasted into each gate separately, #2276 review), declining
+the fast path for JSON-sourced input so both routes fall back to their own `else` arm —
+`parse_input`, i.e. this now-fixed materializer — rather than silently accepting a malformed
+document. Confirmed live that both `else` arms already rejected the same input correctly before
+this fix (reached via a non-M2-streamable filter, `. + []`/`.[0]`), so declining the fast path
+needed no further changes to either fallback for the *comma* class of gap. Correctness over
+performance given `--inplace`'s destructive potential on a false accept: reverting to the
+smaller, already-proven-correct surface rather than risk a second subtle miss in the larger
+one under time pressure.
+
+**Declining the fast path this way silently loosened a *different* guard, though**: `YamlIndex`'s
+own parser enforces a 128-deep parse-time nesting limit, while
+`to_owned_canonicalizing_numbers_at_depth`'s own guard (`assert_nesting_depth`) is a looser,
+*panicking* 256-deep one — a different ceiling for a different reason (stack-overflow safety
+for the conversion step itself, not fidelity with what the fast path used to reject). Declining
+the fast path therefore silently *accepted* JSON nested 129–255 levels deep that the fast path
+used to reject at parse time — confirmed live before this correction: 150 levels of `[...]` via
+`--slurp` printed the full nested structure at exit 0, where the pre-fix binary (still
+unconditionally on `YamlIndex`) correctly rejected it at exit 1. Closed by
+`parse_input_m2_parity` (`yq_runner.rs`), a depth-128 pre-check specific to `--slurp`'s and
+`--inplace`'s own DOM fallback — deliberately *not* `--eval-all`'s, which never had this
+128-deep guarantee to begin with (no M2 fast path of its own to have declined), so tightening
+it there would be an unrelated, unasked-for behavior change. Verified to match a pre-fix build
+exactly at every boundary value (127/128/129/255/256/257), including an off-by-one an earlier
+revision of this same check got wrong in the *stricter* direction (rejecting 128 levels of
+plain nesting when `YamlIndex` itself accepts it — its own `nesting_depth` counter is checked
+*before* incrementing and never counts a leaf scalar as its own nesting level, so 128 levels of
+`[...]` peaks at `nesting_depth == 127` on the innermost bracket, not 128). This incidentally
+also means `--slurp`/`--inplace` no longer reach `assert_nesting_depth`'s 256-deep panic at all
+(previously reachable, and — for the few minutes the buggy fix stood — silently *more*
+reachable, through this same fallback); `--eval-all`'s own, unrelated, pre-existing instance of
+that exact panic is unaffected by any of this and is now tracked as
+[#2282](https://github.com/rust-works/succinctly/issues/2282), per this project's own #1098
+precedent that a CLI-reachable panic on untrusted input is a real robustness concern worth a
+tracking issue even when not newly introduced.
+
+**Known cost: `--inplace`/`--slurp` with well-formed, duplicate-keyed JSON input still
+collapses those duplicates** (`{"a":1,"a":2}` → `{"a":2}`) — `any_input_is_json` is a blanket,
+content-independent gate (computed from `--input-format`/file extension alone, never from
+whether the document is actually malformed), so it declines the fast path for *every* JSON-
+sourced `--slurp`/`--inplace` invocation, not just the malformed ones this fix exists for. This
+is the exact #996 regression that gate caused before #996 fixed it at the source for the
+*other* two JSON M2 gates (`can_json_fast_path`/`can_yaml_fast_path`, the plain stdout path,
+both left untouched by this fix — see below). Accepted deliberately: `--inplace` mutating a
+file on a false accept is a correctness/data-safety concern; a collapsed duplicate key on
+*well-formed* input is a narrower, already-tracked one
+([#1343](https://github.com/rust-works/succinctly/issues/1343), "the DOM fallback for
+`--slurp`/`--eval-all`/`--inplace` still collapses duplicate keys for both formats" — already
+true before this fix for any filter forcing that fallback; this fix just widens which filters
+do). This same collapsing is also what the CLI test suite uses to *prove* the fast path
+actually declined for well-formed JSON input, not merely that ordinary output happened to match
+either way (`test_yq_slurp_fast_path_rejects_trailing_comma_2276`/
+`test_yq_inplace_fast_path_rejects_trailing_comma_leaves_file_untouched_2276`'s own duplicate-
+key assertions) — a `[1,2,3]`-shaped well-formed check alone can't distinguish "the fast path
+ran" from "silently fell back and produced the same bytes."
+
+**A further collateral cost, spelled out explicitly rather than left implicit in "conservative
+for mixed-format"**: `any_input_is_json` is one run-wide boolean with no per-file M2-vs-DOM
+switch (a per-file version was not attempted — each of `can_inplace_fast_path`'s two branches
+is its own, separately-parsed loop, decided once before either starts, so routing within one
+file at a time would mean restructuring both loops into one, a materially larger change for a
+cost real yq has no equivalent to weigh against). `succinctly yq -i '.' a.yaml b.json`, where
+`a.yaml` alone (genuinely YAML, well-formed) would be safe on the M2 fast path and `b.json` is
+what forces the whole run onto the DOM fallback, now collapses `a.yaml`'s own duplicate mapping
+keys too — the exact #442/#1343 loss the M2 fast path exists to avoid, even though `a.yaml` in
+isolation would not lose them. Pinned by
+`test_yq_inplace_mixed_yaml_json_files_collapses_yaml_duplicate_keys_too_2276`.
 
 **The plain stdout fast path (`can_json_fast_path`/`can_yaml_fast_path`, no `--slurp`/
 `--inplace`) has the identical underlying gap and was deliberately left alone**, confirmed
