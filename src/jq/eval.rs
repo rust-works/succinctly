@@ -36839,6 +36839,18 @@ fn delete_at_path(
 /// [`YqDelSliceOutcome::DropParent`]'s doc comment describes for a slice
 /// run, generalized to a plain trailing `.` and to every step kind, not just
 /// yq mode's own chained-scalar-slice case inside `Expr::Iterate`.
+///
+/// The returned `Option<bool>`'s payload (the trailing run's own combined
+/// `?`-optionality) is threaded through the recursion -- load-bearing for
+/// [`splice_optional_group`]'s own re-wrapping of a spliced `Pipe` group's
+/// contents -- but is *not* currently read back by this function's single
+/// call site (`delete_path_steps` only checks `.is_some()`, since a bare
+/// `Expr::Identity`/`Expr::Pipe`-of-identities can never fail to navigate
+/// regardless of any `?` on it, so there is nothing here for a `?` to ever
+/// suppress). That is an invariant of the *recognized collapse set*, not
+/// something this function enforces on its own behalf -- widening the set
+/// to include a component whose navigation *can* fail would need the caller
+/// to start reading this payload back, not just checking `is_some()`.
 fn trailing_identity_optional(steps: &[Expr], optional: bool) -> Option<bool> {
     let (first, rest) = match steps {
         [] => return Some(optional),
