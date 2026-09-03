@@ -1481,27 +1481,16 @@ impl OwnedValue {
         // this leniency shouldn't reach), but a real jq-accepted spelling
         // this crate's own document-input scanners now recognize as a
         // number span (`number_literal_end`, #1171). Preserve it the same
-        // way #1094 preserves a leading zero: check whether inserting `0`
-        // right after any `-` makes the token strictly valid, and if so,
-        // still materialize the *original* (un-inserted) text as the
-        // literal spelling -- `bytes` was already gated by
-        // `number_literal_end` at the scan site, and
+        // way #1094 preserves a leading zero -- `bytes` was already gated
+        // by `number_literal_end` at the scan site, and
         // `Self::from_number_literal` (via `parse_i64_or_f64`) parses a
         // leading-dot float natively, so no separate reparse of the
-        // original text is needed here.
-        let dot_prefix_len = match bytes.first() {
-            Some(b'.') => Some(0),
-            Some(b'-') if bytes.get(1) == Some(&b'.') => Some(1),
-            _ => None,
-        };
-        if let Some(prefix_len) = dot_prefix_len {
-            let mut prefixed = Vec::with_capacity(bytes.len() + 1);
-            prefixed.extend_from_slice(&bytes[..prefix_len]);
-            prefixed.push(b'0');
-            prefixed.extend_from_slice(&bytes[prefix_len..]);
-            if crate::json::validate::is_valid_number(&prefixed) {
-                return core::str::from_utf8(bytes).map_or(Self::Null, Self::from_number_literal);
-            }
+        // original text is needed here. `has_leading_dot`, not a hand-rolled
+        // check inline here: shared with `crate::json::light`'s
+        // `DocumentValue::number_literal` implementation, which needs the
+        // identical escape (#2240 code review).
+        if crate::json::validate::has_leading_dot(bytes) {
+            return core::str::from_utf8(bytes).map_or(Self::Null, Self::from_number_literal);
         }
         // Real jq's own number reader also tolerates a redundant leading
         // zero in the integer part (`007` -> `7`, `007e5` -> `7E+5`,
