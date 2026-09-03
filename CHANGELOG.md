@@ -289,11 +289,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Three more sites ignored `optional`, an asymmetry #2231 already fixed for
+- **Five sites ignored `optional`, an asymmetry #2231 already fixed for
   `debug`/`stderr`/`tostring`/its catch-all fallback** (#2280, follow-up from #2231's own
-  code review): `eval_format` (`src/jq/eval.rs`, gating every `@format` builtin —
+  code review): `eval_generic.rs`'s `Expr::Format` arm (gating every `@format` builtin —
   `@json`, `@csv`, `@tsv`, `@dsv`, `@uri`, `@html`, `@base64`, `@sh`, `@yaml`, `@props`,
-  `@text`) and `eval_generic.rs`'s `Builtin::Path`/`Builtin::GetPath` arms all raised an
+  `@text` — for the CLI's default dispatch), its `Builtin::Path`/`Builtin::GetPath` arms,
+  and `eval.rs`'s own `eval_format`/`builtin_path` (reached via the public
+  `succinctly::jq::eval::eval` library API, and via the CLI whenever `eval_generic.rs`'s
+  own fallback re-enters the full evaluator for a non-identity value) all raised an
   unconditional error from their own materialization instead of consulting `optional` the
   #2184/#2015/#2231 lineage's shared macros (`to_owned_or_suppress!`/`owned_or_suppress!`)
   already provide. `GetPath`'s arm was a particularly sharp inconsistency: its own comment
@@ -301,12 +304,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decision, while the initial materialization two lines above stayed on the unconditional
   macro.
 
+  This PR's own first draft fixed only `eval.rs`'s `eval_format`/`Builtin::Path`/
+  `Builtin::GetPath` (the library-API-facing evaluator) and missed that
+  `jq_runner.rs`/`yq_runner.rs` route the CLI's default dispatch through
+  `eval_generic.rs` exclusively, never touching `eval.rs`'s own `eval()` at all for
+  ordinary use — so the headline fix didn't reach the code path a real `succinctly jq`
+  invocation actually takes. Code review caught this, plus that `eval.rs`'s own
+  `builtin_path` carried the identical bug (unlike its sibling `getpath_one_path`, which
+  already consulted `optional` correctly) and that the first draft's own regression test
+  exercised `path(.a)`'s pre-existing cursor-navigable fast path rather than the
+  `Builtin::Path` fallback line it claimed to pin. All three were fixed and the test
+  corrected to use a non-cursor-navigable path expression (confirmed with temporary debug
+  instrumentation during review that this reaches the intended line).
+
   Like #2231's own findings 1-3, this is defensive rather than a live behavior change
   today: #2286 tagged every error path these materializations can produce (string decode
   failure, #1194 malformed member/delimiter)
   `is_decode_failure()`, and `suppresses(e, optional) = optional && !e.is_decode_failure()`
   is unconditionally `false` for all of them regardless of `optional` — verified live
-  (`test_optional_ignored_sites_2280`, `tests/jq_cli_tests.rs`), mirroring
+  (`test_optional_ignored_sites_2280`/`test_eval_rs_only_sites_still_correct_2280`,
+  `tests/jq_cli_tests.rs`), mirroring
   `test_try_catch_handler_still_runs_under_outer_optional_2231`'s own methodology. Still
   correct to fix: the macro swap also keeps propagating a genuine decode failure
   unchanged, and removes the dependency on this reachability analysis staying true if a

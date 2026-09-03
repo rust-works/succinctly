@@ -29895,12 +29895,23 @@ fn test_getpath_still_raises_on_an_undecodable_sibling_2053() -> Result<()> {
     Ok(())
 }
 
-/// #2280: `eval_format` (every `@format` builtin), and `Builtin::Path`/
-/// `Builtin::GetPath`'s own materialization fallback, all consulted
-/// `optional` for real now (routed through `to_owned_or_suppress!`/
-/// `owned_or_suppress!` instead of a bare `to_owned`/`owned_or_err!` match)
-/// -- following #2231's exact precedent for `debug`/`stderr`/`tostring`/the
-/// catch-all fallback.
+/// #2280: `eval_generic.rs`'s `Expr::Format` arm (every `@format` builtin --
+/// this is the arm the CLI's default jq/yq dispatch actually reaches;
+/// `eval.rs`'s own sibling `eval_format` is library-API/reindex-bridge-only,
+/// see `test_eval_rs_only_sites_still_correct_2280` below), and
+/// `Builtin::Path`/`Builtin::GetPath`'s own materialization fallback, all
+/// consulted `optional` for real now (routed through `owned_or_suppress!`
+/// instead of a bare `owned_or_err!` match) -- following #2231's exact
+/// precedent for `debug`/`stderr`/`tostring`/the catch-all fallback.
+///
+/// `path(.a)` alone would not exercise `Builtin::Path`'s fixed line: a bare
+/// `Expr::Field` is cursor-navigable (`path_expr_is_cursor_navigable`), so
+/// it takes the pre-existing fast path (`push_generic_truthiness_cursor_error`)
+/// instead, never reaching the fallback this PR changed -- confirmed live
+/// with temporary debug instrumentation during review. `path(if true then
+/// .a else null end)` is not cursor-navigable (`Expr::If` isn't in that
+/// function's recognized set), forcing the fallback -- confirmed the same
+/// way.
 ///
 /// Pins that this is defensive, not a behavior change: a document-wide
 /// decode failure (`\ud800`, matching `test_getpath_still_raises_on_an_
@@ -29917,9 +29928,9 @@ fn test_optional_ignored_sites_2280() -> Result<()> {
         r".a | @json",
         r".a | @json?",
         r#"(try (.a | @json) catch "CAUGHT")?"#,
-        "path(.a)",
-        "path(.a)?",
-        r#"(try path(.a) catch "CAUGHT")?"#,
+        "path(if true then .a else null end)",
+        "path(if true then .a else null end)?",
+        r#"(try path(if true then .a else null end) catch "CAUGHT")?"#,
         r#"getpath(["a"])"#,
         r#"getpath(["a"])?"#,
         r#"(try getpath(["a"]) catch "CAUGHT")?"#,
@@ -29944,6 +29955,33 @@ fn test_optional_ignored_sites_2280() -> Result<()> {
     let (_, _, code) = run_jq_stdin_streams(r#"getpath(["d"])"#, doc, &["-c"])?;
     assert_eq!(code, 5, "getpath()'s whole-document gate should still fire");
 
+    Ok(())
+}
+
+/// #2280: `eval.rs`'s own `builtin_path` -- the sibling of
+/// `eval_generic.rs`'s `Builtin::Path` fallback this PR also fixed, reached
+/// only via the public `succinctly::jq::eval::eval` library API or, via the
+/// CLI, when `eval_generic.rs`'s own fallback re-enters the full evaluator
+/// for a non-`reindex_bridge_is_identity` value (any `NumberLiteral` longer
+/// than `REINDEX_LITERAL_LEN_CAP`, or a `Float`).
+///
+/// Confirmed reachable from this exact CLI shape with temporary debug
+/// instrumentation during review. Cannot pin a suppress-vs-raise behavior
+/// difference the way `test_optional_ignored_sites_2280` does for the other
+/// three sites, though: by the time this second materialization runs, the
+/// document has already survived one whole decode (`eval_generic.rs`'s own
+/// fallback materializes first and would raise before ever reaching this
+/// point on truly malformed input) -- there is no error left for `optional`
+/// to suppress or not by the time `builtin_path` gets a turn. This test
+/// only pins that the reindex-bridge round trip through the fixed line
+/// still produces the correct answer, not a live optional-suppression case.
+#[test]
+fn test_eval_rs_only_sites_still_correct_2280() -> Result<()> {
+    let long_number = "1".repeat(300);
+    let doc = format!(r#"{{"f":{long_number}}}"#);
+    let (stdout, code) = run_jq_stdin("path(if true then . else null end)", &doc, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "[]");
     Ok(())
 }
 
