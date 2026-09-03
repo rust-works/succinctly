@@ -10,8 +10,9 @@ use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::Path;
 
 use succinctly::jq::document::{
-    effective_keys, key_delimiter_ok, resolve_display_key, value_delimiter_ok, DisplayKeyGuard,
-    DocumentCursor, DocumentElements, DocumentFields, DocumentValue, IndentSpec, JsonConvention,
+    effective_keys, key_delimiter_ok, resolve_display_key, trailing_element_gap_ok,
+    value_delimiter_ok, DisplayKeyGuard, DocumentCursor, DocumentElements, DocumentFields,
+    DocumentValue, IndentSpec, JsonConvention,
 };
 use succinctly::jq::escape::AsciiEscapeWriter;
 use succinctly::jq::eval_generic::{
@@ -1047,6 +1048,20 @@ fn gather_input_sources(
 /// or a value token the semi-index couldn't classify) -- #1975 found this
 /// function missing every one of `to_owned_at_depth`'s checks for these,
 /// despite this doc comment's own "mirrors ... exactly" claim above.
+///
+/// Also raises on a trailing stray `,` after a real last child (`[1,]`,
+/// `{"a":1,}`, #2243) -- #2262 found this function still missing that
+/// check (and #2211's sibling `container_gap_ok` check for a stray `,`
+/// with *zero* real children, `[,]`/`{,}`) after #1975 gave it #1677's
+/// delimiter check but predates #2211/#2243 landing. Confirmed live and
+/// CLI-reachable through `--slurp`/`--eval-all`/`--inplace
+/// --input-format json` (this function's only callers):
+/// `echo '[1,]' | succinctly yq --slurp --input-format json -o json '.[0]'`
+/// used to exit 0 with `1`, where real yq rejects it. `[,]`/`{,}` remain
+/// unchecked here, same as `eval_generic::to_owned_at_depth`'s identical
+/// cursor-less shape: this function is never given a cursor for the
+/// *container itself*, only `value: &V`, so once a container's child walk
+/// is exhausted there is no cursor left to find its opening bracket from.
 fn to_owned_canonicalizing_numbers<V: DocumentValue>(value: &V) -> Result<OwnedValue, EvalError> {
     to_owned_canonicalizing_numbers_at_depth(value, 0)
 }
@@ -1071,6 +1086,12 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
         let mut guard = DisplayKeyGuard::default();
         let mut f = fields;
         let mut is_first = true;
+        // #2262: the last real field's own cursor, retained past the loop
+        // so the trailing-gap check below (a stray `,` *after* a real last
+        // field, `{"a":1,}`) has something to check from -- mirrors
+        // `eval_generic::to_owned_cursor_at_depth`'s own `last_field`
+        // (#2243).
+        let mut last_field: Option<V::Cursor> = None;
         while let Some((field, rest)) = f.uncons() {
             // `resolve_display_key`, not `field.key_str()`: a key that will
             // not *decode* (#1247/#1385) is preserved via its raw source
@@ -1106,6 +1127,7 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
                 key,
                 to_owned_canonicalizing_numbers_at_depth(&field.value, depth + 1)?,
             );
+            last_field = Some(field.value_cursor);
             f = rest;
             is_first = false;
         }
@@ -1116,11 +1138,27 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
         if f.ends_unpaired() {
             return Err(f.malformed_member_error());
         }
+        // #2262: #2211's `container_gap_ok` (a stray `,` with zero real
+        // fields, `{,}`) needs the *container's own* cursor to find its
+        // opening `{` -- this function only ever receives a bare
+        // `value: &V` (never a cursor for the container itself), and once
+        // `f` is exhausted there is no way to reconstruct one. Same
+        // limitation `eval_generic::to_owned_at_depth`'s identical
+        // value-only shape has -- `{,}` remains unchecked here for that
+        // reason. #2243's `trailing_element_gap_ok` *is* checkable, though:
+        // it only needs the last real field's own cursor, retained above.
+        if let Some(last) = &last_field {
+            if !trailing_element_gap_ok(last, b'}') {
+                return Err(last.malformed_delimiter_error());
+            }
+        }
         OwnedValue::Object(map)
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();
         let mut elems = elements;
         let mut is_first = true;
+        // #2262: same reasoning as the object arm's own `last_field` above.
+        let mut last_elem: Option<V::Cursor> = None;
         while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
             // #1975: matches `eval_generic::to_owned_at_depth`'s array arm --
             // a missing/doubled `,` between elements was silently accepted
@@ -1135,8 +1173,19 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
                 &elem_cursor.value(),
                 depth + 1,
             )?);
+            last_elem = Some(elem_cursor);
             elems = rest;
             is_first = false;
+        }
+        // #2262: same reasoning as the object arm's own check above --
+        // `[,]` remains unchecked here (no container cursor available),
+        // but `[1,]` is, via the last real element's own cursor. This is
+        // the live, CLI-reachable fix: `echo '[1,]' | succinctly yq --slurp
+        // --input-format json -o json '.[0]'` used to exit 0 with `1`.
+        if let Some(last) = &last_elem {
+            if !trailing_element_gap_ok(last, b']') {
+                return Err(last.malformed_delimiter_error());
+            }
         }
         OwnedValue::Array(items)
     } else if value.is_null() {
@@ -6817,6 +6866,70 @@ mod tests {
         let cursor = index.root(json);
         to_owned_canonicalizing_numbers(&cursor.value())
             .expect_err("an unclassifiable value token is not well-formed JSON");
+    }
+
+    /// #2262: `to_owned_canonicalizing_numbers` gained #1975's #1677/#1194
+    /// checks, but never #2211's `container_gap_ok` or #2243's
+    /// `trailing_element_gap_ok` -- unlike its `eval_generic::
+    /// to_owned_cursor_at_depth` counterpart, which has both. This is the
+    /// live, CLI-reachable half of #2262: confirmed before this fix,
+    /// `echo '[1,]' | succinctly yq --slurp --input-format json -o json
+    /// '.[0]'` printed `1` at exit 0, where real yq (v4.53.3, `yq eval-all
+    /// -p json -o json '.[0]' -`) rejects the document outright.
+    #[test]
+    fn to_owned_canonicalizing_numbers_raises_on_trailing_comma_2262() {
+        for json in [&br"[1,]"[..], &br#"{"a":1,}"#[..]] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            to_owned_canonicalizing_numbers(&cursor.value()).expect_err(&format!(
+                "{json:?}: a trailing comma after a real last child is not JSON"
+            ));
+        }
+
+        // Well-formed data is unaffected.
+        let json = br#"{"a":1,"b":2}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let owned = to_owned_canonicalizing_numbers(&cursor.value()).unwrap();
+        assert_eq!(
+            owned,
+            OwnedValue::Object(IndexMap::from([
+                ("a".to_string(), OwnedValue::Int(1)),
+                ("b".to_string(), OwnedValue::Int(2)),
+            ]))
+        );
+        let json = br"[1,2,3]";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        assert_eq!(
+            to_owned_canonicalizing_numbers(&cursor.value()).unwrap(),
+            OwnedValue::Array(vec![
+                OwnedValue::Int(1),
+                OwnedValue::Int(2),
+                OwnedValue::Int(3),
+            ])
+        );
+    }
+
+    /// #2262: unlike the trailing-comma case above, a stray `,` with *zero*
+    /// real children (`[,]`, `{,}`) remains a known, deliberately unclosed
+    /// gap here -- #2211's `container_gap_ok` needs a cursor to the
+    /// *container itself* to find its opening bracket, and this function is
+    /// only ever given a bare `value: &V` (never a cursor for the container,
+    /// unlike `eval_generic::to_owned_cursor_at_depth`'s own `cursor`
+    /// parameter). Once the child walk is exhausted there is nothing left
+    /// to check against -- the same limitation
+    /// `eval_generic::to_owned_at_depth`'s identical value-only shape has.
+    /// Pinned rather than left silently uncovered.
+    #[test]
+    fn to_owned_canonicalizing_numbers_stray_comma_in_empty_container_remains_a_known_gap_2262() {
+        for json in [&br"[,]"[..], &br"{,}"[..]] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            if let Err(e) = to_owned_canonicalizing_numbers(&cursor.value()) {
+                panic!("{json:?}: known gap -- silently accepted, got error {e:?}");
+            }
+        }
     }
 
     /// `depth` levels of single-child `CommentTree::Array` nesting, mirroring

@@ -424,6 +424,40 @@ the same way:
   `to_owned_at_depth`'s own `string_decode_error()`/`is_error()` arms (#1247) were missing
   from this function entirely.
 
+[#2262](https://github.com/rust-works/succinctly/issues/2262) extended this same bridge with
+the two remaining checks `eval_generic::to_owned_at_depth` — the function this bridge's own
+doc comment has always claimed to "mirror ... exactly" — had gained since #1975 landed:
+[#2211](https://github.com/rust-works/succinctly/issues/2211)'s `container_gap_ok` (a stray
+`,` with *zero* real children, `[,]`/`{,}`) and
+[#2243](https://github.com/rust-works/succinctly/issues/2243)'s `trailing_element_gap_ok` (a
+stray `,` *after* a real last child, `[1,]`/`{"a":1,}`). Only the second is addable here:
+`container_gap_ok` needs a cursor to the container itself, and this function (like
+`eval_generic::to_owned_at_depth`) is only ever given a bare `value: &V` — once a container's
+child walk is exhausted there is no cursor left to find its opening bracket from. `[,]`/`{,}`
+therefore remain silently accepted; `[1,]`/`{"a":1,}` now correctly raise, confirmed live and
+CLI-reachable:
+
+```console
+$ echo '[1,]' | succinctly yq --slurp --input-format json -o json '.[0]'
+Error: Invalid JSON text: expected JSON value, found ']'                    # correct (was: 1, exit 0)
+$ echo '[1,]' | yq -p json '.[0]'
+json: null unexpected end of JSON input                                    # real yq agrees
+```
+
+**A pre-existing divergence this widens by one case, not a new one.** Real yq's own
+`-p json`/`eval-all -p json --input-format json` path (confirmed live against v4.53.3) is far
+more lenient about a comma or colon inside a JSON *object* than #1975's own delimiter checks
+already were — it accepts a trailing comma (`{"a":1,}`), a leading one (`{,"a":1}`), a doubled
+one (`{"a":1,,}`), and even a missing colon (`{"a" 1}` → `{"a": 1}`) — apparently because its
+JSON input is routed through a YAML flow-mapping parser rather than a strict JSON one; a JSON
+*array* gets none of that leniency (`[1,]`/`[1 2, 3]` both error). #1975 already rejected the
+missing-colon and missing-comma object cases before #2262 touched anything (confirmed: that
+divergence predates this issue, was never gated behind `--jq-extensions` or otherwise
+softened, and was accepted implicitly by #1975's own goal of mirroring
+`eval_generic::to_owned_at_depth`'s *strict* JSON grammar rather than real yq's specific
+JSON-via-YAML-flow routing). #2262's `{"a":1,}` addition is the same design choice applied to
+one more comma shape, not a new departure from it.
+
 Pulling the other way: [#442](https://github.com/rust-works/succinctly/issues/442),
 [#478](https://github.com/rust-works/succinctly/issues/478),
 [#868](https://github.com/rust-works/succinctly/issues/868) and
