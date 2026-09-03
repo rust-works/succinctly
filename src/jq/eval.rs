@@ -15962,9 +15962,14 @@ fn index_object_by_name<'a, W: Clone + AsRef<[u64]>>(
 ) -> QueryResult<'a, W> {
     match value {
         // #1995: a non-string sibling key (`fields.find`'s own `Err`) is a
-        // hard parse-time error in real jq, never suppressed by `optional`
-        // -- same precedence as every other malformed-JSON `Err` this file
-        // surfaces unconditionally.
+        // hard parse-time error in real jq, never suppressed by this
+        // function's own `optional` parameter -- same precedence as every
+        // other malformed-JSON `Err` this file surfaces unconditionally.
+        // Not the same guarantee as jq's postfix `?` (`Expr::Try`), a
+        // separate suppression mechanism one level up that currently *does*
+        // wrongly swallow this error class -- a distinct, pre-existing,
+        // separately-tracked gap (#2286), not something this arm's own
+        // unconditional `Err` propagation controls.
         StandardJson::Object(fields) => match find_field::<W>(fields, name) {
             Ok(Some(v)) => QueryResult::One(v),
             // jq returns null for missing fields on objects (not an error)

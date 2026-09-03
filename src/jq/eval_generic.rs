@@ -4964,8 +4964,10 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                     Ok(Some(c)) => GenericResult::OneCursor(c),
                     // jq returns null for missing fields on objects (not an error)
                     Ok(None) => GenericResult::Owned(OwnedValue::Null),
-                    // #1677: the field this lookup resolved to has a
-                    // malformed `,`/`:` delimiter.
+                    // Either #1677 (the field this lookup resolved to has a
+                    // malformed `,`/`:` delimiter) or #1995 (some sibling's
+                    // key isn't string-shaped at all) -- see
+                    // `find_cursor`'s own doc comment.
                     Err(err) => GenericResult::Error(err),
                 }
             } else if value.is_null() {
@@ -7791,7 +7793,7 @@ fn index_one_generic<S: EvalSemantics, V: DocumentValue>(
                 match fields.find_cursor(s) {
                     Ok(Some(c)) => GenericResult::OneCursor(c),
                     Ok(None) => GenericResult::Owned(OwnedValue::Null),
-                    // #1677: same malformed-delimiter check as `Expr::Field`.
+                    // #1677/#1995: same checks as `Expr::Field`'s own arm.
                     Err(err) => GenericResult::Error(err),
                 }
             } else if target.is_null() {
