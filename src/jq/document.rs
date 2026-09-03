@@ -946,6 +946,101 @@ pub trait DocumentFields: Sized + Clone {
         false
     }
 
+    /// [`contains`](Self::contains), refusing an object whose members the
+    /// format's grammar never allowed (#1194's unpaired tail, #1677's
+    /// missing/doubled `,`/`:`, #2261's trailing stray comma after a real
+    /// last field) -- `has(key)`'s own check for objects.
+    ///
+    /// **Preserves `contains`'s own early exit on a match** -- unlike every
+    /// other #2261 fix, which rides an already-mandatory full walk for
+    /// free, checking the trailing gap here would mean walking *past* a
+    /// match purely to look for a fault that might not even exist, on a
+    /// method whose whole point (like `keys_unsorted[0]`/`first`, #1629's
+    /// own precedent) is answering without walking the rest of the object.
+    /// Measured: on a 1,000,000-key well-formed object, `has("k0")` (the
+    /// very first key) went from ~0.03s to ~0.12s under a first-draft
+    /// version of this fix that dropped the early exit entirely -- a real
+    /// ~4x regression for exactly the case #1629 exists to keep cheap.
+    ///
+    /// So a match's own trailing-gap answer rides the *cheapest* available
+    /// signal instead: `key_cursor.next_sibling()` is the matched field's
+    /// own value (the same O(1) BP hop [`DistinctKeyCursors::trailing_gap_ok`]
+    /// uses), and *that* cursor's own `next_sibling()` answers "is there
+    /// another field after this one" for free, no walk required. Only when
+    /// the match turns out to *be* the object's real last field --
+    /// `{"a":1,} | has("a")`, this issue's own repro -- does checking cost
+    /// anything at all, and even then it's one more O(1) hop, not a walk.
+    /// A match that is *not* the last field takes the exact
+    /// #1629/#1770-established trade every other early-exit consumer in
+    /// this codebase already takes: `{"a":1,"b":2,} | has("a")` matches
+    /// "a" and returns before ever reaching "b"'s own trailing comma --
+    /// a documented, narrower gap, not silently wrong the way the
+    /// unpatched method was on its own headline repro.
+    ///
+    /// A *non-match* still has to walk to the true end regardless (the
+    /// existing shape `contains` itself already has), so that path's own
+    /// #1194/#1677/#2261 checks stay free, exactly like every other #2261
+    /// fix.
+    ///
+    /// An undecodable/unstringifiable key (`key_display_string` -> `None`)
+    /// still just fails to match, exactly as `contains` already documents
+    /// for itself -- this method closes the #1194/#1677/#2261 *structural*
+    /// gaps `contains` never checked at all, not the separate, already-
+    /// accepted "isn't full behavioral parity with `keys`" divergence
+    /// `contains`'s own doc comment describes.
+    fn contains_checked(&self, name: &str) -> Result<bool, EvalError> {
+        let mut fields = self.clone();
+        let mut is_first = true;
+        // The last key cursor seen, for the *non-match* exhaustion path
+        // below -- that walk always reaches the true end regardless (the
+        // same shape `contains` itself already has), so its own trailing
+        // check is free, unlike the early-exit match path above.
+        let mut last_key_cursor: Option<Self::Cursor> = None;
+        while let Some((key, key_cursor, rest)) = fields.uncons_key() {
+            // #1677: cheap per-key checks, riding the walk `contains`
+            // already makes regardless of early exit -- no extra cost,
+            // early-exit or not.
+            if !key_delimiter_ok::<Self>(&key, &key_cursor, is_first)
+                || !key_only_value_delimiter_ok::<Self>(&key, &key_cursor)
+            {
+                return Err(self.malformed_member_error());
+            }
+            if key_display_string(&key).is_some_and(|k| k.as_ref() == name) {
+                // #2261: free exactly when the match is also the last
+                // field -- see this method's own doc comment for why a
+                // match elsewhere accepts the documented early-exit trade
+                // instead of paying for a walk to confirm one way or
+                // the other.
+                if let Some(value_cursor) = key_cursor.next_sibling() {
+                    if value_cursor.next_sibling().is_none()
+                        && !trailing_element_gap_ok(&value_cursor, b'}')
+                    {
+                        return Err(self.malformed_member_error());
+                    }
+                }
+                return Ok(true);
+            }
+            last_key_cursor = Some(key_cursor);
+            fields = rest;
+            is_first = false;
+        }
+        if fields.ends_unpaired() {
+            return Err(self.malformed_member_error());
+        }
+        // #2261: no match found anywhere, so this walk already reached the
+        // object's true end -- the trailing-gap check is free here, same
+        // as every other #2261 fix, via the same `next_sibling()` hop
+        // `DistinctKeyCursors::trailing_gap_ok` uses.
+        if let Some(key_cursor) = last_key_cursor {
+            if let Some(value_cursor) = key_cursor.next_sibling() {
+                if !trailing_element_gap_ok(&value_cursor, b'}') {
+                    return Err(self.malformed_member_error());
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Check if there are no fields.
     fn is_empty(&self) -> bool;
 

@@ -22401,6 +22401,173 @@ fn test_jq_cursor_transparent_fast_paths_wellformed_unaffected_2261() -> Result<
     Ok(())
 }
 
+/// #2261 follow-up: code review on PR #2291 found and live-confirmed five
+/// more sibling paths sharing the exact "already walks `.len()`/every
+/// field, so the check rides free" shape the original fix used elsewhere,
+/// missed in the first pass: `has(idx)` on arrays, `has(key)` on objects,
+/// `keys`/`keys_unsorted` on *arrays* (the object arm was fixed; this array
+/// arm two branches below it was not), computed/dynamic index access
+/// (`E[K]`, e.g. `.[0,1]`/`.[$i]` -- the literal-index sibling was already
+/// fixed), and `last`/`.[-1]` (unlike `first`, which is genuine O(1) via
+/// `get_cursor(0)` and stays a documented exception per #1629's own
+/// precedent). All five verified against `/usr/bin/jq` 1.7.1.
+#[test]
+fn test_jq_len_checked_sibling_paths_reject_trailing_comma_2261() -> Result<()> {
+    for (input, query) in [
+        (r"[1,2,3,]", "has(0)"),
+        (r#"{"a":1,}"#, "has(\"a\")"),
+        (r"[1,2,3,]", "keys"),
+        (r"[1,2,3,]", ".[0,1]"),
+        (r"[1,2,3,]", "last"),
+    ] {
+        let (out, stderr, code) = run_jq_full(&["-c", query], Some(input))?;
+        assert_eq!(
+            code, 5,
+            "input={input} query={query}: out: {out:?}, stderr: {stderr:?}"
+        );
+        assert!(
+            out.trim().is_empty(),
+            "input={input} query={query}: unexpected output {out:?}"
+        );
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "input={input} query={query}: stderr: {stderr:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// #2261 follow-up: a systematic sweep for every other unchecked
+/// `DocumentElements::collect_cursors`/`.len()` call site in
+/// `eval_generic.rs`/`document.rs` (prompted by the five paths above)
+/// turned up six more real, live, jq-oracle-backed sibling bugs sharing the
+/// identical shape: each already fully resolves every element's cursor
+/// (`collect_cursors`, an already-mandatory walk with an already-checked
+/// `collect_cursors_checked` sibling used elsewhere), so switching to the
+/// checked variant is free. `path(.[])`'s array arm had drifted onto the
+/// unchecked helper even though its own object-arm sibling three lines
+/// above already used the checked `effective_fields_checked`. `pivot` has
+/// no jq oracle (`pivot/0 is not defined` in real jq) but is fixed for
+/// internal consistency with every other builtin here. All others verified
+/// against `/usr/bin/jq` 1.7.1.
+#[test]
+fn test_jq_collect_cursors_checked_sibling_paths_reject_trailing_comma_2261() -> Result<()> {
+    for query in [
+        "[path(.[])]",
+        "reverse",
+        "sort",
+        "unique",
+        "min",
+        "max",
+        "sort_by(.)",
+        "unique_by(.)",
+        "min_by(.)",
+        "max_by(.)",
+    ] {
+        let (out, stderr, code) = run_jq_full(&["-c", query], Some(r"[1,2,3,]"))?;
+        assert_eq!(code, 5, "query={query}: out: {out:?}, stderr: {stderr:?}");
+        assert!(
+            out.trim().is_empty(),
+            "query={query}: unexpected output {out:?}"
+        );
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "query={query}: stderr: {stderr:?}"
+        );
+    }
+
+    // `pivot`/`shuffle`: succinctly-only extensions, no jq oracle -- fixed
+    // for internal consistency (every other builtin above now rejects this
+    // shape) rather than jq parity. `shuffle`'s own output is
+    // non-deterministic, so only its error behavior is checked here.
+    //
+    // `pivot` only accepts an array of arrays/objects, so its own trailing
+    // element is always container-typed -- the #2243 "container-typed last
+    // child still passes through" residual gap (`scalar_text_end` can't
+    // determine a container's own end position, so `trailing_element_gap_ok`
+    // defaults to "can't determine, skip" for it) means a *trailing* comma
+    // can never demonstrate this fix for `pivot` specifically. A *leading*
+    // stray comma between two elements is unaffected by that residual gap
+    // and demonstrates the identical `collect_cursors`-to-`_checked` fix.
+    let (out, stderr, code) = run_jq_full(&["-c", "pivot"], Some(r#"[{"a":1},,{"a":2}]"#))?;
+    assert_eq!(code, 5, "pivot: out: {out:?}, stderr: {stderr:?}");
+    assert!(stderr.contains("Invalid JSON text"), "pivot: {stderr:?}");
+
+    let (out, stderr, code) = run_jq_full(&["-c", "shuffle"], Some(r"[1,2,3,]"))?;
+    assert_eq!(code, 5, "shuffle: out: {out:?}, stderr: {stderr:?}");
+    assert!(stderr.contains("Invalid JSON text"), "shuffle: {stderr:?}");
+
+    Ok(())
+}
+
+/// #2261 follow-up: `has(key)` on objects (`DocumentFields::contains_checked`)
+/// deliberately preserves `contains`'s own early exit on a match -- unlike
+/// every other #2261 fix, checking the trailing gap here is not free, and a
+/// first-draft version that dropped the early exit measured a real ~4x
+/// regression on `has("k0")` over a 1,000,000-key object (see
+/// `contains_checked`'s own doc comment). The tradeoff: a match that is
+/// *not* the object's true last field takes the same #1629/#1770-established
+/// "early exit legitimately misses a later fault" divergence every other
+/// truncating consumer in this codebase already accepts. Pinned here rather
+/// than left as an unstated side effect of the perf fix.
+#[test]
+fn test_jq_has_object_early_exit_still_skips_a_later_trailing_comma_2261() -> Result<()> {
+    // The match *is* the object's real last field -- #2261's own repro,
+    // and the one case `has(key)` must catch without walking further.
+    let (out, stderr, code) = run_jq_full(&["-c", "has(\"a\")"], Some(r#"{"a":1,}"#))?;
+    assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
+    assert!(out.trim().is_empty(), "unexpected output {out:?}");
+    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+
+    // The match is *not* the last field -- a later trailing comma exists
+    // but this early-exit consumer never reaches it, a documented,
+    // deliberately accepted divergence from real jq (which would still
+    // raise, since it can't parse the document at all).
+    let (out, stderr, code) = run_jq_full(&["-c", "has(\"a\")"], Some(r#"{"a":1,"b":2,}"#))?;
+    assert_eq!(code, 0, "known gap: out: {out:?}, stderr: {stderr:?}");
+    assert_eq!(out.trim(), "true", "known gap: unexpected output");
+
+    // A non-match still walks to the true end regardless (the shape
+    // `contains` itself already has), so it catches the same fault the
+    // match-not-last case above misses.
+    let (out, stderr, code) = run_jq_full(&["-c", "has(\"z\")"], Some(r#"{"a":1,"b":2,}"#))?;
+    assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
+    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
+
+    Ok(())
+}
+
+/// #2261 follow-up: well-formed documents (including a duplicate key and
+/// an object where `has`'s match is *not* the last field) are unaffected
+/// by every new check above.
+#[test]
+fn test_jq_len_checked_and_collect_cursors_checked_siblings_wellformed_unaffected_2261(
+) -> Result<()> {
+    for (input, query, expected) in [
+        ("[1,2,3]", "has(0)", "true"),
+        ("[1,2,3]", "has(5)", "false"),
+        (r#"{"a":1,"b":2}"#, "has(\"a\")", "true"),
+        (r#"{"a":1,"b":2}"#, "has(\"z\")", "false"),
+        ("[1,2,3]", "keys", "[0,1,2]"),
+        ("[1,2,3]", ".[0,1]", "1\n2"),
+        ("[1,2,3]", "last", "3"),
+        ("[1,2,3]", "reverse", "[3,2,1]"),
+        ("[3,1,2]", "sort", "[1,2,3]"),
+        ("[1,1,2]", "unique", "[1,2]"),
+        ("[3,1,2]", "min", "1"),
+        ("[3,1,2]", "max", "3"),
+        (r#"[{"a":1},{"a":2}]"#, "pivot", r#"{"a":[1,2]}"#),
+        (r#"{"a":1,"b":2,"a":3}"#, "has(\"a\")", "true"),
+    ] {
+        let (out, stderr, code) = run_jq_full(&["-c", query], Some(input))?;
+        assert_eq!(code, 0, "input={input} query={query}: stderr: {stderr:?}");
+        assert_eq!(out.trim(), expected, "input={input} query={query}");
+    }
+
+    Ok(())
+}
+
 /// #2261: `len_checked`/`Expr::Index`'s own #1677 *leading*-gap check (a
 /// malformed comma *between* two real elements, `[1,,3]`) is the sibling
 /// case to this issue's own trailing-comma repro, and shares the same new
