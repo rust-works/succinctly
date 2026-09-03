@@ -4724,12 +4724,15 @@ fn take_stopping_items_to_result<W: Clone + AsRef<[u64]>>(
     flow: Flow,
 ) -> QueryResult<'_, W> {
     match flow {
-        Flow::Escaped(control) if items.is_empty() => control_to_result(control),
         // #1519: items *and* an escape means a later `?//` alternative failed
         // after an earlier one had already answered. jq reaches that failure,
-        // so the prefix is kept and the control still raises.
+        // so the prefix is kept and the control still raises -- `partial`
+        // (#2204 review) already collapses an empty prefix to the bare
+        // `control_to_result` this used to spell out inline, so converting
+        // unconditionally before the call is just as cheap for the empty
+        // case (mapping over nothing) and drops the redundant branch.
         Flow::Escaped(control) => {
-            QueryResult::Partial(items.into_iter().map(Item::into_owned).collect(), control)
+            partial(items.into_iter().map(Item::into_owned).collect(), control)
         }
         // `_checked`, not the unchecked twin it replaced upstream: an
         // undecodable item must raise rather than silently become "", and a
@@ -4763,7 +4766,7 @@ fn take_stopping_items_to_result<W: Clone + AsRef<[u64]>>(
 /// calling this: `Flow::Stopped { .. }` paired with a real out-of-band
 /// escape becomes `Flow::Escaped` first, so this function only ever needs
 /// to reason about one escape channel, not two.
-fn counted_bool_flow_to_result<'a, W: Clone + AsRef<[u64]>>(
+fn counted_bool_flow_to_result<'a, W>(
     count: usize,
     true_val: bool,
     false_val: bool,
@@ -41223,42 +41226,27 @@ fn builtin_isempty<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         delivered += 1;
         Demand::Stop
     });
-    match flow {
-        // `g` produced an output and we stopped it right there.
-        //
-        // `pending` is deliberately dropped: it is only ever `Some` when an
-        // eager fallback had already raised a trailing control before the
-        // stop, and real jq — which would never have evaluated that far —
-        // answers `false` regardless. Oracle-confirmed for all three shapes:
-        // `isempty(1, error("x"))`, `isempty(1, ("m"|halt_error(3)))` and
-        // `label $o | isempty(1, break $o)` all answer `false`, exit 0.
-        Flow::Stopped { .. } => owned_vec_to_result(vec![OwnedValue::Bool(false); delivered]),
-
-        // `g` ran to exhaustion. The trailing `, true` in jq's definition is
-        // reached exactly when no `break` is left unwinding, so it is appended
-        // to however many `false`s were already emitted -- normally none, but
-        // a `?//` chain whose *last* alternative runs dry after an earlier one
-        // short-circuited answers `false` then `true`
-        // (`isempty([1] as [$x] ?// $x | if ($x|type)=="number" then 9 else
-        // empty end)`, confirmed live against jq 1.7.1).
-        Flow::Exhausted => {
-            let mut out = vec![OwnedValue::Bool(false); delivered];
-            out.push(OwnedValue::Bool(true));
-            owned_vec_to_result(out)
-        }
-
-        // `g`'s own terminator once no further output ever arrived. A *bare*
-        // escape (`delivered == 0`) means there is nothing to answer with and
-        // all three must propagate rather than be reported as "empty" (#882,
-        // #791, #867). `partial` preserves that -- and preserves
-        // `Halt`/`Break` by construction -- while also keeping any prefix a
-        // `?//` retry already delivered: a later alternative's own error is
-        // genuinely reached by jq after an earlier one answered `false`, so
-        // it raises rather than silently discarding that answer (#1519;
-        // `isempty([1] as [$x] ?// $x | if ($x|type)=="number" then 9 else
-        // error("boom") end)` is `false` then an error in real jq).
-        Flow::Escaped(control) => partial(vec![OwnedValue::Bool(false); delivered], control),
-    }
+    // #2204: the identical count-of-matches shape `counted_bool_flow_to_result`
+    // already shares between `builtin_upper_in`/`any_all_gen_cond` -- found in
+    // that fix's own review. `pending` is deliberately dropped on
+    // `Flow::Stopped` (only ever `Some` when an eager fallback had already
+    // raised a trailing control before the stop, and real jq -- which would
+    // never have evaluated that far -- answers `false` regardless;
+    // oracle-confirmed for all three shapes: `isempty(1, error("x"))`,
+    // `isempty(1, ("m"|halt_error(3)))`, `label $o | isempty(1, break $o)` all
+    // answer `false`, exit 0). `Flow::Exhausted`'s appended `true` is jq's
+    // trailing `, true` in `def isempty(g): label $out | (g|false, break
+    // $out), true;`, reached exactly when no `break` is left unwinding -- a
+    // `?//` chain whose *last* alternative runs dry after an earlier one
+    // short-circuited answers `false` then `true` (`isempty([1] as [$x] ?//
+    // $x | if ($x|type)=="number" then 9 else empty end)`, confirmed live
+    // against jq 1.7.1). `Flow::Escaped`'s bare-escape case (`delivered == 0`)
+    // propagates rather than reporting "empty" (#882, #791, #867), and a
+    // non-bare one keeps a `?//` retry's own already-delivered `false` ahead
+    // of a later alternative's genuine error (#1519; `isempty([1] as [$x] ?//
+    // $x | if ($x|type)=="number" then 9 else error("boom") end)` is `false`
+    // then an error in real jq).
+    counted_bool_flow_to_result(delivered, false, true, flow)
 }
 
 /// The YAML type tag (`!!str`, `!!int`, `!!float`, ...) `builtin_delpaths`'s
