@@ -1444,3 +1444,18 @@ fn test_parity_pattern_alternatives_short_circuit_over_document_1519() {
         assert_parity(json, filter);
     }
 }
+
+/// #2312: `eval.rs`'s `get_element_at_index`/`count_elements` (negative-index
+/// resolution, `.foo[-1]`) had the same missing #1677/#2261 trailing-comma
+/// gap check `eval_generic.rs`'s own `Expr::Index` arm already closed
+/// (#2261) -- unreachable from either shipped CLI today (same reachability
+/// analysis as #2293/#2311's sibling fixes in this file: `succinctly jq`
+/// never calls into `eval.rs`, and `succinctly yq`'s one call site always
+/// hands it an already-materialized value), but a real gap for a library
+/// consumer of `jq::eval*` building a cursor directly from raw,
+/// unvalidated bytes. Both evaluators already agree (`eval_generic.rs` was
+/// already correct), so `assert_error_parity` pins the fix.
+#[test]
+fn test_parity_negative_index_trailing_comma_2312() {
+    assert_error_parity(br"[1,2,3,]", ".[-1]");
+}
