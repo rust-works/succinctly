@@ -324,6 +324,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   surfaces — not a new divergence, the same one already pinned for a truncating `.[]`
   consumer.
 
+- **Eleven more `succinctly jq` sibling paths shared #2261's own trailing-stray-comma gap**
+  (#2261 code review, PR #2291): `has(idx)` on arrays, `has(key)` on objects,
+  `keys`/`keys_unsorted` on *arrays* (the object arm had already been fixed above), computed/
+  dynamic index access (`E[K]`, e.g. `.[0,1]`/`.[$i]`), and `last`/`.[-1]` all shared the exact
+  "already walks `.len()`/every field, so the check rides free" shape used throughout the
+  #2261 fix above but had been missed in the first pass — e.g. `printf '[1,2,3,]' | succinctly
+  jq 'last'` printed `3` at exit 0 where real jq (1.7.1) raises. A follow-up systematic sweep of
+  every remaining unchecked `DocumentElements::collect_cursors`/`.len()` call site in
+  `eval_generic.rs`/`document.rs` then turned up six more of the identical shape: `path(.[])`
+  (whose array arm had drifted onto the unchecked `collect_cursors` even though its own
+  object-arm sibling already used the checked helper) and
+  `reverse`/`sort`/`sort_by`/`unique`/`unique_by`/`min`/`min_by`/`max`/`max_by` (all resolved
+  every element via the unchecked `collect_cursors` despite the already-checked
+  `collect_cursors_checked` — fixed for `.[]` itself — existing the whole time); `shuffle`/
+  `pivot` share the identical code but have no jq oracle, fixed for internal consistency only.
+  `has(key)` on objects is the one fix in this batch that is not free: `DocumentFields::contains`
+  deliberately early-exits on a match (#1739), so answering the trailing-gap question too
+  needs its own design — the shipped fix resolves it from the matched key's own cursor via two
+  O(1) `next_sibling()` hops rather than walking further, after a first draft that dropped the
+  early exit measured a real ~4x regression on `has()` for a key near the front of a
+  1,000,000-key object. A match that is not the object's own true last field still takes the
+  same #1629/#1770-established "early exit misses a later fault" trade every other truncating
+  consumer in this codebase already accepts. Two further leads from the same sweep
+  (`to_owned_with_comments_at_depth`, a fourth copy of the #2262 materializer family backing
+  yq's write path; and `LazySource::advance`'s lazy pull behind `map(f)`, confirmed live and
+  reproducible but not fixed here given the size/risk of touching that hot path) are documented
+  in `docs/compliance/jq/limitations.md` as recommended follow-ups rather than folded in.
+
 - **`succinctly yq --slurp`/`--eval-all`/`--inplace --input-format json` silently accepted a
   trailing stray `,` after a real last array/object child** (#2262): `echo '[1,]' | succinctly
   yq --slurp --input-format json -o json '.[0]'` printed `1` at exit 0, where real yq (v4.53.3)

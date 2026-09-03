@@ -1572,6 +1572,150 @@ Every other path this section fixed (`length`, `to_entries`, `keys`, `.a`,
 fully-collected `Vec` before printing anything, so a mid-walk failure there
 never leaks a partial value.
 
+### PR #2291 code review: eleven more sibling paths, found by a systematic sweep
+
+Code review on the PR carrying the section above found and live-confirmed
+five more sibling paths sharing the exact "already walks `.len()`/every
+field, so the check rides free" shape used throughout this section, missed
+in the first pass: `has(idx)` on arrays, `has(key)` on objects,
+`keys`/`keys_unsorted` on *arrays* (the object arm above was fixed; this
+array arm two branches below it, returning `GenericResult::LazyIndexRange`,
+was not), computed/dynamic index access (`E[K]`, e.g. `.[0,1]`/`.[$i]` --
+`index_one_generic`, distinct from the literal-index `Expr::Index` arm
+fixed above), and `last`/`.[-1]` (`Builtin::Last`; unlike `first`, which is
+genuine O(1) via `get_cursor(0)` and stays the documented exception per
+#1629's own precedent this section already established).
+
+A follow-up systematic sweep -- every `DocumentElements`/`DocumentFields`
+binding in `eval_generic.rs`, checked for an unchecked `.len()` or an
+unchecked `collect_cursors()` sitting alongside an already-checked sibling
+-- turned up **six more real, live, jq-oracle-backed bugs** of the second
+shape: `path(.[])`'s array arm (`path_step_generic`) had drifted onto the
+unchecked `collect_cursors()` even though its own object-arm sibling three
+lines above already used the checked `effective_fields_checked`; and
+`reverse`/`sort`/`sort_by`/`unique`/`unique_by`/`min`/`min_by`/`max`/`max_by`
+all resolved every element via the unchecked `collect_cursors()` before
+this fix, despite `collect_cursors_checked` (fixed for `.[]` itself) having
+existed the whole time. `shuffle`/`pivot` share the identical code
+(`collect_cursors()` feeding `to_owned_all_cursors`) but have no jq oracle
+(`pivot/0 is not defined`/`shuffle/0 is not defined` in real jq 1.7.1) --
+fixed anyway for internal consistency with every other builtin in this
+list, not for jq parity.
+
+```
+$ printf '[1,2,3,]' | jq          'has(0)'        # parse error, exit 5
+$ printf '[1,2,3,]' | sjq         'has(0)'        # exit 5 now (was: true, exit 0)
+$ printf '{"a":1,}' | jq          'has("a")'      # parse error, exit 5
+$ printf '{"a":1,}' | sjq         'has("a")'      # exit 5 now (was: true, exit 0)
+$ printf '[1,2,3,]' | jq       -c 'keys'          # parse error, exit 5
+$ printf '[1,2,3,]' | sjq      -c 'keys'          # exit 5 now (was: [0,1,2], exit 0)
+$ printf '[1,2,3,]' | jq       -c '.[0,1]'        # parse error, exit 5
+$ printf '[1,2,3,]' | sjq      -c '.[0,1]'        # exit 5 now (was: 1\n2, exit 0)
+$ printf '[1,2,3,]' | jq          'last'          # parse error, exit 5
+$ printf '[1,2,3,]' | sjq         'last'          # exit 5 now (was: 3, exit 0)
+$ printf '[1,2,3,]' | jq       -c '[path(.[])]'   # parse error, exit 5
+$ printf '[1,2,3,]' | sjq      -c '[path(.[])]'   # exit 5 now (was: [[0],[1],[2]], exit 0)
+$ printf '[1,2,3,]' | jq          'reverse'       # parse error, exit 5
+$ printf '[1,2,3,]' | sjq         'reverse'       # exit 5 now (was: [3,2,1], exit 0)
+```
+
+(`sort`/`unique`/`min`/`max`/`sort_by`/`unique_by`/`min_by`/`max_by` all show
+the identical shape as `reverse`.)
+
+**`has(key)` on objects is the one fix in this whole issue that is not
+free**, and needed two drafts to get right. `DocumentFields::contains`
+early-exits the instant it finds a match -- a documented, deliberate
+design (#1739) this fix does not get to ignore: `has(key)`'s existence
+question and the trailing-gap question are two different questions that
+can only both be answered by walking to the object's true end, and a match
+can sit anywhere. A first draft dropped the early exit entirely (walk
+fully regardless, matching `keys`'s own shape) and measured a real **~4x**
+regression on `has("k0")` (the object's very first key) over a
+1,000,000-key well-formed object: ~0.03s → ~0.12s, interleaved A/B, release
+build, three reps. The shipped fix instead resolves the trailing gap from
+the *matched* key's own cursor alone -- `key_cursor.next_sibling()` is the
+matched field's value (an O(1) BP hop, no walk), and *that* cursor's own
+`next_sibling()` answers "is there another field after this one" for free.
+Only when the match *is* the object's real last field (`{"a":1,} |
+has("a")`, this issue's own repro) does checking cost anything at all, and
+even then it costs one more O(1) hop, not a walk. A match that is **not**
+the last field takes the exact #1629/#1770-established "early exit
+legitimately misses a later fault" trade every other truncating consumer
+in this file already takes:
+
+```
+$ printf '{"a":1,"b":2,}' | jq  'has("a")'   # parse error, exit 5
+$ printf '{"a":1,"b":2,}' | sjq 'has("a")'   # true, exit 0 -- known gap, matches "a" before "b"'s own comma is ever reached
+$ printf '{"a":1,"b":2,}' | sjq 'has("z")'   # parse error, exit 5 -- a non-match still walks to the true end, so it still catches it
+```
+
+A first-draft version of `has(key)`'s CLI test also wrongly attributed a
+result to `stream_lazy_keys_json` a second time (`pivot` on
+`[{},{},]`) -- this one for a different reason than the earlier
+`stream_lazy_keys_json` misattribution above: `pivot` only accepts an
+array of arrays/objects, so its own last element is always container-typed,
+which the #2243 "container-typed last child still passes through" residual
+gap (documented earlier in this file) already leaves open regardless of
+this fix. Corrected to use a *leading*-gap malformed input instead
+(`[{"a":1},,{"a":2}]`), which the identical `collect_cursors`-to-`_checked`
+fix also closes and which the residual container gap does not affect.
+
+Every fix above except `has(key)` on objects was confirmed to show **no
+measurable difference** in an interleaved A/B (a build from immediately
+before this round vs. after, three reps each, release profile) at 2M
+array elements / 1M object keys -- consistent with each one already
+walking the whole container for an unrelated reason before this fix, the
+same "free" pattern established throughout this file.
+
+**Confirmed still open, and out of scope for this round**, from the same
+sweep, for reasons unrelated to `.len()`/`collect_cursors()` (each is
+missing *every* gap check, not specifically the trailing one, a broader
+and differently-shaped problem than this section's own fixes):
+
+- **`to_owned_with_comments_at_depth`** (`eval_generic.rs`) -- a *fourth*
+  copy of the `to_owned_at_depth`/`to_owned_cursor_at_depth` materializer
+  family #2262 already found three of, backing the write path's
+  comment/anchor-preserving conversion (`succinctly yq`'s own `=`/`|=`/
+  `del()` machinery). Has no gap checks of any kind. Confirmed **not**
+  reachable from either shipped CLI with a genuinely JSON-sourced cursor
+  today: `succinctly jq`'s own write path uses the already-fixed
+  `to_owned_at_depth`/`to_owned_cursor_at_depth` instead (confirmed live:
+  `[1,2,3,] | .[0] = 99` already correctly raises), and `succinctly yq
+  --input-format json` parses through `YamlIndex` rather than `JsonIndex`
+  (per #1975/#2262's own account), so its own trailing-gap check would be
+  a permanent no-op there regardless. The identical "library-API-only,
+  inert for genuine JSON input via either CLI" shape already established
+  for `stream_lazy_keys_json` above. Recommended as a `#2262`-scoped
+  follow-up (a fourth materializer copy), not folded in here.
+- **`LazySource::advance`'s `Self::Elements`/`Self::Values` arms**
+  (`eval_generic.rs`), the lazy pull behind `map(f)`/`select(f)`/etc:
+  genuinely live and CLI-reachable, confirmed both for this issue's own
+  trailing-comma shape and for the older, broader #1677 leading-gap shape
+  that predates #2261 entirely:
+  ```
+  $ printf '[1,,3]'   | jq  -c 'map(.+1)'   # parse error, exit 5 (#1677, predates this issue)
+  $ printf '[1,,3]'   | sjq -c 'map(.+1)'   # [2,4], exit 0 -- pre-existing, not new
+  $ printf '[1,2,3,]' | jq  -c 'map(.+1)'   # parse error, exit 5
+  $ printf '[1,2,3,]' | sjq -c 'map(.+1)'   # [2,3,4], exit 0
+  ```
+  Not attempted here: this is `map(f)`'s own performance-tuned hot pull
+  loop (#1565/#1599), and adding gap-checking to it is a materially larger,
+  riskier change than swapping an already-checked sibling in for an
+  unchecked one -- the same "no free ride" caution `has(key)` above
+  required, but for a colder, more central path. Recommended as its own,
+  separate follow-up issue.
+
+Two further leads from the same sweep were investigated and **not**
+reproduced live (so not reported as confirmed bugs, only as ruled out):
+`push_generic_truthiness_cursor_error` (`if COND then ... end` on a
+container condition) and `owned_from_standard_json_at_depth` (the
+`input`/`inputs`-with-cursor-metadata-builtins bridge, #1504) both lack
+their own internal gap checks by inspection, but every constructed repro
+against each (`{"a":[1,2,3,]} | if .a then ... end`;
+`[1,2,3,] | [inputs, line]` with `-n`) already raised correctly, meaning
+something upstream of either function already validates for the shapes
+tried. Not chased further given no live reproduction.
+
 ## Refusing an allocation jq does not survive
 
 `setpath` takes its array index from the document, so the array it pads is sized by the
