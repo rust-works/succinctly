@@ -1857,13 +1857,35 @@ path-array form) shares the same order-dependence.
 A negative out-of-range index is untouched by this fix either way -- it raises instead
 (#2268, the section above, landed separately and already covers it).
 
-Also scoped to a *terminal* index only -- a positive out-of-range index with more path
-after it (`del(.[5].a)`, `del(.[5][])`) extends too in real yq, to `index + 1` rather than
-`index` (there *is* something at the out-of-range position once the rest of the path needs
-to navigate into it), and `del(.[5][])` specifically auto-vivifies `[]` there rather than
-`null` -- a different shape from this fix's own terminal-only rule, confirmed live but not
-implemented; tracked separately as
-[#2314](https://github.com/rust-works/succinctly/issues/2314).
+**Also extended to a mid-chain index, not just a terminal one**
+([#2314](https://github.com/rust-works/succinctly/issues/2314)). A positive out-of-range
+index with more path after it (`del(.[5].a)`, `delpaths([[5,"a"]])`) extends too in real
+yq, but to `index + 1` rather than `index` -- there *is* something at the out-of-range
+position once the rest of the path needs to navigate into it, so this reuses
+`pad_with_nulls` directly (the same `setpath`-side helper #2305's own
+`extend_array_with_nulls_for_delete` wraps) rather than the terminal case's `target_len`
+rule:
+
+```bash
+$ echo '[1,2]' | yq -o=json 'del(.[5].a)'   # [1,2,null,null,null,null] -- index 5 itself now exists
+```
+
+`del(.[5][])` is a further, third shape: the freshly-created slot can't stay `null`, since
+`.[]` never tolerates one (#527) -- real yq auto-vivifies it straight to `[]` instead, the
+same way `setpath` auto-vivifies a `null` into whatever container its own next step needs:
+
+```bash
+$ echo '[1,2]' | yq -o=json 'del(.[5][])'   # [1,2,null,null,null,[]]
+```
+
+Closed across the three sites that resolve a mid-chain array index for a delete --
+`delete_path_steps`'s `Expr::Index` arm (the plain AST walk), `delete_trie_array`'s
+`ArrayStep::Index` arm (the comma-grouped multi-target walk), and `delete_paths_under`'s
+array-key arm (`delpaths`' own recursion) -- all in `src/jq/eval.rs`. The trie walk has no
+`[]`-vivify case to mirror: a bare `.[]` can never reach it as a resolved step (a
+comma-grouped `del()`'s own `.[]` is always fanned out against the real document before the
+trie is built, and an out-of-range mid-chain index has nothing there to fan out over), and
+`delpaths`' own path components are always concrete keys, never a `.[]` wildcard.
 
 ### Other categories
 
