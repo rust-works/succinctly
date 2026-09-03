@@ -29295,6 +29295,44 @@ fn test_keys_negative_index_out_of_range_raises_2264() -> Result<()> {
     Ok(())
 }
 
+/// #2264 review: mirrors #2254's own
+/// `test_negative_index_out_of_range_survives_try_catch_2254` for this
+/// issue's `keys`/`keys_unsorted` lazy fast path specifically -- code
+/// review found `try_single_generic`/`check_lazy_item_for_try`'s own
+/// "`LazyIndexRange` can never fail" doc comments went stale after this
+/// fix, and that no test here actually pinned unsuppressibility through an
+/// explicit `try`/`catch`, only a bare index read. `try`/`catch` is a
+/// succinctly-only extension real yq's lexer rejects outright (confirmed
+/// live against v4.53.3, same as #2254's own precedent test), so this
+/// exercises succinctly's own `try_single_generic` bypass
+/// (`EvalError::is_yq_negative_index_error`), not a real-yq oracle claim.
+#[test]
+fn test_keys_negative_index_out_of_range_survives_try_catch_2264() -> Result<()> {
+    let (out, stderr, code) = run_yq_stdin_with_stderr(
+        "try (.a | keys_unsorted[-5]) catch \"c\"",
+        "a: {x: 1, y: 2}\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+
+    let (out, stderr, code) = run_yq_stdin_with_stderr(
+        "try (.a | keys[-5]) catch \"c\"",
+        "a: [1, 2]\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+
+    Ok(())
+}
+
 /// #2264's jq-mode control: jq has no equivalent of this yq-only rule, so
 /// `keys[-N]`/`keys_unsorted[-N]` stay `null`, matching #2254's own
 /// established jq-mode precedent for ordinary `.a[-N]` reads.

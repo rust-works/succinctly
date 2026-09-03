@@ -5041,11 +5041,19 @@ fn fold_pipe_stages_sink<S: EvalSemantics, V: DocumentValue>(
 /// fix reviewable at the size of a narrow bug fix rather than a `LazyKeys`
 /// redesign.
 ///
-/// `LazyIndexRange` needs no arm at all: its value is fully described by
-/// `len` alone (#684), so unlike `LazyKeys` it can never actually fail --
+/// `LazyIndexRange` needs no arm at all: its own materialization is fully
+/// described by `len` alone (#684) and can never fail on its own, so
 /// forcing it here would cost real allocation for zero correctness
-/// benefit, so it stays on the `other => other` wildcard, exactly as
-/// before this fix.
+/// benefit -- it stays on the `other => other` wildcard, exactly as before
+/// this fix. #2264: `fold_lazy_index_range_stage`'s own negative-index arm
+/// *can* now raise (a yq-mode out-of-range `.[-N]`), but that resolution
+/// always happens upstream, folded into the pipe *before* a `try`/`?`
+/// boundary is reached (`Expr::Pipe`'s own evaluation applies every stage
+/// through `fold_pipe_stages` first) -- so a raw `LazyIndexRange` value
+/// arriving here has already survived any pending index fold, and this
+/// claim is about materializing *that* value, not about whether resolving
+/// an index against it could fail (it can, just never at this point in the
+/// pipeline).
 ///
 /// [`each_try_generic`] below, this function's push-model twin, has a
 /// **similar but distinct, still-open gap**: `eval_each_generic`'s own
@@ -6474,8 +6482,12 @@ fn each_try_generic<S: EvalSemantics, V: DocumentValue>(
 /// materializes via `materialize_atomic` -- matching `try_single_generic`'s
 /// own `LazySeq` arm, and sound for the same reason that one is: a
 /// `try`/`catch`/`?` boundary must know *now* whether its body raised, so
-/// laziness cannot survive past it regardless of push or pull. `LazyIndexRange`
-/// can never fail (`0..len`, pure arithmetic) and passes through unchanged.
+/// laziness cannot survive past it regardless of push or pull. `LazyIndexRange`'s
+/// own materialization can never fail (`0..len`, pure arithmetic) and passes
+/// through unchanged -- see [`try_single_generic`]'s own doc comment (#2264)
+/// for why `fold_lazy_index_range_stage`'s negative-index arm being able to
+/// raise doesn't change that: the fold happens upstream, before a raw
+/// `LazyIndexRange` item can ever reach this check.
 ///
 /// Nested `try`/`catch` boundaries each re-walk the same still-forwarded
 /// `LazyKeys` item once per boundary (`try (try (keys_unsorted) catch empty)
