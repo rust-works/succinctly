@@ -29235,3 +29235,82 @@ fn test_slice_expr_target_partial_prefix_still_discarded_in_yq_mode_2226() -> Re
     assert_eq!(stderr.trim(), "Error: x");
     Ok(())
 }
+
+/// #2264: `keys`/`keys_unsorted`'s own lazy `.[n]` fast path
+/// (`fold_lazy_keys_stage` for object keys, `fold_lazy_index_range_stage`
+/// for array keys) had its own independent negative-index resolution with
+/// no yq-mode check at all -- confirmed live to silently answer `null`
+/// instead of raising, unlike every other `.a[-N]`-shaped read #2254
+/// already fixed. Both arms already walk (or, for the array-keys case,
+/// already know) the whole container's length to resolve a negative index
+/// at all, so the check rides along for free -- same reasoning as #2254's
+/// own sibling fixes.
+#[test]
+fn test_keys_negative_index_out_of_range_raises_2264() -> Result<()> {
+    // Object keys (`fold_lazy_keys_stage`), both `keys` and `keys_unsorted`.
+    let (out, stderr, code) =
+        run_yq_stdin_with_stderr(".a | keys[-5]", "a: {x: 1, y: 2}\n", &["-o", "json"])?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+    let (out, stderr, code) = run_yq_stdin_with_stderr(
+        ".a | keys_unsorted[-5]",
+        "a: {x: 1, y: 2}\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+
+    // Array keys (`fold_lazy_index_range_stage`).
+    let (out, stderr, code) =
+        run_yq_stdin_with_stderr(".a | keys[-5]", "a: [1, 2]\n", &["-o", "json"])?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+
+    // In-bounds negative wraparound is unaffected, both container types.
+    let (out, code) = run_yq_stdin(
+        ".a | keys_unsorted[-1]",
+        "a: {x: 1, y: 2}\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "\"y\"");
+    let (out, code) = run_yq_stdin(".a | keys[-1]", "a: [1, 2, 3]\n", &["-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "2");
+
+    // Positive out-of-range is unaffected -- `null`, not an error.
+    let (out, code) = run_yq_stdin(".a | keys[5]", "a: [1, 2]\n", &["-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "null");
+
+    Ok(())
+}
+
+/// #2264's jq-mode control: jq has no equivalent of this yq-only rule, so
+/// `keys[-N]`/`keys_unsorted[-N]` stay `null`, matching #2254's own
+/// established jq-mode precedent for ordinary `.a[-N]` reads.
+#[test]
+fn test_keys_negative_index_out_of_range_unaffected_in_jq_mode_2264() -> Result<()> {
+    let (out, stderr, code) = run_jq_stdin_with_stderr(
+        ".a | keys_unsorted[-5]",
+        "{\"a\":{\"x\":1,\"y\":2}}",
+        &["-c"],
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(out.trim(), "null");
+
+    let (out, stderr, code) = run_jq_stdin_with_stderr(".a | keys[-5]", "{\"a\":[1,2]}", &["-c"])?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(out.trim(), "null");
+
+    Ok(())
+}

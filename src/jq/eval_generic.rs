@@ -4141,7 +4141,19 @@ fn fold_lazy_keys_stage<S: EvalSemantics, V: DocumentValue>(
         Expr::Index { idx, .. } if !sorted && *idx < 0 => {
             match distinct_key_cursors_checked::<V>(&fields, collapse) {
                 Ok(cursors) => {
-                    let target = usize::try_from(cursors.len() as i64 + idx).ok();
+                    // #2264: `yq_negative_index_check`, not a bare
+                    // `None`-on-still-negative fallthrough -- this arm
+                    // already walks the whole object to resolve `idx`
+                    // against its length (see this arm's own #1629
+                    // comment above), so the check rides along for free,
+                    // the same shape #2254 already fixed for ordinary
+                    // `.a[-N]` array/object reads elsewhere in this file.
+                    let len = cursors.len();
+                    let resolved = len as i64 + idx;
+                    if let Some(e) = yq_negative_index_check::<S>(*idx, resolved, len) {
+                        return GenericResult::Error(e);
+                    }
+                    let target = usize::try_from(resolved).ok();
                     match target.and_then(|t| cursors.into_iter().nth(t)) {
                         Some(cursor) => GenericResult::OneCursor(cursor),
                         None => GenericResult::Owned(OwnedValue::Null),
@@ -4289,6 +4301,13 @@ fn fold_lazy_index_range_stage<S: EvalSemantics, V: DocumentValue>(
             // `LazyKeys`'s `Expr::Index` arm above.
             let target = if *idx < 0 {
                 let normalized = len as i64 + idx;
+                // #2264: yq's own negative-index-out-of-range check --
+                // same shape #2254 already established for ordinary
+                // `.a[-N]` array reads, and the sibling fix just above
+                // in `fold_lazy_keys_stage`.
+                if let Some(e) = yq_negative_index_check::<S>(*idx, normalized, len) {
+                    return GenericResult::Error(e);
+                }
                 if normalized < 0 {
                     None
                 } else {
