@@ -33433,6 +33433,21 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 &mut out,
             ) {
                 Ok(()) => owned_vec_to_result(out),
+                // #2292 review round 2: an uncatchable error must survive
+                // unconditionally, and can't safely take the
+                // prefix-preserving `partial(out, ...)` path below this
+                // match -- `intermediate` would then flow into
+                // `continue_rest_with_fresh_root`'s own `Partial` arm,
+                // which re-wraps it through `catch_error_under_optional`;
+                // that helper has no uncatchable-error awareness at all and
+                // would silently drop `e` under a future `optional == true`
+                // regardless. A hard return here (discarding `out`) is the
+                // only way this arm can actually guarantee what the other
+                // three #2292 sites guarantee, matching the `Array` arm's
+                // own atomic treatment above.
+                Err(Control::Error(e)) if e.is_uncatchable_at_value_position() => {
+                    return QueryResult::Error(e);
+                }
                 // `?` swallows only a genuine error, and -- unlike the
                 // `Array` arm's atomic catch above -- string
                 // interpolation's own already-produced output survives the
@@ -33441,14 +33456,6 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // `{"a":1}`, not `[1,error("x")]?`'s empty result.
                 // `Break`/`Halt` are never caught by `?`, matching every
                 // other `?` site in this file.
-                // #2292 review: an uncatchable error must survive this
-                // arm's own `optional` swallow unconditionally too, same as
-                // every other site this issue and #2270/#2289 touch --
-                // falls through to `Err(control) => partial(...)` below,
-                // preserving whatever prefix `out` already holds.
-                Err(Control::Error(e)) if e.is_uncatchable_at_value_position() => {
-                    partial(out, Control::Error(e))
-                }
                 // #2212/#2227: currently unreachable with `optional ==
                 // true` in *this* (path-context) evaluator (see this
                 // function's own doc comment) -- the jq 1.7.1-verified
