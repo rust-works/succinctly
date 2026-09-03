@@ -848,6 +848,12 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         // shape needs more design work than a single recursive call, so it's
         // tracked separately rather than folded into this fix.
         Expr::Array(inner) => needs_path_context(inner),
+        // `getpath([key])` (#2253): same reasoning as `IndexExpr`'s `key`
+        // below -- without this arm, a `key`/`parent`/`file_index` reachable
+        // only through `getpath`'s own path argument (not downstream of it)
+        // would route the whole pipe through the plain evaluator, missing
+        // path context entirely rather than just reporting a stale position.
+        Expr::Builtin(Builtin::GetPath(path_expr)) => needs_path_context(path_expr),
         Expr::IndexExpr { target, key } => needs_path_context(target) || needs_path_context(key),
         Expr::SliceExpr { target, start, end } => {
             needs_path_context(target)
@@ -31448,6 +31454,127 @@ fn eval_index_expr_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemanti
     }
 }
 
+/// `Builtin::GetPath`'s path-context arm (#2253): reproduces
+/// [`getpath_walk_owned`]'s value semantics exactly (that function is called
+/// unchanged, not reimplemented) while additionally extending `current_path`
+/// -- the piece the generic `Expr::Builtin(_)` catch-all this replaces has no
+/// notion of at all, which let `key`/`parent`/`path`/`file_index` downstream
+/// of a `getpath(...)` silently see a stale, unchanged position regardless of
+/// whether the requested key existed.
+///
+/// `new_path` is the resolved path argument *verbatim*, not `current_path`
+/// extended by it: live-verified against *real jq 1.7.1* that
+/// `path(getpath(...))` always answers the argument array exactly,
+/// discarding whatever ambient position `path()` was itself called from
+/// (`{"x":{"y":{"a":1}}} | .x.y | path(getpath(["a"]))` is `["a"]`, not
+/// `["x","y","a"]`) -- `getpath` is a primitive jq's own path-tracking
+/// recognizes natively, unlike `.a.b`-style navigation, which derives its
+/// path by accumulation. `key`/`parent`/`file_index` (no jq oracle, but
+/// defined to agree with real jq's `path()` answer wherever one exists,
+/// same principle #2213 already established) follow suit for internal
+/// consistency. Note this is *real* jq's own `path()`, not succinctly's own
+/// `path()` builtin (a separate walker, `walk_path`/`navigate_static_
+/// component`) -- that one has its own, pre-existing, unrelated divergence
+/// here (#2257).
+///
+/// One known, deliberately unmatched gap: a slice-descriptor segment inside
+/// the path array (`getpath([{"start":1,"end":3}])`, the shape
+/// `path(.[1:3])` itself produces) computes its *value* successfully in both
+/// jq and here, but real jq's own `path(getpath([...]))` raises `Cannot
+/// index array with object` for that same segment -- `path()` apparently
+/// re-derives the argument step-by-step for at least this shape rather than
+/// truly echoing it verbatim, and that internal re-derivation doesn't
+/// recognize a slice descriptor the way direct `.[1:3]` syntax does. This
+/// implementation still reports the descriptor verbatim rather than
+/// reproducing that error, since jq's own inconsistency here (value
+/// succeeds, `path()` doesn't) has no clean single answer to copy and the
+/// shape is rare in practice (a slice descriptor is something `path(.[a:b])`
+/// produces, not something a caller usually writes by hand into `getpath`'s
+/// argument).
+///
+/// One ambient `optional` throughout, unlike
+/// [`eval_index_expr_with_path_context`]'s `bracket_optional`/
+/// `rest_optional` split -- that split exists only for bracket syntax's own
+/// #1410 carve-out (`?` on `.foo[key]` guards the final index step alone,
+/// never the key sub-expression). `getpath(...)` is an ordinary builtin
+/// call, not bracket syntax, so ordinary `?` semantics apply uniformly: the
+/// same `optional` gates the path argument's own evaluation (matching
+/// `fanout_arg`'s identical `eval_single::<W, S>(arg_expr, value.clone(),
+/// optional)` call for the plain evaluator's own `builtin_getpath`), the
+/// walk's own type-mismatch errors, and `rest`'s continuation.
+fn eval_getpath_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    path_expr: &Expr,
+    rest: &[Expr],
+    value: &OwnedValue,
+    root: &OwnedValue,
+    file_origin: Option<&[usize]>,
+    current_path: &[OwnedValue],
+    optional: bool,
+) -> QueryResult<'a, W> {
+    let path_result = eval_expr_needing_path_context::<W, S>(
+        path_expr,
+        value,
+        root,
+        file_origin,
+        current_path,
+        optional,
+    );
+    let (paths, pending_halt): (Vec<OwnedValue>, Option<i32>) =
+        match drain_path_context_stream(path_result) {
+            (_, Some(Control::Error(e))) => return QueryResult::Error(e),
+            (_, Some(Control::Break(label))) => return QueryResult::Break(label),
+            // #791: paths already yielded before a halt still owe output.
+            (vs, Some(Control::Halt(code))) => (vs, Some(code)),
+            (vs, None) => (vs, None),
+        };
+    if paths.is_empty() {
+        return match pending_halt {
+            Some(code) => partial(Vec::new(), Control::Halt(code)),
+            None => QueryResult::None,
+        };
+    }
+
+    let mut results: Vec<OwnedValue> = Vec::new();
+    for p in paths {
+        // `getpath_walk_owned` owns both the "must be an array"
+        // (`path_must_be_array`) check and the walk itself, so a
+        // non-array `p` reaches `Error`/`None` there without this loop
+        // needing its own copy of that check.
+        match getpath_walk_owned::<W, S>(value, p.clone(), optional) {
+            QueryResult::Owned(v) => {
+                let OwnedValue::Array(new_path) = p else {
+                    unreachable!(
+                        "getpath_walk_owned only reaches Owned once its own \
+                         path_must_be_array check has already confirmed `p` \
+                         is an array"
+                    )
+                };
+                let step = eval_pipe_with_path_context_internal::<W, S>(
+                    rest,
+                    &v,
+                    root,
+                    file_origin,
+                    &new_path,
+                    optional,
+                );
+                if let Some(stop) = accumulate_path_context_step(&mut results, step) {
+                    return stop;
+                }
+            }
+            QueryResult::None => {}
+            QueryResult::Error(e) => {
+                return partial(core::mem::take(&mut results), Control::Error(e));
+            }
+            _ => unreachable!("getpath_walk_owned only ever produces Owned/None/Error"),
+        }
+    }
+
+    match pending_halt {
+        Some(code) => partial(results, Control::Halt(code)),
+        None => owned_vec_to_result(results),
+    }
+}
+
 /// One resolved slice bound: its raw value (as `key`/`parent` etc. would
 /// see it) paired with the rounded `i64` [`slice_owned_value_read`] actually
 /// indexes with. Distinct from [`ResolvedSliceBound`] (`(Option<i64>,
@@ -32641,6 +32768,18 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 optional,
             )
         }
+        // #2253: needs its own arm rather than falling to the generic
+        // `Expr::Builtin(_)` catch-all below, which evaluates via the plain
+        // evaluator and resumes `rest` at the unchanged `current_path`.
+        Expr::Builtin(Builtin::GetPath(path_expr)) => eval_getpath_with_path_context::<W, S>(
+            path_expr,
+            rest,
+            value,
+            root,
+            file_origin,
+            current_path,
+            optional,
+        ),
         Expr::Builtin(_) => {
             // Handle other builtins that don't need special path handling.
             // `first` already *is* this `Expr::Builtin`, so evaluate it

@@ -8971,6 +8971,132 @@ fn test_optional_index_key_error_escapes_path_context_1410() -> Result<()> {
     Ok(())
 }
 
+/// `Builtin::GetPath` (#2253) must extend `current_path` for a downstream
+/// `key`/`parent`/`path`, not resume `rest` at the unchanged ambient
+/// position the way the generic `Expr::Builtin(_)` catch-all did.
+///
+/// The reported path is the resolved argument *verbatim*, not
+/// `current_path` extended by it -- matches real jq 1.7.1's own
+/// `path(getpath(...))`, which discards whatever ambient position `path()`
+/// was itself called from.
+#[test]
+fn test_getpath_extends_path_context_2253() -> Result<()> {
+    let input = r#"{"a":{"x":1}}"#;
+
+    // The issue's own repro: a missing key inside getpath's target.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | getpath([\"zz\"]) | key"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "\"zz\"\n");
+
+    // A *found* key had the identical bug -- unconditional, not gated on
+    // found-vs-missing, unlike #2213's Field/Index fix.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | getpath([\"x\"]) | key"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "\"x\"\n");
+
+    // `parent` is consistent with the verbatim-path rule (real jq 1.7.1's
+    // own `path(getpath(...))` discards the ambient prefix, per this
+    // function's own doc comment -- not succinctly's `path()` builtin,
+    // which has a separate, pre-existing divergence here unrelated to this
+    // fix, see #2257): one level up from `["zz"]` is the root, not `.a`.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | getpath([\"zz\"]) | parent"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "{\"a\":{\"x\":1}}\n");
+
+    Ok(())
+}
+
+/// #2253's fix across the shapes `getpath_walk_owned` itself already
+/// handled correctly for *value* computation, now also verified for the
+/// *path* it reports to `key` -- multi-output path generators, negative and
+/// slice-descriptor segments, indexing through `null`, and both directions
+/// of `?` (path-argument errors and walk-time type errors).
+#[test]
+fn test_getpath_path_context_matches_path_builtin_2253() -> Result<()> {
+    // A generator path argument fans out into independent outputs, each
+    // with its own verbatim path.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "[getpath(([\"a\"],[\"b\"])) | key]"],
+        Some(r#"{"a":1,"b":2}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[\"a\",\"b\"]\n");
+
+    // Indexing through `null` mid-walk is "not an error, propagate null"
+    // (#2213's own rule), same as a missing key.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | getpath([\"zz\"]) | key"],
+        Some(r#"{"a":null}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "\"zz\"\n");
+
+    // A slice-descriptor path segment reports the descriptor itself as
+    // `key`'s answer -- matches `path(.[1:3])`'s own last-component shape.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "getpath([{\"start\":1,\"end\":3}]) | key"],
+        Some("[1,2,3,4]"),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "{\"start\":1,\"end\":3}\n");
+
+    // A non-array path argument is `optional`-suppressed like any other
+    // error reachable from this arm.
+    let (stdout, _, code) = run_jq_full(&["-c", ".a | (getpath(1))? | key"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "");
+
+    // The same shape without `?` still raises.
+    let (_, stderr, code) = run_jq_full(&["-c", ".a | getpath(1) | key"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 5);
+    assert!(
+        stderr.contains("Path must be specified as an array"),
+        "{stderr}"
+    );
+
+    // A genuine walk-time type error (indexing a number) is
+    // `optional`-suppressed the same way.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | (getpath([\"b\"]))? | key"],
+        Some(r#"{"a":5}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "");
+
+    // The same shape without `?` still raises.
+    let (_, stderr, code) =
+        run_jq_full(&["-c", ".a | getpath([\"b\"]) | key"], Some(r#"{"a":5}"#))?;
+    assert_eq!(code, 5);
+    assert!(
+        stderr.contains("Cannot index number with string"),
+        "{stderr}"
+    );
+
+    Ok(())
+}
+
+/// #2253's escape-priority ordering across a multi-output path generator:
+/// an earlier branch's output survives a later branch's error/halt, same
+/// rule `eval_index_expr_with_path_context`'s own per-key loop (#2100)
+/// already established for a computed bracket's own key generator.
+#[test]
+fn test_getpath_path_context_escape_priority_2253() -> Result<()> {
+    // First branch resolves and is printed; second branch's own walk-time
+    // type error escapes with that prefix intact rather than discarding it.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "getpath(([\"a\"], [\"b\",\"y\"])) | key"],
+        Some(r#"{"a":1,"b":5}"#),
+    )?;
+    assert_eq!(code, 5, "stderr: {stderr}");
+    assert_eq!(stdout, "\"a\"\n");
+    assert!(
+        stderr.contains("Cannot index number with string"),
+        "{stderr}"
+    );
+
+    Ok(())
+}
+
 /// A computed bracket (`Expr::IndexExpr`/`Expr::SliceExpr`) must extend
 /// `current_path` the same way a literal `.foo`/`.[0]` does, so `key`/
 /// `parent`/`path` downstream (and inside the bracket's own key/bounds
