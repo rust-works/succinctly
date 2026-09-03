@@ -3805,6 +3805,47 @@ described:
   jq's own hang, as ADR-0018 does not require — is the worse failure mode
   for the realistic inputs this magnitude range covers).
 
+### `--argjson`/`--jsonargs` still reject a bare trailing decimal point with no exponent (`1.`) — accepted divergence, ADR-0018 rule 4c (#2240)
+
+Real jq's own number reader accepts a bare trailing `.` with nothing after it at all,
+treating it the same as if the dot weren't there:
+
+```console
+$ jq -n --argjson x '1.' '$x'
+1
+$ succinctly jq -n --argjson x '1.' '$x'
+Error: Invalid JSON for --argjson x
+```
+
+#2240 fixed `--argjson`/`--jsonargs` to accept the *other* two number leniencies real jq's
+own parser tolerates that strict RFC 8259 doesn't — a leading decimal point (`.5`, #1171)
+and a trailing decimal point immediately *before an exponent marker* (`1.e5`, #2220) — but
+deliberately not this third, narrower shape. Accepting it would route the literal through
+`OwnedValue::from_number_bytes`/`StandardJson::number_literal()`'s shared, pre-existing
+large-integer-precision gap: a bare trailing dot with no exponent on an integer too large
+for `f64` to represent exactly materializes as the wrong integer regardless of entry point
+(confirmed live via plain document input, unrelated to `--argjson`):
+
+```console
+$ jq -c '.' <<< '99999999999999999.'
+99999999999999999
+$ succinctly jq -c '.' <<< '99999999999999999.'
+100000000000000000
+```
+
+`from_number_bytes`'s own doc comment already documents this trade-off for the *general*
+(non-`--argjson`) case as deliberate, reasoning that real jq doesn't preserve this exact
+spelling either (`[1.] -> [1]` on both sides) — true only for a small value where the lossy
+`f64` round-trip happens to be lossless, not for a large one. Extending `--argjson`'s own
+acceptance to this shape would mean trading a clean rejection (the pre-#2240 status quo)
+for a value that's silently wrong rather than absent, for the one case where the
+underlying gap actually bites. Per ADR-0018 rule 4c: matching real jq's own acceptance here
+would risk corrupting data, the worse failure mode for the input shapes this actually
+covers — so `--argjson x '1.'` stays a clean, catchable error rather than a silent
+magnitude error, a narrower divergence from real jq than #2240's own issue text first
+scoped this fix to. Fixing the underlying large-integer-precision gap itself (so `1.` could
+be accepted safely at every magnitude) is out of scope for #2240 and not separately filed.
+
 ## Provenance
 
 | Artifact           | Path                                                                                                       |
