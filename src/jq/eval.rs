@@ -16100,15 +16100,17 @@ pub(crate) fn index_one_owned(
 /// whose factors (its own multiple input lists) are still fixed for the
 /// whole call, unlike a per-key target's.
 ///
-/// `keys`/`ts`/`starts`/`ends`/`target_branches` are each already-
-/// materialized `Vec`s by the time any of the former call sites ran, so
-/// unlike #1612's `s.len() * n` (a single scalar read straight from the
-/// document), there is no cheap, portable way to force `try_reserve_
-/// exact`'s own failure path in an end-to-end test without exhausting
-/// real memory first -- this function's own unit tests instead call it
-/// directly with synthetic large factors, bypassing the (expensive or
-/// outright infeasible) generator materialization a live repro of
-/// comparable scale would need.
+/// `cartesian_product`'s own `lens` (each input array's already-known
+/// length) -- and every one of the former call sites' `keys`/`ts`/
+/// `starts`/`ends`/`target_branches` before them -- are already-
+/// materialized `Vec`s by the time any caller runs, so unlike #1612's
+/// `s.len() * n` (a single scalar read straight from the document), there
+/// is no cheap, portable way to force `try_reserve_exact`'s own failure
+/// path in an end-to-end test without exhausting real memory first --
+/// this function's own unit tests instead call it directly with
+/// synthetic large factors, bypassing the (expensive or outright
+/// infeasible) generator materialization a live repro of comparable
+/// scale would need.
 ///
 /// Every factor is checked in plain `usize` via a `checked_mul` chain,
 /// with an upfront short-circuit for a zero factor. Widening to `u128`
@@ -24984,20 +24986,26 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
     // once-for-all-keys evaluation only wrote `12`.
     //
     // The two structural "is this target trackable" checks (#843/#986)
-    // still only need to fire once -- `target`'s trackability is a
-    // property of its own AST shape plus the ambient `trackable`/`keep`
-    // context, not of any particular key or of `target`'s resolved
-    // *value*, so re-evaluating `target` for a later key can't change the
-    // verdict the first key's resolution already established. They're
-    // gated on the first key's own resolution (not run unconditionally
-    // before the loop the way the old once-for-all-keys code could)
-    // because `target` may not be side-effect-free to resolve at all
-    // (#2234 made `stderr`/`debug` trackable passthroughs) -- checking
-    // once inline, using the exact `branches` that key's own indexing will
-    // go on to use, avoids resolving `target` a second, redundant time for
-    // that key just to run the check.
+    // run on *every* key's own freshly-resolved `branches`, not just the
+    // first (review finding): `target`'s trackability is NOT purely a
+    // function of its own static AST shape whenever that AST contains a
+    // runtime branch (`if`/`select`/`try`-`catch`) whose taken arm can
+    // differ per call -- and it can differ per call precisely because
+    // `target` is now genuinely re-evaluated per key (the very thing this
+    // fix exists to do), so a stateful condition (`input`, ...) can steer
+    // an earlier key into a trackable arm and a later key into an
+    // untracked one. Checking only the first key's resolution and
+    // latching a "trackable, don't check again" verdict let a later key's
+    // genuinely untracked branch through unchecked -- confirmed live as a
+    // real data-corruption bug in this fix's own first draft: an `if`
+    // target reading a fresh `input` per key, trackable on key 1
+    // (`getpath(...)`) and untracked on key 2 (`(1|{"c":10})`), wrote
+    // straight through key 2's untracked branch into the live document
+    // instead of raising jq's "Invalid path expression" the way real jq
+    // does. Re-running the check every key costs nothing extra to
+    // *resolve* -- `branches` is already recomputed fresh each iteration
+    // regardless -- only a few more comparisons.
     let mut target_escape: Option<EvalEscape> = None;
-    let mut checked_trackability = false;
     let mut out: Vec<PathBranch<'a>> = Vec::new();
 
     // The shared exit every escape arm below funnels through, so folding
@@ -25010,7 +25018,7 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
         };
     }
 
-    'outer: for k in &keys {
+    for k in &keys {
         // Keeps `target`'s own partial prefix too, not just `key`'s (#896
         // review): `target` can itself be one of #896's 4 fixed sites
         // (`select`, `if`, `getpath`, a nested computed index), so its own
@@ -25037,50 +25045,51 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
             Err((prefix, e)) => (prefix, Some(e)),
         };
 
-        if !checked_trackability {
-            checked_trackability = true;
-            // #843: `target` can also resolve successfully with
-            // `trackable: false` through `Builtin::GetPath`'s own
-            // deliberate exemption (real jq lets `getpath(P)` navigate an
-            // untracked value, matching how a literal path argument is
-            // trusted regardless of provenance) — but that exemption is
-            // narrowly for `getpath`'s *own* indexing, not a certificate
-            // of trackability for whatever comes after it. Without this
-            // check, `catch (getpath(["other"])[0]) = "HACKED"` silently
-            // wrote into the real document instead of raising "near
-            // attempt to access element 0 of [...]" the way jq does —
-            // found in review.
-            if !trackable {
-                if let Some(PathBranch {
-                    value: first_value, ..
-                }) = branches.first()
-                {
-                    escape!(
-                        EvalError::invalid_path_expression_near_access(&keys[0], first_value)
-                            .into()
-                    );
-                }
-            }
-            // #986: the same check, for a `target` that resolved fine but
-            // is itself untracked — `(1 | .) [K]`, where the pipe's own
-            // literal deferred here rather than raising. `trackable` above
-            // is the *caller's* context; this is the target's own. Both
-            // produce jq's "near attempt" wording, naming the first key as
-            // the navigation that failed.
+        // #843: `target` can also resolve successfully with `trackable:
+        // false` through `Builtin::GetPath`'s own deliberate exemption
+        // (real jq lets `getpath(P)` navigate an untracked value, matching
+        // how a literal path argument is trusted regardless of
+        // provenance) — but that exemption is narrowly for `getpath`'s
+        // *own* indexing, not a certificate of trackability for whatever
+        // comes after it. Without this check, `catch (getpath(["other"])
+        // [0]) = "HACKED"` silently wrote into the real document instead
+        // of raising "near attempt to access element 0 of [...]" the way
+        // jq does — found in review. Named after `k`, this key's own
+        // value, not a fixed `keys[0]` — jq's own error names whichever
+        // key was actually being navigated when the untracked branch was
+        // reached.
+        if !trackable {
             if let Some(PathBranch {
                 value: first_value, ..
-            }) = branches.iter().find(|b| !b.trackable)
+            }) = branches.first()
             {
-                escape!(
-                    EvalError::invalid_path_expression_near_access(&keys[0], first_value).into()
-                );
+                escape!(EvalError::invalid_path_expression_near_access(k, first_value).into());
             }
+        }
+        // #986: the same check, for a `target` that resolved fine but is
+        // itself untracked — `(1 | .) [K]`, where the pipe's own literal
+        // deferred here rather than raising. `trackable` above is the
+        // *caller's* context; this is the target's own. Both produce jq's
+        // "near attempt" wording, naming this key as the navigation that
+        // failed.
+        if let Some(PathBranch {
+            value: first_value, ..
+        }) = branches.iter().find(|b| !b.trackable)
+        {
+            escape!(EvalError::invalid_path_expression_near_access(k, first_value).into());
         }
 
         // Reserved once per key, ahead of that key's own indexing loop,
         // rather than once for the whole `keys x target` product up front
         // -- `target`'s own length can vary per key now (#2139, mirroring
-        // `eval_index_expr`'s identical #2032 change).
+        // `eval_index_expr`'s identical #2032 change). Unlike the old
+        // upfront reservation (guaranteed to fire before `out` held
+        // anything, so its own `Err` prefix was always empty by
+        // construction), a failure here can land on any key after the
+        // first, with `out` already holding every earlier key's output --
+        // `escape!` folds that non-empty prefix in rather than discarding
+        // it, consistent with every other mid-loop failure in this
+        // function.
         if out.try_reserve(branches.len()).is_err() {
             escape!(cannot_reserve_cross_product(&[branches.len()]).into());
         }
@@ -25173,7 +25182,7 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
         // jq's generator never reaches.
         if let Some(control) = this_escape {
             target_escape = Some(control);
-            break 'outer;
+            break;
         }
     }
     // `target_escape` first: see the comment above for why jq's evaluation
@@ -50797,7 +50806,7 @@ mod tests {
     /// live repro of comparable scale would need (see the doc comment on
     /// `try_reserve_product_labeled` itself for why).
     #[test]
-    fn test_try_reserve_product_refuses_usize_overflow_1634() {
+    fn test_try_reserve_product_labeled_refuses_usize_overflow_1634() {
         // `usize::MAX * 2` (widened to `u128` first) doesn't fit back into
         // `usize` at all.
         let result: Result<Vec<OwnedValue>, EvalError> =
@@ -50813,7 +50822,7 @@ mod tests {
     /// succeeded, so it needs its own case distinct from the outright
     /// `usize`-overflow one above.
     #[test]
-    fn test_try_reserve_product_refuses_isize_byte_overflow_1634() {
+    fn test_try_reserve_product_labeled_refuses_isize_byte_overflow_1634() {
         // `usize::MAX / 4`, not a hardcoded 64-bit-only literal (this
         // crate has existing `target_pointer_width = "64"` gates
         // elsewhere, e.g. `trees/bp.rs`/`bits/select.rs`, so 32-bit
@@ -50837,7 +50846,8 @@ mod tests {
     /// back down. Also exercises 3 factors, the `path()`-position slice
     /// sites' own arity.
     #[test]
-    fn test_try_reserve_product_zero_factor_short_circuits_even_after_an_overflowing_pair_1634() {
+    fn test_try_reserve_product_labeled_zero_factor_short_circuits_even_after_an_overflowing_pair_1634(
+    ) {
         let out: Vec<OwnedValue> =
             try_reserve_product_labeled(&[usize::MAX, 2, 0], cannot_reserve_cross_product)
                 .expect("a true product of 0 must succeed regardless of factor order");
@@ -50849,7 +50859,7 @@ mod tests {
     /// and reserves the exact requested capacity, matching what
     /// `Vec::with_capacity` itself would have done before this fix.
     #[test]
-    fn test_try_reserve_product_succeeds_for_ordinary_sizes_1634() {
+    fn test_try_reserve_product_labeled_succeeds_for_ordinary_sizes_1634() {
         let out: Vec<OwnedValue> =
             try_reserve_product_labeled(&[10, 20], cannot_reserve_cross_product)
                 .expect("a 10*20 product must not refuse");

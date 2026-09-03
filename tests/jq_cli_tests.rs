@@ -13383,6 +13383,40 @@ fn test_resolve_index_expr_reevaluates_target_per_key_2139() -> Result<()> {
     Ok(())
 }
 
+/// #2139 (found in this fix's own review): the #843/#986 "is target
+/// trackable" checks must run on *every* key's own freshly-resolved
+/// branches, not just the first -- a first draft of this fix latched a
+/// "trackable, don't check again" verdict off the first key's resolution,
+/// on the mistaken assumption that trackability is purely a function of
+/// `target`'s static AST shape. It isn't, whenever that AST contains a
+/// runtime branch (here, `if`) whose taken arm depends on state that
+/// genuinely differs per key (`input`, read once per key by design, #2139's
+/// whole point): an earlier key landing on a trackable arm must not
+/// exempt a later key that lands on an untracked one. Verified live
+/// against jq 1.7.1: the untracked branch on the second key must still
+/// raise "Invalid path expression", not silently write into the document.
+#[test]
+fn test_resolve_index_expr_checks_trackability_every_key_2139() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-nc",
+            r#"{"a":1,"b":2} | ((if (input) then empty else ({"x":1}|.) end)[("a","b")] = "HACKED")"#,
+        ],
+        Some("true\nfalse\n"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stdout.is_empty(),
+        "document must not be written: {stdout:?}"
+    );
+    assert!(
+        stderr.contains("Invalid path expression"),
+        "stderr: {stderr:?}"
+    );
+
+    Ok(())
+}
+
 /// #972 Guard A: the exact shape that got PR #985 reverted for silent data
 /// corruption on the write side. Before the Stage 1 precursor fix above,
 /// `resolve_index_expr`'s untruncated `Err` prefix for

@@ -22,12 +22,12 @@
 # `#[allow(clippy::disallowed_methods)]` at that one call site with a
 # comment, the same way `vec_with_capacity`'s own definition is.
 disallowed-methods = [
-    { path = "alloc::vec::Vec::with_capacity", reason = "use vec_with_capacity (single length) or try_reserve_product (a product of lengths) -- see #1670" },
+    { path = "alloc::vec::Vec::with_capacity", reason = "use vec_with_capacity (single length), try_reserve_product_labeled (a product of lengths fixed for the whole call), or a per-item Vec::try_reserve inside the loop (a product where one factor varies per outer iteration) -- see #1670" },
     { path = "alloc::string::String::with_capacity", reason = "use string_with_capacity (single length) -- a product-sized String::with_capacity is the same #1670 bug shape as Vec's" },
     { path = "alloc::vec::Vec::resize", reason = "infallible -- #1017's own panic site was here, not with_capacity; reserve capacity fallibly (try_reserve/try_reserve_exact) first, then resize, and allow this call site -- see #1670" },
     { path = "alloc::vec::Vec::resize_with", reason = "same #1670 reasoning as Vec::resize" },
-    { path = "alloc::vec::Vec::reserve", reason = "infallible -- use try_reserve, or try_reserve_product for a product of lengths -- see #1670" },
-    { path = "alloc::vec::Vec::reserve_exact", reason = "infallible -- use try_reserve_exact, or try_reserve_product for a product of lengths -- see #1670" },
+    { path = "alloc::vec::Vec::reserve", reason = "infallible -- use try_reserve, or try_reserve_product_labeled for a product of lengths fixed for the whole call -- see #1670" },
+    { path = "alloc::vec::Vec::reserve_exact", reason = "infallible -- use try_reserve_exact, or try_reserve_product_labeled for a product of lengths fixed for the whole call -- see #1670" },
     { path = "alloc::string::String::reserve", reason = "infallible -- use try_reserve -- see #1670" },
     { path = "alloc::string::String::reserve_exact", reason = "infallible -- use try_reserve_exact -- see #1670" },
 ]
