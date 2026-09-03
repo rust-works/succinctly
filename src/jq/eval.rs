@@ -10773,10 +10773,24 @@ fn eval_format<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // raise, not silently format `""` (or a container holding `""` for a
     // nested field). Every `@format` function shares this single
     // materialization point via `format_owned`.
-    let owned = match to_owned(&value) {
-        Ok(v) => v,
-        Err(e) => return e.into(),
-    };
+    //
+    // #2280: to_owned_or_suppress!, not a bare `to_owned` match -- `optional`
+    // is a live parameter of this function (passed on to `format_owned`
+    // below), so ignoring it here was a real asymmetry across every
+    // `@format` builtin (`@json`, `@csv`, `@tsv`, `@dsv`, `@uri`, `@html`,
+    // `@base64`, `@sh`, `@yaml`, `@props`, `@text`), not just one site.
+    //
+    // Like #2231's own findings 1-3, this is defensive rather than a live
+    // behavior change today: #2286 tagged every one of `to_owned_at_depth`'s
+    // error paths (string decode failure, #1194 malformed member/delimiter)
+    // `is_decode_failure()`, and `suppresses(e, optional) = optional &&
+    // !e.is_decode_failure()` is unconditionally `false` for all of them
+    // regardless of `optional` -- verified live, see
+    // `test_optional_ignored_sites_2280` below. Still correct to fix: this
+    // macro also propagates a genuine decode failure unchanged, and a
+    // future error class routed through `to_owned` here would otherwise
+    // silently inherit the same asymmetry #2231 already fixed elsewhere.
+    let owned = to_owned_or_suppress!(&value, optional);
     match format_owned::<S>(format_type, &owned, optional) {
         Ok(s) => QueryResult::Owned(OwnedValue::String(s)),
         Err(e) => e.into(),
