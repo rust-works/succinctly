@@ -537,7 +537,7 @@ fn type_name<W>(value: &StandardJson<'_, W>) -> &'static str {
 /// exclusively by an already-owned or reindexed document, where no
 /// undecodable borrowed string can exist. `to_owned_for_error_message` was
 /// considered and rejected as the name: roughly a third of the call sites
-/// (`QueryResult::collect_owned`, `push_owned_values`, `Item::into_owned`,
+/// (`QueryResult::collect_owned`, `push_owned_values`, `Item::into_owned_lossy`,
 /// the `Partial` folds) are not error-message contexts at all, and a name
 /// that is a lie at a third of its sites is worse than one that simply
 /// names the hazard.
@@ -2401,7 +2401,7 @@ where
         // #1746-shaped bug, in this lazy sink specifically). Same
         // flush-then-stop shape as `body`'s own escape below -- a buffered
         // first result must be flushed ahead of this control too.
-        let owned = match item.into_owned_checked() {
+        let owned = match item.into_owned() {
             Ok(v) => v,
             Err(e) => {
                 if let Some(previous) = pending_first.take() {
@@ -2649,10 +2649,10 @@ fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// conversions, which immediately classify the result as Int/Float-vs-error
 /// via `range_num` and never inspect a decoded string's actual bytes (#2023
 /// audit). Every other caller that reads the decoded value as real data was
-/// migrated to [`Item::into_owned_checked`] by #2023 (`fanout_arg`'s and
+/// migrated to [`Item::into_owned`] by #2023 (`fanout_arg`'s and
 /// `fanout_two_args_lazy`'s own generator-argument sinks -- this function's
 /// prior callers). A new caller that reads string content must use
-/// `into_owned_checked` instead, not this function.
+/// `Item::into_owned` instead, not this function.
 fn item_to_owned<W: Clone + AsRef<[u64]>>(item: Item<'_, W>) -> OwnedValue {
     match item {
         Item::Owned(v) => v,
@@ -2669,7 +2669,7 @@ fn checked_or_stop<W: Clone + AsRef<[u64]>>(
     item: Item<'_, W>,
     escape: &mut Option<Control>,
 ) -> Result<OwnedValue, Demand> {
-    match item.into_owned_checked() {
+    match item.into_owned() {
         Ok(v) => Ok(v),
         Err(e) => {
             *escape = Some(Control::Error(e));
@@ -3254,7 +3254,13 @@ enum Item<'a, W = Vec<u64>> {
 impl<W: Clone + AsRef<[u64]>> Item<'_, W> {
     /// Materialize, for the owned-surface bridge ([`eval_each_owned`]) and for
     /// consumers that were going to `to_owned_lossy` anyway.
-    fn into_owned(self) -> OwnedValue {
+    ///
+    /// #2196: named `_lossy`, not bare `into_owned`, mirroring #1989's own
+    /// `to_owned`/`to_owned_lossy` rename -- the hazard this documents (a
+    /// silent `""` substitution for an undecodable borrowed string) is the
+    /// same one that rename exists to name at every call site, not hide
+    /// behind the unmarked default spelling.
+    fn into_owned_lossy(self) -> OwnedValue {
         match self {
             Item::Borrowed(v) => to_owned_lossy(&v),
             Item::Owned(v) => v,
@@ -3269,45 +3275,50 @@ impl<W: Clone + AsRef<[u64]>> Item<'_, W> {
     /// one `sink(...)` call in its producer's whole body, all three passing
     /// `Item::Owned`: [`binary_fanout_core`] (from `binary_fanout_each`, whose
     /// only push is `combine`'s own result -- the *operands* are separately
-    /// routed through [`Self::into_owned_checked`] by `checked_fanout_operand`,
+    /// routed through [`Self::into_owned`] by `checked_fanout_operand`,
     /// #1972), [`builtin_paths_filter`] (from `each_paths_filter`, whose only
     /// push is a path array built over an already-[`to_owned_checked`]
     /// document, #1829), and [`builtin_inputs`] (from `each_inputs`, whose only
-    /// push is a queued `OwnedValue`). Neither [`Self::into_owned`] nor
-    /// [`Self::into_owned_checked`] can therefore differ observably at any of
+    /// push is a queued `OwnedValue`). Neither [`Self::into_owned_lossy`] nor
+    /// [`Self::into_owned`] can therefore differ observably at any of
     /// them.
     ///
-    /// Spelled as its own method rather than a bare [`Self::into_owned`] for
-    /// two reasons. #2025 was filed against exactly these three sites on the
-    /// theory that they were unchecked materializations of document-sourced
-    /// strings, and closed only after the sink protocol above was re-derived by
-    /// hand; a classification pass that greps for the call *shape* (#1989) has
-    /// no way to see that argument otherwise, so the name carries it. And if a
-    /// producer ever starts pushing `Item::Borrowed` into one of these sinks,
-    /// the debug assertion fails in CI's debug test run rather than silently
-    /// substituting `""` for an undecodable string -- #1746's bug shape, which
-    /// is precisely what this would become.
+    /// Spelled as its own method rather than a bare [`Self::into_owned_lossy`]
+    /// for two reasons. #2025 was filed against exactly these three sites on
+    /// the theory that they were unchecked materializations of
+    /// document-sourced strings, and closed only after the sink protocol
+    /// above was re-derived by hand; a classification pass that greps for
+    /// the call *shape* (#1989) has no way to see that argument otherwise,
+    /// so the name carries it. And if a producer ever starts pushing
+    /// `Item::Borrowed` into one of these sinks, the debug assertion fails
+    /// in CI's debug test run rather than silently substituting `""` for an
+    /// undecodable string -- #1746's bug shape, which is precisely what this
+    /// would become.
     ///
-    /// Release behaviour is [`Self::into_owned`]'s, unchanged: the assertion
-    /// documents and guards an invariant, it does not add a new failure mode to
-    /// a path that has none today.
+    /// Release behaviour is [`Self::into_owned_lossy`]'s, unchanged: the
+    /// assertion documents and guards an invariant, it does not add a new
+    /// failure mode to a path that has none today.
     fn into_owned_from_owned_producer(self) -> OwnedValue {
         debug_assert!(
             matches!(self, Item::Owned(_)),
             "a producer pushed Item::Borrowed into a sink whose protocol is \
              owned-only; see Item::into_owned_from_owned_producer (#2025)"
         );
-        self.into_owned()
+        self.into_owned_lossy()
     }
 
-    /// Fallible twin of [`Self::into_owned`], raising
+    /// Fallible twin of [`Self::into_owned_lossy`], raising
     /// [`EvalError::decode_failure`] on an undecodable borrowed string
     /// instead of silently substituting `""` (#1972) -- used where the
     /// caller already has somewhere to route the error (`binary_fanout_each`
     /// routes it exactly like `combine`'s own error), unlike the many other
-    /// [`Self::into_owned`] call sites that predate this fix and remain
-    /// unchecked.
-    fn into_owned_checked(self) -> Result<OwnedValue, EvalError> {
+    /// [`Self::into_owned_lossy`] call sites that predate this fix and
+    /// remain unchecked.
+    ///
+    /// #2196: named bare `into_owned`, not `_checked` -- mirroring #1989's
+    /// own rename, the checked form is this file's unmarked default now,
+    /// not the exception that needs flagging.
+    fn into_owned(self) -> Result<OwnedValue, EvalError> {
         match self {
             Item::Borrowed(v) => to_owned(&v),
             Item::Owned(v) => Ok(v),
@@ -4637,7 +4648,7 @@ fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// The all-`Borrowed` fast path defers decoding rather than doing any
 /// itself, so there's nothing to check yet there -- the eventual consumer,
 /// e.g. [`push_owned_values_checked`], is what raises. But the mixed/owned
-/// branch used to convert every item through bare [`Item::into_owned`]
+/// branch used to convert every item through bare [`Item::into_owned_lossy`]
 /// unconditionally, silently substituting `""` for an undecodable item
 /// instead of raising (#2024 code review) -- the #1746-shaped bug one layer
 /// upstream of [`limit_with_n`]'s own fix, its sole production caller:
@@ -4668,7 +4679,7 @@ fn items_to_result_checked<'a, W: Clone + AsRef<[u64]>>(
     }
     let mut out = vec_with_capacity(items.len());
     for item in items {
-        match item.into_owned_checked() {
+        match item.into_owned() {
             Ok(v) => out.push(v),
             Err(e) => return partial(out, Control::Error(e)),
         }
@@ -4731,9 +4742,10 @@ fn take_stopping_items_to_result<W: Clone + AsRef<[u64]>>(
         // `control_to_result` this used to spell out inline, so converting
         // unconditionally before the call is just as cheap for the empty
         // case (mapping over nothing) and drops the redundant branch.
-        Flow::Escaped(control) => {
-            partial(items.into_iter().map(Item::into_owned).collect(), control)
-        }
+        Flow::Escaped(control) => partial(
+            items.into_iter().map(Item::into_owned_lossy).collect(),
+            control,
+        ),
         // `_checked`, not the unchecked twin it replaced upstream: an
         // undecodable item must raise rather than silently become "", and a
         // `?//` retry must not be able to launder that (#1820, #1660).
@@ -4881,7 +4893,7 @@ pub(crate) fn eval_each_owned<S: EvalSemantics>(
     let cursor = index.root(json_bytes);
 
     eval_each::<Vec<u64>, S>(expr, cursor.value(), optional, &mut |item| {
-        sink(item.into_owned())
+        sink(item.into_owned_lossy())
     })
 }
 
@@ -5125,7 +5137,7 @@ fn checked_fanout_operand<W: Clone + AsRef<[u64]>>(
     item: Item<'_, W>,
     abort: &mut Option<Flow>,
 ) -> Result<OwnedValue, Demand> {
-    item.into_owned_checked().map_err(|e| {
+    item.into_owned().map_err(|e| {
         *abort = Some(Flow::Escaped(Control::Error(e)));
         Demand::Stop
     })
@@ -12630,8 +12642,15 @@ fn builtin_implode<W: Clone + AsRef<[u64]>>(
             }
             QueryResult::Owned(OwnedValue::String(result))
         }
-        _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::new("implode input must be an array")),
+        // #2196: `scalar_fallback`, mirroring this function's own
+        // element-level arms above (#1989) -- an undecodable top-level
+        // string wasn't reachable when this arm was last touched (there
+        // was no #1755 precedent yet to apply), but a future caller
+        // shouldn't have to rediscover that this arm needs the same
+        // decode-failure-before-`optional` discipline.
+        _ => scalar_fallback(&value, optional, || {
+            EvalError::new("implode input must be an array")
+        }),
     }
 }
 
@@ -30046,7 +30065,7 @@ fn eval_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     let mut out: Vec<OwnedValue> = Vec::new();
     let flow = each_range::<W, S>(from, to, step, value, optional, &mut |item| {
-        out.push(item.into_owned());
+        out.push(item.into_owned_lossy());
         Demand::Continue
     });
 
@@ -40627,7 +40646,15 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // is #1408's own requirement for this builtin, subsumed here rather than
     // dropped: it is the array constructor's answer, not the `x as $x |`
     // zero-fanout "produce nothing" every other builtin in this family gets.
-    let (n_values, trailing) = stream_outputs(eval_single::<W, S>(n_expr, value.clone(), optional));
+    // #2196: `stream_outputs_checked`, not the bare unchecked twin -- the
+    // last document-value-fed `stream_outputs` call site in this file left
+    // over after #1989 converted `fanout_two_args`'s two and
+    // `fanout_regex_pattern_with_collected_flags`'s one. `range_num` below
+    // classifies `n_values` by variant and reports a fixed, content-free
+    // error either way today, but this closes the shape for consistency
+    // before a future change to that message could turn it into a live gap.
+    let (n_values, trailing) =
+        stream_outputs_checked(eval_single::<W, S>(n_expr, value.clone(), optional));
 
     // Array construction drops its prefix when its generator escapes, so a
     // trailing break/error aborts the whole call with no output -- verified
@@ -41147,10 +41174,10 @@ fn builtin_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // Same sink, same trailing-control rule (#820).
             let (taken, flow) = each_take_n::<W, S>(expr, value.clone(), optional, n);
             let satisfied = taken.len() >= n;
-            // #1989: `into_owned_checked`, not `into_owned` -- these values
+            // #1989: `into_owned`, not `into_owned_lossy` -- these values
             // *are* the query's output, so an undecodable string here was
-            // emitted as `""` rather than raising (`Item::into_owned`'s own
-            // doc comment already flags that gap). Parser-unreachable today
+            // emitted as `""` rather than raising (`Item::into_owned_lossy`'s
+            // own doc comment already flags that gap). Parser-unreachable today
             // (#981) but library/`query!`-reachable, which #1972 already
             // established is worth fixing rather than deferring.
             //
@@ -41166,7 +41193,7 @@ fn builtin_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // control against this same `values` accumulator).
             let mut values: Vec<OwnedValue> = vec_with_capacity(taken.len());
             for item in taken {
-                match item.into_owned_checked() {
+                match item.into_owned() {
                     Ok(v) => values.push(v),
                     Err(e) => return partial(values, Control::Error(e)),
                 }
@@ -41306,7 +41333,7 @@ fn builtin_nth_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // decode is checked here rather than deferred.
             let mut owned = vec_with_capacity(items.len());
             for item in items {
-                match item.into_owned_checked() {
+                match item.into_owned() {
                     Ok(v) => owned.push(v),
                     // #1519: a decode failure past an already-kept prefix is
                     // reached by jq the same way any other later-alternative
@@ -42325,7 +42352,7 @@ fn builtin_halt_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 _ => Ok(items.into_iter().next()),
             };
             let n_result: Result<OwnedValue, EvalEscape> = match first {
-                Ok(Some(item)) => Ok(item.into_owned()),
+                Ok(Some(item)) => Ok(item.into_owned_lossy()),
                 // #1408: a zero-output code expression (`halt_error(empty)`)
                 // must make the whole call produce zero output -- matching
                 // real jq's own `x as $x | ...` desugaring, the same fix
@@ -47663,12 +47690,12 @@ mod tests {
 
     /// #1972: `eval_single`'s fully-open `Expr::Slice` fast path (the same
     /// root cause #1932/#1943 each patched at one consumer) is itself
-    /// unguarded -- `binary_fanout_each`'s own `Item::into_owned` call used
-    /// to silently substitute `""` for an undecodable borrowed operand
+    /// unguarded -- `binary_fanout_each`'s own `Item::into_owned_lossy` call
+    /// used to silently substitute `""` for an undecodable borrowed operand
     /// instead of raising, so a comparison/arithmetic op over a fully-open
     /// slice produced no error signal at all (worse than #1932/#1943's own
     /// manifestation, which at least raised a masked error). Fixed via
-    /// `Item::into_owned_checked`, exercised via `Expr::Compare`
+    /// `Item::into_owned`, exercised via `Expr::Compare`
     /// (`eval_compare` -> `eval_binary_fanout` -> `binary_fanout_core` ->
     /// `binary_fanout_each`).
     #[test]
@@ -47807,15 +47834,15 @@ mod tests {
     /// (deferring the decode, never at risk here), `nth(n; g)` has no such
     /// lazy AST production -- it always parses straight to
     /// `Builtin::NthStream`/`builtin_nth_stream`, whose "always materializing"
-    /// design (#820) used to call `Item::into_owned` unconditionally on the
-    /// selected output, silently turning an undecodable string into `""`
+    /// design (#820) used to call `Item::into_owned_lossy` unconditionally on
+    /// the selected output, silently turning an undecodable string into `""`
     /// instead of raising. Confirmed dead ends investigated alongside this:
     /// `has`/`contains`/`getpath`/`index`/`inside`/`setpath`/`delpaths`/`in`
     /// each already raise (either their own independent root-level
     /// `to_owned` happens to cover the same corrupted document, or a
     /// type mismatch masks it before content ever matters), and bare
     /// `limit`/`first`/`last` return lazily. Fixed via
-    /// `Item::into_owned_checked`, the same helper #1976 introduced.
+    /// `Item::into_owned`, the same helper #1976 introduced.
     #[test]
     fn test_nth_stream_raises_on_selected_output_decode_failure_1972() {
         query!(
@@ -78581,7 +78608,7 @@ mod tests {
     }
 
     /// #1989 cluster 4: `builtin_limit` and `builtin_first_stream` emit
-    /// `Item::into_owned`'s result as the query's *own output*, so the gap
+    /// `Item::into_owned_lossy`'s result as the query's *own output*, so the gap
     /// that function's doc comment already documents was a live
     /// wrong-data bug at those two of its seven call sites. Both are
     /// parser-unreachable (#981/#1986) but library-reachable, which #1972
