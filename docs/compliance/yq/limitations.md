@@ -1766,13 +1766,58 @@ abandoning that invariant, a materially larger change than this fix's own scope.
 correctly *raises* either way; only the reported array-size number can differ, and only in
 this one multi-key-same-array shape.
 
-**A separate, unrelated divergence found investigating this one, not fixed here**: real yq's
-`del()` on a *positive* out-of-range index doesn't no-op the way jq does -- it extends the
-array with `null`s up to (not including) that position (`del(.[5])` on `[1,2]` yields a
-5-element array, `[1,2,null,null,null]`, in real yq, confirmed live), where succinctly
-(matching jq) leaves the array unchanged. Filed separately as
-[#2305](https://github.com/rust-works/succinctly/issues/2305), since it's about a positive
-index and has nothing to do with #2268's own negative-index scope.
+**A separate, unrelated divergence found investigating this one**: real yq's `del()` on a
+*positive* out-of-range index doesn't no-op the way jq does -- it extends the array with
+`null`s up to (not including) that position (`del(.[5])` on `[1,2]` yields a 5-element array,
+`[1,2,null,null,null]`, in real yq, confirmed live), where succinctly (matching jq) used to
+leave the array unchanged. Was its own issue, [#2305](https://github.com/rust-works/succinctly/issues/2305),
+since it's about a positive index and has nothing to do with #2268's own negative-index
+scope -- closed by the next section below.
+
+### `del()`/`delpaths()` on a positive out-of-range array index extends with `null` instead of no-opping
+
+[#2305](https://github.com/rust-works/succinctly/issues/2305). Real yq's own asymmetry between
+positive and negative out-of-range indices (the section above covers the negative half) has a
+second half specific to `del()`/`delpaths()`: a **positive** out-of-range index -- where a plain
+*read* answers `null` in both jq and yq -- makes yq's own `del()` *grow* the array with `null`
+up to the requested length, where jq (and, before this fix, succinctly) leaves it unchanged:
+
+```bash
+$ echo '[1,2]' | yq -o=json 'del(.[5])'      # [1, 2, null, null, null] -- length 5, not a no-op
+$ echo '[1,2]' | jq -c 'del(.[5])'           # [1,2]                    -- jq: genuine no-op
+```
+
+The extension target is the *requested* index itself, not `index + 1` -- there is nothing to
+place *at* the deleted position, only a gap to fill *before* it, so `del(.[2])` on a
+length-2 array (index == current length exactly, no gap) is a true no-op in both tools, and
+only `index > length` triggers the growth. Closed by `extend_array_with_nulls_for_delete`
+(`src/jq/eval.rs`), a fallible-reserve-then-resize sibling of `pad_with_nulls` (`setpath`'s own
+array-growth helper, #1670) shared by `delete_at_path`'s `Expr::Index` arm (`del(.[N])`) and
+`delete_keys`'s own single-key case (`delpaths([[N]])`, confirmed live to share the identical
+extension behavior) -- gated on `yq_mode`, since jq has no such rule at all.
+
+**Deliberately not extended to a `delpaths()` batch of two or more keys.** Confirmed live that
+mixing an in-range delete with an out-of-range one in the same `delpaths()` call is
+**order-dependent** in real yq -- the same *set* of keys, given in a different literal order,
+produces a *different*-length result:
+
+```bash
+$ echo '[1,2,3]' | yq -o=json 'delpaths([[0],[5]])'   # [2,3,null,null,null] -- length 5
+$ echo '[1,2,3]' | yq -o=json 'delpaths([[5],[0]])'   # [2,3,null,null]      -- length 4
+```
+
+`delete_keys`'s array arm resolves every key against the array's length *on entry* and applies
+them all in one batched `retain` pass -- deliberately order-independent, which is what keeps its
+existing (already-correct) in-range-only semantics matching real jq's own order-independent
+`delpaths` union rule. Replicating the order-dependent out-of-range case would need the array
+arm restructured to apply keys sequentially instead, a materially larger change than this fix
+attempts -- tracked separately as
+[#2306](https://github.com/rust-works/succinctly/issues/2306), including whether `del()`'s own
+comma-separated multi-target form (`del(.[0], .[5])`, a different call path than `delpaths()`'s
+path-array form) shares the same order-dependence.
+
+A negative out-of-range index is untouched by this fix either way -- it raises instead
+(#2268, the section above, landed separately and already covers it).
 
 ### Other categories
 
