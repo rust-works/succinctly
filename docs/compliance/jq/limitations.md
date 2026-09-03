@@ -2859,16 +2859,23 @@ Pinned by `test_unbuffered_interleaves_stdout_and_stderr_1653`,
 `test_jq_missing_delimiter_raises_through_nonreserializing_filters_1677`
 ([tests/jq_cli_tests.rs](../../../tests/jq_cli_tests.rs)).
 
-The identical trade-off covers a *stray-comma* fault the same way it covers a *missing*
-delimiter above — `{"a": [,]}` under bare `.` writes `{"a":` before the walk reaches the
-empty array's stray comma and raises (#2210). `-S` forces the fully materializing path,
-which validates the whole document before printing anything, so it emits nothing on the
-same input — the exit code still agrees, only the prefix differs, same as every other case
-in this section. This shape was unreachable through the general (non-`-S`) path before
-#1576's own M2 fast-path fix started correctly declining a nested empty container's stray
-comma instead of silently accepting it as `[]`; only once M2 declines and falls back here
-does this path's own pre-existing, already-accepted non-atomicity apply to it for the first
-time. Pinned by
+The same trade-off also covers a fault found *partway through writing a single result's
+own value*, not just one discovered by a later top-level result's generator advance —
+`print_json`/`write_output_jq_value` stream byte-by-byte with no rewind, so `{"a": [,]}`
+under bare `.` writes `{"a":` before its own recursive walk reaches the stray comma nested
+inside the empty array and raises (#2210), the identical shape `test_jq_identity_on_
+malformed_array_element_errors_1641` above already pins for `[xyz123]`/`[tru]`/
+`[1,zzz,3]`/`{"a": xyz123}` — a bareword-garbage token instead of a stray comma, reaching
+the fault through the same writer the same way. A first pass at this fix buffered
+`write_output_jq_value`'s per-call output and only committed it to real stdout once known
+good (mirroring `evaluate_m2_fast_path`'s own identical contract for its own single-result
+case) — reverted once the existing #1641 test above caught it as a real regression against
+an already-established, deliberately tested contract for this exact writer, not a
+previously-undocumented gap. It would also have needed carving out `--unbuffered`, whose
+own flush (`write_terminator`) is embedded inside this same call tree keyed on whatever
+writer it's given — buffering would make that flush a silent no-op on a temporary buffer
+instead of the real, immediate per-value flush `--unbuffered` promises, breaking its
+interleaving guarantee with side effects from later results. Pinned by
 `test_jq_general_streaming_path_leaks_prefix_before_nested_comma_fault_2210`
 ([tests/jq_cli_tests.rs](../../../tests/jq_cli_tests.rs)).
 
