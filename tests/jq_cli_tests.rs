@@ -29966,9 +29966,10 @@ fn test_fromjson_lone_high_surrogate_key_no_longer_silently_collapses_2013() {
 /// `src/bin/succinctly/jq_runner.rs`) is a *third*, independent surrogate
 /// decoder from the two #2008 already fixed above -- it validates via
 /// `serde_json` first, which rejects a lone low surrogate outright, before
-/// this crate's own leniency (`json_bytes_to_owned_value`) ever gets a
-/// chance to run. Confirmed live against the pinned oracle before the fix
-/// (succinctly errored, real jq substituted U+FFFD, exit 0 either way).
+/// this crate's own leniency (`json_bytes_to_owned_value_checked`, #2295)
+/// ever gets a chance to run. Confirmed live against the pinned oracle
+/// before the fix (succinctly errored, real jq substituted U+FFFD, exit 0
+/// either way).
 #[test]
 fn test_argjson_low_surrogate_substitutes_replacement_character_2012() {
     let (stdout, stderr, code) =
@@ -35074,6 +35075,13 @@ fn test_stderr_in_update_assignment_target_2234() -> Result<()> {
 /// path), `parse_json_value`'s retry branch, `parse_json_stream_strict`
 /// (the primary `--slurp`/`--slurpfile` document-input path), and the
 /// `--seq` per-record materializer.
+///
+/// The leniency assertions here overlap
+/// `test_argjson_tolerates_leading_zero_number_1094`/
+/// `test_argjson_low_surrogate_substitutes_replacement_character_2012`
+/// deliberately -- this test's own point is pinning all four sites'
+/// behavior together as one #2295-scoped regression suite, not replacing
+/// those issue-scoped ones.
 #[test]
 fn test_argjson_wellformed_and_leniency_unaffected_by_checked_swap_2295() -> Result<()> {
     // Happy path (`validate_and_materialize_json`).
