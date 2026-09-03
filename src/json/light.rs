@@ -3040,8 +3040,12 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
         // matters: the caller (`GenericResult::stream_json`'s `LazySeq`
         // arm) discards this writer's own partial output rather than the
         // whole document silently reading back as valid JSON with a
-        // fabricated `null`.
-        StandardJson::Error(msg) => Err(StreamFailure::Decode(EvalError::new(msg))),
+        // fabricated `null`. #2286: `decode_failure`, not `new` -- matches
+        // this same function's `malformed_json_text`-tagged arms just above
+        // (same uncatchable #1194 error class), and keeps this arm
+        // consistent with every other `StandardJson::Error` site fixed by
+        // #2286.
+        StandardJson::Error(msg) => Err(StreamFailure::Decode(EvalError::decode_failure(msg))),
     }
 }
 

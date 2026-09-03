@@ -30567,6 +30567,48 @@ fn test_malformed_value_surfaces_as_error_1194() {
     );
 }
 
+/// #2286 code review: the #1194 malformed-value class above is uncatchable
+/// through *every* materializing route -- except the fold source of
+/// `reduce`/`foreach` (and anything built on it, like `add`), which
+/// resolves via `eval_generic::to_owned_at_depth`'s own `is_error()` arm
+/// (a format-agnostic sibling of `eval::to_owned_at_depth`'s
+/// `StandardJson::Error` arm, not the same function). That sibling was
+/// still tagging the error as an ordinary, catchable `EvalError::new(...)`,
+/// so `[1, xyz123] | try add catch "caught"` printed `"caught"` at exit 0
+/// where real jq 1.7.1 exits 5 unconditionally (`add` desugars to
+/// `reduce .[] as $x (null; . + $x)`, confirmed live).
+#[test]
+fn test_fold_source_malformed_value_is_uncatchable_2286() {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "try add catch \"caught\""], Some("[1, xyz123]"))
+            .unwrap_or_else(|e| panic!("failed to run: {e}"));
+    assert_ne!(code, 0, "stdout: {stdout}");
+    assert_ne!(
+        stdout.trim(),
+        "\"caught\"",
+        "stdout: {stdout}, stderr: {stderr}"
+    );
+    assert!(!stderr.is_empty(), "expected a diagnostic on stderr");
+
+    // The hand-written desugaring must agree, since it's the same fold
+    // machinery `add` itself goes through.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "try (reduce .[] as $x (null; . + $x)) catch \"caught\"",
+        ],
+        Some("[1, xyz123]"),
+    )
+    .unwrap_or_else(|e| panic!("failed to run: {e}"));
+    assert_ne!(code, 0, "stdout: {stdout}");
+    assert_ne!(
+        stdout.trim(),
+        "\"caught\"",
+        "stdout: {stdout}, stderr: {stderr}"
+    );
+    assert!(!stderr.is_empty(), "expected a diagnostic on stderr");
+}
+
 /// #1247: jq is the odd oracle out on invalid UTF-8. `yq` rejects such a
 /// document outright (#1242); `jq` accepts it, substitutes U+FFFD and exits
 /// 0. succinctly did neither -- it echoed the raw bytes, writing invalid

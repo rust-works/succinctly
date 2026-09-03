@@ -1246,11 +1246,13 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
         // the semi-index accepted as a span but could not classify as any
         // JSON token. This function used to materialize it as `null`
         // instead of raising the semi-index's own, more specific message.
-        return Err(EvalError::new(
+        // #2286: `decode_failure`, not `new` -- same uncatchable class as
+        // every other `is_error()`/`StandardJson::Error` site this issue
+        // fixed.
+        return Err(EvalError::decode_failure(
             value
                 .error_message()
-                .unwrap_or("malformed value in document")
-                .to_string(),
+                .unwrap_or("malformed value in document"),
         ));
     } else {
         // Matches `to_owned_at_depth`'s own final `else` arm (#1098) --

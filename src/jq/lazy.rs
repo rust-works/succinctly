@@ -931,8 +931,10 @@ fn cursor_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
         }
         // See `eval_generic::to_owned_at_depth`'s own `is_error` arm
         // (#1194/#1247): a structurally malformed value raises rather than
-        // becoming `null`.
-        StandardJson::Error(msg) => return Err(EvalError::new(msg.to_string())),
+        // becoming `null`. #2286: decode_failure, not new -- same class as
+        // the malformed member/delimiter errors; confirmed live that real
+        // jq treats this uncatchably too.
+        StandardJson::Error(msg) => return Err(EvalError::decode_failure(msg)),
     })
 }
 
