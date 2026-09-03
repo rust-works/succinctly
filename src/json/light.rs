@@ -4184,6 +4184,29 @@ mod tests {
         }
     }
 
+    /// #1995: `JsonFields::find` (not just its `find_cursor` sibling,
+    /// already covered end-to-end via the CLI's `.b` dispatch) raises on a
+    /// non-string sibling key too -- exercised directly here since `find`'s
+    /// only production caller (`eval.rs`'s own separate evaluator) isn't
+    /// reachable from the CLI test suite with raw document text.
+    #[test]
+    fn test_object_find_raises_on_non_string_sibling_key_1995() {
+        let json = br#"{"a":1,123:2}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        let StandardJson::Object(fields) = root.value() else {
+            panic!("expected object");
+        };
+        let err = fields
+            .find("a")
+            .expect_err("non-string sibling key must raise");
+        assert!(
+            err.to_string().contains("expected string key"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn test_array_single_element() {
         let json = br"[42]";
