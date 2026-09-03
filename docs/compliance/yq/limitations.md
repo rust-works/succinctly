@@ -1880,12 +1880,29 @@ $ echo '[1,2]' | yq -o=json 'del(.[5][])'   # [1,2,null,null,null,[]]
 
 Closed across the three sites that resolve a mid-chain array index for a delete --
 `delete_path_steps`'s `Expr::Index` arm (the plain AST walk), `delete_trie_array`'s
-`ArrayStep::Index` arm (the comma-grouped multi-target walk), and `delete_paths_under`'s
-array-key arm (`delpaths`' own recursion) -- all in `src/jq/eval.rs`. The trie walk has no
-`[]`-vivify case to mirror: a bare `.[]` can never reach it as a resolved step (a
-comma-grouped `del()`'s own `.[]` is always fanned out against the real document before the
-trie is built, and an out-of-range mid-chain index has nothing there to fan out over), and
-`delpaths`' own path components are always concrete keys, never a `.[]` wildcard.
+`ArrayStep::Index` arm (the comma-grouped multi-target walk, once that walk's own
+read-based fan-out has already resolved a concrete branch reaching it -- see the residual
+gap below for when it hasn't), and `delete_paths_under`'s array-key arm (`delpaths`' own
+recursion) -- all in `src/jq/eval.rs`. `delpaths`' own path components are always concrete
+keys, never a `.[]` wildcard, so there is no `[]`-vivify case to mirror at that site.
+
+**Two residual gaps found during this fix's own review, not chased here:**
+
+- A **comma-grouped** target whose own `.[]` fan-out crosses the out-of-range index
+  (`del(.[5][], .[0])`) never reaches `delete_trie_array` at all -- the read-based
+  validation that enumerates concrete branches for the trie reads `.[5]` as a plain
+  `null` (correct for an ordinary read) and raises iterating `.[]` over it, rather than
+  extending+vivifying the way the direct, non-comma-grouped form now does. Tracked as
+  [#2324](https://github.com/rust-works/succinctly/issues/2324).
+- The `[]`-vivify rule implemented here is narrowly scoped to a slot this fix *itself*
+  just padded, checked only against a literal `Expr::Iterate` as the very next step.
+  Real yq's actual rule is broader and predates this fix entirely: `null` auto-vivifies
+  into `[]` for **any** subsequent `Index`/`Iterate` del() step, freshly padded or not
+  (`null | del(.[2])` is `[null,null]` in real yq; `{"x":null} | del(.x[2])` is
+  `{"x":[null,null]}`) -- `succinctly yq` gets both wrong today, along with a
+  multi-level chain like `del(.[3][2].a)` (real yq recurses the same rule at each level;
+  this fix's own narrow check only covers one). Tracked as
+  [#2323](https://github.com/rust-works/succinctly/issues/2323).
 
 ### Other categories
 
