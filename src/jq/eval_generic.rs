@@ -7014,7 +7014,7 @@ fn generic_item_to_result<V: DocumentValue>(item: GenericItem<V>) -> GenericResu
 /// [`push_generic_owned_values`] already applies, reused here rather than
 /// re-derived.
 ///
-/// Fallible, unlike `eval::Item::into_owned`: a `LazySeq` item -- a buffered
+/// Fallible, unlike `eval::Item::into_owned_lossy`: a `LazySeq` item -- a buffered
 /// `map`/`select` chain, #724/#725 -- can itself error/break/halt on the
 /// materialization this forces (e.g. `map(1/0) == 1`), where `eval.rs`'s
 /// `QueryResult` has no lazy variant to force in the first place.
