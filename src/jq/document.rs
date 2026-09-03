@@ -1379,6 +1379,42 @@ pub fn value_delimiter_ok<F: DocumentFields>(
     }
 }
 
+/// Whether a trailing stray `,` (`[1,]`, `{"a":1,}`) sits between a
+/// container's *last real child* (`last_cursor`) and `close_char` -- #2243.
+///
+/// Moved here from a private copy in `eval_generic.rs` (#2262) so
+/// `eval::to_owned_at_depth`, `eval_generic`'s own cursor-carrying and
+/// cursor-less `to_owned_at_depth` pair, and `src/bin/succinctly`'s
+/// `yq_runner::to_owned_canonicalizing_numbers_at_depth` (a separate crate,
+/// hence `pub` rather than `pub(crate)`, matching [`key_delimiter_ok`]'s own
+/// reasoning) all share one definition instead of drifting into four
+/// hand-copied ones.
+///
+/// Takes only the cursor, not an already-resolved value:
+/// [`DocumentValue::scalar_text_end`] unconditionally answers `None` for a
+/// container-typed child (see its own doc comment), so resolving one here
+/// first -- via `is_container()`, cheap and already required by every
+/// [`DocumentCursor`] impl -- skips a `.value()` call this check could
+/// never use anyway, rather than decoding it and immediately discarding the
+/// result.
+///
+/// `None` from either remaining half of the lookup -- no resolvable start
+/// position, or (for a scalar child) no derivable end position -- answers
+/// `true` (nothing to flag), the same "can't determine, skip" convention
+/// every sibling gap check in this module already follows.
+pub fn trailing_element_gap_ok<C: DocumentCursor>(last_cursor: &C, close_char: u8) -> bool {
+    if last_cursor.is_container() {
+        return true;
+    }
+    match last_cursor.text_position() {
+        Some(start) => match last_cursor.value().scalar_text_end(start) {
+            Some(end) => last_cursor.trailing_element_gap_ok(end, close_char),
+            None => true,
+        },
+        None => true,
+    }
+}
+
 /// [`value_delimiter_ok`], for a key-only walk (`census`, `checked_len`,
 /// [`DistinctKeyCursors`]) that has not resolved a value cursor at all.
 ///
