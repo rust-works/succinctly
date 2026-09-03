@@ -12,50 +12,12 @@ use succinctly::jq::escape::{
     escape_json_body as run_escaper, write_json_body_jq, write_json_body_jq_ascii,
     write_json_body_yq, write_json_body_yq_ascii,
 };
-use succinctly::jq::eval_generic::to_owned as generic_to_owned;
 use succinctly::jq::{
     assert_value_tree_depth, format_number_jq_compat, nonfinite_display_string, EvalError,
     JqSemantics, NumberRepr, OwnedValue, StreamError,
 };
-use succinctly::json::JsonIndex;
 use succinctly::yaml::format_float_with_fraction;
 pub use succinctly::yaml::format_float_yq;
-
-/// Materialize a complete JSON document into an `OwnedValue`, preserving
-/// each number's exact source spelling (`1.500` stays `1.500`, `1e100`
-/// stays exponent notation) the way a document read from the program's
-/// primary input already does -- unlike routing through
-/// `serde_json::Value`, whose `Number` variant round-trips only through
-/// Rust's own `f64`/`i64` `Display` and loses that spelling (#1058).
-///
-/// `bytes` must already be known-valid JSON with no trailing content --
-/// this crate's own semi-indexer is deliberately lenient (`42 garbage`
-/// parses as `42` with the rest silently ignored, #284) and performs no
-/// validation of its own. Callers that accept raw external text (a CLI
-/// argument, a file) need their own strict pre-validation pass first; see
-/// `jq_runner::parse_json_value`'s doc comment for why that pass can't
-/// simply reuse the `serde_json::Value` it produces.
-///
-/// Shared by `jq_runner::parse_json_value` (`--argjson`/`--jsonargs`) and
-/// `yq_runner::parse_input`'s `InputFormat::Json` arm (the primary input
-/// path) -- previously two independent copies of the same three-line
-/// `JsonIndex::build`/`.root()`/`generic_to_owned` sequence (#1095 review).
-/// `yq_runner::parse_input` immediately discards the preserved spelling
-/// this function keeps (`canonicalize_json_numbers`, #978/#999) -- kept
-/// local to `yq_runner.rs` rather than a second variant here, since it's a
-/// yq-CLI-specific oracle quirk this shared helper has no business knowing
-/// about.
-///
-/// Fallible since #1247: a string that fails to decode raises instead of
-/// materializing as `null`. Every caller here re-serializes an *already
-/// decoded* `OwnedValue`, so in practice this cannot fail on those paths --
-/// but the signature says so rather than a comment promising it, and the
-/// `--argjson`/`--jsonargs` paths take genuinely external text.
-pub fn json_bytes_to_owned_value(bytes: &[u8]) -> Result<OwnedValue, EvalError> {
-    let index = JsonIndex::build(bytes);
-    let cursor = index.root(bytes);
-    generic_to_owned(&cursor.value())
-}
 
 /// Which terminator follows a written value: NUL (`-0`/`--nul-output`),
 /// a bare newline (the default), or nothing (`-j`/`--join-output`). `nul`

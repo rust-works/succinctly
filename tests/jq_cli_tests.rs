@@ -35065,3 +35065,58 @@ fn test_stderr_in_update_assignment_target_2234() -> Result<()> {
     assert_eq!(stderr, "1");
     Ok(())
 }
+
+/// #2295: every `json_bytes_to_owned_value` call site left unchecked now
+/// routes through `json_bytes_to_owned_value_checked` instead -- pins that
+/// the swap doesn't regress well-formed input or either leniency
+/// (`--argjson`'s own leading-zero/low-surrogate retry) at any of the four
+/// fixed call sites: `validate_and_materialize_json` (`--argjson`'s happy
+/// path), `parse_json_value`'s retry branch, `parse_json_stream_strict`
+/// (the primary `--slurp`/`--slurpfile` document-input path), and the
+/// `--seq` per-record materializer.
+#[test]
+fn test_argjson_wellformed_and_leniency_unaffected_by_checked_swap_2295() -> Result<()> {
+    // Happy path (`validate_and_materialize_json`).
+    let (out, code) = run_jq_null("$x", &["-c", "--argjson", "x", r#"{"a":1,"b":[1,2,3]}"#])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":1,"b":[1,2,3]}"#);
+
+    // Leading-zero leniency retry (`parse_json_value`'s own branch).
+    let (out, code) = run_jq_null("$x", &["-c", "--argjson", "x", "007"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "7");
+
+    // Lone low-surrogate leniency, the retry's other half (#2012).
+    let (out, code) = run_jq_null("$x", &["-c", "--argjson", "x", r#""\udc00""#])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "\"\u{fffd}\"");
+    Ok(())
+}
+
+/// #2295: `parse_json_stream_strict` (`--slurp`/`--slurpfile`'s primary
+/// document-input path) unaffected by the checked swap.
+#[test]
+fn test_slurp_wellformed_unaffected_by_checked_swap_2295() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["--slurp", "-c", "."], Some(r#"{"a":1} {"b":2}"#))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), r#"[{"a":1},{"b":2}]"#);
+    Ok(())
+}
+
+/// #2295: `--seq`'s own per-record materializer (both delimiter checks and
+/// leniency) unaffected by the checked swap. `--seq` prefixes *output*
+/// records with an RS byte too (RFC 7464), same as real jq -- confirmed
+/// against `/usr/bin/jq` 1.7.1 -- so the expected values below carry it.
+#[test]
+fn test_seq_wellformed_and_leniency_unaffected_by_checked_swap_2295() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["--seq", "-c", "."], Some("\x1e[1,2,3]\n"))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), "\x1e[1,2,3]");
+
+    // Leading-zero leniency (#1243), the same normalization `--argjson`
+    // shares via `normalize_json_leniently`.
+    let (stdout, stderr, code) = run_jq_full(&["--seq", "-c", "."], Some("\x1e007\n"))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), "\x1e7");
+    Ok(())
+}
