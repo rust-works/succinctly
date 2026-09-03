@@ -16,8 +16,8 @@ use succinctly::jq::document::{
 };
 use succinctly::jq::escape::AsciiEscapeWriter;
 use succinctly::jq::eval_generic::{
-    assert_nesting_depth, eval_with_cursor_using, to_owned as generic_to_owned,
-    to_owned_with_comments, AnchorMark, CommentTree, GenericResult, NodeMeta, MAX_NESTING_DEPTH,
+    check_nesting_depth, eval_with_cursor_using, to_owned as generic_to_owned,
+    to_owned_with_comments, AnchorMark, CommentTree, GenericResult, NodeMeta,
 };
 use succinctly::jq::stream::StreamFailure;
 use succinctly::jq::{
@@ -1071,7 +1071,7 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
     value: &V,
     depth: usize,
 ) -> Result<OwnedValue, EvalError> {
-    // `assert_nesting_depth` (256, matching `eval_generic::to_owned_at_depth`
+    // `check_nesting_depth` (256, matching `eval_generic::to_owned_at_depth`
     // exactly), not `assert_value_tree_depth` (384) -- this walks a
     // `DocumentCursor`-backed `V` directly, the same recursion shape
     // `to_owned_at_depth` guards with the tighter limit, not the looser
@@ -1081,7 +1081,26 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
     // `--input-format json` documents from 256 to 384, since this is now
     // the only pass -- there's no first, 256-guarded `to_owned` call ahead
     // of it anymore to bind the real ceiling).
-    assert_nesting_depth(depth);
+    //
+    // #2282: `check_nesting_depth`, the catchable sibling of
+    // `assert_nesting_depth` (#1818), not the panicking guard itself --
+    // this function's only two callers (`to_owned_canonicalizing_numbers`,
+    // reached from `parse_input`'s JSON arm) sit ahead of any user filter
+    // evaluation, parsing raw external JSON text for `--slurp`/
+    // `--eval-all`/`--inplace`. That's CLI-level input parsing, not the
+    // evaluator's own hot recursion over an already-parsed value -- the
+    // same distinction `jq_runner.rs`'s `json_bytes_to_owned_value_checked`
+    // (#1818) already draws for jq mode's own analogous pre-filter parse
+    // path, converting an identical panic into a catchable error there for
+    // the identical reason. `--slurp`/`--inplace` never reach this call at
+    // all (their own M2-fallback `parse_input_m2_parity` pre-check, #2276,
+    // rejects nesting past 128 first); `--eval-all` has no such pre-check
+    // and was, before this fix, the one remaining path where 257+ levels
+    // of JSON nesting reached this line and panicked (exit 101) instead of
+    // reporting a clean, catchable error (exit 1) -- confirmed live,
+    // `succinctly yq --eval-all --input-format json` on 300 levels of
+    // `[...]` nesting used to panic here.
+    check_nesting_depth(depth)?;
     Ok(if let Some(fields) = value.as_object() {
         let mut map = IndexMap::new();
         let mut guard = DisplayKeyGuard::default();
@@ -1251,72 +1270,48 @@ const M2_PARSE_TIME_DEPTH_LIMIT: usize = 128;
 /// #2276: whether `cursor`'s subtree nests to `limit` levels or deeper --
 /// a pure BP-navigation walk (`first_child`/`next_sibling`/`is_container`,
 /// never `.value()`) so it costs nothing beyond pointer-chasing, no scalar
-/// decoding, for well-formed input. `limit` also bounds this function's
-/// own recursion depth (an early `true` return the moment the check
-/// fires, before ever recursing further), so a large `limit` argument is
-/// still safe -- the walk simply hasn't rejected yet by that point, it
-/// never recurses *past* it.
+/// decoding, for well-formed input. `depth` counts *containers only*
+/// (`[`/`{`), matching `YamlIndex`'s own `enter_nested`, which is called
+/// once per opened `[`/`{` and never for a leaf scalar -- a leaf never
+/// itself constitutes a nesting level. `limit` also bounds this function's
+/// own recursion depth (an early `true` return the moment
+/// `depth >= limit`, before ever recursing further), so a large `limit`
+/// argument is still safe -- the walk simply hasn't rejected yet by that
+/// point, it never recurses *past* it.
 ///
-/// `count_leaves` selects between two genuinely different counting
-/// conventions (#2282 review: NOT interchangeable, discovered while
-/// reusing this walk for a second caller with a different ceiling --
-/// picking the wrong one silently under-rejects by exactly one level for
-/// a leaf-terminated subtree, see below):
+/// Used by [`parse_input_m2_parity`] at `limit =
+/// M2_PARSE_TIME_DEPTH_LIMIT`, for parity with `YamlIndex`'s own
+/// parse-time rejection boundary (#2276): `--slurp`'s and `--inplace`'s
+/// own DOM fallback (`parse_input`, reached exactly when their M2 fast
+/// path declines JSON-sourced input) must reject nesting at least as
+/// strictly as the M2 fast path it replaces did -- `YamlIndex::build`'s
+/// own parser enforced `M2_PARSE_TIME_DEPTH_LIMIT` at *parse* time,
+/// before this fallback existed for JSON input at all. Confirmed live:
+/// 128 levels of plain `[...]` nesting is accepted (`nesting_depth`
+/// reaches 127 on the innermost bracket, checked before incrementing),
+/// only 129+ is rejected -- confirmed against the pre-#2276 binary
+/// directly, not assumed from the constant's name alone.
 ///
-/// - `count_leaves = false`: `depth` counts *containers only* (`[`/`{`),
-///   checked only when `cursor.is_container()` -- matching `YamlIndex`'s
-///   own `enter_nested`, called once per opened `[`/`{` and never for a
-///   leaf scalar. Used by
-///   [`parse_input_m2_parity`] at
-///   `limit = M2_PARSE_TIME_DEPTH_LIMIT`, for parity with `YamlIndex`'s
-///   own parse-time rejection boundary (#2276): `--slurp`'s and
-///   `--inplace`'s own DOM fallback (`parse_input`, reached exactly when
-///   their M2 fast path declines JSON-sourced input) must reject nesting
-///   at least as strictly as the M2 fast path it replaces did --
-///   `YamlIndex::build`'s own parser enforced `M2_PARSE_TIME_DEPTH_LIMIT`
-///   at *parse* time, before this fallback existed for JSON input at all.
-///   Confirmed live: 128 levels of plain `[...]` nesting is accepted,
-///   129+ rejected -- true for both a scalar leaf and an empty innermost
-///   container, the one boundary where the two conventions below happen
-///   to agree.
-/// - `count_leaves = true`: `depth` is checked on *every* visited node,
-///   container or leaf, before any container check -- matching
-///   `to_owned_canonicalizing_numbers_at_depth`'s own unconditional
-///   `assert_nesting_depth(depth)` call, made on every value regardless
-///   of its type. Used by
-///   [`parse_input_eval_all`] at
-///   `limit = MAX_NESTING_DEPTH`, for parity with *that* function's own
-///   panic boundary -- see its own doc comment for why `--eval-all` needs
-///   a different ceiling than the M2-parity one above, not just a
-///   different counting convention. A leaf-terminated subtree recurses
-///   one level deeper into `to_owned_canonicalizing_numbers_at_depth` than
-///   a container-only count would predict, so `count_leaves = false`
-///   here would under-reject by exactly one level whenever the deepest
-///   nesting bottoms out at a scalar rather than an empty container:
-///   confirmed live, 256 levels of `[...]` (and, separately, of nested
-///   `{"k":...}`) wrapped around a scalar leaf panics
-///   `to_owned_canonicalizing_numbers_at_depth` (`assert_nesting_depth`'s
-///   own check on the leaf's `depth = 256` call fires first), where
-///   `count_leaves = false` at the same `limit` would still call it
-///   accepted -- its own boundary (256 accepted / 257 rejected) only
-///   matches the real one for an empty-innermost-container subtree, not a
-///   leaf-terminated one, confirmed live for that case too.
+/// `--eval-all` needs no equivalent pre-check: unlike `--slurp`/
+/// `--inplace`, it never had an M2 fast path of its own to fall back
+/// from, so there is no M2-parity boundary for it to match. Its own,
+/// unrelated exposure to `to_owned_canonicalizing_numbers_at_depth`'s
+/// nesting-depth guard is fixed at the guard itself (#2282) -- see
+/// `check_nesting_depth`'s call site in that function's own doc comment.
 fn json_nested_past_depth_limit<W: AsRef<[u64]>>(
     cursor: JsonCursor<'_, W>,
     depth: usize,
     limit: usize,
-    count_leaves: bool,
 ) -> bool {
-    let is_container = cursor.is_container();
-    if depth >= limit && (count_leaves || is_container) {
-        return true;
-    }
-    if !is_container {
+    if !cursor.is_container() {
         return false;
+    }
+    if depth >= limit {
+        return true;
     }
     let mut child = cursor.first_child();
     while let Some(c) = child {
-        if json_nested_past_depth_limit(c, depth + 1, limit, count_leaves) {
+        if json_nested_past_depth_limit(c, depth + 1, limit) {
             return true;
         }
         child = c.next_sibling();
@@ -1325,51 +1320,16 @@ fn json_nested_past_depth_limit<W: AsRef<[u64]>>(
 }
 
 /// [`parse_input`], preceded by [`json_nested_past_depth_limit`]'s depth
-/// check (`count_leaves = false`, at `M2_PARSE_TIME_DEPTH_LIMIT`) for
-/// JSON-sourced input -- see that function's own doc comment for why.
-/// Used by `--slurp`'s and `--inplace`'s own DOM-fallback call sites
-/// only; `--eval-all`'s call site uses [`parse_input_eval_all`] instead
-/// (see its own doc comment for why both a different ceiling *and* a
-/// different counting convention are needed there).
+/// check (at `M2_PARSE_TIME_DEPTH_LIMIT`) for JSON-sourced input -- see
+/// that function's own doc comment for why. Used by `--slurp`'s and
+/// `--inplace`'s own DOM-fallback call sites only -- `--eval-all` calls
+/// plain [`parse_input`] directly (#2282: no M2-parity pre-check applies
+/// to it).
 fn parse_input_m2_parity(bytes: &[u8], format: InputFormat) -> Result<Vec<OwnedValue>> {
     if format == InputFormat::Json {
         let index = JsonIndex::build(bytes);
-        if json_nested_past_depth_limit(index.root(bytes), 0, M2_PARSE_TIME_DEPTH_LIMIT, false) {
+        if json_nested_past_depth_limit(index.root(bytes), 0, M2_PARSE_TIME_DEPTH_LIMIT) {
             anyhow::bail!(nesting_depth_exceeded_message(M2_PARSE_TIME_DEPTH_LIMIT));
-        }
-    }
-    parse_input(bytes, format)
-}
-
-/// [`parse_input`], preceded by [`json_nested_past_depth_limit`]'s depth
-/// check (`count_leaves = true`, at [`MAX_NESTING_DEPTH`]) for
-/// JSON-sourced input, rather than [`parse_input_m2_parity`]'s own
-/// `M2_PARSE_TIME_DEPTH_LIMIT`/`count_leaves = false` pairing (#2282).
-///
-/// `--eval-all` has no M2 fast path of its own to have declined (unlike
-/// `--slurp`/`--inplace`, [`parse_input_m2_parity`]'s own two callers), so
-/// tightening it to the *M2-parity* ceiling would be the same
-/// unrelated, unasked-for behavior change that function's own doc comment
-/// already rules out for this exact call site. What `--eval-all` *does*
-/// need is protection from `to_owned_canonicalizing_numbers_at_depth`'s
-/// own panicking `assert_nesting_depth` guard, reachable from raw CLI
-/// input: confirmed live, `succinctly yq --eval-all --input-format json`
-/// on 300 levels of `[...]` nesting panicked (exit 101, "nesting depth
-/// exceeds limit of 256") instead of reporting a clean, catchable error.
-/// `count_leaves = true` is required alongside `MAX_NESTING_DEPTH`, not
-/// optional -- `count_leaves = false` at this same ceiling silently lets
-/// a leaf-terminated 256-deep subtree back through to the panic (see
-/// `json_nested_past_depth_limit`'s own doc comment for the confirmed
-/// live repro). With the right pairing, this pre-check rejects precisely
-/// the inputs the panicking guard would otherwise have crashed on, and no
-/// others -- `--eval-all` keeps tolerating everything up to that same
-/// real ceiling, same as before this fix, just without the panic at the
-/// boundary.
-fn parse_input_eval_all(bytes: &[u8], format: InputFormat) -> Result<Vec<OwnedValue>> {
-    if format == InputFormat::Json {
-        let index = JsonIndex::build(bytes);
-        if json_nested_past_depth_limit(index.root(bytes), 0, MAX_NESTING_DEPTH, true) {
-            anyhow::bail!(nesting_depth_exceeded_message(MAX_NESTING_DEPTH));
         }
     }
     parse_input(bytes, format)
@@ -5132,12 +5092,11 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         let mut file_origin: Vec<usize> = Vec::new();
         let mut global_doc_index: usize = 0;
         for (file_idx, (bytes, format, _)) in input_sources.iter().enumerate() {
-            // #2282: `parse_input_eval_all`, not plain `parse_input` -- see
-            // that function's own doc comment for why `--eval-all` needs
-            // its own, wider-ceiling catchable pre-check rather than
-            // reaching `to_owned_canonicalizing_numbers_at_depth`'s
-            // panicking guard directly.
-            let inputs = parse_input_eval_all(bytes, *format)?;
+            // #2282: `to_owned_canonicalizing_numbers_at_depth` (reached via
+            // plain `parse_input` for JSON-sourced input) now reports its
+            // own nesting-depth violations as a catchable error rather than
+            // panicking -- see that function's own doc comment for why.
+            let inputs = parse_input(bytes, *format)?;
             for input in inputs {
                 let should_include = args
                     .document
@@ -6935,14 +6894,19 @@ mod tests {
     /// #999: `to_owned_canonicalizing_numbers` is a genuinely separate
     /// recursion from `to_owned` (kept local to this file rather than
     /// added to the shared library, #999 review), so its own
-    /// `assert_nesting_depth` call needed its own pinning test. 255/256,
+    /// `check_nesting_depth` call needed its own pinning test. 255/256,
     /// not `MAX_VALUE_TREE_DEPTH`'s 384: this walks a `DocumentCursor`
     /// directly, the same recursion shape `to_owned_at_depth` guards with
     /// the tighter `MAX_NESTING_DEPTH`, not the looser guard the old
     /// two-pass code's *second* pass (over an already-materialized
     /// `OwnedValue` tree) used.
+    ///
+    /// Updated for #2282: this guard now returns a catchable `EvalError`
+    /// rather than panicking (`check_nesting_depth`, not
+    /// `assert_nesting_depth`) -- see that call site's own doc comment for
+    /// why. `catch_unwind` is no longer needed or correct here.
     #[test]
-    fn to_owned_canonicalizing_numbers_panics_past_nesting_depth_limit_999() {
+    fn to_owned_canonicalizing_numbers_raises_past_nesting_depth_limit_999() {
         let json = linear_json_nest(255);
         let index = JsonIndex::build(json.as_bytes());
         let cursor = index.root(json.as_bytes());
@@ -6952,13 +6916,10 @@ mod tests {
         let json = linear_json_nest(256);
         let index = JsonIndex::build(json.as_bytes());
         let cursor = index.root(json.as_bytes());
-        let value = cursor.value();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            to_owned_canonicalizing_numbers(&value)
-        }));
+        let result = to_owned_canonicalizing_numbers(&cursor.value());
         assert!(
             result.is_err(),
-            "to_owned_canonicalizing_numbers should panic at depth 256"
+            "to_owned_canonicalizing_numbers should raise a catchable error at depth 256"
         );
     }
 
