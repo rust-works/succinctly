@@ -8231,6 +8231,17 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
             // through the identical promotion step. Inlined here instead,
             // mirroring `escape_generic!`'s own Halt-survives rule exactly
             // rather than reintroducing the bug it was written to avoid.
+            //
+            // The `Err` arm below is not live-repro-tested (review): same
+            // reasoning as `eval::eval_index_expr`'s identical arm -- an
+            // *earlier* key populating `cursors` and a *later* key reaching
+            // this `Partial` arm both require the one fixed `target`
+            // expression to behave non-deterministically across two fresh
+            // evaluations against the same document, and the only stateful
+            // builtin that could do that (`input`) always resolves to an
+            // owned value, never a cursor. Kept for the same defensive,
+            // future-proofing reason `resolve_terminal_prefix` keeps its own
+            // identical handling.
             GenericResult::Partial(vs, control) => {
                 if S::TAG == EvalTag::Yq {
                     escape_generic!(control);

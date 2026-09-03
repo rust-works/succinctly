@@ -34848,6 +34848,23 @@ fn test_index_expr_cli_dispatch_target_own_partial_prefix_preserved_2226() -> Re
     Ok(())
 }
 
+/// #2226 review (patch coverage): `eval_generic::eval_index_expr`'s target
+/// `Partial` arm's `Ok(None)` sub-case -- an earlier-produced value that
+/// legitimately isn't indexable, suppressed by `optional` rather than
+/// erroring (`true` here; `?` only gates *this* per-value type mismatch,
+/// not `target`'s own trailing `error("x")`). Verified against jq 1.7.1:
+/// `(true, [7], error("x"))[(0+0)]?` prints `7` then still raises `x`.
+#[test]
+fn test_index_expr_cli_dispatch_target_own_partial_prefix_ok_none_suppressed_by_optional_2226(
+) -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "(true, [7], error(\"x\"))[(0+0)]?"], Some("null"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "7\n");
+    assert!(stderr.contains('x'), "stderr: {stderr:?}");
+    Ok(())
+}
+
 /// #2226 sibling: the same target-own-prefix fix for
 /// `eval_generic::eval_slice_expr` -- the issue's own canonical repro.
 /// `(0,1):(1,2)` are bare computed bounds (no `as`-binding), so this
@@ -34865,6 +34882,26 @@ fn test_slice_expr_cli_dispatch_target_own_partial_prefix_preserved_2226() -> Re
     )?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "[1]\n[3]\n");
+    assert!(stderr.contains('x'), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #2226 review (patch coverage): `eval_generic::eval_slice_expr`'s target
+/// `Partial` arm's `Ok(None)` sub-case -- an earlier-produced value that
+/// legitimately isn't sliceable, suppressed by `optional` rather than
+/// erroring (`1` is a number, `[7]` an array; `?` only gates *this*
+/// per-value type mismatch, not `target`'s own trailing `error("x")`).
+/// Verified against jq 1.7.1: `(1, [7], error("x"))[(0+0):(1+0)]?` prints
+/// `[7]` then still raises `x`.
+#[test]
+fn test_slice_expr_cli_dispatch_target_own_partial_prefix_ok_none_suppressed_by_optional_2226(
+) -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "(1, [7], error(\"x\"))[(0+0):(1+0)]?"],
+        Some("null"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[7]\n");
     assert!(stderr.contains('x'), "stderr: {stderr:?}");
     Ok(())
 }
