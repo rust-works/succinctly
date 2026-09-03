@@ -1819,6 +1819,14 @@ path-array form) shares the same order-dependence.
 A negative out-of-range index is untouched by this fix either way -- it raises instead
 (#2268, the section above, landed separately and already covers it).
 
+Also scoped to a *terminal* index only -- a positive out-of-range index with more path
+after it (`del(.[5].a)`, `del(.[5][])`) extends too in real yq, to `index + 1` rather than
+`index` (there *is* something at the out-of-range position once the rest of the path needs
+to navigate into it), and `del(.[5][])` specifically auto-vivifies `[]` there rather than
+`null` -- a different shape from this fix's own terminal-only rule, confirmed live but not
+implemented; tracked separately as
+[#2314](https://github.com/rust-works/succinctly/issues/2314).
+
 ### Other categories
 
 Float and number formatting ([#1071](https://github.com/rust-works/succinctly/issues/1071),

@@ -35690,13 +35690,19 @@ fn pad_with_nulls(arr: &mut Vec<OwnedValue>, index: usize) -> Result<(), EvalErr
 /// positive out-of-range *delete* index needs the gap *before* it filled,
 /// never the index itself (there is nothing to put there once it's being
 /// deleted), where `setpath`'s own `pad_with_nulls` grows to make the
-/// target index itself valid for the write that follows. Shared by
+/// target index itself valid for the write that follows. A thin
+/// `target_len - 1` adapter over `pad_with_nulls` rather than a second
+/// copy of its fallible-reserve-then-resize dance (#1670's own guard,
+/// reused rather than duplicated -- #2305 review) -- shared by
 /// `delete_at_path`'s `Expr::Index` arm and `delete_keys`'s own
-/// single-key case rather than duplicating the fallible-reserve-then-
-/// resize dance (#1670) twice. `target_len <= arr.len()` is a safe no-op
-/// (matches `Vec::resize`'s own contract, and is exactly what real yq
-/// does when the requested index lands right at the current length) --
-/// callers never need to check first.
+/// single-key case. `target_len <= arr.len()` is a safe no-op (matches
+/// `Vec::resize`'s own contract, and is exactly what real yq does when
+/// the requested index lands right at the current length) -- callers
+/// never need to check first, and this guard is also what keeps
+/// `target_len - 1` (below) from underflowing: `pad_with_nulls` itself
+/// has no such guard on its own `index`, relying on every existing
+/// caller already establishing `index + 1 > arr.len()` first, same as
+/// this one now does.
 fn extend_array_with_nulls_for_delete(
     arr: &mut Vec<OwnedValue>,
     target_len: usize,
@@ -35704,14 +35710,7 @@ fn extend_array_with_nulls_for_delete(
     if target_len <= arr.len() {
         return Ok(());
     }
-    arr.try_reserve(target_len - arr.len())
-        .map_err(|_| cannot_grow_array(target_len as u64))?;
-    // #1670: already guarded -- `try_reserve` above already proved the
-    // capacity is reservable, so this can't panic the way an unguarded
-    // `resize` (#1017's own panic site) can.
-    #[allow(clippy::disallowed_methods)]
-    arr.resize(target_len, OwnedValue::Null);
-    Ok(())
+    pad_with_nulls(arr, target_len - 1)
 }
 
 /// Helper to set a value at a path
@@ -37036,11 +37035,19 @@ fn delete_trie_array(
     }
 
     // Terminal indices go through `delete_keys`, which silently drops an
-    // index that names nothing in jq mode (or a positive-out-of-range one in
-    // any mode), `?` or not (#415/#477) — but raises on a negative
-    // out-of-range one in yq mode instead (#2268) — and resolves every
+    // index that names nothing in jq mode (or a positive-out-of-range one
+    // in any mode), `?` or not (#415/#477) — but raises on a negative
+    // out-of-range one in yq mode instead (#2268), and resolves every
     // negative index against the length the array had on entry, in one
-    // batch, so overlapping ranges union rather than compound (#424).
+    // batch, so overlapping ranges union rather than compound (#424). A
+    // *positive* out-of-range index is a different story since #2305: in
+    // yq mode, when `doomed` names exactly one terminal index and it
+    // resolves out of range, `delete_keys` extends the array with `null`
+    // instead of dropping it — see that function's own doc comment for
+    // why this is gated on a single-key batch specifically (a
+    // `del(.[5], .[7])` comma-form reaching two or more terminal indices
+    // here shares that same gate, and stays at the pre-#2305 no-op
+    // behavior).
     let doomed: Vec<OwnedValue> = node
         .indices
         .iter()
