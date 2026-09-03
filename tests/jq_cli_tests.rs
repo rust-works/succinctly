@@ -20556,6 +20556,46 @@ fn test_slurp_accepts_nesting_under_limit_1818() -> Result<()> {
     Ok(())
 }
 
+/// #2299: `#1818`'s own guard above covers `validate_json_delimiters`
+/// (`parse_json_stream`'s fallback), the *input*-parsing side of `--slurp`.
+/// It does not cover the separate *output*-materialization boundary
+/// (`materialize_stream_item`'s `GenericResult::One`/`OneCursor` arms,
+/// `jq_runner.rs`), which called `eval_generic::to_owned` directly with no
+/// guard of any kind. `--slurp` wraps its whole input in one more array
+/// level (confirmed by `test_slurp_accepts_nesting_under_limit_1818` above:
+/// `[{input}]`, not bare `{input}`), so a 255-deep input -- one level
+/// *under* #1818's own 256 input-parsing ceiling, and so accepted by it --
+/// became 256-deep once wrapped, landing exactly on `to_owned`'s panicking
+/// ceiling with no guard left to catch it. Confirmed live before this fix:
+/// `succinctly jq --slurp '.'` on `nested_arrays(255)` panicked (exit 101,
+/// `thread '<unnamed>' panicked at ...: nesting depth exceeds limit of
+/// 256`) instead of reporting the clean, catchable error every sibling
+/// case in this file already gets.
+#[test]
+fn test_slurp_output_materialization_reports_clean_error_past_the_wrap_boundary_2299() -> Result<()>
+{
+    let input = nested_arrays(255);
+    let (stdout, stderr, code) = run_jq_full(&["-c", "--slurp", "."], Some(&input))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 256"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// Companion to the #2299 test above: one level shallower (254) still
+/// clears the wrap boundary (254 + 1 == 255, still under the 256 ceiling)
+/// and must succeed, matching #1818's own under-limit companion.
+#[test]
+fn test_slurp_output_materialization_accepts_nesting_at_the_wrap_boundary_2299() -> Result<()> {
+    let input = nested_arrays(254);
+    let (stdout, stderr, code) = run_jq_full(&["-c", "--slurp", "."], Some(&input))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), format!("[{input}]"));
+    Ok(())
+}
+
 /// #1008 (yq PR) code review: `format_number_jq_compat`'s `value == 0.0`/
 /// `value as i64` checks don't distinguish -0.0 from 0.0 (IEEE 754), so a
 /// negative-zero exponent literal silently lost its sign across all three

@@ -151,6 +151,47 @@ pub fn check_nesting_depth(depth: usize) -> Result<(), EvalError> {
     }
 }
 
+/// Depth-only sibling of `to_owned_at_depth` (#2299).
+///
+/// Walks the identical object/array recursion shape, but only to answer
+/// whether `to_owned` would panic on this value -- no materialization, no
+/// key decoding, no delimiter validation. For a caller that already holds
+/// a `V`-typed filter-output value (not raw input bytes, so
+/// `jq_runner.rs`'s own `validate_json_delimiters`/`check_nesting_depth`
+/// pairing doesn't apply) and needs `to_owned`'s hot-path panic converted
+/// into a catchable error at one specific CLI-output boundary, without
+/// taking on a second, fuller copy of `to_owned_at_depth`'s own
+/// materialization logic (the far heavier route `yq_runner.rs`'s
+/// `to_owned_canonicalizing_numbers_at_depth` takes, justified there by the
+/// genuinely different number-canonicalizing work it also does -- this
+/// caller needs nothing else).
+///
+/// `--slurp`'s own re-wrapping of its whole input in one more array level
+/// (`materialize_stream_item`'s only caller today) means a value that
+/// reaches here can be one level deeper than whatever originally cleared
+/// `check_nesting_depth`'s own input-parsing guard, so this cannot assume
+/// the value is already known-shallow and skip the walk.
+pub fn check_value_nesting_depth<V: DocumentValue>(
+    value: &V,
+    depth: usize,
+) -> Result<(), EvalError> {
+    check_nesting_depth(depth)?;
+    if let Some(fields) = value.as_object() {
+        let mut f = fields;
+        while let Some((field, rest)) = f.uncons() {
+            check_value_nesting_depth(&field.value, depth + 1)?;
+            f = rest;
+        }
+    } else if let Some(elements) = value.as_array() {
+        let mut elems = elements;
+        while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
+            check_value_nesting_depth(&elem_cursor.value(), depth + 1)?;
+            elems = rest;
+        }
+    }
+    Ok(())
+}
+
 /// Convert a DocumentValue to an OwnedValue.
 ///
 /// This enables the evaluator to work with both JSON and YAML inputs.
