@@ -13124,6 +13124,51 @@ fn resolve_read_index(key: &OwnedValue, len: usize) -> Option<usize> {
     usize::try_from(resolved).ok().filter(|i| *i < len)
 }
 
+/// The three outcomes an array index can resolve to for a *delete*
+/// (`del()`/`delpaths()`), distinct from [`resolve_read_index`]'s simpler
+/// "in range or not" contract -- yq mode treats a positive out-of-range
+/// index differently from a negative one, so callers that need to tell
+/// them apart use this instead (#2305).
+enum DeleteIndexResolution {
+    /// `key` names a real element -- delete it normally.
+    InRange(usize),
+    /// `key` resolved non-negative but still `>= len` -- real yq (v4.53.3,
+    /// confirmed live) extends the array with `null` up to this length
+    /// rather than treating the deletion as a no-op:
+    /// `[1,2] | del(.[5])` is `[1,2,null,null,null]`, length 5 (the
+    /// requested index itself, not `index + 1` -- there is nothing *at*
+    /// the deleted position once it exists, only a gap filled up to it).
+    /// jq has no such rule (`del(.[5])` on the same input is a no-op), so
+    /// this variant is only ever acted on in yq mode.
+    PositiveOutOfRange(usize),
+    /// `key` is NaN, or resolved negative even after adjusting for `len`
+    /// (magnitude too large) -- a no-op in both modes today, matching
+    /// `resolve_read_index`'s existing contract for reads. Real yq
+    /// actually *raises* on the negative case (confirmed live:
+    /// `[1,2] | del(.[-10])` errors "index [-10] out of range, array size
+    /// is 2") -- #2268 tracks that separately; this variant intentionally
+    /// does not distinguish NaN from negative-OOB, since #2305's own scope
+    /// is the positive case only.
+    Skip,
+}
+
+/// [`resolve_read_index`]'s delete-specific sibling -- same truncation and
+/// negative-index resolution, but keeps the positive-out-of-range case
+/// distinguishable from everything else that would otherwise collapse into
+/// "no such element" (see [`DeleteIndexResolution`]'s own doc comment for
+/// why that distinction matters).
+fn resolve_delete_index(key: &OwnedValue, len: usize) -> DeleteIndexResolution {
+    let Some(index) = numeric_key_to_index(key) else {
+        return DeleteIndexResolution::Skip;
+    };
+    let resolved = if index < 0 { len as i64 + index } else { index };
+    match usize::try_from(resolved) {
+        Ok(i) if i < len => DeleteIndexResolution::InRange(i),
+        Ok(i) => DeleteIndexResolution::PositiveOutOfRange(i),
+        Err(_) => DeleteIndexResolution::Skip,
+    }
+}
+
 /// Builtin: getpath(path) - get value at path
 fn builtin_getpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     path_expr: &Expr,
@@ -35668,6 +35713,35 @@ fn pad_with_nulls(arr: &mut Vec<OwnedValue>, index: usize) -> Result<(), EvalErr
     Ok(())
 }
 
+/// [`pad_with_nulls`]'s delete-side counterpart (#2305) -- extends `arr`
+/// with `null` up to `target_len` exactly, not `target_len + 1`: a
+/// positive out-of-range *delete* index needs the gap *before* it filled,
+/// never the index itself (there is nothing to put there once it's being
+/// deleted), where `setpath`'s own `pad_with_nulls` grows to make the
+/// target index itself valid for the write that follows. Shared by
+/// `delete_at_path`'s `Expr::Index` arm and `delete_keys`'s own
+/// single-key case rather than duplicating the fallible-reserve-then-
+/// resize dance (#1670) twice. `target_len <= arr.len()` is a safe no-op
+/// (matches `Vec::resize`'s own contract, and is exactly what real yq
+/// does when the requested index lands right at the current length) --
+/// callers never need to check first.
+fn extend_array_with_nulls_for_delete(
+    arr: &mut Vec<OwnedValue>,
+    target_len: usize,
+) -> Result<(), EvalError> {
+    if target_len <= arr.len() {
+        return Ok(());
+    }
+    arr.try_reserve(target_len - arr.len())
+        .map_err(|_| cannot_grow_array(target_len as u64))?;
+    // #1670: already guarded -- `try_reserve` above already proved the
+    // capacity is reservable, so this can't panic the way an unguarded
+    // `resize` (#1017's own panic site) can.
+    #[allow(clippy::disallowed_methods)]
+    arr.resize(target_len, OwnedValue::Null);
+    Ok(())
+}
+
 /// Helper to set a value at a path
 ///
 /// Follows jq: `null` is the only value auto-vivified into whatever container
@@ -36087,7 +36161,21 @@ fn delete_keys(
             // .[1:3])` is `[4]`, and a slice naming the same element as a bare
             // index deletes it once — `delpaths([[1],[{"start":1,"end":2}]])`
             // is `[1,3,4]`.
+            //
+            // #2305: a *single*-key batch's own positive-out-of-range index
+            // gets the same null-extension `delete_at_path`'s `Expr::Index`
+            // arm does (`delpaths([[5]])` on `[1,2]` matches `del(.[5])`
+            // exactly, confirmed live) -- gated on `keys.len() == 1`
+            // deliberately, not extended to a multi-key batch: confirmed
+            // live that mixing an in-range delete with an out-of-range one
+            // is order-*dependent* in real yq (`delpaths([[0],[5]])` vs
+            // `delpaths([[5],[0]])` on the same `[1,2,3]` give *different*
+            // results, 5 vs 4 elements) -- this batch/single-`retain`-pass
+            // model has no way to replicate that without processing keys
+            // sequentially, a materially larger change; tracked separately
+            // as #2306 rather than guessed at here.
             let mut indices: Vec<usize> = vec_with_capacity(keys.len());
+            let mut single_key_oob_target: Option<usize> = None;
             for key in keys {
                 match key {
                     OwnedValue::Object(desc) => {
@@ -36116,8 +36204,22 @@ fn delete_keys(
                         {
                             return Err(err);
                         }
-                        if let Some(idx) = resolve_read_index(key, arr.len()) {
-                            indices.push(idx);
+                        // #2305: a positive out-of-range index needs its own,
+                        // different treatment (extend, not raise) -- see
+                        // `resolve_delete_index`'s own doc comment. Reached
+                        // only when the negative-raise check above didn't
+                        // already return, so `Skip` here only ever means
+                        // NaN or (in jq mode) a negative-OOB index that
+                        // stays a no-op.
+                        match resolve_delete_index(key, arr.len()) {
+                            DeleteIndexResolution::InRange(idx) => indices.push(idx),
+                            DeleteIndexResolution::PositiveOutOfRange(target_len)
+                                if yq_mode && keys.len() == 1 =>
+                            {
+                                single_key_oob_target = Some(target_len);
+                            }
+                            DeleteIndexResolution::PositiveOutOfRange(_)
+                            | DeleteIndexResolution::Skip => {}
                         }
                     }
                     other => {
@@ -36137,6 +36239,9 @@ fn delete_keys(
                 index += 1;
                 !doomed
             });
+            if let Some(target_len) = single_key_oob_target {
+                extend_array_with_nulls_for_delete(&mut arr, target_len)?;
+            }
             Ok(OwnedValue::Array(arr))
         }
         // `null` has no fields to begin with, so deleting one is a no-op —
@@ -37352,17 +37457,31 @@ fn delete_at_path(
                 let key = OwnedValue::Int(*idx);
                 // #2268: real yq raises on a negative index whose magnitude
                 // still exceeds the array length after resolving against it
-                // -- checked before the silent-skip fallback below, which
+                // -- checked before the resolution match below, which
                 // still applies to jq mode and to yq's own ordinary
                 // positive-out-of-range case (#477).
                 if let Some(err) = yq_negative_index_error_for_len(yq_mode, &key, arr.len()) {
                     return Err(err);
                 }
-                if let Some(actual_idx) = resolve_read_index(&key, arr.len()) {
-                    arr.remove(actual_idx);
+                // #2305: a positive out-of-range index needs its own,
+                // different treatment (extend, not raise) -- see
+                // `DeleteIndexResolution`'s own doc comment for the
+                // confirmed live boundary. jq has no such rule, so the
+                // extension is yq-mode only; jq mode falls through to the
+                // existing no-op below (`Skip` here only ever means NaN,
+                // since a real negative-OOB index already raised above,
+                // when it was going to).
+                match resolve_delete_index(&key, arr.len()) {
+                    DeleteIndexResolution::InRange(actual_idx) => {
+                        arr.remove(actual_idx);
+                    }
+                    DeleteIndexResolution::PositiveOutOfRange(target_len) if yq_mode => {
+                        extend_array_with_nulls_for_delete(arr, target_len)?;
+                    }
+                    // An out-of-range index names nothing to delete — jq's
+                    // delpaths silently skips it, `?` or not (#477).
+                    DeleteIndexResolution::PositiveOutOfRange(_) | DeleteIndexResolution::Skip => {}
                 }
-                // An out-of-range index names nothing to delete — jq's
-                // delpaths silently skips it, `?` or not (#477).
                 Ok(())
             }
             // `null` has no elements at any index, so this is always a
@@ -68526,6 +68645,101 @@ mod tests {
         // covered here only to pin that this fix didn't disturb it.
         yq_query!(br#"{"a":1}"#, r"del(.)",
             QueryResult::None => {}
+        );
+    }
+
+    #[test]
+    fn test_del_positive_out_of_range_index_extends_with_null_yq_mode_2305() {
+        // #2305: real yq (v4.53.3, confirmed live) extends the array with
+        // `null` up to the requested out-of-range length rather than
+        // no-opping the way jq does -- `[1,2] | del(.[5])` is
+        // `[1,2,null,null,null]`, length 5 (the requested index itself,
+        // not `index + 1`).
+        yq_query!(br"[1,2]", r"del(.[5])",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(
+                    arr,
+                    vec![
+                        OwnedValue::Int(1), OwnedValue::Int(2),
+                        OwnedValue::Null, OwnedValue::Null, OwnedValue::Null,
+                    ]
+                );
+            }
+        );
+        // From an empty array -- extends purely with `null`.
+        yq_query!(br"[]", r"del(.[3])",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Null; 3]);
+            }
+        );
+        // The boundary case: index == length exactly names the very next
+        // append position, with no gap to fill -- a genuine no-op, same as
+        // jq (and unaffected by this fix, since `resolve_delete_index`
+        // still resolves this as `InRange`... no -- `PositiveOutOfRange`
+        // with target_len == current len, `arr.resize` to the same length
+        // is itself a no-op). Confirmed live against real yq.
+        yq_query!(br"[1,2]", r"del(.[2])",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+            }
+        );
+        // A negative out-of-range index is untouched by this fix -- #2268
+        // (landed separately) makes it raise instead of no-opping, matching
+        // real yq; this fix's own `resolve_delete_index`/`Skip` path is
+        // never reached for this case since #2268's own check runs first.
+        yq_query!(br"[1,2]", r"del(.[-10])",
+            QueryResult::Error(e) => {
+                assert!(e.message.contains("out of range"), "message: {}", e.message);
+            }
+        );
+    }
+
+    #[test]
+    fn test_del_positive_out_of_range_index_jq_mode_stays_noop_2305() {
+        // jq has no such extension rule -- `del(.[5])` on `[1,2]` is a
+        // plain no-op in real jq 1.7.1, confirmed live. This fix is
+        // yq-mode only.
+        query!(br"[1,2]", r"del(.[5])",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+            }
+        );
+    }
+
+    #[test]
+    fn test_delpaths_single_key_positive_out_of_range_extends_with_null_yq_mode_2305() {
+        // #2305: `delpaths([[N]])` (a single-element outer path list, the
+        // same terminal shape `del(.[N])` reduces to) shares the identical
+        // null-extension behavior -- confirmed live, byte-for-byte the
+        // same result as `del(.[5])` above.
+        yq_query!(br"[1,2]", r"delpaths([[5]])",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(
+                    arr,
+                    vec![
+                        OwnedValue::Int(1), OwnedValue::Int(2),
+                        OwnedValue::Null, OwnedValue::Null, OwnedValue::Null,
+                    ]
+                );
+            }
+        );
+    }
+
+    #[test]
+    fn test_delpaths_multi_key_out_of_range_stays_noop_known_gap_2305() {
+        // #2306 (deferred from #2305, not this issue's scope): a
+        // multi-key `delpaths()` batch mixing an in-range delete with an
+        // out-of-range one is order-*dependent* in real yq (confirmed
+        // live in #2306's own filing) -- the batch/single-`retain`-pass
+        // model this function uses has no way to replicate that, so a
+        // 2+-key batch's own out-of-range members stay a no-op exactly
+        // like before this fix. Pinned here as a known gap, not a
+        // regression: only the in-range key (index 0) is actually
+        // deleted.
+        yq_query!(br"[1,2,3]", r"delpaths([[0],[5]])",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::Int(2), OwnedValue::Int(3)]);
+            }
         );
     }
 
