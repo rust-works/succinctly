@@ -28760,6 +28760,43 @@ fn test_negative_index_out_of_range_survives_owned_target_computed_index_2254() 
     Ok(())
 }
 
+/// #2270: `eval_stage_with_path_context`'s `Expr::Try` arm had no
+/// uncatchable-error guard at all (unlike its `Expr::Optional` sibling,
+/// fixed by #2227) -- `try`/`catch` under `--eval-all`, combined with a
+/// path-context-triggering builtin elsewhere in the same pipeline
+/// (`file_index` here), wrongly ran the catch handler on a yq
+/// negative-index error instead of letting it survive. Each case pairs the
+/// `try`/`catch` query with an equivalent bare-`?` one to confirm both
+/// dispatch paths through this function now agree.
+#[test]
+fn test_negative_index_out_of_range_survives_try_catch_under_eval_all_2270() -> Result<()> {
+    let multi_doc = "a: [1, 2]\n---\na: [3, 4]\n";
+
+    let (out, stderr, code) = run_yq_stdin_with_stderr(
+        "(try .[0].a[-5] catch \"c\"), file_index",
+        multi_doc,
+        &["-o", "json", "--eval-all"],
+    )?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+
+    let (out, stderr, code) = run_yq_stdin_with_stderr(
+        "(.[0].a[-5]?, file_index)",
+        multi_doc,
+        &["-o", "json", "--eval-all"],
+    )?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+
+    Ok(())
+}
+
 /// #2254's jq-mode control: jq has no equivalent of this yq-only rule, so
 /// jq mode must be entirely unaffected by the fix -- every case above
 /// answers `null`, never raises.

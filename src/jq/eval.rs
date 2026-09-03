@@ -34250,6 +34250,17 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 optional,
             );
             let try_result = match result {
+                // #2270: an uncatchable error (a decode failure, an
+                // invalid-path-expression complaint, or a yq
+                // negative-index raise) must survive `try`/`catch` here
+                // the same way `resolve_node`'s own `Expr::Try` arm
+                // already guarantees for path-tracking evaluation, and
+                // the same way this function's own `Expr::Optional` arm
+                // now does (#2227) -- confirmed live that
+                // `(try .[0].a[-5] catch "c"), file_index` under
+                // `--eval-all` wrongly ran the catch handler before this
+                // guard existed.
+                QueryResult::Error(e) if e.is_uncatchable() => QueryResult::Error(e),
                 QueryResult::Error(e) => match catch.as_deref() {
                     Some(catch_expr) => pair_outputs_with_path::<W>(
                         eval_pipe_with_path_context_internal::<W, S>(
@@ -34278,6 +34289,9 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     ),
                     None => QueryResult::None,
                 },
+                QueryResult::Partial(prefix, Control::Error(e)) if e.is_uncatchable() => {
+                    QueryResult::Partial(prefix, Control::Error(e))
+                }
                 QueryResult::Partial(prefix, Control::Error(e)) => {
                     let handled = match catch.as_deref() {
                         Some(catch_expr) => pair_outputs_with_path::<W>(
