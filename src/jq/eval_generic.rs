@@ -329,11 +329,16 @@ fn to_owned_at_depth<V: DocumentValue>(value: &V, depth: usize) -> Result<OwnedV
         // back as `[null]` at exit 0 where real jq raises a parse error
         // (#1194). The semi-index's own message is more specific than
         // anything reconstructible here, so it is passed through verbatim.
-        Err(EvalError::new(
+        // #2286: `decode_failure`, not `new` -- same uncatchable class as
+        // every other `StandardJson::Error`/`is_error()` site this issue
+        // fixed (confirmed live: this exact generic-evaluator `to_owned_at_depth`
+        // is what `resolve_fold_source`/`reduce`'s fold-source path calls,
+        // so `[1, xyz123] | try add catch "caught"` stayed wrongly catchable
+        // until this arm was retagged too).
+        Err(EvalError::decode_failure(
             value
                 .error_message()
-                .unwrap_or("malformed value in document")
-                .to_string(),
+                .unwrap_or("malformed value in document"),
         ))
     } else {
         // A genuinely unknown type: no format implements one today, so this
@@ -1675,7 +1680,13 @@ fn owned_from_standard_json_at_depth<W: Clone + AsRef<[u64]>>(
         }
         // See `to_owned_at_depth`'s own `is_error` arm (#1194/#1247): a
         // structurally malformed value raises rather than becoming `null`.
-        StandardJson::Error(msg) => return Err(EvalError::new((*msg).to_string())),
+        // #2286: decode_failure, not new -- a bareword-garbage token is the
+        // same "real jq rejects this at parse time" class as the malformed
+        // member/delimiter errors #2286 already tagged; leaving this arm
+        // ordinary/catchable was a real, live gap review caught (`[1,
+        // xyz123] | try add catch "caught"` wrongly printed `"caught"`
+        // instead of raising, unlike real jq).
+        StandardJson::Error(msg) => return Err(EvalError::decode_failure(*msg)),
     })
 }
 
@@ -2423,11 +2434,13 @@ fn push_generic_truthiness_cursor_error<C: DocumentCursor>(c: &C, depth: usize) 
     } else if let Some(reason) = value.string_decode_error() {
         Some(Control::Error(EvalError::decode_failure(reason)))
     } else if value.is_error() {
-        Some(Control::Error(EvalError::new(
+        // #2286: `decode_failure`, not `new` -- see `to_owned_at_depth`'s
+        // own `is_error()` arm above for the full rationale; this is the
+        // truthiness-check sibling of that same class.
+        Some(Control::Error(EvalError::decode_failure(
             value
                 .error_message()
-                .unwrap_or("malformed value in document")
-                .to_string(),
+                .unwrap_or("malformed value in document"),
         )))
     } else {
         None

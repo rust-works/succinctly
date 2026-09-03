@@ -754,7 +754,16 @@ fn to_owned_at_depth<W: Clone + AsRef<[u64]>>(
             }
             OwnedValue::Object(map)
         }
-        StandardJson::Error(_) => OwnedValue::Null,
+        // #2286 review: this arm used to silently substitute `Null` for a
+        // bareword-garbage token (`StandardJson::Error`, e.g. `xyz123`),
+        // contradicting this function's own doc comment ("raising
+        // EvalError::decode_failure on anything it cannot decode") -- worse
+        // than merely catchable, since no error was raised for a caller to
+        // even suppress. Real jq treats this the same as every other #1194
+        // shape: an unconditional parse error (confirmed live against jq
+        // 1.7.1: `[1, xyz123] | add` exits 5 regardless of a wrapping
+        // `try...catch`).
+        StandardJson::Error(msg) => return Err(EvalError::decode_failure(*msg)),
     })
 }
 
@@ -45653,35 +45662,24 @@ mod tests {
         );
     }
 
-    /// #1953: the seven `to_owned` call sites tested individually
-    /// below all propagated this non-decode-failure error unconditionally,
-    /// ignoring `optional`, before this fix -- diverging from an adjacent
-    /// sibling arm at the very same boundary in every case.
-    ///
-    /// None of the seven is reachable with `optional: true` through any
-    /// real `?`/`try` syntax today (code review, #1953): `Expr::Optional`'s
-    /// dispatch (see the doc comment on `eval_single`'s own `Expr::Optional
-    /// (inner) if matches!(**inner, Expr::IndexExpr{..}|Expr::SliceExpr{..})`
-    /// arm) only ever forwards `optional: true` *directly* into a callee for
-    /// that one dynamic-bounds index/slice shape. Every other spelling of
-    /// `?` -- including a literal-bounds slice like `.[0:1]?` (which folds
-    /// to `Expr::Slice`, not `Expr::SliceExpr`, so it
-    /// doesn't take that bypass either) and Assign/Update/SetPath/
-    /// Combinations, none of which are Index/Slice at all -- instead
-    /// evaluates its inner expression with the *ambient* `optional` and
-    /// lets `eval_try`'s own catch-and-convert machinery decide the
-    /// aggregate outcome afterward, independent of what the callee did
-    /// internally. So each site is exercised directly here, the same way
-    /// this file's own pre-existing `eval_assign_optional_swallows_
-    /// ordinary_path_error_called_directly` and its siblings already test
-    /// `optional`-gated behavior with no reachable `?` spelling of its own.
-    /// Fixing it anyway keeps every one of these functions' own `optional`
-    /// parameter internally consistent with what its doc comment already
-    /// promises, in case a future caller (or a future widening of the
-    /// `Expr::Optional` bypass above) ever does reach it with `true`.
-    /// Split one function per site (rather than one function with seven
-    /// blocks) so a regression at any single site fails its own test
-    /// instead of hiding behind an earlier block's panic.
+    /// #1953 named this test (and its six siblings below, sharing this
+    /// function's name in their own doc comments) for the premise that each
+    /// of these seven `to_owned` call sites should respect `optional` for a
+    /// #1194 malformed-member error, the same way an adjacent sibling arm at
+    /// the same boundary already did. #2286 found that premise was never
+    /// checked against the real jq oracle and reversed it (see
+    /// `test_malformed_member_error_is_not_a_decode_failure_1953` above):
+    /// this error class is `is_decode_failure()`-tagged, so `optional` can
+    /// no longer make a difference here -- `eval_try`'s dispatch excludes
+    /// `is_decode_failure()` from ever reaching a `catch` handler or being
+    /// suppressed by `?`, unconditionally. Each site is still exercised
+    /// individually with `optional` in `[true, false]` and asserted to
+    /// raise a decode failure *either way* -- proving `optional` is now a
+    /// genuine no-op for this error class at every one of the seven sites,
+    /// not just the one #1953 originally profiled. Kept as one function per
+    /// site (rather than one function with seven blocks), matching #1953's
+    /// original split, so a regression at any single site fails its own
+    /// test instead of hiding behind an earlier block's panic.
     #[test]
     fn test_eval_single_yq_slice_respects_optional_for_malformed_member_error_1953() {
         let json_bytes: &[u8] = br#"{"a":1,"b"}"#;
