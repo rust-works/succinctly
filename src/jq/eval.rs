@@ -32040,6 +32040,24 @@ fn eval_pipe_with_path_context_internal<'a, W: Clone + AsRef<[u64]>, S: EvalSema
 /// approximate: nothing below reads `exprs` after `split_first`, so calling
 /// this with `(x, rest)` is by construction identical to calling
 /// `eval_pipe_with_path_context_internal` with `[x] ++ rest`.
+///
+/// Several arms in this function's own body check `optional` in an
+/// `if`/match-guard that is currently unreachable with `optional == true`
+/// (marked `#2212/#2227` at each site) -- see [`catch_error_under_optional`]'s
+/// doc comment for the underlying #2073/#2212 argument (the sole former
+/// `true`-producer into this function's own top-level parameter was
+/// removed). #2227 independently re-verified every remaining candidate a
+/// grep for `if optional`/`optional =>` in this function turns up: a
+/// temporary `debug_assert!(!optional, ...)` probe at each one fired zero
+/// times across the full `jq_cli_tests`/`yq_cli_tests`/lib suite (~6,080
+/// test cases, corroborated by an independent 7,139-test re-run during
+/// review), and `optional` is never shadowed (`let optional = ...`)
+/// anywhere in this function's body and never passed a literal `true` by
+/// any internal/recursive call -- so the value each site reads really is
+/// this function's own top-level parameter. Kept as intentional defensive
+/// code rather than deleted, matching `catch_error_under_optional`'s own
+/// "a future path-context arm could legitimately reintroduce a real
+/// producer of `true`" precedent.
 #[allow(clippy::too_many_arguments)]
 fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     first: &Expr,
@@ -32150,17 +32168,10 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Err(_) if optional => return QueryResult::None,
                 Err(e) => return QueryResult::Error(e),
             },
-            // Same `optional`, same evidence, same #2212 conclusion as the
-            // arm just above -- currently unreachable with `optional ==
-            // true`, see `catch_error_under_optional`'s doc comment. #2227
-            // independently re-confirmed this specific arm (not just the
-            // sibling one above it): a `debug_assert!(!optional, ...)` probe
-            // here fired zero times across the full `jq_cli_tests`/
-            // `yq_cli_tests`/lib suite (~6,080 test cases), and `optional`
-            // is never shadowed anywhere in this function's body, so the
-            // value checked here really is the function's own top-level
-            // parameter -- not a locally-rebound value this analysis could
-            // have missed.
+            // Same `optional`, same evidence as the arm just above --
+            // #2212/#2227: currently unreachable, independently confirmed
+            // for this specific arm too (see this function's own doc
+            // comment for the verification method).
             Err(EvalEscape::Error(_)) if optional => return QueryResult::None,
             Err(escape) => return escape.into(),
         };
@@ -32238,13 +32249,8 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 );
             }
             // Non-object/null: error (or None if optional). #2212/#2227:
-            // currently unreachable with `optional == true` -- see
-            // `catch_error_under_optional`'s doc comment for the underlying
-            // #2073/#2212 argument, and this same commit's note on
-            // `EvalEscape::Error(_) if optional` in the `ParentN` arm above
-            // for the verification method (`debug_assert!` probe, zero
-            // fires across ~6,080 tests; `optional` never shadowed in this
-            // function).
+            // currently unreachable with `optional == true` -- see this
+            // function's own doc comment for the verification method.
             if optional {
                 QueryResult::None
             } else {
@@ -33151,11 +33157,10 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 QueryResult::ManyOwned(vs) => vs,
                 QueryResult::None => vec![],
                 // #2212/#2227: currently unreachable with `optional ==
-                // true` -- see `Expr::Field`'s sibling arm above for the
-                // verification method (`debug_assert!` probe, zero fires
-                // across ~6,080 tests; `optional` never shadowed in this
-                // function, so `inner_result`'s own ambient `false` a few
-                // lines up doesn't affect what this arm reads).
+                // true` (see this function's own doc comment) --
+                // `inner_result`'s own ambient `false` a few lines up
+                // doesn't affect what this arm reads, `optional` here is
+                // still the function's own top-level parameter.
                 QueryResult::Error(_) | QueryResult::Partial(_, Control::Error(_)) if optional => {
                     return QueryResult::None;
                 }
@@ -33232,11 +33237,7 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         }
                         QueryResult::None => String::new(),
                         // #2212/#2227: currently unreachable with `optional
-                        // == true` -- see `Expr::Field`'s arm earlier in
-                        // this function for the verification method
-                        // (`debug_assert!` probe, zero fires across
-                        // ~6,080 tests; `optional` never shadowed anywhere
-                        // in this function).
+                        // == true` (see this function's own doc comment).
                         QueryResult::Error(_) | QueryResult::Partial(_, Control::Error(_))
                             if optional =>
                         {
@@ -33293,13 +33294,11 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // `Break`/`Halt` are never caught by `?`, matching every
                 // other `?` site in this file.
                 // #2212/#2227: currently unreachable with `optional ==
-                // true` in *this* (path-context) evaluator -- the jq
-                // 1.7.1-verified behavior in the comment above describes
-                // what this arm would need to do if ever reached that way,
-                // not evidence that it currently is; a `debug_assert!`
-                // probe here fired zero times across ~6,080 tests, same as
-                // every other site in this function (see `Expr::Field`'s
-                // arm earlier for the full method).
+                // true` in *this* (path-context) evaluator (see this
+                // function's own doc comment) -- the jq 1.7.1-verified
+                // behavior in the comment above describes what this arm
+                // would need to do if ever reached that way, not evidence
+                // that it currently is.
                 Err(Control::Error(_)) if optional => owned_vec_to_result(out),
                 Err(control) => partial(out, control),
             };
@@ -33982,10 +33981,7 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
                 // `?` swallows only a genuine error; a halt always escapes
                 // (#791). #2212/#2227: currently unreachable with `optional
-                // == true` -- see `Expr::Field`'s arm earlier in this
-                // function for the verification method (`debug_assert!`
-                // probe, zero fires across ~6,080 tests; `optional` never
-                // shadowed anywhere in this function).
+                // == true` (see this function's own doc comment).
                 QueryResult::Error(_) if optional => QueryResult::None,
                 QueryResult::Error(e) => QueryResult::Error(e),
                 QueryResult::Break(label) => QueryResult::Break(label),
