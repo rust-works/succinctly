@@ -595,11 +595,6 @@ impl EvalError {
         Self::new(format!("expected {expected}, got {got}"))
     }
 
-    /// Create an index out of bounds error.
-    pub fn index_out_of_bounds(index: i64, len: usize) -> Self {
-        Self::new(format!("index {index} out of bounds (length {len})"))
-    }
-
     // ===== jq message shapes ============================================
     //
     // Grouped by sentence shape rather than by call site, because jq reuses

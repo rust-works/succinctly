@@ -443,7 +443,13 @@ way `set_value_at_path` already did for `setpath()`) and
 bounds check now survives `?`, since padding is what makes the positive case succeed rather
 than needing `?` to swallow a failure). No write operator produces `index N out of bounds
 (length M)` any more; a numeric index past the end is not an error jq raises, so there is no
-longer a positive case for succinctly's own wording to cover.
+longer a positive case for succinctly's own wording to cover. The one remaining read-side
+producer -- `eval_stage_with_path_context`'s `Expr::Index` arm, reached only when a
+path-context builtin (`key`/`parent`/`path`/`file_index`) sits downstream of an out-of-bounds
+`.[N]` -- was closed the same way by
+[#2213](https://github.com/rust-works/succinctly/issues/2213): the arm now continues with
+`null` at the extended path instead of raising, matching plain `.a[5]`. `EvalError::
+index_out_of_bounds` (the constructor for this exact wording) is now unused and was removed.
 
 `del()` used to sit here too — `del(.[5])` and `del(.[-5])` on `[1,2]`, plus a missing
 intermediate key or an out-of-range index — but every one of those is a silent no-op now,

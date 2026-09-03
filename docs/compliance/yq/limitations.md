@@ -1437,6 +1437,55 @@ disagree). Fully aligning yq-mode `fromjson` with real yq's stricter, non-pairin
 [#2018](https://github.com/rust-works/succinctly/issues/2018), since it needs its own
 yq-mode branch checked ahead of all of jq's pairing logic, not an arm-by-arm patch.
 
+### `parent` doesn't auto-vivify the missing node it navigated through
+
+[#2146](https://github.com/rust-works/succinctly/issues/2146) (defect 3, still open --
+defects 1 and 2 there were fixed by
+[#2213](https://github.com/rust-works/succinctly/issues/2213)). `key`/`parent`/`path`/
+`file_index` are real yq builtins with no jq counterpart, so real yq v4.53.3 is the only
+oracle for them. Navigating through a missing object key or an out-of-bounds array index is
+"not an error, propagate `null`" in both tools -- but real yq's `parent` goes one step
+further and auto-vivifies the missing node *into the object it returns*, as if the write had
+already happened:
+
+```bash
+$ echo '{}' | yq            -o=json -I=0 '.a | parent'
+{"a":null}
+$ echo '{}' | succinctly yq -o=json -I=0 '.a | parent'
+{}
+```
+
+succinctly has no vivification machinery anywhere in the codebase -- `parent`'s return value
+is always a real node already present in the document, walked to via the accumulated path.
+Post-#2213, that's the *un-vivified* ancestor (`{}`, the actual root) rather than the
+pre-#2213 stub (`null`, `key`/`path`/`parent`'s shared fallback for any path-tracking
+failure) -- a real improvement, since `{}` is at least a genuine document node consistent
+with what `path()`/`key` now report for the same navigation, but still short of yq's
+synthetic `{"a":null}`. Implementing this needs `parent`/`parent(n)` to be able to construct
+a value that isn't a snapshot of anything in the document -- a different kind of change than
+#2213's path-threading fix, which only ever continues with a value already known to be
+correct (`Null`, jq's own answer for what the missing/OOB read itself evaluates to).
+
+### A negative out-of-range array index (`.a[-N]`) silently returns `null` instead of raising
+
+[#2254](https://github.com/rust-works/succinctly/issues/2254), pre-existing and unrelated to
+#2213 -- found while verifying that fix's own reach. Real yq disagrees with real jq on a
+negative index whose magnitude exceeds the array length: jq treats it the same as a positive
+out-of-range index (`null`, not an error); yq raises. A positive out-of-range index is `null`
+in both tools -- the asymmetry is specific to the negative-magnitude case:
+
+```bash
+$ echo '{"a":[1,2]}' | yq -o=json '.a[-1]'   # 2   (in-bounds negative wraparound: fine)
+$ echo '{"a":[1,2]}' | yq -o=json '.a[-2]'   # 1   (in-bounds: fine)
+$ echo '{"a":[1,2]}' | yq -o=json '.a[-3]'   # Error: index [-3] out of range, array size is 2
+```
+
+`resolve_read_index`/`index_one`/`index_one_owned` (`src/jq/eval.rs`) treat "index doesn't
+resolve" as one outcome with no `EvalSemantics`-based dispatch on sign, so `succinctly yq`
+currently gives `null` for the negative-out-of-range case rather than raising -- reachable
+via the plain evaluator alone (`.a[-5]`, no path-context builtin involved), predating #2213
+entirely.
+
 ### Other categories
 
 Float and number formatting ([#1071](https://github.com/rust-works/succinctly/issues/1071),

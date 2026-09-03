@@ -31870,6 +31870,11 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // regardless of `optional`, rather than routing it through
                 // the error-suppression path below, which both swallowed
                 // `rest` entirely under `?` and wrongly raised without one.
+                // `resolve_read_index` doesn't distinguish sign here, but
+                // real yq does (#2254, pre-existing, unrelated to this fix):
+                // it raises on a negative index whose magnitude exceeds the
+                // array length, where jq (and yq's own positive-OOB case)
+                // both agree on `null`.
                 return continue_rest_with_borrowed_value::<W, S>(
                     &OwnedValue::Null,
                     rest,
