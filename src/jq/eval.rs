@@ -67320,6 +67320,12 @@ mod tests {
             // `Optional`/`Paren`-wrapped trailing identity.
             (br#"{"a":5}"#, "del(.a | (.)?)", Ok("{}")),
             (br#"{"a":5}"#, "del(.a | (.))", Ok("{}")),
+            // A parenthesized *pipe* of identities, `?`-suppressed --
+            // exercises `trailing_identity_optional`'s own `Expr::Pipe`
+            // splice arm (a resolved `Optional(Pipe([Identity, Identity]))`
+            // component), not just its plain `Expr::Identity` arm.
+            (br#"{"a":{"b":1,"c":2}}"#, "del(.a | (. | .)?)", Ok("{}")),
+            (br#"{"a":{"b":1,"c":2}}"#, "del(.a | (.|.))", Ok("{}")),
             // `del(.)` alone is genuinely top-level (no parent to remove
             // from at all) and must keep nulling the whole document.
             (br#"{"a":1}"#, "del(.)", Ok("null")),
