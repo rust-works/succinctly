@@ -6726,8 +6726,8 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Length & Keys
         Builtin::Length => builtin_length::<W, S>(value, optional),
         Builtin::Utf8ByteLength => builtin_utf8bytelength(value, optional),
-        Builtin::Keys => builtin_keys::<W>(value, optional, true),
-        Builtin::KeysUnsorted => builtin_keys::<W>(value, optional, false),
+        Builtin::Keys => builtin_keys::<W, S>(value, optional, true),
+        Builtin::KeysUnsorted => builtin_keys::<W, S>(value, optional, false),
         Builtin::Has(key_expr) => builtin_has::<W, S>(key_expr, value, optional),
         Builtin::In(obj_expr) => builtin_in::<W, S>(obj_expr, value, optional),
         Builtin::UpperIn(s) => builtin_upper_in::<W, S>(s, value, optional),
@@ -7136,7 +7136,7 @@ fn builtin_utf8bytelength<W: Clone + AsRef<[u64]>>(
 }
 
 /// Builtin: keys / keys_unsorted
-fn builtin_keys<W: Clone + AsRef<[u64]>>(
+fn builtin_keys<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
     sorted: bool,
@@ -7165,17 +7165,16 @@ fn builtin_keys<W: Clone + AsRef<[u64]>>(
             // `keys_unsorted` writer specifically avoids via
             // `DistinctKeyCursors`/`uncons_key`. `effective_keys` is that
             // same cheap path, exposed as a free function for exactly this
-            // kind of caller. `collapse: false` matches this function's own
-            // prior behaviour on both sides of this fix (never collapsed a
-            // duplicate key, in either mode) -- `builtin_keys` has no
-            // `S: EvalSemantics` parameter to derive a mode-correct
-            // `S::COLLAPSE_DUPLICATE_KEYS` from, and real jq *does* collapse
-            // (confirmed live: `{"a":1,"a":2} | keys_unsorted` is `["a"]`).
-            // That divergence predates this fix on both the old hand-rolled
-            // walk and `DocumentFields::keys()` alike, so it isn't
-            // reintroduced or newly widened here -- tracked separately
-            // rather than folded into this fix's own narrower scope.
-            let mut keys = match effective_keys(&fields, false) {
+            // kind of caller.
+            //
+            // #2313: `S::COLLAPSE_DUPLICATE_KEYS`, not a hardcoded `false`
+            // -- this function used to have no `S: EvalSemantics` parameter
+            // to derive a mode-correct value from, so it never collapsed a
+            // duplicate key in either mode, where real jq does (confirmed
+            // live: `{"a":1,"a":2} | keys_unsorted` is `["a"]`), matching
+            // `eval_generic.rs`'s already-shipped `Builtin::Keys`/
+            // `Builtin::KeysUnsorted` siblings.
+            let mut keys = match effective_keys(&fields, S::COLLAPSE_DUPLICATE_KEYS) {
                 Ok(keys) => keys,
                 Err(e) => return QueryResult::Error(e),
             };
@@ -54896,6 +54895,51 @@ mod tests {
             QueryResult::Owned(OwnedValue::Array(arr)) => {
                 assert_eq!(arr.len(), 2);
                 // Note: Order depends on how JSON was parsed
+            }
+        );
+    }
+
+    /// #2313: `builtin_keys` had no `S: EvalSemantics` parameter to derive
+    /// a mode-correct collapse decision from, so it hardcoded `collapse:
+    /// false` and never collapsed a duplicate key in either mode -- wrong
+    /// in jq mode, where real jq *does* collapse (confirmed live:
+    /// `{"a":1,"a":2} | keys_unsorted` is `["a"]` against jq 1.7.1).
+    /// `eval_generic.rs`'s already-shipped `Builtin::Keys`/
+    /// `Builtin::KeysUnsorted` siblings already got this right via
+    /// `S::COLLAPSE_DUPLICATE_KEYS`; this pins `eval.rs`'s own copy now
+    /// agrees, in both modes -- jq collapses, yq (whose own
+    /// `COLLAPSE_DUPLICATE_KEYS` is `false`) still doesn't, unaffected by
+    /// this fix.
+    #[test]
+    fn test_builtin_keys_unsorted_collapses_duplicate_keys_in_jq_mode_2313() {
+        query!(br#"{"a":1,"a":2}"#, "keys_unsorted",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::String("a".to_string())]);
+            }
+        );
+        query!(br#"{"a":1,"a":2}"#, "keys",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(arr, vec![OwnedValue::String("a".to_string())]);
+            }
+        );
+    }
+
+    /// Companion to the test above: yq mode's own `COLLAPSE_DUPLICATE_KEYS
+    /// = false` means this fix leaves yq's `keys_unsorted` unaffected --
+    /// still no collapsing, matching its pre-fix behavior (which was
+    /// coincidentally already correct for yq, since the old hardcoded
+    /// `false` happens to equal yq's own constant).
+    #[test]
+    fn test_builtin_keys_unsorted_does_not_collapse_in_yq_mode_2313() {
+        yq_query!(br#"{"a":1,"a":2}"#, "keys_unsorted",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(
+                    arr,
+                    vec![
+                        OwnedValue::String("a".to_string()),
+                        OwnedValue::String("a".to_string())
+                    ]
+                );
             }
         );
     }
