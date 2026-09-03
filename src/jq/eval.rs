@@ -8345,12 +8345,11 @@ fn builtin_min<W: Clone + AsRef<[u64]>>(
         StandardJson::Array(elements) => {
             // #1755: to_owned, not to_owned_lossy -- an undecodable
             // string element must raise, not silently sort in as "".
-            let items: Result<Vec<OwnedValue>, EvalError> =
-                elements.map(|e| to_owned(&e)).collect();
-            let items = match items {
-                Ok(items) => items,
-                Err(e) => return QueryResult::Error(e),
-            };
+            // #2327: to_owned_vec_or_suppress!, not a bare match -- see
+            // `builtin_del`'s doc comment for the shared "consult optional
+            // like the sibling scalar arm below" reasoning and reachability
+            // caveat.
+            let items = to_owned_vec_or_suppress!(elements, optional);
             if items.is_empty() {
                 return QueryResult::Owned(OwnedValue::Null);
             }
@@ -8376,12 +8375,9 @@ fn builtin_max<W: Clone + AsRef<[u64]>>(
         StandardJson::Array(elements) => {
             // #1755: to_owned, not to_owned_lossy -- an undecodable
             // string element must raise, not silently sort in as "".
-            let items: Result<Vec<OwnedValue>, EvalError> =
-                elements.map(|e| to_owned(&e)).collect();
-            let items = match items {
-                Ok(items) => items,
-                Err(e) => return QueryResult::Error(e),
-            };
+            // #2327: to_owned_vec_or_suppress!, not a bare match -- see
+            // `builtin_min`'s sibling comment above.
+            let items = to_owned_vec_or_suppress!(elements, optional);
             if items.is_empty() {
                 return QueryResult::Owned(OwnedValue::Null);
             }
@@ -8497,13 +8493,15 @@ fn builtin_min_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
             // #1755: to_owned, not to_owned_lossy -- an undecodable
             // string result must raise, not silently return "".
+            // #2327: suppress_or_raise, not a bare match -- see
+            // `builtin_del`'s doc comment for the shared reasoning.
             let (_, v) = keyed
                 .into_iter()
                 .min_by(|(a, _), (b, _)| compare_values(a, b))
                 .unwrap();
             let min = match to_owned(&v) {
                 Ok(v) => v,
-                Err(e) => return QueryResult::Error(e),
+                Err(e) => return suppress_or_raise(e, optional),
             };
             QueryResult::Owned(min)
         }
@@ -8559,13 +8557,15 @@ fn builtin_max_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
             // #1755: to_owned, not to_owned_lossy -- an undecodable
             // string result must raise, not silently return "".
+            // #2327: suppress_or_raise, not a bare match -- see
+            // `builtin_min_by`'s sibling comment above.
             let (_, v) = keyed
                 .into_iter()
                 .max_by(|(a, _), (b, _)| compare_values(a, b))
                 .unwrap();
             let max = match to_owned(&v) {
                 Ok(v) => v,
-                Err(e) => return QueryResult::Error(e),
+                Err(e) => return suppress_or_raise(e, optional),
             };
             QueryResult::Owned(max)
         }
@@ -9551,13 +9551,10 @@ fn builtin_reverse<W: Clone + AsRef<[u64]>>(
     match value {
         // #1755: to_owned, not to_owned_lossy -- an undecodable element
         // must raise, not silently reverse in as "".
+        // #2327: to_owned_vec_or_suppress!, not a bare match -- see
+        // `builtin_del`'s doc comment for the shared reasoning.
         StandardJson::Array(elements) => {
-            let items: Result<Vec<OwnedValue>, EvalError> =
-                elements.map(|e| to_owned(&e)).collect();
-            let mut items = match items {
-                Ok(items) => items,
-                Err(e) => return QueryResult::Error(e),
-            };
+            let mut items = to_owned_vec_or_suppress!(elements, optional);
             items.reverse();
             QueryResult::Owned(OwnedValue::Array(items))
         }
@@ -9615,9 +9612,13 @@ fn builtin_flatten<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             });
         }
     };
+    // #2327: suppress_or_raise, not a bare match -- `optional` is
+    // genuinely consulted above (the yq-reject/scalar-fallback branches),
+    // so ignoring it here was the same asymmetry #2280/#2327's other sites
+    // fixed elsewhere.
     let items = match items {
         Ok(items) => items,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return suppress_or_raise(e, optional),
     };
     let flattened = flatten_owned(items, depth);
     QueryResult::Owned(OwnedValue::Array(flattened))
@@ -9824,12 +9825,9 @@ fn builtin_unique<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         StandardJson::Array(elements) => {
             // #1755: to_owned, not to_owned_lossy -- an undecodable
             // string element must raise, not silently sort in as "".
-            let items: Result<Vec<OwnedValue>, EvalError> =
-                elements.map(|e| to_owned(&e)).collect();
-            let mut items = match items {
-                Ok(items) => items,
-                Err(e) => return QueryResult::Error(e),
-            };
+            // #2327: to_owned_vec_or_suppress!, not a bare match -- see
+            // `builtin_del`'s doc comment for the shared reasoning.
+            let mut items = to_owned_vec_or_suppress!(elements, optional);
 
             // Sort first (jq's unique returns sorted unique values)
             items.sort_by(compare_values);
@@ -9962,12 +9960,9 @@ fn builtin_sort<W: Clone + AsRef<[u64]>>(
         StandardJson::Array(elements) => {
             // #1755: to_owned, not to_owned_lossy -- an undecodable
             // string element must raise, not silently sort in as "".
-            let items: Result<Vec<OwnedValue>, EvalError> =
-                elements.map(|e| to_owned(&e)).collect();
-            let mut items = match items {
-                Ok(items) => items,
-                Err(e) => return QueryResult::Error(e),
-            };
+            // #2327: to_owned_vec_or_suppress!, not a bare match -- see
+            // `builtin_del`'s doc comment for the shared reasoning.
+            let mut items = to_owned_vec_or_suppress!(elements, optional);
             items.sort_by(compare_values);
             QueryResult::Owned(OwnedValue::Array(items))
         }

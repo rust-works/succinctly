@@ -289,27 +289,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Six more sites ignored `optional`, continuing the #2231/#2280 lineage** (#2327,
+- **17 more sites ignored `optional`, continuing the #2231/#2280 lineage** (#2327,
   follow-up from #2280's own code review): `eval.rs`'s `builtin_del` (its own doc comment
   already promised "any resulting error is caught right here, turning the whole call's
   output into empty when `optional` is set" — the code wasn't honoring it for this
-  particular materialization), `builtin_envvar`, `builtin_transpose`,
-  `builtin_group_by`/`unique_by`/`sort_by`'s shared per-item conversion, and
-  `builtin_halt_error`, plus `eval_generic.rs`'s `Reverse`/`Sort`/`SortBy`/`Unique`/
-  `UniqueBy`/`Min`/`MinBy`/`Max`/`MaxBy` family (`collect_cursors_checked`). All now route
-  through `to_owned_or_suppress!`/`owned_or_suppress!`/`suppress_or_raise` instead of a
-  bare match, matching every site had a genuinely live `optional` consulted elsewhere in
-  the same function — verified per-site before fixing, to rule out the false positives
-  that pattern otherwise produces.
+  particular materialization), `builtin_transpose`, `builtin_group_by`/`unique_by`/
+  `sort_by`'s shared per-item conversion, `builtin_halt_error`, `builtin_min`/`max`/
+  `min_by`/`max_by`, `builtin_reverse`/`unique`/`sort`, `builtin_flatten`, plus
+  `eval_generic.rs`'s `Reverse`/`Sort`/`SortBy`/`Unique`/`UniqueBy`/`Min`/`MinBy`/`Max`/
+  `MaxBy` family (`collect_cursors_checked`) and its `bridge_to_full_evaluator`/`_flow`
+  (the shared reindex-bridge helper several of those same arms fall back to). All now
+  route through `to_owned_or_suppress!`/`to_owned_vec_or_suppress!`/`owned_or_suppress!`/
+  `suppress_or_raise` instead of a bare match, matching every site had a genuinely live
+  `optional` consulted elsewhere in the same function.
 
-  Same defensive character as #2280's own sites: every error path these materializations
-  can produce (string decode failure, #1194 malformed member/delimiter/element-gap) is
-  `is_decode_failure()`-tagged since #2286, so `suppresses()` is unconditionally `false`
-  regardless of `optional` — verified live (`test_optional_ignored_sites_2327`,
-  `tests/jq_cli_tests.rs`) for all seven fixed shapes, including the `Reverse`/`Sort`/…
-  family's distinct trailing-comma error class (`[1,2,3,]`, matching
-  `test_jq_collect_cursors_checked_sibling_paths_reject_trailing_comma_2261`'s own
-  fixture).
+  **A first round of this fix (7 builtins) shipped with a test that didn't prove what it
+  claimed.** Code review found `test_optional_ignored_sites_2327`'s use of a whole-document
+  decode failure (`\ud800`) passed for `del`/`transpose`/`group_by`/`halt_error`/
+  `sort_by`/`unique_by` for the wrong reason: `eval_generic.rs` is the CLI's real entry
+  point (`jq_runner.rs`/`yq_runner.rs` never call `eval.rs`'s `eval()` directly), and every
+  one of these `eval.rs` functions is reached from there only through a reindex-bridge
+  mechanism (`eval_builtin`'s `_` catch-all arm, or `bridge_to_full_evaluator`/a native
+  arm's own inlined equivalent) that calls `to_owned_with_cursor` on the *whole* document
+  **before** ever reaching `eval.rs` — so a real decode failure always raises at the
+  bridge, never at the site this PR fixed. Confirmed for `builtin_del` with temporary
+  debug instrumentation (added and removed during review): its fixed line simply never
+  runs for a `\ud800` document. The same review round also found `builtin_envvar` is a
+  step further — unreachable through any parsed CLI syntax *at all* (`env.VAR` resolves
+  through a different code path entirely), a fact this codebase already documented before
+  this PR (`test_builtin_envvar_raises_on_decode_failure_1820`'s own comment) — so its fix
+  is dropped from CLI-level test claims entirely and exercised only by that pre-existing
+  unit test.
+
+  The review round also found 8 more sibling functions with the identical unfixed
+  asymmetry (`builtin_min`/`max`/`min_by`/`max_by`/`reverse`/`unique`/`sort`/`flatten`,
+  all `eval.rs` — several of them the direct siblings of `eval_generic.rs` arms this PR's
+  first round *did* fix, a direct instance of this project's own documented "two separate
+  jq/yq evaluators" hazard) and one more shared bridge site
+  (`bridge_to_full_evaluator`/`_flow`) — all now fixed too.
+
+  Tests were restructured accordingly: `test_optional_ignored_sites_2327` now covers only
+  the `Reverse`/`Sort`/… family's own `collect_cursors_checked` fix, the one part of this
+  PR with genuine CLI-observable coverage (via the same trailing-comma fixture
+  `test_jq_collect_cursors_checked_sibling_paths_reject_trailing_comma_2261` established,
+  now also asserting the same `stderr` content that test does, not just the exit code). A
+  new `test_eval_rs_sites_produce_correct_output_2327` covers every `eval.rs`-only site
+  instead — proving the macro-swap refactor didn't change the success path's output, the
+  same honest scope `test_eval_rs_only_sites_still_correct_2280` already accepted for
+  `builtin_path`/`eval_format` in #2280.
 
   `eval.rs`'s `eval_array_construction` (#2327's own "plausible, higher-impact" candidate)
   was investigated and deliberately left unchanged: unlike the sites above, its own
@@ -322,6 +349,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unlike the confirmed sites it isn't clearly *correcting an inconsistency the surrounding
   code already established* — so it was left alone rather than changed on pattern-match
   alone.
+
+  Roughly 58 more raw `to_owned`/`collect_cursors_checked` call sites remain unaudited in
+  `eval.rs`/`eval_generic.rs` after this PR — review flagged the recurring #2231→#2280→
+  #2327 pattern itself as the real problem (a sweep-and-patch cycle that keeps finding a
+  few more sites each time, with no mechanism stopping the next one from being missed the
+  same way), and a structural fix (CI/audit tooling, not another manual list) was filed
+  as #2334 rather than continuing the same cycle here.
 
 - **Five sites ignored `optional`, an asymmetry #2231 already fixed for
   `debug`/`stderr`/`tostring`/its catch-all fallback** (#2280, follow-up from #2231's own
