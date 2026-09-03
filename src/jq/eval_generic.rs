@@ -43,8 +43,8 @@ use super::eval::{
     is_retryable_stop, literal_to_owned, needs_path_context, numeric_key_to_array_index,
     numeric_key_to_index, owned_bound_to_i64, owned_to_string, slice_object_as_yq_children,
     slice_owned_value_read, substitute_bound_var, substitute_vars, suppresses, tonumber_from_str,
-    vec_with_capacity, Control, Demand, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics,
-    LimitN, PathTrail, QueryResult, YqSemantics,
+    vec_with_capacity, yq_negative_index_check, Control, Demand, EvalError, EvalSemantics, EvalTag,
+    Flow, JqSemantics, LimitN, PathTrail, QueryResult, YqSemantics,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -4867,10 +4867,23 @@ fn try_single_generic<S: EvalSemantics, V: DocumentValue>(
         }
     };
     match eval_single::<S, _>(inner, value, optional, cursor) {
-        GenericResult::Error(e) if e.is_decode_failure() => GenericResult::Error(e),
+        // #2254: a yq negative-index-out-of-range error is unsuppressible
+        // the same way a decode failure is (see
+        // `EvalError::is_yq_negative_index_error`'s own doc comment) --
+        // confirmed live that `.a[-5]?` still raises in real yq. Real yq has
+        // no `try`/`catch` syntax at all (lexer-rejected outright), so this
+        // arm only ever matters for succinctly's own `--jq-extensions`
+        // surface in yq mode; excluding it from `catch` there too keeps one
+        // consistent "never caught" rule rather than one that depends on
+        // whether a catch handler happens to be present.
+        GenericResult::Error(e) if e.is_decode_failure() || e.is_yq_negative_index_error() => {
+            GenericResult::Error(e)
+        }
         GenericResult::Error(e) => run_catch(&e.payload()),
         GenericResult::Break(_) => run_catch(&OwnedValue::Null),
-        GenericResult::Partial(prefix, Control::Error(e)) if e.is_decode_failure() => {
+        GenericResult::Partial(prefix, Control::Error(e))
+            if e.is_decode_failure() || e.is_yq_negative_index_error() =>
+        {
             GenericResult::Partial(prefix, Control::Error(e))
         }
         GenericResult::Partial(prefix, Control::Error(e)) => {
@@ -4881,7 +4894,9 @@ fn try_single_generic<S: EvalSemantics, V: DocumentValue>(
         }
         GenericResult::LazySeq(seq) => match seq.materialize_atomic() {
             Ok(owned) => GenericResult::Owned(owned),
-            Err(Control::Error(e)) if e.is_decode_failure() => GenericResult::Error(e),
+            Err(Control::Error(e)) if e.is_decode_failure() || e.is_yq_negative_index_error() => {
+                GenericResult::Error(e)
+            }
             Err(Control::Error(e)) => run_catch(&e.payload()),
             Err(Control::Break(_)) => run_catch(&OwnedValue::Null),
             Err(Control::Halt(code)) => GenericResult::Halt(code),
@@ -4950,20 +4965,17 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 let len = elements.len();
                 let resolved = if *idx < 0 { len as i64 + idx } else { *idx };
                 // yq mode only (#2254): a negative index still negative
-                // after resolving against the length raises in real yq,
-                // where jq treats it the same as a positive out-of-range
-                // index (`null`). Checked ahead of the cast below, which
-                // would otherwise wrap a still-negative `resolved` into a
-                // huge `usize` that `get_cursor` simply misses (`None`,
-                // same observable `null` as any other OOB read) --
-                // correct for jq mode, but not distinguishable from an
-                // ordinary miss for yq's own error.
-                if resolved < 0 && S::TAG == EvalTag::Yq {
-                    return if optional {
-                        GenericResult::None
-                    } else {
-                        GenericResult::Error(EvalError::yq_negative_index_out_of_range(*idx, len))
-                    };
+                // after resolving against the length raises in real yq --
+                // unconditionally, not suppressed by `optional` (see
+                // `EvalError::yq_negative_index_out_of_range`'s own doc
+                // comment). Checked ahead of the cast below, which would
+                // otherwise wrap a still-negative `resolved` into a huge
+                // `usize` that `get_cursor` simply misses (`None`, same
+                // observable `null` as any other OOB read) -- correct for
+                // jq mode, but not distinguishable from an ordinary miss
+                // for yq's own error.
+                if let Some(e) = yq_negative_index_check::<S>(*idx, resolved, len) {
+                    return GenericResult::Error(e);
                 }
                 match elements.get_cursor(resolved as usize) {
                     Some(c) => GenericResult::OneCursor(c),
@@ -6189,7 +6201,13 @@ fn each_try_generic<S: EvalSemantics, V: DocumentValue>(
         None => flow,
     };
     match flow {
-        Flow::Escaped(Control::Error(e)) if e.is_decode_failure() => {
+        // Same #2254 yq-negative-index-error exclusion as `eval_try`/
+        // `each_try`/`try_single_generic` (`src/jq/eval.rs`/this file) --
+        // reached from the same `any(.a[-5]?; .)` shape those cover, via
+        // this file's own generic dispatch.
+        Flow::Escaped(Control::Error(e))
+            if e.is_decode_failure() || e.is_yq_negative_index_error() =>
+        {
             Flow::Escaped(Control::Error(e))
         }
         Flow::Escaped(Control::Error(e)) => match catch {
@@ -7774,17 +7792,19 @@ fn index_one_generic<S: EvalSemantics, V: DocumentValue>(
                 // yq mode only (#2254): same rule as `eval_single`'s
                 // `Expr::Index` arm above -- a negative index still
                 // negative after resolving against the length raises in
-                // real yq, where jq treats it the same as a positive
-                // out-of-range index (`null`).
-                if let (Some(idx), Some(r)) = (idx, resolved) {
-                    if r < 0 && S::TAG == EvalTag::Yq {
-                        return if optional {
-                            GenericResult::None
-                        } else {
-                            GenericResult::Error(EvalError::yq_negative_index_out_of_range(
-                                idx, len,
-                            ))
-                        };
+                // real yq, unconditionally (see
+                // `EvalError::yq_negative_index_out_of_range`'s own doc
+                // comment). `resolved` is `idx.map(...)`, so `Some`/`None`
+                // on the two always agree -- one `if let` on `resolved`
+                // alone is enough, `idx` re-derived via `.expect` rather
+                // than re-checked.
+                if let Some(r) = resolved {
+                    if let Some(e) = yq_negative_index_check::<S>(
+                        idx.expect("resolved is Some only when idx is Some"),
+                        r,
+                        len,
+                    ) {
+                        return GenericResult::Error(e);
                     }
                 }
                 match resolved

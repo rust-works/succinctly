@@ -3748,7 +3748,14 @@ fn each_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // A decode failure (#1247) must never be caught by `try`/`catch`,
         // same #1620 exclusion as `eval_try`'s identical arm -- propagates
         // unchanged via the `other => other` wildcard's own reasoning.
-        Flow::Escaped(Control::Error(e)) if e.is_decode_failure() => {
+        //
+        // Same #2254 yq-negative-index-error exclusion as `eval_try`'s
+        // identical arm too -- reached from e.g. `any(.a[-5]?; .)`, whose
+        // generator argument runs through this function via `eval_each`'s
+        // own `Expr::Optional` dispatch.
+        Flow::Escaped(Control::Error(e))
+            if e.is_decode_failure() || e.is_yq_negative_index_error() =>
+        {
             Flow::Escaped(Control::Error(e))
         }
         Flow::Escaped(Control::Error(e)) => match catch {
@@ -6340,7 +6347,19 @@ fn eval_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // equivalent is a parse-time rejection no program could ever catch
         // either. Checked before the ordinary `Error` catch below so it
         // falls through to `other => other` instead.
-        QueryResult::Error(e) if e.is_decode_failure() => QueryResult::Error(e),
+        //
+        // #2254: a yq negative-index-out-of-range error is unsuppressible
+        // the same way (see `EvalError::is_yq_negative_index_error`'s own
+        // doc comment) -- confirmed live that `.a[-5]?` still raises in real
+        // yq. Real yq has no `try`/`catch` syntax at all (lexer-rejected
+        // outright), so this only ever matters for succinctly's own
+        // `--jq-extensions` surface in yq mode; excluding it from `catch`
+        // there too keeps one consistent "never caught" rule rather than
+        // one that depends on whether a catch handler happens to be
+        // present.
+        QueryResult::Error(e) if e.is_decode_failure() || e.is_yq_negative_index_error() => {
+            QueryResult::Error(e)
+        }
         // If error, use catch handler or return nothing. jq runs the handler
         // with the *raised value* as its input, not the original input, so
         // `try error("boom") catch .` yields "boom".
@@ -6360,7 +6379,9 @@ fn eval_try<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Same #1620 decode-failure exclusion as the bare `Error` arm above
         // -- a `Partial` ending in a decode failure must still propagate
         // uncaught, not run the catch handler.
-        QueryResult::Partial(prefix, Control::Error(e)) if e.is_decode_failure() => {
+        QueryResult::Partial(prefix, Control::Error(e))
+            if e.is_decode_failure() || e.is_yq_negative_index_error() =>
+        {
             QueryResult::Partial(prefix, Control::Error(e))
         }
         // The body produced some outputs before erroring (#400): emit them
@@ -15905,7 +15926,10 @@ fn index_array_by_position<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // jq returns null for out-of-bounds array access (not an error)
             Ok(None) => QueryResult::One(StandardJson::Null),
             Err(_len) if S::TAG != EvalTag::Yq => QueryResult::One(StandardJson::Null),
-            Err(_len) if optional => QueryResult::None,
+            // Unconditional, not suppressed by `optional` (#2254) -- see
+            // `EvalError::yq_negative_index_out_of_range`'s own doc comment
+            // and the `eval_try`/`try_single_generic` bypasses that keep it
+            // surviving an outer `?`/`try` too.
             Err(len) => QueryResult::Error(EvalError::yq_negative_index_out_of_range(idx, len)),
         },
         // jq returns null for index on null
@@ -16043,31 +16067,55 @@ fn index_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
-/// yq mode only (#2254): `Some(error)` iff `key` is a negative numeric index
-/// still negative after resolving against `target`'s length -- real yq
-/// raises here (`index_array_by_position`'s own doc comment has the full
-/// rationale, including why `optional` still suppresses it). `None` covers
-/// every other case (jq mode, a non-array target, a non-numeric key, an
-/// in-bounds or positive-direction index) uniformly, so a caller checks this
-/// once and falls through to its own ordinary null/error handling otherwise
-/// -- deliberately *not* threaded into [`index_one_owned`] itself, since
-/// that function's own callers include write-path resolvers
-/// (`resolve_node`/`resolve_index_expr`) that already raise their own,
-/// differently-worded negative-index error and must keep doing so
-/// unconditionally, not just for a still-negative resolved index.
-fn yq_negative_index_error<S: EvalSemantics>(
-    target: &OwnedValue,
-    key: &OwnedValue,
+/// yq mode only (#2254): `Some(error)` iff `resolved` is still negative --
+/// real yq raises here (`index_array_by_position`'s own doc comment has the
+/// full rationale). `idx`/`len` are only for the error's own message, which
+/// reports the argument as written, not the arithmetic.
+///
+/// The `i64`/`usize`-only signature (not `OwnedValue`) is deliberate: both
+/// this function's own `OwnedValue`-domain callers ([`yq_negative_index_error`]
+/// below) and `eval_generic.rs`'s two independent numeric-index arms (which
+/// already reduce to plain integers before their own indexing decision)
+/// reach the identical rule through it, so the boundary condition and error
+/// text live in exactly one place.
+pub(crate) fn yq_negative_index_check<S: EvalSemantics>(
+    idx: i64,
+    resolved: i64,
+    len: usize,
 ) -> Option<EvalError> {
     if S::TAG != EvalTag::Yq {
         return None;
     }
+    (resolved < 0).then(|| EvalError::yq_negative_index_out_of_range(idx, len))
+}
+
+/// [`yq_negative_index_check`] for the common `OwnedValue`-domain shape: a
+/// target that might be an array, indexed by a key that might be a negative
+/// numeric index. `None` covers every case that isn't this one (jq mode, a
+/// non-array target, a non-numeric key, an in-bounds or positive-direction
+/// index) uniformly, so a caller checks this once and falls through to its
+/// own ordinary null/error handling otherwise -- deliberately *not*
+/// threaded into [`index_one_owned`] itself, since that function's own
+/// callers include write-path resolvers (`resolve_node`/`resolve_index_expr`,
+/// `write_index`) that currently have their own gaps here too (`del()`/
+/// `delpaths()` silently no-op instead of raising, tracked separately as
+/// #2268; assignment raises jq's own differently-worded message instead of
+/// yq's, noted in that same issue) -- real, separate bugs, not yet fixed,
+/// rather than folded into this read-only helper's contract.
+fn yq_negative_index_error<S: EvalSemantics>(
+    target: &OwnedValue,
+    key: &OwnedValue,
+) -> Option<EvalError> {
     let OwnedValue::Array(items) = target else {
         return None;
     };
     let idx = numeric_key_to_index(key)?;
-    (idx < 0 && items.len() as i64 + idx < 0)
-        .then(|| EvalError::yq_negative_index_out_of_range(idx, items.len()))
+    let resolved = if idx < 0 {
+        items.len() as i64 + idx
+    } else {
+        idx
+    };
+    yq_negative_index_check::<S>(idx, resolved, items.len())
 }
 
 /// [`index_one`] for a target that is already an owned value, as when the
@@ -27833,25 +27881,25 @@ fn eval_owned_fast_path<S: EvalSemantics>(
         }),
         Expr::Index { idx, .. } => Some(match input {
             OwnedValue::Array(items) => {
+                // yq mode only (#2254): same rule as `index_array_by_position`
+                // and every other call site this fix touches -- a negative
+                // index still negative after resolving against the length
+                // raises in real yq, unconditionally, not suppressed by
+                // `optional` (unlike every *other* read-time indexing error
+                // in this function) -- see
+                // `EvalError::yq_negative_index_out_of_range`'s own doc
+                // comment. Confirmed live that `any(.a[-5]?; .)` -- the one
+                // construct this function is actually still reachable from
+                // ([`eval_each_owned`]) -- wrongly answered `false` instead
+                // of raising before this was unconditional.
+                if let Some(e) = yq_negative_index_error::<S>(input, &OwnedValue::Int(*idx)) {
+                    return Some(Err(e));
+                }
                 let resolved = if *idx < 0 {
                     items.len() as i64 + idx
                 } else {
                     *idx
                 };
-                // yq mode only (#2254): same rule as `index_array_by_position`
-                // and every other call site this fix touches -- a negative
-                // index still negative after resolving against the length
-                // raises in real yq, suppressible by `optional` like any
-                // other read-time indexing error here.
-                if resolved < 0 && S::TAG == EvalTag::Yq {
-                    if optional {
-                        return Some(Ok(None));
-                    }
-                    return Some(Err(EvalError::yq_negative_index_out_of_range(
-                        *idx,
-                        items.len(),
-                    )));
-                }
                 let element = usize::try_from(resolved)
                     .ok()
                     .and_then(|i| items.get(i))

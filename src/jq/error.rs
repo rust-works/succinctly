@@ -874,14 +874,31 @@ impl EvalError {
     /// an error -- the asymmetry is specific to the negative-magnitude
     /// case. `N` here is the original, unresolved index (`-3`, not the
     /// still-negative sum) -- real yq's own message reports the argument as
-    /// written, not the arithmetic. Suppressible by `optional` like any
-    /// other read-time indexing error -- real yq's own lexer doesn't even
-    /// accept `?` after a bracket index in this position, so there's no
-    /// oracle to match either way, and matching this codebase's own
-    /// established default for ordinary indexing errors is simpler than
-    /// carving out a special unsuppressible case with no oracle behind it.
+    /// written, not the arithmetic.
+    ///
+    /// Not suppressed by `optional` -- confirmed live that real yq's own
+    /// lexer *does* accept `?` after a bare bracket index (`.a[-5]?` parses
+    /// fine; only the *parenthesized* form, `(.a[-5])?`, is rejected, a
+    /// different construct), and the error still raises through it
+    /// (`.a[-5]?` on `[1,2]` still exits 1 with this same message in real
+    /// yq). An earlier version of this comment claimed no oracle existed
+    /// for either direction, based on testing only the parenthesized form
+    /// — see [`Self::is_yq_negative_index_error`], consulted by every
+    /// `?`/`try` dispatch point on the read side, for how this is kept
+    /// unsuppressible.
     pub fn yq_negative_index_out_of_range(index: i64, len: usize) -> Self {
         Self::new(format!("index [{index}] out of range, array size is {len}"))
+    }
+
+    /// Whether this is a [`Self::yq_negative_index_out_of_range`] -- `?`
+    /// does not suppress it, the same way [`Self::is_write_time_application_error`]
+    /// and [`Self::is_decode_failure`] each carve out their own
+    /// never-suppressed category. Matched on message text like
+    /// [`Self::is_write_time_application_error`]'s own pair, rather than
+    /// adding a fourth [`ErrorKind`] variant purely for one message.
+    pub fn is_yq_negative_index_error(&self) -> bool {
+        self.message.starts_with("index [")
+            && self.message.contains("] out of range, array size is ")
     }
 
     /// `strptime/1 requires string inputs and arguments` (#929).
@@ -1229,20 +1246,33 @@ impl EvalError {
     }
 
     /// Whether this error class is *always* uncatchable, with no positional
-    /// nuance — [`Self::is_invalid_path_expression`] or
-    /// [`Self::is_decode_failure`]. Unlike
-    /// [`Self::is_untracked_navigation_error`], which genuinely depends on
-    /// *where* the error was caught (a bare postfix `?` on the primitive
-    /// that raised it vs. anything else), both of these mean the same thing
-    /// at every call site that checks them: never suppressed by `?`, never
-    /// handed to a `catch` handler. `resolve_node`'s `Expr::Try` and
-    /// `Expr::Optional` arms (`?`'s two path-context dispatch sites, kept in
-    /// agreement since #1746 — `expr?` is documented sugar for `try expr`)
-    /// both check this today, but a future always-uncatchable error class
-    /// only needs to be added here, not hand-copied into whichever `?`/`try`
-    /// dispatch sites grow the same check next.
+    /// nuance — [`Self::is_invalid_path_expression`],
+    /// [`Self::is_decode_failure`], or [`Self::is_yq_negative_index_error`]
+    /// (#2254). Unlike [`Self::is_untracked_navigation_error`], which
+    /// genuinely depends on *where* the error was caught (a bare postfix `?`
+    /// on the primitive that raised it vs. anything else), all three mean
+    /// the same thing at every call site that checks them: never suppressed
+    /// by `?`, never handed to a `catch` handler. `resolve_node`'s
+    /// `Expr::Try` and `Expr::Optional` arms (`?`'s two path-context
+    /// dispatch sites, kept in agreement since #1746 — `expr?` is
+    /// documented sugar for `try expr`) both check this today, but a future
+    /// always-uncatchable error class only needs to be added here, not
+    /// hand-copied into whichever `?`/`try` dispatch sites grow the same
+    /// check next.
+    ///
+    /// The value-position dispatch points (`eval_try`/`each_try`/
+    /// `try_single_generic`/`each_try_generic`) deliberately do *not* switch
+    /// to this predicate: they need `is_decode_failure() ||
+    /// is_yq_negative_index_error()` specifically, without
+    /// `is_invalid_path_expression()`, which is meaningful only in path
+    /// context (`path()`/`getpath`) and was never verified against value
+    /// position -- widening those four to this broader predicate as a side
+    /// effect of #2254 would be an untested behavior change, not this fix's
+    /// job.
     pub fn is_uncatchable(&self) -> bool {
-        self.is_invalid_path_expression() || self.is_decode_failure()
+        self.is_invalid_path_expression()
+            || self.is_decode_failure()
+            || self.is_yq_negative_index_error()
     }
 
     /// `Cannot check whether <container> has a <key type> key`.
