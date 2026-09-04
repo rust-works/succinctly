@@ -42420,15 +42420,16 @@ fn delpaths_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // #2352: yq's own root-delete rule (#1702, `builtin_del`'s own
     // `Expr::Identity` arm above) applies here too -- real yq's
     // `delpaths([[]])` deletes the whole document and emits nothing, not the
-    // literal `null` jq (and this function, before this fix) prints. Checked
-    // ahead of the `result`/`QueryResult` match below for the same reason
-    // `builtin_del` checks its own analogous case ahead of `delete_at_path`:
-    // there is no way to signal "no output at all" through an `OwnedValue`.
-    if S::TAG == EvalTag::Yq && matches!(paths.first(), Some([])) {
-        return QueryResult::None;
-    }
+    // literal `null` jq (and this function's own jq-mode arm just below)
+    // prints. A guarded arm ahead of the plain `Some([])` one, not a
+    // separate `if`, so both share one pattern instead of testing
+    // `paths.first()` against the same shape twice in adjacent statements —
+    // `return`'s `!` type unifies with the `Result<OwnedValue, EvalError>`
+    // every other arm produces, same as the `Some(_)` arm below already
+    // relies on for its own early exits via `?`.
     let result = match paths.first() {
         None => to_owned(value),
+        Some([]) if S::TAG == EvalTag::Yq => return QueryResult::None,
         Some([]) => Ok(OwnedValue::Null),
         Some(_) => {
             to_owned(value).and_then(|v| delete_paths_sorted(v, &paths, 0, S::TAG == EvalTag::Yq))
