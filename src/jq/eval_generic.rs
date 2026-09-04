@@ -8232,9 +8232,11 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         // STYLE-0012: these four materialize the *key* generator's outputs,
         // which are evaluated with a hardcoded `optional: false` just above.
         // `.[k]?` suppresses only its own final index step, never an error
-        // raised while computing `k` -- jq 1.7.1 agrees (`jq '.[.k]?'` on a
-        // non-string `.k` still exits 5), and `eval.rs`'s own
-        // `eval_index_expr` splits it the same way.
+        // raised while computing `k`; `eval.rs`'s own `eval_index_expr` splits
+        // it the same way, and carries the jq 1.7.1 capture that settles it
+        // (`.[error("boom")]?` exits 5, while `.[.k]?` on a non-string `.k`
+        // exits 0 -- that one is the *index step* being suppressed, not the
+        // key generator).
         GenericResult::One(v) => vec![owned_or_err!(to_owned_key_shape(&v))],
         // STYLE-0012: key generator -- see the `One` arm above.
         GenericResult::OneCursor(c) => vec![owned_or_err!(to_owned_key_shape_cursor(&c))],
@@ -9482,11 +9484,16 @@ fn key_elements_generic<S: EvalSemantics, V: DocumentValue>(
             // the conversion below *is* the check -- `to_owned_cursor` is
             // already the checked one.
             //
-            // STYLE-0012: routed, one level out. `Control` has no suppressed
-            // variant to signal with here, so the check lives in
-            // `sort_family_control(control, optional)` -- this function's
-            // only error channel, and where the `GenericResult` is rebuilt
-            // (#2334).
+            // STYLE-0012: raises regardless of `optional`, and must. Two
+            // reasons, either sufficient. (1) `to_owned_cursor` raises only
+            // decode failures, which `suppresses` never suppresses -- routing
+            // this would be a guaranteed no-op. (2) The only place it *could*
+            // be routed is `sort_family_control`, where the `GenericResult` is
+            // rebuilt -- and that `Control` is shared with `sort_key_generic`,
+            // which carries the user's own key-filter errors
+            // (`sort_by(error("x"))`). Suppressing there would swallow those
+            // instead, which is not what `optional` means. See
+            // `sort_family_control`'s own doc comment (#2334 review).
             None => to_owned_cursor(&cursor).map_err(Control::Error)?,
         };
         keyed.push((k, cursor));
@@ -9518,18 +9525,24 @@ fn reordering_may_keep_cursors<V: DocumentValue>(cursor: Option<&V::Cursor>) -> 
 /// bare `Error`/`Break`/`Halt` with no partial prefix -- so this never
 /// produces a `Partial`.
 ///
-/// #2334: takes `optional` and routes the `Error` arm through [`suppresses`].
-/// `key_elements_generic`'s `to_owned_cursor` materialization (the bare
-/// `sort`/`unique`/`min`/`max` forms, where the conversion *is* the
-/// comparison key) reaches this function as its only error channel, and
-/// `Control` has no suppressed variant for it to signal with -- so the
-/// suppression has to happen here, where the `GenericResult` is rebuilt.
-/// Both call sites already have `optional` in scope. Applies to `Error`
-/// only: `Break`/`Halt` are not error-channel controls and `?` never
-/// touched them.
-fn sort_family_control<V: DocumentValue>(control: Control, optional: bool) -> GenericResult<V> {
+/// Deliberately does *not* take `optional` (#2334 review). An earlier draft
+/// routed the `Error` arm through [`suppresses`] on behalf of
+/// `key_elements_generic`'s `to_owned_cursor` materialization, on the premise
+/// that this was that materialization's only error channel. It is not:
+/// `key_elements_generic` funnels three things into this `Control` --
+/// `push_generic_truthiness_cursor_error`, `to_owned_cursor`, and
+/// `sort_key_generic`, which carries out *whatever the user's key filter
+/// raised* (`sort_by(error("x"))`, `min_by(.a)` on an array, ...).
+///
+/// The routing was therefore a no-op in the direction it was written for and
+/// live in the direction it was not: `to_owned_cursor` raises only
+/// decode failures, which `suppresses` never suppresses at any `optional`, so
+/// the arm could never fire for the materialization -- while a key-filter
+/// error is exactly the suppressible kind, and would have vanished silently
+/// the day `optional` reached here. See `key_elements_generic`'s own
+/// STYLE-0012 marker.
+fn sort_family_control<V: DocumentValue>(control: Control) -> GenericResult<V> {
     match control {
-        Control::Error(e) if suppresses(&e, optional) => GenericResult::None,
         Control::Error(e) => GenericResult::Error(e),
         Control::Break(label) => GenericResult::Break(label),
         Control::Halt(code) => GenericResult::Halt(code),
@@ -9561,7 +9574,7 @@ fn sort_family_array_generic<S: EvalSemantics, V: DocumentValue>(
 ) -> GenericResult<V> {
     let keyed = match key_elements_generic::<S, V>(cursors, key, optional) {
         Ok(keyed) => keyed,
-        Err(control) => return sort_family_control(control, optional),
+        Err(control) => return sort_family_control(control),
     };
     GenericResult::LazySeq(Box::new(LazySeq::from_cursors(reorder(keyed))))
 }
@@ -11332,7 +11345,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             };
             let keyed = match key_elements_generic::<S, V>(cursors, key, optional) {
                 Ok(keyed) => keyed,
-                Err(control) => return sort_family_control(control, optional),
+                Err(control) => return sort_family_control(control),
             };
             // `min_by`/`max_by` on ties: jq's own definitions keep the
             // *first* minimum and the *last* maximum (`min_by` uses `<`,

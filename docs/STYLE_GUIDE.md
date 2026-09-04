@@ -526,12 +526,36 @@ folded in the next. Routing that sits further away — a deferred unwrap inside 
 (`builtin_contains`/`builtin_inside`, #1800), a fold shared by several sibling arms
 (`builtin_add`), a control handed out to a caller (`finish_fork`, `sort_family_control`) —
 is real routing, but the audit cannot see it: say so in a `// STYLE-0012:` marker naming
-where it happens. The window is deliberately not widened to guess at these; a window large
+where it happens.
+
+Check that the shared point really is the *materialization's* error channel before routing
+to it. `sort_family_control` looked like one and is not: it is also where
+`sort_key_generic` hands out the user's own key-filter errors, so routing there would have
+suppressed `sort_by(error("x"))` — a suppression `optional` never authorised — while doing
+nothing at all for the decode failure it was written for (#2334 review). A marker saying
+"raises regardless, and here is why routing would be wrong" is the correct answer to that
+shape, not a route. The window is deliberately not widened to guess at these; a window large
 enough to find them was measured picking up a `suppresses(..)` from *neighbouring* code and
 silently excusing a genuine gap.
 
 `tests/jq_optional_suppression_audit.rs` enforces this and names the exact `file:line`
 of anything unrouted and unmarked.
+
+**If it fails on code you did not write.** It will, and that is working as intended: a
+rebase that brings a new materialization site into either evaluator fails the audit on the
+branch that rebased, not the branch that wrote the site. (It happened on #2334's own first
+rebase, with #2326's `pending_key_stream_control` arm.) Adjudicate it the same way as any
+other site — route it, or mark it with the reason — and say in the commit message that it
+arrived by rebase. Do not raise `WINDOW_AFTER`, lower the vacuity floors, or add the
+function to an exclusion list to get past it.
+
+**What the audit does not cover.** It keys off the `optional: bool` parameter, so a helper
+that materializes while its caller holds the `optional` is invisible to it —
+`eval_generic.rs`'s `path_step_generic`, whose `collect_cursors_checked()?` propagates to a
+caller that decides, is the current example. That is deliberate scoping, not an oversight:
+the decision genuinely belongs to whoever has the flag. If you add a materializing helper
+of that shape, say in *its* doc comment which caller adjudicates its error, since the audit
+cannot.
 
 ### Motivation
 

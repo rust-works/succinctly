@@ -16757,8 +16757,15 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let keys = match eval_single::<W, S>(key, value.clone(), false).materialize_cursor() {
         // STYLE-0012: the key generator is evaluated with a hardcoded
         // `optional: false` just above, deliberately: `.[k]?` suppresses only its
-        // own final index step, never an error raised while computing `k` (jq
-        // 1.7.1 agrees -- `jq '.[.k]?'` on a non-string `.k` still exits 5).
+        // own final index step, never an error raised while computing `k`.
+        // Captured from jq 1.7.1 on `{"k":{"z":1},"a":1}`:
+        //   `.[error("boom")]?` -> exit 5, `boom`   (raised computing `k`)
+        //   `.[.k]?`            -> exit 0, no output (the *index step* failing
+        //                          on a non-string key, which `?` does suppress)
+        // The second row is the one to watch: an earlier version of this comment
+        // cited it as exiting 5, which is backwards -- it is the suppressed case,
+        // not the raising one, and says nothing about the key generator (#2334
+        // review).
         QueryResult::One(v) => match to_owned_key_shape(&v) {
             Ok(v) => vec![v],
             Err(e) => return QueryResult::Error(e),
