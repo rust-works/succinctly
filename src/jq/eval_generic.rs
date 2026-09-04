@@ -8874,6 +8874,15 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
 /// still discards any prefix converted cleanly before that one bad value,
 /// a different failure shape from a generator's own escape that needs its
 /// own priority-ordering pass to fix, not a quick addition here.
+///
+/// #2351: jq-only. Real yq does not stream a slice *bound*'s own escaped
+/// generator's prefix either -- the same carve-out `eval::eval_slice_bound`'s
+/// own sibling gate now applies (mirroring #2226's/#2326's identical
+/// `S::TAG == EvalTag::Yq` gate on their own target/key `Partial` arms).
+/// Live-verified against yq v4.53.3, both bounds independently:
+/// `.[(0,1,error("x")):3]` on `[1,2,3]` prints only `Error: x` (`K1`), and
+/// `.[0:(1,2,error("x"))]` prints only `Error: x` too (`K2`) -- yq mode
+/// keeps the old conservative discard; jq mode is unaffected.
 fn eval_slice_bound<S: EvalSemantics, V: DocumentValue>(
     bound: &Option<Box<Expr>>,
     value: V,
@@ -8893,6 +8902,11 @@ fn eval_slice_bound<S: EvalSemantics, V: DocumentValue>(
             // successfully-produced prefix to do so.
             GenericResult::Halt(code) => (Vec::new(), Some(Control::Halt(code))),
             GenericResult::None => (Vec::new(), None),
+            // #2351: yq mode discards this bound generator's own escaped
+            // prefix (see the function's own doc comment above).
+            GenericResult::Partial(_vs, control) if S::TAG == EvalTag::Yq => {
+                (Vec::new(), Some(control))
+            }
             GenericResult::Partial(vs, control) => (vs, Some(control)),
             GenericResult::One(v) => (vec![to_owned_key_shape(&v).map_err(Control::Error)?], None),
             GenericResult::OneCursor(c) => (

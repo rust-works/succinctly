@@ -29446,6 +29446,39 @@ fn test_index_expr_key_partial_prefix_still_discarded_in_yq_mode_2326() -> Resul
     Ok(())
 }
 
+/// #2351: unlike #2226's/#2326's own target/key gates, `eval_generic::
+/// eval_slice_bound` had *no* yq-mode gate at all -- it unconditionally kept
+/// a slice *bound*'s own escaped generator's prefix in both modes. This is
+/// the issue's own canonical repro (the start bound, `K1`, escaping); the
+/// bare comma-generator bounds have no `as`-binding, so this dispatches
+/// through `eval_generic.rs`, same as #2226's own CLI-dispatch tests.
+/// Verified live against yq v4.53.3: `.[(0,1,error("x")):3]` on `[1,2,3]`
+/// prints only `Error: x`, no `[1,2,3]`/`[2,3]` prefix.
+#[test]
+fn test_slice_bound_start_own_partial_prefix_discarded_in_yq_mode_2351() -> Result<()> {
+    let (out, stderr, code) =
+        run_yq_stdin_with_stderr(".[(0,1,error(\"x\")):3]", "[1, 2, 3]\n", &["-o", "json"])?;
+    assert_eq!(code, 1, "out: {out:?} stderr: {stderr:?}");
+    assert_eq!(out, "");
+    assert_eq!(stderr.trim(), "Error: x");
+    Ok(())
+}
+
+/// #2351 sibling: the same yq-mode gate for the end bound (`K2`), so both of
+/// `eval_slice_bound`'s two call sites (`start` and `end`) are covered
+/// independently, exactly as the issue itself calls out. Verified live
+/// against yq v4.53.3: `.[0:(1,2,error("x"))]` on `[1,2,3]` prints only
+/// `Error: x`, no `[1]`/`[1,2]` prefix.
+#[test]
+fn test_slice_bound_end_own_partial_prefix_discarded_in_yq_mode_2351() -> Result<()> {
+    let (out, stderr, code) =
+        run_yq_stdin_with_stderr(".[0:(1,2,error(\"x\"))]", "[1, 2, 3]\n", &["-o", "json"])?;
+    assert_eq!(code, 1, "out: {out:?} stderr: {stderr:?}");
+    assert_eq!(out, "");
+    assert_eq!(stderr.trim(), "Error: x");
+    Ok(())
+}
+
 /// #2264: `keys`/`keys_unsorted`'s own lazy `.[n]` fast path
 /// (`fold_lazy_keys_stage` for object keys, `fold_lazy_index_range_stage`
 /// for array keys) had its own independent negative-index resolution with

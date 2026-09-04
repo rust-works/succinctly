@@ -35044,6 +35044,38 @@ fn test_slice_expr_cli_dispatch_target_own_partial_prefix_preserved_2226() -> Re
     Ok(())
 }
 
+/// #2351: unlike #2226's own target gate above, `eval_generic::
+/// eval_slice_bound` (the resolver for a slice *bound*, `K1`/`K2` in
+/// `E[K1:K2]`, as opposed to `E[K]`'s single key) had no yq-mode gate at
+/// all before this fix -- jq mode is unaffected by adding one, so this is
+/// the jq-mode control confirming the prefix still streams here. This is
+/// the issue's own canonical repro, the start bound (`K1`) escaping: a bare
+/// comma-generator bound with no `as`-binding, so it dispatches through
+/// `eval_generic.rs` rather than `eval.rs`'s sibling. Verified against jq
+/// 1.7.1: `echo '[1,2,3]' | jq -c '.[(0,1,error("x")):3]'` prints
+/// `[1,2,3]` then `[2,3]` before raising.
+#[test]
+fn test_slice_bound_start_cli_dispatch_own_partial_prefix_preserved_2351() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".[(0,1,error(\"x\")):3]"], Some("[1,2,3]"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[1,2,3]\n[2,3]\n");
+    assert!(stderr.contains('x'), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #2351 sibling: the same jq-mode control for the end bound (`K2`), so
+/// both of `eval_slice_bound`'s two call sites are covered independently.
+/// Verified against jq 1.7.1: `echo '[1,2,3]' | jq -c
+/// '.[0:(1,2,error("x"))]'` prints `[1]` then `[1,2]` before raising.
+#[test]
+fn test_slice_bound_end_cli_dispatch_own_partial_prefix_preserved_2351() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".[0:(1,2,error(\"x\"))]"], Some("[1,2,3]"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[1]\n[1,2]\n");
+    assert!(stderr.contains('x'), "stderr: {stderr:?}");
+    Ok(())
+}
+
 /// #2226 review (patch coverage): `eval_generic::eval_slice_expr`'s target
 /// `Partial` arm's `Ok(None)` sub-case -- an earlier-produced value that
 /// legitimately isn't sliceable, suppressed by `optional` rather than
