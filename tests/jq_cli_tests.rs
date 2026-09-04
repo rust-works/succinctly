@@ -20386,6 +20386,65 @@ fn test_def_shadow_candidate_still_respects_lexical_scope_2036() -> Result<()> {
     Ok(())
 }
 
+/// #2036 review, round 2: an earlier draft populated a shadow candidate's
+/// `builtin_fallback` by cloning its parsed children into `args` too --
+/// correct, but the retained size of a nested chain of the same
+/// shadow-candidate name roughly doubled per nesting level (`args` *and*
+/// `builtin_fallback` each an independent copy of everything below), an
+/// `O(2^depth)` parser-level denial-of-service from a tiny filter string.
+/// Pinned as a timing regression guard: 60 levels of nesting must parse
+/// well under a second, not blow past it -- confirmed live during review
+/// that the pre-fix version took ~5s at 22 levels and did not finish at 24
+/// within a 10s timeout, where the post-fix version parses 500 levels of
+/// nesting (bounded by `MAX_EXPR_DEPTH` past that) in single-digit
+/// milliseconds.
+#[test]
+fn test_def_shadow_deep_nesting_does_not_blow_up_2036() -> Result<()> {
+    let nested = "first(".repeat(60) + "." + &")".repeat(60);
+    let filter = format!("def first: .; {nested}");
+    let start = std::time::Instant::now();
+    let (stdout, stderr, code) = run_jq_full(&["-nc", &filter], Some("null"))?;
+    let elapsed = start.elapsed();
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "null");
+    // A generous margin, not a tight benchmark: this suite runs with
+    // internal test-level parallelism (many other tests spawn their own
+    // `succinctly` subprocess concurrently), so CPU contention alone can
+    // stretch a normally-instant (~10ms, confirmed live) run to a second
+    // or more under load. What this guards against is the *shape* of the
+    // regression, not its exact timing -- reintroducing the `O(2^depth)`
+    // blowup at 60 levels would take a genuinely astronomical amount of
+    // time (`2^60`), not merely a slow few seconds, so any reasonable
+    // margin here still catches a real regression while tolerating CI
+    // noise.
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "60 levels of nesting took {elapsed:?} -- exponential blowup regressed"
+    );
+    Ok(())
+}
+
+/// #2036 review, round 2: a genuinely empty `NAME()` must stay a syntax
+/// error even once `NAME` is a shadow candidate -- an earlier draft's
+/// arity-mismatch fallback (`Self::parse_func_call_or_error`) accepted `()`
+/// as a valid zero-arg call, regressing #2110's own established rule for
+/// exactly this shape (`test_zero_arity_builtin_empty_parens_stays_compile_error_2110`,
+/// above). Oracle-verified against jq 1.7.1: `def f: 1; f()` is a syntax
+/// error in real jq for *any* name, shadowed or not.
+#[test]
+fn test_def_shadow_candidate_empty_parens_stays_syntax_error_2036() -> Result<()> {
+    for filter in [
+        "def not: 1; not()",
+        "def length: 1; length()",
+        "def first: 1; first()",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(stdout, "", "{filter}: stderr {stderr:?}");
+        assert_eq!(code, 3, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+    }
+    Ok(())
+}
+
 /// #1376: `succinctly jq` now supports arity overloading, matching real
 /// jq -- `def f(x): ...` and `def f(x;y): ...` are distinct functions
 /// (`f/1` and `f/2`), and both stay callable after the second definition.

@@ -421,25 +421,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Every row exited 0 in both tools — there was no diagnostic anywhere, just a silently
   different answer, the most serious class of divergence this project tracks. Shadowing
-  a builtin is a real jq idiom (patching a builtin's behavior for one program, or how
-  `~/.jq` and library modules override defaults), not a curiosity.
+  a builtin is a real jq idiom — patching a builtin's behavior for one program — not a
+  curiosity.
 
   Fixed via a lexical prescan (`collect_def_names`, `src/jq/parser.rs`) that collects
-  every identifier spelled after a `def` keyword anywhere in the program — a cheap,
-  deliberately imprecise over-approximation (it does not track lexical position; a false
-  positive costs one wasted re-parse at that one call site, never a wrong answer). At
-  each keyword choke point that can produce a shadowable builtin or fixed-arity special
-  form (`not`, and everything `try_parse_builtin` recognizes, plus `limit`/`until`/
-  `while`/`repeat`/`range`/`first`/`last`/`error`), a name in that set is parsed *both*
-  ways — the keyword's own dedicated parse, and a rewound generic `NAME(args;args)` call
-  (mirroring #2110's existing wrong-arity rewind) — with the former stashed on the
-  latter's new `Expr::FuncCall::builtin_fallback: Option<Box<Expr>>` field. `resolve.rs`'s
-  existing, already-correct scope-tracking pass (#1473) is the sole consumer: it now
-  rewrites the tree, not just reports on it (`check` took `&mut Expr`) — if the name is
-  genuinely in scope as a `def` at that exact position, the fallback is dropped and the
-  call proceeds normally; otherwise the node is rewritten back to the original
-  builtin/special form. A program with no `def`s anywhere pays for one scan of its own
-  source text and nothing else — every existing call site is otherwise untouched.
+  every identifier spelled after a `def` keyword in the *main filter's own source text*
+  — a cheap, deliberately imprecise over-approximation (it does not track lexical
+  position; a false positive costs nothing beyond one skipped fast-path check, never a
+  wrong answer). At each keyword choke point that can produce a shadowable builtin or
+  fixed-arity special form (`not`, and everything `try_parse_builtin` recognizes, plus
+  `limit`/`until`/`while`/`repeat`/`range`/`first`/`last`/`error`), a name in that set is
+  wrapped as `Expr::FuncCall { name, args: vec![], builtin_fallback: Some(Box::new(original)) }`
+  — `original` being the keyword's own dedicated parse, kept as-is; `args` deliberately
+  starts *empty* rather than populated from `original`'s own children (see below).
+  `resolve.rs`'s existing, already-correct scope-tracking pass (#1473) is the sole
+  consumer: it now rewrites the tree, not just reports on it (`check` took `&mut Expr`)
+  — if the name is genuinely in scope as a `def` at that exact position (computed from
+  `builtin_fallback`'s own shape, not `args.len()`, while `args` is still empty), `args`
+  is populated for real — *moved* out of the fallback, not cloned, since the fallback is
+  discarded immediately after — and the call proceeds; otherwise the *whole* fallback is
+  moved back into the node in one piece, restoring the original builtin/special form. A
+  program with no `def`s anywhere pays for one scan of its own source text and nothing
+  else — every existing call site is otherwise untouched.
 
   A shadowing `def` is not restricted to the arity real jq's own grammar happens to
   accept for that name (confirmed live: `def until(a;b;c): "s"; until(1;2;3)` is `"s"` in
@@ -449,11 +452,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the parser rewinds and falls back to an ordinary generic call with no fallback
   attached, deferring entirely to `resolve.rs` to decide whether the result is the user's
   own def, a real builtin at some *other* arity, or genuinely unresolvable — the same
-  three-way split every ordinary call already gets.
+  three-way split every ordinary call already gets. Two more issues surfaced in that same
+  fallback path during review and were fixed alongside it: a genuinely empty `NAME()`
+  must stay a syntax error rather than silently becoming a valid zero-arg call (matching
+  #2110's own established rule for the non-shadow-candidate case), and the fallback
+  reparse itself is now capped by a small retry budget, since an adversarial program
+  nesting the same arity-mismatched name inside itself could otherwise force the same
+  reparse to repeat at every level.
+
+  **A second, more fundamental performance bug was also found and fixed during review,
+  before this ever reached `main`**: an earlier version of this fix populated `args` by
+  cloning `original`'s own children at parse time. Correct, but with a cost that
+  compounds *exponentially* with nesting depth even though no source text is ever
+  re-parsed — every level's node retains both `args` and `builtin_fallback`, each a full
+  independent copy of everything below it, so a node's own retained size roughly doubles
+  per nesting level. `def first: .; first(first(first(...)))` took ~0.8 seconds just to
+  *parse* at 20 levels of nesting under that version — a real, if narrow, parser-level
+  denial-of-service reachable from a tiny adversarial filter string. Leaving `args` empty
+  until `resolve.rs` actually needs it (as described above) means no sub-expression is
+  ever duplicated at parse time at all; confirmed live that the same 20-level (and much
+  deeper) nesting now parses in single-digit milliseconds.
 
   `null`/`true`/`false` are deliberately excluded: they are literal tokens in jq's own
   grammar, not identifier-based calls (confirmed live, `def null: 1; null` stays `null`
   in real jq too, not `1`) — a `def` of that name parses but can never be reached.
+
+  **Known residual gap, not fixed here** (tracked as #2395): the lexical prescan only
+  ever sees the main filter's own source text — a `def` loaded via `include`, `import`,
+  or `~/.jq` cannot shadow a builtin, since it was never scanned and the module-loading
+  step that inlines it runs well after the main filter has already been fully parsed.
 
 - **`del()`'s trailing `.[]` raised instead of no-oping through a tolerated (rather than
   genuinely found) `null`, in yq mode** (#2347, found during #2324's own implementation).
