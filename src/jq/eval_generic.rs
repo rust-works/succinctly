@@ -17100,6 +17100,27 @@ mod tests {
         }
     }
 
+    /// #2372 review: yq mode keeps the pre-fix conservative discard, same
+    /// as `eval.rs`'s sibling gates. No trailing `error(...)` in the bound
+    /// generator here -- unlike the jq-mode test above, a trailing escape
+    /// would trip the pre-existing #2351 yq gate first (emptying `raw`
+    /// before conversion ever runs), exercising old behavior instead of
+    /// this fix's own new conversion-failure guard.
+    #[test]
+    fn test_json_computed_slice_bounds_conversion_failure_discarded_in_yq_mode_2372() {
+        let json = br#"{"a":[1,2,3]}"#;
+        let index = JsonIndex::build(json);
+
+        let expr = crate::jq::parse(r#".a[(1,"x"):2]"#).unwrap();
+        let result = eval_with_cursor_using::<YqSemantics, _>(&expr, index.root(json));
+        match result {
+            GenericResult::Error(e) => {
+                assert!(e.message.contains("integer"), "{}", e.message);
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_json_computed_slice_bounds_open_start_and_open_end() {
         // A missing bound short-circuits `eval_slice_bound` to a single

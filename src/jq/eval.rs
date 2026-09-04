@@ -54007,17 +54007,46 @@ mod tests {
         );
     }
 
+    /// #2372 review: the same priority holds for `break` too, not just
+    /// `error`/`halt` -- confirmed live against jq 1.7.1: `label $out |
+    /// .[(1,"x",break $out):3]` on `[10,20,30]` raises the identical
+    /// conversion error rather than breaking out silently. Unlabeled
+    /// `break $out` here, matching this file's own established precedent
+    /// for testing `eval()` in isolation (real jq's CLI rejects an
+    /// unlabeled `break $out` as a compile error, so the labeled form is
+    /// what was live-verified above; the unlabeled form is this harness's
+    /// own convention for reaching the same value-level escape).
+    #[test]
+    fn test_slice_bound_conversion_failure_outranks_pending_break_2372() {
+        query!(b"[10,20,30]", r#".[(1,"x",break $out):3]"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![
+                    OwnedValue::Array(vec![OwnedValue::Int(20), OwnedValue::Int(30)]),
+                ]);
+                assert!(e.message.contains("integers"), "{}", e.message);
+            }
+        );
+    }
+
     /// #2372: yq mode keeps the pre-fix conservative discard -- real yq has
     /// no clean model for a computed comma-bound at all (confirmed live
     /// against yq v4.53.3: `.[(1,"x"):3]` on `[10,20,30]` rejects the bound
     /// outright, "expected to find 1 number, got 2 instead"), so this
     /// mirrors the generator-escape gate's own yq carve-out rather than
     /// streaming a prefix with no oracle basis for it.
+    ///
+    /// Review: no trailing `error(...)`/`halt`/`break` in the bound
+    /// generator, unlike this test's jq-mode sibling above -- a trailing
+    /// escape would trip the *pre-existing* #2351 yq gate first (which
+    /// empties `raw` before conversion ever runs), exercising old behavior
+    /// instead of this fix's own new conversion-failure guard. This shape
+    /// (a clean two-value generator, no escape at all) is what actually
+    /// reaches it.
     #[test]
     fn test_slice_bound_conversion_failure_discarded_in_yq_mode_2372() {
-        yq_query!(b"[10,20,30]", r#".[(1,"x",error("y")):3]"#,
+        yq_query!(b"[10,20,30]", r#".[(1,"x"):3]"#,
             QueryResult::Error(e) => {
-                assert_eq!(e.message, "y");
+                assert!(e.message.contains("integer"), "{}", e.message);
             }
         );
     }
@@ -54235,11 +54264,16 @@ mod tests {
 
     /// #2372: yq mode keeps the pre-fix conservative discard through the
     /// path-context dispatch too, same as the plain evaluator's own gate.
+    ///
+    /// Review: no trailing escape in the bound generator -- see the plain
+    /// evaluator's own sibling test's comment above for why that shape is
+    /// needed to actually reach this fix's new conversion-failure guard
+    /// rather than the pre-existing #2351 yq gate.
     #[test]
     fn test_slice_bound_path_context_conversion_failure_discarded_in_yq_mode_2372() {
-        yq_query!(b"[10,20,30]", r#".[(1,"x",error("y")):3] | key"#,
+        yq_query!(b"[10,20,30]", r#".[(1,"x"):3] | key"#,
             QueryResult::Error(e) => {
-                assert_eq!(e.message, "y");
+                assert!(e.message.contains("integer"), "{}", e.message);
             }
         );
     }
