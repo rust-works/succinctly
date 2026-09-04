@@ -733,7 +733,16 @@ jobs:
           # which is how the CPU-conditional `src/bits/popcount.rs` flap (#302)
           # is silenced. The action does not thread `--ignore-filename-regex`,
           # so config-file discovery from the checkout is the only route.
-          version: 0.38.0
+          # Bumped to 0.42.0 for #1554: that release carries omni-dev#1580's
+          # fix (PR rust-works/omni-dev#1586, switching `coverage diff`'s
+          # internal git diff to libgit2's patience algorithm), which resolves
+          # the patch-coverage misattribution this repo hit on refactor-shaped
+          # diffs with long runs of near-duplicate lines (src/jq/eval.rs on
+          # PR #1551) -- verified locally against that PR's exact base/head
+          # commits with the 0.42.0 binary: patch coverage now reports 7/7
+          # new lines for eval.rs, not the pre-fix "5161/6070 new lines"
+          # spanning nearly the whole file.
+          version: 0.42.0
           use-prebuilt-binary: ${{ matrix.use-prebuilt }}
           test-args: --features cli,simd,regex,serde --workspace
           fail-under-lines: 55   # floor a few pts below local llvm-cov (ARM: 59.58% lines)
