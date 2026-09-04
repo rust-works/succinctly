@@ -1899,13 +1899,40 @@ gap below for when it hasn't), and `delete_paths_under`'s array-key arm (`delpat
 recursion) -- all in `src/jq/eval.rs`. `delpaths`' own path components are always concrete
 keys, never a `.[]` wildcard, so there is no `[]`-vivify case to mirror at that site.
 
-**One residual gap found during this fix's own review, not chased here:** a
-**comma-grouped** target whose own `.[]` fan-out crosses the out-of-range index
-(`del(.[5][], .[0])`) never reaches `delete_trie_array` at all -- the read-based
-validation that enumerates concrete branches for the trie reads `.[5]` as a plain `null`
-(correct for an ordinary read) and raises iterating `.[]` over it, rather than
-extending+vivifying the way the direct, non-comma-grouped form now does. Tracked as
-[#2324](https://github.com/rust-works/succinctly/issues/2324).
+**A residual gap found during this fix's own review is now closed too**
+([#2324](https://github.com/rust-works/succinctly/issues/2324)). A **comma-grouped**
+target whose own `.[]` fan-out crosses the out-of-range index (`del(.[5][], .[0])`) never
+reached `delete_trie_array` at all -- the read-based validation that enumerates concrete
+branches for the trie read `.[5]` as a plain `null` (correct for an ordinary read) and
+raised iterating `.[]` over it, rather than extending+vivifying the way the direct,
+non-comma-grouped form already did:
+
+```bash
+$ echo '[1,2]' | yq -o=json 'del(.[5][], .[0])'   # [2, null, null, null, []]
+```
+
+Fixed not by teaching `resolve_node`'s shared, read-only `Expr::Iterate` arm (or the
+delete trie) a del()-specific exception, but by a narrow pre-pass
+(`vivify_del_comma_iterate_targets`, called from `builtin_del`) that peels every
+top-level comma branch shaped as a static `Field`/`Index` prefix plus a bare trailing
+`.[]` whose prefix currently reads `null` off the comma group, and runs it through the
+very same `delete_at_path` a single-target `del()` call already uses -- before
+`resolve_del_path_branches` ever sees the rest. That ordering matches real yq's own
+observed behaviour: every such branch resolves against the pristine input, in any
+relative order, ahead of any sibling's own structural (index-shifting) deletion --
+confirmed live, `del(.[5][], .[0])` and `del(.[0], .[5][])` give the identical answer
+above regardless of order. The same root cause also covered a genuinely-existing `null`
+(not just an out-of-range index) reached the identical way:
+
+```bash
+$ echo '{"a":null,"c":9}' | yq -o=json 'del(.a[], .c)'   # {"a": []}
+```
+
+`delpaths()`'s own multi-key batch form was checked and confirmed unaffected --
+its path components are always concrete keys, never a `.[]` wildcard (as already noted
+above), so it never reaches `resolve_node`'s `Expr::Iterate` arm at all; the analogous
+mid-chain-index batch shape (`delpaths([[5,0],[0]])`) already matched real yq before this
+fix, via the same `delete_paths_under` machinery #2314 covers.
 
 (A second gap found during the same review -- `null` never vivifying into `[]` ahead of
 *any* `Index`/`Iterate` del() step, not just a slot #2314 itself just padded -- is now

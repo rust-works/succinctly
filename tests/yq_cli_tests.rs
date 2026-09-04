@@ -29489,3 +29489,159 @@ fn test_keys_negative_index_out_of_range_unaffected_in_jq_mode_2264() -> Result<
 
     Ok(())
 }
+
+/// #2324: a **comma-grouped** `del()` target whose own `.[]` fan-out crosses
+/// a positive out-of-range array index used to raise "Cannot iterate over
+/// null" instead of extending+vivifying the way the direct, non-comma-
+/// grouped form (`del(.[5][])` alone, #2314/#2323) already did -- the
+/// read-based branch-set resolution `resolve_del_path_branches` uses for a
+/// comma group reads `.[5]` as a plain `null` (correct for an ordinary
+/// read) and then raises fanning `.[]` out over it, never reaching the trie
+/// machinery that already knows how to extend. Confirmed live against yq
+/// v4.53.3.
+#[test]
+fn test_del_comma_fanout_positive_out_of_range_iterate_extends_2324() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(.[5][], .[0])", "[1, 2]\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[2,null,null,null,[]]");
+    Ok(())
+}
+
+/// #2324: the fix must not care which order the two targets appear in --
+/// confirmed live against yq v4.53.3 that both orderings give the identical
+/// answer (the out-of-range extension always resolves against the pristine
+/// input, ahead of any sibling's own index-shifting deletion).
+#[test]
+fn test_del_comma_fanout_positive_out_of_range_iterate_extends_reversed_order_2324() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(.[0], .[5][])", "[1, 2]\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[2,null,null,null,[]]");
+    Ok(())
+}
+
+/// #2324: the same fix, reached through an explicit outer paren around the
+/// comma group (`del((.[5][], .[0]))`, syntactically the same query --
+/// parses to `Expr::Paren(Expr::Comma(...))`, the same shape #1223 found for
+/// its own, unrelated rewrite). `vivify_del_comma_iterate_targets` unwraps
+/// `Expr::Paren` before its own `Comma` check for exactly this reason.
+#[test]
+fn test_del_comma_fanout_positive_out_of_range_iterate_extends_paren_wrapped_2324() -> Result<()> {
+    let (out, code) = run_yq_stdin("del((.[5][], .[0]))", "[1, 2]\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[2,null,null,null,[]]");
+    Ok(())
+}
+
+/// #2324: several out-of-range `.[]` targets in the same comma group, all
+/// sharing the same underlying array, still each extend independently --
+/// confirmed live against yq v4.53.3 (`[2, null, null, null, [], null,
+/// null, []]`, i.e. `.[5]` and `.[8]` both become `[]` and `.[0]` is still
+/// removed).
+#[test]
+fn test_del_comma_fanout_multiple_out_of_range_iterate_targets_2324() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.[5][], .[8][], .[0])",
+        "[1, 2]\n",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[2,null,null,null,[],null,null,[]]");
+    Ok(())
+}
+
+/// #2324: the `?` (optional) variant on the trailing `.[]` -- reported as
+/// *worse* than the unsuppressed form in the original issue (it silently
+/// dropped the extension entirely instead of raising). Confirmed live
+/// against yq v4.53.3 that real yq's answer for `del(.[5][]?, .[0])` is
+/// identical to the unsuppressed `del(.[5][], .[0])` above -- `?` on a
+/// del() target does not suppress the vivify (matching #2323's own
+/// established `null | del(.[2]?)` precedent).
+#[test]
+fn test_del_comma_fanout_positive_out_of_range_iterate_optional_still_extends_2324() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(.[5][]?, .[0])", "[1, 2]\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[2,null,null,null,[]]");
+    Ok(())
+}
+
+/// #2324's own second trigger (found during #2323's review, same root
+/// cause): a genuinely-*existing* `null` reached the identical way, not
+/// just a positive-out-of-range index. The single-target form
+/// (`{"a":null} | del(.a[])`) already correctly gave `{"a":[]}` via #2323's
+/// own fix; only the comma-grouped form raised. Confirmed live against yq
+/// v4.53.3.
+#[test]
+fn test_del_comma_fanout_existing_null_iterate_extends_2324() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(.a[], .c)", "a: null\nc: 9\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":[]}"#);
+    Ok(())
+}
+
+/// #2324's own delpaths() check: its own multi-key batch form is structurally
+/// unaffected by this issue's root cause, since a delpaths() path is always
+/// a concrete-key array -- there is no `.[]` wildcard component for
+/// `resolve_node`'s `Expr::Iterate` arm to ever raise on in the first place.
+/// The analogous mid-chain-out-of-range-index batch shape already matched
+/// real yq before this fix too, via #2314's own `delete_paths_under` fix --
+/// pinned here as a `del()`-vs-`delpaths()` control, confirmed live against
+/// yq v4.53.3.
+#[test]
+fn test_delpaths_batch_out_of_range_mid_chain_unaffected_2324() -> Result<()> {
+    let (out, code) = run_yq_stdin("delpaths([[5,0],[0]])", "[1, 2]\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[2,null,null,null,null]");
+    Ok(())
+}
+
+/// #2324's jq-mode control: jq's `del()` has no vivify rule at all (#2323's
+/// own established precedent, `null | del(.[])` raises rather than
+/// vivifying in real jq) -- the comma-grouped form must keep raising
+/// "Cannot iterate over null" exactly as it did before this fix, both for
+/// the out-of-range-index trigger and the genuinely-existing-null one.
+/// Confirmed live against jq 1.7.1.
+#[test]
+fn test_del_comma_fanout_iterate_over_null_unaffected_in_jq_mode_2324() -> Result<()> {
+    let (out, stderr, code) = run_jq_stdin_with_stderr("del(.[5][], .[0])", "[1,2]", &["-c"])?;
+    assert_ne!(code, 0, "out: {out:?}");
+    assert!(
+        stderr.contains("Cannot iterate over null"),
+        "stderr={stderr}"
+    );
+
+    let (out, stderr, code) =
+        run_jq_stdin_with_stderr("del(.a[], .c)", r#"{"a":null,"c":9}"#, &["-c"])?;
+    assert_ne!(code, 0, "out: {out:?}");
+    assert!(
+        stderr.contains("Cannot iterate over null"),
+        "stderr={stderr}"
+    );
+
+    Ok(())
+}
+
+/// #2324: an ordinary plain read of `.[]` over `null` (not a `del()` target
+/// at all) must be entirely unaffected by this fix -- `resolve_node`'s
+/// shared `Expr::Iterate` arm itself was deliberately left untouched, with
+/// the vivify handled by a `del()`-specific pre-pass instead
+/// (`vivify_del_comma_iterate_targets`, called only from `builtin_del`).
+/// Confirmed live against yq v4.53.3 that `.a[]` and `.[5][]` (an
+/// out-of-range read, not a delete) both still raise outside of `del()`.
+#[test]
+fn test_plain_iterate_over_null_read_unaffected_by_2324() -> Result<()> {
+    let (out, stderr, code) = run_yq_stdin_with_stderr(".a[]", "a: null\n", &["-o=json"])?;
+    assert_ne!(code, 0, "out: {out:?}");
+    assert!(
+        stderr.contains("Cannot iterate over null"),
+        "stderr={stderr}"
+    );
+
+    let (out, stderr, code) = run_yq_stdin_with_stderr(".[5][]", "[1, 2]\n", &["-o=json"])?;
+    assert_ne!(code, 0, "out: {out:?}");
+    assert!(
+        stderr.contains("Cannot iterate over null"),
+        "stderr={stderr}"
+    );
+
+    Ok(())
+}
