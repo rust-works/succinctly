@@ -208,7 +208,26 @@ fn collect_def_names(input: &str) -> BTreeSet<String> {
         if !before_ok || !after_ok {
             continue;
         }
-        let rest = input[end..].trim_start();
+        // #2036 review round 2: `trim_start()` alone only skips whitespace,
+        // not a `#`-comment between `def` and its name -- real jq's own
+        // `skip_ws` (which this prescan is meant to approximate) skips both,
+        // repeatedly, so a comment here must be skipped too or a `def`
+        // separated from its name by one is invisible to this scan and the
+        // shadow it should have enabled silently never fires. Confirmed
+        // live: `def #c\nlength: 99; length` returned `0` (the real
+        // builtin) instead of `99` before this fix.
+        let mut rest = &input[end..];
+        loop {
+            let trimmed = rest.trim_start();
+            let Some(after_hash) = trimmed.strip_prefix('#') else {
+                rest = trimmed;
+                break;
+            };
+            rest = match after_hash.find('\n') {
+                Some(i) => &after_hash[i..],
+                None => "",
+            };
+        }
         let mut chars = rest.char_indices();
         let Some((_, first)) = chars.next() else {
             continue;
@@ -1802,6 +1821,7 @@ impl<'a> Parser<'a> {
     /// Syntax: error
     ///         error(MESSAGE)
     fn parse_error_expr(&mut self) -> Result<Expr, ParseError> {
+        let start_pos = self.pos;
         self.consume_keyword("error");
         self.skip_ws();
 
@@ -1811,7 +1831,32 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let msg_expr = self.parse_expr()?;
             self.skip_ws();
-            self.expect(')')?;
+            if self.peek() != Some(')') {
+                // #2036 review round 2: unlike the other 7 shadowable
+                // special forms (until/limit/while/repeat/range/first/last),
+                // this arm used to propagate `Err` straight from `expect`
+                // for a wrong-arity `error(a;b)` call, relying on
+                // `parse_shadowable_special_form`'s own
+                // `retry_shadow_candidate_as_generic_call` fallback to
+                // recover it as a generic call. That fallback re-parses
+                // `input[start_pos..]` from scratch *in addition to* the
+                // `parse_expr()` call just above, which had already fully
+                // (and, for a nested wrong-arity shadow candidate,
+                // recursively-and-also-retried) parsed the same content --
+                // doubling the parse work at every nesting level and
+                // exhausting `shadow_retry_budget` at a depth as shallow as
+                // 7 for a legitimate, non-adversarial nested `def
+                // error(a;b): ...` shadow. Matching #2110/#2237's own
+                // internal-rewind pattern here (`rewind_to_wrong_arity_call`)
+                // instead removes this arm from that fallback path entirely,
+                // exactly as it already does for the other 7 forms.
+                if self.mode == ParserMode::Jq {
+                    return self.rewind_to_wrong_arity_call(start_pos);
+                }
+                self.expect(')')?;
+                unreachable!();
+            }
+            self.next();
             Some(Box::new(msg_expr))
         } else {
             None
@@ -2182,11 +2227,38 @@ impl<'a> Parser<'a> {
         if self.peek() == Some(')') {
             // range(N) - from 0 to N
             self.next();
-            return Ok(Expr::Range {
+            let range = Expr::Range {
                 from: Box::new(Expr::Literal(Literal::Int(0))),
                 to: Some(Box::new(first)),
                 step: None,
-            });
+            };
+            // #2036 review round 2: wrapped in `Paren` -- but *only* when
+            // "range" is a shadow candidate at all (i.e. only on the path
+            // `wrap_shadowable_call` will actually consult) -- so this 1-arg
+            // form stays distinguishable there from a genuine 2-arg
+            // `range(0; N)` call, which desugars to the exact same `Range {
+            // from: Literal(0), .. }` shape otherwise. Needed for
+            // `builtin_fallback_arity`/`_into_args` (`resolve.rs`) to report
+            // the correct real arity (1, not 2) in that case -- confirmed
+            // live before this fix: `def range(a;b): "s"; range(5)` wrongly
+            // shadowed at arity 2, and `def range(a): "s"; range(5)` wrongly
+            // failed to shadow at arity 1.
+            //
+            // An earlier version of this fix wrapped unconditionally,
+            // regardless of whether "range" was ever a shadow candidate --
+            // `Paren` is a transparent no-op at *evaluation*, but it is a
+            // real, observable change to the parsed `Expr` shape, and broke
+            // `walk::tests::map_subexprs_preserves_field_order_three_or_more_children`'s
+            // pre-existing expectation that a plain `range(.a)` (no `def`
+            // anywhere in the filter) parses straight to `Expr::Range`, not
+            // `Expr::Paren(Range(..))`. Gating on `shadowable_defs` keeps
+            // the parsed shape identical to before this issue's fix for
+            // every filter with no `def` of "range" in it at all -- the
+            // overwhelming majority of `range(N)` call sites.
+            if self.shadowable_defs.contains("range") {
+                return Ok(Expr::Paren(Box::new(range)));
+            }
+            return Ok(range);
         }
 
         self.expect(';')?;
@@ -2958,6 +3030,42 @@ impl<'a> Parser<'a> {
     /// `args.len()` whenever `args` is still empty) means no sub-expression
     /// is ever duplicated at parse time at all.
     fn wrap_shadowable_call(name: &str, original: Expr) -> Expr {
+        // #2036 review round 2: only wrap a shape `resolve.rs`'s
+        // `builtin_fallback_arity`/`builtin_fallback_into_args` actually
+        // know how to read back -- the exact set of shapes the 8 dedicated
+        // special-form parsers and `try_parse_builtin` can hand back on
+        // success. `original` is *not* always one of these: #2110/#2237's
+        // own internal `rewind_to_wrong_arity_call` lets a dedicated parser
+        // (e.g. `parse_until_expr` on a wrong-arity call) return `Ok` over
+        // an already-generic `parse_func_call_or_error` + postfix result
+        // instead of `Err` -- a plain `Expr::FuncCall`, or any postfix
+        // wrapping of one (`Expr::IndexExpr`, `Expr::Optional`, ...).
+        // Wrapping *that* as a `builtin_fallback` left no matching arm in
+        // `builtin_fallback_arity`/`_into_args` (both fell to their
+        // wildcard, silently computing arity 0 and discarding the real
+        // args) -- confirmed live: `def until: "s"; until(error("boom"))`
+        // returned `"s"`, discarding the error entirely, where real jq
+        // raises `until/1 is not defined`. There is no builtin
+        // interpretation left to preserve in that case -- the dedicated
+        // parser itself already gave up and fell through to a generic call
+        // -- so it is returned as-is, unwrapped, and resolved exactly like
+        // any other ordinary call site.
+        let is_recognized_special_form_shape = matches!(
+            original,
+            Expr::Not
+                | Expr::Limit { .. }
+                | Expr::Until { .. }
+                | Expr::While { .. }
+                | Expr::Repeat(_)
+                | Expr::FirstExpr(_)
+                | Expr::LastExpr(_)
+                | Expr::Range { .. }
+                | Expr::Error(_)
+                | Expr::Builtin(_)
+        ) || matches!(&original, Expr::Paren(inner) if matches!(**inner, Expr::Range { .. }));
+        if !is_recognized_special_form_shape {
+            return original;
+        }
         Expr::FuncCall {
             name: name.to_string(),
             args: Vec::new(),
