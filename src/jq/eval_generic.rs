@@ -2524,6 +2524,13 @@ fn push_generic_truthiness_cursor_error<C: DocumentCursor>(c: &C, depth: usize) 
         let mut seen_fallback = false;
         let mut index = 0usize;
         let mut f = fields;
+        // #2349: `last_field` -- the last real field's *value* cursor, not
+        // its key -- feeds the #2243 trailing-gap check once the loop
+        // ends, mirroring `to_owned_cursor_at_depth`'s own tracking. No
+        // separate `is_first` flag: `index == 0` already carries that fact
+        // (both would flip/increment together every iteration with no
+        // path that updates one without the other).
+        let mut last_field: Option<C> = None;
         while let Some((field, rest)) = f.uncons() {
             if !seen_fallback {
                 match key_display_string_kind(&field.key) {
@@ -2566,25 +2573,88 @@ fn push_generic_truthiness_cursor_error<C: DocumentCursor>(c: &C, depth: usize) 
                     Err(e) => return Some(Control::Error(e)),
                 }
             }
+            // #2349: same #1677 key/value delimiter checks
+            // `to_owned_cursor_at_depth`'s own object loop runs -- this
+            // walk had none at all, so `{"a" 1}` (missing `:`) or a
+            // duplicate/missing `,` between fields passed silently here
+            // while the materializing sibling correctly raised.
+            if !key_delimiter_ok::<<C::Value as DocumentValue>::Fields>(
+                &field.key,
+                &field.key_cursor,
+                index == 0,
+            ) || !value_delimiter_ok::<<C::Value as DocumentValue>::Fields>(
+                Some(&field.value),
+                &field.value_cursor,
+            ) {
+                return Some(Control::Error(f.malformed_member_error()));
+            }
             index += 1;
             if let Some(control) =
                 push_generic_truthiness_cursor_error(&field.value_cursor, depth + 1)
             {
                 return Some(control);
             }
+            last_field = Some(field.value_cursor);
             f = rest;
         }
         if f.ends_unpaired() {
             return Some(Control::Error(f.malformed_member_error()));
         }
+        // #2349: same #2211/#2243 container/trailing-gap checks
+        // `to_owned_cursor_at_depth`'s own object arm runs after its loop
+        // -- a stray `,` with no real field (`{,}`) or a trailing `,`
+        // after the last real field (`{"a":1,}`) both passed silently
+        // here before this fix.
+        match last_field {
+            None => {
+                if !c.container_gap_ok(b'}') {
+                    return Some(Control::Error(c.malformed_delimiter_error()));
+                }
+            }
+            Some(value_cursor) => {
+                if !trailing_element_gap_ok(&value_cursor, b'}') {
+                    return Some(Control::Error(c.malformed_delimiter_error()));
+                }
+            }
+        }
         None
     } else if let Some(elements) = value.as_array() {
         let mut elems = elements;
+        let mut is_first = true;
+        let mut last_elem: Option<C> = None;
         while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
+            // #2349/#1677: same gap check `to_owned_cursor_at_depth`'s
+            // array loop runs -- a missing/duplicate `,` between elements
+            // previously passed silently here. `element_gap_ok`, not a
+            // hand-inlined `text_position`/`preceding_delimiter_ok` pair
+            // (the issue's own suggested next step) -- #1597 extracted
+            // this exact composition specifically because independent
+            // copies of it had already drifted apart once.
+            if !elem_cursor.element_gap_ok(is_first) {
+                return Some(Control::Error(elem_cursor.malformed_delimiter_error()));
+            }
             if let Some(control) = push_generic_truthiness_cursor_error(&elem_cursor, depth + 1) {
                 return Some(control);
             }
+            last_elem = Some(elem_cursor);
             elems = rest;
+            is_first = false;
+        }
+        // #2349/#2211/#2243: same container/trailing-gap checks
+        // `to_owned_cursor_at_depth`'s own array arm runs after its loop --
+        // `[,]` (no real element) or `[1,]` (trailing `,`) both passed
+        // silently here before this fix.
+        match last_elem {
+            None => {
+                if !c.container_gap_ok(b']') {
+                    return Some(Control::Error(c.malformed_delimiter_error()));
+                }
+            }
+            Some(last) => {
+                if !trailing_element_gap_ok(&last, b']') {
+                    return Some(Control::Error(c.malformed_delimiter_error()));
+                }
+            }
         }
         None
     } else if let Some(reason) = value.string_decode_error() {

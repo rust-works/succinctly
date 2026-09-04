@@ -370,6 +370,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The validate-only traversal backing `select`/`sort_by`/`unique_by`/`min_by`/`max_by`/
+  `path()` silently accepted invalid JSON in a subtree it only ever validates, never
+  materializes** (#2349, split out of #1803). `push_generic_truthiness_cursor_error`
+  (`src/jq/eval_generic.rs`) is the shared validation gate for all six builtins, and both
+  `path()` call sites' own doc comments claim it runs "that same traversal and validation"
+  as the materializing `to_owned_cursor_at_depth` — but three follow-ups since it was
+  written (#1677, #2211, #2243/#2262) each added a delimiter/gap check to the
+  materializing traversals and none reached this one, so a corrupted subtree the query
+  only ever validates (never emits) passed silently where the identical subtree, read
+  directly, correctly raised:
+
+  ```console
+  $ echo '{"c":{"a":1,},"t":5}' | succinctly jq -c 'select(.c) | .t'   # before this fix
+  5
+  $ echo '{"c":{"a":1,},"t":5}' | succinctly jq -c '.c'                # already correct
+  Error: Invalid JSON text: expected string key, found '}'
+  ```
+
+  Fixed by adding the missing checks to `push_generic_truthiness_cursor_error`'s own
+  object/array walk, mirroring `to_owned_cursor_at_depth`'s structure exactly (`is_first`/
+  last-cursor tracking, `key_delimiter_ok`/`value_delimiter_ok` per object field,
+  `preceding_delimiter_ok` per array element, `container_gap_ok`/`trailing_element_gap_ok`
+  after each container's loop) — all four checks reused verbatim from `document.rs`, no
+  new logic. YAML is unaffected: every added check is a JSON-only no-op for a YAML
+  document, matching the issue's own divergence matrix.
+
+  **Performance**: since `path()` runs this gate over the *whole* document on every call
+  (not just the values a query actually reads), the added checks are charged to the
+  entire tree regardless of what's queried. Measured (M-series laptop, interleaved A/B,
+  7 reps, `path(.[0])` on a ~700K-object array — not the pinned bench boxes, indicative
+  only): **+13.1%** with the full fix, of which disabling just the trailing/container-gap
+  checks (`#2211`/`#2243`) recovers **57%** of the regression, confirming those two checks
+  as the dominant cost, as the issue's own investigation predicted. Accepted as the price
+  of the gate the code already claims to run; `select`/`sort_by` and friends walk far
+  smaller subtrees per query and are far less affected.
+
 - **`del()`'s trailing `.[]` raised instead of no-oping through a tolerated (rather than
   genuinely found) `null`, in yq mode** (#2347, found during #2324's own implementation).
   A `null` reached by tolerating a step against it — a missing object field, or an
