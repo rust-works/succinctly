@@ -9044,10 +9044,20 @@ fn eval_slice_bound<S: EvalSemantics, V: DocumentValue>(
             ),
             other => (other.collect_owned().map_err(Control::Error)?, None),
         };
-    let converted = raw
-        .iter()
-        .map(|v| owned_bound_to_i64(v, round).map_err(Control::Error))
-        .collect::<Result<Vec<_>, _>>()?;
+    // #2372: mirrors `eval::eval_slice_bound`'s identical fix exactly -- see
+    // that function's own doc comment for the full rationale and
+    // live-oracle verification, not repeated here. Used to be a bare
+    // `.collect::<Result<Vec<_>, _>>()?`, discarding every already-
+    // converted bound (and silently replacing `escape`) on the first
+    // non-numeric bound.
+    let mut converted = vec_with_capacity(raw.len());
+    for v in &raw {
+        match owned_bound_to_i64(v, round) {
+            Ok(i) => converted.push(i),
+            Err(e) if S::TAG == EvalTag::Yq => return Err(Control::Error(e)),
+            Err(e) => return Ok((converted, Some(Control::Error(e)))),
+        }
+    }
     Ok((converted, escape))
 }
 
@@ -17060,6 +17070,33 @@ mod tests {
                 );
             }
             other => panic!("expected Partial(_, Break), got {other:?}"),
+        }
+    }
+
+    /// #2372: distinct from #1528 above -- this is a bound *conversion*
+    /// failure (a non-numeric value already produced by the generator),
+    /// not the generator's own escape. `1` converts fine; `"x"` fails
+    /// before the generator's own later `error("y")` is ever reached.
+    /// Confirmed against jq 1.7.1: `.a[(1,"x",error("y")):2]` on
+    /// `{"a":[1,2,3]}` prints `[2]` (from the one successfully-converted
+    /// bound) then raises "Array/string slice indices must be integers" --
+    /// not `y`, confirming the conversion failure unconditionally outranks
+    /// the later-pending generator escape.
+    #[test]
+    fn test_json_computed_slice_bounds_conversion_failure_keeps_prefix_2372() {
+        let json = br#"{"a":[1,2,3]}"#;
+        let index = JsonIndex::build(json);
+
+        let expr = crate::jq::parse(r#".a[(1,"x",error("y")):2]"#).unwrap();
+        match eval_with_cursor(&expr, index.root(json)) {
+            GenericResult::Partial(prefix, Control::Error(e)) => {
+                assert_eq!(
+                    prefix.iter().map(OwnedValue::to_json).collect::<Vec<_>>(),
+                    vec!["[2]"]
+                );
+                assert!(e.message.contains("integers"), "{}", e.message);
+            }
+            other => panic!("expected Partial(_, Error), got {other:?}"),
         }
     }
 
