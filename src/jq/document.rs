@@ -170,6 +170,21 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// Navigate to the parent container.
     fn parent(&self) -> Option<Self>;
 
+    /// The parent *within the document*: [`parent`](Self::parent), except
+    /// that a document root has none. JSON has a single root; YAML's
+    /// [`parent`](Self::parent) of a document root is the document stream,
+    /// which is not a node the query language can stand on (#2416 phase 3).
+    fn document_parent(&self) -> Option<Self> {
+        self.parent()
+    }
+
+    /// Whether two cursors stand on the same node. The default compares text
+    /// positions, which every distinct node has its own of; a format whose
+    /// cursor carries a tree position overrides this with the exact test.
+    fn same_node(&self, other: &Self) -> bool {
+        self.text_position() == other.text_position()
+    }
+
     /// Check if this cursor points to a container (array or object).
     fn is_container(&self) -> bool;
 

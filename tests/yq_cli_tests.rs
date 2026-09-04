@@ -29347,6 +29347,33 @@ fn test_negative_index_out_of_range_survives_any_all_generator_2254() -> Result<
     Ok(())
 }
 
+/// A negative index's path component is the *resolved* index in yq mode
+/// (spine 2416, phase 3). Captured live from yq v4.53.3 on `a: [1, 2]`:
+/// `.a[-1] | key` is `1`, `.a[-2] | key` is `0`, `.a[-1] | path` is
+/// `["a",1]` -- the written `-1` that the accumulated-path model kept is
+/// jq's convention (`path(.a[-1])` is `["a",-1]` in jq 1.7.1), which jq
+/// mode keeps. These rows all take the cursor walk. The `?` spelling
+/// (`.a[-1]? | key`) still takes the eager evaluator, because `?` over an
+/// index can reach an absent node and only that evaluator carries an
+/// absent node's path; it answers the written `-1` there, and is that
+/// evaluator's remaining divergence -- see
+/// `test_negative_index_out_of_range_survives_path_context_2254`.
+#[test]
+fn test_negative_index_path_component_is_resolved_in_yq_mode_2416() -> Result<()> {
+    for (filter, want) in [
+        (".a[-1] | key", "1"),
+        (".a[-2] | key", "0"),
+        (".a[-1] | path", r#"["a",1]"#),
+        (".a | .[-1] | key", "1"),
+        (".a[-1] | parent | key", r#""a""#),
+    ] {
+        let (out, code) = run_yq_stdin(filter, "a: [1, 2]\n", &["-o", "json", "-I0"])?;
+        assert_eq!(code, 0, "`{filter}`: {out:?}");
+        assert_eq!(out.trim(), want, "`{filter}`");
+    }
+    Ok(())
+}
+
 /// #2254 review follow-up: three more independent `optional`-suppression
 /// gaps found by a full review round, all in `eval.rs`'s path-context/
 /// library-route evaluator, none exercised by any test above (which only
@@ -29400,7 +29427,15 @@ fn test_negative_index_out_of_range_survives_path_context_2254() -> Result<()> {
 
     // In-bounds negative wraparound and positive out-of-range are both
     // unaffected by the fix -- `?` is still a true no-op for either, not
-    // just for the error case.
+    // just for the error case. Real yq v4.53.3 answers `1` -- the
+    // *resolved* index -- for `.a[-1]? | key` on a two-element sequence
+    // (captured live); the `-1` pinned here is the eager path-context
+    // evaluator's own path component, which this `?` spelling still
+    // reaches (spine 2416: `?` over an index can hit an absent node, whose
+    // path only that evaluator carries). The un-`?` spelling already
+    // answers `1` through the cursor walk -- see
+    // `test_negative_index_path_component_is_resolved_in_yq_mode_2416` --
+    // and this row flips when the eager evaluator retires.
     let (out, code) = run_yq_stdin(".a[-1]? | key", "a: [1, 2]\n", &["-o", "json"])?;
     assert_eq!(code, 0);
     assert_eq!(out.trim(), "-1");

@@ -5670,32 +5670,38 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                         }
                     }
                 }
-                let owned = owned_or_suppress!(to_owned_with_cursor(&value, cursor), optional);
-                // #1909: straight into `eval.rs`'s path-context evaluator
-                // with the tree we just built, rather than through
-                // `eval_on_owned`'s reindex bridge -- which lands in
-                // `eval::eval_pipe`, whose own `needs_path_context` gate
-                // (the same predicate checked just above) materializes the
-                // whole document a *second* time before calling exactly this
-                // function. Only where that bridge was a semantic no-op
-                // (`reindex_bridge_is_identity`); otherwise unchanged.
-                //
-                // `optional` is deliberately not threaded into the bypass,
-                // for the same reason `eval_on_owned` doesn't thread it into
-                // its own `full_eval` call: that entry point restarts every
-                // evaluation at `false` regardless of what its caller
-                // passed, so `false` is what the bridge actually delivered.
-                if reindex_bridge_is_identity(&owned) {
-                    return query_result_to_generic::<V>(
-                        crate::jq::eval::eval_pipe_with_path_context::<Vec<u64>, S>(
-                            exprs,
-                            &owned,
-                            &[],
-                            false,
-                        ),
-                    );
+                // #2416 phase 3: a pipe the walk declined runs here, in the
+                // generic evaluator with `key`/`parent`/`path` answered as
+                // cursor properties, unless `path_context_needs_eager` says
+                // only the eager evaluator can answer it.
+                if path_context_needs_eager(exprs) {
+                    let owned = owned_or_suppress!(to_owned_with_cursor(&value, cursor), optional);
+                    // #1909: straight into `eval.rs`'s path-context evaluator
+                    // with the tree we just built, rather than through
+                    // `eval_on_owned`'s reindex bridge -- which lands in
+                    // `eval::eval_pipe`, whose own `needs_path_context` gate
+                    // (the same predicate checked just above) materializes the
+                    // whole document a *second* time before calling exactly this
+                    // function. Only where that bridge was a semantic no-op
+                    // (`reindex_bridge_is_identity`); otherwise unchanged.
+                    //
+                    // `optional` is deliberately not threaded into the bypass,
+                    // for the same reason `eval_on_owned` doesn't thread it into
+                    // its own `full_eval` call: that entry point restarts every
+                    // evaluation at `false` regardless of what its caller
+                    // passed, so `false` is what the bridge actually delivered.
+                    if reindex_bridge_is_identity(&owned) {
+                        return query_result_to_generic::<V>(
+                            crate::jq::eval::eval_pipe_with_path_context::<Vec<u64>, S>(
+                                exprs,
+                                &owned,
+                                &[],
+                                false,
+                            ),
+                        );
+                    }
+                    return eval_on_owned::<S, _>(&Expr::Pipe(exprs.clone()), owned, optional);
                 }
-                return eval_on_owned::<S, _>(&Expr::Pipe(exprs.clone()), owned, optional);
             }
 
             if exprs.is_empty() {
@@ -7269,10 +7275,15 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
                 }
             }
         }
-        return drain_result_generic(
-            eval_single::<S, _>(&Expr::Pipe(exprs.to_vec()), value, optional, cursor),
-            sink,
-        );
+        // #2416 phase 3: see `eval_single`'s `Expr::Pipe` arm -- the same
+        // gate, so both routes agree on which pipes the eager evaluator
+        // still owns.
+        if path_context_needs_eager(exprs) {
+            return drain_result_generic(
+                eval_single::<S, _>(&Expr::Pipe(exprs.to_vec()), value, optional, cursor),
+                sink,
+            );
+        }
     }
 
     let Some((first, rest)) = exprs.split_first() else {
@@ -10106,6 +10117,12 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
             // re-matched over both with an `unreachable!()` fallback -- the
             // same shape that let a missing arm slip through twice.
             let (idx, key) = (*idx, key.as_ref());
+            // The path component a negative index leaves behind is mode-
+            // decided (ADR-0018), captured live on `{"a":[1,2]}`: jq 1.7.1's
+            // `path(.a[-1])` is `["a",-1]`, the index as written; yq v4.53.3's
+            // `.a[-1] | path` is `["a",1]` and `.a[-1] | key` is `1`, the
+            // index resolved against the length (#2416 phase 3).
+            let mut component = index_component_value(idx, key);
             let next = match node {
                 PathNode::Absent => PathNode::Absent,
                 PathNode::At(c) => {
@@ -10128,6 +10145,9 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
                             if let Some(e) = yq_negative_index_check::<S>(idx, resolved, len) {
                                 return Err(e);
                             }
+                            if S::TAG == EvalTag::Yq && resolved >= 0 {
+                                component = OwnedValue::Int(resolved);
+                            }
                         }
                         usize::try_from(idx)
                             .ok()
@@ -10141,10 +10161,7 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
                     }
                 }
             };
-            out.push((
-                PathTrail::extend(path, index_component_value(idx, key)),
-                next,
-            ));
+            out.push((PathTrail::extend(path, component), next));
             Ok(())
         }
         Expr::Iterate => match node {
@@ -10809,6 +10826,259 @@ pub fn path_context_pipe_streams_cursors(exprs: &[Expr]) -> bool {
         && path_context_walk_split(exprs).is_some_and(|(_, rest)| rest.is_empty())
 }
 
+/// The key under which `c` sits in its parent -- a field name or an element
+/// index -- or `None` at the document root (#2416 phase 3).
+///
+/// Path context as a *cursor property*: real yq's nodes carry parent
+/// pointers and keys, so `key`/`parent`/`path` there are properties of the
+/// node, not state accumulated by the query that reached it. The balanced-
+/// parentheses tree gives the same answer here: the parent is one `enclose`,
+/// the key a sibling scan of the parent's members. That is what lets
+/// `select(key == "a")`, `{k: key}` and every other construct evaluate
+/// path-context builtins in the generic evaluator with no dedicated arm.
+fn cursor_key<C: DocumentCursor>(c: &C) -> Result<Option<OwnedValue>, EvalError> {
+    let Some(parent) = c.document_parent() else {
+        return Ok(None);
+    };
+    let parent_value = parent.value();
+    if let Some(fields) = parent_value.as_object() {
+        let mut f = fields.clone();
+        while let Some((field, rest)) = f.uncons() {
+            if field.value_cursor.same_node(c) {
+                let Some(key) = key_display_string(&field.key) else {
+                    return Err(fields.malformed_member_error());
+                };
+                return Ok(Some(OwnedValue::String(key.into_owned())));
+            }
+            f = rest;
+        }
+        Ok(None)
+    } else if let Some(elements) = parent_value.as_array() {
+        let mut index = 0i64;
+        let mut e = elements;
+        while let Some((elem, rest)) = e.uncons_cursor() {
+            if elem.same_node(c) {
+                return Ok(Some(OwnedValue::Int(index)));
+            }
+            index += 1;
+            e = rest;
+        }
+        Ok(None)
+    } else {
+        Ok(None)
+    }
+}
+
+/// The path from the document root to `c`, and the node at every proper
+/// prefix of it -- `(path, ancestors)` in the shape [`PathContextPos`] holds
+/// them. Empty at the root.
+fn cursor_path_and_ancestors<C: DocumentCursor>(
+    c: &C,
+) -> Result<(Vec<OwnedValue>, Vec<C>), EvalError> {
+    let mut path = Vec::new();
+    let mut ancestors = Vec::new();
+    let mut cur = *c;
+    while let Some(parent) = cur.document_parent() {
+        let Some(key) = cursor_key(&cur)? else {
+            break;
+        };
+        path.push(key);
+        ancestors.push(parent);
+        cur = parent;
+    }
+    path.reverse();
+    ancestors.reverse();
+    Ok((path, ancestors))
+}
+
+/// `n` levels up from `c`, or `None` at or above the document root.
+fn cursor_ancestor<C: DocumentCursor>(c: &C, n: usize) -> Option<C> {
+    let mut cur = *c;
+    for _ in 0..n {
+        cur = cur.document_parent()?;
+    }
+    Some(cur)
+}
+
+/// Whether a path-context pipe the walk declined has to take the eager
+/// evaluator, or can run in the generic evaluator with the path-context
+/// builtins answered as cursor properties (#2416 phase 3).
+///
+/// The generic route is exact exactly when every path-context builtin meets
+/// the document node it stands on. The stages are folded left to right with
+/// two facts about the value entering the next stage -- is it a live node,
+/// and may it be an *absent* one -- and a path-context stage is admitted
+/// only when the value is a present node and the stage is built from
+/// constructs that thread the cursor natively
+/// ([`path_context_stage_native`]). Three things end the exact regime:
+///
+/// * a stage that is neither navigational nor node-preserving --
+///   construction, `tostring`, `to_entries`, arithmetic, a `key`/`path`
+///   emitted earlier -- hands the next builtin a detached value. Real yq
+///   keeps a node's key through some of those (`.a | tostring | key` is
+///   `"a"`) and navigation *inside* a constructed container has keys
+///   (`[1,2] | .[0] | key` is `0`): the owned-domain path tracking only the
+///   eager evaluator has;
+/// * a navigational head that can reach an *absent* node (`.a.b` on
+///   `{"a":{}}`) followed by a computed stage: an absent node has no cursor,
+///   and only the walk and the eager evaluator carry its path;
+/// * a construct that bridges to the eager evaluator mid-expression, which
+///   would hand it a document re-rooted at the stage's input.
+///
+/// `select(key == "a") | parent` stays generic: `select` emits its input
+/// node unchanged, so `parent` still stands on a live cursor.
+fn path_context_needs_eager(exprs: &[Expr]) -> bool {
+    if !exprs.iter().any(needs_path_context) {
+        return false;
+    }
+    let mut is_node = true;
+    let mut can_absent = false;
+    for stage in exprs {
+        if needs_path_context(stage) {
+            if !is_node || can_absent || !path_context_stage_native(stage) {
+                return true;
+            }
+            is_node = path_context_stage_preserves_node(stage);
+        } else if path_context_is_navigational(stage) {
+            can_absent = step_can_yield_absent(stage, can_absent);
+        } else {
+            // A `select(true)`, `first(..)`, `.a?` or `try` without path
+            // context still hands on the node it was given -- absent or not
+            // -- while anything else detaches.
+            let preserves = path_context_stage_preserves_node(stage);
+            is_node = is_node && preserves;
+            if preserves {
+                can_absent = step_can_yield_absent(stage, can_absent);
+            }
+        }
+    }
+    false
+}
+
+/// Whether the value leaving a navigational stage can be an absent node,
+/// given whether the value entering it could. `Field`/`Index` can miss;
+/// `Iterate` only yields real children; `parent` lands on a real ancestor;
+/// `Identity` passes its input through.
+fn step_can_yield_absent(expr: &Expr, incoming: bool) -> bool {
+    match expr {
+        Expr::Field(_) | Expr::Index { .. } => true,
+        Expr::Iterate | Expr::Builtin(Builtin::Parent | Builtin::ParentN(_)) => false,
+        Expr::Identity | Expr::Builtin(Builtin::Select(_)) => incoming,
+        Expr::Paren(inner)
+        | Expr::Optional(inner)
+        | Expr::FirstExpr(inner)
+        | Expr::LastExpr(inner) => step_can_yield_absent(inner, incoming),
+        Expr::Limit { expr, .. } => step_can_yield_absent(expr, incoming),
+        Expr::Builtin(Builtin::FirstStream(inner) | Builtin::LastStream(inner)) => {
+            step_can_yield_absent(inner, incoming)
+        }
+        Expr::Try { expr, catch } => catch.is_some() || step_can_yield_absent(expr, incoming),
+        Expr::Pipe(exprs) => exprs
+            .iter()
+            .fold(incoming, |acc, e| step_can_yield_absent(e, acc)),
+        Expr::Comma(exprs) => exprs.iter().any(|e| step_can_yield_absent(e, incoming)),
+        _ => true,
+    }
+}
+
+/// [`step_can_yield_absent`] folded over a navigational head.
+#[cfg(test)]
+fn head_can_yield_absent(stages: &[Expr]) -> bool {
+    stages
+        .iter()
+        .fold(false, |acc, e| step_can_yield_absent(e, acc))
+}
+
+/// Whether a native path-context stage emits the node it was given (or a
+/// node it navigated to), so a later stage still stands on a live cursor:
+/// `select` passes its input through, `parent` lands on an ancestor, the
+/// bounded consumers forward what their body emits. `key`, `path`,
+/// `file_index`, construction, literals and comparisons emit computed
+/// values, and end the exact regime for anything after them.
+fn path_context_stage_preserves_node(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identity | Expr::Field(_) | Expr::Index { .. } | Expr::Iterate => true,
+        Expr::Builtin(Builtin::Select(_) | Builtin::Parent | Builtin::ParentN(_)) => true,
+        Expr::Paren(inner) | Expr::Optional(inner) => path_context_stage_preserves_node(inner),
+        Expr::FirstExpr(inner) | Expr::LastExpr(inner) => path_context_stage_preserves_node(inner),
+        Expr::Limit { expr, .. } => path_context_stage_preserves_node(expr),
+        Expr::Builtin(Builtin::FirstStream(inner) | Builtin::LastStream(inner)) => {
+            path_context_stage_preserves_node(inner)
+        }
+        Expr::Try { expr, catch } => {
+            path_context_stage_preserves_node(expr)
+                && catch
+                    .as_ref()
+                    .map_or(true, |c| path_context_stage_preserves_node(c))
+        }
+        Expr::Pipe(exprs) | Expr::Comma(exprs) => {
+            exprs.iter().all(path_context_stage_preserves_node)
+        }
+        _ => false,
+    }
+}
+
+/// A top-level pipe stage the generic *sink* evaluator handles natively with
+/// the cursor threaded through: the bounded consumers (`limit`/`first`/
+/// `last`/`nth`), which `eval_each_generic` drives lazily, around anything
+/// [`path_context_single_native`] admits.
+fn path_context_stage_native(expr: &Expr) -> bool {
+    match expr {
+        Expr::Limit { n, expr } => {
+            matches!(**n, Expr::Literal(_)) && path_context_stage_native(expr)
+        }
+        Expr::FirstExpr(inner) | Expr::LastExpr(inner) => path_context_stage_native(inner),
+        Expr::Builtin(Builtin::FirstStream(inner) | Builtin::LastStream(inner)) => {
+            path_context_stage_native(inner)
+        }
+        _ => path_context_single_native(expr),
+    }
+}
+
+/// An expression `eval_single` evaluates natively, cursor included, at every
+/// level -- the set is deliberately closed: a construct that bridges to the
+/// eager evaluator (`Object`, `If`, arithmetic, `And`/`Or`, `As`, ...)
+/// keeps the whole pipe on the eager route until it gets a native arm, at
+/// which point it is added here and the differential net says whether the
+/// answer held.
+fn path_context_single_native(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identity | Expr::Field(_) | Expr::Index { .. } | Expr::Iterate | Expr::Literal(_) => {
+            true
+        }
+        Expr::Paren(inner) | Expr::Array(inner) | Expr::Optional(inner) => {
+            path_context_single_native(inner)
+        }
+        Expr::Comma(exprs) => exprs.iter().all(path_context_single_native),
+        // A nested pipe is re-gated at its own entry, from its own input: it
+        // is native here only if it will not itself fall to the eager
+        // evaluator there, because that bridge would evaluate it against a
+        // document re-rooted at the nested input.
+        Expr::Pipe(exprs) => {
+            exprs.iter().all(path_context_single_native)
+                && (!exprs.iter().any(needs_path_context)
+                    || path_context_walk_split(exprs).is_some()
+                    || !path_context_needs_eager(exprs))
+        }
+        Expr::Compare { left, right, .. } => {
+            path_context_single_native(left) && path_context_single_native(right)
+        }
+        Expr::Try { expr, catch } => {
+            path_context_single_native(expr)
+                && catch
+                    .as_ref()
+                    .map_or(true, |c| path_context_single_native(c))
+        }
+        Expr::FirstExpr(inner) | Expr::LastExpr(inner) => path_context_single_native(inner),
+        Expr::Builtin(Builtin::Key | Builtin::Parent | Builtin::PathNoArg | Builtin::FileIndex) => {
+            true
+        }
+        Expr::Builtin(Builtin::ParentN(n)) => matches!(**n, Expr::Literal(_)),
+        Expr::Builtin(Builtin::Select(cond)) => path_context_single_native(cond),
+        _ => false,
+    }
+}
+
 /// The root position of a walk, once the document has passed the same
 /// validity gate the bridge's `to_owned_with_cursor` doubles as (#1755/#1953):
 /// dropping it would make these pipes start accepting documents they reject
@@ -10819,10 +11089,19 @@ fn path_context_root<V: DocumentValue>(root: V::Cursor) -> Result<PathContextPos
     if let Some(control) = push_generic_truthiness_cursor_error(&root, 0) {
         return Err(control);
     }
+    // The walk's input is not always the document root: a nested pipe
+    // (`first(.a | parent | parent)`) is walked from the node the outer
+    // stage handed it (#2416 phase 3). `path`/`parent` are absolute, so the
+    // position starts from the input's real path and ancestors, climbed
+    // from the cursor itself.
+    let (path, ancestors) = match cursor_path_and_ancestors(&root) {
+        Ok(found) => found,
+        Err(e) => return Err(Control::Error(e)),
+    };
     Ok(PathContextPos {
         node: PathNode::At(root),
-        path: Vec::new(),
-        ancestors: Vec::new(),
+        path,
+        ancestors: ancestors.into_iter().map(PathNode::At).collect(),
     })
 }
 
@@ -12155,6 +12434,47 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         // `ToStream` (code review, #2231: an earlier revision of this
         // comment named only those five, which undersells how many
         // builtins actually funnel through here).
+        // #2416 phase 3: path-context builtins as cursor properties -- see
+        // `cursor_key`. A cursor-backed value answers from the tree; at or
+        // above the document root there is nothing to answer (#2421). A
+        // value with no cursor still goes to the eager evaluator below,
+        // which is the one place owned-domain path tracking lives
+        // (`[1,2] | .[0] | key` is `0` in real yq).
+        Builtin::Key if cursor.is_some() => match cursor_key(&cursor.expect("guarded")) {
+            Ok(Some(key)) => GenericResult::Owned(key),
+            Ok(None) => GenericResult::None,
+            Err(e) => GenericResult::Error(e),
+        },
+        Builtin::PathNoArg if cursor.is_some() => {
+            match cursor_path_and_ancestors(&cursor.expect("guarded")) {
+                Ok((path, _)) => GenericResult::Owned(OwnedValue::Array(path)),
+                Err(e) => GenericResult::Error(e),
+            }
+        }
+        Builtin::Parent if cursor.is_some() => cursor
+            .expect("guarded")
+            .document_parent()
+            .map_or(GenericResult::None, GenericResult::OneCursor),
+        // Only a literal `n` is answered here (`path_context_single_native`
+        // admits nothing else): a computed `n` is evaluated against the
+        // current value by the eager arm, which keeps that shape.
+        Builtin::ParentN(n_expr) if cursor.is_some() && matches!(**n_expr, Expr::Literal(_)) => {
+            let c = cursor.expect("guarded");
+            let Expr::Literal(lit) = &**n_expr else {
+                unreachable!("guarded")
+            };
+            let depth = cursor_path_and_ancestors(&c).map(|(path, _)| path.len());
+            match depth.and_then(|depth| classify_parent_n::<S>(&literal_to_owned(lit), depth)) {
+                Ok(n) => {
+                    cursor_ancestor(&c, n).map_or(GenericResult::None, GenericResult::OneCursor)
+                }
+                Err(e) => GenericResult::Error(e),
+            }
+        }
+        // The generic route carries no file-origin table (#2150, #2427), so
+        // this is the same `0` the eager arm answers with an empty one.
+        Builtin::FileIndex if cursor.is_some() => GenericResult::Owned(OwnedValue::Int(0)),
+
         _ => {
             // #2231: `owned_or_suppress!`, not `owned_or_err!` -- this
             // bridging materialization ran unconditionally regardless of
@@ -20875,6 +21195,131 @@ mod tests {
         assert!(
             !streams(".a | .b"),
             "no path context: the ordinary M2 arms decide"
+        );
+    }
+    /// #2416 phase 3: which path-context pipes the eager evaluator still
+    /// owns. The generic route is exact only when the value reaching a
+    /// path-context builtin is the node it stands on, so each of the three
+    /// static reasons to stay eager is pinned, plus the shapes that now run
+    /// generically.
+    #[test]
+    fn path_context_needs_eager_pins_the_three_reasons_2416() {
+        let eager = |f: &str| {
+            let Expr::Pipe(stages) = parse(f).unwrap() else {
+                panic!("not a pipe: {f}")
+            };
+            path_context_needs_eager(&stages)
+        };
+        // No path context at all: never the eager evaluator's business.
+        assert!(!eager(".a | tostring"));
+        // Generic: a navigational head that cannot miss, then a native stage.
+        assert!(!eager(".[] | select(key == \"a\")"));
+        assert!(!eager(".a[] | select(key != \"c\") | parent"));
+        assert!(!eager(".[] | [key, path]"));
+        assert!(!eager(".[] | select(key == \"b\") | parent(1)"));
+        assert!(!eager(".[] | first(.[] | key)"));
+        // Reason 1: an owned-domain stage before the builtin.
+        assert!(eager(".a | tostring | key"));
+        assert!(eager("to_entries | .[0] | key"));
+        assert!(eager("[.a] | .[0] | parent"));
+        // Reason 2: a head that can reach an absent node, then a computed stage.
+        assert!(eager(".a.b | select(key == \"b\")"));
+        assert!(eager(".a | select(true) | key"));
+        assert!(
+            !eager(".a[] | select(true) | key"),
+            "iterate cannot yield absent"
+        );
+        // An emitted `key`/`path` is a computed value: a later builtin no
+        // longer stands on a node.
+        assert!(eager(".[] | key | key"));
+        assert!(eager(".[] | (key) | length | path"));
+        // ...but `select`/`parent` keep the node, so a later builtin is fine.
+        assert!(!eager(".[] | select(key == \"a\") | parent | key"));
+        assert!(!eager(".a[] | select(key != \"c\") | parent"));
+        // A stage built from something that bridges mid-expression. (Bare
+        // `{k: key}` never reaches the gate at all: `needs_path_context` does
+        // not descend into `Expr::Object`, #1332, so that pipe is not seen as
+        // a path-context pipe in the first place.)
+        assert!(eager(".[] | (key | {k: .})"));
+        assert!(eager(".[] | if key == \"a\" then . else empty end"));
+        assert!(eager(".[] | select(key == \"a\" and true)"));
+        assert!(eager(".[] | parent(1 + 0)"));
+        // A nested pipe that would itself fall to the eager evaluator from a
+        // re-rooted input keeps the outer pipe eager too.
+        assert!(eager(".x | first(.a | tostring | key)"));
+        assert!(
+            eager(".x | first(.a | parent | parent)"),
+            "`.x` can be absent"
+        );
+        assert!(!eager(".x[] | first(.a | parent | parent)"));
+        // Node-preserving stages carry the absent possibility along.
+        assert!(eager(".a[5]? | key"));
+        assert!(eager(".a | select(true) | key"));
+        assert!(!eager(".a[] | select(true) | key"));
+    }
+
+    /// The absent-reachability fold behind reason 2.
+    #[test]
+    fn head_can_yield_absent_tracks_the_last_navigation_2416() {
+        let can = |f: &str| {
+            let stages = match parse(f).unwrap() {
+                Expr::Pipe(stages) => stages,
+                other => vec![other],
+            };
+            head_can_yield_absent(&stages)
+        };
+        assert!(can(".a"));
+        assert!(can(".a | ."));
+        assert!(can(".[0]"));
+        assert!(!can(".[]"));
+        assert!(!can(".a[]"));
+        assert!(!can(".a | parent"));
+        assert!(can("(.a, .[])"), "either branch");
+        assert!(can(".[] | .a"));
+        assert!(!can("."), "the pipe's input is a real node");
+    }
+
+    /// `key`/`parent`/`path` as cursor properties, straight from the tree,
+    /// including the document-root edge (#2421) and array indices.
+    #[test]
+    fn cursor_properties_answer_from_the_tree_2416() {
+        let json = br#"{"a":{"b":[10,20]},"c":1}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let at = |f: &str| {
+            let expr = parse(f).unwrap();
+            match eval_with_cursor(&expr, root) {
+                GenericResult::OneCursor(c) => c,
+                other => panic!("`{f}` is not one cursor: {other:?}"),
+            }
+        };
+        assert_eq!(cursor_key(&root).unwrap(), None, "root has no key");
+        assert!(root.document_parent().is_none());
+        assert_eq!(
+            cursor_key(&at(".a")).unwrap(),
+            Some(OwnedValue::String("a".into()))
+        );
+        assert_eq!(
+            cursor_key(&at(".a.b[1]")).unwrap(),
+            Some(OwnedValue::Int(1))
+        );
+        let (path, ancestors) = cursor_path_and_ancestors(&at(".a.b[1]")).unwrap();
+        assert_eq!(
+            path,
+            vec![
+                OwnedValue::String("a".into()),
+                OwnedValue::String("b".into()),
+                OwnedValue::Int(1)
+            ]
+        );
+        assert_eq!(ancestors.len(), 3);
+        assert!(ancestors[0].same_node(&root));
+        assert!(ancestors[1].same_node(&at(".a")));
+        assert!(ancestors[2].same_node(&at(".a.b")));
+        assert!(cursor_ancestor(&at(".a.b[1]"), 3).unwrap().same_node(&root));
+        assert!(
+            cursor_ancestor(&at(".a.b[1]"), 4).is_none(),
+            "above the root"
         );
     }
 }

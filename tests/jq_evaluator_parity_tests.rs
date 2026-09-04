@@ -1121,8 +1121,6 @@ fn test_path_context_builtins_survive_pipe_parity_554() {
         // Bare, first-stage usage was already correct -- locked in here
         // too so a future change can't silently regress it.
         (br#"{"a":1}"#, "path", "[]"),
-        (br#"{"a":1}"#, "parent", "{}"),
-        (br#"{"a":1}"#, "key", "null"),
     ] {
         assert_parity(json, filter);
         let generic = generic_outputs(json, filter);
@@ -1398,6 +1396,24 @@ fn test_parity_key_at_root_diverges_2421() {
         "eval_generic.rs moved for `. | key` at the root: {generic:?}"
     );
     assert_ne!(full, generic);
+
+    // Phase 3 made `parent` a cursor property too, so the bare form at the
+    // root diverges the same way: the eager evaluator's `{}` against the
+    // reference's nothing.
+    let full = full_outputs(br#"{"a":1}"#, "parent");
+    let generic = generic_outputs(br#"{"a":1}"#, "parent");
+    assert_eq!(full, vec!["{}".to_string()], "eval.rs moved: {full:?}");
+    assert!(
+        generic.is_empty(),
+        "eval_generic.rs moved for bare `parent` at the root: {generic:?}"
+    );
+    let full = full_outputs(br#"{"a":1}"#, "key");
+    let generic = generic_outputs(br#"{"a":1}"#, "key");
+    assert_eq!(full, vec!["null".to_string()], "eval.rs moved: {full:?}");
+    assert!(
+        generic.is_empty(),
+        "eval_generic.rs moved for bare `key` at the root: {generic:?}"
+    );
 }
 
 /// #1519: a `?//`-alternatives bind under a short-circuiting consumer re-runs

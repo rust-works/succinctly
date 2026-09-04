@@ -49,7 +49,6 @@ yq/file_index/*       file_index      file_index is always 0 across multiple inp
 # `parent`/`key` at the document root: real yq emits nothing (exit 0),
 # succinctly prints `{}` and `null`. These are the positions the #2061 walk
 # refuses as Unsupported today; phase 2 flips them.
-yq/parent/*/root      root_edge       parent at the root prints {} where real yq emits nothing — #2421
 
 # Recursive descent drops path context wholesale: every node reached through
 # `..` reports `path == []`, `key == null`, `parent == {}`. `..` is not in
