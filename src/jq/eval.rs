@@ -39127,6 +39127,19 @@ fn delete_path_steps(
                         }
                         Ok(())
                     }
+                    // #2347: the mid-chain sibling of `delete_at_path`'s own
+                    // terminal `Expr::Iterate` arm's identical fix -- a
+                    // `null` reached by *tolerating* a step (`real_slot`
+                    // false, so the vivify check above didn't fire) is
+                    // exempt from the rest of the chain in yq mode, `.[]`
+                    // followed by more path included. Confirmed live
+                    // against yq v4.53.3: `{"x":null} | del(.x.a[].b)` and
+                    // `{"y":1} | del(.x.a[].b)` are both no-ops. jq mode has
+                    // no such exemption (`{"x":null} | del(.x.a[].b)` still
+                    // raises "Cannot iterate over null" in real jq, #527),
+                    // so this stays gated on `yq_mode` rather than becoming
+                    // the unconditional `here`-only exemption below.
+                    OwnedValue::Null if yq_mode => Ok(()),
                     _ if here => Ok(()),
                     _ => Err(EvalError::cannot_iterate_with(
                         if yq_mode { EvalTag::Yq } else { EvalTag::Jq },

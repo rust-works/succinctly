@@ -1975,12 +1975,15 @@ own mandatory review**, both confirmed live against yq v4.53.3:
 - **A dropped `?`.** The pre-pass detected a trailing `.[]` shaped as either bare or
   `?`-suppressed for matching purposes, but always reconstructed a bare `Expr::Iterate` and
   hardcoded `delete_at_path`'s own `optional` parameter to `false`, discarding which one it
-  actually was. For a *genuinely missing* key (as opposed to a real key holding `null`),
-  the delete walk routes through `delete_at_path_through_absent`, which raises on a trailing
-  `.[]` unless that `.[]`'s own `?` suppresses it -- so a real yq no-op turned into a wrongly
-  raised error: `{"x":1} | del(.missing[]?, .x)` is `{}` in real yq. Fixed by threading the
-  trailing `.[]`'s own optionality through (`trailing_bare_iterate_prefix` now returns it
-  alongside the prefix) instead of hardcoding it away.
+  actually was. At the time, a *genuinely missing* key (as opposed to a real key holding
+  `null`) routed the delete walk through `delete_at_path_through_absent`, which then raised
+  on a trailing `.[]` unless that `.[]`'s own `?` suppressed it -- so a real yq no-op turned
+  into a wrongly raised error: `{"x":1} | del(.missing[]?, .x)` is `{}` in real yq. Fixed by
+  threading the trailing `.[]`'s own optionality through (`trailing_bare_iterate_prefix` now
+  returns it alongside the prefix) instead of hardcoding it away. (#2347, below, later made
+  the `?` on a missing-key's trailing `.[]` unnecessary in the first place -- a bare
+  `del(.missing[], .x)` no-ops too now -- but threading it through here remained correct and
+  is unchanged.)
 
 ### `del()` auto-vivifies a `null` into `[]` ahead of an `Index`/`Iterate` step, matching `setpath`
 
@@ -2034,11 +2037,12 @@ document root or any real navigation (a found object key, an in-range or #2314-p
 array element), flipped to `false` by a `Field`/`Slice` step's own null-tolerant arm, and
 never flipped back except by this fix's own vivify. `delete_at_path_through_absent`'s own
 synthetic scratch value is a related but separate case: its whole contract is "the
-container is untouched" (a missing field never materializes), so it now hardcodes both
-`yq_mode` and `real_slot` to `false` for its own recursive walk, matching
-`delete_trie_through_absent`'s already-established pattern -- confirmed live,
+container is untouched" (a missing field never materializes), so `real_slot` is hardcoded
+`false` for its own recursive walk -- this alone blocks every vivify site regardless of
+`yq_mode` (each is gated `yq_mode && real_slot && ...`), confirmed live,
 `{} | del(.missing[-1])` stays `{}`, not the out-of-range error a wrongly-vivified scratch
-would raise.
+would raise. (`yq_mode` itself is *not* hardcoded alongside it -- see #2347, below, which
+found and fixed a real bug in an earlier version of this function that did hardcode both.)
 
 **Also extended to `del()`'s comma-grouped form**, with one additional gate.
 `delete_trie_array`'s own null-skip branch shares the same vivify rule
@@ -2075,6 +2079,59 @@ order-dependence of its own.
 This fix does not reach the comma-grouped **`.[]` fan-out** gap #2324 tracks separately —
 that one fails earlier, in the read-based validation that builds the trie in the first
 place, before `delete_trie_array` is ever called.
+
+### `del()`'s trailing `.[]` no-ops through a *tolerated* (not just a genuinely found) `null`
+
+[#2347](https://github.com/rust-works/succinctly/issues/2347), found during #2324's own
+implementation. The vivify rule two sections above only covers a `null` that is itself the
+navigated value (found, or #2314-padded) -- a `null` reached instead by *tolerating* a step
+against it (a missing object field, or an already-`null` slot navigated further, #476/#527)
+is a different provenance (`real_slot: false`) that real yq treats differently again: not
+vivify, but a silent no-op for the whole rest of the chain, `.[]` included:
+
+```bash
+$ echo '{"y":1}' | yq -o=json 'del(.x.a[])'      # {"y": 1} -- tolerated null, .[] terminal
+$ echo '{"y":1}' | yq -o=json 'del(.x.a.b[])'    # {"y": 1} -- three levels of tolerance
+$ echo '{"y":1}' | yq -o=json 'del(.x.a[].b)'    # {"y": 1} -- .[] mid-chain, not terminal
+```
+
+Before this fix, `delete_at_path`'s `Expr::Iterate` arm (terminal `.[]`) and
+`delete_path_steps`'s own mid-chain `Expr::Iterate` arm (`.[]` followed by more path) both
+had no fallback for this case, falling through to the same generic "cannot iterate over
+null" error jq mode correctly raises there (jq has no such exemption at all, `#527`
+remains a real, unaffected jq/yq divergence). Fixed by adding a `yq_mode`-gated
+`OwnedValue::Null => Ok(())` arm to each, deliberately *not* unconditional the way the
+sibling `Index` arm's own `Null` fallback already is.
+
+A second, deeper bug surfaced during this fix's own verification:
+`delete_at_path_through_absent` (walked once a `Field` step has tolerated a *genuinely
+missing* object key, as opposed to a found key holding `null`) had hardcoded `yq_mode =
+false` unconditionally, in addition to the still-correctly-hardcoded `real_slot = false`
+covered above -- silently downgrading every yq-mode call through it to jq's stricter rule
+the instant a tolerance chain started from a missing key rather than a found-but-`null`
+value. Fixed by threading the caller's own `yq_mode` through instead; safe because
+`real_slot` alone (unchanged) already blocks every vivify site regardless of `yq_mode`.
+This also retroactively closed a gap #2324's own review had explicitly flagged as
+known-but-out-of-scope at the time (`del(.missing[], .x)`, no `?` needed, now correctly
+gives `{}` rather than raising) -- see the "dropped `?`" bullet above, which predates this
+fix.
+
+**Residual gap, not yet fixed:** a comma-grouped sibling whose own trailing shape is `.[]`
+*followed by more path* (not a bare trailing `.[]`) still raises, because
+`vivify_del_comma_iterate_targets`'s `trailing_bare_iterate_prefix` only recognizes a
+prefix ending in a bare (optionally `?`-suppressed) `.[]` -- a sibling like
+`.missing[].x` falls through to the ordinary, read-based comma-branch resolution instead,
+which raises the same way #2324's own fan-out gap does:
+
+```bash
+$ echo '{"y":1}' | yq -o=json 'del(.missing[].x, .y)'   # {} in real yq
+$ echo '{"y":1}' | succinctly yq -o json 'del(.missing[].x, .y)'   # still raises
+```
+
+The non-comma single-target form (`del(.missing[].x)` alone) is fixed and does not have
+this gap -- only the comma-grouped combination of "suffix after the tolerated `.[]`" *and*
+"another sibling in the same call" is affected. Tracked as
+[#2380](https://github.com/rust-works/succinctly/issues/2380).
 
 ### Other categories
 

@@ -30258,3 +30258,59 @@ fn test_2347_delete_through_absent_never_vivifies() -> Result<()> {
     assert_eq!(out.trim(), "{}");
     Ok(())
 }
+
+/// #2347 review found the fix's first draft only covered `.[]` as the
+/// chain's *terminal* component (`delete_at_path`'s own `Expr::Iterate`
+/// arm) -- `delete_path_steps`'s separate mid-chain `Expr::Iterate` arm
+/// (`.[]` followed by more path) had no equivalent yq-mode null-tolerance
+/// case, and still raised. Both a found-null-turned-tolerated shape and a
+/// purely missing-field one are covered, confirmed live against yq v4.53.3.
+#[test]
+fn test_2347_del_tolerated_null_iterate_mid_chain_noops() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(.x.a[].b)", r#"{"x":null}"#, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"x":null}"#);
+
+    let (out, code) = run_yq_stdin("del(.x.a[].b)", r#"{"y":1}"#, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"y":1}"#);
+
+    let (out, code) = run_yq_stdin("del(.missing[].x)", r#"{"y":1}"#, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"y":1}"#);
+
+    Ok(())
+}
+
+/// jq mode's own mid-chain `.[]` (unlike yq's) has no null-tolerance
+/// exemption at all -- unaffected by the mid-chain fix above, confirmed
+/// live against jq 1.7.1.
+#[test]
+fn test_2347_jq_mode_mid_chain_iterate_unaffected() -> Result<()> {
+    let (_out, code) = run_jq_stdin("del(.x.a[].b)", r#"{"x":null}"#, &[])?;
+    assert_ne!(
+        code, 0,
+        "jq mode: mid-chain tolerated-null iterate should still error"
+    );
+    Ok(())
+}
+
+/// Residual gap, not fixed here (tracked as #2380): a comma-grouped
+/// sibling whose own trailing shape is `.[]` *followed by more path* (not
+/// a bare trailing `.[]`) still raises, because
+/// `vivify_del_comma_iterate_targets`'s `trailing_bare_iterate_prefix` only
+/// recognizes a prefix ending in a bare (optionally `?`-suppressed) `.[]`
+/// -- a sibling like `.missing[].x` falls through to the ordinary,
+/// read-based comma-branch resolution instead. The non-comma single-target
+/// form (`del(.missing[].x)` alone, covered by the mid-chain test above) is
+/// unaffected. Pinning the current (unfixed) behavior rather than leaving
+/// it untested.
+#[test]
+fn test_2347_del_comma_grouped_tolerated_null_iterate_suffix_residual_gap() -> Result<()> {
+    let (_out, code) = run_yq_stdin("del(.missing[].x, .y)", r#"{"y":1}"#, &["-o=json", "-I=0"])?;
+    assert_eq!(
+        code, 1,
+        "residual gap: comma-grouped .[]-then-more-path sibling still errors"
+    );
+    Ok(())
+}
