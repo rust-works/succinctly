@@ -3316,3 +3316,114 @@ mod key_display_string_tests {
         assert!(err.message.contains("Invalid JSON text"), "{err:?}");
     }
 }
+
+/// The receiver equivalence [`container_tail_gap_ok`] relies on when it
+/// delegates its `Some(last_child)` arm to [`child_tail_gap_ok`].
+///
+/// That delegation swaps which cursor the error is raised *from*: the
+/// container's, as the cursor-domain call sites originally wrote it, for the
+/// last child's. It is sound only because `JsonCursor::malformed_delimiter_error`
+/// reports `self.text` -- the whole document slice, identical for every
+/// cursor into it -- and because YAML reaches neither raise at all
+/// (`container_gap_ok`/`trailing_element_gap_ok` are `true`-returning
+/// defaults there).
+///
+/// That is an argument about JSON's error being document-scoped, not a
+/// property of the abstraction, so it is pinned here rather than left in a
+/// doc comment: a format whose `malformed_delimiter_error` named the node
+/// would make the delegation change which node is blamed, silently.
+#[cfg(test)]
+mod tail_gap_receiver_tests {
+    use super::{
+        child_tail_gap_ok, container_tail_gap_ok, DocumentCursor, DocumentFields, DocumentValue,
+    };
+    use crate::json::JsonIndex;
+
+    /// A trailing `,` after a real last field (`{"a":1,}`, #2243) raises the
+    /// same error whichever cursor reports it, so delegating the
+    /// `Some(last_child)` arm is invisible to a caller.
+    #[test]
+    fn container_and_child_receivers_agree_on_a_trailing_comma_1803() {
+        let json: &[u8] = br#"{"a":1,}"#;
+        let index = JsonIndex::build(json);
+        let container = index.root(json);
+        let fields = container.value().as_object().expect("an object");
+        // `DocumentFields::uncons`, not the inherent `JsonFields::uncons`:
+        // only the trait form yields a `DocumentField` with a public
+        // `value_cursor` -- the same distinction #1803's `lazy.rs`/`eval.rs`
+        // call sites turn on.
+        let (field, _) = DocumentFields::uncons(&fields).expect("one field");
+        let last_child = field.value_cursor;
+
+        let via_container = container_tail_gap_ok(&container, Some(&last_child), b'}')
+            .expect_err("a trailing comma must raise");
+        let via_child =
+            child_tail_gap_ok(Some(&last_child), b'}').expect_err("a trailing comma must raise");
+
+        assert_eq!(
+            via_container, via_child,
+            "the delegation in `container_tail_gap_ok` changes the raising cursor, so the two \
+             must produce an identical error"
+        );
+        assert_eq!(
+            via_container,
+            last_child.malformed_delimiter_error(),
+            "and both must be the raise the child's own cursor produces"
+        );
+        assert_eq!(
+            container.malformed_delimiter_error(),
+            last_child.malformed_delimiter_error(),
+            "the premise the delegation rests on: for JSON, `malformed_delimiter_error` reports \
+             the whole document, so the receiver cannot matter"
+        );
+    }
+
+    /// The zero-child arm (`{,}`, #2211) is the one
+    /// [`container_tail_gap_ok`] does *not* delegate -- only the container's
+    /// own cursor can find the opening brace -- so it must still raise, and
+    /// [`child_tail_gap_ok`] must still be blind to it. This is what makes
+    /// the two helpers genuinely different rather than one wrapping the
+    /// other.
+    #[test]
+    fn empty_container_arm_is_not_delegated_1803() {
+        let json: &[u8] = br#"{,}"#;
+        let index = JsonIndex::build(json);
+        let container = index.root(json);
+
+        container_tail_gap_ok(&container, None, b'}')
+            .expect_err("a stray comma with no real field must raise (#2211)");
+        child_tail_gap_ok(
+            None::<&crate::json::light::JsonCursor<'_, alloc::vec::Vec<u64>>>,
+            b'}',
+        )
+        .expect("the value domain has no container cursor, so it cannot see `{,}`");
+    }
+
+    /// A well-formed object raises from neither -- the false-positive guard
+    /// for both helpers.
+    #[test]
+    fn wellformed_object_raises_from_neither_1803() {
+        let json: &[u8] = br#"{"a":1}"#;
+        let index = JsonIndex::build(json);
+        let container = index.root(json);
+        let fields = container.value().as_object().expect("an object");
+        // `DocumentFields::uncons`, not the inherent `JsonFields::uncons`:
+        // only the trait form yields a `DocumentField` with a public
+        // `value_cursor` -- the same distinction #1803's `lazy.rs`/`eval.rs`
+        // call sites turn on.
+        let (field, _) = DocumentFields::uncons(&fields).expect("one field");
+        let last_child = field.value_cursor;
+
+        container_tail_gap_ok(&container, Some(&last_child), b'}').expect("well-formed");
+        child_tail_gap_ok(Some(&last_child), b'}').expect("well-formed");
+
+        // A genuinely empty `{}` -- its own document, not `container` with
+        // `None` passed for a field it actually has. That combination would
+        // (correctly) raise: `container_gap_ok` would find `"a"` in the gap
+        // after the brace, which is what it is for.
+        let empty: &[u8] = br#"{}"#;
+        let empty_index = JsonIndex::build(empty);
+        let empty_root = empty_index.root(empty);
+        container_tail_gap_ok(&empty_root, None, b'}').expect("an empty `{}` is well-formed");
+    }
+}
