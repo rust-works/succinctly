@@ -8698,6 +8698,11 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         let out = if any_owned {
             owned
         } else {
+            // STYLE-0012: prefix-preserving by design, per the #2326 review
+            // comment just above -- the error rides out on a `Partial` whose
+            // prefix must survive, so the `eval_try`/`Expr::Optional` boundary
+            // suppresses it, not this site. Same reasoning as the
+            // `escape_generic!` and `pending_halt` arms this one mirrors.
             match to_owned_all_cursors_checked(&cursors) {
                 Ok(vs) => vs,
                 Err((prefix, e)) => {
