@@ -36985,3 +36985,254 @@ fn test_map_path_context_scalar_target_still_raises_in_jq_mode_2375() -> Result<
     }
     Ok(())
 }
+/// #2388: a fold's SOURCE is re-run once per INIT fork, and **only the first
+/// fork sees the fold's own input** -- every later fork sees `null`, because
+/// jq's `DUPN` hands a stack slot that is still retained for backtracking
+/// back as `jv_null()`. Confirmed live against jq 1.7.1 on `{"a":1,"c":2}`:
+///
+/// ```console
+/// $ jq -c '[foreach (.) as $k ((0,1,2); [$k,.])]'
+/// [[{"a":1,"c":2},0],[null,1],[null,2]]
+/// ```
+///
+/// In `path()` context that makes a *navigating* SOURCE raise on the second
+/// fork where it resolved cleanly on the first: `null` is not the value jq's
+/// path register holds, so its per-navigation `jv_identical` check fails.
+/// Before this fix succinctly re-ran SOURCE against the document on every
+/// fork and **fabricated** a second (third, ...) copy of the first fork's
+/// path instead:
+///
+/// ```console
+/// $ echo '{"a":1,"c":2}' | jq -c 'path(foreach (.a) as $k ((0,1); $k))'
+/// jq: error (at <stdin>:1): Invalid path expression near attempt to access element "a" of null
+/// ["a"]                                     # exit 5
+/// $ echo '{"a":1,"c":2}' | succinctly jq -c 'path(foreach (.a) as $k ((0,1); $k))'
+/// ["a"]
+/// ["a"]                                     # exit 0  <- fabricated
+/// ```
+///
+/// #2031's `FoldRegister::branch_provenance` restriction already rejected a
+/// *navigating* second fork (`(0,.c)`); this is the non-navigating one it
+/// could not see, since the register never moved.
+///
+/// The partial-output shape is pinned too, and it differs between the two
+/// constructs: `foreach` streams the first fork's outputs *before* raising,
+/// `reduce` emits nothing (its own final-emission check raises on the first
+/// fork already, before the second is ever entered).
+#[test]
+fn test_foreach_init_fork_source_sees_null_ambient_2388() -> Result<()> {
+    const DOC: &str = r#"{"a":1,"c":2}"#;
+    // (filter, stdout jq streams before raising) -- every row captured from
+    // /usr/bin/jq 1.7.1 on DOC, all exit 5 with
+    // `Invalid path expression near attempt to access element "a" of null`.
+    let cases: &[(&str, &str)] = &[
+        // Two forks, neither navigating -- the headline repro.
+        ("path(foreach (.a) as $k ((0,1); $k))", "[\"a\"]\n"),
+        // Identical INIT values: it is the *fork count*, not the values.
+        ("path(foreach (.a) as $k ((0,0); $k))", "[\"a\"]\n"),
+        // Three forks still raise exactly once, on the second.
+        ("path(foreach (.a) as $k ((0,1,2); $k))", "[\"a\"]\n"),
+        // A `null` first fork is no different -- the register holds the
+        // *document*, not INIT's own value.
+        ("path(foreach (.a) as $k ((null,1); $k))", "[\"a\"]\n"),
+        // A navigating second fork raises for the same reason (#2031 already
+        // rejected this one, but its operand wording was wrong -- see below).
+        ("path(foreach (.a) as $k ((0,.c); $k))", "[\"a\"]\n"),
+        // A multi-element SOURCE streams the whole first fork first.
+        (
+            "path(foreach (.a,.c) as $k ((0,1); $k))",
+            "[\"a\"]\n[\"c\"]\n",
+        ),
+        (
+            "path(foreach (.a,.c) as $k ((0,1,2); $k))",
+            "[\"a\"]\n[\"c\"]\n",
+        ),
+        // Collected into an array, jq emits nothing at all: the array
+        // constructor never completes.
+        ("[path(foreach (.a) as $k ((0,1); $k))]", ""),
+        ("[path(foreach (.a) as $k ((0,0); $k))]", ""),
+        ("[path(foreach (.a) as $k ((0,1,2); $k))]", ""),
+        ("[path(foreach (.a) as $k ((null,1); $k))]", ""),
+        ("[path(foreach (.a) as $k ((0,.c); $k))]", ""),
+        ("[path(foreach (.a,.c) as $k ((0,1); $k))]", ""),
+    ];
+    for (filter, want_stdout) in cases {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, DOC, &["-c"])?;
+        assert_eq!(code, 5, "`{filter}` should exit 5; stderr: {stderr:?}");
+        assert_eq!(
+            stdout, *want_stdout,
+            "`{filter}` streamed the wrong prefix before raising"
+        );
+        assert!(
+            stderr
+                .contains(r#"Invalid path expression near attempt to access element "a" of null"#),
+            "`{filter}`: wanted jq's `... of null` operand, got {stderr:?}"
+        );
+    }
+
+    // `reduce` never reaches the second fork: its own exit-boundary re-check
+    // raises on the first one. Captured from jq 1.7.1, same DOC.
+    let reduce_cases: &[(&str, &str)] = &[
+        ("path(reduce (.a) as $k ((0,1); $k))", "with result 1"),
+        ("path(reduce (.a) as $k ((0,1,2); $k))", "with result 1"),
+        ("path(reduce (.a) as $k ((0,.c); $k))", "with result 1"),
+        ("path(reduce (.a,.c) as $k ((0,1); $k))", "with result 2"),
+        ("[path(reduce (.a) as $k ((0,1); $k))]", "with result 1"),
+    ];
+    for (filter, want_err) in reduce_cases {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, DOC, &["-c"])?;
+        assert_eq!(code, 5, "`{filter}` should exit 5; stderr: {stderr:?}");
+        assert_eq!(
+            stdout, "",
+            "`{filter}`: reduce emits nothing before raising"
+        );
+        assert!(
+            stderr.contains(want_err),
+            "`{filter}`: wanted `{want_err}`, got {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #2388, the secondary half: the error's *operand*. jq names the ambient
+/// input the failed navigation was attempted on, and on a later INIT fork
+/// that input is `null`, not the document. Succinctly used to name the
+/// document, because it re-ran SOURCE against it:
+///
+/// ```console
+/// $ echo '{"a":1,"c":2}' | jq -c 'path(foreach (.a) as $k ((0,.c); $k))'
+/// jq: error (at <stdin>:1): Invalid path expression near attempt to access element "a" of null
+/// # succinctly, before #2388: `... element "a" of {"a":1,"c":2}`
+/// ```
+///
+/// Pinned separately from the case list above because it is the one row whose
+/// *exit code and stdout were already right* -- only the wording moved, so a
+/// test that checked exit codes alone would not have caught it.
+#[test]
+fn test_foreach_init_fork_error_operand_is_null_2388() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_stdin_streams(
+        "path(foreach (.a) as $k ((0,.c); $k))",
+        r#"{"a":1,"c":2}"#,
+        &["-c"],
+    )?;
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n");
+    assert!(
+        stderr.contains(r#"element "a" of null"#),
+        "wanted jq's `of null` operand: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains(r#"of {"a":1,"c":2}"#),
+        "the document must not be named as the operand: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #2388 controls: the rows the null-ambient change must **not** move.
+///
+/// All captured from /usr/bin/jq 1.7.1 on `{"a":1,"c":2}`. A single-fork INIT
+/// never re-runs SOURCE at all, so it keeps resolving against the document; a
+/// *first* fork that navigates raises with the **document** as the operand
+/// (the register moved off root, and the ambient is still the document) and
+/// streams nothing at all, which is the row that proves the change is keyed
+/// on the fork index rather than on "INIT navigated somewhere".
+#[test]
+fn test_fold_init_fork_unchanged_rows_2388() -> Result<()> {
+    const DOC: &str = r#"{"a":1,"c":2}"#;
+
+    // Single-fork INIT: SOURCE still sees the document, path resolves.
+    let ok_cases: &[(&str, &str)] = &[
+        ("path(foreach (.a) as $k (0; $k))", "[\"a\"]\n"),
+        ("path(foreach (.a) as $k (null; $k))", "[\"a\"]\n"),
+        ("path(foreach (.a,.c) as $k (0; $k))", "[\"a\"]\n[\"c\"]\n"),
+        ("[path(foreach (.a) as $k (0; $k))]", "[[\"a\"]]\n"),
+        (
+            "[path(foreach (.a,.c) as $k (null; $k))]",
+            "[[\"a\"],[\"c\"]]\n",
+        ),
+    ];
+    for (filter, want) in ok_cases {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, DOC, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}` should succeed; stderr: {stderr:?}");
+        assert_eq!(stdout, *want, "`{filter}`");
+    }
+
+    // A navigating *first* fork: operand is the document, and nothing streams
+    // -- the raise happens before the first fork emits anything.
+    let doc_operand: &[&str] = &[
+        "path(foreach (.a) as $k ((.c,0); $k))",
+        "path(reduce (.a) as $k ((.c,0); $k))",
+        "[path(foreach (.a,.c) as $k ((.c,0); $k))]",
+    ];
+    for filter in doc_operand {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, DOC, &["-c"])?;
+        assert_eq!(code, 5, "`{filter}` should exit 5; stderr: {stderr:?}");
+        assert_eq!(stdout, "", "`{filter}` must stream nothing");
+        assert!(
+            stderr.contains(r#"element "a" of {"a":1,"c":2}"#),
+            "`{filter}`: wanted the document as the operand, got {stderr:?}"
+        );
+    }
+
+    // A non-navigating SOURCE never routes through the path resolver at all,
+    // so the fork's ambient only shows up in the raised *value*: jq says
+    // `with result 2` (the first fork's own `length` of the document).
+    let (stdout, stderr, code) =
+        run_jq_stdin_streams("path(foreach (length) as $k ((0,1); $k))", DOC, &["-c"])?;
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("Invalid path expression with result 2"),
+        "{stderr:?}"
+    );
+    Ok(())
+}
+
+/// #2388: a `null` ambient is not automatically *untrackable* -- jq's
+/// register comparison is kind-based for `null`/`bool`
+/// (`register_identical`), so a later fork resolves cleanly whenever the
+/// register itself holds a `null`. Both directions captured live from
+/// /usr/bin/jq 1.7.1:
+///
+/// ```console
+/// $ echo 'null'       | jq -c 'path(foreach (.a) as $k ((0,1);  $k))'   # ["a"] ["a"], exit 0
+/// $ echo '{"c":null}' | jq -c 'path(foreach (.a) as $k ((0,.c); $k))'   # ["a"] ["c","a"], exit 0
+/// $ echo '{"a":null}' | jq -c 'path(foreach (.a) as $k ((0,1);  $k))'   # ["a"] then raises
+/// ```
+///
+/// The middle row is the one that needs the register's own path rebased onto
+/// SOURCE's result: that fork's INIT navigated to `["c"]`, so SOURCE's own
+/// `["a"]` is relative to it. Without the rebase it would answer `["a"]`
+/// twice -- the same fabrication class, one level down. The third row is the
+/// near-miss control: a `null` *somewhere in* the document is not the same as
+/// a `null` at the register.
+#[test]
+fn test_foreach_init_fork_null_register_still_tracks_2388() -> Result<()> {
+    // Register is the document root, and the document is `null`.
+    let (stdout, stderr, code) =
+        run_jq_stdin_streams("path(foreach (.a) as $k ((0,1); $k))", "null", &["-c"])?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n[\"a\"]\n");
+
+    // Register moved to `["c"]` by INIT, and `.c` is `null`: the second
+    // fork's own path is rebased onto it.
+    let (stdout, stderr, code) = run_jq_stdin_streams(
+        "path(foreach (.a) as $k ((0,.c); $k))",
+        r#"{"c":null}"#,
+        &["-c"],
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n[\"c\",\"a\"]\n");
+
+    // Control: a `null` elsewhere in the document does not make the ambient
+    // `null` match the register.
+    let (stdout, stderr, code) = run_jq_stdin_streams(
+        "path(foreach (.a) as $k ((0,1); $k))",
+        r#"{"a":null}"#,
+        &["-c"],
+    )?;
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n");
+    assert!(stderr.contains(r#"element "a" of null"#), "{stderr:?}");
+    Ok(())
+}
