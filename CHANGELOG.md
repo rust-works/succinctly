@@ -311,13 +311,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mechanism #2333 above already established), and genuinely can't tell a wrong-kind
   key apart from an object-field key once the target is a sequence.
 
-  **Known residual gap, not fixed here**: a *comma-grouped* `del(.[5], .a)` still
-  raises instead of no-oping `.[5]` and deleting only `.a`, because a `Comma` routes
-  through a different code path (`resolve_node`'s shared leaf resolver, which
-  evaluates via the ordinary value evaluator rather than any of the four functions
-  above) that was found, during this issue's own investigation, to already raise for a
-  **plain read** of `.[5]` against a bare object — a materially larger, read-level
-  divergence rather than a `del()`-specific one. Follow-up filed as #2362.
+  **Known residual gaps, not fixed here** (both tracked as #2362): only the bare
+  integer-literal shorthand (`del(.[5])`, parsed directly as `Expr::Index`) reaches the
+  four fixed sites above.
+  - A *comma-grouped* `del(.[5], .a)` still raises instead of no-oping `.[5]` and
+    deleting only `.a`, because a `Comma` routes through a different code path
+    (`resolve_node`'s shared leaf resolver, which evaluates via the ordinary value
+    evaluator rather than any of the four functions above) that was found, during this
+    issue's own investigation, to already raise for a **plain read** of `.[5]` against a
+    bare object — a materially larger, read-level divergence rather than a
+    `del()`-specific one.
+  - A *computed* index (`del(.[5+0])`, `5 as $i | del(.[$i])`) — or a literal
+    `null`/`true`/`false` key, since only a bare integer literal gets the `Expr::Index`
+    shorthand — is `Expr::IndexExpr`, resolved through `resolve_index_expr`/
+    `key_to_path_component`: generic path-resolution machinery shared by every
+    path-consuming builtin (`path()`, every assignment operator, and `del()` alike, all
+    funneled through the same `resolve_node` dispatcher), found during this PR's own
+    review to still raise the same way. That machinery already has a yq-mode no-op
+    placeholder mechanism (`scalar_noop`, #1181's own precedent) but it's unconditional
+    once triggered, and the correct behavior differs by operation — `del()` should
+    no-op, but assignment should stringify the key and write a new field instead (a
+    separate, pre-existing divergence, unaffected either way) — so extending it here
+    without a way to tell del() apart from assignment would fix one and regress the
+    other.
 
 - **`delpaths([[]])` printed the literal `null` instead of emitting nothing in yq mode**
   (#2352, found while implementing #2306). `del(.)` already special-cases "deleted the
