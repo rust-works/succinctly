@@ -32644,37 +32644,192 @@ fn eval_expr_needing_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>
     }
 }
 
+/// One escape classified out of an [`eval_expr_needing_path_context`]
+/// result, tagged with *how* it arrived -- the only thing
+/// [`BareEscapeRoute`]'s three routes disagree about.
+///
+/// A `Trailing` escape is folded into the call site's own escape slot by
+/// every route (#400/#494: a genuine escape still owes whatever output
+/// preceded it). Only a `Bare` one is routed.
+enum PathContextEscape {
+    /// `QueryResult::Error`/`Break`/`Halt`: the sub-expression escaped
+    /// without producing any output of its own.
+    Bare(Control),
+    /// `QueryResult::Partial(vs, control)`'s trailing control: the escape
+    /// arrived behind a prefix the call site still owes.
+    Trailing(Control),
+}
+
+impl PathContextEscape {
+    /// Drop the bare/trailing tag and keep the control.
+    ///
+    /// This *is* [`BareEscapeRoute::FoldIntoEscape`]'s whole row of the
+    /// table below -- a bare escape treated exactly like a trailing one --
+    /// so it is the single definition both that route and
+    /// [`drain_path_context_stream`] use.
+    fn into_control(self) -> Control {
+        match self {
+            Self::Bare(control) | Self::Trailing(control) => control,
+        }
+    }
+}
+
+/// Where a call site sends a **bare** (non-`Partial`) escape that
+/// [`classify_path_context_stream`] pulled out of an
+/// [`eval_expr_needing_path_context`] result.
+///
+/// #2216 exists because this table lived only in three hand-copied `match`
+/// blocks, and #2416 deletes the arms holding them one at a time. Naming
+/// the routes here is what lets the migration reproduce them; #2100's own
+/// review already watched a live `halt_error` get swallowed by "porting"
+/// one of these blocks while quietly changing how bare and `Partial` halts
+/// fold together.
+///
+/// | bare variant | `FoldIntoEscape`  | `ForeachInput`        | `ForeachInit`         |
+/// |--------------|-------------------|-----------------------|-----------------------|
+/// | `Error(e)`   | into escape slot  | `suppress_or_raise`   | `finish_fork`         |
+/// | `Break(l)`   | into escape slot  | return `Break(l)`     | `finish_fork`         |
+/// | `Halt(c)`    | into escape slot  | return `Halt(c)`      | return `Halt(c)`      |
+///
+/// The rows differ on *`optional`-suppression*, which is why a uniform
+/// `let (vs, escape) = drain_path_context_stream(..)` at the `foreach`
+/// sites would be a silent semantic change rather than a cleanup: a
+/// control folded into the escape slot reaches `eval_foreach_with_values`
+/// as an `input_control`/`init_control` and is suppressed (or not) by that
+/// function's own rules, where the two routing rows below decide
+/// suppression here, before `foreach` ever runs.
+///
+/// `Expr::Reduce`'s path-context arm is deliberately *not* a fourth route,
+/// despite #2216's own table listing it as a fourth hand-copied block: it
+/// classifies through `stream_outputs_checked` and then folds every control
+/// -- bare or trailing alike -- into one `suppress_or_raise`/`Break`/`Halt`
+/// decision, because `reduce`'s output is single-shot and a partial input
+/// prefix has nothing to contribute. That arm's own comment says so; it is
+/// pinned by `test_path_context_escape_routes_pinned_2216` alongside these
+/// three anyway, since #2416 migrates it too.
+#[derive(Clone, Copy, Debug)]
+enum BareEscapeRoute {
+    /// The three computed-bracket-ish sites --
+    /// [`eval_index_expr_with_path_context`]'s key stream,
+    /// [`eval_slice_bound_with_path_context`]'s bound stream and
+    /// [`eval_getpath_with_path_context`]'s path-argument stream. Each is a
+    /// sub-expression *inside* a larger step whose own prefix and later
+    /// per-output failures still have to be weighed against this escape
+    /// (#791/#400/#494/#1897/#2328), so the control is carried in the call
+    /// site's escape slot and adjudicated there rather than returned from
+    /// under it. Nothing is suppressed here: these sites evaluate their
+    /// stream at `optional: false` in the first place.
+    FoldIntoEscape,
+    /// `Expr::Foreach`'s `input`. A bare escape returns immediately, before
+    /// `INIT` is ever evaluated -- mirroring `eval_foreach`'s own
+    /// cursor-sourced code, whose `INIT` likewise never runs (`INIT` can
+    /// have real side effects: `debug`, `error`, `halt_error`). `Error`
+    /// goes through [`suppress_or_raise`] because an ambient `?` may
+    /// silence an ordinary error here, while `Break`/`Halt` are never
+    /// suppressible (#791/#824) and so return directly.
+    ForeachInput,
+    /// `Expr::Foreach`'s `INIT`. `Error`/`Break` go through
+    /// [`finish_fork`] with `input_control.or(..)`, so an escape the
+    /// *input* stream already carried outranks this one and
+    /// `finish_fork`'s own #1902 decode-failure rule decides suppression --
+    /// a strictly different `optional` policy from `ForeachInput`'s
+    /// [`suppress_or_raise`]. `Halt` bypasses both: it must not be ranked
+    /// behind the input's control, nor suppressed, so it returns directly
+    /// (#791). Folding bare and `Partial` halts together here is exactly
+    /// the change #2100's review caught swallowing a live `halt_error`.
+    ForeachInit,
+}
+
 /// Classify a `QueryResult` already restricted to the
 /// `Owned|ManyOwned|None|Error|Break|Halt|Partial` set -- as every
 /// path-context evaluator function in this file produces -- into its output
-/// values plus an optional trailing escape. Shared by the key-materialization
-/// step in [`eval_index_expr_with_path_context`] and the bound-materialization
-/// step in [`eval_slice_bound_with_path_context`] (#2100), one definition
-/// instead of two independently hand-copied match blocks (CLAUDE.md:
-/// "duplicated predicates diverge silently", #106).
+/// values plus an optional escape.
 ///
-/// `Expr::Foreach`/`Expr::Reduce`'s own path-context arms still hand-roll
-/// this classification rather than calling here -- deliberately, for now:
-/// they diverge on the *bare* `Error`/`Break` variants, which they route
-/// through `suppress_or_raise`/`finish_fork` instead of folding into the
-/// escape slot, so converting them is a policy change rather than a
-/// cleanup. Tracked as #2216.
-fn drain_path_context_stream<W: Clone + AsRef<[u64]>>(
+/// The single owner of that mapping and of its `unreachable!` arm (#2216):
+/// [`drain_path_context_stream`], [`drain_path_context_stream_routed`] and
+/// through them `Expr::Foreach`'s two path-context operands all funnel
+/// here, where before #2216 the same seven arms were hand-copied at each
+/// (CLAUDE.md: "duplicated predicates diverge silently", #106).
+fn classify_path_context_stream<W: Clone + AsRef<[u64]>>(
     result: QueryResult<'_, W>,
-) -> (Vec<OwnedValue>, Option<Control>) {
+) -> (Vec<OwnedValue>, Option<PathContextEscape>) {
     match result {
         QueryResult::Owned(v) => (vec![v], None),
         QueryResult::ManyOwned(vs) => (vs, None),
         QueryResult::None => (Vec::new(), None),
-        QueryResult::Error(e) => (Vec::new(), Some(Control::Error(e))),
-        QueryResult::Break(label) => (Vec::new(), Some(Control::Break(label))),
-        QueryResult::Halt(code) => (Vec::new(), Some(Control::Halt(code))),
-        QueryResult::Partial(vs, control) => (vs, Some(control)),
+        QueryResult::Error(e) => (Vec::new(), Some(PathContextEscape::Bare(Control::Error(e)))),
+        QueryResult::Break(label) => (
+            Vec::new(),
+            Some(PathContextEscape::Bare(Control::Break(label))),
+        ),
+        QueryResult::Halt(code) => (
+            Vec::new(),
+            Some(PathContextEscape::Bare(Control::Halt(code))),
+        ),
+        QueryResult::Partial(vs, control) => (vs, Some(PathContextEscape::Trailing(control))),
         QueryResult::One(_) | QueryResult::Many(_) | QueryResult::OneCursor(_) => unreachable!(
             "eval_expr_needing_path_context only ever produces \
              Owned/ManyOwned/None/Error/Break/Halt/Partial"
         ),
     }
+}
+
+/// [`classify_path_context_stream`] plus one row of [`BareEscapeRoute`]'s
+/// table, which is the whole of the per-call-site policy #2216 is about.
+///
+/// `Ok((values, escape))` -- the call site continues, carrying `escape` in
+/// its own escape slot. `Err(result)` -- the call site returns `result`
+/// immediately; only the two `foreach` routes ever produce it.
+///
+/// `input_control` is read by [`BareEscapeRoute::ForeachInit`] alone (the
+/// `foreach` input stream's own already-classified control, which outranks
+/// a bare `INIT` `Error`/`Break`); the other two routes pass `&None`. It is
+/// borrowed rather than moved because `Expr::Foreach`'s arm still needs it
+/// on the non-escaping path -- the clone below only ever runs on the
+/// escaping one.
+fn drain_path_context_stream_routed<'a, W: Clone + AsRef<[u64]>>(
+    result: QueryResult<'_, W>,
+    route: BareEscapeRoute,
+    input_control: &Option<Control>,
+    optional: bool,
+) -> Result<(Vec<OwnedValue>, Option<Control>), QueryResult<'a, W>> {
+    let (values, escape) = classify_path_context_stream(result);
+    let control = match escape {
+        None => return Ok((values, None)),
+        // Every route folds a trailing escape; only a bare one is routed.
+        Some(trailing @ PathContextEscape::Trailing(_)) => {
+            return Ok((values, Some(trailing.into_control())))
+        }
+        Some(PathContextEscape::Bare(control)) => control,
+    };
+    match (route, control) {
+        // The one row with no early return -- see `FoldIntoEscape`.
+        (BareEscapeRoute::FoldIntoEscape, control) => Ok((values, Some(control))),
+        (BareEscapeRoute::ForeachInput, Control::Error(e)) => Err(suppress_or_raise(e, optional)),
+        (BareEscapeRoute::ForeachInput, Control::Break(label)) => Err(QueryResult::Break(label)),
+        (BareEscapeRoute::ForeachInput, Control::Halt(code)) => Err(QueryResult::Halt(code)),
+        (BareEscapeRoute::ForeachInit, Control::Halt(code)) => Err(QueryResult::Halt(code)),
+        (BareEscapeRoute::ForeachInit, control) => Err(finish_fork(
+            Vec::new(),
+            input_control.clone().or(Some(control)),
+            optional,
+        )),
+    }
+}
+
+/// [`BareEscapeRoute::FoldIntoEscape`]'s spelling of
+/// [`drain_path_context_stream_routed`] for the one call site whose return
+/// type cannot carry a `QueryResult` at all: [`eval_slice_bound_with_path_context`]
+/// returns `Result<_, Control>`, so it has nothing to do with an
+/// `Err(QueryResult)` even as a dead arm. That row has no early-return case,
+/// so the `Result` collapses -- pinned by
+/// `test_bare_escape_route_fold_agrees_with_drain_2216`, which is what makes
+/// the collapse a checked claim rather than an assumed one.
+fn drain_path_context_stream<W: Clone + AsRef<[u64]>>(
+    result: QueryResult<'_, W>,
+) -> (Vec<OwnedValue>, Option<Control>) {
+    let (values, escape) = classify_path_context_stream(result);
+    (values, escape.map(PathContextEscape::into_control))
 }
 
 /// [`eval_index_expr`]'s path-context twin (#2100): reproduces its five
@@ -32720,41 +32875,55 @@ fn eval_index_expr_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemanti
     // `eval_index_expr` (`eval.rs`, above) -- a single key-stream escape
     // carries exactly one `Control` variant.
     let mut pending_key_stream_control: Option<Control> = None;
-    let (keys, pending_halt): (Vec<OwnedValue>, Option<i32>) =
-        match drain_path_context_stream(key_result) {
-            // #2371: jq-only, mirroring #2326's identical fix for `key`'s
-            // own generator in the plain evaluators (`eval.rs`'s
-            // `eval_index_expr` above, `eval_generic.rs`'s
-            // `eval_index_expr`) -- real jq's key-outer/target-inner model
-            // indexes each already-produced key as it flows out, so an
-            // `Error`/`Break` partway through the key stream still owes
-            // output for the keys already produced. This function is only
-            // reachable from ordinary jq-mode syntax via a path-context-
-            // forcing builtin (`file_index`/`document_index`/`parent`) --
-            // none of which are real jq builtins (all reject with a compile
-            // error against jq 1.7.1, e.g. `file_index/0 is not defined`),
-            // so the underlying key-outer-generator claim is verified
-            // against the *semantically identical* plain-evaluator path
-            // instead, per #2326: `{"a":1,"b":2} | .[("a","b",error("x"))]`
-            // prints `1`, `2`, then raises against jq 1.7.1. yq mode does
-            // not stream this prefix either (confirmed live against yq
-            // v4.53.3: `.[("a","b",error("x"))]` on `{a: 1, b: 2}` prints
-            // only `Error: x`, no `1`/`2`), so yq mode keeps the
-            // pre-existing conservative discard below.
-            (vs, Some(Control::Error(e))) if S::TAG != EvalTag::Yq => {
-                pending_key_stream_control = Some(Control::Error(e));
-                (vs, None)
-            }
-            (vs, Some(Control::Break(label))) if S::TAG != EvalTag::Yq => {
-                pending_key_stream_control = Some(Control::Break(label));
-                (vs, None)
-            }
-            (_, Some(Control::Error(e))) => return QueryResult::Error(e),
-            (_, Some(Control::Break(label))) => return QueryResult::Break(label),
-            // #791: keys already yielded before a halt still owe output.
-            (vs, Some(Control::Halt(code))) => (vs, Some(code)),
-            (vs, None) => (vs, None),
-        };
+    // #2216: `FoldIntoEscape` -- a bare key-stream escape is carried in this
+    // function's own escape slot (`pending_key_stream_control`/`pending_halt`)
+    // and adjudicated below against later keys' own index errors, never
+    // returned from under this step. That row has no early-return case, so
+    // the `Err` arm here is dead; spelled as an immediate return rather than
+    // an `unreachable!` so a future table edit degrades instead of panicking.
+    let drained = match drain_path_context_stream_routed::<W>(
+        key_result,
+        BareEscapeRoute::FoldIntoEscape,
+        &None,
+        false,
+    ) {
+        Ok(drained) => drained,
+        Err(escaped) => return escaped,
+    };
+    let (keys, pending_halt): (Vec<OwnedValue>, Option<i32>) = match drained {
+        // #2371: jq-only, mirroring #2326's identical fix for `key`'s
+        // own generator in the plain evaluators (`eval.rs`'s
+        // `eval_index_expr` above, `eval_generic.rs`'s
+        // `eval_index_expr`) -- real jq's key-outer/target-inner model
+        // indexes each already-produced key as it flows out, so an
+        // `Error`/`Break` partway through the key stream still owes
+        // output for the keys already produced. This function is only
+        // reachable from ordinary jq-mode syntax via a path-context-
+        // forcing builtin (`file_index`/`document_index`/`parent`) --
+        // none of which are real jq builtins (all reject with a compile
+        // error against jq 1.7.1, e.g. `file_index/0 is not defined`),
+        // so the underlying key-outer-generator claim is verified
+        // against the *semantically identical* plain-evaluator path
+        // instead, per #2326: `{"a":1,"b":2} | .[("a","b",error("x"))]`
+        // prints `1`, `2`, then raises against jq 1.7.1. yq mode does
+        // not stream this prefix either (confirmed live against yq
+        // v4.53.3: `.[("a","b",error("x"))]` on `{a: 1, b: 2}` prints
+        // only `Error: x`, no `1`/`2`), so yq mode keeps the
+        // pre-existing conservative discard below.
+        (vs, Some(Control::Error(e))) if S::TAG != EvalTag::Yq => {
+            pending_key_stream_control = Some(Control::Error(e));
+            (vs, None)
+        }
+        (vs, Some(Control::Break(label))) if S::TAG != EvalTag::Yq => {
+            pending_key_stream_control = Some(Control::Break(label));
+            (vs, None)
+        }
+        (_, Some(Control::Error(e))) => return QueryResult::Error(e),
+        (_, Some(Control::Break(label))) => return QueryResult::Break(label),
+        // #791: keys already yielded before a halt still owe output.
+        (vs, Some(Control::Halt(code))) => (vs, Some(code)),
+        (vs, None) => (vs, None),
+    };
     if keys.is_empty() {
         // NOT `QueryResult::None`, the spelling `eval_index_expr` uses here.
         // That function's own comment justifies the bare `None` with
@@ -33003,8 +33172,19 @@ fn eval_getpath_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>
     // `drain_path_context_stream` classification, which would discard `vs`
     // on those two arms (#400/#494's own convention says a genuine escape
     // still owes whatever output preceded it).
+    // #2216: `FoldIntoEscape`, the same row the key/bound streams take -- its
+    // `Err` arm is dead for the reason spelled out at
+    // `eval_index_expr_with_path_context`'s own call above.
     let (paths, pending_escape): (Vec<OwnedValue>, Option<Control>) =
-        drain_path_context_stream(path_result);
+        match drain_path_context_stream_routed::<W>(
+            path_result,
+            BareEscapeRoute::FoldIntoEscape,
+            &None,
+            false,
+        ) {
+            Ok(drained) => drained,
+            Err(escaped) => return escaped,
+        };
     if paths.is_empty() {
         return match pending_escape {
             Some(control) => partial(Vec::new(), control),
@@ -35269,63 +35449,49 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             update,
             extract,
         } if needs_path_context(input) || needs_path_context(init) => {
+            // #2216: the classification and the `unreachable!` live once, in
+            // `classify_path_context_stream`; what stays here is the named
+            // route decision -- see `BareEscapeRoute`'s own table for why
+            // this operand's bare escapes cannot simply be folded into the
+            // escape slot the way the computed-bracket sites' are.
             let (input_values, input_control): (Vec<OwnedValue>, Option<Control>) =
-                match eval_expr_needing_path_context::<W, S>(
-                    input,
-                    value,
-                    root,
-                    file_origin,
-                    current_path,
+                match drain_path_context_stream_routed::<W>(
+                    eval_expr_needing_path_context::<W, S>(
+                        input,
+                        value,
+                        root,
+                        file_origin,
+                        current_path,
+                        optional,
+                    ),
+                    BareEscapeRoute::ForeachInput,
+                    &None,
                     optional,
                 ) {
-                    QueryResult::Owned(v) => (vec![v], None),
-                    QueryResult::ManyOwned(vs) => (vs, None),
-                    QueryResult::None => (Vec::new(), None),
-                    QueryResult::Error(e) => return suppress_or_raise(e, optional),
-                    QueryResult::Break(label) => return QueryResult::Break(label),
-                    QueryResult::Halt(code) => return QueryResult::Halt(code),
-                    QueryResult::Partial(vs, control) => (vs, Some(control)),
-                    QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => {
-                        unreachable!(
-                            "eval_expr_needing_path_context only ever produces \
-                             Owned/ManyOwned/None/Error/Break/Partial"
-                        )
-                    }
+                    Ok(drained) => drained,
+                    Err(escaped) => return escaped,
                 };
+            // #2216: `ForeachInit`, not `ForeachInput` -- the two rows differ
+            // on `optional`-suppression *and* on whether `input_control`
+            // outranks this operand's own escape. `input_control` is borrowed
+            // here because it is still owed to `eval_foreach_with_values`
+            // below on the non-escaping path.
             let (init_values, init_control): (Vec<OwnedValue>, Option<Control>) =
-                match eval_expr_needing_path_context::<W, S>(
-                    init,
-                    value,
-                    root,
-                    file_origin,
-                    current_path,
+                match drain_path_context_stream_routed::<W>(
+                    eval_expr_needing_path_context::<W, S>(
+                        init,
+                        value,
+                        root,
+                        file_origin,
+                        current_path,
+                        optional,
+                    ),
+                    BareEscapeRoute::ForeachInit,
+                    &input_control,
                     optional,
                 ) {
-                    QueryResult::Owned(v) => (vec![v], None),
-                    QueryResult::ManyOwned(vs) => (vs, None),
-                    QueryResult::None => (Vec::new(), None),
-                    QueryResult::Error(e) => {
-                        return finish_fork(
-                            Vec::new(),
-                            input_control.or(Some(Control::Error(e))),
-                            optional,
-                        );
-                    }
-                    QueryResult::Break(label) => {
-                        return finish_fork(
-                            Vec::new(),
-                            input_control.or(Some(Control::Break(label))),
-                            optional,
-                        );
-                    }
-                    QueryResult::Halt(code) => return QueryResult::Halt(code),
-                    QueryResult::Partial(vs, control) => (vs, Some(control)),
-                    QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => {
-                        unreachable!(
-                            "eval_expr_needing_path_context only ever produces \
-                             Owned/ManyOwned/None/Error/Break/Partial"
-                        )
-                    }
+                    Ok(drained) => drained,
+                    Err(escaped) => return escaped,
                 };
             let result = eval_foreach_with_values::<W, S>(
                 patterns,
@@ -54882,6 +55048,317 @@ mod tests {
                 assert_eq!(e.message, "x");
             }
         );
+    }
+
+    // ---- #2216: `BareEscapeRoute`'s table, pinned ----
+    //
+    // The routes below were read out of the code, not copied from the issue:
+    // #2216's own table listed `Expr::Reduce`'s arm as a fourth hand-rolled
+    // copy of the classification, but that arm already delegates to
+    // `stream_outputs_checked` and folds *every* control (bare or trailing)
+    // into one decision, so it is not a routing site at all. It is pinned
+    // below anyway, because #2416 migrates it alongside `Expr::Foreach`'s.
+
+    /// #2216: render a `Control` compactly, so the routing assertions below
+    /// read as the table `BareEscapeRoute` documents.
+    fn describe_control(control: &Control) -> String {
+        match control {
+            Control::Error(e) => format!("Error({})", e.message),
+            Control::Break(label) => format!("Break({label})"),
+            Control::Halt(code) => format!("Halt({code})"),
+        }
+    }
+
+    /// #2216: render what a call site carries forward -- its values plus its
+    /// own escape slot.
+    fn describe_drained(drained: (Vec<OwnedValue>, Option<Control>)) -> String {
+        let (values, escape) = drained;
+        format!(
+            "{:?}:{}",
+            values.iter().map(OwnedValue::to_json).collect::<Vec<_>>(),
+            escape
+                .as_ref()
+                .map_or_else(|| "none".to_string(), describe_control)
+        )
+    }
+
+    /// #2216: render one application of [`BareEscapeRoute`]'s table --
+    /// `carry:..` when the route folds into the call site's escape slot,
+    /// `return:..` when it escapes the arm outright.
+    fn describe_route(
+        result: QueryResult<'static, Vec<u64>>,
+        route: BareEscapeRoute,
+        input_control: &Option<Control>,
+        optional: bool,
+    ) -> String {
+        match drain_path_context_stream_routed::<Vec<u64>>(result, route, input_control, optional) {
+            Ok(drained) => format!("carry:{}", describe_drained(drained)),
+            Err(QueryResult::None) => "return:None".to_string(),
+            Err(QueryResult::Error(e)) => format!("return:Error({})", e.message),
+            Err(QueryResult::Break(label)) => format!("return:Break({label})"),
+            Err(QueryResult::Halt(code)) => format!("return:Halt({code})"),
+            Err(other) => panic!("unexpected routed escape: {other:?}"),
+        }
+    }
+
+    /// #2216: [`drain_path_context_stream`] must stay exactly
+    /// [`BareEscapeRoute::FoldIntoEscape`]'s row of the table.
+    ///
+    /// The wrapper exists because that row has no early-return case, so its
+    /// `Result` collapses to a plain tuple -- a claim
+    /// [`eval_slice_bound_with_path_context`] depends on (its own return
+    /// type cannot carry a `QueryResult` even as a dead arm). CLAUDE.md's
+    /// rule for exactly this shape: one definition, plus a test that the
+    /// call sites agree (#106).
+    #[test]
+    fn test_bare_escape_route_fold_agrees_with_drain_2216() {
+        // Built twice per shape rather than cloned: `QueryResult` is not
+        // `Clone`, and both entry points consume their argument.
+        let shapes: [fn() -> QueryResult<'static, Vec<u64>>; 9] = [
+            || QueryResult::None,
+            || QueryResult::Owned(OwnedValue::from("v")),
+            || QueryResult::ManyOwned(vec![OwnedValue::from("v"), OwnedValue::from("w")]),
+            || QueryResult::Error(EvalError::new("x")),
+            || QueryResult::Break("out".to_string()),
+            || QueryResult::Halt(5),
+            || {
+                partial(
+                    vec![OwnedValue::from("v")],
+                    Control::Error(EvalError::new("x")),
+                )
+            },
+            || {
+                partial(
+                    vec![OwnedValue::from("v")],
+                    Control::Break("out".to_string()),
+                )
+            },
+            || partial(vec![OwnedValue::from("v")], Control::Halt(5)),
+        ];
+        for make in shapes {
+            let want = describe_drained(drain_path_context_stream(make()));
+            let got = describe_route(make(), BareEscapeRoute::FoldIntoEscape, &None, false);
+            assert_eq!(
+                got,
+                format!("carry:{want}"),
+                "drain_path_context_stream must equal FoldIntoEscape's row"
+            );
+        }
+    }
+
+    /// #2216: the routing table itself, asserted directly -- the three rows
+    /// differ on `optional`-suppression and on whether the `foreach` input
+    /// stream's own control outranks the operand's, and no single query
+    /// shape can separate all of that.
+    ///
+    /// `optional == true` is currently unreachable from live syntax at these
+    /// sites (see `finish_fork`'s own doc comment, #1934 item 7), so the
+    /// suppression columns are exercised here white-box, the same way that
+    /// function's own tests already do.
+    #[test]
+    fn test_bare_escape_route_table_2216() {
+        let none: Option<Control> = None;
+        let prior = Some(Control::Error(EvalError::new("in")));
+
+        // Row 1 -- `FoldIntoEscape`: every bare variant lands in the escape
+        // slot, nothing returns early, nothing is suppressed.
+        for (result, want) in [
+            (QueryResult::Error(EvalError::new("x")), "carry:[]:Error(x)"),
+            (QueryResult::Break("out".to_string()), "carry:[]:Break(out)"),
+            (QueryResult::Halt(5), "carry:[]:Halt(5)"),
+        ] {
+            assert_eq!(
+                describe_route(result, BareEscapeRoute::FoldIntoEscape, &none, false),
+                want
+            );
+        }
+
+        // Row 2 -- `ForeachInput`: all three return immediately, before
+        // `INIT` is ever evaluated. Only `Error` is `optional`-suppressible.
+        for (result, want) in [
+            (QueryResult::Error(EvalError::new("x")), "return:Error(x)"),
+            (QueryResult::Break("out".to_string()), "return:Break(out)"),
+            (QueryResult::Halt(5), "return:Halt(5)"),
+        ] {
+            assert_eq!(
+                describe_route(result, BareEscapeRoute::ForeachInput, &none, false),
+                want
+            );
+        }
+        assert_eq!(
+            describe_route(
+                QueryResult::Error(EvalError::new("x")),
+                BareEscapeRoute::ForeachInput,
+                &none,
+                true
+            ),
+            "return:None",
+            "`suppress_or_raise`: an ordinary error is silenced by an ambient `?`"
+        );
+        assert_eq!(
+            describe_route(
+                QueryResult::Halt(5),
+                BareEscapeRoute::ForeachInput,
+                &none,
+                true
+            ),
+            "return:Halt(5)",
+            "#791: a halt is never suppressible"
+        );
+
+        // Row 3 -- `ForeachInit`: `Error`/`Break` through `finish_fork`, so
+        // the input stream's own control outranks them; `Halt` bypasses that
+        // ranking entirely (#791, and the #2100-review near-miss this issue
+        // was filed over).
+        for (result, want) in [
+            (QueryResult::Error(EvalError::new("x")), "return:Error(x)"),
+            (QueryResult::Break("out".to_string()), "return:Break(out)"),
+            (QueryResult::Halt(5), "return:Halt(5)"),
+        ] {
+            assert_eq!(
+                describe_route(result, BareEscapeRoute::ForeachInit, &none, false),
+                want
+            );
+        }
+        for (result, want) in [
+            (QueryResult::Error(EvalError::new("x")), "return:Error(in)"),
+            (QueryResult::Break("out".to_string()), "return:Error(in)"),
+            (QueryResult::Halt(5), "return:Halt(5)"),
+        ] {
+            assert_eq!(
+                describe_route(result, BareEscapeRoute::ForeachInit, &prior, false),
+                want,
+                "input_control outranks a bare INIT Error/Break, never a Halt"
+            );
+        }
+        assert_eq!(
+            describe_route(
+                QueryResult::Error(EvalError::new("x")),
+                BareEscapeRoute::ForeachInit,
+                &none,
+                true
+            ),
+            "return:None",
+            "`finish_fork`'s own #1902 rule: an ordinary trailing error is suppressed"
+        );
+    }
+
+    /// #2216: the same escaping sub-expression driven through every routing
+    /// position -- a computed bracket, a slice bound, `getpath`'s path
+    /// argument, and `foreach`/`reduce`'s `input` and `INIT` -- so a
+    /// migration (#2416) that re-derives the routes has something to fail
+    /// against. Each position carries an `error`, a `break` and a
+    /// `halt_error` shape: #2100's review found that changing how bare and
+    /// `Partial` halts fold together silently swallowed a live `halt_error`,
+    /// so the halt column is the point of the test, not filler.
+    ///
+    /// **Oracle.** None of these queries runs in real jq: they reach the
+    /// path-context evaluator only via `key`, and jq 1.7.1 rejects it at
+    /// compile time (`jq: error: key/0 is not defined at <top-level>`, exit
+    /// 3). What was captured instead, on 2026-09-05 against
+    /// `/usr/bin/jq` 1.7.1 (`{"a":1,"b":2}` on stdin), is each shape with
+    /// `key` replaced by a constant, i.e. the same routing question asked of
+    /// the evaluator jq does have:
+    ///
+    /// | query (jq spelling)                                 | jq 1.7.1        |
+    /// |-----------------------------------------------------|-----------------|
+    /// | `.[error("x")]`                                     | error `x`, 5    |
+    /// | `.[halt_error]`                                     | halt, 5         |
+    /// | `label $out \| .[break $out]`                       | empty, 0        |
+    /// | `.[error("x"):1]`                                   | error `x`, 5    |
+    /// | `.[halt_error:1]`                                   | halt, 5         |
+    /// | `getpath(error("x"))`                               | error `x`, 5    |
+    /// | `getpath(halt_error)`                               | halt, 5         |
+    /// | `foreach error("x") as $x (0; .)`                   | error `x`, 5    |
+    /// | `foreach halt_error as $x (0; .)`                   | halt, 5         |
+    /// | `label $out \| foreach (break $out) as $x (0; .)`   | empty, 0        |
+    /// | `foreach (1,2) as $x (error("init"); .)`            | error `init`, 5 |
+    /// | `foreach (1,2) as $x (halt_error; .)`               | halt, 5         |
+    /// | `label $out \| foreach (1,2) as $x (break $out; .)` | empty, 0        |
+    /// | `foreach (1, error("in")) as $x (error("init"); .)` | error `init`, 5 |
+    /// | `foreach (1, error("in")) as $x (halt_error; .)`    | halt, 5         |
+    /// | `reduce error("x") as $x (0; .)`                    | error `x`, 5    |
+    /// | `reduce halt_error as $x (0; .)`                    | halt, 5         |
+    /// | `reduce (1,2) as $x (error("init"); .)`             | error `init`, 5 |
+    /// | `reduce (1,2) as $x (halt_error; .)`                | halt, 5         |
+    ///
+    /// Every row succinctly's own path-context spelling can be compared
+    /// against agrees, with **one pre-existing divergence pinned as-is
+    /// below, deliberately not fixed here**: where the `foreach`/`reduce`
+    /// *input* stream carries its own escape and `INIT` also escapes, jq
+    /// reports `INIT`'s (`foreach (1, error("in")) as $x (error("init"); .)`
+    /// => `init`; `label $out \| foreach (1, break $out) as $x
+    /// (error("init"); .)` => `init`) where succinctly reports the input
+    /// stream's (`in`, and the break). That is `ForeachInit`'s
+    /// `input_control.or(..)` ranking, and it is not path-context-specific:
+    /// succinctly's plain `foreach (1, error("in")) as $x (error("init"); .)`
+    /// -- no `key`, ordinary evaluator -- reports `in` too.
+    #[test]
+    fn test_path_context_escape_routes_pinned_2216() {
+        fn outcome(filter: &str) -> (Vec<String>, String) {
+            let json = br#"{"a":1,"b":2}"#;
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let expr = parse(filter).unwrap();
+            let (values, tag) = normalize(eval::<Vec<u64>, JqSemantics>(&expr, cursor));
+            (values.iter().map(OwnedValue::to_json).collect(), tag)
+        }
+
+        for (filter, want) in [
+            // `FoldIntoEscape` -- computed bracket's key stream.
+            (r#".[error("x")] | key"#, "error:x"),
+            (r".[halt_error] | key", "halt:5"),
+            (r"label $out | .[break $out] | key", "ok"),
+            // `FoldIntoEscape` -- slice bound.
+            (r#".[error("x"):1] | key"#, "error:x"),
+            (r".[halt_error:1] | key", "halt:5"),
+            (r"label $out | .[(break $out):1] | key", "ok"),
+            // `FoldIntoEscape` -- `getpath`'s path argument.
+            (r#"getpath(error("x")) | key"#, "error:x"),
+            (r"getpath(halt_error) | key", "halt:5"),
+            (r"label $out | getpath(break $out) | key", "ok"),
+            // `ForeachInput`.
+            (r#"foreach error("x") as $x (key; .)"#, "error:x"),
+            (r"foreach halt_error as $x (key; .)", "halt:5"),
+            (r"label $out | foreach (break $out) as $x (key; .)", "ok"),
+            // `ForeachInit`, with no input-stream control to outrank it.
+            (r#"foreach key as $x (error("init"); .)"#, "error:init"),
+            (r"foreach key as $x (halt_error; .)", "halt:5"),
+            (r"label $out | foreach key as $x (break $out; .)", "ok"),
+            // `ForeachInit`, with one -- the row where `Halt` and
+            // `Error`/`Break` visibly part company.
+            (
+                r#"foreach (key, error("in")) as $x (error("init"); .)"#,
+                "error:in",
+            ),
+            (
+                r#"foreach (key, error("in")) as $x (halt_error; .)"#,
+                "halt:5",
+            ),
+            (
+                r#"label $out | foreach (key, break $out) as $x (error("init"); .)"#,
+                "ok",
+            ),
+            // `Expr::Reduce`'s arm: not a routing site (see the note above
+            // this block), pinned because #2416 migrates it too.
+            (r#"reduce error("x") as $x (key; .)"#, "error:x"),
+            (r"reduce halt_error as $x (key; .)", "halt:5"),
+            (r"label $out | reduce (break $out) as $x (key; .)", "ok"),
+            (r#"reduce key as $x (error("init"); .)"#, "error:init"),
+            (r"reduce key as $x (halt_error; .)", "halt:5"),
+            (r"label $out | reduce key as $x (break $out; .)", "ok"),
+            (
+                r#"reduce (key, error("in")) as $x (error("init"); .)"#,
+                "error:in",
+            ),
+        ] {
+            let (values, tag) = outcome(filter);
+            assert_eq!(tag, want, "{filter}");
+            assert!(
+                values.is_empty(),
+                "{filter} must produce no output before escaping, got {values:?}"
+            );
+        }
     }
 
     // #2351 review, lower-priority coverage: the original 8 tests only ever
