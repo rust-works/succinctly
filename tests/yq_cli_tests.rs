@@ -21231,12 +21231,45 @@ fn test_1162_delpaths_rejects_nested_slice_descriptor() -> Result<()> {
 }
 
 /// An ordinary (non-slice-descriptor) `delpaths()` call is unaffected by
-/// the new yq-mode check.
+/// the new yq-mode check. Corrected by #2306: this used to assert the
+/// batch/union result (`[2]`, deleting original indices 0 and 2
+/// simultaneously) but real yq applies the two paths *sequentially* --
+/// delete index 0 from `[1,2,3]` first (`[2,3]`), then index 2 of *that*
+/// (out of range for a 2-element array, so a no-op) -- confirmed live
+/// (yq v4.53.3) that `delpaths([[0],[2]])` on `[1,2,3]` is `[2,3]`, not
+/// `[2]`.
 #[test]
 fn test_1162_delpaths_ordinary_paths_unaffected() -> Result<()> {
     let (out, code) = run_yq_stdin("delpaths([[0],[2]])", "[1,2,3]", &["-o=json", "-I=0"])?;
     assert_eq!(code, 0);
-    assert_eq!(out.trim(), "[2]");
+    assert_eq!(out.trim(), "[2,3]");
+    Ok(())
+}
+
+/// #2306: `delpaths()`'s own multi-key batch is order-dependent in real
+/// yq -- not just when out-of-range indices are involved, confirmed live
+/// (yq v4.53.3) even for two all-in-range indices. Deleting index 0 first
+/// from `[1,2,3,4]` gives `[2,3,4]`; deleting index 1 of *that* removes
+/// the (now-shifted) value `3`, giving `[2,4]`. The reversed order
+/// (`test_1162_delpaths_reversed_order_gives_a_different_result_2306`
+/// below) gives `[3,4]` instead on the identical input -- real jq's own
+/// `delpaths` gives the order-independent `[3,4]` for *both* orderings.
+#[test]
+fn test_1162_delpaths_order_dependent_even_when_all_in_range_2306() -> Result<()> {
+    let (out, code) = run_yq_stdin("delpaths([[0],[1]])", "[1,2,3,4]", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[2,4]");
+    Ok(())
+}
+
+/// #2306 sibling: the reversed key order from the test above, same input,
+/// different result -- confirming this is genuinely about *sequence*, not
+/// which specific indices are named.
+#[test]
+fn test_1162_delpaths_reversed_order_gives_a_different_result_2306() -> Result<()> {
+    let (out, code) = run_yq_stdin("delpaths([[1],[0]])", "[1,2,3,4]", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[3,4]");
     Ok(())
 }
 
@@ -29355,18 +29388,17 @@ fn test_delpaths_negative_index_out_of_range_raises_2268() -> Result<()> {
     Ok(())
 }
 
-/// #2268: a documented, accepted residual divergence -- when a
-/// negative-out-of-range index is grouped in the *same* `delpaths()` call
-/// as an earlier deletion on the same array, real yq's own error reports
-/// the array's size *after* that earlier deletion already happened
-/// (confirmed live, v4.53.3: `delpaths([[0],[-5]])` on a 2-element array
-/// reports "array size is 1", not 2). `delete_keys`'s own batch invariant
-/// -- every key resolves against the length the array had on *entry*, not
-/// a shrinking length as each is processed, which is what makes an
-/// overlapping range union rather than compound -- means this crate always
-/// reports the *entry* length instead. Still correctly raises, which is
-/// this issue's own actual scope; only the reported number can differ in
-/// this one multi-key-same-array shape, not pinned against real yq itself.
+/// #2268, corrected by #2306: when a negative-out-of-range index is grouped
+/// in the *same* `delpaths()` call as an earlier deletion on the same
+/// array, real yq's own error reports the array's size *after* that
+/// earlier deletion already happened (confirmed live, v4.53.3:
+/// `delpaths([[0],[-5]])` on a 2-element array reports "array size is 1",
+/// not 2). This test used to pin the *entry*-length report ("array size is
+/// 2") as a documented, accepted residual divergence from `delete_keys`'s
+/// own batch invariant -- #2306's sequential-per-path fix for yq mode
+/// closes that gap as a side effect (each path now really does see the
+/// length the previous one left behind), so this now matches real yq
+/// exactly.
 #[test]
 fn test_delpaths_grouped_negative_index_reports_entry_length_2268() -> Result<()> {
     let (out, stderr, code) =
@@ -29374,7 +29406,7 @@ fn test_delpaths_grouped_negative_index_reports_entry_length_2268() -> Result<()
     assert_eq!(code, 1, "out: {out:?}");
     assert_eq!(
         stderr.trim(),
-        "Error: index [-5] out of range, array size is 2"
+        "Error: index [-5] out of range, array size is 1"
     );
 
     Ok(())
