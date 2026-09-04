@@ -8202,7 +8202,8 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
     };
     if keys.is_empty() {
         // `partial_generic`'s invariant (a non-empty prefix by construction)
-        // means this is only reachable with `pending_halt` unset.
+        // means this is only reachable with `pending_halt`/
+        // `pending_key_stream_control` both unset.
         return GenericResult::None;
     }
 
