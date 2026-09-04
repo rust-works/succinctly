@@ -8141,6 +8141,10 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
     // already yielded before the key generator halts on its *next* attempt,
     // so those keys' indexed output must still reach stdout (#791).
     let mut pending_halt: Option<i32> = None;
+    // #2326: mutually exclusive with `pending_halt` -- a single `Partial`
+    // result carries exactly one `Control` variant, so at most one of the
+    // two is ever set.
+    let mut pending_key_stream_control: Option<Control> = None;
     let keys = match eval_single::<S, V>(key, value.clone(), false, cursor) {
         GenericResult::Error(e) => return GenericResult::Error(e),
         GenericResult::Break(label) => return GenericResult::Break(label),
@@ -8152,15 +8156,34 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         // `Break`, which already gets its own explicit early return above.
         GenericResult::Halt(code) => return GenericResult::Halt(code),
         GenericResult::None => return GenericResult::None,
+        // #2326: `key`'s own generator produced `vs` before its own
+        // mid-stream escape -- mirrors #2226's identical fix for `target`'s
+        // side (this same function's own target-evaluation match below):
+        // real jq's key-outer/target-inner model indexes each already-
+        // produced key as it flows out, so `key`'s own escaped generator's
+        // prefix is real jq output too (confirmed live: `[10,20,30] |
+        // .[(1,error("x"))]` prints `20` before raising). jq-only, matching
+        // #2226's own gate -- real yq does not stream this prefix either
+        // (confirmed live, `.[(1,error("x"))]` in yq mode shows no `20`),
+        // so yq mode keeps the pre-existing conservative discard below.
+        GenericResult::Partial(vs, Control::Error(e)) if S::TAG != EvalTag::Yq => {
+            pending_key_stream_control = Some(Control::Error(e));
+            vs
+        }
+        GenericResult::Partial(vs, Control::Break(label)) if S::TAG != EvalTag::Yq => {
+            pending_key_stream_control = Some(Control::Break(label));
+            vs
+        }
         // A `Partial`'s trailing control must abort here too, not silently
         // truncate to its prefix (#694) -- mirrors the target match below.
-        GenericResult::Partial(_, Control::Error(e)) => return GenericResult::Error(e),
-        GenericResult::Partial(_, Control::Break(label)) => return GenericResult::Break(label),
         // Computed indexing's key/target forking isn't part of #400/#494's
         // verified semantics for `Error`/`Break` — conservatively matching
         // those arms rather than inventing new partial-key behavior for
         // them. `Halt` is different: its prefix is kept and threaded through
         // as `pending_halt` instead of discarded, per the comment above.
+        // (yq mode, and any future non-jq/yq semantics, still take these.)
+        GenericResult::Partial(_, Control::Error(e)) => return GenericResult::Error(e),
+        GenericResult::Partial(_, Control::Break(label)) => return GenericResult::Break(label),
         GenericResult::Partial(vs, Control::Halt(code)) => {
             pending_halt = Some(code);
             vs
@@ -8546,6 +8569,20 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
             }
         };
         return partial_generic(out, Control::Halt(code));
+    }
+
+    // #2326: the key stream's own escape, deferred until every already-
+    // produced key finished indexing cleanly -- an indexing failure on one
+    // of those keys outranks it (escapes earlier, via `escape_generic!`
+    // inside the loop above), matching #2226's own documented priority for
+    // the symmetric target-side case.
+    if let Some(control) = pending_key_stream_control {
+        let out = if any_owned {
+            owned
+        } else {
+            owned_or_err!(to_owned_all_cursors(&cursors))
+        };
+        return partial_generic(out, control);
     }
 
     // #1048: a zero-result collapse here (every key/target pair
@@ -12512,11 +12549,12 @@ mod tests {
     }
 
     /// `eval_index_expr`'s `keys` match, `Partial`+`Break` sibling to the
-    /// `Partial`+`Error` case above (#694): a `break` after some keys have
-    /// already streamed collapses to the bare control instead of resolving
-    /// those keys against the target. Confirmed against real jq 1.7.1:
-    /// `label $out | .[("a", break $out)]` on `{"a":1,"b":2}` breaks out of
-    /// the label rather than indexing with `"a"`.
+    /// `Partial`+`Error` case above (#694). #2326 fixed this arm (jq mode
+    /// only) to index the target with each already-produced key instead of
+    /// discarding them, so the successfully-indexed prefix now survives the
+    /// break instead of collapsing to a bare control -- confirmed against
+    /// real jq 1.7.1: `label $out | .[("a", break $out)]` on
+    /// `{"a":1,"b":2}` prints `1` before breaking out of the label.
     #[test]
     fn test_generic_computed_index_read_propagates_partial_break_694() {
         let json = br#"{"a":1,"b":2}"#;
@@ -12526,7 +12564,12 @@ mod tests {
 
         let expr = parse(r#".[("a", break $out)]"#).unwrap();
         let result = eval_using::<JqSemantics, _>(&expr, value);
-        assert!(matches!(result, GenericResult::Break(ref label) if label == "out"));
+        match result {
+            GenericResult::Partial(vs, Control::Break(ref label)) if label == "out" => {
+                assert_eq!(vs, vec![OwnedValue::Int(1)]);
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
     }
 
     /// `GenericResult::LazyIndexRange`'s `stream_json`/`stream_yaml` (#684).

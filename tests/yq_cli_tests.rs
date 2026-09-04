@@ -29373,6 +29373,20 @@ fn test_slice_expr_target_partial_prefix_still_discarded_in_yq_mode_2226() -> Re
     Ok(())
 }
 
+/// #2326: the mirror-image gap on `key`'s own side of `E[K]` -- yq mode
+/// keeps the pre-#2326 conservative discard. Verified live against yq
+/// v4.53.3: `[10,20,30] | .[(1,error("x"))]` prints only `Error: x`, no
+/// `20` prefix.
+#[test]
+fn test_index_expr_key_partial_prefix_still_discarded_in_yq_mode_2326() -> Result<()> {
+    let (out, stderr, code) =
+        run_yq_stdin_with_stderr(".[(1,error(\"x\"))]", "[10, 20, 30]\n", &["-o", "json"])?;
+    assert_eq!(code, 1, "out: {out:?} stderr: {stderr:?}");
+    assert_eq!(out, "");
+    assert_eq!(stderr.trim(), "Error: x");
+    Ok(())
+}
+
 /// #2264: `keys`/`keys_unsorted`'s own lazy `.[n]` fast path
 /// (`fold_lazy_keys_stage` for object keys, `fold_lazy_index_range_stage`
 /// for array keys) had its own independent negative-index resolution with

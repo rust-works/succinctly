@@ -16718,6 +16718,10 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // the key generator halts on its *next* attempt, so those keys' indexed
     // output must still reach stdout (#791).
     let mut pending_halt = None;
+    // #2326: mutually exclusive with `pending_halt` -- a single `Partial`
+    // result carries exactly one `Control` variant, so at most one of the
+    // two is ever set.
+    let mut pending_key_stream_control: Option<Control> = None;
     let keys = match eval_single::<W, S>(key, value.clone(), false).materialize_cursor() {
         QueryResult::One(v) => match to_owned_key_shape(&v) {
             Ok(v) => vec![v],
@@ -16738,9 +16742,28 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Break(label) => return QueryResult::Break(label),
         QueryResult::Halt(code) => return QueryResult::Halt(code),
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor should have converted this"),
+        // #2326: `key`'s own generator produced `vs` before its own
+        // mid-stream escape -- mirrors #2226's identical fix for `target`'s
+        // side (this same function's own `KeyTargets::Partial` arm below):
+        // real jq's key-outer/target-inner model indexes each already-
+        // produced key as it flows out, so `key`'s own escaped generator's
+        // prefix is real jq output too (confirmed live: `[10,20,30] |
+        // .[(1,error("x"))]` prints `20` before raising). jq-only, matching
+        // #2226's own gate -- real yq does not stream this prefix either
+        // (confirmed live, `.[(1,error("x"))]` in yq mode shows no `20`),
+        // so yq mode keeps the pre-existing conservative discard below.
+        QueryResult::Partial(vs, Control::Error(e)) if S::TAG != EvalTag::Yq => {
+            pending_key_stream_control = Some(Control::Error(e));
+            vs
+        }
+        QueryResult::Partial(vs, Control::Break(label)) if S::TAG != EvalTag::Yq => {
+            pending_key_stream_control = Some(Control::Break(label));
+            vs
+        }
         // Computed indexing's key/target forking isn't part of #400/#494's
         // verified semantics — conservatively matching the existing
         // Error/Break arms rather than inventing new partial-key behavior.
+        // (yq mode, and any future non-jq/yq semantics, still take this.)
         QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
         QueryResult::Partial(_, Control::Break(label)) => return QueryResult::Break(label),
         QueryResult::Partial(vs, Control::Halt(code)) => {
@@ -16750,7 +16773,8 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
     if keys.is_empty() {
         // `partial`'s invariant (a non-empty prefix by construction) means
-        // this is only reachable with `pending_halt` unset.
+        // this is only reachable with `pending_halt`/`pending_key_stream_control`
+        // both unset.
         return QueryResult::None;
     }
 
@@ -17013,14 +17037,23 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
     }
 
-    match pending_halt {
+    match (pending_halt, pending_key_stream_control) {
         // Same #1897 fix the old code already applied here.
-        Some(code) => {
+        (Some(code), _) => {
             let (prefix, control) =
                 resolve_terminal_prefix(borrowed, owned, Vec::new(), Control::Halt(code));
             partial(prefix, control)
         }
-        None => match owned {
+        // #2326: the key stream's own escape, deferred until every
+        // already-produced key finished indexing cleanly -- an indexing
+        // failure on one of those keys outranks it (escapes earlier, via
+        // `escape_with_prefix!` inside the loop above), matching #2226's
+        // own documented priority for the symmetric target-side case.
+        (None, Some(control)) => {
+            let (prefix, control) = resolve_terminal_prefix(borrowed, owned, Vec::new(), control);
+            partial(prefix, control)
+        }
+        (None, None) => match owned {
             Some(vs) => owned_vec_to_result(vs),
             None => borrowed_vec_to_result(borrowed),
         },
@@ -53158,6 +53191,83 @@ mod tests {
         );
     }
 
+    /// #2326: the mirror-image gap on `key`'s own side of `E[K]` --
+    /// `key`'s own generator produces `1` before its own `error("x")`
+    /// escapes. Verified against jq 1.7.1: `echo '[10,20,30]' | jq -c
+    /// '.[(1,error("x"))]'` prints `20` then raises `x`.
+    #[test]
+    fn test_index_expr_key_own_partial_prefix_preserved_2326() {
+        query!(br"[10,20,30]", r#".[(1,error("x"))]"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::Int(20)]);
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    /// #2326 sibling: `break` instead of `error`, same key-generator shape.
+    /// No enclosing `label $out` in the filter itself, so the `Partial`+
+    /// `Break` this fix produces propagates uncaught to this query's own
+    /// top-level result, same as the sibling `error` case above and the
+    /// analogous #2226 target-side break test. Verified against jq 1.7.1:
+    /// `label $out | [10,20,30] | .[(1,break $out)]` prints `20`.
+    #[test]
+    fn test_index_expr_key_own_partial_prefix_preserved_on_break_2326() {
+        query!(br"[10,20,30]", r".[(1,break $out)]",
+            QueryResult::Partial(vs, Control::Break(label)) => {
+                assert_eq!(vs, vec![OwnedValue::Int(20)]);
+                assert_eq!(label, "out");
+            }
+        );
+    }
+
+    /// #2326: multiple keys succeed before the key generator errors -- the
+    /// whole successful prefix survives, not just the last one. Verified
+    /// against jq 1.7.1: `echo '[10,20,30,40]' | jq -c
+    /// '.[(0,1,error("x"))]'` prints `10` then `20` before raising.
+    #[test]
+    fn test_index_expr_key_own_partial_prefix_multiple_keys_2326() {
+        query!(br"[10,20,30,40]", r#".[(0,1,error("x"))]"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::Int(10), OwnedValue::Int(20)]);
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    /// #2326: an indexing failure on an already-produced key outranks the
+    /// key generator's own later escape -- mirrors #2226's identical
+    /// priority rule for the target side. The target (`"scalar"`) can't be
+    /// indexed by a number at all, so the first key (`0`) already fails to
+    /// index before the key generator's own second branch (`error("x")`)
+    /// is ever reached. Verified against jq 1.7.1: `echo '"scalar"' | jq -c
+    /// '.[(0,error("x"))]'` raises "Cannot index string with number", not
+    /// `x`.
+    #[test]
+    fn test_index_expr_key_own_partial_prefix_err_outranks_control_2326() {
+        query!(br#""scalar""#, r#".[(0,error("x"))]"#,
+            QueryResult::Error(e) => {
+                assert!(
+                    e.message.contains("Cannot index string with number"),
+                    "message: {}",
+                    e.message
+                );
+            }
+        );
+    }
+
+    /// #2326: yq mode keeps the pre-fix conservative discard -- confirmed
+    /// live against yq v4.53.3: `[10,20,30] | .[(1,error("x"))]` prints
+    /// only `Error: x`, no `20` prefix.
+    #[test]
+    fn test_index_expr_key_partial_prefix_still_discarded_in_yq_mode_2326() {
+        yq_query!(br"[10,20,30]", r#".[(1,error("x"))]"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
     #[test]
     fn test_yq_merge_flags() {
         // Unflagged array `*`/`*=` is yq-only: rhs replaces lhs wholesale,
@@ -54436,20 +54546,15 @@ mod tests {
             // exactly. See `partial_prefix_survives_the_stream_forwarding_
             // constructs` for its coverage.
             //
-            // `.[(1,error("x"))]` stays here: unlike the case above, the
-            // *key* stream `(1,error("x"))` is the multi-output generator
-            // here, not the target (`.` is a single value) — a distinct,
-            // still-open gap in the *keys*-evaluation `Partial` arm
-            // (conservatively documented in `eval_index_expr`'s own body as
-            // "not part of #400/#494's verified semantics"), out of #2226's
-            // scope (which is about `E`'s own prefix, not `K`'s) and tracked
-            // separately.
-            (
-                b"[10,20,30]",
-                r#".[(1,error("x"))]"#,
-                "x",
-                "jq 1.7.1 prints 20, then fails",
-            ),
+            // `.[(1,error("x"))]` *used* to be listed here too (the *key*
+            // stream `(1,error("x"))` is the multi-output generator, not
+            // the target), but #2326 fixed the *keys*-evaluation `Partial`
+            // arm to apply the per-key index to each already-produced key
+            // instead of discarding them -- the same fix #2226 applied to
+            // the target side above -- so it now agrees with jq 1.7.1
+            // exactly. See `partial_prefix_survives_the_stream_forwarding_
+            // constructs` for its coverage.
+            //
             // `map_values` keeps only each key's first output, so jq 1.7.1
             // never reaches the error at all and exits 0.
             (
@@ -54483,9 +54588,9 @@ mod tests {
             (b"null", "[1,(2,break $out),3]"),
             (b"[1,2]", "map((.,break $out))"),
             (br#"{"a":1}"#, "with_entries((.,break $out))"),
-            // `select`/`if`, string interpolation, target-generator index/
-            // slice: see the comment in `atomic` above.
-            (b"[10,20,30]", ".[(1,break $out)]"),
+            // `select`/`if`, string interpolation, target-generator and
+            // (since #2326) key-generator index/slice: see the comment in
+            // `atomic` above.
             (br#"{"a":1}"#, "map_values((.,break $out))"),
             (b"[1,2]", "map_values((.,break $out))"),
             (b"null", "reduce (1,2,break $out) as $v (0;.+$v)"),
@@ -54694,10 +54799,7 @@ mod tests {
         // the old comment already recorded as printing `7` and `8` then
         // failing); `eval_index_expr`'s *target* `Partial` arm now applies
         // the per-key index to each already-produced value instead of
-        // discarding them, so it now agrees with jq 1.7.1 exactly. (The
-        // sibling shape `.[(1,error("x"))]`, where the *key* stream is the
-        // generator instead, stays in `atomic` -- that's a distinct,
-        // still-open gap outside this issue's scope; see the comment there.)
+        // discarding them, so it now agrees with jq 1.7.1 exactly.
         query!(b"[[7],[8]]", r#"(.[0],(.[1],error("x")))[(0+0)]"#,
             QueryResult::Partial(vs, Control::Error(e)) => {
                 assert_eq!(prefix_json(&vs), ["7", "8"]);
@@ -54707,6 +54809,24 @@ mod tests {
         query!(b"[[7],[8]]", r"(.[0],(.[1],break $out))[(0+0)]",
             QueryResult::Partial(vs, Control::Break(label)) => {
                 assert_eq!(prefix_json(&vs), ["7", "8"]);
+                assert_eq!(label, "out");
+            }
+        );
+
+        // #2326 sibling: the mirror-image shape, where the *key* stream is
+        // the generator instead of the target. `eval_index_expr`'s
+        // keys-evaluation `Partial` arm now applies the same treatment on
+        // that side. Verified against jq 1.7.1: `[10,20,30] |
+        // .[(1,error("x"))]` prints `20` then fails.
+        query!(b"[10,20,30]", r#".[(1,error("x"))]"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["20"]);
+                assert_eq!(e.message, "x");
+            }
+        );
+        query!(b"[10,20,30]", r".[(1,break $out)]",
+            QueryResult::Partial(vs, Control::Break(label)) => {
+                assert_eq!(prefix_json(&vs), ["20"]);
                 assert_eq!(label, "out");
             }
         );
