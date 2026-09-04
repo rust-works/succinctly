@@ -33,7 +33,6 @@ seq_item_double_outdent_rejected  yaml_parser  a block sequence continuation tha
 
 path_ctx_root_key           root_edge      `key` at the document root prints `null`; real yq emits nothing at all — #2421
 path_ctx_root_parent        root_edge      `parent` at the document root prints `{}`; real yq emits nothing at all — #2421
-path_ctx_parent_above_root  root_edge      `[.a | parent | parent]` is `[{}]`; real yq stops at the root and yields `[]` — #2421
 path_ctx_object_key         object_arm     `[.a[] | {"k": key}]` is `[{"k":null},{"k":null}]`; the path-context evaluator has no Expr::Object arm, so the leaf loses its path — #1332
 path_ctx_recurse_path       descend_path   `[.. | path]` is all `[]`; recursive descent never threads the accumulated path into its outputs — #2416
 path_ctx_recurse_key        descend_path   `[.. | key]` is all `null`, same cause as path_ctx_recurse_path — #2416

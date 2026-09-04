@@ -12,6 +12,7 @@
 //! single shared definition, used by both runners, closes that off by
 //! construction rather than by convention.
 
+use succinctly::jq::eval_generic::path_context_pipe_streams_cursors;
 use succinctly::jq::{Builtin, Expr};
 
 /// Check if an expression can use the M2 streaming path.
@@ -43,8 +44,18 @@ pub fn can_use_m2_streaming(expr: &Expr) -> bool {
         Expr::Index { .. } => true,
         Expr::Iterate => true,
 
-        // Chained navigation
-        Expr::Pipe(exprs) => exprs.iter().all(can_use_m2_streaming),
+        // Chained navigation -- or a path-context pipe the cursor walk
+        // takes whole (#2416 phase 2): `.a.b | parent`, `[.[] | key]`'s
+        // inner pipe, `(.a, .b) | path`. Each output is then a live document
+        // cursor or a small `key`/`path` value, and streaming the cursor's
+        // own text is what keeps a float scalar's source spelling (#2419)
+        // and a mapping's duplicate keys/comments, where the DOM path's
+        // `to_owned()` re-spells the float as `1e+19`. A path-context pipe
+        // the walk declines, or takes only the head of, stays on the DOM
+        // path exactly as before.
+        Expr::Pipe(exprs) => {
+            path_context_pipe_streams_cursors(exprs) || exprs.iter().all(can_use_m2_streaming)
+        }
 
         // Optional variants
         Expr::Optional(inner) => can_use_m2_streaming(inner),
@@ -223,5 +234,24 @@ mod tests {
             ))),
             "Builtin::NthStream shares NthExpr's arm and must answer the same"
         );
+    }
+    /// #2416 phase 2: a path-context pipe the cursor walk takes whole streams
+    /// through M2 (its outputs are live cursors or small `key`/`path`
+    /// values), so a float scalar keeps its source spelling (#2419) instead
+    /// of the DOM path's `1e+19`. A pipe the walk declines, or only takes
+    /// the head of, stays on the DOM path; so does a bare `key`/`parent`
+    /// with no pipe, which never reaches the walk at all.
+    #[test]
+    fn test_path_context_pipes_stream_when_the_walk_takes_them_whole_2416() {
+        let parse = |f: &str| succinctly::jq::parse(f).expect("parses");
+        assert!(can_use_m2_streaming(&parse(".outer.big | parent")));
+        assert!(can_use_m2_streaming(&parse(".a | key")));
+        assert!(can_use_m2_streaming(&parse("(.a, .b) | path")));
+        assert!(can_use_m2_streaming(&parse(".a.b | parent(2)")));
+        assert!(!can_use_m2_streaming(&parse(".a | key | tostring")));
+        assert!(!can_use_m2_streaming(&parse("(.a | parent) | .x + 0")));
+        assert!(!can_use_m2_streaming(&parse("[.[] | key]")));
+        assert!(!can_use_m2_streaming(&parse("parent")));
+        assert!(!can_use_m2_streaming(&parse("key")));
     }
 }

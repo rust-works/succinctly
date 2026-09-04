@@ -1372,10 +1372,32 @@ fn test_parity_pipe_path_context_bypasses_reindex_bridge_1909() {
         (br#"{"a":{"b":3.5}}"#, ".a | parent"),
         (br#"{"a":{"b":1}}"#, ".a | parent"),
         (br#"{"a":10000000000000000000.0}"#, ".a | parent"),
-        (br"null", ". | key"),
     ] {
         assert_parity(json, filter);
     }
+}
+
+/// `key` at the document root: the two evaluators now *diverge*, and the
+/// generic one is the side that matches the reference.
+///
+/// Real yq prints nothing for `key` at the root (#2421, captured live from
+/// v4.53.3), and #2416 phase 2's cursor walk follows it, so the CLI route
+/// yields no output. `eval.rs`'s eager path-context evaluator still answers
+/// `null` -- its `Key` handler's comment says "(yq behavior)", which is
+/// false against the pinned binary -- and is #2421's remaining half until
+/// that function retires. Pinned in both directions so the migration that
+/// deletes the eager arm has to move this row into the parity table above,
+/// and nothing can quietly re-teach the walk to print `null`.
+#[test]
+fn test_parity_key_at_root_diverges_2421() {
+    let full = full_outputs(br"null", ". | key");
+    let generic = generic_outputs(br"null", ". | key");
+    assert_eq!(full, vec!["null".to_string()], "eval.rs moved: {full:?}");
+    assert!(
+        generic.is_empty(),
+        "eval_generic.rs moved for `. | key` at the root: {generic:?}"
+    );
+    assert_ne!(full, generic);
 }
 
 /// #1519: a `?//`-alternatives bind under a short-circuiting consumer re-runs
@@ -1640,20 +1662,23 @@ fn test_walk_vs_bridge_path_context_parity_2416() {
     }
 }
 
-/// The one place the two routes are *known* to be able to differ, pinned so
-/// #2416 phase 2 has to make a decision rather than discover one.
+/// Float-carrying documents through both routes.
 ///
-/// `try_path_context_cursor_walk` returns `None` — deferring to the bridge —
-/// whenever an emitted value fails `reindex_bridge_is_identity`, precisely so
-/// the walk cannot disagree with the bridge's `to_json_for_reindex`
-/// re-spelling of a bare float. That guard is why these assert *equal* today.
+/// Until #2416 phase 2, `try_path_context_cursor_walk` deferred to the bridge
+/// whenever an emitted value failed `reindex_bridge_is_identity`, so the walk
+/// could never disagree with the bridge's `to_json_for_reindex` re-spelling
+/// of a bare float. Phase 2 deleted that fallback: the walk emits the cursor
+/// itself, and the CLI streams a whole-walk pipe from the cursor's own text
+/// (`m2_gate.rs`), which is where the document's spelling now survives --
+/// `test_path_context_bypass_keeps_yq_float_fidelity_1909` in
+/// `tests/yq_cli_tests.rs` pins that. The re-spelling was the bridge's, not
+/// the reference's: yq v4.53.3 preserves the source spelling in every probed
+/// case (#2419).
 ///
-/// The re-spelling is the bridge's, not the reference's: captured 2026-09-04
-/// against the pinned binaries, yq v4.53.3 preserves the source spelling in
-/// every probed case (#2419). Once the eager evaluator is deleted the fallback
-/// has nothing to defer to, and the walk should emit the document's own
-/// spelling — at which point these cases start to differ and this test is the
-/// thing that says so.
+/// Here both routes are read back through `collect_owned`, which materializes
+/// a cursor with the same value-level conversion the bridge used, so the two
+/// still agree on these documents; the assertion is that phase 2 changed the
+/// *route*, not the value the library hands back.
 #[test]
 fn test_walk_vs_bridge_float_respelling_guard_2419() {
     for doc in [

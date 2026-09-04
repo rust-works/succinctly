@@ -28708,7 +28708,11 @@ fn test_path_context_cursor_walk_falls_back_2061() -> Result<()> {
         (".a | parent", r#"{"a":1}"#, r#"{"a":1}"#),
         // `parent(n)` past the root: the bridge answers with a synthetic
         // empty object that is not a document node.
-        (".a.b | parent(5)", r#"{"a":{"b":1}}"#, "{}"),
+        // Above the root: nothing. Real yq prints nothing for `parent` past
+        // the document root (#2421, captured live from v4.53.3); the eager
+        // evaluator's `{}` -- which this row used to pin, back when the
+        // walk handed the shape to it -- is #2421's remaining half.
+        (".a.b | parent(5)", r#"{"a":{"b":1}}"#, ""),
         // A computed `n` would have to materialize the current value to
         // evaluate it -- the very cost being removed.
         (".a.b | parent(1 - 1) | key", r#"{"a":{"b":1}}"#, r#""b""#),
