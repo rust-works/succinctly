@@ -1699,10 +1699,22 @@ impl<'a> Parser<'a> {
 
     /// Parse a limit expression.
     /// Syntax: limit(N; EXPR)
+    /// #2237: a wrong-arity call (no `(` at all, or a 3rd `;`-separated
+    /// argument) rewinds to `start_pos` and delegates to
+    /// [`Self::rewind_to_wrong_arity_call`], jq mode only -- see that
+    /// function's own doc comment.
     fn parse_limit_expr(&mut self) -> Result<Expr, ParseError> {
+        let start_pos = self.pos;
         self.consume_keyword("limit");
         self.skip_ws();
-        self.expect('(')?;
+        if self.peek() != Some('(') {
+            if self.mode == ParserMode::Jq {
+                return self.rewind_to_wrong_arity_call(start_pos);
+            }
+            self.expect('(')?;
+            unreachable!();
+        }
+        self.next();
         self.skip_ws();
         // `n` deliberately stays restricted to non-comma: real jq's `limit`
         // is defined with the `$n` parameter convention, where a
@@ -1711,11 +1723,31 @@ impl<'a> Parser<'a> {
         // parse but silently misbehave — worse than today's parse error.
         let n = self.parse_pipe_no_comma()?;
         self.skip_ws();
+        // #2237 review: only `)` here is unambiguously a missing-2nd-arg
+        // wrong-arity call -- rewinding on *any* non-`;` character (as an
+        // earlier version of this fix did) also caught a bare `,` right
+        // after `n`, silently defeating the comma restriction above by
+        // reparsing `limit(1,2; .)` through `parse_func_call_or_error`
+        // (whose own `parse_expr` call, unlike `parse_pipe_no_comma`, does
+        // accept commas) instead of raising this function's own intentional
+        // rejection. Anything else (`,` included) falls through to
+        // `expect(';')`, which raises its own natural error for that
+        // specific mismatch, exactly as before this fix.
+        if self.peek() == Some(')') && self.mode == ParserMode::Jq {
+            return self.rewind_to_wrong_arity_call(start_pos);
+        }
         self.expect(';')?;
         self.skip_ws();
         let expr = self.parse_expr()?;
         self.skip_ws();
-        self.expect(')')?;
+        if self.peek() != Some(')') {
+            if self.mode == ParserMode::Jq {
+                return self.rewind_to_wrong_arity_call(start_pos);
+            }
+            self.expect(')')?;
+            unreachable!();
+        }
+        self.next();
 
         Ok(Expr::Limit {
             n: Box::new(n),
@@ -1725,18 +1757,43 @@ impl<'a> Parser<'a> {
 
     /// Parse an until expression.
     /// Syntax: until(COND; UPDATE)
+    ///
+    /// #2237: a wrong-arity call rewinds jq-mode-only, same as
+    /// [`Self::parse_limit_expr`].
     fn parse_until_expr(&mut self) -> Result<Expr, ParseError> {
+        let start_pos = self.pos;
         self.consume_keyword("until");
         self.skip_ws();
-        self.expect('(')?;
+        if self.peek() != Some('(') {
+            if self.mode == ParserMode::Jq {
+                return self.rewind_to_wrong_arity_call(start_pos);
+            }
+            self.expect('(')?;
+            unreachable!();
+        }
+        self.next();
         self.skip_ws();
         let cond = self.parse_expr()?;
         self.skip_ws();
-        self.expect(';')?;
+        if self.peek() != Some(';') {
+            if self.mode == ParserMode::Jq {
+                return self.rewind_to_wrong_arity_call(start_pos);
+            }
+            self.expect(';')?;
+            unreachable!();
+        }
+        self.next();
         self.skip_ws();
         let update = self.parse_expr()?;
         self.skip_ws();
-        self.expect(')')?;
+        if self.peek() != Some(')') {
+            if self.mode == ParserMode::Jq {
+                return self.rewind_to_wrong_arity_call(start_pos);
+            }
+            self.expect(')')?;
+            unreachable!();
+        }
+        self.next();
 
         Ok(Expr::Until {
             cond: Box::new(cond),
@@ -1746,18 +1803,43 @@ impl<'a> Parser<'a> {
 
     /// Parse a while expression.
     /// Syntax: while(COND; UPDATE)
+    ///
+    /// #2237: a wrong-arity call rewinds jq-mode-only, same as
+    /// [`Self::parse_limit_expr`].
     fn parse_while_expr(&mut self) -> Result<Expr, ParseError> {
+        let start_pos = self.pos;
         self.consume_keyword("while");
         self.skip_ws();
-        self.expect('(')?;
+        if self.peek() != Some('(') {
+            if self.mode == ParserMode::Jq {
+                return self.rewind_to_wrong_arity_call(start_pos);
+            }
+            self.expect('(')?;
+            unreachable!();
+        }
+        self.next();
         self.skip_ws();
         let cond = self.parse_expr()?;
         self.skip_ws();
-        self.expect(';')?;
+        if self.peek() != Some(';') {
+            if self.mode == ParserMode::Jq {
+                return self.rewind_to_wrong_arity_call(start_pos);
+            }
+            self.expect(';')?;
+            unreachable!();
+        }
+        self.next();
         self.skip_ws();
         let update = self.parse_expr()?;
         self.skip_ws();
-        self.expect(')')?;
+        if self.peek() != Some(')') {
+            if self.mode == ParserMode::Jq {
+                return self.rewind_to_wrong_arity_call(start_pos);
+            }
+            self.expect(')')?;
+            unreachable!();
+        }
+        self.next();
 
         Ok(Expr::While {
             cond: Box::new(cond),
@@ -1767,21 +1849,45 @@ impl<'a> Parser<'a> {
 
     /// Parse a repeat expression.
     /// Syntax: repeat(EXPR)
+    ///
+    /// #2237: a wrong-arity call rewinds jq-mode-only, same as
+    /// [`Self::parse_limit_expr`].
     fn parse_repeat_expr(&mut self) -> Result<Expr, ParseError> {
+        let start_pos = self.pos;
         self.consume_keyword("repeat");
         self.skip_ws();
-        self.expect('(')?;
+        if self.peek() != Some('(') {
+            if self.mode == ParserMode::Jq {
+                return self.rewind_to_wrong_arity_call(start_pos);
+            }
+            self.expect('(')?;
+            unreachable!();
+        }
+        self.next();
         self.skip_ws();
         let expr = self.parse_expr()?;
         self.skip_ws();
-        self.expect(')')?;
+        if self.peek() != Some(')') {
+            if self.mode == ParserMode::Jq {
+                return self.rewind_to_wrong_arity_call(start_pos);
+            }
+            self.expect(')')?;
+            unreachable!();
+        }
+        self.next();
 
         Ok(Expr::Repeat(Box::new(expr)))
     }
 
     /// Parse a first expression.
     /// Syntax: first or first(expr)
+    ///
+    /// #2237: bare `first` (0 args) is already valid syntax
+    /// (`Builtin::First`), so the only wrong-arity shape here is a 2nd
+    /// `;`-separated argument (`first(1;2)`), which rewinds jq-mode-only,
+    /// same as [`Self::parse_limit_expr`].
     fn parse_first_expr(&mut self) -> Result<Expr, ParseError> {
+        let start_pos = self.pos;
         self.consume_keyword("first");
         self.skip_ws();
         if self.peek() == Some('(') {
@@ -1789,7 +1895,14 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let expr = self.parse_expr()?;
             self.skip_ws();
-            self.expect(')')?;
+            if self.peek() != Some(')') {
+                if self.mode == ParserMode::Jq {
+                    return self.rewind_to_wrong_arity_call(start_pos);
+                }
+                self.expect(')')?;
+                unreachable!();
+            }
+            self.next();
             Ok(Expr::FirstExpr(Box::new(expr)))
         } else {
             Ok(Expr::Builtin(Builtin::First))
@@ -1798,7 +1911,10 @@ impl<'a> Parser<'a> {
 
     /// Parse a last expression.
     /// Syntax: last or last(expr)
+    ///
+    /// #2237: same shape and fix as [`Self::parse_first_expr`].
     fn parse_last_expr(&mut self) -> Result<Expr, ParseError> {
+        let start_pos = self.pos;
         self.consume_keyword("last");
         self.skip_ws();
         if self.peek() == Some('(') {
@@ -1806,7 +1922,14 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let expr = self.parse_expr()?;
             self.skip_ws();
-            self.expect(')')?;
+            if self.peek() != Some(')') {
+                if self.mode == ParserMode::Jq {
+                    return self.rewind_to_wrong_arity_call(start_pos);
+                }
+                self.expect(')')?;
+                unreachable!();
+            }
+            self.next();
             Ok(Expr::LastExpr(Box::new(expr)))
         } else {
             Ok(Expr::Builtin(Builtin::Last))
@@ -1815,10 +1938,25 @@ impl<'a> Parser<'a> {
 
     /// Parse a range expression.
     /// Syntax: range(N) or range(A; B) or range(A; B; STEP)
+    ///
+    /// A wrong-arity call -- bare `range` (no `(` at all), or a 4th
+    /// `;`-separated argument -- rewinds to `start_pos` (jq mode only, same
+    /// carve-out as [`Self::zero_arity_or_wrong_arity_call`]/
+    /// [`Self::parse_required_single_arg`]) and delegates to
+    /// [`Self::parse_func_call_or_error`] so #1473/#2037's resolver reports
+    /// "range/N is not defined" instead of a raw parser rejection (#2237).
     fn parse_range_expr(&mut self) -> Result<Expr, ParseError> {
+        let start_pos = self.pos;
         self.consume_keyword("range");
         self.skip_ws();
-        self.expect('(')?;
+        if self.peek() != Some('(') {
+            if self.mode == ParserMode::Jq {
+                return self.rewind_to_wrong_arity_call(start_pos);
+            }
+            self.expect('(')?;
+            unreachable!();
+        }
+        self.next();
         self.skip_ws();
         let first = self.parse_expr()?;
         self.skip_ws();
@@ -1852,7 +1990,14 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         let step = self.parse_expr()?;
         self.skip_ws();
-        self.expect(')')?;
+        if self.peek() != Some(')') {
+            if self.mode == ParserMode::Jq {
+                return self.rewind_to_wrong_arity_call(start_pos);
+            }
+            self.expect(')')?;
+            unreachable!();
+        }
+        self.next();
 
         Ok(Expr::Range {
             from: Box::new(first),
@@ -2218,6 +2363,24 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The `Expr`-returning counterpart of
+    /// [`Self::zero_arity_or_wrong_arity_call`]/
+    /// [`Self::parse_required_single_arg`]'s shared "detected wrong arity,
+    /// rewind and delegate" tail, for the dedicated-parse-function family
+    /// (`parse_range_expr`, `parse_first_expr`, `parse_limit_expr`, ...)
+    /// that returns `Expr` directly rather than going through
+    /// [`Self::try_parse_builtin`]'s `Option<Builtin>` fallback protocol
+    /// (#2237). `start_pos` must be the position *before* the keyword was
+    /// consumed. Call only in jq mode -- a non-jq-mode call site keeps
+    /// raising its own original raw `ParseError` unchanged, matching every
+    /// other rewind site's identical carve-out (real yq has no name/arity
+    /// resolution vocabulary at all, so jq's own "X/N is not defined"
+    /// wording would be a new divergence there, not a fix).
+    fn rewind_to_wrong_arity_call(&mut self, start_pos: usize) -> Result<Expr, ParseError> {
+        self.pos = start_pos;
+        self.parse_func_call_or_error()
+    }
+
     /// Parse a format string: @text, @json, @uri, @dsv(delimiter), etc.
     fn parse_format_string(&mut self) -> Result<Expr, ParseError> {
         self.expect('@')?;
@@ -2367,6 +2530,61 @@ impl<'a> Parser<'a> {
         self.parse_postfix(parsed)
     }
 
+    /// The single-required-argument counterpart of
+    /// [`Self::zero_arity_or_wrong_arity_call`] (#2237): a builtin like
+    /// `has(expr)`/`select(expr)` that always requires exactly one
+    /// parenthesized argument currently parses that argument inline (`expect
+    /// ('(')` / `parse_expr` / `expect(')')`, each propagated via `?`), so a
+    /// wrong-arity call -- no `(` at all (`has`), or more than one
+    /// `;`-separated argument (`has(1;2)`) -- raises the raw structural
+    /// ParseError immediately, never reaching #1473/#2037's name/arity
+    /// resolver the way #2110 already routes a *zero*-arity builtin's own
+    /// wrong-arity call.
+    ///
+    /// On the correct shape, returns `Ok(Some(expr))`. On either wrong-arity
+    /// shape, **in jq mode**, rewinds to `start_pos` (the position before
+    /// the keyword was consumed) and returns `Ok(None)` -- deliberately
+    /// reusing [`Self::try_parse_builtin`]'s own "not this builtin after
+    /// all" contract, so the caller's existing `else { self
+    /// .parse_func_call_or_error() }` fallback (already present at every
+    /// call site through [`Self::parse_primary_inner`]) does the delegation,
+    /// with no `Builtin`-vs-`Expr` type mismatch to bridge. A genuine syntax
+    /// error *inside* the argument expression itself (`has(1 +)`) still
+    /// propagates as a raw ParseError unchanged -- only the two structural
+    /// checkpoints below ever trigger a rewind, mirroring
+    /// [`Self::zero_arity_or_wrong_arity_call`]'s own peek-based precision
+    /// rather than a blanket catch-and-retry.
+    ///
+    /// yq mode never rewinds, matching that function's identical carve-out:
+    /// real yq has no name/arity resolution vocabulary at all, so jq's own
+    /// "X/N is not defined" wording would be a new divergence there, not a
+    /// fix -- yq mode keeps the pre-#2237 raw ParseError unchanged.
+    fn parse_required_single_arg(&mut self, start_pos: usize) -> Result<Option<Expr>, ParseError> {
+        self.skip_ws();
+        if self.peek() != Some('(') {
+            if self.mode == ParserMode::Jq {
+                self.pos = start_pos;
+                return Ok(None);
+            }
+            // Not a rewind case (yq mode) -- `expect` raises the identical
+            // error the pre-#2237 unconditional `self.expect('(')?` did.
+            return self.expect('(').map(|()| unreachable!());
+        }
+        self.next();
+        self.skip_ws();
+        let arg = self.parse_expr()?;
+        self.skip_ws();
+        if self.peek() != Some(')') {
+            if self.mode == ParserMode::Jq {
+                self.pos = start_pos;
+                return Ok(None);
+            }
+            return self.expect(')').map(|()| unreachable!());
+        }
+        self.next();
+        Ok(Some(arg))
+    }
+
     /// Try to parse a builtin function.
     /// Returns Some(Builtin) if a builtin was parsed, None if not a builtin.
     fn try_parse_builtin(&mut self) -> Result<Option<Builtin>, ParseError> {
@@ -2475,26 +2693,20 @@ impl<'a> Parser<'a> {
 
         // has(expr) - takes an argument
         if self.matches_keyword("has") {
+            let keyword_start = self.pos;
             self.consume_keyword("has");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let arg = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::Has(Box::new(arg))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|arg| Builtin::Has(Box::new(arg))));
         }
 
         // Selection functions
         if self.matches_keyword("select") {
+            let keyword_start = self.pos;
             self.consume_keyword("select");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let cond = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::Select(Box::new(cond))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|cond| Builtin::Select(Box::new(cond))));
         }
         if self.matches_keyword("empty") {
             self.consume_keyword("empty");
@@ -2603,14 +2815,11 @@ impl<'a> Parser<'a> {
         if self.matches_keyword("min_by") {
             // Check min_by before min
             self.reject_unless_jq_extensions("min_by")?;
+            let keyword_start = self.pos;
             self.consume_keyword("min_by");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let f = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::MinBy(Box::new(f))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|f| Builtin::MinBy(Box::new(f))));
         }
         if self.matches_keyword("min") && !self.peek_after_keyword_is_paren("min") {
             self.consume_keyword("min");
@@ -2619,14 +2828,11 @@ impl<'a> Parser<'a> {
         if self.matches_keyword("max_by") {
             // Check max_by before max
             self.reject_unless_jq_extensions("max_by")?;
+            let keyword_start = self.pos;
             self.consume_keyword("max_by");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let f = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::MaxBy(Box::new(f))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|f| Builtin::MaxBy(Box::new(f))));
         }
         if self.matches_keyword("max") && !self.peek_after_keyword_is_paren("max") {
             self.consume_keyword("max");
@@ -2636,14 +2842,11 @@ impl<'a> Parser<'a> {
         // in(obj) - takes an argument (note: "in" is also sometimes used differently in jq)
         // We parse it with required parentheses
         if self.matches_keyword("in") {
+            let keyword_start = self.pos;
             self.consume_keyword("in");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let obj = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::In(Box::new(obj))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|obj| Builtin::In(Box::new(obj))));
         }
 
         // IN(s) - true if any output of s equals the current value
@@ -2679,47 +2882,35 @@ impl<'a> Parser<'a> {
         }
         if self.matches_keyword("ltrimstr") {
             self.reject_unless_jq_extensions("ltrimstr")?;
+            let keyword_start = self.pos;
             self.consume_keyword("ltrimstr");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let s = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::Ltrimstr(Box::new(s))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|s| Builtin::Ltrimstr(Box::new(s))));
         }
         if self.matches_keyword("rtrimstr") {
             self.reject_unless_jq_extensions("rtrimstr")?;
+            let keyword_start = self.pos;
             self.consume_keyword("rtrimstr");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let s = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::Rtrimstr(Box::new(s))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|s| Builtin::Rtrimstr(Box::new(s))));
         }
         if self.matches_keyword("startswith") {
             self.reject_unless_jq_extensions("startswith")?;
+            let keyword_start = self.pos;
             self.consume_keyword("startswith");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let s = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::Startswith(Box::new(s))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|s| Builtin::Startswith(Box::new(s))));
         }
         if self.matches_keyword("endswith") {
             self.reject_unless_jq_extensions("endswith")?;
+            let keyword_start = self.pos;
             self.consume_keyword("endswith");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let s = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::Endswith(Box::new(s))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|s| Builtin::Endswith(Box::new(s))));
         }
         // Check splits before split since split is a prefix of splits
         if self.matches_keyword("splits") {
@@ -2969,14 +3160,11 @@ impl<'a> Parser<'a> {
         }
         // Check sort_by before sort
         if self.matches_keyword("sort_by") {
+            let keyword_start = self.pos;
             self.consume_keyword("sort_by");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let f = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::SortBy(Box::new(f))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|f| Builtin::SortBy(Box::new(f))));
         }
         if self.matches_keyword("sort") {
             self.consume_keyword("sort");
@@ -3503,16 +3691,43 @@ impl<'a> Parser<'a> {
         // env(VAR) - get specific environment variable (yq syntax)
         // env.VAR or env (as builtin)
         if self.matches_keyword("env") {
+            let keyword_start = self.pos;
             self.consume_keyword("env");
             self.skip_ws();
             // Check for env(VAR) syntax - yq style
             if self.peek() == Some('(') {
                 self.next(); // consume '('
                 self.skip_ws();
-                // Parse identifier (unquoted variable name)
-                let var_name = self.parse_ident()?;
+                // Parse identifier (unquoted variable name). Real jq's own
+                // `env` builtin is arity-0 only, so `env(<anything>)` --
+                // this repo's own `env(VAR)` extension syntax given a
+                // non-identifier argument, or more than one argument -- is
+                // always "env/N is not defined" there, not a raw parse
+                // error (#2237). jq mode rewinds to let #1473/#2037's
+                // resolver report that, mirroring
+                // `Self::parse_required_single_arg`'s identical strategy;
+                // yq mode keeps the original raw error unchanged (same
+                // rationale as `Self::zero_arity_or_wrong_arity_call`'s own
+                // carve-out).
+                let var_name = match self.parse_ident() {
+                    Ok(name) => name,
+                    Err(e) => {
+                        if self.mode == ParserMode::Jq {
+                            self.pos = keyword_start;
+                            return Ok(None);
+                        }
+                        return Err(e);
+                    }
+                };
                 self.skip_ws();
-                self.expect(')')?;
+                if self.peek() != Some(')') {
+                    if self.mode == ParserMode::Jq {
+                        self.pos = keyword_start;
+                        return Ok(None);
+                    }
+                    return self.expect(')').map(|()| unreachable!());
+                }
+                self.next();
                 return Ok(Some(Builtin::EnvObject(var_name)));
             }
             return Ok(Some(Builtin::Env));

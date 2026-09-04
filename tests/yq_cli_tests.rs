@@ -1455,6 +1455,33 @@ fn test_yq_mode_zero_arity_wrong_arity_call_unaffected_by_2110() -> Result<()> {
     Ok(())
 }
 
+/// #2237's jq-mode fix (a builtin that always requires at least one
+/// argument, called with the wrong arity, reports jq's own "X/N is not
+/// defined" instead of a raw parser rejection) must not leak into yq mode
+/// either -- same rationale as #2110's own identical carve-out immediately
+/// above. `has`/`has(1;2)` (not `range`, which is gated behind
+/// `--jq-extensions` and gives an unrelated "not part of yq's syntax"
+/// message without it) pinned here against succinctly's own wording.
+#[test]
+fn test_yq_mode_single_arg_builtin_wrong_arity_unaffected_by_2237() -> Result<()> {
+    let (out, stderr, code) = run_yq_stdin_with_stderr("has", "a: 1\n", &[])?;
+    assert_eq!(out, "", "stderr: {stderr}");
+    assert!(
+        stderr.contains("parse error: parse error at position 3: expected '(', found end of input"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(code, 1, "stderr: {stderr}");
+
+    let (out, stderr, code) = run_yq_stdin_with_stderr("has(1;2)", "a: 1\n", &[])?;
+    assert_eq!(out, "", "stderr: {stderr}");
+    assert!(
+        stderr.contains("parse error: parse error at position 5: expected ')', found ';'"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(code, 1, "stderr: {stderr}");
+    Ok(())
+}
+
 /// #2225 (review): the read-mode fix reaches yq mode too, not just jq mode
 /// -- `stderr` fires twice, once per start value, confirming `end` is
 /// re-evaluated fresh per `s` through `eval_generic::eval_slice_expr`
