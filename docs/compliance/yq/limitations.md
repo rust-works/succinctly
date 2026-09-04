@@ -2161,6 +2161,29 @@ would be wrong (not just incomplete) or risks a worse regression:
   null, null, []]`). Tracked as
   [#2376](https://github.com/rust-works/succinctly/issues/2376).
 
+### A computed comma-bound slice's own prefix is never streamed in yq mode
+
+`.[(K1,K2,...):E]`/`.[S:(K1,K2,...)]` — a slice bound written as a parenthesized comma
+generator, computed rather than a single literal or expression — streams each
+already-produced bound's own slice result before a later bound's error/break/halt/type
+failure in jq mode (jq's own `S as $s | T as $t | E | .[$s:$t]` desugaring), confirmed
+against jq 1.7.1: `path(.[(0,1,"x"):(2,3)])` on `[10,20,30]` prints all four
+`{start,end}` combinations of the two valid `start` values before raising on `"x"`.
+
+yq mode conservatively discards this prefix at every one of the three sites that
+resolve a computed bound (`eval_slice_bound`, `eval_slice_bound_with_path_context`,
+`resolve_slice_bound` — the read, path-context-read, and `=`/`|=`/`del()`/`path()`
+write-path resolvers respectively, #2372/#2385) instead of streaming it — real yq has
+no clean model for a computed comma-bound at all, confirmed live against yq v4.53.3:
+`.[(0,"x"):3]` on `[10,20,30]` rejects the bound outright ("expected to find 1 number,
+got 2 instead"), not the type-error message succinctly's own comma-bound generator
+model produces. Since real yq's own behavior for this input shape is "reject the query
+before evaluation," not "stream then error," there is no oracle output to match by
+streaming a prefix here — the conservative discard is the closer approximation of "no
+usable output" a real yq user would see, even though the specific error message
+differs (succinctly raises succinctly's own generator-model error; real yq raises its
+own parse-time rejection).
+
 ### Other categories
 
 Float and number formatting ([#1071](https://github.com/rust-works/succinctly/issues/1071),
