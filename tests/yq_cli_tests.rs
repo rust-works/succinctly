@@ -30469,15 +30469,21 @@ fn test_jq_del_iterate_non_container_still_raises_2346() -> Result<()> {
 }
 
 /// #2346's jq-mode control for `delete_path_steps`'s own *mid-chain*
-/// `Expr::Iterate` arm specifically (`del(.a[])`, not the terminal
-/// `del(.[])` above, which instead reaches `delete_at_path`) -- this fix's
-/// own new yq-mode no-op arm sits ahead of that function's final `_ =>
-/// Err(...)` catch-all, so a jq-mode-only repro is needed to keep the
-/// catch-all itself covered (it's otherwise unreachable in yq mode now,
-/// #2346's review round found this exact line lost coverage without it).
+/// `Expr::Iterate` arm specifically. `del(.a[])` alone -- a trailing
+/// iterate with nothing after it -- turns out to still resolve through
+/// `delete_at_path` (the `[last] => delete_at_path(...)` case one loop
+/// iteration up), same as the terminal `del(.[])` control above; only a
+/// *genuinely* mid-chain shape like `del(.a[].b)` (iterate followed by
+/// more path) ever reaches this function's own inline `Expr::Iterate`
+/// match arm at all (confirmed via a temporary debug probe: `del(.a[])`
+/// never printed it, `del(.a[].b)` did). This fix's own new yq-mode no-op
+/// arm sits ahead of that arm's final `_ => Err(...)` catch-all, so a
+/// jq-mode-only repro is needed to keep the catch-all itself covered (it's
+/// otherwise unreachable in yq mode now, #2346's review round found this
+/// exact line lost coverage without it).
 #[test]
 fn test_jq_del_iterate_mid_chain_non_container_still_raises_2346() -> Result<()> {
-    let (out, stderr, code) = run_jq_stdin_with_stderr("del(.a[])", r#"{"a":5}"#, &["-c"])?;
+    let (out, stderr, code) = run_jq_stdin_with_stderr("del(.a[].b)", r#"{"a":5}"#, &["-c"])?;
     assert_ne!(code, 0, "out: {out:?}");
     assert!(stderr.contains("Cannot iterate over number"), "{stderr}");
     Ok(())
@@ -30501,5 +30507,31 @@ fn test_yq_iterate_path_context_non_container_is_noop_2346() -> Result<()> {
     )?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out, "");
+    Ok(())
+}
+
+/// #2346, `path_step_generic`: a distinct third `Expr::Iterate` site from
+/// the two above, backing `path(expr)`'s own cursor-native path-computation
+/// walk. `path` is a jq-only builtin succinctly does not gate behind
+/// `--jq-extensions` in yq mode (a separate, pre-existing gap, unrelated to
+/// this fix) -- reachable here without any extension flag.
+#[test]
+fn test_yq_path_step_generic_non_container_is_noop_2346() -> Result<()> {
+    let (out, code) = run_yq_stdin("[path(.a[])]", "a: 5\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[]");
+    Ok(())
+}
+
+/// #2346, `path_step_generic`'s decode-failure priority: an undecodable
+/// string scalar reaching this arm must still raise its own decode
+/// failure, never suppressed by the yq-mode no-op just added above --
+/// same `\q` invalid-escape repro `test_decode_failure_not_suppressed_by_
+/// optional_1620` uses elsewhere in this file.
+#[test]
+fn test_yq_path_step_generic_decode_failure_not_suppressed_2346() -> Result<()> {
+    let (out, stderr, code) = run_yq_stdin_with_stderr("[path(.a[])]", "a: \"x\\qy\"\n", &[])?;
+    assert_ne!(code, 0, "out: {out:?}");
+    assert!(stderr.contains("invalid escape sequence"), "{stderr}");
     Ok(())
 }
