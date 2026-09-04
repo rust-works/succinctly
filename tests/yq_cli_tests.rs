@@ -21545,11 +21545,17 @@ fn test_1219_comma_grouped_noop_sibling_leaves_other_siblings_untouched() -> Res
 /// `Noop`-classified branch was left completely unrewritten, so
 /// `resolve_dynamic_indexes` still tried to navigate `.a[1:3]` against the
 /// `Object` `.a` and hard-errored ("Cannot index object with object")
-/// instead of leaving `.a` untouched and deleting only `.c`. Every `Noop`
-/// classification is decided purely from the path's own shape (never
-/// touches the document), so it's always safe to drop a `Noop` branch from
-/// the comma group before navigation ever sees it — fixed by doing exactly
-/// that. Live-verified against yq v4.53.3.
+/// instead of leaving `.a` untouched and deleting only `.c`. An `Object`
+/// target always classifies `Noop` here, so it's always safe to drop this
+/// branch from the comma group before navigation ever sees it — fixed by
+/// doing exactly that. Live-verified against yq v4.53.3.
+///
+/// (#2333 revises this comment's own claim that every `Noop` classification
+/// never touches the document: an `Array`/`Null` target with a trailing
+/// `Field` step is no longer `Noop` at all, it's `Error` — see
+/// `test_2333_del_slice_array_field_tail_errors` below. `Object` is
+/// unaffected by that fix and still classifies `Noop` exactly as this test
+/// pins.)
 #[test]
 fn test_1219_comma_grouped_noop_sibling_object_target_no_longer_crashes() -> Result<()> {
     let (out, code) = run_yq_stdin(
@@ -21777,6 +21783,153 @@ fn test_1219_interior_slice_separated_by_iterate_is_noop() -> Result<()> {
         out.trim(),
         r#"{"a":[{"b":[1,2,3,4]},{"b":[10,20,30,40]},{"b":[100,200]}]}"#
     );
+    Ok(())
+}
+
+/// #2333: #1219's "trailing slice-run followed by more path" rule
+/// classified *every* such shape as an inert no-op, uniformly, regardless
+/// of what the slice actually targets. Real yq's own del() walker doesn't
+/// special-case slices the way this rule does — it navigates the resolved
+/// path against real document data, and its generic indexing can't tell an
+/// object-field key from an array-index key apart (both are spelled
+/// `.key`): once the current node is a sequence, it always tries to parse
+/// the key as an integer, which fails for a genuine field name and raises.
+/// A bare `null` root gets the identical treatment, live-verified:
+/// `.[0:2]` on `null` reads (and therefore errors) exactly like `.[0:2]`
+/// on an array does, for this one purpose.
+#[test]
+fn test_2333_del_slice_array_field_tail_errors() -> Result<()> {
+    let (out, stderr, code) =
+        run_yq_stdin_with_stderr("del(.a[0:2].x)", r#"{"a":[1,2,3]}"#, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 1, "out: {out:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("array") && stderr.contains('x'),
+        "stderr: {stderr:?}"
+    );
+
+    let (out, stderr, code) = run_yq_stdin_with_stderr("del(.[0:2].a)", "null", &["-o=json"])?;
+    assert_eq!(code, 1, "out: {out:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("array") && stderr.contains('a'),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #2333: the error propagates even when the array-targeting field access
+/// isn't the step immediately after the slice — `.a[0:2][0].x` slices,
+/// indexes into the (real) sliced array, and *that* element turns out to
+/// be another array, so the trailing `.x` still hits "cannot index array".
+/// Confirms the check walks real document data at arbitrary depth past the
+/// slice, not just the one step directly following it.
+#[test]
+fn test_2333_del_slice_index_then_field_errors_when_element_is_array() -> Result<()> {
+    let (_out, stderr, code) = run_yq_stdin_with_stderr(
+        "del(.a[0:2][0].x)",
+        r#"{"a":[[1,2],[3,4]]}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 1, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("array") && stderr.contains('x'),
+        "{stderr:?}"
+    );
+    Ok(())
+}
+
+/// #2333: the same `.a[0:2][0].x` shape stays a no-op (per #1219, unchanged)
+/// once the indexed element is *not* an array — a scalar (already pinned by
+/// `test_1219_chained_slice_then_field_is_noop` above, restated here next to
+/// its #2333 sibling) or an object, neither of which trips the new
+/// array-specific check. The object case additionally confirms `.x` is
+/// never actually deleted even though field-indexing an object would
+/// ordinarily be meaningful — real yq's own no-op here is total, not a
+/// partial/successful delete, live-verified.
+#[test]
+fn test_2333_del_slice_index_then_field_stays_noop_for_non_array_element() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[0:2][0].x)",
+        r#"{"a":[1,2,3]}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":[1,2,3]}"#);
+
+    let (out, code) = run_yq_stdin(
+        "del(.a[0:2][0].x)",
+        r#"{"a":[{"x":1,"y":2},{"z":3}]}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":[{"x":1,"y":2},{"z":3}]}"#);
+    Ok(())
+}
+
+/// #2333: `null`'s array-shaped treatment is a quirk of being the *direct*
+/// slice target only — real yq's null-as-array slice has no actual
+/// elements behind it, so navigating one step further (`Index`) before the
+/// trailing `Field` falls through to the ordinary no-op instead of the new
+/// error, unlike a real `Array` target (which keeps erroring at any depth,
+/// per the previous two tests). Live-verified this is a genuine divergence
+/// in kind, not just missing coverage.
+#[test]
+fn test_2333_del_slice_null_only_errors_for_direct_field_tail() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(.[0:2][0].a)", "null", &["-o=json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "null");
+    Ok(())
+}
+
+/// #2333: an `Index` tail (no `Field` anywhere after the slice) stays a
+/// no-op regardless of target type — #1219's own established rule for this
+/// shape (`test_1219_chained_slice_then_index_is_noop`) is untouched, this
+/// just re-confirms it holds for the array-tail-is-array-itself case the
+/// new check's own walker also has to pass through without misfiring.
+#[test]
+fn test_2333_del_slice_index_only_tail_stays_noop() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(.a[0:2][0])", r#"{"a":[1,2,3]}"#, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":[1,2,3]}"#);
+    Ok(())
+}
+
+/// #2333: a comma-grouped sibling gets the *same* error treatment as a
+/// single-path `del()`, but propagated differently from #1219's own
+/// `Noop`-sibling rule — real yq fails the *whole* call here, not just the
+/// erroring branch (unlike a `Noop` sibling, which leaves the rest of the
+/// comma group to proceed normally, per the `test_1219_comma_grouped_*`
+/// tests above). Live-verified: `.c` is not deleted either.
+#[test]
+fn test_2333_del_slice_comma_grouped_array_field_tail_fails_whole_call() -> Result<()> {
+    let (out, stderr, code) = run_yq_stdin_with_stderr(
+        "del(.a[0:2].x, .c)",
+        r#"{"a":[1,2,3],"c":9}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 1, "out: {out:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("array") && stderr.contains('x'),
+        "{stderr:?}"
+    );
+    Ok(())
+}
+
+/// #2333: jq mode has no #1116/#1162/#1219 chained-slice rule at all (see
+/// `test_1219_jq_mode_unaffected`'s own sibling note), so it never had the
+/// #1219 no-op bug in the first place -- real jq 1.7.1 already raises
+/// "Cannot index array with string \"x\"" for this exact shape, unrelated
+/// to any yq-specific fix. Confirms this codebase's own jq mode already
+/// matches (unaffected by #2333's yq-only changes, all gated on
+/// `S::TAG == EvalTag::Yq`) and doesn't regress into a no-op or a crash.
+#[test]
+fn test_2333_jq_mode_unaffected() -> Result<()> {
+    let (_out, stderr, code) = run_jq_stdin_with_stderr(
+        "del(.a[0:2].x)",
+        r#"{"a":[{"x":1},{"x":2},{"x":3}]}"#,
+        &["-c"],
+    )?;
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    assert!(stderr.contains("Cannot index array"), "{stderr:?}");
     Ok(())
 }
 

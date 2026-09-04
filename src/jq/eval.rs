@@ -17833,6 +17833,10 @@ enum YqDelSliceOutcome {
     Noop,
     /// This rule doesn't apply at all -- walk `path_expr` normally.
     NotApplicable,
+    /// #2333: what used to be classified `Noop` uniformly is, for this
+    /// specific resolved path, actually a hard type error in real yq -- see
+    /// [`yq_del_slice_field_error`]'s own doc comment.
+    Error(EvalError),
 }
 
 /// Classifies a resolved `del()` path against real yq's chained-slice rules
@@ -17913,7 +17917,15 @@ fn yq_del_slice_outcome(
     }
     if cut == steps.len() {
         // Last component isn't a slice at all -- the whole call/path
-        // no-ops, regardless of what's earlier in the path.
+        // no-ops, regardless of what's earlier in the path... except when
+        // real yq's own generic navigation would hit a hard type error
+        // along the way (#2333): a `Field` step landing on whatever the
+        // trailing slice(s) produced (or, for `null`'s own direct-target
+        // quirk, on `null` itself) isn't inert there, it raises. See
+        // `yq_del_slice_field_error`'s own doc comment.
+        if let Some(e) = yq_del_slice_field_error(&steps, root) {
+            return YqDelSliceOutcome::Error(e);
+        }
         return YqDelSliceOutcome::Noop;
     }
     let prefix = &steps[..cut];
@@ -17957,6 +17969,96 @@ fn yq_del_slice_outcome(
     })
 }
 
+/// Whether `yq_del_slice_outcome`'s "trailing slice-run followed by more
+/// path" shape (`del(.a[0:2].x)`, `del(.a[0:2][0].x)`, ...) is actually a
+/// hard type error in real yq, not simply inert -- #2333, found live:
+///
+/// ```console
+/// $ echo 'null' | yq -o=json 'del(.[0:2].a)'
+/// Error: cannot index array with 'a' (strconv.ParseInt: parsing "a": invalid syntax)
+/// $ echo '{"a":[1,2,3]}' | yq -o=json 'del(.a[0:2].x)'
+/// Error: cannot index array with 'x' (strconv.ParseInt: parsing "x": invalid syntax)
+/// ```
+///
+/// Real yq's own del() walker doesn't classify a chained slice-run the way
+/// this codebase's #1219 rule does -- it navigates the resolved path
+/// against real document data using its ordinary, non-del-specific
+/// indexing, and that indexing can't tell an object-field key from an
+/// array-index key syntactically (both are spelled `.key`): once the
+/// current node is a sequence (array), it always tries to parse the key as
+/// an integer, which fails for a genuine field name and raises. #1219's own
+/// "no-op" classification is correct for *most* of this shape (confirmed
+/// live for a scalar/string slice result, and for an `Index` tail that
+/// never reaches a field access at all, e.g. `del(.a[0:2][0])`) -- this
+/// function only intercepts the one sub-case that isn't inert.
+///
+/// `null` gets the identical error only when it is the *direct* target of
+/// the slice-run (`null | del(.[0:2].a)`) -- real yq's own null-as-array
+/// slice quirk has no actual elements behind it, so further navigation past
+/// that point falls through to the ordinary no-op instead (confirmed live:
+/// `null | del(.[0:2][0].a)` stays `null`). An `Array` target keeps the
+/// error live through arbitrarily deeper `Index` navigation, since real
+/// document data really is there to walk (confirmed live for
+/// `del(.a[0:2][0].x)`, both erroring when index 0 holds another array and
+/// staying a no-op when it holds a scalar or object).
+fn yq_del_slice_field_error(steps: &[DeleteStep], root: &OwnedValue) -> Option<EvalError> {
+    let last_slice_pos = steps.iter().rposition(|s| s.component.is_slice())?;
+    let Expr::Slice { start, end, .. } = &steps[last_slice_pos].component else {
+        return None;
+    };
+    let prefix: Vec<Expr> = steps[..last_slice_pos]
+        .iter()
+        .map(|s| s.component.clone())
+        .collect();
+    let pre_slice_value = navigate_owned_value(root, &prefix)?;
+    let suffix = &steps[last_slice_pos + 1..];
+
+    if matches!(pre_slice_value, OwnedValue::Null) {
+        return match suffix {
+            [DeleteStep {
+                component: Expr::Field(name),
+                ..
+            }] => Some(EvalError::cannot_index_with_field("array", name)),
+            _ => None,
+        };
+    }
+
+    let OwnedValue::Array(_) = pre_slice_value else {
+        // Only `Array`/`Null` get this treatment -- `String` (#1219/#1321's
+        // own established no-op precedent) and anything else fall through
+        // unchanged.
+        return None;
+    };
+    let sliced = match slice_owned_value(pre_slice_value, *start, *end, false) {
+        Ok(Some(v)) => v,
+        // `Array` always slices to `Ok(Some(_))` -- see `slice_owned_value`'s
+        // own match arm. Unreachable in practice, but falling through to the
+        // pre-existing no-op is the safe default if that ever changes.
+        _ => return None,
+    };
+
+    let mut current = &sliced;
+    for step in suffix {
+        match &step.component {
+            Expr::Field(name) => match current {
+                OwnedValue::Array(_) => {
+                    return Some(EvalError::cannot_index_with_field("array", name))
+                }
+                OwnedValue::Object(map) => current = map.get(name)?,
+                _ => return None,
+            },
+            Expr::Index { idx, .. } => match current {
+                OwnedValue::Array(arr) => {
+                    current = &arr[resolve_read_index(&OwnedValue::Int(*idx), arr.len())?];
+                }
+                _ => return None,
+            },
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// Read-only navigation used by [`yq_del_slice_outcome`]'s prefix peek: does
 /// every step of `steps` resolve, through `root`, to an existing value?
 /// Unlike [`set_path_steps`], never autovivifies (a peek must not create
@@ -17987,36 +18089,36 @@ fn yq_del_slice_outcome(
 /// mirror it here too — a drift would make `yq_del_slice_outcome` disagree
 /// with what the real write does.
 fn navigate_read_only(root: &OwnedValue, steps: &[Expr]) -> bool {
+    navigate_owned_value(root, steps).is_some()
+}
+
+/// [`navigate_read_only`]'s own value-returning twin -- same walk, same
+/// "give up" shape (`Field`/`Index` on an incompatible container, an
+/// out-of-range `Index`, or any step this function can't interpret at all,
+/// `Iterate` included per #1298), but hands back the resolved value instead
+/// of collapsing it to a bare `bool`. Used by [`yq_del_slice_field_error`],
+/// which needs to inspect the value the trailing slice-run actually applies
+/// to, not just confirm it exists.
+fn navigate_owned_value<'a>(root: &'a OwnedValue, steps: &[Expr]) -> Option<&'a OwnedValue> {
     let mut current = root;
     for step in steps {
         let (step, _optional) = unwrap_path_component(step);
         current = match step {
             Expr::Field(name) => match current {
-                OwnedValue::Object(map) => match map.get(name) {
-                    Some(v) => v,
-                    None => return false,
-                },
-                _ => return false,
+                OwnedValue::Object(map) => map.get(name)?,
+                _ => return None,
             },
             Expr::Index { idx, .. } => match current {
                 OwnedValue::Array(arr) => {
-                    match resolve_read_index(&OwnedValue::Int(*idx), arr.len()) {
-                        Some(i) => &arr[i],
-                        None => return false,
-                    }
+                    &arr[resolve_read_index(&OwnedValue::Int(*idx), arr.len())?]
                 }
-                _ => return false,
+                _ => return None,
             },
-            // #1298: `Iterate` fans out into every element/value of a real
-            // container -- unlike `Field`/`Index`, there is no single next
-            // `current` to continue this loop with, so any step here means
-            // "give up", same as every other shape this function can't
-            // interpret.
-            Expr::Iterate => return false,
-            _ => return false,
+            Expr::Iterate => return None,
+            _ => return None,
         };
     }
-    true
+    Some(current)
 }
 
 /// Apply a resolved slice directly to an owned value.
@@ -37524,51 +37626,60 @@ fn delete_trie_array(
 /// own answer is itself inconsistent/order-sensitive with no coherent rule
 /// to replicate, the same territory `builtin_del`'s own known-gap test
 /// already documents. See #1223's follow-up discussion.
-fn rewrite_yq_del_comma_branches(expr: &Expr, root: &OwnedValue) -> Option<Expr> {
+fn rewrite_yq_del_comma_branches(
+    expr: &Expr,
+    root: &OwnedValue,
+) -> Result<Option<Expr>, EvalError> {
     match expr {
         Expr::Paren(inner) => {
-            rewrite_yq_del_comma_branches(inner, root).map(|r| Expr::Paren(Box::new(r)))
+            Ok(rewrite_yq_del_comma_branches(inner, root)?.map(|r| Expr::Paren(Box::new(r))))
         }
         Expr::Optional(inner) => {
-            rewrite_yq_del_comma_branches(inner, root).map(|r| Expr::Optional(Box::new(r)))
+            Ok(rewrite_yq_del_comma_branches(inner, root)?.map(|r| Expr::Optional(Box::new(r))))
         }
         Expr::Comma(branches) => {
-            let new_branches: Vec<Expr> = branches
-                .iter()
-                .filter_map(|branch| {
-                    if let Some(nested) = rewrite_yq_del_comma_branches(branch, root) {
-                        Some(nested)
-                    } else if !needs_path_prepass(branch) {
-                        match yq_del_slice_outcome(branch, root, false) {
-                            YqDelSliceOutcome::DropParent(rewritten) => Some(rewritten),
-                            // A `Noop`-classified branch is inert *regardless*
-                            // of what `root` actually contains: every `Noop`
-                            // return in `yq_del_slice_outcome` happens before
-                            // its own `navigate_read_only` call, so the
-                            // classification is pure syntax, decidable without
-                            // ever touching the document. Drop it from the
-                            // comma group entirely here, rather than leaving
-                            // its raw, still-slice-bearing branch in place --
-                            // `resolve_dynamic_indexes`'s navigation has no
-                            // `?`-style tolerance for a type mismatch (`.a[1:3]`
-                            // against an `Object` `.a` hard-errors there), so a
-                            // Noop branch combined with an incompatible sibling
-                            // type used to crash the whole `del()` call instead
-                            // of correctly leaving just this branch untouched
-                            // (`del(.a[1:3][0], .c)` on `{"a":{"x":1},"c":9}` —
-                            // live-verified against yq v4.53.3: `.a` stays put,
-                            // only `.c` is deleted).
-                            YqDelSliceOutcome::Noop => None,
-                            YqDelSliceOutcome::NotApplicable => Some(branch.clone()),
-                        }
-                    } else {
-                        Some(branch.clone())
+            let mut new_branches: Vec<Expr> = vec_with_capacity(branches.len());
+            for branch in branches {
+                if let Some(nested) = rewrite_yq_del_comma_branches(branch, root)? {
+                    new_branches.push(nested);
+                } else if !needs_path_prepass(branch) {
+                    match yq_del_slice_outcome(branch, root, false) {
+                        YqDelSliceOutcome::DropParent(rewritten) => new_branches.push(rewritten),
+                        // A `Noop`-classified branch is inert *regardless*
+                        // of what `root` actually contains: every `Noop`
+                        // return in `yq_del_slice_outcome` happens before
+                        // its own `navigate_read_only` call, so the
+                        // classification is pure syntax, decidable without
+                        // ever touching the document. Drop it from the
+                        // comma group entirely here, rather than leaving
+                        // its raw, still-slice-bearing branch in place --
+                        // `resolve_dynamic_indexes`'s navigation has no
+                        // `?`-style tolerance for a type mismatch (`.a[1:3]`
+                        // against an `Object` `.a` hard-errors there), so a
+                        // Noop branch combined with an incompatible sibling
+                        // type used to crash the whole `del()` call instead
+                        // of correctly leaving just this branch untouched
+                        // (`del(.a[1:3][0], .c)` on `{"a":{"x":1},"c":9}` —
+                        // live-verified against yq v4.53.3: `.a` stays put,
+                        // only `.c` is deleted).
+                        YqDelSliceOutcome::Noop => {}
+                        YqDelSliceOutcome::NotApplicable => new_branches.push(branch.clone()),
+                        // #2333: unlike `Noop`, this one *does* depend on
+                        // `root` -- and real yq's own answer here is to fail
+                        // the whole call, not just this branch (live-
+                        // verified: `del(.a[0:2].x, .c)` on
+                        // `{"a":[1,2,3],"c":9}` raises, `.c` is not
+                        // deleted either) -- so it propagates out instead of
+                        // being folded into this one branch's own fate.
+                        YqDelSliceOutcome::Error(e) => return Err(e),
                     }
-                })
-                .collect();
-            Some(Expr::Comma(new_branches))
+                } else {
+                    new_branches.push(branch.clone());
+                }
+            }
+            Ok(Some(Expr::Comma(new_branches)))
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -37613,11 +37724,13 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // still applies to its resolved output.
     let rewritten_comma_path_expr: Expr;
     let path_expr: &Expr = if S::TAG == EvalTag::Yq {
-        if let Some(rewritten) = rewrite_yq_del_comma_branches(path_expr, &result) {
-            rewritten_comma_path_expr = rewritten;
-            &rewritten_comma_path_expr
-        } else {
-            path_expr
+        match rewrite_yq_del_comma_branches(path_expr, &result) {
+            Ok(Some(rewritten)) => {
+                rewritten_comma_path_expr = rewritten;
+                &rewritten_comma_path_expr
+            }
+            Ok(None) => path_expr,
+            Err(e) => return suppress_or_raise(e, optional),
         }
     } else {
         path_expr
@@ -37692,6 +37805,7 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         YqDelSliceOutcome::DropParent(rewritten) => builder.insert_expr(&rewritten),
                         YqDelSliceOutcome::Noop => Ok(()),
                         YqDelSliceOutcome::NotApplicable => builder.insert_expr(path),
+                        YqDelSliceOutcome::Error(e) => Err(e),
                     },
                 };
                 if let Err(e) = inserted {
@@ -37790,6 +37904,7 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // here and get wrong.
             YqDelSliceOutcome::Noop => continue,
             YqDelSliceOutcome::NotApplicable => path,
+            YqDelSliceOutcome::Error(e) => return suppress_or_raise(e.clone(), optional),
         };
         // yq's root-delete rule (#1702): real yq deletes the whole
         // document and emits nothing for a bare `del(.)` (no `?`
@@ -38411,6 +38526,7 @@ fn delete_path_steps(
                                 YqDelSliceOutcome::NotApplicable => {
                                     delete_path_steps(elem, rest, optional, yq_mode, true)?;
                                 }
+                                YqDelSliceOutcome::Error(e) => return Err(e),
                             }
                         }
                         for i in remove_indices.into_iter().rev() {
@@ -38440,6 +38556,7 @@ fn delete_path_steps(
                                 YqDelSliceOutcome::NotApplicable => {
                                     delete_path_steps(value, rest, optional, yq_mode, true)?;
                                 }
+                                YqDelSliceOutcome::Error(e) => return Err(e),
                             }
                         }
                         for key in remove_keys {
