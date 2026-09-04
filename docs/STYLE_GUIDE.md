@@ -519,6 +519,17 @@ The unused-variable lint then enforces the claim, and the audit skips the functi
 entirely — this is how `builtin_recurse_f`/`builtin_recurse_cond` record their #1953
 exemption.
 
+**Where the routing has to sit.** The audit accepts a `suppress_or_raise`/`suppresses(`
+that appears below the call, within the same function, and *before the next materialization
+site*. That covers the ordinary shape, where a `Result` is collected in one statement and
+folded in the next. Routing that sits further away — a deferred unwrap inside a closure
+(`builtin_contains`/`builtin_inside`, #1800), a fold shared by several sibling arms
+(`builtin_add`), a control handed out to a caller (`finish_fork`, `sort_family_control`) —
+is real routing, but the audit cannot see it: say so in a `// STYLE-0012:` marker naming
+where it happens. The window is deliberately not widened to guess at these; a window large
+enough to find them was measured picking up a `suppresses(..)` from *neighbouring* code and
+silently excusing a genuine gap.
+
 `tests/jq_optional_suppression_audit.rs` enforces this and names the exact `file:line`
 of anything unrouted and unmarked.
 
