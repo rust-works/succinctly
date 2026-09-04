@@ -21087,6 +21087,65 @@ fn test_1702_yq_comma_with_root_del_emits_nothing() -> Result<()> {
     Ok(())
 }
 
+/// #2352: `delpaths([[]])` — the JSON-array-of-paths spelling of "delete the
+/// whole document" — shares #1702's own root-delete rule: real yq emits
+/// nothing, not the literal `null` this codebase printed before this fix
+/// (`del(.)` already got this right; `delpaths_one`'s own empty-path arm
+/// never picked up the same "no output at all" mechanism). Verified live
+/// against yq v4.53.3 on scalar/array/object targets, matching
+/// `test_1702_yq_bare_root_del_emits_nothing`'s own coverage exactly.
+#[test]
+fn test_2352_yq_delpaths_empty_path_emits_nothing() -> Result<()> {
+    for input in [r#"{"a":1}"#, r"[1,2,3]", r"5"] {
+        let (out, code) = run_yq_stdin("delpaths([[]])", input, &["-o=json"])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "", "input was {input}");
+    }
+    Ok(())
+}
+
+/// #2352: the empty path always sorts before every other path
+/// (`delpaths_one`'s own established invariant), so an empty path anywhere
+/// in a multi-path list collapses the whole call to "emit nothing" in yq
+/// mode too — verified live for both orderings.
+#[test]
+fn test_2352_yq_delpaths_empty_path_among_others_emits_nothing() -> Result<()> {
+    let (out, code) = run_yq_stdin(r#"delpaths([[],["a"]])"#, r#"{"a":1,"b":2}"#, &["-o=json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "");
+
+    let (out, code) = run_yq_stdin(r#"delpaths([["a"],[]])"#, r#"{"a":1,"b":2}"#, &["-o=json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "");
+    Ok(())
+}
+
+/// #2352: jq mode is unaffected by the yq-only widening — real jq's own
+/// `delpaths([[]])` prints the literal `null`, matching succinctly's
+/// existing (unchanged) jq-mode behavior.
+#[test]
+fn test_2352_jq_mode_unaffected() -> Result<()> {
+    let (out, code) = run_jq_stdin("delpaths([[]])", "[1,2,3]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "null");
+    Ok(())
+}
+
+/// #2352 control: a genuinely non-empty `delpaths()` call is unaffected —
+/// this fix's own early return is gated on the empty-path shape specifically,
+/// not on `delpaths()` in general.
+#[test]
+fn test_2352_yq_delpaths_nonempty_path_unaffected() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        r#"delpaths([["a"]])"#,
+        r#"{"a":1,"b":2}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"b":2}"#);
+    Ok(())
+}
+
 /// A comma-grouped multi-path `del()` (`delete_expr_paths_at`'s own sibling-
 /// grouping walker, a completely separate code path from the single-path
 /// case above) gets the same widened rule for each resolved path

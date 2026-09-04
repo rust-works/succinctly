@@ -42075,7 +42075,18 @@ fn delpaths_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     // The empty path names the document itself, and sorts before every other
     // array, so only the first entry needs checking: `delpaths([[],[0]])` and
-    // `delpaths([[0],[]])` are both `null`.
+    // `delpaths([[0],[]])` are both `null` in jq mode.
+    //
+    // #2352: yq's own root-delete rule (#1702, `builtin_del`'s own
+    // `Expr::Identity` arm above) applies here too -- real yq's
+    // `delpaths([[]])` deletes the whole document and emits nothing, not the
+    // literal `null` jq (and this function, before this fix) prints. Checked
+    // ahead of the `result`/`QueryResult` match below for the same reason
+    // `builtin_del` checks its own analogous case ahead of `delete_at_path`:
+    // there is no way to signal "no output at all" through an `OwnedValue`.
+    if S::TAG == EvalTag::Yq && matches!(paths.first(), Some([])) {
+        return QueryResult::None;
+    }
     let result = match paths.first() {
         None => to_owned(value),
         Some([]) => Ok(OwnedValue::Null),
