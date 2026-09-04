@@ -1918,11 +1918,12 @@ top-level comma branch shaped as a static `Field`/`Index` prefix plus a bare tra
 `.[]` whose prefix currently reads `null` off the comma group, and runs it through the
 very same `delete_at_path` a single-target `del()` call already uses -- before
 `resolve_del_path_branches` ever sees the rest. That ordering matches real yq's own
-observed behaviour: every such branch resolves against the pristine input, in any
-relative order, ahead of any sibling's own structural (index-shifting) deletion --
-confirmed live, `del(.[5][], .[0])` and `del(.[0], .[5][])` give the identical answer
-above regardless of order. The same root cause also covered a genuinely-existing `null`
-(not just an out-of-range index) reached the identical way:
+observed behaviour **when no sibling's own resolution can depend on another sibling's
+array-extending side effect**: every such branch resolves against the pristine input
+ahead of any sibling's own structural (index-shifting) deletion, and, among themselves,
+in any relative order -- confirmed live, `del(.[5][], .[0])` and `del(.[0], .[5][])` give
+the identical answer above regardless of order. The same root cause also covered a
+genuinely-existing `null` (not just an out-of-range index) reached the identical way:
 
 ```bash
 $ echo '{"a":null,"c":9}' | yq -o=json 'del(.a[], .c)'   # {"a": []}
@@ -1937,6 +1938,35 @@ fix, via the same `delete_paths_under` machinery #2314 covers.
 (A second gap found during the same review -- `null` never vivifying into `[]` ahead of
 *any* `Index`/`Iterate` del() step, not just a slot #2314 itself just padded -- is now
 closed; see the next section.)
+
+**Two further regressions this pre-pass itself introduced were found and fixed during its
+own mandatory review**, both confirmed live against yq v4.53.3:
+
+- **Order-dependence when a negative index is mixed in.** A comma sibling containing a
+  negative array index (anywhere in its path, matched-shaped or not) can resolve to a
+  different position depending on whether it is evaluated before or after a sibling
+  elsewhere in the group extends the same array -- real yq itself is order-dependent here,
+  and an earlier version of this pre-pass always applied its own vivify branches first
+  regardless of textual order, silently giving one order's answer for both:
+  `del(.[-1], .[4][])` is `[1, null, null, []]` in real yq but `del(.[4][], .[-1])` is
+  `[1, 2, null, null]` -- genuinely different, not just reordered. Fixed by declining the
+  *whole* pre-pass (`contains_length_dependent_index`, checked over every sibling before
+  any matching or mutation) whenever any sibling anywhere contains a negative index, a
+  negative slice bound, or a computed key/slice that can't be proven non-negative --
+  falling through entirely to the unmodified `resolve_del_path_branches` path, the same
+  fallback every other unrecognized shape here already gets. That path raises the same
+  "Cannot iterate over null" (or a genuine "index out of range") this whole pre-pass exists
+  to avoid for the shapes it *does* handle -- a coverage gap for this specific corner case
+  (never in #2324's own scope to begin with), not a wrong answer.
+- **A dropped `?`.** The pre-pass detected a trailing `.[]` shaped as either bare or
+  `?`-suppressed for matching purposes, but always reconstructed a bare `Expr::Iterate` and
+  hardcoded `delete_at_path`'s own `optional` parameter to `false`, discarding which one it
+  actually was. For a *genuinely missing* key (as opposed to a real key holding `null`),
+  the delete walk routes through `delete_at_path_through_absent`, which raises on a trailing
+  `.[]` unless that `.[]`'s own `?` suppresses it -- so a real yq no-op turned into a wrongly
+  raised error: `{"x":1} | del(.missing[]?, .x)` is `{}` in real yq. Fixed by threading the
+  trailing `.[]`'s own optionality through (`trailing_bare_iterate_prefix` now returns it
+  alongside the prefix) instead of hardcoding it away.
 
 ### `del()` auto-vivifies a `null` into `[]` ahead of an `Index`/`Iterate` step, matching `setpath`
 
