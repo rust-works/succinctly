@@ -9463,10 +9463,14 @@ fn test_computed_bracket_path_context_coverage_gaps_2100() -> Result<()> {
     // Index twin's target-result match: `ManyOwned` (a multi-valued
     // target re-run per key), `None` (this key's target evaluates to
     // nothing, but the loop must still continue for later keys, #2032),
-    // `Error`/`Break`/`Halt`/`Partial` (every target-level escape, each
-    // discarding this key's own output and returning whatever earlier
-    // keys already accumulated). `if true then 0 else 1 end` keeps the key
-    // a runtime `0` without folding to a literal `Expr::Index`.
+    // `Error`/`Break`/`Halt` (a bare target-level escape with no output of
+    // its own, discarding this key's own output and returning whatever
+    // earlier keys already accumulated). `Partial` (#2328, jq mode) is its
+    // own case further below -- unlike the bare escapes, it indexes its own
+    // already-produced prefix before `control` gets to fire, so it survives
+    // only when every value in that prefix indexes cleanly. `if true then 0
+    // else 1 end` keeps the key a runtime `0` without folding to a literal
+    // `Expr::Index`.
     let (stdout, _, code) = run_jq_full(
         &["-c", "(.a,.b)[if true then 0 else 1 end] | key"],
         Some(r#"{"a":[1,2],"b":[3,4]}"#),
@@ -9604,19 +9608,32 @@ fn test_computed_bracket_path_context_coverage_gaps_2100() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "");
 
-    // Partial-target arms discard the *target's own* partial prefix
-    // entirely, exactly like the index twin's identical rule -- so a
-    // successful `[1,2]` ahead of the escape contributes nothing to
-    // stdout. This is distinct from a mid-loop slice-*application* error,
-    // covered further below, which keeps whatever earlier `(s, e)` pairs
-    // already contributed.
-    let (_, stderr, code) = run_jq_full(
+    // Partial-target arms (#2328, jq mode): a successful `[1,2]` ahead of
+    // the escape is sliced by `(0.5, 1.5)` and folded into `results` before
+    // `control` fires, exactly like the index twin's own #2328 fix and
+    // `eval_slice_expr`'s pre-existing #2226 rule for the plain-read
+    // sibling -- confirmed against real jq via `path(.)` (no oracle for
+    // `key`, a succinctly extension): `{}  | (([1,2],error("x")))
+    // [(0.5):(1.5)] | path(.)` prints `[]` (one output) before raising.
+    // This is distinct from a mid-loop slice-*application* error, covered
+    // further below, which keeps whatever earlier `(s, e)` pairs already
+    // contributed.
+    let (stdout, stderr, code) = run_jq_full(
         &["-c", "(([1,2],error(\"x\")))[(0.5):(1.5)] | key"],
         Some(r"{}"),
     )?;
     assert_eq!(code, 5);
     assert!(stderr.contains('x'), "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "{\"start\":0.5,\"end\":1.5}");
 
+    // `break` is the one control variant real jq itself never lets a
+    // Partial-target's own prefix survive past (verified directly against
+    // real jq's plain-read evaluator too, the #2226-fixed ground truth:
+    // `label $out | [(([1,2],break $out))[(0.5):(1.5)]]` prints `[]`, no
+    // `[1,2]`) -- not a special case this function's own #2328 fix has to
+    // encode, since the `label`/array-constructor machinery that catches
+    // `break $out` discards whatever `Partial` prefix it carries regardless
+    // of which evaluator produced it.
     let (stdout, _, code) = run_jq_full(
         &[
             "-c",
@@ -9629,7 +9646,7 @@ fn test_computed_bracket_path_context_coverage_gaps_2100() -> Result<()> {
 
     let (stdout, _, code) = run_jq_full(&["-c", "(([1,2],halt))[(0.5):(1.5)] | key"], Some(r"{}"))?;
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "");
+    assert_eq!(stdout.trim(), "{\"start\":0.5,\"end\":1.5}");
 
     // Unpaired target output (#2100's own charged-only-where-read
     // optimization): the bracket's local `rest` is empty (nothing chains
@@ -12083,6 +12100,52 @@ fn test_eval_slice_expr_target_partial_halt_no_longer_discards_prefix_2226() -> 
     )?;
     assert_eq!(code, 6, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "[1,2]\n[4,5]\n");
+    Ok(())
+}
+
+#[test]
+fn test_eval_index_expr_with_path_context_target_partial_no_longer_discards_prefix_2328(
+) -> Result<()> {
+    // `eval_index_expr_with_path_context`'s target-side
+    // `QueryResult::Partial(vs, control)` arm -- the path-context sibling of
+    // `test_eval_index_expr_target_partial_halt_no_longer_discards_prefix_2226`,
+    // reached via `path(...)` instead of a plain read. Before #2328 this arm
+    // discarded `target`'s own already-produced values outright (the
+    // identical bug #2226 fixed one level up in the plain-read evaluator);
+    // #2328 applies the same fix here, indexing each already-produced
+    // target value first before `control` fires. `.a`/`.b` (not array
+    // literals) so the target stays a valid `path()` argument, matching
+    // real jq 1.7.1 exactly: `{"a":[1,2],"b":[3,4]} | path((.a,.b,
+    // halt_error(6))[(0+0)])` streams `["a",0]` then `["b",0]` (indexing
+    // each of `.a`/`.b`'s own values by key `0`) before exiting 6.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path((.a,.b,halt_error(6))[(0+0)])"],
+        Some(r#"{"a":[1,2],"b":[3,4]}"#),
+    )?;
+    assert_eq!(code, 6, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\",0]\n[\"b\",0]\n");
+    Ok(())
+}
+
+#[test]
+fn test_eval_slice_expr_with_path_context_target_partial_no_longer_discards_prefix_2328(
+) -> Result<()> {
+    // `eval_slice_expr_with_path_context`'s target-side `Partial` arm --
+    // the slice sibling of the index test immediately above, and the
+    // path-context sibling of
+    // `test_eval_slice_expr_target_partial_halt_no_longer_discards_prefix_2226`.
+    // Verified against jq 1.7.1: `{"a":[1,2,3],"b":[4,5,6]} |
+    // path((.a,.b,halt_error(6))[(1-1):2])` streams `["a",{"start":0,
+    // "end":2}]` then `["b",{"start":0,"end":2}]` before exiting 6.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path((.a,.b,halt_error(6))[(1-1):2])"],
+        Some(r#"{"a":[1,2,3],"b":[4,5,6]}"#),
+    )?;
+    assert_eq!(code, 6, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(
+        stdout,
+        "[\"a\",{\"start\":0,\"end\":2}]\n[\"b\",{\"start\":0,\"end\":2}]\n"
+    );
     Ok(())
 }
 

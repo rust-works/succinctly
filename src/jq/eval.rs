@@ -32411,6 +32411,12 @@ fn eval_index_expr_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemanti
             current_path,
             false,
         );
+        // #2328: set only by the `Partial` arm below (jq mode) -- deferred
+        // until after `target_outputs` has been walked through the same
+        // per-output loop as a clean `ManyOwned` result, so a later output's
+        // own indexing failure still outranks `control`, exactly like
+        // `eval_index_expr`'s identical priority rule.
+        let mut target_escape: Option<Control> = None;
         let target_outputs = match target_result {
             QueryResult::Owned(v) => vec![v],
             QueryResult::ManyOwned(vs) => vs,
@@ -32431,17 +32437,25 @@ fn eval_index_expr_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemanti
             QueryResult::Halt(code) => {
                 return partial(core::mem::take(&mut results), Control::Halt(code));
             }
-            // Unlike the arms above, this one no longer matches
-            // `eval_index_expr`'s own identical arm (#2226 review finding):
-            // `_` here still discards the target's own already-produced
-            // values before its own mid-stream escape, the exact bug #2226
-            // fixed for `eval_index_expr`'s value-mode counterpart. Left
-            // unaddressed here -- this path-context evaluator backs
-            // assignment/`del()`/`path()` through a computed key, not plain
-            // reads, and #2226's own scope was the plain-read evaluators
-            // only; tracked as a follow-up.
-            QueryResult::Partial(_, control) => {
-                return partial(core::mem::take(&mut results), control);
+            // #2328: mirrors `eval_index_expr`'s own #2226 fix -- `target`'s
+            // own generator produced `vs` before its own mid-stream escape;
+            // real jq's key-outer/target-inner model indexes each
+            // already-produced value by `k` as it flows out, so `target`'s
+            // own escaped generator's prefix is real jq output too here as
+            // well (confirmed live: `0 as $k | ([1,2],[3,4],error("x"))[$k]
+            // | key` prints `0` then `0` before raising -- the same values
+            // #2226 already established one level up for the plain-read
+            // sibling, just routed through path-context here). jq-only,
+            // matching #2226's own yq carve-out: real yq does not stream a
+            // target's own escaped generator's prefix at all (live-verified
+            // against yq v4.53.3, same query prints only the error, no
+            // prefix), so yq mode keeps the old conservative discard.
+            QueryResult::Partial(vs, control) => {
+                if S::TAG == EvalTag::Yq {
+                    return partial(core::mem::take(&mut results), control);
+                }
+                target_escape = Some(control);
+                vs
             }
             QueryResult::One(_) | QueryResult::Many(_) | QueryResult::OneCursor(_) => unreachable!(
                 "eval_stage_with_path_context only ever produces \
@@ -32494,6 +32508,17 @@ fn eval_index_expr_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemanti
                 // accumulated across every earlier key/output.
                 Err(e) => return partial(core::mem::take(&mut results), Control::Error(e)),
             }
+        }
+
+        // #2328: `target`'s own generator escaped after producing
+        // `target_outputs` above (jq mode only, see the `Partial` arm) --
+        // every one of those outputs has now been indexed and folded into
+        // `results` (or already escaped this function via its own index
+        // error, which outranks `control`), so `control` -- `target`'s own
+        // termination -- gets to fire now, exactly `escape_with_prefix!`'s
+        // ordering in `eval_index_expr`.
+        if let Some(control) = target_escape {
+            return partial(core::mem::take(&mut results), control);
         }
     }
 
@@ -32767,6 +32792,13 @@ fn eval_slice_expr_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemanti
                 current_path,
                 false,
             );
+            // #2328: set only by the `Partial` arm below (jq mode) --
+            // deferred until after `target_outputs` has been walked through
+            // the same per-output loop as a clean `ManyOwned` result, so a
+            // later output's own slicing failure still outranks `control`,
+            // mirroring `eval_index_expr_with_path_context`'s identical
+            // priority rule.
+            let mut target_escape: Option<Control> = None;
             let target_outputs = match target_result {
                 QueryResult::Owned(v) => vec![v],
                 QueryResult::ManyOwned(vs) => vs,
@@ -32788,14 +32820,26 @@ fn eval_slice_expr_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemanti
                 QueryResult::Halt(code) => {
                     return partial(core::mem::take(&mut results), Control::Halt(code));
                 }
-                // `_` here still discards the target's own already-produced
-                // values before its own mid-stream escape -- the identical,
-                // still-open gap `eval_index_expr_with_path_context`'s own
-                // sibling arm now documents (#2226 review finding); see that
-                // comment for why this path-context evaluator was left out
-                // of #2226's own scope.
-                QueryResult::Partial(_, control) => {
-                    return partial(core::mem::take(&mut results), control);
+                // #2328: mirrors `eval_index_expr_with_path_context`'s own
+                // fix immediately above -- `target`'s own generator produced
+                // `vs` before its own mid-stream escape; real jq's
+                // pair-outer/target-inner model slices each already-produced
+                // value by `(s, e)` as it flows out, so `target`'s own
+                // escaped generator's prefix is real jq output too here
+                // (confirmed live: `1 as $s | 3 as $e | ([1,2,3,4],[5,6,7,8],
+                // error("x"))[$s:$e] | key` prints `0` then `0` before
+                // raising, same values `eval_slice_expr`'s own #2226-derived
+                // gate already established for the plain-read sibling). jq
+                // -only, matching that gate: real yq does not stream a
+                // target's own escaped generator's prefix at all
+                // (live-verified against yq v4.53.3), so yq mode keeps the
+                // old conservative discard.
+                QueryResult::Partial(vs, control) => {
+                    if S::TAG == EvalTag::Yq {
+                        return partial(core::mem::take(&mut results), control);
+                    }
+                    target_escape = Some(control);
+                    vs
                 }
                 QueryResult::One(_) | QueryResult::Many(_) | QueryResult::OneCursor(_) => {
                     unreachable!(
@@ -32844,6 +32888,16 @@ fn eval_slice_expr_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemanti
                         return partial(core::mem::take(&mut results), Control::Error(e));
                     }
                 }
+            }
+
+            // #2328: `target`'s own generator escaped after producing
+            // `target_outputs` above (jq mode only, see the `Partial` arm)
+            // -- every one of those outputs has now been sliced and folded
+            // into `results` (or already escaped this function via its own
+            // slicing error, which outranks `control`), so `control` --
+            // `target`'s own termination -- gets to fire now.
+            if let Some(control) = target_escape {
+                return partial(core::mem::take(&mut results), control);
             }
         }
         // #2225: this `s`'s own `end` evaluation may have escaped after
