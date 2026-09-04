@@ -2857,9 +2857,14 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
                 // bookkeeping and the recursive render, instead of a second
                 // `elem_cursor.value()` re-deriving the same value (#1576
                 // review).
+                // #1803: `element_gap_ok_at`, not `element_gap_ok` -- this
+                // site needs the resolved `pos` itself for `value_at(pos)`
+                // and `scalar_end_pos(pos, ..)` just below, so it cannot
+                // give up the position the way the `bool`-only sibling does.
+                // Routing through the shared method anyway keeps the
+                // `is_first` -> delimiter mapping at one definition.
                 let elem_value = if let Some(pos) = elem_cursor.text_position() {
-                    let expected = if first { None } else { Some(b',') };
-                    if !elem_cursor.preceding_delimiter_ok(pos, expected) {
+                    if !elem_cursor.element_gap_ok_at(pos, first) {
                         return Err(StreamFailure::Decode(
                             elem_cursor.malformed_delimiter_error(),
                         ));

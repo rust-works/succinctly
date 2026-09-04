@@ -27,11 +27,12 @@ use std::rc::Rc;
 use indexmap::IndexMap;
 
 use super::document::{
-    collapsed_fields, collapsed_fields_if, effective_fields_checked,
-    effective_fields_with_raw_last, effective_keys, effective_len_checked, key_delimiter_ok,
-    key_display_string, key_display_string_kind, key_is_malformed, resolve_display_key,
-    trailing_element_gap_ok, value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors,
-    DocumentCursor, DocumentElements, DocumentFields, DocumentValue, IndentSpec, JsonConvention,
+    child_tail_gap_ok, collapsed_fields, collapsed_fields_if, container_tail_gap_ok,
+    effective_fields_checked, effective_fields_with_raw_last, effective_keys,
+    effective_len_checked, key_delimiter_ok, key_display_string, key_display_string_kind,
+    key_is_malformed, resolve_display_key, trailing_element_gap_ok, value_delimiter_ok,
+    DisplayKeyGuard, DistinctKeyCursors, DocumentCursor, DocumentElements, DocumentFields,
+    DocumentValue, IndentSpec, JsonConvention,
 };
 use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, bind_def, bind_def_call,
@@ -188,14 +189,7 @@ fn to_owned_checked_at_depth<V: DocumentValue>(
         let mut is_first = true;
         let mut last_field: Option<V::Cursor> = None;
         while let Some((field, rest)) = f.uncons() {
-            let Some(key) = resolve_display_key(&field.key, &map, &mut guard)? else {
-                return Err(f.malformed_member_error());
-            };
-            if !key_delimiter_ok::<V::Fields>(&field.key, &field.key_cursor, is_first)
-                || !value_delimiter_ok::<V::Fields>(Some(&field.value), &field.value_cursor)
-            {
-                return Err(f.malformed_member_error());
-            }
+            let key = field.checked_key(&f, &map, &mut guard, is_first)?;
             map.insert(key, to_owned_checked_at_depth(&field.value, depth + 1)?);
             last_field = Some(field.value_cursor);
             f = rest;
@@ -204,11 +198,7 @@ fn to_owned_checked_at_depth<V: DocumentValue>(
         if f.ends_unpaired() {
             return Err(f.malformed_member_error());
         }
-        if let Some(last) = &last_field {
-            if !trailing_element_gap_ok(last, b'}') {
-                return Err(last.malformed_delimiter_error());
-            }
-        }
+        child_tail_gap_ok(last_field.as_ref(), b'}')?;
         Ok(OwnedValue::Object(map))
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();
@@ -216,22 +206,15 @@ fn to_owned_checked_at_depth<V: DocumentValue>(
         let mut is_first = true;
         let mut last_elem: Option<V::Cursor> = None;
         while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
-            if let Some(pos) = elem_cursor.text_position() {
-                let expected = if is_first { None } else { Some(b',') };
-                if !elem_cursor.preceding_delimiter_ok(pos, expected) {
-                    return Err(elem_cursor.malformed_delimiter_error());
-                }
+            if !elem_cursor.element_gap_ok(is_first) {
+                return Err(elem_cursor.malformed_delimiter_error());
             }
             items.push(to_owned_checked_at_depth(&elem_cursor.value(), depth + 1)?);
             last_elem = Some(elem_cursor);
             elems = rest;
             is_first = false;
         }
-        if let Some(last) = &last_elem {
-            if !trailing_element_gap_ok(last, b']') {
-                return Err(last.malformed_delimiter_error());
-            }
-        }
+        child_tail_gap_ok(last_elem.as_ref(), b']')?;
         Ok(OwnedValue::Array(items))
     } else if value.is_null() {
         Ok(OwnedValue::Null)
@@ -334,25 +317,10 @@ fn to_owned_at_depth<V: DocumentValue>(value: &V, depth: usize) -> Result<OwnedV
         // `to_owned_cursor_at_depth`'s own `last_field` (#2243).
         let mut last_field: Option<V::Cursor> = None;
         while let Some((field, rest)) = f.uncons() {
-            // A key that will not *decode* (#1247/#1385) is preserved via
-            // its raw source span rather than raised on (#1642), matching
-            // `length`/`keys_unsorted`/`.`. A key that will not stringify
-            // at all is a different, structural fault -- a key JSON's
-            // grammar never allowed (`{123: 1}`), which the semi-index
-            // accepted because `:` and `,` mean the same nothing to it --
-            // and that still raises: dropping the field silently is #1194,
-            // the disagreement #1385's postmortem names as the thing to
-            // avoid.
-            let Some(key) = resolve_display_key(&field.key, &map, &mut guard)? else {
-                return Err(f.malformed_member_error());
-            };
-            // #1677: same delimiter class as #1194 above, one layer up --
-            // free here since `uncons` already resolved both key and value.
-            if !key_delimiter_ok::<V::Fields>(&field.key, &field.key_cursor, is_first)
-                || !value_delimiter_ok::<V::Fields>(Some(&field.value), &field.value_cursor)
-            {
-                return Err(f.malformed_member_error());
-            }
+            // #1803: the #1642 key resolution and the #1677 delimiter
+            // checks, as the one shared definition -- see
+            // `DocumentField::checked_key` for which fault raises and why.
+            let key = field.checked_key(&f, &map, &mut guard, is_first)?;
             map.insert(key, to_owned_at_depth(&field.value, depth + 1)?);
             last_field = Some(field.value_cursor);
             f = rest;
@@ -376,11 +344,7 @@ fn to_owned_at_depth<V: DocumentValue>(value: &V, depth: usize) -> Result<OwnedV
         // remains unchecked here for that reason. #2243's
         // `trailing_element_gap_ok` *is* checkable, though: it only needs
         // the last real field's own cursor, retained above.
-        if let Some(last) = &last_field {
-            if !trailing_element_gap_ok(last, b'}') {
-                return Err(last.malformed_delimiter_error());
-            }
-        }
+        child_tail_gap_ok(last_field.as_ref(), b'}')?;
         Ok(OwnedValue::Object(map))
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();
@@ -392,12 +356,11 @@ fn to_owned_at_depth<V: DocumentValue>(value: &V, depth: usize) -> Result<OwnedV
             // #1677: no bare-value walk over `DocumentElements` carries a
             // position, so this switches to the cursor-yielding sibling of
             // `uncons` -- always available, same navigation underneath --
-            // purely to reach `text_position()` for the gap check.
-            if let Some(pos) = elem_cursor.text_position() {
-                let expected = if is_first { None } else { Some(b',') };
-                if !elem_cursor.preceding_delimiter_ok(pos, expected) {
-                    return Err(elem_cursor.malformed_delimiter_error());
-                }
+            // purely to reach the cursor `element_gap_ok` needs. #1803: the
+            // check itself is `DocumentCursor::element_gap_ok`, not a fourth
+            // inline re-derivation of `text_position()`/`expected`.
+            if !elem_cursor.element_gap_ok(is_first) {
+                return Err(elem_cursor.malformed_delimiter_error());
             }
             items.push(to_owned_at_depth(&elem_cursor.value(), depth + 1)?);
             last_elem = Some(elem_cursor);
@@ -407,11 +370,7 @@ fn to_owned_at_depth<V: DocumentValue>(value: &V, depth: usize) -> Result<OwnedV
         // #2262: same reasoning as the object arm's own check above --
         // `[,]` remains unchecked here (no container cursor available),
         // but `[1,]` is, via the last real element's own cursor.
-        if let Some(last) = &last_elem {
-            if !trailing_element_gap_ok(last, b']') {
-                return Err(last.malformed_delimiter_error());
-            }
-        }
+        child_tail_gap_ok(last_elem.as_ref(), b']')?;
         Ok(OwnedValue::Array(items))
     // Then check scalars in order of specificity
     } else if value.is_null() {
@@ -551,24 +510,12 @@ fn to_owned_cursor_at_depth<C: DocumentCursor>(
         // needs to) once, after the loop, not per field.
         let mut last_field: Option<C> = None;
         while let Some((field, rest)) = f.uncons() {
-            // Same key handling as `to_owned_at_depth` above, same reasons --
-            // these two conversions are copies of each other and a fix that
-            // moved only one would leave the cursor and value domains
-            // disagreeing about whether a document is valid.
-            let Some(key) = resolve_display_key(&field.key, &map, &mut guard)? else {
-                return Err(f.malformed_member_error());
-            };
-            // Same #1677 checks as `to_owned_at_depth` above, same reason.
-            if !key_delimiter_ok::<<C::Value as DocumentValue>::Fields>(
-                &field.key,
-                &field.key_cursor,
-                is_first,
-            ) || !value_delimiter_ok::<<C::Value as DocumentValue>::Fields>(
-                Some(&field.value),
-                &field.value_cursor,
-            ) {
-                return Err(f.malformed_member_error());
-            }
+            // Same key and delimiter handling as `to_owned_at_depth` above,
+            // and since #1803 literally the same call -- these two
+            // conversions were copies of each other, and a fix that moved
+            // only one would leave the cursor and value domains disagreeing
+            // about whether a document is valid.
+            let key = field.checked_key(&f, &map, &mut guard, is_first)?;
             map.insert(
                 key,
                 to_owned_cursor_at_depth(&field.value_cursor, depth + 1)?,
@@ -580,22 +527,12 @@ fn to_owned_cursor_at_depth<C: DocumentCursor>(
         if f.ends_unpaired() {
             return Err(f.malformed_member_error());
         }
-        // #2211: `key_delimiter_ok`/`value_delimiter_ok` above only ever run
-        // against a real field -- a stray `,` with no real field at all
-        // (`{,}`) leaves the loop never having run, so nothing above catches
-        // it. `map.is_empty()` after the walk is exactly that case (a
-        // genuine `{}` also reaches here, and `container_gap_ok` answers
-        // `true` for it -- see that method's own doc comment).
-        if map.is_empty() {
-            if !cursor.container_gap_ok(b'}') {
-                return Err(cursor.malformed_delimiter_error());
-            }
-        } else {
-            let value_cursor = last_field.expect("map non-empty implies a real field was inserted");
-            if !trailing_element_gap_ok(&value_cursor, b'}') {
-                return Err(cursor.malformed_delimiter_error());
-            }
-        }
+        // #2211 (`{,}`) and #2243 (`{"a":1,}`), as the one shared
+        // `container_tail_gap_ok` rather than the two hand-copied arms this
+        // used to be (#1803). `last_field` is `None` on exactly the walks
+        // that left `map` empty -- every iteration sets both -- so the split
+        // that decision used to make on `map.is_empty()` is unchanged.
+        container_tail_gap_ok(cursor, last_field.as_ref(), b'}')?;
         Ok(OwnedValue::Object(map))
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();
@@ -604,30 +541,19 @@ fn to_owned_cursor_at_depth<C: DocumentCursor>(
         // #2243: same reasoning as the object arm's own `last_field` above.
         let mut last_elem: Option<C> = None;
         while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
-            // #1677: same gap check as `to_owned_at_depth`'s array loop.
-            if let Some(pos) = elem_cursor.text_position() {
-                let expected = if is_first { None } else { Some(b',') };
-                if !elem_cursor.preceding_delimiter_ok(pos, expected) {
-                    return Err(elem_cursor.malformed_delimiter_error());
-                }
+            // #1677: same gap check as `to_owned_at_depth`'s array loop --
+            // #1803 made "same" literal, via the shared `element_gap_ok`.
+            if !elem_cursor.element_gap_ok(is_first) {
+                return Err(elem_cursor.malformed_delimiter_error());
             }
             items.push(to_owned_cursor_at_depth(&elem_cursor, depth + 1)?);
             last_elem = Some(elem_cursor);
             elems = rest;
             is_first = false;
         }
-        // #2211: same reasoning as the object arm's own check just above,
-        // for a stray `,` with no real element (`[,]`).
-        if items.is_empty() {
-            if !cursor.container_gap_ok(b']') {
-                return Err(cursor.malformed_delimiter_error());
-            }
-        } else {
-            let last = last_elem.expect("items non-empty implies a real element was pushed");
-            if !trailing_element_gap_ok(&last, b']') {
-                return Err(cursor.malformed_delimiter_error());
-            }
-        }
+        // #2211/#2243: same reasoning as the object arm's own check just
+        // above, and now literally the same call (#1803).
+        container_tail_gap_ok(cursor, last_elem.as_ref(), b']')?;
         Ok(OwnedValue::Array(items))
     } else {
         // An applicable explicit tag resolves from the raw text and so can
@@ -1048,6 +974,21 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
             // source span; still raise on a key the format's grammar never
             // allowed at all (#1194) -- this arm used to silently drop such
             // a field instead of raising, the same swallow #1194 names.
+            //
+            // STYLE-0013: `resolve_display_key` directly, not
+            // `DocumentField::checked_key`, because this walk deliberately
+            // omits the delimiter half. Its only *production* caller is
+            // `yq_runner.rs`, where the value is always YAML and every
+            // #1677/#2211/#2243 check is a trait-default no-op (`{a: 1,}`
+            // is valid YAML flow syntax; real yq accepts it). So the
+            // omission is unreachable rather than divergent in shipped
+            // behaviour. It is not *provably* unreachable, though:
+            // `to_owned_with_comments` is `pub` and this file's own
+            // `test_json_to_owned_with_comments_uses_line_comment_raw_default`
+            // drives it with JSON, where those checks would fire. Adopting
+            // `checked_key` here is therefore a behaviour change for a
+            // JSON-typed caller, however desirable -- out of scope for
+            // #1803, which is behaviour-preserving by construction.
             let Some(key) = resolve_display_key(&field.key, &map, &mut guard)? else {
                 return Err(f.malformed_member_error());
             };
@@ -2531,6 +2472,23 @@ fn push_generic_truthiness_cursor_error<C: DocumentCursor>(c: &C, depth: usize) 
         // (both would flip/increment together every iteration with no
         // path that updates one without the other).
         let mut last_field: Option<C> = None;
+        // STYLE-0013: this walk deliberately does not route through
+        // `DocumentField::checked_key`, on two separate counts.
+        //
+        // 1. The key half is the #2061 *lazy* form below, not
+        //    `resolve_display_key` per key: allocating a `String` for every
+        //    key made `path(.[0])` over a 1M-object array cost 577 ms
+        //    against 50 ms. `checked_key` is the eager form, so this site
+        //    cannot adopt it without giving that back.
+        // 2. The delimiter half (#1677/#2211/#2243) is *missing* here, and
+        //    that is a live bug, not a design choice -- tracked as #2349,
+        //    which is where it gets fixed and where the cost of doing so
+        //    gets attributed. Fixing it inside #1803's extraction would have
+        //    made a pure refactor the vehicle for a behaviour change.
+        //
+        // This marker is the point of STYLE-0013: #2211 and #2243 each added
+        // a check to "the materializers" and neither noticed this walk, and
+        // nothing in the source said it should be looked at.
         while let Some((field, rest)) = f.uncons() {
             if !seen_fallback {
                 match key_display_string_kind(&field.key) {

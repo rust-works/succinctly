@@ -213,12 +213,28 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// extraction).
     fn element_gap_ok(&self, is_first: bool) -> bool {
         match self.text_position() {
-            Some(pos) => {
-                let expected = if is_first { None } else { Some(b',') };
-                self.preceding_delimiter_ok(pos, expected)
-            }
+            Some(pos) => self.element_gap_ok_at(pos, is_first),
             None => true,
         }
+    }
+
+    /// [`element_gap_ok`](Self::element_gap_ok), for a caller that has
+    /// already resolved this cursor's own `text_position()` and still needs
+    /// it afterwards.
+    ///
+    /// `crate::json::light`'s `stream_json_pretty` is the one such caller
+    /// (#1803): it reuses the same `pos` for `value_at(pos)` and
+    /// `scalar_end_pos(pos, ..)` immediately below the check, so routing it
+    /// through `element_gap_ok` -- which resolves the position internally
+    /// and hands back only a `bool` -- would cost a second
+    /// `text_position()` per element, exactly what
+    /// [`preceding_delimiter_ok`](Self::preceding_delimiter_ok)'s own doc
+    /// comment says not to pay. Splitting the check here rather than leaving
+    /// that site with a fifth inline copy keeps the `is_first` ->
+    /// `Option<b','>` mapping at **one** definition, which is the whole
+    /// point of #1597's original extraction and of #1803's follow-through.
+    fn element_gap_ok_at(&self, text_pos: usize, is_first: bool) -> bool {
+        self.preceding_delimiter_ok(text_pos, if is_first { None } else { Some(b',') })
     }
 
     /// The error to raise when [`preceding_delimiter_ok`](Self::preceding_delimiter_ok)
@@ -1182,9 +1198,7 @@ pub trait DocumentFields: Sized + Clone {
             // #1677: this walk already resolved both the key and the value
             // (`uncons` does), so both checks reuse an existing decode
             // rather than deriving a new position.
-            if !key_delimiter_ok::<Self>(&field.key, &field.key_cursor, is_first)
-                || !value_delimiter_ok::<Self>(Some(&field.value), &field.value_cursor)
-            {
+            if !field.delimiters_ok::<Self>(is_first) {
                 return Err(fields.malformed_member_error());
             }
             keys.push(key.into_owned());
@@ -1557,6 +1571,68 @@ pub fn trailing_element_gap_ok<C: DocumentCursor>(last_cursor: &C, close_char: u
             None => true,
         },
         None => true,
+    }
+}
+
+/// The whole post-loop tail check for a container walk that holds only its
+/// children, never a cursor for the container itself -- the value-domain
+/// half of #1803's extraction.
+///
+/// `last_child` is the last real child's own cursor, or `None` when the
+/// walk produced no child at all. Raises on a stray `,` *after* a real last
+/// child (`{"a":1,}` / `[1,]`, #2243/#2262).
+///
+/// # What it deliberately does not check
+///
+/// #2211's [`DocumentCursor::container_gap_ok`] -- a stray `,` with *no*
+/// real child (`{,}` / `[,]`) -- needs the container's own cursor to find
+/// its opening bracket. A caller that only ever receives a bare
+/// `value: &V` never has one, and once the child list is exhausted there is
+/// no way to reconstruct it. That shape stays unchecked on this path; a
+/// caller that *does* hold a container cursor must use
+/// [`container_tail_gap_ok`] instead, which closes it.
+pub fn child_tail_gap_ok<C: DocumentCursor>(
+    last_child: Option<&C>,
+    close_char: u8,
+) -> Result<(), EvalError> {
+    match last_child {
+        Some(last) if !trailing_element_gap_ok(last, close_char) => {
+            Err(last.malformed_delimiter_error())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The whole post-loop tail check for a container walk that *does* hold the
+/// container's own cursor -- the cursor-domain half of #1803's extraction,
+/// and strictly stronger than [`child_tail_gap_ok`].
+///
+/// Splits on whether the walk produced a real child at all, because the two
+/// cases need different evidence and neither subsumes the other:
+///
+/// - **No child** -- [`DocumentCursor::container_gap_ok`] against the
+///   container, which is the only thing that can tell a genuine `{}`/`[]`
+///   apart from a stray `,` with nothing in it (`{,}` / `[,]`, #2211).
+/// - **At least one child** -- [`trailing_element_gap_ok`] against that last
+///   child, for a stray `,` after it (`{"a":1,}` / `[1,]`, #2243).
+///
+/// Both raise `container.malformed_delimiter_error()`, preserving what the
+/// cursor-domain call sites already did; for JSON that is
+/// `malformed_json_text` over the whole document text, so it reads
+/// identically to the child-receiver form [`child_tail_gap_ok`] uses.
+pub fn container_tail_gap_ok<C: DocumentCursor>(
+    container: &C,
+    last_child: Option<&C>,
+    close_char: u8,
+) -> Result<(), EvalError> {
+    let ok = match last_child {
+        None => container.container_gap_ok(close_char),
+        Some(last) => trailing_element_gap_ok(last, close_char),
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(container.malformed_delimiter_error())
     }
 }
 
@@ -2057,9 +2133,7 @@ pub fn effective_fields_checked<F: DocumentFields>(
         }
         // #1677: free here too -- `uncons` already resolved both key and
         // value, so both checks reuse an existing decode.
-        if !key_delimiter_ok::<F>(&field.key, &field.key_cursor, is_first)
-            || !value_delimiter_ok::<F>(Some(&field.value), &field.value_cursor)
-        {
+        if !field.delimiters_ok::<F>(is_first) {
             return Err(walk.malformed_member_error());
         }
         last_value_cursor = Some(field.value_cursor);
@@ -2644,6 +2718,93 @@ impl<V: DocumentValue, C: DocumentCursor> DocumentField<V, C> {
     /// complex keys) stringify rather than dropping the entry (issue #222).
     pub fn key_str(&self) -> Option<Cow<'_, str>> {
         self.key.key_string()
+    }
+
+    /// Whether both delimiters around this member are well-formed:
+    /// nothing before the key if it is the object's first, exactly one `,`
+    /// otherwise, and exactly one `:` before the value (#1677).
+    ///
+    /// The `bool` half of [`checked_key`](Self::checked_key), split out for
+    /// the walks that cannot take the whole of it (#1803):
+    ///
+    /// - [`DocumentFields::keys`] and `effective_fields_checked` resolve
+    ///   their keys with [`key_display_string`]/[`key_is_malformed`] and
+    ///   hold no `IndexMap` for the #1642 collision guard to check against.
+    /// - `eval_generic`'s validate-only walk (a private function, not
+    ///   linkable here) builds its #1642 collision map *lazily*, from the
+    ///   first undecodable key onward: eagerly resolving a display `String`
+    ///   per key is what made `path(.[0])` over a 1,000,000-object array
+    ///   cost 577 ms against 50 ms (#2061). This half allocates nothing, so
+    ///   that walk can adopt the delimiter rules without the key rules --
+    ///   which is what #2349 needs, and why the split exists.
+    ///
+    /// Free for every caller: a full [`DocumentFields::uncons`] walk has
+    /// already resolved both key and value, so each check reuses an
+    /// existing decode (`text_start`) rather than deriving a position. Every
+    /// check is a no-op for YAML, whose parser validates delimiters as it
+    /// goes, so [`DocumentCursor::preceding_delimiter_ok`]'s `true`-returning
+    /// default stands and the whole conjunction folds away.
+    pub fn delimiters_ok<F>(&self, is_first: bool) -> bool
+    where
+        F: DocumentFields<Value = V, Cursor = C>,
+    {
+        key_delimiter_ok::<F>(&self.key, &self.key_cursor, is_first)
+            && value_delimiter_ok::<F>(Some(&self.value), &self.value_cursor)
+    }
+
+    /// Resolves this member's display key and validates the delimiters
+    /// around it, as the one definition every object walk shares (#1803).
+    ///
+    /// `Ok(key)` is the string to insert; every failure mode raises, and a
+    /// caller has nothing left to decide:
+    ///
+    /// - A key that will not **decode** (#1247/#1385) is preserved via its
+    ///   lossily-decoded raw source span rather than raised on (#1642),
+    ///   matching `length`/`keys_unsorted`/`.`.
+    /// - A key that will not **stringify at all** -- a key JSON's grammar
+    ///   never allowed (`{123: 1}`), which the semi-index accepted because
+    ///   `:` and `,` mean the same nothing to it -- is a different,
+    ///   structural fault and raises (#1194). Dropping the field silently
+    ///   is the disagreement #1385's postmortem names as the thing to avoid.
+    /// - Two colliding decode-failure spellings raise rather than one
+    ///   silently overwriting the other in `map` (#1642's [`DisplayKeyGuard`]).
+    /// - A missing or doubled `,` before the key, or `:` before the value,
+    ///   raises (#1677) -- free here, since a full [`DocumentFields::uncons`]
+    ///   walk has already resolved both.
+    ///
+    /// # Why this is a shared method and not five hand-copied blocks
+    ///
+    /// It was five hand-copied blocks, and the set drifted three times:
+    /// #1677 reached some sites, #2211 two, #2243/#2262 five, each round
+    /// leaving a sibling behind (#1975 found this walk missing from the CLI
+    /// bridge; #2349 tracks the live bug the validate-only walk still has).
+    /// `resolve_display_key`'s own doc already tracked the key half as a
+    /// recurring cost; this method covers the delimiter half with it, so a
+    /// future rule lands in one place. Enforced by STYLE-0013.
+    ///
+    /// Generic over `F: DocumentFields` rather than taking the pieces
+    /// separately, for the same reason [`key_delimiter_ok`] is: naming `F`
+    /// sidesteps needing `DocumentFields` to bind `Self::Cursor` to
+    /// `Self::Value::Cursor`, which it does not. `F` is inferred from
+    /// `fields`, so call sites lose the fully-qualified
+    /// `::<<C::Value as DocumentValue>::Fields>` spelling entirely.
+    pub fn checked_key<F, T>(
+        &self,
+        fields: &F,
+        map: &IndexMap<String, T>,
+        guard: &mut DisplayKeyGuard,
+        is_first: bool,
+    ) -> Result<String, EvalError>
+    where
+        F: DocumentFields<Value = V, Cursor = C>,
+    {
+        let Some(key) = resolve_display_key(&self.key, map, guard)? else {
+            return Err(fields.malformed_member_error());
+        };
+        if !self.delimiters_ok::<F>(is_first) {
+            return Err(fields.malformed_member_error());
+        }
+        Ok(key)
     }
 }
 
