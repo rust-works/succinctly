@@ -50,7 +50,7 @@ use super::eval::{
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
-use super::expr::{Builtin, CompareOp, Expr, FormatType, Pattern};
+use super::expr::{Builtin, CompareOp, Expr, FormatType, ObjectEntry, ObjectKey, Pattern};
 use super::slice::{slice_str, SliceBounds};
 use super::value::{owned_value_eq, NumberRepr, OwnedValue};
 use crate::json::JsonIndex;
@@ -5989,6 +5989,41 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // after the loop, not per-sibling -- same reasoning as `Expr::Array`
         // above, and cheaper (one round trip for `.a, .b, .c` instead of up
         // to three).
+        // #2416 phase 3 / #1332: object construction natively, with the
+        // cursor threaded into every key and value expression, so `{k: key}`
+        // answers the node's own key instead of bridging the whole construct
+        // to the eager evaluator (which had no `Expr::Object` arm and lost
+        // the position). Mirrors `eval::build_object_entries` shape for
+        // shape: keys vary slowest, a non-string key errors (or is swallowed
+        // under `optional`, discarding what was built), and a generator's
+        // trailing escape becomes a `Partial` after the objects already
+        // built.
+        Expr::Object(entries) => {
+            let mut objects = Vec::new();
+            let mut acc: Vec<(String, OwnedValue)> = Vec::new();
+            let built = build_object_entries_generic::<S, V>(
+                entries,
+                &value,
+                optional,
+                cursor,
+                true,
+                &mut acc,
+                &mut objects,
+            );
+            // Deliberately *not* passed through `yq_float_fidelity_fixup`: the
+            // bridge this arm replaces returned the eager evaluator's objects
+            // as built, leaving a computed float bare for the YAML emitter's
+            // nested-float rule (`{"a": (.a * 1e100)}` prints `a: 1e+100`,
+            // as real yq does). The fixup's reindex round trip spells that
+            // same float out in full, which is the `Expr::Array` arm's own
+            // pre-existing divergence (`[.a * 1e100]`), not one to inherit.
+            match built {
+                Ok(()) => owned_vec_to_generic_result(objects),
+                Err(ObjectEscapeGeneric::Suppressed) => GenericResult::None,
+                Err(ObjectEscapeGeneric::Control(control)) => partial_generic(objects, control),
+            }
+        }
+
         Expr::Comma(exprs) => {
             let mut out: Vec<OwnedValue> = Vec::new();
             for expr in exprs {
@@ -10826,6 +10861,87 @@ pub fn path_context_pipe_streams_cursors(exprs: &[Expr]) -> bool {
         && path_context_walk_split(exprs).is_some_and(|(_, rest)| rest.is_empty())
 }
 
+/// How object construction stops early: a non-string key under `optional`
+/// yields nothing at all (what was built so far is discarded, as
+/// `eval::eval_object_construction` does), any other escape carries the
+/// control out after the objects already built.
+enum ObjectEscapeGeneric {
+    Suppressed,
+    Control(Control),
+}
+
+/// The generic twin of `eval::build_object_entries` (#2416 phase 3): one
+/// object per combination of key and value outputs, keys varying slowest,
+/// every sub-expression evaluated with `cursor` so path-context builtins
+/// inside the construction answer as cursor properties.
+fn build_object_entries_generic<S: EvalSemantics, V: DocumentValue>(
+    entries: &[ObjectEntry],
+    value: &V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sole: bool,
+    acc: &mut Vec<(String, OwnedValue)>,
+    out: &mut Vec<OwnedValue>,
+) -> Result<(), ObjectEscapeGeneric> {
+    let Some((entry, rest)) = entries.split_first() else {
+        let object = if sole {
+            core::mem::take(acc).into_iter().collect::<IndexMap<_, _>>()
+        } else {
+            acc.iter().cloned().collect::<IndexMap<_, _>>()
+        };
+        out.push(OwnedValue::Object(object));
+        return Ok(());
+    };
+
+    let (keys, key_trailing) = match &entry.key {
+        ObjectKey::Literal(name) => (vec![OwnedValue::String(name.clone())], None),
+        ObjectKey::Expr(key_expr) => {
+            let mut keys = Vec::new();
+            let trailing = push_generic_owned_values(
+                eval_single::<S, V>(key_expr, value.clone(), optional, cursor),
+                &mut keys,
+            );
+            (keys, trailing)
+        }
+    };
+    let sole = sole && keys.len() == 1;
+
+    for key in keys {
+        let mut vals = Vec::new();
+        let val_trailing = push_generic_owned_values(
+            eval_single::<S, V>(&entry.value, value.clone(), optional, cursor),
+            &mut vals,
+        );
+        let sole = sole && vals.len() == 1;
+
+        for val in vals {
+            let OwnedValue::String(key_str) = &key else {
+                return Err(if optional {
+                    ObjectEscapeGeneric::Suppressed
+                } else {
+                    ObjectEscapeGeneric::Control(Control::Error(
+                        EvalError::cannot_use_as_object_key(&key),
+                    ))
+                });
+            };
+            acc.push((key_str.clone(), val));
+            let result =
+                build_object_entries_generic::<S, V>(rest, value, optional, cursor, sole, acc, out);
+            acc.pop();
+            result?;
+        }
+
+        if let Some(control) = val_trailing {
+            return Err(ObjectEscapeGeneric::Control(control));
+        }
+    }
+
+    if let Some(control) = key_trailing {
+        return Err(ObjectEscapeGeneric::Control(control));
+    }
+    Ok(())
+}
+
 /// The key under which `c` sits in its parent -- a field name or an element
 /// index -- or `None` at the document root (#2416 phase 3).
 ///
@@ -11018,19 +11134,20 @@ fn path_context_stage_preserves_node(expr: &Expr) -> bool {
     }
 }
 
-/// A top-level pipe stage the generic *sink* evaluator handles natively with
-/// the cursor threaded through: the bounded consumers (`limit`/`first`/
-/// `last`/`nth`), which `eval_each_generic` drives lazily, around anything
-/// [`path_context_single_native`] admits.
+/// A top-level pipe stage the generic evaluator handles natively with the
+/// cursor threaded through, on *either* route.
+///
+/// Both routes can evaluate a stage: the sink pipeline (`eval_each_generic`)
+/// and the non-sink one (`eval_single` + `fold_pipe_stages`), which is what
+/// the yq CLI's DOM path drives. A construct native in the sink evaluator
+/// only -- `if`, arithmetic, `limit` -- still bridges to the eager evaluator
+/// from `eval_single`, with no cursor, so admitting it here answered
+/// `.[] | key + 10` as `null + 10` on that route. Hence this is exactly
+/// [`path_context_single_native`], plus the two bounded consumers that have
+/// native `eval_single` arms of their own.
 fn path_context_stage_native(expr: &Expr) -> bool {
     match expr {
-        Expr::Limit { n, expr } => {
-            matches!(**n, Expr::Literal(_)) && path_context_stage_native(expr)
-        }
         Expr::FirstExpr(inner) | Expr::LastExpr(inner) => path_context_stage_native(inner),
-        Expr::Builtin(Builtin::FirstStream(inner) | Builtin::LastStream(inner)) => {
-            path_context_stage_native(inner)
-        }
         _ => path_context_single_native(expr),
     }
 }
@@ -11075,6 +11192,15 @@ fn path_context_single_native(expr: &Expr) -> bool {
         }
         Expr::Builtin(Builtin::ParentN(n)) => matches!(**n, Expr::Literal(_)),
         Expr::Builtin(Builtin::Select(cond)) => path_context_single_native(cond),
+        // Native since #2416 phase 3 (`build_object_entries_generic`): every
+        // key and value expression is evaluated with the cursor.
+        Expr::Object(entries) => entries.iter().all(|entry| {
+            path_context_single_native(&entry.value)
+                && match &entry.key {
+                    ObjectKey::Literal(_) => true,
+                    ObjectKey::Expr(key) => path_context_single_native(key),
+                }
+        }),
         _ => false,
     }
 }
@@ -21239,8 +21365,10 @@ mod tests {
         // A stage built from something that bridges mid-expression. (Bare
         // `{k: key}` never reaches the gate at all: `needs_path_context` does
         // not descend into `Expr::Object`, #1332, so that pipe is not seen as
-        // a path-context pipe in the first place.)
-        assert!(eager(".[] | (key | {k: .})"));
+        // a path-context pipe in the first place; and object construction is
+        // native now, so `(key | {k: .})` is admitted.)
+        assert!(eager(".[] | (key | tostring)"));
+        assert!(!eager(".[] | (key | {k: .})"));
         assert!(eager(".[] | if key == \"a\" then . else empty end"));
         assert!(eager(".[] | select(key == \"a\" and true)"));
         assert!(eager(".[] | parent(1 + 0)"));

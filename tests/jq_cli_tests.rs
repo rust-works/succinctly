@@ -7334,6 +7334,35 @@ fn test_as_path_context_builtin_body_loop_arms_1663() -> Result<()> {
     Ok(())
 }
 
+/// Spine 2416, phase 3: object construction is native in the generic
+/// evaluator (`build_object_entries_generic`), mirroring the eager
+/// `build_object_entries` fan-out -- keys vary slowest. Captured live from
+/// jq 1.7.1: `{a: (1,2), b: (3,4)}` on `{}` is `{"a":1,"b":3}`,
+/// `{"a":1,"b":4}`, `{"a":2,"b":3}`, `{"a":2,"b":4}`. The `key` rows have no
+/// jq oracle (`key` is a succinctly extension) and pin the cursor-property
+/// answer.
+#[test]
+fn test_object_construction_fanout_and_key_2416() -> Result<()> {
+    let (out, _, code) = run_jq_full(&["-c", "{a: (1,2), b: (3,4)}"], Some("{}"))?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        out.trim(),
+        "{\"a\":1,\"b\":3}\n{\"a\":1,\"b\":4}\n{\"a\":2,\"b\":3}\n{\"a\":2,\"b\":4}"
+    );
+    let (out, _, code) = run_jq_full(
+        &["-c", ".a[] | {k: key, v: .}"],
+        Some(r#"{"a":{"b":[1,2],"c":"x"}}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        out.trim(),
+        "{\"k\":\"b\",\"v\":[1,2]}\n{\"k\":\"c\",\"v\":\"x\"}"
+    );
+    let (out, _, code) = run_jq_full(&["-c", ".a | {(1): key}"], Some(r#"{"a":1}"#))?;
+    assert_eq!(code, 5, "a non-string key errors: {out:?}");
+    Ok(())
+}
+
 /// Documents the one remaining deliberate, narrow gap #1663/#1765 leave
 /// open rather than silently missing: a `?//`-chained `AsPattern` (2+
 /// alternatives) still has no dedicated evaluation arm, so a path-context
