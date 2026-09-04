@@ -2728,7 +2728,8 @@ impl<V: DocumentValue, C: DocumentCursor> DocumentField<V, C> {
     /// the walks that cannot take the whole of it (#1803):
     ///
     /// - [`DocumentFields::keys`] and `effective_fields_checked` resolve
-    ///   their keys with [`key_display_string`]/[`key_is_malformed`] and
+    ///   their keys with [`key_display_string`]/`key_is_malformed` (the
+    ///   latter private, not linkable here) and
     ///   hold no `IndexMap` for the #1642 collision guard to check against.
     /// - `eval_generic`'s validate-only walk (a private function, not
     ///   linkable here) builds its #1642 collision map *lazily*, from the

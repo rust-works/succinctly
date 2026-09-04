@@ -28,6 +28,7 @@ which tags apply to the changes and search this file for those tags. Each rule h
 | Adding or editing a markdown table                | `documentation`                              |
 | Writing commit messages                           | `commits`                                    |
 | Touching `no_std` boundaries or `std`-gated code  | `module-organization`                        |
+| Walking `DocumentFields` / `DocumentElements`      | `code-style`, `testing`                      |
 | Reviewing code for style compliance               | All tags relevant to the changed code        |
 
 ---
@@ -42,7 +43,7 @@ A new convention needs to be added to this style guide.
 
 ### Guidance
 
-Assign the next sequential ID (currently next is `STYLE-0013`) and include:
+Assign the next sequential ID (currently next is `STYLE-0014`) and include:
 
 1. A **Tags** line immediately after the heading — a comma-separated list of category labels
    from the tag vocabulary below.
@@ -577,3 +578,69 @@ exemption from prose scattered across two 100k-line files into something greppab
 the next sweep does not have to rediscover by eye. The runtime half of the guard is
 `EvalError::debug_assert_materialization_error`, which fails loudly on the day the
 "decode failures only" premise stops holding and the routing starts to matter.
+
+---
+
+## STYLE-0013: object/array member validation in a document walk
+
+**Tags:** `code-style`, `testing`
+
+### Situation
+
+Writing or editing a walk that unconses [`DocumentFields`] or [`DocumentElements`] and
+validates what it finds -- any of the `to_owned*_at_depth` family, the `-e`/lazy
+materializers, `document.rs`'s own key walks, or the CLI's `--input-format json` bridge.
+
+### Guidance
+
+Do not hand-copy the validation. Route through the shared definitions:
+
+```rust
+// The whole member rule: #1642/#1194 key resolution + #1677 delimiters.
+let key = field.checked_key(&f, &map, &mut guard, is_first)?;
+
+// The delimiter half alone, for a walk with no display-key map to guard,
+// or one that must not allocate a `String` per key (#2061).
+if !field.delimiters_ok::<F>(is_first) { return Err(f.malformed_member_error()); }
+
+// Array elements (#1677); `element_gap_ok_at` when you still need the position.
+if !elem_cursor.element_gap_ok(is_first) { return Err(elem_cursor.malformed_delimiter_error()); }
+
+// The post-loop tail: `{,}`/`[,]` (#2211) and `{"a":1,}`/`[1,]` (#2243).
+child_tail_gap_ok(last_elem.as_ref(), b']')?;              // no container cursor in hand
+container_tail_gap_ok(cursor, last_elem.as_ref(), b']')?;  // container cursor in hand
+```
+
+A site that genuinely cannot route carries a `// STYLE-0013:` citation with a specific
+reason -- the same traceability STYLE-0004 requires of a lint suppression and STYLE-0012 of
+an unrouted materialization. "It is fine" is not a reason; name what the site needs that the
+helper cannot give, or the issue that tracks closing the gap. The exemptions in the tree
+today are `json::light::stream_json_pretty` (needs the resolved position, hence
+`element_gap_ok_at`), `eval_generic`'s validate-only walk (lazy key map, #2061; missing
+delimiter checks tracked as #2349), `lazy.rs`'s missing trailing-gap check (#2349's family),
+and the comment-preserving walk (YAML-only in production).
+
+### Motivation
+
+This rule exists because the same omission shipped four times. The member rules accumulated
+over #1677, #2211 and #2243/#2262, and **each round added its check to some walks and not
+others** -- #1975 found the CLI bridge with none of them, and #2349 is the wrong-answer bug
+the drift finally produced in `select`/`sort_by`/`path()`.
+
+Extraction alone had already been tried and had already failed to hold:
+[`DocumentCursor::element_gap_ok`] was pulled out by #1597's review for exactly this reason,
+and five sites went on hand-rolling its four lines anyway -- including two written *after*
+it existed. Centralising a check does not stop the omission, because nothing forces a call
+site through it. That is the same finding STYLE-0012 records, and it has the same answer: a
+static audit, plus a greppable marker at each deliberate exemption so the next sweep does
+not have to rediscover it by eye.
+
+Behavioural tests could not close this class either, and not by bad luck. The delimiter
+rules are JSON-only -- every one is a `true`-returning trait default for YAML -- so a walk
+reachable only from YAML shows no difference at all, and a walk whose corrupt subtree is
+merely *validated* rather than emitted shows none either. #1962's cross-site consistency net
+did drive three of the sites, and still missed this: its `FuzzMalformation` alphabet has
+only decode-failure, structural and collision variants, and its generator emits only
+well-formed containers, so it could not express a delimiter or gap corruption at any case
+count (#2350). A static audit does not depend on a corruption being reachable, expressible,
+or observable.
