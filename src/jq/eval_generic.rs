@@ -495,6 +495,29 @@ pub fn to_owned_all_cursors<'a, C: DocumentCursor + 'a>(
     cursors.into_iter().map(to_owned_cursor).collect()
 }
 
+/// [`to_owned_all_cursors`]'s prefix-preserving sibling (#2145): on a decode
+/// failure, returns whatever converted successfully *before* the failing
+/// cursor instead of discarding it -- `.collect::<Result<Vec<_>, _>>()`
+/// (what `to_owned_all_cursors` uses) drops every already-collected item on
+/// the first `Err`, which is fine for a caller with nothing of its own to
+/// lose, but wrong for one folding this conversion's result into an
+/// already-running prefix (`escape_generic!`'s own `Partial`-folding use,
+/// its sole caller so far). Mirrors `eval.rs`'s `promote_borrowed_checked`
+/// (#1897) -- the same fix, for the cursor-native accumulator instead of
+/// the borrowed-`StandardJson` one.
+fn to_owned_all_cursors_checked<'a, C: DocumentCursor + 'a>(
+    cursors: impl IntoIterator<Item = &'a C>,
+) -> Result<Vec<OwnedValue>, (Vec<OwnedValue>, EvalError)> {
+    let mut acc = Vec::new();
+    for c in cursors {
+        match to_owned_cursor(c) {
+            Ok(v) => acc.push(v),
+            Err(e) => return Err((acc, e)),
+        }
+    }
+    Ok(acc)
+}
+
 fn to_owned_cursor_at_depth<C: DocumentCursor>(
     cursor: &C,
     depth: usize,
@@ -8185,21 +8208,27 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
     // live: `jq -n '(input | if . == "STOP" then halt else . end)
     // [("x","y")]'` on a bad-then-STOP input stream exits 0 silently in
     // real jq), while `Error`/`Break` downgrade to the promotion's own
-    // error, same as `resolve_terminal_prefix`'s matching arm.
+    // error, same as `resolve_terminal_prefix`'s matching arm. #2145: the
+    // secondary failure can't discard the *prefix* either -- uses the
+    // prefix-preserving `to_owned_all_cursors_checked` (mirroring `eval.rs`'s
+    // `promote_borrowed_checked`) instead of the all-or-nothing
+    // `to_owned_all_cursors`, so whatever converted before the failing
+    // cursor survives into the reported `Partial` the same way it already
+    // does on `eval.rs`'s equivalent path.
     macro_rules! escape_generic {
         ($control:expr) => {{
             let control = $control;
             let out = if any_owned {
                 owned
             } else {
-                match to_owned_all_cursors(&cursors) {
+                match to_owned_all_cursors_checked(&cursors) {
                     Ok(vs) => vs,
-                    Err(e) => {
+                    Err((prefix, e)) => {
                         let control = match control {
                             Control::Halt(code) => Control::Halt(code),
                             Control::Error(_) | Control::Break(_) => Control::Error(e),
                         };
-                        return partial_generic(Vec::new(), control);
+                        return partial_generic(prefix, control);
                     }
                 }
             };
@@ -17218,6 +17247,36 @@ mod tests {
             summarize(b"[[7],[8]]", "(.[0],(.[1],break $out))[(0+0):2]"),
             partial_break(&["[7]", "[8]"])
         );
+    }
+
+    /// #2145: `eval_index_expr`'s `escape_generic!` macro used to discard
+    /// the *entire* already-accumulated prefix if converting `cursors` to
+    /// owned values itself failed (a "double fault" -- the failure
+    /// converting the prefix, on top of the separate error/break/halt that
+    /// triggered folding it into a `Partial` in the first place). The
+    /// target `(.arr[0],.arr[1])` is a genuine multi-output generator
+    /// (#2032 re-evaluates it fresh per key): key `"bad"` succeeds for
+    /// both elements, pushing a cursor to `"ok"` and one to the
+    /// undecodable string into `cursors`; key `5` then fails to index
+    /// either element (both are objects) on its first target, triggering
+    /// `escape_generic!` while `cursors` still holds both -- `"ok"` must
+    /// survive into the reported prefix, not just `control`. Verified
+    /// against jq 1.7.1 for the non-corrupted shape: `{"arr":[{"bad":"ok"},
+    /// {"bad":"safe"}]} | (.arr[0],.arr[1])[("bad",5)]` prints `"ok"` then
+    /// `"safe"` before raising "Cannot index object with number".
+    #[test]
+    fn generic_escape_generic_keeps_convertible_prefix_on_double_fault_2145() {
+        let json: &[u8] = b"{\"arr\":[{\"bad\":\"ok\"},{\"bad\":\"\xff\xfe\"}]}";
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(r#"(.arr[0],.arr[1])[("bad",5)]"#).unwrap();
+        match eval_with_cursor(&expr, index.root(json)) {
+            GenericResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::String("ok".to_string())]);
+                assert!(e.is_decode_failure(), "{e:?}");
+                assert!(e.message.contains("invalid UTF-8"), "{e:?}");
+            }
+            other => panic!("expected Partial([\"ok\"], decode Error), got {other:?}"),
+        }
     }
 
     #[test]
