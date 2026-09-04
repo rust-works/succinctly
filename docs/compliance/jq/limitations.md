@@ -3882,6 +3882,67 @@ magnitude error, a narrower divergence from real jq than #2240's own issue text 
 scoped this fix to. Fixing the underlying large-integer-precision gap itself (so `1.` could
 be accepted safely at every magnitude) is out of scope for #2240 and not separately filed.
 
+### `foreach`/`reduce`'s INIT-fork re-entry: SOURCE reads real jq's synthetic `null`, not the ambient input — recorded on its merits, ADR-0018 rule 4 (#534, #2163)
+
+`foreach`/`reduce`'s parser accepted a top-level comma in the INIT slot from #534 onward
+(`foreach SOURCE as $x (INIT1, INIT2; ...)`), which forks the whole construct once per INIT
+output, each fork re-running over the same SOURCE stream. Real jq has an internal quirk here
+that this file never documented until now, even though the divergence itself has shipped
+since #534 and is already pinned by `test_reduce_comma_slots`/`test_foreach_comma_slots`
+(`src/jq/eval.rs`) — an ADR-0018 rule 6 gap this entry closes:
+
+```console
+$ echo '[1,2,3]' | jq -c '[reduce .[] as $x (0,1; .+$x)]'
+[6]
+jq: error (at <stdin>:0): Cannot iterate over null (null)
+$ echo '[1,2,3]' | succinctly jq -c '[reduce .[] as $x (0,1; .+$x)]'
+[6,7]
+```
+
+Real jq's own bytecode compiler re-enters SOURCE's evaluation once per INIT fork, and for
+every fork after the first, the ambient input (`.`) SOURCE sees there is a synthetic `null`
+— not the real document — an artifact of how jq's VM threads the input register across a
+backtrack boundary, not a designed feature. `.[]` on that synthetic `null` raises "Cannot
+iterate over null"; a null-tolerant field read instead answers `null` silently
+([#2163](https://github.com/rust-works/succinctly/issues/2163) extended the original #534
+finding to this shape):
+
+```console
+$ echo '{"a":1,"c":2}' | jq -c '[foreach (.a) as $k ((0,.c); $k)]'
+[1,null]
+$ echo '{"a":1,"c":2}' | succinctly jq -c '[foreach (.a) as $k ((0,.c); $k)]'
+[1,1]
+```
+
+succinctly's evaluators (`src/jq/eval.rs` and `src/jq/eval_generic.rs` — this is a
+shared-core behavior, pinned identical across both by
+`test_parity_foreach_reduce_init_fork_source_reads_ambient_input_2163` in
+`tests/jq_evaluator_parity_tests.rs`) compute SOURCE's values once, upfront, and reuse them
+across every INIT fork — so every fork sees SOURCE evaluated against the real ambient input,
+consistently. `.[]` never sees a `null` to fail on, and a field read never silently degrades
+to `null`.
+
+This does not fit any of ADR-0018 rule 4's four named conditions letter-for-letter (the
+output is readable, nothing is corrupted, and the process doesn't die either way) — recorded
+here on its merits instead, matching this file's own "A structurally malformed value doesn't
+abort the rest of a multi-value stream" precedent for that same carve-out shape. Matching
+jq's quirk exactly would mean re-deriving jq's own undocumented VM register-threading rule
+(which expression shapes get a fresh backtrack point, and what `.` reads as across one) and
+restructuring the shared INIT-fork core in **three** evaluators (`eval.rs`'s value evaluator,
+`eval_generic.rs`'s generic/CLI evaluator, and the path-context evaluator's own
+`Expr::Foreach`/`resolve_reduce` arms) to re-evaluate SOURCE per-fork against a synthetic
+`null` document, rather than the current once-upfront computation
+(`input_values`/`substituted_*_matrix`) all three share. A prior attempt at a narrower
+version of this fix (nulling only the bound pattern variable, not re-deriving SOURCE itself)
+regressed a passing test
+(`test_eval_reduce_init_partial_prefix_still_forks_when_trailing_error_suppressed_1934`),
+confirming the narrow form doesn't hold up and the full form is a genuine multi-evaluator
+architectural change, not a local fix. Given `.[]`'s identical case already went unfixed
+since #534 with no user-visible complaint, and succinctly's own behavior is the more useful
+of the two here (a consistent value instead of a silent `null`/hard error split depending on
+fork position) — the value bar for that reconstruction doesn't clear the cost, so it is
+recorded as an accepted divergence rather than a queued fix.
+
 ## Provenance
 
 | Artifact           | Path                                                                                                       |
