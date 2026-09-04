@@ -17461,10 +17461,33 @@ fn eval_slice_bound<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
             QueryResult::Partial(vs, control) => (vs, Some(control)),
         };
-    let converted = raw
-        .iter()
-        .map(|v| owned_bound_to_i64(v, round).map_err(Control::Error))
-        .collect::<Result<Vec<_>, _>>()?;
+    // #2372: used to be a bare `.collect::<Result<Vec<_>, _>>()?`, which
+    // discarded every already-converted bound (and silently replaced
+    // `escape`, if the raw generator had one pending) on the first
+    // non-numeric bound. A conversion failure only ever touches a value the
+    // generator already produced, strictly before whatever produced
+    // `escape` in true generator order, so it unconditionally outranks
+    // `escape` -- no `Halt`-survives nuance needed here the way a genuine
+    // secondary *rendering* failure elsewhere in this file needs (that
+    // question doesn't arise: this failure IS the primary event, not a
+    // problem rendering one). Confirmed live against jq 1.7.1, including
+    // the `Halt` case: `.[(0,"x",error("y")):3]` on `[10,20,30]` raises
+    // "Array/string slice indices must be integers" (not `y`), and
+    // `.[(0,"x",halt):3]` raises the identical message rather than exiting
+    // silently -- `halt` is never reached either. yq mode keeps the
+    // pre-existing conservative discard (mirrors the generator-escape gate
+    // above): real yq has no clean model for a computed comma-bound at all
+    // (confirmed live against yq v4.53.3 -- `.[(0,"x"):3]` on `[10,20,30]`
+    // rejects the bound outright, "expected to find 1 number, got 2
+    // instead"), so there's no oracle basis for streaming a prefix here.
+    let mut converted = vec_with_capacity(raw.len());
+    for v in &raw {
+        match owned_bound_to_i64(v, round) {
+            Ok(i) => converted.push(i),
+            Err(e) if S::TAG == EvalTag::Yq => return Err(Control::Error(e)),
+            Err(e) => return Ok((converted, Some(Control::Error(e)))),
+        }
+    }
     Ok((converted, escape))
 }
 
@@ -32804,14 +32827,17 @@ fn eval_slice_bound_with_path_context<W: Clone + AsRef<[u64]>, S: EvalSemantics>
     if S::TAG == EvalTag::Yq && escape.is_some() {
         raw = Vec::new();
     }
-    let converted = raw
-        .into_iter()
-        .map(|v| {
-            owned_bound_to_i64(&v, round)
-                .map(|i| (v, i))
-                .map_err(Control::Error)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    // #2372: mirrors `eval_slice_bound`'s identical fix (`eval.rs`, above)
+    // exactly -- see that function's own doc comment for the full
+    // rationale and live-oracle verification, not repeated here.
+    let mut converted = vec_with_capacity(raw.len());
+    for v in raw {
+        match owned_bound_to_i64(&v, round) {
+            Ok(i) => converted.push((v, i)),
+            Err(e) if S::TAG == EvalTag::Yq => return Err(Control::Error(e)),
+            Err(e) => return Ok((converted, Some(Control::Error(e)))),
+        }
+    }
     Ok((converted, escape))
 }
 
@@ -53939,6 +53965,63 @@ mod tests {
         );
     }
 
+    /// #2372: `eval_slice_bound`'s own bound *conversion* step (distinct
+    /// from #2351's *generator-escape* fix immediately below) used a bare
+    /// `.collect::<Result<Vec<_>, _>>()?`, discarding every already-
+    /// converted bound on the first non-numeric one. `1` converts to `1`
+    /// fine; `"x"` fails conversion before the generator's own later
+    /// `error("y")` is ever reached. Verified against jq 1.7.1: `echo
+    /// '[10,20,30]' | jq -c '.[(1,"x",error("y")):3]'` prints `[20,30]`
+    /// (from the one successfully-converted bound `1`) then raises "Array/
+    /// string slice indices must be integers" -- *not* `y`, confirming a
+    /// conversion failure unconditionally outranks a later-pending
+    /// generator escape (no `Halt`-survives nuance needed: the failure is
+    /// on a value produced strictly before whatever triggered the pending
+    /// escape, in true generator order).
+    #[test]
+    fn test_slice_bound_conversion_failure_keeps_prefix_in_jq_mode_2372() {
+        query!(b"[10,20,30]", r#".[(1,"x",error("y")):3]"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![
+                    OwnedValue::Array(vec![OwnedValue::Int(20), OwnedValue::Int(30)]),
+                ]);
+                assert!(e.message.contains("integers"), "{}", e.message);
+            }
+        );
+    }
+
+    /// #2372 sibling: the same conversion-failure priority holds even when
+    /// the generator's later branch is `halt` rather than `error` --
+    /// confirmed live against jq 1.7.1: `.[(1,"x",halt):3]` on `[10,20,30]`
+    /// raises the identical conversion error rather than exiting silently
+    /// (`halt` is never reached).
+    #[test]
+    fn test_slice_bound_conversion_failure_outranks_pending_halt_2372() {
+        query!(b"[10,20,30]", r#".[(1,"x",halt):3]"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![
+                    OwnedValue::Array(vec![OwnedValue::Int(20), OwnedValue::Int(30)]),
+                ]);
+                assert!(e.message.contains("integers"), "{}", e.message);
+            }
+        );
+    }
+
+    /// #2372: yq mode keeps the pre-fix conservative discard -- real yq has
+    /// no clean model for a computed comma-bound at all (confirmed live
+    /// against yq v4.53.3: `.[(1,"x"):3]` on `[10,20,30]` rejects the bound
+    /// outright, "expected to find 1 number, got 2 instead"), so this
+    /// mirrors the generator-escape gate's own yq carve-out rather than
+    /// streaming a prefix with no oracle basis for it.
+    #[test]
+    fn test_slice_bound_conversion_failure_discarded_in_yq_mode_2372() {
+        yq_query!(b"[10,20,30]", r#".[(1,"x",error("y")):3]"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "y");
+            }
+        );
+    }
+
     /// #2351: unlike #2226/#2326's own target/key gates, `eval_slice_bound`
     /// had *no* yq-mode gate at all -- it unconditionally kept a slice
     /// *bound*'s own escaped generator's prefix in both modes. This is the
@@ -54129,6 +54212,34 @@ mod tests {
         yq_query!(b"[1,2,3]", r#"path(.[0:(1,2,error("x"))])"#,
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    /// #2372: `eval_slice_bound_with_path_context`'s identical conversion-
+    /// failure gap (mirrors `eval_slice_bound`'s own #2372 fix above; see
+    /// that function's tests for the live-oracle-verified underlying
+    /// semantics -- `key` itself has no jq oracle, same caveat as the
+    /// #2351-review tests below). One bound (`1`) converts before `"x"`
+    /// fails, so `key` reports that one pair's own path component before
+    /// raising.
+    #[test]
+    fn test_slice_bound_path_context_conversion_failure_keeps_prefix_in_jq_mode_2372() {
+        query!(b"[10,20,30]", r#".[(1,"x",error("y")):3] | key"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"{"start":1,"end":3}"#]);
+                assert!(e.message.contains("integers"), "{}", e.message);
+            }
+        );
+    }
+
+    /// #2372: yq mode keeps the pre-fix conservative discard through the
+    /// path-context dispatch too, same as the plain evaluator's own gate.
+    #[test]
+    fn test_slice_bound_path_context_conversion_failure_discarded_in_yq_mode_2372() {
+        yq_query!(b"[10,20,30]", r#".[(1,"x",error("y")):3] | key"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "y");
             }
         );
     }
