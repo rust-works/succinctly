@@ -63138,6 +63138,38 @@ mod tests {
         );
     }
 
+    /// #2163: the `test_reduce_comma_slots`/`test_foreach_comma_slots` INIT-fork
+    /// divergence above isn't specific to a `.[]`-iterating SOURCE — real jq's
+    /// underlying quirk (a later INIT fork's own re-evaluation of SOURCE runs
+    /// against a synthetic `null` ambient document, not the real one) fires for
+    /// *any* SOURCE that reads `.`, including a bare field access with no
+    /// iteration at all. Verified live against jq 1.7.1:
+    ///
+    /// ```console
+    /// $ echo '{"a":1,"c":2}' | jq -c '[foreach (.a) as $k ((0,.c); $k)]'
+    /// [1,null]
+    /// $ echo '{"a":1,"c":2}' | jq -c '[reduce (.a) as $k ((0,.c); $k)]'
+    /// [1,null]
+    /// ```
+    ///
+    /// succinctly re-evaluates SOURCE identically for every INIT fork instead
+    /// (each fork's own `.` is the real ambient input), so a null-tolerant
+    /// field read like `.a` answers the same value both times, `1` — pinning
+    /// that consistent value here per the same divergence already accepted for
+    /// the `.[]` case (see `docs/compliance/jq/limitations.md`'s "INIT-fork
+    /// re-entry" entry).
+    #[test]
+    fn test_foreach_reduce_init_fork_source_reads_ambient_input_2163() {
+        assert_eq!(
+            outputs(br#"{"a":1,"c":2}"#, "[foreach (.a) as $k ((0,.c); $k)]"),
+            ["[1,1]"]
+        );
+        assert_eq!(
+            outputs(br#"{"a":1,"c":2}"#, "[reduce (.a) as $k ((0,.c); $k)]"),
+            ["[1,1]"]
+        );
+    }
+
     #[test]
     fn test_range() {
         // range(n) - generates 0 to n-1
