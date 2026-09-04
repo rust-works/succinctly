@@ -91,7 +91,10 @@ const MATERIALIZER_FN_PREFIX: &str = "to_owned";
 ///   in the CLI crate's `jq_runner.rs`, which has no `optional` in scope and is
 ///   not one of the files scanned here. Leaving it out keeps the premise
 ///   `debug_assert_materialization_error` pins ("this family raises only decode
-///   failures") true of exactly the set the audit covers.
+///   failures") true of exactly the set the audit covers -- enforced by
+///   [`test_to_owned_checked_has_no_call_sites_outside_its_own_definition_2367`]
+///   below, since nothing else here would notice a second call site appearing
+///   inside either evaluator (#2367).
 const MATERIALIZER_FN_EXCLUSIONS: &[&str] = &[
     "to_owned_lossy",
     "to_owned_lossy_at_depth",
@@ -672,5 +675,145 @@ fn test_style_0012_exemption_spellings_are_still_in_use_2334() {
         eval_rs.contains(EXEMPT_MARKER),
         "no `// {EXEMPT_MARKER}` marker left in eval.rs -- the exemption \
          convention has been removed without removing the audit",
+    );
+}
+
+/// Pins the premise `MATERIALIZER_FN_EXCLUSIONS`'s `to_owned_checked` entry
+/// rests on (#2367).
+///
+/// `to_owned_checked`/`to_owned_checked_at_depth` are excluded from the main
+/// audit above because they are the one member of the materialization family
+/// whose error is not always `decode_failure`-tagged (#2299) -- routing them
+/// through `debug_assert_materialization_error` would misfire on exactly the
+/// nesting-depth error they exist to return, not a bug. That exclusion is
+/// sound only because the family's one call site,
+/// `jq_runner.rs::materialize_stream_item`, sits outside both evaluators
+/// scanned here and has no live `optional` in scope. Neither half of the
+/// STYLE-0012 guard would notice a second call site appearing inside
+/// `eval.rs`/`eval_generic.rs`: the exclusion list keeps it invisible to the
+/// main audit above, and the runtime assert in `error.rs` cannot be added at
+/// its call site without misfiring on the very error class it returns by
+/// design. Rather than widen either half to special-case a function that
+/// cannot use them, this test pins the premise directly: neither evaluator
+/// may call `to_owned_checked`/`to_owned_checked_at_depth` at all, outside
+/// their own mutually-recursive definitions.
+#[test]
+fn test_to_owned_checked_has_no_call_sites_outside_its_own_definition_2367() {
+    const SELF_FAMILY: &[&str] = &["to_owned_checked", "to_owned_checked_at_depth"];
+
+    struct Finder<'a> {
+        lines: &'a [&'a str],
+        path: &'a str,
+        stack: Vec<String>,
+        violations: Vec<String>,
+    }
+
+    impl Finder<'_> {
+        fn in_self_family(&self) -> bool {
+            self.stack
+                .last()
+                .is_some_and(|f| SELF_FAMILY.contains(&f.as_str()))
+        }
+
+        fn record(&mut self, name: &str, span: Span) {
+            if self.in_self_family() {
+                return;
+            }
+            let line = span.start().line;
+            let snippet = self
+                .lines
+                .get(line.saturating_sub(1))
+                .map(|s| s.trim())
+                .unwrap_or_default();
+            self.violations.push(format!(
+                "{}:{line} in `{}` calls `{name}`:\n      {snippet}",
+                self.path,
+                self.stack.last().map_or("<top level>", String::as_str),
+            ));
+        }
+    }
+
+    impl<'ast> Visit<'ast> for Finder<'_> {
+        fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+            // `#[cfg(test)] mod tests` -- unit tests legitimately call
+            // `to_owned_checked` directly (#2299's own tests do, right next
+            // to its definition), same exemption as the main audit's `Audit`
+            // above.
+            if has_cfg_test(&node.attrs) {
+                return;
+            }
+            visit::visit_item_mod(self, node);
+        }
+
+        fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+            self.stack.push(node.sig.ident.to_string());
+            visit::visit_item_fn(self, node);
+            self.stack.pop();
+        }
+
+        fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+            self.stack.push(node.sig.ident.to_string());
+            visit::visit_impl_item_fn(self, node);
+            self.stack.pop();
+        }
+
+        fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = &*node.func {
+                if let Some(last) = path.path.segments.last() {
+                    let name = last.ident.to_string();
+                    if SELF_FAMILY.contains(&name.as_str()) {
+                        self.record(&name, node.span());
+                    }
+                }
+            }
+            visit::visit_expr_call(self, node);
+        }
+
+        fn visit_macro(&mut self, node: &'ast syn::Macro) {
+            // Same defense as the main audit's own macro scan: a call hidden
+            // inside a macro's unparsed token stream would otherwise walk
+            // straight past this visitor.
+            let flat = node.tokens.to_string();
+            let words: Vec<&str> = flat
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .collect();
+            for name in SELF_FAMILY {
+                if words.contains(name) {
+                    self.record(name, node.span());
+                }
+            }
+            visit::visit_macro(self, node);
+        }
+    }
+
+    let mut violations = Vec::new();
+    for (path, src) in SOURCES {
+        let file = syn::parse_file(src).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let lines: Vec<&str> = src.lines().collect();
+        let mut finder = Finder {
+            lines: &lines,
+            path,
+            stack: Vec::new(),
+            violations: Vec::new(),
+        };
+        finder.visit_file(&file);
+        violations.append(&mut finder.violations);
+    }
+
+    assert!(
+        violations.is_empty(),
+        "#2367: {} call site(s) of `to_owned_checked`/`to_owned_checked_at_depth` \
+         found outside their own definition:\n\n{}\n\n\
+         `to_owned_checked` is deliberately excluded from both halves of the \
+         STYLE-0012 guard (see `MATERIALIZER_FN_EXCLUSIONS`'s doc comment) \
+         because it is the one member of the materialization family that can \
+         raise a non-decode-failure error, and its only sanctioned call site \
+         (`jq_runner.rs::materialize_stream_item`) is outside both evaluators. \
+         A new call site inside `eval.rs`/`eval_generic.rs` invalidates that \
+         exclusion -- see issue #2367 for what to do instead (route it through \
+         the main audit like any other materializer, or give it its own \
+         reasoned treatment) before adding one.",
+        violations.len(),
+        violations.join("\n"),
     );
 }
