@@ -17355,6 +17355,18 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// Keeps the bound generator's own partial prefix rather than discarding it
 /// on escape (#1528) -- see `eval_generic::eval_slice_bound`'s own doc
 /// comment for the full rationale, shared verbatim here.
+///
+/// #2351: jq-only. Real yq does not stream a slice *bound*'s own escaped
+/// generator's prefix either -- the same carve-out `eval_index_expr`'s
+/// (#2226) and its `eval_slice_expr`/key-shaped sibling's (#2326) own target/
+/// key evaluations already apply, just never wired up here even though this
+/// function feeds both of `E[K1:K2]`'s bounds. Live-verified against yq
+/// v4.53.3, both bounds independently: `.[(0,1,error("x")):3]` on `[1,2,3]`
+/// prints only `Error: x` (`K1`, this repro's own shape), and `.[0:(1,2,
+/// error("x"))]` prints only `Error: x` too (`K2`) -- neither the `[1,2,3]`/
+/// `[2,3]` prefix succinctly used to stream pre-fix. yq mode keeps the old
+/// conservative discard; jq mode is unaffected (matches jq 1.7.1: both
+/// shapes still print their prefix before raising).
 fn eval_slice_bound<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     bound: &Option<Box<Expr>>,
     value: StandardJson<'_, W>,
@@ -17385,6 +17397,13 @@ fn eval_slice_bound<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Halt(code) => (Vec::new(), Some(Control::Halt(code))),
             QueryResult::OneCursor(_) => {
                 unreachable!("materialize_cursor should have converted this")
+            }
+            // #2351: yq mode discards this bound generator's own escaped
+            // prefix (see the function's own doc comment above) -- mirrors
+            // #2226's/#2326's identical `S::TAG == EvalTag::Yq` gate on their
+            // own target/key `Partial` arms.
+            QueryResult::Partial(_vs, control) if S::TAG == EvalTag::Yq => {
+                (Vec::new(), Some(control))
             }
             QueryResult::Partial(vs, control) => (vs, Some(control)),
         };
@@ -53524,6 +53543,26 @@ mod tests {
         );
     }
 
+    /// #2351: unlike #2226/#2326's own target/key gates, `eval_slice_bound`
+    /// had *no* yq-mode gate at all -- it unconditionally kept a slice
+    /// *bound*'s own escaped generator's prefix in both modes. This is the
+    /// issue's own canonical repro, the start bound (`K1`) escaping.
+    /// Verified against jq 1.7.1: `echo '[1,2,3]' | jq -c
+    /// '.[(0,1,error("x")):3]'` prints `[1,2,3]` then `[2,3]` before
+    /// raising -- jq mode is unaffected by this fix.
+    #[test]
+    fn test_slice_bound_start_own_partial_prefix_preserved_in_jq_mode_2351() {
+        query!(b"[1,2,3]", r#".[(0,1,error("x")):3]"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![
+                    OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3)]),
+                    OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Int(3)]),
+                ]);
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
     /// #2326 sibling: `break` instead of `error`, same key-generator shape.
     /// No enclosing `label $out` in the filter itself, so the `Partial`+
     /// `Break` this fix produces propagates uncaught to this query's own
@@ -53549,6 +53588,24 @@ mod tests {
         query!(br"[10,20,30,40]", r#".[(0,1,error("x"))]"#,
             QueryResult::Partial(vs, Control::Error(e)) => {
                 assert_eq!(vs, vec![OwnedValue::Int(10), OwnedValue::Int(20)]);
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    /// #2351 sibling: the end bound (`K2`) escaping instead of the start
+    /// bound, so both of `eval_slice_bound`'s two call sites (`start` and
+    /// `end` in `eval_slice_expr`) are covered independently. Verified
+    /// against jq 1.7.1: `echo '[1,2,3]' | jq -c '.[0:(1,2,error("x"))]'`
+    /// prints `[1]` then `[1,2]` before raising -- jq mode is unaffected.
+    #[test]
+    fn test_slice_bound_end_own_partial_prefix_preserved_in_jq_mode_2351() {
+        query!(b"[1,2,3]", r#".[0:(1,2,error("x"))]"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![
+                    OwnedValue::Array(vec![OwnedValue::Int(1)]),
+                    OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
+                ]);
                 assert_eq!(e.message, "x");
             }
         );
@@ -53581,6 +53638,32 @@ mod tests {
     #[test]
     fn test_index_expr_key_partial_prefix_still_discarded_in_yq_mode_2326() {
         yq_query!(br"[10,20,30]", r#".[(1,error("x"))]"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    /// #2351: yq mode's own new gate -- real yq does not stream a slice
+    /// bound's own escaped generator's prefix at all, matching #2226's/
+    /// #2326's identical carve-out for the target/key cases. Verified live
+    /// against yq v4.53.3: `.[(0,1,error("x")):3]` on `[1,2,3]` prints only
+    /// `Error: x`, no `[1,2,3]`/`[2,3]` prefix.
+    #[test]
+    fn test_slice_bound_start_own_partial_prefix_discarded_in_yq_mode_2351() {
+        yq_query!(b"[1,2,3]", r#".[(0,1,error("x")):3]"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    /// #2351 sibling: the same yq-mode gate for the end bound (`K2`).
+    /// Verified live against yq v4.53.3: `.[0:(1,2,error("x"))]` on
+    /// `[1,2,3]` prints only `Error: x`, no `[1]`/`[1,2]` prefix.
+    #[test]
+    fn test_slice_bound_end_own_partial_prefix_discarded_in_yq_mode_2351() {
+        yq_query!(b"[1,2,3]", r#".[0:(1,2,error("x"))]"#,
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "x");
             }
