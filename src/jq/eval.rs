@@ -16111,6 +16111,22 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // error) — and only attach `outer_control` once that's done, unless
         // piping itself fails first, in which case that failure is what the
         // generator actually reaches and `outer_control` never surfaces.
+        //
+        // #2373: jq-only, matching #2226/#2328's own established gate for
+        // the identical "a generator's own Partial prefix" question
+        // elsewhere in this file -- real yq does not stream a preceding
+        // pipe stage's own escaped-generator prefix either (confirmed live
+        // against yq v4.53.3: `([1,2],[3,4],error("x")) | length` prints
+        // only `Error: x`, no `2`/`2`). This is `eval_pipe`'s own *general*
+        // mechanism (`E | F` for any `F`, not specific to indexing) --
+        // #2373 itself was filed narrowly against the literal-bounds
+        // index/slice fast path, but `E[0]` on a non-trivial `E` desugars
+        // to `E | .[0]`, reaching this exact arm; the fix here also closes
+        // the broader `E | F` gap the issue's own repro happened to
+        // surface only one instance of.
+        QueryResult::Partial(_vs, outer_control) if S::TAG == EvalTag::Yq => {
+            partial(Vec::new(), outer_control)
+        }
         QueryResult::Partial(vs, outer_control) => {
             pipe_owned_prefix::<S, W>(rest, vs, Some(outer_control), optional)
         }
@@ -31487,6 +31503,14 @@ fn continue_rest_with_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // matches this arm's own "keep the prefix, don't discard it" shape
         // (the same policy `Expr::Iterate`'s identical call already uses),
         // not the array/object-construction "discard everything" policy.
+        //
+        // #2373: jq-only, matching #2226/#2328's own established gate --
+        // see `eval_pipe`'s identical fix (above) for the full rationale
+        // and live-oracle verification, not repeated at every one of this
+        // family's near-identical helpers.
+        QueryResult::Partial(_vs, outer_control) if S::TAG == EvalTag::Yq => {
+            partial(Vec::new(), outer_control)
+        }
         QueryResult::Partial(vs, outer_control) => {
             let mut results = Vec::new();
             for v in vs {
@@ -31700,6 +31724,13 @@ fn continue_rest_with_paths<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
         QueryResult::Halt(code) => QueryResult::Halt(code),
+        // #2373: jq-only, matching #2226/#2328's own established gate --
+        // see `eval_pipe`'s identical fix (above) for the full rationale
+        // and live-oracle verification, not repeated at every one of this
+        // family's near-identical helpers.
+        QueryResult::Partial(_vs, outer_control) if S::TAG == EvalTag::Yq => {
+            partial(Vec::new(), outer_control)
+        }
         QueryResult::Partial(vs, outer_control) => {
             let mut results = Vec::new();
             for v in vs {
@@ -31859,6 +31890,14 @@ fn continue_rest_with_fresh_root<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // error while still correctly keeping the already-produced prefix.
         // `atomic: false` matches this arm's "keep the prefix" shape, not
         // an array/object-construction "discard everything" policy.
+        //
+        // #2373: jq-only, matching #2226/#2328's own established gate --
+        // see `eval_pipe`'s identical fix (above) for the full rationale
+        // and live-oracle verification, not repeated at every one of this
+        // family's near-identical helpers.
+        QueryResult::Partial(_vs, outer_control) if S::TAG == EvalTag::Yq => {
+            partial(Vec::new(), outer_control)
+        }
         QueryResult::Partial(vs, outer_control) => {
             let mut results = Vec::new();
             for v in vs {
@@ -55427,6 +55466,47 @@ mod tests {
         );
     }
 
+    /// #2373: `eval_pipe`'s own general mechanism (`E | F` for any `F`, not
+    /// specific to indexing) -- issue #2373 was filed narrowly against the
+    /// literal-bounds index/slice fast path specifically (`E[0]` on a
+    /// non-trivial `E` desugars to `E | .[0]`, reaching this exact
+    /// mechanism), but the underlying gap is general. Confirmed live
+    /// against yq v4.53.3: `([1,2],[3,4],error("x")) | length` prints only
+    /// `Error: x`, no `2`/`2`. jq mode is unaffected (matches
+    /// `regression_issue_400_pipe_keeps_the_prefix_before_an_error` above).
+    #[test]
+    fn test_pipe_partial_prefix_discarded_in_yq_mode_2373() {
+        yq_query!(b"null", r#"(1,2,error("x")) | .+10"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    /// #2373: the issue's own canonical repro -- a literal-bounds index
+    /// bracket on a non-trivial target. Confirmed live against yq v4.53.3:
+    /// `([1,2],[3,4],error("x"))[0]` prints only `Error: x`, no `1`/`3`.
+    #[test]
+    fn test_literal_index_bracket_partial_prefix_discarded_in_yq_mode_2373() {
+        yq_query!(b"null", r#"([1,2],[3,4],error("x"))[0]"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    /// #2373 sibling: the literal-bounds *slice* bracket, the issue's other
+    /// named repro shape. Confirmed live against yq v4.53.3:
+    /// `([1,2],[3,4],error("x"))[0:1]` prints only `Error: x`.
+    #[test]
+    fn test_literal_slice_bracket_partial_prefix_discarded_in_yq_mode_2373() {
+        yq_query!(b"null", r#"([1,2],[3,4],error("x"))[0:1]"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
     #[test]
     fn regression_issue_400_as_binding_keeps_the_prefix_before_an_error() {
         // Verified against jq 1.7.1: `(1,2,error("x")) as $v | $v + 10` is
@@ -73784,6 +73864,80 @@ mod tests {
                 assert_eq!(e.message, "boom");
             }
             other => panic!("expected Partial, got {other:?}"),
+        }
+    }
+
+    /// #2373: yq mode keeps the pre-fix conservative discard for
+    /// `continue_rest_with_context`'s own `Partial` arm too -- mirrors
+    /// `eval_pipe`'s identical fix. Direct call with a hand-built
+    /// `QueryResult::Partial` `intermediate`, not a parsed filter: review
+    /// found that `(1,2,error("x")) | file_index` (the natural-looking CLI
+    /// trigger) actually dispatches through `eval_stage_with_path_context`'s
+    /// own `Expr::Comma` arm instead, never reaching this function's own
+    /// guard at all (confirmed by temporarily swapping this guard for
+    /// `unreachable!()`: the CLI-style test still passed). A direct call is
+    /// unambiguous about which arm it exercises.
+    #[test]
+    fn test_continue_rest_with_context_partial_prefix_discarded_in_yq_mode_2373() {
+        let rest_expr = parse("tostring").unwrap();
+        let intermediate: QueryResult<'_, Vec<u64>> = QueryResult::Partial(
+            vec![OwnedValue::Int(1), OwnedValue::Int(2)],
+            Control::Error(EvalError::new("x")),
+        );
+        match continue_rest_with_context::<Vec<u64>, YqSemantics>(
+            intermediate,
+            core::slice::from_ref(&rest_expr),
+            &OwnedValue::Null,
+            None,
+            &[],
+            false,
+        ) {
+            QueryResult::Error(e) => assert_eq!(e.message, "x"),
+            other => panic!("expected bare Error, got {other:?}"),
+        }
+    }
+
+    /// #2373: `continue_rest_with_paths`'s own `Partial` arm, mirroring
+    /// `continue_rest_with_context`'s identical fix -- direct call, same
+    /// reasoning as that test for why (no natural-looking CLI filter is
+    /// known to reach this specific function rather than a sibling).
+    #[test]
+    fn test_continue_rest_with_paths_partial_prefix_discarded_in_yq_mode_2373() {
+        let rest_expr = parse("tostring").unwrap();
+        let paired: QueryResult<'_, Vec<u64>> = QueryResult::Partial(
+            vec![OwnedValue::Int(1), OwnedValue::Int(2)],
+            Control::Error(EvalError::new("x")),
+        );
+        match continue_rest_with_paths::<Vec<u64>, YqSemantics>(
+            paired,
+            core::slice::from_ref(&rest_expr),
+            &OwnedValue::Null,
+            None,
+            &[],
+            false,
+        ) {
+            QueryResult::Error(e) => assert_eq!(e.message, "x"),
+            other => panic!("expected bare Error, got {other:?}"),
+        }
+    }
+
+    /// #2373: `continue_rest_with_fresh_root`'s own `Partial` arm, same
+    /// shape as the two siblings above.
+    #[test]
+    fn test_continue_rest_with_fresh_root_partial_prefix_discarded_in_yq_mode_2373() {
+        let rest_expr = parse("tostring").unwrap();
+        let intermediate: QueryResult<'_, Vec<u64>> = QueryResult::Partial(
+            vec![OwnedValue::Int(1), OwnedValue::Int(2)],
+            Control::Error(EvalError::new("x")),
+        );
+        match continue_rest_with_fresh_root::<Vec<u64>, YqSemantics>(
+            intermediate,
+            core::slice::from_ref(&rest_expr),
+            None,
+            false,
+        ) {
+            QueryResult::Error(e) => assert_eq!(e.message, "x"),
+            other => panic!("expected bare Error, got {other:?}"),
         }
     }
 

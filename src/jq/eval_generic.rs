@@ -3863,6 +3863,22 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
             // this stage first — `eval_on_many_owned` already
             // propagates any control the piping itself hits — and
             // only attach `outer_control` once that's done cleanly.
+            //
+            // #2373: jq-only, matching #2226/#2328's own established gate
+            // for the identical "a generator's own Partial prefix" question
+            // elsewhere in this codebase -- real yq does not stream a
+            // preceding pipe stage's own escaped-generator prefix either
+            // (confirmed live against yq v4.53.3: `([1,2],[3,4],error("x"))
+            // | length` prints only `Error: x`, no `2`/`2`). This is the
+            // *general* pipe mechanism (`E | F` for any `F`, not specific to
+            // indexing) -- #2373 itself was filed narrowly against the
+            // literal-bounds index/slice fast path, but `E[0]` on a
+            // non-trivial `E` desugars to `E | .[0]`, reaching this exact
+            // arm; the fix here also closes the broader `E | F` gap the
+            // issue's own repro happened to surface only one instance of.
+            GenericResult::Partial(_vs, outer_control) if S::TAG == EvalTag::Yq => {
+                return partial_generic(Vec::new(), outer_control);
+            }
             GenericResult::Partial(vs, outer_control) => {
                 match eval_on_many_owned::<S, _>(expr, vs, optional) {
                     p @ (GenericResult::Partial(..)
