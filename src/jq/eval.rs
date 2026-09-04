@@ -70292,6 +70292,25 @@ mod tests {
     }
 
     #[test]
+    fn test_delpaths_yq_mode_empty_path_mid_sequence_wipes_to_null_2306() {
+        // #2306: the sequential yq-mode loop's own empty-path case, mixed
+        // with an ordinary key rather than appearing alone -- an earlier
+        // key deletes normally, then the empty path (naming the whole
+        // document) wipes the result to `null`, matching the same
+        // "sequential, mutating between each path" model as every other
+        // case in this test group. `[0]` on `[1,2,3]` first gives `[2,3]`,
+        // then `[]` (the whole document at that point) wipes it. Real yq
+        // itself produces *no output at all* here rather than the literal
+        // value `null` (a separate, already-filed divergence, #2352,
+        // shared with `delpaths([[]])` alone) -- this test checks the
+        // owned value this arm actually returns, not the CLI's rendering
+        // of it.
+        yq_query!(br"[1,2,3]", r"delpaths([[0],[]])",
+            QueryResult::Owned(OwnedValue::Null) => {}
+        );
+    }
+
+    #[test]
     fn test_del_mid_chain_positive_out_of_range_index_extends_with_null_yq_mode_2314() {
         // #2314: #2305's follow-up -- a positive out-of-range index that is
         // *not* the terminal delete step still needs to exist, so the rest
