@@ -746,12 +746,21 @@ fn test_to_owned_checked_has_no_call_sites_outside_its_own_definition_2367() {
         }
 
         fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+            // A standalone `#[cfg(test)] fn` (not wrapped in a `#[cfg(test)]
+            // mod`) is the same legitimate-unit-test case `visit_item_mod`
+            // above exempts -- checked here too so one isn't missed.
+            if has_cfg_test(&node.attrs) {
+                return;
+            }
             self.stack.push(node.sig.ident.to_string());
             visit::visit_item_fn(self, node);
             self.stack.pop();
         }
 
         fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+            if has_cfg_test(&node.attrs) {
+                return;
+            }
             self.stack.push(node.sig.ident.to_string());
             visit::visit_impl_item_fn(self, node);
             self.stack.pop();
