@@ -37572,6 +37572,188 @@ fn rewrite_yq_del_comma_branches(expr: &Expr, root: &OwnedValue) -> Option<Expr>
     }
 }
 
+/// Read-only static walk through a `Field`/`Index`-only prefix (#2324's own
+/// pre-pass detection below), answering exactly what an ordinary read would:
+/// `Null` for a missing object key or an out-of-range array index, matching
+/// `navigate_static_component`'s own read semantics (that function is not
+/// reused directly because it *consumes* its input to avoid a clone on the
+/// hot `=`/`|=` path -- this caller only ever needs to peek, on the rare
+/// error-recovery path below, so borrowing is both simpler and cheaper
+/// here). Returns `Err(())` on a genuine type mismatch -- indexing a
+/// non-container, non-null value -- so the caller can leave that case for
+/// the ordinary `resolve_del_path_branches` path to raise its own
+/// correctly-worded error, exactly as it already does today.
+fn peek_static_prefix<'a>(
+    mut current: &'a OwnedValue,
+    prefix: &[Expr],
+) -> Result<&'a OwnedValue, ()> {
+    const NULL: OwnedValue = OwnedValue::Null;
+    for component in prefix {
+        current = match (component, current) {
+            (Expr::Field(name), OwnedValue::Object(map)) => map.get(name).unwrap_or(&NULL),
+            (Expr::Field(_), OwnedValue::Null) => &NULL,
+            (Expr::Index { idx, .. }, OwnedValue::Array(items)) => {
+                let resolved = if *idx < 0 {
+                    items.len() as i64 + idx
+                } else {
+                    *idx
+                };
+                usize::try_from(resolved)
+                    .ok()
+                    .filter(|&i| i < items.len())
+                    .map_or(&NULL, |i| &items[i])
+            }
+            (Expr::Index { .. }, OwnedValue::Null) => &NULL,
+            // Anything else (a `Field`/`Index` against a scalar) is a
+            // genuine type mismatch -- the caller's own prefix filter
+            // (`trailing_bare_iterate_prefix`) only ever hands this
+            // `Field`/`Index` components, so this arm exists purely so a
+            // future widening of that filter fails closed here instead of
+            // panicking.
+            _ => return Err(()),
+        };
+    }
+    Ok(current)
+}
+
+/// Detect whether `sibling` -- one top-level branch of a `del()` comma group
+/// -- is shaped as a static `Field`/`Index` prefix (no computed key, no
+/// slice, no nested iterate) followed by a bare, optionally `?`-suppressed,
+/// *trailing* `.[]`. Returns the prefix's own flattened components (may be
+/// empty, for a bare `.[]`/`.[]?` branch) when it is; `None` for every other
+/// shape, which [`vivify_del_comma_iterate_targets`] then leaves completely
+/// untouched.
+///
+/// `push_path_components` (already used by `resolve_seq` for the identical
+/// job) does the flattening -- including splicing a `Paren`/nested `Pipe`
+/// and distributing an outer `Optional` over a group -- so this doesn't have
+/// to hand-roll that walk a second time. `Expr::Index`'s own `idx` is always
+/// a resolved literal (the parser folds every constant index into it; a
+/// computed one becomes `Expr::IndexExpr` instead, a different variant this
+/// prefix filter already excludes), so there is no "looks static but isn't"
+/// case to worry about here.
+fn trailing_bare_iterate_prefix(sibling: &Expr) -> Option<Vec<Expr>> {
+    let mut flat = Vec::new();
+    push_path_components(&mut flat, sibling);
+    let last = flat.last()?;
+    let is_trailing_iterate = matches!(last, Expr::Iterate)
+        || matches!(last, Expr::Optional(inner) if matches!(inner.as_ref(), Expr::Iterate));
+    if !is_trailing_iterate {
+        return None;
+    }
+    let prefix = &flat[..flat.len() - 1];
+    prefix
+        .iter()
+        .all(|e| matches!(e, Expr::Field(_) | Expr::Index { .. }))
+        .then(|| prefix.to_vec())
+}
+
+/// #2324's own pre-pass: peel off every top-level `del()` comma branch shaped
+/// as a static `Field`/`Index` prefix followed by a bare trailing `.[]`
+/// ([`trailing_bare_iterate_prefix`]) whose prefix currently reads as `null`
+/// -- genuinely so in the document, or because a positive index along the
+/// way is out of range (an ordinary read answers `null` either way, no error
+/// -- only *iterating* a `null` raises).
+///
+/// `resolve_node`'s own `Expr::Iterate` arm is read-only path-resolution
+/// machinery shared by every other caller (`=`, `|=`, `path()`, an ordinary
+/// read reached through `path()`) and is correct to raise "Cannot iterate
+/// over null" for exactly this value there -- but `del()`'s own comma-
+/// grouped target set is built by feeding the *whole* comma expression
+/// through that same read-based resolver (`resolve_del_path_branches`), so
+/// the same raise fires for a `del()` target too, before the trie this
+/// issue's sibling fixes (#2314/#2323) ever runs. Both of those already
+/// established the correct answer for a *single*, non-comma target
+/// (`delete_path_steps`'s own `Expr::Index`/`Expr::Iterate` arms extend/
+/// vivify instead of raising) -- comma-grouping is what routes around that
+/// machinery entirely (`needs_path_prepass` is unconditionally `true` for
+/// any `Expr::Comma`, so even a single `.[5][]` sibling takes the read-based
+/// `resolve_node` path once it has a comma sibling, where alone it would
+/// have stayed on the `DelPaths::Verbatim` fast path and never touched
+/// `resolve_node` at all).
+///
+/// Rather than teach `resolve_node`'s shared `Expr::Iterate` arm a
+/// del()-specific exception (risking every other path-resolving caller) or
+/// teach the trie a new "vivify but nothing to delete" leaf kind, this
+/// reuses #2314/#2323's own already-correct machinery directly: peel the
+/// offending branch off the comma group and run it through the very same
+/// `delete_at_path` a single-target `del()` call already uses, *before*
+/// `resolve_del_path_branches` ever sees the rest. That ordering matches
+/// real yq's own observed behaviour -- every vivify-eligible branch resolves
+/// against the pristine input, in any relative order, ahead of any sibling's
+/// own structural deletion (an index removal that shifts the array).
+/// Confirmed live against yq v4.53.3: `del(.[5][], .[0])` and
+/// `del(.[0], .[5][])` on `[1,2]` both give `[2, null, null, null, []]` --
+/// same result regardless of which comma position `.[5][]` occupies, and
+/// `del(.[5][], .[2][])`/`del(.[2][], .[5][])` likewise agree
+/// (`[1, 2, [], null, null, []]`) even with two such branches sharing
+/// overlapping padding.
+///
+/// A branch this doesn't recognize (a computed key, a slice, a mid-chain
+/// iterate, `Field`/`Index` on a value that isn't currently `null`) is left
+/// completely untouched and falls through to the unmodified
+/// `resolve_del_path_branches`/trie path exactly as before this fix --
+/// including the case where the prefix isn't even readable without an
+/// actual type error (`peek_static_prefix`'s `Err`), which is left for that
+/// existing path to raise its own correctly-worded complaint.
+///
+/// Returns `Ok(None)` when `path_expr` is not (after unwrapping any
+/// `Expr::Paren`) a `Comma` at all, or no branch in it matched this shape --
+/// the caller uses `path_expr` unchanged. `Ok(Some(remaining))` carries
+/// whatever siblings still need ordinary resolution -- possibly empty,
+/// meaning every branch was consumed here and `result` already holds
+/// `del()`'s complete answer. `Err` is a genuine error surfaced while
+/// applying one of the peeled branches -- propagated exactly like any other
+/// per-step `del()` failure, leaving the caller to turn it into
+/// `QueryResult::None` under the call's own outer `?` exactly as the
+/// ordinary per-path loop already does.
+///
+/// `Expr::Paren` is unwrapped (any nesting depth) before the `Comma` check,
+/// mirroring `rewrite_yq_del_comma_branches`'s own identical unwrap for the
+/// identical reason (#1223): `del((.[5][], .[0]))` parses to
+/// `Expr::Paren(Expr::Comma(...))`, not a bare top-level `Comma`, and is
+/// otherwise syntactically the same query. The returned `remaining` is never
+/// re-wrapped in that `Paren` -- unlike `Expr::Optional`, a bare `Paren` is
+/// fully transparent to every downstream consumer here
+/// (`resolve_node`/`needs_path_prepass`/`delete_at_path` each just recurse
+/// through it), so dropping it changes nothing observable. `Expr::Optional`
+/// itself is deliberately *not* unwrapped the same way: an outer `?` on the
+/// whole comma group is a different, untested shape outside every repro
+/// this issue documents, and isn't obviously transparent the way `Paren`
+/// is.
+fn vivify_del_comma_iterate_targets(
+    path_expr: &Expr,
+    result: &mut OwnedValue,
+) -> Result<Option<Vec<Expr>>, EvalError> {
+    let mut unwrapped = path_expr;
+    while let Expr::Paren(inner) = unwrapped {
+        unwrapped = inner;
+    }
+    let Expr::Comma(siblings) = unwrapped else {
+        return Ok(None);
+    };
+    let mut remaining = vec_with_capacity(siblings.len());
+    let mut handled_any = false;
+    for sibling in siblings {
+        let prefix = trailing_bare_iterate_prefix(sibling)
+            .filter(|prefix| matches!(peek_static_prefix(result, prefix), Ok(OwnedValue::Null)));
+        let Some(prefix) = prefix else {
+            remaining.push(sibling.clone());
+            continue;
+        };
+        handled_any = true;
+        let mut components = prefix;
+        components.push(Expr::Iterate);
+        let branch_expr = if components.len() == 1 {
+            components.into_iter().next().expect("len checked")
+        } else {
+            Expr::Pipe(components)
+        };
+        delete_at_path(result, &branch_expr, false, true, true)?;
+    }
+    Ok(handled_any.then_some(remaining))
+}
+
 /// Builtin: del(path) - delete a single path
 fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     path_expr: &Expr,
@@ -37594,7 +37776,7 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // path (`del(.a?)`) is unaffected — it's already a distinct
     // `Expr::Optional` node baked into `path_expr`, which the walkers still
     // honor on their own.
-    let result = to_owned_or_suppress!(&value, optional);
+    let mut result = to_owned_or_suppress!(&value, optional);
 
     // yq's comma-grouped chained-slice del() pre-rewrite (#1223):
     // `resolve_dynamic_indexes`'s own generic navigation raises a hard type
@@ -37618,6 +37800,41 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             &rewritten_comma_path_expr
         } else {
             path_expr
+        }
+    } else {
+        path_expr
+    };
+
+    // #2324: peel off every comma branch shaped as a static `Field`/`Index`
+    // prefix plus a bare trailing `.[]` whose prefix currently reads `null`
+    // -- see `vivify_del_comma_iterate_targets`'s own doc comment for why
+    // this has to run as its own pre-pass rather than as a fix inside
+    // `resolve_node`/`resolve_del_path_branches` or the delete trie. Mutates
+    // `result` in place (extending/vivifying exactly as the already-correct
+    // single-target `del(.[5][])` form does) and, when it consumed every
+    // comma branch, returns the whole call's answer immediately.
+    let vivified_comma_path_expr: Expr;
+    let path_expr: &Expr = if S::TAG == EvalTag::Yq {
+        match vivify_del_comma_iterate_targets(path_expr, &mut result) {
+            Ok(None) => path_expr,
+            Ok(Some(remaining)) => {
+                if remaining.is_empty() {
+                    return QueryResult::Owned(result);
+                }
+                vivified_comma_path_expr = if remaining.len() == 1 {
+                    remaining.into_iter().next().expect("len checked")
+                } else {
+                    Expr::Comma(remaining)
+                };
+                &vivified_comma_path_expr
+            }
+            Err(e) => {
+                return if optional {
+                    QueryResult::None
+                } else {
+                    QueryResult::Error(e)
+                };
+            }
         }
     } else {
         path_expr
