@@ -13,7 +13,7 @@ use indexmap::IndexMap;
 #[cfg(test)]
 use std::borrow::Cow;
 
-use super::error::EvalError;
+use super::error::{debug_assert_materialization_error, EvalError};
 use super::stream::{StreamFailure, StreamResult};
 
 /// Indentation configuration for cursor/lazy streaming output.
@@ -2739,30 +2739,41 @@ pub trait DocumentElements: Sized + Copy + Clone {
     /// Only a caller that needs the gap between siblings checked --
     /// `.[]`/`to_entries` on arrays -- uses this instead.
     fn collect_cursors_checked(&self) -> Result<Vec<Self::Cursor>, EvalError> {
-        let mut cursors = Vec::new();
-        let mut elems = *self;
-        let mut is_first = true;
-        while let Some((cursor, rest)) = elems.uncons_cursor() {
-            if !cursor.element_gap_ok(is_first) {
-                return Err(self.malformed_element_error());
+        // #2334: the walk lives in a closure purely so its two error returns
+        // funnel through one `Result` this method can assert on -- see
+        // `debug_assert_materialization_error`. A second (provided) trait
+        // method would have done the same job at the cost of widening
+        // `DocumentElements`'s surface for an assert; nothing else about the
+        // walk changed.
+        let walk = || -> Result<Vec<Self::Cursor>, EvalError> {
+            let mut cursors = Vec::new();
+            let mut elems = *self;
+            let mut is_first = true;
+            while let Some((cursor, rest)) = elems.uncons_cursor() {
+                if !cursor.element_gap_ok(is_first) {
+                    return Err(self.malformed_element_error());
+                }
+                cursors.push(cursor);
+                elems = rest;
+                is_first = false;
             }
-            cursors.push(cursor);
-            elems = rest;
-            is_first = false;
-        }
-        // #2261: trailing stray comma after a real last element (`[1,]`) --
-        // free here since this walk already resolved every element's own
-        // cursor; mirrors `to_owned_cursor_at_depth`'s own `last_elem` check
-        // (#2243) rather than duplicating its logic. `collect_cursors_checked`
-        // has no container cursor to check the *zero-element* stray-comma
-        // shape (`[,]`, #2211) against -- same documented limitation as
-        // `to_owned_at_depth`'s own value-only callers.
-        if let Some(last) = cursors.last() {
-            if !trailing_element_gap_ok(last, b']') {
-                return Err(self.malformed_element_error());
+            // #2261: trailing stray comma after a real last element (`[1,]`) --
+            // free here since this walk already resolved every element's own
+            // cursor; mirrors `to_owned_cursor_at_depth`'s own `last_elem` check
+            // (#2243) rather than duplicating its logic. `collect_cursors_checked`
+            // has no container cursor to check the *zero-element* stray-comma
+            // shape (`[,]`, #2211) against -- same documented limitation as
+            // `to_owned_at_depth`'s own value-only callers.
+            if let Some(last) = cursors.last() {
+                if !trailing_element_gap_ok(last, b']') {
+                    return Err(self.malformed_element_error());
+                }
             }
-        }
-        Ok(cursors)
+            Ok(cursors)
+        };
+        let result = walk();
+        debug_assert_materialization_error(&result);
+        result
     }
 
     /// [`DocumentElements::len`], refusing a trailing stray `,` after a real

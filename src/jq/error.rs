@@ -1560,6 +1560,54 @@ impl EvalError {
     }
 }
 
+/// Asserts, in debug builds only, that a materialization raised nothing but a
+/// [`EvalError::decode_failure`]-tagged error (#2334).
+///
+/// This pins the premise the whole `optional`-suppression routing audit rests
+/// on. `eval::suppresses` is `optional && !e.is_decode_failure()`, so as long
+/// as `to_owned`/`to_owned_cursor`/`collect_cursors_checked` can *only* raise
+/// decode failures, routing one of their call sites through
+/// `to_owned_or_suppress!`/`owned_or_suppress!`/`suppress_or_raise` and leaving
+/// it as a bare `QueryResult::Error(e)` produce byte-identical output. That is
+/// exactly why the #2231 -> #2280 -> #2327 lineage kept recurring: no
+/// behavioural test can fail when a site is left unrouted, so a missed site
+/// costs nothing until an auditor happens to read that function. #2327's own
+/// pinning test (`test_optional_ignored_sites_2327`) asserts exit 5 both with
+/// and without a trailing `?` -- it records the non-difference, and by
+/// construction cannot detect the invariant regressing.
+///
+/// The premise held when this was written: every error path in the family is
+/// `decode_failure` (`eval::to_owned_at_depth`,
+/// `eval_generic::to_owned_at_depth`/`to_owned_cursor_at_depth`), the
+/// `malformed_delimiter/member/element_error` trio (#2286 retagged the last of
+/// them via [`EvalError::malformed_json_text`]), and
+/// [`EvalError::colliding_display_key`], which delegates to
+/// [`EvalError::decode_failure`]. The day that stops being true -- someone adds
+/// a genuinely suppressible error kind to one of these walks -- the
+/// routed/unrouted distinction starts changing output at every call site at
+/// once, silently. This assert makes that day a loud debug-build failure
+/// instead, pointing at `tests/jq_optional_suppression_audit.rs` for the sites
+/// that then need re-adjudicating.
+///
+/// Same shape as `Item::into_owned_from_owned_producer`'s own `debug_assert!`
+/// (#2025) and for the same reason: a hand-derived claim that nothing but
+/// review was keeping true.
+///
+/// Called from the four depth-0 entry points only, never the recursive
+/// `*_at_depth` inner calls -- one assert per materialization, not one per
+/// node.
+#[inline]
+pub(crate) fn debug_assert_materialization_error<T>(result: &Result<T, EvalError>) {
+    debug_assert!(
+        !matches!(result, Err(e) if !e.is_decode_failure()),
+        "#2334: a materialization raised a non-decode-failure error, which \
+         `eval::suppresses` *can* suppress -- the `optional`-routing audit in \
+         tests/jq_optional_suppression_audit.rs assumes it never can. Every \
+         raw materialization site in a live-`optional` function now needs \
+         re-adjudicating, not just this one."
+    );
+}
+
 impl core::fmt::Display for EvalError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", self.message)

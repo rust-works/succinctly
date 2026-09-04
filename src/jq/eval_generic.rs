@@ -36,15 +36,16 @@ use super::document::{
 use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, bind_def, bind_def_call,
     cannot_reserve_cross_product, classify_limit_n, classify_nth_n, classify_parent_n,
-    collapse_vec, collect_pattern_var_names, compare_values, enter_def_call_frame,
-    eval as full_eval, eval_each_owned, eval_foreach_with_values, eval_reduce_with_values,
-    extract_pattern_bindings, format_owned, has_type_mismatch_is_permissive, index_component_value,
-    index_in_array_bounds, index_one_owned as index_owned_by_key, is_pure_chain_link,
-    is_retryable_stop, literal_to_owned, needs_path_context, numeric_key_to_array_index,
-    numeric_key_to_index, owned_bound_to_i64, owned_to_string, slice_object_as_yq_children,
-    slice_owned_value_read, substitute_bound_var, substitute_vars, suppresses, tonumber_from_str,
-    vec_with_capacity, yq_negative_index_check, Control, Demand, EvalError, EvalSemantics, EvalTag,
-    Flow, JqSemantics, LimitN, PathTrail, QueryResult, YqSemantics,
+    collapse_vec, collect_pattern_var_names, compare_values, debug_assert_materialization_error,
+    enter_def_call_frame, eval as full_eval, eval_each_owned, eval_foreach_with_values,
+    eval_reduce_with_values, extract_pattern_bindings, format_owned,
+    has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
+    index_one_owned as index_owned_by_key, is_pure_chain_link, is_retryable_stop, literal_to_owned,
+    needs_path_context, numeric_key_to_array_index, numeric_key_to_index, owned_bound_to_i64,
+    owned_to_string, slice_object_as_yq_children, slice_owned_value_read, substitute_bound_var,
+    substitute_vars, suppresses, tonumber_from_str, vec_with_capacity, yq_negative_index_check,
+    Control, Demand, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail,
+    QueryResult, YqSemantics,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -273,7 +274,11 @@ fn to_owned_checked_at_depth<V: DocumentValue>(
 /// cannot be *decoded* (#1098, #1247) -- see
 /// [`DocumentValue::string_decode_error`].
 pub fn to_owned<V: DocumentValue>(value: &V) -> Result<OwnedValue, EvalError> {
-    to_owned_at_depth(value, 0)
+    let result = to_owned_at_depth(value, 0);
+    // #2334: see `debug_assert_materialization_error`'s own doc comment --
+    // depth-0 entry point only.
+    debug_assert_materialization_error(&result);
+    result
 }
 
 /// The error for an object member the format's index accepted but its grammar
@@ -469,7 +474,11 @@ fn to_owned_at_depth<V: DocumentValue>(value: &V, depth: usize) -> Result<OwnedV
 /// Panics past [`MAX_NESTING_DEPTH`] levels of nesting (#998), same as
 /// [`to_owned`].
 pub fn to_owned_cursor<C: DocumentCursor>(cursor: &C) -> Result<OwnedValue, EvalError> {
-    to_owned_cursor_at_depth(cursor, 0)
+    let result = to_owned_cursor_at_depth(cursor, 0);
+    // #2334: see `debug_assert_materialization_error`'s own doc comment --
+    // depth-0 entry point only.
+    debug_assert_materialization_error(&result);
+    result
 }
 
 /// Map every value through [`to_owned`], short-circuiting at the first
@@ -2346,7 +2355,7 @@ fn finish_fork_generic<V: DocumentValue>(
         // A decode failure (#1620) is never silenced by an ambient
         // `optional`, unlike an ordinary trailing error -- see
         // `Expr::Optional`'s own arm above for the full rationale.
-        Some(Control::Error(ref e)) if optional && !e.is_decode_failure() => {
+        Some(Control::Error(ref e)) if suppresses(e, optional) => {
             owned_vec_to_generic_result(outputs)
         }
         Some(control) => partial_generic(outputs, control),
@@ -3877,16 +3886,26 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
                         // piped through, exactly as the `Error` arm
                         // below does (#400/#494, #1247) -- not
                         // `owned_or_err!`, which would discard it.
+                        //
+                        // STYLE-0012: and not `owned_or_suppress!` either,
+                        // for the same reason. Suppressing here would throw
+                        // the prefix away; the `Control::Error` rides out on
+                        // the `Partial` instead and is caught, if at all, by
+                        // the `eval_try`/`Expr::Optional` boundary that owns
+                        // the whole pipe. Applies to all four conversion arms
+                        // below.
                         GenericResult::One(r) => match to_owned(&r) {
                             Ok(o) => results.push(o),
                             Err(e) => return partial_generic(results, Control::Error(e)),
                         },
+                        // STYLE-0012: see the `One` arm above.
                         GenericResult::OneCursor(c) => match to_owned_cursor(&c) {
                             Ok(o) => results.push(o),
                             Err(e) => return partial_generic(results, Control::Error(e)),
                         },
                         GenericResult::Many(rs) => {
                             for r in &rs {
+                                // STYLE-0012: see the `One` arm above.
                                 match to_owned(r) {
                                     Ok(o) => results.push(o),
                                     Err(e) => return partial_generic(results, Control::Error(e)),
@@ -3895,6 +3914,7 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
                         }
                         GenericResult::ManyCursor(cs) => {
                             for c in &cs {
+                                // STYLE-0012: see the `One` arm above.
                                 match to_owned_cursor(c) {
                                     Ok(o) => results.push(o),
                                     Err(e) => return partial_generic(results, Control::Error(e)),
@@ -4468,13 +4488,16 @@ fn fold_lazy_seq_stage<S: EvalSemantics, V: DocumentValue>(
                         .collect(),
                 )
             } else {
-                GenericResult::ManyOwned(owned_or_err!(items
-                    .into_iter()
-                    .map(|item| match item {
-                        LazyElem::Cursor(c) => to_owned_cursor(&c),
-                        LazyElem::Owned(o) => Ok(o),
-                    })
-                    .collect::<Result<Vec<_>, _>>()))
+                GenericResult::ManyOwned(owned_or_suppress!(
+                    items
+                        .into_iter()
+                        .map(|item| match item {
+                            LazyElem::Cursor(c) => to_owned_cursor(&c),
+                            LazyElem::Owned(o) => Ok(o),
+                        })
+                        .collect::<Result<Vec<_>, _>>(),
+                    optional
+                ))
             }
         }
 
@@ -5301,6 +5324,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 match elements.collect_cursors_checked() {
                     Ok(cursors) if cursors.is_empty() => GenericResult::None,
                     Ok(cursors) => GenericResult::ManyCursor(cursors),
+                    Err(err) if suppresses(&err, optional) => GenericResult::None,
                     Err(err) => GenericResult::Error(err),
                 }
             } else if let Some(fields) = value.as_object() {
@@ -5413,7 +5437,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                         return result;
                     }
                 }
-                let owned = owned_or_err!(to_owned_with_cursor(&value, cursor));
+                let owned = owned_or_suppress!(to_owned_with_cursor(&value, cursor), optional);
                 // #1909: straight into `eval.rs`'s path-context evaluator
                 // with the tree we just built, rather than through
                 // `eval_on_owned`'s reindex bridge -- which lands in
@@ -5646,9 +5670,17 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             let items: Vec<OwnedValue> = match eval_single::<S, _>(inner, value, optional, cursor)
                 .materialize_lazy()
             {
+                // STYLE-0012: array construction is atomic in jq -- the twin
+                // of `eval::eval_array_construction`, which #2327
+                // investigated and deliberately left unrouted for the same
+                // reason. `optional` is forwarded into `inner`'s own
+                // evaluation above and never consulted for these errors.
                 GenericResult::One(v) => vec![owned_or_err!(to_owned(&v))],
+                // STYLE-0012: atomic array construction -- see the `One` arm above.
                 GenericResult::OneCursor(c) => vec![owned_or_err!(to_owned_cursor(&c))],
+                // STYLE-0012: atomic array construction -- see the `One` arm above.
                 GenericResult::Many(vs) => owned_or_err!(to_owned_all(&vs)),
+                // STYLE-0012: atomic array construction -- see the `One` arm above.
                 GenericResult::ManyCursor(cs) => owned_or_err!(to_owned_all_cursors(&cs)),
                 GenericResult::None => Vec::new(),
                 GenericResult::Owned(v) => vec![v],
@@ -5738,6 +5770,14 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // Fall back to the full evaluator for complex expressions
         _ => {
             // Convert to OwnedValue, then to JSON, then evaluate with full evaluator
+            //
+            // STYLE-0012: `optional` is never `true` here -- after #693 the
+            // only caller that forces it is the `IndexExpr`/`SliceExpr`
+            // special case, which matches before this wildcard (the comment
+            // just below states this, and a `debug_assert!(!optional)` probe
+            // over the whole suite confirmed it: zero hits from any
+            // parser-driven test). Whatever error escapes is caught, if at
+            // all, by the caller's own `Expr::Optional`/`eval_try` boundary.
             let owned = owned_or_err!(to_owned_with_cursor(&value, cursor));
             let json_str = owned.to_json_for_reindex::<S>();
             let json_bytes = json_str.as_bytes();
@@ -6247,7 +6287,7 @@ fn each_repeat_generic<S: EvalSemantics, V: DocumentValue>(
 ) -> Flow {
     let owned = match to_owned_with_cursor(&value, cursor) {
         Ok(v) => v,
-        Err(e) if optional && !e.is_decode_failure() => return Flow::Exhausted,
+        Err(e) if suppresses(&e, optional) => return Flow::Exhausted,
         Err(e) => return Flow::Escaped(Control::Error(e)),
     };
     let mut empty_rounds = 0usize;
@@ -8189,12 +8229,21 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
             pending_halt = Some(code);
             vs
         }
+        // STYLE-0012: these four materialize the *key* generator's outputs,
+        // which are evaluated with a hardcoded `optional: false` just above.
+        // `.[k]?` suppresses only its own final index step, never an error
+        // raised while computing `k` -- jq 1.7.1 agrees (`jq '.[.k]?'` on a
+        // non-string `.k` still exits 5), and `eval.rs`'s own
+        // `eval_index_expr` splits it the same way.
         GenericResult::One(v) => vec![owned_or_err!(to_owned_key_shape(&v))],
+        // STYLE-0012: key generator -- see the `One` arm above.
         GenericResult::OneCursor(c) => vec![owned_or_err!(to_owned_key_shape_cursor(&c))],
+        // STYLE-0012: key generator -- see the `One` arm above.
         GenericResult::Many(vs) => owned_or_err!(vs
             .iter()
             .map(to_owned_key_shape)
             .collect::<Result<Vec<_>, _>>()),
+        // STYLE-0012: key generator -- see the `One` arm above.
         GenericResult::ManyCursor(cs) => owned_or_err!(cs
             .iter()
             .map(to_owned_key_shape_cursor)
@@ -8407,6 +8456,9 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                     // fix it still discarded the *prefix* the same way
                     // `escape_generic!` itself used to (review finding: the
                     // sibling gap #2145's own fix left in place here).
+                    // STYLE-0012: prefix-preserving by design (#2145, quoted just above):
+                    // the error rides out on a `Partial` whose prefix must survive, so the
+                    // `eval_try`/`Expr::Optional` boundary suppresses it, not this site.
                     owned = match to_owned_all_cursors_checked(&cursors) {
                         Ok(vs) => vs,
                         Err((prefix, e)) => {
@@ -8508,6 +8560,9 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                                 // `push` after a mid-loop flip re-admits the
                                 // #1017/#1612/#1634/#1669 abort class this
                                 // guard exists to close).
+                                // STYLE-0012: escapes with a `Control` that carries the already-pushed
+                                // prefix out, same as the `#2145` arm above -- suppressing here would
+                                // discard it.
                                 match to_owned_cursor(&c) {
                                     Ok(v) => {
                                         if owned.try_reserve(1).is_err() {
@@ -8614,6 +8669,9 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         let out = if any_owned {
             owned
         } else {
+            // STYLE-0012: a `Halt` is already in flight and takes precedence; this
+            // arm deliberately discards the conversion error (`Err((prefix, _))`)
+            // rather than raising or suppressing it -- see the comment above.
             match to_owned_all_cursors_checked(&cursors) {
                 Ok(vs) => vs,
                 Err((prefix, _)) => prefix,
@@ -9009,13 +9067,17 @@ fn slice_one_generic<S: EvalSemantics, V: DocumentValue>(
         // inside a sliced element respects `optional` here too -- this is
         // the `eval_generic` twin of `eval.rs`'s own `eval_single`
         // literal-bounds `Expr::Slice` array arm, which had the identical
-        // gap this same PR fixed (see that arm's own #2001 comment). Can't
-        // reuse `eval.rs`'s `suppress_or_raise`/`to_owned_or_suppress!`
-        // directly: different result type (`GenericResult` vs
-        // `QueryResult`), so the equivalent check is inlined instead.
+        // gap this same PR fixed (see that arm's own #2001 comment). The
+        // *result* type differs (`GenericResult` vs `QueryResult`), so
+        // `suppress_or_raise`/`to_owned_or_suppress!` themselves don't fit --
+        // but the *predicate* does, and #2334 routed this through the shared
+        // `suppresses` rather than leaving a fourth hand-copy of
+        // `optional && !e.is_decode_failure()` to drift (the exact drift
+        // `suppresses`'s own doc comment records happening twice already,
+        // #1902 and #1934).
         return match to_owned_all(items[range].iter()) {
             Ok(v) => GenericResult::Owned(OwnedValue::Array(v)),
-            Err(e) if optional && !e.is_decode_failure() => GenericResult::None,
+            Err(e) if suppresses(&e, optional) => GenericResult::None,
             Err(e) => GenericResult::Error(e),
         };
     }
@@ -9032,7 +9094,7 @@ fn slice_one_generic<S: EvalSemantics, V: DocumentValue>(
         // `optional`.
         let owned = match to_owned(&target) {
             Ok(v) => v,
-            Err(e) if optional && !e.is_decode_failure() => return GenericResult::None,
+            Err(e) if suppresses(&e, optional) => return GenericResult::None,
             Err(e) => return GenericResult::Error(e),
         };
         let OwnedValue::Object(map) = owned else {
@@ -9249,8 +9311,18 @@ fn eval_has_generic<S: EvalSemantics, V: DocumentValue>(
     if matches!(unwrap_paren(key_expr), Expr::Comma(_)) {
         return None;
     }
+    // STYLE-0012: `.ok()?` here declines the *fast path*, it does not swallow
+    // the error -- this function returns `Option<GenericResult<V>>`, and its
+    // one caller answers `None` by running the same `has(key)` through
+    // `bridge_to_full_evaluator(.., optional)`, which materializes and
+    // raises (or suppresses) properly. Routing here would make the fast path
+    // answer `None`-as-no-output where the slow path raises.
     let key_owned = match eval_single::<S, V>(key_expr, value.clone(), optional, cursor) {
+        // STYLE-0012: declines the fast path -- see the comment above the
+        // `match`.
         GenericResult::One(v) => to_owned(&v).ok()?,
+        // STYLE-0012: declines the fast path -- see the comment above the
+        // `match`.
         GenericResult::OneCursor(c) => to_owned_cursor(&c).ok()?,
         GenericResult::Owned(v) => v,
         _ => return None,
@@ -9404,6 +9476,12 @@ fn key_elements_generic<S: EvalSemantics, V: DocumentValue>(
             // The bare forms compare elements by their own decoded value, so
             // the conversion below *is* the check -- `to_owned_cursor` is
             // already the checked one.
+            //
+            // STYLE-0012: routed, one level out. `Control` has no suppressed
+            // variant to signal with here, so the check lives in
+            // `sort_family_control(control, optional)` -- this function's
+            // only error channel, and where the `GenericResult` is rebuilt
+            // (#2334).
             None => to_owned_cursor(&cursor).map_err(Control::Error)?,
         };
         keyed.push((k, cursor));
@@ -9434,8 +9512,19 @@ fn reordering_may_keep_cursors<V: DocumentValue>(cursor: Option<&V::Cursor>) -> 
 /// Every builtin in this family is atomic -- `eval.rs`'s own arms return
 /// bare `Error`/`Break`/`Halt` with no partial prefix -- so this never
 /// produces a `Partial`.
-fn sort_family_control<V: DocumentValue>(control: Control) -> GenericResult<V> {
+///
+/// #2334: takes `optional` and routes the `Error` arm through [`suppresses`].
+/// `key_elements_generic`'s `to_owned_cursor` materialization (the bare
+/// `sort`/`unique`/`min`/`max` forms, where the conversion *is* the
+/// comparison key) reaches this function as its only error channel, and
+/// `Control` has no suppressed variant for it to signal with -- so the
+/// suppression has to happen here, where the `GenericResult` is rebuilt.
+/// Both call sites already have `optional` in scope. Applies to `Error`
+/// only: `Break`/`Halt` are not error-channel controls and `?` never
+/// touched them.
+fn sort_family_control<V: DocumentValue>(control: Control, optional: bool) -> GenericResult<V> {
     match control {
+        Control::Error(e) if suppresses(&e, optional) => GenericResult::None,
         Control::Error(e) => GenericResult::Error(e),
         Control::Break(label) => GenericResult::Break(label),
         Control::Halt(code) => GenericResult::Halt(code),
@@ -9467,7 +9556,7 @@ fn sort_family_array_generic<S: EvalSemantics, V: DocumentValue>(
 ) -> GenericResult<V> {
     let keyed = match key_elements_generic::<S, V>(cursors, key, optional) {
         Ok(keyed) => keyed,
-        Err(control) => return sort_family_control(control),
+        Err(control) => return sort_family_control(control, optional),
     };
     GenericResult::LazySeq(Box::new(LazySeq::from_cursors(reorder(keyed))))
 }
@@ -10477,10 +10566,17 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 // observe the difference: reinstate it if some future
                 // dispatch path starts forcing `optional = true` here.
                 Some(control) => {
+                    // STYLE-0012: this builds the *prefix* of a `Partial`
+                    // that already carries `control`; suppressing here would
+                    // discard outputs the escaping control is meant to be
+                    // reported alongside. Same reasoning as
+                    // `fold_pipe_stages`' own conversion arms.
                     let prefix: Vec<OwnedValue> = match cursor {
+                        // STYLE-0012: `Partial` prefix -- see the comment above the `match`.
                         Some(c) => owned_or_err!(core::iter::repeat_with(|| to_owned_cursor(&c))
                             .take(truthy_count)
                             .collect::<Result<Vec<_>, _>>()),
+                        // STYLE-0012: `Partial` prefix -- see the comment above the `match`.
                         None => owned_or_err!(core::iter::repeat_with(|| to_owned(&value))
                             .take(truthy_count)
                             .collect::<Result<Vec<_>, _>>()),
@@ -10561,8 +10657,9 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     // this walk already materializes every element via
                     // `to_owned_all_cursors` regardless, so the #1677/#2261
                     // gap checks ride along for free.
-                    let cursors = owned_or_err!(elements.collect_cursors_checked());
-                    let mut values: Vec<OwnedValue> = owned_or_err!(to_owned_all_cursors(&cursors));
+                    let cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
+                    let mut values: Vec<OwnedValue> =
+                        owned_or_suppress!(to_owned_all_cursors(&cursors), optional);
                     let mut rng = ChaCha8Rng::from_rng(&mut rand::rng());
                     values.shuffle(&mut rng);
                     GenericResult::Owned(OwnedValue::Array(values))
@@ -10586,8 +10683,9 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 // #2261 (systematic sweep): same `collect_cursors_checked`
                 // fix as `Shuffle` just above -- free here too, for the
                 // same reason.
-                let cursors = owned_or_err!(elements.collect_cursors_checked());
-                let items: Vec<OwnedValue> = owned_or_err!(to_owned_all_cursors(&cursors));
+                let cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
+                let items: Vec<OwnedValue> =
+                    owned_or_suppress!(to_owned_all_cursors(&cursors), optional);
                 if items.is_empty() {
                     return GenericResult::Owned(OwnedValue::Array(vec![]));
                 }
@@ -10836,14 +10934,14 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 // `_checked`: same #1677 gap check as `.[]`'s array arm --
                 // this walk visits every element regardless, so it's free
                 // to ride here too.
-                let cursors = owned_or_err!(elements.collect_cursors_checked());
+                let cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
                 let mut entries: Vec<OwnedValue> = Vec::new();
                 for (i, elem_cursor) in cursors.into_iter().enumerate() {
                     let mut entry = IndexMap::new();
                     entry.insert("key".to_string(), OwnedValue::Int(i as i64));
                     entry.insert(
                         "value".to_string(),
-                        owned_or_err!(to_owned_cursor(&elem_cursor)),
+                        owned_or_suppress!(to_owned_cursor(&elem_cursor), optional),
                     );
                     entries.push(OwnedValue::Object(entry));
                 }
@@ -10897,7 +10995,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     entry.insert("key".to_string(), OwnedValue::String(key.into_owned()));
                     entry.insert(
                         "value".to_string(),
-                        owned_or_err!(to_owned_cursor(&field.value_cursor)),
+                        owned_or_suppress!(to_owned_cursor(&field.value_cursor), optional),
                     );
                     entries.push(OwnedValue::Object(entry));
                 }
@@ -11229,7 +11327,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             };
             let keyed = match key_elements_generic::<S, V>(cursors, key, optional) {
                 Ok(keyed) => keyed,
-                Err(control) => return sort_family_control(control),
+                Err(control) => return sort_family_control(control, optional),
             };
             // `min_by`/`max_by` on ties: jq's own definitions keep the
             // *first* minimum and the *last* maximum (`min_by` uses `<`,

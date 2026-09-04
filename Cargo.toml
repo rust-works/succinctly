@@ -101,6 +101,15 @@ tempfile = "3.10"
 # Bench-only: A/B baseline for jq substring-search builtins (issue #303). Already
 # present transitively via serde_json, so declaring it here is a supply-chain no-op.
 memchr = "2.7"
+# Test-only: `tests/jq_optional_suppression_audit.rs` parses src/jq/eval.rs and
+# src/jq/eval_generic.rs to enforce STYLE-0012 (issue #2334). Both crates are
+# already in Cargo.lock transitively (via serde/bytemuck derive), so declaring
+# them here is a supply-chain no-op -- same reasoning as memchr just above.
+# `proc-macro2/span-locations` gives the audit line numbers to report; edition
+# 2021 means resolver v2, so it does not unify into the proc-macro/build-
+# dependency graph that actually runs the derive macros.
+syn = { version = "2.0", features = ["full", "visit"] }
+proc-macro2 = { version = "1.0", features = ["span-locations"] }
 
 [[bench]]
 name = "rank_select"

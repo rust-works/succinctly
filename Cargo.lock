@@ -1015,6 +1015,7 @@ dependencies = [
  "md5",
  "memchr",
  "memmap2",
+ "proc-macro2",
  "proptest",
  "rand 0.10.2",
  "rand_chacha 0.10.0",
@@ -1022,6 +1023,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "syn 2.0.111",
  "tempfile",
 ]
 

@@ -428,6 +428,7 @@ impl<W: Clone + AsRef<[u64]>> QueryResult<'_, W> {
 //
 // The kind helpers below stay here: they are about values, not messages,
 // and `super::error` renders whatever it is handed.
+pub(crate) use super::error::debug_assert_materialization_error;
 pub use super::error::{BinOp, Control, EvalError, EvalEscape};
 
 impl<W> From<EvalEscape> for QueryResult<'_, W> {
@@ -647,7 +648,12 @@ fn to_owned_lossy_at_depth<W: Clone + AsRef<[u64]>>(
 /// [`DocumentValue`](super::document::DocumentValue) impl making the shared
 /// helper directly usable.
 fn to_owned<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) -> Result<OwnedValue, EvalError> {
-    to_owned_at_depth(value, 0)
+    let result = to_owned_at_depth(value, 0);
+    // #2334: asserted here, at the depth-0 entry point, not inside the
+    // recursive `to_owned_at_depth` -- one assert per materialization rather
+    // than one per node.
+    debug_assert_materialization_error(&result);
+    result
 }
 
 fn to_owned_at_depth<W: Clone + AsRef<[u64]>>(
@@ -1578,7 +1584,13 @@ fn eval_array_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // unguarded, so a decode failure on a *non-winning* comparison element
     // was silently swallowed entirely rather than merely corrupting the
     // eventual output value.
+    // STYLE-0012: array construction is atomic in jq -- `optional` is
+    // forwarded into `inner`'s own evaluation above and never consulted for
+    // this function's own errors. #2327 investigated routing this and
+    // deliberately declined; see this function's own doc comment.
     let items: Vec<OwnedValue> = match result.materialize_cursor() {
+        // STYLE-0012: atomic array construction -- see the statement's own
+        // comment just above.
         QueryResult::One(v) => match to_owned(&v) {
             Ok(v) => vec![v],
             Err(e) => return QueryResult::Error(e),
@@ -7708,7 +7720,14 @@ fn map_over<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     let mut results = Vec::new();
     for elem in elements {
+        // STYLE-0012: `map(f)` is `[.[] | f]` -- array construction, atomic in
+        // jq for the same reason `eval_array_construction` is (this function's
+        // own `Partial` arm below already says so). `optional` is forwarded
+        // into `f`'s evaluation and never consulted here; the inner filter's
+        // own `QueryResult::Error` arm returns bare too.
         match eval_single::<W, S>(f, elem, optional).materialize_cursor() {
+            // STYLE-0012: atomic array construction -- see the `map(f)` comment
+            // at the top of this loop.
             QueryResult::One(v) => match to_owned(&v) {
                 Ok(owned) => results.push(owned),
                 Err(e) => return QueryResult::Error(e),
@@ -7717,6 +7736,8 @@ fn map_over<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Owned(v) => results.push(v),
             QueryResult::Many(vs) => {
                 for v in &vs {
+                    // STYLE-0012: same array-construction atomicity as the
+                    // `One` arm above.
                     match to_owned(v) {
                         Ok(owned) => results.push(owned),
                         Err(e) => return QueryResult::Error(e),
@@ -7845,14 +7866,14 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     match eval_single::<W, S>(f, field_val, optional).materialize_cursor() {
                         QueryResult::One(v) => match to_owned(&v) {
                             Ok(owned) => Some(owned),
-                            Err(e) => return QueryResult::Error(e),
+                            Err(e) => return suppress_or_raise(e, optional),
                         },
                         QueryResult::OneCursor(_) => unreachable!(),
                         QueryResult::Owned(v) => Some(v),
                         QueryResult::Many(vs) => match vs.first() {
                             Some(v) => match to_owned(v) {
                                 Ok(owned) => Some(owned),
-                                Err(e) => return QueryResult::Error(e),
+                                Err(e) => return suppress_or_raise(e, optional),
                             },
                             None => None,
                         },
@@ -7889,7 +7910,7 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // between elements.
             let cursors = match elements.collect_cursors_checked() {
                 Ok(c) => c,
-                Err(e) => return QueryResult::Error(e),
+                Err(e) => return suppress_or_raise(e, optional),
             };
             let mut results: Vec<OwnedValue> = vec_with_capacity(cursors.len());
             for cursor in cursors {
@@ -7903,7 +7924,7 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 match eval_single::<W, S>(f, elem, optional).materialize_cursor() {
                     QueryResult::One(v) => match to_owned(&v) {
                         Ok(owned) => results.push(owned),
-                        Err(e) => return QueryResult::Error(e),
+                        Err(e) => return suppress_or_raise(e, optional),
                     },
                     QueryResult::OneCursor(_) => unreachable!(),
                     QueryResult::Owned(v) => results.push(v),
@@ -7911,7 +7932,7 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         if let Some(v) = vs.first() {
                             match to_owned(v) {
                                 Ok(owned) => results.push(owned),
-                                Err(e) => return QueryResult::Error(e),
+                                Err(e) => return suppress_or_raise(e, optional),
                             }
                         }
                     }
@@ -7970,6 +7991,9 @@ fn builtin_add<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // #1755: to_owned, not to_owned_lossy -- an undecodable element must
     // raise, not silently fold in as "".
     let items: Result<Vec<OwnedValue>, EvalError> = match value {
+        // STYLE-0012: routed, but at the shared `match items` fold below --
+        // both this arm and the `Object` one feed the same `Result`, and the
+        // audit's routing window stops at the next materialization site.
         StandardJson::Array(elements) => elements.map(|e| to_owned(&e)).collect(),
         StandardJson::Object(fields) => fields.map(|f| to_owned(&f.value())).collect(),
         _ => {
@@ -7980,7 +8004,7 @@ fn builtin_add<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
     let items = match items {
         Ok(items) => items,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return suppress_or_raise(e, optional),
     };
     if items.is_empty() {
         return QueryResult::Owned(OwnedValue::Null);
@@ -8455,6 +8479,10 @@ fn object_pair_type_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #1755: to_owned, not to_owned_lossy -- a field the key filter
         // `f` never touches can still be undecodable, and must raise
         // rather than silently drop out of this error message's operand.
+        //
+        // STYLE-0012: this is the `else` of `if optional`, so `optional` is
+        // `false` here by construction -- `suppress_or_raise(e, optional)`
+        // would be `QueryResult::Error(e)` on every path.
         let original = match to_owned(&StandardJson::Object(fields)) {
             Ok(v) => v,
             Err(e) => return QueryResult::Error(e),
@@ -9498,7 +9526,7 @@ fn builtin_last<W: Clone + AsRef<[u64]>>(
                 // element must raise, not silently become "".
                 match to_owned(&items[items.len() - 1]) {
                     Ok(v) => QueryResult::Owned(v),
-                    Err(e) => QueryResult::Error(e),
+                    Err(e) => suppress_or_raise(e, optional),
                 }
             }
         }
@@ -9598,6 +9626,8 @@ fn builtin_flatten<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // two copies of the same error literal (#1901 review).
     let yq_reject_non_array = || EvalError::yq_only_arrays_supported_for("flatten");
     let items: Result<Vec<OwnedValue>, EvalError> = match &value {
+        // STYLE-0012: routed at the shared `match items` fold below -- see
+        // `builtin_add`'s identical note.
         StandardJson::Array(elements) => elements.map(|e| to_owned(&e)).collect(),
         StandardJson::Object(_) if S::TAG == EvalTag::Yq => {
             return scalar_fallback(&value, optional, yq_reject_non_array);
@@ -10072,7 +10102,7 @@ fn builtin_to_entries<W: Clone + AsRef<[u64]>>(
             // on the identical input.
             let cursors = match elements.collect_cursors_checked() {
                 Ok(c) => c,
-                Err(e) => return QueryResult::Error(e),
+                Err(e) => return suppress_or_raise(e, optional),
             };
             let mut entries: Vec<OwnedValue> = vec_with_capacity(cursors.len());
             for (i, cursor) in cursors.into_iter().enumerate() {
@@ -10092,7 +10122,7 @@ fn builtin_to_entries<W: Clone + AsRef<[u64]>>(
                 // wider blast radius than this fix's own #1677 scope.
                 let val = match to_owned(&cursor.value()) {
                     Ok(v) => v,
-                    Err(e) => return QueryResult::Error(e),
+                    Err(e) => return suppress_or_raise(e, optional),
                 };
                 let mut entry = IndexMap::new();
                 entry.insert("key".to_string(), OwnedValue::Int(i as i64));
@@ -10134,7 +10164,7 @@ fn builtin_to_entries<W: Clone + AsRef<[u64]>>(
                 };
                 let val = match to_owned(&field.value) {
                     Ok(val) => val,
-                    Err(e) => return QueryResult::Error(e),
+                    Err(e) => return suppress_or_raise(e, optional),
                 };
 
                 let mut entry = IndexMap::new();
@@ -10258,6 +10288,8 @@ fn builtin_from_entries<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // review), same pattern as `builtin_flatten`.
     let yq_reject_non_array = || EvalError::yq_from_entries_requires_array();
     let entries: Result<Vec<OwnedValue>, EvalError> = match &value {
+        // STYLE-0012: routed at the shared `match entries` fold below -- see
+        // `builtin_add`'s identical note.
         StandardJson::Array(elements) => elements.map(|elem| to_owned(&elem)).collect(),
         StandardJson::Object(_) if S::TAG == EvalTag::Yq => {
             return scalar_fallback(&value, optional, yq_reject_non_array);
@@ -10274,7 +10306,7 @@ fn builtin_from_entries<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
     let entries = match entries {
         Ok(entries) => entries,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return suppress_or_raise(e, optional),
     };
     match entries_to_object(entries) {
         Ok(result) => QueryResult::Owned(OwnedValue::Object(result)),
@@ -10337,7 +10369,7 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         match eval_single::<Vec<u64>, S>(f, cursor.value(), optional).materialize_cursor() {
             QueryResult::One(v) => match to_owned(&v) {
                 Ok(v) => transformed.push(v),
-                Err(e) => return QueryResult::Error(e),
+                Err(e) => return suppress_or_raise(e, optional),
             },
             QueryResult::OneCursor(_) => unreachable!(),
             QueryResult::Owned(v) => transformed.push(v),
@@ -10345,7 +10377,7 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 for v in vs {
                     match to_owned(&v) {
                         Ok(v) => transformed.push(v),
-                        Err(e) => return QueryResult::Error(e),
+                        Err(e) => return suppress_or_raise(e, optional),
                     }
                 }
             }
@@ -10530,7 +10562,7 @@ fn eval_string_interpolation_single_value<'a, W: Clone + AsRef<[u64]>, S: EvalSe
                     // #1932/#1943's own fast-path consumers.
                     QueryResult::One(v) => match to_owned(&v) {
                         Ok(v) => owned_to_string::<S>(&v),
-                        Err(e) => return QueryResult::Error(e),
+                        Err(e) => return suppress_or_raise(e, optional),
                     },
                     QueryResult::OneCursor(_) => unreachable!(),
                     QueryResult::Owned(v) => owned_to_string::<S>(&v),
@@ -10538,7 +10570,7 @@ fn eval_string_interpolation_single_value<'a, W: Clone + AsRef<[u64]>, S: EvalSe
                         if let Some(v) = vs.first() {
                             match to_owned(v) {
                                 Ok(v) => owned_to_string::<S>(&v),
-                                Err(e) => return QueryResult::Error(e),
+                                Err(e) => return suppress_or_raise(e, optional),
                             }
                         } else {
                             String::new()
@@ -12973,7 +13005,7 @@ fn search_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 for (i, elem) in (*elements).enumerate() {
                     let owned = match to_owned(&elem) {
                         Ok(v) => v,
-                        Err(e) => return QueryResult::Error(e),
+                        Err(e) => return suppress_or_raise(e, optional),
                     };
                     if owned_value_eq::<S>(&owned, pattern) {
                         indices.push(OwnedValue::Int(i as i64));
@@ -12985,7 +13017,7 @@ fn search_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 for (i, elem) in (*elements).enumerate() {
                     let owned = match to_owned(&elem) {
                         Ok(v) => v,
-                        Err(e) => return QueryResult::Error(e),
+                        Err(e) => return suppress_or_raise(e, optional),
                     };
                     if owned_value_eq::<S>(&owned, pattern) {
                         return QueryResult::Owned(OwnedValue::Int(i as i64));
@@ -13005,7 +13037,7 @@ fn search_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 for (i, elem) in (*elements).enumerate() {
                     let owned = match to_owned(&elem) {
                         Ok(v) => v,
-                        Err(e) => return QueryResult::Error(e),
+                        Err(e) => return suppress_or_raise(e, optional),
                     };
                     if owned_value_eq::<S>(&owned, pattern) {
                         last = Some(i);
@@ -15929,7 +15961,7 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // must raise, not silently become "" for the path-context walk.
         let owned = match to_owned(&value) {
             Ok(v) => v,
-            Err(e) => return QueryResult::Error(e),
+            Err(e) => return suppress_or_raise(e, optional),
         };
         return eval_pipe_with_path_context::<W, S>(exprs, &owned, &[], optional);
     }
@@ -16723,6 +16755,10 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // two is ever set.
     let mut pending_key_stream_control: Option<Control> = None;
     let keys = match eval_single::<W, S>(key, value.clone(), false).materialize_cursor() {
+        // STYLE-0012: the key generator is evaluated with a hardcoded
+        // `optional: false` just above, deliberately: `.[k]?` suppresses only its
+        // own final index step, never an error raised while computing `k` (jq
+        // 1.7.1 agrees -- `jq '.[.k]?'` on a non-string `.k` still exits 5).
         QueryResult::One(v) => match to_owned_key_shape(&v) {
             Ok(v) => vec![v],
             Err(e) => return QueryResult::Error(e),
@@ -18901,7 +18937,7 @@ fn collect_rhs_outputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     match eval_single::<W, S>(value_expr, input.clone(), optional).materialize_cursor() {
         QueryResult::One(v) => match to_owned(&v) {
             Ok(owned) => Ok((vec![owned], None)),
-            Err(e) => Err(QueryResult::Error(e)),
+            Err(e) => Err(suppress_or_raise(e, optional)),
         },
         QueryResult::OneCursor(_) => {
             unreachable!("materialize_cursor should have converted this")
@@ -29546,6 +29582,10 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // the terminal control.
     let (input_values, input_control): (Vec<OwnedValue>, Option<Control>) =
         match input_result.materialize_cursor() {
+            // STYLE-0012: routed, one level out -- the error folds into
+            // `input_control` and reaches `finish_fork(.., optional)`, the
+            // shared suppression point #1902 fixed. See the identical fold
+            // for INIT below.
             QueryResult::One(v) => match to_owned(&v) {
                 Ok(v) => (vec![v], None),
                 Err(e) => (Vec::new(), Some(Control::Error(e))),
@@ -29578,6 +29618,10 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // #1902: same checked-conversion treatment as `input_values` above.
     let (init_values, init_control): (Vec<OwnedValue>, Option<Control>) =
         match init_result.materialize_cursor() {
+            // STYLE-0012: routed, one level out. The error folds into
+            // `init_control` and is handed to `finish_fork(.., optional)`
+            // below, the shared suppression point #1902 fixed -- suppressing
+            // here as well would double-catch and drop `input_control`.
             QueryResult::One(v) => match to_owned(&v) {
                 Ok(v) => (vec![v], None),
                 Err(e) => (Vec::new(), Some(Control::Error(e))),
@@ -36114,6 +36158,11 @@ fn each_paths_filter<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // a bare `Error`, never a `Partial`.
     let owned = match to_owned(&value) {
         Ok(owned) => owned,
+        // #2334: `suppresses`, not a bare escape. Nothing has been pushed to
+        // `sink` yet, so the suppressed form is a clean `Exhausted` -- the
+        // same shape `each_repeat_generic` (`eval_generic.rs`) already uses
+        // for its own pre-loop materialization.
+        Err(e) if suppresses(&e, optional) => return Flow::Exhausted,
         Err(e) => return Flow::Escaped(Control::Error(e)),
     };
 
@@ -41521,7 +41570,7 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // become "".
                 match to_owned(&cursor.value()) {
                     Ok(v) => QueryResult::Owned(v),
-                    Err(e) => QueryResult::Error(e),
+                    Err(e) => suppress_or_raise(e, optional),
                 }
             } else {
                 // Parse as YAML (default)
@@ -42747,8 +42796,15 @@ fn delpaths_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `null` anyway (`delete_keys`'s own `OwnedValue::Null` arm), so the
     // document really did end up wholly deleted regardless of where `[]`
     // falls in the batch or what (no-op) work follows it.
+    //
+    // STYLE-0012: a decode failure from `to_owned` must bypass `optional`
+    // at all three sites below, per #1746's review -- `eval_assign`/
+    // `eval_update`/`builtin_path`/`builtin_setpath`/`builtin_del` all return
+    // it unconditionally too. The `match result` below carries the full
+    // reasoning; routing any of them would contradict it.
     let mut root_deleted = false;
     let result = if S::TAG == EvalTag::Yq {
+        // STYLE-0012: see the note above `root_deleted`.
         to_owned(value).and_then(|mut v| {
             for &path in &paths {
                 v = if path.is_empty() {
@@ -42765,8 +42821,10 @@ fn delpaths_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // other array, so only the first entry needs checking:
         // `delpaths([[],[0]])` and `delpaths([[0],[]])` are both `null`.
         match paths.first() {
+            // STYLE-0012: see the note above `root_deleted`.
             None => to_owned(value),
             Some([]) => Ok(OwnedValue::Null),
+            // STYLE-0012: see the note above `root_deleted`.
             Some(_) => to_owned(value).and_then(|v| delete_paths_sorted(v, &paths, 0, false)),
         }
     };
@@ -43912,7 +43970,7 @@ fn bsearch_one_target<W: Clone + AsRef<[u64]>>(
         elements_iter.map(|v| to_owned(&v)).collect();
     let elements = match elements {
         Ok(elements) => elements,
-        Err(e) => return QueryResult::Error(e),
+        Err(e) => return suppress_or_raise(e, optional),
     };
 
     // jq's search from `builtin.jq`: an inclusive `hi` and a
@@ -44456,7 +44514,7 @@ fn builtin_shuffle<W: Clone + AsRef<[u64]>>(
             // in as if it were the real value.
             let mut items: Vec<OwnedValue> = match elements.map(|e| to_owned(&e)).collect() {
                 Ok(v) => v,
-                Err(e) => return QueryResult::Error(e),
+                Err(e) => return suppress_or_raise(e, optional),
             };
             // Use a seeded RNG for reproducibility in tests if needed,
             // but seed from system entropy for actual randomness
@@ -44501,7 +44559,7 @@ fn builtin_pivot<W: Clone + AsRef<[u64]>>(
             // in as if it were the real value.
             let items: Vec<OwnedValue> = match elements.map(|e| to_owned(&e)).collect() {
                 Ok(v) => v,
-                Err(e) => return QueryResult::Error(e),
+                Err(e) => return suppress_or_raise(e, optional),
             };
 
             if items.is_empty() {
