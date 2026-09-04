@@ -502,8 +502,9 @@ pub fn to_owned_all_cursors<'a, C: DocumentCursor + 'a>(
 /// the first `Err`, which is fine for a caller with nothing of its own to
 /// lose, but wrong for one folding this conversion's result into an
 /// already-running prefix (`eval_index_expr`'s own `Partial`-folding uses --
-/// `escape_generic!`, the `pending_halt` finalizer, and the target `Partial`
-/// arm's own promotion -- its only callers so far). Mirrors `eval.rs`'s
+/// `escape_generic!`, `ensure_owned!` (#2340), the `pending_halt` and
+/// `pending_key_stream_control` finalizers, and the target `Partial` arm's
+/// own promotion -- its callers so far). Mirrors `eval.rs`'s
 /// `promote_borrowed_checked` (#1897) -- the same fix, and the same `&[C]`
 /// (not a generic `IntoIterator`) so `cursors.len()` is available to
 /// pre-size `acc` via `vec_with_capacity`, same as that sibling does.
@@ -8272,27 +8273,34 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
     // `cursors` prefix (the #2145 gap `escape_generic!` already closed for
     // its own promotion) but also silently replacing whatever this
     // function's own keys-evaluation phase had already queued in
-    // `pending_halt`/`pending_key_stream_control` -- worse than #2145's own
-    // gap, since even an uncatchable `Halt` from an earlier key's own
-    // escape was lost. Now uses the same prefix-preserving
-    // `to_owned_all_cursors_checked` and Halt-survives/Error-Break-
-    // downgrades priority `escape_generic!` and the tail resolvers below
-    // both already establish: an already-pending `Halt` survives
-    // unconditionally, anything else (a pending `Error`/`Break`, or
-    // nothing pending at all) downgrades to this decode failure.
+    // `pending_halt`/`pending_key_stream_control`. Now uses the
+    // prefix-preserving `to_owned_all_cursors_checked`, same as
+    // `escape_generic!` above.
+    //
+    // Unlike `escape_generic!`, this decode failure is *not* given
+    // Halt-survives priority over an already-pending `pending_halt`/
+    // `pending_key_stream_control` -- `escape_generic!`'s Halt-survives rule
+    // is about its own `$control` argument (a `Halt` that's already the
+    // live escape at that call site), not about deferring to the separate,
+    // earlier-queued `pending_halt`. The established rule for *that*
+    // question, restated at three other places in this function (the
+    // ordinary per-key `Error` arm's comment a few lines below, and the
+    // `pending_key_stream_control` block's own comment further down), is
+    // the opposite: a later key's own event outranks an earlier still-
+    // pending halt (live-verified against jq 1.7.1/1.8.2: `{"a":1} |
+    // .[("a", 5, halt)]` prints `1`, then the indexing error, and never
+    // reaches `halt`). This decode failure is discovered while processing a
+    // later key than whatever queued `pending_halt`, so it follows that
+    // same rule unconditionally, matching `eval.rs`'s analogous promotion
+    // site (`KeyTargets::Owned`'s `borrowed -> owned` transition), which
+    // has never consulted `pending_halt` here either.
     macro_rules! ensure_owned {
         () => {
             if !any_owned {
                 any_owned = true;
                 owned = match to_owned_all_cursors_checked(&cursors) {
                     Ok(vs) => vs,
-                    Err((prefix, e)) => {
-                        let control = match pending_halt {
-                            Some(code) => Control::Halt(code),
-                            None => Control::Error(e),
-                        };
-                        return partial_generic(prefix, control);
-                    }
+                    Err((prefix, e)) => return partial_generic(prefix, Control::Error(e)),
                 };
                 cursors.clear();
             }
@@ -8342,15 +8350,18 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
             // every value in `vs` indexes cleanly does `control` --
             // `target`'s own termination -- get to fire.
             //
-            // Does *not* reuse `ensure_owned!()`: that macro's own
-            // `owned_or_err!`-based promotion bare-returns
-            // `GenericResult::Error` on a decode failure, unconditionally
-            // discarding whatever `control` this arm is holding --
-            // including an uncatchable `Halt`, which `escape_generic!`
-            // above this loop already goes out of its way to preserve
-            // through the identical promotion step. Inlined here instead,
-            // mirroring `escape_generic!`'s own Halt-survives rule exactly
-            // rather than reintroducing the bug it was written to avoid.
+            // Does *not* reuse `ensure_owned!()`: that macro (#2340) always
+            // downgrades a decode failure to `Control::Error(e)`, with no
+            // parameter for a locally-held `control` to preserve -- correct
+            // for its own call sites, which never have one, but wrong here,
+            // where an uncatchable `Halt` this arm is already holding in
+            // `control` (this key's own indexing has already succeeded for
+            // every prior value in `vs`; this promotion failure is
+            // incidental to converting `cursors`, not this arm's own
+            // termination) must still survive a promotion failure, same as
+            // `escape_generic!` above this loop already goes out of its way
+            // to preserve. Inlined here instead, mirroring
+            // `escape_generic!`'s own Halt-survives rule exactly.
             //
             // The `Err` arm below is not live-repro-tested (review): same
             // reasoning as `eval::eval_index_expr`'s identical arm -- an
