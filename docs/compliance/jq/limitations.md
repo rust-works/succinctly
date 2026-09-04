@@ -2492,6 +2492,32 @@ Pinned by [`test_generic_lazy_seq_first_after_map_skips_later_error_725`](../../
 [`test_first_over_lazy_seq_iterate_skips_later_error_1565`](../../../tests/jq_cli_tests.rs)
 (the `first(map(f) | .[] | g)` spelling, plus the draining counter-cases above).
 
+**One more wrinkle: `.[0]` and `.[0.0]` don't agree.** `eval_generic.rs`'s lazy-sequence fold
+keys the skip-the-rest fast arm off the literal AST shape `Expr::Index { idx: 0, key: None }`
+(#1401), which only a bare integer-literal `.[0]` parses to -- `.[0.0]` folds to a different
+node and falls through to the eager evaluator instead, so it does *not* get the skip and
+raises exactly like real jq does for both spellings:
+
+```
+$ echo '[1,2,3]' > /tmp/a.json
+$ succinctly jq -c 'map(if . > 1 then error("boom") else . end) | .[0]'   /tmp/a.json   # 1, exit 0
+$ succinctly jq -c 'map(if . > 1 then error("boom") else . end) | .[0.0]' /tmp/a.json   # error, exit 5
+$ jq          -c 'map(if . > 1 then error("boom") else . end) | .[0]'   /tmp/a.json     # error, exit 5 (both spellings)
+```
+
+`.[0]` and `.[0.0]` are equivalent everywhere else in this codebase -- that equivalence is
+the whole premise of #1088's spelling preservation, asserted for reading, `del`,
+`setpath`/`=`/`|=` and `getpath` by
+[`tests/jq_index_number_invariant_tests.rs`](../../../tests/jq_index_number_invariant_tests.rs)
+-- this lazy-fold fast arm is the one place the spelling changes the answer. Left as-is
+rather than widened to also match `.[0.0]` ([#2174](https://github.com/rust-works/succinctly/issues/2174)):
+widening would make both spellings agree, but on the *divergent* side, spreading this
+limitation to a second spelling where ADR-0018 says matching jq is plainly possible instead
+(#1401's own comment on the fast arm records the same reasoning). `Expr::Index { idx: 0, key:
+None }`'s pinning is correct and does not need to change even if this limitation is ever
+lifted for `.[0]` itself -- only then would widening the arm become the right move, not
+before.
+
 ## A truncating consumer of `keys_unsorted[]` skips a malformed member it never needed
 
 Sibling of the `map(f)` divergence directly above, for the same underlying reason: a
