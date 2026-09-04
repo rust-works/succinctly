@@ -2184,6 +2184,59 @@ usable output" a real yq user would see, even though the specific error message
 differs (succinctly raises succinctly's own generator-model error; real yq raises its
 own parse-time rejection).
 
+### Float scalars lose their source spelling on the value route (#2419)
+
+This is the yq-mode counterpart to jq mode's
+["Float literals lose their source spelling"](../jq/limitations.md#float-literals-lose-their-source-spelling)
+— except real yq holds a line real jq does not: real *yq*'s `tostring` echoes a float
+scalar's source text verbatim, with no shortest-rendering exception. Confirmed live against
+the pinned v4.53.3 binary:
+
+```bash
+$ printf 'outer:\n  big: 10000000000000000000.0\n' | yq '.outer.big | tostring'
+10000000000000000000.0
+$ printf 'outer:\n  big: 100000000000000000000\n' | yq '.outer.big | tostring'
+100000000000000000000
+```
+
+succinctly's value route — `.outer.big | tostring`, which resolves the scalar through
+`OwnedValue::Float` — re-spells the value whenever its shortest rendering differs from its
+source text:
+
+```bash
+$ printf 'outer:\n  big: 10000000000000000000.0\n' | succinctly yq '.outer.big | tostring'
+1e+19
+$ printf 'outer:\n  big: 100000000000000000000\n' | succinctly yq '.outer.big | tostring'
+1e+20
+```
+
+`1.50`, `1e3` and `0.1` are unaffected — their shortest rendering already matches their
+source spelling, so [`is_preservable_float_literal`](../../../src/yaml/scalar.rs) keeps them
+intact on both tools — and so is the plain `.outer.big` identity read, which never goes
+through the value route at all.
+
+The path-context bridge route — `.outer.big | parent | .big | tostring` — sidesteps the
+value route entirely and matches real yq on the `.0`-suffixed spelling, but produces a
+*third*, still-wrong spelling on the integer-looking one, where real yq prints the bare
+integer with no trailing `.0`:
+
+```bash
+$ printf 'outer:\n  big: 10000000000000000000.0\n' | succinctly yq '.outer.big | parent | .big | tostring'
+10000000000000000000.0
+$ printf 'outer:\n  big: 100000000000000000000\n' | succinctly yq '.outer.big | parent | .big | tostring'
+100000000000000000000.0
+```
+
+`try_path_context_cursor_walk` (#2061) falls back to this bridge specifically to stay
+output-identical with it whenever a value-route emission would otherwise be re-spelled.
+[#2416](https://github.com/rust-works/succinctly/issues/2416) retires the bridge, at which
+point that fallback has nothing left to defer to — this capture is the evidence that the
+re-spelling is succinctly's own artifact rather than a reference behaviour to match, so
+#2416's path-context walk should emit the document's own spelling once the bridge is gone,
+not inherit either of the two wrong spellings shown above.
+[#2419](https://github.com/rust-works/succinctly/issues/2419) is the ADR-0018 record for
+this divergence; fixing the re-spelling itself is out of its scope.
+
 ### Other categories
 
 Float and number formatting ([#1071](https://github.com/rust-works/succinctly/issues/1071),

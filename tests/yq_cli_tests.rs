@@ -8803,6 +8803,63 @@ fn test_yq_tostring_computed_nan_uses_yaml_spelling_1060() -> Result<()> {
     Ok(())
 }
 
+/// #2419: pins a *documented divergence*, not desired behaviour -- see
+/// "Float scalars lose their source spelling on the value route (#2419)" in
+/// [`docs/compliance/yq/limitations.md`](../docs/compliance/yq/limitations.md).
+/// Real yq v4.53.3 preserves a float scalar's source spelling everywhere,
+/// including through `tostring`; succinctly's value route (`OwnedValue::Float`)
+/// re-spells it whenever the shortest rendering differs from the source text.
+/// `1.50`/`1e3`/`0.1` are unaffected (`is_preservable_float_literal` keeps
+/// them), and the path-context bridge route (`| parent | .big | tostring`)
+/// avoids the value route but produces a third, still-wrong spelling on the
+/// integer-looking case. All four expectations here were captured live from
+/// the pinned binaries and must move together if either tool's behaviour
+/// changes -- see #2416, which retires the bridge and is expected to fix the
+/// value-route case listed here as its side effect.
+#[test]
+fn test_yq_float_value_route_respelling_2419() -> Result<()> {
+    // Value route: re-spelled by succinctly, preserved by real yq.
+    for (input, want) in [
+        ("outer:\n  big: 10000000000000000000.0\n", "1e+19"),
+        ("outer:\n  big: 100000000000000000000\n", "1e+20"),
+    ] {
+        let (stdout, code) = run_yq_stdin(".outer.big | tostring", input, &["-r"])?;
+        assert_eq!(code, 0, "for {input:?}: {stdout:?}");
+        assert_eq!(stdout.trim_end(), want, "for {input:?}");
+    }
+
+    // Preserved by both tools: shortest rendering already matches source spelling.
+    for (input, want) in [
+        ("outer:\n  big: 1.50\n", "1.50"),
+        ("outer:\n  big: 1e3\n", "1e3"),
+        ("outer:\n  big: 0.1\n", "0.1"),
+    ] {
+        let (stdout, code) = run_yq_stdin(".outer.big | tostring", input, &["-r"])?;
+        assert_eq!(code, 0, "for {input:?}: {stdout:?}");
+        assert_eq!(stdout.trim_end(), want, "for {input:?}");
+    }
+
+    // Path-context bridge route: matches real yq on the `.0`-suffixed case,
+    // but prints a third spelling (`...0.0` instead of real yq's bare
+    // integer `...0`) on the integer-looking case.
+    for (input, want) in [
+        (
+            "outer:\n  big: 10000000000000000000.0\n",
+            "10000000000000000000.0",
+        ),
+        (
+            "outer:\n  big: 100000000000000000000\n",
+            "100000000000000000000.0",
+        ),
+    ] {
+        let (stdout, code) = run_yq_stdin(".outer.big | parent | .big | tostring", input, &["-r"])?;
+        assert_eq!(code, 0, "for {input:?}: {stdout:?}");
+        assert_eq!(stdout.trim_end(), want, "for {input:?}");
+    }
+
+    Ok(())
+}
+
 #[test]
 fn test_build_configuration_flag() -> Result<()> {
     // --build-configuration prints diagnostics and exits successfully.
