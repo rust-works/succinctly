@@ -28856,11 +28856,31 @@ fn eval_owned_fast_path<S: EvalSemantics>(
 /// round trip cost nothing incorrect, just an unnecessary detour. Behavior
 /// is unchanged: [`eval_owned_fast_path`]'s own match still dispatches here
 /// for exactly the same three shapes it always has.
+///
+/// `#[inline]`, matching the sibling cursor-based helpers this mirrors
+/// (`index_object_by_name`/`index_array_by_position`, both also `#[inline]`)
+/// -- the code this replaces used to sit directly inline in
+/// `eval_owned_fast_path`'s own match arm, with no call boundary at all, on
+/// what is the single most frequently hit shape in `each`/`map`/streaming
+/// iteration (review finding).
+///
+/// Both call sites already filter to exactly `Identity`/`Field(_)`/
+/// `Index { .. }` before calling; the `debug_assert!` makes that precondition
+/// structural rather than implicit, so a future third call site that forgets
+/// the filter fails loudly in tests instead of silently falling through to
+/// the `_ => None` catch-all (review finding) -- `None` there is otherwise
+/// indistinguishable from every other shape's genuine "not fast-pathable"
+/// answer.
+#[inline]
 fn eval_owned_navigation<S: EvalSemantics>(
     expr: &Expr,
     input: &OwnedValue,
     optional: bool,
 ) -> Option<Result<Option<OwnedValue>, EvalError>> {
+    debug_assert!(
+        matches!(expr, Expr::Identity | Expr::Field(_) | Expr::Index { .. }),
+        "eval_owned_navigation called with a shape it doesn't handle: {expr:?}"
+    );
     match expr {
         Expr::Identity => Some(Ok(Some(input.clone()))),
         Expr::Field(name) => Some(match input {
@@ -52777,6 +52797,23 @@ mod tests {
             )),
             bridge
         );
+    }
+
+    /// #2201 review: pins the invariant `eval_owned_navigation`'s and
+    /// `eval_owned_pure`'s own doc comments both assert in prose --
+    /// `produces_fresh_value` is `false` for the bare `Identity`/`Field`/
+    /// `Index` shapes, not just for a `Pipe` ending in one (the case
+    /// `pipes_ending_in_navigation_are_evaluable_but_not_gated_2048` already
+    /// pins above). This is what makes `eval_owned_pure`'s direct call to
+    /// `eval_owned_navigation` (skipping `is_owned_pure_composite`) provably
+    /// behavior-preserving rather than merely asserted to be.
+    #[test]
+    fn bare_navigation_shapes_are_pure_but_not_freshly_constructed_2201() {
+        for expr in [Expr::Identity, Expr::Field("a".into()), Expr::index(0)] {
+            assert!(is_owned_pure_expr(&expr), "{expr:?}");
+            assert!(!produces_fresh_value(&expr), "{expr:?}");
+            assert!(!is_owned_pure_composite(&expr), "{expr:?}");
+        }
     }
 
     /// #2048: the fast path has to actually *fire* for the issue's own repro
