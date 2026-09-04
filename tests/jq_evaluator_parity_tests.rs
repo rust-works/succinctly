@@ -1388,32 +1388,24 @@ fn test_parity_pipe_path_context_bypasses_reindex_bridge_1909() {
 /// and nothing can quietly re-teach the walk to print `null`.
 #[test]
 fn test_parity_key_at_root_diverges_2421() {
-    let full = full_outputs(br"null", ". | key");
-    let generic = generic_outputs(br"null", ". | key");
-    assert_eq!(full, vec!["null".to_string()], "eval.rs moved: {full:?}");
-    assert!(
-        generic.is_empty(),
-        "eval_generic.rs moved for `. | key` at the root: {generic:?}"
-    );
-    assert_ne!(full, generic);
-
-    // Phase 3 made `parent` a cursor property too, so the bare form at the
-    // root diverges the same way: the eager evaluator's `{}` against the
-    // reference's nothing.
-    let full = full_outputs(br#"{"a":1}"#, "parent");
-    let generic = generic_outputs(br#"{"a":1}"#, "parent");
-    assert_eq!(full, vec!["{}".to_string()], "eval.rs moved: {full:?}");
-    assert!(
-        generic.is_empty(),
-        "eval_generic.rs moved for bare `parent` at the root: {generic:?}"
-    );
-    let full = full_outputs(br#"{"a":1}"#, "key");
-    let generic = generic_outputs(br#"{"a":1}"#, "key");
-    assert_eq!(full, vec!["null".to_string()], "eval.rs moved: {full:?}");
-    assert!(
-        generic.is_empty(),
-        "eval_generic.rs moved for bare `key` at the root: {generic:?}"
-    );
+    // Since the library entry point routes every path-context query to the
+    // generic evaluator (spine 2416, phase 3), both sides answer as the
+    // reference does -- nothing -- and the eager evaluator's `null`/`{}` is
+    // no longer reachable from either. The rows stay as the pin that this
+    // does not regress.
+    for (json, filter) in [
+        (br"null".as_slice(), ". | key"),
+        (br#"{"a":1}"#, "parent"),
+        (br#"{"a":1}"#, "key"),
+    ] {
+        let full = full_outputs(json, filter);
+        let generic = generic_outputs(json, filter);
+        assert!(full.is_empty(), "eval.rs moved for `{filter}`: {full:?}");
+        assert!(
+            generic.is_empty(),
+            "eval_generic.rs moved for `{filter}`: {generic:?}"
+        );
+    }
 }
 
 /// #1519: a `?//`-alternatives bind under a short-circuiting consumer re-runs

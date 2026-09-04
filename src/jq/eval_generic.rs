@@ -38,7 +38,7 @@ use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, bind_def, bind_def_call,
     cannot_reserve_cross_product, classify_limit_n, classify_nth_n, classify_parent_n,
     collapse_vec, collect_pattern_var_names, compare_values, debug_assert_materialization_error,
-    enter_def_call_frame, eval as full_eval, eval_each_owned, eval_foreach_with_values,
+    enter_def_call_frame, eval_each_owned, eval_foreach_with_values, eval_full as full_eval,
     eval_reduce_with_values, extract_pattern_bindings, fold_escaped_generator_prefix, format_owned,
     has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
     index_one_owned as index_owned_by_key, is_pure_chain_link, is_retryable_stop, literal_to_owned,
@@ -2986,7 +2986,7 @@ impl<V: DocumentValue> GenericResult<V> {
     /// materialize a lazy result anyway (as opposed to `push_generic_truthiness`
     /// and `eval_first_or_last_generic`, which have their own bespoke `LazySeq`
     /// handling below specifically to avoid forcing materialization here).
-    fn materialize_lazy(self) -> Self {
+    pub(crate) fn materialize_lazy(self) -> Self {
         match self {
             Self::LazyKeys {
                 fields,

@@ -18694,12 +18694,70 @@ pub fn eval<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     cursor: JsonCursor<'a, W>,
 ) -> QueryResult<'a, W> {
+    // Spine 2416, phase 3: a query that reads path context anywhere is
+    // evaluated by the generic evaluator, where `key`/`parent`/`path` are
+    // cursor properties and object construction, `select`, `if` and the
+    // bounded consumers thread the cursor natively. This evaluator's own
+    // `eval_pipe` would divert such a pipe to `eval_stage_with_path_context`
+    // -- the eager, materializing path-context evaluator that spine is
+    // retiring -- so the library entry point no longer enters it at all
+    // for these shapes. The generic evaluator still bridges back into this
+    // file for the shapes only the eager evaluator can answer (owned-domain
+    // navigation, absent nodes, constructs it has no native arm for), and
+    // does so through [`eval_full`], never through here, so the two cannot
+    // recurse into each other.
+    if needs_path_context(expr) {
+        return generic_to_query_result(super::eval_generic::eval_with_cursor_using::<S, _>(
+            expr, cursor,
+        ));
+    }
+    eval_full::<W, S>(expr, cursor)
+}
+
+/// This evaluator alone, with no generic-evaluator routing: the entry the
+/// generic evaluator's bridges use (`eval_generic::eval_on_owned`,
+/// `bridge_to_full_evaluator`), and what [`eval`] itself falls through to
+/// for a query with no path context.
+pub(crate) fn eval_full<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    cursor: JsonCursor<'a, W>,
+) -> QueryResult<'a, W> {
     // Special case: Identity returns the cursor directly for efficient output
     // This avoids decomposing arrays/objects into individual cursors
     if matches!(expr, Expr::Identity) {
         return QueryResult::OneCursor(cursor);
     }
     eval_single::<W, S>(expr, cursor.value(), false)
+}
+
+/// The generic evaluator's result in this evaluator's shape (spine 2416,
+/// phase 3). Lazy variants are materialized first; a cursor stays a cursor
+/// where [`QueryResult`] can hold one, and a batch of cursors becomes their
+/// values -- `QueryResult` has no `ManyCursor`.
+fn generic_to_query_result<W: Clone + AsRef<[u64]>>(
+    result: super::eval_generic::GenericResult<StandardJson<'_, W>>,
+) -> QueryResult<'_, W> {
+    use super::eval_generic::GenericResult;
+    match result.materialize_lazy() {
+        GenericResult::One(v) => QueryResult::One(v),
+        GenericResult::OneCursor(c) => QueryResult::OneCursor(c),
+        GenericResult::Many(vs) => QueryResult::Many(vs),
+        GenericResult::ManyCursor(cs) => {
+            QueryResult::Many(cs.into_iter().map(|c| c.value()).collect())
+        }
+        GenericResult::None => QueryResult::None,
+        GenericResult::Error(e) => QueryResult::Error(e),
+        GenericResult::Owned(v) => QueryResult::Owned(v),
+        GenericResult::ManyOwned(vs) => QueryResult::ManyOwned(vs),
+        GenericResult::Break(label) => QueryResult::Break(label),
+        GenericResult::Halt(code) => QueryResult::Halt(code),
+        GenericResult::Partial(prefix, control) => QueryResult::Partial(prefix, control),
+        GenericResult::LazyKeys { .. }
+        | GenericResult::LazyIndexRange(_)
+        | GenericResult::LazySeq(_) => {
+            unreachable!("materialize_lazy() already normalized every lazy variant")
+        }
+    }
 }
 
 /// Evaluate a jq expression, returning only successfully matched values.
@@ -55678,7 +55736,15 @@ mod tests {
             ),
             (
                 r#"foreach (key, error("in")) as $x (halt_error; .)"#,
-                "halt:5",
+                // `error:in`, not `halt:5`, since the library entry routes this
+                // to the generic evaluator (spine 2416, phase 3): `key` at
+                // the root emits nothing there (#2421), so the source's first
+                // output is its error, and the value evaluator only reaches
+                // INIT after a first source item -- jq evaluates INIT first
+                // (`foreach (1, error("in")) as $x (halt_error; .)` halts,
+                // captured from 1.7.1). That ordering is the value
+                // evaluator's own pre-existing divergence, not a routing one.
+                "error:in",
             ),
             (
                 r#"label $out | foreach (key, break $out) as $x (error("init"); .)"#,
@@ -73977,9 +74043,14 @@ mod tests {
 
     #[test]
     fn test_key_at_root() {
-        // Test key at root level - returns null
+        // `key` at the document root emits nothing: real yq prints nothing
+        // there (#2421, captured live from v4.53.3), and the library entry
+        // point routes every path-context query to the generic evaluator
+        // (spine 2416, phase 3), where `key` is a cursor property. The
+        // `null` this used to pin was this evaluator's own answer, which is
+        // no longer reachable from `eval`.
         query!(br#"{"a": 1}"#, "key",
-            QueryResult::Owned(OwnedValue::Null) => {}
+            QueryResult::None => {}
         );
     }
 
