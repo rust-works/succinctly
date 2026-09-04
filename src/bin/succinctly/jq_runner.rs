@@ -229,6 +229,10 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
             Expr::FuncCall {
                 name: full_name,
                 args: rewritten_args,
+                // A `namespace::name` call is never itself a candidate for
+                // #2036's shadow-detection (that only wraps bare-identifier
+                // keyword dispatch, never `::`-qualified syntax).
+                builtin_fallback: None,
             }
         }
         // Recursively process all other expression types
@@ -254,11 +258,22 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
                 .collect();
             Expr::Object(new_entries)
         }
-        Expr::FuncCall { name, args } => {
+        Expr::FuncCall {
+            name,
+            args,
+            builtin_fallback,
+        } => {
             let new_args: Vec<Expr> = args.into_iter().map(rewrite_namespaced_calls).collect();
             Expr::FuncCall {
                 name,
                 args: new_args,
+                // #2036: preserved and recursed into -- this pass runs
+                // *before* `resolve.rs`'s own rewrite (see
+                // `process_program`'s ordering doc comment), so a
+                // shadow-candidate's fallback can itself contain a
+                // `namespace::f(...)` call (e.g. inside a shadowed
+                // `limit(n; ns::f)`) that still needs rewriting here too.
+                builtin_fallback: builtin_fallback.map(|b| Box::new(rewrite_namespaced_calls(*b))),
             }
         }
         Expr::FuncDef {
@@ -1218,7 +1233,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
         context.named.iter().map(|(k, v)| (k.as_str(), v)).collect();
     all_vars.push(("ARGS", &args_value));
 
-    let expr = jq::substitute_vars(&expr, all_vars);
+    let mut expr = jq::substitute_vars(&expr, all_vars);
 
     // #1473: resolve every function call against the `def`s, parameters and
     // builtins in scope at its position, exactly as real jq's compiler does —
@@ -1231,7 +1246,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     // module function as undefined. `substitute_vars` above substitutes
     // `OwnedValue`s, never sub-expressions, so it cannot introduce a call and
     // running after it rather than before is equivalent.
-    let unresolved = jq::resolve_func_calls_all(&expr);
+    let unresolved = jq::resolve_func_calls_all(&mut expr);
     if !unresolved.is_empty() {
         report_unresolved_calls(&unresolved, &filter_str);
         return Ok(exit_codes::COMPILE_ERROR);

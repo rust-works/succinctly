@@ -20127,6 +20127,29 @@ fn test_single_arg_builtin_wrong_arity_reports_not_defined_2237() -> Result<()> 
     Ok(())
 }
 
+/// #2036: a user `def` can shadow a builtin of the same name, matching
+/// real jq -- the parser previously lowered a recognized builtin name to a
+/// typed `Expr::Builtin`/special-form node at parse time, before any `def`
+/// had been seen, so the user's own definition was silently unreachable.
+/// The issue's own 5-row repro table, oracle-verified against jq 1.7.1.
+/// Before this fix every row here computed the *builtin's* answer instead
+/// (`0`, `3`, `[1,2]`, `true`, `1` respectively).
+#[test]
+fn test_def_shadows_builtin_2036() -> Result<()> {
+    for (filter, want) in [
+        ("def length: 1; length", "1"),
+        ("[1,2,3] | def length: 999; length", "999"),
+        (r#"def map(f): "shadowed"; [1,2] | map(.)"#, r#""shadowed""#),
+        (r#"def not: "shadowed"; false | not"#, r#""shadowed""#),
+        (r#"def first(f): "shadowed"; first(1,2)"#, r#""shadowed""#),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 0, "{filter}: stderr {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "{filter}");
+    }
+    Ok(())
+}
+
 /// #2237 sibling: the same fix for the "dedicated parse function" family
 /// (`range`/`limit`/`until`/`while`/`repeat`/`first`/`last`), which returns
 /// `Expr` directly rather than going through `try_parse_builtin`'s
@@ -20161,6 +20184,32 @@ fn test_dedicated_parse_fn_wrong_arity_reports_not_defined_2237() -> Result<()> 
             "{filter}: stderr {stderr:?}"
         );
         assert_eq!(code, 3, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+    }
+    Ok(())
+}
+
+/// #2036: every fixed-arity special form (`limit`, `until`, `while`,
+/// `repeat`, `range`, `first`, `last`, `error`) is shadowable too, not just
+/// the ordinary builtins `try_parse_builtin` recognizes -- each goes
+/// through its own dedicated parser (`parse_limit_expr`, etc.) rather than
+/// that shared function, so each needed its own fix. Oracle-verified
+/// against jq 1.7.1 (`--jq-extensions` not needed here: this is the `jq`
+/// subcommand, which always accepts this surface).
+#[test]
+fn test_def_shadows_special_forms_2036() -> Result<()> {
+    for (filter, want) in [
+        (r#"def limit(a;b): "s"; limit(1;(1,2))"#, r#""s""#),
+        (r#"def until(c;u): "s"; 0 | until(true;.+1)"#, r#""s""#),
+        (r#"def while(c;u): "s"; 0 | while(false;.+1)"#, r#""s""#),
+        (r#"def repeat(e): "s"; 0 | repeat(.)"#, r#""s""#),
+        (r#"def range(a;b): "s"; [range(1;3)]"#, r#"["s"]"#),
+        (r#"def first: "s"; first"#, r#""s""#),
+        (r#"def last(f): "s"; last(1,2)"#, r#""s""#),
+        (r#"def error: "s"; error"#, r#""s""#),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 0, "{filter}: stderr {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "{filter}");
     }
     Ok(())
 }
@@ -20241,6 +20290,99 @@ fn test_env_empty_parens_stays_compile_error_not_runtime_2237() -> Result<()> {
     assert_eq!(stdout, "", "stderr: {stderr:?}");
     assert!(!stderr.contains("undefined function"), "stderr: {stderr:?}");
     assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #2036: a shadowing `def` is not restricted to the arity real jq's own
+/// grammar happens to accept for that name -- `until/2`'s own dedicated
+/// parser (`parse_until_expr`) only ever parses exactly 2 arguments, but
+/// `def until(a;b;c): ...` (arity 3) still shadows correctly. Before this
+/// fix's own review found and fixed this, the specialized parser's own
+/// hard failure on the unexpected 3rd argument was propagated as a raw
+/// parse error instead of falling back to an ordinary generic call for
+/// `resolve.rs` to resolve -- confirmed live this doesn't just apply to
+/// the 8 special forms above but to a `try_parse_builtin`-recognized
+/// builtin too (`ltrimstr/1` -> a 2-arg shadow), which consumes its own
+/// argument list as part of recognizing the keyword in the first place.
+/// Oracle-verified against jq 1.7.1.
+#[test]
+fn test_def_shadows_at_a_different_arity_than_the_builtin_2036() -> Result<()> {
+    for (filter, want) in [
+        (r#"def until(a;b;c): "s"; until(1;2;3)"#, r#""s""#),
+        (r#"def limit(a;b;c): "s"; limit(1;2;3)"#, r#""s""#),
+        (r#"def error(x;y): "s"; error(1;2)"#, r#""s""#),
+        (r#"def ltrimstr(a;b): "s"; ltrimstr(1;2)"#, r#""s""#),
+        (
+            r#"def not(x): "shadow1-" + (x|tostring); not(5)"#,
+            r#""shadow1-5""#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 0, "{filter}: stderr {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "{filter}");
+    }
+    Ok(())
+}
+
+/// #2036: a `def` at one arity for a name that also has a builtin at a
+/// *different* arity leaves the other arity's own builtin meaning
+/// untouched -- `def not(x): ...` (arity 1) does not disturb bare `not`
+/// (arity 0), matching real jq's own per-arity overload resolution.
+/// Oracle-verified against jq 1.7.1.
+#[test]
+fn test_def_shadow_at_one_arity_leaves_other_arity_builtin_intact_2036() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-nc", r#"def not(x): "shadow1"; false | not"#], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "true");
+    Ok(())
+}
+
+/// #2036: `null`/`true`/`false` are literal tokens in jq's own grammar,
+/// not identifier-based calls -- a `def` of the same *bare* name parses
+/// (it is not a syntax error) but can never actually be reached, matching
+/// real jq exactly (confirmed live, `def null: 1; null` stays `null` in
+/// both jq 1.7.1 and here, not `1`). Unlike `not`/builtins/special forms,
+/// these three are deliberately excluded from #2036's own shadow-check.
+#[test]
+fn test_null_true_false_never_shadowable_2036() -> Result<()> {
+    for (filter, want) in [
+        ("def null: 1; null", "null"),
+        ("def true: 1; true", "true"),
+        ("def false: 1; false", "false"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 0, "{filter}: stderr {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "{filter}");
+    }
+    Ok(())
+}
+
+/// #2036: the lexical prescan that flags a name as a shadow *candidate* is
+/// deliberately imprecise (it does not track lexical position) -- the real
+/// scope decision still comes from `resolve.rs`'s own existing, precise
+/// scope walker. A `def` appearing textually *after* a call, or in an
+/// unrelated sibling branch, must not shadow that call -- exactly the same
+/// forward-reference and sibling-visibility rules #1473 already enforces
+/// for ordinary user `def`s, now also exercised through a builtin name.
+/// Oracle-verified against jq 1.7.1.
+#[test]
+fn test_def_shadow_candidate_still_respects_lexical_scope_2036() -> Result<()> {
+    for (filter, want) in [
+        // The def is nested inside `f`'s own body -- only visible there,
+        // not at the top-level `length` after `f`.
+        ("def f: def length: 99; length; f, length", "99\n0"),
+        // The def is in a *later* sibling branch (a parenthesized group
+        // after the comma) -- the earlier `length` is unaffected.
+        ("length, (def length: 99; length)", "0\n99"),
+        // A parameter of the same name does not itself introduce a def
+        // visible to a bare `length` call elsewhere in the same body.
+        ("def f(x): length; f(1)", "0"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 0, "{filter}: stderr {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "{filter}");
+    }
     Ok(())
 }
 

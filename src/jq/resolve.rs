@@ -57,10 +57,11 @@
 //! jq's `def f($a): …` desugars to `def f(a): a as $a | …`, which leaves `a`
 //! callable.
 
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use super::walk::{builtin_kids, BuiltinKids};
+use super::walk::map_builtin_subexprs;
 use super::{Expr, ObjectKey, StringPart};
 
 /// A call this pass could not resolve to any in-scope `def`, parameter or
@@ -349,7 +350,7 @@ type Scope = Vec<(String, usize)>;
 /// the program and rewrites `ns::f` into a `FuncCall` named `ns::f`, matching
 /// the wrapper it also creates. Running earlier would report every module
 /// function as undefined.
-pub fn resolve_func_calls(expr: &Expr) -> Result<(), UnresolvedCall> {
+pub fn resolve_func_calls(expr: &mut Expr) -> Result<(), UnresolvedCall> {
     match resolve_func_calls_all(expr).into_iter().next() {
         Some(first) => Err(first),
         None => Ok(()),
@@ -364,7 +365,7 @@ pub fn resolve_func_calls(expr: &Expr) -> Result<(), UnresolvedCall> {
 /// every unresolvable call in one compile pass (`jq: N compile errors`);
 /// this is what lets the jq runner match that instead of always reporting
 /// `jq: 1 compile error` (#2037).
-pub fn resolve_func_calls_all(expr: &Expr) -> Vec<UnresolvedCall> {
+pub fn resolve_func_calls_all(expr: &mut Expr) -> Vec<UnresolvedCall> {
     let mut scope = Scope::new();
     let mut errors = Vec::new();
     check(expr, &mut scope, &mut errors);
@@ -388,7 +389,7 @@ fn in_scope(scope: &Scope, name: &str, arity: usize) -> bool {
 /// unresolvable call to `errors` rather than stopping at the first, matching
 /// how real jq's own compiler keeps going to report every compile error in
 /// one pass (#2037).
-fn check(expr: &Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
+fn check(expr: &mut Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
     match expr {
         // #1371: neither variant can occur here. This pass runs once, on the
         // freshly parsed program, before evaluation begins; both are built
@@ -401,9 +402,19 @@ fn check(expr: &Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
         // definition it resolved to -- so only its arguments can carry an
         // unresolved call, and they are checked in the scope this node sits
         // in. The definition's own body was checked at its `FuncDef`.
-        Expr::Shared(inner) => check(inner, scope, errors),
+        //
+        // `Shared` wraps an `Rc`, which this pass cannot get a unique `&mut`
+        // through if any other owner is alive -- harmless here since the
+        // variant is unreachable in practice (see above); `Rc::get_mut`
+        // silently skips recursion rather than panicking on the
+        // (never-hit) multi-owner case.
+        Expr::Shared(inner) => {
+            if let Some(inner) = Rc::get_mut(inner) {
+                check(inner, scope, errors);
+            }
+        }
         Expr::DefCall { args, .. } => {
-            for arg in args {
+            for arg in args.iter_mut() {
                 check(arg, scope, errors);
             }
         }
@@ -434,7 +445,7 @@ fn check(expr: &Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
         | Expr::Label { body: inner, .. } => check(inner, scope, errors),
 
         Expr::Error(inner) => {
-            if let Some(e) = inner.as_deref() {
+            if let Some(e) = inner.as_deref_mut() {
                 check(e, scope, errors);
             }
         }
@@ -522,7 +533,7 @@ fn check(expr: &Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
             // g(1)` is `g/1 is not defined` in jq, not a call to the outer
             // `g`. Pushed after the function's own name so a parameter
             // shadowing it wins.
-            for p in params {
+            for p in params.iter() {
                 scope.push((p.clone(), 0));
             }
             check(body, scope, errors);
@@ -534,7 +545,7 @@ fn check(expr: &Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
 
         Expr::Try { expr, catch } => {
             check(expr, scope, errors);
-            if let Some(c) = catch.as_deref() {
+            if let Some(c) = catch.as_deref_mut() {
                 check(c, scope, errors);
             }
         }
@@ -551,14 +562,14 @@ fn check(expr: &Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
 
         Expr::SliceExpr { target, start, end } => {
             check(target, scope, errors);
-            check_opt(start.as_deref(), scope, errors);
-            check_opt(end.as_deref(), scope, errors);
+            check_opt(start.as_deref_mut(), scope, errors);
+            check_opt(end.as_deref_mut(), scope, errors);
         }
 
         Expr::Range { from, to, step } => {
             check(from, scope, errors);
-            check_opt(to.as_deref(), scope, errors);
-            check_opt(step.as_deref(), scope, errors);
+            check_opt(to.as_deref_mut(), scope, errors);
+            check_opt(step.as_deref_mut(), scope, errors);
         }
 
         Expr::Reduce {
@@ -582,11 +593,11 @@ fn check(expr: &Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
             check(input, scope, errors);
             check(init, scope, errors);
             check(update, scope, errors);
-            check_opt(extract.as_deref(), scope, errors);
+            check_opt(extract.as_deref_mut(), scope, errors);
         }
 
         Expr::Pipe(exprs) | Expr::Comma(exprs) => {
-            for e in exprs {
+            for e in exprs.iter_mut() {
                 check(e, scope, errors);
             }
         }
@@ -604,9 +615,45 @@ fn check(expr: &Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
         // discard the extra errors by stopping at the first one — would
         // report errors real jq's compiler never reaches once every call is
         // collected instead of just the first (#2037).
-        Expr::FuncCall { name, args } => {
-            if in_scope(scope, name, args.len()) || is_jq_builtin(name, args.len()) {
-                for a in args {
+        //
+        // #2036: `builtin_fallback` is this node's alternate parse -- the
+        // builtin or special form the parser would have produced had the
+        // name never been shadowable -- attached only when the lexical
+        // prescan flagged `name` as possibly `def`'d somewhere in the
+        // program (see `Expr::FuncCall`'s own doc comment). Real shadowing
+        // (`in_scope`) is checked *first* and wins outright: a `def` at
+        // this exact `(name, arity)` always shadows the builtin, matching
+        // real jq. Only once that fails does the fallback matter -- and
+        // only then, because it exists precisely to answer "what if this
+        // name turns out not to be shadowed after all," the same question
+        // `is_jq_builtin`/the error arm below already answer for a call
+        // that was never eligible for a fallback in the first place.
+        // Whichever way it resolves, `builtin_fallback` is always `None`
+        // by the time this function returns for this node -- either
+        // dropped here (shadowing confirmed) or moved out and substituted
+        // (shadowing declined) -- so no other pass over the tree, before
+        // or after this one runs to completion, ever needs to know it
+        // exists.
+        Expr::FuncCall {
+            name,
+            args,
+            builtin_fallback,
+        } => {
+            if in_scope(scope, name, args.len()) {
+                for a in args.iter_mut() {
+                    check(a, scope, errors);
+                }
+                *builtin_fallback = None;
+            } else if let Some(fallback) = builtin_fallback.take() {
+                // Not shadowed after all -- restore the original parse.
+                // Its arity always matches this call site's own (the
+                // parser attaches a fallback only by re-parsing the exact
+                // same source span the fallback itself came from), so this
+                // substitution can never silently discard a real argument.
+                *expr = *fallback;
+                check(expr, scope, errors);
+            } else if is_jq_builtin(name, args.len()) {
+                for a in args.iter_mut() {
                     check(a, scope, errors);
                 }
             } else {
@@ -623,22 +670,22 @@ fn check(expr: &Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
         // to `eval`'s own "module not loaded" reporting rather than claimed
         // undefined here.
         Expr::NamespacedCall { args, .. } => {
-            for a in args {
+            for a in args.iter_mut() {
                 check(a, scope, errors);
             }
         }
 
         Expr::Object(entries) => {
-            for entry in entries {
-                if let ObjectKey::Expr(k) = &entry.key {
+            for entry in entries.iter_mut() {
+                if let ObjectKey::Expr(k) = &mut entry.key {
                     check(k, scope, errors);
                 }
-                check(&entry.value, scope, errors);
+                check(&mut entry.value, scope, errors);
             }
         }
 
         Expr::StringInterpolation(parts) => {
-            for part in parts {
+            for part in parts.iter_mut() {
                 if let StringPart::Expr(e) = part {
                     check(e, scope, errors);
                 }
@@ -646,28 +693,28 @@ fn check(expr: &Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
         }
 
         // No builtin introduces a function binding, so its sub-expressions
-        // inherit the current scope unchanged. Routed through `builtin_kids`
-        // rather than a second 207-arm match: that function has no wildcard, so
-        // a new sub-expression-carrying variant is a compile error there and
-        // this pass picks the fix up for free.
-        Expr::Builtin(builtin) => match builtin_kids(builtin) {
-            BuiltinKids::None => {}
-            BuiltinKids::One(a) => check(a, scope, errors),
-            BuiltinKids::Two(a, b) => {
-                check(a, scope, errors);
-                check(b, scope, errors);
-            }
-            BuiltinKids::Three(a, b, c) => {
-                check(a, scope, errors);
-                check(b, scope, errors);
-                check(c, scope, errors);
-            }
-        },
+        // inherit the current scope unchanged. Rebuilt via
+        // `map_builtin_subexprs` rather than an in-place mutable walker: a
+        // builtin's own operand can itself be a `FuncCall` this same #2036
+        // rewrite needs to reach (`map(length)` where `length` is
+        // shadowed, say), so each sub-expression is cloned, checked (which
+        // may substitute it), and used to rebuild the builtin -- the same
+        // clone-and-rebuild shape `jq_runner.rs`'s `rewrite_namespaced_calls`
+        // already uses for its own builtin arm, reusing this function's
+        // existing, tested infrastructure rather than hand-writing a
+        // second, mutable 207-arm match beside `builtin_kids`.
+        Expr::Builtin(builtin) => {
+            *builtin = map_builtin_subexprs(builtin, &mut |sub| {
+                let mut sub = sub.clone();
+                check(&mut sub, scope, errors);
+                sub
+            });
+        }
     }
 }
 
 /// [`check`] over an optional sub-expression.
-fn check_opt(expr: Option<&Expr>, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
+fn check_opt(expr: Option<&mut Expr>, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
     if let Some(e) = expr {
         check(e, scope, errors);
     }
@@ -683,8 +730,8 @@ mod tests {
     /// expectation in this module was captured from the pinned oracle
     /// (`/usr/bin/jq`, jq-1.7.1), never from succinctly's own output.
     fn resolve(filter: &str) -> Result<(), String> {
-        let expr = parse(filter).expect("filter must parse");
-        resolve_func_calls(&expr).map_err(|e| format!("{e}"))
+        let mut expr = parse(filter).expect("filter must parse");
+        resolve_func_calls(&mut expr).map_err(|e| format!("{e}"))
     }
 
     /// The compiled-in roster must match what `./scripts/sync-jq-builtin-names.sh`
@@ -865,12 +912,13 @@ mod tests {
         let unresolved = || Expr::FuncCall {
             name: "nosuchfn".into(),
             args: Vec::new(),
+            builtin_fallback: None,
         };
 
         let mut scope = Scope::new();
         let mut errors = Vec::new();
         check(
-            &Expr::Shared(Rc::new(unresolved())),
+            &mut Expr::Shared(Rc::new(unresolved())),
             &mut scope,
             &mut errors,
         );
@@ -885,7 +933,7 @@ mod tests {
         let mut scope = Scope::new();
         let mut errors = Vec::new();
         check(
-            &Expr::DefCall {
+            &mut Expr::DefCall {
                 def: Rc::new(crate::jq::FuncDefData {
                     name: "f".into(),
                     params: Vec::new(),

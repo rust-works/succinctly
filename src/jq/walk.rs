@@ -846,9 +846,20 @@ pub fn map_subexprs(expr: &Expr, mut f: &mut dyn FnMut(&Expr) -> Expr) -> Expr {
         // *particular* name/arity (installing a `DefCall`, binding a
         // `$`-parameter reference) does so with its own guarded arm first and
         // reaches this one only once that guard has already failed.
-        Expr::FuncCall { name, args } => Expr::FuncCall {
+        // `builtin_fallback` (#2036) is always `None` by the time any of
+        // this function's callers run -- `resolve.rs`'s compile-time
+        // rewrite consumes it first, over the whole tree, before
+        // evaluation (and so before DefCall installation/param
+        // substitution) ever begins. Recursed into defensively anyway,
+        // matching `args`, rather than assumed away.
+        Expr::FuncCall {
+            name,
+            args,
+            builtin_fallback,
+        } => Expr::FuncCall {
             name: name.clone(),
             args: args.iter().map(&mut f).collect(),
+            builtin_fallback: builtin_fallback.as_deref().map(|b| Box::new(f(b))),
         },
         Expr::NamespacedCall {
             namespace,

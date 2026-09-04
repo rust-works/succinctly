@@ -29,9 +29,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 #[cfg(not(test))]
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::expr::{
     ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, FuncDefBound, Import, Include,
@@ -172,6 +172,58 @@ const MAX_PATTERN_DEPTH: usize = 256;
 /// the same caveat; the two deliberately share one number.
 const MAX_EXPR_DEPTH: usize = 256;
 
+/// #2036 Direction 3: a cheap, deliberately over-approximate scan for every
+/// identifier spelled after a `def` keyword anywhere in `input` -- see
+/// `Parser::shadowable_defs`'s own doc comment for why imprecision here is
+/// safe (a false positive costs one wasted double-parse at one call site; a
+/// false negative is impossible to turn into a wrong *answer* either, since
+/// `resolve.rs`'s own scope-aware pass is what actually decides shadowing,
+/// this is only a hint for which call sites are worth asking it about).
+/// Deliberately not lexically aware -- does not skip string literals or
+/// comments, so `"def foo"` or `# def foo` also add `foo` to the set. Plain
+/// substring scanning, not a real lexer pass, by design.
+fn collect_def_names(input: &str) -> BTreeSet<String> {
+    fn is_ident_start(c: char) -> bool {
+        c.is_alphabetic() || c == '_'
+    }
+    // Yq mode's own `-`-in-identifier extension (`.my-key`) is folded in
+    // unconditionally here too, even though real `def` doesn't exist in yq
+    // at all without succinctly's own extension -- a mode-blind superset
+    // only ever widens the (already-imprecise) set, never narrows it.
+    fn is_ident_continue(c: char) -> bool {
+        c.is_alphanumeric() || c == '_' || c == '-'
+    }
+
+    let mut names = BTreeSet::new();
+    for (start, _) in input.match_indices("def") {
+        let end = start + 3;
+        let before_ok = input[..start]
+            .chars()
+            .next_back()
+            .map_or(true, |c| !is_ident_continue(c) && !is_ident_start(c));
+        let after_ok = input[end..]
+            .chars()
+            .next()
+            .map_or(true, |c| !is_ident_continue(c));
+        if !before_ok || !after_ok {
+            continue;
+        }
+        let rest = input[end..].trim_start();
+        let mut chars = rest.char_indices();
+        let Some((_, first)) = chars.next() else {
+            continue;
+        };
+        if !is_ident_start(first) {
+            continue;
+        }
+        let ident_end = chars
+            .find(|&(_, c)| !is_ident_continue(c))
+            .map_or(rest.len(), |(i, _)| i);
+        names.insert(rest[..ident_end].to_string());
+    }
+    names
+}
+
 /// Parser state.
 struct Parser<'a> {
     input: &'a str,
@@ -186,6 +238,23 @@ struct Parser<'a> {
     pattern_depth: usize,
     /// Current `Expr` recursion depth; see [`MAX_EXPR_DEPTH`].
     expr_depth: usize,
+    /// #2036 Direction 3: every identifier that appears anywhere after a
+    /// `def` keyword in `input`, computed once by [`collect_def_names`] at
+    /// construction. A cheap, deliberately *imprecise* over-approximation
+    /// of "names a `def` in this program might shadow a builtin at" -- it
+    /// does not track lexical scope (that is `resolve.rs`'s job, done
+    /// correctly, once the tree exists) and can include a false positive
+    /// (a `def` spelled inside a string literal, say). A false positive
+    /// only costs one wasted double-parse at that one call site; it can
+    /// never cause an incorrect *answer*, since `resolve.rs`'s own
+    /// scope-aware check is what actually decides, for each call site,
+    /// whether the name is genuinely in scope there. Consulted only at the
+    /// keyword choke points that can produce a shadowable builtin/special
+    /// form (see [`Self::maybe_shadow_builtin`] and
+    /// [`Self::zero_arity_or_wrong_arity_call`]) -- a program with no
+    /// `def`s anywhere pays for one scan of its own source text and
+    /// nothing else.
+    shadowable_defs: BTreeSet<String>,
 }
 
 impl<'a> Parser<'a> {
@@ -198,6 +267,7 @@ impl<'a> Parser<'a> {
             jq_extensions: false,
             pattern_depth: 0,
             expr_depth: 0,
+            shadowable_defs: collect_def_names(input),
         }
     }
 
@@ -209,6 +279,7 @@ impl<'a> Parser<'a> {
             jq_extensions,
             pattern_depth: 0,
             expr_depth: 0,
+            shadowable_defs: collect_def_names(input),
         }
     }
 
@@ -1400,48 +1471,85 @@ impl<'a> Parser<'a> {
                 let keyword_start = self.pos;
                 if self.matches_keyword("null") {
                     self.consume_keyword("null");
-                    self.zero_arity_or_wrong_arity_call(keyword_start, Expr::Literal(Literal::Null))
+                    // #2036: `null`/`true`/`false` are literal tokens in
+                    // jq's own grammar, not shadowable identifier calls --
+                    // `None` here, unlike `not` and every builtin below.
+                    self.zero_arity_or_wrong_arity_call(
+                        keyword_start,
+                        None,
+                        Expr::Literal(Literal::Null),
+                    )
                 } else if self.matches_keyword("true") {
                     self.consume_keyword("true");
                     self.zero_arity_or_wrong_arity_call(
                         keyword_start,
+                        None,
                         Expr::Literal(Literal::Bool(true)),
                     )
                 } else if self.matches_keyword("false") {
                     self.consume_keyword("false");
                     self.zero_arity_or_wrong_arity_call(
                         keyword_start,
+                        None,
                         Expr::Literal(Literal::Bool(false)),
                     )
                 } else if self.matches_keyword("not") {
                     self.consume_keyword("not");
-                    self.zero_arity_or_wrong_arity_call(keyword_start, Expr::Not)
+                    self.zero_arity_or_wrong_arity_call(keyword_start, Some("not"), Expr::Not)
                 } else if self.matches_keyword("if") {
                     self.parse_if_expr()
                 } else if self.matches_keyword("try") {
                     self.parse_try_expr()
                 } else if self.matches_keyword("error") {
-                    self.parse_error_expr()
+                    self.parse_shadowable_special_form(
+                        keyword_start,
+                        "error",
+                        Self::parse_error_expr,
+                    )
                 } else if self.matches_keyword("reduce") {
                     self.parse_reduce_expr()
                 } else if self.matches_keyword("foreach") {
                     self.parse_foreach_expr()
                 } else if self.matches_keyword("limit") {
                     self.reject_unless_jq_extensions("limit")?;
-                    self.parse_limit_expr()
+                    self.parse_shadowable_special_form(
+                        keyword_start,
+                        "limit",
+                        Self::parse_limit_expr,
+                    )
                 } else if self.matches_keyword("until") {
-                    self.parse_until_expr()
+                    self.parse_shadowable_special_form(
+                        keyword_start,
+                        "until",
+                        Self::parse_until_expr,
+                    )
                 } else if self.matches_keyword("while") {
-                    self.parse_while_expr()
+                    self.parse_shadowable_special_form(
+                        keyword_start,
+                        "while",
+                        Self::parse_while_expr,
+                    )
                 } else if self.matches_keyword("repeat") {
-                    self.parse_repeat_expr()
+                    self.parse_shadowable_special_form(
+                        keyword_start,
+                        "repeat",
+                        Self::parse_repeat_expr,
+                    )
                 } else if self.matches_keyword("range") {
                     self.reject_unless_jq_extensions("range")?;
-                    self.parse_range_expr()
+                    self.parse_shadowable_special_form(
+                        keyword_start,
+                        "range",
+                        Self::parse_range_expr,
+                    )
                 } else if self.matches_keyword("first") {
-                    self.parse_first_expr()
+                    self.parse_shadowable_special_form(
+                        keyword_start,
+                        "first",
+                        Self::parse_first_expr,
+                    )
                 } else if self.matches_keyword("last") {
-                    self.parse_last_expr()
+                    self.parse_shadowable_special_form(keyword_start, "last", Self::parse_last_expr)
                 } else if self.matches_keyword("def") {
                     // Phase 9: Function definition
                     self.parse_def_expr()
@@ -1449,56 +1557,104 @@ impl<'a> Parser<'a> {
                     self.parse_label_expr()
                 } else if self.matches_keyword("break") {
                     self.parse_break_expr()
-                } else if let Some(builtin) = self.try_parse_builtin()? {
-                    // #2110: a following `(<args>)` means this was actually
-                    // a wrong-arity call, not a bare builtin reference --
-                    // `zero_arity_or_wrong_arity_call` rewinds and re-parses
-                    // it as one instead of falling into postfix parsing,
-                    // which would just reject the `(` as a stray token; it
-                    // also applies postfix itself (e.g. `env.PATH`,
-                    // `keys[0]`) on whichever `Expr` it ends up returning.
-                    self.zero_arity_or_wrong_arity_call(keyword_start, Expr::Builtin(builtin))
                 } else {
-                    // Phase 9: Try to parse as function call.
-                    //
-                    // #2237 review: postfix (`.field`/`[idx]`) should be
-                    // applied to the resolved call here too, exactly like
-                    // the `zero_arity_or_wrong_arity_call` branch above
-                    // already does -- a pre-existing gap, not previously
-                    // scoped to any wrong-arity fix: even a legitimately
-                    // *defined* function call followed by postfix failed to
-                    // parse at all before this (`def f(x): {a:x}; f(1).a`
-                    // raised a raw "unexpected character '.'" instead of
-                    // returning `1`, confirmed against jq 1.7.1). Also
-                    // fixes the same gap for every wrong-arity call that
-                    // reaches this branch via `Ok(None)` from
-                    // `Self::try_parse_builtin` (`Self::parse_required_single_arg`'s
-                    // rewind path -- `has`/`select`/`env`/...).
-                    //
-                    // jq mode only (review, round 2): yq mode's own
-                    // merge-flag scan (`Self::scan_merge_flags`, called from
-                    // the `*`/`*=` operator parsing) silently stops at the
-                    // first unrecognized character rather than erroring,
-                    // leaving it -- and anything after it -- for this exact
-                    // fallback to parse as an ordinary expression. Applying
-                    // postfix unconditionally here let a bare merge-flag
-                    // remnant absorb a trailing `.field` the way `n.b`
-                    // legitimately can as a plain identifier expression,
-                    // producing a full (if semantically wrong-flag) parse
-                    // where real yq's own lexer unconditionally rejects
-                    // *any* non-flag content immediately after `*=`/`*` --
-                    // confirmed live against yq v4.53.3, `.a *= n.b` (an
-                    // ordinary, unrelated identifier reference, not even a
-                    // merge-flag context) is *also* `lexer: invalid input
-                    // text`. Real jq has no such restriction (`.a *=n .b`
-                    // parses as `.a *= (n.b)` there, confirmed live, and
-                    // only fails later at name resolution), so jq mode
-                    // keeps the postfix fix.
-                    let call = self.parse_func_call_or_error()?;
-                    if self.mode == ParserMode::Jq {
-                        self.parse_postfix(call)
-                    } else {
-                        Ok(call)
+                    // #2036: the shadow-check name is re-derived from
+                    // `input` (`ident_text_at`), not read off whichever
+                    // `Builtin` `try_parse_builtin` might return -- many
+                    // arms consume their own argument list as part of
+                    // recognizing the builtin (`ltrimstr(s)`), so the bare
+                    // keyword text at `keyword_start` is the only reliable
+                    // source for "what identifier was this," and is needed
+                    // even on the `Err` arm below, where there is no
+                    // `Builtin` at all yet to derive it from.
+                    let name = self.ident_text_at(keyword_start).to_string();
+                    let shadow_candidate = self.shadowable_defs.contains(&name);
+                    match self.try_parse_builtin() {
+                        Ok(Some(builtin)) => {
+                            // #2110: a following `(<args>)` means this was
+                            // actually a wrong-arity call, not a bare
+                            // builtin reference -- `zero_arity_or_wrong_
+                            // arity_call` rewinds and re-parses it as one
+                            // instead of falling into postfix parsing,
+                            // which would just reject the `(` as a stray
+                            // token; it also applies postfix itself (e.g.
+                            // `env.PATH`, `keys[0]`) on whichever `Expr` it
+                            // ends up returning.
+                            self.zero_arity_or_wrong_arity_call(
+                                keyword_start,
+                                shadow_candidate.then_some(name.as_str()),
+                                Expr::Builtin(builtin),
+                            )
+                        }
+                        // Not recognized as any builtin at all -- ordinary
+                        // function call, unrelated to #2036 (a name never
+                        // matched here never goes through the shadow path
+                        // either way).
+                        //
+                        // #2237 review: postfix (`.field`/`[idx]`) should be
+                        // applied to the resolved call here too, exactly like
+                        // the `zero_arity_or_wrong_arity_call` branch above
+                        // already does -- a pre-existing gap, not previously
+                        // scoped to any wrong-arity fix: even a legitimately
+                        // *defined* function call followed by postfix failed to
+                        // parse at all before this (`def f(x): {a:x}; f(1).a`
+                        // raised a raw "unexpected character '.'" instead of
+                        // returning `1`, confirmed against jq 1.7.1). Also
+                        // fixes the same gap for every wrong-arity call that
+                        // reaches this branch via `Ok(None)` from
+                        // `Self::try_parse_builtin` (`Self::parse_required_single_arg`'s
+                        // rewind path -- `has`/`select`/`env`/...).
+                        //
+                        // jq mode only (review, round 2): yq mode's own
+                        // merge-flag scan (`Self::scan_merge_flags`, called from
+                        // the `*`/`*=` operator parsing) silently stops at the
+                        // first unrecognized character rather than erroring,
+                        // leaving it -- and anything after it -- for this exact
+                        // fallback to parse as an ordinary expression. Applying
+                        // postfix unconditionally here let a bare merge-flag
+                        // remnant absorb a trailing `.field` the way `n.b`
+                        // legitimately can as a plain identifier expression,
+                        // producing a full (if semantically wrong-flag) parse
+                        // where real yq's own lexer unconditionally rejects
+                        // *any* non-flag content immediately after `*=`/`*` --
+                        // confirmed live against yq v4.53.3, `.a *= n.b` (an
+                        // ordinary, unrelated identifier reference, not even a
+                        // merge-flag context) is *also* `lexer: invalid input
+                        // text`. Real jq has no such restriction (`.a *=n .b`
+                        // parses as `.a *= (n.b)` there, confirmed live, and
+                        // only fails later at name resolution), so jq mode
+                        // keeps the postfix fix.
+                        Ok(None) => {
+                            let call = self.parse_func_call_or_error()?;
+                            if self.mode == ParserMode::Jq {
+                                self.parse_postfix(call)
+                            } else {
+                                Ok(call)
+                            }
+                        }
+                        // #2036: `try_parse_builtin` matched a keyword but
+                        // failed parsing the argument shape it expects for
+                        // it (e.g. `def ltrimstr(a;b): ...; ltrimstr(1;2)`
+                        // -- real `ltrimstr/1`'s own parser only ever
+                        // accepts exactly one argument). Confirmed live
+                        // that real jq still lets this shadow
+                        // (`ltrimstr(a;b)` is a real jq idiom, not an
+                        // error): for a shadow candidate, the failure is
+                        // not propagated -- see
+                        // `retry_shadow_candidate_as_generic_call`'s own
+                        // doc comment for the empty-parens and
+                        // retry-budget safeguards this needs (and for why
+                        // it applies the same jq-mode-only postfix fix as
+                        // the `Ok(None)` arm just above). A non-candidate
+                        // name keeps today's behavior exactly: the parse
+                        // error propagates unchanged.
+                        Err(e) => {
+                            if shadow_candidate {
+                                self.retry_shadow_candidate_as_generic_call(keyword_start, e)
+                            } else {
+                                Err(e)
+                            }
+                        }
                     }
                 }
             }
@@ -2392,14 +2548,11 @@ impl<'a> Parser<'a> {
         // Return as function call - the evaluator will check if it's defined
         // Note: for known identifiers that aren't functions, we'd have returned earlier
         // So if we reach here, it's either a user-defined function call or an error
-        if args.is_empty() {
-            // Zero-arg function call - but this might be an unknown identifier
-            // For now, treat it as a function call; the evaluator will handle errors
-            Ok(Expr::FuncCall { name, args })
-        } else {
-            // Has arguments, definitely a function call
-            Ok(Expr::FuncCall { name, args })
-        }
+        Ok(Expr::FuncCall {
+            name,
+            args,
+            builtin_fallback: None,
+        })
     }
 
     /// The `Expr`-returning counterpart of
@@ -2547,9 +2700,25 @@ impl<'a> Parser<'a> {
     ///
     /// [`try_parse_builtin`]: Self::try_parse_builtin
     /// [`resolve.rs`]: super::resolve
+    ///
+    /// `shadow_name` (#2036): `Some(name)` for a keyword that real jq lets a
+    /// `def` shadow (`not`, and everything [`try_parse_builtin`] recognizes);
+    /// `None` for one it never can (`null`/`true`/`false` are literal tokens
+    /// in jq's own grammar, not identifier-based calls -- confirmed live,
+    /// `def null: 1; null` stays `null` in both jq 1.7.1 and here). Only
+    /// consulted in the tail (bare-keyword) branch below, never the
+    /// wrong-arity rewind above: that branch already unconditionally
+    /// reparses as a generic call with no fallback attached, which is
+    /// already exactly correct here too (`not(x)` where `not/1` is not in
+    /// scope has no zero-arity fallback to offer regardless of shadowing --
+    /// `Expr::Not` only ever represents the arity-0 case). The tail's own
+    /// reparse, by contrast, can only ever yield zero args (having reached
+    /// the tail at all means there was no unconsumed non-empty arg list
+    /// following), so its result's arity always matches `parsed`'s.
     fn zero_arity_or_wrong_arity_call(
         &mut self,
         start_pos: usize,
+        shadow_name: Option<&str>,
         parsed: Expr,
     ) -> Result<Expr, ParseError> {
         let after_keyword = self.pos;
@@ -2575,6 +2744,12 @@ impl<'a> Parser<'a> {
             }
         }
         self.pos = after_keyword;
+        if let Some(name) = shadow_name {
+            if self.shadowable_defs.contains(name) {
+                let wrapped = self.rewind_reparse_as_shadowable_call(start_pos, parsed)?;
+                return self.parse_postfix(wrapped);
+            }
+        }
         self.parse_postfix(parsed)
     }
 
@@ -2631,6 +2806,94 @@ impl<'a> Parser<'a> {
         }
         self.next();
         Ok(Some(arg))
+    }
+
+    /// #2036 Direction 3: entry point for every *fixed*-arity special form
+    /// (`limit`, `until`, `while`, `repeat`, `range`, `first`, `last`,
+    /// `error`). `parse_original` is the keyword's own dedicated parser
+    /// (`Self::parse_limit_expr`, etc.), tried first always -- unaffected
+    /// on a program with no matching `def` anywhere (the `shadowable_defs`
+    /// fast-reject below is the entire cost there, no double-parse at all).
+    ///
+    /// A shadowing `def` is not restricted to the builtin's own arity real
+    /// jq's grammar happens to accept (confirmed live: `def until(a;b;c):
+    /// "s"; until(1;2;3)` is `"s"` in real jq, even though `until/2` is the
+    /// *only* shape `parse_until_expr` itself parses). When `name` is a
+    /// shadow candidate but `parse_original` fails outright -- the written
+    /// arity doesn't match what the dedicated parser accepts -- that
+    /// failure is *not* propagated: this rewinds to `start_pos` and falls
+    /// back to an ordinary generic call with no `builtin_fallback` at all,
+    /// deferring entirely to `resolve.rs` to decide whether the result is
+    /// a real `def` at that arity, a real jq builtin at some *other* arity
+    /// (`is_jq_builtin`), or genuinely unresolvable -- the same three-way
+    /// split every ordinary call already gets.
+    fn parse_shadowable_special_form(
+        &mut self,
+        start_pos: usize,
+        name: &str,
+        parse_original: impl FnOnce(&mut Self) -> Result<Expr, ParseError>,
+    ) -> Result<Expr, ParseError> {
+        if !self.shadowable_defs.contains(name) {
+            return parse_original(self);
+        }
+        match parse_original(self) {
+            Ok(original) => self.rewind_reparse_as_shadowable_call(start_pos, original),
+            Err(_) => {
+                self.pos = start_pos;
+                self.parse_func_call_or_error()
+            }
+        }
+    }
+
+    /// #2036 Direction 3: rewind to `start_pos` (before the keyword began)
+    /// and re-parse the same source span as an ordinary `NAME(args;args)`
+    /// call, stashing `original` -- whatever the keyword's own dedicated
+    /// parse produced for that identical span -- as the new node's
+    /// `builtin_fallback`. [`super::resolve::check`] is the sole consumer:
+    /// once it knows whether this exact `(name, arity)` is genuinely a
+    /// `def` in scope at this position, it either keeps the call (real
+    /// shadowing) or substitutes `original` back in (not shadowed after
+    /// all). Shared by every call site that can produce a shadowable
+    /// builtin or fixed-arity special form; see
+    /// [`Self::zero_arity_or_wrong_arity_call`]'s own doc comment for why
+    /// it alone additionally gates this behind `shadow_name`.
+    fn rewind_reparse_as_shadowable_call(
+        &mut self,
+        start_pos: usize,
+        original: Expr,
+    ) -> Result<Expr, ParseError> {
+        self.pos = start_pos;
+        let call = self.parse_func_call_or_error()?;
+        Ok(match call {
+            Expr::FuncCall { name, args, .. } => Expr::FuncCall {
+                name,
+                args,
+                builtin_fallback: Some(Box::new(original)),
+            },
+            // `parse_func_call_or_error` can also return a namespaced call
+            // (`NAME::rest`) if the rewound identifier happens to be
+            // followed by `::` -- vanishingly unlikely for a real builtin
+            // name, and there is no `FuncCall` to attach a fallback to in
+            // that shape anyway, so it is returned as-is rather than
+            // forced into one.
+            other => other,
+        })
+    }
+
+    /// The bare identifier text starting at `pos`, independent of how far
+    /// parsing may have since advanced past it. Some builtins consume their
+    /// own argument list as part of being recognized (`ltrimstr(s)`), so
+    /// `self.pos` after a successful [`Self::try_parse_builtin`] call can
+    /// cover far more than just the keyword itself -- this re-derives just
+    /// the identifier from `input`, the same span [`collect_def_names`]
+    /// itself would have captured for a `def` of the same name.
+    fn ident_text_at(&self, pos: usize) -> &'a str {
+        let rest = &self.input[pos..];
+        let end = rest
+            .char_indices()
+            .find(|&(_, c)| !(c.is_alphanumeric() || c == '_'))
+            .map_or(rest.len(), |(i, _)| i);
+        &rest[..end]
     }
 
     /// Try to parse a builtin function.

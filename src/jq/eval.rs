@@ -1413,7 +1413,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             then,
             bound,
         } => eval_func_def::<W, S>(name, params, body, then, bound, value, optional),
-        Expr::FuncCall { name, args } => eval_func_call::<W>(name, args, value, optional),
+        Expr::FuncCall { name, args, .. } => eval_func_call::<W>(name, args, value, optional),
 
         // #1371: a call already bound to its definition. Unlike `FuncCall`
         // above (which only ever errors, since an unbound call is a compile
@@ -45808,7 +45808,9 @@ pub(crate) fn install_def_calls(
         // -- so expansion is never handed one. Do not read the fallthrough
         // below as *permitting* a forward reference: it is unreachable for
         // one, and would still mis-resolve it if that pass were bypassed.
-        Expr::FuncCall { name, args } if *name == def.name && args.len() == def.params.len() => {
+        Expr::FuncCall { name, args, .. }
+            if *name == def.name && args.len() == def.params.len() =>
+        {
             // #1371: bind the call to its definition, but do **not**
             // substitute yet. Substitution happens in `eval_def_call`, when
             // evaluation actually reaches this node.
@@ -46363,7 +46365,7 @@ fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, subst_dollar
                 bound: FuncDefBound::default(),
             }
         }
-        Expr::FuncCall { name, args } if name == param && args.is_empty() => {
+        Expr::FuncCall { name, args, .. } if name == param && args.is_empty() => {
             // In jq, function parameters are bare identifiers that parse as
             // zero-arg FuncCalls. This is a reference to the parameter --
             // never gated on `subst_dollar` (see this function's own doc
@@ -46741,6 +46743,7 @@ mod tests {
             body: Expr::FuncCall {
                 name: "f".to_string(),
                 args: vec![],
+                builtin_fallback: None,
             },
         });
         let bound = BoundBody::default();
@@ -76364,6 +76367,7 @@ mod tests {
         let call_f = || Expr::FuncCall {
             name: "f".into(),
             args: Vec::new(),
+            builtin_fallback: None,
         };
         let nth = Expr::NthExpr {
             n: Box::new(call_f()),
@@ -76405,6 +76409,7 @@ mod tests {
             args: vec![Expr::FuncCall {
                 name: "f".into(),
                 args: Vec::new(),
+                builtin_fallback: None,
             }],
         };
 

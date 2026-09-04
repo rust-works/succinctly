@@ -4075,7 +4075,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
     // unfaithful to here. Reporting only the first is simply what this
     // extension has always done, not a shortcut #2037 introduced or one that
     // needs revisiting alongside it.
-    if let Err(unresolved) = jq::resolve_func_calls(&program.expr) {
+    if let Err(unresolved) = jq::resolve_func_calls(&mut program.expr) {
         anyhow::bail!("{unresolved}");
     }
 
@@ -4089,7 +4089,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         .split_exp
         .as_deref()
         .map(|s| {
-            let expr = jq::parse_program_with_mode_and_extensions(
+            let mut expr = jq::parse_program_with_mode_and_extensions(
                 s,
                 jq::ParserMode::Yq,
                 args.jq_extensions,
@@ -4099,7 +4099,7 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             // #1473: the filename expression is a second, independently parsed
             // program, so it needs its own resolution pass -- the main
             // filter's says nothing about it.
-            if let Err(unresolved) = jq::resolve_func_calls(&expr) {
+            if let Err(unresolved) = jq::resolve_func_calls(&mut expr) {
                 anyhow::bail!("{unresolved} in --split-exp expression");
             }
             Ok(expr)
