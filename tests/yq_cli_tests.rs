@@ -29810,6 +29810,24 @@ fn test_resolve_slice_bound_end_own_partial_prefix_discarded_in_yq_mode_2351_rev
     Ok(())
 }
 
+/// #2385: `resolve_slice_bound`'s own new conversion-failure gate keeps
+/// the pre-existing conservative discard in yq mode too, mirroring the
+/// #2351-review generator-escape gate immediately above -- real yq has no
+/// clean model for a computed comma-bound at all (per #2372's own
+/// live-verified finding for the read-path siblings), so there's no oracle
+/// basis for streaming a prefix here. `del(.[(0,1,"x"):3])` (no `error(...)`
+/// at all -- this is a resolved-but-non-numeric bound, not a generator
+/// escape) on `[1,2,3]` prints only the conversion error.
+#[test]
+fn test_resolve_slice_bound_type_error_discarded_in_yq_mode_2385() -> Result<()> {
+    let (out, stderr, code) =
+        run_yq_stdin_with_stderr("del(.[(0,1,\"x\"):3])", "[1, 2, 3]\n", &["-o", "json"])?;
+    assert_eq!(code, 1, "out: {out:?} stderr: {stderr:?}");
+    assert_eq!(out, "");
+    assert!(stderr.contains("must be integers"), "stderr: {stderr:?}");
+    Ok(())
+}
+
 /// #2351 review (Gap 2): `eval_slice_bound_with_path_context` (the
 /// `key`/`parent`/`path` twin, via `drain_path_context_stream`) had no
 /// yq-mode gate at all. `key` is real, native yq syntax. Verified live

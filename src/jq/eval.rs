@@ -26485,25 +26485,32 @@ type ResolvedSliceBound = (Option<i64>, Option<NumberKey>);
 /// discard-prefix `eval_owned_multi`, mirroring `resolve_index_expr`'s
 /// `key`/`key_escape` split for its own (single) generator argument.
 ///
-/// **Residual, found in #1517's own review, not fixed here.** A
-/// resolved-but-non-numeric bound (e.g. `"x"` in `.[(0,1,"x"):(2,3)]`) is a
-/// genuinely different failure from a generator's own error/break/halt (a
-/// type error on a value the generator already committed to, not an escape
-/// mid-stream) -- but the `.collect::<Result<Vec<_>, _>>()?` below still
-/// discards the *whole* converted prefix on the first such value, including
-/// any that resolved cleanly before it, the same shape of bug #1517 fixes
-/// for a genuine escape. Confirmed against jq 1.7.1: `path(.[(0,1,"x"):(2,3)])`
+/// #2385: a resolved-but-non-numeric bound (e.g. `"x"` in
+/// `.[(0,1,"x"):(2,3)]`) is a genuinely different failure from a
+/// generator's own error/break/halt (a type error on a value the generator
+/// already committed to, not an escape mid-stream) -- the
+/// `.collect::<Result<Vec<_>, _>>()?` this used to end with discarded the
+/// *whole* converted prefix on the first such value, including any that
+/// resolved cleanly before it, the same shape of bug #1517 fixes for a
+/// genuine escape. Fixed the same way #2372 fixed the identical gap in
+/// `eval_slice_bound`/`eval_slice_bound_with_path_context`: convert one
+/// value at a time, and on the first failure, return the successfully-
+/// converted prefix paired with the new error instead of a bare `Err` --
+/// the caller's own `starts`/`ends` (`Vec<ResolvedSliceBound>`) plus
+/// `starts_escape`/`ends_escape` deferred-escape threading already handles
+/// this shape with no changes needed there, same as #2372's own callers.
+/// A conversion failure unconditionally outranks any later-pending
+/// generator escape -- it only ever touches a value already produced,
+/// strictly before whatever triggered the pending escape in true generator
+/// order (#2372's own rationale, re-verified here: `path(.[(0,1,"x"):(2,3)])`
 /// on `[10,20,30]` prints `[{"start":0,"end":2}]`, `[{"start":0,"end":3}]`,
-/// `[{"start":1,"end":2}]`, `[{"start":1,"end":3}]` before raising
-/// `Array/string slice indices must be integers`; this function answers
-/// with none of the four. Not a regression -- confirmed present (with a
-/// *different*, wrong error message) before this fix too, since the old
-/// discard-prefix `eval_owned_multi` already threw the whole prefix away on
-/// any escape, generator or type, before this distinction was even
-/// visible. Left as a known gap rather than folded into this PR: giving a
-/// type failure the same keep-partial treatment as a generator escape needs
-/// its own priority-ordering pass against `target_escape`/`bounds_escape`
-/// above, re-verified against jq the same way, not a quick addition here.
+/// `[{"start":1,"end":2}]`, `[{"start":1,"end":3}]` before raising "Array/
+/// string slice indices must be integers"; adding a trailing `halt` to the
+/// start-bound generator, `.[(0,1,"x",halt):(2,3)]`, produces the identical
+/// four pairs and the identical error -- `halt` is never reached). yq mode
+/// keeps the pre-existing conservative discard (mirrors the generator-
+/// escape gate immediately below): real yq has no clean model for a
+/// computed comma-bound at all, per #2372's own live-verified finding.
 ///
 /// #2351 review (Gap 1): jq-only, matching `eval_slice_bound`'s own gate.
 /// `eval_owned_multi_keep_partial` itself can't carry this gate -- it's a
@@ -26531,14 +26538,14 @@ fn resolve_slice_bound<S: EvalSemantics>(
     if S::TAG == EvalTag::Yq && escape.is_some() {
         values = Vec::new();
     }
-    let resolved = values
-        .iter()
-        .map(|v| {
-            owned_bound_to_i64(v, round)
-                .map(|i| (i, numeric_slice_bound_key(v)))
-                .map_err(EvalEscape::from)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut resolved = vec_with_capacity(values.len());
+    for v in &values {
+        match owned_bound_to_i64(v, round) {
+            Ok(i) => resolved.push((i, numeric_slice_bound_key(v))),
+            Err(e) if S::TAG == EvalTag::Yq => return Err(EvalEscape::from(e)),
+            Err(e) => return Ok((resolved, Some(EvalEscape::from(e)))),
+        }
+    }
     Ok((resolved, escape))
 }
 
