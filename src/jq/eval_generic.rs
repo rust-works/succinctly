@@ -2480,18 +2480,17 @@ fn push_generic_truthiness_cursor_error<C: DocumentCursor>(c: &C, depth: usize) 
         // path that updates one without the other).
         let mut last_field: Option<C> = None;
         // STYLE-0013: this walk deliberately does not route through
-        // `DocumentField::checked_key`, on two separate counts.
+        // `DocumentField::checked_key` -- the key half is the #2061 *lazy*
+        // form below, not `resolve_display_key` per key: allocating a
+        // `String` for every key made `path(.[0])` over a 1M-object array
+        // cost 577 ms against 50 ms. `checked_key` is the eager form, so
+        // this site cannot adopt it without giving that back.
         //
-        // 1. The key half is the #2061 *lazy* form below, not
-        //    `resolve_display_key` per key: allocating a `String` for every
-        //    key made `path(.[0])` over a 1M-object array cost 577 ms
-        //    against 50 ms. `checked_key` is the eager form, so this site
-        //    cannot adopt it without giving that back.
-        // 2. The delimiter half (#1677/#2211/#2243) is *missing* here, and
-        //    that is a live bug, not a design choice -- tracked as #2349,
-        //    which is where it gets fixed and where the cost of doing so
-        //    gets attributed. Fixing it inside #1803's extraction would have
-        //    made a pure refactor the vehicle for a behaviour change.
+        // The delimiter half (#1677/#2211/#2243) *was* missing here until
+        // #2349 fixed it -- see the `key_delimiter_ok`/`value_delimiter_ok`
+        // calls below and the container/trailing-gap checks after each
+        // loop, added by that fix directly (not via `checked_key`/
+        // `delimiters_ok`, for the same eager-allocation reason above).
         //
         // The marker above is what STYLE-0013 is for. #2211 and #2243 each
         // added a check to "the materializers", neither noticed this walk,
