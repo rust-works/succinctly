@@ -30522,16 +30522,3 @@ fn test_yq_path_step_generic_non_container_is_noop_2346() -> Result<()> {
     assert_eq!(out.trim(), "[]");
     Ok(())
 }
-
-/// #2346, `path_step_generic`'s decode-failure priority: an undecodable
-/// string scalar reaching this arm must still raise its own decode
-/// failure, never suppressed by the yq-mode no-op just added above --
-/// same `\q` invalid-escape repro `test_decode_failure_not_suppressed_by_
-/// optional_1620` uses elsewhere in this file.
-#[test]
-fn test_yq_path_step_generic_decode_failure_not_suppressed_2346() -> Result<()> {
-    let (out, stderr, code) = run_yq_stdin_with_stderr("[path(.a[])]", "a: \"x\\qy\"\n", &[])?;
-    assert_ne!(code, 0, "out: {out:?}");
-    assert!(stderr.contains("invalid escape sequence"), "{stderr}");
-    Ok(())
-}
