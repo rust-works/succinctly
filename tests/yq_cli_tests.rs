@@ -1329,8 +1329,7 @@ fn test_yq_leaf_paths_leaf_definition_unaffected_by_868() -> Result<()> {
 /// `effective_fields`), matching real jq exactly.
 #[test]
 fn test_jq_mode_paths_duplicate_key_still_dedupes_868() -> Result<()> {
-    let (output, _stderr, code) =
-        run_jq_stdin_with_stderr("[paths]", r#"{"a":1,"a":2,"b":3}"#, &["-c"])?;
+    let (output, code) = run_jq_stdin("[paths]", r#"{"a":1,"a":2,"b":3}"#, &["-c"])?;
 
     assert_eq!(code, 0, "out: {output:?}");
     assert_eq!(output.trim(), r#"[["a"],["b"]]"#);
@@ -18113,8 +18112,7 @@ fn test_yq_sub_3arg_zero_width_pattern_interaction_1122() -> Result<()> {
 /// stay untouched by this yq-only fix -- confirmed against jq 1.7.1.
 #[test]
 fn test_jq_sub_3arg_unaffected_by_1122() -> Result<()> {
-    let (stdout, _stderr, code) =
-        run_jq_stdin_with_stderr(r#""AAA" | sub("a";"X";"i")"#, "null", &["-c"])?;
+    let (stdout, code) = run_jq_stdin(r#""AAA" | sub("a";"X";"i")"#, "null", &["-c"])?;
     assert_eq!(code, 0, "stdout: {stdout:?}");
     assert_eq!(stdout.trim_end(), "\"XAA\"");
     Ok(())
@@ -21125,8 +21123,7 @@ fn test_1162_bare_root_comma_container_slice_del_is_noop() -> Result<()> {
 /// jq (no parent-key-drop concept exists there at all).
 #[test]
 fn test_1162_chained_array_slice_del_jq_mode_unaffected() -> Result<()> {
-    let (out, _stderr, code) =
-        run_jq_stdin_with_stderr("del(.a[1:3])", r#"{"a":[1,2,3,4,5],"b":6}"#, &["-c"])?;
+    let (out, code) = run_jq_stdin("del(.a[1:3])", r#"{"a":[1,2,3,4,5],"b":6}"#, &["-c"])?;
     assert_eq!(code, 0);
     assert_eq!(out.trim(), r#"{"a":[1,4,5],"b":6}"#);
     Ok(())
@@ -21188,8 +21185,7 @@ fn test_1162_delpaths_ordinary_paths_unaffected() -> Result<()> {
 /// new rejection is yq-mode-only.
 #[test]
 fn test_1162_delpaths_slice_descriptor_jq_mode_unaffected() -> Result<()> {
-    let (out, _stderr, code) =
-        run_jq_stdin_with_stderr(r#"delpaths([[{"start":1,"end":3}]])"#, "[1,2,3,4]", &["-c"])?;
+    let (out, code) = run_jq_stdin(r#"delpaths([[{"start":1,"end":3}]])"#, "[1,2,3,4]", &["-c"])?;
     assert_eq!(code, 0);
     assert_eq!(out.trim(), "[1,4]");
     Ok(())
@@ -21515,8 +21511,7 @@ fn test_1219_iterate_chained_slice_then_index_is_noop_per_element() -> Result<()
 /// `delete_at_path` walk.
 #[test]
 fn test_1219_jq_mode_unaffected() -> Result<()> {
-    let (out, _stderr, code) =
-        run_jq_stdin_with_stderr("del(.a[1:3][0])", r#"{"a":[1,2,3,4]}"#, &["-c"])?;
+    let (out, code) = run_jq_stdin("del(.a[1:3][0])", r#"{"a":[1,2,3,4]}"#, &["-c"])?;
     assert_eq!(code, 0);
     assert_eq!(out.trim(), r#"{"a":[1,3,4]}"#);
     Ok(())
@@ -22587,8 +22582,7 @@ fn test_slice_assign_computed_bound_unaffected_targets_1117() -> Result<()> {
 /// still errors there, matching real jq exactly.
 #[test]
 fn test_slice_assign_scalar_computed_bound_jq_mode_unaffected_1117() -> Result<()> {
-    let (_out, _stderr, code) =
-        run_jq_stdin_with_stderr("0 as $a | 1 as $b | .[$a:$b] = 99", "5", &["-c"])?;
+    let (_out, code) = run_jq_stdin("0 as $a | 1 as $b | .[$a:$b] = 99", "5", &["-c"])?;
     assert_ne!(code, 0);
     Ok(())
 }
@@ -23193,8 +23187,7 @@ fn test_jq_urid_invalid_utf8_after_percent_decode_is_lossy_1146() -> Result<()> 
 /// unaffected (WHATWG and jq's rule already agreed on that shape).
 #[test]
 fn test_jq_urid_overlong_percent_decode_collapses_to_one_fffd_1719() -> Result<()> {
-    let (out, _stderr, code) =
-        run_jq_stdin_with_stderr("@urid | explode", "\"%E0%80%80\"", &["-c"])?;
+    let (out, code) = run_jq_stdin("@urid | explode", "\"%E0%80%80\"", &["-c"])?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "[65533]");
     Ok(())
@@ -24512,8 +24505,7 @@ fn test_yq_scan_extension_keeps_jq_style_zero_width_1255() -> Result<()> {
 /// therefore the fix, not a substitution of convenience.
 #[test]
 fn test_jq_split_regex_keeps_zero_width_1255() -> Result<()> {
-    let (output, _stderr, code) =
-        run_jq_stdin_with_stderr(r#"split("a*"; "g")"#, "\"bab\"\n", &["-c"])?;
+    let (output, code) = run_jq_stdin(r#"split("a*"; "g")"#, "\"bab\"\n", &["-c"])?;
     assert_eq!(code, 0, "output: {output:?}");
     let v: serde_json::Value = serde_json::from_str(&output)?;
     assert_eq!(v, serde_json::json!(["", "b", "", "b", ""]));
@@ -24627,8 +24619,7 @@ fn test_yq_split_regex_arity_three_plus_accepted_1439() -> Result<()> {
 /// jq-modeled regex-split behavior unchanged -- this fix is yq-mode only.
 #[test]
 fn test_jq_split_regex_unaffected_by_1439() -> Result<()> {
-    let (out, _stderr, code) =
-        run_jq_stdin_with_stderr(r#"split("[0-9]";"g")"#, "\"a1b2c\"", &["-c"])?;
+    let (out, code) = run_jq_stdin(r#"split("[0-9]";"g")"#, "\"a1b2c\"", &["-c"])?;
     assert_eq!(code, 0, "out={out}");
     let v: serde_json::Value = serde_json::from_str(&out)?;
     assert_eq!(v, serde_json::json!(["a", "b", "c"]));
@@ -24655,8 +24646,7 @@ fn test_yq_splits_extension_keeps_jq_style_zero_width_1255() -> Result<()> {
 /// completely untouched by this yq-only fix.
 #[test]
 fn test_jq_gsub_zero_width_unaffected_by_1255() -> Result<()> {
-    let (stdout, _stderr, code) =
-        run_jq_stdin_with_stderr(r#""bab" | gsub("a*";"X")"#, "null", &["-c"])?;
+    let (stdout, code) = run_jq_stdin(r#""bab" | gsub("a*";"X")"#, "null", &["-c"])?;
     assert_eq!(code, 0, "stdout: {stdout:?}");
     assert_eq!(stdout.trim(), r#""XbXXbX""#);
     Ok(())
@@ -28012,7 +28002,7 @@ fn test_path_context_cursor_walk_shapes_2061() -> Result<()> {
         assert_eq!(code, 0, "yq `{filter}` on `{input}`: {out:?}");
         assert_eq!(out.trim(), want, "yq `{filter}` on `{input}`");
 
-        let (out, _, code) = run_jq_stdin_with_stderr(filter, input, &["-c"])?;
+        let (out, code) = run_jq_stdin(filter, input, &["-c"])?;
         assert_eq!(code, 0, "jq `{filter}` on `{input}`: {out:?}");
         assert_eq!(out.trim(), want, "jq `{filter}` on `{input}`");
     }
@@ -28137,7 +28127,7 @@ fn test_path_context_cursor_walk_keeps_the_validity_gate_2061() -> Result<()> {
         r#"{"a":"\u12","d":{"e":5}}"#,
     ] {
         for filter in [".d.e | key", ".d.e | path", ".d.e | parent"] {
-            let (out, _, code) = run_jq_stdin_with_stderr(filter, input, &["-c"])?;
+            let (out, code) = run_jq_stdin(filter, input, &["-c"])?;
             assert_ne!(code, 0, "`{filter}` on `{input}` must still raise: {out:?}");
             assert_eq!(out, "", "`{filter}` on `{input}`");
         }
@@ -28145,8 +28135,7 @@ fn test_path_context_cursor_walk_keeps_the_validity_gate_2061() -> Result<()> {
 
     // A well-formed document with the same shape answers normally, so the
     // gate is not simply rejecting everything.
-    let (out, _, code) =
-        run_jq_stdin_with_stderr(".d.e | key", r#"{"a":"ok","d":{"e":5}}"#, &["-c"])?;
+    let (out, code) = run_jq_stdin(".d.e | key", r#"{"a":"ok","d":{"e":5}}"#, &["-c"])?;
     assert_eq!(code, 0);
     assert_eq!(out.trim(), r#""e""#);
 
