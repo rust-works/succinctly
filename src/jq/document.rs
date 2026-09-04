@@ -3386,7 +3386,7 @@ mod tail_gap_receiver_tests {
     /// other.
     #[test]
     fn empty_container_arm_is_not_delegated_1803() {
-        let json: &[u8] = br#"{,}"#;
+        let json: &[u8] = br"{,}";
         let index = JsonIndex::build(json);
         let container = index.root(json);
 
@@ -3421,7 +3421,7 @@ mod tail_gap_receiver_tests {
         // `None` passed for a field it actually has. That combination would
         // (correctly) raise: `container_gap_ok` would find `"a"` in the gap
         // after the brace, which is what it is for.
-        let empty: &[u8] = br#"{}"#;
+        let empty: &[u8] = br"{}";
         let empty_index = JsonIndex::build(empty);
         let empty_root = empty_index.root(empty);
         container_tail_gap_ok(&empty_root, None, b'}').expect("an empty `{}` is well-formed");
