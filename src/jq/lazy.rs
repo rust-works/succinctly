@@ -28,8 +28,8 @@ use std::borrow::Cow;
 use crate::json::light::{JsonCursor, StandardJson};
 
 use super::document::{
-    effective_len, effective_len_checked, key_display_string, DisplayKeyGuard, DistinctKeyCursors,
-    DocumentCursor, DocumentFields,
+    container_tail_gap_ok, effective_len, effective_len_checked, key_display_string,
+    DisplayKeyGuard, DistinctKeyCursors, DocumentCursor, DocumentFields,
 };
 use super::error::EvalError;
 use super::escape::write_json_body_jq;
@@ -849,6 +849,10 @@ fn cursor_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
             // Use cursor navigation to iterate children
             let mut items = Vec::new();
             let mut is_first = true;
+            // #2358: the last real element's own cursor, retained past the
+            // loop so the trailing-gap check below (`[1,]`) has something
+            // to check from -- mirrors the `Object` arm's own `last_field`.
+            let mut last_elem: Option<JsonCursor<'_, W>> = None;
             for child in cursor.children() {
                 // #2211 code review: this walk (unlike its
                 // `eval_generic::to_owned_cursor_at_depth` sibling it
@@ -863,22 +867,17 @@ fn cursor_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
                     return Err(child.malformed_delimiter_error());
                 }
                 items.push(cursor_to_owned_at_depth(&child, depth + 1)?);
+                last_elem = Some(child);
                 is_first = false;
             }
-            // #2211: a stray `,` with no real element at all (`[,]`) left
-            // the loop above with nothing to check a delimiter against --
-            // `items.is_empty()` after the walk is exactly that case (a
-            // genuine `[]` also reaches here, and `container_gap_ok`
-            // answers `true` for it).
-            // STYLE-0013: deliberately *not* `container_tail_gap_ok` -- that
-            // helper also runs #2243's trailing-gap check (`[1,]`), which
-            // this walk has never had. Adding it here would be a behaviour
-            // change; this walk's missing check is tracked as #2358 (#2349
-            // itself is closed and never touched this file -- its fix was
-            // to `eval_generic.rs`'s validate-only walk, not this one).
-            if items.is_empty() && !cursor.container_gap_ok(b']') {
-                return Err(cursor.malformed_delimiter_error());
-            }
+            // #2211/#2243, via the shared `container_tail_gap_ok`. #2358
+            // closes the STYLE-0013 exemption this walk used to carry: a
+            // stray `,` with no real element at all (`[,]`) was already
+            // checked, directly against `container_gap_ok`, but a stray `,`
+            // *after* a real last element (`[1,]`) was not -- unlike every
+            // other materializer sharing this same helper. Adopting it here
+            // is the behaviour change that comment used to defer.
+            container_tail_gap_ok(cursor, last_elem.as_ref(), b']')?;
             OwnedValue::Array(items)
         }
         StandardJson::Object(fields) => {
@@ -890,6 +889,9 @@ fn cursor_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
             // `eval_generic::to_owned_at_depth`'s identical shape.
             let mut f = fields;
             let mut is_first = true;
+            // #2358: same reasoning as the `Array` arm's own `last_elem`
+            // above.
+            let mut last_field: Option<JsonCursor<'_, W>> = None;
             // #1803: `DocumentFields::uncons`, not the inherent
             // `JsonFields::uncons` -- the trait impl (`json::light`) builds
             // its `DocumentField` from exactly the four accessors this loop
@@ -907,22 +909,17 @@ fn cursor_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
                     key,
                     cursor_to_owned_at_depth(&field.value_cursor, depth + 1)?,
                 );
+                last_field = Some(field.value_cursor);
                 f = rest;
                 is_first = false;
             }
             if f.ends_unpaired() {
                 return Err(f.malformed_member_error());
             }
-            // #2211: same reasoning as the array arm's own check just
-            // above, for a stray `,` with no real field at all (`{,}`) --
-            // `key_delimiter_ok`/`value_delimiter_ok` above only ever run
-            // against a real field, so the walk producing zero fields at
-            // all leaves nothing to check.
-            // STYLE-0013: same exemption as the `Array` arm above --
-            // `{"a":1,}` (#2243) is unchecked here, tracked as #2358.
-            if map.is_empty() && !cursor.container_gap_ok(b'}') {
-                return Err(cursor.malformed_delimiter_error());
-            }
+            // #2211/#2243, via the shared `container_tail_gap_ok` -- #2358
+            // closes this walk's own STYLE-0013 exemption; see the `Array`
+            // arm's identical comment above.
+            container_tail_gap_ok(cursor, last_field.as_ref(), b'}')?;
             OwnedValue::Object(map)
         }
         // See `eval_generic::to_owned_at_depth`'s own `is_error` arm
@@ -1191,6 +1188,37 @@ mod tests {
             let err = val
                 .materialize()
                 .expect_err("a stray comma in an apparently-empty container is not JSON");
+            assert!(
+                err.message.contains("Invalid JSON text"),
+                "{json:?}: message: {}",
+                err.message
+            );
+
+            let val: JqValue<'_, Vec<u64>> = JqValue::from_cursor(index.root(json));
+            assert!(val.into_owned().is_err(), "{json:?}: into_owned must agree");
+        }
+    }
+
+    /// #2358: a stray `,` *after* a real last child (`[1,]`, `{"a":1,}`,
+    /// #2243) now raises here too -- this materializer always holds a real
+    /// cursor, at every depth including the true top level (unlike
+    /// `eval_generic::to_owned_at_depth`'s bare-value entry point), so
+    /// swapping its old `container_gap_ok`-only check for the shared
+    /// `container_tail_gap_ok` closes the gap the STYLE-0013 comment this
+    /// replaced used to defer to this issue, with no residual "top level
+    /// stays unchecked" caveat the way `eval_generic.rs`'s fix has to carry.
+    /// Confirmed live against `/usr/bin/jq` 1.7.1: both exit 5.
+    #[test]
+    fn materialize_raises_on_trailing_comma_after_last_child_2358() {
+        use crate::json::JsonIndex;
+
+        for json in [b"[1,]".as_slice(), br#"{"a":1,}"#.as_slice()] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let val = JqValue::from_cursor(cursor);
+            let err = val
+                .materialize()
+                .expect_err("a stray trailing comma after a real last child is not JSON");
             assert!(
                 err.message.contains("Invalid JSON text"),
                 "{json:?}: message: {}",

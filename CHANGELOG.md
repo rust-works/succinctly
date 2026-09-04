@@ -370,6 +370,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Two rows of #2349's own delimiter-consistency matrix stayed open after that fix
+  landed** (#2358). Both are the "bare `value: &V`, no container cursor available" shape
+  #2211/#2243 already documented as a permanent limitation on some materializers, but
+  turned out not to be permanent everywhere it was assumed:
+
+  - `eval_generic.rs`'s `to_owned_at_depth` (the library-facing, cursor-less `to_owned`
+    entry point) genuinely has no cursor at the true top level, but every *recursive* call
+    already resolves the child's own cursor for an unrelated reason (`field.value_cursor`,
+    `elem_cursor`) and simply discarded it. Threading that cursor through as a new
+    parameter lets `container_tail_gap_ok` close #2211's `{,}`/`[,]` check for every nested
+    container the same way `to_owned_cursor_at_depth` always could — only the true top
+    level keeps the documented, unavoidable gap.
+  - `lazy.rs`'s independent `cursor_to_owned_at_depth` (the JSON-cursor materializer) was
+    never in the "no cursor" situation at all — it always holds a real `JsonCursor`, at
+    every depth including the top. Its own STYLE-0013 comment named this issue directly as
+    the reason `container_tail_gap_ok` wasn't already used in place of a hand-inlined
+    `container_gap_ok`-only check. Swapping it in closes #2243's trailing-comma check
+    (`[1,]`, `{"a":1,}`) at every level, not just nested ones.
+
+  Neither fix is independently reachable through the shipped CLI's default JSON parsing
+  path — the semi-index build itself already rejects malformed delimiters before either
+  materializer runs on genuinely untrusted stdin text, the same reason #2349's own matrix
+  called these rows "non-live." Both are reachable through other entry points into these
+  functions (a direct library caller of `to_owned`, or a lenient/pre-validated document),
+  and are pinned directly rather than through the CLI:
+  `test_to_owned_raises_on_nested_stray_comma_in_empty_container_2358`/
+  `test_to_owned_raises_on_nested_trailing_comma_2358` (`eval_generic.rs`) and
+  `materialize_raises_on_trailing_comma_after_last_child_2358` (`lazy.rs`). Two further
+  rows in the same materializer family (`eval.rs`'s own `to_owned_at_depth`,
+  `yq_runner.rs`'s `to_owned_canonicalizing_numbers_at_depth`) likely have the identical
+  opportunity but are out of this issue's scope; tracked as #2403.
+
 - **The validate-only traversal backing `select`/`sort_by`/`unique_by`/`min_by`/`max_by`/
   `path()` silently accepted invalid JSON in a subtree it only ever validates, never
   materializes** (#2349, split out of #1803). `push_generic_truthiness_cursor_error`
