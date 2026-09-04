@@ -1226,6 +1226,16 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // substitutes `""` into the message and, worse, would still report
         // "cannot iterate" instead of the real reason, even under `?`, where
         // a decode failure must never be suppressed, #1247/#1620).
+        //
+        // #2346: real yq's `.[]` over *any* non-container (not just `null`)
+        // silently produces zero output, confirmed live against yq v4.53.3
+        // for number/string/bool/null, both bare and through `?`/del()/
+        // assignment. jq has no such rule (`.[]` on a scalar always raises
+        // there, confirmed against jq 1.7.1) -- so this widens the existing
+        // `optional`-suppression `scalar_fallback` already does for `.[]?`
+        // into an unconditional one in yq mode, rather than adding a new
+        // arm: a decode failure still raises either way (`scalar_fallback`
+        // checks that first, unconditionally).
         Expr::Iterate => match value {
             StandardJson::Array(elements) => {
                 let results: Vec<_> = elements.collect();
@@ -1242,7 +1252,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     .collect();
                 QueryResult::Many(results)
             }
-            _ => scalar_fallback(&value, optional, || {
+            _ => scalar_fallback(&value, optional || S::TAG == EvalTag::Yq, || {
                 EvalError::cannot_iterate_with(S::TAG, &to_owned_lossy(&value))
             }),
         },
@@ -23531,6 +23541,26 @@ fn resolve_iterate_bounded<S: EvalSemantics>(
                 )
             })
             .collect()),
+        // #2346 considered, deliberately NOT fixed here: real yq's `.[]`
+        // over a genuinely-resolved non-container is a silent no-op
+        // (confirmed live: `first(.a[])` on `{"a":5}` is `[]`, not an
+        // error, against yq v4.53.3), but this function is also reached by
+        // `resolve_del_path_branches`'s comma-fanout fallback (any sibling
+        // with a negative index declines the vivify pre-pass and falls
+        // through to this read-only path-computation machinery, which has
+        // no way to extend/vivify an array the way `delete_at_path`'s own
+        // `real_slot`-gated rule does) -- an out-of-range index read
+        // reaching this arm there is not a genuinely-resolved scalar, it's
+        // a placeholder for a write real yq's own vivify would perform, and
+        // this function has no way to tell the two apart (no `real_slot`
+        // equivalent, unlike `delete_at_path`/`delete_path_steps`).
+        // Silently returning zero branches for that shape regresses an
+        // honest "Cannot iterate" (a documented, tracked coverage gap) into
+        // a silently wrong answer instead -- confirmed live: `del(.[-1],
+        // .[4][])` on `[1,2]` reached this arm and produced `[1]`
+        // (`.[4][]`'s branch silently vanished) where real yq gives `[1,
+        // null, null, []]`. Left as a follow-up (only `first`, real yq
+        // surface, is currently affected) rather than folded into this fix.
         other => Err((
             Vec::new(),
             EvalError::cannot_iterate_with(S::TAG, other).into(),
@@ -33514,10 +33544,15 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     }
                 }
                 // #2212: `optional` is this arm's own ambient parameter, not
-                // `iterate_element_step`'s per-element `false` above --
-                // currently unreachable with `optional == true`, same
-                // evidence as `catch_error_under_optional`'s doc comment.
-                _ if optional => return QueryResult::None,
+                // `iterate_element_step`'s per-element `false` above -- the
+                // `optional` half is currently unreachable with `optional ==
+                // true`, same evidence as `catch_error_under_optional`'s doc
+                // comment; the `S::TAG == EvalTag::Yq` half is live, though
+                // (#2346: real yq's `.[]` over any non-container is a
+                // silent no-op, not just under `?` -- see the sibling fix
+                // on this file's other `Expr::Iterate` arm for the full
+                // live-oracle evidence).
+                _ if optional || S::TAG == EvalTag::Yq => return QueryResult::None,
                 _ => return QueryResult::Error(EvalError::cannot_iterate_with(S::TAG, value)),
             }
             match stopped {
@@ -38784,7 +38819,17 @@ fn delete_at_path(
                 // (#527), so this arm must stay yq-only rather than becoming
                 // unconditional the way `Index`'s is.
                 OwnedValue::Null if yq_mode => Ok(()),
-                _ if optional => Ok(()),
+                // #2346: real yq's `.[]` over any *other* non-container is
+                // also a silent no-op, `del()` included -- confirmed live,
+                // `del(.[])` on `5` stays `5` against yq v4.53.3. jq has no
+                // such rule (`del(.[])` on a scalar always raises there),
+                // so this stays yq-mode only, same as every other
+                // `is_yq_field_index_noop_scalar` site in this function.
+                // `is_yq_field_index_noop_scalar` itself excludes `Null`
+                // (the sibling arm above already covers it, with its own
+                // narrower `real_slot`-independent rationale), so the two
+                // arms never overlap.
+                _ if optional || (yq_mode && is_yq_field_index_noop_scalar(root)) => Ok(()),
                 _ => Err(EvalError::cannot_iterate_with(
                     if yq_mode { EvalTag::Yq } else { EvalTag::Jq },
                     root,
@@ -39304,7 +39349,14 @@ fn delete_path_steps(
                     // so this stays gated on `yq_mode` rather than becoming
                     // the unconditional `here`-only exemption below.
                     OwnedValue::Null if yq_mode => Ok(()),
-                    _ if here => Ok(()),
+                    // #2346: same yq-mode scalar no-op as `delete_at_path`'s
+                    // own terminal `Expr::Iterate` arm, for any *other*
+                    // non-container -- confirmed live, `del(.a[])` and
+                    // `del(.a[].b)` on `{"a":5}` both stay unchanged against
+                    // yq v4.53.3. `is_yq_field_index_noop_scalar` excludes
+                    // `Null` (the sibling arm above already covers it), so
+                    // the two arms never overlap.
+                    _ if here || (yq_mode && is_yq_field_index_noop_scalar(root)) => Ok(()),
                     _ => Err(EvalError::cannot_iterate_with(
                         if yq_mode { EvalTag::Yq } else { EvalTag::Jq },
                         root,
