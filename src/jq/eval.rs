@@ -32442,14 +32442,21 @@ fn eval_index_expr_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemanti
             // real jq's key-outer/target-inner model indexes each
             // already-produced value by `k` as it flows out, so `target`'s
             // own escaped generator's prefix is real jq output too here as
-            // well (confirmed live: `0 as $k | ([1,2],[3,4],error("x"))[$k]
-            // | key` prints `0` then `0` before raising -- the same values
-            // #2226 already established one level up for the plain-read
-            // sibling, just routed through path-context here). jq-only,
-            // matching #2226's own yq carve-out: real yq does not stream a
-            // target's own escaped generator's prefix at all (live-verified
-            // against yq v4.53.3, same query prints only the error, no
-            // prefix), so yq mode keeps the old conservative discard.
+            // well. Unlike #2226's own plain-read fix, this function is
+            // reached only via `key`/`parent`/`file_index` (or one nested
+            // inside a comma/pipe/etc. -- see `needs_path_context`), never
+            // `path()`/`del()`/assignment, which dispatch through the
+            // wholly separate `resolve_index_expr`/`resolve_dynamic_indexes`
+            // resolver instead (that resolver already threads a target's
+            // own escape-with-prefix correctly, via `resolve_node`'s own
+            // `Err((prefix, e))` arm) -- so there is no jq oracle for a
+            // query that exercises this exact arm (`key` is a succinctly
+            // extension). jq-only, matching #2226's own yq carve-out: real
+            // yq does not stream a target's own escaped generator's prefix
+            // at all (live-verified against yq v4.53.3, which does support
+            // `key`: `(.a,.b,error("x"))[(0+0)] | key` prints only the
+            // error, no `0`/`0` prefix), so yq mode keeps the old
+            // conservative discard.
             QueryResult::Partial(vs, control) => {
                 if S::TAG == EvalTag::Yq {
                     return partial(core::mem::take(&mut results), control);
@@ -32825,15 +32832,19 @@ fn eval_slice_expr_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemanti
                 // `vs` before its own mid-stream escape; real jq's
                 // pair-outer/target-inner model slices each already-produced
                 // value by `(s, e)` as it flows out, so `target`'s own
-                // escaped generator's prefix is real jq output too here
-                // (confirmed live: `1 as $s | 3 as $e | ([1,2,3,4],[5,6,7,8],
-                // error("x"))[$s:$e] | key` prints `0` then `0` before
-                // raising, same values `eval_slice_expr`'s own #2226-derived
-                // gate already established for the plain-read sibling). jq
-                // -only, matching that gate: real yq does not stream a
-                // target's own escaped generator's prefix at all
-                // (live-verified against yq v4.53.3), so yq mode keeps the
-                // old conservative discard.
+                // escaped generator's prefix is real jq output too here.
+                // Same routing caveat as the index arm above: reached only
+                // via `key`/`parent`/`file_index`, never `path()`/`del()`/
+                // assignment (those route through `resolve_index_expr`/
+                // `resolve_dynamic_indexes` instead), so no jq oracle for a
+                // query exercising this exact arm. jq-only, matching that
+                // gate: real yq does not stream a target's own escaped
+                // generator's prefix at all (live-verified against yq
+                // v4.53.3, via a computed bound in its own supported
+                // `N as $v | ...` spelling -- yq's grammar rejects bare
+                // arithmetic inside slice brackets: `0 as $s | 2 as $e |
+                // (.a,.b,error("x"))[$s:$e] | key` prints only the error,
+                // no prefix), so yq mode keeps the old conservative discard.
                 QueryResult::Partial(vs, control) => {
                     if S::TAG == EvalTag::Yq {
                         return partial(core::mem::take(&mut results), control);
