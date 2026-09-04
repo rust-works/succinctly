@@ -42,7 +42,7 @@ A new convention needs to be added to this style guide.
 
 ### Guidance
 
-Assign the next sequential ID (currently next is `STYLE-0012`) and include:
+Assign the next sequential ID (currently next is `STYLE-0013`) and include:
 
 1. A **Tags** line immediately after the heading — a comma-separated list of category labels
    from the tag vocabulary below.
@@ -470,3 +470,75 @@ The core crate is `no_std`. Preserve that:
 The guarantee is easy to break accidentally with a stray `std::` path, so keeping the `std` surface
 behind explicit feature gates — and testing the default-features-off build — makes the boundary
 enforceable rather than aspirational.
+
+---
+
+## STYLE-0012: `optional`-suppression routing in the jq evaluators
+
+**Tags:** `code-style`, `testing`
+
+### Situation
+
+Writing or editing a function in `src/jq/eval.rs` or `src/jq/eval_generic.rs` that takes a
+live `optional: bool` and materializes a borrowed document value — any call to the
+`to_owned*` family (`to_owned`, `to_owned_cursor`, `to_owned_with_cursor`,
+`to_owned_all`, `to_owned_key_shape`, …) or to `collect_cursors_checked`.
+
+### Guidance
+
+Every such call site must **either** route its error through the shared suppression
+machinery, **or** carry a `// STYLE-0012:` citation with a one-line specific reason —
+exactly the traceability STYLE-0004 requires of a lint suppression.
+
+Routing, in order of preference:
+
+```rust
+// eval.rs
+let owned = to_owned_or_suppress!(&value, optional);
+let items = to_owned_vec_or_suppress!(elements, optional);
+Err(e) => return suppress_or_raise(e, optional),
+
+// eval_generic.rs
+let owned = owned_or_suppress!(to_owned(&value), optional);
+Err(e) if suppresses(&e, optional) => GenericResult::None,
+```
+
+Never hand-copy the predicate. `optional && !e.is_decode_failure()` has one definition,
+`eval::suppresses`; it drifted out of sync twice already (#1902, #1934), and #2334 found
+four more hand-copies of it.
+
+Exempting, when the site genuinely must not consult `optional`:
+
+```rust
+// STYLE-0012: `map(f)` is `[.[] | f]` -- array construction, atomic in jq.
+QueryResult::One(v) => match to_owned(&v) { .. }
+```
+
+When the *whole parameter* is dead, prefer the stronger marker: name it `_optional`.
+The unused-variable lint then enforces the claim, and the audit skips the function
+entirely — this is how `builtin_recurse_f`/`builtin_recurse_cond` record their #1953
+exemption.
+
+`tests/jq_optional_suppression_audit.rs` enforces this and names the exact `file:line`
+of anything unrouted and unmarked.
+
+### Motivation
+
+This rule exists because the same bug shipped three times — #2231, #2280, #2327 — each
+round's review finding sites the previous sweep missed, several of them the direct sibling
+of a function that same PR had just fixed in the other evaluator.
+
+The reason it recurred is that **the invariant is invisible at runtime**. `suppresses` is
+`optional && !e.is_decode_failure()`, and every error the materialization family can raise
+is `decode_failure`-tagged today, so routing a site and leaving it bare produce identical
+output. No behavioural test can fail; a missed site costs nothing until an auditor happens
+to read that exact function. #2327's own pinning test asserts the same exit code with and
+without a trailing `?` — it records the non-difference and by construction cannot detect a
+regression.
+
+Centralising the *check* did not stop the *omission*, because nothing forced a call site
+through it. A static audit does, and a `// STYLE-0012:` marker turns each deliberate
+exemption from prose scattered across two 100k-line files into something greppable that
+the next sweep does not have to rediscover by eye. The runtime half of the guard is
+`EvalError::debug_assert_materialization_error`, which fails loudly on the day the
+"decode failures only" premise stops holding and the routing starts to matter.
