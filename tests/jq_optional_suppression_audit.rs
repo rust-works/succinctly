@@ -187,19 +187,28 @@ struct Site {
     body_start: usize,
 }
 
+/// One frame of the enclosing-function stack.
+struct Frame {
+    name: String,
+    /// Whether the signature binds an `optional: bool` the body can read.
+    live_optional: bool,
+    /// 1-based, inclusive line range of the function's body.
+    ///
+    /// Load-bearing, not bookkeeping: without it the routing window runs
+    /// straight off the end of the function and picks up a `suppresses(..)`
+    /// belonging to the *next* one, silently excusing a real gap. Caught by
+    /// this file's own negative test -- a freshly-added unrouted helper passed
+    /// the audit because `each_repeat_generic`, twenty lines below it, was
+    /// routed.
+    body_start: usize,
+    body_end: usize,
+}
+
 struct Audit<'a> {
     lines: Vec<&'a str>,
-    /// Innermost enclosing function: name, whether it binds a live
-    /// `optional: bool`, and the 1-based line range of its body. A stack, so a
-    /// nested `fn` without the parameter does not inherit its parent's.
-    ///
-    /// The line range is load-bearing, not bookkeeping: without it the
-    /// routing window below runs straight off the end of the function and
-    /// picks up a `suppresses(..)` belonging to the *next* one, silently
-    /// excusing a real gap. Caught by this file's own negative test -- a
-    /// freshly-added unrouted helper passed the audit because
-    /// `each_repeat_generic`, twenty lines below it, was routed.
-    stack: Vec<(String, bool, usize, usize)>,
+    /// Innermost enclosing function last. A stack, so a nested `fn` without
+    /// the parameter does not inherit its parent's.
+    stack: Vec<Frame>,
     live_optional_fns: usize,
     sites_examined: usize,
     /// Every raw site, resolved in a second pass -- see [`Audit::resolve`].
@@ -218,35 +227,20 @@ impl<'a> Audit<'a> {
     }
 
     fn in_live_optional_fn(&self) -> bool {
-        self.stack.last().is_some_and(|(_, live, _, _)| *live)
-    }
-
-    fn enclosing(&self) -> String {
-        self.stack
-            .last()
-            .map(|(name, _, _, _)| name.clone())
-            .unwrap_or_else(|| "<unknown>".to_string())
-    }
-
-    /// The enclosing function's own body lines, as a 1-based inclusive range.
-    fn body_range(&self) -> (usize, usize) {
-        self.stack
-            .last()
-            .map(|(_, _, start, end)| (*start, *end))
-            .unwrap_or((1, self.lines.len()))
+        self.stack.last().is_some_and(|f| f.live_optional)
     }
 
     fn push_fn(&mut self, sig: &syn::Signature, body: &syn::Block) {
-        let live = binds_live_optional(sig);
-        if live {
+        let live_optional = binds_live_optional(sig);
+        if live_optional {
             self.live_optional_fns += 1;
         }
-        self.stack.push((
-            sig.ident.to_string(),
-            live,
-            body.span().start().line,
-            body.span().end().line,
-        ));
+        self.stack.push(Frame {
+            name: sig.ident.to_string(),
+            live_optional,
+            body_start: body.span().start().line,
+            body_end: body.span().end().line,
+        });
     }
 
     /// Record a materialization site for [`Audit::resolve`] to judge.
@@ -256,18 +250,21 @@ impl<'a> Audit<'a> {
         }
         self.sites_examined += 1;
         let line = span.start().line; // 1-based
-        let (body_start, body_end) = self.body_range();
+        let frame = self
+            .stack
+            .last()
+            .expect("in_live_optional_fn implies a frame");
         self.candidates.push(Site {
             line,
-            func: self.enclosing(),
+            func: frame.name.clone(),
             snippet: self
                 .lines
                 .get(line.saturating_sub(1))
                 .unwrap_or(&"")
                 .trim()
                 .to_string(),
-            body_end,
-            body_start,
+            body_start: frame.body_start,
+            body_end: frame.body_end,
         });
     }
 

@@ -30136,6 +30136,128 @@ fn test_eval_rs_sites_produce_correct_output_2327() -> Result<()> {
     Ok(())
 }
 
+/// #2334: every site STYLE-0012's audit made this PR route still raises the
+/// two error classes it is meant to, through a bare call and through a
+/// trailing `?`.
+///
+/// **This test cannot detect the invariant regressing, and is not trying to.**
+/// Every error path below is `is_decode_failure()`-tagged (#2286), which
+/// `suppresses` never suppresses regardless of `optional`, so a site that
+/// stopped being routed would produce exactly these outputs too. That is the
+/// whole reason the real guard is static -- see
+/// `tests/jq_optional_suppression_audit.rs`, and the same limitation
+/// `test_optional_ignored_sites_2327` and
+/// `test_eval_rs_only_sites_still_correct_2280` already accepted for their own
+/// rounds. What this pins is that the routing edits did not change the
+/// raise-vs-succeed behaviour of any of these builtins.
+///
+/// Two error classes, because they reach different code: an undecodable
+/// string value (`"\ud800"`), which the `to_owned` walk raises on, and a
+/// trailing stray comma (`[1,2,3,]`, #2261), which is
+/// `collect_cursors_checked`'s own malformed-element gap. Several builtins
+/// only reach a routed line through the *second* -- `last`, `bsearch`,
+/// `shuffle` and `pivot` all answer a `"\ud800"` document at exit 0, because
+/// the lazy/index path answers before their own materialization runs, the
+/// same "the fixed line never runs for this document" shape #2327's own test
+/// comment documents for `builtin_del`. Each row below is placed in whichever
+/// table it was verified to actually reach.
+#[test]
+fn test_style_0012_routed_sites_still_raise_2334() -> Result<()> {
+    // Class 1: an undecodable string somewhere in the document.
+    for (filter, doc) in [
+        ("add", r#"["\ud800"]"#),
+        ("map_values(.)", r#"{"a":"\ud800"}"#),
+        ("map(.)", r#"["\ud800"]"#),
+        ("to_entries", r#"{"a":"\ud800"}"#),
+        ("from_entries", r#"[{"key":"a","value":"\ud800"}]"#),
+        ("with_entries(.)", r#"{"a":"\ud800"}"#),
+        ("flatten", r#"[["\ud800"]]"#),
+        ("indices(1)", r#"["\ud800"]"#),
+        ("index(1)", r#"["\ud800"]"#),
+        ("rindex(1)", r#"["\ud800"]"#),
+        ("sort", r#"["\ud800"]"#),
+        ("unique", r#"["\ud800"]"#),
+        ("min", r#"["\ud800"]"#),
+        ("max", r#"["\ud800"]"#),
+        (".[0:1]", r#"["\ud800"]"#),
+        ("[..]", r#"["\ud800"]"#),
+        (".a = 1", r#"{"a":"\ud800"}"#),
+        (r#""\(.a)""#, r#"{"a":"\ud800"}"#),
+        // `paths(f)`, not bare `paths`: the filtered form is what reaches
+        // `each_paths_filter`'s own materialization.
+        (r#"[paths(type == "string")]"#, r#"{"a":"\ud800"}"#),
+    ] {
+        for suffix in ["", "?"] {
+            let full = format!("{filter}{suffix}");
+            let (stdout, stderr, code) = run_jq_stdin_streams(&full, doc, &["-c"])?;
+            assert_eq!(code, 5, "{full}: stdout {stdout:?} stderr {stderr:?}");
+            assert_eq!(stdout, "", "{full}: stderr {stderr:?}");
+        }
+    }
+
+    // Class 2: `collect_cursors_checked`'s malformed-element gap -- a trailing
+    // stray comma after a real last element (#2261).
+    for filter in [
+        "to_entries",
+        "map_values(.)",
+        "[.[]]",
+        "add",
+        "last",
+        "flatten",
+        "sort",
+        "unique",
+        "min",
+        "max",
+        "shuffle",
+        "pivot",
+        "bsearch(1)",
+        "indices(1)",
+    ] {
+        for suffix in ["", "?"] {
+            let full = format!("{filter}{suffix}");
+            let (stdout, stderr, code) = run_jq_stdin_streams(&full, "[1,2,3,]", &["-c"])?;
+            assert_eq!(code, 5, "{full}: stdout {stdout:?} stderr {stderr:?}");
+            assert_eq!(stdout, "", "{full}: stderr {stderr:?}");
+        }
+    }
+
+    // Not a blanket rejection: the same builtins on a well-formed document
+    // still produce their ordinary output, so no routing edit turned one of
+    // them into an unconditional error.
+    for (filter, doc, expected) in [
+        ("add", "[1,2,3]", "6"),
+        ("map_values(.+1)", r#"{"a":1}"#, r#"{"a":2}"#),
+        ("map(.+1)", "[1,2]", "[2,3]"),
+        ("last", "[1,2,3]", "3"),
+        ("to_entries", r#"{"a":1}"#, r#"[{"key":"a","value":1}]"#),
+        ("from_entries", r#"[{"key":"a","value":1}]"#, r#"{"a":1}"#),
+        ("with_entries(.value += 1)", r#"{"a":1}"#, r#"{"a":2}"#),
+        ("flatten", "[[1],[2]]", "[1,2]"),
+        ("indices(2)", "[1,2,3]", "[1]"),
+        ("index(2)", "[1,2,3]", "1"),
+        ("rindex(2)", "[1,2,3]", "1"),
+        ("bsearch(2)", "[1,2,3]", "1"),
+        (r#""\(.a)""#, r#"{"a":1}"#, r#""1""#),
+        (r#"[paths(type == "number")]"#, r#"{"a":1}"#, r#"[["a"]]"#),
+        ("[..]", "[1]", "[[1],1]"),
+        (".a = 2", r#"{"a":1}"#, r#"{"a":2}"#),
+        ("sort", "[2,1]", "[1,2]"),
+        ("unique", "[2,1,1]", "[1,2]"),
+        ("min", "[2,1]", "1"),
+        ("max", "[2,1]", "2"),
+        (".[0:1]", "[1,2]", "[1]"),
+        ("[.[]]", "[1,2]", "[1,2]"),
+        ("pivot", "[[1,2],[3,4]]", "[[1,3],[2,4]]"),
+        ("shuffle | length", "[1,2,3]", "3"),
+    ] {
+        let (stdout, code) = run_jq_stdin(filter, doc, &["-c"])?;
+        assert_eq!(code, 0, "{filter}: doc {doc}");
+        assert_eq!(stdout.trim(), expected, "{filter}: doc {doc}");
+    }
+
+    Ok(())
+}
+
 /// #2053, constraint 2 from the issue that split this fix off from #1909:
 /// `path_expr` must be evaluated exactly once, on *both* branches
 /// `eval_generic.rs`'s new native `Builtin::GetPath` arm can take -- the
