@@ -323,6 +323,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (confirmed live: `del(.a[0:2].x, .c)` on `{"a":[1,2,3],"c":9}` leaves `.c` undeleted
   too).
 
+  Code review (round 2) found two real bugs in the first draft, both fixed: (1) the
+  slice-run boundary was computed as the *last* slice's own position rather than the
+  *start* of the maximal contiguous run ending there, so a chained *multi*-slice run
+  before the field tail (`del(.a[0:2][1:3].x)`) left an earlier slice unguarded and
+  silently misclassified back to `Noop` — fixed by walking backward to the run's actual
+  start and applying every slice in it sequentially, matching `yq_del_slice_outcome`'s own
+  established "a run of any length collapses to one target" rule; (2) a `?` on the
+  erroring field step itself (`del(.a[0:2].x?)`, distinct from `del(...)`'s own outer `?`)
+  was never consulted, regressing a case that was already a correct no-op on `main` before
+  this PR (caught by an A/B diff against `main`'s own pre-fix binary, not just the new
+  code in isolation) — fixed by checking `DeleteStep.optional` before raising. The null-
+  handling special case was also refactored away during this round: rather than two
+  hand-rolled checks (one for `null`, one for `Array`), a `Null` pre-slice value is now
+  modeled as an empty `Array` and walked through the exact same suffix logic, since an
+  empty array's own semantics (a `Field` step still hits the "current is an `Array`" arm;
+  an `Index` step always resolves out-of-bounds and gives up) already reproduce the
+  established no-op-past-the-direct-target behavior without a second copy of the walk —
+  closing the "duplicated predicates diverge silently" gap the multi-slice-run bug above
+  was itself an instance of.
+
+  A third, pre-existing (not introduced by this fix, confirmed via an A/B diff against
+  `main`) gap was found and filed separately as #2344 rather than expanding this PR's
+  scope further: a literal `.[]` (`Iterate`) earlier in the path, before the chained
+  slice-run (`del(.a[][0:2].x)`), still silently no-ops — the whole-path classification
+  this fix lives in has no way to defer to `delete_at_path`'s own per-element `Iterate`
+  handling once it's already committed to answering `Noop`/`Error` for the "no slice at
+  the very end" shape.
+
 - **17 more sites ignored `optional`, continuing the #2231/#2280 lineage** (#2327,
   follow-up from #2280's own code review): `eval.rs`'s `builtin_del` (its own doc comment
   already promised "any resulting error is caught right here, turning the whole call's

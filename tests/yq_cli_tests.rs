@@ -21914,6 +21914,122 @@ fn test_2333_del_slice_comma_grouped_array_field_tail_fails_whole_call() -> Resu
     Ok(())
 }
 
+/// #2333 code review (round 2): the fix's first draft found the *last*
+/// slice's own position, not the *start* of the maximal contiguous slice-run
+/// ending there -- for a run of exactly one slice the two coincide, so every
+/// other test in this file passed, but a chained *two*-slice run before a
+/// trailing `Field` (`.a[0:2][1:3].x`) left the earlier slice unguarded in
+/// the computed prefix, and the prefix-navigation helper has no
+/// `Expr::Slice` arm at all (by design -- its only other caller already
+/// filters those out), so it silently gave up and misclassified the whole
+/// shape back to the pre-#2333 `Noop` bug. Matches
+/// `yq_del_slice_outcome`'s own established "a run of any length collapses
+/// to the same target as one slice" rule (see its own #1219 doc comment) --
+/// this is that same rule, verified for the `Error` half of the
+/// classification, not just the `DropParent`/`Noop` halves #1219 already
+/// covers. Live-verified against yq v4.53.3.
+#[test]
+fn test_2333_del_double_slice_run_then_field_errors() -> Result<()> {
+    let (_out, stderr, code) = run_yq_stdin_with_stderr(
+        "del(.a[0:2][1:3].x)",
+        r#"{"a":[1,2,3,4,5]}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 1, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("array") && stderr.contains('x'),
+        "{stderr:?}"
+    );
+
+    // A second independent two-slice shape, different bounds -- both
+    // review rounds each found this bug via a different concrete repro;
+    // keeping both closes the gap either one's own narrower fix would have
+    // left open.
+    let (_out, stderr, code) = run_yq_stdin_with_stderr(
+        "del(.a[0:4][0:2].x)",
+        r#"{"a":[1,2,3,4,5]}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 1, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("array") && stderr.contains('x'),
+        "{stderr:?}"
+    );
+    Ok(())
+}
+
+/// #2333 code review (round 2): the same two-slice-run generalization as
+/// the previous test, but for `null`'s own direct-target quirk -- the whole
+/// run still collapses to `null`'s single array-shaped target, so the error
+/// fires exactly as it does for a single slice.
+#[test]
+fn test_2333_del_double_slice_run_null_direct_target_errors() -> Result<()> {
+    let (_out, stderr, code) =
+        run_yq_stdin_with_stderr("del(.[0:2][1:3].a)", "null", &["-o=json"])?;
+    assert_eq!(code, 1, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("array") && stderr.contains('a'),
+        "{stderr:?}"
+    );
+    Ok(())
+}
+
+/// #2333 code review (round 2): `null`'s "only the *direct* slice target"
+/// rule (see `test_2333_del_slice_null_only_errors_for_direct_field_tail`)
+/// still holds once the slice itself is a two-slice run and an `Index` step
+/// sits between the run and the trailing field -- confirms the multi-slice
+/// fix didn't accidentally widen `null`'s own narrower error condition too.
+#[test]
+fn test_2333_del_double_slice_run_null_through_index_stays_noop() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(.[0:2][1:3][0].a)", "null", &["-o=json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "null");
+    Ok(())
+}
+
+/// #2333 code review (round 2): the multi-slice-run generalization also
+/// holds through a deeper `Index` navigation into a real array (unlike the
+/// `null` case above) -- `.a[0:3][0:2][0].x` collapses its two-slice run,
+/// indexes into the result, and still raises when that element is itself an
+/// array, matching the single-slice
+/// `test_2333_del_slice_index_then_field_errors_when_element_is_array`
+/// sibling exactly.
+#[test]
+fn test_2333_del_double_slice_run_then_index_then_field_errors_on_array_element() -> Result<()> {
+    let (_out, stderr, code) = run_yq_stdin_with_stderr(
+        "del(.a[0:3][0:2][0].x)",
+        r#"{"a":[[1,2],[3,4],[5,6]]}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 1, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("array") && stderr.contains('x'),
+        "{stderr:?}"
+    );
+    Ok(())
+}
+
+/// #2333 code review (round 2): a `?` on the erroring field step itself
+/// (`del(.a[0:2].x?)`) suppresses the new error, same as `?` suppresses any
+/// other ordinary path-step error — distinct from `del(...)`'s own outer
+/// `?` (`del(...)?`), which the pre-existing `test_1219_*` tests already
+/// cover via `optional: bool`. Caught by an A/B diff against `main`'s own
+/// pre-#2333 binary: `del(.a[0:2].x?)` was already a correct no-op there
+/// (real yq agrees), and this fix's first draft regressed it into an
+/// unconditional raise by never reading `DeleteStep.optional` for the
+/// erroring step.
+#[test]
+fn test_2333_del_slice_field_tail_optional_suppresses_error() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(.a[0:2].x?)", r#"{"a":[1,2,3]}"#, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":[1,2,3]}"#);
+
+    let (out, code) = run_yq_stdin("del(.[0:2].a?)", "null", &["-o=json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "null");
+    Ok(())
+}
+
 /// #2333: jq mode has no #1116/#1162/#1219 chained-slice rule at all (see
 /// `test_1219_jq_mode_unaffected`'s own sibling note), so it never had the
 /// #1219 no-op bug in the first place -- real jq 1.7.1 already raises
