@@ -36169,10 +36169,12 @@ fn test_m2_lazyseq_halt_prints_nothing_1576() -> Result<()> {
 // them is a zero-iteration loop by construction.
 //
 // The fix (`eval_range_values`, `src/jq/eval.rs`) replaces the plain `+=`
-// with `i.checked_add(step)`, bailing out (`None`) the instant an addition
-// would leave `i64`'s range; `each_range`'s `emit` closure then falls back to
-// the pre-existing, `MAX_RANGE`-capped `eval_range_values_f64`, matching jq's
-// own `f64`-based model, for that one `(from, to, step)` combination.
+// with `i.checked_add(step)`. #2131 round 3 and #2219 (see that function's
+// own doc comment) established that an overflowing candidate can never
+// satisfy the range's own `< to`/`> to` condition either way, so it now ends
+// the loop and keeps whatever was already pushed, rather than bailing to
+// the pre-existing, `MAX_RANGE`-capped `eval_range_values_f64` -- for
+// `Int`/`Int`/`Int` operands, that fallback is no longer reachable at all.
 //
 // An earlier version of this fix gated the `i64` path behind a blanket
 // `±2^53` magnitude cutoff (the threshold where every integer round-trips
@@ -36182,21 +36184,31 @@ fn test_m2_lazyseq_halt_prints_nothing_1576() -> Result<()> {
 // silently degraded ordinary large-but-safe integers (nanosecond-epoch
 // timestamps, large database IDs) to `f64`, where at that magnitude they can
 // round to the same double and the whole range collapses to empty. The
-// `checked_add`-based fix below only ever falls back when an overflow is
-// genuinely about to happen, so it keeps the exact `i64` answer for every
-// range that doesn't actually risk one, however large its magnitude.
+// `checked_add`-based fix below keeps the exact `i64` answer for every
+// range, however large its magnitude, and however close to `i64::MIN`/`MAX`
+// it runs -- overflow now means "the range ends here," never "discard
+// everything and start over in `f64`."
 
-/// The issue's own repro: two `i64` literals only 50 apart at `~2^63`
-/// magnitude round to the *same* `f64` once parsed, so real jq's
-/// `while(. > $upto; . + $by)` never even emits its own starting value --
-/// confirmed live against the pinned jq 1.7.1 oracle (empty output, exit 0).
-/// Before this fix, succinctly's unconditional `i64` fast path instead wrapped
-/// `from + step` past `i64::MIN` via two's-complement and streamed garbage.
-/// `from` is only 50 above `i64::MIN` and `step` subtracts 100 more, so the
-/// revised fix's `checked_add` overflows on the very first application,
-/// falling back to `f64` before a single value is ever produced.
+/// The issue's own repro: `from` is only 50 above `i64::MIN` and `step`
+/// subtracts 100 more, so `checked_add` overflows on the very first
+/// application. Before #2131's revised fix, succinctly's unconditional
+/// `i64` fast path instead wrapped `from + step` past `i64::MIN` via
+/// two's-complement and streamed garbage.
+///
+/// #2219 retargeted this test's expectation: two `i64` literals only 50
+/// apart at `~2^63` magnitude round to the *same* `f64` once real jq parses
+/// them (its own unary minus collapses a literal this large to a `double`
+/// before `range` ever sees it -- an unrelated, already-documented
+/// divergence, `docs/compliance/jq/limitations.md`'s #2131 section), so
+/// real jq's `while(. > $upto; . + $by)` never even emits its own starting
+/// value -- confirmed live against the pinned jq 1.7.1 oracle (empty
+/// output, exit 0). succinctly no longer matches that by coincidence: since
+/// #2219, an overflowing `checked_add` ends the loop and keeps whatever was
+/// already pushed (here, the exact `from` value) instead of discarding it
+/// for an `f64` recomputation, so succinctly's own answer is the one exact
+/// value real jq's literal-collapse quirk prevents it from ever seeing.
 #[test]
-fn test_range_i64_overflow_original_repro_matches_jq_2131() -> Result<()> {
+fn test_range_i64_overflow_keeps_exact_prefix_diverging_from_jq_2219() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
         &[
             "-nc",
@@ -36205,7 +36217,10 @@ fn test_range_i64_overflow_original_repro_matches_jq_2131() -> Result<()> {
         None,
     )?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "", "expected no output, matching real jq");
+    assert_eq!(
+        stdout, "-9223372036854775758\n",
+        "expected the exact from value, kept rather than discarded (#2219)"
+    );
     Ok(())
 }
 

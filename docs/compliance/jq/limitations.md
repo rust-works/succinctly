@@ -3616,7 +3616,7 @@ own repro table didn't happen to list, not new ones introduced by this fix.
   [#2131](https://github.com/rust-works/succinctly/issues/2131). **Fixed**:
   see the next section.
 
-### `range`'s `i64` fast path at extreme magnitude (#2131): overflow-checked in place, extending the same #2089 hang-avoidance divergence
+### `range`'s `i64` fast path at extreme magnitude (#2131, #2219): overflow-checked in place, extending the same #2089 hang-avoidance divergence
 
 The gap the previous section left open: `eval_range_values` (the exact-`i64`
 fast path taken when `from`/`to`/`step` are all integers) computed
@@ -3700,17 +3700,59 @@ not the real property); it was corrected the same way, and the sweep's own
 (`92234642714974`) so this class of bug is caught automatically rather
 than by inspection alone.
 
-This keeps the original repro fixed:
+**#2219 refinement: the same proof extends to the loop's own per-iteration
+advance, not just the cap-boundary lookahead.** Round 3 above fixed one call
+to `i.checked_add(step)` (the cap-boundary lookahead) but left the other
+(the ordinary advance that keeps a non-cap-terminated loop going) gated by
+`?`, discarding every already-pushed value on overflow there too:
+`range(9223372036854775802; 9223372036854775804; 20)` returned `[]` instead
+of the exact `[9223372036854775802]` its own first (and only) value already
+computed correctly. #2219 recognized this is the identical soundness
+argument, not a new one: `to` is always a valid `i64`, so an overflowing
+candidate can never satisfy `< to`/`> to` regardless of *which* call site
+computed it — cap-terminated or not. Both call sites now end the loop and
+keep whatever has already been pushed. A `range` between two valid `i64`
+endpoints always pushes at least one value (`from` itself) before any
+possible overflow, so **the `None => eval_range_values_f64(...)` fallback in
+`each_range`'s `emit` closure is now unreachable for `Int`/`Int`/`Int`
+operands entirely** — `eval_range_values` always returns `Some`. The
+function's `Option` return type is unchanged (kept for API stability, not
+because `None` can still occur) — see its own doc comment, and
+`test_range_dispatch_keeps_exact_int_prefix_through_overflow_2219`, which
+pins this for both the original repro and a fresh near-`i64::MAX` case.
+
+This changes what the original repro now produces:
 
 ```console
 $ echo null | succinctly jq 'range(-9223372036854775758; -9223372036854775808; -100)'
-$                                                                                     # empty, exit 0 -- matches jq 1.7.1
+-9223372036854775758
 ```
 
 (`from` is only 50 above `i64::MIN` and `step` subtracts 100 more, so
-`checked_add` overflows on the very first application — the fallback engages
-before a single extra value is ever produced.) But it recovers the
-nanosecond-scale case the `±2^53` gate used to silently break:
+`checked_add` overflows on the very first application -- but `from` itself
+was already pushed before that overflow ends the loop, so it's kept.) Real
+jq 1.7.1 still answers empty here, but only because its own unary minus
+collapses a literal this large to a `double` before `range` ever sees it
+(confirmed live: `jq -nc '-9223372036854775758'` prints
+`-9223372036854776000`, already rounded) -- an unrelated, pre-existing
+divergence (see the "Widened divergence" discussion below), not something
+#2219 changed. The pre-#2219 empty answer matched jq's only by coincidence
+of that unrelated quirk; feeding the same magnitudes in as *data* instead of
+literals (`echo '[-9223372036854775758,-9223372036854775808,-100]' | jq -c
+'[range(.[0];.[1];.[2])]'`) already showed jq answering
+`[-9223372036854775758]` even before this fix -- the single value #2219 now
+also gives from the literal spelling.
+
+`eval_range_values_i64(i64::MAX - 10, i64::MAX, 1000)` and its mirror at
+`i64::MIN` (overflow on the very first add, one value already pushed) and
+`eval_range_values_i64(0, i64::MAX, big_step)` (overflow on the *second*
+add, two values already pushed) are pinned the same way in
+`test_eval_range_values_overflow_detection_2131`, which #2219 retargeted
+from asserting `None` to asserting the exact kept prefix at each of these
+three magnitude combinations.
+
+But the fix below still recovers the nanosecond-scale case the `±2^53` gate
+used to silently break:
 
 ```console
 $ echo null | succinctly jq -c '[range(1700000000000000000; 1700000000000000010; 1)]'
@@ -3827,8 +3869,10 @@ both about *jq's* arithmetic or a separate, pre-existing part of
 succinctly's own dispatch rather than the exact-`i64`-path divergence just
 described:
 
-- **Both sides use `f64`** (a plain float literal, or an `i64` range where
-  `checked_add` genuinely detects overflow and falls back): reproducible via
+- **Both sides use `f64`** (any `from`/`to`/`step` combination where at
+  least one operand isn't a plain integer, e.g. a float literal — since
+  #2219, an `i64` range can no longer reach `eval_range_values_f64` via
+  overflow, only via this non-integer dispatch arm): reproducible via
   `range(72057594037927936.0; 72057594037927944.0; 1)` — jq 1.7.1 gives one
   value, `[72057594037927936.0]`, where succinctly's own (unchanged)
   `eval_range_values_f64` gives `[]`. This is `eval_range_values_f64`'s own
