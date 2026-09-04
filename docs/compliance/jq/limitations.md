@@ -1794,15 +1794,29 @@ and differently-shaped problem than this section's own fixes):
   entry above for the fix and its residual gap.
 
 Two further leads from the same sweep were investigated and **not**
-reproduced live (so not reported as confirmed bugs, only as ruled out):
-`push_generic_truthiness_cursor_error` (`if COND then ... end` on a
-container condition) and `owned_from_standard_json_at_depth` (the
+reproduced live (so not reported as confirmed bugs, only as ruled out) at
+the time: `push_generic_truthiness_cursor_error` (`if COND then ... end`
+on a container condition) and `owned_from_standard_json_at_depth` (the
 `input`/`inputs`-with-cursor-metadata-builtins bridge, #1504) both lack
 their own internal gap checks by inspection, but every constructed repro
 against each (`{"a":[1,2,3,]} | if .a then ... end`;
 `[1,2,3,] | [inputs, line]` with `-n`) already raised correctly, meaning
 something upstream of either function already validates for the shapes
-tried. Not chased further given no live reproduction.
+tried. Not chased further given no live reproduction *of those specific
+repros* — **update (#2349): a live, CLI-reachable gap in
+`push_generic_truthiness_cursor_error` was found and fixed after all**,
+just not via `if...then...end` (whose own `Control::from(cond)` path
+apparently validates upstream, matching what this entry found). `select`,
+`sort_by`/`unique_by`/`min_by`/`max_by`, and `path()` all route through
+this same function without that upstream validation, and a trailing-comma/
+missing-colon/stray-comma corruption in a subtree the query only ever
+validates (never emits) silently passed — `{"c":{"a":1,},"t":5} |
+select(.c) | .t` answered `5` instead of raising, confirmed live. See
+this doc's "The validate-only traversal..." entry in `CHANGELOG.md` for
+the fix; the underlying lesson stands even though this specific
+conclusion didn't: a function lacking its own checks by inspection can
+still be live-exploitable through a caller this investigation's own
+repro set didn't try.
 
 ## `has(key)`/`contains()` and `find()` get two more pre-existing gaps closed (#2288)
 

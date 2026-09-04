@@ -36474,3 +36474,99 @@ fn test_seq_wellformed_and_leniency_unaffected_by_checked_swap_2295() -> Result<
     assert_eq!(stdout.trim(), "\x1e7");
     Ok(())
 }
+
+/// #2349: `push_generic_truthiness_cursor_error` -- the shared validation
+/// gate for `select`/`sort_by`/`unique_by`/`min_by`/`max_by`/`path()` -- had
+/// none of the `#1677`/`#2211`/`#2243` delimiter/gap checks its materializing
+/// siblings (`to_owned_cursor_at_depth` and friends) already run, so a
+/// document corrupted in a subtree the query only ever *validates* (never
+/// emits) passed silently instead of raising. Every row here is a document
+/// real jq rejects; before this fix, succinctly accepted all eight (exit 0)
+/// while the materializing control for the identical subtree already
+/// correctly raised. Repros and control verified live against `/usr/bin/jq`
+/// 1.7.1 in the issue's own filing.
+#[test]
+fn test_validate_only_gate_delimiter_checks_2349() -> Result<()> {
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "trailing comma in nested object, select+field",
+            r#"{"c":{"a":1,},"t":5}"#,
+            "select(.c) | .t",
+        ),
+        (
+            "trailing comma in nested array element, sort_by",
+            r#"[{"a":2,"b":[1,]},{"a":1}]"#,
+            "sort_by(.a) | length",
+        ),
+        (
+            "trailing comma in nested array element, unique_by",
+            r#"[{"a":2,"b":[1,]},{"a":1}]"#,
+            "unique_by(.a) | length",
+        ),
+        (
+            "trailing comma in nested array element, min_by",
+            r#"[{"a":2,"b":[1,]},{"a":1}]"#,
+            "min_by(.a) | .a",
+        ),
+        (
+            "trailing comma in nested object, path()",
+            r#"{"c":{"a":1,}}"#,
+            "path(.c)",
+        ),
+        (
+            "stray comma with no real field, object",
+            r#"{"c":{,},"t":5}"#,
+            "select(.c) | .t",
+        ),
+        (
+            "stray comma with no real element, array",
+            r#"{"c":[,],"t":5}"#,
+            "select(.c) | .t",
+        ),
+        (
+            "missing colon between key and value",
+            r#"{"c":{"a" 1},"t":5}"#,
+            "select(.c) | .t",
+        ),
+    ];
+
+    for (desc, doc, filter) in cases {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_ne!(
+            code, 0,
+            "{desc}: `{filter}` on `{doc}` should raise, matching real jq \
+             (got exit 0, stdout: {stdout:?})"
+        );
+        assert!(
+            stderr.contains("Invalid JSON"),
+            "{desc}: expected a JSON validity error, stderr: {stderr:?}"
+        );
+    }
+
+    // Well-formed control: the same shape, no corruption, must be unaffected.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "select(.c) | .t"], Some(r#"{"c":{"a":1},"t":5}"#))?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), "5");
+
+    Ok(())
+}
+
+/// #2349 control: the same gate's *array* elements must also validate the
+/// leading-comma/duplicate-comma shape (`[1,,2]`), not just the trailing
+/// stray-comma cases above -- a distinct `#1677` check
+/// (`preceding_delimiter_ok`) from the trailing/#2211 ones.
+#[test]
+fn test_validate_only_gate_array_element_delimiter_2349() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "select(.c) | .t"], Some(r#"{"c":[1,,2],"t":5}"#))?;
+    assert_ne!(
+        code, 0,
+        "duplicate comma between array elements should raise (stdout: {stdout:?})"
+    );
+    assert!(
+        stderr.contains("Invalid JSON"),
+        "expected a JSON validity error, stderr: {stderr:?}"
+    );
+    Ok(())
+}
