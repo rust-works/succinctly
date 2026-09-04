@@ -4470,16 +4470,14 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // of silently returning a 100000-element/-sum prefix.
     let mut emit = |from_val: RangeNum, to_val: RangeNum, step_val: RangeNum| -> Demand {
         let (one, truncated) = match (from_val, to_val, step_val) {
+            // `eval_range_values` never falls back to `eval_range_values_f64`
+            // since #2219 -- an `i64` overflow now ends its loop and keeps
+            // whatever was already pushed, rather than bailing; see its own
+            // doc comment. `eval_range_values_f64` remains real production
+            // code, reachable only via the other match arm below (any
+            // non-integer operand).
             (RangeNum::Int(f), RangeNum::Int(t), RangeNum::Int(st)) => {
-                // `eval_range_values` always returns `Some` since #2219 (an
-                // `i64` overflow now ends its loop rather than bailing) --
-                // the `None` arm is kept only because the function's return
-                // type is retained for API stability; see its own doc
-                // comment.
-                match eval_range_values::<W>(f, t, st) {
-                    Some(result) => result,
-                    None => eval_range_values_f64::<W>(f as f64, t as f64, st as f64),
-                }
+                eval_range_values::<W>(f, t, st)
             }
             (f, t, st) => eval_range_values_f64::<W>(f.as_f64(), t.as_f64(), st.as_f64()),
         };
@@ -30672,19 +30670,21 @@ fn range_max_exceeded_error() -> EvalError {
 /// Helper to generate range values, capped at [`MAX_RANGE`] per call --
 /// issue #2131's revised fix, further revised by #2219.
 ///
-/// Always returns `Some((result, truncated))` -- an `i64` overflow at any
-/// point (cap-boundary lookahead or the loop's own per-iteration advance)
-/// ends the loop and returns whatever has already been pushed, never
-/// discards it (see "# Overflow means exhaustion, not failure" below).
-/// `truncated` means the cap actually cut the range short (`true`) rather
-/// than the range finishing naturally within it (`false`) -- deliberately
-/// *not* an error here: this has no visibility into whether the caller's own
-/// sink would have stopped asking before the cap anyway (`first`/`limit`'s
+/// Always returns `(result, truncated)` -- an `i64` overflow at any point
+/// (cap-boundary lookahead or the loop's own per-iteration advance) ends the
+/// loop and returns whatever has already been pushed, never discards it
+/// (see "# Overflow means exhaustion, not failure" below). `truncated` means
+/// the cap actually cut the range short (`true`) rather than the range
+/// finishing naturally within it (`false`) -- deliberately *not* an error
+/// here: this has no visibility into whether the caller's own sink would
+/// have stopped asking before the cap anyway (`first`/`limit`'s
 /// demand-driven early exit, #2089), only [`each_range`]'s `emit` does, so
-/// the truncation verdict is reported back rather than acted on locally. The
-/// `Option` return type is retained from #2131 for API stability even though
-/// every code path now produces `Some` -- see #2219 for why removing it
-/// wasn't part of that issue's scope.
+/// the truncation verdict is reported back rather than acted on locally.
+/// #2131 originally gave this an `Option` return, `None` signalling the
+/// caller to fall back to [`eval_range_values_f64`] on overflow; #2219
+/// removed it once every overflow path had been proven to keep its partial
+/// answer instead of discarding it, leaving no way for this function to
+/// fail -- see #2219 for the proof.
 ///
 /// # Overflow means exhaustion, not failure
 ///
@@ -30786,7 +30786,7 @@ fn eval_range_values<'a, W: Clone + AsRef<[u64]>>(
     from: i64,
     to: i64,
     step: i64,
-) -> Option<(QueryResult<'a, W>, bool)> {
+) -> (QueryResult<'a, W>, bool) {
     let mut values: Vec<OwnedValue> = Vec::new();
     let mut truncated = false;
 
@@ -30837,6 +30837,8 @@ fn eval_range_values<'a, W: Clone + AsRef<[u64]>>(
                 truncated = i.checked_add(step).is_some_and(|next| next > to);
                 break;
             }
+            // Mirror of the ascending arm's advance above (same proof,
+            // `> to` in place of `< to`).
             let Some(next) = i.checked_add(step) else {
                 break;
             };
@@ -30844,7 +30846,7 @@ fn eval_range_values<'a, W: Clone + AsRef<[u64]>>(
         }
     }
 
-    Some((owned_vec_to_result(values), truncated))
+    (owned_vec_to_result(values), truncated)
 }
 
 /// Helper to generate range values over floats, capped at [`MAX_RANGE`] per
@@ -47185,29 +47187,28 @@ mod tests {
         }
     }
 
-    /// Shared by the `#2131` `eval_range_values` tests below: converts its
-    /// `Option<(QueryResult, bool)>` return into a plain `Option<(Vec<i64>,
-    /// bool)>` for equality comparison -- `QueryResult` doesn't derive
+    /// Shared by the `#2131`/`#2219` `eval_range_values` tests below:
+    /// converts its `(QueryResult, bool)` return into a plain `(Vec<i64>,
+    /// bool)` for equality comparison -- `QueryResult` doesn't derive
     /// `PartialEq` (and doesn't need to for production code, only here).
     /// Panics if a value comes back that isn't `Int`, since every input this
     /// helper is used with is an all-integer `range` (the only case
     /// [`eval_range_values`] is ever invoked for).
-    fn eval_range_values_i64(from: i64, to: i64, step: i64) -> Option<(Vec<i64>, bool)> {
-        eval_range_values::<Vec<u64>>(from, to, step).map(|(qr, truncated)| {
-            let values = match qr {
-                QueryResult::None => Vec::new(),
-                QueryResult::Owned(OwnedValue::Int(i)) => vec![i],
-                QueryResult::ManyOwned(items) => items
-                    .into_iter()
-                    .map(|v| match v {
-                        OwnedValue::Int(i) => i,
-                        other => panic!("expected Int, got {other:?}"),
-                    })
-                    .collect(),
-                other => panic!("expected an Int-only range result, got {other:?}"),
-            };
-            (values, truncated)
-        })
+    fn eval_range_values_i64(from: i64, to: i64, step: i64) -> (Vec<i64>, bool) {
+        let (qr, truncated) = eval_range_values::<Vec<u64>>(from, to, step);
+        let values = match qr {
+            QueryResult::None => Vec::new(),
+            QueryResult::Owned(OwnedValue::Int(i)) => vec![i],
+            QueryResult::ManyOwned(items) => items
+                .into_iter()
+                .map(|v| match v {
+                    OwnedValue::Int(i) => i,
+                    other => panic!("expected Int, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected an Int-only range result, got {other:?}"),
+        };
+        (values, truncated)
     }
 
     /// Independent reference for [`eval_range_values`]'s computation,
@@ -47243,14 +47244,12 @@ mod tests {
     /// treatment to a lookahead on a *non*-cap-terminated iteration (the
     /// loop's own advance) too, ending the loop and keeping whatever is
     /// already in `values` instead of returning `None` -- mirroring
-    /// [`eval_range_values`]'s own `break` since #2219. This reference's
-    /// `Option` return type is retained purely so the sweep test below can
-    /// still assert the two computations produce identical `Option` values
-    /// at every swept magnitude, not because either side can still produce
-    /// `None`. Decoupling it here independently re-derives the same
+    /// [`eval_range_values`]'s own `break` since #2219, and its return type
+    /// change to a plain tuple once neither side could produce `None`
+    /// anymore. Decoupling it here independently re-derives the same
     /// conclusion via `i128` arithmetic instead of trusting the production
     /// code's own control flow.
-    fn reference_range_i64(from: i64, to: i64, step: i64) -> Option<(Vec<i64>, bool)> {
+    fn reference_range_i64(from: i64, to: i64, step: i64) -> (Vec<i64>, bool) {
         let to128 = to as i128;
         let step128 = step as i128;
         let mut i: i128 = from as i128;
@@ -47287,7 +47286,7 @@ mod tests {
                 i = next;
             }
         }
-        Some((values, truncated))
+        (values, truncated)
     }
 
     /// #2131 (revised fix): pins the specific magnitudes the issue and its
@@ -47304,27 +47303,23 @@ mod tests {
     /// Retargeted by #2219: every case here that overflows still overflows
     /// exactly where this comment says it does, but #2219 changed what
     /// happens next -- the values already pushed before the overflowing
-    /// advance are now kept (`Some((partial_values, false))`) instead of
-    /// discarded for an `f64` recomputation (`None`), so every assertion
-    /// below that used to expect `None` now expects the exact partial
-    /// answer instead.
+    /// advance are now kept (`(partial_values, false)`) instead of
+    /// discarded for an `f64` recomputation, so every assertion below that
+    /// used to expect `None` now expects the exact partial answer instead.
     #[test]
     fn test_eval_range_values_overflow_detection_2131() {
         // Ordinary small range: exact, no overflow.
-        assert_eq!(
-            eval_range_values_i64(0, 10, 1),
-            Some(((0..10).collect(), false))
-        );
+        assert_eq!(eval_range_values_i64(0, 10, 1), ((0..10).collect(), false));
 
         // The regression this refinement fixes: a nanosecond-epoch-scale
         // range whose magnitude is well past the old `2^53` gate but whose
         // 10-step walk never comes close to `i64::MAX` -- must stay exact.
         assert_eq!(
             eval_range_values_i64(1_700_000_000_000_000_000, 1_700_000_000_000_000_010, 1),
-            Some((
+            (
                 (1_700_000_000_000_000_000..1_700_000_000_000_000_010).collect(),
                 false
-            ))
+            )
         );
 
         // The confirmed-hangs-in-real-jq shape: completes correctly and
@@ -47334,7 +47329,7 @@ mod tests {
         let bound = 1i64 << 53;
         assert_eq!(
             eval_range_values_i64(bound - 2, bound + 2, 1),
-            Some(((bound - 2..bound + 2).collect(), false))
+            ((bound - 2..bound + 2).collect(), false)
         );
 
         // #2219: `from` is 50 above `i64::MIN`, `step` subtracts 100 more --
@@ -47344,7 +47339,7 @@ mod tests {
         // bailed via `?` and returned `None`).
         assert_eq!(
             eval_range_values_i64(-9223372036854775758, -9223372036854775808, -100),
-            Some((vec![-9223372036854775758], false))
+            (vec![-9223372036854775758], false)
         );
 
         // Overflow near `i64::MAX` on the first add: the gap to `to` (10)
@@ -47352,13 +47347,13 @@ mod tests {
         // already overshoots -- the one pushed value is kept (#2219).
         assert_eq!(
             eval_range_values_i64(i64::MAX - 10, i64::MAX, 1000),
-            Some((vec![i64::MAX - 10], false))
+            (vec![i64::MAX - 10], false)
         );
 
         // Mirror at `i64::MIN`, negative step.
         assert_eq!(
             eval_range_values_i64(i64::MIN + 10, i64::MIN, -1000),
-            Some((vec![i64::MIN + 10], false))
+            (vec![i64::MIN + 10], false)
         );
 
         // Overflow NOT on the first add: from 0, a step just past half of
@@ -47367,7 +47362,7 @@ mod tests {
         let big_step = i64::MAX / 2 + 100;
         assert_eq!(
             eval_range_values_i64(0, i64::MAX, big_step),
-            Some((vec![0, big_step], false))
+            (vec![0, big_step], false)
         );
 
         // Zero-iteration cases at the most extreme possible magnitudes: the
@@ -47375,18 +47370,18 @@ mod tests {
         // regardless of how extreme `from`/`to` are.
         assert_eq!(
             eval_range_values_i64(i64::MAX, i64::MIN, 1),
-            Some((Vec::new(), false))
+            (Vec::new(), false)
         );
         assert_eq!(
             eval_range_values_i64(i64::MIN, i64::MAX, -1),
-            Some((Vec::new(), false))
+            (Vec::new(), false)
         );
 
         // step == 0: always trivially empty (matches jq's `else empty end`
         // arm), regardless of from/to magnitude -- no add is ever attempted.
         assert_eq!(
             eval_range_values_i64(i64::MIN, i64::MAX, 0),
-            Some((Vec::new(), false))
+            (Vec::new(), false)
         );
     }
 
@@ -47416,13 +47411,12 @@ mod tests {
     /// values (`99999 * step < to` but `100000 * step > to`, verified by
     /// hand) -- hitting the cap here does not actually cut anything short,
     /// so `truncated` must come back `false`, not `true`; what matters is
-    /// that this returns `Some` at all; instead of the round-2 bug's `None`,
-    /// discarding every already-correct pushed value.
+    /// that this returns its exact answer at all, not the round-2 bug's
+    /// discard-and-recompute.
     #[test]
     fn test_eval_range_values_cap_hit_lookahead_overflow_does_not_bail_2131() {
         let step = 92234642714974i64;
-        let (values, truncated) =
-            eval_range_values_i64(0, i64::MAX, step).expect("cap-hit exit must not overflow-bail");
+        let (values, truncated) = eval_range_values_i64(0, i64::MAX, step);
         assert_eq!(values.len(), MAX_RANGE);
         assert!(
             !truncated,
@@ -47434,8 +47428,7 @@ mod tests {
 
         // Mirror at the descending arm: `i64::MIN`-adjacent `to`, negative
         // step, same magnitude -- same "exactly MAX_RANGE values" shape.
-        let (values, truncated) = eval_range_values_i64(0, i64::MIN, -step)
-            .expect("cap-hit exit must not overflow-bail (descending)");
+        let (values, truncated) = eval_range_values_i64(0, i64::MIN, -step);
         assert_eq!(values.len(), MAX_RANGE);
         assert!(!truncated);
         assert_eq!(values[250], -250 * step);
@@ -47452,16 +47445,14 @@ mod tests {
     #[test]
     fn test_eval_range_values_cap_hit_genuine_truncation_still_flagged_2131() {
         let to = MAX_RANGE as i64 + 5;
-        let (values, truncated) =
-            eval_range_values_i64(0, to, 1).expect("small-step cap hit never overflows");
+        let (values, truncated) = eval_range_values_i64(0, to, 1);
         assert_eq!(values.len(), MAX_RANGE);
         assert!(
             truncated,
             "5 more values ({MAX_RANGE}..{to}) genuinely exist beyond the cap"
         );
 
-        let (values, truncated) =
-            eval_range_values_i64(0, -to, -1).expect("small-step cap hit never overflows");
+        let (values, truncated) = eval_range_values_i64(0, -to, -1);
         assert_eq!(values.len(), MAX_RANGE);
         assert!(truncated);
     }
@@ -47627,14 +47618,26 @@ mod tests {
         // the overflowing candidate can never satisfy `< to` either way, so
         // the loop ends and keeps the one exact `Int` value already pushed,
         // instead of discarding it for a `Float` recomputation. This proves
-        // the `None => eval_range_values_f64(...)` arm at this call site is
-        // unreachable dead code for this dispatch arm (kept only for API
-        // stability, per `eval_range_values`'s own doc comment) -- the
-        // f64 path remains reachable only via the *other* `emit` match arm,
-        // for genuinely non-integer `from`/`to`/`step`.
+        // the `eval_range_values_f64` call this dispatch arm used to fall
+        // back to is unreachable from here (see `eval_range_values`'s own
+        // doc comment for why its signature no longer even offers that
+        // path) -- the f64 path remains reachable only via the *other*
+        // `emit` match arm, for genuinely non-integer `from`/`to`/`step`.
         assert_eq!(
             range_values("range(9223372036854774000;9223372036854775807;1000000000000000)"),
             vec![OwnedValue::Int(9223372036854774000)]
+        );
+
+        // #2219, descending mirror of the multi-iteration overflow case
+        // `test_eval_range_values_overflow_detection_2131` already pins at
+        // the unit level (`eval_range_values_i64(0, i64::MAX, big_step)`):
+        // the first advance succeeds, the second overflows past `i64::MIN`,
+        // and both values computed before that overflow are kept end to
+        // end through the full dispatch, not just at the unit level.
+        let big_step = i64::MAX / 2 + 100;
+        assert_eq!(
+            range_values(&format!("range(0;{};{})", i64::MIN, -big_step)),
+            vec![OwnedValue::Int(0), OwnedValue::Int(-big_step)]
         );
     }
 

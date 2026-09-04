@@ -36244,18 +36244,26 @@ fn test_range_near_boundary_still_uses_i64_fast_path_2131() -> Result<()> {
 
 /// A range whose `to` bound is close to `i64::MAX` (`i64::MAX - ~1.8e15`,
 /// still a valid `i64`) with a `step` (`1e15`) large enough to overshoot it
-/// in one add must route to the `f64` path rather than the exact `i64`
-/// one -- before this fix, `eval_range_values` computed this directly in
-/// `i64` and (depending on the exact combination) either produced an answer
-/// jq itself would not, or -- as this exact case does when misrouted --
-/// panics on `attempt to add with overflow` in a debug build (confirmed
-/// while developing this fix); the revised fix's `checked_add` catches this
-/// on the very first addition. The chosen step is large relative to the
-/// span so real jq also terminates quickly rather than stalling near this
-/// magnitude; verified against the pinned jq 1.7.1 oracle (timeout-guarded
-/// during development -- this specific combination returns instantly).
+/// in one add -- before #2131's fix, `eval_range_values` computed this
+/// directly in `i64` with no overflow guard and panicked on `attempt to add
+/// with overflow` in a debug build (confirmed while developing that fix);
+/// `checked_add` catches this on the very first addition instead.
+///
+/// Retargeted by #2219: this test's name and doc comment used to claim the
+/// query "must route to the `f64` path rather than the exact `i64` one" --
+/// true when this test was written (round 3's fix still bailed the whole
+/// function via `?` on this exact overflow), but no longer true since #2219
+/// removed that bail: the loop now ends and keeps the one value (`from`
+/// itself) already pushed before the overflowing add, staying on the exact
+/// `i64` path throughout. The assertion below was passing by coincidence
+/// even before this rename -- succinctly's JSON formatter prints a
+/// whole-number `Float` the same way it prints an `Int` (`9223372036854774000`,
+/// no decimal point), so the stdout string alone can't distinguish which
+/// path actually ran; `test_range_dispatch_keeps_exact_int_prefix_through_overflow_2219`
+/// (`src/jq/eval.rs`) is what actually asserts the value's *type*, not just
+/// its printed form.
 #[test]
-fn test_range_beyond_boundary_routes_to_f64_path_2131() -> Result<()> {
+fn test_range_beyond_boundary_stays_on_exact_i64_path_2219() -> Result<()> {
     let (stdout, code) = run_jq_null(
         "[range(9223372036854774000;9223372036854775807;1000000000000000)]",
         &["-c"],
