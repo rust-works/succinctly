@@ -63152,12 +63152,17 @@ mod tests {
         // reduce, re-running over the *same* source stream. Real jq 1.7.1
         // diverges here for a reason unrelated to this evaluator: its own
         // bytecode re-enters `SOURCE` on the second INIT fork with `.`
-        // already clobbered by the first fork's own iteration (`jq -n
-        // 'reduce .[] as $x (0,1; .+$x)' <<<'[1,2,3]'` prints `6` then
-        // errors "Cannot iterate over null"). This codebase's INIT-forking
-        // doesn't share that quirk — pinning succinctly's own consistent
-        // value here, not jq's, so a future refactor doesn't silently
-        // change it either way without a failing test to flag it.
+        // already clobbered by the first fork's own iteration (`echo
+        // '[1,2,3]' | jq -c 'reduce .[] as $x (0,1; .+$x)'` prints `6` then
+        // errors "Cannot iterate over null" — not `jq -n ...`, which
+        // supplies `null` as `.` from the very first fork and so errors
+        // immediately with nothing printed at all; see
+        // docs/compliance/jq/limitations.md's "INIT-fork re-entry" entry for
+        // the full writeup, including why `[reduce ...]`'s own buffered
+        // array form prints nothing before erroring either). This codebase's
+        // INIT-forking doesn't share that quirk — pinning succinctly's own
+        // consistent value here, not jq's, so a future refactor doesn't
+        // silently change it either way without a failing test to flag it.
         assert_eq!(
             outputs(b"[1,2,3]", "reduce .[] as $x (0,1; .+$x)"),
             ["6", "7"]

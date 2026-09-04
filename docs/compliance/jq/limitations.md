@@ -3882,7 +3882,7 @@ magnitude error, a narrower divergence from real jq than #2240's own issue text 
 scoped this fix to. Fixing the underlying large-integer-precision gap itself (so `1.` could
 be accepted safely at every magnitude) is out of scope for #2240 and not separately filed.
 
-### `foreach`/`reduce`'s INIT-fork re-entry: SOURCE reads real jq's synthetic `null`, not the ambient input — recorded on its merits, ADR-0018 rule 4 (#534, #2163)
+### `foreach`/`reduce`'s INIT-fork re-entry: SOURCE reads real jq's synthetic `null`, not the ambient input — no carve-out; recorded as a still-open policy question (#534, #2163)
 
 `foreach`/`reduce`'s parser accepted a top-level comma in the INIT slot from #534 onward
 (`foreach SOURCE as $x (INIT1, INIT2; ...)`), which forks the whole construct once per INIT
@@ -3893,11 +3893,15 @@ since #534 and is already pinned by `test_reduce_comma_slots`/`test_foreach_comm
 
 ```console
 $ echo '[1,2,3]' | jq -c '[reduce .[] as $x (0,1; .+$x)]'
-[6]
-jq: error (at <stdin>:0): Cannot iterate over null (null)
+jq: error (at <stdin>:1): Cannot iterate over null (null)
 $ echo '[1,2,3]' | succinctly jq -c '[reduce .[] as $x (0,1; .+$x)]'
 [6,7]
 ```
+
+(real jq's exit code is 5, and — because `[...]` fully buffers its generator before printing
+anything — stdout is completely empty here, not a partial `[6]`; the pre-existing
+`test_reduce_comma_slots`/`test_foreach_comma_slots` code comments in `src/jq/eval.rs`
+understated this the same way, corrected alongside this entry).
 
 Real jq's own bytecode compiler re-enters SOURCE's evaluation once per INIT fork, and for
 every fork after the first, the ambient input (`.`) SOURCE sees there is a synthetic `null`
@@ -3914,34 +3918,55 @@ $ echo '{"a":1,"c":2}' | succinctly jq -c '[foreach (.a) as $k ((0,.c); $k)]'
 [1,1]
 ```
 
-succinctly's evaluators (`src/jq/eval.rs` and `src/jq/eval_generic.rs` — this is a
-shared-core behavior, pinned identical across both by
-`test_parity_foreach_reduce_init_fork_source_reads_ambient_input_2163` in
-`tests/jq_evaluator_parity_tests.rs`) compute SOURCE's values once, upfront, and reuse them
-across every INIT fork — so every fork sees SOURCE evaluated against the real ambient input,
-consistently. `.[]` never sees a `null` to fail on, and a field read never silently degrades
-to `null`.
+Two of succinctly's three jq evaluators — `eval.rs`'s value evaluator and
+`eval_generic.rs`'s generic/CLI evaluator — share one core
+(`eval_reduce_with_values`/`eval_foreach_with_values`) that computes SOURCE's values once,
+upfront, and reuses them across every INIT fork, so every fork sees SOURCE evaluated against
+the real ambient input there. That front-end-level agreement (not independent
+double-implementation of the fold itself, since both front ends call the same shared
+functions) is what `test_parity_foreach_reduce_init_fork_source_reads_ambient_input_2163`
+(`tests/jq_evaluator_parity_tests.rs`) pins.
 
-This does not fit any of ADR-0018 rule 4's four named conditions letter-for-letter (the
-output is readable, nothing is corrupted, and the process doesn't die either way) — recorded
-here on its merits instead, matching this file's own "A structurally malformed value doesn't
-abort the rest of a multi-value stream" precedent for that same carve-out shape. Matching
-jq's quirk exactly would mean re-deriving jq's own undocumented VM register-threading rule
-(which expression shapes get a fresh backtrack point, and what `.` reads as across one) and
-restructuring the shared INIT-fork core in **three** evaluators (`eval.rs`'s value evaluator,
-`eval_generic.rs`'s generic/CLI evaluator, and the path-context evaluator's own
-`Expr::Foreach`/`resolve_reduce` arms) to re-evaluate SOURCE per-fork against a synthetic
-`null` document, rather than the current once-upfront computation
-(`input_values`/`substituted_*_matrix`) all three share. A prior attempt at a narrower
-version of this fix (nulling only the bound pattern variable, not re-deriving SOURCE itself)
-regressed a passing test
-(`test_eval_reduce_init_partial_prefix_still_forks_when_trailing_error_suppressed_1934`),
-confirming the narrow form doesn't hold up and the full form is a genuine multi-evaluator
-architectural change, not a local fix. Given `.[]`'s identical case already went unfixed
-since #534 with no user-visible complaint, and succinctly's own behavior is the more useful
-of the two here (a consistent value instead of a silent `null`/hard error split depending on
-fork position) — the value bar for that reconstruction doesn't clear the cost, so it is
-recorded as an accepted divergence rather than a queued fix.
+The **third** evaluator — the path-context evaluator's `resolve_reduce`/`resolve_foreach`
+(`src/jq/eval.rs`) — is not part of that shared core and is not consistent with it here: its
+own SOURCE resolution (`resolve_fold_source`, added by #2031 for path-trackability, not for
+this divergence) already re-runs once per INIT fork, inside the per-branch loop, using the
+real document every time rather than a cached value — architecturally the closest thing in
+this codebase to what a jq-matching fix would need, but it does not inject a synthetic
+`null`, and in path/assignment position it does not reach the value evaluator's `[1,1]`
+answer at all:
+
+```console
+$ echo '{"a":1,"c":2}' | succinctly jq -c 'path(reduce (.a) as $k ((0,.c); $k))'
+jq: error (at <stdin>:1): Invalid path expression with result 1
+```
+
+This pre-existing three-way inconsistency (a #2031 restriction on navigating INIT forks,
+unrelated to #2163) is filed separately as
+[#2388](https://github.com/rust-works/succinctly/issues/2388) rather than folded into this
+entry, since it is a succinctly-internal-consistency gap, not a jq-fidelity question.
+
+This divergence does not fit any of ADR-0018 rule 4's four named conditions letter-for-letter
+(the output is readable, nothing is corrupted, and the process doesn't die either way), so
+per rule 4 it is recorded here as a still-open policy question — matching this file's own "A
+structurally malformed value doesn't abort the rest of a multi-value stream" entry, which is
+itself still open rather than a settled precedent to build on. Matching jq's quirk exactly
+would mean re-deriving jq's own undocumented VM register-threading rule (which expression
+shapes get a fresh backtrack point, and what `.` reads as across one) and reshaping the
+shared `eval_reduce_with_values`/`eval_foreach_with_values` core so it re-evaluates SOURCE
+per-fork against a synthetic `null` document instead of its current once-upfront
+computation. A prior attempt at a narrower version of this fix (nulling only the bound
+pattern variable, not re-deriving SOURCE itself) regressed a passing test
+(`test_eval_reduce_init_partial_prefix_still_forks_when_trailing_error_suppressed_1934`) —
+but that test's own SOURCE is a constant (`5`) that never reads `.` at all, so the regression
+shows only that *that particular* patch shape was wrong, not that a correctly-shaped
+per-fork-null fix is itself infeasible; no such fix has actually been attempted. Given `.[]`'s
+identical case has already shipped since #534 with no user-visible complaint, and
+succinctly's own value-evaluator behavior is arguably more useful than jq's here (one
+consistent value instead of a silent `null`/hard-error split depending on fork position) —
+this is recorded now, with regression coverage in place, as an open question for whoever
+next has reason to attempt the real per-fork re-evaluation, rather than as either a queued
+fix or a closed decision.
 
 ## Provenance
 
