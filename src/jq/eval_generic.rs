@@ -8264,17 +8264,36 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
 
     // Promotes `cursors` into `owned` on the first Owned-kind result seen,
     // shared by both `KeyTargets` arms below (#2032 review: this exact
-    // 4-line sequence used to be written out twice). `owned_or_err!`'s bare
-    // return on a promotion failure here is pre-existing, unchanged by
-    // #2032 -- unlike `escape_generic!` above, this path was already
-    // reachable before this fix (any ordinary indexing result could be the
-    // first `Owned` one), so its error-only-ever handling isn't new
-    // territory this fix needs to harden.
+    // 4-line sequence used to be written out twice).
+    //
+    // #2340: used to promote via the all-or-nothing `owned_or_err!(
+    // to_owned_all_cursors(&cursors))` -- a bare `return GenericResult::
+    // Error(e)` on a secondary decode failure here, discarding not just the
+    // `cursors` prefix (the #2145 gap `escape_generic!` already closed for
+    // its own promotion) but also silently replacing whatever this
+    // function's own keys-evaluation phase had already queued in
+    // `pending_halt`/`pending_key_stream_control` -- worse than #2145's own
+    // gap, since even an uncatchable `Halt` from an earlier key's own
+    // escape was lost. Now uses the same prefix-preserving
+    // `to_owned_all_cursors_checked` and Halt-survives/Error-Break-
+    // downgrades priority `escape_generic!` and the tail resolvers below
+    // both already establish: an already-pending `Halt` survives
+    // unconditionally, anything else (a pending `Error`/`Break`, or
+    // nothing pending at all) downgrades to this decode failure.
     macro_rules! ensure_owned {
         () => {
             if !any_owned {
                 any_owned = true;
-                owned = owned_or_err!(to_owned_all_cursors(&cursors));
+                owned = match to_owned_all_cursors_checked(&cursors) {
+                    Ok(vs) => vs,
+                    Err((prefix, e)) => {
+                        let control = match pending_halt {
+                            Some(code) => Control::Halt(code),
+                            None => Control::Error(e),
+                        };
+                        return partial_generic(prefix, control);
+                    }
+                };
                 cursors.clear();
             }
         };
@@ -17384,6 +17403,51 @@ mod tests {
         let json: &[u8] = b"{\"arr\":[{\"bad\":\"ok\"},{\"bad\":\"\xff\xfe\"}]}";
         let index = JsonIndex::build(json);
         let expr = crate::jq::parse(r#"(.arr[0],.arr[1])[("bad",5)]"#).unwrap();
+        match eval_with_cursor(&expr, index.root(json)) {
+            GenericResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::String("ok".to_string())]);
+                assert!(e.is_decode_failure(), "{e:?}");
+                assert!(e.message.contains("invalid UTF-8"), "{e:?}");
+            }
+            other => panic!("expected Partial([\"ok\"], decode Error), got {other:?}"),
+        }
+    }
+
+    /// #2340: `eval_index_expr`'s `ensure_owned!` macro -- the promotion
+    /// step shared by the `KeyTargets::Native`/`KeyTargets::Owned` arms --
+    /// used to convert `cursors` via the all-or-nothing
+    /// `owned_or_err!(to_owned_all_cursors(&cursors))`, a bare `return
+    /// GenericResult::Error(e)` on a decode failure that discarded the
+    /// entire already-accumulated `cursors` prefix. Unlike
+    /// `escape_generic!`'s identical gap (#2145, the sibling test above),
+    /// this promotion isn't reached through a *target*-side escape -- it
+    /// fires mid-stream, the moment a later key's own indexing needs an
+    /// owned value while `cursors` still holds an earlier key's undecodable
+    /// one.
+    ///
+    /// The target here is `.arr[]` (a plain `Expr::Iterate`), not a comma
+    /// generator like #2145's -- `.arr[]` collects lazy cursors up front
+    /// with no eager decode (`Expr::Iterate`'s own arm returns
+    /// `GenericResult::ManyCursor` directly), so evaluating it for either
+    /// key never itself fails; a comma target such as `(.arr[0],.arr[1])`
+    /// was tried first and found to *already* fail before indexing ever
+    /// starts, exercising #2145's already-fixed `Partial`-arm promotion
+    /// instead of this macro's.
+    ///
+    /// Key `"bad"` succeeds natively for both array elements, pushing a
+    /// cursor to `"ok"` and one to the undecodable string into `cursors`.
+    /// Key `"missing"` then indexes the first element to `Owned(Null)`
+    /// (absent field), which is the one `GenericResult::Owned` arm that
+    /// calls `ensure_owned!()` -- promoting the two pending cursors while
+    /// `"missing"` is still being processed. `"ok"` must survive into the
+    /// reported prefix. Verified against jq 1.7.1 for the non-corrupted
+    /// shape: `{"arr":[{"bad":"ok"},{"bad":"safe"}]} | .arr[][("bad",
+    /// "missing")]` prints `"ok"`, `"safe"`, `null`, `null`.
+    #[test]
+    fn generic_ensure_owned_keeps_convertible_prefix_on_double_fault_2340() {
+        let json: &[u8] = b"{\"arr\":[{\"bad\":\"ok\"},{\"bad\":\"\xff\xfe\"}]}";
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(r#".arr[][("bad","missing")]"#).unwrap();
         match eval_with_cursor(&expr, index.root(json)) {
             GenericResult::Partial(vs, Control::Error(e)) => {
                 assert_eq!(vs, vec![OwnedValue::String("ok".to_string())]);
