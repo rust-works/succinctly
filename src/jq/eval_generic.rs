@@ -501,14 +501,16 @@ pub fn to_owned_all_cursors<'a, C: DocumentCursor + 'a>(
 /// (what `to_owned_all_cursors` uses) drops every already-collected item on
 /// the first `Err`, which is fine for a caller with nothing of its own to
 /// lose, but wrong for one folding this conversion's result into an
-/// already-running prefix (`escape_generic!`'s own `Partial`-folding use,
-/// its sole caller so far). Mirrors `eval.rs`'s `promote_borrowed_checked`
-/// (#1897) -- the same fix, for the cursor-native accumulator instead of
-/// the borrowed-`StandardJson` one.
-fn to_owned_all_cursors_checked<'a, C: DocumentCursor + 'a>(
-    cursors: impl IntoIterator<Item = &'a C>,
+/// already-running prefix (`eval_index_expr`'s own `Partial`-folding uses --
+/// `escape_generic!`, the `pending_halt` finalizer, and the target `Partial`
+/// arm's own promotion -- its only callers so far). Mirrors `eval.rs`'s
+/// `promote_borrowed_checked` (#1897) -- the same fix, and the same `&[C]`
+/// (not a generic `IntoIterator`) so `cursors.len()` is available to
+/// pre-size `acc` via `vec_with_capacity`, same as that sibling does.
+fn to_owned_all_cursors_checked<C: DocumentCursor>(
+    cursors: &[C],
 ) -> Result<Vec<OwnedValue>, (Vec<OwnedValue>, EvalError)> {
-    let mut acc = Vec::new();
+    let mut acc = vec_with_capacity(cursors.len());
     for c in cursors {
         match to_owned_cursor(c) {
             Ok(v) => acc.push(v),
@@ -8323,14 +8325,22 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                 }
                 if !any_owned {
                     any_owned = true;
-                    owned = match to_owned_all_cursors(&cursors) {
+                    // #2145: uses the prefix-preserving
+                    // `to_owned_all_cursors_checked` instead of the
+                    // all-or-nothing `to_owned_all_cursors` -- this arm's
+                    // own doc comment above already claimed to mirror
+                    // `escape_generic!`'s Halt-survives rule, but until this
+                    // fix it still discarded the *prefix* the same way
+                    // `escape_generic!` itself used to (review finding: the
+                    // sibling gap #2145's own fix left in place here).
+                    owned = match to_owned_all_cursors_checked(&cursors) {
                         Ok(vs) => vs,
-                        Err(e) => {
+                        Err((prefix, e)) => {
                             let control = match control {
                                 Control::Halt(code) => Control::Halt(code),
                                 Control::Error(_) | Control::Break(_) => Control::Error(e),
                             };
-                            return partial_generic(Vec::new(), control);
+                            return partial_generic(prefix, control);
                         }
                     };
                     cursors.clear();
@@ -8501,10 +8511,39 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         // carry cursors, not just owned values — the same rework #631 is
         // already deferred on — so this only documents the trade-off rather
         // than papering over it.
+        // #2145: uses the prefix-preserving `to_owned_all_cursors_checked`
+        // instead of `owned_or_err!(to_owned_all_cursors(&cursors))` -- the
+        // latter bare-returns `GenericResult::Error` on a decode failure
+        // here, discarding the accumulated prefix *and* silently downgrading
+        // this arm's own already-uncatchable `Control::Halt(code)` into a
+        // catchable decode error (worse than the `escape_generic!` gap this
+        // issue's own fix closed one block above: there the held `control`
+        // at least survived). The control here is always `Halt` by
+        // construction (this whole block only runs when `pending_halt` is
+        // `Some`), so a promotion failure can only ever keep it, matching
+        // `resolve_terminal_prefix`'s and `escape_generic!`'s own
+        // "Halt survives a promotion failure" rule -- the decode error
+        // itself is discarded, same as those two.
+        //
+        // Not live-repro-tested (review): reaching this arm needs `halt` to
+        // appear in the *key* stream (`.[(1,halt)]`) alongside undecodable
+        // content elsewhere in the same document, but `Builtin::Halt`'s own
+        // evaluation (confirmed live via a debug probe) falls through
+        // `eval_single`'s native dispatch to `bridge_to_full_evaluator`,
+        // which materializes the *entire* document up front -- so any
+        // undecodable content anywhere in it surfaces there first, as the
+        // key stream's own `Partial(_, Control::Error(_))` collapse a few
+        // lines above (the `#2326`-tracked "key stream discards its own
+        // prefix" gap), before `pending_halt` is ever set. Kept for the
+        // same defensive, future-proofing reason `resolve_terminal_prefix`
+        // keeps its own identical handling.
         let out = if any_owned {
             owned
         } else {
-            owned_or_err!(to_owned_all_cursors(&cursors))
+            match to_owned_all_cursors_checked(&cursors) {
+                Ok(vs) => vs,
+                Err((prefix, _)) => prefix,
+            }
         };
         return partial_generic(out, Control::Halt(code));
     }
