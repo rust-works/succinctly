@@ -7,9 +7,14 @@
 //! that currently AGREE are asserted equal (locking them in). Cases that
 //! currently DIVERGE are pinned with `assert_ne!` plus the observed outputs, so
 //! the fix is forced to update them and no NEW drift slips in silently.
+//!
+//! A third axis lives at the bottom of this file (#2416 phase 0): inside
+//! `eval_generic.rs`, a path-context pipe is answered either by the #2061
+//! cursor walk or by the materializing bridge, and those two must agree too.
+//! `eval_generic::PathContextRoute` makes both routes drivable from here.
 
 use succinctly::jq::eval_generic;
-use succinctly::jq::{eval, parse, Expr, JqSemantics, QueryResult};
+use succinctly::jq::{eval, parse, EvalSemantics, Expr, JqSemantics, QueryResult, YqSemantics};
 use succinctly::json::JsonIndex;
 
 /// Outputs of the full evaluator (`src/jq/eval.rs`).
@@ -1489,5 +1494,383 @@ fn test_parity_foreach_reduce_init_fork_source_reads_ambient_input_2163() {
         "[reduce (.a) as $k ((0,.c); $k)]",
     ] {
         assert_parity(br#"{"a":1,"c":2}"#, filter);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #2416 phase 0, axis three: the cursor walk vs the materializing bridge.
+//
+// The two axes above compare `eval.rs` with `eval_generic.rs`. Inside
+// `eval_generic.rs` there is a *third* pair that has to agree and had nothing
+// asserting it: a pipe stage that `needs_path_context` is answered either by
+// `try_path_context_cursor_walk` (#2061, straight from cursors) or, for any
+// shape the walk does not model, by the materializing bridge
+// (`to_owned_with_cursor` + `eval::eval_pipe_with_path_context`).
+//
+// #2416 migrates the eager evaluator's arms into the walk one at a time, and
+// the fallback is *meant* to be output-identical — which is exactly why
+// nothing in the suite could see #2061's own lost optimization; patch coverage
+// caught it instead. `PathContextRoute` makes the two routes drivable from
+// here so "identical" becomes an assertion.
+//
+// The walk is genuinely exercised by these cases, not merely offered: with the
+// route site instrumented, the two shape tables below reach 332 path-context
+// evaluations per route, and the walk answers 246 of them. The other 86 are
+// shapes `path_context_is_cursor_walkable` still refuses -- the migration's
+// own backlog. A test that only ever reached the bridge would pass while
+// proving nothing (#1599's lesson).
+// ---------------------------------------------------------------------------
+
+/// Outputs of the generic evaluator with the path-context route pinned.
+fn route_outputs<S: EvalSemantics>(
+    json: &[u8],
+    filter: &str,
+    route: eval_generic::PathContextRoute,
+) -> Vec<String> {
+    let index = JsonIndex::build(json);
+    let cursor = index.root(json);
+    let expr = parse(filter).expect("parse failed");
+    eval_generic::eval_with_cursor_using_route::<S, _>(&expr, cursor, route)
+        .collect_owned()
+        .expect("materializes")
+        .iter()
+        .map(succinctly::jq::OwnedValue::to_json)
+        .collect()
+}
+
+/// Assert the cursor walk and the materializing bridge agree, in both modes.
+///
+/// Both modes on purpose: `key`/`parent`/`path` are yq builtins that
+/// `succinctly jq` also accepts as an extension, and the walk is shared, so a
+/// mode-specific regression in one route would otherwise only be visible in
+/// half the surface (#2226's lesson about a shared site with a per-mode gate).
+fn assert_walk_bridge_parity(json: &[u8], filter: &str) {
+    for (mode, walk, bridge) in [
+        (
+            "jq",
+            route_outputs::<JqSemantics>(
+                json,
+                filter,
+                eval_generic::PathContextRoute::WalkThenBridge,
+            ),
+            route_outputs::<JqSemantics>(json, filter, eval_generic::PathContextRoute::BridgeOnly),
+        ),
+        (
+            "yq",
+            route_outputs::<YqSemantics>(
+                json,
+                filter,
+                eval_generic::PathContextRoute::WalkThenBridge,
+            ),
+            route_outputs::<YqSemantics>(json, filter, eval_generic::PathContextRoute::BridgeOnly),
+        ),
+    ] {
+        assert_eq!(
+            walk,
+            bridge,
+            "path-context route drift ({mode} mode) for `{filter}` on `{}`:\n  \
+             walk   = {walk:?}\n  bridge = {bridge:?}",
+            String::from_utf8_lossy(json)
+        );
+    }
+}
+
+/// Every path-context shape the walk models today, plus a ring of shapes just
+/// outside it, over documents that exercise object keys, array indices,
+/// nesting and duplicate mapping keys.
+///
+/// A shape the walk refuses is not a failure here — the bridge answers it and
+/// both routes agree trivially. That is the point of the one-directional gate
+/// #2416 phase 2 relies on: an un-migrated arm is a missed optimization, never
+/// a wrong answer. This test is what keeps that claim true as arms migrate.
+#[test]
+fn test_walk_vs_bridge_path_context_parity_2416() {
+    let docs: [&[u8]; 5] = [
+        br#"{"a":{"b":1,"c":2},"d":[10,20]}"#,
+        br#"{"a":{"b":{"e":1}},"d":[[1],[2]]}"#,
+        br#"{"a":1,"a":2,"d":[10,20]}"#,
+        br#"{"a":{"b":1,"b":2},"d":[10,20]}"#,
+        br#"[{"k":1},{"k":2}]"#,
+    ];
+    for doc in docs {
+        for filter in [
+            // Leaves at the root, where the walk currently defers.
+            "key",
+            "parent",
+            "path",
+            // Navigation prefixes the walk models.
+            ".a | key",
+            ".a | path",
+            ".a | parent",
+            ".a[] | key",
+            ".a[] | path",
+            ".a[] | parent",
+            ".d[] | key",
+            ".d[] | path",
+            ".[] | key",
+            "[.[] | key]",
+            "[.a[] | key]",
+            "[.a[] | path]",
+            ".a.b | path",
+            ".a.b | parent | key",
+            ".a[] | parent(1) | key",
+            ".a[] | parent(0) | key",
+            "[.a[] | (key, path)]",
+            // Stages past the leaf, which fold through the ordinary evaluator.
+            ".a | key | tostring",
+            "[.a[] | key] | length",
+            "[.d[] | path] | flatten",
+            // Shapes outside the walkable set: the bridge answers, and both
+            // routes must still agree.
+            ".a[] | select(true) | key",
+            "{\"k\": key}",
+            "[.a[] | {\"k\": key}]",
+            "first(.a[] | key)",
+            "[limit(1; .a[] | key)]",
+            "[foreach (.a[] | key) as $k ([]; . + [$k])] | last",
+            "[reduce (.a[] | key) as $k ([]; . + [$k])]",
+            "try (.a[] | key) catch \"e\"",
+            "(.a[] | key)?",
+            "label $o | (.a[] | key, break $o)",
+            ".a[] | key as $k | $k",
+            "[.. | path]",
+        ] {
+            assert_walk_bridge_parity(doc, filter);
+        }
+    }
+}
+
+/// The one place the two routes are *known* to be able to differ, pinned so
+/// #2416 phase 2 has to make a decision rather than discover one.
+///
+/// `try_path_context_cursor_walk` returns `None` — deferring to the bridge —
+/// whenever an emitted value fails `reindex_bridge_is_identity`, precisely so
+/// the walk cannot disagree with the bridge's `to_json_for_reindex`
+/// re-spelling of a bare float. That guard is why these assert *equal* today.
+///
+/// The re-spelling is the bridge's, not the reference's: captured 2026-09-04
+/// against the pinned binaries, yq v4.53.3 preserves the source spelling in
+/// every probed case (#2419). Once the eager evaluator is deleted the fallback
+/// has nothing to defer to, and the walk should emit the document's own
+/// spelling — at which point these cases start to differ and this test is the
+/// thing that says so.
+#[test]
+fn test_walk_vs_bridge_float_respelling_guard_2419() {
+    for doc in [
+        br#"{"a":{"b":1.50,"c":1e3},"d":[1e20,20]}"#.as_slice(),
+        br#"{"a":{"b":100000000000000000000,"c":2},"d":[10,20]}"#.as_slice(),
+        br#"{"a":{"b":10000000000000000000.0},"d":[1]}"#.as_slice(),
+    ] {
+        for filter in [
+            ".a | key",
+            ".a[] | key",
+            ".a[] | path",
+            ".a.b | parent",
+            ".a | .b | parent | .b | tostring",
+            "[.a[] | parent]",
+            "[.d[] | parent]",
+        ] {
+            assert_walk_bridge_parity(doc, filter);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #2374 item 3: a table-driven parity test over the target-Partial-prefix
+// yq-gate family, landed here as part of #2416 phase 0.
+//
+// The pattern is `if S::TAG == EvalTag::Yq { discard } else { keep the
+// target's own already-produced prefix and fold it in }`, hand-copied at 8+
+// call sites across `eval.rs` and `eval_generic.rs` with no shared definition
+// and no test that the copies agree. It has already shipped wrong once:
+// `eval_generic::eval_slice_bound` had no yq gate at all until #2351 caught it
+// as a live bug.
+//
+// The table below enumerates the indexing-like constructs #2374 names and
+// pins every one against output captured live on 2026-09-05 from the pinned
+// oracles (/usr/bin/jq 1.7.1 and Homebrew yq v4.53.3) on this exact document.
+// A ninth construct added without the gate then fails one shared test instead
+// of shipping silently.
+//
+// `(.a, error("e"))` is the target: it produces one value and then raises, so
+// the whole family sees a `Partial`. jq streams the prefix and exits 5; yq
+// discards it and exits 1.
+// ---------------------------------------------------------------------------
+
+/// `(outputs of eval.rs, outputs of eval_generic.rs)` for one filter under `S`.
+///
+/// Kept separate rather than asserted equal inside the helper: the two
+/// path-context sites in this family are a *known* divergence, and a helper
+/// that collapsed the pair could not express it.
+fn both_evaluator_outputs<S: EvalSemantics>(
+    json: &[u8],
+    filter: &str,
+) -> (Vec<String>, Vec<String>) {
+    let index = JsonIndex::build(json);
+    let expr = parse(filter).expect("parse failed");
+
+    let full: QueryResult<Vec<u64>> = eval::<Vec<u64>, S>(&expr, index.root(json));
+    let full = full
+        .collect_owned()
+        .iter()
+        .map(succinctly::jq::OwnedValue::to_json)
+        .collect();
+
+    let generic = eval_generic::eval_with_cursor_using::<S, _>(&expr, index.root(json))
+        .collect_owned()
+        .expect("materializes")
+        .iter()
+        .map(succinctly::jq::OwnedValue::to_json)
+        .collect();
+
+    (full, generic)
+}
+
+/// The document every row below was captured against.
+const YQ_GATE_DOC: &[u8] = br#"{"a":{"b":1,"c":2},"d":[10,20]}"#;
+
+#[test]
+fn test_target_partial_prefix_yq_gate_family_2374() {
+    // (construct, filter, jq oracle outputs, yq oracle outputs)
+    //
+    // Every `yq` column is empty and that is the whole point: real yq drops
+    // the prefix the target already produced. A site that forgets the gate
+    // shows up here as a non-empty yq column.
+    let rows: &[(&str, &str, &[&str], &[&str])] = &[
+        ("index/field", r#"(.a, error("e")).b"#, &["1"], &[]),
+        ("index/dynamic", r#"(.a, error("e")) | .["b"]"#, &["1"], &[]),
+        ("index/number", r#"(.d, error("e"))[1]"#, &["20"], &[]),
+        (
+            "index/negative",
+            r#"(.d, error("e")) | .[-1]"#,
+            &["20"],
+            &[],
+        ),
+        ("slice/both", r#"(.d, error("e"))[0:1]"#, &["[10]"], &[]),
+        (
+            "slice/open-end",
+            r#"(.d, error("e")) | .[1:]"#,
+            &["[20]"],
+            &[],
+        ),
+        (
+            "slice/open-start",
+            r#"(.d, error("e")) | .[:1]"#,
+            &["[10]"],
+            &[],
+        ),
+        ("iterate", r#"(.a, error("e"))[]"#, &["1", "2"], &[]),
+        ("keys", r#"(.a, error("e")) | keys"#, &[r#"["b","c"]"#], &[]),
+        (
+            "keys_unsorted",
+            r#"(.a, error("e")) | keys_unsorted"#,
+            &[r#"["b","c"]"#],
+            &[],
+        ),
+        ("has", r#"(.a, error("e")) | has("b")"#, &["true"], &[]),
+        (
+            "to_entries",
+            r#"(.a, error("e")) | to_entries"#,
+            &[r#"[{"key":"b","value":1},{"key":"c","value":2}]"#],
+            &[],
+        ),
+        ("length", r#"(.a, error("e")) | length"#, &["2"], &[]),
+        ("del", r#"(.a, error("e")) | del(.b)"#, &[r#"{"c":2}"#], &[]),
+    ];
+
+    for (construct, filter, jq_expected, yq_expected) in rows {
+        for (mode, expected, (full, generic)) in [
+            (
+                "jq",
+                *jq_expected,
+                both_evaluator_outputs::<JqSemantics>(YQ_GATE_DOC, filter),
+            ),
+            (
+                "yq",
+                *yq_expected,
+                both_evaluator_outputs::<YqSemantics>(YQ_GATE_DOC, filter),
+            ),
+        ] {
+            assert_eq!(
+                full, expected,
+                "[{construct}] eval.rs disagrees with the {mode} oracle for `{filter}`"
+            );
+            assert_eq!(
+                generic, expected,
+                "[{construct}] eval_generic.rs disagrees with the {mode} oracle for `{filter}`"
+            );
+        }
+    }
+}
+
+/// The two path-context members of the same family — and they are missing the
+/// gate, which is exactly the recurrence #2374 predicted.
+///
+/// `eval_index_expr_with_path_context` and `eval_slice_expr_with_path_context`
+/// keep the target's already-produced prefix in yq mode, where their
+/// plain-read siblings (pinned as passing in the table above) discard it. Real
+/// yq emits nothing for every row here; succinctly emits the value.
+///
+/// Captured live on 2026-09-05 from yq v4.53.3. Pinned as a divergence rather
+/// than fixed: these are arms of `eval_stage_with_path_context`, the function
+/// #2416 exists to retire, so the fix belongs to the migration that deletes
+/// them — and #2416's own hygiene rule says a PR adding an arm there has to
+/// argue why it is not a migration.
+///
+/// jq mode has no oracle for these at all: jq 1.7.1 rejects `key`, `path` and
+/// `parent` at compile time (`key/0 is not defined`, exit 3), so they are
+/// succinctly extensions there and only yq mode can be checked.
+#[test]
+fn test_target_partial_prefix_path_context_sites_miss_the_yq_gate_2374() {
+    // (construct, filter, succinctly's current yq-mode output)
+    let rows: &[(&str, &str, &[&str])] = &[
+        (
+            "index/field + key",
+            r#"(.a, error("e")).b | key"#,
+            &[r#""b""#],
+        ),
+        (
+            "index/field + path",
+            r#"(.a, error("e")).b | path"#,
+            &[r#"["a","b"]"#],
+        ),
+        (
+            "index/field + parent",
+            r#"(.a, error("e")).b | parent"#,
+            &[r#"{"b":1,"c":2}"#],
+        ),
+        ("index/number + key", r#"(.d, error("e"))[0] | key"#, &["0"]),
+        (
+            "index/number + path",
+            r#"(.d, error("e"))[0] | path"#,
+            &[r#"["d",0]"#],
+        ),
+        (
+            "slice + path",
+            r#"(.d, error("e"))[0:1] | path"#,
+            &[r#"["d",{"start":0,"end":1}]"#],
+        ),
+    ];
+
+    // Real yq emits nothing for every row: the target's prefix is discarded
+    // before the index/slice ever runs.
+    let oracle: Vec<String> = Vec::new();
+
+    for (construct, filter, current) in rows {
+        let (full, generic) = both_evaluator_outputs::<YqSemantics>(YQ_GATE_DOC, filter);
+        assert_eq!(
+            full, *current,
+            "[{construct}] eval.rs moved for `{filter}` — if this is the #2416 \
+             migration landing, drop the row and add it to the passing table above"
+        );
+        assert_eq!(
+            generic, *current,
+            "[{construct}] eval_generic.rs moved for `{filter}`"
+        );
+        assert_ne!(
+            full, oracle,
+            "[{construct}] `{filter}` now matches real yq — nice; move the row \
+             into test_target_partial_prefix_yq_gate_family_2374"
+        );
     }
 }

@@ -3784,6 +3784,128 @@ fn takes_input_queue_bridge(expr: &Expr) -> bool {
         && !crate::jq::walk::uses_cursor_metadata_builtins(expr)
 }
 
+/// Which route a path-context pipe takes when `Expr::Pipe` finds a stage
+/// that `needs_path_context` (#2416 phase 0).
+///
+/// `try_path_context_cursor_walk` (#2061) answers `path`/`key`/`parent`/
+/// `file_index` straight from the cursors it walks; anything it does not
+/// model returns `None` and falls through to the **bridge**, which
+/// materializes the whole document with `to_owned_with_cursor` and hands it
+/// to `eval::eval_pipe_with_path_context`. The fallback is meant to be
+/// *output-identical*, which is precisely why nothing in the suite could see
+/// #2061's own lost optimization — patch coverage caught it instead.
+///
+/// #2416 migrates the eager evaluator's arms into the walk one at a time, so
+/// "walk and bridge agree" needs to become an assertion rather than an
+/// assumption. This enum is the axis that makes it testable:
+/// [`eval_with_cursor_using_route`] runs the same filter down the other
+/// route, and `tests/jq_evaluator_parity_tests.rs` compares the two.
+///
+/// `#[doc(hidden)]`: a test seam, not API. Production callers get
+/// [`WalkThenBridge`](PathContextRoute::WalkThenBridge), which is the default
+/// and the shipped behaviour.
+#[doc(hidden)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum PathContextRoute {
+    /// Try the cursor walk first, falling back to the materializing bridge
+    /// for any shape it does not model. The shipped behaviour.
+    #[default]
+    WalkThenBridge,
+    /// Skip the walk and go straight to the bridge.
+    ///
+    /// Always *correct* — the bridge is what every un-migrated arm already
+    /// reaches — but it costs an `OwnedValue` tree over the whole document,
+    /// which is the cost #2061 exists to remove. Test-only.
+    BridgeOnly,
+}
+
+/// Ambient [`PathContextRoute`] for the current thread.
+///
+/// Mirrors `eval.rs`'s own `ambient_frame_depth`/`remaining_inputs` shape (see
+/// their doc comments) rather than threading a parameter through every
+/// `eval_single`/`fold_pipe_stages` signature: the route is consulted at
+/// exactly one call site, several recursion levels below every public entry
+/// point, and this codebase has no environment parameter anywhere for it to
+/// ride on.
+///
+/// The read is one thread-local `Cell::get` per path-context pipe — a branch
+/// that already precedes an O(document) walk or an O(document) tree build, so
+/// it does not show up next to either. Nothing on the ordinary (no
+/// `needs_path_context` stage) path touches it at all.
+///
+/// `#[cfg(feature = "std")]` only, same rationale as its two siblings in
+/// `eval.rs`: a `no_std` embedding has no `thread_local!`. There the route is
+/// a compile-time constant and the gate folds away.
+#[cfg(feature = "std")]
+mod path_context_route {
+    use super::PathContextRoute;
+    use std::cell::Cell;
+
+    thread_local! {
+        static CURRENT: Cell<PathContextRoute> =
+            const { Cell::new(PathContextRoute::WalkThenBridge) };
+    }
+
+    pub(crate) fn get() -> PathContextRoute {
+        CURRENT.with(Cell::get)
+    }
+
+    /// Installs `route` for the caller's scope, restoring the previous value
+    /// on drop — so a call that has returned never leaks its route into a
+    /// sibling evaluation.
+    #[must_use]
+    pub(crate) struct Guard(PathContextRoute);
+
+    pub(crate) fn enter(route: PathContextRoute) -> Guard {
+        let previous = get();
+        CURRENT.with(|c| c.set(route));
+        Guard(previous)
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            CURRENT.with(|c| c.set(self.0));
+        }
+    }
+}
+
+#[cfg(not(feature = "std"))]
+mod path_context_route {
+    use super::PathContextRoute;
+
+    pub(crate) fn get() -> PathContextRoute {
+        PathContextRoute::WalkThenBridge
+    }
+
+    pub(crate) struct Guard;
+
+    pub(crate) fn enter(_route: PathContextRoute) -> Guard {
+        Guard
+    }
+}
+
+/// Evaluate against a cursor with an explicit [`PathContextRoute`] (#2416).
+///
+/// Identical to [`eval_with_cursor_using`] except that `route` decides whether
+/// a path-context pipe may take the #2061 cursor walk or must go through the
+/// materializing bridge. The route is scoped to this call and restored on
+/// return, including on an early return from a control.
+///
+/// `#[doc(hidden)]`: the walk-vs-bridge differential axis in
+/// `tests/jq_evaluator_parity_tests.rs` needs to drive both routes from
+/// outside the crate, and `try_path_context_cursor_walk` /
+/// `path_context_is_cursor_walkable` are private. This is the minimum surface
+/// that buys that, rather than exposing either of them.
+#[doc(hidden)]
+pub fn eval_with_cursor_using_route<S: EvalSemantics, C: DocumentCursor>(
+    expr: &Expr,
+    cursor: C,
+    route: PathContextRoute,
+) -> GenericResult<C::Value> {
+    let _guard = path_context_route::enter(route);
+    eval_with_cursor_using::<S, C>(expr, cursor)
+}
+
 /// Evaluate an expression against a cursor.
 ///
 /// This entry point preserves cursor position metadata, enabling
@@ -5535,9 +5657,17 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 // first. `.[0] | key` cost 519 MiB on a 20 MB array to
                 // answer `0`. Anything the walk does not model returns
                 // `None` and falls through to the bridge below, unchanged.
-                if let Some(root) = cursor {
-                    if let Some(result) = try_path_context_cursor_walk::<S, V>(exprs, root) {
-                        return result;
+                //
+                // #2416 phase 0: `PathContextRoute::BridgeOnly` skips the
+                // walk so the two routes can be diffed against each other
+                // (`tests/jq_evaluator_parity_tests.rs`). The bridge below is
+                // always correct, so the gate is one-directional: turning the
+                // walk off can lose an optimization, never an answer.
+                if path_context_route::get() == PathContextRoute::WalkThenBridge {
+                    if let Some(root) = cursor {
+                        if let Some(result) = try_path_context_cursor_walk::<S, V>(exprs, root) {
+                            return result;
+                        }
                     }
                 }
                 let owned = owned_or_suppress!(to_owned_with_cursor(&value, cursor), optional);
