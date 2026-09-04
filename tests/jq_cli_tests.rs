@@ -6861,26 +6861,29 @@ fn test_path_context_builtins_across_pipe_stages_554() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(output.trim(), r#"{"b":{"c":1}}"#);
 
-    // `parent` at the document root (empty `current_path`): the
-    // yq-compatible "return an empty object" default, not a navigation
-    // failure. A leading `.` forces this through an actual `Expr::Pipe`
-    // (matching every other case in this test) -- a *bare* `parent` with
-    // no pipe operator at all doesn't route through `eval_pipe`'s own
-    // `needs_path_context` check the same way, and so wouldn't reach the
-    // arm this test means to exercise.
+    // `parent` at the document root (empty `current_path`) emits nothing:
+    // real yq prints nothing there (#2421, captured live from v4.53.3 --
+    // the "return an empty object" default this test used to pin was never
+    // yq's behaviour), and the cursor walk follows it (#2416 phase 2). A
+    // leading `.` forces this through an actual `Expr::Pipe` (matching
+    // every other case in this test) -- a *bare* `parent` with no pipe
+    // operator at all doesn't route through `eval_pipe`'s own
+    // `needs_path_context` check the same way, and still answers `{}` from
+    // the eager evaluator: #2421's remaining half.
     let (output, _, code) = run_jq_full(&["-c", ". | parent"], Some("1"))?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), "{}");
+    assert_eq!(output.trim(), "");
 
     // `parent(n)` with `n` strictly greater than the current path's depth
     // (genuinely overshoots past the root, unlike `parent(2)` above which
-    // stays within the path).
+    // stays within the path) emits nothing, like `parent` at the root above
+    // (#2421: real yq prints nothing past the root).
     let (output, _, code) = run_jq_full(
         &["-c", ".a.b.c | parent(4)"],
         Some(r#"{"a":{"b":{"c":1}}}"#),
     )?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), "{}");
+    assert_eq!(output.trim(), "");
 
     Ok(())
 }
@@ -6911,10 +6914,14 @@ fn test_parent_n_agrees_with_chained_parent_at_root_boundary_1476() -> Result<()
     assert_eq!(n_form.trim(), r#"{"a":{"b":1}}"#);
 
     // The fresh-root reset after landing on the boundary still applies --
-    // `key` afterward is `null`, same as it is after a plain `parent`.
+    // `key` afterward is `key` at the root, which emits *nothing*: real yq
+    // prints nothing for `key` at the document root (#2421, captured live
+    // from v4.53.3), and the cursor walk follows it (#2416 phase 2). The
+    // eager evaluator's `null` -- the value this test used to pin -- is
+    // #2421's remaining half.
     let (output, _, code) = run_jq_full(&["-c", ".a | parent(1) | key"], Some(r#"{"a":1}"#))?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), "null");
+    assert_eq!(output.trim(), "");
 
     Ok(())
 }
