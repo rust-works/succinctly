@@ -29376,3 +29376,160 @@ fn test_plain_iterate_over_null_read_unaffected_by_2324() -> Result<()> {
 
     Ok(())
 }
+
+/// #2324 review, regression 1: a `remaining` (non-vivify-matched) sibling
+/// containing a negative index resolves against a *different* array length
+/// depending on whether it sits before or after a vivify-matched sibling in
+/// the comma group -- the pre-pass's own mutate-eagerly ordering ignored
+/// that, giving the same (wrong for one of the two orderings) answer either
+/// way. Confirmed live against yq v4.53.3: `del(.[-1], .[4][])` on `[1,2]`
+/// is `[1, null, null, []]`, but `del(.[4][], .[-1])` is `[1, 2, null,
+/// null]` -- genuinely different answers depending on textual order. The
+/// fix declines the whole pre-pass whenever any sibling contains a negative
+/// index anywhere (`contains_length_dependent_index`), falling through to
+/// the unmodified `resolve_del_path_branches` path, which raises "Cannot
+/// iterate over null" for both orderings here -- a coverage gap, not a
+/// wrong answer (this exact shape was never in #2324's own scope, which
+/// only ever paired a vivify-eligible branch with a *positive* fixed
+/// index).
+#[test]
+fn test_del_comma_fanout_negative_index_sibling_declines_prepass_2324() -> Result<()> {
+    let (_, stderr, code) =
+        run_yq_stdin_with_stderr("del(.[-1], .[4][])", "[1, 2]\n", &["-o=json"])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("Cannot iterate over null"),
+        "stderr={stderr}"
+    );
+
+    let (_, stderr, code) =
+        run_yq_stdin_with_stderr("del(.[4][], .[-1])", "[1, 2]\n", &["-o=json"])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("Cannot iterate over null"),
+        "stderr={stderr}"
+    );
+
+    Ok(())
+}
+
+/// #2324 review, regression 1 (second finder's repro): a negative index can
+/// also appear *inside* a sibling that itself matches
+/// `trailing_bare_iterate_prefix`'s own vivify shape (`.[-3][]` matches
+/// exactly like `.[5][]` does) -- so the order-safety guard has to scan
+/// every sibling up front, not just whichever ones end up in `remaining`
+/// after matching, since which bucket a negative-index sibling lands in is
+/// itself order-dependent. Confirmed live against yq v4.53.3:
+/// `del(.[-2][], .[5][])` on `[1,2]` is `[1, 2, null, null, null, []]`
+/// (`.[-2][]`, read against the *pristine* length-2 array, resolves to a
+/// real value and is silently dropped rather than vivifying), while
+/// `del(.[-2][], .[4][])` is `[1, 2, null, null, []]`. Both are declined by
+/// this pre-pass (raising "Cannot iterate over number" -- `.[-2]` reads a
+/// real, non-null value against the pristine array once the whole comma
+/// group falls through to the unmodified `resolve_del_path_branches`
+/// path), matching the same "coverage gap, not a wrong answer" contract as
+/// the simpler repro above.
+#[test]
+fn test_del_comma_fanout_negative_index_in_matched_shape_sibling_declines_prepass_2324(
+) -> Result<()> {
+    let (_, stderr, code) =
+        run_yq_stdin_with_stderr("del(.[-2][], .[5][])", "[1, 2]\n", &["-o=json"])?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("Cannot iterate"), "stderr={stderr}");
+
+    let (_, stderr, code) =
+        run_yq_stdin_with_stderr("del(.[-2][], .[4][])", "[1, 2]\n", &["-o=json"])?;
+    assert_ne!(code, 0);
+    assert!(stderr.contains("Cannot iterate"), "stderr={stderr}");
+
+    Ok(())
+}
+
+/// #2324 review, regression 1 control: a `del()` comma sibling carrying a
+/// negative *slice* bound (`.[-2:]`, no trailing `.[]`) rather than a
+/// negative index. This shape never actually reaches
+/// `vivify_del_comma_iterate_targets`'s own siblings at all -- the
+/// pre-existing #1223 `rewrite_yq_del_comma_branches`/`yq_del_slice_outcome`
+/// pass (which runs *before* the #2324 pre-pass in `builtin_del`) already
+/// intercepts and neutralizes every comma branch containing a slice
+/// component, trailing-iterate or not, ahead of it -- so
+/// `contains_length_dependent_index`'s own `Expr::Slice` arm is exercised
+/// directly by a unit test instead (`eval.rs`'s own `#[cfg(test)] mod
+/// tests`), not reachable here. This is pinned as an end-to-end control
+/// confirming the *existing*, already-correct #1223 pipeline still governs
+/// this shape unchanged by the #2324 pre-pass: confirmed live against yq
+/// v4.53.3 that `del(.[-2:], .[4][])` and its reversed sibling order both
+/// give `[1, 2, null, null, []]` -- `.[-2:]` (a bare trailing slice with no
+/// static prefix before it) is a documented #1223 no-op, and only `.[4][]`
+/// takes effect.
+#[test]
+fn test_del_comma_fanout_negative_slice_bound_sibling_2324() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(.[-2:], .[4][])", "[1, 2]\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[1,2,null,null,[]]");
+
+    let (out, code) = run_yq_stdin("del(.[4][], .[-2:])", "[1, 2]\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[1,2,null,null,[]]");
+
+    Ok(())
+}
+
+/// #2324 review, regression 2: the `?` on a comma-grouped vivify-eligible
+/// sibling's own trailing `.[]` was being silently discarded by the
+/// pre-pass, which always reconstructed a bare, unsuppressed `Expr::Iterate`
+/// and hardcoded `delete_at_path`'s own `optional` parameter to `false`
+/// regardless. For a *genuinely missing* key (not merely a `null`-valued
+/// one), the delete walk routes through `delete_at_path_through_absent`,
+/// which raises on a trailing `.[]` unless that `.[]`'s own `?` suppresses
+/// it -- so dropping the flag turned a real yq no-op into a wrongly-raised
+/// error. Confirmed live against yq v4.53.3: `{"x":1} | del(.missing[]?,
+/// .x)` is `{}`.
+#[test]
+fn test_del_comma_fanout_missing_key_iterate_optional_suppresses_2324() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(.missing[]?, .x)", "x: 1\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "{}");
+
+    Ok(())
+}
+
+/// #2324 review, regression 2 (nested repro): the same `?`-suppression fix,
+/// through a static `Field`/`Index` prefix deeper than one component
+/// (`.a[2][]?`). Confirmed live against yq v4.53.3: `{"b":1} |
+/// del(.a[2][]?, .b)` is `{}`.
+#[test]
+fn test_del_comma_fanout_missing_key_iterate_optional_suppresses_nested_2324() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(.a[2][]?, .b)", "b: 1\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "{}");
+
+    Ok(())
+}
+
+/// #2324 review, regression 2 control: the identical shape *without* the
+/// `?` on the trailing `.[]` must keep raising exactly as it did before
+/// this fix -- the fix threads the sibling's *own* `?` through, it does not
+/// change what happens when there isn't one. This control's own raise
+/// predates and is independent of this fix (it also fires for the
+/// non-comma-grouped single-target form, `del(.missing[])` alone, via the
+/// same `delete_at_path_through_absent` machinery) -- it is not itself
+/// verified against real yq here, since live-testing during review found
+/// real yq actually treats a *missing* key's trailing `.[]` as a silent
+/// no-op even without a `?` (`{"x":1} | yq 'del(.missing[], .x)'` is `{}`
+/// against yq v4.53.3), diverging from succinctly's existing, pre-#2324,
+/// single-target behaviour for the identical shape. That divergence is
+/// unrelated to the comma pre-pass this review covers and is out of scope
+/// here; this test only pins that this fix does not change it either way.
+#[test]
+fn test_del_comma_fanout_missing_key_iterate_no_optional_still_raises_2324() -> Result<()> {
+    let (out, stderr, code) =
+        run_yq_stdin_with_stderr("del(.missing[], .x)", "x: 1\n", &["-o=json"])?;
+    assert_ne!(code, 0, "out: {out:?}");
+    assert!(
+        stderr.contains("Cannot iterate over null"),
+        "stderr={stderr}"
+    );
+
+    Ok(())
+}

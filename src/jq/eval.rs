@@ -37620,9 +37620,22 @@ fn peek_static_prefix<'a>(
 /// -- is shaped as a static `Field`/`Index` prefix (no computed key, no
 /// slice, no nested iterate) followed by a bare, optionally `?`-suppressed,
 /// *trailing* `.[]`. Returns the prefix's own flattened components (may be
-/// empty, for a bare `.[]`/`.[]?` branch) when it is; `None` for every other
-/// shape, which [`vivify_del_comma_iterate_targets`] then leaves completely
+/// empty, for a bare `.[]`/`.[]?` branch) alongside whether the trailing
+/// `.[]` itself carried a `?` when it is; `None` for every other shape,
+/// which [`vivify_del_comma_iterate_targets`] then leaves completely
 /// untouched.
+///
+/// The returned `bool` matters for real correctness, not just style: a
+/// missing (not merely `null`-valued) object key routes
+/// `vivify_del_comma_iterate_targets`'s own `delete_at_path` call through
+/// [`delete_at_path_through_absent`], which -- unlike a genuinely-`null`
+/// value reached via a real lookup -- forces the rest of the chain into
+/// non-real-slot mode, and a trailing `.[]` there raises unless *its own*
+/// `?` suppresses it (`delete_at_path`'s `Expr::Iterate` arm's `_ if
+/// optional`). Dropping this flag on the floor (an earlier version of this
+/// fix always reconstructed a bare, unsuppressed `Iterate`) turned a real
+/// yq no-op into a wrongly-raised error -- confirmed live (yq v4.53.3):
+/// `{"x":1} | del(.missing[]?, .x)` is `{}`, not an error.
 ///
 /// `push_path_components` (already used by `resolve_seq` for the identical
 /// job) does the flattening -- including splicing a `Paren`/nested `Pipe`
@@ -37632,20 +37645,20 @@ fn peek_static_prefix<'a>(
 /// computed one becomes `Expr::IndexExpr` instead, a different variant this
 /// prefix filter already excludes), so there is no "looks static but isn't"
 /// case to worry about here.
-fn trailing_bare_iterate_prefix(sibling: &Expr) -> Option<Vec<Expr>> {
+fn trailing_bare_iterate_prefix(sibling: &Expr) -> Option<(Vec<Expr>, bool)> {
     let mut flat = Vec::new();
     push_path_components(&mut flat, sibling);
     let last = flat.last()?;
-    let is_trailing_iterate = matches!(last, Expr::Iterate)
-        || matches!(last, Expr::Optional(inner) if matches!(inner.as_ref(), Expr::Iterate));
-    if !is_trailing_iterate {
-        return None;
-    }
+    let trailing_optional = match last {
+        Expr::Iterate => false,
+        Expr::Optional(inner) if matches!(inner.as_ref(), Expr::Iterate) => true,
+        _ => return None,
+    };
     let prefix = &flat[..flat.len() - 1];
     prefix
         .iter()
         .all(|e| matches!(e, Expr::Field(_) | Expr::Index { .. }))
-        .then(|| prefix.to_vec())
+        .then(|| (prefix.to_vec(), trailing_optional))
 }
 
 /// #2324's own pre-pass: peel off every top-level `del()` comma branch shaped
@@ -37679,15 +37692,40 @@ fn trailing_bare_iterate_prefix(sibling: &Expr) -> Option<Vec<Expr>> {
 /// offending branch off the comma group and run it through the very same
 /// `delete_at_path` a single-target `del()` call already uses, *before*
 /// `resolve_del_path_branches` ever sees the rest. That ordering matches
-/// real yq's own observed behaviour -- every vivify-eligible branch resolves
-/// against the pristine input, in any relative order, ahead of any sibling's
-/// own structural deletion (an index removal that shifts the array).
-/// Confirmed live against yq v4.53.3: `del(.[5][], .[0])` and
-/// `del(.[0], .[5][])` on `[1,2]` both give `[2, null, null, null, []]` --
-/// same result regardless of which comma position `.[5][]` occupies, and
-/// `del(.[5][], .[2][])`/`del(.[2][], .[5][])` likewise agree
-/// (`[1, 2, [], null, null, []]`) even with two such branches sharing
-/// overlapping padding.
+/// real yq's own observed behaviour **when no sibling's own resolution can
+/// depend on another sibling's array-extending side effect** -- every
+/// vivify-eligible branch resolves against the pristine input, ahead of any
+/// sibling's own structural deletion (an index removal that shifts the
+/// array), and, among themselves, in any relative order. Confirmed live
+/// against yq v4.53.3: `del(.[5][], .[0])` and `del(.[0], .[5][])` on
+/// `[1,2]` both give `[2, null, null, null, []]` -- same result regardless
+/// of which comma position `.[5][]` occupies, and `del(.[5][],
+/// .[2][])`/`del(.[2][], .[5][])` likewise agree (`[1, 2, [], null, null,
+/// []]`) even with two such branches sharing overlapping padding.
+///
+/// That "any relative order" guarantee stops holding the moment *any*
+/// sibling in the group -- matched or not -- carries a negative array index,
+/// a negative slice bound, or a computed key/slice: its resolved value can
+/// itself depend on the document's length at the moment it is evaluated,
+/// which is exactly what textual order controls. Confirmed live (yq
+/// v4.53.3) both as silent wrong-answer risk and as genuine order-dependence
+/// in real yq itself: `del(.[-1], .[4][])` on `[1,2]` is `[1, null, null,
+/// []]`, but `del(.[4][], .[-1])` is `[1, 2, null, null]` -- and
+/// `del(.[-2][], .[5][])`/`del(.[-2][], .[4][])` (a negative index inside a
+/// *matched*-shaped sibling, not just a `remaining` one) diverge from this
+/// pre-pass's own order-blind answer too. [`contains_length_dependent_index`]
+/// is this function's guard against exactly that: any sibling containing one
+/// of those shapes anywhere makes the *whole* pre-pass decline (`Ok(None)`),
+/// falling through entirely to the unmodified `resolve_del_path_branches`
+/// path below -- the same fallback every other unrecognized shape already
+/// gets, and the one this function used unconditionally before this guard
+/// existed. That sacrifices this pre-pass's own coverage for the
+/// negative-index-mixed-with-vivify corner case (never in #2324's own scope
+/// to begin with -- its repros only ever paired a vivify-eligible branch
+/// with a *positive* fixed index like `.[0]`), but never produces a silently
+/// wrong answer: the fallback still raises the same "Cannot iterate over
+/// null" (or a genuine "index out of range") this whole pre-pass exists to
+/// avoid for the shapes it *does* handle.
 ///
 /// A branch this doesn't recognize (a computed key, a slice, a mid-chain
 /// iterate, `Field`/`Index` on a value that isn't currently `null`) is left
@@ -37732,12 +37770,28 @@ fn vivify_del_comma_iterate_targets(
     let Expr::Comma(siblings) = unwrapped else {
         return Ok(None);
     };
+    // Order-safety guard (review of #2324, both regressions confirmed live
+    // against yq v4.53.3) -- see this function's own doc comment for the
+    // repros. Checked over *every* sibling, before any matching or mutation:
+    // a negative index (or anything that could resolve to one) can appear
+    // inside a `trailing_bare_iterate_prefix`-*matched* sibling's own prefix
+    // just as easily as inside a `remaining` one -- `.[-3][]` matches that
+    // shape exactly like `.[5][]` does -- and whichever bucket it lands in
+    // depends on this loop's own progressive mutation, which is precisely
+    // the ambiguity that makes the result order-dependent. Bailing here,
+    // before any sibling has been matched or `result` touched, is what lets
+    // this be a whole-call decline rather than a partial, still-ambiguous
+    // one.
+    if siblings.iter().any(contains_length_dependent_index) {
+        return Ok(None);
+    }
     let mut remaining = vec_with_capacity(siblings.len());
     let mut handled_any = false;
     for sibling in siblings {
-        let prefix = trailing_bare_iterate_prefix(sibling)
-            .filter(|prefix| matches!(peek_static_prefix(result, prefix), Ok(OwnedValue::Null)));
-        let Some(prefix) = prefix else {
+        let prefix = trailing_bare_iterate_prefix(sibling).filter(|(prefix, _)| {
+            matches!(peek_static_prefix(result, prefix), Ok(OwnedValue::Null))
+        });
+        let Some((prefix, trailing_optional)) = prefix else {
             remaining.push(sibling.clone());
             continue;
         };
@@ -37749,9 +37803,45 @@ fn vivify_del_comma_iterate_targets(
         } else {
             Expr::Pipe(components)
         };
-        delete_at_path(result, &branch_expr, false, true, true)?;
+        delete_at_path(result, &branch_expr, trailing_optional, true, true)?;
     }
     Ok(handled_any.then_some(remaining))
+}
+
+/// Whether `expr` contains, anywhere within it -- through any nesting of
+/// `Pipe`/`Comma`/`Paren`/`Optional` -- an array-position component whose
+/// resolution can depend on the length of the array it indexes into at the
+/// moment it is evaluated: a literal negative [`Expr::Index`], a
+/// [`Expr::Slice`] with a negative bound, or a computed
+/// [`Expr::IndexExpr`]/[`Expr::SliceExpr`] key (whose resolved value can't
+/// be proven non-negative statically, so it's treated the same way). Used
+/// by [`vivify_del_comma_iterate_targets`]'s own up-front guard -- see that
+/// function's doc comment for why *any* sibling carrying one of these, not
+/// just a `remaining` (non-vivify-matched) one, forces the whole pre-pass to
+/// decline.
+///
+/// Deliberately scoped to the same path-expression grammar
+/// `push_path_components` already flattens (`Pipe`/`Paren`/`Optional`), plus
+/// `Comma` for a nested group (`del((.a[-1], .b), .c)`) -- a `del()` target
+/// built from a more exotic filter (`if`/`reduce`/a function call) is out of
+/// scope for this guard the same way it already was for
+/// `trailing_bare_iterate_prefix`'s own shape match, which never matches
+/// such a sibling as a vivify candidate in the first place. Not finding a
+/// negative index inside one of those doesn't matter either way: whatever
+/// non-path-shaped expression it evaluates to goes through the ordinary
+/// `resolve_del_path_branches` path exactly as it always has, guard or no
+/// guard.
+fn contains_length_dependent_index(expr: &Expr) -> bool {
+    match expr {
+        Expr::Index { idx, .. } => *idx < 0,
+        Expr::Slice { start, end, .. } => {
+            start.is_some_and(|s| s < 0) || end.is_some_and(|e| e < 0)
+        }
+        Expr::IndexExpr { .. } | Expr::SliceExpr { .. } => true,
+        Expr::Pipe(exprs) | Expr::Comma(exprs) => exprs.iter().any(contains_length_dependent_index),
+        Expr::Paren(inner) | Expr::Optional(inner) => contains_length_dependent_index(inner),
+        _ => false,
+    }
 }
 
 /// Builtin: del(path) - delete a single path
@@ -75630,6 +75720,52 @@ mod tests {
             .map(OwnedValue::to_json)
             .collect();
         assert_eq!(rendered, vec![r#"{"a":1}"#.to_string()]);
+    }
+
+    #[test]
+    fn contains_length_dependent_index_flags_negative_index_anywhere_2324() {
+        // #2324 review, regression 1: a top-level negative `Expr::Index`.
+        assert!(contains_length_dependent_index(&parse(".[-1]").unwrap()));
+        // A positive index is never length-dependent -- must not false-positive.
+        assert!(!contains_length_dependent_index(&parse(".[1]").unwrap()));
+        // Mid-chain, not just the last component (`.a[-1].b`).
+        assert!(contains_length_dependent_index(&parse(".a[-1].b").unwrap()));
+        // Through a nested `Paren`/`Optional`.
+        assert!(contains_length_dependent_index(&parse("(.[-1])?").unwrap()));
+        // Through a nested `Comma` (`del((.a[-1], .b), .c)`'s inner group).
+        assert!(contains_length_dependent_index(
+            &parse("(.a[-1], .b)").unwrap()
+        ));
+        // A negative slice bound, start or end, is length-dependent too.
+        assert!(contains_length_dependent_index(&parse(".[-2:]").unwrap()));
+        assert!(contains_length_dependent_index(&parse(".[:-2]").unwrap()));
+        // A positive-only slice is not.
+        assert!(!contains_length_dependent_index(&parse(".[1:2]").unwrap()));
+        // A computed key/slice can't be proven non-negative statically, so
+        // it's conservatively flagged too.
+        assert!(contains_length_dependent_index(&parse(".[.a]").unwrap()));
+        assert!(contains_length_dependent_index(&parse(".[.a:2]").unwrap()));
+        // A plain field/iterate chain with none of the above is unaffected.
+        assert!(!contains_length_dependent_index(&parse(".a.b[]").unwrap()));
+    }
+
+    #[test]
+    fn trailing_bare_iterate_prefix_threads_optional_flag_2324() {
+        // #2324 review, regression 2: the trailing `.[]`'s own `?` must be
+        // reported back, not silently discarded -- `vivify_del_comma_iterate_targets`
+        // threads it into `delete_at_path`'s `optional` parameter.
+        let (prefix, optional) = trailing_bare_iterate_prefix(&parse(".a[]?").unwrap())
+            .expect("should match trailing-iterate shape");
+        assert_eq!(prefix, vec![Expr::Field("a".to_string())]);
+        assert!(optional, "the `?` on the trailing `.[]` must be reported");
+
+        let (prefix, optional) = trailing_bare_iterate_prefix(&parse(".a[]").unwrap())
+            .expect("should match trailing-iterate shape");
+        assert_eq!(prefix, vec![Expr::Field("a".to_string())]);
+        assert!(!optional, "no `?` was written, so this must be false");
+
+        // A non-trailing-iterate shape still doesn't match at all.
+        assert!(trailing_bare_iterate_prefix(&parse(".a").unwrap()).is_none());
     }
 
     #[test]
