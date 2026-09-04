@@ -61,7 +61,7 @@ use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use super::walk::map_builtin_subexprs;
+use super::walk::{builtin_kids, map_builtin_subexprs, BuiltinKids};
 use super::{Expr, ObjectKey, StringPart};
 
 /// A call this pass could not resolve to any in-scope `def`, parameter or
@@ -384,6 +384,79 @@ fn in_scope(scope: &Scope, name: &str, arity: usize) -> bool {
     scope.iter().rev().any(|(n, a)| *a == arity && n == name)
 }
 
+/// #2036: the arity `fallback` -- a successfully-parsed builtin or
+/// fixed-arity special form stashed on `Expr::FuncCall::builtin_fallback` --
+/// represents. Read-only: never clones or allocates, so computing it to
+/// decide `in_scope` costs nothing beyond the match itself, regardless of
+/// how large `fallback`'s own children are.
+fn builtin_fallback_arity(fallback: &Expr) -> usize {
+    match fallback {
+        Expr::Not => 0,
+        Expr::Limit { .. } | Expr::Until { .. } | Expr::While { .. } => 2,
+        Expr::Repeat(_) | Expr::FirstExpr(_) | Expr::LastExpr(_) => 1,
+        Expr::Range { to, step, .. } => 1 + usize::from(to.is_some()) + usize::from(step.is_some()),
+        Expr::Error(msg) => usize::from(msg.is_some()),
+        Expr::Builtin(builtin) => match builtin_kids(builtin) {
+            BuiltinKids::None => 0,
+            BuiltinKids::One(_) => 1,
+            BuiltinKids::Two(_, _) => 2,
+            BuiltinKids::Three(_, _, _) => 3,
+        },
+        // Unreachable in practice -- `wrap_shadowable_call`'s only two
+        // callers only ever hand it one of the shapes above.
+        _ => 0,
+    }
+}
+
+/// #2036: moves `fallback`'s own sub-expressions out as the argument list a
+/// generic `NAME(args;args)` call over the same source span would have
+/// produced -- called only once [`check`] has determined the call is
+/// genuinely shadowed by an in-scope `def`. Takes `fallback` *by value* and
+/// moves its children rather than cloning them: `fallback` is discarded
+/// immediately after this returns (the caller already took it out of
+/// `builtin_fallback` via `Option::take`), so there is nothing left that
+/// would need its own independent copy -- cloning here, even though it
+/// would only run once per confirmed-shadowed node rather than compounding
+/// across every declined one, could still duplicate an arbitrarily large
+/// not-yet-resolved subtree sitting in one of `fallback`'s own arguments.
+fn builtin_fallback_into_args(fallback: Expr) -> Vec<Expr> {
+    match fallback {
+        Expr::Not => Vec::new(),
+        Expr::Limit { n, expr } => alloc::vec![*n, *expr],
+        Expr::Until { cond, update } | Expr::While { cond, update } => {
+            alloc::vec![*cond, *update]
+        }
+        Expr::Repeat(inner) | Expr::FirstExpr(inner) | Expr::LastExpr(inner) => {
+            alloc::vec![*inner]
+        }
+        Expr::Range { from, to, step } => {
+            let mut args = alloc::vec![*from];
+            args.extend(to.map(|b| *b));
+            args.extend(step.map(|b| *b));
+            args
+        }
+        Expr::Error(msg) => msg.into_iter().map(|b| *b).collect(),
+        // `builtin_kids` only ever borrows -- there is no by-value
+        // counterpart, so this one case clones rather than moves. Bounded
+        // even so: it can only fire once per node that check() has just
+        // confirmed is genuinely shadowed, immediately followed by
+        // recursing into (and thereby resolving/shrinking) each cloned
+        // child -- it does not compound across the *declined* case above
+        // (`*expr = *fallback`, always a pure move), which is the shape
+        // nested-but-not-actually-shadowed candidates take and the one
+        // this issue's own review found exponential before this fix.
+        Expr::Builtin(builtin) => match builtin_kids(&builtin) {
+            BuiltinKids::None => Vec::new(),
+            BuiltinKids::One(a) => alloc::vec![a.clone()],
+            BuiltinKids::Two(a, b) => alloc::vec![a.clone(), b.clone()],
+            BuiltinKids::Three(a, b, c) => alloc::vec![a.clone(), b.clone(), c.clone()],
+        },
+        // Unreachable in practice -- see `builtin_fallback_arity`'s own
+        // identical fallback arm, which this must stay consistent with.
+        _ => Vec::new(),
+    }
+}
+
 /// Recurse into `expr` under `scope`, restoring `scope` before returning so a
 /// sibling never sees a binding introduced by its neighbour. Appends every
 /// unresolvable call to `errors` rather than stopping at the first, matching
@@ -403,15 +476,17 @@ fn check(expr: &mut Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
         // unresolved call, and they are checked in the scope this node sits
         // in. The definition's own body was checked at its `FuncDef`.
         //
-        // `Shared` wraps an `Rc`, which this pass cannot get a unique `&mut`
-        // through if any other owner is alive -- harmless here since the
-        // variant is unreachable in practice (see above); `Rc::get_mut`
-        // silently skips recursion rather than panicking on the
-        // (never-hit) multi-owner case.
+        // `Shared` wraps an `Rc`. `resolve_func_calls`/`Expr::Shared` are
+        // both public API, so an external caller can hand this a multi-owner
+        // `Rc` even though this crate's own 3 CLI call sites never do (see
+        // above) -- `Rc::make_mut` (clone-on-write if not uniquely owned,
+        // unlike `Rc::get_mut`'s silent "return None, skip this subtree
+        // entirely" on the same case) keeps recursion unconditional exactly
+        // like the pre-`&mut Expr` version of this arm did, at the cost of
+        // one clone in the (self-inflicted, still never hit by this crate's
+        // own callers) multi-owner case.
         Expr::Shared(inner) => {
-            if let Some(inner) = Rc::get_mut(inner) {
-                check(inner, scope, errors);
-            }
+            check(Rc::make_mut(inner), scope, errors);
         }
         Expr::DefCall { args, .. } => {
             for arg in args.iter_mut() {
@@ -620,46 +695,62 @@ fn check(expr: &mut Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
         // builtin or special form the parser would have produced had the
         // name never been shadowable -- attached only when the lexical
         // prescan flagged `name` as possibly `def`'d somewhere in the
-        // program (see `Expr::FuncCall`'s own doc comment). Real shadowing
-        // (`in_scope`) is checked *first* and wins outright: a `def` at
-        // this exact `(name, arity)` always shadows the builtin, matching
-        // real jq. Only once that fails does the fallback matter -- and
-        // only then, because it exists precisely to answer "what if this
-        // name turns out not to be shadowed after all," the same question
-        // `is_jq_builtin`/the error arm below already answer for a call
-        // that was never eligible for a fallback in the first place.
-        // Whichever way it resolves, `builtin_fallback` is always `None`
-        // by the time this function returns for this node -- either
-        // dropped here (shadowing confirmed) or moved out and substituted
-        // (shadowing declined) -- so no other pass over the tree, before
-        // or after this one runs to completion, ever needs to know it
-        // exists.
+        // program (see `Expr::FuncCall`'s own doc comment). `args` starts
+        // out *empty* whenever `builtin_fallback` is `Some` (the parser
+        // deliberately does not clone the fallback's own children into it
+        // -- see `wrap_shadowable_call`'s own doc comment for why that
+        // duplication made nested shadow candidates an `O(2^depth)`
+        // parser-level denial-of-service), so the arity to check scope
+        // against has to come from the fallback's own shape
+        // (`builtin_fallback_arity`) whenever `args` is still empty, not
+        // from `args.len()` directly.
+        //
+        // Real shadowing (`in_scope`) is checked *first* and wins outright:
+        // a `def` at this exact `(name, arity)` always shadows the
+        // builtin, matching real jq. Only then is `args` actually
+        // populated -- moved out of `fallback` (`builtin_fallback_into_args`),
+        // not cloned, since `fallback` is discarded immediately after and
+        // there is nothing left needing its own copy. If shadowing is
+        // declined instead, the *whole* fallback is moved back into `expr`
+        // in one piece -- again no cloning -- and re-checked so its own
+        // nested children get the identical treatment. Whichever way it
+        // resolves, `builtin_fallback` is always `None` and `args` always
+        // populated by the time this function returns for this node -- so
+        // no other pass over the tree, before or after this one runs to
+        // completion, ever needs to know `builtin_fallback` exists, or
+        // sees a node whose `args` is emptily lying about its real arity.
         Expr::FuncCall {
             name,
             args,
             builtin_fallback,
         } => {
-            if in_scope(scope, name, args.len()) {
+            let arity = if args.is_empty() {
+                builtin_fallback
+                    .as_deref()
+                    .map_or(0, builtin_fallback_arity)
+            } else {
+                args.len()
+            };
+            if in_scope(scope, name, arity) {
+                if let Some(fallback) = builtin_fallback.take() {
+                    *args = builtin_fallback_into_args(*fallback);
+                }
                 for a in args.iter_mut() {
                     check(a, scope, errors);
                 }
-                *builtin_fallback = None;
             } else if let Some(fallback) = builtin_fallback.take() {
-                // Not shadowed after all -- restore the original parse.
-                // Its arity always matches this call site's own (the
-                // parser attaches a fallback only by re-parsing the exact
-                // same source span the fallback itself came from), so this
-                // substitution can never silently discard a real argument.
+                // Not shadowed after all -- restore the original parse in
+                // one move, no cloning.
                 *expr = *fallback;
                 check(expr, scope, errors);
-            } else if is_jq_builtin(name, args.len()) {
+            } else if is_jq_builtin(name, arity) {
                 for a in args.iter_mut() {
                     check(a, scope, errors);
                 }
             } else {
                 errors.push(UnresolvedCall {
                     name: name.clone(),
-                    arity: args.len(),
+                    arity,
                 });
             }
         }

@@ -250,12 +250,23 @@ struct Parser<'a> {
     /// scope-aware check is what actually decides, for each call site,
     /// whether the name is genuinely in scope there. Consulted only at the
     /// keyword choke points that can produce a shadowable builtin/special
-    /// form (see [`Self::maybe_shadow_builtin`] and
+    /// form (see [`Self::parse_shadowable_special_form`] and
     /// [`Self::zero_arity_or_wrong_arity_call`]) -- a program with no
     /// `def`s anywhere pays for one scan of its own source text and
     /// nothing else.
     shadowable_defs: BTreeSet<String>,
+    /// #2036: bounds the total number of times
+    /// [`Self::retry_shadow_candidate_as_generic_call`]'s own fallback
+    /// reparse can fire across this whole parse, so a deeply nested,
+    /// arity-mismatched shadow candidate degrades to "stops shadowing past
+    /// this depth" instead of the `O(2^depth)` blowup that function's own
+    /// doc comment describes. An ordinary, non-adversarial program never
+    /// comes close to this; the exact constant is not load-bearing.
+    shadow_retry_budget: usize,
 }
+
+/// See [`Parser::shadow_retry_budget`].
+const SHADOW_RETRY_BUDGET: usize = 64;
 
 impl<'a> Parser<'a> {
     #[allow(dead_code)] // STYLE-0005: kept for tests and future use
@@ -268,6 +279,7 @@ impl<'a> Parser<'a> {
             pattern_depth: 0,
             expr_depth: 0,
             shadowable_defs: collect_def_names(input),
+            shadow_retry_budget: SHADOW_RETRY_BUDGET,
         }
     }
 
@@ -280,6 +292,7 @@ impl<'a> Parser<'a> {
             pattern_depth: 0,
             expr_depth: 0,
             shadowable_defs: collect_def_names(input),
+            shadow_retry_budget: SHADOW_RETRY_BUDGET,
         }
     }
 
@@ -1643,14 +1656,24 @@ impl<'a> Parser<'a> {
                         // not propagated -- see
                         // `retry_shadow_candidate_as_generic_call`'s own
                         // doc comment for the empty-parens and
-                        // retry-budget safeguards this needs (and for why
-                        // it applies the same jq-mode-only postfix fix as
-                        // the `Ok(None)` arm just above). A non-candidate
-                        // name keeps today's behavior exactly: the parse
-                        // error propagates unchanged.
+                        // retry-budget safeguards this needs. A
+                        // non-candidate name keeps today's behavior
+                        // exactly: the parse error propagates unchanged.
+                        //
+                        // Postfix applied here (jq mode only), matching the
+                        // `Ok(None)` arm's own #2237 fix just above -- this
+                        // is the identical "ends up an ordinary generic
+                        // call" shape, just reached via a failed builtin
+                        // attempt instead of never matching one at all.
                         Err(e) => {
                             if shadow_candidate {
-                                self.retry_shadow_candidate_as_generic_call(keyword_start, e)
+                                let call =
+                                    self.retry_shadow_candidate_as_generic_call(keyword_start, e)?;
+                                if self.mode == ParserMode::Jq {
+                                    self.parse_postfix(call)
+                                } else {
+                                    Ok(call)
+                                }
                             } else {
                                 Err(e)
                             }
@@ -2746,7 +2769,7 @@ impl<'a> Parser<'a> {
         self.pos = after_keyword;
         if let Some(name) = shadow_name {
             if self.shadowable_defs.contains(name) {
-                let wrapped = self.rewind_reparse_as_shadowable_call(start_pos, parsed)?;
+                let wrapped = Self::wrap_shadowable_call(name, parsed);
                 return self.parse_postfix(wrapped);
             }
         }
@@ -2837,47 +2860,109 @@ impl<'a> Parser<'a> {
             return parse_original(self);
         }
         match parse_original(self) {
-            Ok(original) => self.rewind_reparse_as_shadowable_call(start_pos, original),
-            Err(_) => {
-                self.pos = start_pos;
-                self.parse_func_call_or_error()
-            }
+            Ok(original) => Ok(Self::wrap_shadowable_call(name, original)),
+            Err(e) => self.retry_shadow_candidate_as_generic_call(start_pos, e),
         }
     }
 
-    /// #2036 Direction 3: rewind to `start_pos` (before the keyword began)
-    /// and re-parse the same source span as an ordinary `NAME(args;args)`
-    /// call, stashing `original` -- whatever the keyword's own dedicated
-    /// parse produced for that identical span -- as the new node's
-    /// `builtin_fallback`. [`super::resolve::check`] is the sole consumer:
-    /// once it knows whether this exact `(name, arity)` is genuinely a
-    /// `def` in scope at this position, it either keeps the call (real
-    /// shadowing) or substitutes `original` back in (not shadowed after
-    /// all). Shared by every call site that can produce a shadowable
-    /// builtin or fixed-arity special form; see
-    /// [`Self::zero_arity_or_wrong_arity_call`]'s own doc comment for why
-    /// it alone additionally gates this behind `shadow_name`.
-    fn rewind_reparse_as_shadowable_call(
+    /// #2036: shared by every arity-mismatch recovery path (the special
+    /// forms above, and [`Self::try_parse_builtin`]'s own call site) --
+    /// `original_err` is whatever the keyword's own dedicated parser failed
+    /// with. Two safeguards found and fixed during this fix's own review,
+    /// both live-verified against real jq:
+    ///
+    /// - **A genuinely empty `NAME()`** must stay a syntax error, not
+    ///   silently become a valid zero-arg call: [`Self::parse_func_call_or_error`]'s
+    ///   own empty-arg-list leniency exists for the ordinary "just call
+    ///   `foo`" case, not this one -- confirmed live, `def not: 1; not()`
+    ///   parsed as `1` (exit 0) here before this check, where real jq
+    ///   raises `syntax error, unexpected ')'` (exit 3) for *every* name,
+    ///   shadowed or not (matching #2110's own established empty-parens
+    ///   rejection for the non-shadow-candidate case). Detected by peeking
+    ///   for `(` immediately followed by `)` at `start_pos` -- if so,
+    ///   `original_err` (whatever the specialized parser's own failure was,
+    ///   typically an "expected expression" complaint from trying to parse
+    ///   nothing) is propagated instead of attempting the fallback at all.
+    /// - **A bounded retry budget**: unlike the successful-parse path
+    ///   ([`Self::wrap_shadowable_call`]), there is no already-built AST to
+    ///   derive arguments from when the specialized parser fails -- the
+    ///   fallback genuinely has to re-parse `input[start_pos..]` from
+    ///   scratch. If every level of a deeply nested, *arity-mismatched*
+    ///   shadow candidate (`def until(a;b;c): ...` nested inside itself)
+    ///   also fails its own specialized parse, each level's fallback
+    ///   reparse walks every nested level again, compounding into the same
+    ///   `O(2^depth)` blowup [`Self::wrap_shadowable_call`]'s own doc
+    ///   comment describes for the (now-fixed) successful-parse case --
+    ///   confirmed live as a real, if far more contrived, second instance
+    ///   of the same denial-of-service shape. `shadow_retry_budget`
+    ///   (initialized once per `Parser`, decremented every time this
+    ///   fallback is actually attempted) bounds the *total* number of such
+    ///   reparses across the whole program to a small constant, keeping the
+    ///   worst case linear instead of exponential -- past the budget,
+    ///   `original_err` is propagated instead, the same as if `name` had
+    ///   never been a shadow candidate at all. Ordinary, non-adversarial
+    ///   programs never come close to exhausting it.
+    fn retry_shadow_candidate_as_generic_call(
         &mut self,
         start_pos: usize,
-        original: Expr,
+        original_err: ParseError,
     ) -> Result<Expr, ParseError> {
+        if self.peek_after_keyword_at_is_empty_parens(start_pos) {
+            return Err(original_err);
+        }
+        let Some(remaining) = self.shadow_retry_budget.checked_sub(1) else {
+            return Err(original_err);
+        };
+        self.shadow_retry_budget = remaining;
         self.pos = start_pos;
-        let call = self.parse_func_call_or_error()?;
-        Ok(match call {
-            Expr::FuncCall { name, args, .. } => Expr::FuncCall {
-                name,
-                args,
-                builtin_fallback: Some(Box::new(original)),
-            },
-            // `parse_func_call_or_error` can also return a namespaced call
-            // (`NAME::rest`) if the rewound identifier happens to be
-            // followed by `::` -- vanishingly unlikely for a real builtin
-            // name, and there is no `FuncCall` to attach a fallback to in
-            // that shape anyway, so it is returned as-is rather than
-            // forced into one.
-            other => other,
-        })
+        self.parse_func_call_or_error()
+    }
+
+    /// Whether `input[pos..]` is `IDENT` immediately followed by `(` then
+    /// `)` with nothing but whitespace between -- a genuinely empty
+    /// argument list, as opposed to `(` followed by a real (if malformed)
+    /// expression. `pos` must be the position *before* the identifier.
+    fn peek_after_keyword_at_is_empty_parens(&self, pos: usize) -> bool {
+        let after_ident = pos + self.ident_text_at(pos).len();
+        let rest = self.input[after_ident..].trim_start();
+        let Some(rest) = rest.strip_prefix('(') else {
+            return false;
+        };
+        rest.trim_start().starts_with(')')
+    }
+
+    /// #2036 Direction 3: wrap a *successfully*-parsed `original` -- the
+    /// keyword's own dedicated parse -- as `Expr::FuncCall { name, args:
+    /// vec![], builtin_fallback: Some(original) }`. [`super::resolve::check`]
+    /// is the sole consumer: once it knows whether this exact `(name,
+    /// arity)` is genuinely a `def` in scope at this position, it either
+    /// populates `args` for real (moved out of `original`, not cloned --
+    /// see `resolve.rs`'s own `builtin_fallback_into_args`) for a real
+    /// shadowing call, or substitutes `original` back into the node whole
+    /// (not shadowed after all).
+    ///
+    /// **`args` deliberately starts empty here, not populated from
+    /// `original`'s own children.** An earlier version of this function
+    /// cloned them out at parse time instead -- correct, but with a cost
+    /// that compounds *exponentially* with nesting depth even though no
+    /// source text is re-parsed: every nesting level's node holds both
+    /// `args` *and* `builtin_fallback`, each an independent full copy of
+    /// everything below it, so the node's own retained size roughly doubles
+    /// per level, and cloning a subtree of size `2^depth` at each of
+    /// `depth` levels sums back to `O(2^depth)` total. Confirmed live during
+    /// this fix's own review as a genuine parser-level denial-of-service:
+    /// `def first: .; first(first(first(...)))` took ~0.8s to *parse* at 20
+    /// levels of nesting, well under `MAX_EXPR_DEPTH`. Leaving `args` empty
+    /// until `resolve.rs` actually needs it (`super::resolve::UnresolvedCall`'s
+    /// own arity check reads `builtin_fallback`'s shape directly instead of
+    /// `args.len()` whenever `args` is still empty) means no sub-expression
+    /// is ever duplicated at parse time at all.
+    fn wrap_shadowable_call(name: &str, original: Expr) -> Expr {
+        Expr::FuncCall {
+            name: name.to_string(),
+            args: Vec::new(),
+            builtin_fallback: Some(Box::new(original)),
+        }
     }
 
     /// The bare identifier text starting at `pos`, independent of how far
