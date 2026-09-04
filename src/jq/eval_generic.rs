@@ -5989,6 +5989,12 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // after the loop, not per-sibling -- same reasoning as `Expr::Array`
         // above, and cheaper (one round trip for `.a, .b, .c` instead of up
         // to three).
+        // #2416 phase 3: `if` through the sink evaluator's own arm
+        // (`each_if_generic`), which evaluates the condition and the taken
+        // branch with the cursor, instead of the eager bridge -- so
+        // `if key == "a" then . else empty end` keeps standing on the node.
+        Expr::If { .. } => collect_each_generic::<S, V>(expr, value, optional, cursor),
+
         // #2416 phase 3 / #1332: object construction natively, with the
         // cursor threaded into every key and value expression, so `{k: key}`
         // answers the node's own key instead of bridging the whole construct
@@ -10861,6 +10867,48 @@ pub fn path_context_pipe_streams_cursors(exprs: &[Expr]) -> bool {
         && path_context_walk_split(exprs).is_some_and(|(_, rest)| rest.is_empty())
 }
 
+/// Collecting wrapper over the sink evaluator's native arms, for constructs
+/// that `eval_single` had no arm of its own for and used to bridge to the
+/// eager evaluator through an `OwnedValue` round trip -- losing the cursor,
+/// and with it every path-context builtin inside (#2416 phase 3). Runs
+/// `eval_each_generic` into a `Vec` and normalizes what it collected: a
+/// clean run becomes the usual `One`/`Many`/`Owned` shape (cursors kept as
+/// cursors), an escape after some outputs becomes a `Partial` carrying them.
+fn collect_each_generic<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+) -> GenericResult<V> {
+    let mut items: Vec<GenericItem<V>> = Vec::new();
+    let flow = eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| {
+        items.push(item);
+        Demand::Continue
+    });
+    let control = match flow {
+        Flow::Exhausted | Flow::Stopped { pending: None } => {
+            return match items_to_generic_result(items) {
+                Ok(result) => result,
+                Err((prefix, control)) => partial_generic(prefix, control),
+            };
+        }
+        Flow::Stopped {
+            pending: Some(control),
+        }
+        | Flow::Escaped(control) => control,
+    };
+    let mut owned = vec_with_capacity(items.len());
+    for item in items {
+        match generic_item_into_owned(item) {
+            Ok(v) => owned.push(v),
+            // A decode failure while rendering the prefix is the error: the
+            // secondary-failure rule `resolve_terminal_prefix` applies.
+            Err(failure) => return partial_generic(owned, failure),
+        }
+    }
+    partial_generic(owned, control)
+}
+
 /// How object construction stops early: a non-string key under `optional`
 /// yields nothing at all (what was built so far is discarded, as
 /// `eval::eval_object_construction` does), any other escape carries the
@@ -11187,11 +11235,32 @@ fn path_context_single_native(expr: &Expr) -> bool {
                     .map_or(true, |c| path_context_single_native(c))
         }
         Expr::FirstExpr(inner) | Expr::LastExpr(inner) => path_context_single_native(inner),
-        Expr::Builtin(Builtin::Key | Builtin::Parent | Builtin::PathNoArg | Builtin::FileIndex) => {
-            true
-        }
+        Expr::Builtin(
+            Builtin::Key
+            | Builtin::Parent
+            | Builtin::PathNoArg
+            | Builtin::FileIndex
+            | Builtin::Empty,
+        ) => true,
         Expr::Builtin(Builtin::ParentN(n)) => matches!(**n, Expr::Literal(_)),
         Expr::Builtin(Builtin::Select(cond)) => path_context_single_native(cond),
+        // Native in `eval_single` via `collect_each_generic` over
+        // `each_if_generic`; every sub-expression is single-evaluated.
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            path_context_single_native(cond)
+                && path_context_single_native(then_branch)
+                && path_context_single_native(else_branch)
+        }
+        // `eval_limit_generic` is native in `eval_single` unless the body
+        // reads `input` (which is not single-native anyway); a literal `n`
+        // keeps the count out of the value stream.
+        Expr::Limit { n, expr } => {
+            matches!(**n, Expr::Literal(_)) && path_context_single_native(expr)
+        }
         // Native since #2416 phase 3 (`build_object_entries_generic`): every
         // key and value expression is evaluated with the cursor.
         Expr::Object(entries) => entries.iter().all(|entry| {
@@ -21344,6 +21413,10 @@ mod tests {
         assert!(!eager(".[] | [key, path]"));
         assert!(!eager(".[] | select(key == \"b\") | parent(1)"));
         assert!(!eager(".[] | first(.[] | key)"));
+        assert!(
+            eager(".[] | key + 10"),
+            "arithmetic still bridges from eval_single"
+        );
         // Reason 1: an owned-domain stage before the builtin.
         assert!(eager(".a | tostring | key"));
         assert!(eager("to_entries | .[0] | key"));
@@ -21369,7 +21442,9 @@ mod tests {
         // native now, so `(key | {k: .})` is admitted.)
         assert!(eager(".[] | (key | tostring)"));
         assert!(!eager(".[] | (key | {k: .})"));
-        assert!(eager(".[] | if key == \"a\" then . else empty end"));
+        assert!(!eager(".[] | if key == \"a\" then . else empty end"));
+        assert!(!eager(".[] | limit(1; .[] | key)"));
+        assert!(eager(".[] | limit(1 + 0; key)"), "computed n");
         assert!(eager(".[] | select(key == \"a\" and true)"));
         assert!(eager(".[] | parent(1 + 0)"));
         // A nested pipe that would itself fall to the eager evaluator from a
