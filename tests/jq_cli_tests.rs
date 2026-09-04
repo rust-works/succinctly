@@ -14509,24 +14509,63 @@ fn test_first_limit_path_truncation_does_not_overreach_slice_bound_fanout_1517()
     Ok(())
 }
 
-/// #1517 review's own known-gap residual, documented on `resolve_slice_bound`
-/// itself: a resolved-but-non-numeric bound value still discards the whole
-/// converted prefix, including values that resolved cleanly before it --
-/// the same shape of bug #1517 fixes for a genuine generator escape, just
-/// not extended to a type failure in this PR. Not a regression: confirmed
-/// present (with a *different*, wrong error message -- `b` instead of the
-/// correct type-error text) before this fix too. Pinning today's honest,
-/// still-imperfect output rather than asserting nothing here, so a future
-/// fix's diff shows exactly what changes.
+/// #2385: fixes #1517 review's own known-gap residual, previously
+/// documented on `resolve_slice_bound` itself -- a resolved-but-non-numeric
+/// bound value used to discard the whole converted prefix, including
+/// values that resolved cleanly before it, the same shape of bug #1517
+/// fixed for a genuine generator escape. Now matches jq 1.7.1 exactly: all
+/// four combinations of the two valid `start` values (0, 1) against both
+/// `end` values (2, 3) print before raising.
 #[test]
-fn test_resolve_slice_bound_type_error_still_drops_valid_prefix_1517_known_gap() -> Result<()> {
+fn test_resolve_slice_bound_type_error_keeps_valid_prefix_2385() -> Result<()> {
     let (stdout, stderr, code) =
         run_jq_full(&["-c", r#"path(.[(0,1,"x"):(2,3)])"#], Some("[10,20,30]"))?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
-    // jq 1.7.1 prints all four combinations of the two valid `start` values
-    // (0, 1) against both `end` values (2, 3) before raising -- this
-    // function currently drops all four instead.
-    assert_eq!(stdout, "");
+    assert_eq!(
+        stdout,
+        "[{\"start\":0,\"end\":2}]\n[{\"start\":0,\"end\":3}]\n[{\"start\":1,\"end\":2}]\n[{\"start\":1,\"end\":3}]\n"
+    );
+    assert!(stderr.contains("must be integers"), "stderr: {stderr:?}");
+
+    Ok(())
+}
+
+/// #2385 sibling: the end bound's own conversion failure (the second
+/// `resolve_slice_bound` call site inside `resolve_slice_expr`). Verified
+/// against jq 1.7.1: `path(.[0:(1,2,"x")])` on `[10,20,30]` prints
+/// `[{"start":0,"end":1}]`, `[{"start":0,"end":2}]` before raising.
+#[test]
+fn test_resolve_slice_bound_end_type_error_keeps_valid_prefix_2385() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"path(.[0:(1,2,"x")])"#], Some("[10,20,30]"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(
+        stdout,
+        "[{\"start\":0,\"end\":1}]\n[{\"start\":0,\"end\":2}]\n"
+    );
+    assert!(stderr.contains("must be integers"), "stderr: {stderr:?}");
+
+    Ok(())
+}
+
+/// #2385: a conversion failure unconditionally outranks a later-pending
+/// generator escape in the start bound's own comma -- it only ever touches
+/// a value already produced, strictly before whatever triggered the
+/// pending escape in true generator order (mirrors #2372's identical
+/// finding for the read-path siblings). Verified against jq 1.7.1: adding
+/// a trailing `halt` to the start-bound generator produces the identical
+/// four pairs and the identical error -- `halt` is never reached.
+#[test]
+fn test_resolve_slice_bound_type_error_outranks_pending_halt_2385() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"path(.[(0,1,"x",halt):(2,3)])"#],
+        Some("[10,20,30]"),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(
+        stdout,
+        "[{\"start\":0,\"end\":2}]\n[{\"start\":0,\"end\":3}]\n[{\"start\":1,\"end\":2}]\n[{\"start\":1,\"end\":3}]\n"
+    );
     assert!(stderr.contains("must be integers"), "stderr: {stderr:?}");
 
     Ok(())
