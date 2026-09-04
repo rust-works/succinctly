@@ -16124,7 +16124,21 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // to `E | .[0]`, reaching this exact arm; the fix here also closes
         // the broader `E | F` gap the issue's own repro happened to
         // surface only one instance of.
-        QueryResult::Partial(_vs, outer_control) if S::TAG == EvalTag::Yq => {
+        //
+        // Review: excludes an uncatchable-at-value-position error (#2254's
+        // decode failure / yq negative-index raise) from the discard --
+        // that class survives a promotion/rendering failure the same way
+        // `Halt` does elsewhere in this file (#1897), regardless of mode.
+        // Caught by an existing, pre-#2373 integration test
+        // (`test_negative_index_out_of_range_survives_try_catch_partial_
+        // prefix_2270`, `tests/yq_cli_tests.rs`) this PR's first version
+        // broke: `.[0].a | (try (1, .[-5]) catch "c") | key` on a
+        // 2-element array must still print `1`'s own `key` (`null`)
+        // before the uncatchable out-of-range error, in yq mode too.
+        QueryResult::Partial(_vs, outer_control)
+            if S::TAG == EvalTag::Yq
+                && !matches!(&outer_control, Control::Error(e) if e.is_uncatchable_at_value_position()) =>
+        {
             partial(Vec::new(), outer_control)
         }
         QueryResult::Partial(vs, outer_control) => {
@@ -31563,7 +31577,18 @@ fn continue_rest_with_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // call site into this family today, per this file's own #2212
         // doc comment) but kept for the same future-proofing reason that
         // doc comment gives, not deleted as dead code.
-        QueryResult::Partial(_vs, outer_control) if S::TAG == EvalTag::Yq => {
+        //
+        // Also excludes an uncatchable-at-value-position error (#2254),
+        // same as `eval_pipe`'s identical carve-out above -- caught by a
+        // pre-existing integration test this PR's first version broke,
+        // `test_negative_index_out_of_range_survives_try_catch_partial_
+        // prefix_2270` (`tests/yq_cli_tests.rs`): a `key`-forced
+        // path-context pipe must still print an earlier value's own `key`
+        // before an uncatchable out-of-range error, in yq mode too.
+        QueryResult::Partial(_vs, outer_control)
+            if S::TAG == EvalTag::Yq
+                && !matches!(&outer_control, Control::Error(e) if e.is_uncatchable_at_value_position()) =>
+        {
             catch_error_under_optional::<W>(partial(Vec::new(), outer_control), optional, false)
         }
         QueryResult::Partial(vs, outer_control) => {
@@ -31792,7 +31817,18 @@ fn continue_rest_with_paths<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // call site into this family today, per this file's own #2212
         // doc comment) but kept for the same future-proofing reason that
         // doc comment gives, not deleted as dead code.
-        QueryResult::Partial(_vs, outer_control) if S::TAG == EvalTag::Yq => {
+        //
+        // Also excludes an uncatchable-at-value-position error (#2254),
+        // same as `eval_pipe`'s identical carve-out above -- caught by a
+        // pre-existing integration test this PR's first version broke,
+        // `test_negative_index_out_of_range_survives_try_catch_partial_
+        // prefix_2270` (`tests/yq_cli_tests.rs`): a `key`-forced
+        // path-context pipe must still print an earlier value's own `key`
+        // before an uncatchable out-of-range error, in yq mode too.
+        QueryResult::Partial(_vs, outer_control)
+            if S::TAG == EvalTag::Yq
+                && !matches!(&outer_control, Control::Error(e) if e.is_uncatchable_at_value_position()) =>
+        {
             catch_error_under_optional::<W>(partial(Vec::new(), outer_control), optional, false)
         }
         QueryResult::Partial(vs, outer_control) => {
@@ -31968,7 +32004,18 @@ fn continue_rest_with_fresh_root<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // call site into this family today, per this file's own #2212
         // doc comment) but kept for the same future-proofing reason that
         // doc comment gives, not deleted as dead code.
-        QueryResult::Partial(_vs, outer_control) if S::TAG == EvalTag::Yq => {
+        //
+        // Also excludes an uncatchable-at-value-position error (#2254),
+        // same as `eval_pipe`'s identical carve-out above -- caught by a
+        // pre-existing integration test this PR's first version broke,
+        // `test_negative_index_out_of_range_survives_try_catch_partial_
+        // prefix_2270` (`tests/yq_cli_tests.rs`): a `key`-forced
+        // path-context pipe must still print an earlier value's own `key`
+        // before an uncatchable out-of-range error, in yq mode too.
+        QueryResult::Partial(_vs, outer_control)
+            if S::TAG == EvalTag::Yq
+                && !matches!(&outer_control, Control::Error(e) if e.is_uncatchable_at_value_position()) =>
+        {
             catch_error_under_optional::<W>(partial(Vec::new(), outer_control), optional, false)
         }
         QueryResult::Partial(vs, outer_control) => {
@@ -55593,6 +55640,25 @@ mod tests {
         yq_query!(b"null", r#"([1,2],[3,4],error("x"))[0:1]"#,
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    /// #2373 review: an uncatchable-at-value-position error (#2254's yq
+    /// negative-index raise here) is excluded from the yq-mode discard --
+    /// it survives a promotion/rendering failure the same way `Halt` does
+    /// elsewhere in this file, regardless of mode. This is the case a
+    /// pre-existing integration test (`test_negative_index_out_of_range_
+    /// survives_try_catch_partial_prefix_2270`, `tests/yq_cli_tests.rs`)
+    /// caught this PR's first version breaking. `.[-5]` on a 2-element
+    /// array is the uncatchable raise; `1` is the earlier-produced value
+    /// that must still survive it.
+    #[test]
+    fn test_pipe_uncatchable_error_still_keeps_prefix_in_yq_mode_2373() {
+        yq_query!(b"[1,2]", r"(1, .[-5]) | tostring",
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::String("1".to_string())]);
+                assert!(e.message.contains("out of range"), "{}", e.message);
             }
         );
     }

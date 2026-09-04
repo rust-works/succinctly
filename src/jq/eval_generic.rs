@@ -3946,7 +3946,18 @@ fn fold_pipe_stages<S: EvalSemantics, V: DocumentValue>(
             // non-trivial `E` desugars to `E | .[0]`, reaching this exact
             // arm; the fix here also closes the broader `E | F` gap the
             // issue's own repro happened to surface only one instance of.
-            GenericResult::Partial(_vs, outer_control) if S::TAG == EvalTag::Yq => {
+            //
+            // Review: excludes an uncatchable-at-value-position error
+            // (#2254's decode failure / yq negative-index raise), same as
+            // `eval::eval_pipe`'s identical carve-out -- that class
+            // survives a promotion/rendering failure the same way `Halt`
+            // does elsewhere, regardless of mode. Caught by a pre-existing
+            // integration test this PR's first version broke (see
+            // `eval::eval_pipe`'s own comment for the exact repro).
+            GenericResult::Partial(_vs, outer_control)
+                if S::TAG == EvalTag::Yq
+                    && !matches!(&outer_control, Control::Error(e) if e.is_uncatchable_at_value_position()) =>
+            {
                 return partial_generic(Vec::new(), outer_control);
             }
             GenericResult::Partial(vs, outer_control) => {
