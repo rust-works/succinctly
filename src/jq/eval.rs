@@ -24981,6 +24981,130 @@ fn no_fold_register(values: Vec<OwnedValue>) -> Vec<FoldSourceValue> {
         .collect()
 }
 
+/// The ambient `.` a fold's SOURCE runs against on **one** INIT fork, plus
+/// that ambient's own provenance relative to that fork's own
+/// [`FoldRegister`] -- exactly the trio [`resolve_fold_source`] takes
+/// (#2388).
+struct FoldSourceAmbient<'v> {
+    value: &'v OwnedValue,
+    trackable: bool,
+    snapshot: bool,
+    /// Whether a trackable SOURCE branch's own path is *relative to*
+    /// `reg.path` rather than absolute, so [`relocate_source_registers`]
+    /// has to rebase it. Only ever `true` on a `null`-ambient fork whose
+    /// register sits somewhere other than the root -- on the first fork the
+    /// ambient is the document itself, which is only ever at the register
+    /// when the register is the root.
+    relocate: bool,
+}
+
+/// Which `.` a fold's SOURCE sees on INIT fork `fork_index`, and whether
+/// jq's shared path register still recognises it.
+///
+/// **Only the first INIT fork sees the fold's own input; every later fork
+/// sees `null` (#2388).** Real jq re-runs SOURCE per INIT fork, and its
+/// `DUPN` hands the retained-for-backtracking stack slot back as `jv_null()`
+/// once a fork point is live. Confirmed live against jq 1.7.1 on
+/// `{"a":1,"c":2}`:
+///
+/// ```console
+/// $ jq -c '[foreach (.) as $k ((0,1,2); [$k,.])]'
+/// [[{"a":1,"c":2},0],[null,1],[null,2]]
+/// $ jq -c '[foreach (length) as $k ((0,1); $k)]'
+/// [2,0]
+/// ```
+///
+/// -- the `length` row is what rules out treating this as a mere
+/// trackability question: the *values* SOURCE produces differ per fork too,
+/// so the substituted ambient has to reach [`resolve_fold_source`] itself,
+/// not just its two `bool`s.
+///
+/// In `path()` context that is what makes a navigating SOURCE raise on the
+/// second fork where it resolved cleanly on the first: `null` is not the
+/// value the register holds, so jq's per-navigation
+/// `jv_identical(current_input, value_at_path)` fails --
+/// `path(foreach (.a) as $k ((0,1); $k))` streams `["a"]` and then raises
+/// `Invalid path expression near attempt to access element "a" of null`.
+/// Before #2388 succinctly re-ran SOURCE against the document on every
+/// fork and fabricated a second `["a"]` instead.
+///
+/// The `null` ambient *is* at the register when the register itself holds a
+/// `null` -- [`register_identical`]'s kind-based clause for `null`/`bool`,
+/// the same rule every other register comparison in this file uses.
+/// Confirmed live, both directions:
+///
+/// ```console
+/// $ echo 'null'      | jq -c 'path(foreach (.a) as $k ((0,1);  $k))'   # ["a"] ["a"]
+/// $ echo '{"c":null}'| jq -c 'path(foreach (.a) as $k ((0,.c); $k))'   # ["a"] ["c","a"]
+/// ```
+///
+/// The second row is where `relocate` earns its keep: that fork's register
+/// was moved to `["c"]` by INIT, so SOURCE's own `["a"]` is relative to it.
+fn fold_source_ambient<'v>(
+    fork_index: usize,
+    reg: &FoldRegister,
+    value: &'v OwnedValue,
+    null: &'v OwnedValue,
+    trackable: bool,
+    snapshot: bool,
+) -> FoldSourceAmbient<'v> {
+    if fork_index == 0 {
+        // #2031: `doc_branch` stands for the document itself (SOURCE's own
+        // ambient `.`) at its pre-fold position; comparing it to `reg` via
+        // `branch_provenance` answers exactly "is `.` still where the
+        // register is" -- `true` whenever INIT didn't navigate (`reg.path`
+        // stays root, `FoldRegister::enter`'s untracked branch) or
+        // navigated nowhere (`Expr::Identity`, whose own path is root
+        // too), `false` the moment INIT's own navigation moved the
+        // register elsewhere. Confirmed live: `path(foreach (.a) as $k
+        // (.a; .))` raises "near attempt to access element a of
+        // {\"a\":1}" from SOURCE's own `.a` -- the very same expression
+        // that, run as `path(foreach (.a) as $k (0; .))`, resolves cleanly
+        // -- so this has to be recomputed per INIT fork, not read once
+        // from the fold's own ambient `trackable`/`snapshot`.
+        let doc_branch = PathBranch::passthrough(
+            PathPrefix::root(),
+            Cow::Borrowed(value),
+            trackable,
+            snapshot,
+        );
+        let (source_trackable, source_snapshot) = reg.branch_provenance(Some(&doc_branch));
+        return FoldSourceAmbient {
+            value,
+            trackable: source_trackable,
+            snapshot: source_snapshot,
+            relocate: false,
+        };
+    }
+    // A later fork's ambient is `null`, so `branch_provenance`'s
+    // path-equality shortcut cannot answer this: the question is no longer
+    // "did INIT move the register off the document's own root position" but
+    // "does the register recognise a `null`", which is a *value* question
+    // `register_identical` owns. `snapshot: false` -- a freshly-substituted
+    // `null` is not a frozen `$var` binding.
+    let at_register = reg.trackable && register_identical(&reg.value, null, false);
+    FoldSourceAmbient {
+        value: null,
+        trackable: at_register,
+        snapshot: false,
+        relocate: at_register && reg.path.depth() > 0,
+    }
+}
+
+/// Rebase every trackable SOURCE element's own
+/// [`register_path`](FoldSourceValue::register_path) onto `base`, for the
+/// one ambient shape whose resolved paths come back relative to the
+/// register rather than absolute -- see
+/// [`FoldSourceAmbient::relocate`] (#2388). Mirrors
+/// [`FoldRegister::relocate`]'s own trackable arm exactly.
+fn relocate_source_registers(elements: &mut [FoldSourceValue], base: &Rc<PathPrefix>) {
+    for elem in elements {
+        if let Some(path) = &elem.register_path {
+            elem.register_path = Some(PathPrefix::extend_many(base, path.to_vec()));
+        }
+    }
+}
+
 /// `path()`-tracking counterpart of [`eval_reduce`] — resolves
 /// `reduce EXPR as $var (INIT; UPDATE)` in path context, replicating
 /// `eval_reduce`'s own control flow (INIT forks, per-source-element UPDATE
@@ -25045,31 +25169,18 @@ fn resolve_reduce<'a, S: EvalSemantics>(
     // Shared across every INIT fork (#695), same "whole tree, not
     // per-branch" accounting `eval_reduce` itself uses.
     let mut budget = REDUCE_FOREACH_MAX_STEPS;
-    for init_branch in &init_branches {
+    // #2388: hoisted so `fold_source_ambient` can hand a later fork's
+    // `null` ambient back as a borrow rather than allocating one per fork.
+    let null_ambient = OwnedValue::Null;
+    for (fork_index, init_branch) in init_branches.iter().enumerate() {
         let (reg, acc) = FoldRegister::enter(init_branch, value, trackable);
 
         // #2031: SOURCE runs immediately after INIT against the same
         // shared register real jq threads through the whole construct.
-        // `doc_branch` stands for the document itself (SOURCE's own
-        // ambient `.`) at its pre-fold position; comparing it to `reg` via
-        // `branch_provenance` answers exactly "is `.` still where the
-        // register is" -- `true` whenever INIT didn't navigate (`reg.path`
-        // stays root, `FoldRegister::enter`'s untracked branch) or
-        // navigated nowhere (`Expr::Identity`, whose own path is root
-        // too), `false` the moment INIT's own navigation moved the
-        // register elsewhere. Confirmed live: `path(foreach (.a) as $k
-        // (.a; .))` raises "near attempt to access element a of
-        // {\"a\":1}" from SOURCE's own `.a` -- the very same expression
-        // that, run as `path(foreach (.a) as $k (0; .))`, resolves cleanly
-        // -- so this has to be recomputed per INIT fork, not read once
-        // from the fold's own ambient `trackable`/`snapshot`.
-        let doc_branch = PathBranch::passthrough(
-            PathPrefix::root(),
-            Cow::Borrowed(value),
-            trackable,
-            snapshot,
-        );
-        let (source_trackable, source_snapshot) = reg.branch_provenance(Some(&doc_branch));
+        // #2388: and only the *first* INIT fork sees the fold's own input
+        // as that SOURCE's ambient `.` -- see `fold_source_ambient`.
+        let ambient =
+            fold_source_ambient(fork_index, &reg, value, &null_ambient, trackable, snapshot);
         // Mirrors `eval_reduce`'s own source-stream handling: `reduce`'s
         // output is always single-shot, so a `Partial` input just extracts
         // the control and drops the prefix (there's no path-tracking
@@ -25079,8 +25190,11 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         // `foreach` has a prefix to stream first (#1872). Whatever earlier
         // INIT forks already emitted into `out` survives, same as any
         // other mid-loop abort below.
-        let (input_values, input_escape) =
-            resolve_fold_source::<S>(input, value, source_trackable, source_snapshot);
+        let (mut input_values, input_escape) =
+            resolve_fold_source::<S>(input, ambient.value, ambient.trackable, ambient.snapshot);
+        if ambient.relocate {
+            relocate_source_registers(&mut input_values, &reg.path);
+        }
         if let Some(control) = input_escape {
             return path_result(out, Some(control.into()));
         }
@@ -25275,26 +25389,27 @@ fn resolve_foreach<'a, S: EvalSemantics>(
 
     let mut out: Vec<PathBranch<'a>> = Vec::new();
     let mut budget = REDUCE_FOREACH_MAX_STEPS;
-    for init_branch in &init_branches {
+    // #2388: see `resolve_reduce`'s identical hoist.
+    let null_ambient = OwnedValue::Null;
+    for (fork_index, init_branch) in init_branches.iter().enumerate() {
         let (reg, mut state) = FoldRegister::enter(init_branch, value, trackable);
 
-        // #2031: see `resolve_reduce`'s identical derivation — SOURCE's own
-        // ambient trackable/snapshot is recomputed per INIT fork from
-        // wherever that fork's own register stands after INIT ran.
-        let doc_branch = PathBranch::passthrough(
-            PathPrefix::root(),
-            Cow::Borrowed(value),
-            trackable,
-            snapshot,
-        );
-        let (source_trackable, source_snapshot) = reg.branch_provenance(Some(&doc_branch));
+        // #2031/#2388: see `resolve_reduce`'s identical derivation —
+        // SOURCE's own ambient value, trackability and snapshot mark are
+        // all recomputed per INIT fork from wherever that fork's own
+        // register stands after INIT ran.
+        let ambient =
+            fold_source_ambient(fork_index, &reg, value, &null_ambient, trackable, snapshot);
         // Unlike `reduce`, a `Partial` source stream's own prefix is
         // iterated below — mirrors `eval_foreach`'s identical rule, and
         // #1467's path-check escape is now just another such trailing
         // control rather than a short-circuit ahead of this call, which is
         // what lets the elements produced before it still stream (#1872).
-        let (input_values, input_control) =
-            resolve_fold_source::<S>(input, value, source_trackable, source_snapshot);
+        let (mut input_values, input_control) =
+            resolve_fold_source::<S>(input, ambient.value, ambient.trackable, ambient.snapshot);
+        if ambient.relocate {
+            relocate_source_registers(&mut input_values, &reg.path);
+        }
 
         // `eval_foreach`'s own substitution, minus the two things this
         // function's `[Pattern::Var(_)]` gate (see `resolve_node`'s dispatch
