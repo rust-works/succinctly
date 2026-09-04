@@ -20445,6 +20445,111 @@ fn test_def_shadow_candidate_empty_parens_stays_syntax_error_2036() -> Result<()
     Ok(())
 }
 
+/// #2036 review, round 2: when a shadow candidate's own dedicated parser
+/// hits a wrong-arity call but (per #2110/#2237) internally rewinds to a
+/// successful, already-generic `Ok(FuncCall{..})`/postfix-wrapped result
+/// instead of returning `Err`, that generic result must not be wrapped as
+/// `builtin_fallback` -- `builtin_fallback_arity`/`_into_args`
+/// (`resolve.rs`) have no matching arm for that shape and fell to their
+/// "unreachable in practice" wildcard, silently computing arity 0 and
+/// discarding the real arguments (and their side effects) entirely.
+/// Confirmed live before this fix: `def until: "s"; until(error("boom"))`
+/// printed `"s"` (exit 0), silently swallowing the `error("boom")`
+/// argument, where real jq raises `until/1 is not defined` (exit 3).
+/// Oracle-verified against jq 1.7.1, including the postfix-wrapped shape.
+#[test]
+fn test_def_shadow_fallback_wrong_arity_not_double_counted_2036() -> Result<()> {
+    for (filter, name) in [
+        (r#"def until: "s"; until(error("boom"))"#, "until/1"),
+        (r#"def limit: "s"; limit(1)"#, "limit/1"),
+        (r#"def while: "s"; while(1)"#, "while/1"),
+        (r#"def repeat: "s"; repeat(1;2)"#, "repeat/2"),
+        (r#"def until: {"a":"s"}; until(0).a"#, "until/1"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(stdout, "", "{filter}: stderr {stderr:?}");
+        assert!(
+            stderr.contains(&format!("{name} is not defined at <top-level>, line 1:")),
+            "{filter}: stderr {stderr:?}"
+        );
+        assert_eq!(code, 3, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+    }
+    Ok(())
+}
+
+/// #2036 review, round 2: `range(N)` -- the 1-arg sugar for `range(0; N)`
+/// -- desugars to the exact same `Expr::Range { from: Literal(0), to:
+/// Some(_), .. }` shape a genuine 2-arg `range(0; N)` call produces, so
+/// computing the shadow-check arity straight from that shape is ambiguous.
+/// Confirmed live before this fix: `def range(a;b): "s"; range(5)` wrongly
+/// shadowed at arity 2 (should not shadow at all -- `range(5)` is arity
+/// 1), and `def range(a): "s"; range(5)` wrongly failed to shadow at
+/// arity 1. Oracle-verified against jq 1.7.1.
+#[test]
+fn test_def_shadow_range_one_vs_two_arg_arity_2036() -> Result<()> {
+    // range/2 shadow must not match the 1-arg call.
+    let (stdout, stderr, code) = run_jq_full(&["-nc", r#"def range(a;b): "s"; [range(5)]"#], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[0,1,2,3,4]");
+
+    // range/1 shadow must match the 1-arg call.
+    let (stdout, stderr, code) = run_jq_full(&["-nc", r#"def range(a): "s"; range(5)"#], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), r#""s""#);
+
+    // Unshadowed 1-arg sugar keeps working normally either way.
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "[range(3)]"], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[0,1,2]");
+    Ok(())
+}
+
+/// #2036 review, round 2: the lexical prescan (`collect_def_names`) used
+/// only `str::trim_start`, which skips whitespace but not a `#`-comment
+/// between the `def` keyword and its name -- real jq's own `skip_ws`
+/// (which this prescan approximates) skips both. A `def` separated from
+/// its name by a comment was therefore invisible to the prescan and never
+/// became a shadow candidate at all, reproducing the exact silent-wrong-
+/// value bug class this issue exists to fix, just for one more spelling.
+/// Confirmed live before this fix: `def #c\nlength: 99; length` printed
+/// `0` (the real builtin) instead of `99`.
+#[test]
+fn test_def_shadow_candidate_comment_before_name_2036() -> Result<()> {
+    let filter = "def #c\nlength: 99; length";
+    let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "99");
+    Ok(())
+}
+
+/// #2036 review, round 2: unlike the other 7 shadowable special forms,
+/// `parse_error_expr` used to propagate a wrong-arity `error(a;b)` call's
+/// `Err` straight out to `parse_shadowable_special_form`'s own
+/// `retry_shadow_candidate_as_generic_call` fallback, which re-parses the
+/// same span from scratch *in addition to* the `parse_expr()` call
+/// `parse_error_expr` had already run over the same content -- doubling
+/// the parse work at every nesting level of a wrong-arity-shadowed,
+/// nested `error(...)` chain and exhausting the shared
+/// `shadow_retry_budget` (64) at a depth as shallow as 7, well within
+/// what a real (non-adversarial) generated or hand-written program could
+/// reach. Fixed by giving `parse_error_expr` the same internal rewind the
+/// other 7 forms already have. Pinned at depth 14, comfortably past the
+/// old failure point and still fast, not a tight bound -- deeper nesting
+/// still eventually hits the same pre-existing #2110/#2237
+/// exponential-reparse cost the other 7 forms already have for their own
+/// wrong-arity case (out of this issue's scope; confirmed identical on a
+/// fresh `main` build).
+#[test]
+fn test_def_shadow_nested_error_wrong_arity_realistic_depth_2036() -> Result<()> {
+    let depth = 14;
+    let nested = "error(".repeat(depth) + "1" + &";2)".repeat(depth);
+    let filter = format!("def error(a;b): a; {nested}");
+    let (stdout, stderr, code) = run_jq_full(&["-nc", &filter], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "1");
+    Ok(())
+}
+
 /// #1376: `succinctly jq` now supports arity overloading, matching real
 /// jq -- `def f(x): ...` and `def f(x;y): ...` are distinct functions
 /// (`f/1` and `f/2`), and both stay callable after the second definition.

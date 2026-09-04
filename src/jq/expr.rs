@@ -438,6 +438,22 @@ pub enum Expr {
         /// restoring the original builtin/special-form). By the time any
         /// other pass over the tree runs, this field is always `None` --
         /// see `resolve::check`'s own doc comment.
+        ///
+        /// **Library-API precondition (#2036 review, round 2):** while this
+        /// field is still `Some`, `args` is deliberately left empty (see
+        /// above), so evaluating the tree directly ([`crate::jq::eval`]/
+        /// [`crate::jq::eval_lenient`]) *without* first calling
+        /// [`crate::jq::resolve_func_calls`]/[`crate::jq::resolve_func_calls_all`]
+        /// makes a node whose shadowing is genuinely declined -- a program
+        /// with an unrelated-arity `def` of a builtin's name elsewhere,
+        /// e.g. `def length(x): x; [1,2,3] | length` -- report `undefined
+        /// function: length/0` instead of evaluating the real builtin
+        /// (confirmed live via a direct call to `eval`). Both CLI runners
+        /// (`jq_runner.rs`, `yq_runner.rs`) already call one of the resolve
+        /// functions before evaluating, so this is unreachable from the
+        /// `succinctly` binary; it only affects an external caller of this
+        /// crate's own public `jq` API that evaluates a jq-mode-parsed
+        /// `Expr` without resolving it first. Tracked as #2402.
         builtin_fallback: Option<Box<Self>>,
     },
 

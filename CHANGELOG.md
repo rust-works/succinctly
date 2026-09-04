@@ -458,7 +458,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   #2110's own established rule for the non-shadow-candidate case), and the fallback
   reparse itself is now capped by a small retry budget, since an adversarial program
   nesting the same arity-mismatched name inside itself could otherwise force the same
-  reparse to repeat at every level.
+  reparse to repeat at every level (the budget bounds the *number* of retries to a small
+  constant, not the reparse cost of each one — see the round-2 findings below for where
+  that distinction mattered).
 
   **A second, more fundamental performance bug was also found and fixed during review,
   before this ever reached `main`**: an earlier version of this fix populated `args` by
@@ -481,6 +483,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ever sees the main filter's own source text — a `def` loaded via `include`, `import`,
   or `~/.jq` cannot shadow a builtin, since it was never scanned and the module-loading
   step that inlines it runs well after the main filter has already been fully parsed.
+
+  **Four more bugs found and fixed during a second, independent review round, before
+  this ever reached `main`:**
+
+  - A shadow candidate whose dedicated parser hit a wrong-arity call but (per the
+    independently-merged #2237, which touched this exact keyword-dispatch region and was
+    merged during this fix's own rebase) internally rewound to an already-successful,
+    already-generic `Ok(FuncCall{..})` — or a postfix-wrapped one — instead of returning
+    `Err`, had that generic result wrapped as `builtin_fallback` anyway.
+    `builtin_fallback_arity`/`builtin_fallback_into_args` (`resolve.rs`) had no matching
+    arm for that shape and fell to their "unreachable in practice" wildcard, silently
+    computing arity 0 and discarding the real arguments — and their side effects —
+    entirely:
+
+    ```console
+    $ succinctly jq -nc 'def until: "shadowed"; until(error("boom"))'   # before this fix
+    "shadowed"
+    $ jq -nc 'def until: "shadowed"; until(error("boom"))'
+    jq: error: until/1 is not defined at <top-level>, line 1: ...
+    ```
+
+    Fixed by only ever wrapping the exact closed set of shapes
+    `builtin_fallback_arity`/`_into_args` know how to read back (`wrap_shadowable_call`,
+    `parser.rs`) — anything else is returned unwrapped, resolved as an ordinary call like
+    any other, since the dedicated parser itself already gave up on a builtin
+    interpretation in that case.
+  - `range(N)` — the 1-arg sugar for `range(0; N)` — desugars to the exact same
+    `Expr::Range { from: Literal(0), to: Some(_), .. }` shape a genuine 2-arg
+    `range(0; N)` call produces, so computing the shadow-check arity from that shape
+    alone is ambiguous: `def range(a;b): "s"; range(5)` wrongly shadowed at arity 2, and
+    `def range(a): "s"; range(5)` wrongly failed to shadow at arity 1. Fixed by having
+    `parse_range_expr` mark the 1-arg form with an `Expr::Paren` wrapper (a no-op
+    everywhere else in eval/path/walk) so `resolve.rs` can tell the two shapes apart.
+  - `collect_def_names`'s lexical prescan used `str::trim_start`, which skips whitespace
+    but not a `#`-comment between the `def` keyword and its name — reproducing this
+    issue's own bug class for one more spelling: `def #c\nlength: 99; length` returned
+    `0` instead of `99`. Fixed by skipping comments the same way the real parser's own
+    `skip_ws` does.
+  - Unlike the other 7 shadowable special forms, `parse_error_expr`'s own wrong-arity
+    path relied entirely on `retry_shadow_candidate_as_generic_call`'s fallback reparse,
+    which re-parses the whole call from scratch *in addition to* the `parse_expr()` call
+    `parse_error_expr` had already run over the same content — doubling the parse work at
+    every nesting level of a wrong-arity-shadowed, nested `error(...)` chain and
+    exhausting the shared retry budget at a depth as shallow as 7, well within what a
+    real, non-adversarial program could reach (contrary to this entry's own earlier claim
+    above that the budget kept the worst case to "linear instead of exponential" — it
+    bounds the retry *count*, not each retry's cost, and for `error` specifically that
+    cost itself was compounding). Fixed by giving `parse_error_expr` the same internal
+    wrong-arity rewind the other 7 forms already have via #2237, removing it from the
+    budgeted fallback path entirely — a nested shadowed `error(...)` chain now resolves
+    correctly at realistic depths (pinned at 14) rather than erroring at 7. Deeper,
+    adversarial nesting still eventually hits the same pre-existing #2110/#2237
+    exponential-reparse cost the other 7 forms' own wrong-arity case already has —
+    confirmed identical on a fresh `main` build, unrelated to and out of scope for this
+    fix.
+
+  **Known residual gap, not fixed here** (tracked as #2402): evaluating a jq-mode-parsed
+  `Expr` directly via this crate's own public `eval`/`eval_lenient` API, *without* first
+  calling `resolve_func_calls`/`resolve_func_calls_all`, can now wrongly report
+  `undefined function` for a shadow-candidate call whose shadowing is genuinely declined
+  (`def length(x): x; [1,2,3] | length` errors instead of evaluating to `3`) — an honest
+  compile-shaped error, never a silently wrong *value*, and unreachable from the
+  `succinctly` binary itself (both CLI runners already resolve before evaluating), but a
+  real precondition change for an external caller of the library API.
 
 - **`del()`'s trailing `.[]` raised instead of no-oping through a tolerated (rather than
   genuinely found) `null`, in yq mode** (#2347, found during #2324's own implementation).

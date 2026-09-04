@@ -394,6 +394,15 @@ fn builtin_fallback_arity(fallback: &Expr) -> usize {
         Expr::Not => 0,
         Expr::Limit { .. } | Expr::Until { .. } | Expr::While { .. } => 2,
         Expr::Repeat(_) | Expr::FirstExpr(_) | Expr::LastExpr(_) => 1,
+        // #2036 review round 2: `range(N)` -- the 1-arg sugar form --
+        // desugars to the exact same `Range { from: Literal(0), to:
+        // Some(_), step: None }` shape a genuine 2-arg `range(0; N)` call
+        // produces, so the general `Expr::Range` arm below cannot tell them
+        // apart. `parse_range_expr` (`parser.rs`) marks the 1-arg form by
+        // wrapping it in `Expr::Paren` (otherwise unused for this purpose,
+        // and a no-op everywhere else) precisely so this arm can report the
+        // correct arity of 1 here instead of the wrong 2.
+        Expr::Paren(inner) if matches!(**inner, Expr::Range { .. }) => 1,
         Expr::Range { to, step, .. } => 1 + usize::from(to.is_some()) + usize::from(step.is_some()),
         Expr::Error(msg) => usize::from(msg.is_some()),
         Expr::Builtin(builtin) => match builtin_kids(builtin) {
@@ -402,8 +411,16 @@ fn builtin_fallback_arity(fallback: &Expr) -> usize {
             BuiltinKids::Two(_, _) => 2,
             BuiltinKids::Three(_, _, _) => 3,
         },
-        // Unreachable in practice -- `wrap_shadowable_call`'s only two
-        // callers only ever hand it one of the shapes above.
+        // Genuinely unreachable: `wrap_shadowable_call` (`parser.rs`) only
+        // ever stores one of the shapes matched above in
+        // `builtin_fallback` -- anything else (a plain `Expr::FuncCall`, or
+        // any postfix wrapping of one, produced when a dedicated parser's
+        // own #2110/#2237 wrong-arity rewind fires) is returned unwrapped,
+        // with `builtin_fallback` left `None`, specifically so it can never
+        // reach here. Kept as a defensive fallback rather than `unreachable!()`
+        // since the two functions have no compiler-enforced link to
+        // `wrap_shadowable_call`'s own match -- see that function's doc
+        // comment for the bug this arm used to silently paper over.
         _ => 0,
     }
 }
@@ -429,6 +446,17 @@ fn builtin_fallback_into_args(fallback: Expr) -> Vec<Expr> {
         Expr::Repeat(inner) | Expr::FirstExpr(inner) | Expr::LastExpr(inner) => {
             alloc::vec![*inner]
         }
+        // #2036 review round 2: the 1-arg `range(N)` marker -- see
+        // `builtin_fallback_arity`'s matching arm. The single real argument
+        // the user wrote is `to` (the synthesized `from: Literal(0)` was
+        // never written and must not be surfaced as a second argument).
+        Expr::Paren(inner) if matches!(*inner, Expr::Range { .. }) => match *inner {
+            Expr::Range { to: Some(to), .. } => alloc::vec![*to],
+            // `parse_range_expr` only ever produces this marker with `to:
+            // Some(_)` -- defensive, not reachable.
+            Expr::Range { .. } => Vec::new(),
+            _ => unreachable!("guarded by the outer match arm's pattern"),
+        },
         Expr::Range { from, to, step } => {
             let mut args = alloc::vec![*from];
             args.extend(to.map(|b| *b));
@@ -451,7 +479,7 @@ fn builtin_fallback_into_args(fallback: Expr) -> Vec<Expr> {
             BuiltinKids::Two(a, b) => alloc::vec![a.clone(), b.clone()],
             BuiltinKids::Three(a, b, c) => alloc::vec![a.clone(), b.clone(), c.clone()],
         },
-        // Unreachable in practice -- see `builtin_fallback_arity`'s own
+        // Genuinely unreachable -- see `builtin_fallback_arity`'s own
         // identical fallback arm, which this must stay consistent with.
         _ => Vec::new(),
     }
