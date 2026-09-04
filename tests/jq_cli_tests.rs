@@ -7353,6 +7353,12 @@ fn test_as_path_context_builtin_body_loop_arms_1663() -> Result<()> {
 /// Pinned so a future regression or accidental fix is visible either way,
 /// matching #1306's identical "known gap" precedent
 /// (`test_func_def_path_context_argument_passing_is_a_known_gap_1306`).
+///
+/// **Closed by spine 2416's phase 3**, deliberately: `key` is now a cursor
+/// property in the generic evaluator (`cursor_key`), so it answers `"a"`
+/// from the node `.a` stands on no matter which construct the builtin sits
+/// inside -- there is no arm to be missing any more. Same closure as
+/// `test_func_def_path_context_argument_passing_is_a_known_gap_1306`.
 #[test]
 fn test_as_pattern_alternatives_path_context_still_a_known_gap_1663() -> Result<()> {
     let (stdout, _, code) = run_jq_full(
@@ -7360,7 +7366,7 @@ fn test_as_pattern_alternatives_path_context_still_a_known_gap_1663() -> Result<
         Some(r#"{"a":[1]}"#),
     )?;
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "null");
+    assert_eq!(stdout.trim(), r#""a""#);
 
     Ok(())
 }
@@ -8652,11 +8658,17 @@ fn test_func_def_path_context_builtins_1306() -> Result<()> {
 /// regression (this starting to silently resolve, without the routing
 /// decision being deliberately revisited) is visible rather than an
 /// unnoticed behavior change either way.
+///
+/// **Closed by spine 2416's phase 3**: `needs_path_context` still does not
+/// see through the call argument, and no longer has to -- `key` is a cursor
+/// property in the generic evaluator (`cursor_key`), so the un-gated pipe
+/// answers `"a"` from the node `.a` stands on. The routing decision this
+/// test guarded is moot for cursor-backed values.
 #[test]
 fn test_func_def_path_context_argument_passing_is_a_known_gap_1306() -> Result<()> {
     let (stdout, _, code) = run_jq_full(&["-c", ".a | def f(x): x; f(key)"], Some(r#"{"a":1}"#))?;
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "null");
+    assert_eq!(stdout.trim(), r#""a""#);
 
     Ok(())
 }
@@ -8674,19 +8686,23 @@ fn test_func_def_path_context_argument_passing_is_a_known_gap_1306() -> Result<(
 /// 2-element array is `["0","0","1","1"]`, not `["0","1","0","1"]` or any
 /// other cross-branch-aware shape) before #1306 was filed. `key`/`.a.b?` as
 /// top-level comma siblings with nothing preceding them share the same
-/// root `current_path` (empty) `key` alone at the root already returns
-/// `null` for -- so `null` here is that same, already-correct answer, not
-/// a regression of a real bug. See #1306's own comment thread for the
+/// root `current_path` (empty). See #1306's own comment thread for the
 /// full oracle comparison.
+///
+/// What `key` at the root *answers* moved with spine 2416's phase 3: real
+/// yq prints nothing there (#2421), and `key` as a cursor property does
+/// too, so the comma's `key` branch contributes no output. The
+/// independence claim is unchanged -- the `.a.b?` branch still reports its
+/// own `null`, unaffected by its sibling.
 #[test]
 fn test_func_def_key_comma_sibling_independence_is_not_a_bug_1306() -> Result<()> {
     let (stdout, _, code) = run_jq_full(&["-c", ".a.b?, key"], Some(r#"{"a":{"b":null}}"#))?;
     assert_eq!(code, 0);
-    assert_eq!(stdout, "null\nnull\n");
+    assert_eq!(stdout, "null\n");
 
     let (stdout, _, code) = run_jq_full(&["-c", "key, .a.b?"], Some(r#"{"a":{"b":null}}"#))?;
     assert_eq!(code, 0);
-    assert_eq!(stdout, "null\nnull\n");
+    assert_eq!(stdout, "null\n");
 
     Ok(())
 }

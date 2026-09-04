@@ -2228,6 +2228,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
     }
 
     #[inline]
+    fn same_node(&self, other: &Self) -> bool {
+        self.bp_pos == other.bp_pos
+    }
+
+    #[inline]
     fn is_container(&self) -> bool {
         JsonCursor::is_container(self)
     }

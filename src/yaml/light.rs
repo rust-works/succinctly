@@ -6115,6 +6115,19 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
         YamlCursor::parent(self)
     }
 
+    /// The stream root (`bp_pos == 0`, the virtual sequence of documents) is
+    /// not a parent a query can reach: `parent` from a document root emits
+    /// nothing, matching real yq (#2421).
+    fn document_parent(&self) -> Option<Self> {
+        let parent = YamlCursor::parent(self)?;
+        (parent.bp_pos != 0).then_some(parent)
+    }
+
+    #[inline]
+    fn same_node(&self, other: &Self) -> bool {
+        self.bp_pos == other.bp_pos
+    }
+
     #[inline]
     fn is_container(&self) -> bool {
         YamlCursor::is_container(self)
