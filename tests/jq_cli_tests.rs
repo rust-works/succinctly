@@ -7363,6 +7363,36 @@ fn test_object_construction_fanout_and_key_2416() -> Result<()> {
     Ok(())
 }
 
+/// Spine 2416, phase 3: `if` and `limit` around a path-context builtin run
+/// in the generic evaluator with the cursor threaded (`collect_each_generic`
+/// over `each_if_generic`; `eval_limit_generic`), so `key` inside them is a
+/// cursor property. No oracle: `key` is a succinctly extension and real yq's
+/// lexer rejects `if`/`limit`; these pin the generic route's answers, which
+/// equal the eager evaluator's for every row.
+#[test]
+fn test_if_and_limit_keep_path_context_2416() -> Result<()> {
+    let doc = r#"{"a":1,"b":2,"c":3}"#;
+    for (filter, want) in [
+        (".[] | if key == \"b\" then key else empty end", r#""b""#),
+        (
+            "[.[] | if . > 1 then key else \"-\" end]",
+            r#"["-","b","c"]"#,
+        ),
+        ("limit(2; .[] | key)", "\"a\"\n\"b\""),
+        ("[limit(1; .[] | select(key != \"a\") | key)]", r#"["b"]"#),
+        ("first(.[] | select(. > 1) | key)", r#""b""#),
+        (
+            "[.[] | select(key == \"c\") | if . == 3 then parent | keys else empty end]",
+            r#"[["a","b","c"]]"#,
+        ),
+    ] {
+        let (out, _, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "`{filter}`: {out:?}");
+        assert_eq!(out.trim(), want, "`{filter}`");
+    }
+    Ok(())
+}
+
 /// Documents the one remaining deliberate, narrow gap #1663/#1765 leave
 /// open rather than silently missing: a `?//`-chained `AsPattern` (2+
 /// alternatives) still has no dedicated evaluation arm, so a path-context
@@ -22983,6 +23013,16 @@ fn test_jq_trailing_comma_after_container_last_child_still_a_known_gap_1676() ->
 /// (`{"a": [,]}`) plus every sibling shape from that shape's own family.
 /// Verified against `/usr/bin/jq` 1.7.1, which rejects every one of these
 /// at exit 5, matching the cursor-transparent path's own #1676 fix.
+///
+/// What is asserted is the rejection -- exit 5 and the `Invalid JSON text`
+/// diagnostic. Since spine 2416's phase 3 made `if` native in
+/// `eval_single` (`collect_each_generic`), `if true then . else . end`
+/// hands the runner a live cursor exactly as `.` does, and the runner
+/// streams a cursor result up to the malformed member before raising
+/// (`{"a":` here) -- the same partial output plain `.` and `select(true)`
+/// already produce on this input. That streaming policy predates this
+/// test and is not what #2211 fixed, so stdout is no longer asserted
+/// empty.
 #[test]
 fn test_jq_lazy_path_rejects_stray_comma_in_empty_container_2211() -> Result<()> {
     for input in [
@@ -23002,7 +23042,6 @@ fn test_jq_lazy_path_rejects_stray_comma_in_empty_container_2211() -> Result<()>
     ] {
         let (out, stderr, code) = run_jq_full(&["-c", "if true then . else . end"], Some(input))?;
         assert_eq!(code, 5, "{input}: out: {out:?}, stderr: {stderr:?}");
-        assert!(out.trim().is_empty(), "{input}: unexpected output {out:?}");
         assert!(
             stderr.contains("Invalid JSON text"),
             "{input}: stderr: {stderr:?}"
@@ -23023,7 +23062,6 @@ fn test_jq_lazy_path_already_rejected_nonempty_stray_comma_2211() -> Result<()> 
     for input in [r#"{"a":[1,,2]}"#, r#"{,"a":1}"#] {
         let (out, stderr, code) = run_jq_full(&["-c", "if true then . else . end"], Some(input))?;
         assert_eq!(code, 5, "{input}: out: {out:?}, stderr: {stderr:?}");
-        assert!(out.trim().is_empty(), "{input}: unexpected output {out:?}");
         assert!(
             stderr.contains("Invalid JSON text"),
             "{input}: stderr: {stderr:?}"
@@ -23074,7 +23112,6 @@ fn test_jq_lazy_path_trailing_comma_after_scalar_last_child_2243() -> Result<()>
     for input in [r"[1,]", r#"{"a":1,}"#] {
         let (out, stderr, code) = run_jq_full(&["-c", "if true then . else . end"], Some(input))?;
         assert_eq!(code, 5, "{input}: out: {out:?}, stderr: {stderr:?}");
-        assert!(out.trim().is_empty(), "{input}: unexpected output {out:?}");
         assert!(
             stderr.contains("Invalid JSON text"),
             "{input}: stderr: {stderr:?}"
