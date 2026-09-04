@@ -34343,6 +34343,53 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         }
                     }
                 }
+                // #2375: the same non-container rule the value-only
+                // `builtin_map` already applies in yq mode (#1907), which
+                // this arm was missing entirely -- so a `map(f)` whose `f`
+                // (or whose downstream `rest`) needed path context still
+                // raised `Cannot iterate over ...` where plain `map(f)` on
+                // the identical input did not. The rule is asymmetric.
+                //
+                // `null` gets yq's usual empty-container treatment: nothing
+                // to iterate, `results` stays empty, and the tail below
+                // yields `[]` exactly as a `[]` input would. Captured live
+                // (yq v4.53.3, `a: null`): `.a | map(key)` => `[]`,
+                // `.a | map(key) | . + 100` => `[100]`.
+                OwnedValue::Null if S::TAG == EvalTag::Yq => {}
+                // Every *other* scalar passes through completely unchanged
+                // -- `f` never runs, and `rest` continues against that
+                // unchanged value rather than against `[]` or no-output.
+                // Captured live (`a: 5`): `.a | map(key)` => `5`,
+                // `.a | map(key) | . + 100` => `105`. `current_path` is
+                // deliberately handed on untouched, which is what keeps a
+                // downstream `key` reporting the *original* node's own key
+                // (`a: 5`, `.a | map(. + 1) | key` => `"a"`) -- yq never
+                // replaced the node, so it never lost its path (#2375's own
+                // review). The container rows of that same review, where yq
+                // instead re-roots the freshly built array's path so a
+                // downstream `key` emits nothing, still diverge and stay out
+                // of scope here -- recorded as a residual gap in
+                // `docs/compliance/yq/limitations.md`.
+                //
+                // This bypasses the `catch_error_under_optional`/array
+                // construction tail below rather than feeding it, since
+                // there is no array to construct and no per-element control
+                // signal to be atomic about.
+                _ if S::TAG == EvalTag::Yq => {
+                    let passthrough = QueryResult::Owned(value.clone());
+                    return if rest.is_empty() {
+                        passthrough
+                    } else {
+                        continue_rest_with_context::<W, S>(
+                            passthrough,
+                            rest,
+                            root,
+                            file_origin,
+                            current_path,
+                            optional,
+                        )
+                    };
+                }
                 // #2212: currently unreachable with `optional == true`, same
                 // evidence as `catch_error_under_optional`'s doc comment.
                 _ if optional => return QueryResult::None,

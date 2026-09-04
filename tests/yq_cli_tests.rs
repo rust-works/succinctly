@@ -25670,15 +25670,23 @@ fn test_yq_error_value_preview_matches_tostring_number_literal_spelling_1055() -
 /// #2346 retired plain `.a[]` as a yq-mode `cannot_iterate` trigger: real
 /// yq's own `.[]` over any non-container is a silent no-op (confirmed live
 /// against yq v4.53.3), not an error, so `.a[]` no longer reaches this
-/// constructor in yq mode at all. `map(key)` still does -- the path-context
-/// evaluator's own `Expr::Builtin(Builtin::Map(f))` arm (distinct from the
-/// value-only evaluator's `builtin_map`, which #2346 left alone since it
-/// was already yq-gated) has no such gate. Deliberately not folded into
-/// #2346's own scope: `map`'s real yq-mode rule is asymmetric (`null` ->
-/// `[]`, any other scalar -> unchanged passthrough, confirmed live), not
-/// the uniform "always empty" rule `.[]` itself gets, so copying #2346's
-/// own widening onto this arm would be wrong, not just incomplete. Tracked
-/// as #2375.
+/// constructor in yq mode at all. This test then used `map(key)`, which
+/// #2375 retired the same way -- the path-context evaluator's
+/// `Expr::Builtin(Builtin::Map(f))` arm now applies the same asymmetric
+/// yq rule (`null` -> `[]`, any other scalar -> unchanged passthrough) the
+/// value-only `builtin_map` already had since #1907.
+///
+/// The trigger is now an assignment whose *path* expression iterates:
+/// `.a | (.[] | key) = 1`, which reaches `cannot_iterate_with` through the
+/// path-computation walk rather than through any `map`/`.[]` evaluation
+/// arm. Like every other yq-mode use of jq's "Cannot iterate over ..."
+/// template, that is itself a divergence from real yq (which no-ops and
+/// prints the document unchanged, confirmed live against v4.53.3) -- a
+/// pre-existing one, unrelated to and deliberately out of scope for #2375.
+/// It is what this test needs, though: the invariant under test is that
+/// *whenever* yq mode does build that preview, the number keeps its source
+/// spelling, and there is no shape where real yq emits the template at all
+/// to compare against instead.
 #[test]
 fn test_yq_cannot_iterate_preview_matches_tostring_number_literal_spelling_1055() -> Result<()> {
     let cases: &[&str] = &["1e2", "1E5", "1.5e-10"];
@@ -25687,7 +25695,7 @@ fn test_yq_cannot_iterate_preview_matches_tostring_number_literal_spelling_1055(
         let (tostring_out, code) = run_yq_stdin(".a | tostring", &input, &[])?;
         assert_eq!(code, 0, "literal={literal} tostring out: {tostring_out:?}");
         let expected = tostring_out.trim();
-        let (_out, stderr, code) = run_yq_stdin_with_stderr(".a | map(key)", &input, &[])?;
+        let (_out, stderr, code) = run_yq_stdin_with_stderr(".a | (.[] | key) = 1", &input, &[])?;
         assert_ne!(code, 0, "literal={literal} unexpectedly iterated a scalar");
         assert!(
             stderr.contains(expected),
@@ -30622,5 +30630,87 @@ fn test_yq_path_step_generic_non_container_is_noop_2346() -> Result<()> {
     let (out, code) = run_yq_stdin("[path(.a[])]", "a: 5\n", &["-o", "json"])?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "[]");
+    Ok(())
+}
+
+/// #2375: `map(f)`'s *path-context* arm (`eval_stage_with_path_context`,
+/// `src/jq/eval.rs`) still raised `Cannot iterate over ...` on a
+/// non-container in yq mode, where the value-only `builtin_map` a few
+/// thousand lines above already applied #1907's rule. That arm is the one
+/// reached whenever `f` -- or anything downstream of the `map` -- needs
+/// path tracking; `key` inside `f` is a native yq builtin, so no
+/// `--jq-extensions` flag is needed to reach it.
+///
+/// Captured live from the pinned oracle (yq v4.53.3):
+///
+/// ```console
+/// $ printf 'a: null\n' | yq -o=json -I=0 '.a | map(key)'            # []
+/// $ printf 'a: 5\n'    | yq -o=json -I=0 '.a | map(key)'            # 5
+/// $ printf 'a: "s"\n'  | yq -o=json -I=0 '.a | map(key)'            # "s"
+/// $ printf 'a: true\n' | yq -o=json -I=0 '.a | map(key)'            # true
+/// $ printf 'a: null\n' | yq -o=json -I=0 '.a | map(key) | . + 100'  # [100]
+/// $ printf 'a: 5\n'    | yq -o=json -I=0 '.a | map(key) | . + 100'  # 105
+/// $ printf 'a: 5\n'    | yq -o=json -I=0 '.a | map(. + 1) | key'    # "a"
+/// $ printf 'a: [1,2]\n'  | yq -o=json -I=0 '.a | map(key)'          # [0,1]
+/// $ printf 'a: {b: 1}\n' | yq -o=json -I=0 '.a | map(key)'          # ["b"]
+/// ```
+///
+/// `null` behaves as an already-empty container (result `[]`, and the rest
+/// of the pipe continues against that `[]`); every other scalar passes
+/// through completely unchanged, with the rest of the pipe continuing
+/// against *it* rather than against `[]`. The `map(. + 1) | key` row is
+/// what pins the path: yq never replaced the scalar node, so it keeps its
+/// own path and a downstream `key` still reports `"a"`.
+///
+/// Every capture above spaces the `+`: yq's lexer reads the unspaced
+/// `map(.+1)` as a different query entirely, yielding `[]` for *any* input
+/// (see #2375's review comment).
+#[test]
+fn test_map_path_context_scalar_target_noops_in_yq_mode_2375() -> Result<()> {
+    let args = &["-o=json", "-I=0"];
+
+    // `null` is an already-empty container: `[]`, and `rest` continues
+    // against that `[]`.
+    let (out, code) = run_yq_stdin(".a | map(key)", "a: null\n", args)?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[]");
+    let (out, code) = run_yq_stdin(".a | map(key) | . + 100", "a: null\n", args)?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[100]");
+
+    // Every other scalar passes through unchanged -- `key` inside the
+    // `map` never runs at all.
+    for (doc, expected) in [
+        ("a: 5\n", "5"),
+        ("a: \"s\"\n", "\"s\""),
+        ("a: true\n", "true"),
+    ] {
+        let (out, code) = run_yq_stdin(".a | map(key)", doc, args)?;
+        assert_eq!(code, 0, "doc {doc:?}, out: {out:?}");
+        assert_eq!(out.trim(), expected, "doc {doc:?}");
+    }
+
+    // ... and `rest` continues against that unchanged value, not `[]`.
+    let (out, code) = run_yq_stdin(".a | map(key) | . + 100", "a: 5\n", args)?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "105");
+
+    // The passthrough keeps the node's own path, so a `key` downstream of
+    // the `map` still names the original node.
+    for doc in ["a: null\n", "a: 5\n", "a: \"s\"\n", "a: true\n"] {
+        let (out, code) = run_yq_stdin(".a | map(. + 1) | key", doc, args)?;
+        assert_eq!(code, 0, "doc {doc:?}, out: {out:?}");
+        assert_eq!(out.trim(), "\"a\"", "doc {doc:?}");
+    }
+
+    // Containers are unaffected -- `f` still runs per element, each with
+    // its own `key`.
+    let (out, code) = run_yq_stdin(".a | map(key)", "a: [1, 2]\n", args)?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "[0,1]");
+    let (out, code) = run_yq_stdin(".a | map(key)", "a: {b: 1}\n", args)?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"["b"]"#);
+
     Ok(())
 }

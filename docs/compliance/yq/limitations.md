@@ -2144,13 +2144,33 @@ from a plain read, `del()`, or a `path()`-style path computation (#2346). `=`/`|
 `set_path`/`update_path` machinery already had this right beforehand.
 
 Two adjacent sites were deliberately left unfixed, since a naive copy of the same widening
-would be wrong (not just incomplete) or risks a worse regression:
+would be wrong (not just incomplete) or risks a worse regression. The first has since been
+fixed on its own terms (#2375); the second is still open:
 
-- **`map(f)` still raises** when path-tracking is needed inside `f` (`eval_stage_with_path_
-  context`'s own `Expr::Builtin(Builtin::Map(f))` arm) — `map`'s real yq-mode rule is
-  *asymmetric* (`null` -> `[]`, but any other scalar passes through **unchanged**, confirmed
-  live: `5 | map(.+1)` is `5`, not `[]` or empty), not the uniform "always empty" rule `.[]`
-  itself gets. Tracked as [#2375](https://github.com/rust-works/succinctly/issues/2375).
+- **`map(f)` used to still raise** when path-tracking is needed inside `f`
+  (`eval_stage_with_path_context`'s own `Expr::Builtin(Builtin::Map(f))` arm) — `map`'s
+  real yq-mode rule is *asymmetric* (`null` -> `[]`, but any other scalar passes through
+  **unchanged**), not the uniform "always empty" rule `.[]` itself gets, which is why
+  #2346 left it alone rather than copying its own widening onto it. Fixed in #2375 by
+  giving that arm the same rule the value-only `builtin_map` has had since #1907, captured
+  live against yq v4.53.3 (note the spaced `+`: yq's lexer reads the unspaced `map(.+1)`
+  as a different query entirely, yielding `[]` for *any* input):
+
+  ```bash
+  $ printf 'a: null\n' | yq -o=json -I=0 '.a | map(key)'            # []
+  $ printf 'a: 5\n'    | yq -o=json -I=0 '.a | map(key)'            # 5
+  $ printf 'a: 5\n'    | yq -o=json -I=0 '.a | map(key) | . + 100'  # 105
+  $ printf 'a: 5\n'    | yq -o=json -I=0 '.a | map(. + 1) | key'    # "a"
+  ```
+
+  **Residual gap, not yet fixed:** the *container* rows of the same arm diverge in the
+  opposite direction, and are untouched by #2375. yq's `map(f)` over a container builds a
+  new, detached node whose path is `[]`, so a downstream `key` emits nothing at all
+  (`printf 'a: [1,2]\n' | yq -o=json '.a | map(. + 1) | key'` prints nothing, exit 0),
+  where succinctly still reports the *pre-map* node's key (`"a"`). Passing a non-container
+  through with its path intact — which is what makes the scalar rows above correct — is the
+  same mechanism seen from the other side: yq never replaced the scalar node, so it kept
+  its own path.
 - **`first(.a[])` on a genuinely-resolved scalar still raises** (`resolve_iterate_bounded`,
   shared by `resolve_node`'s own `Expr::Iterate` arm and `first`/`limit`'s fast path) —
   this function is also reached by `resolve_del_path_branches`'s comma-fanout fallback for a
