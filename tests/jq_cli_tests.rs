@@ -36938,3 +36938,50 @@ fn test_validate_only_gate_array_element_delimiter_2349() -> Result<()> {
     );
     Ok(())
 }
+
+/// #2375 jq-mode counterpart of
+/// `test_map_path_context_scalar_target_noops_in_yq_mode_2375`
+/// (`tests/yq_cli_tests.rs`): the non-container no-op that fix added to
+/// `eval_stage_with_path_context`'s `Builtin::Map` arm is gated on
+/// `S::TAG == EvalTag::Yq`, so jq mode must keep raising. Real jq has no
+/// `key` builtin at all, so the oracle capture uses `map(. + 1)` and jq's
+/// own value path, which reaches the same error (jq 1.7.1):
+///
+/// ```console
+/// $ echo 'null' | jq 'map(. + 1)'
+/// jq: error (at <stdin>:1): Cannot iterate over null (null)
+/// $ echo '5'    | jq 'map(. + 1)'
+/// jq: error (at <stdin>:1): Cannot iterate over number (5)
+/// $ echo '"s"'  | jq 'map(. + 1)'
+/// jq: error (at <stdin>:1): Cannot iterate over string ("s")
+/// $ echo 'true' | jq 'map(. + 1)'
+/// jq: error (at <stdin>:1): Cannot iterate over boolean (true)
+/// ```
+///
+/// `key` is a succinctly extension in jq mode, and it is what routes these
+/// through the path-context arm rather than `builtin_map` -- the whole
+/// point of this counterpart, since the value path was already correct for
+/// jq before #2375.
+#[test]
+fn test_map_path_context_scalar_target_still_raises_in_jq_mode_2375() -> Result<()> {
+    for (input, expected) in [
+        ("null\n", "Cannot iterate over null (null)"),
+        ("5\n", "Cannot iterate over number (5)"),
+        ("\"s\"\n", "Cannot iterate over string (\"s\")"),
+        ("true\n", "Cannot iterate over boolean (true)"),
+    ] {
+        for filter in [".a | map(key)", ".a | map(key) | . + 100"] {
+            let doc = format!("{{\"a\":{}}}", input.trim());
+            let (stdout, stderr, code) = run_jq_stdin_streams(filter, &doc, &["-c"])?;
+            assert_eq!(
+                code, 5,
+                "doc {doc:?}, filter {filter:?}, stdout: {stdout:?}"
+            );
+            assert!(
+                stderr.contains(expected),
+                "doc {doc:?}, filter {filter:?}, stderr: {stderr:?}"
+            );
+        }
+    }
+    Ok(())
+}
