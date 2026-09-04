@@ -20187,6 +20187,63 @@ fn test_single_arg_builtin_internal_syntax_error_stays_parse_error_2237() -> Res
     Ok(())
 }
 
+/// #2237 review: a wrong-arity call's rewound result must still support
+/// postfix (`.field`/`[idx]`) -- `rewind_to_wrong_arity_call` and
+/// `parse_primary_inner`'s own `parse_func_call_or_error` fallback both
+/// left this unwrapped in an earlier version of this fix, exactly the
+/// `null(1).foo` regression `zero_arity_or_wrong_arity_call`'s own doc
+/// comment recounts. Also exercises the same fallback's *pre-existing* gap
+/// (unrelated to arity, present on `main` before #2237 too): a
+/// legitimately-defined function call followed by postfix failed to parse
+/// at all. Verified against jq 1.7.1.
+#[test]
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_wrong_arity_call_supports_postfix_2237() -> Result<()> {
+    for (filter, name) in [
+        ("range(1;2;3;4).foo", "range/4"),
+        ("has(1;2).foo", "has/2"),
+        ("select(1;2).foo", "select/2"),
+        ("env(1;2).foo", "env/2"),
+        ("limit(1;2;3).foo", "limit/3"),
+        ("undefinedname(1).foo", "undefinedname/1"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], Some(r#"{"foo":1}"#))?;
+        assert_eq!(stdout, "", "{filter}: stderr {stderr:?}");
+        assert!(
+            stderr.contains(&format!("{name} is not defined at <top-level>, line 1:")),
+            "{filter}: stderr {stderr:?}"
+        );
+        assert_eq!(code, 3, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+    }
+
+    // The pre-existing gap this fix incidentally closes too: a
+    // legitimately-defined function call followed by postfix now parses
+    // and evaluates, matching jq 1.7.1 (`f(1).a` => `1`).
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "def f(x): {a:x}; f(1).a"], None)?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "1");
+    Ok(())
+}
+
+/// #2237 review: `env()` (truly empty parens, no argument at all) must
+/// stay a compile-time syntax error, not rewind into a *successful* parse
+/// of `env/0` that then fails at runtime -- the same `()`-exclusion
+/// `zero_arity_or_wrong_arity_call`'s own doc comment establishes for
+/// `length()`/`not()`/`keys()`/`null()` (real jq's grammar has no
+/// zero-argument parenthesized call shape at all). Before this fix,
+/// `parse_ident()`'s failure on an immediate `)` was indistinguishable from
+/// its failure on a genuinely wrong-shaped argument (`env(1)`), so `env()`
+/// silently changed from jq 1.7.1's own compile-time syntax error (exit 3)
+/// to succinctly's runtime "undefined function" error (exit 5).
+#[test]
+fn test_env_empty_parens_stays_compile_error_not_runtime_2237() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "env()"], None)?;
+    assert_eq!(stdout, "", "stderr: {stderr:?}");
+    assert!(!stderr.contains("undefined function"), "stderr: {stderr:?}");
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    Ok(())
+}
+
 /// #1376: `succinctly jq` now supports arity overloading, matching real
 /// jq -- `def f(x): ...` and `def f(x;y): ...` are distinct functions
 /// (`f/1` and `f/2`), and both stay callable after the second definition.
