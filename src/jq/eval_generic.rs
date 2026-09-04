@@ -294,6 +294,13 @@ fn malformed_object_member<F: DocumentFields>(fields: &F) -> Option<EvalError> {
             return Some(walk.malformed_member_error());
         }
         // #1677: comma-before-key rides this same key-only walk for free.
+        //
+        // STYLE-0013: `key_delimiter_ok` directly, not
+        // `DocumentField::delimiters_ok`. This is a key-*only* walk
+        // (`uncons_key`, never `uncons`), so there is no `DocumentField` to
+        // call it on and no value resolved to check a `:` against -- taking
+        // the shared helper would mean resolving every value, which is the
+        // cost `uncons_key` exists to avoid (#1514).
         if !key_delimiter_ok::<F>(&key, &cursor, is_first) {
             return Some(walk.malformed_member_error());
         }
@@ -2486,9 +2493,9 @@ fn push_generic_truthiness_cursor_error<C: DocumentCursor>(c: &C, depth: usize) 
         //    gets attributed. Fixing it inside #1803's extraction would have
         //    made a pure refactor the vehicle for a behaviour change.
         //
-        // This marker is the point of STYLE-0013: #2211 and #2243 each added
-        // a check to "the materializers" and neither noticed this walk, and
-        // nothing in the source said it should be looked at.
+        // The marker above is what STYLE-0013 is for. #2211 and #2243 each
+        // added a check to "the materializers", neither noticed this walk,
+        // and nothing in the source said it should be looked at.
         while let Some((field, rest)) = f.uncons() {
             if !seen_fallback {
                 match key_display_string_kind(&field.key) {
@@ -11115,6 +11122,16 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     // the comma before each key; this loop already resolves
                     // every field's value regardless (`to_owned_cursor`
                     // below), so the colon check rides along for free.
+                    //
+                    // STYLE-0013: `value_delimiter_ok` directly, not
+                    // `DocumentField::delimiters_ok`. The two halves of the
+                    // member rule are deliberately split across two walks
+                    // here -- the comma half already ran, over key cursors
+                    // only -- so the shared helper would re-check it. The key
+                    // itself comes from `key_display_string`, not
+                    // `resolve_display_key`: `to_entries` builds an array of
+                    // `{key, value}` pairs, which has no display-key map for
+                    // #1642's collision guard to consult.
                     if !value_delimiter_ok::<V::Fields>(Some(&field.value), &field.value_cursor) {
                         return GenericResult::Error(fields.malformed_member_error());
                     }
