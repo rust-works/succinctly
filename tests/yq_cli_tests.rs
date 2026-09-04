@@ -30162,29 +30162,99 @@ fn test_del_comma_fanout_missing_key_iterate_optional_suppresses_nested_2324() -
     Ok(())
 }
 
-/// #2324 review, regression 2 control: the identical shape *without* the
-/// `?` on the trailing `.[]` must keep raising exactly as it did before
-/// this fix -- the fix threads the sibling's *own* `?` through, it does not
-/// change what happens when there isn't one. This control's own raise
-/// predates and is independent of this fix (it also fires for the
-/// non-comma-grouped single-target form, `del(.missing[])` alone, via the
-/// same `delete_at_path_through_absent` machinery) -- it is not itself
-/// verified against real yq here, since live-testing during review found
-/// real yq actually treats a *missing* key's trailing `.[]` as a silent
-/// no-op even without a `?` (`{"x":1} | yq 'del(.missing[], .x)'` is `{}`
-/// against yq v4.53.3), diverging from succinctly's existing, pre-#2324,
-/// single-target behaviour for the identical shape. That divergence is
-/// unrelated to the comma pre-pass this review covers and is out of scope
-/// here; this test only pins that this fix does not change it either way.
+/// #2324 review had flagged the identical shape *without* the `?` on the
+/// trailing `.[]` as a known, out-of-scope divergence: real yq treats a
+/// *missing* key's trailing `.[]` as a silent no-op even without a `?`
+/// (confirmed live against yq v4.53.3), but succinctly's own pre-#2347
+/// `delete_at_path_through_absent` hardcoded `yq_mode = false` for the
+/// whole "walk the rest of the chain against a throwaway absent value"
+/// recursion, silently downgrading every yq-mode call through it to jq's
+/// own stricter "iterate over null always raises" rule (#527). #2347 fixed
+/// that (threading the real `yq_mode` through instead), which closes this
+/// exact gap as a side effect -- this test is updated from "still raises"
+/// to the now-correct no-op, matching real yq exactly.
 #[test]
-fn test_del_comma_fanout_missing_key_iterate_no_optional_still_raises_2324() -> Result<()> {
-    let (out, stderr, code) =
-        run_yq_stdin_with_stderr("del(.missing[], .x)", "x: 1\n", &["-o=json"])?;
-    assert_ne!(code, 0, "out: {out:?}");
-    assert!(
-        stderr.contains("Cannot iterate over null"),
-        "stderr={stderr}"
+fn test_del_comma_fanout_missing_key_iterate_no_optional_now_noops_2347() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(.missing[], .x)", "x: 1\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "expected no-op per #2347's fix");
+    assert_eq!(out.trim(), "{}");
+
+    Ok(())
+}
+
+/// #2347's own issue repro: `.[5]` on a 2-element array is a positive
+/// out-of-range mid-chain index, padded with `null`s (#2314); `.missing` is
+/// then a genuinely missing field on that padded (real, but null) slot,
+/// tolerated per #476/#2323's own `real_slot` rule; the trailing `.[]` on
+/// that tolerated null must no-op in yq mode rather than raise. Confirmed
+/// live against yq v4.53.3: the array padding itself is kept (a real,
+/// committed side effect), but nothing is actually deleted.
+#[test]
+fn test_2347_del_nested_missing_field_after_array_pad_iterate_noops() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(.[5].missing[])", "[1, 2]", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[1,2,null,null,null,null]");
+    Ok(())
+}
+
+/// Same shape without any array involved: an object's own missing field,
+/// tolerated to `null`, then a further missing field on *that* tolerated
+/// null (two levels deep), then a trailing `.[]` -- must no-op all the way
+/// through, matching #476's "the exemption hands to the whole rest of the
+/// chain" rule. Confirmed live against yq v4.53.3.
+#[test]
+fn test_2347_del_multi_level_missing_field_iterate_noops() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(.x.a.b[])", r#"{"y":1}"#, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"y":1}"#);
+    Ok(())
+}
+
+/// A *genuinely found* `null` (not reached by tolerating a missing step)
+/// still vivifies to `[]` under a trailing `.[]` -- #2323's own established
+/// rule, unaffected by #2347's fix, which only adds a no-op for the
+/// *tolerated*-null case `real_slot: false` distinguishes. Confirmed live
+/// against yq v4.53.3 (`{"x":null} | del(.x[])` is `{"x":[]}`) and
+/// unaffected by threading `yq_mode` through `delete_at_path_through_absent`
+/// (that function is never reached for a found value, only a missing one).
+#[test]
+fn test_2347_del_genuinely_found_null_iterate_still_vivifies() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(.x[])", r#"{"x":null}"#, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"x":[]}"#);
+    Ok(())
+}
+
+/// jq mode is unaffected by #2347's fix -- real jq has no yq-style
+/// null-tolerance exemption for a trailing `.[]` at all, found or
+/// tolerated: `{"x":null} | del(.x[])` and `{"y":1} | del(.x.a[])` both
+/// still raise "Cannot iterate over null" (#527), confirmed live against
+/// jq 1.7.1.
+#[test]
+fn test_2347_jq_mode_unaffected() -> Result<()> {
+    let (_out, code) = run_jq_stdin("del(.x[])", r#"{"x":null}"#, &[])?;
+    assert_ne!(code, 0, "jq mode: found-null iterate should still error");
+
+    let (_out, code) = run_jq_stdin("del(.x.a[])", r#"{"y":1}"#, &[])?;
+    assert_ne!(
+        code, 0,
+        "jq mode: tolerated-null iterate should still error"
     );
 
+    Ok(())
+}
+
+/// The original safety property `delete_at_path_through_absent`'s own doc
+/// comment establishes must survive #2347's fix: a throwaway `absent` value
+/// must never vivify, even now that `yq_mode` is threaded through instead
+/// of hardcoded `false` -- `real_slot` alone (still hardcoded `false`)
+/// blocks every vivify site regardless. Confirmed live against yq v4.53.3:
+/// `{} | del(.missing[-1])` stays a clean no-op, not the out-of-range error
+/// an incorrectly-vivified `absent` would raise.
+#[test]
+fn test_2347_delete_through_absent_never_vivifies() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(.missing[-1])", "{}", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "{}");
     Ok(())
 }

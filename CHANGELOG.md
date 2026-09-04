@@ -289,6 +289,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`del()`'s trailing `.[]` raised instead of no-oping through a tolerated (rather than
+  genuinely found) `null`, in yq mode** (#2347, found during #2324's own implementation).
+  A `null` reached by tolerating a step against it — a missing object field, or an
+  already-`null` slot navigated further — exempts the rest of a `del()` chain in real
+  yq, `.[]` included; succinctly's own `Expr::Iterate` arm only handled the *vivify*
+  case (a genuinely found/padded `null`, which turns into `[]`), with no fallback for
+  the tolerated case, so it fell through to the generic "cannot iterate" error instead:
+
+  ```console
+  $ echo '{"y":1}' | yq -o=json 'del(.x.a[])'
+  {"y": 1}
+  $ echo '{"y":1}' | succinctly yq -o json 'del(.x.a[])'   # before this fix
+  Error: Cannot iterate over null (null)
+  ```
+
+  Fixed by adding a `yq_mode`-gated `OwnedValue::Null => Ok(())` case to
+  `delete_at_path`'s `Expr::Iterate` arm, ahead of the existing catch-all — deliberately
+  *not* unconditional the way the sibling `Index` arm's own `Null` fallback is, since jq
+  mode has no such exemption at all (`{"x":null} | del(.x[])` still raises "Cannot
+  iterate over null" in real jq regardless of how the null was reached, #527).
+
+  A second, deeper bug surfaced while verifying this: `delete_at_path_through_absent`
+  (the recursive walker for "the rest of the chain, against a throwaway `null`, once a
+  step has already tolerated a genuinely *missing* object field") hardcoded
+  `yq_mode = false` unconditionally, regardless of the caller's actual mode — silently
+  downgrading every yq-mode call through it to jq's own stricter rule the instant the
+  tolerance chain started from a missing key rather than a found-but-`null` value
+  (`{"y":1} | del(.x.a.b[])`, three levels of missing-field tolerance, is a clean no-op
+  in real yq but still raised before this fix). Fixed by threading the caller's own
+  `yq_mode` through instead of hardcoding it — safe to do because the function's other
+  hardcoded flag, `real_slot = false`, already blocks every vivify site on its own
+  (each is gated `yq_mode && real_slot && ...`), so enabling `yq_mode` alone cannot
+  newly reach any of them; confirmed live that the original safety property this
+  function's own doc comment establishes (`{} | del(.missing[-1])` stays a clean no-op,
+  never vivifying a throwaway value into an array first) still holds.
+
+  This also retroactively fixes a gap #2324's own code review had explicitly flagged as
+  known-but-out-of-scope: a comma-grouped `del(.missing[], .x)` (no `?` needed) now
+  correctly no-ops to `{}`, matching real yq, instead of raising.
+
 - **`del()`/`delpaths()` against an object with a wrong-kind key (numeric/null/bool)
   raised instead of no-oping in yq mode** (#2353). Real yq's own object indexing only
   understands string field names — handed anything else, it silently contributes
