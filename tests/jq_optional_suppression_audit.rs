@@ -7,7 +7,8 @@
 //! `eval::suppresses` is `optional && !e.is_decode_failure()`. Every error the
 //! materialization family can raise today is `decode_failure`-tagged --
 //! `to_owned`/`to_owned_at_depth`, `to_owned_cursor_at_depth`,
-//! `to_owned_with_cursor` and `collect_cursors_checked`, whose only error
+//! `to_owned_with_cursor`, `collect_cursors_checked` and
+//! `yaml_value_to_owned_checked`, whose only error
 //! constructors are `EvalError::decode_failure`,
 //! `EvalError::colliding_display_key` (which delegates to it) and the
 //! `malformed_delimiter/member/element_error` trio (#2286 retagged the last of
@@ -101,8 +102,29 @@ const MATERIALIZER_FN_EXCLUSIONS: &[&str] = &[
 ];
 
 fn is_materializer_fn(name: &str) -> bool {
+    if MATERIALIZER_FN_EXTRA.contains(&name) {
+        return true;
+    }
     name.starts_with(MATERIALIZER_FN_PREFIX) && !MATERIALIZER_FN_EXCLUSIONS.contains(&name)
 }
+
+/// Materializers whose names do not carry the `to_owned` prefix, and so would
+/// otherwise slip past [`is_materializer_fn`] entirely.
+///
+/// `yaml_value_to_owned_checked` (`eval.rs`, `#[cfg(feature = "std")]`) is the
+/// `load` builtin's own YAML walk: `YamlCursor -> Result<OwnedValue,
+/// EvalError>`, recursive, raising exactly the two constructors the rest of
+/// the family does (`EvalError::decode_failure` and
+/// `EvalError::colliding_display_key`, which delegates to it). It sits inside
+/// `builtin_load`, which has a live `optional` -- and the prefix rule could not
+/// see it, because the prefix is in the *middle* of the name (#2334 review).
+///
+/// Keep this roster empty if you can: a name that starts with `to_owned` is
+/// found by default, which is the polarity this audit is about. Anything here
+/// had to be noticed by a human first, which is exactly the failure mode
+/// STYLE-0012 exists to stop -- so a new materializer should be *named* into
+/// the family rather than added here.
+const MATERIALIZER_FN_EXTRA: &[&str] = &["yaml_value_to_owned_checked"];
 
 /// Methods with the same materialization contract. `collect_cursors_checked`
 /// is only ever a method call (`elements.collect_cursors_checked()`).
@@ -177,7 +199,7 @@ fn marker_in_attached_comment_block(lines: &[&str], idx: usize, body_start: usiz
 /// renamed helper or a refactor that moves the code out from under the visitor
 /// leaves it passing green while checking nothing.
 ///
-/// Today's counts are 380 functions and 149 call sites. The floors are ~90% of
+/// Today's counts are 380 functions and 151 call sites. The floors are ~90% of
 /// that (#2334 review tightened them from 250/100, which left enough headroom
 /// that a change halving the visitor's reach would still have passed): close
 /// enough to catch a scan that has lost a whole file or a whole node kind,
