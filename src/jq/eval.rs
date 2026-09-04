@@ -41410,11 +41410,19 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                                 // If single document, return it directly; otherwise return array
                                 let mut doc_values = Vec::new();
                                 while let Some((doc_cursor, rest)) = docs.uncons_cursor() {
-                                    match yaml_value_to_owned_checked(doc_cursor) {
+                                    let loaded = yaml_value_to_owned_checked(doc_cursor);
+                                    debug_assert_materialization_error(&loaded);
+                                    match loaded {
                                         Ok(v) => doc_values.push(v),
                                         // #1620: a decode failure is never
-                                        // suppressed, `optional` or not.
-                                        Err(e) => return QueryResult::Error(e),
+                                        // suppressed, `optional` or not --
+                                        // which `suppress_or_raise` states
+                                        // rather than assumes. #2334 routed
+                                        // this to match the JSON branch above,
+                                        // in the same function, on the same
+                                        // error class; the outcome is
+                                        // unchanged either way.
+                                        Err(e) => return suppress_or_raise(e, optional),
                                     }
                                     docs = rest;
                                 }
@@ -41427,10 +41435,16 @@ fn builtin_load<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                             // Documents are always wrapped in a virtual root sequence,
                             // so this is defensive; `root` itself is this single
                             // document's cursor either way.
-                            _ => match yaml_value_to_owned_checked(root) {
-                                Ok(v) => QueryResult::Owned(v),
-                                Err(e) => QueryResult::Error(e),
-                            },
+                            _ => {
+                                let loaded = yaml_value_to_owned_checked(root);
+                                debug_assert_materialization_error(&loaded);
+                                match loaded {
+                                    Ok(v) => QueryResult::Owned(v),
+                                    // Same #1620 routing as the sequence arm
+                                    // just above (#2334).
+                                    Err(e) => suppress_or_raise(e, optional),
+                                }
+                            }
                         }
                     }
                     Err(_) if optional => QueryResult::None,

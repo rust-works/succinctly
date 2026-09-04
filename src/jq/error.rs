@@ -1593,9 +1593,17 @@ impl EvalError {
 /// (#2025) and for the same reason: a hand-derived claim that nothing but
 /// review was keeping true.
 ///
-/// Called from the four depth-0 entry points only, never the recursive
+/// [`EvalError::colliding_display_key`] again, plus `eval.rs`'s
+/// `yaml_value_to_owned_checked` -- the `load` builtin's own YAML walk, whose
+/// name hides the `to_owned` in the middle and which #2334's review found
+/// outside both halves of the guard for exactly that reason. Its two error
+/// constructors are the same two.
+///
+/// Called from the depth-0 entry points only, never the recursive
 /// `*_at_depth` inner calls -- one assert per materialization, not one per
-/// node.
+/// node. `yaml_value_to_owned_checked` recurses into itself rather than into a
+/// separate `_at_depth`, so it is asserted at its two `builtin_load` call
+/// sites instead, which is the same thing: once per materialization.
 #[inline]
 pub(crate) fn debug_assert_materialization_error<T>(result: &Result<T, EvalError>) {
     debug_assert!(

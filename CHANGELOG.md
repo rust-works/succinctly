@@ -42,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     window silently excusing real gaps with a `suppresses(..)` belonging to neighbouring
     code.
   - **Runtime** — `EvalError::debug_assert_materialization_error`, called at the family's
-    four depth-0 entry points, pins the "decode failures only" premise the whole audit
+    depth-0 entry points, pins the "decode failures only" premise the whole audit
     rests on. The day that stops holding, the routed/unrouted distinction starts changing
     output at every site at once; this makes that a loud debug-build failure instead of a
     silent one. It fired nowhere across the full suite.
@@ -62,6 +62,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prefix must survive, so its `Control::Error` is suppressed at the `eval_try` boundary
   rather than at the conversion; and several sites are already routed one level out
   (`finish_fork`, `fanout_arg`'s deferred unwrap, `sort_family_control`).
+
+  Review also found one materializer the prefix rule could not see: `builtin_load`'s
+  `yaml_value_to_owned_checked`, which hides the `to_owned` in the middle of its name and
+  so sat outside both halves of the guard while its own function held a live `optional`
+  (and while the JSON branch three lines above it had just been routed). It is now on the
+  audit's roster, both its call sites are routed to match their JSON sibling, and both are
+  asserted.
 
   Along the way: four hand-copies of `optional && !e.is_decode_failure()` now call the
   shared `suppresses` — the same drift its own doc comment already records happening twice
