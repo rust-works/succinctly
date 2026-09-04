@@ -8273,34 +8273,54 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
     // `cursors` prefix (the #2145 gap `escape_generic!` already closed for
     // its own promotion) but also silently replacing whatever this
     // function's own keys-evaluation phase had already queued in
-    // `pending_halt`/`pending_key_stream_control`. Now uses the
-    // prefix-preserving `to_owned_all_cursors_checked`, same as
-    // `escape_generic!` above.
+    // `pending_halt`/`pending_key_stream_control`. Now uses the same
+    // prefix-preserving `to_owned_all_cursors_checked` and Halt-survives/
+    // Error-Break-downgrades priority `escape_generic!` above already
+    // establishes for this identical cursors -> owned conversion: an
+    // already-pending `Halt` survives unconditionally, anything else (a
+    // pending `Error`/`Break`, or nothing pending at all) downgrades to
+    // this decode failure.
     //
-    // Unlike `escape_generic!`, this decode failure is *not* given
-    // Halt-survives priority over an already-pending `pending_halt`/
-    // `pending_key_stream_control` -- `escape_generic!`'s Halt-survives rule
-    // is about its own `$control` argument (a `Halt` that's already the
-    // live escape at that call site), not about deferring to the separate,
-    // earlier-queued `pending_halt`. The established rule for *that*
-    // question, restated at three other places in this function (the
-    // ordinary per-key `Error` arm's comment a few lines below, and the
-    // `pending_key_stream_control` block's own comment further down), is
-    // the opposite: a later key's own event outranks an earlier still-
-    // pending halt (live-verified against jq 1.7.1/1.8.2: `{"a":1} |
-    // .[("a", 5, halt)]` prints `1`, then the indexing error, and never
-    // reaches `halt`). This decode failure is discovered while processing a
-    // later key than whatever queued `pending_halt`, so it follows that
-    // same rule unconditionally, matching `eval.rs`'s analogous promotion
-    // site (`KeyTargets::Owned`'s `borrowed -> owned` transition), which
-    // has never consulted `pending_halt` here either.
+    // Review round 2 first replaced this with an unconditional
+    // `Control::Error(e)`, reasoning by analogy to the *different* rule a
+    // few lines below ("a later key's own event outranks an earlier still-
+    // pending halt", live-verified via `{"a":1} | .[("a", 5, halt)]`) and
+    // to `eval.rs`'s analogous promotion site (which also never consults
+    // `pending_halt`) -- on the theory that the combined scenario (a
+    // `pending_halt` plus an independently-undecodable cursor still in
+    // `cursors`) was unreachable, since evaluating `halt` bridges through
+    // `bridge_to_full_evaluator`, which eagerly materializes the whole `.`
+    // value first and so would already have surfaced any undecodable
+    // content reachable from it. That reasoning has a real gap: it only
+    // holds when `target`'s cursors are necessarily descendants of `.` --
+    // true for ordinary navigation, but false for `at_offset`/
+    // `at_position`, which navigate the whole document's index independent
+    // of the current `.` narrowing. Confirmed live (debug probe): `.a |
+    // at_offset(N)[("found","missing",halt)]` against `{"a":1,"corrupt":
+    // {"found":"<invalid-utf8>","other":2}}`, where `N` points at
+    // `"corrupt"`'s value, reaches this arm with `pending_halt = Some(0)`
+    // -- `halt`'s bridge only materializes the clean `.a`, while
+    // `at_offset` hands `cursors` a pointer into the untouched, corrupt
+    // sibling. So the "later key's own event" rule doesn't apply here:
+    // that rule is about a key's *own* indexing operation legitimately
+    // failing (a real type/range error for *that* key); this decode
+    // failure instead comes from *rendering* an earlier key's already-
+    // successful result, the same role `escape_generic!` already plays for
+    // its own promotion -- hence the same Halt-survives priority, not the
+    // per-key-error one.
     macro_rules! ensure_owned {
         () => {
             if !any_owned {
                 any_owned = true;
                 owned = match to_owned_all_cursors_checked(&cursors) {
                     Ok(vs) => vs,
-                    Err((prefix, e)) => return partial_generic(prefix, Control::Error(e)),
+                    Err((prefix, e)) => {
+                        let control = match pending_halt {
+                            Some(code) => Control::Halt(code),
+                            None => Control::Error(e),
+                        };
+                        return partial_generic(prefix, control);
+                    }
                 };
                 cursors.clear();
             }
@@ -17466,6 +17486,41 @@ mod tests {
                 assert!(e.message.contains("invalid UTF-8"), "{e:?}");
             }
             other => panic!("expected Partial([\"ok\"], decode Error), got {other:?}"),
+        }
+    }
+
+    /// #2340 review round 2: an earlier fix attempt replaced `ensure_owned!`'s
+    /// Halt-survives priority with an unconditional `Control::Error(e)`,
+    /// reasoning that a `pending_halt` and an independently-undecodable
+    /// `cursors` entry could never coexist -- since evaluating `halt`
+    /// bridges through `bridge_to_full_evaluator`, which eagerly
+    /// materializes the whole `.` value first, so any undecodable content
+    /// reachable from it would already have surfaced there. That holds only
+    /// when `target`'s cursors are necessarily descendants of `.` -- true
+    /// for ordinary navigation, false for `at_offset`/`at_position`, which
+    /// navigate the *whole document's* index independent of `.`'s current
+    /// narrowing (`eval.rs` cannot reach this: its own `at_offset`/
+    /// `at_position` unconditionally return an error, so this is
+    /// `eval_generic.rs`-only). `.a` is a clean scalar, so `halt`'s bridge
+    /// materializes it trivially and `pending_halt` gets set; `at_offset`
+    /// then jumps straight to the untouched, corrupt `corrupt.found` field,
+    /// which `ensure_owned!` only discovers later, while processing key
+    /// `"missing"`. `cursors` holds only that one undecodable entry (no
+    /// earlier successful push to preserve as a prefix), so an empty-prefix
+    /// `Halt(0)` collapses to a bare `GenericResult::Halt` (`partial_generic`'s
+    /// documented empty-prefix behavior) -- the uncatchable exit real jq's
+    /// `halt` guarantees, not a catchable decode `Error` a `try` could
+    /// swallow.
+    #[test]
+    fn generic_ensure_owned_pending_halt_survives_at_offset_double_fault_2340() {
+        let json: &[u8] = b"{\"a\":1,\"corrupt\":{\"found\":\"\xff\xfe\",\"other\":2}}";
+        let offset = json[1..].iter().position(|&b| b == b'{').unwrap() + 1;
+        let index = JsonIndex::build(json);
+        let expr_str = format!(r#".a | at_offset({offset})[("found","missing",halt)]"#);
+        let expr = crate::jq::parse(&expr_str).unwrap();
+        match eval_with_cursor(&expr, index.root(json)) {
+            GenericResult::Halt(0) => {}
+            other => panic!("expected Halt(0), got {other:?}"),
         }
     }
 
