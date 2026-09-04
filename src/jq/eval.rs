@@ -28809,7 +28809,9 @@ fn eval_owned_fast_path<S: EvalSemantics>(
         }
     }
     match expr {
-        Expr::Identity => Some(Ok(Some(input.clone()))),
+        Expr::Identity | Expr::Field(_) | Expr::Index { .. } => {
+            eval_owned_navigation::<S>(expr, input, optional)
+        }
         Expr::Builtin(Builtin::ToString) => {
             Some(Ok(Some(OwnedValue::String(owned_to_string::<S>(input)))))
         }
@@ -28841,6 +28843,26 @@ fn eval_owned_fast_path<S: EvalSemantics>(
                 Err(e) => Some(Err(e)),
             }
         }
+        _ => None,
+    }
+}
+
+/// The `Identity`/`Field`/`Index` arms of [`eval_owned_fast_path`], factored
+/// out (#2201 review follow-up to #2048) so [`eval_owned_pure`]'s own
+/// navigation arm can call them directly instead of round-tripping through
+/// the wrapper's `is_owned_pure_composite` pre-check -- a check that arm's
+/// own doc comment already establishes is always cheaply `false` for these
+/// three shapes (`produces_fresh_value` rejects them immediately), so the
+/// round trip cost nothing incorrect, just an unnecessary detour. Behavior
+/// is unchanged: [`eval_owned_fast_path`]'s own match still dispatches here
+/// for exactly the same three shapes it always has.
+fn eval_owned_navigation<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+) -> Option<Result<Option<OwnedValue>, EvalError>> {
+    match expr {
+        Expr::Identity => Some(Ok(Some(input.clone()))),
         Expr::Field(name) => Some(match input {
             OwnedValue::Object(map) => Ok(Some(map.get(name).cloned().unwrap_or(OwnedValue::Null))),
             OwnedValue::Null => Ok(Some(OwnedValue::Null)),
@@ -29046,9 +29068,13 @@ fn eval_owned_pure<S: EvalSemantics>(
         // `!optional` gate at its call site), under which those arms answer
         // `Ok(Some(_))` or `Err(_)` and never `Ok(None)`; the `Ok(None)` arm
         // below is a non-panicking fallback to the bridge rather than an
-        // `unreachable!()`.
+        // `unreachable!()`. Calls `eval_owned_navigation` directly (#2201
+        // review follow-up), not `eval_owned_fast_path` -- that wrapper's own
+        // `is_owned_pure_composite` pre-check is always cheaply `false` for
+        // these three shapes anyway (see its own doc comment), so going
+        // through it here was a detour, not a behavior difference.
         Expr::Identity | Expr::Field(_) | Expr::Index { .. } => {
-            match eval_owned_fast_path::<S>(expr, input, false)? {
+            match eval_owned_navigation::<S>(expr, input, false)? {
                 Ok(Some(v)) => Some(Ok(v)),
                 Ok(None) => None,
                 Err(e) => Some(Err(e)),
