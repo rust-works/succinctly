@@ -6039,15 +6039,20 @@ fn test_computed_index_streams_keys_produced_before_halt() -> Result<()> {
 }
 
 #[test]
-fn test_computed_index_still_conservative_on_error_and_break() -> Result<()> {
-    // The fix above is deliberately halt-specific: `Error`/`Break` keep the
-    // pre-existing, documented conservative behavior (discard the prefix
-    // rather than stream it), matching real jq's own gap here -- see
-    // `eval_index_expr`'s doc comment. `Error` still aborts the whole
-    // process (exit 5), it just doesn't print `20`/`30` first.
+fn test_computed_index_now_streams_prefix_on_error_too_2326() -> Result<()> {
+    // #2326: this used to be named
+    // `test_computed_index_still_conservative_on_error_and_break`, pinning
+    // a deliberately conservative discard-the-prefix behavior for `Error`/
+    // `Break` that its own comment claimed matched "real jq's own gap" --
+    // that claim was never actually checked against the oracle. It
+    // doesn't: real jq streams the keys already produced before the key
+    // generator's own error, the same as it already does for `halt`
+    // (`test_computed_index_streams_keys_produced_before_halt` above).
+    // #2326 closed the gap. Verified against jq 1.7.1: `[10,20,30] |
+    // .[(1,2,error("boom"))]` prints `20` then `30` before erroring.
     let (stdout, stderr, code) = run_jq_full(&[r#".[(1,2,error("boom"))]"#], Some("[10,20,30]"))?;
     assert_eq!(code, 5);
-    assert_eq!(stdout, "");
+    assert_eq!(stdout, "20\n30\n");
     assert!(stderr.contains("boom"));
     Ok(())
 }
@@ -35074,6 +35079,53 @@ fn test_slice_expr_cli_dispatch_target_own_partial_prefix_err_outranks_control_2
     assert_eq!(stdout, "");
     assert!(
         stderr.contains("Cannot index number with object"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #2326: the mirror-image gap on `key`'s own side of `E[K]` --
+/// `eval_generic::eval_index_expr`'s key-evaluation match used to discard
+/// `key`'s own already-produced prefix and keep only the escaping control.
+/// `run_jq_full` execs the real CLI subprocess, which always dispatches
+/// through `eval_generic::eval_index_expr` for an ordinary stdin/file read.
+/// Verified against jq 1.7.1: `echo '[10,20,30]' | jq -c
+/// '.[(1,error("x"))]'` prints `20` then raises `x`.
+#[test]
+fn test_index_expr_cli_dispatch_key_own_partial_prefix_preserved_2326() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".[(1,error(\"x\"))]"], Some("[10,20,30]"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "20\n");
+    assert!(stderr.contains('x'), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #2326 review (patch coverage): multiple keys succeed before the key
+/// generator errors -- the whole successful prefix survives. Verified
+/// against jq 1.7.1: `echo '[10,20,30,40]' | jq -c
+/// '.[(0,1,error("x"))]'` prints `10` then `20` before raising.
+#[test]
+fn test_index_expr_cli_dispatch_key_own_partial_prefix_multiple_keys_2326() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", ".[(0,1,error(\"x\"))]"], Some("[10,20,30,40]"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "10\n20\n");
+    assert!(stderr.contains('x'), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #2326 review (patch coverage): an indexing failure on an already-
+/// produced key outranks the key generator's own later escape, mirroring
+/// #2226's identical priority rule for the target side. Verified against
+/// jq 1.7.1: `echo '"scalar"' | jq -c '.[(0,error("x"))]'` raises "Cannot
+/// index string with number", not `x`.
+#[test]
+fn test_index_expr_cli_dispatch_key_own_partial_prefix_err_outranks_control_2326() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".[(0,error(\"x\"))]"], Some("\"scalar\""))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("Cannot index string with number"),
         "stderr: {stderr:?}"
     );
     Ok(())
