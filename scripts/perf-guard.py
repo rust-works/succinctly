@@ -65,8 +65,7 @@ oversights -- worth revisiting once this guard has a track record:
   or `src/bits/popcount.rs`'s explicit intrinsics is invisible here, the same
   split `bench`'s own default/simd/portable-popcount 3-way matrix exists to
   separate for `rank_select`.
-- The committed `--baseline` file is a *fallback* used only for non-PR runs
-  (a direct push to `main`) and carries a real staleness risk: at this
+- The committed `--baseline` file carries a real staleness risk: at this
   project's merge cadence, `Ir` drifts 1-3% across every query within days
   from ordinary accumulated changes alone (measured directly: baseline
   source commit vs. `main` 3 days/147 commits later, 55 of them touching
@@ -74,9 +73,15 @@ oversights -- worth revisiting once this guard has a track record:
   pinning `codegen-units=1` on both sides of that same comparison left the
   drift the same size or larger, so #1587's fix for a similar-looking
   wall-clock/icache issue does not apply here. It is why `--baseline-binary`
-  exists: a same-run comparison against the PR's own merge-base cancels
-  staleness from any cause, instead of trying to keep a checked-in file
-  fresh against a fast-moving `main`.
+  exists: a same-run comparison cancels staleness from any cause, instead of
+  trying to keep a checked-in file fresh against a fast-moving `main`. `ci.yml`
+  now passes `--baseline-binary` on *every* run this job triggers for --
+  `pull_request` against the PR's own `git merge-base`, and (#2117) `push`
+  against `github.event.before`, the commit `main` pointed to immediately
+  before that push -- so the checked-in file only still matters as a
+  fallback for the rare case neither can supply a binary (a branch's first
+  push, or a `before` SHA this checkout doesn't have), and as a seed for a
+  human running this script locally with no comparison binary of their own.
 
 Standard library only; no third-party dependencies.
 """
