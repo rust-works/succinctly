@@ -289,6 +289,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`del()` through a chained slice-run followed by more path (`del(.a[0:2].x)`) silently
+  no-op'd instead of erroring when the slice target is an array or `null`** (#2333, found
+  during #2323's own code review). #1219's own "trailing slice-run followed by anything
+  non-slice makes the whole `del()` inert" rule classified every such shape uniformly as a
+  no-op — correct for a string slice (#1219/#1321's own established precedent) and for a
+  bare trailing `Index` (`del(.a[0:2][0])`), but real yq's own generic indexing can't tell
+  an object-field key from an array-index key apart (both are spelled `.key`): once the
+  current node is a sequence, it always tries to parse the key as an integer, which fails
+  for a genuine field name and raises `cannot index array with '<name>'` instead of
+  no-oping. Live-verified:
+
+  ```console
+  $ echo 'null' | yq -o=json 'del(.[0:2].a)'
+  Error: cannot index array with 'a' (strconv.ParseInt: parsing "a": invalid syntax)
+  $ echo '{"a":[1,2,3]}' | yq -o=json 'del(.a[0:2].x)'
+  Error: cannot index array with 'x' (strconv.ParseInt: parsing "x": invalid syntax)
+  ```
+
+  Fixed via a new `yq_del_slice_field_error` check, added to `yq_del_slice_outcome`'s
+  existing "last component isn't a slice" branch as a new `YqDelSliceOutcome::Error`
+  outcome (wired into all 5 of that enum's call sites, one of which —
+  `rewrite_yq_del_comma_branches`, the comma-branch pre-filter — needed its own return
+  type widened from `Option<Expr>` to `Result<Option<Expr>, EvalError>` to propagate it).
+  `null`'s array-shaped treatment is a quirk of being the *direct* slice target only
+  (real yq's null-as-array slice has no actual elements behind it, confirmed live:
+  `null | del(.[0:2][0].a)` stays `null`, not an error) — an `Array` target keeps the
+  error live through arbitrarily deeper `Index` navigation instead, since real document
+  data really is there to walk (confirmed live: `del(.a[0:2][0].x)` errors when index 0
+  holds another array, stays a no-op when it holds a scalar or object). A comma-grouped
+  sibling gets the same error treatment but propagated differently from #1219's own
+  `Noop`-sibling rule: real yq fails the *whole* call, not just the erroring branch
+  (confirmed live: `del(.a[0:2].x, .c)` on `{"a":[1,2,3],"c":9}` leaves `.c` undeleted
+  too).
+
 - **17 more sites ignored `optional`, continuing the #2231/#2280 lineage** (#2327,
   follow-up from #2280's own code review): `eval.rs`'s `builtin_del` (its own doc comment
   already promised "any resulting error is caught right here, turning the whole call's
