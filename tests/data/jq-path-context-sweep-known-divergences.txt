@@ -1,0 +1,74 @@
+# Known divergences of succinctly from the pinned oracles for the path-context
+# sweep (scripts/jq-path-context-oracle-sweep.sh, #2416 phase 0).
+#
+# One line per divergent *class*, whitespace-separated:
+#
+#   <mode>/<class glob>    <category>    <reason — #issue>
+#
+# The glob is matched against `<mode>/<class>` with shell pattern matching, so
+# `*` spans `/`. `#` lines and blank lines are ignored. First match wins, so
+# order is significant: put the construct-specific patterns above the
+# position-specific ones.
+#
+# The check is two-sided, like tests/data/jq-golden-known-failures.txt: a
+# divergence with no line here fails the sweep, and a line here that never
+# matched a divergence fails it too — so a fix is forced to shrink this file
+# and no gap can hide behind a stale entry.
+#
+# Every line is an oracle capture, never a memory claim: each was recorded by
+# this sweep against /usr/bin/jq 1.7.1 and Homebrew yq v4.53.3 on 2026-09-05.
+# The representative shapes are pinned as golden cases under
+# tests/data/{jq,yq}-golden/cases/path_ctx_* so CI enforces them on every leg;
+# this file is what keeps the *sweep* a pass/fail signal rather than a list a
+# reader has to re-triage by hand.
+
+# --- yq mode ----------------------------------------------------------------
+
+# Real yq's `first(f)` is not jq's. `.a | first(key)` answers `1` (the first
+# child's *value*), `.a[] | first(key)` answers nothing at all, and the
+# argument is never evaluated as a filter. succinctly implements jq's
+# `first(f)`. Not a path-context gap — the leaf under it is incidental.
+yq/*/first/*/*        yq_first        real yq's first(f) ignores its argument and yields the first child — #2377
+
+# `{"k": key}`/`{"k": path}`/`{"k": parent}` answer null/[]/{} at every
+# position: `eval_pipe_with_path_context_internal` has no `Expr::Object` arm,
+# so the whole object construction falls to the context-dropping fallback.
+yq/*/object/*/*       object_arm      no Expr::Object arm in the path-context evaluator, so the leaf loses its path — #1332
+
+# Real yq's comma is stream-level: `.a[] | ((key), 1)` answers `"b" "c" 1 1`
+# (every `key` output, then every `1`), where succinctly interleaves per
+# element (`"b" 1 "c" 1`). Same root cause as the `a, b | c` grouping.
+yq/*/comma/*/*        comma_stream    yq's comma composes at the stream level, succinctly's per element — #2420
+
+# `file_index` answers 0 for every input file. Real yq counts files (`0`,
+# `1`), and `--eval-all` diverges further still (succinctly slurps the files
+# into one array; yq keeps them a stream). Surfaced by this sweep — see the
+# #2416 phase 0 report; no issue filed yet.
+yq/file_index/*       file_index      file_index is always 0 across multiple input files — #2416 phase 0
+
+# `parent`/`key` at the document root: real yq emits nothing (exit 0),
+# succinctly prints `{}` and `null`. These are the positions the #2061 walk
+# refuses as Unsupported today; phase 2 flips them.
+yq/key/*/root         root_edge       key at the root prints null where real yq emits nothing — #2421
+yq/parent/*/root      root_edge       parent at the root prints {} where real yq emits nothing — #2421
+
+# Recursive descent drops path context wholesale: every node reached through
+# `..` reports `path == []`, `key == null`, `parent == {}`. `..` is not in
+# `path_context_is_cursor_walkable`, and the bridge's own recurse arm never
+# threads the accumulated path into its outputs. Surfaced by this sweep — see
+# the #2416 phase 0 report; no issue filed yet.
+yq/key/*/descend      descend_path    `..` loses path context: key is null at every depth — #2416 phase 0
+yq/parent/*/descend   descend_path    `..` loses path context: parent is {} at every depth — #2416 phase 0
+yq/path/*/descend     descend_path    `..` loses path context: path is [] at every depth — #2416 phase 0
+
+# --- jq mode ----------------------------------------------------------------
+
+# `path(foreach (getpath(...)) as $x (null; $x))` raises "Invalid path
+# expression with result ..." where jq 1.7.1 resolves it to the path. Same
+# family as #2388's `foreach` INIT-fork disagreement, and the shape the
+# promoted scratch sweep was originally written to hunt.
+jq/getpath/foreach/path/*   foreach_path   path(foreach getpath(..) as $x ...) raises where jq resolves the path — #2388
+
+# `.. | (getpath([<path producer>]))?` drops the `[]` output jq produces for
+# the root position; the `?` swallows it instead of letting it through.
+jq/*/getpath/opt/descend    optional_root  `?` over getpath at the root drops jq's own `[]` output — #2416 phase 0
