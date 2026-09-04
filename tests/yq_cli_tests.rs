@@ -29446,6 +29446,47 @@ fn test_index_expr_key_partial_prefix_still_discarded_in_yq_mode_2326() -> Resul
     Ok(())
 }
 
+/// #2328: `eval_index_expr_with_path_context`'s target `Partial` fix is
+/// jq-only, mirroring #2226's own carve-out one level up -- real yq does
+/// not stream a target's own escaped generator's prefix through `del()`
+/// either. `del()` (not `path()`, which isn't native yq surface) is what
+/// forces path-context routing here; `.a`/`.b` are deleted only if the
+/// gate is missed. Verified live against yq v4.53.3:
+/// `del((.a,.b,error("x"))[(0)])` on `{a: [1,2], b: [3,4]}` prints only
+/// `Error: x`, with neither `.a` nor `.b` touched (the whole command
+/// errors before producing any output document).
+#[test]
+fn test_index_expr_with_path_context_target_partial_prefix_still_discarded_in_yq_mode_2328(
+) -> Result<()> {
+    let (out, stderr, code) = run_yq_stdin_with_stderr(
+        "del((.a,.b,error(\"x\"))[(0)])",
+        "a:\n  - 1\n  - 2\nb:\n  - 3\n  - 4\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 1, "out: {out:?} stderr: {stderr:?}");
+    assert_eq!(out, "");
+    assert_eq!(stderr.trim(), "Error: x");
+    Ok(())
+}
+
+/// #2328 sibling: the identical yq-mode carve-out for
+/// `eval_slice_expr_with_path_context`. Verified live against yq v4.53.3:
+/// `del((.a,.b,error("x"))[(0):(2)])` on `{a: [1,2,3], b: [4,5,6]}` prints
+/// only `Error: x`.
+#[test]
+fn test_slice_expr_with_path_context_target_partial_prefix_still_discarded_in_yq_mode_2328(
+) -> Result<()> {
+    let (out, stderr, code) = run_yq_stdin_with_stderr(
+        "del((.a,.b,error(\"x\"))[(0):(2)])",
+        "a:\n  - 1\n  - 2\n  - 3\nb:\n  - 4\n  - 5\n  - 6\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 1, "out: {out:?} stderr: {stderr:?}");
+    assert_eq!(out, "");
+    assert_eq!(stderr.trim(), "Error: x");
+    Ok(())
+}
+
 /// #2351: unlike #2226's/#2326's own target/key gates, `eval_generic::
 /// eval_slice_bound` had *no* yq-mode gate at all -- it unconditionally kept
 /// a slice *bound*'s own escaped generator's prefix in both modes. This is
