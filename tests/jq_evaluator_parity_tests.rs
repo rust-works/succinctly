@@ -1475,11 +1475,13 @@ fn test_parity_positive_index_trailing_comma_2312() {
 /// INIT fork after the first; succinctly re-evaluates SOURCE identically for
 /// every fork instead — see `docs/compliance/jq/limitations.md`'s "INIT-fork
 /// re-entry" entry and `eval.rs`'s
-/// `test_foreach_reduce_init_fork_source_reads_ambient_input_2163`) is a
-/// shared-core behavior, not `eval.rs`-specific. Pins that both evaluators
-/// land on the same (succinctly-consistent) answer rather than just one of
-/// them, so a future refactor of either evaluator's INIT-fork handling can't
-/// silently reintroduce drift between them.
+/// `test_foreach_reduce_init_fork_source_reads_ambient_input_2163`). Both
+/// front ends here (`full_outputs`/`generic_outputs`) ultimately dispatch to
+/// the same shared `eval_reduce_with_values`/`eval_foreach_with_values` core,
+/// so this does not double-verify two independently-coded evaluators — it
+/// pins that each front end's own input-collection step still feeds that
+/// shared core the same way, so a future change to either front end's
+/// dispatch can't quietly stop reaching it.
 #[test]
 fn test_parity_foreach_reduce_init_fork_source_reads_ambient_input_2163() {
     for filter in [
