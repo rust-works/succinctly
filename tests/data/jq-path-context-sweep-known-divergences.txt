@@ -33,7 +33,6 @@ yq/*/first/*/*        yq_first        real yq's first(f) ignores its argument an
 # `{"k": key}`/`{"k": path}`/`{"k": parent}` answer null/[]/{} at every
 # position: `eval_pipe_with_path_context_internal` has no `Expr::Object` arm,
 # so the whole object construction falls to the context-dropping fallback.
-yq/*/object/*/*       object_arm      no Expr::Object arm in the path-context evaluator, so the leaf loses its path — #1332
 
 # Real yq's comma is stream-level: `.a[] | ((key), 1)` answers `"b" "c" 1 1`
 # (every `key` output, then every `1`), where succinctly interleaves per

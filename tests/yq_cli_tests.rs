@@ -9327,15 +9327,19 @@ fn test_line_select_filters_and_keeps_position() -> Result<()> {
 
 #[test]
 fn test_line_column_object_construction_is_a_known_limitation() -> Result<()> {
-    // Object/array construction (`{...}`/`[...]`) isn't natively cursor-aware
-    // in the generic evaluator — it round-trips through OwnedValue, which
-    // has nowhere to carry a position. Documented limitation (#532), pinned
-    // here so a future fix is visible as an intentional test change rather
-    // than a silent behavior shift.
+    // Object construction used to round-trip through OwnedValue, which has
+    // nowhere to carry a position, so `line`/`column` inside `{...}` read
+    // `0` (#532). Spine 2416's phase 3 made object construction native in
+    // the generic evaluator with the cursor threaded into every value
+    // expression, so they now answer from the node: real yq v4.53.3 gives
+    // `.baz | line` as `2` on this document (its lexer rejects the unquoted
+    // object-key spelling, so the construction itself has no oracle). The
+    // `column` value is succinctly's own (yq says `1`), a separate,
+    // pre-existing divergence this test is not about.
     let yaml = "foo: bar\nbaz: qux\n";
     let (output, code) = run_yq_stdin(".baz | {l: line, c: column}", yaml, &["-o=json", "-I=0"])?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#"{"l":0,"c":0}"#);
+    assert_eq!(output.trim(), r#"{"l":2,"c":6}"#);
     Ok(())
 }
 
@@ -29368,6 +29372,28 @@ fn test_negative_index_path_component_is_resolved_in_yq_mode_2416() -> Result<()
         (".a[-1] | parent | key", r#""a""#),
     ] {
         let (out, code) = run_yq_stdin(filter, "a: [1, 2]\n", &["-o", "json", "-I0"])?;
+        assert_eq!(code, 0, "`{filter}`: {out:?}");
+        assert_eq!(out.trim(), want, "`{filter}`");
+    }
+    Ok(())
+}
+
+/// #1332, closed by spine 2416's phase 3: object construction is native in
+/// the generic evaluator with the cursor threaded into every key and value,
+/// so `key` inside `{..}` answers the node's own key. Every row captured
+/// live from yq v4.53.3 on `a: {b: [1, 2], c: x}`; the last one is the
+/// key-generator fan-out, keys varying slowest.
+#[test]
+fn test_object_construction_keeps_path_context_2416() -> Result<()> {
+    let doc = "a:\n  b: [1, 2]\n  c: x\n";
+    for (filter, want) in [
+        (".a | {\"x\": key}", r#"{"x":"a"}"#),
+        ("[.a[] | {\"k\": key}]", r#"[{"k":"b"},{"k":"c"}]"#),
+        (".a | {(.c, \"q\"): key}", "{\"x\":\"a\"}\n{\"q\":\"a\"}"),
+        (".a.b[] | key + 10", "10\n11"),
+        (".a[] | key + \"!\"", "\"b!\"\n\"c!\""),
+    ] {
+        let (out, code) = run_yq_stdin(filter, doc, &["-o", "json", "-I0"])?;
         assert_eq!(code, 0, "`{filter}`: {out:?}");
         assert_eq!(out.trim(), want, "`{filter}`");
     }
