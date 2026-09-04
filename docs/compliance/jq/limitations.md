@@ -3699,13 +3699,18 @@ candidate can never satisfy `< to`/`> to` regardless of *which* call site
 computed it — cap-terminated or not. Both call sites now end the loop and
 keep whatever has already been pushed. A `range` between two valid `i64`
 endpoints always pushes at least one value (`from` itself) before any
-possible overflow, so **the `None => eval_range_values_f64(...)` fallback in
-`each_range`'s `emit` closure is now unreachable for `Int`/`Int`/`Int`
-operands entirely** — `eval_range_values` always returns `Some`. The
-function's `Option` return type is unchanged (kept for API stability, not
-because `None` can still occur) — see its own doc comment, and
+possible overflow, so **the `None => eval_range_values_f64(...)` fallback
+`each_range`'s `emit` closure used to reach for `Int`/`Int`/`Int` operands
+is now provably unreachable**. `eval_range_values` therefore drops its
+`Option` return type entirely — it's a private function with exactly two
+in-file call sites (production and its own test module), so there was no
+external caller for an `Option` signature to stay compatible with — see its
+own doc comment, and
 `test_range_dispatch_keeps_exact_int_prefix_through_overflow_2219`, which
 pins this for both the original repro and a fresh near-`i64::MAX` case.
+`eval_range_values_f64` remains real, reachable production code; it's just
+reached only via `emit`'s other match arm now, for genuinely non-integer
+operands.
 
 This changes what the original repro now produces:
 
