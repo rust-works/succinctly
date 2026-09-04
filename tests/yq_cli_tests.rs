@@ -29448,18 +29448,21 @@ fn test_index_expr_key_partial_prefix_still_discarded_in_yq_mode_2326() -> Resul
 
 /// #2328: `eval_index_expr_with_path_context`'s target `Partial` fix is
 /// jq-only, mirroring #2226's own carve-out one level up -- real yq does
-/// not stream a target's own escaped generator's prefix through `del()`
-/// either. `del()` (not `path()`, which isn't native yq surface) is what
-/// forces path-context routing here; `.a`/`.b` are deleted only if the
-/// gate is missed. Verified live against yq v4.53.3:
-/// `del((.a,.b,error("x"))[(0)])` on `{a: [1,2], b: [3,4]}` prints only
-/// `Error: x`, with neither `.a` nor `.b` touched (the whole command
-/// errors before producing any output document).
+/// not stream a target's own escaped generator's prefix through `key`
+/// either. `key` (not `del()`/`path()`, which route through the wholly
+/// separate `resolve_index_expr`/`resolve_dynamic_indexes` resolver --
+/// correcting #2328's own body, a review finding) is what forces
+/// path-context routing through this function; confirmed by instrumenting
+/// both `Partial` arms with a debug probe: `del(...)` never fired it in
+/// this build, `| key` did. Verified live against real yq v4.53.3 too
+/// (which does support `key`, unlike computed-bound `del()`'s own
+/// syntax restrictions): `(.a,.b,error("x"))[(0+0)] | key` on
+/// `{a: [1,2], b: [3,4]}` prints only `Error: x`, no `0`/`0` prefix.
 #[test]
 fn test_index_expr_with_path_context_target_partial_prefix_still_discarded_in_yq_mode_2328(
 ) -> Result<()> {
     let (out, stderr, code) = run_yq_stdin_with_stderr(
-        "del((.a,.b,error(\"x\"))[(0)])",
+        "(.a,.b,error(\"x\"))[(0+0)] | key",
         "a:\n  - 1\n  - 2\nb:\n  - 3\n  - 4\n",
         &["-o", "json"],
     )?;
@@ -29470,14 +29473,20 @@ fn test_index_expr_with_path_context_target_partial_prefix_still_discarded_in_yq
 }
 
 /// #2328 sibling: the identical yq-mode carve-out for
-/// `eval_slice_expr_with_path_context`. Verified live against yq v4.53.3:
-/// `del((.a,.b,error("x"))[(0):(2)])` on `{a: [1,2,3], b: [4,5,6]}` prints
+/// `eval_slice_expr_with_path_context`. `0 as $s | 2 as $e | ...[$s:$e]`
+/// (not a bare literal bound, which constant-folds to `Expr::Slice`'s
+/// static fast path and never reaches this function at all, #1326) is
+/// real yq's own supported spelling for a computed slice bound -- yq
+/// rejects `[(1-1):2]`'s bare-arithmetic-in-brackets form outright
+/// (`bad expression, please check expression syntax`), confirmed live.
+/// Verified live against yq v4.53.3: `0 as $s | 2 as $e |
+/// (.a,.b,error("x"))[$s:$e] | key` on `{a: [1,2,3], b: [4,5,6]}` prints
 /// only `Error: x`.
 #[test]
 fn test_slice_expr_with_path_context_target_partial_prefix_still_discarded_in_yq_mode_2328(
 ) -> Result<()> {
     let (out, stderr, code) = run_yq_stdin_with_stderr(
-        "del((.a,.b,error(\"x\"))[(0):(2)])",
+        "0 as $s | 2 as $e | (.a,.b,error(\"x\"))[$s:$e] | key",
         "a:\n  - 1\n  - 2\n  - 3\nb:\n  - 4\n  - 5\n  - 6\n",
         &["-o", "json"],
     )?;

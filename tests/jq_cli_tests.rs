@@ -9629,11 +9629,11 @@ fn test_computed_bracket_path_context_coverage_gaps_2100() -> Result<()> {
     // `break` is the one control variant real jq itself never lets a
     // Partial-target's own prefix survive past (verified directly against
     // real jq's plain-read evaluator too, the #2226-fixed ground truth:
-    // `label $out | [(([1,2],break $out))[(0.5):(1.5)]]` prints `[]`, no
-    // `[1,2]`) -- not a special case this function's own #2328 fix has to
-    // encode, since the `label`/array-constructor machinery that catches
-    // `break $out` discards whatever `Partial` prefix it carries regardless
-    // of which evaluator produced it.
+    // `label $out | [(([1,2],break $out))[(0.5):(1.5)]]` prints nothing at
+    // all -- no `[]`, no `[1,2]`) -- not a special case this function's own
+    // #2328 fix has to encode, since the `label`/array-constructor
+    // machinery that catches `break $out` discards whatever `Partial`
+    // prefix it carries regardless of which evaluator produced it.
     let (stdout, _, code) = run_jq_full(
         &[
             "-c",
@@ -12108,22 +12108,38 @@ fn test_eval_index_expr_with_path_context_target_partial_no_longer_discards_pref
 ) -> Result<()> {
     // `eval_index_expr_with_path_context`'s target-side
     // `QueryResult::Partial(vs, control)` arm -- the path-context sibling of
-    // `test_eval_index_expr_target_partial_halt_no_longer_discards_prefix_2226`,
-    // reached via `path(...)` instead of a plain read. Before #2328 this arm
-    // discarded `target`'s own already-produced values outright (the
-    // identical bug #2226 fixed one level up in the plain-read evaluator);
-    // #2328 applies the same fix here, indexing each already-produced
-    // target value first before `control` fires. `.a`/`.b` (not array
-    // literals) so the target stays a valid `path()` argument, matching
-    // real jq 1.7.1 exactly: `{"a":[1,2],"b":[3,4]} | path((.a,.b,
-    // halt_error(6))[(0+0)])` streams `["a",0]` then `["b",0]` (indexing
-    // each of `.a`/`.b`'s own values by key `0`) before exiting 6.
+    // `test_eval_index_expr_target_partial_halt_no_longer_discards_prefix_2226`.
+    // Before #2328 this arm discarded `target`'s own already-produced
+    // values outright (the identical bug #2226 fixed one level up in the
+    // plain-read evaluator); #2328 applies the same fix here, indexing each
+    // already-produced target value first before `control` fires.
+    //
+    // Reached via `| key`, not `path(...)`/`del(...)`/assignment (review
+    // finding, correcting #2328's own body): `path(EXPR)` dispatches
+    // through `Builtin::Path` -> `builtin_path_on_owned` ->
+    // `resolve_dynamic_indexes`/`resolve_index_expr`, and `del()`/`=`/`|=`
+    // through `builtin_del`/`resolve_index_expr` -- a wholly separate
+    // resolver that already threads a target's own escape-with-prefix
+    // through `resolve_node`'s `Err((prefix, e))` arm (see
+    // `resolve_index_expr`'s own comment at its `target_escape` binding).
+    // This function is reached only via `needs_path_context`'s actual
+    // trigger set (`key`/`parent`/`file_index`, or one of those nested
+    // inside a comma/pipe/etc.) -- confirmed by instrumenting both `Partial`
+    // arms with a debug probe: `path(...)`/`del(...)` never fired it,
+    // `| key` did, in both jq and yq mode.
+    //
+    // No jq oracle for `key` itself (a succinctly extension, `jq:
+    // error: key/0 is not defined`) -- internal consistency instead,
+    // matching every other `key`-based case already in
+    // `test_computed_bracket_path_context_coverage_gaps_2100`: `0` is the
+    // index each of `.a`'s/`.b`'s own values was read by, matching that
+    // test's own `(.a,.b)[if true then 0 else 1 end] | key` => `0\n0`.
     let (stdout, stderr, code) = run_jq_full(
-        &["-c", "path((.a,.b,halt_error(6))[(0+0)])"],
+        &["-c", "(.a,.b,halt_error(6))[(0+0)] | key"],
         Some(r#"{"a":[1,2],"b":[3,4]}"#),
     )?;
     assert_eq!(code, 6, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "[\"a\",0]\n[\"b\",0]\n");
+    assert_eq!(stdout, "0\n0\n");
     Ok(())
 }
 
@@ -12134,18 +12150,17 @@ fn test_eval_slice_expr_with_path_context_target_partial_no_longer_discards_pref
     // the slice sibling of the index test immediately above, and the
     // path-context sibling of
     // `test_eval_slice_expr_target_partial_halt_no_longer_discards_prefix_2226`.
-    // Verified against jq 1.7.1: `{"a":[1,2,3],"b":[4,5,6]} |
-    // path((.a,.b,halt_error(6))[(1-1):2])` streams `["a",{"start":0,
-    // "end":2}]` then `["b",{"start":0,"end":2}]` before exiting 6.
+    // Same routing correction and no-oracle caveat as that test: reached
+    // via `| key`, not `path(...)`. `{"start":0,"end":2}` is `key`'s own
+    // established shape for a slice step, matching this file's other slice
+    // `| key` cases (e.g. `test_computed_bracket_path_context_coverage_gaps_2100`'s
+    // `(.a,.b)[(0.5):(1.5)] | key` => `{"start":0.5,"end":1.5}` per value).
     let (stdout, stderr, code) = run_jq_full(
-        &["-c", "path((.a,.b,halt_error(6))[(1-1):2])"],
+        &["-c", "(.a,.b,halt_error(6))[(1-1):2] | key"],
         Some(r#"{"a":[1,2,3],"b":[4,5,6]}"#),
     )?;
     assert_eq!(code, 6, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(
-        stdout,
-        "[\"a\",{\"start\":0,\"end\":2}]\n[\"b\",{\"start\":0,\"end\":2}]\n"
-    );
+    assert_eq!(stdout, "{\"start\":0,\"end\":2}\n{\"start\":0,\"end\":2}\n");
     Ok(())
 }
 
