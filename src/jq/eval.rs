@@ -39,10 +39,9 @@ use std::rc::Rc;
 use indexmap::IndexMap;
 
 use super::document::{
-    effective_fields, effective_fields_checked, effective_keys, effective_len_checked,
-    key_delimiter_ok, key_display_string, key_display_string_kind, resolve_display_key,
-    trailing_element_gap_ok, value_delimiter_ok, DisplayKeyGuard, DocumentCursor, DocumentElements,
-    DocumentFields,
+    child_tail_gap_ok, effective_fields, effective_fields_checked, effective_keys,
+    effective_len_checked, key_display_string, key_display_string_kind, DisplayKeyGuard,
+    DocumentCursor, DocumentElements, DocumentFields,
 };
 use super::slice::{self, SliceBounds};
 use super::walk::{any_subexpr, map_builtin_subexprs, map_subexprs};
@@ -690,16 +689,11 @@ fn to_owned_at_depth<W: Clone + AsRef<[u64]>>(
                 elems = rest;
                 is_first = false;
             }
-            // #2262: see this function's own doc comment above -- `[,]`
-            // (#2211's `container_gap_ok`) can't be checked here, no
-            // container cursor is ever in hand. `[1,]` (#2243) can: it
-            // only needs the last real element's own cursor, retained
-            // above.
-            if let Some(last) = &last_elem {
-                if !trailing_element_gap_ok(last, b']') {
-                    return Err(last.malformed_delimiter_error());
-                }
-            }
+            // #2262/#1803: the value-domain tail -- `[1,]` (#2243) checked
+            // via the last real element's own cursor, `[,]` (#2211) not,
+            // because no container cursor is ever in hand here. See
+            // `child_tail_gap_ok`'s own doc comment.
+            child_tail_gap_ok(last_elem.as_ref(), b']')?;
             OwnedValue::Array(items)
         }
         StandardJson::Object(fields) => {
@@ -719,34 +713,20 @@ fn to_owned_at_depth<W: Clone + AsRef<[u64]>>(
             // #2262: same reasoning as the array arm's own `last_elem`
             // above.
             let mut last_field: Option<JsonCursor<'_, W>> = None;
-            while let Some((field, rest)) = f.uncons() {
-                let key_val = field.key();
-                // `resolve_display_key` covers both key axes in one call
-                // (#1734): `Ok(None)` is a structurally non-string key
-                // (#1194) and raises here, matching
-                // `eval_generic::to_owned_at_depth`'s own handling of the
-                // identical case; `Err` is a collision between two
-                // decode-failure fallback spellings, which also raises
-                // rather than silently overwriting an entry in `map`
-                // (#1642's `DisplayKeyGuard`); `Ok(Some(key))` covers both
-                // an ordinary key and a decode-failure key preserved via
-                // its lossily-decoded raw source span.
-                let Some(key) = resolve_display_key(&key_val, &map, &mut guard)? else {
-                    return Err(f.malformed_member_error());
-                };
-                // #1677/#2262: same delimiter checks as
-                // `eval_generic::to_owned_at_depth`'s object loop -- this
-                // function had none of it before #2262.
-                if !key_delimiter_ok::<JsonFields<'_, W>>(&key_val, &field.key_cursor(), is_first)
-                    || !value_delimiter_ok::<JsonFields<'_, W>>(
-                        Some(&field.value()),
-                        &field.value_cursor(),
-                    )
-                {
-                    return Err(f.malformed_member_error());
-                }
-                map.insert(key, to_owned_at_depth(&field.value(), depth + 1)?);
-                last_field = Some(field.value_cursor());
+            // #1803: `DocumentFields::uncons`, not the inherent
+            // `JsonFields::uncons` -- the trait's own impl (`json::light`)
+            // builds its `DocumentField` from exactly the four accessors
+            // this loop already called by hand (`key`/`value`/`key_cursor`/
+            // `value_cursor`), so nothing extra is resolved, and it is what
+            // lets this walk share `checked_key` with its generic siblings
+            // instead of hand-copying their checks a third time.
+            while let Some((field, rest)) = DocumentFields::uncons(&f) {
+                // #1734/#1677/#2262: key resolution and delimiter checks in
+                // one shared call -- see `DocumentField::checked_key`. This
+                // function had none of the delimiter half before #2262.
+                let key = field.checked_key(&f, &map, &mut guard, is_first)?;
+                map.insert(key, to_owned_at_depth(&field.value, depth + 1)?);
+                last_field = Some(field.value_cursor);
                 f = rest;
                 is_first = false;
             }
@@ -754,11 +734,7 @@ fn to_owned_at_depth<W: Clone + AsRef<[u64]>>(
                 return Err(f.malformed_member_error());
             }
             // #2262: same reasoning as the array arm's own check above.
-            if let Some(last) = &last_field {
-                if !trailing_element_gap_ok(last, b'}') {
-                    return Err(last.malformed_delimiter_error());
-                }
-            }
+            child_tail_gap_ok(last_field.as_ref(), b'}')?;
             OwnedValue::Object(map)
         }
         // #2286 review: this arm used to silently substitute `Null` for a

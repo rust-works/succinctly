@@ -28,9 +28,8 @@ use std::borrow::Cow;
 use crate::json::light::{JsonCursor, StandardJson};
 
 use super::document::{
-    effective_len, effective_len_checked, key_delimiter_ok, key_display_string,
-    resolve_display_key, value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors, DocumentCursor,
-    DocumentFields,
+    effective_len, effective_len_checked, key_display_string, DisplayKeyGuard, DistinctKeyCursors,
+    DocumentCursor, DocumentFields,
 };
 use super::error::EvalError;
 use super::escape::write_json_body_jq;
@@ -853,17 +852,15 @@ fn cursor_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
             for child in cursor.children() {
                 // #2211 code review: this walk (unlike its
                 // `eval_generic::to_owned_cursor_at_depth` sibling it
-                // otherwise mirrors) never called `preceding_delimiter_ok`
-                // at all -- not even the missing/doubled-comma-between-two-
-                // real-elements check (#1677), which the `Object` arm below
-                // already had. `{"a" 1, "b": 2} | -e` used to silently
-                // succeed for the array shape (`[1 2, 3]`) the same way this
-                // object shape used to before #1956.
-                if let Some(pos) = child.text_position() {
-                    let expected = if is_first { None } else { Some(b',') };
-                    if !child.preceding_delimiter_ok(pos, expected) {
-                        return Err(child.malformed_delimiter_error());
-                    }
+                // otherwise mirrors) never ran this check at all -- not even
+                // the missing/doubled-comma-between-two-real-elements case
+                // (#1677), which the `Object` arm below already had.
+                // `{"a" 1, "b": 2} | -e` used to silently succeed for the
+                // array shape (`[1 2, 3]`) the same way this object shape
+                // used to before #1956. #1803: via the shared
+                // `element_gap_ok` rather than an inline copy of it.
+                if !child.element_gap_ok(is_first) {
+                    return Err(child.malformed_delimiter_error());
                 }
                 items.push(cursor_to_owned_at_depth(&child, depth + 1)?);
                 is_first = false;
@@ -873,6 +870,10 @@ fn cursor_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
             // `items.is_empty()` after the walk is exactly that case (a
             // genuine `[]` also reaches here, and `container_gap_ok`
             // answers `true` for it).
+            // STYLE-0013: deliberately *not* `container_tail_gap_ok` -- that
+            // helper also runs #2243's trailing-gap check (`[1,]`), which
+            // this walk has never had. Adding it here would be a behaviour
+            // change, and this walk's missing checks are tracked as #2349.
             if items.is_empty() && !cursor.container_gap_ok(b']') {
                 return Err(cursor.malformed_delimiter_error());
             }
@@ -887,32 +888,23 @@ fn cursor_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
             // `eval_generic::to_owned_at_depth`'s identical shape.
             let mut f = fields;
             let mut is_first = true;
-            while let Some((field, rest)) = f.uncons() {
-                // A key that isn't a `String` token at all is *structurally*
-                // malformed (#1194) and now raises, matching
-                // `keys()`/`effective_keys`. A key that is a string but
-                // won't decode is preserved via its raw source span rather
-                // than raised on (#1247/#1642), matching
-                // `length`/`keys_unsorted`/`.`.
-                let Some(key) = resolve_display_key(&field.key(), &map, &mut guard)? else {
-                    return Err(f.malformed_member_error());
-                };
-                // #1956: this walk (unlike its `eval_generic::to_owned_at_depth`
-                // sibling it otherwise mirrors) never called `key_delimiter_ok`/
-                // `value_delimiter_ok` -- a missing/doubled `,`/`:` (#1677) with
-                // an otherwise-even member count silently succeeded here.
-                if !key_delimiter_ok::<crate::json::light::JsonFields<'_, W>>(
-                    &field.key(),
-                    &field.key_cursor(),
-                    is_first,
-                ) || !value_delimiter_ok::<crate::json::light::JsonFields<'_, W>>(
-                    Some(&field.value()),
-                    &field.value_cursor(),
-                ) {
-                    return Err(f.malformed_member_error());
-                }
-                let value_cursor = field.value_cursor();
-                map.insert(key, cursor_to_owned_at_depth(&value_cursor, depth + 1)?);
+            // #1803: `DocumentFields::uncons`, not the inherent
+            // `JsonFields::uncons` -- the trait impl (`json::light`) builds
+            // its `DocumentField` from exactly the four accessors this loop
+            // already called by hand, so nothing extra is resolved, and it
+            // is what lets this walk share `checked_key` with its generic
+            // siblings rather than hand-copying their checks again. #1956
+            // is the reminder of why that matters: this walk (unlike the
+            // `eval_generic::to_owned_at_depth` sibling it otherwise
+            // mirrors) had no delimiter checks at all until then, so a
+            // missing or doubled `,`/`:` with an otherwise-even member
+            // count silently succeeded here.
+            while let Some((field, rest)) = DocumentFields::uncons(&f) {
+                let key = field.checked_key(&f, &map, &mut guard, is_first)?;
+                map.insert(
+                    key,
+                    cursor_to_owned_at_depth(&field.value_cursor, depth + 1)?,
+                );
                 f = rest;
                 is_first = false;
             }
@@ -924,6 +916,8 @@ fn cursor_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
             // `key_delimiter_ok`/`value_delimiter_ok` above only ever run
             // against a real field, so the walk producing zero fields at
             // all leaves nothing to check.
+            // STYLE-0013: same exemption as the `Array` arm above --
+            // `{"a":1,}` (#2243) is unchecked here, tracked as #2349.
             if map.is_empty() && !cursor.container_gap_ok(b'}') {
                 return Err(cursor.malformed_delimiter_error());
             }

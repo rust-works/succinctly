@@ -10,9 +10,8 @@ use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::Path;
 
 use succinctly::jq::document::{
-    effective_keys, key_delimiter_ok, resolve_display_key, trailing_element_gap_ok,
-    value_delimiter_ok, DisplayKeyGuard, DocumentCursor, DocumentElements, DocumentFields,
-    DocumentValue, IndentSpec, JsonConvention,
+    child_tail_gap_ok, effective_keys, DisplayKeyGuard, DocumentCursor, DocumentElements,
+    DocumentFields, DocumentValue, IndentSpec, JsonConvention,
 };
 use succinctly::jq::escape::AsciiEscapeWriter;
 use succinctly::jq::eval_generic::{
@@ -1113,36 +1112,17 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
         // (#2243).
         let mut last_field: Option<V::Cursor> = None;
         while let Some((field, rest)) = f.uncons() {
-            // `resolve_display_key`, not `field.key_str()`: a key that will
-            // not *decode* (#1247/#1385) is preserved via its raw source
-            // span rather than dropped (#1642) -- this loop used to
-            // silently drop such a field under `--slurp`/`--eval-all`/
-            // `--inplace` (the only callers of `parse_input`, hence of this
-            // function), one short of `length`'s real field count. A key
-            // that will not *stringify* at all -- a key JSON's grammar never
-            // allowed (`{123: 1}`) -- is a different, structural fault
-            // (#1194) and now raises instead of silently dropping the whole
-            // field (#1975: this used to be an `if let Some(key) = ... {}`
-            // with no `else`, the exact pattern #1679 already fixed at five
-            // other call sites, but missed here). Two colliding
-            // decode-failure keys now raise instead of silently overwriting
-            // one another (#1642/#1738), matching every other materializer.
-            let Some(key) = resolve_display_key(&field.key, &map, &mut guard)? else {
-                return Err(f.malformed_member_error());
-            };
-            // #1975: this walk was missing the #1677 malformed-`,`/`:`
-            // delimiter check entirely -- unlike its
-            // `eval_generic::to_owned_at_depth` sibling it otherwise
-            // mirrors, which has always had it. This is why
-            // `--input-format json --slurp`/`--eval-all`/`--inplace`
-            // (the only callers of `parse_input`, hence of this
-            // function) silently accepted `{"a" 1, "b": 2}` when every
-            // other route into the evaluator correctly raised.
-            if !key_delimiter_ok::<V::Fields>(&field.key, &field.key_cursor, is_first)
-                || !value_delimiter_ok::<V::Fields>(Some(&field.value), &field.value_cursor)
-            {
-                return Err(f.malformed_member_error());
-            }
+            // #1803: `DocumentField::checked_key` -- the key resolution
+            // (#1642/#1194) and the `,`/`:` delimiter checks (#1677) as one
+            // shared definition, which is exactly what this site needed. It
+            // is the walk that has fallen behind twice: #1975 found it
+            // dropping undecodable keys *and* missing the delimiter checks
+            // its `eval_generic::to_owned_at_depth` sibling had always had,
+            // so `--input-format json --slurp`/`--eval-all`/`--inplace` (the
+            // only callers of `parse_input`, hence of this function)
+            // silently accepted `{"a" 1, "b": 2}` when every other route
+            // into the evaluator correctly raised.
+            let key = field.checked_key(&f, &map, &mut guard, is_first)?;
             map.insert(
                 key,
                 to_owned_canonicalizing_numbers_at_depth(&field.value, depth + 1)?,
@@ -1158,20 +1138,13 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
         if f.ends_unpaired() {
             return Err(f.malformed_member_error());
         }
-        // #2262: #2211's `container_gap_ok` (a stray `,` with zero real
-        // fields, `{,}`) needs the *container's own* cursor to find its
-        // opening `{` -- this function only ever receives a bare
-        // `value: &V` (never a cursor for the container itself), and once
-        // `f` is exhausted there is no way to reconstruct one. Same
-        // limitation `eval_generic::to_owned_at_depth`'s identical
-        // value-only shape has -- `{,}` remains unchecked here for that
-        // reason. #2243's `trailing_element_gap_ok` *is* checkable, though:
-        // it only needs the last real field's own cursor, retained above.
-        if let Some(last) = &last_field {
-            if !trailing_element_gap_ok(last, b'}') {
-                return Err(last.malformed_delimiter_error());
-            }
-        }
+        // #2262/#1803: `child_tail_gap_ok` is the value-domain tail --
+        // `{"a":1,}` checked via the last real field's own cursor, `{,}`
+        // left unchecked because #2211's `container_gap_ok` needs a cursor
+        // for the container itself that this signature never receives. Its
+        // doc comment carries the full reasoning, which this site and
+        // `eval_generic::to_owned_at_depth` used to state twice.
+        child_tail_gap_ok(last_field.as_ref(), b'}')?;
         OwnedValue::Object(map)
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();
@@ -1202,11 +1175,7 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
         // but `[1,]` is, via the last real element's own cursor. This is
         // the live, CLI-reachable fix: `echo '[1,]' | succinctly yq --slurp
         // --input-format json -o json '.[0]'` used to exit 0 with `1`.
-        if let Some(last) = &last_elem {
-            if !trailing_element_gap_ok(last, b']') {
-                return Err(last.malformed_delimiter_error());
-            }
-        }
+        child_tail_gap_ok(last_elem.as_ref(), b']')?;
         OwnedValue::Array(items)
     } else if value.is_null() {
         OwnedValue::Null
