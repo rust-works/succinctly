@@ -30468,6 +30468,21 @@ fn test_jq_del_iterate_non_container_still_raises_2346() -> Result<()> {
     Ok(())
 }
 
+/// #2346's jq-mode control for `delete_path_steps`'s own *mid-chain*
+/// `Expr::Iterate` arm specifically (`del(.a[])`, not the terminal
+/// `del(.[])` above, which instead reaches `delete_at_path`) -- this fix's
+/// own new yq-mode no-op arm sits ahead of that function's final `_ =>
+/// Err(...)` catch-all, so a jq-mode-only repro is needed to keep the
+/// catch-all itself covered (it's otherwise unreachable in yq mode now,
+/// #2346's review round found this exact line lost coverage without it).
+#[test]
+fn test_jq_del_iterate_mid_chain_non_container_still_raises_2346() -> Result<()> {
+    let (out, stderr, code) = run_jq_stdin_with_stderr("del(.a[])", r#"{"a":5}"#, &["-c"])?;
+    assert_ne!(code, 0, "out: {out:?}");
+    assert!(stderr.contains("Cannot iterate over number"), "{stderr}");
+    Ok(())
+}
+
 /// #2346, path-context evaluator: the same yq-mode no-op has to hold when
 /// something downstream forces path-tracking (`needs_path_context`), not
 /// just on the lighter value-only read path above -- `eval_stage_with_path_
