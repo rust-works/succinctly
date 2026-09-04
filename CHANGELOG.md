@@ -9,6 +9,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The "materialization ignores a live `optional`" gap is now a build failure, not a
+  sweep** (#2334). The same bug shipped three times — #2231, #2280, #2327 — each round's
+  review finding sites the last sweep missed, several of them the direct sibling of a
+  function that same PR had just fixed in the *other* evaluator.
+
+  The reason it recurred is that **the invariant is unobservable at runtime**.
+  `eval::suppresses` is `optional && !e.is_decode_failure()`, and every error the
+  `to_owned`/`to_owned_cursor`/`to_owned_with_cursor`/`collect_cursors_checked` family can
+  raise is `decode_failure`-tagged — #2286 retagged the last one that wasn't, via
+  `EvalError::malformed_json_text` — so routing a call site and leaving it bare produce
+  byte-identical output. No behavioural test can fail when a site is missed; #2327's own
+  pinning test asserts the same exit code with *and* without a trailing `?`, which records
+  the non-difference and by construction cannot detect the invariant regressing.
+  Centralising the *check* did not stop the *omission*, because nothing forced a call site
+  through it.
+
+  Two guards replace the sweep, following #2025's precedent
+  (`tests/jq_owned_only_sink_invariant_test.rs`) for a hand-derived claim that only review
+  was keeping true:
+
+  - **Static** — `tests/jq_optional_suppression_audit.rs` parses `src/jq/eval.rs` and
+    `src/jq/eval_generic.rs` with `syn` and fails, naming `file:line` and the enclosing
+    function, on any raw materialization inside a function with a live `optional: bool`
+    that is neither routed through the suppression machinery nor carrying a
+    `// STYLE-0012:` citation. It sees sites hidden inside `owned_or_err!` /
+    `push_or_control!` token streams — the shape of #2327's worst miss, where 7 of the 8
+    second-round sites were one evaluator's copy of a fix the other had received — and it
+    asserts its own scan is not vacuous, the classic failure of a grep-shaped gate. Its
+    routing window is clipped to the enclosing function body and to the next
+    materialization site; both clips were added after negative tests showed the unclipped
+    window silently excusing real gaps with a `suppresses(..)` belonging to neighbouring
+    code.
+  - **Runtime** — `EvalError::debug_assert_materialization_error`, called at the family's
+    four depth-0 entry points, pins the "decode failures only" premise the whole audit
+    rests on. The day that stops holding, the routed/unrouted distinction starts changing
+    output at every site at once; this makes that a loud debug-build failure instead of a
+    silent one. It fired nowhere across the full suite.
+
+  Every site the audit found is adjudicated — routed where the builtin's own result value
+  is being materialized (`add`, `map_values`, `last`, `to_entries`, `from_entries`,
+  `with_entries`, `shuffle`, `pivot`, `bsearch`, the `indices`/`index`/`rindex` family,
+  string interpolation, `each_paths_filter`, `collect_rhs_outputs`, and
+  `eval_generic.rs`'s `Expr::Iterate`/`Expr::Pipe`/`Shuffle`/`Pivot`/`ToEntries` arms), and
+  marked with a specific reason otherwise: array construction is atomic in jq
+  (`eval_array_construction`, `map_over`, `Expr::Array` — #2327's own declined candidate);
+  key generators are evaluated at a hardcoded `optional: false`, so `.[k]?` never
+  suppresses an error raised computing `k` (confirmed against jq 1.7.1); a `Partial`'s
+  prefix must survive, so its `Control::Error` is suppressed at the `eval_try` boundary
+  rather than at the conversion; and several sites are already routed one level out
+  (`finish_fork`, `fanout_arg`'s deferred unwrap, `sort_family_control`).
+
+  Along the way: four hand-copies of `optional && !e.is_decode_failure()` now call the
+  shared `suppresses` — the same drift its own doc comment already records happening twice
+  (#1902, #1934) — and `sort_family_control` takes `optional`, giving
+  `key_elements_generic` a channel to suppress through where `Control` has no suppressed
+  variant. **No behaviour change**: every path involved is decode-failure-tagged, and a
+  `debug_assert!(!optional)` probe over the whole suite re-confirmed #693's claim that
+  `eval_generic.rs`'s native arms never see `optional = true` from any parser-driven
+  query — only three white-box unit tests that hardcode it, one of them already named
+  `..._is_unreachable_via_parser_725`.
+
+  The convention is written down as **STYLE-0012** in
+  [docs/STYLE_GUIDE.md](docs/STYLE_GUIDE.md), modelled on STYLE-0004's "every lint
+  suppression must be traceable to a documented reason". When the whole parameter is dead,
+  the preferred marker remains `_optional` — the unused-variable lint enforces that one,
+  which is how `builtin_recurse_f`/`builtin_recurse_cond` record their #1953 exemption.
+
 - **`path()`/`=`/`del()` no longer re-clone an owned subtree at every step of a static
   `Field`/`Index` chain** (#2058), fixing the O(d²) that #1690's own depth-scaled acceptance
   benchmark (`jq_write_path_del_shared_prefix_depth`) flagged as still binding its exponent to
