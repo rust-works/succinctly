@@ -25589,9 +25589,12 @@ fn test_yq_error_value_preview_matches_tostring_number_literal_spelling_1055() -
 /// constructor in yq mode at all. `map(key)` still does -- the path-context
 /// evaluator's own `Expr::Builtin(Builtin::Map(f))` arm (distinct from the
 /// value-only evaluator's `builtin_map`, which #2346 left alone since it
-/// was already yq-gated) has no such gate, a known, narrower, adjacent gap
-/// left open rather than folded into #2346's own scope -- see that arm's
-/// call site for the tracking issue.
+/// was already yq-gated) has no such gate. Deliberately not folded into
+/// #2346's own scope: `map`'s real yq-mode rule is asymmetric (`null` ->
+/// `[]`, any other scalar -> unchanged passthrough, confirmed live), not
+/// the uniform "always empty" rule `.[]` itself gets, so copying #2346's
+/// own widening onto this arm would be wrong, not just incomplete. Tracked
+/// as #2375.
 #[test]
 fn test_yq_cannot_iterate_preview_matches_tostring_number_literal_spelling_1055() -> Result<()> {
     let cases: &[&str] = &["1e2", "1E5", "1.5e-10"];

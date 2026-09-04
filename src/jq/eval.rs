@@ -23560,7 +23560,8 @@ fn resolve_iterate_bounded<S: EvalSemantics>(
         // .[4][])` on `[1,2]` reached this arm and produced `[1]`
         // (`.[4][]`'s branch silently vanished) where real yq gives `[1,
         // null, null, []]`. Left as a follow-up (only `first`, real yq
-        // surface, is currently affected) rather than folded into this fix.
+        // surface, is currently affected) rather than folded into this
+        // fix. Tracked as #2376.
         other => Err((
             Vec::new(),
             EvalError::cannot_iterate_with(S::TAG, other).into(),

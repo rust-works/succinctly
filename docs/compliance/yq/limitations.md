@@ -2133,6 +2133,34 @@ this gap -- only the comma-grouped combination of "suffix after the tolerated `.
 "another sibling in the same call" is affected. Tracked as
 [#2380](https://github.com/rust-works/succinctly/issues/2380).
 
+### `.[]` over a non-container is now a silent no-op — two residual gaps remain (#2346)
+
+Real yq's `.[]` (iterate) produces zero output — not an error — for *any* non-container
+target (number, string, bool, `null`), not just `null`, confirmed live against yq v4.53.3
+for plain reads, `del()`, and assignment alike (`echo '{"x":5}' | yq -o=json '.x[]'` is
+empty, exit 0). jq has no such rule (`.[]` on a scalar always raises there, confirmed
+against jq 1.7.1), so this is yq-mode only — fixed at every `Expr::Iterate` site reachable
+from a plain read, `del()`, or a `path()`-style path computation (#2346). `=`/`|=`'s own
+`set_path`/`update_path` machinery already had this right beforehand.
+
+Two adjacent sites were deliberately left unfixed, since a naive copy of the same widening
+would be wrong (not just incomplete) or risks a worse regression:
+
+- **`map(f)` still raises** when path-tracking is needed inside `f` (`eval_stage_with_path_
+  context`'s own `Expr::Builtin(Builtin::Map(f))` arm) — `map`'s real yq-mode rule is
+  *asymmetric* (`null` -> `[]`, but any other scalar passes through **unchanged**, confirmed
+  live: `5 | map(.+1)` is `5`, not `[]` or empty), not the uniform "always empty" rule `.[]`
+  itself gets. Tracked as [#2375](https://github.com/rust-works/succinctly/issues/2375).
+- **`first(.a[])` on a genuinely-resolved scalar still raises** (`resolve_iterate_bounded`,
+  shared by `resolve_node`'s own `Expr::Iterate` arm and `first`/`limit`'s fast path) —
+  this function is also reached by `resolve_del_path_branches`'s comma-fanout fallback for a
+  declined vivify pre-pass, where an out-of-range index read is a placeholder for a write
+  real yq's own vivify would perform, not a genuinely-resolved scalar; naively widening this
+  function turns an honest raise (`del(.[-1], .[4][])`, a documented, tracked coverage gap)
+  into a silently wrong answer instead (confirmed live: `[1]` instead of real yq's `[1,
+  null, null, []]`). Tracked as
+  [#2376](https://github.com/rust-works/succinctly/issues/2376).
+
 ### Other categories
 
 Float and number formatting ([#1071](https://github.com/rust-works/succinctly/issues/1071),

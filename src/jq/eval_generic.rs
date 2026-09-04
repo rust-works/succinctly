@@ -9871,8 +9871,15 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
             Ok(())
         }
         Expr::Iterate => match node {
-            // `null` and a missing node are not iterable, matching
-            // `path(.[])` on `null` raising rather than yielding nothing.
+            // #2346: real yq's `.[]` over any non-container -- including a
+            // missing/null node here -- is a silent no-op (confirmed live
+            // against yq v4.53.3), matching every other `Expr::Iterate`
+            // site this issue fixed. jq keeps raising (`path(.[])` on
+            // `null` still errors there), so this stays gated on `S::TAG`
+            // -- the arm below is then only ever reached in jq mode, which
+            // is why it can keep hardcoding `EvalTag::Jq` rather than
+            // consulting `S::TAG` itself.
+            PathNode::Absent if S::TAG == EvalTag::Yq => Ok(()),
             PathNode::Absent => Err(EvalError::cannot_iterate_with(
                 EvalTag::Jq,
                 &OwnedValue::Null,
@@ -9912,6 +9919,19 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
                             PathNode::At(ec),
                         ));
                     }
+                    Ok(())
+                } else if let Some(reason) = v.string_decode_error() {
+                    // #1247/#1620: an undecodable-string scalar must raise
+                    // its own decode failure unconditionally, never
+                    // suppressed by the yq-mode no-op below -- same
+                    // priority order as `scalar_fallback`/
+                    // `decode_failure_or` elsewhere in this fix.
+                    Err(EvalError::decode_failure(reason))
+                } else if S::TAG == EvalTag::Yq {
+                    // #2346: see this arm's `PathNode::Absent` sibling
+                    // above for the full live-oracle evidence -- a
+                    // genuinely-resolved non-container scalar gets the
+                    // same silent no-op here.
                     Ok(())
                 } else {
                     // `to_owned_cursor`, not `to_owned`: only the cursor
