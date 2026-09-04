@@ -20081,6 +20081,112 @@ fn test_zero_arity_builtin_empty_parens_stays_compile_error_2110() -> Result<()>
     Ok(())
 }
 
+/// #2237: extends #2110's fix to builtins that always require at least one
+/// argument and parse it inline (`self.expect('(')?`/`self.parse_expr()?`/
+/// `self.expect(')')?`, via the new `parse_required_single_arg` helper) --
+/// before this fix, a wrong-arity call (no `(` at all, or a 2nd
+/// `;`-separated argument) raised a raw structural `ParseError` instead of
+/// #1473/#2037's own "X/N is not defined" compile error. Verified against
+/// the pinned oracle (`/usr/bin/jq`, jq-1.7.1); `env` uses `env(1)` (a
+/// non-identifier argument) instead of a 0-arg call since bare `env` is
+/// itself valid (arity-0) syntax.
+#[test]
+fn test_single_arg_builtin_wrong_arity_reports_not_defined_2237() -> Result<()> {
+    for (filter, name) in [
+        ("has", "has/0"),
+        ("has(1;2)", "has/2"),
+        ("select", "select/0"),
+        ("select(1;2)", "select/2"),
+        ("env(1)", "env/1"),
+        ("env(1;2)", "env/2"),
+        ("min_by", "min_by/0"),
+        ("min_by(1;2)", "min_by/2"),
+        ("max_by", "max_by/0"),
+        ("max_by(1;2)", "max_by/2"),
+        ("in", "in/0"),
+        ("in(1;2)", "in/2"),
+        ("ltrimstr", "ltrimstr/0"),
+        ("ltrimstr(1;2)", "ltrimstr/2"),
+        ("rtrimstr", "rtrimstr/0"),
+        ("rtrimstr(1;2)", "rtrimstr/2"),
+        ("startswith", "startswith/0"),
+        ("startswith(1;2)", "startswith/2"),
+        ("endswith", "endswith/0"),
+        ("endswith(1;2)", "endswith/2"),
+        ("sort_by", "sort_by/0"),
+        ("sort_by(1;2)", "sort_by/2"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(stdout, "", "{filter}: stderr {stderr:?}");
+        assert!(
+            stderr.contains(&format!("{name} is not defined at <top-level>, line 1:")),
+            "{filter}: stderr {stderr:?}"
+        );
+        assert_eq!(code, 3, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+    }
+    Ok(())
+}
+
+/// #2237 sibling: the same fix for the "dedicated parse function" family
+/// (`range`/`limit`/`until`/`while`/`repeat`/`first`/`last`), which returns
+/// `Expr` directly rather than going through `try_parse_builtin`'s
+/// `Option<Builtin>` protocol -- the new `rewind_to_wrong_arity_call`
+/// helper. Covers every wrong-arity shape each of these can take: 0 args
+/// (below the minimum), too few (missing a required `;` argument, only
+/// reachable for the 2-required-arg family), and too many. Verified against
+/// the pinned oracle.
+#[test]
+fn test_dedicated_parse_fn_wrong_arity_reports_not_defined_2237() -> Result<()> {
+    for (filter, name) in [
+        ("range", "range/0"),
+        ("range(1;2;3;4)", "range/4"),
+        ("limit", "limit/0"),
+        ("limit(1)", "limit/1"),
+        ("limit(1;2;3)", "limit/3"),
+        ("until", "until/0"),
+        ("until(1)", "until/1"),
+        ("until(1;2;3)", "until/3"),
+        ("while", "while/0"),
+        ("while(1)", "while/1"),
+        ("while(1;2;3)", "while/3"),
+        ("repeat", "repeat/0"),
+        ("repeat(1;2)", "repeat/2"),
+        ("first(1;2)", "first/2"),
+        ("last(1;2)", "last/2"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(stdout, "", "{filter}: stderr {stderr:?}");
+        assert!(
+            stderr.contains(&format!("{name} is not defined at <top-level>, line 1:")),
+            "{filter}: stderr {stderr:?}"
+        );
+        assert_eq!(code, 3, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+    }
+    Ok(())
+}
+
+/// #2237 control: a genuine syntax error *inside* a required argument
+/// (unlike a structural arity mismatch) must still raise a raw parse error,
+/// not get rewound into a spurious name/arity resolution attempt -- the
+/// `parse_required_single_arg`/`rewind_to_wrong_arity_call` family only
+/// intervenes at the specific `(`/`)`/`;` structural checkpoints, never on
+/// a `parse_expr()` failure itself. Verified against the pinned oracle:
+/// real jq also raises a (differently-worded) syntax error here, never
+/// "has/N is not defined".
+#[test]
+fn test_single_arg_builtin_internal_syntax_error_stays_parse_error_2237() -> Result<()> {
+    for filter in ["has(1 +)", "range(1;2;3+)"] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(stdout, "", "{filter}: stderr {stderr:?}");
+        assert!(
+            !stderr.contains("is not defined"),
+            "{filter}: stderr {stderr:?}"
+        );
+        assert_eq!(code, 3, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+    }
+    Ok(())
+}
+
 /// #1376: `succinctly jq` now supports arity overloading, matching real
 /// jq -- `def f(x): ...` and `def f(x;y): ...` are distinct functions
 /// (`f/1` and `f/2`), and both stay callable after the second definition.
