@@ -5335,6 +5335,13 @@ fn standard_json_to_jq_value<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     parent_cursor: &JsonCursor<'a, W>,
 ) -> Result<JqValue<'a, W>, EvalError> {
+    // STYLE-0013: `preceding_gap_ok` directly, not `key_delimiter_ok`/
+    // `value_delimiter_ok` -- this is the CLI-crate lazy materializer, not
+    // `DocumentFields`-generic, and its array/object arms below already
+    // hold the child/key/value cursors' own resolved `text_position()`
+    // rather than an unresolved `DocumentValue`, so routing through the
+    // library-side wrappers would re-derive a position this walk already
+    // has for free.
     Ok(match value {
         StandardJson::Null => JqValue::Null,
         StandardJson::Bool(b) => JqValue::Bool(b),
@@ -5818,6 +5825,12 @@ fn check_preceding_delimiter<W: AsRef<[u64]>>(
     child_cursor: &JsonCursor<'_, W>,
     index: usize,
 ) -> Result<Option<usize>> {
+    // STYLE-0013: `preceding_gap_ok` directly -- this is `print_json`'s
+    // own array-arm helper, returning the resolved position for its
+    // caller to cache and reuse (see this function's own doc comment on
+    // why: a version that re-derived the position instead measured 19-30%
+    // slower, #1643). `key_delimiter_ok`/`value_delimiter_ok` don't return
+    // a position, so adopting either would give that back.
     let Some(start) = child_cursor.text_position() else {
         return Ok(None);
     };
@@ -5866,6 +5879,12 @@ fn validate_json_delimiters<W: Clone + AsRef<[u64]>>(
     cursor: &JsonCursor<'_, W>,
     depth: usize,
 ) -> core::result::Result<(), EvalError> {
+    // STYLE-0013: `preceding_gap_ok` directly, in both the array and
+    // object arms below -- this is the CLI's own cold-path validator
+    // (this function's own doc comment above explains why it exists
+    // instead of routing through `print_json`), reusing each child's
+    // already-resolved `text_position()` via `value_at` (see `scalar_end_pos`'s
+    // own doc comment) the same way `check_preceding_delimiter` does.
     check_nesting_depth(depth)?;
     match cursor.value() {
         StandardJson::Array(elements) => {
@@ -6063,6 +6082,14 @@ where
     Out: Write,
     Wrd: Clone + AsRef<[u64]>,
 {
+    // STYLE-0013: the object arm below calls `preceding_gap_ok` directly,
+    // not `key_delimiter_ok`/`value_delimiter_ok` -- this is the streaming
+    // writer's own single-walk validate-then-write pass (#1643), reusing
+    // `k.start()`/`field.value_cursor().text_position()` this same walk
+    // already resolved to build the output rather than a second decode.
+    // Routing through the library-side wrappers only accepts an
+    // already-resolved `DocumentValue`/cursor pair, which is exactly what
+    // this walk is resolving for the first time as it goes.
     anyhow::ensure!(
         level < MAX_VALUE_TREE_DEPTH,
         "{}",

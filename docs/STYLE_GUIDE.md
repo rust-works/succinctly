@@ -616,9 +616,10 @@ reason -- the same traceability STYLE-0004 requires of a lint suppression and ST
 an unrouted materialization. "It is fine" is not a reason; name what the site needs that the
 helper cannot give, or the issue that tracks closing the gap. The exemptions in the tree
 today are `json::light::stream_json_pretty` (needs the resolved position, hence
-`element_gap_ok_at`), `eval_generic`'s validate-only walk (lazy key map, #2061; missing
-delimiter checks tracked as #2349), `lazy.rs`'s missing trailing-gap check (#2349's family),
-and the comment-preserving walk (YAML-only in production).
+`element_gap_ok_at`), `eval_generic`'s validate-only walk (lazy key map, #2061 -- its
+delimiter checks were the #2349 fix, added directly rather than via this route, for the
+same lazy-key reason), `lazy.rs`'s missing trailing-gap check (#2358), and the
+comment-preserving walk (YAML-only in production).
 
 ### Motivation
 

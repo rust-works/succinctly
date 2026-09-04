@@ -873,7 +873,9 @@ fn cursor_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
             // STYLE-0013: deliberately *not* `container_tail_gap_ok` -- that
             // helper also runs #2243's trailing-gap check (`[1,]`), which
             // this walk has never had. Adding it here would be a behaviour
-            // change, and this walk's missing checks are tracked as #2349.
+            // change; this walk's missing check is tracked as #2358 (#2349
+            // itself is closed and never touched this file -- its fix was
+            // to `eval_generic.rs`'s validate-only walk, not this one).
             if items.is_empty() && !cursor.container_gap_ok(b']') {
                 return Err(cursor.malformed_delimiter_error());
             }
@@ -917,7 +919,7 @@ fn cursor_to_owned_at_depth<W: Clone + AsRef<[u64]>>(
             // against a real field, so the walk producing zero fields at
             // all leaves nothing to check.
             // STYLE-0013: same exemption as the `Array` arm above --
-            // `{"a":1,}` (#2243) is unchecked here, tracked as #2349.
+            // `{"a":1,}` (#2243) is unchecked here, tracked as #2358.
             if map.is_empty() && !cursor.container_gap_ok(b'}') {
                 return Err(cursor.malformed_delimiter_error());
             }

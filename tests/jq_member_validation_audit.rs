@@ -68,6 +68,15 @@ use syn::visit::{self, Visit};
 /// at all: it is the walk that has fallen behind twice (#1975 found it
 /// missing the delimiter checks *and* silently dropping undecodable keys),
 /// and a scan that stopped at the crate boundary would have caught neither.
+///
+/// `jq_runner.rs` (its JSON-only sibling, also `succinctly-cli`) hand-rolls
+/// the same `,`/`:` checks via `preceding_gap_ok` across four functions
+/// (`standard_json_to_jq_value`, `check_preceding_delimiter`,
+/// `validate_json_delimiters`, `print_json`), each with its own
+/// `// STYLE-0013:` exemption citing the perf rationale already documented
+/// beside every one of those calls (#1643/#1676). Left out of `SOURCES`
+/// until now for no recorded reason -- the same "stopped at the crate
+/// boundary" gap `yq_runner.rs`'s own inclusion above exists to close.
 const SOURCES: &[(&str, &str)] = &[
     ("src/jq/eval.rs", include_str!("../src/jq/eval.rs")),
     (
@@ -80,6 +89,10 @@ const SOURCES: &[(&str, &str)] = &[
         "src/bin/succinctly/yq_runner.rs",
         include_str!("../src/bin/succinctly/yq_runner.rs"),
     ),
+    (
+        "src/bin/succinctly/jq_runner.rs",
+        include_str!("../src/bin/succinctly/jq_runner.rs"),
+    ),
 ];
 
 /// The primitives `DocumentField::checked_key` and
@@ -89,11 +102,18 @@ const SOURCES: &[(&str, &str)] = &[
 /// mapping specifically: `element_gap_ok`/`element_gap_ok_at` are the two
 /// definitions of it, and a third re-derivation at a call site is the shape
 /// #1597 extracted and five sites re-grew anyway.
+///
+/// `preceding_gap_ok` is `preceding_delimiter_ok`'s own JSON backing
+/// implementation (`JsonCursor::preceding_delimiter_ok` is a one-line
+/// wrapper around it) -- a call to it outside that wrapper is the exact
+/// same `is_first -> Option<b','>` re-derivation one layer lower, so it
+/// belongs on this list for the same reason `preceding_delimiter_ok` does.
 const AUDITED: &[&str] = &[
     "resolve_display_key",
     "key_delimiter_ok",
     "value_delimiter_ok",
     "preceding_delimiter_ok",
+    "preceding_gap_ok",
 ];
 
 /// The STYLE-0013 exemption marker, cited inline the way STYLE-0004's
@@ -105,14 +125,15 @@ const EXEMPT_MARKER: &str = "STYLE-0013:";
 /// The classic failure of a grep-shaped gate is going quietly vacuous: a
 /// renamed helper, a `syn` upgrade, or a refactor that moves code out from
 /// under the visitor leaves it passing green while checking nothing. Today
-/// the scan sees 5 audited call sites across 5 files (one key-only walk, one
-/// comment-preserving walk, two in the validate-only walk, one in
-/// `to_entries`); the floors sit just
-/// under that. If a legitimate refactor lowers the real count past a floor,
-/// move the floor *and* say in the commit message what shrank -- do not lower
-/// it to make a red test green.
-const MIN_SITES_EXAMINED: usize = 4;
-const MIN_FILES_PARSED: usize = 5;
+/// the scan sees 20 audited call sites across 6 files (verified by
+/// instrumenting `run_audit()` directly, not hand-counted -- the exact
+/// per-walk breakdown drifts too easily to keep current in prose, which is
+/// the same lesson this whole file exists to enforce on the production
+/// code); the floors sit just under that. If a legitimate refactor lowers
+/// the real count past a floor, move the floor *and* say in the commit
+/// message what shrank -- do not lower it to make a red test green.
+const MIN_SITES_EXAMINED: usize = 12;
+const MIN_FILES_PARSED: usize = 6;
 
 struct Site {
     file: &'static str,

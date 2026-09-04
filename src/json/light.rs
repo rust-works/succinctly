@@ -1158,6 +1158,14 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
             fields = rest;
             index += 1;
         }
+        // STYLE-0013: `preceding_gap_ok` directly, not `key_delimiter_ok`/
+        // `value_delimiter_ok` -- both take `is_first`/`text_start` from an
+        // already-decoded key/value, but this walk only knows `key_start`
+        // (captured once, at the moment a candidate becomes `winner`) and
+        // defers the check to the end so only the field that actually wins
+        // last-write-wins gets validated, never a superseded earlier
+        // candidate. Neither primitive has a "check this position against
+        // this cursor" shape that fits a deferred check.
         if let Some((key_start, field, is_first)) = winner {
             let value_cursor = field.value_cursor();
             let comma_expected = if is_first { None } else { Some(b',') };
@@ -1242,6 +1250,9 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
             fields = rest;
             index += 1;
         }
+        // STYLE-0013: same reason as `find`'s own exemption -- only
+        // `key_start` (captured when a candidate becomes `winner`) is kept,
+        // and the check is deferred to the last-write-wins field alone.
         if let Some((key_start, value_cursor, is_first)) = winner {
             let comma_expected = if is_first { None } else { Some(b',') };
             if !preceding_gap_ok(value_cursor.text(), key_start, comma_expected) {

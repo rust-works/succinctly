@@ -1613,26 +1613,30 @@ pub fn child_tail_gap_ok<C: DocumentCursor>(
 /// - **No child** -- [`DocumentCursor::container_gap_ok`] against the
 ///   container, which is the only thing that can tell a genuine `{}`/`[]`
 ///   apart from a stray `,` with nothing in it (`{,}` / `[,]`, #2211).
-/// - **At least one child** -- [`trailing_element_gap_ok`] against that last
-///   child, for a stray `,` after it (`{"a":1,}` / `[1,]`, #2243).
+/// - **At least one child** -- delegates to [`child_tail_gap_ok`], the exact
+///   same [`trailing_element_gap_ok`] check against that last child, for a
+///   stray `,` after it (`{"a":1,}` / `[1,]`, #2243).
 ///
-/// Both raise `container.malformed_delimiter_error()`, preserving what the
-/// cursor-domain call sites already did; for JSON that is
-/// `malformed_json_text` over the whole document text, so it reads
-/// identically to the child-receiver form [`child_tail_gap_ok`] uses.
+/// The two branches raise from different cursors (`container` vs. the last
+/// child), which only matters if their `malformed_delimiter_error()`s could
+/// differ -- for JSON, both read `self.text`, the same whole-document slice
+/// regardless of which node's cursor calls it, so the two are
+/// byte-identical; YAML never reaches either raise (`container_gap_ok`/
+/// `trailing_element_gap_ok` are `true`-returning defaults there).
 pub fn container_tail_gap_ok<C: DocumentCursor>(
     container: &C,
     last_child: Option<&C>,
     close_char: u8,
 ) -> Result<(), EvalError> {
-    let ok = match last_child {
-        None => container.container_gap_ok(close_char),
-        Some(last) => trailing_element_gap_ok(last, close_char),
-    };
-    if ok {
-        Ok(())
-    } else {
-        Err(container.malformed_delimiter_error())
+    match last_child {
+        None => {
+            if container.container_gap_ok(close_char) {
+                Ok(())
+            } else {
+                Err(container.malformed_delimiter_error())
+            }
+        }
+        Some(_) => child_tail_gap_ok(last_child, close_char),
     }
 }
 
@@ -2737,7 +2741,7 @@ impl<V: DocumentValue, C: DocumentCursor> DocumentField<V, C> {
     ///   per key is what made `path(.[0])` over a 1,000,000-object array
     ///   cost 577 ms against 50 ms (#2061). This half allocates nothing, so
     ///   that walk can adopt the delimiter rules without the key rules --
-    ///   which is what #2349 needs, and why the split exists.
+    ///   which is what #2349 needed, and why the split exists.
     ///
     /// Free for every caller: a full [`DocumentFields::uncons`] walk has
     /// already resolved both key and value, so each check reuses an
@@ -2778,7 +2782,10 @@ impl<V: DocumentValue, C: DocumentCursor> DocumentField<V, C> {
     /// It was five hand-copied blocks, and the set drifted three times:
     /// #1677 reached some sites, #2211 two, #2243/#2262 five, each round
     /// leaving a sibling behind (#1975 found this walk missing from the CLI
-    /// bridge; #2349 tracks the live bug the validate-only walk still has).
+    /// bridge; #2349 fixed the validate-only walk's own delimiter gap,
+    /// directly via `key_delimiter_ok`/`value_delimiter_ok` rather than
+    /// through this method -- see `push_generic_truthiness_cursor_error`'s
+    /// own STYLE-0013 note for why it still can't take the key half).
     /// `resolve_display_key`'s own doc already tracked the key half as a
     /// recurring cost; this method covers the delimiter half with it, so a
     /// future rule lands in one place. Enforced by STYLE-0013.
