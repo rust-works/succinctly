@@ -36999,22 +36999,47 @@ fn flatten_delete_path(expr: &Expr, optional: bool, out: &mut Vec<DeleteStep>) {
 /// [`delete_at_path`]'s chain-walk. Same contract: errors propagate, the
 /// rebuilt `null` is discarded, the container is untouched.
 ///
-/// #2323: hardcodes `yq_mode = false` and `real_slot = false` for the
-/// recursive walk, matching `delete_trie_through_absent`'s own established
-/// pattern (and for the identical reason its doc comment gives: the value
-/// is always a synthetic `Null` no caller ever reads back, so there is
-/// nothing here for the vivify-to-`[]` fix to usefully apply to). Before
-/// this fix that didn't matter -- #2305/#2314's own array-extension logic
-/// lives entirely inside the `Array` arm, unreachable from a bare `Null` --
-/// but #2323's own vivify *is* reachable from `Null`, and running it here
-/// would mutate the throwaway `absent` into an array before an out-of-range
-/// index against *that* raises an error real yq never raises for this
-/// shape: confirmed live, `{} | del(.missing[-1])` is `{}` (a clean no-op,
-/// the missing field never materializes), not the `-1`-out-of-range error
-/// vivifying `absent` first would incorrectly produce.
-fn delete_at_path_through_absent(rest: &[Expr], optional: bool) -> Result<(), EvalError> {
+/// #2323: hardcodes `real_slot = false` for the recursive walk, matching
+/// `delete_trie_through_absent`'s own established pattern (and for the
+/// identical reason its doc comment gives: the value is always a synthetic
+/// `Null` no caller ever reads back, so there is nothing here for the
+/// vivify-to-`[]` fix to usefully apply to). Before this fix that didn't
+/// matter -- #2305/#2314's own array-extension logic lives entirely inside
+/// the `Array` arm, unreachable from a bare `Null` -- but #2323's own vivify
+/// *is* reachable from `Null`, and running it here would mutate the
+/// throwaway `absent` into an array before an out-of-range index against
+/// *that* raises an error real yq never raises for this shape: confirmed
+/// live, `{} | del(.missing[-1])` is `{}` (a clean no-op, the missing field
+/// never materializes), not the `-1`-out-of-range error vivifying `absent`
+/// first would incorrectly produce. `real_slot = false` alone (independent
+/// of `yq_mode`) already blocks every vivify site in this file -- each is
+/// gated `yq_mode && real_slot && ...` -- so hardcoding it is sufficient on
+/// its own; `yq_mode` does not need to be hardcoded alongside it.
+///
+/// #2347: `yq_mode` itself is *not* hardcoded (as an earlier version of this
+/// function did) -- it has to be the caller's own, or a genuinely-missing
+/// object field loses yq-mode-only tolerance rules for the rest of its
+/// chain, not just the vivify rule the paragraph above is about. Confirmed
+/// live as a real bug this fix corrects: `{"y":1} | del(.x.a.b[])` is
+/// `{"y":1}` in real yq (three levels of missing-field tolerance, then a
+/// trailing `.[]` that must no-op per `delete_at_path`'s own `Expr::Iterate`
+/// arm's yq-only null-tolerance case) -- hardcoding `yq_mode = false` here
+/// silently downgraded that chain to jq's own stricter "iterate over null
+/// always raises" rule (#527) the instant it passed through a genuinely
+/// missing key rather than a found-but-`null`-valued one, regardless of
+/// which mode actually called this. Safe to thread through precisely
+/// because `real_slot` stays hardcoded `false`: every vivify site in this
+/// recursive walk needs both flags together, so `yq_mode` alone being
+/// `true` here still can't reach any of them -- only non-vivifying,
+/// purely-informational uses of `yq_mode` (like the new `Iterate` arm) are
+/// newly reachable.
+fn delete_at_path_through_absent(
+    rest: &[Expr],
+    optional: bool,
+    yq_mode: bool,
+) -> Result<(), EvalError> {
     let mut absent = OwnedValue::Null;
-    delete_path_steps(&mut absent, rest, optional, false, false)
+    delete_path_steps(&mut absent, rest, optional, yq_mode, false)
 }
 
 /// One array-level step of a `del` path: a bare index, or a slice.
@@ -38642,6 +38667,24 @@ fn delete_at_path(
                     map.clear();
                     Ok(())
                 }
+                // #2347: a `null` reached by *tolerating* a step (a missing
+                // object field, or an already-`null` slot navigated further)
+                // rather than genuinely found is exempt from the rest of the
+                // chain, `.[]` included -- matching `Field`'s/`Index`'s own
+                // unconditional null no-op above them in this same file
+                // (#476). Confirmed live against yq v4.53.3: `{"x":null} |
+                // del(.x.a[])` and #2314's own padded-then-missing-field
+                // variant (`[1,2] | del(.[5].missing[])`) both leave the
+                // document untouched, not an error. Only reachable with
+                // `real_slot` false -- a genuinely *found* null (`real_slot`
+                // true) already vivified above instead -- and gated on
+                // `yq_mode`, unlike `Index`'s own unconditional `Null =>
+                // Ok(())` fallback: jq mode has no such exemption at all,
+                // `{"x":null} | del(.x[])` still raises "Cannot iterate over
+                // null" in real jq regardless of how the null was reached
+                // (#527), so this arm must stay yq-only rather than becoming
+                // unconditional the way `Index`'s is.
+                OwnedValue::Null if yq_mode => Ok(()),
                 _ if optional => Ok(()),
                 _ => Err(EvalError::cannot_iterate_with(
                     if yq_mode { EvalTag::Yq } else { EvalTag::Jq },
@@ -38876,11 +38919,19 @@ fn delete_path_steps(
                     }
                     // Same "reads as `null`, keep walking" rule as
                     // `delete_trie_object`'s missing-field arm (#527):
-                    // `del(.a.b.c)` is a no-op, `del(.a.b[])` still raises.
+                    // `del(.a.b.c)` is a no-op in both modes, and so —
+                    // #2347's fix — is `del(.a.b[])` in yq mode specifically
+                    // (`delete_at_path_through_absent` now forwards this
+                    // function's own `yq_mode` rather than hardcoding
+                    // `false`, so `delete_at_path`'s `Expr::Iterate` arm's
+                    // yq-only null-tolerance case is reachable here too);
+                    // jq mode still raises, unaffected (#527 remains a real
+                    // jq divergence, just no longer misapplied to yq too).
                     // `here` no longer gates this — a `?` on the missing step
-                    // does not suppress what the tail itself raises, and the
-                    // walk into a throwaway `null` cannot create the key.
-                    return delete_at_path_through_absent(rest, optional);
+                    // does not suppress what the tail itself raises in jq
+                    // mode, and the walk into a throwaway `null` cannot
+                    // create the key.
+                    return delete_at_path_through_absent(rest, optional, yq_mode);
                 }
                 // `null` tolerates any key — `null | del(.a.b)` and
                 // `{"x":null} | del(.x.a)` are both no-ops (#476) — but only
@@ -38966,10 +39017,18 @@ fn delete_path_steps(
                         | DeleteIndexResolution::Skip => {
                             // An out-of-range index resolves to null, and
                             // deleting further into null is a no-op for most
-                            // tails, `?` or not (#477) — but not `[]`, which
-                            // still raises `Cannot iterate over null (null)`
-                            // (#527/#529).
-                            return delete_at_path_through_absent(rest, optional);
+                            // tails, `?` or not (#477). In jq mode a trailing
+                            // `.[]` still raises `Cannot iterate over null
+                            // (null)` (#527/#529) — but #2347: in yq mode it
+                            // no-ops too, same as every other tail, so
+                            // `yq_mode` is threaded through here rather than
+                            // hardcoded, same fix as the `Field` arm's own
+                            // identical call above. `PositiveOutOfRange`
+                            // only still reaches this arm in jq mode (yq
+                            // mode's own case pads instead, just above); a
+                            // NaN-valued key (`Skip`) reaches it in either
+                            // mode.
+                            return delete_at_path_through_absent(rest, optional, yq_mode);
                         }
                     }
                 }
