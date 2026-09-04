@@ -1,0 +1,1 @@
+[try path(.a|tostring) catch "caught"]

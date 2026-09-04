@@ -1,0 +1,1 @@
+reduce paths as $p (0; . + ($p|length))

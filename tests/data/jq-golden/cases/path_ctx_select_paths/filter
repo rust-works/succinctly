@@ -1,0 +1,1 @@
+[paths | select(length == 2)]

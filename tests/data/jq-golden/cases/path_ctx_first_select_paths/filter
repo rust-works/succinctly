@@ -1,0 +1,1 @@
+[first(paths | select(length > 1))]

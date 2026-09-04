@@ -191,3 +191,14 @@
 # #985's revert is what the other direction looks like.
 fold_register_var_from_navigated_binding   path-tracking   a variable bound from a navigated position carries no snapshot marker — #1573
 fold_register_empty_merge_artifact         path-tracking   jq accepts `$x + {}` only because an empty merge returns its left operand's pointer; mirrored `{} + $x` refuses there too, so there is no rule to model — #1466
+
+#
+# Extended by #2416 phase 0 (the oracle-backed net for retiring the eager
+# path-context evaluator). Both entries were surfaced by
+# scripts/jq-path-context-oracle-sweep.sh sweeping path-context shapes against
+# pinned jq 1.7.1, and both are recorded rather than deleted: the point of a
+# net is that a shape it caught stays caught. See
+# tests/data/jq-path-context-sweep-known-divergences.txt for the sweep's own
+# class-level manifest.
+path_ctx_path_foreach_getpath      path-tracking   `path(foreach getpath(...) as $x ...)` raises "Invalid path expression with result 1" where jq resolves it to ["a","b"] — #2388
+path_ctx_optional_getpath_recurse  path-tracking   `.. | (getpath([paths]))?` drops the root position's own `[]` output (jq: [1,2,[],10,20], succinctly: [1,2,10,20]) — #2416

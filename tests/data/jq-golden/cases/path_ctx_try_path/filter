@@ -1,0 +1,1 @@
+[try path(.a.b) catch "e"]

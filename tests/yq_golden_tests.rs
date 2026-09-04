@@ -4,6 +4,12 @@
 //! (`input.yaml`), a jq-style filter (`filter`), CLI arguments (`args`, one per
 //! line), and the expected stdout (`expected.out`).
 //!
+//! A case where yq exits 0 having printed nothing carries an empty
+//! `expected.out` alongside a marker file `expected.empty`, so a silent
+//! success is distinguishable from a fixture that was never captured. Real yq
+//! does this: `key` and `parent` at the document root emit no output at all
+//! (#2421).
+//!
 //! A case where the oracle *rejects* the input additionally carries
 //! `expected.status` (its exit code) and `expected.err` (its stderr), both
 //! asserted byte-for-byte; a passing case omits both and is asserted to exit
@@ -94,10 +100,23 @@ fn cases() -> Vec<Case> {
                  a passing case omits it — rerun ./scripts/sync-yq-golden.sh"
             );
             // A failing case may legitimately produce no stdout (though it can
-            // also stream a prefix first); a passing one producing none means
-            // the fixture never got captured.
+            // also stream a prefix first); a passing one producing none is
+            // usually a fixture that never got captured — but not always, so
+            // the exception has to be *declared*. `expected.empty` is written
+            // by ./scripts/sync-yq-golden.sh exactly when yq exits 0 having
+            // printed nothing, which real yq genuinely does: `key` and
+            // `parent` at the document root emit no output at all (#2421,
+            // captured live from v4.53.3). Without the marker the corpus could
+            // not hold those cases, and "the mechanism cannot express it"
+            // would have quietly become "narrow the case until it fits".
+            let expected_empty = dir.join("expected.empty").exists();
             assert!(
-                !expected.is_empty() || expected_status.is_some(),
+                !expected_empty || (expected.is_empty() && expected_status.is_none()),
+                "case {name} carries expected.empty but is not a silent success \
+                 — rerun ./scripts/sync-yq-golden.sh"
+            );
+            assert!(
+                !expected.is_empty() || expected_status.is_some() || expected_empty,
                 "case {name} has an empty expected.out — rerun ./scripts/sync-yq-golden.sh"
             );
             Case {
