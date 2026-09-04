@@ -32365,8 +32365,40 @@ fn eval_index_expr_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemanti
     // position -- current_path unchanged.
     let key_result =
         eval_expr_needing_path_context::<W, S>(key, value, root, file_origin, current_path, false);
+    // #2371: mutually exclusive with `pending_halt`, mirroring #2326's
+    // identical `pending_key_stream_control` in the plain evaluator's own
+    // `eval_index_expr` (`eval.rs`, above) -- a single key-stream escape
+    // carries exactly one `Control` variant.
+    let mut pending_key_stream_control: Option<Control> = None;
     let (keys, pending_halt): (Vec<OwnedValue>, Option<i32>) =
         match drain_path_context_stream(key_result) {
+            // #2371: jq-only, mirroring #2326's identical fix for `key`'s
+            // own generator in the plain evaluators (`eval.rs`'s
+            // `eval_index_expr` above, `eval_generic.rs`'s
+            // `eval_index_expr`) -- real jq's key-outer/target-inner model
+            // indexes each already-produced key as it flows out, so an
+            // `Error`/`Break` partway through the key stream still owes
+            // output for the keys already produced. This function is only
+            // reachable from ordinary jq-mode syntax via a path-context-
+            // forcing builtin (`file_index`/`document_index`/`parent`) --
+            // none of which are real jq builtins (all reject with a compile
+            // error against jq 1.7.1, e.g. `file_index/0 is not defined`),
+            // so the underlying key-outer-generator claim is verified
+            // against the *semantically identical* plain-evaluator path
+            // instead, per #2326: `{"a":1,"b":2} | .[("a","b",error("x"))]`
+            // prints `1`, `2`, then raises against jq 1.7.1. yq mode does
+            // not stream this prefix either (confirmed live against yq
+            // v4.53.3: `.[("a","b",error("x"))]` on `{a: 1, b: 2}` prints
+            // only `Error: x`, no `1`/`2`), so yq mode keeps the
+            // pre-existing conservative discard below.
+            (vs, Some(Control::Error(e))) if S::TAG != EvalTag::Yq => {
+                pending_key_stream_control = Some(Control::Error(e));
+                (vs, None)
+            }
+            (vs, Some(Control::Break(label))) if S::TAG != EvalTag::Yq => {
+                pending_key_stream_control = Some(Control::Break(label));
+                (vs, None)
+            }
             (_, Some(Control::Error(e))) => return QueryResult::Error(e),
             (_, Some(Control::Break(label))) => return QueryResult::Break(label),
             // #791: keys already yielded before a halt still owe output.
@@ -32382,17 +32414,21 @@ fn eval_index_expr_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemanti
         // before this check and only the `Partial(vs, Halt)` shape (whose
         // `vs` is non-empty by construction) can set `pending_halt`. That
         // invariant does not survive the port: `drain_path_context_stream`
-        // deliberately folds bare `Halt` and `Partial(_, Halt)` into one
-        // `(vs, Some(code))` arm, so an *empty* key stream can now arrive
-        // here carrying a live halt (`.[halt]`, `.[halt_error]`). Returning
-        // `None` swallowed it -- `[.a | .[halt_error] | key]` printed `[]`
+        // deliberately folds bare `Halt`/`Error`/`Break` and their
+        // `Partial(_, ...)` counterparts into one `(vs, Some(control))`
+        // shape, so an *empty* key stream can now arrive here carrying a
+        // live halt (`.[halt]`, `.[halt_error]`) -- or, since #2371, a live
+        // jq-mode `pending_key_stream_control` (`.[error("x")]`, zero keys
+        // produced before the error). Returning `None` for the halt case
+        // used to swallow it -- `[.a | .[halt_error] | key]` printed `[]`
         // and exited 0 where the plain evaluator exits 5 with no stdout.
         // `partial` collapses an empty prefix back to the bare
         // `Halt`/`Error`/`Break`, which is exactly what the slice twin
         // below already relies on for its own empty-bound short-circuits.
-        return match pending_halt {
-            Some(code) => partial(Vec::new(), Control::Halt(code)),
-            None => QueryResult::None,
+        return match (pending_halt, pending_key_stream_control) {
+            (Some(code), _) => partial(Vec::new(), Control::Halt(code)),
+            (None, Some(control)) => partial(Vec::new(), control),
+            (None, None) => QueryResult::None,
         };
     }
 
@@ -32497,10 +32533,17 @@ fn eval_index_expr_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemanti
         }
     }
 
-    match pending_halt {
+    match (pending_halt, pending_key_stream_control) {
         // #1897: same fix the plain evaluator already applies here.
-        Some(code) => partial(results, Control::Halt(code)),
-        None => owned_vec_to_result(results),
+        (Some(code), _) => partial(results, Control::Halt(code)),
+        // #2371: the key stream's own escape, deferred until every
+        // already-produced key finished indexing cleanly -- an indexing
+        // failure on one of those keys outranks it (escapes earlier, via
+        // the `return partial(...)` arms inside the loop above), matching
+        // #2326's own documented priority for the symmetric plain-evaluator
+        // case.
+        (None, Some(control)) => partial(results, control),
+        (None, None) => owned_vec_to_result(results),
     }
 }
 
@@ -53927,6 +53970,72 @@ mod tests {
     #[test]
     fn test_slice_bound_path_context_end_own_partial_prefix_discarded_in_yq_mode_2351_review() {
         yq_query!(b"[1,2,3]", r#".[0:(1,2,error("x"))] | key"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    // #2371: `eval_index_expr_with_path_context`'s own key-stream handling
+    // had the missing #2326 mirror -- a key stream ending in `Error`/`Break`
+    // discarded the keys already produced, unlike the sibling `Halt` arm two
+    // lines above it (which already kept them, #791) and unlike the plain
+    // evaluator's own `eval_index_expr` (already fixed by #2326). `| key`
+    // forces path-context dispatch the same way the #2351-review tests above
+    // do; `key` isn't a real jq builtin, so these test succinctly's own
+    // internal consistency rather than pinning a jq 1.7.1 CLI transcript --
+    // see #2326's own plain-evaluator tests above for the live-oracle-backed
+    // claim about the underlying key-outer-generator semantics this mirrors.
+
+    /// #2371: jq mode keeps the keys already produced ("a", "b") before the
+    /// key generator's own `error("x")`.
+    #[test]
+    fn test_index_expr_key_stream_path_context_own_partial_prefix_preserved_2371() {
+        query!(br#"{"a":1,"b":2}"#, r#".[("a","b",error("x"))] | key"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::from("a"), OwnedValue::from("b")]);
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    /// #2371 sibling: `break` instead of `error`, same key-generator shape.
+    #[test]
+    fn test_index_expr_key_stream_path_context_own_partial_prefix_preserved_on_break_2371() {
+        query!(br#"{"a":1,"b":2}"#, r#".[("a","b",break $out)] | key"#,
+            QueryResult::Partial(vs, Control::Break(label)) => {
+                assert_eq!(vs, vec![OwnedValue::from("a"), OwnedValue::from("b")]);
+                assert_eq!(label, "out");
+            }
+        );
+    }
+
+    /// #2371: yq mode keeps the pre-fix conservative discard -- confirmed
+    /// live against yq v4.53.3: `.[("a","b",error("x"))]` on `{a: 1, b: 2}`
+    /// prints only `Error: x`, no `"a"`/`"b"` prefix (the plain-evaluator
+    /// shape; `key` itself is real yq syntax, so this exercises the same
+    /// underlying key-stream gate through the path-context dispatch).
+    #[test]
+    fn test_index_expr_key_stream_path_context_partial_prefix_discarded_in_yq_mode_2371() {
+        yq_query!(br#"{"a":1,"b":2}"#, r#".[("a","b",error("x"))] | key"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    /// #2371: the `keys.is_empty()` early-return path -- zero keys produced
+    /// before the key stream's own immediate error, matching
+    /// `drain_path_context_stream`'s `QueryResult::Error(e) => (Vec::new(),
+    /// Some(Control::Error(e)))` arm. An empty `Partial` prefix collapses to
+    /// a bare `Error` (`partial`'s documented behavior), so this must raise
+    /// the same way the non-empty-prefix case above does, not swallow the
+    /// error the way the pre-fix code's `keys.is_empty()` block would have
+    /// for an analogous `Halt` (#791's own repro shape, mirrored here for
+    /// `Error`).
+    #[test]
+    fn test_index_expr_key_stream_path_context_empty_prefix_still_raises_2371() {
+        query!(br#"{"a":1,"b":2}"#, r#".[error("x")] | key"#,
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "x");
             }
