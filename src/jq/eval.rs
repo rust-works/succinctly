@@ -31507,9 +31507,18 @@ fn continue_rest_with_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #2373: jq-only, matching #2226/#2328's own established gate --
         // see `eval_pipe`'s identical fix (above) for the full rationale
         // and live-oracle verification, not repeated at every one of this
-        // family's near-identical helpers.
+        // family's near-identical helpers. Routed through
+        // `catch_error_under_optional` (`atomic: false`), matching the
+        // jq-mode arm just below -- review: a bare `partial(...)` here
+        // skipped it, so `?` failed to suppress a trailing error in yq
+        // mode where jq mode already correctly suppresses it (#1964's own
+        // documented rule for this exact match block). Currently
+        // unreachable (`optional` is proven always `false` at every
+        // call site into this family today, per this file's own #2212
+        // doc comment) but kept for the same future-proofing reason that
+        // doc comment gives, not deleted as dead code.
         QueryResult::Partial(_vs, outer_control) if S::TAG == EvalTag::Yq => {
-            partial(Vec::new(), outer_control)
+            catch_error_under_optional::<W>(partial(Vec::new(), outer_control), optional, false)
         }
         QueryResult::Partial(vs, outer_control) => {
             let mut results = Vec::new();
@@ -31727,9 +31736,18 @@ fn continue_rest_with_paths<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #2373: jq-only, matching #2226/#2328's own established gate --
         // see `eval_pipe`'s identical fix (above) for the full rationale
         // and live-oracle verification, not repeated at every one of this
-        // family's near-identical helpers.
+        // family's near-identical helpers. Routed through
+        // `catch_error_under_optional` (`atomic: false`), matching the
+        // jq-mode arm just below -- review: a bare `partial(...)` here
+        // skipped it, so `?` failed to suppress a trailing error in yq
+        // mode where jq mode already correctly suppresses it (#1964's own
+        // documented rule for this exact match block). Currently
+        // unreachable (`optional` is proven always `false` at every
+        // call site into this family today, per this file's own #2212
+        // doc comment) but kept for the same future-proofing reason that
+        // doc comment gives, not deleted as dead code.
         QueryResult::Partial(_vs, outer_control) if S::TAG == EvalTag::Yq => {
-            partial(Vec::new(), outer_control)
+            catch_error_under_optional::<W>(partial(Vec::new(), outer_control), optional, false)
         }
         QueryResult::Partial(vs, outer_control) => {
             let mut results = Vec::new();
@@ -31894,9 +31912,18 @@ fn continue_rest_with_fresh_root<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #2373: jq-only, matching #2226/#2328's own established gate --
         // see `eval_pipe`'s identical fix (above) for the full rationale
         // and live-oracle verification, not repeated at every one of this
-        // family's near-identical helpers.
+        // family's near-identical helpers. Routed through
+        // `catch_error_under_optional` (`atomic: false`), matching the
+        // jq-mode arm just below -- review: a bare `partial(...)` here
+        // skipped it, so `?` failed to suppress a trailing error in yq
+        // mode where jq mode already correctly suppresses it (#1964's own
+        // documented rule for this exact match block). Currently
+        // unreachable (`optional` is proven always `false` at every
+        // call site into this family today, per this file's own #2212
+        // doc comment) but kept for the same future-proofing reason that
+        // doc comment gives, not deleted as dead code.
         QueryResult::Partial(_vs, outer_control) if S::TAG == EvalTag::Yq => {
-            partial(Vec::new(), outer_control)
+            catch_error_under_optional::<W>(partial(Vec::new(), outer_control), optional, false)
         }
         QueryResult::Partial(vs, outer_control) => {
             let mut results = Vec::new();
@@ -73894,6 +73921,35 @@ mod tests {
         ) {
             QueryResult::Error(e) => assert_eq!(e.message, "x"),
             other => panic!("expected bare Error, got {other:?}"),
+        }
+    }
+
+    /// #2373 review: the yq-mode gate above must route through
+    /// `catch_error_under_optional`, same as its jq-mode sibling arm just
+    /// below it -- a bare `partial(...)` skipped it, so `?` would fail to
+    /// suppress a trailing error in yq mode where jq mode already
+    /// correctly suppresses it. `optional` is proven always `false` at
+    /// every live call site into this family today (per this file's own
+    /// #2212 doc comment), so this pins the defensive code's own contract
+    /// directly rather than relying on a CLI-level repro that cannot exist
+    /// yet.
+    #[test]
+    fn test_continue_rest_with_context_yq_mode_partial_still_respects_optional_2373() {
+        let rest_expr = parse("tostring").unwrap();
+        let intermediate: QueryResult<'_, Vec<u64>> = QueryResult::Partial(
+            vec![OwnedValue::Int(1), OwnedValue::Int(2)],
+            Control::Error(EvalError::new("x")),
+        );
+        match continue_rest_with_context::<Vec<u64>, YqSemantics>(
+            intermediate,
+            core::slice::from_ref(&rest_expr),
+            &OwnedValue::Null,
+            None,
+            &[],
+            true,
+        ) {
+            QueryResult::None => {}
+            other => panic!("expected optional to suppress the error, got {other:?}"),
         }
     }
 
