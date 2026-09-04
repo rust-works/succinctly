@@ -9936,6 +9936,22 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
                     // suppressed by the yq-mode no-op below -- same
                     // priority order as `scalar_fallback`/
                     // `decode_failure_or` elsewhere in this fix.
+                    //
+                    // Currently unreachable via this function's only caller
+                    // (`Builtin::Path`, `eval_generic.rs`): confirmed via a
+                    // temporary debug probe that `path_step_generic` is
+                    // never even entered for a document containing an
+                    // undecodable scalar, because that caller's own
+                    // `push_generic_truthiness_cursor_error` pre-walk
+                    // (#1755/#1953's "validity gate", a whole-*document*
+                    // check run before any cursor walk) already raises the
+                    // identical `decode_failure` first, regardless of
+                    // whether the query's own path ever touches that
+                    // scalar. Kept anyway, matching the equivalent
+                    // defensive arm in `decode_failure_or`/`scalar_fallback`
+                    // elsewhere in this fix -- correct if a future caller of
+                    // this function ever reaches it without that same
+                    // upfront gate.
                     Err(EvalError::decode_failure(reason))
                 } else if S::TAG == EvalTag::Yq {
                     // #2346: see this arm's `PathNode::Absent` sibling
