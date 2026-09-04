@@ -305,10 +305,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ```
 
   Fixed by adding a `yq_mode`-gated `OwnedValue::Null => Ok(())` case to
-  `delete_at_path`'s `Expr::Iterate` arm, ahead of the existing catch-all — deliberately
-  *not* unconditional the way the sibling `Index` arm's own `Null` fallback is, since jq
-  mode has no such exemption at all (`{"x":null} | del(.x[])` still raises "Cannot
-  iterate over null" in real jq regardless of how the null was reached, #527).
+  `delete_at_path`'s *terminal* `Expr::Iterate` arm and its mid-chain sibling in
+  `delete_path_steps` (`.[]` followed by more path, e.g. `del(.x.a[].b)` — found during
+  this fix's own review, initially missed since the terminal case alone was the issue's
+  own stated repro), both ahead of their existing catch-alls — deliberately *not*
+  unconditional the way the sibling `Index` arm's own `Null` fallback is, since jq mode
+  has no such exemption at all (`{"x":null} | del(.x[])` still raises "Cannot iterate
+  over null" in real jq regardless of how the null was reached, #527).
 
   A second, deeper bug surfaced while verifying this: `delete_at_path_through_absent`
   (the recursive walker for "the rest of the chain, against a throwaway `null`, once a
@@ -328,6 +331,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   This also retroactively fixes a gap #2324's own code review had explicitly flagged as
   known-but-out-of-scope: a comma-grouped `del(.missing[], .x)` (no `?` needed) now
   correctly no-ops to `{}`, matching real yq, instead of raising.
+
+  **Known residual gap, not fixed here** (tracked as #2380): a comma-grouped sibling
+  whose own trailing shape is `.[]` *followed by more path* (not a bare trailing `.[]`)
+  still raises — `del(.missing[].x, .y)` on `{"y":1}` is `{}` in real yq, still an error
+  here — because `vivify_del_comma_iterate_targets`'s own prefix-matching only recognizes
+  a bare trailing `.[]`, falling through to the ordinary, read-based comma-branch
+  resolution for anything with a suffix after it. The non-comma single-target form
+  (`del(.missing[].x)` alone) is unaffected by this gap.
 
 - **`del()`/`delpaths()` against an object with a wrong-kind key (numeric/null/bool)
   raised instead of no-oping in yq mode** (#2353). Real yq's own object indexing only
