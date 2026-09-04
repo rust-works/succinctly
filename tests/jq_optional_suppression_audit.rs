@@ -77,6 +77,12 @@ const MATERIALIZER_FN_PREFIX: &str = "to_owned";
 ///   infallible (they return `OwnedValue`, not `Result`), so there is no error
 ///   for `optional` to suppress or raise. `to_owned_for_diagnostic` is the one
 ///   sanctioned lossy materialization left in `eval_generic.rs` (#1247).
+/// - `to_owned_value` is `AnchorResolved`'s own infallible accessor
+///   (`eval.rs`'s `resolve_plain(..).to_owned_value(text)`,
+///   `eval_generic.rs`'s `resolved.to_owned_value(text)`) -- an anchor helper
+///   that shares the prefix and nothing else. It is a *method*, so the call
+///   visitor never sees it; the macro token scan below matches on bare words
+///   and would, so it is excluded here (#2334 review).
 /// - `to_owned_checked` is the #2299 sibling of `to_owned` that swaps
 ///   `assert_nesting_depth`'s panic for a *catchable* `check_nesting_depth`
 ///   error -- the one member of the family that genuinely can raise a
@@ -91,6 +97,7 @@ const MATERIALIZER_FN_EXCLUSIONS: &[&str] = &[
     "to_owned_for_diagnostic",
     "to_owned_checked",
     "to_owned_checked_at_depth",
+    "to_owned_value",
 ];
 
 fn is_materializer_fn(name: &str) -> bool {
@@ -170,11 +177,16 @@ fn marker_in_attached_comment_block(lines: &[&str], idx: usize, body_start: usiz
 /// renamed helper or a refactor that moves the code out from under the visitor
 /// leaves it passing green while checking nothing.
 ///
-/// Today's counts are 381 functions and 148 call sites. These floors sit well
-/// below that -- low enough not to churn on ordinary edits, high enough that a
-/// scan which has stopped seeing the evaluators cannot pass.
-const MIN_LIVE_OPTIONAL_FNS: usize = 250;
-const MIN_SITES_EXAMINED: usize = 100;
+/// Today's counts are 380 functions and 149 call sites. The floors are ~90% of
+/// that (#2334 review tightened them from 250/100, which left enough headroom
+/// that a change halving the visitor's reach would still have passed): close
+/// enough to catch a scan that has lost a whole file or a whole node kind,
+/// loose enough that ordinary churn -- a handful of functions gaining or
+/// losing the parameter -- does not touch them. If a legitimate refactor
+/// lowers the real count past a floor, move the floor *and* say in the commit
+/// message what shrank; do not lower it to make a red test green.
+const MIN_LIVE_OPTIONAL_FNS: usize = 340;
+const MIN_SITES_EXAMINED: usize = 134;
 
 struct Site {
     line: usize,
@@ -211,6 +223,9 @@ struct Audit<'a> {
     stack: Vec<Frame>,
     live_optional_fns: usize,
     sites_examined: usize,
+    /// Functions spelling the parameter `_optional` -- the exemption marker --
+    /// while still reading it. See [`binds_live_optional`]'s doc comment.
+    dishonest_underscore_fns: Vec<String>,
     /// Every raw site, resolved in a second pass -- see [`Audit::resolve`].
     candidates: Vec<Site>,
 }
@@ -222,6 +237,7 @@ impl<'a> Audit<'a> {
             stack: Vec::new(),
             live_optional_fns: 0,
             sites_examined: 0,
+            dishonest_underscore_fns: Vec::new(),
             candidates: Vec::new(),
         }
     }
@@ -231,7 +247,15 @@ impl<'a> Audit<'a> {
     }
 
     fn push_fn(&mut self, sig: &syn::Signature, body: &syn::Block) {
-        let live_optional = binds_live_optional(sig);
+        // A function that spells the parameter `_optional` but reads it anyway
+        // is claiming an exemption it does not have. Audit it as live *and*
+        // report the spelling, so the fix is to rename rather than to bolt a
+        // marker onto every site (#2334 review).
+        let dishonest = binds_underscored_optional(sig) && body_reads_ident(body, "_optional");
+        if dishonest {
+            self.dishonest_underscore_fns.push(sig.ident.to_string());
+        }
+        let live_optional = binds_live_optional(sig) || dishonest;
         if live_optional {
             self.live_optional_fns += 1;
         }
@@ -314,12 +338,27 @@ impl<'a> Audit<'a> {
 /// Whether `sig` binds an `optional: bool` the body can actually read.
 ///
 /// `_optional: bool` does not count: an underscore-prefixed parameter is the
-/// codebase's existing, *compiler-enforced* marker for "this function ignores
-/// `optional` on purpose" -- `builtin_recurse_f`/`builtin_recurse_cond` (#1953)
-/// are spelled that way, and the unused-variable lint keeps the spelling honest
-/// in a way no comment can. STYLE-0012 names it as the preferred marker when
-/// the whole parameter is dead.
+/// codebase's existing marker for "this function ignores `optional` on
+/// purpose" -- `builtin_recurse_f`/`builtin_recurse_cond` (#1953) are spelled
+/// that way. STYLE-0012 names it as the preferred marker when the whole
+/// parameter is dead.
+///
+/// The unused-variable lint keeps that spelling *mostly* honest, but only
+/// mostly: it fires on an unused binding, never on an underscored one that is
+/// used. So a function could spell the parameter `_optional`, read it anyway,
+/// and silently take its whole body out of this audit with nothing complaining
+/// (#2334 review). [`binds_underscored_optional`] plus [`body_reads_ident`]
+/// close that: the main test reports any function that does both.
 fn binds_live_optional(sig: &syn::Signature) -> bool {
+    binds_optional_named(sig, "optional")
+}
+
+/// The `_optional` spelling of the same parameter -- the exemption marker.
+fn binds_underscored_optional(sig: &syn::Signature) -> bool {
+    binds_optional_named(sig, "_optional")
+}
+
+fn binds_optional_named(sig: &syn::Signature, want: &str) -> bool {
     sig.inputs.iter().any(|arg| {
         let syn::FnArg::Typed(pat) = arg else {
             return false;
@@ -327,17 +366,61 @@ fn binds_live_optional(sig: &syn::Signature) -> bool {
         let syn::Pat::Ident(ident) = &*pat.pat else {
             return false;
         };
-        if ident.ident != "optional" {
+        if ident.ident != want {
             return false;
         }
         matches!(&*pat.ty, syn::Type::Path(p) if p.path.is_ident("bool"))
     })
 }
 
+/// Whether `body` reads `name` anywhere -- as a value, or inside a macro's
+/// token stream (which `syn` never parses into expressions, so the visitor
+/// below has to check the raw tokens too).
+fn body_reads_ident(body: &syn::Block, name: &str) -> bool {
+    struct Reads<'a> {
+        name: &'a str,
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for Reads<'_> {
+        fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+            if node.path.is_ident(self.name) {
+                self.found = true;
+            }
+            visit::visit_expr_path(self, node);
+        }
+        fn visit_macro(&mut self, node: &'ast syn::Macro) {
+            let flat = node.tokens.to_string();
+            if flat
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .any(|w| w == self.name)
+            {
+                self.found = true;
+            }
+            visit::visit_macro(self, node);
+        }
+    }
+    let mut v = Reads { name, found: false };
+    v.visit_block(body);
+    v.found
+}
+
+/// Whether the item is `#[cfg(test)]`-gated, and so legitimately outside the
+/// audit: unit tests call the materializers directly with hand-picked
+/// `optional` values.
+///
+/// `not(test)` is explicitly *not* this: an item compiled only in non-test
+/// builds is ordinary production code, and skipping it would be a silent hole
+/// exactly the shape this audit exists to close (#2334 review). Neither file
+/// has one today; the check is here so that adding one is not a quiet
+/// exemption.
 fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
-    attrs
-        .iter()
-        .any(|a| a.path().is_ident("cfg") && a.to_token_stream_string().contains("test"))
+    attrs.iter().any(|a| {
+        if !a.path().is_ident("cfg") {
+            return false;
+        }
+        let tokens = a.to_token_stream_string();
+        tokens.contains("test") && !tokens.replace(' ', "").contains("not(test)")
+    })
 }
 
 /// `syn::Attribute` has no direct "render me" method that keeps working across
@@ -460,6 +543,7 @@ fn test_every_optional_materialization_site_is_routed_or_exempt_2334() {
     let mut report = String::new();
     let mut violations = 0usize;
     let mut offending_files = BTreeSet::new();
+    let mut dishonest: Vec<String> = Vec::new();
 
     for (path, src) in SOURCES {
         let file = syn::parse_file(src).unwrap_or_else(|e| panic!("{path}: {e}"));
@@ -468,6 +552,12 @@ fn test_every_optional_materialization_site_is_routed_or_exempt_2334() {
 
         live_optional_fns += audit.live_optional_fns;
         sites_examined += audit.sites_examined;
+        dishonest.extend(
+            audit
+                .dishonest_underscore_fns
+                .iter()
+                .map(|f| format!("{path}: {f}")),
+        );
 
         for site in &audit.resolve() {
             violations += 1;
@@ -496,6 +586,18 @@ fn test_every_optional_materialization_site_is_routed_or_exempt_2334() {
          behaviour change either way today -- see this file's own header for \
          why that is exactly the reason the check has to be static.",
         offending_files.len(),
+    );
+
+    assert!(
+        dishonest.is_empty(),
+        "STYLE-0012: {} function(s) spell the parameter `_optional` -- the \
+         exemption marker that takes the whole function out of this audit -- \
+         and then read it anyway:\n  {}\n\nThe unused-variable lint cannot \
+         catch that: it fires on an unused binding, never on an underscored \
+         one that is used. Rename the parameter to `optional` (and route or \
+         mark its materialization sites), or stop reading it.",
+        dishonest.len(),
+        dishonest.join("\n  "),
     );
 
     assert!(

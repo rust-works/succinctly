@@ -55,16 +55,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   marked with a specific reason otherwise: array construction is atomic in jq
   (`eval_array_construction`, `map_over`, `Expr::Array` — #2327's own declined candidate);
   key generators are evaluated at a hardcoded `optional: false`, so `.[k]?` never
-  suppresses an error raised computing `k` (confirmed against jq 1.7.1); a `Partial`'s
+  suppresses an error raised computing `k` (captured from jq 1.7.1:
+  `.[error("boom")]?` exits 5, while `.[.k]?` on a non-string `.k` exits 0 — the latter is
+  the *index step* being suppressed, and an earlier draft of this comment cited it
+  backwards); a `Partial`'s
   prefix must survive, so its `Control::Error` is suppressed at the `eval_try` boundary
   rather than at the conversion; and several sites are already routed one level out
   (`finish_fork`, `fanout_arg`'s deferred unwrap, `sort_family_control`).
 
   Along the way: four hand-copies of `optional && !e.is_decode_failure()` now call the
   shared `suppresses` — the same drift its own doc comment already records happening twice
-  (#1902, #1934) — and `sort_family_control` takes `optional`, giving
-  `key_elements_generic` a channel to suppress through where `Control` has no suppressed
-  variant. **No behaviour change**: every path involved is decode-failure-tagged, and a
+  (#1902, #1934). `sort_family_control` deliberately does *not* join them: review found it
+  is not the materialization's private error channel but a shared one, also carrying
+  whatever the user's key filter raised (`sort_by(error("x"))`), so routing it would have
+  been a guaranteed no-op for the decode failure it was written for and a live
+  over-suppression for everything else. It keeps its original signature and
+  `key_elements_generic` carries a marker saying why. **No behaviour change**: every path
+  involved is decode-failure-tagged, and a
   `debug_assert!(!optional)` probe over the whole suite re-confirmed #693's claim that
   `eval_generic.rs`'s native arms never see `optional = true` from any parser-driven
   query — only three white-box unit tests that hardcode it, one of them already named
