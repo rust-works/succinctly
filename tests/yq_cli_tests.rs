@@ -20859,6 +20859,126 @@ fn test_delpaths_noop_on_scalar_root_2106() -> Result<()> {
     Ok(())
 }
 
+/// #2353: a wrong-*kind* delete key against a genuine `Object` root (not a
+/// scalar -- #2106's own territory above) also no-ops in yq mode, both for
+/// `del()`'s static-integer index and `delpaths()`'s equivalent JSON
+/// component -- confirmed live against yq v4.53.3, including on an empty
+/// object. This is a real asymmetry, not a blanket "any wrong-kind key
+/// no-ops" rule: an `Array` root with a wrong-kind key still errors (real
+/// yq's own array indexing always tries to parse the key as an integer),
+/// pinned separately below.
+#[test]
+fn test_2353_del_wrong_kind_index_key_noop_on_object_root() -> Result<()> {
+    for input in [r#"{"a":1}"#, "{}"] {
+        let (out, code) = run_yq_stdin("del(.[5])", input, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "del, object root {input}");
+        assert_eq!(out.trim(), input, "del, object root {input}");
+
+        let (out, code) = run_yq_stdin("delpaths([[5]])", input, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "delpaths, object root {input}");
+        assert_eq!(out.trim(), input, "delpaths, object root {input}");
+    }
+    Ok(())
+}
+
+/// #2353: the same no-op applies mid-chain -- a wrong-kind key against a
+/// nested object leaves that whole sub-path untouched, for both `del()`'s
+/// own walker and `delpaths()`'s recursive one, matching `test_1219`'s own
+/// established mid-chain-vs-terminal coverage pattern for the sibling
+/// slice-run rule.
+#[test]
+fn test_2353_del_wrong_kind_index_key_noop_mid_chain() -> Result<()> {
+    let input = r#"{"a":{"x":1}}"#;
+
+    let (out, code) = run_yq_stdin("del(.a[5].y)", input, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "del mid-chain: {out}");
+    assert_eq!(out.trim(), input);
+
+    let (out, code) = run_yq_stdin(r#"delpaths([["a",5]])"#, input, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "delpaths mid-chain: {out}");
+    assert_eq!(out.trim(), input);
+
+    Ok(())
+}
+
+/// #2353: **residual gap, not fixed here** -- unlike the single-path shape
+/// above, a comma-grouped `del(.[5], .a)` still raises instead of no-oping
+/// `.[5]` and deleting only `.a`. A single static path (`del(.[5])` alone)
+/// never needs "path prepass" and reaches `delete_at_path` directly (the
+/// site this issue's own fix touches); a `Comma` always does, routing
+/// through `resolve_node`'s shared leaf resolver (`resolve_leaf`), which
+/// evaluates the branch via the *ordinary value evaluator* to get its
+/// output rather than delegating to any of this issue's fixed `delete_*`
+/// functions. That evaluator was found (during this issue's own
+/// investigation, live-verified) to already raise for a **plain read**
+/// of `.[5]` against a bare object (`{"a":1} | .[5]` raises "Cannot index
+/// object with number" in succinctly, where real yq returns `null`) --
+/// this is a materially larger, read-level divergence, not a del()-specific
+/// one, and out of scope for this fix. Filed as a follow-up, #2362. Pinning
+/// the current (unfixed) behavior here rather than silently leaving it
+/// untested.
+#[test]
+fn test_2353_del_comma_grouped_wrong_kind_key_still_errors_residual_gap() -> Result<()> {
+    let (_out, code) = run_yq_stdin("del(.[5], .a)", r#"{"a":1,"b":2}"#, &["-o=json", "-I=0"])?;
+    assert_eq!(
+        code, 1,
+        "residual gap: comma-grouped form still errors, unlike the single-path fix above"
+    );
+    Ok(())
+}
+
+/// #2353: an `Array` root with a wrong-kind key is *not* covered by the
+/// same rule -- real yq's own array indexing always tries to parse the key
+/// as an integer, so a string/null key there still raises (confirmed live
+/// for `del()`, `delpaths()`, and mid-chain through `delpaths()`'s own
+/// recursive walker). This asymmetry is the reason the fix lives on the
+/// `Object` arms only, not a blanket wrong-kind-key carve-out.
+#[test]
+fn test_2353_del_wrong_kind_key_still_errors_on_array_root() -> Result<()> {
+    let (_out, code) = run_yq_stdin(r#"del(.["a"])"#, "[1,2,3]", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 1, "del, array root, string key");
+
+    let (_out, code) = run_yq_stdin(r#"delpaths([["a"]])"#, "[1,2,3]", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 1, "delpaths, array root, string key");
+
+    let (_out, code) = run_yq_stdin(
+        r#"delpaths([["a","x"]])"#,
+        r#"{"a":[1,2,3]}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 1, "delpaths, array root mid-chain, string key");
+
+    Ok(())
+}
+
+/// #2353: jq mode is unaffected -- real jq still raises `Cannot index
+/// object with number` (succinctly's existing, unchanged jq-mode wording)
+/// for every shape the yq-mode tests above no-op.
+#[test]
+fn test_2353_jq_mode_unaffected() -> Result<()> {
+    let (_output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_succinctly"));
+            command.arg("jq").arg("del(.[5])");
+            command
+        },
+        Some(br#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 5, "jq mode del must still error");
+
+    let (_output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_succinctly"));
+            command.arg("jq").arg("delpaths([[5]])");
+            command
+        },
+        Some(br#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 5, "jq mode delpaths must still error");
+
+    Ok(())
+}
+
 /// del()'s parent-key rule also applies when the resolved path fans out
 /// into more than one target (a top-level comma, or a computed key with
 /// multiple values) — the multi-path delete walk never sees the original
@@ -22532,22 +22652,41 @@ fn test_1116_chained_scalar_slice_del_nested_index_and_field() -> Result<()> {
     Ok(())
 }
 
-/// `navigate_read_only`'s type-mismatch fallbacks (`Field` against a
-/// non-object, `Index` against a non-array) both bail out to `None`,
-/// deferring to `delete_at_path`'s own pre-existing, unaffected error —
-/// regression guards confirming #1116's rewrite doesn't fire (or change
-/// the error) for these shapes.
+/// `navigate_read_only`'s type-mismatch fallback for `Field` against a
+/// non-object bails out to `None`, deferring to `delete_at_path`'s own
+/// pre-existing, unaffected error — regression guard confirming #1116's
+/// rewrite doesn't fire (or change the error) for this shape. An `Array`
+/// root with a wrong-kind key still errors regardless of mode (#2353's own
+/// established asymmetry: only an `Object` root no-ops for a wrong-kind
+/// key, since real yq's own array indexing always tries to parse the key
+/// as an integer first).
 #[test]
-fn test_1116_chained_scalar_slice_del_navigator_type_mismatches_unaffected() -> Result<()> {
+fn test_1116_chained_scalar_slice_del_navigator_type_mismatch_field_on_array_unaffected(
+) -> Result<()> {
     let (_out, stderr, code) = run_yq_stdin_with_stderr("del(.a.b[0:1])", r#"{"a":[1,2,3]}"#, &[])?;
     assert_ne!(code, 0);
     assert!(stderr.contains("Cannot index array"), "stderr: {stderr}");
+    Ok(())
+}
 
-    let (_out, stderr, code) =
-        run_yq_stdin_with_stderr("del(.a[0].b[0:1])", r#"{"a":{"x":1}}"#, &[])?;
-    assert_ne!(code, 0);
-    assert!(stderr.contains("Cannot index object"), "stderr: {stderr}");
-
+/// `navigate_read_only`'s other type-mismatch fallback -- `Index` against a
+/// non-array (here `.a[0]` against an `Object`) -- also bails out to
+/// `None`, deferring to `delete_at_path`'s own `Expr::Index` arm. That arm
+/// no longer errors here as of #2353: an `Object` root with a numeric key
+/// no-ops in yq mode instead, matching real yq (confirmed live against
+/// v4.53.3 -- `del(.a[0].b[0:1])` on `{"a":{"x":1}}` leaves the document
+/// untouched, exit 0). This test previously asserted the pre-#2353 error;
+/// updated to match the corrected, oracle-verified behavior.
+#[test]
+fn test_1116_chained_scalar_slice_del_navigator_type_mismatch_index_on_object_now_noops(
+) -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "del(.a[0].b[0:1])",
+        r#"{"a":{"x":1}}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":{"x":1}}"#);
     Ok(())
 }
 

@@ -289,6 +289,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`del()`/`delpaths()` against an object with a wrong-kind key (numeric/null/bool)
+  raised instead of no-oping in yq mode** (#2353). Real yq's own object indexing only
+  understands string field names — handed anything else, it silently contributes
+  nothing rather than erroring, unlike succinctly's prior behavior:
+
+  ```console
+  $ echo '{"a":1}' | yq -o=json 'del(.[5])'
+  {"a": 1}
+  $ echo '{"a":1}' | succinctly yq -o json 'del(.[5])'   # before this fix
+  Error: Cannot index object with number
+  ```
+
+  Fixed at 4 sites in `src/jq/eval.rs` — `delete_keys`, `delete_at_path`,
+  `delete_paths_under`, and `delete_path_steps` (the terminal, single-key, mid-chain,
+  and mid-chain-through-`delpaths()` shapes respectively) — each gated on yq mode only;
+  jq mode is unaffected, matching real jq's own unchanged error there. This asymmetric
+  rule is scoped to **objects only**: an `Array` root with a wrong-kind key (string/
+  null/bool) still errors in both tools, since real yq's own array indexing always
+  tries to parse the key as an integer first (the same `strconv.ParseInt`-flavored
+  mechanism #2333 above already established), and genuinely can't tell a wrong-kind
+  key apart from an object-field key once the target is a sequence.
+
+  **Known residual gap, not fixed here**: a *comma-grouped* `del(.[5], .a)` still
+  raises instead of no-oping `.[5]` and deleting only `.a`, because a `Comma` routes
+  through a different code path (`resolve_node`'s shared leaf resolver, which
+  evaluates via the ordinary value evaluator rather than any of the four functions
+  above) that was found, during this issue's own investigation, to already raise for a
+  **plain read** of `.[5]` against a bare object — a materially larger, read-level
+  divergence rather than a `del()`-specific one. Follow-up filed as #2362.
+
 - **`delpaths([[]])` printed the literal `null` instead of emitting nothing in yq mode**
   (#2352, found while implementing #2306). `del(.)` already special-cases "deleted the
   whole document" as no output at all (#1702, real yq's own root-delete rule), but

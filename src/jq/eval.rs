@@ -36628,6 +36628,15 @@ fn delete_paths_under(
             }
             // A non-string key names no child at all: jq's `Cannot index
             // object with <kind>`.
+            //
+            // #2353: no-op in yq mode instead -- confirmed live for the
+            // mid-chain case too (`delpaths([["a",5]])` on `{"a":{"x":1}}`
+            // leaves `.a` untouched), matching `delete_keys`'s own identical
+            // carve-out for the terminal case. The array arm below is
+            // unaffected -- real yq's own array indexing always tries to
+            // parse any key as an integer, so a wrong-kind key there still
+            // raises in real yq too, mid-chain or not (confirmed live).
+            _ if yq_mode => Ok(OwnedValue::Object(entries)),
             other => Err(EvalError::cannot_index("object", other)),
         },
         OwnedValue::Array(mut arr) => match key {
@@ -36712,12 +36721,32 @@ fn delete_keys(
             // A non-string key is jq's `Cannot delete <kind> field of object`;
             // checked over every key in the batch, since a run can group
             // several distinct key types together.
+            //
+            // #2353: in yq mode, a non-string key against an object
+            // contributes nothing instead of raising -- confirmed live
+            // against yq v4.53.3 for every key kind (`number`, `null`,
+            // `bool`), both via `del()` and `delpaths()`, on an empty and a
+            // non-empty object alike, and through a comma-grouped `del()`
+            // sibling (`del(.[5], .a)` deletes `.a` and leaves the rest
+            // untouched, not a whole-call error). Asymmetric with the array
+            // arm below on purpose: real yq's own array indexing always
+            // tries to parse *any* key as an integer (the same
+            // `strconv.ParseInt`-flavored "cannot index array with '<key>'"
+            // wording #2333 already established), so a non-numeric key
+            // there still raises in real yq too -- confirmed live, this is
+            // not a symmetric rule. Assignment through a non-string object
+            // key (`.[5] = 9`) is unrelated and left untouched: real yq
+            // neither no-ops nor errors there, it silently stringifies the
+            // key and assigns a new field (`{"a":1,"5":9}`) -- a different
+            // mechanism (`eval_assign`/`set_path_steps`) this issue's own
+            // scope doesn't cover.
             let mut doomed: BTreeSet<&str> = BTreeSet::new();
             for key in keys {
                 match key {
                     OwnedValue::String(name) => {
                         doomed.insert(name.as_str());
                     }
+                    _ if yq_mode => {}
                     other => {
                         return Err(EvalError::cannot_delete_field_of_object(other.type_name()))
                     }
@@ -38503,6 +38532,17 @@ fn delete_at_path(
                 // #2106: same scalar no-op as the `Field` arm above, for an
                 // index key (`2.5 | del(.[0])` stays `2.5` in real yq).
                 _ if yq_mode && is_yq_field_index_noop_scalar(root) => Ok(()),
+                // #2353: an `Object` root (the one `OwnedValue` shape
+                // `is_yq_field_index_noop_scalar` deliberately excludes,
+                // since it's about scalar roots, not a wrong-kind key
+                // against a container) also no-ops in yq mode for a numeric
+                // index key -- confirmed live, matching `delete_keys`'s own
+                // identical carve-out for `delpaths()`'s batch form. Real
+                // yq's own array indexing always tries to parse *any* key
+                // as an integer, so this asymmetry is real: an `Array` root
+                // with a wrong-kind key stays above, still erroring, because
+                // real yq errors there too.
+                OwnedValue::Object(_) if yq_mode => Ok(()),
                 _ => Err(EvalError::cannot_index_with_type(
                     owned_type_name(root),
                     "number",
@@ -38893,6 +38933,11 @@ fn delete_path_steps(
                 // #2106: same mid-chain scalar no-op as `Field` above, for an
                 // index step.
                 _ if yq_mode && is_yq_field_index_noop_scalar(root) => return Ok(()),
+                // #2353: same mid-chain `Object`-with-wrong-kind-key no-op as
+                // `delete_at_path`'s own terminal `Index` arm -- confirmed
+                // live, `del(.a[5].y)` on `{"a":{"x":1}}` leaves `.a`
+                // untouched.
+                OwnedValue::Object(_) if yq_mode => return Ok(()),
                 _ => {
                     return Err(EvalError::cannot_index_with_type(
                         owned_type_name(root),
