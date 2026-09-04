@@ -289,6 +289,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`delpaths([[]])` printed the literal `null` instead of emitting nothing in yq mode**
+  (#2352, found while implementing #2306). `del(.)` already special-cases "deleted the
+  whole document" as no output at all (#1702, real yq's own root-delete rule), but
+  `delpaths_one`'s own empty-path arm — the JSON-array-of-paths spelling of the identical
+  operation — never picked up the same mechanism, since its own `Ok(OwnedValue::Null)`
+  result had no way to signal "no output" once already wrapped as an ordinary value.
+  Fixed by checking for the empty-path shape ahead of that result, in yq mode only (jq
+  mode is unaffected — real jq's own `delpaths([[]])` already prints `null`, matching
+  succinctly's existing jq-mode behavior). The empty path always sorts first in
+  `delpaths_one`'s own path list (an existing invariant, unchanged), so a multi-path call
+  with an empty path anywhere in it (`delpaths([[],["a"]])`, `delpaths([["a"],[]])`)
+  collapses to the same "emit nothing" outcome regardless of where the empty path
+  appears in the argument — confirmed live against yq v4.53.3 for all three shapes.
+
 - **`del()` through a chained slice-run followed by more path (`del(.a[0:2].x)`) silently
   no-op'd instead of erroring when the slice target is an array or `null`** (#2333, found
   during #2323's own code review). #1219's own "trailing slice-run followed by anything
