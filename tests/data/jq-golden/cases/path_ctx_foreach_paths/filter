@@ -1,0 +1,1 @@
+[foreach paths as $p ([]; . + [$p])] | last

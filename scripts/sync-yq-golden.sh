@@ -13,6 +13,11 @@
 # so a case that exercises input yq refuses to process has an oracle for that
 # too.
 #
+# A case where yq exits 0 having printed nothing gets a marker file
+# expected.empty beside its empty expected.out, so the Rust loader can tell a
+# silent success from a fixture that was never captured. Real yq does this:
+# `key` and `parent` at the document root emit no output at all (#2421).
+#
 # Usage:
 #   ./scripts/sync-yq-golden.sh              # regenerate expected.out files
 #   ./scripts/sync-yq-golden.sh --check      # verify goldens match pinned yq
@@ -91,6 +96,16 @@ for dir in "$GOLDEN_DIR"/cases/*/; do
         echo "error: case $name now passes under yq $PIN but has expected.status/err" >&2
         stale=$((stale + 1))
       fi
+      # The silent-success marker is a golden too: it says yq printed nothing
+      # on success (#2421), and it going stale in either direction is drift.
+      if [[ -s "$work_dir/out" && -f "$dir/expected.empty" ]]; then
+        echo "error: case $name now prints output under yq $PIN but has expected.empty" >&2
+        stale=$((stale + 1))
+      fi
+      if [[ ! -s "$work_dir/out" && ! -f "$dir/expected.empty" ]]; then
+        echo "error: case $name prints nothing under yq $PIN but has no expected.empty" >&2
+        stale=$((stale + 1))
+      fi
     else
       if [[ "$(cat "$dir/expected.status" 2>/dev/null)" != "$status" ]]; then
         echo "error: case $name exits $status under yq $PIN, expected.status says" \
@@ -107,8 +122,18 @@ for dir in "$GOLDEN_DIR"/cases/*/; do
     if [[ $status -eq 0 ]]; then
       # A case that used to fail and now passes sheds its failure fixtures.
       rm -f "$dir/expected.status" "$dir/expected.err"
+      # `expected.empty` declares "yq exited 0 and printed nothing", which real
+      # yq genuinely does (`key`/`parent` at the document root, #2421). The
+      # Rust loader would otherwise reject an empty expected.out as a fixture
+      # that was never captured, and the corpus could not hold those cases.
+      if [[ -s "$dir/expected.out" ]]; then
+        rm -f "$dir/expected.empty"
+      else
+        : > "$dir/expected.empty"
+      fi
       echo "wrote cases/$name/expected.out" >&2
     else
+      rm -f "$dir/expected.empty"
       echo "$status" > "$dir/expected.status"
       cp "$work_dir/err" "$dir/expected.err"
       echo "wrote cases/$name/expected.{out,err,status} (yq exit $status)" >&2
