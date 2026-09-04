@@ -5358,7 +5358,15 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                     Err(err) => GenericResult::Error(err),
                 }
             } else {
-                decode_failure_or(&value, optional, || {
+                // #2346: real yq's `.[]` over any non-container (not just
+                // `null`) is a silent no-op, confirmed live against yq
+                // v4.53.3 -- see `eval.rs`'s identical fix on its own
+                // `Expr::Iterate` arm for the full live-oracle evidence.
+                // `decode_failure_or`'s own `optional` parameter already
+                // has exactly this "suppress unconditionally" shape, so
+                // widening it covers this without a new branch -- a decode
+                // failure still raises either way, checked first.
+                decode_failure_or(&value, optional || S::TAG == EvalTag::Yq, || {
                     GenericResult::Error(EvalError::cannot_iterate_with(
                         S::TAG,
                         &to_owned_for_diagnostic(&value, cursor),

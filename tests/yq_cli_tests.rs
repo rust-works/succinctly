@@ -22321,30 +22321,27 @@ fn test_yq_del_slice_outcome_iterate_prefix_real_container_1432() -> Result<()> 
 }
 
 /// #1432 (coverage, #1863): the same `navigate_read_only` `Iterate` arm's
-/// scalar-hit branch, reached via `del()`. Pinned as *known-divergent* -- a
-/// pre-existing bug unrelated to #1432's own fix (`navigate_read_only`'s
-/// match arms are byte-for-byte unchanged by that PR), found only while
-/// restoring this coverage, not something this PR fixes. Real yq applies
-/// the same #1181/#1232 "a scalar hit anywhere mid-chain permanently
-/// no-ops" rule `=`'s own write path (and `del()`'s slice-prefix handling
-/// elsewhere in this same file) already get right; `del()`'s own
-/// `Iterate`-then-slice path does not, raising instead. Live-verified
-/// against yq v4.53.3; reported as a follow-up on #1863.
+/// scalar-hit branch, reached via `del()`. Was pinned as *known-divergent*
+/// (real yq no-ops; succinctly raised) -- #2346 closes this as part of its
+/// own broader fix: `delete_path_steps`'s mid-chain `Expr::Iterate` arm now
+/// applies the same `is_yq_field_index_noop_scalar` no-op every sibling
+/// `Field`/`Index` arm in this function already had, so a scalar hit ahead
+/// of a chained slice-run is unaffected all the way through, matching real
+/// yq (confirmed live against v4.53.3, `a: 5 | del(.a[].b[0:1])` stays
+/// `{"a":5}`).
 ///
-/// The sibling `Null` case this test used to pin as equally divergent is
-/// fixed by #2323: `delete_path_steps`'s `Expr::Iterate` arm now vivifies a
+/// The sibling `Null` case this test used to pin as equally divergent was
+/// fixed by #2323: `delete_path_steps`'s `Expr::Iterate` arm vivifies a
 /// `null` root into `[]` in yq mode before matching, the same rule
 /// `delete_at_path`'s terminal arms and `setpath`'s own auto-vivify already
-/// apply -- `a: null | del(.a[].b[0:1])` is `{"a":[]}` now, matching real
-/// yq (an empty array has nothing to fan `.b[0:1]` into).
+/// apply -- `a: null | del(.a[].b[0:1])` is `{"a":[]}` (an empty array has
+/// nothing to fan `.b[0:1]` into).
 #[test]
 fn test_yq_del_slice_outcome_iterate_prefix_scalar_and_null_1432() -> Result<()> {
-    // Scalar hit -- real yq no-ops; succinctly raises. Still divergent,
-    // unaffected by #2323 (a scalar `5` is never a `null` to vivify).
-    let (_out, err, code) =
-        run_yq_stdin_with_stderr("del(.a[].b[0:1])", "a: 5\n", &["-o=json", "-I=0"])?;
-    assert_ne!(code, 0);
-    assert!(err.contains("Cannot iterate"), "err={err}");
+    // Scalar hit -- real yq no-ops, and so does succinctly now (#2346).
+    let (out, code) = run_yq_stdin("del(.a[].b[0:1])", "a: 5\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"{"a":5}"#);
 
     // `Null` -- real yq autovivifies to `[]` (nothing left to delete),
     // confirmed live; #2323 closes this.
@@ -25585,6 +25582,16 @@ fn test_yq_error_value_preview_matches_tostring_number_literal_spelling_1055() -
 /// constructor (`cannot_iterate`, triggered by iterating a scalar) rather
 /// than `error(v)` directly -- a different call path through the same
 /// `EvalTag`-dispatched core.
+///
+/// #2346 retired plain `.a[]` as a yq-mode `cannot_iterate` trigger: real
+/// yq's own `.[]` over any non-container is a silent no-op (confirmed live
+/// against yq v4.53.3), not an error, so `.a[]` no longer reaches this
+/// constructor in yq mode at all. `map(key)` still does -- the path-context
+/// evaluator's own `Expr::Builtin(Builtin::Map(f))` arm (distinct from the
+/// value-only evaluator's `builtin_map`, which #2346 left alone since it
+/// was already yq-gated) has no such gate, a known, narrower, adjacent gap
+/// left open rather than folded into #2346's own scope -- see that arm's
+/// call site for the tracking issue.
 #[test]
 fn test_yq_cannot_iterate_preview_matches_tostring_number_literal_spelling_1055() -> Result<()> {
     let cases: &[&str] = &["1e2", "1E5", "1.5e-10"];
@@ -25593,7 +25600,7 @@ fn test_yq_cannot_iterate_preview_matches_tostring_number_literal_spelling_1055(
         let (tostring_out, code) = run_yq_stdin(".a | tostring", &input, &[])?;
         assert_eq!(code, 0, "literal={literal} tostring out: {tostring_out:?}");
         let expected = tostring_out.trim();
-        let (_out, stderr, code) = run_yq_stdin_with_stderr(".a[]", &input, &[])?;
+        let (_out, stderr, code) = run_yq_stdin_with_stderr(".a | map(key)", &input, &[])?;
         assert_ne!(code, 0, "literal={literal} unexpectedly iterated a scalar");
         assert!(
             stderr.contains(expected),
@@ -30057,27 +30064,27 @@ fn test_del_comma_fanout_iterate_over_null_unaffected_in_jq_mode_2324() -> Resul
 }
 
 /// #2324: an ordinary plain read of `.[]` over `null` (not a `del()` target
-/// at all) must be entirely unaffected by this fix -- `resolve_node`'s
-/// shared `Expr::Iterate` arm itself was deliberately left untouched, with
-/// the vivify handled by a `del()`-specific pre-pass instead
+/// at all) must be entirely unaffected by *that* fix -- `resolve_node`'s
+/// shared `Expr::Iterate` arm was deliberately left untouched by #2324
+/// itself, with the vivify handled by a `del()`-specific pre-pass instead
 /// (`vivify_del_comma_iterate_targets`, called only from `builtin_del`).
-/// Confirmed live against yq v4.53.3 that `.a[]` and `.[5][]` (an
-/// out-of-range read, not a delete) both still raise outside of `del()`.
+///
+/// #2346 correction: this test's own original claim -- "confirmed live
+/// against yq v4.53.3 that `.a[]` and `.[5][]` both still raise outside of
+/// `del()`" -- was never actually true; re-verified live just now and both
+/// give silent no-op (exit 0, no output), same as every other non-container
+/// `.[]` target (#2346's own broader finding). Updated to assert the
+/// correct behavior rather than continuing to pin a claim that doesn't hold
+/// against the oracle.
 #[test]
 fn test_plain_iterate_over_null_read_unaffected_by_2324() -> Result<()> {
-    let (out, stderr, code) = run_yq_stdin_with_stderr(".a[]", "a: null\n", &["-o=json"])?;
-    assert_ne!(code, 0, "out: {out:?}");
-    assert!(
-        stderr.contains("Cannot iterate over null"),
-        "stderr={stderr}"
-    );
+    let (out, code) = run_yq_stdin(".a[]", "a: null\n", &["-o=json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out, "");
 
-    let (out, stderr, code) = run_yq_stdin_with_stderr(".[5][]", "[1, 2]\n", &["-o=json"])?;
-    assert_ne!(code, 0, "out: {out:?}");
-    assert!(
-        stderr.contains("Cannot iterate over null"),
-        "stderr={stderr}"
-    );
+    let (out, code) = run_yq_stdin(".[5][]", "[1, 2]\n", &["-o=json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out, "");
 
     Ok(())
 }
@@ -30345,6 +30352,41 @@ fn test_2347_jq_mode_mid_chain_iterate_unaffected() -> Result<()> {
     Ok(())
 }
 
+/// #2346: real yq's `.[]` over *any* non-container -- not just `null` --
+/// silently produces zero output, confirmed live against yq v4.53.3 for
+/// number/string/bool/null alike (`echo '{"x":5}' | yq -o=json '.x[]'` is
+/// empty, exit 0). jq has no such rule (`.[]` on a scalar always raises
+/// there, confirmed against jq 1.7.1), so this is yq-mode only. Covers the
+/// value-only evaluator's own `Expr::Iterate` arm (`eval.rs`'s
+/// `scalar_fallback` call) and its `eval_generic.rs` CLI-dispatch
+/// counterpart (`decode_failure_or`), both reached by a plain top-level
+/// read with no path-tracking need.
+#[test]
+fn test_yq_iterate_plain_read_non_container_is_noop_2346() -> Result<()> {
+    for (yaml, query) in [
+        ("5\n", "."),
+        ("\"hi\"\n", "."),
+        ("true\n", "."),
+        ("null\n", "."),
+    ] {
+        let (out, code) = run_yq_stdin(&format!("{query}[]"), yaml, &["-o=json"])?;
+        assert_eq!(code, 0, "yaml={yaml:?} out: {out:?}");
+        assert_eq!(out, "", "yaml={yaml:?}");
+    }
+
+    // Nested field access into a scalar, not just the bare root.
+    let (out, code) = run_yq_stdin(".a[]", "a: 5\n", &["-o=json"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out, "");
+
+    // Array/object controls: unaffected, still iterate normally.
+    let (out, code) = run_yq_stdin(".[]", "[1, 2, 3]\n", &["-o=json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "1\n2\n3\n");
+
+    Ok(())
+}
+
 /// Residual gap, not fixed here (tracked as #2380): a comma-grouped
 /// sibling whose own trailing shape is `.[]` *followed by more path* (not
 /// a bare trailing `.[]`) still raises, because
@@ -30362,5 +30404,84 @@ fn test_2347_del_comma_grouped_tolerated_null_iterate_suffix_residual_gap() -> R
         code, 1,
         "residual gap: comma-grouped .[]-then-more-path sibling still errors"
     );
+    Ok(())
+}
+
+/// #2346's jq-mode control: `.[]` over a non-container must keep raising in
+/// `succinctly jq`, unaffected by the yq-mode-only fix above -- confirmed
+/// against jq 1.7.1, `.[]` on a number/`null` both raise "Cannot iterate
+/// over ...".
+#[test]
+fn test_jq_iterate_plain_read_non_container_still_raises_2346() -> Result<()> {
+    for (json, expect) in [
+        ("5", "Cannot iterate over number"),
+        ("null", "Cannot iterate over null"),
+    ] {
+        let (out, stderr, code) = run_jq_stdin_with_stderr(".[]", json, &["-c"])?;
+        assert_ne!(code, 0, "json={json} out: {out:?}");
+        assert!(stderr.contains(expect), "json={json} stderr={stderr}");
+    }
+    Ok(())
+}
+
+/// #2346, `del()` side: real yq's `del(.[])`/mid-chain `del(.a[]...)` over a
+/// non-container target is a silent no-op (the document comes back
+/// unchanged), confirmed live against yq v4.53.3. Covers `delete_at_path`'s
+/// own terminal `Expr::Iterate` arm (bare `del(.[])`) and
+/// `delete_path_steps`'s mid-chain arm (`del(.a[])`, `del(.a[].b)`) --
+/// distinct functions from the plain-read sites above, and from `=`/`|=`'s
+/// own `set_path`/`update_path` machinery, which was already correct
+/// before this fix (confirmed live and left untouched).
+#[test]
+fn test_yq_del_iterate_non_container_is_noop_2346() -> Result<()> {
+    let (out, code) = run_yq_stdin("del(.[])", "5\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "5");
+
+    let (out, code) = run_yq_stdin("del(.a[])", "a: 5\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":5}"#);
+
+    let (out, code) = run_yq_stdin("del(.a[].b)", "a: 5\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), r#"{"a":5}"#);
+
+    // Array/object controls: unaffected, `del(.[])` still clears them.
+    let (out, code) = run_yq_stdin("del(.[])", "[1, 2, 3]\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[]");
+
+    Ok(())
+}
+
+/// #2346's jq-mode control for the `del()` side: `del(.[])` over a
+/// non-container must keep raising in `succinctly jq`, matching jq 1.7.1
+/// (confirmed live).
+#[test]
+fn test_jq_del_iterate_non_container_still_raises_2346() -> Result<()> {
+    let (out, stderr, code) = run_jq_stdin_with_stderr("del(.[])", "5", &["-c"])?;
+    assert_ne!(code, 0, "out: {out:?}");
+    assert!(stderr.contains("Cannot iterate over number"), "{stderr}");
+    Ok(())
+}
+
+/// #2346, path-context evaluator: the same yq-mode no-op has to hold when
+/// something downstream forces path-tracking (`needs_path_context`), not
+/// just on the lighter value-only read path above -- `eval_stage_with_path_
+/// context`'s own `Expr::Iterate` arm is a distinct function from both the
+/// plain-read sites and `del()`'s own machinery. `key` is a jq-only
+/// path-context builtin, gated behind `--jq-extensions` in yq mode (#1512)
+/// -- irrelevant to whether the underlying `.[]` no-op itself is real yq
+/// surface, which it independently is (verified in the plain-read test
+/// above without any extension flag).
+#[test]
+fn test_yq_iterate_path_context_non_container_is_noop_2346() -> Result<()> {
+    let (out, code) = run_yq_stdin(
+        "(.a)? | .[] | key",
+        "a: 5\n",
+        &["--jq-extensions", "-o", "json"],
+    )?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out, "");
     Ok(())
 }
