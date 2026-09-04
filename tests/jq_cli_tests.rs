@@ -35076,6 +35076,44 @@ fn test_slice_bound_end_cli_dispatch_own_partial_prefix_preserved_2351() -> Resu
     Ok(())
 }
 
+/// #2351 review (Gap 1): jq-mode control for `resolve_slice_bound` (the
+/// path-mode resolver behind `path()`/`=`/`del()`), through the real CLI
+/// binary rather than the library `eval()` -- confirms the new yq-mode gate
+/// added to this function doesn't disturb jq mode's own streamed prefix.
+/// Verified against jq 1.7.1: `echo '[1,2,3]' | jq -c
+/// 'path(.[(0,1,error("x")):3])'` prints `[{"start":0,"end":3}]` then
+/// `[{"start":1,"end":3}]` before raising `x`.
+#[test]
+fn test_resolve_slice_bound_cli_dispatch_start_own_partial_prefix_preserved_2351_review(
+) -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "path(.[(0,1,error(\"x\")):3])"], Some("[1,2,3]"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(
+        stdout,
+        "[{\"start\":0,\"end\":3}]\n[{\"start\":1,\"end\":3}]\n"
+    );
+    assert!(stderr.contains('x'), "stderr: {stderr:?}");
+    Ok(())
+}
+
+/// #2351 review (Gap 2): jq-mode control for
+/// `eval_slice_bound_with_path_context` (the `key`/`parent`/`path` twin),
+/// through the real CLI binary. `key` isn't a real jq builtin (a succinctly
+/// extension), so the filter text itself has no jq oracle, but the values
+/// are the same ones the `path()` sibling test above already pins against
+/// jq 1.7.1, unwrapped from their enclosing one-element array.
+#[test]
+fn test_slice_bound_path_context_cli_dispatch_start_own_partial_prefix_preserved_2351_review(
+) -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", ".[(0,1,error(\"x\")):3] | key"], Some("[1,2,3]"))?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "{\"start\":0,\"end\":3}\n{\"start\":1,\"end\":3}\n");
+    assert!(stderr.contains('x'), "stderr: {stderr:?}");
+    Ok(())
+}
+
 /// #2226 review (patch coverage): `eval_generic::eval_slice_expr`'s target
 /// `Partial` arm's `Ok(None)` sub-case -- an earlier-produced value that
 /// legitimately isn't sliceable, suppressed by `optional` rather than
