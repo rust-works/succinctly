@@ -418,6 +418,27 @@ pub enum Expr {
         name: String,
         /// Arguments (empty for no-arg calls)
         args: Vec<Self>,
+        /// #2036: the parse this exact call site would have produced had
+        /// its name never been shadowable -- a builtin, or one of the
+        /// fixed-arity special forms (`limit`, `until`, `while`, `repeat`,
+        /// `range`, `first`, `last`, `not`) the parser normally lowers
+        /// eagerly, before any `def` has been seen. `None` for an ordinary
+        /// call whose name the parser's own lexical prescan never saw
+        /// `def`'d anywhere in the program (the overwhelming majority of
+        /// calls) -- those parse exactly as before, at no extra cost.
+        ///
+        /// `Some` only ever appears on a node built by the parser
+        /// re-parsing the same source span twice (mirroring `#2110`'s
+        /// existing wrong-arity rewind) once the prescan flags the name as
+        /// possibly shadowed. [`crate::jq::resolve`]'s scope-tracking pass
+        /// is the sole consumer: once it knows whether `name`/`args.len()`
+        /// is genuinely a `def` in scope at this position, it either drops
+        /// this field (a real shadowing call) or substitutes this field's
+        /// value in place of the whole node (not shadowed after all,
+        /// restoring the original builtin/special-form). By the time any
+        /// other pass over the tree runs, this field is always `None` --
+        /// see `resolve::check`'s own doc comment.
+        builtin_fallback: Option<Box<Self>>,
     },
 
     /// A sub-expression that has already had every enclosing substitution

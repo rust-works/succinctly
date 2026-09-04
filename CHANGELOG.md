@@ -406,6 +406,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of the gate the code already claims to run; `select`/`sort_by` and friends walk far
   smaller subtrees per query and are far less affected.
 
+- **A user `def` could not shadow a builtin of the same name — the builtin silently won,
+  producing a wrong value with no error** (#2036). `succinctly jq`'s parser lowers a
+  recognized builtin name to a typed `Expr::Builtin`/special-form node at parse time,
+  before any `def` has been seen, so the user's own definition was parsed, bound, and
+  then never consulted:
+
+  ```console
+  $ jq -nc 'def length: 1; length'
+  1
+  $ succinctly jq -nc 'def length: 1; length'   # before this fix
+  0
+  ```
+
+  Every row exited 0 in both tools — there was no diagnostic anywhere, just a silently
+  different answer, the most serious class of divergence this project tracks. Shadowing
+  a builtin is a real jq idiom (patching a builtin's behavior for one program, or how
+  `~/.jq` and library modules override defaults), not a curiosity.
+
+  Fixed via a lexical prescan (`collect_def_names`, `src/jq/parser.rs`) that collects
+  every identifier spelled after a `def` keyword anywhere in the program — a cheap,
+  deliberately imprecise over-approximation (it does not track lexical position; a false
+  positive costs one wasted re-parse at that one call site, never a wrong answer). At
+  each keyword choke point that can produce a shadowable builtin or fixed-arity special
+  form (`not`, and everything `try_parse_builtin` recognizes, plus `limit`/`until`/
+  `while`/`repeat`/`range`/`first`/`last`/`error`), a name in that set is parsed *both*
+  ways — the keyword's own dedicated parse, and a rewound generic `NAME(args;args)` call
+  (mirroring #2110's existing wrong-arity rewind) — with the former stashed on the
+  latter's new `Expr::FuncCall::builtin_fallback: Option<Box<Expr>>` field. `resolve.rs`'s
+  existing, already-correct scope-tracking pass (#1473) is the sole consumer: it now
+  rewrites the tree, not just reports on it (`check` took `&mut Expr`) — if the name is
+  genuinely in scope as a `def` at that exact position, the fallback is dropped and the
+  call proceeds normally; otherwise the node is rewritten back to the original
+  builtin/special form. A program with no `def`s anywhere pays for one scan of its own
+  source text and nothing else — every existing call site is otherwise untouched.
+
+  A shadowing `def` is not restricted to the arity real jq's own grammar happens to
+  accept for that name (confirmed live: `def until(a;b;c): "s"; until(1;2;3)` is `"s"` in
+  real jq, even though `until/2` is the only shape `parse_until_expr` itself parses) — a
+  gap found during this fix's own review. When the keyword's own dedicated parser fails
+  outright on the written arity, that failure is not propagated for a shadow candidate:
+  the parser rewinds and falls back to an ordinary generic call with no fallback
+  attached, deferring entirely to `resolve.rs` to decide whether the result is the user's
+  own def, a real builtin at some *other* arity, or genuinely unresolvable — the same
+  three-way split every ordinary call already gets.
+
+  `null`/`true`/`false` are deliberately excluded: they are literal tokens in jq's own
+  grammar, not identifier-based calls (confirmed live, `def null: 1; null` stays `null`
+  in real jq too, not `1`) — a `def` of that name parses but can never be reached.
+
 - **`del()`'s trailing `.[]` raised instead of no-oping through a tolerated (rather than
   genuinely found) `null`, in yq mode** (#2347, found during #2324's own implementation).
   A `null` reached by tolerating a step against it — a missing object field, or an
