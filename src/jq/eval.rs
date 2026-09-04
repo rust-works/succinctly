@@ -70688,22 +70688,20 @@ mod tests {
     }
 
     #[test]
-    fn test_delpaths_yq_mode_empty_path_mid_sequence_wipes_to_null_2306() {
+    fn test_delpaths_yq_mode_empty_path_mid_sequence_emits_nothing_2306() {
         // #2306: the sequential yq-mode loop's own empty-path case, mixed
         // with an ordinary key rather than appearing alone -- an earlier
         // key deletes normally, then the empty path (naming the whole
         // document) wipes the result to `null`, matching the same
         // "sequential, mutating between each path" model as every other
         // case in this test group. `[0]` on `[1,2,3]` first gives `[2,3]`,
-        // then `[]` (the whole document at that point) wipes it. Real yq
-        // itself produces *no output at all* here rather than the literal
-        // value `null` (a separate, already-filed divergence, #2352,
-        // shared with `delpaths([[]])` alone) -- this test checks the
-        // owned value this arm actually returns, not the CLI's rendering
-        // of it.
-        yq_query!(br"[1,2,3]", r"delpaths([[0],[]])",
-            QueryResult::Owned(OwnedValue::Null) => {}
-        );
+        // then `[]` (the whole document at that point) wipes it -- and
+        // #2352's own fix (landed after this test was first written)
+        // makes that `root_deleted` state emit nothing at all, matching
+        // real yq's `delpaths([[]])` (alone) and `del(.)` exactly, rather
+        // than the literal value `null`, regardless of what (necessarily
+        // no-op) work follows the empty path in the same batch.
+        yq_query!(br"[1,2,3]", r"delpaths([[0],[]])", QueryResult::None => {});
     }
 
     #[test]
