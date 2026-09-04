@@ -1459,8 +1459,47 @@ impl<'a> Parser<'a> {
                     // `keys[0]`) on whichever `Expr` it ends up returning.
                     self.zero_arity_or_wrong_arity_call(keyword_start, Expr::Builtin(builtin))
                 } else {
-                    // Phase 9: Try to parse as function call
-                    self.parse_func_call_or_error()
+                    // Phase 9: Try to parse as function call.
+                    //
+                    // #2237 review: postfix (`.field`/`[idx]`) should be
+                    // applied to the resolved call here too, exactly like
+                    // the `zero_arity_or_wrong_arity_call` branch above
+                    // already does -- a pre-existing gap, not previously
+                    // scoped to any wrong-arity fix: even a legitimately
+                    // *defined* function call followed by postfix failed to
+                    // parse at all before this (`def f(x): {a:x}; f(1).a`
+                    // raised a raw "unexpected character '.'" instead of
+                    // returning `1`, confirmed against jq 1.7.1). Also
+                    // fixes the same gap for every wrong-arity call that
+                    // reaches this branch via `Ok(None)` from
+                    // `Self::try_parse_builtin` (`Self::parse_required_single_arg`'s
+                    // rewind path -- `has`/`select`/`env`/...).
+                    //
+                    // jq mode only (review, round 2): yq mode's own
+                    // merge-flag scan (`Self::scan_merge_flags`, called from
+                    // the `*`/`*=` operator parsing) silently stops at the
+                    // first unrecognized character rather than erroring,
+                    // leaving it -- and anything after it -- for this exact
+                    // fallback to parse as an ordinary expression. Applying
+                    // postfix unconditionally here let a bare merge-flag
+                    // remnant absorb a trailing `.field` the way `n.b`
+                    // legitimately can as a plain identifier expression,
+                    // producing a full (if semantically wrong-flag) parse
+                    // where real yq's own lexer unconditionally rejects
+                    // *any* non-flag content immediately after `*=`/`*` --
+                    // confirmed live against yq v4.53.3, `.a *= n.b` (an
+                    // ordinary, unrelated identifier reference, not even a
+                    // merge-flag context) is *also* `lexer: invalid input
+                    // text`. Real jq has no such restriction (`.a *=n .b`
+                    // parses as `.a *= (n.b)` there, confirmed live, and
+                    // only fails later at name resolution), so jq mode
+                    // keeps the postfix fix.
+                    let call = self.parse_func_call_or_error()?;
+                    if self.mode == ParserMode::Jq {
+                        self.parse_postfix(call)
+                    } else {
+                        Ok(call)
+                    }
                 }
             }
 
@@ -2376,9 +2415,18 @@ impl<'a> Parser<'a> {
     /// other rewind site's identical carve-out (real yq has no name/arity
     /// resolution vocabulary at all, so jq's own "X/N is not defined"
     /// wording would be a new divergence there, not a fix).
+    ///
+    /// Applies [`Self::parse_postfix`] to the resolved call before
+    /// returning it (review finding): `parse_func_call_or_error` alone
+    /// leaves a trailing `.field`/`[idx]` as a raw "unexpected character"
+    /// parse error, exactly the `null(1).foo` regression
+    /// [`Self::zero_arity_or_wrong_arity_call`]'s own doc comment already
+    /// recounts -- confirmed live against jq 1.7.1: `range(1;2;3;4).foo`
+    /// reports `range/4 is not defined`, not a syntax error.
     fn rewind_to_wrong_arity_call(&mut self, start_pos: usize) -> Result<Expr, ParseError> {
         self.pos = start_pos;
-        self.parse_func_call_or_error()
+        let call = self.parse_func_call_or_error()?;
+        self.parse_postfix(call)
     }
 
     /// Parse a format string: @text, @json, @uri, @dsv(delimiter), etc.
@@ -3709,6 +3757,22 @@ impl<'a> Parser<'a> {
                 // yq mode keeps the original raw error unchanged (same
                 // rationale as `Self::zero_arity_or_wrong_arity_call`'s own
                 // carve-out).
+                //
+                // Review: an empty `env()` must NOT rewind -- unlike
+                // `env(1)`, it has no argument at all to disambiguate from
+                // real jq's own `f()` syntax error (`def f: 1; f()` is a
+                // syntax error there too, not `f/0 is not defined`; see
+                // `Self::zero_arity_or_wrong_arity_call`'s own identical
+                // `()`-exclusion doc comment). Without this guard,
+                // `parse_ident()` on an immediate `)` failed exactly like a
+                // non-identifier argument would, and the rewind turned
+                // `env()` into a *successful* parse of `FuncCall{name:
+                // "env", args: []}` -- changing a jq 1.7.1 compile-time
+                // syntax error (exit 3) into succinctly's own runtime
+                // "undefined function" error (exit 5), confirmed live.
+                if self.peek() == Some(')') {
+                    return self.parse_ident().map(|_| unreachable!());
+                }
                 let var_name = match self.parse_ident() {
                     Ok(name) => name,
                     Err(e) => {
@@ -6990,9 +7054,22 @@ mod tests {
     #[test]
     fn test_jq_mode_rejects_merge_flags() {
         // Real jq has no merge-flag syntax at all — jq mode must not
-        // recognize these tokens, regardless of what yq mode does.
+        // recognize these tokens, regardless of what yq mode does. `+`
+        // can't start an expression, so `.a *+ .b` stays a genuine parse
+        // error.
         assert!(parse(".a *+ .b").is_err());
-        assert!(parse(".a *=n .b").is_err());
+        // `.a *=n .b`, by contrast, is NOT a parse error in jq mode (#2237
+        // review correction, verified live against jq 1.7.1): jq's own
+        // grammar has no flag-scanning special case after `*=` at all, so
+        // `n` simply starts an ordinary expression -- `.a *= (n.b)`, an
+        // identifier call `n` with postfix field access `.b`. Real jq
+        // parses this successfully too and only fails later, at name
+        // resolution (`n/0 is not defined`) -- a stage this `parse()`
+        // function doesn't perform. The pre-#2237 assertion here held only
+        // because of the very postfix-chaining gap #2237's review found and
+        // fixed (`n` parsed, but the trailing `.b` was left unconsumed,
+        // failing the overall parse for an unrelated reason).
+        assert!(parse(".a *=n .b").is_ok());
 
         // Plain `*`/`*=` still work in jq mode, with default (all-false) flags.
         assert_eq!(
