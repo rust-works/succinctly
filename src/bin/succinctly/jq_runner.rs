@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 
 use succinctly::dsv::{build_index as build_dsv_index, DsvConfig, DsvRows};
 use succinctly::jq::document::{
-    effective_keys, key_hash, DistinctKeyCursors, IndentSpec, JsonConvention,
+    effective_keys, key_hash, DistinctKeyCursors, DocumentCursor, DocumentValue, IndentSpec,
+    JsonConvention,
 };
 use succinctly::jq::eval_generic::{
     check_nesting_depth, eval_with_cursor, to_owned as generic_to_owned,
@@ -5783,83 +5784,16 @@ impl LiteralFormatter for PreserveFormatter {
 // comment for the semi-index background (`json::standard::is_delim`
 // treating `,`/`:` as invisible) and the backward-scan rationale.
 
-/// Forward-scan mirror of [`preceding_gap_ok`], used to catch the trailing
-/// half of #1643's own deferred gap (#1676): a `,`/`:` sitting between a
-/// container's last real child and its closing bracket (`{"a":1,}`,
-/// `[1,2,]`), or inside an apparently-empty container (`{,}`, `[,]`).
-///
-/// Scans *forward* from `start` -- a position every caller here obtains
-/// cheaply (a scalar child's own `text_range().1`, or `open_pos + 1` for a
-/// genuinely empty container) -- exactly as bounded as `preceding_gap_ok`'s
-/// backward scan: it stops the instant it reaches real content, so its cost
-/// is the size of the gap itself, never the container's remaining text.
-///
-/// Returns the position of the first non-whitespace, non-delimiter byte on
-/// success (so the caller can confirm it's the expected closing bracket),
-/// or `None` if the gap holds a doubled delimiter or one that doesn't match
-/// `expected`.
-fn following_gap_ok(text: &[u8], start: usize, expected: Option<u8>) -> Option<usize> {
-    let mut i = start;
-    let mut found = None;
-    while i < text.len() {
-        match text[i] {
-            b @ (b',' | b':') => {
-                if found.is_some() {
-                    return None; // doubled delimiter
-                }
-                found = Some(b);
-                i += 1;
-            }
-            b if b.is_ascii_whitespace() => i += 1,
-            _ => break, // reached real content -- a value, or the closing bracket
-        }
-    }
-    (found == expected).then_some(i)
-}
-
-/// Whether a container closes cleanly once its last real child's own text
-/// has ended at `gap_start` (or `gap_start` is `open_pos + 1`, for a
-/// genuinely empty container): no trailing `,`/`:` before the matching
-/// closing bracket (#1676).
-///
-/// Deliberately narrower than a complete fix: `gap_start` must already be
-/// known cheaply. Callers only have that when the last child is a scalar
-/// (via `scalar_end_pos`, an O(1) length read, not a fresh scan) or when
-/// the container is empty. When the last child is itself a container,
-/// finding *its* closing bracket costs exactly the O(subtree) walk this
-/// function's sibling `preceding_gap_ok` was written to avoid, so callers
-/// skip this check in that case rather than pay for it -- the same
-/// "tracked as a follow-up, not folded in here" trade #1643 already made,
-/// narrowed by one more case rather than eliminated.
-fn trailing_gap_ok(text: &[u8], gap_start: usize, close_char: u8) -> bool {
-    matches!(following_gap_ok(text, gap_start, None), Some(pos) if text.get(pos) == Some(&close_char))
-}
-
-/// Cheap end position (one past the last byte) of an already-resolved
-/// scalar `value` known to start at `start` -- `None` for a container or
-/// unresolved value, which callers treat as "can't determine, skip"
-/// (#1676's own deferred case for a container, or a defensively-skipped
-/// unresolved cursor).
-///
-/// Deliberately doesn't call `JsonCursor::text_range()`: every caller here
-/// already resolved `value` via `.value_at(start)` (reusing the *same*
-/// `start` a caller-side `text_position()` already paid for -- see
-/// `check_preceding_delimiter`'s own doc comment on why a second lookup
-/// measured 19-30% slower for #1643), so re-deriving the position and
-/// re-dispatching on the leading byte a second time would silently
-/// reintroduce that exact regression. `raw_bytes()` on a string/number is
-/// already the value's own exact text span; `true`/`false`/`null` are
-/// fixed-width literals.
-fn scalar_end_pos<W: AsRef<[u64]>>(start: usize, value: &StandardJson<'_, W>) -> Option<usize> {
-    match value {
-        StandardJson::String(s) => Some(start + s.raw_bytes().len()),
-        StandardJson::Number(n) => Some(start + n.raw_bytes().len()),
-        StandardJson::Bool(true) => Some(start + 4),
-        StandardJson::Bool(false) => Some(start + 5),
-        StandardJson::Null => Some(start + 4),
-        StandardJson::Array(_) | StandardJson::Object(_) | StandardJson::Error(_) => None,
-    }
-}
+// `following_gap_ok`/`trailing_gap_ok`/`scalar_end_pos` (#1676) used to live
+// here as CLI-only checks, structurally identical to (but not calling)
+// `succinctly::json::light`'s own private copies of the same predicates.
+// #2263 migrated every call site here onto the `DocumentCursor`/
+// `DocumentValue` trait methods #2243 added
+// (`trailing_element_gap_ok`/`scalar_text_end`), which delegate to
+// `json::light`'s copies -- so this printer and the evaluator's own
+// object/array walk (`eval_generic.rs`) share one definition instead of
+// three drifting copies, the same consolidation #1677 already did for
+// `preceding_gap_ok`.
 
 /// Array-element wrapper around [`preceding_gap_ok`]: element `index` (0-
 /// based) must be preceded by `,`, except the first, which must be
@@ -5928,7 +5862,7 @@ fn check_preceding_delimiter<W: AsRef<[u64]>>(
 /// like a leading-zero number (#1094) or a genuinely malformed document, so
 /// this walk is cold by construction and doesn't need `print_json`'s
 /// `known_text_pos` reuse trick.
-fn validate_json_delimiters<W: AsRef<[u64]>>(
+fn validate_json_delimiters<W: Clone + AsRef<[u64]>>(
     cursor: &JsonCursor<'_, W>,
     depth: usize,
 ) -> core::result::Result<(), EvalError> {
@@ -5949,13 +5883,13 @@ fn validate_json_delimiters<W: AsRef<[u64]>>(
                 validate_json_delimiters(&child, depth + 1)?;
                 // #1676: reuses `start` (already resolved above) via
                 // `value_at` rather than `child.value()`, which would
-                // re-derive it -- see `scalar_end_pos`'s own doc comment.
-                last_gap_end = start.and_then(|s| scalar_end_pos(s, &child.value_at(s)));
+                // re-derive it -- see `scalar_text_end`'s own doc comment.
+                last_gap_end = start.and_then(|s| child.value_at(s).scalar_text_end(s));
             }
             // #1676: trailing `,` (`[1,2,]`) or a stray `,` in an
             // apparently-empty array (`[,]`) -- `last_gap_end` is `None`
             // both when there's nothing to check yet and when the last
-            // element is itself a container (`scalar_end_pos`'s own doc
+            // element is itself a container (`scalar_text_end`'s own doc
             // comment explains why that case is skipped, not just unknown).
             if let Some(open_pos) = cursor.text_position() {
                 let gap_start = if saw_any {
@@ -5964,7 +5898,7 @@ fn validate_json_delimiters<W: AsRef<[u64]>>(
                     Some(open_pos + 1)
                 };
                 if let Some(gap_start) = gap_start {
-                    if !trailing_gap_ok(cursor.text(), gap_start, b']') {
+                    if !cursor.trailing_element_gap_ok(gap_start, b']') {
                         return Err(EvalError::malformed_json_text(cursor.text()));
                     }
                 }
@@ -5991,7 +5925,7 @@ fn validate_json_delimiters<W: AsRef<[u64]>>(
                 validate_json_delimiters(&value_cursor, depth + 1)?;
                 // #1676: same `value_at`-reuse discipline as the array arm.
                 last_gap_end =
-                    value_start.and_then(|s| scalar_end_pos(s, &value_cursor.value_at(s)));
+                    value_start.and_then(|s| value_cursor.value_at(s).scalar_text_end(s));
                 remaining = rest;
                 field_index += 1;
             }
@@ -6007,7 +5941,7 @@ fn validate_json_delimiters<W: AsRef<[u64]>>(
                     Some(open_pos + 1)
                 };
                 if let Some(gap_start) = gap_start {
-                    if !trailing_gap_ok(cursor.text(), gap_start, b'}') {
+                    if !cursor.trailing_element_gap_ok(gap_start, b'}') {
                         return Err(EvalError::malformed_json_text(cursor.text()));
                     }
                 }
@@ -6211,7 +6145,7 @@ where
                         // array (`[,]`) -- cheap since there's no subtree
                         // to scan, just the gap between `[` and `]`.
                         if let Some(open_pos) = container_pos {
-                            if !trailing_gap_ok(c.text(), open_pos + 1, b']') {
+                            if !c.trailing_element_gap_ok(open_pos + 1, b']') {
                                 return Err(MalformedJsonError(EvalError::malformed_json_text(
                                     c.text(),
                                 ))
@@ -6259,13 +6193,13 @@ where
                         let base = array_scratch.len();
                         // #1676: tracks the last element's own end position
                         // (cheap for a scalar; `None` for a container --
-                        // see `scalar_end_pos`'s own doc comment) so a
+                        // see `scalar_text_end`'s own doc comment) so a
                         // trailing `,` before `]` (`[1,2,]`) can be caught
                         // below, before anything is written. Reuses `pos`
                         // (already resolved by `check_preceding_delimiter`)
                         // via `value_at` rather than `child_cursor.value()`,
                         // which would re-derive the same position a second
-                        // time -- see `scalar_end_pos`'s own doc comment on
+                        // time -- see `scalar_text_end`'s own doc comment on
                         // why that matters on this hot path specifically.
                         let mut last_gap_end = None;
                         for (i, child_cursor) in elements.cursor_iter().enumerate() {
@@ -6273,10 +6207,10 @@ where
                             array_scratch
                                 .push((child_cursor.bp_position(), pos.unwrap_or(usize::MAX)));
                             last_gap_end =
-                                pos.and_then(|s| scalar_end_pos(s, &child_cursor.value_at(s)));
+                                pos.and_then(|s| child_cursor.value_at(s).scalar_text_end(s));
                         }
                         if let Some(gap_start) = last_gap_end {
-                            if !trailing_gap_ok(c.text(), gap_start, b']') {
+                            if !c.trailing_element_gap_ok(gap_start, b']') {
                                 array_scratch.truncate(base);
                                 return Err(MalformedJsonError(EvalError::malformed_json_text(
                                     c.text(),
@@ -6343,7 +6277,7 @@ where
                         // object (`{,}`) -- same reasoning as the array
                         // arm's own empty-case check above.
                         if let Some(open_pos) = container_pos {
-                            if !trailing_gap_ok(c.text(), open_pos + 1, b'}') {
+                            if !c.trailing_element_gap_ok(open_pos + 1, b'}') {
                                 return Err(MalformedJsonError(EvalError::malformed_json_text(
                                     c.text(),
                                 ))
@@ -6451,7 +6385,7 @@ where
                             // rather than `field.value_cursor().value()`,
                             // which would re-derive it.
                             last_gap_end = value_start
-                                .and_then(|s| scalar_end_pos(s, &field.value_cursor().value_at(s)));
+                                .and_then(|s| field.value_cursor().value_at(s).scalar_text_end(s));
                             let (raw, escaped) = k.raw_and_escaped();
                             scratch.push(PreparedField {
                                 key_bp: field.key_cursor().bp_position(),
@@ -6482,7 +6416,7 @@ where
                             .into());
                         }
                         if let Some(gap_start) = last_gap_end {
-                            if !trailing_gap_ok(frame.text, gap_start, b'}') {
+                            if !c.trailing_element_gap_ok(gap_start, b'}') {
                                 scratch.truncate(base);
                                 return Err(MalformedJsonError(EvalError::malformed_json_text(
                                     frame.text,
