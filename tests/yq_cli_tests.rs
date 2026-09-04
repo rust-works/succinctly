@@ -29479,6 +29479,79 @@ fn test_slice_bound_end_own_partial_prefix_discarded_in_yq_mode_2351() -> Result
     Ok(())
 }
 
+/// #2351 review (Gap 1): `resolve_slice_bound` (the path-mode resolver
+/// behind `path()`/`=`/`del()`, via `resolve_dynamic_indexes`) had no
+/// yq-mode gate at all -- through the real CLI binary via `del(...)` (real
+/// yq syntax, unlike bare `path(...)`, which needs `--jq-extensions` and so
+/// has no yq oracle). Verified live against yq v4.53.3:
+/// `del(.[(0,1,error("x")):3])` on `[1,2,3]` prints only `Error: x`.
+#[test]
+fn test_resolve_slice_bound_start_own_partial_prefix_discarded_in_yq_mode_2351_review() -> Result<()>
+{
+    let (out, stderr, code) = run_yq_stdin_with_stderr(
+        "del(.[(0,1,error(\"x\")):3])",
+        "[1, 2, 3]\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 1, "out: {out:?} stderr: {stderr:?}");
+    assert_eq!(out, "");
+    assert_eq!(stderr.trim(), "Error: x");
+    Ok(())
+}
+
+/// #2351 review sibling: the end bound (`K2`). Verified live against yq
+/// v4.53.3: `del(.[0:(1,2,error("x"))])` on `[1,2,3]` prints only
+/// `Error: x`.
+#[test]
+fn test_resolve_slice_bound_end_own_partial_prefix_discarded_in_yq_mode_2351_review() -> Result<()>
+{
+    let (out, stderr, code) = run_yq_stdin_with_stderr(
+        "del(.[0:(1,2,error(\"x\"))])",
+        "[1, 2, 3]\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 1, "out: {out:?} stderr: {stderr:?}");
+    assert_eq!(out, "");
+    assert_eq!(stderr.trim(), "Error: x");
+    Ok(())
+}
+
+/// #2351 review (Gap 2): `eval_slice_bound_with_path_context` (the
+/// `key`/`parent`/`path` twin, via `drain_path_context_stream`) had no
+/// yq-mode gate at all. `key` is real, native yq syntax. Verified live
+/// against yq v4.53.3: `.[(0,1,error("x")):3] | key` on `[1,2,3]` prints
+/// only `Error: x`, no `{"start":...,"end":...}` prefix.
+#[test]
+fn test_slice_bound_path_context_start_own_partial_prefix_discarded_in_yq_mode_2351_review(
+) -> Result<()> {
+    let (out, stderr, code) = run_yq_stdin_with_stderr(
+        ".[(0,1,error(\"x\")):3] | key",
+        "[1, 2, 3]\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 1, "out: {out:?} stderr: {stderr:?}");
+    assert_eq!(out, "");
+    assert_eq!(stderr.trim(), "Error: x");
+    Ok(())
+}
+
+/// #2351 review sibling: the end bound (`K2`). Verified live against yq
+/// v4.53.3: `.[0:(1,2,error("x"))] | key` on `[1,2,3]` prints only
+/// `Error: x`.
+#[test]
+fn test_slice_bound_path_context_end_own_partial_prefix_discarded_in_yq_mode_2351_review(
+) -> Result<()> {
+    let (out, stderr, code) = run_yq_stdin_with_stderr(
+        ".[0:(1,2,error(\"x\"))] | key",
+        "[1, 2, 3]\n",
+        &["-o", "json"],
+    )?;
+    assert_eq!(code, 1, "out: {out:?} stderr: {stderr:?}");
+    assert_eq!(out, "");
+    assert_eq!(stderr.trim(), "Error: x");
+    Ok(())
+}
+
 /// #2264: `keys`/`keys_unsorted`'s own lazy `.[n]` fast path
 /// (`fold_lazy_keys_stage` for object keys, `fold_lazy_index_range_stage`
 /// for array keys) had its own independent negative-index resolution with

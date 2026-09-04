@@ -17402,6 +17402,17 @@ fn eval_slice_bound<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // prefix (see the function's own doc comment above) -- mirrors
             // #2226's/#2326's identical `S::TAG == EvalTag::Yq` gate on their
             // own target/key `Partial` arms.
+            //
+            // #2351 review: discarding `_vs` here also means the
+            // `owned_bound_to_i64` conversion below never runs on it in yq
+            // mode, which incidentally sidesteps a separate, pre-existing,
+            // unrelated bug: `owned_bound_to_i64`'s `.collect::<Result<...>,
+            // _>>()?` throws away the *whole* prefix (converted values
+            // included) on the first non-numeric bound value, not just the
+            // bad one -- still live in jq mode (`.[(0,"x",error("y")):3]` on
+            // `[10,20,30]` should print `[10,20,30]` per jq 1.7.1 but prints
+            // nothing here) and untouched by this PR. Not a fix for that bug,
+            // just an accident of evaluation order once the prefix is gone.
             QueryResult::Partial(_vs, control) if S::TAG == EvalTag::Yq => {
                 (Vec::new(), Some(control))
             }
@@ -26366,6 +26377,21 @@ type ResolvedSliceBound = (Option<i64>, Option<NumberKey>);
 /// type failure the same keep-partial treatment as a generator escape needs
 /// its own priority-ordering pass against `target_escape`/`bounds_escape`
 /// above, re-verified against jq the same way, not a quick addition here.
+///
+/// #2351 review (Gap 1): jq-only, matching `eval_slice_bound`'s own gate.
+/// `eval_owned_multi_keep_partial` itself can't carry this gate -- it's a
+/// shared helper whose *other* callers (`recurse`'s children evaluation,
+/// `resolve_node`'s `Select`/`If`/`GetPath` arms, `resolve_index_expr`'s own
+/// `key`, ...) must keep their own prefix in yq mode too, so the gate has to
+/// live here, at this specific call site, not inside the helper. Live-
+/// verified against yq v4.53.3: `del(.[(0,1,error("x")):3])` on `[1,2,3]`
+/// prints only `Error: x`, no `{"start":...}` prefix reaching the caller
+/// (the same `resolve_dynamic_indexes` codepath `=`/`path()` also drive).
+/// Discarding the prefix here also means `owned_bound_to_i64` below never
+/// runs on it in yq mode, which incidentally sidesteps the unrelated
+/// non-numeric-bound bug this doc comment's own "Residual" paragraph
+/// describes -- not a fix for that bug, just an accident of evaluation
+/// order once the prefix is gone.
 fn resolve_slice_bound<S: EvalSemantics>(
     bound: &Option<Box<Expr>>,
     value: &OwnedValue,
@@ -26374,7 +26400,10 @@ fn resolve_slice_bound<S: EvalSemantics>(
     let Some(expr) = bound else {
         return Ok((vec![(None, None)], None));
     };
-    let (values, escape) = eval_owned_multi_keep_partial::<S>(expr, value);
+    let (mut values, escape) = eval_owned_multi_keep_partial::<S>(expr, value);
+    if S::TAG == EvalTag::Yq && escape.is_some() {
+        values = Vec::new();
+    }
     let resolved = values
         .iter()
         .map(|v| {
@@ -32621,6 +32650,17 @@ type RawSliceBound = (OwnedValue, Option<i64>);
 /// to build the resulting path component the same way `walk_path`/
 /// `navigation_element` already do for a *literal* slice (#1326's own
 /// representation).
+///
+/// #2351 review (Gap 2): jq-only, matching `eval_slice_bound`'s own gate.
+/// `drain_path_context_stream` itself can't carry this gate -- it's shared
+/// with `eval_index_expr_with_path_context`'s own `key` materialization
+/// above, which (per that function's own #2226-review comment) still
+/// deliberately keeps its prefix in every mode as a separate, untouched
+/// gap; folding the yq-only discard into the shared helper would silently
+/// change that sibling's behavior too. So the gate lives here instead, at
+/// this bound-specific call site. Live-verified against yq v4.53.3:
+/// `.[(0,1,error("x")):3] | key` on `[1,2,3]` (via `--jq-extensions`)
+/// prints only `Error: x`, no `{"start":...,"end":...}` prefix.
 fn eval_slice_bound_with_path_context<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     bound: &Option<Box<Expr>>,
     value: &OwnedValue,
@@ -32634,7 +32674,10 @@ fn eval_slice_bound_with_path_context<W: Clone + AsRef<[u64]>, S: EvalSemantics>
     };
     let result =
         eval_expr_needing_path_context::<W, S>(expr, value, root, file_origin, current_path, false);
-    let (raw, escape) = drain_path_context_stream(result);
+    let (mut raw, escape) = drain_path_context_stream(result);
+    if S::TAG == EvalTag::Yq && escape.is_some() {
+        raw = Vec::new();
+    }
     let converted = raw
         .into_iter()
         .map(|v| {
@@ -53666,6 +53709,276 @@ mod tests {
         yq_query!(b"[1,2,3]", r#".[0:(1,2,error("x"))]"#,
             QueryResult::Error(e) => {
                 assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    // #2351 review, Gap 1: `resolve_slice_bound` (the path-mode resolver
+    // behind `path()`/`=`/`del()`, via `resolve_dynamic_indexes`) had the
+    // identical missing-gate bug `eval_slice_bound` (read mode) was fixed
+    // for above -- it fed `eval_owned_multi_keep_partial` unconditionally,
+    // with no `S::TAG == EvalTag::Yq` carve-out at all. Confirmed live
+    // against yq v4.53.3 with `del(...)`, since bare `path(...)` isn't real
+    // yq syntax (`--jq-extensions` only, an internal succinctly extension):
+    // `del(.[(0,1,error("x")):3])` on `[1,2,3]` prints only `Error: x`. The
+    // tests below exercise the underlying resolver directly via `path()`
+    // (parsed with jq extensions unconditionally by `query!`/`yq_query!`,
+    // same as every other `path(...)` test in this file), since `path()`'s
+    // output makes the discarded prefix directly observable.
+
+    /// #2351 review (Gap 1): jq-mode control, start bound (`K1`). Verified
+    /// against jq 1.7.1: `path(.[(0,1,error("x")):3])` on `[1,2,3]` prints
+    /// `[{"start":0,"end":3}]` then `[{"start":1,"end":3}]` before raising
+    /// `x` -- jq mode is unaffected by the new gate.
+    #[test]
+    fn test_resolve_slice_bound_start_own_partial_prefix_preserved_in_jq_mode_2351_review() {
+        query!(b"[1,2,3]", r#"path(.[(0,1,error("x")):3])"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"[{"start":0,"end":3}]"#, r#"[{"start":1,"end":3}]"#]);
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    /// #2351 review sibling: the end bound (`K2`). Verified against jq
+    /// 1.7.1: `path(.[0:(1,2,error("x"))])` on `[1,2,3]` prints
+    /// `[{"start":0,"end":1}]` then `[{"start":0,"end":2}]` before raising.
+    #[test]
+    fn test_resolve_slice_bound_end_own_partial_prefix_preserved_in_jq_mode_2351_review() {
+        query!(b"[1,2,3]", r#"path(.[0:(1,2,error("x"))])"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"[{"start":0,"end":1}]"#, r#"[{"start":0,"end":2}]"#]);
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    /// #2351 review (Gap 1): the new yq-mode gate on `resolve_slice_bound`,
+    /// start bound (`K1`). Real `path(...)` has no yq oracle (jq-only
+    /// syntax, gated behind `--jq-extensions`), but the underlying resolver
+    /// this exercises is the same one `del(...)`/`=` reach in yq mode --
+    /// live-verified there instead: `del(.[(0,1,error("x")):3])` on
+    /// `[1,2,3]` prints only `Error: x`, matching this test's own
+    /// `QueryResult::Error` (no `Partial` prefix at all).
+    #[test]
+    fn test_resolve_slice_bound_start_own_partial_prefix_discarded_in_yq_mode_2351_review() {
+        yq_query!(b"[1,2,3]", r#"path(.[(0,1,error("x")):3])"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    /// #2351 review sibling: the end bound (`K2`). Live-verified via
+    /// `del(.[0:(1,2,error("x"))])` on `[1,2,3]`: prints only `Error: x`.
+    #[test]
+    fn test_resolve_slice_bound_end_own_partial_prefix_discarded_in_yq_mode_2351_review() {
+        yq_query!(b"[1,2,3]", r#"path(.[0:(1,2,error("x"))])"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    // #2351 review, Gap 2: `eval_slice_bound_with_path_context` (the
+    // `key`/`parent`/`path` twin reached via `drain_path_context_stream`)
+    // had the same missing gate. `key` is real, native yq syntax (no
+    // `--jq-extensions` needed), so these have a direct live oracle.
+
+    /// #2351 review (Gap 2): jq-mode control, start bound (`K1`). `key`
+    /// isn't a real jq builtin (a succinctly extension modeled on yq's own
+    /// `key`), so there's no jq oracle for the filter text itself, but the
+    /// values are the same ones `test_resolve_slice_bound_start_own_
+    /// partial_prefix_preserved_in_jq_mode_2351_review` above already
+    /// pins against jq 1.7.1's `path(...)` output, just unwrapped from
+    /// their enclosing one-element array (`key` yields a path's last
+    /// component, not the whole path).
+    #[test]
+    fn test_slice_bound_path_context_start_own_partial_prefix_preserved_in_jq_mode_2351_review() {
+        query!(b"[1,2,3]", r#".[(0,1,error("x")):3] | key"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"{"start":0,"end":3}"#, r#"{"start":1,"end":3}"#]);
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    /// #2351 review sibling: the end bound (`K2`).
+    #[test]
+    fn test_slice_bound_path_context_end_own_partial_prefix_preserved_in_jq_mode_2351_review() {
+        query!(b"[1,2,3]", r#".[0:(1,2,error("x"))] | key"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"{"start":0,"end":1}"#, r#"{"start":0,"end":2}"#]);
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    /// #2351 review (Gap 2): the new yq-mode gate, start bound (`K1`).
+    /// Live-verified against yq v4.53.3: `.[(0,1,error("x")):3] | key` on
+    /// `[1,2,3]` prints only `Error: x`, no `{"start":...,"end":...}`
+    /// prefix.
+    #[test]
+    fn test_slice_bound_path_context_start_own_partial_prefix_discarded_in_yq_mode_2351_review() {
+        yq_query!(b"[1,2,3]", r#".[(0,1,error("x")):3] | key"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    /// #2351 review sibling: the end bound (`K2`). Live-verified against yq
+    /// v4.53.3: `.[0:(1,2,error("x"))] | key` on `[1,2,3]` prints only
+    /// `Error: x`.
+    #[test]
+    fn test_slice_bound_path_context_end_own_partial_prefix_discarded_in_yq_mode_2351_review() {
+        yq_query!(b"[1,2,3]", r#".[0:(1,2,error("x"))] | key"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    // #2351 review, lower-priority coverage: the original 8 tests only ever
+    // drove `eval_slice_bound`'s gate with `error(...)`. The gate itself
+    // (`QueryResult::Partial(_vs, control) if S::TAG == EvalTag::Yq`) is
+    // escape-kind-agnostic -- it doesn't inspect `control` at all -- so the
+    // following pin `Control::Break`/`Control::Halt` through the same arm.
+
+    /// #2351 review: `break` (unlabeled, matching this file's own
+    /// established precedent for testing `eval()` in isolation, e.g.
+    /// `regression_issue_400_boolean_keeps_the_prefix_before_a_control`'s
+    /// `"(true,true) and (1, break $out)"` case above) through the start
+    /// bound in jq mode. Real jq's CLI rejects an unlabeled `break $out` as
+    /// a compile error (`$*label-out is not defined`) rather than letting it
+    /// run as a value-level escape -- there is no live oracle for *this*
+    /// exact raw shape, only for the values it carries, which are the same
+    /// ones `error(...)` already produces for this bound (confirmed live:
+    /// `label $out | ([1,2,3] | .[(0,1,break $out):3])` prints `[1,2,3]`
+    /// then `[2,3]` before the label catches the break, exit 0).
+    #[test]
+    fn test_slice_bound_start_break_escape_preserved_in_jq_mode_2351_review() {
+        query!(b"[1,2,3]", r".[(0,1,break $out):3]",
+            QueryResult::Partial(vs, Control::Break(label)) => {
+                assert_eq!(prefix_json(&vs), ["[1,2,3]", "[2,3]"]);
+                assert_eq!(label, "out");
+            }
+        );
+    }
+
+    /// #2351 review sibling: the same `break` shape in yq mode -- the gate
+    /// discards the prefix regardless of escape kind. With the prefix
+    /// empty, `eval_slice_expr`'s own `starts.is_empty()` short-circuit
+    /// (see `partial`'s "an empty prefix collapses to the bare variant" doc
+    /// comment) means this surfaces as a bare `QueryResult::Break`, not a
+    /// `Partial` with an empty `vs`. `break`/`label` are not real yq syntax
+    /// at all (its lexer rejects them outright, live-verified: `yq 'label
+    /// $out | .[(0,1,break $out):3]'` is a lexer error), so there is no
+    /// oracle to check here; this pins the gate's own internal consistency
+    /// instead -- it must treat `Break` exactly like `Error`.
+    #[test]
+    fn test_slice_bound_start_break_escape_discarded_in_yq_mode_2351_review() {
+        yq_query!(b"[1,2,3]", r".[(0,1,break $out):3]",
+            QueryResult::Break(label) => {
+                assert_eq!(label, "out");
+            }
+        );
+    }
+
+    /// #2351 review: `halt_error` (bare, default exit code) through the
+    /// start bound in jq mode. Verified against jq 1.7.1: `[1,2,3] |
+    /// .[(0,1,halt_error):3]` prints `[1,2,3]` then `[2,3]` to stdout
+    /// (this test's own prefix) and the current input (`[1,2,3]`, `.` at
+    /// the point `halt_error` runs) to stderr, exit 5 --
+    /// `JqSemantics::DEFAULT_HALT_ERROR_CODE`.
+    #[test]
+    fn test_slice_bound_start_halt_escape_preserved_in_jq_mode_2351_review() {
+        query!(b"[1,2,3]", r".[(0,1,halt_error):3]",
+            QueryResult::Partial(vs, Control::Halt(code)) => {
+                assert_eq!(prefix_json(&vs), ["[1,2,3]", "[2,3]"]);
+                assert_eq!(code, 5);
+            }
+        );
+    }
+
+    /// #2351 review sibling: the same `halt_error` shape in yq mode --
+    /// collapses to a bare `QueryResult::Halt`, same reasoning as the
+    /// `break` sibling above. Real yq's lexer rejects `halt_error` outright
+    /// too (live-verified: `yq '.[(0,1,halt_error):3]'` is a lexer error),
+    /// so as with `break` above this pins the gate's own kind-agnostic
+    /// behavior rather than an oracle comparison.
+    /// `YqSemantics::DEFAULT_HALT_ERROR_CODE` is `1` (yq's uniform failure
+    /// code), not jq's `5`.
+    #[test]
+    fn test_slice_bound_start_halt_escape_discarded_in_yq_mode_2351_review() {
+        yq_query!(b"[1,2,3]", r".[(0,1,halt_error):3]",
+            QueryResult::Halt(code) => {
+                assert_eq!(code, 1);
+            }
+        );
+    }
+
+    /// #2351 review: both `K1` and `K2` escaping in the same query. The
+    /// naive expectation ("`K1` evaluates first, so its own error wins") is
+    /// *wrong* -- verified live against jq 1.7.1: `.[(0,1,error("x")):
+    /// (2,3,error("y"))]` on `[1,2,3]` prints `[1,2]` then `[1,2,3]` and
+    /// raises `y`, not `x`. `end` is re-evaluated fresh for every `start`
+    /// output (#2225), and that inner loop runs entirely before `start`'s
+    /// own generator is ever asked for its *second* output -- so for
+    /// `start`'s first output (`0`), `end`'s own generator (`2`, `3`,
+    /// `error("y")`) runs to completion and raises before `start`'s `x`
+    /// would ever surface. `start`'s own `error("x")` is never reached at
+    /// all in jq mode.
+    #[test]
+    fn test_slice_bound_both_bounds_escaping_same_query_jq_mode_2351_review() {
+        query!(b"[1,2,3]", r#".[(0,1,error("x")):(2,3,error("y"))]"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["[1,2]", "[1,2,3]"]);
+                assert_eq!(e.message, "y");
+            }
+        );
+    }
+
+    /// #2351 review sibling: the same query in yq mode -- and here the
+    /// naive expectation *is* right, for a different reason than assumed.
+    /// Verified live against yq v4.53.3: `.[(0,1,error("x")):(2,3,
+    /// error("y"))]` on `[1,2,3]` prints only `Error: x`, not `y`. This
+    /// falls directly out of the new gate: `start`'s own escape empties
+    /// `starts` (this PR's `resolve_slice_bound`/`eval_slice_bound` fix),
+    /// and `eval_slice_expr`'s `if starts.is_empty() { return ... }`
+    /// short-circuits *before* `end` is ever evaluated for any `s` --
+    /// `error("y")` never runs at all in yq mode, where it's `error("x")`
+    /// that never runs in jq mode (see the jq-mode sibling above). Not a
+    /// coincidence chosen for the test: it's the same mechanism that makes
+    /// yq mode's `Error: x` match yq v4.53.3's own actual output.
+    #[test]
+    fn test_slice_bound_both_bounds_escaping_same_query_yq_mode_2351_review() {
+        yq_query!(b"[1,2,3]", r#".[(0,1,error("x")):(2,3,error("y"))]"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "x");
+            }
+        );
+    }
+
+    /// #2351 review: a resolved-but-non-numeric bound value combined with
+    /// an escape (`.[(0,"x",error("y")):3]`) in yq mode. Live-verified
+    /// against yq v4.53.3: prints only `Error: y` (no output, no type
+    /// error about "x"). This pins the accidental interaction the new gate
+    /// has with the pre-existing, unrelated `owned_bound_to_i64` bug
+    /// documented on `eval_slice_bound`'s own `#2351 review` comment above
+    /// (and `resolve_slice_bound`'s "Residual" paragraph): with the prefix
+    /// discarded before conversion ever runs on it in yq mode, `"x"` never
+    /// reaches `owned_bound_to_i64` at all, so `error("y")` -- the bound
+    /// generator's own escape -- is what surfaces, matching real yq exactly.
+    /// jq mode still has the underlying bug live (undisturbed by this PR):
+    /// jq 1.7.1 itself prints `[10,20,30]` before its own type error, where
+    /// succinctly's jq mode currently prints nothing -- a separate,
+    /// pre-existing gap, not asserted here.
+    #[test]
+    fn test_slice_bound_non_numeric_prefix_value_sidesteps_conversion_bug_in_yq_mode_2351_review() {
+        yq_query!(b"[10,20,30]", r#".[(0,"x",error("y")):3]"#,
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "y");
             }
         );
     }
