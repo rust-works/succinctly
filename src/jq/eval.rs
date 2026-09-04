@@ -4471,9 +4471,11 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut emit = |from_val: RangeNum, to_val: RangeNum, step_val: RangeNum| -> Demand {
         let (one, truncated) = match (from_val, to_val, step_val) {
             (RangeNum::Int(f), RangeNum::Int(t), RangeNum::Int(st)) => {
-                // Try the exact-`i64` path first; it self-detects overflow
-                // (`None`) and only then do we pay for a from-scratch `f64`
-                // recomputation -- see `eval_range_values`'s own doc comment.
+                // `eval_range_values` always returns `Some` since #2219 (an
+                // `i64` overflow now ends its loop rather than bailing) --
+                // the `None` arm is kept only because the function's return
+                // type is retained for API stability; see its own doc
+                // comment.
                 match eval_range_values::<W>(f, t, st) {
                     Some(result) => result,
                     None => eval_range_values_f64::<W>(f as f64, t as f64, st as f64),
@@ -30592,33 +30594,43 @@ fn range_max_exceeded_error() -> EvalError {
 }
 
 /// Helper to generate range values, capped at [`MAX_RANGE`] per call --
-/// issue #2131's revised fix.
+/// issue #2131's revised fix, further revised by #2219.
 ///
-/// Returns `None` the instant `i64` arithmetic would overflow, signalling
-/// the caller ([`each_range`]'s `emit`) to discard whatever this call
-/// already pushed and recompute the *entire* range from scratch via
-/// [`eval_range_values_f64`] instead, matching jq's own `f64`-based model at
-/// that point. Otherwise returns `Some((result, truncated))`, `truncated`
-/// meaning the cap actually cut the range short (`true`) rather than the
-/// range finishing naturally within it (`false`) -- deliberately *not* an
-/// error here: this has no visibility into whether the caller's own sink
-/// would have stopped asking before the cap anyway (`first`/`limit`'s
+/// Always returns `Some((result, truncated))` -- an `i64` overflow at any
+/// point (cap-boundary lookahead or the loop's own per-iteration advance)
+/// ends the loop and returns whatever has already been pushed, never
+/// discards it (see "# Overflow means exhaustion, not failure" below).
+/// `truncated` means the cap actually cut the range short (`true`) rather
+/// than the range finishing naturally within it (`false`) -- deliberately
+/// *not* an error here: this has no visibility into whether the caller's own
+/// sink would have stopped asking before the cap anyway (`first`/`limit`'s
 /// demand-driven early exit, #2089), only [`each_range`]'s `emit` does, so
-/// the truncation verdict is reported back rather than acted on locally.
+/// the truncation verdict is reported back rather than acted on locally. The
+/// `Option` return type is retained from #2131 for API stability even though
+/// every code path now produces `Some` -- see #2219 for why removing it
+/// wasn't part of that issue's scope.
 ///
-/// # Safety criterion
+/// # Overflow means exhaustion, not failure
 ///
 /// The only way this loop can misbehave is the `i64` addition wrapping via
 /// two's-complement (#2131's original bug: plain `i +=`, no guard at all).
 /// [`i64::checked_add`] makes that impossible to miss -- the moment a
-/// partial sum would leave `i64`'s range, it returns `None` and this
-/// function bails immediately via `?`, before that value is ever observed or
-/// pushed. There is no separate bound to prove equivalent to this behavior
-/// (the earlier `±2^53` gate had to prove its threshold made `i64` and
-/// `f64` arithmetic agree bit-for-bit); overflow-freedom is checked exactly,
-/// by the same arithmetic that would otherwise overflow, at every step it
-/// could occur, however many magnitude combinations of `from`/`to`/`step`
-/// might trigger it.
+/// partial sum would leave `i64`'s range, it returns `None`. #2219 applies
+/// the same proof #2131 round 3 already established for the cap-boundary
+/// lookahead (see below) to this per-iteration advance too: `to` is always
+/// itself a valid `i64`, so a candidate that overflows `i64` can never
+/// satisfy `< to` (ascending) or `> to` (descending) either -- the range was
+/// always going to end here, overflow or not. Ending the loop on that
+/// `None` therefore keeps every value already pushed instead of discarding
+/// them for an `f64` recomputation none of them needed (#2219's own repro:
+/// `range(9223372036854775802; 9223372036854775804; 20)` used to bail on
+/// its second `checked_add`, throwing away the one already-correct value
+/// `9223372036854775802` for a fresh `f64` walk). There is no separate bound
+/// to prove equivalent to this behavior (the earlier `±2^53` gate had to
+/// prove its threshold made `i64` and `f64` arithmetic agree bit-for-bit);
+/// overflow-freedom is checked exactly, by the same arithmetic that would
+/// otherwise overflow, at every step it could occur, however many magnitude
+/// combinations of `from`/`to`/`step` might trigger it.
 ///
 /// # Cap-boundary decoupling (round 3)
 ///
@@ -30655,20 +30667,18 @@ fn range_max_exceeded_error() -> EvalError {
 /// and genuinely has more values keeps reporting `truncated = true` exactly
 /// as before (`test_eval_range_values_cap_hit_genuine_truncation_still_flagged_2131`).
 ///
-/// This cap-boundary lookahead is a fundamentally different call than the
-/// per-iteration advance on a *non*-cap-terminated loop: that one is still
-/// gated by `?`, because there the loop genuinely needs `i`'s next value to
-/// keep going, and an overflow there means the range ran off the edge of
-/// representable `i64` space while still short of the cap -- the
-/// genuine-overflow case the rest of this doc comment describes, where
-/// bailing to `eval_range_values_f64` is what makes near-`i64::MIN`/`MAX`
-/// ranges match jq's own boundary-adjacent rounding behavior (see the
-/// issue's own repro below). The cap-boundary lookahead has no such
-/// obligation: it exists purely to answer "does one more value exist" for
-/// a batch this call has *already* finished correctly computing, so there
-/// is nothing to discard either way. A natural exit (the `while` condition
-/// itself becoming false, cap never engaged) never sets `truncated`, so it
-/// stays at its `false` initial value -- no lookahead needed there at all.
+/// Before #2219, this cap-boundary lookahead was treated as a fundamentally
+/// different call than the per-iteration advance on a *non*-cap-terminated
+/// loop: that one was still gated by `?`, bailing the whole function (and
+/// discarding every already-pushed value for an `f64` recomputation) the
+/// moment the range ran off the edge of representable `i64` space while
+/// still short of the cap. #2219 recognized that the same soundness proof
+/// applies equally to both call sites -- an overflowing candidate can never
+/// satisfy `< to`/`> to` either way, cap-terminated or not -- so both now
+/// end the loop the same way, keeping whatever has already been pushed. A
+/// natural exit (the `while` condition itself becoming false, no overflow
+/// anywhere) never sets `truncated`, so it stays at its `false` initial
+/// value -- no lookahead needed there at all.
 ///
 /// This also *narrows* the previous gate correctly: a range with no
 /// overflow risk at all -- e.g. a nanosecond-epoch-scale
@@ -30682,12 +30692,19 @@ fn range_max_exceeded_error() -> EvalError {
 /// adjacent, roughly `±9.2 * 10^18`) -- six orders of magnitude tighter than
 /// it needed to be, and this was that gate's own undisclosed regression.
 ///
-/// A genuine `i64::MIN`/`i64::MAX`-adjacent case (the issue's own repro,
+/// A genuine `i64::MIN`/`i64::MAX`-adjacent case (#2131's own repro,
 /// `range(-9223372036854775758; -9223372036854775808; -100)`) still
 /// overflows on its very first `checked_add` (`from` is only 50 above
-/// `i64::MIN`, and `step` subtracts 100 more) and still correctly falls
-/// back to `f64` -- see `test_eval_range_values_overflow_detection_2131` and
-/// the rest of this module's `#2131`-tagged tests for the sign/step-width
+/// `i64::MIN`, and `step` subtracts 100 more) -- but per #2219, this no
+/// longer falls back to `f64`: `from` itself is a valid `i64` value inside
+/// the requested range, so it is pushed before the overflowing advance ends
+/// the loop, and the single-element answer `[-9223372036854775758]` is kept
+/// exactly rather than discarded. This also happens to match jq's own
+/// answer for the data-sourced spelling of this range (jq's unary minus on a
+/// *literal* collapses to `f64` and diverges here for an unrelated reason,
+/// tracked separately in `docs/compliance/jq/limitations.md`'s #2131
+/// section) -- see `test_eval_range_values_overflow_detection_2131` and the
+/// rest of this module's `#2131`-tagged tests for the sign/step-width
 /// combinations swept to confirm this.
 fn eval_range_values<'a, W: Clone + AsRef<[u64]>>(
     from: i64,
@@ -30721,7 +30738,20 @@ fn eval_range_values<'a, W: Clone + AsRef<[u64]>>(
                 truncated = i.checked_add(step).is_some_and(|next| next < to);
                 break;
             }
-            i = i.checked_add(step)?;
+            // Same proof as the cap-hit lookahead above, just reached one
+            // push earlier (below `MAX_RANGE`, not at it): an overflowing
+            // `i.checked_add(step)` here means the true next value exceeds
+            // `i64::MAX`, and `to` is always a valid `i64`, so that next
+            // value could never satisfy `< to` either -- the range is
+            // exhausted, not truncated. Ending the loop keeps every value
+            // already pushed instead of discarding the whole batch and
+            // falling back to a from-scratch `f64` recomputation (#2219;
+            // previously this was `i.checked_add(step)?`, which bailed the
+            // entire function on exactly this provably-harmless overflow).
+            let Some(next) = i.checked_add(step) else {
+                break;
+            };
+            i = next;
         }
     } else if step < 0 {
         let mut i = from;
@@ -30731,7 +30761,10 @@ fn eval_range_values<'a, W: Clone + AsRef<[u64]>>(
                 truncated = i.checked_add(step).is_some_and(|next| next > to);
                 break;
             }
-            i = i.checked_add(step)?;
+            let Some(next) = i.checked_add(step) else {
+                break;
+            };
+            i = next;
         }
     }
 
@@ -47047,12 +47080,17 @@ mod tests {
     /// out-of-`i64`-range candidate there as proof no further value exists
     /// (`truncated = false`) rather than as a signal to bail -- `to` is
     /// always representable in `i64`, so a candidate that isn't can never
-    /// satisfy the comparison against it either way. Only a lookahead
-    /// attempted on a *non*-cap-terminated iteration (the loop's own
-    /// advance, still needed to keep going) can trigger this reference's
-    /// `None`, mirroring `eval_range_values`'s own `?`. Decoupling it here
-    /// independently re-derives the same conclusion via `i128` arithmetic
-    /// instead of trusting the production code's own control flow.
+    /// satisfy the comparison against it either way. #2219 extends this same
+    /// treatment to a lookahead on a *non*-cap-terminated iteration (the
+    /// loop's own advance) too, ending the loop and keeping whatever is
+    /// already in `values` instead of returning `None` -- mirroring
+    /// [`eval_range_values`]'s own `break` since #2219. This reference's
+    /// `Option` return type is retained purely so the sweep test below can
+    /// still assert the two computations produce identical `Option` values
+    /// at every swept magnitude, not because either side can still produce
+    /// `None`. Decoupling it here independently re-derives the same
+    /// conclusion via `i128` arithmetic instead of trusting the production
+    /// code's own control flow.
     fn reference_range_i64(from: i64, to: i64, step: i64) -> Option<(Vec<i64>, bool)> {
         let to128 = to as i128;
         let step128 = step as i128;
@@ -47071,7 +47109,7 @@ mod tests {
                 }
                 let next = i + step128;
                 if !in_i64(next) {
-                    return None;
+                    break;
                 }
                 i = next;
             }
@@ -47085,7 +47123,7 @@ mod tests {
                 }
                 let next = i + step128;
                 if !in_i64(next) {
-                    return None;
+                    break;
                 }
                 i = next;
             }
@@ -47103,6 +47141,14 @@ mod tests {
     /// (also must now stay on the exact `i64` path: `i64` has no
     /// precision-loss problem at that magnitude the way `f64` does, a
     /// beneficial side effect of narrowing the gate, not a new bug).
+    ///
+    /// Retargeted by #2219: every case here that overflows still overflows
+    /// exactly where this comment says it does, but #2219 changed what
+    /// happens next -- the values already pushed before the overflowing
+    /// advance are now kept (`Some((partial_values, false))`) instead of
+    /// discarded for an `f64` recomputation (`None`), so every assertion
+    /// below that used to expect `None` now expects the exact partial
+    /// answer instead.
     #[test]
     fn test_eval_range_values_overflow_detection_2131() {
         // Ordinary small range: exact, no overflow.
@@ -47132,26 +47178,38 @@ mod tests {
             Some(((bound - 2..bound + 2).collect(), false))
         );
 
-        // The issue's own repro: `from` is 50 above `i64::MIN`, `step`
-        // subtracts 100 more -- overflows on the very first `checked_add`,
-        // before a single value beyond `from` is ever produced.
+        // #2219: `from` is 50 above `i64::MIN`, `step` subtracts 100 more --
+        // overflows on the very first `checked_add`, but `from` itself was
+        // already pushed before that overflowing advance, so it's kept
+        // rather than discarded for an `f64` recomputation (pre-#2219, this
+        // bailed via `?` and returned `None`).
         assert_eq!(
             eval_range_values_i64(-9223372036854775758, -9223372036854775808, -100),
-            None
+            Some((vec![-9223372036854775758], false))
         );
 
         // Overflow near `i64::MAX` on the first add: the gap to `to` (10)
         // is far smaller than `step` (1000), so the first push-then-add
-        // already overshoots.
-        assert_eq!(eval_range_values_i64(i64::MAX - 10, i64::MAX, 1000), None);
+        // already overshoots -- the one pushed value is kept (#2219).
+        assert_eq!(
+            eval_range_values_i64(i64::MAX - 10, i64::MAX, 1000),
+            Some((vec![i64::MAX - 10], false))
+        );
 
         // Mirror at `i64::MIN`, negative step.
-        assert_eq!(eval_range_values_i64(i64::MIN + 10, i64::MIN, -1000), None);
+        assert_eq!(
+            eval_range_values_i64(i64::MIN + 10, i64::MIN, -1000),
+            Some((vec![i64::MIN + 10], false))
+        );
 
         // Overflow NOT on the first add: from 0, a step just past half of
-        // `i64::MAX` only overshoots on its *second* application.
+        // `i64::MAX` only overshoots on its *second* application -- both
+        // values computed before that overshoot are kept (#2219).
         let big_step = i64::MAX / 2 + 100;
-        assert_eq!(eval_range_values_i64(0, i64::MAX, big_step), None);
+        assert_eq!(
+            eval_range_values_i64(0, i64::MAX, big_step),
+            Some((vec![0, big_step], false))
+        );
 
         // Zero-iteration cases at the most extreme possible magnitudes: the
         // `while` condition fails on entry, so no add is ever attempted
@@ -47340,16 +47398,20 @@ mod tests {
         assert_eq!(combos, from_anchors.len() * steps.len() * ks.len());
     }
 
-    /// #2131 (revised fix), end to end through the full `each_range`/`emit`
-    /// dispatch (not just [`eval_range_values`] directly): a range with no
-    /// overflow risk keeps its exact `Int` values regardless of how large
-    /// its magnitude is, while a range that genuinely cannot be computed in
-    /// `i64` without overflowing falls back to `Float` -- confirming the
-    /// routing decision in `each_range`'s `emit` closure (the `match` on
-    /// `eval_range_values`'s `Option`) actually reaches production code, not
-    /// just the unit-level tests above.
+    /// #2131 (revised fix)/#2219, end to end through the full
+    /// `each_range`/`emit` dispatch (not just [`eval_range_values`]
+    /// directly): a range with no overflow risk keeps its exact `Int`
+    /// values regardless of how large its magnitude is. Renamed by #2219,
+    /// which also retargeted this test's own premise: an `Int`/`Int`/`Int`
+    /// range that hits an `i64` overflow no longer falls back to `Float`
+    /// either -- it keeps the exact `Int` prefix already computed before
+    /// the overflow, proving the `None => eval_range_values_f64(...)` arm
+    /// in `each_range`'s `emit` closure is unreachable dead code for this
+    /// dispatch arm (see `eval_range_values`'s own doc comment). The `f64`
+    /// path itself is still real production code, just reachable only via
+    /// `emit`'s *other* match arm, for genuinely non-integer operands.
     #[test]
-    fn test_range_dispatch_falls_back_to_f64_only_on_genuine_overflow_2131() {
+    fn test_range_dispatch_keeps_exact_int_prefix_through_overflow_2219() {
         fn range_values(src: &str) -> Vec<OwnedValue> {
             let json: &[u8] = b"null";
             let index = JsonIndex::build(json);
@@ -47387,23 +47449,34 @@ mod tests {
             other => panic!("expected Array, got {other:?}"),
         }
 
-        // The issue's own repro: overflows on the first `checked_add`,
-        // falls back to `f64`, and (matching real jq, whose `from`/`to`
-        // round to the same double at this magnitude) produces no values.
+        // #2219: overflows on the first `checked_add`, but `from` was
+        // already pushed as an exact `Int` before that overflow ends the
+        // loop, so it's kept rather than discarded for an `f64`
+        // recomputation. (Pre-#2219 this produced no values at all, via a
+        // `?`-triggered bail to `eval_range_values_f64` -- a coincidental,
+        // not deliberate, match with real jq's own answer here: jq's unary
+        // minus collapses a literal this large to a `f64` before `range`
+        // ever sees it, an unrelated divergence tracked in
+        // `docs/compliance/jq/limitations.md`'s #2131 section.)
         assert_eq!(
             range_values("range(-9223372036854775758;-9223372036854775808;-100)"),
-            Vec::new()
+            vec![OwnedValue::Int(-9223372036854775758)]
         );
 
-        // A genuine near-`i64::MAX` overflow: routed to the f64 path, so
-        // values come back as Float even though the source literals were
-        // plain integers.
-        for v in range_values("range(9223372036854774000;9223372036854775807;1000000000000000)") {
-            assert!(
-                matches!(v, OwnedValue::Float(_)),
-                "expected Float once a genuine i64 overflow is detected, got {v:?}"
-            );
-        }
+        // #2219: a genuine near-`i64::MAX` overflow no longer reaches
+        // `eval_range_values_f64` at all for `Int`/`Int`/`Int` operands --
+        // the overflowing candidate can never satisfy `< to` either way, so
+        // the loop ends and keeps the one exact `Int` value already pushed,
+        // instead of discarding it for a `Float` recomputation. This proves
+        // the `None => eval_range_values_f64(...)` arm at this call site is
+        // unreachable dead code for this dispatch arm (kept only for API
+        // stability, per `eval_range_values`'s own doc comment) -- the
+        // f64 path remains reachable only via the *other* `emit` match arm,
+        // for genuinely non-integer `from`/`to`/`step`.
+        assert_eq!(
+            range_values("range(9223372036854774000;9223372036854775807;1000000000000000)"),
+            vec![OwnedValue::Int(9223372036854774000)]
+        );
     }
 
     /// Helper macro to run a query and match the result.
