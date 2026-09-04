@@ -2017,6 +2017,111 @@ pub(crate) fn prefer_pending_control(
     }
 }
 
+/// Returns whether this evaluation mode streams the already-produced prefix
+/// of an indexing-like construct's sub-generator that escaped mid-stream.
+///
+/// The one definition of the `S::TAG` test #2226 (`E[K]`'s target), #2326
+/// (`E[K]`'s key) and #2351 (`E[K1:K2]`'s bounds) each re-derived by hand,
+/// once per evaluator: eight instances across this file and
+/// [`eval_generic`](super::eval_generic) by the time #2374 counted them, with
+/// nothing tying them together. `eval_generic::eval_slice_bound` had already
+/// shipped with *no* gate at all until #2351 caught it as a live bug, which
+/// is exactly the "duplicated predicates diverge silently" failure CLAUDE.md
+/// names; the next indexing-like construct inherits the rule by calling this
+/// instead of by remembering it.
+///
+/// Those eight are the value-mode sites, which survive spine 2416's
+/// migration. Two further copies live in
+/// `eval_index_expr_with_path_context`/`eval_slice_expr_with_path_context`
+/// (#2328) and are deliberately *not* routed here: those functions are
+/// scheduled for retirement under that spine, and their own gap is #2431.
+/// [`resolve_slice_bound`], the write-side resolver, states the same rule in
+/// its own `EvalEscape` domain and is likewise left alone (#1952).
+///
+/// Captured live rather than recalled (ADR-0018) -- jq 1.7.1 (`/usr/bin/jq`)
+/// streams the prefix, Homebrew yq v4.53.3 discards it, in all three of the
+/// family's shapes:
+///
+/// | shape  | input        | filter                            | jq 1.7.1 stdout    | yq v4.53.3 stdout |
+/// |--------|--------------|-----------------------------------|--------------------|-------------------|
+/// | key    | `[10,20,30]` | `.[(1,error("x"))]`               | `20`               | (none)            |
+/// | target | `null`       | `([1,2],[3,4],error("x"))[(0+0)]` | `1`, `3`           | (none)            |
+/// | bound  | `[1,2,3]`    | `.[(0,1,error("x")):3]`           | `[1,2,3]`, `[2,3]` | (none)            |
+///
+/// (both raise `x` on stderr afterwards: jq exit 5, yq exit 1.)
+///
+/// Not a fidelity judgement call per site any more: yq's discard is the
+/// *conservative* pre-#2226 behaviour that happens to match real yq, so a new
+/// site that forgets the gate diverges loudly in jq mode and silently in yq
+/// mode. [`fold_escaped_generator_prefix`] is the whole-arm shape built on
+/// top of this predicate; the two `eval_slice_bound`s and the two key-stream
+/// matches, which have no accumulator to fold into, call it directly.
+#[inline]
+pub(crate) fn streams_escaped_generator_prefix<S: EvalSemantics>() -> bool {
+    S::TAG != EvalTag::Yq
+}
+
+/// The one definition of the four-step tail every indexing-like construct's
+/// *target* `Partial` arm runs: gate on [`streams_escaped_generator_prefix`]
+/// (yq escapes immediately, discarding the prefix), promote the running
+/// accumulator if this arm is the first owned contributor, fold each
+/// already-produced value in through the construct's own per-value operation,
+/// then escape with the generator's own `control`.
+///
+/// A macro rather than a function because every step but the fold has to
+/// `return` from the caller through that function's own local `escape!`/
+/// `escape_with_prefix!`/`escape_generic!` -- the accumulator those close
+/// over (borrowed/owned split, cursor/owned split, or a single `Vec`) differs
+/// per site and cannot cross a function boundary. Same "no-`Try`-impl,
+/// need-early-return" idiom as [`to_owned_or_suppress`] and
+/// `eval_generic.rs`'s `owned_or_err!`.
+///
+/// `escape:` takes that local macro's *name*; `promote:` is the block run
+/// after the gate and before the fold (empty at the two slice sites, whose
+/// accumulator is already `Vec<OwnedValue>`); `accumulator:` is re-evaluated
+/// at each use so a site whose accumulator is reached through an
+/// `Option`/`as_mut` can pass that expression directly.
+///
+/// The four sites routed through it:
+/// [`eval_index_expr`]/[`eval_slice_expr`] here, and
+/// `eval_generic::eval_index_expr`/`eval_generic::eval_slice_expr`.
+/// `eval_index_expr`'s own arm used to re-check `yq_negative_index_error`
+/// inside the fold loop "for structural parity"; that check is
+/// unreachable past the gate by construction
+/// ([`yq_negative_index_check_core`] returns `None` whenever
+/// `S::TAG != EvalTag::Yq`), and this macro is the structural parity it was
+/// standing in for.
+macro_rules! fold_escaped_generator_prefix {
+    (
+        semantics: $sem:ty,
+        escape: $escape:ident,
+        prefix: $vs:ident,
+        control: $control:ident,
+        promote: $promote:block,
+        accumulator: $acc:expr,
+        fold: |$t:ident| $op:expr $(,)?
+    ) => {{
+        if !$crate::jq::eval::streams_escaped_generator_prefix::<$sem>() {
+            $escape!($control);
+        }
+        $promote
+        if $acc.try_reserve($vs.len()).is_err() {
+            $escape!($crate::jq::eval::Control::Error(
+                $crate::jq::eval::cannot_reserve_cross_product(&[$vs.len()]),
+            ));
+        }
+        for $t in &$vs {
+            match $op {
+                Ok(Some(v)) => $acc.push(v),
+                Ok(None) => {}
+                Err(e) => $escape!($crate::jq::eval::Control::Error(e)),
+            }
+        }
+        $escape!($control)
+    }};
+}
+pub(crate) use fold_escaped_generator_prefix;
+
 /// Collapse a `Vec<T>` accumulator into the smallest shape representing it:
 /// empty calls `none`, exactly one calls `one` with that value, more than one
 /// calls `many` with the whole vec. The one definition every
@@ -16873,28 +16978,34 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // real jq's key-outer/target-inner model indexes each already-
         // produced key as it flows out, so `key`'s own escaped generator's
         // prefix is real jq output too (confirmed live: `[10,20,30] |
-        // .[(1,error("x"))]` prints `20` before raising). jq-only, matching
-        // #2226's own gate -- real yq does not stream this prefix either
-        // (confirmed live, `.[(1,error("x"))]` in yq mode shows no `20`),
-        // so yq mode keeps the pre-existing conservative discard below.
-        QueryResult::Partial(vs, Control::Error(e)) if S::TAG != EvalTag::Yq => {
-            pending_control = prefer_pending_control(pending_control, Control::Error(e));
-            vs
-        }
-        QueryResult::Partial(vs, Control::Break(label)) if S::TAG != EvalTag::Yq => {
-            pending_control = prefer_pending_control(pending_control, Control::Break(label));
-            vs
-        }
-        // Computed indexing's key/target forking isn't part of #400/#494's
-        // verified semantics — conservatively matching the existing
-        // Error/Break arms rather than inventing new partial-key behavior.
-        // (yq mode, and any future non-jq/yq semantics, still take this.)
-        QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
-        QueryResult::Partial(_, Control::Break(label)) => return QueryResult::Break(label),
-        QueryResult::Partial(vs, Control::Halt(code)) => {
-            pending_control = prefer_pending_control(pending_control, Control::Halt(code));
-            vs
-        }
+        // .[(1,error("x"))]` prints `20` before raising). Real yq does not
+        // stream this prefix either (confirmed live, `.[(1,error("x"))]` in
+        // yq mode shows no `20`), so yq mode keeps the pre-existing
+        // conservative discard.
+        //
+        // #2374: the mode test is [`streams_escaped_generator_prefix`], the
+        // family's one definition, not a fifth hand-written `S::TAG`
+        // comparison -- and the five arms this used to need collapse to
+        // three, since only `Error`/`Break` discard. `Halt` is different in
+        // *both* modes: its prefix is kept and threaded through as
+        // `pending_control`, because those already-produced keys' indexed
+        // output still owes real jq's stdout before the process exits
+        // (#791). Computed indexing's key/target forking isn't part of
+        // #400/#494's verified semantics, so the discard stays a bare
+        // `Error`/`Break` rather than inventing a `Partial` shape for it
+        // (yq mode, and any future non-jq/yq semantics, take those two).
+        QueryResult::Partial(vs, control) => match control {
+            Control::Error(e) if !streams_escaped_generator_prefix::<S>() => {
+                return QueryResult::Error(e)
+            }
+            Control::Break(label) if !streams_escaped_generator_prefix::<S>() => {
+                return QueryResult::Break(label)
+            }
+            control => {
+                pending_control = prefer_pending_control(pending_control, control);
+                vs
+            }
+        },
     };
     if keys.is_empty() {
         // `partial`'s invariant (a non-empty prefix by construction) means
@@ -16980,77 +17091,86 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             //
             // Mirrors `KeyTargets::Owned`'s own loop below exactly (this
             // prefix is already `Vec<OwnedValue>`, the same shape `Owned`
-            // handles, `yq_negative_index_error` check included -- always a
-            // no-op past the gate above, kept for structural parity): an
-            // indexing failure on an earlier-produced value fires before
-            // `target`'s own later escape ever would in the real generator
-            // order, so it outranks `control` here the same way a later
-            // key's index error already outranks an earlier key's pending
-            // halt in the `Owned`/`Borrowed` arms; only once every value in
-            // `vs` indexes cleanly does `control` -- `target`'s own
-            // termination -- get to fire.
+            // handles): an indexing failure on an earlier-produced value
+            // fires before `target`'s own later escape ever would in the
+            // real generator order, so it outranks `control` here the same
+            // way a later key's index error already outranks an earlier
+            // key's pending halt in the `Owned`/`Borrowed` arms; only once
+            // every value in `vs` indexes cleanly does `control` --
+            // `target`'s own termination -- get to fire.
+            //
+            // #2374: the gate/fold/escape tail is now
+            // [`fold_escaped_generator_prefix`], shared with this file's
+            // `eval_slice_expr` and both of `eval_generic.rs`'s siblings,
+            // rather than a fourth hand-written copy. The `Owned` loop's
+            // `yq_negative_index_error` check is *not* carried into it: it
+            // is unreachable past the gate by construction
+            // (`yq_negative_index_check_core` returns `None` for every
+            // `S::TAG != EvalTag::Yq`), and it was only ever here "for
+            // structural parity", which the shared macro now supplies for
+            // real.
             QueryResult::Partial(vs, control) => {
-                if S::TAG == EvalTag::Yq {
-                    escape_with_prefix!(control);
+                fold_escaped_generator_prefix! {
+                    semantics: S,
+                    escape: escape_with_prefix,
+                    prefix: vs,
+                    control: control,
+                    promote: {
+                        if owned.is_none() {
+                            owned = Some(
+                                match promote_borrowed_checked(core::mem::take(&mut borrowed)) {
+                                    Ok(v) => v,
+                                    // An earlier key's own undecodable value
+                                    // predates this key's target generator in
+                                    // real evaluation order, so it outranks
+                                    // `control` too -- except when `control`
+                                    // is an uncatchable `Halt`, which must
+                                    // survive a promotion failure untouched,
+                                    // same rule `resolve_terminal_prefix`
+                                    // enforces for every other escape in this
+                                    // function (#987/#1832); `vs` is never
+                                    // attempted here either way, matching that
+                                    // helper's own `extra` never being touched
+                                    // on its `Err` branch.
+                                    //
+                                    // Not live-repro-tested (review):
+                                    // `target` is one fixed expression
+                                    // re-evaluated fresh per key against the
+                                    // same document, so whether a given key's
+                                    // evaluation is a clean success
+                                    // (populating `borrowed`) or a `Partial`
+                                    // (reaching this arm) is a deterministic
+                                    // function of `(target, value)` alone, not
+                                    // of which key is current -- an *earlier*
+                                    // key populating `borrowed` and a *later*
+                                    // key hitting this arm therefore requires
+                                    // `target` itself to behave
+                                    // non-deterministically across the two
+                                    // calls. The one stateful builtin that
+                                    // could do that, `input`, always returns
+                                    // an owned value (`builtin_input`'s own
+                                    // `owned_vec_to_result`), so it can never
+                                    // populate `borrowed` in the first place.
+                                    // Kept anyway, matching
+                                    // `resolve_terminal_prefix`'s own
+                                    // identical defensive handling, in case a
+                                    // future stateful mechanism changes this.
+                                    Err((prefix, e)) => {
+                                        let control = match control {
+                                            Control::Halt(_) => control,
+                                            Control::Error(_) | Control::Break(_) => {
+                                                Control::Error(e)
+                                            }
+                                        };
+                                        return partial(prefix, control);
+                                    }
+                                },
+                            );
+                        }
+                    },
+                    accumulator: owned.as_mut().expect("promoted by the block above"),
+                    fold: |t| index_one_owned(t, k, optional),
                 }
-                if owned.is_none() {
-                    owned = Some(
-                        match promote_borrowed_checked(core::mem::take(&mut borrowed)) {
-                            Ok(v) => v,
-                            // An earlier key's own undecodable value predates
-                            // this key's target generator in real evaluation
-                            // order, so it outranks `control` too -- except
-                            // when `control` is an uncatchable `Halt`, which
-                            // must survive a promotion failure untouched,
-                            // same rule `resolve_terminal_prefix` enforces
-                            // for every other escape in this function (#987/
-                            // #1832); `vs` is never attempted here either
-                            // way, matching that helper's own `extra` never
-                            // being touched on its `Err` branch.
-                            //
-                            // Not live-repro-tested (review): `target` is one
-                            // fixed expression re-evaluated fresh per key
-                            // against the same document, so whether a given
-                            // key's evaluation is a clean success (populating
-                            // `borrowed`) or a `Partial` (reaching this arm)
-                            // is a deterministic function of `(target, value)`
-                            // alone, not of which key is current -- an
-                            // *earlier* key populating `borrowed` and a
-                            // *later* key hitting this arm therefore requires
-                            // `target` itself to behave non-deterministically
-                            // across the two calls. The one stateful builtin
-                            // that could do that, `input`, always returns an
-                            // owned value (`builtin_input`'s own
-                            // `owned_vec_to_result`), so it can never
-                            // populate `borrowed` in the first place. Kept
-                            // anyway, matching `resolve_terminal_prefix`'s
-                            // own identical defensive handling, in case a
-                            // future stateful mechanism changes this.
-                            Err((prefix, e)) => {
-                                let control = match control {
-                                    Control::Halt(_) => control,
-                                    Control::Error(_) | Control::Break(_) => Control::Error(e),
-                                };
-                                return partial(prefix, control);
-                            }
-                        },
-                    );
-                }
-                let acc = owned.as_mut().expect("just ensured Some");
-                if acc.try_reserve(vs.len()).is_err() {
-                    escape_with_prefix!(Control::Error(cannot_reserve_cross_product(&[vs.len()])));
-                }
-                for t in &vs {
-                    if let Some(e) = yq_negative_index_error::<S>(t, k) {
-                        escape_with_prefix!(Control::Error(e));
-                    }
-                    match index_one_owned(t, k, optional) {
-                        Ok(Some(v)) => owned.as_mut().expect("still Some").push(v),
-                        Ok(None) => {}
-                        Err(e) => escape_with_prefix!(Control::Error(e)),
-                    }
-                }
-                escape_with_prefix!(control)
             }
         };
         match key_targets {
@@ -17345,21 +17465,23 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // v4.53.3, `([1,2],[3,4],error("x"))[(0,1):(1,2)]` prints
                 // only `Error: x`. yq mode keeps the old conservative
                 // discard.
+                //
+                // #2374: the gate/fold/escape tail is
+                // [`fold_escaped_generator_prefix`], the family's one
+                // definition, shared with `eval_index_expr` above and both
+                // of `eval_generic.rs`'s siblings. `promote:` is empty here
+                // -- `out` is already `Vec<OwnedValue>`, so there is no
+                // borrowed accumulator to promote first.
                 QueryResult::Partial(vs, control) => {
-                    if S::TAG == EvalTag::Yq {
-                        escape!(control);
+                    fold_escaped_generator_prefix! {
+                        semantics: S,
+                        escape: escape,
+                        prefix: vs,
+                        control: control,
+                        promote: {},
+                        accumulator: out,
+                        fold: |t| slice_owned_value_read::<S>(t, *s, *e, optional),
                     }
-                    if out.try_reserve(vs.len()).is_err() {
-                        escape!(Control::Error(cannot_reserve_cross_product(&[vs.len()])));
-                    }
-                    for t in &vs {
-                        match slice_owned_value_read::<S>(t, *s, *e, optional) {
-                            Ok(Some(v)) => out.push(v),
-                            Ok(None) => {}
-                            Err(e) => escape!(Control::Error(e)),
-                        }
-                    }
-                    escape!(control)
                 }
             };
             match &targets {
@@ -17526,11 +17648,17 @@ fn eval_slice_bound<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 unreachable!("materialize_cursor should have converted this")
             }
             // #2351: yq mode discards this bound generator's own escaped
-            // prefix (see the function's own doc comment above) -- mirrors
-            // #2226's/#2326's identical `S::TAG == EvalTag::Yq` gate on their
-            // own target/key `Partial` arms.
+            // prefix (see the function's own doc comment above) -- the same
+            // carve-out #2226's/#2326's own target/key `Partial` arms apply.
             //
-            // #2351 review: discarding `_vs` here also means the
+            // #2374: routed through [`streams_escaped_generator_prefix`],
+            // the family's one definition, so the two arms this used to need
+            // collapse to one. `eval_generic::eval_slice_bound` -- the
+            // sibling an ordinary CLI read actually reaches -- shipped with
+            // *no* gate here at all until #2351 found it, which is the
+            // silent divergence a shared definition exists to prevent.
+            //
+            // #2351 review: discarding the prefix here also means the
             // `owned_bound_to_i64` conversion below never runs on it in yq
             // mode, which incidentally sidesteps a separate, pre-existing,
             // unrelated bug: `owned_bound_to_i64`'s `.collect::<Result<...>,
@@ -17540,10 +17668,14 @@ fn eval_slice_bound<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // `[10,20,30]` should print `[10,20,30]` per jq 1.7.1 but prints
             // nothing here) and untouched by this PR. Not a fix for that bug,
             // just an accident of evaluation order once the prefix is gone.
-            QueryResult::Partial(_vs, control) if S::TAG == EvalTag::Yq => {
-                (Vec::new(), Some(control))
-            }
-            QueryResult::Partial(vs, control) => (vs, Some(control)),
+            QueryResult::Partial(vs, control) => (
+                if streams_escaped_generator_prefix::<S>() {
+                    vs
+                } else {
+                    Vec::new()
+                },
+                Some(control),
+            ),
         };
     // #2372: used to be a bare `.collect::<Result<Vec<_>, _>>()?`, which
     // discarded every already-converted bound (and silently replaced
@@ -54355,6 +54487,104 @@ mod tests {
                 assert_eq!(e.message, "x");
             }
         );
+    }
+
+    /// #2374: the family's shared definition itself, pinned once rather
+    /// than only through each of its call sites' own regression tests.
+    ///
+    /// [`streams_escaped_generator_prefix`] -- and
+    /// [`fold_escaped_generator_prefix`], the whole-arm shape built on it --
+    /// replaced eight hand-copied `S::TAG == EvalTag::Yq` comparisons across
+    /// this file and `eval_generic.rs`: `E[K]`'s target (#2226), `E[K]`'s
+    /// key (#2326) and both of `E[K1:K2]`'s bounds (#2351), in each
+    /// evaluator. There was no test that the copies agreed, and they had
+    /// already disagreed for real once -- `eval_generic::eval_slice_bound`
+    /// shipped with *no* gate until #2351 found it. This test is the one a
+    /// ninth indexing-like construct fails if it forgets the rule; the
+    /// per-site tests above cannot notice a site that never routed through
+    /// the definition in the first place.
+    ///
+    /// Captured live rather than recalled (ADR-0018) from jq 1.7.1
+    /// (`/usr/bin/jq`, exit 5, prefix on stdout and `x` on stderr) and
+    /// Homebrew yq v4.53.3 (`yq -o=json -I=0`, exit 1, nothing on stdout):
+    ///
+    /// | input        | filter                                  | jq 1.7.1 stdout    | yq v4.53.3 stdout |
+    /// |--------------|-----------------------------------------|--------------------|-------------------|
+    /// | `[10,20,30]` | `.[(1,error("x"))]`                     | `20`               | (none)            |
+    /// | `null`       | `([1,2],[3,4],error("x"))[(0+0)]`       | `1`, `3`           | (none)            |
+    /// | `null`       | `([1,2],[3,4],error("x"))[(0+0):(1+0)]` | `[1]`, `[3]`       | (none)            |
+    /// | `[1,2,3]`    | `.[(0,1,error("x")):3]`                 | `[1,2,3]`, `[2,3]` | (none)            |
+    /// | `[1,2,3]`    | `.[0:(1,2,error("x"))]`                 | `[1]`, `[1,2]`     | (none)            |
+    ///
+    /// Bounds are spelled `(0+0)`/`(1+0)` rather than `0`/`1` deliberately:
+    /// a slice whose bounds both fold to constants never reaches
+    /// `eval_slice_expr` at all (#1326's static `Expr::Slice` fast path),
+    /// the same trap `test_slice_expr_target_own_partial_prefix_preserved_2226`
+    /// above records.
+    #[test]
+    fn streams_escaped_generator_prefix_gates_the_whole_family_2374() {
+        // The predicate itself, independent of any call site: jq streams
+        // the prefix, yq discards it.
+        assert!(streams_escaped_generator_prefix::<JqSemantics>());
+        assert!(!streams_escaped_generator_prefix::<YqSemantics>());
+
+        let arr =
+            |items: &[i64]| OwnedValue::Array(items.iter().copied().map(OwnedValue::Int).collect());
+        let rows: [(&[u8], &str, &str, Vec<OwnedValue>); 5] = [
+            (
+                b"[10,20,30]",
+                r#".[(1,error("x"))]"#,
+                "E[K] key generator (#2326)",
+                vec![OwnedValue::Int(20)],
+            ),
+            (
+                b"null",
+                r#"([1,2],[3,4],error("x"))[(0+0)]"#,
+                "E[K] target generator (#2226)",
+                vec![OwnedValue::Int(1), OwnedValue::Int(3)],
+            ),
+            (
+                b"null",
+                r#"([1,2],[3,4],error("x"))[(0+0):(1+0)]"#,
+                "E[K1:K2] target generator (#2226)",
+                vec![arr(&[1]), arr(&[3])],
+            ),
+            (
+                b"[1,2,3]",
+                r#".[(0,1,error("x")):3]"#,
+                "E[K1:K2] start bound (#2351)",
+                vec![arr(&[1, 2, 3]), arr(&[2, 3])],
+            ),
+            (
+                b"[1,2,3]",
+                r#".[0:(1,2,error("x"))]"#,
+                "E[K1:K2] end bound (#2351)",
+                vec![arr(&[1]), arr(&[1, 2])],
+            ),
+        ];
+
+        for (json, filter, site, jq_prefix) in rows {
+            let index = JsonIndex::build(json);
+
+            // jq mode folds the already-produced prefix in through the
+            // construct's own per-value operation, then escapes with the
+            // generator's own control.
+            let jq_expr = parse(filter).unwrap();
+            match eval::<Vec<u64>, JqSemantics>(&jq_expr, index.root(json)) {
+                QueryResult::Partial(vs, Control::Error(e)) => {
+                    assert_eq!(vs, jq_prefix, "{site}: jq prefix");
+                    assert_eq!(e.message, "x", "{site}: jq escape");
+                }
+                other => panic!("{site}: jq mode must stream the prefix, got {other:?}"),
+            }
+
+            // yq mode discards it and escapes bare.
+            let yq_expr = parse_with_mode_and_extensions(filter, ParserMode::Yq, true).unwrap();
+            match eval::<Vec<u64>, YqSemantics>(&yq_expr, index.root(json)) {
+                QueryResult::Error(e) => assert_eq!(e.message, "x", "{site}: yq escape"),
+                other => panic!("{site}: yq mode must discard the prefix, got {other:?}"),
+            }
+        }
     }
 
     /// #2326: the mirror-image gap on `key`'s own side of `E[K]` --

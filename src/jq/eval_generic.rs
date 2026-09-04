@@ -39,14 +39,14 @@ use super::eval::{
     cannot_reserve_cross_product, classify_limit_n, classify_nth_n, classify_parent_n,
     collapse_vec, collect_pattern_var_names, compare_values, debug_assert_materialization_error,
     enter_def_call_frame, eval as full_eval, eval_each_owned, eval_foreach_with_values,
-    eval_reduce_with_values, extract_pattern_bindings, format_owned,
+    eval_reduce_with_values, extract_pattern_bindings, fold_escaped_generator_prefix, format_owned,
     has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
     index_one_owned as index_owned_by_key, is_pure_chain_link, is_retryable_stop, literal_to_owned,
     needs_path_context, numeric_key_to_array_index, numeric_key_to_index, owned_bound_to_i64,
     owned_to_string, prefer_pending_control, slice_object_as_yq_children, slice_owned_value_read,
-    substitute_bound_var, substitute_vars, suppresses, tonumber_from_str, vec_with_capacity,
-    yq_negative_index_check, Control, Demand, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics,
-    LimitN, PathTrail, QueryResult, YqSemantics,
+    streams_escaped_generator_prefix, substitute_bound_var, substitute_vars, suppresses,
+    tonumber_from_str, vec_with_capacity, yq_negative_index_check, Control, Demand, EvalError,
+    EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail, QueryResult, YqSemantics,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -8440,32 +8440,35 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         // real jq's key-outer/target-inner model indexes each already-
         // produced key as it flows out, so `key`'s own escaped generator's
         // prefix is real jq output too (confirmed live: `[10,20,30] |
-        // .[(1,error("x"))]` prints `20` before raising). jq-only, matching
-        // #2226's own gate -- real yq does not stream this prefix either
-        // (confirmed live, `.[(1,error("x"))]` in yq mode shows no `20`),
-        // so yq mode keeps the pre-existing conservative discard below.
-        GenericResult::Partial(vs, Control::Error(e)) if S::TAG != EvalTag::Yq => {
-            pending_control = prefer_pending_control(pending_control, Control::Error(e));
-            vs
-        }
-        GenericResult::Partial(vs, Control::Break(label)) if S::TAG != EvalTag::Yq => {
-            pending_control = prefer_pending_control(pending_control, Control::Break(label));
-            vs
-        }
-        // A `Partial`'s trailing control must abort here too, not silently
-        // truncate to its prefix (#694) -- mirrors the target match below.
-        // Computed indexing's key/target forking isn't part of #400/#494's
-        // verified semantics for `Error`/`Break` — conservatively matching
-        // those arms rather than inventing new partial-key behavior for
-        // them. `Halt` is different: its prefix is kept and threaded through
-        // as `pending_control` instead of discarded, per the comment above.
-        // (yq mode, and any future non-jq/yq semantics, still take these.)
-        GenericResult::Partial(_, Control::Error(e)) => return GenericResult::Error(e),
-        GenericResult::Partial(_, Control::Break(label)) => return GenericResult::Break(label),
-        GenericResult::Partial(vs, Control::Halt(code)) => {
-            pending_control = prefer_pending_control(pending_control, Control::Halt(code));
-            vs
-        }
+        // .[(1,error("x"))]` prints `20` before raising). Real yq does not
+        // stream this prefix either (confirmed live, `.[(1,error("x"))]` in
+        // yq mode shows no `20`), so yq mode keeps the pre-existing
+        // conservative discard.
+        //
+        // #2374: the mode test is `eval::streams_escaped_generator_prefix`,
+        // the family's one definition, not a fifth hand-written `S::TAG`
+        // comparison -- and the five arms this used to need collapse to
+        // three, since only `Error`/`Break` discard. A `Partial`'s trailing
+        // control must still abort rather than silently truncate to its
+        // prefix (#694), and computed indexing's key/target forking isn't
+        // part of #400/#494's verified semantics, so that discard stays a
+        // bare `Error`/`Break` rather than inventing a `Partial` shape for
+        // it (yq mode, and any future non-jq/yq semantics, take those two).
+        // `Halt` is different in *both* modes: its prefix is kept and
+        // threaded through as `pending_control` instead of discarded, per
+        // the comment above.
+        GenericResult::Partial(vs, control) => match control {
+            Control::Error(e) if !streams_escaped_generator_prefix::<S>() => {
+                return GenericResult::Error(e)
+            }
+            Control::Break(label) if !streams_escaped_generator_prefix::<S>() => {
+                return GenericResult::Break(label)
+            }
+            control => {
+                pending_control = prefer_pending_control(pending_control, control);
+                vs
+            }
+        },
         // STYLE-0012: these four materialize the *key* generator's outputs,
         // which are evaluated with a hardcoded `optional: false` just above.
         // `.[k]?` suppresses only its own final index step, never an error
@@ -8693,45 +8696,44 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
             // future-proofing reason `resolve_terminal_prefix` keeps its own
             // identical handling.
             GenericResult::Partial(vs, control) => {
-                if S::TAG == EvalTag::Yq {
-                    escape_generic!(control);
-                }
-                if !any_owned {
-                    any_owned = true;
-                    // #2145: uses the prefix-preserving
-                    // `to_owned_all_cursors_checked` instead of the
-                    // all-or-nothing `to_owned_all_cursors` -- this arm's
-                    // own doc comment above already claimed to mirror
-                    // `escape_generic!`'s Halt-survives rule, but until this
-                    // fix it still discarded the *prefix* the same way
-                    // `escape_generic!` itself used to (review finding: the
-                    // sibling gap #2145's own fix left in place here).
-                    // STYLE-0012: prefix-preserving by design (#2145, quoted just above):
-                    // the error rides out on a `Partial` whose prefix must survive, so the
-                    // `eval_try`/`Expr::Optional` boundary suppresses it, not this site.
-                    owned = match to_owned_all_cursors_checked(&cursors) {
-                        Ok(vs) => vs,
-                        Err((prefix, e)) => {
-                            let control = match control {
-                                Control::Halt(code) => Control::Halt(code),
-                                Control::Error(_) | Control::Break(_) => Control::Error(e),
+                fold_escaped_generator_prefix! {
+                    semantics: S,
+                    escape: escape_generic,
+                    prefix: vs,
+                    control: control,
+                    promote: {
+                        if !any_owned {
+                            any_owned = true;
+                            // #2145: uses the prefix-preserving
+                            // `to_owned_all_cursors_checked` instead of the
+                            // all-or-nothing `to_owned_all_cursors` -- this
+                            // arm's own doc comment above already claimed to
+                            // mirror `escape_generic!`'s Halt-survives rule,
+                            // but until this fix it still discarded the
+                            // *prefix* the same way `escape_generic!` itself
+                            // used to (review finding: the sibling gap
+                            // #2145's own fix left in place here).
+                            // STYLE-0012: prefix-preserving by design
+                            // (#2145, quoted just above): the error rides out
+                            // on a `Partial` whose prefix must survive, so the
+                            // `eval_try`/`Expr::Optional` boundary suppresses
+                            // it, not this site.
+                            owned = match to_owned_all_cursors_checked(&cursors) {
+                                Ok(vs) => vs,
+                                Err((prefix, e)) => {
+                                    let control = match control {
+                                        Control::Halt(code) => Control::Halt(code),
+                                        Control::Error(_) | Control::Break(_) => Control::Error(e),
+                                    };
+                                    return partial_generic(prefix, control);
+                                }
                             };
-                            return partial_generic(prefix, control);
+                            cursors.clear();
                         }
-                    };
-                    cursors.clear();
+                    },
+                    accumulator: owned,
+                    fold: |t| index_owned_by_key(t, k, optional),
                 }
-                if owned.try_reserve(vs.len()).is_err() {
-                    escape_generic!(Control::Error(cannot_reserve_cross_product(&[vs.len()])));
-                }
-                for t in &vs {
-                    match index_owned_by_key(t, k, optional) {
-                        Ok(Some(v)) => owned.push(v),
-                        Ok(None) => {}
-                        Err(e) => escape_generic!(Control::Error(e)),
-                    }
-                }
-                escape_generic!(control)
             }
             GenericResult::One(v) => KeyTargets::Native(vec![v]),
             GenericResult::Many(vs) => KeyTargets::Native(vs),
@@ -9103,21 +9105,23 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
                 // against yq v4.53.3, `([1,2],[3,4],error("x"))[(0,1):(1,2)]`
                 // prints only `Error: x`. yq mode keeps the old conservative
                 // discard.
+                //
+                // #2374: the gate/fold/escape tail is
+                // `eval::fold_escaped_generator_prefix`, the family's one
+                // definition, shared with `eval_index_expr` above and both
+                // of `eval.rs`'s siblings. `promote:` is empty here -- `out`
+                // is already `Vec<OwnedValue>`, so there is no cursor
+                // accumulator to promote first.
                 GenericResult::Partial(vs, control) => {
-                    if S::TAG == EvalTag::Yq {
-                        escape!(control);
+                    fold_escaped_generator_prefix! {
+                        semantics: S,
+                        escape: escape,
+                        prefix: vs,
+                        control: control,
+                        promote: {},
+                        accumulator: out,
+                        fold: |t| slice_owned_value_read::<S>(t, *s, *e, optional),
                     }
-                    if out.try_reserve(vs.len()).is_err() {
-                        escape!(Control::Error(cannot_reserve_cross_product(&[vs.len()])));
-                    }
-                    for t in &vs {
-                        match slice_owned_value_read::<S>(t, *s, *e, optional) {
-                            Ok(Some(v)) => out.push(v),
-                            Ok(None) => {}
-                            Err(e) => escape!(Control::Error(e)),
-                        }
-                    }
-                    escape!(control)
                 }
                 GenericResult::One(v) => Targets::Borrowed(vec![v]),
                 GenericResult::Many(vs) => Targets::Borrowed(vs),
@@ -9252,10 +9256,20 @@ fn eval_slice_bound<S: EvalSemantics, V: DocumentValue>(
             GenericResult::None => (Vec::new(), None),
             // #2351: yq mode discards this bound generator's own escaped
             // prefix (see the function's own doc comment above).
-            GenericResult::Partial(_vs, control) if S::TAG == EvalTag::Yq => {
-                (Vec::new(), Some(control))
-            }
-            GenericResult::Partial(vs, control) => (vs, Some(control)),
+            //
+            // #2374: routed through `eval::streams_escaped_generator_prefix`,
+            // the family's one definition, so the two arms this used to need
+            // collapse to one. This is the site that shipped with *no* gate
+            // at all until #2351 caught it as a live bug -- the silent
+            // divergence a shared definition exists to prevent.
+            GenericResult::Partial(vs, control) => (
+                if streams_escaped_generator_prefix::<S>() {
+                    vs
+                } else {
+                    Vec::new()
+                },
+                Some(control),
+            ),
             GenericResult::One(v) => (vec![to_owned_key_shape(&v).map_err(Control::Error)?], None),
             GenericResult::OneCursor(c) => (
                 vec![to_owned_key_shape_cursor(&c).map_err(Control::Error)?],
