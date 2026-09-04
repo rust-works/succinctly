@@ -467,6 +467,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     without a way to tell del() apart from assignment would fix one and regress the
     other.
 
+- **`.[]` (iterate) over a non-container raised in yq mode where real yq silently produces
+  no output** (#2346). Real yq's `.[]` gives zero output — not an error — for *any*
+  non-container target (number, string, bool, `null`), not just `null`, confirmed live
+  against yq v4.53.3 for plain reads, `del()`, and assignment alike (`echo '{"x":5}' | yq
+  -o=json '.x[]'` is empty, exit 0); jq has no such rule, so this is yq-mode only. Fixed at
+  every `Expr::Iterate` site reachable from a plain read (both evaluators' value-only arms),
+  `del()` (`delete_at_path`'s terminal arm and `delete_path_steps`'s mid-chain arm), and a
+  `path()`-style path computation (`eval_stage_with_path_context`, `path_step_generic`);
+  `=`/`|=`'s own `set_path`/`update_path` machinery already had this right. Two adjacent,
+  structurally-similar sites were deliberately left unfixed rather than given the same
+  widening, since a naive copy would be wrong (`map(f)`'s real yq-mode rule is asymmetric,
+  not uniform) or risks a worse regression (`resolve_iterate_bounded`'s `first(f)` gap is
+  also reached by `del()`'s comma-fanout fallback, where the same widening would turn an
+  honest raise into a silently wrong answer) — see
+  `docs/compliance/yq/limitations.md`'s own entry for both, tracked as
+  [#2375](https://github.com/rust-works/succinctly/issues/2375) and
+  [#2376](https://github.com/rust-works/succinctly/issues/2376).
+
 - **`delpaths([[]])` printed the literal `null` instead of emitting nothing in yq mode**
   (#2352, found while implementing #2306). `del(.)` already special-cases "deleted the
   whole document" as no output at all (#1702, real yq's own root-delete rule), but
