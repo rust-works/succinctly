@@ -36722,15 +36722,25 @@ fn delete_keys(
             // checked over every key in the batch, since a run can group
             // several distinct key types together.
             //
-            // #2353: in yq mode, a non-string key against an object
-            // contributes nothing instead of raising -- confirmed live
-            // against yq v4.53.3 for every key kind (`number`, `null`,
-            // `bool`), both via `del()` and `delpaths()`, on an empty and a
-            // non-empty object alike, and through a comma-grouped `del()`
-            // sibling (`del(.[5], .a)` deletes `.a` and leaves the rest
-            // untouched, not a whole-call error). Asymmetric with the array
-            // arm below on purpose: real yq's own array indexing always
-            // tries to parse *any* key as an integer (the same
+            // #2353: real yq's own object indexing contributes nothing for a
+            // non-string key -- confirmed live against yq v4.53.3 for every
+            // key kind (`number`, `null`, `bool`), both via `del()` and
+            // `delpaths()`, on an empty and a non-empty object alike, and
+            // through a comma-grouped `del()` sibling (`del(.[5], .a)`
+            // deletes `.a` and leaves the rest untouched, not a whole-call
+            // error). This is the *oracle rule*, not a claim that this fix
+            // reaches every shape below: only the literal-index terminal
+            // and mid-chain paths that dispatch straight to `delete_keys`/
+            // `delete_at_path`/`delete_paths_under`/`delete_path_steps`
+            // actually no-op today. A comma-grouped sibling and any
+            // *computed* index (`.[5+0]`, `5 as $i | .[$i]`, or a literal
+            // `null`/`true`/`false` key, which parses as `Expr::IndexExpr`
+            // rather than the bare-integer-literal `Expr::Index` shorthand)
+            // both resolve through different, shared machinery this fix
+            // does not touch, and still raise -- tracked as a known,
+            // deliberately out-of-scope gap, filed as #2362. Asymmetric with
+            // the array arm below on purpose: real yq's own array indexing
+            // always tries to parse *any* key as an integer (the same
             // `strconv.ParseInt`-flavored "cannot index array with '<key>'"
             // wording #2333 already established), so a non-numeric key
             // there still raises in real yq too -- confirmed live, this is

@@ -20927,6 +20927,42 @@ fn test_2353_del_comma_grouped_wrong_kind_key_still_errors_residual_gap() -> Res
     Ok(())
 }
 
+/// #2353 review found this second, independent residual gap (scope expanded
+/// on #2362): a *computed* index against an object -- `.[5+0]`, `5 as $i |
+/// .[$i]`, or a literal `null`/`true`/`false` key (only a bare integer
+/// literal gets the `Expr::Index` shorthand this issue's own fix touches;
+/// anything else, including those literals, is `Expr::IndexExpr`) --
+/// resolves through `resolve_index_expr`/`key_to_path_component`, generic
+/// path-resolution machinery shared by every path-consuming builtin
+/// (`path()`, every assignment operator, and `del()` alike), not through
+/// any of this issue's fixed `delete_*` functions. Real yq no-ops all of
+/// these against an object (confirmed live against v4.53.3); succinctly
+/// still raises. Pinning the current (unfixed) behavior rather than
+/// leaving it untested -- see #2362 for why a blanket fix there risks
+/// regressing assignment's own, different "stringify the key" divergence.
+#[test]
+fn test_2353_del_computed_index_wrong_kind_key_still_errors_residual_gap() -> Result<()> {
+    let (_out, code) = run_yq_stdin("del(.[5+0])", r#"{"a":1}"#, &["-o=json", "-I=0"])?;
+    assert_eq!(
+        code, 1,
+        "residual gap: computed-arithmetic index still errors"
+    );
+
+    let (_out, code) = run_yq_stdin("5 as $i | del(.[$i])", r#"{"a":1}"#, &["-o=json", "-I=0"])?;
+    assert_eq!(
+        code, 1,
+        "residual gap: computed-variable index still errors"
+    );
+
+    let (_out, code) = run_yq_stdin("del(.[null])", r#"{"a":1}"#, &["-o=json", "-I=0"])?;
+    assert_eq!(
+        code, 1,
+        "residual gap: literal null key (IndexExpr) still errors"
+    );
+
+    Ok(())
+}
+
 /// #2353: an `Array` root with a wrong-kind key is *not* covered by the
 /// same rule -- real yq's own array indexing always tries to parse the key
 /// as an integer, so a string/null key there still raises (confirmed live
