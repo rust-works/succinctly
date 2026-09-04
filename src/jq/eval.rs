@@ -17992,55 +17992,96 @@ fn yq_del_slice_outcome(
 /// never reaches a field access at all, e.g. `del(.a[0:2][0])`) -- this
 /// function only intercepts the one sub-case that isn't inert.
 ///
+/// A `?` on the erroring step itself (`del(.a[0:2].x?)`, distinct from
+/// `del(...)`'s own outer `?` handled by every caller's `suppress_or_raise`)
+/// suppresses the error, same as `?` suppresses any other ordinary
+/// path-step error -- confirmed live (#2333 code review round 2, caught by
+/// a live A/B diff against `main`'s own pre-fix binary):
+/// `del(.a[0:2].x?)` on `{"a":[1,2,3]}` stays unchanged in real yq, but this
+/// function's own first draft raised regardless of the `?`.
+///
 /// `null` gets the identical error only when it is the *direct* target of
 /// the slice-run (`null | del(.[0:2].a)`) -- real yq's own null-as-array
 /// slice quirk has no actual elements behind it, so further navigation past
 /// that point falls through to the ordinary no-op instead (confirmed live:
-/// `null | del(.[0:2][0].a)` stays `null`). An `Array` target keeps the
-/// error live through arbitrarily deeper `Index` navigation, since real
-/// document data really is there to walk (confirmed live for
-/// `del(.a[0:2][0].x)`, both erroring when index 0 holds another array and
-/// staying a no-op when it holds a scalar or object).
+/// `null | del(.[0:2][0].a)` stays `null`). Modeled here by substituting an
+/// empty `Array` for a `Null` pre-slice value rather than special-casing it
+/// separately: an empty array slices to itself under any bounds, a trailing
+/// `Field` step on it hits the exact same "current is an `Array`" arm a real
+/// array does, and a trailing `Index` step on it always resolves
+/// out-of-bounds (`resolve_read_index` against `len() == 0`) and gives up --
+/// which is exactly "further navigation past that point falls through to
+/// the ordinary no-op." One walker, not two, for the same reason
+/// `yq_del_slice_outcome`'s own doc comment gives for not reusing
+/// `through_slice`: two hand-synchronized copies of "what a trailing
+/// `Field`/`Index` step does to a sliced value" is the "duplicated
+/// predicates diverge silently" shape (#106) this exact function's own
+/// multi-slice-run bug (below) was found to already be.
+///
+/// An `Array` target keeps the error live through arbitrarily deeper
+/// `Index` navigation, since real document data really is there to walk
+/// (confirmed live for `del(.a[0:2][0].x)`, both erroring when index 0
+/// holds another array and staying a no-op when it holds a scalar or
+/// object).
+///
+/// The slice-run this walks is the *maximal contiguous run ending at the
+/// last slice in `steps`* -- not just that one slice's own position (#2333
+/// code review, live-verified twice independently: `del(.a[0:2][1:3].x)`
+/// and `del(.a[0:4][0:2].x)` on `{"a":[1,2,3,4,5]}` both raise the same
+/// "cannot index array" error the single-slice case does, matching
+/// `yq_del_slice_outcome`'s own established "a run of any length collapses
+/// to the same target as one slice" rule -- computing `prefix` as only
+/// `steps[..last_slice_pos]` left an *earlier* slice in a multi-slice run
+/// unguarded, since `navigate_owned_value` has no `Expr::Slice` arm and
+/// silently gives up on one, misclassifying back to `Noop`). Every slice in
+/// the run is applied to the same real value in sequence, same as
+/// `yq_del_slice_outcome`'s own `DropParent` rewrite already does for its
+/// half of this rule.
 fn yq_del_slice_field_error(steps: &[DeleteStep], root: &OwnedValue) -> Option<EvalError> {
     let last_slice_pos = steps.iter().rposition(|s| s.component.is_slice())?;
-    let Expr::Slice { start, end, .. } = &steps[last_slice_pos].component else {
-        return None;
-    };
-    let prefix: Vec<Expr> = steps[..last_slice_pos]
+    let mut run_start = last_slice_pos;
+    while run_start > 0 && steps[run_start - 1].component.is_slice() {
+        run_start -= 1;
+    }
+    let prefix: Vec<Expr> = steps[..run_start]
         .iter()
         .map(|s| s.component.clone())
         .collect();
     let pre_slice_value = navigate_owned_value(root, &prefix)?;
-    let suffix = &steps[last_slice_pos + 1..];
 
-    if matches!(pre_slice_value, OwnedValue::Null) {
-        return match suffix {
-            [DeleteStep {
-                component: Expr::Field(name),
-                ..
-            }] => Some(EvalError::cannot_index_with_field("array", name)),
-            _ => None,
+    // Only `Array`/`Null` get this treatment -- `String` (#1219/#1321's own
+    // established no-op precedent) and anything else fall through
+    // unchanged, before ever applying a slice or walking the suffix.
+    let mut sliced = match pre_slice_value {
+        OwnedValue::Null => OwnedValue::Array(Vec::new()),
+        OwnedValue::Array(_) => pre_slice_value.clone(),
+        _ => return None,
+    };
+    for step in &steps[run_start..=last_slice_pos] {
+        let Expr::Slice { start, end, .. } = &step.component else {
+            unreachable!("every step in run_start..=last_slice_pos is_slice() by construction");
+        };
+        sliced = match slice_owned_value(&sliced, *start, *end, false) {
+            Ok(Some(v)) => v,
+            // `Array` always slices to `Ok(Some(_))` -- see
+            // `slice_owned_value`'s own match arm. Unreachable in practice,
+            // but falling through to the pre-existing no-op is the safe
+            // default if that ever changes.
+            _ => return None,
         };
     }
 
-    let OwnedValue::Array(_) = pre_slice_value else {
-        // Only `Array`/`Null` get this treatment -- `String` (#1219/#1321's
-        // own established no-op precedent) and anything else fall through
-        // unchanged.
-        return None;
-    };
-    let sliced = match slice_owned_value(pre_slice_value, *start, *end, false) {
-        Ok(Some(v)) => v,
-        // `Array` always slices to `Ok(Some(_))` -- see `slice_owned_value`'s
-        // own match arm. Unreachable in practice, but falling through to the
-        // pre-existing no-op is the safe default if that ever changes.
-        _ => return None,
-    };
-
     let mut current = &sliced;
-    for step in suffix {
+    for step in &steps[last_slice_pos + 1..] {
         match &step.component {
             Expr::Field(name) => match current {
+                // `step.optional` (a `?` *inside* the path, `del(.a[0:2].x?)`
+                // -- distinct from `del(...)`'s own outer `?`, handled by
+                // `suppress_or_raise` at every caller) suppresses just this
+                // one field access, same as `?` suppresses any other
+                // ordinary path-step error: confirmed live, real yq no-ops
+                // here rather than raising.
+                OwnedValue::Array(_) if step.optional => return None,
                 OwnedValue::Array(_) => {
                     return Some(EvalError::cannot_index_with_field("array", name))
                 }
