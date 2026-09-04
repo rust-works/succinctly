@@ -108,6 +108,25 @@ fn run_jq_stdin_with_stderr(
     Ok((stdout, stderr, exit_code))
 }
 
+/// jq-mode counterpart of `run_yq_stdin` -- #2338: `run_yq_stdin_with_stderr`
+/// already had a no-stderr sibling for yq mode; jq mode didn't, so every
+/// jq-mode test that doesn't need stderr paid for decoding and discarding it
+/// anyway via `run_jq_stdin_with_stderr`. See `run_yq_stdin`'s own #2016 doc
+/// comment above for why this can't be a hand-rolled `spawn()` +
+/// `write_all(...)?` + `wait_with_output()` sequence.
+fn run_jq_stdin(filter: &str, input: &str, extra_args: &[&str]) -> Result<(String, i32)> {
+    let (output, exit_code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_succinctly"));
+            command.arg("jq").args(extra_args).arg(filter);
+            command
+        },
+        Some(input.as_bytes()),
+    )?;
+    let stdout = String::from_utf8(output.stdout)?;
+    Ok((stdout, exit_code))
+}
+
 /// Helper to run yq command with file input
 fn run_yq_file(filter: &str, file_path: &str, extra_args: &[&str]) -> Result<(String, i32)> {
     let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
@@ -11518,7 +11537,7 @@ fn test_yq_last_of_an_empty_stream_is_null_1521() -> Result<()> {
 /// behavior either way -- a small in-range float still round-trips exactly.
 #[test]
 fn test_jq_mode_computed_float_formatting_unaffected_by_997() -> Result<()> {
-    let (out, _stderr, code) = run_jq_stdin_with_stderr(".a * 1", r#"{"a": 1.5}"#, &["-c"])?;
+    let (out, code) = run_jq_stdin(".a * 1", r#"{"a": 1.5}"#, &["-c"])?;
     assert_eq!(code, 0);
     assert_eq!(out.trim(), "1.5");
     Ok(())
@@ -17480,7 +17499,7 @@ fn test_yq_tostring_computed_float_within_threshold_stays_decimal_1054() -> Resu
 /// leaked from the yq-only branch into jq mode.
 #[test]
 fn test_jq_tostring_computed_float_unaffected_1054() -> Result<()> {
-    let (out, _stderr, code) = run_jq_stdin_with_stderr("(1e10 * 2) | tostring", "1", &["-r"])?;
+    let (out, code) = run_jq_stdin("(1e10 * 2) | tostring", "1", &["-r"])?;
     assert_eq!(code, 0);
     assert_eq!(out.trim_end(), "20000000000");
     Ok(())
@@ -18916,7 +18935,7 @@ fn test_slice_assign_through_field_after_slice_still_errors_1142() -> Result<()>
 /// splicing the write-through result into the array, matching real jq.
 #[test]
 fn test_slice_compound_add_array_target_jq_mode_unaffected_1142() -> Result<()> {
-    let (out, _stderr, code) = run_jq_stdin_with_stderr(".[0:2] += [99]", "[1,2,3]", &["-c"])?;
+    let (out, code) = run_jq_stdin(".[0:2] += [99]", "[1,2,3]", &["-c"])?;
     assert_eq!(code, 0);
     assert_eq!(out.trim(), "[1,2,99,3]");
     Ok(())
@@ -19855,7 +19874,7 @@ fn test_yq_base64d_container_stringifies_to_empty_1109() -> Result<()> {
 #[test]
 fn test_jq_urid_base64d_still_reject_non_string_1109() -> Result<()> {
     for filter in ["@urid", "@base64d"] {
-        let (_out, _stderr, code) = run_jq_stdin_with_stderr(filter, "42", &[])?;
+        let (_out, code) = run_jq_stdin(filter, "42", &[])?;
         assert_ne!(code, 0, "filter {filter:?} unexpectedly succeeded");
     }
     Ok(())
@@ -20058,7 +20077,7 @@ fn test_1197_add_builtin_inherits_right_null_gating_consistently() -> Result<()>
     assert_eq!(output.trim(), r#""a""#);
 
     // jq mode is unaffected -- `+`'s right-null rule stays unconditional.
-    let (output, _stderr, code) = run_jq_stdin_with_stderr("[7, null] | add", "null", &["-c"])?;
+    let (output, code) = run_jq_stdin("[7, null] | add", "null", &["-c"])?;
     assert_eq!(code, 0, "out: {output:?}");
     assert_eq!(output.trim(), "7");
 
@@ -20338,7 +20357,7 @@ fn test_1197_right_null_add_errors_for_number_bool_object() -> Result<()> {
 #[test]
 fn test_1197_right_null_add_unaffected_in_jq_mode() -> Result<()> {
     for (expr, expected) in [("7 + null", "7"), (r#"{"x":1} + null"#, r#"{"x":1}"#)] {
-        let (out, _stderr, code) = run_jq_stdin_with_stderr(expr, "null", &["-c"])?;
+        let (out, code) = run_jq_stdin(expr, "null", &["-c"])?;
         assert_eq!(code, 0, "expr {expr:?}: out {out:?}");
         assert_eq!(out.trim(), expected, "expr {expr:?}");
     }
@@ -22644,7 +22663,7 @@ fn test_yq_base64d_rejects_embedded_whitespace_1123() -> Result<()> {
 /// errors in jq 1.7.1).
 #[test]
 fn test_jq_base64d_does_not_trim_whitespace_1123() -> Result<()> {
-    let (_out, _stderr, code) = run_jq_stdin_with_stderr("@base64d", r#"" aGVsbG8=""#, &[])?;
+    let (_out, code) = run_jq_stdin("@base64d", r#"" aGVsbG8=""#, &[])?;
     assert_ne!(code, 0);
     Ok(())
 }
@@ -22968,7 +22987,7 @@ fn test_jq_base64d_invalid_trailing_byte_uses_invalid_data_message_1146() -> Res
 /// confirmed live).
 #[test]
 fn test_jq_base64d_invalid_utf8_is_lossy_not_error_1146() -> Result<()> {
-    let (out, _stderr, code) = run_jq_stdin_with_stderr("@base64d", "\"null\"", &[])?;
+    let (out, code) = run_jq_stdin("@base64d", "\"null\"", &[])?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "\"\u{fffd}\u{fffd}\"");
     Ok(())
@@ -22991,7 +23010,7 @@ fn test_jq_base64d_invalid_utf8_is_lossy_not_error_1146() -> Result<()> {
 /// own granularity" section for the full detail.
 #[test]
 fn test_jq_base64d_drops_trailing_byte_quirk_fixed_1717() -> Result<()> {
-    let (out, _stderr, code) = run_jq_stdin_with_stderr("@base64d | explode", "\"4UE=\"", &["-c"])?;
+    let (out, code) = run_jq_stdin("@base64d | explode", "\"4UE=\"", &["-c"])?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "[65533]");
     Ok(())
@@ -23009,7 +23028,7 @@ fn test_jq_base64d_drops_trailing_byte_quirk_fixed_1717() -> Result<()> {
 /// sweep against jq 1.7.1; independently re-verified live before fixing.
 #[test]
 fn test_jq_base64d_drops_whole_tail_when_one_byte_short_of_seq_len_1717() -> Result<()> {
-    let (out, _stderr, code) = run_jq_stdin_with_stderr("@base64d | explode", "\"8EFC\"", &["-c"])?;
+    let (out, code) = run_jq_stdin("@base64d | explode", "\"8EFC\"", &["-c"])?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "[65533]");
     Ok(())
@@ -23148,7 +23167,7 @@ fn test_jq_base64d_still_lenient_on_inputs_yq_now_rejects_1135() -> Result<()> {
         (r#""ab==cd""#, r#""i""#),
     ];
     for (input, expected) in cases {
-        let (out, _stderr, code) = run_jq_stdin_with_stderr("@base64d", input, &[])?;
+        let (out, code) = run_jq_stdin("@base64d", input, &[])?;
         assert_eq!(code, 0, "input={input} out: {out:?}");
         assert_eq!(out.trim(), *expected, "input={input}");
     }
@@ -23159,7 +23178,7 @@ fn test_jq_base64d_still_lenient_on_inputs_yq_now_rejects_1135() -> Result<()> {
 /// like `%FF`) previously had no regression test either.
 #[test]
 fn test_jq_urid_invalid_utf8_after_percent_decode_is_lossy_1146() -> Result<()> {
-    let (out, _stderr, code) = run_jq_stdin_with_stderr("@urid", "\"%FF\"", &[])?;
+    let (out, code) = run_jq_stdin("@urid", "\"%FF\"", &[])?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "\"\u{fffd}\"");
     Ok(())
@@ -25160,13 +25179,13 @@ fn test_yq_iterate_adjacent_builtins_reject_object_unlike_jq_1901() -> Result<()
     // values" semantics; group_by/unique/unique_by hit jq's own
     // object-vs-array pairing bug (#995); from_entries hits its own,
     // unrelated indexing error.
-    let (out, _stderr, code) = run_jq_stdin_with_stderr("any", doc, &["-c"])?;
+    let (out, code) = run_jq_stdin("any", doc, &["-c"])?;
     assert_eq!(code, 0);
     assert_eq!(out.trim(), "true");
-    let (out, _stderr, code) = run_jq_stdin_with_stderr("all", doc, &["-c"])?;
+    let (out, code) = run_jq_stdin("all", doc, &["-c"])?;
     assert_eq!(code, 0);
     assert_eq!(out.trim(), "true");
-    let (out, _stderr, code) = run_jq_stdin_with_stderr("flatten", doc, &["-c"])?;
+    let (out, code) = run_jq_stdin("flatten", doc, &["-c"])?;
     assert_eq!(code, 0);
     assert_eq!(out.trim(), "[3,1]");
     for filter in ["group_by(.)", "unique", "unique_by(.)"] {
