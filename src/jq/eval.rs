@@ -1963,6 +1963,60 @@ fn resolve_terminal_prefix<W: Clone + AsRef<[u64]>>(
     }
 }
 
+/// Rank a candidate for an index expression's single "pending key-stream
+/// control" slot, per [`prefer_pending_control`]'s documented order: `Halt`
+/// outranks `Error`/`Break`, and any of them outranks nothing pending at all.
+fn pending_control_rank(control: Option<&Control>) -> u8 {
+    match control {
+        Some(Control::Halt(_)) => 2,
+        Some(Control::Error(_) | Control::Break(_)) => 1,
+        None => 0,
+    }
+}
+
+/// The one definition of `E[K]`'s pending-key-stream-control priority rule
+/// (#2381): an already-pending `Halt` outranks a deferred key-stream
+/// `Error`/`Break`, and both outrank nothing pending at all. Returns whichever
+/// of `pending` and `candidate` wins that order.
+///
+/// Both [`eval_index_expr`] and its [`eval_generic`](super::eval_generic)
+/// twin used to carry a `pending_halt: Option<i32>` *beside* a
+/// `pending_key_stream_control: Option<Control>` and re-derive this ordering
+/// by hand where the two were finally resolved -- a 3-arm tuple match in this
+/// file, two sequential `if let`s in the other -- with only a comment
+/// asserting that the pair was mutually exclusive. `Control` already has a
+/// `Halt(i32)` variant, so the pair collapses into a single
+/// `pending_control: Option<Control>`: the exclusivity becomes structural (one
+/// slot cannot hold two controls), and the ordering moves off the resolution
+/// sites -- which now just `match pending_control` -- onto the *assignment*
+/// site, where this function is the only thing that decides it. A future arm
+/// that records a second candidate therefore cannot let an `Error` quietly
+/// clobber a `Halt`, which is exactly the invariant the old comment could only
+/// assert.
+///
+/// Equal rank keeps the incumbent: a single `Partial` carries exactly one
+/// `Control`, so today's key-stream match never offers a second candidate at
+/// all, and keeping the first-observed one is the conservative reading of the
+/// "earliest signal wins" rule [`resolve_terminal_prefix`] already documents.
+///
+/// Deliberately *not* the rule for a secondary promotion failure --
+/// [`resolve_terminal_prefix`]'s own `Err` arm, and `escape_generic!`/
+/// `ensure_owned!` in [`eval_generic`](super::eval_generic). There a fresh
+/// decode error raised while *rendering the prefix* replaces a held
+/// `Error`/`Break` and only a `Halt` survives it, which is a different
+/// question (which control to report when reporting itself fails) with a
+/// different answer, so those sites are not routed through here.
+pub(crate) fn prefer_pending_control(
+    pending: Option<Control>,
+    candidate: Control,
+) -> Option<Control> {
+    if pending_control_rank(pending.as_ref()) >= pending_control_rank(Some(&candidate)) {
+        pending
+    } else {
+        Some(candidate)
+    }
+}
+
 /// Collapse a `Vec<T>` accumulator into the smallest shape representing it:
 /// empty calls `none`, exactly one calls `one` with that value, more than one
 /// calls `many` with the whole vec. The one definition every
@@ -16763,19 +16817,25 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     // (3) Keys first: an empty key stream must not evaluate the target.
     //
-    // `pending_halt` carries a halt that arrived after some keys were
-    // already produced (`.[(1,2,halt)]`) — unlike `Error`/`Break`, which stay
-    // conservative (see the comment below), a halt's already-produced keys
-    // still owe real jq's output before the process exits: real jq's
-    // key-outer/target-inner generator model (see this function's own outer
-    // doc comment) evaluates `target` once per key already yielded before
-    // the key generator halts on its *next* attempt, so those keys' indexed
-    // output must still reach stdout (#791).
-    let mut pending_halt = None;
-    // #2326: mutually exclusive with `pending_halt` -- a single `Partial`
-    // result carries exactly one `Control` variant, so at most one of the
-    // two is ever set.
-    let mut pending_key_stream_control: Option<Control> = None;
+    // `pending_control` carries the key stream's own escape when it arrived
+    // after some keys were already produced (`.[(1,2,halt)]`,
+    // `.[(1,2,error("boom"))]`). A `Halt` is the reason the slot exists:
+    // unlike `Error`/`Break`, which stay conservative in yq mode (see the
+    // arms below), a halt's already-produced keys still owe real jq's output
+    // before the process exits -- real jq's key-outer/target-inner generator
+    // model (see this function's own outer doc comment) evaluates `target`
+    // once per key already yielded before the key generator halts on its
+    // *next* attempt, so those keys' indexed output must still reach stdout
+    // (#791).
+    //
+    // #2381: one `Option<Control>` slot, not the `pending_halt: Option<i32>`
+    // plus `pending_key_stream_control: Option<Control>` pair this used to
+    // be -- `Control` already has a `Halt(i32)` variant, so their mutual
+    // exclusivity is structural now rather than asserted by a comment, and
+    // every write goes through the shared `prefer_pending_control` ordering
+    // (`Halt` > `Error`/`Break` > nothing) that `eval_generic`'s twin uses
+    // too.
+    let mut pending_control: Option<Control> = None;
     let keys = match eval_single::<W, S>(key, value.clone(), false).materialize_cursor() {
         // STYLE-0012: the key generator is evaluated with a hardcoded
         // `optional: false` just above, deliberately: `.[k]?` suppresses only its
@@ -16818,11 +16878,11 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // (confirmed live, `.[(1,error("x"))]` in yq mode shows no `20`),
         // so yq mode keeps the pre-existing conservative discard below.
         QueryResult::Partial(vs, Control::Error(e)) if S::TAG != EvalTag::Yq => {
-            pending_key_stream_control = Some(Control::Error(e));
+            pending_control = prefer_pending_control(pending_control, Control::Error(e));
             vs
         }
         QueryResult::Partial(vs, Control::Break(label)) if S::TAG != EvalTag::Yq => {
-            pending_key_stream_control = Some(Control::Break(label));
+            pending_control = prefer_pending_control(pending_control, Control::Break(label));
             vs
         }
         // Computed indexing's key/target forking isn't part of #400/#494's
@@ -16832,14 +16892,13 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
         QueryResult::Partial(_, Control::Break(label)) => return QueryResult::Break(label),
         QueryResult::Partial(vs, Control::Halt(code)) => {
-            pending_halt = Some(code);
+            pending_control = prefer_pending_control(pending_control, Control::Halt(code));
             vs
         }
     };
     if keys.is_empty() {
         // `partial`'s invariant (a non-empty prefix by construction) means
-        // this is only reachable with `pending_halt`/`pending_key_stream_control`
-        // both unset.
+        // this is only reachable with `pending_control` unset.
         return QueryResult::None;
     }
 
@@ -17102,23 +17161,26 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
     }
 
-    match (pending_halt, pending_key_stream_control) {
-        // Same #1897 fix the old code already applied here.
-        (Some(code), _) => {
-            let (prefix, control) =
-                resolve_terminal_prefix(borrowed, owned, Vec::new(), Control::Halt(code));
-            partial(prefix, control)
-        }
-        // #2326: the key stream's own escape, deferred until every
-        // already-produced key finished indexing cleanly -- an indexing
-        // failure on one of those keys outranks it (escapes earlier, via
-        // `escape_with_prefix!` inside the loop above), matching #2226's
-        // own documented priority for the symmetric target-side case.
-        (None, Some(control)) => {
+    // #2326: the key stream's own escape, deferred until every
+    // already-produced key finished indexing cleanly -- an indexing failure
+    // on one of those keys outranks it (escapes earlier, via
+    // `escape_with_prefix!` inside the loop above), matching #2226's own
+    // documented priority for the symmetric target-side case. #1897's fix
+    // (fold the running prefix in rather than dropping it) applies to every
+    // held control here, `Halt` included; `resolve_terminal_prefix` is where
+    // the two still differ, on what a *promotion* failure does to the held
+    // control.
+    //
+    // #2381: a plain two-arm match now that `pending_control` is one slot --
+    // the `Halt`-outranks-`Error`/`Break` ordering this used to re-derive as
+    // a 3-arm tuple match lives in `prefer_pending_control`, at the writes
+    // above.
+    match pending_control {
+        Some(control) => {
             let (prefix, control) = resolve_terminal_prefix(borrowed, owned, Vec::new(), control);
             partial(prefix, control)
         }
-        (None, None) => match owned {
+        None => match owned {
             Some(vs) => owned_vec_to_result(vs),
             None => borrowed_vec_to_result(borrowed),
         },
@@ -54284,6 +54346,81 @@ mod tests {
                 ]);
                 assert!(e.message.contains("integers"), "{}", e.message);
             }
+        );
+    }
+
+    /// #2381: the priority rule itself, pinned once rather than only
+    /// through each call site's own end-to-end regression test.
+    ///
+    /// `prefer_pending_control` is the single definition both
+    /// `eval_index_expr`s (this file's and `eval_generic.rs`'s) write their
+    /// `pending_control` slot through, replacing the hand-copied
+    /// `pending_halt`/`pending_key_stream_control` tuple match / sequential
+    /// `if let` pair. The order it encodes -- `Halt` > `Error`/`Break` >
+    /// nothing pending -- is unreachable from either call site today (a
+    /// single `Partial` carries exactly one `Control`, so no arm ever offers
+    /// a second candidate), which is precisely why it needs its own test:
+    /// the behavioural tests that cover those sites cannot distinguish this
+    /// ordering from any other, and the invariant they rely on used to be a
+    /// comment.
+    #[test]
+    fn prefer_pending_control_orders_halt_over_error_break_over_none_2381() {
+        /// Collapses a slot to a comparable tag, so the assertions read as
+        /// the ordering table they are (`Control` is not `PartialEq`).
+        fn tag(slot: &Option<Control>) -> String {
+            match slot {
+                None => "none".to_string(),
+                Some(Control::Halt(code)) => format!("halt({code})"),
+                Some(Control::Error(e)) => format!("error({})", e.message),
+                Some(Control::Break(label)) => format!("break({label})"),
+            }
+        }
+        let err = || Control::Error(EvalError::new("first"));
+        let brk = || Control::Break("first".to_string());
+
+        // Anything outranks nothing pending.
+        for candidate in [err(), brk(), Control::Halt(3)] {
+            let expected = tag(&Some(candidate.clone()));
+            assert_eq!(tag(&prefer_pending_control(None, candidate)), expected);
+        }
+
+        // A pending `Halt` outranks a later `Error`/`Break`...
+        for candidate in [err(), brk()] {
+            assert_eq!(
+                tag(&prefer_pending_control(Some(Control::Halt(3)), candidate)),
+                "halt(3)"
+            );
+        }
+        // ...and symmetrically, a `Halt` candidate outranks a pending
+        // `Error`/`Break`.
+        for pending in [err(), brk()] {
+            assert_eq!(
+                tag(&prefer_pending_control(Some(pending), Control::Halt(3))),
+                "halt(3)"
+            );
+        }
+
+        // Equal rank keeps the incumbent: the earliest signal wins, matching
+        // `resolve_terminal_prefix`'s own "earliest error wins" rule.
+        for pending in [err(), brk()] {
+            let expected = tag(&Some(pending.clone()));
+            for candidate in [
+                Control::Error(EvalError::new("second")),
+                Control::Break("second".to_string()),
+            ] {
+                assert_eq!(
+                    tag(&prefer_pending_control(Some(pending.clone()), candidate)),
+                    expected
+                );
+            }
+        }
+        // Two halts likewise keep the first.
+        assert_eq!(
+            tag(&prefer_pending_control(
+                Some(Control::Halt(3)),
+                Control::Halt(9)
+            )),
+            "halt(3)"
         );
     }
 

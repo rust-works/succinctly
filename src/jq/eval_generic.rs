@@ -43,10 +43,10 @@ use super::eval::{
     has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
     index_one_owned as index_owned_by_key, is_pure_chain_link, is_retryable_stop, literal_to_owned,
     needs_path_context, numeric_key_to_array_index, numeric_key_to_index, owned_bound_to_i64,
-    owned_to_string, slice_object_as_yq_children, slice_owned_value_read, substitute_bound_var,
-    substitute_vars, suppresses, tonumber_from_str, vec_with_capacity, yq_negative_index_check,
-    Control, Demand, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail,
-    QueryResult, YqSemantics,
+    owned_to_string, prefer_pending_control, slice_object_as_yq_children, slice_owned_value_read,
+    substitute_bound_var, substitute_vars, suppresses, tonumber_from_str, vec_with_capacity,
+    yq_negative_index_check, Control, Demand, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics,
+    LimitN, PathTrail, QueryResult, YqSemantics,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -501,8 +501,8 @@ pub fn to_owned_all_cursors<'a, C: DocumentCursor + 'a>(
 /// the first `Err`, which is fine for a caller with nothing of its own to
 /// lose, but wrong for one folding this conversion's result into an
 /// already-running prefix (`eval_index_expr`'s own `Partial`-folding uses --
-/// `escape_generic!`, `ensure_owned!` (#2340), the `pending_halt` and
-/// `pending_key_stream_control` finalizers, and the target `Partial` arm's
+/// `escape_generic!`, `ensure_owned!` (#2340), the `pending_control`
+/// finalizer (#2381), and the target `Partial` arm's
 /// own promotion -- its callers so far). Mirrors `eval.rs`'s
 /// `promote_borrowed_checked` (#1897) -- the same fix, and the same `&[C]`
 /// (not a generic `IntoIterator`) so `cursors.len()` is available to
@@ -8276,19 +8276,23 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
 ) -> GenericResult<V> {
     // Keys first: an empty key stream must not evaluate the target at all.
     //
-    // `pending_halt` carries a halt that arrived after some keys were
-    // already produced (`.[(1,2,halt)]`) — unlike `Error`/`Break`, which stay
-    // conservative (see the comment on the `Partial` arm below), a halt's
-    // already-produced keys still owe real jq's output before the process
-    // exits: real jq's key-outer/target-inner generator model (see
-    // `eval::eval_index_expr`'s doc comment) evaluates `target` once per key
-    // already yielded before the key generator halts on its *next* attempt,
-    // so those keys' indexed output must still reach stdout (#791).
-    let mut pending_halt: Option<i32> = None;
-    // #2326: mutually exclusive with `pending_halt` -- a single `Partial`
-    // result carries exactly one `Control` variant, so at most one of the
-    // two is ever set.
-    let mut pending_key_stream_control: Option<Control> = None;
+    // `pending_control` carries the key stream's own escape when it arrived
+    // after some keys were already produced (`.[(1,2,halt)]`,
+    // `.[(1,2,error("boom"))]`). A `Halt` is the reason the slot exists:
+    // unlike `Error`/`Break`, which stay conservative in yq mode (see the
+    // `Partial` arms below), a halt's already-produced keys still owe real
+    // jq's output before the process exits -- real jq's key-outer/
+    // target-inner generator model (see `eval::eval_index_expr`'s doc
+    // comment) evaluates `target` once per key already yielded before the key
+    // generator halts on its *next* attempt, so those keys' indexed output
+    // must still reach stdout (#791).
+    //
+    // #2381: one `Option<Control>` slot, not the `pending_halt: Option<i32>`
+    // plus `pending_key_stream_control: Option<Control>` pair this used to
+    // be -- see `eval::prefer_pending_control`, the shared definition of the
+    // `Halt` > `Error`/`Break` > nothing ordering both this function and
+    // `eval::eval_index_expr` write through.
+    let mut pending_control: Option<Control> = None;
     let keys = match eval_single::<S, V>(key, value.clone(), false, cursor) {
         GenericResult::Error(e) => return GenericResult::Error(e),
         GenericResult::Break(label) => return GenericResult::Break(label),
@@ -8311,11 +8315,11 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         // (confirmed live, `.[(1,error("x"))]` in yq mode shows no `20`),
         // so yq mode keeps the pre-existing conservative discard below.
         GenericResult::Partial(vs, Control::Error(e)) if S::TAG != EvalTag::Yq => {
-            pending_key_stream_control = Some(Control::Error(e));
+            pending_control = prefer_pending_control(pending_control, Control::Error(e));
             vs
         }
         GenericResult::Partial(vs, Control::Break(label)) if S::TAG != EvalTag::Yq => {
-            pending_key_stream_control = Some(Control::Break(label));
+            pending_control = prefer_pending_control(pending_control, Control::Break(label));
             vs
         }
         // A `Partial`'s trailing control must abort here too, not silently
@@ -8324,12 +8328,12 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         // verified semantics for `Error`/`Break` — conservatively matching
         // those arms rather than inventing new partial-key behavior for
         // them. `Halt` is different: its prefix is kept and threaded through
-        // as `pending_halt` instead of discarded, per the comment above.
+        // as `pending_control` instead of discarded, per the comment above.
         // (yq mode, and any future non-jq/yq semantics, still take these.)
         GenericResult::Partial(_, Control::Error(e)) => return GenericResult::Error(e),
         GenericResult::Partial(_, Control::Break(label)) => return GenericResult::Break(label),
         GenericResult::Partial(vs, Control::Halt(code)) => {
-            pending_halt = Some(code);
+            pending_control = prefer_pending_control(pending_control, Control::Halt(code));
             vs
         }
         // STYLE-0012: these four materialize the *key* generator's outputs,
@@ -8357,8 +8361,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
     };
     if keys.is_empty() {
         // `partial_generic`'s invariant (a non-empty prefix by construction)
-        // means this is only reachable with `pending_halt`/
-        // `pending_key_stream_control` both unset.
+        // means this is only reachable with `pending_control` unset.
         return GenericResult::None;
     }
 
@@ -8427,7 +8430,8 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
     // `cursors` prefix (the #2145 gap `escape_generic!` already closed for
     // its own promotion) but also silently replacing whatever this
     // function's own keys-evaluation phase had already queued in
-    // `pending_halt`/`pending_key_stream_control`. Now uses the same
+    // `pending_control` (#2381; then a `pending_halt`/
+    // `pending_key_stream_control` pair). Now uses the same
     // prefix-preserving `to_owned_all_cursors_checked` and Halt-survives/
     // Error-Break-downgrades priority `escape_generic!` above already
     // establishes for this identical cursors -> owned conversion: an
@@ -8440,8 +8444,8 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
     // few lines below ("a later key's own event outranks an earlier still-
     // pending halt", live-verified via `{"a":1} | .[("a", 5, halt)]`) and
     // to `eval.rs`'s analogous promotion site (which also never consults
-    // `pending_halt`) -- on the theory that the combined scenario (a
-    // `pending_halt` plus an independently-undecodable cursor still in
+    // `pending_control`) -- on the theory that the combined scenario (a
+    // pending `Halt` plus an independently-undecodable cursor still in
     // `cursors`) was unreachable, since evaluating `halt` bridges through
     // `bridge_to_full_evaluator`, which eagerly materializes the whole `.`
     // value first and so would already have surfaced any undecodable
@@ -8452,7 +8456,8 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
     // of the current `.` narrowing. Confirmed live (debug probe): `.a |
     // at_offset(N)[("found","missing",halt)]` against `{"a":1,"corrupt":
     // {"found":"<invalid-utf8>","other":2}}`, where `N` points at
-    // `"corrupt"`'s value, reaches this arm with `pending_halt = Some(0)`
+    // `"corrupt"`'s value, reaches this arm with
+    // `pending_control = Some(Control::Halt(0))`
     // -- `halt`'s bridge only materializes the clean `.a`, while
     // `at_offset` hands `cursors` a pointer into the untouched, corrupt
     // sibling. So the "later key's own event" rule doesn't apply here:
@@ -8469,9 +8474,19 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                 owned = match to_owned_all_cursors_checked(&cursors) {
                     Ok(vs) => vs,
                     Err((prefix, e)) => {
-                        let control = match pending_halt {
-                            Some(code) => Control::Halt(code),
-                            None => Control::Error(e),
+                        // #2381: matched by reference, and deliberately not
+                        // routed through `prefer_pending_control` -- this is
+                        // the *secondary promotion failure* rule
+                        // (`escape_generic!` above, `resolve_terminal_prefix`
+                        // in `eval.rs`), where a pending `Error`/`Break` is
+                        // replaced by this decode failure and only a `Halt`
+                        // survives it. `prefer_pending_control` answers the
+                        // other question -- which key-stream escape to hold
+                        // in the first place -- and keeps the incumbent at
+                        // equal rank, which would be wrong here.
+                        let control = match &pending_control {
+                            Some(Control::Halt(code)) => Control::Halt(*code),
+                            Some(Control::Error(_) | Control::Break(_)) | None => Control::Error(e),
                         };
                         return partial_generic(prefix, control);
                     }
@@ -8733,81 +8748,66 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         }
     }
 
-    if let Some(code) = pending_halt {
-        // Known fidelity gap, same family as #631: `GenericResult::Partial`
-        // is `Vec<OwnedValue>`, so a cursor prefix has to go through
-        // `to_owned()` here — which collapses duplicate YAML mapping keys
-        // that streaming the cursors directly (the no-halt path below)
-        // preserves. `.[(0,1)]` on a document with a duplicate-keyed element
-        // keeps both keys; `.[(0,1,halt)]` on the same document silently
-        // loses one, because appending `halt` routes the same prefix through
-        // this arm instead. Fixing it for real needs `Partial` itself to
-        // carry cursors, not just owned values — the same rework #631 is
-        // already deferred on — so this only documents the trade-off rather
-        // than papering over it.
-        // #2145: uses the prefix-preserving `to_owned_all_cursors_checked`
-        // instead of `owned_or_err!(to_owned_all_cursors(&cursors))` -- the
-        // latter bare-returns `GenericResult::Error` on a decode failure
-        // here, discarding the accumulated prefix *and* silently downgrading
-        // this arm's own already-uncatchable `Control::Halt(code)` into a
-        // catchable decode error (worse than the `escape_generic!` gap this
-        // issue's own fix closed one block above: there the held `control`
-        // at least survived). The control here is always `Halt` by
-        // construction (this whole block only runs when `pending_halt` is
-        // `Some`), so a promotion failure can only ever keep it, matching
-        // `resolve_terminal_prefix`'s and `escape_generic!`'s own
-        // "Halt survives a promotion failure" rule -- the decode error
-        // itself is discarded, same as those two.
-        //
-        // Not live-repro-tested (review): reaching this arm needs `halt` to
-        // appear in the *key* stream (`.[(1,halt)]`) alongside undecodable
-        // content elsewhere in the same document, but `Builtin::Halt`'s own
-        // evaluation (confirmed live via a debug probe) falls through
-        // `eval_single`'s native dispatch to `bridge_to_full_evaluator`,
-        // which materializes the *entire* document up front -- so any
-        // undecodable content anywhere in it surfaces there first, as the
-        // key stream's own `Partial(_, Control::Error(_))` collapse a few
-        // lines above (the `#2326`-tracked "key stream discards its own
-        // prefix" gap), before `pending_halt` is ever set. Kept for the
-        // same defensive, future-proofing reason `resolve_terminal_prefix`
-        // keeps its own identical handling.
-        let out = if any_owned {
-            owned
-        } else {
-            // STYLE-0012: a `Halt` is already in flight and takes precedence; this
-            // arm deliberately discards the conversion error (`Err((prefix, _))`)
-            // rather than raising or suppressing it -- see the comment above.
-            match to_owned_all_cursors_checked(&cursors) {
-                Ok(vs) => vs,
-                Err((prefix, _)) => prefix,
-            }
-        };
-        return partial_generic(out, Control::Halt(code));
-    }
-
     // #2326: the key stream's own escape, deferred until every already-
     // produced key finished indexing cleanly -- an indexing failure on one
     // of those keys outranks it (escapes earlier, via `escape_generic!`
     // inside the loop above), matching #2226's own documented priority for
     // the symmetric target-side case.
     //
-    // #2326 review: uses the same prefix-preserving `to_owned_all_cursors_checked`
-    // (and the same Halt-survives/Error-Break-downgrades secondary-failure
-    // rule) `escape_generic!` and the `pending_halt` block above both
-    // already establish -- the plain `owned_or_err!(to_owned_all_cursors(...))`
-    // this arm originally used would discard the whole already-indexed
-    // prefix and silently replace `control`'s own message with an unrelated
-    // decode-failure one on a secondary conversion failure, unlike every
-    // other escape path in this function.
-    if let Some(control) = pending_key_stream_control {
+    // #2381: one block, not the `pending_halt` block followed by a
+    // `pending_key_stream_control` one this used to be. Their bodies already
+    // agreed -- the `Halt` copy's `Err((prefix, _)) => prefix` is what the
+    // shared `Halt`-survives/`Error`-`Break`-downgrades arm below computes
+    // for a `Control::Halt` -- and the sequencing that expressed "a pending
+    // `Halt` outranks a deferred key-stream `Error`/`Break`" now lives in
+    // `eval::prefer_pending_control`, at the writes to `pending_control`.
+    //
+    // Known fidelity gap for the `Halt` case, same family as #631:
+    // `GenericResult::Partial` is `Vec<OwnedValue>`, so a cursor prefix has
+    // to go through `to_owned()` here — which collapses duplicate YAML
+    // mapping keys that streaming the cursors directly (the no-escape path
+    // below) preserves. `.[(0,1)]` on a document with a duplicate-keyed
+    // element keeps both keys; `.[(0,1,halt)]` on the same document silently
+    // loses one, because appending `halt` routes the same prefix through
+    // this block instead. Fixing it for real needs `Partial` itself to carry
+    // cursors, not just owned values — the same rework #631 is already
+    // deferred on — so this only documents the trade-off rather than
+    // papering over it.
+    //
+    // #2145/#2326 review: uses the prefix-preserving
+    // `to_owned_all_cursors_checked` instead of
+    // `owned_or_err!(to_owned_all_cursors(&cursors))` -- the latter
+    // bare-returns `GenericResult::Error` on a decode failure here,
+    // discarding the accumulated prefix *and* silently replacing the held
+    // control (for a `Halt`, downgrading an already-uncatchable exit into a
+    // catchable decode error) with an unrelated decode-failure message. The
+    // secondary-failure rule applied instead is the one `escape_generic!`
+    // and `eval.rs`'s `resolve_terminal_prefix` already establish: a `Halt`
+    // survives and the decode error is discarded, an `Error`/`Break`
+    // downgrades to it.
+    //
+    // The `Halt`-plus-undecodable-cursor combination is not live-repro-tested
+    // (review): reaching it needs `halt` to appear in the *key* stream
+    // (`.[(1,halt)]`) alongside undecodable content elsewhere in the same
+    // document, but `Builtin::Halt`'s own evaluation (confirmed live via a
+    // debug probe) falls through `eval_single`'s native dispatch to
+    // `bridge_to_full_evaluator`, which materializes the *entire* document up
+    // front -- so any undecodable content anywhere in it surfaces there
+    // first, as the key stream's own `Partial(_, Control::Error(_))` collapse
+    // a few lines above (the `#2326`-tracked "key stream discards its own
+    // prefix" gap), before `pending_control` is ever set. Kept for the same
+    // defensive, future-proofing reason `resolve_terminal_prefix` keeps its
+    // own identical handling.
+    if let Some(control) = pending_control {
         let out = if any_owned {
             owned
         } else {
-            // STYLE-0012: prefix-preserving by design, per the #2326 review
-            // comment just above -- the error rides out on a `Partial` whose
-            // prefix must survive, so the `eval_try`/`Expr::Optional` boundary
-            // suppresses it, not this site. Same reasoning as the
-            // `escape_generic!` and `pending_halt` arms this one mirrors.
+            // STYLE-0012: prefix-preserving by design, per the review comment
+            // just above -- an `Error` rides out on a `Partial` whose prefix
+            // must survive, so the `eval_try`/`Expr::Optional` boundary
+            // suppresses it, not this site; a `Halt` deliberately discards the
+            // conversion error rather than raising or suppressing it. Same
+            // reasoning as the `escape_generic!` arm this one mirrors.
             match to_owned_all_cursors_checked(&cursors) {
                 Ok(vs) => vs,
                 Err((prefix, e)) => {
@@ -17814,7 +17814,7 @@ mod tests {
 
     /// #2340 review round 2: an earlier fix attempt replaced `ensure_owned!`'s
     /// Halt-survives priority with an unconditional `Control::Error(e)`,
-    /// reasoning that a `pending_halt` and an independently-undecodable
+    /// reasoning that a pending `Halt` and an independently-undecodable
     /// `cursors` entry could never coexist -- since evaluating `halt`
     /// bridges through `bridge_to_full_evaluator`, which eagerly
     /// materializes the whole `.` value first, so any undecodable content
@@ -17825,7 +17825,7 @@ mod tests {
     /// narrowing (`eval.rs` cannot reach this: its own `at_offset`/
     /// `at_position` unconditionally return an error, so this is
     /// `eval_generic.rs`-only). `.a` is a clean scalar, so `halt`'s bridge
-    /// materializes it trivially and `pending_halt` gets set; `at_offset`
+    /// materializes it trivially and `pending_control` gets set; `at_offset`
     /// then jumps straight to the untouched, corrupt `corrupt.found` field,
     /// which `ensure_owned!` only discovers later, while processing key
     /// `"missing"`. `cursors` holds only that one undecodable entry (no
