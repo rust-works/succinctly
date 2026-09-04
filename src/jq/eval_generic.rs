@@ -8576,11 +8576,29 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
     // of those keys outranks it (escapes earlier, via `escape_generic!`
     // inside the loop above), matching #2226's own documented priority for
     // the symmetric target-side case.
+    //
+    // #2326 review: uses the same prefix-preserving `to_owned_all_cursors_checked`
+    // (and the same Halt-survives/Error-Break-downgrades secondary-failure
+    // rule) `escape_generic!` and the `pending_halt` block above both
+    // already establish -- the plain `owned_or_err!(to_owned_all_cursors(...))`
+    // this arm originally used would discard the whole already-indexed
+    // prefix and silently replace `control`'s own message with an unrelated
+    // decode-failure one on a secondary conversion failure, unlike every
+    // other escape path in this function.
     if let Some(control) = pending_key_stream_control {
         let out = if any_owned {
             owned
         } else {
-            owned_or_err!(to_owned_all_cursors(&cursors))
+            match to_owned_all_cursors_checked(&cursors) {
+                Ok(vs) => vs,
+                Err((prefix, e)) => {
+                    let control = match control {
+                        Control::Halt(code) => Control::Halt(code),
+                        Control::Error(_) | Control::Break(_) => Control::Error(e),
+                    };
+                    return partial_generic(prefix, control);
+                }
+            }
         };
         return partial_generic(out, control);
     }
