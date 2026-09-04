@@ -2499,17 +2499,18 @@ node and falls through to the eager evaluator instead, so it does *not* get the 
 raises exactly like real jq does for both spellings:
 
 ```
-$ echo '[1,2,3]' > /tmp/a.json
-$ succinctly jq -c 'map(if . > 1 then error("boom") else . end) | .[0]'   /tmp/a.json   # 1, exit 0
-$ succinctly jq -c 'map(if . > 1 then error("boom") else . end) | .[0.0]' /tmp/a.json   # error, exit 5
-$ jq          -c 'map(if . > 1 then error("boom") else . end) | .[0]'   /tmp/a.json     # error, exit 5 (both spellings)
+$ echo '[1,2,3]' | succinctly jq -c 'map(if . > 1 then error("boom") else . end) | .[0]'   # 1, exit 0
+$ echo '[1,2,3]' | succinctly jq -c 'map(if . > 1 then error("boom") else . end) | .[0.0]' # error, exit 5
+$ echo '[1,2,3]' | jq          -c 'map(if . > 1 then error("boom") else . end) | .[0]'     # error, exit 5 (both spellings)
 ```
 
 `.[0]` and `.[0.0]` are equivalent everywhere else in this codebase -- that equivalence is
 the whole premise of #1088's spelling preservation, asserted for reading, `del`,
 `setpath`/`=`/`|=` and `getpath` by
 [`tests/jq_index_number_invariant_tests.rs`](../../../tests/jq_index_number_invariant_tests.rs)
--- this lazy-fold fast arm is the one place the spelling changes the answer. Left as-is
+-- this lazy-fold fast arm is the one place the spelling changes the answer. Pinned by
+[`test_lazy_seq_first_index_zero_vs_float_spelling_disagree_2174`](../../../tests/jq_cli_tests.rs).
+Left as-is
 rather than widened to also match `.[0.0]` ([#2174](https://github.com/rust-works/succinctly/issues/2174)):
 widening would make both spellings agree, but on the *divergent* side, spreading this
 limitation to a second spelling where ADR-0018 says matching jq is plainly possible instead

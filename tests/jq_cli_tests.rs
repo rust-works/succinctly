@@ -28420,6 +28420,31 @@ fn test_first_over_lazy_seq_iterate_skips_later_error_1565() -> Result<()> {
     Ok(())
 }
 
+/// #2174: `.[0]` and `.[0.0]` are equivalent everywhere else in this codebase
+/// (#1088's spelling preservation), but `eval_generic.rs`'s lazy-sequence
+/// fold keys its `#725` skip-the-rest fast arm off the literal AST shape
+/// `Expr::Index { idx: 0, key: None }` (#1401's own pinning comment), which
+/// only a bare integer-literal `.[0]` parses to -- `.[0.0]` falls through to
+/// the eager evaluator and raises exactly like real jq does for both
+/// spellings. Documented as an accepted, deliberate wrinkle on the already-
+/// accepted #725 divergence in `docs/compliance/jq/limitations.md`, pinned
+/// here so it stays a decision rather than drifting.
+#[test]
+fn test_lazy_seq_first_index_zero_vs_float_spelling_disagree_2174() -> Result<()> {
+    let filter = r#"map(if . > 1 then error("boom") else . end)"#;
+
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", &format!("{filter} | .[0]")], Some("[1,2,3]"))?;
+    assert_eq!((stdout.as_str(), code), ("1\n", 0), "stderr: {stderr}");
+
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", &format!("{filter} | .[0.0]")], Some("[1,2,3]"))?;
+    assert_ne!(code, 0, "stdout: {stdout:?}");
+    assert!(stderr.contains("boom"), "stderr={stderr}");
+
+    Ok(())
+}
+
 /// #1597 part 2: `.[]` over a real array now walks lazily
 /// (`each_lazy_array_iterate_sink`), so `first`/`limit` stop pulling cursors
 /// instead of collecting every one up front. Output must stay byte-identical
