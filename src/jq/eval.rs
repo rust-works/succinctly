@@ -42464,7 +42464,22 @@ fn delpaths_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // comparator growing here to drift from it. The sort has to be stable, as
     // jq's is: two paths can compare equal and still name different keys,
     // `[[1],[1.0]]` being the pair.
-    paths.sort_by(compare_values);
+    //
+    // #2306: yq mode does not sort at all -- real yq's own `delpaths()`
+    // applies paths *sequentially*, in the caller's own order, each one
+    // seeing whatever state every earlier path already left behind, not
+    // jq's simultaneous-batch model this sort exists to support. Confirmed
+    // live (yq v4.53.3) this isn't only about out-of-range indices: even an
+    // all-in-range batch is order-dependent -- `delpaths([[0],[1]])` on
+    // `[1,2,3,4]` is `[2,4]` (delete index 0 -> `[2,3,4]`, then index 1 of
+    // *that* -> `[2,4]`), while `delpaths([[1],[0]])` on the same input is
+    // `[3,4]` instead; real jq's own `delpaths` gives the order-independent
+    // `[3,4]` for *both* orderings. Handled below by looping one path at a
+    // time instead of handing the whole (sorted) batch to
+    // `delete_paths_sorted` in one call.
+    if S::TAG != EvalTag::Yq {
+        paths.sort_by(compare_values);
+    }
 
     // Every survivor of the `retain` is an array, so this only re-borrows.
     let paths: Vec<&[OwnedValue]> = paths
@@ -42475,29 +42490,47 @@ fn delpaths_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         })
         .collect();
 
-    // The empty path names the document itself, and sorts before every other
-    // array, so only the first entry needs checking: `delpaths([[],[0]])` and
-    // `delpaths([[0],[]])` are both `null` in jq mode.
+    // #2306: yq mode applies paths one at a time, in the caller's own
+    // order, each `delete_paths_sorted` call started fresh from what the
+    // previous one left behind -- a single-element path list has no
+    // sort/group ambiguity of its own, so this reuses that function's
+    // existing per-path deletion (including its own recursive handling of
+    // a multi-component path) rather than a second copy of it.
     //
-    // #2352: yq's own root-delete rule (#1702, `builtin_del`'s own
-    // `Expr::Identity` arm above) applies here too -- real yq's
-    // `delpaths([[]])` deletes the whole document and emits nothing, not the
-    // literal `null` jq (and this function's own jq-mode arm just below)
-    // prints. A guarded arm ahead of the plain `Some([])` one, not a
-    // separate `if`, so both share one pattern instead of testing
-    // `paths.first()` against the same shape twice in adjacent statements —
-    // `return`'s `!` type unifies with the `Result<OwnedValue, EvalError>`
-    // every other arm produces, same as the `Some(_)` arm below already
-    // relies on for its own early exits via `?`.
-    let result = match paths.first() {
-        None => to_owned(value),
-        Some([]) if S::TAG == EvalTag::Yq => return QueryResult::None,
-        Some([]) => Ok(OwnedValue::Null),
-        Some(_) => {
-            to_owned(value).and_then(|v| delete_paths_sorted(v, &paths, 0, S::TAG == EvalTag::Yq))
+    // #2352: an empty path names the whole document, and real yq's own
+    // root-delete rule (#1702, `builtin_del`'s own `Expr::Identity` arm)
+    // applies here too -- deleting the root emits *nothing*, not the
+    // literal `null` jq mode (and this function's own jq-mode arm below)
+    // prints for the identical shape. `root_deleted` latches once any path
+    // in the sequence is empty: every path after that is a no-op against
+    // `null` anyway (`delete_keys`'s own `OwnedValue::Null` arm), so the
+    // document really did end up wholly deleted regardless of where `[]`
+    // falls in the batch or what (no-op) work follows it.
+    let mut root_deleted = false;
+    let result = if S::TAG == EvalTag::Yq {
+        to_owned(value).and_then(|mut v| {
+            for &path in &paths {
+                v = if path.is_empty() {
+                    root_deleted = true;
+                    OwnedValue::Null
+                } else {
+                    delete_paths_sorted(v, core::slice::from_ref(&path), 0, true)?
+                };
+            }
+            Ok(v)
+        })
+    } else {
+        // The empty path names the document itself, and sorts before every
+        // other array, so only the first entry needs checking:
+        // `delpaths([[],[0]])` and `delpaths([[0],[]])` are both `null`.
+        match paths.first() {
+            None => to_owned(value),
+            Some([]) => Ok(OwnedValue::Null),
+            Some(_) => to_owned(value).and_then(|v| delete_paths_sorted(v, &paths, 0, false)),
         }
     };
     match result {
+        Ok(_) if root_deleted => QueryResult::None,
         Ok(v) => QueryResult::Owned(v),
         // #1746 review: a decode failure from `to_owned` must bypass
         // `optional` the same way every other converted call site does
@@ -70602,19 +70635,26 @@ mod tests {
     }
 
     #[test]
-    fn test_delpaths_multi_key_out_of_range_stays_noop_known_gap_2305() {
-        // #2306 (deferred from #2305, not this issue's scope): a
-        // multi-key `delpaths()` batch mixing an in-range delete with an
-        // out-of-range one is order-*dependent* in real yq (confirmed
-        // live in #2306's own filing) -- the batch/single-`retain`-pass
-        // model this function uses has no way to replicate that, so a
-        // 2+-key batch's own out-of-range members stay a no-op exactly
-        // like before this fix. Pinned here as a known gap, not a
-        // regression: only the in-range key (index 0) is actually
-        // deleted.
+    fn test_delpaths_multi_key_mixed_in_range_and_out_of_range_sequential_2306() {
+        // #2306 (deferred from #2305, resolved here): a multi-key
+        // `delpaths()` batch mixing an in-range delete with an
+        // out-of-range one is order-*dependent* in real yq -- confirmed
+        // live (yq v4.53.3): delete index 0 from `[1,2,3]` first
+        // (`[2,3]`), then extend *that* to length 5 (`[2,3,null,null,
+        // null]`), since index 5 no longer resolves in-range against the
+        // now-shrunk length. `delpaths_one`'s yq-mode path now applies
+        // each key sequentially (skipping the jq-only upfront sort)
+        // instead of batching the whole list against the array's
+        // original length, matching this exactly.
         yq_query!(br"[1,2,3]", r"delpaths([[0],[5]])",
             QueryResult::Owned(OwnedValue::Array(arr)) => {
-                assert_eq!(arr, vec![OwnedValue::Int(2), OwnedValue::Int(3)]);
+                assert_eq!(
+                    arr,
+                    vec![
+                        OwnedValue::Int(2), OwnedValue::Int(3),
+                        OwnedValue::Null, OwnedValue::Null, OwnedValue::Null,
+                    ]
+                );
             }
         );
     }
