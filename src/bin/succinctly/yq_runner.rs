@@ -1058,10 +1058,17 @@ fn gather_input_sources(
 /// --input-format json` (this function's only callers):
 /// `echo '[1,]' | succinctly yq --slurp --input-format json -o json '.[0]'`
 /// used to exit 0 with `1`, where real yq rejects it. `[,]`/`{,}` remain
-/// unchecked here, same as `eval_generic::to_owned_at_depth`'s identical
-/// cursor-less shape: this function is never given a cursor for the
+/// unchecked here: this function is never given a cursor for the
 /// *container itself*, only `value: &V`, so once a container's child walk
 /// is exhausted there is no cursor left to find its opening bracket from.
+/// `eval_generic::to_owned_at_depth` had the identical shape, but #2358
+/// found every one of its recursive call sites already resolves the
+/// child's own cursor for an unrelated reason and simply discards it --
+/// threading it through closed the gap there for every nested container.
+/// This function's own recursion (below) does the same "resolve, then
+/// discard" thing for its own #1677 checks -- untouched by #2358, whose
+/// own scope named only the `eval_generic.rs` function; tracked as #2403
+/// rather than assumed to close the same way without checking.
 fn to_owned_canonicalizing_numbers<V: DocumentValue>(value: &V) -> Result<OwnedValue, EvalError> {
     to_owned_canonicalizing_numbers_at_depth(value, 0)
 }
@@ -7126,9 +7133,12 @@ mod tests {
     /// only ever given a bare `value: &V` (never a cursor for the container,
     /// unlike `eval_generic::to_owned_cursor_at_depth`'s own `cursor`
     /// parameter). Once the child walk is exhausted there is nothing left
-    /// to check against -- the same limitation
-    /// `eval_generic::to_owned_at_depth`'s identical value-only shape has.
-    /// Pinned rather than left silently uncovered.
+    /// to check against. `eval_generic::to_owned_at_depth` had the
+    /// identical value-only shape, but #2358 closed it there by threading
+    /// each recursive call's already-resolved child cursor through as the
+    /// next level's container cursor -- untouched here, out of #2358's own
+    /// scope (tracked as #2403). Pinned rather than left silently
+    /// uncovered.
     #[test]
     fn to_owned_canonicalizing_numbers_stray_comma_in_empty_container_remains_a_known_gap_2262() {
         for json in [&br"[,]"[..], &br"{,}"[..]] {

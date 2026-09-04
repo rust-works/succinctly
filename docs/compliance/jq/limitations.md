@@ -1327,6 +1327,27 @@ practice #2243's own issue text cites for not folding into #2211):
   shares the same validation hole, so declining the fast path there would
   cost M2's performance with no correctness gain -- tracked as a further,
   broader follow-up rather than folded into #2276.
+
+  **Update (#2358)**: "expected to stay that way" above turned out to be true only for
+  the true top level, not the permanent limitation it was assumed to be. Every recursive
+  call into `eval_generic.rs`'s `to_owned_at_depth` already resolves the child's own
+  cursor for an unrelated reason (`field.value_cursor`, `elem_cursor`) and simply
+  discarded it -- threading that cursor through as a new function parameter lets
+  `container_tail_gap_ok` close `container_gap_ok`'s `{,}`/`[,]` check for every *nested*
+  container the same way `to_owned_cursor_at_depth` always could. Only the true top level
+  (the one caller with no cursor to give in the first place, `to_owned`'s own depth-0
+  entry point) keeps the gap. Separately, `lazy.rs`'s own independent JSON-cursor
+  materializer (`cursor_to_owned_at_depth`, not one of the three named above -- it was
+  never in the "no container cursor" situation at all) had its own, narrower gap of the
+  same shape: it always holds a real cursor but had never adopted
+  `container_tail_gap_ok` in place of a hand-inlined `container_gap_ok`-only check, so
+  its trailing-comma case (`[1,]`, `{"a":1,}`) was unchecked at *every* depth, not just
+  nested ones -- now closed unconditionally there, with no top-level caveat.
+  `eval.rs`'s own `to_owned_at_depth` and `yq_runner.rs`'s
+  `to_owned_canonicalizing_numbers_at_depth` likely have the identical "recursive calls
+  already resolve a cursor" opportunity `eval_generic.rs` did, but neither was touched by
+  #2358, whose scope named only that one function; tracked as #2403 rather than assumed
+  to close the same way without checking.
 - **#2263**: `jq_runner.rs` still carries its own independent, hand-copied
   `trailing_gap_ok`/`scalar_end_pos` pair rather than the new trait methods --
   a cleanup, not a behavior gap, but the same "duplicated predicates diverge

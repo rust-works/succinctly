@@ -629,6 +629,12 @@ fn to_owned_lossy_at_depth<W: Clone + AsRef<[u64]>>(
 /// container's child walk is exhausted there is no cursor left to find its
 /// opening bracket from -- the same limitation #2211 already documented for
 /// `jq_runner::standard_json_to_jq_value`'s identical value-only shape.
+/// `eval_generic::to_owned_at_depth` had this same shape too, but #2358
+/// found every one of its recursive call sites already resolves the
+/// child's own cursor for an unrelated reason and simply discards it --
+/// threading it through closed the gap there for nested containers. This
+/// function's own recursion likely has the identical opportunity;
+/// untouched here, out of #2358's own scope (tracked as #2403).
 ///
 /// A decode failure raised here is never suppressed by `?` — see
 /// [`suppresses`], and [`to_owned_or_suppress`] for the call-site idiom
