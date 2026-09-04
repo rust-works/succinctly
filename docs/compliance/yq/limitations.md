@@ -1805,17 +1805,15 @@ terminal per-container batch, e.g. `delpaths([[-5]])`). Unlike the read-side fix
 still raises the identical error in real yq, matching `del()`'s own `optional` parameter's
 established scope (a `?`/type-mismatch suppression, never extended to this new check).
 
-**One residual divergence, not chased here**: when a negative-out-of-range index is grouped
-in the *same* `delpaths()` call as an earlier deletion on the same array, real yq's own error
-reports the array's size *after* that earlier deletion already happened -- confirmed live,
-`delpaths([[0],[-5]])` on a 2-element array reports "array size is 1", not 2, meaning real
-yq's own `delpaths` resolves indices *sequentially*, not against the array's length on entry.
-`delete_keys`'s own batch invariant is the opposite by design (every key resolves against the
-length the array had on entry, which is what makes an overlapping range union rather than
-compound, per its own doc comment) -- matching real yq's sequential resolution here would mean
-abandoning that invariant, a materially larger change than this fix's own scope. Still
-correctly *raises* either way; only the reported array-size number can differ, and only in
-this one multi-key-same-array shape.
+**Was a residual divergence, closed by [#2306](https://github.com/rust-works/succinctly/issues/2306)**:
+when a negative-out-of-range index is grouped in the *same* `delpaths()` call as an earlier
+deletion on the same array, real yq's own error reports the array's size *after* that earlier
+deletion already happened -- confirmed live, `delpaths([[0],[-5]])` on a 2-element array
+reports "array size is 1", not 2, meaning real yq's own `delpaths` resolves indices
+*sequentially*, not against the array's length on entry. `delpaths_one` (`src/jq/eval.rs`) now
+applies a yq-mode multi-path batch one path at a time instead of handing the whole (sorted)
+list to `delete_keys` in one call -- see the "batch of two or more keys" entry below for the
+fuller writeup -- so this now reports "array size is 1" too, matching real yq exactly.
 
 **A separate, unrelated divergence found investigating this one**: real yq's `del()` on a
 *positive* out-of-range index doesn't no-op the way jq does -- it extends the array with
@@ -1847,28 +1845,44 @@ array-growth helper, #1670) shared by `delete_at_path`'s `Expr::Index` arm (`del
 `delete_keys`'s own single-key case (`delpaths([[N]])`, confirmed live to share the identical
 extension behavior) -- gated on `yq_mode`, since jq has no such rule at all.
 
-**Deliberately not extended to a `delpaths()` batch of two or more keys.** Confirmed live that
-mixing an in-range delete with an out-of-range one in the same `delpaths()` call is
-**order-dependent** in real yq -- the same *set* of keys, given in a different literal order,
-produces a *different*-length result:
+### `delpaths()`'s multi-key batch applies sequentially, not as a union
+
+[#2306](https://github.com/rust-works/succinctly/issues/2306). Real yq's own `delpaths()`
+applies a 2+-path batch **sequentially** -- one path at a time, each seeing whatever state
+every earlier path already left behind -- not jq's own simultaneous/union model, which
+resolves every path against the array's *starting* length. This isn't only about
+out-of-range indices: even an all-in-range batch is order-dependent, confirmed live:
+
+```bash
+$ echo '[1,2,3,4]' | yq -o=json 'delpaths([[0],[1]])'   # [2,4] -- delete index 0, then index 1 of what's left
+$ echo '[1,2,3,4]' | yq -o=json 'delpaths([[1],[0]])'   # [3,4] -- same keys, reversed order, different result
+```
+
+(Real jq's own `delpaths` gives the order-independent `[3,4]` for *both* orderings.) Mixing an
+in-range delete with an out-of-range one shows the same order-dependence -- the same *set* of
+keys, given in a different literal order, produces a *different*-length result:
 
 ```bash
 $ echo '[1,2,3]' | yq -o=json 'delpaths([[0],[5]])'   # [2,3,null,null,null] -- length 5
 $ echo '[1,2,3]' | yq -o=json 'delpaths([[5],[0]])'   # [2,3,null,null]      -- length 4
 ```
 
-`delete_keys`'s array arm resolves every key against the array's length *on entry* and applies
-them all in one batched `retain` pass -- deliberately order-independent, which is what keeps its
-existing (already-correct) in-range-only semantics matching real jq's own order-independent
-`delpaths` union rule. Replicating the order-dependent out-of-range case would need the array
-arm restructured to apply keys sequentially instead, a materially larger change than this fix
-attempts -- tracked separately as
-[#2306](https://github.com/rust-works/succinctly/issues/2306), including whether `del()`'s own
-comma-separated multi-target form (`del(.[0], .[5])`, a different call path than `delpaths()`'s
-path-array form) shares the same order-dependence.
+`delpaths_one` (`src/jq/eval.rs`) used to sort the whole path list before deleting anything --
+a step that exists to support jq's own simultaneous/union model, applied unconditionally
+regardless of mode. It now skips that sort in yq mode and instead applies each path
+individually, via a loop calling the existing `delete_paths_sorted` once per path (in the
+caller's own given order) rather than handing the whole (sorted) list to it in one call. jq
+mode's own code path -- sort, then one batched call -- is unchanged.
 
-A negative out-of-range index is untouched by this fix either way -- it raises instead
-(#2268, the section above, landed separately and already covers it).
+A negative out-of-range index is otherwise unaffected by this fix -- it still raises (#2268,
+the section above), just with an array-size figure that's now correct for a grouped batch too,
+per that section's own updated note.
+
+**Still open: `del()`'s own comma-separated multi-target form** (`del(.[0], .[5])`, a
+different call path than `delpaths()`'s path-array form -- each target reaches `delete_keys`
+through its own separate call, not a shared batch, so #2306's fix above doesn't reach it).
+Confirmed live that real yq's `del()` comma form is *also* order-dependent the identical way,
+which succinctly does not yet reproduce -- not yet filed as its own issue.
 
 **Also extended to a mid-chain index, not just a terminal one**
 ([#2314](https://github.com/rust-works/succinctly/issues/2314)). A positive out-of-range

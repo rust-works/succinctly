@@ -36689,14 +36689,20 @@ fn delete_keys(
             // gets the same null-extension `delete_at_path`'s `Expr::Index`
             // arm does (`delpaths([[5]])` on `[1,2]` matches `del(.[5])`
             // exactly, confirmed live) -- gated on `keys.len() == 1`
-            // deliberately, not extended to a multi-key batch: confirmed
-            // live that mixing an in-range delete with an out-of-range one
-            // is order-*dependent* in real yq (`delpaths([[0],[5]])` vs
-            // `delpaths([[5],[0]])` on the same `[1,2,3]` give *different*
-            // results, 5 vs 4 elements) -- this batch/single-`retain`-pass
-            // model has no way to replicate that without processing keys
-            // sequentially, a materially larger change; tracked separately
-            // as #2306 rather than guessed at here.
+            // deliberately, not extended to a multi-key batch: real yq's
+            // own multi-key `delpaths()` batch is order-*dependent*
+            // (`delpaths([[0],[5]])` vs `delpaths([[5],[0]])` on the same
+            // `[1,2,3]` give *different* results, 5 vs 4 elements), which
+            // this batch/single-`retain`-pass model has no way to
+            // replicate. #2306 closes that gap for `delpaths()` -- its own
+            // caller, `delpaths_one`, never reaches this function with more
+            // than one key at a time in yq mode anymore, looping over paths
+            // sequentially itself instead -- so a `keys.len() > 1` call
+            // here is now only ever jq mode (unaffected: real jq's own
+            // `delpaths` genuinely is order-independent) or `del()`'s own
+            // comma-separated multi-target form, which still reaches here
+            // batched and still has this same gap (#2306's own "still
+            // open" note).
             let mut indices: Vec<usize> = vec_with_capacity(keys.len());
             let mut single_key_oob_target: Option<usize> = None;
             for key in keys {
@@ -70257,6 +70263,28 @@ mod tests {
                     vec![
                         OwnedValue::Int(2), OwnedValue::Int(3),
                         OwnedValue::Null, OwnedValue::Null, OwnedValue::Null,
+                    ]
+                );
+            }
+        );
+    }
+
+    #[test]
+    fn test_delpaths_multi_key_mixed_reversed_order_gives_a_different_result_2306() {
+        // #2306 sibling: the reversed key order from the test above, same
+        // input, a *different*-length result -- the same pairing
+        // `docs/compliance/yq/limitations.md` uses to demonstrate this
+        // divergence. Confirmed live (yq v4.53.3): extend `[1,2,3]` to
+        // length 5 first (`[1,2,3,null,null]`), then delete index 0 of
+        // *that* (`[2,3,null,null]`), since index 0 is now in-range
+        // against the extended length.
+        yq_query!(br"[1,2,3]", r"delpaths([[5],[0]])",
+            QueryResult::Owned(OwnedValue::Array(arr)) => {
+                assert_eq!(
+                    arr,
+                    vec![
+                        OwnedValue::Int(2), OwnedValue::Int(3),
+                        OwnedValue::Null, OwnedValue::Null,
                     ]
                 );
             }

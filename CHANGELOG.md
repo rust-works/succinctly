@@ -577,15 +577,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `yq_negative_index_check`/`yq_negative_index_error` helpers (all five take a plain
   `yq_mode: bool`, not `S: EvalSemantics`). Unlike the read-side fix, not
   suppressible by an earlier `?` in the path chain — confirmed live, real yq's own
-  `del(.a?[-5])` still raises. One residual divergence documented, not chased: when grouped
-  with an earlier same-array deletion in one `delpaths()` call, real yq's own error reports
-  the array's *already-shrunk* size (sequential resolution), where this crate's own
-  `delete_keys` deliberately resolves every key against the array's length on entry (the
-  invariant that makes an overlapping range union rather than compound) — still correctly
-  raises either way, only the reported number can differ, and only in that one
-  multi-key-same-array shape. Also surfaced, and filed separately as #2305 (out of this
-  issue's negative-index scope): real yq's `del()` on a *positive* out-of-range index extends
-  the array with nulls instead of no-op, which succinctly (matching jq) doesn't reproduce.
+  `del(.a?[-5])` still raises. A residual divergence was documented here, not chased at the
+  time: when grouped with an earlier same-array deletion in one `delpaths()` call, real yq's
+  own error reports the array's *already-shrunk* size (sequential resolution), where this
+  crate's own `delete_keys` deliberately resolved every key against the array's length on
+  entry — closed by #2306 below, which now reports the shrunk size too. Also surfaced, and
+  filed separately as #2305 (out of this issue's negative-index scope): real yq's `del()` on
+  a *positive* out-of-range index extends the array with nulls instead of no-op, which
+  succinctly (matching jq) doesn't reproduce.
+- **`delpaths()`'s multi-key batch applied as a union, not sequentially** (#2306): real yq's
+  own `delpaths()` applies a 2+-path batch one path at a time, each seeing whatever state
+  every earlier path already left behind — not jq's own simultaneous/union model this crate's
+  `delete_keys` was built around, which resolves every path against the array's *starting*
+  length. Confirmed live this isn't only about out-of-range indices — even an all-in-range
+  batch is order-dependent (`delpaths([[0],[1]])` on `[1,2,3,4]` is `[2,4]`;
+  `delpaths([[1],[0]])` on the same input is `[3,4]`, where real jq's own `delpaths` gives the
+  order-independent `[3,4]` for both). `delpaths_one` (`src/jq/eval.rs`) now skips its
+  upfront sort in yq mode (the sort exists to support jq's own batch semantics) and applies
+  each path individually instead of handing the whole list to `delete_keys` in one call. jq
+  mode is unaffected. `del()`'s own comma-separated multi-target form shares the same
+  order-dependence in real yq and does not yet reproduce it, since each of its targets already
+  reaches `delete_keys` through its own separate call rather than a shared batch.
 - **`has(key)`/`contains()` on objects didn't raise on a non-string sibling key
   (`{"a":1,123:2}`), and `JsonFields::find` (unlike its `find_cursor` sibling) had neither
   the #1677 `,`/`:` delimiter check nor the #2261 trailing-comma check at all** (#2288,
