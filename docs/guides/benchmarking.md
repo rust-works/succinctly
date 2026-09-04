@@ -170,10 +170,13 @@ check while it builds a track record.
 
 On `pull_request` runs, the baseline is a binary built fresh from the PR's own
 `git merge-base` in the same CI run (`--baseline-binary`), not the committed file —
-see #1582 below for why. On other runs (a direct push to `main`) there is no PR to
-build a merge-base from, so it falls back to the checked-in
-`tests/data/perf-guard-baseline.json`. To deliberately update that file after a real,
-understood cost change:
+see #1582 below for why. On `push` runs (every commit the merge queue lands on
+`main`), the baseline is likewise a binary built fresh from `github.event.before`
+(the commit `main` pointed to immediately before that push, #2117) — the checked-in
+`tests/data/perf-guard-baseline.json` is now only a fallback for the rare case
+neither can supply a binary (a branch's first push, or a `before` SHA the checkout
+doesn't have), and a seed for running the script locally with no comparison binary
+of your own. To deliberately update that file after a real, understood cost change:
 
 ```bash
 cargo build --release --features cli

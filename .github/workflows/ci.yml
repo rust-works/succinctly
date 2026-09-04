@@ -591,6 +591,13 @@ jobs:
       # that already passed this same required CI when it landed. Built into
       # a separate worktree/target dir so it can't collide with (or poison
       # the cache of) the PR-head build below.
+      #
+      # Review (#2117): this step's own `worktree add`/`cd`/`cargo build`
+      # sequence is duplicated (with a different SHA source and dest path)
+      # by the "Build previous-commit binary" step just below -- if you're
+      # changing the build invocation here (a feature flag, the worktree
+      # convention, ...), check whether that step needs the identical change
+      # too, so the two baselines stay built consistently.
       - name: Build merge-base binary
         if: github.event_name == 'pull_request'
         run: |
@@ -600,6 +607,47 @@ jobs:
           cd /tmp/perf-guard-merge-base
           cargo build --release --features cli
 
+      # #2117: the `push` path's own same-run baseline, mirroring #1582's
+      # `pull_request` treatment above -- compares against the single commit
+      # this push landed on top of (`github.event.before`, the SHA `main`
+      # pointed to immediately before this push), cancelling the same
+      # ordinary `Ir` drift #1582 already cancels for `pull_request` runs.
+      # Without this, every `push` (i.e. every commit the merge queue lands
+      # on `main`) fell back to the checked-in
+      # `tests/data/perf-guard-baseline.json` file, which drifts 1-3% across
+      # every query within days at this project's merge cadence (#2059) --
+      # a real staleness incident this closes off at the source rather than
+      # requiring a periodic manual `--update-baseline` refresh.
+      #
+      # Falls back to that same checked-in file (leaving `PERF_GUARD_PREV_BUILT`
+      # unset, so the run step below leaves `EXTRA_ARGS` empty) when `before`
+      # isn't a real, buildable commit -- the all-zeros SHA on a branch's
+      # first push, or a SHA this `fetch-depth: 0` checkout doesn't actually
+      # have (a force-push/history-rewrite edge case) -- rather than
+      # assuming it always is.
+      #
+      # Same `worktree add`/`cd`/`cargo build` sequence as "Build merge-base
+      # binary" above (see its own comment) -- keep the two in sync.
+      - name: Build previous-commit binary
+        if: github.event_name == 'push'
+        env:
+          # Not attacker-influenced (GitHub computes this itself, always a
+          # 40-hex-char SHA or the all-zero SHA) -- routed through `env:`
+          # rather than spliced into the script via `${{ }}` anyway, so this
+          # step isn't a template a future *do* attacker-influenced field
+          # (a branch/tag name, say) could get copy-pasted into unsafely.
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "$BEFORE" != "0000000000000000000000000000000000000000" ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            echo "Building previous-commit binary at $BEFORE for push-relative perf comparison (#2117)"
+            git worktree add --detach /tmp/perf-guard-prev-commit "$BEFORE"
+            cd /tmp/perf-guard-prev-commit
+            cargo build --release --features cli
+            echo "PERF_GUARD_PREV_BUILT=1" >> "$GITHUB_ENV"
+          else
+            echo "::warning::github.event.before ($BEFORE) is not a valid buildable commit -- falling back to the checked-in baseline file for this push"
+          fi
+
       - name: Build release binary
         run: cargo build --release --features cli
 
@@ -607,6 +655,8 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             EXTRA_ARGS="--baseline-binary /tmp/perf-guard-merge-base/target/release/succinctly"
+          elif [ "${{ github.event_name }}" = "push" ] && [ "$PERF_GUARD_PREV_BUILT" = "1" ]; then
+            EXTRA_ARGS="--baseline-binary /tmp/perf-guard-prev-commit/target/release/succinctly"
           else
             EXTRA_ARGS=""
           fi
