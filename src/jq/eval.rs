@@ -26522,10 +26522,10 @@ type ResolvedSliceBound = (Option<i64>, Option<NumberKey>);
 /// prints only `Error: x`, no `{"start":...}` prefix reaching the caller
 /// (the same `resolve_dynamic_indexes` codepath `=`/`path()` also drive).
 /// Discarding the prefix here also means `owned_bound_to_i64` below never
-/// runs on it in yq mode, which incidentally sidesteps the unrelated
-/// non-numeric-bound bug this doc comment's own "Residual" paragraph
-/// describes -- not a fix for that bug, just an accident of evaluation
-/// order once the prefix is gone.
+/// runs on it in yq mode, so a non-numeric bound alongside a pending
+/// generator escape never reaches the `#2385` conversion-failure gate
+/// above at all in yq mode -- not because that gate excludes it, just
+/// because there's nothing left to convert by the time it would run.
 fn resolve_slice_bound<S: EvalSemantics>(
     bound: &Option<Box<Expr>>,
     value: &OwnedValue,
@@ -54842,17 +54842,18 @@ mod tests {
     /// #2351 review: a resolved-but-non-numeric bound value combined with
     /// an escape (`.[(0,"x",error("y")):3]`) in yq mode. Live-verified
     /// against yq v4.53.3: prints only `Error: y` (no output, no type
-    /// error about "x"). This pins the accidental interaction the new gate
-    /// has with the pre-existing, unrelated `owned_bound_to_i64` bug
-    /// documented on `eval_slice_bound`'s own `#2351 review` comment above
-    /// (and `resolve_slice_bound`'s "Residual" paragraph): with the prefix
-    /// discarded before conversion ever runs on it in yq mode, `"x"` never
-    /// reaches `owned_bound_to_i64` at all, so `error("y")` -- the bound
-    /// generator's own escape -- is what surfaces, matching real yq exactly.
-    /// jq mode still has the underlying bug live (undisturbed by this PR):
-    /// jq 1.7.1 itself prints `[10,20,30]` before its own type error, where
-    /// succinctly's jq mode currently prints nothing -- a separate,
-    /// pre-existing gap, not asserted here.
+    /// error about "x"). This pins the accidental interaction the
+    /// generator-escape gate has with the (now-fixed, #2372)
+    /// `owned_bound_to_i64` conversion step: with the prefix discarded
+    /// before conversion ever runs on it in yq mode, `"x"` never reaches
+    /// `owned_bound_to_i64` at all, so `error("y")` -- the bound
+    /// generator's own escape -- is what surfaces, matching real yq
+    /// exactly. jq mode is unaffected by this yq-only gate either way, and
+    /// (as of #2372) no longer has an underlying conversion-prefix bug to
+    /// sidestep: `echo '[10,20,30]' | succinctly jq -c
+    /// '.[(0,"x",error("y")):3]'` now prints `[10,20,30]` before its own
+    /// type error, matching jq 1.7.1 exactly (this test doesn't assert
+    /// that -- see `eval_slice_bound`'s own `#2372` tests for it).
     #[test]
     fn test_slice_bound_non_numeric_prefix_value_sidesteps_conversion_bug_in_yq_mode_2351_review() {
         yq_query!(b"[10,20,30]", r#".[(0,"x",error("y")):3]"#,
