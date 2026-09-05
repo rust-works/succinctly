@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`succinctly yq` reads a numeric index on a mapping as `null`, not an
+  error** (#2459). Confirmed live against yq v4.53.3: `.a[5]` on `a: {b: 1}`
+  is `null` (`key`/`path` answer `5`/`["a",5]` for that position, same as any
+  other missing key), where jq raises `Cannot index object with number` --
+  succinctly reproduced jq's error in both modes before this fix. Read-only:
+  the write side (`.a[5] = 1`) is a distinct, already-tracked divergence
+  (real yq coerces the index to a string key and inserts it, #1863).
+
 ### Changed
 
 - **`succinctly yq --eval-all` now evaluates over the document *list*, not a

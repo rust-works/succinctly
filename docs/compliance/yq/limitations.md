@@ -1513,6 +1513,15 @@ Pinned as known-divergent by `test_yq_assign_all_noop_mismatched_element_type_14
 match yq: an `Index` step hitting a genuine scalar mid-chain permanently no-ops the whole
 write (#1232), same as every other position.
 
+**The *read* side of the third bullet is resolved ([#2459](https://github.com/rust-works/succinctly/issues/2459)):**
+a terminal (not mid-chain) numeric index landing on a real `Object` -- `.a[5]` on
+`a: {b: 1}` -- now answers `null` in yq mode, matching real yq's own read (confirmed live:
+`.a[5]` is `null`, `.a[5] | key` is `5`, `.a[5] | path` is `["a",5]`), via
+`eval::yq_numeric_index_on_object_is_null`. The *write* side above is untouched by that
+fix and remains exactly the coercion gap this section describes -- `.a[5] = 1` still
+raises `Cannot index object with number` in succinctly where real yq inserts a string key
+(`{"a":{"b":1,"5":1}}`).
+
 ### `=`'s multi-output RHS: real yq takes only the last value, no fan-out
 
 [#1430](https://github.com/rust-works/succinctly/issues/1430) started as a narrower report

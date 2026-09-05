@@ -33505,3 +33505,74 @@ fn test_yq_binary_operator_fans_out_left_major_2451() -> Result<()> {
 
     Ok(())
 }
+
+/// #2459: real yq treats a numeric index on a *mapping* as a missing key --
+/// `null`, at the position the index names -- where jq raises `Cannot index
+/// object with number`, which is what succinctly reproduced in both modes
+/// before this fix. Captured live from yq v4.53.3 (`-o=json -I0`) on
+/// `a:\n  b: 1\n`:
+///
+/// ```text
+/// $ yq -o=json -I0 '.a[5]'          null
+/// $ yq -o=json -I0 '.a | .[5]'      null
+/// $ yq -o=json -I0 '.a[5] | key'    5
+/// $ yq -o=json -I0 '.a[5] | path'   ["a",5]
+/// $ yq -o=json -I0 '.a[-1]'         null
+/// $ yq -o=json -I0 '.a[1.5]'        null
+/// $ yq -o=json -I0 '.a["5"]'        null    (a genuine string-key miss, unrelated)
+/// $ succinctly yq -o=json '.a[5]'   Error: Cannot index object with number  (was, exit 1)
+/// ```
+///
+/// The rule is `eval::yq_numeric_index_on_object_is_null`, consulted by both
+/// evaluators at every site a numeric index reaches a real `Object`:
+/// `eval::index_array_by_position` (the literal-index and computed-key value
+/// route), `eval::eval_owned_navigation` (the pure/reindex-bridge fast
+/// path), `eval::eval_stage_with_path_context`'s and the computed-key loop's
+/// own `Expr::Index`/owned-target arms (the eager path-context evaluator),
+/// and `eval_generic::index_one_generic`/`Expr::Index` inline arm/
+/// `path_step_generic` (the generic route spine 2416 introduced) -- one
+/// definition, several call sites, per CLAUDE.md's "duplicated predicates
+/// diverge silently" (#106).
+///
+/// **Read-only.** The write side (`.a[5] = 1`) is a distinct, already
+/// tracked-but-unfixed divergence: real yq coerces the index to a string key
+/// and inserts it (`{"a":{"b":1,"5":1}}`), where succinctly still raises the
+/// same `Cannot index object with number` -- see
+/// `docs/compliance/yq/limitations.md`'s "mid-chain `Field`/`Index` step"
+/// entry (#1863), which already documents the identical coercion gap for a
+/// mid-chain shape.
+#[test]
+fn test_yq_numeric_index_on_mapping_is_null_2459() -> Result<()> {
+    let args = &["-o=json", "-I=0"];
+    let doc = "a:\n  b: 1\n";
+    for (filter, expected) in [
+        (".a[5]", "null"),
+        (".a | .[5]", "null"),
+        (".a[5] | key", "5"),
+        (".a[5] | path", "[\"a\",5]"),
+        (".a[-1]", "null"),
+        (".a[1.5]", "null"),
+        (".a[\"5\"]", "null"),
+        // Computed-key forms reach a separate set of call sites than the
+        // literal-index forms above (the parser constant-folds a literal
+        // subscript to `Expr::Index`, a computed one stays `Expr::IndexExpr`)
+        // -- both must agree.
+        (".a[(2+3)]", "null"),
+        (".a[(2+3)] | key", "5"),
+        (".a[(2+3)] | path", "[\"a\",5]"),
+        ("5 as $y | .a[$y]", "null"),
+        ("5 as $y | .a[$y] | key", "5"),
+    ] {
+        let (output, code) = run_yq_stdin(filter, doc, args)?;
+        assert_eq!(code, 0, "`{filter}`: {output:?}");
+        assert_eq!(output.trim(), expected, "`{filter}`");
+    }
+    // The write side is unchanged -- still errors, not part of this fix.
+    let (_out, stderr, code) = run_yq_stdin_with_stderr(".a[5] = 1", doc, &[])?;
+    assert_ne!(code, 0, "write side is not part of #2459 -- see #1863");
+    assert!(
+        stderr.contains("Cannot index object with number"),
+        "got: {stderr}"
+    );
+    Ok(())
+}
