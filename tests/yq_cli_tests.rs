@@ -28194,6 +28194,11 @@ fn test_select_and_if_truthiness_flat_over_alias_fanout_1804() -> Result<()> {
 /// materialized -- this walk is the only place that stops short. Real yq
 /// rejects this whole document at parse time (no yq behaviour to match
 /// either way).
+///
+/// Covers both container shapes -- the object branch and the array branch
+/// each carry their own `c.is_alias()` short-circuit in
+/// `push_generic_truthiness_cursor_error`, so an array-only test would
+/// leave the object branch's check unexercised.
 #[test]
 fn test_select_no_longer_raises_on_decode_failure_reachable_only_via_alias_1804() -> Result<()> {
     let doc = "a: &a [\"b\\qc\"]\nb: *a\n";
@@ -28214,6 +28219,20 @@ fn test_select_no_longer_raises_on_decode_failure_reachable_only_via_alias_1804(
 
     // Materializing through the alias still raises.
     let (_, stderr, code) = run_yq_stdin_with_stderr(".b[0]", doc, &[])?;
+    assert_ne!(code, 0, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("invalid escape sequence"),
+        "stderr: {stderr}"
+    );
+
+    // Same trade-off, mapping-target alias this time -- exercises the
+    // object branch's own `c.is_alias()` check.
+    let map_doc = "a: &a {x: \"b\\qc\"}\nb: *a\n";
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr("select(.b) | 1", map_doc, &[])?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), "1");
+
+    let (_, stderr, code) = run_yq_stdin_with_stderr(".b.x", map_doc, &[])?;
     assert_ne!(code, 0, "stderr: {stderr:?}");
     assert!(
         stderr.contains("invalid escape sequence"),
