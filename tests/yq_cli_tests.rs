@@ -24554,12 +24554,99 @@ fn test_yaml_bare_scalar_alias_result_is_materialized_on_the_dom_path_763() -> R
     // with no anchor anywhere, which it then cannot read back
     // (`unknown anchor 'x' referenced`). A root `*name` can never satisfy
     // the soundness gate, since its `&name` would have to be inside its own
-    // subtree and a cyclic anchor is rejected at index build. succinctly's
-    // streaming path still prints `*x` here; making the two agree is #1350.
+    // subtree and a cyclic anchor is rejected at index build. #1350 made
+    // the streaming path (no `-P`) agree with the DOM path here too --
+    // both resolve, neither prints `*x` for a root alias result.
     let input = "a: &x 1\nb: *x\n";
     let (output, exit_code) = run_yq_stdin(".b", input, &["-P"])?;
     assert_eq!(exit_code, 0);
     assert_eq!(output, "1\n");
+
+    let (output, exit_code) = run_yq_stdin(".b", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "1\n", "streaming path must agree with -P (#1350)");
+    Ok(())
+}
+
+/// #1350: `--sort-keys` on the M2 streaming path used to have no soundness
+/// pass at all -- unlike `-P`/`sort_keys(..)`, which route through
+/// `enforce_anchor_soundness`. A sort that lifts an alias above the anchor
+/// it resolves to now falls back to the DOM evaluator for the whole
+/// input (gated on `index.has_aliases()`, so a document with no aliases
+/// keeps the fast path regardless of `--sort-keys`), matching `-P`'s
+/// output exactly and staying readable by `succinctly yq` itself.
+///
+/// Covers all three shapes the 2026-09-04 triage named live-affected:
+/// flat, nested, and a sequence of mappings.
+#[test]
+fn test_yaml_sort_keys_alias_above_anchor_takes_dom_path_1350() -> Result<()> {
+    for input in [
+        "b: &x 1\na: *x\n",
+        "outer:\n  b: &x 1\n  a: *x\n",
+        "items:\n  - b: &x 1\n    a: *x\n",
+    ] {
+        let (streamed, code) = run_yq_stdin(".", input, &["--sort-keys"])?;
+        assert_eq!(code, 0, "input: {input}");
+        let (dom_forced, code) = run_yq_stdin(".", input, &["--sort-keys", "-P"])?;
+        assert_eq!(code, 0, "input: {input}");
+        assert_eq!(
+            streamed, dom_forced,
+            "streaming and DOM-forced (-P) output must agree, input: {input}"
+        );
+
+        // Must re-parse: this is the actual soundness property #1350 fixes.
+        let (_, reread_code) = run_yq_stdin(".", &streamed, &[])?;
+        assert_eq!(
+            reread_code, 0,
+            "sorted output must be readable by succinctly yq itself, input: {input}\noutput: {streamed}"
+        );
+    }
+    Ok(())
+}
+
+/// #1350: the DOM fallback above is gated on `index.has_aliases()`, not on
+/// `--sort-keys` alone -- a document whose anchor/alias order was already
+/// sound must keep streaming its alias marks (`*x`), not silently resolve
+/// them the way a *reordered* document's soundness fix does.
+#[test]
+fn test_yaml_sort_keys_sound_order_keeps_streaming_marks_1350() -> Result<()> {
+    let input = "a: &x 1\nz: *x\n";
+    let (output, code) = run_yq_stdin(".", input, &["--sort-keys"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        output, "a: &x 1\nz: *x\n",
+        "already-sound order must keep its alias mark, not resolve it"
+    );
+    Ok(())
+}
+
+/// Code review on #1350's fix: an earlier version gated the DOM fallback on
+/// `sort_keys && index.has_aliases()` alone, with no `is_identity` check --
+/// but `stream_yaml_sort_keys_alias_fallback` always evaluates
+/// `&Expr::Identity`, not the real filter. A non-identity M2-streamable
+/// filter (`.outer`) combined with `--sort-keys` on an alias-bearing
+/// document would have silently ignored `.outer` and streamed the *whole*
+/// identity-evaluated document instead -- caught before merge by exactly
+/// this test failing under the broad gate.
+///
+/// This does not close the soundness gap for non-identity filters (`.outer`
+/// here can still emit an alias above its anchor -- confirmed live, still
+/// unreadable by `succinctly yq` itself); it only pins that the *value*
+/// returned is correct, not silently replaced by the whole document. The
+/// non-identity soundness gap is real and separate, filed as a follow-up.
+#[test]
+fn test_yaml_sort_keys_non_identity_filter_still_applies_1350() -> Result<()> {
+    let input = "outer:\n  b: &x 1\n  a: *x\nunrelated: 99\n";
+    let (output, code) = run_yq_stdin(".outer", input, &["--sort-keys"])?;
+    assert_eq!(code, 0);
+    assert!(
+        !output.contains("unrelated"),
+        "must evaluate .outer, not silently fall back to identity: {output:?}"
+    );
+    assert!(
+        output.contains('1'),
+        "must contain .outer's own content: {output:?}"
+    );
     Ok(())
 }
 
@@ -29323,9 +29410,14 @@ fn test_sort_family_preserves_comments_and_flow_style_1687() -> Result<()> {
 /// 'x' referenced` when asked to read its own output back (both verified
 /// live against v4.53.3). `enforce_anchor_soundness` is what normally
 /// prevents that, but it is a DOM-path pass over a `CommentTree` and the
-/// cursor-streaming path has none (#1350) -- so `DocumentCursor::
+/// cursor-streaming path has none -- so `DocumentCursor::
 /// document_has_aliases` sends an alias-bearing document down the DOM path
 /// unchanged, losing the marks rather than emitting an unreadable file.
+/// A different, narrower gap in the same family -- the CLI's own
+/// `--sort-keys` flag on plain identity output had no such gate at all,
+/// rather than routing to a DOM path with no marks -- was #1350; this
+/// builtin family's `document_has_aliases` gate is unrelated to that fix
+/// and unaffected by it.
 ///
 /// This is a deliberate divergence from real yq, not a gap: the same one
 /// ADR-0018 admits for `del()` and the rest of the #763 family.

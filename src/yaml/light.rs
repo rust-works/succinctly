@@ -1415,6 +1415,18 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         // than relying on each downstream read to notice a bare-dash
         // wrapper on its own.
         let self_ = self.resolve_bare_seq_item();
+        // #1350: a bare alias *root* (`succinctly yq '.b'` on `b: *x`) used
+        // to stream `*x` literally -- unlike every non-root alias, which
+        // `stream_yaml_value` resolves normally as part of its parent. A
+        // root `*name` can never survive `enforce_anchor_soundness` (the DOM
+        // path this is meant to agree with, per that function's own doc
+        // comment): its `&name` would have to sit inside the alias's own
+        // subtree, which is impossible (a cyclic anchor is rejected at
+        // index build). So the DOM path always resolves a root alias to its
+        // target instead of printing the mark, and this streaming path
+        // should too. `resolve_alias_target_cursor` is a no-op (single
+        // `.value()` check, no chain walk) when `self_` isn't an alias.
+        let self_ = self_.resolve_alias_target_cursor().unwrap_or(self_);
         self_.write_leading_anchor(out)?;
         let value = self_.value();
         if let YamlValue::String(s) = &value {

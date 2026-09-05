@@ -102,25 +102,43 @@ Scoped to a *container* alias target only: a bare scalar-target alias (`a: &a "b
 still raises from `select`/`if` exactly as before, since resolving one scalar costs `O(1)`
 and was never part of the cost this fix removes.
 
-**Known gap in this rule.** `enforce_anchor_soundness` takes a `sort_keys` argument and
-handles it correctly — but only on the DOM path. The cursor-streaming path never calls it,
-so succinctly currently reproduces the unsound output it is supposed to prevent. The two
-paths disagree on the same document, which is what makes the gap unambiguous:
+**Resolved ([#1350](https://github.com/rust-works/succinctly/issues/1350)).**
+`enforce_anchor_soundness` takes a `sort_keys` argument and has always handled it correctly
+on the DOM path; the cursor-streaming path used to never call it, reproducing the unsound
+output it is supposed to prevent. The streaming path now checks `sort_keys &&
+index.has_aliases()` once per file/stdin input (an index it already built to decide the fast
+path in the first place) and, when true, evaluates that whole input through the DOM
+evaluator instead — the same one `-P` already used, so the two paths now agree:
 
 ```bash
-$ printf 'b: &x 1\na: *x\n' | succinctly yq --sort-keys '.'        # streaming
-a: *x
-b: &x 1
-$ printf 'b: &x 1\na: *x\n' | succinctly yq --sort-keys -P '.'     # DOM-forced (-P)
+$ printf 'b: &x 1\na: *x\n' | succinctly yq --sort-keys '.'
 a: 1
 b: &x 1
-
 $ printf 'b: &x 1\na: *x\n' | succinctly yq --sort-keys '.' | succinctly yq '.'
-Error: YAML parse error: unknown anchor 'x' referenced at offset 3
+a: 1
+b: &x 1
 ```
 
-That is [#1350](https://github.com/rust-works/succinctly/issues/1350) — a bug against this
-carve-out, not a second carve-out. Related open items in the same family:
+A sound document (no inversion) still streams normally, unaffected:
+
+```bash
+$ printf 'a: &x 1\nz: *x\n' | succinctly yq --sort-keys '.'
+a: &x 1
+z: *x
+```
+
+A bare alias *root* (`succinctly yq '.b'` on `b: *x`) used to print `*x` literally on the
+streaming path while the DOM path (`-P '.b'`) resolved it — also part of #1350, since a root
+alias can never survive `enforce_anchor_soundness` either way (its `&name` would have to sit
+inside its own subtree, which index build already rejects as a cycle). Both paths now
+resolve it:
+
+```bash
+$ printf 'a: &x 1\nb: *x\n' | succinctly yq '.b'
+1
+```
+
+Related open items in the same family, still unresolved:
 [#1359](https://github.com/rust-works/succinctly/issues/1359) (a write that changes a node's
 kind drops its `&anchor`, where real yq keeps it),
 [#1360](https://github.com/rust-works/succinctly/issues/1360) (NaN false-positives the

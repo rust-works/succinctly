@@ -1475,6 +1475,80 @@ fn evaluate_yaml_direct_filtered(
     }
 }
 
+/// #1350: `--sort-keys` on the M2 streaming fast path has no soundness
+/// pass -- `enforce_anchor_soundness` only runs on the DOM path
+/// (`evaluate_yaml_direct_filtered` + [`output_value`] below), so a sort
+/// that inverts an anchor's declaration order relative to its alias
+/// produces YAML succinctly itself cannot read back. Routes one file's (or
+/// stdin's) identity output through the DOM evaluator instead of the M2
+/// streamers, reusing `bytes` already in hand -- a second parse, not a
+/// second read. Callers gate this on `sort_keys && index.has_aliases()`
+/// (an index they already built to decide the M2 path in the first place),
+/// so the cost is paid only under `--sort-keys` on alias-bearing documents;
+/// every other invocation is unaffected.
+///
+/// Deliberately whole-*file* granularity, not per-document within a
+/// multi-document file, matching the fix locus named in #1350's own
+/// triage -- a document within an alias-bearing file that happens not to
+/// have any aliases itself still takes the (cheap, one extra parse) DOM
+/// route alongside its siblings, rather than adding a second axis of
+/// per-document routing on top of the existing per-file M2-vs-DOM switch.
+///
+/// Identity only (`&Expr::Identity`, not a general filter): callers must
+/// gate this on `is_identity` too, not just `sort_keys && has_aliases()` --
+/// a non-identity M2-streamable filter (`.foo`) still needs its own real
+/// evaluation, which this function does not perform (#1350 code review: an
+/// earlier version without the `is_identity` gate silently replaced such a
+/// filter's result with the whole identity-evaluated document).
+///
+/// `doc_streamed`/`any_truthy` grouped into one struct rather than two more
+/// `&mut bool` parameters (clippy's `too_many_arguments`, matching this
+/// file's own [`DirectEvalOptions`] precedent for the identical reason).
+struct FallbackStreamState<'a> {
+    doc_streamed: &'a mut bool,
+    any_truthy: &'a mut bool,
+}
+
+fn stream_yaml_sort_keys_alias_fallback<W: Write>(
+    writer: &mut W,
+    bytes: &[u8],
+    doc_filter: Option<(usize, usize)>,
+    sink: &mut ErrorSink,
+    output_config: &OutputConfig,
+    strip_style: bool,
+    state: FallbackStreamState<'_>,
+) -> Result<usize> {
+    let FallbackStreamState {
+        doc_streamed,
+        any_truthy,
+    } = state;
+    let (doc_results, num_docs) = evaluate_yaml_direct_filtered(
+        bytes,
+        &Expr::Identity,
+        doc_filter,
+        sink,
+        DirectEvalOptions {
+            need_comments: true,
+            strip_style,
+            sort_keys: true,
+            mark_json_sourced: false,
+        },
+    )?;
+    for results in doc_results {
+        for (result, comments) in results {
+            // Mirrors the DOM `else` branch's own identical truthiness
+            // accumulation for `--exit-status` (#178).
+            *any_truthy |= !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
+            let separator = Some(DocSeparatorArgs {
+                doc_streamed,
+                no_doc: output_config.no_doc,
+            });
+            output_value(writer, &result, &comments, output_config, separator)?;
+        }
+    }
+    Ok(num_docs)
+}
+
 /// Evaluate a jq expression on an OwnedValue by converting to JSON and back.
 ///
 /// Variables (`--arg`/`--argjson`, `$ARGS`) are substituted into `expr` up
@@ -4780,6 +4854,53 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             if fmt == InputFormat::Json {
                 index.mark_json_sourced();
             }
+
+            // #1350: `--sort-keys` has no soundness pass on the M2 fast
+            // path below -- fall back to the DOM evaluator for this whole
+            // input, which already gets it right. `index` is already built
+            // (this check costs nothing extra); the fallback itself is a
+            // second parse of `yaml_bytes`, paid only here.
+            //
+            // `is_identity` is load-bearing, not incidental:
+            // `stream_yaml_sort_keys_alias_fallback` always evaluates
+            // `&Expr::Identity`, not `program.expr` -- a non-identity
+            // M2-streamable filter (e.g. `.foo`) combined with `--sort-keys`
+            // on an alias-bearing document must keep evaluating that real
+            // filter on the fast path below, not silently ignore it here.
+            if is_identity
+                && sort_keys
+                && output_config.output_format == OutputFormat::Yaml
+                && index.has_aliases()
+            {
+                let doc_filter = args.document.map(|target| (target, global_doc_index));
+                // Single stdin input, no further reads to filter -- unlike
+                // the per-file loop's identical call below, `global_doc_index`
+                // is never consulted again after this `return`.
+                let _num_docs = stream_yaml_sort_keys_alias_fallback(
+                    &mut writer,
+                    &yaml_bytes,
+                    doc_filter,
+                    &mut sink,
+                    &output_config,
+                    args.pretty_print,
+                    FallbackStreamState {
+                        doc_streamed: &mut yaml_doc_streamed,
+                        any_truthy: &mut any_truthy,
+                    },
+                )?;
+                writer.flush()?;
+                if let Some(code) = sink.halted() {
+                    return Ok(code);
+                }
+                // No `write_terminator` here (unlike the P9 fast path's own
+                // identity branch below): `output_value`, which
+                // `stream_yaml_sort_keys_alias_fallback` calls per result,
+                // already writes its own terminator after each one -- an
+                // extra call here double-terminated every result (caught by
+                // this fix's own tests).
+                return Ok(i32::from(args.exit_status && !any_truthy));
+            }
+
             let root = index.root(&yaml_bytes);
 
             // Output each document using M2 streaming
@@ -4917,6 +5038,35 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 if fmt == InputFormat::Json {
                     index.mark_json_sourced();
                 }
+
+                // #1350: see the stdin branch's identical check above for
+                // the full rationale, including why `is_identity` is
+                // load-bearing here.
+                if is_identity
+                    && sort_keys
+                    && output_config.output_format == OutputFormat::Yaml
+                    && index.has_aliases()
+                {
+                    let doc_filter = args.document.map(|target| (target, global_doc_index));
+                    let num_docs = stream_yaml_sort_keys_alias_fallback(
+                        &mut writer,
+                        &yaml_bytes,
+                        doc_filter,
+                        &mut sink,
+                        &output_config,
+                        args.pretty_print,
+                        FallbackStreamState {
+                            doc_streamed: &mut yaml_doc_streamed,
+                            any_truthy: &mut any_truthy,
+                        },
+                    )?;
+                    global_doc_index += num_docs;
+                    if sink.halted().is_some() || stream_truncated.get() {
+                        break 'm2_files;
+                    }
+                    continue 'm2_files;
+                }
+
                 let root = index.root(&yaml_bytes);
 
                 match root.value() {
