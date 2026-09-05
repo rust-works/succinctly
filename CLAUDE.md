@@ -263,7 +263,11 @@ included. Divergence is permitted only where the reference emits output it canno
 back, where matching would corrupt data or discard a write, or where matching would take the
 host process down — and every divergence must be recorded in
 [docs/compliance/jq/limitations.md](docs/compliance/jq/limitations.md) or
-[docs/compliance/yq/limitations.md](docs/compliance/yq/limitations.md). Behavioural rules
+[docs/compliance/yq/limitations.md](docs/compliance/yq/limitations.md). A fork between
+candidate behaviours is decided in that order, in both modes: first whether one of those
+conditions lets us refuse the reference's behaviour, then which option matches the pinned
+reference more closely, and only when neither separates them, which option performs better
+or uses less memory (ADR-0018's #2416 amendment). Behavioural rules
 therefore belong on `EvalSemantics` (per-mode), not on per-format traits like
 `DocumentFields`.
 
