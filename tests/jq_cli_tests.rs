@@ -38242,3 +38242,25 @@ fn test_jq_binary_fanout_stays_right_major_2451() -> Result<()> {
 
     Ok(())
 }
+
+/// #2483: yq mode's new "ordering against a real `null` is false"
+/// rule (`eval::yq_null_ordering_is_false`) must not leak into jq mode --
+/// jq 1.7.1's total order still sorts `null` below every other value, so
+/// `null < 1` stays `true` and `1 < null` stays `false`, matching the
+/// pinned oracle.
+#[test]
+fn test_jq_mode_null_ordering_keeps_total_order_2483() -> Result<()> {
+    for (filter, expected) in [
+        ("null < 1", "true"),
+        ("null <= 1", "true"),
+        ("1 < null", "false"),
+        ("1 <= null", "false"),
+        ("null < null", "false"),
+        ("null <= null", "true"),
+    ] {
+        let (out, code) = run_jq_stdin(filter, "null", &["-c"])?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(out.trim(), expected, "`{filter}`");
+    }
+    Ok(())
+}
