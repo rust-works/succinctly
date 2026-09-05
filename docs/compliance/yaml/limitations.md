@@ -195,11 +195,13 @@ Three alias forms are refused at index build:
   properties of its own — carved out of the loader's usual "grammar isn't checked" policy
   because leaving it lenient had a specific, concrete cost: `&anchor *alias` is the *only*
   shape that can construct an alias chain more than one hop deep, so every multi-hop-chain
-  bug this codebase has ever had (#1193's stack-overflow DoS, #1315/#1318/#1319's
+  bug this codebase has ever had (#1193's stack-overflow DoS, #1315/#1319's
   single-hop-only accessor bugs) was reachable only through input real `yq` and PyYAML both
   already refuse. Both are confirmed live to reject every spelling (block value, next line,
   flow, mapping key, `!!str`-tagged) — this is not a case where matching means giving up an
-  advantage.
+  advantage. (#1318 looked like the same shape at first report but turned out to be a
+  different bug — nested `<<` merge-key *traversal*, not an alias chain — and needed its
+  own separate fix; see `CHANGELOG.md`.)
 
 ```
 $ printf 'a: &x {self: *x}\n' | succinctly yq '.'

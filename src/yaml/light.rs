@@ -4343,6 +4343,15 @@ enum FieldsInner<'a, W> {
     Direct(Option<YamlCursor<'a, W>>),
     Merged {
         entries: Rc<Vec<(YamlCursor<'a, W>, YamlCursor<'a, W>)>>,
+        /// Each `<<` field's own raw value cursor, in encounter order —
+        /// kept alongside the collapsed `entries` so `find`/`find_cursor`
+        /// can recurse into a merge source's *own* nested `<<` when a name
+        /// isn't found in this level's one-hop view (#1318). `entries`
+        /// alone can't support that: when two sources each have their own
+        /// `<<`, both get copied into `entries` under the same literal
+        /// `"<<"` key and the second silently overwrites the first via
+        /// `upsert_field`, discarding one source's chain entirely.
+        merge_value_cursors: Rc<Vec<YamlCursor<'a, W>>>,
         index: usize,
     },
 }
@@ -4351,8 +4360,13 @@ impl<W> Clone for FieldsInner<'_, W> {
     fn clone(&self) -> Self {
         match self {
             FieldsInner::Direct(c) => FieldsInner::Direct(*c),
-            FieldsInner::Merged { entries, index } => FieldsInner::Merged {
+            FieldsInner::Merged {
+                entries,
+                merge_value_cursors,
+                index,
+            } => FieldsInner::Merged {
                 entries: entries.clone(),
+                merge_value_cursors: merge_value_cursors.clone(),
                 index: *index,
             },
         }
@@ -4385,9 +4399,10 @@ impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
     pub fn from_mapping_cursor(mapping_cursor: YamlCursor<'a, W>) -> Self {
         let key_cursor = mapping_cursor.first_child();
         match resolve_merge_keys(key_cursor) {
-            Some(entries) => Self {
+            Some((entries, merge_value_cursors)) => Self {
                 inner: FieldsInner::Merged {
                     entries: Rc::new(entries),
+                    merge_value_cursors: Rc::new(merge_value_cursors),
                     index: 0,
                 },
             },
@@ -4414,7 +4429,7 @@ impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
     pub fn is_empty(&self) -> bool {
         match &self.inner {
             FieldsInner::Direct(c) => c.is_none(),
-            FieldsInner::Merged { entries, index } => *index >= entries.len(),
+            FieldsInner::Merged { entries, index, .. } => *index >= entries.len(),
         }
     }
 
@@ -4436,12 +4451,17 @@ impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
 
                 Some((field, rest))
             }
-            FieldsInner::Merged { entries, index } => {
+            FieldsInner::Merged {
+                entries,
+                merge_value_cursors,
+                index,
+            } => {
                 let &(key_cursor, value_cursor) = entries.get(*index)?;
 
                 let rest = Self {
                     inner: FieldsInner::Merged {
                         entries: entries.clone(),
+                        merge_value_cursors: merge_value_cursors.clone(),
                         index: index + 1,
                     },
                 };
@@ -4461,7 +4481,14 @@ impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
     /// YAML permits duplicate mapping keys; per YAML 1.2 and to match `yq`,
     /// the last matching entry wins (see issue #174). A `Merged` list is
     /// already deduplicated, so this loop is a no-op scan for it.
+    ///
+    /// A name absent from this level falls back to recursing into any merge
+    /// source's own nested `<<` (#1318) — see `merge_fallback`'s doc comment.
     pub fn find(&self, name: &str) -> Option<YamlValue<'a, W>> {
+        self.find_at_depth(name, 0)
+    }
+
+    fn find_at_depth(&self, name: &str, depth: usize) -> Option<YamlValue<'a, W>> {
         let mut fields = self.clone();
         let mut result = None;
         while let Some((field, rest)) = fields.uncons() {
@@ -4477,7 +4504,7 @@ impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
             }
             fields = rest;
         }
-        result
+        result.or_else(|| self.merge_fallback(name, depth).map(|c| c.value()))
     }
 
     /// Find a field by name and return a cursor to its value.
@@ -4485,7 +4512,14 @@ impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
     /// Same last-duplicate-key-wins semantics as [`find`](Self::find) — kept
     /// as a separate loop rather than reusing `find` so the returned cursor
     /// (needed for `line`/`column`) doesn't require re-navigating.
+    ///
+    /// A name absent from this level falls back to recursing into any merge
+    /// source's own nested `<<` (#1318) — see `merge_fallback`'s doc comment.
     pub fn find_cursor(&self, name: &str) -> Option<YamlCursor<'a, W>> {
+        self.find_cursor_at_depth(name, 0)
+    }
+
+    fn find_cursor_at_depth(&self, name: &str, depth: usize) -> Option<YamlCursor<'a, W>> {
         let mut fields = self.clone();
         let mut result = None;
         while let Some((field, rest)) = fields.uncons() {
@@ -4498,7 +4532,65 @@ impl<'a, W: AsRef<[u64]>> YamlFields<'a, W> {
             }
             fields = rest;
         }
-        result
+        result.or_else(|| self.merge_fallback(name, depth))
+    }
+
+    /// Recurse into this mapping's own merge sources' *nested* `<<` when
+    /// `name` isn't found at this level (#1318).
+    ///
+    /// `resolve_merge_keys`/`merge_field_into` only expand a mapping's
+    /// *own* merge sources one hop deep — a source's own `<<` field is
+    /// copied into `entries` verbatim, as a literal `"<<"` key, not
+    /// recursively resolved (see their doc comments; that stays correct
+    /// and unchanged, since `keys`/`has`/`to_entries`/`.[]`/`-o json` all
+    /// depend on seeing that literal `"<<"` entry). So a name that exists
+    /// only two-or-more hops down a merge chain (`z: {<<: *top}`,
+    /// `top: {<<: *mid}`, `mid: {<<: *base}`, name only on `base`) is
+    /// invisible to `entries`'s flat scan above — this walks
+    /// `merge_value_cursors` (each `<<` field's own raw value cursor,
+    /// captured during `resolve_merge_keys`'s single pass) and recurses
+    /// into every source `merge_sources` names for it.
+    ///
+    /// Order matters: when two sources both carry the name only via their
+    /// *own* nested merge, real yq (v4.53.3, default flags) has the
+    /// last-listed source in a `<<: [...]` sequence win, and the
+    /// last-declared of two separate `<<:` fields on the same mapping win
+    /// (verified live; neither is the reverse of what `merge_field_into`'s
+    /// existing one-hop copy gives for a *shallow* conflict on the same
+    /// sources — that shallow-conflict precedence is a separate,
+    /// out-of-scope divergence, since a name present at this level never
+    /// reaches this fallback at all). Iterating both loops in reverse and
+    /// returning the first hit reproduces that: the last-declared `<<:`
+    /// field and its last-listed source are tried first.
+    ///
+    /// `merge_sources` cannot form a cycle (`YamlIndex::build` rejects
+    /// alias cycles before any traversal runs — `validate_alias_acyclicity`
+    /// in `src/yaml/index.rs`), but nothing bounds a long *acyclic* chain
+    /// of sibling merges, so `depth` is checked against the same
+    /// `MAX_ALIAS_CHAIN_DEPTH` ceiling `resolve_alias_chain` uses for the
+    /// same class of hazard, purely as a stack-safety limit.
+    fn merge_fallback(&self, name: &str, depth: usize) -> Option<YamlCursor<'a, W>> {
+        let FieldsInner::Merged {
+            merge_value_cursors,
+            ..
+        } = &self.inner
+        else {
+            return None;
+        };
+
+        assert_depth(depth, MAX_ALIAS_CHAIN_DEPTH);
+
+        for &merge_value_cursor in merge_value_cursors.iter().rev() {
+            for source in merge_sources(merge_value_cursor).into_iter().rev() {
+                if let Some(hit) =
+                    YamlFields::from_mapping_cursor(source).find_cursor_at_depth(name, depth + 1)
+                {
+                    return Some(hit);
+                }
+            }
+        }
+
+        None
     }
 }
 
@@ -4511,6 +4603,15 @@ impl<'a, W: AsRef<[u64]>> Iterator for YamlFields<'a, W> {
         Some(field)
     }
 }
+
+/// `resolve_merge_keys`'s result: the collapsed, deduplicated one-hop field
+/// list, paired with each `<<` field's own raw value cursor in encounter
+/// order (used by `YamlFields::merge_fallback` to recurse into a merge
+/// source's *own* nested `<<` — see that function's doc comment, #1318).
+type MergedFields<'a, W> = (
+    Vec<(YamlCursor<'a, W>, YamlCursor<'a, W>)>,
+    Vec<YamlCursor<'a, W>>,
+);
 
 /// Resolve YAML merge keys (`<<`) into an ordered, deduplicated field list.
 ///
@@ -4538,7 +4639,11 @@ impl<'a, W: AsRef<[u64]>> Iterator for YamlFields<'a, W> {
 ///   folded last).
 /// - A merge source's own fields are taken verbatim: a `<<` key nested
 ///   inside a source is copied as an ordinary key, not expanded recursively.
-///   yq does not recurse into a merged-in mapping's own merge key.
+///   This merged *view* (what `keys`/`has`/`to_entries`/`.[]`/`-o json` see)
+///   is not recursed for the merged-in mapping's own merge key — but name
+///   *traversal* is: `YamlFields::find`/`find_cursor` falls back to
+///   recursing into it when a name isn't found here (`merge_fallback`,
+///   #1318).
 /// - An invalid merge value (null, scalar, an alias that doesn't resolve to
 ///   a mapping, or a non-mapping sequence element) contributes nothing
 ///   rather than erroring, matching yq's silent-skip behavior.
@@ -4572,7 +4677,7 @@ impl<'a, W: AsRef<[u64]>> Iterator for YamlFields<'a, W> {
 /// key is confirmed to exist.
 fn resolve_merge_keys<'a, W: AsRef<[u64]>>(
     first_key: Option<YamlCursor<'a, W>>,
-) -> Option<Vec<(YamlCursor<'a, W>, YamlCursor<'a, W>)>> {
+) -> Option<MergedFields<'a, W>> {
     let mut fields = YamlFields::raw(first_key);
     let mut seen: Vec<(YamlCursor<'a, W>, YamlCursor<'a, W>, YamlValue<'a, W>)> = Vec::new();
 
@@ -4584,16 +4689,23 @@ fn resolve_merge_keys<'a, W: AsRef<[u64]>>(
             let mut entries: Vec<(YamlCursor<'a, W>, YamlCursor<'a, W>)> =
                 Vec::with_capacity(seen.len() + 1);
             let mut positions: BTreeMap<String, usize> = BTreeMap::new();
+            // Each `<<` field's own raw value cursor, in encounter order —
+            // see `FieldsInner::Merged::merge_value_cursors`'s doc comment
+            // for why `entries` alone can't support `find`/`find_cursor`'s
+            // nested-merge fallback (#1318).
+            let mut merge_value_cursors: Vec<YamlCursor<'a, W>> = Vec::new();
 
             for (key, value, key_value) in seen {
                 upsert_field(&mut entries, &mut positions, key, value, &key_value);
             }
+            merge_value_cursors.push(field.value_cursor);
             merge_field_into(&mut entries, &mut positions, field.value_cursor);
 
             fields = rest;
             while let Some((field, rest)) = fields.uncons() {
                 let key_value = field.key_cursor.value();
                 if is_merge_key_value(&key_value) {
+                    merge_value_cursors.push(field.value_cursor);
                     merge_field_into(&mut entries, &mut positions, field.value_cursor);
                 } else {
                     upsert_field(
@@ -4607,7 +4719,7 @@ fn resolve_merge_keys<'a, W: AsRef<[u64]>>(
                 fields = rest;
             }
 
-            return Some(entries);
+            return Some((entries, merge_value_cursors));
         }
 
         seen.push((field.key_cursor, field.value_cursor, key_value));

@@ -398,6 +398,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **YAML `<<` merge-key field *traversal* now recurses through a merge source's own nested
+  `<<`, instead of silently reading as `null`** (#1318). `resolve_merge_keys`/
+  `merge_field_into` only ever expand a mapping's own merge sources one hop deep — a
+  source's own `<<` field is copied into the merged view as a literal `"<<"` key, not
+  recursively resolved (unchanged; `keys`/`has`/`to_entries`/`.[]`/`-o json` all depend on
+  seeing that literal entry). But `YamlFields::find`/`find_cursor` — the lookup behind
+  every `.field` access — only ever scanned that one-hop view, so a name reachable only
+  two-or-more hops down a merge chain was invisible:
+
+  ```console
+  $ printf 'base: &base {x: 1}\nmid: &mid {<<: *base}\ntop: &top {<<: *mid}\nz: {<<: *top}\n' \
+      | succinctly yq '.z.x'
+  1                                  # was: null
+  ```
+
+  `find`/`find_cursor` now fall back to recursing into each merge source's own nested `<<`
+  (via the same `merge_sources` used for the one-hop case) when a name isn't found in the
+  mapping's own merged view — bounded by the existing `MAX_ALIAS_CHAIN_DEPTH` ceiling as a
+  stack-safety limit, since cycles are already rejected at build time but an acyclic chain
+  of sibling merges has no other bound. Verified live against yq v4.53.3 that when the name
+  is reachable through more than one nested source, the *last*-listed source in a `<<:
+  [...]` sequence wins, and the *last*-declared of two separate `<<:` fields on the same
+  mapping wins — matched by iterating both in reverse and returning the first hit.
+
 - **`succinctly yq`'s default (non-validating) YAML loader now rejects `&anchor *alias`
   (an alias node decorated with its own anchor or tag) at parse time, matching real yq and
   PyYAML** (#1374). Per the YAML 1.2 grammar an alias node carries no properties of its
@@ -405,10 +429,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enforced this, but the default loader silently accepted it and built a walkable
   alias-to-alias chain from it — the *only* shape that can construct a multi-hop alias
   chain, and the root cause behind every multi-hop-chain bug this codebase has had
-  (#1193's stack-overflow DoS; #1315/#1318/#1319's single-hop-only accessor bugs, now
-  closed alongside this fix). `YamlIndex::build` now returns a new `YamlError::PropertyOnAlias`
-  for every spelling (block value, next line, flow sequence/mapping, mapping key, `!!str`
-  tag) rather than accepting it:
+  (#1193's stack-overflow DoS; #1315/#1319's single-hop-only accessor bugs, now closed
+  alongside this fix — #1318 turned out to be a different bug entirely, not an alias-chain
+  shape at all, and needed its own separate fix above). `YamlIndex::build` now returns a
+  new `YamlError::PropertyOnAlias` for every spelling (block value, next line, flow
+  sequence/mapping, mapping key, `!!str` tag) rather than accepting it:
 
   ```console
   $ printf 'a0: &a0 hello\na1: &a1 *a0\nz: *a1\n' | succinctly yq -o json '.'
