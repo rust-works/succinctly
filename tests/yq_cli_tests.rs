@@ -29095,39 +29095,39 @@ fn test_nth_limit_float_classification_matches_jq_mode_1825() -> Result<()> {
 /// even valid yq syntax -- its lexer rejects the bare keyword, confirmed
 /// live against yq v4.53.3). `select(false)` reaches the same
 /// zero-output-filter shape through ordinary yq syntax, and real yq's own
-/// behavior for it is neither "delete" nor "always leave `null`" -- an
-/// already-existing key/element is left completely untouched, while one
-/// only reached through autovivification still lands `null`. This test
-/// locks in that `update_path`'s `Field`/`Index`/`Iterate` arms keep their
-/// pre-#1916 shape (still-`null`, not deleted) for an *existing* target in
-/// yq mode, guarding against the #1916 fix regressing yq the way an
-/// unconditional (non-`S::TAG`-gated) version of it did during review: it
-/// deleted the key/element outright there instead, which real yq does not
-/// do at all.
+/// behavior for it is neither "delete" nor jq mode's "always leave
+/// `null`" -- an already-existing key/element is left **completely
+/// untouched**, while one only reached through autovivification still lands
+/// `null` (#2484). This test locks in that `update_path`'s
+/// `Field`/`Index`/`Iterate` arms keep an existing target unchanged (not
+/// deleted, and not overwritten with `null` either) in yq mode, guarding
+/// against the #1916 fix regressing yq the way an unconditional
+/// (non-`S::TAG`-gated) version of it did during review: it deleted the
+/// key/element outright there instead, which real yq does not do at all.
 #[test]
 fn test_field_index_iterate_update_path_unaffected_by_1916_in_yq_mode() -> Result<()> {
     let args = &["-o=json", "-I=0"];
 
-    // Field: the key stays present (still `null`, matching this arm's
-    // pre-#1916 shape), not deleted.
+    // Field: the key keeps its original value, untouched -- not deleted,
+    // and (#2484) not overwritten with `null` either.
     let (out, code) = run_yq_stdin(".a |= select(false)", "a: 1\nb: 2\n", args)?;
     assert_eq!(code, 0);
-    assert_eq!(out.trim(), r#"{"a":null,"b":2}"#);
+    assert_eq!(out.trim(), r#"{"a":1,"b":2}"#);
 
-    // Index: the array keeps its length, not shrunk.
+    // Index: the array keeps its length and its original element.
     let (out, code) = run_yq_stdin(".[0] |= select(false)", "[1, 2, 3]\n", args)?;
     assert_eq!(code, 0);
-    assert_eq!(out.trim(), "[null,2,3]");
+    assert_eq!(out.trim(), "[1,2,3]");
 
-    // Iterate over an array: no element removed.
+    // Iterate over an array: no element removed or overwritten.
     let (out, code) = run_yq_stdin(".[] |= select(. != 2)", "[1, 2, 3]\n", args)?;
     assert_eq!(code, 0);
-    assert_eq!(out.trim(), "[1,null,3]");
+    assert_eq!(out.trim(), "[1,2,3]");
 
-    // Iterate over an object: no key removed.
+    // Iterate over an object: no key removed or overwritten.
     let (out, code) = run_yq_stdin(".[] |= select(. != 2)", "a: 1\nb: 2\nc: 3\n", args)?;
     assert_eq!(code, 0);
-    assert_eq!(out.trim(), r#"{"a":1,"b":null,"c":3}"#);
+    assert_eq!(out.trim(), r#"{"a":1,"b":2,"c":3}"#);
 
     // A negative out-of-range index still raises yq's own eager bounds
     // error, not jq mode's deferred one -- unaffected by whether the
@@ -33503,5 +33503,77 @@ fn test_yq_binary_operator_fans_out_left_major_2451() -> Result<()> {
         assert_eq!(out.trim(), want, "`{filter}`");
     }
 
+    Ok(())
+}
+
+/// #2484: real yq's `|=` with a zero-output update filter leaves an
+/// already-existing target completely untouched, where jq 1.7.1 deletes the
+/// key/element (since jq 1.7) and succinctly's pre-fix yq mode wrote `null`
+/// -- a three-way divergence per ADR-0018 (mode decides). Captured live from
+/// yq v4.53.3 (`-o=json -I0`):
+///
+/// ```text
+/// $ yq '.a |= (1 | select(false))'         a: 1          => {"a":1}       (untouched)
+/// $ yq '.x |= (1 | select(false))'         a: 1          => {"a":1,"x":null}  (absent target: already agreed, #2470)
+/// $ yq '.a[] |= select(. > 5)'             a: [1,6,2,7]  => {"a":[1,6,2,7]}   (every element untouched, none removed)
+/// $ yq '.a[0] |= select(. > 5)'            a: [1,6,2,7]  => {"a":[1,6,2,7]}   (single index, same rule)
+/// $ yq '.a[10] |= select(. > 5)'           a: [1,2,3]    => padded with null out to index 10 (unaffected: #1916's own bounds rule, not this one)
+/// $ yq '.a[1:2] |= (. | select(false))'    a: [1,2,3]    => {"a":[1,2,3]}     (slice form untouched too)
+/// $ jq -c '.a |= (1 | select(false))'      {"a":1}       => {}               (jq 1.7.1 deletes the key -- unchanged by this fix, see jq_cli_tests.rs)
+/// ```
+///
+/// `.a |= (.zzz | key)` on `a: 1` (also asked for in the issue) is *not*
+/// pinned here: real yq answers `{"a":1}` (`.zzz` on the number `1` --
+/// `.a`'s own value, since `|=`'s right side runs against the target, not
+/// the whole document -- yields nothing, an already-known, separate
+/// divergence: yq indexes a *scalar* with a key as "nothing everywhere", not
+/// an error; see `docs/compliance/yq/limitations.md`'s "Row 2" under the
+/// absent-key-read entry). succinctly still raises `Cannot index number
+/// with string "zzz"` there today, so the update filter never gets the
+/// chance to be zero-output in the first place -- a pre-existing gap this
+/// fix does not touch.
+///
+/// Fixed in `update_path`'s own terminal `Expr::Identity` arm (the base
+/// case every `Field`/`Index`/`Iterate`/`Slice` arm's leaf write funnels
+/// through, plus `update_path_steps`'s identical terminal case, now a call
+/// into the same arm rather than a second copy of it).
+#[test]
+fn test_yq_update_zero_output_filter_leaves_target_untouched_2484() -> Result<()> {
+    let args = &["-o=json", "-I=0"];
+    for (doc, filter, expected) in [
+        ("a: 1\n", ".a |= (1 | select(false))", "{\"a\":1}"),
+        (
+            "a: 1\n",
+            ".x |= (1 | select(false))",
+            "{\"a\":1,\"x\":null}",
+        ),
+        (
+            "a: [1, 6, 2, 7]\n",
+            ".a[] |= select(. > 5)",
+            "{\"a\":[1,6,2,7]}",
+        ),
+        (
+            "a: [1, 6, 2, 7]\n",
+            ".a[0] |= select(. > 5)",
+            "{\"a\":[1,6,2,7]}",
+        ),
+        (
+            "a: [1, 2, 3]\n",
+            ".a[1:2] |= (. | select(false))",
+            "{\"a\":[1,2,3]}",
+        ),
+    ] {
+        let (output, code) = run_yq_stdin(filter, doc, args)?;
+        assert_eq!(code, 0, "`{filter}` on {doc:?}: {output:?}");
+        assert_eq!(output.trim(), expected, "`{filter}` on {doc:?}");
+    }
+    // #1916's own bounds rule is unaffected: a positive out-of-range index
+    // still pads with `null` all the way out, regardless of the filter.
+    let (output, code) = run_yq_stdin(".a[10] |= select(. > 5)", "a: [1, 2, 3]\n", args)?;
+    assert_eq!(code, 0, "{output:?}");
+    assert_eq!(
+        output.trim(),
+        "{\"a\":[1,2,3,null,null,null,null,null,null,null,null]}"
+    );
     Ok(())
 }
