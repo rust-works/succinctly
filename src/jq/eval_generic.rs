@@ -2499,6 +2499,27 @@ fn push_generic_owned_values<V: DocumentValue>(
 /// container-shaped condition is free.
 fn push_generic_truthiness_cursor_error<C: DocumentCursor>(c: &C, depth: usize) -> Option<Control> {
     assert_nesting_depth(depth);
+    // #1804: do not resolve through an alias here. A document shaped as a
+    // chain of anchors each referencing the previous one twice (`aN: &aN
+    // [*a(N-1), *a(N-1)]`) makes descending into every alias target cost
+    // O(2^N) -- the fan-out is the walk's own unconditional per-child
+    // recursion, not any per-node work, so the only fix is to stop before
+    // recursing into an alias at all. `select(.)`/`and`/`or`/`not`/`//`/
+    // `any`/`if` all agree with real yq that a non-null container is
+    // truthy regardless of contents, so skipping the corruption check
+    // inside an alias's target changes no truthiness answer either tool
+    // gives.
+    //
+    // Accepted trade-off: a decode failure reachable *only* through an
+    // alias (`a: &a ["bad\q"]` / `b: *a` with `select(.b)`) no longer
+    // raises from this check. It still raises whenever `.a` is visited
+    // directly, or `.b` is materialized (`.b[0]` keeps erroring) -- this
+    // walk is the only place that stops short. Real yq rejects that whole
+    // document at parse time, so there is no yq behaviour to match either
+    // way.
+    if c.is_alias() {
+        return None;
+    }
     let value = c.value();
     if let Some(fields) = value.as_object() {
         // The #1642 collision map is built lazily, only from the point an
