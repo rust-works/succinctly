@@ -792,7 +792,16 @@ jobs:
           # commits with the 0.42.0 binary: patch coverage now reports 7/7
           # new lines for eval.rs, not the pre-fix "5161/6070 new lines"
           # spanning nearly the whole file.
-          version: 0.42.0
+          # Bumped to 0.43.0 for #2467: that release adds source-comment
+          # coverage markers (rust-works/omni-dev#1593) -- `tolerate`/`ignore`
+          # regions delimited by `// omni-dev: coverage tolerate reason="..."`
+          # ... `// omni-dev: coverage end`, scanned from each revision's own
+          # source. On an older binary a marker comment is inert and nothing
+          # is silenced, so this pin must stay >= 0.43.0. This is what lets
+          # `src/util/simd/x86.rs` mask its CPU-gated `detect_fast_bmi2` flap
+          # (10 lines, net 9 covered, #2449) via an in-source marker instead
+          # of a file-level exclusion.
+          version: 0.43.0
           use-prebuilt-binary: ${{ matrix.use-prebuilt }}
           test-args: --features cli,simd,regex,serde --workspace
           fail-under-lines: 55   # floor a few pts below local llvm-cov (ARM: 59.58% lines)
