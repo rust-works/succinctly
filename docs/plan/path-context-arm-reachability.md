@@ -100,9 +100,13 @@ order; the `Gate` column names the first that fired for that query.
 | R2  | `can_absent && !absent_routed`       | the navigational head can miss, and `path_context_absent_split` declined the pipe     |
 | R3  | `!path_context_stage_native(stage)`  | the stage is built from a construct with no native cursor-threading arm               |
 
-R2 dominates the table because the natural probe shape starts `.a.b`, and a
-`.field` step can always miss. The same shapes with a head that cannot miss trip
-R3 instead -- e.g. `.a[] | (key | tostring)`, `.a[] | reduce (key) as $k (""; . +
+R2 still dominates the table, but for a narrower reason since #2472 (below): a
+`.field` step can always miss, and a *head that can miss* is only handed over
+now when neither the constant route nor the owned identity pipe can take the
+stages after it. The probe shape that trips it is `.a?` (which
+`path_context_is_navigational` excludes, so no position is walked) or a bare
+`parent` operand (which no route can name a position for). The same shapes with
+a head that cannot miss trip R3 instead -- e.g. `.a[] | (key | tostring)`, `.a[] | reduce (key) as $k (""; . +
 $k) | . + "x"` and `.a[] | select(key == "b" and true)` all report R3. This is an
 ordering artefact, not a claim that R3 is rare.
 
@@ -116,32 +120,32 @@ any further admission rather than trusting them.
 
 | #   | Handler (site in `eval_stage_with_path_context`)                   | Verdict   | Proof query (jq mode, document `D`)                   | Gate |
 |-----|--------------------------------------------------------------------|-----------|-------------------------------------------------------|------|
-| H1  | pre-match `if matches!(first, Expr::Builtin(Builtin::PathNoArg))`  | REACHABLE | `.a.b \| path + []`                                   | R2   |
-| H2  | pre-match `if matches!(first, Expr::Builtin(Builtin::Key))`        | REACHABLE | `.a.b \| key + "x"`                                   | R2   |
-| H3  | pre-match `if matches!(first, Expr::Builtin(Builtin::FileIndex))`  | REACHABLE | `.a.b \| file_index + 1`                              | R2   |
+| H1  | pre-match `if matches!(first, Expr::Builtin(Builtin::PathNoArg))`  | REACHABLE | `.a? \| path + []`                                    | R2   |
+| H2  | pre-match `if matches!(first, Expr::Builtin(Builtin::Key))`        | REACHABLE | `.a? \| key + "x"`                                    | R2   |
+| H3  | pre-match `if matches!(first, Expr::Builtin(Builtin::FileIndex))`  | REACHABLE | `.a? \| file_index + 1`                               | R2   |
 | H4  | pre-match `if matches!(first, Expr::Builtin(Builtin::Parent))`     | REACHABLE | `.a.b \| parent + {}`                                 | R2   |
 | H5  | pre-match `if let Expr::Builtin(Builtin::ParentN(n_expr)) = first` | REACHABLE | `.a.b \| parent(0+1) + {}`                            | R2   |
-| A01 | `Expr::Identity`                                                   | REACHABLE | `.a.b \| . \| key + "x"`                              | R2   |
-| A02 | `Expr::Field(name)`                                                | REACHABLE | `.a.b \| key + "x"`                                   | R2   |
-| A03 | `Expr::Index { idx, key }`                                         | REACHABLE | `.c[0] \| key + 1`                                    | R2   |
+| A01 | `Expr::Identity`                                                   | REACHABLE | `.a.b \| . \| parent + {}`                            | R2   |
+| A02 | `Expr::Field(name)`                                                | REACHABLE | `.a.b \| parent + {}`                                 | R2   |
+| A03 | `Expr::Index { idx, key }`                                         | REACHABLE | `.c[0] \| parent + []`                                | R2   |
 | A04 | `Expr::Slice { .. }`                                               | REACHABLE | `.c[0:1] \| .[0] \| key + 1`                          | R1   |
 | A05 | `Expr::Iterate`                                                    | REACHABLE | `.a[] \| (key \| tostring)`                            | R3   |
-| A06 | `Expr::Paren(inner)`                                               | REACHABLE | `(.a.b) \| key + "x"`                                 | R2   |
+| A06 | `Expr::Paren(inner)`                                               | REACHABLE | `.a.b \| (parent) + {}`                               | R2   |
 | A07 | `Expr::Optional(inner) if IndexExpr/SliceExpr`                     | REACHABLE | `.c[.n]? \| key + 1`                                  | R1   |
 | A08 | `Expr::Optional(inner)`                                            | REACHABLE | `.a? \| key + "x"`                                    | R2   |
 | A09 | `Expr::Pipe(inner) if rest.is_empty()`                             | REACHABLE | `.a.b \| -(key\|length)`                              | R2   |
-| A10 | `Expr::Pipe(inner)`                                                | REACHABLE | `.a.b \| key + "x"`                                   | R2   |
-| A11 | `Expr::Arithmetic { .. }`                                          | REACHABLE | `.a.b \| key + "x"`                                   | R2   |
+| A10 | `Expr::Pipe(inner)`                                                | REACHABLE | `.a.b \| parent + {}`                                 | R2   |
+| A11 | `Expr::Arithmetic { .. }`                                          | REACHABLE | `.a.b \| parent + {}`                                 | R2   |
 | A12 | `Expr::And(..) \| Expr::Or(..)`                                    | REACHABLE | `.a.b \| key == "b" and true`                         | R2   |
 | A13 | `Expr::Negate(operand)`                                            | REACHABLE | `.a.b \| -(key\|length)`                              | R2   |
-| A14 | `Expr::Compare { .. }`                                             | REACHABLE | `.a.b \| (key + "x") \| . == "bx"`                    | R2   |
-| A15 | `Expr::Builtin(Builtin::Select(cond))`                             | REACHABLE | `.a.b \| select(key == "b") \| key + "x"`             | R2   |
+| A14 | `Expr::Compare { .. }`                                             | REACHABLE | `.a? \| (key + "x") \| . == "bx"`                     | R2   |
+| A15 | `Expr::Builtin(Builtin::Select(cond))`                             | REACHABLE | `.a.b \| select(key == "b") \| parent + {}`           | R2   |
 | A16 | `Expr::Builtin(Builtin::Map(f))`                                   | REACHABLE | `.a \| map(key + "x")`                                | R2   |
 | A17 | `Expr::Builtin(Builtin::GetPath(path_expr))`                       | REACHABLE | `.a \| getpath(["b"]) \| . as $x \| key`              | R1   |
-| A18 | `Expr::Builtin(_)`                                                 | REACHABLE | `.a.b \| (key + "x") \| length`                       | R2   |
+| A18 | `Expr::Builtin(_)`                                                 | REACHABLE | `.a[] \| (key \| length)`                             | R3   |
 | A19 | `Expr::IndexExpr { target, key }`                                  | REACHABLE | `.c[.n] \| key + 1`                                   | R1   |
 | A20 | `Expr::SliceExpr { target, start, end }`                           | REACHABLE | `.c[.n:.m] \| .[0] \| key + 1`                        | R1   |
-| A21 | `Expr::Array(inner) if needs_path_context(inner)`                  | REACHABLE | `.a.b \| [key] + ["x"]`                               | R2   |
+| A21 | `Expr::Array(inner) if needs_path_context(inner)`                  | REACHABLE | `.a? \| [key] + ["x"]`                                | R2   |
 | A22 | `Expr::StringInterpolation(parts) if ..`                           | REACHABLE | `.a.b \| ("\(key)") \| . + "x"`                       | R2   |
 | A23 | `Expr::DefCall { .. }`                                             | REACHABLE | `def f: key; .a.b \| f + "x"`                         | R2   |
 | A24 | `Expr::Shared(inner)`                                              | REACHABLE | `def f(x): x; .a.b \| f(key) + "z"`                   | R2   |
@@ -153,7 +157,7 @@ any further admission rather than trusting them.
 | A30 | `Expr::LastExpr(expr) if ..`                                       | REACHABLE | `.a.b \| last(key + "x")`                             | R2   |
 | A31 | `Expr::Reduce { .. } if ..`                                        | REACHABLE | `.a.b \| reduce (key) as $k (""; . + $k) \| . + "x"`  | R2   |
 | A32 | `Expr::Foreach { .. } if ..`                                       | REACHABLE | `.a.b \| foreach (key) as $k (""; . + $k) \| . + "x"` | R2   |
-| A33 | `Expr::Object(_) \| Expr::Array(_) \| Expr::Literal(_)`            | REACHABLE | `.a.b \| (key + "x") \| {z: .}`                       | R2   |
+| A33 | `Expr::Object(_) \| Expr::Array(_) \| Expr::Literal(_)`            | REACHABLE | `.a? \| (key + "x") \| {z: .}`                        | R2   |
 | A34 | `Expr::If { .. }`                                                  | REACHABLE | `.a.b \| if key == "b" then key + "x" else "y" end`   | R2   |
 | A35 | `Expr::Comma(exprs)`                                               | REACHABLE | `.a.b \| (key + "x"), key`                            | R2   |
 | A36 | `Expr::Try { .. }`                                                 | REACHABLE | `.a.b \| try (key + "x") catch "e"`                   | R2   |
@@ -230,6 +234,60 @@ component -- which it cannot do uniformly, because an *absent* position
 is the next step for this cluster, and it is what would make the five `R1` rows
 unreachable.
 
+## #2472: gate reason 2 narrowed, and the pin still holds at 43
+
+[#2472](https://github.com/rust-works/succinctly/issues/2472) took two of the
+three shapes gate reason `R2` still hands over -- a `parent`/`parent(n)` read
+from a possibly-absent position inside a non-navigational stage, and navigation
+*after* a non-navigational stage -- and moved them onto the owned identity pipe
+(ADR-0021 decision 7). An absent position is the deepest real ancestor it hangs
+under plus the components taken past it, which is exactly an `OwnedIdentity`, so
+`parent` has a node to answer with and the position may move. The third shape, a
+fan-out head, stays eager by design: one position per element is the memory cost
+`path_context_fans_out` exists to refuse, and ADR-0021 records it as the exit
+condition's residue.
+
+**`PINNED_ARM_COUNT` stays at 43.** Re-run of the method above on the post-#2472
+tree, in two passes. Pass 1 instrumented `path_context_needs_eager` alone
+(one `eprintln!` per disjunct) and ran all 43 listed proof queries: **29 still
+enter the gate, 14 no longer do.** The 14 are `H1`, `H2`, `H3`, `A01`, `A02`,
+`A03`, `A06`, `A10`, `A11`, `A14`, `A15`, `A18`, `A21` and `A33` -- every one
+of them a `.a.b`-headed `key`/`path`/`file_index` shape, which is precisely the
+class the identity route now answers.
+
+Pass 2 instrumented those 14 handlers and swept the 29 surviving queries plus
+candidates. **All 14 still fire**, and the table above now carries the
+re-derived query for each (outputs pinned in
+`test_arm_audit_proof_queries_are_unmoved_by_the_gate_2416`, alongside the old
+spellings). Two shapes do the work:
+
+- **`?` is the reliable `R2` head now.** `path_context_is_navigational`
+  deliberately excludes `Expr::Optional` (the walk's own documented exclusion:
+  `?` in path context is not `?` in a path expression), so the absent split's
+  head stops before it, there is no position to walk, and the pipe still trips
+  `can_absent && !absent_routed`. `.a? | key + "x"` fires `H1`, `H2`, `A01`,
+  `A02`, `A11` and `A21` in one query.
+- **`parent` outside a ruled stage is still not routable.** A bare
+  `parent + {}` has `parent` as an arithmetic *operand*, and
+  `owned_identity_operand_resolvable` refuses a read it cannot name a position
+  for -- #2471's own pinned row. So `.a.b | parent + {}` still enters at `R2`
+  and reaches `A02`, `A10` and `A11`.
+
+The 29 unmoved rows need no re-derivation and none was done: this change does
+not touch `eval_stage_with_path_context` at all, only which pipes reach it, so a
+query that still enters the gate fires exactly the arms it fired before.
+
+**Nothing became unreachable, so nothing was deleted.** The reason is
+structural, not incidental: every arm listed here is reached by *some* stage
+shape, and the identity route accepts a `rest` only when every stage of it has
+an `owned_identity_rule` or is navigation the pipe can name a component for.
+`and`/`or` (`A12`), unary minus outside a ruled stage (`A13`), `map` (`A16`),
+`reduce`/`foreach` (`A31`/`A32`), `as`/`label`/`def` (`A23`-`A27`, `A37`,
+`A38`) and the bounded consumers (`A28`-`A30`) have no rule, so a pipe
+containing one still hands over -- and once it does, the generic structural
+arms (`A01`, `A02`, `A06`, `A10`, `A11`) run inside it. Deleting an arm needs
+those *stage* shapes migrated, not this route widened.
+
 ## Result
 
 | Metric                                            | Before | After |
@@ -238,6 +296,7 @@ unreachable.
 | ... proven REACHABLE by a live query               | --     | 43    |
 | ... proven UNREACHABLE                             | --     | 0     |
 | ... neither                                        | --     | 0     |
+| ... whose listed proof query moved off the gate    | --     | 14    |
 | `PINNED_ARM_COUNT`                                 | 43     | 43    |
 
 Nothing is deletable at this point in the spine. Doors 2 and 3 are closed as
@@ -263,7 +322,14 @@ evaluator, with no second route to check.
   proof query is the same one.
 - Reachability here is a property of the current tree. Re-run the method above
   (instrument, run, revert) rather than trusting this table after the gate or
-  `path_context_single_native` moves.
+  `path_context_single_native` moves. #2472 is the worked example: 14 of the 43
+  rows needed a re-derived query and *none* of them was unreachable, so a table
+  read without re-running would have claimed 14 deletable arms.
+- The `R2` cluster is now the *stage* shapes with no `owned_identity_rule`
+  (`and`/`or`, `map`, `reduce`/`foreach`, `as`/`label`/`def`, the bounded
+  consumers) plus a bare `parent` operand. Those are what to migrate next for
+  this reason; widening the absent route again buys nothing, because it already
+  accepts every `rest` those stages are missing from.
 - The step-5 closure did *not* change what the sweep
   (`scripts/jq-path-context-oracle-sweep.sh`) sees for `file_index`. Its
   yq-mode cases run `succinctly yq FILTER one.yaml two.yaml` with no
