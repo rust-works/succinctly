@@ -5818,6 +5818,14 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         Expr::Paren(inner) => eval_single::<S, _>(inner, value, optional, cursor),
 
         Expr::Pipe(exprs) => {
+            // #2451 rule 1: the branch-major union walk lives on the sink
+            // route, so the non-sink route reaches the *same* function
+            // through `collect_each_generic` rather than growing a second
+            // copy of it -- the same delegation `Expr::Label`/`Expr::DefCall`
+            // above already use.
+            if yq_context_pipe_applies::<S>(exprs) {
+                return collect_each_generic::<S, V>(expr, value, optional, cursor);
+            }
             // `path`/`parent`/`parent(n)`/`key` need the path accumulated
             // across every stage of this pipe, which only the full evaluator
             // tracks (`eval::eval_pipe`'s own `needs_path_context` routing,
@@ -7577,6 +7585,13 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Flow {
+    // #2451 rule 1: in yq mode a pipe with a union in it is evaluated over a
+    // whole context list, branch-major, by `eval_yq_context_pipe` -- ahead of
+    // the path-context routing below on purpose, since the sub-pipes it drives
+    // are handed a cursor each and reach that routing themselves.
+    if let Some(flow) = try_yq_context_pipe::<S, V>(exprs, value.clone(), optional, cursor, sink) {
+        return flow;
+    }
     if exprs.iter().any(needs_path_context) {
         // #2416 phase 2: the cursor walk emits straight into `sink`, so a
         // path-context pipe is as lazy as any other stage here. Anything the
@@ -7670,6 +7685,313 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
         Some(flow) => flow,
         None => upstream,
     }
+}
+
+/// One entry of a yq-mode *context list* (#2451): the succinctly spelling of
+/// real yq's `Context.MatchingNodes` element.
+///
+/// Deliberately narrower than [`GenericItem`], because a context list is held
+/// across several evaluations of *different* branch expressions and so has to
+/// be re-usable: a cursor (`V::Cursor: Copy`), a borrowed document value, or
+/// an owned one. That is also what keeps rule 1's memory cost bounded by the
+/// number of outputs rather than by the document -- a navigational upstream
+/// contributes one cursor per output, never a materialized subtree.
+///
+/// The three lazy [`GenericItem`] shapes (`LazyKeys`/`LazyIndexRange`/
+/// `LazySeq`) have no re-usable form, so they materialize into `Owned` on the
+/// way in (see [`yq_context_item`]). They stand for a single value each, so
+/// that is a fidelity-neutral loss of laziness on this route only.
+#[derive(Clone)]
+enum YqContextItem<V: DocumentValue> {
+    Cursor(V::Cursor),
+    Value(V),
+    Owned(OwnedValue),
+}
+
+impl<V: DocumentValue> YqContextItem<V> {
+    /// Hand this context entry back to the ordinary item-driven evaluator.
+    /// Takes `&self` because one entry is fed to *every* branch of a union.
+    fn to_generic_item(&self) -> GenericItem<V> {
+        match self {
+            Self::Cursor(c) => GenericItem::OneCursor(*c),
+            Self::Value(v) => GenericItem::One(v.clone()),
+            Self::Owned(o) => GenericItem::Owned(o.clone()),
+        }
+    }
+}
+
+/// Capture one produced [`GenericItem`] as a re-usable context entry.
+///
+/// `OneCursorValue`'s pre-decoded value (#1609) is dropped rather than
+/// carried: this entry may be replayed into many branches, and
+/// `GenericItem::OneCursorValue` is documented as constructible at exactly
+/// one site, so widening [`YqContextItem`] to keep it would trade a real
+/// invariant for one avoided re-decode.
+fn yq_context_item<V: DocumentValue>(item: GenericItem<V>) -> Result<YqContextItem<V>, Control> {
+    Ok(match item {
+        GenericItem::One(v) => YqContextItem::Value(v),
+        GenericItem::OneCursor(c) => YqContextItem::Cursor(c),
+        GenericItem::OneCursorValue(c, _) => YqContextItem::Cursor(c),
+        GenericItem::Owned(o) => YqContextItem::Owned(o),
+        lazy @ (GenericItem::LazyKeys { .. }
+        | GenericItem::LazyIndexRange(_)
+        | GenericItem::LazySeq(_)) => YqContextItem::Owned(generic_item_into_owned(lazy)?),
+    })
+}
+
+/// Does this pipe have a stage that is a union (`,`)?
+///
+/// A stage that is itself a (parenthesized) pipe counts, because `L | (X | Y)`
+/// and `(L | X) | Y` are the same evaluation in yq -- `pipeOperator`
+/// (`pkg/yqlib/operator_pipe.go`, v4.53.3) only threads its left side's whole
+/// node list into its right side, so pipe nesting is associative there. That
+/// is what [`yq_flatten_pipe_stages`] then relies on.
+///
+/// Allocation-free on purpose: this runs on *every* yq-mode pipe, and only
+/// the ones that answer `true` pay for the flattening.
+fn yq_pipe_has_union(stages: &[Expr]) -> bool {
+    stages.iter().any(|stage| match unwrap_paren(stage) {
+        Expr::Comma(_) => true,
+        Expr::Pipe(inner) => yq_pipe_has_union(inner),
+        _ => false,
+    })
+}
+
+/// Splice nested pipes into one flat stage list, stripping parens.
+///
+/// Both rewrites are semantics-preserving for every mode (`Expr::Paren` is
+/// already transparent to both evaluators, and `Expr::Pipe` nesting is
+/// associative), but this is only ever called from the yq-mode union route:
+/// its point is to put a union that sits at the head of a *nested* pipe --
+/// `(.a, .b) | ((.c, .d) | .)` -- at a stage index the union walk can see.
+fn yq_flatten_pipe_stages(stages: &[Expr], out: &mut Vec<Expr>) {
+    for stage in stages {
+        match unwrap_paren(stage) {
+            Expr::Pipe(inner) => yq_flatten_pipe_stages(inner, out),
+            other => out.push(other.clone()),
+        }
+    }
+}
+
+/// Run `stages` over one context entry, honouring `sink`'s demand.
+///
+/// The empty-`stages` case is *not* delegated to
+/// [`continue_pipe_element_generic`]: that would reach
+/// `eval_each_pipe_generic`'s own empty-pipe short-circuit, which drops the
+/// cursor. Here the entry is the answer, cursor and all.
+fn run_yq_stages_over_item<S: EvalSemantics, V: DocumentValue>(
+    stages: &[Expr],
+    item: &YqContextItem<V>,
+    optional: bool,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    if stages.is_empty() {
+        return push_one_generic(item.to_generic_item(), sink);
+    }
+    continue_pipe_element_generic::<S, V>(
+        item.to_generic_item(),
+        &mut RestPipe::new(stages),
+        optional,
+        sink,
+    )
+}
+
+/// Materialize the outputs of `stages` over a whole context list.
+///
+/// A control that ends the run **discards whatever the run already
+/// produced**, rather than handing the prefix on. That is real yq's own
+/// answer, and the same rule
+/// [`eval::streams_escaped_generator_prefix`](super::eval::streams_escaped_generator_prefix)
+/// already carries for the indexing family (#2226/#2326/#2351/#2374): a Go
+/// error aborts the whole expression there, so no partial node list survives
+/// it. Captured live against yq v4.53.3 on `{"a":{"b":1,"c":2},"d":[10,20]}`
+/// -- `(.a, error("e"))`, `(.a, error("e")) | .b`, `(.a, .d, error("e"))`,
+/// `(.a, error("e")) | (.b, .c)` and `.d[] , error("e")` each print nothing
+/// on stdout and `Error: e` on stderr, exit 1. This route is yq-only, so
+/// there is no jq-mode prefix-streaming arm to gate.
+fn collect_yq_context<S: EvalSemantics, V: DocumentValue>(
+    stages: &[Expr],
+    inputs: &[YqContextItem<V>],
+    optional: bool,
+) -> Result<Vec<YqContextItem<V>>, Control> {
+    let mut out: Vec<YqContextItem<V>> = Vec::new();
+    let mut stray: Option<Control> = None;
+    let flow =
+        eval_yq_context_pipe::<S, V>(stages, inputs, optional, &mut |item| match yq_context_item(
+            item,
+        ) {
+            Ok(entry) => {
+                out.push(entry);
+                Demand::Continue
+            }
+            Err(control) => {
+                stray = Some(control);
+                Demand::Stop
+            }
+        });
+    match (stray, flow) {
+        (Some(control), _) | (None, Flow::Escaped(control)) => Err(control),
+        // This sink only ever says `Stop` on the `stray` path handled above,
+        // so a `Stopped` here is one a *nested* consumer raised and already
+        // acted on -- nothing left to report.
+        (None, Flow::Exhausted | Flow::Stopped { .. }) => Ok(out),
+    }
+}
+
+/// Where rule 1's branch-major walk splits a flat pipe: the index of the
+/// first union stage, or `None` when this pipe is not one the walk owns.
+///
+/// The one declining case is an **absent** position: a navigational prefix
+/// that can land on a missing key (`.a.x`) followed by something that reads
+/// path context. Spine 2416's cursor walk and its absent sibling answer those
+/// exactly -- `.a.x | (key, path)` is `"x"`, `["a","x"]` on yq v4.53.3, and
+/// `"x"` is a key no node in the document has -- and a [`YqContextItem`] has
+/// no way to carry an absent position, only a cursor or a value. So the walk
+/// keeps them, and the answer is unchanged from before #2451.
+///
+/// That costs branch-major ordering only where a *missing-key-capable* stage
+/// sits between the multiplicity and the union, since the declining shapes
+/// are otherwise single-position: `head_can_yield_absent` is already `false`
+/// for `.a[]`/`.d[]` (iterating an absent node yields nothing) and for an
+/// empty prefix, which is every multi-element shape the sweep exercises.
+fn yq_union_stage_index(stages: &[Expr]) -> Option<usize> {
+    let at = stages.iter().position(|s| matches!(s, Expr::Comma(_)))?;
+    if stages.iter().any(needs_path_context) && head_can_yield_absent(&stages[..at]) {
+        return None;
+    }
+    Some(at)
+}
+
+/// **The one definition of rule 1 of yq's context-list model** (#2451): a
+/// pipe evaluated over a whole *list* of inputs at once, branch-major
+/// through every union it contains.
+///
+/// Real yq has no scalar evaluation mode. `Context.MatchingNodes`
+/// (`pkg/yqlib/context.go`, v4.53.3) is always a list; `|` hands its left
+/// side's entire list to its right side in one call (`operator_pipe.go`), and
+/// `,` (`operator_union.go`) evaluates *each of its branches against that
+/// whole list independently* and concatenates the branch results in order.
+/// So `(.a, .b) | (.c, .d)` is `3 5 4 6` -- `.c` over both, then `.d` over
+/// both -- where jq (and succinctly everywhere else) pipes each value
+/// independently and interleaves, `3 4 5 6`.
+///
+/// Captured live against Homebrew yq v4.53.3; the rows are in
+/// `test_yq_pipe_into_union_is_branch_major_2451`.
+///
+/// The walk is: find the first union stage; materialize everything before it
+/// over every input (that is the context list the union sees); run each
+/// branch over that whole list, concatenating; then recurse with the
+/// concatenation as the input list for the stages after the union. Recursing
+/// on the *concatenated* list, rather than continuing per branch output, is
+/// what makes a second union downstream see the first one's full result --
+/// `(.a, .b) | (.c, .d) | (. + 1, . + 2)` is `4 6 5 7 5 7 6 8`, which no
+/// per-output continuation produces. A branch that is itself a union recurses
+/// through the same entry point, so nesting needs no separate case.
+///
+/// Cost: one [`YqContextItem`] per output of the stages before each union --
+/// a cursor for a navigational upstream, so the list is bounded by the number
+/// of outputs, not by the document. The loss is demand: a consumer's `Stop`
+/// cannot reach back into a materialized list, so a `limit`/`first` wrapped
+/// around one of these pipes evaluates the union in full. Real yq has no
+/// side-effecting builtin to observe that with (`stderr`/`debug` are lexer
+/// errors there), and materializing is what real yq itself does, so this
+/// costs fidelity nothing on the reference surface.
+///
+/// `stages` must already be flat (see [`yq_flatten_pipe_stages`]).
+fn eval_yq_context_pipe<S: EvalSemantics, V: DocumentValue>(
+    stages: &[Expr],
+    inputs: &[YqContextItem<V>],
+    optional: bool,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    let Some(at) = yq_union_stage_index(stages) else {
+        // No union left -- or one this walk declines (see
+        // [`yq_union_stage_index`]) -- so back to the ordinary per-value
+        // pipe, which is both lazy and identical to yq for every other
+        // operator: they all loop their context list and concatenate.
+        // `run_yq_stages_over_item` re-enters `eval_each_pipe_generic`, whose
+        // own gate consults the same function, so a declined pipe takes the
+        // path-context routes rather than looping back here.
+        for item in inputs {
+            match run_yq_stages_over_item::<S, V>(stages, item, optional, sink) {
+                Flow::Exhausted => {}
+                stopped_or_escaped => return stopped_or_escaped,
+            }
+        }
+        return Flow::Exhausted;
+    };
+    let Expr::Comma(branches) = &stages[at] else {
+        // `yq_union_stage_index` matched this exact pattern to pick `at`.
+        unreachable!("the stage yq_union_stage_index selected is an Expr::Comma")
+    };
+
+    let context = if at == 0 {
+        inputs.to_vec()
+    } else {
+        match collect_yq_context::<S, V>(&stages[..at], inputs, optional) {
+            Ok(context) => context,
+            Err(control) => return Flow::Escaped(control),
+        }
+    };
+
+    let mut united: Vec<YqContextItem<V>> = Vec::new();
+    for branch in branches {
+        let mut flat: Vec<Expr> = Vec::new();
+        yq_flatten_pipe_stages(core::slice::from_ref(branch), &mut flat);
+        // Same as `eval_each_generic`'s own `Comma` arm: a branch that escapes
+        // ends the union, and the branches after it are not evaluated -- with
+        // the whole union's result discarded, per `collect_yq_context`.
+        match collect_yq_context::<S, V>(&flat, &context, optional) {
+            Ok(produced) => united.extend(produced),
+            Err(control) => return Flow::Escaped(control),
+        }
+    }
+
+    eval_yq_context_pipe::<S, V>(&stages[at + 1..], &united, optional, sink)
+}
+
+/// Does rule 1 own this pipe? **Both** routes must ask the same question:
+/// `eval_single`'s `Expr::Pipe` arm delegates here through
+/// `collect_each_generic`, and a pipe the walk declines falls back to the
+/// eager bridge, which re-enters `eval_single` with the very same stages --
+/// so an entry gate that admitted more than [`try_yq_context_pipe`] does is
+/// not a wasted check but an infinite loop between the two.
+fn yq_context_pipe_applies<S: EvalSemantics>(exprs: &[Expr]) -> bool {
+    if S::TAG != EvalTag::Yq || !yq_pipe_has_union(exprs) {
+        return false;
+    }
+    let mut flat: Vec<Expr> = Vec::new();
+    yq_flatten_pipe_stages(exprs, &mut flat);
+    yq_union_stage_index(&flat).is_some()
+}
+
+/// Rule 1's entry point from either evaluator route: `Some(flow)` when this
+/// is a yq-mode pipe with a union in it, `None` when the caller should carry
+/// on exactly as before.
+fn try_yq_context_pipe<S: EvalSemantics, V: DocumentValue>(
+    exprs: &[Expr],
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Option<Flow> {
+    if !yq_context_pipe_applies::<S>(exprs) {
+        return None;
+    }
+    let mut flat: Vec<Expr> = Vec::new();
+    yq_flatten_pipe_stages(exprs, &mut flat);
+    // The cursor, when there is one, so a path-context stage downstream still
+    // has a position to answer from.
+    let root = match cursor {
+        Some(c) => YqContextItem::Cursor(c),
+        None => YqContextItem::Value(value),
+    };
+    Some(eval_yq_context_pipe::<S, V>(
+        &flat,
+        core::slice::from_ref(&root),
+        optional,
+        sink,
+    ))
 }
 
 /// Generic-evaluator twin of `eval::each_take_first` (#1461): pull at most

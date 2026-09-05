@@ -34,16 +34,6 @@ yq/*/first/*/*        yq_first        real yq's first(f) ignores its argument an
 # position: `eval_pipe_with_path_context_internal` has no `Expr::Object` arm,
 # so the whole object construction falls to the context-dropping fallback.
 
-# Real yq's comma is stream-level: `.a[] | ((key), 1)` answers `"b" "c" 1 1`
-# (every `key` output, then every `1`), where succinctly interleaves per
-# element (`"b" 1 "c" 1`). Both branches here are parenthesised, so this is
-# *not* #2420's precedence rule -- that is fixed, and yq's grouping is now
-# succinctly yq's. What remains is yq's evaluation model: an operator is
-# applied to the whole context list its left-hand side produced, where
-# succinctly (like jq) pipes each value independently. Separately scoped;
-# #2420 is cited only because it is where the distinction was drawn.
-yq/*/comma/*/*        comma_stream    yq's comma composes at the stream level, succinctly's per element — #2420
-
 # `file_index` answers 0 for every input file. Real yq counts files (`0`,
 # `1`). Surfaced by this sweep — see the #2416 phase 0 report; no issue filed
 # yet.
