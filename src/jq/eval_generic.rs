@@ -6063,6 +6063,12 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // `eval.rs`'s identical arm.
         Expr::FuncDef { .. } => collect_each_generic::<S, V>(expr, value, optional, cursor),
 
+        // #2416 phase 3: transparent to cursor-based evaluation, same spirit
+        // as `Expr::Paren` above -- native via `eval_each_generic`'s own
+        // `Shared` pair (`is_pure_chain_link`'s split between the cheap
+        // eager path and the lazy one).
+        Expr::Shared(_) => collect_each_generic::<S, V>(expr, value, optional, cursor),
+
         Expr::Comma(exprs) => {
             let mut out: Vec<OwnedValue> = Vec::new();
             for expr in exprs {
@@ -11333,6 +11339,9 @@ fn path_context_single_native(expr: &Expr) -> bool {
         Expr::FuncDef { body, then, .. } => {
             path_context_single_native(body) && path_context_single_native(then)
         }
+        // Native since #2416 phase 3: transparent to evaluation, so whatever
+        // `inner` is decides.
+        Expr::Shared(inner) => path_context_single_native(inner),
         _ => false,
     }
 }
