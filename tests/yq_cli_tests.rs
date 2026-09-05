@@ -34199,4 +34199,168 @@ mod issue_870_position_shifting_writes {
         );
         Ok(())
     }
+
+    // -- review round: value alignment must not fire on coincidence -------
+
+    /// A `|=` that rewrites each element **in place** moves nothing, so
+    /// every element keeps its own comment. An earlier cut of this fix read
+    /// "no element matched by value" as "every element is new" and wiped
+    /// all four comments — worse than the positional walk it replaced.
+    ///
+    /// $ yq '.arr |= [.[] | .port = 9]'
+    ///   arr:\n  - name: a # ca\n    port: 9 # cp\n  - name: b # cb\n    port: 9 # cq
+    #[test]
+    fn test_yaml_in_place_transform_keeps_every_comment_870() -> Result<()> {
+        let input =
+            "arr:\n  - name: a # ca\n    port: 1 # cp\n  - name: b # cb\n    port: 2 # cq\n";
+        let (output, exit_code) = run_yq_stdin(".arr |= [.[] | .port = 9]", input, &[])?;
+        assert_eq!(exit_code, 0);
+        assert_eq!(
+            output,
+            "arr:\n  - name: a # ca\n    port: 9 # cp\n  - name: b # cb\n    port: 9 # cq\n"
+        );
+        Ok(())
+    }
+
+    /// The same, where the transform also changes each element's style.
+    ///
+    /// $ yq '.arr |= [.[] | . + "!"]'  =>  arr:\n  - "x!" # cx\n  - y! # cy
+    #[test]
+    fn test_yaml_in_place_transform_keeps_style_and_comment_870() -> Result<()> {
+        let input = "arr:\n  - \"x\" # cx\n  - y # cy\n";
+        let (output, exit_code) = run_yq_stdin(".arr |= [.[] | . + \"!\"]", input, &[])?;
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, "arr:\n  - \"x!\" # cx\n  - y! # cy\n");
+        Ok(())
+    }
+
+    /// The hard case for a value-based rule: incrementing `[1, 2]` gives
+    /// `[2, 3]`, which *reads* as "the 2 slid down a slot and the 3 is new".
+    /// It is not — each element was rewritten where it stood — and the
+    /// giveaway is that the result is not a permutation: the 3 matches
+    /// nothing. Both comments must stay on their own slots.
+    ///
+    /// $ yq '.arr |= [.[] + 1]'  =>  arr:\n  - 2 # c0\n  - 3 # c1
+    #[test]
+    fn test_yaml_coincidental_value_overlap_is_not_movement_870() -> Result<()> {
+        let input = "arr:\n  - 1 # c0\n  - 2 # c1\n";
+        let (output, exit_code) = run_yq_stdin(".arr |= [.[] + 1]", input, &[])?;
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, "arr:\n  - 2 # c0\n  - 3 # c1\n");
+        Ok(())
+    }
+
+    // -- closed literals inherit nothing ----------------------------------
+
+    /// A constructed literal is a new node in real yq, so it carries no
+    /// comment even when its value equals the element that was there — the
+    /// case value alignment alone cannot see.
+    ///
+    /// $ yq '.arr = ["b","a","a"]'  =>  arr:\n  - b\n  - a\n  - a
+    #[test]
+    fn test_yaml_closed_literal_array_inherits_nothing_870() -> Result<()> {
+        let input = "arr:\n  - a # c0\n  - a # c1\n  - b # c2\n";
+        let (output, exit_code) = run_yq_stdin(".arr = [\"b\",\"a\",\"a\"]", input, &[])?;
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, "arr:\n  - b\n  - a\n  - a\n");
+        Ok(())
+    }
+
+    /// The object half of the same rule, including the case where every
+    /// value is unchanged: yq still drops both comments, because both
+    /// values are literals in the filter rather than the document's nodes.
+    ///
+    /// $ yq '.o = {"a": "1", "b": 2}'  =>  o:\n  a: "1"\n  b: 2
+    #[test]
+    fn test_yaml_closed_literal_object_inherits_nothing_870() -> Result<()> {
+        let input = "o:\n  a: \"1\" # ca\n  b: 2 # cb\n";
+        let (output, code) = run_yq_stdin(".o = {\"a\": \"1\", \"b\": 2}", input, &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(output, "o:\n  a: \"1\"\n  b: 2\n");
+
+        // $ yq '.o = {"a": "9"}'  =>  o:\n  a: "9"
+        let (output, code) = run_yq_stdin(".o = {\"a\": \"9\"}", input, &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(output, "o:\n  a: \"9\"\n");
+        Ok(())
+    }
+
+    /// The converse: a constructor that *references* the document is not
+    /// closed, so those fields keep what their own keys had.
+    ///
+    /// $ yq '.o = {"b": .o.b, "a": .o.a}'  =>  o:\n  b: 2 # cb\n  a: "1" # ca
+    #[test]
+    fn test_yaml_referencing_constructor_is_not_a_closed_literal_870() -> Result<()> {
+        let input = "o:\n  a: \"1\" # ca\n  b: 2 # cb\n";
+        let (output, code) = run_yq_stdin(".o = {\"b\": .o.b, \"a\": .o.a}", input, &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(output, "o:\n  b: 2 # cb\n  a: \"1\" # ca\n");
+        Ok(())
+    }
+
+    /// `|=` and `+=` always read the node already there, so neither can be
+    /// a closed literal however literal its right-hand side looks — the
+    /// appended element is new, the existing ones keep everything.
+    ///
+    /// $ yq '.arr += ["z"]'  =>  arr:\n  - "x" # cx\n  - y # cy\n  - z
+    #[test]
+    fn test_yaml_compound_assign_is_never_a_closed_literal_870() -> Result<()> {
+        let input = "arr:\n  - \"x\" # cx\n  - y # cy\n";
+        let (output, exit_code) = run_yq_stdin(".arr += [\"z\"]", input, &[])?;
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, "arr:\n  - \"x\" # cx\n  - y # cy\n  - z\n");
+        Ok(())
+    }
+
+    // -- documented residuals ---------------------------------------------
+
+    /// **Known divergence** (gap 1 on `reconcile_presentation`): under a
+    /// permutation of *equal* elements, values cannot say which node went
+    /// where. Real yq, which tracks node identity, reverses the comments
+    /// (`c2, c1, c0`); matching by value pairs each `a` with the first
+    /// unclaimed `a` instead. Pinned so a future node-identity model
+    /// (#1351) has to update it deliberately.
+    #[test]
+    fn test_yaml_permutation_of_equal_elements_is_arbitrary_870() -> Result<()> {
+        let input = "arr:\n  - a # c0\n  - a # c1\n  - b # c2\n";
+        let (output, exit_code) = run_yq_stdin(".arr |= reverse", input, &[])?;
+        assert_eq!(exit_code, 0);
+        // yq: `- b # c2`, `- a # c1`, `- a # c0`.
+        assert_eq!(output, "arr:\n  - b # c2\n  - a # c0\n  - a # c1\n");
+        Ok(())
+    }
+
+    /// **Known divergence** (gap 2): a `del` at an array index renumbers
+    /// every later slot, so a static index from another stage means one
+    /// node before it and another after — and the target list records no
+    /// order. `collect_write_targets` declines the expression instead of
+    /// guessing, which leaves it on the positional walk; both orderings
+    /// then give the same answer, where yq's differ from it.
+    ///
+    /// yq prints `- - new` / `  - b0 # b0` for both.
+    #[test]
+    fn test_yaml_del_renumbering_another_stages_index_falls_back_870() -> Result<()> {
+        let input = "arr:\n  - - a0 # a0\n  - - b0 # b0\n";
+        for filter in [
+            ".arr[1] = ([\"new\"] + .arr[1]) | del(.arr[0])",
+            "del(.arr[0]) | .arr[0] = ([\"new\"] + .arr[0])",
+        ] {
+            let (output, exit_code) = run_yq_stdin(filter, input, &[])?;
+            assert_eq!(exit_code, 0, "{filter}");
+            assert_eq!(output, "arr:\n  - - new # a0\n    - b0\n", "{filter}");
+        }
+        Ok(())
+    }
+
+    /// The bail-out above must stay narrow: a `del` alongside a write that
+    /// never enters the same array is unambiguous, and both fixes still
+    /// apply.
+    #[test]
+    fn test_yaml_del_beside_an_unrelated_write_still_remaps_870() -> Result<()> {
+        let input = "arr:\n  - \"x\" # cx\n  - y # cy\nn: 1\n";
+        let (output, exit_code) = run_yq_stdin("del(.arr[0]) | .n = 2", input, &[])?;
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, "arr:\n  - y # cy\nn: 2\n");
+        Ok(())
+    }
 }
