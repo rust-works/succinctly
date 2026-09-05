@@ -398,6 +398,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`succinctly yq`'s default (non-validating) YAML loader now rejects `&anchor *alias`
+  (an alias node decorated with its own anchor or tag) at parse time, matching real yq and
+  PyYAML** (#1374). Per the YAML 1.2 grammar an alias node carries no properties of its
+  own; the opt-in strict validator (`check_after_anchor`, `src/yaml/validate.rs`) already
+  enforced this, but the default loader silently accepted it and built a walkable
+  alias-to-alias chain from it — the *only* shape that can construct a multi-hop alias
+  chain, and the root cause behind every multi-hop-chain bug this codebase has had
+  (#1193's stack-overflow DoS; #1315/#1318/#1319's single-hop-only accessor bugs, now
+  closed alongside this fix). `YamlIndex::build` now returns a new `YamlError::PropertyOnAlias`
+  for every spelling (block value, next line, flow sequence/mapping, mapping key, `!!str`
+  tag) rather than accepting it:
+
+  ```console
+  $ printf 'a0: &a0 hello\na1: &a1 *a0\nz: *a1\n' | succinctly yq -o json '.'
+  Error: YAML parse error: alias '*a0' at offset 22 cannot carry an anchor or tag (an alias node has no node properties)
+  ```
+
+  A document-root form across a `---` multi-document separator (`--- &a0 hello\n--- &a1
+  *a0`) is rejected too, even though real yq accepts it there — real yq's own output for
+  that shape is corrupted (`"hello--- &a1 *a0"`, concatenating the prior document's value
+  with the next line's literal text), so matching would mean reproducing the corruption
+  rather than the behaviour (ADR-0018 rule 4(b)); see
+  [docs/compliance/yq/limitations.md](docs/compliance/yq/limitations.md#anchor-on-alias-at-document-root-level--rule-4b).
+  `MAX_ALIAS_CHAIN_DEPTH` remains in `src/yaml/light.rs` purely as defense in depth, since a
+  parser-built index can no longer reach a chain depth past 1 through any valid input.
+
 - **Two rows of #2349's own delimiter-consistency matrix stayed open after that fix
   landed** (#2358). Both are the "bare `value: &V`, no container cursor available" shape
   #2211/#2243 already documented as a permanent limitation on some materializers, but

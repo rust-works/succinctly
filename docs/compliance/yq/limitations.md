@@ -176,6 +176,41 @@ Two interactions remain open, neither closed by #1709 itself:
    materially larger change than #1709's own scope, filed separately as
    [#2004](https://github.com/rust-works/succinctly/issues/2004).
 
+### Anchor-on-alias at document-root level — rule 4(b)
+
+An alias node carrying its own `&anchor`/`!tag` (`&a *b`) is invalid per the YAML 1.2
+grammar — an alias node has no properties of its own. Real yq and PyYAML both confirm this
+live for the ordinary shape, inside a mapping or sequence:
+
+```bash
+$ printf 'a0: &a0 hello\na1: &a1 *a0\nz: *a1\n' | yq .
+Error: bad file '-': yaml: while parsing a block mapping at <unknown position>: line 1, column 9: did not find expected key
+```
+
+succinctly's default loader now rejects this uniformly ([#1374](https://github.com/rust-works/succinctly/issues/1374),
+`YamlError::PropertyOnAlias`; see
+[YAML Limitations](../yaml/limitations.md#three-exceptions-an-alias-with-no-usable-target-or-an-illegal-decoration-is-rejected)) —
+for the ordinary shape above this is bug-for-bug fidelity, not a divergence: real yq errors,
+succinctly errors.
+
+The one shape where this *is* a deliberate divergence is at document-root level, across a
+`---` multi-document separator. There, real yq does not error at all — it silently emits
+corrupted output instead, concatenating the first document's scalar value with the literal
+*text* of the following `---`-anchor-alias line:
+
+```bash
+$ printf -- '--- &a0 hello\n--- &a1 *a0\n' | yq .
+---
+hello--- &a1 *a0
+$ printf -- '--- &a0 hello\n--- &a1 *a0\n' | yq -o=json .
+"hello--- &a1 *a0"
+```
+
+(Both confirmed live against yq v4.53.3, exit 0 — real yq does not treat this as an error at
+all.) succinctly rejects this shape too rather than reproduce the corruption, per rule 4(b)
+(matching would corrupt a document): a `"hello--- &a1 *a0"` string is not a value any
+reasonable query result should ever produce, and there is no way to make it round-trip.
+
 ### Merge-flag `+` and `d` combined — **no carve-out; this one is out of policy**
 
 Real yq's `*+d` applies the deep-merge *and* the append, doubling the right operand.
