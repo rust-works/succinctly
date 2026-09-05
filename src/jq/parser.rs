@@ -5166,6 +5166,44 @@ impl<'a> Parser<'a> {
             self.skip_ws();
         }
 
+        // #2451 rule 2: a union of two identities yields the list *once*.
+        //
+        // Real yq's `,` (`pkg/yqlib/operator_union.go:32`, v4.53.3) appends
+        // its right operand's nodes only `if rhs.MatchingNodes !=
+        // lhs.MatchingNodes` -- a Go pointer comparison on the backing
+        // `*list.List`, there so that two self-modifying operands don't get
+        // double-counted. `.` (`operator_self.go`, `return context, nil`)
+        // hands back its input context object untouched, and so does a pipe
+        // of `.`s (`operator_pipe.go` builds its RHS context with
+        // `ChildContext(lhs.MatchingNodes)`, reusing the same list), so the
+        // guard fires for them too. Every other operator builds a fresh list
+        // via `ChildContext(list.New())` and is always appended.
+        //
+        // Chained `,` is right-associative in yq (`expression_postfix.go`
+        // pops only on *strictly* greater precedence, and `,`'s is equal to
+        // its own), so only the innermost pair can ever collapse -- which,
+        // for the flat operand list this parser builds, is exactly "drop the
+        // last operand when the last two are both identity-transparent",
+        // applied once. Live-captured on `a: {c: 3, d: 4}\nb: {c: 5, d: 6}`,
+        // where `(.a, .b) | (., ., ...)` with 1..7 dots prints
+        // `2, 2, 4, 6, 8, 10, 12` lines -- `2 * max(1, n - 1)`, which is what
+        // one dropped operand and no other change produces.
+        //
+        // The survivor is kept as a **one-branch `Expr::Comma`**, not
+        // unwrapped to the bare operand: a union always builds itself a
+        // *fresh* list, so an enclosing `,` must still append it. Real yq
+        // agrees -- `(.a, .b) | ((., .), .)` and `(.a, .b) | (., (., .))`
+        // both print 4 lines, where unwrapping the inner pair back to `.`
+        // would collapse the outer pair too and print 2. A one-branch union
+        // evaluates to exactly its branch, so nothing else changes.
+        if exprs.len() >= 2 {
+            let tail = &exprs[exprs.len() - 2..];
+            if tail.iter().all(yq_union_returns_input_context) {
+                exprs.pop();
+                return Ok(Expr::Comma(exprs));
+            }
+        }
+
         Ok(Expr::comma(exprs))
     }
 
@@ -5740,6 +5778,33 @@ impl<'a> Parser<'a> {
 /// // Object construction
 /// let expr = parse("{name: .name, age: .age}").unwrap();
 /// ```
+/// Does this yq-mode expression hand its input context object straight back,
+/// unchanged and un-copied?
+///
+/// That is the property real yq's `,` pointer-compares on -- see
+/// [`Parser::parse_yq_comma_expr`] for the mechanism and the captured
+/// sequence. In the surface language only `.` has it, plus the two shapes
+/// that are transparently `.`: parentheses, and a pipe whose every stage is
+/// itself transparent (`. | .`, live-verified to collapse:
+/// `(.a, .b) | ((. | .), .)` prints 2 lines, not 4).
+///
+/// Deliberately *not* extended to assignment operands, which real yq's own
+/// comment names as the guard's intended case (`(.foo = "bar"), (.thing =
+/// "cat")`): succinctly's assignments return an independently-edited document
+/// rather than mutating one shared context, so collapsing the pair would drop
+/// a write rather than de-duplicate one. That is a separate, larger
+/// divergence -- `yq '(.a.c = 1), (.b.c = 2)'` prints **one** document with
+/// both writes where succinctly prints two with one each -- recorded in
+/// docs/compliance/yq/limitations.md rather than half-fixed here.
+fn yq_union_returns_input_context(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identity => true,
+        Expr::Paren(inner) => yq_union_returns_input_context(inner),
+        Expr::Pipe(stages) => stages.iter().all(yq_union_returns_input_context),
+        _ => false,
+    }
+}
+
 pub fn parse(input: &str) -> Result<Expr, ParseError> {
     parse_with_mode(input, ParserMode::Jq)
 }
@@ -6065,6 +6130,71 @@ mod tests {
     /// says the *mode* decides, so the load-bearing assertion here is that the
     /// **same source text parses to two different ASTs** depending on
     /// `ParserMode`, not that either shape exists in isolation.
+    /// #2451 rule 2: in yq mode a union whose *innermost* pair is two
+    /// identity-transparent operands drops the second one at parse time.
+    ///
+    /// Real yq's `,` appends its right operand only when the two operands
+    /// return different backing lists (`operator_union.go:32`, v4.53.3), and
+    /// `.` returns its input context object verbatim. Chained `,` is
+    /// right-associative there, so only the innermost pair can ever collapse
+    /// -- which, over this parser's flat operand list, is one `pop`.
+    ///
+    /// The survivor stays wrapped in a one-branch `Expr::Comma`, because a
+    /// union always builds a fresh list and so an *enclosing* union must
+    /// still append it: `(.a, .b) | ((., .), .)` prints 4 lines in real yq,
+    /// which unwrapping to a bare `Expr::Identity` would turn into 2.
+    ///
+    /// jq mode never collapses -- `jq -c '(.a, .b) | (., .)'` prints four
+    /// lines (captured from /usr/bin/jq 1.7.1).
+    #[test]
+    fn test_yq_union_of_two_identities_yields_the_list_once_2451() {
+        let yq = |s: &str| parse_with_mode(s, ParserMode::Yq).unwrap();
+        let id = Expr::Identity;
+
+        // The innermost pair collapses; the survivor keeps its union wrapper.
+        assert_eq!(yq("., ."), Expr::Comma(vec![id.clone()]));
+        assert_eq!(yq("., ., ."), Expr::Comma(vec![id.clone(), id.clone()]));
+        assert_eq!(
+            yq("., ., ., ."),
+            Expr::Comma(vec![id.clone(), id.clone(), id.clone()])
+        );
+
+        // Transparent through parens and through a pipe of identities --
+        // `pipeOperator` reuses its left side's list rather than copying it.
+        assert_eq!(
+            yq("(.), ."),
+            Expr::Comma(vec![Expr::Paren(Box::new(id.clone()))])
+        );
+        assert_eq!(
+            yq(". | ., ."),
+            Expr::Comma(vec![Expr::Pipe(vec![id.clone(), id.clone()])])
+        );
+
+        // A non-transparent operand on either side of the innermost pair
+        // blocks the collapse; every operand still contributes.
+        assert_eq!(
+            yq("., ., .c"),
+            Expr::Comma(vec![id.clone(), id.clone(), Expr::Field("c".into())])
+        );
+        assert_eq!(
+            yq(".c, ."),
+            Expr::Comma(vec![Expr::Field("c".into()), id.clone()])
+        );
+
+        // A nested union is a fresh list, so the outer pair does not collapse
+        // even though the inner one did.
+        assert_eq!(
+            yq("(., .), ."),
+            Expr::Comma(vec![
+                Expr::Paren(Box::new(Expr::Comma(vec![id.clone()]))),
+                id.clone(),
+            ])
+        );
+
+        // jq mode is untouched: `parse_comma_expr` has no collapse at all.
+        assert_eq!(parse("., .").unwrap(), Expr::Comma(vec![id.clone(), id]));
+    }
+
     #[test]
     fn test_yq_mode_pipe_binds_tighter_than_comma_2420() {
         let int = |i: i64| Expr::Literal(Literal::number_literal(i.to_string()));

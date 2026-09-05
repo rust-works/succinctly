@@ -27832,11 +27832,17 @@ fn test_decode_failure_does_not_corrupt_json_output_1247() -> Result<()> {
 
         // Materializing: `--arg` forces the DOM path, and a multi-result
         // filter loses its cursor to `GenericResult::Many`.
+        //
+        // The multi-result spelling is `.,.,.` rather than `.,.`: since
+        // #2451 a union of two bare identities yields the list *once* in yq
+        // mode (real yq's own pointer-identity guard), so `.,.` is no longer
+        // multi-result at all. Three dots is the shortest spelling that
+        // still is -- yq prints the document twice for it.
         for extra in [
             &["-o", "json", "-I", "0", "--arg", "z", "y"][..],
             &["-o", "json", "-I", "0"][..],
         ] {
-            let filter = if extra.len() > 4 { "." } else { ".,." };
+            let filter = if extra.len() > 4 { "." } else { ".,.,." };
             let (output, stderr, exit_code) = run_yq_split(filter, input, extra)?;
             match materialized {
                 None => {
@@ -27848,7 +27854,7 @@ fn test_decode_failure_does_not_corrupt_json_output_1247() -> Result<()> {
                 }
                 Some(expected) => {
                     assert_eq!(exit_code, 0, "args {extra:?}, stderr: {stderr}");
-                    let expected = if filter == ".,." {
+                    let expected = if filter == ".,.,." {
                         format!("{expected}\n{expected}")
                     } else {
                         expected.to_string()
@@ -32207,6 +32213,134 @@ fn test_yq_union_branch_error_discards_the_prefix_2451() -> Result<()> {
         assert_eq!(out, "", "`{filter}` should print nothing");
         assert!(err.contains("Error: e"), "`{filter}` stderr: {err}");
         assert_eq!(code, 1, "`{filter}` exit");
+    }
+
+    Ok(())
+}
+
+/// #2451 rule 2: a union of two bare identities yields the list **once**.
+///
+/// `,` in real yq (`pkg/yqlib/operator_union.go:32`, v4.53.3) appends its
+/// right operand's nodes only `if rhs.MatchingNodes != lhs.MatchingNodes` --
+/// a pointer comparison on the backing list, there so two self-modifying
+/// operands aren't double-counted. `.` (`operator_self.go`) hands its input
+/// context object straight back, so the guard fires for it. Chained `,` is
+/// right-associative (`expression_postfix.go` pops only on strictly greater
+/// precedence), so exactly one operand is ever dropped -- which is what makes
+/// `n` identical `.` branches over a 2-element context print
+/// `2 * max(1, n - 1)` lines.
+///
+/// Every row is a live capture; jq's answer is quoted beside it and pinned in
+/// `jq_cli_tests.rs`'s `test_jq_union_of_identities_still_duplicates_2451`.
+#[test]
+fn test_yq_union_of_two_identities_yields_the_list_once_2451() -> Result<()> {
+    let args = &["-o", "json", "-I0"];
+    let doc = CONTEXT_LIST_DOC_2451;
+    let a = r#"{"c":3,"d":4}"#;
+    let b = r#"{"c":5,"d":6}"#;
+
+    // The `2, 2, 4, 6, 8, 10, 12` sequence for 1..7 identical `.` branches:
+    //
+    // $ yq -o=json -I0 '(.a, .b) | (.)'                    =>  2 lines
+    // $ yq -o=json -I0 '(.a, .b) | (., .)'                 =>  2 lines
+    // $ yq -o=json -I0 '(.a, .b) | (., ., .)'              =>  4 lines
+    // $ yq -o=json -I0 '(.a, .b) | (., ., ., .)'           =>  6 lines
+    // $ yq -o=json -I0 '(.a, .b) | (., ., ., ., .)'        =>  8 lines
+    // $ yq -o=json -I0 '(.a, .b) | (., ., ., ., ., .)'     => 10 lines
+    // $ yq -o=json -I0 '(.a, .b) | (., ., ., ., ., ., .)'  => 12 lines
+    //
+    // jq prints `2n` for all of them (`(.a, .b) | (., .)` is 4 lines).
+    for (dots, groups) in [(1, 1), (2, 1), (3, 2), (4, 3), (5, 4), (6, 5), (7, 6)] {
+        let branches = vec!["."; dots].join(", ");
+        let (out, code) = run_yq_stdin(&format!("(.a, .b) | ({branches})"), doc, args)?;
+        assert_eq!(code, 0, "{dots} dots");
+        let want = vec![format!("{a}\n{b}"); groups].join("\n");
+        assert_eq!(out.trim(), want, "{dots} dots");
+    }
+
+    // $ yq -o=json -I0 '(.a, .b) | (., ., .c)'
+    //     =>  {a} / {b} / {a} / {b} / 3 / 5
+    // $ jq -c        '(.a, .b) | (., ., .c)'
+    //     =>  {a} / {a} / 3 / {b} / {b} / 5
+    // A differing third branch does not un-collapse the leading pair, and it
+    // is not itself dropped: three branches, six lines.
+    let (out, code) = run_yq_stdin("(.a, .b) | (., ., .c)", doc, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), format!("{a}\n{b}\n{a}\n{b}\n3\n5"));
+
+    // $ yq -o=json -I0 '(.a, .b) | (.c, .)'  =>  3 / 5 / {a} / {b}
+    // $ jq -c        '(.a, .b) | (.c, .)'    =>  3 / {a} / 5 / {b}
+    // The *first* operand of the pair is not transparent, so nothing drops.
+    let (out, code) = run_yq_stdin("(.a, .b) | (.c, .)", doc, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), format!("3\n5\n{a}\n{b}"));
+
+    // Transparency reaches through parentheses and through a pipe of
+    // identities -- `pipeOperator` hands its left side's own list to its
+    // right side rather than copying it, so `. | .` is still the same list.
+    //
+    // $ yq -o=json -I0 '(.a, .b) | ((.), .)'    =>  {a} / {b}
+    // $ yq -o=json -I0 '(.a, .b) | (. | ., .)'  =>  {a} / {b}
+    // jq prints 4 lines for both (and reads `(. | ., .)` as `. | (., .)`,
+    // since jq ranks `,` tighter than `|` -- the opposite of yq, #2420).
+    for filter in ["(.a, .b) | ((.), .)", "(.a, .b) | (. | ., .)"] {
+        let (out, code) = run_yq_stdin(filter, doc, args)?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(out.trim(), format!("{a}\n{b}"), "`{filter}`");
+    }
+
+    // A *nested* union builds a fresh list, so an enclosing pair does not
+    // collapse even when the inner one did.
+    //
+    // $ yq -o=json -I0 '(.a, .b) | ((., .), .)'  =>  {a} / {b} / {a} / {b}
+    // $ yq -o=json -I0 '(.a, .b) | (., (., .))'  =>  {a} / {b} / {a} / {b}
+    for filter in ["(.a, .b) | ((., .), .)", "(.a, .b) | (., (., .))"] {
+        let (out, code) = run_yq_stdin(filter, doc, args)?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(out.trim(), format!("{a}\n{b}\n{a}\n{b}"), "`{filter}`");
+    }
+
+    Ok(())
+}
+
+/// #2451 rule 2 composed with rule 1: the capture's rows 5, 8, N1 and N2,
+/// which need both -- the collapse decides how many branches there are, the
+/// branch-major walk decides their order.
+#[test]
+fn test_yq_identity_union_composes_with_branch_major_order_2451() -> Result<()> {
+    let args = &["-o", "json", "-I0"];
+    let doc = CONTEXT_LIST_DOC_2451;
+
+    for (filter, want) in [
+        // $ yq -o=json -I0 '(.a, .b) | (.c, .d) | (., .)'  =>  3 / 5 / 4 / 6
+        // $ jq -c        '(.a, .b) | (.c, .d) | (., .)'    =>  3/3/4/4/5/5/6/6
+        ("(.a, .b) | (.c, .d) | (., .)", "3\n5\n4\n6"),
+        // $ yq -o=json -I0 '(.a, .b) | .c | (., .)'  =>  3 / 5
+        // $ jq -c        '(.a, .b) | .c | (., .)'    =>  3 / 3 / 5 / 5
+        ("(.a, .b) | .c | (., .)", "3\n5"),
+        // $ yq -o=json -I0 '((.a, .b) | (.c, .d)) | (., .)'  =>  3 / 5 / 4 / 6
+        // $ jq -c        '((.a, .b) | (.c, .d)) | (., .)'    =>  3/3/4/4/5/5/6/6
+        ("((.a, .b) | (.c, .d)) | (., .)", "3\n5\n4\n6"),
+        // $ yq -o=json -I0 '(.a, .b) | ((.c, .d) | (., .))'  =>  3 / 5 / 4 / 6
+        // $ jq -c        '(.a, .b) | ((.c, .d) | (., .))'    =>  3/3/4/4/5/5/6/6
+        ("(.a, .b) | ((.c, .d) | (., .))", "3\n5\n4\n6"),
+        // $ yq -o=json -I0 '.n | (.[0], .[1]) | (., .)'  =>  1 / 2
+        (".n | (.[0], .[1]) | (., .)", "1\n2"),
+        // $ yq -o=json -I0 '[.n[] | (., .)]'  =>  [1,2,3]
+        // $ jq -c        '[.n[] | (., .)]'    =>  [1,1,2,2,3,3]
+        ("[.n[] | (., .)]", "[1,2,3]"),
+        // $ yq -o=json -I0 '(.n[0], .n[1]) | [., .]'  =>  [1] / [2]
+        // $ jq -c        '(.n[0], .n[1]) | [., .]'    =>  [1,1] / [2,2]
+        // `[...]` collects per context node, and within one node the pair
+        // collapses to a single element.
+        ("(.n[0], .n[1]) | [., .]", "[1]\n[2]"),
+        // $ yq -o=json -I0 '(., .) | length'  =>  3
+        // $ jq -c        '(., .) | length'    =>  3 / 3
+        ("(., .) | length", "3"),
+    ] {
+        let (out, code) = run_yq_stdin(filter, doc, args)?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(out.trim(), want, "`{filter}`");
     }
 
     Ok(())
