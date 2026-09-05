@@ -1982,3 +1982,246 @@ fn test_target_partial_prefix_path_context_sites_miss_the_yq_gate_2374() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Spine 2416 step 5: `eval::eval_pipe`'s path-context diversion
+//
+// `eval_pipe` used to send any pipe with a `needs_path_context` stage straight
+// to `eval::eval_pipe_with_path_context`, with no gate at all -- the third of
+// the three routes into the eager evaluator that
+// `docs/plan/path-context-arm-reachability.md` found. It now hands the pipe to
+// `eval_generic` with a root cursor over a reindexed copy of its input, so
+// `path_context_needs_eager` decides, and the pipes that decision keeps eager
+// reach the same evaluator by the same values as before.
+//
+// Two things need pinning, and neither is visible to the walk-vs-bridge axis
+// above: the *reachable* shapes (a path-context pipe only reaches `eval_pipe`
+// through a construct `needs_path_context` does not recurse into, so no
+// top-level filter gets there) and the *absence of a loop* (the generic
+// evaluator's own bridge re-enters `eval.rs`; a redirect that bounced back
+// would not fail an assertion, it would not return).
+// ---------------------------------------------------------------------------
+
+/// The document the audit's proof queries were captured against
+/// (`docs/plan/path-context-arm-reachability.md`, "Method").
+const ARM_AUDIT_DOC: &[u8] = br#"{"a":{"b":1},"c":[10,20],"n":0,"m":1}"#;
+
+/// Every proof query from the arm-reachability audit's 43-row table, with the
+/// output it had before `eval_pipe`'s diversion was routed through the gate.
+///
+/// jq 1.7.1 has no `key`/`parent`/`path`/`file_index` at all (`key/0 is not
+/// defined`, exit 3), so there is no oracle for these in jq mode; they are
+/// succinctly extensions and what is asserted is that closing the door moved
+/// none of them. The audit's own table is the index: a row here that changes
+/// invalidates a row there.
+#[test]
+fn test_arm_audit_proof_queries_are_unmoved_by_the_gate_2416() {
+    let rows: &[(&str, &[&str])] = &[
+        ("path + []", &[r#"["a","b"]"#]),
+        (r#".a.b | key + "x""#, &[r#""bx""#]),
+        (".a.b | file_index + 1", &["1"]),
+        (".a.b | parent + {}", &[r#"{"b":1}"#]),
+        (".a.b | parent(0+1) + {}", &[r#"{"b":1}"#]),
+        (r#".a.b | . | key + "x""#, &[r#""bx""#]),
+        (".c[0] | key + 1", &["1"]),
+        (".c[0:1] | .[0] | key + 1", &["1"]),
+        (r#".a[] | key + "x""#, &[r#""bx""#]),
+        (r#"(.a.b) | key + "x""#, &[r#""bx""#]),
+        (".c[.n]? | key + 1", &["1"]),
+        (r#".a? | key + "x""#, &[r#""ax""#]),
+        (".a.b | -(key|length)", &["-1"]),
+        (r#".a.b | key == "b" and true"#, &["true"]),
+        (r#".a.b | (key + "x") | . == "bx""#, &["true"]),
+        (r#".a.b | select(key == "b") | key + "x""#, &[r#""bx""#]),
+        (r#".a | map(key + "x")"#, &[r#"["bx"]"#]),
+        (r#".a | getpath(["b"]) | . as $x | key"#, &[r#""b""#]),
+        (r#".a.b | (key + "x") | length"#, &["2"]),
+        (".c[.n] | key + 1", &["1"]),
+        (".c[.n:.m] | .[0] | key + 1", &["1"]),
+        (r#".a.b | [key] + ["x"]"#, &[r#"["b","x"]"#]),
+        (r#".a.b | ("\(key)") | . + "x""#, &[r#""bx""#]),
+        (r#"def f: key; .a.b | f + "x""#, &[r#""bx""#]),
+        (r#"def f(x): x; .a.b | f(key) + "z""#, &[r#""bz""#]),
+        (r#".a.b | def f: key; f + "x""#, &[r#""bx""#]),
+        (r#".a.b | . as $x | key + "x""#, &[r#""bx""#]),
+        (r#".c | . as [$x] | key + "x""#, &[r#""cx""#]),
+        (r#".a.b | limit(1; key + "x")"#, &[r#""bx""#]),
+        (r#".a.b | first(key + "x")"#, &[r#""bx""#]),
+        (r#".a.b | last(key + "x")"#, &[r#""bx""#]),
+        (
+            r#".a.b | reduce (key) as $k (""; . + $k) | . + "x""#,
+            &[r#""bx""#],
+        ),
+        (
+            r#".a.b | foreach (key) as $k (""; . + $k) | . + "x""#,
+            &[r#""bx""#],
+        ),
+        (r#".a.b | (key + "x") | {z: .}"#, &[r#"{"z":"bx"}"#]),
+        (
+            r#".a.b | if key == "b" then key + "x" else "y" end"#,
+            &[r#""bx""#],
+        ),
+        (r#".a.b | (key + "x"), key"#, &[r#""bx""#, r#""b""#]),
+        (r#".a.b | try (key + "x") catch "e""#, &[r#""bx""#]),
+        (r#".a.b | label $o | ((key + "x"), break $o)"#, &[r#""bx""#]),
+        (
+            r#".a[] | if key == "b" then key + "x" else "y" end"#,
+            &[r#""bx""#],
+        ),
+        (
+            r#".a[] | reduce (key) as $k (""; . + $k) | . + "x""#,
+            &[r#""bx""#],
+        ),
+    ];
+    for (filter, expected) in rows {
+        // `path + []` is the audit's H1 row spelled against `.a.b`.
+        let filter = if *filter == "path + []" {
+            ".a.b | path + []"
+        } else {
+            filter
+        };
+        let full = full_outputs(ARM_AUDIT_DOC, filter);
+        assert_eq!(
+            as_strs(&full),
+            *expected,
+            "arm-audit proof query moved: `{filter}`"
+        );
+        assert_eq!(
+            as_strs(&generic_outputs(ARM_AUDIT_DOC, filter)),
+            *expected,
+            "arm-audit proof query moved in the generic evaluator: `{filter}`"
+        );
+    }
+}
+
+/// The shapes that actually reach `eval::eval_pipe` with a path-context pipe.
+///
+/// Measured, not guessed: with the diversion instrumented, exactly these
+/// constructs got there, because `needs_path_context` deliberately does not
+/// recurse into `reduce`/`foreach`'s UPDATE and EXTRACT, into an assignment's
+/// right-hand side, or into `Expr::Object`'s entries -- so the enclosing
+/// program answers `false` and the inner pipe arrives with no routing
+/// decision made for it. The first four are `path_context_needs_eager ==
+/// false` rows, i.e. the ones the door closure actually moves onto the
+/// generic evaluator.
+///
+/// Two rows are oracle-backed; the rest are succinctly extensions in jq mode
+/// (jq 1.7.1 has no `key`), pinned as unmoved. Captured live from yq v4.53.3
+/// on 2026-09-05, on `{"a":{"b":1,"e":2},"c":[10,20]}` written as YAML:
+///
+/// ```console
+/// $ yq -o=json -I0 '.x = [.a[] | key]' d.yaml
+/// {"a":{"b":1,"e":2},"c":[10,20],"x":["b","e"]}
+/// $ yq -o=json -I0 '.x = (.a.b | key)' d.yaml
+/// {"a":{"b":1,"e":2},"c":[10,20],"x":"b"}
+/// ```
+#[test]
+fn test_path_context_pipes_reaching_eval_pipe_are_unmoved_2416() {
+    const DOC: &[u8] = br#"{"a":{"b":1,"e":2},"c":[10,20]}"#;
+    let rows: &[(&str, &[&str])] = &[
+        // `reduce`'s UPDATE: `.` is the accumulator, so the pipe's position
+        // is the accumulator's own, which is exactly what the reindexed root
+        // cursor expresses.
+        ("reduce .c[] as $x (.a; [.[] | key])", &["[0,1]"]),
+        (
+            "foreach .c[] as $x (.a; .; [.[] | key])",
+            &[r#"["b","e"]"#, r#"["b","e"]"#],
+        ),
+        (
+            "reduce .c[] as $x (.a; . + {\"z\": ([.[] | key] | length)})",
+            &[r#"{"b":1,"e":2,"z":3}"#],
+        ),
+        // Assignment right-hand side -- and real yq agrees, see the captures
+        // in this test's doc comment.
+        (
+            ".x = [.a[] | key]",
+            &[r#"{"a":{"b":1,"e":2},"c":[10,20],"x":["b","e"]}"#],
+        ),
+        (
+            ".x = (.a.b | key)",
+            &[r#"{"a":{"b":1,"e":2},"c":[10,20],"x":"b"}"#],
+        ),
+        // `with_entries`'s inner filter, and `any/2`'s condition: both reach
+        // `eval_pipe` with `path_context_needs_eager == true`, so they still
+        // take the eager evaluator -- pinned so the split between the two
+        // answers is visible if the gate moves.
+        (
+            r".a | with_entries(.value = (.a.b | key))",
+            &[r#"{"b":"b","e":"b"}"#],
+        ),
+    ];
+    for (filter, expected) in rows {
+        assert_eq!(
+            as_strs(&full_outputs(DOC, filter)),
+            *expected,
+            "door-3 shape moved: `{filter}`"
+        );
+        assert_eq!(
+            as_strs(&generic_outputs(DOC, filter)),
+            *expected,
+            "door-3 shape moved in the generic evaluator: `{filter}`"
+        );
+    }
+}
+
+/// The redirect does not recurse.
+///
+/// `eval_pipe` hands its pipe to the generic evaluator, whose own bridges
+/// (`eval_on_owned` -> `eval_full` -> `eval_single`) come straight back into
+/// `eval.rs`. If the gate's `false` answer could be reached a second time for
+/// the same pipe, the two would ping-pong -- and a loop does not fail an
+/// assertion, it hangs or overflows the stack, so the test *completing* is
+/// the assertion. Depth is deliberately past any constant fan-out: a bounded
+/// number of bounces would still finish, a loop would not.
+#[test]
+fn test_eval_pipe_path_context_redirect_does_not_recurse_2416() {
+    const DOC: &[u8] = br#"{"a":{"b":1,"e":2},"c":[10,20]}"#;
+
+    // A path-context pipe nested `depth` levels deep inside `reduce` UPDATEs,
+    // each level re-entering `eval_pipe` with that level's accumulator as its
+    // root. Only depth 1 has a value to pin -- from depth 2 the accumulator
+    // is the inner `reduce`'s own array result, which has no `.a`, so the
+    // filter raises. That is the pre-existing answer (identical on the tree
+    // before this change), and it is still the right shape to run: the
+    // recursion this test is about happens on the way *in*, before the type
+    // error is reached.
+    assert_eq!(
+        as_strs(&full_outputs(DOC, "reduce .c[] as $x (.a; [.[] | key])")),
+        ["[0,1]"]
+    );
+    for depth in [2_usize, 4, 8] {
+        let mut filter = String::from("[.[] | key]");
+        for _ in 0..depth {
+            filter = format!("reduce .c[] as $x (.a; {filter})");
+        }
+        // Returning at all is the assertion; the equality keeps the two
+        // evaluators from drifting into different non-answers.
+        assert_eq!(
+            full_outputs(DOC, &filter),
+            generic_outputs(DOC, &filter),
+            "depth {depth}: `{filter}`"
+        );
+    }
+
+    // A long path-context pipe and a deep parenthesis nest around one, so the
+    // per-stage and per-level recursion inside the redirect are exercised on
+    // a filter that stays well-typed all the way down.
+    //
+    // The depths here (and the fold depths above) are bounded by what a debug
+    // test thread's 2 MiB stack holds, not by what the redirect can take: the
+    // release binary answers all three shapes at 64 folds / 200 stages / 100
+    // parens, identically before and after this change. A loop would not fit
+    // in any of them.
+    let stages: String = core::iter::repeat_n(" | .", 60).collect();
+    let filter = format!(".x = ([.a[] | key]{stages})");
+    assert_eq!(
+        as_strs(&full_outputs(DOC, &filter)),
+        [r#"{"a":{"b":1,"e":2},"c":[10,20],"x":["b","e"]}"#]
+    );
+
+    let filter = format!(".x = {}[.a[] | key]{}", "(".repeat(30), ")".repeat(30));
+    assert_eq!(
+        as_strs(&full_outputs(DOC, &filter)),
+        [r#"{"a":{"b":1,"e":2},"c":[10,20],"x":["b","e"]}"#]
+    );
+}

@@ -16114,7 +16114,7 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Ok(v) => v,
             Err(e) => return suppress_or_raise(e, optional),
         };
-        return eval_pipe_with_path_context::<W, S>(exprs, &owned, &[], optional);
+        return eval_path_context_pipe_owned::<W, S>(exprs, &owned, optional);
     }
 
     if exprs.is_empty() {
@@ -29825,7 +29825,23 @@ fn eval_owned_input_reindexed<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let index = JsonIndex::build(json_bytes);
     let cursor = index.root(json_bytes);
 
-    match eval_single::<Vec<u64>, S>(expr, cursor.value(), optional).materialize_cursor() {
+    detach_from_temp_document(eval_single::<Vec<u64>, S>(expr, cursor.value(), optional))
+}
+
+/// Own every value in `result` so it stops borrowing the throwaway document
+/// it was evaluated against, and can satisfy any caller's `'a`/`W`.
+///
+/// One definition shared by [`eval_owned_input_reindexed`] and
+/// [`eval_path_context_pipe_owned`] (spine 2416, step 5): both build a
+/// temporary `JsonIndex` over `to_json_for_reindex` output, so both have to
+/// detach before returning, and a second hand-written copy of this match is
+/// exactly the "duplicated predicates diverge silently" shape (#106) --
+/// `Partial` is stream-preserving here and collapsing it would be an easy,
+/// silent way for the two copies to disagree.
+fn detach_from_temp_document<'a, W: Clone + AsRef<[u64]>>(
+    result: QueryResult<'_, Vec<u64>>,
+) -> QueryResult<'a, W> {
+    match result.materialize_cursor() {
         QueryResult::One(v) => QueryResult::Owned(to_owned_lossy(&v)),
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
         QueryResult::Many(vs) => QueryResult::ManyOwned(vs.iter().map(to_owned_lossy).collect()),
@@ -29835,7 +29851,7 @@ fn eval_owned_input_reindexed<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
         QueryResult::Halt(code) => QueryResult::Halt(code),
-        // Stream-preserving, so a `Partial` passes straight through — this
+        // Stream-preserving, so a `Partial` passes straight through -- this
         // function's whole point is keeping the shape intact.
         QueryResult::Partial(vs, control) => QueryResult::Partial(vs, control),
     }
@@ -31590,6 +31606,79 @@ fn builtin_isvalid<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 // ============================================================================
 // Phase 10: Path Expressions, Math, Environment, etc.
 // ============================================================================
+
+/// Route a path-context pipe reaching [`eval_pipe`] through the one gate
+/// (spine 2416, step 5 -- the audit's "door 3",
+/// `docs/plan/path-context-arm-reachability.md`).
+///
+/// `eval_pipe` used to call [`eval_pipe_with_path_context`] on any pipe with
+/// a `needs_path_context` stage, with no gate at all. `jq::eval` no longer
+/// reaches that (ADR-0021 decision 4), but the generic evaluator's bridges
+/// back into this file do: `needs_path_context` deliberately does not recurse
+/// into `Expr::Object`'s entries, `reduce`/`foreach`'s UPDATE/EXTRACT,
+/// `limit`'s `n`, or a `?//` chain, so a pipe hidden in one of those reaches
+/// this evaluator with the enclosing program's own routing decision already
+/// made against a `false`. Measured, not assumed: `reduce .c[] as $x (.a;
+/// [.[] | key])` and `.x = [.a[] | key]` both arrive here, and
+/// [`crate::jq::eval_generic::path_context_needs_eager`] answers `false` for
+/// both.
+///
+/// **The reindex is what makes the generic route exact here.** The eager
+/// evaluator treats the value it is handed as its own root (`current_path`
+/// is `[]`), while the generic evaluator answers `key`/`parent`/`path` from
+/// a cursor -- and [`eval_pipe`] has no cursor to give it, only a
+/// `StandardJson` that may be a sub-value of a larger document. Serializing
+/// `owned` into a throwaway document and taking *its* root cursor is exactly
+/// the eager evaluator's position, expressed as a node: same round trip
+/// `eval_owned_input_reindexed` and `eval_generic::eval_on_owned` already
+/// make. Handing the pipe over with no cursor instead was tried and is
+/// wrong -- `key` then falls through `eval_builtin`'s cursor-guarded arm to
+/// the `null` stub, and `.x = [.a[] | key]` prints `[null,null]` rather than
+/// `["b","e"]`.
+///
+/// Two conditions keep the eager evaluator, and both are checked *before*
+/// paying for the round trip:
+///
+/// * `path_context_needs_eager` -- the one gate, ADR-0021 decision 3;
+/// * a value the reindex would not round-trip
+///   ([`crate::jq::eval_generic::reindex_bridge_is_identity`]) -- today only
+///   a `NumberLiteral` past `REINDEX_LITERAL_LEN_CAP` (#1211), since a
+///   `StandardJson` sourced number materializes as a `NumberLiteral`, never
+///   a bare `Float`. Sending that through the round trip would silently drop
+///   the literal, which the current eager route does not.
+///
+/// Non-recursive by construction: the eager branch is terminal, and the
+/// generic branch is only taken when the gate said `false`, which is the one
+/// answer that stops `eval_single`'s own `Expr::Pipe` arm from bridging the
+/// same pipe back here through `eval_on_owned`.
+fn eval_path_context_pipe_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    exprs: &[Expr],
+    owned: &OwnedValue,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    use super::eval_generic::{path_context_needs_eager, reindex_bridge_is_identity};
+    // The gate call stays *in the condition* -- `tests/jq_path_context_
+    // single_door_guard.rs` reads the `if` itself, and a boolean bound above
+    // it reads as gated to a human but not to that scan. The round-trip test
+    // is bound, because spelling it inline makes
+    // `clippy::suspicious_operation_groupings` read the two different
+    // arguments (`exprs`, `owned`) as a typo.
+    let round_trip_is_lossless = reindex_bridge_is_identity(owned);
+    if path_context_needs_eager(exprs) || !round_trip_is_lossless {
+        return eval_pipe_with_path_context::<W, S>(exprs, owned, &[], optional);
+    }
+
+    // Same throwaway document `eval_owned_input_reindexed` builds, and the
+    // same `to_json_for_reindex` (not `to_json`) for the same reason (#561).
+    let json_str = owned.to_json_for_reindex::<S>();
+    let json_bytes = json_str.as_bytes();
+    let index = crate::json::JsonIndex::build(json_bytes);
+    let cursor = index.root(json_bytes);
+
+    let result =
+        super::eval_generic::eval_path_context_pipe_with_cursor::<S, _>(exprs, cursor, optional);
+    detach_from_temp_document(generic_to_query_result(result))
+}
 
 /// Evaluate a pipe while tracking the traversal path.
 /// This enables PathNoArg and Parent to access the path context.

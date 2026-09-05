@@ -2109,7 +2109,7 @@ const REINDEX_LITERAL_LEN_CAP: usize = 256;
 /// (`"1e+19"`), while `.outer.big|parent|.big+0` wrongly *gained* it for a
 /// value the pipe had just computed. Only a value the bridge would have left
 /// alone can safely skip the bridge.
-fn reindex_bridge_is_identity(value: &OwnedValue) -> bool {
+pub(crate) fn reindex_bridge_is_identity(value: &OwnedValue) -> bool {
     match value {
         OwnedValue::Float(_) => false,
         OwnedValue::Int(_) => true,
@@ -3954,6 +3954,37 @@ pub fn eval_with_cursor_using<S: EvalSemantics, C: DocumentCursor>(
         return eval_each_owned_collect::<S, C::Value>(expr, &owned, false);
     }
     eval_single::<S, C::Value>(expr, cursor.value(), false, Some(cursor))
+}
+
+/// Evaluate a path-context pipe reaching this module from `eval.rs`'s own
+/// `eval_pipe` (spine 2416, step 5 -- the audit's "door 3").
+///
+/// `eval_pipe` used to send any pipe with a `needs_path_context` stage
+/// straight to `eval::eval_pipe_with_path_context`, bypassing
+/// [`path_context_needs_eager`] entirely. It now hands the pipe here
+/// instead, so the one gate decides which pipes the eager evaluator still
+/// owns -- see `eval::eval_path_context_pipe_owned` for the reindex that
+/// gives this call the root cursor `key`/`parent`/`path` are properties of.
+///
+/// Differs from [`eval_with_cursor_using`] in two ways, both of which the
+/// call site needs: `optional` is the caller's ambient value rather than a
+/// fresh `false` (`eval_pipe` is reached mid-expression, under a `?`/`try`
+/// that has already decided suppression), and the stages arrive as a slice
+/// so the `Expr::Pipe` is rebuilt once here rather than by every caller.
+/// The `takes_input_queue_bridge` carve-out is deliberately not repeated:
+/// that bridge exists for a *top-level* program sharing `jq_runner`'s input
+/// queue, and this entry is never a top-level program.
+pub(crate) fn eval_path_context_pipe_with_cursor<S: EvalSemantics, C: DocumentCursor>(
+    exprs: &[Expr],
+    cursor: C,
+    optional: bool,
+) -> GenericResult<C::Value> {
+    eval_single::<S, C::Value>(
+        &Expr::Pipe(exprs.to_vec()),
+        cursor.value(),
+        optional,
+        Some(cursor),
+    )
 }
 
 /// Streaming counterpart of [`eval_with_cursor`] (#1653): deliver each output
@@ -11217,7 +11248,7 @@ fn cursor_ancestor<C: DocumentCursor>(c: &C, n: usize) -> Option<C> {
 ///
 /// `select(key == "a") | parent` stays generic: `select` emits its input
 /// node unchanged, so `parent` still stands on a live cursor.
-fn path_context_needs_eager(exprs: &[Expr]) -> bool {
+pub(crate) fn path_context_needs_eager(exprs: &[Expr]) -> bool {
     if !exprs.iter().any(needs_path_context) {
         return false;
     }
