@@ -12817,49 +12817,55 @@ fn try_path_context_cursor_walk<S: EvalSemantics, V: DocumentValue>(
 /// therefore a refusal, not a fallback -- reached only with
 /// `needs_path_context` already true.
 fn path_context_absent_resolvable(expr: &Expr) -> bool {
+    path_context_resolvable(expr, false)
+}
+
+/// [`path_context_absent_resolvable`] with `parent`/`parent(n)` admitted
+/// too (#2472): the owned identity pipe *does* hold the node they answer
+/// with, so a read the constant-only route has to refuse is a literal there
+/// -- `Expr::TrackedVar`, the one node that spells an arbitrary
+/// `OwnedValue`. See [`path_context_resolve_constants`]'s `Parent` arm.
+fn owned_identity_stage_resolvable(expr: &Expr) -> bool {
+    path_context_resolvable(expr, true)
+}
+
+/// The shared body of the two predicates above. `with_parent` is the *only*
+/// difference between them, so a construct admitted for one is admitted for
+/// the other and the rewriter's arms cover both call sites.
+fn path_context_resolvable(expr: &Expr, with_parent: bool) -> bool {
     if !needs_path_context(expr) {
         // Nothing to resolve. Whatever this is, it evaluates against the
         // `null` an absent position holds and answers exactly as it does on
         // the eager route, which navigated into the same `null`.
         return true;
     }
+    let sub = |e: &Expr| path_context_resolvable(e, with_parent);
     match expr {
         Expr::Builtin(Builtin::Key | Builtin::PathNoArg | Builtin::FileIndex) => true,
-        Expr::Paren(inner) | Expr::Array(inner) | Expr::Optional(inner) => {
-            path_context_absent_resolvable(inner)
-        }
-        Expr::FirstExpr(inner) | Expr::LastExpr(inner) => path_context_absent_resolvable(inner),
-        Expr::Builtin(Builtin::FirstStream(inner) | Builtin::LastStream(inner)) => {
-            path_context_absent_resolvable(inner)
-        }
-        Expr::Comma(exprs) => exprs.iter().all(path_context_absent_resolvable),
-        Expr::Pipe(exprs) => path_context_absent_stages_resolvable(exprs),
-        Expr::Builtin(Builtin::Select(cond)) => path_context_absent_resolvable(cond),
-        Expr::Limit { n, expr } => {
-            path_context_absent_resolvable(n) && path_context_absent_resolvable(expr)
-        }
-        Expr::Try { expr, catch } => {
-            path_context_absent_resolvable(expr)
-                && catch
-                    .as_deref()
-                    .map_or(true, path_context_absent_resolvable)
-        }
+        // #2472: a node, not a constant -- resolvable only where the caller
+        // carries the identity to climb.
+        Expr::Builtin(Builtin::Parent) => with_parent,
+        // `parent(n)` climbs `n` levels, and `n` has to be knowable without
+        // evaluating a stream against a position that may not exist: the
+        // same literal-only restriction `owned_identity_pipe_supported`
+        // already places on a bare `parent(n)` stage.
+        Expr::Builtin(Builtin::ParentN(n)) => with_parent && matches!(**n, Expr::Literal(_)),
+        Expr::Paren(inner) | Expr::Array(inner) | Expr::Optional(inner) => sub(inner),
+        Expr::FirstExpr(inner) | Expr::LastExpr(inner) => sub(inner),
+        Expr::Builtin(Builtin::FirstStream(inner) | Builtin::LastStream(inner)) => sub(inner),
+        Expr::Comma(exprs) => exprs.iter().all(sub),
+        Expr::Pipe(exprs) => path_context_stages_resolvable(exprs, with_parent),
+        Expr::Builtin(Builtin::Select(cond)) => sub(cond),
+        Expr::Limit { n, expr } => sub(n) && sub(expr),
+        Expr::Try { expr, catch } => sub(expr) && catch.as_deref().map_or(true, sub),
         Expr::If {
             cond,
             then_branch,
             else_branch,
-        } => {
-            path_context_absent_resolvable(cond)
-                && path_context_absent_resolvable(then_branch)
-                && path_context_absent_resolvable(else_branch)
-        }
-        Expr::Compare { left, right, .. } => {
-            path_context_absent_resolvable(left) && path_context_absent_resolvable(right)
-        }
-        Expr::And(left, right) | Expr::Or(left, right) => {
-            path_context_absent_resolvable(left) && path_context_absent_resolvable(right)
-        }
-        Expr::Negate(inner) => path_context_absent_resolvable(inner),
+        } => sub(cond) && sub(then_branch) && sub(else_branch),
+        Expr::Compare { left, right, .. } => sub(left) && sub(right),
+        Expr::And(left, right) | Expr::Or(left, right) => sub(left) && sub(right),
+        Expr::Negate(inner) => sub(inner),
         _ => false,
     }
 }
@@ -12868,9 +12874,15 @@ fn path_context_absent_resolvable(expr: &Expr) -> bool {
 /// the position only while the position has not moved, because the resolved
 /// constants describe one position and nothing carries a second one.
 fn path_context_absent_stages_resolvable(stages: &[Expr]) -> bool {
+    path_context_stages_resolvable(stages, false)
+}
+
+/// [`path_context_absent_stages_resolvable`] with the `with_parent` knob
+/// [`path_context_resolvable`] documents.
+fn path_context_stages_resolvable(stages: &[Expr], with_parent: bool) -> bool {
     let mut moved = false;
     for stage in stages {
-        if needs_path_context(stage) && (moved || !path_context_absent_resolvable(stage)) {
+        if needs_path_context(stage) && (moved || !path_context_resolvable(stage, with_parent)) {
             return false;
         }
         moved = moved || !path_context_absent_keeps_position(stage);
@@ -12936,7 +12948,7 @@ fn path_context_absent_keeps_position(expr: &Expr) -> bool {
 /// deduplication: it keeps `PathContextRoute::BridgeOnly` meaning what
 /// `tests/jq_evaluator_parity_tests.rs` needs it to mean for those pipes --
 /// walk off, bridge on -- instead of quietly substituting a third route.
-fn path_context_absent_split(exprs: &[Expr]) -> Option<(&[Expr], &[Expr])> {
+fn path_context_absent_split(exprs: &[Expr]) -> Option<(&[Expr], &[Expr], AbsentRestRoute)> {
     if path_context_walk_split(exprs).is_some() {
         return None;
     }
@@ -12951,10 +12963,129 @@ fn path_context_absent_split(exprs: &[Expr]) -> Option<(&[Expr], &[Expr])> {
     if !head_can_yield_absent(head) || head.iter().any(path_context_fans_out) {
         return None;
     }
-    if !path_context_absent_stages_resolvable(rest) || path_context_needs_eager(rest) {
-        return None;
+    let route = path_context_absent_rest_route(rest)?;
+    Some((head, rest, route))
+}
+
+/// How the stages after an absent-route head are evaluated at a position.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AbsentRestRoute {
+    /// ADR-0021 decision 6: `key`/`path`/`file_index` become literals and
+    /// what is left runs over `null` in the ordinary owned evaluator. No
+    /// materialization at all, so it is preferred wherever it applies.
+    Constants,
+    /// ADR-0021 decision 7 (#2472): the position becomes an
+    /// [`OwnedIdentity`] and the rest runs in [`eval_owned_identity_pipe`],
+    /// which answers `parent` with a real node and lets the position move.
+    OwnedIdentity,
+}
+
+/// Which route [`path_context_absent_split`]'s `rest` takes, or `None` to
+/// leave the pipe on the eager evaluator.
+///
+/// The constant route is tried first because it answers a position without
+/// materializing anything; the identity route pays one `to_owned_cursor` of
+/// the deepest real ancestor per position (see
+/// [`path_context_absent_identity`]).
+///
+/// The constant route additionally requires that `rest` not need the eager
+/// evaluator itself: `rest` is evaluated from the walked *node*, so an eager
+/// evaluation of it would materialize a document re-rooted there and answer
+/// `key`/`path` against the wrong root. The identity route has no such
+/// requirement -- it evaluates `rest` itself, from a position it carries --
+/// which is exactly why it reaches the shapes decision 6 declines.
+fn path_context_absent_rest_route(rest: &[Expr]) -> Option<AbsentRestRoute> {
+    if path_context_absent_stages_resolvable(rest) && !path_context_needs_eager(rest) {
+        return Some(AbsentRestRoute::Constants);
     }
-    Some((head, rest))
+    if owned_identity_pipe_supported(rest) && owned_identity_escapes_are_carried(rest) {
+        return Some(AbsentRestRoute::OwnedIdentity);
+    }
+    None
+}
+
+/// Whether every *navigation* stage of `rest` carries an escape, and an
+/// already-emitted prefix, out of the owned identity pipe the way the eager
+/// route this replaces does.
+///
+/// Two gaps say no for a computed bracket or `getpath`, and only for those:
+/// [`owned_identity_values`] folds every non-error escape into "no more
+/// values" (so `[.a | .[halt_error] | key]` would exit 0 instead of 5), and
+/// [`eval_owned_identity_pipe`]'s navigation arm drops the outputs a step
+/// produced before it failed (so `.arr | .[(0,"a")] | key` would lose the
+/// `0` the first component answered). Every other navigation stage -- `.c`,
+/// `.[0]`, `.[]`, a literal slice -- has no sub-expression to escape from,
+/// and a computed bracket *inside* a ruled stage (`[.[halt]]`,
+/// `select(.[halt])`) is evaluated by `eval_each_owned`, which returns a
+/// `Flow` and carries both.
+///
+/// This is a refusal, not a fix: the same two gaps are live on the owned
+/// identity pipe's own route (`owned_identity_pipe_applies`), where they
+/// predate this one. Widening the absent route is not the place to close
+/// them, so a pipe that would newly meet them stays exactly where it was.
+///
+/// The recursion mirrors [`owned_identity_nav_supported`]'s -- `?`, `(..)`
+/// and a nested pipe are the only wrappers a navigation stage has -- so a
+/// shape admitted there is inspected here.
+fn owned_identity_escapes_are_carried(stages: &[Expr]) -> bool {
+    stages.iter().all(owned_identity_stage_escapes_are_carried)
+}
+
+/// [`owned_identity_escapes_are_carried`] for one stage.
+fn owned_identity_stage_escapes_are_carried(expr: &Expr) -> bool {
+    match strip_parens(expr) {
+        Expr::IndexExpr { .. } | Expr::SliceExpr { .. } | Expr::Builtin(Builtin::GetPath(_)) => {
+            false
+        }
+        Expr::Optional(inner) => owned_identity_stage_escapes_are_carried(inner),
+        Expr::Pipe(exprs) => exprs.iter().all(owned_identity_stage_escapes_are_carried),
+        _ => true,
+    }
+}
+
+/// The [`OwnedIdentity`] of an absent position (#2472).
+///
+/// An absent position is completely described by the deepest real ancestor
+/// it hangs under plus the components taken past it, which is exactly what
+/// an `OwnedIdentity` records: `base` is that ancestor's cursor, and the
+/// chain holds one link per component. Only the first link has a value to
+/// carry -- everything below the ancestor is absent, which is `null` -- so
+/// this pays exactly one `to_owned_cursor` per absent position.
+///
+/// `parent` then pops the chain, which is what the walk's own answers
+/// already are: on `a: {b: 1}`, `.a.x.y | parent` is `null` (the absent
+/// `.a.x`) and `parent(2)` is the real `.a`. Real yq *vivifies* the missing
+/// keys and prints `{"y":null}` / `{"b":1,"x":{"y":null}}` there; that
+/// divergence is #2435's, recorded in `docs/compliance/yq/limitations.md`,
+/// and this route reproduces succinctly's side of it rather than changing
+/// it.
+fn path_context_absent_identity<V: DocumentValue>(
+    pos: &PathContextPos<V>,
+) -> Result<OwnedIdentity<V>, EvalError> {
+    // A position becomes absent by stepping off a real node, and the walk
+    // roots itself at one (`path_context_root`), so the ancestor chain
+    // always holds at least one live cursor -- and, since a step from an
+    // absent node is absent too, every entry after the last live one is
+    // absent.
+    let Some(base_index) = pos
+        .ancestors
+        .iter()
+        .rposition(|node| matches!(node, PathNode::At(_)))
+    else {
+        debug_assert!(false, "an absent position hangs under a real ancestor");
+        return Ok(OwnedIdentity::detached());
+    };
+    let PathNode::At(base) = pos.ancestors[base_index] else {
+        unreachable!("rposition matched a live cursor")
+    };
+    let base_value = Rc::new(to_owned_cursor(&base)?);
+    let absent = Rc::new(OwnedValue::Null);
+    let mut id = OwnedIdentity::kept(base);
+    for (i, component) in pos.path[base_index..].iter().enumerate() {
+        let parent = if i == 0 { &base_value } else { &absent };
+        id = id.child(parent, component.clone());
+    }
+    Ok(id)
 }
 
 /// The `Expr` one resolved path component spells.
@@ -12985,11 +13116,34 @@ fn path_component_literal(component: &OwnedValue) -> Expr {
 /// here would evaluate its `key` against no position and answer `null`,
 /// which is the silent-fallback failure ADR-0021 was written to end. The
 /// `_` arm is reached only for a subtree with no path-context builtin in it.
-fn path_context_resolve_absent<V: DocumentValue>(expr: &Expr, pos: &PathContextPos<V>) -> Expr {
+fn path_context_resolve_absent<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    pos: &PathContextPos<V>,
+) -> Result<Expr, EvalError> {
     // An absent position always has at least one component -- it took a
     // `.a`/`[i]` step to become absent -- so its key is the walk's own
     // `path.last()`.
-    path_context_resolve_constants(expr, pos.path.last(), &pos.path)
+    path_context_resolve_constants::<S, V>(
+        expr,
+        &PathContextAt {
+            key: pos.path.last(),
+            path: &pos.path,
+            parent_from: None,
+        },
+    )
+}
+
+/// The position [`path_context_resolve_constants`] rewrites against.
+///
+/// `key`/`path` are the constants the position answers. `parent_from` is
+/// the value and identity `parent`/`parent(n)` climb, carried only by the
+/// owned identity pipe -- the constant-only route leaves it `None`, and
+/// [`path_context_absent_resolvable`] refuses `parent` there, so the
+/// rewriter's `Parent` arms are unreachable with it unset.
+struct PathContextAt<'a, V: DocumentValue> {
+    key: Option<&'a OwnedValue>,
+    path: &'a [OwnedValue],
+    parent_from: Option<(&'a OwnedValue, &'a OwnedIdentity<V>)>,
 }
 
 /// [`path_context_resolve_absent`]'s worker, over the constants themselves:
@@ -12997,16 +13151,18 @@ fn path_context_resolve_absent<V: DocumentValue>(expr: &Expr, pos: &PathContextP
 /// detached owned root, #2416 step 3), and `path` is the full path. Shared
 /// with the owned identity pipe, whose `key`/`path` inside a `select`/`[..]`
 /// are constants for the same reason.
-fn path_context_resolve_constants(
+fn path_context_resolve_constants<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
-    key: Option<&OwnedValue>,
-    path: &[OwnedValue],
-) -> Expr {
+    at: &PathContextAt<'_, V>,
+) -> Result<Expr, EvalError> {
     if !needs_path_context(expr) {
-        return expr.clone();
+        return Ok(expr.clone());
     }
-    let boxed = |e: &Expr| Box::new(path_context_resolve_constants(e, key, path));
-    match expr {
+    let (key, path) = (at.key, at.path);
+    let boxed = |e: &Expr| -> Result<Box<Expr>, EvalError> {
+        Ok(Box::new(path_context_resolve_constants::<S, V>(e, at)?))
+    };
+    Ok(match expr {
         Expr::Builtin(Builtin::Key) => match key {
             Some(component) => path_component_literal(component),
             None => Expr::Builtin(Builtin::Empty),
@@ -13035,52 +13191,69 @@ fn path_context_resolve_constants(
         Expr::Builtin(Builtin::FileIndex) => {
             Expr::Literal(Literal::Int(ambient_file_index().unwrap_or(0)))
         }
-        Expr::Paren(inner) => Expr::Paren(boxed(inner)),
-        Expr::Array(inner) => Expr::Array(boxed(inner)),
-        Expr::Optional(inner) => Expr::Optional(boxed(inner)),
-        Expr::FirstExpr(inner) => Expr::FirstExpr(boxed(inner)),
-        Expr::LastExpr(inner) => Expr::LastExpr(boxed(inner)),
-        Expr::Negate(inner) => Expr::Negate(boxed(inner)),
+        // #2472: `parent`/`parent(n)` inside a stage the owned identity
+        // pipe evaluates as a whole (`[path, parent]`, `select(parent !=
+        // null)`). The node they answer with is not a constant -- no
+        // `Literal` spells an object -- but the identity holds it, and
+        // `Expr::TrackedVar` is the node that carries an arbitrary
+        // `OwnedValue` through the ordinary evaluator (it is what `$x`
+        // becomes once bound). Nothing above the document root is `empty`,
+        // the same answer `eval_owned_identity_pipe`'s own bare `parent`
+        // arm gives (#2421).
+        Expr::Builtin(Builtin::Parent) => path_context_resolve_parent(at, 1)?,
+        Expr::Builtin(Builtin::ParentN(n_expr)) => {
+            let Expr::Literal(lit) = &**n_expr else {
+                unreachable!("path_context_resolvable admits a literal n only")
+            };
+            let n = classify_parent_n::<S>(&literal_to_owned(lit), path.len())?;
+            path_context_resolve_parent(at, n)?
+        }
+        Expr::Paren(inner) => Expr::Paren(boxed(inner)?),
+        Expr::Array(inner) => Expr::Array(boxed(inner)?),
+        Expr::Optional(inner) => Expr::Optional(boxed(inner)?),
+        Expr::FirstExpr(inner) => Expr::FirstExpr(boxed(inner)?),
+        Expr::LastExpr(inner) => Expr::LastExpr(boxed(inner)?),
+        Expr::Negate(inner) => Expr::Negate(boxed(inner)?),
         Expr::Builtin(Builtin::FirstStream(inner)) => {
-            Expr::Builtin(Builtin::FirstStream(boxed(inner)))
+            Expr::Builtin(Builtin::FirstStream(boxed(inner)?))
         }
         Expr::Builtin(Builtin::LastStream(inner)) => {
-            Expr::Builtin(Builtin::LastStream(boxed(inner)))
+            Expr::Builtin(Builtin::LastStream(boxed(inner)?))
         }
-        Expr::Builtin(Builtin::Select(cond)) => Expr::Builtin(Builtin::Select(boxed(cond))),
+        Expr::Builtin(Builtin::Select(cond)) => Expr::Builtin(Builtin::Select(boxed(cond)?)),
         Expr::Comma(exprs) => Expr::Comma(
             exprs
                 .iter()
-                .map(|e| path_context_resolve_constants(e, key, path))
-                .collect(),
+                .map(|e| path_context_resolve_constants::<S, V>(e, at))
+                .collect::<Result<Vec<_>, _>>()?,
         ),
         Expr::Pipe(exprs) => Expr::Pipe(
             exprs
                 .iter()
-                .map(|e| path_context_resolve_constants(e, key, path))
-                .collect(),
+                .map(|e| path_context_resolve_constants::<S, V>(e, at))
+                .collect::<Result<Vec<_>, _>>()?,
         ),
         Expr::Limit { n, expr } => Expr::Limit {
-            n: boxed(n),
-            expr: boxed(expr),
+            n: boxed(n)?,
+            expr: boxed(expr)?,
         },
         Expr::Try { expr, catch } => Expr::Try {
-            expr: boxed(expr),
-            catch: catch.as_deref().map(boxed),
+            expr: boxed(expr)?,
+            catch: catch.as_deref().map(boxed).transpose()?,
         },
         Expr::If {
             cond,
             then_branch,
             else_branch,
         } => Expr::If {
-            cond: boxed(cond),
-            then_branch: boxed(then_branch),
-            else_branch: boxed(else_branch),
+            cond: boxed(cond)?,
+            then_branch: boxed(then_branch)?,
+            else_branch: boxed(else_branch)?,
         },
         Expr::Compare { op, left, right } => Expr::Compare {
             op: *op,
-            left: boxed(left),
-            right: boxed(right),
+            left: boxed(left)?,
+            right: boxed(right)?,
         },
         // #2471 sub-item 5: the owned identity pipe resolves a read inside
         // an arithmetic operand (`key + 1`). The *absent* route's own gate
@@ -13089,13 +13262,37 @@ fn path_context_resolve_constants(
         // what is routed there.
         Expr::Arithmetic { op, left, right } => Expr::Arithmetic {
             op: *op,
-            left: boxed(left),
-            right: boxed(right),
+            left: boxed(left)?,
+            right: boxed(right)?,
         },
-        Expr::And(left, right) => Expr::And(boxed(left), boxed(right)),
-        Expr::Or(left, right) => Expr::Or(boxed(left), boxed(right)),
+        Expr::And(left, right) => Expr::And(boxed(left)?, boxed(right)?),
+        Expr::Or(left, right) => Expr::Or(boxed(left)?, boxed(right)?),
         other => other.clone(),
-    }
+    })
+}
+
+/// The literal `parent(n)` answers with at `at`, for
+/// [`path_context_resolve_constants`]: the ancestor's value carried in an
+/// `Expr::TrackedVar`, or `empty` where there is none (above the document
+/// root, or a caller with no identity -- a shape
+/// [`path_context_absent_resolvable`] refuses, asserted rather than
+/// silently answered with `null`).
+fn path_context_resolve_parent<V: DocumentValue>(
+    at: &PathContextAt<'_, V>,
+    n: usize,
+) -> Result<Expr, EvalError> {
+    let Some((value, id)) = at.parent_from else {
+        debug_assert!(
+            false,
+            "path_context_absent_resolvable refuses parent without an identity"
+        );
+        return Ok(Expr::Builtin(Builtin::Empty));
+    };
+    Ok(match owned_identity_ancestor(value, id, n) {
+        OwnedAncestor::Owned(v, _) => Expr::TrackedVar(Rc::new(v)),
+        OwnedAncestor::Node(c) => Expr::TrackedVar(Rc::new(to_owned_cursor(&c)?)),
+        OwnedAncestor::None => Expr::Builtin(Builtin::Empty),
+    })
 }
 
 /// The absent route (#2416 step 2): walk the navigational head as positions,
@@ -13119,7 +13316,7 @@ fn try_path_context_absent_sink<S: EvalSemantics, V: DocumentValue>(
     root: V::Cursor,
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Option<Flow> {
-    let (head, rest) = path_context_absent_split(exprs)?;
+    let (head, rest, route) = path_context_absent_split(exprs)?;
     let root_pos = match path_context_root::<V>(root) {
         Ok(pos) => pos,
         Err(control) => return Some(Flow::Escaped(control)),
@@ -13130,25 +13327,44 @@ fn try_path_context_absent_sink<S: EvalSemantics, V: DocumentValue>(
     // error follows them, the same rule `path_context_step_generic` states.
     let stepped =
         path_context_step_generic::<S, V>(&Expr::Pipe(head.to_vec()), &root_pos, &mut positions);
+    // A live node keeps its cursor wherever `rest` can be evaluated from
+    // one; the identity route's own real positions are the shapes where it
+    // cannot (`.c | key` moves the position `rest` reads), and those
+    // materialize the node instead of re-rooting the document eagerly.
+    let rest_is_cursor_native = !path_context_needs_eager(rest);
     for pos in &positions {
         let flow = match &pos.node {
-            PathNode::At(c) => {
+            PathNode::At(c) if rest_is_cursor_native => {
                 eval_each_pipe_generic::<S, V>(rest, c.value(), false, Some(*c), sink)
             }
-            PathNode::Absent => {
-                let resolved = Expr::Pipe(
-                    rest.iter()
-                        .map(|stage| path_context_resolve_absent::<V>(stage, pos))
-                        .collect(),
-                );
-                debug_assert!(
-                    !needs_path_context(&resolved),
-                    "path_context_absent_split admitted a stage the resolver leaves unresolved"
-                );
-                eval_each_owned::<S>(&resolved, &OwnedValue::Null, false, &mut |v| {
-                    sink(GenericItem::Owned(v))
-                })
-            }
+            PathNode::At(c) => match to_owned_cursor(c) {
+                Ok(value) => eval_owned_identity_pipe::<S, V>(
+                    rest,
+                    value,
+                    OwnedIdentity::kept(*c),
+                    false,
+                    sink,
+                ),
+                Err(e) => Flow::Escaped(Control::Error(e)),
+            },
+            PathNode::Absent => match route {
+                AbsentRestRoute::Constants => {
+                    match path_context_resolve_absent_stages::<S, V>(rest, pos) {
+                        Ok(resolved) => {
+                            eval_each_owned::<S>(&resolved, &OwnedValue::Null, false, &mut |v| {
+                                sink(GenericItem::Owned(v))
+                            })
+                        }
+                        Err(e) => Flow::Escaped(Control::Error(e)),
+                    }
+                }
+                AbsentRestRoute::OwnedIdentity => match path_context_absent_identity::<V>(pos) {
+                    Ok(id) => {
+                        eval_owned_identity_pipe::<S, V>(rest, OwnedValue::Null, id, false, sink)
+                    }
+                    Err(e) => Flow::Escaped(Control::Error(e)),
+                },
+            },
         };
         match flow {
             Flow::Exhausted => {}
@@ -13159,6 +13375,24 @@ fn try_path_context_absent_sink<S: EvalSemantics, V: DocumentValue>(
         Ok(()) => Flow::Exhausted,
         Err(e) => Flow::Escaped(Control::Error(e)),
     })
+}
+
+/// [`path_context_resolve_absent`] over every stage of `rest`, as the one
+/// pipe the ordinary owned evaluator then runs over `null`.
+fn path_context_resolve_absent_stages<S: EvalSemantics, V: DocumentValue>(
+    rest: &[Expr],
+    pos: &PathContextPos<V>,
+) -> Result<Expr, EvalError> {
+    let mut stages = vec_with_capacity(rest.len());
+    for stage in rest {
+        stages.push(path_context_resolve_absent::<S, V>(stage, pos)?);
+    }
+    let resolved = Expr::Pipe(stages);
+    debug_assert!(
+        !needs_path_context(&resolved),
+        "path_context_absent_split admitted a stage the resolver leaves unresolved"
+    );
+    Ok(resolved)
 }
 
 /// The non-sink half of [`try_path_context_absent_sink`], for
@@ -14649,6 +14883,41 @@ impl<V: DocumentValue> OwnedIdentity<V> {
     }
 }
 
+/// Where `parent(n)` from an owned value with identity lands: inside the
+/// owned tree (or at its root), on a document node above that root, or
+/// nowhere at all. One definition of the climb, so
+/// [`eval_owned_identity_pipe`]'s `parent`/`parent(n)` stages and
+/// [`path_context_resolve_constants`]'s rewrite of a `parent` *inside* a
+/// stage cannot disagree about where `n` levels up is.
+enum OwnedAncestor<V: DocumentValue> {
+    Owned(OwnedValue, OwnedIdentity<V>),
+    Node(V::Cursor),
+    None,
+}
+
+/// `n` levels up from `value`, whose position is `id`. `n == 0` is the
+/// value itself, matching `parent(0)`.
+fn owned_identity_ancestor<V: DocumentValue>(
+    value: &OwnedValue,
+    id: &OwnedIdentity<V>,
+    n: usize,
+) -> OwnedAncestor<V> {
+    let mut current = (value.clone(), id.clone());
+    for climbed in 0..n {
+        match current.1.parent() {
+            Some(OwnedParent::Owned(v, vid)) => current = (v, vid),
+            Some(OwnedParent::Node(c)) => {
+                return match cursor_ancestor(&c, n - climbed - 1) {
+                    Some(a) => OwnedAncestor::Node(a),
+                    None => OwnedAncestor::None,
+                };
+            }
+            None => return OwnedAncestor::None,
+        }
+    }
+    OwnedAncestor::Owned(current.0, current.1)
+}
+
 /// How a stage that leaves the cursor domain positions its output (#2416
 /// step 3). A closed list: a stage with no rule keeps the pipe on the eager
 /// evaluator, exactly as before, so an unlisted builtin can only cost the
@@ -14895,7 +15164,7 @@ fn owned_identity_pipe_supported(stages: &[Expr]) -> bool {
             }
             _ => match owned_identity_rule(stage) {
                 Some(_) => {
-                    if needs_path_context(stage) && !path_context_absent_resolvable(stage) {
+                    if needs_path_context(stage) && !owned_identity_stage_resolvable(stage) {
                         return false;
                     }
                 }
@@ -15070,7 +15339,7 @@ fn owned_identity_step<S: EvalSemantics, V: DocumentValue>(
 /// position `id` describes, so the rewrite is the same one
 /// [`eval_owned_identity_pipe`]'s ruled-stage arm applies -- one definition
 /// ([`path_context_resolve_constants`]), consulted from both.
-fn owned_identity_resolve_component<V: DocumentValue>(
+fn owned_identity_resolve_component<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     id: &OwnedIdentity<V>,
 ) -> Result<Expr, EvalError> {
@@ -15079,7 +15348,17 @@ fn owned_identity_resolve_component<V: DocumentValue>(
     }
     let key = id.key()?;
     let path = id.path()?;
-    Ok(path_context_resolve_constants(expr, key.as_ref(), &path))
+    path_context_resolve_constants::<S, V>(
+        expr,
+        &PathContextAt {
+            key: key.as_ref(),
+            path: &path,
+            // A computed component keeps the constant-only gate
+            // ([`owned_identity_component_supported`]), so no `parent` can
+            // appear in one.
+            parent_from: None,
+        },
+    )
 }
 
 /// `.[K]` / `.[S:T]` / `E[K]` / `E[S:T]` over an owned value, naming the
@@ -15118,7 +15397,7 @@ fn owned_identity_computed_step<S: EvalSemantics, V: DocumentValue>(
     };
     match expr {
         Expr::IndexExpr { target, key } => {
-            let key_expr = owned_identity_resolve_component(key, id)?;
+            let key_expr = owned_identity_resolve_component::<S, V>(key, id)?;
             let keys = owned_identity_values::<S>(&key_expr, value, optional)?;
             let values = owned_identity_values::<S>(
                 &wrap(Expr::IndexExpr {
@@ -15146,11 +15425,11 @@ fn owned_identity_computed_step<S: EvalSemantics, V: DocumentValue>(
         }
         Expr::SliceExpr { target, start, end } => {
             let start_expr = match start {
-                Some(e) => Some(owned_identity_resolve_component(e, id)?),
+                Some(e) => Some(owned_identity_resolve_component::<S, V>(e, id)?),
                 None => None,
             };
             let end_expr = match end {
-                Some(e) => Some(owned_identity_resolve_component(e, id)?),
+                Some(e) => Some(owned_identity_resolve_component::<S, V>(e, id)?),
                 None => None,
             };
             let values = owned_identity_values::<S>(
@@ -15230,7 +15509,7 @@ fn owned_identity_getpath_step<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     out: &mut Vec<(OwnedValue, OwnedIdentity<V>)>,
 ) -> Result<(), EvalError> {
-    let path_expr = owned_identity_resolve_component(path_expr, id)?;
+    let path_expr = owned_identity_resolve_component::<S, V>(path_expr, id)?;
     let paths = owned_identity_values::<S>(&path_expr, value, optional)?;
     let values = owned_identity_values::<S>(
         &Expr::Builtin(Builtin::GetPath(Box::new(path_expr))),
@@ -15447,6 +15726,29 @@ fn continue_owned_identity_items<S: EvalSemantics, V: DocumentValue>(
     Flow::Exhausted
 }
 
+/// Continue a pipe `n` levels up from an owned value with identity. A climb
+/// that leaves the owned tree hands the rest of the pipe back to
+/// [`eval_each_pipe_generic`] with the document cursor it reached, which is
+/// what keeps `parent` from materializing the document.
+fn continue_owned_identity_ancestor<S: EvalSemantics, V: DocumentValue>(
+    rest: &[Expr],
+    value: &OwnedValue,
+    id: &OwnedIdentity<V>,
+    n: usize,
+    optional: bool,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    match owned_identity_ancestor(value, id, n) {
+        OwnedAncestor::Owned(v, vid) => {
+            eval_owned_identity_pipe::<S, V>(rest, v, vid, optional, sink)
+        }
+        OwnedAncestor::Node(c) => {
+            eval_each_pipe_generic::<S, V>(rest, c.value(), optional, Some(c), sink)
+        }
+        OwnedAncestor::None => Flow::Exhausted,
+    }
+}
+
 /// `a // b` over an owned value with identity: the left operand's value if
 /// it is truthy (errors in it suppressed, as `//` does), else the right's.
 fn eval_owned_identity_alternative<S: EvalSemantics, V: DocumentValue>(
@@ -15519,15 +15821,9 @@ fn eval_owned_identity_pipe<S: EvalSemantics, V: DocumentValue>(
             optional,
             sink,
         ),
-        Expr::Builtin(Builtin::Parent) => match id.parent() {
-            Some(OwnedParent::Owned(v, vid)) => {
-                eval_owned_identity_pipe::<S, V>(rest, v, vid, optional, sink)
-            }
-            Some(OwnedParent::Node(c)) => {
-                eval_each_pipe_generic::<S, V>(rest, c.value(), optional, Some(c), sink)
-            }
-            None => Flow::Exhausted,
-        },
+        Expr::Builtin(Builtin::Parent) => {
+            continue_owned_identity_ancestor::<S, V>(rest, &value, &id, 1, optional, sink)
+        }
         Expr::Builtin(Builtin::ParentN(n_expr)) => {
             let Expr::Literal(lit) = &**n_expr else {
                 unreachable!("owned_identity_pipe_supported admits a literal n only")
@@ -15539,26 +15835,7 @@ fn eval_owned_identity_pipe<S: EvalSemantics, V: DocumentValue>(
                 Ok(n) => n,
                 Err(e) => return Flow::Escaped(Control::Error(e)),
             };
-            let mut current = (value, id);
-            for climbed in 0..n {
-                match current.1.parent() {
-                    Some(OwnedParent::Owned(v, vid)) => current = (v, vid),
-                    Some(OwnedParent::Node(c)) => {
-                        return match cursor_ancestor(&c, n - climbed - 1) {
-                            Some(a) => eval_each_pipe_generic::<S, V>(
-                                rest,
-                                a.value(),
-                                optional,
-                                Some(a),
-                                sink,
-                            ),
-                            None => Flow::Exhausted,
-                        };
-                    }
-                    None => return Flow::Exhausted,
-                }
-            }
-            eval_owned_identity_pipe::<S, V>(rest, current.0, current.1, optional, sink)
+            continue_owned_identity_ancestor::<S, V>(rest, &value, &id, n, optional, sink)
         }
         Expr::Alternative(left, right) => {
             match eval_owned_identity_alternative::<S, V>(left, right, &value, &id, optional) {
@@ -15582,7 +15859,17 @@ fn eval_owned_identity_pipe<S: EvalSemantics, V: DocumentValue>(
                     (Ok(key), Ok(path)) => (key, path),
                     (Err(e), _) | (_, Err(e)) => return Flow::Escaped(Control::Error(e)),
                 };
-                resolved = path_context_resolve_constants(stage, key.as_ref(), &path);
+                resolved = match path_context_resolve_constants::<S, V>(
+                    stage,
+                    &PathContextAt {
+                        key: key.as_ref(),
+                        path: &path,
+                        parent_from: Some((&value, &id)),
+                    },
+                ) {
+                    Ok(e) => e,
+                    Err(e) => return Flow::Escaped(Control::Error(e)),
+                };
                 &resolved
             } else {
                 stage
@@ -24506,21 +24793,31 @@ mod tests {
             !eager(".a[] | select(true) | key"),
             "iterate cannot yield absent"
         );
-        // ...but three shapes of it still are, and each is a real limit of
-        // resolving the position to constants rather than an oversight:
-        // `parent` answers with a document *node* no literal can spell;
-        // navigation after a non-navigational stage moves the position the
-        // constants describe; and a fan-out head would collect one position
-        // per element, the guard `path_context_walk_split` already applies.
-        assert!(eager(".a.b | [path, parent]"), "parent is not a constant");
-        assert!(
-            eager(".a.b | select(true) | .c | key"),
-            "navigation after a non-navigational stage moves the position"
-        );
+        // #2472: two of the three shapes the constant route declined are
+        // the owned identity pipe's now. An absent position is the deepest
+        // real ancestor plus the components taken past it, which is exactly
+        // an `OwnedIdentity`, so `parent` answers with a real node again
+        // and the position may move after a non-navigational stage.
+        assert!(!eager(".a.b | [path, parent]"));
+        assert!(!eager(".a.b | [path, parent(2)]"));
+        assert!(!eager(".a.b | select(true) | .c | key"));
+        assert!(!eager(".a.b | select(parent != null) | key"));
+        assert!(!eager(".a.b | tostring | parent | key"));
+        // The third shape stays eager by design, and is the exit
+        // condition's residue ADR-0021 records: a fan-out head is one
+        // position per element, the memory guard `path_context_fans_out`
+        // documents and `path_context_walk_split` already applies.
         assert!(
             eager(".[] | .k | select(key == \"k\")"),
             "a fan-out head collects one position per element"
         );
+        // A stage with no identity rule still has nothing to carry the
+        // position through it, on either route.
+        assert!(eager(".a.b | explode | key"), "no identity rule");
+        // `parent(n)` with a computed `n` is refused by both routes: the
+        // hop count would have to be evaluated against a position that may
+        // not exist.
+        assert!(eager(".a.b | [path, parent(1 + 0)]"));
         // #2416 phase 3, this PR: `as` is now single-native
         // (`collect_each_generic` over `each_as_generic`), so a pipe with it
         // as the last stage runs generically -- same admission `if`/`limit`/
@@ -24634,20 +24931,37 @@ mod tests {
                 path_context_absent_resolvable(&expr),
                 "gate refuses `{filter}`; drop the row or widen the gate"
             );
-            let resolved = path_context_resolve_absent(&expr, &pos);
+            let resolved = path_context_resolve_absent::<JqSemantics, _>(&expr, &pos)
+                .expect("the constant route's rewrite cannot fail");
             assert!(
                 !needs_path_context(&resolved),
                 "`{filter}` resolved to `{resolved:?}`, which still needs path context"
             );
         }
-        // `parent` is the deliberate exclusion: it answers with a document
-        // node, which no literal spells.
+        // `parent` is the deliberate exclusion *on this route*: it answers
+        // with a document node, which no literal spells and this position
+        // carries no identity to climb. #2472 routes exactly these shapes
+        // to the owned identity pipe instead, where the same rewriter does
+        // spell them -- as an `Expr::TrackedVar` around the ancestor's
+        // value, not a literal -- so the second loop pins that the two
+        // gates differ by `parent` and nothing else.
         for filter in ["parent", "parent(1)", "[path, parent]", "select(parent)"] {
+            let expr = parse(filter).unwrap();
             assert!(
-                !path_context_absent_resolvable(&parse(filter).unwrap()),
-                "`{filter}` must stay on the eager route"
+                !path_context_absent_resolvable(&expr),
+                "`{filter}` must stay off the constant route"
+            );
+            assert!(
+                owned_identity_stage_resolvable(&expr),
+                "`{filter}` is the identity route's business (#2472)"
             );
         }
+        // A `parent(n)` whose `n` is not a literal is refused by both: the
+        // hop count would have to be evaluated against a position that may
+        // not exist.
+        assert!(!owned_identity_stage_resolvable(
+            &parse("parent(1 + 0)").unwrap()
+        ));
     }
 
     /// The split's four static conditions, each pinned by a shape that trips
@@ -24659,13 +24973,18 @@ mod tests {
                 Expr::Pipe(stages) => stages,
                 other => vec![other],
             };
-            path_context_absent_split(&stages).map(|(head, rest)| (head.len(), rest.len()))
+            path_context_absent_split(&stages)
+                .map(|(head, rest, route)| (head.len(), rest.len(), route))
         };
-        assert_eq!(split(".a.b | select(key == \"b\")"), Some((1, 1)));
-        assert_eq!(split(".a | select(true) | key"), Some((1, 2)));
+        use AbsentRestRoute::{Constants, OwnedIdentity};
+        assert_eq!(
+            split(".a.b | select(key == \"b\")"),
+            Some((1, 1, Constants))
+        );
+        assert_eq!(split(".a | select(true) | key"), Some((1, 2, Constants)));
         assert_eq!(
             split(".a.b.c | if key == \"c\" then 1 else 2 end"),
-            Some((1, 1))
+            Some((1, 1, Constants))
         );
         // The head cannot miss: already exact on the cursor route.
         assert_eq!(split(".[] | select(key == \"b\")"), None);
@@ -24673,16 +24992,26 @@ mod tests {
         // takes end to end: the walk's business, not this route's.
         assert_eq!(split(".a.b | key"), None);
         assert_eq!(split(".a.b | parent | key"), None);
-        // A fan-out head would collect one position per element.
+        // A fan-out head would collect one position per element -- the
+        // guard `path_context_walk_split` applies for the same memory
+        // reason, and the residue ADR-0021 records (#2472 shape 3).
         assert_eq!(split(".[] | .k | select(key == \"k\")"), None);
-        // `parent` is not a constant.
-        assert_eq!(split(".a.b | [path, parent]"), None);
-        // Navigation after a non-navigational stage moves the position the
-        // constants describe.
-        assert_eq!(split(".a.b | select(true) | .c | key"), None);
+        // #2472 shapes 1 and 2: `parent` is not a constant, and navigation
+        // after a non-navigational stage moves the position the constants
+        // describe -- both are the owned identity pipe's now.
+        assert_eq!(split(".a.b | [path, parent]"), Some((1, 1, OwnedIdentity)));
+        assert_eq!(
+            split(".a.b | select(true) | .c | key"),
+            Some((1, 3, OwnedIdentity))
+        );
         // `rest` would take the eager evaluator, which would materialize a
-        // document re-rooted at the walked node.
-        assert_eq!(split(".a.b | tostring | key"), None);
+        // document re-rooted at the walked node -- so the constant route
+        // refuses it and the identity route, which evaluates `rest` itself
+        // from a position it carries, takes it.
+        assert_eq!(split(".a.b | tostring | key"), Some((1, 2, OwnedIdentity)));
+        // Neither route: `explode` has no identity rule, so there is
+        // nothing to carry the position through it.
+        assert_eq!(split(".a.b | explode | key"), None);
     }
 
     /// The absent-reachability fold behind reason 2.
