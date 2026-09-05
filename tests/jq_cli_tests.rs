@@ -7393,6 +7393,30 @@ fn test_if_and_limit_keep_path_context_2416() -> Result<()> {
     Ok(())
 }
 
+/// Spine 2416, phase 3: `EXPR as $x | body` (bare-variable `as`) is now
+/// native in `eval_single` (`collect_each_generic` over `each_as_generic`),
+/// so it no longer bridges the whole construct to the eager evaluator --
+/// mirroring `if`/`limit`/`Object`'s own migration above. No jq oracle:
+/// `key` is a succinctly extension. `EXPR as $x | body` leaves `.` unchanged
+/// for `body` (confirmed live: `.a as $v | .` on `{"a":1}` is the whole
+/// document, not `1`), so both rows below bind `$x`/`$ks` from `.` itself
+/// (`Expr::Identity`/an array construction) rather than navigating away from
+/// the per-element position `key` answers for -- the pre-migration answer
+/// (captured on this PR's own pre-change build) is unchanged.
+#[test]
+fn test_as_keeps_path_context_2416() -> Result<()> {
+    let doc = r#"[{"a":1},{"b":2}]"#;
+    for (filter, want) in [
+        (".[] | . as $x | key", "0\n1"),
+        ("[.[] | key] as $ks | $ks", "[0,1]"),
+    ] {
+        let (out, _, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "`{filter}`: {out:?}");
+        assert_eq!(out.trim(), want, "`{filter}`");
+    }
+    Ok(())
+}
+
 /// Documents the one remaining deliberate, narrow gap #1663/#1765 leave
 /// open rather than silently missing: a `?//`-chained `AsPattern` (2+
 /// alternatives) still has no dedicated evaluation arm, so a path-context

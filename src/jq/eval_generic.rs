@@ -6030,6 +6030,15 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             }
         }
 
+        // #2416 phase 3: `EXPR as $x | body` natively via the sink
+        // evaluator's own arm (`each_as_generic`), collected the same way
+        // `Expr::If` is above -- `expr` and `body` both evaluate against the
+        // same ambient cursor (mirroring `eval::eval_as`: `as` leaves `.`
+        // unchanged for `body`, only binding the variable), so a `key`/
+        // `parent`/`path` inside either answers as a cursor property instead
+        // of bridging the whole construct to the eager evaluator.
+        Expr::As { .. } => collect_each_generic::<S, V>(expr, value, optional, cursor),
+
         Expr::Comma(exprs) => {
             let mut out: Vec<OwnedValue> = Vec::new();
             for expr in exprs {
@@ -11270,6 +11279,12 @@ fn path_context_single_native(expr: &Expr) -> bool {
                     ObjectKey::Expr(key) => path_context_single_native(key),
                 }
         }),
+        // Native since #2416 phase 3 (`collect_each_generic` over
+        // `each_as_generic`): `expr` and `body` both evaluate against the
+        // same ambient cursor, mirroring `eval::eval_as`.
+        Expr::As { expr, body, .. } => {
+            path_context_single_native(expr) && path_context_single_native(body)
+        }
         _ => false,
     }
 }
@@ -21428,6 +21443,18 @@ mod tests {
             !eager(".a[] | select(true) | key"),
             "iterate cannot yield absent"
         );
+        // #2416 phase 3, this PR: `as` is now single-native
+        // (`collect_each_generic` over `each_as_generic`), so a pipe with it
+        // as the last stage runs generically -- same admission `if`/`limit`/
+        // `Object` got above. `EXPR as $x | BODY` leaves `.` unchanged for
+        // `BODY` (confirmed live: `.a as $v | .` on `{"a":1}` is the whole
+        // document, not `1`), so this row keeps `key` at the per-element
+        // position `.[]` already put it at.
+        assert!(!eager(".[] | . as $x | key"));
+        // Arithmetic still bridges from `eval_single` (unchanged from the
+        // `if`/`limit` rows above), so wrapping one in `as`'s body keeps the
+        // whole pipe eager.
+        assert!(eager(".[] | . as $x | key + 10"));
         // An emitted `key`/`path` is a computed value: a later builtin no
         // longer stands on a node.
         assert!(eager(".[] | key | key"));
