@@ -7508,6 +7508,17 @@ fn test_shared_keeps_path_context_2416() -> Result<()> {
     let (out, _, code) = run_jq_full(&["-c", "def id(x): x; .[] | id(key)"], Some(doc))?;
     assert_eq!(code, 0, "{out:?}");
     assert_eq!(out.trim(), "0\n1");
+    // A call argument is substituted into the body at bind time, so it is
+    // gated too: `key + 10` still bridges from `eval_single` (arithmetic is
+    // not single-native), and losing the cursor there would answer
+    // `null + 10` twice. The eager route answers 10 and 11; so must this one.
+    let (out, _, code) = run_jq_full(
+        &["-c", "def f(x): x; .[] | f(key + 10)"],
+        Some(r#"[{"a":1},{"b":2}]"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "10\n11");
+
     Ok(())
 }
 

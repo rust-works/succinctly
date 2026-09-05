@@ -11339,7 +11339,12 @@ fn path_context_single_native(expr: &Expr) -> bool {
         // deliberately cheap and syntax-only: a builtin reaching `body`
         // solely through a call *argument* is a known, narrower gap, same
         // scoping precedent as there.
-        Expr::DefCall { def, .. } => path_context_single_native(&def.body),
+        // The call's arguments are substituted into the body when the call is
+        // bound, so they have to be single-native too: `f(key + 10)` would
+        // otherwise be admitted while its arithmetic still bridges.
+        Expr::DefCall { def, args, .. } => {
+            path_context_single_native(&def.body) && args.iter().all(path_context_single_native)
+        }
         // Native since #2416 phase 3 (`eval_each_generic`'s own `FuncDef`
         // arm, `bind_def`). `body`/`then` are exactly what
         // `needs_path_context`'s own identical pair of arms recurses into --
@@ -21535,6 +21540,9 @@ mod tests {
         assert!(eager(".[] | . as {a: $a} | key + 10"));
         assert!(eager(".[] | label $out | key + 10"));
         assert!(eager(".[] | (def k: 1; key + 10)"));
+        // `DefCall` is a runtime node the parser never produces, so its
+        // argument gate is pinned by the CLI (`f(key + 10)` in
+        // `test_shared_keeps_path_context_2416`) rather than here.
         // An emitted `key`/`path` is a computed value: a later builtin no
         // longer stands on a node.
         assert!(eager(".[] | key | key"));
