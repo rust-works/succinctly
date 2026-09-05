@@ -1444,6 +1444,26 @@ mod tests {
         }
     }
 
+    /// Same shape as `test_build_rejects_direct_self_alias` but with the
+    /// property+alias at document-root level rather than as a mapping
+    /// value, exercising `parse_block_node`'s own `Some(b'*')` dispatch
+    /// arm (#1374) rather than the value-position one.
+    #[test]
+    fn test_build_rejects_document_root_self_alias() {
+        let yaml = "&x *x";
+        let expected_offset = yaml.find("*x").expect("alias text present in input");
+        let Err(err) = YamlIndex::build(yaml.as_bytes()) else {
+            panic!("anchor-on-alias must be rejected at build time");
+        };
+        match err {
+            YamlError::PropertyOnAlias { offset, name } => {
+                assert_eq!(name, "x");
+                assert_eq!(offset, expected_offset);
+            }
+            other => panic!("expected PropertyOnAlias, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_build_rejects_grandparent_alias_cycle() {
         expect_alias_cycle("a: &x\n  b:\n    c: *x", "x", "*x");
