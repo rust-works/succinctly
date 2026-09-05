@@ -12944,6 +12944,19 @@ fn path_context_resolvable(expr: &Expr, with_parent: bool) -> bool {
         Expr::Compare { left, right, .. } => sub(left) && sub(right),
         Expr::And(left, right) | Expr::Or(left, right) => sub(left) && sub(right),
         Expr::Negate(inner) => sub(inner),
+        // #2473 (gate reason 3 of spine 2416): every key and value expression
+        // of an object literal is evaluated at the stage's own input, exactly
+        // like `Expr::Array`'s inner expression above, so a read inside one
+        // resolves against this position. Reachable only since
+        // `needs_path_context` learned to descend into `Expr::Object`
+        // (#1332's other half) -- before that no route was ever asked.
+        Expr::Object(entries) => entries.iter().all(|entry| {
+            sub(&entry.value)
+                && match &entry.key {
+                    ObjectKey::Literal(_) => true,
+                    ObjectKey::Expr(key) => sub(key),
+                }
+        }),
         _ => false,
     }
 }
@@ -13345,6 +13358,25 @@ fn path_context_resolve_constants<S: EvalSemantics, V: DocumentValue>(
         },
         Expr::And(left, right) => Expr::And(boxed(left)?, boxed(right)?),
         Expr::Or(left, right) => Expr::Or(boxed(left)?, boxed(right)?),
+        // #2473: the rewriter's half of `path_context_resolvable`'s own
+        // `Expr::Object` arm -- one rewrite per key and per value, so a
+        // `{"k": key}` at an absent position comes out with no path context
+        // left in it (`path_context_absent_resolution_clears_path_context_2416`
+        // is the test that holds the two halves equal).
+        Expr::Object(entries) => Expr::Object(
+            entries
+                .iter()
+                .map(|entry| {
+                    Ok(ObjectEntry {
+                        key: match &entry.key {
+                            ObjectKey::Literal(name) => ObjectKey::Literal(name.clone()),
+                            ObjectKey::Expr(key) => ObjectKey::Expr(boxed(key)?),
+                        },
+                        value: *boxed(&entry.value)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, EvalError>>()?,
+        ),
         other => other.clone(),
     })
 }
@@ -24931,13 +24963,21 @@ mod tests {
         // ...but `select`/`parent` keep the node, so a later builtin is fine.
         assert!(!eager(".[] | select(key == \"a\") | parent | key"));
         assert!(!eager(".a[] | select(key != \"c\") | parent"));
-        // A stage built from something that bridges mid-expression. (Bare
-        // `{k: key}` never reaches the gate at all: `needs_path_context` does
-        // not descend into `Expr::Object`, #1332, so that pipe is not seen as
-        // a path-context pipe in the first place; and object construction is
-        // native now, so `(key | {k: .})` is admitted.)
+        // A stage built from something that bridges mid-expression. Object
+        // construction is native, so `(key | {k: .})` is admitted -- and
+        // since #2473 gave `needs_path_context` its own `Expr::Object` arm
+        // (#1332's other half), a bare `{k: key}` reaches this gate at all
+        // for the first time, and is admitted for the same reason.
         assert!(eager(".[] | (key | tostring)"));
         assert!(!eager(".[] | (key | {k: .})"));
+        assert!(!eager(".[] | {\"k\": key}"));
+        assert!(!eager(".[] | {(key): 1}"));
+        assert!(!eager(".[] | {\"k\": key, \"p\": path}"));
+        assert!(!eager(".[] | {\"k\": (key + \"x\")}"));
+        // ...but a value expression that is not itself single-native keeps
+        // the construction on the eager route, the same closed-list rule
+        // every other arm follows.
+        assert!(eager(".[] | {\"k\": (key | tostring)}"));
         assert!(!eager(".[] | if key == \"a\" then . else empty end"));
         assert!(!eager(".[] | limit(1; .[] | key)"));
         assert!(eager(".[] | limit(1 + 0; key)"), "computed n");

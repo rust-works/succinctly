@@ -32115,11 +32115,12 @@ fn test_absent_position_keeps_path_context_2416() -> Result<()> {
 /// `parent(0)` row is a straight fidelity gain, since the vivification
 /// never applies to the value itself.
 ///
-/// `{"p": parent, "k": key}` prints nothing here, in yq mode and jq mode
-/// alike: `needs_path_context` does not descend into `Expr::Object`
-/// (#1332), so that pipe is never seen as a path-context pipe by any route
-/// and `parent` is answered with no position at all. It is pinned as the
-/// pre-existing gap it is, unmoved by this change.
+/// `{"p": parent, "k": key}` printed nothing here when this test was written,
+/// in yq mode and jq mode alike, because `needs_path_context` did not descend
+/// into `Expr::Object` (#1332) and no route was ever asked. #2473 closed that
+/// half, so the row below is now resolved at the absent position like every
+/// other one -- with the same #2435 divergence on `parent` (succinctly prints
+/// the deepest real ancestor, `{"b":1}`; yq vivifies, `{"b":1,"x":null}`).
 #[test]
 fn test_absent_position_owned_identity_2472() -> Result<()> {
     let args = &["-o=json", "-I=0"];
@@ -32161,8 +32162,16 @@ fn test_absent_position_owned_identity_2472() -> Result<()> {
         (".a.x | tostring | parent | key", "\"a\""),
         (".a.x | length | key", "\"x\""),
         (".a.x.y | tostring | parent(2) | key", "\"a\""),
-        // #1332's object-construction gap, unmoved.
-        (".a.x | {\"p\": parent, \"k\": key}", ""),
+        // #1332's object-construction gap, closed by #2473: `needs_path_context`
+        // descends into `Expr::Object` now, so this pipe is seen as a
+        // path-context pipe and the absent position is resolved inside the
+        // construction. `parent` is the deepest real ancestor, the same
+        // #2435 divergence from yq's vivified `{"b":1,"x":null}` that the
+        // `[path, parent]` rows above already record.
+        (
+            ".a.x | {\"p\": parent, \"k\": key}",
+            "{\"p\":{\"b\":1},\"k\":\"x\"}",
+        ),
     ] {
         let (output, code) = run_yq_stdin(filter, doc, args)?;
         assert_eq!(code, 0, "`{filter}`: {output:?}");
@@ -32252,6 +32261,83 @@ fn test_owned_identity_rules_match_yq_2416() -> Result<()> {
         let (output, code) = run_yq_stdin(filter, doc, args)?;
         assert_eq!(code, 0, "{filter}");
         assert_eq!(output.trim_end(), expected, "{filter}");
+    }
+    Ok(())
+}
+
+/// #1332's other half, closed by #2473 (gate reason 3 of spine 2416):
+/// `needs_path_context` now descends into `Expr::Object`, so a
+/// `key`/`parent`/`path` inside an object literal is *routed* like any other
+/// path-context read instead of being invisible to routing entirely.
+///
+/// Before this, `{"x": key}` was never seen as a path-context read at all, so
+/// no route was ever asked. The generic evaluator's own `Expr::Object` arm
+/// (`build_object_entries_generic`, #2439) reads the cursor, so a *live-node*
+/// shape happened to be right; every shape that needs a route -- an absent
+/// position, or a value that has already left the cursor domain -- answered
+/// `null` (jq mode) or nothing (yq mode). All of them are captured rows now.
+///
+/// Captured 2026-09-06 from yq v4.53.3 on `a:\n  b: 1\nc:\n  - 10\n  - 20\n`,
+/// `-o=json -I=0`:
+///
+/// ```text
+/// $ yq '.a | {"k": key}'                        {"k":"a"}
+/// $ yq '.[] | {"k": key, "p": path}'            {"k":"a","p":["a"]} / {"k":"c","p":["c"]}
+/// $ yq '.zz | {"k": key}'                       {"k":"zz"}
+/// $ yq '.a.zz | {"k": key}'                     {"k":"zz"}
+/// $ yq '.a | tostring | {"k": key}'             {"k":"a"}
+/// $ yq '.c | to_entries | .[0] | {"k": key}'    {"k":0}
+/// $ yq '.a? | {"k": key}'                       {"k":"a"}
+/// $ yq '.a | {"k": key} as $o | $o'             {"k":"a"}
+/// $ yq '.a | {(key): 1}'                        {"a":1}
+/// $ yq '.a.b | {"k": key, "p": parent}'         {"k":"b","p":{"b":1}}
+/// $ yq '.a | {"k": (key + "!")}'                {"k":"a!"}
+/// $ yq '.a.zz | {"p": parent, "k": key}'        {"p":{"b":1,"zz":null},"k":"zz"}
+/// ```
+///
+/// Every row matches byte for byte except the last, which is the #2435
+/// vivification divergence `test_absent_position_owned_identity_2472` already
+/// records: succinctly prints the deepest real ancestor for an absent
+/// `parent`, yq materializes the missing key into it.
+#[test]
+fn test_object_construction_keeps_path_context_2473() -> Result<()> {
+    let args = &["-o=json", "-I=0"];
+    let doc = "a:\n  b: 1\nc:\n  - 10\n  - 20\n";
+    for (filter, expected) in [
+        (".a | {\"k\": key}", "{\"k\":\"a\"}"),
+        (
+            ".[] | {\"k\": key, \"p\": path}",
+            "{\"k\":\"a\",\"p\":[\"a\"]}\n{\"k\":\"c\",\"p\":[\"c\"]}",
+        ),
+        // An absent position: the constant route resolves `key` inside the
+        // construction now that the pipe is routed at all.
+        (".zz | {\"k\": key}", "{\"k\":\"zz\"}"),
+        (".a.zz | {\"k\": key}", "{\"k\":\"zz\"}"),
+        // A value that has left the cursor domain: the owned identity pipe.
+        (".a | tostring | {\"k\": key}", "{\"k\":\"a\"}"),
+        (".c | to_entries | .[0] | {\"k\": key}", "{\"k\":0}"),
+        // `?` is the head no route can walk, so this one reaches the eager
+        // evaluator -- whose value-construction arm evaluates the key/value
+        // slots at the stage's own position since #2473, instead of resetting
+        // the context before they run.
+        (".a? | {\"k\": key}", "{\"k\":\"a\"}"),
+        (".a | {\"k\": key} as $o | $o", "{\"k\":\"a\"}"),
+        (".a | {(key): 1}", "{\"a\":1}"),
+        (
+            ".a.b | {\"k\": key, \"p\": parent}",
+            "{\"k\":\"b\",\"p\":{\"b\":1}}",
+        ),
+        (".a | {\"k\": (key + \"!\")}", "{\"k\":\"a!\"}"),
+        // #2435: yq vivifies the missing key into the parent it returns
+        // (`{"b":1,"zz":null}`); succinctly prints the deepest real ancestor.
+        (
+            ".a.zz | {\"p\": parent, \"k\": key}",
+            "{\"p\":{\"b\":1},\"k\":\"zz\"}",
+        ),
+    ] {
+        let (output, code) = run_yq_stdin(filter, doc, args)?;
+        assert_eq!(code, 0, "`{filter}`: {output:?}");
+        assert_eq!(output.trim(), expected, "`{filter}`");
     }
     Ok(())
 }
