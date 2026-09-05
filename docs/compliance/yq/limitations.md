@@ -2257,6 +2257,128 @@ not inherit either of the two wrong spellings shown above.
 [#2419](https://github.com/rust-works/succinctly/issues/2419) is the ADR-0018 record for
 this divergence; fixing the re-spelling itself is out of its scope.
 
+### Comma binds looser than pipe in real yq — succinctly currently applies jq's grouping in both modes (#2420)
+
+Real yq's parser is a shunting-yard operator-precedence parser
+([`pkg/yqlib/expression_postfix.go`](https://github.com/mikefarah/yq/blob/v4.53.3/pkg/yqlib/expression_postfix.go)),
+and its own precedence table
+([`pkg/yqlib/operation.go`](https://github.com/mikefarah/yq/blob/v4.53.3/pkg/yqlib/operation.go))
+assigns `pipeOpType` precedence 30 and `unionOpType` (`,`) precedence 10 —
+**pipe binds *tighter* than comma**. jq's grammar ranks the two operators the
+other way around (comma binds tighter than pipe), and `succinctly` currently
+applies jq's ranking in *both* modes, not yq's own, in `succinctly yq`.
+Confirmed live against the pinned v4.53.3 binary and `/usr/bin/jq` 1.7.1 on
+`printf 'a: 1\nb: 2\nc: 3\n'`:
+
+```bash
+$ printf 'a: 1\nb: 2\nc: 3\n' | yq -o=json -I0 '.a, .b | . + 10'
+1
+12
+$ echo '{"a":1,"b":2,"c":3}' | jq -c '.a, .b | . + 10'
+11
+12
+$ printf 'a: 1\nb: 2\nc: 3\n' | succinctly yq -o=json '.a, .b | . + 10'
+11
+12
+
+$ printf 'a: 1\nb: 2\nc: 3\n' | yq -o=json -I0 '.a | ., .b'
+1
+2
+$ echo '{"a":1,"b":2,"c":3}' | jq -c '.a | ., .b'
+1
+jq: error (at <stdin>:1): Cannot index number with string ("b")   # on stderr
+
+$ printf 'a: 1\nb: 2\nc: 3\n' | yq -o=json -I0 '.a, .b | ., .c'
+1
+2
+3
+$ echo '{"a":1,"b":2,"c":3}' | jq -c '.a, .b | ., .c'
+1
+jq: error (at <stdin>:1): Cannot index number with string ("c")   # on stderr
+
+$ printf 'a: 1\nb: 2\nc: 3\n' | yq -o=json -I0 '.a | .b, .c | . + 1'
+4
+$ echo '{"a":1,"b":2,"c":3}' | jq -c '.a | .b, .c | . + 1'
+jq: error (at <stdin>:1): Cannot index number with string ("b")   # on stderr, no stdout
+
+$ printf 'a: 1\nb: 2\nc: 3\n' | yq -o=json -I0 '(.a, .b) | . + 10'
+11
+12
+$ echo '{"a":1,"b":2,"c":3}' | jq -c '(.a, .b) | . + 10'
+11
+12
+
+$ printf 'a: 1\nb: 2\nc: 3\n' | yq -o=json -I0 '.a, (.b | . + 10)'
+1
+12
+$ echo '{"a":1,"b":2,"c":3}' | jq -c '.a, (.b | . + 10)'
+1
+12
+
+$ printf 'a: 1\nb: 2\nc: 3\n' | yq -o=json -I0 '[.a, .b | . + 10]'
+[1,12]
+$ echo '{"a":1,"b":2,"c":3}' | jq -c '[.a, .b | . + 10]'
+[11,12]
+
+$ printf 'a: 1\nb: 2\nc: 3\n' | yq -o=json -I0 '.a, .b | length'
+1
+1
+$ echo '{"a":1,"b":2,"c":3}' | jq -c '.a, .b | length'
+1
+2
+
+$ printf 'a: 1\nb: 2\nc: 3\n' | yq -o=json -I0 '.a, .b | key'
+1
+"b"
+```
+
+Given `pipe`=30 > `union`=10, `A, B | C` parses as `A, (B | C)` in real yq:
+only the *rightmost* comma branch is fed forward through a following pipe;
+every earlier comma branch evaluates independently against whatever context
+enclosed the whole comma expression (the top-level input, or the LHS of an
+outer pipe if the comma expression sits on a pipe's right-hand side). This
+holds **everywhere in the grammar, not only at top level** — it is a fixed
+entry in yq's operator table, not a special case for the first token:
+
+- `.a | ., .b` groups as `(.a | .), .b`. `.b` runs against the *original*
+  document (yielding `2`), not against `.a`'s value (`1`), which is why real
+  yq raises no error here where jq's `.a | (., .b)` grouping raises "Cannot
+  index number with string" evaluating `.b` against the number `1`.
+- `.a | .b, .c | . + 1` groups as `(.a | .b), (.c | . + 1)` — two independent
+  pipe chains joined by one comma, not one three-stage chain starting from
+  `.a`. Real yq's first branch (`.a | .b`, indexing the number `1` with
+  `.b`) fails exactly as jq's does, but yq drops the failing branch silently
+  (no stderr, exit code 0) rather than jq's fail-loud behaviour, and prints
+  only the second branch's `4`.
+
+The `.a, .b | length`/`.a, .b | key` rows are captured verbatim for
+completeness: the `1`/`1` `length` result (not jq's `1`/`2`) is real yq's own
+scalar-`length` semantics (`2 | length` is `1` in yq, not jq's absolute-value
+`2`) — a separate, unrelated divergence, not evidence against the grouping
+rule above.
+
+**Explicit parentheses restore jq's grouping**, because they are a hard
+boundary the shunting-yard algorithm cannot see across: `(.a, .b) | . + 10`
+and `.a, (.b | . + 10)` both match real jq's answer, regardless of which side
+of the comma the parens wrap. **Construction brackets do not** —  `[...]`
+only scopes evaluation to its contents, it does not change the relative
+comma/pipe precedence inside them, so `[.a, .b | . + 10]` is
+`[.a, (.b | . + 10)]` = `[1,12]`, not jq's `[11,12]`.
+
+Per [ADR-0018](../../adrs/adr-0018.md) rule 2, mode decides: `succinctly yq`
+must follow yq's grammar here, not jq's. It currently does not —
+`succinctly` parses `,` as binding tighter than `|` **in both modes** (jq's
+ranking), so any yq-mode filter that combines an unparenthesised `,` and `|`
+at the same bracket depth risks silently picking up jq's grouping in place of
+yq's own. This is filed as
+[#2420](https://github.com/rust-works/succinctly/issues/2420); this entry
+only records the divergence per ADR-0018 rule 6. Implementing yq's own
+precedence table in `succinctly yq`'s parser is a separate, out-of-scope
+change — see the issue for the parser-change plan and the test-surface audit
+of `tests/yq_cli_tests.rs` and the yq golden corpus that motivated capturing
+this before the Phase 0 corpus for [#2416](https://github.com/rust-works/succinctly/issues/2416)
+grew any larger.
+
 ### Other categories
 
 Float and number formatting ([#1071](https://github.com/rust-works/succinctly/issues/1071),
