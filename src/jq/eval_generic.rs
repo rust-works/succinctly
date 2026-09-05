@@ -13082,6 +13082,16 @@ fn path_context_resolve_constants(
             left: boxed(left),
             right: boxed(right),
         },
+        // #2471 sub-item 5: the owned identity pipe resolves a read inside
+        // an arithmetic operand (`key + 1`). The *absent* route's own gate
+        // ([`path_context_absent_resolvable`]) still refuses arithmetic, so
+        // adding the arm here widens what can be rewritten without widening
+        // what is routed there.
+        Expr::Arithmetic { op, left, right } => Expr::Arithmetic {
+            op: *op,
+            left: boxed(left),
+            right: boxed(right),
+        },
         Expr::And(left, right) => Expr::And(boxed(left), boxed(right)),
         Expr::Or(left, right) => Expr::Or(boxed(left), boxed(right)),
         other => other.clone(),
@@ -14689,7 +14699,7 @@ enum OwnedIdentityRule {
 
 fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
     use OwnedIdentityRule::{
-        Alternative, Detaches, DetachesContainer, Extremum, KeyNode, Keeps, LeftOperand, Slice,
+        Alternative, Detaches, DetachesContainer, Extremum, Keeps, KeyNode, LeftOperand, Slice,
     };
     Some(match strip_parens(stage) {
         Expr::Slice { .. } => Slice,
@@ -14780,14 +14790,14 @@ fn owned_identity_nav_supported(expr: &Expr) -> bool {
                 && start
                     .as_deref()
                     .map_or(true, owned_identity_component_supported)
-                && end.as_deref().map_or(true, owned_identity_component_supported)
+                && end
+                    .as_deref()
+                    .map_or(true, owned_identity_component_supported)
         }
         // #2471: `getpath(p)` is navigation by a computed *chain* of
         // components; jq's own `path(getpath(["a","b"]))` is `["a","b"]`
         // (captured from jq 1.7.1), i.e. every component is taken.
-        Expr::Builtin(Builtin::GetPath(path_expr)) => {
-            owned_identity_component_supported(path_expr)
-        }
+        Expr::Builtin(Builtin::GetPath(path_expr)) => owned_identity_component_supported(path_expr),
         Expr::Optional(inner) | Expr::Paren(inner) => owned_identity_nav_supported(inner),
         Expr::Pipe(exprs) => exprs.iter().all(owned_identity_nav_supported),
         _ => false,
@@ -14819,6 +14829,16 @@ fn owned_identity_operand_supported(expr: &Expr) -> bool {
     }
 }
 
+/// An operand of a ruled arithmetic/comparison/negation stage whose own
+/// path-context reads (if any) can be rewritten to the constants the
+/// identity answers (#2471 sub-item 5). An operand that reads nothing is
+/// admitted whatever its shape -- the ordinary owned evaluator computes it,
+/// and only the *left* one needs a nameable position, which
+/// [`OwnedIdentityRule::LeftOperand`] answers or declines on its own.
+fn owned_identity_operand_resolvable(expr: &Expr) -> bool {
+    !needs_path_context(expr) || path_context_absent_resolvable(expr)
+}
+
 /// The static gate for the owned identity pipe: every stage of `stages` is
 /// navigation, a path-context builtin answered from the identity, or a stage
 /// with an [`owned_identity_rule`] whose own path-context builtins (if any)
@@ -14839,8 +14859,29 @@ fn owned_identity_pipe_supported(stages: &[Expr]) -> bool {
             Expr::Builtin(Builtin::Key | Builtin::PathNoArg | Builtin::FileIndex) => {}
             Expr::Builtin(Builtin::Parent) => {}
             Expr::Builtin(Builtin::ParentN(n)) if matches!(**n, Expr::Literal(_)) => {}
-            Expr::Arithmetic { left, .. } | Expr::Compare { left, .. } | Expr::Negate(left) => {
-                if needs_path_context(stage) || !owned_identity_operand_supported(left) {
+            // #2471 sub-item 5: a read inside an operand is a constant for
+            // a fixed identity -- the same rewrite the ruled `_` arm below
+            // already applies -- so the stage is admitted when every operand
+            // resolves. `OwnedIdentityRule::LeftOperand` then places the
+            // output: a bare `key` operand leaves it detached, a bare
+            // `path`/`file_index` one leaves it where the node stood.
+            Expr::Arithmetic { left, right, .. } | Expr::Compare { left, right, .. } => {
+                if needs_path_context(stage) {
+                    if !owned_identity_operand_resolvable(left)
+                        || !owned_identity_operand_resolvable(right)
+                    {
+                        return false;
+                    }
+                } else if !owned_identity_operand_supported(left) {
+                    return false;
+                }
+            }
+            Expr::Negate(inner) => {
+                if needs_path_context(stage) {
+                    if !owned_identity_operand_resolvable(inner) {
+                        return false;
+                    }
+                } else if !owned_identity_operand_supported(inner) {
                     return false;
                 }
             }
@@ -15330,6 +15371,37 @@ fn owned_identity_placed_by<S: EvalSemantics, V: DocumentValue>(
             else {
                 unreachable!("LeftOperand is assigned to arithmetic, comparison and negation only")
             };
+            let left = strip_parens(left);
+            // #2471 sub-item 5: a *bare* path-context read as the left
+            // operand. Captured from yq v4.53.3 on `a: {b: [1,2,3], c: x}`:
+            //
+            // ```text
+            // .a | to_entries | .[0] | key + 1 | key         (nothing)
+            // .a | to_entries | .[0] | (key + 1) | path      []
+            // .a | to_entries | .[0] | (path + []) | key     0
+            // .a | to_entries | .[0] | (file_index + 0) | key  0
+            // ```
+            //
+            // `path`/`file_index` build an ordinary node at the position, so
+            // the output stands where the input stood; `key`'s own output is
+            // a key node, and yq's key node for an entry of a value it
+            // synthesized carries no parent, so arithmetic over it is
+            // detached. (The one shape succinctly does not follow is yq's
+            // `.a.c | tostring | (key + "x") | path` => `["a","cx"]`, a path
+            // naming a node that does not exist -- an artifact of yq
+            // mutating the key node in place. succinctly answers `[]`.)
+            if owned_identity_emits_position(left) {
+                return Ok(if matches!(left, Expr::Builtin(Builtin::Key)) {
+                    None
+                } else {
+                    Some(id.clone())
+                });
+            }
+            // A resolved read the rule cannot name (`[key] + 1`, `empty` at
+            // the document root) has no position either.
+            if !owned_identity_operand_supported(left) {
+                return Ok(None);
+            }
             owned_identity_operand::<S, V>(left, value, id, optional)?.map(|(_, oid)| oid)
         }
         OwnedIdentityRule::Extremum => {
@@ -15424,24 +15496,16 @@ fn eval_owned_identity_pipe<S: EvalSemantics, V: DocumentValue>(
         // second `key` emits nothing -- `id.key()` answers `None` for a key
         // node, which is exactly yq's own `.a.b | key | key`.
         Expr::Builtin(Builtin::Key) => match id.key() {
-            Ok(Some(key)) => eval_owned_identity_pipe::<S, V>(
-                rest,
-                key,
-                id.with_key_node(true),
-                optional,
-                sink,
-            ),
+            Ok(Some(key)) => {
+                eval_owned_identity_pipe::<S, V>(rest, key, id.with_key_node(true), optional, sink)
+            }
             Ok(None) => Flow::Exhausted,
             Err(e) => Flow::Escaped(Control::Error(e)),
         },
         Expr::Builtin(Builtin::PathNoArg) => match id.path() {
-            Ok(path) => eval_owned_identity_pipe::<S, V>(
-                rest,
-                OwnedValue::Array(path),
-                id,
-                optional,
-                sink,
-            ),
+            Ok(path) => {
+                eval_owned_identity_pipe::<S, V>(rest, OwnedValue::Array(path), id, optional, sink)
+            }
             Err(e) => Flow::Escaped(Control::Error(e)),
         },
         // Same measured status as `path_context_resolve_constants`'s own
@@ -24412,9 +24476,19 @@ mod tests {
             eager(".a | [key] | .[0] | path"),
             "the stage reads path context"
         );
+        // #2471 sub-item 5: a read *inside* an arithmetic or comparison
+        // operand is a constant for a fixed identity, so the stage is
+        // admitted now that #2460's empty-operand rule and #2470's
+        // read-only operands settled what it evaluates to.
+        assert!(!eager(".a | to_entries | .[0] | key + 1"));
+        assert!(!eager(".a | to_entries | .[0] | key == 0"));
+        assert!(!eager(".a | to_entries | .[0] | path + []"));
+        assert!(!eager(".a | tostring | key + \"x\""));
+        // ...but an operand whose own read the constants cannot express
+        // still hands the pipe over.
         assert!(
-            eager(".a | to_entries | .[0] | key + 1"),
-            "path context under arithmetic"
+            eager(".a | to_entries | .[0] | parent + {}"),
+            "parent is not a constant"
         );
         // #2416 step 2: a head that can reach an absent node is no longer a
         // reason on its own -- `path_context_absent_split` walks the head as
