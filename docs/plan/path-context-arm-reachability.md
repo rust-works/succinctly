@@ -192,6 +192,44 @@ admission removes is R3 for an `Expr::Iterate` head, not the arm -- `.a[] | key 
 query above was re-derived (`.a[] | (key | tostring)`, still R3, marker
 confirmed). Nothing became unreachable, so nothing was deleted.
 
+## #2471: gate reason 1 narrowed, and the pin still holds at 43
+
+[#2471](https://github.com/rust-works/succinctly/issues/2471) took four of the
+owned-domain shapes gate reason `R1` still hands over -- computed
+`IndexExpr`/`SliceExpr` (and `?` over them) as navigation, `getpath(p)` as a
+navigational stage, a path-context read after `key`/`path`/`file_index`
+replaced the value, and a read under arithmetic inside a ruled stage -- and
+moved them onto the owned identity pipe (ADR-0021 decision 7). Each row is an
+oracle capture; `test_owned_identity_rules_match_yq_2416` (yq mode) and
+`test_computed_navigation_keeps_path_context_2471` /
+`test_path_context_after_key_or_path_2471` (jq mode) carry them.
+
+**`PINNED_ARM_COUNT` stays at 43.** Re-run of the method above, on the
+post-#2471 tree, with the five `R1` arms instrumented and each fed its own
+proof query from the table (document `D`):
+
+| Id  | Proof query                                | Marker  | Output  |
+|-----|--------------------------------------------|---------|---------|
+| A04 | `.c[0:1] \| .[0] \| key + 1`                | fired   | `1`     |
+| A07 | `.c[.n]? \| key + 1`                        | fired   | `1`     |
+| A17 | `.a \| getpath(["b"]) \| . as $x \| key`    | fired   | `"b"`   |
+| A19 | `.c[.n] \| key + 1`                         | fired   | `1`     |
+| A20 | `.c[.n:.m] \| .[0] \| key + 1`              | fired   | `1`     |
+
+All five still fire, with their pinned outputs unchanged
+(`test_arm_audit_proof_queries_are_unmoved_by_the_gate_2416` is green). The
+reason is structural rather than incidental: #2471 widened what the *owned
+identity pipe* accepts once a pipe has already left the cursor domain, but a
+computed bracket or a `getpath` standing at the **head** of a pipe is still a
+detaching stage with no `owned_identity_rule`, so `owned_identity_pipe_applies`
+declines it and `path_context_needs_eager` answers `true` exactly as before.
+Widening that would mean teaching the cursor walk itself
+(`path_context_is_navigational` + `path_step_generic`) to evaluate a computed
+component -- which it cannot do uniformly, because an *absent* position
+(`PathNode::Absent`) carries no cursor to evaluate the component against. That
+is the next step for this cluster, and it is what would make the five `R1` rows
+unreachable.
+
 ## Result
 
 | Metric                                            | Before | After |
@@ -216,7 +254,9 @@ evaluator, with no second route to check.
   reason and are the cheapest cluster to attack: `Expr::Slice`, `Expr::IndexExpr`
   and `Expr::SliceExpr` are missing from `path_context_single_native` even though
   their literal-bound siblings (`Expr::Index`, `Expr::Slice` with folded bounds)
-  are navigational.
+  are navigational. #2471 (section above) took the *owned-domain* half of that
+  cluster and left all five arms reachable: what remains is the head-of-pipe
+  half, which needs the cursor walk to evaluate a computed component.
 - `A24` (`Expr::Shared`) is only ever produced by `substitute_func_param`
   (`src/jq/eval.rs`), so it dies with `A23`/`A25` and not before.
 - `A38` (`Expr::Break`) cannot be reached without `A37` (`Expr::Label`): the
