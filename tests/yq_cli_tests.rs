@@ -34068,4 +34068,135 @@ mod issue_870_position_shifting_writes {
         assert_eq!(output, "arr:\n  - \"z\"\n  - y\nn: 1\n");
         Ok(())
     }
+
+    /// The issue's own repro. A prepend shifts every old element down one
+    /// slot: the new element must get fresh metadata, and `"x"` must keep
+    /// its own quotes rather than inheriting index 1's plain style.
+    ///
+    /// $ yq '.arr = ["new"] + .arr | .n = 2'
+    ///   arr:\n  - new\n  - "x"\n  - y\nn: 2
+    #[test]
+    fn test_yaml_prepend_does_not_shift_style_onto_new_element_870() -> Result<()> {
+        let input = "arr:\n  - \"x\"\n  - y\nn: 1\n";
+        let (output, exit_code) = run_yq_stdin(".arr = [\"new\"] + .arr | .n = 2", input, &[])?;
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, "arr:\n  - new\n  - \"x\"\n  - y\nn: 2\n");
+        Ok(())
+    }
+
+    /// A reverse keeps both elements but swaps their slots, so each must
+    /// carry its own style to its new position.
+    ///
+    /// $ yq '.arr = (.arr|reverse)'  =>  arr:\n  - y\n  - "x"
+    #[test]
+    fn test_yaml_reverse_carries_style_to_new_positions_870() -> Result<()> {
+        let input = "arr:\n  - \"x\"\n  - y\nn: 1\n";
+        let (output, exit_code) = run_yq_stdin(".arr = (.arr|reverse)", input, &[])?;
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, "arr:\n  - y\n  - \"x\"\nn: 1\n");
+        Ok(())
+    }
+
+    /// `|=` reaches the same write path as `=` and must reorder identically.
+    ///
+    /// $ yq '.arr |= reverse'  =>  arr:\n  - y\n  - "x"
+    #[test]
+    fn test_yaml_update_assign_reverse_carries_style_870() -> Result<()> {
+        let input = "arr:\n  - \"x\"\n  - y\n";
+        let (output, exit_code) = run_yq_stdin(".arr |= reverse", input, &[])?;
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, "arr:\n  - y\n  - \"x\"\n");
+        Ok(())
+    }
+
+    /// A wholesale replacement whose elements match nothing in the pristine
+    /// array gets no metadata at all — before #870 both new elements
+    /// inherited the old slots' comments and style.
+    ///
+    /// $ yq '.arr = ["p","q"]'  =>  arr:\n  - p\n  - q
+    #[test]
+    fn test_yaml_wholesale_replacement_drops_old_metadata_870() -> Result<()> {
+        let input = "arr:\n  - \"x\" # cx\n  - y # cy\n";
+        let (output, exit_code) = run_yq_stdin(".arr = [\"p\",\"q\"]", input, &[])?;
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, "arr:\n  - p\n  - q\n");
+        Ok(())
+    }
+
+    /// `+=` appends: the existing elements keep their own slots and the
+    /// appended one gets nothing.
+    ///
+    /// $ yq '.arr += ["z"]'  =>  arr:\n  - "x"\n  - y\n  - z
+    #[test]
+    fn test_yaml_append_keeps_existing_and_leaves_new_bare_870() -> Result<()> {
+        let input = "arr:\n  - \"x\"\n  - y\n";
+        let (output, exit_code) = run_yq_stdin(".arr += [\"z\"]", input, &[])?;
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, "arr:\n  - \"x\"\n  - y\n  - z\n");
+        Ok(())
+    }
+
+    /// Writing the array to itself changes nothing, so every element keeps
+    /// exactly what it had — the alignment must be stable, not merely
+    /// "different from before".
+    ///
+    /// $ yq '.arr = .arr'  =>  arr:\n  - "x" # cx\n  - y # cy
+    #[test]
+    fn test_yaml_self_assign_preserves_everything_870() -> Result<()> {
+        let input = "arr:\n  - \"x\" # cx\n  - y # cy\n";
+        let (output, exit_code) = run_yq_stdin(".arr = .arr", input, &[])?;
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, "arr:\n  - \"x\" # cx\n  - y # cy\n");
+        Ok(())
+    }
+
+    /// Object fields stay matched by key across a wholesale write: a
+    /// reordering constructor must carry each field's own comment with its
+    /// own key, never align them by value across different keys.
+    ///
+    /// $ yq '.o = {"b": .o.b, "a": .o.a}'  =>  o:\n  b: 2 # cb\n  a: "1" # ca
+    #[test]
+    fn test_yaml_object_reorder_keeps_comments_with_their_keys_870() -> Result<()> {
+        let input = "o:\n  a: \"1\" # ca\n  b: 2 # cb\nn: 0\n";
+        let (output, exit_code) = run_yq_stdin(".o = {\"b\": .o.b, \"a\": .o.a}", input, &[])?;
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, "o:\n  b: 2 # cb\n  a: \"1\" # ca\nn: 0\n");
+        Ok(())
+    }
+
+    /// A computed index is not statically resolvable, so `collect_write_targets`
+    /// declines it and reconciliation falls back to the pre-#870 lockstep
+    /// walk. The write itself must still land, and untouched siblings must
+    /// keep their metadata — "falls back" has to mean "unchanged", not
+    /// "loses everything". Nothing moved here, so the fallback happens to
+    /// agree with real yq exactly: slot 1 keeps its own plain style and its
+    /// own comment while taking the new value.
+    ///
+    /// $ yq '.arr[(.i)] = "z"'  =>  i: 1 / arr:\n  - "x" # cx\n  - z # cy / n: 1 # cn
+    #[test]
+    fn test_yaml_computed_index_write_falls_back_cleanly_870() -> Result<()> {
+        let input = "i: 1\narr:\n  - \"x\" # cx\n  - y # cy\nn: 1 # cn\n";
+        let (output, exit_code) = run_yq_stdin(".arr[(.i)] = \"z\"", input, &[])?;
+        assert_eq!(exit_code, 0);
+        assert_eq!(
+            output,
+            "i: 1\narr:\n  - \"x\" # cx\n  - z # cy\nn: 1 # cn\n"
+        );
+        Ok(())
+    }
+
+    /// An untouched sibling of a reshuffled array keeps its own comment and
+    /// style: threading write paths must narrow what gets reset, not widen
+    /// it.
+    #[test]
+    fn test_yaml_untouched_siblings_survive_a_reshuffle_870() -> Result<()> {
+        let input = "keep: \"q\" # ck\narr:\n  - \"x\" # cx\n  - y # cy\n";
+        let (output, exit_code) = run_yq_stdin(".arr = (.arr|reverse)", input, &[])?;
+        assert_eq!(exit_code, 0);
+        assert_eq!(
+            output,
+            "keep: \"q\" # ck\narr:\n  - y # cy\n  - \"x\" # cx\n"
+        );
+        Ok(())
+    }
 }

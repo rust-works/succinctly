@@ -2027,6 +2027,45 @@ fn array_sources(
     r_items: &[OwnedValue],
     targets: &[RelTarget<'_>],
 ) -> Vec<Option<usize>> {
+    // A wholesale write at this array (`.arr = <expr>`, `|=`, `+=`)
+    // replaces its contents outright, so slot `i` of the result is not slot
+    // `i` of the pristine in any meaningful sense — a prepend shifts
+    // everything down one, a reverse turns the order around.
+    //
+    // Real yq carries presentation on *node identity*: an element the
+    // expression referenced keeps its own comment and style, one it
+    // constructed gets none. Matching each result element to the first
+    // still-unclaimed pristine element holding an equal value, in order,
+    // approximates that without a shared-node value model (#1351) — and
+    // reproduces yq exactly for the prepend and reverse that motivated this
+    // issue. Where it still differs is a constructed literal that happens
+    // to equal an old element; see [`reconcile_presentation`]'s own doc
+    // comment.
+    //
+    // Checked before the `del` remap below: once the array has been
+    // rewritten wholesale, pristine *positions* mean nothing, so a `del`
+    // in the same pipe has no positional model left to remap against.
+    if targets
+        .iter()
+        .any(|(steps, kind)| steps.is_empty() && *kind == WriteKind::Set)
+    {
+        let mut claimed = vec![false; p_items.len()];
+        return r_items
+            .iter()
+            .map(|r_v| {
+                let found = p_items
+                    .iter()
+                    .enumerate()
+                    .find(|(p, p_v)| !claimed[*p] && *p_v == r_v)
+                    .map(|(p, _)| p);
+                if let Some(p) = found {
+                    claimed[p] = true;
+                }
+                found
+            })
+            .collect();
+    }
+
     // `del(.arr[k])` shifts every later element down one slot, so slot `i`
     // of the result is a *different* pristine node than slot `i` was — the
     // exact case that made `del(.arr[0])` inherit index 0's comment instead
