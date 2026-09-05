@@ -2086,6 +2086,28 @@ fn test_arm_audit_proof_queries_are_unmoved_by_the_gate_2416() {
             r#".a[] | reduce (key) as $k (""; . + $k) | . + "x""#,
             &[r#""bx""#],
         ),
+        // #2472's re-derived proof queries, same precedent as A05's above:
+        // routing the absent shapes to the owned identity pipe moved
+        // fourteen rows' listed queries off the eager evaluator, so the
+        // audit re-derived one apiece. Both spellings stay pinned, which is
+        // what makes the move readable as "same outputs, different route".
+        // `?` is the reliable R2 head now: `path_context_is_navigational`
+        // excludes it, so the absent split's head stops before it and there
+        // is no position to route.
+        (r".a? | path + []", &[r#"["a"]"#]),
+        (".a? | file_index + 1", &["1"]),
+        (".a.b | (file_index | tostring)", &[r#""0""#]),
+        (".a.b | . | parent + {}", &[r#"{"b":1}"#]),
+        (".c[0] | parent + []", &["[10,20]"]),
+        (".a.b | (parent) + {}", &[r#"{"b":1}"#]),
+        (r#".a? | (key + "x") | . == "bx""#, &["false"]),
+        (
+            r#".a.b | select(key == "b") | parent + {}"#,
+            &[r#"{"b":1}"#],
+        ),
+        (r".a[] | (key | length)", &["1"]),
+        (r#".a? | [key] + ["x"]"#, &[r#"["a","x"]"#]),
+        (r#".a? | (key + "x") | {z: .}"#, &[r#"{"z":"ax"}"#]),
     ];
     for (filter, expected) in rows {
         // `path + []` is the audit's H1 row spelled against `.a.b`.
