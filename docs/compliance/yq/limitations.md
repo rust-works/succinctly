@@ -2204,7 +2204,7 @@ usable output" a real yq user would see, even though the specific error message
 differs (succinctly raises succinctly's own generator-model error; real yq raises its
 own parse-time rejection).
 
-### Float scalars lose their source spelling on the value route (#2419)
+### An integer-shaped overflow float gains a trailing `.0` on the value route (#2419)
 
 This is the yq-mode counterpart to jq mode's
 ["Float literals lose their source spelling"](../jq/limitations.md#float-literals-lose-their-source-spelling)
@@ -2220,42 +2220,41 @@ $ printf 'outer:\n  big: 100000000000000000000\n' | yq '.outer.big | tostring'
 ```
 
 succinctly's value route — `.outer.big | tostring`, which resolves the scalar through
-`OwnedValue::Float` — re-spells the value whenever its shortest rendering differs from its
-source text:
+`OwnedValue` rather than the cursor — used to re-spell *both* of these through the shortest
+`f64` rendering (`1e+19`, `1e+20`), because neither literal survives
+[`is_preservable_float_literal`](../../../src/yaml/scalar.rs) (20 significant digits exceeds
+its cap; the second has no `.`/`e` at all). Since
+[#2438](https://github.com/rust-works/succinctly/issues/2438),
+`OwnedValue::from_document_float` records the document's own decimal spelling at that
+boundary instead, which closes the `.0`-suffixed case and narrows the divergence to the
+integer-shaped one:
 
 ```bash
 $ printf 'outer:\n  big: 10000000000000000000.0\n' | succinctly yq '.outer.big | tostring'
-1e+19
-$ printf 'outer:\n  big: 100000000000000000000\n' | succinctly yq '.outer.big | tostring'
-1e+20
-```
-
-`1.50`, `1e3` and `0.1` are unaffected — their shortest rendering already matches their
-source spelling, so [`is_preservable_float_literal`](../../../src/yaml/scalar.rs) keeps them
-intact on both tools — and so is the plain `.outer.big` identity read, which never goes
-through the value route at all.
-
-The path-context bridge route — `.outer.big | parent | .big | tostring` — sidesteps the
-value route entirely and matches real yq on the `.0`-suffixed spelling, but produces a
-*third*, still-wrong spelling on the integer-looking one, where real yq prints the bare
-integer with no trailing `.0`:
-
-```bash
-$ printf 'outer:\n  big: 10000000000000000000.0\n' | succinctly yq '.outer.big | parent | .big | tostring'
 10000000000000000000.0
-$ printf 'outer:\n  big: 100000000000000000000\n' | succinctly yq '.outer.big | parent | .big | tostring'
+$ printf 'outer:\n  big: 100000000000000000000\n' | succinctly yq '.outer.big | tostring'
 100000000000000000000.0
 ```
 
-`try_path_context_cursor_walk` (#2061) falls back to this bridge specifically to stay
-output-identical with it whenever a value-route emission would otherwise be re-spelled.
-[#2416](https://github.com/rust-works/succinctly/issues/2416) retires the bridge, at which
-point that fallback has nothing left to defer to — this capture is the evidence that the
-re-spelling is succinctly's own artifact rather than a reference behaviour to match, so
-#2416's path-context walk should emit the document's own spelling once the bridge is gone,
-not inherit either of the two wrong spellings shown above.
+`1.50`, `1e3` and `0.1` are unaffected — their source spelling is preserved outright on both
+tools — and so is the plain `.outer.big` identity read, which never goes through the value
+route at all.
+
+What remains is the trailing `.0` on the integer-shaped spelling. It is not removable in
+isolation: that same `100000000000000000000.0` text is exactly what real yq itself prints
+for the same scalar on JSON output (`yq -o json '[.a]'` on `a: 99999999999999999999` answers
+`[100000000000000000000.0]`, oracle-captured), and it is what distinguishes a document-sourced
+float from a computed one of the identical magnitude, which real yq spells `1e+20` instead.
+Dropping the `.0` for `tostring` alone needs a second, output-position-dependent spelling
+that `OwnedValue::NumberLiteral`'s single text field cannot carry.
+
+The path-context route — `.outer.big | parent | .big | tostring` — now answers identically
+to the value route on every row above, where it used to print a third spelling. The
+reindex-identity fallback that `try_path_context_cursor_walk` (#2061) once used to stay
+output-identical with the bridge was removed by the spine 2416 sink walk; the two routes
+agreeing here is what makes that removal safe on the `.0`-suffixed case.
 [#2419](https://github.com/rust-works/succinctly/issues/2419) is the ADR-0018 record for
-this divergence; fixing the re-spelling itself is out of its scope.
+what is left.
 
 ### Comma binds looser than pipe in real yq — the grouping is resolved (#2420); two evaluation-model residuals remain (#2451, #2452)
 

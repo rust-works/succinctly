@@ -3591,6 +3591,13 @@ fn format_float_yq_with(f: f64, ordinary_magnitude: impl FnOnce(f64) -> String) 
         "format_float_yq_with requires a finite value; NaN/Infinity have no \
          JSON/YAML spelling here and must be special-cased by the caller"
     );
+    if !yq_float_is_scientific(f) {
+        return ordinary_magnitude(f);
+    }
+    // Only the scientific branch needs the exponential rendering, so the
+    // `format!` stays inside it: `yq_float_is_scientific` decides
+    // arithmetically, and an everyday-magnitude value never pays for a
+    // string it would immediately discard.
     let sci = format!("{f:e}");
     let (mantissa, exp_str) = sci
         .split_once('e')
@@ -3598,12 +3605,67 @@ fn format_float_yq_with(f: f64, ordinary_magnitude: impl FnOnce(f64) -> String) 
     let exp: i32 = exp_str
         .parse()
         .expect("exponent from Rust's exponential formatter is always a valid i32");
-    if (-4..6).contains(&exp) {
-        ordinary_magnitude(f)
-    } else {
-        let sign = if exp < 0 { '-' } else { '+' };
-        format!("{mantissa}e{sign}{:02}", exp.abs())
-    }
+    let sign = if exp < 0 { '-' } else { '+' };
+    format!("{mantissa}e{sign}{:02}", exp.abs())
+}
+
+/// Whether real yq would spell `f` in scientific notation rather than decimally.
+///
+/// The one definition of yq's magnitude threshold (#2438): everything that
+/// formats a computed float ([`format_float_yq`], [`format_float_yq_yaml`],
+/// and the private `format_float_yq_with` they share) and everything that
+/// has to *decide* on the threshold rather than format with it asks this.
+/// The rule used to be
+/// written out twice -- once here and once as the reindex bridge's
+/// unconditional [`format_float_with_fraction`] fallback in
+/// `OwnedValue::to_json_for_reindex` (`src/jq/value.rs`) -- so a computed
+/// float above the threshold came out of `[...]`/`,` as a 100-digit decimal
+/// expansion where a bare one printed `1e+100`.
+///
+/// A document-sourced float that reaches `OwnedValue` with no preservable
+/// source literal left (a YAML integer-shaped scalar too big for `i64`, or
+/// a tag-forced `!!float 100000000000000000000`) needs the full decimal
+/// spelling real yq gives it, while a *computed* float of the very same
+/// magnitude needs scientific -- oracle-confirmed against yq v4.53.3, which
+/// answers `[100000000000000000000.0]` for `-o json '[.a]'` on
+/// `a: 99999999999999999999` and `[1e+20]` for `-o json '[1e20 * 1]'`. No
+/// threshold rule can tell those apart, so provenance is recorded at the
+/// document boundary instead: [`crate::jq::OwnedValue::from_document_float`]
+/// uses this to bake the decimal spelling in as a literal exactly where yq
+/// keeps one,
+/// which frees the reindex bridge to apply the threshold to everything left
+/// (#2438).
+///
+/// Stated arithmetically rather than by reading the exponent back out of
+/// `format!("{f:e}")`, which is where the rule started: this now runs on the
+/// DOM decode path for *every* document float
+/// (`to_owned_at_depth` -> [`crate::jq::OwnedValue::from_document_float`]),
+/// so the string form charged a float-heavy document one allocation per
+/// number just to learn that the number was ordinary.
+///
+/// The two agree exactly. `{:e}`'s exponent is that of the shortest decimal
+/// that round-trips to `f`, so `exp` lands in `-4..6` precisely when
+/// `1e-4 <= |f| < 1e6` (`0.0`/`-0.0` print as `0e0`, exponent `0`, and are
+/// ordinary). Neither boundary can be crossed by the shortest-repr rounding:
+/// printing a double just below `1e6` as `1e6` would round-trip to a
+/// *different* double, and `1e-4` itself is the nearest double to 10^-4, so
+/// it prints as `1e-4` while the double below it prints as
+/// `9.999999999999999e-5`. Pinned by
+/// `yq_float_is_scientific_agrees_with_the_exponent_it_replaces`, which
+/// keeps the `{:e}` form as the test oracle over both boundaries, their
+/// neighbouring doubles, the extremes, and a few hundred pseudorandom
+/// values.
+///
+/// `f` must be finite, like [`format_float_yq`].
+#[must_use]
+pub fn yq_float_is_scientific(f: f64) -> bool {
+    debug_assert!(
+        f.is_finite(),
+        "yq_float_is_scientific requires a finite value; NaN/Infinity have no \
+         JSON/YAML spelling here and must be special-cased by the caller"
+    );
+    let magnitude = f.abs();
+    magnitude != 0.0 && !(1e-4..1e6).contains(&magnitude)
 }
 
 /// If `canonicalize` and `resolved` is a finite `Float`, the value to
@@ -7913,6 +7975,100 @@ fn stream_yaml_single_quoted<Out: core::fmt::Write>(out: &mut Out, s: &str) -> c
 mod tests {
     use super::*;
     use crate::yaml::{YamlError, YamlIndex};
+
+    /// #2438: [`yq_float_is_scientific`] is stated arithmetically because it
+    /// runs once per document float on the DOM decode path, but the rule it
+    /// encodes is "`format!("{f:e}")`'s exponent is outside `-4..6`". This
+    /// keeps that string form as the *oracle* and asserts the two agree.
+    ///
+    /// The grid is boundary-first, because that is the only place the two
+    /// could disagree: both boundaries, the double immediately below each,
+    /// and the extremes at either end of the range. `999999.9999999999` is
+    /// the decimal spelling of the double below `1e6`, kept as a literal so
+    /// the row is readable next to the computed one. The pseudorandom tail
+    /// (a plain LCG, no dev-dependency) covers the interior: half as raw bit
+    /// patterns, which spread over the whole exponent range, and half as
+    /// mantissa-times-power-of-ten values clustered around the boundaries,
+    /// which raw bits essentially never land near.
+    #[test]
+    fn yq_float_is_scientific_agrees_with_the_exponent_it_replaces() {
+        /// The rule as originally written: read the exponent back out of
+        /// Rust's shortest-round-trip exponential rendering.
+        fn exponent_says_scientific(f: f64) -> bool {
+            let sci = format!("{f:e}");
+            let exp: i32 = sci
+                .split_once('e')
+                .expect("always has an 'e'")
+                .1
+                .parse()
+                .expect("always a valid i32");
+            !(-4..6).contains(&exp)
+        }
+
+        let below_1e_minus_4 = f64::from_bits(1e-4f64.to_bits() - 1);
+        let below_1e6 = f64::from_bits(1e6f64.to_bits() - 1);
+        let mut cases = vec![
+            0.0,
+            1e-4,
+            below_1e_minus_4,
+            1e6,
+            below_1e6,
+            999_999.999_999_999_9,
+            5e-324,
+            f64::MIN_POSITIVE,
+            f64::MAX,
+            1.0,
+            0.5,
+            99_999.0,
+            100_000.0,
+            1e-5,
+            1e5,
+        ];
+        // Negatives of every row above: the predicate reads `f.abs()`, so a
+        // sign that leaked into either side would show up only here.
+        for i in 0..cases.len() {
+            cases.push(-cases[i]);
+        }
+        // `-0.0` is not `-(0.0)` as a literal to the parser in every
+        // position, so it is spelled out rather than relied on above.
+        cases.push(-0.0);
+
+        // A plain LCG (Knuth's MMIX constants) -- deterministic, no
+        // dev-dependency, and the seed is fixed so a failure reproduces.
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            state
+        };
+        for _ in 0..256 {
+            let f = f64::from_bits(next());
+            if f.is_finite() {
+                cases.push(f);
+            }
+        }
+        for _ in 0..256 {
+            // Mantissa in [1, 10), exponent in -8..=8 -- straddles both
+            // boundaries densely.
+            let mantissa = 1.0 + (next() >> 11) as f64 / (1u64 << 53) as f64 * 9.0;
+            let exp = (next() % 17) as i32 - 8;
+            let f = mantissa * 10f64.powi(exp);
+            if f.is_finite() {
+                cases.push(f);
+                cases.push(-f);
+            }
+        }
+
+        for f in cases {
+            assert_eq!(
+                yq_float_is_scientific(f),
+                exponent_says_scientific(f),
+                "disagreed for {f:e} (bits {:#x})",
+                f.to_bits()
+            );
+        }
+    }
 
     /// Helper to get the first document from the root document array.
     /// All YAML documents are wrapped in a virtual root sequence.

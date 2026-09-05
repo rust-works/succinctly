@@ -140,9 +140,12 @@ impl ResolvedScalar {
     /// (deliberately — `YqSemantics` there re-breaks #978's
     /// JSON-sourced-`1e2`-renders-as-`100` rule), and jq's plain-`Float`
     /// fallback is the one that drops the point. Every other bridge is
-    /// `S`-gated and already spells a bare `Float` with
-    /// `format_float_with_fraction` under `YqSemantics`, so a tag-forced
-    /// float survives those untouched. Handing the re-spelling to
+    /// `S`-gated and spells a bare `Float` with `format_float_yq` under
+    /// `YqSemantics`, whose everyday-magnitude branch is
+    /// `format_float_with_fraction` (#2438) -- and a tag-forced float past
+    /// that magnitude threshold has already picked up its own spelling from
+    /// [`OwnedValue::from_document_float`] in the arm below -- so a
+    /// tag-forced float survives those untouched either way. Handing the re-spelling to
     /// `eval_generic`'s cursor materialization and to `load()` as well
     /// costs real oracle fidelity: their values reach string-producing
     /// builtins, where real yq prints the scalar's own text, so
@@ -183,7 +186,11 @@ impl ResolvedScalar {
                 {
                     OwnedValue::from_number_literal(&super::format_float_with_fraction(f))
                 }
-                None => OwnedValue::Float(f),
+                // #2438: same document boundary as `to_owned_at_depth`'s own
+                // bare-float arm (`src/jq/eval_generic.rs`) -- an explicitly
+                // tagged `!!float 100000000000000000000` reaches `OwnedValue`
+                // here instead, and needs the identical provenance record.
+                None => OwnedValue::from_document_float(f),
             },
             Self::Str => OwnedValue::String(text.into_owned()),
         }
