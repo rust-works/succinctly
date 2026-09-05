@@ -38242,3 +38242,23 @@ fn test_jq_binary_fanout_stays_right_major_2451() -> Result<()> {
 
     Ok(())
 }
+
+/// #2462: yq's `downcase`/`upcase` builtins are not real jq names -- jq
+/// 1.7.1 has neither spelling (`jq -n 'downcase'` => `downcase/0 is not
+/// defined`). yq's own `downcase`/`upcase` keywords were added only in yq
+/// mode's parser (`src/jq/parser.rs`), so jq mode still resolves them as
+/// ordinary unresolved function calls and reports jq's own error, matching
+/// the oracle -- see `test_yq_downcase_upcase_builtins_2462`
+/// (yq_cli_tests.rs) for the yq-mode captures this leaves unaffected.
+#[test]
+fn test_jq_mode_has_no_downcase_upcase_2462() -> Result<()> {
+    for filter in ["downcase", "upcase"] {
+        let (_out, stderr, code) = run_jq_stdin_streams(filter, "\"x\"", &[])?;
+        assert_ne!(code, 0, "`{filter}` should be rejected in jq mode");
+        assert!(
+            stderr.contains("is not defined"),
+            "`{filter}` stderr should say not defined, got: {stderr}"
+        );
+    }
+    Ok(())
+}
