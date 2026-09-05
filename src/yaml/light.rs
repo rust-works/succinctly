@@ -6119,7 +6119,23 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     /// not a parent a query can reach: `parent` from a document root emits
     /// nothing, matching real yq (#2421).
     fn document_parent(&self) -> Option<Self> {
-        let parent = YamlCursor::parent(self)?;
+        let mut parent = YamlCursor::parent(self)?;
+        // A block sequence item's BP parent is its `-` wrapper node, which
+        // never carries a TY bit and whose `value()` resolves to the item
+        // itself -- so a caller asking "which array holds this node" would
+        // see a scalar/mapping where it expects the sequence, and `key`,
+        // `path`, `parent` would all answer as if the item were the root
+        // (#2455). Climb through the wrapper to the sequence that owns it.
+        // `uncons_cursor` already hands out the unwrapped item cursor, so
+        // this is the one place the wrapper is still visible to the
+        // evaluator.
+        if !parent.is_container()
+            && parent
+                .text_position()
+                .is_some_and(|text_pos| starts_seq_entry(parent.text, text_pos))
+        {
+            parent = YamlCursor::parent(&parent)?;
+        }
         (parent.bp_pos != 0).then_some(parent)
     }
 

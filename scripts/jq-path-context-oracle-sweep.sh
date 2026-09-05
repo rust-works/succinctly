@@ -360,6 +360,30 @@ cat > "$WORK/two.yaml" <<'JSON'
 {"a":{"b":3,"c":4},"d":[30,40]}
 JSON
 
+# The same two documents in block style. A block sequence item sits behind a
+# `-` wrapper node that the flow form has no counterpart for, and #2455 was a
+# path-context bug only that wrapper could expose (`.d[] | key == 0` answered
+# nothing on `- 10` and `true` on `[10, 20]`), so every yq-mode case runs on
+# both forms. Hand-written rather than derived with `yq -P`, so the sweep
+# does not depend on the oracle's own pretty-printer; the runner checks the
+# block files decode to the flow ones before any case runs.
+cat > "$WORK/one-block.yaml" <<'YAML'
+a:
+  b: 1
+  c: 2
+d:
+  - 10
+  - 20
+YAML
+cat > "$WORK/two-block.yaml" <<'YAML'
+a:
+  b: 3
+  c: 4
+d:
+  - 30
+  - 40
+YAML
+
 # --- runner -----------------------------------------------------------------
 
 esc() {
@@ -443,7 +467,7 @@ S_ERR="$WORK/s.err"
 O_ERR="$WORK/o.err"
 
 run_case() {
-  local mode="$1" class="$2" filter="$3"
+  local mode="$1" class="$2" filter="$3" variant="${4:-}"
   total=$((total + 1))
 
   local s_out s_code o_out o_code s_err o_err
@@ -456,9 +480,9 @@ run_case() {
     # Two input files, deliberately: `file_index` is a leaf in this alphabet
     # and is identically 0 with one file, so a single-file sweep could not
     # tell a correct implementation from a stubbed constant.
-    s_out="$("$SUCC" yq -o=json -I=0 "$filter" "$WORK/one.yaml" "$WORK/two.yaml" 2>"$S_ERR")" && s_code=0 || s_code=$?
+    s_out="$("$SUCC" yq -o=json -I=0 "$filter" "$WORK/one$variant.yaml" "$WORK/two$variant.yaml" 2>"$S_ERR")" && s_code=0 || s_code=$?
     s_err="$(cat "$S_ERR")"
-    o_out="$("$YQ" -o=json -I=0 "$filter" "$WORK/one.yaml" "$WORK/two.yaml" 2>"$O_ERR")" && o_code=0 || o_code=$?
+    o_out="$("$YQ" -o=json -I=0 "$filter" "$WORK/one$variant.yaml" "$WORK/two$variant.yaml" 2>"$O_ERR")" && o_code=0 || o_code=$?
     o_err="$(cat "$O_ERR")"
   fi
 
@@ -468,8 +492,8 @@ run_case() {
       known_labels+=("$CLASSIFY_LABEL")
     else
       unexpected=$((unexpected + 1))
-      unexpected_classes+=("$mode/$class")
-      divergence_log+="[$mode $class] $filter
+      unexpected_classes+=("$mode/$class${variant:+ (block)}")
+      divergence_log+="[$mode $class${variant:+ block}] $filter
   oracle:      out=$(esc "$o_out") err=$(esc "$o_err") exit=$o_code
   succinctly:  out=$(esc "$s_out") err=$(esc "$s_err") exit=$s_code
 "
@@ -477,14 +501,28 @@ run_case() {
   fi
 
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$mode" "$class" "$(esc "$filter")" \
+    "$mode${variant:+ block}" "$class" "$(esc "$filter")" \
     "$s_code" "$(esc "$s_out")" "$(esc "$s_err")" \
     "$o_code" "$(esc "$o_out")" "$(esc "$o_err")"
 }
 
+# The block files must be the same documents as the flow ones, or a block
+# divergence could be the fixture rather than the evaluator.
+if [[ -n "${YQ:-}" ]]; then
+  for f in one two; do
+    if [[ "$("$YQ" -o=json -I=0 . "$WORK/$f-block.yaml")" != "$(cat "$WORK/$f.yaml")" ]]; then
+      echo "error: $WORK/$f-block.yaml does not decode to $WORK/$f.yaml" >&2
+      exit 1
+    fi
+  done
+fi
+
 for line in "${CASES[@]}"; do
   IFS=$'\t' read -r c_mode c_class c_filter <<<"$line"
   run_case "$c_mode" "$c_class" "$c_filter"
+  if [[ "$c_mode" == yq ]]; then
+    run_case "$c_mode" "$c_class" "$c_filter" -block
+  fi
 done
 
 {
