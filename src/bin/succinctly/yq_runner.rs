@@ -1845,6 +1845,218 @@ fn walk_alias_groups<W: AsRef<[u64]> + Clone>(
     }
 }
 
+/// One step of a *statically resolvable* write path (#870).
+///
+/// A negative index is kept exactly as written: `-1` only means anything
+/// relative to the container it lands in, so
+/// [`reconcile_presentation_at_depth`] resolves it once it has that
+/// container in hand.
+#[derive(Clone, Debug, PartialEq)]
+enum PathStep {
+    Key(String),
+    Index(i64),
+}
+
+/// What a write did at the path it resolved to (#870).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriteKind {
+    /// `=`, `|=`, a compound assign or `//=`: the node **at** the path was
+    /// rewritten in place.
+    Set,
+    /// `del(...)`: the node at the path was removed from its parent, so the
+    /// parent's later children all shifted down one slot.
+    Del,
+}
+
+/// A path a write actually touched, plus what it did there (#870).
+#[derive(Clone, Debug)]
+struct WriteTarget {
+    path: Vec<PathStep>,
+    kind: WriteKind,
+}
+
+/// Collect the [`PathStep`]s of a *static* navigation chain, returning
+/// `false` for anything whose resolved path is not a single, document-
+/// independent sequence known from the AST alone.
+///
+/// Accepts exactly `Identity`/`Field`/`Index` chained through `Pipe`, plus
+/// the `Paren`/`Optional` wrappers [`is_alias_sensitive_assign`] already
+/// unwraps. Everything else — `Iterate` (`.[]`), a computed key
+/// (`IndexExpr`), a slice, a `Comma`, a function call — is rejected, and
+/// its caller falls back to the pre-#870 lockstep walk.
+///
+/// Constant keys never need special handling here: the parser folds
+/// `.["a"]` into [`Expr::Field`] and `.[0]` into [`Expr::Index`] (see
+/// [`Expr::IndexExpr`]'s own doc comment), so a static chain is always
+/// spelled with those two variants. [`Expr::Index`]'s `key` slot only
+/// carries a *spelling* for `path()` output; `idx` is what navigation —
+/// and therefore reconciliation — actually uses.
+fn static_path_steps(expr: &Expr, out: &mut Vec<PathStep>) -> bool {
+    match expr {
+        Expr::Identity => true,
+        Expr::Field(name) => {
+            out.push(PathStep::Key(name.clone()));
+            true
+        }
+        Expr::Index { idx, .. } => {
+            out.push(PathStep::Index(*idx));
+            true
+        }
+        Expr::Paren(inner) | Expr::Optional(inner) => static_path_steps(inner, out),
+        Expr::Pipe(stages) => stages.iter().all(|s| static_path_steps(s, out)),
+        _ => false,
+    }
+}
+
+/// Resolve which paths `expr` writes to, or `None` when any write stage's
+/// left-hand side is not a static navigation chain (#870).
+///
+/// `None` is not an error — it means "reconcile the way it did before
+/// #870", which is still correct for every write that doesn't reshuffle
+/// positions, and no worse than before for one that does.
+///
+/// Only expressions [`is_alias_sensitive_assign`] already accepts reach
+/// here, so the pass-through arms below mirror its own allow-list exactly:
+/// `.`, `select(...)`, `empty`, `debug`/`debug(msg)` rewrite nothing and
+/// therefore contribute no target.
+///
+/// Resolving each stage's left-hand side independently — rather than
+/// re-evaluating the pipe against a running document, as an earlier plan
+/// for this issue proposed — is exact precisely *because* every accepted
+/// path is static: `.arr[0]` denotes `["arr", 0]` whatever the document
+/// holds, so no stage's resolution can depend on an earlier stage's write.
+/// A path that *would* depend on the document (`.arr[(.i)] = 1`) is
+/// rejected by [`static_path_steps`] instead of being resolved against a
+/// document that may already be stale.
+fn collect_write_targets(expr: &Expr) -> Option<Vec<WriteTarget>> {
+    fn push(lhs: &Expr, kind: WriteKind, out: &mut Vec<WriteTarget>) -> bool {
+        match lhs {
+            Expr::Paren(inner) => push(inner, kind, out),
+            // `del(.arr[0], .arr[2])` removes both, and each branch is a
+            // path of its own — a generator is only valid on a `del`'s
+            // left, never an assignment's, so this arm is gated on `Del`
+            // rather than accepting `.a, .b = 1`.
+            Expr::Comma(branches) if kind == WriteKind::Del => {
+                branches.iter().all(|b| push(b, kind, out))
+            }
+            _ => {
+                let mut path = Vec::new();
+                if !static_path_steps(lhs, &mut path) {
+                    return false;
+                }
+                out.push(WriteTarget { path, kind });
+                true
+            }
+        }
+    }
+
+    fn walk(expr: &Expr, out: &mut Vec<WriteTarget>) -> bool {
+        match expr {
+            Expr::Assign { path, .. }
+            | Expr::Update { path, .. }
+            | Expr::CompoundAssign { path, .. }
+            | Expr::AlternativeAssign { path, .. } => push(path, WriteKind::Set, out),
+            Expr::Builtin(Builtin::Del(inner)) => push(inner, WriteKind::Del, out),
+            Expr::Identity
+            | Expr::Builtin(
+                Builtin::Select(_) | Builtin::Empty | Builtin::Debug | Builtin::DebugMsg(_),
+            ) => true,
+            Expr::Paren(inner) | Expr::Optional(inner) => walk(inner, out),
+            Expr::Pipe(stages) => stages.iter().all(|s| walk(s, out)),
+            _ => false,
+        }
+    }
+
+    let mut out = Vec::new();
+    walk(expr, &mut out).then_some(out)
+}
+
+/// A write path, relative to the node currently being reconciled, paired
+/// with what the write did there (#870).
+type RelTarget<'t> = (&'t [PathStep], WriteKind);
+
+/// Turn a jq index (possibly negative) into a slot of a `len`-element
+/// container, matching `numeric_key_to_index`'s from-the-end convention.
+fn resolve_index(idx: i64, len: usize) -> Option<usize> {
+    let resolved = if idx < 0 {
+        len.checked_sub(idx.unsigned_abs() as usize)?
+    } else {
+        idx as usize
+    };
+    (resolved < len).then_some(resolved)
+}
+
+/// Narrow `targets` to those descending through object key `key`, dropping
+/// that step (#870).
+fn descend_key<'t>(targets: &[RelTarget<'t>], key: &str) -> Vec<RelTarget<'t>> {
+    targets
+        .iter()
+        .filter_map(|(steps, kind)| match steps.split_first() {
+            Some((PathStep::Key(k), rest)) if k == key => Some((rest, *kind)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Narrow `targets` to those descending through array slot `index` of a
+/// `len`-element array, dropping that step (#870).
+fn descend_index<'t>(targets: &[RelTarget<'t>], index: usize, len: usize) -> Vec<RelTarget<'t>> {
+    targets
+        .iter()
+        .filter_map(|(steps, kind)| match steps.split_first() {
+            Some((PathStep::Index(n), rest)) if resolve_index(*n, len) == Some(index) => {
+                Some((rest, *kind))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Decide which pristine slot each result slot of an array actually came
+/// from (#870), given the writes that landed on this array.
+///
+/// `None` at a slot means "no pristine counterpart" — the slot gets fresh,
+/// empty metadata, which is what real `yq` gives a node the write created.
+///
+/// Positional identity (`i -> i`) is the pre-#870 behaviour and stays the
+/// answer for every write that doesn't move anything: `.arr[0] = "z"`
+/// rewrites one slot in place, and real `yq` keeps that slot's own style
+/// (`- "z"`, verified against the pinned binary).
+fn array_sources(
+    p_items: &[OwnedValue],
+    r_items: &[OwnedValue],
+    targets: &[RelTarget<'_>],
+) -> Vec<Option<usize>> {
+    // `del(.arr[k])` shifts every later element down one slot, so slot `i`
+    // of the result is a *different* pristine node than slot `i` was — the
+    // exact case that made `del(.arr[0])` inherit index 0's comment instead
+    // of index 1's. The removed set is known exactly, so the remap is too.
+    let mut removed: Vec<usize> = targets
+        .iter()
+        .filter_map(|(steps, kind)| match (steps, kind) {
+            ([PathStep::Index(n)], WriteKind::Del) => resolve_index(*n, p_items.len()),
+            _ => None,
+        })
+        .collect();
+    if !removed.is_empty() {
+        removed.sort_unstable();
+        removed.dedup();
+        let survivors: Vec<usize> = (0..p_items.len())
+            .filter(|i| !removed.contains(i))
+            .collect();
+        // Only trust the remap when the array that actually came out is the
+        // shape it predicts. A pipe that deleted *and* appended, or a `del`
+        // whose path didn't resolve the way it reads, falls through to
+        // positional rather than misattributing against a model that has
+        // already been shown wrong.
+        if survivors.len() == r_items.len() {
+            return survivors.into_iter().map(Some).collect();
+        }
+    }
+
+    (0..r_items.len()).map(Some).collect()
+}
+
 /// Reconcile a pristine (pre-write) presentation tree against a post-write
 /// value (issue #739, ADR-0017's mechanism 1, applied to path-mutation
 /// queries: `=`, `|=`, `+=`, `del()`, ...).
@@ -1870,33 +2082,43 @@ fn walk_alias_groups<W: AsRef<[u64]> + Clone>(
 /// the YAML documents this rewrites are config-file-sized, not
 /// data-file-sized.
 ///
-/// **Known gap, filed as #870**: this function matches a child to
-/// its pristine counterpart purely by key/index, so any write that
-/// reshuffles an `Array`'s or `Object`'s *positions* - not just a
-/// wholesale replacement like `.a = [4, 5, 6]` on `a: ['x', 'y', 'z']`,
-/// but an everyday `.arr = ["new"] + .arr` prepend or a `del()` that
-/// shifts later indices down - misattributes old elements' style/comments
-/// to whichever new element now sits at the same key/index, instead of
-/// giving every element under the write fresh (empty) metadata the way
-/// real `yq`'s node-mutation model does (confirmed against the pinned
-/// binary: prepending to `arr:\n  - "x"\n  - y` should drop the new
-/// element's style entirely and leave `"x"`'s own quotes exactly where
-/// they were; this function instead lets the new element inherit `"x"`'s
-/// old quote style and leaves `"x"` unquoted). This function has no way
-/// to tell "recursing into an untouched sibling subtree" apart from
-/// "recursing into a reshuffled subtree that happens to share
-/// positions/keys with the old one" - both look identical from a pure
-/// before/after value diff; only a path-based approach (the
-/// `resolve_dynamic_indexes` alternative above) could distinguish them.
-/// Purely cosmetic (no data loss, no incorrect *values*, still strictly
-/// better than every write losing all style/comments unconditionally,
-/// which was the pre-#739 baseline).
+/// `targets` closes most of what #870 filed against the lockstep walk. A
+/// pure before/after value diff cannot tell "recursing into an untouched
+/// sibling subtree" apart from "recursing into a subtree the write
+/// reshuffled" — both look identical — so a write that moves an `Array`'s
+/// elements used to hand each new element whichever old element now
+/// happens to sit at its index. [`collect_write_targets`] resolves the
+/// paths a write actually touched straight from the AST (no
+/// `resolve_dynamic_indexes` plumbing needed, and no dependence on the
+/// document), and [`array_sources`] uses them to map each result slot back
+/// to the pristine slot it really came from: an exact remap across a
+/// `del()`, and a value-identity alignment across a wholesale write. An
+/// empty `targets` — a write whose path isn't static, e.g.
+/// `.arr[(.i)] = 1` — falls back to the pre-#870 lockstep walk unchanged.
+///
+/// **Remaining gap**: real `yq` carries presentation on *node identity*,
+/// so a freshly constructed literal never inherits anything even when its
+/// value happens to equal an old node's. `.arr = ["b","a","a"]` over
+/// `[a # c0, a # c1, b # c2]` prints three bare scalars in `yq`; the
+/// value-identity alignment here matches them up and keeps the comments.
+/// Object fields have the same gap (`.o = {"a": "1"}` keeps `a`'s old
+/// comment where `yq` drops it) and are deliberately left on key matching:
+/// aligning object children by *value* would let one key inherit a
+/// different key's comment, which is the very misattribution #870 is
+/// about. Closing either needs the shared-node value model tracked by
+/// #1351 and #865. Purely cosmetic throughout (no data loss, no incorrect
+/// *values*).
 fn reconcile_presentation(
     pristine_value: &OwnedValue,
     pristine_tree: &CommentTree,
     result_value: &OwnedValue,
+    targets: &[WriteTarget],
 ) -> CommentTree {
-    reconcile_presentation_at_depth(pristine_value, pristine_tree, result_value, 0)
+    let relative: Vec<RelTarget<'_>> = targets
+        .iter()
+        .map(|t| (t.path.as_slice(), t.kind))
+        .collect();
+    reconcile_presentation_at_depth(pristine_value, pristine_tree, result_value, &relative, 0)
 }
 
 /// Panics past `succinctly::jq::MAX_VALUE_TREE_DEPTH` levels of nesting
@@ -1907,6 +2129,7 @@ fn reconcile_presentation_at_depth(
     pristine_value: &OwnedValue,
     pristine_tree: &CommentTree,
     result_value: &OwnedValue,
+    targets: &[RelTarget<'_>],
     depth: usize,
 ) -> CommentTree {
     assert_value_tree_depth(depth);
@@ -1916,10 +2139,21 @@ fn reconcile_presentation_at_depth(
             let mut fields = IndexMap::new();
             let mut key_comments = IndexMap::new();
             for (k, r_v) in r_fields {
+                // Object children stay matched by key: a key names the same
+                // node before and after a write however the map is
+                // reordered, so there is no position to misattribute across
+                // (verified: `yq '.o = {"b": .o.b, "a": .o.a}'` keeps each
+                // field's own comment with its own key). See this function's
+                // doc comment for the object-side gap this leaves open.
+                let child_targets = descend_key(targets, k);
                 let child = match p_fields.get(k) {
-                    Some(p_v) => {
-                        reconcile_presentation_at_depth(p_v, pristine_tree.field(k), r_v, depth + 1)
-                    }
+                    Some(p_v) => reconcile_presentation_at_depth(
+                        p_v,
+                        pristine_tree.field(k),
+                        r_v,
+                        &child_targets,
+                        depth + 1,
+                    ),
                     None => CommentTree::empty(),
                 };
                 fields.insert(k.clone(), child);
@@ -1946,17 +2180,24 @@ fn reconcile_presentation_at_depth(
         }
         (OwnedValue::Array(p_items), OwnedValue::Array(r_items)) => {
             let own_meta = pristine_tree.meta().clone();
+            // #870: which pristine slot each result slot really came from —
+            // identity unless a write at this node moved things.
+            let sources = array_sources(p_items, r_items, targets);
             let items = r_items
                 .iter()
                 .enumerate()
-                .map(|(i, r_v)| match p_items.get(i) {
-                    Some(p_v) => reconcile_presentation_at_depth(
-                        p_v,
-                        pristine_tree.at_index(i),
-                        r_v,
-                        depth + 1,
-                    ),
-                    None => CommentTree::empty(),
+                .map(|(i, r_v)| {
+                    let child_targets = descend_index(targets, i, r_items.len());
+                    match sources[i].and_then(|p| p_items.get(p).map(|p_v| (p, p_v))) {
+                        Some((p, p_v)) => reconcile_presentation_at_depth(
+                            p_v,
+                            pristine_tree.at_index(p),
+                            r_v,
+                            &child_targets,
+                            depth + 1,
+                        ),
+                        None => CommentTree::empty(),
+                    }
                 })
                 .collect();
             CommentTree::Array(own_meta, items)
@@ -2307,6 +2548,15 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
         None => None,
     };
 
+    // Which paths this write actually touches (#870), resolved from the
+    // AST alone. Computed only when there is a pristine tree to reconcile
+    // against at all, so a plain read pays nothing; `None` (a non-static
+    // path) reconciles exactly as it did before #870.
+    let write_targets = presentation_sync_ctx
+        .as_ref()
+        .and_then(|_| collect_write_targets(expr))
+        .unwrap_or_default();
+
     let result = eval_with_cursor_using::<YqSemantics, _>(expr, cursor);
     // A value with no live cursor of its own (an assignment/`del()`
     // result, a computed value, ...) has no comment/style to read directly
@@ -2317,7 +2567,7 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
         let comments = presentation_sync_ctx
             .as_ref()
             .map_or_else(CommentTree::empty, |(pristine, tree)| {
-                reconcile_presentation(pristine, tree, &v)
+                reconcile_presentation(pristine, tree, &v, &write_targets)
             });
         (v, comments)
     };
@@ -7017,11 +7267,11 @@ mod tests {
         use succinctly::jq::MAX_VALUE_TREE_DEPTH;
 
         let under = linear_array_nest(MAX_VALUE_TREE_DEPTH - 1);
-        let _ = reconcile_presentation(&under, &CommentTree::empty(), &under);
+        let _ = reconcile_presentation(&under, &CommentTree::empty(), &under, &[]);
 
         let over = linear_array_nest(MAX_VALUE_TREE_DEPTH);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            reconcile_presentation(&over, &CommentTree::empty(), &over)
+            reconcile_presentation(&over, &CommentTree::empty(), &over, &[])
         }));
         assert!(
             result.is_err(),

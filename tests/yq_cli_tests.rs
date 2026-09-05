@@ -33932,3 +33932,140 @@ fn test_yq_update_zero_output_filter_leaves_target_untouched_2484() -> Result<()
     );
     Ok(())
 }
+
+// =============================================================================
+// #870: `reconcile_presentation` misattributes style/comments across a write
+// that shifts an array's positions.
+//
+// Wrapped in a module of its own rather than appended at bare file end: two
+// branches each adding a `-> Result<()>` test here otherwise present git with
+// identical trailing `    Ok(())\n}\n` context on both sides, which it happily
+// merges into one function short a closing brace.
+//
+// Every expectation below is the pinned real `yq` (v4.53.3) output for the
+// same input and filter, captured live.
+// =============================================================================
+mod issue_870_position_shifting_writes {
+    use super::*;
+
+    /// `del` at index 0 shifts index 1 down into its slot, so the survivor
+    /// must keep *its own* comment, not the deleted element's.
+    ///
+    /// $ yq 'del(.arr[0])'  =>  arr:\n  - y # cy
+    #[test]
+    fn test_yaml_del_array_element_remaps_later_comments_870() -> Result<()> {
+        let input = "arr:\n  - \"x\" # cx\n  - y # cy\n";
+        let (output, exit_code) = run_yq_stdin("del(.arr[0])", input, &[])?;
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, "arr:\n  - y # cy\n");
+        Ok(())
+    }
+
+    /// Deleting from the middle: everything before the removed index keeps
+    /// its own slot, everything after shifts down exactly one.
+    ///
+    /// $ yq 'del(.arr[1])'  =>  arr:\n  - "x" # cx\n  - z # cz
+    #[test]
+    fn test_yaml_del_middle_element_keeps_prefix_and_shifts_suffix_870() -> Result<()> {
+        let input = "arr:\n  - \"x\" # cx\n  - y # cy\n  - z # cz\n";
+        let (output, exit_code) = run_yq_stdin("del(.arr[1])", input, &[])?;
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, "arr:\n  - \"x\" # cx\n  - z # cz\n");
+        Ok(())
+    }
+
+    /// A negative index resolves from the end before the remap, like every
+    /// other navigation step.
+    ///
+    /// $ yq 'del(.arr[-1])'  =>  arr:\n  - a # c0\n  - b # c1
+    #[test]
+    fn test_yaml_del_negative_index_remaps_870() -> Result<()> {
+        let input = "arr:\n  - a # c0\n  - b # c1\n  - c # c2\n";
+        let (output, exit_code) = run_yq_stdin("del(.arr[-1])", input, &[])?;
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, "arr:\n  - a # c0\n  - b # c1\n");
+        Ok(())
+    }
+
+    /// `del(.arr[0], .arr[2])` is a generator on `del`'s left: both branches
+    /// are paths, and the single survivor keeps its own comment.
+    ///
+    /// $ yq 'del(.arr[0], .arr[2])'  =>  arr:\n  - b # c1
+    #[test]
+    fn test_yaml_del_multiple_indices_remaps_870() -> Result<()> {
+        let input = "arr:\n  - a # c0\n  - b # c1\n  - c # c2\n";
+        let (output, exit_code) = run_yq_stdin("del(.arr[0], .arr[2])", input, &[])?;
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, "arr:\n  - b # c1\n");
+        Ok(())
+    }
+
+    /// The remap must not fabricate an anchor *declaration*. Deleting the
+    /// `&x` element leaves the surviving `*x` with nothing to resolve
+    /// against, so `enforce_anchor_soundness` drops the mark and prints the
+    /// value — deliberately unlike real yq, which emits a dangling `- *x`
+    /// it then cannot read back (#763's documented divergence).
+    ///
+    /// Before #870 the survivor inherited index 0's `Declares` mark and
+    /// printed `- &x a`: an anchor declaration that was never in the input.
+    #[test]
+    fn test_yaml_del_anchor_element_does_not_fabricate_declaration_870() -> Result<()> {
+        let input = "l:\n  - &x a\n  - *x\n  - z\n";
+        let (output, exit_code) = run_yq_stdin("del(.l[0])", input, &[])?;
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, "l:\n  - a\n  - z\n");
+        Ok(())
+    }
+
+    /// The mirror case, where the remap keeps a mark that really is sound:
+    /// `&x` stays at index 0 and the alias shifts down into index 1.
+    ///
+    /// $ yq 'del(.l[1])'  =>  l:\n  - &x a\n  - *x
+    #[test]
+    fn test_yaml_del_keeps_sound_alias_after_shift_870() -> Result<()> {
+        let input = "l:\n  - &x a\n  - q\n  - *x\n";
+        let (output, exit_code) = run_yq_stdin("del(.l[1])", input, &[])?;
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, "l:\n  - &x a\n  - *x\n");
+        Ok(())
+    }
+
+    /// Object fields are matched by key, so deleting one has never shifted
+    /// anything — a control that the new path-threading left it alone.
+    ///
+    /// $ yq 'del(.o.a)'  =>  o:\n  b: 2 # cb
+    #[test]
+    fn test_yaml_del_object_key_unaffected_870() -> Result<()> {
+        let input = "o:\n  a: 1 # ca\n  b: 2 # cb\n";
+        let (output, exit_code) = run_yq_stdin("del(.o.a)", input, &[])?;
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, "o:\n  b: 2 # cb\n");
+        Ok(())
+    }
+
+    /// A pipe of writes: each stage's path is resolved independently, and
+    /// the `del` still remaps.
+    ///
+    /// $ yq '.z = 1 | del(.arr[0])'  =>  a: 1 # ca / arr:\n  - y # cy / z: 1
+    #[test]
+    fn test_yaml_pipe_of_writes_remaps_del_870() -> Result<()> {
+        let input = "a: 1 # ca\narr:\n  - \"x\" # cx\n  - y # cy\n";
+        let (output, exit_code) = run_yq_stdin(".z = 1 | del(.arr[0])", input, &[])?;
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, "a: 1 # ca\narr:\n  - y # cy\nz: 1\n");
+        Ok(())
+    }
+
+    /// An in-place write at an index moves nothing, so that slot keeps its
+    /// own style — real yq prints `- "z"`, not `- z`, because the write
+    /// overwrites the node's value and not its identity. This is the case
+    /// the remap must *not* disturb.
+    #[test]
+    fn test_yaml_index_write_keeps_slot_style_870() -> Result<()> {
+        let input = "arr:\n  - \"x\"\n  - y\nn: 1\n";
+        let (output, exit_code) = run_yq_stdin(".arr[0] = \"z\"", input, &[])?;
+        assert_eq!(exit_code, 0);
+        assert_eq!(output, "arr:\n  - \"z\"\n  - y\nn: 1\n");
+        Ok(())
+    }
+}
