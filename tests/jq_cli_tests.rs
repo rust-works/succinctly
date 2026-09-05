@@ -7467,6 +7467,28 @@ fn test_def_call_keeps_path_context_2416() -> Result<()> {
     Ok(())
 }
 
+/// Spine 2416, phase 3: `def name(params): body; then` is now native via
+/// `eval_each_generic`'s own `FuncDef` arm (`bind_def`), which installs the
+/// definition and re-evaluates `then` through the same collecting wrapper
+/// used for `Expr::As`/`Expr::Label`/etc. above. No jq oracle. Pre-migration
+/// answer (this PR's own pre-change build) unchanged, for both a `then` that
+/// calls the def (reaching `Expr::DefCall`, same shape as the test above)
+/// and one that merely wraps a bare `key` reference in `then` without ever
+/// calling the def at all.
+#[test]
+fn test_func_def_keeps_path_context_2416() -> Result<()> {
+    let doc = r#"[{"a":1},{"b":2}]"#;
+    for (filter, want) in [
+        (".[] | (def k: .; k, key)", "{\"a\":1}\n0\n{\"b\":2}\n1"),
+        (".[] | (def k: 1; key)", "0\n1"),
+    ] {
+        let (out, _, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "`{filter}`: {out:?}");
+        assert_eq!(out.trim(), want, "`{filter}`");
+    }
+    Ok(())
+}
+
 /// Documents the one remaining deliberate, narrow gap #1663/#1765 leave
 /// open rather than silently missing: a `?//`-chained `AsPattern` (2+
 /// alternatives) still has no dedicated evaluation arm, so a path-context
