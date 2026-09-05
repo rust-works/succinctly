@@ -7691,4 +7691,166 @@ mod tests {
             "serde_json_to_owned should panic at MAX_VALUE_TREE_DEPTH"
         );
     }
+
+    // -- #870: write-path resolution -------------------------------------
+    //
+    // `collect_write_targets` is only ever *called* behind
+    // `is_alias_sensitive_assign`, so several of its arms cannot be reached
+    // from a CLI filter string even though every one of them is load-bearing
+    // if that gate ever widens. Exercised directly here, in the same spirit
+    // as the `emit_yaml_value` flow-style test above.
+
+    fn assign(path: Expr) -> Expr {
+        Expr::Assign {
+            path: Box::new(path),
+            value: Box::new(Expr::Identity),
+        }
+    }
+
+    fn targets_of(expr: &Expr) -> Option<Vec<(Vec<PathStep>, WriteKind)>> {
+        collect_write_targets(expr).map(|ts| ts.into_iter().map(|t| (t.path, t.kind)).collect())
+    }
+
+    /// A leading `.` contributes no step: `.` is the node you are already
+    /// at, so `. = x` targets the root and `.a` is one step, not two.
+    #[test]
+    fn collect_write_targets_identity_path_is_the_root_870() {
+        assert_eq!(
+            targets_of(&assign(Expr::Identity)),
+            Some(vec![(vec![], WriteKind::Set)])
+        );
+        assert_eq!(
+            targets_of(&assign(Expr::Pipe(vec![
+                Expr::Identity,
+                Expr::Field("a".into()),
+            ]))),
+            Some(vec![(vec![PathStep::Key("a".into())], WriteKind::Set)])
+        );
+    }
+
+    /// `Paren`/`Optional` are transparent on both sides: around the whole
+    /// write (`(.a = 1)?`) and around the path itself (`(.a)? = 1`).
+    #[test]
+    fn collect_write_targets_unwraps_paren_and_optional_870() {
+        let a = || PathStep::Key("a".into());
+        for path in [
+            Expr::Paren(Box::new(Expr::Field("a".into()))),
+            Expr::Optional(Box::new(Expr::Field("a".into()))),
+        ] {
+            assert_eq!(
+                targets_of(&assign(path)),
+                Some(vec![(vec![a()], WriteKind::Set)])
+            );
+        }
+        for wrap in [
+            Expr::Paren(Box::new(assign(Expr::Field("a".into())))),
+            Expr::Optional(Box::new(assign(Expr::Field("a".into())))),
+        ] {
+            assert_eq!(targets_of(&wrap), Some(vec![(vec![a()], WriteKind::Set)]));
+        }
+        // ...including a parenthesised `del` path, which reaches `push`'s
+        // own `Paren` arm rather than `static_path_steps`'.
+        assert_eq!(
+            targets_of(&Expr::Builtin(Builtin::Del(Box::new(Expr::Paren(
+                Box::new(Expr::Field("a".into()))
+            ))))),
+            Some(vec![(vec![a()], WriteKind::Del)])
+        );
+    }
+
+    /// The pass-through stages `is_alias_sensitive_assign` allows alongside
+    /// a write contribute no target of their own, and must not make the
+    /// whole pipe unresolvable.
+    #[test]
+    fn collect_write_targets_pass_through_stages_contribute_nothing_870() {
+        for stage in [
+            Expr::Identity,
+            Expr::Builtin(Builtin::Empty),
+            Expr::Builtin(Builtin::Debug),
+            Expr::Builtin(Builtin::Select(Box::new(Expr::Identity))),
+        ] {
+            assert_eq!(
+                targets_of(&Expr::Pipe(vec![assign(Expr::Field("a".into())), stage])),
+                Some(vec![(vec![PathStep::Key("a".into())], WriteKind::Set)])
+            );
+        }
+    }
+
+    /// A generator is accepted on a `del`'s left, where it means "remove
+    /// each of these", and rejected on an assignment's, where it is not
+    /// valid syntax to begin with — accepting it there would invent a write
+    /// the evaluator never performs.
+    #[test]
+    fn collect_write_targets_comma_is_del_only_870() {
+        let branches = vec![
+            Expr::Index { idx: 0, key: None },
+            Expr::Index { idx: 2, key: None },
+        ];
+        assert_eq!(
+            targets_of(&Expr::Builtin(Builtin::Del(Box::new(Expr::Comma(
+                branches.clone()
+            ))))),
+            Some(vec![
+                (vec![PathStep::Index(0)], WriteKind::Del),
+                (vec![PathStep::Index(2)], WriteKind::Del),
+            ])
+        );
+        assert_eq!(targets_of(&assign(Expr::Comma(branches))), None);
+    }
+
+    /// Anything whose resolved path depends on the document — a computed
+    /// key, an iterate, a slice — makes the whole expression unresolvable,
+    /// so reconciliation falls back to the positional walk rather than
+    /// acting on a path it only guessed at.
+    #[test]
+    fn collect_write_targets_rejects_non_static_paths_870() {
+        for path in [
+            Expr::IndexExpr {
+                target: Box::new(Expr::Field("arr".into())),
+                key: Box::new(Expr::Field("i".into())),
+            },
+            Expr::Iterate,
+            Expr::Slice {
+                start: None,
+                end: None,
+                start_key: None,
+                end_key: None,
+            },
+        ] {
+            assert_eq!(targets_of(&assign(path)), None);
+        }
+        // A stage that is neither a write nor a pass-through is rejected
+        // whole, even though `is_alias_sensitive_assign` would not let one
+        // reach here today.
+        assert_eq!(targets_of(&Expr::Field("a".into())), None);
+    }
+
+    /// A negative index resolves from the end, and an out-of-range one
+    /// resolves to nothing rather than wrapping or clamping.
+    #[test]
+    fn resolve_index_handles_negatives_and_bounds_870() {
+        assert_eq!(resolve_index(0, 3), Some(0));
+        assert_eq!(resolve_index(2, 3), Some(2));
+        assert_eq!(resolve_index(3, 3), None);
+        assert_eq!(resolve_index(-1, 3), Some(2));
+        assert_eq!(resolve_index(-3, 3), Some(0));
+        assert_eq!(resolve_index(-4, 3), None);
+        assert_eq!(resolve_index(0, 0), None);
+    }
+
+    /// The `del` remap only applies when the array that actually came out is
+    /// the shape it predicts. Here it is not — one element was removed but
+    /// two arrived — so `array_sources` falls back to positional rather than
+    /// remapping against a model already shown wrong.
+    #[test]
+    fn array_sources_del_remap_falls_back_on_unexpected_length_870() {
+        let pristine = [OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3)];
+        let result = [OwnedValue::Int(2), OwnedValue::Int(3), OwnedValue::Int(9)];
+        let steps = [PathStep::Index(0)];
+        let targets = [(&steps[..], WriteKind::Del)];
+        assert_eq!(
+            array_sources(&pristine, &result, &targets),
+            vec![Some(0), Some(1), Some(2)]
+        );
+    }
 }
