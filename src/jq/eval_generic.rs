@@ -47,8 +47,9 @@ use super::eval::{
     slice_owned_value_read, streams_escaped_generator_prefix, substitute_bound_var,
     substitute_vars, suppress_or_raise, suppresses, tonumber_from_str, vec_with_capacity,
     yq_absent_key_read_is_empty, yq_empty_operand_output, yq_negative_index_check,
-    yq_read_only_context, BinaryFanoutRules, Control, Demand, EmptyOperandOp, EvalError,
-    EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail, QueryResult, YqSemantics,
+    yq_numeric_index_on_object_is_null, yq_read_only_context, BinaryFanoutRules, Control, Demand,
+    EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail,
+    QueryResult, YqSemantics,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -5839,6 +5840,12 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 // errored while `null | .[$n]` — the same query, and the same
                 // rule in `index_one_generic` — returned null.
                 GenericResult::Owned(OwnedValue::Null)
+            } else if value.as_object().is_some() && yq_numeric_index_on_object_is_null::<S>() {
+                // #2459: yq mode only -- `.a[5]` on a mapping is `null`, the
+                // same rule `index_one_generic`'s own numeric-key arm
+                // applies for the computed-key sibling `.a[$k]`. See
+                // `eval::yq_numeric_index_on_object_is_null`.
+                GenericResult::Owned(OwnedValue::Null)
             } else {
                 // No `optional`-guarded arm here (unlike `index_one_generic`,
                 // the computed-key sibling this literal `.[N]` form doesn't
@@ -9748,7 +9755,11 @@ fn index_one_generic<S: EvalSemantics, V: DocumentValue>(
                     // Out-of-bounds is null, not an error (#307).
                     None => GenericResult::Owned(OwnedValue::Null),
                 }
-            } else if target.is_null() {
+            // #2459: yq mode only, the `Object` half of this condition --
+            // see `yq_numeric_index_on_object_is_null`.
+            } else if target.is_null()
+                || (target.as_object().is_some() && yq_numeric_index_on_object_is_null::<S>())
+            {
                 GenericResult::Owned(OwnedValue::Null)
             } else if optional {
                 GenericResult::None
@@ -11509,6 +11520,13 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
                             .ok()
                             .and_then(|i| elements.get_cursor(i))
                             .map_or(PathNode::Absent, PathNode::At)
+                    } else if v.as_object().is_some() && yq_numeric_index_on_object_is_null::<S>() {
+                        // #2459: yq mode only -- a numeric index on a
+                        // mapping is an absent position, same as the
+                        // `Expr::Field` arm's own missing-key case above.
+                        // `.a[5] | key` is `5`, `.a[5] | path` is `["a",5]`.
+                        // See `eval::yq_numeric_index_on_object_is_null`.
+                        PathNode::Absent
                     } else {
                         return Err(EvalError::cannot_index_with_type(
                             path_node_type_name::<V>(node),

@@ -38242,3 +38242,20 @@ fn test_jq_binary_fanout_stays_right_major_2451() -> Result<()> {
 
     Ok(())
 }
+
+/// #2459: yq mode's new "numeric index on a mapping is null" rule
+/// (`eval::yq_numeric_index_on_object_is_null`) must not leak into jq mode
+/// -- jq 1.7.1 raises `Cannot index object with number` here unconditionally,
+/// which succinctly already reproduced and must keep reproducing.
+#[test]
+fn test_jq_mode_numeric_index_on_object_still_errors_2459() -> Result<()> {
+    for filter in [".a[5]", "5 as $y | .a[$y]"] {
+        let (_out, stderr, code) = run_jq_stdin_streams(filter, "{\"a\":{\"b\":1}}", &[])?;
+        assert_ne!(code, 0, "`{filter}` should still error in jq mode");
+        assert!(
+            stderr.contains("Cannot index object with number"),
+            "`{filter}` stderr: {stderr}"
+        );
+    }
+    Ok(())
+}
