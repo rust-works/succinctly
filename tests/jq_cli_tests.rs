@@ -7522,6 +7522,53 @@ fn test_shared_keeps_path_context_2416() -> Result<()> {
     Ok(())
 }
 
+/// #1332's other half, closed by #2473 (gate reason 3 of spine 2416), in jq
+/// mode. `needs_path_context` descends into `Expr::Object` now, so an object
+/// literal's key and value slots are routed like any other path-context read.
+///
+/// No jq oracle -- `key`/`parent`/`path` are succinctly extensions jq 1.7.1
+/// rejects at compile time -- so these pin the extension answers, which are
+/// byte-identical to the yq-captured rows in
+/// `test_object_construction_keeps_path_context_2473`
+/// (`tests/yq_cli_tests.rs`) except for the `parent`-on-absent one #2435
+/// already records. The four "was `{"x":null}`" rows below are the bug #1332
+/// reported: the value slot answered with no position at all.
+#[test]
+fn test_object_construction_keeps_path_context_2473() -> Result<()> {
+    let doc = r#"{"a":{"b":1},"c":[10,20]}"#;
+    for (filter, want) in [
+        (".a | {\"k\": key}", "{\"k\":\"a\"}"),
+        (
+            ".[] | {\"k\": key, \"p\": path}",
+            "{\"k\":\"a\",\"p\":[\"a\"]}\n{\"k\":\"c\",\"p\":[\"c\"]}",
+        ),
+        // Was `{"k":null}`: an absent position.
+        (".zz | {\"k\": key}", "{\"k\":\"zz\"}"),
+        (".a.zz | {\"k\": key}", "{\"k\":\"zz\"}"),
+        // Was `{"k":null}`: a value that has left the cursor domain.
+        (".a | tostring | {\"k\": key}", "{\"k\":\"a\"}"),
+        (".c | to_entries | .[0] | {\"k\": key}", "{\"k\":0}"),
+        (".a? | {\"k\": key}", "{\"k\":\"a\"}"),
+        (".a | {\"k\": key} as $o | $o", "{\"k\":\"a\"}"),
+        // Was a `Cannot use null (null) as object key` error.
+        (".a.zz | {(key): 1}", "{\"zz\":1}"),
+        (
+            ".a.b | {\"k\": key, \"p\": parent}",
+            "{\"k\":\"b\",\"p\":{\"b\":1}}",
+        ),
+        (".a | {\"k\": (key + \"!\")}", "{\"k\":\"a!\"}"),
+        (
+            ".a.zz | {\"p\": parent, \"k\": key}",
+            "{\"p\":{\"b\":1},\"k\":\"zz\"}",
+        ),
+    ] {
+        let (out, _, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "`{filter}`: {out:?}");
+        assert_eq!(out.trim(), want, "`{filter}`");
+    }
+    Ok(())
+}
+
 /// Spine 2416 gate reason 3 (#2473): `and`/`or` with a path-context operand
 /// are native in `eval_single` (`eval_boolean_generic` over
 /// `eval::boolean_fanout_bools`), so the non-sink route threads the cursor

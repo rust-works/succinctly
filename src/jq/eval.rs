@@ -1319,12 +1319,32 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         // `[key]`/`[parent]`/`[file_index]` (#1302): an array literal is
         // still just "collect this inner expression's outputs", the same
         // reasoning as `Comma` above -- whatever the wrapped expression
-        // needs, the `[...]` wrapper needs too. `Expr::Object` isn't
-        // included here yet: it has the identical gap (`{"x": key}` also
-        // stubs to `null`, confirmed live), but its multi-entry/generator-key
-        // shape needs more design work than a single recursive call, so it's
-        // tracked separately rather than folded into this fix.
+        // needs, the `[...]` wrapper needs too.
         Expr::Array(inner) => needs_path_context(inner),
+        // `{"x": key}` / `{(key): 1}` (#1332's other half, closed by #2473 --
+        // gate reason 3 of spine 2416): object construction is the same
+        // "evaluate these expressions at my own position" shape as `Array`
+        // above, one per key and per value. It was left out of this function
+        // when #1302 added `Array`, and that omission is what made the whole
+        // class invisible to routing: `.a.x | {"k": key}` was never seen as a
+        // path-context pipe at all, so no route (walk, absent, owned
+        // identity, eager) was ever asked, and `key` answered `null` -- the
+        // silent fallback ADR-0021 exists to end. The generic evaluator's own
+        // `Expr::Object` arm (`build_object_entries_generic`, #2439) already
+        // reads the cursor, so a *live-node* shape answered correctly by
+        // accident; only the shapes that need a route -- an absent position,
+        // and a value that already left the cursor domain -- were wrong.
+        //
+        // `path_context_resolvable`/`path_context_resolve_constants`
+        // (`eval_generic.rs`) gained matching arms in the same change, so the
+        // absent and owned-identity routes accept what this now sends them.
+        Expr::Object(entries) => entries.iter().any(|entry| {
+            needs_path_context(&entry.value)
+                || match &entry.key {
+                    ObjectKey::Literal(_) => false,
+                    ObjectKey::Expr(key) => needs_path_context(key),
+                }
+        }),
         // `getpath([key])` (#2253): same reasoning as `IndexExpr`'s `key`
         // below -- without this arm, a `key`/`parent`/`file_index` reachable
         // only through `getpath`'s own path argument (not downstream of it)
@@ -2141,6 +2161,12 @@ impl From<Control> for ObjectEscape {
     }
 }
 
+/// How [`build_object_entries`] evaluates one key or value slot of an object
+/// literal: every output the slot produced, plus a deferred escape if its own
+/// generator terminated in an error, a break or a halt --
+/// [`stream_outputs_checked`]'s pair, which both strategies wrap (#2473).
+type ObjectSlotEvaluator<'a> = dyn FnMut(&Expr) -> (Vec<OwnedValue>, Option<Control>) + 'a;
+
 /// Emit one object per combination of the remaining entries' key/value outputs.
 ///
 /// Object construction is a generator in jq: an entry whose key or value yields
@@ -2173,9 +2199,29 @@ impl From<Control> for ObjectEscape {
 /// the accumulated values into the object instead of cloning them, keeping the
 /// common path allocation-for-allocation identical to the pre-#354 code. Without
 /// it, `{a: .big}` would deep-clone `.big` on the way out.
-fn build_object_entries<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+///
+/// The *operand evaluator* is a parameter (#2473, gate reason 3 of spine
+/// 2416), so the key/value slots can be evaluated somewhere other than
+/// [`eval_single`].
+///
+/// The second strategy is `eval_stage_with_path_context`'s own
+/// value-construction arm, which evaluates each slot through
+/// [`eval_pipe_with_path_context_internal`] so a `key`/`parent`/`path` inside
+/// `{"k": key}` still stands where the input node stood. That arm used to
+/// call the plain evaluator for the whole construction, which is what made
+/// `.a | {"x": key}` print `{"x": null}` for a year (#1332) -- but only the
+/// *inputs* of a construction read the enclosing position; the constructed
+/// value itself is still a fresh root, which is why the arm's own
+/// "reset the path context" handling of the result is untouched. Exactly the
+/// split `Expr::Array(inner) if needs_path_context(inner)` (#1302) already
+/// makes for array construction.
+///
+/// One definition, two strategies -- the shape [`boolean_fanout_core`] and
+/// [`binary_fanout_core`] already use, and for the same reason: a second copy
+/// of jq's keys-vary-slowest fan-out would drift from this one.
+fn build_object_entries(
     entries: &[super::expr::ObjectEntry],
-    value: &StandardJson<'_, W>,
+    eval_operand: &mut ObjectSlotEvaluator<'_>,
     optional: bool,
     sole: bool,
     acc: &mut Vec<(String, OwnedValue)>,
@@ -2196,18 +2242,16 @@ fn build_object_entries<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     let (keys, key_trailing) = match &entry.key {
         ObjectKey::Literal(s) => (vec![OwnedValue::String(s.clone())], None),
-        ObjectKey::Expr(key_expr) => {
-            // #2022: checked, not `stream_outputs` -- an undecodable computed
-            // key must raise, not silently materialize as `""`.
-            stream_outputs_checked(eval_single::<W, S>(key_expr, value.clone(), optional))
-        }
+        // #2022: the strategies are `stream_outputs_checked`-wrapped, not
+        // `stream_outputs` -- an undecodable computed key must raise, not
+        // silently materialize as `""`.
+        ObjectKey::Expr(key_expr) => eval_operand(key_expr),
     };
     let sole = sole && keys.len() == 1;
 
     for key in keys {
         // #2022: same fix as the key slot above, for the value slot.
-        let (vals, val_trailing) =
-            stream_outputs_checked(eval_single::<W, S>(&entry.value, value.clone(), optional));
+        let (vals, val_trailing) = eval_operand(&entry.value);
         let sole = sole && vals.len() == 1;
 
         for val in vals {
@@ -2225,7 +2269,7 @@ fn build_object_entries<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
 
             acc.push((key_str.clone(), val));
-            let result = build_object_entries::<W, S>(rest, value, optional, sole, acc, out);
+            let result = build_object_entries(rest, eval_operand, optional, sole, acc, out);
             acc.pop();
             result?;
         }
@@ -2253,6 +2297,23 @@ fn eval_object_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    eval_object_construction_with(
+        entries,
+        &mut |expr| stream_outputs_checked(eval_single::<W, S>(expr, value.clone(), optional)),
+        optional,
+    )
+}
+
+/// [`eval_object_construction`] over [`build_object_entries`]'s
+/// pluggable operand evaluator -- see that function for why there are two
+/// strategies (#2473). Only the fan-out's inputs change; the escape-to-result
+/// conversion below is shared, so `try {("a",1):2}` streams its prefix the
+/// same way on both.
+fn eval_object_construction_with<'a, W: Clone + AsRef<[u64]>>(
+    entries: &[super::expr::ObjectEntry],
+    eval_operand: &mut ObjectSlotEvaluator<'_>,
+    optional: bool,
+) -> QueryResult<'a, W> {
     let mut objects = Vec::new();
     let mut acc = Vec::new();
 
@@ -2261,7 +2322,14 @@ fn eval_object_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // objects already pushed to `out` by the time `build_object_entries`
     // returns `Err` travel onward as `QueryResult::Partial`'s prefix, the same
     // carrier `eval_comma` uses for `(1,error("x"))` (#400/#494).
-    match build_object_entries::<W, S>(entries, &value, optional, true, &mut acc, &mut objects) {
+    match build_object_entries(
+        entries,
+        eval_operand,
+        optional,
+        true,
+        &mut acc,
+        &mut objects,
+    ) {
         Ok(()) => {}
         Err(ObjectEscape::None) => return QueryResult::None,
         Err(ObjectEscape::Break(label)) => {
@@ -36898,7 +36966,44 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // where *each* constructed value must become its own root --
             // so a multi-output result loops by hand below instead,
             // mirroring how `Expr::Comma` accumulates its own branches.
-            match eval_owned_input::<W, S>(first, value, optional) {
+            // #2473 (#1332's other half): only the *result* of a
+            // construction is a fresh root -- its key and value slots are
+            // evaluated at the position this stage was given, exactly like
+            // `Expr::Array(inner) if needs_path_context(inner)` (#1302, A21)
+            // a few arms above. `eval_owned_input` evaluates them with no
+            // position at all, which is what made `.a | {"x": key}` print
+            // `{"x": null}`. Routing them through this same function keeps
+            // the position; everything below -- each constructed value
+            // becoming its own root, the fan-out, the escape handling -- is
+            // unchanged and shared. Not a new handler: this is the same
+            // `Expr::Object(_) | Expr::Array(_) | Expr::Literal(_)` arm, so
+            // `tests/jq_path_context_arm_guard.rs`'s count is unmoved.
+            //
+            // The inner evaluation forces `optional` to `false` for the same
+            // reason A21 documents: `Expr::Optional` broadcasts `true` into
+            // whatever it wraps with no catch of its own, so a genuine error
+            // inside the construction must surface here and be caught by
+            // *this* arm's own `optional` below, atomically.
+            let constructed = match first {
+                Expr::Object(entries) if needs_path_context(first) => {
+                    eval_object_construction_with::<W>(
+                        entries,
+                        &mut |expr| {
+                            stream_outputs_checked(eval_pipe_with_path_context_internal::<W, S>(
+                                core::slice::from_ref(expr),
+                                value,
+                                root,
+                                file_origin,
+                                current_path,
+                                false,
+                            ))
+                        },
+                        optional,
+                    )
+                }
+                _ => eval_owned_input::<W, S>(first, value, optional),
+            };
+            match constructed {
                 // #1280: a zero-output generator inside the construction
                 // (`{(empty): 1}`, `[empty]` behaves differently -- this is
                 // specifically the object-key-generator case) means the
