@@ -31263,3 +31263,103 @@ fn test_block_sequence_item_key_path_parent_through_generic_route_2455() -> Resu
     }
     Ok(())
 }
+
+/// Spine 2416, step 2: a navigational head that lands on an *absent* node no
+/// longer sends the whole pipe to the eager evaluator.
+///
+/// An absent node has no cursor, so `key`/`path`/`file_index` cannot be read
+/// off one. They are functions of the path that reached it, though, so the
+/// absent route resolves them to constants and evaluates what is left over
+/// `null` in the ordinary evaluator -- same `select`/`if`/comparison
+/// semantics, no document materialized. On a 16 MB document
+/// `.metadata.missing | select(key == "missing")` went from a 348 MB peak to
+/// 29.5 MB (Apple M4 Pro, `/usr/bin/time -l`).
+///
+/// Captured 2026-09-05 from yq v4.53.3 on `a:\n  b: 1\n`, with
+/// `-o=json -I=0` (`\n` shown as a line break):
+///
+/// ```text
+/// $ yq -o=json -I=0 '.a.x | key'                    "x"
+/// $ yq -o=json -I=0 '.a.x | path'                   ["a","x"]
+/// $ yq -o=json -I=0 '.a.x.y | key'                  "y"
+/// $ yq -o=json -I=0 '.a.x.y | path'                 ["a","x","y"]
+/// $ yq -o=json -I=0 '.a.x | select(key == "x")'     null
+/// $ yq -o=json -I=0 '.a.x | select(key == "zzz")'   (nothing)
+/// $ yq -o=json -I=0 '.a.x | select(true) | key'     "x"
+/// $ yq -o=json -I=0 '.a.x | [key, path]'            ["x",["a","x"]]
+/// $ yq -o=json -I=0 '.a.x | (key, path)'            "x" / ["a","x"]
+/// $ yq -o=json -I=0 '.a.x | key | tostring'         "x"
+/// $ yq -o=json -I=0 '.a.x | file_index'             0
+/// $ yq -o=json -I=0 '.a.x[] | key'                  (nothing)
+/// $ yq -o=json -I=0 '.q[0].r | path'                ["q",0,"r"]
+/// ```
+///
+/// Three rows of that capture are **not** asserted as yq's answer, because
+/// yq vivifies the missing key into the value `parent` returns and
+/// succinctly does not -- ADR-0018 rule 4(b), already recorded in
+/// `docs/compliance/yq/limitations.md` under "`parent` doesn't auto-vivify
+/// the missing node it navigated through" (#2146/#2435). They are pinned
+/// here as *succinctly's* answer so the divergence stays visible:
+///
+/// ```text
+/// $ yq -o=json -I=0 '.a.x | parent'          {"b":1,"x":null}   succinctly: {"b":1}
+/// $ yq -o=json -I=0 '.a.x.y | parent'        {"y":null}         succinctly: null
+/// $ yq -o=json -I=0 '.a.x.y | parent(2)'     {"b":1,"x":{"y":null}}  succinctly: {"b":1}
+/// ```
+#[test]
+fn test_absent_position_keeps_path_context_2416() -> Result<()> {
+    let args = &["-o=json", "-I=0"];
+    let doc = "a:\n  b: 1\n";
+    for (filter, expected) in [
+        (".a.x | key", "\"x\""),
+        (".a.x | path", "[\"a\",\"x\"]"),
+        (".a.x.y | key", "\"y\""),
+        (".a.x.y | path", "[\"a\",\"x\",\"y\"]"),
+        (".a.x | select(key == \"x\")", "null"),
+        (".a.x | select(key == \"zzz\")", ""),
+        (".a.x | select(true) | key", "\"x\""),
+        (".a.x | [key, path]", "[\"x\",[\"a\",\"x\"]]"),
+        (".a.x | (key, path)", "\"x\"\n[\"a\",\"x\"]"),
+        (".a.x | key | tostring", "\"x\""),
+        (".a.x | file_index", "0"),
+        (".a.x[] | key", ""),
+        (".q[0].r | path", "[\"q\",0,\"r\"]"),
+        // succinctly's own answer; see the doc comment for yq's.
+        (".a.x | parent", "{\"b\":1}"),
+        (".a.x.y | parent", "null"),
+        (".a.x.y | parent(2)", "{\"b\":1}"),
+    ] {
+        let (output, code) = run_yq_stdin(filter, doc, args)?;
+        assert_eq!(code, 0, "`{filter}`: {output:?}");
+        assert_eq!(output.trim(), expected, "`{filter}`");
+    }
+    Ok(())
+}
+
+/// Spine 2416, step 2: the shapes the absent route deliberately does *not*
+/// take, pinned as still-correct output rather than as a route.
+///
+/// `parent` answers with a document node, which the resolver cannot spell as
+/// a constant, so a `parent` inside a non-navigational stage keeps the eager
+/// evaluator -- and with it the eager evaluator's own `{}` for the absent
+/// ancestor, where the walk emits `null` for the same position. Both are
+/// pinned here so the inconsistency is visible rather than latent; real yq
+/// prints its vivified `{"y":null}` for the second element (captured
+/// 2026-09-05, v4.53.3).
+///
+/// ```text
+/// $ yq -o=json -I=0 '.a.x.y | [path, parent]'   [["a","x","y"],{"y":null}]
+/// $ yq -o=json -I=0 '.a.x.y | parent'           {"y":null}
+/// ```
+#[test]
+fn test_absent_position_parent_still_takes_the_eager_route_2416() -> Result<()> {
+    let args = &["-o=json", "-I=0"];
+    let doc = "a:\n  b: 1\n";
+    // The eager route's `{}` for an absent ancestor, next to the walk's
+    // `null` for the very same position one row above in
+    // `test_absent_position_keeps_path_context_2416`.
+    let (output, code) = run_yq_stdin(".a.x.y | [path, parent]", doc, args)?;
+    assert_eq!(code, 0, "{output:?}");
+    assert_eq!(output.trim(), "[[\"a\",\"x\",\"y\"],{}]");
+    Ok(())
+}
