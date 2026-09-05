@@ -1878,15 +1878,16 @@ existing one keeps its old value. Only **key** lookups are covered — real yq a
 through arrays even read-only (`.x = (.n[9] | key)` on `n: [1, 2]` is `x: 9`), so an
 out-of-range array index stays the ordinary `null` read.
 
-Five neighbouring shapes were captured alongside and are **not** part of this rule; each
-is a separate divergence:
+Four neighbouring shapes were captured alongside and are **not** part of this rule; each
+is a separate divergence (a fifth, `|=` with a zero-output filter, was captured here too
+but is now resolved -- see
+[#2484](https://github.com/rust-works/succinctly/issues/2484) below):
 
 | filter                                    | input             | real yq        | succinctly                             |
 |-------------------------------------------|-------------------|----------------|----------------------------------------|
 | `null < 1`, `.zzz < 1`, `null <= 1`       | `a: 1`            | `false`        | `true`                                 |
 | `.s.zzz`                                  | `s: x`            | *(nothing)*    | `Error: Cannot index string with string "zzz"` |
 | `.a \| with_entries(.value = key)`        | `a: {b: 1, e: 2}` | `{"b":0,"e":1}`| `{"b":1,"e":2}`                        |
-| `.a \|= (1 \| select(false))`             | `a: 1`            | `{"a":1}`      | `{"a":null}`                           |
 | `.x = (keys)`                             | `a: 1`            | `{"a":1,"x":["a","x"]}` | `{"a":1,"x":["a"]}`           |
 
 Row 1 is yq's ordering comparison against a real `null`, which is `false` for every
@@ -1896,12 +1897,9 @@ Row 2 is yq indexing a *scalar* with a key, which yields nothing everywhere, not
 a read-only context — it is what makes `.s.zzz + 1` also `1`. Row 3 is what `key` reports
 for an element of a constructed array: real yq answers the index, succinctly has no path
 context for a value it built itself, so the `=` right side is empty and the write is
-skipped. Row 4 is `|=` with a zero-output *filter*, which real yq no-ops the same way it
-no-ops a zero-output `=` right side — succinctly's `update_path` writes `null` instead.
-`.x |= (1 | select(false))` on an absent `.x` already agrees (`x: null`), so only the
-existing-target half diverges.
+skipped.
 
-Row 5 is an evaluation-*order* divergence that predates all of this and is unrelated to
+Row 4 is an evaluation-*order* divergence that predates all of this and is unrelated to
 absent reads: real yq's `assignUpdateOperator` resolves (and auto-creates) the **left**
 side first, then evaluates the right side against the document that traversal has already
 mutated, so the right side can see the node the assignment is about to write into.
@@ -1924,6 +1922,42 @@ now correctly empty, the underlying order difference is what shows:
 (the `a: 1` prefix elided). Closing these needs the right side evaluated against the
 left-vivified document, which is a change to the assignment model rather than to this
 rule -- and would move `.x = (keys)`/`.x = (length)` at the same time.
+
+### `|=` with a zero-output update filter -- resolved ([#2484](https://github.com/rust-works/succinctly/issues/2484))
+
+A three-way divergence per ADR-0018 (mode decides): jq 1.7.1 (since jq 1.7) deletes the
+key/element a zero-output `|=` filter targets (`_modify`'s own `delpaths` fallback);
+real yq instead leaves an already-existing target completely untouched; succinctly's
+pre-fix yq mode wrote `null` in both cases, matching neither. Captured live against yq
+v4.53.3 (`-o=json -I0`):
+
+| filter                                  | input          | real yq            |
+|------------------------------------------|----------------|---------------------|
+| `.a \|= (1 \| select(false))`             | `a: 1`         | `{"a":1}` (untouched) |
+| `.x \|= (1 \| select(false))`             | `a: 1`         | `{"a":1,"x":null}` (absent target: already agreed, #2470) |
+| `.a[] \|= select(. > 5)`                  | `a: [1,6,2,7]` | `{"a":[1,6,2,7]}` (every element untouched, none removed) |
+| `.a[0] \|= select(. > 5)`                 | `a: [1,6,2,7]` | `{"a":[1,6,2,7]}` (single index, same rule) |
+| `.a[10] \|= select(. > 5)`                | `a: [1,2,3]`   | padded with `null` out to index 10 (#1916's own bounds rule, not this one -- unaffected) |
+| `.a[1:2] \|= (. \| select(false))`        | `a: [1,2,3]`   | `{"a":[1,2,3]}` (slice form untouched too) |
+
+Fixed in `update_path`'s own terminal `Expr::Identity` arm -- the base case every
+`Field`/`Index`/`Iterate`/`Slice` arm's leaf write already funnels through -- by simply
+not assigning anything when the filter is zero-output in yq mode: `root` at that point
+already *is* the value being updated (the pre-existing one for an already-populated slot,
+or the freshly-autovivified/padded default for one that didn't exist before this write),
+so "leave it as it was" needs no separate before/after snapshot. `update_path_steps`'s own
+terminal case (`.a[N] |=`/`.a.b |=`-style multi-step chains) used to keep an independent,
+identical copy of the same three lines; it now calls into the `Expr::Identity` arm instead
+of duplicating it, so this fix (and any future one) cannot drift between the two the way
+CLAUDE.md's "duplicated predicates diverge silently" warns about.
+
+**Not chased here:** `.a |= (.zzz | key)` on `a: 1` (also asked for in the issue) is not
+part of this fix. Real yq answers `{"a":1}` because `.zzz` on the number `1` -- `|=`'s
+right side runs against the *target's own value*, not the whole document -- yields
+nothing there (yq indexes a scalar with a key as "nothing everywhere", the "Row 2"
+divergence in the entry above); succinctly still raises `Cannot index number with string
+"zzz"` for that shape, so the update filter never gets the chance to become zero-output in
+the first place. That is the pre-existing scalar-indexing gap, not this one.
 
 ### A negative out-of-range array index (`.a[-N]`) raises -- resolved for ordinary reads, a few call sites remain
 

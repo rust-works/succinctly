@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`succinctly yq`'s `|=` with a zero-output update filter now leaves an
+  already-existing target completely untouched** (#2484). Confirmed live
+  against yq v4.53.3: `.a |= (1 | select(false))` on `a: 1` stays `{"a":1}`,
+  and `.a[] |= select(. > 5)` on `a: [1,6,2,7]` leaves every element as-is
+  rather than removing any — where jq 1.7.1 deletes the key/element and
+  succinctly's pre-fix yq mode wrote `null` in both cases, a three-way
+  divergence. The absent-target half (`.x |= ...`) already agreed (#2470);
+  jq mode is unaffected.
+
 ### Changed
 
 - **`succinctly yq --eval-all` now evaluates over the document *list*, not a

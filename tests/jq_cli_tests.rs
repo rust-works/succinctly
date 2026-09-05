@@ -38242,3 +38242,29 @@ fn test_jq_binary_fanout_stays_right_major_2451() -> Result<()> {
 
     Ok(())
 }
+
+/// #2484: yq mode's new "leave the target untouched" rule for a zero-output
+/// `|=` filter (`update_path`'s terminal `Expr::Identity` arm) must not
+/// leak into jq mode -- jq 1.7.1 (since 1.7) deletes the key/element
+/// instead, which succinctly already reproduced and must keep reproducing.
+#[test]
+fn test_jq_mode_update_zero_output_filter_still_deletes_2484() -> Result<()> {
+    for (doc, filter, expected) in [
+        ("{\"a\":1}", ".a |= (1 | select(false))", "{}"),
+        (
+            "{\"a\":[1,6,2,7]}",
+            ".a[] |= select(. > 5)",
+            "{\"a\":[6,7]}",
+        ),
+        (
+            "{\"a\":[1,6,2,7]}",
+            ".a[0] |= select(. > 5)",
+            "{\"a\":[6,2,7]}",
+        ),
+    ] {
+        let (out, code) = run_jq_stdin(filter, doc, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}` on {doc:?}");
+        assert_eq!(out.trim(), expected, "`{filter}` on {doc:?}");
+    }
+    Ok(())
+}

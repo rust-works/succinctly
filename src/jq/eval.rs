@@ -21515,15 +21515,30 @@ fn update_path<S: EvalSemantics>(
             // surface -- `.a |= (1, error("x"))` is `{"a":1}` in jq 1.7.1,
             // not an error.
             //
-            // A zero-output filter still falls back to `Null` at *this*
-            // level -- the `Field`/`Index`/`Iterate` arms above are what
+            // A zero-output filter falls back to `Null` at *this* level in
+            // jq mode -- the `Field`/`Index`/`Iterate` arms above are what
             // turn that into a real delete (#1916), by checking the
             // `wrote` bool returned here rather than inspecting the
             // resulting value (a legitimate `.a |= null` also leaves
             // `Null` behind, and must not be deleted).
+            //
+            // yq mode (#2484): a zero-output filter instead leaves `root`
+            // completely untouched -- neither jq's "always null" nor its
+            // "delete" rule (`{"a":1} | .a |= select(false)` stays
+            // `{"a":1}` in real yq v4.53.3, confirmed live). `root` here
+            // already *is* the value being updated -- the pre-existing one
+            // for an already-populated slot, or the freshly-autovivified/
+            // padded default for one that didn't exist before this write
+            // (every caller -- the `Field`/`Index`/`Iterate`/`Slice` arms
+            // below, and `update_path_steps`'s identical terminal case --
+            // autovivifies/pads *before* reaching here) -- so simply
+            // skipping the assignment is exactly "leave it as it was", no
+            // separate before/after snapshot needed.
             let outputs = eval_owned_multi_first::<S>(filter_expr, root)?;
             let wrote = !outputs.is_empty();
-            *root = outputs.into_iter().next().unwrap_or(OwnedValue::Null);
+            if wrote || S::TAG != EvalTag::Yq {
+                *root = outputs.into_iter().next().unwrap_or(OwnedValue::Null);
+            }
             Ok(wrote)
         }
         Expr::Field(name) => {
@@ -21868,13 +21883,14 @@ fn update_path_steps<S: EvalSemantics>(
     loop {
         let (first, rest) = match steps {
             // Only ever reached via the fresh-run shortcut below, standing in
-            // for a chain whose leaf position is `Expr::Identity` -- mirrors
-            // `update_path`'s own terminal `Expr::Identity` arm exactly.
+            // for a chain whose leaf position is `Expr::Identity` -- calls
+            // straight into `update_path`'s own terminal `Expr::Identity`
+            // arm rather than keeping a second copy of it, so a rule that
+            // arm gains (#2484's yq-mode "leave untouched") can't drift
+            // between the two the way CLAUDE.md's "duplicated predicates
+            // diverge silently" warns about.
             [] => {
-                let outputs = eval_owned_multi_first::<S>(filter_expr, root)?;
-                let wrote = !outputs.is_empty();
-                *root = outputs.into_iter().next().unwrap_or(OwnedValue::Null);
-                return Ok(wrote);
+                return update_path::<S>(root, &Expr::Identity, filter_expr, optional, scalar_noop);
             }
             [last] => return update_path::<S>(root, last, filter_expr, optional, scalar_noop),
             [first, rest @ ..] => (first, rest),
