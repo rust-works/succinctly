@@ -7417,6 +7417,20 @@ fn test_as_keeps_path_context_2416() -> Result<()> {
     Ok(())
 }
 
+/// Spine 2416, phase 3: destructuring `as` (`Expr::AsPattern`) is now native
+/// via `each_as_pattern_generic`, same migration as bare `as` above. No jq
+/// oracle. The pre-migration answer (this PR's own pre-change build) is
+/// unchanged: `expr` is `Expr::Identity`, so `.` for `body` is already the
+/// per-element position `key` answers for.
+#[test]
+fn test_as_pattern_keeps_path_context_2416() -> Result<()> {
+    let doc = r#"{"x":{"p":10},"y":{"p":20}}"#;
+    let (out, _, code) = run_jq_full(&["-c", ".[] | . as {p: $p} | key"], Some(doc))?;
+    assert_eq!(code, 0, "{out:?}");
+    assert_eq!(out.trim(), "\"x\"\n\"y\"");
+    Ok(())
+}
+
 /// Documents the one remaining deliberate, narrow gap #1663/#1765 leave
 /// open rather than silently missing: a `?//`-chained `AsPattern` (2+
 /// alternatives) still has no dedicated evaluation arm, so a path-context
@@ -7977,11 +7991,23 @@ fn test_as_pattern_single_pattern_path_context_resolves_1765() -> Result<()> {
 /// `Many`/`Partial` result into a single `OwnedValue::Array` instead of
 /// streaming it -- silently changing both output count and value shape for
 /// something never even the (broken) `key`/`parent` stub was meant to
-/// affect. Confirmed live against pre-#1765 `main`: both filters below give
-/// two separate `"null"`/`"0"` outputs there, not one collapsed
-/// `"[null,null]"` or a type error. `needs_path_context`'s `AsPattern` arm
-/// now carries the identical `patterns.len() == 1` gate the eval arm does,
-/// closing this before it ever shipped.
+/// affect. `needs_path_context`'s `AsPattern` arm now carries the identical
+/// `patterns.len() == 1` gate the eval arm does, closing this before it ever
+/// shipped. The second filter below still pins that guard: two separate
+/// `"0"` outputs, not one collapsed `"[0,0]"`.
+///
+/// **The first filter's expected value changed under spine 2416's phase 3**
+/// (`Expr::AsPattern` native in `eval_single` via `collect_each_generic`,
+/// closing this same construct's #1332-shaped gap for the `?//`-chain case
+/// too, not just the single-pattern one #1765 fixed). `EXPR as PATTERN |
+/// BODY` leaves `.` unchanged for `BODY` -- confirmed live (`.a as $v | .`
+/// on `{"a":1}` is the whole document, not `1`) -- so `key` in `(.a[] as
+/// {x:$v} ?// [$v] | key)` answers for the *ambient* `.`, the document root,
+/// each of the two times the chain runs, not for the bound `.a[]` element.
+/// `key`/`parent` at or above the root emit nothing (#2421), so the old
+/// stubbed `"null"` pair is now correctly empty. Cardinality is still
+/// preserved -- zero outputs both times, not one array -- just as `"0"\n"0"`
+/// still is when a computed stage keeps the pair alive.
 #[test]
 fn test_as_pattern_qmark_slash_slash_chain_does_not_collapse_cardinality_1765() -> Result<()> {
     let (stdout, _, code) = run_jq_full(
@@ -7989,7 +8015,7 @@ fn test_as_pattern_qmark_slash_slash_chain_does_not_collapse_cardinality_1765() 
         Some(r#"{"a":[{"x":1},{"x":2}]}"#),
     )?;
     assert_eq!(code, 0);
-    assert_eq!(stdout, "\"null\"\n\"null\"\n");
+    assert_eq!(stdout, "");
 
     let (stdout, _, code) = run_jq_full(
         &["-c", "(.a[] as {x:$v} ?// [$v] | key) + 0 | tostring"],
