@@ -24620,6 +24620,39 @@ fn test_yaml_sort_keys_sound_order_keeps_streaming_marks_1350() -> Result<()> {
     Ok(())
 }
 
+/// Code review on #1350's fix: resolving a root alias by swapping in the
+/// target's own cursor, then calling `write_leading_anchor` on *that*
+/// cursor, printed the target's `&anchor` as if it belonged to the alias
+/// result -- streaming a spurious leading `&x` that `-P` (and every other
+/// container-target case) never does. `write_leading_anchor` must run
+/// against the pre-resolution cursor (always a no-op there, since #1374
+/// rejects an anchor on an alias node itself), not the resolved one.
+///
+/// The scalar case (`test_yaml_bare_scalar_alias_result_is_materialized_
+/// on_the_dom_path_763`) never exercised this: `write_leading_anchor` only
+/// fires for a *container* target, which a bare scalar never is.
+#[test]
+fn test_yaml_root_alias_container_target_no_spurious_anchor_1350() -> Result<()> {
+    for input in [
+        "a: &x\n  k: 1\nb: *x\n",       // block mapping target
+        "a: &x\n  - 1\n  - 2\nb: *x\n", // block sequence target
+    ] {
+        let (streamed, code) = run_yq_stdin(".b", input, &[])?;
+        assert_eq!(code, 0, "input: {input}");
+        let (dom_forced, code) = run_yq_stdin(".b", input, &["-P"])?;
+        assert_eq!(code, 0, "input: {input}");
+        assert_eq!(
+            streamed, dom_forced,
+            "streaming must not print the target's own anchor for an alias result, input: {input}"
+        );
+        assert!(
+            !streamed.contains("&x"),
+            "no anchor mark belongs on a resolved alias result, input: {input}\noutput: {streamed:?}"
+        );
+    }
+    Ok(())
+}
+
 /// Code review on #1350's fix: an earlier version gated the DOM fallback on
 /// `sort_keys && index.has_aliases()` alone, with no `is_identity` check --
 /// but `stream_yaml_sort_keys_alias_fallback` always evaluates
