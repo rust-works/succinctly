@@ -251,9 +251,12 @@ invalid, it accepts.
   (`|0`, `|10`, `> text`).
 - **Flow collections** — leading/doubled commas, unbalanced or unclosed brackets, bare `-`
   items, document markers inside a flow collection.
-- **Anchors & aliases** — an anchor immediately followed by an alias (`&a *b`) or a block
-  indicator; an alias naming an anchor that is not in scope (`a: *nope`), including a forward
-  reference. A `*` that is scalar content rather than a node (`a: rm *.tmp`) is untouched.
+- **Anchors & aliases** — an anchor immediately followed by a block indicator with no value
+  between them. A `*` that is scalar content rather than a node (`a: rm *.tmp`) is untouched.
+  (An anchor or tag immediately before an alias, `&a *b` / `!!str *b`, and an alias naming an
+  out-of-scope anchor, `a: *nope`, are both rejected by the *default* loader itself — see
+  [YAML Limitations](../compliance/yaml/limitations.md#three-exceptions-an-alias-with-no-usable-target-or-an-illegal-decoration-is-rejected) —
+  so `--validate` adds nothing beyond the default for either.)
 - **Comments** — a `#` not separated from the preceding token by whitespace; a comment
   interrupting a multi-line plain scalar.
 - **Documents & directives** — content after a `...` marker; a `%YAML` directive with no

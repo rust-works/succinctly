@@ -27,13 +27,13 @@ path:
 | Dimension                              | Result              | Meaning                                        |
 |----------------------------------------|---------------------|------------------------------------------------|
 | **Load** (valid YAML, output compared) | **267/279 = 95.7%** | Parses and produces the JSON the suite expects |
-| **Reject** (invalid YAML, must fail)   | **66/94 = 70.2%**   | Refused by the loader or the opt-in validator  |
+| **Reject** (invalid YAML, must fail)   | **67/94 = 71.3%**   | Refused by the loader or the opt-in validator  |
 | **Parse** (valid YAML, no JSON form)   | **29/29 = 100.0%**  | Parses without error                           |
 
 The **Reject** figure is what the conformance harness rejects with the opt-in
 validator enabled (loader OR validator, see below). The *default non-validating
-loader alone* rejects only 8/94 (8.5%) by design — the opt-in validator
-([#223](https://github.com/rust-works/succinctly/issues/223)) closes 58 more.
+loader alone* rejects 16/94 (17.0%) by design — the opt-in validator
+([#223](https://github.com/rust-works/succinctly/issues/223)) closes 51 more.
 
 [#224](https://github.com/rust-works/succinctly/issues/224) (tag support) moved the Load
 figure from 235/279 (84.2%) to 267/279, the largest single jump on this page, and closed
@@ -45,15 +45,27 @@ absorbed like any other invalid input the non-validating loader doesn't check fo
 the loader-alone figure from 12/94 to 8/94. See
 [Tags — resolved](#tags--resolved-224) below.
 
-The 40 non-passing cases are enumerated individually, with a category and reason, in
+By the time [#1374](https://github.com/rust-works/succinctly/issues/1374) (anchor-on-alias
+rejection, see
+[Three exceptions](#three-exceptions-an-alias-with-no-usable-target-or-an-illegal-decoration-is-rejected)
+below) was implemented, re-measuring found the loader-alone figure already at 14/94 rather
+than the 8/94 recorded just above — independent drift from other changes since #224 that this
+page had not been regenerated against; not investigated further here, since it predates and is
+unrelated to #1374's own change. #1374 itself moves the figure from 14/94 to 16/94: 2 corpus
+cases (SR86, SU74) that were previously caught only by the opt-in validator are now caught by
+the default loader too. This does not move the overall **Reject** figure (still 67/94, itself
+also a re-measurement correction from the 66/94 recorded above): both cases were already
+counted as rejected via the validator before this change.
+
+The 39 non-passing cases are enumerated individually, with a category and reason, in
 [`tests/data/yaml-test-suite-known-failures.txt`](../../../tests/data/yaml-test-suite-known-failures.txt).
 That file is the machine-readable source of truth; the test asserts it matches reality
 exactly, so it cannot silently drift from this page.
 
 ## Validation: default loader vs. the opt-in validator
 
-**The default loader is non-validating by design.** `YamlIndex::build` rejects 8 of the
-suite's 94 invalid documents; the other 86 are accepted and produce a value.
+**The default loader is non-validating by design.** `YamlIndex::build` rejects 16 of the
+suite's 94 invalid documents; the other 78 are accepted and produce a value.
 
 This follows from semi-indexing. The index records *structure* — where values start and
 end, and how they nest — not grammar conformance. The parser is a structure recognizer:
@@ -65,19 +77,19 @@ it is 5-10x faster than `yq`.
 **When you need malformed YAML rejected, use the opt-in validator.**
 [`succinctly yaml validate`](../../guides/cli.md) / `syq --validate` runs a separate strict
 pass ([`src/yaml/validate.rs`](../../../src/yaml/validate.rs)) before indexing — mirroring
-`json validate` / `sjq --validate`, so the default path pays nothing. It rejects **58 of
-the 86** documents below with zero false positives on the valid corpus (a guardrail test,
+`json validate` / `sjq --validate`, so the default path pays nothing. It rejects **51 of
+the 78** documents below with zero false positives on the valid corpus (a guardrail test,
 `validator_accepts_all_valid_cases`, enforces that). The conformance harness treats a
 must-fail case as handled if the loader *or* the validator rejects it, which is why the
-Reject figure above is 66/94 rather than 8/94.
+Reject figure above is 67/94 rather than 16/94.
 
-The 28 documents the validator does not yet reject (marked `lax:*` in the manifest) need
+The 27 documents the validator does not yet reject (marked `lax:*` in the manifest) need
 deeper structural analysis — cross-line anchor binding, block-scalar content indentation,
 flow multi-line implicit keys, malformed tag syntax — and are tracked in
 [#223](https://github.com/rust-works/succinctly/issues/223) (`lax:tags` under #224, see
 below).
 
-The 28 documents still lax today (neither the loader nor the validator rejects them) break
+The 27 documents still lax today (neither the loader nor the validator rejects them) break
 down as:
 
 | Category           | Cases | What is not checked                                     |
@@ -87,21 +99,21 @@ down as:
 | `lax:flow`         | 4     | Flow collection syntax                                  |
 | `lax:anchors`      | 4     | Anchor and alias rules, incl. an unindented tag target (#224) |
 | `lax:documents`    | 3     | Directive and document-marker placement, incl. a mid-stream `%TAG` (#224) |
-| `lax:tags`         | 2     | Malformed tag syntax (disallowed flow indicators) — #224 |
+| `lax:tags`         | 1     | Malformed tag syntax (disallowed flow indicators) — #224 |
 | `lax:comments`     | 2     | Comment placement                                       |
 | `lax:block-scalar` | 2     | Block scalar header validity (`\|--` parses)             |
 | `lax:tabs`         | 1     | Tabs where indentation is expected                       |
 
 This table is the current *remainder* — cases the validator has not yet caught up to — not
-a fixed accounting of the original 86; earlier revisions of this page also carried
+a fixed accounting of the original 78; earlier revisions of this page also carried
 `lax:other` and `lax:quoting` rows that the validator has since closed out entirely.
 
 The opt-in validation mode now exists ([#223](https://github.com/rust-works/succinctly/issues/223)),
 mirroring the JSON side's `succinctly json validate` / `sjq --validate`. Validation is a
 separate pass run before indexing, so the default path pays nothing for it — see
-[`src/yaml/validate.rs`](../../../src/yaml/validate.rs). The 86 cases above were its
-acceptance criteria; it rejects 58 of them today (each `lax:*` line removed from the
-manifest is a case now rejected), with the 28 harder cases still tracked in #223 (`lax:tags`
+[`src/yaml/validate.rs`](../../../src/yaml/validate.rs). The 78 cases above were its
+acceptance criteria; it rejects 51 of them today (each `lax:*` line removed from the
+manifest is a case now rejected), with the 27 harder cases still tracked in #223 (`lax:tags`
 under #224).
 
 ### What "accepted" means: the text is kept, not dropped
@@ -157,10 +169,9 @@ mapping instead of a value under a key, which corrupted the next entry — here 
 a phantom `"":"c"` pair, with the `2` dropped as well. Content after the misaligned item is
 kept too: a further out-dented or realigned line still joins the same sequence.
 
-### Two exceptions: an alias with no usable target is rejected
+### Three exceptions: an alias with no usable target, or an illegal decoration, is rejected
 
-Two alias forms are refused at index build. They are the same failure underneath — an
-alias with nothing to resolve to:
+Three alias forms are refused at index build:
 
 - **Cyclic.** An alias that would make an anchored value contain itself
   (`a: &x {self: *x}`) fails with `YamlError::AliasCycle` ("anchor value contains itself").
@@ -177,54 +188,77 @@ alias with nothing to resolve to:
   enforces this too ([#404](https://github.com/rust-works/succinctly/issues/404)); it did
   not at first, which briefly made the opt-in strict mode *laxer* than the default one for
   this input.
+- **Decorated.** An alias node itself carrying an `&anchor` or `!tag`
+  (`&y *x`, `!!str *x`) fails with `YamlError::PropertyOnAlias` since
+  [#1374](https://github.com/rust-works/succinctly/issues/1374). Unlike the first two, this
+  *is* a genuine grammar-conformance check — the YAML 1.2 grammar gives an alias node no
+  properties of its own — carved out of the loader's usual "grammar isn't checked" policy
+  because leaving it lenient had a specific, concrete cost: `&anchor *alias` is the *only*
+  shape that can construct an alias chain more than one hop deep, so every multi-hop-chain
+  bug this codebase has ever had (#1193's stack-overflow DoS, #1315/#1318/#1319's
+  single-hop-only accessor bugs) was reachable only through input real `yq` and PyYAML both
+  already refuse. Both are confirmed live to reject every spelling (block value, next line,
+  flow, mapping key, `!!str`-tagged) — this is not a case where matching means giving up an
+  advantage.
 
 ```
 $ printf 'a: &x {self: *x}\n' | succinctly yq '.'
 Error: YAML parse error: cyclic alias 'x' at offset 13 (anchor value contains itself)
 $ printf 'a: *x\nb: &x 5\n' | succinctly yq '.'
 Error: YAML parse error: unknown anchor 'x' referenced at offset 3
+$ printf 'a0: &a0 hello\na1: &a1 *a0\n' | succinctly yq '.'
+Error: YAML parse error: alias '*a0' at offset 22 cannot carry an anchor or tag (an alias node has no node properties)
 $ printf 'b: &x 5\na: *x\n' | succinctly yq -o json -I0 '.'
-{"b":5,"a":5}             # a resolvable alias is unaffected
+{"b":5,"a":5}             # a resolvable, undecorated alias is unaffected
 ```
 
 Until #372 the second silently yielded `null` — or `""` where the alias was a key — the
-same silent-wrong-data mode as the `- ` case above.
+same silent-wrong-data mode as the `- ` case above. Before #1374 the third silently built a
+resolvable but ungrammatical alias chain instead of erroring.
 
-These two are the loader's only checks on *document structure*, and neither is grammar
+The first two are the loader's only checks on *document structure*, and neither is grammar
 conformance: both are cases where there is no value to produce at all, not cases where the
-input breaks a rule the index could otherwise ignore. Rejecting the rest of what the suite
-calls invalid is the validator's job.
+input breaks a rule the index could otherwise ignore. The third is grammar conformance, but a
+single, narrowly-scoped one rather than a step toward general conformance checking — see
+above for why it earns an exception. Rejecting the rest of what the suite calls invalid is
+the validator's job.
 
-Neither costs this page's conformance numbers anything: no case in the corpus contains an
-alias to an out-of-scope anchor, so the loader-alone reject figure, the accepted-but-invalid
-document count, and the `lax:anchors` row are unmoved by #372.
+Cyclic and Unknown cost this page's conformance numbers nothing: no case in the corpus
+contains an alias to an out-of-scope anchor, so the loader-alone reject figure, the
+accepted-but-invalid document count, and the `lax:anchors` row are unmoved by #372. Decorated
+does move the loader-alone reject figure (+2, see above) but not the `lax:anchors` row or the
+overall Reject figure: both corpus cases it newly catches (SR86, SU74) were already rejected
+via the opt-in validator, which has had this exact check
+([`check_after_anchor`](../../../src/yaml/validate.rs)) since before #1374.
 
-### A third, differently-timed check: excessively long alias chains
+### A related, differently-timed check: excessively long alias chains (historical — see #1374 below)
 
-Unlike the cyclic and unknown-anchor cases above, an alias chain that is merely very long —
-`a0: &a0 v`, `a1: &a1 *a0`, `a2: &a2 *a1`, ... — is not rejected at `YamlIndex::build`
-time; the index builds successfully regardless of chain length. [#153](https://github.com/rust-works/succinctly/issues/153)'s
-cycle check only rejects a chain that revisits its own anchor, and a long non-cyclic chain
-never does. Before [#1193](https://github.com/rust-works/succinctly/issues/1193), *walking*
-such a chain (via `type`, `tostring`, `-o json` output, arithmetic, or any other query that
-resolves the aliased value) drove real, uncatchable stack overflow through several
-independent self-recursive code paths in `src/yaml/light.rs`, `src/bin/succinctly/yq_runner.rs`,
-and `src/jq/eval.rs` — the same underlying failure mode #153 fixed for cycles specifically,
-recurring for long-but-acyclic chains that #153's own check does not cover.
+Before [#1374](https://github.com/rust-works/succinctly/issues/1374) (Decorated, above), an
+alias chain that was merely very long — `a0: &a0 v`, `a1: &a1 *a0`, `a2: &a2 *a1`, ... — was
+not rejected at `YamlIndex::build` time; the index built successfully regardless of chain
+length. [#153](https://github.com/rust-works/succinctly/issues/153)'s cycle check only rejects
+a chain that revisits its own anchor, and a long non-cyclic chain never does. Before
+[#1193](https://github.com/rust-works/succinctly/issues/1193), *walking* such a chain (via
+`type`, `tostring`, `-o json` output, arithmetic, or any other query that resolves the aliased
+value) drove real, uncatchable stack overflow through several independent self-recursive code
+paths in `src/yaml/light.rs`, `src/bin/succinctly/yq_runner.rs`, and `src/jq/eval.rs` — the
+same underlying failure mode #153 fixed for cycles specifically, recurring for long-but-acyclic
+chains that #153's own check does not cover.
 
-The fix is a runtime ceiling, not a build-time rejection: `MAX_ALIAS_CHAIN_DEPTH` (65,536
+#1193's fix was a runtime ceiling, not a build-time rejection: `MAX_ALIAS_CHAIN_DEPTH` (65,536
 hops, `src/yaml/light.rs`) bounds every alias-resolving accessor to a clean `panic!` past
 that depth, rather than allowing the resolution loop to run unbounded. Because the fix
 converts what used to be self-recursion into an explicit iterative loop, the ceiling exists
 only to cap adversarial CPU time, not stack depth — the loop itself costs O(1) stack
-regardless of chain length. A chain within the limit resolves normally; one beyond it
-panics with a `nesting depth exceeds limit` message (a clean Rust panic, not a stack
-overflow) rather than crashing the process the way #1193's own repro did:
+regardless of chain length.
 
-```
-$ succinctly yq -o json '.' 70000-hop-chain.yaml
-thread 'main' panicked at ...: nesting depth exceeds limit of 65536
-```
+**This whole scenario is now unreachable through valid input.** `a1: &a1 *a0` — every link in
+the example chain above after the first — is exactly the Decorated shape #1374 rejects at
+parse time, and it was the *only* way to construct a chain more than one hop deep. A document
+`YamlIndex::build` accepts today can therefore never have an alias chain longer than one hop,
+so `MAX_ALIAS_CHAIN_DEPTH` and its `panic!` past the ceiling remain in the code purely as
+defense in depth against a hand-built index that bypasses the parser's own checks, not as a
+mitigation reachable through the CLI on any input the loader itself would accept.
 
 ### The other ways `YamlIndex::build` fails
 

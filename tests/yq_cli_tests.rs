@@ -5314,49 +5314,24 @@ fn test_yaml_anchor_alias_without_merge() -> Result<()> {
 
 /// #1191: `as_str()`'s `Alias` arm only unwrapped a single level of alias
 /// indirection, unlike its `type_name()`/`as_object()`/`as_array()`/
-/// `number_literal()` siblings, which all correctly recurse through a chain
-/// of any length. A string slice (`.[S:E]`) is one of the few call sites
-/// that goes through `as_str()` directly (`slice_one_generic`,
-/// `src/jq/eval_generic.rs`), so it's an observable way to exercise the bug:
-/// before this fix, `.z[0:2]` on a value reached through two alias hops
-/// silently gave `[]` (the "not a string, not an array either" empty-slice
-/// fallback) instead of slicing the resolved string, even though `.z | type`
-/// already correctly reported `"string"` for the exact same node -- the
-/// contradiction the issue itself calls out.
-#[test]
-fn test_yaml_chained_alias_as_str_slices_correctly_1191() -> Result<()> {
-    let input = "x: &a hello\ny: &b *a\nz: *b\n";
-    let (output, exit_code) = run_yq_stdin(".z[0:2]", input, &["-o=json"])?;
-    assert_eq!(exit_code, 0, "out: {output:?}");
-    assert_eq!(output.trim(), r#""he""#);
-    Ok(())
-}
-
-/// #1191: a single-hop alias (the case that already worked) must keep
-/// working identically after generalizing the `Alias` arm to recurse.
+/// `number_literal()` siblings. A string slice (`.[S:E]`) is one of the few
+/// call sites that goes through `as_str()` directly (`slice_one_generic`,
+/// `src/jq/eval_generic.rs`), so it's an observable way to exercise the bug.
+///
+/// #1191's original repro chained two/three aliases (`y: &b *a`) to prove the
+/// fix recurses rather than unwrapping just one hop. #1374 closed off that
+/// exact shape at parse time (`&anchor *alias` is invalid YAML - an alias
+/// node carries no properties of its own, and it was the only way to build a
+/// multi-hop alias chain), so only the single-hop case remains constructible
+/// from valid input; it's kept here as the regression test for the original
+/// bug ([`.y[0:2]`] silently gave `[]` instead of slicing the resolved
+/// string, even though `.y | type` already correctly reported `"string"`).
 #[test]
 fn test_yaml_single_hop_alias_as_str_slices_correctly_1191() -> Result<()> {
     let input = "x: &a hello\ny: *a\n";
     let (output, exit_code) = run_yq_stdin(".y[0:2]", input, &["-o=json"])?;
     assert_eq!(exit_code, 0, "out: {output:?}");
     assert_eq!(output.trim(), r#""he""#);
-    Ok(())
-}
-
-/// #1191: `type_name()` and `as_str()` must agree on a triply-chained alias
-/// -- the exact contradiction the issue reports (told it's a `"string"` by
-/// `type_name()`, but unable to read it as one via `as_str()`) must not
-/// reappear for a longer chain than the doubly-aliased case above.
-#[test]
-fn test_yaml_triple_hop_alias_as_str_slices_correctly_1191() -> Result<()> {
-    let input = "x: &a hello\ny: &b *a\nw: &c *b\nz: *c\n";
-    let (type_output, code) = run_yq_stdin(".z | type", input, &[])?;
-    assert_eq!(code, 0, "out: {type_output:?}");
-    assert_eq!(type_output.trim(), "string");
-
-    let (slice_output, code) = run_yq_stdin(".z[0:2]", input, &["-o=json"])?;
-    assert_eq!(code, 0, "out: {slice_output:?}");
-    assert_eq!(slice_output.trim(), r#""he""#);
     Ok(())
 }
 
@@ -7610,132 +7585,30 @@ fn test_yaml_alias_cycle_fails_for_identity_filter() -> Result<()> {
 
 #[test]
 fn test_yaml_direct_self_alias_cycle() -> Result<()> {
+    // `&x *x` is anchor-on-alias (#1374, invalid YAML - an alias node carries
+    // no properties of its own) as well as a would-be self-cycle; the
+    // property check in `parse_alias` now rejects it before the cycle
+    // checker ever runs, so the error is `PropertyOnAlias`, not `AliasCycle`.
     let input = "a: &x *x";
     let (stdout, stderr, exit_code) = run_yq_stdin_with_stderr(".", input, &[])?;
     assert_eq!(exit_code, 1, "expected clean error exit, stderr: {stderr}");
     assert_eq!(stdout, "");
     assert!(
-        stderr.contains("cyclic alias 'x'"),
-        "stderr should name the cycle: {stderr}"
+        stderr.contains("cannot carry an anchor or tag"),
+        "stderr should name the property-on-alias rejection: {stderr}"
     );
     Ok(())
 }
 
-// =============================================================================
-// Deep (non-cyclic) alias-chain recursion guard (#1193) -- a syntactically
-// valid chain of anchored aliases, each referencing the previous, that never
-// revisits its own anchor (so #153's cycle check above doesn't reject it),
-// used to drive real, uncatchable stack overflow through
-// `YamlValue::Alias`'s recursive scalar accessors.
-// =============================================================================
-
-/// Builds `k0: &a0 <leaf>`, `k1: &a1 *a0`, ..., `z: *a{depth - 1}` -- a
-/// chain of `depth` anchored aliases, each hopping to the previous, with a
-/// top-level `z` referencing the tail.
-fn deep_alias_chain(depth: usize, leaf: &str) -> String {
-    let mut doc = String::new();
-    for i in 0..depth {
-        if i == 0 {
-            doc.push_str(&format!("k{i}: &a{i} {leaf}\n"));
-        } else {
-            doc.push_str(&format!("k{i}: &a{i} *a{}\n", i - 1));
-        }
-    }
-    doc.push_str(&format!("z: *a{}\n", depth - 1));
-    doc
-}
-
-#[test]
-fn test_yaml_deep_alias_chain_does_not_stack_overflow_1193() -> Result<()> {
-    // 50,000 hops crashed with SIGABRT (exit 134, "stack overflow, aborting")
-    // before the fix; the issue's own measurement found 20,000 hops still
-    // safe under the old recursive accessors. `[.z]` array-wraps the tail so
-    // the query is forced through `to_owned_at_depth`'s typed accessors
-    // (`as_bool`/`as_i64`/.../`type_name`) rather than the identity-output
-    // streaming path, which resolves aliases differently (and is untouched
-    // by this fix). An integer leaf exercises `as_i64`, confirming the fix
-    // doesn't just avoid the crash but resolves the full chain correctly.
-    let input = deep_alias_chain(50_000, "42");
-    let (stdout, stderr, exit_code) =
-        run_yq_stdin_with_stderr("[.z]", &input, &["-o", "json", "--indent", "0"])?;
-    assert_eq!(exit_code, 0, "expected a clean exit, stderr: {stderr}");
-    assert_eq!(stdout.trim(), "[42]");
-    Ok(())
-}
-
-#[test]
-fn test_yaml_moderate_alias_chain_resolves_through_every_hop_1193() -> Result<()> {
-    // A chain well short of any depth guard, confirming the iterative
-    // `resolve_alias_chain` walk is correct at ordinary depths, not just
-    // crash-safe at extreme ones. `as_bool` is one of the accessors that
-    // used to recurse via `target.and_then(|t| t.value().as_bool())`.
-    let input = deep_alias_chain(25, "true");
-    let (stdout, exit_code) = run_yq_stdin("[.z, (.z and true)]", &input, &["-o", "json"])?;
-    assert_eq!(exit_code, 0);
-    assert_eq!(stdout.trim(), "[\n  true,\n  true\n]");
-    Ok(())
-}
-
-#[test]
-fn test_yaml_alias_chain_past_depth_cap_panics_cleanly_not_via_stack_overflow_1193() -> Result<()> {
-    // Past `MAX_ALIAS_CHAIN_DEPTH` (65,536), `resolve_alias_chain` panics
-    // (via `assert_depth`, mirroring this crate's other `MAX_*` depth
-    // ceilings) rather than looping forever. A `Result::unwrap`-style Rust
-    // panic unwinds cleanly to exit 101 with a message -- a world apart from
-    // the uncatchable exit-134 SIGABRT this issue reports, even though
-    // neither is catchable by a jq `try`/`catch` inside the query itself.
-    let input = deep_alias_chain(70_000, "42");
-    let (stdout, stderr, exit_code) =
-        run_yq_stdin_with_stderr("[.z]", &input, &["-o", "json", "--indent", "0"])?;
-    assert_eq!(
-        exit_code, 101,
-        "expected a clean panic exit, stderr: {stderr}"
-    );
-    assert_eq!(stdout, "");
-    assert!(
-        stderr.contains("nesting depth exceeds limit"),
-        "stderr should name the depth guard: {stderr}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_yaml_deep_alias_chain_json_stream_output_does_not_stack_overflow_1193() -> Result<()> {
-    // `[.z]` (used by the tests above) forces materialization through
-    // `to_owned_at_depth`'s typed accessors. Bare `.z` with `-o json`
-    // instead forces `YamlCursor::stream_json_value`/`write_json_to` -- a
-    // completely separate alias-following code path with its own
-    // independent self-recursion, found live during this PR's own review:
-    // `succinctly yq -o json '.'` (this repo's own CLAUDE.md-documented
-    // standard invocation) SIGABRTed on a long chain even after the
-    // typed-accessor fix above, since neither `stream_json_value` nor
-    // `write_json_to` called into `resolve_alias_chain` at all yet.
-    let input = deep_alias_chain(50_000, "42");
-    let (stdout, stderr, exit_code) =
-        run_yq_stdin_with_stderr(".z", &input, &["-o", "json", "--indent", "0"])?;
-    assert_eq!(exit_code, 0, "expected a clean exit, stderr: {stderr}");
-    assert_eq!(stdout.trim(), "42");
-    Ok(())
-}
-
-#[test]
-fn test_yaml_alias_chain_through_owned_evaluator_bridge_does_not_stack_overflow_1193() -> Result<()>
-{
-    // Arithmetic (`+`) isn't cursor-native in the lazy evaluator, so it
-    // bridges to the full/owned evaluator, which materializes the input
-    // document via `yaml_value_to_owned` (src/jq/eval.rs) -- a third
-    // independent alias-following recursion found live during this PR's
-    // own review, distinct from both the typed accessors and the JSON
-    // streaming writer above. Kept small (500 hops, not 50,000): this
-    // whole-document conversion path has a separate, pre-existing O(n^2)
-    // total-work cost for a document shaped like this one (#1317) that
-    // isn't this test's concern -- only crash-safety and correctness are.
-    let input = deep_alias_chain(500, "42");
-    let (stdout, stderr, exit_code) = run_yq_stdin_with_stderr(".z + 1", &input, &[])?;
-    assert_eq!(exit_code, 0, "expected a clean exit, stderr: {stderr}");
-    assert_eq!(stdout.trim(), "43");
-    Ok(())
-}
+// Deep (non-cyclic) alias-chain recursion guard tests (#1193) used to live
+// here, built via a `deep_alias_chain` helper chaining `k1: &a1 *a0`-shaped
+// hops. #1374 closed off that exact shape at parse time (`&anchor *alias` is
+// invalid YAML - an alias node carries no properties of its own, and it was
+// the *only* way to construct an alias chain more than one hop deep), so a
+// multi-hop chain can no longer be built from input the parser accepts, and
+// the crash path those tests guarded is now unreachable. `MAX_ALIAS_CHAIN_DEPTH`
+// and its `assert_depth` calls remain in `src/yaml/light.rs` as defense in
+// depth against a hand-built index, per that constant's doc comment.
 
 // =============================================================================
 // Compatibility tests - Block scalar edge cases
@@ -11209,16 +11082,16 @@ fn test_alias_as_a_flow_mapping_key_resolves() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(output, "{\n  \"\": 3,\n  \"\": 4\n}\n");
 
-    // An anchor and an alias to it on the *same* node: the alias edge now lands on
-    // the node the anchor names, so this is a cycle by the `target == alias` arm of
-    // `validate_alias_acyclicity` rather than by its ancestor arm. It must stay an
-    // error — resolving it would be unbounded materialization.
+    // An anchor and an alias to it on the *same* node: `&x *x` is anchor-on-alias
+    // (#1374, invalid YAML - an alias node carries no properties of its own),
+    // rejected by the property check in `record_key_alias` before the cycle
+    // checker (`validate_alias_acyclicity`) would even see it.
     let (stdout, stderr, code) = run_yq_stdin_with_stderr(".", "{&x *x: 1}\n", &["-o=json"])?;
     assert_eq!(code, 1, "expected clean error exit, stderr: {stderr}");
     assert_eq!(stdout, "");
     assert!(
-        stderr.contains("cyclic alias 'x'"),
-        "stderr should name the cycle: {stderr}"
+        stderr.contains("cannot carry an anchor or tag"),
+        "stderr should name the property-on-alias rejection: {stderr}"
     );
     Ok(())
 }
@@ -11252,15 +11125,15 @@ fn test_alias_as_a_flow_sequence_key_resolves() -> Result<()> {
         assert_eq!(output.trim(), expected, "for {yaml:?}");
     }
 
-    // An anchor and an alias to it on the same key: must still be rejected as
-    // a cycle, the same as the flow-mapping key position above - this call
-    // path must not have quietly dropped `record_key_alias`'s cycle check.
+    // An anchor and an alias to it on the same key: must still be rejected,
+    // the same as the flow-mapping key position above - this call path must
+    // not have quietly dropped `record_key_alias`'s property check (#1374).
     let (stdout, stderr, code) = run_yq_stdin_with_stderr(".", "[&x *x: 1]\n", &["-o=json"])?;
     assert_eq!(code, 1, "expected clean error exit, stderr: {stderr}");
     assert_eq!(stdout, "");
     assert!(
-        stderr.contains("cyclic alias 'x'"),
-        "stderr should name the cycle: {stderr}"
+        stderr.contains("cannot carry an anchor or tag"),
+        "stderr should name the property-on-alias rejection: {stderr}"
     );
     Ok(())
 }
@@ -17286,17 +17159,19 @@ fn test_builtin_has_yq_type_mismatch_never_errors_917() -> Result<()> {
 /// resolving it at all; this crate's own alias-key resolution, correct or
 /// not, is a separate and out-of-scope question from this test).
 ///
-/// Two review rounds each found a different way to get this wrong:
 /// `contains` originally matched only a literal `String`-variant key,
 /// silently excluding `Alias` (reporting `false` for a key `keys`/`.`
 /// agreed existed, since `has()` used to reach a fully materializing path
-/// that resolves aliases before this native arm existed); a fix using the
-/// whole-value `as_str()` then over-resolved a **multi-hop** alias chain
-/// relative to `keys()`'s own single-hop resolution (`key_string_kind`),
-/// disagreeing with `keys()` again, just for a deeper chain. Both cases are
-/// pinned here since `key_display_string` (the eventual, shared fix) is the
-/// same function `keys()` itself is built on, and could in principle regress
-/// either shape again without the two staying wired together this way.
+/// that resolves aliases before this native arm existed) -- pinned here
+/// since `key_display_string` (the fix) is the same function `keys()`
+/// itself is built on, and could in principle regress this shape again.
+///
+/// A second review round found this native arm over-resolving relative to
+/// `keys()` on a **multi-hop** alias-typed key (`b: &y *x` then `c: *y: 2`,
+/// #1374's anchor-on-alias shape). #1374 closed that shape off at parse time
+/// (invalid YAML - an alias node carries no properties of its own, and it
+/// was the only way to build a multi-hop chain), so that regression is no
+/// longer reachable from valid input and its case is gone from this test.
 #[test]
 fn test_has_yq_alias_typed_key_matches_own_resolved_spelling_1739() -> Result<()> {
     // One-hop: an ordinary alias-typed key.
@@ -17307,23 +17182,6 @@ fn test_has_yq_alias_typed_key_matches_own_resolved_spelling_1739() -> Result<()
     let (out, code) = run_yq_stdin(".b | keys", one_hop, &["-o", "json", "-I0"])?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), r#"["hello"]"#);
-
-    // Two-hop: an alias to an alias used as a key. `keys()` only resolves
-    // one hop today (a separate, pre-existing gap of its own), so the
-    // *correct* answer here is that neither `has("hello")` (the fully
-    // resolved spelling) nor the raw key text matches -- only whatever
-    // `keys()` itself already reports (empty string, an unresolved
-    // complex-key fallback) should.
-    let two_hop = "a: &x hello\nb: &y *x\nc:\n  *y: 2\n";
-    let (out, code) = run_yq_stdin(r#".c | has("hello")"#, two_hop, &[])?;
-    assert_eq!(code, 0, "out: {out:?}");
-    assert_eq!(out.trim(), "false");
-    let (out, code) = run_yq_stdin(".c | keys", two_hop, &["-o", "json", "-I0"])?;
-    assert_eq!(code, 0, "out: {out:?}");
-    assert_eq!(out.trim(), r#"[""]"#);
-    let (out, code) = run_yq_stdin(r#".c | has("")"#, two_hop, &[])?;
-    assert_eq!(code, 0, "out: {out:?}");
-    assert_eq!(out.trim(), "true");
     Ok(())
 }
 
@@ -28031,7 +27889,12 @@ fn test_yq_string_repeat_cap_compound_assign_does_not_abort_1612() -> Result<()>
 /// `_ => false` default), so an alias resolving to `false`/`null` was
 /// silently reported as truthy regardless of what it pointed at. This is a
 /// pre-existing gap in `is_falsy` itself, newly load-bearing once `select`
-/// started relying on it. Covers a direct alias and a 2-hop chain.
+/// started relying on it.
+///
+/// Originally also covered a 2-hop chain (`a: &y *x`); #1374 closed off that
+/// anchor-on-alias shape at parse time (invalid YAML - an alias node carries
+/// no properties of its own, and it was the only way to build a multi-hop
+/// chain), so only the direct-alias case remains constructible.
 #[test]
 fn test_select_resolves_alias_falsiness_1645() -> Result<()> {
     let (stdout, _stderr, code) =
@@ -28048,17 +27911,6 @@ fn test_select_resolves_alias_falsiness_1645() -> Result<()> {
     assert_eq!(
         stdout, "",
         "an alias to `null` must be filtered out, not passed through"
-    );
-
-    let (stdout, _stderr, code) = run_yq_stdin_with_stderr(
-        "select(.b) | .keep",
-        "orig: &x false\na: &y *x\nb: *y\nkeep: 5\n",
-        &[],
-    )?;
-    assert_eq!(code, 0);
-    assert_eq!(
-        stdout, "",
-        "a 2-hop alias chain to `false` must be filtered out"
     );
 
     let (stdout, _stderr, code) =

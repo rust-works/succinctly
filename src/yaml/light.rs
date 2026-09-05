@@ -6152,6 +6152,13 @@ fn decode_failure(e: YamlStringError) -> StreamFailure {
 /// time one call can be forced to spend on a pathologically long,
 /// adversarially-crafted chain; picked generously (no legitimate document
 /// plausibly nears it) rather than against any specific measurement.
+///
+/// #1374 made `&anchor *alias` (anchoring an alias node) a parse-time
+/// rejection, and that shape was the *only* way to construct an alias
+/// chain more than one hop deep -- so an index built by `YamlIndex::build`
+/// from valid input can no longer reach depth 2, let alone this ceiling.
+/// This guard remains purely as defense in depth against a hand-built
+/// index that bypasses the parser's own checks.
 const MAX_ALIAS_CHAIN_DEPTH: usize = 65_536;
 
 impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
@@ -8082,36 +8089,21 @@ mod tests {
         }
     }
 
-    /// Builds YAML defining a `depth`-hop alias chain terminating in the
-    /// string `"hello"`, with a `z` field aliasing the last link (#1191 code
-    /// review: shared by the two tests below instead of each duplicating
-    /// this construction).
-    fn build_alias_chain_yaml(depth: usize) -> String {
-        let mut yaml = String::from("a0: &a0 hello\n");
-        for i in 1..depth {
-            yaml.push_str(&format!("a{i}: &a{i} *a{}\n", i - 1));
-        }
-        yaml.push_str(&format!("z: *a{}\n", depth - 1));
-        yaml
-    }
-
-    /// #1191 code review: `as_str()`'s `Alias` arm was first fixed by
-    /// self-recursing (`t.value().as_str()`), matching every sibling typed
-    /// accessor's own pre-existing shape -- but that shape has no depth
-    /// bound, and review found it drives a real, uncatchable stack overflow
-    /// on a long, non-cyclic alias chain (the same class of bug #1193
-    /// tracks for the other accessors). Confirms the actual fix
-    /// (`resolve_alias_chain`'s iterative walk) resolves a 50,000-hop
-    /// chain -- comfortably below `MAX_ALIAS_CHAIN_DEPTH` -- without
-    /// panicking or overflowing the stack, calling `DocumentValue::as_str()`
-    /// directly so this test can't be satisfied by some other, unrelated
-    /// code path (e.g. `type_name()`'s own still-unbounded recursion,
-    /// separately tracked by #1193) happening to also resolve correctly.
+    /// #1191/#1193 code review originally exercised `resolve_alias_chain`/
+    /// `resolve_alias_target_cursor` against a `depth`-hop alias chain built
+    /// via `a{i}: &a{i} *a{i-1}` (each link anchoring the previous alias).
+    /// #1374 closed that shape off at parse time (`&anchor *alias` is
+    /// invalid YAML -- an alias node carries no properties of its own, and
+    /// it was the *only* way to construct a chain more than one hop deep),
+    /// so a `YamlIndex::build`-produced index can no longer reach depth 2 by
+    /// any valid input, and the multi-hop/depth-cap tests that once lived
+    /// here are gone along with it. The two tests below keep 1-hop coverage
+    /// of the same iterative walk instead.
     #[test]
-    fn test_as_str_resolves_deep_alias_chain_without_stack_overflow_1191() {
+    fn test_as_str_resolves_one_hop_alias() {
         use crate::jq::document::DocumentValue;
 
-        let yaml = build_alias_chain_yaml(50_000);
+        let yaml = "a0: &a0 hello\nz: *a0\n";
         let index = YamlIndex::build(yaml.as_bytes()).unwrap();
         let root = index.root(yaml.as_bytes());
         let YamlValue::Mapping(fields) = first_doc(root) else {
@@ -8121,44 +8113,9 @@ mod tests {
         assert_eq!(z.as_str().as_deref(), Some("hello"));
     }
 
-    /// #1191 code review: the success-path test above never exercises
-    /// `MAX_ALIAS_CHAIN_DEPTH`'s own boundary, so an off-by-one in
-    /// `resolve_alias_chain`'s loop (e.g. `<=` vs `<`, or a shifted
-    /// increment) would go uncaught. A chain one hop *past* the ceiling must
-    /// panic cleanly (a controlled `assert_depth` failure), not silently
-    /// succeed and not stack-overflow.
     #[test]
-    #[should_panic(expected = "nesting depth exceeds limit")]
-    fn test_as_str_panics_past_max_alias_chain_depth_1191() {
-        use crate::jq::document::DocumentValue;
-
-        // `z`'s own hop is consumed by `as_str`'s outer match before
-        // `resolve_alias_chain` ever runs, so the chain it walks (starting
-        // at `z`'s target) is one hop shorter than `build_alias_chain_yaml`'s
-        // `depth` -- `+ 2`, not `+ 1`, is what actually pushes that inner
-        // walk past `MAX_ALIAS_CHAIN_DEPTH` (confirmed empirically: `+ 1`
-        // still resolves successfully with room to spare).
-        let yaml = build_alias_chain_yaml(MAX_ALIAS_CHAIN_DEPTH + 2);
-        let index = YamlIndex::build(yaml.as_bytes()).unwrap();
-        let root = index.root(yaml.as_bytes());
-        let YamlValue::Mapping(fields) = first_doc(root) else {
-            panic!("expected root document to be a mapping");
-        };
-        let z = fields.find("z").expect("z field must exist");
-        let _ = z.as_str();
-    }
-
-    /// #1193/PR #1314 code review: `YamlCursor::tag`'s own `Alias` arm had
-    /// the identical self-recursive shape as the typed accessors above
-    /// (`t.tag()`, re-entering itself once per hop) -- found live via a
-    /// direct call to this method (not reachable through the yq CLI's own
-    /// `tag` builtin, which operates on an already-materialized value, not
-    /// a cursor -- see `resolve_alias_target_cursor`'s doc comment for the
-    /// other methods in the same boat). Confirms the fix resolves a
-    /// 50,000-hop chain without panicking or overflowing the stack.
-    #[test]
-    fn test_tag_resolves_deep_alias_chain_without_stack_overflow_1193() {
-        let yaml = build_alias_chain_yaml(50_000);
+    fn test_tag_resolves_one_hop_alias() {
+        let yaml = "a0: &a0 hello\nz: *a0\n";
         let index = YamlIndex::build(yaml.as_bytes()).unwrap();
         let root = index.root(yaml.as_bytes());
         let YamlValue::Mapping(fields) = first_doc(root) else {
@@ -8166,23 +8123,6 @@ mod tests {
         };
         let z_cursor = fields.find_cursor("z").expect("z field must exist");
         assert_eq!(z_cursor.tag(), "!!str");
-    }
-
-    /// #1193/PR #1314 code review: the success-path test above never
-    /// exercises `MAX_ALIAS_CHAIN_DEPTH`'s own boundary for `tag()` -- see
-    /// `test_as_str_panics_past_max_alias_chain_depth_1191`'s matching
-    /// rationale and its `+ 2` note, which applies identically here.
-    #[test]
-    #[should_panic(expected = "nesting depth exceeds limit")]
-    fn test_tag_panics_past_max_alias_chain_depth_1193() {
-        let yaml = build_alias_chain_yaml(MAX_ALIAS_CHAIN_DEPTH + 2);
-        let index = YamlIndex::build(yaml.as_bytes()).unwrap();
-        let root = index.root(yaml.as_bytes());
-        let YamlValue::Mapping(fields) = first_doc(root) else {
-            panic!("expected root document to be a mapping");
-        };
-        let z_cursor = fields.find_cursor("z").expect("z field must exist");
-        let _ = z_cursor.tag();
     }
 
     /// #1247 coverage: `YamlStringError::message()`'s `InvalidUtf8` arm and
@@ -8206,18 +8146,22 @@ mod tests {
 
     /// #1247 code review: `string_decode_error()`'s `Alias` arm resolves the
     /// *whole* alias chain first (mirroring `as_str`'s own #1191 fix, per
-    /// the doc comment directly above the `Alias` arm), so a 2+-hop alias to
-    /// an undecodable string still reports the decode failure instead of
-    /// silently answering "not a decode failure" after only one hop. Never
-    /// exercised directly before — builds a 2-hop chain (`z` -> `a1` ->
-    /// `a0`) terminating in a double-quoted string with an invalid escape
-    /// sequence (`\q`, not one of the recognized single-char escapes), then
-    /// calls `string_decode_error()` on the still-unresolved `Alias` value.
+    /// the doc comment directly above the `Alias` arm), so an alias to an
+    /// undecodable string still reports the decode failure instead of
+    /// silently answering "not a decode failure". Never exercised directly
+    /// before — originally built a 2-hop chain (`z` -> `a1` -> `a0`), but
+    /// #1374 closed off that anchor-on-alias shape at parse time (invalid
+    /// YAML -- an alias node carries no properties of its own, and it was
+    /// the only way to build a multi-hop chain), so this is now 1-hop
+    /// (`z` -> `a0`) terminating in a double-quoted string with an invalid
+    /// escape sequence (`\q`, not one of the recognized single-char
+    /// escapes), then calls `string_decode_error()` on the still-unresolved
+    /// `Alias` value.
     #[test]
     fn test_string_decode_error_resolves_alias_chain_1247() {
         use crate::jq::document::DocumentValue;
 
-        let yaml = "a0: &a0 \"bad\\qescape\"\na1: &a1 *a0\nz: *a1\n";
+        let yaml = "a0: &a0 \"bad\\qescape\"\nz: *a0\n";
         let index = YamlIndex::build(yaml.as_bytes()).unwrap();
         let root = index.root(yaml.as_bytes());
         let YamlValue::Mapping(fields) = first_doc(root) else {

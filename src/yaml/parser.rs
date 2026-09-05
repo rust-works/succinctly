@@ -179,6 +179,17 @@ struct Parser<'a, const HAS_CR: bool> {
     aliases: BTreeMap<usize, usize>,
     /// Explicit source tags collected during parsing: bp_pos → raw tag text
     tags: BTreeMap<usize, String>,
+    /// `bp_pos` of the node an anchor or tag was just scanned for, if that
+    /// node hasn't opened yet. An alias node opening at this same `bp_pos`
+    /// would mean the property was meant for it — invalid per the YAML 1.2
+    /// grammar (an alias node carries no properties of its own), and
+    /// rejected by real yq/PyYAML (#1374).
+    ///
+    /// Never needs clearing: `bp_pos` only ever increases (every
+    /// [`Self::write_bp_open`]/[`Self::write_bp_close`] call increments it),
+    /// so a stale value can only equal the position of the exact node the
+    /// property was scanned for — never any later node.
+    pending_property_bp: Option<usize>,
     /// Trailing same-line comments collected during parsing: bp_pos of the
     /// owning node → `(start, end)` byte range of the raw `#...` comment text.
     /// See [`SemiIndex::line_comments`].
@@ -288,6 +299,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             anchors: BTreeMap::new(),
             aliases: BTreeMap::new(),
             tags: BTreeMap::new(),
+            pending_property_bp: None,
             line_comments: BTreeMap::new(),
             pending_head_comment: None,
             in_document: false,
@@ -4951,6 +4963,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // YAML allows anchor redefinition - later definitions override earlier ones
         // Store placeholder - will be updated when value BP is opened
         self.anchors.insert(name.clone(), self.bp_pos);
+        self.pending_property_bp = Some(self.bp_pos);
 
         Ok(name)
     }
@@ -4972,6 +4985,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         let name = self.parse_anchor_name()?;
         self.skip_inline_whitespace();
         self.anchors.insert(name, self.bp_pos - 1);
+        self.pending_property_bp = Some(self.bp_pos - 1);
         Ok(())
     }
 
@@ -4999,6 +5013,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         self.advance();
         // Alias names follow the anchor-name rules.
         let name = self.parse_anchor_name()?;
+        // An anchor/tag scanned for this same (already-open) key node just
+        // above means the property was meant for this alias - invalid, since
+        // an alias node carries no properties of its own (#1374).
+        if self.pending_property_bp == Some(self.bp_pos - 1) {
+            return Err(YamlError::PropertyOnAlias {
+                offset: alias_start,
+                name,
+            });
+        }
         match self.anchors.get(&name) {
             Some(&target_bp_pos) => {
                 self.aliases.insert(self.bp_pos - 1, target_bp_pos);
@@ -5018,6 +5041,21 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// Parse an alias reference (`*name`).
     /// Creates a leaf node in the BP tree pointing to the aliased value.
     fn parse_alias(&mut self) -> Result<(), YamlError> {
+        // An anchor/tag scanned for the node about to open here means the
+        // property was meant for this alias - invalid, since an alias node
+        // carries no properties of its own (#1374). Check before opening the
+        // node so the rejected alias never enters the BP tree.
+        if self.pending_property_bp == Some(self.bp_pos) {
+            // Offset of the `*`, so the error points at the alias itself.
+            let alias_start = self.pos;
+            self.advance();
+            let name = self.parse_anchor_name()?;
+            return Err(YamlError::PropertyOnAlias {
+                offset: alias_start,
+                name,
+            });
+        }
+
         // Mark alias position
         self.set_ib();
         self.write_bp_open();
@@ -5115,6 +5153,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 Some(b'!') => {
                     let tag = self.parse_tag()?;
                     self.tags.insert(self.bp_pos, tag);
+                    self.pending_property_bp = Some(self.bp_pos);
                     self.skip_inline_whitespace();
                     had_property = true;
                 }
@@ -5148,6 +5187,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 Some(b'!') => {
                     let tag = self.parse_tag()?;
                     self.tags.insert(self.bp_pos, tag);
+                    self.pending_property_bp = Some(self.bp_pos);
                     self.skip_flow_whitespace();
                     had_property = true;
                 }
@@ -5167,6 +5207,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         let tag = self.parse_tag()?;
         self.skip_inline_whitespace();
         self.tags.insert(self.bp_pos - 1, tag);
+        self.pending_property_bp = Some(self.bp_pos - 1);
         Ok(())
     }
 
@@ -5564,6 +5605,17 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                         Some(b'{' | b'[') => {
                             // Property before flow collection
                             self.parse_value(indent)?;
+                        }
+                        Some(b'*') => {
+                            // Property before alias (`&a *b`) at document-root
+                            // level - invalid (an alias node carries no
+                            // properties of its own); route through
+                            // `parse_alias`, whose `pending_property_bp`
+                            // check rejects it (#1374). Real yq accepts this
+                            // specific shape but emits corrupted output
+                            // rather than erroring - reject uniformly
+                            // instead, per docs/compliance/yq/limitations.md.
+                            self.parse_alias()?;
                         }
                         _ => {
                             // Scalar value - only doc_root if not inside a container

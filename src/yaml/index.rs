@@ -1421,9 +1421,27 @@ mod tests {
         expect_alias_cycle("a: &anchor\n  self: *anchor", "anchor", "*anchor");
     }
 
+    /// `&x *x` is anchor-on-alias (#1374, invalid YAML -- an alias node
+    /// carries no properties of its own) as well as a would-be self-cycle;
+    /// the property check in `parse_alias` rejects it before the cycle
+    /// checker (`validate_alias_acyclicity`) ever runs, so the error here is
+    /// `PropertyOnAlias`, not `AliasCycle` — unlike this file's other
+    /// `expect_alias_cycle` cases, which all cycle through a *nested*
+    /// structure rather than decorating the alias itself.
     #[test]
     fn test_build_rejects_direct_self_alias() {
-        expect_alias_cycle("a: &x *x", "x", "*x");
+        let yaml = "a: &x *x";
+        let expected_offset = yaml.find("*x").expect("alias text present in input");
+        let Err(err) = YamlIndex::build(yaml.as_bytes()) else {
+            panic!("anchor-on-alias must be rejected at build time");
+        };
+        match err {
+            YamlError::PropertyOnAlias { offset, name } => {
+                assert_eq!(name, "x");
+                assert_eq!(offset, expected_offset);
+            }
+            other => panic!("expected PropertyOnAlias, got {other:?}"),
+        }
     }
 
     #[test]

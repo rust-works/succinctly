@@ -93,6 +93,17 @@ pub enum YamlError {
         name: String,
     },
 
+    /// An alias node (`*name`) was itself decorated with an anchor or tag
+    /// (`&other *name` / `!!str *name`). Per the YAML 1.2 grammar an alias
+    /// node carries no node properties of its own - real yq and PyYAML both
+    /// reject this (#1374).
+    PropertyOnAlias {
+        /// Byte offset of the alias (`*name`)
+        offset: usize,
+        /// The referenced anchor name
+        name: String,
+    },
+
     /// Tag not supported - kept for backwards compatibility but no longer used.
     #[deprecated(note = "Tags are now supported (#224)")]
     TagNotSupported {
@@ -227,6 +238,12 @@ impl fmt::Display for YamlError {
             Self::UnknownAnchor { offset, name } => {
                 write!(f, "unknown anchor '{name}' referenced at offset {offset}")
             }
+            Self::PropertyOnAlias { offset, name } => {
+                write!(
+                    f,
+                    "alias '*{name}' at offset {offset} cannot carry an anchor or tag (an alias node has no node properties)"
+                )
+            }
             #[allow(deprecated)]
             // STYLE-0004: Display arm for a deprecated error variant kept for back-compat
             Self::TagNotSupported { offset } => {
@@ -359,6 +376,18 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "cyclic alias 'anchor' at offset 20 (anchor value contains itself)"
+        );
+    }
+
+    #[test]
+    fn test_property_on_alias_display() {
+        let err = YamlError::PropertyOnAlias {
+            offset: 11,
+            name: "a0".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "alias '*a0' at offset 11 cannot carry an anchor or tag (an alias node has no node properties)"
         );
     }
 
