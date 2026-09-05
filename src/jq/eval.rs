@@ -16114,7 +16114,7 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Ok(v) => v,
             Err(e) => return suppress_or_raise(e, optional),
         };
-        return eval_path_context_pipe_owned::<W, S>(exprs, &owned, optional);
+        return eval_path_context_pipe_owned::<W, S>(exprs, &owned, optional, None);
     }
 
     if exprs.is_empty() {
@@ -18807,18 +18807,33 @@ pub fn eval_owned_with_file_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>
     input: &OwnedValue,
     file_origin: &[usize],
 ) -> QueryResult<'a, W> {
-    if needs_path_context(expr) {
-        eval_pipe_with_path_context_internal::<W, S>(
+    if !needs_path_context(expr) {
+        return eval_owned_input::<W, S>(expr, input, false);
+    }
+    // Spine 2416 step 5: through the one gate, like every other path-context
+    // entry, instead of straight into the eager evaluator (the audit's
+    // "door 2", `docs/plan/path-context-arm-reachability.md`).
+    // [`eval_path_context_pipe_owned`] reindexes the combined array into a
+    // throwaway document and hands the generic evaluator its root cursor,
+    // where `file_index` is a property of the node like `key` and `path`
+    // are -- so a pipe the gate keeps generic (`.[] | file_index`,
+    // `select(file_index == 1)`) is answered without materializing the whole
+    // combined array a second time, and one it hands back to the eager
+    // evaluator (`.[] | file_index + 1`, which has no native arithmetic arm
+    // yet, ADR-0021) reads the identical table.
+    //
+    // The table is ambient for the whole evaluation rather than a parameter
+    // because the cursor route answers `file_index` in `eval_builtin`, which
+    // has no route-specific argument to carry it -- see
+    // `eval_generic::file_origin`.
+    super::eval_generic::with_file_origin(file_origin, || {
+        eval_path_context_pipe_owned::<W, S>(
             core::slice::from_ref(expr),
             input,
-            input,
-            Some(file_origin),
-            &[],
             false,
+            Some(file_origin),
         )
-    } else {
-        eval_owned_input::<W, S>(expr, input, false)
-    }
+    })
 }
 
 // =============================================================================
@@ -31655,17 +31670,41 @@ fn eval_path_context_pipe_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     exprs: &[Expr],
     owned: &OwnedValue,
     optional: bool,
+    file_origin: Option<&[usize]>,
 ) -> QueryResult<'a, W> {
-    use super::eval_generic::{path_context_needs_eager, reindex_bridge_is_identity};
+    use super::eval_generic::{
+        path_context_needs_eager, reindex_bridge_is_identity, FILE_ORIGIN_SCOPE_AVAILABLE,
+    };
+    // A `--eval-all` table that this build cannot make ambient is the third
+    // reason to stay eager: there the table is an ordinary parameter, so the
+    // answer is the pre-step-5 one rather than a `file_index` silently stubbed
+    // to `0` (see `eval_generic::FILE_ORIGIN_SCOPE_AVAILABLE`). Spelled with
+    // `matches!` rather than `Option::is_none_or`, which postdates this
+    // crate's MSRV.
+    let table_needs_ambient = matches!(file_origin, Some(table) if !table.is_empty());
     // The gate call stays *in the condition* -- `tests/jq_path_context_
     // single_door_guard.rs` reads the `if` itself, and a boolean bound above
-    // it reads as gated to a human but not to that scan. The round-trip test
-    // is bound, because spelling it inline makes
+    // it reads as gated to a human but not to that scan. The other two reasons
+    // are bound, because spelling them inline makes
     // `clippy::suspicious_operation_groupings` read the two different
     // arguments (`exprs`, `owned`) as a typo.
     let round_trip_is_lossless = reindex_bridge_is_identity(owned);
-    if path_context_needs_eager(exprs) || !round_trip_is_lossless {
-        return eval_pipe_with_path_context::<W, S>(exprs, owned, &[], optional);
+    let table_would_be_lost = table_needs_ambient && !FILE_ORIGIN_SCOPE_AVAILABLE;
+    if path_context_needs_eager(exprs) || !round_trip_is_lossless || table_would_be_lost {
+        return match file_origin {
+            // `--eval-all`'s own call: hand the eager evaluator the table
+            // directly rather than making it read back the ambient copy this
+            // same call installed.
+            Some(table) => eval_pipe_with_path_context_internal::<W, S>(
+                exprs,
+                owned,
+                owned,
+                Some(table),
+                &[],
+                optional,
+            ),
+            None => eval_pipe_with_path_context::<W, S>(exprs, owned, &[], optional),
+        };
     }
 
     // Same throwaway document `eval_owned_input_reindexed` builds, and the
@@ -31689,10 +31728,24 @@ pub(crate) fn eval_pipe_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSe
     optional: bool,
 ) -> QueryResult<'a, W> {
     // Call the internal version with root value. `file_origin` is only ever
-    // `Some` for `--eval-all`'s combined-array evaluation, which calls
-    // `eval_pipe_with_path_context_internal` directly (see
-    // `eval_owned_with_file_index`) rather than through this wrapper.
-    eval_pipe_with_path_context_internal::<W, S>(exprs, value, value, None, current_path, optional)
+    // installed for `--eval-all`'s combined-array evaluation (#715), and
+    // since spine 2416 step 5 it arrives as the ambient table
+    // `eval_generic::with_file_origin` scopes rather than as an argument
+    // `eval_owned_with_file_index` threaded by calling
+    // `eval_pipe_with_path_context_internal` directly -- that direct call
+    // was the audit's "door 2", and closing it is what lets `--eval-all`
+    // route through the generic evaluator like every other entry while the
+    // pipes this gate still hands back here keep answering `file_index`
+    // from the same table.
+    let file_origin = super::eval_generic::current_file_origin();
+    eval_pipe_with_path_context_internal::<W, S>(
+        exprs,
+        value,
+        value,
+        file_origin.as_deref(),
+        current_path,
+        optional,
+    )
 }
 
 /// Fold one fan-out step's result into `results`, matching the project's
