@@ -5098,14 +5098,17 @@ impl<'a> Parser<'a> {
 
     /// Parse a complete expression — jq's `Exp`, and this grammar's entry point.
     ///
-    /// The precedence order below `Exp` is, loosest first:
+    /// **The relative precedence of `|` and `,` is mode-dependent**, because the
+    /// two reference tools rank them the opposite way round (ADR-0018 rule 2:
+    /// mode decides, never the input format). In jq mode the order below `Exp`
+    /// is, loosest first:
     ///
     /// ```text
     /// parse_expr        Exp   := parse_pipe_expr
-    /// parse_pipe_expr         := parse_comma_expr ( '|' parse_comma_expr )*
-    /// parse_comma_expr        := parse_binding    ( ',' parse_binding    )*
+    /// parse_pipe_expr         := parse_comma_expr    ( '|' parse_comma_expr    )*
+    /// parse_comma_expr        := parse_binding       ( ',' parse_binding       )*
     /// parse_binding           := parse_assignment [ "as" Patterns '|' parse_expr ]
-    /// parse_obj_val     ExpD  := parse_binding    ( '|' parse_binding    )*
+    /// parse_obj_val     ExpD  := parse_binding       ( '|' parse_binding       )*
     /// ```
     ///
     /// `|` is the *loosest* operator and `,` binds tighter, matching jq's
@@ -5113,12 +5116,64 @@ impl<'a> Parser<'a> {
     /// the wrong way round made `1,2,3 | . * 2` mean `1, 2, (3 | . * 2)` and
     /// print `1 2 6` instead of `2 4 6` — silent data loss, since every
     /// comma branch but the last lost its transformation (#462).
+    ///
+    /// In yq mode the two levels are **swapped**:
+    ///
+    /// ```text
+    /// parse_expr        Exp   := parse_yq_comma_expr
+    /// parse_yq_comma_expr     := parse_pipe_no_comma ( ',' parse_pipe_no_comma )*
+    /// parse_pipe_no_comma     := parse_binding       ( '|' parse_binding       )*
+    /// ```
+    ///
+    /// Real yq's parser is a shunting-yard operator-precedence parser whose own
+    /// table (`pkg/yqlib/operation.go`, v4.53.3) gives `pipeOpType` precedence
+    /// **30** and `unionOpType` (`,`) precedence **10** — pipe binds *tighter*
+    /// than comma, so `A, B | C` is `A, (B | C)`, not jq's `(A, B) | C`. This is
+    /// a fixed entry in that table, so it holds at every nesting depth: explicit
+    /// parentheses restore jq's grouping (they are a boundary the shunting yard
+    /// cannot see across), construction brackets do not — `[.a, .b | . + 10]` is
+    /// `[1,12]` on real yq where jq gives `[11,12]` (#2420). Note that
+    /// `parse_pipe_no_comma` is literally jq's own `ExpD` production, reused
+    /// here: "a pipe chain that stops at a comma" is exactly what yq's higher
+    /// pipe precedence makes each comma operand.
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
-        self.parse_pipe_expr()
+        match self.mode {
+            ParserMode::Jq => self.parse_pipe_expr(),
+            ParserMode::Yq => self.parse_yq_comma_expr(),
+        }
+    }
+
+    /// Parse a yq-mode expression: `chain , chain , ...`, where each operand is
+    /// a whole pipe chain rather than jq's single comma operand.
+    ///
+    /// The mirror image of [`Self::parse_pipe_expr`], and reached only from
+    /// [`Self::parse_expr`] under [`ParserMode::Yq`]. See that method's doc for
+    /// the precedence numbers this encodes.
+    fn parse_yq_comma_expr(&mut self) -> Result<Expr, ParseError> {
+        let first = self.parse_pipe_no_comma()?;
+        self.skip_ws();
+
+        if self.peek() != Some(',') {
+            return Ok(first);
+        }
+
+        let mut exprs = vec![first];
+
+        while self.peek() == Some(',') {
+            self.next();
+            self.skip_ws();
+            exprs.push(self.parse_pipe_no_comma()?);
+            self.skip_ws();
+        }
+
+        Ok(Expr::comma(exprs))
     }
 
     /// Parse a pipe expression: `stage | stage | ...`, where each stage is a
     /// comma list.
+    ///
+    /// jq mode only — yq ranks the two operators the other way round and goes
+    /// through [`Self::parse_yq_comma_expr`] instead (#2420).
     fn parse_pipe_expr(&mut self) -> Result<Expr, ParseError> {
         let first = self.parse_comma_expr()?;
         self.skip_ws();
@@ -5140,6 +5195,8 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse one pipe stage: `expr, expr, ...`.
+    ///
+    /// jq mode only, as the sole caller [`Self::parse_pipe_expr`] is.
     fn parse_comma_expr(&mut self) -> Result<Expr, ParseError> {
         let first = self.parse_binding()?;
         self.skip_ws();
@@ -5247,7 +5304,7 @@ impl<'a> Parser<'a> {
     /// Parse a pipe expression that stops at a `,` — deliberately *not* a full
     /// [`Self::parse_expr`].
     ///
-    /// Exactly two kinds of position want this, and no others:
+    /// Exactly three kinds of position want this, and no others:
     ///
     /// 1. **Object-construction values**, jq's `ExpD` production. Inside
     ///    `{...}` a `,` separates entries, so `{a: 1, b: 2}` must not read
@@ -5256,6 +5313,10 @@ impl<'a> Parser<'a> {
     ///    crate's rather than jq's: jq's `$n` parameter convention fans the
     ///    whole call out once per output of `n`, which is not implemented here,
     ///    so `n` stays single-valued instead of silently taking one branch.
+    /// 3. **Every comma operand in yq mode** ([`Self::parse_yq_comma_expr`]),
+    ///    where real yq's own precedence table ranks `|` (30) above `,` (10),
+    ///    making "a pipe chain that stops at a comma" the whole of one comma
+    ///    operand rather than a restricted sub-position (#2420).
     ///
     /// Every *other* body that once called this — `if` branches, `def` bodies,
     /// `reduce`/`foreach` slots, `label` bodies, string interpolation — is a
@@ -5994,6 +6055,77 @@ mod tests {
 
         // A comma with no pipe is still a bare comma — no spurious Pipe wrapper.
         assert_eq!(parse("1,2").unwrap(), Expr::Comma(vec![int(1), int(2)]));
+    }
+
+    /// The mirror image of the test above, for yq mode (#2420).
+    ///
+    /// Real yq's precedence table (`pkg/yqlib/operation.go`, v4.53.3) gives
+    /// `pipeOpType` **30** and `unionOpType` (`,`) **10**, so `A, B | C` is
+    /// `A, (B | C)` there — the opposite of jq's `parser.y`. ADR-0018 rule 2
+    /// says the *mode* decides, so the load-bearing assertion here is that the
+    /// **same source text parses to two different ASTs** depending on
+    /// `ParserMode`, not that either shape exists in isolation.
+    #[test]
+    fn test_yq_mode_pipe_binds_tighter_than_comma_2420() {
+        let int = |i: i64| Expr::Literal(Literal::number_literal(i.to_string()));
+        let yq = |s: &str| parse_with_mode(s, ParserMode::Yq).unwrap();
+
+        // One text, two modes, two shapes.
+        assert_eq!(
+            parse("1,2 | 3").unwrap(),
+            Expr::Pipe(vec![Expr::Comma(vec![int(1), int(2)]), int(3)])
+        );
+        assert_eq!(
+            yq("1,2 | 3"),
+            Expr::Comma(vec![int(1), Expr::Pipe(vec![int(2), int(3)])])
+        );
+
+        // The comma stays n-ary at the top and every operand is a whole pipe
+        // chain, so `1,2 | 3,4` is three operands, not two comma stages.
+        assert_eq!(
+            yq("1,2 | 3,4"),
+            Expr::Comma(vec![int(1), Expr::Pipe(vec![int(2), int(3)]), int(4)])
+        );
+
+        // `.a | 1,2 | .b` is `(.a | 1), (2 | .b)` — two independent chains.
+        assert_eq!(
+            yq(".a | 1,2 | .b"),
+            Expr::Comma(vec![
+                Expr::Pipe(vec![Expr::Field("a".into()), int(1)]),
+                Expr::Pipe(vec![int(2), Expr::Field("b".into())]),
+            ])
+        );
+
+        // Parentheses are a boundary the shunting yard cannot see across, so
+        // they restore jq's grouping in yq mode too.
+        assert_eq!(
+            yq("(1,2) | 3"),
+            Expr::Pipe(vec![
+                Expr::Paren(Box::new(Expr::Comma(vec![int(1), int(2)]))),
+                int(3),
+            ])
+        );
+
+        // Construction brackets are *not* such a boundary: they scope
+        // evaluation, not precedence.
+        assert_eq!(
+            yq("[1,2 | 3]"),
+            Expr::Array(Box::new(Expr::Comma(vec![
+                int(1),
+                Expr::Pipe(vec![int(2), int(3)]),
+            ])))
+        );
+        assert_eq!(
+            parse("[1,2 | 3]").unwrap(),
+            Expr::Array(Box::new(Expr::Pipe(vec![
+                Expr::Comma(vec![int(1), int(2)]),
+                int(3),
+            ])))
+        );
+
+        // Neither operator alone changes shape, in either mode.
+        assert_eq!(yq("1,2"), Expr::Comma(vec![int(1), int(2)]));
+        assert_eq!(yq("1 | 2"), Expr::Pipe(vec![int(1), int(2)]));
     }
 
     /// `as` binds below the comma: its body swallows the rest of the

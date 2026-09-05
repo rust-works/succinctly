@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`succinctly yq` now ranks `|` above `,`, as real yq does — `A, B | C` means
+  `A, (B | C)` in yq mode, not jq's `(A, B) | C`** (#2420). yq's parser is a
+  shunting-yard operator-precedence parser and its own table
+  (`pkg/yqlib/operation.go`, v4.53.3) gives `pipeOpType` precedence **30** and
+  `unionOpType` (`,`) precedence **10** — pipe binds *tighter*. jq's `parser.y`
+  ranks them the other way (`%right '|'` declared before `%left ','`), and
+  succinctly applied jq's ranking in *both* modes. Per ADR-0018 rule 2 the mode
+  decides, never the input format, so `succinctly jq` is unchanged and
+  `succinctly yq` follows yq here whether the input is YAML or JSON:
+
+  ```console
+  $ printf 'a: 1\nb: 2\n' | succinctly yq -o=json -I0 '.a, .b | . + 10'
+  1                                  # was: 11
+  12                                 # real yq v4.53.3 prints 1 then 12
+  $ echo '{"a":1,"b":2}' | succinctly jq -c '.a, .b | . + 10'
+  11                                 # unchanged; real jq 1.7.1 prints 11 then 12
+  12
+  ```
+
+  This is a fixed entry in yq's operator table, so it holds at every nesting
+  depth rather than only at top level. Explicit parentheses restore jq's
+  grouping (`(.a, .b) | . + 10` is `11`/`12` in both modes) because they are a
+  boundary the shunting yard cannot see across; **construction brackets do
+  not** — `[.a, .b | . + 10]` is `[1,12]` in yq mode and `[11,12]` in jq mode.
+  Any existing yq-mode filter that combines an unparenthesised `,` and `|` at
+  the same bracket depth changes meaning; parenthesise the comma branch to keep
+  the old grouping.
+
 - **The "materialization ignores a live `optional`" gap is now a build failure, not a
   sweep** (#2334). The same bug shipped three times — #2231, #2280, #2327 — each round's
   review finding sites the last sweep missed, several of them the direct sibling of a

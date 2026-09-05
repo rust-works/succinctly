@@ -12625,6 +12625,31 @@ fn test_mid_chain_identity_does_not_discard_rest_of_write_path_yq_2241() -> Resu
 /// evaluator #554's fix above already established this file needs its own
 /// coverage for, not just `jq_cli_tests.rs`'s (a jq-scoped fix to shared
 /// evaluator code can silently regress yq without a dedicated check).
+///
+/// #2420's audit flagged the `def f: 5; f, key` case as depending on jq's
+/// comma/pipe grouping. Re-captured against yq v4.53.3 on this test's own
+/// input, it does not: real yq has no `def` at all, and rejects the whole
+/// filter before precedence is ever consulted --
+///
+/// ```console
+/// $ printf 'a: 1\n' | yq -o=json -I0 '.a | def f: 5; f, key'
+/// Error: 1:6: lexer: invalid input text "def f: 5; f, key"   (exit 1)
+/// $ printf 'a: 1\n' | yq -o=json -I0 '.a | def f: 5; f'
+/// Error: 1:6: lexer: invalid input text "def f: 5; f"        (exit 1)
+/// ```
+///
+/// -- with or without the comma. `def` in yq mode is a pre-existing,
+/// separately-scoped succinctly extension (an ungated one, unlike #1512's
+/// family), and `Expr::FuncDef`'s `then` clause is a full `Exp` in both
+/// modes, so the comma lands *inside* the pipe's right-hand side either way
+/// and #2420's precedence swap leaves the expectations below unchanged. The
+/// row is recorded here rather than silently left as an unverified
+/// assertion. The one line real yq does answer is the interpolation:
+///
+/// ```console
+/// $ printf 'a: 1\n' | yq -o=json -I0 '.a | "k=\(key)"'
+/// "k=a"
+/// ```
 #[test]
 fn test_string_interpolation_and_func_def_path_context_yq_1334_1306() -> Result<()> {
     let (output, code) = run_yq_stdin(r#".a | "k=\(key)""#, "a: 1\n", &["-o", "json", "-I0"])?;
@@ -15398,30 +15423,89 @@ fn test_eval_all_file_index_bare() -> Result<()> {
 /// operand to its first value whenever the pipe also needed path context
 /// (e.g. shared a comma with `file_index`) -- the same #768 bug class, in a
 /// call site #768 didn't touch.
+///
+/// #2420 moved the unparenthesised spelling's comma *outside* the pipe in yq
+/// mode, which would have retired the #822 coverage entirely (`file_index`
+/// would no longer share a pipe with the fan-out). The original shape is
+/// therefore kept, spelled with the parentheses that now express it, and the
+/// unparenthesised text is pinned alongside it for the new grouping.
+///
+/// Re-captured on this test's own two fixtures against real yq v4.53.3.
+/// succinctly's `--eval-all` is real yq's `eval-all`/`ea` subcommand (v4.53.3
+/// has no such *flag*), so `yq ea` is the oracle:
+///
+/// ```console
+/// $ yq ea -o=json -I0 '.[] | ((1,2,3) + 1), file_index'         f1 f2
+/// 2 3 4 2 3 4 2 3 4 2 3 4 0 1        # 14 lines
+/// $ yq ea -o=json -I0 '.[] | (((1,2,3) + 1), file_index)'       f1 f2
+/// 2 3 4 2 3 4 2 3 4 2 3 4 0 0 1 1    # 16 lines
+/// ```
+///
+/// succinctly's counts differ from both -- yq evaluates each operator over
+/// the whole *context list* the pipe's left side produced, so its `(1,2,3)`
+/// fan-out and its `file_index` are each replayed once per context, where
+/// succinctly (like jq) pipes each left-hand value independently. That
+/// evaluation-model divergence is separate from #2420's precedence table and
+/// is not what this test pins; what it pins is that the fan-out is not
+/// collapsed to its first value, which is #822's actual subject.
 #[test]
 fn test_eval_all_arithmetic_fanout_survives_file_index_in_pipe_issue_822() -> Result<()> {
     let (f1, f2) = two_doc_fixtures()?;
+
+    // #822's shape: the comma shares a pipe with `file_index`, so the
+    // path-context walk must not collapse `(1,2,3) + 1` to `2`.
+    let (stdout, _stderr, code) = run_yq_files(
+        ".[] | (((1,2,3) + 1), file_index)",
+        &[f1.path(), f2.path()],
+        &["--eval-all", "-o", "json"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "2\n3\n4\n0\n2\n3\n4\n1");
+
+    // #2420's shape: unparenthesised, the comma is now the outermost
+    // operator, so this is `(.[] | ((1,2,3) + 1)), file_index` -- the
+    // fan-out still survives (twice, once per document), and `file_index`
+    // is evaluated against the combined input rather than per document.
     let (stdout, _stderr, code) = run_yq_files(
         ".[] | ((1,2,3) + 1), file_index",
         &[f1.path(), f2.path()],
         &["--eval-all", "-o", "json"],
     )?;
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "2\n3\n4\n0\n2\n3\n4\n1");
+    assert_eq!(stdout.trim(), "2\n3\n4\n2\n3\n4\n0");
+
     Ok(())
 }
 
-/// Same #822 gap, for `Expr::Compare`.
+/// Same #822 gap, for `Expr::Compare` -- and the same #2420 re-capture as the
+/// test above, whose doc comment carries the full oracle rows:
+///
+/// ```console
+/// $ yq ea -o=json -I0 '.[] | ((1,2,3) > 1), file_index'   f1 f2
+/// false true true (x4) 0 1              # 14 lines
+/// $ yq ea -o=json -I0 '.[] | (((1,2,3) > 1), file_index)' f1 f2
+/// false true true (x4) 0 0 1 1          # 16 lines
+/// ```
 #[test]
 fn test_eval_all_compare_fanout_survives_file_index_in_pipe_issue_822() -> Result<()> {
     let (f1, f2) = two_doc_fixtures()?;
+
+    let (stdout, _stderr, code) = run_yq_files(
+        ".[] | (((1,2,3) > 1), file_index)",
+        &[f1.path(), f2.path()],
+        &["--eval-all", "-o", "json"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "false\ntrue\ntrue\n0\nfalse\ntrue\ntrue\n1");
+
     let (stdout, _stderr, code) = run_yq_files(
         ".[] | ((1,2,3) > 1), file_index",
         &[f1.path(), f2.path()],
         &["--eval-all", "-o", "json"],
     )?;
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "false\ntrue\ntrue\n0\nfalse\ntrue\ntrue\n1");
+    assert_eq!(stdout.trim(), "false\ntrue\ntrue\nfalse\ntrue\ntrue\n0");
+
     Ok(())
 }
 
@@ -30776,6 +30860,234 @@ fn test_map_path_context_scalar_target_noops_in_yq_mode_2375() -> Result<()> {
     let (out, code) = run_yq_stdin(".a | map(key)", "a: {b: 1}\n", args)?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), r#"["b"]"#);
+
+    Ok(())
+}
+
+// =============================================================================
+// #2420: yq ranks `|` (precedence 30) above `,` (precedence 10)
+// =============================================================================
+
+/// Every filter below was captured live from the pinned oracles before the
+/// parser change landed: Homebrew `yq` v4.53.3 on `a: 1\nb: 2\nc: 3\n` with
+/// `-o=json -I0`, and `/usr/bin/jq` 1.7.1 on the equivalent
+/// `{"a":1,"b":2,"c":3}` with `-c`. The captures are quoted per-assertion.
+const PRECEDENCE_DOC_2420: &str = "a: 1\nb: 2\nc: 3\n";
+
+/// #2420: in yq mode `A, B | C` is `A, (B | C)`, not jq's `(A, B) | C`.
+///
+/// Real yq's parser is a shunting-yard operator-precedence parser whose own
+/// table (`pkg/yqlib/operation.go`, v4.53.3) gives `pipeOpType` **30** and
+/// `unionOpType` (`,`) **10** — pipe binds *tighter*. jq's `parser.y` ranks
+/// them the other way (`%right '|'` before `%left ','`), and succinctly used
+/// to apply jq's ranking in both modes. ADR-0018 rule 2: the mode decides.
+///
+/// The parser-level counterpart is
+/// `jq::parser::tests::test_yq_mode_pipe_binds_tighter_than_comma_2420`; the
+/// jq-mode side is pinned in `jq_cli_tests.rs`'s
+/// `test_jq_comma_still_binds_tighter_than_pipe_2420`.
+#[test]
+fn test_yq_pipe_binds_tighter_than_comma_2420() -> Result<()> {
+    let args = &["-o", "json", "-I0"];
+
+    // $ yq -o=json -I0 '.a, .b | . + 10'  =>  1 / 12
+    // $ jq -c        '.a, .b | . + 10'    =>  11 / 12
+    let (output, code) = run_yq_stdin(".a, .b | . + 10", PRECEDENCE_DOC_2420, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "1\n12");
+
+    // $ yq -o=json -I0 '.a | ., .b'  =>  1 / 2
+    // $ jq -c        '.a | ., .b'    =>  1, then "Cannot index number with
+    //                                    string \"b\"" on stderr (exit 5)
+    // `.b` runs against the *original* document, not against `.a`'s value,
+    // which is why yq raises nothing where jq errors.
+    let (output, code) = run_yq_stdin(".a | ., .b", PRECEDENCE_DOC_2420, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "1\n2");
+
+    // $ yq -o=json -I0 '.a, .b | ., .c'  =>  1 / 2 / 3
+    // $ jq -c        '.a, .b | ., .c'    =>  1, then the same jq error
+    // Three comma operands, each its own pipe chain: `.a`, `.b | .`, `.c`.
+    let (output, code) = run_yq_stdin(".a, .b | ., .c", PRECEDENCE_DOC_2420, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "1\n2\n3");
+
+    // $ yq -o=json -I0 '(.a, .b) | . + 10'  =>  11 / 12
+    // $ jq -c        '(.a, .b) | . + 10'    =>  11 / 12
+    // Parentheses are a hard boundary the shunting yard cannot see across,
+    // so they restore jq's grouping in yq mode.
+    let (output, code) = run_yq_stdin("(.a, .b) | . + 10", PRECEDENCE_DOC_2420, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "11\n12");
+
+    // $ yq -o=json -I0 '.a, (.b | . + 10)'  =>  1 / 12
+    // $ jq -c        '.a, (.b | . + 10)'    =>  1 / 12
+    // ... on either side of the comma.
+    let (output, code) = run_yq_stdin(".a, (.b | . + 10)", PRECEDENCE_DOC_2420, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "1\n12");
+
+    // $ yq -o=json -I0 '.a, .b | key'  =>  1 / "b"
+    // $ jq -c        '.a, .b | key'    =>  "key/0 is not defined" (exit 3)
+    let (output, code) = run_yq_stdin(".a, .b | key", PRECEDENCE_DOC_2420, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "1\n\"b\"");
+
+    // $ yq -o=json -I0 '.a, .b | length'  =>  1 / 1
+    // $ jq -c        '.a, .b | length'    =>  1 / 2
+    // yq's `length` on a scalar is its rendered width (`2 | length` is 1,
+    // not jq's absolute value 2) -- a separate, already-documented
+    // divergence that happens to agree here once the grouping is right.
+    let (output, code) = run_yq_stdin(".a, .b | length", PRECEDENCE_DOC_2420, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "1\n1");
+
+    Ok(())
+}
+
+/// #2420: the precedence is a fixed entry in yq's operator table, so it holds
+/// at **every** nesting depth -- construction brackets, object values,
+/// `as` bodies and gated-extension call sites all inherit it -- and it is the
+/// *mode* that decides, not the input format (ADR-0018 rule 2).
+#[test]
+fn test_yq_pipe_precedence_holds_at_every_depth_2420() -> Result<()> {
+    let args = &["-o", "json", "-I0"];
+
+    // $ yq -o=json -I0 '[.a, .b | . + 10]'  =>  [1,12]
+    // $ jq -c        '[.a, .b | . + 10]'    =>  [11,12]
+    // `[...]` scopes evaluation, not precedence.
+    let (output, code) = run_yq_stdin("[.a, .b | . + 10]", PRECEDENCE_DOC_2420, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[1,12]");
+
+    // $ yq -o=json -I0 '[.a, .b | . * 2]'  =>  [1,4]
+    // $ jq -c        '[.a, .b | . * 2]'    =>  [2,4]
+    let (output, code) = run_yq_stdin("[.a, .b | . * 2]", PRECEDENCE_DOC_2420, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[1,4]");
+
+    // $ yq -o=json -I0 '{"x": (.a, .b | . + 1)}'  =>  {"x":1} / {"x":3}
+    // $ jq -c        '{"x": (.a, .b | . + 1)}'    =>  {"x":2} / {"x":3}
+    // Object-value position: the parens bound the value, but *inside* them
+    // yq's own ranking still applies.
+    let (output, code) = run_yq_stdin(r#"{"x": (.a, .b | . + 1)}"#, PRECEDENCE_DOC_2420, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "{\"x\":1}\n{\"x\":3}");
+
+    // $ yq -o=json -I0 '.a as $x | $x, .b | . + 1'  =>  1 / 3
+    // $ jq -c        '.a as $x | $x, .b | . + 1'    =>  2 / 3
+    // `as` still swallows everything to its right, and what it swallows is
+    // now a comma of pipe chains: `.a as $x | ($x, (.b | . + 1))`.
+    let (output, code) = run_yq_stdin(".a as $x | $x, .b | . + 1", PRECEDENCE_DOC_2420, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "1\n3");
+
+    // $ yq -o=json -I0 '.[] | key, path'  on 'a: 1\nb: 2\n'  =>  "a" / "b" / []
+    // Groups as `(.[] | key), path`, so `path` names the *root*, not the
+    // iterated members. (jq 1.7.1 has no `key`, so there is no jq row.)
+    let (output, code) = run_yq_stdin(".[] | key, path", "a: 1\nb: 2\n", args)?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "\"a\"\n\"b\"\n[]");
+
+    // Three pipes deep, on 'a: 1\nb: {c: 3, d: 4}\nc: 5\nd: 6\n':
+    // $ yq -o=json -I0 '.a, .b | .c, .d | . + 1'  =>  1 / 3 / 7
+    // $ jq -c        '.a, .b | .c, .d | . + 1'    =>  "Cannot index number
+    //                                                 with string \"c\""
+    // Three comma operands: `.a`, `.b | .c`, `.d | . + 1`.
+    let (output, code) = run_yq_stdin(
+        ".a, .b | .c, .d | . + 1",
+        "a: 1\nb: {c: 3, d: 4}\nc: 5\nd: 6\n",
+        args,
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "1\n3\n7");
+
+    // $ yq -o=json -I0 '.a | .b, .c | . + 1'  on 'a: {b: 9}\nc: 3\n'  =>  9 / 4
+    // $ jq -c        '.a | .b, .c | . + 1'                            =>  10 / 1
+    // Two independent chains, `(.a | .b)` and `(.c | . + 1)`, not one
+    // three-stage chain rooted at `.a`.
+    let (output, code) = run_yq_stdin(".a | .b, .c | . + 1", "a: {b: 9}\nc: 3\n", args)?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "9\n4");
+
+    // The *mode* decides, not the format: JSON input through `-p json` gets
+    // yq's grouping too.
+    // $ yq -p=json -o=json -I0 '.a, .b | . + 10'  on {"a":1,"b":2,"c":3}  =>  1 / 12
+    let (output, code) = run_yq_stdin(
+        ".a, .b | . + 10",
+        r#"{"a":1,"b":2,"c":3}"#,
+        &["-p", "json", "-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "1\n12");
+
+    // A gated jq-only extension inherits the same grouping. Real yq cannot
+    // lex `limit` at all --
+    // $ yq -o=json -I0 '.a, .b | limit(1; . + 10)'
+    //   Error: 1:10: lexer: invalid input text "limit(1; . + 10)"   (exit 1)
+    // -- so there is no oracle row for the extension itself, only for the
+    // grouping it must be spelled with (`.a, (.b | limit(1; . + 10))`).
+    // $ jq -c '.a, .b | limit(1; . + 10)'  =>  11 / 12
+    let (output, code) = run_yq_stdin(
+        ".a, .b | limit(1; . + 10)",
+        PRECEDENCE_DOC_2420,
+        &["-o", "json", "-I0", "--jq-extensions"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "1\n12");
+
+    // ... and stays rejected without the flag, grouping or no grouping.
+    let (_output, code) = run_yq_stdin(
+        ".a, .b | limit(1; . + 10)",
+        PRECEDENCE_DOC_2420,
+        &["-o", "json", "-I0"],
+    )?;
+    assert_ne!(code, 0);
+
+    Ok(())
+}
+
+/// #2420: two probes where succinctly's post-fix grouping is right but the
+/// *output* still differs from real yq, for reasons scoped elsewhere. Pinned
+/// so the residue is visible rather than mistaken for a precedence bug.
+#[test]
+fn test_yq_pipe_precedence_residual_divergences_2420() -> Result<()> {
+    let args = &["-o", "json", "-I0"];
+
+    // Grouping is `(.a | .b), (.c | . + 1)`; `.a | .b` indexes the number 1
+    // and fails in both tools. Real yq *drops* the failing comma branch
+    // silently and prints only the second:
+    // $ yq -o=json -I0 '.a | .b, .c | . + 1'  =>  4   (exit 0, empty stderr)
+    // succinctly is fail-loud here, as jq is:
+    // $ jq -c '.a | .b, .c | . + 1'  =>  "Cannot index number with string
+    //                                     \"b\"" (exit 5, no stdout)
+    // That silent-drop behaviour is a separate divergence from #2420's
+    // grouping, and is not what this change is about.
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr(".a | .b, .c | . + 1", PRECEDENCE_DOC_2420, args)?;
+    assert_eq!(code, 1);
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("Cannot index number with string \"b\""),
+        "stderr: {stderr:?}"
+    );
+
+    // Both sides fully parenthesised, so #2420's precedence plays no part --
+    // yet the two tools still disagree, on *order*:
+    // $ yq -o=json -I0 '(.a, .b) | (.c, .d)'  on 'a: {c: 3, d: 4}\nb: {c: 5, d: 6}\n'
+    //   =>  3 / 5 / 4 / 6
+    // $ jq -c        '(.a, .b) | (.c, .d)'    =>  3 / 4 / 5 / 6
+    // yq evaluates a `,` over the whole *context list* produced by the pipe's
+    // left side (`.c` over both, then `.d` over both), where jq and succinctly
+    // pipe each left-hand value independently. That is yq's evaluation model,
+    // not its precedence table, and the parser cannot express it.
+    let (output, code) = run_yq_stdin(
+        "(.a, .b) | (.c, .d)",
+        "a: {c: 3, d: 4}\nb: {c: 5, d: 6}\n",
+        args,
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "3\n4\n5\n6");
 
     Ok(())
 }

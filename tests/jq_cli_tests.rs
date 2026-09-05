@@ -37687,3 +37687,87 @@ fn test_fold_init_before_source_escape_matrix_2440() -> Result<()> {
     }
     Ok(())
 }
+
+/// #2420's jq-mode side: nothing changes here.
+///
+/// The parser now ranks `|` above `,` in **yq** mode, matching real yq's own
+/// precedence table (`pipeOpType` 30, `unionOpType` 10 in
+/// `pkg/yqlib/operation.go`, v4.53.3). jq's `parser.y` ranks them the other
+/// way (`%right '|'` declared before `%left ','`), and ADR-0018 rule 2 says
+/// the mode decides -- so every filter below must keep jq's grouping. Rows
+/// captured live from `/usr/bin/jq` 1.7.1 on `{"a":1,"b":2,"c":3}`; the
+/// yq-mode answers for the same texts are in `yq_cli_tests.rs`'s
+/// `test_yq_pipe_binds_tighter_than_comma_2420`.
+#[test]
+fn test_jq_comma_still_binds_tighter_than_pipe_2420() -> Result<()> {
+    let doc = r#"{"a":1,"b":2,"c":3}"#;
+    let args = &["-c"];
+
+    // $ jq -c '.a, .b | . + 10'  =>  11 / 12   (yq: 1 / 12)
+    let (output, code) = run_jq_stdin(".a, .b | . + 10", doc, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "11\n12\n");
+
+    // $ jq -c '[.a, .b | . + 10]'  =>  [11,12]   (yq: [1,12])
+    let (output, code) = run_jq_stdin("[.a, .b | . + 10]", doc, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "[11,12]\n");
+
+    // $ jq -c '[.a, .b | . * 2]'  =>  [2,4]   (yq: [1,4])
+    let (output, code) = run_jq_stdin("[.a, .b | . * 2]", doc, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "[2,4]\n");
+
+    // $ jq -c '.a, .b | length'  =>  1 / 2   (yq: 1 / 1)
+    let (output, code) = run_jq_stdin(".a, .b | length", doc, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "1\n2\n");
+
+    // $ jq -c '.a, .b | select(. > 1)'  =>  2   (yq: 1 / 2)
+    let (output, code) = run_jq_stdin(".a, .b | select(. > 1)", doc, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "2\n");
+
+    // $ jq -c '{"x": (.a, .b | . + 1)}'  =>  {"x":2} / {"x":3}
+    //                                       (yq: {"x":1} / {"x":3})
+    let (output, code) = run_jq_stdin(r#"{"x": (.a, .b | . + 1)}"#, doc, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "{\"x\":2}\n{\"x\":3}\n");
+
+    // $ jq -c '.a as $x | $x, .b | . + 1'  =>  2 / 3   (yq: 1 / 3)
+    let (output, code) = run_jq_stdin(".a as $x | $x, .b | . + 1", doc, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "2\n3\n");
+
+    // $ jq -c '.a, .b | limit(1; . + 10)'  =>  11 / 12
+    //   (yq mode, with --jq-extensions: 1 / 12; real yq cannot lex `limit`)
+    let (output, code) = run_jq_stdin(".a, .b | limit(1; . + 10)", doc, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "11\n12\n");
+
+    // Grouping the jq way explicitly is a no-op in jq mode, and parentheses
+    // still bind what they enclose.
+    // $ jq -c '(.a, .b) | . + 10'  =>  11 / 12
+    // $ jq -c '.a, (.b | . + 10)'  =>  1 / 12
+    let (output, code) = run_jq_stdin("(.a, .b) | . + 10", doc, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "11\n12\n");
+    let (output, code) = run_jq_stdin(".a, (.b | . + 10)", doc, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(output, "1\n12\n");
+
+    // jq's grouping pipes a scalar into a field access and fails loudly.
+    // $ jq -c '.a | ., .b'
+    //   1
+    //   jq: error (at <stdin>:0): Cannot index number with string "b"   (exit 5)
+    // (yq: 1 / 2, exit 0.)
+    let (stdout, stderr, code) = run_jq_stdin_streams(".a | ., .b", doc, args)?;
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    assert_eq!(stdout, "1\n");
+    assert!(
+        stderr.contains("Cannot index number with string \"b\""),
+        "stderr: {stderr:?}"
+    );
+
+    Ok(())
+}

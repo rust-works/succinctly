@@ -63,6 +63,29 @@ All features from the [jq Language Reference](jq-language.md) work with yq, incl
 - Format strings (`@json`, `@csv`, `@base64`, etc.)
 - Module system (`import`, `include`)
 
+### Operator precedence differs on `|` vs `,`
+
+The [jq operator-precedence table](jq-language.md#operator-precedence) applies in
+yq mode **except for its two loosest levels, which are swapped** (#2420). Real
+yq's parser is a shunting-yard operator-precedence parser and its own table
+(`pkg/yqlib/operation.go`, v4.53.3) gives `pipeOpType` precedence 30 and
+`unionOpType` (`,`) precedence 10 — pipe binds *tighter* than comma, the
+opposite of jq's `parser.y`. `succinctly yq` follows yq, `succinctly jq`
+follows jq (ADR-0018 rule 2: the mode decides, not the input format):
+
+| Filter               | `succinctly yq` / `yq` | `succinctly jq` / `jq` |
+|----------------------|------------------------|------------------------|
+| `.a, .b \| . + 10`   | `1` `12`               | `11` `12`              |
+| `[.a, .b \| . + 10]` | `[1,12]`               | `[11,12]`              |
+| `(.a, .b) \| . + 10` | `11` `12`              | `11` `12`              |
+| `.a, (.b \| . + 10)` | `1` `12`               | `1` `12`               |
+
+(on `a: 1`/`b: 2`.) It is a fixed entry in yq's operator table, so it holds at
+every nesting depth. Explicit parentheses restore jq's grouping, on either side
+of the comma, because they are a boundary the shunting yard cannot see across;
+construction brackets do not, since `[...]` scopes evaluation rather than
+precedence.
+
 ---
 
 ## YAML-Specific Features
