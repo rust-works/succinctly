@@ -6066,6 +6066,13 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // through `collect_each_generic` instead of the eager bridge.
         Expr::DefCall { .. } => collect_each_generic::<S, V>(expr, value, optional, cursor),
 
+        // #2416 phase 3: `def name(params): body; then` is pure AST
+        // substitution -- native via `eval_each_generic`'s own `FuncDef` arm
+        // (`bind_def`), which installs the definition and re-evaluates
+        // `then` through this same collecting wrapper, mirroring
+        // `eval.rs`'s identical arm.
+        Expr::FuncDef { .. } => collect_each_generic::<S, V>(expr, value, optional, cursor),
+
         Expr::Comma(exprs) => {
             let mut out: Vec<OwnedValue> = Vec::new();
             for expr in exprs {
@@ -11327,6 +11334,15 @@ fn path_context_single_native(expr: &Expr) -> bool {
         // solely through a call *argument* is a known, narrower gap, same
         // scoping precedent as there.
         Expr::DefCall { def, .. } => path_context_single_native(&def.body),
+        // Native since #2416 phase 3 (`eval_each_generic`'s own `FuncDef`
+        // arm, `bind_def`). `body`/`then` are exactly what
+        // `needs_path_context`'s own identical pair of arms recurses into --
+        // same deliberately cheap, syntax-only approximation as `DefCall`
+        // above (a builtin reaching `body` solely through a call *argument*
+        // is a known, narrower gap).
+        Expr::FuncDef { body, then, .. } => {
+            path_context_single_native(body) && path_context_single_native(then)
+        }
         _ => false,
     }
 }
@@ -21495,12 +21511,21 @@ mod tests {
         assert!(!eager(".[] | . as $x | key"));
         assert!(!eager(".[] | . as {a: $a} | key"));
         assert!(!eager(".[] | label $out | key"));
+        // A `def` whose `then` uses `key` directly (not through a call to
+        // the def) is single-native the same way: `body`/`then` are exactly
+        // what `path_context_single_native`'s `FuncDef` arm checks.
+        // `Expr::DefCall` has no row here -- it is a runtime-only node
+        // (installed by `bind_def` on first evaluation), never produced by a
+        // fresh `parse()`; `test_def_call_keeps_path_context_2416` (CLI) is
+        // its coverage instead.
+        assert!(!eager(".[] | (def k: 1; key)"));
         // Arithmetic still bridges from `eval_single` (unchanged from the
-        // `if`/`limit` rows above), so wrapping one in `as`'s/`label`'s body
-        // keeps the whole pipe eager.
+        // `if`/`limit` rows above), so wrapping one in `as`'s/`label`'s/
+        // `def`'s body keeps the whole pipe eager.
         assert!(eager(".[] | . as $x | key + 10"));
         assert!(eager(".[] | . as {a: $a} | key + 10"));
         assert!(eager(".[] | label $out | key + 10"));
+        assert!(eager(".[] | (def k: 1; key + 10)"));
         // An emitted `key`/`path` is a computed value: a later builtin no
         // longer stands on a node.
         assert!(eager(".[] | key | key"));
