@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`succinctly yq --eval-all` now evaluates over the document *list*, not a
+  slurped array of the documents — and `file_index` counts input files on the
+  ordinary multi-file path too** (#2427). Real yq's `ea`
+  (`all_at_once_evaluator.go`, v4.53.3) reads every document of every file into
+  one node list and runs the expression once against it; only two operators
+  behave differently from the per-document case, and both gate on the
+  `EvaluateTogether` flag `readDocuments` stamps on those initial nodes
+  (`utils.go:85`) — `[E]` collects `E`'s outputs across the whole list into one
+  array, and a binary operator evaluates both operands over the whole list and
+  emits every pairing. succinctly slurped instead, so the expression saw an
+  array it should never have seen:
+
+  ```console
+  $ succinctly yq --eval-all -o=json -I0 '.name' f1.yaml f2.yaml
+  "first"                            # was: Cannot index array with string "name"
+  "second"
+  $ succinctly yq --eval-all -o=json -I0 'keys' f1.yaml f2.yaml
+  ["a","name"]                       # was: [0,1]
+  ["b","name"]
+  $ succinctly yq --eval-all -o=json -I0 '[.]' f1.yaml f2.yaml
+  [{"a":1,"name":"first"},{"b":2,"name":"second"}]   # was: an array of that array
+  $ succinctly yq --eval-all -o=json -I0 '. + {"z": 9}' f1.yaml f2.yaml
+  {"a":1,"name":"first","z":9}       # was: a three-element array
+  {"a":1,"name":"first","z":9}       # four outputs, matching real yq
+  {"b":2,"name":"second","z":9}
+  {"b":2,"name":"second","z":9}
+  $ succinctly yq 'file_index' f1.yaml f2.yaml
+  0                                  # was: 0 for every file
+  1
+  ```
+
+  **Every `--eval-all` filter written against the old model changes.** The
+  `.[]`-over-documents idiom the previous release documented
+  (`--eval-all '.[] | select(file_index == 0)'`) now iterates each *document's*
+  own members, exactly as real yq's does; drop the `.[] |` prefix
+  (`--eval-all 'select(file_index == 0)'`). `path`, `key` and `parent` answer
+  relative to their own document now rather than to the vanished array, and
+  `document_index` counts documents within their file. Two `ea` shapes are still
+  short of real yq and are recorded in
+  [docs/compliance/yq/limitations.md](docs/compliance/yq/limitations.md): the
+  `---` separator between results, and `. as $x | [$x]`.
+
 - **`succinctly yq` now evaluates over a *context list*, as real yq does — a pipe
   into a union is branch-major, a union of two bare identities yields the list
   once, and binary operators fan out left-major** (#2451). Real yq has no scalar

@@ -296,45 +296,69 @@ at all. The justification is the spec target, which is why the case belongs here
 Representative cases, each live-verified. These are gaps to close, listed here so they are
 not rediscovered from scratch.
 
-### `--eval-all` slurps the documents into one array; real `yq ea` evaluates over a context list of them (#2427)
+### The `---` between results is per-run, not per-node as real yq's printer makes it (#2427)
 
-`succinctly yq --eval-all` collects every document of every input file into one array and
-evaluates the expression once against that array. Real yq's `ea` evaluates the expression
-once with the *list of documents* as its input: navigation maps over the list, `[E]`
-collects E's whole output list into one array, `length`/`keys`/`del` apply per document,
-and a binary operator is cartesian over both operands' lists. Only a filter that happens to
-treat its input as an array agrees between the two. Captured from the pinned v4.53.3 binary
-with `yq ea -o=json -I0` on `f1.yaml` (`a: 1`, `name: first`) and `f2.yaml` (`b: 2`,
-`name: second`):
+Real yq's printer decides the `---` separator **per output node**, from two fields the node
+carries — `document` (its index within its own file) and `fileIndex`
+([`printer.go`](https://github.com/mikefarah/yq/blob/v4.53.3/pkg/yqlib/printer.go), the
+`p.previousDocIndex != mappedDoc.GetDocument() || p.previousFileIndex != mappedDoc.GetFileIndex()`
+test). Two things follow that succinctly does not reproduce:
+
+1. **`previousFileIndex` is set once and never updated inside the loop** (only
+   `p.previousDocIndex` is assigned at the bottom of the iteration), so every node whose
+   file differs from the *first printed node's* file gets a separator, however many have
+   already been printed from that same file.
+2. **Whether a node has a file/document at all is a per-operator property.**
+   `CandidateNode.Copy` carries `document`/`fileIndex` across, but `CreateReplacement`
+   builds a fresh node and starts both at `0`
+   ([`candidate_node.go`](https://github.com/mikefarah/yq/blob/v4.53.3/pkg/yqlib/candidate_node.go)),
+   and the choice between the two is made independently by each operator. So `.`, `.name`,
+   `select`, `del`, `=`, `{...}` and `+` all keep it, while `keys`, `length`, `type`,
+   `tostring`, `to_entries`, `map`, `[...]`, `has`, `path`, `key`, `parent`, `line`,
+   `column`, `filename`, `file_index`, `document_index` and every literal do not.
+
+succinctly's values carry no such field, and there is no unifying rule to derive one from —
+so it writes `---` between successive results whenever the output is YAML and there is more
+than one. That agrees with real yq for every filter in group (2)'s first list and for
+one-document-per-file input, and diverges for the second list. Live-verified against
+v4.53.3 on `f1.yaml` (`a: 1`, `name: first`) and `f2.yaml` (`b: 2`, `name: second`):
 
 ```bash
-$ yq ea -o=json -I0 '.name' f1.yaml f2.yaml            # "first" / "second"
-$ succinctly yq --eval-all -o=json '.name' f1.yaml f2.yaml
-Error: Cannot index array with string "name"
-$ yq ea -o=json -I0 '[.]' f1.yaml f2.yaml              # one array of both documents
-$ succinctly yq --eval-all -o=json '[.]' f1.yaml f2.yaml   # an array holding that array
-$ yq ea -o=json -I0 '. + {"z": 9}' f1.yaml f2.yaml     # four outputs (2 documents x 2)
-$ yq ea -o=json -I0 'keys' f1.yaml f2.yaml             # ["a","name"] / ["b","name"]
-$ succinctly yq --eval-all -o=json 'keys' f1.yaml f2.yaml  # [0,1]
+$ yq '.'      f1.yaml f2.yaml    # a: 1 / name: first / --- / b: 2 / name: second   (agrees)
+$ yq 'length' f1.yaml f2.yaml    # 2 / 2
+$ succinctly yq 'length' f1.yaml f2.yaml           # 2 / --- / 2
+$ yq 'file_index' f1.yaml f2.yaml                  # 0 / 1
+$ succinctly yq 'file_index' f1.yaml f2.yaml       # 0 / --- / 1
+$ yq '.name, .name' f1.yaml f2.yaml   # first / first / --- / second / --- / second
+$ succinctly yq '.name, .name' f1.yaml f2.yaml     # first / first / --- / second / second
 ```
 
-`file_index`/`document_index` on this path count files and documents as yq does since
-#2469 (`0 0 1` and `0 1 0` for a two-document file followed by a one-document file), so the
-numbering is right even though the shape of the evaluation is not.
+Same on the `--eval-all` path, which since #2427 also produces one result per document:
+`yq ea 'file_index' f1.yaml f2.yaml` prints `0` and `1` with no separator where succinctly
+writes one between them. Closing this needs per-node file/document provenance threaded from
+the evaluator to the printer, plus yq's own per-operator table for which operators set it —
+tracked on [#2427](https://github.com/rust-works/succinctly/issues/2427).
 
-This is not fixable in the CLI runner alone: a per-document loop would repair `.name`,
-`keys`, `del` and `select(file_index == 1)` but would print `[.]` twice and `. + {"z": 9}`
-twice, both still wrong. The evaluation model is the same one
-[#2451](https://github.com/rust-works/succinctly/issues/2451) implements for `(.a, .b) |
-(.c, .d)` inside a single document -- yq's `,` and its `ea` both build a context list, and
-every operator is defined over lists. #2451's three rules already apply on this path
-(`--eval-all`'s union ordering is branch-major with them), but what makes `[.]` collect
-once and `. + {"z": 9}` go cartesian across documents is a *different* mechanism:
-`EvaluateTogether` (`pkg/yqlib/utils.go:85`), a per-node flag set only by the all-at-once
-multi-file reader. Tracked as
-[#2427](https://github.com/rust-works/succinctly/issues/2427); the stray `---` that plain
-multi-file `succinctly yq` prints between files, and the always-0 `file_index` on that
-non-`ea` path, are the same issue's other two divergences.
+### `. as $x | [$x]` under `--eval-all` collects one copy per document, not one per binding (#2427)
+
+`--eval-all` follows real yq's `EvaluateTogether` rules for `[E]` and for binary operators
+(see [the context-list section](#yqs-context-list-evaluation-model-in-a-single-document-2451)), but not for
+variable binding. `operator_variables.go` consults the same flag, and the observable effect
+is that the *body* of an `as` binding keeps seeing the whole document list even though the
+binding itself is per document — so a `[...]` in the body collects one entry per document
+in context rather than one per binding. Live against v4.53.3, `f1.yaml`/`f2.yaml` as above:
+
+```bash
+$ yq ea -o=json -I0 '. as $x | [$x]' f1.yaml f2.yaml
+[{"a":1,"name":"first"},{"a":1,"name":"first"}]
+[{"b":2,"name":"second"},{"b":2,"name":"second"}]
+$ succinctly yq --eval-all -o=json -I0 '. as $x | [$x]' f1.yaml f2.yaml
+[{"a":1,"name":"first"}]
+[{"b":2,"name":"second"}]
+```
+
+`. as $d | $d` (no collect in the body) agrees, as does every other row of #2427's own
+capture table.
 
 ### `-j`/`--join-output` collides with real yq's own `-j`
 
@@ -2613,8 +2637,10 @@ Three related divergences are **not** covered and stay open:
 - **`EvaluateTogether`** ([#2427](https://github.com/rust-works/succinctly/issues/2427)) is
   what makes `[...]` collect once across documents and binary operators go cartesian under
   `--eval-all`. It is a flag on the document nodes the all-at-once multi-file reader
-  builds, never set inside a single document, so it changes nothing here — see
-  [the `--eval-all` section](#--eval-all-slurps-the-documents-into-one-array-real-yq-ea-evaluates-over-a-context-list-of-them-2427).
+  builds, never set inside a single document, so it changes nothing here. Implemented for
+  `[...]` and for binary operators by #2427; `as` still consults it in real yq and does not
+  here, which is the one row of that issue's capture table still open (see
+  [that section](#-as-x--x-under---eval-all-collects-one-copy-per-document-not-one-per-binding-2427)).
 - **A union of two assignments.** yq's pointer guard also fires for two operands that both
   hand back the *same, mutated* context, which is the case its own source comment names:
   `yq '(.a.c = 1), (.b.c = 2)'` prints **one** document carrying both writes. succinctly's
