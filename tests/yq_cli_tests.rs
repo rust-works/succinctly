@@ -32407,6 +32407,24 @@ const OWNED_IDENTITY_ROWS_2416: &[(&str, &str)] = &[
     (".a.b | sort | .[(-1)] | key", "2"),
     (".a.b | sort | .[(-1)] | path", r#"["a","b",2]"#),
     (".a.d | to_entries | .[(0)] | key", "0"),
+    // #2471 sub-item 3: `key`/`path`/`file_index` replace the value with a
+    // fresh scalar that keeps the node's position, and `key`'s own output
+    // is a *key node* -- a second `key` emits nothing, while any other
+    // stage rebuilds an ordinary node at the same position and `key`
+    // answers again.
+    (".a.c | key | key", ""),
+    (".a.c | key | path", r#"["a","c"]"#),
+    (".a.c | key | parent | key", r#""a""#),
+    (".a.c | key | length | key", r#""c""#),
+    (".a.c | key | tostring | key", r#""c""#),
+    (".a.c | tostring | key | key", ""),
+    (".a.c | tostring | key | path", r#"["a","c"]"#),
+    (".a.c | tostring | key | tostring | key", r#""c""#),
+    (".a.c | path | key", r#""c""#),
+    (".a.c | path | length | key", r#""c""#),
+    (".a.c | path | parent | key", r#""a""#),
+    (".a.c | file_index | key", r#""c""#),
+    (".a.b | to_entries | .[0].value | key | key", ""),
 ];
 
 /// #2460: real yq's binary operators when one operand produces **zero

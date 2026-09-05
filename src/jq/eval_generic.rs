@@ -7816,7 +7816,7 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
         rest.iter().any(needs_path_context)
             && !path_context_is_navigational(first)
             && !path_context_stage_preserves_node(first)
-            && !needs_path_context(first)
+            && (!needs_path_context(first) || owned_identity_emits_position(first))
             && owned_identity_rule(first).is_some()
             && owned_identity_pipe_supported(rest)
     });
@@ -14530,6 +14530,13 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 struct OwnedIdentity<V: DocumentValue> {
     base: Option<V::Cursor>,
     ancestors: Vec<(Rc<OwnedValue>, OwnedValue)>,
+    /// This value *is* the key `key` emitted (#2471). It stands at the same
+    /// position -- `path`/`parent` answer exactly as they did for the node
+    /// `key` was asked of -- but a key has no key of its own, so a second
+    /// `key` emits nothing (`.a.b | key | key` prints nothing in yq
+    /// v4.53.3, where `.a.b | key | path` is still `["a","b"]` and
+    /// `.a.b | key | tostring | key` is `"b"` again).
+    key_node: bool,
 }
 
 impl<V: DocumentValue> Clone for OwnedIdentity<V> {
@@ -14537,6 +14544,7 @@ impl<V: DocumentValue> Clone for OwnedIdentity<V> {
         Self {
             base: self.base,
             ancestors: self.ancestors.clone(),
+            key_node: self.key_node,
         }
     }
 }
@@ -14554,6 +14562,7 @@ impl<V: DocumentValue> OwnedIdentity<V> {
         Self {
             base: Some(base),
             ancestors: Vec::new(),
+            key_node: false,
         }
     }
 
@@ -14562,7 +14571,15 @@ impl<V: DocumentValue> OwnedIdentity<V> {
         Self {
             base: None,
             ancestors: Vec::new(),
+            key_node: false,
         }
+    }
+
+    /// The same position, flagged as (or no longer as) the key `key`
+    /// emitted -- see [`OwnedIdentity::key_node`].
+    fn with_key_node(mut self, key_node: bool) -> Self {
+        self.key_node = key_node;
+        self
     }
 
     /// The identity of `component` inside `parent`, whose identity is `self`.
@@ -14572,12 +14589,17 @@ impl<V: DocumentValue> OwnedIdentity<V> {
         Self {
             base: self.base,
             ancestors,
+            // A child of a key node is an ordinary node again.
+            key_node: false,
         }
     }
 
     /// `key`: the last component taken, else the base node's own key, else
     /// nothing (a detached root, or the document root -- #2421).
     fn key(&self) -> Result<Option<OwnedValue>, EvalError> {
+        if self.key_node {
+            return Ok(None);
+        }
         match self.ancestors.last() {
             Some((_, component)) => Ok(Some(component.clone())),
             None => match self.base {
@@ -14605,6 +14627,8 @@ impl<V: DocumentValue> OwnedIdentity<V> {
     /// node above the base (nothing above a detached root or the document
     /// root).
     fn parent(mut self) -> Option<OwnedParent<V>> {
+        // Climbing out of a key node lands on an ordinary node.
+        self.key_node = false;
         match self.ancestors.pop() {
             Some((value, _)) => Some(OwnedParent::Owned((*value).clone(), self)),
             None => self
@@ -14653,11 +14677,19 @@ enum OwnedIdentityRule {
     /// `path(.a[0:3])` and takes the `{"start":s,"end":e}` component, the
     /// model #2215 pinned for the extension builtins there.
     Slice,
+    /// `key` (#2471): the emitted key stands where the node it was asked of
+    /// stood -- `path`/`parent` are unchanged -- but is flagged as a key
+    /// node, so a *second* `key` emits nothing. Captured from yq v4.53.3 on
+    /// `a: {b: 1}`: `.a.b | key | path` is `["a","b"]`, `.a.b | key |
+    /// parent | key` is `"a"`, `.a.b | key | key` prints nothing, and
+    /// `.a.b | key | tostring | key` is `"b"` again (any other rule builds
+    /// an ordinary node at the same position, which clears the flag).
+    KeyNode,
 }
 
 fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
     use OwnedIdentityRule::{
-        Alternative, Detaches, DetachesContainer, Extremum, Keeps, LeftOperand, Slice,
+        Alternative, Detaches, DetachesContainer, Extremum, KeyNode, Keeps, LeftOperand, Slice,
     };
     Some(match strip_parens(stage) {
         Expr::Slice { .. } => Slice,
@@ -14700,6 +14732,13 @@ fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
             | Builtin::Del(_)
             | Builtin::Select(_) => Keeps,
             Builtin::Keys | Builtin::KeysUnsorted | Builtin::WithEntries(_) => Detaches,
+            // #2471: `key`/`path`/`file_index` replace the value with a
+            // fresh scalar that keeps the node's position, so a later
+            // path-context read is answered from the identity instead of
+            // sending the whole pipe to the eager evaluator. `key` alone
+            // carries the key-node flag; see `OwnedIdentityRule::KeyNode`.
+            Builtin::Key => KeyNode,
+            Builtin::PathNoArg | Builtin::FileIndex => Keeps,
             Builtin::Map(_) => DetachesContainer,
             Builtin::Min | Builtin::Max => Extremum,
             _ => return None,
@@ -14784,17 +14823,20 @@ fn owned_identity_operand_supported(expr: &Expr) -> bool {
 /// navigation, a path-context builtin answered from the identity, or a stage
 /// with an [`owned_identity_rule`] whose own path-context builtins (if any)
 /// resolve to constants. `key`/`path`/`file_index` turn the value into a
-/// fresh scalar, so nothing after one of them may read path context.
+/// fresh scalar that keeps the node's position (#2471), so a later stage may
+/// still read it -- `key` alone flags its output as a key node, which
+/// answers a second `key` with nothing.
 fn owned_identity_pipe_supported(stages: &[Expr]) -> bool {
-    for (i, stage) in stages.iter().enumerate() {
-        let rest = &stages[i + 1..];
+    for stage in stages {
         if owned_identity_nav_supported(stage) {
             continue;
         }
         match strip_parens(stage) {
-            Expr::Builtin(Builtin::Key | Builtin::PathNoArg | Builtin::FileIndex) => {
-                return !rest.iter().any(needs_path_context);
-            }
+            // #2471: `key`/`path`/`file_index` replace the value with a
+            // fresh scalar that stands where the node stood, so a later
+            // path-context read is answered from the identity rather than
+            // ending the pipe here.
+            Expr::Builtin(Builtin::Key | Builtin::PathNoArg | Builtin::FileIndex) => {}
             Expr::Builtin(Builtin::Parent) => {}
             Expr::Builtin(Builtin::ParentN(n)) if matches!(**n, Expr::Literal(_)) => {}
             Expr::Arithmetic { left, .. } | Expr::Compare { left, .. } | Expr::Negate(left) => {
@@ -14836,11 +14878,23 @@ fn owned_identity_pipe_applies(exprs: &[Expr]) -> bool {
         }
         let rest = &exprs[i + 1..];
         return rest.iter().any(needs_path_context)
-            && !needs_path_context(stage)
+            && (!needs_path_context(stage) || owned_identity_emits_position(stage))
             && owned_identity_rule(stage).is_some()
             && owned_identity_pipe_supported(rest);
     }
     false
+}
+
+/// Whether a stage *is* a bare path-context read (#2471). Such a stage reads
+/// the position of the node it is given -- which the cursor route has already
+/// answered by the time the value reaches the owned identity pipe -- so it
+/// can be the stage a pipe leaves the cursor domain at, unlike a stage that
+/// merely *contains* a read.
+fn owned_identity_emits_position(stage: &Expr) -> bool {
+    matches!(
+        strip_parens(stage),
+        Expr::Builtin(Builtin::Key | Builtin::PathNoArg | Builtin::FileIndex)
+    )
 }
 
 /// One navigation step over an owned value, naming the component taken.
@@ -15225,8 +15279,24 @@ fn owned_identity_after_stage<S: EvalSemantics, V: DocumentValue>(
     output: &OwnedValue,
     optional: bool,
 ) -> Result<Option<OwnedIdentity<V>>, EvalError> {
+    // Every rule but `KeyNode` builds an ordinary node, so the key-node flag
+    // an input `key` left behind is cleared here -- `.a.b | key | tostring |
+    // key` is `"b"` again in yq v4.53.3.
+    let placed = owned_identity_placed_by::<S, V>(stage, rule, value, id, output, optional)?;
+    Ok(placed.map(|id| id.with_key_node(rule == OwnedIdentityRule::KeyNode)))
+}
+
+/// [`owned_identity_after_stage`] before the key-node flag is applied.
+fn owned_identity_placed_by<S: EvalSemantics, V: DocumentValue>(
+    stage: &Expr,
+    rule: OwnedIdentityRule,
+    value: &OwnedValue,
+    id: &OwnedIdentity<V>,
+    output: &OwnedValue,
+    optional: bool,
+) -> Result<Option<OwnedIdentity<V>>, EvalError> {
     Ok(match rule {
-        OwnedIdentityRule::Keeps => Some(id.clone()),
+        OwnedIdentityRule::Keeps | OwnedIdentityRule::KeyNode => Some(id.clone()),
         OwnedIdentityRule::Slice => {
             let Expr::Slice {
                 start,
@@ -15284,22 +15354,6 @@ fn owned_identity_after_stage<S: EvalSemantics, V: DocumentValue>(
         OwnedIdentityRule::Alternative => {
             unreachable!("Alternative is evaluated by eval_owned_identity_alternative")
         }
-    })
-}
-
-/// Hand a value with no further identity to the rest of the pipe: the
-/// ordinary owned evaluator, or the sink when nothing is left.
-fn continue_owned_identity_plain<S: EvalSemantics, V: DocumentValue>(
-    rest: &[Expr],
-    value: OwnedValue,
-    optional: bool,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
-) -> Flow {
-    if rest.is_empty() {
-        return push_one_generic(GenericItem::Owned(value), sink);
-    }
-    eval_each_owned::<S>(&Expr::Pipe(rest.to_vec()), &value, optional, &mut |o| {
-        sink(GenericItem::Owned(o))
     })
 }
 
@@ -15366,24 +15420,38 @@ fn eval_owned_identity_pipe<S: EvalSemantics, V: DocumentValue>(
         return continue_owned_identity_items::<S, V>(rest, out, optional, sink);
     }
     match strip_parens(stage) {
+        // #2471: the emitted key keeps the node's position, flagged so a
+        // second `key` emits nothing -- `id.key()` answers `None` for a key
+        // node, which is exactly yq's own `.a.b | key | key`.
         Expr::Builtin(Builtin::Key) => match id.key() {
-            Ok(Some(key)) => continue_owned_identity_plain::<S, V>(rest, key, optional, sink),
+            Ok(Some(key)) => eval_owned_identity_pipe::<S, V>(
+                rest,
+                key,
+                id.with_key_node(true),
+                optional,
+                sink,
+            ),
             Ok(None) => Flow::Exhausted,
             Err(e) => Flow::Escaped(Control::Error(e)),
         },
         Expr::Builtin(Builtin::PathNoArg) => match id.path() {
-            Ok(path) => {
-                continue_owned_identity_plain::<S, V>(rest, OwnedValue::Array(path), optional, sink)
-            }
+            Ok(path) => eval_owned_identity_pipe::<S, V>(
+                rest,
+                OwnedValue::Array(path),
+                id,
+                optional,
+                sink,
+            ),
             Err(e) => Flow::Escaped(Control::Error(e)),
         },
         // Same measured status as `path_context_resolve_constants`'s own
         // `FileIndex` arm (see its comment): the table exists now, this route
         // is not reached with one installed, and `id.path()` is what to feed
         // `file_index_for_path` when it is.
-        Expr::Builtin(Builtin::FileIndex) => continue_owned_identity_plain::<S, V>(
+        Expr::Builtin(Builtin::FileIndex) => eval_owned_identity_pipe::<S, V>(
             rest,
             OwnedValue::Int(ambient_file_index().unwrap_or(0)),
+            id,
             optional,
             sink,
         ),
@@ -15531,6 +15599,9 @@ fn owned_identity_leaving_cursor<S: EvalSemantics, V: DocumentValue>(
     let id = OwnedIdentity::kept(cursor);
     match rule {
         OwnedIdentityRule::Keeps => Ok(Some(id)),
+        // #2471: `key` at the cursor boundary -- the emitted key stands
+        // where the node stood, flagged so a second `key` emits nothing.
+        OwnedIdentityRule::KeyNode => Ok(Some(id.with_key_node(true))),
         OwnedIdentityRule::Detaches => Ok(Some(OwnedIdentity::detached())),
         OwnedIdentityRule::DetachesContainer => Ok(Some(if cursor.is_container() {
             OwnedIdentity::detached()
@@ -24322,12 +24393,21 @@ mod tests {
         assert!(!eager(".a | to_entries | getpath([0]) | key"));
         assert!(!eager(".a | to_entries | getpath([0, \"key\"]) | path"));
         assert!(!eager(".a | tostring | getpath([]) | path"));
-        // ...and stays eager where it has no rule, where path context is
-        // read after `key`/`path` already replaced the value, where the
-        // stage itself reads path context, or where a later stage does so
-        // in a shape the constants cannot express.
+        // #2471 sub-item 3: a path-context read *after* `key`/`path`/
+        // `file_index` replaced the value is answered from the identity
+        // too. The fresh scalar stands where the node stood, and `key`'s
+        // own output is flagged as a key node so a second `key` emits
+        // nothing (yq v4.53.3).
+        assert!(!eager(".a | tostring | key | key"));
+        assert!(!eager(".a | tostring | key | path"));
+        assert!(!eager(".a | tostring | key | tostring | key"));
+        assert!(!eager(".a.b | path | length | key"));
+        assert!(!eager(".a.b | file_index | key"));
+        assert!(!eager(".a.b | key | parent | key"));
+        // ...and stays eager where it has no rule, where the stage itself
+        // reads path context, or where a later stage does so in a shape the
+        // constants cannot express.
         assert!(eager(".a | explode | key"), "no identity rule");
-        assert!(eager(".a | tostring | key | key"), "key after key");
         assert!(
             eager(".a | [key] | .[0] | path"),
             "the stage reads path context"
@@ -24395,10 +24475,10 @@ mod tests {
         // `DefCall` is a runtime node the parser never produces, so its
         // argument gate is pinned by the CLI (`f(key + 10)` in
         // `test_shared_keeps_path_context_2416`) rather than here.
-        // An emitted `key`/`path` is a computed value: a later builtin no
-        // longer stands on a node.
-        assert!(eager(".[] | key | key"));
-        assert!(eager(".[] | (key) | length | path"));
+        // An emitted `key`/`path` keeps the node's position since #2471, so
+        // a later builtin reads it from the identity instead of bridging.
+        assert!(!eager(".[] | key | key"));
+        assert!(!eager(".[] | (key) | length | path"));
         // ...but `select`/`parent` keep the node, so a later builtin is fine.
         assert!(!eager(".[] | select(key == \"a\") | parent | key"));
         assert!(!eager(".a[] | select(key != \"c\") | parent"));

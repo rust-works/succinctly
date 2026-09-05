@@ -7596,6 +7596,47 @@ fn test_computed_navigation_keeps_path_context_2471() -> Result<()> {
     Ok(())
 }
 
+/// #2471 (gate reason 1 of spine 2416): a path-context read *after*
+/// `key`/`path`/`file_index` already replaced the value.
+///
+/// The fresh scalar stands where the node stood, and `key`'s own output is a
+/// *key node* -- a key has no key, so a second `key` emits nothing, while any
+/// other stage rebuilds an ordinary node at the same position and `key`
+/// answers again. Captured from yq v4.53.3 (`-o=json -I0`) on the YAML
+/// equivalent of this document; `key`/`path` with no argument are succinctly
+/// extensions in jq mode (real jq rejects `path/0 is not defined`), so yq's
+/// model is the only oracle there is and jq mode follows it:
+///
+/// ```text
+/// $ yq '.a.b | key | key'              (nothing)
+/// $ yq '.a.b | key | path'             ["a","b"]
+/// $ yq '.a.b | key | parent | key'     "a"
+/// $ yq '.a.b | key | tostring | key'   "b"
+/// $ yq '.a.b | path | length | key'    "b"
+/// $ yq '.a.b | file_index | key'       "b"
+/// ```
+#[test]
+fn test_path_context_after_key_or_path_2471() -> Result<()> {
+    let doc = r#"{"a":{"b":1,"a":7}}"#;
+    for (filter, want) in [
+        (".a.b | key | key", ""),
+        (".a.b | key | path", "[\"a\",\"b\"]"),
+        (".a.b | key | parent | key", "\"a\""),
+        (".a.b | key | tostring | key", "\"b\""),
+        (".a.b | key | length | key", "\"b\""),
+        (".a.b | tostring | key | key", ""),
+        (".a.b | tostring | key | path", "[\"a\",\"b\"]"),
+        (".a.b | path | key", "\"b\""),
+        (".a.b | path | length | key", "\"b\""),
+        (".a.b | file_index | key", "\"b\""),
+    ] {
+        let (out, _, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "`{filter}`: {out:?}");
+        assert_eq!(out.trim(), want, "`{filter}`");
+    }
+    Ok(())
+}
+
 /// Documents the one remaining deliberate, narrow gap #1663/#1765 leave
 /// open rather than silently missing: a `?//`-chained `AsPattern` (2+
 /// alternatives) still has no dedicated evaluation arm, so a path-context
