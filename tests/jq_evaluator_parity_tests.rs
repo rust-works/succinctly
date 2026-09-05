@@ -1715,6 +1715,30 @@ fn test_walk_vs_bridge_path_context_parity_2416() {
             "label $o | (.a[] | key, break $o)",
             ".a[] | key as $k | $k",
             "[.. | path]",
+            // #2416 step 2: heads that can land on an absent node. Some of
+            // these miss on some of the documents above and not on others,
+            // which is the point -- the absent route walks the head as
+            // positions and has to answer both kinds from the same pipe.
+            ".a.zz | key",
+            ".a.zz | path",
+            ".a.zz | parent",
+            ".a.zz.yy | key",
+            ".a.zz.yy | path",
+            ".a.zz | select(key == \"zz\")",
+            ".a.zz | select(true) | key",
+            ".a.zz | [key, path]",
+            ".a.zz | (key, path)",
+            ".a.zz | key | tostring",
+            ".a.zz | file_index",
+            ".a.zz | if key == \"zz\" then 1 else 2 end",
+            ".d[9] | key",
+            ".d[9] | path",
+            ".d[9] | select(key == 9)",
+            ".zz.yy | path",
+            ".a.zz | limit(1; key)",
+            ".a.zz | first(key)",
+            ".a.zz | try (key) catch \"e\"",
+            ".a.zz.yy | [path, parent]",
         ] {
             assert_walk_bridge_parity(doc, filter);
         }

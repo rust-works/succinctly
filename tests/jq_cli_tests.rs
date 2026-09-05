@@ -37771,3 +37771,47 @@ fn test_jq_comma_still_binds_tighter_than_pipe_2420() -> Result<()> {
 
     Ok(())
 }
+
+/// Spine 2416, step 2: the absent route in jq mode.
+///
+/// `key`/`path`/`parent` are yq builtins `succinctly jq` also accepts as an
+/// extension, so real jq is an oracle only for `path(f)`, which it does have.
+/// Captured 2026-09-05 from `/usr/bin/jq` 1.7.1 on `{"a":{"b":1}}`:
+///
+/// ```text
+/// $ jq -c 'path(.a.x)'     ["a","x"]
+/// $ jq -c 'path(.a.x.y)'   ["a","x","y"]
+/// $ jq -c '.a.x | path'    jq: error: path/0 is not defined  (exit 3)
+/// ```
+///
+/// The extension rows are pinned against this branch's own pre-change build
+/// (`origin/main` at e962a8fa6, same document, same filters): the absent
+/// class moved off the eager evaluator with byte-identical output, which is
+/// the claim -- 38 yq-mode and 19 jq-mode shapes compared, 0 diffs.
+#[test]
+fn test_absent_position_keeps_path_context_2416() -> Result<()> {
+    let doc = r#"{"a":{"b":1,"c":[1,2]}}"#;
+    for (filter, expected) in [
+        ("path(.a.x)", "[\"a\",\"x\"]"),
+        ("path(.a.x.y)", "[\"a\",\"x\",\"y\"]"),
+        (".a.x | key", "\"x\""),
+        (".a.x | path", "[\"a\",\"x\"]"),
+        (".a.x | select(key == \"x\")", "null"),
+        (".a.x | if key == \"x\" then 1 else 2 end", "1"),
+        (".a.x | [key, path]", "[\"x\",[\"a\",\"x\"]]"),
+        (".a.x | select(true) | key", "\"x\""),
+        (".a.c[5] | key", "5"),
+        (".a.c[5] | select(key == 5)", "null"),
+        (".a.x | limit(1; key)", "\"x\""),
+        (".a.x | try (key) catch \"e\"", "\"x\""),
+        // Not the absent route: an absent `parent` is a node no constant can
+        // spell, so this stays on the eager evaluator (see the yq-mode
+        // sibling test for the divergence that leaves visible).
+        (".a.x.y | [path, parent]", "[[\"a\",\"x\",\"y\"],{}]"),
+    ] {
+        let (out, _, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "`{filter}`: {out:?}");
+        assert_eq!(out.trim(), expected, "`{filter}`");
+    }
+    Ok(())
+}

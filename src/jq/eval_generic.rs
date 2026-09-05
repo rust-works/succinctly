@@ -51,7 +51,7 @@ use super::eval::{
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
-use super::expr::{Builtin, CompareOp, Expr, FormatType, ObjectEntry, ObjectKey, Pattern};
+use super::expr::{Builtin, CompareOp, Expr, FormatType, Literal, ObjectEntry, ObjectKey, Pattern};
 use super::slice::{slice_str, SliceBounds};
 use super::value::{owned_value_eq, NumberRepr, OwnedValue};
 use crate::json::JsonIndex;
@@ -5689,6 +5689,17 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                         }
                     }
                 }
+                // #2416 step 2: a head that can land on an absent node.
+                // Outside the `PathContextRoute` gate above on purpose --
+                // that gate turns the *walk* off so the two routes can be
+                // diffed, and this is phase 3's absent half, not the walk:
+                // it is the only thing that answers these pipes exactly, so
+                // switching it off would change answers, not just cost.
+                if let Some(root) = cursor {
+                    if let Some(result) = try_path_context_absent_walk::<S, V>(exprs, root) {
+                        return result;
+                    }
+                }
                 // #2416 phase 3: a pipe the walk declined runs here, in the
                 // generic evaluator with `key`/`parent`/`path` answered as
                 // cursor properties, unless `path_context_needs_eager` says
@@ -7381,6 +7392,13 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
                 if let Some(flow) = try_path_context_walk_sink::<S, V>(exprs, root, sink) {
                     return flow;
                 }
+            }
+        }
+        // #2416 step 2: see `eval_single`'s `Expr::Pipe` arm for why this
+        // sits outside the `PathContextRoute` gate above.
+        if let Some(root) = cursor {
+            if let Some(flow) = try_path_context_absent_sink::<S, V>(exprs, root, sink) {
+                return flow;
             }
         }
         // #2416 phase 3: see `eval_single`'s `Expr::Pipe` arm -- the same
@@ -11164,9 +11182,14 @@ fn path_context_needs_eager(exprs: &[Expr]) -> bool {
     }
     let mut is_node = true;
     let mut can_absent = false;
+    // #2416 step 2: a head that can miss no longer sends the pipe here on
+    // its own -- `try_path_context_absent_{sink,walk}` walk the head as
+    // positions and resolve the rest's path-context builtins against
+    // whichever one they reach. What that route declines still comes here.
+    let absent_routed = path_context_absent_split(exprs).is_some();
     for stage in exprs {
         if needs_path_context(stage) {
-            if !is_node || can_absent || !path_context_stage_native(stage) {
+            if !is_node || (can_absent && !absent_routed) || !path_context_stage_native(stage) {
                 return true;
             }
             is_node = path_context_stage_preserves_node(stage);
@@ -11213,7 +11236,6 @@ fn step_can_yield_absent(expr: &Expr, incoming: bool) -> bool {
 }
 
 /// [`step_can_yield_absent`] folded over a navigational head.
-#[cfg(test)]
 fn head_can_yield_absent(stages: &[Expr]) -> bool {
     stages
         .iter()
@@ -11499,6 +11521,382 @@ fn try_path_context_cursor_walk<S: EvalSemantics, V: DocumentValue>(
         // so `false` is what it actually delivered.
         fold_pipe_stages::<S, V>(resolved, rest, false)
     })
+}
+
+/// Whether an expression's path-context builtins can be *resolved to
+/// constants* once the position they stand at is known (#2416 step 2).
+///
+/// At an absent position the value is `null` and there is no cursor, so
+/// nothing in the generic evaluator can answer `key`/`path` the way
+/// [`cursor_key`] answers them for a live node -- and `V` has no null to
+/// hand it either, since a `DocumentValue` is always a view onto real
+/// document bytes. But an absent position is fully described by the path
+/// that reached it, and `key`/`path`/`file_index` are functions of that path
+/// alone. Replacing them with literals *before* evaluation leaves an
+/// ordinary filter over `null`, which the existing evaluator answers with no
+/// path context at all -- so the whole class leaves the eager evaluator
+/// without a single construct's semantics being re-derived.
+///
+/// `parent`/`parent(n)` are deliberately **not** resolvable here: they
+/// answer with a document *node*, which no literal can spell. Reifying the
+/// materialized ancestor would pay exactly the per-node materialization
+/// [`path_context_fans_out`] exists to avoid, so a stage that reaches one
+/// from a possibly-absent position stays on the eager route (`.a.x.y |
+/// [path, parent]`) -- the one piece of the absent class this step leaves
+/// behind.
+///
+/// Recursion stops at anything that changes the value a nested builtin
+/// stands on: a `select`/`if`/comparison operand still sees the stage's own
+/// input, but `.y` inside the stage does not, so a `key` under one is
+/// refused rather than resolved against the wrong position. The `_` arm is
+/// therefore a refusal, not a fallback -- reached only with
+/// `needs_path_context` already true.
+fn path_context_absent_resolvable(expr: &Expr) -> bool {
+    if !needs_path_context(expr) {
+        // Nothing to resolve. Whatever this is, it evaluates against the
+        // `null` an absent position holds and answers exactly as it does on
+        // the eager route, which navigated into the same `null`.
+        return true;
+    }
+    match expr {
+        Expr::Builtin(Builtin::Key | Builtin::PathNoArg | Builtin::FileIndex) => true,
+        Expr::Paren(inner) | Expr::Array(inner) | Expr::Optional(inner) => {
+            path_context_absent_resolvable(inner)
+        }
+        Expr::FirstExpr(inner) | Expr::LastExpr(inner) => path_context_absent_resolvable(inner),
+        Expr::Builtin(Builtin::FirstStream(inner) | Builtin::LastStream(inner)) => {
+            path_context_absent_resolvable(inner)
+        }
+        Expr::Comma(exprs) => exprs.iter().all(path_context_absent_resolvable),
+        Expr::Pipe(exprs) => path_context_absent_stages_resolvable(exprs),
+        Expr::Builtin(Builtin::Select(cond)) => path_context_absent_resolvable(cond),
+        Expr::Limit { n, expr } => {
+            path_context_absent_resolvable(n) && path_context_absent_resolvable(expr)
+        }
+        Expr::Try { expr, catch } => {
+            path_context_absent_resolvable(expr)
+                && catch
+                    .as_deref()
+                    .map_or(true, path_context_absent_resolvable)
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            path_context_absent_resolvable(cond)
+                && path_context_absent_resolvable(then_branch)
+                && path_context_absent_resolvable(else_branch)
+        }
+        Expr::Compare { left, right, .. } => {
+            path_context_absent_resolvable(left) && path_context_absent_resolvable(right)
+        }
+        Expr::And(left, right) | Expr::Or(left, right) => {
+            path_context_absent_resolvable(left) && path_context_absent_resolvable(right)
+        }
+        Expr::Negate(inner) => path_context_absent_resolvable(inner),
+        _ => false,
+    }
+}
+
+/// [`path_context_absent_resolvable`] over a pipe's stages: a stage may read
+/// the position only while the position has not moved, because the resolved
+/// constants describe one position and nothing carries a second one.
+fn path_context_absent_stages_resolvable(stages: &[Expr]) -> bool {
+    let mut moved = false;
+    for stage in stages {
+        if needs_path_context(stage) && (moved || !path_context_absent_resolvable(stage)) {
+            return false;
+        }
+        moved = moved || !path_context_absent_keeps_position(stage);
+    }
+    true
+}
+
+/// Whether a stage leaves the position it was given untouched.
+///
+/// Stricter than [`path_context_stage_preserves_node`], which also admits
+/// navigation (`.a?`, `parent`, `.[]`): a *cursor* moves with those and
+/// still answers `key` correctly, while an absent position is carried as a
+/// resolved constant that navigation would silently make stale.
+fn path_context_absent_keeps_position(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identity | Expr::Builtin(Builtin::Select(_)) => true,
+        Expr::Paren(inner) | Expr::FirstExpr(inner) | Expr::LastExpr(inner) => {
+            path_context_absent_keeps_position(inner)
+        }
+        Expr::Builtin(Builtin::FirstStream(inner) | Builtin::LastStream(inner)) => {
+            path_context_absent_keeps_position(inner)
+        }
+        Expr::Limit { expr, .. } => path_context_absent_keeps_position(expr),
+        Expr::Try { expr, catch } => {
+            path_context_absent_keeps_position(expr)
+                && catch
+                    .as_deref()
+                    .map_or(true, path_context_absent_keeps_position)
+        }
+        Expr::Pipe(exprs) | Expr::Comma(exprs) => {
+            exprs.iter().all(path_context_absent_keeps_position)
+        }
+        _ => false,
+    }
+}
+
+/// The static gate for the absent route (#2416 step 2): the navigational
+/// head whose position has to be walked, and the stages that read it.
+///
+/// `None` leaves the pipe exactly where it was -- which, for every pipe this
+/// accepts, is the eager evaluator: [`path_context_needs_eager`] hands over
+/// any pipe whose head can miss, and that is the reason this route exists to
+/// remove.
+///
+/// Four conditions, all static, all decided before the first output (the
+/// sink cannot un-emit):
+///
+/// * the head can actually miss ([`head_can_yield_absent`]) -- a head that
+///   cannot is already exact on the cursor route, and routing it here would
+///   trade a lazy stage for an eagerly collected `Vec` of positions;
+/// * the head does not fan out, the same guard [`path_context_walk_split`]
+///   applies and for the same reason: one position per element is a `Vec`
+///   the size of the document;
+/// * every path-context builtin left in `rest` resolves against the walked
+///   position ([`path_context_absent_stages_resolvable`]);
+/// * `rest` does not itself need the eager evaluator. That one is not
+///   optional: `rest` is evaluated from the walked *node*, so an eager
+///   evaluation of it would materialize a document re-rooted there and
+///   answer `key`/`path` against the wrong root.
+///
+/// A pipe [`path_context_walk_split`] already takes is left to the walk,
+/// which emits cursors and needs no resolution at all. That is not just
+/// deduplication: it keeps `PathContextRoute::BridgeOnly` meaning what
+/// `tests/jq_evaluator_parity_tests.rs` needs it to mean for those pipes --
+/// walk off, bridge on -- instead of quietly substituting a third route.
+fn path_context_absent_split(exprs: &[Expr]) -> Option<(&[Expr], &[Expr])> {
+    if path_context_walk_split(exprs).is_some() {
+        return None;
+    }
+    let head_len = exprs
+        .iter()
+        .take_while(|stage| path_context_is_navigational(stage))
+        .count();
+    let (head, rest) = exprs.split_at(head_len);
+    if rest.is_empty() || !rest.iter().any(needs_path_context) {
+        return None;
+    }
+    if !head_can_yield_absent(head) || head.iter().any(path_context_fans_out) {
+        return None;
+    }
+    if !path_context_absent_stages_resolvable(rest) || path_context_needs_eager(rest) {
+        return None;
+    }
+    Some((head, rest))
+}
+
+/// The `Expr` one resolved path component spells.
+///
+/// A path component is a mapping key (a string) or a sequence index (an
+/// integer) -- [`cursor_key`] and `path_step_generic` are the only two
+/// things that build one, and neither produces anything else.
+fn path_component_literal(component: &OwnedValue) -> Expr {
+    match component {
+        OwnedValue::String(s) => Expr::Literal(Literal::String(s.clone())),
+        OwnedValue::Int(i) => Expr::Literal(Literal::Int(*i)),
+        _ => {
+            debug_assert!(
+                false,
+                "a path component is a string key or an integer index"
+            );
+            Expr::Literal(Literal::Null)
+        }
+    }
+}
+
+/// Replace every path-context builtin in `expr` with the constant it answers
+/// at `pos`, leaving a filter that needs no path context at all.
+///
+/// The arms mirror [`path_context_absent_resolvable`] exactly, and the two
+/// are held together by `path_context_absent_resolution_clears_path_context`
+/// rather than by their comments -- a shape admitted there and not rewritten
+/// here would evaluate its `key` against no position and answer `null`,
+/// which is the silent-fallback failure ADR-0021 was written to end. The
+/// `_` arm is reached only for a subtree with no path-context builtin in it.
+fn path_context_resolve_absent<V: DocumentValue>(expr: &Expr, pos: &PathContextPos<V>) -> Expr {
+    if !needs_path_context(expr) {
+        return expr.clone();
+    }
+    let boxed = |e: &Expr| Box::new(path_context_resolve_absent::<V>(e, pos));
+    match expr {
+        // `key` at the document root emits nothing (#2421). An absent
+        // position always has at least one component -- it took a `.a`/`[i]`
+        // step to become absent -- so this is the walk's own `path.last()`.
+        Expr::Builtin(Builtin::Key) => match pos.path.last() {
+            Some(component) => path_component_literal(component),
+            None => Expr::Builtin(Builtin::Empty),
+        },
+        Expr::Builtin(Builtin::PathNoArg) => {
+            let components: Vec<Expr> = pos.path.iter().map(path_component_literal).collect();
+            Expr::Array(Box::new(match components.len() {
+                0 => Expr::Builtin(Builtin::Empty),
+                1 => components.into_iter().next().expect("len checked"),
+                _ => Expr::Comma(components),
+            }))
+        }
+        // The generic route carries no file-origin table (#2150, #2427), so
+        // this is the same `0` the eager arm answers with an empty one.
+        Expr::Builtin(Builtin::FileIndex) => Expr::Literal(Literal::Int(0)),
+        Expr::Paren(inner) => Expr::Paren(boxed(inner)),
+        Expr::Array(inner) => Expr::Array(boxed(inner)),
+        Expr::Optional(inner) => Expr::Optional(boxed(inner)),
+        Expr::FirstExpr(inner) => Expr::FirstExpr(boxed(inner)),
+        Expr::LastExpr(inner) => Expr::LastExpr(boxed(inner)),
+        Expr::Negate(inner) => Expr::Negate(boxed(inner)),
+        Expr::Builtin(Builtin::FirstStream(inner)) => {
+            Expr::Builtin(Builtin::FirstStream(boxed(inner)))
+        }
+        Expr::Builtin(Builtin::LastStream(inner)) => {
+            Expr::Builtin(Builtin::LastStream(boxed(inner)))
+        }
+        Expr::Builtin(Builtin::Select(cond)) => Expr::Builtin(Builtin::Select(boxed(cond))),
+        Expr::Comma(exprs) => Expr::Comma(
+            exprs
+                .iter()
+                .map(|e| path_context_resolve_absent::<V>(e, pos))
+                .collect(),
+        ),
+        Expr::Pipe(exprs) => Expr::Pipe(
+            exprs
+                .iter()
+                .map(|e| path_context_resolve_absent::<V>(e, pos))
+                .collect(),
+        ),
+        Expr::Limit { n, expr } => Expr::Limit {
+            n: boxed(n),
+            expr: boxed(expr),
+        },
+        Expr::Try { expr, catch } => Expr::Try {
+            expr: boxed(expr),
+            catch: catch.as_deref().map(boxed),
+        },
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => Expr::If {
+            cond: boxed(cond),
+            then_branch: boxed(then_branch),
+            else_branch: boxed(else_branch),
+        },
+        Expr::Compare { op, left, right } => Expr::Compare {
+            op: *op,
+            left: boxed(left),
+            right: boxed(right),
+        },
+        Expr::And(left, right) => Expr::And(boxed(left), boxed(right)),
+        Expr::Or(left, right) => Expr::Or(boxed(left), boxed(right)),
+        other => other.clone(),
+    }
+}
+
+/// The absent route (#2416 step 2): walk the navigational head as positions,
+/// then evaluate `rest` from each one.
+///
+/// A position that landed on a real node is handed straight back to
+/// [`eval_each_pipe_generic`] with its cursor, which is what the pipe would
+/// have done all along if the head could not have missed. An absent position
+/// has no cursor and no `V` to stand on, so `rest`'s path-context builtins
+/// are resolved to constants ([`path_context_resolve_absent`]) and what is
+/// left runs over `OwnedValue::Null` in the ordinary owned evaluator -- the
+/// same evaluator, and therefore the same `select`/`if`/comparison
+/// semantics, the rest of the pipeline already uses.
+///
+/// `optional` is `false` for `rest`, the same convention
+/// [`try_path_context_walk_sink`] documents: the eager bridge this replaces
+/// restarts every evaluation at `false` regardless of what its caller
+/// passed.
+fn try_path_context_absent_sink<S: EvalSemantics, V: DocumentValue>(
+    exprs: &[Expr],
+    root: V::Cursor,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Option<Flow> {
+    let (head, rest) = path_context_absent_split(exprs)?;
+    let root_pos = match path_context_root::<V>(root) {
+        Ok(pos) => pos,
+        Err(control) => return Some(Flow::Escaped(control)),
+    };
+    let mut positions: Vec<PathContextPos<V>> = Vec::new();
+    // Positions reached before an error are still evaluated -- jq's
+    // generator never un-emits an output it already produced -- and the
+    // error follows them, the same rule `path_context_step_generic` states.
+    let stepped =
+        path_context_step_generic::<S, V>(&Expr::Pipe(head.to_vec()), &root_pos, &mut positions);
+    for pos in &positions {
+        let flow = match &pos.node {
+            PathNode::At(c) => {
+                eval_each_pipe_generic::<S, V>(rest, c.value(), false, Some(*c), sink)
+            }
+            PathNode::Absent => {
+                let resolved = Expr::Pipe(
+                    rest.iter()
+                        .map(|stage| path_context_resolve_absent::<V>(stage, pos))
+                        .collect(),
+                );
+                debug_assert!(
+                    !needs_path_context(&resolved),
+                    "path_context_absent_split admitted a stage the resolver leaves unresolved"
+                );
+                eval_each_owned::<S>(&resolved, &OwnedValue::Null, false, &mut |v| {
+                    sink(GenericItem::Owned(v))
+                })
+            }
+        };
+        match flow {
+            Flow::Exhausted => {}
+            other => return Some(other),
+        }
+    }
+    Some(match stepped {
+        Ok(()) => Flow::Exhausted,
+        Err(e) => Flow::Escaped(Control::Error(e)),
+    })
+}
+
+/// The non-sink half of [`try_path_context_absent_sink`], for
+/// `eval_single`'s `Expr::Pipe` arm -- one route, driven by a collecting
+/// sink, so the two cannot disagree. Same normalization
+/// [`collect_each_generic`] applies: a clean run keeps cursors as cursors,
+/// an escape after some outputs becomes a `Partial` carrying them.
+fn try_path_context_absent_walk<S: EvalSemantics, V: DocumentValue>(
+    exprs: &[Expr],
+    root: V::Cursor,
+) -> Option<GenericResult<V>> {
+    path_context_absent_split(exprs)?;
+    let mut items: Vec<GenericItem<V>> = Vec::new();
+    let flow = try_path_context_absent_sink::<S, V>(exprs, root, &mut |item| {
+        items.push(item);
+        Demand::Continue
+    })?;
+    let control = match flow {
+        Flow::Exhausted | Flow::Stopped { pending: None } => {
+            return Some(match items_to_generic_result(items) {
+                Ok(result) => result,
+                Err((prefix, control)) => partial_generic(prefix, control),
+            })
+        }
+        Flow::Stopped {
+            pending: Some(control),
+        }
+        | Flow::Escaped(control) => control,
+    };
+    let mut owned = vec_with_capacity(items.len());
+    for item in items {
+        match generic_item_into_owned(item) {
+            Ok(v) => owned.push(v),
+            // A decode failure while rendering the prefix is the error: the
+            // secondary-failure rule `resolve_terminal_prefix` applies.
+            Err(failure) => return Some(partial_generic(owned, failure)),
+        }
+    }
+    Some(partial_generic(owned, control))
 }
 
 fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
@@ -21529,12 +21927,36 @@ mod tests {
         assert!(eager(".a | tostring | key"));
         assert!(eager("to_entries | .[0] | key"));
         assert!(eager("[.a] | .[0] | parent"));
-        // Reason 2: a head that can reach an absent node, then a computed stage.
-        assert!(eager(".a.b | select(key == \"b\")"));
-        assert!(eager(".a | select(true) | key"));
+        // #2416 step 2: a head that can reach an absent node is no longer a
+        // reason on its own -- `path_context_absent_split` walks the head as
+        // positions and resolves the rest's `key`/`path`/`file_index`
+        // against whichever one it reaches.
+        assert!(!eager(".a.b | select(key == \"b\")"));
+        assert!(!eager(".a | select(true) | key"));
+        assert!(!eager(".a.b | if key == \"b\" then 1 else 2 end"));
+        assert!(!eager(".a.b | key | tostring"));
+        // `[key, path]` has no row here: the *walk* takes it end to end
+        // (`path_context_is_cursor_walkable` admits `[..]`, and its fan-out
+        // is paths-only), so it never reached the eager evaluator to begin
+        // with -- `path_context_absent_split` leaves those alone.
         assert!(
             !eager(".a[] | select(true) | key"),
             "iterate cannot yield absent"
+        );
+        // ...but three shapes of it still are, and each is a real limit of
+        // resolving the position to constants rather than an oversight:
+        // `parent` answers with a document *node* no literal can spell;
+        // navigation after a non-navigational stage moves the position the
+        // constants describe; and a fan-out head would collect one position
+        // per element, the guard `path_context_walk_split` already applies.
+        assert!(eager(".a.b | [path, parent]"), "parent is not a constant");
+        assert!(
+            eager(".a.b | select(true) | .c | key"),
+            "navigation after a non-navigational stage moves the position"
+        );
+        assert!(
+            eager(".[] | .k | select(key == \"k\")"),
+            "a fan-out head collects one position per element"
         );
         // #2416 phase 3, this PR: `as` is now single-native
         // (`collect_each_generic` over `each_as_generic`), so a pipe with it
@@ -21591,10 +22013,113 @@ mod tests {
             "`.x` can be absent"
         );
         assert!(!eager(".x[] | first(.a | parent | parent)"));
-        // Node-preserving stages carry the absent possibility along.
+        // Node-preserving stages carry the absent possibility along, but
+        // `?` is not one the absent split can walk: `path_context_is_
+        // navigational` excludes it (the walk's own documented exclusion --
+        // `?` in path context is not `?` in a path expression), so the head
+        // stops before it and there is no position to resolve against.
         assert!(eager(".a[5]? | key"));
-        assert!(eager(".a | select(true) | key"));
         assert!(!eager(".a[] | select(true) | key"));
+    }
+
+    /// The absent route's gate and its rewriter are two descriptions of one
+    /// closed list, and CLAUDE.md's rule for that pair is "one definition,
+    /// plus a test that the call sites agree". They cannot be one function
+    /// -- the gate is static and the rewriter needs a position -- so this
+    /// asserts the property that matters instead: a shape
+    /// [`path_context_absent_resolvable`] admits must come out of
+    /// [`path_context_resolve_absent`] with **no** path context left in it.
+    /// A shape admitted and not rewritten would evaluate its `key` against
+    /// nothing and answer `null`, which is exactly the silent fallback
+    /// ADR-0021 was written to end.
+    #[test]
+    fn path_context_absent_resolution_clears_path_context_2416() {
+        let doc = br#"{"a":{"b":1}}"#;
+        let index = JsonIndex::build(doc);
+        let root = index.root(doc);
+        // A position two components deep, both of them absent, so `key`
+        // and `path` resolve to different constants.
+        let pos: PathContextPos<crate::json::StandardJson<'_, Vec<u64>>> = PathContextPos {
+            node: PathNode::Absent,
+            path: vec![
+                OwnedValue::String("a".to_string()),
+                OwnedValue::String("x".to_string()),
+            ],
+            ancestors: vec![PathNode::At(root), PathNode::Absent],
+        };
+        for filter in [
+            "key",
+            "path",
+            "file_index",
+            "(key)",
+            "[key, path]",
+            "(key, path)",
+            "select(key == \"x\")",
+            "if key == \"x\" then 1 else 2 end",
+            "first(key)",
+            "last(path)",
+            "limit(1; key)",
+            "try (key) catch \"e\"",
+            "(key == \"x\") and (path == [])",
+            "-(file_index)",
+            "key | tostring",
+            "select(true) | key",
+            "(key)?",
+        ] {
+            let expr = parse(filter).unwrap();
+            assert!(
+                path_context_absent_resolvable(&expr),
+                "gate refuses `{filter}`; drop the row or widen the gate"
+            );
+            let resolved = path_context_resolve_absent(&expr, &pos);
+            assert!(
+                !needs_path_context(&resolved),
+                "`{filter}` resolved to `{resolved:?}`, which still needs path context"
+            );
+        }
+        // `parent` is the deliberate exclusion: it answers with a document
+        // node, which no literal spells.
+        for filter in ["parent", "parent(1)", "[path, parent]", "select(parent)"] {
+            assert!(
+                !path_context_absent_resolvable(&parse(filter).unwrap()),
+                "`{filter}` must stay on the eager route"
+            );
+        }
+    }
+
+    /// The split's four static conditions, each pinned by a shape that trips
+    /// exactly one of them.
+    #[test]
+    fn path_context_absent_split_pins_its_four_conditions_2416() {
+        let split = |f: &str| {
+            let stages = match parse(f).unwrap() {
+                Expr::Pipe(stages) => stages,
+                other => vec![other],
+            };
+            path_context_absent_split(&stages).map(|(head, rest)| (head.len(), rest.len()))
+        };
+        assert_eq!(split(".a.b | select(key == \"b\")"), Some((1, 1)));
+        assert_eq!(split(".a | select(true) | key"), Some((1, 2)));
+        assert_eq!(
+            split(".a.b.c | if key == \"c\" then 1 else 2 end"),
+            Some((1, 1))
+        );
+        // The head cannot miss: already exact on the cursor route.
+        assert_eq!(split(".[] | select(key == \"b\")"), None);
+        // Nothing left to read the position, or a shape the walk already
+        // takes end to end: the walk's business, not this route's.
+        assert_eq!(split(".a.b | key"), None);
+        assert_eq!(split(".a.b | parent | key"), None);
+        // A fan-out head would collect one position per element.
+        assert_eq!(split(".[] | .k | select(key == \"k\")"), None);
+        // `parent` is not a constant.
+        assert_eq!(split(".a.b | [path, parent]"), None);
+        // Navigation after a non-navigational stage moves the position the
+        // constants describe.
+        assert_eq!(split(".a.b | select(true) | .c | key"), None);
+        // `rest` would take the eager evaluator, which would materialize a
+        // document re-rooted at the walked node.
+        assert_eq!(split(".a.b | tostring | key"), None);
     }
 
     /// The absent-reachability fold behind reason 2.
