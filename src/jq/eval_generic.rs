@@ -6060,6 +6060,12 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // of bridging.
         Expr::Label { .. } => collect_each_generic::<S, V>(expr, value, optional, cursor),
 
+        // #2416 phase 3: a bound call natively via `eval_each_generic`'s own
+        // `DefCall` arm (`bind_def_call`/`enter_def_call_frame`) -- the same
+        // recursion-depth accounting that arm already does, just reached
+        // through `collect_each_generic` instead of the eager bridge.
+        Expr::DefCall { .. } => collect_each_generic::<S, V>(expr, value, optional, cursor),
+
         Expr::Comma(exprs) => {
             let mut out: Vec<OwnedValue> = Vec::new();
             for expr in exprs {
@@ -11314,6 +11320,13 @@ fn path_context_single_native(expr: &Expr) -> bool {
         // Native since #2416 phase 3 (`each_label_generic`): the body is all
         // that can carry a path-context builtin.
         Expr::Label { body, .. } => path_context_single_native(body),
+        // Native since #2416 phase 3 (`eval_each_generic`'s own `DefCall`
+        // arm, `bind_def_call`). `def.body` is the only field
+        // `needs_path_context`'s own identical arm recurses into --
+        // deliberately cheap and syntax-only: a builtin reaching `body`
+        // solely through a call *argument* is a known, narrower gap, same
+        // scoping precedent as there.
+        Expr::DefCall { def, .. } => path_context_single_native(&def.body),
         _ => false,
     }
 }
