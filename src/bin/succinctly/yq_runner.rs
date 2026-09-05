@@ -8075,6 +8075,10 @@ mod tests {
             // `-0.0 == 0.0`, with different bit patterns.
             (OwnedValue::Float(-0.0), OwnedValue::Float(0.0)),
             (OwnedValue::Int(0), OwnedValue::Float(-0.0)),
+            // Null and Bool, whose only requirement is that they hash as
+            // themselves.
+            (OwnedValue::Null, OwnedValue::Null),
+            (OwnedValue::Bool(true), OwnedValue::Bool(true)),
             // Object equality is order-independent.
             (
                 OwnedValue::Object(IndexMap::from_iter([
@@ -8119,6 +8123,26 @@ mod tests {
         let b = OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Int(1)]);
         assert_ne!(a, b);
         assert_ne!(owned_value_align_hash(&a), owned_value_align_hash(&b));
+
+        // `null`, `false` and `0` are three different values, and a hash
+        // that ran them together would make the alignment pair them up.
+        let distinct = [
+            OwnedValue::Null,
+            OwnedValue::Bool(false),
+            OwnedValue::Bool(true),
+            OwnedValue::Int(0),
+            OwnedValue::String(String::new()),
+        ];
+        let hashes: Vec<u64> = distinct.iter().map(owned_value_align_hash).collect();
+        for i in 0..hashes.len() {
+            for j in (i + 1)..hashes.len() {
+                assert_ne!(
+                    hashes[i], hashes[j],
+                    "{:?} and {:?} must not share a bucket",
+                    distinct[i], distinct[j]
+                );
+            }
+        }
     }
 
     /// NaN equals nothing, itself included, so it can never be matched —
@@ -8173,6 +8197,21 @@ mod tests {
                 path: Box::new(Expr::Field("a".into())),
                 filter: Box::new(Expr::Array(Box::new(lit()))),
             }),
+            Some(false)
+        );
+
+        // A computed object key is closed only when the key expression is:
+        // `{(1): 2}` builds everything itself, `{(.k): 2}` does not.
+        let object_with_key = |key: Expr| Expr::Assign {
+            path: Box::new(Expr::Field("a".into())),
+            value: Box::new(Expr::Object(vec![succinctly::jq::ObjectEntry {
+                key: ObjectKey::Expr(Box::new(key)),
+                value: lit(),
+            }])),
+        };
+        assert_eq!(fresh_of(&object_with_key(lit())), Some(true));
+        assert_eq!(
+            fresh_of(&object_with_key(Expr::Field("k".into()))),
             Some(false)
         );
     }
