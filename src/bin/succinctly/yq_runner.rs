@@ -1522,7 +1522,13 @@ fn stream_yaml_sort_keys_alias_fallback<W: Write>(
         doc_streamed,
         any_truthy,
     } = state;
-    let (doc_results, num_docs) = evaluate_yaml_direct_filtered(
+    // Every caller of this function already parsed `bytes` successfully
+    // (that `YamlIndex::build` is exactly how `index.has_aliases()` was
+    // known before deciding to call this at all) -- `YamlIndex::build` is
+    // pure, so this second parse of the identical bytes cannot fail either.
+    // The `?` below exists only because `evaluate_yaml_direct_filtered`'s
+    // signature returns `Result` for its *own*, more general callers.
+    let eval_result = evaluate_yaml_direct_filtered(
         bytes,
         &Expr::Identity,
         doc_filter,
@@ -1533,7 +1539,8 @@ fn stream_yaml_sort_keys_alias_fallback<W: Write>(
             sort_keys: true,
             mark_json_sourced: false,
         },
-    )?;
+    );
+    let (doc_results, num_docs) = eval_result?; // omni-dev: coverage tolerate-line reason="unreachable: bytes already parsed successfully by every caller (#1350)"
     for results in doc_results {
         for (result, comments) in results {
             // Mirrors the DOM `else` branch's own identical truthiness
