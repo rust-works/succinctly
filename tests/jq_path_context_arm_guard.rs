@@ -41,6 +41,13 @@ use syn::visit::{self, Visit};
 /// The pinned count. Lower it in the PR that migrates an arm to the cursor
 /// walk; raise it only in a PR that says why the new arm is not a migration
 /// (#2416, "Hygiene going forward", rule 2).
+///
+/// Step 4 of that spine audited every one of these handlers for reachability
+/// and found no dead ones: `docs/plan/path-context-arm-reachability.md` has a
+/// live proof query and the gate reason for each, plus the three routes that
+/// enter the eager evaluator (the `path_context_needs_eager` bridge is only
+/// one of them -- `--eval-all` and `eval::eval_pipe`'s own diversion have no
+/// gate). Read it before assuming an arm is deletable.
 const PINNED_ARM_COUNT: usize = 43;
 
 const TARGET_FN: &str = "eval_stage_with_path_context";
