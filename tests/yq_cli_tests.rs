@@ -1651,7 +1651,14 @@ fn test_yq_optional_ambient_no_longer_suppresses_rest_error_2073() -> Result<()>
     )?;
     assert_eq!(code, 1, "stderr: {stderr}");
     assert!(stderr.contains("boom"), "stderr: {stderr}");
-    assert_eq!(stdout, "0\n");
+    // Nothing on stdout since #2451: a union branch that raises discards the
+    // whole expression's output in yq mode. Real yq has no `?` to spell this
+    // exact filter with (`yq '.a | (.[])? | ...'` is a lexer error), but its
+    // closest legal shape agrees -- `yq -o=json -I0 '.a | .[] | (key,
+    // error("boom"))'` on `a: [1, 2, 3]` prints nothing and `Error: boom`,
+    // exit 1 (captured 2026-09-06, v4.53.3). What #2073 pins is unchanged:
+    // the error is *not* suppressed by the ambient `?`.
+    assert_eq!(stdout, "");
 
     Ok(())
 }
@@ -15671,7 +15678,12 @@ fn test_eval_all_arithmetic_fanout_survives_file_index_in_pipe_issue_822() -> Re
         &["--eval-all", "-o", "json"],
     )?;
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "2\n3\n4\n0\n2\n3\n4\n1");
+    // #2451 made this branch-major: the union runs `((1,2,3) + 1)` over the
+    // whole context list `.[]` produced, then `file_index` over the same
+    // list. Still short of yq's 16 lines, which need `EvaluateTogether`
+    // (#2427) to make the *arithmetic* cartesian too -- but the order is
+    // yq's now.
+    assert_eq!(stdout.trim(), "2\n3\n4\n2\n3\n4\n0\n1");
 
     // #2420's shape: unparenthesised, the comma is now the outermost
     // operator, so this is `(.[] | ((1,2,3) + 1)), file_index` -- the
@@ -15707,7 +15719,8 @@ fn test_eval_all_compare_fanout_survives_file_index_in_pipe_issue_822() -> Resul
         &["--eval-all", "-o", "json"],
     )?;
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "false\ntrue\ntrue\n0\nfalse\ntrue\ntrue\n1");
+    // Branch-major since #2451; see the `Expr::Arithmetic` twin above.
+    assert_eq!(stdout.trim(), "false\ntrue\ntrue\nfalse\ntrue\ntrue\n0\n1");
 
     let (stdout, _stderr, code) = run_yq_files(
         ".[] | ((1,2,3) > 1), file_index",
@@ -31422,7 +31435,7 @@ fn test_yq_pipe_precedence_holds_at_every_depth_2420() -> Result<()> {
     Ok(())
 }
 
-/// #2420: two probes where succinctly's post-fix grouping is right but the
+/// #2420: a probe where succinctly's post-fix grouping is right but the
 /// *output* still differs from real yq, for reasons scoped elsewhere. Pinned
 /// so the residue is visible rather than mistaken for a precedence bug.
 #[test]
@@ -31447,22 +31460,10 @@ fn test_yq_pipe_precedence_residual_divergences_2420() -> Result<()> {
         "stderr: {stderr:?}"
     );
 
-    // Both sides fully parenthesised, so #2420's precedence plays no part --
-    // yet the two tools still disagree, on *order*:
-    // $ yq -o=json -I0 '(.a, .b) | (.c, .d)'  on 'a: {c: 3, d: 4}\nb: {c: 5, d: 6}\n'
-    //   =>  3 / 5 / 4 / 6
-    // $ jq -c        '(.a, .b) | (.c, .d)'    =>  3 / 4 / 5 / 6
-    // yq evaluates a `,` over the whole *context list* produced by the pipe's
-    // left side (`.c` over both, then `.d` over both), where jq and succinctly
-    // pipe each left-hand value independently. That is yq's evaluation model,
-    // not its precedence table, and the parser cannot express it.
-    let (output, code) = run_yq_stdin(
-        "(.a, .b) | (.c, .d)",
-        "a: {c: 3, d: 4}\nb: {c: 5, d: 6}\n",
-        args,
-    )?;
-    assert_eq!(code, 0);
-    assert_eq!(output.trim(), "3\n4\n5\n6");
+    // The second residual this test used to carry -- `(.a, .b) | (.c, .d)`
+    // answering `3 4 5 6` where yq answers `3 5 4 6` -- is gone: that was
+    // yq's context-list evaluation model, not its precedence table, and
+    // #2451 implements it. See `test_yq_pipe_into_union_is_branch_major_2451`.
 
     Ok(())
 }
@@ -32133,5 +32134,219 @@ fn test_yq_all_four_empty_operand_shapes_are_indistinguishable_2460() -> Result<
             }
         }
     }
+    Ok(())
+}
+
+// =============================================================================
+// #2451: yq's context-list model for a single document
+// =============================================================================
+
+/// The document every #2451 row was captured against: `yq -o=json -I0 FILTER`
+/// on this YAML, and `/usr/bin/jq 1.7.1 -c FILTER` on the equivalent
+/// `{"a":{"c":3,"d":4},"b":{"c":5,"d":6},"n":[1,2,3]}`.
+const CONTEXT_LIST_DOC_2451: &str = "a: {c: 3, d: 4}\nb: {c: 5, d: 6}\nn: [1, 2, 3]\n";
+
+/// #2451 rule 1: a pipe into a union is **branch-major**.
+///
+/// Real yq has no scalar evaluation mode -- `Context.MatchingNodes`
+/// (`pkg/yqlib/context.go`, v4.53.3) is always a list. `|` hands its left
+/// side's whole list to its right side in one call (`operator_pipe.go`), and
+/// `,` evaluates each of its branches against that same whole list and
+/// concatenates the branch results in order (`operator_union.go`). So `.c`
+/// runs over every value the left side produced, *then* `.d` does -- where jq
+/// pipes each value independently and interleaves.
+///
+/// Every expectation below is a live capture, quoted per assertion. jq's own
+/// answer is quoted beside it and pinned in `jq_cli_tests.rs`'s
+/// `test_jq_pipe_into_union_stays_element_major_2451`, so the divergence is
+/// pinned from both sides.
+#[test]
+fn test_yq_pipe_into_union_is_branch_major_2451() -> Result<()> {
+    let args = &["-o", "json", "-I0"];
+    let doc = CONTEXT_LIST_DOC_2451;
+
+    // $ yq -o=json -I0 '(.a, .b) | (.c, .d)'  =>  3 / 5 / 4 / 6
+    // $ jq -c        '(.a, .b) | (.c, .d)'    =>  3 / 4 / 5 / 6
+    let (out, code) = run_yq_stdin("(.a, .b) | (.c, .d)", doc, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "3\n5\n4\n6");
+
+    // $ yq -o=json -I0 '(.a, .b) | (.c, .d) | . + 10'  =>  13 / 15 / 14 / 16
+    // $ jq -c        '(.a, .b) | (.c, .d) | . + 10'    =>  13 / 14 / 15 / 16
+    // The stage after the union runs per output, but over the union's own
+    // branch-major order.
+    let (out, code) = run_yq_stdin("(.a, .b) | (.c, .d) | . + 10", doc, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "13\n15\n14\n16");
+
+    // $ yq -o=json -I0 '.n[] | (., . * 10)'  =>  1 / 2 / 3 / 10 / 20 / 30
+    // $ jq -c        '.n[] | (., . * 10)'    =>  1 / 10 / 2 / 20 / 3 / 30
+    // The multiplicity need not come from a comma: `.[]` splats into one
+    // context list too.
+    let (out, code) = run_yq_stdin(".n[] | (., . * 10)", doc, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "1\n2\n3\n10\n20\n30");
+
+    // $ yq -o=json -I0 '[(.a, .b) | (.c, .d)]'  =>  [3,5,4,6]
+    // $ jq -c        '[(.a, .b) | (.c, .d)]'    =>  [3,4,5,6]
+    let (out, code) = run_yq_stdin("[(.a, .b) | (.c, .d)]", doc, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[3,5,4,6]");
+
+    // $ yq -o=json -I0 '(.a, .b) | with_entries(.) | (.c, .d)'  =>  3/5/4/6
+    // $ jq -c        '(.a, .b) | with_entries(.) | (.c, .d)'    =>  3/4/5/6
+    // The list the union sees is everything *upstream* of it, not just the
+    // stage immediately before: an intervening non-union stage does not
+    // re-split the context.
+    let (out, code) = run_yq_stdin("(.a, .b) | with_entries(.) | (.c, .d)", doc, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "3\n5\n4\n6");
+
+    // $ yq -o=json -I0 '(.a, .b) | (.c, .d) | (. + 1, . + 2)'
+    //     =>  4 / 6 / 5 / 7 / 5 / 7 / 6 / 8
+    // $ jq -c        '(.a, .b) | (.c, .d) | (. + 1, . + 2)'
+    //     =>  4 / 5 / 5 / 6 / 6 / 7 / 7 / 8
+    // A second union sees the *whole* concatenation the first one produced --
+    // the row no "continue per branch output" model reproduces.
+    let (out, code) = run_yq_stdin("(.a, .b) | (.c, .d) | (. + 1, . + 2)", doc, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "4\n6\n5\n7\n5\n7\n6\n8");
+
+    // $ yq -o=json -I0 '1 | (. + 1, . + 2) | (. * 10, . * 100)'
+    //     =>  20 / 30 / 200 / 300
+    // $ jq -c        '1 | (. + 1, . + 2) | (. * 10, . * 100)'
+    //     =>  20 / 200 / 30 / 300
+    // Branch-major even when the document root is the only input: the rule is
+    // about the union, not about how many values reached it.
+    let (out, code) = run_yq_stdin("1 | (. + 1, . + 2) | (. * 10, . * 100)", doc, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "20\n30\n200\n300");
+
+    Ok(())
+}
+
+/// #2451 rule 1, nesting: `|` is associative in yq's model (`pipeOperator`
+/// only threads its left side's node list into its right side), so a union
+/// reached through a *nested* pipe still sees the outer context list.
+///
+/// N1 and N2 print the same thing in real yq despite different bracketing,
+/// which is what a per-element pipe cannot produce for N2: grouping
+/// `(.c, .d) | (., .)` as one parenthesised right-hand stage would evaluate
+/// it once per left value and give `3 4 5 6`.
+#[test]
+fn test_yq_union_under_a_nested_pipe_still_sees_the_outer_list_2451() -> Result<()> {
+    let args = &["-o", "json", "-I0"];
+    let doc = CONTEXT_LIST_DOC_2451;
+
+    // $ yq -o=json -I0 '((.a, .b) | (.c, .d)) | (., . + 100)'
+    //     =>  3 / 5 / 4 / 6 / 103 / 105 / 104 / 106
+    // $ jq -c        '((.a, .b) | (.c, .d)) | (., . + 100)'
+    //     =>  3 / 103 / 4 / 104 / 5 / 105 / 6 / 106
+    let (out, code) = run_yq_stdin("((.a, .b) | (.c, .d)) | (., . + 100)", doc, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "3\n5\n4\n6\n103\n105\n104\n106");
+
+    // $ yq -o=json -I0 '(.a, .b) | ((.c, .d) | (., . + 100))'
+    //     =>  3 / 5 / 4 / 6 / 103 / 105 / 104 / 106
+    // $ jq -c        '(.a, .b) | ((.c, .d) | (., . + 100))'
+    //     =>  3 / 103 / 4 / 104 / 5 / 105 / 6 / 106
+    // Same output from a different bracketing, which is the point: `|` is
+    // associative in yq's model, so the union sees the outer list either way.
+    let (out, code) = run_yq_stdin("(.a, .b) | ((.c, .d) | (., . + 100))", doc, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "3\n5\n4\n6\n103\n105\n104\n106");
+
+    // Rule 1 does not reach operators that yq itself applies per node. `[...]`
+    // collects one array per context node unless every node carries
+    // `EvaluateTogether` (`operator_collect.go`), which only `--eval-all`'s
+    // document nodes do (#2427) -- so these two already agreed and still do.
+    //
+    // $ yq -o=json -I0 '(.a, .b) | [.c]'  =>  [3] / [5]
+    let (out, code) = run_yq_stdin("(.a, .b) | [.c]", doc, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[3]\n[5]");
+
+    // $ yq -o=json -I0 '(.a, .b) | ((.c, .d) | [.])'  =>  [3] / [5] / [4] / [6]
+    let (out, code) = run_yq_stdin("(.a, .b) | ((.c, .d) | [.])", doc, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[3]\n[5]\n[4]\n[6]");
+
+    // Likewise a binary operator: `crossFunctionWithPrefs` takes its
+    // per-node path for `,`-built nodes, so `+` still pairs within one node.
+    //
+    // $ yq -o=json -I0 '(.a, .b) | (.c + .d)'  =>  7 / 11
+    let (out, code) = run_yq_stdin("(.a, .b) | (.c + .d)", doc, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "7\n11");
+
+    // `as` binds one value at a time (`operator_variables.go`), so its body
+    // sees a one-element context and interleaves like jq.
+    //
+    // $ yq -o=json -I0 '(.a, .b) as $x | ($x.c, $x.d)'  =>  3 / 4 / 5 / 6
+    let (out, code) = run_yq_stdin("(.a, .b) as $x | ($x.c, $x.d)", doc, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "3\n4\n5\n6");
+
+    Ok(())
+}
+
+/// #2451 rule 1 and path context: `key`/`path`/`parent` after a union are
+/// answered from each value's own cursor, so branch-major ordering reaches
+/// them too. These are the sweep rows
+/// (`scripts/jq-path-context-oracle-sweep.sh`) whose `comma_stream` manifest
+/// entry this change retires.
+#[test]
+fn test_yq_branch_major_order_reaches_path_context_2451() -> Result<()> {
+    let args = &["-o", "json", "-I0"];
+    let doc = CONTEXT_LIST_DOC_2451;
+
+    // $ yq -o=json -I0 '(.a, .b) | (.c, .d) | key'  =>  "c" / "c" / "d" / "d"
+    let (out, code) = run_yq_stdin("(.a, .b) | (.c, .d) | key", doc, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "\"c\"\n\"c\"\n\"d\"\n\"d\"");
+
+    // $ yq -o=json -I0 '(.a, .b) | (.c, .d) | path'
+    //     =>  ["a","c"] / ["b","c"] / ["a","d"] / ["b","d"]
+    let (out, code) = run_yq_stdin("(.a, .b) | (.c, .d) | path", doc, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        out.trim(),
+        "[\"a\",\"c\"]\n[\"b\",\"c\"]\n[\"a\",\"d\"]\n[\"b\",\"d\"]"
+    );
+
+    // $ yq -o=json -I0 '(.a, .b) | (.c, .d) | parent | key'  =>  "a"/"b"/"a"/"b"
+    let (out, code) = run_yq_stdin("(.a, .b) | (.c, .d) | parent | key", doc, args)?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "\"a\"\n\"b\"\n\"a\"\n\"b\"");
+
+    Ok(())
+}
+
+/// #2451 rule 1, error handling: a union branch that raises **discards the
+/// whole expression's output**, including whatever earlier branches already
+/// produced. That is the same rule `eval::streams_escaped_generator_prefix`
+/// already carries for the indexing family (#2226/#2326/#2351/#2374) -- real
+/// yq's error is a Go error, so no partial node list survives it.
+///
+/// Captured live on `{"a":{"b":1,"c":2},"d":[10,20]}`: every filter below
+/// prints nothing on stdout and `Error: e` on stderr, exit 1.
+#[test]
+fn test_yq_union_branch_error_discards_the_prefix_2451() -> Result<()> {
+    let args = &["-o", "json", "-I0"];
+    let doc = "a: {b: 1, c: 2}\nd: [10, 20]\n";
+
+    for filter in [
+        r#"(.a, error("e")) | .b"#,
+        r#"(.a, error("e")).b"#,
+        r#"(.a, error("e")) | (.b, .c)"#,
+        r#"(.a, error("e")).b | key"#,
+        r#"(.d, error("e"))[0:1] | path"#,
+    ] {
+        let (out, err, code) = run_yq_stdin_with_stderr(filter, doc, args)?;
+        assert_eq!(out, "", "`{filter}` should print nothing");
+        assert!(err.contains("Error: e"), "`{filter}` stderr: {err}");
+        assert_eq!(code, 1, "`{filter}` exit");
+    }
+
     Ok(())
 }

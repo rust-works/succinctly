@@ -1911,26 +1911,30 @@ fn test_target_partial_prefix_yq_gate_family_2374() {
     }
 }
 
-/// The two path-context members of the same family — and they are missing the
-/// gate, which is exactly the recurrence #2374 predicted.
+/// The two path-context members of the same family — they used to *miss* the
+/// gate, and since #2451 they no longer reach the arms that miss it.
 ///
 /// `eval_index_expr_with_path_context` and `eval_slice_expr_with_path_context`
-/// keep the target's already-produced prefix in yq mode, where their
-/// plain-read siblings (pinned as passing in the table above) discard it. Real
-/// yq emits nothing for every row here; succinctly emits the value.
+/// still keep a target's already-produced prefix in yq mode (that ungated
+/// pair is #2431). What changed is which route these shapes take: every row
+/// below has a union (`,`) for its target, so yq mode now evaluates the whole
+/// pipe through #2451's context-list walk (`eval_generic::eval_yq_context_pipe`),
+/// whose own collection step discards a prefix that escaped — the same rule
+/// [`streams_escaped_generator_prefix`] carries for the plain-read siblings in
+/// the table above. Both routes now answer real yq exactly: nothing, exit 1.
 ///
-/// Captured live on 2026-09-05 from yq v4.53.3. Pinned as a divergence rather
-/// than fixed: these are arms of `eval_stage_with_path_context`, the function
-/// #2416 exists to retire, so the fix belongs to the migration that deletes
-/// them — and #2416's own hygiene rule says a PR adding an arm there has to
-/// argue why it is not a migration.
+/// Kept as its own test rather than folded into the table above because that
+/// table's jq column is the *jq oracle*, and jq 1.7.1 has none for these:
+/// `key`, `path` and `parent` are rejected at compile time there
+/// (`key/0 is not defined`, exit 3), so the jq column here is succinctly's own
+/// extension behaviour, captured from succinctly rather than from jq.
 ///
-/// jq mode has no oracle for these at all: jq 1.7.1 rejects `key`, `path` and
-/// `parent` at compile time (`key/0 is not defined`, exit 3), so they are
-/// succinctly extensions there and only yq mode can be checked.
+/// yq column captured live on 2026-09-05 from yq v4.53.3 (`yq -o=json -I=0`
+/// on `{"a":{"b":1,"c":2},"d":[10,20]}`): every row prints nothing on stdout
+/// and `Error: e` on stderr, exit 1.
 #[test]
-fn test_target_partial_prefix_path_context_sites_miss_the_yq_gate_2374() {
-    // (construct, filter, succinctly's current yq-mode output)
+fn test_target_partial_prefix_path_context_sites_match_the_yq_gate_2451() {
+    // (construct, filter, succinctly's jq-mode extension output)
     let rows: &[(&str, &str, &[&str])] = &[
         (
             "index/field + key",
@@ -1964,21 +1968,25 @@ fn test_target_partial_prefix_path_context_sites_miss_the_yq_gate_2374() {
     // before the index/slice ever runs.
     let oracle: Vec<String> = Vec::new();
 
-    for (construct, filter, current) in rows {
+    for (construct, filter, jq_extension) in rows {
         let (full, generic) = both_evaluator_outputs::<YqSemantics>(YQ_GATE_DOC, filter);
         assert_eq!(
-            full, *current,
-            "[{construct}] eval.rs moved for `{filter}` — if this is the #2416 \
-             migration landing, drop the row and add it to the passing table above"
+            full, oracle,
+            "[{construct}] eval.rs disagrees with the yq oracle for `{filter}`"
         );
         assert_eq!(
-            generic, *current,
-            "[{construct}] eval_generic.rs moved for `{filter}`"
+            generic, oracle,
+            "[{construct}] eval_generic.rs disagrees with the yq oracle for `{filter}`"
         );
-        assert_ne!(
-            full, oracle,
-            "[{construct}] `{filter}` now matches real yq — nice; move the row \
-             into test_target_partial_prefix_yq_gate_family_2374"
+
+        let (full, generic) = both_evaluator_outputs::<JqSemantics>(YQ_GATE_DOC, filter);
+        assert_eq!(
+            full, *jq_extension,
+            "[{construct}] eval.rs moved in jq mode for `{filter}`"
+        );
+        assert_eq!(
+            generic, *jq_extension,
+            "[{construct}] eval_generic.rs moved in jq mode for `{filter}`"
         );
     }
 }

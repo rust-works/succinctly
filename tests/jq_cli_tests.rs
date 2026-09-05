@@ -38111,3 +38111,49 @@ fn test_jq_mode_has_no_empty_operand_rule_2460() -> Result<()> {
     }
     Ok(())
 }
+
+/// #2451: jq mode keeps jq's **element-major** pipe-into-union order.
+///
+/// The yq-mode counterpart is `yq_cli_tests.rs`'s
+/// `test_yq_pipe_into_union_is_branch_major_2451`; #2451 is a yq-mode rule
+/// (`S::TAG == EvalTag::Yq`), and this is the guard that it stayed there.
+/// Every expectation is a live capture from `/usr/bin/jq` 1.7.1 with `-c` on
+/// `{"a":{"c":3,"d":4},"b":{"c":5,"d":6},"n":[1,2,3]}`.
+#[test]
+fn test_jq_pipe_into_union_stays_element_major_2451() -> Result<()> {
+    let doc = r#"{"a":{"c":3,"d":4},"b":{"c":5,"d":6},"n":[1,2,3]}"#;
+
+    for (filter, want) in [
+        // $ jq -c '(.a, .b) | (.c, .d)'  =>  3 / 4 / 5 / 6
+        ("(.a, .b) | (.c, .d)", "3\n4\n5\n6"),
+        // $ jq -c '(.a, .b) | (.c, .d) | . + 10'  =>  13 / 14 / 15 / 16
+        ("(.a, .b) | (.c, .d) | . + 10", "13\n14\n15\n16"),
+        // $ jq -c '.n[] | (., . * 10)'  =>  1 / 10 / 2 / 20 / 3 / 30
+        (".n[] | (., . * 10)", "1\n10\n2\n20\n3\n30"),
+        // $ jq -c '[(.a, .b) | (.c, .d)]'  =>  [3,4,5,6]
+        ("[(.a, .b) | (.c, .d)]", "[3,4,5,6]"),
+        // $ jq -c '(.a, .b) | with_entries(.) | (.c, .d)'  =>  3 / 4 / 5 / 6
+        ("(.a, .b) | with_entries(.) | (.c, .d)", "3\n4\n5\n6"),
+        // $ jq -c '(.a, .b) | (.c, .d) | (. + 1, . + 2)'
+        //     =>  4 / 5 / 5 / 6 / 6 / 7 / 7 / 8
+        (
+            "(.a, .b) | (.c, .d) | (. + 1, . + 2)",
+            "4\n5\n5\n6\n6\n7\n7\n8",
+        ),
+        // $ jq -c '1 | (. + 1, . + 2) | (. * 10, . * 100)'
+        //     =>  20 / 200 / 30 / 300
+        ("1 | (. + 1, . + 2) | (. * 10, . * 100)", "20\n200\n30\n300"),
+        // $ jq -c '((.a, .b) | (.c, .d)) | (., .)'  =>  3/3/4/4/5/5/6/6
+        ("((.a, .b) | (.c, .d)) | (., .)", "3\n3\n4\n4\n5\n5\n6\n6"),
+        // $ jq -c '(.a, .b) | ((.c, .d) | (., .))'  =>  3/3/4/4/5/5/6/6
+        ("(.a, .b) | ((.c, .d) | (., .))", "3\n3\n4\n4\n5\n5\n6\n6"),
+        // $ jq -c '(.a, .b) | .c | (., .)'  =>  3 / 3 / 5 / 5
+        ("(.a, .b) | .c | (., .)", "3\n3\n5\n5"),
+    ] {
+        let (out, code) = run_jq_stdin(filter, doc, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(out.trim(), want, "`{filter}`");
+    }
+
+    Ok(())
+}
