@@ -2780,7 +2780,11 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 // `stream_json_value`'s matching `Alias` arm.
                 match target.and_then(|t| t.resolve_alias_target_cursor()) {
                     Some(resolved) => resolved.tag(),
-                    None => "!!null",
+                    // `target` is always `Some` for a `YamlIndex::build`-produced
+                    // index (see `parse_alias_value`), so this arm is unreachable
+                    // defense in depth; its hit status flips with instrumentation
+                    // rather than with any test, hence the marker (#1374 follow-up).
+                    None => "!!null", // omni-dev: coverage tolerate-line reason="unreachable: an alias target is never None for a built index (#1374)"
                 }
             }
             YamlValue::Error(_) => "!!null",
@@ -6158,7 +6162,11 @@ fn decode_failure(e: YamlStringError) -> StreamFailure {
 /// chain more than one hop deep -- so an index built by `YamlIndex::build`
 /// from valid input can no longer reach depth 2, let alone this ceiling.
 /// This guard remains purely as defense in depth against a hand-built
-/// index that bypasses the parser's own checks.
+/// index that bypasses the parser's own checks -- and is exercised as such:
+/// `test_as_str_panics_past_max_alias_chain_depth` and
+/// `test_tag_panics_past_max_alias_chain_depth` reach it through
+/// `YamlIndex::rewire_alias_target` (test-only), which points an alias at
+/// itself to make a one-node unbounded chain.
 const MAX_ALIAS_CHAIN_DEPTH: usize = 65_536;
 
 impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
@@ -8096,9 +8104,11 @@ mod tests {
     /// invalid YAML -- an alias node carries no properties of its own, and
     /// it was the *only* way to construct a chain more than one hop deep),
     /// so a `YamlIndex::build`-produced index can no longer reach depth 2 by
-    /// any valid input, and the multi-hop/depth-cap tests that once lived
-    /// here are gone along with it. The two tests below keep 1-hop coverage
-    /// of the same iterative walk instead.
+    /// any valid input. The 1-hop tests below cover the walk's entry and
+    /// exit; the `*_through_rewired_index` / `*_past_max_alias_chain_depth`
+    /// tests after them rebuild the multi-hop and ceiling cases on top of
+    /// `YamlIndex::rewire_alias_target` (test-only), which is the only way
+    /// left to put an alias behind an alias.
     #[test]
     fn test_as_str_resolves_one_hop_alias() {
         use crate::jq::document::DocumentValue;
@@ -8123,6 +8133,99 @@ mod tests {
         };
         let z_cursor = fields.find_cursor("z").expect("z field must exist");
         assert_eq!(z_cursor.tag(), "!!str");
+    }
+
+    /// The document every rewired-index test below starts from: two
+    /// ordinary 1-hop aliases of the same anchor.
+    const REWIRE_YAML: &str = "a0: &a0 hello\nb: *a0\nz: *a0\n";
+
+    /// Cursor to the value of top-level key `name` in the first document.
+    fn top_level_cursor<'a>(index: &'a YamlIndex, yaml: &'a str, name: &str) -> YamlCursor<'a> {
+        let YamlValue::Mapping(fields) = first_doc(index.root(yaml.as_bytes())) else {
+            panic!("expected root document to be a mapping");
+        };
+        fields
+            .find_cursor(name)
+            .unwrap_or_else(|| panic!("{name} field must exist"))
+    }
+
+    /// Builds `REWIRE_YAML` and repoints `z`'s alias at `target` (another
+    /// top-level key) via `YamlIndex::rewire_alias_target`. `"b"` yields the
+    /// 2-hop chain `z -> b -> a0` no valid document can spell since #1374;
+    /// `"z"` yields a self-loop, i.e. an unbounded chain in one node.
+    fn rewired_index(target: &str) -> YamlIndex {
+        let mut index = YamlIndex::build(REWIRE_YAML.as_bytes()).unwrap();
+        let target_bp = top_level_cursor(&index, REWIRE_YAML, target).bp_pos;
+        let z_bp = top_level_cursor(&index, REWIRE_YAML, "z").bp_pos;
+        index.rewire_alias_target(z_bp, target_bp);
+        index
+    }
+
+    /// `resolve_alias_chain`'s loop body (the alias-behind-alias hop) is
+    /// unreachable from any parser-built index since #1374; this keeps it
+    /// exercised through `as_str`, the accessor #1191 first fixed.
+    #[test]
+    fn test_as_str_resolves_two_hop_alias_through_rewired_index() {
+        use crate::jq::document::DocumentValue;
+
+        let index = rewired_index("b");
+        let z = top_level_cursor(&index, REWIRE_YAML, "z").value();
+        assert_eq!(z.as_str().as_deref(), Some("hello"));
+    }
+
+    /// Same for `resolve_alias_target_cursor`'s loop body, via `tag()`
+    /// (#1193's cursor-side fix).
+    #[test]
+    fn test_tag_resolves_two_hop_alias_through_rewired_index() {
+        let index = rewired_index("b");
+        assert_eq!(top_level_cursor(&index, REWIRE_YAML, "z").tag(), "!!str");
+    }
+
+    /// `type_name`'s own `Alias` arm resolves the chain too (#1193/PR
+    /// #1314); it was only ever reached through the CLI tests #1374 removed,
+    /// so pin it directly, at 1 hop and at 2.
+    #[test]
+    fn test_type_name_resolves_alias_chain() {
+        use crate::jq::document::DocumentValue;
+
+        let plain = YamlIndex::build(REWIRE_YAML.as_bytes()).unwrap();
+        assert_eq!(
+            top_level_cursor(&plain, REWIRE_YAML, "z")
+                .value()
+                .type_name(),
+            "string"
+        );
+
+        let rewired = rewired_index("b");
+        assert_eq!(
+            top_level_cursor(&rewired, REWIRE_YAML, "z")
+                .value()
+                .type_name(),
+            "string"
+        );
+    }
+
+    /// #1191 code review: a chain past `MAX_ALIAS_CHAIN_DEPTH` must panic
+    /// cleanly (a controlled `assert_depth` failure), not silently succeed
+    /// and not stack-overflow -- otherwise an off-by-one in
+    /// `resolve_alias_chain`'s loop would go uncaught. A self-looping alias
+    /// is that chain without the 65,537 nodes the pre-#1374 version built.
+    #[test]
+    #[should_panic(expected = "nesting depth exceeds limit")]
+    fn test_as_str_panics_past_max_alias_chain_depth() {
+        use crate::jq::document::DocumentValue;
+
+        let index = rewired_index("z");
+        let _ = top_level_cursor(&index, REWIRE_YAML, "z").value().as_str();
+    }
+
+    /// #1193/PR #1314 code review: the same ceiling check for
+    /// `resolve_alias_target_cursor`, via `tag()`.
+    #[test]
+    #[should_panic(expected = "nesting depth exceeds limit")]
+    fn test_tag_panics_past_max_alias_chain_depth() {
+        let index = rewired_index("z");
+        let _ = top_level_cursor(&index, REWIRE_YAML, "z").tag();
     }
 
     /// #1247 coverage: `YamlStringError::message()`'s `InvalidUtf8` arm and
