@@ -7489,6 +7489,28 @@ fn test_func_def_keeps_path_context_2416() -> Result<()> {
     Ok(())
 }
 
+/// Spine 2416, phase 3: `Expr::Shared` (a call argument captured behind an
+/// `Rc` once substituted into a callee's body, #1371) is now native via
+/// `eval_each_generic`'s own `Shared` pair (`is_pure_chain_link`'s split
+/// between the cheap eager path and the lazy one), reached through
+/// `collect_each_generic` instead of the eager bridge. No jq oracle.
+/// `id(x): x` doesn't change `.`, so this pins the pre-migration answer
+/// (this PR's own pre-change build) unchanged: `key` reaches this arm as
+/// the argument passed into a one-arg identity-shaped def. Like
+/// `Expr::DefCall`, `Expr::Shared` is a runtime-only node (only ever
+/// synthesized when a call's argument is substituted into its callee's
+/// body), never produced by a fresh `parse()`, so it has no row in
+/// `path_context_needs_eager_pins_the_three_reasons_2416`; this CLI test is
+/// its coverage.
+#[test]
+fn test_shared_keeps_path_context_2416() -> Result<()> {
+    let doc = r#"[{"a":1},{"b":2}]"#;
+    let (out, _, code) = run_jq_full(&["-c", "def id(x): x; .[] | id(key)"], Some(doc))?;
+    assert_eq!(code, 0, "{out:?}");
+    assert_eq!(out.trim(), "0\n1");
+    Ok(())
+}
+
 /// Documents the one remaining deliberate, narrow gap #1663/#1765 leave
 /// open rather than silently missing: a `?//`-chained `AsPattern` (2+
 /// alternatives) still has no dedicated evaluation arm, so a path-context
