@@ -80,6 +80,28 @@ silently discard the write, so the mark is dropped and the computed value printe
 4(b). True alias node identity remains unimplemented
 ([#1351](https://github.com/rust-works/succinctly/issues/1351)).
 
+A related, narrower gap sits in `select`/`if`'s condition-truthiness check
+(`push_generic_truthiness_cursor_error`, [src/jq/eval_generic.rs](../../../src/jq/eval_generic.rs)):
+it does not walk into a *container* reached through an alias, so a decode failure reachable
+only that way no longer raises
+([#1804](https://github.com/rust-works/succinctly/issues/1804), fixed a real `O(2^N)` cost
+for a document shaped as a chain of anchors each referencing the previous one twice). This
+is not a yq-fidelity divergence — real yq rejects the whole document at parse time, so there
+is no yq behaviour to match either way:
+
+```bash
+$ printf 'a: &a ["bad\\q"]\nb: *a\n' | succinctly yq 'select(.b) | 1'
+1
+$ printf 'a: &a ["bad\\q"]\nb: *a\n' | succinctly yq '.a'
+Error: invalid escape sequence
+$ printf 'a: &a ["bad\\q"]\nb: *a\n' | succinctly yq '.b[0]'
+Error: invalid escape sequence
+```
+
+Scoped to a *container* alias target only: a bare scalar-target alias (`a: &a "bad\q"`)
+still raises from `select`/`if` exactly as before, since resolving one scalar costs `O(1)`
+and was never part of the cost this fix removes.
+
 **Known gap in this rule.** `enforce_anchor_soundness` takes a `sort_keys` argument and
 handles it correctly — but only on the DOM path. The cursor-streaming path never calls it,
 so succinctly currently reproduces the unsound output it is supposed to prevent. The two

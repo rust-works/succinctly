@@ -2499,29 +2499,40 @@ fn push_generic_owned_values<V: DocumentValue>(
 /// container-shaped condition is free.
 fn push_generic_truthiness_cursor_error<C: DocumentCursor>(c: &C, depth: usize) -> Option<Control> {
     assert_nesting_depth(depth);
-    // #1804: do not resolve through an alias here. A document shaped as a
-    // chain of anchors each referencing the previous one twice (`aN: &aN
-    // [*a(N-1), *a(N-1)]`) makes descending into every alias target cost
-    // O(2^N) -- the fan-out is the walk's own unconditional per-child
-    // recursion, not any per-node work, so the only fix is to stop before
-    // recursing into an alias at all. `select(.)`/`and`/`or`/`not`/`//`/
-    // `any`/`if` all agree with real yq that a non-null container is
-    // truthy regardless of contents, so skipping the corruption check
-    // inside an alias's target changes no truthiness answer either tool
-    // gives.
-    //
-    // Accepted trade-off: a decode failure reachable *only* through an
-    // alias (`a: &a ["bad\q"]` / `b: *a` with `select(.b)`) no longer
-    // raises from this check. It still raises whenever `.a` is visited
-    // directly, or `.b` is materialized (`.b[0]` keeps erroring) -- this
-    // walk is the only place that stops short. Real yq rejects that whole
-    // document at parse time, so there is no yq behaviour to match either
-    // way.
-    if c.is_alias() {
-        return None;
-    }
     let value = c.value();
     if let Some(fields) = value.as_object() {
+        // #1804: do not walk *into* an alias's container target here. A
+        // document shaped as a chain of anchors each referencing the
+        // previous one twice (`aN: &aN [*a(N-1), *a(N-1)]`) makes
+        // descending into every alias target's children cost O(2^N) -- the
+        // fan-out is this walk's own unconditional per-child recursion
+        // cascading through nested aliases, not any per-node work, so the
+        // only fix is to stop before recursing into a container reached
+        // through an alias. `select(.)`/`if` (the constructs that reach
+        // this walk today) agree with real yq that a non-null container is
+        // truthy regardless of contents, so skipping the corruption check
+        // inside an alias's container target changes no truthiness answer.
+        //
+        // Deliberately scoped to *container* targets only -- resolving a
+        // scalar-target alias costs O(1) (no children to cascade through),
+        // so it keeps running the checks below exactly as before #1804;
+        // gating on `c.is_alias()` before this branch split (an earlier,
+        // review-caught version of this fix) also silently swallowed a
+        // decode failure reachable through a bare scalar alias, which
+        // bought no performance -- see `test_select_no_longer_raises_on_decode_failure_reachable_only_via_scalar_alias_1804`
+        // for the case that must keep raising.
+        //
+        // Accepted trade-off: a decode failure reachable *only* through an
+        // alias to a container (`a: &a ["bad\q"]` / `b: *a` with
+        // `select(.b)`) no longer raises from this check. It still raises
+        // whenever `.a` is visited directly, or `.b` is materialized
+        // (`.b[0]` keeps erroring) -- this walk is the only place that
+        // stops short. Real yq rejects that whole document at parse time,
+        // so there is no yq behaviour to match either way. Recorded in
+        // `docs/compliance/yq/limitations.md`.
+        if c.is_alias() {
+            return None;
+        }
         // The #1642 collision map is built lazily, only from the point an
         // undecodable key actually appears (#2061).
         //
@@ -2658,6 +2669,11 @@ fn push_generic_truthiness_cursor_error<C: DocumentCursor>(c: &C, depth: usize) 
         }
         None
     } else if let Some(elements) = value.as_array() {
+        // #1804: same container-target-alias short-circuit as the object
+        // branch above -- see its comment for the full rationale.
+        if c.is_alias() {
+            return None;
+        }
         let mut elems = elements;
         let mut is_first = true;
         let mut last_elem: Option<C> = None;
