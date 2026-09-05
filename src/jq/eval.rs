@@ -21876,7 +21876,7 @@ pub(crate) fn index_component_value(idx: i64, key: Option<&NumberKey>) -> OwnedV
 /// into the one shared per-number rule rather than a second hand-copied
 /// `match key { ... }`, per CLAUDE.md's "duplicated predicates diverge
 /// silently".
-fn slice_component_value(
+pub(crate) fn slice_component_value(
     start: Option<i64>,
     start_key: Option<&NumberKey>,
     end: Option<i64>,
@@ -74132,14 +74132,30 @@ mod tests {
     // which evaluates via the *plain* (non-path-context) evaluator, losing
     // `key`/`file_index` for anything nested inside.
 
+    // Spine 2416 step 3 re-pinned these three to the reference: a comparison
+    // or arithmetic result stands where its *left operand* stood, and a
+    // literal has no position, so real yq prints nothing for each of them
+    // (captured live from v4.53.3 on `- 10\n- 20`: `.[] | (1==1) | key`,
+    // `.[] | (1+1) | key` and `.[] | (-1) | key` all print nothing, exit 0,
+    // while `.[] | (. == 10) | key` prints `0 1`). `key` is a yq builtin,
+    // so the yq capture is the reference in jq mode too. The `0 1` these
+    // used to pin was this evaluator's own answer.
     #[test]
     fn test_key_survives_comparison_mid_pipe() {
-        assert_eq!(outputs(b"[10,20]", ".[] | (1==1) | key"), vec!["0", "1"]);
+        assert_eq!(
+            outputs(b"[10,20]", ".[] | (1==1) | key"),
+            Vec::<String>::new()
+        );
+        assert_eq!(outputs(b"[10,20]", ".[] | (. == 10) | key"), vec!["0", "1"]);
     }
 
     #[test]
     fn test_key_survives_arithmetic_mid_pipe() {
-        assert_eq!(outputs(b"[10,20]", ".[] | (1+1) | key"), vec!["0", "1"]);
+        assert_eq!(
+            outputs(b"[10,20]", ".[] | (1+1) | key"),
+            Vec::<String>::new()
+        );
+        assert_eq!(outputs(b"[10,20]", ".[] | (. + 1) | key"), vec!["0", "1"]);
     }
 
     /// #1056: `eval_pipe_with_path_context_internal`'s own `Expr::Arithmetic`
@@ -74148,7 +74164,11 @@ mod tests {
     /// minus.
     #[test]
     fn test_key_survives_unary_minus_mid_pipe_1056() {
-        assert_eq!(outputs(b"[10,20]", ".[] | -(1) | key"), vec!["0", "1"]);
+        assert_eq!(
+            outputs(b"[10,20]", ".[] | -(1) | key"),
+            Vec::<String>::new()
+        );
+        assert_eq!(outputs(b"[10,20]", ".[] | -(.) | key"), vec!["0", "1"]);
     }
 
     #[test]

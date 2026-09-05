@@ -12624,11 +12624,19 @@ fn test_path_context_builtins_across_pipe_stages_554() -> Result<()> {
 }
 
 /// yq-mode counterpart to `jq_cli_tests.rs`'s
-/// `test_literal_slice_path_context_resolves_2215` -- the new
-/// `eval_stage_with_path_context` `Expr::Slice` arm lives on the shared
-/// `<S: EvalSemantics>` evaluator, so this file needs its own dedicated
-/// check rather than relying on the jq-mode coverage alone (a jq-scoped fix
-/// to shared evaluator code can silently regress yq without one).
+/// `test_literal_slice_path_context_resolves_2215`. The two modes answer
+/// differently on purpose (ADR-0018): jq mode follows jq's own
+/// `path(.a[0:3])` and names a `{"start":s,"end":e}` component, while real
+/// yq keeps the container's position for a slice. The rows here used to
+/// pin the jq model for yq mode too; spine 2416 step 3 re-pinned them to
+/// the capture (yq v4.53.3, `-o=json -I0`, on `a: [1, 2, 3, 4]`):
+///
+/// ```text
+/// .a | .[0:3] | path          ["a"]
+/// .a | .[0:3] | key           "a"
+/// .a | .[0:3] | .[0]          1
+/// .a | .[0:3] | .[0] | path   ["a",0]
+/// ```
 #[test]
 fn test_literal_slice_path_context_resolves_yq_2215() -> Result<()> {
     let (output, code) = run_yq_stdin(
@@ -12637,7 +12645,7 @@ fn test_literal_slice_path_context_resolves_yq_2215() -> Result<()> {
         &["-o", "json", "-I0"],
     )?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#"["a",{"start":0,"end":3}]"#);
+    assert_eq!(output.trim(), r#"["a"]"#);
 
     let (output, code) = run_yq_stdin(
         ".a | .[0:3] | key",
@@ -12645,7 +12653,15 @@ fn test_literal_slice_path_context_resolves_yq_2215() -> Result<()> {
         &["-o", "json", "-I0"],
     )?;
     assert_eq!(code, 0);
-    assert_eq!(output.trim(), r#"{"start":0,"end":3}"#);
+    assert_eq!(output.trim(), r#""a""#);
+
+    let (output, code) = run_yq_stdin(
+        ".a | .[0:3] | .[0] | path",
+        "a: [1, 2, 3, 4]\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"["a",0]"#);
 
     let (output, code) = run_yq_stdin(
         ".a | .[0:3] | .[0]",
@@ -31363,3 +31379,275 @@ fn test_absent_position_parent_still_takes_the_eager_route_2416() -> Result<()> 
     assert_eq!(output.trim(), "[[\"a\",\"x\",\"y\"],{}]");
     Ok(())
 }
+
+/// #2416 step 3: path context through owned containers. A builtin that builds
+/// a new value either hands it the input node's position (`to_entries`,
+/// `sort`, `tostring`, `[...]`, a slice, a write) or starts a detached tree
+/// (`map`, `keys`, `with_entries`, `{...}`, a literal); navigation inside the
+/// new value descends from that position, arithmetic and comparison stand
+/// where their *left* operand stood, `min`/`max` are the child they picked,
+/// and `parent` climbs back through the owned value and then into the
+/// document. Every row was captured from yq v4.53.3 (`-o=json -I0`) on
+/// `OWNED_IDENTITY_DOC_2416`; the eager evaluator answered 47 of them
+/// differently before the owned identity pipe (`null` for a detached `key`,
+/// `["a","b"]` for `min | path`, a `{"start":..}` component for a slice).
+#[test]
+fn test_owned_identity_rules_match_yq_2416() -> Result<()> {
+    let args = &["-o", "json", "-I0"];
+    for (filter, expected) in OWNED_IDENTITY_ROWS_2416 {
+        let (output, code) = run_yq_stdin(filter, OWNED_IDENTITY_DOC_2416, args)?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(output.trim_end(), *expected, "{filter}");
+    }
+    // `map` over a scalar or `null` passes the value through with its
+    // position; only a container result is detached (the residual gap
+    // limitations.md recorded against #2375):
+    // $ yq -o=json -I0 '.a | map(. + 1) | key'     =>  "a"    (a: 5)
+    // $ yq -o=json -I0 '.a | map(. + 1) | path'    =>  ["a"]
+    // $ yq -o=json -I0 '.b | map(. + 1) | key'     =>  "b"    (b: null)
+    // $ yq -o=json -I0 '.d | map(. + 1) | key'     =>  (nothing)   (d: [1, 2])
+    // $ yq -o=json -I0 '.e | map(. + 1) | path'    =>  []     (e: {f: 1})
+    // $ yq -o=json -I0 '.d | map(.) | .[0] | path' =>  [0]
+    // A literal left operand has no position (yq lexes `-(1)` differently,
+    // so the unary-minus row is `(-1)`):
+    // $ yq -o=json -I0 '.[] | (1==1) | key'    =>  (nothing)   on `- 10\n- 20`
+    // $ yq -o=json -I0 '.[] | (1+1) | key'     =>  (nothing)
+    // $ yq -o=json -I0 '.[] | (-1) | key'      =>  (nothing)
+    // $ yq -o=json -I0 '.[] | (. == 10) | key' =>  0 / 1
+    for (filter, expected) in [
+        (".[] | (1==1) | key", ""),
+        (".[] | (1+1) | key", ""),
+        (".[] | (-1) | key", ""),
+        (".[] | (. == 10) | key", "0\n1"),
+    ] {
+        let (output, code) = run_yq_stdin(filter, "- 10\n- 20\n", args)?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(output.trim_end(), expected, "{filter}");
+    }
+    let doc = "a: 5\nb: null\nc: s\nd: [1, 2]\ne: {f: 1}\n";
+    for (filter, expected) in [
+        (".a | map(. + 1) | key", "\"a\""),
+        (".a | map(. + 1) | path", "[\"a\"]"),
+        (".b | map(. + 1) | key", "\"b\""),
+        (".b | map(. + 1) | path", "[\"b\"]"),
+        (".c | map(. + 1) | key", "\"c\""),
+        (".d | map(. + 1) | key", ""),
+        (".e | map(. + 1) | key", ""),
+        (".e | map(. + 1) | path", "[]"),
+        (".d | map(.) | .[0] | path", "[0]"),
+        (".e | map(.) | .[0] | path", "[0]"),
+    ] {
+        let (output, code) = run_yq_stdin(filter, doc, args)?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(output.trim_end(), expected, "{filter}");
+    }
+    Ok(())
+}
+
+const OWNED_IDENTITY_DOC_2416: &str = "a:\n  b: [1, 2, 3]\n  c: x\n  d: {e: 5}\nz: 9\n";
+
+/// `(filter, expected stdout)`, captured from yq v4.53.3; an empty expected
+/// string is a filter that printed nothing. yq's `downcase`/`upcase` rows
+/// (`.a.c | downcase | key` is `"c"`) are #2462, not here.
+const OWNED_IDENTITY_ROWS_2416: &[(&str, &str)] = &[
+    (".a.c | tostring | key", r#""c""#),
+    (".a.c | tostring | path", r#"["a","c"]"#),
+    (
+        ".a.c | tostring | parent",
+        r#"{"b":[1,2,3],"c":"x","d":{"e":5}}"#,
+    ),
+    (".a.c | tostring | tostring | key", r#""c""#),
+    (r#".a.c | . + "y" | key"#, r#""c""#),
+    (r#".a.c | . + "y" | path"#, r#"["a","c"]"#),
+    (".a.b | .[0] + 1 | key", "0"),
+    (".a.b | length | key", r#""b""#),
+    (".a.b | length | path", r#"["a","b"]"#),
+    (".a.b | to_entries | key", r#""b""#),
+    (".a.b | to_entries | path", r#"["a","b"]"#),
+    (".a.b | to_entries | .[0] | key", "0"),
+    (".a.b | to_entries | .[0] | path", r#"["a","b",0]"#),
+    (
+        ".a.b | to_entries | .[0] | parent",
+        r#"[{"key":0,"value":1},{"key":1,"value":2},{"key":2,"value":3}]"#,
+    ),
+    (".a.b | to_entries | .[0].value | key", r#""value""#),
+    (
+        ".a.b | to_entries | .[0].value | path",
+        r#"["a","b",0,"value"]"#,
+    ),
+    (
+        ".a.b | to_entries | .[0].value | parent",
+        r#"{"key":0,"value":1}"#,
+    ),
+    (
+        ".a.b | to_entries | .[] | parent | key",
+        r#""b"
+"b"
+"b""#,
+    ),
+    (".a.b | map(. + 1) | key", ""),
+    (".a.b | map(. + 1) | .[0] | key", "0"),
+    (".a.b | map(. + 1) | .[0] | path", "[0]"),
+    (".a.b | map(. + 1) | .[0] | parent", "[2,3,4]"),
+    (".a.b | map(.) | .[1] | path", "[1]"),
+    (".a.d | keys | .[0] | key", "0"),
+    (".a.d | keys | .[0] | path", "[0]"),
+    (".a.b | sort | .[0] | key", "0"),
+    (".a.b | sort | .[0] | path", r#"["a","b",0]"#),
+    (".a.b | reverse | .[0] | path", r#"["a","b",0]"#),
+    (".a.b | reverse | .[0] | key", "0"),
+    (".a.b | unique | .[1] | path", r#"["a","b",1]"#),
+    (".a.d | with_entries(.) | .e | key", r#""e""#),
+    (".a.d | with_entries(.) | .e | path", r#"["e"]"#),
+    (".a.d | with_entries(.) | .e | parent", r#"{"e":5}"#),
+    (".a.b | min | key", "0"),
+    (".a.b | min | path", r#"["a","b",0]"#),
+    (".a.b | min | parent | key", r#""b""#),
+    ("[.a.c] | .[0] | key", "0"),
+    ("[.a.c] | .[0] | path", "[0]"),
+    ("[.a.c] | .[0] | parent", r#"["x"]"#),
+    ("[.a.c] | key", ""),
+    ("[.a.c, .z] | .[1] | path", "[1]"),
+    (".a.b | tojson | key", r#""b""#),
+    (".a.b | tojson | path", r#"["a","b"]"#),
+    (".a.b | flatten | .[0] | path", r#"["a","b",0]"#),
+    (".a.b | flatten | key", r#""b""#),
+    (".a.d | to_entries | from_entries | key", r#""d""#),
+    (
+        ".a.d | to_entries | from_entries | .e | path",
+        r#"["a","d","e"]"#,
+    ),
+    (".a.b | .[0:2] | key", r#""b""#),
+    (".a.b | .[0:2] | .[0] | path", r#"["a","b",0]"#),
+    (".a.b | .[0:2] | path", r#"["a","b"]"#),
+    (r#".a.c | split("") | .[0] | path"#, r#"["a","c",0]"#),
+    (r#".a.b | join(",") | key"#, r#""b""#),
+    (".a.b | [.[] | . * 2] | .[0] | path", r#"["a","b",0]"#),
+    (".a.b | map_values(. + 1) | .[0] | path", r#"["a","b",0]"#),
+    (".a.b | map_values(. + 1) | .[0] | key", "0"),
+    (".a.b | map_values(. + 1) | key", r#""b""#),
+    (r#".a | {"x": .c} | key"#, ""),
+    (r#".a | {"x": .c} | path"#, "[]"),
+    (r#".a | {"x": .c} | .x | key"#, r#""x""#),
+    (r#".a | {"x": .c} | .x | path"#, r#"["x"]"#),
+    (r#".a | {"x": .c} | .x | parent"#, r#"{"x":"x"}"#),
+    (".a.b | 1 | key", ""),
+    (r#".a.b | "s" | path"#, "[]"),
+    (".a.b | [] | key", r#""b""#),
+    (".a.b | {} | path", "[]"),
+    (".a.b | null | key", ""),
+    (".a.b | [.[]] | key", r#""b""#),
+    (".a.b | [.[]] | .[1] | path", r#"["a","b",1]"#),
+    (".a.b | .[0] | . * 2 | key", "0"),
+    (".a.b | 1 + .[0] | key", ""),
+    (".a.b | .[0] + .[1] | key", "0"),
+    (".a.b | .[0] + .[1] | path", r#"["a","b",0]"#),
+    (".a.b | .[1] - .[0] | path", r#"["a","b",1]"#),
+    (".a.b | .[0] == 1 | key", "0"),
+    (".a.b | .[0] == 1 | path", r#"["a","b",0]"#),
+    (".a.b | not | key", r#""b""#),
+    (".a.b | .[-1] | key", "2"),
+    (".a.b | .[-1] | path", r#"["a","b",2]"#),
+    (".a.b | . as $x | $x | key", r#""b""#),
+    (".a.b | . as $x | $x | path", r#"["a","b"]"#),
+    (".a.b | . as $x | $x[0] | path", r#"["a","b",0]"#),
+    (
+        ".a.b | (.[0], .[1]) | key",
+        "0
+1",
+    ),
+    (".a.b | . // 1 | key", r#""b""#),
+    (".a.q // .a.b | key", r#""b""#),
+    (".a.b | .[5] // .[0] | path", r#"["a","b",0]"#),
+    (".a.b | any | key", r#""b""#),
+    (".a.b | contains([1]) | key", r#""b""#),
+    (r#".a.c | test("x") | key"#, r#""c""#),
+    (r#".a.c | sub("x"; "y") | key"#, r#""c""#),
+    (r#".a.c | sub("x"; "y") | path"#, r#"["a","c"]"#),
+    (".a | del(.c) | key", r#""a""#),
+    (".a | del(.c) | .b | path", r#"["a","b"]"#),
+    (".a | .c = 1 | key", r#""a""#),
+    (".a | .c = 1 | .c | path", r#"["a","c"]"#),
+    (
+        ".a | .c = 1 | .c | parent",
+        r#"{"b":[1,2,3],"c":1,"d":{"e":5}}"#,
+    ),
+    (".a | .b[0] = 9 | .b[0] | path", r#"["a","b",0]"#),
+    (".a.b | .[0] |= . + 1 | .[0] | path", r#"["a","b",0]"#),
+    (".a.b | tojson | fromjson | key", r#""b""#),
+    (".a.b | tojson | fromjson | .[0] | path", r#"["a","b",0]"#),
+    (".a.b | @json | key", r#""b""#),
+    (".a.b | sort_by(.) | .[0] | path", r#"["a","b",0]"#),
+    (".a.b | group_by(.) | key", r#""b""#),
+    (".a.b | group_by(.) | .[0] | path", r#"["a","b",0]"#),
+    (".a.b | group_by(.) | .[0][0] | path", r#"["a","b",0,0]"#),
+    (".a | to_entries | map(.key) | .[0] | path", "[0]"),
+    (".a | to_entries | map(.key) | key", ""),
+    (".a | with_entries(.) | key", ""),
+    (
+        ".a.b | to_entries | .[0] | .value | . + 1 | key",
+        r#""value""#,
+    ),
+    (
+        ".a.b | to_entries | .[0] | .value | . + 1 | path",
+        r#"["a","b",0,"value"]"#,
+    ),
+    (".a.b | max | path", r#"["a","b",2]"#),
+    (".a.b | max | parent", "[1,2,3]"),
+    (".a.b | min | parent", "[1,2,3]"),
+    (
+        ".a.d | to_entries | .[0].key | path",
+        r#"["a","d",0,"key"]"#,
+    ),
+    (
+        ".a.d | to_entries | .[0].key | parent",
+        r#"{"key":"e","value":5}"#,
+    ),
+    (".a.b | .[1:] | .[0] | path", r#"["a","b",0]"#),
+    (".a.b | .[1:] | key", r#""b""#),
+    (r#".a.c | split("") | key"#, r#""c""#),
+    (r#".a.c | split("") | .[0] | parent"#, r#"["x"]"#),
+    (r#".a.b | join(",") | path"#, r#"["a","b"]"#),
+    (
+        r#".a.b | join(",") | parent"#,
+        r#"{"b":[1,2,3],"c":"x","d":{"e":5}}"#,
+    ),
+    (".a.b | (.[0] + 1) | key", "0"),
+    (".a.b | [.[] | . + 1] | key", r#""b""#),
+    (".a.b | [.[] | . + 1] | .[0] | parent", "[2,3,4]"),
+    (".a.b | [.[] | . + 1] | .[0] | parent | key", r#""b""#),
+    (".a.b | map(. + 1) | .[0] | parent | key", ""),
+    (".a.b | map(. + 1) | .[0] | parent | path", "[]"),
+    (".a.d | keys | key", ""),
+    (".a.d | keys | path", "[]"),
+    (".a.d | keys | .[0] | parent | path", "[]"),
+    (
+        ".a.b | length | parent",
+        r#"{"b":[1,2,3],"c":"x","d":{"e":5}}"#,
+    ),
+    (".a.b | tostring | .[0:1] | key", r#""b""#),
+    (".a.b | to_entries | .[0].value | parent | key", "0"),
+    (
+        ".a.b | to_entries | .[0].value | parent | path",
+        r#"["a","b",0]"#,
+    ),
+    (
+        ".a.b | to_entries | .[0].value | parent | parent | path",
+        r#"["a","b"]"#,
+    ),
+    (
+        ".a.b | to_entries | .[0].value | parent(2) | path",
+        r#"["a","b"]"#,
+    ),
+    (
+        ".a.b | to_entries | .[0].value | parent(3) | path",
+        r#"["a"]"#,
+    ),
+    (".a.b | to_entries | .[0].value | parent(3) | key", r#""a""#),
+    (".a.b | to_entries | .[0].value | parent(4) | key", ""),
+    (".a.b | map(. + 1) | .[0] | parent(2) | key", ""),
+    (".a.b | map(. + 1) | .[0] | parent(2) | path", ""),
+    (".a.b | map(. + 1) | .[0] | parent | parent | path", ""),
+    (".a.b | sort | .[0] | parent | path", r#"["a","b"]"#),
+    (".a.b | sort | .[0] | parent | parent | key", r#""a""#),
+];
