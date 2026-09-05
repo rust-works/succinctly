@@ -6634,7 +6634,7 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
 /// across rounds instead of resetting per round was tried and silently
 /// reintroduces the exact `limit(80000; repeat(1))`-style truncation #2014
 /// exists to fix). This *raises* on exhaustion, matching
-/// `resolve_repeat_bounded`'s path-context sibling so `path(repeat(f))`
+/// `resolve_repeat_sink`'s path-context sibling so `path(repeat(f))`
 /// and `repeat(f)` agree on the same wide-round wall at the same count
 /// (`test_path_repeat_width_budget_matches_value_mode_1933`). A separate
 /// per-round-count `MAX_EMPTY_REPEAT_ROUNDS` cap counts consecutive rounds

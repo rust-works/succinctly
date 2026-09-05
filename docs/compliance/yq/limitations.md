@@ -2171,7 +2171,7 @@ fixed on its own terms (#2375); the second is still open:
   there detaches a container result and passes a scalar through with its position, which
   is the same mechanism seen from both sides — yq never replaced the scalar node, so it
   kept its own path. Pinned in `test_owned_identity_rules_match_yq_2416`.
-- **`first(.a[])` on a genuinely-resolved scalar still raises** (`resolve_iterate_bounded`,
+- **`first(.a[])` on a genuinely-resolved scalar still raises** (`resolve_iterate_sink`,
   shared by `resolve_node`'s own `Expr::Iterate` arm and `first`/`limit`'s fast path) —
   this function is also reached by `resolve_del_path_branches`'s comma-fanout fallback for a
   declined vivify pre-pass, where an out-of-range index read is a placeholder for a write

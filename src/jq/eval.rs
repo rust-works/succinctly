@@ -22381,10 +22381,12 @@ type PathResolveResult<'a> = Result<Vec<PathBranch<'a>>, (Vec<PathBranch<'a>>, E
 /// intent at each call site stays readable.
 ///
 /// Count-bounded resolutions narrow it rather than forwarding it
-/// ([`resolve_node_bounded`], [`resolve_repeat_bounded`]): a caller that
-/// wants at most `n` branches can never need more than `n` outputs from
-/// any single leaf, and that cap is what keeps `first(range(2000000000))`
-/// inside a fold source from materializing two billion values.
+/// ([`resolve_bounded_sink`]): a caller that wants at most `n` branches can
+/// never need more than `n` outputs from any single leaf, and that cap is
+/// what keeps `first(range(2000000000))` inside a fold source from
+/// materializing two billion values. It is the one dial left for
+/// [`resolve_leaf`]'s general non-primitive case, the single producer with
+/// no sink of its own to stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Keep {
     /// Stop the leaf's generator after its first output (#987).
@@ -22436,59 +22438,6 @@ fn path_result(branches: Vec<PathBranch<'_>>, escape: Option<EvalEscape>) -> Pat
     }
 }
 
-/// Keep at most `n` resolved branches, dropping a trailing escape the
-/// consumer never reached — jq's own `def first(f): label $out | (f, break
-/// $out);` and `limit`'s identical `break $out` never resume `f`'s generator
-/// once `$out` is satisfied, so an error/break/halt *after* the nth output
-/// is never raised in the first place.
-///
-/// Sound only because no [`PathResolveResult`] producer emits an `Err` side
-/// prefix *longer* than the branches jq's own generator emits before that
-/// escape. That is not decorative — an earlier attempt at this exact fix
-/// (PR #985, issue #972) assumed the stronger "exactly equal" form without
-/// checking, and `resolve_index_expr`/`resolve_slice_expr`'s key/bound ×
-/// target cross product violated it: `del(limit(2; select((true,
-/// error("t")))[("x","y")]))` silently deleted both keys instead of
-/// raising, because the untruncated prefix (length 2) satisfied `limit(2)`.
-/// Both functions were fixed ahead of this helper's reinstatement (see their
-/// own doc comments) to restrict their key/bound loops to a single element
-/// once their `target` has escaped, and that is pinned by
-/// [`test_resolve_index_expr_prefix_matches_jq_when_target_escapes_972`] and
-/// [`test_first_limit_path_truncation_does_not_overreach_index_fanout_972`]
-/// (both in `tests/jq_cli_tests.rs`) rather than merely asserted here.
-///
-/// **Only the "not longer" half holds universally, and only that half is
-/// what this function needs.** A prefix *shorter* than jq's is still
-/// possible — `resolve_slice_expr` drops the bound generator's own partial
-/// prefix, so `[10,20,30] | path(limit(1; .[(0,error("b")):(2,3)]))` raises
-/// here where jq answers `[{"start":0,"end":2}]`, exit 0 (pre-existing, on
-/// `main` too). A short prefix under-satisfies the `>= n` test below, so
-/// the escape propagates and the caller refuses — visibly wrong, never a
-/// false success, and never a write jq would not perform. Do not restate
-/// the invariant as "exactly equal": that is the form PR #985 assumed.
-///
-/// Drops `Halt` along with `Error`/`Break` once satisfied. jq never reaches
-/// it either (`path(first(select((true, ("m"|halt_error(3))))))` is `[]`,
-/// exit 0, confirmed against jq 1.7.1), and the value-position twins
-/// `each_take_first`/`each_take_n` already drop it for the same consumers.
-/// `resolve_leaf`'s opposite Halt-*keeping* rule (relevant to #987) is not a
-/// counterexample: it is a terminal fallback for a value that has no path
-/// shape at all, where no consumer was ever satisfied by an earlier output.
-///
-/// This is not laziness: the resolver underneath is still eager, so a
-/// dropped escape's side effects (`stderr`, a consumed `input`, `halt_error`'s
-/// own write) have already fired by the time this runs — only the escape
-/// itself is discarded, never the work that produced it. Making the
-/// resolver stop pulling early is #987/#820's territory
-/// (`docs/plan/jq-lazy-generator-consumers.md`), not this function's.
-fn take_path_branches(result: PathResolveResult<'_>, n: usize) -> PathResolveResult<'_> {
-    match result {
-        Ok(branches) => Ok(branches.into_iter().take(n).collect()),
-        Err((prefix, _)) if prefix.len() >= n => Ok(prefix.into_iter().take(n).collect()),
-        Err(e) => Err(e),
-    }
-}
-
 /// Peel any wrapping `Expr::Paren` down to the inner expression — `(false)`
 /// and `false` are the same node for a caller that only cares about literal
 /// shape, not surface syntax (`Expr::Alternative`'s `#845` fix, below).
@@ -22519,8 +22468,8 @@ enum ResolveFlow {
     /// A sink answered [`Demand::Stop`].
     ///
     /// A trailing escape the producer had already computed is *dropped*
-    /// here rather than carried, matching [`take_path_branches`]'s own
-    /// rule and `def first(f): label $out | (f, break $out);` — once
+    /// here rather than carried, following `def first(f): label $out | (f,
+    /// break $out);` — once
     /// the consumer is satisfied, jq never resumes the generator, so an
     /// error/break/halt after the last delivered branch is never raised.
     Stopped,
@@ -22603,8 +22552,6 @@ fn resolve_cond_fork_sink(
 
 /// `.[]`'s own path-branch construction (#1850), emitted one element at a
 /// time so a bounded consumer stops the walk instead of truncating it
-/// afterwards. [`resolve_iterate_bounded`] is the collecting wrapper for
-/// the callers that still want a `Vec`.
 ///
 /// **Precondition, not re-checked here:** the caller must already know
 /// `value` is trackable (#843) and raise
@@ -22669,6 +22616,246 @@ fn resolve_iterate_sink<'a, S: EvalSemantics>(
         // surface, is currently affected) rather than folded into this
         // fix. Tracked as #2376.
         other => ResolveFlow::Escaped(EvalError::cannot_iterate_with(S::TAG, other).into()),
+    }
+}
+
+/// Resolve `expr`, delivering at most `n` branches to `sink` (#1952).
+///
+/// The one bounding mechanism every bounded consumer shares — `limit(n; f)`,
+/// `first(f)` (which is `limit(1; f)`) and `nth(n; f)` — replacing the three
+/// hand-copied generator special cases #1850/#1906/#1935 each added
+/// (`resolve_node_bounded`, `resolve_repeat_bounded`, `resolve_iterate_bounded`,
+/// `take_path_branches`). Because the bound is a sink answer rather than a
+/// dispatch on the *outermost* expression's shape, it reaches a generator
+/// through arbitrary combinator nesting: `path(limit(2; if true then
+/// repeat(.) else empty end))` is `[]`, `[]` (jq 1.7.1), where the old
+/// `unwrap_paren`-then-match dispatch saw an `Expr::If` and gave up.
+///
+/// `keep` is still narrowed to `n` alongside the sink: it is the dial
+/// [`resolve_leaf`]'s general non-primitive case reads, which is the one
+/// producer that has no sink of its own to stop yet.
+///
+/// A `Stopped` that this function's *own* counter caused folds to
+/// `Exhausted` — the bound is satisfied, which is a success for the caller,
+/// and it is what drops a trailing escape the consumer never reached
+/// (jq's `def first(f): label $out | (f, break $out);` never resumes `f`).
+/// Only a stop the *downstream* sink asked for propagates.
+fn resolve_bounded_sink<'a, S: EvalSemantics>(
+    expr: &Expr,
+    value: &'a OwnedValue,
+    trackable: bool,
+    snapshot: bool,
+    keep: Keep,
+    n: usize,
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
+    if n == 0 {
+        return ResolveFlow::Exhausted;
+    }
+    let mut emitted = 0usize;
+    let mut downstream_stopped = false;
+    let flow = resolve_node_sink::<S>(
+        expr,
+        value,
+        trackable,
+        snapshot,
+        keep.at_most(n),
+        &mut |branch| {
+            emitted += 1;
+            if sink(branch) == Demand::Stop {
+                downstream_stopped = true;
+                return Demand::Stop;
+            }
+            if emitted >= n {
+                Demand::Stop
+            } else {
+                Demand::Continue
+            }
+        },
+    );
+    match flow {
+        ResolveFlow::Stopped if !downstream_stopped => ResolveFlow::Exhausted,
+        other => other,
+    }
+}
+
+/// `repeat(f)`'s own path-branch construction (#1906), emitting each round's
+/// branches as they are produced so a bounded consumer stops the loop.
+///
+/// `repeat(f)` has no base case at all (real jq's `def repeat(f): f,
+/// repeat(f);`, unconditional on how many outputs `f` produced), so an `f`
+/// that never errors loops forever — confirmed live, `limit(3;
+/// repeat(empty))` hangs against pinned jq 1.7.1 too. That is why this arm
+/// cannot be an eager resolution truncated afterwards: the call would never
+/// return.
+///
+/// Each cycle re-resolves `f` against the *same* original `value`, never the
+/// previous cycle's own result — `repeat` has no leading `.,` the way
+/// `recurse`'s `., (f | r)` does, and threads no state between rounds.
+/// Confirmed live against jq 1.7.1: `{"a":{"a":2}} | path(limit(2;
+/// repeat(.a)))` is `["a"]`, `["a"]`, not the progressively deepening
+/// `["a"]`, `["a","a"]` `recurse(.a)` gives.
+///
+/// `MAX_ITERATIONS` (round count) and `budget` ([`REPEAT_WIDTH_BUDGET`],
+/// total branches) are the same two-tier backstop `resolve_repeat_bounded`
+/// carried, kept identical so this migration changes no bounded shape:
+/// exhausting the round cap ends the walk silently (`path(limit(3;
+/// repeat(empty)))` is no output, exit 0) while exhausting the width budget
+/// raises, matching value mode's own "repeat: maximum iterations exceeded"
+/// (`path(limit(50000; repeat(.[])))` on a wide array). Both are documented
+/// divergences from jq's own hang in
+/// [`docs/compliance/jq/limitations.md`](../../docs/compliance/jq/limitations.md).
+fn resolve_repeat_sink<'a, S: EvalSemantics>(
+    f: &Expr,
+    value: &'a OwnedValue,
+    trackable: bool,
+    snapshot: bool,
+    keep: Keep,
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
+    const MAX_ITERATIONS: usize = 1000;
+    let mut budget = REPEAT_WIDTH_BUDGET;
+    for _ in 0..MAX_ITERATIONS {
+        let mut stopped = false;
+        let mut over_budget = false;
+        let flow = resolve_node_sink::<S>(f, value, trackable, snapshot, keep, &mut |branch| {
+            if budget == 0 {
+                over_budget = true;
+                return Demand::Stop;
+            }
+            budget -= 1;
+            if sink(branch) == Demand::Stop {
+                stopped = true;
+                Demand::Stop
+            } else {
+                Demand::Continue
+            }
+        });
+        if over_budget {
+            return ResolveFlow::Escaped(
+                EvalError::new("repeat: maximum iterations exceeded".to_string()).into(),
+            );
+        }
+        if stopped {
+            return ResolveFlow::Stopped;
+        }
+        if let ResolveFlow::Escaped(e) = flow {
+            return ResolveFlow::Escaped(e);
+        }
+    }
+    ResolveFlow::Exhausted
+}
+
+/// `path(limit(n; expr))` — `n` is the OUTER loop, exactly as in value
+/// context (#1279): `{"a":1,"b":2} | [path(limit((1,2); .a,.b))]` is
+/// `[["a"],["a"],["b"]]` in jq. One bounded resolution per `n` output, with
+/// `n`'s own trailing escape fired only after the whole prefix.
+///
+/// `classify_limit_n` is shared with value mode's `limit_with_n` so
+/// `path(limit(-1.5; ...))` cannot drift from `limit(-1.5; ...)` — the bug
+/// #1313 already had to fix once. A zero-output `n` produces zero output
+/// rather than collapsing to `Null`'s unlimited passthrough (verified live
+/// against jq 1.7.1: `path(limit(empty; .a,.b))` on `{"a":1,"b":2}` produces
+/// nothing, exit 0).
+fn resolve_limit_sink<'a, S: EvalSemantics>(
+    n_expr: &Expr,
+    expr: &Expr,
+    value: &'a OwnedValue,
+    trackable: bool,
+    snapshot: bool,
+    keep: Keep,
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
+    let (n_values, escape) = eval_owned_multi_keep_partial::<S>(n_expr, value);
+    for n_value in n_values {
+        let flow = match classify_limit_n(n_value) {
+            Ok(LimitN::Unlimited) => {
+                resolve_node_sink::<S>(expr, value, trackable, snapshot, keep, sink)
+            }
+            Ok(LimitN::Take(n)) => {
+                resolve_bounded_sink::<S>(expr, value, trackable, snapshot, keep, n, sink)
+            }
+            Err(e) => return ResolveFlow::Escaped(e.into()),
+        };
+        match flow {
+            ResolveFlow::Exhausted => {}
+            other => return other,
+        }
+    }
+    match escape {
+        Some(e) => ResolveFlow::Escaped(e),
+        None => ResolveFlow::Exhausted,
+    }
+}
+
+/// `path(nth(n; expr))` (#1952) — the arm `nth` had none of at all, which is
+/// exactly the "the next bounded consumer will hand-copy the same two
+/// generator special cases a third time" prediction that filed this issue.
+///
+/// jq 1.7.1 defines it as `def nth($n; f): if $n < 0 then error("nth doesn't
+/// support negative indices") else label $out | foreach f as $item (-1; .+1;
+/// if . == $n then $item, break $out else empty end) end;` — so it *skips*
+/// the first `n` outputs, emits the next one, and breaks; a generator with
+/// fewer than `n + 1` outputs emits nothing at all rather than falling back
+/// to the last one. Captured live against jq 1.7.1:
+///
+/// ```console
+/// $ echo '{"a":1,"b":2}' | jq -c 'path(nth(1; .a,.b))'
+/// ["b"]
+/// $ echo '{"a":1,"b":2}' | jq -c '[path(nth(5; .a,.b))]'
+/// []
+/// $ echo '{"a":{"a":2}}' | jq -c 'path(nth(2; repeat(.a)))'
+/// ["a"]
+/// $ echo '{"a":1}' | jq -c 'path(nth(-1; .a))'
+/// jq: error (at <stdin>:1): nth doesn't support negative indices
+/// ```
+///
+/// `n` is the outer loop and `classify_nth_n` is shared with
+/// `builtin_nth_stream`, for the same anti-drift reason
+/// [`resolve_limit_sink`] shares `classify_limit_n`.
+fn resolve_nth_sink<'a, S: EvalSemantics>(
+    n_expr: &Expr,
+    expr: &Expr,
+    value: &'a OwnedValue,
+    trackable: bool,
+    snapshot: bool,
+    keep: Keep,
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
+    let (n_values, escape) = eval_owned_multi_keep_partial::<S>(n_expr, value);
+    for n_value in n_values {
+        let n = match classify_nth_n(n_value) {
+            Ok(n) => n,
+            Err(e) => return ResolveFlow::Escaped(e.into()),
+        };
+        let mut skipped = 0usize;
+        let mut downstream_stopped = false;
+        let flow = resolve_node_sink::<S>(
+            expr,
+            value,
+            trackable,
+            snapshot,
+            keep.at_most(n.saturating_add(1)),
+            &mut |branch| {
+                if skipped < n {
+                    skipped += 1;
+                    return Demand::Continue;
+                }
+                if sink(branch) == Demand::Stop {
+                    downstream_stopped = true;
+                }
+                Demand::Stop
+            },
+        );
+        match flow {
+            ResolveFlow::Exhausted => {}
+            ResolveFlow::Stopped if !downstream_stopped => {}
+            other => return other,
+        }
+    }
+    match escape {
+        Some(e) => ResolveFlow::Escaped(e),
+        None => ResolveFlow::Exhausted,
     }
 }
 
@@ -23018,6 +23205,50 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             emit_passthrough(value, trackable, snapshot, sink)
         }
 
+        // `repeat(f)` (#1906) and the three bounded consumers below all
+        // resolve through the sink now, so a bound threads through arbitrary
+        // combinator nesting rather than only reaching a generator that is
+        // syntactically `limit`/`first`'s direct child (#1952). Verified live
+        // against jq 1.7.1: `{"a":1} | path(limit(2; if true then repeat(.)
+        // else empty end))` is `[]`, `[]`.
+        Expr::Repeat(f) => resolve_repeat_sink::<S>(f, value, trackable, snapshot, keep, sink),
+
+        // `first(f)` keeps only the first branch `f` resolves to, which is
+        // exactly `limit(1; f)` for path-tracking purposes (#1935).
+        // `Expr::FirstExpr` is what the dedicated `first(...)` parse path
+        // builds; `Builtin::FirstStream` is never constructed by the parser
+        // (#1986) -- `parse_first_expr` intercepts `first(...)` before
+        // `try_parse_builtin` ever runs, so this second arm is dead from any
+        // parseable query. Kept anyway as defensive symmetry, the same way
+        // `builtin_first_stream_propagates_bare_halt`'s own doc comment
+        // documents and tests `Builtin::FirstStream` directly.
+        Expr::FirstExpr(inner) | Expr::Builtin(Builtin::FirstStream(inner)) => {
+            resolve_bounded_sink::<S>(inner, value, trackable, snapshot, keep, 1, sink)
+        }
+
+        // `limit(n; f)` uses the same `n`-conversion rule as `eval_limit`, so
+        // `path(limit(...))` agrees with plain `limit(...)` in this
+        // evaluator -- including anywhere `eval_limit` itself still diverges
+        // from jq (e.g. a negative `n`), which is that function's bug to fix,
+        // not this resolver's. `Builtin::Limit` is never constructed by the
+        // parser (a CLI `limit(n; expr)` always parses through
+        // `parse_limit_expr` into `Expr::Limit`, matched first) -- kept for
+        // exhaustiveness/parity with the value-mode arm, not
+        // coverage-testable through this dispatch.
+        Expr::Limit { n, expr } => {
+            resolve_limit_sink::<S>(n, expr, value, trackable, snapshot, keep, sink)
+        }
+        Expr::Builtin(Builtin::Limit(n, expr)) => {
+            resolve_limit_sink::<S>(n, expr, value, trackable, snapshot, keep, sink)
+        }
+
+        // `nth(n; f)` (#1952). `Builtin::NthStream` is what a CLI `nth(n; f)`
+        // parses to; `Expr::NthExpr` is parser-unreachable but constructible
+        // by `eval_generic`'s own rewrites, so both spell the same arm.
+        Expr::NthExpr { n, expr } | Expr::Builtin(Builtin::NthStream(n, expr)) => {
+            resolve_nth_sink::<S>(n, expr, value, trackable, snapshot, keep, sink)
+        }
+
         // Every remaining shape still resolves eagerly and reaches the sink
         // through `drain_path_result`, which is byte-identical to the eager
         // result for an always-`Continue` sink -- so this is a missed
@@ -23273,26 +23504,6 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
             resolve_recurse::<S>(f, Some(cond), value, trackable, snapshot, keep)
         }
 
-        // `first(f)` keeps only the first branch `f` resolves to.
-        // `Expr::FirstExpr` is what the dedicated `first(...)` parse path
-        // builds; `Builtin::FirstStream` is never constructed by the parser
-        // (#1986) -- `parse_first_expr` intercepts `first(...)` before
-        // `try_parse_builtin` ever runs, so this second arm is dead from any
-        // parseable query. Kept anyway as defensive symmetry, the same way
-        // `builtin_first_stream_propagates_bare_halt`'s own doc comment
-        // documents and tests `Builtin::FirstStream` directly rather than
-        // relying on a (nonexistent) parser path to reach it.
-        //
-        // #1935: `first(f)` is exactly `limit(1; f)` for path-tracking
-        // purposes, so it shares `resolve_limit_one_n`'s own bounded
-        // dispatch (`resolve_node_bounded`, which fast-paths `repeat`/`.[]`
-        // the same way `limit` does) rather than `take_path_branches`'s
-        // generic truncate-after-the-fact shape alone. Live-verified against
-        // jq 1.7.1: `{"a":1} | path(first(repeat(.)))` is `[]`.
-        Expr::FirstExpr(inner) | Expr::Builtin(Builtin::FirstStream(inner)) => {
-            resolve_node_bounded::<S>(inner, value, trackable, snapshot, keep, 1)
-        }
-
         // `a // b`: resolve `a`, keep only its truthy branches — jq's `//`
         // filters a multi-output left side rather than choosing all-or-
         // nothing (`retain_truthy` is this rule's value-only twin) — and
@@ -23347,24 +23558,6 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
             } else {
                 Ok(branches)
             }
-        }
-
-        // `limit(n; f)`: same `n`-conversion rule as `eval_limit`, so
-        // `path(limit(...))` agrees with plain `limit(...)` in this
-        // evaluator — including anywhere `eval_limit` itself still diverges
-        // from jq (e.g. a negative `n`), which is that function's bug to
-        // fix, not this resolver's. Both internal spellings reach here for
-        // the same reason as `first` above.
-        Expr::Limit { n, expr } => resolve_limit::<S>(n, expr, value, trackable, snapshot, keep),
-        // `Builtin::Limit` is never constructed by the parser (a CLI
-        // `limit(n; expr)` always parses through `parse_limit_expr` into
-        // `Expr::Limit` above, matched first) -- unreachable from any
-        // parseable query, same as `builtin_limit_propagates_halt_from_expr_argument`'s
-        // own doc comment already establishes for the sibling value-mode
-        // builtin. Kept for exhaustiveness/parity with that arm, not
-        // coverage-testable through this dispatch.
-        Expr::Builtin(Builtin::Limit(n, expr)) => {
-            resolve_limit::<S>(n, expr, value, trackable, snapshot, keep)
         }
 
         // #1440: `reduce`/`foreach` are real sugar over the same
@@ -23674,265 +23867,6 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
         }
 
         other => resolve_leaf::<S>(other, value, trackable, snapshot, keep),
-    }
-}
-
-/// Resolve `n; expr`'s `n` the same way `eval_limit` does, then take that
-/// many resolved branches of `expr`.
-///
-/// Uses `eval_owned_expr_ctrl` (which preserves [`Control`] losslessly, the
-/// same #575 precedent `resolve_node`'s other arms rely on), not the
-/// `eval_owned_expr` that collapses a `break` into a synthetic "not in
-/// label" error — this call sits directly in `resolve_node`'s own domain
-/// (unlike the far more broadly-shared `eval_owned_expr` call sites #833
-/// tracks), so there is no reason to leave `limit(n; f)`'s own `n` bound
-/// carrying #824's bug after every other arm here was fixed: verified live,
-/// `label $out | path(limit(break $out; .a))` on `{"a":1}` now produces no
-/// output, exit 0, matching real jq exactly.
-fn resolve_limit<'a, S: EvalSemantics>(
-    n_expr: &Expr,
-    expr: &Expr,
-    value: &'a OwnedValue,
-    trackable: bool,
-    snapshot: bool,
-    keep: Keep,
-) -> PathResolveResult<'a> {
-    // #1313: `eval_owned_expr_ctrl` (used elsewhere in this file) collapses
-    // a genuinely zero-output bound to `Null` by design -- which would fall
-    // into the `Null`/`Bool` "unlimited passthrough" arm below instead of
-    // jq's own `n as $n | ...` desugaring, where a zero-output `n` never
-    // even reaches `path(paths)` and the whole call produces zero output
-    // (verified live against jq 1.7.1: `path(limit(empty; .a,.b))` on
-    // `{"a":1,"b":2}` produces nothing, exit 0). `eval_owned_expr_full`
-    // keeps that distinction visible.
-    // `n` is the OUTER loop, exactly as in value context (#1279):
-    // `{"a":1,"b":2} | [path(limit((1,2); .a,.b))]` is `[["a"],["a"],["b"]]`
-    // in jq. Path context cannot use `fanout_arg` -- it returns
-    // `PathResolveResult`, not `QueryResult` -- so the loop is written out,
-    // but it follows the same two rules: concatenate one resolution per `n`,
-    // and fire `n`'s own trailing escape only after the whole prefix.
-    //
-    // `take_path_branches`' "the prefix is never *longer* than jq's"
-    // invariant (#972/#985) still holds: it is applied per `n` inside
-    // `resolve_limit_one_n`, capping each resolution at that `n` before the
-    // results are concatenated, so no single resolution can overrun its own
-    // bound.
-    let (n_values, escape) = eval_owned_multi_keep_partial::<S>(n_expr, value);
-    let mut branches = Vec::new();
-    for n_value in n_values {
-        match resolve_limit_one_n::<S>(n_value, expr, value, trackable, snapshot, keep) {
-            Ok(mut b) => branches.append(&mut b),
-            Err((mut b, e)) => {
-                branches.append(&mut b);
-                return Err((branches, e));
-            }
-        }
-    }
-    match escape {
-        Some(e) => Err((branches, e)),
-        None => Ok(branches),
-    }
-}
-
-/// Shared "resolve `expr`, capped at `n` branches" dispatch for every
-/// bounded consumer of a generator (`limit(n; expr)` and, since #1935,
-/// `first(f)` == `limit(1; f)` for path-tracking purposes) -- extracted from
-/// two independent, drifting copies of this same three-way match (#1935's
-/// own code review, echoing the "duplicated predicates diverge silently"
-/// lesson #106 already burned this file on once).
-///
-/// - #1850: bare `.[]` is bounded directly via `.take(n)` on the same
-///   iterator `resolve_node`'s own `Expr::Iterate` arm builds (see
-///   [`resolve_iterate_bounded`]'s own doc comment for the implementation),
-///   making `path(limit(n; .[]))`/`path(first(.[]))` O(n) instead of
-///   O(document size). Scoped to exactly this shape rather than
-///   `resolve_node`'s generator path in general because every other arm
-///   there returns a fully materialized `Vec<PathBranch>` with no
-///   sink/early-stop protocol to plug into -- a fully general fix needs
-///   that protocol threaded through `resolve_node` itself, tracked as its
-///   own open design question in #1952 rather than attempted here.
-/// - #1906: `repeat(f)` needs the same interception, for a correctness
-///   reason rather than a performance one -- see [`resolve_repeat_bounded`]'s
-///   own doc comment. This has to intercept *before* the generic
-///   `resolve_node` call below, not truncate its result afterward the way
-///   `take_path_branches` does for every other shape: an un-intercepted
-///   `Expr::Repeat` falls through to `resolve_leaf`'s general case, which
-///   evaluates it via the ordinary (value-mode) evaluator -- bounded by
-///   `eval_repeat`'s own `MAX_ITERATIONS = 1000` round cap, so it *does*
-///   still return, just slowly and with the wrong answer for a `repeat`
-///   whose body is otherwise perfectly path-trackable (confirmed live: the
-///   pre-#1906 code returned "Invalid path expression" for `path(limit(3;
-///   repeat(.)))` after computing, not hanging on, up to 1000 rounds).
-///   Only a body that never produces *any* output (`repeat(empty)`) comes
-///   close to a true hang, and even that is bounded by the same cap.
-///
-/// Both fast paths are gated the same way their originals were: `Iterate`
-/// requires `trackable` (an untracked value falls through to the generic
-/// path below, which raises the correct error on its own); `Repeat` has no
-/// such gate because `resolve_repeat_bounded` re-threads `trackable` through
-/// its own per-round `resolve_node` call instead.
-fn resolve_node_bounded<'a, S: EvalSemantics>(
-    expr: &Expr,
-    value: &'a OwnedValue,
-    trackable: bool,
-    snapshot: bool,
-    keep: Keep,
-    n: usize,
-) -> PathResolveResult<'a> {
-    match unwrap_paren(expr) {
-        Expr::Repeat(f) => resolve_repeat_bounded::<S>(f, value, trackable, snapshot, keep, n),
-        Expr::Iterate if trackable => resolve_iterate_bounded::<S>(value, n),
-        _ => take_path_branches(
-            resolve_node::<S>(expr, value, trackable, snapshot, keep.at_most(n)),
-            n,
-        ),
-    }
-}
-
-/// `path(limit(n; expr))`'s resolution for one already-resolved `n` — the body
-/// of [`resolve_limit`], run once per output of its `n` generator (#1279).
-fn resolve_limit_one_n<'a, S: EvalSemantics>(
-    n_value: OwnedValue,
-    expr: &Expr,
-    value: &'a OwnedValue,
-    trackable: bool,
-    snapshot: bool,
-    keep: Keep,
-) -> PathResolveResult<'a> {
-    // Uses main's `classify_limit_n` (landed independently while this
-    // branch was in flight) rather than the inline match this commit
-    // originally duplicated here: identical case-for-case, and one
-    // definition shared with `limit_with_n` keeps the two contexts from
-    // drifting -- `path(limit(-1.5; ...))` diverging from value-mode
-    // `limit(-1.5; ...)` is exactly the bug #1313 already had to fix once.
-    let n = match classify_limit_n(n_value) {
-        Ok(LimitN::Unlimited) => return resolve_node::<S>(expr, value, trackable, snapshot, keep),
-        Ok(LimitN::Take(n)) => n,
-        Err(e) => return Err((Vec::new(), e.into())),
-    };
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    resolve_node_bounded::<S>(expr, value, trackable, snapshot, keep, n)
-}
-
-/// `repeat(f)`'s own path-branch construction (#1906), bounded to at most
-/// `n` branches -- mirroring [`resolve_iterate_bounded`]'s #1850 precedent
-/// in shape, but for a correctness reason rather than a performance one:
-/// `repeat(f)` has no base case at all (real jq's own `def repeat(f): f,
-/// repeat(f);`, unconditional on how many outputs `f` produced), so an `f`
-/// that never errors and never produces a value on some round loops
-/// forever -- confirmed live, `limit(3; repeat(empty))` hangs against
-/// pinned jq 1.7.1 too. `resolve_node`'s other arms all return a fully
-/// materialized `Vec<PathBranch>` for `take_path_branches` to truncate
-/// afterward, which cannot work here: the call would simply never return.
-///
-/// Each cycle re-resolves `f` against the *same* original `value`, never
-/// the previous cycle's own result -- `repeat` has no leading `.,` the way
-/// `recurse`'s `., (f | r)` does, and threads no state between rounds at
-/// all. Confirmed live against jq 1.7.1: `{"a":{"a":2}} | path(limit(2;
-/// repeat(.a)))` is `["a"]`, `["a"]` -- the identical single-level path
-/// twice, not the progressively deepening `["a"]`, `["a","a"]` `recurse(.a)`
-/// gives for the same input -- matching `eval_repeat`'s own identical
-/// value-only semantics (its doc comment: "evaluates `expr` with the
-/// original input each time").
-///
-/// `MAX_ITERATIONS` (round count) and `budget` (total branch count, via
-/// [`REPEAT_WIDTH_BUDGET`]) together mirror `eval_repeat`'s own identical
-/// two-tier backstop
-/// (`src/jq/eval.rs`) -- documented as a deliberate divergence from real
-/// jq's own hang/unbounded-allocation in
-/// [`docs/compliance/jq/limitations.md`](../../docs/compliance/jq/limitations.md),
-/// not new to this fix: `eval_repeat`'s value-mode sibling already
-/// terminates `limit(3; repeat(empty))` with no output instead of hanging
-/// (round cap), and already refuses a wide enough fan-out with "repeat:
-/// maximum iterations exceeded" rather than growing `outputs` unboundedly
-/// (branch-count budget) -- this keeps path-mode consistent with both
-/// rather than reintroducing either gap only here (code review, #1933:
-/// an earlier version of this function had the round cap but not the
-/// branch-count budget, letting `path(limit(50000; repeat(.[])))` on a
-/// wide array allocate 5x what value-mode's identical query allows).
-///
-/// Code review, #1933: an earlier version of the `Err` arm below always
-/// propagated `e`, even when `branches` already satisfied `n` before the
-/// error -- confirmed live to spuriously exit 5 for `path(limit(1;
-/// repeat((., error("boom")))))`, which real jq treats as fully successful
-/// (its own `limit` never asks for a second output once the first
-/// satisfies `n`, so it never reaches the error). Mirrors
-/// [`take_path_branches`]'s own identical `prefix.len() >= n` check for the
-/// same reason.
-fn resolve_repeat_bounded<'a, S: EvalSemantics>(
-    f: &Expr,
-    value: &'a OwnedValue,
-    trackable: bool,
-    snapshot: bool,
-    keep: Keep,
-    n: usize,
-) -> PathResolveResult<'a> {
-    const MAX_ITERATIONS: usize = 1000;
-    let mut budget = REPEAT_WIDTH_BUDGET;
-    let mut branches: Vec<PathBranch<'a>> = Vec::new();
-    for _ in 0..MAX_ITERATIONS {
-        if branches.len() >= n {
-            break;
-        }
-        match resolve_node::<S>(f, value, trackable, snapshot, keep.at_most(n)) {
-            Ok(round) => {
-                for branch in round {
-                    if budget == 0 {
-                        let e: EvalEscape =
-                            EvalError::new("repeat: maximum iterations exceeded".to_string())
-                                .into();
-                        return Err((branches, e));
-                    }
-                    budget -= 1;
-                    branches.push(branch);
-                    if branches.len() >= n {
-                        break;
-                    }
-                }
-            }
-            Err((mut b, e)) => {
-                branches.append(&mut b);
-                if branches.len() >= n {
-                    branches.truncate(n);
-                    return Ok(branches);
-                }
-                return Err((branches, e));
-            }
-        }
-    }
-    branches.truncate(n);
-    Ok(branches)
-}
-
-/// Collecting, `n`-bounded wrapper over [`resolve_iterate_sink`] (#1850) --
-/// [`resolve_node_bounded`]'s `.[]` fast path, the one caller that still
-/// wants a `Vec`. The branch construction itself lives in the sink so the
-/// two cannot drift (#106).
-///
-/// **Precondition, not re-checked here:** the caller must already know
-/// `value` is trackable (#843) and raise
-/// `invalid_path_expression_near_iterate` itself when it is not.
-fn resolve_iterate_bounded<S: EvalSemantics>(
-    value: &OwnedValue,
-    n: usize,
-) -> PathResolveResult<'_> {
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    let mut out = Vec::new();
-    let flow = resolve_iterate_sink::<S>(value, &mut |b| {
-        out.push(b);
-        if out.len() >= n {
-            Demand::Stop
-        } else {
-            Demand::Continue
-        }
-    });
-    match flow {
-        ResolveFlow::Escaped(e) => Err((out, e)),
-        ResolveFlow::Exhausted | ResolveFlow::Stopped => Ok(out),
     }
 }
 
@@ -24996,9 +24930,9 @@ impl FoldRegister {
 /// once the leaf is allowed to reach its third output.
 ///
 /// **The invariant this now depends on is stronger than the one this file
-/// generally maintains.** `take_path_branches`' own doc comment promises
-/// only that a prefix is never *longer* than jq's; a *shorter* one has
-/// always been acceptable, because branches were previously discarded here.
+/// generally maintains.** A resolved prefix is only ever promised to be no
+/// *longer* than jq's; a *shorter* one has always been acceptable, because
+/// branches were previously discarded here.
 /// They are values now, so a short prefix is a wrong answer rather than a
 /// wrong error message. The `Err(_)` arm below deliberately falls back to
 /// `eval_owned_expr_fork` for any escape that is neither `Halt` nor
@@ -25009,8 +24943,9 @@ impl FoldRegister {
 /// (1,2,error("s"))` prefix intact). It does **not** cover the six places
 /// that launder an `Err` into a short `Ok` below this call -- `Expr::Optional`'s
 /// blanket arm, `resolve_catch`'s no-`catch` case, `Expr::Label` on a
-/// matching break, `take_path_branches`, `resolve_recurse`'s
-/// `RECURSE_MAX_ITEMS` cap, and `resolve_repeat_bounded`. Anyone changing
+/// matching break, `resolve_bounded_sink`'s satisfied-bound fold to
+/// `Exhausted`, `resolve_recurse`'s `RECURSE_MAX_ITEMS` cap, and
+/// `resolve_repeat_sink`'s round cap. Anyone changing
 /// one of those is changing a fold's values here too.
 ///
 /// **`EvalTag::Jq` only.** Real yq's lexer rejects `reduce`, `foreach` *and*
@@ -28781,7 +28716,7 @@ fn eval_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 pub(crate) const REDUCE_FOREACH_MAX_STEPS: usize = 100_000;
 
 /// `repeat(f)`'s own step budget — bounds how many values a *single*
-/// round may fork into at once (`resolve_repeat_bounded`/`each_repeat`),
+/// round may fork into at once (`resolve_repeat_sink`/`each_repeat`),
 /// and separately (`eval_repeat`) the total output size of the eager,
 /// non-demand-driven fallback path. Split from [`REDUCE_FOREACH_MAX_STEPS`]
 /// by #2079 (previously the same constant by coincidence); kept at the
@@ -30392,8 +30327,8 @@ fn limit_with_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `(value, trailing)` pair now, so the zero-output bound never reaches
     // here as a value at all -- it simply runs this body zero times.
     //
-    // Uses main's `classify_limit_n`, shared with `resolve_limit_one_n`
-    // above, in place of the inline match this commit first duplicated.
+    // Uses main's `classify_limit_n`, shared with `resolve_limit_sink`,
+    // in place of the inline match this commit first duplicated.
     let n = match classify_limit_n(n_value) {
         Ok(LimitN::Unlimited) => return eval_single::<W, S>(expr, value, optional),
         Ok(LimitN::Take(n)) => n,
@@ -30930,7 +30865,7 @@ fn eval_repeat<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // fall through to `owned_vec_to_result(outputs)` silently, returning a
     // truncated-but-successful result with no signal. Now raises the same
     // way the per-value `budget` two lines below already does, matching
-    // `resolve_repeat_bounded`'s identical guard.
+    // `resolve_repeat_sink`'s identical guard.
     const MAX_ITERATIONS: usize = 1000;
     // Bounds total output size independent of `expr`'s own fan-out (#855
     // follow-up): the per-round loop below used to push at most one
@@ -78852,7 +78787,7 @@ mod tests {
     fn builtin_limit_n_classification_matches_classify_limit_n() {
         // `builtin_limit` used to hand-roll its own `n` classification
         // instead of calling `classify_limit_n` (unlike `each_limit`,
-        // `resolve_limit_one_n`, and `limit_with_n`, all migrated to it in
+        // `resolve_limit_sink`, and `limit_with_n`, all migrated to it in
         // the same change): a positive non-integer float (e.g. `2.9`) was
         // silently truncated to `Take(2)` instead of erroring.
         // `builtin_limit` is parser-unreachable today (see
@@ -81615,7 +81550,7 @@ mod tests {
         );
 
         // ...and a *bounded* one must contribute exactly its bound, which
-        // is why `resolve_node_bounded` narrows `keep` rather than
+        // is why `resolve_bounded_sink` narrows `keep` rather than
         // dropping it: two here, not one (`Keep::First`) and not five
         // (an unnarrowed `Keep::AtMost`).
         query!(

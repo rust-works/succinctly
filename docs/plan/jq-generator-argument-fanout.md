@@ -321,7 +321,7 @@ cannot bypass the fix silently.
   observable. Own commit, own probe cited, or a bisect blames the wrong change.
 - **Path context** returns `PathResolveResult`, not `QueryResult`, so it cannot use
   `fanout_arg`. Two doc-commented rules point opposite ways and must both be re-read first:
-  `take_path_branches`' "prefix is never longer than jq's" invariant (the exact assumption
+  the "prefix is never longer than jq's" invariant (the exact assumption
   #972/#985 got wrong) and `resolve_leaf`'s halt-*keeping* rule.
 - **`#[cfg]` matrix.** `builtin_test` has a `#[cfg(not(feature = "regex"))]` twin and a regex
   twin, touched in different stages — do not let them drift. `cargo check --no-default-features`
