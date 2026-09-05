@@ -325,10 +325,13 @@ numbering is right even though the shape of the evaluation is not.
 This is not fixable in the CLI runner alone: a per-document loop would repair `.name`,
 `keys`, `del` and `select(file_index == 1)` but would print `[.]` twice and `. + {"z": 9}`
 twice, both still wrong. The evaluation model is the same one
-[#2451](https://github.com/rust-works/succinctly/issues/2451) records for `(.a, .b) |
+[#2451](https://github.com/rust-works/succinctly/issues/2451) implements for `(.a, .b) |
 (.c, .d)` inside a single document -- yq's `,` and its `ea` both build a context list, and
-every operator is defined over lists -- so the fix is one yq-mode rule for "an expression
-over a context list", decided under #2451 and applied here. Tracked as
+every operator is defined over lists. #2451's three rules already apply on this path
+(`--eval-all`'s union ordering is branch-major with them), but what makes `[.]` collect
+once and `. + {"z": 9}` go cartesian across documents is a *different* mechanism:
+`EvaluateTogether` (`pkg/yqlib/utils.go:85`), a per-node flag set only by the all-at-once
+multi-file reader. Tracked as
 [#2427](https://github.com/rust-works/succinctly/issues/2427); the stray `---` that plain
 multi-file `succinctly yq` prints between files, and the always-0 `file_index` on that
 non-`ea` path, are the same issue's other two divergences.
@@ -2392,7 +2395,7 @@ agreeing here is what makes that removal safe on the `.0`-suffixed case.
 [#2419](https://github.com/rust-works/succinctly/issues/2419) is the ADR-0018 record for
 what is left.
 
-### Comma binds looser than pipe in real yq — the grouping is resolved (#2420); two evaluation-model residuals remain (#2451, #2452)
+### Comma binds looser than pipe in real yq — the grouping is resolved (#2420), the evaluation model with it (#2451); one residual remains (#2452)
 
 Real yq's parser is a shunting-yard operator-precedence parser
 ([`pkg/yqlib/expression_postfix.go`](https://github.com/mikefarah/yq/blob/v4.53.3/pkg/yqlib/expression_postfix.go)),
@@ -2514,16 +2517,18 @@ untouched (`test_jq_comma_still_binds_tighter_than_pipe_2420`). Three
 existing yq-mode tests that had encoded jq's grouping were re-captured against
 the pinned binary rather than kept.
 
-Two divergences the capture exposed are **not** precedence and stay open,
-pinned as residuals in `test_yq_pipe_precedence_residual_divergences_2420`:
+Two divergences the capture exposed are **not** precedence. The first is now
+fixed; the second stays open, pinned as the residual in
+`test_yq_pipe_precedence_residual_divergences_2420`:
 
-- [#2451](https://github.com/rust-works/succinctly/issues/2451): real yq
-  applies a pipe's right side to the whole *list* its left side produced, so
-  `(.a, .b) | (.c, .d)` on `a: {c: 3, d: 4}` / `b: {c: 5, d: 6}` prints
-  `3 5 4 6` in yq and `3 4 5 6` here (jq's per-element order). Both sides are
-  parenthesised, so no grouping rule reaches it; the oracle sweep's
-  `comma_stream` class is this divergence, which is why it did not flip when
-  the precedence fix landed.
+- [#2451](https://github.com/rust-works/succinctly/issues/2451) — **resolved.**
+  Real yq applies a pipe's right side to the whole *list* its left side
+  produced, so `(.a, .b) | (.c, .d)` on `a: {c: 3, d: 4}` / `b: {c: 5, d: 6}`
+  prints `3 5 4 6`; succinctly printed jq's per-element `3 4 5 6`. Both sides
+  are parenthesised, so no grouping rule reaches it — this was the evaluation
+  model, and yq-mode now implements it (see
+  [the context-list section](#yqs-context-list-evaluation-model-in-a-single-document-2451)).
+  The oracle sweep's `comma_stream` class is gone with it.
 - [#2452](https://github.com/rust-works/succinctly/issues/2452): under yq's
   own grouping `.a | .b, .c | . + 1` fails in its first branch; real yq drops
   that branch silently and exits 0, succinctly raises as jq does.
@@ -2532,6 +2537,55 @@ The `length` row above is also two things at once: real yq's rendered-width
 rule for scalars, and a succinctly-internal inconsistency where the comma
 fan-out path still applies jq's absolute-value rule
 ([#2453](https://github.com/rust-works/succinctly/issues/2453)).
+
+### yq's context-list evaluation model in a single document (#2451)
+
+Real yq has no scalar evaluation mode. `Context.MatchingNodes`
+([`pkg/yqlib/context.go`](https://github.com/mikefarah/yq/blob/v4.53.3/pkg/yqlib/context.go))
+is always a *list*, `|` hands its left side's whole list to its right side in one call
+([`operator_pipe.go`](https://github.com/mikefarah/yq/blob/v4.53.3/pkg/yqlib/operator_pipe.go)),
+and each operator decides for itself how to fan out over it.
+[#2451](https://github.com/rust-works/succinctly/issues/2451) implements the three rules
+that follow from that for a single document, in `succinctly yq` only (ADR-0018 rule 2 —
+mode decides; `succinctly jq` keeps jq's model unchanged):
+
+1. **A pipe into a union is branch-major.** `,`
+   ([`operator_union.go`](https://github.com/mikefarah/yq/blob/v4.53.3/pkg/yqlib/operator_union.go))
+   evaluates each of its branches against the same whole list and concatenates the branch
+   results in order, so `(.a, .b) | (.c, .d)` is `3 5 4 6`, not jq's `3 4 5 6`.
+2. **A union of two bare identities yields the list once.** `,` appends its right operand
+   only when the two operands return different backing lists (a Go pointer comparison,
+   there so two self-modifying operands are not double-counted), and `.` returns its input
+   context object verbatim. With right-associative chaining that gives `2 2 4 6 8` output
+   lines for one to five `.` branches over a two-element context.
+3. **Binary operators fan out left-major.** `doCrossFunc`
+   ([`operators.go`](https://github.com/mikefarah/yq/blob/v4.53.3/pkg/yqlib/operators.go))
+   loops the left operand's matches outermost and re-evaluates the right operand inside
+   that loop, so `(.a.c, .b.c) + (1, 10)` is `4 13 6 15` where jq gives `4 6 13 15`.
+
+Three related divergences are **not** covered and stay open:
+
+- **`EvaluateTogether`** ([#2427](https://github.com/rust-works/succinctly/issues/2427)) is
+  what makes `[...]` collect once across documents and binary operators go cartesian under
+  `--eval-all`. It is a flag on the document nodes the all-at-once multi-file reader
+  builds, never set inside a single document, so it changes nothing here — see
+  [the `--eval-all` section](#--eval-all-slurps-the-documents-into-one-array-real-yq-ea-evaluates-over-a-context-list-of-them-2427).
+- **A union of two assignments.** yq's pointer guard also fires for two operands that both
+  hand back the *same, mutated* context, which is the case its own source comment names:
+  `yq '(.a.c = 1), (.b.c = 2)'` prints **one** document carrying both writes. succinctly's
+  assignments each return an independently edited document, so it prints two, each with one
+  write. Collapsing the pair the way rule 2 does would *discard* the second write rather
+  than de-duplicate it, so rule 2 is deliberately restricted to identity-transparent
+  operands. Shared-node assignment is the same missing mechanism as the alias-node identity
+  [the anchor-soundness section](#anchor-soundness-never-emit-yaml-we-cannot-read-back--rule-4a)
+  records.
+- **A missing-key stage in front of a union.** Rule 1 carries its context list as cursors,
+  and an absent position (`.a.x` where `x` is not a key) is not a cursor, so a pipe whose
+  prefix can land on one keeps spine 2416's path-context walk instead — which is exact for
+  those pipes but element-major. `.a.x | (key, path)` is therefore right (`"x"`,
+  `["a","x"]`), while `(.a, .b) | .c | (key, path)` keeps jq's interleaving. Every
+  multi-valued shape the oracle sweep exercises has either an empty prefix or an iterating
+  one (`.a[]`), neither of which can yield an absent node, so the sweep is clean.
 
 ### Other categories
 

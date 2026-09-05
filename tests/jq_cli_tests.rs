@@ -38202,3 +38202,43 @@ fn test_jq_union_of_identities_still_duplicates_2451() -> Result<()> {
 
     Ok(())
 }
+
+/// #2451 rule 3 is yq-only: jq keeps its right-outer/left-inner fanout.
+///
+/// Captured from `/usr/bin/jq` 1.7.1 with `-c` on
+/// `{"a":{"c":3,"d":4},"b":{"c":5,"d":6},"n":[1,2,3]}`; the yq-mode
+/// counterpart is `yq_cli_tests.rs`'s
+/// `test_yq_binary_operator_fans_out_left_major_2451`.
+#[test]
+fn test_jq_binary_fanout_stays_right_major_2451() -> Result<()> {
+    let doc = r#"{"a":{"c":3,"d":4},"b":{"c":5,"d":6},"n":[1,2,3]}"#;
+
+    for (filter, want) in [
+        // $ jq -c '(.a.c, .b.c) + (1, 10)'  =>  4 / 6 / 13 / 15
+        ("(.a.c, .b.c) + (1, 10)", "4\n6\n13\n15"),
+        // $ jq -c '(.n[0], .n[1]) - (1, 2)'  =>  0 / 1 / -1 / 0
+        ("(.n[0], .n[1]) - (1, 2)", "0\n1\n-1\n0"),
+        // $ jq -c '(.a.c, .b.c) * (2, 3)'  =>  6 / 10 / 9 / 15
+        ("(.a.c, .b.c) * (2, 3)", "6\n10\n9\n15"),
+        // $ jq -c '(.a.c, .b.c) / (1, 2)'  =>  3 / 5 / 1.5 / 2.5
+        ("(.a.c, .b.c) / (1, 2)", "3\n5\n1.5\n2.5"),
+        // $ jq -c '(.a.c, .b.c) % (2, 3)'  =>  1 / 1 / 0 / 2
+        ("(.a.c, .b.c) % (2, 3)", "1\n1\n0\n2"),
+        // $ jq -c '(.n[0], .n[1]) < (1, 2)'  =>  false / false / true / false
+        ("(.n[0], .n[1]) < (1, 2)", "false\nfalse\ntrue\nfalse"),
+        // $ jq -c '(.a.c, .b.c) + (1, 10) + (100, 1000)'
+        //     =>  104 / 106 / 113 / 115 / 1004 / 1006 / 1013 / 1015
+        (
+            "(.a.c, .b.c) + (1, 10) + (100, 1000)",
+            "104\n106\n113\n115\n1004\n1006\n1013\n1015",
+        ),
+        // $ jq -c '.n[] + .n[]'  =>  2 3 4 3 4 5 4 5 6  (same as yq)
+        (".n[] + .n[]", "2\n3\n4\n3\n4\n5\n4\n5\n6"),
+    ] {
+        let (out, code) = run_jq_stdin(filter, doc, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(out.trim(), want, "`{filter}`");
+    }
+
+    Ok(())
+}

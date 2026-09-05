@@ -272,6 +272,14 @@ pub trait EvalSemantics: Copy + Default {
     /// comment carries the table and the six internal yq inconsistencies it
     /// reproduces bug-for-bug (ADR-0018 rule 3).
     const EMPTY_OPERAND_BINARY_RULE: bool;
+
+    /// If true (yq, #2451), a binary operator loops its **left** operand
+    /// outermost and re-evaluates the right one per left match. If false
+    /// (jq), the right operand is the outer loop.
+    ///
+    /// See `BinaryFanoutRules::left_major` (this module, private) for the
+    /// captured rows and the yq source this reproduces.
+    const BINARY_FANOUT_IS_LEFT_MAJOR: bool;
 }
 
 /// jq-compatible evaluation semantics (default).
@@ -301,6 +309,7 @@ impl EvalSemantics for JqSemantics {
     const UTF8_LOSSY_USES_JQ_MAXIMAL_SUBPART_RULE: bool = true;
     const ROOT_PATH_CONTEXT_YIELDS_NOTHING: bool = false;
     const EMPTY_OPERAND_BINARY_RULE: bool = false;
+    const BINARY_FANOUT_IS_LEFT_MAJOR: bool = false;
 }
 
 /// yq-compatible evaluation semantics.
@@ -332,6 +341,7 @@ impl EvalSemantics for YqSemantics {
     const UTF8_LOSSY_USES_JQ_MAXIMAL_SUBPART_RULE: bool = false;
     const ROOT_PATH_CONTEXT_YIELDS_NOTHING: bool = true;
     const EMPTY_OPERAND_BINARY_RULE: bool = true;
+    const BINARY_FANOUT_IS_LEFT_MAJOR: bool = true;
 }
 
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
@@ -435,11 +445,42 @@ pub(crate) fn yq_empty_operand_output(
     }
 }
 
-/// `Some(op)` in yq mode, `None` in jq mode -- the single per-mode gate on
-/// [`yq_empty_operand_output`], so no call site spells the `S::` const out
-/// itself (#2460).
-pub(crate) fn empty_operand_rule<S: EvalSemantics>(op: EmptyOperandOp) -> Option<EmptyOperandOp> {
-    S::EMPTY_OPERAND_BINARY_RULE.then_some(op)
+/// The two per-mode rules a binary-operator fanout needs, resolved once from
+/// `S` so no call site spells an `S::` const out itself.
+///
+/// One struct rather than two arguments because both are read by the same
+/// loop and every call site supplies both: [`binary_fanout_rules`] is the
+/// single place either is decided.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BinaryFanoutRules {
+    /// `Some(op)` in yq mode, `None` in jq mode -- the gate on
+    /// [`yq_empty_operand_output`] (#2460).
+    pub(crate) empty: Option<EmptyOperandOp>,
+    /// `true` in yq mode (#2451): the **left** operand is the outer loop and
+    /// the right is re-evaluated per left match, matching
+    /// `doCrossFunc`/`resultsForRHS` (`pkg/yqlib/operators.go:113-138`,
+    /// v4.53.3). `false` in jq mode, which loops the other way round.
+    ///
+    /// Live-captured on `a: {c: 3, d: 4}\nb: {c: 5, d: 6}\nn: [1, 2, 3]`:
+    ///
+    /// | filter                     | yq v4.53.3      | jq 1.7.1        |
+    /// |----------------------------|-----------------|-----------------|
+    /// | `(.a.c, .b.c) + (1, 10)`   | `4 13 6 15`     | `4 6 13 15`     |
+    /// | `(.n[0], .n[1]) - (1, 2)`  | `0 -1 1 0`      | `0 1 -1 0`      |
+    /// | `.n[] + .n[]`              | `2 3 4 3 4 5 4 5 6` | (identical) |
+    ///
+    /// `and`/`or` need no flag: [`boolean_fanout_core`] has always looped the
+    /// left operand outermost (jq short-circuits per left output), which is
+    /// already yq's order.
+    pub(crate) left_major: bool,
+}
+
+/// The one place either binary-fanout rule is read off `S` (#2460/#2451).
+pub(crate) fn binary_fanout_rules<S: EvalSemantics>(op: EmptyOperandOp) -> BinaryFanoutRules {
+    BinaryFanoutRules {
+        empty: S::EMPTY_OPERAND_BINARY_RULE.then_some(op),
+        left_major: S::BINARY_FANOUT_IS_LEFT_MAJOR,
+    }
 }
 
 /// The value a path-context builtin standing on the document root falls back
@@ -3874,7 +3915,7 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             left,
             right,
             optional,
-            empty_operand_rule::<S>(EmptyOperandOp::Compare(*op)),
+            binary_fanout_rules::<S>(EmptyOperandOp::Compare(*op)),
             |left_val, right_val| {
                 Ok(OwnedValue::Bool(apply_compare_op::<S>(
                     *op, &left_val, &right_val,
@@ -3898,7 +3939,7 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             left,
             right,
             optional,
-            empty_operand_rule::<S>(EmptyOperandOp::Arith(*op)),
+            binary_fanout_rules::<S>(EmptyOperandOp::Arith(*op)),
             |left_val, right_val| arith_combine::<S>(*op, left_val, right_val),
             sink,
         ),
@@ -5403,7 +5444,7 @@ fn binary_fanout_core<'a, W: Clone + AsRef<[u64]>>(
     left: &Expr,
     right: &Expr,
     optional: bool,
-    empty_rule: Option<EmptyOperandOp>,
+    rules: BinaryFanoutRules,
     combine: impl FnMut(OwnedValue, OwnedValue) -> Result<OwnedValue, EvalError>,
 ) -> QueryResult<'a, W> {
     let mut out: Vec<OwnedValue> = Vec::new();
@@ -5412,7 +5453,7 @@ fn binary_fanout_core<'a, W: Clone + AsRef<[u64]>>(
         left,
         right,
         optional,
-        empty_rule,
+        rules,
         combine,
         &mut |item: Item<'a, W>| {
             out.push(item.into_owned_from_owned_producer());
@@ -5431,7 +5472,9 @@ fn binary_fanout_core<'a, W: Clone + AsRef<[u64]>>(
     }
 }
 
-/// The one definition of jq's right-outer/left-inner fanout loop, written
+/// The one definition of the binary-operator fanout loop -- jq's
+/// right-outer/left-inner, and (since #2451) yq's left-outer/right-inner,
+/// chosen by [`BinaryFanoutRules::left_major`] -- written
 /// against the demand-driven sink (#1459, Stage 4 of
 /// `docs/plan/jq-lazy-generator-consumers.md`) and parameterized over *how*
 /// an operand is enumerated.
@@ -5484,7 +5527,7 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>>(
     left: &Expr,
     right: &Expr,
     optional: bool,
-    empty_rule: Option<EmptyOperandOp>,
+    rules: BinaryFanoutRules,
     mut combine: impl FnMut(OwnedValue, OwnedValue) -> Result<OwnedValue, EvalError>,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
@@ -5496,23 +5539,39 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>>(
     // count can be answered from `yq_empty_operand_output` instead of
     // silently contributing no pairings. `None` in jq mode, where `1 + empty`
     // really is nothing.
-    let mut right_seen = 0usize;
+    let mut outer_seen = 0usize;
+    // #2451: which operand drives the outer loop. jq re-evaluates the *left*
+    // operand per right output; yq re-evaluates the *right* one per left
+    // output (`doCrossFunc`, `pkg/yqlib/operators.go:113-138`). Only the
+    // nesting swaps -- `combine` still receives (left, right) either way, and
+    // #2460's empty-operand rule is symmetric in the two, so it needs no
+    // second spelling here.
+    let (outer_expr, inner_expr) = if rules.left_major {
+        (left, right)
+    } else {
+        (right, left)
+    };
 
-    let outer = each_operand(right, &mut |right_item: Item<'a, W>| {
-        right_seen += 1;
-        let right_val = match checked_fanout_operand(right_item, &mut abort) {
+    let outer = each_operand(outer_expr, &mut |outer_item: Item<'a, W>| {
+        outer_seen += 1;
+        let outer_val = match checked_fanout_operand(outer_item, &mut abort) {
             Ok(v) => v,
             Err(demand) => return demand,
         };
 
-        let mut left_seen = 0usize;
-        let inner = each_operand(left, &mut |left_item: Item<'a, W>| {
-            left_seen += 1;
-            let left_val = match checked_fanout_operand(left_item, &mut abort) {
+        let mut inner_seen = 0usize;
+        let inner = each_operand(inner_expr, &mut |inner_item: Item<'a, W>| {
+            inner_seen += 1;
+            let inner_val = match checked_fanout_operand(inner_item, &mut abort) {
                 Ok(v) => v,
                 Err(demand) => return demand,
             };
-            match combine(left_val, right_val.clone()) {
+            let (left_val, right_val) = if rules.left_major {
+                (outer_val.clone(), inner_val)
+            } else {
+                (inner_val, outer_val.clone())
+            };
+            match combine(left_val, right_val) {
                 Ok(v) => sink(Item::Owned(v)),
                 Err(e) => {
                     // The sink-world spelling of the eager body's
@@ -5555,13 +5614,13 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>>(
             return Demand::Stop;
         }
 
-        // #2460 (yq mode only): the *left* operand produced nothing for this
-        // right value, so this pairing is answered from the empty-operand
+        // #2460 (yq mode only): the *inner* operand produced nothing for this
+        // outer value, so this pairing is answered from the empty-operand
         // table rather than skipped. Only after `inner` ran to exhaustion --
         // an operand that escaped or was stopped part-way is not "empty".
-        if left_seen == 0 && matches!(inner, Flow::Exhausted) {
-            if let Some(op) = empty_rule {
-                if let Some(v) = yq_empty_operand_output(op, Some(&right_val)) {
+        if inner_seen == 0 && matches!(inner, Flow::Exhausted) {
+            if let Some(op) = rules.empty {
+                if let Some(v) = yq_empty_operand_output(op, Some(&outer_val)) {
                     if matches!(sink(Item::Owned(v)), Demand::Stop) {
                         abort = Some(Flow::Stopped { pending: None });
                         return Demand::Stop;
@@ -5622,12 +5681,12 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>>(
     // `test_short_circuit_side_effect_shapes_already_match_jq_820`).
     // `foreach` has no Stage 5 arm and still falls back the same way this
     // comment always meant to illustrate.
-    if let (Some(op), 0, None, Flow::Exhausted) = (empty_rule, right_seen, &abort, &outer) {
-        // #2460 (yq mode only): the *right* operand produced nothing, so the
-        // outer loop never ran and `left` was never evaluated at all. Drive
-        // it once here and answer each of its outputs from the same table --
-        // and, if it is empty too, answer the both-empty row once.
-        return empty_outer_operand_pass(&each_operand, left, op, sink);
+    if let (Some(op), 0, None, Flow::Exhausted) = (rules.empty, outer_seen, &abort, &outer) {
+        // #2460 (yq mode only): the *outer* operand produced nothing, so the
+        // loop above never ran and the inner one was never evaluated at all.
+        // Drive it once here and answer each of its outputs from the same
+        // table -- and, if it is empty too, answer the both-empty row once.
+        return empty_outer_operand_pass(&each_operand, inner_expr, op, sink);
     }
     abort.unwrap_or(outer)
 }
@@ -5641,19 +5700,19 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>>(
 /// reaches `left` at all when `right` is empty.
 fn empty_outer_operand_pass<'a, W: Clone + AsRef<[u64]>>(
     each_operand: &impl Fn(&Expr, &mut dyn FnMut(Item<'a, W>) -> Demand) -> Flow,
-    left: &Expr,
+    other: &Expr,
     op: EmptyOperandOp,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
     let mut abort: Option<Flow> = None;
-    let mut left_seen = 0usize;
-    let flow = each_operand(left, &mut |left_item: Item<'a, W>| {
-        left_seen += 1;
-        let left_val = match checked_fanout_operand(left_item, &mut abort) {
+    let mut other_seen = 0usize;
+    let flow = each_operand(other, &mut |other_item: Item<'a, W>| {
+        other_seen += 1;
+        let other_val = match checked_fanout_operand(other_item, &mut abort) {
             Ok(v) => v,
             Err(demand) => return demand,
         };
-        match yq_empty_operand_output(op, Some(&left_val)) {
+        match yq_empty_operand_output(op, Some(&other_val)) {
             Some(v) => sink(Item::Owned(v)),
             None => Demand::Continue,
         }
@@ -5661,7 +5720,7 @@ fn empty_outer_operand_pass<'a, W: Clone + AsRef<[u64]>>(
     if let Some(flow) = abort {
         return flow;
     }
-    if left_seen == 0 && matches!(flow, Flow::Exhausted) {
+    if other_seen == 0 && matches!(flow, Flow::Exhausted) {
         // Both operands empty: one pairing, with no "other operand" at all.
         if let Some(v) = yq_empty_operand_output(op, None) {
             return match sink(Item::Owned(v)) {
@@ -5791,7 +5850,7 @@ fn boolean_fanout_core<'a, W: Clone + AsRef<[u64]>>(
     left: &Expr,
     right: &Expr,
     short_circuit: bool,
-    empty_rule: Option<EmptyOperandOp>,
+    rules: BinaryFanoutRules,
 ) -> QueryResult<'a, W> {
     let mut left_bools = Vec::new();
     let left_control = push_truthiness(eval_operand(left), &mut left_bools);
@@ -5803,7 +5862,7 @@ fn boolean_fanout_core<'a, W: Clone + AsRef<[u64]>>(
     // `yq_empty_operand_output`, not here, so `and`/`or` and the arithmetic/
     // comparison fanout share one definition of "this operand was empty".
     if left_bools.is_empty() && left_control.is_none() {
-        left_bools.extend(empty_boolean_operand(empty_rule));
+        left_bools.extend(empty_boolean_operand(rules.empty));
     }
 
     let mut out = vec_with_capacity(left_bools.len());
@@ -5817,7 +5876,7 @@ fn boolean_fanout_core<'a, W: Clone + AsRef<[u64]>>(
             return partial(out.into_iter().map(OwnedValue::Bool).collect(), control);
         }
         if out.len() == before {
-            out.extend(empty_boolean_operand(empty_rule));
+            out.extend(empty_boolean_operand(rules.empty));
         }
     }
 
@@ -5838,7 +5897,7 @@ fn eval_binary_fanout<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     right: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
-    empty_rule: Option<EmptyOperandOp>,
+    rules: BinaryFanoutRules,
     combine: impl FnMut(OwnedValue, OwnedValue) -> Result<OwnedValue, EvalError>,
 ) -> QueryResult<'a, W> {
     binary_fanout_core(
@@ -5846,7 +5905,7 @@ fn eval_binary_fanout<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         left,
         right,
         optional,
-        empty_rule,
+        rules,
         combine,
     )
 }
@@ -5895,7 +5954,7 @@ fn eval_arithmetic<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         right,
         value,
         optional,
-        empty_operand_rule::<S>(EmptyOperandOp::Arith(op)),
+        binary_fanout_rules::<S>(EmptyOperandOp::Arith(op)),
         |left_val, right_val| arith_combine::<S>(op, left_val, right_val),
     )
 }
@@ -6659,7 +6718,7 @@ fn eval_compare<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         right,
         value,
         optional,
-        empty_operand_rule::<S>(EmptyOperandOp::Compare(op)),
+        binary_fanout_rules::<S>(EmptyOperandOp::Compare(op)),
         |left_val, right_val| {
             Ok(OwnedValue::Bool(apply_compare_op::<S>(
                 op, &left_val, &right_val,
@@ -6832,7 +6891,7 @@ fn eval_boolean<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         left,
         right,
         short_circuit,
-        empty_operand_rule::<S>(EmptyOperandOp::Boolean),
+        binary_fanout_rules::<S>(EmptyOperandOp::Boolean),
     )
 }
 
@@ -32995,7 +33054,7 @@ fn eval_binary_fanout_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSema
     file_origin: Option<&[usize]>,
     current_path: &[OwnedValue],
     optional: bool,
-    empty_rule: Option<EmptyOperandOp>,
+    rules: BinaryFanoutRules,
     combine: impl FnMut(OwnedValue, OwnedValue) -> Result<OwnedValue, EvalError>,
 ) -> QueryResult<'a, W> {
     binary_fanout_core(
@@ -33021,7 +33080,7 @@ fn eval_binary_fanout_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSema
         left,
         right,
         optional,
-        empty_rule,
+        rules,
         combine,
     )
 }
@@ -33166,7 +33225,7 @@ fn eval_boolean_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>
         left,
         right,
         short_circuit,
-        empty_operand_rule::<S>(EmptyOperandOp::Boolean),
+        binary_fanout_rules::<S>(EmptyOperandOp::Boolean),
     )
 }
 
@@ -34993,7 +35052,7 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 file_origin,
                 current_path,
                 optional,
-                empty_operand_rule::<S>(EmptyOperandOp::Arith(*op)),
+                binary_fanout_rules::<S>(EmptyOperandOp::Arith(*op)),
                 |left_val, right_val| arith_combine::<S>(*op, left_val, right_val),
             );
             if rest.is_empty() {
@@ -35090,7 +35149,7 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 file_origin,
                 current_path,
                 optional,
-                empty_operand_rule::<S>(EmptyOperandOp::Compare(*op)),
+                binary_fanout_rules::<S>(EmptyOperandOp::Compare(*op)),
                 |left_val, right_val| {
                     Ok(OwnedValue::Bool(apply_compare_op::<S>(
                         *op, &left_val, &right_val,
@@ -55260,6 +55319,35 @@ mod tests {
                 assert_eq!(e.message, "x");
             }
         );
+    }
+
+    /// #2451: the per-mode fanout rules, pinned at their one definition.
+    ///
+    /// `left_major` has no observable effect on any *single*-output operand,
+    /// so a site that read the wrong const would still pass most of the
+    /// suite; this asserts the definition itself, the way #2374's test
+    /// above does for the empty-operand half it now travels with.
+    #[test]
+    fn binary_fanout_rules_are_per_mode_2451() {
+        let op = EmptyOperandOp::Arith(ArithOp::Add);
+
+        let jq = binary_fanout_rules::<JqSemantics>(op);
+        assert_eq!(jq.empty, None, "jq: `1 + empty` really is nothing");
+        assert!(!jq.left_major, "jq loops the right operand outermost");
+
+        let yq = binary_fanout_rules::<YqSemantics>(op);
+        assert_eq!(
+            yq.empty,
+            Some(op),
+            "yq answers an empty operand from the table"
+        );
+        assert!(yq.left_major, "yq loops the left operand outermost");
+
+        // The two halves are independent knobs on the same struct but come
+        // from the same mode, so they never disagree about which mode they
+        // are describing.
+        assert_eq!(jq.empty.is_some(), jq.left_major);
+        assert_eq!(yq.empty.is_some(), yq.left_major);
     }
 
     /// #2374: the family's shared definition itself, pinned once rather

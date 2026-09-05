@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`succinctly yq` now evaluates over a *context list*, as real yq does — a pipe
+  into a union is branch-major, a union of two bare identities yields the list
+  once, and binary operators fan out left-major** (#2451). Real yq has no scalar
+  evaluation mode: `Context.MatchingNodes` (`pkg/yqlib/context.go`, v4.53.3) is
+  always a list, `|` hands its left side's whole list to its right side in one
+  call, and every operator decides for itself how to fan out over it. succinctly
+  piped each value independently, as jq does. Per ADR-0018 rule 2 the mode
+  decides, never the input format, so `succinctly jq` is unchanged:
+
+  ```console
+  $ printf 'a: {c: 3, d: 4}\nb: {c: 5, d: 6}\n' | succinctly yq -o=json -I0 '(.a, .b) | (.c, .d)'
+  3                                  # was: 3 4 5 6
+  5                                  # real yq v4.53.3 prints 3 5 4 6
+  4
+  6
+  $ printf 'a: {c: 3}\nb: {c: 5}\n' | succinctly yq -o=json -I0 '(.a, .b) | (., .)'
+  {"c":3}                            # was: each object twice
+  {"c":5}                            # real yq prints each once
+  $ printf 'a: {c: 3}\nb: {c: 5}\n' | succinctly yq -o=json -I0 '(.a.c, .b.c) + (1, 10)'
+  4                                  # was: 4 6 13 15
+  13                                 # real yq prints 4 13 6 15
+  6
+  15
+  ```
+
+  The three rules are yq's own: `,` runs each branch across the whole list and
+  concatenates branch-major (`operator_union.go`); it appends its right operand
+  only when the two operands return different backing lists, which `.` never
+  does (`operator_self.go` returns its input context verbatim), so `(., .)`
+  de-duplicates and a chain of `n` dots yields `max(1, n - 1)` copies; and
+  `doCrossFunc` (`operators.go`) loops the left operand outermost, re-evaluating
+  the right one per left match, where jq loops the other way. **Any yq-mode
+  filter whose output order or count depended on the old per-element model
+  changes.** `and`/`or` are unaffected (already left-major in both tools), and so
+  is `--eval-all`'s document-level fan-out, which needs a separate mechanism
+  (#2427).
+
 - **`succinctly yq` now ranks `|` above `,`, as real yq does — `A, B | C` means
   `A, (B | C)` in yq mode, not jq's `(A, B) | C`** (#2420). yq's parser is a
   shunting-yard operator-precedence parser and its own table
