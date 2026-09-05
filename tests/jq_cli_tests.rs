@@ -7446,6 +7446,27 @@ fn test_label_keeps_path_context_2416() -> Result<()> {
     Ok(())
 }
 
+/// Spine 2416, phase 3: a bound call (`Expr::DefCall`, installed by
+/// `Expr::FuncDef`'s own arm on first evaluation) is now native via
+/// `eval_each_generic`'s existing `DefCall` arm
+/// (`bind_def_call`/`enter_def_call_frame`), reached through
+/// `collect_each_generic` instead of the eager bridge. No jq oracle. `def
+/// k: key;` doesn't change `.`, so this pins the pre-migration answer (this
+/// PR's own pre-change build) unchanged. `Expr::DefCall` is a runtime-only
+/// node (installed by `bind_def` on first evaluation of the enclosing
+/// `FuncDef`, never produced by the parser), so unlike `As`/`AsPattern`/
+/// `Label` above it cannot be pinned as a bare `Expr::Pipe` stage in
+/// `path_context_needs_eager_pins_the_three_reasons_2416` -- this CLI test
+/// is the construct's coverage.
+#[test]
+fn test_def_call_keeps_path_context_2416() -> Result<()> {
+    let doc = r#"[{"a":1},{"b":2}]"#;
+    let (out, _, code) = run_jq_full(&["-c", "def k: key; .[] | k"], Some(doc))?;
+    assert_eq!(code, 0, "{out:?}");
+    assert_eq!(out.trim(), "0\n1");
+    Ok(())
+}
+
 /// Documents the one remaining deliberate, narrow gap #1663/#1765 leave
 /// open rather than silently missing: a `?//`-chained `AsPattern` (2+
 /// alternatives) still has no dedicated evaluation arm, so a path-context
