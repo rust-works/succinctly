@@ -54,7 +54,7 @@ use super::eval::{
 #[cfg(test)]
 use super::expr::FuncDefBound;
 use super::expr::{Builtin, CompareOp, Expr, FormatType, Literal, ObjectEntry, ObjectKey, Pattern};
-use super::slice::{slice_str, SliceBounds};
+use super::slice::{literal_component_from_values, slice_str, SliceBounds};
 use super::value::{owned_value_eq, NumberRepr, OwnedValue};
 use crate::json::JsonIndex;
 
@@ -14726,10 +14726,43 @@ fn owned_identity_nav_supported(expr: &Expr) -> bool {
         | Expr::Index { .. }
         | Expr::Iterate
         | Expr::Slice { .. } => true,
+        // #2471: a *computed* component is navigation here too. The
+        // component expression is evaluated against this stage's own input
+        // -- the input whose position `id` describes -- so a `key`/`path`
+        // inside one resolves to a constant exactly as it does inside a
+        // ruled stage, and the target has to be single-output so the
+        // component stream and the value stream pair up (see
+        // [`owned_identity_computed_step`]).
+        Expr::IndexExpr { target, key } => {
+            owned_identity_operand_supported(target) && owned_identity_component_supported(key)
+        }
+        Expr::SliceExpr { target, start, end } => {
+            owned_identity_operand_supported(target)
+                && start
+                    .as_deref()
+                    .map_or(true, owned_identity_component_supported)
+                && end.as_deref().map_or(true, owned_identity_component_supported)
+        }
+        // #2471: `getpath(p)` is navigation by a computed *chain* of
+        // components; jq's own `path(getpath(["a","b"]))` is `["a","b"]`
+        // (captured from jq 1.7.1), i.e. every component is taken.
+        Expr::Builtin(Builtin::GetPath(path_expr)) => {
+            owned_identity_component_supported(path_expr)
+        }
         Expr::Optional(inner) | Expr::Paren(inner) => owned_identity_nav_supported(inner),
         Expr::Pipe(exprs) => exprs.iter().all(owned_identity_nav_supported),
         _ => false,
     }
+}
+
+/// A computed navigation component (`.[K]`, `.[S:T]`, `getpath(P)`) the
+/// owned identity pipe can evaluate: anything the ordinary owned evaluator
+/// understands once this stage's own `key`/`path`/`file_index` reads have
+/// been rewritten to the constants the identity answers -- the same
+/// predicate the absent route uses for the same rewrite
+/// ([`path_context_resolve_constants`]), reused rather than re-derived.
+fn owned_identity_component_supported(expr: &Expr) -> bool {
+    path_context_absent_resolvable(expr)
 }
 
 /// An operand whose identity can be named without evaluating a generator:
@@ -14827,6 +14860,16 @@ fn owned_identity_step<S: EvalSemantics, V: DocumentValue>(
             out.push((value.clone(), id.clone()));
             Ok(())
         }
+        // The bare `E[K]?` / `E[S:T]?` spelling: its `?` covers the
+        // *indexing* step alone, never the target's or the component's own
+        // evaluation (`eval_index_expr`'s rule, which the value evaluator
+        // already honours), so the whole `Expr::Optional` node is what the
+        // values come from rather than its inner node under `optional`.
+        Expr::Optional(inner)
+            if matches!(**inner, Expr::IndexExpr { .. } | Expr::SliceExpr { .. }) =>
+        {
+            owned_identity_computed_step::<S, V>(inner, value, id, true, true, out)
+        }
         Expr::Optional(inner) => owned_identity_step::<S, V>(inner, value, id, true, out),
         Expr::Paren(inner) => owned_identity_step::<S, V>(inner, value, id, optional, out),
         Expr::Pipe(exprs) => {
@@ -14915,7 +14958,223 @@ fn owned_identity_step<S: EvalSemantics, V: DocumentValue>(
             );
             Ok(())
         }
+        Expr::IndexExpr { .. } | Expr::SliceExpr { .. } => {
+            owned_identity_computed_step::<S, V>(expr, value, id, false, optional, out)
+        }
+        Expr::Builtin(Builtin::GetPath(path_expr)) => {
+            owned_identity_getpath_step::<S, V>(path_expr, value, id, optional, out)
+        }
         _ => unreachable!("owned_identity_nav_supported admits no other shape"),
+    }
+}
+
+/// This stage's own `key`/`path`/`file_index` reads, rewritten to the
+/// constants `id` answers (#2471).
+///
+/// A computed component is evaluated against the stage's *input*, whose
+/// position `id` describes, so the rewrite is the same one
+/// [`eval_owned_identity_pipe`]'s ruled-stage arm applies -- one definition
+/// ([`path_context_resolve_constants`]), consulted from both.
+fn owned_identity_resolve_component<V: DocumentValue>(
+    expr: &Expr,
+    id: &OwnedIdentity<V>,
+) -> Result<Expr, EvalError> {
+    if !needs_path_context(expr) {
+        return Ok(expr.clone());
+    }
+    let key = id.key()?;
+    let path = id.path()?;
+    Ok(path_context_resolve_constants(expr, key.as_ref(), &path))
+}
+
+/// `.[K]` / `.[S:T]` / `E[K]` / `E[S:T]` over an owned value, naming the
+/// component each output takes (#2471).
+///
+/// jq compiles `E[K]` as `K as $k | E | .[$k]` and `E[S:T]` as `S as $s | T
+/// as $t | E | .[$s:$t]`: the component streams are *outer* and the target
+/// is innermost, so the values pair up with the components in the order the
+/// nested loops produce them. The values themselves always come from the
+/// ordinary owned evaluator ([`owned_identity_values`]), so every error
+/// text, `null` for a missing key and mode-specific indexing rule is the one
+/// definition the rest of the pipeline already uses; only the component is
+/// derived here.
+///
+/// Mode decides the slice component (ADR-0018), the same split
+/// [`OwnedIdentityRule::Slice`] draws for a *literal* slice: real yq keeps
+/// the container's position (`.a.b | .[(1):(3)] | key` is `"b"`, captured
+/// from v4.53.3), while jq mode takes the `{"start":s,"end":e}` component
+/// jq's own `path(.n[(1):(3)])` reports (captured from jq 1.7.1).
+fn owned_identity_computed_step<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    value: &OwnedValue,
+    id: &OwnedIdentity<V>,
+    bracket_optional: bool,
+    optional: bool,
+    out: &mut Vec<(OwnedValue, OwnedIdentity<V>)>,
+) -> Result<(), EvalError> {
+    // `bracket_optional` reproduces the `E[K]?` spelling exactly, so the
+    // suppression the values see is the one the value evaluator applies.
+    let wrap = |node: Expr| -> Expr {
+        if bracket_optional {
+            Expr::Optional(Box::new(node))
+        } else {
+            node
+        }
+    };
+    match expr {
+        Expr::IndexExpr { target, key } => {
+            let key_expr = owned_identity_resolve_component(key, id)?;
+            let keys = owned_identity_values::<S>(&key_expr, value, optional)?;
+            let values = owned_identity_values::<S>(
+                &wrap(Expr::IndexExpr {
+                    target: target.clone(),
+                    key: Box::new(key_expr),
+                }),
+                value,
+                optional,
+            )?;
+            let Some((target_value, target_id)) =
+                owned_identity_operand::<S, V>(target, value, id, optional)?
+            else {
+                return Ok(());
+            };
+            let parent = Rc::new(target_value.clone());
+            // Zipped, like the sibling `Expr::Iterate` arm: the owned
+            // evaluator yields exactly one value per key, and a mismatch
+            // means the indexing raised or was suppressed, in which case the
+            // surplus components are unused.
+            for (v, k) in values.into_iter().zip(keys) {
+                let component = owned_index_component::<S>(&target_value, k);
+                out.push((v, target_id.child(&parent, component)));
+            }
+            Ok(())
+        }
+        Expr::SliceExpr { target, start, end } => {
+            let start_expr = match start {
+                Some(e) => Some(owned_identity_resolve_component(e, id)?),
+                None => None,
+            };
+            let end_expr = match end {
+                Some(e) => Some(owned_identity_resolve_component(e, id)?),
+                None => None,
+            };
+            let values = owned_identity_values::<S>(
+                &wrap(Expr::SliceExpr {
+                    target: target.clone(),
+                    start: start_expr.clone().map(Box::new),
+                    end: end_expr.clone().map(Box::new),
+                }),
+                value,
+                optional,
+            )?;
+            let Some((target_value, target_id)) =
+                owned_identity_operand::<S, V>(target, value, id, optional)?
+            else {
+                return Ok(());
+            };
+            if S::TAG == EvalTag::Yq {
+                out.extend(values.into_iter().map(|v| (v, target_id.clone())));
+                return Ok(());
+            }
+            let bound = |e: &Option<Expr>| -> Result<Vec<OwnedValue>, EvalError> {
+                match e {
+                    Some(e) => owned_identity_values::<S>(e, value, optional),
+                    None => Ok(vec![OwnedValue::Null]),
+                }
+            };
+            let starts = bound(&start_expr)?;
+            let ends = bound(&end_expr)?;
+            let parent = Rc::new(target_value.clone());
+            // `S` outer, `T` middle, `E` inner -- jq's own desugaring, which
+            // is also the order the value evaluator emits in (confirmed
+            // live: `[1,2,3] | .[(0,1):(2,3)]` is `[1,2] [1,2,3] [2] [2,3]`
+            // against jq 1.7.1).
+            let components = starts.iter().flat_map(|s| {
+                ends.iter()
+                    .map(|e| literal_component_from_values(s.clone(), e.clone()))
+            });
+            for (v, component) in values.into_iter().zip(components) {
+                out.push((v, target_id.child(&parent, component)));
+            }
+            Ok(())
+        }
+        other => unreachable!("not a computed navigation step: {other:?}"),
+    }
+}
+
+/// The path component a computed index leaves behind.
+///
+/// Mode decides a negative array index (ADR-0018), the same rule
+/// [`owned_identity_step`]'s literal `Expr::Index` arm and
+/// `path_step_generic` already apply: yq resolves it against the length,
+/// jq keeps it as written.
+fn owned_index_component<S: EvalSemantics>(target: &OwnedValue, key: OwnedValue) -> OwnedValue {
+    if S::TAG == EvalTag::Yq {
+        if let (Some(items), OwnedValue::Int(i)) = (target.as_array(), &key) {
+            let resolved = items.len() as i64 + *i;
+            if *i < 0 && resolved >= 0 {
+                return OwnedValue::Int(resolved);
+            }
+        }
+    }
+    key
+}
+
+/// `getpath(p)` as a navigational stage (#2471): every component of `p` is
+/// taken, so the output stands where that chain lands.
+///
+/// jq's own model, captured from jq 1.7.1: `path(getpath(["a","b"]))` is
+/// `["a","b"]` and `path(getpath(["zz"]))` is `["zz"]` -- an absent
+/// component still counts. Real yq's lexer rejects `getpath` outright, so in
+/// yq mode this is a succinctly extension behind `--jq-extensions` (#1512)
+/// and jq's model is the only one there is.
+fn owned_identity_getpath_step<S: EvalSemantics, V: DocumentValue>(
+    path_expr: &Expr,
+    value: &OwnedValue,
+    id: &OwnedIdentity<V>,
+    optional: bool,
+    out: &mut Vec<(OwnedValue, OwnedIdentity<V>)>,
+) -> Result<(), EvalError> {
+    let path_expr = owned_identity_resolve_component(path_expr, id)?;
+    let paths = owned_identity_values::<S>(&path_expr, value, optional)?;
+    let values = owned_identity_values::<S>(
+        &Expr::Builtin(Builtin::GetPath(Box::new(path_expr))),
+        value,
+        optional,
+    )?;
+    // Zipped for the same reason the `Expr::IndexExpr` arm above is: a
+    // non-array argument raises in the owned evaluator, which is where that
+    // error text lives, and the surplus components are then unused.
+    for (v, p) in values.into_iter().zip(paths) {
+        let Some(components) = p.as_array() else {
+            continue;
+        };
+        let mut current = value.clone();
+        let mut current_id = id.clone();
+        for component in components {
+            let parent = Rc::new(current.clone());
+            current = owned_child_at(&current, component);
+            current_id = current_id.child(&parent, component.clone());
+        }
+        out.push((v, current_id));
+    }
+    Ok(())
+}
+
+/// The value at one path component of an owned container, or `null` -- the
+/// ancestor chain [`owned_identity_getpath_step`] records for `parent`,
+/// which is `getpath`'s own "missing is null" rule applied one step at a
+/// time.
+fn owned_child_at(value: &OwnedValue, component: &OwnedValue) -> OwnedValue {
+    match (value, component) {
+        (OwnedValue::Object(map), OwnedValue::String(k)) => {
+            map.get(k.as_str()).cloned().unwrap_or(OwnedValue::Null)
+        }
+        (OwnedValue::Array(items), OwnedValue::Int(i)) => usize::try_from(*i)
+            .ok()
+            .and_then(|i| items.get(i).cloned())
+            .unwrap_or(OwnedValue::Null),
+        _ => OwnedValue::Null,
     }
 }
 
@@ -24050,6 +24309,19 @@ mod tests {
         // real yq's own `downcase`/`upcase` spellings answer `key`/`path`
         // through the same rule -- no longer the "no identity rule" example.
         assert!(!eager(".a | ascii_downcase | key"));
+        // #2471 sub-item 1: a *computed* index/slice is navigation in the
+        // owned domain too, `?` over it included, so it no longer ends the
+        // owned identity pipe.
+        assert!(!eager(".a | to_entries | .[(0,1)] | key"));
+        assert!(!eager(".a | to_entries | .[(0,1)]? | path"));
+        assert!(!eager(".a | to_entries | .[(0):(1)] | key"));
+        assert!(!eager(".a | to_entries | .[(0):(1)]? | key"));
+        assert!(!eager(".a | to_entries | .[.[0].key | length] | key"));
+        // #2471 sub-item 2: `getpath(p)` is navigation by a chain of
+        // components.
+        assert!(!eager(".a | to_entries | getpath([0]) | key"));
+        assert!(!eager(".a | to_entries | getpath([0, \"key\"]) | path"));
+        assert!(!eager(".a | tostring | getpath([]) | path"));
         // ...and stays eager where it has no rule, where path context is
         // read after `key`/`path` already replaced the value, where the
         // stage itself reads path context, or where a later stage does so

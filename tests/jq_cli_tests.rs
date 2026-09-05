@@ -7522,6 +7522,80 @@ fn test_shared_keeps_path_context_2416() -> Result<()> {
     Ok(())
 }
 
+/// #2471 (gate reason 1 of spine 2416): a *computed* index or slice, and
+/// `getpath(p)`, are navigation inside the owned domain too, so a pipe that
+/// left the cursor domain earlier keeps its position through them instead of
+/// falling to the eager evaluator.
+///
+/// jq mode keeps jq's own `path(.[expr])` model, captured from
+/// `/usr/bin/jq` 1.7.1 on this document:
+///
+/// ```text
+/// $ jq -c '[path(.a.b[(0,1)])]'   [["a","b",0],["a","b",1]]
+/// $ jq -c 'path(.a.b[(1):(3)])'   ["a","b",{"start":1,"end":3}]
+/// $ jq -c 'path(.a.b[(-1)])'      ["a","b",-1]
+/// $ jq -c 'path(getpath(["a","b",0]))'   ["a","b",0]
+/// $ jq -c 'path(getpath(["zz"]))'        ["zz"]
+/// ```
+///
+/// `key`/`path` with no argument are succinctly extensions in jq mode (real
+/// jq rejects `path/0 is not defined`), so the rows below pin succinctly's
+/// answers against that captured *component* model rather than against a
+/// whole-filter jq capture. yq mode's own rows -- where a slice keeps the
+/// container's position instead (#2215/#2463) -- are in
+/// `test_owned_identity_rules_match_yq_2416`.
+#[test]
+fn test_computed_navigation_keeps_path_context_2471() -> Result<()> {
+    let doc = r#"{"a":{"b":[1,2,3],"c":"x","d":{"e":5}},"z":9}"#;
+    for (filter, want) in [
+        (".a | to_entries | .[(0,1)] | key", "0\n1"),
+        (
+            ".a | to_entries | .[(0,1)] | path",
+            "[\"a\",0]\n[\"a\",1]",
+        ),
+        (".a | to_entries | .[(0,1)]? | key", "0\n1"),
+        (".a.b | sort | .[(0,1)] | path", "[\"a\",\"b\",0]\n[\"a\",\"b\",1]"),
+        (".a.b | sort | .[(-1)] | path", "[\"a\",\"b\",-1]"),
+        (
+            ".a.b | sort | .[(1):(3)] | key",
+            "{\"start\":1,\"end\":3}",
+        ),
+        (
+            ".a.b | sort | .[(1):(3)] | path",
+            "[\"a\",\"b\",{\"start\":1,\"end\":3}]",
+        ),
+        (
+            ".a.b | sort | .[(1):(3)] | .[0] | path",
+            "[\"a\",\"b\",{\"start\":1,\"end\":3},0]",
+        ),
+        (".a | to_entries | getpath([0]) | key", "0"),
+        (
+            ".a | to_entries | getpath([0, \"key\"]) | path",
+            "[\"a\",0,\"key\"]",
+        ),
+        (
+            ".a | to_entries | getpath([0, \"zz\"]) | path",
+            "[\"a\",0,\"zz\"]",
+        ),
+        (".a | tostring | getpath([]) | path", "[\"a\"]"),
+        (".a.b | sort | getpath([1]) | key", "1"),
+    ] {
+        let (out, _, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "`{filter}`: {out:?}");
+        assert_eq!(out.trim(), want, "`{filter}`");
+    }
+    // A non-array argument still raises the owned evaluator's own message:
+    // the values every row above reports come from that one evaluator, so
+    // only the path component is derived by the identity pipe.
+    let (_, err, code) = run_jq_full(
+        &["-c", ".a | to_entries | getpath(\"x\") | path"],
+        Some(doc),
+    )?;
+    assert_eq!(code, 5, "{err:?}");
+    assert!(err.contains("Path must be specified as an array"), "{err:?}");
+    Ok(())
+}
+
 /// Documents the one remaining deliberate, narrow gap #1663/#1765 leave
 /// open rather than silently missing: a `?//`-chained `AsPattern` (2+
 /// alternatives) still has no dedicated evaluation arm, so a path-context
