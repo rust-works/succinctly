@@ -32425,6 +32425,21 @@ const OWNED_IDENTITY_ROWS_2416: &[(&str, &str)] = &[
     (".a.c | path | parent | key", r#""a""#),
     (".a.c | file_index | key", r#""c""#),
     (".a.b | to_entries | .[0].value | key | key", ""),
+    // #2471 sub-item 5: a path-context read under arithmetic or comparison
+    // inside a ruled stage. `path`/`file_index` build an ordinary node at
+    // the position, so the result stands where the input stood; `key`'s own
+    // output is a key node with no parent of its own, so arithmetic over it
+    // is detached.
+    (".a | to_entries | .[0] | key + 1", "1"),
+    (".a | to_entries | .[0] | key + 1 | key", ""),
+    (".a | to_entries | .[0] | (key + 1) | path", "[]"),
+    (".a | to_entries | .[0] | (key == 0)", "true"),
+    (".a | to_entries | .[0] | (key == 0) | key", ""),
+    (".a | to_entries | .[0] | (path + []) | key", "0"),
+    (".a | to_entries | .[0] | (path + []) | path", r#"["a",0]"#),
+    (".a | to_entries | .[0] | (file_index + 0) | key", "0"),
+    (r#".a.c | tostring | key + "x""#, r#""cx""#),
+    (r#".a.c | tostring | (key + "x") | key"#, ""),
 ];
 
 /// #2460: real yq's binary operators when one operand produces **zero

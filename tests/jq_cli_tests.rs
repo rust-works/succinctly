@@ -7549,17 +7549,14 @@ fn test_computed_navigation_keeps_path_context_2471() -> Result<()> {
     let doc = r#"{"a":{"b":[1,2,3],"c":"x","d":{"e":5}},"z":9}"#;
     for (filter, want) in [
         (".a | to_entries | .[(0,1)] | key", "0\n1"),
-        (
-            ".a | to_entries | .[(0,1)] | path",
-            "[\"a\",0]\n[\"a\",1]",
-        ),
+        (".a | to_entries | .[(0,1)] | path", "[\"a\",0]\n[\"a\",1]"),
         (".a | to_entries | .[(0,1)]? | key", "0\n1"),
-        (".a.b | sort | .[(0,1)] | path", "[\"a\",\"b\",0]\n[\"a\",\"b\",1]"),
-        (".a.b | sort | .[(-1)] | path", "[\"a\",\"b\",-1]"),
         (
-            ".a.b | sort | .[(1):(3)] | key",
-            "{\"start\":1,\"end\":3}",
+            ".a.b | sort | .[(0,1)] | path",
+            "[\"a\",\"b\",0]\n[\"a\",\"b\",1]",
         ),
+        (".a.b | sort | .[(-1)] | path", "[\"a\",\"b\",-1]"),
+        (".a.b | sort | .[(1):(3)] | key", "{\"start\":1,\"end\":3}"),
         (
             ".a.b | sort | .[(1):(3)] | path",
             "[\"a\",\"b\",{\"start\":1,\"end\":3}]",
@@ -7592,7 +7589,10 @@ fn test_computed_navigation_keeps_path_context_2471() -> Result<()> {
         Some(doc),
     )?;
     assert_eq!(code, 5, "{err:?}");
-    assert!(err.contains("Path must be specified as an array"), "{err:?}");
+    assert!(
+        err.contains("Path must be specified as an array"),
+        "{err:?}"
+    );
     Ok(())
 }
 
