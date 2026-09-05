@@ -102,9 +102,15 @@ order; the `Gate` column names the first that fired for that query.
 
 R2 dominates the table because the natural probe shape starts `.a.b`, and a
 `.field` step can always miss. The same shapes with a head that cannot miss trip
-R3 instead -- e.g. `.a[] | key + "x"`, `.a[] | if key == "b" then key + "x" else
-"y" end` and `.a[] | reduce (key) as $k (""; . + $k) | . + "x"` all report R3.
-This is an ordering artefact, not a claim that R3 is rare.
+R3 instead -- e.g. `.a[] | (key | tostring)`, `.a[] | reduce (key) as $k (""; . +
+$k) | . + "x"` and `.a[] | select(key == "b" and true)` all report R3. This is an
+ordering artefact, not a claim that R3 is rare.
+
+Step 1b (below) moved two of the three shapes this paragraph used to name --
+`.a[] | key + "x"` and `.a[] | if key == "b" then key + "x" else "y" end` -- off
+R3 and onto the generic route, which is what an admission to
+`path_context_single_native` is *for*. Re-derive this paragraph's examples after
+any further admission rather than trusting them.
 
 ## The 43 handlers
 
@@ -119,7 +125,7 @@ This is an ordering artefact, not a claim that R3 is rare.
 | A02 | `Expr::Field(name)`                                                | REACHABLE | `.a.b \| key + "x"`                                   | R2   |
 | A03 | `Expr::Index { idx, key }`                                         | REACHABLE | `.c[0] \| key + 1`                                    | R2   |
 | A04 | `Expr::Slice { .. }`                                               | REACHABLE | `.c[0:1] \| .[0] \| key + 1`                          | R1   |
-| A05 | `Expr::Iterate`                                                    | REACHABLE | `.a[] \| key + "x"`                                   | R3   |
+| A05 | `Expr::Iterate`                                                    | REACHABLE | `.a[] \| (key \| tostring)`                            | R3   |
 | A06 | `Expr::Paren(inner)`                                               | REACHABLE | `(.a.b) \| key + "x"`                                 | R2   |
 | A07 | `Expr::Optional(inner) if IndexExpr/SliceExpr`                     | REACHABLE | `.c[.n]? \| key + 1`                                  | R1   |
 | A08 | `Expr::Optional(inner)`                                            | REACHABLE | `.a? \| key + "x"`                                    | R2   |
@@ -153,6 +159,38 @@ This is an ordering artefact, not a claim that R3 is rare.
 | A36 | `Expr::Try { .. }`                                                 | REACHABLE | `.a.b \| try (key + "x") catch "e"`                   | R2   |
 | A37 | `Expr::Label { name, body }`                                       | REACHABLE | `.a.b \| label $out \| (key + "x", break $out)`       | R2   |
 | A38 | `Expr::Break(name)`                                                | REACHABLE | `.a.b \| label $out \| (key + "x", break $out)`       | R2   |
+
+## Step 1b: `Expr::Arithmetic` admitted, and the pin holds at 43
+
+Spine 2416 step 1b gave `eval_generic`'s own `eval_single` a native
+`Expr::Arithmetic` arm (`collect_each_generic` over the sink evaluator's
+existing `binary_fanout_each_generic` arm) and added `Expr::Arithmetic` to
+`path_context_single_native`. Two shapes had blocked that admission and both are
+now closed:
+
+- yq's rule for a binary operator whose operand produces *zero* outputs
+  ([#2460](https://github.com/rust-works/succinctly/issues/2460)). `key + 1` at
+  the document root is `1` in real yq, not nothing, and the eager route used to
+  answer it from a `null`/`{}` placeholder. Admitting arithmetic would have moved
+  that shape to a route with a *different* answer. It is now one definition
+  (`jq::eval::yq_empty_operand_output`) that both fanouts consult, so the two
+  routes agree before the move rather than after it.
+- `try (1+1) catch "x"` on a #1194-malformed document (`{123: 1}`), where jq
+  1.7.1 rejects the whole input regardless of what the filter reads. The eager
+  bridge's ambient materialization is what produces that failure, so the new arm
+  is gated on `needs_path_context`: arithmetic that reads no path context stays
+  on the bridge and keeps paying the decode.
+  `test_try_catch_contains_a_genuinely_catchable_malformed_key_error_1812` is
+  the guard.
+
+**`PINNED_ARM_COUNT` stays at 43.** `A11` (`Expr::Arithmetic`) is the arm the
+admission was aimed at and it is still reachable: re-run with the method above,
+its marker fires for 33 of the 36 queries probed, including its own listed proof
+query `.a.b | key + "x"` (R2) and every `.c[...]`-headed R1 row. What the
+admission removes is R3 for an `Expr::Iterate` head, not the arm -- `.a[] | key +
+"x"` no longer reaches the eager evaluator at all, which is why `A05`'s proof
+query above was re-derived (`.a[] | (key | tostring)`, still R3, marker
+confirmed). Nothing became unreachable, so nothing was deleted.
 
 ## Result
 

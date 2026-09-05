@@ -239,6 +239,39 @@ pub trait EvalSemantics: Copy + Default {
     /// replacement-character substitution: matched, at each caller's own
     /// granularity" section for the live-verified detail.
     const UTF8_LOSSY_USES_JQ_MAXIMAL_SUBPART_RULE: bool;
+
+    /// If true (yq), a path-context read that has nothing to read -- `key`,
+    /// `parent`, `parent(n)` standing on the *document root*, where there is
+    /// no enclosing key and no ancestor -- produces **zero outputs**, the
+    /// same as any other filter that emits nothing. If false (jq), the eager
+    /// path-context evaluator substitutes a placeholder value instead
+    /// (`null` for `key`, `{}` for `parent`).
+    ///
+    /// yq's own answer was captured live against v4.53.3 (#2460): `key`,
+    /// `parent`, `parent(1)` and `.[] | select(false)` at the root are
+    /// indistinguishable in real yq across all 13 binary operators and 7
+    /// right-hand shapes -- 196 comparable cells per shape, zero mismatches
+    /// -- so the emptiness is a property of "zero outputs", never of which
+    /// filter produced it. A placeholder is what made succinctly disagree
+    /// with *itself* between `key` (`null`) and `parent` (`{}`). The other
+    /// half of the same rule is `yq_empty_operand_output` (this module,
+    /// private).
+    ///
+    /// jq mode is deliberately untouched: `key`/`parent` are succinctly
+    /// extensions there with no oracle to match, and the placeholder is the
+    /// behavior every existing jq-mode shape was pinned against.
+    const ROOT_PATH_CONTEXT_YIELDS_NOTHING: bool;
+
+    /// If true (yq), a binary operator whose *operand* produced zero outputs
+    /// answers from `yq_empty_operand_output`'s table (this module, private)
+    /// instead of contributing no pairings at all. If false (jq), an empty
+    /// operand makes the whole expression empty -- `1 + empty` is nothing in
+    /// real jq.
+    ///
+    /// Captured live against yq v4.53.3 (#2460); that function's own doc
+    /// comment carries the table and the six internal yq inconsistencies it
+    /// reproduces bug-for-bug (ADR-0018 rule 3).
+    const EMPTY_OPERAND_BINARY_RULE: bool;
 }
 
 /// jq-compatible evaluation semantics (default).
@@ -266,6 +299,8 @@ impl EvalSemantics for JqSemantics {
     const MAX_STRING_REPEAT_BYTES: Option<u128> = None;
     const SELECT_EMITS_ONCE_IF_ANY_TRUTHY: bool = false;
     const UTF8_LOSSY_USES_JQ_MAXIMAL_SUBPART_RULE: bool = true;
+    const ROOT_PATH_CONTEXT_YIELDS_NOTHING: bool = false;
+    const EMPTY_OPERAND_BINARY_RULE: bool = false;
 }
 
 /// yq-compatible evaluation semantics.
@@ -295,6 +330,8 @@ impl EvalSemantics for YqSemantics {
     const MAX_STRING_REPEAT_BYTES: Option<u128> = Some(10 * 1024 * 1024);
     const SELECT_EMITS_ONCE_IF_ANY_TRUTHY: bool = true;
     const UTF8_LOSSY_USES_JQ_MAXIMAL_SUBPART_RULE: bool = false;
+    const ROOT_PATH_CONTEXT_YIELDS_NOTHING: bool = true;
+    const EMPTY_OPERAND_BINARY_RULE: bool = true;
 }
 
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
@@ -307,6 +344,138 @@ use super::value::{
     assert_value_tree_depth, cmp_f64, infinite_float_preview_text, is_infinity_sentinel,
     is_nan_sentinel, numeric_repr_cmp, owned_value_eq, NumberRepr, OwnedValue,
 };
+
+/// Which binary operator an operand that produced *zero outputs* is being
+/// combined under, for [`yq_empty_operand_output`].
+///
+/// One enum rather than three call-site matches: the whole point of #2460's
+/// rule is that it is keyed on "this operand emitted nothing", never on which
+/// filter produced the emptiness or which of the two evaluators noticed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmptyOperandOp {
+    /// `+`, `-`, `*`, `/`, `%`.
+    Arith(ArithOp),
+    /// `==`, `!=`, `<`, `>`, `<=`, `>=`.
+    Compare(CompareOp),
+    /// `and`/`or`. Unlike the two above, these consume the answer as a
+    /// *truthiness contribution* (one `false` output standing in for the
+    /// empty operand) rather than as a finished pairing -- which is exactly
+    /// what reproduces yq's captured behaviour for both: `and` short-circuits
+    /// to `false` without ever consulting the other operand, and `or` falls
+    /// through to the other operand's own truthiness.
+    Boolean,
+}
+
+/// **The one definition of yq's binary-operator rule for an operand that
+/// produced zero outputs** (#2460), consulted by both evaluators: the
+/// generic/cursor route (`eval_generic::binary_fanout_each_generic`) and the
+/// eager path-context route ([`binary_fanout_each`]/[`boolean_fanout_core`]).
+///
+/// `other` is the *other* operand's value for this pairing, or `None` when
+/// that operand produced zero outputs too. The return is the output to emit,
+/// or `None` to emit nothing for this pairing.
+///
+/// Captured live against Homebrew `yq` v4.53.3 over 515 invocations (#2460's
+/// oracle matrix). `key`, `parent`, `parent(1)` and `.[] | select(false)` --
+/// 196 comparable cells each -- produced **zero mismatches** against one
+/// another, which is why this function takes no producer argument at all.
+///
+/// | op                | one empty operand              | both empty |
+/// |-------------------|--------------------------------|------------|
+/// | `+`               | the other operand, verbatim    | nothing    |
+/// | `-` `*` `/` `%`   | nothing                        | nothing    |
+/// | `==`              | `true` iff the other is `null` | `true`     |
+/// | `!=`              | mirror of `==`                 | `false`    |
+/// | `<` `>`           | `false`                        | `false`    |
+/// | `<=` `>=`         | `false`                        | `true`     |
+/// | `and` / `or`      | one `false` truthiness output  | same       |
+///
+/// `//` needs no entry: an empty operand is already falsy/absent to
+/// `eval_alternative`'s own left-side test, so `E // x` -> `x`, `x // E` ->
+/// `x` and `E // E` -> nothing fall straight out of the existing rule once
+/// the root `key`/`parent` placeholders stop fabricating a *truthy* `{}`
+/// (see [`EvalSemantics::ROOT_PATH_CONTEXT_YIELDS_NOTHING`]).
+///
+/// **Six internal yq inconsistencies are reproduced here bug-for-bug**, per
+/// ADR-0018 rule 3 and its 2026-09-05 decision-order amendment -- none of
+/// them corrupts data, discards a write, emits YAML yq cannot read back, or
+/// takes the host process down, so none qualifies for the narrow refusal
+/// rule:
+///
+/// 1. `+` treats the empty operand as an identity element while `-`/`*`/`/`/
+///    `%` treat the identical condition as "the whole expression is empty".
+/// 2. `==`/`!=` special-case `null`; the four ordering comparisons do not.
+/// 3. Two empty operands compare like `null == null` (`<=`/`>=` -> `true`),
+///    but one empty operand against a literal `null` does not.
+/// 4. `or` defers to the other operand; `and` throws that information away.
+/// 5. A real `null` is asymmetric for `+` (`null + 1` -> `1`, `1 + null` ->
+///    an error) while an empty operand is symmetric.
+/// 6. yq has three distinct "null-ish" categories -- a real `null`, a
+///    missing-key `null`, and a zero-output filter -- that do not share one
+///    operator branch. Only the third is this function's business; the
+///    missing-key half (`.zzz * 2`) is a separate, still-divergent shape.
+pub(crate) fn yq_empty_operand_output(
+    op: EmptyOperandOp,
+    other: Option<&OwnedValue>,
+) -> Option<OwnedValue> {
+    // `None` (the other operand was empty too) counts as null here for
+    // `==`/`!=` and is what flips `<=`/`>=` to `true` -- the two rows the
+    // single-empty rule cannot derive (inconsistency 3 above).
+    let other_is_null = matches!(other, None | Some(OwnedValue::Null));
+    match op {
+        EmptyOperandOp::Arith(ArithOp::Add) => other.cloned(),
+        EmptyOperandOp::Arith(ArithOp::Sub | ArithOp::Mul(_) | ArithOp::Div | ArithOp::Mod) => None,
+        EmptyOperandOp::Compare(CompareOp::Eq) => Some(OwnedValue::Bool(other_is_null)),
+        EmptyOperandOp::Compare(CompareOp::Ne) => Some(OwnedValue::Bool(!other_is_null)),
+        EmptyOperandOp::Compare(CompareOp::Lt | CompareOp::Gt) => Some(OwnedValue::Bool(false)),
+        EmptyOperandOp::Compare(CompareOp::Le | CompareOp::Ge) => {
+            Some(OwnedValue::Bool(other.is_none()))
+        }
+        EmptyOperandOp::Boolean => Some(OwnedValue::Bool(false)),
+    }
+}
+
+/// `Some(op)` in yq mode, `None` in jq mode -- the single per-mode gate on
+/// [`yq_empty_operand_output`], so no call site spells the `S::` const out
+/// itself (#2460).
+pub(crate) fn empty_operand_rule<S: EvalSemantics>(op: EmptyOperandOp) -> Option<EmptyOperandOp> {
+    S::EMPTY_OPERAND_BINARY_RULE.then_some(op)
+}
+
+/// The value a path-context builtin standing on the document root falls back
+/// to, or [`QueryResult::None`] when the mode says such a read produces
+/// nothing (#2460, yq).
+///
+/// One definition for all four sites that had hand-written placeholders
+/// (`key` and `parent`/`parent(n)`, each in both `eval_builtin`'s
+/// no-context fallback and the eager path-context evaluator), so the two
+/// routes cannot answer the root differently again -- which is exactly how
+/// `key` came to be `null` while `parent` was a *truthy* `{}`.
+fn root_path_context_placeholder<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    placeholder: OwnedValue,
+) -> QueryResult<'a, W> {
+    if S::ROOT_PATH_CONTEXT_YIELDS_NOTHING {
+        QueryResult::None
+    } else {
+        QueryResult::Owned(placeholder)
+    }
+}
+
+/// The jq-mode placeholder for `parent`/`parent(n)` past the document root.
+fn no_parent_placeholder() -> OwnedValue {
+    OwnedValue::Object(IndexMap::new())
+}
+
+/// [`yq_empty_operand_output`]'s `and`/`or` row, as the `bool` those two
+/// operators actually consume (#2460). `None` in jq mode, and `None` too if
+/// the table ever stops answering for `Boolean` -- the table stays the single
+/// source of truth either way.
+fn empty_boolean_operand(empty_rule: Option<EmptyOperandOp>) -> Option<bool> {
+    match yq_empty_operand_output(empty_rule?, None) {
+        Some(OwnedValue::Bool(b)) => Some(b),
+        _ => None,
+    }
+}
 
 /// Result of evaluating a jq expression.
 #[derive(Debug)]
@@ -3705,6 +3874,7 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             left,
             right,
             optional,
+            empty_operand_rule::<S>(EmptyOperandOp::Compare(*op)),
             |left_val, right_val| {
                 Ok(OwnedValue::Bool(apply_compare_op::<S>(
                     *op, &left_val, &right_val,
@@ -3728,6 +3898,7 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             left,
             right,
             optional,
+            empty_operand_rule::<S>(EmptyOperandOp::Arith(*op)),
             |left_val, right_val| arith_combine::<S>(*op, left_val, right_val),
             sink,
         ),
@@ -5232,6 +5403,7 @@ fn binary_fanout_core<'a, W: Clone + AsRef<[u64]>>(
     left: &Expr,
     right: &Expr,
     optional: bool,
+    empty_rule: Option<EmptyOperandOp>,
     combine: impl FnMut(OwnedValue, OwnedValue) -> Result<OwnedValue, EvalError>,
 ) -> QueryResult<'a, W> {
     let mut out: Vec<OwnedValue> = Vec::new();
@@ -5240,6 +5412,7 @@ fn binary_fanout_core<'a, W: Clone + AsRef<[u64]>>(
         left,
         right,
         optional,
+        empty_rule,
         combine,
         &mut |item: Item<'a, W>| {
             out.push(item.into_owned_from_owned_producer());
@@ -5311,6 +5484,7 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>>(
     left: &Expr,
     right: &Expr,
     optional: bool,
+    empty_rule: Option<EmptyOperandOp>,
     mut combine: impl FnMut(OwnedValue, OwnedValue) -> Result<OwnedValue, EvalError>,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
@@ -5318,14 +5492,22 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>>(
     // can only answer `Demand` — the same shape as `eval_each_pipe`'s
     // `downstream` and `any_all_gen_cond`'s `probe_escape`.
     let mut abort: Option<Flow> = None;
+    // #2460: how many outputs each operand actually produced, so a *zero*
+    // count can be answered from `yq_empty_operand_output` instead of
+    // silently contributing no pairings. `None` in jq mode, where `1 + empty`
+    // really is nothing.
+    let mut right_seen = 0usize;
 
     let outer = each_operand(right, &mut |right_item: Item<'a, W>| {
+        right_seen += 1;
         let right_val = match checked_fanout_operand(right_item, &mut abort) {
             Ok(v) => v,
             Err(demand) => return demand,
         };
 
+        let mut left_seen = 0usize;
         let inner = each_operand(left, &mut |left_item: Item<'a, W>| {
+            left_seen += 1;
             let left_val = match checked_fanout_operand(left_item, &mut abort) {
                 Ok(v) => v,
                 Err(demand) => return demand,
@@ -5371,6 +5553,21 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>>(
         // in the inner loop must not overwrite that verdict.
         if abort.is_some() {
             return Demand::Stop;
+        }
+
+        // #2460 (yq mode only): the *left* operand produced nothing for this
+        // right value, so this pairing is answered from the empty-operand
+        // table rather than skipped. Only after `inner` ran to exhaustion --
+        // an operand that escaped or was stopped part-way is not "empty".
+        if left_seen == 0 && matches!(inner, Flow::Exhausted) {
+            if let Some(op) = empty_rule {
+                if let Some(v) = yq_empty_operand_output(op, Some(&right_val)) {
+                    if matches!(sink(Item::Owned(v)), Demand::Stop) {
+                        abort = Some(Flow::Stopped { pending: None });
+                        return Demand::Stop;
+                    }
+                }
+            }
         }
 
         match inner {
@@ -5425,7 +5622,55 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>>(
     // `test_short_circuit_side_effect_shapes_already_match_jq_820`).
     // `foreach` has no Stage 5 arm and still falls back the same way this
     // comment always meant to illustrate.
+    if let (Some(op), 0, None, Flow::Exhausted) = (empty_rule, right_seen, &abort, &outer) {
+        // #2460 (yq mode only): the *right* operand produced nothing, so the
+        // outer loop never ran and `left` was never evaluated at all. Drive
+        // it once here and answer each of its outputs from the same table --
+        // and, if it is empty too, answer the both-empty row once.
+        return empty_outer_operand_pass(&each_operand, left, op, sink);
+    }
     abort.unwrap_or(outer)
+}
+
+/// The `right`-operand-produced-nothing half of [`binary_fanout_each`]'s
+/// #2460 rule, split out so the loop above keeps one `return` shape.
+///
+/// Real yq's `+`/`//` are symmetric in the empty operand (`key + 1` and
+/// `1 + key` are both `1`), which is only reproducible by evaluating the
+/// *other* operand in this case -- jq's right-outer/left-inner loop never
+/// reaches `left` at all when `right` is empty.
+fn empty_outer_operand_pass<'a, W: Clone + AsRef<[u64]>>(
+    each_operand: &impl Fn(&Expr, &mut dyn FnMut(Item<'a, W>) -> Demand) -> Flow,
+    left: &Expr,
+    op: EmptyOperandOp,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    let mut abort: Option<Flow> = None;
+    let mut left_seen = 0usize;
+    let flow = each_operand(left, &mut |left_item: Item<'a, W>| {
+        left_seen += 1;
+        let left_val = match checked_fanout_operand(left_item, &mut abort) {
+            Ok(v) => v,
+            Err(demand) => return demand,
+        };
+        match yq_empty_operand_output(op, Some(&left_val)) {
+            Some(v) => sink(Item::Owned(v)),
+            None => Demand::Continue,
+        }
+    });
+    if let Some(flow) = abort {
+        return flow;
+    }
+    if left_seen == 0 && matches!(flow, Flow::Exhausted) {
+        // Both operands empty: one pairing, with no "other operand" at all.
+        if let Some(v) = yq_empty_operand_output(op, None) {
+            return match sink(Item::Owned(v)) {
+                Demand::Continue => Flow::Exhausted,
+                Demand::Stop => Flow::Stopped { pending: None },
+            };
+        }
+    }
+    flow
 }
 
 /// Shared unary fork/negate/finish core behind [`eval_negate`] and its
@@ -5546,9 +5791,20 @@ fn boolean_fanout_core<'a, W: Clone + AsRef<[u64]>>(
     left: &Expr,
     right: &Expr,
     short_circuit: bool,
+    empty_rule: Option<EmptyOperandOp>,
 ) -> QueryResult<'a, W> {
     let mut left_bools = Vec::new();
     let left_control = push_truthiness(eval_operand(left), &mut left_bools);
+    // #2460 (yq mode only): an operand that produced *zero* outputs
+    // contributes one `false` truthiness value, which is the whole of yq's
+    // captured `and`/`or` behaviour -- `and` then short-circuits to `false`
+    // without consulting the other side (yq's inconsistency 4), and `or`
+    // falls through to the other operand's own truthiness. The rule lives in
+    // `yq_empty_operand_output`, not here, so `and`/`or` and the arithmetic/
+    // comparison fanout share one definition of "this operand was empty".
+    if left_bools.is_empty() && left_control.is_none() {
+        left_bools.extend(empty_boolean_operand(empty_rule));
+    }
 
     let mut out = vec_with_capacity(left_bools.len());
     for left_bool in left_bools {
@@ -5556,8 +5812,12 @@ fn boolean_fanout_core<'a, W: Clone + AsRef<[u64]>>(
             out.push(short_circuit);
             continue;
         }
+        let before = out.len();
         if let Some(control) = push_truthiness(eval_operand(right), &mut out) {
             return partial(out.into_iter().map(OwnedValue::Bool).collect(), control);
+        }
+        if out.len() == before {
+            out.extend(empty_boolean_operand(empty_rule));
         }
     }
 
@@ -5578,6 +5838,7 @@ fn eval_binary_fanout<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     right: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
+    empty_rule: Option<EmptyOperandOp>,
     combine: impl FnMut(OwnedValue, OwnedValue) -> Result<OwnedValue, EvalError>,
 ) -> QueryResult<'a, W> {
     binary_fanout_core(
@@ -5585,6 +5846,7 @@ fn eval_binary_fanout<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         left,
         right,
         optional,
+        empty_rule,
         combine,
     )
 }
@@ -5628,9 +5890,14 @@ fn eval_arithmetic<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    eval_binary_fanout::<W, S>(left, right, value, optional, |left_val, right_val| {
-        arith_combine::<S>(op, left_val, right_val)
-    })
+    eval_binary_fanout::<W, S>(
+        left,
+        right,
+        value,
+        optional,
+        empty_operand_rule::<S>(EmptyOperandOp::Arith(op)),
+        |left_val, right_val| arith_combine::<S>(op, left_val, right_val),
+    )
 }
 
 /// Add two values (numbers, strings, arrays, objects).
@@ -6387,11 +6654,18 @@ fn eval_compare<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    eval_binary_fanout::<W, S>(left, right, value, optional, |left_val, right_val| {
-        Ok(OwnedValue::Bool(apply_compare_op::<S>(
-            op, &left_val, &right_val,
-        )))
-    })
+    eval_binary_fanout::<W, S>(
+        left,
+        right,
+        value,
+        optional,
+        empty_operand_rule::<S>(EmptyOperandOp::Compare(op)),
+        |left_val, right_val| {
+            Ok(OwnedValue::Bool(apply_compare_op::<S>(
+                op, &left_val, &right_val,
+            )))
+        },
+    )
 }
 
 /// Apply a comparison operator to two already-evaluated values.
@@ -6558,6 +6832,7 @@ fn eval_boolean<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         left,
         right,
         short_circuit,
+        empty_operand_rule::<S>(EmptyOperandOp::Boolean),
     )
 }
 
@@ -7099,16 +7374,15 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // When called without context, return empty path (root position)
             QueryResult::Owned(OwnedValue::Array(vec![]))
         }
-        Builtin::Parent => {
-            // Parent requires path context which is handled in eval_pipe_with_context
-            // When called without context, return empty object (no parent at root)
-            QueryResult::Owned(OwnedValue::Object(IndexMap::new()))
-        }
+        // `parent`/`parent(n)` with no path context at all is the root
+        // position: there is no ancestor to return. Same #2460 rule, and the
+        // same per-mode gate, as `resolve_ancestor_path`'s own past-the-root
+        // arm -- real yq answers with zero outputs, jq mode keeps the `{}`
+        // placeholder these arms have always returned.
+        Builtin::Parent => root_path_context_placeholder::<W, S>(no_parent_placeholder()),
         Builtin::ParentN(n_expr) => {
-            // ParentN requires path context which is handled in eval_pipe_with_context
-            // When called without context, return empty object
             let _ = n_expr; // Unused here, but evaluated in context version
-            QueryResult::Owned(OwnedValue::Object(IndexMap::new()))
+            root_path_context_placeholder::<W, S>(no_parent_placeholder())
         }
         Builtin::Paths => builtin_paths::<W>(value, optional),
         Builtin::PathsFilter(filter) => builtin_paths_filter::<W, S>(filter, value, optional),
@@ -7208,11 +7482,11 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // is handled by the yq runner, not here
             QueryResult::One(value.clone())
         }
-        Builtin::Key => {
-            // Key requires path context which is handled in eval_pipe_with_context
-            // If we reach here without context, return null (at root level)
-            QueryResult::Owned(OwnedValue::Null)
-        }
+        // `key` with no path context at all is the root position: there is no
+        // enclosing key to read. Same #2460 rule and gate as the
+        // `eval_stage_with_path_context` arm -- zero outputs in yq mode, the
+        // historical `null` placeholder in jq mode.
+        Builtin::Key => root_path_context_placeholder::<W, S>(OwnedValue::Null),
 
         // Phase 11: Path manipulation
         Builtin::Del(path) => builtin_del::<W, S>(path, value, optional),
@@ -32655,7 +32929,7 @@ pub(crate) fn classify_parent_n<S: EvalSemantics>(
 /// root) means `&current_path[..len]` is a real path to resolve via
 /// `get_value_at_owned_path`, which already returns `root` itself for an
 /// empty path.
-fn resolve_ancestor_path<'a, 'p, W: Clone + AsRef<[u64]>>(
+fn resolve_ancestor_path<'a, 'p, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     root: &OwnedValue,
     current_path: &'p [OwnedValue],
     n: usize,
@@ -32663,8 +32937,15 @@ fn resolve_ancestor_path<'a, 'p, W: Clone + AsRef<[u64]>>(
     match current_path.len().checked_sub(n) {
         None => (
             &[],
-            // Gone past root - return empty object
-            QueryResult::Owned(OwnedValue::Object(IndexMap::new())),
+            // Climbed past the root, so there is no ancestor to return.
+            // #2460: real yq answers with *zero outputs* (live-verified
+            // against v4.53.3: `parent`, `parent(1)` and `[parent]` on a root
+            // document print nothing, nothing and `[]`). The empty-object
+            // placeholder is worse than merely wrong: `{}` is *truthy*, so it
+            // short-circuited `//` and `or` as well as feeding `+`/`*` an
+            // operand real yq never supplies. jq mode keeps it -- `parent` is
+            // a succinctly extension there with no oracle to match.
+            root_path_context_placeholder::<W, S>(no_parent_placeholder()),
         ),
         Some(len) => {
             let ancestor_path = &current_path[..len];
@@ -32714,6 +32995,7 @@ fn eval_binary_fanout_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSema
     file_origin: Option<&[usize]>,
     current_path: &[OwnedValue],
     optional: bool,
+    empty_rule: Option<EmptyOperandOp>,
     combine: impl FnMut(OwnedValue, OwnedValue) -> Result<OwnedValue, EvalError>,
 ) -> QueryResult<'a, W> {
     binary_fanout_core(
@@ -32739,6 +33021,7 @@ fn eval_binary_fanout_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSema
         left,
         right,
         optional,
+        empty_rule,
         combine,
     )
 }
@@ -32883,6 +33166,7 @@ fn eval_boolean_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>
         left,
         right,
         short_circuit,
+        empty_operand_rule::<S>(EmptyOperandOp::Boolean),
     )
 }
 
@@ -34012,8 +34296,17 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Position unchanged (#1449).
     if matches!(first, Expr::Builtin(Builtin::Key)) {
         let key_result = if current_path.is_empty() {
-            // At root - return null (yq behavior)
-            QueryResult::Owned(OwnedValue::Null)
+            // At root there is no enclosing key to read. #2460: real yq
+            // answers with *zero outputs* here, not a value -- live-verified
+            // against v4.53.3, where `key`, `[key]` and `key | type` on a
+            // root document print nothing, `[]` and nothing respectively.
+            // The `null` placeholder is what made this evaluator disagree
+            // with its own generic sibling (which already emits nothing) and
+            // with `parent`'s `{}` placeholder next door; see
+            // `EvalSemantics::ROOT_PATH_CONTEXT_YIELDS_NOTHING`. jq mode
+            // keeps the placeholder -- `key` is a succinctly extension there
+            // with no oracle to match.
+            root_path_context_placeholder::<W, S>(OwnedValue::Null)
         } else {
             // Get the last element of the path (the current key)
             QueryResult::Owned(current_path.last().unwrap().clone())
@@ -34060,7 +34353,7 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // routed through the shared helper (#1449), just with a different
     // `current_path` argument for the continuation.
     if matches!(first, Expr::Builtin(Builtin::Parent)) {
-        let (parent_path, parent_result) = resolve_ancestor_path::<W>(root, current_path, 1);
+        let (parent_path, parent_result) = resolve_ancestor_path::<W, S>(root, current_path, 1);
         return continue_rest_with_context::<W, S>(
             parent_result,
             rest,
@@ -34104,7 +34397,7 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // two arms had each hand-rolled this arithmetic separately, and
         // that divergence (a subtly different boundary condition in this
         // arm alone) was the exact bug #1476 fixed.
-        let (parent_path, parent_result) = resolve_ancestor_path::<W>(root, current_path, n);
+        let (parent_path, parent_result) = resolve_ancestor_path::<W, S>(root, current_path, n);
         return continue_rest_with_context::<W, S>(
             parent_result,
             rest,
@@ -34700,6 +34993,7 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 file_origin,
                 current_path,
                 optional,
+                empty_operand_rule::<S>(EmptyOperandOp::Arith(*op)),
                 |left_val, right_val| arith_combine::<S>(*op, left_val, right_val),
             );
             if rest.is_empty() {
@@ -34796,6 +35090,7 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 file_origin,
                 current_path,
                 optional,
+                empty_operand_rule::<S>(EmptyOperandOp::Compare(*op)),
                 |left_val, right_val| {
                     Ok(OwnedValue::Bool(apply_compare_op::<S>(
                         *op, &left_val, &right_val,

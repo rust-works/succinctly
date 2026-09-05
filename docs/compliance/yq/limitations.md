@@ -1771,6 +1771,48 @@ a value that isn't a snapshot of anything in the document -- a different kind of
 #2213's path-threading fix, which only ever continues with a value already known to be
 correct (`Null`, jq's own answer for what the missing/OOB read itself evaluates to).
 
+### A binary operand that navigated to a missing key: succinctly sees `null`, real yq sees nothing
+
+[#2460](https://github.com/rust-works/succinctly/issues/2460) gave yq mode real yq's rule
+for a binary operator whose operand produces **zero outputs** -- `key`, `parent`,
+`parent(1)` at the document root, or any other filter that emits nothing. That rule is
+implemented once (`jq::eval::yq_empty_operand_output`) and is exact for those shapes. Real
+yq has a *second*, wider category of "empty operand" that it does not cover: an operand
+that navigated to a **missing key**. Captured live against yq v4.53.3 on
+
+```yaml
+a:
+  b: 1
+s: x
+n: [1, 2]
+```
+
+| filter                | real yq                                   | succinctly yq                                      |
+|-----------------------|-------------------------------------------|----------------------------------------------------|
+| `.zzz`                | `null`                                    | `null`                                             |
+| `.zzz \| . * 2`       | `Error: cannot multiply !!null with !!int` | `Error: null (null) and number (2) ...`           |
+| `.zzz * 2`            | *(nothing)*, exit 0                       | `Error: null (null) and number (2) cannot be multiplied` |
+| `.zzz / 2`            | *(nothing)*, exit 0                       | `Error: ... cannot be divided`                     |
+| `.zzz - 1`            | *(nothing)*, exit 0                       | `1`                                                |
+| `.zzz + 1`            | `1`                                       | `1` (agrees, for an unrelated reason)              |
+| `.zzz \| key`         | `"zzz"`                                   | `"zzz"`                                            |
+| `(.zzz \| key) + 1`   | `1`                                       | `Error: string ("zzz") and number (1) cannot be added` |
+| `(.zzz \| key) + "!"` | `"!"`                                     | `"zzz!"`                                           |
+
+Real yq is inconsistent with itself here, twice over, and both inconsistencies are what
+make this hard rather than mechanical. `.zzz` on its own is a `null` **value** (`.zzz | . *
+2` raises, exactly like `null * 2`), but the same `.zzz` written directly as an operand is
+an empty **candidate list** (`.zzz * 2` yields nothing) -- so yq's traversal answers
+differently depending on whether an operator or a pipe is asking. And `.zzz | key` is
+`"zzz"` standing alone yet contributes nothing as an operand, so the emptiness survives a
+whole pipe once that pipe is an operand.
+
+succinctly materializes an ordinary `null` for a missing key at every position, so it has
+no way to distinguish the two contexts. Closing this needs an *absent* operand value
+threaded through operand evaluation -- a model change of the same kind ADR-0021 made for
+path context -- not another entry in #2460's table, which is keyed on an operand producing
+no outputs and would answer these shapes the moment the operand actually produced none.
+
 ### A negative out-of-range array index (`.a[-N]`) raises -- resolved for ordinary reads, a few call sites remain
 
 [#2254](https://github.com/rust-works/succinctly/issues/2254). Real yq disagrees with real

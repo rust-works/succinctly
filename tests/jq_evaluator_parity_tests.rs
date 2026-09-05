@@ -2026,6 +2026,12 @@ fn test_arm_audit_proof_queries_are_unmoved_by_the_gate_2416() {
         (".c[0] | key + 1", &["1"]),
         (".c[0:1] | .[0] | key + 1", &["1"]),
         (r#".a[] | key + "x""#, &[r#""bx""#]),
+        // A05's re-derived proof query: spine 2416 step 1b moved
+        // `.a[] | key + "x"` (the row just above) onto the generic route, so
+        // the audit needed a shape that still reaches `Expr::Iterate`'s eager
+        // arm. Both are pinned, which is what makes the move visible as "same
+        // outputs, different route" rather than as a silent change.
+        (r".a[] | (key | tostring)", &[r#""b""#]),
         (r#"(.a.b) | key + "x""#, &[r#""bx""#]),
         (".c[.n]? | key + 1", &["1"]),
         (r#".a? | key + "x""#, &[r#""ax""#]),
