@@ -14601,8 +14601,12 @@ impl<V: DocumentValue> OwnedIdentity<V> {
 /// step 3). A closed list: a stage with no rule keeps the pipe on the eager
 /// evaluator, exactly as before, so an unlisted builtin can only cost the
 /// migration, never an answer. Every entry is an oracle capture (see
-/// [`OwnedIdentity`]); a builtin real yq's lexer rejects (`add`, `explode`,
-/// `ascii_downcase`) has no row to match and is deliberately absent.
+/// [`OwnedIdentity`]); a builtin real yq's lexer rejects (`add`, `explode`)
+/// has no row to match and is deliberately absent. `Builtin::AsciiDowncase`/
+/// `AsciiUpcase` do have a row below despite the name -- they're reached by
+/// real yq's own `downcase`/`upcase` spellings, not just the jq-only
+/// `ascii_downcase`/`ascii_upcase` ones gated behind `--jq-extensions`
+/// (#2462).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum OwnedIdentityRule {
     /// The output stands where the input stood: `to_entries`, `sort`,
@@ -14651,6 +14655,8 @@ fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
             Builtin::ToString
             | Builtin::ToJson
             | Builtin::FromJson
+            | Builtin::AsciiDowncase
+            | Builtin::AsciiUpcase
             | Builtin::Length
             | Builtin::Type
             | Builtin::ToEntries
@@ -24022,11 +24028,15 @@ mod tests {
         assert!(!eager(".a | .[0] + .[1] | key"));
         assert!(!eager(".a | min | parent | key"));
         assert!(!eager(".a | to_entries | .[] | select(key == 0)"));
+        // `ascii_downcase`/`ascii_upcase` gained a `Keeps` row (#2462) so
+        // real yq's own `downcase`/`upcase` spellings answer `key`/`path`
+        // through the same rule -- no longer the "no identity rule" example.
+        assert!(!eager(".a | ascii_downcase | key"));
         // ...and stays eager where it has no rule, where path context is
         // read after `key`/`path` already replaced the value, where the
         // stage itself reads path context, or where a later stage does so
         // in a shape the constants cannot express.
-        assert!(eager(".a | ascii_downcase | key"), "no identity rule");
+        assert!(eager(".a | explode | key"), "no identity rule");
         assert!(eager(".a | tostring | key | key"), "key after key");
         assert!(
             eager(".a | [key] | .[0] | path"),
