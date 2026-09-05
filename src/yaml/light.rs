@@ -1415,6 +1415,19 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         // than relying on each downstream read to notice a bare-dash
         // wrapper on its own.
         let self_ = self.resolve_bare_seq_item();
+        // #1350 code review: `write_leading_anchor` must run *before*
+        // resolving a root alias below, not after -- the target's own
+        // `&anchor` belongs to the target's own identity, not to this
+        // alias's. Resolving first and then calling `write_leading_anchor`
+        // on the resolved cursor printed the *target's* anchor as if it
+        // were this result's own (`succinctly yq '.b'` on `a: &x {k: 1}` /
+        // `b: *x` streamed a spurious leading `&x`, where `-P '.b'` -- and
+        // real yq's own root-alias handling, see the #763 comment below --
+        // print none). An alias node itself never carries an anchor of its
+        // own (#1374 rejects `&anchor *alias` at parse time), so calling
+        // this on the pre-resolution cursor is always a no-op when `self_`
+        // is an alias, exactly as needed.
+        self_.write_leading_anchor(out)?;
         // #1350: a bare alias *root* (`succinctly yq '.b'` on `b: *x`) used
         // to stream `*x` literally -- unlike every non-root alias, which
         // `stream_yaml_value` resolves normally as part of its parent. A
@@ -1426,8 +1439,12 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         // target instead of printing the mark, and this streaming path
         // should too. `resolve_alias_target_cursor` is a no-op (single
         // `.value()` check, no chain walk) when `self_` isn't an alias.
+        //
+        // Known gap, not a new regression (confirmed against pre-#1350
+        // `main`, which dropped it too): the alias's *own* trailing comment
+        // (e.g. `b: *x # kept`) is not carried over here, only the target's.
+        // Same family as #1085 (a node can carry only one comment slot).
         let self_ = self_.resolve_alias_target_cursor().unwrap_or(self_);
-        self_.write_leading_anchor(out)?;
         let value = self_.value();
         if let YamlValue::String(s) = &value {
             // #1615: this root-scalar shortcut bypasses `stream_yaml_value`/
