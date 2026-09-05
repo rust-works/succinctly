@@ -46,9 +46,9 @@ use super::eval::{
     owned_to_string, prefer_pending_control, slice_component_value, slice_object_as_yq_children,
     slice_owned_value_read, streams_escaped_generator_prefix, substitute_bound_var,
     substitute_vars, suppress_or_raise, suppresses, tonumber_from_str, vec_with_capacity,
-    yq_empty_operand_output, yq_negative_index_check, BinaryFanoutRules, Control, Demand,
-    EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail,
-    QueryResult, YqSemantics,
+    yq_absent_key_read_is_empty, yq_empty_operand_output, yq_negative_index_check,
+    BinaryFanoutRules, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
+    JqSemantics, LimitN, PathTrail, QueryResult, YqSemantics,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -5643,10 +5643,16 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         Expr::Identity => cursor.map_or(GenericResult::One(value), GenericResult::OneCursor),
 
         Expr::Field(name) => {
+            // #2470 (yq mode, read-only context only): see
+            // `eval::yq_absent_key_read_is_empty` -- the same rule the eager
+            // evaluator's `index_object_by_name` applies, from the same
+            // definition.
+            let absent_is_empty = yq_absent_key_read_is_empty::<S>();
             if let Some(fields) = value.as_object() {
                 match fields.find_cursor(name) {
                     Ok(Some(c)) => GenericResult::OneCursor(c),
                     // jq returns null for missing fields on objects (not an error)
+                    Ok(None) if absent_is_empty => GenericResult::None,
                     Ok(None) => GenericResult::Owned(OwnedValue::Null),
                     // Either #1677 (the field this lookup resolved to has a
                     // malformed `,`/`:` delimiter) or #1995 (some sibling's
@@ -5656,7 +5662,11 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 }
             } else if value.is_null() {
                 // jq returns null for field access on null
-                GenericResult::Owned(OwnedValue::Null)
+                if absent_is_empty {
+                    GenericResult::None
+                } else {
+                    GenericResult::Owned(OwnedValue::Null)
+                }
             } else if optional {
                 GenericResult::None
             } else {
@@ -9137,15 +9147,24 @@ fn index_one_generic<S: EvalSemantics, V: DocumentValue>(
 ) -> GenericResult<V> {
     match key {
         OwnedValue::String(s) => {
+            // #2470: same rule as `Expr::Field`'s own arm -- a computed
+            // string key is still a key lookup (`.["zzz"] * 2` and
+            // `"zzz" as $k | .[$k] * 2` are both empty in real yq).
+            let absent_is_empty = yq_absent_key_read_is_empty::<S>();
             if let Some(fields) = target.as_object() {
                 match fields.find_cursor(s) {
                     Ok(Some(c)) => GenericResult::OneCursor(c),
+                    Ok(None) if absent_is_empty => GenericResult::None,
                     Ok(None) => GenericResult::Owned(OwnedValue::Null),
                     // #1677/#1995: same checks as `Expr::Field`'s own arm.
                     Err(err) => GenericResult::Error(err),
                 }
             } else if target.is_null() {
-                GenericResult::Owned(OwnedValue::Null)
+                if absent_is_empty {
+                    GenericResult::None
+                } else {
+                    GenericResult::Owned(OwnedValue::Null)
+                }
             } else if optional {
                 GenericResult::None
             } else {
@@ -10893,6 +10912,16 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
                     }
                 }
             };
+            // #2470 (yq mode, read-only context only): a key lookup that
+            // found nothing produces no position at all, so the walk has
+            // nothing to continue from and `key`/`path` are never reached --
+            // `(.zzz | key) + 1` is `1` in real yq, not `"zzz" + 1`. Only
+            // `Expr::Field` takes this: the sibling `Expr::Index` arm's own
+            // absent node stays, since real yq auto-creates through arrays
+            // even read-only (`.n[9] | key` is `9` inside an operand too).
+            if matches!(next, PathNode::Absent) && yq_absent_key_read_is_empty::<S>() {
+                return Ok(());
+            }
             out.push((
                 PathTrail::extend(path, OwnedValue::String(name.clone())),
                 next,

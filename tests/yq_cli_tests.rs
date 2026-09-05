@@ -32144,6 +32144,428 @@ fn test_yq_all_four_empty_operand_shapes_are_indistinguishable_2460() -> Result<
 }
 
 // =============================================================================
+// #2470: yq's read-only evaluation context (`Context.DontAutoCreate`)
+// =============================================================================
+
+/// The document every #2470 assignment-side row runs against. `.a` is an
+/// object with two entries (so `with_entries` has something to walk), `.c` an
+/// array, and `.x`/`.q`/`.zzz` are absent.
+const ABSENT_RHS_DOC_2470: &str = "a:\n  b: 1\n  e: 2\nc: [10, 20]\n";
+
+/// The same document as JSON, for the jq-mode control.
+const ABSENT_RHS_JSON_2470: &str = r#"{"a": {"b": 1, "e": 2}, "c": [10, 20]}"#;
+
+/// A real document that happens to be entry-shaped, so an absent read inside
+/// `=`'s right side can be shown empty without `with_entries` anywhere.
+const ENTRY_SHAPED_DOC_2470: &str = "key: b\nvalue: 1\n";
+
+/// #2470: in yq mode, a key lookup that finds nothing inside `=`'s right
+/// side yields **no node at all**, where the same read anywhere else yields a
+/// `null` node carrying the attempted key.
+///
+/// The mechanism is real yq's `Context.DontAutoCreate`, forced on for this
+/// evaluation by `assignUpdateOperator`'s `crossFunction(d,
+/// context.ReadOnlyClone(), ...)` (`pkg/yqlib/operator_assign.go`); with it
+/// on, `traverse`/`traverseMap` (`pkg/yqlib/operator_traverse_path.go`) never
+/// fabricate the `!!null` child whose `Key` is what `key`/`path` report, and
+/// the candidate is dropped before `operator_keys.go` is reached. Everything
+/// else in the table follows from ordinary generator semantics on a
+/// zero-output right side: `//` never sees a falsy left side, `[..]` collects
+/// `[]`, `length` yields nothing, and the assignment performs zero writes.
+///
+/// Implemented once, as `jq::eval::yq_read_only_context` plus
+/// `jq::eval::yq_absent_key_read_is_empty`, consulted by both evaluators.
+/// Every row is a live capture from Homebrew `yq` v4.53.3, run as
+/// `yq -o=json -I0 FILTER doc.yaml` and re-captured (not transcribed) when
+/// this test was written.
+#[test]
+fn test_yq_absent_key_in_assign_rhs_yields_no_node_2470() -> Result<()> {
+    for (filter, want, want_code) in [
+        (
+            r".a | with_entries(.value = (.a.b | key))",
+            r#"{"b":1,"e":2}"#,
+            0,
+        ),
+        (
+            r".a | with_entries(.value = (.zzz | key))",
+            r#"{"b":1,"e":2}"#,
+            0,
+        ),
+        (
+            r".a | with_entries(.value = (.key | key))",
+            r#"{"b":"key","e":"key"}"#,
+            0,
+        ),
+        (
+            r".a | with_entries(.value = (.value | key))",
+            r#"{"b":"value","e":"value"}"#,
+            0,
+        ),
+        (
+            r".a | with_entries(.value = (.zzz | path))",
+            r#"{"b":1,"e":2}"#,
+            0,
+        ),
+        (r".a | with_entries(.value = (.zzz))", r#"{"b":1,"e":2}"#, 0),
+        (
+            r".a | with_entries(.value = (.zzz | length))",
+            r#"{"b":1,"e":2}"#,
+            0,
+        ),
+        (
+            r".a | with_entries(.value = (.a.zzz | key))",
+            r#"{"b":1,"e":2}"#,
+            0,
+        ),
+        (
+            r".a | with_entries(.value = ([.zzz | key] | length))",
+            r#"{"b":0,"e":0}"#,
+            0,
+        ),
+        (
+            r#".a | with_entries(.value = (.key + "!"))"#,
+            r#"{"b":"b!","e":"e!"}"#,
+            0,
+        ),
+        (
+            r".a | to_entries | map(.value = (.zzz | key)) | from_entries",
+            r#"{"b":1,"e":2}"#,
+            0,
+        ),
+        (
+            r".a | map_values(.value = (.zzz|key))",
+            r#"{"b":1,"e":2}"#,
+            0,
+        ),
+        (
+            r".x = (.a.y | key)",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":null}"#,
+            0,
+        ),
+        (
+            r".x = (.zzz | key)",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":null}"#,
+            0,
+        ),
+        (
+            r".x = (.zzz | path)",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":null}"#,
+            0,
+        ),
+        (
+            r".x = (.a.zzz | key)",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":null}"#,
+            0,
+        ),
+        (
+            r".x = (.a.zzz | parent | length)",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":null}"#,
+            0,
+        ),
+        (
+            r".x = (.zzz | length)",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":null}"#,
+            0,
+        ),
+        (
+            r".x = (.zzz | tostring)",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":null}"#,
+            0,
+        ),
+        (
+            r#".x = ({"k":.zzz})"#,
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":null}"#,
+            0,
+        ),
+        (
+            r".x = [.zzz]",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":[]}"#,
+            0,
+        ),
+        (
+            r".x = ([.zzz | key])",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":[]}"#,
+            0,
+        ),
+        (
+            r#".x = (.zzz | key // "dflt")"#,
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":null}"#,
+            0,
+        ),
+        (
+            r".x = (.zzz | key, 5)",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":5}"#,
+            0,
+        ),
+        (
+            r".x = (.zzz)",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":null}"#,
+            0,
+        ),
+        (
+            r".x = null",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":null}"#,
+            0,
+        ),
+        (
+            r".x = (.a.b)",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":1}"#,
+            0,
+        ),
+        (
+            r".x = (.a.b | path)",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":["a","b"]}"#,
+            0,
+        ),
+        (
+            r".x = (.a | key)",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":"a"}"#,
+            0,
+        ),
+        (r".x = (.zzz | key) | .x", r"null", 0),
+        (
+            r".a.b = (.q | key)",
+            r#"{"a":{"b":1,"e":2},"c":[10,20]}"#,
+            0,
+        ),
+        (
+            r".a.e = (.zzz | key)",
+            r#"{"a":{"b":1,"e":2},"c":[10,20]}"#,
+            0,
+        ),
+        (
+            r". as $r | .x = (.zzz | key)",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":null}"#,
+            0,
+        ),
+        (
+            r".x += (.zzz | key)",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":null}"#,
+            0,
+        ),
+        (
+            r".x -= (.zzz | key)",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":null}"#,
+            0,
+        ),
+        (
+            r".x += (.zzz)",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":null}"#,
+            0,
+        ),
+        (
+            r".x *= (.zzz)",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":null}"#,
+            0,
+        ),
+        (
+            r".a.e += (.zzz | key)",
+            r#"{"a":{"b":1,"e":2},"c":[10,20]}"#,
+            0,
+        ),
+        (r".a.e -= (.zzz)", r#"{"a":{"b":1,"e":2},"c":[10,20]}"#, 0),
+        (r".a.e *= (.zzz)", r#"{"a":{"b":1,"e":2},"c":[10,20]}"#, 0),
+        (
+            r".x |= (.zzz | key)",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":"zzz"}"#,
+            0,
+        ),
+        (
+            r".x |= (.a.zzz | key)",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":"zzz"}"#,
+            0,
+        ),
+        (
+            r".x |= (.q.zzz | key)",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":"zzz"}"#,
+            0,
+        ),
+    ] {
+        let (out, stderr, code) =
+            run_yq_stdin_with_stderr(filter, ABSENT_RHS_DOC_2470, &["-o", "json", "-I", "0"])?;
+        assert_eq!(
+            (out.trim(), code),
+            (want, want_code),
+            "`{filter}` -- stderr: {stderr}"
+        );
+    }
+
+    // The `with_entries` rows above all read an absent key off a synthesised
+    // entry; this one reads it off a *real* document that happens to be
+    // entry-shaped, so the emptiness cannot be blamed on `with_entries`.
+    let (out, stderr, code) = run_yq_stdin_with_stderr(
+        r".value = (.a.b | key)",
+        ENTRY_SHAPED_DOC_2470,
+        &["-o", "json", "-I", "0"],
+    )?;
+    assert_eq!(
+        (out.trim(), code),
+        (r#"{"key":"b","value":1}"#, 0),
+        "`.value = (.a.b | key)` -- stderr: {stderr}"
+    );
+    Ok(())
+}
+
+/// #2470, the half that is not about absent reads at all: a yq-mode
+/// assignment whose right side produces **zero outputs** still emits one
+/// document, with the target path auto-created and never written.
+///
+/// This is what makes every `x: null` in the test above an assignment that
+/// vivified a *new* target rather than one that wrote a `null`, and every
+/// unchanged row an assignment that skipped the write on an *existing*
+/// target. Captured with `1 | select(false)` -- a right side that is empty
+/// for reasons of its own -- so the rule is keyed on "produced nothing" and
+/// not on why. `jq::eval::yq_empty_rhs_document` implements it; jq mode is
+/// pinned to jq's own opposite answer (no document at all) in
+/// `test_jq_absent_key_and_empty_rhs_keep_jqs_own_answers_2470`.
+#[test]
+fn test_yq_zero_output_assign_rhs_still_emits_one_document_2470() -> Result<()> {
+    for (filter, want, want_code) in [
+        (
+            r".x = (1 | select(false))",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":null}"#,
+            0,
+        ),
+        (
+            r".a.b = (1 | select(false))",
+            r#"{"a":{"b":1,"e":2},"c":[10,20]}"#,
+            0,
+        ),
+        (
+            r".q.r.s = (1 | select(false))",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"q":{"r":{"s":null}}}"#,
+            0,
+        ),
+        (
+            r".q[] = (1 | select(false))",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"q":[]}"#,
+            0,
+        ),
+        (
+            r".c[] = (1 | select(false))",
+            r#"{"a":{"b":1,"e":2},"c":[10,20]}"#,
+            0,
+        ),
+        (
+            r"(.x,.y) = (1 | select(false))",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":null,"y":null}"#,
+            0,
+        ),
+        (
+            r". = (1 | select(false))",
+            r#"{"a":{"b":1,"e":2},"c":[10,20]}"#,
+            0,
+        ),
+        (r".x = (1 | select(false)) | .x", r"null", 0),
+        (
+            r".x = (.c[] | select(false))",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":null}"#,
+            0,
+        ),
+    ] {
+        let (out, stderr, code) =
+            run_yq_stdin_with_stderr(filter, ABSENT_RHS_DOC_2470, &["-o", "json", "-I", "0"])?;
+        assert_eq!(
+            (out.trim(), code),
+            (want, want_code),
+            "`{filter}` -- stderr: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// #2470's negative half: the read-only context is a *scope*, not a blanket
+/// rule, and these are the constructs real yq pointedly leaves outside it.
+///
+/// A comparison operand keeps the null node (`compareOperator` does not
+/// clone its context read-only), `//` keeps it, `|=`'s right side keeps it
+/// (`SingleChildContext`, not `ReadOnlyClone`), and a bare filter, a collect
+/// and an object construction outside an operand all keep it too. Without
+/// these rows the implementation could pass the two tests above by making
+/// every absent read empty everywhere, which is not what yq does.
+#[test]
+fn test_yq_read_only_context_is_scoped_not_global_2470() -> Result<()> {
+    for (filter, want, want_code) in [
+        (r"(.zzz | key) // 5", r#""zzz""#, 0),
+        (r#"(.zzz | key) == "zzz""#, r"true", 0),
+        (r".zzz | key", r#""zzz""#, 0),
+        (r".zzz | path", r#"["zzz"]"#, 0),
+        (r"[.zzz]", r"[null]", 0),
+        (r"[(.zzz | key)] | length", r"1", 0),
+        (r#"{"k": (.zzz | key)}"#, r#"{"k":"zzz"}"#, 0),
+        (r".n[9] | key", r"9", 0),
+        (r"(.n[9] | key) + 1", r"10", 0),
+        (r".a.b | key", r#""b""#, 0),
+        (r".zzz | length", r"0", 0),
+        (r".zzz", r"null", 0),
+    ] {
+        let (out, stderr, code) =
+            run_yq_stdin_with_stderr(filter, EMPTY_OPERAND_DOC, &["-o", "json", "-I", "0"])?;
+        assert_eq!(
+            (out.trim(), code),
+            (want, want_code),
+            "`{filter}` -- stderr: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// #2470's jq-mode control: none of it applies there. jq has no read-only
+/// context, no `key`, and its own answers for every shape the yq rule
+/// changes -- `.x = (.zzz | length)` is `x: 0`, `.x = empty` is no document
+/// at all, `.zzz * 2` raises. Captured live from `/usr/bin/jq` 1.7.1 (the
+/// pinned oracle -- Homebrew's is 1.8.2).
+#[test]
+fn test_jq_absent_key_and_empty_rhs_keep_jqs_own_answers_2470() -> Result<()> {
+    for (filter, want, want_code) in [
+        (
+            r".x = (.zzz | length)",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":0}"#,
+            0,
+        ),
+        (
+            r".x = (.zzz)",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":null}"#,
+            0,
+        ),
+        (r".x = empty", r"", 0),
+        (
+            r#".x = ({"k":.zzz})"#,
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":{"k":null}}"#,
+            0,
+        ),
+        (
+            r".x = [.zzz]",
+            r#"{"a":{"b":1,"e":2},"c":[10,20],"x":[null]}"#,
+            0,
+        ),
+        (r".zzz * 2", r"", 5),
+        (r".zzz - 1", r"", 5),
+        (r"1 + .zzz", r"1", 0),
+        (r".zzz + 1", r"1", 0),
+        (r".zzz < 1", r"true", 0),
+        (r"[.zzz]", r"[null]", 0),
+        (r".zzz and true", r"false", 0),
+        (r".zzz // 5", r"5", 0),
+        (
+            r".a.e = (.zzz | tostring)",
+            r#"{"a":{"b":1,"e":"null"},"c":[10,20]}"#,
+            0,
+        ),
+        (r".x += empty", r"", 0),
+        (r".a.e -= (.zzz)", r"", 5),
+    ] {
+        let (out, stderr, code) = run_jq_stdin_with_stderr(filter, ABSENT_RHS_JSON_2470, &["-c"])?;
+        assert_eq!(
+            (out.trim(), code),
+            (want, want_code),
+            "`{filter}` -- stderr: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+// =============================================================================
 // #2451: yq's context-list model for a single document
 // =============================================================================
 
