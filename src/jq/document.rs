@@ -410,6 +410,25 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         None
     }
 
+    /// Whether this node is itself an alias (`*name`), without resolving
+    /// through it.
+    ///
+    /// `false` for formats with no alias concept (JSON), where this
+    /// monomorphizes to a constant and costs nothing. Only YAML cursors
+    /// override this, with an O(1) index check rather than [`alias`](Self::alias)'s
+    /// name lookup — a caller that only needs the yes/no answer (not the
+    /// name) should prefer this.
+    ///
+    /// Needed by a subtree walk that must not re-descend into an alias
+    /// target (#1804): a document shaped as a chain of anchors each
+    /// referencing the previous one twice (`aN: &aN [*a(N-1), *a(N-1)]`)
+    /// makes an unconditional per-child walk cost O(2^N) — the walk itself
+    /// is what fans out, not any per-node work, so the only fix is to stop
+    /// before recursing into an alias at all.
+    fn is_alias(&self) -> bool {
+        false
+    }
+
     /// Whether this cursor's *document* declares any `*name` alias at all.
     ///
     /// A whole-document property, not a property of this node, and O(1) --

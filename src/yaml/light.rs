@@ -6369,6 +6369,11 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     }
 
     #[inline]
+    fn is_alias(&self) -> bool {
+        YamlCursor::is_alias(self)
+    }
+
+    #[inline]
     fn document_has_aliases(&self) -> bool {
         self.index.has_aliases()
     }

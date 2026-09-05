@@ -28131,6 +28131,98 @@ fn test_select_raises_on_yaml_decode_failure_nested_in_container_1645() -> Resul
     Ok(())
 }
 
+/// #1804: a document shaped as a chain of anchors each referencing the
+/// previous one twice (`aN: &aN [*a(N-1), *a(N-1)]`) made
+/// `push_generic_truthiness_cursor_error`'s subtree walk cost `O(2^N)` --
+/// every `select`/`if` condition unconditionally re-descended into both
+/// copies of each alias target. `DocumentCursor::is_alias` now short-circuits
+/// the walk at an alias node instead of resolving through it, since jq's own
+/// truthiness rule (a non-null container is truthy regardless of contents)
+/// needs none of what the walk would find inside.
+///
+/// Pinned as a timing regression guard, following
+/// `test_def_shadow_deep_nesting_does_not_blow_up_2036`'s pattern: 30 levels
+/// is deep enough that a *broken* `O(2^N)` walk would take an astronomical
+/// amount of time (`2^30` node visits), not merely a slow few seconds, so a
+/// generous margin still catches a real regression while tolerating this
+/// suite's own CPU contention (many tests spawn concurrent subprocesses).
+/// Confirmed live pre-fix: `select(.)` at N=24 took 3.07s (this test's
+/// N=30 would not finish within any reasonable bound); post-fix, N=30
+/// completes in single-digit milliseconds.
+///
+/// `if`/`select` only -- `and`/`or`/`not`/`//`/`any` are NOT fixed by this
+/// change (confirmed live: `.a20 and true` still took 109s at N=26) because
+/// `eval_single` has no native arm for them and they bridge through
+/// `full_eval` (the eager/materializing evaluator), which this walk is never
+/// consulted from. That gap is tracked separately, coupled to the #2416
+/// migration that would need to give them a native arm the way `if` already
+/// has one.
+#[test]
+fn test_select_and_if_truthiness_flat_over_alias_fanout_1804() -> Result<()> {
+    let mut doc = String::from("a0: &a0 leaf\n");
+    for i in 1..=30 {
+        doc.push_str(&format!("a{i}: &a{i} [*a{}, *a{}]\n", i - 1, i - 1));
+    }
+
+    let start = std::time::Instant::now();
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(".a30 | select(.) | length", &doc, &[])?;
+    let elapsed = start.elapsed();
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), "2");
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "select(.) over a 30-level alias fan-out took {elapsed:?} -- O(2^N) blowup regressed"
+    );
+
+    let start = std::time::Instant::now();
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr("if .a30 then 1 else 2 end", &doc, &[])?;
+    let elapsed = start.elapsed();
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), "1");
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "if over a 30-level alias fan-out took {elapsed:?} -- O(2^N) blowup regressed"
+    );
+
+    Ok(())
+}
+
+/// #1804's accepted trade-off: not descending into an alias inside
+/// `select`'s corruption walk means a decode failure reachable *only*
+/// through an alias no longer raises from `select` itself. It still raises
+/// whenever the aliased field is visited directly, or the alias is
+/// materialized -- this walk is the only place that stops short. Real yq
+/// rejects this whole document at parse time (no yq behaviour to match
+/// either way).
+#[test]
+fn test_select_no_longer_raises_on_decode_failure_reachable_only_via_alias_1804() -> Result<()> {
+    let doc = "a: &a [\"b\\qc\"]\nb: *a\n";
+
+    // select(.b)'s condition walk no longer descends into the alias, so the
+    // nested decode failure inside it is never seen.
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr("select(.b) | 1", doc, &[])?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), "1");
+
+    // Visiting `.a` directly still raises.
+    let (_, stderr, code) = run_yq_stdin_with_stderr(".a", doc, &[])?;
+    assert_ne!(code, 0, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("invalid escape sequence"),
+        "stderr: {stderr}"
+    );
+
+    // Materializing through the alias still raises.
+    let (_, stderr, code) = run_yq_stdin_with_stderr(".b[0]", doc, &[])?;
+    assert_ne!(code, 0, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("invalid escape sequence"),
+        "stderr: {stderr}"
+    );
+
+    Ok(())
+}
+
 /// #1813: `colliding_display_key_error`'s uncatchability fix lives in
 /// shared `src/jq/error.rs`/`document.rs` code, reached identically by
 /// both evaluators -- confirms the fix applies to yq mode too, not just
