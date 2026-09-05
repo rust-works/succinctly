@@ -438,8 +438,12 @@ pub(crate) enum EmptyOperandOp {
 ///    an error) while an empty operand is symmetric.
 /// 6. yq has three distinct "null-ish" categories -- a real `null`, a
 ///    missing-key `null`, and a zero-output filter -- that do not share one
-///    operator branch. Only the third is this function's business; the
-///    missing-key half (`.zzz * 2`) is a separate, still-divergent shape.
+///    operator branch. Only the third is this function's business. The
+///    missing-key half (`.zzz * 2`) is [`yq_read_only_context`]'s (#2470):
+///    an arithmetic or `and`/`or` operand is evaluated read-only, so such a
+///    read produces zero outputs *before* reaching this table, and a
+///    comparison operand -- which is not read-only -- still sees the real
+///    `null` node.
 pub(crate) fn yq_empty_operand_output(
     op: EmptyOperandOp,
     other: Option<&OwnedValue>,
@@ -478,21 +482,28 @@ pub(crate) fn yq_empty_operand_output(
 /// | construct                | probe                    | yq        |
 /// |--------------------------|--------------------------|-----------|
 /// | `=`-family right side    | `.x = (.zzz \| key)`     | `x: null` |
+/// | arithmetic operand       | `(.zzz \| key) + 1`      | `1`       |
+/// | `and`/`or` operand       | `(.zzz \| key) and true` | `false`   |
 ///
-/// and one that pointedly does **not**, which is why this is a scope rather
-/// than a blanket rule: `|=`'s own right side (`.x |= (.zzz | key)` is
-/// `x: "zzz"`, since `assignUpdateOperator` runs it through
-/// `SingleChildContext` instead of `ReadOnlyClone`,
+/// and three that pointedly do **not**, which is why this is a scope rather
+/// than a blanket rule: a comparison operand (`(.zzz | key) == "zzz"` is
+/// `true`), `//` (`(.zzz | key) // 5` is `"zzz"`), and `|=`'s own right side
+/// (`.x |= (.zzz | key)` is `x: "zzz"`, since `assignUpdateOperator` runs it
+/// through `SingleChildContext` instead of `ReadOnlyClone`,
 /// `pkg/yqlib/operator_assign.go`). A bare filter, a collect (`[.zzz]` is
-/// `[null]`) and an object construction outside an assignment's right side
-/// keep the null node too.
+/// `[null]`) and an object construction outside an operand keep the null
+/// node too.
 ///
-/// The scope covers the whole right-hand subexpression, nested pipes
-/// included -- so it is ambient rather than a parameter, the same shape (and
-/// for the same reason) as `eval_generic`'s `path_context_route`/
-/// `with_file_origin`: the sites that consult it are many recursion levels
-/// below the sites that establish it, and this codebase has no
-/// evaluation-environment parameter for it to ride on.
+/// The scope covers the operand's *whole* subexpression, nested pipes
+/// included -- `(.zzz | key) + 1` is `1`, not `"zzz" + 1` -- so it is
+/// ambient rather than a parameter, the same shape (and for the same reason)
+/// as `eval_generic`'s `path_context_route`/`with_file_origin`: the sites
+/// that consult it are many recursion levels below the sites that establish
+/// it, and this codebase has no evaluation-environment parameter for it to
+/// ride on. [`yq_read_only_context::suspend`] is the other half of that:
+/// operand evaluation here is demand-driven, so the *consumer* of an
+/// operand's outputs runs on the stack inside the producing call and must
+/// not inherit the scope.
 ///
 /// `#[cfg(feature = "std")]` only, same limitation as its two siblings named
 /// above: a `no_std` embedding has no `thread_local!`, so the scope is never
@@ -529,6 +540,14 @@ pub(crate) mod yq_read_only_context {
         set(true)
     }
 
+    /// Leave any read-only context for the caller's scope -- what a
+    /// demand-driven operand's *sink* runs under, so that a downstream stage
+    /// (`.zzz + 1 | .yyy`) or the other operand's own pairing work does not
+    /// inherit a scope that belongs to the operand expression alone.
+    pub(crate) fn suspend() -> Guard {
+        set(false)
+    }
+
     impl Drop for Guard {
         fn drop(&mut self) {
             ACTIVE.with(|c| c.set(self.0));
@@ -545,6 +564,10 @@ pub(crate) mod yq_read_only_context {
     pub(crate) struct Guard;
 
     pub(crate) fn enter() -> Guard {
+        Guard
+    }
+
+    pub(crate) fn suspend() -> Guard {
         Guard
     }
 }
@@ -593,13 +616,25 @@ pub(crate) struct BinaryFanoutRules {
     /// left operand outermost (jq short-circuits per left output), which is
     /// already yq's order.
     pub(crate) left_major: bool,
+    /// `true` in yq mode for an **arithmetic** or `and`/`or` operand (#2470):
+    /// the operand expression is evaluated inside a
+    /// [read-only context](yq_read_only_context), so a key lookup that finds
+    /// nothing there produces no output rather than a `null` node -- which is
+    /// then answered by [`yq_empty_operand_output`]'s own zero-output row.
+    ///
+    /// `false` for a **comparison** operand even in yq mode: real yq's
+    /// `compareOperator` does not clone its context read-only, and
+    /// `(.zzz | key) == "zzz"` is `true` there, not `false` (v4.53.3).
+    pub(crate) read_only: bool,
 }
 
-/// The one place either binary-fanout rule is read off `S` (#2460/#2451).
+/// The one place any binary-fanout rule is read off `S` (#2460/#2451/#2470).
 pub(crate) fn binary_fanout_rules<S: EvalSemantics>(op: EmptyOperandOp) -> BinaryFanoutRules {
     BinaryFanoutRules {
         empty: S::EMPTY_OPERAND_BINARY_RULE.then_some(op),
         left_major: S::BINARY_FANOUT_IS_LEFT_MAJOR,
+        read_only: S::READ_ONLY_ABSENT_KEY_IS_EMPTY
+            && matches!(op, EmptyOperandOp::Arith(_) | EmptyOperandOp::Boolean),
     }
 }
 
@@ -5651,6 +5686,12 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>>(
     mut combine: impl FnMut(OwnedValue, OwnedValue) -> Result<OwnedValue, EvalError>,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
+    // #2470 (yq mode, arithmetic and `and`/`or` only): every operand below is
+    // enumerated through this wrapper instead of `each_operand` directly, so
+    // the operand *expression* runs inside a read-only context while the sink
+    // it feeds -- the other operand's pairing work and whatever consumes the
+    // result downstream -- does not. See `yq_read_only_context`.
+    let each_operand = read_only_operand_strategy(rules, each_operand);
     // Why the fanout ended, recorded out-of-band because the driver closure
     // can only answer `Demand` — the same shape as `eval_each_pipe`'s
     // `downstream` and `any_all_gen_cond`'s `probe_escape`.
@@ -5809,6 +5850,32 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>>(
         return empty_outer_operand_pass(&each_operand, inner_expr, op, sink);
     }
     abort.unwrap_or(outer)
+}
+
+/// Wrap an operand-enumeration strategy so the operand expression itself runs
+/// inside a [read-only context](yq_read_only_context) and its sink does not
+/// (#2470).
+///
+/// A pass-through when `rules.read_only` is `false` (jq mode, and a
+/// comparison operand in either mode), so nothing outside yq's arithmetic
+/// and `and`/`or` operands pays for -- or observes -- the scope. The
+/// `suspend` on the way into the sink is what makes `.zzz + 1 | .yyy` keep
+/// reading `.yyy` normally, and what lets the *inner* operand's own wrapped
+/// call re-enter the scope from scratch.
+fn read_only_operand_strategy<'a, W: Clone + AsRef<[u64]>>(
+    rules: BinaryFanoutRules,
+    each_operand: impl Fn(&Expr, &mut dyn FnMut(Item<'a, W>) -> Demand) -> Flow,
+) -> impl Fn(&Expr, &mut dyn FnMut(Item<'a, W>) -> Demand) -> Flow {
+    move |expr: &Expr, sink: &mut dyn FnMut(Item<'a, W>) -> Demand| {
+        if !rules.read_only {
+            return each_operand(expr, sink);
+        }
+        let _scope = yq_read_only_context::enter();
+        each_operand(expr, &mut |item| {
+            let _suspended = yq_read_only_context::suspend();
+            sink(item)
+        })
+    }
 }
 
 /// The `right`-operand-produced-nothing half of [`binary_fanout_each`]'s
@@ -5972,6 +6039,18 @@ fn boolean_fanout_core<'a, W: Clone + AsRef<[u64]>>(
     short_circuit: bool,
     rules: BinaryFanoutRules,
 ) -> QueryResult<'a, W> {
+    // #2470 (yq mode): `and`/`or` evaluate both operands read-only, exactly
+    // like arithmetic -- `(.zzz | key) and true` is `false` in real yq while
+    // `"zzz" and true` is `true`. This operand strategy is eager (a whole
+    // `QueryResult` per call, not a sink), so there is nothing to suspend:
+    // the scope covers only the call itself.
+    let mut eval_operand = move |expr: &Expr| {
+        if !rules.read_only {
+            return eval_operand(expr);
+        }
+        let _scope = yq_read_only_context::enter();
+        eval_operand(expr)
+    };
     let mut left_bools = Vec::new();
     let left_control = push_truthiness(eval_operand(left), &mut left_bools);
     // #2460 (yq mode only): an operand that produced *zero* outputs

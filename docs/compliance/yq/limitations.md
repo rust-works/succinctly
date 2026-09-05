@@ -1796,47 +1796,92 @@ a value that isn't a snapshot of anything in the document -- a different kind of
 #2213's path-threading fix, which only ever continues with a value already known to be
 correct (`Null`, jq's own answer for what the missing/OOB read itself evaluates to).
 
-### A binary operand that navigated to a missing key: succinctly sees `null`, real yq sees nothing
+### An absent key read inside a read-only context — resolved (#2470); four neighbouring shapes remain
 
 [#2460](https://github.com/rust-works/succinctly/issues/2460) gave yq mode real yq's rule
-for a binary operator whose operand produces **zero outputs** -- `key`, `parent`,
-`parent(1)` at the document root, or any other filter that emits nothing. That rule is
-implemented once (`jq::eval::yq_empty_operand_output`) and is exact for those shapes. Real
-yq has a *second*, wider category of "empty operand" that it does not cover: an operand
-that navigated to a **missing key**. Captured live against yq v4.53.3 on
+for a binary operator whose operand produces **zero outputs**, and left two matrix cells
+open: an operand that navigated to a **missing key** (`.zzz * 2`, `(.zzz | key) + 1`),
+which real yq also treats as empty even though the same read is a `null` node everywhere
+else. [#2470](https://github.com/rust-works/succinctly/issues/2470) closed both, together
+with the whole assignment-side half of the same mechanism.
 
-```yaml
-a:
-  b: 1
-s: x
-n: [1, 2]
-```
+The mechanism is real yq's `Context.DontAutoCreate` (`pkg/yqlib/context.go`), traced to
+source and re-verified live against v4.53.3. `traverse`/`traverseMap`
+(`pkg/yqlib/operator_traverse_path.go`) fabricate a missing child as a real `!!null` node
+with its `Key` set — which is what lets `key`/`path` answer for a position that does not
+exist — only while the flag is off; with it on the miss contributes no candidate at all,
+before `operator_keys.go` is ever reached. Three constructs force it on, and three
+pointedly do not:
 
-| filter                | real yq                                   | succinctly yq                                      |
-|-----------------------|-------------------------------------------|----------------------------------------------------|
-| `.zzz`                | `null`                                    | `null`                                             |
-| `.zzz \| . * 2`       | `Error: cannot multiply !!null with !!int` | `Error: null (null) and number (2) ...`           |
-| `.zzz * 2`            | *(nothing)*, exit 0                       | `Error: null (null) and number (2) cannot be multiplied` |
-| `.zzz / 2`            | *(nothing)*, exit 0                       | `Error: ... cannot be divided`                     |
-| `.zzz - 1`            | *(nothing)*, exit 0                       | `1`                                                |
-| `.zzz + 1`            | `1`                                       | `1` (agrees, for an unrelated reason)              |
-| `.zzz \| key`         | `"zzz"`                                   | `"zzz"`                                            |
-| `(.zzz \| key) + 1`   | `1`                                       | `Error: string ("zzz") and number (1) cannot be added` |
-| `(.zzz \| key) + "!"` | `"!"`                                     | `"zzz!"`                                           |
+| construct                  | probe                       | real yq   | read-only? |
+|----------------------------|-----------------------------|-----------|------------|
+| `=`-family right side      | `.x = (.zzz \| key)`         | `x: null` | yes        |
+| arithmetic operand         | `(.zzz \| key) + 1`          | `1`       | yes        |
+| `and`/`or` operand         | `(.zzz \| key) and true`     | `false`   | yes        |
+| comparison operand         | `(.zzz \| key) == "zzz"`     | `true`    | no         |
+| `//`                       | `(.zzz \| key) // 5`         | `"zzz"`   | no         |
+| `\|=`'s right side         | `.x \|= (.zzz \| key)`       | `x: "zzz"`| no         |
 
-Real yq is inconsistent with itself here, twice over, and both inconsistencies are what
-make this hard rather than mechanical. `.zzz` on its own is a `null` **value** (`.zzz | . *
-2` raises, exactly like `null * 2`), but the same `.zzz` written directly as an operand is
-an empty **candidate list** (`.zzz * 2` yields nothing) -- so yq's traversal answers
-differently depending on whether an operator or a pipe is asking. And `.zzz | key` is
-`"zzz"` standing alone yet contributes nothing as an operand, so the emptiness survives a
-whole pipe once that pipe is an operand.
+`assignUpdateOperator` (`pkg/yqlib/operator_assign.go`) is where the last two rows part:
+plain `=` runs its right side through `crossFunction(d, context.ReadOnlyClone(), ...)`,
+which forces the flag on; `|=` runs it through `context.SingleChildContext(candidate)`,
+which inherits the ordinary auto-creating setting.
 
-succinctly materializes an ordinary `null` for a missing key at every position, so it has
-no way to distinguish the two contexts. Closing this needs an *absent* operand value
-threaded through operand evaluation -- a model change of the same kind ADR-0021 made for
-path context -- not another entry in #2460's table, which is keyed on an operand producing
-no outputs and would answer these shapes the moment the operand actually produced none.
+Implemented once as `jq::eval::yq_read_only_context` (the ambient scope) plus
+`jq::eval::yq_absent_key_read_is_empty` (the mode gate), consulted by every navigation
+site in both evaluators, and `jq::eval::yq_empty_rhs_document` for the other half of the
+assignment rule: a zero-output right side still emits one document, with the target path
+auto-created and never written, so a new target survives as an explicit `null` while an
+existing one keeps its old value. Only **key** lookups are covered — real yq auto-creates
+through arrays even read-only (`.x = (.n[9] | key)` on `n: [1, 2]` is `x: 9`), so an
+out-of-range array index stays the ordinary `null` read.
+
+Five neighbouring shapes were captured alongside and are **not** part of this rule; each
+is a separate divergence:
+
+| filter                                    | input             | real yq        | succinctly                             |
+|-------------------------------------------|-------------------|----------------|----------------------------------------|
+| `null < 1`, `.zzz < 1`, `null <= 1`       | `a: 1`            | `false`        | `true`                                 |
+| `.s.zzz`                                  | `s: x`            | *(nothing)*    | `Error: Cannot index string with string "zzz"` |
+| `.a \| with_entries(.value = key)`        | `a: {b: 1, e: 2}` | `{"b":0,"e":1}`| `{"b":1,"e":2}`                        |
+| `.a \|= (1 \| select(false))`             | `a: 1`            | `{"a":1}`      | `{"a":null}`                           |
+| `.x = (keys)`                             | `a: 1`            | `{"a":1,"x":["a","x"]}` | `{"a":1,"x":["a"]}`           |
+
+Row 1 is yq's ordering comparison against a real `null`, which is `false` for every
+operator regardless of the other side — nothing to do with absent reads (`.zzz` is a
+genuine `null` node in that position, since a comparison operand is not read-only).
+Row 2 is yq indexing a *scalar* with a key, which yields nothing everywhere, not only in
+a read-only context — it is what makes `.s.zzz + 1` also `1`. Row 3 is what `key` reports
+for an element of a constructed array: real yq answers the index, succinctly has no path
+context for a value it built itself, so the `=` right side is empty and the write is
+skipped. Row 4 is `|=` with a zero-output *filter*, which real yq no-ops the same way it
+no-ops a zero-output `=` right side — succinctly's `update_path` writes `null` instead.
+`.x |= (1 | select(false))` on an absent `.x` already agrees (`x: null`), so only the
+existing-target half diverges.
+
+Row 5 is an evaluation-*order* divergence that predates all of this and is unrelated to
+absent reads: real yq's `assignUpdateOperator` resolves (and auto-creates) the **left**
+side first, then evaluates the right side against the document that traversal has already
+mutated, so the right side can see the node the assignment is about to write into.
+succinctly evaluates the right side against the pristine input. `.x = (length)` on `a: 1`
+is `x: 2` in real yq and `x: 1` here for the same reason.
+
+That order is why four shapes that used to agree by coincidence now do not. `.zzz.q =
+(.zzz | key)` on `a: 1` is `zzz: {q: "zzz"}` in real yq because `.zzz` genuinely *exists*
+by the time the right side runs; succinctly's old answer matched only because its absent
+read fabricated a `null` node whose key happened to be spelled the same. With the read
+now correctly empty, the underlying order difference is what shows:
+
+| filter                    | input  | real yq              | succinctly          |
+|---------------------------|--------|----------------------|---------------------|
+| `.zzz.q = (.zzz \| key)`   | `a: 1` | `{"zzz":{"q":"zzz"}}`| `{"zzz":{"q":null}}`|
+| `.zzz.q += (.zzz \| key)`  | `a: 1` | `{"zzz":{"q":"zzz"}}`| `{"zzz":{"q":null}}`|
+| `.zzz.q -= (.zzz \| key)`  | `a: 1` | `{"zzz":{"q":"zzz"}}`| `{"zzz":{"q":null}}`|
+| `.zzz.q *= (.zzz \| key)`  | `a: 1` | *(error, exit 1)*    | `{"zzz":{"q":null}}`|
+
+(the `a: 1` prefix elided). Closing these needs the right side evaluated against the
+left-vivified document, which is a change to the assignment model rather than to this
+rule -- and would move `.x = (keys)`/`.x = (length)` at the same time.
 
 ### A negative out-of-range array index (`.a[-N]`) raises -- resolved for ordinary reads, a few call sites remain
 

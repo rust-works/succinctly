@@ -32474,6 +32474,72 @@ fn test_yq_zero_output_assign_rhs_still_emits_one_document_2470() -> Result<()> 
     Ok(())
 }
 
+/// #2470's second scope, and #2460's two residual matrix cells: an
+/// **arithmetic** or `and`/`or` operand is evaluated read-only too, so a
+/// missing-key navigation written directly as an operand contributes no
+/// output and #2460's `yq_empty_operand_output` table answers the pairing.
+///
+/// `.zzz * 2` yields nothing while `.zzz | . * 2` raises `cannot multiply
+/// !!null with !!int` -- the same read, answering differently depending on
+/// whether an operator or a pipe is asking, which is exactly the read-only
+/// clone. The scope covers the operand's whole subexpression, which is why
+/// `(.zzz | key) + 1` is `1` rather than `"zzz" + 1`.
+///
+/// Array indexing is deliberately not covered: real yq auto-creates through
+/// arrays even read-only, so `.n[9] + 1` is the ordinary `null + 1`. Every
+/// row is a live capture from yq v4.53.3.
+#[test]
+fn test_yq_absent_key_as_binary_operand_yields_no_node_2470() -> Result<()> {
+    for (filter, want, want_code) in [
+        (r".zzz + 1", r"1", 0),
+        (r"1 + .zzz", r"1", 0),
+        (r".zzz - 1", r"", 0),
+        (r"1 - .zzz", r"", 0),
+        (r".zzz * 2", r"", 0),
+        (r".zzz / 2", r"", 0),
+        (r".zzz % 2", r"", 0),
+        (r".zzz == null", r"true", 0),
+        (r".zzz != null", r"false", 0),
+        (r".zzz // 5", r"5", 0),
+        (r".zzz and true", r"false", 0),
+        (r"true and .zzz", r"false", 0),
+        (r".zzz or false", r"false", 0),
+        (r"false or .zzz", r"false", 0),
+        (r".zzz | . + 1", r"1", 0),
+        (r"(.zzz) + 1", r"1", 0),
+        (r"[.zzz] | .[0] + 1", r"1", 0),
+        (r".a.zzz + 1", r"1", 0),
+        (r".n[9] + 1", r"1", 0),
+        (r"(.zzz | key) + 1", r"1", 0),
+        (r".zzz + .zzz", r"", 0),
+        (r".zzz + .a", r#"{"b":1}"#, 0),
+        (r#"(.zzz | key) + "!""#, r#""!""#, 0),
+        (r"(.zzz | key) * 2", r"", 0),
+        (r"(.zzz | key) and true", r"false", 0),
+        (r"true and (.zzz | key)", r"false", 0),
+        (r"(.zzz | key) or false", r"false", 0),
+        (r#".zzz + "!""#, r#""!""#, 0),
+        (r"[.zzz] + []", r"[]", 0),
+        (r#"{"k": .zzz} + {}"#, r"{}", 0),
+        (r"(.a | .zzz) + 1", r"1", 0),
+        (r".zzz.yyy + 1", r"1", 0),
+        (r".zzz - 1 - 1", r"", 0),
+        (r#".["zzz"] * 2"#, r"", 0),
+        (r#""zzz" as $k | .[$k] * 2"#, r"", 0),
+        (r".zzz[] * 2", r"", 0),
+        (r".a.b * 2", r"2", 0),
+    ] {
+        let (out, stderr, code) =
+            run_yq_stdin_with_stderr(filter, EMPTY_OPERAND_DOC, &["-o", "json", "-I", "0"])?;
+        assert_eq!(
+            (out.trim(), code),
+            (want, want_code),
+            "`{filter}` -- stderr: {stderr}"
+        );
+    }
+    Ok(())
+}
+
 /// #2470's negative half: the read-only context is a *scope*, not a blanket
 /// rule, and these are the constructs real yq pointedly leaves outside it.
 ///

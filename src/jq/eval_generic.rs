@@ -47,8 +47,8 @@ use super::eval::{
     slice_owned_value_read, streams_escaped_generator_prefix, substitute_bound_var,
     substitute_vars, suppress_or_raise, suppresses, tonumber_from_str, vec_with_capacity,
     yq_absent_key_read_is_empty, yq_empty_operand_output, yq_negative_index_check,
-    BinaryFanoutRules, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
-    JqSemantics, LimitN, PathTrail, QueryResult, YqSemantics,
+    yq_read_only_context, BinaryFanoutRules, Control, Demand, EmptyOperandOp, EvalError,
+    EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail, QueryResult, YqSemantics,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -8158,6 +8158,10 @@ fn binary_fanout_each_generic<V: DocumentValue>(
     mut combine: impl FnMut(OwnedValue, OwnedValue) -> Result<OwnedValue, EvalError>,
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Flow {
+    // #2470: same wrapper, same rule, same `BinaryFanoutRules::read_only`
+    // flag as `eval::binary_fanout_each` -- see
+    // `eval::read_only_operand_strategy` and `eval::yq_read_only_context`.
+    let each_operand = read_only_operand_strategy_generic(rules, each_operand);
     let mut abort: Option<Flow> = None;
     // #2460: how many outputs each operand produced, so a *zero* count is
     // answered from `yq_empty_operand_output` rather than contributing no
@@ -8257,6 +8261,26 @@ fn binary_fanout_each_generic<V: DocumentValue>(
         return empty_outer_operand_pass_generic::<V>(&each_operand, inner_expr, op, sink);
     }
     abort.unwrap_or(outer)
+}
+
+/// The generic-evaluator twin of `eval::read_only_operand_strategy` (#2470):
+/// wrap an operand-enumeration strategy so the operand expression runs inside
+/// a read-only context and the sink it feeds does not. Pass-through unless
+/// `rules.read_only`.
+fn read_only_operand_strategy_generic<V: DocumentValue>(
+    rules: BinaryFanoutRules,
+    each_operand: impl Fn(&Expr, &mut dyn FnMut(GenericItem<V>) -> Demand) -> Flow,
+) -> impl Fn(&Expr, &mut dyn FnMut(GenericItem<V>) -> Demand) -> Flow {
+    move |expr: &Expr, sink: &mut dyn FnMut(GenericItem<V>) -> Demand| {
+        if !rules.read_only {
+            return each_operand(expr, sink);
+        }
+        let _scope = yq_read_only_context::enter();
+        each_operand(expr, &mut |item| {
+            let _suspended = yq_read_only_context::suspend();
+            sink(item)
+        })
+    }
 }
 
 /// The `right`-operand-produced-nothing half of
