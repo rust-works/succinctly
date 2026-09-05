@@ -30024,6 +30024,101 @@ fn test_path_single_dynamic_stage_static_tail_does_not_over_materialize_2050() -
     Ok(())
 }
 
+/// #2178: a *non-rejecting* builtin (`debug`, `stderr`, ...) sitting between
+/// two generator stages used to make `resolve_seq` widen the earlier stage's
+/// `keep` to "need every output" -- #2050's fix could not tell "a `select`
+/// follows" from "a passthrough follows", so it widened for both, and the
+/// stage-batch loop had no way to un-ask for a value once the widened stage
+/// had produced it.
+///
+/// Depth-first resolution answers it without any static "can this stage
+/// reject" analysis: the first candidate is threaded through the *rest* of
+/// the pipe before the generator is asked for a second, so the raise from
+/// `.a` stops it there. Captured live against `/usr/bin/jq` 1.7.1:
+///
+/// ```console
+/// $ echo null | jq -c '[path(range(1000000) | debug | .a)]' 2>&1 | grep -c DEBUG
+/// 1
+/// $ echo null | jq -c '[path(range(1000000) | debug | .a)]'
+/// jq: error (at <stdin>:1): Invalid path expression near attempt to access element "a" of 0
+/// ```
+///
+/// (`succinctly` answered 100000 and 1000 respectively for these two sizes
+/// before this fix -- a `RECURSE_MAX_ITEMS`-style cap, not the full million.)
+#[test]
+fn test_path_passthrough_between_generator_stages_calls_debug_once_2178() -> Result<()> {
+    for n in ["1000", "1000000"] {
+        let filter = format!("[path(range({n}) | debug | .a)]");
+        let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some("null"))?;
+        assert_eq!(code, 5, "n={n}, stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout, "", "n={n}");
+        assert_eq!(
+            stderr.matches("DEBUG").count(),
+            1,
+            "n={n}: jq calls debug exactly once; stderr: {stderr:?}"
+        );
+        assert!(
+            stderr.contains(r#"Invalid path expression near attempt to access element "a" of 0"#),
+            "n={n}: stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #2178 companion: a stage that genuinely *can* reject still gets every
+/// candidate it needs, which is the #2050 regression depth-first resolution
+/// must not reintroduce. `select` rejects `paths`'s first output, so jq asks
+/// for the next -- captured live against `/usr/bin/jq` 1.7.1:
+///
+/// ```console
+/// $ echo '{"a":{"b":1}}' | jq -c '[path(paths | select(length == 2))]'
+/// jq: error (at <stdin>:1): Invalid path expression with result ["a","b"]
+/// ```
+///
+/// (The raise is the point: reaching `["a","b"]` at all means `paths` was
+/// asked past its rejected first output. A stage-batch loop truncated to one
+/// value answers `[]`, exit 0.)
+#[test]
+fn test_path_rejecting_stage_still_reaches_a_later_candidate_2178() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "[path(paths | select(length == 2))]"],
+        Some(r#"{"a":{"b":1}}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains(r#"Invalid path expression with result ["a","b"]"#),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #2178: with the pipe resolved depth-first, a *downstream* escape is the
+/// one raised -- an already-yielded value is threaded all the way through the
+/// rest of the pipe before an earlier stage's next alternative is tried, so
+/// `t2` (the later stage's) supersedes `t1`, and the branch that succeeded is
+/// still printed first. Captured live against `/usr/bin/jq` 1.7.1:
+///
+/// ```console
+/// $ echo '{"a":[{"c":[{"foo":1}]}]}' | jq -c 'path(.a[(0,error("t1"))] | .c[(0,error("t2"))] | .foo)'
+/// ["a",0,"c",0,"foo"]
+/// jq: error (at <stdin>:1): t2
+/// ```
+#[test]
+fn test_path_multistage_escape_order_matches_jq_2178() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            r#"path(.a[(0,error("t1"))] | .c[(0,error("t2"))] | .foo)"#,
+        ],
+        Some(r#"{"a":[{"c":[{"foo":1}]}]}"#),
+    )?;
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\",0,\"c\",0,\"foo\"]\n");
+    assert!(stderr.contains("t2"), "stderr: {stderr:?}");
+    assert!(!stderr.contains("t1"), "stderr: {stderr:?}");
+    Ok(())
+}
+
 /// The same eagerness applied to `input`/`inputs` destroys data.
 ///
 /// `input`/`inputs` pop from the process-global queue that the CLI's own
@@ -35786,7 +35881,7 @@ fn test_optional_comma_sibling_prune_holds_across_scalar_shapes_for_assignment_2
 }
 
 /// #2124's fix has two call sites, not one: `resolve_seq`'s fully-static
-/// fast path (every test above) and `apply_static_tail`'s per-branch tail
+/// fast path (every test above) and `apply_static_tail_one`'s per-branch tail
 /// application, reached only once a *real* dynamic/computed element
 /// precedes the `?`-guarded step in the same pipe. `.[(0,1)].a?` fans out
 /// over the computed index first (dynamic), then applies `.a? = 9` as each

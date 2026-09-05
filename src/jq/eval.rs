@@ -22924,10 +22924,9 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
     match expr {
         // `None`: an ordinary pipe has no externally-known register to
         // inject (#2046) — see `resolve_seq`'s own doc comment.
-        Expr::Pipe(exprs) => drain_path_result(
-            resolve_seq::<S>(exprs, value, trackable, snapshot, keep, None),
-            sink,
-        ),
+        Expr::Pipe(exprs) => {
+            resolve_seq_sink::<S>(exprs, value, trackable, snapshot, keep, None, sink)
+        }
         Expr::Paren(inner) => resolve_node_sink::<S>(inner, value, trackable, snapshot, keep, sink),
         // #1371: `path(f)` has to see *through* a call to whatever its body
         // navigates, exactly as it did when the body was substituted in
@@ -24352,6 +24351,26 @@ fn resolve_against_cow<'a, S: EvalSemantics>(
                 e,
             )),
         },
+    }
+}
+/// [`resolve_against_cow`]'s sink form -- see that function for why the
+/// `Cow` is matched by value rather than through a reference.
+fn resolve_against_cow_sink<'a, S: EvalSemantics>(
+    expr: &Expr,
+    current: Cow<'a, OwnedValue>,
+    trackable: bool,
+    snapshot: bool,
+    keep: Keep,
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
+    match current {
+        Cow::Borrowed(r) => resolve_node_sink::<S>(expr, r, trackable, snapshot, keep, sink),
+        // Resolution can only borrow from this local copy, so every branch
+        // is forced back to `Cow::Owned` before it can escape the borrow --
+        // exactly the clone cost this path always paid, neither more nor less.
+        Cow::Owned(v) => resolve_node_sink::<S>(expr, &v, trackable, snapshot, keep, &mut |b| {
+            sink(b.into_owned_value())
+        }),
     }
 }
 
@@ -27061,89 +27080,87 @@ fn resolve_static_tail<'a, S: EvalSemantics>(
     value_after_components::<S>(components, value.clone()).map_err(|e| (Vec::new(), e))
 }
 
-/// Apply a purely-static path tail to every branch, extending each branch's
-/// path with `tail` verbatim and threading its value through
-/// [`resolve_static_tail`]. On the first tail-application failure, returns
-/// whatever branches were already extended, paired with that failure —
-/// `resolve_seq`'s own `Err`-side "keep what already resolved" contract.
+/// Apply a purely-static path tail to one branch, extending its path with
+/// `tail` verbatim and threading its value through
+/// [`resolve_static_tail`].
 ///
-/// `resolve_seq` calls this exactly once, after its fan-out loop finishes —
-/// whether every element resolved cleanly or some element escaped along the
-/// way (#977, #1013). Funneling both outcomes through one call site is what
-/// keeps a purely-static tail (a literal `.foo`/`[N]`/`[N:M]`) from silently
-/// getting dropped off a partial, escaped prefix.
-fn apply_static_tail<'a, S: EvalSemantics>(
-    branches: Vec<PathBranch<'a>>,
+/// `Ok(None)` is a `?`-suppressed step in `tail` pruning the branch (#2124)
+/// -- zero output, not a fabricated `null` one. `Err` is a genuine tail
+/// failure; the caller keeps whatever it had already emitted, which is
+/// `resolve_seq`'s own "keep what already resolved" contract (#977, #1013).
+///
+/// [`resolve_seq_stage`] calls this on every branch that reaches the end of
+/// the fan-out -- whether it got there cleanly or is the partial output of
+/// a stage that then escaped -- which is what keeps a literal
+/// `.foo`/`[N]`/`[N:M]` tail from being dropped off an escaped prefix.
+fn apply_static_tail_one<'a, S: EvalSemantics>(
+    branch: PathBranch<'a>,
     tail: &[Expr],
-) -> PathResolveResult<'a> {
-    let mut out = vec_with_capacity(branches.len());
-    for PathBranch {
+) -> Result<Option<PathBranch<'a>>, EvalEscape> {
+    let PathBranch {
         path: prefix,
         value: current,
         trackable,
         snapshot,
         register,
-    } in branches
-    {
-        // A dynamic element as the pipe's last component (e.g. `.a[.k]`) is
-        // the common, still-trackable shape here, and leaves `tail` empty —
-        // reuse `current` directly rather than paying `resolve_static_tail`/
-        // `value_after_components`'s own clone-then-return-unchanged for a
-        // no-op walk. Anything else — a non-empty `tail`, or an untracked
-        // `current` even with an empty one (#843: `current` may be
-        // `Builtin::GetPath`'s own resolved-but-still-untracked result, see
-        // `resolve_static_tail`'s doc comment) — goes through the shared,
-        // trackable-aware helper.
-        let end: Cow<'a, OwnedValue> = if tail.is_empty() {
-            // #986: with no tail there is nothing to navigate *into*, so an
-            // untracked `current` is not this function's problem to raise —
-            // it passes through carrying its own flag, and whoever turns out
-            // to be the genuinely terminal consumer decides. That is what
-            // lets `path((1|.)[K])` blame `K` (via `resolve_index_expr`'s
-            // post-target check) rather than the literal, while `path(1|2)`
-            // still raises at `resolve_dynamic_indexes`.
-            current
-        } else {
-            match resolve_static_tail::<S>(tail, &current, trackable) {
-                Ok(Some(end)) => Cow::Owned(end),
-                // A `?`-suppressed step in `tail` prunes this branch
-                // entirely (#2124) — the same verdict a plain Comma sibling
-                // with no `?` failure at all would give by simply
-                // contributing zero branches, not one fabricated `null`
-                // branch at a path the value doesn't have this shape at.
-                Ok(None) => continue,
-                Err((_, e)) => return Err((out, e)),
-            }
-        };
-        // #701: no literal in-place `extend_from_slice` equivalent once
-        // `path` is `Rc`-based (a `Node` isn't a growable buffer) — this is
-        // an ordinary `extend_many`, the same class as every other
-        // multi-append site. `tail`'s length is bounded by the filter's own
-        // static suffix, not document depth, so this doesn't reopen an O(d²)
-        // hole; it's a small, honest constant-factor trade against the
-        // amortized `Vec` growth this replaces.
-        let path = PathPrefix::extend_many(&prefix, tail.iter().cloned());
-        out.push(PathBranch {
-            path,
-            value: end,
-            // A non-empty tail navigated successfully, which is only
-            // reachable when `trackable` held; an empty one changes nothing.
-            trackable,
-            // An empty tail hands `current` straight back, so a frozen
-            // variable snapshot survives it unchanged; a non-empty one
-            // navigated *into* the value and so produced a different one,
-            // which is no longer the snapshot (#1466).
-            snapshot: snapshot && tail.is_empty(),
-            // The register survives for exactly the same reason, and fails
-            // to for a different one: an empty tail navigates nothing, so a
-            // register live at `prefix` is still live here; a non-empty one
-            // *did* navigate, which by definition moves the register onto
-            // what it reached — at which point `trackable` already carries
-            // it and this field is not consulted (#1573).
-            register: register.filter(|_| tail.is_empty()),
-        });
-    }
-    Ok(out)
+    } = branch;
+    // A dynamic element as the pipe's last component (e.g. `.a[.k]`) is
+    // the common, still-trackable shape here, and leaves `tail` empty —
+    // reuse `current` directly rather than paying `resolve_static_tail`/
+    // `value_after_components`'s own clone-then-return-unchanged for a
+    // no-op walk. Anything else — a non-empty `tail`, or an untracked
+    // `current` even with an empty one (#843: `current` may be
+    // `Builtin::GetPath`'s own resolved-but-still-untracked result, see
+    // `resolve_static_tail`'s doc comment) — goes through the shared,
+    // trackable-aware helper.
+    let end: Cow<'a, OwnedValue> = if tail.is_empty() {
+        // #986: with no tail there is nothing to navigate *into*, so an
+        // untracked `current` is not this function's problem to raise —
+        // it passes through carrying its own flag, and whoever turns out
+        // to be the genuinely terminal consumer decides. That is what
+        // lets `path((1|.)[K])` blame `K` (via `resolve_index_expr`'s
+        // post-target check) rather than the literal, while `path(1|2)`
+        // still raises at `resolve_dynamic_indexes`.
+        current
+    } else {
+        match resolve_static_tail::<S>(tail, &current, trackable) {
+            Ok(Some(end)) => Cow::Owned(end),
+            // A `?`-suppressed step in `tail` prunes this branch
+            // entirely (#2124) — the same verdict a plain Comma sibling
+            // with no `?` failure at all would give by simply
+            // contributing zero branches, not one fabricated `null`
+            // branch at a path the value doesn't have this shape at.
+            Ok(None) => return Ok(None),
+            Err((_, e)) => return Err(e),
+        }
+    };
+    // #701: no literal in-place `extend_from_slice` equivalent once
+    // `path` is `Rc`-based (a `Node` isn't a growable buffer) — this is
+    // an ordinary `extend_many`, the same class as every other
+    // multi-append site. `tail`'s length is bounded by the filter's own
+    // static suffix, not document depth, so this doesn't reopen an O(d²)
+    // hole; it's a small, honest constant-factor trade against the
+    // amortized `Vec` growth this replaces.
+    let path = PathPrefix::extend_many(&prefix, tail.iter().cloned());
+    Ok(Some(PathBranch {
+        path,
+        value: end,
+        // A non-empty tail navigated successfully, which is only
+        // reachable when `trackable` held; an empty one changes nothing.
+        trackable,
+        // An empty tail hands `current` straight back, so a frozen
+        // variable snapshot survives it unchanged; a non-empty one
+        // navigated *into* the value and so produced a different one,
+        // which is no longer the snapshot (#1466).
+        snapshot: snapshot && tail.is_empty(),
+        // The register survives for exactly the same reason, and fails
+        // to for a different one: an empty tail navigates nothing, so a
+        // register live at `prefix` is still live here; a non-empty one
+        // *did* navigate, which by definition moves the register onto
+        // what it reached — at which point `trackable` already carries
+        // it and this field is not consulted (#1573).
+        register: register.filter(|_| tail.is_empty()),
+    }))
 }
 
 /// The register-relevant facts about one resolved step (#1573), bundled so
@@ -27325,37 +27342,61 @@ fn carry_register<'a>(
     }
 }
 
-/// Resolve a pipe of path nodes, threading the value left to right.
+/// Resolve a pipe of path nodes, threading the value left to right —
+/// depth-first, the way jq's own generator composition does.
 ///
 /// The threading is the whole point: a computed key sees the value reaching
 /// *its* position, which is the document root only when it sits at the top of
 /// the path. `path(.x | .a[.k])` resolves `.k` against `.x`, giving
 /// `["x","a","a"]`.
 ///
+/// **Depth-first, not stage-by-stage (#2178).** Each output of stage `i` is
+/// pushed straight into the *rest* of the pipe ([`resolve_seq_stage`]'s own
+/// recursion) before stage `i` is asked for its next output — where this
+/// function used to rebuild a whole `Vec` of branches per stage. Two
+/// consequences, both of them jq's behaviour:
+///
+/// - A downstream stage that raises stops the upstream generator on the
+///   spot, because the recursion's `Demand::Stop` reaches it. `path(range(3)
+///   | debug | .a)` calls `debug` exactly once, on `0`, then raises — jq's
+///   uncaught error aborts the whole computation rather than making it
+///   backtrack for `range`'s next candidate. The stage-batch form could not
+///   express that and called `debug` once per widened candidate (#2178).
+/// - A downstream *escape* is the one raised, not an earlier stage's, with
+///   no `deferred_escape` bookkeeping to arrange it: the branch that escapes
+///   later is simply reached first. Verified live against jq 1.7.1:
+///   `path(.a[(0,error("t1"))] | .c[(0,error("t2"))] | .foo)` on
+///   `{"a":[{"c":[{"foo":1}]}]}` raises `t2`.
+///
+/// A stage's own partial output still survives its escape and is threaded
+/// through everything after it (#1013) — it reached the sink before the
+/// escape did, which is exactly jq's "never un-emit" rule.
+///
 /// `register` (#2046) is an *externally known* path register, distinct from
-/// the one this function's own fan-out loop already carries stage-to-stage
+/// the one this function's own recursion already carries stage-to-stage
 /// via each [`PathBranch`]'s own `register` field (#1573/#2041) — this
 /// parameter is what seeds that mechanism in the first place, for the one
 /// caller that has a register from *outside* this call to inject:
 /// [`FoldRegister::resolve`], which has no other way to make a fold's own
 /// persistent register visible to a `$var` reference chained inside
 /// UPDATE/EXTRACT (`. as $x | reduce ... (0; $x.a; ...)` — see that
-/// function's own doc comment). `resolve_node`'s ordinary `Expr::Pipe` arm
-/// passes `None`: an ordinary pipe has no such outside register, only
+/// function's own doc comment). `resolve_node_sink`'s ordinary `Expr::Pipe`
+/// arm passes `None`: an ordinary pipe has no such outside register, only
 /// whatever it establishes for itself.
 ///
 /// Only ever consulted at the seed branch below, mirroring `trackable`/
 /// `snapshot`: once seeded, `reestablishes_register`/`carry_register`'s
 /// already-tested stage-to-stage rules take over unchanged, so this adds one
 /// new *source* for the carried register, not a new rule for recognising it.
-fn resolve_seq<'a, S: EvalSemantics>(
+fn resolve_seq_sink<'a, S: EvalSemantics>(
     exprs: &[Expr],
     value: &'a OwnedValue,
     trackable: bool,
     snapshot: bool,
     keep: Keep,
     register: Option<&'a OwnedValue>,
-) -> PathResolveResult<'a> {
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
     let mut flat = Vec::new();
     for e in exprs {
         push_path_components(&mut flat, e);
@@ -27366,7 +27407,7 @@ fn resolve_seq<'a, S: EvalSemantics>(
     // resolving those would expand nothing (each is already single-valued),
     // so there's no gain. A bare `.foo[]`/`.foo[]?` is different: it isn't
     // single-valued, so `needs_fanout_pass` (unlike `needs_path_prepass`)
-    // still routes it through the fan-out loop below rather than
+    // still routes it through the fan-out below rather than
     // `value_after_components`'s single-value assumption (#682). The
     // *value* still has to be threaded through a purely static tail, because
     // an enclosing `IndexExpr` indexes it: in `.a[.k].b[.j]`, `.j` applies to
@@ -27395,62 +27436,38 @@ fn resolve_seq<'a, S: EvalSemantics>(
     // bespoke message for it — still a hard error either way, never the
     // silent wrong-success #843 is about.
     let Some(last_dynamic) = flat.iter().rposition(needs_fanout_pass) else {
-        let end = match resolve_static_tail::<S>(&flat, value, trackable)? {
-            Some(end) => end,
+        let end = match resolve_static_tail::<S>(&flat, value, trackable) {
+            Ok(Some(end)) => end,
             // A `?`-suppressed step somewhere in this purely-static pipe
             // prunes the whole branch (#2124) — zero output, not a
             // fabricated `null` one; see `value_after_components`'s own
             // doc comment for why zero can only mean that here.
-            None => return Ok(Vec::new()),
+            Ok(None) => return ResolveFlow::Exhausted,
+            Err((_, e)) => return ResolveFlow::Escaped(e),
         };
         // `resolve_static_tail` above already raised for an untracked
         // value, so this is `true` in practice — carried rather than
         // asserted so the two can't drift.
         //
         // Snapshot survives only when `flat` is empty (#1591), the same
-        // rule `apply_static_tail` already applies for its own tail: an
+        // rule `apply_static_tail_one` already applies for its own tail: an
         // empty `flat` means the whole pipe was a no-op (`.`, `.?`, ...),
         // so `end` is `value` handed straight back, still whatever ambient
         // snapshot it already was. A non-empty `flat` genuinely navigated,
         // which breaks the frozen-pointer identity regardless of ambient.
         let branch_snapshot = snapshot && flat.is_empty();
-        return Ok(vec![PathBranch::passthrough(
+        let branch = PathBranch::passthrough(
             PathPrefix::from_components(flat),
             Cow::Owned(end),
             trackable,
             branch_snapshot,
-        )]);
+        );
+        return match sink(branch) {
+            Demand::Continue => ResolveFlow::Exhausted,
+            Demand::Stop => ResolveFlow::Stopped,
+        };
     };
 
-    // Fan out one pipe element at a time. Note this rebuilds `branches` stage
-    // by stage (every currently-active branch through element N, then all of
-    // those through element N+1, ...) rather than threading each branch
-    // depth-first through the *entire* remaining pipe the way jq's own
-    // generator composition does — so for a pipe with more than one dynamic
-    // element, an escape partway through a stage still drops every
-    // not-yet-reached sibling branch *at that same stage* (branches from an
-    // earlier stage's own fan-out that hadn't reached this stage yet). That
-    // is a known simplification, not a byte-for-byte reproduction of jq's
-    // stream order; the single-dynamic-element case (the overwhelmingly
-    // common one, and the one every #530 sibling repro exercises) is exact.
-    // What *does* survive an escape (#1013): the escaping branch's own
-    // partial output (everything it produced before hitting its escape) is
-    // still threaded through every remaining dynamic stage and the tail,
-    // exactly like a branch that never escaped at all — see below. That is
-    // what makes this function's `Err` *prefix content* faithful to jq's
-    // own pre-escape stream even across multiple dynamic stages (unlike
-    // `resolve_index_expr`/`resolve_slice_expr`'s own pre-#972 gap, a
-    // different failure mode where the prefix was too *long*, not too
-    // short) — confirmed for `first(.[]|.[]|.[])`-shaped multi-stage pipes
-    // by `test_first_path_truncation_keeps_full_multistage_pipe_path_972`.
-    // The stage-by-stage (not depth-first) rebuild above is still a real
-    // divergence, but only in *evaluation order*: a not-yet-reached sibling
-    // this function's own fan-out never gets to is also a sibling jq's real
-    // depth-first generator would never reach either, so no branch either
-    // side actually emits is lost — see #987/#820 for the separate,
-    // still-open question of whether a sibling that's never *reached* was
-    // nonetheless *evaluated* (side effects included) ahead of being pruned.
-    let tail = &flat[last_dynamic + 1..];
     // The root branch inherits this call's own trackability: seeding it
     // `true` regardless is what made `catch (getpath(["other"]) | .qqq)`
     // and `catch (select(true) | .y)` stop raising, since every later
@@ -27467,7 +27484,7 @@ fn resolve_seq<'a, S: EvalSemantics>(
     // the stage-to-stage carrying mechanism below; every subsequent stage
     // reads it as `carried_register`, exactly as it already would for a
     // register `resolve_leaf` established from inside this same call.
-    let mut branches: Vec<PathBranch<'a>> = vec![PathBranch::passthrough(
+    let seed = PathBranch::passthrough(
         PathPrefix::root(),
         Cow::Borrowed(value),
         trackable,
@@ -27477,242 +27494,222 @@ fn resolve_seq<'a, S: EvalSemantics>(
         None
     } else {
         register.map(Cow::Borrowed)
-    })];
-    // Set the first time any stage's branch escapes, and overwritten by any
-    // later stage's own escape (#1013) — mirroring the pre-existing "a later
-    // step's own failure outranks an earlier deferred one" rule this
-    // function already applies between the fan-out loop and
-    // `apply_static_tail` below (also used by `resolve_slice_expr`'s
-    // `target_escape`). This matches jq's real generator order: jq threads
-    // an already-yielded value all the way through the rest of the pipe
-    // (potentially hitting a *later* escape) before it ever backtracks to
-    // try a fan-out's next alternative, so a downstream escape is the one
-    // jq actually raises, not an earlier one it never got back to. Verified
-    // live against jq 1.7.1: `path(.a[(0,error("t1"))] | .c[(0,error("t2"))]
-    // | .foo)` on `{"a":[{"c":[{"foo":1}]}]}` raises `t2`, not `t1`.
-    let mut deferred_escape: Option<EvalEscape> = None;
-    for (stage_index, element) in flat[..=last_dynamic].iter().enumerate() {
-        // #2050: `keep` is this whole call's *terminal* demand (typically
-        // `Keep::First`, #987's "stop a generator after its first output"
-        // rule) — correct only for the position nothing else in this
-        // `resolve_seq` call follows. An earlier stage here is not that
-        // position whenever a *later stage in this same fan-out loop*
-        // still has to run: a `select`/filter downstream may reject that
-        // stage's first output and only accept a later one (`paths |
-        // select(length == 2) | .foo` needs `paths`'s *second* output,
-        // since its first is rejected), so truncating the generator to one
-        // value before the filter ever runs can turn a genuine "later
-        // output survives" pipe into a wrongly-empty result, or a
-        // wrongly-silent one — #1872's `resolve_fold_source` already
-        // established the fix for its own "needs every output" case
-        // (`Keep::AtMost(usize::MAX)`, not `Keep::First`); this reuses the
-        // identical value for the identical reason. Only `resolve_leaf`'s
-        // general non-primitive case actually reads `keep` at all (its own
-        // doc comment), so this widening is a no-op for every other arm
-        // (`Select` included, which ignores `keep` entirely) and only
-        // changes behavior for a bare generator builtin (`paths`, `range`,
-        // `keys`, ...) reached mid-pipe.
-        //
-        // `tail` (this call's own *static* trailing components — `Field`/
-        // `Index`/`Slice`, never `Select` or anything else that can reject
-        // — see `push_path_components`/`needs_path_prepass`) is deliberately
-        // NOT part of this condition, unlike an earlier version of this fix
-        // (#2050 code review): a static component can only either succeed
-        // with exactly one output or *error*, and an uncaught error aborts
-        // the whole evaluation rather than making jq backtrack and try an
-        // earlier stage's next candidate (confirmed live: `path(range(3) |
-        // debug | .a)` calls `debug` exactly once, on `0`, then raises —
-        // `1`/`2` are never even asked for, so `.a` being unconditionally
-        // erroring on a number is not a reason to widen `range`'s own
-        // `keep`). Gating on `tail.is_empty()` too made the truly-last
-        // fan-out stage (whatever precedes a non-empty static tail) widen
-        // unconditionally — silently reintroducing #987's regression
-        // (`path(paths | .a)`/`path(range(1_000_000) | .a)` fully
-        // materializing their generator before the static tail ever runs)
-        // for the overwhelmingly common "one dynamic stage, then a plain
-        // field/index" shape. `stage_index == last_dynamic` alone is sound
-        // regardless of `tail`'s contents: #2050's own repro still widens
-        // correctly, because `select` there occupies `last_dynamic` itself
-        // (not `paths`), so `paths` (`stage_index` 0 of 1) is unaffected by
-        // this change.
-        //
-        // A residual, narrower divergence remains for a *non-rejecting*
-        // builtin (`debug`, `stderr`, ...) sitting between two genuine
-        // fan-out stages with no filter between them (`path(range(3) |
-        // debug | .a)`): `debug` itself, now at `last_dynamic`, correctly
-        // gets the real `keep` regardless of `tail` — but `range` (an
-        // *earlier* fan-out-loop stage) still widens, because nothing here
-        // proves `debug` cannot reject a candidate the way `select` can.
-        // Live-verified this is not merely cosmetic: `path(range(1_000_000)
-        // | debug | .a)` calls `debug` 100,000 times here (a
-        // `RECURSE_MAX_ITEMS`-style cap, not the full million) against
-        // jq's own single call. Distinguishing "can this later stage ever
-        // reject" from "is this just the last static-tail-adjacent stage"
-        // needs a real reachable-rejection analysis this fix does not
-        // attempt — tracked as #2178 rather than folded in here.
-        let stage_keep = if stage_index == last_dynamic {
-            keep
-        } else {
-            Keep::AtMost(usize::MAX)
+    });
+    resolve_seq_stage::<S>(&flat, last_dynamic, 0, seed, keep, sink)
+}
+
+/// Collecting adapter over [`resolve_seq_sink`], for the callers that still
+/// want a materialized `Vec<PathBranch>` ([`FoldRegister::resolve`]).
+fn resolve_seq<'a, S: EvalSemantics>(
+    exprs: &[Expr],
+    value: &'a OwnedValue,
+    trackable: bool,
+    snapshot: bool,
+    keep: Keep,
+    register: Option<&'a OwnedValue>,
+) -> PathResolveResult<'a> {
+    let mut out = Vec::new();
+    let flow = resolve_seq_sink::<S>(
+        exprs,
+        value,
+        trackable,
+        snapshot,
+        keep,
+        register,
+        &mut |b| {
+            out.push(b);
+            Demand::Continue
+        },
+    );
+    match flow {
+        ResolveFlow::Exhausted | ResolveFlow::Stopped => Ok(out),
+        ResolveFlow::Escaped(e) => Err((out, e)),
+    }
+}
+
+/// Thread one branch through `flat[stage_index..]` and the static tail,
+/// depth-first — [`resolve_seq_sink`]'s recursion, one frame per pipe stage.
+///
+/// Each output of this stage is placed onto the incoming branch's prefix and
+/// immediately handed to the *next* stage, so a `Demand::Stop` from anywhere
+/// downstream (a bounded consumer, or an escape) reaches this stage's own
+/// producer before it is asked for another value.
+fn resolve_seq_stage<'a, S: EvalSemantics>(
+    flat: &[Expr],
+    last_dynamic: usize,
+    stage_index: usize,
+    branch: PathBranch<'a>,
+    keep: Keep,
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
+    if stage_index > last_dynamic {
+        return match apply_static_tail_one::<S>(branch, &flat[last_dynamic + 1..]) {
+            Ok(Some(b)) => match sink(b) {
+                Demand::Continue => ResolveFlow::Exhausted,
+                Demand::Stop => ResolveFlow::Stopped,
+            },
+            Ok(None) => ResolveFlow::Exhausted,
+            Err(e) => ResolveFlow::Escaped(e),
         };
-        // Whether this stage can carry a live path register across itself
-        // at all (#1573). `false` is the answer for every stage this
-        // resolver cannot see inside, because jq's register moves on any
-        // `INDEX` the stage executes — including the ones hidden in a
-        // jq-defined builtin (`first` is `.[0]`) or a user function body,
-        // which arrive here as one opaque computed value. See
-        // [`cannot_move_register`]: dropping the register merely costs a
-        // refusal, keeping a stale one fabricates a path.
-        let stage_preserves_register = cannot_move_register(element);
-        let mut next = Vec::new();
-        // Consumes `branches` (not `&branches`) so each `current` arrives by
-        // value: only then can `resolve_against_cow` recover the branch's
-        // full `'a` when it's still `Cow::Borrowed`, rather than capping it
-        // at this loop iteration's own short borrow (#668).
-        for PathBranch {
-            path: prefix,
-            value: current,
-            trackable: branch_trackable,
-            snapshot: branch_snapshot,
-            // The path register as it stands *entering* this stage (#1573).
-            //
-            // While `branch_trackable` holds, the register is `current`
-            // itself — but `current` is about to be moved into
-            // `resolve_against_cow`, and the step is the one that knows
-            // whether it navigated off it, so that case is left to the step
-            // (`resolve_leaf` records `current` as the register on the very
-            // transition that drops trackability). What has to be carried
-            // by hand is the *already*-untracked case, where the register
-            // is live somewhere behind us and no step below can see it any
-            // more.
-            register: carried_register,
-        } in branches
-        {
-            // #986: each branch carries its own trackability now, so this
-            // passes *that* rather than the single outer parameter. It is
-            // what makes `1 | .[K]` reach `resolve_index_expr` already
-            // knowing its target is untracked, which is how jq's "near
-            // attempt to access element K of 1" wording gets produced
-            // without any new context parameter (see #989).
-            // Where one step's output lands, for both the `Ok` fan-out and
-            // the partial prefix an escaping stage leaves behind. Written
-            // once rather than twice: the two arms differ only in which
-            // list they walk, and #1573's register re-establishment had
-            // already been fixed in the `Ok` arm alone once before the
-            // `Err` arm's identical omission was noticed.
-            let place_step = |step: PathBranch<'a>| -> PathBranch<'a> {
-                let PathBranch {
-                    path: components,
-                    value: resulting,
-                    trackable: step_trackable,
-                    snapshot: step_snapshot,
-                    register: step_register,
-                } = step;
-                let facts = StepRegisterFacts {
-                    navigated: components.depth() > 0,
-                    stage_preserves_register,
-                    step_snapshot,
-                };
-                // The register entering this step (#2044): while the branch
-                // was still trackable, the register was `current` itself,
-                // and `resolve_leaf` records that value as `step_register`
-                // on exactly the transition that drops trackability --
-                // `carried_register` is only ever populated once already
-                // untracked. Computed once and threaded into both this
-                // check and `carry_register` below, rather than each
-                // re-deriving it, so the jq-only mode gate
-                // (`trackable_step_register_eligible`) cannot drift between
-                // the two the way this file's own history already shows it
-                // can.
-                let trackable_step_eligible =
-                    trackable_step_register_eligible::<S>(branch_trackable);
-                let register_entering = if trackable_step_eligible {
-                    step_register.as_deref()
-                } else {
-                    carried_register.as_deref()
-                };
-                let reestablished = reestablishes_register(facts, register_entering, &resulting);
-                let path = if reestablished {
-                    Rc::clone(&prefix)
-                } else {
-                    PathPrefix::extend_many(&prefix, components.to_vec())
-                };
-                PathBranch {
-                    register: carry_register(
-                        facts,
-                        reestablished,
-                        trackable_step_eligible,
-                        &carried_register,
-                        step_register,
-                    ),
-                    path,
-                    value: resulting,
-                    // Untracked is absorbing: nothing downstream can
-                    // re-certify a value that was computed rather than
-                    // navigated to. Erring toward `false` is also the safe
-                    // direction — it can only turn a silent acceptance into
-                    // a loud error, never the reverse (#985's revert is what
-                    // the reverse looks like).
-                    //
-                    // #1573 adds the one exception jq itself has: untracked
-                    // is absorbing for *navigation*, but a `$var` whose
-                    // frozen value is still identical to the live register
-                    // is not navigation — jq's own `path_intact` compares
-                    // against `value_at_path`, which a literal never moved,
-                    // so the variable re-establishes the register's position
-                    // rather than reaching a new one. See
-                    // `reestablishes_register`.
-                    trackable: reestablished || (branch_trackable && step_trackable),
-                    // Unlike `trackable`, this comes from the *step* alone:
-                    // the value leaving this stage is the step's own output,
-                    // so `.a | $x` still hands back the frozen snapshot
-                    // whatever `.a` was, and `$x | .a` no longer is one
-                    // (#1466).
-                    //
-                    // A re-established branch is `trackable` again, and this
-                    // type's invariant is that `snapshot` implies
-                    // `!trackable`: a certified snapshot has resolved to a
-                    // real path and needs no second marker (#1573).
-                    snapshot: step_snapshot && !reestablished,
-                }
-            };
-            match resolve_against_cow::<S>(
-                element,
-                current,
-                branch_trackable,
-                branch_snapshot,
-                stage_keep,
-            ) {
-                Ok(resolved) => {
-                    for step in resolved {
-                        next.push(place_step(step));
-                    }
-                }
-                Err((partial, e)) => {
-                    for step in partial {
-                        next.push(place_step(step));
-                    }
-                    // Keep whatever this branch produced before its escape,
-                    // record the escape, and stop attempting any
-                    // not-yet-reached sibling at this stage (the "known
-                    // simplification" above) — but do *not* return early:
-                    // `next` still feeds the remaining dynamic stages
-                    // (#1013) exactly like a branch that never escaped,
-                    // since e.g. `.a[(0,error("t"))]`'s successful `0`
-                    // alternative still has to run through everything after
-                    // it (`.c[(0,1)] | .foo`) before jq would ever raise
-                    // `t`.
-                    deferred_escape = Some(e);
-                    break;
-                }
-            }
-        }
-        branches = next;
     }
 
-    match apply_static_tail::<S>(branches, tail) {
-        Ok(tailed) => path_result(tailed, deferred_escape),
-        Err(tail_err) => Err(tail_err),
+    let element = &flat[stage_index];
+    // #2050: `keep` is this whole call's *terminal* demand (typically
+    // `Keep::First`, #987's "stop a generator after its first output"
+    // rule) — correct only for the position nothing else in this pipe
+    // follows. An earlier stage is not that position: a `select`/filter
+    // downstream may reject that stage's first output and only accept a
+    // later one (`paths | select(length == 2) | .foo` needs `paths`'s
+    // *second* output), so truncating the generator to one value before the
+    // filter ever runs turns a genuine "later output survives" pipe into a
+    // wrongly-empty result. Only `resolve_leaf`'s general non-primitive case
+    // reads `keep` at all, so this widening is a no-op for every other arm.
+    //
+    // Widening is now *only* a materialization cost, never a side-effect
+    // one (#2178): the recursion below answers `Demand::Stop` the moment
+    // anything downstream escapes or is satisfied, so an earlier stage's
+    // widened generator stops being drained there. `path(range(1000000) |
+    // debug | .a)` calls `debug` once, matching jq, even though `range`
+    // itself is still resolved eagerly by `resolve_leaf`.
+    let stage_keep = if stage_index == last_dynamic {
+        keep
+    } else {
+        Keep::AtMost(usize::MAX)
+    };
+    // Whether this stage can carry a live path register across itself
+    // at all (#1573). `false` is the answer for every stage this
+    // resolver cannot see inside, because jq's register moves on any
+    // `INDEX` the stage executes — including the ones hidden in a
+    // jq-defined builtin (`first` is `.[0]`) or a user function body,
+    // which arrive here as one opaque computed value. See
+    // [`cannot_move_register`]: dropping the register merely costs a
+    // refusal, keeping a stale one fabricates a path.
+    let stage_preserves_register = cannot_move_register(element);
+
+    let PathBranch {
+        path: prefix,
+        value: current,
+        // #986: each branch carries its own trackability, so this passes
+        // *that* rather than a single outer parameter. It is what makes
+        // `1 | .[K]` reach `resolve_index_expr` already knowing its target
+        // is untracked, which is how jq's "near attempt to access element K
+        // of 1" wording gets produced without any new context parameter
+        // (see #989).
+        trackable: branch_trackable,
+        snapshot: branch_snapshot,
+        // The path register as it stands *entering* this stage (#1573).
+        //
+        // While `branch_trackable` holds, the register is `current`
+        // itself — but `current` is about to be moved into
+        // `resolve_against_cow_sink`, and the step is the one that knows
+        // whether it navigated off it, so that case is left to the step
+        // (`resolve_leaf` records `current` as the register on the very
+        // transition that drops trackability). What has to be carried
+        // by hand is the *already*-untracked case, where the register
+        // is live somewhere behind us and no step below can see it any
+        // more.
+        register: carried_register,
+    } = branch;
+
+    // Set when the recursion below reports anything other than
+    // `Exhausted`, which is also when this stage's own producer is told to
+    // stop. It outranks `flow`: a downstream escape is the one jq raises,
+    // because jq threads an already-yielded value all the way through the
+    // rest of the pipe before it ever backtracks to try this stage's next
+    // alternative.
+    let mut downstream: Option<ResolveFlow> = None;
+    let flow = resolve_against_cow_sink::<S>(
+        element,
+        current,
+        branch_trackable,
+        branch_snapshot,
+        stage_keep,
+        &mut |step| {
+            let PathBranch {
+                path: components,
+                value: resulting,
+                trackable: step_trackable,
+                snapshot: step_snapshot,
+                register: step_register,
+            } = step;
+            let facts = StepRegisterFacts {
+                navigated: components.depth() > 0,
+                stage_preserves_register,
+                step_snapshot,
+            };
+            // The register entering this step (#2044): while the branch
+            // was still trackable, the register was `current` itself,
+            // and `resolve_leaf` records that value as `step_register`
+            // on exactly the transition that drops trackability --
+            // `carried_register` is only ever populated once already
+            // untracked. Computed once and threaded into both this
+            // check and `carry_register` below, rather than each
+            // re-deriving it, so the jq-only mode gate
+            // (`trackable_step_register_eligible`) cannot drift between
+            // the two the way this file's own history already shows it
+            // can.
+            let trackable_step_eligible = trackable_step_register_eligible::<S>(branch_trackable);
+            let register_entering = if trackable_step_eligible {
+                step_register.as_deref()
+            } else {
+                carried_register.as_deref()
+            };
+            let reestablished = reestablishes_register(facts, register_entering, &resulting);
+            let path = if reestablished {
+                Rc::clone(&prefix)
+            } else {
+                PathPrefix::extend_many(&prefix, components.to_vec())
+            };
+            let placed = PathBranch {
+                register: carry_register(
+                    facts,
+                    reestablished,
+                    trackable_step_eligible,
+                    &carried_register,
+                    step_register,
+                ),
+                path,
+                value: resulting,
+                // Untracked is absorbing: nothing downstream can
+                // re-certify a value that was computed rather than
+                // navigated to. Erring toward `false` is also the safe
+                // direction — it can only turn a silent acceptance into
+                // a loud error, never the reverse (#985's revert is what
+                // the reverse looks like).
+                //
+                // #1573 adds the one exception jq itself has: untracked
+                // is absorbing for *navigation*, but a `$var` whose
+                // frozen value is still identical to the live register
+                // is not navigation — jq's own `path_intact` compares
+                // against `value_at_path`, which a literal never moved,
+                // so the variable re-establishes the register's position
+                // rather than reaching a new one. See
+                // `reestablishes_register`.
+                trackable: reestablished || (branch_trackable && step_trackable),
+                // Unlike `trackable`, this comes from the *step* alone:
+                // the value leaving this stage is the step's own output,
+                // so `.a | $x` still hands back the frozen snapshot
+                // whatever `.a` was, and `$x | .a` no longer is one
+                // (#1466).
+                //
+                // A re-established branch is `trackable` again, and this
+                // type's invariant is that `snapshot` implies
+                // `!trackable`: a certified snapshot has resolved to a
+                // real path and needs no second marker (#1573).
+                snapshot: step_snapshot && !reestablished,
+            };
+            match resolve_seq_stage::<S>(flat, last_dynamic, stage_index + 1, placed, keep, sink) {
+                ResolveFlow::Exhausted => Demand::Continue,
+                other => {
+                    downstream = Some(other);
+                    Demand::Stop
+                }
+            }
+        },
+    );
+    match downstream {
+        Some(f) => f,
+        None => flow,
     }
 }
 
@@ -68419,7 +68416,7 @@ mod tests {
         );
         // A different generator builtin (`range`, not `paths`) reproduces
         // the identical shape, confirming this is `resolve_seq`'s own
-        // stage-by-stage `keep` propagation, not something specific to
+        // per-stage `keep` propagation, not something specific to
         // `paths`'s own resolve_node handling. Confirmed live: jq raises
         // on `2` here (the first candidate `select` actually lets
         // through), never on `0` (the generator's own first output).
