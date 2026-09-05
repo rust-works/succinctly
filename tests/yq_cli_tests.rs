@@ -32256,6 +32256,88 @@ fn test_owned_identity_rules_match_yq_2416() -> Result<()> {
     Ok(())
 }
 
+/// Spine 2416 gate reason 3 (#2473): `and`/`or` with a path-context operand,
+/// against yq v4.53.3.
+///
+/// Captured 2026-09-06 on `a: 1\nb: 2\n`, `-o=json -I=0`:
+///
+/// ```text
+/// $ yq '.[] | key == "a" and true'          true / false
+/// $ yq '.[] | (key == "b") or false'        false / true
+/// $ yq '.[] | key and true'                 true / true
+/// $ yq '.[] | select(key == "a" and . == 1)' 1
+/// $ yq '.[] | {"k": (key and true)}'        {"k":true} / {"k":true}
+/// $ yq '.[] | [key, (key == "a" and true)]' ["a",true] / ["b",false]
+/// $ yq 'key and true'                       false
+/// $ yq 'key or false'                       false
+/// $ yq 'parent and true'                    false
+/// ```
+///
+/// `{"k": (key and true)}` was `{"k":false}` before this arm and is the row
+/// the migration is *for*: the object's value expression is single-evaluated,
+/// so an `and` inside it had no cursor until `eval_single` gained an arm.
+/// The three root rows are #2460's empty-operand rule (`key`/`parent` at the
+/// root emit nothing, and a zero-output operand contributes one `false`),
+/// unchanged by this arm because both routes read it from
+/// `yq_empty_operand_output`.
+///
+/// **One divergence stays, and it is not this arm's:** real yq evaluates an
+/// `and`/`or` *operand* against the document **root**, not against the node
+/// the pipe stands on. Captured on `a: {b: 1}\nc: [10, 20]\n`:
+///
+/// ```text
+/// $ yq '.a | true and .b'        false   (`.b` resolved at the root)
+/// $ yq '.a | true and .a.b'      true
+/// $ yq '.c | true and .[0]'      false
+/// $ yq '.a | true and (key)'     false   (`key` at the root is nothing)
+/// $ yq '.a | key and parent'     false   (ditto for `parent`)
+/// $ yq '.a | .b and true'        true    (the *left* operand is not re-rooted)
+/// $ yq '.a | 0 + .b'             1       (arithmetic is not re-rooted either)
+/// ```
+///
+/// succinctly evaluates both operands at the current node in both modes, so
+/// it answers `true` for `.a | key and parent`. That predates this arm (the
+/// eager route answered `true` too) and is orthogonal to path context --
+/// `.a | true and .b` diverges with no path-context builtin anywhere -- so it
+/// is recorded here rather than encoded.
+#[test]
+fn test_and_or_keep_path_context_2473() -> Result<()> {
+    let args = &["-o=json", "-I=0"];
+    let doc = "a: 1\nb: 2\n";
+    for (filter, expected) in [
+        (".[] | key == \"a\" and true", "true\nfalse"),
+        (".[] | (key == \"b\") or false", "false\ntrue"),
+        (".[] | key and true", "true\ntrue"),
+        (".[] | select(key == \"a\" and . == 1)", "1"),
+        (
+            ".[] | {\"k\": (key and true)}",
+            "{\"k\":true}\n{\"k\":true}",
+        ),
+        (
+            ".[] | [key, (key == \"a\" and true)]",
+            "[\"a\",true]\n[\"b\",false]",
+        ),
+        ("key and true", "false"),
+        ("key or false", "false"),
+        ("parent and true", "false"),
+    ] {
+        let (output, code) = run_yq_stdin(filter, doc, args)?;
+        assert_eq!(code, 0, "`{filter}`: {output:?}");
+        assert_eq!(output.trim(), expected, "`{filter}`");
+    }
+    // The re-rooted-operand divergence above, pinned as succinctly's own
+    // answer so a future fix has to move this row deliberately.
+    for (filter, expected) in [
+        (".a | key and parent", "true"),
+        (".a | true and .b", "true"),
+    ] {
+        let (output, code) = run_yq_stdin(filter, "a: {b: 1}\nc: [10, 20]\n", args)?;
+        assert_eq!(code, 0, "`{filter}`: {output:?}");
+        assert_eq!(output.trim(), expected, "`{filter}`");
+    }
+    Ok(())
+}
+
 const OWNED_IDENTITY_DOC_2416: &str = "a:\n  b: [1, 2, 3]\n  c: x\n  d: {e: 5}\nz: 9\n";
 
 /// `(filter, expected stdout)`, captured from yq v4.53.3; an empty expected

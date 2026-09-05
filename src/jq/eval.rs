@@ -6090,20 +6090,54 @@ fn boolean_fanout_core<'a, W: Clone + AsRef<[u64]>>(
     short_circuit: bool,
     rules: BinaryFanoutRules,
 ) -> QueryResult<'a, W> {
+    let (out, control) = boolean_fanout_bools(
+        |expr, bools| push_truthiness(eval_operand(expr), bools),
+        left,
+        right,
+        short_circuit,
+        rules,
+    );
+    match control {
+        Some(control) => partial(out.into_iter().map(OwnedValue::Bool).collect(), control),
+        None => bools_to_result(out),
+    }
+}
+
+/// [`boolean_fanout_core`]'s algorithm with the result type factored out:
+/// the loop only ever needs one truthiness bit per operand output, so the
+/// operand strategy pushes bits and this returns bits, leaving each caller
+/// to build its own result from them.
+///
+/// The generic evaluator's `and`/`or` arm (`eval_generic::eval_boolean_generic`,
+/// spine 2416 gate reason 3) is the second caller. It threads a cursor into
+/// both operands, which `QueryResult` cannot carry, so sharing the *body*
+/// rather than copying it is what keeps #2460's empty-operand rule and
+/// #2470's read-only scope from drifting between the two routes -- the same
+/// "one definition, plus a test that the call sites agree" rule
+/// [`binary_fanout_core`] and `eval_generic::binary_fanout_each_generic`
+/// already follow for arithmetic and comparison.
+pub(crate) fn boolean_fanout_bools(
+    mut push_operand: impl FnMut(&Expr, &mut Vec<bool>) -> Option<Control>,
+    left: &Expr,
+    right: &Expr,
+    short_circuit: bool,
+    rules: BinaryFanoutRules,
+) -> (Vec<bool>, Option<Control>) {
     // #2470 (yq mode): `and`/`or` evaluate both operands read-only, exactly
     // like arithmetic -- `(.zzz | key) and true` is `false` in real yq while
-    // `"zzz" and true` is `true`. This operand strategy is eager (a whole
-    // `QueryResult` per call, not a sink), so there is nothing to suspend:
-    // the scope covers only the call itself.
-    let mut eval_operand = move |expr: &Expr| {
+    // `"zzz" and true` is `true`. Both operand strategies are eager (a whole
+    // result per call, not a sink), so there is nothing to suspend: the scope
+    // covers only the call itself, and the truthiness push inside it does no
+    // key lookup for `yq_absent_key_read_is_empty` to answer.
+    let mut push_operand = move |expr: &Expr, bools: &mut Vec<bool>| {
         if !rules.read_only {
-            return eval_operand(expr);
+            return push_operand(expr, bools);
         }
         let _scope = yq_read_only_context::enter();
-        eval_operand(expr)
+        push_operand(expr, bools)
     };
     let mut left_bools = Vec::new();
-    let left_control = push_truthiness(eval_operand(left), &mut left_bools);
+    let left_control = push_operand(left, &mut left_bools);
     // #2460 (yq mode only): an operand that produced *zero* outputs
     // contributes one `false` truthiness value, which is the whole of yq's
     // captured `and`/`or` behaviour -- `and` then short-circuits to `false`
@@ -6122,18 +6156,15 @@ fn boolean_fanout_core<'a, W: Clone + AsRef<[u64]>>(
             continue;
         }
         let before = out.len();
-        if let Some(control) = push_truthiness(eval_operand(right), &mut out) {
-            return partial(out.into_iter().map(OwnedValue::Bool).collect(), control);
+        if let Some(control) = push_operand(right, &mut out) {
+            return (out, Some(control));
         }
         if out.len() == before {
             out.extend(empty_boolean_operand(rules.empty));
         }
     }
 
-    match left_control {
-        Some(control) => partial(out.into_iter().map(OwnedValue::Bool).collect(), control),
-        None => bools_to_result(out),
-    }
+    (out, left_control)
 }
 
 /// Backs `eval_arithmetic`/`eval_compare`. Operands are evaluated through
