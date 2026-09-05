@@ -37325,3 +37325,224 @@ fn test_foreach_init_fork_null_register_still_tracks_2388() -> Result<()> {
     assert!(stderr.contains(r#"element "a" of null"#), "{stderr:?}");
     Ok(())
 }
+
+/// #2440: the full SOURCE x INIT escape matrix for `foreach` and `reduce`,
+/// captured from `/usr/bin/jq` 1.7.1 (`jq-1.7.1-apple`, **not** the Homebrew
+/// 1.8.2) on 2026-09-05 with `{"a":1}` on stdin and `-c`.
+///
+/// jq evaluates a fold's INIT **before** it ever pulls the first SOURCE
+/// output, so INIT's own escape always wins and a zero-output INIT leaves
+/// SOURCE unevaluated entirely -- side effects (`halt_error`) included.
+/// succinctly pulled SOURCE first, so a SOURCE whose first output escaped hid
+/// INIT's error/halt/break; 62 of the 168 cells below moved when that was
+/// fixed, and they are marked `// #2440` in the table.
+///
+/// Each query is `label $out | KIND (SOURCE) as $x (INIT; .)`, optionally
+/// wrapped in `[...]`; the `label` is uniform so the `break $out` rows have
+/// somewhere to land. A cell is `stdout|exit|stderr`. Every cell in this
+/// matrix produces at most one output line, so `stdout` is that line spelled
+/// literally (empty for no output). `stderr` is empty (silent), `E:msg`
+/// (`jq: error (at <stdin>:N): msg`) or `H` (`halt_error`'s own dump of the
+/// current input, `{"a":1}`).
+///
+/// The four cells per row are, in order: `foreach` bare, `foreach` in
+/// `[...]`, `reduce` bare, `reduce` in `[...]`.
+///
+/// Shapes worth reading directly out of the table:
+///
+/// - `(1, error("in"))` x `error("init")` => `init` (was `in`) -- the
+///   headline repro from the issue.
+/// - `halt_error` x `empty` => exit 0, nothing on stderr: SOURCE's halt never
+///   runs, because INIT produced no fork to run it for.
+/// - `(1, error("in"))` x `(0, error("init"))` => `0` then `in`: INIT's
+///   *trailing* error is still outranked, because fork 1 runs SOURCE to
+///   completion first and SOURCE escapes there. Ordering, not precedence.
+/// - `1` x `(0, error("init"))` => `0` then `init`, and `[...]`-wrapped it is
+///   just `init`: the array constructor never completes.
+#[test]
+fn test_fold_init_before_source_escape_matrix_2440() -> Result<()> {
+    const INPUT: &str = r#"{"a":1}"#;
+    // (SOURCE, INIT, [foreach bare, foreach [...], reduce bare, reduce [...]])
+    let rows: &[(&str, &str, [&str; 4])] = &[
+        ("1", "0", ["0|0|", "[0]|0|", "0|0|", "[0]|0|"]),
+        (
+            "1",
+            "error(\"init\")",
+            ["|5|E:init", "|5|E:init", "|5|E:init", "|5|E:init"],
+        ),
+        ("1", "halt_error", ["|5|H", "|5|H", "|5|H", "|5|H"]),
+        (
+            "1",
+            "(0, error(\"init\"))",
+            ["0|5|E:init", "|5|E:init", "0|5|E:init", "|5|E:init"],
+        ),
+        ("1", "break $out", ["|0|", "|0|", "|0|", "|0|"]),
+        ("1", "empty", ["|0|", "[]|0|", "|0|", "[]|0|"]),
+        (
+            "(1, error(\"in\"))",
+            "0",
+            ["0|5|E:in", "|5|E:in", "|5|E:in", "|5|E:in"],
+        ),
+        (
+            "(1, error(\"in\"))",
+            "error(\"init\")",
+            ["|5|E:init", "|5|E:init", "|5|E:init", "|5|E:init"],
+        ), // #2440
+        (
+            "(1, error(\"in\"))",
+            "halt_error",
+            ["|5|H", "|5|H", "|5|H", "|5|H"],
+        ), // #2440
+        (
+            "(1, error(\"in\"))",
+            "(0, error(\"init\"))",
+            ["0|5|E:in", "|5|E:in", "|5|E:in", "|5|E:in"],
+        ),
+        (
+            "(1, error(\"in\"))",
+            "break $out",
+            ["|0|", "|0|", "|0|", "|0|"],
+        ), // #2440
+        (
+            "(1, error(\"in\"))",
+            "empty",
+            ["|0|", "[]|0|", "|0|", "[]|0|"],
+        ), // #2440
+        (
+            "error(\"in\")",
+            "0",
+            ["|5|E:in", "|5|E:in", "|5|E:in", "|5|E:in"],
+        ),
+        (
+            "error(\"in\")",
+            "error(\"init\")",
+            ["|5|E:init", "|5|E:init", "|5|E:init", "|5|E:init"],
+        ), // #2440
+        (
+            "error(\"in\")",
+            "halt_error",
+            ["|5|H", "|5|H", "|5|H", "|5|H"],
+        ), // #2440
+        (
+            "error(\"in\")",
+            "(0, error(\"init\"))",
+            ["|5|E:in", "|5|E:in", "|5|E:in", "|5|E:in"],
+        ),
+        ("error(\"in\")", "break $out", ["|0|", "|0|", "|0|", "|0|"]), // #2440
+        ("error(\"in\")", "empty", ["|0|", "[]|0|", "|0|", "[]|0|"]),  // #2440
+        ("(1, halt_error)", "0", ["0|5|H", "|5|H", "|5|H", "|5|H"]),
+        (
+            "(1, halt_error)",
+            "error(\"init\")",
+            ["|5|E:init", "|5|E:init", "|5|E:init", "|5|E:init"],
+        ), // #2440
+        (
+            "(1, halt_error)",
+            "halt_error",
+            ["|5|H", "|5|H", "|5|H", "|5|H"],
+        ),
+        (
+            "(1, halt_error)",
+            "(0, error(\"init\"))",
+            ["0|5|H", "|5|H", "|5|H", "|5|H"],
+        ),
+        (
+            "(1, halt_error)",
+            "break $out",
+            ["|0|", "|0|", "|0|", "|0|"],
+        ), // #2440
+        ("(1, halt_error)", "empty", ["|0|", "[]|0|", "|0|", "[]|0|"]), // #2440
+        ("halt_error", "0", ["|5|H", "|5|H", "|5|H", "|5|H"]),
+        (
+            "halt_error",
+            "error(\"init\")",
+            ["|5|E:init", "|5|E:init", "|5|E:init", "|5|E:init"],
+        ), // #2440
+        ("halt_error", "halt_error", ["|5|H", "|5|H", "|5|H", "|5|H"]),
+        (
+            "halt_error",
+            "(0, error(\"init\"))",
+            ["|5|H", "|5|H", "|5|H", "|5|H"],
+        ),
+        ("halt_error", "break $out", ["|0|", "|0|", "|0|", "|0|"]), // #2440
+        ("halt_error", "empty", ["|0|", "[]|0|", "|0|", "[]|0|"]),  // #2440
+        ("empty", "0", ["|0|", "[]|0|", "0|0|", "[0]|0|"]),
+        (
+            "empty",
+            "error(\"init\")",
+            ["|5|E:init", "|5|E:init", "|5|E:init", "|5|E:init"],
+        ),
+        ("empty", "halt_error", ["|5|H", "|5|H", "|5|H", "|5|H"]),
+        (
+            "empty",
+            "(0, error(\"init\"))",
+            ["|5|E:init", "|5|E:init", "0|5|E:init", "|5|E:init"],
+        ),
+        ("empty", "break $out", ["|0|", "|0|", "|0|", "|0|"]),
+        ("empty", "empty", ["|0|", "[]|0|", "|0|", "[]|0|"]),
+        ("(1, break $out)", "0", ["0|0|", "|0|", "|0|", "|0|"]),
+        (
+            "(1, break $out)",
+            "error(\"init\")",
+            ["|5|E:init", "|5|E:init", "|5|E:init", "|5|E:init"],
+        ), // #2440
+        (
+            "(1, break $out)",
+            "halt_error",
+            ["|5|H", "|5|H", "|5|H", "|5|H"],
+        ), // #2440
+        (
+            "(1, break $out)",
+            "(0, error(\"init\"))",
+            ["0|0|", "|0|", "|0|", "|0|"],
+        ),
+        (
+            "(1, break $out)",
+            "break $out",
+            ["|0|", "|0|", "|0|", "|0|"],
+        ),
+        ("(1, break $out)", "empty", ["|0|", "[]|0|", "|0|", "[]|0|"]), // #2440
+    ];
+    for (source, init, cells) in rows {
+        for (cell, (kind, wrap)) in cells.iter().zip([
+            ("foreach", false),
+            ("foreach", true),
+            ("reduce", false),
+            ("reduce", true),
+        ]) {
+            let core = format!("{kind} ({source}) as $x ({init}; .)");
+            let core = if wrap { format!("[{core}]") } else { core };
+            let filter = format!("label $out | {core}");
+            let (stdout, stderr, code) = run_jq_stdin_streams(&filter, INPUT, &["-c"])?;
+
+            let mut parts = cell.splitn(3, '|');
+            let want_out = parts.next().expect("stdout field");
+            let want_code: i32 = parts.next().expect("exit field").parse()?;
+            let want_err = parts.next().expect("stderr field");
+
+            let want_stdout = if want_out.is_empty() {
+                String::new()
+            } else {
+                format!("{want_out}\n")
+            };
+            assert_eq!(stdout, want_stdout, "`{filter}` stdout");
+            assert_eq!(code, want_code, "`{filter}` exit; stderr: {stderr:?}");
+            match want_err {
+                "" => assert_eq!(stderr, "", "`{filter}` must be silent"),
+                "H" => assert_eq!(
+                    stderr.trim_end(),
+                    INPUT,
+                    "`{filter}` must be `halt_error`'s own dump"
+                ),
+                msg => {
+                    let msg = msg.strip_prefix("E:").expect("stderr field kind");
+                    assert!(
+                        stderr.starts_with("jq: error ") && stderr.trim_end().ends_with(msg),
+                        "`{filter}` wanted error `{msg}`, got {stderr:?}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}

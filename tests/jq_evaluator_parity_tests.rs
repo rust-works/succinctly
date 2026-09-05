@@ -1527,6 +1527,57 @@ fn test_parity_foreach_reduce_init_fork_source_reads_ambient_input_2163() {
     }
 }
 
+/// #2440: both front ends must evaluate INIT *before* the first SOURCE pull,
+/// so INIT's own error outranks a SOURCE that errors on its first output.
+/// Captured from /usr/bin/jq 1.7.1 on `{"a":1}`: `foreach (1, error("in"))
+/// as $x (error("init"); .)` reports `init`, and `reduce`'s twin does too;
+/// succinctly reported `in` from both front ends before the fix.
+///
+/// The two front ends share `eval_foreach_with_values`/
+/// `eval_reduce_with_values` (see the #2163 test above for what that does and
+/// does not prove), but the ordering being pinned here is *each front end's
+/// own*: the fix moved the INIT evaluation out of the callers' hand-rolled
+/// prologues and into a `source` closure the shared core decides whether to
+/// call at all, so a front end that reverted to evaluating SOURCE eagerly
+/// would fail here while still compiling.
+#[test]
+fn test_parity_fold_init_evaluated_before_source_2440() {
+    for filter in [
+        r#"foreach (1, error("in")) as $x (error("init"); .)"#,
+        r#"reduce (1, error("in")) as $x (error("init"); .)"#,
+        r#"foreach error("in") as $x (error("init"); .)"#,
+        r#"reduce error("in") as $x (error("init"); .)"#,
+    ] {
+        assert_error_parity(br#"{"a":1}"#, filter);
+        // Parity alone would be satisfied by both front ends reporting
+        // `in`, which is exactly the pre-fix behaviour -- so name the
+        // message jq gives.
+        let index = JsonIndex::build(br#"{"a":1}"#);
+        let expr = parse(filter).expect("parse failed");
+        let full: QueryResult<Vec<u64>> =
+            eval::<Vec<u64>, JqSemantics>(&expr, index.root(br#"{"a":1}"#));
+        match full {
+            QueryResult::Error(e) => assert_eq!(e.message, "init", "`{filter}`"),
+            other => panic!("`{filter}` did not raise: {:?}", other.collect_owned()),
+        }
+    }
+    // A zero-output INIT never pulls SOURCE at all, in either front end:
+    // jq 1.7.1's `[foreach error("in") as $x (empty; .)]` is `[]`, exit 0.
+    for filter in [
+        r#"[foreach error("in") as $x (empty; .)]"#,
+        r#"[reduce error("in") as $x (empty; .)]"#,
+        r#"[foreach (1, error("in")) as $x (empty; .)]"#,
+        r#"[reduce (1, error("in")) as $x (empty; .)]"#,
+    ] {
+        assert_parity(br#"{"a":1}"#, filter);
+        assert_eq!(
+            as_strs(&generic_outputs(br#"{"a":1}"#, filter)),
+            ["[]"],
+            "`{filter}` must not reach SOURCE at all"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // #2416 phase 0, axis three: the cursor walk vs the materializing bridge.
 //
