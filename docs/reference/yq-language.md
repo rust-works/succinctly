@@ -480,6 +480,7 @@ same kind of thing as the rest of this table — extra, off by default.
 | `--no-doc`            | Omit document separators (`---`)              |
 | `--tab`               | Use tabs for indentation (write-only — see [Known Limitations](#known-limitations)) |
 | `--split-exp EXPR`    | Split output into one file per result (below) |
+| `-S, --sort-keys`     | Sort mapping keys in output (succinctly extension — real yq has no such flag) |
 
 ### `--front-matter`
 
