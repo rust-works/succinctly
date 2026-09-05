@@ -43,11 +43,11 @@ use super::eval::{
     has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
     index_one_owned as index_owned_by_key, is_pure_chain_link, is_retryable_stop, literal_to_owned,
     needs_path_context, numeric_key_to_array_index, numeric_key_to_index, owned_bound_to_i64,
-    owned_to_string, prefer_pending_control, slice_object_as_yq_children, slice_owned_value_read,
-    streams_escaped_generator_prefix, substitute_bound_var, substitute_vars, suppress_or_raise,
-    suppresses, tonumber_from_str, vec_with_capacity, yq_negative_index_check, Control, Demand,
-    EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail, QueryResult,
-    YqSemantics,
+    owned_to_string, prefer_pending_control, slice_component_value, slice_object_as_yq_children,
+    slice_owned_value_read, streams_escaped_generator_prefix, substitute_bound_var,
+    substitute_vars, suppress_or_raise, suppresses, tonumber_from_str, vec_with_capacity,
+    yq_negative_index_check, Control, Demand, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics,
+    LimitN, PathTrail, QueryResult, YqSemantics,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -5738,6 +5738,18 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 return GenericResult::One(value);
             }
 
+            // #2416 step 3: the owned identity pipe lives in the sink route;
+            // the staged fold below would hand its owned values to
+            // `eval_on_owned` with no position.
+            if owned_identity_pipe_applies(exprs) {
+                return collect_each_generic::<S, V>(
+                    &Expr::Pipe(exprs.clone()),
+                    value,
+                    optional,
+                    cursor,
+                );
+            }
+
             let current = eval_single::<S, _>(&exprs[0], value, optional, cursor);
             fold_pipe_stages::<S, V>(current, &exprs[1..], optional)
         }
@@ -7424,12 +7436,41 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
     }
 
     let mut downstream: Option<Flow> = None;
+    // #2416 step 3: an owned value leaving the cursor domain at `first`
+    // carries its identity into the rest of the pipe when a later stage
+    // reads path context. Decided once, statically, so the per-item closure
+    // pays nothing for the ordinary pipe.
+    let identity_from_first = cursor.filter(|_| {
+        rest.iter().any(needs_path_context)
+            && !path_context_is_navigational(first)
+            && !path_context_stage_preserves_node(first)
+            && !needs_path_context(first)
+            && owned_identity_rule(first).is_some()
+            && owned_identity_pipe_supported(rest)
+    });
     // Same once-per-driver cache as `drive_pipe_elements_generic` (#1598):
     // this closure also runs once per item stage 1 produces.
     let mut rest = RestPipe::new(rest);
     let upstream = {
         let mut driver = |item: GenericItem<V>| -> Demand {
-            let flow = continue_pipe_element_generic::<S, V>(item, &mut rest, optional, &mut *sink);
+            let flow = match identity_from_first {
+                Some(c) => match owned_identity_materialize::<V>(item) {
+                    Ok(o) => match owned_identity_leaving_cursor::<S, V>(first, c, &o, optional) {
+                        Ok(id) => eval_owned_identity_pipe::<S, V>(
+                            rest.stages(),
+                            o,
+                            id.unwrap_or_else(OwnedIdentity::detached),
+                            optional,
+                            &mut *sink,
+                        ),
+                        Err(e) => Flow::Escaped(Control::Error(e)),
+                    },
+                    Err(control) => Flow::Escaped(control),
+                },
+                None => {
+                    continue_pipe_element_generic::<S, V>(item, &mut rest, optional, &mut *sink)
+                }
+            };
             match flow {
                 Flow::Exhausted => Demand::Continue,
                 other => {
@@ -11180,6 +11221,12 @@ fn path_context_needs_eager(exprs: &[Expr]) -> bool {
     if !exprs.iter().any(needs_path_context) {
         return false;
     }
+    // #2416 step 3: a pipe that leaves the cursor domain at a stage the
+    // owned identity pipe can follow is answered there, whatever the stages
+    // after it are.
+    if owned_identity_pipe_applies(exprs) {
+        return false;
+    }
     let mut is_node = true;
     let mut can_absent = false;
     // #2416 step 2: a head that can miss no longer sends the pipe here on
@@ -11721,20 +11768,33 @@ fn path_component_literal(component: &OwnedValue) -> Expr {
 /// which is the silent-fallback failure ADR-0021 was written to end. The
 /// `_` arm is reached only for a subtree with no path-context builtin in it.
 fn path_context_resolve_absent<V: DocumentValue>(expr: &Expr, pos: &PathContextPos<V>) -> Expr {
+    // An absent position always has at least one component -- it took a
+    // `.a`/`[i]` step to become absent -- so its key is the walk's own
+    // `path.last()`.
+    path_context_resolve_constants(expr, pos.path.last(), &pos.path)
+}
+
+/// [`path_context_resolve_absent`]'s worker, over the constants themselves:
+/// `key` is `None` where it emits nothing (the document root, #2421, or a
+/// detached owned root, #2416 step 3), and `path` is the full path. Shared
+/// with the owned identity pipe, whose `key`/`path` inside a `select`/`[..]`
+/// are constants for the same reason.
+fn path_context_resolve_constants(
+    expr: &Expr,
+    key: Option<&OwnedValue>,
+    path: &[OwnedValue],
+) -> Expr {
     if !needs_path_context(expr) {
         return expr.clone();
     }
-    let boxed = |e: &Expr| Box::new(path_context_resolve_absent::<V>(e, pos));
+    let boxed = |e: &Expr| Box::new(path_context_resolve_constants(e, key, path));
     match expr {
-        // `key` at the document root emits nothing (#2421). An absent
-        // position always has at least one component -- it took a `.a`/`[i]`
-        // step to become absent -- so this is the walk's own `path.last()`.
-        Expr::Builtin(Builtin::Key) => match pos.path.last() {
+        Expr::Builtin(Builtin::Key) => match key {
             Some(component) => path_component_literal(component),
             None => Expr::Builtin(Builtin::Empty),
         },
         Expr::Builtin(Builtin::PathNoArg) => {
-            let components: Vec<Expr> = pos.path.iter().map(path_component_literal).collect();
+            let components: Vec<Expr> = path.iter().map(path_component_literal).collect();
             Expr::Array(Box::new(match components.len() {
                 0 => Expr::Builtin(Builtin::Empty),
                 1 => components.into_iter().next().expect("len checked"),
@@ -11760,13 +11820,13 @@ fn path_context_resolve_absent<V: DocumentValue>(expr: &Expr, pos: &PathContextP
         Expr::Comma(exprs) => Expr::Comma(
             exprs
                 .iter()
-                .map(|e| path_context_resolve_absent::<V>(e, pos))
+                .map(|e| path_context_resolve_constants(e, key, path))
                 .collect(),
         ),
         Expr::Pipe(exprs) => Expr::Pipe(
             exprs
                 .iter()
-                .map(|e| path_context_resolve_absent::<V>(e, pos))
+                .map(|e| path_context_resolve_constants(e, key, path))
                 .collect(),
         ),
         Expr::Limit { n, expr } => Expr::Limit {
@@ -13186,6 +13246,799 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // callers (tracked separately as #2280).
             let owned = owned_or_suppress!(to_owned_with_cursor(&value, cursor), optional);
             eval_on_owned::<S, _>(&Expr::Builtin(builtin.clone()), owned, optional)
+        }
+    }
+}
+
+// ===========================================================================
+// #2416 step 3: path context through owned containers
+// ===========================================================================
+
+/// Where an owned value stands in the document (#2416 step 3).
+///
+/// Real yq's nodes carry parent pointers, and a builtin that builds a new
+/// value either hands it the input node's *position* (`to_entries`, `sort`,
+/// `tostring`, `[...]`, a slice, a write) or starts a *detached* tree
+/// (`map`, `keys`, `with_entries`, `{...}`, a literal). Navigation inside the
+/// new value then descends from that position, and `parent` climbs back
+/// through the owned value and, at its root, into the document. Every row
+/// below was captured from yq v4.53.3 on `a: {b: [1, 2, 3], c: x, d: {e:
+/// 5}}`; the full capture is `test_owned_identity_rules_match_yq_2416` in
+/// `tests/yq_cli_tests.rs`:
+///
+/// ```text
+/// .a.b | to_entries | .[0].value | path        ["a","b",0,"value"]
+/// .a.b | to_entries | .[0].value | parent(3)   .a   (owned root, then the document)
+/// .a.b | map(. + 1) | .[0] | path              [0]  (detached root)
+/// .a.b | map(. + 1) | .[0] | parent(2)         nothing
+/// .a.b | .[0] + .[1] | key                     0    (the left operand's node)
+/// .a.b | min | path                            ["a","b",0]
+/// ```
+///
+/// `base` is the document node whose position the owned root inherited
+/// (`None` for a detached root); `ancestors` is the chain of owned values
+/// descended through to reach this one, each with the component taken. The
+/// chain holds the ancestor *values* rather than a root plus a relative
+/// path so that a stage rebuilding the value at a position (`to_entries`
+/// twice over) never has to patch a shared root: `parent` is simply the
+/// last link.
+struct OwnedIdentity<V: DocumentValue> {
+    base: Option<V::Cursor>,
+    ancestors: Vec<(Rc<OwnedValue>, OwnedValue)>,
+}
+
+impl<V: DocumentValue> Clone for OwnedIdentity<V> {
+    fn clone(&self) -> Self {
+        Self {
+            base: self.base,
+            ancestors: self.ancestors.clone(),
+        }
+    }
+}
+
+/// One level up from an [`OwnedIdentity`]: a value inside the owned tree,
+/// or the document node above its root.
+enum OwnedParent<V: DocumentValue> {
+    Owned(OwnedValue, OwnedIdentity<V>),
+    Node(V::Cursor),
+}
+
+impl<V: DocumentValue> OwnedIdentity<V> {
+    /// An owned root standing at `base`'s position.
+    fn kept(base: V::Cursor) -> Self {
+        Self {
+            base: Some(base),
+            ancestors: Vec::new(),
+        }
+    }
+
+    /// An owned root with no position at all.
+    fn detached() -> Self {
+        Self {
+            base: None,
+            ancestors: Vec::new(),
+        }
+    }
+
+    /// The identity of `component` inside `parent`, whose identity is `self`.
+    fn child(&self, parent: &Rc<OwnedValue>, component: OwnedValue) -> Self {
+        let mut ancestors = self.ancestors.clone();
+        ancestors.push((Rc::clone(parent), component));
+        Self {
+            base: self.base,
+            ancestors,
+        }
+    }
+
+    /// `key`: the last component taken, else the base node's own key, else
+    /// nothing (a detached root, or the document root -- #2421).
+    fn key(&self) -> Result<Option<OwnedValue>, EvalError> {
+        match self.ancestors.last() {
+            Some((_, component)) => Ok(Some(component.clone())),
+            None => match self.base {
+                Some(c) => cursor_key(&c),
+                None => Ok(None),
+            },
+        }
+    }
+
+    /// `path`: the base node's path, then every component taken.
+    fn path(&self) -> Result<Vec<OwnedValue>, EvalError> {
+        let mut path = match self.base {
+            Some(c) => cursor_path_and_ancestors(&c)?.0,
+            None => Vec::new(),
+        };
+        path.extend(
+            self.ancestors
+                .iter()
+                .map(|(_, component)| component.clone()),
+        );
+        Ok(path)
+    }
+
+    /// `parent`: the last ancestor inside the owned tree, else the document
+    /// node above the base (nothing above a detached root or the document
+    /// root).
+    fn parent(mut self) -> Option<OwnedParent<V>> {
+        match self.ancestors.pop() {
+            Some((value, _)) => Some(OwnedParent::Owned((*value).clone(), self)),
+            None => self
+                .base
+                .and_then(|c| c.document_parent())
+                .map(OwnedParent::Node),
+        }
+    }
+}
+
+/// How a stage that leaves the cursor domain positions its output (#2416
+/// step 3). A closed list: a stage with no rule keeps the pipe on the eager
+/// evaluator, exactly as before, so an unlisted builtin can only cost the
+/// migration, never an answer. Every entry is an oracle capture (see
+/// [`OwnedIdentity`]); a builtin real yq's lexer rejects (`add`, `explode`,
+/// `ascii_downcase`) has no row to match and is deliberately absent.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OwnedIdentityRule {
+    /// The output stands where the input stood: `to_entries`, `sort`,
+    /// `tostring`, `length`, `[...]`, a slice, a write, `not`, `@json`.
+    Keeps,
+    /// The output starts a detached tree: `keys`, `with_entries`, `{...}`,
+    /// a literal.
+    Detaches,
+    /// `map`: a container input yields a detached tree (where `[.[] | f]`
+    /// keeps -- yq's own inconsistency, reproduced), but a scalar or `null`
+    /// passes through with its position (`.a | map(. + 1) | key` on `a: 5`
+    /// is `"a"`; on `a: [1, 2]` it is nothing).
+    DetachesContainer,
+    /// The output stands where the *left operand* stood: arithmetic,
+    /// comparison and unary minus (`.[0] + .[1] | key` is `0`; `1 + .[0] |
+    /// key` and `(1==1) | key` are nothing, a literal having no position).
+    LeftOperand,
+    /// `min`/`max`: the output *is* one of the input's children, at its own
+    /// position.
+    Extremum,
+    /// `a // b`: the output stands where whichever side produced it stood.
+    Alternative,
+    /// A literal slice. Mode decides (ADR-0018): real yq keeps the
+    /// container's position (`.a | .[0:3] | .[0] | path` is `["a",0]`,
+    /// `parent | parent` the root), while jq mode follows jq's own
+    /// `path(.a[0:3])` and takes the `{"start":s,"end":e}` component, the
+    /// model #2215 pinned for the extension builtins there.
+    Slice,
+}
+
+fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
+    use OwnedIdentityRule::{
+        Alternative, Detaches, DetachesContainer, Extremum, Keeps, LeftOperand, Slice,
+    };
+    Some(match strip_parens(stage) {
+        Expr::Slice { .. } => Slice,
+        Expr::Array(_)
+        | Expr::Not
+        | Expr::Format(FormatType::Json)
+        | Expr::Assign { .. }
+        | Expr::Update { .. } => Keeps,
+        Expr::Object(_) | Expr::Literal(_) => Detaches,
+        Expr::Arithmetic { .. } | Expr::Compare { .. } | Expr::Negate(_) => LeftOperand,
+        Expr::Alternative(..) => Alternative,
+        Expr::Builtin(builtin) => match builtin {
+            Builtin::ToString
+            | Builtin::ToJson
+            | Builtin::FromJson
+            | Builtin::Length
+            | Builtin::Type
+            | Builtin::ToEntries
+            | Builtin::FromEntries
+            | Builtin::Sort
+            | Builtin::SortBy(_)
+            | Builtin::Reverse
+            | Builtin::Unique
+            | Builtin::Flatten
+            | Builtin::Join(_)
+            | Builtin::Split(_)
+            | Builtin::Any
+            | Builtin::Contains(_)
+            | Builtin::Test(_)
+            | Builtin::GroupBy(_)
+            | Builtin::MapValues(_)
+            | Builtin::Has(_)
+            | Builtin::Tag
+            | Builtin::Kind
+            | Builtin::Style
+            | Builtin::Line
+            | Builtin::Column
+            | Builtin::Del(_)
+            | Builtin::Select(_) => Keeps,
+            Builtin::Keys | Builtin::KeysUnsorted | Builtin::WithEntries(_) => Detaches,
+            Builtin::Map(_) => DetachesContainer,
+            Builtin::Min | Builtin::Max => Extremum,
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
+/// `((e))` positions its output exactly as `e` does.
+fn strip_parens(mut expr: &Expr) -> &Expr {
+    while let Expr::Paren(inner) = expr {
+        expr = inner;
+    }
+    expr
+}
+
+/// Navigation the owned identity pipe performs itself, so it can name the
+/// component each step takes. `Iterate` fans out, so it is navigation here
+/// but not an *operand* (see [`owned_identity_operand_supported`]).
+fn owned_identity_nav_supported(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Iterate
+        | Expr::Slice { .. } => true,
+        Expr::Optional(inner) | Expr::Paren(inner) => owned_identity_nav_supported(inner),
+        Expr::Pipe(exprs) => exprs.iter().all(owned_identity_nav_supported),
+        _ => false,
+    }
+}
+
+/// An operand whose identity can be named without evaluating a generator:
+/// `.`, a literal, or single-output navigation.
+fn owned_identity_operand_supported(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identity
+        | Expr::Literal(_)
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Slice { .. } => true,
+        Expr::Optional(inner) | Expr::Paren(inner) => owned_identity_operand_supported(inner),
+        Expr::Pipe(exprs) => exprs.iter().all(owned_identity_operand_supported),
+        _ => false,
+    }
+}
+
+/// The static gate for the owned identity pipe: every stage of `stages` is
+/// navigation, a path-context builtin answered from the identity, or a stage
+/// with an [`owned_identity_rule`] whose own path-context builtins (if any)
+/// resolve to constants. `key`/`path`/`file_index` turn the value into a
+/// fresh scalar, so nothing after one of them may read path context.
+fn owned_identity_pipe_supported(stages: &[Expr]) -> bool {
+    for (i, stage) in stages.iter().enumerate() {
+        let rest = &stages[i + 1..];
+        if owned_identity_nav_supported(stage) {
+            continue;
+        }
+        match strip_parens(stage) {
+            Expr::Builtin(Builtin::Key | Builtin::PathNoArg | Builtin::FileIndex) => {
+                return !rest.iter().any(needs_path_context);
+            }
+            Expr::Builtin(Builtin::Parent) => {}
+            Expr::Builtin(Builtin::ParentN(n)) if matches!(**n, Expr::Literal(_)) => {}
+            Expr::Arithmetic { left, .. } | Expr::Compare { left, .. } | Expr::Negate(left) => {
+                if needs_path_context(stage) || !owned_identity_operand_supported(left) {
+                    return false;
+                }
+            }
+            Expr::Alternative(left, right) => {
+                if needs_path_context(stage)
+                    || !owned_identity_operand_supported(left)
+                    || !owned_identity_operand_supported(right)
+                {
+                    return false;
+                }
+            }
+            _ => match owned_identity_rule(stage) {
+                Some(_) => {
+                    if needs_path_context(stage) && !path_context_absent_resolvable(stage) {
+                        return false;
+                    }
+                }
+                None => return false,
+            },
+        }
+    }
+    true
+}
+
+/// Whether a pipe leaves the cursor domain at a stage the owned identity
+/// pipe can follow: the first non-node-preserving stage has a rule, does not
+/// itself read path context, and everything after it is
+/// [`owned_identity_pipe_supported`]. Decided statically, once, by
+/// [`path_context_needs_eager`]; `false` means the pipe is either entirely
+/// in the cursor domain or still the eager evaluator's.
+fn owned_identity_pipe_applies(exprs: &[Expr]) -> bool {
+    for (i, stage) in exprs.iter().enumerate() {
+        if path_context_is_navigational(stage) || path_context_stage_preserves_node(stage) {
+            continue;
+        }
+        let rest = &exprs[i + 1..];
+        return rest.iter().any(needs_path_context)
+            && !needs_path_context(stage)
+            && owned_identity_rule(stage).is_some()
+            && owned_identity_pipe_supported(rest);
+    }
+    false
+}
+
+/// One navigation step over an owned value, naming the component taken.
+/// The *values* come from the ordinary owned evaluator, so every error
+/// message, `null` on a missing key and yq-mode indexing rule is the one the
+/// rest of the pipeline already produces; only the component is derived
+/// here, and only where a step can name one.
+fn owned_identity_step<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    value: &OwnedValue,
+    id: &OwnedIdentity<V>,
+    optional: bool,
+    out: &mut Vec<(OwnedValue, OwnedIdentity<V>)>,
+) -> Result<(), EvalError> {
+    match expr {
+        Expr::Identity => {
+            out.push((value.clone(), id.clone()));
+            Ok(())
+        }
+        Expr::Optional(inner) => owned_identity_step::<S, V>(inner, value, id, true, out),
+        Expr::Paren(inner) => owned_identity_step::<S, V>(inner, value, id, optional, out),
+        Expr::Pipe(exprs) => {
+            let mut current = vec![(value.clone(), id.clone())];
+            for stage in exprs {
+                let mut next = Vec::new();
+                for (v, vid) in &current {
+                    owned_identity_step::<S, V>(stage, v, vid, optional, &mut next)?;
+                }
+                current = next;
+            }
+            out.extend(current);
+            Ok(())
+        }
+        Expr::Slice {
+            start,
+            end,
+            start_key,
+            end_key,
+        } => {
+            let values = owned_identity_values::<S>(expr, value, optional)?;
+            if S::TAG == EvalTag::Yq {
+                out.extend(values.into_iter().map(|v| (v, id.clone())));
+            } else {
+                let parent = Rc::new(value.clone());
+                let component =
+                    slice_component_value(*start, start_key.as_ref(), *end, end_key.as_ref());
+                out.extend(
+                    values
+                        .into_iter()
+                        .map(|v| (v, id.child(&parent, component.clone()))),
+                );
+            }
+            Ok(())
+        }
+        Expr::Field(name) => {
+            let values = owned_identity_values::<S>(expr, value, optional)?;
+            let parent = Rc::new(value.clone());
+            out.extend(
+                values
+                    .into_iter()
+                    .map(|v| (v, id.child(&parent, OwnedValue::String(name.clone())))),
+            );
+            Ok(())
+        }
+        Expr::Index { idx, key } => {
+            let values = owned_identity_values::<S>(expr, value, optional)?;
+            let mut component = index_component_value(*idx, key.as_ref());
+            if let Some(elements) = value.as_array() {
+                if *idx < 0 && S::TAG == EvalTag::Yq {
+                    let resolved = elements.len() as i64 + *idx;
+                    if resolved >= 0 {
+                        component = OwnedValue::Int(resolved);
+                    }
+                }
+            }
+            let parent = Rc::new(value.clone());
+            out.extend(
+                values
+                    .into_iter()
+                    .map(|v| (v, id.child(&parent, component.clone()))),
+            );
+            Ok(())
+        }
+        Expr::Iterate => {
+            let values = owned_identity_values::<S>(expr, value, optional)?;
+            let parent = Rc::new(value.clone());
+            let components: Vec<OwnedValue> = match value {
+                OwnedValue::Array(items) => (0..items.len())
+                    .map(|i| OwnedValue::Int(i as i64))
+                    .collect(),
+                OwnedValue::Object(map) => {
+                    map.keys().map(|k| OwnedValue::String(k.clone())).collect()
+                }
+                _ => Vec::new(),
+            };
+            // The owned evaluator yields exactly one value per member; a
+            // mismatch means the input was not a container after all (an
+            // error or, under `?`, nothing), in which case the components
+            // are unused.
+            out.extend(
+                values
+                    .into_iter()
+                    .zip(components)
+                    .map(|(v, component)| (v, id.child(&parent, component))),
+            );
+            Ok(())
+        }
+        _ => unreachable!("owned_identity_nav_supported admits no other shape"),
+    }
+}
+
+/// Every output of `expr` over `value` in the ordinary owned evaluator.
+fn owned_identity_values<S: EvalSemantics>(
+    expr: &Expr,
+    value: &OwnedValue,
+    optional: bool,
+) -> Result<Vec<OwnedValue>, EvalError> {
+    let mut values = Vec::new();
+    match eval_each_owned::<S>(expr, value, optional, &mut |v| {
+        values.push(v);
+        Demand::Continue
+    }) {
+        Flow::Escaped(Control::Error(e)) => Err(e),
+        // A `break`/`halt` cannot come out of navigation; treat any other
+        // escape as "no more values" the way a collecting sink does.
+        _ => Ok(values),
+    }
+}
+
+/// The value and identity of an operand (`.`, a literal, single-output
+/// navigation) evaluated over `value`; `None` when it produced nothing.
+fn owned_identity_operand<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    value: &OwnedValue,
+    id: &OwnedIdentity<V>,
+    optional: bool,
+) -> Result<Option<(OwnedValue, OwnedIdentity<V>)>, EvalError> {
+    let expr = strip_parens(expr);
+    if let Expr::Literal(lit) = expr {
+        return Ok(Some((literal_to_owned(lit), OwnedIdentity::detached())));
+    }
+    let mut out = Vec::new();
+    owned_identity_step::<S, V>(expr, value, id, optional, &mut out)?;
+    Ok(out.into_iter().next())
+}
+
+/// The identity of `output`, an output of `stage` evaluated over `value`
+/// (whose identity is `id`), per the stage's [`OwnedIdentityRule`].
+/// `Alternative` is not answered here: its output is chosen by
+/// [`eval_owned_identity_alternative`], which knows which side produced it.
+fn owned_identity_after_stage<S: EvalSemantics, V: DocumentValue>(
+    stage: &Expr,
+    rule: OwnedIdentityRule,
+    value: &OwnedValue,
+    id: &OwnedIdentity<V>,
+    output: &OwnedValue,
+    optional: bool,
+) -> Result<Option<OwnedIdentity<V>>, EvalError> {
+    Ok(match rule {
+        OwnedIdentityRule::Keeps => Some(id.clone()),
+        OwnedIdentityRule::Slice => {
+            let Expr::Slice {
+                start,
+                end,
+                start_key,
+                end_key,
+            } = strip_parens(stage)
+            else {
+                unreachable!("Slice is assigned to Expr::Slice only")
+            };
+            Some(if S::TAG == EvalTag::Yq {
+                id.clone()
+            } else {
+                id.child(
+                    &Rc::new(value.clone()),
+                    slice_component_value(*start, start_key.as_ref(), *end, end_key.as_ref()),
+                )
+            })
+        }
+        OwnedIdentityRule::Detaches => Some(OwnedIdentity::detached()),
+        OwnedIdentityRule::DetachesContainer => {
+            if value.as_array().is_some() || value.as_object().is_some() {
+                Some(OwnedIdentity::detached())
+            } else {
+                Some(id.clone())
+            }
+        }
+        OwnedIdentityRule::LeftOperand => {
+            let (Expr::Arithmetic { left, .. } | Expr::Compare { left, .. } | Expr::Negate(left)) =
+                strip_parens(stage)
+            else {
+                unreachable!("LeftOperand is assigned to arithmetic, comparison and negation only")
+            };
+            owned_identity_operand::<S, V>(left, value, id, optional)?.map(|(_, oid)| oid)
+        }
+        OwnedIdentityRule::Extremum => {
+            let parent = Rc::new(value.clone());
+            let component = match value {
+                OwnedValue::Array(items) => items
+                    .iter()
+                    .position(|item| {
+                        crate::jq::eval::compare_values(item, output) == core::cmp::Ordering::Equal
+                    })
+                    .map(|i| OwnedValue::Int(i as i64)),
+                OwnedValue::Object(map) => map
+                    .iter()
+                    .find(|(_, item)| {
+                        crate::jq::eval::compare_values(item, output) == core::cmp::Ordering::Equal
+                    })
+                    .map(|(k, _)| OwnedValue::String(k.clone())),
+                _ => None,
+            };
+            component.map(|component| id.child(&parent, component))
+        }
+        OwnedIdentityRule::Alternative => {
+            unreachable!("Alternative is evaluated by eval_owned_identity_alternative")
+        }
+    })
+}
+
+/// Hand a value with no further identity to the rest of the pipe: the
+/// ordinary owned evaluator, or the sink when nothing is left.
+fn continue_owned_identity_plain<S: EvalSemantics, V: DocumentValue>(
+    rest: &[Expr],
+    value: OwnedValue,
+    optional: bool,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    if rest.is_empty() {
+        return push_one_generic(GenericItem::Owned(value), sink);
+    }
+    eval_each_owned::<S>(&Expr::Pipe(rest.to_vec()), &value, optional, &mut |o| {
+        sink(GenericItem::Owned(o))
+    })
+}
+
+/// Continue a pipe from one owned value carrying its identity, honouring
+/// `sink`'s demand. Escapes from a downstream stage are carried out through
+/// `pending`, the same way [`eval_each_pipe_generic`]'s own driver does.
+fn continue_owned_identity_items<S: EvalSemantics, V: DocumentValue>(
+    rest: &[Expr],
+    items: impl IntoIterator<Item = (OwnedValue, OwnedIdentity<V>)>,
+    optional: bool,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    for (v, vid) in items {
+        match eval_owned_identity_pipe::<S, V>(rest, v, vid, optional, sink) {
+            Flow::Exhausted => {}
+            other => return other,
+        }
+    }
+    Flow::Exhausted
+}
+
+/// `a // b` over an owned value with identity: the left operand's value if
+/// it is truthy (errors in it suppressed, as `//` does), else the right's.
+fn eval_owned_identity_alternative<S: EvalSemantics, V: DocumentValue>(
+    left: &Expr,
+    right: &Expr,
+    value: &OwnedValue,
+    id: &OwnedIdentity<V>,
+    optional: bool,
+) -> Result<Option<(OwnedValue, OwnedIdentity<V>)>, EvalError> {
+    if let Some((v, vid)) = owned_identity_operand::<S, V>(left, value, id, true)? {
+        if v.is_truthy() {
+            return Ok(Some((v, vid)));
+        }
+    }
+    owned_identity_operand::<S, V>(right, value, id, optional)
+}
+
+/// The owned identity pipe (#2416 step 3): evaluate `stages` from an owned
+/// `value` whose position is `id`, answering `key`/`path`/`parent`/
+/// `parent(n)`/`file_index` from the identity and threading it through
+/// navigation and every stage with an [`owned_identity_rule`]. A `parent`
+/// that climbs out of the owned tree hands the rest of the pipe back to
+/// [`eval_each_pipe_generic`] with the document cursor it reached.
+///
+/// Only reached for pipes [`owned_identity_pipe_supported`] accepted, so the
+/// `_` arms below are refusals of shapes the gate already declined, never
+/// fallbacks.
+fn eval_owned_identity_pipe<S: EvalSemantics, V: DocumentValue>(
+    stages: &[Expr],
+    value: OwnedValue,
+    id: OwnedIdentity<V>,
+    optional: bool,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    let Some((stage, rest)) = stages.split_first() else {
+        return push_one_generic(GenericItem::Owned(value), sink);
+    };
+    if owned_identity_nav_supported(stage) {
+        let mut out = Vec::new();
+        if let Err(e) = owned_identity_step::<S, V>(stage, &value, &id, optional, &mut out) {
+            return Flow::Escaped(Control::Error(e));
+        }
+        return continue_owned_identity_items::<S, V>(rest, out, optional, sink);
+    }
+    match strip_parens(stage) {
+        Expr::Builtin(Builtin::Key) => match id.key() {
+            Ok(Some(key)) => continue_owned_identity_plain::<S, V>(rest, key, optional, sink),
+            Ok(None) => Flow::Exhausted,
+            Err(e) => Flow::Escaped(Control::Error(e)),
+        },
+        Expr::Builtin(Builtin::PathNoArg) => match id.path() {
+            Ok(path) => {
+                continue_owned_identity_plain::<S, V>(rest, OwnedValue::Array(path), optional, sink)
+            }
+            Err(e) => Flow::Escaped(Control::Error(e)),
+        },
+        // The generic route carries no file-origin table (#2150, #2427).
+        Expr::Builtin(Builtin::FileIndex) => {
+            continue_owned_identity_plain::<S, V>(rest, OwnedValue::Int(0), optional, sink)
+        }
+        Expr::Builtin(Builtin::Parent) => match id.parent() {
+            Some(OwnedParent::Owned(v, vid)) => {
+                eval_owned_identity_pipe::<S, V>(rest, v, vid, optional, sink)
+            }
+            Some(OwnedParent::Node(c)) => {
+                eval_each_pipe_generic::<S, V>(rest, c.value(), optional, Some(c), sink)
+            }
+            None => Flow::Exhausted,
+        },
+        Expr::Builtin(Builtin::ParentN(n_expr)) => {
+            let Expr::Literal(lit) = &**n_expr else {
+                unreachable!("owned_identity_pipe_supported admits a literal n only")
+            };
+            let n = match id
+                .path()
+                .and_then(|path| classify_parent_n::<S>(&literal_to_owned(lit), path.len()))
+            {
+                Ok(n) => n,
+                Err(e) => return Flow::Escaped(Control::Error(e)),
+            };
+            let mut current = (value, id);
+            for climbed in 0..n {
+                match current.1.parent() {
+                    Some(OwnedParent::Owned(v, vid)) => current = (v, vid),
+                    Some(OwnedParent::Node(c)) => {
+                        return match cursor_ancestor(&c, n - climbed - 1) {
+                            Some(a) => eval_each_pipe_generic::<S, V>(
+                                rest,
+                                a.value(),
+                                optional,
+                                Some(a),
+                                sink,
+                            ),
+                            None => Flow::Exhausted,
+                        };
+                    }
+                    None => return Flow::Exhausted,
+                }
+            }
+            eval_owned_identity_pipe::<S, V>(rest, current.0, current.1, optional, sink)
+        }
+        Expr::Alternative(left, right) => {
+            match eval_owned_identity_alternative::<S, V>(left, right, &value, &id, optional) {
+                Ok(Some((v, vid))) => {
+                    eval_owned_identity_pipe::<S, V>(rest, v, vid, optional, sink)
+                }
+                Ok(None) => Flow::Exhausted,
+                Err(e) => Flow::Escaped(Control::Error(e)),
+            }
+        }
+        _ => {
+            let Some(rule) = owned_identity_rule(stage) else {
+                unreachable!("owned_identity_pipe_supported admits ruled stages only")
+            };
+            // A `key`/`path`/`file_index` inside the stage (`select(key ==
+            // 0)`, `[key, path]`) is a constant for a fixed identity, the
+            // same resolution the absent route applies (#2416 step 2).
+            let resolved;
+            let stage_expr = if needs_path_context(stage) {
+                let (key, path) = match (id.key(), id.path()) {
+                    (Ok(key), Ok(path)) => (key, path),
+                    (Err(e), _) | (_, Err(e)) => return Flow::Escaped(Control::Error(e)),
+                };
+                resolved = path_context_resolve_constants(stage, key.as_ref(), &path);
+                &resolved
+            } else {
+                stage
+            };
+            let mut downstream: Option<Flow> = None;
+            let upstream = eval_each_owned::<S>(stage_expr, &value, optional, &mut |output| {
+                let flow = match owned_identity_after_stage::<S, V>(
+                    stage, rule, &value, &id, &output, optional,
+                ) {
+                    Ok(Some(oid)) => {
+                        eval_owned_identity_pipe::<S, V>(rest, output, oid, optional, sink)
+                    }
+                    // The rule could not place the output (a left operand
+                    // that produced nothing, an extremum of a scalar): real
+                    // yq has no position for it either, so it continues
+                    // detached.
+                    Ok(None) => eval_owned_identity_pipe::<S, V>(
+                        rest,
+                        output,
+                        OwnedIdentity::detached(),
+                        optional,
+                        sink,
+                    ),
+                    Err(e) => Flow::Escaped(Control::Error(e)),
+                };
+                match flow {
+                    Flow::Exhausted => Demand::Continue,
+                    other => {
+                        downstream = Some(other);
+                        Demand::Stop
+                    }
+                }
+            });
+            match downstream {
+                Some(flow) => flow,
+                None => upstream,
+            }
+        }
+    }
+}
+
+/// One item produced by a stage leaving the cursor domain, as the owned
+/// value the identity pipe carries. `sort`/`reverse`/`keys` emit lazy
+/// sequences and lazy key lists rather than owned values, and a stage may
+/// hand a document value straight through; all of them stand at the same
+/// position, so all of them materialize here.
+fn owned_identity_materialize<V: DocumentValue>(
+    item: GenericItem<V>,
+) -> Result<OwnedValue, Control> {
+    match generic_item_to_result(item).materialize_lazy() {
+        GenericResult::Owned(o) => Ok(o),
+        GenericResult::One(v) => to_owned(&v).map_err(Control::Error),
+        GenericResult::OneCursor(c) => to_owned_cursor(&c).map_err(Control::Error),
+        GenericResult::Error(e) => Err(Control::Error(e)),
+        GenericResult::Break(label) => Err(Control::Break(label)),
+        GenericResult::Halt(code) => Err(Control::Halt(code)),
+        // `generic_item_to_result` maps one item to `One`/`OneCursor`/
+        // `Owned` or a lazy variant, and `materialize_lazy` maps those to
+        // `Owned` or an escape.
+        _ => unreachable!("a single pipe item never materializes to a stream"),
+    }
+}
+
+/// The identity of `output`, produced by `stage` from the document node at
+/// `cursor` -- the boundary where a value first leaves the cursor domain
+/// (#2416 step 3). Rules that name a *child* of the input (`min`, a left
+/// operand `.[0]`) navigate an owned copy of the node, which the stage has
+/// already materialized to compute its output.
+fn owned_identity_leaving_cursor<S: EvalSemantics, V: DocumentValue>(
+    stage: &Expr,
+    cursor: V::Cursor,
+    output: &OwnedValue,
+    optional: bool,
+) -> Result<Option<OwnedIdentity<V>>, EvalError> {
+    let Some(rule) = owned_identity_rule(stage) else {
+        return Ok(None);
+    };
+    let id = OwnedIdentity::kept(cursor);
+    match rule {
+        OwnedIdentityRule::Keeps => Ok(Some(id)),
+        OwnedIdentityRule::Detaches => Ok(Some(OwnedIdentity::detached())),
+        OwnedIdentityRule::DetachesContainer => Ok(Some(if cursor.is_container() {
+            OwnedIdentity::detached()
+        } else {
+            id
+        })),
+        OwnedIdentityRule::LeftOperand | OwnedIdentityRule::Extremum | OwnedIdentityRule::Slice => {
+            // STYLE-0012: the stage that produced `output` already
+            // materialized this node under the same `optional`, so a decode
+            // failure here cannot be the first one seen; it raises as the
+            // internal invariant it is.
+            let input = to_owned_cursor(&cursor)?;
+            owned_identity_after_stage::<S, V>(stage, rule, &input, &id, output, optional)
+        }
+        OwnedIdentityRule::Alternative => {
+            let Expr::Alternative(left, right) = strip_parens(stage) else {
+                unreachable!("Alternative is assigned to Expr::Alternative only")
+            };
+            // STYLE-0012: same invariant as the arm above.
+            let input = to_owned_cursor(&cursor)?;
+            Ok(
+                eval_owned_identity_alternative::<S, V>(left, right, &input, &id, optional)?
+                    .map(|(_, oid)| oid),
+            )
         }
     }
 }
@@ -21923,10 +22776,30 @@ mod tests {
             eager(".[] | key + 10"),
             "arithmetic still bridges from eval_single"
         );
-        // Reason 1: an owned-domain stage before the builtin.
-        assert!(eager(".a | tostring | key"));
-        assert!(eager("to_entries | .[0] | key"));
-        assert!(eager("[.a] | .[0] | parent"));
+        // Reason 1, an owned-domain stage before the builtin, is answered
+        // by the owned identity pipe (#2416 step 3) wherever the stage has
+        // an `owned_identity_rule` and the rest reads the position it
+        // carries...
+        assert!(!eager(".a | tostring | key"));
+        assert!(!eager("to_entries | .[0] | key"));
+        assert!(!eager("[.a] | .[0] | parent"));
+        assert!(!eager(".a | .[0] + .[1] | key"));
+        assert!(!eager(".a | min | parent | key"));
+        assert!(!eager(".a | to_entries | .[] | select(key == 0)"));
+        // ...and stays eager where it has no rule, where path context is
+        // read after `key`/`path` already replaced the value, where the
+        // stage itself reads path context, or where a later stage does so
+        // in a shape the constants cannot express.
+        assert!(eager(".a | ascii_downcase | key"), "no identity rule");
+        assert!(eager(".a | tostring | key | key"), "key after key");
+        assert!(
+            eager(".a | [key] | .[0] | path"),
+            "the stage reads path context"
+        );
+        assert!(
+            eager(".a | to_entries | .[0] | key + 1"),
+            "path context under arithmetic"
+        );
         // #2416 step 2: a head that can reach an absent node is no longer a
         // reason on its own -- `path_context_absent_split` walks the head as
         // positions and resolves the rest's `key`/`path`/`file_index`

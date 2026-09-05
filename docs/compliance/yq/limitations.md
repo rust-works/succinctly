@@ -2163,14 +2163,14 @@ fixed on its own terms (#2375); the second is still open:
   $ printf 'a: 5\n'    | yq -o=json -I=0 '.a | map(. + 1) | key'    # "a"
   ```
 
-  **Residual gap, not yet fixed:** the *container* rows of the same arm diverge in the
-  opposite direction, and are untouched by #2375. yq's `map(f)` over a container builds a
-  new, detached node whose path is `[]`, so a downstream `key` emits nothing at all
-  (`printf 'a: [1,2]\n' | yq -o=json '.a | map(. + 1) | key'` prints nothing, exit 0),
-  where succinctly still reports the *pre-map* node's key (`"a"`). Passing a non-container
-  through with its path intact — which is what makes the scalar rows above correct — is the
-  same mechanism seen from the other side: yq never replaced the scalar node, so it kept
-  its own path.
+  The *container* rows of the same arm used to diverge in the opposite direction: yq's
+  `map(f)` over a container builds a new, detached node whose path is `[]`, so a downstream
+  `key` emits nothing at all (`printf 'a: [1,2]\n' | yq -o=json '.a | map(. + 1) | key'`
+  prints nothing, exit 0), where succinctly reported the *pre-map* node's key (`"a"`).
+  Closed by the owned identity pipe (spine 2416 step 3, ADR-0021 decision 7): `map`'s rule
+  there detaches a container result and passes a scalar through with its position, which
+  is the same mechanism seen from both sides — yq never replaced the scalar node, so it
+  kept its own path. Pinned in `test_owned_identity_rules_match_yq_2416`.
 - **`first(.a[])` on a genuinely-resolved scalar still raises** (`resolve_iterate_bounded`,
   shared by `resolve_node`'s own `Expr::Iterate` arm and `first`/`limit`'s fast path) —
   this function is also reached by `resolve_del_path_branches`'s comma-fanout fallback for a
