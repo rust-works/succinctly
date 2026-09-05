@@ -280,6 +280,20 @@ pub trait EvalSemantics: Copy + Default {
     /// See `BinaryFanoutRules::left_major` (this module, private) for the
     /// captured rows and the yq source this reproduces.
     const BINARY_FANOUT_IS_LEFT_MAJOR: bool;
+
+    /// If true (yq, #2470), a **key lookup that finds nothing** yields zero
+    /// outputs -- instead of the usual `null` node -- while a read-only
+    /// context (`yq_read_only_context`, this module, private) is active. If
+    /// false (jq), the read is `null` everywhere and the scope is never
+    /// entered at all.
+    ///
+    /// Reproduces real yq's `Context.DontAutoCreate`: `traverse`/
+    /// `traverseMap` fabricate the missing child as a real `!!null` node
+    /// (with `Key` set, which is what lets `key`/`path` answer for it) only
+    /// when the flag is *off*; with it on, the miss contributes no candidate
+    /// at all. See `yq_read_only_context`'s own doc comment for which
+    /// contexts force it on and for the captured rows.
+    const READ_ONLY_ABSENT_KEY_IS_EMPTY: bool;
 }
 
 /// jq-compatible evaluation semantics (default).
@@ -310,6 +324,7 @@ impl EvalSemantics for JqSemantics {
     const ROOT_PATH_CONTEXT_YIELDS_NOTHING: bool = false;
     const EMPTY_OPERAND_BINARY_RULE: bool = false;
     const BINARY_FANOUT_IS_LEFT_MAJOR: bool = false;
+    const READ_ONLY_ABSENT_KEY_IS_EMPTY: bool = false;
 }
 
 /// yq-compatible evaluation semantics.
@@ -342,6 +357,7 @@ impl EvalSemantics for YqSemantics {
     const ROOT_PATH_CONTEXT_YIELDS_NOTHING: bool = true;
     const EMPTY_OPERAND_BINARY_RULE: bool = true;
     const BINARY_FANOUT_IS_LEFT_MAJOR: bool = true;
+    const READ_ONLY_ABSENT_KEY_IS_EMPTY: bool = true;
 }
 
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
@@ -443,6 +459,110 @@ pub(crate) fn yq_empty_operand_output(
         }
         EmptyOperandOp::Boolean => Some(OwnedValue::Bool(false)),
     }
+}
+
+/// **The one definition of yq's read-only evaluation context** (#2470),
+/// consulted by both evaluators and by every navigation site that has to
+/// decide what a key lookup that found nothing evaluates to.
+///
+/// Real yq carries the flag on the `Context` struct it threads through
+/// evaluation (`Context.DontAutoCreate`, `pkg/yqlib/context.go`). With it
+/// off, `traverse`/`traverseMap` (`pkg/yqlib/operator_traverse_path.go`)
+/// fabricate the missing child as a real `!!null` node with its `Key` set,
+/// which is what lets `key`/`path` answer for a position that does not
+/// exist; with it on, the miss contributes no candidate at all and the drop
+/// happens before `key`/`path` are ever reached. Three constructs force it
+/// on, all live-captured against yq v4.53.3 on `a: {b: 1}`, `s: x`,
+/// `n: [1, 2]`:
+///
+/// | construct                | probe                    | yq        |
+/// |--------------------------|--------------------------|-----------|
+/// | `=`-family right side    | `.x = (.zzz \| key)`     | `x: null` |
+///
+/// and one that pointedly does **not**, which is why this is a scope rather
+/// than a blanket rule: `|=`'s own right side (`.x |= (.zzz | key)` is
+/// `x: "zzz"`, since `assignUpdateOperator` runs it through
+/// `SingleChildContext` instead of `ReadOnlyClone`,
+/// `pkg/yqlib/operator_assign.go`). A bare filter, a collect (`[.zzz]` is
+/// `[null]`) and an object construction outside an assignment's right side
+/// keep the null node too.
+///
+/// The scope covers the whole right-hand subexpression, nested pipes
+/// included -- so it is ambient rather than a parameter, the same shape (and
+/// for the same reason) as `eval_generic`'s `path_context_route`/
+/// `with_file_origin`: the sites that consult it are many recursion levels
+/// below the sites that establish it, and this codebase has no
+/// evaluation-environment parameter for it to ride on.
+///
+/// `#[cfg(feature = "std")]` only, same limitation as its two siblings named
+/// above: a `no_std` embedding has no `thread_local!`, so the scope is never
+/// active there and a missing key reads back as the ordinary `null` node.
+#[cfg(feature = "std")]
+pub(crate) mod yq_read_only_context {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ACTIVE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Whether a read-only context is currently active. Callers must still
+    /// gate on [`super::EvalSemantics::READ_ONLY_ABSENT_KEY_IS_EMPTY`] --
+    /// [`super::yq_absent_key_read_is_empty`] is the one place that does
+    /// both.
+    pub(crate) fn active() -> bool {
+        ACTIVE.with(Cell::get)
+    }
+
+    /// Restores the previous state on drop, so a call that has returned
+    /// never leaks its scope into a sibling evaluation.
+    #[must_use]
+    pub(crate) struct Guard(bool);
+
+    fn set(active_now: bool) -> Guard {
+        let previous = active();
+        ACTIVE.with(|c| c.set(active_now));
+        Guard(previous)
+    }
+
+    /// Enter a read-only context for the caller's scope.
+    pub(crate) fn enter() -> Guard {
+        set(true)
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ACTIVE.with(|c| c.set(self.0));
+        }
+    }
+}
+
+#[cfg(not(feature = "std"))]
+pub(crate) mod yq_read_only_context {
+    pub(crate) fn active() -> bool {
+        false
+    }
+
+    pub(crate) struct Guard;
+
+    pub(crate) fn enter() -> Guard {
+        Guard
+    }
+}
+
+/// Whether a key lookup that found nothing must yield **no output** here,
+/// instead of the `null` node every other context reads back (#2470).
+///
+/// The single gate on [`yq_read_only_context`]: the mode says whether the
+/// rule exists at all, the ambient scope says whether it applies right now.
+/// Deliberately keyed on the *lookup kind*, not on the value: only a key
+/// lookup (`.zzz`, `.["zzz"]`, `.[$k]` with a string `$k`) is covered, on an
+/// object without that key or on a `null` node. An out-of-range **array**
+/// index is not -- real yq auto-creates through arrays even inside a
+/// read-only context (`.x = (.n[9] | key)` on `n: [1, 2]` is `x: 9`, and it
+/// pads `n` out to ten elements while it is at it), so `.n[9]` stays the
+/// ordinary `null` read.
+pub(crate) fn yq_absent_key_read_is_empty<S: EvalSemantics>() -> bool {
+    S::READ_ONLY_ABSENT_KEY_IS_EMPTY && yq_read_only_context::active()
 }
 
 /// The two per-mode rules a binary-operator fanout needs, resolved once from
@@ -1282,7 +1402,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     match expr {
         Expr::Identity => QueryResult::One(value),
 
-        Expr::Field(name) => index_object_by_name::<W>(value, name, optional),
+        Expr::Field(name) => index_object_by_name::<W, S>(value, name, optional),
 
         Expr::Index { idx, .. } => index_array_by_position::<W, S>(value, *idx, optional),
 
@@ -16697,11 +16817,17 @@ fn find_field<'a, W: Clone + AsRef<[u64]>>(
 /// null-input passthrough below is reached *only* for a valid key kind, which is
 /// what makes `null | .["a"]` yield `null` while `null | .[null]` errors.
 #[inline]
-fn index_object_by_name<'a, W: Clone + AsRef<[u64]>>(
+fn index_object_by_name<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     name: &str,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // #2470 (yq mode, inside a read-only context only): a key lookup that
+    // finds nothing yields *no* node rather than `null` -- on an object
+    // without the key and on a `null` node alike (real yq's `.a * 2` on a
+    // `null` document is empty, while on `a: null` it raises, so the
+    // distinction is "was a child found", not "is the parent null").
+    let absent_is_empty = yq_absent_key_read_is_empty::<S>();
     match value {
         // #1995: a non-string sibling key (`fields.find`'s own `Err`) is a
         // hard parse-time error in real jq, never suppressed by this
@@ -16715,10 +16841,12 @@ fn index_object_by_name<'a, W: Clone + AsRef<[u64]>>(
         StandardJson::Object(fields) => match find_field::<W>(fields, name) {
             Ok(Some(v)) => QueryResult::One(v),
             // jq returns null for missing fields on objects (not an error)
+            Ok(None) if absent_is_empty => QueryResult::None,
             Ok(None) => QueryResult::One(StandardJson::Null),
             Err(e) => QueryResult::Error(e),
         },
         // jq returns null for field access on null
+        StandardJson::Null if absent_is_empty => QueryResult::None,
         StandardJson::Null => QueryResult::One(StandardJson::Null),
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_index_with_field(type_name(&value), name)),
@@ -16876,7 +17004,7 @@ fn index_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
     match key {
         OwnedValue::String(s) if indexable_by_string => {
-            index_object_by_name::<W>(target, s, optional)
+            index_object_by_name::<W, S>(target, s, optional)
         }
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)
             if indexable_by_number =>
@@ -19400,11 +19528,12 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // on a clean multi-output completion -- shared with `eval_update_multi`
     // (#1844). See `normalize_rhs_values_for_fork`'s own doc comment for
     // the full rationale of both rules.
-    let (rhs_values, terminal) =
-        match normalize_rhs_values_for_fork::<W, S>(rhs_values, terminal, optional) {
-            Ok(v) => v,
-            Err(early_return) => return early_return,
-        };
+    let (rhs_values, terminal) = match normalize_rhs_values_for_fork::<W, S>(
+        rhs_values, terminal, optional, path_expr, &input,
+    ) {
+        Ok(v) => v,
+        Err(early_return) => return early_return,
+    };
 
     // Resolve computed keys against the *original* document, before any
     // write, then apply them to every RHS output in turn: `.[("a","b")] =
@@ -19586,6 +19715,18 @@ fn collect_rhs_outputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     input: &StandardJson<'a, W>,
     optional: bool,
 ) -> Result<(Vec<OwnedValue>, Option<Control>), QueryResult<'a, W>> {
+    // #2470 (yq mode): `assignUpdateOperator` runs a plain `=`'s right side
+    // through `crossFunction(d, context.ReadOnlyClone(), ...)`, which forces
+    // `Context.DontAutoCreate` on for that evaluation -- so a key lookup that
+    // finds nothing in here yields no node at all, and `.x = (.zzz | key)` is
+    // `x: null` rather than `x: "zzz"`. Captured the same way for `+=`/`-=`/
+    // `*=`, which share this prologue (`/=`, `%=` and `//=` share it too;
+    // real yq's parser has no such operators, so those are succinctly
+    // extensions kept consistent with their siblings rather than matched).
+    // `|=` never reaches here: `eval_update` evaluates its filter through
+    // `update_path` instead, matching yq's own `SingleChildContext`, which
+    // leaves `DontAutoCreate` alone. See `yq_read_only_context`.
+    let _scope = S::READ_ONLY_ABSENT_KEY_IS_EMPTY.then(yq_read_only_context::enter);
     match eval_single::<W, S>(value_expr, input.clone(), optional).materialize_cursor() {
         QueryResult::One(v) => match to_owned(&v) {
             Ok(owned) => Ok((vec![owned], None)),
@@ -19612,9 +19753,11 @@ fn collect_rhs_outputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// the fork loop runs -- shared by `eval_assign`/`eval_compound_assign`/
 /// `eval_alternative_assign` (#392/#1430/#1844):
 ///
-/// - A zero-output RHS produces zero documents (`Err` short-circuits the
-///   caller directly with that result) -- not `eval_rhs_once`'s old
-///   "collapse empty to `Null`" behavior.
+/// - A zero-output RHS produces zero documents in **jq** mode (`Err`
+///   short-circuits the caller directly with that result) -- not
+///   `eval_rhs_once`'s old "collapse empty to `Null`" behavior. In **yq**
+///   mode it produces exactly one document instead, with the target path
+///   auto-created but never written -- [`yq_empty_rhs_document`], #2470.
 /// - Real yq never forks over a multi-output RHS the way jq's does (#392):
 ///   it applies only the *last* output, once, to every resolved path --
 ///   confirmed live (v4.53.3): `.x = (1,2,3)` on `{"x":0}` is `{"x":3}`,
@@ -19631,9 +19774,14 @@ fn normalize_rhs_values_for_fork<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     mut rhs_values: Vec<OwnedValue>,
     terminal: Option<Control>,
     optional: bool,
+    path_expr: &Expr,
+    input: &StandardJson<'a, W>,
 ) -> Result<(Vec<OwnedValue>, Option<Control>), QueryResult<'a, W>> {
     if rhs_values.is_empty() {
         return Err(match terminal {
+            None if S::READ_ONLY_ABSENT_KEY_IS_EMPTY => {
+                yq_empty_rhs_document::<W, S>(path_expr, input, optional)
+            }
             None => QueryResult::None,
             Some(Control::Error(_)) if optional => QueryResult::None,
             Some(control) => partial(Vec::new(), control), // normalizes to bare Error/Break
@@ -19645,6 +19793,65 @@ fn normalize_rhs_values_for_fork<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         rhs_values.push(last);
     }
     Ok((rhs_values, terminal))
+}
+
+/// The one document a yq-mode assignment with a **zero-output** right side
+/// still emits (#2470): the target path auto-created, and nothing written
+/// into it.
+///
+/// Real yq's `assignUpdateOperator` navigates the left side with
+/// auto-creation on before it ever looks at the right side's candidates, and
+/// then simply runs its write loop zero times. So a *new* target survives as
+/// an explicit `null` while an *existing* one keeps its old value, and the
+/// document is emitted either way -- where jq mode produces no document at
+/// all (`jq '.x = empty'` is empty output, pinned in jq mode). Live-captured
+/// against yq v4.53.3 with a right side that is empty for reasons of its own
+/// (`1 | select(false)`), so the rule is keyed on "the right side produced
+/// nothing" and not on why:
+///
+/// | filter                     | input        | yq v4.53.3               |
+/// |----------------------------|--------------|--------------------------|
+/// | `.x = (1 \| select(false))` | `a: 1`       | `{"a":1,"x":null}`       |
+/// | `.a = (1 \| select(false))` | `a: 1`       | `{"a":1}`                |
+/// | `.a.b.c = (1 \| select(false))` | `z: 1`  | `{"z":1,"a":{"b":{"c":null}}}` |
+/// | `.a[] = (1 \| select(false))` | `z: 1`     | `{"z":1,"a":[]}`         |
+/// | `.a[] = (1 \| select(false))` | `a: [1,2]` | `{"a":[1,2]}`            |
+/// | `(.a,.b) = (1 \| select(false))` | `a: 1`  | `{"a":1,"b":null}`       |
+///
+/// Implemented as `path |= .` rather than a bespoke "vivify but skip the
+/// write" walk: `update_path` already creates every missing step on the way
+/// down and then writes back whatever the filter returned, so an
+/// `Expr::Identity` filter is exactly "create the path, change nothing" --
+/// including the `Iterate`-autovivifies-`Null`-to-`[]` and slice cases,
+/// which a second hand-written walk would have had to re-derive (and could
+/// then drift from, the #106 failure this file keeps one definition to
+/// avoid).
+fn yq_empty_rhs_document<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    path_expr: &Expr,
+    input: &StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    // Same `optional` policy, in the same order, as `eval_assign`'s own
+    // `NotChecked` arm: a non-decode-failure `to_owned` error and a path
+    // resolution error are both swallowed by an outer `?`, a halt never is.
+    let mut result = match to_owned(input) {
+        Ok(result) => result,
+        Err(e) => return suppress_or_raise(e, optional),
+    };
+    let paths = match resolve_dynamic_indexes::<S>(path_expr, &result, false) {
+        Ok(paths) => paths,
+        Err((_, EvalEscape::Error(_))) if optional => return QueryResult::None,
+        Err((_, escape)) => return escape.into(),
+    };
+    for path in &paths {
+        if let Err(escape) = update_path::<S>(&mut result, path, &Expr::Identity, false, true) {
+            return match escape {
+                EvalEscape::Error(_) if optional => QueryResult::None,
+                other => other.into(),
+            };
+        }
+    }
+    QueryResult::Owned(result)
 }
 
 /// Shared RHS-fork loop for `eval_assign`/`eval_compound_assign`/
@@ -19734,11 +19941,12 @@ fn eval_update_multi<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     terminal: Option<Control>,
     build_filter: impl FnMut(OwnedValue) -> Expr,
 ) -> QueryResult<'a, W> {
-    let (rhs_values, terminal) =
-        match normalize_rhs_values_for_fork::<W, S>(rhs_values, terminal, optional) {
-            Ok(v) => v,
-            Err(early_return) => return early_return,
-        };
+    let (rhs_values, terminal) = match normalize_rhs_values_for_fork::<W, S>(
+        rhs_values, terminal, optional, path_expr, &input,
+    ) {
+        Ok(v) => v,
+        Err(early_return) => return early_return,
+    };
 
     // #1953: a non-decode-failure to_owned error respects `optional`
     // like the sibling `resolve_dynamic_indexes` arm just below (and
@@ -29618,8 +29826,17 @@ fn eval_owned_navigation<S: EvalSemantics>(
     );
     match expr {
         Expr::Identity => Some(Ok(Some(input.clone()))),
+        // #2470: `Ok(None)` here is this helper's own "no output", which is
+        // exactly what a key lookup that found nothing must produce inside a
+        // read-only context (`yq_absent_key_read_is_empty`) -- the same rule
+        // its cursor-based sibling `index_object_by_name` applies.
         Expr::Field(name) => Some(match input {
-            OwnedValue::Object(map) => Ok(Some(map.get(name).cloned().unwrap_or(OwnedValue::Null))),
+            OwnedValue::Object(map) => Ok(match map.get(name) {
+                Some(v) => Some(v.clone()),
+                None if yq_absent_key_read_is_empty::<S>() => None,
+                None => Some(OwnedValue::Null),
+            }),
+            OwnedValue::Null if yq_absent_key_read_is_empty::<S>() => Ok(None),
             OwnedValue::Null => Ok(Some(OwnedValue::Null)),
             _ if optional => Ok(None),
             _ => Err(EvalError::cannot_index_with_field(
@@ -34485,6 +34702,15 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let mut new_path = current_path.to_vec();
             new_path.push(OwnedValue::String(name.clone()));
 
+            // #2470 (yq mode, read-only context only): a key lookup that
+            // finds nothing yields *no* node here either, so `rest` never
+            // runs and `key`/`path` have nothing to report -- which is
+            // exactly real yq's ordering, where `traverseMap` drops the
+            // candidate before `operator_keys.go` is ever reached. The same
+            // rule, from the same definition, that `index_object_by_name`
+            // applies on the ordinary read path.
+            let absent_is_empty = yq_absent_key_read_is_empty::<S>();
+
             // Get the field value
             if let OwnedValue::Object(entries) = value {
                 if let Some(v) = entries.get(name) {
@@ -34496,6 +34722,9 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         &new_path,
                         optional,
                     );
+                }
+                if absent_is_empty {
+                    return QueryResult::None;
                 }
                 // jq returns null for missing fields on objects (not an
                 // error) -- continue `rest` from that `Null` at `new_path`
@@ -34514,6 +34743,9 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // jq returns null for field access on null, same #2213 fix as
             // the missing-field case just above.
             if matches!(value, OwnedValue::Null) {
+                if absent_is_empty {
+                    return QueryResult::None;
+                }
                 return continue_rest_with_borrowed_value::<W, S>(
                     &OwnedValue::Null,
                     rest,
@@ -53603,7 +53835,9 @@ mod tests {
         let cursor = index.root(json_bytes);
         let result = match expr {
             Expr::Identity => QueryResult::One(cursor.value()),
-            Expr::Field(name) => index_object_by_name::<Vec<u64>>(cursor.value(), name, optional),
+            Expr::Field(name) => {
+                index_object_by_name::<Vec<u64>, JqSemantics>(cursor.value(), name, optional)
+            }
             Expr::Index { idx, .. } => {
                 index_array_by_position::<Vec<u64>, JqSemantics>(cursor.value(), *idx, optional)
             }
