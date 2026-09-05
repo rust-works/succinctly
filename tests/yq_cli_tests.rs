@@ -1419,6 +1419,12 @@ fn test_yq_default_rejects_jq_only_builtins_1512() -> Result<()> {
         "isnormal",
         "isfinite",
         "nan",
+        // #2462: real yq's lexer rejects these outright ("invalid input
+        // text"); real yq spells the same operation `downcase`/`upcase`,
+        // which are always on (not gated -- see
+        // test_yq_downcase_upcase_builtins_2462).
+        "ascii_downcase",
+        "ascii_upcase",
     ] {
         let (_out, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[])?;
         assert_ne!(code, 0, "filter {filter:?} should be rejected by default");
@@ -1571,6 +1577,8 @@ fn test_yq_jq_extensions_flag_enables_jq_only_builtins_1512() -> Result<()> {
         "1 | isnormal",
         "1 | isfinite",
         "nan",
+        "\"ABC\" | ascii_downcase",
+        "\"abc\" | ascii_upcase",
     ] {
         let (_out, stderr, code) =
             run_yq_stdin_with_stderr(filter, "a: 1\n", &["--jq-extensions"])?;
@@ -33503,5 +33511,45 @@ fn test_yq_binary_operator_fans_out_left_major_2451() -> Result<()> {
         assert_eq!(out.trim(), want, "`{filter}`");
     }
 
+    Ok(())
+}
+
+/// #2462: real yq v4.53.3 has its own `downcase`/`upcase` builtins (jq has
+/// no such names at all -- `downcase`/`upcase` are undefined there too, so
+/// this is reference surface per ADR-0018, not a succinctly extension).
+/// Captured live from yq v4.53.3 (`-o=json -I0`) on `a:\n  c: x\n`:
+///
+/// ```text
+/// $ yq -o=json -I0 '.a.c | downcase'          "x"
+/// $ yq -o=json -I0 '.a.c | upcase'            "X"
+/// $ yq -o=json -I0 '.a.c | downcase | key'    "c"    (keeps the node's position)
+/// $ yq -o=json -I0 '.a.c | upcase | path'     ["a","c"]
+/// $ yq -o=json -I0 '.a.c | ascii_downcase'    Error: 1:10: lexer: invalid input text "cii_downcase"
+/// ```
+///
+/// jq 1.7.1 has neither spelling (`downcase`/1.7.1 is not defined), so
+/// jq mode is unaffected and not asserted against the oracle here --
+/// see `test_jq_mode_has_no_downcase_upcase_2462` (jq_cli_tests.rs).
+#[test]
+fn test_yq_downcase_upcase_builtins_2462() -> Result<()> {
+    let args = &["-o=json", "-I=0"];
+    let doc = "a:\n  c: x\n";
+    for (filter, expected) in [
+        (".a.c | downcase", "\"x\""),
+        (".a.c | upcase", "\"X\""),
+        (".a.c | downcase | key", "\"c\""),
+        (".a.c | upcase | path", "[\"a\",\"c\"]"),
+    ] {
+        let (output, code) = run_yq_stdin(filter, doc, args)?;
+        assert_eq!(code, 0, "`{filter}`: {output:?}");
+        assert_eq!(output.trim(), expected, "`{filter}`");
+    }
+    // Real yq's lexer rejects jq's own spelling outright.
+    let (_out, stderr, code) = run_yq_stdin_with_stderr(".a.c | ascii_downcase", doc, &[])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("--jq-extensions"),
+        "stderr should mention --jq-extensions, got: {stderr}"
+    );
     Ok(())
 }

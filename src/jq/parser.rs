@@ -3376,12 +3376,30 @@ impl<'a> Parser<'a> {
         }
 
         // Phase 5: String Functions
+        // Real yq's lexer rejects `ascii_downcase`/`ascii_upcase` outright
+        // ("invalid input text") -- they're jq's own spellings, gated behind
+        // `--jq-extensions` like the rest of the jq-only surface (#1512,
+        // #2462).
         if self.matches_keyword("ascii_downcase") {
+            self.reject_unless_jq_extensions("ascii_downcase")?;
             self.consume_keyword("ascii_downcase");
             return Ok(Some(Builtin::AsciiDowncase));
         }
         if self.matches_keyword("ascii_upcase") {
+            self.reject_unless_jq_extensions("ascii_upcase")?;
             self.consume_keyword("ascii_upcase");
+            return Ok(Some(Builtin::AsciiUpcase));
+        }
+        // `downcase`/`upcase` are real yq v4.53.3 builtins (not jq's own --
+        // jq has no such names), so they're reference surface rather than an
+        // extension: always on in yq mode, never recognized in jq mode
+        // (falls through to jq's own "downcase/0 is not defined") (#2462).
+        if self.mode == ParserMode::Yq && self.matches_keyword("downcase") {
+            self.consume_keyword("downcase");
+            return Ok(Some(Builtin::AsciiDowncase));
+        }
+        if self.mode == ParserMode::Yq && self.matches_keyword("upcase") {
+            self.consume_keyword("upcase");
             return Ok(Some(Builtin::AsciiUpcase));
         }
         if self.matches_keyword("ltrimstr") {

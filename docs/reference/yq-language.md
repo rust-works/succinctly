@@ -193,6 +193,8 @@ succinctly yq --eval-all '[.] | reduce .[] as $item ({}; . * $item)' f1.yaml f2.
 | `load(file)`  | Load external YAML/JSON file                 | `load("config.yaml")`          |
 | `parent`      | Return parent node                           | `.. \| select(.name) \| parent`|
 | `parent(n)`   | Return nth parent node                       | `parent(2)`                    |
+| `downcase`    | Lowercase ASCII characters                   | `"HELLO" \| downcase`          |
+| `upcase`      | Uppercase ASCII characters                   | `"hello" \| upcase`            |
 
 ```bash
 # Remove keys from object
@@ -212,7 +214,17 @@ succinctly yq '. + {config: load("defaults.yaml")}' input.yaml
 
 # Get parent of matching node
 succinctly yq '.. | select(.name == "target") | parent' file.yaml
+
+# Case conversion (real yq spellings, confirmed live against v4.53.3)
+echo '"HELLO"' | succinctly yq 'downcase'
+# Output: hello
 ```
+
+Real yq's lexer rejects jq's own `ascii_downcase`/`ascii_upcase` spellings
+outright (`invalid input text`) -- those are gated behind `--jq-extensions`
+like the rest of the jq-only surface (see
+[Gated jq Builtins](#gated-jq-builtins---jq-extensions)), while `downcase`/
+`upcase` are always on (#2462).
 
 ### Merge-Flag Suffixes on `*`/`*=`
 
@@ -446,6 +458,7 @@ surface (#1512):
 | `sin`, `cos`, `tan`                                  | Trig functions (#1837)                        |
 | `asinh`, `acosh`, `atanh`                            | Inverse hyperbolic trig functions (#1837)     |
 | `skip(n; f)`                                         | Drop the first `n` outputs of `f` (#1882)     |
+| `ascii_downcase`, `ascii_upcase`                     | jq's spellings of `downcase`/`upcase` (#2462) |
 
 ```bash
 echo '{}' | succinctly yq 'paths'

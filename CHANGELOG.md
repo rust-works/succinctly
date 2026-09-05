@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`succinctly yq` gains real yq's own `downcase`/`upcase` builtins** (#2462).
+  Confirmed live against yq v4.53.3: `downcase`/`upcase` lowercase/uppercase
+  ASCII characters and keep the node's position (`.a.c | downcase | key` is
+  `"c"`), while yq's lexer rejects jq's own `ascii_downcase`/`ascii_upcase`
+  spellings outright (`invalid input text`) — those remain available only
+  behind `--jq-extensions`, like the rest of the jq-only surface (#1512).
+
 ### Changed
 
 - **`succinctly yq --eval-all` now evaluates over the document *list*, not a
