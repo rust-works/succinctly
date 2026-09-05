@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`succinctly yq`'s ordering comparisons (`<`/`<=`/`>`/`>=`) against a real
+  `null` now answer `false`, not jq's total order** (#2483). Confirmed live
+  against yq v4.53.3: real yq treats `null` as orderable only against
+  another `null` (`null <= null`/`null >= null` are `true`, matching
+  equality), never against any other value (`null < 1`, `1 < null`, `.zzz <
+  1` are all `false`) -- jq's total order sorts `null` below everything, so
+  `null < 1` is `true` there, which is what succinctly reproduced in yq mode
+  too before this fix. `null` against an array/object remains a residual
+  gap: real yq raises an operand-order-dependent, Go-internal error there
+  instead of answering at all, which this fix does not chase.
+
 ### Changed
 
 - **`succinctly yq --eval-all` now evaluates over the document *list*, not a

@@ -33505,3 +33505,81 @@ fn test_yq_binary_operator_fans_out_left_major_2451() -> Result<()> {
 
     Ok(())
 }
+
+/// #2483: real yq's ordering comparisons (`<`/`<=`/`>`/`>=`) treat a real
+/// `null` operand as orderable only against another `null` -- never against
+/// any other value -- unlike jq's total order (which sorts `null` below
+/// everything, so jq's `null < 1` is `true`). succinctly reproduced jq's
+/// total order in yq mode too before this fix. Captured live from yq
+/// v4.53.3 (`-o=json -I0`) on `a: 1`:
+///
+/// ```text
+/// $ yq 'null == 1'    false      $ yq '1 == null'    false
+/// $ yq 'null != 1'    true       $ yq '1 != null'    true
+/// $ yq 'null < 1'     false      $ yq '1 < null'     false
+/// $ yq 'null <= 1'    false      $ yq '1 <= null'    false
+/// $ yq 'null > 1'     false      $ yq '1 > null'     false
+/// $ yq 'null >= 1'    false      $ yq '1 >= null'    false
+/// $ yq 'null == null' true
+/// $ yq 'null != null' false
+/// $ yq 'null < null'  false
+/// $ yq 'null > null'  false
+/// $ yq 'null <= null' true
+/// $ yq 'null >= null' true
+/// $ yq '.zzz < 1'     false   (a real null node, not an empty operand)
+/// ```
+///
+/// `null` against `"a"`/`false` gives the same row as `null` against `1`
+/// (also captured live, not shown above for brevity).
+///
+/// Fixed as `eval::yq_null_ordering_is_false`, consulted from the one
+/// shared `eval::apply_compare_op` all three evaluators route every
+/// comparison through -- see `docs/compliance/yq/limitations.md`'s
+/// "Ordering comparisons against a real `null`" entry, which also records
+/// the one residual this fix does not chase: `null` against an array/object
+/// raises a Go-internal, operand-order-dependent error in real yq rather
+/// than answering `false`.
+#[test]
+fn test_yq_null_ordering_comparisons_are_false_2483() -> Result<()> {
+    let args = &["-o=json", "-I=0"];
+    let doc = "a: 1\n";
+    for (filter, expected) in [
+        ("null == 1", "false"),
+        ("null != 1", "true"),
+        ("null < 1", "false"),
+        ("null <= 1", "false"),
+        ("null > 1", "false"),
+        ("null >= 1", "false"),
+        ("1 == null", "false"),
+        ("1 != null", "true"),
+        ("1 < null", "false"),
+        ("1 <= null", "false"),
+        ("1 > null", "false"),
+        ("1 >= null", "false"),
+        ("null == null", "true"),
+        ("null != null", "false"),
+        ("null < null", "false"),
+        ("null > null", "false"),
+        ("null <= null", "true"),
+        ("null >= null", "true"),
+        ("null == \"a\"", "false"),
+        ("null < \"a\"", "false"),
+        ("null <= \"a\"", "false"),
+        ("null > \"a\"", "false"),
+        ("null >= \"a\"", "false"),
+        ("null == false", "false"),
+        ("null < false", "false"),
+        ("null <= false", "false"),
+        ("null > false", "false"),
+        ("null >= false", "false"),
+        (".zzz < 1", "false"),
+        (".zzz <= 1", "false"),
+        (".zzz > 1", "false"),
+        (".zzz >= 1", "false"),
+    ] {
+        let (output, code) = run_yq_stdin(filter, doc, args)?;
+        assert_eq!(code, 0, "`{filter}`: {output:?}");
+        assert_eq!(output.trim(), expected, "`{filter}`");
+    }
+    Ok(())
+}

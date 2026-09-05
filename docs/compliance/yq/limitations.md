@@ -1878,30 +1878,28 @@ existing one keeps its old value. Only **key** lookups are covered — real yq a
 through arrays even read-only (`.x = (.n[9] | key)` on `n: [1, 2]` is `x: 9`), so an
 out-of-range array index stays the ordinary `null` read.
 
-Five neighbouring shapes were captured alongside and are **not** part of this rule; each
-is a separate divergence:
+Four more neighbouring shapes were captured alongside and are **not** part of this rule;
+each is a separate divergence (a fifth, ordering comparisons against a real `null`, was
+captured here too but is now resolved -- see
+[#2483](https://github.com/rust-works/succinctly/issues/2483) below):
 
 | filter                                    | input             | real yq        | succinctly                             |
 |-------------------------------------------|-------------------|----------------|----------------------------------------|
-| `null < 1`, `.zzz < 1`, `null <= 1`       | `a: 1`            | `false`        | `true`                                 |
 | `.s.zzz`                                  | `s: x`            | *(nothing)*    | `Error: Cannot index string with string "zzz"` |
 | `.a \| with_entries(.value = key)`        | `a: {b: 1, e: 2}` | `{"b":0,"e":1}`| `{"b":1,"e":2}`                        |
 | `.a \|= (1 \| select(false))`             | `a: 1`            | `{"a":1}`      | `{"a":null}`                           |
 | `.x = (keys)`                             | `a: 1`            | `{"a":1,"x":["a","x"]}` | `{"a":1,"x":["a"]}`           |
 
-Row 1 is yq's ordering comparison against a real `null`, which is `false` for every
-operator regardless of the other side — nothing to do with absent reads (`.zzz` is a
-genuine `null` node in that position, since a comparison operand is not read-only).
-Row 2 is yq indexing a *scalar* with a key, which yields nothing everywhere, not only in
-a read-only context — it is what makes `.s.zzz + 1` also `1`. Row 3 is what `key` reports
+Row 1 is yq indexing a *scalar* with a key, which yields nothing everywhere, not only in
+a read-only context — it is what makes `.s.zzz + 1` also `1`. Row 2 is what `key` reports
 for an element of a constructed array: real yq answers the index, succinctly has no path
 context for a value it built itself, so the `=` right side is empty and the write is
-skipped. Row 4 is `|=` with a zero-output *filter*, which real yq no-ops the same way it
+skipped. Row 3 is `|=` with a zero-output *filter*, which real yq no-ops the same way it
 no-ops a zero-output `=` right side — succinctly's `update_path` writes `null` instead.
 `.x |= (1 | select(false))` on an absent `.x` already agrees (`x: null`), so only the
 existing-target half diverges.
 
-Row 5 is an evaluation-*order* divergence that predates all of this and is unrelated to
+Row 4 is an evaluation-*order* divergence that predates all of this and is unrelated to
 absent reads: real yq's `assignUpdateOperator` resolves (and auto-creates) the **left**
 side first, then evaluates the right side against the document that traversal has already
 mutated, so the right side can see the node the assignment is about to write into.
@@ -1924,6 +1922,51 @@ now correctly empty, the underlying order difference is what shows:
 (the `a: 1` prefix elided). Closing these needs the right side evaluated against the
 left-vivified document, which is a change to the assignment model rather than to this
 rule -- and would move `.x = (keys)`/`.x = (length)` at the same time.
+
+### Ordering comparisons against a real `null` -- resolved for scalars ([#2483](https://github.com/rust-works/succinctly/issues/2483)); containers remain a residual gap
+
+Real yq v4.53.3's ordering comparators (`<`/`<=`/`>`/`>=`) treat a real `null` operand as
+orderable only against another `null` -- never against any other value -- unlike jq's
+total order, which sorts `null` below everything (`null < 1` is jq's `true`). succinctly
+reproduced jq's total order in yq mode too before this fix. Captured live (`-o=json -I0`
+on `a: 1`, plus `.zzz` for a genuine `null` *node* rather than a `null` literal --
+comparison operands are not read-only, unlike an arithmetic/`and`/`or` operand under
+`yq_absent_key_read_is_empty`, the previous section's own rule):
+
+| filter                                          | real yq |
+|--------------------------------------------------|---------|
+| `null == 1` / `1 == null`                        | `false` |
+| `null != 1` / `1 != null`                        | `true`  |
+| `null < 1`, `<= 1`, `> 1`, `>= 1` (either order) | `false` |
+| `null == null`                                   | `true`  |
+| `null != null`                                   | `false` |
+| `null < null`, `null > null`                     | `false` |
+| `null <= null`, `null >= null`                   | `true`  |
+| `null <op> "a"`, `null <op> false`               | same as vs a number |
+| `.zzz < 1`                                       | `false` |
+
+Fixed as `eval::yq_null_ordering_is_false`, consulted from `eval::apply_compare_op` --
+the one shared comparison-operator implementation all three evaluators (the ordinary
+cursor evaluator, the eager path-context evaluator, and the generic/CLI evaluator) already
+route through, so this is a single call site, not three.
+
+**Not reproduced: `null` against an array/object.** Real yq raises a Go-internal error
+there instead of answering at all, and the wording depends on operand *order* -- its
+ordering comparator is implemented as a subtraction internally:
+
+```console
+$ yq 'null < []'
+Error: !!seq () cannot be subtracted from !!null
+$ yq '[] < null'
+Error: arrays not yet supported for comparison
+```
+
+That is a materially different, deeper quirk than "ordering against null is false", and
+reproducing it bug-for-bug (order-dependent wording, distinct messages per container
+kind) is out of scope here. succinctly instead falls under the same "`false`
+unconditionally" rule as the scalar case above for a `null`-vs-container ordering
+comparison — an improvement over the pre-fix `true` (jq's total order), but still not a
+byte-for-byte match with real yq's error.
 
 ### A negative out-of-range array index (`.a[-N]`) raises -- resolved for ordinary reads, a few call sites remain
 
