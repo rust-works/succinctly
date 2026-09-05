@@ -35,20 +35,20 @@ use super::document::{
     DocumentValue, IndentSpec, JsonConvention,
 };
 use super::eval::{
-    apply_compare_op, arith_combine, as_var_refs, bind_def, bind_def_call,
+    apply_compare_op, arith_combine, as_var_refs, binary_fanout_rules, bind_def, bind_def_call,
     cannot_reserve_cross_product, classify_limit_n, classify_nth_n, classify_parent_n,
     collapse_vec, collect_pattern_var_names, compare_values, debug_assert_materialization_error,
-    empty_operand_rule, enter_def_call_frame, eval_each_owned, eval_foreach_with_values,
-    eval_full as full_eval, eval_reduce_with_values, extract_pattern_bindings,
-    fold_escaped_generator_prefix, format_owned, has_type_mismatch_is_permissive,
-    index_component_value, index_in_array_bounds, index_one_owned as index_owned_by_key,
-    is_pure_chain_link, is_retryable_stop, literal_to_owned, needs_path_context,
-    numeric_key_to_array_index, numeric_key_to_index, owned_bound_to_i64, owned_to_string,
-    prefer_pending_control, slice_component_value, slice_object_as_yq_children,
+    enter_def_call_frame, eval_each_owned, eval_foreach_with_values, eval_full as full_eval,
+    eval_reduce_with_values, extract_pattern_bindings, fold_escaped_generator_prefix, format_owned,
+    has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
+    index_one_owned as index_owned_by_key, is_pure_chain_link, is_retryable_stop, literal_to_owned,
+    needs_path_context, numeric_key_to_array_index, numeric_key_to_index, owned_bound_to_i64,
+    owned_to_string, prefer_pending_control, slice_component_value, slice_object_as_yq_children,
     slice_owned_value_read, streams_escaped_generator_prefix, substitute_bound_var,
     substitute_vars, suppress_or_raise, suppresses, tonumber_from_str, vec_with_capacity,
-    yq_empty_operand_output, yq_negative_index_check, Control, Demand, EmptyOperandOp, EvalError,
-    EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail, QueryResult, YqSemantics,
+    yq_empty_operand_output, yq_negative_index_check, BinaryFanoutRules, Control, Demand,
+    EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail,
+    QueryResult, YqSemantics,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -6633,7 +6633,7 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             left,
             right,
             optional,
-            empty_operand_rule::<S>(EmptyOperandOp::Compare(*op)),
+            binary_fanout_rules::<S>(EmptyOperandOp::Compare(*op)),
             |left_val, right_val| {
                 Ok(OwnedValue::Bool(apply_compare_op::<S>(
                     *op, &left_val, &right_val,
@@ -6660,7 +6660,7 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             left,
             right,
             optional,
-            empty_operand_rule::<S>(EmptyOperandOp::Arith(*op)),
+            binary_fanout_rules::<S>(EmptyOperandOp::Arith(*op)),
             |left_val, right_val| arith_combine::<S>(*op, left_val, right_val),
             sink,
         ),
@@ -8107,7 +8107,7 @@ fn binary_fanout_each_generic<V: DocumentValue>(
     left: &Expr,
     right: &Expr,
     optional: bool,
-    empty_rule: Option<EmptyOperandOp>,
+    rules: BinaryFanoutRules,
     mut combine: impl FnMut(OwnedValue, OwnedValue) -> Result<OwnedValue, EvalError>,
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Flow {
@@ -8117,11 +8117,19 @@ fn binary_fanout_each_generic<V: DocumentValue>(
     // pairings -- the same rule, from the same definition, that
     // `eval::binary_fanout_each` consults on the eager route. `None` in jq
     // mode, where `1 + empty` really is nothing.
-    let mut right_seen = 0usize;
+    let mut outer_seen = 0usize;
+    // #2451: jq loops the right operand outermost, yq the left -- the same
+    // `BinaryFanoutRules::left_major` the eager loop reads, so the two routes
+    // cannot pick different orders.
+    let (outer_expr, inner_expr) = if rules.left_major {
+        (left, right)
+    } else {
+        (right, left)
+    };
 
-    let outer = each_operand(right, &mut |right_item: GenericItem<V>| {
-        right_seen += 1;
-        let right_val = match generic_item_into_owned(right_item) {
+    let outer = each_operand(outer_expr, &mut |outer_item: GenericItem<V>| {
+        outer_seen += 1;
+        let outer_val = match generic_item_into_owned(outer_item) {
             Ok(v) => v,
             Err(control) => {
                 abort = Some(Flow::Escaped(control));
@@ -8129,17 +8137,22 @@ fn binary_fanout_each_generic<V: DocumentValue>(
             }
         };
 
-        let mut left_seen = 0usize;
-        let inner = each_operand(left, &mut |left_item: GenericItem<V>| {
-            left_seen += 1;
-            let left_val = match generic_item_into_owned(left_item) {
+        let mut inner_seen = 0usize;
+        let inner = each_operand(inner_expr, &mut |inner_item: GenericItem<V>| {
+            inner_seen += 1;
+            let inner_val = match generic_item_into_owned(inner_item) {
                 Ok(v) => v,
                 Err(control) => {
                     abort = Some(Flow::Escaped(control));
                     return Demand::Stop;
                 }
             };
-            match combine(left_val, right_val.clone()) {
+            let (left_val, right_val) = if rules.left_major {
+                (outer_val.clone(), inner_val)
+            } else {
+                (inner_val, outer_val.clone())
+            };
+            match combine(left_val, right_val) {
                 Ok(v) => sink(GenericItem::Owned(v)),
                 // Reached by the `Expr::Arithmetic` caller only: the two
                 // `Expr::Compare` call sites wrap the infallible
@@ -8165,13 +8178,13 @@ fn binary_fanout_each_generic<V: DocumentValue>(
             return Demand::Stop;
         }
 
-        // #2460 (yq mode only): the *left* operand produced nothing for this
-        // right value, so this pairing is answered from the empty-operand
+        // #2460 (yq mode only): the *inner* operand produced nothing for this
+        // outer value, so this pairing is answered from the empty-operand
         // table instead of skipped. Only once `inner` ran to exhaustion -- an
         // operand that escaped or was stopped part-way is not "empty".
-        if left_seen == 0 && matches!(inner, Flow::Exhausted) {
-            if let Some(op) = empty_rule {
-                if let Some(v) = yq_empty_operand_output(op, Some(&right_val)) {
+        if inner_seen == 0 && matches!(inner, Flow::Exhausted) {
+            if let Some(op) = rules.empty {
+                if let Some(v) = yq_empty_operand_output(op, Some(&outer_val)) {
                     if matches!(sink(GenericItem::Owned(v)), Demand::Stop) {
                         abort = Some(Flow::Stopped { pending: None });
                         return Demand::Stop;
@@ -8189,12 +8202,12 @@ fn binary_fanout_each_generic<V: DocumentValue>(
         }
     });
 
-    if let (Some(op), 0, None, Flow::Exhausted) = (empty_rule, right_seen, &abort, &outer) {
-        // #2460 (yq mode only): the *right* operand produced nothing, so the
-        // outer loop never ran and `left` was never evaluated at all -- drive
-        // it once here so `1 + key` and `key + 1` stay symmetric the way real
-        // yq is. Mirrors `eval::empty_outer_operand_pass`.
-        return empty_outer_operand_pass_generic::<V>(&each_operand, left, op, sink);
+    if let (Some(op), 0, None, Flow::Exhausted) = (rules.empty, outer_seen, &abort, &outer) {
+        // #2460 (yq mode only): the *outer* operand produced nothing, so the
+        // loop never ran and the inner one was never evaluated at all --
+        // drive it once here so `1 + key` and `key + 1` stay symmetric the
+        // way real yq is. Mirrors `eval::empty_outer_operand_pass`.
+        return empty_outer_operand_pass_generic::<V>(&each_operand, inner_expr, op, sink);
     }
     abort.unwrap_or(outer)
 }
@@ -8205,22 +8218,22 @@ fn binary_fanout_each_generic<V: DocumentValue>(
 /// `return` shape in the loop above).
 fn empty_outer_operand_pass_generic<V: DocumentValue>(
     each_operand: &impl Fn(&Expr, &mut dyn FnMut(GenericItem<V>) -> Demand) -> Flow,
-    left: &Expr,
+    other: &Expr,
     op: EmptyOperandOp,
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Flow {
     let mut abort: Option<Flow> = None;
-    let mut left_seen = 0usize;
-    let flow = each_operand(left, &mut |left_item: GenericItem<V>| {
-        left_seen += 1;
-        let left_val = match generic_item_into_owned(left_item) {
+    let mut other_seen = 0usize;
+    let flow = each_operand(other, &mut |other_item: GenericItem<V>| {
+        other_seen += 1;
+        let other_val = match generic_item_into_owned(other_item) {
             Ok(v) => v,
             Err(control) => {
                 abort = Some(Flow::Escaped(control));
                 return Demand::Stop;
             }
         };
-        match yq_empty_operand_output(op, Some(&left_val)) {
+        match yq_empty_operand_output(op, Some(&other_val)) {
             Some(v) => sink(GenericItem::Owned(v)),
             None => Demand::Continue,
         }
@@ -8228,7 +8241,7 @@ fn empty_outer_operand_pass_generic<V: DocumentValue>(
     if let Some(flow) = abort {
         return flow;
     }
-    if left_seen == 0 && matches!(flow, Flow::Exhausted) {
+    if other_seen == 0 && matches!(flow, Flow::Exhausted) {
         // Both operands empty: one pairing, with no "other operand" at all.
         if let Some(v) = yq_empty_operand_output(op, None) {
             return push_one_generic(GenericItem::Owned(v), sink);
@@ -8268,7 +8281,7 @@ fn eval_compare_generic<S: EvalSemantics, V: DocumentValue>(
         left,
         right,
         optional,
-        empty_operand_rule::<S>(EmptyOperandOp::Compare(op)),
+        binary_fanout_rules::<S>(EmptyOperandOp::Compare(op)),
         |left_val, right_val| {
             Ok(OwnedValue::Bool(apply_compare_op::<S>(
                 op, &left_val, &right_val,

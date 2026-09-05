@@ -32345,3 +32345,90 @@ fn test_yq_identity_union_composes_with_branch_major_order_2451() -> Result<()> 
 
     Ok(())
 }
+
+/// #2451 rule 3: a binary operator fans out **left-major** in yq mode.
+///
+/// `doCrossFunc` (`pkg/yqlib/operators.go:113-138`, v4.53.3) evaluates the
+/// left operand once, loops its matches outermost, and re-evaluates the right
+/// operand from scratch inside that loop -- so the *right* operand varies
+/// fastest. jq's own fanout loops the other way round (`(1,2) + (10,20)` is
+/// `11 12 21 22`), so the two disagree on order for any pairing where both
+/// operands produce more than one value.
+///
+/// Every row is a live capture on `CONTEXT_LIST_DOC_2451`; jq's answer is
+/// quoted beside it and pinned in `jq_cli_tests.rs`'s
+/// `test_jq_binary_fanout_stays_right_major_2451`.
+#[test]
+fn test_yq_binary_operator_fans_out_left_major_2451() -> Result<()> {
+    let args = &["-o", "json", "-I0"];
+    let doc = CONTEXT_LIST_DOC_2451;
+
+    for (filter, want) in [
+        // $ yq -o=json -I0 '(.a.c, .b.c) + (1, 10)'  =>  4 / 13 / 6 / 15
+        // $ jq -c        '(.a.c, .b.c) + (1, 10)'    =>  4 / 6 / 13 / 15
+        ("(.a.c, .b.c) + (1, 10)", "4\n13\n6\n15"),
+        // $ yq -o=json -I0 '(.n[0], .n[1]) - (1, 2)'  =>  0 / -1 / 1 / 0
+        // $ jq -c        '(.n[0], .n[1]) - (1, 2)'    =>  0 / 1 / -1 / 0
+        ("(.n[0], .n[1]) - (1, 2)", "0\n-1\n1\n0"),
+        // $ yq -o=json -I0 '(.a.c, .b.c) * (2, 3)'  =>  6 / 9 / 10 / 15
+        // $ jq -c        '(.a.c, .b.c) * (2, 3)'    =>  6 / 10 / 9 / 15
+        ("(.a.c, .b.c) * (2, 3)", "6\n9\n10\n15"),
+        // $ yq -o=json -I0 '(.a.c, .b.c) / (1, 2)'  =>  3.0 / 1.5 / 5.0 / 2.5
+        // $ jq -c        '(.a.c, .b.c) / (1, 2)'    =>  3 / 5 / 1.5 / 2.5
+        // (`3.0` vs `3` is yq's own integer-division rendering, not order.)
+        ("(.a.c, .b.c) / (1, 2)", "3.0\n1.5\n5.0\n2.5"),
+        // $ yq -o=json -I0 '(.a.c, .b.c) % (2, 3)'  =>  1 / 0 / 1 / 2
+        // $ jq -c        '(.a.c, .b.c) % (2, 3)'    =>  1 / 1 / 0 / 2
+        ("(.a.c, .b.c) % (2, 3)", "1\n0\n1\n2"),
+        // $ yq -o=json -I0 '(.n[0], .n[1]) < (1, 2)'
+        //     =>  false / true / false / false
+        // $ jq -c        '(.n[0], .n[1]) < (1, 2)'
+        //     =>  false / false / true / false
+        // Comparisons share the same loop.
+        ("(.n[0], .n[1]) < (1, 2)", "false\ntrue\nfalse\nfalse"),
+        // $ yq -o=json -I0 '(.a.c, .b.c) + (1, 10) + (100, 1000)'
+        //     =>  104 / 1004 / 113 / 1013 / 106 / 1006 / 115 / 1015
+        // $ jq -c        '(.a.c, .b.c) + (1, 10) + (100, 1000)'
+        //     =>  104 / 106 / 113 / 115 / 1004 / 1006 / 1013 / 1015
+        (
+            "(.a.c, .b.c) + (1, 10) + (100, 1000)",
+            "104\n1004\n113\n1013\n106\n1006\n115\n1015",
+        ),
+        // $ yq -o=json -I0 '.n[] + .n[]'  =>  2 3 4 3 4 5 4 5 6
+        // $ jq -c        '.n[] + .n[]'    =>  2 3 4 3 4 5 4 5 6
+        // Identical either way -- the operands are the same generator, so the
+        // two orders transpose onto each other. Pinned so a future change
+        // cannot quietly reorder it.
+        (".n[] + .n[]", "2\n3\n4\n3\n4\n5\n4\n5\n6"),
+        // $ yq -o=json -I0 '(.a, .b) | .c + (.d, 1)'  =>  7 / 4 / 11 / 6
+        // $ jq -c        '(.a, .b) | .c + (.d, 1)'    =>  7 / 4 / 11 / 6
+        // Also identical: a single-output left operand has nothing to
+        // permute. What it does pin is that #2451's rule 1 does not make the
+        // *operator* see the whole context list -- `crossFunctionWithPrefs`
+        // takes its per-node path for `,`-built nodes, so `+` still pairs
+        // within one node (the whole-list case is `EvaluateTogether`, #2427).
+        ("(.a, .b) | .c + (.d, 1)", "7\n4\n11\n6"),
+        // `and`/`or` were already left-major in both tools -- jq
+        // short-circuits per left output, which is the same nesting -- so
+        // they need no flag and did not move.
+        //
+        // $ yq -o=json -I0 '(.a.c > 1, .b.c > 100) and (.n[0] > 0, .n[1] > 100)'
+        //     =>  true / false / false
+        (
+            "(.a.c > 1, .b.c > 100) and (.n[0] > 0, .n[1] > 100)",
+            "true\nfalse\nfalse",
+        ),
+        // $ yq -o=json -I0 '(.a.c > 100, .b.c > 1) or (.n[0] > 100, .n[1] > 0)'
+        //     =>  false / true / true
+        (
+            "(.a.c > 100, .b.c > 1) or (.n[0] > 100, .n[1] > 0)",
+            "false\ntrue\ntrue",
+        ),
+    ] {
+        let (out, code) = run_yq_stdin(filter, doc, args)?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(out.trim(), want, "`{filter}`");
+    }
+
+    Ok(())
+}
