@@ -28223,6 +28223,34 @@ fn test_select_no_longer_raises_on_decode_failure_reachable_only_via_alias_1804(
     Ok(())
 }
 
+/// Code review on #1804's fix: an earlier version of the alias
+/// short-circuit gated on `c.is_alias()` before knowing whether the
+/// resolved target was a container or a scalar -- so it also swallowed a
+/// decode failure reachable through a bare *scalar*-target alias, even
+/// though resolving a scalar target costs O(1) (no children to cascade
+/// through) and was never part of the O(2^N) fan-out this issue fixes.
+/// Confirmed live against the two binaries either side of that fix: this
+/// exact input raised pre-fix, silently passed with the broad gate, and
+/// raises again with the container-only gate. Unlike the sibling test
+/// above (`b: *a` where `a` is an *array*), this one aliases a bare
+/// scalar directly.
+#[test]
+fn test_select_still_raises_on_decode_failure_reachable_only_via_scalar_alias_1804() -> Result<()> {
+    let doc = "a: &a \"b\\qc\"\nb: *a\n";
+
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr("select(.b) | 1", doc, &[])?;
+    assert_ne!(
+        code, 0,
+        "a decode failure reached through a scalar-target alias must still raise\nstdout: {stdout:?}\nstderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("invalid escape sequence"),
+        "stderr: {stderr}"
+    );
+
+    Ok(())
+}
+
 /// #1813: `colliding_display_key_error`'s uncatchability fix lives in
 /// shared `src/jq/error.rs`/`document.rs` code, reached identically by
 /// both evaluators -- confirms the fix applies to yq mode too, not just
