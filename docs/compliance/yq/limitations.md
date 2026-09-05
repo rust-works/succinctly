@@ -2257,7 +2257,7 @@ not inherit either of the two wrong spellings shown above.
 [#2419](https://github.com/rust-works/succinctly/issues/2419) is the ADR-0018 record for
 this divergence; fixing the re-spelling itself is out of its scope.
 
-### Comma binds looser than pipe in real yq — succinctly currently applies jq's grouping in both modes (#2420)
+### Comma binds looser than pipe in real yq — the grouping is resolved (#2420); two evaluation-model residuals remain (#2451, #2452)
 
 Real yq's parser is a shunting-yard operator-precedence parser
 ([`pkg/yqlib/expression_postfix.go`](https://github.com/mikefarah/yq/blob/v4.53.3/pkg/yqlib/expression_postfix.go)),
@@ -2265,9 +2265,13 @@ and its own precedence table
 ([`pkg/yqlib/operation.go`](https://github.com/mikefarah/yq/blob/v4.53.3/pkg/yqlib/operation.go))
 assigns `pipeOpType` precedence 30 and `unionOpType` (`,`) precedence 10 —
 **pipe binds *tighter* than comma**. jq's grammar ranks the two operators the
-other way around (comma binds tighter than pipe), and `succinctly` currently
-applies jq's ranking in *both* modes, not yq's own, in `succinctly yq`.
-Confirmed live against the pinned v4.53.3 binary and `/usr/bin/jq` 1.7.1 on
+other way around (comma binds tighter than pipe), and until
+[#2420](https://github.com/rust-works/succinctly/issues/2420) `succinctly`
+applied jq's ranking in *both* modes. `succinctly yq`'s parser now uses yq's
+own table (`parse_yq_comma_expr` in `src/jq/parser.rs`: a comma of
+pipe-without-comma operands, in `ParserMode::Yq` only); the `succinctly yq`
+rows below record the pre-fix output and are kept so the capture stays
+readable next to the two references. Confirmed live against the pinned v4.53.3 binary and `/usr/bin/jq` 1.7.1 on
 `printf 'a: 1\nb: 2\nc: 3\n'`:
 
 ```bash
@@ -2366,18 +2370,33 @@ comma/pipe precedence inside them, so `[.a, .b | . + 10]` is
 `[.a, (.b | . + 10)]` = `[1,12]`, not jq's `[11,12]`.
 
 Per [ADR-0018](../../adrs/adr-0018.md) rule 2, mode decides: `succinctly yq`
-must follow yq's grammar here, not jq's. It currently does not —
-`succinctly` parses `,` as binding tighter than `|` **in both modes** (jq's
-ranking), so any yq-mode filter that combines an unparenthesised `,` and `|`
-at the same bracket depth risks silently picking up jq's grouping in place of
-yq's own. This is filed as
-[#2420](https://github.com/rust-works/succinctly/issues/2420); this entry
-only records the divergence per ADR-0018 rule 6. Implementing yq's own
-precedence table in `succinctly yq`'s parser is a separate, out-of-scope
-change — see the issue for the parser-change plan and the test-surface audit
-of `tests/yq_cli_tests.rs` and the yq golden corpus that motivated capturing
-this before the Phase 0 corpus for [#2416](https://github.com/rust-works/succinctly/issues/2416)
-grew any larger.
+follows yq's grammar here, not jq's. The parser change landed under
+[#2420](https://github.com/rust-works/succinctly/issues/2420): `,` now binds
+looser than `|` in yq mode at every depth (pinned by
+`test_yq_pipe_precedence_holds_at_every_depth_2420`), parentheses and
+construction brackets behave as captured above, and `succinctly jq` is
+untouched (`test_jq_comma_still_binds_tighter_than_pipe_2420`). Three
+existing yq-mode tests that had encoded jq's grouping were re-captured against
+the pinned binary rather than kept.
+
+Two divergences the capture exposed are **not** precedence and stay open,
+pinned as residuals in `test_yq_pipe_precedence_residual_divergences_2420`:
+
+- [#2451](https://github.com/rust-works/succinctly/issues/2451): real yq
+  applies a pipe's right side to the whole *list* its left side produced, so
+  `(.a, .b) | (.c, .d)` on `a: {c: 3, d: 4}` / `b: {c: 5, d: 6}` prints
+  `3 5 4 6` in yq and `3 4 5 6` here (jq's per-element order). Both sides are
+  parenthesised, so no grouping rule reaches it; the oracle sweep's
+  `comma_stream` class is this divergence, which is why it did not flip when
+  the precedence fix landed.
+- [#2452](https://github.com/rust-works/succinctly/issues/2452): under yq's
+  own grouping `.a | .b, .c | . + 1` fails in its first branch; real yq drops
+  that branch silently and exits 0, succinctly raises as jq does.
+
+The `length` row above is also two things at once: real yq's rendered-width
+rule for scalars, and a succinctly-internal inconsistency where the comma
+fan-out path still applies jq's absolute-value rule
+([#2453](https://github.com/rust-works/succinctly/issues/2453)).
 
 ### Other categories
 
