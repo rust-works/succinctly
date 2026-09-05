@@ -5602,6 +5602,103 @@ fn test_yaml_merge_key_field_access_still_resolves_712() -> Result<()> {
     Ok(())
 }
 
+/// #1318: `resolve_merge_keys`/`merge_field_into` expand a mapping's own
+/// merge sources only one hop deep, copying a source's own `<<` field into
+/// the merged view as a literal `"<<"` key rather than recursively
+/// resolving it - so a name reachable only two-or-more hops down a merge
+/// chain (here, `x`/`y` are only ever explicit on `base`, never on `mid` or
+/// `top`) was silently invisible to `find`/`find_cursor`'s flat scan and
+/// read as `null`, even though real yq (v4.53.3) resolves it. Confirmed
+/// live against real yq for every assertion below, including the ones that
+/// must stay unchanged (`has`, `-o json`'s literal `"<<"` entry).
+#[test]
+fn test_yaml_merge_key_nested_traversal_resolves_1318() -> Result<()> {
+    let input = "base: &base {x: 1, y: 2, q: 0}\nmid: &mid { <<: *base, y: 5 }\ntop: &top { <<: *mid, q: 9 }\nz:   { <<: [*top], y: 99 }\n";
+
+    let (output, exit_code) = run_yq_stdin(".z.x", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(
+        output.trim(),
+        "1",
+        "z.x should resolve through z -> top -> mid -> base"
+    );
+
+    let (output, exit_code) = run_yq_stdin(".top.x", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(
+        output.trim(),
+        "1",
+        "top.x should resolve through top -> mid -> base"
+    );
+
+    let (output, exit_code) = run_yq_stdin(".z.q", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), "9", "top's own override of q must still win");
+
+    let (output, exit_code) = run_yq_stdin(".z[\"x\"]", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(
+        output.trim(),
+        "1",
+        "bracket indexing shares find_cursor with plain field access"
+    );
+
+    // Unchanged: `has` never expands beyond the one-hop merged view.
+    let (output, exit_code) = run_yq_stdin(".z | has(\"x\")", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), "false");
+
+    // Unchanged: the merged view's own literal "<<" entry, and -o json's
+    // rendering of it, are untouched by this fix.
+    let (output, exit_code) = run_yq_stdin(".z", input, &["-o", "json", "-I0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"<<":{"x":1,"y":5,"q":0},"q":9,"y":99}"#);
+
+    Ok(())
+}
+
+/// #1318: two sources merged via a `<<: [*a, *b]` sequence, where the
+/// queried field exists only inside each source's *own* nested `<<` (never
+/// copied into the one-hop merged view at all). Real yq (v4.53.3, default
+/// flags) has the last-listed source win here - confirmed live, and
+/// independently verified this is not simply "first-listed wins reversed":
+/// swapping declaration order without changing sequence order left the
+/// result unchanged, and swapping sequence order without changing
+/// declaration order flipped it.
+#[test]
+fn test_yaml_merge_key_nested_multi_source_last_listed_wins_1318() -> Result<()> {
+    let input = "deep1: &deep1 {w: 1}\nmid1: &mid1 {<<: *deep1}\ndeep2: &deep2 {w: 2}\nmid2: &mid2 {<<: *deep2}\nz: {<<: [*mid1, *mid2]}\n";
+    let (output, exit_code) = run_yq_stdin(".z.w", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), "2");
+    Ok(())
+}
+
+/// #1318: two *separate* `<<:` fields on the same mapping (not one
+/// sequence), each resolving to a different nested-only chain. Real yq
+/// (v4.53.3, default flags) has the later-declared `<<:` field win -
+/// confirmed live.
+#[test]
+fn test_yaml_merge_key_nested_duplicate_merge_fields_last_declared_wins_1318() -> Result<()> {
+    let input = "deepA: &deepA {w: 1}\nmidA: &midA {<<: *deepA}\ndeepB: &deepB {w: 2}\nmidB: &midB {<<: *deepB}\nz: {<<: *midA, <<: *midB}\n";
+    let (output, exit_code) = run_yq_stdin(".z.w", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), "2");
+    Ok(())
+}
+
+/// #1318: an own explicit field must still beat a value only reachable via
+/// the nested-merge fallback - the fallback must never even trigger when
+/// the one-hop merged view already has an answer.
+#[test]
+fn test_yaml_merge_key_own_field_beats_nested_fallback_1318() -> Result<()> {
+    let input = "deep1: &deep1 {w: 1}\nmid1: &mid1 {<<: *deep1}\nz: {<<: [*mid1], w: 99}\n";
+    let (output, exit_code) = run_yq_stdin(".z.w", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), "99");
+    Ok(())
+}
+
 #[test]
 fn test_yaml_mapping_anchor_preserved_on_query_result_712() -> Result<()> {
     // A query result whose OWN cursor carries the anchor (not a nested
