@@ -7726,12 +7726,15 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::DocumentIndex => builtin_document_index::<W>(),
         Builtin::LineComment => builtin_line_comment::<W>(),
         Builtin::FileIndex => {
-            // Requires the `--eval-all` path-context evaluator to resolve to
-            // anything but 0; reached here means either outside `--eval-all`
-            // or nested in a shape that evaluator doesn't cover (#715), the
-            // same documented "0 outside supported context" contract
-            // `document_index` already has.
-            QueryResult::Owned(OwnedValue::Int(0))
+            // The ambient node origin (#2427) when the CLI installed one --
+            // the ordinary multi-file path and `--eval-all` both do, per
+            // input document. Without it, `0`: reached here means either a
+            // single-file run or a shape the path-context evaluator doesn't
+            // cover (#715), the same documented "0 outside supported
+            // context" contract `document_index` already has.
+            QueryResult::Owned(OwnedValue::Int(
+                super::eval_generic::ambient_file_index().unwrap_or(0),
+            ))
         }
         Builtin::Shuffle => builtin_shuffle::<W>(value, optional),
         Builtin::Pivot => builtin_pivot::<W>(value, optional),
@@ -19323,6 +19326,13 @@ pub fn eval_lenient<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// Evaluate `expr` against a combined `--eval-all` array (succinctly
 /// extension, #715).
 ///
+/// **No longer the CLI's `--eval-all` route.** Since #2427 that is
+/// [`eval_documents_together`], which hands the expression the document list
+/// real yq's `ea` evaluates over rather than an array wrapping it. This entry
+/// point, and the file-origin table it installs, remain the library-level
+/// spelling for "evaluate against a combined array, resolving `file_index`
+/// from a per-top-level-element side table".
+///
 /// Makes `file_index`/`fileIndex`/`fi` resolve via `file_origin` -- a side
 /// table mapping each top-level array position to its originating file
 /// index, built by the yq CLI driver -- wherever
@@ -19374,6 +19384,69 @@ pub fn eval_owned_with_file_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>
             Some(file_origin),
         )
     })
+}
+
+/// Evaluate `expr` once over every document of every `--eval-all` input file
+/// (#2427) -- succinctly's `allAtOnceEvaluator.EvaluateFiles`.
+///
+/// `documents` is `(value, file index, document index within that file)`, in
+/// the order real yq reads them: every document of file 0, then of file 1, and
+/// so on. Each one becomes a context-list entry carrying real yq's
+/// `EvaluateTogether` flag and its own origin, and
+/// `eval_generic::eval_yq_documents_together` (private, so named rather than
+/// linked) runs the expression once over that list -- see its doc comment for
+/// the evaluation model, which is where the fidelity claim lives.
+///
+/// Each document is reindexed into its own throwaway JSON document so the
+/// entry can be a cursor: that is what lets `path`/`key`/`parent` answer
+/// relative to *that document* (`yq ea 'path' f1 f2` is `[]` twice, and
+/// `parent` at the root yields nothing) rather than relative to a containing
+/// array, which is exactly what the previous slurp got wrong. A document the
+/// round-trip would not preserve (`reindex_bridge_is_identity`) stays an owned
+/// value and loses only the position, not the value.
+pub fn eval_documents_together<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    documents: &[(OwnedValue, usize, usize)],
+) -> QueryResult<'a, W> {
+    use super::eval_generic::{reindex_bridge_is_identity, NodeOrigin, YqDocument};
+    use crate::json::JsonIndex;
+
+    // Same throwaway document `eval_owned_input_reindexed` builds, and the
+    // same `to_json_for_reindex` (not `to_json`) for the same reason (#561) --
+    // one per input document rather than one for a combined array.
+    let texts: Vec<String> = documents
+        .iter()
+        .map(|(value, _, _)| {
+            if reindex_bridge_is_identity(value) {
+                value.to_json_for_reindex::<S>()
+            } else {
+                String::new()
+            }
+        })
+        .collect();
+    let indexes: Vec<Option<JsonIndex>> = documents
+        .iter()
+        .zip(&texts)
+        .map(|((value, _, _), text)| {
+            reindex_bridge_is_identity(value).then(|| JsonIndex::build(text.as_bytes()))
+        })
+        .collect();
+    let inputs: Vec<YqDocument<_>> = documents
+        .iter()
+        .zip(&texts)
+        .zip(&indexes)
+        .map(|(((value, file, document), text), index)| YqDocument {
+            cursor: index.as_ref().map(|index| index.root(text.as_bytes())),
+            value: value.clone(),
+            origin: NodeOrigin {
+                file: *file,
+                document: Some(*document),
+            },
+        })
+        .collect();
+
+    let result = super::eval_generic::eval_yq_documents_together::<S, _>(expr, &inputs);
+    detach_from_temp_document(generic_to_query_result(result))
 }
 
 // =============================================================================
@@ -34686,13 +34759,20 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `document_index`'s existing "0 outside supported context" contract.
     // Position unchanged (#1449).
     if matches!(first, Expr::Builtin(Builtin::FileIndex)) {
-        let file_idx = current_path
-            .first()
-            .and_then(OwnedValue::as_i64)
-            .and_then(|i| usize::try_from(i).ok())
-            .and_then(|i| file_origin.and_then(|origins| origins.get(i).copied()))
-            .unwrap_or(0);
-        let file_index_result = QueryResult::Owned(OwnedValue::Int(file_idx as i64));
+        // #2427: the ambient node origin outranks the table, for the same
+        // reason `eval_generic::file_index_for_path` consults it first --
+        // the origin is a property of the node, the table a property of a
+        // position inside one combined array, and only one is ever
+        // installed at a time.
+        let file_idx = super::eval_generic::ambient_file_index().unwrap_or_else(|| {
+            current_path
+                .first()
+                .and_then(OwnedValue::as_i64)
+                .and_then(|i| usize::try_from(i).ok())
+                .and_then(|i| file_origin.and_then(|origins| origins.get(i).copied()))
+                .unwrap_or(0) as i64
+        });
+        let file_index_result = QueryResult::Owned(OwnedValue::Int(file_idx));
         return continue_rest_with_context::<W, S>(
             file_index_result,
             rest,
@@ -46125,8 +46205,12 @@ fn builtin_column<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
 /// when processing YAML directly.
 fn builtin_document_index<'a, W: Clone + AsRef<[u64]>>() -> QueryResult<'a, W> {
     // For JSON input or when document context is lost, return 0 (single document assumed).
-    // The generic evaluator handles this properly for YAML with cursor metadata.
-    QueryResult::Owned(OwnedValue::Int(0))
+    // The generic evaluator handles this properly for YAML with cursor metadata,
+    // and `--eval-all` installs an ambient node origin per input document
+    // (#2427) because its throwaway per-document JSON indexes each answer 0.
+    QueryResult::Owned(OwnedValue::Int(
+        super::eval_generic::ambient_document_index().unwrap_or(0),
+    ))
 }
 
 /// `line_comment` - returns the trailing same-line comment text, or `""` (yq, #710)

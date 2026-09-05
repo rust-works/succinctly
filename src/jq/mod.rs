@@ -87,8 +87,9 @@ pub mod walk;
 
 pub use error::{BinOp, Control, ErrorKind, EvalError, EvalErrorPayload};
 pub use eval::{
-    eval, eval_lenient, eval_owned_with_file_index, nonfinite_display_string, substitute_vars,
-    sync_aliased_paths, EvalSemantics, JqSemantics, QueryResult, YqSemantics,
+    eval, eval_documents_together, eval_lenient, eval_owned_with_file_index,
+    nonfinite_display_string, substitute_vars, sync_aliased_paths, EvalSemantics, JqSemantics,
+    QueryResult, YqSemantics,
 };
 // `input`/`inputs`/`input_line_number`'s CLI-facing seam (#723) -- only
 // exists under `eval.rs`'s own `#[cfg(feature = "std")]` gate (a `thread_local!`

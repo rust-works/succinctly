@@ -1085,12 +1085,13 @@ pub struct YqCommand {
     #[arg(short = 's', long, overrides_with = "slurp")]
     pub slurp: bool,
 
-    /// Combine all documents from all files into one evaluation context
-    /// (yq-compatible name: `eval-all`/`ea`), exposing `file_index`/
-    /// `fileIndex`/`fi` for cross-file merges. Unlike real yq, expressions
-    /// must use explicit `.[]` iteration (e.g. `.[] | select(file_index ==
-    /// 0)`) rather than a bare top-level `select(...)` -- see
-    /// docs/reference/yq-language.md for the full deviation (#715).
+    /// Evaluate the filter once over the list of every document of every
+    /// file (yq-compatible name: `eval-all`/`ea`), exposing `file_index`/
+    /// `fileIndex`/`fi` for cross-file merges. The filter never sees a
+    /// containing array, so it applies per document (`select(file_index ==
+    /// 0)`, not `.[] | select(...)`); `[E]` collects across the whole list
+    /// and a binary operator pairs both operands over it, matching real yq
+    /// (#715, #2427). See docs/reference/yq-language.md.
     #[arg(long = "eval-all", alias = "ea", overrides_with = "eval_all")]
     pub eval_all: bool,
 

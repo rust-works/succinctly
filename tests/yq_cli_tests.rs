@@ -1707,11 +1707,10 @@ fn test_input_format_json_bridge_preserves_decode_failure_key_1642() -> Result<(
     assert_eq!(code, 0);
     assert_eq!(output.trim(), r#"["a\\q","b"]"#, "--slurp keys");
 
-    let (output, code) = run_yq_stdin(
-        ".[0] | length",
-        json,
-        &["--input-format", "json", "--eval-all"],
-    )?;
+    // #2427: `--eval-all` is a document *stream*, not a slurped array, so
+    // the document itself is the input -- no `.[0]` unwrap (real yq's own
+    // `ea 'length'` answers the document's field count too).
+    let (output, code) = run_yq_stdin("length", json, &["--input-format", "json", "--eval-all"])?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), "2", "--eval-all length");
 
@@ -3028,9 +3027,12 @@ fn test_integer_valued_float_survives_slurp_eval_all_load_907() -> Result<()> {
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "[2.0]");
 
+    // #2427: `--eval-all` no longer slurps into an array, so `.` is the one
+    // document itself -- `2.0`, not `[2.0]`. Live-verified against yq
+    // v4.53.3: `yq ea -o=json -I0 '.'` on `2.0` prints `2`.
     let (out, code) = run_yq_stdin(".", "2.0", &["--eval-all", "-o", "json", "-I", "0"])?;
     assert_eq!(code, 0, "out: {out:?}");
-    assert_eq!(out.trim(), "[2.0]");
+    assert_eq!(out.trim(), "2.0");
 
     let mut input_file = NamedTempFile::new()?;
     writeln!(input_file, "a: 2.0")?;
@@ -4641,12 +4643,13 @@ fn test_nul_output_dom_path_no_separator_leak_on_later_doc_failure_1709() -> Res
 
 /// Same fix, `--eval-all` -- deferred separately from the standard loop
 /// above (own call site, own `results.len() > 1 && i > 0` condition).
-/// `--eval-all` combines every document into one array context, so `.[]`
-/// yields each *whole document* as its own result (`a: 1`, not `1`).
+/// Since #2427 `--eval-all` evaluates over the document *list*, so `.`
+/// already yields each whole document as its own result (`a: 1`, not `1`);
+/// `.[]` would iterate each document's members instead.
 #[test]
 fn test_nul_output_eval_all_no_separator_leak_on_later_doc_failure_1709() -> Result<()> {
     let input = "a: 1\n---\nb: \"x\\0y\"\n";
-    let (output, stderr, code) = run_yq_stdin_with_stderr(".[]", input, &["--eval-all", "-0"])?;
+    let (output, stderr, code) = run_yq_stdin_with_stderr(".", input, &["--eval-all", "-0"])?;
     assert_eq!(code, 1);
     assert_eq!(output, "a: 1\0");
     assert!(stderr.contains("NUL"), "got: {stderr}");
@@ -5130,17 +5133,14 @@ fn test_nul_output_multidoc_dom_path_does_not_corrupt_1701() -> Result<()> {
     Ok(())
 }
 
-/// Same fix, `--eval-all` (#1701 code review round 2). `.[]` (not `.`)
-/// is required to actually exercise the between-results `---` guard
-/// (`yq_runner.rs`'s `results.len() > 1 && i > 0` arm) -- `.` combines
-/// every document into a single array result under `--eval-all`, so it
-/// never reaches that branch at all (found by a round-4 gap sweep: the
-/// original version of this test round-tripped cleanly but tested a
-/// strictly weaker property than its own doc comment claimed).
+/// Same fix, `--eval-all` (#1701 code review round 2). The between-results
+/// `---` guard (`yq_runner.rs`'s `results.len() > 1 && i > 0` arm) needs a
+/// multi-result filter: before #2427 that meant `.[]` over the slurped
+/// array, and since #2427 plain `.` is already one result per document.
 #[test]
 fn test_join_output_eval_all_does_not_corrupt_1701() -> Result<()> {
     let input = "a: 1\n---\nb: 2\n";
-    let (output, code) = run_yq_stdin(".[]", input, &["--eval-all", "--join-output"])?;
+    let (output, code) = run_yq_stdin(".", input, &["--eval-all", "--join-output"])?;
     assert_eq!(code, 0);
     assert_eq!(output, "a: 1\n---\nb: 2");
     Ok(())
@@ -5150,7 +5150,7 @@ fn test_join_output_eval_all_does_not_corrupt_1701() -> Result<()> {
 #[test]
 fn test_nul_output_eval_all_does_not_corrupt_1701() -> Result<()> {
     let input = "a: 1\n---\nb: 2\n";
-    let (output, code) = run_yq_stdin(".[]", input, &["--eval-all", "-0"])?;
+    let (output, code) = run_yq_stdin(".", input, &["--eval-all", "-0"])?;
     assert_eq!(code, 0);
     assert_eq!(output, "a: 1\0\n---\nb: 2\0");
     Ok(())
@@ -11819,7 +11819,7 @@ fn test_computed_whole_float_json_sourced_input_unaffected_by_949() -> Result<()
 #[test]
 fn test_eval_all_applies_json_sourced_floats_1498() -> Result<()> {
     let (out, code) = run_yq_stdin(
-        ".[0].a",
+        ".a",
         r#"{"a":1.0}"#,
         &["--input-format", "json", "--eval-all", "-o=json"],
     )?;
@@ -11834,7 +11834,7 @@ fn test_eval_all_applies_json_sourced_floats_1498() -> Result<()> {
 #[test]
 fn test_eval_all_json_sourced_float_strips_trailing_zero_not_the_fraction_1498() -> Result<()> {
     let (out, code) = run_yq_stdin(
-        ".[0].a",
+        ".a",
         r#"{"a":2.50}"#,
         &["--input-format", "json", "--eval-all", "-o=json"],
     )?;
@@ -11848,7 +11848,7 @@ fn test_eval_all_json_sourced_float_strips_trailing_zero_not_the_fraction_1498()
 #[test]
 fn test_eval_all_json_sourced_int_unaffected_1498() -> Result<()> {
     let (out, code) = run_yq_stdin(
-        ".[0].a",
+        ".a",
         r#"{"a":5}"#,
         &["--input-format", "json", "--eval-all", "-o=json"],
     )?;
@@ -11864,7 +11864,7 @@ fn test_eval_all_json_sourced_int_unaffected_1498() -> Result<()> {
 /// `1.50` must not be affected by this fix at all.
 #[test]
 fn test_eval_all_yaml_sourced_float_keeps_literal_spelling_1498() -> Result<()> {
-    let (out, code) = run_yq_stdin(".[0].a", "a: 1.50\n", &["--eval-all", "-o=json"])?;
+    let (out, code) = run_yq_stdin(".a", "a: 1.50\n", &["--eval-all", "-o=json"])?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "1.50");
     Ok(())
@@ -12276,16 +12276,18 @@ fn test_yq_halt_not_caught_by_try_catch_or_label() -> Result<()> {
 /// must discard the whole array, same as error/break.
 #[test]
 fn test_map_with_path_context_discards_partial_array_on_halt() -> Result<()> {
+    // #2427: `--eval-all` hands the expression each document, not a slurped
+    // array of them, so the array `map` walks has to be inside a document.
+    // The halt is in the *first* document's own map, so nothing at all may
+    // reach stdout.
     let mut f1 = NamedTempFile::new()?;
-    writeln!(f1, "1")?;
+    writeln!(f1, "[1, 2]")?;
     let mut f2 = NamedTempFile::new()?;
-    writeln!(f2, "2")?;
-    let mut f3 = NamedTempFile::new()?;
-    writeln!(f3, "3")?;
+    writeln!(f2, "[3, 4]")?;
 
     let (stdout, stderr, code) = run_yq_files(
         "map(if . == 2 then halt else . + 10 + file_index end)",
-        &[f1.path(), f2.path(), f3.path()],
+        &[f1.path(), f2.path()],
         &["--eval-all"],
     )?;
     assert_eq!(code, 0, "stderr: {stderr}");
@@ -15511,12 +15513,20 @@ fn two_doc_fixtures() -> Result<(NamedTempFile, NamedTempFile)> {
     Ok((f1, f2))
 }
 
+/// #2427: `--eval-all` evaluates the expression once over the *list* of every
+/// document of every file, not over a slurped array of them, so `length` is
+/// each document's own field count -- two files, two answers. Live-verified:
+/// `yq ea -o=json -I0 'length' f1.yaml f2.yaml` prints `2` twice.
 #[test]
 fn test_eval_all_combines_documents_across_files() -> Result<()> {
     let (f1, f2) = two_doc_fixtures()?;
-    let (stdout, _stderr, code) = run_yq_files("length", &[f1.path(), f2.path()], &["--eval-all"])?;
+    let (stdout, _stderr, code) = run_yq_files(
+        "length",
+        &[f1.path(), f2.path()],
+        &["--eval-all", "-o", "json", "-I", "0"],
+    )?;
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "2");
+    assert_eq!(stdout.trim(), "2\n2");
     Ok(())
 }
 
@@ -15528,24 +15538,33 @@ fn test_eval_all_works_from_stdin() -> Result<()> {
     let (stdout, stderr, code) =
         run_yq_stdin_with_stderr(".", "a: 1\n", &["--eval-all", "-o", "json", "-I0"])?;
     assert_eq!(code, 0, "stderr: {stderr}");
-    assert_eq!(stdout.trim(), r#"[{"a":1}]"#);
+    // #2427: one document in, one document out -- no array wrapper. Real yq
+    // agrees: `yq ea -o=json -I0 '.'` on `a: 1` prints `{"a":1}`.
+    assert_eq!(stdout.trim(), r#"{"a":1}"#);
     Ok(())
 }
 
 #[test]
 fn test_eval_all_ea_alias() -> Result<()> {
     let (f1, f2) = two_doc_fixtures()?;
-    let (stdout, _stderr, code) = run_yq_files("length", &[f1.path(), f2.path()], &["--ea"])?;
+    let (stdout, _stderr, code) = run_yq_files(
+        "length",
+        &[f1.path(), f2.path()],
+        &["--ea", "-o", "json", "-I", "0"],
+    )?;
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "2");
+    assert_eq!(stdout.trim(), "2\n2");
     Ok(())
 }
 
+/// Bare `file_index` -- one answer per document since #2427, where before it
+/// needed a `.[]` to iterate the slurped array. `yq ea -o=json 'file_index'
+/// f1.yaml f2.yaml` prints `0` then `1`.
 #[test]
 fn test_eval_all_file_index_bare() -> Result<()> {
     let (f1, f2) = two_doc_fixtures()?;
     let (stdout, _stderr, code) = run_yq_files(
-        ".[] | file_index",
+        "file_index",
         &[f1.path(), f2.path()],
         &["--eval-all", "-o", "json"],
     )?;
@@ -15571,51 +15590,48 @@ fn test_eval_all_file_index_bare() -> Result<()> {
 /// cursor-threading arm yet (ADR-0021's remaining list). A regression that
 /// dropped the table on either side shows up as a `0` for the second file.
 ///
-/// **`--eval-all` slurps where real yq streams (#2427).** succinctly combines
-/// every document into one array, so `.[]` iterates *documents*; real yq
-/// keeps them a document stream, so its `.[]` iterates each document's own
-/// members. Both binaries answer the same question about which file a node
-/// came from -- they just disagree about what `.[]` selects. Captured live
-/// from yq v4.53.3 on 2026-09-05, on this test's own two fixtures
-/// (`a: 1 / name: first` and `b: 2 / name: second`):
+/// **Every row below is real yq's own answer since #2427**, which replaced the
+/// slurp with the document-list evaluation real `ea` performs, so `.[]` now
+/// iterates each *document's* members in both binaries rather than the
+/// documents themselves. Captured live from yq v4.53.3 on this test's own two
+/// fixtures (`a: 1 / name: first` and `b: 2 / name: second`):
 ///
 /// ```console
-/// $ yq ea -o=json -I0 '.[] | file_index'        f1 f2   # 0 0 1 1
-/// $ yq ea -o=json -I0 '[.[] | file_index]'      f1 f2   # [0,0,1,1]
-/// $ yq ea -o=json -I0 'file_index'              f1 f2   # 0 1
-/// $ yq ea -o=json -I0 '.[] | file_index + 1'    f1 f2   # 1 1 2 2
-/// $ yq ea -o=json -I0 '.[] | select(file_index == 1)' f1 f2
-/// 2
-/// "second"
-/// $ yq ea -o=json -I0 '.[].name | file_index'   f1 f2   # (no output)
+/// $ yq ea -o=json -I0 '.[] | file_index'              f1 f2   # 0 0 1 1
+/// $ yq ea -o=json -I0 '[.[] | file_index]'            f1 f2   # [0,0,1,1]
+/// $ yq ea -o=json -I0 'file_index'                    f1 f2   # 0 1
+/// $ yq ea -o=json -I0 '.name | file_index'            f1 f2   # 0 1
+/// $ yq ea -o=json -I0 '.[] | [file_index, key]'       f1 f2
+/// [0,"a"] [0,"name"] [1,"b"] [1,"name"]
+/// $ yq ea -o=json -I0 'select(file_index == 1) | .name' f1 f2 # "second"
+/// $ yq ea -o=json -I0 '.[] | file_index + 1'          f1 f2   # 1 1 2 2
 /// ```
 ///
-/// yq's counts are succinctly's doubled because each of its documents has two
-/// members; the file numbering itself (`0` then `1`) is the same, and that is
-/// the property this door closure had to preserve.
+/// The last row is a succinctly extension (real yq's lexer rejects
+/// `if`/`then`/`else` outright, #1512), kept because it is the shape that
+/// forces the eager route.
 #[test]
 fn test_eval_all_file_index_agrees_across_both_routes_2416() -> Result<()> {
     let (f1, f2) = two_doc_fixtures()?;
     // (filter, expected stdout, which route answers `file_index`)
     let rows: &[(&str, &str, &str)] = &[
-        (".[] | file_index", "0\n1", "cursor"),
-        ("[.[] | file_index]", "[0,1]", "cursor"),
-        ("file_index", "0", "cursor (root: no top-level index)"),
-        (".[].name | file_index", "0\n1", "cursor"),
-        (".[] | .name | file_index", "0\n1", "cursor"),
-        (".[] | [file_index, key]", "[0,0]\n[1,1]", "cursor"),
+        (".[] | file_index", "0\n0\n1\n1", "cursor"),
+        ("[.[] | file_index]", "[0,0,1,1]", "cursor"),
+        ("file_index", "0\n1", "cursor (document root)"),
+        (".name | file_index", "0\n1", "cursor"),
         (
-            ".[] | select(file_index == 1) | .name",
-            "\"second\"",
+            ".[] | [file_index, key]",
+            "[0,\"a\"]\n[0,\"name\"]\n[1,\"b\"]\n[1,\"name\"]",
             "cursor",
         ),
+        ("select(file_index == 1) | .name", "\"second\"", "cursor"),
         (
             ".[] | file_index + 1",
-            "1\n2",
+            "1\n1\n2\n2",
             "eager (no native arithmetic arm)",
         ),
         (
-            r#".[] | if file_index == 1 then "f2" else "f1" end"#,
+            r#"if file_index == 1 then "f2" else "f1" end"#,
             "\"f1\"\n\"f2\"",
             "cursor",
         ),
@@ -15650,7 +15666,8 @@ fn test_eval_all_file_index_agrees_across_both_routes_2416() -> Result<()> {
 ///
 /// Re-captured on this test's own two fixtures against real yq v4.53.3.
 /// succinctly's `--eval-all` is real yq's `eval-all`/`ea` subcommand (v4.53.3
-/// has no such *flag*), so `yq ea` is the oracle:
+/// has no such *flag*), so `yq ea` is the oracle -- and since #2427 both
+/// counts match it exactly:
 ///
 /// ```console
 /// $ yq ea -o=json -I0 '.[] | ((1,2,3) + 1), file_index'         f1 f2
@@ -15658,14 +15675,6 @@ fn test_eval_all_file_index_agrees_across_both_routes_2416() -> Result<()> {
 /// $ yq ea -o=json -I0 '.[] | (((1,2,3) + 1), file_index)'       f1 f2
 /// 2 3 4 2 3 4 2 3 4 2 3 4 0 0 1 1    # 16 lines
 /// ```
-///
-/// succinctly's counts differ from both -- yq evaluates each operator over
-/// the whole *context list* the pipe's left side produced, so its `(1,2,3)`
-/// fan-out and its `file_index` are each replayed once per context, where
-/// succinctly (like jq) pipes each left-hand value independently. That
-/// evaluation-model divergence is separate from #2420's precedence table and
-/// is not what this test pins; what it pins is that the fan-out is not
-/// collapsed to its first value, which is #822's actual subject.
 #[test]
 fn test_eval_all_arithmetic_fanout_survives_file_index_in_pipe_issue_822() -> Result<()> {
     let (f1, f2) = two_doc_fixtures()?;
@@ -15680,22 +15689,24 @@ fn test_eval_all_arithmetic_fanout_survives_file_index_in_pipe_issue_822() -> Re
     assert_eq!(code, 0);
     // #2451 made this branch-major: the union runs `((1,2,3) + 1)` over the
     // whole context list `.[]` produced, then `file_index` over the same
-    // list. Still short of yq's 16 lines, which need `EvaluateTogether`
-    // (#2427) to make the *arithmetic* cartesian too -- but the order is
-    // yq's now.
-    assert_eq!(stdout.trim(), "2\n3\n4\n2\n3\n4\n0\n1");
+    // list. #2427 made `.[]` iterate each document's own members, so the
+    // context list is four nodes and the count is real yq's 16.
+    assert_eq!(
+        stdout.trim(),
+        "2\n3\n4\n2\n3\n4\n2\n3\n4\n2\n3\n4\n0\n0\n1\n1"
+    );
 
     // #2420's shape: unparenthesised, the comma is now the outermost
     // operator, so this is `(.[] | ((1,2,3) + 1)), file_index` -- the
-    // fan-out still survives (twice, once per document), and `file_index`
-    // is evaluated against the combined input rather than per document.
+    // fan-out still survives (once per member of each document), and
+    // `file_index` is evaluated against the document list itself.
     let (stdout, _stderr, code) = run_yq_files(
         ".[] | ((1,2,3) + 1), file_index",
         &[f1.path(), f2.path()],
         &["--eval-all", "-o", "json"],
     )?;
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "2\n3\n4\n2\n3\n4\n0");
+    assert_eq!(stdout.trim(), "2\n3\n4\n2\n3\n4\n2\n3\n4\n2\n3\n4\n0\n1");
 
     Ok(())
 }
@@ -15720,7 +15731,10 @@ fn test_eval_all_compare_fanout_survives_file_index_in_pipe_issue_822() -> Resul
     )?;
     assert_eq!(code, 0);
     // Branch-major since #2451; see the `Expr::Arithmetic` twin above.
-    assert_eq!(stdout.trim(), "false\ntrue\ntrue\nfalse\ntrue\ntrue\n0\n1");
+    assert_eq!(
+        stdout.trim(),
+        "false\ntrue\ntrue\nfalse\ntrue\ntrue\nfalse\ntrue\ntrue\nfalse\ntrue\ntrue\n0\n0\n1\n1"
+    );
 
     let (stdout, _stderr, code) = run_yq_files(
         ".[] | ((1,2,3) > 1), file_index",
@@ -15728,7 +15742,10 @@ fn test_eval_all_compare_fanout_survives_file_index_in_pipe_issue_822() -> Resul
         &["--eval-all", "-o", "json"],
     )?;
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "false\ntrue\ntrue\nfalse\ntrue\ntrue\n0");
+    assert_eq!(
+        stdout.trim(),
+        "false\ntrue\ntrue\nfalse\ntrue\ntrue\nfalse\ntrue\ntrue\nfalse\ntrue\ntrue\n0\n1"
+    );
 
     Ok(())
 }
@@ -15739,7 +15756,7 @@ fn test_eval_all_compare_fanout_survives_file_index_in_pipe_issue_822() -> Resul
 fn test_eval_all_file_index_select() -> Result<()> {
     let (f1, f2) = two_doc_fixtures()?;
     let (stdout, _stderr, code) = run_yq_files(
-        ".[] | select(file_index == 0)",
+        "select(file_index == 0)",
         &[f1.path(), f2.path()],
         &["--eval-all"],
     )?;
@@ -15752,7 +15769,7 @@ fn test_eval_all_file_index_select() -> Result<()> {
 fn test_eval_all_file_index_select_then_field() -> Result<()> {
     let (f1, f2) = two_doc_fixtures()?;
     let (stdout, _stderr, code) = run_yq_files(
-        ".[] | select(file_index == 0) | .name",
+        "select(file_index == 0) | .name",
         &[f1.path(), f2.path()],
         &["--eval-all"],
     )?;
@@ -15769,7 +15786,7 @@ fn test_eval_all_file_index_select_then_field() -> Result<()> {
 fn test_eval_all_file_index_in_if_then_else() -> Result<()> {
     let (f1, f2) = two_doc_fixtures()?;
     let (stdout, _stderr, code) = run_yq_files(
-        r#".[] | if file_index == 0 then "from-f1" else "from-f2" end"#,
+        r#"if file_index == 0 then "from-f1" else "from-f2" end"#,
         &[f1.path(), f2.path()],
         &["--eval-all"],
     )?;
@@ -15784,7 +15801,7 @@ fn test_eval_all_file_index_in_if_then_else() -> Result<()> {
 fn test_eval_all_file_index_in_try_catch() -> Result<()> {
     let (f1, f2) = two_doc_fixtures()?;
     let (stdout, _stderr, code) = run_yq_files(
-        r#".[] | try select(file_index == 1) catch "err""#,
+        r#"try select(file_index == 1) catch "err""#,
         &[f1.path(), f2.path()],
         &["--eval-all"],
     )?;
@@ -15800,7 +15817,7 @@ fn test_eval_all_file_index_in_try_catch() -> Result<()> {
 fn test_eval_all_file_index_survives_label_wrapper() -> Result<()> {
     let (f1, f2) = two_doc_fixtures()?;
     let (stdout, _stderr, code) = run_yq_files(
-        "label $out | .[] | file_index",
+        "label $out | file_index",
         &[f1.path(), f2.path()],
         &["--eval-all", "-o", "json"],
     )?;
@@ -15823,9 +15840,13 @@ fn test_eval_all_file_index_in_map() -> Result<()> {
         &["--eval-all"],
     )?;
     assert_eq!(code, 0);
-    // Renders in real yq's "compact" form (#785): `- ` shares its line
-    // with the mapping's own first field.
-    assert_eq!(stdout, "- a: 1\n  name: first\n");
+    // #2427: `map(f)` is `[.[] | f]` applied to each *document*, so it walks
+    // that document's own values -- file 0's document keeps both of them and
+    // file 1's keeps none. Real yq prints the same two arrays (`- 1 / - first`
+    // then `[]`); the `---` between them is succinctly's own separator
+    // divergence, which needs per-node document/file provenance real yq's
+    // printer reads and succinctly does not carry (#2427 divergence 2).
+    assert_eq!(stdout, "- 1\n- first\n---\n[]\n");
     Ok(())
 }
 
@@ -15860,7 +15881,7 @@ fn test_eval_all_file_index_camelcase_and_short_alias() -> Result<()> {
     let (f1, f2) = two_doc_fixtures()?;
     for keyword in ["fileIndex", "fi"] {
         let (stdout, _stderr, code) = run_yq_files(
-            &format!(".[] | {keyword}"),
+            keyword,
             &[f1.path(), f2.path()],
             &["--eval-all", "-o", "json"],
         )?;
@@ -15874,7 +15895,7 @@ fn test_eval_all_file_index_camelcase_and_short_alias() -> Result<()> {
 fn test_eval_all_reduce_merge() -> Result<()> {
     let (f1, f2) = two_doc_fixtures()?;
     let (stdout, _stderr, code) = run_yq_files(
-        "reduce .[] as $item ({}; . * $item)",
+        "[.] | reduce .[] as $item ({}; . * $item)",
         &[f1.path(), f2.path()],
         &["--eval-all", "-o", "json", "-I0"],
     )?;
@@ -15892,7 +15913,7 @@ fn test_eval_all_reduce_merge() -> Result<()> {
 fn test_eval_all_select_star_merge_single_doc_per_file() -> Result<()> {
     let (f1, f2) = two_doc_fixtures()?;
     let (stdout, _stderr, code) = run_yq_files(
-        "(.[] | select(file_index == 0)) * (.[] | select(file_index == 1))",
+        "(select(file_index == 0)) * (select(file_index == 1))",
         &[f1.path(), f2.path()],
         &["--eval-all", "-o", "json", "-I0"],
     )?;
@@ -15904,7 +15925,7 @@ fn test_eval_all_select_star_merge_single_doc_per_file() -> Result<()> {
 #[test]
 fn test_eval_all_doc_separator_between_results() -> Result<()> {
     let (f1, f2) = two_doc_fixtures()?;
-    let (stdout, _stderr, code) = run_yq_files(".[]", &[f1.path(), f2.path()], &["--eval-all"])?;
+    let (stdout, _stderr, code) = run_yq_files(".", &[f1.path(), f2.path()], &["--eval-all"])?;
     assert_eq!(code, 0);
     assert_eq!(stdout, "a: 1\nname: first\n---\nb: 2\nname: second\n");
     Ok(())
@@ -15919,7 +15940,7 @@ fn test_eval_all_doc_separator_between_results() -> Result<()> {
 fn test_eval_all_split_doc_emits_separators() -> Result<()> {
     let (f1, f2) = two_doc_fixtures()?;
     let (stdout, _stderr, code) =
-        run_yq_files(".[] | split_doc", &[f1.path(), f2.path()], &["--eval-all"])?;
+        run_yq_files("split_doc", &[f1.path(), f2.path()], &["--eval-all"])?;
     assert_eq!(code, 0);
     assert_eq!(stdout, "a: 1\nname: first\n---\nb: 2\nname: second\n");
     Ok(())
@@ -15930,9 +15951,207 @@ fn test_eval_all_doc_flag_interaction() -> Result<()> {
     let mut multi = NamedTempFile::new()?;
     write!(multi, "x: 1\n---\nx: 2\n")?;
     let (stdout, _stderr, code) =
-        run_yq_files(".[] | .x", &[multi.path()], &["--eval-all", "--doc", "1"])?;
+        run_yq_files(".x", &[multi.path()], &["--eval-all", "--doc", "1"])?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "2");
+    Ok(())
+}
+
+/// #2427: `--eval-all` is the ordinary evaluator run once over the *list* of
+/// every document of every file -- real yq's `allAtOnceEvaluator.EvaluateFiles`
+/// (`pkg/yqlib/all_at_once_evaluator.go:47-75`, v4.53.3) -- not a slurp of them
+/// into one array. The filter never sees a containing array, so navigation,
+/// `keys`, `length` and `del` all apply per document.
+///
+/// Every row is `yq ea -o=json -I0 FILTER f1.yaml f2.yaml` against the pinned
+/// v4.53.3 binary, on this module's own `two_doc_fixtures`.
+#[test]
+fn test_eval_all_is_a_document_list_not_a_slurp_2427() -> Result<()> {
+    let (f1, f2) = two_doc_fixtures()?;
+    let rows: &[(&str, &str)] = &[
+        (
+            ".",
+            "{\"a\":1,\"name\":\"first\"}\n{\"b\":2,\"name\":\"second\"}",
+        ),
+        (".name", "\"first\"\n\"second\""),
+        ("keys", "[\"a\",\"name\"]\n[\"b\",\"name\"]"),
+        ("length", "2\n2"),
+        (".[]", "1\n\"first\"\n2\n\"second\""),
+        ("del(.name)", "{\"a\":1}\n{\"b\":2}"),
+        (
+            "to_entries",
+            concat!(
+                "[{\"key\":\"a\",\"value\":1},{\"key\":\"name\",\"value\":\"first\"}]\n",
+                "[{\"key\":\"b\",\"value\":2},{\"key\":\"name\",\"value\":\"second\"}]",
+            ),
+        ),
+        (".[0:1]", "[\"a\"]\n[\"b\"]"),
+        ("{\"n\": .name}", "{\"n\":\"first\"}\n{\"n\":\"second\"}"),
+        ("select(.a) | .a", "1"),
+        (
+            ". as $d | $d",
+            "{\"a\":1,\"name\":\"first\"}\n{\"b\":2,\"name\":\"second\"}",
+        ),
+        ("(. , .) | .name", "\"first\"\n\"second\""),
+    ];
+    for (filter, expected) in rows {
+        let (stdout, stderr, code) = run_yq_files(
+            filter,
+            &[f1.path(), f2.path()],
+            &["--eval-all", "-o", "json", "-I", "0"],
+        )?;
+        assert_eq!(code, 0, "`{filter}` exited {code}, stderr: {stderr}");
+        assert_eq!(stdout.trim(), *expected, "filter: {filter}");
+    }
+    Ok(())
+}
+
+/// #2427: the two operators that consult real yq's `EvaluateTogether` flag.
+/// `readDocuments` (`pkg/yqlib/utils.go:85`) stamps it on the initial document
+/// nodes and nothing else ever sets it, so `[E]` collects `E`'s outputs across
+/// the whole list into **one** array (`operator_collect.go:33-49`) and a binary
+/// operator runs both operands over the whole list and emits every pairing
+/// (`operators.go:113-172`) -- `. + {"z": 9}` over two documents is four
+/// outputs, each document merged with `z` twice.
+///
+/// Rows captured from `yq ea -o=json -I0` on the same two fixtures.
+#[test]
+fn test_eval_all_collect_and_binary_evaluate_together_2427() -> Result<()> {
+    let (f1, f2) = two_doc_fixtures()?;
+    let rows: &[(&str, &str)] = &[
+        (
+            "[.]",
+            "[{\"a\":1,\"name\":\"first\"},{\"b\":2,\"name\":\"second\"}]",
+        ),
+        ("[.[]]", "[1,\"first\",2,\"second\"]"),
+        ("[.name]", "[\"first\",\"second\"]"),
+        ("[.[] | file_index]", "[0,0,1,1]"),
+        ("[.] | length", "2"),
+        ("[.name] | length", "2"),
+        ("[.] | map(.name)", "[\"first\",\"second\"]"),
+        (
+            ". + {\"z\": 9}",
+            concat!(
+                "{\"a\":1,\"name\":\"first\",\"z\":9}\n",
+                "{\"a\":1,\"name\":\"first\",\"z\":9}\n",
+                "{\"b\":2,\"name\":\"second\",\"z\":9}\n",
+                "{\"b\":2,\"name\":\"second\",\"z\":9}",
+            ),
+        ),
+        (
+            ". + .",
+            concat!(
+                "{\"a\":1,\"name\":\"first\"}\n",
+                "{\"a\":1,\"name\":\"second\",\"b\":2}\n",
+                "{\"b\":2,\"name\":\"first\",\"a\":1}\n",
+                "{\"b\":2,\"name\":\"second\"}",
+            ),
+        ),
+        // The left operand is read-only (#2470), so `.a` contributes only
+        // file 1's `1` -- but the literal right operand is re-run over the
+        // whole two-node context, so there are still two pairings.
+        (".a + 1", "2\n2"),
+        (
+            ".name + \"X\"",
+            "\"firstX\"\n\"firstX\"\n\"secondX\"\n\"secondX\"",
+        ),
+    ];
+    for (filter, expected) in rows {
+        let (stdout, stderr, code) = run_yq_files(
+            filter,
+            &[f1.path(), f2.path()],
+            &["--eval-all", "-o", "json", "-I", "0"],
+        )?;
+        assert_eq!(code, 0, "`{filter}` exited {code}, stderr: {stderr}");
+        assert_eq!(stdout.trim(), *expected, "filter: {filter}");
+    }
+    Ok(())
+}
+
+/// #2427: the flag rides the node, so anything that *builds* a node clears it
+/// and anything that hands the same node on keeps it. `.` , `select` and a
+/// parenthesised group keep it; `.name`, `keys` and a previous `[...]` do not.
+/// Live rows from `yq ea -o=json -I0` on the same two fixtures.
+#[test]
+fn test_eval_all_navigation_clears_evaluate_together_2427() -> Result<()> {
+    let (f1, f2) = two_doc_fixtures()?;
+    let both = "[{\"a\":1,\"name\":\"first\"},{\"b\":2,\"name\":\"second\"}]";
+    let rows: &[(&str, &str)] = &[
+        // Preserved.
+        (". | [.]", both),
+        ("(.) | [.]", both),
+        ("select(true) | [.]", both),
+        // Cleared: one array per document.
+        (".name | [.]", "[\"first\"]\n[\"second\"]"),
+        ("keys | [.]", "[[\"a\",\"name\"]]\n[[\"b\",\"name\"]]"),
+        (
+            "[.] | [.]",
+            "[[{\"a\":1,\"name\":\"first\"},{\"b\":2,\"name\":\"second\"}]]",
+        ),
+    ];
+    for (filter, expected) in rows {
+        let (stdout, stderr, code) = run_yq_files(
+            filter,
+            &[f1.path(), f2.path()],
+            &["--eval-all", "-o", "json", "-I", "0"],
+        )?;
+        assert_eq!(code, 0, "`{filter}` exited {code}, stderr: {stderr}");
+        assert_eq!(stdout.trim(), *expected, "filter: {filter}");
+    }
+    Ok(())
+}
+
+/// #2427: each `--eval-all` document is reindexed into its own throwaway
+/// document, so `path`/`key`/`parent` answer relative to *that document*
+/// rather than to the array the old slurp wrapped them in -- `path` is `[]` at
+/// the root and `parent` there yields nothing, exactly as real yq's do.
+/// `file_index`/`document_index` come from the entry's own origin instead.
+///
+/// ```console
+/// $ yq ea -o=json -I0 'path'                f1 f2                  # [] []
+/// $ yq ea -o=json -I0 'parent'              f1 f2                  # (nothing)
+/// $ yq ea -o=json -I0 '.name | path'        f1 f2                  # ["name"] x2
+/// $ yq ea -o=json -I0 '.name | file_index'  f1 f2                  # 0 1
+/// $ yq ea -o=json -I0 'document_index'      multi.yaml f1.yaml     # 0 1 0
+/// ```
+#[test]
+fn test_eval_all_position_builtins_answer_per_document_2427() -> Result<()> {
+    let (f1, f2) = two_doc_fixtures()?;
+    let rows: &[(&str, &str)] = &[
+        ("path", "[]\n[]"),
+        ("parent", ""),
+        (".name | path", "[\"name\"]\n[\"name\"]"),
+        (".name | key", "\"name\"\n\"name\""),
+        (
+            ".name | parent",
+            "{\"a\":1,\"name\":\"first\"}\n{\"b\":2,\"name\":\"second\"}",
+        ),
+        (".name | file_index", "0\n1"),
+        ("line", "1\n1"),
+    ];
+    for (filter, expected) in rows {
+        let (stdout, stderr, code) = run_yq_files(
+            filter,
+            &[f1.path(), f2.path()],
+            &["--eval-all", "-o", "json", "-I", "0"],
+        )?;
+        assert_eq!(code, 0, "`{filter}` exited {code}, stderr: {stderr}");
+        assert_eq!(stdout.trim(), *expected, "filter: {filter}");
+    }
+
+    // Two documents from one file, then one from another: `file_index` counts
+    // files and `document_index` counts documents within their own file.
+    let mut multi = NamedTempFile::new()?;
+    write!(multi, "x: 1\n---\ny: 2\n")?;
+    for (filter, expected) in [("file_index", "0\n0\n1"), ("document_index", "0\n1\n0")] {
+        let (stdout, stderr, code) = run_yq_files(
+            filter,
+            &[multi.path(), f1.path()],
+            &["--eval-all", "-o", "json", "-I", "0"],
+        )?;
+        assert_eq!(code, 0, "`{filter}` exited {code}, stderr: {stderr}");
+        assert_eq!(stdout.trim(), expected, "filter: {filter}");
+    }
     Ok(())
 }
 
@@ -26646,7 +26865,7 @@ fn test_yq_auto_output_eval_all_matches_yaml_input_1493() -> Result<()> {
         .arg("yq")
         .arg("--eval-all")
         .arg("-o=auto")
-        .arg(".[0]")
+        .arg(".")
         .arg(input_file.path())
         .stdin(Stdio::null())
         .output()?;
@@ -30152,7 +30371,7 @@ fn test_negative_index_out_of_range_survives_try_catch_under_eval_all_2270() -> 
     let multi_doc = "a: [1, 2]\n---\na: [3, 4]\n";
 
     let (out, stderr, code) = run_yq_stdin_with_stderr(
-        "(try .[0].a[-5] catch \"c\"), file_index",
+        "(try .a[-5] catch \"c\"), file_index",
         multi_doc,
         &["-o", "json", "--eval-all"],
     )?;
@@ -30163,7 +30382,7 @@ fn test_negative_index_out_of_range_survives_try_catch_under_eval_all_2270() -> 
     );
 
     let (out, stderr, code) = run_yq_stdin_with_stderr(
-        "(.[0].a[-5]?, file_index)",
+        "(.a[-5]?, file_index)",
         multi_doc,
         &["-o", "json", "--eval-all"],
     )?;
@@ -30187,7 +30406,7 @@ fn test_negative_index_out_of_range_survives_try_catch_partial_prefix_2270() -> 
     let multi_doc = "a: [1, 2]\n---\na: [3, 4]\n";
 
     let (out, stderr, code) = run_yq_stdin_with_stderr(
-        ".[0].a | (try (1, .[-5]) catch \"c\") | key",
+        ".a | (try (1, .[-5]) catch \"c\") | key",
         multi_doc,
         &["-o", "json", "--eval-all"],
     )?;
@@ -30208,7 +30427,7 @@ fn test_negative_index_out_of_range_survives_try_catch_partial_prefix_2270() -> 
     // root `key` answers, not whether the `Partial` prefix survives. `[key]`
     // makes that observable again: one `[]` line, one per prefix output.
     let (out, stderr, code) = run_yq_stdin_with_stderr(
-        ".[0].a | (try (1, .[-5]) catch \"c\") | [key]",
+        ".a | (try (1, .[-5]) catch \"c\") | [key]",
         multi_doc,
         &["-o", "json", "--eval-all"],
     )?;

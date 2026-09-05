@@ -1618,7 +1618,7 @@ fn evaluate_input(
 /// error/break through `sink` (evaluation continues past one, per yq's
 /// convention -- see `ErrorSink`'s own doc comment) rather than failing the
 /// whole run. Factored out of [`evaluate_input`] so `--eval-all`'s
-/// `eval_owned_with_file_index` call site (#715) shares the exact same
+/// `eval_documents_together` call site (#715, #2427) shares the exact same
 /// conversion/error-reporting policy instead of a second, divergence-prone
 /// copy.
 fn query_result_to_owned_values(
@@ -1629,7 +1629,7 @@ fn query_result_to_owned_values(
     // other (#1247): report it and yield nothing, exactly as the
     // `QueryResult::Error` arm below does.
     //
-    // Both callers ([`evaluate_input`] above, `eval_owned_with_file_index`
+    // Both callers ([`evaluate_input`] above, `eval_documents_together`
     // below) only ever produce a `result` rooted in an already-decoded
     // `OwnedValue` re-serialized to JSON and reindexed -- `eval_owned_input`
     // (this function's non-path-context caller) explicitly converts every
@@ -5193,14 +5193,15 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             }
         }
     } else if args.eval_all {
-        // Handle --eval-all: combine every document from every file into one
-        // evaluation context, exposing `file_index`/`fileIndex`/`fi` (#715).
-        // Input-gathering mirrors --slurp's DOM path (all_docs collection),
-        // but tracks each document's origin file index alongside it and
-        // evaluates via `eval_owned_with_file_index` instead of plain
-        // `evaluate_input`, so `file_index` resolves against that side table.
-        // `--front-matter` is rejected in combination above, so every
-        // gathered body is `None` here.
+        // Handle --eval-all: evaluate the filter once over the list of every
+        // document of every file, exposing `file_index`/`fileIndex`/`fi`
+        // (#715). Input-gathering mirrors --slurp's DOM path (all_docs
+        // collection), but tracks each document's origin file and
+        // within-file document index alongside it, and evaluates via
+        // `eval_documents_together` -- which builds one context-list entry
+        // per document rather than handing the expression an array of them
+        // (#2427). `--front-matter` is rejected in combination above, so
+        // every gathered body is `None` here.
         let (input_sources, validate_exit_code) = gather_input_sources(
             &input_files,
             args.input_format,
@@ -5231,8 +5232,14 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         };
         let output_config = output_config.for_source(&args, uniform_format);
 
-        let mut all_docs: Vec<OwnedValue> = Vec::new();
-        let mut file_origin: Vec<usize> = Vec::new();
+        // #2427: the document *list*, not a slurped array. Real `ea` is the
+        // ordinary evaluator with the initial context set to every document
+        // of every file, each one flagged `EvaluateTogether`
+        // (`pkg/yqlib/utils.go:85`) -- so `.name`, `keys`, `length` and
+        // `del(.name)` all apply per document, while `[.]` collects across
+        // the whole list. Each entry carries its own `(file, document)`
+        // origin, which is what `file_index`/`document_index` read back.
+        let mut all_docs: Vec<(OwnedValue, usize, usize)> = Vec::new();
         let mut global_doc_index: usize = 0;
         for (file_idx, (bytes, format, _)) in input_sources.iter().enumerate() {
             // #2282: `to_owned_canonicalizing_numbers_at_depth` (reached via
@@ -5240,25 +5247,19 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             // own nesting-depth violations as a catchable error rather than
             // panicking -- see that function's own doc comment for why.
             let inputs = parse_input(bytes, *format)?;
-            for input in inputs {
+            for (doc_idx, input) in inputs.into_iter().enumerate() {
                 let should_include = args
                     .document
                     .map_or(true, |target| target == global_doc_index);
                 if should_include {
-                    all_docs.push(input);
-                    file_origin.push(file_idx);
+                    all_docs.push((input, file_idx, doc_idx));
                 }
                 global_doc_index += 1;
             }
         }
 
-        let combined = OwnedValue::Array(all_docs);
-        let query_result: QueryResult<'_, Vec<u64>> = jq::eval_owned_with_file_index::<
-            Vec<u64>,
-            YqSemantics,
-        >(
-            &program.expr, &combined, &file_origin
-        );
+        let query_result: QueryResult<'_, Vec<u64>> =
+            jq::eval_documents_together::<Vec<u64>, YqSemantics>(&program.expr, &all_docs);
         let results = query_result_to_owned_values(query_result, &mut sink);
 
         let mut split_doc_state = SplitDocState::new(has_split_doc);
