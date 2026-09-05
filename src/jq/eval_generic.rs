@@ -4043,6 +4043,94 @@ pub(crate) fn current_file_origin() -> Option<alloc::rc::Rc<[usize]>> {
     file_origin::current()
 }
 
+/// Where one input node came from: the index of the file it was read from
+/// and, when the caller tracks it, the index of the document *within* that
+/// file (#2427).
+///
+/// Real yq carries both on every `CandidateNode` (`fileIndex`/`document`,
+/// `pkg/yqlib/candidate_node.go`, v4.53.3), stamped by `readDocuments`
+/// (`utils.go:60-89`) as each document is decoded, and `file_index`/
+/// `document_index` are plain reads of those two fields. succinctly's
+/// documents are `OwnedValue`s with no room for a per-node field, so the
+/// origin rides an ambient scope instead -- installed around the evaluation
+/// of one document (the ordinary multi-file path) or of one context-list
+/// entry (`--eval-all`), which is exactly the granularity at which it varies.
+///
+/// `document` is `Option` because the ordinary path's cursor already answers
+/// `document_index` from the YAML index itself; only the file number is
+/// missing there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NodeOrigin {
+    pub(crate) file: usize,
+    pub(crate) document: Option<usize>,
+}
+
+/// The ambient [`NodeOrigin`]. Same `thread_local!`-with-restore shape, and
+/// the same `no_std` degradation, as [`file_origin`] above -- see its doc
+/// comment for why an ambient rather than a parameter.
+#[cfg(feature = "std")]
+mod node_origin {
+    use super::NodeOrigin;
+    use std::cell::Cell;
+
+    thread_local! {
+        static CURRENT: Cell<Option<NodeOrigin>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn current() -> Option<NodeOrigin> {
+        CURRENT.with(Cell::get)
+    }
+
+    /// Installs `origin` for `f`'s dynamic extent, restoring the previous
+    /// value on the way out -- including when `f` escapes with a control.
+    pub(crate) fn with<R>(origin: NodeOrigin, f: impl FnOnce() -> R) -> R {
+        struct Restore(Option<NodeOrigin>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                CURRENT.with(|c| c.set(self.0.take()));
+            }
+        }
+        let _restore = Restore(CURRENT.with(|c| c.replace(Some(origin))));
+        f()
+    }
+}
+
+#[cfg(not(feature = "std"))]
+mod node_origin {
+    use super::NodeOrigin;
+
+    pub(crate) fn current() -> Option<NodeOrigin> {
+        None
+    }
+
+    pub(crate) fn with<R>(_origin: NodeOrigin, f: impl FnOnce() -> R) -> R {
+        f()
+    }
+}
+
+/// Install `origin` as the ambient node origin for `f` (#2427).
+pub(crate) fn with_node_origin<R>(origin: NodeOrigin, f: impl FnOnce() -> R) -> R {
+    node_origin::with(origin, f)
+}
+
+/// `file_index` from the ambient node origin, if one is installed.
+///
+/// Consulted *before* [`file_index_for_path`]'s own table: the origin is a
+/// property of the node being evaluated, where the table is a property of a
+/// position inside one combined array, and only one of the two is ever
+/// installed at a time.
+pub(crate) fn ambient_file_index() -> Option<i64> {
+    node_origin::current().and_then(|o| i64::try_from(o.file).ok())
+}
+
+/// `document_index` from the ambient node origin, if one is installed and
+/// carries a document number.
+pub(crate) fn ambient_document_index() -> Option<i64> {
+    node_origin::current()
+        .and_then(|o| o.document)
+        .and_then(|d| i64::try_from(d).ok())
+}
+
 /// `file_index` for a node at `path`: the origin file of the top-level
 /// element `path` descends from (#715).
 ///
@@ -4053,6 +4141,9 @@ pub(crate) fn current_file_origin() -> Option<alloc::rc::Rc<[usize]>> {
 /// expression `eval::eval_stage_with_path_context`'s own `Builtin::FileIndex`
 /// handler computes from its `file_origin` parameter.
 fn file_index_for_path(path: &[OwnedValue]) -> i64 {
+    if let Some(file) = ambient_file_index() {
+        return file;
+    }
     let Some(table) = file_origin::current() else {
         return 0;
     };
@@ -7749,20 +7840,46 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
 /// way in (see [`yq_context_item`]). They stand for a single value each, so
 /// that is a fidelity-neutral loss of laziness on this route only.
 #[derive(Clone)]
-enum YqContextItem<V: DocumentValue> {
+enum YqContextNode<V: DocumentValue> {
     Cursor(V::Cursor),
     Value(V),
     Owned(OwnedValue),
 }
 
+/// What a context entry carries *besides* its node -- the two per-node fields
+/// real yq's `CandidateNode` has that succinctly's values do not (#2427).
+///
+/// `together` is real yq's `EvaluateTogether` (`pkg/yqlib/candidate_node.go`,
+/// set at `pkg/yqlib/utils.go:85` by `readDocuments` and nowhere else, so only
+/// `--eval-all`'s initial document nodes have it). `origin` is the
+/// `fileIndex`/`document` pair `file_index`/`document_index` read back.
+///
+/// Both are dropped by anything that builds a new node and preserved by
+/// anything that hands the same node on -- see [`yq_stage_preserves_node`].
+#[derive(Clone, Copy, Default)]
+struct YqContextTag {
+    together: bool,
+    origin: Option<NodeOrigin>,
+}
+
+#[derive(Clone)]
+struct YqContextItem<V: DocumentValue> {
+    node: YqContextNode<V>,
+    tag: YqContextTag,
+}
+
 impl<V: DocumentValue> YqContextItem<V> {
+    fn new(node: YqContextNode<V>, tag: YqContextTag) -> Self {
+        Self { node, tag }
+    }
+
     /// Hand this context entry back to the ordinary item-driven evaluator.
     /// Takes `&self` because one entry is fed to *every* branch of a union.
     fn to_generic_item(&self) -> GenericItem<V> {
-        match self {
-            Self::Cursor(c) => GenericItem::OneCursor(*c),
-            Self::Value(v) => GenericItem::One(v.clone()),
-            Self::Owned(o) => GenericItem::Owned(o.clone()),
+        match &self.node {
+            YqContextNode::Cursor(c) => GenericItem::OneCursor(*c),
+            YqContextNode::Value(v) => GenericItem::One(v.clone()),
+            YqContextNode::Owned(o) => GenericItem::Owned(o.clone()),
         }
     }
 }
@@ -7774,16 +7891,22 @@ impl<V: DocumentValue> YqContextItem<V> {
 /// `GenericItem::OneCursorValue` is documented as constructible at exactly
 /// one site, so widening [`YqContextItem`] to keep it would trade a real
 /// invariant for one avoided re-decode.
-fn yq_context_item<V: DocumentValue>(item: GenericItem<V>) -> Result<YqContextItem<V>, Control> {
-    Ok(match item {
-        GenericItem::One(v) => YqContextItem::Value(v),
-        GenericItem::OneCursor(c) => YqContextItem::Cursor(c),
-        GenericItem::OneCursorValue(c, _) => YqContextItem::Cursor(c),
-        GenericItem::Owned(o) => YqContextItem::Owned(o),
-        lazy @ (GenericItem::LazyKeys { .. }
-        | GenericItem::LazyIndexRange(_)
-        | GenericItem::LazySeq(_)) => YqContextItem::Owned(generic_item_into_owned(lazy)?),
-    })
+fn yq_context_item<V: DocumentValue>(
+    item: GenericItem<V>,
+    tag: YqContextTag,
+) -> Result<YqContextItem<V>, Control> {
+    Ok(YqContextItem::new(
+        match item {
+            GenericItem::One(v) => YqContextNode::Value(v),
+            GenericItem::OneCursor(c) => YqContextNode::Cursor(c),
+            GenericItem::OneCursorValue(c, _) => YqContextNode::Cursor(c),
+            GenericItem::Owned(o) => YqContextNode::Owned(o),
+            lazy @ (GenericItem::LazyKeys { .. }
+            | GenericItem::LazyIndexRange(_)
+            | GenericItem::LazySeq(_)) => YqContextNode::Owned(generic_item_into_owned(lazy)?),
+        },
+        tag,
+    ))
 }
 
 /// Does this pipe have a stage that is a union (`,`)?
@@ -7820,13 +7943,56 @@ fn yq_flatten_pipe_stages(stages: &[Expr], out: &mut Vec<Expr>) {
     }
 }
 
+/// Does running `stage` over a node hand *that same node* back?
+///
+/// Real yq's per-node flags ride the `CandidateNode`, so they survive exactly
+/// the operators that return their input node: `.` (`operator_self.go:3-5`,
+/// `return context, nil`), `select` (`operator_select.go`, which pushes the
+/// candidate itself), and grouping. Everything else -- navigation into a
+/// child, a collect, a literal, an arithmetic result -- produces a node the
+/// document reader never stamped, so `EvaluateTogether` is false on it and
+/// `file_index`/`document_index` read whatever the constructing operator
+/// happened to copy.
+///
+/// Conservative in the safe direction: an unlisted stage is treated as
+/// building a new node, which drops the flags rather than propagating them
+/// too far.
+fn yq_stage_preserves_node(stage: &Expr) -> bool {
+    match unwrap_paren(stage) {
+        Expr::Identity => true,
+        Expr::Builtin(Builtin::Select(_)) => true,
+        Expr::Pipe(inner) => inner.iter().all(yq_stage_preserves_node),
+        Expr::Comma(branches) => branches.iter().all(yq_stage_preserves_node),
+        _ => false,
+    }
+}
+
 /// Run `stages` over one context entry, honouring `sink`'s demand.
+///
+/// The entry's [`NodeOrigin`], when it has one, is made ambient for the run --
+/// that is how `file_index`/`document_index` answer per document under
+/// `--eval-all` and per file on the ordinary multi-file path (#2427), where
+/// real yq reads two fields off the `CandidateNode` itself.
 ///
 /// The empty-`stages` case is *not* delegated to
 /// [`continue_pipe_element_generic`]: that would reach
 /// `eval_each_pipe_generic`'s own empty-pipe short-circuit, which drops the
 /// cursor. Here the entry is the answer, cursor and all.
 fn run_yq_stages_over_item<S: EvalSemantics, V: DocumentValue>(
+    stages: &[Expr],
+    item: &YqContextItem<V>,
+    optional: bool,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    match item.tag.origin {
+        Some(origin) => with_node_origin(origin, || {
+            run_yq_stages_bare::<S, V>(stages, item, optional, sink)
+        }),
+        None => run_yq_stages_bare::<S, V>(stages, item, optional, sink),
+    }
+}
+
+fn run_yq_stages_bare<S: EvalSemantics, V: DocumentValue>(
     stages: &[Expr],
     item: &YqContextItem<V>,
     optional: bool,
@@ -7845,6 +8011,12 @@ fn run_yq_stages_over_item<S: EvalSemantics, V: DocumentValue>(
 
 /// Materialize the outputs of `stages` over a whole context list.
 ///
+/// Each captured entry inherits the [`YqContextTag`] the walk published in
+/// `cur` immediately before the run that produced it -- the walk is
+/// synchronous, so "the tag in `cur` when the sink fires" is exactly "the tag
+/// of the input entry this output came from", with the per-node flags already
+/// dropped by [`yq_stage_preserves_node`] where the stages build new nodes.
+///
 /// A control that ends the run **discards whatever the run already
 /// produced**, rather than handing the prefix on. That is real yq's own
 /// answer, and the same rule
@@ -7860,13 +8032,12 @@ fn collect_yq_context<S: EvalSemantics, V: DocumentValue>(
     stages: &[Expr],
     inputs: &[YqContextItem<V>],
     optional: bool,
+    cur: &core::cell::Cell<YqContextTag>,
 ) -> Result<Vec<YqContextItem<V>>, Control> {
     let mut out: Vec<YqContextItem<V>> = Vec::new();
     let mut stray: Option<Control> = None;
-    let flow =
-        eval_yq_context_pipe::<S, V>(stages, inputs, optional, &mut |item| match yq_context_item(
-            item,
-        ) {
+    let flow = eval_yq_context_pipe::<S, V>(stages, inputs, optional, cur, &mut |item| {
+        match yq_context_item(item, cur.get()) {
             Ok(entry) => {
                 out.push(entry);
                 Demand::Continue
@@ -7875,7 +8046,8 @@ fn collect_yq_context<S: EvalSemantics, V: DocumentValue>(
                 stray = Some(control);
                 Demand::Stop
             }
-        });
+        }
+    });
     match (stray, flow) {
         (Some(control), _) | (None, Flow::Escaped(control)) => Err(control),
         // This sink only ever says `Stop` on the `stray` path handled above,
@@ -7885,8 +8057,32 @@ fn collect_yq_context<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
-/// Where rule 1's branch-major walk splits a flat pipe: the index of the
-/// first union stage, or `None` when this pipe is not one the walk owns.
+/// Which stage of a flat pipe the context-list walk owns, and under which of
+/// yq's rules.
+#[derive(Clone, Copy)]
+enum YqListStage {
+    /// A union (`,`): #2451 rule 1, branch-major over the whole list.
+    Union,
+    /// `[E]` over inputs that *all* carry `EvaluateTogether`: real yq's
+    /// `collectOperator` (`pkg/yqlib/operator_collect.go:33-49`) checks that
+    /// flag on every node of its context and, when they all have it, builds
+    /// **one** array from `E`'s outputs over the whole list instead of one
+    /// array per node (#2427).
+    Collect,
+    /// A binary operator over inputs that all carry `EvaluateTogether`:
+    /// `crossFunctionWithPrefs` (`pkg/yqlib/operators.go:145-172`) makes the
+    /// same check and then runs `doCrossFunc` **once** over the whole
+    /// context, so both operands see the full list and every pairing is
+    /// emitted (#2427).
+    Binary,
+}
+
+/// Where the walk splits a flat pipe: the first stage it owns, or `None` when
+/// this pipe is not one the walk owns at all.
+///
+/// `together` is whether every input entry carries `EvaluateTogether` on the
+/// way in; it is dropped at the first stage that builds a new node, so
+/// `.a | [.]` is per document where `[.]` is one array.
 ///
 /// The one declining case is an **absent** position: a navigational prefix
 /// that can land on a missing key (`.a.x`) followed by something that reads
@@ -7901,17 +8097,47 @@ fn collect_yq_context<S: EvalSemantics, V: DocumentValue>(
 /// are otherwise single-position: `head_can_yield_absent` is already `false`
 /// for `.a[]`/`.d[]` (iterating an absent node yields nothing) and for an
 /// empty prefix, which is every multi-element shape the sweep exercises.
-fn yq_union_stage_index(stages: &[Expr]) -> Option<usize> {
-    let at = stages.iter().position(|s| matches!(s, Expr::Comma(_)))?;
+fn yq_list_stage(stages: &[Expr], together: bool) -> Option<(usize, YqListStage)> {
+    let mut together = together;
+    let mut found: Option<(usize, YqListStage)> = None;
+    for (i, stage) in stages.iter().enumerate() {
+        if matches!(stage, Expr::Comma(_)) {
+            found = Some((i, YqListStage::Union));
+            break;
+        }
+        if together {
+            match stage {
+                Expr::Array(_) => {
+                    found = Some((i, YqListStage::Collect));
+                    break;
+                }
+                Expr::Arithmetic { .. } | Expr::Compare { .. } => {
+                    found = Some((i, YqListStage::Binary));
+                    break;
+                }
+                _ => {}
+            }
+            together = yq_stage_preserves_node(stage);
+        }
+    }
+    let (at, kind) = found?;
     if stages.iter().any(needs_path_context) && head_can_yield_absent(&stages[..at]) {
         return None;
     }
-    Some(at)
+    Some((at, kind))
 }
 
-/// **The one definition of rule 1 of yq's context-list model** (#2451): a
-/// pipe evaluated over a whole *list* of inputs at once, branch-major
-/// through every union it contains.
+/// Rule 1's stage index alone, for the entry gate -- see [`yq_list_stage`].
+fn yq_union_stage_index(stages: &[Expr]) -> Option<usize> {
+    yq_list_stage(stages, false).map(|(at, _)| at)
+}
+
+/// **The one definition of rules 1 and 3 of yq's context-list model**
+/// (#2451, #2427): a pipe evaluated over a whole *list* of inputs at once,
+/// branch-major through every union it contains, and -- for a list whose
+/// entries all came straight out of the `--eval-all` reader -- collecting and
+/// cross-multiplying over the whole list where real yq's `EvaluateTogether`
+/// flag says to.
 ///
 /// Real yq has no scalar evaluation mode. `Context.MatchingNodes`
 /// (`pkg/yqlib/context.go`, v4.53.3) is always a list; `|` hands its left
@@ -7923,43 +8149,56 @@ fn yq_union_stage_index(stages: &[Expr]) -> Option<usize> {
 /// independently and interleaves, `3 4 5 6`.
 ///
 /// Captured live against Homebrew yq v4.53.3; the rows are in
-/// `test_yq_pipe_into_union_is_branch_major_2451`.
+/// `test_yq_pipe_into_union_is_branch_major_2451` and, for the
+/// `EvaluateTogether` rules, `tests/yq_cli_tests.rs`'s `--eval-all` cases.
 ///
-/// The walk is: find the first union stage; materialize everything before it
-/// over every input (that is the context list the union sees); run each
-/// branch over that whole list, concatenating; then recurse with the
-/// concatenation as the input list for the stages after the union. Recursing
-/// on the *concatenated* list, rather than continuing per branch output, is
-/// what makes a second union downstream see the first one's full result --
-/// `(.a, .b) | (.c, .d) | (. + 1, . + 2)` is `4 6 5 7 5 7 6 8`, which no
-/// per-output continuation produces. A branch that is itself a union recurses
-/// through the same entry point, so nesting needs no separate case.
+/// The walk is: find the first stage the walk owns; materialize everything
+/// before it over every input (that is the context list that stage sees); run
+/// that stage's own rule; then recurse with its result as the input list for
+/// the stages after it. Recursing on the *concatenated* list, rather than
+/// continuing per branch output, is what makes a second union downstream see
+/// the first one's full result -- `(.a, .b) | (.c, .d) | (. + 1, . + 2)` is
+/// `4 6 5 7 5 7 6 8`, which no per-output continuation produces. A branch that
+/// is itself a union recurses through the same entry point, so nesting needs
+/// no separate case.
 ///
-/// Cost: one [`YqContextItem`] per output of the stages before each union --
-/// a cursor for a navigational upstream, so the list is bounded by the number
-/// of outputs, not by the document. The loss is demand: a consumer's `Stop`
-/// cannot reach back into a materialized list, so a `limit`/`first` wrapped
-/// around one of these pipes evaluates the union in full. Real yq has no
-/// side-effecting builtin to observe that with (`stderr`/`debug` are lexer
-/// errors there), and materializing is what real yq itself does, so this
-/// costs fidelity nothing on the reference surface.
+/// Cost: one [`YqContextItem`] per output of the stages before each owned
+/// stage -- a cursor for a navigational upstream, so the list is bounded by
+/// the number of outputs, not by the document. The loss is demand: a
+/// consumer's `Stop` cannot reach back into a materialized list, so a
+/// `limit`/`first` wrapped around one of these pipes evaluates the stage in
+/// full. Real yq has no side-effecting builtin to observe that with
+/// (`stderr`/`debug` are lexer errors there), and materializing is what real
+/// yq itself does, so this costs fidelity nothing on the reference surface.
 ///
-/// `stages` must already be flat (see [`yq_flatten_pipe_stages`]).
+/// `stages` must already be flat (see [`yq_flatten_pipe_stages`]). `cur`
+/// carries the tag of the entry currently being run, for
+/// [`collect_yq_context`]'s sink to read back.
 fn eval_yq_context_pipe<S: EvalSemantics, V: DocumentValue>(
     stages: &[Expr],
     inputs: &[YqContextItem<V>],
     optional: bool,
+    cur: &core::cell::Cell<YqContextTag>,
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Flow {
-    let Some(at) = yq_union_stage_index(stages) else {
-        // No union left -- or one this walk declines (see
-        // [`yq_union_stage_index`]) -- so back to the ordinary per-value
-        // pipe, which is both lazy and identical to yq for every other
-        // operator: they all loop their context list and concatenate.
+    // `collectOperator`'s own `evaluateAllTogether` fold
+    // (`operator_collect.go:33-38`): every node must carry the flag, and an
+    // empty context list is not a together context at all.
+    let together = !inputs.is_empty() && inputs.iter().all(|item| item.tag.together);
+    let Some((at, kind)) = yq_list_stage(stages, together) else {
+        // No stage left for the walk -- or one it declines (see
+        // [`yq_list_stage`]) -- so back to the ordinary per-value pipe, which
+        // is both lazy and identical to yq for every other operator: they all
+        // loop their context list and concatenate.
         // `run_yq_stages_over_item` re-enters `eval_each_pipe_generic`, whose
         // own gate consults the same function, so a declined pipe takes the
         // path-context routes rather than looping back here.
+        let preserves = stages.iter().all(yq_stage_preserves_node);
         for item in inputs {
+            cur.set(YqContextTag {
+                together: item.tag.together && preserves,
+                origin: item.tag.origin,
+            });
             match run_yq_stages_over_item::<S, V>(stages, item, optional, sink) {
                 Flow::Exhausted => {}
                 stopped_or_escaped => return stopped_or_escaped,
@@ -7967,34 +8206,192 @@ fn eval_yq_context_pipe<S: EvalSemantics, V: DocumentValue>(
         }
         return Flow::Exhausted;
     };
-    let Expr::Comma(branches) = &stages[at] else {
-        // `yq_union_stage_index` matched this exact pattern to pick `at`.
-        unreachable!("the stage yq_union_stage_index selected is an Expr::Comma")
-    };
 
     let context = if at == 0 {
         inputs.to_vec()
     } else {
-        match collect_yq_context::<S, V>(&stages[..at], inputs, optional) {
+        match collect_yq_context::<S, V>(&stages[..at], inputs, optional, cur) {
             Ok(context) => context,
             Err(control) => return Flow::Escaped(control),
         }
     };
+    let rest = &stages[at + 1..];
 
-    let mut united: Vec<YqContextItem<V>> = Vec::new();
-    for branch in branches {
-        let mut flat: Vec<Expr> = Vec::new();
-        yq_flatten_pipe_stages(core::slice::from_ref(branch), &mut flat);
-        // Same as `eval_each_generic`'s own `Comma` arm: a branch that escapes
-        // ends the union, and the branches after it are not evaluated -- with
-        // the whole union's result discarded, per `collect_yq_context`.
-        match collect_yq_context::<S, V>(&flat, &context, optional) {
-            Ok(produced) => united.extend(produced),
-            Err(control) => return Flow::Escaped(control),
+    let produced = match kind {
+        YqListStage::Union => {
+            let Expr::Comma(branches) = &stages[at] else {
+                // `yq_list_stage` matched this exact pattern to pick `at`.
+                unreachable!("the stage yq_list_stage selected as a union is an Expr::Comma")
+            };
+            let mut united: Vec<YqContextItem<V>> = Vec::new();
+            for branch in branches {
+                let mut flat: Vec<Expr> = Vec::new();
+                yq_flatten_pipe_stages(core::slice::from_ref(branch), &mut flat);
+                // Same as `eval_each_generic`'s own `Comma` arm: a branch that
+                // escapes ends the union, and the branches after it are not
+                // evaluated -- with the whole union's result discarded, per
+                // `collect_yq_context`.
+                match collect_yq_context::<S, V>(&flat, &context, optional, cur) {
+                    Ok(branch_items) => united.extend(branch_items),
+                    Err(control) => return Flow::Escaped(control),
+                }
+            }
+            united
+        }
+        YqListStage::Collect => {
+            match collect_together::<S, V>(&stages[at], &context, optional, cur) {
+                Ok(item) => vec![item],
+                Err(flow) => return flow,
+            }
+        }
+        YqListStage::Binary => match cross_together::<S, V>(&stages[at], &context, optional, cur) {
+            Ok(items) => items,
+            Err(flow) => return flow,
+        },
+    };
+
+    eval_yq_context_pipe::<S, V>(rest, &produced, optional, cur, sink)
+}
+
+/// `[E]` over a context list whose entries all carry `EvaluateTogether`:
+/// **one** array holding `E`'s outputs over every entry, in order.
+///
+/// Real yq's `collectTogether` (`pkg/yqlib/operator_collect.go:7-22`) loops
+/// the context, evaluates `E` against each node as its own single read-only
+/// child context, and appends every result into one sequence node. Reproduced
+/// by running the *ordinary* per-node `[E]` over each entry -- which is
+/// already that same single-node collect, read-only rule included -- and
+/// splicing the one-array-per-entry results together. Doing it that way is
+/// what keeps `[.a]`'s absent-key rule identical on both paths instead of
+/// re-deriving it here.
+///
+/// The array is a node real yq builds from scratch, so it carries neither the
+/// flag nor an origin: `[.] | [.]` is an array of one array, and
+/// `[.] | file_index` is `0`.
+fn collect_together<S: EvalSemantics, V: DocumentValue>(
+    stage: &Expr,
+    context: &[YqContextItem<V>],
+    optional: bool,
+    cur: &core::cell::Cell<YqContextTag>,
+) -> Result<YqContextItem<V>, Flow> {
+    let single = core::slice::from_ref(stage);
+    let mut merged: Vec<OwnedValue> = Vec::new();
+    for item in context {
+        cur.set(item.tag);
+        let mut stray: Option<Control> = None;
+        let flow = run_yq_stages_over_item::<S, V>(single, item, optional, &mut |produced| {
+            match generic_item_into_owned(produced) {
+                // The per-node collect always yields exactly one array; the
+                // non-array arm is unreachable defensive splicing rather than
+                // a second rule.
+                Ok(OwnedValue::Array(elements)) => {
+                    merged.extend(elements);
+                    Demand::Continue
+                }
+                Ok(other) => {
+                    merged.push(other);
+                    Demand::Continue
+                }
+                Err(control) => {
+                    stray = Some(control);
+                    Demand::Stop
+                }
+            }
+        });
+        if let Some(control) = stray {
+            return Err(Flow::Escaped(control));
+        }
+        match flow {
+            Flow::Exhausted | Flow::Stopped { pending: None } => {}
+            Flow::Stopped {
+                pending: Some(control),
+            }
+            | Flow::Escaped(control) => return Err(Flow::Escaped(control)),
         }
     }
+    Ok(YqContextItem::new(
+        YqContextNode::Owned(OwnedValue::Array(merged)),
+        YqContextTag::default(),
+    ))
+}
 
-    eval_yq_context_pipe::<S, V>(&stages[at + 1..], &united, optional, sink)
+/// A binary operator over a context list whose entries all carry
+/// `EvaluateTogether`: **both** operands are evaluated over the whole list,
+/// and every pairing is emitted.
+///
+/// Real yq's `doCrossFunc` (`pkg/yqlib/operators.go:113-138`) loops the LHS
+/// matches and re-evaluates the RHS from scratch against the *same shared
+/// context* for each one (`operators.go:73`), so a context-size-sensitive RHS
+/// multiplies: `yq ea '. + {"z": 9}' f1.yaml f2.yaml` prints four documents,
+/// two copies of each file's merged with `z`. Both operands being pure, "run
+/// each operand once over the whole list and pair every combination" is
+/// observationally the same nested loop.
+///
+/// The pairing order, the read-only operand rule and the zero-output-operand
+/// table all come from [`binary_fanout_each_generic`] unchanged -- the only
+/// thing this function supplies is an operand strategy that evaluates over the
+/// context *list* instead of over one value.
+fn cross_together<S: EvalSemantics, V: DocumentValue>(
+    stage: &Expr,
+    context: &[YqContextItem<V>],
+    optional: bool,
+    cur: &core::cell::Cell<YqContextTag>,
+) -> Result<Vec<YqContextItem<V>>, Flow> {
+    let each_operand = |operand: &Expr, operand_sink: &mut dyn FnMut(GenericItem<V>) -> Demand| {
+        let mut flat: Vec<Expr> = Vec::new();
+        yq_flatten_pipe_stages(core::slice::from_ref(operand), &mut flat);
+        eval_yq_context_pipe::<S, V>(&flat, context, false, cur, operand_sink)
+    };
+    let mut produced: Vec<YqContextItem<V>> = Vec::new();
+    let mut stray: Option<Control> = None;
+    // Every pairing is a value the operator computed, so it carries neither
+    // `EvaluateTogether` nor an origin -- `. + {"z": 9} | [.]` is one array
+    // per result, matching real yq.
+    let mut collect = |item: GenericItem<V>| match yq_context_item(item, YqContextTag::default()) {
+        Ok(entry) => {
+            produced.push(entry);
+            Demand::Continue
+        }
+        Err(control) => {
+            stray = Some(control);
+            Demand::Stop
+        }
+    };
+    let flow = match stage {
+        Expr::Compare { op, left, right } => binary_fanout_each_generic::<V>(
+            each_operand,
+            left,
+            right,
+            optional,
+            binary_fanout_rules::<S>(EmptyOperandOp::Compare(*op)),
+            |left_val, right_val| {
+                Ok(OwnedValue::Bool(apply_compare_op::<S>(
+                    *op, &left_val, &right_val,
+                )))
+            },
+            &mut collect,
+        ),
+        Expr::Arithmetic { op, left, right } => binary_fanout_each_generic::<V>(
+            each_operand,
+            left,
+            right,
+            optional,
+            binary_fanout_rules::<S>(EmptyOperandOp::Arith(*op)),
+            |left_val, right_val| arith_combine::<S>(*op, left_val, right_val),
+            &mut collect,
+        ),
+        _ => unreachable!("yq_list_stage selects only Compare/Arithmetic as a binary stage"),
+    };
+    if let Some(control) = stray {
+        return Err(Flow::Escaped(control));
+    }
+    match flow {
+        Flow::Exhausted | Flow::Stopped { pending: None } => Ok(produced),
+        Flow::Stopped {
+            pending: Some(control),
+        }
+        | Flow::Escaped(control) => Err(Flow::Escaped(control)),
+    }
 }
 
 /// Does rule 1 own this pipe? **Both** routes must ask the same question:
@@ -8015,6 +8412,10 @@ fn yq_context_pipe_applies<S: EvalSemantics>(exprs: &[Expr]) -> bool {
 /// Rule 1's entry point from either evaluator route: `Some(flow)` when this
 /// is a yq-mode pipe with a union in it, `None` when the caller should carry
 /// on exactly as before.
+///
+/// The root entry is never `EvaluateTogether`: that flag is stamped only by
+/// real yq's all-at-once multi-document reader, whose succinctly counterpart
+/// is [`eval_yq_documents_together`].
 fn try_yq_context_pipe<S: EvalSemantics, V: DocumentValue>(
     exprs: &[Expr],
     value: V,
@@ -8029,16 +8430,96 @@ fn try_yq_context_pipe<S: EvalSemantics, V: DocumentValue>(
     yq_flatten_pipe_stages(exprs, &mut flat);
     // The cursor, when there is one, so a path-context stage downstream still
     // has a position to answer from.
-    let root = match cursor {
-        Some(c) => YqContextItem::Cursor(c),
-        None => YqContextItem::Value(value),
-    };
+    let root = YqContextItem::new(
+        match cursor {
+            Some(c) => YqContextNode::Cursor(c),
+            None => YqContextNode::Value(value),
+        },
+        YqContextTag::default(),
+    );
+    let cur = core::cell::Cell::new(YqContextTag::default());
     Some(eval_yq_context_pipe::<S, V>(
         &flat,
         core::slice::from_ref(&root),
         optional,
+        &cur,
         sink,
     ))
+}
+
+/// One `--eval-all` input document: its value, a cursor into a document the
+/// caller keeps alive for the evaluation, and where it was read from (#2427).
+pub(crate) struct YqDocument<C: DocumentCursor> {
+    pub(crate) cursor: Option<C>,
+    pub(crate) value: OwnedValue,
+    pub(crate) origin: NodeOrigin,
+}
+
+/// Evaluate `expr` **once** over every document of every input file, the way
+/// real yq's `--eval-all` does (#2427).
+///
+/// `allAtOnceEvaluator.EvaluateFiles` (`pkg/yqlib/all_at_once_evaluator.go:47-75`,
+/// v4.53.3) reads every document of every file into one node list via
+/// `readDocuments` -- which stamps each one `EvaluateTogether: true`
+/// (`pkg/yqlib/utils.go:85`) -- and runs the expression once against that
+/// whole list as the initial context. It is the ordinary evaluator throughout;
+/// the flag is the only difference, and only `[...]` and binary operators
+/// consult it. So `yq ea '.name' f1 f2` is one output per document, while
+/// `yq ea '[.]' f1 f2` is a single array of both -- and `.name | [.]` is back
+/// to one array per document, because navigation produced nodes the reader
+/// never stamped.
+///
+/// Not a slurp: the expression never sees a containing array, so `.name`,
+/// `keys`, `length` and `del(.name)` all apply per document.
+pub(crate) fn eval_yq_documents_together<S: EvalSemantics, C: DocumentCursor>(
+    expr: &Expr,
+    documents: &[YqDocument<C>],
+) -> GenericResult<C::Value> {
+    let inputs: Vec<YqContextItem<C::Value>> = documents
+        .iter()
+        .map(|doc| {
+            YqContextItem::new(
+                match doc.cursor {
+                    Some(cursor) => YqContextNode::Cursor(cursor),
+                    None => YqContextNode::Owned(doc.value.clone()),
+                },
+                YqContextTag {
+                    together: true,
+                    origin: Some(doc.origin),
+                },
+            )
+        })
+        .collect();
+    let mut flat: Vec<Expr> = Vec::new();
+    yq_flatten_pipe_stages(core::slice::from_ref(expr), &mut flat);
+    let cur = core::cell::Cell::new(YqContextTag::default());
+    let mut items: Vec<GenericItem<C::Value>> = Vec::new();
+    let flow = eval_yq_context_pipe::<S, C::Value>(&flat, &inputs, false, &cur, &mut |item| {
+        items.push(item);
+        Demand::Continue
+    });
+    // Same tail as `collect_each_generic`: a clean run answers with the items,
+    // a control keeps whatever was already produced as a `Partial`.
+    let control = match flow {
+        Flow::Exhausted | Flow::Stopped { pending: None } => {
+            return match items_to_generic_result(items) {
+                Ok(result) => result,
+                Err((prefix, control)) => partial_generic(prefix, control),
+            };
+        }
+        Flow::Stopped {
+            pending: Some(control),
+        }
+        | Flow::Escaped(control) => control,
+    };
+    let mut owned = vec_with_capacity(items.len());
+    for item in items {
+        match generic_item_into_owned(item) {
+            Ok(v) => owned.push(v),
+            Err(failure) => return partial_generic(owned, failure),
+        }
+    }
+    partial_generic(owned, control)
 }
 
 /// Generic-evaluator twin of `eval::each_take_first` (#1461): pull at most
@@ -12505,7 +12986,9 @@ fn path_context_resolve_constants(
         // than switched to an unexercised `file_index_for_path(path)` call --
         // `path` here is absolute, so that is the one-line change to make the
         // moment a route does arrive with a table (#2427).
-        Expr::Builtin(Builtin::FileIndex) => Expr::Literal(Literal::Int(0)),
+        Expr::Builtin(Builtin::FileIndex) => {
+            Expr::Literal(Literal::Int(ambient_file_index().unwrap_or(0)))
+        }
         Expr::Paren(inner) => Expr::Paren(boxed(inner)),
         Expr::Array(inner) => Expr::Array(boxed(inner)),
         Expr::Optional(inner) => Expr::Optional(boxed(inner)),
@@ -12679,8 +13162,13 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         }
 
         Builtin::DocumentIndex => {
-            let doc_index = cursor.and_then(|c| c.document_index()).unwrap_or(0);
-            GenericResult::Owned(OwnedValue::Int(doc_index as i64))
+            // #2427: the ambient origin wins where one is installed --
+            // `--eval-all` reindexes each input document into its own
+            // throwaway single-document JSON index, whose own
+            // `document_index()` is 0 for every one of them.
+            let doc_index = ambient_document_index()
+                .unwrap_or_else(|| cursor.and_then(|c| c.document_index()).unwrap_or(0) as i64);
+            GenericResult::Owned(OwnedValue::Int(doc_index))
         }
 
         Builtin::Anchor => {
@@ -14582,9 +15070,12 @@ fn eval_owned_identity_pipe<S: EvalSemantics, V: DocumentValue>(
         // `FileIndex` arm (see its comment): the table exists now, this route
         // is not reached with one installed, and `id.path()` is what to feed
         // `file_index_for_path` when it is.
-        Expr::Builtin(Builtin::FileIndex) => {
-            continue_owned_identity_plain::<S, V>(rest, OwnedValue::Int(0), optional, sink)
-        }
+        Expr::Builtin(Builtin::FileIndex) => continue_owned_identity_plain::<S, V>(
+            rest,
+            OwnedValue::Int(ambient_file_index().unwrap_or(0)),
+            optional,
+            sink,
+        ),
         Expr::Builtin(Builtin::Parent) => match id.parent() {
             Some(OwnedParent::Owned(v, vid)) => {
                 eval_owned_identity_pipe::<S, V>(rest, v, vid, optional, sink)
