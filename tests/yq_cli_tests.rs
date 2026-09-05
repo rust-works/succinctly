@@ -32044,6 +32044,9 @@ fn test_block_sequence_item_key_path_parent_through_generic_route_2455() -> Resu
 /// $ yq -o=json -I=0 '.a.x.y | parent'        {"y":null}         succinctly: null
 /// $ yq -o=json -I=0 '.a.x.y | parent(2)'     {"b":1,"x":{"y":null}}  succinctly: {"b":1}
 /// ```
+///
+/// `test_absent_position_owned_identity_2472` carries the shapes this
+/// constant route declines and #2472 moved to the owned identity pipe.
 #[test]
 fn test_absent_position_keeps_path_context_2416() -> Result<()> {
     let args = &["-o=json", "-I=0"];
@@ -32074,31 +32077,118 @@ fn test_absent_position_keeps_path_context_2416() -> Result<()> {
     Ok(())
 }
 
-/// Spine 2416, step 2: the shapes the absent route deliberately does *not*
-/// take, pinned as still-correct output rather than as a route.
+/// #2472 (spine 2416 gate reason 2): the two absent shapes the constant
+/// resolver declines, now answered by the owned identity pipe.
 ///
-/// `parent` answers with a document node, which the resolver cannot spell as
-/// a constant, so a `parent` inside a non-navigational stage keeps the eager
-/// evaluator -- and with it the eager evaluator's own `{}` for the absent
-/// ancestor, where the walk emits `null` for the same position. Both are
-/// pinned here so the inconsistency is visible rather than latent; real yq
-/// prints its vivified `{"y":null}` for the second element (captured
-/// 2026-09-05, v4.53.3).
+/// An absent position *is* an `OwnedIdentity` (ADR-0021 decision 7): value
+/// `null`, `base` the deepest real ancestor's cursor, `ancestors` the chain
+/// of components taken past it. That gives `parent` a real node to answer
+/// with -- so a `parent` inside a construct no longer needs a literal that
+/// cannot be written -- and lets the position *move* after a
+/// non-navigational stage, which is what the resolved constants could not
+/// survive.
+///
+/// Captured 2026-09-06 from yq v4.53.3 on `a:\n  b: 1\n` (and, byte for
+/// byte, on the flow spelling `a: {b: 1}`), `-o=json -I=0`:
 ///
 /// ```text
-/// $ yq -o=json -I=0 '.a.x.y | [path, parent]'   [["a","x","y"],{"y":null}]
-/// $ yq -o=json -I=0 '.a.x.y | parent'           {"y":null}
+/// $ yq '.a.x.y | [path, parent]'          [["a","x","y"],{"y":null}]
+/// $ yq '.a.x.y | [path, parent(2)]'       [["a","x","y"],{"b":1,"x":{"y":null}}]
+/// $ yq '.a.x.y | [path, parent(0)]'       [["a","x","y"],null]
+/// $ yq '.a.x.y | parent | parent | key'   "a"
+/// $ yq '.a.x.y | parent | key'            "x"
+/// $ yq '.a.x | (parent | key), key'       "a"
+/// $ yq '.a.x | select(true) | .c | path'  ["a","x","c"]
+/// $ yq '.a.b | select(true) | .c | key'   (nothing)
+/// $ yq '.a.x | {"p": parent, "k": key}'   {"p":{"b":1,"x":null},"k":"x"}
+/// $ yq '.a[5] | parent'                   [1,null,null,null,null,null]   (on `a: [1]`)
+/// $ yq '.[] | .k | select(key == "k")'    1 / 2   (on `a: {k: 1}` / `b: {k: 2}`)
 /// ```
+///
+/// The `parent`-on-absent rows diverge, and deliberately: yq *vivifies* the
+/// missing key into the node it returns, succinctly prints the deepest real
+/// ancestor chain instead (ADR-0018 rule 4(b), #2146/#2435, recorded in
+/// `docs/compliance/yq/limitations.md`). This route does not change that
+/// answer -- it makes it *consistent*: the eager evaluator used to print
+/// `{}` for the one-level absent ancestor of `.a.x.y` where the walk prints
+/// `null` for the very same position, and both now print `null`. The
+/// `parent(0)` row is a straight fidelity gain, since the vivification
+/// never applies to the value itself.
+///
+/// `{"p": parent, "k": key}` prints nothing here, in yq mode and jq mode
+/// alike: `needs_path_context` does not descend into `Expr::Object`
+/// (#1332), so that pipe is never seen as a path-context pipe by any route
+/// and `parent` is answered with no position at all. It is pinned as the
+/// pre-existing gap it is, unmoved by this change.
 #[test]
-fn test_absent_position_parent_still_takes_the_eager_route_2416() -> Result<()> {
+fn test_absent_position_owned_identity_2472() -> Result<()> {
     let args = &["-o=json", "-I=0"];
     let doc = "a:\n  b: 1\n";
-    // The eager route's `{}` for an absent ancestor, next to the walk's
-    // `null` for the very same position one row above in
-    // `test_absent_position_keeps_path_context_2416`.
-    let (output, code) = run_yq_stdin(".a.x.y | [path, parent]", doc, args)?;
+    for (filter, expected) in [
+        // Shape 1: `parent`/`parent(n)` from a possibly-absent position
+        // inside a non-navigational stage.
+        (".a.x.y | [path, parent]", "[[\"a\",\"x\",\"y\"],null]"),
+        (".a.x.y | [path, parent(0)]", "[[\"a\",\"x\",\"y\"],null]"),
+        (
+            ".a.x.y | [path, parent(2)]",
+            "[[\"a\",\"x\",\"y\"],{\"b\":1}]",
+        ),
+        (
+            ".a.x.y | [path, parent(3)]",
+            "[[\"a\",\"x\",\"y\"],{\"a\":{\"b\":1}}]",
+        ),
+        // Above the document root is nothing at all, the same answer a bare
+        // `parent` gives there (#2421).
+        (".a.x.y | [path, parent(4)]", "[[\"a\",\"x\",\"y\"]]"),
+        (".a.x | [path, parent]", "[[\"a\",\"x\"],{\"b\":1}]"),
+        (".a.x | select(parent != null) | key", "\"x\""),
+        // succinctly's absent `parent` is `null` where yq's is `{"y":null}`,
+        // so this `select` passes here and fails there -- the same #2435
+        // divergence, seen through a predicate.
+        (
+            ".a.x.y | select(parent == null) | path",
+            "[\"a\",\"x\",\"y\"]",
+        ),
+        // Shape 2: navigation after a non-navigational stage.
+        (".a.x | select(true) | .c | key", "\"c\""),
+        (".a.x | select(true) | .c | path", "[\"a\",\"x\",\"c\"]"),
+        (".a | select(true) | .b | key", "\"b\""),
+        // Same route, from a stage that replaces the value rather than
+        // filtering it: the identity is what carries the position, so the
+        // absent side answers exactly as the live side does.
+        (".a.x | tostring | key", "\"x\""),
+        (".a.x | tostring | path", "[\"a\",\"x\"]"),
+        (".a.x | tostring | parent | key", "\"a\""),
+        (".a.x | length | key", "\"x\""),
+        (".a.x.y | tostring | parent(2) | key", "\"a\""),
+        // #1332's object-construction gap, unmoved.
+        (".a.x | {\"p\": parent, \"k\": key}", ""),
+    ] {
+        let (output, code) = run_yq_stdin(filter, doc, args)?;
+        assert_eq!(code, 0, "`{filter}`: {output:?}");
+        assert_eq!(output.trim(), expected, "`{filter}`");
+    }
+    // An absent *index* hangs under a real sequence, so the chain's deepest
+    // real ancestor is that sequence and `parent` is the sequence itself.
+    for (filter, expected) in [
+        (".a[5] | parent", "[1]"),
+        (".a[5] | [path, parent, key]", "[[\"a\",5],[1],5]"),
+        (".a[5] | [path, parent(2)]", "[[\"a\",5],{\"a\":[1]}]"),
+    ] {
+        let (output, code) = run_yq_stdin(filter, "a: [1]\n", args)?;
+        assert_eq!(code, 0, "`{filter}`: {output:?}");
+        assert_eq!(output.trim(), expected, "`{filter}`");
+    }
+    // Shape 3, the residue ADR-0021 records: a fan-out head would collect
+    // one position per element, so it stays on the eager evaluator by
+    // design. Pinned as output, not as a route -- the answer is yq's.
+    let (output, code) = run_yq_stdin(
+        ".[] | .k | select(key == \"k\")",
+        "a: {k: 1}\nb: {k: 2}\n",
+        args,
+    )?;
     assert_eq!(code, 0, "{output:?}");
-    assert_eq!(output.trim(), "[[\"a\",\"x\",\"y\"],{}]");
+    assert_eq!(output.trim(), "1\n2");
     Ok(())
 }
 

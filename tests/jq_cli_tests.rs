@@ -38166,10 +38166,25 @@ fn test_absent_position_keeps_path_context_2416() -> Result<()> {
         (".a.c[5] | select(key == 5)", "null"),
         (".a.x | limit(1; key)", "\"x\""),
         (".a.x | try (key) catch \"e\"", "\"x\""),
-        // Not the absent route: an absent `parent` is a node no constant can
-        // spell, so this stays on the eager evaluator (see the yq-mode
-        // sibling test for the divergence that leaves visible).
-        (".a.x.y | [path, parent]", "[[\"a\",\"x\",\"y\"],{}]"),
+        // #2472: an absent `parent` is a node no constant can spell, so
+        // these take the owned identity pipe instead -- the position is the
+        // deepest real ancestor plus the components past it, and `parent`
+        // pops that chain. jq has no `parent` at all (`parent/0 is not
+        // defined`, 1.7.1), so the yq-mode sibling test carries the oracle;
+        // these rows pin that jq mode answers from the same identity.
+        (".a.x.y | [path, parent]", "[[\"a\",\"x\",\"y\"],null]"),
+        (".a.x.y | [path, parent(0)]", "[[\"a\",\"x\",\"y\"],null]"),
+        (
+            ".a.x.y | [path, parent(2)]",
+            "[[\"a\",\"x\",\"y\"],{\"b\":1,\"c\":[1,2]}]",
+        ),
+        (".a.c[5] | [path, parent]", "[[\"a\",\"c\",5],[1,2]]"),
+        // Navigation after a non-navigational stage: the position moves, so
+        // the constants cannot describe it and the identity does.
+        (".a.x | select(true) | .z | key", "\"z\""),
+        (".a.x | select(true) | .z | path", "[\"a\",\"x\",\"z\"]"),
+        (".a.x | tostring | key", "\"x\""),
+        (".a.x | tostring | path", "[\"a\",\"x\"]"),
     ] {
         let (out, _, code) = run_jq_full(&["-c", filter], Some(doc))?;
         assert_eq!(code, 0, "`{filter}`: {out:?}");
