@@ -28884,87 +28884,97 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate input to get the stream of values
-    let input_result = eval_single::<W, S>(input, value.clone(), optional);
-    // #1902/#1934: to_owned/promote_borrowed_checked, not to_owned_lossy --
-    // an undecodable input element used to silently become `""` instead of
-    // raising. A decode failure is never suppressed by `optional` (#1620),
-    // matching the "drop the prefix, propagate unconditionally" policy the
-    // comment below already applies to an ordinary `Partial` error -- but a
-    // *non*-decode-failure conversion error (a #1194 malformed-member error
-    // -- a #1642 collision error is itself tagged as a decode failure and
-    // so is unaffected by this) is an ordinary error like any other, and
-    // `optional` should suppress it the same way the bare `QueryResult::Error`
-    // arm below already does (#1934 item 3: this used to be unconditionally
-    // fatal regardless of `optional`, unlike that sibling arm). #1934 item 6:
-    // this widening -- a malformed key/collision now raises here where the
-    // pre-#1902 unchecked `to_owned_lossy` silently dropped the offending member --
-    // is `to_owned`'s own already-established contract from #1755
-    // onward, not new scope creep specific to `reduce`; #1907 tracks the
-    // general "`to_owned`'s `Err` can carry a non-decode-failure
-    // error" question this arm (and its `eval_foreach`/`eval_as` siblings)
-    // are instances of.
-    let input_values: Vec<OwnedValue> = match input_result.materialize_cursor() {
-        QueryResult::One(v) => match to_owned(&v) {
-            Ok(v) => vec![v],
-            Err(e) => return suppress_or_raise(e, optional),
-        },
-        QueryResult::OneCursor(_) => unreachable!(),
-        QueryResult::Many(vs) => match promote_borrowed_checked(vs) {
-            Ok(vs) => vs,
-            Err((_, e)) => return suppress_or_raise(e, optional),
-        },
-        QueryResult::Owned(v) => vec![v],
-        QueryResult::ManyOwned(vs) => vs,
-        QueryResult::None => Vec::new(),
-        // #1934 item 2: a decode failure raised directly by `input`'s own
-        // evaluation (not via the checked-conversion arms above) must not
-        // be suppressed by `optional` either, matching `finish_fork`'s
-        // identical guard -- this arm had drifted from it.
-        QueryResult::Error(e) => return suppress_or_raise(e, optional),
-        QueryResult::Break(label) => return QueryResult::Break(label),
-        QueryResult::Halt(code) => return QueryResult::Halt(code),
-        // `reduce`'s own output is always single-shot — it only ever emits
-        // the final accumulator, never intermediate values (verified against
-        // jq: `reduce (1,2,error("x"),4) as $v (0;.+$v)` produces no output
-        // at all, just the error) — so a `Partial` input stream just extracts
-        // the control and drops the prefix, same as the bare arms above.
-        QueryResult::Partial(_prefix, Control::Error(e)) => return suppress_or_raise(e, optional),
-        QueryResult::Partial(_prefix, Control::Break(label)) => return QueryResult::Break(label),
-        QueryResult::Partial(_prefix, Control::Halt(code)) => return QueryResult::Halt(code),
-    };
-
-    // Evaluate INIT. Each of its outputs forks the whole reduce into a fully
-    // independent execution over `input_values` (#534): `reduce (1,2) as $x
-    // ((10,20); .+$x)` is `13`, `23`, one result per INIT output. A `Partial`
-    // INIT stream still forks over the prefix it did produce, mirroring
-    // `eval_reduce`'s own optional-aware policy on its `input` stream above.
+    // INIT first, `input` second (#2440). jq evaluates INIT before it ever
+    // pulls the source generator, so INIT's own escape always outranks the
+    // source's and a zero-output INIT means the source never runs at all --
+    // captured from jq 1.7.1 on `{"a":1}`: `reduce (1, error("in")) as $x
+    // (error("init"); .)` reports `init` (succinctly reported `in` before
+    // this fix), and `reduce halt_error as $x (empty; .)` exits 0 without
+    // halting. The source is handed to the shared core as a closure so that
+    // "INIT produced nothing" can short-circuit it there, once, for every
+    // caller (#106's one-definition rule) -- see
+    // [`eval_reduce_with_values`]. `path()`'s own resolver already ordered
+    // the two this way (#2388).
+    //
+    // #1902/#1934: `stream_outputs_checked` (to_owned/promote_borrowed_checked,
+    // not to_owned_lossy) -- an undecodable INIT output used to silently
+    // become `""` instead of raising. A `Partial` INIT stream still forks
+    // over the prefix it did produce; a bare `Error`/`Break`/`Halt` folds to
+    // an empty prefix that the core's own `init_values.is_empty()` guard
+    // collapses back to exactly the `QueryResult` a hand-rolled early return
+    // here used to produce (`finish_fork(Vec::new(), Some(Control::Error(e)),
+    // optional)` == `suppress_or_raise(e, optional)`; `Break`/`Halt` collapse
+    // the same way via `partial`'s own empty-prefix rule). Verified against
+    // jq 1.7.1: `reduce (5) as $x ((1,2,error("boom")); .+$x)?` prints `6`,
+    // `7` (both successful INIT forks), only the trailing error is swallowed.
+    //
+    // Each INIT output forks the whole reduce into a fully independent
+    // execution over the source (#534): `reduce (1,2) as $x ((10,20); .+$x)`
+    // is `13`, `23`, one result per INIT output.
     let init_result = eval_single::<W, S>(init, value.clone(), optional);
-    // #1902/#1934: [`stream_outputs_checked`] folds a checked-conversion
-    // failure into `init_control` exactly like an ordinary `Partial`'s
-    // control -- the already-converted prefix still forks below before the
-    // decode failure surfaces as the terminal control via `finish_fork`
-    // (which never suppresses a decode failure under `optional`, #1902),
-    // and a bare (non-`Partial`) `Error`/`Break`/`Halt` folds to an empty
-    // prefix that `finish_fork` collapses back to exactly the same
-    // `QueryResult` a hand-rolled early return here used to produce
-    // directly (verified by hand: `finish_fork(Vec::new(),
-    // Some(Control::Error(e)), optional)` == `suppress_or_raise(e,
-    // optional)`; `Break`/`Halt` collapse the same way via `partial`'s own
-    // empty-prefix rule). A `Partial` INIT stream's already-produced prefix
-    // still forks below regardless of whether its trailing control ends up
-    // suppressed -- verified against jq 1.7.1: `reduce (5) as $x
-    // ((1,2,error("boom")); .+$x)?` prints `6`, `7` (both successful INIT
-    // forks), only the trailing error is swallowed.
     let (init_values, init_control) = stream_outputs_checked(init_result.materialize_cursor());
 
-    eval_reduce_with_values::<W, S>(
+    eval_reduce_with_values::<W, S, _>(
         patterns,
         update,
-        input_values,
         init_values,
         init_control,
         optional,
+        || {
+            // #1902/#1934: to_owned/promote_borrowed_checked, not to_owned_lossy --
+            // an undecodable input element used to silently become `""` instead
+            // of raising. A decode failure is never suppressed by `optional`
+            // (#1620), matching the "drop the prefix, propagate unconditionally"
+            // policy the `Partial` arms below already apply -- but a
+            // *non*-decode-failure conversion error (a #1194 malformed-member
+            // error -- a #1642 collision error is itself tagged as a decode
+            // failure and so is unaffected by this) is an ordinary error like any
+            // other, and `optional` should suppress it the same way the bare
+            // `QueryResult::Error` arm below already does (#1934 item 3: this
+            // used to be unconditionally fatal regardless of `optional`, unlike
+            // that sibling arm). #1934 item 6: this widening -- a malformed
+            // key/collision now raises here where the pre-#1902 unchecked
+            // `to_owned_lossy` silently dropped the offending member -- is
+            // `to_owned`'s own already-established contract from #1755 onward,
+            // not new scope creep specific to `reduce`; #1907 tracks the general
+            // "`to_owned`'s `Err` can carry a non-decode-failure error" question
+            // this arm (and its `eval_foreach`/`eval_as` siblings) are instances
+            // of.
+            //
+            // `reduce`'s own output is always single-shot -- it only ever emits
+            // the final accumulator, never intermediate values (verified against
+            // jq: `reduce (1,2,error("x"),4) as $v (0;.+$v)` produces no output
+            // at all, just the error) -- so a `Partial` input stream just extracts
+            // the control and drops the prefix, same as the bare arms below.
+            match eval_single::<W, S>(input, value, optional).materialize_cursor() {
+                QueryResult::One(v) => match to_owned(&v) {
+                    Ok(v) => Ok(vec![v]),
+                    Err(e) => Err(suppress_or_raise(e, optional)),
+                },
+                QueryResult::OneCursor(_) => unreachable!(),
+                QueryResult::Many(vs) => match promote_borrowed_checked(vs) {
+                    Ok(vs) => Ok(vs),
+                    Err((_, e)) => Err(suppress_or_raise(e, optional)),
+                },
+                QueryResult::Owned(v) => Ok(vec![v]),
+                QueryResult::ManyOwned(vs) => Ok(vs),
+                QueryResult::None => Ok(Vec::new()),
+                // #1934 item 2: a decode failure raised directly by `input`'s own
+                // evaluation (not via the checked-conversion arms above) must not
+                // be suppressed by `optional` either, matching `finish_fork`'s
+                // identical guard -- this arm had drifted from it.
+                QueryResult::Error(e) => Err(suppress_or_raise(e, optional)),
+                QueryResult::Break(label) => Err(QueryResult::Break(label)),
+                QueryResult::Halt(code) => Err(QueryResult::Halt(code)),
+                QueryResult::Partial(_prefix, Control::Error(e)) => {
+                    Err(suppress_or_raise(e, optional))
+                }
+                QueryResult::Partial(_prefix, Control::Break(label)) => {
+                    Err(QueryResult::Break(label))
+                }
+                QueryResult::Partial(_prefix, Control::Halt(code)) => Err(QueryResult::Halt(code)),
+            }
+        },
     )
 }
 
@@ -28978,17 +28988,38 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// evaluation by either caller -- it runs against the accumulator, a
 /// synthetic value with no real document position, so `key` there already
 /// answers `null` correctly without needing to change (#1765's own scoping).
-pub(crate) fn eval_reduce_with_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+///
+/// `input` arrives as a `source` *closure*, not a `Vec`, because jq
+/// evaluates INIT before it ever pulls the source generator (#2440): a
+/// zero-output INIT must leave the source unevaluated, side effects
+/// included. Every caller therefore evaluates INIT eagerly and defers
+/// `input` to this function, which decides whether to run it at all.
+pub(crate) fn eval_reduce_with_values<'a, W, S, F>(
     patterns: &[Pattern],
     update: &Expr,
-    input_values: Vec<OwnedValue>,
     init_values: Vec<OwnedValue>,
     init_control: Option<Control>,
     optional: bool,
-) -> QueryResult<'a, W> {
+    source: F,
+) -> QueryResult<'a, W>
+where
+    W: Clone + AsRef<[u64]>,
+    S: EvalSemantics,
+    F: FnOnce() -> Result<Vec<OwnedValue>, QueryResult<'a, W>>,
+{
+    // #2440: INIT has already run by the time this is called, and a
+    // zero-output INIT means the source generator is never pulled at all --
+    // `reduce halt_error as $x (empty; .)` exits 0 in jq 1.7.1, where
+    // evaluating the source first would have halted the process. That is why
+    // `source` is a closure rather than a `Vec`: the short-circuit lives here,
+    // once, instead of at each of the three call sites.
     if init_values.is_empty() {
         return finish_fork(Vec::new(), init_control, optional);
     }
+    let input_values = match source() {
+        Ok(values) => values,
+        Err(escaped) => return escaped,
+    };
 
     // Every name any alternative could bind (#1365) -- a name unbound by
     // whichever alternative actually matches defaults to `null` in UPDATE,
@@ -30062,105 +30093,81 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    // Evaluate input to get the stream. A `Partial` input (#400, #494) still
-    // has its produced prefix iterated below — jq's generator processes each
-    // input value as it's produced, so `foreach (1,2,error("x"),4) as $v (0;
-    // .+$v)` emits `1`, `3` before erroring — the input stream's own control
-    // is held until the loop over that prefix has run its course.
-    let input_result = eval_single::<W, S>(input, value.clone(), optional);
-    // #1902: to_owned/promote_borrowed_checked, not to_owned_lossy -- a
-    // checked-conversion failure folds into `input_control` exactly like an
-    // ordinary `Partial`'s control (the comment above): the already-decoded
-    // prefix is still iterated below before the decode failure surfaces as
-    // the terminal control.
-    let (input_values, input_control): (Vec<OwnedValue>, Option<Control>) =
-        match input_result.materialize_cursor() {
-            // STYLE-0012: routed, one level out -- the error folds into
-            // `input_control` and reaches `finish_fork(.., optional)`, the
-            // shared suppression point #1902 fixed. See the identical fold
-            // for INIT below.
-            QueryResult::One(v) => match to_owned(&v) {
-                Ok(v) => (vec![v], None),
-                Err(e) => (Vec::new(), Some(Control::Error(e))),
-            },
-            QueryResult::OneCursor(_) => unreachable!(),
-            QueryResult::Many(vs) => match promote_borrowed_checked(vs) {
-                Ok(vs) => (vs, None),
-                Err((prefix, e)) => (prefix, Some(Control::Error(e))),
-            },
-            QueryResult::Owned(v) => (vec![v], None),
-            QueryResult::ManyOwned(vs) => (vs, None),
-            QueryResult::None => (Vec::new(), None),
-            // An immediate (non-`Partial`) error has no prefix to salvage,
-            // so `?` suppresses it the same way `eval_reduce`'s equivalent
-            // arm already does — this one was missing it, letting an
-            // ambient `?` fail to catch an error in the source stream
-            // (#534 follow-up). #1934 item 2: excludes a decode failure from
-            // that suppression too, matching `finish_fork`.
-            QueryResult::Error(e) => return suppress_or_raise(e, optional),
-            QueryResult::Break(label) => return QueryResult::Break(label),
-            QueryResult::Halt(code) => return QueryResult::Halt(code),
-            QueryResult::Partial(vs, control) => (vs, Some(control)),
-        };
-
-    // Evaluate INIT. Each of its outputs forks the whole foreach into a
-    // fully independent execution over `input_values` (#534): `[foreach
-    // (1,2) as $x ((10,20); .+$x)]` is `[11,13,21,23]`, the concatenation of
-    // one independent run per INIT output.
+    // INIT first, `input` second (#2440) -- see [`eval_reduce`]'s twin of
+    // this comment for the captured jq 1.7.1 rows. `foreach (1, error("in"))
+    // as $x (error("init"); .)` reports `init`, not the source's `in`, and
+    // `foreach halt_error as $x (empty; .)` exits 0 without halting, because
+    // a zero-output INIT never pulls the source at all.
+    //
+    // #1902: `stream_outputs_checked` gives INIT the same checked conversion
+    // (`to_owned`/`promote_borrowed_checked`, not `to_owned_lossy`) the
+    // source gets below, folding a bare `Error`/`Break`/`Halt` into
+    // `init_control` with an empty prefix. That fold is exactly what the old
+    // hand-rolled arms here did *except* for their `input_control.or(..)`
+    // ranking, which #2440 deletes along with the ordering that made it
+    // reachable: with the source not yet evaluated there is no earlier
+    // control for INIT's to rank behind, and the core's own
+    // `init_values.is_empty()` guard collapses an empty prefix plus control
+    // back to the same bare `QueryResult` those arms returned directly
+    // (`partial`'s empty-prefix rule; `Halt` included, which is why no
+    // separate halt arm survives here -- #2100's review near-miss was about
+    // folding bare and *`Partial`* halts together, which this does not do).
+    //
+    // Each INIT output forks the whole foreach into a fully independent
+    // execution over the source (#534): `[foreach (1,2) as $x ((10,20);
+    // .+$x)]` is `[11,13,21,23]`, the concatenation of one independent run
+    // per INIT output.
     let init_result = eval_single::<W, S>(init, value.clone(), optional);
-    // #1902: same checked-conversion treatment as `input_values` above.
-    let (init_values, init_control): (Vec<OwnedValue>, Option<Control>) =
-        match init_result.materialize_cursor() {
-            // STYLE-0012: routed, one level out. The error folds into
-            // `init_control` and is handed to `finish_fork(.., optional)`
-            // below, the shared suppression point #1902 fixed -- suppressing
-            // here as well would double-catch and drop `input_control`.
-            QueryResult::One(v) => match to_owned(&v) {
-                Ok(v) => (vec![v], None),
-                Err(e) => (Vec::new(), Some(Control::Error(e))),
-            },
-            QueryResult::OneCursor(_) => unreachable!(),
-            QueryResult::Many(vs) => match promote_borrowed_checked(vs) {
-                Ok(vs) => (vs, None),
-                Err((prefix, e)) => (prefix, Some(Control::Error(e))),
-            },
-            QueryResult::Owned(v) => (vec![v], None),
-            QueryResult::ManyOwned(vs) => (vs, None),
-            QueryResult::None => (Vec::new(), None),
-            // #1902 review: routed through `finish_fork` (not a bare
-            // `return`) so `input_control` -- evaluated earlier than INIT,
-            // per the source order above -- isn't silently dropped if it
-            // also holds a control (most importantly a decode failure,
-            // which `finish_fork` never suppresses regardless of
-            // `optional`). Same precedence as the fork loop's own
-            // `aborted.or_else(|| input_control.clone())` below.
-            QueryResult::Error(e) => {
-                return finish_fork(
-                    Vec::new(),
-                    input_control.or(Some(Control::Error(e))),
-                    optional,
-                )
-            }
-            QueryResult::Break(label) => {
-                return finish_fork(
-                    Vec::new(),
-                    input_control.or(Some(Control::Break(label))),
-                    optional,
-                )
-            }
-            QueryResult::Halt(code) => return QueryResult::Halt(code),
-            QueryResult::Partial(vs, control) => (vs, Some(control)),
-        };
+    let (init_values, init_control) = stream_outputs_checked(init_result.materialize_cursor());
 
-    eval_foreach_with_values::<W, S>(
+    eval_foreach_with_values::<W, S, _>(
         patterns,
         update,
         extract,
-        input_values,
-        input_control,
         init_values,
         init_control,
         optional,
+        || {
+            // A `Partial` input (#400, #494) still has its produced prefix
+            // iterated by the core -- jq's generator processes each input
+            // value as it's produced, so `foreach (1,2,error("x"),4) as $v
+            // (0; .+$v)` emits `1`, `3` before erroring -- so the input
+            // stream's own control is carried alongside the prefix rather
+            // than replacing it.
+            //
+            // #1902: to_owned/promote_borrowed_checked, not to_owned_lossy --
+            // a checked-conversion failure folds into `input_control` exactly
+            // like an ordinary `Partial`'s control: the already-decoded prefix
+            // is still iterated before the decode failure surfaces as the
+            // terminal control.
+            match eval_single::<W, S>(input, value, optional).materialize_cursor() {
+                // STYLE-0012: routed, one level out -- the error folds into
+                // `input_control` and reaches `finish_fork(.., optional)`, the
+                // shared suppression point #1902 fixed.
+                QueryResult::One(v) => match to_owned(&v) {
+                    Ok(v) => Ok((vec![v], None)),
+                    Err(e) => Ok((Vec::new(), Some(Control::Error(e)))),
+                },
+                QueryResult::OneCursor(_) => unreachable!(),
+                QueryResult::Many(vs) => match promote_borrowed_checked(vs) {
+                    Ok(vs) => Ok((vs, None)),
+                    Err((prefix, e)) => Ok((prefix, Some(Control::Error(e)))),
+                },
+                QueryResult::Owned(v) => Ok((vec![v], None)),
+                QueryResult::ManyOwned(vs) => Ok((vs, None)),
+                QueryResult::None => Ok((Vec::new(), None)),
+                // An immediate (non-`Partial`) error has no prefix to salvage,
+                // so `?` suppresses it the same way `eval_reduce`'s equivalent
+                // arm already does — this one was missing it, letting an
+                // ambient `?` fail to catch an error in the source stream
+                // (#534 follow-up). #1934 item 2: excludes a decode failure from
+                // that suppression too, matching `finish_fork`.
+                QueryResult::Error(e) => Err(suppress_or_raise(e, optional)),
+                QueryResult::Break(label) => Err(QueryResult::Break(label)),
+                QueryResult::Halt(code) => Err(QueryResult::Halt(code)),
+                QueryResult::Partial(vs, control) => Ok((vs, Some(control))),
+            }
+        },
     )
 }
 
@@ -30175,35 +30182,45 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// by either caller -- both run against the accumulator, a synthetic value
 /// with no real document position, so `key` there already answers `null`
 /// correctly without needing to change (#1765's own scoping).
-#[allow(clippy::too_many_arguments)] // STYLE-0004: `input`'s own trailing
-                                     // control (`input_control`) is a distinct parameter from `init`'s
-                                     // (`init_control`) -- `foreach` (unlike `reduce`, whose shared core has no
-                                     // `input_control` at all) must track the source stream's own control
-                                     // separately, since it can outlive `input_values` being consumed (#534
-                                     // follow-up); collapsing the two into one shared field would lose that
-                                     // distinction, not just shorten the signature.
-pub(crate) fn eval_foreach_with_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+///
+/// `input` arrives as a `source` *closure*, not a `(Vec, Option<Control>)`
+/// pair, for the reason [`eval_reduce_with_values`] documents: jq evaluates
+/// INIT before it ever pulls the source generator (#2440), so a zero-output
+/// INIT must leave the source unevaluated, side effects included. The
+/// closure still yields the source's own trailing control alongside its
+/// prefix -- `foreach` (unlike `reduce`) emits per step, so that control
+/// can outlive `input_values` being consumed (#534 follow-up) and is
+/// adjudicated per INIT fork below.
+pub(crate) fn eval_foreach_with_values<'a, W, S, F>(
     patterns: &[Pattern],
     update: &Expr,
     extract: Option<&Expr>,
-    input_values: Vec<OwnedValue>,
-    input_control: Option<Control>,
     init_values: Vec<OwnedValue>,
     init_control: Option<Control>,
     optional: bool,
-) -> QueryResult<'a, W> {
+    source: F,
+) -> QueryResult<'a, W>
+where
+    W: Clone + AsRef<[u64]>,
+    S: EvalSemantics,
+    F: FnOnce() -> Result<(Vec<OwnedValue>, Option<Control>), QueryResult<'a, W>>,
+{
     // Same hoist as `eval_reduce`: skipped entirely when there are no
     // INIT forks to consume it.
     //
-    // #1902 review: with zero forks to run, `input_control` (which can now
-    // carry a decode failure, per this function's own checked conversion
-    // above) never gets the chance the loop below gives it via
-    // `aborted.or_else(|| input_control.clone())` -- surface it here
-    // first, same precedence, so a corrupted `input` doesn't go silently
-    // unnoticed just because INIT happened to produce nothing.
+    // #2440: with zero INIT forks the source generator is never pulled at
+    // all -- `foreach halt_error as $x (empty; .)` exits 0 in jq 1.7.1,
+    // where evaluating the source first would have halted the process. The
+    // pre-#2440 code reached here with `input` already evaluated and had to
+    // rank its control ahead of INIT's (`input_control.clone().or(..)`);
+    // there is now nothing to rank, because there is nothing to evaluate.
     if init_values.is_empty() {
-        return finish_fork(Vec::new(), input_control.clone().or(init_control), optional);
+        return finish_fork(Vec::new(), init_control, optional);
     }
+    let (input_values, input_control) = match source() {
+        Ok(drained) => drained,
+        Err(escaped) => return escaped,
+    };
 
     // Every name any alternative could bind (#1365) -- same convention as
     // `eval_reduce`'s own hoist.
@@ -32990,28 +33007,38 @@ impl PathContextEscape {
 /// one of these blocks while quietly changing how bare and `Partial` halts
 /// fold together.
 ///
-/// | bare variant | `FoldIntoEscape`  | `ForeachInput`        | `ForeachInit`         |
-/// |--------------|-------------------|-----------------------|-----------------------|
-/// | `Error(e)`   | into escape slot  | `suppress_or_raise`   | `finish_fork`         |
-/// | `Break(l)`   | into escape slot  | return `Break(l)`     | `finish_fork`         |
-/// | `Halt(c)`    | into escape slot  | return `Halt(c)`      | return `Halt(c)`      |
+/// | bare variant | `FoldIntoEscape`  | `ForeachInput`        |
+/// |--------------|-------------------|-----------------------|
+/// | `Error(e)`   | into escape slot  | `suppress_or_raise`   |
+/// | `Break(l)`   | into escape slot  | return `Break(l)`     |
+/// | `Halt(c)`    | into escape slot  | return `Halt(c)`      |
 ///
-/// The rows differ on *`optional`-suppression*, which is why a uniform
-/// `let (vs, escape) = drain_path_context_stream(..)` at the `foreach`
-/// sites would be a silent semantic change rather than a cleanup: a
-/// control folded into the escape slot reaches `eval_foreach_with_values`
-/// as an `input_control`/`init_control` and is suppressed (or not) by that
-/// function's own rules, where the two routing rows below decide
-/// suppression here, before `foreach` ever runs.
+/// The rows differ on whether the escape leaves the call site at all, which
+/// is why a uniform `let (vs, escape) = drain_path_context_stream(..)` at
+/// `foreach`'s *input* would be a silent semantic change rather than a
+/// cleanup: a control folded into the escape slot reaches
+/// `eval_foreach_with_values` as an `input_control` and is adjudicated
+/// per INIT fork there, where `ForeachInput` decides it here, before
+/// `foreach` ever runs.
 ///
-/// `Expr::Reduce`'s path-context arm is deliberately *not* a fourth route,
-/// despite #2216's own table listing it as a fourth hand-copied block: it
+/// #2440 retired a third route, `ForeachInit`. Its whole content was
+/// ranking `foreach`'s *input*-stream control ahead of a bare `INIT`
+/// escape (`finish_fork(Vec::new(), input_control.or(..), optional)`),
+/// which only meant anything while `input` was evaluated first. jq
+/// evaluates INIT first, so there is no earlier control to rank behind and
+/// the row is exactly `FoldIntoEscape`: the bare escape rides `init_control`
+/// into `eval_foreach_with_values`, whose `init_values.is_empty()` guard
+/// collapses it back to the same bare `QueryResult` the old early return
+/// produced (`partial`'s empty-prefix rule, `Halt` included).
+///
+/// `Expr::Reduce`'s path-context arm is deliberately *not* a route either,
+/// despite #2216's own table listing it as a hand-copied block: it
 /// classifies through `stream_outputs_checked` and then folds every control
 /// -- bare or trailing alike -- into one `suppress_or_raise`/`Break`/`Halt`
 /// decision, because `reduce`'s output is single-shot and a partial input
 /// prefix has nothing to contribute. That arm's own comment says so; it is
 /// pinned by `test_path_context_escape_routes_pinned_2216` alongside these
-/// three anyway, since #2416 migrates it too.
+/// anyway, since #2416 migrates it too.
 #[derive(Clone, Copy, Debug)]
 enum BareEscapeRoute {
     /// The three computed-bracket-ish sites --
@@ -33025,24 +33052,15 @@ enum BareEscapeRoute {
     /// under it. Nothing is suppressed here: these sites evaluate their
     /// stream at `optional: false` in the first place.
     FoldIntoEscape,
-    /// `Expr::Foreach`'s `input`. A bare escape returns immediately, before
-    /// `INIT` is ever evaluated -- mirroring `eval_foreach`'s own
-    /// cursor-sourced code, whose `INIT` likewise never runs (`INIT` can
-    /// have real side effects: `debug`, `error`, `halt_error`). `Error`
-    /// goes through [`suppress_or_raise`] because an ambient `?` may
+    /// `Expr::Foreach`'s `input`. A bare escape returns from the whole fold
+    /// immediately -- mirroring `eval_foreach`'s own cursor-sourced code.
+    /// `Error` goes through [`suppress_or_raise`] because an ambient `?` may
     /// silence an ordinary error here, while `Break`/`Halt` are never
-    /// suppressible (#791/#824) and so return directly.
+    /// suppressible (#791/#824) and so return directly. Since #2440 `INIT`
+    /// has already run by this point, so this row no longer decides whether
+    /// `INIT` runs at all -- a zero-output `INIT` means the closure holding
+    /// this call is never invoked.
     ForeachInput,
-    /// `Expr::Foreach`'s `INIT`. `Error`/`Break` go through
-    /// [`finish_fork`] with `input_control.or(..)`, so an escape the
-    /// *input* stream already carried outranks this one and
-    /// `finish_fork`'s own #1902 decode-failure rule decides suppression --
-    /// a strictly different `optional` policy from `ForeachInput`'s
-    /// [`suppress_or_raise`]. `Halt` bypasses both: it must not be ranked
-    /// behind the input's control, nor suppressed, so it returns directly
-    /// (#791). Folding bare and `Partial` halts together here is exactly
-    /// the change #2100's review caught swallowing a live `halt_error`.
-    ForeachInit,
 }
 
 /// Classify a `QueryResult` already restricted to the
@@ -33084,18 +33102,14 @@ fn classify_path_context_stream<W: Clone + AsRef<[u64]>>(
 ///
 /// `Ok((values, escape))` -- the call site continues, carrying `escape` in
 /// its own escape slot. `Err(result)` -- the call site returns `result`
-/// immediately; only the two `foreach` routes ever produce it.
+/// immediately; only [`BareEscapeRoute::ForeachInput`] ever produces it.
 ///
-/// `input_control` is read by [`BareEscapeRoute::ForeachInit`] alone (the
-/// `foreach` input stream's own already-classified control, which outranks
-/// a bare `INIT` `Error`/`Break`); the other two routes pass `&None`. It is
-/// borrowed rather than moved because `Expr::Foreach`'s arm still needs it
-/// on the non-escaping path -- the clone below only ever runs on the
-/// escaping one.
+/// #2440 removed an `input_control` parameter here, read by the retired
+/// `ForeachInit` route alone: see [`BareEscapeRoute`]'s own note for why
+/// that ranking no longer has anything to rank.
 fn drain_path_context_stream_routed<'a, W: Clone + AsRef<[u64]>>(
     result: QueryResult<'_, W>,
     route: BareEscapeRoute,
-    input_control: &Option<Control>,
     optional: bool,
 ) -> Result<(Vec<OwnedValue>, Option<Control>), QueryResult<'a, W>> {
     let (values, escape) = classify_path_context_stream(result);
@@ -33113,12 +33127,6 @@ fn drain_path_context_stream_routed<'a, W: Clone + AsRef<[u64]>>(
         (BareEscapeRoute::ForeachInput, Control::Error(e)) => Err(suppress_or_raise(e, optional)),
         (BareEscapeRoute::ForeachInput, Control::Break(label)) => Err(QueryResult::Break(label)),
         (BareEscapeRoute::ForeachInput, Control::Halt(code)) => Err(QueryResult::Halt(code)),
-        (BareEscapeRoute::ForeachInit, Control::Halt(code)) => Err(QueryResult::Halt(code)),
-        (BareEscapeRoute::ForeachInit, control) => Err(finish_fork(
-            Vec::new(),
-            input_control.clone().or(Some(control)),
-            optional,
-        )),
     }
 }
 
@@ -33189,7 +33197,6 @@ fn eval_index_expr_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemanti
     let drained = match drain_path_context_stream_routed::<W>(
         key_result,
         BareEscapeRoute::FoldIntoEscape,
-        &None,
         false,
     ) {
         Ok(drained) => drained,
@@ -33484,7 +33491,6 @@ fn eval_getpath_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>
         match drain_path_context_stream_routed::<W>(
             path_result,
             BareEscapeRoute::FoldIntoEscape,
-            &None,
             false,
         ) {
             Ok(drained) => drained,
@@ -35678,36 +35684,24 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // control (#1978 code review): reproduces `eval_reduce`'s own
         // cursor-sourced handling exactly -- an input-stream error, break,
         // or halt, even one arriving after a partial prefix, returns
-        // immediately with the prefix discarded, before `INIT` is ever
-        // evaluated (`reduce`'s own output is always single-shot, so a
-        // partial prefix has nothing to contribute). Safe to fold the bare
-        // and `Partial` cases together this way specifically because
-        // `eval_reduce`'s own code already treats them identically (both
-        // return before touching `init`) -- `eval_foreach`'s sibling arm
-        // below can't take the same shortcut, since it evaluates `INIT`
-        // regardless of a `Partial` input's own control.
+        // immediately with the prefix discarded (`reduce`'s own output is
+        // always single-shot, so a partial prefix has nothing to
+        // contribute). Safe to fold the bare and `Partial` cases together
+        // this way specifically because `eval_reduce`'s own code already
+        // treats them identically -- `eval_foreach`'s sibling arm below
+        // can't take the same shortcut, since it iterates a `Partial`
+        // input's own prefix before its control fires.
+        //
+        // #2440: `INIT` is evaluated *first* here, as it is in
+        // `eval_reduce`, and `input` is deferred into
+        // `eval_reduce_with_values`'s `source` closure so that a
+        // zero-output `INIT` never evaluates it at all.
         Expr::Reduce {
             input,
             patterns,
             init,
             update,
         } if needs_path_context(input) || needs_path_context(init) => {
-            let (input_values, input_control) =
-                stream_outputs_checked(eval_expr_needing_path_context::<W, S>(
-                    input,
-                    value,
-                    root,
-                    file_origin,
-                    current_path,
-                    optional,
-                ));
-            if let Some(control) = input_control {
-                return match control {
-                    Control::Error(e) => suppress_or_raise(e, optional),
-                    Control::Break(label) => QueryResult::Break(label),
-                    Control::Halt(code) => QueryResult::Halt(code),
-                };
-            }
             let (init_values, init_control) =
                 stream_outputs_checked(eval_expr_needing_path_context::<W, S>(
                     init,
@@ -35717,13 +35711,29 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     current_path,
                     optional,
                 ));
-            let result = eval_reduce_with_values::<W, S>(
+            let result = eval_reduce_with_values::<W, S, _>(
                 patterns,
                 update,
-                input_values,
                 init_values,
                 init_control,
                 optional,
+                || {
+                    let (input_values, input_control) =
+                        stream_outputs_checked(eval_expr_needing_path_context::<W, S>(
+                            input,
+                            value,
+                            root,
+                            file_origin,
+                            current_path,
+                            optional,
+                        ));
+                    match input_control {
+                        None => Ok(input_values),
+                        Some(Control::Error(e)) => Err(suppress_or_raise(e, optional)),
+                        Some(Control::Break(label)) => Err(QueryResult::Break(label)),
+                        Some(Control::Halt(code)) => Err(QueryResult::Halt(code)),
+                    }
+                },
             );
             continue_rest_with_context::<W, S>(
                 result,
@@ -35739,14 +35749,16 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // `input`/`INIT` independently via `eval_expr_needing_path_context`
         // (#1978 code review) rather than unconditionally once either
         // needs it. Unlike `Reduce`, this can't fold onto
-        // `stream_outputs_checked`'s uniform bare-or-`Partial` handling:
-        // an input-stream `Partial` here keeps its already-produced prefix
-        // and carries the control forward (`input_control`), but a *bare*
-        // (non-`Partial`) error/break/halt still returns immediately,
-        // before `INIT` is ever evaluated -- collapsing that distinction
-        // would evaluate `INIT` (a real side effect, e.g. `debug`/`error`
-        // inside it) in a case where `eval_foreach`'s own cursor-sourced
-        // code never does. Mirrors that code exactly instead.
+        // `stream_outputs_checked`'s uniform bare-or-`Partial` handling of
+        // the *input* stream: a `Partial` there keeps its already-produced
+        // prefix and carries the control forward (`input_control`), but a
+        // *bare* (non-`Partial`) error/break/halt returns immediately.
+        // Mirrors `eval_foreach`'s own cursor-sourced code exactly.
+        //
+        // #2440: `INIT` is evaluated *first* here too, and `input` is
+        // deferred into `eval_foreach_with_values`'s `source` closure, so a
+        // zero-output `INIT` never evaluates it at all -- side effects
+        // (`debug`, `error`, `halt_error`) included.
         Expr::Foreach {
             input,
             patterns,
@@ -35755,58 +35767,48 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             extract,
         } if needs_path_context(input) || needs_path_context(init) => {
             // #2216: the classification and the `unreachable!` live once, in
-            // `classify_path_context_stream`; what stays here is the named
-            // route decision -- see `BareEscapeRoute`'s own table for why
-            // this operand's bare escapes cannot simply be folded into the
-            // escape slot the way the computed-bracket sites' are.
-            let (input_values, input_control): (Vec<OwnedValue>, Option<Control>) =
-                match drain_path_context_stream_routed::<W>(
-                    eval_expr_needing_path_context::<W, S>(
-                        input,
-                        value,
-                        root,
-                        file_origin,
-                        current_path,
-                        optional,
-                    ),
-                    BareEscapeRoute::ForeachInput,
-                    &None,
+            // `classify_path_context_stream`. #2440 retired this operand's
+            // own former route (`ForeachInit`): its whole content was
+            // ranking the *input* stream's already-classified control ahead
+            // of INIT's, and with INIT evaluated first there is no such
+            // control yet. What is left is exactly `FoldIntoEscape` -- a bare
+            // escape carried in the call site's own slot, which
+            // `eval_foreach_with_values`'s `init_values.is_empty()` guard
+            // then collapses back to the same bare `QueryResult` the old
+            // early return produced (`partial`'s empty-prefix rule).
+            let (init_values, init_control) =
+                drain_path_context_stream(eval_expr_needing_path_context::<W, S>(
+                    init,
+                    value,
+                    root,
+                    file_origin,
+                    current_path,
                     optional,
-                ) {
-                    Ok(drained) => drained,
-                    Err(escaped) => return escaped,
-                };
-            // #2216: `ForeachInit`, not `ForeachInput` -- the two rows differ
-            // on `optional`-suppression *and* on whether `input_control`
-            // outranks this operand's own escape. `input_control` is borrowed
-            // here because it is still owed to `eval_foreach_with_values`
-            // below on the non-escaping path.
-            let (init_values, init_control): (Vec<OwnedValue>, Option<Control>) =
-                match drain_path_context_stream_routed::<W>(
-                    eval_expr_needing_path_context::<W, S>(
-                        init,
-                        value,
-                        root,
-                        file_origin,
-                        current_path,
-                        optional,
-                    ),
-                    BareEscapeRoute::ForeachInit,
-                    &input_control,
-                    optional,
-                ) {
-                    Ok(drained) => drained,
-                    Err(escaped) => return escaped,
-                };
-            let result = eval_foreach_with_values::<W, S>(
+                ));
+            let result = eval_foreach_with_values::<W, S, _>(
                 patterns,
                 update,
                 extract.as_deref(),
-                input_values,
-                input_control,
                 init_values,
                 init_control,
                 optional,
+                || {
+                    // #2216: `ForeachInput`'s row -- a bare escape returns
+                    // from the fold outright rather than being carried, and
+                    // only its `Error` is `optional`-suppressible.
+                    drain_path_context_stream_routed::<W>(
+                        eval_expr_needing_path_context::<W, S>(
+                            input,
+                            value,
+                            root,
+                            file_origin,
+                            current_path,
+                            optional,
+                        ),
+                        BareEscapeRoute::ForeachInput,
+                        optional,
+                    )
+                },
             );
             continue_rest_with_context::<W, S>(
                 result,
@@ -51547,40 +51549,65 @@ mod tests {
         );
     }
 
-    /// #1902 review: `eval_foreach`'s `init_values.is_empty()` early return
-    /// used to hand `finish_fork` only `init_control`, dropping
-    /// `input_control` (and the decode failure it can now carry) entirely
-    /// whenever INIT produces nothing -- confirmed live during review:
-    /// `reduce`'s equivalent already raised unconditionally (its `input`
-    /// never depends on INIT), so the two constructs disagreed on the same
-    /// input.
+    /// #2440, superseding a #1902-review pin: `eval_foreach`'s
+    /// `init_values.is_empty()` early return used to weigh `input_control`
+    /// (and the decode failure it can carry) ahead of `init_control`,
+    /// because `input` had already been evaluated by the time INIT ran. jq
+    /// evaluates INIT *first*, so a zero-output INIT never pulls the source
+    /// at all and there is no `input_control` to weigh -- captured from
+    /// /usr/bin/jq 1.7.1 on `{"a":"x","arr":["p","q"]}`:
+    ///
+    /// | query                                                          | jq 1.7.1        |
+    /// |----------------------------------------------------------------|-----------------|
+    /// | `[foreach .a as $x (empty; .+1)]`                              | `[]`, exit 0    |
+    /// | `[foreach .arr[] as $x (error("boom"); .+1)]`                  | error `boom`, 5 |
+    /// | `try ([foreach .arr[] as $x (error("boom"); .+1)]) catch "C"`  | `"C"`, exit 0   |
+    /// | `[foreach .arr[] as $x (0; .+1)]`                              | `[1,2]`, exit 0 |
+    ///
+    /// The decode-failure rows below are succinctly's own extension of that
+    /// (jq has no undecodable-string concept): an input the fold never reads
+    /// cannot raise, and an INIT error that is not a decode failure stays
+    /// catchable, where the pre-#2440 code promoted the unread input's
+    /// decode failure over both.
     #[test]
-    fn test_eval_foreach_input_control_not_dropped_when_init_is_empty_1902() {
+    fn test_eval_foreach_skips_input_entirely_when_init_is_empty_2440() {
+        // A corrupted `input` is simply never decoded when INIT is empty.
         query!(
             b"{\"a\": \"\xff\xfe\"}",
             "[foreach .a as $x (empty; . + 1)]",
-            QueryResult::Error(e) => assert!(e.is_decode_failure())
+            QueryResult::Owned(OwnedValue::Array(vs)) => assert_eq!(vs, Vec::<OwnedValue>::new())
         );
-        // Positive control: a genuinely empty INIT with valid input still
-        // correctly produces no output and no error.
+        // Same shape with valid input -- unchanged by #2440, and the row jq
+        // itself can answer.
         query!(
             br#"{"a": "x"}"#,
             "[foreach .a as $x (empty; . + 1)]",
             QueryResult::Owned(OwnedValue::Array(vs)) => assert_eq!(vs, Vec::<OwnedValue>::new())
         );
-        // Same class of bug, different trigger: INIT's own bare `Error`
-        // (not "produced nothing") used to `return` immediately, dropping
-        // `input_control` the same way -- `try (...) catch "C"` proved it
-        // catchable before this fix, since the decode failure never
-        // reached `finish_fork`'s own uncatchable-for-decode-failure logic.
+        // INIT's own bare `Error` likewise wins outright: the source is not
+        // evaluated, so the error that surfaces is INIT's ordinary one, not
+        // the input's decode failure.
         query!(
             b"{\"arr\": [\"\xff\xfe\"]}",
             "[foreach .arr[] as $x (error(\"boom\"); . + 1)]",
-            QueryResult::Error(e) => assert!(e.is_decode_failure())
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "boom");
+                assert!(!e.is_decode_failure());
+            }
         );
+        // ... and being an ordinary error, it is catchable -- matching jq's
+        // `catch "CAUGHT"` row above.
         query!(
             b"{\"arr\": [\"\xff\xfe\"]}",
             "try ([foreach .arr[] as $x (error(\"boom\"); . + 1)]) catch \"CAUGHT\"",
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "CAUGHT")
+        );
+        // Control, and the half of #1902 that still stands: with INIT
+        // producing a value the source *is* read, so its decode failure
+        // surfaces exactly as before.
+        query!(
+            b"{\"arr\": [\"\xff\xfe\"]}",
+            "[foreach .arr[] as $x (0; . + 1)]",
             QueryResult::Error(e) => assert!(e.is_decode_failure())
         );
     }
@@ -55491,10 +55518,9 @@ mod tests {
     fn describe_route(
         result: QueryResult<'static, Vec<u64>>,
         route: BareEscapeRoute,
-        input_control: &Option<Control>,
         optional: bool,
     ) -> String {
-        match drain_path_context_stream_routed::<Vec<u64>>(result, route, input_control, optional) {
+        match drain_path_context_stream_routed::<Vec<u64>>(result, route, optional) {
             Ok(drained) => format!("carry:{}", describe_drained(drained)),
             Err(QueryResult::None) => "return:None".to_string(),
             Err(QueryResult::Error(e)) => format!("return:Error({})", e.message),
@@ -55540,7 +55566,7 @@ mod tests {
         ];
         for make in shapes {
             let want = describe_drained(drain_path_context_stream(make()));
-            let got = describe_route(make(), BareEscapeRoute::FoldIntoEscape, &None, false);
+            let got = describe_route(make(), BareEscapeRoute::FoldIntoEscape, false);
             assert_eq!(
                 got,
                 format!("carry:{want}"),
@@ -55549,10 +55575,17 @@ mod tests {
         }
     }
 
-    /// #2216: the routing table itself, asserted directly -- the three rows
-    /// differ on `optional`-suppression and on whether the `foreach` input
-    /// stream's own control outranks the operand's, and no single query
-    /// shape can separate all of that.
+    /// #2216: the routing table itself, asserted directly -- the two rows
+    /// differ on whether a bare escape leaves the call site at all, and on
+    /// `optional`-suppression, which no single query shape separates.
+    ///
+    /// #2440 retired the third row (`ForeachInit`): its content was ranking
+    /// `foreach`'s input-stream control ahead of a bare `INIT` escape, and
+    /// INIT is now evaluated before the input stream exists. `foreach`'s
+    /// `INIT` takes `FoldIntoEscape` (row 1) instead, which the last
+    /// assertion below pins as *equivalent* to what `ForeachInit` used to
+    /// return, once `eval_foreach_with_values`'s `init_values.is_empty()`
+    /// guard has collapsed the carried escape.
     ///
     /// `optional == true` is currently unreachable from live syntax at these
     /// sites (see `finish_fork`'s own doc comment, #1934 item 7), so the
@@ -55560,9 +55593,6 @@ mod tests {
     /// function's own tests already do.
     #[test]
     fn test_bare_escape_route_table_2216() {
-        let none: Option<Control> = None;
-        let prior = Some(Control::Error(EvalError::new("in")));
-
         // Row 1 -- `FoldIntoEscape`: every bare variant lands in the escape
         // slot, nothing returns early, nothing is suppressed.
         for (result, want) in [
@@ -55571,20 +55601,20 @@ mod tests {
             (QueryResult::Halt(5), "carry:[]:Halt(5)"),
         ] {
             assert_eq!(
-                describe_route(result, BareEscapeRoute::FoldIntoEscape, &none, false),
+                describe_route(result, BareEscapeRoute::FoldIntoEscape, false),
                 want
             );
         }
 
-        // Row 2 -- `ForeachInput`: all three return immediately, before
-        // `INIT` is ever evaluated. Only `Error` is `optional`-suppressible.
+        // Row 2 -- `ForeachInput`: all three return immediately. Only
+        // `Error` is `optional`-suppressible.
         for (result, want) in [
             (QueryResult::Error(EvalError::new("x")), "return:Error(x)"),
             (QueryResult::Break("out".to_string()), "return:Break(out)"),
             (QueryResult::Halt(5), "return:Halt(5)"),
         ] {
             assert_eq!(
-                describe_route(result, BareEscapeRoute::ForeachInput, &none, false),
+                describe_route(result, BareEscapeRoute::ForeachInput, false),
                 want
             );
         }
@@ -55592,55 +55622,68 @@ mod tests {
             describe_route(
                 QueryResult::Error(EvalError::new("x")),
                 BareEscapeRoute::ForeachInput,
-                &none,
                 true
             ),
             "return:None",
             "`suppress_or_raise`: an ordinary error is silenced by an ambient `?`"
         );
         assert_eq!(
-            describe_route(
-                QueryResult::Halt(5),
-                BareEscapeRoute::ForeachInput,
-                &none,
-                true
-            ),
+            describe_route(QueryResult::Halt(5), BareEscapeRoute::ForeachInput, true),
             "return:Halt(5)",
             "#791: a halt is never suppressible"
         );
 
-        // Row 3 -- `ForeachInit`: `Error`/`Break` through `finish_fork`, so
-        // the input stream's own control outranks them; `Halt` bypasses that
-        // ranking entirely (#791, and the #2100-review near-miss this issue
-        // was filed over).
-        for (result, want) in [
-            (QueryResult::Error(EvalError::new("x")), "return:Error(x)"),
-            (QueryResult::Break("out".to_string()), "return:Break(out)"),
-            (QueryResult::Halt(5), "return:Halt(5)"),
-        ] {
-            assert_eq!(
-                describe_route(result, BareEscapeRoute::ForeachInit, &none, false),
-                want
-            );
-        }
-        for (result, want) in [
-            (QueryResult::Error(EvalError::new("x")), "return:Error(in)"),
-            (QueryResult::Break("out".to_string()), "return:Error(in)"),
-            (QueryResult::Halt(5), "return:Halt(5)"),
-        ] {
-            assert_eq!(
-                describe_route(result, BareEscapeRoute::ForeachInit, &prior, false),
-                want,
-                "input_control outranks a bare INIT Error/Break, never a Halt"
-            );
-        }
-        assert_eq!(
-            describe_route(
-                QueryResult::Error(EvalError::new("x")),
-                BareEscapeRoute::ForeachInit,
-                &none,
-                true
+        // #2440: the retired `ForeachInit` row, re-derived. A bare INIT
+        // escape now rides row 1's escape slot into
+        // `eval_foreach_with_values`, whose empty-INIT guard is
+        // `finish_fork(Vec::new(), init_control, optional)` -- and that is
+        // exactly what the deleted route returned directly, `Halt` included
+        // (`partial`'s empty-prefix rule). Asserted rather than argued,
+        // because the equivalence is the whole justification for deleting
+        // the route.
+        for (make, want) in [
+            (
+                (|| QueryResult::Error(EvalError::new("x")))
+                    as fn() -> QueryResult<'static, Vec<u64>>,
+                "return:Error(x)",
             ),
+            (
+                || QueryResult::Break("out".to_string()),
+                "return:Break(out)",
+            ),
+            (|| QueryResult::Halt(5), "return:Halt(5)"),
+        ] {
+            let carried = match drain_path_context_stream_routed::<Vec<u64>>(
+                make(),
+                BareEscapeRoute::FoldIntoEscape,
+                false,
+            ) {
+                Ok((values, escape)) => {
+                    assert!(values.is_empty(), "a bare escape carries no values");
+                    finish_fork::<Vec<u64>>(Vec::new(), escape, false)
+                }
+                Err(escaped) => escaped,
+            };
+            let got = match carried {
+                QueryResult::None => "return:None".to_string(),
+                QueryResult::Error(e) => format!("return:Error({})", e.message),
+                QueryResult::Break(label) => format!("return:Break({label})"),
+                QueryResult::Halt(code) => format!("return:Halt({code})"),
+                other => panic!("unexpected collapsed escape: {other:?}"),
+            };
+            assert_eq!(got, want, "#2440: FoldIntoEscape + the empty-INIT guard");
+        }
+        // The one suppression the collapsed row still performs, matching
+        // `finish_fork`'s own #1902 rule.
+        assert_eq!(
+            match finish_fork::<Vec<u64>>(
+                Vec::new(),
+                Some(Control::Error(EvalError::new("x"))),
+                true,
+            ) {
+                QueryResult::None => "return:None",
+                _ => "not suppressed",
+            },
             "return:None",
             "`finish_fork`'s own #1902 rule: an ordinary trailing error is suppressed"
         );
@@ -55675,27 +55718,33 @@ mod tests {
     /// | `foreach error("x") as $x (0; .)`                   | error `x`, 5    |
     /// | `foreach halt_error as $x (0; .)`                   | halt, 5         |
     /// | `label $out \| foreach (break $out) as $x (0; .)`   | empty, 0        |
+    /// | `foreach halt_error as $x (empty; .)`               | empty, 0        |
     /// | `foreach (1,2) as $x (error("init"); .)`            | error `init`, 5 |
     /// | `foreach (1,2) as $x (halt_error; .)`               | halt, 5         |
     /// | `label $out \| foreach (1,2) as $x (break $out; .)` | empty, 0        |
     /// | `foreach (1, error("in")) as $x (error("init"); .)` | error `init`, 5 |
     /// | `foreach (1, error("in")) as $x (halt_error; .)`    | halt, 5         |
+    /// | `label $out \| foreach (1, break $out) as $x (error("init"); .)` | error `init`, 5 |
     /// | `reduce error("x") as $x (0; .)`                    | error `x`, 5    |
     /// | `reduce halt_error as $x (0; .)`                    | halt, 5         |
     /// | `reduce (1,2) as $x (error("init"); .)`             | error `init`, 5 |
     /// | `reduce (1,2) as $x (halt_error; .)`                | halt, 5         |
+    /// | `reduce (1, error("in")) as $x (error("init"); .)`  | error `init`, 5 |
     ///
     /// Every row succinctly's own path-context spelling can be compared
-    /// against agrees, with **one pre-existing divergence pinned as-is
-    /// below, deliberately not fixed here**: where the `foreach`/`reduce`
-    /// *input* stream carries its own escape and `INIT` also escapes, jq
-    /// reports `INIT`'s (`foreach (1, error("in")) as $x (error("init"); .)`
-    /// => `init`; `label $out \| foreach (1, break $out) as $x
-    /// (error("init"); .)` => `init`) where succinctly reports the input
-    /// stream's (`in`, and the break). That is `ForeachInit`'s
-    /// `input_control.or(..)` ranking, and it is not path-context-specific:
-    /// succinctly's plain `foreach (1, error("in")) as $x (error("init"); .)`
-    /// -- no `key`, ordinary evaluator -- reports `in` too.
+    /// against now agrees. The last three used to be pinned here as a known
+    /// divergence -- where the *input* stream carried its own escape and
+    /// `INIT` also escaped, succinctly reported the input's -- which #2440
+    /// fixed by evaluating `INIT` before the source is ever pulled, in the
+    /// shared fold cores rather than in any routing table.
+    ///
+    /// #2440 also changed what a *bare* `key` INIT means here. `key` at the
+    /// root emits nothing (#2421), so `foreach SOURCE as $x (key; .)` is
+    /// jq's `foreach SOURCE as $x (empty; .)`: the source is never
+    /// evaluated, exit 0, whatever the source would have escaped with. The
+    /// `ForeachInput` rows below therefore use `(0, key)` -- still
+    /// path-context-routed, but with an INIT that actually forks -- and the
+    /// bare-`key` INIT is pinned separately as its own short-circuit row.
     #[test]
     fn test_path_context_escape_routes_pinned_2216() {
         fn outcome(filter: &str) -> (Vec<String>, String) {
@@ -55720,47 +55769,54 @@ mod tests {
             (r#"getpath(error("x")) | key"#, "error:x"),
             (r"getpath(halt_error) | key", "halt:5"),
             (r"label $out | getpath(break $out) | key", "ok"),
-            // `ForeachInput`.
-            (r#"foreach error("x") as $x (key; .)"#, "error:x"),
-            (r"foreach halt_error as $x (key; .)", "halt:5"),
-            (r"label $out | foreach (break $out) as $x (key; .)", "ok"),
-            // `ForeachInit`, with no input-stream control to outrank it.
+            // `ForeachInput`. `(0, key)`, not bare `key`: #2440 makes a
+            // zero-output INIT skip the source entirely, and `key` at the
+            // root emits nothing (#2421).
+            (r#"foreach error("x") as $x ((0, key); .)"#, "error:x"),
+            (r"foreach halt_error as $x ((0, key); .)", "halt:5"),
+            (
+                r"label $out | foreach (break $out) as $x ((0, key); .)",
+                "ok",
+            ),
+            // #2440's short-circuit itself: a zero-output INIT means the
+            // source's own `halt_error` never runs. jq agrees --
+            // `foreach halt_error as $x (empty; .)` exits 0.
+            (r"foreach halt_error as $x (key; .)", "ok"),
+            (r#"foreach error("x") as $x (key; .)"#, "ok"),
+            // `foreach`'s INIT, with no input-stream control in sight -- it
+            // is evaluated before the source exists (#2440).
             (r#"foreach key as $x (error("init"); .)"#, "error:init"),
             (r"foreach key as $x (halt_error; .)", "halt:5"),
             (r"label $out | foreach key as $x (break $out; .)", "ok"),
-            // `ForeachInit`, with one -- the row where `Halt` and
-            // `Error`/`Break` visibly part company.
+            // ... and with a source that would also have escaped: INIT's
+            // escape wins, which is what #2440 fixed.
             (
                 r#"foreach (key, error("in")) as $x (error("init"); .)"#,
-                "error:in",
+                "error:init",
             ),
             (
                 r#"foreach (key, error("in")) as $x (halt_error; .)"#,
-                // `error:in`, not `halt:5`, since the library entry routes this
-                // to the generic evaluator (spine 2416, phase 3): `key` at
-                // the root emits nothing there (#2421), so the source's first
-                // output is its error, and the value evaluator only reaches
-                // INIT after a first source item -- jq evaluates INIT first
-                // (`foreach (1, error("in")) as $x (halt_error; .)` halts,
-                // captured from 1.7.1). That ordering is the value
-                // evaluator's own pre-existing divergence, not a routing one.
-                "error:in",
+                "halt:5",
             ),
             (
                 r#"label $out | foreach (key, break $out) as $x (error("init"); .)"#,
-                "ok",
+                "error:init",
             ),
             // `Expr::Reduce`'s arm: not a routing site (see the note above
             // this block), pinned because #2416 migrates it too.
-            (r#"reduce error("x") as $x (key; .)"#, "error:x"),
-            (r"reduce halt_error as $x (key; .)", "halt:5"),
-            (r"label $out | reduce (break $out) as $x (key; .)", "ok"),
+            (r#"reduce error("x") as $x ((0, key); .)"#, "error:x"),
+            (r"reduce halt_error as $x ((0, key); .)", "halt:5"),
+            (
+                r"label $out | reduce (break $out) as $x ((0, key); .)",
+                "ok",
+            ),
+            (r"reduce halt_error as $x (key; .)", "ok"),
             (r#"reduce key as $x (error("init"); .)"#, "error:init"),
             (r"reduce key as $x (halt_error; .)", "halt:5"),
             (r"label $out | reduce key as $x (break $out; .)", "ok"),
             (
                 r#"reduce (key, error("in")) as $x (error("init"); .)"#,
-                "error:in",
+                "error:init",
             ),
         ] {
             let (values, tag) = outcome(filter);

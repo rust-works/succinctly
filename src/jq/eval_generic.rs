@@ -44,9 +44,10 @@ use super::eval::{
     index_one_owned as index_owned_by_key, is_pure_chain_link, is_retryable_stop, literal_to_owned,
     needs_path_context, numeric_key_to_array_index, numeric_key_to_index, owned_bound_to_i64,
     owned_to_string, prefer_pending_control, slice_object_as_yq_children, slice_owned_value_read,
-    streams_escaped_generator_prefix, substitute_bound_var, substitute_vars, suppresses,
-    tonumber_from_str, vec_with_capacity, yq_negative_index_check, Control, Demand, EvalError,
-    EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail, QueryResult, YqSemantics,
+    streams_escaped_generator_prefix, substitute_bound_var, substitute_vars, suppress_or_raise,
+    suppresses, tonumber_from_str, vec_with_capacity, yq_negative_index_check, Control, Demand,
+    EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail, QueryResult,
+    YqSemantics,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -5847,31 +5848,38 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             init,
             update,
         } if !streams_unbounded(input) && !streams_unbounded(init) => {
-            let (input_values, input_control) =
-                stream_owned_outputs_generic::<S, V>(input, value.clone(), optional, cursor);
-            // `reduce`'s output is single-shot -- it emits only the final
-            // accumulator, never an intermediate -- so a control anywhere in
-            // the input stream discards the prefix and propagates alone.
-            // Mirrors `eval::eval_reduce`'s identical arms, `optional`
-            // suppression included (a decode failure is never suppressed,
-            // #1620/#1902, which `suppresses` already encodes).
-            if let Some(control) = input_control {
-                return match control {
-                    Control::Error(e) if suppresses(&e, optional) => GenericResult::None,
-                    Control::Error(e) => GenericResult::Error(e),
-                    Control::Break(label) => GenericResult::Break(label),
-                    Control::Halt(code) => GenericResult::Halt(code),
-                };
-            }
+            // #2440: INIT first, `input` second -- jq evaluates INIT before
+            // it ever pulls the source generator, so INIT's own escape
+            // outranks the source's and a zero-output INIT leaves the source
+            // unevaluated entirely. This is the arm the CLI actually reaches
+            // (`jq_runner.rs`/`yq_runner.rs` route through `eval_generic`),
+            // so it has to agree with `eval::eval_reduce`'s own ordering
+            // rather than merely resemble it.
             let (init_values, init_control) =
-                stream_owned_outputs_generic::<S, V>(init, value, optional, cursor);
-            query_result_to_generic::<V>(eval_reduce_with_values::<Vec<u64>, S>(
+                stream_owned_outputs_generic::<S, V>(init, value.clone(), optional, cursor);
+            query_result_to_generic::<V>(eval_reduce_with_values::<Vec<u64>, S, _>(
                 patterns,
                 update,
-                input_values,
                 init_values,
                 init_control,
                 optional,
+                || {
+                    let (input_values, input_control) =
+                        stream_owned_outputs_generic::<S, V>(input, value, optional, cursor);
+                    // `reduce`'s output is single-shot -- it emits only the
+                    // final accumulator, never an intermediate -- so a control
+                    // anywhere in the input stream discards the prefix and
+                    // propagates alone. Mirrors `eval::eval_reduce`'s
+                    // identical arms, `optional` suppression included (a
+                    // decode failure is never suppressed, #1620/#1902, which
+                    // `suppresses` already encodes via `suppress_or_raise`).
+                    match input_control {
+                        None => Ok(input_values),
+                        Some(Control::Error(e)) => Err(suppress_or_raise(e, optional)),
+                        Some(Control::Break(label)) => Err(QueryResult::Break(label)),
+                        Some(Control::Halt(code)) => Err(QueryResult::Halt(code)),
+                    }
+                },
             ))
         }
 
@@ -5879,9 +5887,10 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // difference preserved: unlike `reduce` it emits per step, so a
         // `Partial` input stream's already-produced prefix is still iterated
         // and `input_control` is carried alongside it rather than replacing
-        // it. `eval_foreach_with_values` owns that precedence (it folds
-        // `input_control` in ahead of INIT's), so it is passed through
-        // untouched here rather than re-decided.
+        // it. `eval_foreach_with_values` owns that precedence, so it is
+        // passed through untouched here rather than re-decided.
+        //
+        // #2440: INIT first, `input` second, same as the `reduce` arm above.
         Expr::Foreach {
             input,
             patterns,
@@ -5889,19 +5898,20 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             update,
             extract,
         } if !streams_unbounded(input) && !streams_unbounded(init) => {
-            let (input_values, input_control) =
-                stream_owned_outputs_generic::<S, V>(input, value.clone(), optional, cursor);
             let (init_values, init_control) =
-                stream_owned_outputs_generic::<S, V>(init, value, optional, cursor);
-            query_result_to_generic::<V>(eval_foreach_with_values::<Vec<u64>, S>(
+                stream_owned_outputs_generic::<S, V>(init, value.clone(), optional, cursor);
+            query_result_to_generic::<V>(eval_foreach_with_values::<Vec<u64>, S, _>(
                 patterns,
                 update,
                 extract.as_deref(),
-                input_values,
-                input_control,
                 init_values,
                 init_control,
                 optional,
+                || {
+                    Ok(stream_owned_outputs_generic::<S, V>(
+                        input, value, optional, cursor,
+                    ))
+                },
             ))
         }
 
