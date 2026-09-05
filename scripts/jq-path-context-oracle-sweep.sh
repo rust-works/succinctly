@@ -31,13 +31,14 @@
 # combination class is present, so a future alphabet shrink fails loudly.
 #
 # **yq comma/pipe precedence (#2420).** Real yq v4.53.3 parses `a, b | c` as
-# `a, (b | c)`; jq and succinctly (both modes) parse it as `(a, b) | c`.
-# Verified live: `printf 'a: 1\nb: 2\n' | yq -o=json -I0 '.a, .b | . + 10'`
-# prints `1` then `12`, where `succinctly yq` prints `11` then `12`. Every
-# yq-mode case must therefore parenthesise each comma branch, or the sweep
-# records a parser divergence that has nothing to do with path context.
-# `--self-test` enforces it mechanically: no yq-mode filter may contain a `,`
-# and a `|` at the same bracket depth.
+# `a, (b | c)`, where jq parses it as `(a, b) | c`. succinctly used to apply
+# jq's grouping in both modes; since #2420 `succinctly yq` follows yq's own
+# precedence table (`pipeOpType` 30, `unionOpType` 10) and the two agree.
+# Every yq-mode case here nevertheless parenthesises each comma branch, so
+# that a case's meaning does not silently depend on which grouping rule is in
+# force — the corpus is about path context, not about parsing. `--self-test`
+# enforces it mechanically: no yq-mode filter may contain a `,` and a `|` at
+# the same bracket depth.
 #
 # Usage:
 #   cargo build --release --features cli,simd,regex,serde

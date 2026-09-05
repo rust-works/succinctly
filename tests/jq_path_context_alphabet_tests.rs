@@ -24,10 +24,12 @@
 //!    construction/`select`/comma/`if`/`try`/`label`, and each of those again
 //!    under `path(...)` and `?`.
 //! 2. **yq comma/pipe precedence (#2420).** Real yq v4.53.3 groups `a, b | c`
-//!    as `a, (b | c)`; jq and succinctly (both modes) group it as
-//!    `(a, b) | c`. A yq-mode case holding a `,` and a `|` at the same bracket
-//!    depth therefore records a *parser* divergence that says nothing about
-//!    path context, so no such case may be generated.
+//!    as `a, (b | c)` where jq groups it as `(a, b) | c`. succinctly used to
+//!    apply jq's grouping in both modes; since #2420 `succinctly yq` follows
+//!    yq's own precedence table and the two agree. The rule is kept all the
+//!    same: a yq-mode case holding a `,` and a `|` at the same bracket depth
+//!    would make its meaning depend on which grouping rule is in force, which
+//!    says nothing about path context, so no such case may be generated.
 //!
 //! `--list-cases` needs neither the succinctly binary nor an oracle, so this
 //! test is hermetic and runs on every CI leg.
@@ -200,9 +202,10 @@ fn no_yq_case_mixes_comma_and_pipe_at_one_depth() {
     assert!(
         offenders.is_empty(),
         "{} yq-mode case(s) mix `,` and `|` at one bracket depth. Real yq v4.53.3 \
-         groups `a, b | c` as `a, (b | c)` where succinctly groups `(a, b) | c` \
-         (#2420), so these record a parser divergence, not a path-context one — \
-         parenthesise each comma branch:\n  {}",
+         groups `a, b | c` as `a, (b | c)` where jq groups `(a, b) | c` (#2420, \
+         now matched in yq mode), so these would make a case's meaning depend on \
+         the grouping rule rather than on path context — parenthesise each comma \
+         branch:\n  {}",
         offenders.len(),
         offenders.join("\n  ")
     );
