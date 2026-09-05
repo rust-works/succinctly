@@ -19386,6 +19386,33 @@ pub fn eval_owned_with_file_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>
     })
 }
 
+/// Make `file_index`/`fileIndex`/`fi` answer `file_index` for every evaluation
+/// until the returned guard is dropped (#2427).
+///
+/// Real yq stamps `fileIndex` on every node as it decodes each file
+/// (`pkg/yqlib/utils.go:60-89`), so `file_index` is a plain node read on both
+/// its evaluators -- including the ordinary per-document streaming one, which
+/// evaluates each file independently and so has no combined array to index
+/// into. succinctly's values carry no such field; the CLI's per-file loop
+/// installs this scope around each file's evaluation instead, which is exactly
+/// the granularity `file_index` varies at.
+///
+/// The guard restores whatever was installed before, so nesting is safe.
+#[must_use = "the scope ends when the guard is dropped"]
+pub fn enter_file_index_scope(file_index: usize) -> FileIndexScope {
+    FileIndexScope(super::eval_generic::enter_node_origin(
+        super::eval_generic::NodeOrigin {
+            file: file_index,
+            // The ordinary path's cursor answers `document_index` from the
+            // YAML index itself, so only the file number is missing there.
+            document: None,
+        },
+    ))
+}
+
+/// The scope [`enter_file_index_scope`] opens; dropping it closes the scope.
+pub struct FileIndexScope(#[allow(dead_code)] super::eval_generic::NodeOriginGuard);
+
 /// Evaluate `expr` once over every document of every `--eval-all` input file
 /// (#2427) -- succinctly's `allAtOnceEvaluator.EvaluateFiles`.
 ///

@@ -145,30 +145,42 @@ succinctly yq '.items[] | split_doc' file.yaml
 
 **Real yq surface, not a succinctly invention** — cross-file evaluation is real yq (`eval-all`), filed by [#715](https://github.com/rust-works/succinctly/issues/715) as a feature to implement, not as an extension. It carries an ordinary fidelity obligation under ADR-0018 rule 4, and the deviation noted below is tracked accordingly, not exempted under rule 5.
 
-`--eval-all`/`--ea` combines every document from every input file into one evaluation context (default `eval` mode evaluates each document independently, low memory). `file_index`/`fileIndex`/`fi` returns the 0-indexed origin file position, resolvable only within that combined context.
+`--eval-all`/`--ea` evaluates the filter **once over the list of every document of every input file** (the default `eval` mode evaluates each document independently, low memory). That is real yq's own model, not a slurp: the filter never sees a containing array, so `.name`, `keys`, `length` and `del(.name)` all apply per document, and one output is printed per document.
 
-| Function/Flag        | Description                                                      |
-|----------------------|------------------------------------------------------------------|
-| `--eval-all`, `--ea` | Combine all documents from all files into one evaluation context |
-| `file_index`         | 0-indexed origin file position (within `--eval-all`)             |
-| `fileIndex`          | Alias for `file_index` (real yq's own spelling)                  |
-| `fi`                 | Short alias for `file_index`                                     |
+Two operators behave differently under `--eval-all` than they do per document, and both for the same reason — real yq flags the initial document nodes `EvaluateTogether` (`pkg/yqlib/utils.go:85`) and only these two consult it:
+
+- **`[E]` collects across the whole list**: `--eval-all '[.]'` is one array of every document. Anything that builds a new node clears the flag, so `--eval-all '.name | [.]'` is back to one array per document.
+- **A binary operator runs both operands over the whole list** and emits every pairing: `--eval-all '. + {"z": 9}'` on two files prints four documents.
+
+`file_index`/`fileIndex`/`fi` returns the 0-indexed origin file position, and `document_index`/`documentIndex`/`di` the document's index within that file. Both answer on the ordinary multi-file path too, not just under `--eval-all`.
+
+| Function/Flag        | Description                                                          |
+|----------------------|----------------------------------------------------------------------|
+| `--eval-all`, `--ea` | Evaluate once over every document of every file, as one context list |
+| `file_index`         | 0-indexed origin file position                                       |
+| `fileIndex`          | Alias for `file_index` (real yq's own spelling)                      |
+| `fi`                 | Short alias for `file_index`                                         |
 
 ```bash
-# Combine documents across files, count them
+# One field count per document
 succinctly yq --eval-all 'length' f1.yaml f2.yaml
 
 # Select only documents from the first file
-succinctly yq --eval-all '.[] | select(file_index == 0)' f1.yaml f2.yaml
+succinctly yq --eval-all 'select(file_index == 0)' f1.yaml f2.yaml
 
-# General merge across any number of files
-succinctly yq --eval-all 'reduce .[] as $item ({}; . * $item)' f1.yaml f2.yaml f3.yaml
+# Every document, in one array
+succinctly yq --eval-all '[.]' f1.yaml f2.yaml
 
 # Merge exactly two files (correct only when each contributes one document)
-succinctly yq --eval-all '(.[] | select(file_index == 0)) * (.[] | select(file_index == 1))' f1.yaml f2.yaml
+succinctly yq --eval-all 'select(file_index == 0) * select(file_index == 1)' f1.yaml f2.yaml
+
+# General merge across any number of files: collect the documents into one
+# array first, then fold it (`reduce` is a succinctly extension here -- real
+# yq's lexer rejects it)
+succinctly yq --eval-all '[.] | reduce .[] as $item ({}; . * $item)' f1.yaml f2.yaml f3.yaml
 ```
 
-**Deviation from real yq**: real yq's `eval-all` treats the combined documents as an implicit node list that most operators broadcast over, so `select(fileIndex == 0) * select(fileIndex == 1)` works with no `.[]`. succinctly's evaluator has one scalar value per evaluation instead, so `.[]` must be explicit — `.[] | select(file_index == 0)`, not the bare `select(fileIndex == 0)`. `file_index`/`key`/`document_index` resolve correctly through `.`/`.[]`/`.field` navigation, comparisons, `select(...)`, `map(...)`, `if/then/else`, `try/catch`, comma, `label`, array literals (`[...]`), and user-defined functions — but not inside object literals (`{...}`) or `any`/`all`, where they fall back to `0` (see [Known Limitations](#known-limitations)). `--eval-all` is incompatible with `--slurp`, `--inplace`, `--raw-input`, `--split-exp`, and `--front-matter`.
+**Changed in this release**: the `.[] |` prefix the previous version of this section used (`--eval-all '.[] | select(file_index == 0)'`) is no longer the idiom — `.[]` now iterates each *document's* own members, exactly as real yq's does. `file_index`/`key`/`document_index`/`path`/`parent` resolve relative to their own document through `.`/`.[]`/`.field` navigation, comparisons, `select(...)`, `map(...)`, `if/then/else`, `try/catch`, comma, `label`, array literals (`[...]`), and user-defined functions — but not inside object literals (`{...}`) or `any`/`all`, where they fall back to `0` (see [Known Limitations](#known-limitations)). `--eval-all` is incompatible with `--slurp`, `--inplace`, `--raw-input`, `--split-exp`, and `--front-matter`.
 
 ### yq-Specific Operators
 

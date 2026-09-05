@@ -5006,7 +5006,15 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 }
             }
         } else {
-            'm2_files: for file_path in &input_files {
+            'm2_files: for (file_index, file_path) in input_files.iter().enumerate() {
+                // #2427: `file_index` is a per-file constant on this path -- each
+                // file is evaluated independently, so there is no combined
+                // array whose top-level index could stand in for it. Real yq
+                // stamps the number on every node as it decodes the file
+                // (`pkg/yqlib/utils.go:60-89`); this scope is succinctly's
+                // equivalent, and `yq 'file_index' f1 f2` prints `0` then `1`
+                // on both binaries because of it.
+                let _file_index_scope = jq::enter_file_index_scope(file_index);
                 let path = Path::new(file_path);
                 // A later file's read failure can fire after `writer`
                 // already buffered real output from earlier files in this
@@ -5369,7 +5377,16 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             deferred_validate_exit_code = validate_exit_code;
 
             let mut global_doc_index: usize = 0;
-            'files: for (bytes, format, _) in &input_sources {
+            'files: for (file_index, (bytes, format, _)) in input_sources.iter().enumerate() {
+                // #2427: `file_index` is a per-file constant on this path -- each
+                // file is evaluated independently, so there is no combined
+                // array whose top-level index could stand in for it. Real yq
+                // stamps the number on every node as it decodes the file
+                // (`pkg/yqlib/utils.go:60-89`); this scope is succinctly's
+                // equivalent, and `yq 'file_index' f1 f2` prints `0` then `1`
+                // on both binaries because of it.
+                let _file_index_scope = jq::enter_file_index_scope(file_index);
+
                 // Yaml/Auto and Json both go through the same cursor-native
                 // evaluator now (#1398) -- JSON is a YAML subset, and
                 // routing it through `YamlIndex`/`mark_json_sourced` here
@@ -5726,7 +5743,16 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         }
 
         let mut global_doc_index: usize = 0;
-        'inplace_files: for file_path in &input_files {
+        'inplace_files: for (file_index, file_path) in input_files.iter().enumerate() {
+            // #2427: `file_index` is a per-file constant on this path -- each
+            // file is evaluated independently, so there is no combined
+            // array whose top-level index could stand in for it. Real yq
+            // stamps the number on every node as it decodes the file
+            // (`pkg/yqlib/utils.go:60-89`); this scope is succinctly's
+            // equivalent, and `yq 'file_index' f1 f2` prints `0` then `1`
+            // on both binaries because of it.
+            let _file_index_scope = jq::enter_file_index_scope(file_index);
+
             let path = Path::new(file_path);
             let raw_bytes = read_file(path)?;
             let resolved_format = resolve_input_format(args.input_format, Some(path));
@@ -6158,7 +6184,16 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
         // gate below.
         let mut all_results: Vec<Vec<Vec<ResultWithComments>>> = Vec::new();
         let mut global_doc_index: usize = 0;
-        'collect: for (bytes, format, _) in &input_sources {
+        'collect: for (file_index, (bytes, format, _)) in input_sources.iter().enumerate() {
+            // #2427: `file_index` is a per-file constant on this path -- each
+            // file is evaluated independently, so there is no combined
+            // array whose top-level index could stand in for it. Real yq
+            // stamps the number on every node as it decodes the file
+            // (`pkg/yqlib/utils.go:60-89`); this scope is succinctly's
+            // equivalent, and `yq 'file_index' f1 f2` prints `0` then `1`
+            // on both binaries because of it.
+            let _file_index_scope = jq::enter_file_index_scope(file_index);
+
             // Yaml/Auto and Json both go through the same cursor-native
             // evaluator now (#1398) -- see the matching comment on the
             // `--split-exp` loop above for why (JSON is a YAML subset;

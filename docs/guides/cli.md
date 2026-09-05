@@ -435,7 +435,7 @@ succinctly yq '.users[]' input.yaml
 - `--validate`: Validate YAML strictly (opt-in) before processing; reports line:column errors and bails without producing output (see [YAML Validation](#yaml-validation))
 - `-i, --inplace`: Update the file in place
 - `--doc <N>`: Select specific document by 0-based index from multi-document stream
-- `--eval-all`, `--ea`: Combine all documents from all files into one evaluation context, exposing `file_index`/`fileIndex`/`fi` for cross-file merges (e.g. `.[] | select(file_index == 0)`). Requires explicit `.[]` iteration, unlike real yq's bare `select(fileIndex == 0)` — see [yq Language Reference](../reference/yq-language.md#cross-file-operations) for the full deviation (#715). Combines documents through the `OwnedValue` DOM, same as `--slurp`, so output carries no comments regardless of the input. Incompatible with `--slurp`, `--inplace`, `--raw-input`, `--split-exp`, `--front-matter`
+- `--eval-all`, `--ea`: Evaluate the filter once over the list of every document of every file, exposing `file_index`/`fileIndex`/`fi` for cross-file merges (e.g. `select(file_index == 0)`). The filter never sees a containing array, so it applies per document; `[E]` collects across the whole list and a binary operator pairs both operands over it, matching real yq — see [yq Language Reference](../reference/yq-language.md#cross-file-operations) (#715, #2427). Reads documents through the `OwnedValue` DOM, same as `--slurp`, so output carries no comments regardless of the input. Incompatible with `--slurp`, `--inplace`, `--raw-input`, `--split-exp`, `--front-matter`
 - `--front-matter <MODE>`: Treat input as text with a `---`-fenced YAML front matter header (e.g. Markdown). `extract` evaluates only the front matter, discarding the body; `process` re-emits the transformed front matter followed by the untouched body. Incompatible with `--doc`, `--null-input`, `--raw-input`, `--eval-all`, an explicit `--input-format json` (front matter is YAML by definition); `process` mode also requires YAML output and is incompatible with `--slurp`; `extract` mode is incompatible with `--inplace` (it captures no body to reattach, so `-i` would discard everything after the closing fence). Position builtins (`at_offset`, `at_position`, `line`, `column`) resolve against the extracted YAML block's own coordinates, not the original file — a `line`/`column` reported under `--front-matter` does not match the file's line/column
 
 ### Variables
@@ -498,7 +498,7 @@ cat data.yaml | succinctly yq '.items[]'
 succinctly yq '.' multi-doc.yaml
 
 # Combine documents across files, merge by file origin
-succinctly yq --eval-all '(.[] | select(file_index == 0)) * (.[] | select(file_index == 1))' base.yaml override.yaml
+succinctly yq --eval-all 'select(file_index == 0) * select(file_index == 1)' base.yaml override.yaml
 
 # Extract/rewrite YAML front matter in a Markdown file
 succinctly yq --front-matter extract '.title' post.md

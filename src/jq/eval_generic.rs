@@ -4081,16 +4081,24 @@ mod node_origin {
         CURRENT.with(Cell::get)
     }
 
+    /// Restores the previous ambient origin when dropped -- including when
+    /// the scope is left by an early `return`/`break`/`?`.
+    pub struct Guard(Option<NodeOrigin>);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            CURRENT.with(|c| c.set(self.0.take()));
+        }
+    }
+
+    pub(crate) fn enter(origin: NodeOrigin) -> Guard {
+        Guard(CURRENT.with(|c| c.replace(Some(origin))))
+    }
+
     /// Installs `origin` for `f`'s dynamic extent, restoring the previous
     /// value on the way out -- including when `f` escapes with a control.
     pub(crate) fn with<R>(origin: NodeOrigin, f: impl FnOnce() -> R) -> R {
-        struct Restore(Option<NodeOrigin>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                CURRENT.with(|c| c.set(self.0.take()));
-            }
-        }
-        let _restore = Restore(CURRENT.with(|c| c.replace(Some(origin))));
+        let _guard = enter(origin);
         f()
     }
 }
@@ -4103,6 +4111,14 @@ mod node_origin {
         None
     }
 
+    /// Same shape as the `std` guard, but there is nowhere to store the
+    /// ambient origin without a `thread_local!`, so it restores nothing.
+    pub struct Guard;
+
+    pub(crate) fn enter(_origin: NodeOrigin) -> Guard {
+        Guard
+    }
+
     pub(crate) fn with<R>(_origin: NodeOrigin, f: impl FnOnce() -> R) -> R {
         f()
     }
@@ -4112,6 +4128,18 @@ mod node_origin {
 pub(crate) fn with_node_origin<R>(origin: NodeOrigin, f: impl FnOnce() -> R) -> R {
     node_origin::with(origin, f)
 }
+
+/// Install `origin` until the returned guard is dropped (#2427).
+///
+/// The guard spelling, rather than [`with_node_origin`]'s closure, is what the
+/// yq CLI's per-file loops need: their bodies `continue`/`break 'label` out,
+/// which a closure cannot do.
+pub(crate) fn enter_node_origin(origin: NodeOrigin) -> NodeOriginGuard {
+    node_origin::enter(origin)
+}
+
+/// The RAII guard [`enter_node_origin`] returns.
+pub(crate) type NodeOriginGuard = node_origin::Guard;
 
 /// `file_index` from the ambient node origin, if one is installed.
 ///

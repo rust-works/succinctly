@@ -16155,6 +16155,57 @@ fn test_eval_all_position_builtins_answer_per_document_2427() -> Result<()> {
     Ok(())
 }
 
+/// #2427 divergence 1: `file_index` counts files on the **ordinary** multi-file
+/// path too, not only under `--eval-all`. That path evaluates each file
+/// independently, so there is no combined array whose top-level index could
+/// stand in for the file number; the CLI installs a per-file scope
+/// (`jq::enter_file_index_scope`) around each file's evaluation instead, the
+/// way real yq stamps `fileIndex` on every node as it decodes the file
+/// (`pkg/yqlib/utils.go:60-89`).
+///
+/// Rows from `yq -o=json -I0 FILTER f1.yaml f2.yaml` on v4.53.3.
+#[test]
+fn test_file_index_counts_files_outside_eval_all_2427() -> Result<()> {
+    let (f1, f2) = two_doc_fixtures()?;
+    let rows: &[(&str, &str)] = &[
+        ("file_index", "0\n1"),
+        ("fileIndex", "0\n1"),
+        ("fi", "0\n1"),
+        ("[file_index]", "[0]\n[1]"),
+        ("file_index + 1", "1\n2"),
+        ("select(file_index == 1)", "{\"b\":2,\"name\":\"second\"}"),
+        (".name, file_index", "\"first\"\n0\n\"second\"\n1"),
+    ];
+    for (filter, expected) in rows {
+        let (stdout, stderr, code) =
+            run_yq_files(filter, &[f1.path(), f2.path()], &["-o", "json", "-I", "0"])?;
+        assert_eq!(code, 0, "`{filter}` exited {code}, stderr: {stderr}");
+        assert_eq!(stdout.trim(), *expected, "filter: {filter}");
+    }
+
+    // A single file still answers 0, and a multi-document file does not make
+    // the number advance -- it counts files, not documents.
+    let mut multi = NamedTempFile::new()?;
+    write!(multi, "x: 1\n---\ny: 2\n")?;
+    let (stdout, _stderr, code) = run_yq_files(
+        "file_index",
+        &[multi.path(), f1.path()],
+        &["-o", "json", "-I", "0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "0\n0\n1");
+
+    // ... and `document_index`, which the cursor answers, is unaffected.
+    let (stdout, _stderr, code) = run_yq_files(
+        "document_index",
+        &[multi.path(), f1.path()],
+        &["-o", "json", "-I", "0"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "0\n1\n0");
+    Ok(())
+}
+
 #[test]
 fn test_eval_all_rejects_slurp() -> Result<()> {
     let (f1, _f2) = two_doc_fixtures()?;

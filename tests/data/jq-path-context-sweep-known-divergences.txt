@@ -34,22 +34,16 @@ yq/*/first/*/*        yq_first        real yq's first(f) ignores its argument an
 # position: `eval_pipe_with_path_context_internal` has no `Expr::Object` arm,
 # so the whole object construction falls to the context-dropping fallback.
 
-# `file_index` answers 0 for every input file. Real yq counts files (`0`,
-# `1`). Surfaced by this sweep — see the #2416 phase 0 report; no issue filed
-# yet.
-#
-# Scoped, not stale: this row is the *ordinary* multi-file path, which is what
-# the yq-mode cases here run (`succinctly yq FILTER one.yaml two.yaml`, no
-# `--eval-all`). That path evaluates each document independently through
-# `evaluate_input`, which has no file-origin table to install, and answering
-# `file_index` there needs a per-file scalar rather than the top-level-index
-# table `--eval-all` uses — a node's own `path.first()` is a key of its
-# document, not a file number. `--eval-all` itself answers `file_index`
-# correctly on both its routes since spine 2416 step 5 (see
-# tests/yq_cli_tests.rs::test_eval_all_file_index_agrees_across_both_routes_2416),
-# and diverges from yq for a different reason: succinctly slurps the files
-# into one array where yq keeps them a document stream (#2427).
-yq/file_index/*       file_index      file_index is always 0 across multiple input files, outside --eval-all — #2416 phase 0
+# `file_index` itself agrees everywhere since #2427: the ordinary multi-file
+# path installs a per-file scope (`jq::enter_file_index_scope`) around each
+# file's evaluation, the way real yq stamps `fileIndex` on every node as it
+# decodes the file (`pkg/yqlib/utils.go:60-89`), and `--eval-all` carries the
+# same origin per document. What is left under `..` is not a `file_index`
+# question at all but the *comma ordering* one below: `.. | ((file_index), 1)`
+# needs #2451's branch-major union over the whole `..` result list, which the
+# context-list walk declines for a recursive-descent head for the same reason
+# the three rows below exist.
+yq/file_index/*/descend  descend_path  `..` into a union is element-major, so file_index interleaves — #2451
 
 # `parent`/`key` at the document root: real yq emits nothing (exit 0),
 # succinctly prints `{}` and `null`. These are the positions the #2061 walk
