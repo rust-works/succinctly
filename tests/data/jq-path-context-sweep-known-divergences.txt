@@ -45,10 +45,21 @@ yq/*/first/*/*        yq_first        real yq's first(f) ignores its argument an
 yq/*/comma/*/*        comma_stream    yq's comma composes at the stream level, succinctly's per element — #2420
 
 # `file_index` answers 0 for every input file. Real yq counts files (`0`,
-# `1`), and `--eval-all` diverges further still (succinctly slurps the files
-# into one array; yq keeps them a stream). Surfaced by this sweep — see the
-# #2416 phase 0 report; no issue filed yet.
-yq/file_index/*       file_index      file_index is always 0 across multiple input files — #2416 phase 0
+# `1`). Surfaced by this sweep — see the #2416 phase 0 report; no issue filed
+# yet.
+#
+# Scoped, not stale: this row is the *ordinary* multi-file path, which is what
+# the yq-mode cases here run (`succinctly yq FILTER one.yaml two.yaml`, no
+# `--eval-all`). That path evaluates each document independently through
+# `evaluate_input`, which has no file-origin table to install, and answering
+# `file_index` there needs a per-file scalar rather than the top-level-index
+# table `--eval-all` uses — a node's own `path.first()` is a key of its
+# document, not a file number. `--eval-all` itself answers `file_index`
+# correctly on both its routes since spine 2416 step 5 (see
+# tests/yq_cli_tests.rs::test_eval_all_file_index_agrees_across_both_routes_2416),
+# and diverges from yq for a different reason: succinctly slurps the files
+# into one array where yq keeps them a document stream (#2427).
+yq/file_index/*       file_index      file_index is always 0 across multiple input files, outside --eval-all — #2416 phase 0
 
 # `parent`/`key` at the document root: real yq emits nothing (exit 0),
 # succinctly prints `{}` and `null`. These are the positions the #2061 walk

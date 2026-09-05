@@ -1,4 +1,4 @@
-# Per-arm reachability of the eager path-context evaluator (spine 2416, step 4)
+# Per-arm reachability of the eager path-context evaluator (spine 2416, steps 4-5)
 
 `eval_stage_with_path_context` (`src/jq/eval.rs`) is the eager, materialising
 path-context evaluator ADR-0021 is retiring. It handles 43 expression shapes by
@@ -38,32 +38,56 @@ and was run as
 printf '%s' '{"a":{"b":1},"c":[10,20],"n":0,"m":1}' | succinctly jq '<filter>'
 ```
 
-## The three doors into the eager evaluator
+## The one door into the eager evaluator
 
-The gate is not the only entry, which is why reachability had to be measured
-rather than derived from `path_context_needs_eager` alone:
+Step 4 found three; step 5 closed two of them. What is left is the gate:
 
 1. **The gate.** `path_context_needs_eager(exprs)` returning `true` in
    `eval_single`'s `Expr::Pipe` arm and in `eval_each_pipe_generic`
    (`src/jq/eval_generic.rs`) bridges the whole pipe to
    `eval::eval_pipe_with_path_context`. This is the door ADR-0021 decision 3
-   describes and the one step 5 closes.
-2. **`--eval-all`.** `eval::eval_owned_with_file_index` (#715) calls
+   describes, and it is now the only one.
+2. ~~**`--eval-all`.**~~ *Closed (step 5.)*
+   `eval::eval_owned_with_file_index` (#715) used to call
    `eval_pipe_with_path_context_internal` directly, on `needs_path_context(expr)`
-   alone, with no gate at all. Verified live:
-   `succinctly yq --eval-all '[.[] | file_index]' f1.yaml f2.yaml` fires
+   alone, with no gate at all -- verified live at step 4 that
+   `succinctly yq --eval-all '[.[] | file_index]' f1.yaml f2.yaml` fired
    `H3`, `A05`, `A09` and `A21` without `path_context_needs_eager` being
-   consulted.
-3. **`eval::eval_pipe`'s own diversion.** `eval_pipe` still routes any pipe with
-   `needs_path_context` into `eval_pipe_with_path_context`. `jq::eval` no longer
-   reaches it (ADR-0021 decision 4 sends path-context queries to the generic
-   evaluator first), but the generic evaluator's own bridges back into this file
-   (`eval_on_owned` / `bridge_to_full_evaluator` -> `eval_full`) can, so the
-   diversion is live code, not a dead branch behind the entry point.
+   consulted. It reindexes the combined array and evaluates it through the
+   generic evaluator now, like every other entry. The file-origin table that
+   forced the direct call is an ambient scope (`eval_generic::with_file_origin`)
+   the cursor route, the absent route, the owned-identity route and the eager
+   evaluator all read, so `file_index` is answered the same way wherever the
+   gate sends the pipe (#2427's `file_index` half, for the `--eval-all` route).
+3. ~~**`eval::eval_pipe`'s own diversion.**~~ *Closed (step 5.)*
+   `eval_pipe` used to route any pipe with `needs_path_context` into
+   `eval_pipe_with_path_context`. `jq::eval` does not reach it (ADR-0021
+   decision 4), but the generic evaluator's own bridges back into that file
+   (`eval_on_owned` / `bridge_to_full_evaluator` -> `eval_full`) do, so it was
+   live code rather than a dead branch -- measured, not argued: with the
+   diversion instrumented, `reduce .c[] as $x (.a; [.[] | key])` and
+   `.x = [.a[] | key]` both reach it, because `needs_path_context` deliberately
+   does not recurse into a fold's UPDATE/EXTRACT or an assignment's right-hand
+   side, so the enclosing program's routing decision was made against a
+   `false`. It now hands the pipe to the generic evaluator over a root cursor
+   for a reindexed copy of its input -- the eager evaluator's own
+   "`root` is the value I was handed, `current_path` is `[]`" position,
+   expressed as a node -- and `path_context_needs_eager` decides.
 
-Doors 2 and 3 mean that lowering the arm count is gated on more than
-`path_context_needs_eager`: the arms have to stop being reachable through all
-three.
+`tests/jq_path_context_single_door_guard.rs` is what keeps this section true:
+it scans `src/` and fails if any entry into `eval_pipe_with_path_context`/
+`_internal` from outside `src/jq/eval.rs` is not inside a
+`path_context_needs_eager` branch, and pins that `eval_pipe` and
+`eval_owned_with_file_index` name neither symbol.
+
+**No arm became unreachable.** Every one of the 43 rows below is proved by a
+query that enters through the gate (the `Gate` column names which disjunct
+fired), and step 5 did not touch that route -- the proof queries' outputs are
+pinned unchanged in
+`tests/jq_evaluator_parity_tests.rs::test_arm_audit_proof_queries_are_unmoved_by_the_gate_2416`.
+The four arms step 4 attributed to the `--eval-all` door (`H3`, `A05`, `A09`,
+`A21`) each have a gate-route proof query in the table as well, so closing that
+door removed no arm's only route. `PINNED_ARM_COUNT` therefore stays at 43.
 
 ## Gate reasons
 
@@ -140,10 +164,13 @@ This is an ordering artefact, not a claim that R3 is rare.
 | ... neither                                        | --     | 0     |
 | `PINNED_ARM_COUNT`                                 | 43     | 43    |
 
-Nothing is deletable at this point in the spine. The eager evaluator shrinks
-when the generic evaluator gains native arms (widening
-`path_context_single_native`), when the absent route widens, and when doors 2
-and 3 above are closed -- not before.
+Nothing is deletable at this point in the spine. Doors 2 and 3 are closed as
+of step 5, which is a precondition rather than a deletion: the eager evaluator
+shrinks when the generic evaluator gains native arms (widening
+`path_context_single_native`) and when the absent route widens. What the
+closure buys is that `path_context_needs_eager` is now the whole answer to
+"which pipes reach an arm" -- so a migration that narrows the gate narrows the
+evaluator, with no second route to check.
 
 ### Notes for the next migration
 
@@ -159,3 +186,13 @@ and 3 above are closed -- not before.
 - Reachability here is a property of the current tree. Re-run the method above
   (instrument, run, revert) rather than trusting this table after the gate or
   `path_context_single_native` moves.
+- The step-5 closure did *not* change what the sweep
+  (`scripts/jq-path-context-oracle-sweep.sh`) sees for `file_index`. Its
+  yq-mode cases run `succinctly yq FILTER one.yaml two.yaml` with no
+  `--eval-all`, and that path evaluates each document independently through
+  `evaluate_input`, which has no file-origin table to install -- so the
+  manifest's `yq/file_index/*` row (24 divergences) still stands, and the
+  `--eval-all` half of #2427 is the half this step closed. Answering
+  `file_index` on the ordinary multi-file path needs a per-file scalar, not a
+  top-level-index table: `path.first()` there is a key of the document, not a
+  file number.
