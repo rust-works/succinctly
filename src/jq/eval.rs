@@ -16946,6 +16946,12 @@ fn index_object_by_name<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// constructor's own doc comment for the live-confirmed oracle behavior and
 /// `EvalError::is_yq_negative_index_error`, consulted by every `?`/`try`
 /// dispatch point on the read side to keep it that way.
+///
+/// yq mode only (#2459): a numeric index also reaches a real `Object` here
+/// -- `.a[5]` is `Expr::Index { idx: 5 }` once the parser constant-folds a
+/// literal subscript, so this is the one place both that literal form and
+/// `index_one`'s computed-key form (`.a[$k]`) end up, and the one place
+/// [`yq_numeric_index_on_object_is_null`] needs to be checked to cover both.
 #[inline]
 fn index_array_by_position<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
@@ -16970,6 +16976,9 @@ fn index_array_by_position<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         },
         // jq returns null for index on null
         StandardJson::Null => QueryResult::One(StandardJson::Null),
+        StandardJson::Object(_) if yq_numeric_index_on_object_is_null::<S>() => {
+            QueryResult::One(StandardJson::Null)
+        }
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_index_with_type(
             type_name(&value),
@@ -17071,6 +17080,29 @@ pub(crate) fn has_type_mismatch_is_permissive<S: EvalSemantics>() -> bool {
     S::NEGATIVE_INDEX_IN_HAS
 }
 
+/// Whether a numeric index on a *mapping* reads as a missing key (null,
+/// with the index itself as the position) instead of raising jq's `Cannot
+/// index object with number`.
+///
+/// Real yq v4.53.3 (confirmed live) has no notion of "wrong key kind" for a
+/// mapping the way jq does: `.a[5]` on `a: {b: 1}` is `null`, and `key`/
+/// `path` answer for that position exactly as they would for a genuinely
+/// absent string field (`.a[5] | key` is `5`, `.a[5] | path` is
+/// `["a", 5]`). jq raises unconditionally, which is what succinctly
+/// reproduced in both modes before this rule (#2459). `S: EvalSemantics`-
+/// generic so `index_one` (below, the borrowed `StandardJson` route) and
+/// `eval_generic::index_one_generic` (the `DocumentValue`-generic route)
+/// consult one definition -- CLAUDE.md's "duplicated predicates diverge
+/// silently" (#106).
+///
+/// Read-only: the write side (`.a[5] = 1`) is a distinct, already-tracked
+/// divergence (real yq coerces the index to a string key and inserts it,
+/// `docs/compliance/yq/limitations.md`'s "mid-chain `Field`/`Index` step"
+/// entry, #1863) that this rule does not touch.
+pub(crate) fn yq_numeric_index_on_object_is_null<S: EvalSemantics>() -> bool {
+    S::TAG == EvalTag::Yq
+}
+
 /// Apply one resolved key to one target value.
 ///
 /// The key kind is dispatched *before* the container is inspected, so the error
@@ -17082,7 +17114,11 @@ fn index_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     let indexable_by_string = matches!(target, StandardJson::Object(_) | StandardJson::Null);
-    let indexable_by_number = matches!(target, StandardJson::Array(_) | StandardJson::Null);
+    // #2459: yq mode also indexes a mapping by number (into `null`, via
+    // `index_array_by_position`'s own `Object` arm) -- see
+    // `yq_numeric_index_on_object_is_null`.
+    let indexable_by_number = matches!(target, StandardJson::Array(_) | StandardJson::Null)
+        || (matches!(target, StandardJson::Object(_)) && yq_numeric_index_on_object_is_null::<S>());
 
     match key {
         OwnedValue::String(s) if indexable_by_string => {
@@ -30052,6 +30088,11 @@ fn eval_owned_navigation<S: EvalSemantics>(
                 Ok(Some(element))
             }
             OwnedValue::Null => Ok(Some(OwnedValue::Null)),
+            // #2459: yq mode only -- same rule as `index_array_by_position`'s
+            // own `Object` arm. See `yq_numeric_index_on_object_is_null`.
+            OwnedValue::Object(_) if yq_numeric_index_on_object_is_null::<S>() => {
+                Ok(Some(OwnedValue::Null))
+            }
             _ if optional => Ok(None),
             _ => Err(EvalError::cannot_index_with_type(
                 owned_type_name(input),
@@ -34209,7 +34250,26 @@ fn eval_index_expr_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemanti
             if let Some(e) = yq_negative_index_error::<S>(&t, k) {
                 return partial(core::mem::take(&mut results), Control::Error(e));
             }
-            match index_one_owned(&t, k, bracket_optional) {
+            // #2459: yq mode only -- same rule as `index_array_by_position`'s
+            // own `Object` arm, checked ahead of `index_one_owned` for the
+            // same reason as the `yq_negative_index_error` check just above
+            // (that function has no notion of this yq-only rule either, and
+            // is also reached from the write side, where the rule does not
+            // apply -- see `yq_numeric_index_on_object_is_null`'s own doc
+            // comment). `.a[(EXPR)] | key` on a mapping is `5`, matching
+            // the literal `.a[5] | key` sibling in `path_step_generic`.
+            let numeric_on_object = matches!(t, OwnedValue::Object(_))
+                && matches!(
+                    k,
+                    OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)
+                )
+                && yq_numeric_index_on_object_is_null::<S>();
+            let indexed = if numeric_on_object {
+                Ok(Some(OwnedValue::Null))
+            } else {
+                index_one_owned(&t, k, bracket_optional)
+            };
+            match indexed {
                 Ok(Some(v)) => {
                     let new_path = target_path.map(|mut path| {
                         path.push(k.clone());
@@ -35007,6 +35067,21 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // jq treats indexing `null` with an integer the same way
             // (#2213): always `null`, never an error.
             if matches!(value, OwnedValue::Null) {
+                return continue_rest_with_borrowed_value::<W, S>(
+                    &OwnedValue::Null,
+                    rest,
+                    root,
+                    file_origin,
+                    &new_path,
+                    optional,
+                );
+            }
+            // #2459: yq mode only -- a numeric index on a mapping is `null`
+            // too, at the position `new_path` already carries (`.a[5] |
+            // key` is `5`, `.a[5] | path` is `["a", 5]`), same rule as
+            // `eval::index_array_by_position`'s own `Object` arm. See
+            // `yq_numeric_index_on_object_is_null`.
+            if matches!(value, OwnedValue::Object(_)) && yq_numeric_index_on_object_is_null::<S>() {
                 return continue_rest_with_borrowed_value::<W, S>(
                     &OwnedValue::Null,
                     rest,
