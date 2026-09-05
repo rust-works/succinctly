@@ -3903,6 +3903,129 @@ mod path_context_route {
     }
 }
 
+/// The `--eval-all` file-origin table for the current thread (#715, #2427).
+///
+/// `--eval-all` combines every document from every input file into one array
+/// and answers `file_index` from a side table mapping each top-level array
+/// position to the file it came from. Before spine 2416 step 5 that table was
+/// a parameter threaded through `eval::eval_pipe_with_path_context_internal`,
+/// which is why `eval::eval_owned_with_file_index` had to call the eager
+/// evaluator directly -- the audit's "door 2"
+/// (`docs/plan/path-context-arm-reachability.md`). The cursor route has no
+/// such parameter to thread: `file_index` is answered in `eval_builtin`,
+/// several recursion levels below any entry point and generic over a cursor
+/// type it cannot carry alongside. Same reasoning, and the same shape, as
+/// [`path_context_route`] above -- see its doc comment.
+///
+/// Scoped by [`with_file_origin`] and read by [`file_index_for_path`] and by
+/// `eval::eval_pipe_with_path_context`, so the cursor route, the absent
+/// route, the owned-identity route and the eager evaluator all answer
+/// `file_index` from one table instead of four.
+///
+/// An `Rc<[usize]>` rather than a borrowed slice: a `thread_local!` cannot
+/// hold a lifetime, and the clone a read costs is a refcount bump, not the
+/// table. Reading never holds the `RefCell` borrow across the evaluation, so
+/// a nested [`with_file_origin`] cannot panic on a double borrow.
+#[cfg(feature = "std")]
+mod file_origin {
+    use alloc::rc::Rc;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static CURRENT: RefCell<Option<Rc<[usize]>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn current() -> Option<Rc<[usize]>> {
+        CURRENT.with(|c| c.borrow().clone())
+    }
+
+    /// Installs `table` for `f`'s dynamic extent, restoring the previous
+    /// value on the way out -- including when `f` escapes with a control.
+    pub(crate) fn with<R>(table: &[usize], f: impl FnOnce() -> R) -> R {
+        struct Restore(Option<Rc<[usize]>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                CURRENT.with(|c| *c.borrow_mut() = self.0.take());
+            }
+        }
+        let installed: Rc<[usize]> = Rc::from(table.to_vec().into_boxed_slice());
+        let _restore = Restore(CURRENT.with(|c| c.borrow_mut().replace(installed)));
+        f()
+    }
+
+    /// Whether `to_vec` above is worth skipping: an empty table answers `0`
+    /// everywhere, which is what no table at all already answers.
+    pub(crate) fn table_is_useful(table: &[usize]) -> bool {
+        !table.is_empty()
+    }
+}
+
+#[cfg(not(feature = "std"))]
+mod file_origin {
+    use alloc::rc::Rc;
+
+    pub(crate) fn current() -> Option<Rc<[usize]>> {
+        None
+    }
+
+    pub(crate) fn with<R>(_table: &[usize], f: impl FnOnce() -> R) -> R {
+        f()
+    }
+
+    pub(crate) fn table_is_useful(_table: &[usize]) -> bool {
+        false
+    }
+}
+
+/// Whether this build can make a file-origin table ambient at all.
+///
+/// `false` without `std`: [`file_origin`]'s storage is a `thread_local!`, and
+/// a `no_std` embedding has none (same limitation as [`path_context_route`]
+/// and `eval.rs`'s `remaining_inputs`). The difference is that those two
+/// degrade into a slower-but-correct default, while an unreadable file-origin
+/// table would answer `file_index` as `0` -- a wrong answer, the #715 failure
+/// class. So `eval::eval_path_context_pipe_owned` consults this and keeps a
+/// pipe that *has* a table on the eager evaluator, where the table is an
+/// ordinary parameter, whenever the ambient cannot be read back.
+pub(crate) const FILE_ORIGIN_SCOPE_AVAILABLE: bool = cfg!(feature = "std");
+
+/// Install `table` as the ambient `--eval-all` file-origin table for `f`
+/// (#715, #2427). See [`file_origin`].
+pub(crate) fn with_file_origin<R>(table: &[usize], f: impl FnOnce() -> R) -> R {
+    if !file_origin::table_is_useful(table) {
+        return f();
+    }
+    file_origin::with(table, f)
+}
+
+/// The ambient `--eval-all` file-origin table, if one is installed --
+/// `eval::eval_pipe_with_path_context`'s bridge into the eager evaluator's
+/// own `file_origin` parameter.
+pub(crate) fn current_file_origin() -> Option<alloc::rc::Rc<[usize]>> {
+    file_origin::current()
+}
+
+/// `file_index` for a node at `path`: the origin file of the top-level
+/// element `path` descends from (#715).
+///
+/// `path.first()`, not `.last()` -- `file_index` answers "which file did this
+/// whole document come from", unaffected by further navigation. `0` with no
+/// table (every route outside `--eval-all`) and `0` at the root, the same
+/// "0 outside supported context" contract `document_index` has, and the same
+/// expression `eval::eval_stage_with_path_context`'s own `Builtin::FileIndex`
+/// handler computes from its `file_origin` parameter.
+fn file_index_for_path(path: &[OwnedValue]) -> i64 {
+    let Some(table) = file_origin::current() else {
+        return 0;
+    };
+    path.first()
+        .and_then(OwnedValue::as_i64)
+        .and_then(|i| usize::try_from(i).ok())
+        .and_then(|i| table.get(i).copied())
+        .and_then(|origin| i64::try_from(origin).ok())
+        .unwrap_or(0)
+}
+
 /// Evaluate against a cursor with an explicit [`PathContextRoute`] (#2416).
 ///
 /// Identical to [`eval_with_cursor_using`] except that `route` decides whether
@@ -11832,8 +11955,19 @@ fn path_context_resolve_constants(
                 _ => Expr::Comma(components),
             }))
         }
-        // The generic route carries no file-origin table (#2150, #2427), so
-        // this is the same `0` the eager arm answers with an empty one.
+        // Still the constant `0`, but no longer for the reason the previous
+        // comment gave: the generic route *does* carry a file-origin table
+        // now (`with_file_origin`, spine 2416 step 5). This arm is simply not
+        // reached with one installed -- measured on 2026-09-05 by
+        // instrumenting it and sweeping the `--eval-all` shapes that could
+        // plausibly take the absent route (`.[] | .nope | file_index`,
+        // `.[] | .a.nope | file_index`, `.[] | .nope | [file_index]`,
+        // `.[] | .nope | select(file_index == 1)`, ...): every one is
+        // answered by `eval_builtin`'s cursor arm or by the eager evaluator
+        // instead, and this arm never fired. Left as the constant rather
+        // than switched to an unexercised `file_index_for_path(path)` call --
+        // `path` here is absolute, so that is the one-line change to make the
+        // moment a route does arrive with a table (#2427).
         Expr::Builtin(Builtin::FileIndex) => Expr::Literal(Literal::Int(0)),
         Expr::Paren(inner) => Expr::Paren(boxed(inner)),
         Expr::Array(inner) => Expr::Array(boxed(inner)),
@@ -13263,9 +13397,18 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 Err(e) => GenericResult::Error(e),
             }
         }
-        // The generic route carries no file-origin table (#2150, #2427), so
-        // this is the same `0` the eager arm answers with an empty one.
-        Builtin::FileIndex if cursor.is_some() => GenericResult::Owned(OwnedValue::Int(0)),
+        // #2427: answered from the ambient `--eval-all` file-origin table
+        // (`with_file_origin`), not the constant `0` this arm used to
+        // return -- `eval::eval_owned_with_file_index` installs the table
+        // and then routes through this evaluator like every other entry
+        // (spine 2416 step 5, the audit's "door 2"). Still `0` everywhere
+        // else, since no other caller installs a table.
+        Builtin::FileIndex if cursor.is_some() => {
+            match cursor_path_and_ancestors(&cursor.expect("guarded")) {
+                Ok((path, _)) => GenericResult::Owned(OwnedValue::Int(file_index_for_path(&path))),
+                Err(e) => GenericResult::Error(e),
+            }
+        }
 
         _ => {
             // #2231: `owned_or_suppress!`, not `owned_or_err!` -- this
@@ -13898,7 +14041,10 @@ fn eval_owned_identity_pipe<S: EvalSemantics, V: DocumentValue>(
             }
             Err(e) => Flow::Escaped(Control::Error(e)),
         },
-        // The generic route carries no file-origin table (#2150, #2427).
+        // Same measured status as `path_context_resolve_constants`'s own
+        // `FileIndex` arm (see its comment): the table exists now, this route
+        // is not reached with one installed, and `id.path()` is what to feed
+        // `file_index_for_path` when it is.
         Expr::Builtin(Builtin::FileIndex) => {
             continue_owned_identity_plain::<S, V>(rest, OwnedValue::Int(0), optional, sink)
         }

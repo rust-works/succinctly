@@ -15518,6 +15518,88 @@ fn test_eval_all_file_index_bare() -> Result<()> {
     Ok(())
 }
 
+/// Spine 2416 step 5: `--eval-all` reaches the eager evaluator only through
+/// `path_context_needs_eager` now, and the file-origin table follows it there.
+///
+/// `eval::eval_owned_with_file_index` used to call
+/// `eval_pipe_with_path_context_internal` directly, passing the table as an
+/// argument -- the audit's "door 2"
+/// (`docs/plan/path-context-arm-reachability.md`). It routes through the
+/// generic evaluator now, where `file_index` is a cursor property like `key`
+/// and `path`, and the table is installed as an ambient scope
+/// (`eval_generic::with_file_origin`) that both the cursor route *and* the
+/// eager evaluator read. So the split matters and is what this test pins:
+/// `.[] | file_index` and `select(file_index == n)` are answered by the
+/// cursor route (the gate keeps them generic), while `.[] | file_index + 1`
+/// still goes to the eager evaluator, because arithmetic has no native
+/// cursor-threading arm yet (ADR-0021's remaining list). A regression that
+/// dropped the table on either side shows up as a `0` for the second file.
+///
+/// **`--eval-all` slurps where real yq streams (#2427).** succinctly combines
+/// every document into one array, so `.[]` iterates *documents*; real yq
+/// keeps them a document stream, so its `.[]` iterates each document's own
+/// members. Both binaries answer the same question about which file a node
+/// came from -- they just disagree about what `.[]` selects. Captured live
+/// from yq v4.53.3 on 2026-09-05, on this test's own two fixtures
+/// (`a: 1 / name: first` and `b: 2 / name: second`):
+///
+/// ```console
+/// $ yq ea -o=json -I0 '.[] | file_index'        f1 f2   # 0 0 1 1
+/// $ yq ea -o=json -I0 '[.[] | file_index]'      f1 f2   # [0,0,1,1]
+/// $ yq ea -o=json -I0 'file_index'              f1 f2   # 0 1
+/// $ yq ea -o=json -I0 '.[] | file_index + 1'    f1 f2   # 1 1 2 2
+/// $ yq ea -o=json -I0 '.[] | select(file_index == 1)' f1 f2
+/// 2
+/// "second"
+/// $ yq ea -o=json -I0 '.[].name | file_index'   f1 f2   # (no output)
+/// ```
+///
+/// yq's counts are succinctly's doubled because each of its documents has two
+/// members; the file numbering itself (`0` then `1`) is the same, and that is
+/// the property this door closure had to preserve.
+#[test]
+fn test_eval_all_file_index_agrees_across_both_routes_2416() -> Result<()> {
+    let (f1, f2) = two_doc_fixtures()?;
+    // (filter, expected stdout, which route answers `file_index`)
+    let rows: &[(&str, &str, &str)] = &[
+        (".[] | file_index", "0\n1", "cursor"),
+        ("[.[] | file_index]", "[0,1]", "cursor"),
+        ("file_index", "0", "cursor (root: no top-level index)"),
+        (".[].name | file_index", "0\n1", "cursor"),
+        (".[] | .name | file_index", "0\n1", "cursor"),
+        (".[] | [file_index, key]", "[0,0]\n[1,1]", "cursor"),
+        (
+            ".[] | select(file_index == 1) | .name",
+            "\"second\"",
+            "cursor",
+        ),
+        (
+            ".[] | file_index + 1",
+            "1\n2",
+            "eager (no native arithmetic arm)",
+        ),
+        (
+            r#".[] | if file_index == 1 then "f2" else "f1" end"#,
+            "\"f1\"\n\"f2\"",
+            "cursor",
+        ),
+    ];
+    for (filter, expected, route) in rows {
+        let (stdout, stderr, code) = run_yq_files(
+            filter,
+            &[f1.path(), f2.path()],
+            &["--eval-all", "-o", "json", "-I", "0"],
+        )?;
+        assert_eq!(code, 0, "`{filter}` exited {code}, stderr: {stderr}");
+        assert_eq!(
+            stdout.trim(),
+            *expected,
+            "`{filter}` ({route}) lost the --eval-all file-origin table"
+        );
+    }
+    Ok(())
+}
+
 /// Regression test for #822: `Expr::Arithmetic` inside
 /// `eval_pipe_with_path_context_internal` used to collapse a multi-output
 /// operand to its first value whenever the pipe also needed path context
