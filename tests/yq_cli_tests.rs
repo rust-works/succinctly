@@ -31091,3 +31091,77 @@ fn test_yq_pipe_precedence_residual_divergences_2420() -> Result<()> {
 
     Ok(())
 }
+
+/// #2455: on a block-style sequence, a path-context builtin reached through
+/// the generic evaluator (anything but the bare `.[] | key` cursor walk)
+/// answered as if the item were the document root -- `key` emitted nothing,
+/// `path` was `[]`, `parent` was the item itself. The item's balanced-
+/// parentheses parent is its `-` wrapper node, not the sequence, and
+/// `document_parent` did not climb through it. Every row here was captured
+/// from yq v4.53.3 (`-o=json -I0`) and runs on the block form *and* the
+/// equivalent flow form, which was already right and must stay identical.
+#[test]
+fn test_block_sequence_item_key_path_parent_through_generic_route_2455() -> Result<()> {
+    let args = &["-o", "json", "-I0"];
+    // `- x\n- y\n- z` and `[x, y, z]` are the same document to yq.
+    let block = "- x\n- y\n- z\n";
+    let flow = "[x, y, z]\n";
+    // $ yq -o=json -I0 '.[] | key == 0'          =>  true / false / false
+    // $ yq -o=json -I0 '.[] | select(key == 0)'  =>  "x"
+    // $ yq -o=json -I0 '.[] | parent | length'   =>  3 / 3 / 3
+    // $ yq -o=json -I0 '.[] | [path]'            =>  [[0]] / [[1]] / [[2]]
+    // $ yq -o=json -I0 '.[] | [parent(2)]'       =>  [] / [] / []
+    // $ yq -o=json -I0 '.[] | key | . == 0'      =>  true / false / false
+    for (filter, expected) in [
+        (".[] | key == 0", "true\nfalse\nfalse"),
+        (".[] | select(key == 0)", "\"x\""),
+        (".[] | parent | length", "3\n3\n3"),
+        (".[] | [path]", "[[0]]\n[[1]]\n[[2]]"),
+        (".[] | [parent(2)]", "[]\n[]\n[]"),
+        (".[] | key | . == 0", "true\nfalse\nfalse"),
+    ] {
+        for doc in [block, flow] {
+            let (output, code) = run_yq_stdin(filter, doc, args)?;
+            assert_eq!(code, 0, "{filter} on {doc:?}");
+            assert_eq!(output.trim(), expected, "{filter} on {doc:?}");
+        }
+    }
+
+    // Every block item shape sits behind the same wrapper: a scalar, a
+    // compact mapping, a flow sequence, a nested block sequence, a bare `-`
+    // (null) and a block scalar.
+    // $ yq -o=json -I0 '.[] | key == 0'          =>  true / false x5
+    // $ yq -o=json -I0 '.[] | select(key == 1)'  =>  {"a":1}
+    // $ yq -o=json -I0 '.[] | parent | length'   =>  6 x6
+    // $ yq -o=json -I0 '.[1].a | path'           =>  [1,"a"]
+    // $ yq -o=json -I0 '.[3][0] | parent'        =>  ["p","q"]
+    let shapes = "- x\n- a: 1\n- [1, 2]\n- - p\n  - q\n-\n- |\n  lit\n";
+    for (filter, expected) in [
+        (".[] | key == 0", "true\nfalse\nfalse\nfalse\nfalse\nfalse"),
+        (".[] | select(key == 1)", "{\"a\":1}"),
+        (".[] | parent | length", "6\n6\n6\n6\n6\n6"),
+        (".[1].a | path", "[1,\"a\"]"),
+        (".[3][0] | parent", "[\"p\",\"q\"]"),
+    ] {
+        let (output, code) = run_yq_stdin(filter, shapes, args)?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(output.trim(), expected, "{filter}");
+    }
+
+    // A nested block sequence: the inner items climb through their own
+    // wrapper to the inner sequence, and `parent(2)` reaches the outer one.
+    // $ yq -o=json -I0 '.[] | select(key == 0)'        =>  ["p","q"]
+    // $ yq -o=json -I0 '.[0][] | parent(2) | length'   =>  2 / 2
+    // $ yq -o=json -I0 '.[0][] | [path]'               =>  [[0,0]] / [[0,1]]
+    let nested = "- - p\n  - q\n- - r\n";
+    for (filter, expected) in [
+        (".[] | select(key == 0)", "[\"p\",\"q\"]"),
+        (".[0][] | parent(2) | length", "2\n2"),
+        (".[0][] | [path]", "[[0,0]]\n[[0,1]]"),
+    ] {
+        let (output, code) = run_yq_stdin(filter, nested, args)?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(output.trim(), expected, "{filter}");
+    }
+    Ok(())
+}
