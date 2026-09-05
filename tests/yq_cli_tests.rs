@@ -25576,11 +25576,22 @@ fn test_yq_string_interpolation_path_context_error_is_atomic_1403() -> Result<()
 
 /// A yq-mode path-context string is still a fresh root for whatever
 /// follows it in the pipe, same as jq mode's identical reset.
+///
+/// #2460 changed what that fresh root *answers*: a `key` standing on the
+/// document root produces zero outputs in yq mode, not the `null`
+/// placeholder this test used to pin. Live-verified against yq v4.53.3 --
+/// `yq -o json '.a | "\(key)" | key'` on `a: 1` prints nothing, exit 0 --
+/// so this row is now an oracle match where it was a divergence.
 #[test]
 fn test_yq_string_interpolation_path_context_resets_root_for_rest_1403() -> Result<()> {
     let (output, code) = run_yq_stdin(r#".a | "\(key)" | key"#, "a: 1\n", &["-o", "json"])?;
     assert_eq!(code, 0, "output: {output:?}");
-    assert_eq!(output.trim(), "null");
+    assert_eq!(output.trim(), "");
+    // The reset itself is what this test is about, and it is still
+    // observable: the interpolated string keeps the *pre*-reset key.
+    let (output, code) = run_yq_stdin(r#".a | "\(key)""#, "a: 1\n", &["-o", "json"])?;
+    assert_eq!(code, 0, "output: {output:?}");
+    assert_eq!(output.trim(), "\"a\"");
     Ok(())
 }
 
@@ -29750,7 +29761,28 @@ fn test_negative_index_out_of_range_survives_try_catch_partial_prefix_2270() -> 
         &["-o", "json", "--eval-all"],
     )?;
     assert_eq!(code, 1, "out: {out:?}");
-    assert_eq!(out.trim(), "null");
+    // #2460 moved this line from `null` to nothing: the surviving prefix
+    // (`1`) is a detached value at the root position, and a `key` there now
+    // produces zero outputs in yq mode instead of the `null` placeholder --
+    // live-verified against yq v4.53.3 on the closest expressible shape,
+    // `.a | "\(key)" | key`, which prints nothing there too (real yq's lexer
+    // rejects `try`/`catch` outright, so this exact filter has no oracle).
+    assert_eq!(out.trim(), "");
+    assert_eq!(
+        stderr.trim(),
+        "Error: index [-5] out of range, array size is 2"
+    );
+
+    // The prefix itself is still delivered -- what changed is only what a
+    // root `key` answers, not whether the `Partial` prefix survives. `[key]`
+    // makes that observable again: one `[]` line, one per prefix output.
+    let (out, stderr, code) = run_yq_stdin_with_stderr(
+        ".[0].a | (try (1, .[-5]) catch \"c\") | [key]",
+        multi_doc,
+        &["-o", "json", "--eval-all"],
+    )?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(out.trim(), "[]");
     assert_eq!(
         stderr.trim(),
         "Error: index [-5] out of range, array size is 2"
@@ -31644,3 +31676,226 @@ const OWNED_IDENTITY_ROWS_2416: &[(&str, &str)] = &[
     (".a.b | sort | .[0] | parent | path", r#"["a","b"]"#),
     (".a.b | sort | .[0] | parent | parent | key", r#""a""#),
 ];
+
+/// #2460: real yq's binary operators when one operand produces **zero
+/// outputs** -- an empty path-context read at the document root (`key`,
+/// `parent`, `parent(1)`) or any other filter that emits nothing
+/// (`.[] | select(false)`).
+///
+/// Every row below is a live capture from Homebrew `yq` v4.53.3 against the
+/// document in `EMPTY_OPERAND_DOC`, run as `yq -o=json -I0 FILTER d.yaml`,
+/// and re-captured (not transcribed) when this test was written: the 515-run
+/// oracle matrix on the issue, its `table.md` sections 2-5. The per-operator
+/// rule that capture derives is implemented once, in
+/// `jq::eval::yq_empty_operand_output`, whose doc comment carries the table
+/// and the six yq inconsistencies it reproduces bug-for-bug (ADR-0018 rule 3
+/// and its 2026-09-05 decision-order amendment).
+///
+/// Rows 1-98 are section 2 (one empty operand, every operator against every
+/// right-hand shape, plus the reversed `1 op E` spelling); rows 99-112 are
+/// section 3 (both operands empty, where `<=`/`>=` flip to `true` and `==`
+/// behaves like `null == null`); the rest are section 4's genuine-`null`
+/// controls and section 5's non-root control, which prove the rule is keyed
+/// on emptiness and not on the `key` builtin.
+const EMPTY_OPERAND_DOC: &str = "a:\n  b: 1\ns: x\nn: [1, 2]\n";
+
+#[test]
+fn test_yq_empty_operand_binary_operator_matrix_2460() -> Result<()> {
+    for (filter, want, want_code) in [
+        (r"(key) + 1", r"1", 0),
+        (r"1 + (key)", r"1", 0),
+        (r#"(key) + "s""#, r#""s""#, 0),
+        (r"(key) + [1]", r"[1]", 0),
+        (r#"(key) + {"k": 1}"#, r#"{"k":1}"#, 0),
+        (r"(key) + null", r"null", 0),
+        (r"(key) + true", r"true", 0),
+        (r"(key) - 1", r"", 0),
+        (r"1 - (key)", r"", 0),
+        (r#"(key) - "s""#, r"", 0),
+        (r"(key) - [1]", r"", 0),
+        (r#"(key) - {"k": 1}"#, r"", 0),
+        (r"(key) - null", r"", 0),
+        (r"(key) - true", r"", 0),
+        (r"(key) * 1", r"", 0),
+        (r"1 * (key)", r"", 0),
+        (r#"(key) * "s""#, r"", 0),
+        (r"(key) * [1]", r"", 0),
+        (r#"(key) * {"k": 1}"#, r"", 0),
+        (r"(key) * null", r"", 0),
+        (r"(key) * true", r"", 0),
+        (r"(key) / 1", r"", 0),
+        (r"1 / (key)", r"", 0),
+        (r#"(key) / "s""#, r"", 0),
+        (r"(key) / [1]", r"", 0),
+        (r#"(key) / {"k": 1}"#, r"", 0),
+        (r"(key) / null", r"", 0),
+        (r"(key) / true", r"", 0),
+        (r"(key) % 1", r"", 0),
+        (r"1 % (key)", r"", 0),
+        (r#"(key) % "s""#, r"", 0),
+        (r"(key) % [1]", r"", 0),
+        (r#"(key) % {"k": 1}"#, r"", 0),
+        (r"(key) % null", r"", 0),
+        (r"(key) % true", r"", 0),
+        (r"(key) == 1", r"false", 0),
+        (r"1 == (key)", r"false", 0),
+        (r#"(key) == "s""#, r"false", 0),
+        (r"(key) == [1]", r"false", 0),
+        (r#"(key) == {"k": 1}"#, r"false", 0),
+        (r"(key) == null", r"true", 0),
+        (r"(key) == true", r"false", 0),
+        (r"(key) != 1", r"true", 0),
+        (r"1 != (key)", r"true", 0),
+        (r#"(key) != "s""#, r"true", 0),
+        (r"(key) != [1]", r"true", 0),
+        (r#"(key) != {"k": 1}"#, r"true", 0),
+        (r"(key) != null", r"false", 0),
+        (r"(key) != true", r"true", 0),
+        (r"(key) < 1", r"false", 0),
+        (r"1 < (key)", r"false", 0),
+        (r#"(key) < "s""#, r"false", 0),
+        (r"(key) < [1]", r"false", 0),
+        (r#"(key) < {"k": 1}"#, r"false", 0),
+        (r"(key) < null", r"false", 0),
+        (r"(key) < true", r"false", 0),
+        (r"(key) > 1", r"false", 0),
+        (r"1 > (key)", r"false", 0),
+        (r#"(key) > "s""#, r"false", 0),
+        (r"(key) > [1]", r"false", 0),
+        (r#"(key) > {"k": 1}"#, r"false", 0),
+        (r"(key) > null", r"false", 0),
+        (r"(key) > true", r"false", 0),
+        (r"(key) <= 1", r"false", 0),
+        (r"1 <= (key)", r"false", 0),
+        (r#"(key) <= "s""#, r"false", 0),
+        (r"(key) <= [1]", r"false", 0),
+        (r#"(key) <= {"k": 1}"#, r"false", 0),
+        (r"(key) <= null", r"false", 0),
+        (r"(key) <= true", r"false", 0),
+        (r"(key) >= 1", r"false", 0),
+        (r"1 >= (key)", r"false", 0),
+        (r#"(key) >= "s""#, r"false", 0),
+        (r"(key) >= [1]", r"false", 0),
+        (r#"(key) >= {"k": 1}"#, r"false", 0),
+        (r"(key) >= null", r"false", 0),
+        (r"(key) >= true", r"false", 0),
+        (r"(key) and 1", r"false", 0),
+        (r"1 and (key)", r"false", 0),
+        (r#"(key) and "s""#, r"false", 0),
+        (r"(key) and [1]", r"false", 0),
+        (r#"(key) and {"k": 1}"#, r"false", 0),
+        (r"(key) and null", r"false", 0),
+        (r"(key) and true", r"false", 0),
+        (r"(key) or 1", r"true", 0),
+        (r"1 or (key)", r"true", 0),
+        (r#"(key) or "s""#, r"true", 0),
+        (r"(key) or [1]", r"true", 0),
+        (r#"(key) or {"k": 1}"#, r"true", 0),
+        (r"(key) or null", r"false", 0),
+        (r"(key) or true", r"true", 0),
+        (r"(key) // 1", r"1", 0),
+        (r"1 // (key)", r"1", 0),
+        (r#"(key) // "s""#, r#""s""#, 0),
+        (r"(key) // [1]", r"[1]", 0),
+        (r#"(key) // {"k": 1}"#, r#"{"k":1}"#, 0),
+        (r"(key) // null", r"null", 0),
+        (r"(key) // true", r"true", 0),
+        (r"key + parent", r"", 0),
+        (r"key - parent", r"", 0),
+        (r"key * parent", r"", 0),
+        (r"key / parent", r"", 0),
+        (r"key % parent", r"", 0),
+        (r"key == parent", r"true", 0),
+        (r"key != parent", r"false", 0),
+        (r"key < parent", r"false", 0),
+        (r"key > parent", r"false", 0),
+        (r"key <= parent", r"true", 0),
+        (r"key >= parent", r"true", 0),
+        (r"key and parent", r"false", 0),
+        (r"key or parent", r"false", 0),
+        (r"key // parent", r"", 0),
+        (r"null + 1", r"1", 0),
+        (r"1 + null", r"", 1),
+        (r"null * 2", r"", 1),
+        (r".zzz + 1", r"1", 0),
+        // Four rows that reach the **eager** path-context evaluator's own copy
+        // of the rule (`eval::binary_fanout_each` / `boolean_fanout_core`)
+        // rather than the generic one: `Expr::And` and `Expr::Alternative`
+        // have no native `eval_single` arm in `eval_generic.rs`, so the whole
+        // expression bridges, and the arithmetic inside is then evaluated by
+        // `eval.rs`. Verified with a temporary marker at each site that these
+        // exercise the inner-empty pass, the outer-empty pass and the
+        // `and`/`or` `false` contribution respectively -- the rows above
+        // mostly take the generic route, so without these the eager half of
+        // "one definition, both routes" would be untested. Captured live from
+        // yq v4.53.3 like every other row.
+        (r"(key + 1) and true", r"true", 0),
+        (r"(1 + key) and true", r"true", 0),
+        (r"(1 - key) and true", r"false", 0),
+        (r#"(key * 2) // "d""#, r#""d""#, 0),
+        (r#".a | key + "!""#, r#""a!""#, 0),
+        (r".a | key * 2", r#""aa""#, 0),
+    ] {
+        let (out, stderr, code) =
+            run_yq_stdin_with_stderr(filter, EMPTY_OPERAND_DOC, &["-o", "json", "-I", "0"])?;
+        assert_eq!(
+            (out.trim(), code),
+            (want, want_code),
+            "`{filter}` -- stderr: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// #2460's other half: real yq's rule is keyed on *zero outputs*, never on
+/// which filter produced them. The oracle capture ran all four empty shapes
+/// -- `key`, `parent`, `parent(1)` and `.[] | select(false)` -- against all
+/// 13 operators and 7 right-hand shapes, 196 comparable cells each, and
+/// found **zero mismatches** between them.
+///
+/// That is what `jq::eval::yq_empty_operand_output` takes no producer
+/// argument for, and it is the property the placeholder stubs used to break:
+/// `key` was `null` and `parent` a *truthy* `{}`, so succinctly disagreed
+/// with itself between two shapes real yq cannot tell apart. This test is
+/// the guard on that equivalence -- it compares succinctly against
+/// succinctly, so it keeps holding with no oracle installed.
+#[test]
+fn test_yq_all_four_empty_operand_shapes_are_indistinguishable_2460() -> Result<()> {
+    let empties = ["key", "parent", "parent(1)", ".[] | select(false)"];
+    let ops = [
+        "+", "-", "*", "/", "%", "==", "!=", "<", ">", "<=", ">=", "and", "or", "//",
+    ];
+    let rhs = ["1", "\"s\"", "[1]", "{\"k\": 1}", "null", "true"];
+    for op in ops {
+        for r in rhs {
+            // Forward (`E op r`) and reversed (`r op E`) are compared in
+            // separate buckets: the claim under test is that the four
+            // *producers* agree, not that the operator is symmetric.
+            for reversed in [false, true] {
+                let mut seen: Option<(&str, String, i32)> = None;
+                for e in empties {
+                    let filter = if reversed {
+                        format!("{r} {op} ({e})")
+                    } else {
+                        format!("({e}) {op} {r}")
+                    };
+                    let (out, _, code) = run_yq_stdin_with_stderr(
+                        &filter,
+                        EMPTY_OPERAND_DOC,
+                        &["-o", "json", "-I", "0"],
+                    )?;
+                    let got = (out.trim().to_string(), code);
+                    match &seen {
+                        None => seen = Some((e, got.0, got.1)),
+                        Some((first, want_out, want_code)) => assert_eq!(
+                            (got.0.as_str(), got.1),
+                            (want_out.as_str(), *want_code),
+                            "`{filter}`: `{e}` disagrees with `{first}`"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}

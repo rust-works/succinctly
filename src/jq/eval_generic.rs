@@ -38,16 +38,17 @@ use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, bind_def, bind_def_call,
     cannot_reserve_cross_product, classify_limit_n, classify_nth_n, classify_parent_n,
     collapse_vec, collect_pattern_var_names, compare_values, debug_assert_materialization_error,
-    enter_def_call_frame, eval_each_owned, eval_foreach_with_values, eval_full as full_eval,
-    eval_reduce_with_values, extract_pattern_bindings, fold_escaped_generator_prefix, format_owned,
-    has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
-    index_one_owned as index_owned_by_key, is_pure_chain_link, is_retryable_stop, literal_to_owned,
-    needs_path_context, numeric_key_to_array_index, numeric_key_to_index, owned_bound_to_i64,
-    owned_to_string, prefer_pending_control, slice_component_value, slice_object_as_yq_children,
+    empty_operand_rule, enter_def_call_frame, eval_each_owned, eval_foreach_with_values,
+    eval_full as full_eval, eval_reduce_with_values, extract_pattern_bindings,
+    fold_escaped_generator_prefix, format_owned, has_type_mismatch_is_permissive,
+    index_component_value, index_in_array_bounds, index_one_owned as index_owned_by_key,
+    is_pure_chain_link, is_retryable_stop, literal_to_owned, needs_path_context,
+    numeric_key_to_array_index, numeric_key_to_index, owned_bound_to_i64, owned_to_string,
+    prefer_pending_control, slice_component_value, slice_object_as_yq_children,
     slice_owned_value_read, streams_escaped_generator_prefix, substitute_bound_var,
     substitute_vars, suppress_or_raise, suppresses, tonumber_from_str, vec_with_capacity,
-    yq_negative_index_check, Control, Demand, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics,
-    LimitN, PathTrail, QueryResult, YqSemantics,
+    yq_empty_operand_output, yq_negative_index_check, Control, Demand, EmptyOperandOp, EvalError,
+    EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail, QueryResult, YqSemantics,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -6017,6 +6018,33 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             eval_compare_generic::<S, V>(*op, left, right, value, optional, cursor)
         }
 
+        // Spine 2416 step 1b: arithmetic through the sink evaluator's own
+        // `Expr::Arithmetic` arm (`binary_fanout_each_generic`), which
+        // evaluates both operands with the cursor -- so `.[] | key + 10`
+        // answers per-element keys on the non-sink route too, where the
+        // eager bridge used to hand it `null + 10`. That is what admits
+        // `Expr::Arithmetic` to `path_context_single_native`.
+        //
+        // **Gated on `needs_path_context`, unlike the `Expr::Compare` arm
+        // above.** The eager bridge materializes the ambient value on its
+        // way through, and for a #1194-malformed document (`{123: 1}`) that
+        // materialization is the decode failure jq answers *every* query on
+        // that document with -- including one that never reads `.`, like
+        // `try (1+1) catch "x"` (exit 5, live-verified against jq 1.7.1 and
+        // pinned by `test_try_catch_contains_a_genuinely_catchable_malformed_key_error_1812`).
+        // An ungated arm here would answer `2` and lose that. The gate keeps
+        // arithmetic that reads no path context on the bridge, where it
+        // still pays the ambient decode; arithmetic that does read path
+        // context could not have been on a malformed document's root and
+        // survived the walk anyway. (`Expr::Compare`'s own arm already
+        // diverges here -- `1==1` on `{123: 1}` answers `true` -- which is a
+        // pre-existing gap, not one this arm widens.)
+        Expr::Arithmetic { left, right, .. }
+            if needs_path_context(left) || needs_path_context(right) =>
+        {
+            collect_each_generic::<S, V>(expr, value, optional, cursor)
+        }
+
         // Array construction: collect every output of the inner expression
         // into one array. Handled natively (mirrors `eval::eval_array_construction`)
         // so a builtin with its own cursor-native, duplicate-key-preserving fix
@@ -6597,6 +6625,7 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             left,
             right,
             optional,
+            empty_operand_rule::<S>(EmptyOperandOp::Compare(*op)),
             |left_val, right_val| {
                 Ok(OwnedValue::Bool(apply_compare_op::<S>(
                     *op, &left_val, &right_val,
@@ -6623,6 +6652,7 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             left,
             right,
             optional,
+            empty_operand_rule::<S>(EmptyOperandOp::Arith(*op)),
             |left_val, right_val| arith_combine::<S>(*op, left_val, right_val),
             sink,
         ),
@@ -7755,12 +7785,20 @@ fn binary_fanout_each_generic<V: DocumentValue>(
     left: &Expr,
     right: &Expr,
     optional: bool,
+    empty_rule: Option<EmptyOperandOp>,
     mut combine: impl FnMut(OwnedValue, OwnedValue) -> Result<OwnedValue, EvalError>,
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Flow {
     let mut abort: Option<Flow> = None;
+    // #2460: how many outputs each operand produced, so a *zero* count is
+    // answered from `yq_empty_operand_output` rather than contributing no
+    // pairings -- the same rule, from the same definition, that
+    // `eval::binary_fanout_each` consults on the eager route. `None` in jq
+    // mode, where `1 + empty` really is nothing.
+    let mut right_seen = 0usize;
 
     let outer = each_operand(right, &mut |right_item: GenericItem<V>| {
+        right_seen += 1;
         let right_val = match generic_item_into_owned(right_item) {
             Ok(v) => v,
             Err(control) => {
@@ -7769,7 +7807,9 @@ fn binary_fanout_each_generic<V: DocumentValue>(
             }
         };
 
+        let mut left_seen = 0usize;
         let inner = each_operand(left, &mut |left_item: GenericItem<V>| {
+            left_seen += 1;
             let left_val = match generic_item_into_owned(left_item) {
                 Ok(v) => v,
                 Err(control) => {
@@ -7803,6 +7843,21 @@ fn binary_fanout_each_generic<V: DocumentValue>(
             return Demand::Stop;
         }
 
+        // #2460 (yq mode only): the *left* operand produced nothing for this
+        // right value, so this pairing is answered from the empty-operand
+        // table instead of skipped. Only once `inner` ran to exhaustion -- an
+        // operand that escaped or was stopped part-way is not "empty".
+        if left_seen == 0 && matches!(inner, Flow::Exhausted) {
+            if let Some(op) = empty_rule {
+                if let Some(v) = yq_empty_operand_output(op, Some(&right_val)) {
+                    if matches!(sink(GenericItem::Owned(v)), Demand::Stop) {
+                        abort = Some(Flow::Stopped { pending: None });
+                        return Demand::Stop;
+                    }
+                }
+            }
+        }
+
         match inner {
             Flow::Exhausted => Demand::Continue,
             other => {
@@ -7812,7 +7867,52 @@ fn binary_fanout_each_generic<V: DocumentValue>(
         }
     });
 
+    if let (Some(op), 0, None, Flow::Exhausted) = (empty_rule, right_seen, &abort, &outer) {
+        // #2460 (yq mode only): the *right* operand produced nothing, so the
+        // outer loop never ran and `left` was never evaluated at all -- drive
+        // it once here so `1 + key` and `key + 1` stay symmetric the way real
+        // yq is. Mirrors `eval::empty_outer_operand_pass`.
+        return empty_outer_operand_pass_generic::<V>(&each_operand, left, op, sink);
+    }
     abort.unwrap_or(outer)
+}
+
+/// The `right`-operand-produced-nothing half of
+/// [`binary_fanout_each_generic`]'s #2460 rule -- the generic-evaluator twin
+/// of `eval::empty_outer_operand_pass`, split out for the same reason (one
+/// `return` shape in the loop above).
+fn empty_outer_operand_pass_generic<V: DocumentValue>(
+    each_operand: &impl Fn(&Expr, &mut dyn FnMut(GenericItem<V>) -> Demand) -> Flow,
+    left: &Expr,
+    op: EmptyOperandOp,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    let mut abort: Option<Flow> = None;
+    let mut left_seen = 0usize;
+    let flow = each_operand(left, &mut |left_item: GenericItem<V>| {
+        left_seen += 1;
+        let left_val = match generic_item_into_owned(left_item) {
+            Ok(v) => v,
+            Err(control) => {
+                abort = Some(Flow::Escaped(control));
+                return Demand::Stop;
+            }
+        };
+        match yq_empty_operand_output(op, Some(&left_val)) {
+            Some(v) => sink(GenericItem::Owned(v)),
+            None => Demand::Continue,
+        }
+    });
+    if let Some(flow) = abort {
+        return flow;
+    }
+    if left_seen == 0 && matches!(flow, Flow::Exhausted) {
+        // Both operands empty: one pairing, with no "other operand" at all.
+        if let Some(v) = yq_empty_operand_output(op, None) {
+            return push_one_generic(GenericItem::Owned(v), sink);
+        }
+    }
+    flow
 }
 
 /// Collecting wrapper over [`binary_fanout_each_generic`] for `eval_single`'s
@@ -7846,6 +7946,7 @@ fn eval_compare_generic<S: EvalSemantics, V: DocumentValue>(
         left,
         right,
         optional,
+        empty_operand_rule::<S>(EmptyOperandOp::Compare(op)),
         |left_val, right_val| {
             Ok(OwnedValue::Bool(apply_compare_op::<S>(
                 op, &left_val, &right_val,
@@ -11516,6 +11617,17 @@ fn path_context_single_native(expr: &Expr) -> bool {
                     || !path_context_needs_eager(exprs))
         }
         Expr::Compare { left, right, .. } => {
+            path_context_single_native(left) && path_context_single_native(right)
+        }
+        // Native since spine 2416 step 1b (`eval_single`'s own
+        // `Expr::Arithmetic` arm, above, over `collect_each_generic`). Two
+        // shapes blocked this admission until now, and both are closed:
+        // yq's rule for an operand that produces zero outputs (#2460,
+        // `jq::eval::yq_empty_operand_output`, consulted by the generic and
+        // eager fanouts alike so the two routes agree on `key + 1`), and the
+        // ambient decode `try (1+1) catch "x"` depends on for a malformed
+        // document, which the arm's own `needs_path_context` gate preserves.
+        Expr::Arithmetic { left, right, .. } => {
             path_context_single_native(left) && path_context_single_native(right)
         }
         Expr::Try { expr, catch } => {
@@ -22949,10 +23061,13 @@ mod tests {
         assert!(!eager(".[] | [key, path]"));
         assert!(!eager(".[] | select(key == \"b\") | parent(1)"));
         assert!(!eager(".[] | first(.[] | key)"));
-        assert!(
-            eager(".[] | key + 10"),
-            "arithmetic still bridges from eval_single"
-        );
+        // Generic since spine 2416 step 1b: `Expr::Arithmetic` has an
+        // `eval_single` arm of its own now, so the non-sink route threads
+        // the cursor into both operands instead of handing the eager
+        // bridge a `null + 10`.
+        assert!(!eager(".[] | key + 10"));
+        assert!(!eager(".[] | (key + 1) * 2"));
+        assert!(!eager(".[] | key + \"!\""));
         // Reason 1, an owned-domain stage before the builtin, is answered
         // by the owned identity pipe (#2416 step 3) wherever the stage has
         // an `owned_identity_rule` and the rest reads the position it
@@ -23026,13 +23141,13 @@ mod tests {
         // fresh `parse()`; `test_def_call_keeps_path_context_2416` (CLI) is
         // its coverage instead.
         assert!(!eager(".[] | (def k: 1; key)"));
-        // Arithmetic still bridges from `eval_single` (unchanged from the
-        // `if`/`limit` rows above), so wrapping one in `as`'s/`label`'s/
-        // `def`'s body keeps the whole pipe eager.
-        assert!(eager(".[] | . as $x | key + 10"));
-        assert!(eager(".[] | . as {a: $a} | key + 10"));
-        assert!(eager(".[] | label $out | key + 10"));
-        assert!(eager(".[] | (def k: 1; key + 10)"));
+        // Arithmetic is single-native since spine 2416 step 1b, so wrapping
+        // one in `as`'s/`label`'s/`def`'s body no longer drags the whole
+        // pipe back to the eager evaluator either.
+        assert!(!eager(".[] | . as $x | key + 10"));
+        assert!(!eager(".[] | . as {a: $a} | key + 10"));
+        assert!(!eager(".[] | label $out | key + 10"));
+        assert!(!eager(".[] | (def k: 1; key + 10)"));
         // `DefCall` is a runtime node the parser never produces, so its
         // argument gate is pinned by the CLI (`f(key + 10)` in
         // `test_shared_keeps_path_context_2416`) rather than here.

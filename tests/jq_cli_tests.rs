@@ -38062,3 +38062,52 @@ fn test_absent_position_keeps_path_context_2416() -> Result<()> {
     }
     Ok(())
 }
+
+/// #2460 gives *yq mode* a rule for a binary operator whose operand produced
+/// zero outputs (`key + 1` on a root document is `1` there, not nothing).
+/// **jq mode is deliberately untouched**, and this is the pin on that: real
+/// jq has no such rule at all -- an empty operand makes the whole expression
+/// empty, for every operator except `//`, whose own falsy/absent fallback
+/// predates this issue entirely.
+///
+/// Every row captured live from `/usr/bin/jq` 1.7.1 (not Homebrew's 1.8.2).
+/// `empty` is the shape used rather than `key`/`parent`, because those two
+/// are succinctly extensions in jq mode with no oracle to capture -- their
+/// own jq-mode placeholders (`null` and `{}`) are pinned separately, further
+/// up this file, and #2460 left them alone.
+#[test]
+fn test_jq_mode_has_no_empty_operand_rule_2460() -> Result<()> {
+    for (filter, want) in [
+        ("1 + empty", ""),
+        ("empty + 1", ""),
+        ("empty - 1", ""),
+        ("empty * 1", ""),
+        ("empty / 1", ""),
+        ("empty % 1", ""),
+        ("empty == 1", ""),
+        // Not `true`: yq's `==` special-cases a `null` other operand, jq's
+        // does not reach an `==` at all.
+        ("empty == null", ""),
+        ("empty != 1", ""),
+        ("empty < 1", ""),
+        ("empty <= 1", ""),
+        ("empty > 1", ""),
+        ("empty >= 1", ""),
+        ("empty and 1", ""),
+        ("empty or 1", ""),
+        ("empty + empty", ""),
+        ("empty == empty", ""),
+        // The one operator that answers, in both modes and for the same
+        // pre-existing reason: `//` falls through to its right operand when
+        // the left produces no truthy output.
+        ("empty // 1", "1"),
+    ] {
+        let (out, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
+        assert_eq!(
+            (out.trim(), code),
+            (want, 0),
+            "`{filter}` -- stderr: {stderr}"
+        );
+    }
+    Ok(())
+}
