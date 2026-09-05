@@ -44,10 +44,13 @@ use syn::visit::{self, Visit};
 ///
 /// Step 4 of that spine audited every one of these handlers for reachability
 /// and found no dead ones: `docs/plan/path-context-arm-reachability.md` has a
-/// live proof query and the gate reason for each, plus the three routes that
-/// enter the eager evaluator (the `path_context_needs_eager` bridge is only
-/// one of them -- `--eval-all` and `eval::eval_pipe`'s own diversion have no
-/// gate). Read it before assuming an arm is deletable.
+/// live proof query and the gate reason for each. Step 5 then closed the two
+/// routes that entered the eager evaluator *without* consulting
+/// `path_context_needs_eager` (`--eval-all` and `eval::eval_pipe`'s own
+/// diversion), so the gate is now the whole answer to which pipes reach an
+/// arm -- `tests/jq_path_context_single_door_guard.rs` keeps it that way.
+/// Closing them removed no arm's only route, so the pin did not move. Read
+/// that page before assuming an arm is deletable.
 const PINNED_ARM_COUNT: usize = 43;
 
 const TARGET_FN: &str = "eval_stage_with_path_context";
