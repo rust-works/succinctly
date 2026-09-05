@@ -6039,6 +6039,11 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // of bridging the whole construct to the eager evaluator.
         Expr::As { .. } => collect_each_generic::<S, V>(expr, value, optional, cursor),
 
+        // #2416 phase 3: destructuring `as` natively via
+        // `each_as_pattern_generic` -- same cursor-threading as `Expr::As`
+        // above, for every `?//`-chained alternative.
+        Expr::AsPattern { .. } => collect_each_generic::<S, V>(expr, value, optional, cursor),
+
         Expr::Comma(exprs) => {
             let mut out: Vec<OwnedValue> = Vec::new();
             for expr in exprs {
@@ -11283,6 +11288,11 @@ fn path_context_single_native(expr: &Expr) -> bool {
         // `each_as_generic`): `expr` and `body` both evaluate against the
         // same ambient cursor, mirroring `eval::eval_as`.
         Expr::As { expr, body, .. } => {
+            path_context_single_native(expr) && path_context_single_native(body)
+        }
+        // Native since #2416 phase 3 (`each_as_pattern_generic`): same
+        // reasoning as `Expr::As` above, for every `?//`-chained alternative.
+        Expr::AsPattern { expr, body, .. } => {
             path_context_single_native(expr) && path_context_single_native(body)
         }
         _ => false,
@@ -21451,10 +21461,12 @@ mod tests {
         // document, not `1`), so this row keeps `key` at the per-element
         // position `.[]` already put it at.
         assert!(!eager(".[] | . as $x | key"));
+        assert!(!eager(".[] | . as {a: $a} | key"));
         // Arithmetic still bridges from `eval_single` (unchanged from the
         // `if`/`limit` rows above), so wrapping one in `as`'s body keeps the
         // whole pipe eager.
         assert!(eager(".[] | . as $x | key + 10"));
+        assert!(eager(".[] | . as {a: $a} | key + 10"));
         // An emitted `key`/`path` is a computed value: a later builtin no
         // longer stands on a node.
         assert!(eager(".[] | key | key"));
