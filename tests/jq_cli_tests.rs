@@ -38157,3 +38157,48 @@ fn test_jq_pipe_into_union_stays_element_major_2451() -> Result<()> {
 
     Ok(())
 }
+
+/// #2451 rule 2 is yq-only: jq has no pointer-identity guard on `,`, so a
+/// union of identities duplicates every time. Captured from `/usr/bin/jq`
+/// 1.7.1 with `-c` on `{"a":{"c":3,"d":4},"b":{"c":5,"d":6},"n":[1,2,3]}`;
+/// the yq-mode counterpart is `yq_cli_tests.rs`'s
+/// `test_yq_union_of_two_identities_yields_the_list_once_2451`.
+#[test]
+fn test_jq_union_of_identities_still_duplicates_2451() -> Result<()> {
+    let doc = r#"{"a":{"c":3,"d":4},"b":{"c":5,"d":6},"n":[1,2,3]}"#;
+    let a = r#"{"c":3,"d":4}"#;
+    let b = r#"{"c":5,"d":6}"#;
+
+    // $ jq -c '(.a, .b) | (., .)'                => 4 lines (each doubled)
+    // $ jq -c '(.a, .b) | (., ., .)'             => 6 lines (each tripled)
+    // $ jq -c '(.a, .b) | (., ., ., .)'          => 8 lines
+    // ... i.e. `2n`, never yq's `2 * max(1, n - 1)`.
+    for dots in 1..=4usize {
+        let branches = vec!["."; dots].join(", ");
+        let (out, code) = run_jq_stdin(&format!("(.a, .b) | ({branches})"), doc, &["-c"])?;
+        assert_eq!(code, 0, "{dots} dots");
+        let want = format!("{}\n{}", vec![a; dots].join("\n"), vec![b; dots].join("\n"));
+        assert_eq!(out.trim(), want, "{dots} dots");
+    }
+
+    for (filter, want) in [
+        // $ jq -c '(.a, .b) | (., ., .c)'  =>  {a} / {a} / 3 / {b} / {b} / 5
+        ("(.a, .b) | (., ., .c)", format!("{a}\n{a}\n3\n{b}\n{b}\n5")),
+        // $ jq -c '(.a, .b) | (.c, .)'  =>  3 / {a} / 5 / {b}
+        ("(.a, .b) | (.c, .)", format!("3\n{a}\n5\n{b}")),
+        // $ jq -c '(.a, .b) | ((.), .)'  =>  {a} / {a} / {b} / {b}
+        ("(.a, .b) | ((.), .)", format!("{a}\n{a}\n{b}\n{b}")),
+        // $ jq -c '[.n[] | (., .)]'  =>  [1,1,2,2,3,3]
+        ("[.n[] | (., .)]", "[1,1,2,2,3,3]".to_string()),
+        // $ jq -c '(.n[0], .n[1]) | [., .]'  =>  [1,1] / [2,2]
+        ("(.n[0], .n[1]) | [., .]", "[1,1]\n[2,2]".to_string()),
+        // $ jq -c '(., .) | length'  =>  3 / 3
+        ("(., .) | length", "3\n3".to_string()),
+    ] {
+        let (out, code) = run_jq_stdin(filter, doc, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}`");
+        assert_eq!(out.trim(), want, "`{filter}`");
+    }
+
+    Ok(())
+}
