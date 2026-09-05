@@ -465,6 +465,57 @@ pub(crate) fn yq_empty_operand_output(
     }
 }
 
+/// yq mode only (#2483): an ordering comparison (`<`/`<=`/`>`/`>=`) against a
+/// **real** `null` operand -- as opposed to [`yq_empty_operand_output`]'s
+/// zero-*output* operand, a distinct "null-ish" category per that function's
+/// own doc comment -- is `false` unconditionally, never jq's total order
+/// (which sorts `null` below everything, so jq's `null < 1` is `true`).
+/// `None` from this function means "the ordinary rule already gives the
+/// right answer" (every non-comparison op, and `null` against `null` itself,
+/// where equality already makes `<=`/`>=` come out `true` the normal way).
+///
+/// Captured live against yq v4.53.3 (`-o=json -I0`) on `a: 1`:
+///
+/// | filter                                    | real yq |
+/// |--------------------------------------------|---------|
+/// | `null == 1` / `1 == null`                  | `false` |
+/// | `null != 1` / `1 != null`                  | `true`  |
+/// | `null < 1`, `<= 1`, `> 1`, `>= 1` (either order) | `false` |
+/// | `null == null`                             | `true`  |
+/// | `null != null`                             | `false` |
+/// | `null < null`, `null > null`               | `false` |
+/// | `null <= null`, `null >= null`              | `true`  |
+/// | `null <op> "a"`, `null <op> false`         | same as vs a number |
+/// | `.zzz < 1` (a genuine `null` *node*, not an empty operand -- comparison operands are not read-only) | `false` |
+///
+/// **Not reproduced here:** `null` against an array/object in real yq
+/// raises a Go-internal error instead of answering `false` at all -- and the
+/// wording depends on operand *order* (`null < []` is `!!seq () cannot be
+/// subtracted from !!null`; `[] < null` is `arrays not yet supported for
+/// comparison`). That is a separate, much deeper quirk (yq's ordering
+/// comparator is implemented as a subtraction internally) than "ordering
+/// against null is false" and is not part of this rule -- see
+/// `docs/compliance/yq/limitations.md`.
+pub(crate) fn yq_null_ordering_is_false<S: EvalSemantics>(
+    op: CompareOp,
+    left: &OwnedValue,
+    right: &OwnedValue,
+) -> Option<bool> {
+    if S::TAG != EvalTag::Yq
+        || !matches!(
+            op,
+            CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge
+        )
+    {
+        return None;
+    }
+    match (left, right) {
+        (OwnedValue::Null, OwnedValue::Null) => None,
+        (OwnedValue::Null, _) | (_, OwnedValue::Null) => Some(false),
+        _ => None,
+    }
+}
+
 /// **The one definition of yq's read-only evaluation context** (#2470),
 /// consulted by both evaluators and by every navigation site that has to
 /// decide what a key lookup that found nothing evaluates to.
@@ -6940,6 +6991,10 @@ pub(crate) fn apply_compare_op<S: EvalSemantics>(
     left: &OwnedValue,
     right: &OwnedValue,
 ) -> bool {
+    // #2483: yq mode only -- see `yq_null_ordering_is_false`.
+    if let Some(result) = yq_null_ordering_is_false::<S>(op, left, right) {
+        return result;
+    }
     match op {
         CompareOp::Eq => owned_value_eq::<S>(left, right),
         CompareOp::Ne => !owned_value_eq::<S>(left, right),
