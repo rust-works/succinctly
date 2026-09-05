@@ -7431,6 +7431,21 @@ fn test_as_pattern_keeps_path_context_2416() -> Result<()> {
     Ok(())
 }
 
+/// Spine 2416, phase 3: `label $name | body` is now native via
+/// `each_label_generic`, so a `key` reached before a `break` inside the
+/// label's body keeps the ambient cursor instead of bridging. No jq oracle
+/// (`label`/`break` are real jq, but `key` is a succinctly extension).
+/// `label` doesn't change `.` either, so this pins the pre-migration answer
+/// (this PR's own pre-change build) unchanged.
+#[test]
+fn test_label_keeps_path_context_2416() -> Result<()> {
+    let doc = r#"[{"a":1},{"b":2}]"#;
+    let (out, _, code) = run_jq_full(&["-c", ".[] | label $out | (key, break $out)"], Some(doc))?;
+    assert_eq!(code, 0, "{out:?}");
+    assert_eq!(out.trim(), "0\n1");
+    Ok(())
+}
+
 /// Documents the one remaining deliberate, narrow gap #1663/#1765 leave
 /// open rather than silently missing: a `?//`-chained `AsPattern` (2+
 /// alternatives) still has no dedicated evaluation arm, so a path-context

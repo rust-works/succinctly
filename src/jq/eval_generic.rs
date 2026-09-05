@@ -6044,6 +6044,12 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // above, for every `?//`-chained alternative.
         Expr::AsPattern { .. } => collect_each_generic::<S, V>(expr, value, optional, cursor),
 
+        // #2416 phase 3: `label $name | body` natively via
+        // `each_label_generic`, so a `key`/`parent`/`path` reached before or
+        // after a `break` inside the body keeps the ambient cursor instead
+        // of bridging.
+        Expr::Label { .. } => collect_each_generic::<S, V>(expr, value, optional, cursor),
+
         Expr::Comma(exprs) => {
             let mut out: Vec<OwnedValue> = Vec::new();
             for expr in exprs {
@@ -11295,6 +11301,9 @@ fn path_context_single_native(expr: &Expr) -> bool {
         Expr::AsPattern { expr, body, .. } => {
             path_context_single_native(expr) && path_context_single_native(body)
         }
+        // Native since #2416 phase 3 (`each_label_generic`): the body is all
+        // that can carry a path-context builtin.
+        Expr::Label { body, .. } => path_context_single_native(body),
         _ => false,
     }
 }
@@ -21462,11 +21471,13 @@ mod tests {
         // position `.[]` already put it at.
         assert!(!eager(".[] | . as $x | key"));
         assert!(!eager(".[] | . as {a: $a} | key"));
+        assert!(!eager(".[] | label $out | key"));
         // Arithmetic still bridges from `eval_single` (unchanged from the
-        // `if`/`limit` rows above), so wrapping one in `as`'s body keeps the
-        // whole pipe eager.
+        // `if`/`limit` rows above), so wrapping one in `as`'s/`label`'s body
+        // keeps the whole pipe eager.
         assert!(eager(".[] | . as $x | key + 10"));
         assert!(eager(".[] | . as {a: $a} | key + 10"));
+        assert!(eager(".[] | label $out | key + 10"));
         // An emitted `key`/`path` is a computed value: a later builtin no
         // longer stands on a node.
         assert!(eager(".[] | key | key"));
