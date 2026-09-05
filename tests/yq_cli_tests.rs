@@ -24650,6 +24650,57 @@ fn test_yaml_sort_keys_non_identity_filter_still_applies_1350() -> Result<()> {
     Ok(())
 }
 
+/// #1350's DOM fallback has two call sites -- stdin and the per-*file* M2
+/// loop, mirrored implementations of the same check. The tests above only
+/// exercise stdin; this one drives the file-argument path (`omni-dev
+/// coverage diff` flagged the per-file call site as entirely uncovered).
+#[test]
+fn test_yaml_sort_keys_alias_above_anchor_takes_dom_path_via_file_arg_1350() -> Result<()> {
+    let mut input_file = NamedTempFile::new()?;
+    write!(input_file, "b: &x 1\na: *x\n")?;
+
+    let (streamed, code) = run_yq_file(".", input_file.path().to_str().unwrap(), &["--sort-keys"])?;
+    assert_eq!(code, 0);
+    assert_eq!(streamed, "a: 1\nb: &x 1\n");
+
+    let (_, reread_code) = run_yq_stdin(".", &streamed, &[])?;
+    assert_eq!(
+        reread_code, 0,
+        "sorted file output must be readable by succinctly yq itself, output: {streamed}"
+    );
+    Ok(())
+}
+
+/// Same file-argument path, but with two files -- pins that
+/// `global_doc_index` (used for `--doc` filtering of *later* reads) still
+/// advances correctly across a document handled by the DOM fallback, not
+/// just the ordinary M2 loop.
+#[test]
+fn test_yaml_sort_keys_alias_above_anchor_multi_file_doc_index_1350() -> Result<()> {
+    let mut aliased_file = NamedTempFile::new()?;
+    write!(aliased_file, "b: &x 1\na: *x\n")?;
+    let mut plain_file = NamedTempFile::new()?;
+    write!(plain_file, "z: 1\ny: 2\n")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("--sort-keys")
+        .arg(".")
+        .arg(aliased_file.path())
+        .arg(plain_file.path())
+        .output()?;
+    let exit_code = exit_code_or_signal_death(output.status, &output.stderr)?;
+    let stdout = String::from_utf8(output.stdout)?;
+    assert_eq!(
+        exit_code,
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(stdout, "a: 1\nb: &x 1\n---\ny: 2\nz: 1\n");
+    Ok(())
+}
+
 #[test]
 fn test_yaml_flow_sequence_item_anchor_survives_a_write_763() -> Result<()> {
     // The flow *array* arm, distinct from the flow mapping arm above: the
