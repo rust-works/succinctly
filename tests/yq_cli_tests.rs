@@ -7638,6 +7638,27 @@ fn test_yaml_anchor_on_alias_rejected_in_every_position() -> Result<()> {
     Ok(())
 }
 
+/// The one *deliberate* divergence from real yq documented for #1374
+/// (`docs/compliance/yq/limitations.md`, "document root" section): real yq
+/// doesn't error on `&anchor *alias` across a `---` multi-document
+/// separator at all — it silently concatenates the first document's scalar
+/// value with the literal source text of the anchor-alias line
+/// (`"hello--- &a1 *a0"`, confirmed live against yq v4.53.3). succinctly
+/// rejects this shape too, per ADR-0018 rule 4(b) (matching would corrupt a
+/// document) rather than reproduce output with no valid round-trip.
+#[test]
+fn test_yaml_document_root_anchor_on_alias_rejected_1374() -> Result<()> {
+    let yaml = "--- &a0 hello\n--- &a1 *a0\n";
+    let (stdout, stderr, exit_code) = run_yq_stdin_with_stderr(".", yaml, &[])?;
+    assert_eq!(exit_code, 1, "expected clean error exit, stderr: {stderr}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("cannot carry an anchor or tag"),
+        "stderr should name the property-on-alias rejection: {stderr}"
+    );
+    Ok(())
+}
+
 // Deep (non-cyclic) alias-chain recursion guard tests (#1193) used to live
 // here, built via a `deep_alias_chain` helper chaining `k1: &a1 *a0`-shaped
 // hops. #1374 closed off that exact shape at parse time (`&anchor *alias` is
