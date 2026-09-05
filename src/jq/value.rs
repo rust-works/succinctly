@@ -1385,6 +1385,43 @@ impl OwnedValue {
         Self::Float(f)
     }
 
+    /// A *document-sourced* float with no preservable source literal left,
+    /// materialized so its provenance survives into `OwnedValue` (#2438).
+    ///
+    /// Two document shapes reach `OwnedValue` as a bare `f64` with their
+    /// spelling already gone: a YAML integer-shaped scalar too big for `i64`
+    /// (`a: 99999999999999999999`), and a tag-forced float whose text is
+    /// integer-shaped (`a: !!float 100000000000000000000`). Real yq spells
+    /// both out in full decimal wherever it re-serializes them, at *any*
+    /// magnitude -- `yq -o json '[.a]'` on the first answers
+    /// `[100000000000000000000.0]`, not `[1e+20]` -- while a genuinely
+    /// **computed** float of the identical magnitude gets scientific
+    /// notation there instead (`yq -o json '[1e20 * 1]'` answers `[1e+20]`).
+    /// Both captured live from yq v4.53.3.
+    ///
+    /// Since the two are the same `f64`, no magnitude threshold can separate
+    /// them downstream -- which is exactly what #2438 hit: the reindex
+    /// bridge (`to_json_for_reindex`) used to force the decimal spelling on
+    /// *every* bare yq-mode `Float` so the document cases would survive it,
+    /// which spelled `[.a * 1e100]` as a 101-digit expansion where real yq
+    /// prints `1e+100`. Recording the provenance here, at the one boundary
+    /// that still knows it, lets the bridge apply yq's own threshold
+    /// ([`crate::yaml::yq_float_is_scientific`]) to everything else.
+    ///
+    /// Only above/below yq's threshold: inside the everyday range the
+    /// decimal spelling *is* what the bridge would have produced anyway, and
+    /// baking a literal there would leak into the string builtins that read
+    /// it (`!!float 2 | tostring` must stay `2`, #1090/#1176). Non-finite
+    /// floats have no decimal spelling at all and stay bare.
+    #[must_use]
+    pub fn from_document_float(f: f64) -> Self {
+        if f.is_finite() && crate::yaml::yq_float_is_scientific(f) {
+            Self::from_number_literal(&crate::yaml::format_float_with_fraction(f))
+        } else {
+            Self::Float(f)
+        }
+    }
+
     /// Create a number that carries its document source text.
     ///
     /// Parses `literal` the same way every document-materializing conversion
@@ -1914,12 +1951,19 @@ impl OwnedValue {
     /// evaluator (#561, #472).
     ///
     /// `S: EvalSemantics` picks the plain (non-`NumberLiteral`) `Float`
-    /// fallback's spelling (#953): yq keeps a decimal point regardless of
-    /// magnitude (`format_float_with_fraction`), matching real yq's own
-    /// `-o json '[.a]'` output for a value with no preserved literal (e.g.
-    /// an i64-overflow YAML scalar reaching this bridge via `[...]`/
-    /// `map_values`/`with_entries`, which have no native `eval_generic.rs`
-    /// cursor arm). jq keeps the pre-existing bare `Display` (no forced
+    /// fallback's spelling (#953, #2438): yq applies its own magnitude
+    /// threshold (`format_float_yq` -- decimal-with-point for everyday
+    /// magnitudes, `e+NN`/`e-NN` past it), which is what a *computed* float
+    /// gets from real yq wherever it re-serializes one. This used to be an
+    /// unconditional `format_float_with_fraction` so that a **document**
+    /// float with no preserved literal (an i64-overflow YAML scalar reaching
+    /// this bridge via `[...]`/`map_values`/`with_entries`) would keep the
+    /// full decimal spelling real yq gives *it* at the same magnitude -- the
+    /// two answers genuinely differ for the identical `f64`, so the
+    /// provenance is now recorded upstream instead, at
+    /// [`from_document_float`](Self::from_document_float), leaving this
+    /// fallback free to spell the computed case correctly. jq keeps the
+    /// pre-existing bare `Display` (no forced
     /// point): real jq's own convention drops a computed value's literal
     /// formatting entirely (`1.0 + 4.0` prints `5`, not `5.0`), and a bare
     /// `Float` reaching this fallback is by construction one that already
@@ -2022,7 +2066,7 @@ impl OwnedValue {
             }
             Self::NumberLiteral(NumberRepr::Int(n), _) => format!("{n}"),
             Self::NumberLiteral(NumberRepr::Float(f), _) if S::TAG == EvalTag::Yq => {
-                crate::yaml::format_float_with_fraction(*f)
+                crate::yaml::format_float_yq(*f)
             }
             Self::NumberLiteral(NumberRepr::Float(f), _) => jq_bare_float_display(*f),
             Self::Array(arr) => {
@@ -2045,8 +2089,8 @@ impl OwnedValue {
                     .collect();
                 format!("{{{}}}", entries.join(","))
             }
-            // yq keeps a whole-number `Float`'s decimal point at any
-            // magnitude (#953); jq keeps the original bare `Display` (see
+            // yq spells a computed float by its own magnitude threshold
+            // (#953, #2438); jq keeps the original bare `Display` (see
             // this function's own doc comment for why the fork is required,
             // not optional).
             // `infinite_fmt` is unreachable from here either way -- every
@@ -2056,7 +2100,7 @@ impl OwnedValue {
             other if S::TAG == EvalTag::Yq => other.to_json_at_depth(
                 depth,
                 format_number_jq_compat,
-                crate::yaml::format_float_with_fraction,
+                crate::yaml::format_float_yq,
                 yq_infinite_float_json_text,
             ),
             other => other.to_json_at_depth(
@@ -3080,6 +3124,50 @@ mod tests {
         // legitimately formatted number -- both parses must fail today.
         assert!(NAN_SENTINEL.parse::<f64>().is_err());
         assert!(NAN_SENTINEL.parse::<i64>().is_err());
+    }
+
+    /// #2438: the document boundary bakes yq's own decimal spelling into a
+    /// float that has no source literal left, but only past yq's
+    /// scientific-notation threshold -- inside the everyday range the value
+    /// stays a bare `Float`, which is what keeps `!!float 2 | tostring`
+    /// answering `2` rather than `2.0` (#1090/#1176).
+    #[test]
+    fn test_from_document_float_records_provenance_only_past_the_threshold() {
+        assert_eq!(
+            OwnedValue::from_document_float(1e20),
+            OwnedValue::from_number_literal("100000000000000000000.0")
+        );
+        assert_eq!(
+            OwnedValue::from_document_float(1e-5),
+            OwnedValue::from_number_literal("0.00001")
+        );
+        // Everyday magnitudes, and non-finite values (which have no decimal
+        // spelling at all), stay bare.
+        for f in [2.0, 0.5, -1.0, 99999.0, 0.0, f64::NAN, f64::INFINITY] {
+            assert!(
+                matches!(OwnedValue::from_document_float(f), OwnedValue::Float(_)),
+                "expected a bare Float for {f}"
+            );
+        }
+    }
+
+    /// #2438: the bridge's yq fallback now spells a *computed* float by the
+    /// same threshold the emitters use, rather than forcing a decimal point
+    /// at every magnitude. jq mode's own fallback is untouched.
+    #[test]
+    fn test_to_json_for_reindex_yq_float_uses_the_shared_threshold_2438() {
+        assert_eq!(
+            OwnedValue::Float(1e20).to_json_for_reindex::<YqSemantics>(),
+            "1e+20"
+        );
+        assert_eq!(
+            OwnedValue::Float(2.0).to_json_for_reindex::<YqSemantics>(),
+            "2.0"
+        );
+        assert_eq!(
+            OwnedValue::Float(1e20).to_json_for_reindex::<JqSemantics>(),
+            "100000000000000000000"
+        );
     }
 
     #[test]

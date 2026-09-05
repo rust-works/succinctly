@@ -226,7 +226,12 @@ fn to_owned_checked_at_depth<V: DocumentValue>(
     } else if let Some(i) = value.as_i64() {
         Ok(OwnedValue::Int(i))
     } else if let Some(f) = value.as_f64() {
-        Ok(OwnedValue::Float(f))
+        // #2438: a document scalar that got this far has no preservable
+        // literal left (`number_literal()` answered `None` just above), so
+        // this is the boundary where its provenance is still known -- see
+        // `OwnedValue::from_document_float`. Unreachable for JSON input,
+        // whose `number_literal()` override is unconditional.
+        Ok(OwnedValue::from_document_float(f))
     } else if let Some(s) = value.as_str() {
         Ok(OwnedValue::String(s.into_owned()))
     } else if let Some(reason) = value.string_decode_error() {
@@ -414,7 +419,12 @@ fn to_owned_at_depth<V: DocumentValue>(
     } else if let Some(i) = value.as_i64() {
         Ok(OwnedValue::Int(i))
     } else if let Some(f) = value.as_f64() {
-        Ok(OwnedValue::Float(f))
+        // #2438: a document scalar that got this far has no preservable
+        // literal left (`number_literal()` answered `None` just above), so
+        // this is the boundary where its provenance is still known -- see
+        // `OwnedValue::from_document_float`. Unreachable for JSON input,
+        // whose `number_literal()` override is unconditional.
+        Ok(OwnedValue::from_document_float(f))
     } else if let Some(s) = value.as_str() {
         Ok(OwnedValue::String(s.into_owned()))
     } else if let Some(reason) = value.string_decode_error() {
@@ -2139,14 +2149,22 @@ fn reindex_bridge_is_identity(value: &OwnedValue) -> bool {
 /// sourced or genuinely computed (e.g. `1e10 * 2`) -- that distinction isn't
 /// recoverable from a `GenericResult` variant once a value has passed through
 /// even one further construction step (`to_entries`'s object wrapping looks
-/// identical, from here, to freshly computed arithmetic). The trade-off this
-/// accepts, matching an already-documented precedent
-/// (`test_yq_array_wrapped_computed_float_keeps_scientific_notation_known_gap_1168`,
-/// same shape as #1124/#1144's `join` gap): a genuinely computed float
-/// wrapped directly in `[...]`/`,` (`[1e10 * 2]`) also gets its decimal point
-/// forced, when real yq would keep scientific notation there. Getting both
-/// right needs provenance tagged at `OwnedValue::Float`'s own construction
-/// site, not reconstructed after the fact here -- out of scope for this fix.
+/// identical, from here, to freshly computed arithmetic).
+///
+/// #1168 accepted a gap as the price of that: a genuinely computed float
+/// wrapped directly in `[...]`/`,` (`[1e10 * 2]`) also got its decimal point
+/// forced, where real yq keeps scientific notation. #2438 closed it by
+/// tagging the provenance at `OwnedValue`'s own construction site after all
+/// -- [`OwnedValue::from_document_float`], applied at the document boundary
+/// (`to_owned_at_depth`, `ResolvedScalar::to_owned_value`) rather than
+/// reconstructed here -- which let `to_json_for_reindex`'s yq fallback
+/// switch to yq's own magnitude threshold (`format_float_yq`). This function
+/// is unchanged by that and still round-trips the whole result; what changed
+/// is that a document-sourced float now arrives already carrying its
+/// spelling, so the round trip preserves it as a literal instead of having
+/// to synthesize one for everything. `[1e10 * 2]` keeps scientific notation
+/// as a result; the ordinary-magnitude `join` gap (#1124/#1144, `[2.0/2]`)
+/// is below the threshold and is untouched.
 ///
 /// Round-tripping just `values` (not the whole input document, unlike the
 /// old wildcard fallback these two arms replace) keeps `Expr::Array`'s and
@@ -12571,7 +12589,10 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             } else if let Some(i) = value.as_i64() {
                 GenericResult::Owned(OwnedValue::Int(i))
             } else if let Some(f) = value.as_f64() {
-                GenericResult::Owned(OwnedValue::Float(f))
+                // #2438: still the document's own value, so it carries the
+                // same provenance the `number_literal()` arm above preserves
+                // -- see `OwnedValue::from_document_float`.
+                GenericResult::Owned(OwnedValue::from_document_float(f))
             } else if let Some(s) = value.as_str() {
                 match tonumber_from_str(s.as_ref()) {
                     Ok(n) => GenericResult::Owned(n),

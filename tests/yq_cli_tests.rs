@@ -8803,58 +8803,64 @@ fn test_yq_tostring_computed_nan_uses_yaml_spelling_1060() -> Result<()> {
     Ok(())
 }
 
-/// #2419: pins a *documented divergence*, not desired behaviour -- see
-/// "Float scalars lose their source spelling on the value route (#2419)" in
+/// #2419, narrowed by #2438: real yq v4.53.3 preserves a float scalar's
+/// source spelling everywhere, including through `tostring`. succinctly's
+/// value route used to re-spell *every* such scalar through the shortest
+/// `f64` rendering (`1e+19`, `1e+20`); #2438's
+/// `OwnedValue::from_document_float` now bakes the decimal spelling in at
+/// the document boundary instead, which closes the `.0`-suffixed case
+/// outright and leaves only the integer-shaped one divergent (`...0.0`
+/// against real yq's bare `...0`). See "An integer-shaped
+/// overflow float gains a trailing `.0` on the value route (#2419)" in
 /// [`docs/compliance/yq/limitations.md`](../docs/compliance/yq/limitations.md).
-/// Real yq v4.53.3 preserves a float scalar's source spelling everywhere,
-/// including through `tostring`; succinctly's value route (`OwnedValue::Float`)
-/// re-spells it whenever the shortest rendering differs from the source text.
-/// `1.50`/`1e3`/`0.1` are unaffected (`is_preservable_float_literal` keeps
-/// them), and the path-context bridge route (`| parent | .big | tostring`)
-/// avoids the value route but produces a third, still-wrong spelling on the
-/// integer-looking case. All four expectations here were captured live from
-/// the pinned binaries and must move together if either tool's behaviour
-/// changes -- see #2416, which retires the bridge and is expected to fix the
-/// value-route case listed here as its side effect.
+///
+/// The value route and the path-context bridge route (`| parent | .big |
+/// tostring`) now agree with each other on all five rows, where they used to
+/// print three different spellings between them. Every expectation here was
+/// captured live from the pinned binaries:
+///
+/// ```console
+/// $ printf 'outer:\n  big: 10000000000000000000.0\n' | yq -r '.outer.big | tostring'
+/// 10000000000000000000.0
+/// $ printf 'outer:\n  big: 100000000000000000000\n' | yq -r '.outer.big | tostring'
+/// 100000000000000000000
+/// ```
 #[test]
 fn test_yq_float_value_route_respelling_2419() -> Result<()> {
-    // Value route: re-spelled by succinctly, preserved by real yq.
-    for (input, want) in [
-        ("outer:\n  big: 10000000000000000000.0\n", "1e+19"),
-        ("outer:\n  big: 100000000000000000000\n", "1e+20"),
-    ] {
-        let (stdout, code) = run_yq_stdin(".outer.big | tostring", input, &["-r"])?;
-        assert_eq!(code, 0, "for {input:?}: {stdout:?}");
-        assert_eq!(stdout.trim_end(), want, "for {input:?}");
-    }
-
-    // Preserved by both tools: shortest rendering already matches source spelling.
-    for (input, want) in [
+    // Preserved by both tools. The first three already matched before #2438
+    // (`is_preservable_float_literal` keeps their source text); the fourth is
+    // #2438's own fix -- 20 significant digits exceed that predicate's cap,
+    // so it reaches `OwnedValue` with no literal left and used to answer
+    // `1e+19`.
+    let agreed = [
         ("outer:\n  big: 1.50\n", "1.50"),
         ("outer:\n  big: 1e3\n", "1e3"),
         ("outer:\n  big: 0.1\n", "0.1"),
-    ] {
-        let (stdout, code) = run_yq_stdin(".outer.big | tostring", input, &["-r"])?;
-        assert_eq!(code, 0, "for {input:?}: {stdout:?}");
-        assert_eq!(stdout.trim_end(), want, "for {input:?}");
-    }
-
-    // Path-context bridge route: matches real yq on the `.0`-suffixed case,
-    // but prints a third spelling (`...0.0` instead of real yq's bare
-    // integer `...0`) on the integer-looking case.
-    for (input, want) in [
         (
             "outer:\n  big: 10000000000000000000.0\n",
             "10000000000000000000.0",
         ),
-        (
-            "outer:\n  big: 100000000000000000000\n",
-            "100000000000000000000.0",
-        ),
-    ] {
+    ];
+    // Still divergent: an integer-shaped overflow scalar has no decimal
+    // point of its own to keep, and the spelling #2438 bakes in is the one
+    // real yq itself uses on `-o json` for the same value
+    // (`100000000000000000000.0`), so the `.0` real yq drops on YAML-side
+    // `tostring` cannot come back off here.
+    let divergent = [(
+        "outer:\n  big: 100000000000000000000\n",
+        "100000000000000000000.0",
+    )];
+
+    for (input, want) in agreed.iter().chain(divergent.iter()) {
+        // Value route.
+        let (stdout, code) = run_yq_stdin(".outer.big | tostring", input, &["-r"])?;
+        assert_eq!(code, 0, "for {input:?}: {stdout:?}");
+        assert_eq!(stdout.trim_end(), *want, "value route, for {input:?}");
+
+        // Path-context bridge route -- same answer as the value route now.
         let (stdout, code) = run_yq_stdin(".outer.big | parent | .big | tostring", input, &["-r"])?;
         assert_eq!(code, 0, "for {input:?}: {stdout:?}");
-        assert_eq!(stdout.trim_end(), want, "for {input:?}");
+        assert_eq!(stdout.trim_end(), *want, "bridge route, for {input:?}");
     }
 
     Ok(())
@@ -11561,6 +11567,84 @@ fn test_computed_float_scientific_notation_yaml_output_997() -> Result<()> {
     let (out, code) = run_yq_stdin(r#"{"a": (.a * 1e100)}"#, "a: 1\n", &[])?;
     assert_eq!(code, 0);
     assert_eq!(out.trim(), "a: 1e+100");
+    Ok(())
+}
+
+/// #2438: `[...]`/`,` used to spell a computed float above yq's
+/// scientific-notation threshold as a full decimal expansion -- `[.a * 1e100]`
+/// printed a 101-digit number where the same value printed `1e+100` bare
+/// (#997 above) or inside an object. Two definitions of the threshold rule:
+/// the emitters' (`format_float_yq`/`format_float_yq_yaml_nested`) and the
+/// reindex bridge's unconditional `format_float_with_fraction` fallback,
+/// which `yq_float_fidelity_fixup`'s round trip baked into synthesized
+/// literal text that the emitters then echoed verbatim.
+///
+/// Every row captured live from yq v4.53.3 on `a: 1`:
+///
+/// ```console
+/// $ yq '[.a * 1e100]' a.yaml      => - 1e+100
+/// $ yq '[.a * 1e15]'  a.yaml      => - 1e+15
+/// $ yq '[.a * 1e16]'  a.yaml      => - 1e+16
+/// $ yq '[.a * 1e21]'  a.yaml      => - 1e+21
+/// $ yq '[.a / 100000]' a.yaml     => - 1e-05
+/// $ yq '[.a * 1000000]' a.yaml    => - 1000000
+/// $ yq '[.a / 3]' a.yaml          => - 0.3333333333333333
+/// $ yq '(.a * 1e100), 1' a.yaml   => 1e+100 / 1
+/// ```
+///
+/// `[.a * 1000000]` is the deliberate control: `1000000` is an *int* literal
+/// in yq, so that row never becomes a float at all and must stay `1000000`
+/// rather than picking up `1e+06` from the threshold. `[.a / 3]` is the
+/// ordinary-magnitude control, and `(.a * 1e100), 1` is the `Expr::Comma`
+/// arm the issue asked to check alongside `Expr::Array`.
+#[test]
+fn test_computed_float_threshold_agrees_inside_array_and_comma_2438() -> Result<()> {
+    for (filter, want_yaml, want_json) in [
+        ("[.a * 1e100]", "- 1e+100", "[1e+100]"),
+        ("[.a * 1e15]", "- 1e+15", "[1e+15]"),
+        ("[.a * 1e16]", "- 1e+16", "[1e+16]"),
+        ("[.a * 1e21]", "- 1e+21", "[1e+21]"),
+        ("[.a / 100000]", "- 1e-05", "[1e-05]"),
+        ("[.a * 1000000]", "- 1000000", "[1000000]"),
+        ("[.a / 3]", "- 0.3333333333333333", "[0.3333333333333333]"),
+        ("(.a * 1e100), 1", "1e+100\n1", "1e+100\n1"),
+    ] {
+        let (out, code) = run_yq_stdin(filter, "a: 1\n", &[])?;
+        assert_eq!(code, 0, "yaml output for {filter:?}: {out:?}");
+        assert_eq!(out.trim_end(), want_yaml, "yaml output for {filter:?}");
+
+        let (out, code) = run_yq_stdin(filter, "a: 1\n", &["-o", "json", "-I0"])?;
+        assert_eq!(code, 0, "json output for {filter:?}: {out:?}");
+        assert_eq!(out.trim_end(), want_json, "json output for {filter:?}");
+    }
+    Ok(())
+}
+
+/// #2438: jq mode must be untouched by the yq-side threshold work -- its own
+/// `to_json_for_reindex` fallback (`jq_bare_float_display`) is `S`-gated
+/// away from `format_float_yq` and stays that way.
+///
+/// This pins the *pre-existing* jq-mode divergence rather than a fix: real
+/// jq 1.7.1 prints `1e+100` here, succinctly prints the full expansion, and
+/// it does so identically for the bare filter and the array-wrapped one --
+/// i.e. the gap is jq mode's own number formatting, not the reindex bridge,
+/// so #2438 neither widens nor closes it. Captured live on `{"a":1}`:
+///
+/// ```console
+/// $ /usr/bin/jq -c '[.a * 1e100]' a.json   => [1e+100]
+/// $ /usr/bin/jq -c '.a * 1e100'   a.json   => 1e+100
+/// ```
+#[test]
+fn test_jq_mode_float_threshold_unchanged_by_2438() -> Result<()> {
+    let expansion = format!("1{}", "0".repeat(100));
+    for (filter, want) in [
+        ("[.a * 1e100]", format!("[{expansion}]")),
+        (".a * 1e100", expansion.clone()),
+    ] {
+        let (out, code) = run_jq_stdin(filter, "{\"a\":1}\n", &["-c"])?;
+        assert_eq!(code, 0, "for {filter:?}: {out:?}");
+        assert_eq!(out.trim_end(), want, "for {filter:?}");
+    }
     Ok(())
 }
 
@@ -17831,28 +17915,42 @@ fn test_yq_comma_multiple_overflow_fields_all_fixed_1168() -> Result<()> {
     Ok(())
 }
 
-/// #1168 review round: `yq_float_fidelity_fixup` first tried scoping itself
-/// to only a direct cursor result (`OneCursor`/`ManyCursor`), leaving an
-/// already-constructed value (`Owned`/`ManyOwned`) untouched on the theory
-/// that it can't be a document literal. That theory was wrong -- code review
-/// found `Builtin::ToEntries` (and any other builtin with its own native
-/// construction around a document value) *also* reaches `Expr::Array` as
-/// `Owned`, so the narrower scoping silently regressed #953 for exactly
-/// that shape (`[to_entries]` on an overflow field, see
-/// `test_yq_array_wrapped_to_entries_overflow_int_keeps_decimal_point_1168`
-/// below) while it was trying to avoid over-forcing a genuinely computed
-/// float like this one. Since a `GenericResult` variant can't distinguish
-/// "builtin construction around a document value" from "genuinely computed"
-/// once a value has passed through even one further construction step, the
-/// fixup now applies uniformly to the whole constructed result -- accepting
-/// this known, pre-existing-class gap (same shape as #1124/#1144's `join`
-/// gap) as the trade-off: a bare computed float wrapped directly in
-/// `[...]`/`,` also gets its decimal point forced, when real yq would keep
-/// scientific notation. Pinned here so a future attempt to "fix" this case
-/// re-checks it doesn't reintroduce the `to_entries` regression instead.
+/// #2438 closes what #1168 pinned here as a known gap: a bare *computed*
+/// float wrapped directly in `[...]`/`,` used to get its decimal point
+/// forced by `yq_float_fidelity_fixup`'s round trip, where real yq keeps
+/// scientific notation.
+///
+/// #1168's reasoning for accepting that -- a `GenericResult` variant can't
+/// tell "builtin construction around a document value" (`[to_entries]` on an
+/// overflow field, `test_yq_array_comma_wrapped_to_entries_overflow_int_keeps_decimal_point_1168`)
+/// apart from "genuinely computed" -- was correct as far as it went, and the
+/// two really are the same `f64` by the time the fixup sees them. #2438's
+/// fix moves the distinction *upstream* of the fixup instead, to the one
+/// boundary that still knows it: `OwnedValue::from_document_float`, applied
+/// where a document scalar with no preservable literal becomes an
+/// `OwnedValue` (`to_owned_at_depth`, `ResolvedScalar::to_owned_value`).
+/// The bridge is then free to apply yq's own magnitude threshold
+/// (`format_float_yq`) to everything else, which is what makes this row and
+/// the `to_entries` row above both correct at the same time.
+///
+/// Both oracle-captured from yq v4.53.3, same magnitude, opposite answers:
+///
+/// ```console
+/// $ printf 'null\n' | yq -o=json -I=0 '[1e20 * 1]'
+/// [1e+20]
+/// $ printf 'a: 99999999999999999999\n' | yq -o=json -I=0 '[.a]'
+/// [100000000000000000000.0]
+/// ```
 #[test]
-fn test_yq_array_wrapped_computed_float_forces_decimal_known_gap_1168() -> Result<()> {
+fn test_yq_array_wrapped_computed_float_keeps_scientific_notation_2438() -> Result<()> {
     let (stdout, code) = run_yq_stdin("[1e20 * 1]", "null\n", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "[1e+20]");
+
+    // The document-sourced value of the identical magnitude still keeps the
+    // decimal spelling real yq gives it (#953) -- the pair is the whole
+    // point, so they are pinned together rather than in separate tests.
+    let (stdout, code) = run_yq_stdin("[.a]", "a: 99999999999999999999\n", &["-o", "json", "-I0"])?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim_end(), "[100000000000000000000.0]");
     Ok(())
