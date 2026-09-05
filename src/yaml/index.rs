@@ -548,6 +548,27 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         Some(YamlCursor::new(self, text, *target_bp_pos))
     }
 
+    /// Test-only: repoint the alias at `alias_bp_pos` at `target_bp_pos`,
+    /// bypassing every check the parser applies.
+    ///
+    /// `YamlIndex::build` can no longer produce an alias whose target is
+    /// itself an alias -- `&anchor *alias` was the only spelling that did,
+    /// and #1374 rejects it at parse time -- so the multi-hop and
+    /// depth-ceiling paths of `YamlCursor::resolve_alias_chain` and
+    /// `resolve_alias_target_cursor` (kept as defense in depth against
+    /// exactly such a hand-built index) are reachable only through an index
+    /// rewired like this. Pointing an alias at *itself* yields an unbounded
+    /// chain in one node, which is how the ceiling tests reach
+    /// `MAX_ALIAS_CHAIN_DEPTH` without building 65,537 nodes.
+    #[cfg(test)]
+    pub(crate) fn rewire_alias_target(&mut self, alias_bp_pos: usize, target_bp_pos: usize) {
+        debug_assert!(
+            self.aliases.contains_key(&alias_bp_pos),
+            "not an alias node"
+        );
+        self.aliases.insert(alias_bp_pos, target_bp_pos);
+    }
+
     /// Reject documents whose aliases would make an anchored value contain
     /// itself (issue #153: unbounded recursion when materializing).
     ///
@@ -1421,6 +1442,27 @@ mod tests {
         expect_alias_cycle("a: &anchor\n  self: *anchor", "anchor", "*anchor");
     }
 
+    /// Assert that `yaml` is rejected with `PropertyOnAlias` naming
+    /// `expected_name` at the byte offset of `alias_text` within `yaml`
+    /// (#1374). `expect_err` + `assert_eq!` on the whole error value rather
+    /// than `expect_alias_cycle`'s `let Err(..) else { panic!() }` / `other
+    /// => panic!()` shape: those two arms can never execute in a passing
+    /// test, so each caller written that way adds two permanently
+    /// uncovered lines (the shape this helper replaced was flagged for
+    /// exactly that).
+    fn expect_property_on_alias(yaml: &str, expected_name: &str, alias_text: &str) {
+        let expected_offset = yaml.find(alias_text).expect("alias text present in input");
+        let err = YamlIndex::build(yaml.as_bytes())
+            .expect_err("anchor-on-alias must be rejected at build time");
+        assert_eq!(
+            err,
+            YamlError::PropertyOnAlias {
+                offset: expected_offset,
+                name: expected_name.to_string(),
+            }
+        );
+    }
+
     /// `&x *x` is anchor-on-alias (#1374, invalid YAML -- an alias node
     /// carries no properties of its own) as well as a would-be self-cycle;
     /// the property check in `parse_alias` rejects it before the cycle
@@ -1430,18 +1472,7 @@ mod tests {
     /// structure rather than decorating the alias itself.
     #[test]
     fn test_build_rejects_direct_self_alias() {
-        let yaml = "a: &x *x";
-        let expected_offset = yaml.find("*x").expect("alias text present in input");
-        let Err(err) = YamlIndex::build(yaml.as_bytes()) else {
-            panic!("anchor-on-alias must be rejected at build time");
-        };
-        match err {
-            YamlError::PropertyOnAlias { offset, name } => {
-                assert_eq!(name, "x");
-                assert_eq!(offset, expected_offset);
-            }
-            other => panic!("expected PropertyOnAlias, got {other:?}"),
-        }
+        expect_property_on_alias("a: &x *x", "x", "*x");
     }
 
     /// Same shape as `test_build_rejects_direct_self_alias` but with the
@@ -1450,18 +1481,7 @@ mod tests {
     /// arm (#1374) rather than the value-position one.
     #[test]
     fn test_build_rejects_document_root_self_alias() {
-        let yaml = "&x *x";
-        let expected_offset = yaml.find("*x").expect("alias text present in input");
-        let Err(err) = YamlIndex::build(yaml.as_bytes()) else {
-            panic!("anchor-on-alias must be rejected at build time");
-        };
-        match err {
-            YamlError::PropertyOnAlias { offset, name } => {
-                assert_eq!(name, "x");
-                assert_eq!(offset, expected_offset);
-            }
-            other => panic!("expected PropertyOnAlias, got {other:?}"),
-        }
+        expect_property_on_alias("&x *x", "x", "*x");
     }
 
     #[test]
