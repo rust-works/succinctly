@@ -205,6 +205,7 @@ pub fn has_fast_bmi2() -> bool {
     }
 }
 
+// omni-dev: coverage tolerate reason="CPU-gated: the avx512f early-return only executes on Zen 4+ / Skylake-X runners, and its absence changes which AMD/Intel branch below executes too (#2449)"
 #[cfg(all(target_arch = "x86_64", any(feature = "std", test)))]
 fn detect_fast_bmi2() -> bool {
     // First check if BMI2 is supported at all
@@ -254,6 +255,7 @@ fn detect_fast_bmi2() -> bool {
     // Family 0x1A = Zen 5+ (fast BMI2)
     family >= 0x19
 }
+// omni-dev: coverage end
 
 #[cfg(all(test, target_arch = "x86_64"))]
 mod tests {

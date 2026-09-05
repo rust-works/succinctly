@@ -35,10 +35,17 @@ diff:
   #     they are deterministic on the runner fleet, not CPU-conditional noise.
   #
   #   src/util/simd/x86.rs
-  #     Has an `avx512f` arm (the `has_fast_bmi2` early return), so it flaps by
-  #     the same mechanism — but only by ~1-2 lines in a large file, below the
-  #     threshold that surfaces the "also moved" note. Excluding the whole file
-  #     would hide far more real coverage than noise.
+  #     Has an `avx512f` arm inside `detect_fast_bmi2` (the `has_fast_bmi2`
+  #     early return) that flaps by the same runtime-CPU-detection mechanism —
+  #     10 lines flip, net 9 covered lines, depending on whether the runner
+  #     draws a host with avx512f (#2449; this paragraph previously
+  #     understated the flap as "~1-2 lines"). Rather than excluding the whole
+  #     ~230-line file, the flapping region is wrapped in a
+  #     `// omni-dev: coverage tolerate` marker directly in
+  #     src/util/simd/x86.rs (requires omni-dev >= 0.43.0, see the version pin
+  #     comment in ci.yml; rust-works/omni-dev#1593, succinctly#2467): the file
+  #     keeps contributing its real coverage to the total, and only the
+  #     CPU-gated delta is masked.
   #
   # Keep this list to files with *observed* flap: an entry here removes the file
   # from the reported total as well, so over-excluding quietly shrinks what the
