@@ -36,10 +36,11 @@ use super::document::{
 };
 use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, binary_fanout_rules, bind_def, bind_def_call,
-    cannot_reserve_cross_product, classify_limit_n, classify_nth_n, classify_parent_n,
-    collapse_vec, collect_pattern_var_names, compare_values, debug_assert_materialization_error,
-    enter_def_call_frame, eval_each_owned, eval_foreach_with_values, eval_full as full_eval,
-    eval_reduce_with_values, extract_pattern_bindings, fold_escaped_generator_prefix, format_owned,
+    boolean_fanout_bools, cannot_reserve_cross_product, classify_limit_n, classify_nth_n,
+    classify_parent_n, collapse_vec, collect_pattern_var_names, compare_values,
+    debug_assert_materialization_error, enter_def_call_frame, eval_each_owned,
+    eval_foreach_with_values, eval_full as full_eval, eval_reduce_with_values,
+    extract_pattern_bindings, fold_escaped_generator_prefix, format_owned,
     has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
     index_one_owned as index_owned_by_key, is_pure_chain_link, is_retryable_stop, literal_to_owned,
     needs_path_context, numeric_key_to_array_index, numeric_key_to_index, owned_bound_to_i64,
@@ -6226,6 +6227,28 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             collect_each_generic::<S, V>(expr, value, optional, cursor)
         }
 
+        // Spine 2416 gate reason 3 (#2473): `and`/`or` with a path-context
+        // operand, through `eval_boolean_generic` -- `eval::boolean_fanout_bools`
+        // with `eval_single` *plus the cursor* as the operand strategy. Without
+        // this arm `.[] | key == "a" and true` fell to the wildcard bridge
+        // below, which materializes the ambient value and hands the eager
+        // evaluator a document re-rooted at this stage's input.
+        //
+        // **Gated on `needs_path_context`, for the same reason the
+        // `Expr::Arithmetic` arm above is** (and the `Expr::Compare` arm is
+        // not): the bridge's ambient materialization is what makes
+        // `try (1+1) catch "x"` fail on a #1194-malformed document, and
+        // `test_try_catch_contains_a_genuinely_catchable_malformed_key_error_1812`
+        // pins that. An `and`/`or` that reads no path context stays on the
+        // bridge and keeps paying the decode; one that does could not have
+        // stood on a malformed document's root and survived the walk anyway.
+        Expr::And(left, right) if needs_path_context(left) || needs_path_context(right) => {
+            eval_boolean_generic::<S, V>(left, right, false, value, optional, cursor)
+        }
+        Expr::Or(left, right) if needs_path_context(left) || needs_path_context(right) => {
+            eval_boolean_generic::<S, V>(left, right, true, value, optional, cursor)
+        }
+
         // Array construction: collect every output of the inner expression
         // into one array. Handled natively (mirrors `eval::eval_array_construction`)
         // so a builtin with its own cursor-native, duplicate-key-preserving fix
@@ -8908,6 +8931,51 @@ fn eval_compare_generic<S: EvalSemantics, V: DocumentValue>(
         Flow::Escaped(control) => Some(control),
     };
     finish_fork_generic(out, control.or(stray), optional)
+}
+
+/// `and`/`or` with the cursor threaded into both operands (spine 2416 gate
+/// reason 3, #2473) -- the boolean twin of [`eval_compare_generic`] above.
+///
+/// The loop itself is `eval::boolean_fanout_bools`, shared with the eager
+/// route rather than copied, so #2460's zero-output-operand rule and #2470's
+/// read-only operand scope have one definition across both. What this adds is
+/// the operand strategy: `eval_single` *with* `cursor`, so `.[] | key == "a"
+/// and true` reads each element's own key instead of being handed a `null`
+/// by the eager bridge.
+///
+/// `short_circuit` is the truth value that ends the pairing -- `false` for
+/// `and`, `true` for `or` -- exactly as `eval::eval_and`/`eval::eval_or`
+/// pass it.
+fn eval_boolean_generic<S: EvalSemantics, V: DocumentValue>(
+    left: &Expr,
+    right: &Expr,
+    short_circuit: bool,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+) -> GenericResult<V> {
+    let (bools, control) = boolean_fanout_bools(
+        |operand, out| {
+            push_generic_truthiness(
+                eval_single::<S, V>(operand, value.clone(), optional, cursor),
+                out,
+            )
+        },
+        left,
+        right,
+        short_circuit,
+        binary_fanout_rules::<S>(EmptyOperandOp::Boolean),
+    );
+    let outputs: Vec<OwnedValue> = bools.into_iter().map(OwnedValue::Bool).collect();
+    // `partial_generic`/`owned_vec_to_generic_result`, not
+    // `finish_fork_generic`: `eval::boolean_fanout_core` never consults
+    // `optional` for its own trailing control either (an ambient `?` catches
+    // the aggregate once, at `Expr::Optional`'s arm), and the two routes have
+    // to agree on that as much as on the loop.
+    match control {
+        Some(control) => partial_generic(outputs, control),
+        None => owned_vec_to_generic_result(outputs),
+    }
 }
 
 /// Shared resolution of [`each_take_first_generic`]'s and
@@ -12580,6 +12648,16 @@ fn path_context_single_native(expr: &Expr) -> bool {
         // ambient decode `try (1+1) catch "x"` depends on for a malformed
         // document, which the arm's own `needs_path_context` gate preserves.
         Expr::Arithmetic { left, right, .. } => {
+            path_context_single_native(left) && path_context_single_native(right)
+        }
+        // Native since spine 2416 gate reason 3 (#2473): `eval_single`'s own
+        // `Expr::And`/`Expr::Or` arms, above, over `eval_boolean_generic`.
+        // Same `needs_path_context` gate and same reason as `Expr::Arithmetic`
+        // just above, and the loop those arms run is `eval::boolean_fanout_bools`,
+        // so #2460's rule for an operand that produces zero outputs -- `key and
+        // true` at the document root is `false` in real yq, not nothing -- is
+        // the same definition on this route as on the eager one.
+        Expr::And(left, right) | Expr::Or(left, right) => {
             path_context_single_native(left) && path_context_single_native(right)
         }
         Expr::Try { expr, catch } => {
@@ -24863,7 +24941,19 @@ mod tests {
         assert!(!eager(".[] | if key == \"a\" then . else empty end"));
         assert!(!eager(".[] | limit(1; .[] | key)"));
         assert!(eager(".[] | limit(1 + 0; key)"), "computed n");
-        assert!(eager(".[] | select(key == \"a\" and true)"));
+        // Native since spine 2416 gate reason 3 (#2473): `and`/`or` have
+        // `eval_single` arms of their own now, so a path-context operand
+        // reads the cursor on the non-sink route too. `select(...)`'s own
+        // condition is single-evaluated, so it follows.
+        assert!(!eager(".[] | select(key == \"a\" and true)"));
+        assert!(!eager(".[] | key == \"a\" and true"));
+        assert!(!eager(".[] | (key == \"a\") or false"));
+        assert!(!eager(".[] | key and parent"));
+        assert!(!eager(".[] | {\"k\": (key and true)}"));
+        // ...and an operand that is not itself single-native still keeps the
+        // whole pipe on the eager route, the same closed-list discipline
+        // every other arm follows.
+        assert!(eager(".[] | (key | tostring) and true"));
         assert!(eager(".[] | parent(1 + 0)"));
         // A nested pipe that would itself fall to the eager evaluator from a
         // re-rooted input keeps the outer pipe eager too.

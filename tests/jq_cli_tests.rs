@@ -7522,6 +7522,88 @@ fn test_shared_keeps_path_context_2416() -> Result<()> {
     Ok(())
 }
 
+/// Spine 2416 gate reason 3 (#2473): `and`/`or` with a path-context operand
+/// are native in `eval_single` (`eval_boolean_generic` over
+/// `eval::boolean_fanout_bools`), so the non-sink route threads the cursor
+/// into both operands instead of handing the eager bridge a `null`.
+///
+/// No jq oracle: `key`/`parent`/`path` are succinctly extensions jq 1.7.1
+/// rejects at compile time (`key/0 is not defined`). Every row below is the
+/// yq-captured answer where yq has one (see the yq-mode twin,
+/// `test_and_or_keep_path_context_2473` in `tests/yq_cli_tests.rs`) and the
+/// pinned extension answer otherwise.
+///
+/// **Two rows moved**, both toward jq's own generator semantics. `key` at the
+/// document root emits *nothing* (ADR-0021 decision 2), and jq's `empty and
+/// true` is nothing, not `false` (verified live against jq 1.7.1). The eager
+/// bridge used to answer `false` for `key and true` and `true` for
+/// `parent and true` there, from a stub with no position; the native arm
+/// answers with jq's own zero-output rule. yq mode keeps `false` for both,
+/// which is what real yq prints -- #2460's empty-operand rule, consulted from
+/// the one definition both routes share.
+#[test]
+fn test_and_or_keep_path_context_2473() -> Result<()> {
+    let doc = r#"{"a":1,"b":2}"#;
+    for (filter, want) in [
+        (".[] | key == \"a\" and true", "true\nfalse"),
+        (".[] | (key == \"b\") or false", "false\ntrue"),
+        (".[] | key and true", "true\ntrue"),
+        (".[] | select(key == \"a\" and . == 1)", "1"),
+        // #1332's object gap seen through `and`: the value expression is
+        // single-evaluated, so the native arm reaches it with the cursor.
+        // The eager bridge answered `{"k":false}` twice.
+        (
+            ".[] | {\"k\": (key and true)}",
+            "{\"k\":true}\n{\"k\":true}",
+        ),
+        (
+            ".[] | [key, (key == \"a\" and true)]",
+            "[\"a\",true]\n[\"b\",false]",
+        ),
+        (".a | key and parent", "true"),
+        // A `key` at the root produces no outputs, and jq's `and`/`or` have
+        // no empty-operand rule, so the whole expression produces none.
+        ("key and true", ""),
+        ("key or false", ""),
+        ("parent and true", ""),
+    ] {
+        let (out, _, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "`{filter}`: {out:?}");
+        assert_eq!(out.trim(), want, "`{filter}`");
+    }
+    Ok(())
+}
+
+/// Spine 2416 gate reason 3 (#2473) companion: the `and`/`or` arms are gated
+/// on `needs_path_context`, exactly like `Expr::Arithmetic`'s (#2475), so an
+/// `and`/`or` that reads no path context still takes the eager bridge and
+/// still pays its ambient decode on a #1194-malformed document.
+///
+/// `try (key and true) catch "x"` exits 0 with no output on the native route,
+/// which is not a regression this arm introduces: `try (key + 1) catch "x"`
+/// and `try (key == 1) catch "x"` already did, from the `Expr::Arithmetic`
+/// and `Expr::Compare` arms. It is pinned here so the *difference* between a
+/// gated and an ungated arm stays visible, alongside
+/// `test_try_catch_contains_a_genuinely_catchable_malformed_key_error_1812`.
+#[test]
+fn test_and_or_without_path_context_still_pays_the_ambient_decode_2473() -> Result<()> {
+    let doc = "{123: 1}";
+    for filter in ["true and true", r#"try (true and true) catch "x""#] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 5, "`{filter}` stdout: {stdout:?} stderr: {stderr}");
+        assert!(stdout.trim().is_empty(), "`{filter}` stdout: {stdout:?}");
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "`{filter}` stderr: {stderr}"
+        );
+    }
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"try (key and true) catch "x""#], Some(doc))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr}");
+    assert!(stdout.trim().is_empty(), "stdout: {stdout:?}");
+    Ok(())
+}
+
 /// #2471 (gate reason 1 of spine 2416): a *computed* index or slice, and
 /// `getpath(p)`, are navigation inside the owned domain too, so a pipe that
 /// left the cursor domain earlier keeps its position through them instead of
