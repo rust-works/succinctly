@@ -13054,8 +13054,8 @@ fn test_resolve_limit_path_context_rejects_non_numeric_n() -> Result<()> {
 }
 
 /// #1850: `path(limit(n; .[]))` on a bare `.[]` now resolves via
-/// `resolve_iterate_bounded`'s `.take(n)`-bounded iterator instead of
-/// `resolve_node` + `take_path_branches`'s eager-materialize-then-truncate
+/// `resolve_iterate_sink`'s demand-driven emission instead of
+/// `resolve_node`'s eager-materialize-then-truncate
 /// pattern. Output must stay byte-identical for `n` under, at, and over the
 /// array's length -- the bound only changes how much work is done, never
 /// which branches are produced. Oracle-verified against jq 1.7.1.
@@ -13117,7 +13117,7 @@ fn test_path_limit_bare_iterate_through_parens_bounded_1850() -> Result<()> {
 /// fast path through `limit` must raise the same "near attempt to iterate"
 /// error the plain (non-`limit`) `Expr::Iterate` arm always has -- both call
 /// sites gate on `trackable` themselves before ever calling
-/// `resolve_iterate_bounded`, which has no such check of its own. Oracle-verified
+/// `resolve_iterate_sink`, which has no such check of its own. Oracle-verified
 /// against jq 1.7.1: the caught scalar `5` is the value named, not a
 /// `cannot_iterate_with` "Cannot iterate over number" message.
 #[test]
@@ -13137,7 +13137,7 @@ fn test_path_limit_bare_iterate_untrackable_value_still_near_attempt_error_1850(
 
 /// #1850 companion: a compound expression (`.[] | select(...)`) is not the
 /// bare `Expr::Iterate` shape the fast path targets, so it still takes the
-/// original eager `resolve_node` + `take_path_branches` route -- confirming
+/// original eager `resolve_node` route -- confirming
 /// the fast path's narrower scope doesn't regress the general case.
 #[test]
 fn test_path_limit_compound_iterate_still_correct_1850() -> Result<()> {
@@ -14319,7 +14319,7 @@ fn test_first_limit_path_undersatisfied_still_raises_972() -> Result<()> {
     Ok(())
 }
 
-/// #972 Guard E: `take_path_branches` drops `Halt` along with `Error`/
+/// #972 Guard E: a satisfied bound drops `Halt` along with `Error`/
 /// `Break` once the consumer is satisfied, matching jq
 /// (`path(first(select((true, ("m"|halt_error(3))))))` is `[]`, exit 0).
 /// The `m` payload still reaches stderr — the resolver underneath is still
@@ -14548,7 +14548,7 @@ fn test_resolve_slice_expr_keeps_target_partial_fanout_before_its_own_error_973(
 /// produced some values before escaping (`(0,error("b"))`) reset the whole
 /// prefix to empty instead of keeping what it had already produced --
 /// unlike `target`'s own escape (#973 above), which was already correctly
-/// kept. A short `Err` prefix under-satisfies `take_path_branches`' `>= n`
+/// kept. A short `Err` prefix under-satisfies the bounded consumer's `n`
 /// test, so `first`/`limit` in path position wrongly refused a filter real
 /// jq answers. Both bound axes covered, both verified live against jq
 /// 1.7.1: `start`'s own escape lets `end` (nested inside `start`'s first
@@ -14583,7 +14583,7 @@ fn test_resolve_slice_expr_keeps_bound_partial_fanout_before_its_own_error_1517(
 
     // The issue's own `first`/`limit` repros: previously raised `b` where
     // jq answers cleanly, since the (wrongly empty) prefix under-satisfied
-    // `take_path_branches`' `>= 1` test.
+    // the bounded consumer's `>= 1` test.
     let (stdout, stderr, code) = run_jq_full(
         &["-c", r#"path(limit(1; .[(0,error("b")):(2,3)]))"#],
         Some("[10,20,30]"),
@@ -14686,7 +14686,7 @@ fn test_eval_slice_expr_keeps_bound_partial_fanout_before_its_own_error_1528() -
 
 /// #1517 Guard A (the write-side twin of #972's own Guard A, this time on
 /// the bound axis instead of the key axis): the exact boundary that would
-/// silently over-satisfy `take_path_branches` if the fix above overshot
+/// silently over-satisfy the bounded consumer if the fix above overshot
 /// jq's real pre-escape count instead of matching it exactly. `limit(2; ...)`
 /// on the `start`-escape shape (real prefix length 2, per the test above) is
 /// fully satisfied and must write both; `limit(3; ...)` is still
@@ -15354,7 +15354,7 @@ fn test_path_repeat_tracks_through_trackable_body_1906() -> Result<()> {
 }
 
 /// Code review on PR #1933 (fixing #1906): an earlier version of
-/// `resolve_repeat_bounded` always propagated a later round's error, even
+/// `resolve_repeat_sink` always propagated a later round's error, even
 /// when `limit`'s own `n` was already satisfied by branches produced
 /// before it -- something real jq's own lazy `limit` never even reaches.
 /// Confirmed live against jq 1.7.1: exit 0, `[]`, no error at all.
@@ -15369,7 +15369,7 @@ fn test_path_repeat_error_dropped_once_limit_satisfied_1933() -> Result<()> {
     Ok(())
 }
 
-/// Code review on PR #1933: an earlier version of `resolve_repeat_bounded`
+/// Code review on PR #1933: an earlier version of `resolve_repeat_sink`
 /// had no per-branch budget at all, unlike `eval_repeat`'s value-mode
 /// sibling (`REPEAT_WIDTH_BUDGET`) -- letting a large `limit()`-
 /// supplied `n` combined with a wide-fanning-out body allocate far more
@@ -15423,7 +15423,7 @@ fn test_repeat_limit_n_above_1000_no_longer_truncates_2014() -> Result<()> {
 /// bound it, so it still runs `eval_repeat`'s original capped loop. #2014
 /// changed only how that cap fails on exhaustion: silent truncation to a
 /// short, successful result became a hard error, matching
-/// `resolve_repeat_bounded`'s (path-mode) existing convention instead of
+/// `resolve_repeat_sink`'s (path-mode) existing convention instead of
 /// returning wrong-but-plausible output with no diagnostic. Real jq hangs
 /// on all of these instead (no oracle answer to compare against, same as
 /// `repeat(empty)` above) -- see limitations.md's own writeup of this
@@ -15446,10 +15446,10 @@ fn test_repeat_eager_fallback_raises_instead_of_silently_truncating_2014() -> Re
     Ok(())
 }
 
-/// #1935: `first(f)` needs the same `resolve_node_bounded` dispatch #1906/
-/// #1850 gave `limit` -- `first(f)` is exactly `limit(1; f)` for
-/// path-tracking purposes, but was routing through the generic
-/// `take_path_branches(resolve_node(...), 1)` shape instead, which cannot
+/// #1935: `first(f)` needs the same bounded dispatch #1906/#1850 gave
+/// `limit` -- `first(f)` is exactly `limit(1; f)` for path-tracking
+/// purposes, but was routing through a generic
+/// resolve-everything-then-truncate shape instead, which cannot
 /// fast-path either `repeat` or `.[]` (an un-intercepted `Expr::Repeat`
 /// falls through to `resolve_leaf`'s general case, itself bounded by
 /// `eval_repeat`'s own 1000-round cap -- so it still returns, just slowly
@@ -15489,7 +15489,8 @@ fn test_path_first_repeat_tracks_through_trackable_body_1935() -> Result<()> {
 }
 
 /// #1935 (code review): the `Expr::Iterate` fast path (#1850) is the other
-/// half of `resolve_node_bounded`'s dispatch, reused by `first(f)` alongside
+/// half of the bounded dispatch (`resolve_bounded_sink` since #1952),
+/// reused by `first(f)` alongside
 /// `Expr::Repeat` -- covered separately from the `repeat`-focused test above
 /// since it went unpinned by any of this issue's own tests despite being
 /// live-verified during review. `path(limit(1; .[]))`'s already-established
@@ -15527,22 +15528,173 @@ fn test_path_first_iterate_uses_bounded_fast_path_1935() -> Result<()> {
     Ok(())
 }
 
-/// #1935: `nth(n; repeat(f))` is a documented, deliberately unfixed gap --
-/// `nth` has no `resolve_node` arm at all yet (a pre-existing gap
-/// independent of `repeat`), so `repeat`-specific interception there has
-/// nothing to extend. Pins the current (wrong) behavior as a known-gap
-/// regression guard rather than leaving it silently unverified.
+/// #1952: `nth(n; f)` now has a path-context arm, and it is the *same*
+/// bounded-consumer mechanism `limit`/`first` use ([`resolve_bounded_sink`]),
+/// not a third hand-copy of `Expr::Repeat`/`Expr::Iterate` interception --
+/// which is exactly what this issue was filed to prevent. Closes the
+/// "`nth` has no `resolve_node` arm at all" half of #1935's own known gap
+/// (the other half, a combinator-nested `repeat`, is
+/// `test_path_bounded_consumers_thread_through_combinators_1952` below).
+///
+/// jq 1.7.1 defines `nth($n; f)` as a `foreach`-counter that skips the first
+/// `$n` outputs, emits the next one and breaks -- so a generator with fewer
+/// than `$n + 1` outputs emits *nothing*, rather than falling back to its
+/// last. Captured live against `/usr/bin/jq` 1.7.1:
+///
+/// ```console
+/// $ echo '{"a":{"a":2}}' | jq -c 'path(nth(2; repeat(.a)))'
+/// ["a"]
+/// $ echo '{"a":1,"b":2}' | jq -c 'path(nth(0; .a,.b))'
+/// ["a"]
+/// $ echo '{"a":1,"b":2}' | jq -c 'path(nth(1; .a,.b))'
+/// ["b"]
+/// $ echo '{"a":1,"b":2}' | jq -c '[path(nth(5; .a,.b))]'
+/// []
+/// $ echo '{"a":1,"b":2}' | jq -c '[path(nth((0,1); .a,.b))]'
+/// [["a"],["b"]]
+/// $ echo '[1,2,3]' | jq -c 'path(nth(1; .[]))'
+/// [1]
+/// $ echo '{"a":1}' | jq -c 'path(nth(-1; .a))'
+/// jq: error (at <stdin>:1): nth doesn't support negative indices
+/// ```
 #[test]
-fn test_path_nth_repeat_known_gap_1935() -> Result<()> {
-    let (_, stderr, code) = run_jq_full(
+fn test_path_nth_tracks_like_limit_1952() -> Result<()> {
+    // `repeat` reached as `nth`'s direct child -- the shape #1935 pinned as
+    // a known gap, now answering jq's own value.
+    let (stdout, _, code) = run_jq_full(
         &["-c", "path(nth(2; repeat(.a)))"],
         Some("{\"a\":{\"a\":2}}"),
     )?;
-    assert_ne!(code, 0, "known gap: nth has no path-context support yet");
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[\"a\"]\n");
+
+    // An ordinary (non-`repeat`) generator: `nth` skips, it does not clamp.
+    for (n, expected) in [("0", "[\"a\"]\n"), ("1", "[\"b\"]\n")] {
+        let (stdout, _, code) = run_jq_full(
+            &["-c", &format!("path(nth({n}; .a,.b))")],
+            Some("{\"a\":1,\"b\":2}"),
+        )?;
+        assert_eq!(code, 0, "n={n}");
+        assert_eq!(stdout, expected, "n={n}");
+    }
+
+    // Fewer outputs than `n + 1`: nothing at all, not the last one.
+    let (stdout, _, code) =
+        run_jq_full(&["-c", "[path(nth(5; .a,.b))]"], Some("{\"a\":1,\"b\":2}"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[]\n");
+
+    // `n` is the outer loop, exactly as it is for `limit` (#1279).
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "[path(nth((0,1); .a,.b))]"],
+        Some("{\"a\":1,\"b\":2}"),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[[\"a\"],[\"b\"]]\n");
+
+    // `.[]` under `nth`, the other shape #1850 had to hand-copy for `limit`.
+    let (stdout, _, code) = run_jq_full(&["-c", "path(nth(1; .[]))"], Some("[1,2,3]"))?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "[1]\n");
+
+    // A negative index is jq's own error, not a silent index 0.
+    let (_, stderr, code) = run_jq_full(&["-c", "path(nth(-1; .a))"], Some("{\"a\":1}"))?;
+    assert_ne!(code, 0);
     assert!(
-        stderr.contains("Invalid path expression"),
+        stderr.contains("nth doesn't support negative indices"),
         "stderr: {stderr}"
     );
+    Ok(())
+}
+
+/// #1952: a bound now reaches a generator through arbitrary combinator
+/// nesting, because it is a sink answer (`Demand::Stop`) rather than a
+/// dispatch on the bounded consumer's *direct* child. The old
+/// `resolve_node_bounded` saw an `Expr::If` here and fell through to the
+/// generic, fully-materializing path, which reported "Invalid path
+/// expression" for every one of these.
+///
+/// Captured live against `/usr/bin/jq` 1.7.1:
+///
+/// ```console
+/// $ echo '{"a":1}' | jq -c 'path(limit(2; if true then repeat(.) else empty end))'
+/// []
+/// []
+/// $ echo '{"a":1}' | jq -c 'path(limit(2; try repeat(.) catch empty))'
+/// []
+/// []
+/// $ echo '[1,2,3]' | jq -c 'path(first(if true then .[] else empty end))'
+/// [0]
+/// $ echo '{"a":{"a":2}}' | jq -c 'path(first(. as $x | repeat(.a)))'
+/// ["a"]
+/// $ echo '{"a":1,"b":2}' | jq -c 'path(nth(1; if true then (.a,.b) else empty end))'
+/// ["b"]
+/// ```
+#[test]
+fn test_path_bounded_consumers_thread_through_combinators_1952() -> Result<()> {
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "path(limit(2; if true then repeat(.) else empty end))",
+            "{\"a\":1}",
+            "[]\n[]\n",
+        ),
+        (
+            "path(limit(2; try repeat(.) catch empty))",
+            "{\"a\":1}",
+            "[]\n[]\n",
+        ),
+        (
+            "path(first(if true then .[] else empty end))",
+            "[1,2,3]",
+            "[0]\n",
+        ),
+        (
+            "path(first(. as $x | repeat(.a)))",
+            "{\"a\":{\"a\":2}}",
+            "[\"a\"]\n",
+        ),
+        (
+            "path(nth(1; if true then (.a,.b) else empty end))",
+            "{\"a\":1,\"b\":2}",
+            "[\"b\"]\n",
+        ),
+    ];
+    for (query, input, expected) in cases {
+        let (stdout, stderr, code) = run_jq_full(&["-c", query], Some(input))?;
+        assert_eq!(code, 0, "query {query:?}, stderr: {stderr}");
+        assert_eq!(stdout, *expected, "query {query:?}");
+    }
+    Ok(())
+}
+
+/// #1952: an *unbounded* `path(repeat(f))` is the one shape whose answer
+/// this migration changes. It used to fall through to `resolve_leaf`, which
+/// evaluated `repeat` as an opaque value and reported "Invalid path
+/// expression with result ..."; it now resolves as a path like every other
+/// `repeat`, bounded only by the same `MAX_ITERATIONS = 1000` round cap
+/// `path(limit(n; repeat(f)))` has always had.
+///
+/// Real jq hangs here (it emits `[]` forever), so there is no oracle answer
+/// to match either way -- confirmed by running
+/// `echo '{"a":1}' | timeout 5 jq -c 'path(repeat(.))'`, which prints `[]`
+/// until the timeout kills it. The round cap is an already-documented
+/// divergence from that hang (`docs/compliance/jq/limitations.md`), and
+/// 1000 correct paths is the same answer `path(limit(1500; repeat(.)))`
+/// already gave; the old error was not.
+#[test]
+fn test_path_unbounded_repeat_hits_the_round_cap_1952() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "[path(repeat(.))] | length"], Some("{\"a\":1}"))?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "1000\n");
+
+    // The bounded shape the round cap has always governed is unchanged.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "[path(limit(1500; repeat(.)))] | length"],
+        Some("{\"a\":1}"),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "1000\n");
     Ok(())
 }
 
@@ -35519,7 +35671,7 @@ fn fold_source_bounded_generator_stays_bounded_1872() -> Result<()> {
 /// `resolve_node`'s own branches, which makes a *short* branch prefix a wrong
 /// answer rather than merely a wrong error message. Several arms below that
 /// call launder an `Err` into a truncated `Ok` -- `Expr::Optional`'s blanket
-/// arm, `Expr::Label` on a matching break, `take_path_branches` -- and none of
+/// arm, `Expr::Label` on a matching break, a satisfied bound -- and none of
 /// them is covered by the `Err(_)` fallback. Each case's value count is
 /// captured from jq 1.7.1.
 #[test]
@@ -35541,7 +35693,7 @@ fn fold_source_laundered_short_prefix_value_counts_1872() -> Result<()> {
             r#"{"a":1}"#,
             "[foreach (limit(2; 1,2,3), 9) as $k (0; .+$k)]",
             "[1,3,12]\n",
-            "take_path_branches truncates to its bound, not to one",
+            "a bounded consumer truncates to its bound, not to one",
         ),
     ] {
         let (stdout, _stderr, code) = run_jq_full(&["-c", filter], Some(input))?;

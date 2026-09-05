@@ -3194,7 +3194,7 @@ case above).
 
 **Path mode is unchanged and still has the original bug.**
 [#2014](https://github.com/rust-works/succinctly/issues/2014) only touched
-value mode's two evaluators; `resolve_repeat_bounded` (path mode, the
+value mode's two evaluators; `resolve_repeat_sink` (path mode, the
 `path(repeat(f))`/`path(limit(n; repeat(f)))` route added by
 [#1906](https://github.com/rust-works/succinctly/issues/1906)) still runs
 its own flat `MAX_ITERATIONS = 1000` round cap regardless of the wrapping
@@ -3208,7 +3208,7 @@ $ succinctly jq -cn 'path(limit(1500; repeat(.))) | length' # counts output line
 This is the same bug value mode had before #2014, now isolated to path mode
 alone -- left open rather than fixed here since #2014's own scope and
 verification are both about value mode; a follow-up applying the identical
-demand-driven treatment to `resolve_repeat_bounded` would close this the
+demand-driven treatment to `resolve_repeat_sink` would close this the
 same way.
 
 ### `reduce`/`foreach`'s own step budget (#695/#2079): bounds genuine fanout, not ordinary element count
@@ -3412,44 +3412,6 @@ Tracked as [#2152](https://github.com/rust-works/succinctly/issues/2152)
 (array/object accumulation) and noted here rather than filing a third,
 narrower until/while-COND-specific issue for what is the same underlying
 "which `Expr` shapes does `eval_owned_fast_path` cover" question.
-
-### `path(repeat(f))` tracking (#1906/#1935) only reaches `limit`/`first`'s *direct* child, not `nth` or a combinator-nested `repeat`
-
-[#1906](https://github.com/rust-works/succinctly/issues/1906)/PR #1933 added `Expr::Repeat`
-interception for `path(limit(n; repeat(f)))` (`resolve_limit_one_n`);
-[#1935](https://github.com/rust-works/succinctly/issues/1935) extended the identical
-interception to `path(first(repeat(f)))` (`first(f)` being `limit(1; f)` for this purpose).
-Both fixes only fire when `Expr::Repeat` is the *direct* (paren-unwrapped) child of the
-bounded consumer's own body expression:
-
-```console
-$ echo '{"a":{"a":2}}' | jq -c 'path(nth(2; repeat(.a)))'
-["a"]
-$ echo '{"a":{"a":2}}' | succinctly jq -c 'path(nth(2; repeat(.a)))'
-jq: error (at <stdin>:1): Invalid path expression with result {"a":2}
-
-$ echo '{"a":1}' | jq -c 'path(limit(2; if true then repeat(.) else 1 end))'
-[]
-[]
-$ echo '{"a":1}' | succinctly jq -c 'path(limit(2; if true then repeat(.) else 1 end))'
-jq: error (at <stdin>:1): Invalid path expression with result {"a":1}
-```
-
-`nth(n; f)` (`Builtin::NthStream`) has no `resolve_node` arm at all today -- a pre-existing
-gap independent of `repeat` (`path(nth(1; .a,.b))` on an ordinary, non-`repeat` generator
-already diverges the same way). Extending `repeat`-specific interception to `nth` has
-nothing to attach to until `nth` has *any* path-context support to extend. `Expr::If`/
-`Expr::Alternative`/(likely) `Expr::Comma` all recurse into `resolve_node` directly on
-their branches rather than through a bounded consumer, so a `repeat` reached only after
-passing through one of these has no way to know, at that point, how many outputs will
-actually be needed -- closing this generally would need a bound threaded *through*
-arbitrary combinator nesting before ever calling `resolve_node` on the `repeat` itself,
-which its current single `(expr, value, trackable, snapshot) -> Vec<PathBranch>` signature
-has no parameter for. Tracked as its own standalone design question in
-[#1952](https://github.com/rust-works/succinctly/issues/1952) (a general sink/early-stop
-protocol for `resolve_node`, the same shape `eval_each_owned` already gives value-mode
-evaluation) rather than attempted here; the narrow `first`/`limit` fixes already close
-the two shapes named in #1906/#1935's own repros.
 
 ### A generator-argument expression used to fan out normally, then silently narrow to a single array the moment `key`/`parent`/`file_index` showed up anywhere else in the same pipe -- fixed for 3 of 4 sites
 
