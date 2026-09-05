@@ -6,6 +6,9 @@
 use anyhow::{Context, Result};
 use indexmap::IndexMap;
 use std::cell::Cell;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::Path;
 
@@ -21,7 +24,8 @@ use succinctly::jq::eval_generic::{
 use succinctly::jq::stream::StreamFailure;
 use succinctly::jq::{
     self, assert_value_tree_depth, nesting_depth_exceeded_message, nonfinite_display_string,
-    sync_aliased_paths, Builtin, EvalError, Expr, NumberRepr, OwnedValue, QueryResult, YqSemantics,
+    sync_aliased_paths, Builtin, EvalError, Expr, NumberRepr, ObjectKey, OwnedValue, QueryResult,
+    YqSemantics,
 };
 use succinctly::json::light::JsonCursor;
 use succinctly::json::JsonIndex;
@@ -1873,6 +1877,11 @@ enum WriteKind {
 struct WriteTarget {
     path: Vec<PathStep>,
     kind: WriteKind,
+    /// The written value is a closed literal — it reads nothing from the
+    /// document, so every node it produces is freshly constructed and can
+    /// have inherited no presentation from anything. See
+    /// [`is_closed_literal`].
+    fresh: bool,
 }
 
 /// Collect the [`PathStep`]s of a *static* navigation chain, returning
@@ -1908,6 +1917,37 @@ fn static_path_steps(expr: &Expr, out: &mut Vec<PathStep>) -> bool {
     }
 }
 
+/// Whether `expr` produces a value that reads nothing from the document, so
+/// every node in it is freshly constructed (#870).
+///
+/// Real yq carries presentation on node identity: `.o = {"a": "1"}` drops
+/// `a`'s old comment because the `"1"` in the filter is a *new* scalar node,
+/// while `.o = {"a": .o.a}` keeps it because that one is the original node
+/// arriving by a different route (both verified against yq v4.53.3).
+/// Provable closedness is the half of that distinction reachable without a
+/// shared-node value model (#1351).
+///
+/// Deliberately one-directional: `true` means "certainly constructed", and
+/// anything not on this list answers `false` even when it happens to be
+/// closed. A false `true` would *discard* presentation the document really
+/// owns, so the burden of proof sits on the destructive answer.
+fn is_closed_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) => true,
+        Expr::Array(inner) | Expr::Paren(inner) | Expr::Negate(inner) => is_closed_literal(inner),
+        Expr::Comma(parts) => parts.iter().all(is_closed_literal),
+        Expr::Arithmetic { left, right, .. } => is_closed_literal(left) && is_closed_literal(right),
+        Expr::Object(entries) => entries.iter().all(|e| {
+            let key_closed = match &e.key {
+                ObjectKey::Literal(_) => true,
+                ObjectKey::Expr(k) => is_closed_literal(k),
+            };
+            key_closed && is_closed_literal(&e.value)
+        }),
+        _ => false,
+    }
+}
+
 /// Resolve which paths `expr` writes to, or `None` when any write stage's
 /// left-hand side is not a static navigation chain (#870).
 ///
@@ -1929,22 +1969,22 @@ fn static_path_steps(expr: &Expr, out: &mut Vec<PathStep>) -> bool {
 /// rejected by [`static_path_steps`] instead of being resolved against a
 /// document that may already be stale.
 fn collect_write_targets(expr: &Expr) -> Option<Vec<WriteTarget>> {
-    fn push(lhs: &Expr, kind: WriteKind, out: &mut Vec<WriteTarget>) -> bool {
+    fn push(lhs: &Expr, kind: WriteKind, fresh: bool, out: &mut Vec<WriteTarget>) -> bool {
         match lhs {
-            Expr::Paren(inner) => push(inner, kind, out),
+            Expr::Paren(inner) => push(inner, kind, fresh, out),
             // `del(.arr[0], .arr[2])` removes both, and each branch is a
             // path of its own — a generator is only valid on a `del`'s
             // left, never an assignment's, so this arm is gated on `Del`
             // rather than accepting `.a, .b = 1`.
             Expr::Comma(branches) if kind == WriteKind::Del => {
-                branches.iter().all(|b| push(b, kind, out))
+                branches.iter().all(|b| push(b, kind, fresh, out))
             }
             _ => {
                 let mut path = Vec::new();
                 if !static_path_steps(lhs, &mut path) {
                     return false;
                 }
-                out.push(WriteTarget { path, kind });
+                out.push(WriteTarget { path, kind, fresh });
                 true
             }
         }
@@ -1952,11 +1992,16 @@ fn collect_write_targets(expr: &Expr) -> Option<Vec<WriteTarget>> {
 
     fn walk(expr: &Expr, out: &mut Vec<WriteTarget>) -> bool {
         match expr {
-            Expr::Assign { path, .. }
-            | Expr::Update { path, .. }
+            // Only a plain `=` can be proved to write a constructed value:
+            // `|=`'s filter and a compound assign's operator both read the
+            // node already there, so their result is never wholly fresh.
+            Expr::Assign { path, value } => {
+                push(path, WriteKind::Set, is_closed_literal(value), out)
+            }
+            Expr::Update { path, .. }
             | Expr::CompoundAssign { path, .. }
-            | Expr::AlternativeAssign { path, .. } => push(path, WriteKind::Set, out),
-            Expr::Builtin(Builtin::Del(inner)) => push(inner, WriteKind::Del, out),
+            | Expr::AlternativeAssign { path, .. } => push(path, WriteKind::Set, false, out),
+            Expr::Builtin(Builtin::Del(inner)) => push(inner, WriteKind::Del, false, out),
             Expr::Identity
             | Expr::Builtin(
                 Builtin::Select(_) | Builtin::Empty | Builtin::Debug | Builtin::DebugMsg(_),
@@ -1968,12 +2013,42 @@ fn collect_write_targets(expr: &Expr) -> Option<Vec<WriteTarget>> {
     }
 
     let mut out = Vec::new();
-    walk(expr, &mut out).then_some(out)
+    if !walk(expr, &mut out) {
+        return None;
+    }
+
+    // Stage order is invisible here, and a `del` at an array index makes it
+    // matter: it renumbers every later slot, so a static index from another
+    // stage means one node before the `del` and a different one after.
+    // `.arr[1] = ... | del(.arr[0])` and `del(.arr[0]) | .arr[0] = ...` are
+    // the same two writes in this list and different documents on the page.
+    //
+    // Deletions from the *same* array are exempt — `array_sources` removes
+    // them as one set, which is what `del(.arr[0], .arr[2])` means anyway —
+    // and so is any path that never enters the array at all (`.z = 1 |
+    // del(.arr[0])`). Anything else gives up the whole expression rather
+    // than reconcile against an order it cannot see.
+    let ambiguous = out.iter().enumerate().any(|(di, d)| {
+        if d.kind != WriteKind::Del {
+            return false;
+        }
+        let Some((PathStep::Index(_), parent)) = d.path.split_last() else {
+            return false;
+        };
+        out.iter().enumerate().any(|(ti, t)| {
+            ti != di
+                && t.path.len() > parent.len()
+                && t.path[..parent.len()] == *parent
+                && !(t.kind == WriteKind::Del && t.path.len() == parent.len() + 1)
+        })
+    });
+    (!ambiguous).then_some(out)
 }
 
 /// A write path, relative to the node currently being reconciled, paired
-/// with what the write did there (#870).
-type RelTarget<'t> = (&'t [PathStep], WriteKind);
+/// with what the write did there and whether its value was constructed
+/// outright (#870).
+type RelTarget<'t> = (&'t [PathStep], WriteKind, bool);
 
 /// Turn a jq index (possibly negative) into a slot of a `len`-element
 /// container, matching `numeric_key_to_index`'s from-the-end convention.
@@ -1991,8 +2066,8 @@ fn resolve_index(idx: i64, len: usize) -> Option<usize> {
 fn descend_key<'t>(targets: &[RelTarget<'t>], key: &str) -> Vec<RelTarget<'t>> {
     targets
         .iter()
-        .filter_map(|(steps, kind)| match steps.split_first() {
-            Some((PathStep::Key(k), rest)) if k == key => Some((rest, *kind)),
+        .filter_map(|(steps, kind, fresh)| match steps.split_first() {
+            Some((PathStep::Key(k), rest)) if k == key => Some((rest, *kind, *fresh)),
             _ => None,
         })
         .collect()
@@ -2003,9 +2078,9 @@ fn descend_key<'t>(targets: &[RelTarget<'t>], key: &str) -> Vec<RelTarget<'t>> {
 fn descend_index<'t>(targets: &[RelTarget<'t>], index: usize, len: usize) -> Vec<RelTarget<'t>> {
     targets
         .iter()
-        .filter_map(|(steps, kind)| match steps.split_first() {
+        .filter_map(|(steps, kind, fresh)| match steps.split_first() {
             Some((PathStep::Index(n), rest)) if resolve_index(*n, len) == Some(index) => {
-                Some((rest, *kind))
+                Some((rest, *kind, *fresh))
             }
             _ => None,
         })
@@ -2027,43 +2102,54 @@ fn array_sources(
     r_items: &[OwnedValue],
     targets: &[RelTarget<'_>],
 ) -> Vec<Option<usize>> {
-    // A wholesale write at this array (`.arr = <expr>`, `|=`, `+=`)
-    // replaces its contents outright, so slot `i` of the result is not slot
-    // `i` of the pristine in any meaningful sense — a prepend shifts
-    // everything down one, a reverse turns the order around.
-    //
-    // Real yq carries presentation on *node identity*: an element the
-    // expression referenced keeps its own comment and style, one it
-    // constructed gets none. Matching each result element to the first
-    // still-unclaimed pristine element holding an equal value, in order,
-    // approximates that without a shared-node value model (#1351) — and
-    // reproduces yq exactly for the prepend and reverse that motivated this
-    // issue. Where it still differs is a constructed literal that happens
-    // to equal an old element; see [`reconcile_presentation`]'s own doc
-    // comment.
-    //
-    // Checked before the `del` remap below: once the array has been
-    // rewritten wholesale, pristine *positions* mean nothing, so a `del`
-    // in the same pipe has no positional model left to remap against.
-    if targets
+    let wholesale = targets
         .iter()
-        .any(|(steps, kind)| steps.is_empty() && *kind == WriteKind::Set)
-    {
-        let mut claimed = vec![false; p_items.len()];
-        return r_items
+        .find(|(steps, kind, _)| steps.is_empty() && *kind == WriteKind::Set);
+
+    if let Some((_, _, fresh)) = wholesale {
+        // A closed literal built every element here, so none of them can
+        // have inherited anything: `.arr = ["p","q"]` prints two bare
+        // scalars in real yq even where the old slots were quoted and
+        // commented.
+        if *fresh {
+            return vec![None; r_items.len()];
+        }
+
+        // Otherwise the expression read the document, so some of these
+        // elements may be nodes that were already here, arriving at a new
+        // slot: a prepend shifts everything down one, a reverse turns the
+        // order around. Match each result element to a pristine element
+        // holding an equal value.
+        let aligned = align_by_value(p_items, r_items);
+
+        // Only *use* that alignment where it is actually evidence of
+        // movement, because equal values are circumstantial: `.arr |= [.[]
+        // + 1]` turns `[1, 2]` into `[2, 3]`, which reads as "the 2 moved
+        // down a slot and the 3 is new" and is really "each element was
+        // incremented where it stood". Real yq keeps each node's own
+        // comment there, exactly as the positional walk always did, and
+        // reading the coincidence as movement would take that away — a step
+        // backwards, not the gap this issue is about.
+        //
+        // Two things make it real rather than circumstantial:
+        //
+        // 1. something has to have moved at all (`p != i` somewhere), which
+        //    rules out a self-assign and an append; and
+        // 2. at equal lengths, every element has to be accounted for. A
+        //    genuine permutation — a reverse, a sort, a rotation — is a
+        //    bijection; a coincidental overlap leaves some result element
+        //    unmatched, as `[1, 2] -> [2, 3]` leaves the 3.
+        //
+        // A length change is movement on its own: inserting or removing an
+        // element shifts its neighbours whatever the values say.
+        let moved = aligned
             .iter()
-            .map(|r_v| {
-                let found = p_items
-                    .iter()
-                    .enumerate()
-                    .find(|(p, p_v)| !claimed[*p] && *p_v == r_v)
-                    .map(|(p, _)| p);
-                if let Some(p) = found {
-                    claimed[p] = true;
-                }
-                found
-            })
-            .collect();
+            .enumerate()
+            .any(|(i, src)| src.is_some_and(|p| p != i));
+        let accounted = p_items.len() != r_items.len() || aligned.iter().all(Option::is_some);
+        if moved && accounted {
+            return aligned;
+        }
     }
 
     // `del(.arr[k])` shifts every later element down one slot, so slot `i`
@@ -2072,7 +2158,7 @@ fn array_sources(
     // of index 1's. The removed set is known exactly, so the remap is too.
     let mut removed: Vec<usize> = targets
         .iter()
-        .filter_map(|(steps, kind)| match (steps, kind) {
+        .filter_map(|(steps, kind, _)| match (steps, kind) {
             ([PathStep::Index(n)], WriteKind::Del) => resolve_index(*n, p_items.len()),
             _ => None,
         })
@@ -2094,6 +2180,102 @@ fn array_sources(
     }
 
     (0..r_items.len()).map(Some).collect()
+}
+
+/// Pair each element of `r_items` with a distinct element of `p_items`
+/// holding an equal value, in order (#870).
+///
+/// Indexes the pristine elements by [`owned_value_align_hash`] first, so a
+/// long sequence costs one pass rather than a scan per element — a 100k
+/// `.arr |= reverse` was quadratic when this matched by rescanning.
+///
+/// Ties are broken by document order, which is right for an insertion or a
+/// deletion but arbitrary for a permutation of *equal* elements: reversing
+/// `[a # c0, a # c1]` pairs `c0` with the first `a` where real yq, which
+/// tracks node identity, pairs `c1`. Values alone cannot tell those apart;
+/// see [`reconcile_presentation`]'s own doc comment.
+fn align_by_value(p_items: &[OwnedValue], r_items: &[OwnedValue]) -> Vec<Option<usize>> {
+    let mut buckets: HashMap<u64, VecDeque<usize>> = HashMap::new();
+    for (i, v) in p_items.iter().enumerate() {
+        buckets
+            .entry(owned_value_align_hash(v))
+            .or_default()
+            .push_back(i);
+    }
+    r_items
+        .iter()
+        .map(|r_v| {
+            let candidates = buckets.get_mut(&owned_value_align_hash(r_v))?;
+            // The hash only narrows: equal values always share a bucket,
+            // but a bucket can hold unequal ones (two i64 that round to the
+            // same f64), and a NaN element equals nothing at all — so the
+            // match is still decided by `==`.
+            let pos = candidates.iter().position(|&p| p_items[p] == *r_v)?;
+            candidates.remove(pos)
+        })
+        .collect()
+}
+
+/// Hash an [`OwnedValue`] consistently with its own `PartialEq`, for
+/// [`align_by_value`]'s bucketing (#870).
+///
+/// `OwnedValue`'s equality is *jq value equality*, not structural, so this
+/// has to agree with it on three points or equal values land in different
+/// buckets and the alignment silently misses them:
+///
+/// 1. `Int`, `Float` and `NumberLiteral` compare across variants by `f64`
+///    value, so all three hash through one canonical `f64`.
+/// 2. `-0.0 == 0.0`, whose bit patterns differ — zero is normalized first.
+/// 3. `Object` equality is order-independent (it mirrors `IndexMap`'s), so
+///    fields are combined with a commutative fold rather than in order.
+///
+/// The converse is not required: unequal values may collide freely, since
+/// [`align_by_value`] confirms every candidate with `==` anyway. NaN, which
+/// equals nothing, therefore needs no special case here.
+fn owned_value_align_hash(value: &OwnedValue) -> u64 {
+    fn number_bits(n: f64) -> u64 {
+        // `+0.0` and `-0.0` are equal but differently encoded.
+        if n == 0.0 { 0.0_f64 } else { n }.to_bits()
+    }
+
+    fn hash_at_depth(value: &OwnedValue, depth: usize) -> u64 {
+        assert_value_tree_depth(depth);
+        let mut h = DefaultHasher::new();
+        match value {
+            OwnedValue::Null => 0_u8.hash(&mut h),
+            OwnedValue::Bool(b) => (1_u8, b).hash(&mut h),
+            OwnedValue::Int(i) => (2_u8, number_bits(*i as f64)).hash(&mut h),
+            OwnedValue::Float(f) => (2_u8, number_bits(*f)).hash(&mut h),
+            OwnedValue::NumberLiteral(repr, _) => {
+                let n = match repr {
+                    NumberRepr::Int(i) => *i as f64,
+                    NumberRepr::Float(f) => *f,
+                };
+                (2_u8, number_bits(n)).hash(&mut h);
+            }
+            OwnedValue::String(s) => (3_u8, s).hash(&mut h),
+            OwnedValue::Array(items) => {
+                (4_u8, items.len()).hash(&mut h);
+                for item in items {
+                    hash_at_depth(item, depth + 1).hash(&mut h);
+                }
+            }
+            OwnedValue::Object(fields) => {
+                (5_u8, fields.len()).hash(&mut h);
+                // Commutative: `{a: 1, b: 2}` and `{b: 2, a: 1}` are equal.
+                let combined = fields.iter().fold(0_u64, |acc, (k, v)| {
+                    let mut fh = DefaultHasher::new();
+                    k.hash(&mut fh);
+                    hash_at_depth(v, depth + 1).hash(&mut fh);
+                    acc ^ fh.finish()
+                });
+                combined.hash(&mut h);
+            }
+        }
+        h.finish()
+    }
+
+    hash_at_depth(value, 0)
 }
 
 /// Reconcile a pristine (pre-write) presentation tree against a post-write
@@ -2121,32 +2303,45 @@ fn array_sources(
 /// the YAML documents this rewrites are config-file-sized, not
 /// data-file-sized.
 ///
-/// `targets` closes most of what #870 filed against the lockstep walk. A
-/// pure before/after value diff cannot tell "recursing into an untouched
-/// sibling subtree" apart from "recursing into a subtree the write
-/// reshuffled" — both look identical — so a write that moves an `Array`'s
-/// elements used to hand each new element whichever old element now
-/// happens to sit at its index. [`collect_write_targets`] resolves the
-/// paths a write actually touched straight from the AST (no
-/// `resolve_dynamic_indexes` plumbing needed, and no dependence on the
-/// document), and [`array_sources`] uses them to map each result slot back
-/// to the pristine slot it really came from: an exact remap across a
-/// `del()`, and a value-identity alignment across a wholesale write. An
-/// empty `targets` — a write whose path isn't static, e.g.
+/// `targets` closes what #870 filed against the lockstep walk. A pure
+/// before/after value diff cannot tell "recursing into an untouched sibling
+/// subtree" apart from "recursing into a subtree the write reshuffled" —
+/// both look identical — so a write that moves an `Array`'s elements used
+/// to hand each new element whichever old element now sits at its index.
+/// [`collect_write_targets`] resolves the paths a write actually touched
+/// straight from the AST (no `resolve_dynamic_indexes` plumbing needed, and
+/// no dependence on the document), and the arms below use them to decide
+/// what each result node may inherit:
+///
+/// - a `del()` gets an exact index remap ([`array_sources`]);
+/// - a wholesale write of a **closed literal** ([`is_closed_literal`])
+///   inherits nothing at all, matching yq's fresh construction;
+/// - any other wholesale write of an array aligns by value
+///   ([`align_by_value`]), but only where the alignment is real evidence of
+///   movement rather than a coincidence of equal values;
+/// - everything else stays positional, exactly as before #870.
+///
+/// An empty `targets` — a write whose path isn't static, e.g.
 /// `.arr[(.i)] = 1` — falls back to the pre-#870 lockstep walk unchanged.
 ///
-/// **Remaining gap**: real `yq` carries presentation on *node identity*,
-/// so a freshly constructed literal never inherits anything even when its
-/// value happens to equal an old node's. `.arr = ["b","a","a"]` over
-/// `[a # c0, a # c1, b # c2]` prints three bare scalars in `yq`; the
-/// value-identity alignment here matches them up and keeps the comments.
-/// Object fields have the same gap (`.o = {"a": "1"}` keeps `a`'s old
-/// comment where `yq` drops it) and are deliberately left on key matching:
-/// aligning object children by *value* would let one key inherit a
-/// different key's comment, which is the very misattribution #870 is
-/// about. Closing either needs the shared-node value model tracked by
-/// #1351 and #865. Purely cosmetic throughout (no data loss, no incorrect
-/// *values*).
+/// **Remaining gaps.** All three predate #870 and none is a wrong *value*:
+///
+/// 1. Real `yq` carries presentation on *node identity*, which values can
+///    only approximate. Under a genuine permutation of **equal** elements
+///    the pairing is arbitrary: reversing `[a # c0, a # c1]` pairs `c0`
+///    with the first `a` where `yq`, which knows the nodes, pairs `c1`.
+/// 2. Stage order is invisible in `targets`, and a `del` at an array index
+///    renumbers slots, so `.arr[1] = ... | del(.arr[0])` and its reverse
+///    are the same target list and different documents.
+///    [`collect_write_targets`] detects that shape and declines the whole
+///    expression rather than guess, leaving it on the positional walk.
+/// 3. Object fields are matched by key, never aligned by value: a key names
+///    the same node however the map is reordered, and aligning object
+///    children by value would let one key inherit a *different* key's
+///    comment — the very misattribution #870 is about.
+///
+/// Closing (1) and (2) properly needs the shared-node value model tracked
+/// by #1351 and #865.
 fn reconcile_presentation(
     pristine_value: &OwnedValue,
     pristine_tree: &CommentTree,
@@ -2155,7 +2350,7 @@ fn reconcile_presentation(
 ) -> CommentTree {
     let relative: Vec<RelTarget<'_>> = targets
         .iter()
-        .map(|t| (t.path.as_slice(), t.kind))
+        .map(|t| (t.path.as_slice(), t.kind, t.fresh))
         .collect();
     reconcile_presentation_at_depth(pristine_value, pristine_tree, result_value, &relative, 0)
 }
@@ -2177,15 +2372,21 @@ fn reconcile_presentation_at_depth(
             let own_meta = pristine_tree.meta().clone();
             let mut fields = IndexMap::new();
             let mut key_comments = IndexMap::new();
+            // A closed literal built every field here, so none of them can
+            // have inherited anything: real yq prints `.o = {"a": "1"}` with
+            // no comment on `a`, even where the value is unchanged.
+            let fresh_write = targets
+                .iter()
+                .any(|(steps, kind, fresh)| steps.is_empty() && *kind == WriteKind::Set && *fresh);
             for (k, r_v) in r_fields {
-                // Object children stay matched by key: a key names the same
-                // node before and after a write however the map is
+                // Object children are otherwise matched by key: a key names
+                // the same node before and after a write however the map is
                 // reordered, so there is no position to misattribute across
                 // (verified: `yq '.o = {"b": .o.b, "a": .o.a}'` keeps each
                 // field's own comment with its own key). See this function's
                 // doc comment for the object-side gap this leaves open.
                 let child_targets = descend_key(targets, k);
-                let child = match p_fields.get(k) {
+                let child = match p_fields.get(k).filter(|_| !fresh_write) {
                     Some(p_v) => reconcile_presentation_at_depth(
                         p_v,
                         pristine_tree.field(k),
@@ -2209,7 +2410,7 @@ fn reconcile_presentation_at_depth(
                 // key and comment, silently dropping the write's value
                 // entirely (found in review).
                 if let CommentTree::Object(_, _, pristine_key_comments) = pristine_tree {
-                    if let Some((kc, _)) = pristine_key_comments.get(k) {
+                    if let Some((kc, _)) = pristine_key_comments.get(k).filter(|_| !fresh_write) {
                         let value_absent = matches!(r_v, OwnedValue::Null);
                         key_comments.insert(k.clone(), (kc.clone(), value_absent));
                     }
@@ -7847,10 +8048,169 @@ mod tests {
         let pristine = [OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3)];
         let result = [OwnedValue::Int(2), OwnedValue::Int(3), OwnedValue::Int(9)];
         let steps = [PathStep::Index(0)];
-        let targets = [(&steps[..], WriteKind::Del)];
+        let targets = [(&steps[..], WriteKind::Del, false)];
         assert_eq!(
             array_sources(&pristine, &result, &targets),
             vec![Some(0), Some(1), Some(2)]
         );
+    }
+
+    /// The alignment hash has to agree with `OwnedValue`'s own *jq value*
+    /// equality, not with structural equality: any pair that compares equal
+    /// must land in the same bucket, or [`align_by_value`] silently fails
+    /// to match them. These are the three ways that can go wrong.
+    #[test]
+    fn owned_value_align_hash_agrees_with_value_equality_870() {
+        let equal_pairs = [
+            // Numbers compare across all three variants by f64 value.
+            (OwnedValue::Int(1), OwnedValue::Float(1.0)),
+            (
+                OwnedValue::Int(1),
+                OwnedValue::NumberLiteral(NumberRepr::Int(1), "1".into()),
+            ),
+            (
+                OwnedValue::Float(1.0),
+                OwnedValue::NumberLiteral(NumberRepr::Float(1.0), "1.0".into()),
+            ),
+            // `-0.0 == 0.0`, with different bit patterns.
+            (OwnedValue::Float(-0.0), OwnedValue::Float(0.0)),
+            (OwnedValue::Int(0), OwnedValue::Float(-0.0)),
+            // Object equality is order-independent.
+            (
+                OwnedValue::Object(IndexMap::from_iter([
+                    ("a".to_string(), OwnedValue::Int(1)),
+                    ("b".to_string(), OwnedValue::Int(2)),
+                ])),
+                OwnedValue::Object(IndexMap::from_iter([
+                    ("b".to_string(), OwnedValue::Int(2)),
+                    ("a".to_string(), OwnedValue::Int(1)),
+                ])),
+            ),
+            // ...including nested, and mixing the number rule in.
+            (
+                OwnedValue::Array(vec![OwnedValue::Object(IndexMap::from_iter([(
+                    "n".to_string(),
+                    OwnedValue::Int(2),
+                )]))]),
+                OwnedValue::Array(vec![OwnedValue::Object(IndexMap::from_iter([(
+                    "n".to_string(),
+                    OwnedValue::Float(2.0),
+                )]))]),
+            ),
+        ];
+        for (a, b) in equal_pairs {
+            assert_eq!(a, b, "test premise: {a:?} should equal {b:?}");
+            assert_eq!(
+                owned_value_align_hash(&a),
+                owned_value_align_hash(&b),
+                "equal values must hash equal: {a:?} vs {b:?}"
+            );
+        }
+    }
+
+    /// Values that differ only by *position* inside a container must not
+    /// collide, or the alignment stops distinguishing arrays it should.
+    /// (Unequal values are allowed to collide — `align_by_value` confirms
+    /// every candidate with `==` — this just checks the hash is not
+    /// uselessly coarse.)
+    #[test]
+    fn owned_value_align_hash_distinguishes_array_order_870() {
+        let a = OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)]);
+        let b = OwnedValue::Array(vec![OwnedValue::Int(2), OwnedValue::Int(1)]);
+        assert_ne!(a, b);
+        assert_ne!(owned_value_align_hash(&a), owned_value_align_hash(&b));
+    }
+
+    /// NaN equals nothing, itself included, so it can never be matched —
+    /// whatever it hashes to, the `==` confirmation rejects it.
+    #[test]
+    fn align_by_value_never_matches_nan_870() {
+        let nan = [OwnedValue::Float(f64::NAN)];
+        assert_eq!(align_by_value(&nan, &nan), vec![None]);
+    }
+
+    /// Each pristine element is claimed at most once, so a result with more
+    /// copies of a value than the document had leaves the extras unmatched.
+    #[test]
+    fn align_by_value_claims_each_element_once_870() {
+        let pristine = [OwnedValue::Int(7), OwnedValue::Int(8)];
+        let result = [
+            OwnedValue::Int(8),
+            OwnedValue::Int(7),
+            OwnedValue::Int(7),
+            OwnedValue::Int(9),
+        ];
+        assert_eq!(
+            align_by_value(&pristine, &result),
+            vec![Some(1), Some(0), None, None]
+        );
+    }
+
+    /// Only a plain `=` can carry a provably constructed value. `|=` and the
+    /// compound assigns always read the node already there.
+    #[test]
+    fn collect_write_targets_marks_closed_literal_writes_fresh_870() {
+        let lit = || Expr::Literal(succinctly::jq::Literal::Int(1));
+        let fresh_of = |e: &Expr| collect_write_targets(e).map(|ts| ts[0].fresh);
+
+        assert_eq!(
+            fresh_of(&Expr::Assign {
+                path: Box::new(Expr::Field("a".into())),
+                value: Box::new(Expr::Array(Box::new(lit()))),
+            }),
+            Some(true)
+        );
+        // References the document, so nothing about it is provably fresh.
+        assert_eq!(
+            fresh_of(&Expr::Assign {
+                path: Box::new(Expr::Field("a".into())),
+                value: Box::new(Expr::Field("b".into())),
+            }),
+            Some(false)
+        );
+        assert_eq!(
+            fresh_of(&Expr::Update {
+                path: Box::new(Expr::Field("a".into())),
+                filter: Box::new(Expr::Array(Box::new(lit()))),
+            }),
+            Some(false)
+        );
+    }
+
+    /// A `del` at an array index renumbers slots for every other write that
+    /// reaches into the same array, and the target list records no stage
+    /// order — so that combination is declined whole. Deletions from the
+    /// same array are exempt (they are removed as one set), and so is a
+    /// write that never enters the array.
+    #[test]
+    fn collect_write_targets_declines_del_that_renumbers_another_write_870() {
+        let del = |e: Expr| Expr::Builtin(Builtin::Del(Box::new(e)));
+        let arr_idx = |i: i64| {
+            Expr::Pipe(vec![
+                Expr::Field("arr".into()),
+                Expr::Index { idx: i, key: None },
+            ])
+        };
+        let set = |p: Expr| Expr::Assign {
+            path: Box::new(p),
+            value: Box::new(Expr::Literal(succinctly::jq::Literal::Int(1))),
+        };
+
+        // A write into the same array, after a del that renumbers it.
+        assert!(
+            collect_write_targets(&Expr::Pipe(vec![set(arr_idx(1)), del(arr_idx(0))])).is_none()
+        );
+        // Same two writes, other order — equally undecidable from this list.
+        assert!(
+            collect_write_targets(&Expr::Pipe(vec![del(arr_idx(0)), set(arr_idx(1))])).is_none()
+        );
+        // Two deletions from one array are handled together, not declined.
+        assert!(collect_write_targets(&del(Expr::Comma(vec![arr_idx(0), arr_idx(2)]))).is_some());
+        // A write elsewhere is unaffected by the renumbering.
+        assert!(collect_write_targets(&Expr::Pipe(vec![
+            del(arr_idx(0)),
+            set(Expr::Field("n".into()))
+        ]))
+        .is_some());
     }
 }
