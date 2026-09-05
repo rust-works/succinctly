@@ -7600,6 +7600,44 @@ fn test_yaml_direct_self_alias_cycle() -> Result<()> {
     Ok(())
 }
 
+/// #1374's triage comment enumerates every spelling of anchor/tag-on-alias
+/// it verified live against real yq v4.53.3 and required the default loader
+/// to reject; `test_yaml_direct_self_alias_cycle` above and the flow-key
+/// cases in `test_alias_as_a_flow_mapping_key_resolves` /
+/// `test_alias_as_a_flow_sequence_key_resolves` already cover three of them
+/// (block value, flow-map key, flow-seq key). This covers the rest: tag-only
+/// and tag+anchor decoration (yq rejects both, not just anchor-on-alias),
+/// flow-sequence *value* position, the alias on its own next line (with and
+/// without an intervening comment — the triage comment notes this is a
+/// "which node did the property land on" check, not a one-token lookahead),
+/// a block sequence item, an explicit key, and a compact mapping entry.
+#[test]
+fn test_yaml_anchor_on_alias_rejected_in_every_position() -> Result<()> {
+    for yaml in [
+        "a0: &a0 hello\na1: !!str *a0\n",
+        "a0: &a0 hello\na1: !!str &a1 *a0\n",
+        "a0: &a0 hello\ns: [&a1 *a0]\n",
+        "a0: &a0 hello\na1: &a1\n  *a0\n",
+        "a0: &a0 hello\na1: &a1\n  # comment\n  *a0\n",
+        "a0: &a0 hello\ns:\n  - &a1 *a0\n",
+        "a0: &a0 hello\n? &k1 *a0\n: v\n",
+        "a0: &a0 hello\n&k1 *a0 : v\n",
+        "a0: &a0 hello\ns:\n  - &a1 *a0: v\n",
+    ] {
+        let (stdout, stderr, exit_code) = run_yq_stdin_with_stderr(".", yaml, &[])?;
+        assert_eq!(
+            exit_code, 1,
+            "expected clean error exit for {yaml:?}: {stderr}"
+        );
+        assert_eq!(stdout, "", "for {yaml:?}");
+        assert!(
+            stderr.contains("cannot carry an anchor or tag"),
+            "stderr should name the property-on-alias rejection for {yaml:?}: {stderr}"
+        );
+    }
+    Ok(())
+}
+
 // Deep (non-cyclic) alias-chain recursion guard tests (#1193) used to live
 // here, built via a `deep_alias_chain` helper chaining `k1: &a1 *a0`-shaped
 // hops. #1374 closed off that exact shape at parse time (`&anchor *alias` is
