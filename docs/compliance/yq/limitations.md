@@ -274,6 +274,43 @@ at all. The justification is the spec target, which is why the case belongs here
 Representative cases, each live-verified. These are gaps to close, listed here so they are
 not rediscovered from scratch.
 
+### `--eval-all` slurps the documents into one array; real `yq ea` evaluates over a context list of them (#2427)
+
+`succinctly yq --eval-all` collects every document of every input file into one array and
+evaluates the expression once against that array. Real yq's `ea` evaluates the expression
+once with the *list of documents* as its input: navigation maps over the list, `[E]`
+collects E's whole output list into one array, `length`/`keys`/`del` apply per document,
+and a binary operator is cartesian over both operands' lists. Only a filter that happens to
+treat its input as an array agrees between the two. Captured from the pinned v4.53.3 binary
+with `yq ea -o=json -I0` on `f1.yaml` (`a: 1`, `name: first`) and `f2.yaml` (`b: 2`,
+`name: second`):
+
+```bash
+$ yq ea -o=json -I0 '.name' f1.yaml f2.yaml            # "first" / "second"
+$ succinctly yq --eval-all -o=json '.name' f1.yaml f2.yaml
+Error: Cannot index array with string "name"
+$ yq ea -o=json -I0 '[.]' f1.yaml f2.yaml              # one array of both documents
+$ succinctly yq --eval-all -o=json '[.]' f1.yaml f2.yaml   # an array holding that array
+$ yq ea -o=json -I0 '. + {"z": 9}' f1.yaml f2.yaml     # four outputs (2 documents x 2)
+$ yq ea -o=json -I0 'keys' f1.yaml f2.yaml             # ["a","name"] / ["b","name"]
+$ succinctly yq --eval-all -o=json 'keys' f1.yaml f2.yaml  # [0,1]
+```
+
+`file_index`/`document_index` on this path count files and documents as yq does since
+#2469 (`0 0 1` and `0 1 0` for a two-document file followed by a one-document file), so the
+numbering is right even though the shape of the evaluation is not.
+
+This is not fixable in the CLI runner alone: a per-document loop would repair `.name`,
+`keys`, `del` and `select(file_index == 1)` but would print `[.]` twice and `. + {"z": 9}`
+twice, both still wrong. The evaluation model is the same one
+[#2451](https://github.com/rust-works/succinctly/issues/2451) records for `(.a, .b) |
+(.c, .d)` inside a single document -- yq's `,` and its `ea` both build a context list, and
+every operator is defined over lists -- so the fix is one yq-mode rule for "an expression
+over a context list", decided under #2451 and applied here. Tracked as
+[#2427](https://github.com/rust-works/succinctly/issues/2427); the stray `---` that plain
+multi-file `succinctly yq` prints between files, and the always-0 `file_index` on that
+non-`ea` path, are the same issue's other two divergences.
+
 ### `-j`/`--join-output` collides with real yq's own `-j`
 
 Not an [extension](#extensions) for the `-j` spelling — real yq's arg parser does accept
