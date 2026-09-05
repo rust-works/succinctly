@@ -32372,6 +32372,41 @@ const OWNED_IDENTITY_ROWS_2416: &[(&str, &str)] = &[
     (".a.b | map(. + 1) | .[0] | parent | parent | path", ""),
     (".a.b | sort | .[0] | parent | path", r#"["a","b"]"#),
     (".a.b | sort | .[0] | parent | parent | key", r#""a""#),
+    // #2471 sub-item 1: a *computed* index or slice inside the owned domain
+    // is navigation like its literal sibling, `?` over it included. Real
+    // yq keeps the container's position for a slice, exactly as it does for
+    // the literal `.[1:]` rows above.
+    (
+        ".a | to_entries | .[(0,1)] | key",
+        "0
+1",
+    ),
+    (
+        ".a | to_entries | .[(0,1)] | path",
+        r#"["a",0]
+["a",1]"#,
+    ),
+    (
+        ".a | to_entries | .[(0,1)]? | key",
+        "0
+1",
+    ),
+    (
+        ".a | to_entries | .[(0,1)] | parent | key",
+        r#""a"
+"a""#,
+    ),
+    (
+        ".a.b | sort | .[(0,1)] | key",
+        "0
+1",
+    ),
+    (".a.b | sort | .[(1):(3)] | key", r#""b""#),
+    (".a.b | sort | .[(1):(3)] | .[0] | path", r#"["a","b",0]"#),
+    (".a.b | sort | .[(1):(3)]? | key", r#""b""#),
+    (".a.b | sort | .[(-1)] | key", "2"),
+    (".a.b | sort | .[(-1)] | path", r#"["a","b",2]"#),
+    (".a.d | to_entries | .[(0)] | key", "0"),
 ];
 
 /// #2460: real yq's binary operators when one operand produces **zero
