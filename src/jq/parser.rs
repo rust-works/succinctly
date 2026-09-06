@@ -3920,7 +3920,9 @@ impl<'a> Parser<'a> {
             self.consume_keyword("path");
             self.skip_ws();
             if self.peek() == Some('(') {
-                // path(expr) - jq style
+                // path(expr) - jq style; real yq's `path` is nullary, so this
+                // form is jq-only surface in yq mode (#2430).
+                self.reject_unless_jq_extensions("path(f)")?;
                 self.next();
                 self.skip_ws();
                 let expr = self.parse_expr()?;

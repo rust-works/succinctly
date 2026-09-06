@@ -421,6 +421,7 @@ surface (#1512):
 | Builtin                                              | Description                                   |
 |------------------------------------------------------|-----------------------------------------------|
 | `paths`, `paths(f)`, `leaf_paths`                    | Paths to every node / every leaf node         |
+| `path(f)`                                            | Path to values selected by `f` (#2430)        |
 | `getpath(path)`                                      | Value at a path array                         |
 | `tostream`, `fromstream(f)`, `truncate_stream(f)`    | Streaming event representation                |
 | `IN(s)`, `IN(src; s)`                                | Membership test                               |
