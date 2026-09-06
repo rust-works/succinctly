@@ -31362,14 +31362,11 @@ fn try_reduce_step_alternatives<S: EvalSemantics>(
         // #2157: `state` is unconditionally overwritten by the very next
         // statement regardless of which branch runs, so there is no live
         // borrow of its old value to preserve -- the one call site where
-        // `try_owned_accumulator_step` can move `state` straight into
-        // `arith_combine` instead of `eval_owned_expr_fork`'s own
+        // `fold_step_via_accumulator_or_fork` can move `state` straight
+        // into `arith_combine` instead of `eval_owned_expr_fork`'s own
         // `&OwnedValue`-forced clone.
         let (update_vals, update_control) =
-            match try_owned_accumulator_step::<S>(substituted, state, optional) {
-                Ok(result) => result,
-                Err(state) => eval_owned_expr_fork::<S>(substituted, &state, optional),
-            };
+            fold_step_via_accumulator_or_fork::<S>(substituted, state, optional);
         // Unconditional, mirroring the pre-#1365 single-pattern fold's own
         // "acc = update_vals.into_iter().last()" -- run even when
         // `update_control` is `Some(..)`, since a retried alternative
@@ -31786,8 +31783,8 @@ fn eval_owned_fast_path<S: EvalSemantics>(
         // (the `&OwnedValue` signature below leaves no other option), so
         // it only shrinks the constant factor -- the fold itself remains
         // O(n^2) over a growing accumulator here; see #2157, whose own
-        // fix is [`try_owned_accumulator_step`] below, for the genuinely
-        // owned sibling `reduce`/`foreach`'s own fold loop calls instead
+        // fix is [`fold_step_via_accumulator_or_fork`] below, for the
+        // genuinely owned sibling `reduce`'s own fold loop calls instead
         // of this borrowed one.
         //
         // #2152: extended from a bare `Expr::Literal` `right` to any shape
@@ -31814,7 +31811,7 @@ fn eval_owned_fast_path<S: EvalSemantics>(
 /// a literal-shaped right operand `to_owned`-able with no input access) --
 /// the common `reduce`/`foreach`/`until`/`while` UPDATE-body accumulator
 /// idiom both [`eval_owned_fast_path`]'s own arm and #2157's genuinely
-/// owned [`try_owned_accumulator_step`] fast-path. `None` for any other
+/// owned [`fold_step_via_accumulator_or_fork`] fast-path. `None` for any other
 /// shape, including a syntactically-`Arithmetic` one whose right operand
 /// isn't [`literal_shaped_expr_to_owned`]-recognizable.
 fn owned_arith_accumulator_shape(expr: &Expr) -> Option<(ArithOp, OwnedValue)> {
@@ -31827,51 +31824,62 @@ fn owned_arith_accumulator_shape(expr: &Expr) -> Option<(ArithOp, OwnedValue)> {
     Some((*op, literal_shaped_expr_to_owned(right.as_ref(), 0)?))
 }
 
-/// #2157: the genuinely-owned sibling of [`eval_owned_fast_path`]'s own
-/// `. + <literal>` arm, for a caller that -- unlike that function's
-/// `&OwnedValue` signature -- already holds full ownership of `state` and
-/// is about to unconditionally overwrite it regardless of this call's
-/// outcome (`reduce`/`foreach`'s own fold loop, confirmed via
-/// `try_reduce_step_alternatives`: `state` is reassigned from
-/// `update_vals.into_iter().last()` immediately after, with no live borrow
-/// of the old value surviving that reassignment).
+/// #2157: `reduce`/`foreach`'s own fold-loop UPDATE dispatch -- shared by
+/// [`try_reduce_step_alternatives`] and [`try_foreach_step_alternatives`]
+/// (review flagged an earlier version of this fix as duplicating this
+/// exact dispatch verbatim at both call sites, byte-for-byte down to the
+/// comment). Both hold `state` fully unaliased at this call (unconditionally
+/// overwritten immediately after, no live borrow of the old value
+/// surviving), unlike [`eval_owned_fast_path`]'s own `&OwnedValue`-bound
+/// `. + <literal>` arm -- so when `expr` is that same shape
+/// (`owned_arith_accumulator_shape`), `state` moves *by value* straight
+/// into [`arith_combine`] instead of being cloned first, letting
+/// `arith_add`'s in-place `push_str`/`extend` reuse the accumulator's own
+/// spare capacity. `owned_arith_accumulator_shape` only inspects `&expr`,
+/// never `state`, so the shape check happens *before* `state` is touched
+/// at all -- an earlier version of this function instead moved `state` in
+/// unconditionally and handed it back via `Err(state)` on a shape
+/// mismatch, a `Result`-as-"try this, or hand it back" convention review
+/// called out as solely a byproduct of that ordering, easy to misread as
+/// "the operation failed" rather than "shape didn't match." Checking the
+/// shape first removes the need for it entirely: the `None` arm below
+/// simply borrows `state` for the existing [`eval_owned_expr_fork`] path
+/// rather than ever needing it back.
 ///
-/// Moving `state` straight into [`arith_combine`] (which already takes its
-/// `left` operand by value) instead of cloning it first is the actual O(n)
-/// fix #2086/#2152's own `&OwnedValue`-bound fast path couldn't make:
-/// `arith_add`'s in-place `push_str`/`extend` can then reuse the
-/// accumulator's own spare capacity instead of being handed a fresh
-/// exact-capacity clone every step, the same way it already does for any
-/// other genuinely-owned caller.
+/// For `reduce`, this is the actual O(n) fix #2086/#2152's own
+/// `&OwnedValue`-bound fast path couldn't make. For `foreach`, it is not:
+/// every `foreach` step also hands `state` to EXTRACT (or pushes it
+/// straight to `outputs` when EXTRACT is omitted) before the next step can
+/// consume it, a second read this by-value move alone can't eliminate --
+/// see `try_foreach_step_alternatives`'s own doc comment and
+/// `docs/compliance/jq/limitations.md`'s #2157 section for the measured
+/// (modest, non-asymptotic) result there.
 ///
-/// Returns `Ok((vec![new_state], None))` on a successful combine and
-/// `Ok((Vec::new(), Some(Control::Error(e))))`/`Ok((Vec::new(), None))`
-/// (the latter when `optional` suppresses the error) on failure -- the
-/// exact shape [`eval_owned_expr_fork`] itself returns for this same
-/// expression, so the caller's own `update_vals`/`update_control` handling
-/// downstream (retry-on-`?//`-alternative included) needs no changes.
-/// `Err(state)` when `expr` isn't this shape at all -- checked before
-/// `state` is touched at all, so it comes back completely unconsumed for
-/// the caller to fall through to its existing [`eval_owned_expr_fork`]
-/// call with -- deliberately narrow: replicating that call's own
-/// `?//`-retry/decode-failure semantics here for the rare failing-combine
-/// case would be new surface for exactly the kind of subtle regression
-/// #2237's own review already caught twice in a similarly "looks like a
-/// safe mechanical copy" refactor (#2389), for a case that isn't the
-/// O(n^2) driver this fix targets in the first place.
-fn try_owned_accumulator_step<S: EvalSemantics>(
+/// On a match, returns the exact `(Vec<OwnedValue>, Option<Control>)`
+/// shape [`eval_owned_expr_fork`] itself returns for this same expression
+/// (`(vec![v], None)` on success, `(Vec::new(), Some(Control::Error(e)))`
+/// or `(Vec::new(), None)` when `optional` suppresses the error) -- so the
+/// caller's own `update_vals`/`update_control` handling downstream
+/// (retry-on-`?//`-alternative included) needs no changes either way.
+/// Deliberately doesn't replicate `eval_owned_expr_fork`'s own
+/// `?//`-retry/decode-failure semantics for the failing-combine case --
+/// new surface for exactly the kind of subtle regression #2237's own
+/// review already caught twice in a similarly "looks like a safe
+/// mechanical copy" refactor (#2389), for a case that isn't the O(n^2)
+/// driver this fix targets in the first place.
+fn fold_step_via_accumulator_or_fork<S: EvalSemantics>(
     expr: &Expr,
     state: OwnedValue,
     optional: bool,
-) -> Result<(Vec<OwnedValue>, Option<Control>), OwnedValue> {
-    let Some((op, rhs)) = owned_arith_accumulator_shape(expr) else {
-        return Err(state);
-    };
-    Ok(match arith_combine::<S>(op, state, rhs) {
-        Ok(v) => (vec![v], None),
-        Err(_) if optional => (Vec::new(), None),
-        Err(e) => (Vec::new(), Some(Control::Error(e))),
-    })
+) -> (Vec<OwnedValue>, Option<Control>) {
+    match owned_arith_accumulator_shape(expr) {
+        Some((op, rhs)) => match arith_combine::<S>(op, state, rhs) {
+            Ok(v) => (vec![v], None),
+            Err(_) if optional => (Vec::new(), None),
+            Err(e) => (Vec::new(), Some(Control::Error(e))),
+        },
+        None => eval_owned_expr_fork::<S>(expr, &state, optional),
+    }
 }
 
 /// The `Identity`/`Field`/`Index` arms of [`eval_owned_fast_path`], factored
@@ -32688,17 +32696,26 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
             return (state, Some(control));
         }
 
-        // #2157: same reasoning as `try_reduce_step_alternatives`'s own
-        // identical call site -- `state` is unconditionally overwritten
-        // immediately below regardless of which branch runs.
+        // #2157: `state` is fed into `fold_step_via_accumulator_or_fork` by
+        // value (see `try_reduce_step_alternatives`'s own identical call
+        // site), but unlike that sibling, the resulting `update_vals`
+        // can't be consumed right away here -- the EXTRACT loop just below
+        // still needs to borrow it. Setting the *next* `state` from
+        // `update_vals` is therefore deferred past that loop (see the
+        // `into_iter().last()` after it) instead of happening right here;
+        // review found an earlier version of this fix set `state` via
+        // `.last().cloned()` at this exact point, which clones the whole
+        // accumulator every step on top of the EXTRACT loop's own read of
+        // it -- paying both clones and confirmed (interleaved benchmark)
+        // to land zero measurable improvement. Deferring to `into_iter()`
+        // below removes one of those two clones, a real but modest win
+        // (~7%, measured) -- not `reduce`'s O(n) result, since the
+        // EXTRACT/output read is a second, structurally unavoidable read
+        // of `state` this fix was never going to eliminate on its own; see
+        // `fold_step_via_accumulator_or_fork`'s own doc comment and
+        // `docs/compliance/jq/limitations.md`'s #2157 section.
         let (update_vals, update_control) =
-            match try_owned_accumulator_step::<S>(substituted_update, state, optional) {
-                Ok(result) => result,
-                Err(state) => eval_owned_expr_fork::<S>(substituted_update, &state, optional),
-            };
-        // Unconditional, mirroring `try_reduce_step_alternatives`'s own
-        // rule -- a retried alternative resumes from exactly this value.
-        state = update_vals.last().cloned().unwrap_or(OwnedValue::Null);
+            fold_step_via_accumulator_or_fork::<S>(substituted_update, state, optional);
 
         // EXTRACT (or the implicit identity when omitted) runs once per
         // UPDATE output THIS alternative actually produced -- unconditionally,
@@ -32717,7 +32734,15 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                 // there are source elements (#695), and that width needs
                 // its own accounting.
                 if let Some(control) = charge_budget(budget, "foreach") {
-                    return (state, Some(control));
+                    // `state` was already moved into `fold_step_via_accumulator_or_fork`
+                    // above and not yet reassigned (that happens after this
+                    // loop) -- `Null` stands in for it here since the caller
+                    // discards whatever `state` a `Some(control)` return
+                    // carries once it aborts the fold (confirmed at this
+                    // function's own call site: `state = new_state;` runs,
+                    // but `state` is never read again once `step_control`
+                    // is `Some`, the fork just `break`s).
+                    return (OwnedValue::Null, Some(control));
                 }
                 let (ext_vals, ext_control) =
                     eval_owned_expr_fork::<S>(ext_expr, update_val, optional);
@@ -32743,12 +32768,23 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                         state = update_val.clone();
                         continue 'alternatives;
                     }
-                    Some(control) => return (state, Some(control)),
+                    // Same moved-`state`/discarded-on-abort reasoning as the
+                    // budget-check return above.
+                    Some(control) => return (OwnedValue::Null, Some(control)),
                 }
             } else {
                 outputs.push(update_val.clone());
             }
         }
+
+        // Only reached once the EXTRACT loop above has run to completion
+        // without retrying (a retry already set `state` itself and jumped
+        // straight to the next `'alternatives` iteration, skipping this).
+        // `update_vals` is no longer borrowed by anything past this point,
+        // so this is the one place its last element can move into `state`
+        // instead of being cloned out of it -- mirroring
+        // `try_reduce_step_alternatives`'s own `into_iter().last()`.
+        state = update_vals.into_iter().last().unwrap_or(OwnedValue::Null);
 
         match update_control {
             None => return (state, None),
@@ -68651,7 +68687,7 @@ mod tests {
 
     #[test]
     fn test_2157_owned_arith_accumulator_shape_recognizes_and_rejects_correctly() {
-        // Direct unit coverage of the shape-check `try_owned_accumulator_step`
+        // Direct unit coverage of the shape-check `fold_step_via_accumulator_or_fork`
         // gates on: `Some` only for a bare `Identity`-left `Arithmetic` whose
         // right side `literal_shaped_expr_to_owned` can convert with no
         // input access, `None` for everything else (including a
@@ -68690,40 +68726,44 @@ mod tests {
     }
 
     #[test]
-    fn test_2157_try_owned_accumulator_step_returns_state_unconsumed_on_shape_mismatch() {
-        // The `Err(state)` path must hand `state` back completely
-        // unconsumed -- the whole point of checking the shape *before*
-        // touching `state` is so the caller's fallback to
-        // `eval_owned_expr_fork` sees the original, un-mutated accumulator.
-        let state = OwnedValue::String("untouched".to_string());
-        match try_owned_accumulator_step::<JqSemantics>(&Expr::Identity, state, false) {
-            Err(OwnedValue::String(s)) => assert_eq!(s, "untouched"),
-            // `Expr::Identity` never matches `owned_arith_accumulator_shape`'s
-            // `Arithmetic` pattern, so `Err(state)` unchanged is the only
-            // possible outcome here.
-            other => unreachable!("Expr::Identity never matches the Arithmetic shape: {other:?}"), // omni-dev: coverage tolerate-line reason="Expr::Identity never matches owned_arith_accumulator_shape (#2157)"
-        }
+    fn test_2157_fold_step_via_accumulator_or_fork_borrows_state_on_shape_mismatch() {
+        // On a shape mismatch, `owned_arith_accumulator_shape` (which only
+        // ever inspects `&expr`) has already decided `None` before `state`
+        // is touched at all, so the `None` arm borrows it for
+        // `eval_owned_expr_fork` rather than needing it handed back --
+        // pinned here via a value `eval_owned_expr_fork` itself would
+        // reject if it received anything other than the original,
+        // unmodified accumulator -- confirmed live against jq 1.7.1:
+        // `reduce (1) as $x (5; .foo)` raises "Cannot index number with
+        // string \"foo\"", naming `5`, the untouched original `state`, not
+        // some corrupted intermediate.
+        query!(b"null", r"reduce (1) as $x (5; .foo)",
+            QueryResult::Error(e) => {
+                assert!(e.message.contains("Cannot index number with string"));
+            }
+        );
     }
 
     #[test]
-    fn test_2157_try_owned_accumulator_step_suppresses_error_when_optional() {
-        // `try_owned_accumulator_step`'s `Err(_) if optional` arm mirrors
-        // `eval_owned_fast_path`'s own identical convention for this same
-        // `. + <literal>` shape (#2086) -- exercised directly here since no
-        // ordinary jq syntax reaches it *through* `reduce`/`foreach`'s own
-        // callers: `Expr::Try`/`Expr::Optional` never force `optional =
-        // true` into the expression they wrap (#693 -- see the `scalar_noop`
-        // binding's doc comment in `update_path` for the established
-        // precedent), so `(reduce ...)?` catches a per-step error via its
-        // own outer `eval_try`, not by setting this flag. Unit-level-only
-        // coverage, not jq-oracle-verifiable through any surface syntax.
+    fn test_2157_fold_step_via_accumulator_or_fork_suppresses_error_when_optional() {
+        // `fold_step_via_accumulator_or_fork`'s `Err(_) if optional` arm
+        // mirrors `eval_owned_fast_path`'s own identical convention for
+        // this same `. + <literal>` shape (#2086) -- exercised directly
+        // here since no ordinary jq syntax reaches it *through*
+        // `reduce`/`foreach`'s own callers: `Expr::Try`/`Expr::Optional`
+        // never force `optional = true` into the expression they wrap
+        // (#693 -- see the `scalar_noop` binding's doc comment in
+        // `update_path` for the established precedent), so `(reduce ...)?`
+        // catches a per-step error via its own outer `eval_try`, not by
+        // setting this flag. Unit-level-only coverage, not
+        // jq-oracle-verifiable through any surface syntax.
         let expr = Expr::Arithmetic {
             op: ArithOp::Add,
             left: Box::new(Expr::Identity),
             right: Box::new(Expr::Literal(Literal::String("a".to_string()))),
         };
         let (vals, control) =
-            try_owned_accumulator_step::<JqSemantics>(&expr, OwnedValue::Int(1), true).unwrap();
+            fold_step_via_accumulator_or_fork::<JqSemantics>(&expr, OwnedValue::Int(1), true);
         assert!(vals.is_empty());
         assert!(control.is_none());
     }
@@ -68732,7 +68772,7 @@ mod tests {
     fn test_2157_fold_accumulator_by_value_move_matches_general_evaluator() {
         // #2157: `try_reduce_step_alternatives`/`try_foreach_step_alternatives`
         // now move `state` by value into `arith_combine` via
-        // `try_owned_accumulator_step` instead of cloning through
+        // `fold_step_via_accumulator_or_fork` instead of cloning through
         // `eval_owned_fast_path`. Every case here is confirmed live against
         // jq 1.7.1 to still agree byte-for-byte -- this is the same
         // input/output contract #2086/#2152's own tests already pin, run
@@ -68760,6 +68800,25 @@ mod tests {
                 r"reduce (range(500) | tostring) as $x ({}; . + {($x): true}) | length"
             ),
             ["500"]
+        );
+        // `foreach`'s own analogue of the reduce cases above -- a growing
+        // String/Array accumulator, not the O(1)-sized Int case already
+        // covered (which can't distinguish a correct move from a subtly
+        // broken one, since cloning an Int is free either way). Confirmed
+        // live against jq 1.7.1.
+        assert_eq!(
+            outputs(
+                b"null",
+                r#"foreach range(50) as $x (""; . + "x") | select(length == 50)"#
+            ),
+            [r#""xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx""#]
+        );
+        assert_eq!(
+            outputs(
+                b"null",
+                r"foreach range(50) as $x ([]; . + [$x]) | select(length == 50)"
+            ),
+            ["[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49]"]
         );
     }
 

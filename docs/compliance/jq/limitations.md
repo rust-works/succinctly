@@ -3273,9 +3273,8 @@ second time regardless -- two O(current-size) copies per step either way,
 just memcpy instead of serialize/parse).
 
 [#2157](https://github.com/rust-works/succinctly/issues/2157) fixed the
-remaining O(n²) shape for the two call sites that actually matter --
-`try_reduce_step_alternatives`/`try_foreach_step_alternatives`'s own fold
-loops, where the accumulator `state: OwnedValue` is confirmed unaliased
+remaining O(n²) shape for `try_reduce_step_alternatives`'s own fold loop,
+where the accumulator `state: OwnedValue` is confirmed unaliased
 (unconditionally overwritten immediately after this call, with no live
 borrow of the old value surviving) -- via a new `try_owned_accumulator_step`
 that recognizes the same `. + <literal>`-shaped UPDATE body
@@ -3293,13 +3292,13 @@ Measured post-fix scaling curve (`reduce range(N) as $x (""; . + "x") |
 length`, wall-clock via bash's `time` builtin, output verified identical to
 pre-fix at every N):
 
-| N | pre-#2157 | post-#2157 |
-|---|---|---|
-| 6,250 | 6ms | 6ms |
-| 12,500 | 9ms | 7ms |
-| 25,000 | 18ms | 10ms |
-| 50,000 | 38ms | 16ms |
-| 99,999 | 135ms | 29ms |
+| N      | pre-#2157 | post-#2157 |
+|--------|-----------|------------|
+| 6,250  | 6ms       | 6ms        |
+| 12,500 | 9ms       | 7ms        |
+| 25,000 | 18ms      | 10ms       |
+| 50,000 | 38ms      | 16ms       |
+| 99,999 | 135ms     | 29ms       |
 
 Pre-fix time roughly doubles-plus per doubling of N throughout (the O(n²)
 signature); post-fix growth is close to linear once the ~5-6ms
@@ -3307,12 +3306,43 @@ process-startup floor is netted out (net time 6,250->99,999: ~1ms->~24ms,
 a 16x range of N for a ~24x time increase, vs. pre-fix's ~1ms->~130ms net,
 a ~130x increase over the same range).
 
+**`try_foreach_step_alternatives` shares the identical `try_owned_accumulator_step`
+call (the same unaliased-`state` reasoning applies equally to its own fold
+loop) but does not reach the same O(n) result, and this doc originally
+claimed otherwise -- corrected here per review.** `reduce` only ever reads
+its accumulator once per step (as the next step's input); `foreach` reads
+it *twice* -- once to hand to EXTRACT (or push directly to `outputs` when
+EXTRACT is omitted, `foreach`'s default per-step-emit behavior), and again
+as the next step's `state` -- and a plain by-value move can eliminate only
+one of the two reads, not both, since each needs its own owned copy. A
+first version of this fix moved `state` into `try_owned_accumulator_step`
+but then still cloned `update_vals.last()` for the next `state` *after* the
+EXTRACT loop had already needed to borrow `update_vals` -- paying both
+clones anyway (review caught this: interleaved benchmarking of that version
+against the pre-fix baseline showed no measurable difference, confirming
+zero benefit had actually landed). The corrected version defers taking
+`state` from `update_vals` until after the EXTRACT loop no longer needs to
+borrow it, so that one read becomes a real move -- landing one clone per
+step instead of two, not zero. Measured (`foreach range(99999) as $x (""; .
++ "x") | empty`, wall-clock, 5 interleaved reps): pre-fix ~6.48s average,
+post-fix ~6.05s average, a real but modest **~7%** improvement -- nowhere
+near `reduce`'s near-linear result, because the EXTRACT/output-emit clone
+is structurally unavoidable here and dominates the total cost regardless.
+Emitting a growing accumulator once per step is itself O(n²) in total
+output size no matter how efficiently `state` is threaded internally (the
+same "quadratic by output shape" property noted elsewhere in this
+codebase's own benchmarking discipline) -- genuinely fixing `foreach`'s own
+asymptotic behavior would need `eval_owned_fast_path` extended to cover
+common EXTRACT shapes too (starting with `empty`, currently absent from its
+match and so still round-tripping through the reindex bridge per step
+regardless of this fix), which is out of scope here.
+
 **Bonus, not part of #2157's own stated scope**: `owned_arith_accumulator_shape`
 calls the same `literal_shaped_expr_to_owned` [#2152](https://github.com/rust-works/succinctly/issues/2152)
 already extended to recognize literal-shaped `Expr::Array`/`Expr::Object`
 right-hand sides, so the array/object-accumulator idioms #2152 closed at
 the *constant-factor* level (still cloning via `eval_owned_fast_path`) get
-the same by-value treatment at these two fold-loop call sites, for free --
+the same by-value treatment `reduce`'s own fold loop gets above, for free --
 confirmed live: `reduce range(25000) as $x ([]; . + [$x]) | length` dropped
 from ~1.25s to ~0.013s (~96x), and `reduce (range(5000) | tostring) as $x
 ({}; . + {($x): $x}) | length` dropped from ~0.42s to ~0.010s (~42x), both
@@ -3394,11 +3424,13 @@ shape `eval_owned_fast_path` doesn't cover): `[0,""] | until(.[0] >= N;
 new `100000` ceiling in this build, against real jq's own apparently-linear
 ~0.1-0.2s at the same N (confirmed live). #2086's fix (see the previous
 section -- a constant-factor win, not an asymptotic one; #2157 fixed the
-remaining O(n²) shape, but only at `reduce`/`foreach`'s own fold-loop call
-sites, not `eval_owned_fast_path` itself, so `until`/`while`'s separate
-step mechanism below is unaffected by it either way) brought that analogous
-`reduce` figure down from ~7.8s to ~0.17s for `reduce`/`foreach`'s *bare*
-accumulator shape (`. + <literal>`) -- but this `until`/`while` repro's own state is
+remaining O(n²) shape for `reduce`'s own fold loop specifically (see the
+previous section's own correction for why `foreach`'s otherwise-identical
+call site doesn't reach the same result), not `eval_owned_fast_path`
+itself, so `until`/`while`'s separate step mechanism below is unaffected by
+it either way) brought that analogous `reduce` figure down from ~7.8s to
+~0.17s for `reduce`/`foreach`'s *bare* accumulator shape (`. + <literal>`)
+-- but this `until`/`while` repro's own state is
 array-wrapped (`[.[0]+1, .[1] + "x"]`, since a loop needs a counter *and* an
 accumulator, unlike `reduce`/`foreach`'s cleanly separate INIT-vs-`$x`
 shape), so neither inner arithmetic's left operand is the bare `.`
