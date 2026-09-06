@@ -13,8 +13,8 @@ use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::Path;
 
 use succinctly::jq::document::{
-    child_tail_gap_ok, container_tail_gap_ok, effective_keys, DisplayKeyGuard, DocumentCursor,
-    DocumentElements, DocumentFields, DocumentValue, IndentSpec, JsonConvention,
+    effective_keys, tail_gap_ok, DisplayKeyGuard, DocumentCursor, DocumentElements, DocumentFields,
+    DocumentValue, IndentSpec, JsonConvention,
 };
 use succinctly::jq::escape::AsciiEscapeWriter;
 use succinctly::jq::eval_generic::{
@@ -1215,15 +1215,12 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
             return Err(f.malformed_member_error());
         }
         // #2403: with `cursor` in hand (every level but the true top),
-        // `container_tail_gap_ok` closes #2211's `{,}` gap the same way
-        // `eval_generic::to_owned_at_depth` does since #2358 --
-        // `child_tail_gap_ok` alone (the `None` fallback, only ever hit at
-        // the true top level) still can't, for the reason this function's
-        // own doc comment above explains.
-        match cursor {
-            Some(c) => container_tail_gap_ok(c, last_field.as_ref(), b'}')?,
-            None => child_tail_gap_ok(last_field.as_ref(), b'}')?,
-        }
+        // `tail_gap_ok` closes #2211's `{,}` gap the same way
+        // `eval_generic::to_owned_at_depth` does since #2358 -- its own
+        // `None` fallback (only ever hit at the true top level) still
+        // can't, for the reason this function's own doc comment above
+        // explains.
+        tail_gap_ok(cursor, last_field.as_ref(), b'}')?;
         OwnedValue::Object(map)
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();
@@ -1251,10 +1248,7 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
             is_first = false;
         }
         // #2403: same reasoning as the object arm's own check above.
-        match cursor {
-            Some(c) => container_tail_gap_ok(c, last_elem.as_ref(), b']')?,
-            None => child_tail_gap_ok(last_elem.as_ref(), b']')?,
-        }
+        tail_gap_ok(cursor, last_elem.as_ref(), b']')?;
         OwnedValue::Array(items)
     } else if value.is_null() {
         OwnedValue::Null

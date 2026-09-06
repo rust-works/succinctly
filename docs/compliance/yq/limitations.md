@@ -670,8 +670,19 @@ stray `,` *after* a real last child, `[1,]`/`{"a":1,}`). Only the second is adda
 `container_gap_ok` needs a cursor to the container itself, and this function (like
 `eval_generic::to_owned_at_depth`) is only ever given a bare `value: &V` — once a container's
 child walk is exhausted there is no cursor left to find its opening bracket from. `[,]`/`{,}`
-therefore remain silently accepted; `[1,]`/`{"a":1,}` now correctly raise, confirmed live and
-CLI-reachable:
+therefore remained silently accepted at the time; `[1,]`/`{"a":1,}` now correctly raise,
+confirmed live and CLI-reachable:
+
+**Update (#2403)**: the "no cursor left to find its opening bracket from" premise above no
+longer holds for nested containers. `container_gap_ok` needs a cursor to the container
+itself, but every recursive call into `to_owned_canonicalizing_numbers_at_depth` already
+resolves the child's own cursor (`field.value_cursor`, `elem_cursor`) for an unrelated
+reason and previously discarded it — threading it through (via the shared `tail_gap_ok`
+helper in `document.rs`, mirroring #2358's identical fix for `eval_generic::to_owned_at_depth`)
+lets `container_tail_gap_ok` close `[,]`/`{,}` for every *nested* container the same way
+`to_owned_cursor_at_depth` always could. Only the true top level
+(`to_owned_canonicalizing_numbers`'s own depth-0 entry point, which has no cursor to give in
+the first place) keeps the gap now.
 
 ```console
 $ echo '[1,]' | succinctly yq --slurp --input-format json -o json '.[0]'

@@ -1674,6 +1674,34 @@ pub fn container_tail_gap_ok<C: DocumentCursor>(
     }
 }
 
+/// The post-loop tail check for a container walk that only *sometimes* holds
+/// the container's own cursor.
+///
+/// Used by a recursive value-domain materializer (`eval::to_owned_at_depth`,
+/// `eval_generic::to_owned_at_depth`, `yq_runner::
+/// to_owned_canonicalizing_numbers_at_depth`) whose public entry point
+/// starts at `cursor: None` (no container cursor exists yet) and whose own
+/// recursive calls pass `Some` (the child cursor each already resolved for
+/// an unrelated reason, per #2358/#2403). Delegates to
+/// [`container_tail_gap_ok`] when a cursor is available (closing #2211's
+/// `{,}`/`[,]` check) or [`child_tail_gap_ok`]'s weaker fallback when it
+/// isn't (the true top level, where the gap remains open by construction --
+/// see those two functions' own doc comments for why).
+///
+/// Extracted (#2403 review) after the identical 4-line `match cursor { ... }`
+/// was hand-copied into three separate files -- one call this instead of a
+/// fourth (or fifth) copy.
+pub fn tail_gap_ok<C: DocumentCursor>(
+    cursor: Option<&C>,
+    last_child: Option<&C>,
+    close_char: u8,
+) -> Result<(), EvalError> {
+    match cursor {
+        Some(c) => container_tail_gap_ok(c, last_child, close_char),
+        None => child_tail_gap_ok(last_child, close_char),
+    }
+}
+
 /// [`trailing_element_gap_ok`], for a key-only object walk that has
 /// tracked only the last field's *key* cursor (`census`, `checked_len`,
 /// `contains_checked`'s exhaustion path, [`DistinctKeyCursors`]'s own

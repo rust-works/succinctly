@@ -30,9 +30,9 @@ use super::document::{
     child_tail_gap_ok, collapsed_fields, collapsed_fields_if, container_tail_gap_ok,
     effective_fields_checked, effective_fields_with_raw_last, effective_keys,
     effective_len_checked, key_delimiter_ok, key_display_string, key_display_string_kind,
-    key_is_malformed, resolve_display_key, trailing_element_gap_ok, value_delimiter_ok,
-    DisplayKeyGuard, DistinctKeyCursors, DocumentCursor, DocumentElements, DocumentFields,
-    DocumentValue, IndentSpec, JsonConvention,
+    key_is_malformed, resolve_display_key, tail_gap_ok, trailing_element_gap_ok,
+    value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors, DocumentCursor, DocumentElements,
+    DocumentFields, DocumentValue, IndentSpec, JsonConvention,
 };
 use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, binary_fanout_rules, bind_def, bind_def_call,
@@ -372,15 +372,11 @@ fn to_owned_at_depth<V: DocumentValue>(
             return Err(f.malformed_member_error());
         }
         // #2358: with `cursor` in hand (every level but the true top),
-        // `container_tail_gap_ok` closes #2211's `{,}` gap the same way
-        // `to_owned_cursor_at_depth` always could -- `child_tail_gap_ok`
-        // alone (the `None` fallback, only ever hit at the true top level)
-        // still can't, for the reason this function's own doc comment
-        // above explains.
-        match cursor {
-            Some(c) => container_tail_gap_ok(c, last_field.as_ref(), b'}')?,
-            None => child_tail_gap_ok(last_field.as_ref(), b'}')?,
-        }
+        // `tail_gap_ok` closes #2211's `{,}` gap the same way
+        // `to_owned_cursor_at_depth` always could -- its own `None` fallback
+        // (only ever hit at the true top level) still can't, for the reason
+        // this function's own doc comment above explains.
+        tail_gap_ok(cursor, last_field.as_ref(), b'}')?;
         Ok(OwnedValue::Object(map))
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();
@@ -408,10 +404,7 @@ fn to_owned_at_depth<V: DocumentValue>(
             is_first = false;
         }
         // #2358: same reasoning as the object arm's own check above.
-        match cursor {
-            Some(c) => container_tail_gap_ok(c, last_elem.as_ref(), b']')?,
-            None => child_tail_gap_ok(last_elem.as_ref(), b']')?,
-        }
+        tail_gap_ok(cursor, last_elem.as_ref(), b']')?;
         Ok(OwnedValue::Array(items))
     // Then check scalars in order of specificity
     } else if value.is_null() {
