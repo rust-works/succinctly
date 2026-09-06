@@ -84895,4 +84895,225 @@ mod tests {
         );
         query!(br"5", "(implode)?", QueryResult::None => {});
     }
+
+    /// #1351: `alias_identity`'s redirect and mirror, exercised directly on
+    /// hand-built tables so each gate is pinned independently of the CLI
+    /// tests that drive the same code end to end.
+    #[cfg(feature = "std")]
+    mod alias_identity_tests_1351 {
+        use super::*;
+
+        fn json(s: &str) -> OwnedValue {
+            parse_complete_json(s, false).unwrap()
+        }
+
+        fn path(keys: &[&str]) -> Vec<OwnedValue> {
+            keys.iter()
+                .map(|k| match k.parse::<i64>() {
+                    Ok(i) => OwnedValue::Int(i),
+                    Err(_) => OwnedValue::String((*k).to_string()),
+                })
+                .collect()
+        }
+
+        /// One `Field`/`Index`/`Iterate` component per entry, so a redirected
+        /// `Expr` can be compared without depending on how the parser nests
+        /// a `Pipe`.
+        fn steps(expr: &Expr) -> Vec<String> {
+            let mut flat = Vec::new();
+            push_path_components(&mut flat, expr);
+            flat.iter()
+                .map(|c| match unwrap_path_component(c).0 {
+                    Expr::Field(name) => name.clone(),
+                    Expr::Index { idx, .. } => idx.to_string(),
+                    Expr::Iterate => "[]".to_string(),
+                    other => format!("{other:?}"),
+                })
+                .collect()
+        }
+
+        fn table() -> alias_identity::AliasTable {
+            // a: &x {p: 1, q: 2} / b: *x / c: *x
+            alias_identity::AliasTable::from_groups(vec![(
+                path(&["a"]),
+                vec![path(&["b"]), path(&["c"])],
+            )])
+        }
+
+        const DOC: &str = r#"{"a":{"p":1,"q":2},"b":{"p":1,"q":2},"c":{"p":1,"q":2}}"#;
+
+        fn redirected(
+            filter: &str,
+            doc: &OwnedValue,
+            opts: alias_identity::Redirect,
+        ) -> Vec<Vec<String>> {
+            let mut paths = vec![parse(filter).unwrap()];
+            alias_identity::redirect_paths(&mut paths, doc, opts);
+            paths.iter().map(steps).collect()
+        }
+
+        const THROUGH: alias_identity::Redirect = alias_identity::Redirect {
+            through_terminal: false,
+            fan_out_iterate: true,
+        };
+
+        #[test]
+        fn nothing_installed_is_a_no_op() {
+            let doc = json(DOC);
+            assert!(!alias_identity::active());
+            assert_eq!(redirected(".b.p", &doc, THROUGH), vec![vec!["b", "p"]]);
+            let mut post = json(r#"{"a":{"p":9},"b":{"p":1}}"#);
+            alias_identity::mirror_after_write(&json(r#"{"a":{"p":1},"b":{"p":1}}"#), &mut post);
+            assert_eq!(post, json(r#"{"a":{"p":9},"b":{"p":1}}"#));
+        }
+
+        #[test]
+        fn proper_prefix_redirects_and_terminal_does_not() {
+            let _guard = alias_identity::enter(table());
+            let doc = json(DOC);
+            assert_eq!(redirected(".b.p", &doc, THROUGH), vec![vec!["a", "p"]]);
+            assert_eq!(redirected(".c.q", &doc, THROUGH), vec![vec!["a", "q"]]);
+            // Rule 1: a path ending exactly at the alias is left alone...
+            assert_eq!(redirected(".b", &doc, THROUGH), vec![vec!["b"]]);
+            // ...unless the caller asked for the terminal too (`|=` with a
+            // shape-preserving filter).
+            let terminal = alias_identity::Redirect {
+                through_terminal: true,
+                fan_out_iterate: true,
+            };
+            assert_eq!(redirected(".b", &doc, terminal), vec![vec!["a"]]);
+            // Paths off the alias positions are untouched.
+            assert_eq!(redirected(".a.p", &doc, THROUGH), vec![vec!["a", "p"]]);
+            assert_eq!(redirected(".zzz.p", &doc, THROUGH), vec![vec!["zzz", "p"]]);
+        }
+
+        #[test]
+        fn equality_gate_refuses_a_rebound_position() {
+            let _guard = alias_identity::enter(table());
+            // `b` was rebound to 5 earlier in the pipe: no longer the shared node.
+            let doc = json(r#"{"a":{"p":1,"q":2},"b":5,"c":{"p":1,"q":2}}"#);
+            assert_eq!(redirected(".b.p", &doc, THROUGH), vec![vec!["b", "p"]]);
+            assert_eq!(redirected(".c.p", &doc, THROUGH), vec![vec!["a", "p"]]);
+            // A deleted anchor leaves nothing to redirect to (rule 7).
+            let doc = json(r#"{"b":{"p":1,"q":2},"c":{"p":1,"q":2}}"#);
+            assert_eq!(redirected(".b.p", &doc, THROUGH), vec![vec!["b", "p"]]);
+        }
+
+        #[test]
+        fn iterate_fans_out_only_over_aliases_and_only_when_asked() {
+            let _guard = alias_identity::enter(table());
+            let doc = json(DOC);
+            assert_eq!(
+                redirected(".[].p", &doc, THROUGH),
+                vec![vec!["a", "p"], vec!["a", "p"], vec!["a", "p"]]
+            );
+            let no_fan = alias_identity::Redirect {
+                through_terminal: false,
+                fan_out_iterate: false,
+            };
+            assert_eq!(redirected(".[].p", &doc, no_fan), vec![vec!["[]", "p"]]);
+            // No alias lives under `.a`, so its iterate is left to the walker.
+            assert_eq!(
+                redirected(".a[].z", &doc, THROUGH),
+                vec![vec!["a", "[]", "z"]]
+            );
+        }
+
+        #[test]
+        fn multi_hop_and_negative_index_normalisation() {
+            // x: &y {z: 0} / a: &x {q: *y} / b: *x, and l: [&s {p: 1}, *s] --
+            // an alias reached through an array index.
+            let table = alias_identity::AliasTable::from_groups(vec![
+                (path(&["x"]), vec![path(&["a", "q"])]),
+                (path(&["a"]), vec![path(&["b"])]),
+                (path(&["l", "0"]), vec![path(&["l", "1"])]),
+            ]);
+            let _guard = alias_identity::enter(table);
+            let doc =
+                json(r#"{"x":{"z":0},"a":{"q":{"z":0}},"b":{"q":{"z":0}},"l":[{"p":1},{"p":1}]}"#);
+            assert_eq!(redirected(".b.q.z", &doc, THROUGH), vec![vec!["x", "z"]]);
+            // `.l[-1]` names the same slot as `.l[1]` for the table lookup; the
+            // components after a redirected prefix are kept as written.
+            assert_eq!(
+                redirected(".l[-1].p", &doc, THROUGH),
+                vec![vec!["l", "0", "p"]]
+            );
+            assert_eq!(
+                redirected(".l[1].p", &doc, THROUGH),
+                vec![vec!["l", "0", "p"]]
+            );
+            // Out of range: the static walk stops and the path is left as is.
+            assert_eq!(
+                redirected(".l[7].k", &doc, THROUGH),
+                vec![vec!["l", "7", "k"]]
+            );
+        }
+
+        #[test]
+        fn concrete_paths_redirect_and_slice_descriptors_bail() {
+            let _guard = alias_identity::enter(table());
+            let doc = json(DOC);
+            let mut p = path(&["b", "p"]);
+            alias_identity::redirect_concrete_path(&mut p, &doc);
+            assert_eq!(p, path(&["a", "p"]));
+            let mut terminal = path(&["b"]);
+            alias_identity::redirect_concrete_path(&mut terminal, &doc);
+            assert_eq!(terminal, path(&["b"]));
+            let slice = json(r#"{"start":0,"end":1}"#);
+            let mut with_slice = vec![OwnedValue::String("b".into()), slice.clone()];
+            alias_identity::redirect_concrete_path(&mut with_slice, &doc);
+            assert_eq!(with_slice, vec![OwnedValue::String("b".into()), slice]);
+        }
+
+        #[test]
+        fn mirror_copies_untouched_slots_and_skips_rebound_ones() {
+            let _guard = alias_identity::enter(table());
+            let pre = json(DOC);
+            // The write landed on the anchor; `b` is untouched, `c` was rebound.
+            let mut post = json(r#"{"a":{"p":9,"q":2},"b":{"p":1,"q":2},"c":null}"#);
+            alias_identity::mirror_after_write(&pre, &mut post);
+            assert_eq!(
+                post,
+                json(r#"{"a":{"p":9,"q":2},"b":{"p":9,"q":2},"c":null}"#)
+            );
+            // A slot that was not a copy of the anchor before the write is
+            // never written even if it still equals its own pre-write value.
+            let pre = json(r#"{"a":{"p":1,"q":2},"b":5,"c":{"p":1,"q":2}}"#);
+            let mut post = json(r#"{"a":{"p":9,"q":2},"b":5,"c":{"p":1,"q":2}}"#);
+            alias_identity::mirror_after_write(&pre, &mut post);
+            assert_eq!(post, json(r#"{"a":{"p":9,"q":2},"b":5,"c":{"p":9,"q":2}}"#));
+        }
+
+        #[test]
+        fn mirror_reaches_a_fixpoint_over_nested_groups() {
+            // a: &x {p: &y 1, q: *y} / b: *x -- group order puts the outer
+            // anchor first, so the inner alias's update must be picked up by a
+            // second pass.
+            let table = alias_identity::AliasTable::from_groups(vec![
+                (path(&["a"]), vec![path(&["b"])]),
+                (path(&["a", "p"]), vec![path(&["a", "q"])]),
+            ]);
+            let _guard = alias_identity::enter(table);
+            let pre = json(r#"{"a":{"p":1,"q":1},"b":{"p":1,"q":1}}"#);
+            let mut post = json(r#"{"a":{"p":5,"q":1},"b":{"p":1,"q":1}}"#);
+            alias_identity::mirror_after_write(&pre, &mut post);
+            assert_eq!(post, json(r#"{"a":{"p":5,"q":5},"b":{"p":5,"q":5}}"#));
+        }
+
+        #[test]
+        fn guard_restores_the_previous_table() {
+            assert!(!alias_identity::active());
+            {
+                let _outer = alias_identity::enter(table());
+                assert!(alias_identity::active());
+                {
+                    let _inner =
+                        alias_identity::enter(alias_identity::AliasTable::from_groups(vec![]));
+                    assert!(alias_identity::active());
+                }
+                assert!(alias_identity::active());
+            }
+            assert!(!alias_identity::active());
+        }
+    }
 }
