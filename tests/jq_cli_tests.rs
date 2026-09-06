@@ -22239,6 +22239,58 @@ fn test_jq_computed_float_scientific_notation_tostring_2456() -> Result<()> {
     Ok(())
 }
 
+/// #2543: `--null-input` (`-n`) mode's own top-level evaluation entry point
+/// (`evaluate_input_streaming`, always the sink-based/streaming evaluator --
+/// unlike file/piped input, which can pick the eager evaluator instead)
+/// reached a *different* bug than #2456 fixed: a computed value immediately
+/// followed by `tostring`/a format function/string interpolation was routed
+/// through `eval_each_owned` wrapped in a single-element `Expr::Pipe`, which
+/// `eval_owned_fast_path` (`eval.rs`) didn't recognize as the same shape its
+/// own bare-`Builtin(ToString)` arm matches (and had no `Expr::Format` arm
+/// for at all) -- falling through to a JSON round-trip that rebakes the
+/// already-correct scientific-notation spelling as a document-sourced
+/// literal, so `tostring`'s own literal-preserving convention (uppercase
+/// `E`) applied instead of the computed-value one (lowercase `e`). Every
+/// case here is confirmed live against jq 1.7.1 with `-n` specifically (the
+/// non-`-n` piped equivalent already passed before this fix).
+#[test]
+fn test_jq_null_input_computed_float_scientific_notation_2543() -> Result<()> {
+    for (filter, want) in [
+        ("(2 * 1e16) | tostring", "\"2e+16\""),
+        ("(2 * 1e16) | @json", "\"2e+16\""),
+        (r#""\(2 * 1e16)""#, "\"2e+16\""),
+        ("[2 * 1e16] | @csv", "\"2e+16\""),
+        ("(1 * 1e15) | tostring", "\"1000000000000000\""),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(
+            code, 0,
+            "for {filter:?}: stdout={stdout:?} stderr={stderr:?}"
+        );
+        assert_eq!(stdout.trim_end(), want, "for {filter:?}");
+    }
+    Ok(())
+}
+
+/// #2543 review: the fix above must stay narrow enough to preserve
+/// short-circuit demand -- routing *any* single remaining pipe stage
+/// through `eval_on_owned` (rather than only the side-effect-free
+/// `Expr::Format`/`Builtin::ToString` shapes) made `first(...)` evaluate a
+/// comma's later branch it must never reach. `-n` specifically, since that's
+/// the evaluation path the fix touches; the equivalent piped-input case is
+/// already pinned by `test_short_circuit_side_effect_shapes_already_match_jq_820`.
+#[test]
+fn test_jq_null_input_first_over_comma_still_short_circuits_2543() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "first(1 | (1, (\"B\" | stderr)))"], None)?;
+    assert_eq!(code, 0, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout.trim_end(), "1");
+    assert_eq!(
+        stderr, "",
+        "stderr must stay empty -- the second comma branch's `stderr` side effect must never run"
+    );
+    Ok(())
+}
+
 /// #1051: `builtin_stderr` gained an `S: EvalSemantics` parameter so yq mode
 /// can echo a `NumberLiteral` verbatim; confirm jq mode's own container
 /// formatting (`format_number_jq_compat`'s uppercase-`E` reformatting) is
