@@ -230,6 +230,11 @@ $ printf 'a: &x 1\nb: *x\n' | succinctly yq '.b'
 1
 ```
 
+[#2486](https://github.com/rust-works/succinctly/issues/2486) extended the same fallback to
+every M2-streamable filter, not just identity (`--sort-keys '.outer'`, `--sort-keys '.[]'`,
+...) — the fallback now evaluates the real filter expression instead of always assuming `.`,
+so any shape that can reach the M2 fast path gets the same soundness check.
+
 Related open items in the same family, still unresolved:
 [#1359](https://github.com/rust-works/succinctly/issues/1359) (a write that changes a node's
 kind drops its `&anchor`, where real yq keeps it),

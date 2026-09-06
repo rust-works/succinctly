@@ -24974,18 +24974,17 @@ fn test_yaml_root_alias_container_target_no_spurious_anchor_1350() -> Result<()>
 
 /// Code review on #1350's fix: an earlier version gated the DOM fallback on
 /// `sort_keys && index.has_aliases()` alone, with no `is_identity` check --
-/// but `stream_yaml_sort_keys_alias_fallback` always evaluates
+/// but `stream_yaml_sort_keys_alias_fallback` always evaluated
 /// `&Expr::Identity`, not the real filter. A non-identity M2-streamable
 /// filter (`.outer`) combined with `--sort-keys` on an alias-bearing
 /// document would have silently ignored `.outer` and streamed the *whole*
 /// identity-evaluated document instead -- caught before merge by exactly
 /// this test failing under the broad gate.
 ///
-/// This does not close the soundness gap for non-identity filters (`.outer`
-/// here can still emit an alias above its anchor -- confirmed live, still
-/// unreadable by `succinctly yq` itself); it only pins that the *value*
-/// returned is correct, not silently replaced by the whole document. The
-/// non-identity soundness gap is real and separate, filed as a follow-up.
+/// #2486 later generalized the fallback to take the real `expr` instead of
+/// a hardcoded identity, which also closed the soundness gap this test's
+/// own comment used to describe as open -- see
+/// `test_yaml_sort_keys_non_identity_filter_takes_dom_path_2486` for that.
 #[test]
 fn test_yaml_sort_keys_non_identity_filter_still_applies_1350() -> Result<()> {
     let input = "outer:\n  b: &x 1\n  a: *x\nunrelated: 99\n";
@@ -24999,6 +24998,56 @@ fn test_yaml_sort_keys_non_identity_filter_still_applies_1350() -> Result<()> {
         output.contains('1'),
         "must contain .outer's own content: {output:?}"
     );
+    Ok(())
+}
+
+/// #2486: `stream_yaml_sort_keys_alias_fallback` now takes the real `expr`
+/// instead of a hardcoded `Expr::Identity` (#1350 only covered identity
+/// output), so a non-identity M2-streamable filter combined with
+/// `--sort-keys` over an alias-bearing document takes the same sound DOM
+/// route identity output already did -- matches `-P`, and re-parses.
+#[test]
+fn test_yaml_sort_keys_non_identity_filter_takes_dom_path_2486() -> Result<()> {
+    let input = "outer:\n  b: &x 1\n  a: *x\nunrelated: 99\n";
+
+    let (streamed, code) = run_yq_stdin(".outer", input, &["--sort-keys"])?;
+    assert_eq!(code, 0);
+    let (dom_forced, code) = run_yq_stdin(".outer", input, &["--sort-keys", "-P"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        streamed, dom_forced,
+        "streaming and DOM-forced (-P) output must agree"
+    );
+
+    let (_, reread_code) = run_yq_stdin(".", &streamed, &[])?;
+    assert_eq!(
+        reread_code, 0,
+        ".outer's sorted output must be readable by succinctly yq itself, output: {streamed}"
+    );
+    Ok(())
+}
+
+/// #2486: the same fix must hold for a filter that walks *into* a document
+/// with aliases in more than one place, and for a filter that fans a
+/// single input out into multiple documents (`.[]`), not just a single
+/// field access.
+#[test]
+fn test_yaml_sort_keys_non_identity_filter_multi_output_2486() -> Result<()> {
+    let input = "outer:\n  b: &x 1\n  a: *x\nlist:\n  - m: &y 1\n    n: *y\n";
+
+    let (streamed, code) = run_yq_stdin(".[]", input, &["--sort-keys"])?;
+    assert_eq!(code, 0);
+    let (dom_forced, code) = run_yq_stdin(".[]", input, &["--sort-keys", "-P"])?;
+    assert_eq!(code, 0);
+    assert_eq!(streamed, dom_forced);
+
+    for doc in streamed.split("---\n") {
+        if doc.trim().is_empty() {
+            continue;
+        }
+        let (_, reread_code) = run_yq_stdin(".", doc, &[])?;
+        assert_eq!(reread_code, 0, "each document must re-parse: {doc:?}");
+    }
     Ok(())
 }
 
