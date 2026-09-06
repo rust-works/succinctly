@@ -3310,11 +3310,11 @@ mod tests {
                 "jq_float_is_scientific for {f:e}"
             );
             assert_eq!(jq_bare_float_display(f), want, "for {f:e}");
+            let neg = -f;
             assert_eq!(
-                jq_bare_float_display(-f),
+                jq_bare_float_display(neg),
                 format!("-{want}"),
-                "for {:e}",
-                -f
+                "for {neg:e}"
             );
         }
     }
