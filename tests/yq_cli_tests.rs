@@ -24664,19 +24664,17 @@ fn test_yaml_write_inside_anchored_container_keeps_anchor_763() -> Result<()> {
 }
 
 #[test]
-fn test_yaml_write_through_alias_drops_the_mark_rather_than_the_write_763() -> Result<()> {
-    // DELIBERATE DIVERGENCE. Real yq models an alias as a shared node, so
-    // `.b.p = 9` mutates the anchor's own value and prints
-    // `a: &x {p: 9}\nb: *x\n`. succinctly's alias sync is one-directional
-    // (anchor -> aliases), so `.a` still holds `{p: 1}` here. Emitting
-    // `b: *x` on top of that would silently throw the write away and print
-    // `p: 1` back; the soundness gate sees the two values disagree and drops
-    // the mark instead, so the computed value survives. Tracked separately
-    // as the alias-identity follow-up.
+fn test_yaml_write_through_alias_reaches_the_shared_node_763_1351() -> Result<()> {
+    // Until #1351 this test pinned a DELIBERATE DIVERGENCE: succinctly's
+    // alias sync was one-directional, so `.b.p = 9` updated only `.b`, and
+    // the soundness gate dropped `b`'s mark rather than let `b: *x` discard
+    // the write (`a: &x {p: 1}\nb:\n  p: 9\n`). #1351's path redirect now
+    // lands the write on the anchor's node, as real yq does, and the mark
+    // survives because the values agree again.
     let input = "a: &x {p: 1}\nb: *x\n";
     let (output, exit_code) = run_yq_stdin(".b.p = 9", input, &[])?;
     assert_eq!(exit_code, 0);
-    assert_eq!(output, "a: &x {p: 1}\nb:\n  p: 9\n");
+    assert_eq!(output, "a: &x {p: 9}\nb: *x\n");
     Ok(())
 }
 
@@ -25056,14 +25054,34 @@ fn test_yaml_nested_alias_mark_is_dropped_at_its_own_path_763() -> Result<()> {
     // Exercises the soundness gate's path bookkeeping: the mark it clears
     // is two levels down, so it has to walk back to that exact node rather
     // than the root. Object and array steps both, since they take separate
-    // branches.
+    // branches. The write *ends* at the alias (a rebind to a different value
+    // of the same kind, so `reconcile_presentation` keeps the stale mark and
+    // only the gate can clear it); a write *through* the alias would instead
+    // be redirected onto the anchor since #1351 -- see the test below.
+    let (output, exit_code) =
+        run_yq_stdin(r#".o.b = {"p": 5}"#, "o:\n  a: &x {p: 1}\n  b: *x\n", &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "o:\n  a: &x {p: 1}\n  b:\n    p: 5\n");
+
+    let (output, exit_code) =
+        run_yq_stdin(r#".l[1] = {"p": 5}"#, "l:\n  - &x {p: 1}\n  - *x\n", &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "l:\n  - &x {p: 1}\n  - p: 5\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_nested_write_through_alias_keeps_the_mark_763_1351() -> Result<()> {
+    // The same two nested shapes written *through* the alias: #1351 redirects
+    // each onto the anchor two levels down, so the mark survives (verified
+    // against yq v4.53.3).
     let (output, exit_code) = run_yq_stdin(".o.b.p = 9", "o:\n  a: &x {p: 1}\n  b: *x\n", &[])?;
     assert_eq!(exit_code, 0);
-    assert_eq!(output, "o:\n  a: &x {p: 1}\n  b:\n    p: 9\n");
+    assert_eq!(output, "o:\n  a: &x {p: 9}\n  b: *x\n");
 
     let (output, exit_code) = run_yq_stdin(".l[1].p = 9", "l:\n  - &x {p: 1}\n  - *x\n", &[])?;
     assert_eq!(exit_code, 0);
-    assert_eq!(output, "l:\n  - &x {p: 1}\n  - p: 9\n");
+    assert_eq!(output, "l:\n  - &x {p: 9}\n  - *x\n");
     Ok(())
 }
 
