@@ -481,7 +481,7 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
 /// entirely (`1.0 + 4.0` prints `5`, not `5.0`). Named and shared, rather
 /// than a hand-copied `|f| f.to_string()` closure at each call site, per the
 /// #106 "duplicated predicates diverge silently" lesson in `CLAUDE.md` --
-/// [`to_json`](OwnedValue::to_json), [`to_json_for_reindex_at_depth`]'s
+/// [`to_json`](OwnedValue::to_json), `to_json_for_reindex_at_depth`'s
 /// jq-mode fallback, and [`stream::stream_owned_value_json_jq`](crate::jq::stream)
 /// all need this exact formatter.
 ///
