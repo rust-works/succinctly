@@ -3888,7 +3888,7 @@ described:
   jq's own hang, as ADR-0018 does not require — is the worse failure mode
   for the realistic inputs this magnitude range covers).
 
-### Unary minus in filter text destroys literal preservation — accepted divergence, ADR-0018 rule 4c (#2357)
+### Unary minus in filter text destroys literal preservation — inherits the `range` divergence's own rule 4(c) grant (#2357)
 
 Real jq preserves a number literal's exact source spelling through to output (`jq -n
 '1.0'` → `1.0`, `1e10` → `1E+10`), but a *unary minus written in the filter text* breaks
@@ -3927,13 +3927,23 @@ jq's `[]` came entirely from unary minus collapsing `from` to exactly `i64::MIN`
 magnitudes in as data (where jq keeps its literals) already showed the two tools
 disagreeing on `range` itself, underneath the unary-minus coincidence.
 
-**Accepted rather than matched (ADR-0018 rule 4c):** succinctly already diverges
-deliberately and wholesale from jq's `double`-based number model above `2^53` for this
-whole magnitude class (see the `range` divergence above, and #2131/#2089) — including cases
-where matching jq would mean reproducing a genuine hang. Making unary minus specifically
-collapse to `double`, while every other operation in the same class keeps the exact value,
-would make succinctly's own behavior *less* internally consistent, not more, for a single
-operator's worth of parity. Pinned by
+**Accepted rather than matched — not a fresh rule-4 exemption, the same one already
+granted above.** This is not an independent divergence needing its own justification: it is
+the necessary consequence of the `range` divergence's own accepted trade-off ("succinctly
+stays on the exact `i64` path where jq's own arithmetic would round, stall, or hang",
+above), which already covers this exact magnitude class under ADR-0018 rule 4(c) —
+avoiding **the same named failure mode** rule 4(c) rejected there: "silently degrading
+large-but-safe integers to `f64`". Making unary minus specifically force that same
+degradation, for the one syntactic shape "a literal token immediately preceded by `-`" and
+no other, would reintroduce precisely that failure mode for this operator alone — while
+`9223372036854775758` negated via `0 - 9223372036854775758`, or the identical magnitude
+arriving as data with its sign already attached, both keep the exact value today. A
+special case narrow enough to catch only the unary-minus spelling would need to specifically
+detect and degrade a literal it would otherwise preserve exactly, which is the regression
+the `range` fix's own rule-4(c) argument already ruled out for this magnitude class, not a
+new argument invented for this operator. ("The other operator does the same thing" is not
+itself a rule-4 condition — the condition being invoked here is 4(c), inherited from the
+`range` entry above, not re-derived from consistency alone.) Pinned by
 `test_unary_minus_destroys_literal_preservation_2357` (`tests/jq_cli_tests.rs`).
 
 ### `--argjson`/`--jsonargs` still reject a bare trailing decimal point with no exponent (`1.`) — accepted divergence, ADR-0018 rule 4c (#2240)
