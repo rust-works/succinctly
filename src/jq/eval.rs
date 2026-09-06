@@ -86102,4 +86102,41 @@ mod tests {
         assert!(!contains_assign(&expr));
         assert!(!is_alias_sensitive_assign(&expr));
     }
+
+    /// **The walk must not be exponential.** `def f1: f0|f0; def f2: f1|f1;
+    /// …` doubles the number of expansions per level, so without memoizing a
+    /// body's answer the gate is `O(2^n)` in the nesting depth: 24 levels
+    /// took 5.1s before the memo, and each further level doubled that.
+    ///
+    /// Memoizing is sound only *because* a body's scope is fixed at its
+    /// definition site, which makes the answer a function of the body alone.
+    ///
+    /// Calls the predicate **directly**, with no evaluation: `f0|f0` also
+    /// doubles the evaluator's own output count, so a CLI-level version of
+    /// this test measures that pre-existing cost rather than the gate's, and
+    /// its wall-clock bound then fails under `cargo llvm-cov`'s
+    /// instrumentation for reasons that have nothing to do with the gate.
+    /// 40 levels is ~10^12 expansions unmemoized — this test does not need a
+    /// timing assertion to fail, it simply would not finish.
+    #[test]
+    fn write_shape_gate_is_not_exponential_in_def_nesting_2091() {
+        let mut filter = String::from("def f0: .a = 1;");
+        let mut prev = String::from("f0");
+        for i in 1..=40 {
+            filter.push_str(&format!(" def f{i}: {prev}|{prev};"));
+            prev = format!("f{i}");
+        }
+        filter.push(' ');
+        filter.push_str(&prev);
+
+        let expr = parse(&filter).expect("filter should parse");
+        // Every level is a pipe of writes, so the whole thing is one.
+        assert!(is_alias_sensitive_assign(&expr));
+
+        // The same shape with a reshaping leaf must be refused, and just as
+        // cheaply -- a `false` answer walks the same tree.
+        let reshaping = filter.replacen("def f0: .a = 1;", "def f0: map(.);", 1);
+        let expr = parse(&reshaping).expect("filter should parse");
+        assert!(!is_alias_sensitive_assign(&expr));
+    }
 }

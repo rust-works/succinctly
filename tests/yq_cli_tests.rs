@@ -40061,39 +40061,4 @@ mod issue_2091_def_and_binder_wrapped_writes {
         }
         Ok(())
     }
-
-    /// **The walk must not be exponential.** `def f1: f0|f0; def f2: f1|f1;
-    /// …` doubles the number of expansions per level; without memoizing a
-    /// body's answer, 24 levels of it in a 421-byte filter spent 5.1s on a
-    /// two-line document, and each further level doubled that.
-    ///
-    /// Memoizing is sound only *because* a body's scope is now fixed at its
-    /// definition site, which makes the answer a function of the body alone.
-    ///
-    /// The bound here is deliberately loose -- it is guarding against
-    /// exponential blowup, not measuring the machine. Pre-fix this filter
-    /// took over 5s; the evaluator's own (pre-existing, semantic) cost for it
-    /// is well under a second.
-    #[test]
-    fn test_yaml_def_gate_is_not_exponential_2091() -> Result<()> {
-        let mut filter = String::from("def f0: empty;");
-        let mut prev = String::from("f0");
-        for i in 1..=24 {
-            filter.push_str(&format!(" def f{i}: {prev}|{prev};"));
-            prev = format!("f{i}");
-        }
-        filter.push(' ');
-        filter.push_str(&prev);
-
-        let start = std::time::Instant::now();
-        let (_output, code) = run_yq_stdin(&filter, DOC, &[])?;
-        let elapsed = start.elapsed();
-        assert_eq!(code, 0);
-        assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "24 nested doubling defs took {elapsed:?}; the gate is expanding \
-             each body more than once"
-        );
-        Ok(())
-    }
 }
