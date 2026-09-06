@@ -15158,7 +15158,12 @@ fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
 }
 
 /// `((e))` positions its output exactly as `e` does.
-fn strip_parens(mut expr: &Expr) -> &Expr {
+///
+/// `pub(super)` since #2481: `eval::yq_prepare_assign_targets` asks the same
+/// "what is this expression really" question of an assignment's right side,
+/// and a second copy of this two-line loop is exactly the duplicated-predicate
+/// shape (#106) this crate keeps one definition to avoid.
+pub(super) fn strip_parens(mut expr: &Expr) -> &Expr {
     while let Expr::Paren(inner) = expr {
         expr = inner;
     }

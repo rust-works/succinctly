@@ -19886,10 +19886,32 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         return QueryResult::Owned(unchanged);
     }
 
+    // #2481 (yq mode): create the target path(s) on a working copy *before*
+    // the right side runs, so the right side reads yq's already-mutated
+    // document. jq mode gets `None` here and keeps evaluating its RHS
+    // against the untouched input, exactly as before -- see
+    // [`yq_prepare_assign_targets`].
+    let resolved = match yq_noop_check {
+        YqAssignNoopCheck::Continue { pristine, paths } => Some((pristine, paths)),
+        YqAssignNoopCheck::Skip(_) => unreachable!("handled by the early return above"),
+        YqAssignNoopCheck::NotChecked => None,
+    };
+    let yq_targets = match yq_prepare_assign_targets::<W, S>(
+        path_expr, value_expr, &input, resolved, optional, true,
+    ) {
+        Ok(targets) => targets,
+        Err(early_return) => return early_return,
+    };
+
     // Evaluate the RHS once, keeping every output instead of collapsing to
     // the first (#392) -- shared with `eval_compound_assign`/
     // `eval_alternative_assign` (#1778/#1844).
-    let (rhs_values, terminal) = match collect_rhs_outputs::<W, S>(value_expr, &input, optional) {
+    let (rhs_values, terminal) = match collect_rhs_outputs::<W, S>(
+        value_expr,
+        &input,
+        yq_targets.as_ref().and_then(YqAssignTargets::rhs_document),
+        optional,
+    ) {
         Ok(v) => v,
         Err(early_return) => return early_return,
     };
@@ -19898,7 +19920,10 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // (#1844). See `normalize_rhs_values_for_fork`'s own doc comment for
     // the full rationale of both rules.
     let (rhs_values, terminal) = match normalize_rhs_values_for_fork::<W, S>(
-        rhs_values, terminal, optional, path_expr, &input,
+        rhs_values,
+        terminal,
+        optional,
+        yq_targets.as_ref().map(|targets| &targets.doc),
     ) {
         Ok(v) => v,
         Err(early_return) => return early_return,
@@ -19924,14 +19949,18 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // inside the path.
     // #1233 (code review): reuse `yq_noop_check`'s own resolution instead
     // of redoing an identical `to_owned_lossy` + `resolve_dynamic_indexes` pass
-    // -- see `YqAssignNoopCheck::Continue`'s doc comment. Only the
-    // `NotChecked` case (jq mode, or a genuinely dynamic path) still needs
-    // to resolve here from scratch, exactly as this function always did
-    // before that check existed.
-    let (pristine, paths) = match yq_noop_check {
-        YqAssignNoopCheck::Continue { pristine, paths } => (pristine, paths),
-        YqAssignNoopCheck::Skip(_) => unreachable!("handled by the early return above"),
-        YqAssignNoopCheck::NotChecked => {
+    // -- see `YqAssignNoopCheck::Continue`'s doc comment. Since #2481 that
+    // reuse rides through `yq_prepare_assign_targets`, which also owns the
+    // dynamic-path resolution in yq mode (real yq resolves its left side
+    // first, #1412); only jq mode still resolves here from scratch, exactly
+    // as this function always did before either check existed.
+    let (pristine, paths) = match yq_targets {
+        // yq mode: `yq_prepare_assign_targets` already resolved the paths
+        // and vivified them; its working copy *is* yq's document, so the
+        // writes below splice into that rather than into the untouched
+        // input (#2481).
+        Some(YqAssignTargets { doc, paths, .. }) => (doc, paths),
+        None => {
             // #1953: a non-decode-failure to_owned error (a #1194
             // malformed-member error -- a #1642 collision error is itself
             // tagged as a decode failure and so is unaffected by this)
@@ -20079,9 +20108,15 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// combinator here uses (#400, #494), so the zero-prefix case (a bare
 /// `Error`/`Break`) and the nonzero-prefix case (`Partial`) share one code
 /// path in [`normalize_rhs_values_for_fork`] below instead of two.
+///
+/// `vivified` is [`YqAssignTargets::rhs_document`]'s answer (#2481): the
+/// working copy the left side was already auto-created on, whenever creating
+/// it actually changed the document. The right side then reads *that*, not
+/// the input, which is what makes `.x = (keys)` on `a: 1` include `"x"`.
 fn collect_rhs_outputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value_expr: &Expr,
     input: &StandardJson<'a, W>,
+    vivified: Option<&OwnedValue>,
     optional: bool,
 ) -> Result<(Vec<OwnedValue>, Option<Control>), QueryResult<'a, W>> {
     // #2470 (yq mode): `assignUpdateOperator` runs a plain `=`'s right side
@@ -20096,7 +20131,19 @@ fn collect_rhs_outputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `update_path` instead, matching yq's own `SingleChildContext`, which
     // leaves `DontAutoCreate` alone. See `yq_read_only_context`.
     let _scope = S::READ_ONLY_ABSENT_KEY_IS_EMPTY.then(yq_read_only_context::enter);
-    match eval_single::<W, S>(value_expr, input.clone(), optional).materialize_cursor() {
+    // #2481: `eval_owned_input` round-trips the working copy through a
+    // throwaway document, so a node's own *position* (`line`/`column`/
+    // `style`) is not preserved across it -- which is why `rhs_document`
+    // hands this `None` whenever auto-creating the target changed nothing,
+    // keeping the far more common case on the input cursor. (Those three
+    // builtins already read `0`/`""` from an assignment's right side on the
+    // cursor route too, so nothing regresses either way; see
+    // `docs/compliance/yq/limitations.md`.)
+    let evaluated = match vivified {
+        Some(doc) => eval_owned_input::<W, S>(value_expr, doc, optional),
+        None => eval_single::<W, S>(value_expr, input.clone(), optional),
+    };
+    match evaluated.materialize_cursor() {
         QueryResult::One(v) => match to_owned(&v) {
             Ok(owned) => Ok((vec![owned], None)),
             Err(e) => Err(suppress_or_raise(e, optional)),
@@ -20126,7 +20173,8 @@ fn collect_rhs_outputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ///   short-circuits the caller directly with that result) -- not
 ///   `eval_rhs_once`'s old "collapse empty to `Null`" behavior. In **yq**
 ///   mode it produces exactly one document instead, with the target path
-///   auto-created but never written -- [`yq_empty_rhs_document`], #2470.
+///   auto-created but never written -- that document is `yq_target_doc`,
+///   built up front by [`yq_prepare_assign_targets`] (#2470/#2481).
 /// - Real yq never forks over a multi-output RHS the way jq's does (#392):
 ///   it applies only the *last* output, once, to every resolved path --
 ///   confirmed live (v4.53.3): `.x = (1,2,3)` on `{"x":0}` is `{"x":3}`,
@@ -20143,15 +20191,15 @@ fn normalize_rhs_values_for_fork<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     mut rhs_values: Vec<OwnedValue>,
     terminal: Option<Control>,
     optional: bool,
-    path_expr: &Expr,
-    input: &StandardJson<'a, W>,
+    yq_target_doc: Option<&OwnedValue>,
 ) -> Result<(Vec<OwnedValue>, Option<Control>), QueryResult<'a, W>> {
     if rhs_values.is_empty() {
         return Err(match terminal {
-            None if S::READ_ONLY_ABSENT_KEY_IS_EMPTY => {
-                yq_empty_rhs_document::<W, S>(path_expr, input, optional)
-            }
-            None => QueryResult::None,
+            // `Some` exactly in yq mode (every assignment entry point
+            // prepares its targets there, #2481) -- that working copy is
+            // already the document real yq would emit after running its
+            // write loop zero times, so there is nothing left to compute.
+            None => yq_target_doc.map_or(QueryResult::None, |doc| QueryResult::Owned(doc.clone())),
             Some(Control::Error(_)) if optional => QueryResult::None,
             Some(control) => partial(Vec::new(), control), // normalizes to bare Error/Break
         });
@@ -20164,19 +20212,73 @@ fn normalize_rhs_values_for_fork<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     Ok((rhs_values, terminal))
 }
 
-/// The one document a yq-mode assignment with a **zero-output** right side
-/// still emits (#2470): the target path auto-created, and nothing written
-/// into it.
+/// yq's assignment target, resolved and auto-created **before** the right
+/// side is evaluated (#2481) -- [`yq_prepare_assign_targets`]'s result.
+struct YqAssignTargets {
+    /// The working copy with every target path created. This is yq's own
+    /// mutated document: the right side reads it, and every write is
+    /// spliced into it rather than into the untouched input.
+    doc: OwnedValue,
+    /// `path_expr` resolved against the input, once, up front -- reused as
+    /// the write loop's path list so it is never resolved twice.
+    paths: Vec<Expr>,
+    /// Whether auto-creating the targets actually changed the document.
+    /// The single gate on [`Self::rhs_document`].
+    created: bool,
+}
+
+impl YqAssignTargets {
+    /// The document the right side must be evaluated against, or `None` to
+    /// leave it on the input cursor.
+    ///
+    /// `Some` only when auto-creating the target really changed something:
+    /// an unchanged working copy is by definition indistinguishable from
+    /// the input for any *value* the right side can read, so routing it
+    /// through [`eval_owned_input`]'s reindex bridge would buy nothing and
+    /// cost a whole serialize/reparse round trip -- one that also drops the
+    /// node positions `line`/`column`/`style` are read from.
+    fn rhs_document(&self) -> Option<&OwnedValue> {
+        self.created.then_some(&self.doc)
+    }
+}
+
+/// Resolve and auto-create a yq-mode assignment's target path(s) on an owned
+/// working copy, before its right side runs. `None` in jq mode, which
+/// evaluates its right side against the untouched input as it always has.
 ///
-/// Real yq's `assignUpdateOperator` navigates the left side with
-/// auto-creation on before it ever looks at the right side's candidates, and
-/// then simply runs its write loop zero times. So a *new* target survives as
-/// an explicit `null` while an *existing* one keeps its old value, and the
-/// document is emitted either way -- where jq mode produces no document at
-/// all (`jq '.x = empty'` is empty output, pinned in jq mode). Live-captured
-/// against yq v4.53.3 with a right side that is empty for reasons of its own
-/// (`1 | select(false)`), so the rule is keyed on "the right side produced
-/// nothing" and not on why:
+/// Real yq's `assignUpdateOperator` traverses the left side with
+/// auto-creation *on* and only then evaluates the right side, against the
+/// already-mutated document (through `ReadOnlyClone`, whose own half of the
+/// rule is [`yq_read_only_context`], #2470). So the right side genuinely
+/// sees the node the assignment is about to write. Captured on `a: 1`
+/// (v4.53.3, `-o=json -I0`), succinctly's pre-#2481 answer alongside:
+///
+/// | filter                  | yq v4.53.3                  | was          |
+/// |-------------------------|-----------------------------|--------------|
+/// | `.x = (keys)`           | `{"a":1,"x":["a","x"]}`     | `["a"]`      |
+/// | `.x = (length)`         | `{"a":1,"x":2}`             | `1`          |
+/// | `.zzz.q = (.zzz \| key)` | `{"a":1,"zzz":{"q":"zzz"}}` | `{"q":null}` |
+/// | `.zzz.q += (.zzz \| key)`| `{"a":1,"zzz":{"q":"zzz"}}` | `{"q":null}` |
+/// | `(.x,.y) = (keys)`      | `x`/`y` both `["a","x","y"]`| both `["a"]` |
+/// | `.x.y = (.x \| keys)`   | `{"a":1,"x":{"y":["y"]}}`   | `{"y":null}` |
+///
+/// and on `[]`: `.[2] = (length)` is `[null,null,3]` (the padding happens
+/// first), where it used to be `[null,null,0]`.
+///
+/// `.x = (.x | type)` moves the same way but does not reach parity: the
+/// vivified `null` is now read back (it used to contribute nothing at all,
+/// leaving the target at the auto-created `null`), so this answers
+/// `x: "null"` where real yq says `x: "!!null"` -- `type`'s yq-tag spelling
+/// is a separate, pre-existing gap this change neither touches nor causes.
+///
+/// The same up-front walk is what a **zero-output** right side then emits
+/// unchanged (#2470): yq runs its write loop zero times, so a *new* target
+/// survives as an explicit `null` while an *existing* one keeps its old
+/// value, and the document is emitted either way -- where jq mode produces
+/// no document at all (`jq '.x = empty'` is empty output, pinned in jq
+/// mode). Live-captured with a right side that is empty for reasons of its
+/// own (`1 | select(false)`), so the rule is keyed on "the right side
+/// produced nothing" and not on why:
 ///
 /// | filter                     | input        | yq v4.53.3               |
 /// |----------------------------|--------------|--------------------------|
@@ -20187,40 +20289,87 @@ fn normalize_rhs_values_for_fork<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// | `.a[] = (1 \| select(false))` | `a: [1,2]` | `{"a":[1,2]}`            |
 /// | `(.a,.b) = (1 \| select(false))` | `a: 1`  | `{"a":1,"b":null}`       |
 ///
-/// Implemented as `path |= .` rather than a bespoke "vivify but skip the
-/// write" walk: `update_path` already creates every missing step on the way
-/// down and then writes back whatever the filter returned, so an
+/// Auto-creation is `path |= .` rather than a bespoke "vivify but skip the
+/// write" walk: [`update_path`] already creates every missing step on the
+/// way down and then writes back whatever the filter returned, so an
 /// `Expr::Identity` filter is exactly "create the path, change nothing" --
-/// including the `Iterate`-autovivifies-`Null`-to-`[]` and slice cases,
-/// which a second hand-written walk would have had to re-derive (and could
-/// then drift from, the #106 failure this file keeps one definition to
-/// avoid).
-fn yq_empty_rhs_document<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+/// including the `Iterate`-autovivifies-`Null`-to-`[]` and slice cases, and
+/// including the scalar-target no-op that makes `.a.b = 1` on `a: 1` create
+/// nothing at all (`{"a":1}`, matching yq). A second hand-written walk would
+/// have had to re-derive all of that, and could then drift from it -- the
+/// #106 failure this file keeps one definition to avoid.
+///
+/// `scalar_slice_noop` is the caller's own [`eval_update_multi`] flag,
+/// passed straight through so this walk creates exactly what that operator's
+/// write would have created and no more -- `-=`/`*=` keep #1340's
+/// deliberate exclusion from the slice no-op mechanism (real yq's own no-op
+/// for those two is not "run the filter and discard", and is not implemented
+/// here), instead of silently gaining it through the pre-pass.
+///
+/// `resolved` is [`YqAssignNoopCheck::Continue`]'s already-computed
+/// `(pristine, paths)` pair when the caller had one; otherwise the pair is
+/// derived here. Deriving it here is what moves *dynamic* path resolution
+/// ahead of the right side in yq mode, which is the order real yq itself
+/// uses (`.[error("p")] = error("r")` reports `"p"`, where jq reports
+/// `"r"` -- #1412); jq mode is untouched, since this returns `None` there
+/// before resolving anything.
+fn yq_prepare_assign_targets<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     path_expr: &Expr,
+    value_expr: &Expr,
     input: &StandardJson<'a, W>,
+    resolved: Option<(OwnedValue, Vec<Expr>)>,
     optional: bool,
-) -> QueryResult<'a, W> {
+    scalar_slice_noop: bool,
+) -> Result<Option<YqAssignTargets>, QueryResult<'a, W>> {
+    if S::TAG != EvalTag::Yq {
+        return Ok(None);
+    }
     // Same `optional` policy, in the same order, as `eval_assign`'s own
-    // `NotChecked` arm: a non-decode-failure `to_owned` error and a path
+    // jq-mode arm: a non-decode-failure `to_owned` error and a path
     // resolution error are both swallowed by an outer `?`, a halt never is.
-    let mut result = match to_owned(input) {
-        Ok(result) => result,
-        Err(e) => return suppress_or_raise(e, optional),
+    let (pristine, paths) = match resolved {
+        Some(pair) => pair,
+        None => {
+            let pristine = match to_owned(input) {
+                Ok(pristine) => pristine,
+                Err(e) => return Err(suppress_or_raise(e, optional)),
+            };
+            let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false) {
+                Ok(paths) => paths,
+                Err((_, EvalEscape::Error(_))) if optional => return Err(QueryResult::None),
+                Err((_, escape)) => return Err(escape.into()),
+            };
+            (pristine, paths)
+        }
     };
-    let paths = match resolve_dynamic_indexes::<S>(path_expr, &result, false) {
-        Ok(paths) => paths,
-        Err((_, EvalEscape::Error(_))) if optional => return QueryResult::None,
-        Err((_, escape)) => return escape.into(),
-    };
+    // Change detection costs a second copy of the whole document, and only
+    // ever buys something for a right side that can read one. A bare
+    // literal (`.a = 5`, the overwhelmingly common shape) cannot, so it
+    // skips the copy outright and reports `created: false` -- correct by
+    // construction, since `rhs_document`'s only consumer is the right side
+    // that literal has already been proved independent of.
+    let before = (!matches!(
+        super::eval_generic::strip_parens(value_expr),
+        Expr::Literal(_)
+    ))
+    .then(|| pristine.clone());
+    let mut doc = pristine;
     for path in &paths {
-        if let Err(escape) = update_path::<S>(&mut result, path, &Expr::Identity, false, true) {
-            return match escape {
+        if let Err(escape) =
+            update_path::<S>(&mut doc, path, &Expr::Identity, false, scalar_slice_noop)
+        {
+            return Err(match escape {
                 EvalEscape::Error(_) if optional => QueryResult::None,
                 other => other.into(),
-            };
+            });
         }
     }
-    QueryResult::Owned(result)
+    let created = before.is_some_and(|before| doc != before);
+    Ok(Some(YqAssignTargets {
+        doc,
+        paths,
+        created,
+    }))
 }
 
 /// Shared RHS-fork loop for `eval_assign`/`eval_compound_assign`/
@@ -20301,6 +20450,10 @@ fn fork_rhs_over_paths<'a, W: Clone + AsRef<[u64]>, State>(
 /// value` for compound assignment, `. // value` for alternative
 /// assignment) fresh per output, so `update_path`'s per-path `Identity`
 /// resolves to that output's own spliced value, not a shared one.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: `yq_targets` (#2481) joins the
+                                     // `path_expr`/`input` pair it *replaces* in yq mode -- both are still needed for jq
+                                     // mode's own resolve, so bundling them would mean a struct whose two halves are never
+                                     // live at the same time.
 fn eval_update_multi<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     path_expr: &Expr,
     input: StandardJson<'a, W>,
@@ -20308,28 +20461,41 @@ fn eval_update_multi<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     scalar_slice_noop: bool,
     rhs_values: Vec<OwnedValue>,
     terminal: Option<Control>,
+    yq_targets: Option<YqAssignTargets>,
     build_filter: impl FnMut(OwnedValue) -> Expr,
 ) -> QueryResult<'a, W> {
     let (rhs_values, terminal) = match normalize_rhs_values_for_fork::<W, S>(
-        rhs_values, terminal, optional, path_expr, &input,
+        rhs_values,
+        terminal,
+        optional,
+        yq_targets.as_ref().map(|targets| &targets.doc),
     ) {
         Ok(v) => v,
         Err(early_return) => return early_return,
     };
 
-    // #1953: a non-decode-failure to_owned error respects `optional`
-    // like the sibling `resolve_dynamic_indexes` arm just below (and
-    // `eval_assign`/`eval_update`'s matching sites) -- only a genuine
-    // decode failure is unconditional.
-    let pristine = match to_owned(&input) {
-        Ok(v) => v,
-        Err(e) => return suppress_or_raise(e, optional),
-    };
-    let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false) {
-        Ok(paths) => paths,
-        // `?` swallows only a genuine error; a halt always escapes (#791).
-        Err((_, EvalEscape::Error(_))) if optional => return QueryResult::None,
-        Err((_, escape)) => return escape.into(),
+    let (pristine, paths) = match yq_targets {
+        // yq mode: already resolved and auto-created before the right side
+        // ran (#2481), and that working copy is the document every write
+        // splices into.
+        Some(YqAssignTargets { doc, paths, .. }) => (doc, paths),
+        None => {
+            // #1953: a non-decode-failure to_owned error respects `optional`
+            // like the sibling `resolve_dynamic_indexes` arm just below (and
+            // `eval_assign`/`eval_update`'s matching sites) -- only a genuine
+            // decode failure is unconditional.
+            let pristine = match to_owned(&input) {
+                Ok(v) => v,
+                Err(e) => return suppress_or_raise(e, optional),
+            };
+            let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false) {
+                Ok(paths) => paths,
+                // `?` swallows only a genuine error; a halt always escapes (#791).
+                Err((_, EvalEscape::Error(_))) if optional => return QueryResult::None,
+                Err((_, escape)) => return escape.into(),
+            };
+            (pristine, paths)
+        }
     };
     let scalar_noop = scalar_slice_noop && S::TAG == EvalTag::Yq;
 
@@ -20389,7 +20555,31 @@ fn eval_compound_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // old behavior) -- jq forks once per output, yq keeps only the last;
     // see `eval_update_multi`'s own doc comment for the full rationale and
     // oracle verification.
-    let (rhs_values, terminal) = match collect_rhs_outputs::<W, S>(value_expr, &input, optional) {
+    // #2481: create the target path(s) on a working copy before the right
+    // side runs, so it reads yq's already-mutated document -- one
+    // definition, shared with `eval_assign`. `None` (the `resolved`
+    // argument) rather than a reused `YqAssignNoopCheck::Continue` payload:
+    // this caller went through the `yq_assign_skip_rhs` wrapper, which
+    // discards it, so the pair is re-derived here exactly as it was before
+    // (#1414).
+    let yq_targets = match yq_prepare_assign_targets::<W, S>(
+        path_expr,
+        value_expr,
+        &input,
+        None,
+        optional,
+        matches!(op, AssignOp::Add),
+    ) {
+        Ok(targets) => targets,
+        Err(early_return) => return early_return,
+    };
+
+    let (rhs_values, terminal) = match collect_rhs_outputs::<W, S>(
+        value_expr,
+        &input,
+        yq_targets.as_ref().and_then(YqAssignTargets::rhs_document),
+        optional,
+    ) {
         Ok(v) => v,
         Err(early_return) => return early_return,
     };
@@ -20420,6 +20610,7 @@ fn eval_compound_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         matches!(op, AssignOp::Add),
         rhs_values,
         terminal,
+        yq_targets,
         move |rhs_value| Expr::Arithmetic {
             op: arith_op,
             left: Box::new(Expr::Identity),
@@ -20455,7 +20646,26 @@ fn eval_alternative_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     //
     // #1778: every output is kept, not just the first; see
     // `eval_update_multi`'s own doc comment.
-    let (rhs_values, terminal) = match collect_rhs_outputs::<W, S>(value_expr, &input, optional) {
+    // #2481: create the target path(s) on a working copy before the right
+    // side runs, so it reads yq's already-mutated document -- one
+    // definition, shared with `eval_assign`. `None` (the `resolved`
+    // argument) rather than a reused `YqAssignNoopCheck::Continue` payload:
+    // this caller went through the `yq_assign_skip_rhs` wrapper, which
+    // discards it, so the pair is re-derived here exactly as it was before
+    // (#1414).
+    let yq_targets = match yq_prepare_assign_targets::<W, S>(
+        path_expr, value_expr, &input, None, optional, true,
+    ) {
+        Ok(targets) => targets,
+        Err(early_return) => return early_return,
+    };
+
+    let (rhs_values, terminal) = match collect_rhs_outputs::<W, S>(
+        value_expr,
+        &input,
+        yq_targets.as_ref().and_then(YqAssignTargets::rhs_document),
+        optional,
+    ) {
         Ok(v) => v,
         Err(early_return) => return early_return,
     };
@@ -20479,6 +20689,7 @@ fn eval_alternative_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         true,
         rhs_values,
         terminal,
+        yq_targets,
         |rhs_value| {
             Expr::Alternative(
                 Box::new(Expr::Identity),
@@ -53387,7 +53598,7 @@ mod tests {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let expr = parse(".").unwrap();
-        match collect_rhs_outputs::<Vec<u64>, JqSemantics>(&expr, &cursor.value(), false) {
+        match collect_rhs_outputs::<Vec<u64>, JqSemantics>(&expr, &cursor.value(), None, false) {
             Err(QueryResult::Error(e)) => assert!(e.is_decode_failure(), "{e:?}"),
             other => panic!("unexpected result: {other:?}"),
         }
@@ -53400,7 +53611,7 @@ mod tests {
         let index = JsonIndex::build(json_bytes);
         let cursor = index.root(json_bytes);
         let expr = parse(".[]").unwrap();
-        match collect_rhs_outputs::<Vec<u64>, JqSemantics>(&expr, &cursor.value(), false) {
+        match collect_rhs_outputs::<Vec<u64>, JqSemantics>(&expr, &cursor.value(), None, false) {
             Err(QueryResult::Error(e)) => assert!(e.is_decode_failure(), "{e:?}"),
             other => panic!("unexpected result: {other:?}"),
         }
