@@ -36253,3 +36253,72 @@ fn test_owned_identity_pipe_carries_control_and_prefix_2495() -> Result<()> {
 
     Ok(())
 }
+
+/// #2508: a non-string *scalar* object-construction key (number/boolean/
+/// null) stringifies in real yq, instead of raising jq's `Cannot use <type>
+/// as object key`. Captured live from yq v4.53.3 (`-o=json -I0`, `-n`):
+///
+/// ```text
+/// $ yq -n '{(0): 1}'      {"0":1}      $ yq -n '{(1.5): 1}'    {"1.5":1}
+/// $ yq -n '{(1.0): 1}'    {"1.0":1}    $ yq -n '{(1e10): 1}'   {"1e10":1}
+/// $ yq -n '{(true): 1}'   {"true":1}   $ yq -n '{(false): 1}'  {"false":1}
+/// $ yq -n '{(null): 1}'   {"null":1}
+/// $ succinctly yq -n '{(0): 1}'  Error: Cannot use number (0) as object key  (was, exit 1)
+/// ```
+///
+/// Array/object keys are a separate, much odder quirk (any non-empty
+/// array/object key collapses to `""`, confirmed live) and are deliberately
+/// left raising -- not part of this issue's scope. jq 1.7.1 raises
+/// unconditionally for every scalar row above, so jq mode is untouched.
+///
+/// Fixed as `eval::yq_object_key_stringify`, consulted by
+/// `build_object_entries` and `eval_generic::build_object_entries_generic`.
+#[test]
+fn test_yq_object_construction_scalar_key_stringify_2508() -> Result<()> {
+    let args = &["-o", "json", "-I0", "-n"];
+    for (filter, expected) in [
+        ("{(0): 1}", r#"{"0":1}"#),
+        ("{(1.5): 1}", r#"{"1.5":1}"#),
+        ("{(1.0): 1}", r#"{"1.0":1}"#),
+        ("{(1e10): 1}", r#"{"1e10":1}"#),
+        ("{(true): 1}", r#"{"true":1}"#),
+        ("{(false): 1}", r#"{"false":1}"#),
+        ("{(null): 1}", r#"{"null":1}"#),
+    ] {
+        let (output, code) = run_yq_stdin(filter, "", args)?;
+        assert_eq!(code, 0, "`{filter}`: {output:?}");
+        assert_eq!(output.trim(), expected, "`{filter}`");
+    }
+
+    // Array/object keys are out of this issue's scope -- still raise.
+    for filter in ["{([1,2]): 1}", "{({}): 1}"] {
+        let (_out, stderr, code) = run_yq_stdin_with_stderr(filter, "", args)?;
+        assert_ne!(code, 0, "`{filter}` should still error");
+        assert!(
+            stderr.contains("Cannot use") && stderr.contains("as object key"),
+            "`{filter}`: {stderr}"
+        );
+    }
+
+    // jq mode is untouched.
+    let (_out, stderr, code) = run_jq_stdin_with_stderr("{(0): 1}", "null", &["-n"])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("Cannot use number (0) as object key"),
+        "{stderr}"
+    );
+
+    // `from_entries` is a separate function (#2521), unaffected by this fix.
+    let (_out, stderr, code) = run_yq_stdin_with_stderr(
+        r#"[{"key":0,"value":1}] | from_entries"#,
+        "null",
+        &["-o", "json"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("Cannot use number (0) as object key"),
+        "{stderr}"
+    );
+
+    Ok(())
+}

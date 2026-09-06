@@ -465,6 +465,61 @@ pub(crate) fn yq_empty_operand_output(
     }
 }
 
+/// yq mode only (#2508): a non-string *scalar* object-construction key
+/// (`{(0): 1}`) stringifies instead of raising jq's `Cannot use <type> as
+/// object key`.
+///
+/// `None` means "keep the existing behavior" -- either jq mode, or a key
+/// this rule does not cover (a real `String` never reaches the caller's own
+/// check in the first place, and an `Array`/`Object` key is deliberately
+/// excluded, see below). `Some(key)` is the string to use in its place.
+///
+/// Captured live against yq v4.53.3 (`-o=json -I0`, `-n`):
+///
+/// | filter             | real yq        |
+/// |---------------------|----------------|
+/// | `{(0): 1}`           | `{"0":1}`      |
+/// | `{(1.5): 1}`         | `{"1.5":1}`    |
+/// | `{(1.0): 1}`         | `{"1.0":1}`    |
+/// | `{(1e10): 1}`        | `{"1e10":1}`   |
+/// | `{(true): 1}`        | `{"true":1}`   |
+/// | `{(false): 1}`       | `{"false":1}`  |
+/// | `{(null): 1}`        | `{"null":1}`   |
+///
+/// The `1.0`/`1e10` rows are why this reuses [`owned_to_string`] (the same
+/// conversion `tostring`/[`yq_scalar_string_concat_is_ok`]-style `+` already
+/// use) rather than a fresh `format!`: a `NumberLiteral`'s exact source
+/// spelling survives here too.
+///
+/// **Deliberately excludes `Array`/`Object` keys.** Real yq's own
+/// stringification there is a much deeper, likely-unintentional Go-internal
+/// quirk, not a principled "stringify the value" rule: confirmed live that
+/// *any* non-empty array or non-empty object key collapses to the empty
+/// string (`{([1,2,3]): 1}` and `{({"a":1}): 1}` are both `{"":1}`), while
+/// an empty object key is the one exception (`{({}): 1}` is `{"{}":1}`) --
+/// not `owned_to_string`'s own JSON-shaped answer for either case. That is
+/// a separate, much odder divergence than this issue's scope (which only
+/// asked to capture float/bool/null keys), so it is left raising rather
+/// than guessed at.
+///
+/// jq 1.7.1 raises unconditionally for every row above, so jq mode is
+/// untouched. One definition consulted by [`build_object_entries`] (this
+/// file's native fan-out) and `eval_generic::build_object_entries_generic`
+/// (the generic fan-out, already `S`-generic) -- CLAUDE.md's "duplicated
+/// predicates diverge silently" (#106).
+pub(crate) fn yq_object_key_stringify<S: EvalSemantics>(key: &OwnedValue) -> Option<String> {
+    if S::TAG != EvalTag::Yq {
+        return None;
+    }
+    match key {
+        OwnedValue::Null | OwnedValue::Bool(_) => Some(owned_to_string::<S>(key)),
+        OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
+            Some(owned_to_string::<S>(key))
+        }
+        OwnedValue::String(_) | OwnedValue::Array(_) | OwnedValue::Object(_) => None,
+    }
+}
+
 /// yq mode only (#2483): an ordering comparison (`<`/`<=`/`>`/`>=`) against a
 /// **real** `null` operand -- as opposed to [`yq_empty_operand_output`]'s
 /// zero-*output* operand, a distinct "null-ish" category per that function's
@@ -2716,7 +2771,7 @@ type ObjectSlotEvaluator<'a> = dyn FnMut(&Expr) -> (Vec<OwnedValue>, Option<Cont
 /// One definition, two strategies -- the shape [`boolean_fanout_core`] and
 /// [`binary_fanout_core`] already use, and for the same reason: a second copy
 /// of jq's keys-vary-slowest fan-out would drift from this one.
-fn build_object_entries(
+fn build_object_entries<S: EvalSemantics>(
     entries: &[super::expr::ObjectEntry],
     eval_operand: &mut ObjectSlotEvaluator<'_>,
     optional: bool,
@@ -2752,21 +2807,35 @@ fn build_object_entries(
         let sole = sole && vals.len() == 1;
 
         for val in vals {
-            let OwnedValue::String(key_str) = &key else {
-                // A single non-string key is jq's `Cannot use <t> (<v>) as
-                // object key` — the same sentence `from_entries` raises,
-                // because jq *defines* `from_entries` as object construction
-                // over the entries (#391) — unless `optional` (`?`) is set, in
-                // which case it is suppressed into an empty result instead.
-                return Err(if optional {
-                    ObjectEscape::None
-                } else {
-                    ObjectEscape::Error(EvalError::cannot_use_as_object_key(&key))
-                });
+            // #2508 (yq mode): a non-string *scalar* key (number/boolean/
+            // null) stringifies instead of raising -- see
+            // `yq_object_key_stringify`'s own doc comment for the full
+            // captured matrix and why array/object keys are deliberately
+            // excluded. `None` here covers jq mode and those excluded key
+            // kinds alike, both of which keep the original error.
+            let key_str = match &key {
+                OwnedValue::String(s) => s.clone(),
+                _ => match yq_object_key_stringify::<S>(&key) {
+                    Some(s) => s,
+                    None => {
+                        // A single non-string key is jq's `Cannot use <t>
+                        // (<v>) as object key` — the same sentence
+                        // `from_entries` raises, because jq *defines*
+                        // `from_entries` as object construction over the
+                        // entries (#391) — unless `optional` (`?`) is set,
+                        // in which case it is suppressed into an empty
+                        // result instead.
+                        return Err(if optional {
+                            ObjectEscape::None
+                        } else {
+                            ObjectEscape::Error(EvalError::cannot_use_as_object_key(&key))
+                        });
+                    }
+                },
             };
 
-            acc.push((key_str.clone(), val));
-            let result = build_object_entries(rest, eval_operand, optional, sole, acc, out);
+            acc.push((key_str, val));
+            let result = build_object_entries::<S>(rest, eval_operand, optional, sole, acc, out);
             acc.pop();
             result?;
         }
@@ -2794,7 +2863,7 @@ fn eval_object_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
-    eval_object_construction_with(
+    eval_object_construction_with::<W, S>(
         entries,
         &mut |expr| stream_outputs_checked(eval_single::<W, S>(expr, value.clone(), optional)),
         optional,
@@ -2806,7 +2875,7 @@ fn eval_object_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// strategies (#2473). Only the fan-out's inputs change; the escape-to-result
 /// conversion below is shared, so `try {("a",1):2}` streams its prefix the
 /// same way on both.
-fn eval_object_construction_with<'a, W: Clone + AsRef<[u64]>>(
+fn eval_object_construction_with<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     entries: &[super::expr::ObjectEntry],
     eval_operand: &mut ObjectSlotEvaluator<'_>,
     optional: bool,
@@ -2819,7 +2888,7 @@ fn eval_object_construction_with<'a, W: Clone + AsRef<[u64]>>(
     // objects already pushed to `out` by the time `build_object_entries`
     // returns `Err` travel onward as `QueryResult::Partial`'s prefix, the same
     // carrier `eval_comma` uses for `(1,error("x"))` (#400/#494).
-    match build_object_entries(
+    match build_object_entries::<S>(
         entries,
         eval_operand,
         optional,
@@ -37791,7 +37860,7 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // *this* arm's own `optional` below, atomically.
             let constructed = match first {
                 Expr::Object(entries) if needs_path_context(first) => {
-                    eval_object_construction_with::<W>(
+                    eval_object_construction_with::<W, S>(
                         entries,
                         &mut |expr| {
                             stream_outputs_checked(eval_pipe_with_path_context_internal::<W, S>(
