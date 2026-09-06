@@ -2004,24 +2004,33 @@ answers `x: 9` there but does **not** write yq's padding back into `.n` (`{"n":[
 "x":9}` against yq's ten-element `n`) — a separate, pre-existing read-side gap, unchanged
 by #2470 and #2481 alike.
 
-Two neighbouring shapes were captured alongside and are **not** part of this rule; each
-is a separate divergence (three more — ordering comparisons against a real `null`, `|=`
-with a zero-output filter, and the evaluation *order* of an assignment's two sides — were
-captured here too but are now resolved: see
+One neighbouring shape was captured alongside and is **not** part of this rule; it is a
+separate divergence (four more — ordering comparisons against a real `null`, `|=` with a
+zero-output filter, the evaluation *order* of an assignment's two sides, and indexing a
+*scalar* with a key — were captured here too but are now resolved: see
 [#2483](https://github.com/rust-works/succinctly/issues/2483),
-[#2484](https://github.com/rust-works/succinctly/issues/2484) below, and the section
-immediately after this one):
+[#2484](https://github.com/rust-works/succinctly/issues/2484) below, the section
+immediately after this one, and
+[#2482](https://github.com/rust-works/succinctly/issues/2482)):
 
 | filter                                    | input             | real yq        | succinctly                             |
 |-------------------------------------------|-------------------|----------------|----------------------------------------|
-| `.s.zzz`                                  | `s: x`            | *(nothing)*    | `Error: Cannot index string with string "zzz"` |
 | `.a \| with_entries(.value = key)`        | `a: {b: 1, e: 2}` | `{"b":0,"e":1}`| `{"b":1,"e":2}`                        |
 
-Row 1 is yq indexing a *scalar* with a key, which yields nothing everywhere, not only in
-a read-only context — it is what makes `.s.zzz + 1` also `1`. Row 2 is what `key` reports
-for an element of a constructed array: real yq answers the index, succinctly has no path
-context for a value it built itself, so the `=` right side is empty and the write is
-skipped.
+This row is what `key` reports for an element of a constructed array: real yq answers the
+index, succinctly has no path context for a value it built itself, so the `=` right side
+is empty and the write is skipped.
+
+**Resolved (#2482):** indexing a *scalar* (string/number/boolean) with any key -- a field
+name (`.s.zzz`), a numeric index (`.s[0]`), or a computed key of either kind -- yields
+nothing everywhere in real yq, not only in a read-only context (it is what makes
+`.s.zzz + 1` also `1`), where succinctly used to raise jq's own `Cannot index <type> with
+<key>` in yq mode too. Fixed as `jq::eval::yq_field_index_on_scalar_is_empty`, consulted
+by both evaluators at every scalar-target index site; see that predicate's own doc
+comment for the full call-site list and `tests/yq_cli_tests.rs`'s
+`test_yq_index_scalar_with_key_is_empty_2482` for the full captured matrix. `null` is
+unaffected (it keeps its own separate, unconditional-null rule), and a real container
+target keeps its own structural error.
 
 ### An assignment's target is created before its right side runs — resolved (#2481)
 
@@ -2205,13 +2214,16 @@ identical copy of the same three lines; it now calls into the `Expr::Identity` a
 of duplicating it, so this fix (and any future one) cannot drift between the two the way
 CLAUDE.md's "duplicated predicates diverge silently" warns about.
 
-**Not chased here:** `.a |= (.zzz | key)` on `a: 1` (also asked for in the issue) is not
-part of this fix. Real yq answers `{"a":1}` because `.zzz` on the number `1` -- `|=`'s
-right side runs against the *target's own value*, not the whole document -- yields
-nothing there (yq indexes a scalar with a key as "nothing everywhere", the "Row 2"
-divergence in the entry above); succinctly still raises `Cannot index number with string
-"zzz"` for that shape, so the update filter never gets the chance to become zero-output in
-the first place. That is the pre-existing scalar-indexing gap, not this one.
+**Not chased here, but since resolved by a different fix:** `.a |= (.zzz | key)` on `a: 1`
+(also asked for in the issue) was not part of this fix at the time. Real yq answers
+`{"a":1}` because `.zzz` on the number `1` -- `|=`'s right side runs against the *target's
+own value*, not the whole document -- yields nothing there (yq indexes a scalar with a key
+as "nothing everywhere" everywhere, not only read-only). succinctly used to raise `Cannot
+index number with string "zzz"` for that shape instead, so the update filter never got the
+chance to become zero-output in the first place -- that was the pre-existing
+scalar-indexing gap, not this one. [#2482](https://github.com/rust-works/succinctly/issues/2482)
+has since closed it directly (see the entry above), and succinctly now answers `{"a":1}`
+here too.
 
 ### A negative out-of-range array index (`.a[-N]`) raises -- resolved for ordinary reads, a few call sites remain
 

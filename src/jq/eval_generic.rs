@@ -48,9 +48,10 @@ use super::eval::{
     slice_object_as_yq_children, slice_owned_value_read, streams_escaped_generator_prefix,
     substitute_bound_var, substitute_vars, suppress_or_raise, suppresses, tonumber_from_str,
     vec_with_capacity, yq_absent_key_read_is_empty, yq_empty_operand_output,
-    yq_negative_index_check, yq_numeric_index_on_object_is_null, yq_object_key_stringify,
-    yq_read_only_context, BinaryFanoutRules, Control, Demand, EmptyOperandOp, EvalError,
-    EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail, QueryResult, YqSemantics,
+    yq_field_index_on_scalar_is_empty, yq_negative_index_check, yq_numeric_index_on_object_is_null,
+    yq_object_key_stringify, yq_read_only_context, BinaryFanoutRules, Control, Demand,
+    EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail,
+    QueryResult, YqSemantics,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -5824,6 +5825,17 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 } else {
                     GenericResult::Owned(OwnedValue::Null)
                 }
+            } else if value.as_array().is_none() && yq_field_index_on_scalar_is_empty::<S>() {
+                // #2482 (yq mode, unconditional -- not gated on read-only
+                // context like `absent_is_empty` above): a genuine scalar
+                // (string/number/boolean) has no fields at all in real yq's
+                // model, and that reads as an *empty* result everywhere, not
+                // just inside a binary-op operand. An *array* target still
+                // raises its own structural error in real yq (`.arr.zzz` on
+                // `arr: [1, 2]`, confirmed live), so this is gated on "not a
+                // container" rather than "anything but object/null". See
+                // `eval::yq_field_index_on_scalar_is_empty`.
+                GenericResult::None
             } else if optional {
                 GenericResult::None
             } else {
@@ -5883,6 +5895,14 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 // applies for the computed-key sibling `.a[$k]`. See
                 // `eval::yq_numeric_index_on_object_is_null`.
                 GenericResult::Owned(OwnedValue::Null)
+            } else if yq_field_index_on_scalar_is_empty::<S>() {
+                // #2482 (yq mode): every yq-mode `Object` case was already
+                // absorbed by the branch above (the predicate there is
+                // unconditionally true in yq mode), so only a genuine scalar
+                // (string/number/boolean) reaches here -- `.s[0]` on `s: x`
+                // is empty in real yq, not an error. See
+                // `eval::yq_field_index_on_scalar_is_empty`.
+                GenericResult::None
             } else {
                 // No `optional`-guarded arm here (unlike `index_one_generic`,
                 // the computed-key sibling this literal `.[N]` form doesn't
@@ -9809,6 +9829,14 @@ fn index_one_generic<S: EvalSemantics, V: DocumentValue>(
                 } else {
                     GenericResult::Owned(OwnedValue::Null)
                 }
+            } else if target.as_array().is_none() && yq_field_index_on_scalar_is_empty::<S>() {
+                // #2482 (yq mode): a computed string key (`.s[$k]`) on a
+                // scalar target is the same empty-not-error rule as the
+                // literal-field sibling in `eval_single`'s own `Expr::Field`
+                // arm -- see `eval::yq_field_index_on_scalar_is_empty`. An
+                // array target keeps its own structural error, excluded the
+                // same way that sibling arm excludes it.
+                GenericResult::None
             } else if optional {
                 GenericResult::None
             } else {
@@ -9865,11 +9893,29 @@ fn index_one_generic<S: EvalSemantics, V: DocumentValue>(
                 || (target.as_object().is_some() && yq_numeric_index_on_object_is_null::<S>())
             {
                 GenericResult::Owned(OwnedValue::Null)
+            } else if yq_field_index_on_scalar_is_empty::<S>() {
+                // #2482 (yq mode): every yq-mode `Object` case was already
+                // absorbed by the branch above -- only a genuine scalar
+                // reaches here. `.s[0]`/`0 as $k | .s[$k]` on `s: x` are
+                // both empty in real yq, not an error.
+                GenericResult::None
             } else if optional {
                 GenericResult::None
             } else {
                 GenericResult::Error(EvalError::cannot_index(target.type_name(), key))
             }
+        }
+        // #2482 (yq mode): any other key kind (bool/array/object/null) on a
+        // scalar target is the same empty-not-error rule -- real yq has no
+        // notion of "wrong key kind" for a target that has no children at
+        // all (confirmed live: `null as $k | .s[$k]`, `[1,2] as $k |
+        // .s[$k]`, and `{} as $k | .s[$k]` are all empty on `s: x`).
+        _ if target.as_array().is_none()
+            && target.as_object().is_none()
+            && !target.is_null()
+            && yq_field_index_on_scalar_is_empty::<S>() =>
+        {
+            GenericResult::None
         }
         _ if optional => GenericResult::None,
         _ => GenericResult::Error(EvalError::cannot_index(target.type_name(), key)),
@@ -11552,6 +11598,19 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
                             Some(fc) => PathNode::At(fc),
                             None => PathNode::Absent,
                         }
+                    } else if v.as_array().is_none() && yq_field_index_on_scalar_is_empty::<S>() {
+                        // #2482 (yq mode, unconditional -- not gated on
+                        // read-only context like the absent-key rule below):
+                        // a scalar has no fields at all in real yq's model,
+                        // and the walk produces no position to continue
+                        // from at all, so `key`/`path` are never reached
+                        // either -- `.s.zzz | key` is empty in real yq,
+                        // same as the bare read. An array target still
+                        // raises its own structural error (`.arr.zzz`),
+                        // excluded here the same way `eval_single`'s own
+                        // `Expr::Field` arm excludes it. See
+                        // `eval::yq_field_index_on_scalar_is_empty`.
+                        return Ok(());
                     } else {
                         return Err(EvalError::cannot_index_with_field(
                             path_node_type_name::<V>(node),
@@ -11631,6 +11690,13 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
                         // `.a[5] | key` is `5`, `.a[5] | path` is `["a",5]`.
                         // See `eval::yq_numeric_index_on_object_is_null`.
                         PathNode::Absent
+                    } else if yq_field_index_on_scalar_is_empty::<S>() {
+                        // #2482 (yq mode): every yq-mode `Object` case was
+                        // already absorbed by the branch above -- only a
+                        // genuine scalar reaches here. `.s[0] | key` is
+                        // empty in real yq, same as `Expr::Field`'s own
+                        // scalar arm above.
+                        return Ok(());
                     } else {
                         return Err(EvalError::cannot_index_with_type(
                             path_node_type_name::<V>(node),
