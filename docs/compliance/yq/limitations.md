@@ -1213,23 +1213,33 @@ $ echo '"a{}c"' | yq            'sub({};"X";"g")'   # "ac" (coerces to "{}", als
 $ echo '"a{}c"' | succinctly yq 'sub({};"X";"g")'   # Error: object ({}) is not a string -- unchanged, known gap
 ```
 
-### Presentation metadata lost on two whole output routes
+### Presentation metadata lost on one whole output route
 
-Neither route builds a `CommentTree`, so both drop comments, style **and** anchors together:
-`--inplace` never builds one ([#1349](https://github.com/rust-works/succinctly/issues/1349)),
-and any filter yielding multiple results — anything containing a comma — loses its cursor
-before one can be captured
-([#1361](https://github.com/rust-works/succinctly/issues/1361)). Both predate
-[ADR-0017](../../adrs/adr-0017.md)'s mechanism and neither is anchor-specific.
+A filter yielding multiple results — anything containing a comma — loses its cursor before a
+`CommentTree` can be captured, so it drops comments, style **and** anchors together
+([#1361](https://github.com/rust-works/succinctly/issues/1361)). It predates
+[ADR-0017](../../adrs/adr-0017.md)'s mechanism and is not anchor-specific.
 
-There used to be a third: `map(...)`, which lost all three the same way for the same reason —
-it took the DOM route, which carries none of them.
+Two others have been closed. `map(...)` lost all three the same way for the same reason — it
+took the DOM route, which carried none of them;
 [#757](https://github.com/rust-works/succinctly/issues/757) closed it by streaming `map`'s
-elements from their own cursors (see the duplicate-key section above for the full list of
-what that one route was dropping). `--inplace` is *not* an exception here despite #1349:
-its M2 fast path shares `stream_cursor!` with stdout, so an M2-eligible `map` keeps comments
-and style through `-i` too — #1349 is about the `--inplace` **DOM fallback**, which a
-non-M2-eligible filter still reaches.
+elements from their own cursors (see the duplicate-key section above for the full list of what
+that one route was dropping). And `--inplace`'s DOM fallback, which never built a
+`CommentTree` at all, was closed by
+[#1349](https://github.com/rust-works/succinctly/issues/1349): a YAML-sourced `-i` file now
+goes through the same cursor-native evaluator stdout uses, so `-i '.a = 99'` on
+`a: &x 1\nb: *x` writes `b: *x` rather than the `b: 1` it used to — the same filter no longer
+produces a different *value* depending on whether it edited the file or printed it. `-i`'s M2
+fast path already shared `stream_cursor!` with stdout, so this only ever concerned the
+fallback a non-M2-eligible filter reaches.
+
+A JSON-sourced `-i` file stays on the materializing route deliberately: a `YamlIndex` accepts
+`[1,]` as a flow sequence, so rerouting it would reopen the hole
+[#2276](https://github.com/rust-works/succinctly/issues/2276) closed, and JSON has no
+comments, anchors or block style to lose either way. The duplicate-key cost noted above is
+also unchanged by #1349 — `evaluate_yaml_cursor` still materializes each result into an
+`IndexMap`-backed `OwnedValue` before `output_value` writes it, so the cursor-native route
+preserves *presentation* but not duplicate keys.
 
 ### An untracked terminal path branch — resolved for `path()`/`=`/`|=`/compound-assigns, still open for `del()` and for trailing navigation
 
