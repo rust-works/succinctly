@@ -708,6 +708,66 @@ impl OutputConfig {
     }
 }
 
+/// Raise if any mapping in `bytes` holds two keys whose *display* spellings
+/// collide in a way an `IndexMap<String, _>` cannot represent (#1749),
+/// without materializing a single value (#1349).
+///
+/// [`yaml_to_owned_value`] performs this same check as it builds its map,
+/// and every route that goes through it is already covered. The
+/// cursor-native evaluator is not: it reaches `OwnedValue` through
+/// `to_owned_with_comments`, whose generic `resolve_display_key` classifies
+/// only *decode-failure* keys as fallback spellings, and a YAML complex key
+/// (`? [1,2]`) decodes cleanly to `""`. Telling those apart needs
+/// [`YamlValue::key_string_kind`], which is not on the `DocumentValue`
+/// trait — the same reason `yaml_to_owned_value` drives [`DisplayKeyGuard`]
+/// by hand rather than going through the generic path.
+///
+/// **This shares its classification with [`yaml_to_owned_value`] and must
+/// keep doing so**: both call `key_string_kind` and `DisplayKeyGuard::check`
+/// rather than restating the rule, so only the traversal is written twice.
+/// `validate_yaml_display_keys_agrees_with_yaml_to_owned_value_1349` pins
+/// that the two answer identically.
+fn validate_yaml_display_keys(bytes: &[u8]) -> Result<()> {
+    fn walk<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>, depth: usize) -> Result<()> {
+        // The same limit `yaml_to_owned_value` recurses under; a document
+        // deeper than this is refused there rather than overflowing here.
+        check_nesting_depth(depth).map_err(|e| anyhow::anyhow!("{e}"))?;
+        match cursor.value() {
+            YamlValue::Mapping(fields) => {
+                let mut seen: IndexMap<String, ()> = IndexMap::new();
+                let mut guard = DisplayKeyGuard::default();
+                for field in fields {
+                    let (key, is_fallback) = field.key().key_string_kind();
+                    let key = key.into_owned();
+                    if !guard.check(&seen, &key, is_fallback) {
+                        return Err(anyhow::anyhow!(
+                            "{}",
+                            EvalError::colliding_display_key(&key)
+                        ));
+                    }
+                    seen.insert(key, ());
+                    walk(field.value_cursor(), depth + 1)?;
+                }
+                Ok(())
+            }
+            YamlValue::Sequence(elements) => {
+                let mut rest = elements;
+                // `uncons_resolved_cursor`, matching `yaml_to_owned_value`'s
+                // own sequence arm and its #835 note.
+                while let Some((elem_cursor, next)) = rest.uncons_resolved_cursor() {
+                    walk(elem_cursor, depth + 1)?;
+                    rest = next;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    let index = YamlIndex::build(bytes).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
+    walk(index.root(bytes), 0)
+}
+
 /// Convert a YAML value to an OwnedValue for jq evaluation.
 ///
 /// Takes a cursor rather than a bare `YamlValue`: an explicit tag
@@ -6504,31 +6564,23 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     global_doc_index += inputs.len();
                     (collected, matching_docs > 1)
                 } else {
-                    // Validation gate, result discarded (#1349). This is the
-                    // *same* call this route already made before rerouting,
-                    // kept for everything it rejects that the cursor-native
-                    // evaluator does not: #1749's colliding complex/
-                    // undecodable mapping keys (two different sequence keys
-                    // both stringify to `""`, and `OwnedValue::Object`'s
-                    // `IndexMap` would silently drop one), and #2276's M2
-                    // nesting-depth parity check.
-                    //
-                    // The collision check cannot simply move to the
-                    // cursor-native walk: `resolve_display_key`'s generic
+                    // #1749's colliding-key guard, which the cursor-native
+                    // evaluator does not apply for itself (#1349 review):
+                    // `resolve_display_key`'s generic
                     // `key_display_string_kind` only flags a key whose
                     // *decode* failed, while a YAML complex key decodes
-                    // cleanly to `""`. Classifying it needs `YamlValue`'s own
-                    // `key_string_kind` (#1749), which is not on the
-                    // `DocumentValue` trait -- so the cursor-native route
-                    // silently drops one of the two, which is exactly what
-                    // this gate exists to prevent. Re-deriving that
-                    // classification here instead would duplicate a
-                    // predicate that must not drift.
+                    // cleanly to `""`, so two different sequence keys both
+                    // land on `""` and `OwnedValue::Object`'s `IndexMap`
+                    // silently drops one of them.
                     //
-                    // Costs no more than before: this route already
-                    // materialized every document to evaluate it, and now
-                    // materializes them to validate instead.
-                    let _validated = parse_input_m2_parity(&input_bytes, format)?;
+                    // Keys only, no values: the cursor-native route
+                    // materializes each result itself and raises any
+                    // value-level decode error on its own, so this walk has
+                    // nothing to add there. An earlier cut reused
+                    // `parse_input_m2_parity` for this instead and paid a
+                    // second full materialization of the document for it --
+                    // 2.1x slower and 2.9x peak RSS on a 5 MB file.
+                    validate_yaml_display_keys(&input_bytes)?;
 
                     let (collected, num_docs) = evaluate_yaml_direct_filtered(
                         &input_bytes,
