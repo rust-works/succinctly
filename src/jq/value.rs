@@ -474,17 +474,74 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
     assemble_scientific(sign, &mantissa_str, shifted_exp)
 }
 
-/// jq mode's bare `Float` display: no forced decimal point, matching real
-/// jq's own convention that a computed value (one with no preserved
-/// `NumberLiteral` source text) loses its literal formatting entirely
-/// (`1.0 + 4.0` prints `5`, not `5.0`). Named and shared, rather than a
-/// hand-copied `|f| f.to_string()` closure at each call site, per the #106
-/// "duplicated predicates diverge silently" lesson in `CLAUDE.md` --
+/// jq mode's bare `Float` display: no forced decimal point.
+///
+/// Matches real jq's own convention that a computed value (one with no
+/// preserved `NumberLiteral` source text) loses its literal formatting
+/// entirely (`1.0 + 4.0` prints `5`, not `5.0`). Named and shared, rather
+/// than a hand-copied `|f| f.to_string()` closure at each call site, per the
+/// #106 "duplicated predicates diverge silently" lesson in `CLAUDE.md` --
 /// [`to_json`](OwnedValue::to_json), [`to_json_for_reindex_at_depth`]'s
 /// jq-mode fallback, and [`stream::stream_owned_value_json_jq`](crate::jq::stream)
 /// all need this exact formatter.
-pub(crate) fn jq_bare_float_display(f: f64) -> String {
-    f.to_string()
+///
+/// #2456: a plain `f.to_string()` alone is wrong past
+/// [`jq_float_is_scientific`]'s threshold -- Rust's `Display` for `f64` never
+/// switches to exponential notation, so a computed value like `1e100` used to
+/// come out as a 101-digit decimal expansion where real jq 1.7.1 prints
+/// `1e+100`.
+#[must_use]
+pub fn jq_bare_float_display(f: f64) -> String {
+    if !jq_float_is_scientific(f) {
+        return f.to_string();
+    }
+    // Only the scientific branch needs the exponential rendering -- an
+    // everyday-magnitude value never pays for a string it would immediately
+    // discard, matching yq's own `format_float_yq_with` (`src/yaml/light.rs`).
+    let sci = format!("{f:e}");
+    let (mantissa, exp_str) = sci
+        .split_once('e')
+        .expect("Rust's exponential formatter always includes a lowercase 'e'");
+    let exp: i64 = exp_str
+        .parse()
+        .expect("exponent from Rust's exponential formatter is always a valid i64");
+    let sign = if exp < 0 { '-' } else { '+' };
+    format!("{mantissa}e{sign}{:02}", exp.unsigned_abs())
+}
+
+/// Whether real jq would spell a computed `f64` in scientific notation
+/// rather than decimally, when printing it bare ([`jq_bare_float_display`]).
+///
+/// Unlike yq's own threshold ([`crate::yaml::yq_float_is_scientific`], a
+/// fixed magnitude range), jq's C `dtoa`/`g_fmt`-derived formatter
+/// (`jv_dtoa.c`/`jv_print.c` in the reference implementation) decides by
+/// digit count: writing `f`'s shortest round-tripping decimal as
+/// `d.ddd...e{exp}` (`ndigits` significant digits, decimal point at position
+/// `decpt = exp + 1`), scientific notation is used exactly when
+/// `decpt <= -4` or `decpt > ndigits + 15`. Oracle-verified against jq 1.7.1
+/// across a matrix of magnitudes and digit counts straddling both boundaries
+/// (`1e15`/`1e16`, `1e-4`/`1e-5`, and multi-digit mantissas at each) --
+/// pinned by `jq_float_is_scientific_agrees_with_the_pinned_oracle`.
+///
+/// `f` must be finite; 0.0 always takes the ordinary branch (`{:e}` renders
+/// it `0e0`, `ndigits = 1`, `decpt = 1`, well inside the ordinary range).
+#[must_use]
+pub(crate) fn jq_float_is_scientific(f: f64) -> bool {
+    debug_assert!(
+        f.is_finite(),
+        "jq_float_is_scientific requires a finite value; NaN/Infinity have no \
+         JSON spelling here and must be special-cased by the caller"
+    );
+    let sci = format!("{f:e}");
+    let (mantissa, exp_str) = sci
+        .split_once('e')
+        .expect("Rust's exponential formatter always includes a lowercase 'e'");
+    let ndigits = mantissa.bytes().filter(u8::is_ascii_digit).count() as i64;
+    let exp: i64 = exp_str
+        .parse()
+        .expect("exponent from Rust's exponential formatter is always a valid i64");
+    let decpt = exp + 1;
+    decpt <= -4 || decpt > ndigits + 15
 }
 
 /// Join a sign, an already-normalized mantissa, a negative-exponent flag,
@@ -1631,7 +1688,11 @@ impl OwnedValue {
     pub fn number_str(&self) -> Option<Cow<'_, str>> {
         match self {
             Self::Int(n) => Some(Cow::Owned(n.to_string())),
-            Self::Float(f) => Some(Cow::Owned(f.to_string())),
+            // #2456: was a bare `f.to_string()`, matching `jq_bare_float_display`'s
+            // own pre-fix bug (this is jq mode's own rendering convention --
+            // `numeric_display_string`'s yq-mode arms always return before
+            // reaching here for a `Float`).
+            Self::Float(f) => Some(Cow::Owned(jq_bare_float_display(*f))),
             Self::NumberLiteral(_, literal) => {
                 Some(Cow::Owned(format_number_jq_compat(literal.as_bytes())))
             }
@@ -3160,11 +3221,14 @@ mod tests {
         }
     }
 
-    /// #2438: the bridge's yq fallback now spells a *computed* float by the
-    /// same threshold the emitters use, rather than forcing a decimal point
-    /// at every magnitude. jq mode's own fallback is untouched.
+    /// #2438: the bridge's yq fallback spells a *computed* float by yq's own
+    /// threshold, rather than forcing a decimal point at every magnitude.
+    /// #2456: jq mode's own fallback applies its own (different) threshold
+    /// too, rather than never reformatting a computed float at all -- this
+    /// used to pin the opposite (a full 21-digit decimal expansion) as
+    /// deliberately untouched by #2438, which #2456 fixes.
     #[test]
-    fn test_to_json_for_reindex_yq_float_uses_the_shared_threshold_2438() {
+    fn test_to_json_for_reindex_float_uses_each_modes_own_threshold_2438_2456() {
         assert_eq!(
             OwnedValue::Float(1e20).to_json_for_reindex::<YqSemantics>(),
             "1e+20"
@@ -3175,8 +3239,55 @@ mod tests {
         );
         assert_eq!(
             OwnedValue::Float(1e20).to_json_for_reindex::<JqSemantics>(),
-            "100000000000000000000"
+            "1e+20"
         );
+        // jq's own threshold sits at a different magnitude than yq's fixed
+        // `>= 1e6`/`<= 1e-4` (#953): 1e10 already clears yq's, but jq's own
+        // digit-count rule (`decpt = 11 <= ndigits(1) + 15 = 16`) keeps it
+        // decimal there.
+        assert_eq!(
+            OwnedValue::Float(1e10).to_json_for_reindex::<JqSemantics>(),
+            "10000000000"
+        );
+        assert_eq!(
+            OwnedValue::Float(1e10).to_json_for_reindex::<YqSemantics>(),
+            "1e+10"
+        );
+    }
+
+    /// #2456: `jq_bare_float_display`'s digit-count threshold
+    /// (`decpt <= -4 || decpt > ndigits + 15`), pinned directly against real
+    /// jq 1.7.1 (`echo null | jq -cn '1 * <value>'`) across both boundary
+    /// crossings and several multi-digit mantissas at each. `1e15`/`1e16`
+    /// and `1e-4`/`1e-5` are the exact boundary and its first crossing;
+    /// `9.99999999999999e15` (16-digit mantissa, one digit short of rounding
+    /// up to `1e16`) pins that the threshold reads the shortest-round-trip
+    /// digit count, not the source magnitude alone.
+    #[test]
+    fn test_jq_float_scientific_threshold_matches_pinned_oracle_2456() {
+        for (f, want) in [
+            (1e15, "1000000000000000"),
+            (1e16, "1e+16"),
+            (1e17, "1e+17"),
+            (1.5e15, "1500000000000000"),
+            (1.5e16, "15000000000000000"),
+            (1.5e17, "1.5e+17"),
+            (1.23456e17, "123456000000000000"),
+            (1.23456e18, "1234560000000000000"),
+            (9.99999999999999e15, "9999999999999990"),
+            (1e-4, "0.0001"),
+            (1e-5, "1e-05"),
+            (1e-6, "1e-06"),
+            (0.0, "0"),
+        ] {
+            assert_eq!(jq_bare_float_display(f), want, "for {f:e}");
+            assert_eq!(
+                jq_bare_float_display(-f),
+                format!("-{want}"),
+                "for {:e}",
+                -f
+            );
+        }
     }
 
     #[test]

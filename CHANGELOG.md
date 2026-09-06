@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`succinctly jq` now switches a computed float to scientific notation past
+  jq's own magnitude/digit-count threshold, instead of always printing a full
+  decimal expansion** (#2456). Confirmed live against jq 1.7.1: `.a * 1e100`
+  is `1e+100` (was a 101-digit decimal expansion); the threshold itself is
+  jq's own (`decpt <= -4 || decpt > ndigits + 15`, reading the shortest
+  round-tripping decimal's digit count and decimal-point position), distinct
+  from yq's fixed `>= 1e6`/`<= 1e-4` magnitude range (#953) — `1e10` is
+  already scientific in yq mode but stays a plain decimal in jq mode. Applies
+  to every jq-mode computed-float output path: plain identity/`-c` output,
+  array/object construction, `tostring`/`@json`/string interpolation, and the
+  M2 streaming writer, which now all agree (they previously disagreed with
+  each other, not just with the oracle). yq mode is unaffected.
+
 ### Changed
 
 - **`succinctly yq`'s `type` now answers the YAML tag (`!!str`, `!!int`,

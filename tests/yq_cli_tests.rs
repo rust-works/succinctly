@@ -11732,22 +11732,23 @@ fn test_computed_float_threshold_agrees_inside_array_and_comma_2438() -> Result<
 /// `to_json_for_reindex` fallback (`jq_bare_float_display`) is `S`-gated
 /// away from `format_float_yq` and stays that way.
 ///
-/// This pins the *pre-existing* jq-mode divergence rather than a fix: real
-/// jq 1.7.1 prints `1e+100` here, succinctly prints the full expansion, and
-/// it does so identically for the bare filter and the array-wrapped one --
-/// i.e. the gap is jq mode's own number formatting, not the reindex bridge,
-/// so #2438 neither widens nor closes it. Captured live on `{"a":1}`:
+/// Renamed/updated by #2456: this used to pin jq mode's own pre-existing
+/// divergence (a full decimal expansion where real jq prints `1e+100`) as
+/// deliberately *unchanged* by #2438 -- #2456 is the fix for that divergence
+/// itself, so the "unchanged" framing no longer applies; what's pinned now is
+/// that jq mode's own threshold (distinct from yq's -- see
+/// `jq_float_is_scientific`'s doc comment) is what applies here, still
+/// independent of `format_float_yq`. Captured live on `{"a":1}`:
 ///
 /// ```console
 /// $ /usr/bin/jq -c '[.a * 1e100]' a.json   => [1e+100]
 /// $ /usr/bin/jq -c '.a * 1e100'   a.json   => 1e+100
 /// ```
 #[test]
-fn test_jq_mode_float_threshold_unchanged_by_2438() -> Result<()> {
-    let expansion = format!("1{}", "0".repeat(100));
+fn test_jq_mode_float_threshold_matches_oracle_2438_2456() -> Result<()> {
     for (filter, want) in [
-        ("[.a * 1e100]", format!("[{expansion}]")),
-        (".a * 1e100", expansion.clone()),
+        ("[.a * 1e100]", "[1e+100]".to_string()),
+        (".a * 1e100", "1e+100".to_string()),
     ] {
         let (out, code) = run_jq_stdin(filter, "{\"a\":1}\n", &["-c"])?;
         assert_eq!(code, 0, "for {filter:?}: {out:?}");
