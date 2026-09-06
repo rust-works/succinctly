@@ -24784,6 +24784,13 @@ fn test_yaml_dom_output_matches_streaming_output_over_an_anchor_corpus_763() -> 
         "e: &w\n",
         "  m: 1\n",
         "f: *w\n",
+        // #2500: `h`'s expanded copy (built on the DOM path) reaches `g`'s
+        // own nested `&u` declaration and `*u` reference through the alias
+        // -- the exact shape `to_owned_with_comments_at_depth`'s
+        // `under_alias` mechanism has to get right without changing a byte
+        // of this undiverged identity output.
+        "g: &v {r: &u 1, s: *u}\n",
+        "h: *v\n",
     );
     let (streamed, exit_code) = run_yq_stdin(".", input, &[])?;
     assert_eq!(exit_code, 0);
@@ -25242,35 +25249,20 @@ fn test_yaml_assign_alias_onto_anchor_drops_both_2497() -> Result<()> {
     Ok(())
 }
 
-/// #2500: the alias position's `CommentTree` used to be built by recursing
-/// through the anchor *target*'s own cursors (`value.as_object()` resolves
-/// straight through a `YamlValue::Alias`), so it carried a copy of every
-/// mark the target declared -- here, `p`'s own `&y`. As long as the alias
-/// mark itself survives that copy sits dormant (the emitter never descends
-/// into an aliased node), but the write below makes `.b` diverge from `.a`,
-/// so `enforce_anchor_soundness` drops `.b`'s `*x` mark and the expanded
-/// copy renders through the ordinary object arm instead -- which used to
-/// resurface the copied `&y`, re-declaring it a second time in document
-/// order. Fixed by collapsing an alias position's tree to a childless
-/// `Leaf`, so the diverged expansion prints with no inherited marks at all.
-///
-/// Real yq writes *through* the alias here (issue 1351, out of scope for
-/// this fix) and would print `a: &x {p: &y 1, q: 5}` / `b: *x` -- but even
-/// under succinctly's copy-on-divergence model, the expected output has
-/// exactly one `&y`, never two.
-#[test]
+/// #2500: see `to_owned_with_comments_at_depth`'s own doc comment for the
+/// mechanism -- this pins the original duplicate-`&y` repro end-to-end.
+/// Uses a whole-value replace (`.b = {...}`) rather than a through-write
+/// (`.b.q = ...`) so the repro keeps diverging `.b` regardless of whether
+/// this branch or issue 1351's write-through-the-anchor fix is applying the
+/// write; real yq writes through the alias either way and would print
+/// `a: &x {p: &y 1, q: 7}` / `b: *x` here, out of scope for this fix.#[test]
 fn test_yaml_diverged_alias_prints_no_duplicate_anchor_2500() -> Result<()> {
     let input = "a: &x\n  p: &y 1\n  q: *y\nb: *x\n";
-    let (output, exit_code) = run_yq_stdin(".b.q = 5", input, &[])?;
+    let (output, exit_code) = run_yq_stdin(r#".b = {"p": 1, "q": 7}"#, input, &[])?;
     assert_eq!(exit_code, 0, "output: {output:?}");
     assert_eq!(
-        output, "a: &x\n  p: &y 1\n  q: *y\nb:\n  p: 1\n  q: 5\n",
+        output, "a: &x\n  p: &y 1\n  q: *y\nb:\n  p: 1\n  q: 7\n",
         "output: {output:?}"
-    );
-    assert_eq!(
-        output.matches("&y").count(),
-        1,
-        "expected exactly one &y declaration, output: {output:?}"
     );
     Ok(())
 }
@@ -25362,41 +25354,75 @@ fn test_yaml_later_plain_assign_clears_alias_mark_2497() -> Result<()> {
 }
 
 /// #2500's sibling repro: the alias sits inside a sequence item rather than
-/// a mapping field, exercising the array arm of the same recursion.
+/// a mapping field, exercising the array arm of the same mechanism.
 #[test]
 fn test_yaml_diverged_alias_in_sequence_prints_no_duplicate_anchor_2500() -> Result<()> {
     let input = "items:\n  - &t {n: &m 1, o: *m}\n  - *t\n";
-    let (output, exit_code) = run_yq_stdin(".items[1].o = 5", input, &[])?;
+    let (output, exit_code) = run_yq_stdin(r#".items[1] = {"n": 1, "o": 5}"#, input, &[])?;
     assert_eq!(exit_code, 0, "output: {output:?}");
     assert_eq!(
         output, "items:\n  - &t {n: &m 1, o: *m}\n  - n: 1\n    o: 5\n",
         "output: {output:?}"
     );
+    Ok(())
+}
+
+/// #2500: a nested *alias reference* reached through a diverged alias's
+/// expanded copy is not a copied declaration and must survive as `*base`,
+/// not inline the target's value -- see `to_owned_with_comments_at_depth`'s
+/// own doc comment for why only a `Declares` mark is dropped. `.prod.name`
+/// writes through the `prod` alias on this branch, diverging its expanded
+/// copy (issue 1351 will later redirect this particular write onto `.env`
+/// instead, at which point `.prod` would stay `*env` and never reach the
+/// expanded-copy path at all) -- named for the mechanism rather than this
+/// specific write shape so it keeps meaning either way.
+#[test]
+fn test_yaml_alias_subtree_keeps_nested_alias_marks_2500() -> Result<()> {
+    let input = concat!(
+        "base: &base\n",
+        "  host: h\n",
+        "  port: 1\n",
+        "env: &env\n",
+        "  cfg: *base\n",
+        "  name: dev\n",
+        "prod: *env\n",
+    );
+    let (output, exit_code) = run_yq_stdin(r#".prod.name = "prod""#, input, &[])?;
+    assert_eq!(exit_code, 0, "output: {output:?}");
     assert_eq!(
-        output.matches("&m").count(),
-        1,
-        "expected exactly one &m declaration, output: {output:?}"
+        output,
+        concat!(
+            "base: &base\n",
+            "  host: h\n",
+            "  port: 1\n",
+            "env: &env\n",
+            "  cfg: *base\n",
+            "  name: dev\n",
+            "prod:\n",
+            "  cfg: *base\n",
+            "  name: prod\n",
+        ),
+        "output: {output:?}"
     );
     Ok(())
 }
 
-/// #2500: the fix only changes the *side-tree* built for an alias position,
-/// never the value the writer/emitter renders when the alias mark itself
-/// survives -- `emit_yaml_value_at_depth` checks `comments.alias_name()`
-/// before any value-shape dispatch and never touches the (now-`Leaf`)
-/// children in that case, so a plain identity query over a document whose
-/// aliases never diverge must be byte-for-byte unaffected.
+/// #2500: a diverged alias's expanded copy keeps ordinary presentation data
+/// (comments, style, nested marks) the same as any other computed subtree
+/// would -- see `to_owned_with_comments_at_depth`'s own doc comment; only a
+/// copied anchor *declaration* is special-cased and dropped. No oracle to
+/// match: real yq prints an unreadable `b: *x` here (no `&x` anywhere,
+/// since `.a` was deleted -- confirmed live against v4.53.3), so this pins
+/// succinctly's own behavior only.
 #[test]
-fn test_yaml_alias_identity_output_unchanged_2500() -> Result<()> {
-    let input = "a: &x\n  p: &y 1\n  q: *y\nb: *x\n";
-    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+fn test_yaml_alias_subtree_keeps_comments_and_style_2500() -> Result<()> {
+    let input = "a: &x\n  p: 1 # note\n  l: [1, 2]\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin("del(.a) | .b.p = 2", input, &[])?;
     assert_eq!(exit_code, 0, "output: {output:?}");
-    assert_eq!(output, input);
-
-    let input = "items:\n  - &t {n: &m 1, o: *m}\n  - *t\n";
-    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
-    assert_eq!(exit_code, 0, "output: {output:?}");
-    assert_eq!(output, input);
+    assert_eq!(
+        output, "b:\n  p: 2 # note\n  l: [1, 2]\n",
+        "output: {output:?}"
+    );
     Ok(())
 }
 
