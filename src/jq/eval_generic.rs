@@ -10555,7 +10555,26 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                         // already-indexed prefix must still survive as
                         // `Partial`, not vanish with it.
                         GenericResult::Error(e) => escape_generic!(Control::Error(e)),
-                        _ => unreachable!("index_one_generic yields OneCursor/Owned/None/Error"),
+                        // #2182: was a wildcard `_ =>` -- verified by
+                        // reading `index_one_generic`'s own body
+                        // exhaustively: every branch resolves to
+                        // `OneCursor`/`Owned`/`None`/`Error`, so this is a
+                        // provably closed set today. Spelled out
+                        // per-variant so a future `GenericResult` variant
+                        // it starts returning is a compile error here, not
+                        // a silent absorption into a catch-all.
+                        GenericResult::One(_)
+                        | GenericResult::Many(_)
+                        | GenericResult::ManyCursor(_)
+                        | GenericResult::LazyKeys { .. }
+                        | GenericResult::LazyIndexRange(_)
+                        | GenericResult::LazySeq(_)
+                        | GenericResult::ManyOwned(_)
+                        | GenericResult::Break(_)
+                        | GenericResult::Halt(_)
+                        | GenericResult::Partial(..) => {
+                            unreachable!("index_one_generic yields OneCursor/Owned/None/Error")
+                        }
                     }
                 }
             }
@@ -10965,7 +10984,27 @@ fn eval_slice_expr<S: EvalSemantics, V: DocumentValue>(
                             // target-evaluation fix above making the same
                             // claim.
                             GenericResult::Error(e) => escape!(Control::Error(e)),
-                            _ => unreachable!("slice_one_generic yields Owned/None/Error"),
+                            // #2182: was a wildcard `_ =>` -- verified by
+                            // reading `slice_one_generic`'s own body
+                            // exhaustively: every return path resolves to
+                            // `Owned`/`None`/`Error`, so this is a provably
+                            // closed set today. Spelled out per-variant so
+                            // a future `GenericResult` variant it starts
+                            // returning is a compile error here, not a
+                            // silent absorption into a catch-all.
+                            GenericResult::One(_)
+                            | GenericResult::OneCursor(_)
+                            | GenericResult::Many(_)
+                            | GenericResult::ManyCursor(_)
+                            | GenericResult::LazyKeys { .. }
+                            | GenericResult::LazyIndexRange(_)
+                            | GenericResult::LazySeq(_)
+                            | GenericResult::ManyOwned(_)
+                            | GenericResult::Break(_)
+                            | GenericResult::Halt(_)
+                            | GenericResult::Partial(..) => {
+                                unreachable!("slice_one_generic yields Owned/None/Error")
+                            }
                         }
                     }
                 }
@@ -16956,10 +16995,25 @@ fn owned_identity_materialize<V: DocumentValue>(
         GenericResult::Error(e) => Err(Control::Error(e)),
         GenericResult::Break(label) => Err(Control::Break(label)),
         GenericResult::Halt(code) => Err(Control::Halt(code)),
-        // `generic_item_to_result` maps one item to `One`/`OneCursor`/
-        // `Owned` or a lazy variant, and `materialize_lazy` maps those to
-        // `Owned` or an escape.
-        _ => unreachable!("a single pipe item never materializes to a stream"),
+        // #2182: was a wildcard `_ =>` -- `generic_item_to_result` maps one
+        // item to `One`/`OneCursor`/`Owned` or a lazy variant
+        // (`LazyKeys`/`LazyIndexRange`/`LazySeq`), and `materialize_lazy`
+        // maps those lazy variants to `Owned` or an escape
+        // (`Error`/`Break`/`Halt`) -- so the combined range is exactly the
+        // six variants already handled above, verified by reading both
+        // functions' bodies. Spelled out per-variant so a future
+        // `GenericResult`/`GenericItem` variant is a compile error here,
+        // not a silent absorption into a catch-all.
+        GenericResult::Many(_)
+        | GenericResult::ManyCursor(_)
+        | GenericResult::LazyKeys { .. }
+        | GenericResult::LazyIndexRange(_)
+        | GenericResult::LazySeq(_)
+        | GenericResult::None
+        | GenericResult::ManyOwned(_)
+        | GenericResult::Partial(..) => {
+            unreachable!("a single pipe item never materializes to a stream")
+        }
     }
 }
 
