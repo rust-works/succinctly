@@ -1425,6 +1425,10 @@ fn test_yq_default_rejects_jq_only_builtins_1512() -> Result<()> {
         // test_yq_downcase_upcase_builtins_2462).
         "ascii_downcase",
         "ascii_upcase",
+        // #2430: real yq's `path` is nullary; `path(f)` is jq's. Bare
+        // `path` (not in this list) stays ungated -- see
+        // test_yq_bare_path_ungated_2430.
+        "path(.a)",
     ] {
         let (_out, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[])?;
         assert_ne!(code, 0, "filter {filter:?} should be rejected by default");
@@ -1579,6 +1583,7 @@ fn test_yq_jq_extensions_flag_enables_jq_only_builtins_1512() -> Result<()> {
         "nan",
         "\"ABC\" | ascii_downcase",
         "\"abc\" | ascii_upcase",
+        "path(.a)",
     ] {
         let (_out, stderr, code) =
             run_yq_stdin_with_stderr(filter, "a: 1\n", &["--jq-extensions"])?;
@@ -1587,6 +1592,28 @@ fn test_yq_jq_extensions_flag_enables_jq_only_builtins_1512() -> Result<()> {
             "filter {filter:?} should succeed with --jq-extensions, stderr: {stderr}"
         );
     }
+    Ok(())
+}
+
+/// #2430: real yq's `path` is nullary (the current traversal path); `path(f)`
+/// is jq's own construct and has no yq oracle at all -- unlike `path`, it's
+/// gated behind `--jq-extensions` above. Pins the error position at the
+/// keyword's own start (matching every other `reject_unless_jq_extensions`
+/// site), not at the `(` that disambiguates the two forms, and confirms bare
+/// `path` keeps working with no flag either way.
+#[test]
+fn test_yq_bare_path_ungated_2430() -> Result<()> {
+    let (out, code) = run_yq_stdin(".a | path", "a: 1\n", &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), r#"["a"]"#);
+
+    let (_out, stderr, code) = run_yq_stdin_with_stderr("path(.a)", "a: 1\n", &[])?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("parse error at position 0"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("--jq-extensions"), "stderr: {stderr}");
     Ok(())
 }
 
