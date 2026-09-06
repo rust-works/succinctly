@@ -128,6 +128,31 @@ positionally and drops the marks. A multi-document stream applies the redirect a
 anchor marks to the last document only
 ([#2520](https://github.com/rust-works/succinctly/issues/2520), pre-existing).
 
+The same soundness gate also governs `.c = .b`-style plain assignments
+(split out of #1351 as [#2497](https://github.com/rust-works/succinctly/issues/2497)):
+`propagate_assign_alias_marks` copies an alias mark onto the assignment's target whenever the
+value side is a static read of an aliased node, then leaves `enforce_anchor_soundness` to
+decide whether that mark actually survives. Writing an alias *onto* the very node that
+declares its own anchor destroys the only remaining declaration, so both marks come out
+unresolvable and both are dropped:
+
+```bash
+$ printf 'a: &x 1\nb: *x\n' | yq '.a = .b'
+a: *x
+b: *x
+$ printf 'a: &x 1\nb: *x\n' | yq '.a = .b' | yq '.'
+Error: bad file '-': yaml: line 1, column 5: unknown anchor 'x' referenced
+
+$ printf 'a: &x 1\nb: *x\n' | succinctly yq '.a = .b'
+a: 1
+b: 1
+```
+
+This is not a bug in the propagation pass — it is rule 4(a) applying to a second write shape
+that reaches the same unsound state `del(.a)` above does, discovered mechanically rather than
+special-cased: `enforce_anchor_soundness` runs unchanged afterwards and simply finds no
+`Declares` mark left for `x` to resolve either alias against.
+
 A related, narrower gap sits in `select`/`if`'s condition-truthiness check
 (`push_generic_truthiness_cursor_error`, [src/jq/eval_generic.rs](../../../src/jq/eval_generic.rs)):
 it does not walk into a *container* reached through an alias, so a decode failure reachable

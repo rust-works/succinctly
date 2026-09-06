@@ -25085,6 +25085,133 @@ fn test_yaml_nested_write_through_alias_keeps_the_mark_763_1351() -> Result<()> 
     Ok(())
 }
 
+// =============================================================================
+// #2497 (split from #1351's "case 2") - a plain assignment (`.c = .b`) whose
+// value is a static read of an aliased node must itself alias, matching real
+// yq's node-copy semantics: `propagate_assign_alias_marks` in
+// `yq_runner.rs` looks up the source path's mark in the already-reconciled
+// `CommentTree` and copies an `Aliases` mark onto the target when found.
+// Every expected string below is pinned against mikefarah/yq v4.53.3, run
+// directly against that binary.
+// =============================================================================
+
+#[test]
+fn test_yaml_assign_from_alias_keeps_alias_mark_2497() -> Result<()> {
+    // Scalar source: `yq '.c = .b'` on `b: *x` prints `c: *x`.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".c = .b", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: &x 1\nb: *x\nc: *x\n");
+
+    let (json, exit_code) = run_yq_stdin(".c = .b", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(json.trim(), r#"{"a":1,"b":1,"c":1}"#, "values unchanged");
+
+    // Container source: same rule, `.a` is a mapping rather than a scalar.
+    let input = "a: &x {p: 1}\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".c = .b", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: &x {p: 1}\nb: *x\nc: *x\n");
+
+    let (json, exit_code) = run_yq_stdin(".c = .b", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(json.trim(), r#"{"a":{"p":1},"b":{"p":1},"c":{"p":1}}"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_assign_from_alias_paren_optional_bracket_forms_2497() -> Result<()> {
+    // `(.b)`, `.b?`, and `.["b"]` are all still static navigation to `.b` and
+    // must propagate the mark exactly like the bare `.b` case above.
+    let input = "a: &x 1\nb: *x\n";
+    for filter in [".c = (.b)", ".c = .b?", r#".c = .["b"]"#] {
+        let (output, exit_code) = run_yq_stdin(filter, input, &[])?;
+        assert_eq!(exit_code, 0, "filter: {filter}");
+        assert_eq!(output, "a: &x 1\nb: *x\nc: *x\n", "filter: {filter}");
+
+        let (json, exit_code) = run_yq_stdin(filter, input, &["-o=json", "-I=0"])?;
+        assert_eq!(exit_code, 0, "filter: {filter}");
+        assert_eq!(
+            json.trim(),
+            r#"{"a":1,"b":1,"c":1}"#,
+            "values unchanged, filter: {filter}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_yaml_assign_from_anchor_is_plain_2497() -> Result<()> {
+    // `.a` is the anchor's own declaration, not an alias -- `yq '.c = .a'`
+    // prints a plain `c: 1`, never `&x`/`*x`.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".c = .a", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: &x 1\nb: *x\nc: 1\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_assign_from_alias_chain_2497() -> Result<()> {
+    // `.c = .b | .d = .c`: the second stage must see the mark the first
+    // stage just set on `.c`, which did not exist in the pristine document
+    // at all.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".c = .b | .d = .c", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: &x 1\nb: *x\nc: *x\nd: *x\n");
+
+    let (json, exit_code) = run_yq_stdin(".c = .b | .d = .c", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(json.trim(), r#"{"a":1,"b":1,"c":1,"d":1}"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_assign_arithmetic_rhs_is_plain_2497() -> Result<()> {
+    // DELIBERATE NON-DIVERGENCE: real yq has a data-loss bug here --
+    // `.c = (.b + 1)` prints `c: *x` while silently keeping the *old* value
+    // (1, not 2) underneath. succinctly does not reproduce that: the RHS
+    // isn't static navigation, so this pass leaves it alone and the actual
+    // computed value (2) prints as a plain scalar.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".c = (.b + 1)", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: &x 1\nb: *x\nc: 2\n");
+
+    let (json, exit_code) = run_yq_stdin(".c = (.b + 1)", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(json.trim(), r#"{"a":1,"b":1,"c":2}"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_assign_alias_onto_anchor_drops_both_2497() -> Result<()> {
+    // DELIBERATE DIVERGENCE, rule 4(a) (see
+    // `docs/compliance/yq/limitations.md`). Real yq prints `a: *x\nb: *x\n`
+    // here -- overwriting the anchor's own declaration with an alias to
+    // itself, so no `&x` is left anywhere and yq then refuses to re-read its
+    // own output (`unknown anchor 'x' referenced`, verified against the
+    // pinned binary). `enforce_anchor_soundness` runs after this pass finds
+    // no surviving declaration and drops both marks.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".a = .b", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: 1\nb: 1\n");
+
+    let (round_tripped, exit_code) = run_yq_stdin(".", &output, &[])?;
+    assert_eq!(
+        exit_code, 0,
+        "succinctly must be able to re-read its own output"
+    );
+    assert_eq!(round_tripped, output);
+
+    let (json, exit_code) = run_yq_stdin(".a = .b", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(json.trim(), r#"{"a":1,"b":1}"#, "values unchanged");
+    Ok(())
+}
+
 /// #1201: `reduce`/`foreach`'s binding clause is parsed by the shared
 /// `parse_pattern`, which both `ParserMode`s reach, so full destructuring
 /// patterns land in yq mode too. There is no oracle to match here -- real yq

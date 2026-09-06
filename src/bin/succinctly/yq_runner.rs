@@ -2806,6 +2806,152 @@ fn comment_tree_at_path_mut<'t>(
     Some(node)
 }
 
+/// Read-only counterpart of [`comment_tree_at_path_mut`] used by
+/// [`propagate_assign_alias_marks`] (#2497) to look up a `value` operand's
+/// current mark before copying it onto the assignment's target. Built on
+/// [`CommentTree::field`]/[`CommentTree::at_index`], which already fall back
+/// to [`CommentTree::empty`] for a missing key/index or a shape mismatch, so
+/// unlike its mutable counterpart this never needs to fail — an
+/// out-of-bounds or wrong-kind step along the way just means "no mark here",
+/// which is exactly the answer that should make the caller do nothing.
+fn nav_comment_tree<'t>(tree: &'t CommentTree, steps: &[TreeStep<'_>]) -> &'t CommentTree {
+    let mut node = tree;
+    for step in steps {
+        node = match step {
+            TreeStep::Key(k) => node.field(k),
+            TreeStep::Index(i) => node.at_index(*i),
+        };
+    }
+    node
+}
+
+/// Whether `expr` is *static navigation* — a chain of `Expr::Field`/
+/// `Expr::Index` steps through `Expr::Paren`/`Expr::Optional`, e.g. `.b`,
+/// `.a.b`, `.b?`, `(.b)` — and if so, the [`TreeStep`] path it names.
+///
+/// `.["b"]` needs no case of its own: the parser already folds a
+/// constant-string index to [`Expr::Field`] (see that variant's own doc
+/// comment), so it reaches the `Expr::Field` arm below like `.b` would.
+/// A negative [`Expr::Index`] is deliberately excluded (`None`) — resolving
+/// `.[-1]` needs the target array's length, which a purely syntactic path
+/// can't supply, and this function only ever runs against a path/value pair
+/// that must be statically knowable from the AST alone.
+///
+/// Used by [`propagate_assign_alias_marks`] (#2497) to recognise both an
+/// assignment's `path` and its `value` operand as "just navigation", the
+/// narrow class where copying a mark from one path to another is safe: an
+/// arithmetic or other computed `value` (`.c = (.b + 1)`) returns `None`
+/// here and the pass leaves that assignment alone, matching real yq's own
+/// data-loss bug on that shape rather than "fixing" it (see the limitations
+/// doc entry this issue adds).
+fn static_nav_steps(expr: &Expr) -> Option<Vec<TreeStep<'_>>> {
+    match expr {
+        Expr::Identity => Some(Vec::new()),
+        Expr::Field(name) => Some(vec![TreeStep::Key(name.as_str())]),
+        Expr::Index { idx, .. } if *idx >= 0 => Some(vec![TreeStep::Index(*idx as usize)]),
+        Expr::Paren(inner) | Expr::Optional(inner) => static_nav_steps(inner),
+        Expr::Pipe(stages) => {
+            let mut steps = Vec::new();
+            for stage in stages {
+                steps.extend(static_nav_steps(stage)?);
+            }
+            Some(steps)
+        }
+        _ => None,
+    }
+}
+
+/// Extract `expr`'s `(path, value)` pairs when its shape is a plain
+/// [`Expr::Assign`] (`=`) or a [`Expr::Pipe`] of such assigns applied in
+/// order (`.c = .b | .d = .c`), unwrapping `Expr::Paren`/`Expr::Optional`
+/// around the whole expression or any one stage.
+///
+/// Deliberately narrower than [`is_alias_sensitive_assign`]'s own
+/// `is_shape_preserving`, which also admits `Update`/`CompoundAssign`/
+/// `AlternativeAssign`/`del`/`select`/... — [`propagate_assign_alias_marks`]
+/// only knows how to reason about plain `=`, whose right-hand side is a
+/// value expression to copy rather than a filter applied to the existing
+/// one, so `.a |= .b`, `.a += .b`, etc. all correctly fall outside this and
+/// are left for `enforce_anchor_soundness` alone to settle (#2497's own
+/// scope note excludes `|=`).
+fn collect_assign_chain(expr: &Expr) -> Option<Vec<(&Expr, &Expr)>> {
+    match expr {
+        Expr::Assign { path, value } => Some(vec![(path.as_ref(), value.as_ref())]),
+        Expr::Paren(inner) | Expr::Optional(inner) => collect_assign_chain(inner),
+        Expr::Pipe(stages) => {
+            let mut pairs = Vec::new();
+            for stage in stages {
+                pairs.extend(collect_assign_chain(stage)?);
+            }
+            Some(pairs)
+        }
+        _ => None,
+    }
+}
+
+/// Propagate an alias mark through a plain assignment whose value is a
+/// static read of an aliased node (#2497, split from #1351's "case 2"):
+/// real `yq` prints `c: *x` for `.c = .b` when the source has `b: *x`,
+/// because go-yaml's `Set` copies the RHS node's `Kind`/`Tag`/`Value`
+/// wholesale, and an alias node's `Kind` says "I am an alias" — so the
+/// destination becomes an alias node too. `reconcile_presentation_at_depth`
+/// has no notion of a write's *source* path (it only diffs pristine vs.
+/// result value shape at matching keys/indices), so a key that's brand new
+/// in the result — `.c` did not exist before this write — gets
+/// `CommentTree::empty()` and never had a chance to pick up `.b`'s mark on
+/// its own.
+///
+/// Walks `expr`'s assignment stages in order, mutating `tree` — the
+/// already-[`reconcile_presentation`]d tree for one result document — as it
+/// goes, rather than reading a separate pristine snapshot: for every path
+/// this pass hasn't touched yet, `tree` already agrees with the pristine
+/// tree exactly (`reconcile_presentation_at_depth`'s "both scalars: mark
+/// survives" rule), and for a path an *earlier* stage in this same chain
+/// just wrote to (`.c` in `.c = .b | .d = .c`), `tree` holds the fresher
+/// answer pristine never had at all. Reading `tree` uniformly is therefore
+/// both simpler and gives the chain case exactly the "second stage sees the
+/// first stage's mark" behaviour it needs, with no separate fallback logic.
+///
+/// Only ever *adds* an `Aliases` mark, and only when both `path` and
+/// `value` are [`static_nav_steps`] — never for `Declares(_)` or an absent
+/// mark on the value side (`.c = .a`, an anchor's own declaration, stays
+/// plain: `c: 1`), and never for a non-navigation value (`.c = (.b + 1)`
+/// stays plain too, matching real yq's own data-loss bug on that shape
+/// rather than reproducing it). The write fully replaces the target's
+/// `CommentTree` node with a fresh alias-only leaf — dropping any comment/
+/// style the target previously carried — since a plain assignment is, in
+/// go-yaml's model, a wholesale node replacement, not an in-place value
+/// edit; a brand-new key (`.c`) had no comment/style to lose anyway, and an
+/// existing key overwritten this way (`.a = .b` on `a: &x 1`) trades its old
+/// `Declares` mark for the new `Aliases` one, which is exactly what lets
+/// [`enforce_anchor_soundness`] — running after this pass — discover no
+/// declaration for `x` survives and drop both marks (rule 4(a): `.a = .b`
+/// prints `a: 1` / `b: 1`, recorded in `docs/compliance/yq/limitations.md`
+/// next to the `del(.a)` example).
+fn propagate_assign_alias_marks(expr: &Expr, tree: &mut CommentTree) {
+    let Some(stages) = collect_assign_chain(expr) else {
+        return;
+    };
+    for (path_expr, value_expr) in stages {
+        let (Some(path_steps), Some(value_steps)) =
+            (static_nav_steps(path_expr), static_nav_steps(value_expr))
+        else {
+            continue;
+        };
+        let Some(AnchorMark::Aliases(name)) = nav_comment_tree(tree, &value_steps).anchor_mark()
+        else {
+            continue;
+        };
+        let name = name.clone();
+        if let Some(node) = comment_tree_at_path_mut(tree, &path_steps) {
+            *node = CommentTree::Leaf(NodeMeta {
+                anchor: Some(AnchorMark::Aliases(name)),
+                ..NodeMeta::empty()
+            });
+        }
+    }
+}
+
 /// Evaluate a jq expression directly on a YAML cursor.
 ///
 /// This uses the generic evaluator to preserve position metadata (line/column).
@@ -3055,6 +3201,24 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
         if let Ok(docs) = &mut docs {
             for (value, _comments) in docs.iter_mut() {
                 sync_aliased_paths(value, pristine, groups);
+            }
+        }
+    }
+
+    // Propagate an alias mark through a plain assignment whose value is a
+    // static read of an aliased node (#2497): see
+    // `propagate_assign_alias_marks`'s own doc comment for the full
+    // rationale. Gated on `presentation_sync_ctx` rather than re-deriving
+    // its own condition: that's exactly "there is a reconciled `CommentTree`
+    // here worth revisiting", which this pass needs and nothing else does.
+    // Must run after `reconcile_presentation` has produced each result
+    // document's tree (via `no_comments`/`owned_with_comments` above) and
+    // before `enforce_anchor_soundness` below, which is what actually
+    // decides whether the mark this pass adds is safe to keep.
+    if presentation_sync_ctx.is_some() {
+        if let Ok(docs) = &mut docs {
+            for (_value, comments) in docs.iter_mut() {
+                propagate_assign_alias_marks(expr, comments);
             }
         }
     }
