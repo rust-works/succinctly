@@ -36111,3 +36111,104 @@ fn test_map_family_bodies_see_their_members_position_2471() -> Result<()> {
     }
     Ok(())
 }
+
+/// #2495: the owned identity pipe's `owned_identity_*` navigation cluster
+/// (`src/jq/eval_generic.rs`) used to fold every non-`Error` escape from a
+/// computed bracket into "no more values" and discard an already-collected
+/// prefix on any escape at all -- both root-caused by
+/// `owned_identity_values` throwing away its collected `Vec` the moment
+/// `eval_each_owned` signalled `Flow::Escaped`, instead of handing the
+/// prefix back *alongside* the escape the way `Flow`'s own contract
+/// ("everything before it was already delivered") already works elsewhere
+/// in this file.
+///
+/// 1. A `halt`/`halt_error` inside a computed bracket's key vanished
+///    entirely -- pre-fix, `[.a | .[halt_error] | key]` on `a: {b: 1}`
+///    answered `[]` at exit 0 instead of halting.
+/// 2. A step's already-produced output was lost when a *later* component
+///    of the same computed bracket failed -- pre-fix, `.arr | .[(0,"a")] |
+///    key` on `arr: [1, 2, 3]` answered nothing instead of `0` before
+///    raising (real jq's own `.[(0,"a")]`, without `key`, proves the
+///    prefix-preservation rule itself: `[1,2,3] | .[(0,"a")]` prints `1`
+///    then raises `Cannot index array with string "a"`, confirmed against
+///    jq 1.7.1 -- `key` just reports the *index* `0` instead of the
+///    *value* `1` for that same first component).
+///
+/// Fixing this also surfaced a third, previously-latent issue removing the
+/// `owned_identity_escapes_are_carried` decline exposed: the `IndexExpr`
+/// arm evaluated its key expression *twice* (once alone for the
+/// component's key, once re-embedded in the full bracket for its value),
+/// so a side-effecting key like `halt_error` printed its message twice.
+/// `owned_identity_computed_step` now stands the already-computed key(s)
+/// back in as `Expr::Literal`s for the second evaluation instead of
+/// re-running the original expression, so the side effect fires once.
+///
+/// Both shapes, captured on this fix (yq has no real reference for `key`,
+/// a succinctly extension; `halt_error`'s own exit code is yq's own -- `1`,
+/// not jq's `5` -- confirmed unchanged by this fix against the pre-#2495
+/// `.a | .[halt_error]` baseline with no `key` at all):
+///
+/// ```console
+/// $ succinctly yq -o=json -I0 '[.a | .[halt_error] | key]'   # a: {b: 1}
+/// stdout: (nothing)   stderr: {"b":1}   exit: 1
+/// $ succinctly yq -o=json -I0 '.arr | .[(0,"a")] | key'      # arr: [1,2,3]
+/// stdout: 0   stderr: Error: Cannot index array with string "a"   exit: 1
+/// ```
+#[test]
+fn test_owned_identity_pipe_carries_control_and_prefix_2495() -> Result<()> {
+    let args = &["-o", "json", "-I0"];
+
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr("[.a | .[halt_error] | key]", "a:\n  b: 1\n", args)?;
+    assert_eq!(code, 1, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(
+        stdout, "",
+        "a halted computed-bracket key must emit nothing"
+    );
+    assert_eq!(
+        stderr.trim_end(),
+        r#"{"b":1}"#,
+        "halt_error's message must appear exactly once, not doubled by a second key evaluation"
+    );
+
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(
+        ".arr | .[(0,\"a\")] | key",
+        "arr:\n  - 1\n  - 2\n  - 3\n",
+        args,
+    )?;
+    assert_eq!(code, 1, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(
+        stdout.trim_end(),
+        "0",
+        "the first component's already-answered key must survive the second component's error"
+    );
+    assert!(
+        stderr.contains("Cannot index array with string \"a\""),
+        "stderr={stderr:?}"
+    );
+
+    // The same two shapes with an intervening `Keeps`-rule stage
+    // (`tostring`/`sort`), which is what actually routes them through
+    // `owned_identity_pipe_applies` rather than the absent-position route
+    // above -- both routes share the same fixed cluster, so both must
+    // agree.
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(
+        "[.a | tostring | .[halt_error] | key]",
+        "a:\n  b: 1\n",
+        args,
+    )?;
+    assert_eq!(code, 1, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr.trim_end(), r#"{"b":1}"#);
+
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(
+        ".arr | sort | .[(0,\"a\")] | key",
+        "arr:\n  - 3\n  - 1\n  - 2\n",
+        args,
+    )?;
+    assert_eq!(code, 1, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout.trim_end(), "0");
+    assert!(stderr.contains("Cannot index array with string \"a\""));
+
+    Ok(())
+}
