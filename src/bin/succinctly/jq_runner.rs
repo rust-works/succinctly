@@ -22,7 +22,7 @@ use succinctly::jq::eval_generic::{
 use succinctly::jq::walk::map_builtin_subexprs;
 use succinctly::jq::{
     self, format_number_jq_compat, jq_bare_float_display, nonfinite_display_string, Builtin,
-    EvalError, Expr, FuncDefBound, JqSemantics, JqValue, OwnedValue, Program, StreamStats,
+    EvalError, Expr, FuncDefBound, JqSemantics, JqValue, OwnedValue, Param, Program, StreamStats,
     UnresolvedCall, MAX_VALUE_TREE_DEPTH,
 };
 use succinctly::json::light::{preceding_gap_ok, JsonCursor, StandardJson};
@@ -52,9 +52,9 @@ pub struct ModuleLoader {
     /// Search path for modules (in order of priority)
     search_path: Vec<PathBuf>,
     /// Loaded modules (path -> function definitions: name, params, body)
-    loaded_modules: BTreeMap<String, Vec<(String, Vec<String>, Expr)>>,
+    loaded_modules: BTreeMap<String, Vec<(String, Vec<Param>, Expr)>>,
     /// Auto-loaded ~/.jq file definitions (if file exists): name, params, body
-    auto_loaded_defs: Vec<(String, Vec<String>, Expr)>,
+    auto_loaded_defs: Vec<(String, Vec<Param>, Expr)>,
 }
 
 impl ModuleLoader {
@@ -124,7 +124,7 @@ impl ModuleLoader {
     }
 
     /// Load a module and return its function definitions (name, params, body).
-    pub fn load_module(&mut self, module_path: &str) -> Result<Vec<(String, Vec<String>, Expr)>> {
+    pub fn load_module(&mut self, module_path: &str) -> Result<Vec<(String, Vec<Param>, Expr)>> {
         // Check if already loaded
         if let Some(defs) = self.loaded_modules.get(module_path) {
             return Ok(defs.clone());
@@ -485,10 +485,10 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
 }
 
 /// Extract function definitions from an expression, preserving parameters.
-fn extract_func_defs(expr: &Expr) -> Vec<(String, Vec<String>, Expr)> {
+fn extract_func_defs(expr: &Expr) -> Vec<(String, Vec<Param>, Expr)> {
     let mut defs = Vec::new();
 
-    fn extract_inner(expr: &Expr, defs: &mut Vec<(String, Vec<String>, Expr)>) {
+    fn extract_inner(expr: &Expr, defs: &mut Vec<(String, Vec<Param>, Expr)>) {
         if let Expr::FuncDef {
             name,
             params,

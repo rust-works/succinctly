@@ -637,7 +637,7 @@ fn check(expr: &mut Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
             // `g`. Pushed after the function's own name so a parameter
             // shadowing it wins.
             for p in params.iter() {
-                scope.push((p.clone(), 0));
+                scope.push((p.name().to_string(), 0));
             }
             check(body, scope, errors);
             scope.truncate(with_self);

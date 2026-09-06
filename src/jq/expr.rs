@@ -17,6 +17,65 @@ use std::rc::Rc;
 
 use super::value::{NumberRepr, OwnedValue};
 
+/// A `def`'s own parameter, carrying whether it was written with a
+/// leading `$` (`def f($g): ...`) or bare (`def f(g): ...`).
+///
+/// #2283: the two shapes bind a call-site argument to the identical
+/// value, but answer a different question when a nested `def`'s own
+/// parameter of a matching name might shadow an *outer* `$var`
+/// substitution: a bare parameter has no `$`-binding of its own (an
+/// outer `$g` reaches through it), while a `$`-style one does (it must
+/// not be pre-filled with the outer value before this def is ever
+/// called). Storing this as a variant on the parameter itself, rather
+/// than stripping the `$` at parse time (as the pre-#2283 parser did) or
+/// as a parallel bitmask alongside a bare-only `Vec<String>` (an earlier
+/// version of this fix, reverted after review): a `Vec<Param>` occupies
+/// the identical 24 bytes `Vec<String>` did (`Vec<T>`'s own
+/// representation -- pointer, length, capacity -- never depends on `T`'s
+/// size), so `Expr::FuncDef` and `Expr`'s own pinned footprint (`#1401`)
+/// are both unchanged by this type, unlike adding a same-purpose field
+/// alongside `params` (which measurably cost `Expr` 8 bytes regardless
+/// of the field's own size -- confirmed via `-Zprint-type-sizes` across
+/// every shape tried, including a bare `u8`, and pushed
+/// `MAX_EXPR_DEPTH`/`MAX_PATTERN_DEPTH`, `src/jq/parser.rs`, into a
+/// genuine stack overflow on the CLI's own 8 MiB stack before this
+/// design was chosen instead).
+///
+/// [`Param::name`] recovers the bare identifier every existing bare-name
+/// consumer (call-site argument substitution, arity checks) already
+/// expects, regardless of variant -- both spellings bind that same bare
+/// name at the call site; only the shadow-check sites in
+/// `substitute_var_impl`/`substitute_func_param_impl` (`src/jq/eval.rs`)
+/// need to distinguish `Bare`/`Dollar` at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Param {
+    /// `def f(g): ...` -- binds only the bare `g` call-site namespace.
+    Bare(String),
+    /// `def f($g): ...` -- binds the bare `g` namespace (identically to
+    /// `Bare`) *and* makes `$g` available inside the body, with no other
+    /// binding mechanism for that `$g` (confirmed live against jq 1.7.1:
+    /// `def f(g): $g; f(1)` is a compile error, "$g is not defined" --
+    /// bare alone never creates a `$`-binding).
+    Dollar(String),
+}
+
+impl Param {
+    /// The bare identifier, regardless of spelling -- what every existing
+    /// bare-name consumer (call-site substitution, arity/name checks)
+    /// already expects; only the two shadow-check sites need the
+    /// `Bare`/`Dollar` distinction itself.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Bare(name) | Self::Dollar(name) => name,
+        }
+    }
+
+    /// Whether this parameter was written `$`-style (`$g`, not bare `g`).
+    pub fn is_dollar(&self) -> bool {
+        matches!(self, Self::Dollar(_))
+    }
+}
+
 /// A jq expression representing a query path.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
@@ -395,8 +454,10 @@ pub enum Expr {
     FuncDef {
         /// Function name
         name: String,
-        /// Parameter names (empty for no-arg functions)
-        params: Vec<String>,
+        /// Parameters (empty for no-arg functions) -- see [`Param`]'s own
+        /// doc comment for why each carries its bare-vs-`$`-style spelling
+        /// instead of just a bare `String`.
+        params: Vec<Param>,
         /// Function body
         body: Box<Self>,
         /// Expression where this function is in scope

@@ -44,14 +44,14 @@ use super::eval::{
     has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
     index_one_owned as index_owned_by_key, is_pure_chain_link, is_retryable_stop, literal_to_owned,
     needs_path_context, numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned,
-    owned_bound_to_i64, owned_to_string, prefer_pending_control, slice_component_value,
-    slice_object_as_yq_children, slice_owned_value_read, streams_escaped_generator_prefix,
-    substitute_bound_var, substitute_vars, suppress_or_raise, suppresses, tonumber_from_str,
-    vec_with_capacity, yq_absent_key_read_is_empty, yq_empty_operand_output,
-    yq_field_index_on_scalar_is_empty, yq_negative_index_check, yq_numeric_index_on_object_is_null,
-    yq_object_key_stringify, yq_read_only_context, BinaryFanoutRules, Control, Demand,
-    EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail,
-    QueryResult, YqSemantics,
+    owned_bound_to_i64, owned_to_string, param_names, prefer_pending_control,
+    slice_component_value, slice_object_as_yq_children, slice_owned_value_read,
+    streams_escaped_generator_prefix, substitute_bound_var, substitute_vars, suppress_or_raise,
+    suppresses, tonumber_from_str, vec_with_capacity, yq_absent_key_read_is_empty,
+    yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_negative_index_check,
+    yq_numeric_index_on_object_is_null, yq_object_key_stringify, yq_read_only_context,
+    BinaryFanoutRules, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
+    JqSemantics, LimitN, PathTrail, QueryResult, YqSemantics,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -7267,7 +7267,7 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             then,
             bound,
         } => {
-            let bound_then = bind_def(name, params, body, then, bound);
+            let bound_then = bind_def(name, &param_names(params), body, then, bound);
             eval_each_generic::<S, V>(&bound_then, value, optional, cursor, sink)
         }
 
@@ -25841,7 +25841,7 @@ mod tests {
 
         let _guard = enter_def_call_frame(crate::jq::eval::MAX_EVAL_FRAMES);
         let cache = FuncDefBound::default();
-        let defcall = bind_def(&name, &params, &body, &then, &cache);
+        let defcall = bind_def(&name, &param_names(&params), &body, &then, &cache);
         assert!(
             matches!(&*defcall, Expr::DefCall { frames, .. } if *frames == crate::jq::eval::MAX_EVAL_FRAMES),
             "expected bind_def to seed frames from the ambient depth"

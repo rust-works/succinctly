@@ -21422,32 +21422,32 @@ fn test_bare_param_not_shadowed_by_dollar_binding_of_same_name_2141() -> Result<
     Ok(())
 }
 
-/// #2141 review found a genuine, *not-fixable-here* ambiguity next to the
-/// original bug: `parse_func_def_parts` discards a parameter's leading `$`
-/// at parse time, so `def f(g)` and `def f($g)` produce the identical
-/// `params: ["g"]` -- `substitute_var_impl`'s `Expr::FuncDef` arm has no
+/// #2141 review found a genuine ambiguity next to the original bug:
+/// `parse_func_def_parts` discarded a parameter's leading `$` at parse
+/// time, so `def f(g)` and `def f($g)` produced the identical
+/// `params: ["g"]` -- `substitute_var_impl`'s `Expr::FuncDef` arm had no
 /// way to tell, from the AST alone, whether a nested def's own parameter
 /// of a matching name should shadow an *outer* `$`-bound value (true for
 /// `$`-style, since `$g` inside then means the nested def's *own*
 /// argument) or not (true for bare-style, since a bare `g` inside has no
 /// `$`-binding of its own and `$g` there still means the outer value).
+/// Fixed by #2283's `Param` enum, which retains exactly that distinction
+/// instead of discarding it.
 ///
-/// A first draft of this fix optimized for the bare case (always
+/// A first draft of #2141's own fix optimized for the bare case (always
 /// substitute) and broke the `$`-style one in the process -- confirmed
 /// live regression against jq 1.7.1:
 /// `3 as $item | def double($item): $item * 2; double(10)` must be `20`
 /// (uses `double`'s own argument), the draft gave `6` (wrongly captured
 /// the outer `3` into `double`'s body before `double` was ever called).
 /// See `test_dollar_style_func_param_shadows_outer_binding_of_same_name_2141`
-/// below for that (correct, unregressed) shape.
+/// below for that (correct, unregressed, still-relevant-post-#2283) shape.
 ///
-/// Reverting to the original shadow check keeps that `$`-style case
+/// #2141 reverted to the original shadow check, keeping that `$`-style case
 /// correct at the cost of leaving the *bare*-nested-parameter case wrong
-/// the other way, pinned here as a known gap rather than left untested:
-/// jq 1.7.1's `3 as $g | def f(g): $g; f(1)` is `3` (the outer `$g`,
-/// untouched by `f`'s own unrelated bare `g` parameter); this prints `1`
-/// instead (`f`'s own bare-parameter substitution wrongly fills in the
-/// `$g` that the outer substitution's shadow check left untouched).
+/// the other way -- pinned as a known gap at the time
+/// (`test_bare_nested_param_wrongly_shadows_outer_dollar_binding_known_gap_2141`),
+/// now fixed and renamed by #2283 below (see that test's own doc comment).
 #[test]
 fn test_dollar_style_func_param_shadows_outer_binding_of_same_name_2141() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
@@ -21462,14 +21462,18 @@ fn test_dollar_style_func_param_shadows_outer_binding_of_same_name_2141() -> Res
     Ok(())
 }
 
+/// #2283 fixed the gap this test used to pin: `Expr::FuncDef` now stores
+/// `Vec<Param>` (`Param::Bare`/`Param::Dollar`) instead of a bare
+/// `Vec<String>`, so `substitute_var_impl`'s shadow check can tell a bare
+/// nested parameter (which has no `$`-binding of its own, so an outer `$g`
+/// reaches through it) apart from a `$`-style one (which does, and blocks
+/// it) -- previously both looked identical. Confirmed live against jq
+/// 1.7.1: `3`.
 #[test]
-fn test_bare_nested_param_wrongly_shadows_outer_dollar_binding_known_gap_2141() -> Result<()> {
+fn test_bare_nested_param_no_longer_shadows_outer_dollar_binding_2283() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-nc", "3 as $g | def f(g): $g; f(1)"], None)?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
-    // jq 1.7.1 answers "3" (the outer $g); this is the known, documented
-    // gap -- see this test's own doc comment above and
-    // substitute_var_impl's `Expr::FuncDef` arm.
-    assert_eq!(stdout.trim_end(), "1");
+    assert_eq!(stdout.trim_end(), "3");
     Ok(())
 }
 
@@ -21486,6 +21490,68 @@ fn test_dollar_style_func_param_still_resolves_2141() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-nc", "def f($x): $x; f(5)"], None)?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
     assert_eq!(stdout.trim_end(), "5");
+    Ok(())
+}
+
+/// #2283: a mixed bare/`$`-style parameter list (`parse_func_params`'s own
+/// per-parameter loop) records each parameter's own spelling independently
+/// -- not just a single flag for the whole def. Confirmed live against jq
+/// 1.7.1.
+#[test]
+fn test_mixed_bare_and_dollar_params_in_one_def_2283() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-nc", "def f(a; $b; c): [a, $b, c]; f(1; 2; 3)"], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "[1,2,3]");
+    Ok(())
+}
+
+/// #2283 review: `substitute_func_param_impl`'s own `Expr::FuncDef` arm has
+/// a *different*, deeper, NOT-fixed-here gap next to the one this issue
+/// closed in `substitute_var_impl` -- pinned as a known gap per this
+/// project's convention rather than left silently wrong. `Param` confirms
+/// a nested def's own matching parameter (bare *or* `$`-style) correctly
+/// shadows an outer *bare* `param` substitution (`$`-style desugars to
+/// bind the bare namespace too, confirmed live: `def h($param): param`
+/// alone is a compile error, "param is not defined", so `$`-style alone
+/// never leaves bare `param` unbound) -- but the same blanket check also
+/// blocks an outer `$param`(dollar) substitution from reaching a nested
+/// *bare*-only parameter's body, which it should not (a bare parameter
+/// creates no `$`-binding of its own). Needs a second, independent
+/// `subst_bare`-style flag threaded through `substitute_func_param_impl`
+/// the way `subst_dollar` already is -- a materially larger change than
+/// #2283's own `Param` type, tracked separately as #2555. jq 1.7.1 answers
+/// `99` (`h`'s own bare parameter doesn't touch `$param`, so it resolves
+/// to `f`'s own); this answers `1` (`h`'s own argument, wrongly captured).
+#[test]
+fn test_bare_nested_param_wrongly_shadows_outer_dollar_func_param_known_gap_2283() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-nc", "def f($param): def h(param): $param; h(1); f(99)"],
+        None,
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "1");
+    Ok(())
+}
+
+/// #2283 review: `bind_def_call`'s own argument-binding for a duplicate
+/// parameter name is *separately* broken, confirmed present on
+/// unmodified `main` (i.e. entirely unrelated to #2283's own shadow-check
+/// fix -- not a regression, and not fixed here) -- pinned as a known gap,
+/// tracked separately as #2560. jq 1.7.1 resolves `$a` to the *second* occurrence's own argument (`2`,
+/// ordinary later-wins parameter shadowing); this resolves to the first
+/// occurrence's argument (`1`) instead. See
+/// `test_duplicate_named_param_shadow_resolves_by_last_occurrence_2283`
+/// (`src/jq/eval.rs`) for direct, isolated confirmation that #2283's own
+/// shadow-check logic (which outer-`$var` substitution reaches a nested
+/// def's body) already resolves duplicate names correctly by the *last*
+/// occurrence -- this remaining gap is specifically in argument binding at
+/// call time, a different mechanism.
+#[test]
+fn test_duplicate_named_param_argument_binding_known_gap_2283() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "9 as $a | def f(a; $a): $a; f(1;2)"], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "1");
     Ok(())
 }
 

@@ -364,7 +364,7 @@ use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
 
 use super::expr::{
     ArithOp, AssignOp, BoundBody, Builtin, CompareOp, Expr, FormatType, FuncDefBound, FuncDefData,
-    Literal, MergeFlags, NumberKey, ObjectEntry, ObjectKey, Pattern, StringPart,
+    Literal, MergeFlags, NumberKey, ObjectEntry, ObjectKey, Param, Pattern, StringPart,
 };
 use super::value::{
     assert_value_tree_depth, cmp_f64, infinite_float_preview_text, is_infinity_sentinel,
@@ -2457,7 +2457,15 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             body,
             then,
             bound,
-        } => eval_func_def::<W, S>(name, params, body, then, bound, value, optional),
+        } => eval_func_def::<W, S>(
+            name,
+            &param_names(params),
+            body,
+            then,
+            bound,
+            value,
+            optional,
+        ),
         Expr::FuncCall {
             name,
             args,
@@ -4956,7 +4964,7 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             then,
             bound,
         } => {
-            let bound_then = bind_def(name, params, body, then, bound);
+            let bound_then = bind_def(name, &param_names(params), body, then, bound);
             eval_each::<W, S>(&bound_then, value, optional, sink)
         }
 
@@ -31048,30 +31056,39 @@ fn substitute_var_impl(
             then,
             ..
         } => {
-            // #2141 review: deliberately NOT changed to always substitute
-            // `body` (an earlier draft of this fix did, reasoning that
-            // `params` are bare and `var_name` is `$`-bound, so a bare
-            // nested parameter can never shadow an outer `$`-bound name).
-            // That reasoning is correct for a *bare* nested parameter
-            // (`def f(g): $g` -- `$g` inside should resolve to the outer
-            // binding) but wrong for a `$`-style one (`def f($g): $g` --
-            // `$g` inside is `f`'s *own* parameter, and must NOT be
-            // pre-filled with the outer value before `f` is ever called,
-            // or `f`'s own later argument substitution has nothing left to
-            // replace): `parse_func_def_parts` discards a parameter's
-            // leading `$` at parse time, so `params: Vec<String>` cannot
-            // tell the two cases apart, and this function has no way to
-            // pick the right answer for both from the AST alone. Confirmed
-            // live against jq 1.7.1 that the "always substitute" draft
-            // broke the `$`-style case: `3 as $g | def f($g): $g; f(1)`
-            // must be `1` (matches this un-reverted code); the draft gave
-            // `3` instead (the outer value, captured before `f` even ran).
-            // Keeping the pre-existing shadow check means the *bare*-nested-
-            // parameter case remains wrong the other way (`3 as $g | def
-            // f(g): $g; f(1)` is `3` on jq, `1` here) -- a real, known gap,
-            // tracked separately (#2141 follow-up) rather than "fixed" into
-            // a worse regression on the more common `$`-style shape.
-            let shadowed = params.contains(&var_name.to_string());
+            // #2283: shadowed only when the *last* (jq's own later-wins
+            // shadowing rule for duplicate parameter names) matching
+            // parameter is itself `$`-style. A bare nested parameter
+            // (`def f(g): $g`) has no `$`-binding of its own, so an outer
+            // `$g` substitution must still reach into `f`'s body; a
+            // `$`-style one (`def f($g): $g`) must not be pre-filled with
+            // the outer value before `f` is ever called, or `f`'s own
+            // later argument substitution has nothing left to replace.
+            // `parse_func_def_parts`/`parse_def_expr` used to discard a
+            // parameter's leading `$` at parse time, making `params:
+            // Vec<String>` alone unable to tell the two cases apart
+            // (#2141 review reverted an "always substitute" draft here
+            // after confirming live that it broke the `$`-style case: `3
+            // as $g | def f($g): $g; f(1)` must be `1`, not `3`, the outer
+            // value baked in too early) -- `Param`'s own `Bare`/`Dollar`
+            // variants now carry exactly that distinction, so both cases
+            // resolve correctly instead of picking one to get right at the
+            // other's expense. `.rev().find()`, not the first match: a
+            // duplicate-named parameter list (`def f(a; $a): ...`) must
+            // resolve by its *last* occurrence, matching ordinary
+            // shadowing precedence -- an earlier version of this exact fix
+            // used the first match instead and let an outer `$a` leak
+            // through `def f(a; $a): $a` (confirmed live against jq 1.7.1:
+            // `9 as $a | def f(a; $a): $a; f(1;2)` is `2`, not `9`).
+            // Confirmed live against jq 1.7.1: `3 as $g | def f(g): $g;
+            // f(1)` is `3` (bare -- outer reaches in), `3 as $g | def
+            // f($g): $g; f(1)` is `1` (dollar-style -- shadowed), matching
+            // this fix.
+            let shadowed = params
+                .iter()
+                .rev()
+                .find(|p| p.name() == var_name)
+                .is_some_and(Param::is_dollar);
             Expr::FuncDef {
                 name: name.clone(),
                 params: params.clone(),
@@ -38319,7 +38336,7 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // Each output continues `rest` from its own path, not this
             // arm's ambient one -- see `path_probe_stage` (#1409).
             let paired = !rest.is_empty() && rest.iter().any(needs_path_context);
-            let bound_then = bind_def(name, params, body, then, bound);
+            let bound_then = bind_def(name, &param_names(params), body, then, bound);
             // #2094 review kept `bound_then` clone-free in the unpaired
             // (common) case so this arm keeps the full benefit of
             // `bind_def`'s own cache; #1510 extends that to the paired case,
@@ -49251,6 +49268,19 @@ mod ambient_frame_depth {
     }
 }
 
+/// The bare identifier of each of `params`, regardless of bare-vs-`$`
+/// spelling -- #2283: `bind_def`/`FuncDefData`'s own `params: Vec<String>`
+/// only ever needs the bare call-binding name (both spellings bind that
+/// identically; only `substitute_var_impl`/`substitute_func_param_impl`'s
+/// shadow checks need `Param`'s own `Bare`/`Dollar` distinction, and they
+/// run on the still-`Expr::FuncDef`-shaped tree before this conversion
+/// ever happens), so every one of `Expr::FuncDef`'s four evaluation arms
+/// converts once here rather than `bind_def` itself taking `&[Param]` and
+/// converting on every one of its own many (test-included) call sites.
+pub(crate) fn param_names(params: &[Param]) -> Vec<String> {
+    params.iter().map(|p| p.name().to_string()).collect()
+}
+
 /// Install `def name(params): body` over `then`, the shared first half of
 /// every `Expr::FuncDef` evaluation arm (#1371).
 ///
@@ -50080,22 +50110,39 @@ fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, subst_dollar
             // innermost-first def lookup resolves it to the nested `def g`,
             // not to `param`'s substituted argument.
             let then_shadowed = name == param && params.is_empty();
-            // A nested def's own parameter list shadows `param` within its
-            // own body -- correct when the nested parameter is bare
-            // (`def h(param): ...`, the same namespace as `param` itself),
-            // but pre-existing and unfixed here (#2141 review): a *bare*
-            // `param` can never carry an outer `$param` reference's own
-            // value into a nested def whose OWN parameter is `$`-style
-            // (`def h($param): $param` inside `f(param)`'s own body still
-            // needs `f`'s outer `$param`, since `h`'s `$param` is `h`'s
-            // own, unrelated binding) -- `params` can't tell the two
-            // spellings apart (`parse_func_def_parts` discards `$` at
-            // parse time), so this blanket check over-shadows the `$`-style
-            // case identically to `substitute_var_impl`'s own `FuncDef` arm
-            // (see that arm's doc comment for the live-verified repro and
-            // why neither direction can be made fully correct without a
-            // parser change).
-            let body_shadowed = params.contains(&param.to_string());
+            // #2283 review: this blanket "any matching param name shadows,
+            // bare or `$`-style alike" is correct as-is for the *bare*
+            // `param`-reference substitution this arm mostly exists for --
+            // confirmed live against jq 1.7.1 that a `$`-style nested
+            // parameter shadows the *bare* namespace too, not just its own
+            // `$name`: `def h($param): param` is itself a compile error in
+            // jq ("param is not defined") when called with no enclosing
+            // bare `param` of its own, and `def f(param): def h($param):
+            // param; h(1); f(5)` answers `1` (`h`'s own bound argument),
+            // never `5` -- so a `$`-style parameter desugars to something
+            // that binds *both* the bare and `$` namespaces (matching `def
+            // f(param): param as $param | ...`), and this check's pre-#2283
+            // comment's claim that a `$`-style nested parameter does *not*
+            // shadow a bare substitution was wrong -- this line needed no
+            // change once `Param` was available to check.
+            //
+            // What *is* still wrong here, confirmed live and NOT fixed by
+            // this issue (tracked as a follow-up instead): this same
+            // blanket check also gates *`$param`-Var* substitution (via
+            // `subst_dollar` staying ambient into `body` below) whenever
+            // any matching param name exists, even a *bare* one -- but a
+            // bare nested parameter creates no `$name` binding at all, so
+            // an outer `$param` substitution should still reach through
+            // it. `def f($param): def h(param): $param; h(1); f(99)`
+            // answers `99` in jq (`h`'s own bare parameter doesn't touch
+            // `$param`, so it resolves to `f`'s own) but `1` here. Fixing
+            // this needs a second, independent `subst_bare`-style flag
+            // threaded through this whole function (this one gate
+            // conflates "block bare substitution" with "block
+            // `$`-substitution", and they need different shadowing rules)
+            // -- a materially larger change than this arm's own `Param`
+            // fix, out of scope here.
+            let body_shadowed = params.iter().any(|p| p.name() == param);
             Expr::FuncDef {
                 name: name.clone(),
                 params: params.clone(),
@@ -50396,6 +50443,68 @@ mod tests {
     /// `#[cfg(feature = "std")]`: `ambient_frame_depth` itself is a no-op
     /// under `no_std` (see its own module doc comment) -- there is no
     /// no_std variant of this mechanism to test.
+    /// #2283 review: `substitute_var_impl`'s shadow check must resolve a
+    /// duplicate-named parameter list by its *last* occurrence (jq's own
+    /// later-wins shadowing precedence), not its first -- an earlier
+    /// version of this exact fix used `.position()` (first match) and let
+    /// an outer `$a` leak straight into `def f(a; $a): $a`'s body despite
+    /// the *later* `$a` parameter being `$`-style. Verified directly on
+    /// the substitution itself (bypassing `bind_def_call`'s own separate,
+    /// pre-existing, unrelated bug in duplicate-name *argument* binding --
+    /// confirmed live against jq 1.7.1 that `9 as $a | def f(a; $a): $a;
+    /// f(1;2)` end-to-end is `2` on jq but `1` even on unmodified `main`,
+    /// for a reason unconnected to shadowing -- so this test checks the
+    /// shadow decision in isolation): `f`'s own `$a` reference inside
+    /// `body` must remain an unsubstituted `Expr::Var`, not get replaced
+    /// with the outer `9`, whichever position the `$`-style parameter
+    /// sits at.
+    #[test]
+    fn test_duplicate_named_param_shadow_resolves_by_last_occurrence_2283() {
+        let make_funcdef = |params: Vec<Param>| Expr::FuncDef {
+            name: "f".to_string(),
+            params,
+            body: Box::new(Expr::Var("a".to_string())),
+            then: Box::new(Expr::Identity),
+            bound: FuncDefBound::default(),
+        };
+
+        // `$`-style parameter last: `def f(a; $a): $a`.
+        let dollar_last = make_funcdef(vec![
+            Param::Bare("a".to_string()),
+            Param::Dollar("a".to_string()),
+        ]);
+        let substituted = substitute_var(&dollar_last, "a", &OwnedValue::Int(9));
+        let Expr::FuncDef { body, .. } = &substituted else {
+            panic!("expected FuncDef");
+        };
+        assert_eq!(
+            **body,
+            Expr::Var("a".to_string()),
+            "the later, $-style parameter must shadow the outer $a -- body should stay \
+             unsubstituted, not become Literal(9)"
+        );
+
+        // `$`-style parameter first, bare last: `def f($a; a): $a` -- the
+        // *bare* trailing parameter no longer has a `$`-binding of its own
+        // at that position, so this one is NOT shadowed (matches
+        // `test_bare_nested_param_no_longer_shadows_outer_dollar_binding_2283`'s
+        // own single-parameter case).
+        let dollar_first = make_funcdef(vec![
+            Param::Dollar("a".to_string()),
+            Param::Bare("a".to_string()),
+        ]);
+        let substituted = substitute_var(&dollar_first, "a", &OwnedValue::Int(9));
+        let Expr::FuncDef { body, .. } = &substituted else {
+            panic!("expected FuncDef");
+        };
+        assert_eq!(
+            **body,
+            Expr::Literal(Literal::Int(9)),
+            "the later, bare parameter has no $-binding of its own -- the outer $a must \
+             reach through"
+        );
+    }
+
     #[test]
     fn test_bind_def_memoizes_per_node_2094() {
         let Expr::FuncDef {
@@ -50409,9 +50518,9 @@ mod tests {
             panic!("expected a top-level FuncDef");
         };
 
-        let first = bind_def(&name, &params, &body, &then, &bound);
+        let first = bind_def(&name, &param_names(&params), &body, &then, &bound);
         let first_ptr = Rc::as_ptr(&first);
-        let second = bind_def(&name, &params, &body, &then, &bound);
+        let second = bind_def(&name, &param_names(&params), &body, &then, &bound);
         assert!(
             Rc::ptr_eq(&first, &second),
             "a second call at the same depth sharing the same FuncDefBound must reuse the \
@@ -50422,7 +50531,7 @@ mod tests {
         // An independent node's own cache cell is untouched by the one
         // above -- confirms the cache is keyed per-node, not global.
         let fresh_cache = FuncDefBound::default();
-        let third = bind_def(&name, &params, &body, &then, &fresh_cache);
+        let third = bind_def(&name, &param_names(&params), &body, &then, &fresh_cache);
         assert!(
             !Rc::ptr_eq(&first, &third),
             "a different FuncDefBound must compute its own Rc, not see another node's cache"
@@ -50454,7 +50563,7 @@ mod tests {
 
         // No ambient depth entered yet: a fresh top-level `def` still seeds
         // from `0`, matching every evaluator's actual call site.
-        match &*bind_def(&name, &params, &body, &then, &cache) {
+        match &*bind_def(&name, &param_names(&params), &body, &then, &cache) {
             Expr::DefCall { frames, .. } => assert_eq!(*frames, 0),
             other => panic!("expected DefCall, got {other:?}"),
         }
@@ -50466,7 +50575,7 @@ mod tests {
         // FuncDef node.
         {
             let _guard = enter_def_call_frame(MAX_EVAL_FRAMES - 1);
-            match &*bind_def(&name, &params, &body, &then, &cache) {
+            match &*bind_def(&name, &param_names(&params), &body, &then, &cache) {
                 Expr::DefCall { frames, .. } => assert_eq!(*frames, MAX_EVAL_FRAMES - 1),
                 other => panic!("expected DefCall, got {other:?}"),
             }
@@ -50476,7 +50585,7 @@ mod tests {
         // `def` reached *after* the nested call returns -- a sibling, not
         // something nested inside it -- does not inherit a depth that no
         // longer applies to it.
-        match &*bind_def(&name, &params, &body, &then, &cache) {
+        match &*bind_def(&name, &param_names(&params), &body, &then, &cache) {
             Expr::DefCall { frames, .. } => assert_eq!(*frames, 0),
             other => panic!("expected DefCall, got {other:?}"),
         }
@@ -50511,7 +50620,7 @@ mod tests {
 
         let cache = FuncDefBound::default();
 
-        let first = bind_def(&name, &params, &body, &then, &cache);
+        let first = bind_def(&name, &param_names(&params), &body, &then, &cache);
         let first_frames = match &*first {
             Expr::DefCall { frames, .. } => *frames,
             other => panic!("expected DefCall, got {other:?}"),
@@ -50522,7 +50631,7 @@ mod tests {
         // node being reached again through an `Expr::Shared` wrapper
         // threaded into a deeper recursive `DefCall`'s substituted body.
         let _guard = enter_def_call_frame(500);
-        let second = bind_def(&name, &params, &body, &then, &cache);
+        let second = bind_def(&name, &param_names(&params), &body, &then, &cache);
         let second_frames = match &*second {
             Expr::DefCall { frames, .. } => *frames,
             other => panic!("expected DefCall, got {other:?}"),
@@ -50565,7 +50674,7 @@ mod tests {
 
         let _guard = enter_def_call_frame(MAX_EVAL_FRAMES);
         let cache = FuncDefBound::default();
-        let bound_then = bind_def(&name, &params, &body, &then, &cache);
+        let bound_then = bind_def(&name, &param_names(&params), &body, &then, &cache);
         let Expr::DefCall {
             def,
             args,
