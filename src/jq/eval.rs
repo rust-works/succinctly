@@ -20894,7 +20894,7 @@ fn yq_prepare_assign_targets<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Same `optional` policy, in the same order, as `eval_assign`'s own
     // jq-mode arm: a non-decode-failure `to_owned` error and a path
     // resolution error are both swallowed by an outer `?`, a halt never is.
-    let (pristine, paths) = match resolved {
+    let (pristine, mut paths) = match resolved {
         Some(pair) => pair,
         None => {
             let pristine = match to_owned(input) {
@@ -20915,11 +20915,19 @@ fn yq_prepare_assign_targets<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // skips the copy outright and reports `created: false` -- correct by
     // construction, since `rhs_document`'s only consumer is the right side
     // that literal has already been proved independent of.
+    // #2530: redirect through aliases *before* the targets are created, so a
+    // new key under `b: *x` is created on the anchor's node, not on the
+    // copy -- otherwise the copy no longer equals the anchor and the write's
+    // own redirect (rule 3's equality gate) rightly refuses. Idempotent for
+    // paths `yq_assign_noop_check` already redirected, and a no-op in jq
+    // mode, where no table is ever installed.
+    alias_identity::redirect_paths(&mut paths, &pristine, alias_identity::Redirect::THROUGH);
     let before = (!matches!(
         super::eval_generic::strip_parens(value_expr),
         Expr::Literal(_)
     ))
     .then(|| pristine.clone());
+    let pre_creation = alias_identity::active().then(|| pristine.clone());
     let mut doc = pristine;
     for path in &paths {
         if let Err(escape) =
@@ -20932,6 +20940,12 @@ fn yq_prepare_assign_targets<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
     }
     let created = before.is_some_and(|before| doc != before);
+    // #2530: the created slot is part of the shared node, so every alias copy
+    // gets it too -- keeping the copies equal to the anchor for the write
+    // that follows and for later pipe stages.
+    if let Some(pre) = &pre_creation {
+        alias_identity::mirror_after_write(pre, &mut doc);
+    }
     Ok(Some(YqAssignTargets {
         doc,
         paths,
