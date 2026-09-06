@@ -9946,7 +9946,21 @@ fn map_bracketed_over_object_fields<'a, W: Clone + AsRef<[u64]>, S: EvalSemantic
             QueryResult::Error(e) => return Err(QueryResult::Error(e)),
             QueryResult::Break(label) => return Err(QueryResult::Break(label)),
             QueryResult::Halt(code) => return Err(QueryResult::Halt(code)),
-            _ => unreachable!("eval_array_construction only returns Owned/Error/Break/Halt"),
+            // #2182: was a wildcard `_ =>` -- verified by reading
+            // `eval_array_construction`'s own body exhaustively: every path
+            // through it returns `Owned`, or early-returns `Error`/`Break`/
+            // `Halt`, so this is a provably closed set today. Spelled out
+            // per-variant so a future `QueryResult` variant it starts
+            // returning is a compile error at every one of its call sites,
+            // not a silent absorption into a catch-all.
+            QueryResult::One(_)
+            | QueryResult::OneCursor(_)
+            | QueryResult::Many(_)
+            | QueryResult::None
+            | QueryResult::ManyOwned(_)
+            | QueryResult::Partial(..) => {
+                unreachable!("eval_array_construction only returns Owned/Error/Break/Halt")
+            }
         }
     }
     Ok(computed)
@@ -10019,7 +10033,20 @@ fn builtin_min_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     QueryResult::Error(e) => return QueryResult::Error(e),
                     QueryResult::Break(label) => return QueryResult::Break(label),
                     QueryResult::Halt(code) => return QueryResult::Halt(code),
-                    _ => {
+                    // #2182: was a wildcard `_ =>` -- verified by reading
+                    // `eval_array_construction`'s own body exhaustively:
+                    // every path through it returns `Owned`, or
+                    // early-returns `Error`/`Break`/`Halt`, so this is a
+                    // provably closed set today. Spelled out per-variant so
+                    // a future `QueryResult` variant it starts returning is
+                    // a compile error at every one of its call sites, not a
+                    // silent absorption into a catch-all.
+                    QueryResult::One(_)
+                    | QueryResult::OneCursor(_)
+                    | QueryResult::Many(_)
+                    | QueryResult::None
+                    | QueryResult::ManyOwned(_)
+                    | QueryResult::Partial(..) => {
                         unreachable!("eval_array_construction only returns Owned/Error/Break/Halt")
                     }
                 }
@@ -10083,7 +10110,20 @@ fn builtin_max_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     QueryResult::Error(e) => return QueryResult::Error(e),
                     QueryResult::Break(label) => return QueryResult::Break(label),
                     QueryResult::Halt(code) => return QueryResult::Halt(code),
-                    _ => {
+                    // #2182: was a wildcard `_ =>` -- verified by reading
+                    // `eval_array_construction`'s own body exhaustively:
+                    // every path through it returns `Owned`, or
+                    // early-returns `Error`/`Break`/`Halt`, so this is a
+                    // provably closed set today. Spelled out per-variant so
+                    // a future `QueryResult` variant it starts returning is
+                    // a compile error at every one of its call sites, not a
+                    // silent absorption into a catch-all.
+                    QueryResult::One(_)
+                    | QueryResult::OneCursor(_)
+                    | QueryResult::Many(_)
+                    | QueryResult::None
+                    | QueryResult::ManyOwned(_)
+                    | QueryResult::Partial(..) => {
                         unreachable!("eval_array_construction only returns Owned/Error/Break/Halt")
                     }
                 }
@@ -11261,7 +11301,20 @@ fn builtin_group_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     QueryResult::Error(e) => return QueryResult::Error(e),
                     QueryResult::Break(label) => return QueryResult::Break(label),
                     QueryResult::Halt(code) => return QueryResult::Halt(code),
-                    _ => {
+                    // #2182: was a wildcard `_ =>` -- verified by reading
+                    // `eval_array_construction`'s own body exhaustively:
+                    // every path through it returns `Owned`, or
+                    // early-returns `Error`/`Break`/`Halt`, so this is a
+                    // provably closed set today. Spelled out per-variant so
+                    // a future `QueryResult` variant it starts returning is
+                    // a compile error at every one of its call sites, not a
+                    // silent absorption into a catch-all.
+                    QueryResult::One(_)
+                    | QueryResult::OneCursor(_)
+                    | QueryResult::Many(_)
+                    | QueryResult::None
+                    | QueryResult::ManyOwned(_)
+                    | QueryResult::Partial(..) => {
                         unreachable!("eval_array_construction only returns Owned/Error/Break/Halt")
                     }
                 };
@@ -11431,7 +11484,20 @@ fn builtin_unique_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     QueryResult::Error(e) => return QueryResult::Error(e),
                     QueryResult::Break(label) => return QueryResult::Break(label),
                     QueryResult::Halt(code) => return QueryResult::Halt(code),
-                    _ => {
+                    // #2182: was a wildcard `_ =>` -- verified by reading
+                    // `eval_array_construction`'s own body exhaustively:
+                    // every path through it returns `Owned`, or
+                    // early-returns `Error`/`Break`/`Halt`, so this is a
+                    // provably closed set today. Spelled out per-variant so
+                    // a future `QueryResult` variant it starts returning is
+                    // a compile error at every one of its call sites, not a
+                    // silent absorption into a catch-all.
+                    QueryResult::One(_)
+                    | QueryResult::OneCursor(_)
+                    | QueryResult::Many(_)
+                    | QueryResult::None
+                    | QueryResult::ManyOwned(_)
+                    | QueryResult::Partial(..) => {
                         unreachable!("eval_array_construction only returns Owned/Error/Break/Halt")
                     }
                 };
@@ -11532,7 +11598,20 @@ fn builtin_sort_by<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     QueryResult::Error(e) => return QueryResult::Error(e),
                     QueryResult::Break(label) => return QueryResult::Break(label),
                     QueryResult::Halt(code) => return QueryResult::Halt(code),
-                    _ => {
+                    // #2182: was a wildcard `_ =>` -- verified by reading
+                    // `eval_array_construction`'s own body exhaustively:
+                    // every path through it returns `Owned`, or
+                    // early-returns `Error`/`Break`/`Halt`, so this is a
+                    // provably closed set today. Spelled out per-variant so
+                    // a future `QueryResult` variant it starts returning is
+                    // a compile error at every one of its call sites, not a
+                    // silent absorption into a catch-all.
+                    QueryResult::One(_)
+                    | QueryResult::OneCursor(_)
+                    | QueryResult::Many(_)
+                    | QueryResult::None
+                    | QueryResult::ManyOwned(_)
+                    | QueryResult::Partial(..) => {
                         unreachable!("eval_array_construction only returns Owned/Error/Break/Halt")
                     }
                 };
@@ -17653,7 +17732,20 @@ fn eval_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 QueryResult::Break(label) => QueryResult::Break(label),
                 QueryResult::Halt(code) => QueryResult::Halt(code),
                 QueryResult::Partial(vs, control) => QueryResult::Partial(vs, control),
-                _ => unreachable!("eval_owned_pipe only returns Owned-family variants"),
+                // #2182: was a wildcard `_ =>` -- verified by tracing
+                // `eval_owned_pipe`'s full call chain (`eval_owned_input` ->
+                // `eval_owned_fast_path`/`eval_owned_input_reindexed` ->
+                // `detach_from_temp_document`, the last already an
+                // exhaustive per-variant match): every path resolves to
+                // `Owned`/`None`/`Error`/`ManyOwned`/`Break`/`Halt`/
+                // `Partial`, never `One`/`OneCursor`/`Many`, so this is a
+                // provably closed set today. Spelled out per-variant so a
+                // future `QueryResult` variant this chain starts returning
+                // is a compile error here, not a silent absorption into a
+                // catch-all.
+                QueryResult::One(_) | QueryResult::OneCursor(_) | QueryResult::Many(_) => {
+                    unreachable!("eval_owned_pipe only returns Owned-family variants")
+                }
             }
         }
         QueryResult::ManyOwned(vs) => pipe_owned_prefix::<S, W>(rest, vs, None, optional),
@@ -18722,7 +18814,23 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         // still survive as `Partial`, matching real jq's
                         // output instead of vanishing.
                         QueryResult::Error(e) => escape_with_prefix!(Control::Error(e)),
-                        _ => unreachable!("index_one yields only One/None/Error"),
+                        // #2182: was a wildcard `_ =>` -- verified by tracing
+                        // both of `index_one`'s callees (`index_object_by_name`,
+                        // `index_array_by_position`) exhaustively: every arm in
+                        // both resolves to `One`/`None`/`Error`, so this is a
+                        // provably closed set today. Spelled out per-variant so
+                        // a future `QueryResult` variant this callee starts
+                        // returning is a compile error here, not a silent
+                        // absorption into a catch-all.
+                        QueryResult::OneCursor(_)
+                        | QueryResult::Many(_)
+                        | QueryResult::Owned(_)
+                        | QueryResult::ManyOwned(_)
+                        | QueryResult::Break(_)
+                        | QueryResult::Halt(_)
+                        | QueryResult::Partial(..) => {
+                            unreachable!("index_one yields only One/None/Error")
+                        }
                     }
                 }
             }
@@ -19145,7 +19253,23 @@ fn eval_slice_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                             // target-evaluation fix above making the same
                             // claim.
                             QueryResult::Error(e) => escape!(Control::Error(e)),
-                            _ => unreachable!("Expr::Slice yields only One/Owned/None/Error"),
+                            // #2182: was a wildcard `_ =>` -- verified by
+                            // tracing `eval_single`'s own `Expr::Slice` arm
+                            // exhaustively (every branch, including its
+                            // `suppress_or_raise` calls, resolves to
+                            // `One`/`Owned`/`None`/`Error`), so this is a
+                            // provably closed set today. Spelled out
+                            // per-variant so a future `QueryResult` variant
+                            // that arm starts returning is a compile error
+                            // here, not a silent absorption into a catch-all.
+                            QueryResult::OneCursor(_)
+                            | QueryResult::Many(_)
+                            | QueryResult::ManyOwned(_)
+                            | QueryResult::Break(_)
+                            | QueryResult::Halt(_)
+                            | QueryResult::Partial(..) => {
+                                unreachable!("Expr::Slice yields only One/Owned/None/Error")
+                            }
                         }
                     }
                 }
@@ -36212,7 +36336,22 @@ fn eval_getpath_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>
             QueryResult::Error(e) => {
                 return partial(core::mem::take(&mut results), Control::Error(e));
             }
-            _ => unreachable!("getpath_walk_owned only ever produces Owned/None/Error"),
+            // #2182: was a wildcard `_ =>` -- verified by reading
+            // `getpath_walk_owned`'s own body exhaustively (every return
+            // path, including its `e.into()` calls, resolves to
+            // `Owned`/`None`/`Error`), so this is a provably closed set
+            // today. Spelled out per-variant so a future `QueryResult`
+            // variant it starts returning is a compile error here, not a
+            // silent absorption into a catch-all.
+            QueryResult::One(_)
+            | QueryResult::OneCursor(_)
+            | QueryResult::Many(_)
+            | QueryResult::ManyOwned(_)
+            | QueryResult::Break(_)
+            | QueryResult::Halt(_)
+            | QueryResult::Partial(..) => {
+                unreachable!("getpath_walk_owned only ever produces Owned/None/Error")
+            }
         }
     }
 
