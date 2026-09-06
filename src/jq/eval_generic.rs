@@ -1913,6 +1913,27 @@ fn owned_from_standard_json<W: Clone + AsRef<[u64]>>(
     owned_from_standard_json_at_depth(value, 0)
 }
 
+/// #2400: unlike `to_owned_cursor_at_depth`'s `#1677`/`#2211`/`#2243`
+/// delimiter/gap checks (`element_gap_ok`/`container_tail_gap_ok`/
+/// `checked_key`), this function has none -- structurally *by design*, not
+/// an overlooked gap the way `push_generic_truthiness_cursor_error`'s was
+/// before #2349. Investigated with a wide repro net (`input`/`inputs`,
+/// `path()`/`getpath`/`key` reaching this function via `query_result_to_generic`,
+/// `as $x`/`reduce`/`foreach` bindings) and found genuinely unreachable: every
+/// live call site feeds this function bytes that are either (a) validated
+/// upfront by the input-reading pipeline before `input`/`inputs` ever sees
+/// them, or (b) a fresh `to_json_for_reindex` re-serialization of an
+/// already-decoded `OwnedValue` (this function's own doc comment above
+/// already notes callers round-trip through it), which succinctly's own
+/// serializer never emits with a malformed delimiter. `push_generic_truthiness_cursor_error`'s
+/// gap was real because it walks the *original* document cursor directly,
+/// with no such round-trip in between -- the structural difference that
+/// makes this function's missing checks safe where that one's weren't.
+/// (The wider probes did surface genuine jq divergences -- e.g. `.t as $x |
+/// $x`/`reduce`/`foreach` accepting a document corrupted in an untouched
+/// `.c` -- but those are instances of semi-indexing's own documented
+/// lazy-validation trade-off, unrelated to this function specifically, not
+/// evidence of a gap here.)
 fn owned_from_standard_json_at_depth<W: Clone + AsRef<[u64]>>(
     value: &crate::json::light::StandardJson<'_, W>,
     depth: usize,
