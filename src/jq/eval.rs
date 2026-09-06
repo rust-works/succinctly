@@ -17711,6 +17711,14 @@ fn index_object_by_name<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // jq returns null for field access on null
         StandardJson::Null if absent_is_empty => QueryResult::None,
         StandardJson::Null => QueryResult::One(StandardJson::Null),
+        // #2482 (yq mode): a scalar (string/number/boolean) has no fields at
+        // all in real yq's model, but that reads as an *empty* result, not
+        // jq's structural error -- see `yq_field_index_on_scalar_is_empty`.
+        StandardJson::String(_) | StandardJson::Number(_) | StandardJson::Bool(_)
+            if yq_field_index_on_scalar_is_empty::<S>() =>
+        {
+            QueryResult::None
+        }
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_index_with_field(type_name(&value), name)),
     }
@@ -17759,6 +17767,14 @@ fn index_array_by_position<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         StandardJson::Null => QueryResult::One(StandardJson::Null),
         StandardJson::Object(_) if yq_numeric_index_on_object_is_null::<S>() => {
             QueryResult::One(StandardJson::Null)
+        }
+        // #2482 (yq mode): `.s[0]` on a scalar `s` -- same empty-not-error
+        // rule as the field-name sibling in `index_object_by_name`, see
+        // `yq_field_index_on_scalar_is_empty`.
+        StandardJson::String(_) | StandardJson::Number(_) | StandardJson::Bool(_)
+            if yq_field_index_on_scalar_is_empty::<S>() =>
+        {
+            QueryResult::None
         }
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_index_with_type(
@@ -17884,6 +17900,33 @@ pub(crate) fn yq_numeric_index_on_object_is_null<S: EvalSemantics>() -> bool {
     S::TAG == EvalTag::Yq
 }
 
+/// Whether indexing a *scalar* (string, number, or boolean -- **not** `null`,
+/// which already has its own unconditional-null rule) with any key -- a
+/// field name, a numeric index, or a computed key of either kind -- produces
+/// **no output** rather than jq's `Cannot index <type> with <key>`.
+///
+/// Real yq v4.53.3 (confirmed live, #2482) has no notion of "indexable" the
+/// way jq does: on `s: x`, `.s.zzz` and `.s[0]` both print nothing at all
+/// (exit 0), not even a `null` node -- but `.s.zzz + 1` is `1`, since the
+/// empty read still resolves to `null` once it reaches an arithmetic
+/// operand (`yq_empty_operand_output`'s own zero-output row). `.s | .zzz`
+/// and `.s.zzz | key`/`| path` are the same empty read through a pipe/path
+/// step. `-e` still reports "no matches found" (exit 1), same as any other
+/// empty read. jq raises unconditionally, which is what succinctly
+/// reproduced in both modes before this rule. The *write* side (`.s.zzz =
+/// 1`) is untouched by this predicate -- it already no-ops via
+/// `yq_assign_classify`'s total-noop classification, a separate mechanism.
+///
+/// `S: EvalSemantics`-generic so every scalar-target index site in both
+/// evaluators -- `index_object_by_name`/`index_array_by_position`/
+/// `index_one` here, and their `eval_generic` counterparts (`eval_single`'s
+/// `Expr::Field`/`Expr::Index` arms, `index_one_generic`, and
+/// `path_step_generic`'s `Expr::Field`/`Expr::Index` arms) -- consult one
+/// definition (CLAUDE.md's "duplicated predicates diverge silently", #106).
+pub(crate) fn yq_field_index_on_scalar_is_empty<S: EvalSemantics>() -> bool {
+    S::TAG == EvalTag::Yq
+}
+
 /// Apply one resolved key to one target value.
 ///
 /// The key kind is dispatched *before* the container is inspected, so the error
@@ -17914,6 +17957,16 @@ fn index_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // no element. jq yields null rather than erroring.
                 None => QueryResult::One(StandardJson::Null),
             }
+        }
+        // #2482 (yq mode): a computed key (`.s[$k]`) on a scalar target is
+        // the same empty-not-error rule as the literal-field/literal-index
+        // siblings above -- see `yq_field_index_on_scalar_is_empty`.
+        _ if matches!(
+            target,
+            StandardJson::String(_) | StandardJson::Number(_) | StandardJson::Bool(_)
+        ) && yq_field_index_on_scalar_is_empty::<S>() =>
+        {
+            QueryResult::None
         }
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_index(type_name(&target), key)),
@@ -31116,6 +31169,19 @@ fn eval_owned_navigation<S: EvalSemantics>(
             }),
             OwnedValue::Null if yq_absent_key_read_is_empty::<S>() => Ok(None),
             OwnedValue::Null => Ok(Some(OwnedValue::Null)),
+            // #2482 (yq mode): a scalar has no fields at all in real yq's
+            // model, and that's an empty result, not jq's structural error
+            // -- same rule, same predicate as `index_object_by_name`'s own
+            // scalar arm.
+            OwnedValue::String(_)
+            | OwnedValue::Int(_)
+            | OwnedValue::Float(_)
+            | OwnedValue::NumberLiteral(..)
+            | OwnedValue::Bool(_)
+                if yq_field_index_on_scalar_is_empty::<S>() =>
+            {
+                Ok(None)
+            }
             _ if optional => Ok(None),
             _ => Err(EvalError::cannot_index_with_field(
                 owned_type_name(input),
@@ -31155,6 +31221,17 @@ fn eval_owned_navigation<S: EvalSemantics>(
             // own `Object` arm. See `yq_numeric_index_on_object_is_null`.
             OwnedValue::Object(_) if yq_numeric_index_on_object_is_null::<S>() => {
                 Ok(Some(OwnedValue::Null))
+            }
+            // #2482 (yq mode): `.s[0]` on a scalar `s` -- same empty rule as
+            // the sibling `Expr::Field` arm above.
+            OwnedValue::String(_)
+            | OwnedValue::Int(_)
+            | OwnedValue::Float(_)
+            | OwnedValue::NumberLiteral(..)
+            | OwnedValue::Bool(_)
+                if yq_field_index_on_scalar_is_empty::<S>() =>
+            {
+                Ok(None)
             }
             _ if optional => Ok(None),
             _ => Err(EvalError::cannot_index_with_type(
@@ -36064,6 +36141,17 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     optional,
                 );
             }
+            // #2482 (yq mode): a scalar (string/number/boolean) has no
+            // fields at all in real yq's model -- an empty result, not jq's
+            // structural error. An array target still raises its own
+            // structural error (`.arr.zzz`), excluded here the same way the
+            // ordinary (non-path-context) `index_object_by_name` excludes
+            // it. `rest` never runs (there's no node to continue from), the
+            // same "no position produced" outcome the absent-key arm above
+            // returns.
+            if !matches!(value, OwnedValue::Array(_)) && yq_field_index_on_scalar_is_empty::<S>() {
+                return QueryResult::None;
+            }
             // Non-object/null: error (or None if optional). #2212/#2227:
             // currently unreachable with `optional == true` -- see this
             // function's own doc comment for the verification method.
@@ -36153,6 +36241,13 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     &new_path,
                     optional,
                 );
+            }
+            // #2482 (yq mode): every yq-mode `Object` case was already
+            // absorbed by the branch above -- only a genuine scalar reaches
+            // here. `.s[0] | key` is empty in real yq, same as `Expr::
+            // Field`'s own scalar arm.
+            if yq_field_index_on_scalar_is_empty::<S>() {
+                return QueryResult::None;
             }
             // #2212/#2227: currently unreachable with `optional == true` --
             // same verification as `Expr::Field`'s sibling arm above.

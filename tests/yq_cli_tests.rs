@@ -6283,9 +6283,17 @@ fn test_yaml_explicit_tag_resolves_through_alias_903() -> Result<()> {
 fn test_yaml_explicit_tag_error_messages_agree_with_type_903() -> Result<()> {
     let input = "a: !!str 1\n";
 
-    let (_, err, code) = run_yq_stdin_with_stderr(".a.foo", input, &[])?;
-    assert_eq!(code, 1);
-    assert!(err.contains("Cannot index string with"), "{err}");
+    // #2482 closed this particular row's error off entirely: a scalar
+    // (tagged or not) indexed by a field name is now an empty read in yq
+    // mode, never `Cannot index string with...` -- so `tagged_type_name`'s
+    // divergent (explicit-tag) branch is no longer reachable through
+    // `Expr::Field`/`Expr::Index`'s own error arm at all (real yq has no
+    // such error to match). The other four rows below are unaffected --
+    // none of them navigate through `Expr::Field`/`Expr::Index`, so they
+    // still exercise `tagged_type_name` on this exact tagged value.
+    let (out, code) = run_yq_stdin(".a.foo", input, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "");
 
     let (_, err, code) = run_yq_stdin_with_stderr(".a | last", input, &[])?;
     assert_eq!(code, 1);
@@ -28258,15 +28266,21 @@ fn test_map_preserves_presentation_inplace_757() -> Result<()> {
 /// byte-at-a-time writer could not avoid.
 #[test]
 fn test_map_error_writes_no_truncated_prefix_757() -> Result<()> {
-    // Element 1 converts fine; element 2 cannot be indexed.
+    // Element 1 converts fine; element 2 cannot be indexed. #2482: a
+    // *scalar* (number/string/boolean) target no longer errors here in yq
+    // mode (`.a.b` on `a: 5` is empty, not `Cannot index number...`), so
+    // this uses an *array* target instead -- real yq still raises its own
+    // structural error there (`.arr.zzz`, confirmed live), unaffected by
+    // that fix.
     let (stdout, stderr, code) =
-        run_yq_stdin_with_stderr("map(.a.b)", "- a: {b: 1}\n- a: 5\n", &[])?;
+        run_yq_stdin_with_stderr("map(.a.b)", "- a: {b: 1}\n- a: [1, 2]\n", &[])?;
     assert_eq!(stdout, "", "no partial array may reach stdout");
-    assert!(stderr.contains("Cannot index number"), "stderr: {stderr:?}");
+    assert!(stderr.contains("Cannot index array"), "stderr: {stderr:?}");
     assert_eq!(code, 1);
 
     // Same for a body that fails on the very first element.
-    let (stdout, _, code) = run_yq_stdin_with_stderr("map(.a.b)", "- a: 5\n- a: 6\n", &[])?;
+    let (stdout, _, code) =
+        run_yq_stdin_with_stderr("map(.a.b)", "- a: [1, 2]\n- a: [3, 4]\n", &[])?;
     assert_eq!(stdout, "");
     assert_eq!(code, 1);
     Ok(())
@@ -28331,19 +28345,22 @@ fn test_map_over_empty_container_757() -> Result<()> {
 /// rather than silently change output.
 #[test]
 fn test_map_multidoc_separator_matches_other_m2_expressions_757() -> Result<()> {
+    // #2482: an array target, not a scalar (`a: 5` no longer errors here in
+    // yq mode -- see `test_map_error_writes_no_truncated_prefix_757`'s own
+    // updated doc comment).
     let (map_out, _, code) =
-        run_yq_stdin_with_stderr("map(.a.b)", "- a: {b: 1}\n---\n- a: 5\n", &[])?;
+        run_yq_stdin_with_stderr("map(.a.b)", "- a: {b: 1}\n---\n- a: [1, 2]\n", &[])?;
     assert_eq!(map_out, "- 1\n---\n");
     assert_eq!(code, 1);
 
     // The pre-existing M2 expression, same shape, same trailing separator.
-    let (nav_out, _, code) = run_yq_stdin_with_stderr(".a.b", "a: {b: 1}\n---\na: 5\n", &[])?;
+    let (nav_out, _, code) = run_yq_stdin_with_stderr(".a.b", "a: {b: 1}\n---\na: [1, 2]\n", &[])?;
     assert_eq!(nav_out, "1\n---\n");
     assert_eq!(code, 1);
 
     // The DOM path suppresses it, for `map` and navigation alike.
     let (dom_out, _, code) =
-        run_yq_stdin_with_stderr("map(.a.b)", "- a: {b: 1}\n---\n- a: 5\n", &["-P"])?;
+        run_yq_stdin_with_stderr("map(.a.b)", "- a: {b: 1}\n---\n- a: [1, 2]\n", &["-P"])?;
     assert_eq!(dom_out, "- 1\n");
     assert_eq!(code, 1);
     Ok(())
@@ -30452,15 +30469,21 @@ fn test_runaway_recursion_errors_cleanly_in_yq_mode_1371() -> Result<()> {
 #[test]
 fn fold_source_value_reuse_is_jq_mode_only_1872() -> Result<()> {
     // The `scalar_noop` shape: still the evaluator's own type error, not
-    // the resolver's target-unchanged branch value.
+    // the resolver's target-unchanged branch value. #2482: an *array*
+    // target, not a scalar -- `.a.b` on a number/string/boolean `a` no
+    // longer errors in yq mode at all (it's an empty read there now), so
+    // this needs a shape the evaluator still genuinely raises on to keep
+    // testing what it always tested (real yq still raises its own
+    // structural error on a field-name index into an array, confirmed
+    // live).
     let (_out, stderr, code) = run_yq_stdin_with_stderr(
         "path(foreach (.a.b) as $k (.; .))",
-        "a: 1\n",
+        "a: [1, 2]\n",
         &["-o", "json"],
     )?;
     assert_ne!(code, 0);
     assert!(
-        stderr.contains(r#"Cannot index number with string "b""#),
+        stderr.contains(r#"Cannot index array with string "b""#),
         "stderr: {stderr}"
     );
 
@@ -32300,33 +32323,32 @@ fn test_yq_pipe_precedence_holds_at_every_depth_2420() -> Result<()> {
     Ok(())
 }
 
-/// #2420: a probe where succinctly's post-fix grouping is right but the
-/// *output* still differs from real yq, for reasons scoped elsewhere. Pinned
-/// so the residue is visible rather than mistaken for a precedence bug.
+/// #2420: a probe that used to carry two residual divergences where
+/// succinctly's post-fix *grouping* was right but the *output* still
+/// differed from real yq, for reasons scoped elsewhere. Both are now
+/// closed, so this pins the (now-matching) output instead of the residue.
 #[test]
 fn test_yq_pipe_precedence_residual_divergences_2420() -> Result<()> {
     let args = &["-o", "json", "-I0"];
 
     // Grouping is `(.a | .b), (.c | . + 1)`; `.a | .b` indexes the number 1
-    // and fails in both tools. Real yq *drops* the failing comma branch
-    // silently and prints only the second:
+    // with a field name. This used to look like real yq "dropping" a
+    // failing comma branch, but #2482 supplies the real mechanism: `.a | .b`
+    // was never an error in real yq to begin with (indexing a scalar with a
+    // key is an empty read there, not a structural error) -- there is no
+    // failing branch for a comma to drop. succinctly now agrees:
     // $ yq -o=json -I0 '.a | .b, .c | . + 1'  =>  4   (exit 0, empty stderr)
-    // succinctly is fail-loud here, as jq is:
+    // jq's own model has no such rule, so it still raises there:
     // $ jq -c '.a | .b, .c | . + 1'  =>  "Cannot index number with string
     //                                     \"b\"" (exit 5, no stdout)
-    // That silent-drop behaviour is a separate divergence from #2420's
-    // grouping, and is not what this change is about.
     let (stdout, stderr, code) =
         run_yq_stdin_with_stderr(".a | .b, .c | . + 1", PRECEDENCE_DOC_2420, args)?;
-    assert_eq!(code, 1);
-    assert_eq!(stdout, "");
-    assert!(
-        stderr.contains("Cannot index number with string \"b\""),
-        "stderr: {stderr:?}"
-    );
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), "4");
+    assert_eq!(stderr, "");
 
     // The second residual this test used to carry -- `(.a, .b) | (.c, .d)`
-    // answering `3 4 5 6` where yq answers `3 5 4 6` -- is gone: that was
+    // answering `3 4 5 6` where yq answers `3 5 4 6` -- is gone too: that was
     // yq's context-list evaluation model, not its precedence table, and
     // #2451 implements it. See `test_yq_pipe_into_union_is_branch_major_2451`.
 
@@ -36403,6 +36425,118 @@ fn test_yq_from_entries_scalar_key_stringify_2521() -> Result<()> {
         stderr.contains("Cannot use number (0) as object key"),
         "{stderr}"
     );
+
+    Ok(())
+}
+
+/// #2482: indexing a *scalar* (string/number/boolean) with any key -- a
+/// field name (`.s.zzz`), a numeric index (`.s[0]`), or a computed key of
+/// either kind -- produces no output at all in real yq, not jq's `Cannot
+/// index <type> with <key>` structural error, which succinctly reproduced
+/// in both modes before this fix. Captured live from yq v4.53.3 on `s: x`
+/// (plain scalar output -- yq prints nothing for an empty stream, so
+/// `-o=json -I0`'s bracketing would only obscure that):
+///
+/// ```text
+/// $ yq '.s.zzz'          (nothing, exit 0)
+/// $ yq '.s.zzz + 1'      1
+/// $ yq '.s[0]'           (nothing, exit 0)
+/// $ yq '.s[]'            (nothing, exit 0)
+/// $ yq '.s | .zzz'       (nothing, exit 0)
+/// $ yq '.s.zzz?'         (nothing, exit 0)
+/// $ yq '.s.zzz | key'    (nothing, exit 0)
+/// $ yq '.s.zzz | path'   (nothing, exit 0)
+/// $ yq -e '.s.zzz'       Error: no matches found  (exit 1)
+/// $ yq '.s.zzz = 1'      s: x   (unchanged -- a pre-existing no-op via
+///                                `yq_assign_classify`'s total-noop
+///                                classification, untouched by this fix)
+/// $ succinctly yq '.s.zzz'   Error: Cannot index string with string "zzz"  (was, exit 1)
+/// ```
+///
+/// Same empty-not-error rule on a number/boolean target (`n: 5`, `b: true`):
+/// `.n.zzz`, `.b.zzz`, `.n.zzz + 1` and `.b.zzz + 1` (both `1`). `null` is
+/// unaffected -- `.z.zzz` on `z: null` is already `null` in both real and
+/// succinctly yq (indexing `null` keeps its own separate, unconditional-null
+/// rule; it is not treated as a "scalar" by this predicate). A real
+/// container target keeps its own structural error: `.arr.zzz` on `arr:
+/// [1, 2]` is `Error: cannot index array with 'zzz' (...)` in real yq (a
+/// different message, still an error, exit 1) -- unaffected, since this
+/// predicate is gated on "not a container", not merely "not an object".
+///
+/// jq 1.7.1 raises unconditionally (`Cannot index string with string
+/// "zzz"`), so jq mode is untouched -- not asserted against the oracle
+/// here, see `test_jq_mode_has_no_downcase_upcase_2462`'s own precedent
+/// (jq_cli_tests.rs) for why jq mode's own suite covers that side.
+///
+/// Fixed as `eval::yq_field_index_on_scalar_is_empty`, consulted by both
+/// evaluators at every scalar-target index site: `eval::
+/// index_object_by_name`/`index_array_by_position`/`index_one`/
+/// `eval_owned_navigation`/`eval_stage_with_path_context`'s `Expr::Field`/
+/// `Expr::Index` arms, and `eval_generic`'s `eval_single`'s `Expr::Field`/
+/// `Expr::Index` arms, `index_one_generic`, and `path_step_generic`'s
+/// `Expr::Field`/`Expr::Index` arms -- one definition, several call sites
+/// (CLAUDE.md's "duplicated predicates diverge silently", #106).
+#[test]
+fn test_yq_index_scalar_with_key_is_empty_2482() -> Result<()> {
+    let doc = "s: x\nn: 5\nb: true\nz: null\narr:\n  - 1\n  - 2\n";
+    for filter in [
+        ".s.zzz",
+        ".s[0]",
+        ".s[]",
+        ".s | .zzz",
+        ".s.zzz?",
+        ".s.zzz | key",
+        ".s.zzz | path",
+        ".n.zzz",
+        ".b.zzz",
+        "0 as $k | .s[$k]",
+        "\"zzz\" as $k | .s[$k]",
+        "null as $k | .s[$k]",
+    ] {
+        let (output, code) = run_yq_stdin(filter, doc, &[])?;
+        assert_eq!(code, 0, "`{filter}`: {output:?}");
+        assert_eq!(
+            output.trim(),
+            "",
+            "`{filter}` should print nothing, got {output:?}"
+        );
+    }
+
+    // Arithmetic operand context: the empty read still resolves to `null`.
+    for (filter, expected) in [
+        (".s.zzz + 1", "1"),
+        (".n.zzz + 1", "1"),
+        (".b.zzz + 1", "1"),
+    ] {
+        let (output, code) = run_yq_stdin(filter, doc, &[])?;
+        assert_eq!(code, 0, "`{filter}`: {output:?}");
+        assert_eq!(output.trim(), expected, "`{filter}`");
+    }
+
+    // `null` keeps its own separate, unconditional-null rule -- not "scalar".
+    let (output, code) = run_yq_stdin(".z.zzz", doc, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "null");
+
+    // A real container keeps its own structural error -- a different
+    // message than the scalar case, but still an error -- this predicate is
+    // gated on "not a container".
+    let (_out, stderr, code) = run_yq_stdin_with_stderr(".arr.zzz", doc, &[])?;
+    assert_ne!(code, 0, "`.arr.zzz` should still error");
+    assert!(stderr.contains("Cannot index array"), "got: {stderr}");
+
+    // `-e`: an empty stream still reports "no matches found" (exit 1), same
+    // as any other empty read.
+    let (_out, stderr, code) = run_yq_stdin_with_stderr(".s.zzz", doc, &["-e"])?;
+    assert_ne!(code, 0, "`-e` over an empty stream should exit non-zero");
+    assert!(stderr.contains("no matches found"), "got: {stderr}");
+
+    // Write side is a pre-existing no-op (`yq_assign_classify`'s total-noop
+    // classification), untouched by this predicate -- captured here for
+    // completeness, not as new behavior.
+    let (output, code) = run_yq_stdin(".s.zzz = 1", doc, &[])?;
+    assert_eq!(code, 0);
+    assert!(output.contains("s: x"), "got: {output:?}");
 
     Ok(())
 }
