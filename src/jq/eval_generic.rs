@@ -23050,7 +23050,10 @@ mod tests {
     /// #2138's sink: same `keys_unsorted[]` shape as the test above, but the
     /// first field *name* itself is undecodable -- exercises the merged
     /// `OneCursor | OneCursorValue` arm's `to_owned_key_shape_cursor`
-    /// failure path for a real `.[K]` key generator.
+    /// failure path for a real `.[K]` key generator. The corrupt name is
+    /// first, so `cursors` is still empty when it fails -- the sibling test
+    /// below covers a *later* key's decode failure, where the answer
+    /// differs.
     #[test]
     fn generic_computed_index_key_via_keys_unsorted_undecodable_name_2138() {
         let json: &[u8] = b"{\"\xff\xfe\":1,\"b\":2}";
@@ -23059,6 +23062,40 @@ mod tests {
         match eval_with_cursor(&expr, index.root(json)) {
             GenericResult::Error(e) => assert!(e.is_decode_failure(), "{e:?}"),
             other => panic!("expected decode Error, got {other:?}"),
+        }
+    }
+
+    /// #2138 behavior change (review finding): the pre-#2138 key-collection
+    /// arms for a `Many`/`ManyCursor` key stream (`.iter().map(to_owned_key_
+    /// shape[_cursor]).collect::<Result<Vec<_>, _>>()`) shaped *every* key
+    /// up front in one fallible batch, so a decode failure on the *second*
+    /// key aborted to a bare `Error` -- discarding the first key's output
+    /// even though it would have indexed cleanly, since no indexing had
+    /// happened yet at that point. #2138 folds key-shaping and indexing into
+    /// one per-key step, so key `"a"` (first, decodes and indexes to `1`)
+    /// is already sitting in `cursors` by the time key `"\xff\xfe"` (second)
+    /// fails to decode -- `escape_generic!` then reports that prefix,
+    /// matching the same philosophy #2145/#2340/#2381 already established
+    /// for every *other* escape source in this function (an already-indexed
+    /// key's output survives a later escape, regardless of what triggers
+    /// it). This is a real, intentional behavior change, not a regression:
+    /// there is no `jq`/`yq` oracle for it (a document with an undecodable
+    /// field name is not valid JSON/YAML to begin with), but discarding
+    /// `"a"`'s already-computed `1` here would have been the odd one out
+    /// against every other escape this function already preserves a prefix
+    /// for.
+    #[test]
+    fn generic_computed_index_key_via_keys_unsorted_later_key_undecodable_name_preserves_prefix_2138(
+    ) {
+        let json: &[u8] = b"{\"a\":1,\"\xff\xfe\":2}";
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(".[(keys_unsorted[])]").unwrap();
+        match eval_with_cursor(&expr, index.root(json)) {
+            GenericResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(vs, vec![OwnedValue::Int(1)]);
+                assert!(e.is_decode_failure(), "{e:?}");
+            }
+            other => panic!("expected Partial([1], decode Error), got {other:?}"),
         }
     }
 

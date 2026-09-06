@@ -18445,90 +18445,69 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // every write goes through the shared `prefer_pending_control` ordering
     // (`Halt` > `Error`/`Break` > nothing) that `eval_generic`'s twin uses
     // too.
-    let mut pending_control: Option<Control> = None;
-    let keys = match eval_single::<W, S>(key, value.clone(), false).materialize_cursor() {
-        // STYLE-0012: the key generator is evaluated with a hardcoded
-        // `optional: false` just above, deliberately: `.[k]?` suppresses only its
-        // own final index step, never an error raised while computing `k`.
-        // Captured from jq 1.7.1 on `{"k":{"z":1},"a":1}`:
-        //   `.[error("boom")]?` -> exit 5, `boom`   (raised computing `k`)
-        //   `.[.k]?`            -> exit 0, no output (the *index step* failing
-        //                          on a non-string key, which `?` does suppress)
-        // The second row is the one to watch: an earlier version of this comment
-        // cited it as exiting 5, which is backwards -- it is the suppressed case,
-        // not the raising one, and says nothing about the key generator (#2334
-        // review).
-        QueryResult::One(v) => match to_owned_key_shape(&v) {
-            Ok(v) => vec![v],
-            Err(e) => return QueryResult::Error(e),
-        },
-        QueryResult::Many(vs) => {
-            let keys: Result<Vec<OwnedValue>, EvalError> =
-                vs.iter().map(to_owned_key_shape).collect();
-            match keys {
-                Ok(keys) => keys,
-                Err(e) => return QueryResult::Error(e),
-            }
-        }
-        QueryResult::Owned(v) => vec![v],
-        QueryResult::ManyOwned(vs) => vs,
-        QueryResult::None => return QueryResult::None,
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        QueryResult::Break(label) => return QueryResult::Break(label),
-        QueryResult::Halt(code) => return QueryResult::Halt(code),
-        QueryResult::OneCursor(_) => unreachable!("materialize_cursor should have converted this"),
-        // #2326: `key`'s own generator produced `vs` before its own
-        // mid-stream escape -- mirrors #2226's identical fix for `target`'s
-        // side (this same function's own `KeyTargets::Partial` arm below):
-        // real jq's key-outer/target-inner model indexes each already-
-        // produced key as it flows out, so `key`'s own escaped generator's
-        // prefix is real jq output too (confirmed live: `[10,20,30] |
-        // .[(1,error("x"))]` prints `20` before raising). Real yq does not
-        // stream this prefix either (confirmed live, `.[(1,error("x"))]` in
-        // yq mode shows no `20`), so yq mode keeps the pre-existing
-        // conservative discard.
-        //
-        // #2374: the mode test is [`streams_escaped_generator_prefix`], the
-        // family's one definition, not a fifth hand-written `S::TAG`
-        // comparison -- and the five arms this used to need collapse to
-        // three, since only `Error`/`Break` discard. `Halt` is different in
-        // *both* modes: its prefix is kept and threaded through as
-        // `pending_control`, because those already-produced keys' indexed
-        // output still owes real jq's stdout before the process exits
-        // (#791). Computed indexing's key/target forking isn't part of
-        // #400/#494's verified semantics, so the discard stays a bare
-        // `Error`/`Break` rather than inventing a `Partial` shape for it
-        // (yq mode, and any future non-jq/yq semantics, take those two).
-        QueryResult::Partial(vs, control) => match control {
-            Control::Error(e) if !streams_escaped_generator_prefix::<S>() => {
-                return QueryResult::Error(e)
-            }
-            Control::Break(label) if !streams_escaped_generator_prefix::<S>() => {
-                return QueryResult::Break(label)
-            }
-            control => {
-                pending_control = prefer_pending_control(pending_control, control);
-                vs
-            }
-        },
-    };
-    if keys.is_empty() {
-        // `partial`'s invariant (a non-empty prefix by construction) means
-        // this is only reachable with `pending_control` unset.
-        return QueryResult::None;
+    // #2138: keys are pulled one at a time via `eval_each`'s sink protocol
+    // instead of `eval_single`'s eager, always-materialize-everything
+    // collection this used to be -- real jq's own `K as $k | E | .[$k]`
+    // compilation stops asking `K` for its next value the moment an
+    // *earlier* key's own indexing step raises (`{"a":1} | .[("a", 5,
+    // error("boom"))]` errors on key `5` and never evaluates
+    // `error("boom")` at all, live-verified against jq 1.7.1/1.8.2 --
+    // this function used to evaluate it anyway, since the old
+    // `keys: Vec<_>` was fully materialized up front, before any indexing
+    // began). Mirrors `eval_generic::eval_index_expr`'s identical #2138 fix
+    // one file over -- see that function's own doc comment for the fuller
+    // design rationale (the `terminal`/`Demand`/`Flow` shape is the same;
+    // only the concrete types differ, `Item`/`QueryResult` here vs.
+    // `GenericItem`/`GenericResult` there).
+    //
+    // `terminal` is this closure's escape hatch: `escape_with_prefix!` can
+    // now only answer `Demand` from inside the sink below (a `return` there
+    // exits the closure, not this function), so a definitive `QueryResult`
+    // is parked here and `Demand::Stop` is what actually stops the pull --
+    // checked once, right after the pull ends.
+    let mut borrowed: Vec<StandardJson<'a, W>> = Vec::new();
+    let mut owned: Option<Vec<OwnedValue>> = None;
+    let mut terminal: Option<QueryResult<'a, W>> = None;
+
+    // Escapes to a `Partial` over whatever `borrowed`/`owned` already holds
+    // -- the shared exit every control arm below funnels through, so the
+    // "fold the running prefix in" step can't drift between them.
+    //
+    // #2138: now runs from inside the per-key sink below, which can only
+    // answer `Demand` -- parks the answer in `terminal` and stops the pull
+    // via `Demand::Stop` instead of `return`ing a `QueryResult` directly.
+    macro_rules! escape_with_prefix {
+        ($control:expr) => {{
+            // `mem::take`, not a bare move: this runs from inside a `FnMut`
+            // sink that may be invoked again after an earlier key's own
+            // work (though never again *after* this macro fires, since
+            // returning `Demand::Stop` ends the pull) -- moving `borrowed`/
+            // `owned` out of the closure's environment outright would only
+            // let the closure implement `FnOnce`, which `eval_each`'s sink
+            // parameter can't accept.
+            let (prefix, control) = resolve_terminal_prefix(
+                core::mem::take(&mut borrowed),
+                owned.take(),
+                Vec::new(),
+                $control,
+            );
+            terminal = Some(partial(prefix, control));
+            return Demand::Stop;
+        }};
     }
 
-    // (2) Key outer, target inner -- and, since #2032, `target` (`E`) is
-    // re-evaluated fresh for *every* key rather than once for all of them,
-    // matching jq's own `K as $k | E | .[$k]` compilation: a side effect
-    // inside `E` (`stderr`, `input`, ...) fires once per key, not once
-    // total, and each key's own output count is independent (`E = input`
-    // genuinely reads a different line per key, confirmed live: `jq -n
-    // '[(input)[("a","b")]]'` on two JSON lines answers `[1,2]`, one read
-    // per key, not one read shared by both). Only the *value* stream
-    // ordering changes here; `optional`'s own scope is unaffected (it still
-    // reaches only `index_one`/`index_one_owned`, never key or target
-    // evaluation).
+    // One key's worth of work: evaluate `target` fresh, index it by this
+    // key, fold the result into `borrowed`/`owned`. Key outer, target inner
+    // -- and, since #2032, `target` (`E`) is re-evaluated fresh for *every*
+    // key rather than once for all of them, matching jq's own `K as $k | E
+    // | .[$k]` compilation: a side effect inside `E` (`stderr`, `input`,
+    // ...) fires once per key, not once total, and each key's own output
+    // count is independent (`E = input` genuinely reads a different line
+    // per key, confirmed live: `jq -n '[(input)[("a","b")]]'` on two JSON
+    // lines answers `[1,2]`, one read per key, not one read shared by
+    // both). Only the *value* stream ordering changes here; `optional`'s
+    // own scope is unaffected (it still reaches only `index_one`/
+    // `index_one_owned`, never key or target evaluation).
     //
     // Borrowed and owned results are kept apart so the common (borrowed)
     // case never materializes the document -- `push_promoted`/
@@ -18536,20 +18515,20 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `eval_comma`'s identical per-element accumulation already uses (#353/
     // #1755/#1790), reused here instead of re-deriving a third copy of the
     // same "one ordered accumulator, promoted at most once" logic.
-    let mut borrowed: Vec<StandardJson<'a, W>> = Vec::new();
-    let mut owned: Option<Vec<OwnedValue>> = None;
-
-    // Escapes to a `Partial` over whatever `borrowed`/`owned` already holds
-    // -- the shared exit every control arm below funnels through, so the
-    // "fold the running prefix in" step can't drift between them.
-    macro_rules! escape_with_prefix {
-        ($control:expr) => {{
-            let (prefix, control) = resolve_terminal_prefix(borrowed, owned, Vec::new(), $control);
-            return partial(prefix, control);
-        }};
-    }
-
-    for k in &keys {
+    //
+    // #2138: was the body of a `for k in &keys` loop over an eagerly-
+    // materialized `Vec<OwnedValue>`; `k` is now a macro parameter fed one
+    // key at a time from the sink below instead of a loop-bound name, but
+    // every line inside is otherwise unchanged.
+    macro_rules! process_one_key {
+        ($k:expr) => {{
+            let k = $k;
+            // #2138: labeled block, not a bare loop body -- there is no
+            // enclosing loop any more for the old `QueryResult::None =>
+            // continue` arm below to continue out of, so `continue` becomes
+            // `break 'process_one_key` instead: "this key contributes
+            // nothing, stop processing it" reads the same either way.
+            'process_one_key: {
         let target_result = eval_single::<W, S>(target, value.clone(), false).materialize_cursor();
         // Normalized once per key so the two index loops below (Borrowed vs
         // Owned) are the only place `index_one`/`index_one_owned` are
@@ -18569,7 +18548,7 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // nothing and the loop moves on to the next one (#2032: unlike
             // the old once-for-all-keys evaluation, this no longer implies
             // every other key is empty too).
-            QueryResult::None => continue,
+            QueryResult::None => break 'process_one_key,
             QueryResult::Error(e) => escape_with_prefix!(Control::Error(e)),
             QueryResult::Break(label) => escape_with_prefix!(Control::Break(label)),
             QueryResult::Halt(code) => escape_with_prefix!(Control::Halt(code)),
@@ -18667,7 +18646,16 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                                                 Control::Error(e)
                                             }
                                         };
-                                        return partial(prefix, control);
+                                        // #2138: this `promote:` block runs
+                                        // from inside the per-key sink,
+                                        // which can only answer `Demand` --
+                                        // see `escape_with_prefix!`'s own
+                                        // doc comment above for why this
+                                        // parks the answer in `terminal`
+                                        // instead of `return`ing a
+                                        // `QueryResult` directly.
+                                        terminal = Some(partial(prefix, control));
+                                        return Demand::Stop;
                                     }
                                 },
                             );
@@ -18749,7 +18737,25 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     owned = Some(
                         match promote_borrowed_checked(core::mem::take(&mut borrowed)) {
                             Ok(v) => v,
-                            Err((prefix, e)) => return partial(prefix, Control::Error(e)),
+                            // #2138: this secondary promotion failure used
+                            // to have to choose between a pending
+                            // key-stream `Halt` and this decode failure's
+                            // own `Error` -- that question is gone along
+                            // with `pending_control` itself: keys are no
+                            // longer materialized ahead of indexing, so by
+                            // the time any key's own per-key work runs
+                            // here, the key stream has not produced
+                            // anything *after* this key for there to be a
+                            // pending event about. This decode failure is
+                            // simply the only event in play, and (per
+                            // `escape_with_prefix!`'s own doc comment
+                            // above) is reported via `terminal`, not a bare
+                            // `return`, since this runs from inside the
+                            // per-key sink.
+                            Err((prefix, e)) => {
+                                terminal = Some(partial(prefix, Control::Error(e)));
+                                return Demand::Stop;
+                            }
                         },
                     );
                 }
@@ -18784,31 +18790,118 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
             }
         }
+        } // closes 'process_one_key: { ... }
+        }};
     }
 
-    // #2326: the key stream's own escape, deferred until every
-    // already-produced key finished indexing cleanly -- an indexing failure
-    // on one of those keys outranks it (escapes earlier, via
-    // `escape_with_prefix!` inside the loop above), matching #2226's own
-    // documented priority for the symmetric target-side case. #1897's fix
-    // (fold the running prefix in rather than dropping it) applies to every
-    // held control here, `Halt` included; `resolve_terminal_prefix` is where
-    // the two still differ, on what a *promotion* failure does to the held
-    // control.
+    // #2138: keys pulled one at a time -- each `Item` the key expression's
+    // own generator produces becomes exactly one key (`Item` has no
+    // compound/lazy variant the way `eval_generic`'s `GenericItem` does),
+    // run through `process_one_key!` immediately, before the *next* key is
+    // ever asked for. This is the actual fix: real jq's key-outer/
+    // target-inner model means a later key's own evaluation (including any
+    // side effect, like `error(...)`) must never be reached once an earlier
+    // key's indexing step has already escaped, and `eval_each` (already
+    // used this way by `fanout_arg`'s own `ArgFanout::All` lazy sink) is
+    // what gives this function a demand-driven pull to stop with.
     //
-    // #2381: a plain two-arm match now that `pending_control` is one slot --
-    // the `Halt`-outranks-`Error`/`Break` ordering this used to re-derive as
-    // a 3-arm tuple match lives in `prefer_pending_control`, at the writes
-    // above.
-    match pending_control {
-        Some(control) => {
-            let (prefix, control) = resolve_terminal_prefix(borrowed, owned, Vec::new(), control);
-            partial(prefix, control)
+    // `Item::Borrowed` goes through `to_owned_key_shape` (STYLE-0012: this
+    // normalizes an array/object key to its empty shape rather than cloning
+    // its content -- matches the pre-#2138 `One`/`Many` arms exactly, since
+    // a `Many` key stream is what `push_many`-style unpacking now delivers
+    // as repeated `Borrowed` pushes). `Item::Owned` mirrors the pre-#2138
+    // `Owned`/`ManyOwned` arms exactly (no `to_owned_key_shape`
+    // normalization for these -- pre-existing, unchanged behavior): an
+    // already-owned key keeps its full content.
+    let mut sink = |item: Item<'a, W>| -> Demand {
+        match item {
+            Item::Borrowed(v) => {
+                // STYLE-0012: this materializes the *key* generator's
+                // output, evaluated with a hardcoded `optional: false` in
+                // the `eval_each` call below. `.[k]?` suppresses only its
+                // own final index step, never an error raised while
+                // computing `k` -- see the pre-#2138 arm this replaces for
+                // the jq 1.7.1 capture that settles it.
+                let k = match to_owned_key_shape(&v) {
+                    Ok(k) => k,
+                    Err(e) => escape_with_prefix!(Control::Error(e)),
+                };
+                process_one_key!(&k);
+            }
+            Item::Owned(o) => {
+                process_one_key!(&o);
+            }
         }
-        None => match owned {
-            Some(vs) => owned_vec_to_result(vs),
-            None => borrowed_vec_to_result(borrowed),
+        Demand::Continue
+    };
+
+    let flow = eval_each::<W, S>(key, value.clone(), false, &mut sink);
+
+    // A per-key escape (`escape_with_prefix!` above) always parks its
+    // answer here before stopping the pull -- see `terminal`'s own doc
+    // comment above. Checked first: it outranks anything the key stream's
+    // own tail could still report (matches #2326's original priority: "an
+    // indexing failure on one of those keys outranks [the key stream's own
+    // escape]").
+    if let Some(result) = terminal {
+        return result;
+    }
+
+    // The key stream's own tail, now read off `Flow` instead of a
+    // preliminary `QueryResult` match -- `eval_each`'s contract makes this
+    // exhaustive without `pending_control`'s old `prefer_pending_control`
+    // merge: nothing here can set `terminal` (that already returned above),
+    // so whatever `flow` reports is the *only* outstanding event, not one
+    // of several to arbitrate between.
+    match flow {
+        // The key stream ran out on its own, with every key it did produce
+        // already folded into `borrowed`/`owned` above -- including zero
+        // keys at all, which the final `owned_vec_to_result`/
+        // `borrowed_vec_to_result` fallback below already collapses to
+        // `None`, the same as the old `if keys.is_empty() { return
+        // QueryResult::None }` early check did.
+        Flow::Exhausted => {}
+        // Our sink is the only thing that can ask the pull to stop, and it
+        // only ever does so through `escape_with_prefix!`, which sets
+        // `terminal` before returning `Demand::Stop` -- so `terminal` would
+        // already be `Some` and the check above would already have
+        // returned.
+        Flow::Stopped { .. } => unreachable!("sink always sets `terminal` before Demand::Stop"), // omni-dev: coverage tolerate-line reason="unreachable: escape_with_prefix! sets `terminal` before Demand::Stop; already returned above (#2138)"
+        // #2326: the key stream's own escape -- real jq's key-outer/
+        // target-inner model indexes each already-produced key as it flows
+        // out, so `key`'s own escaped generator's prefix is real jq output
+        // too (confirmed live: `[10,20,30] | .[(1,error("x"))]` prints `20`
+        // before raising). Real yq does not stream this prefix either
+        // (confirmed live, `.[(1,error("x"))]` in yq mode shows no `20`),
+        // so yq mode keeps the pre-existing conservative discard.
+        //
+        // #2374: the mode test is `streams_escaped_generator_prefix`, the
+        // family's one definition, not a hand-written `S::TAG` comparison.
+        // A `Halt` is different in *both* modes: its prefix is always kept
+        // (matches the immediate `Halt` case too -- an empty `borrowed`/
+        // `owned` here collapses to a bare `QueryResult::Halt` via
+        // `resolve_terminal_prefix`/`partial`, the same as an immediate
+        // `eval_single` `Halt` used to `return` directly).
+        Flow::Escaped(control) => match control {
+            Control::Error(e) if !streams_escaped_generator_prefix::<S>() => {
+                return QueryResult::Error(e)
+            }
+            Control::Break(label) if !streams_escaped_generator_prefix::<S>() => {
+                return QueryResult::Break(label)
+            }
+            control => {
+                let (prefix, control) =
+                    resolve_terminal_prefix(borrowed, owned, Vec::new(), control);
+                return partial(prefix, control);
+            }
         },
+    }
+
+    // #1048: a zero-result collapse here (every key/target pair
+    // optional-suppressed) must be `None`, not `ManyOwned`.
+    match owned {
+        Some(vs) => owned_vec_to_result(vs),
+        None => borrowed_vec_to_result(borrowed),
     }
 }
 
@@ -53371,14 +53464,27 @@ mod tests {
             QueryResult::Error(e) if e.is_decode_failure() => {}
         );
         // A *multi*-output computed-index key (`.keys[]` as the key
-        // expression) reaches `to_owned_key_shape`'s own `QueryResult::Many`
-        // arm, distinct from the single-key case above (`QueryResult::One`)
-        // -- one valid key, one malformed, to also exercise the `.collect()`
-        // short-circuit rather than only its first element.
+        // expression) reaches `to_owned_key_shape`'s own `Item::Borrowed`
+        // sink arm, distinct from the single-key case above -- one valid
+        // key, one malformed, to exercise a decode failure on a *later*
+        // pulled key.
+        //
+        // #2138: this used to be a bare `Error` (the whole key stream was
+        // materialized via one fallible `.collect()` before any indexing
+        // began, so key "a"'s own indexing to `1` never actually ran).
+        // Keys are now pulled and indexed one at a time -- real jq's
+        // key-outer/target-inner model -- so by the time key `"\xff\xfe"`
+        // fails to decode, key `"a"` has already indexed cleanly to `1`,
+        // and that prefix survives as `Partial`, matching the same
+        // philosophy #2145/#2340/#2381 already established for every
+        // *other* escape source in this function (an already-indexed key's
+        // output survives a later escape, regardless of what triggers it).
         query!(
             &b"{\"a\":1,\"keys\":[\"a\",\"\xff\xfe\"]}"[..],
             ".[(.keys[])]",
-            QueryResult::Error(e) if e.is_decode_failure() => {}
+            QueryResult::Partial(vs, Control::Error(e)) if e.is_decode_failure() => {
+                assert_eq!(vs, vec![OwnedValue::Int(1)]);
+            }
         );
     }
 
