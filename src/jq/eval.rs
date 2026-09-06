@@ -49965,15 +49965,21 @@ fn eval_func_call<'a, W: Clone + AsRef<[u64]>>(
     // (the field's own invariant), so without this check the message below
     // reads as an ordinary "no such builtin" typo report -- indistinguishable
     // from a genuine bug in the caller's filter, when the real cause is a
-    // missing resolve call before evaluating a jq-mode-parsed `Expr`
-    // directly. No extra tree walk: this only enriches the message on a
-    // node that was already about to error either way.
+    // missing resolve call before evaluating this `Expr` directly. No extra
+    // tree walk: this only enriches the message on a node that was already
+    // about to error either way.
+    //
+    // Deliberately not "jq-mode-parsed": `wrap_shadowable_call`
+    // (`parser.rs`) isn't gated on `ParserMode::Jq`, so a yq-mode-parsed
+    // `Expr` using a jq-extension special form (`until`/`while`/`repeat`/
+    // `error`/`first`/`last` under `--jq-extensions`) can carry an
+    // unresolved `builtin_fallback` too (review finding).
     let message = if unresolved_builtin_fallback {
         format!(
             "undefined function: {name}/{}: a `def {name}` elsewhere in this \
              program means the parser deferred resolving this call site -- \
              call `resolve_func_calls`/`resolve_func_calls_all` before \
-             evaluating a jq-mode-parsed `Expr` directly (see \
+             evaluating this `Expr` directly (see \
              `Expr::FuncCall::builtin_fallback`'s doc comment)",
             args.len()
         )
@@ -50067,6 +50073,40 @@ mod tests {
                 assert!(
                     e.message.contains("resolve_func_calls"),
                     "expected the message to name the missing precondition, got: {}",
+                    e.message
+                );
+            }
+            other => panic!("expected an Error, got {other:?}"),
+        }
+    }
+
+    /// #2402 review finding: `wrap_shadowable_call` (`parser.rs`) isn't
+    /// gated on `ParserMode::Jq`, so a yq-mode-parsed `Expr` using a
+    /// jq-extension special form under `--jq-extensions` can carry an
+    /// unresolved `builtin_fallback` too -- the message must not claim
+    /// "jq-mode-parsed" (an earlier revision of this fix did).
+    #[test]
+    fn test_eval_without_resolve_names_missing_precondition_yq_mode_2402() {
+        use crate::json::JsonIndex;
+
+        let json: &[u8] = b"[1,2,3]";
+        let index = JsonIndex::build(json);
+        // `def until(x): x;` shadows a different arity than the bare
+        // 2-argument `until(cond; update)` special form, so this call site
+        // never actually shadows -- but resolving is skipped here.
+        let expr =
+            parse_with_mode_and_extensions("def until(x): x; until(true; .)", ParserMode::Yq, true)
+                .unwrap();
+        match eval::<Vec<u64>, YqSemantics>(&expr, index.root(json)) {
+            QueryResult::Error(e) => {
+                assert!(
+                    e.message.contains("resolve_func_calls"),
+                    "expected the message to name the missing precondition, got: {}",
+                    e.message
+                );
+                assert!(
+                    !e.message.contains("jq-mode"),
+                    "message must not claim a parser mode that doesn't hold in general, got: {}",
                     e.message
                 );
             }
