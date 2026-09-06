@@ -106,15 +106,19 @@ now when neither the constant route nor the owned identity pipe can take the
 stages after it. The probe shape that trips it is `.a?` (which
 `path_context_is_navigational` excludes, so no position is walked) or a bare
 `parent` operand (which no route can name a position for). The same shapes with
-a head that cannot miss trip R3 instead -- e.g. `.a[] | (key | tostring)`, `.a[] | reduce (key) as $k (""; . +
-$k) | . + "x"` and `.a[] | select(key == "b" and true)` all report R3. This is an
-ordering artefact, not a claim that R3 is rare.
+a head that cannot miss trip R3 instead -- e.g. `.a[] | (key | tostring)`,
+`.a[] | (key | length)`, `.a[] | {"k": (key | tostring)}` and
+`.a[] | ((key | tostring) and true)` all report R3 (re-derived after #2473,
+below). This is an ordering artefact, not a claim that R3 is rare.
 
 Step 1b (below) moved two of the three shapes this paragraph used to name --
 `.a[] | key + "x"` and `.a[] | if key == "b" then key + "x" else "y" end` -- off
 R3 and onto the generic route, which is what an admission to
-`path_context_single_native` is *for*. Re-derive this paragraph's examples after
-any further admission rather than trusting them.
+`path_context_single_native` is *for*, and #2473 moved two more:
+`.a[] | select(key == "b" and true)` and
+`.a[] | reduce (key) as $k (""; . + $k) | . + "x"` both report no gate at all
+now. Re-derive this paragraph's examples after any further admission rather than
+trusting them.
 
 ## The 43 handlers
 
@@ -136,7 +140,7 @@ any further admission rather than trusting them.
 | A09 | `Expr::Pipe(inner) if rest.is_empty()`                             | REACHABLE | `.a.b \| -(key\|length)`                              | R2   |
 | A10 | `Expr::Pipe(inner)`                                                | REACHABLE | `.a.b \| parent + {}`                                 | R2   |
 | A11 | `Expr::Arithmetic { .. }`                                          | REACHABLE | `.a.b \| parent + {}`                                 | R2   |
-| A12 | `Expr::And(..) \| Expr::Or(..)`                                    | REACHABLE | `.a.b \| key == "b" and true`                         | R2   |
+| A12 | `Expr::And(..) \| Expr::Or(..)`                                    | REACHABLE | `.a? \| key == "a" and true`                          | R2   |
 | A13 | `Expr::Negate(operand)`                                            | REACHABLE | `.a.b \| -(key\|length)`                              | R2   |
 | A14 | `Expr::Compare { .. }`                                             | REACHABLE | `.a? \| (key + "x") \| . == "bx"`                     | R2   |
 | A15 | `Expr::Builtin(Builtin::Select(cond))`                             | REACHABLE | `.a.b \| select(key == "b") \| parent + {}`           | R2   |
@@ -288,16 +292,99 @@ containing one still hands over -- and once it does, the generic structural
 arms (`A01`, `A02`, `A06`, `A10`, `A11`) run inside it. Deleting an arm needs
 those *stage* shapes migrated, not this route widened.
 
+## #2473: gate reason 3 narrowed, and the pin still holds at 43
+
+[#2473](https://github.com/rust-works/succinctly/issues/2473) is the gate's
+third disjunct: a stage built from a construct the generic evaluator has no
+cursor-threading arm for. Four constructs were on the list; three moved and one
+did not.
+
+- **`and`/`or`** got `eval_single` arms of their own (`eval_boolean_generic`
+  over `eval::boolean_fanout_bools`, shared with the eager route so #2460's
+  zero-output-operand rule and #2470's read-only operand scope keep one
+  definition), and joined `path_context_single_native`. Gated on
+  `needs_path_context`, exactly as `Expr::Arithmetic` is, so an `and`/`or` that
+  reads no path context still pays the bridge's ambient decode on a malformed
+  document.
+- **`Expr::Object` inside `needs_path_context`** -- #1332's other half. This is
+  not an admission (`path_context_single_native` has had an `Expr::Object` arm
+  since #2439) but a *routing* fix: an object literal's key and value slots
+  were invisible to `needs_path_context`, so a pipe containing one was never
+  recognised as a path-context pipe and no route was ever asked. The generic
+  evaluator's own arm reads the cursor, which is why a live-node shape happened
+  to be right; every shape that needs a route -- an absent position, a value
+  that had left the cursor domain -- answered `null` (jq mode) or nothing (yq
+  mode). `path_context_resolvable` and `path_context_resolve_constants` gained
+  matching `Expr::Object` arms, and the eager evaluator's existing
+  value-construction arm now evaluates the slots at the position it was given
+  instead of resetting the context first (the same split `Expr::Array(inner) if
+  needs_path_context(inner)` has made since #1302). That last change is a
+  pluggable slot evaluator on `build_object_entries`, **not** a new handler, so
+  the arm count is unmoved.
+- **`reduce`/`foreach`** joined `path_context_single_native`: the generic arms
+  already evaluate INPUT and INIT through `stream_owned_outputs_generic` with
+  the cursor, so the admission is the same "the arm already exists, say so"
+  shape `Expr::As`/`Expr::Label` had. UPDATE and EXTRACT are not part of the
+  gate -- they evaluate against the accumulator, a value with no document
+  position, which is why `needs_path_context` does not descend into them
+  either.
+- **`range`/`repeat`/`while`/`until` got no arm.** Real yq's lexer rejects all
+  four (v4.53.3), and jq 1.7.1 has no path-context builtin to put inside one,
+  so there is no captured behaviour to migrate toward -- only succinctly's own
+  extension surface. Their current answers are pinned instead
+  (`test_range_repeat_while_until_stay_extension_only_2473`).
+
+**`PINNED_ARM_COUNT` stays at 43.** Re-run of the method above on the
+post-#2473 tree, in two passes.
+
+Pass 1 instrumented `path_context_needs_eager` alone (one `eprintln!` per
+disjunct) and ran all 43 listed proof queries: **42 still enter the gate, 1
+does not.** The one is `A12` (`Expr::And(..) | Expr::Or(..)`), whose listed
+query `.a.b | key == "b" and true` is exactly the shape the first bullet
+migrated. Every other row reports the same disjunct it reported before, and
+every output is unchanged (`test_arm_audit_proof_queries_are_unmoved_by_the_gate_2416`).
+
+Pass 2 instrumented `A12` and swept candidates. **It still fires**, on several
+shapes and through all three disjuncts:
+
+| Candidate                                       | Gate | Marker | Output      |
+|-------------------------------------------------|------|--------|-------------|
+| `.a? \| key == "a" and true`                     | R2   | fired  | `true`      |
+| `.a? \| (key and parent)`                        | R2   | fired  | `true`      |
+| `.[] \| ((key \| tostring) and true)`             | R3   | fired  | `true` (x4) |
+| `.a \| to_entries \| .[0] \| key == 0 and true`    | R1   | fired  | `true`      |
+| `.[] \| .k \| (key == "k" and true)`              | R2   | fired  | `true`      |
+
+The table above carries the first of those as `A12`'s query now; the old
+spelling stays pinned alongside it, which is what makes the move readable as
+"same outputs, different route" rather than as a silent change.
+
+The three arms this change could plausibly have starved were checked
+explicitly and all still fire: `A21` (`Expr::Array(inner) if
+needs_path_context(inner)`) and `A33` (`Expr::Object(_) | Expr::Array(_) |
+Expr::Literal(_)`) on `.a? | {"k": key}` and `.a? | [key] + ["x"]`, and
+`A31`/`A32` (`reduce`/`foreach`) on their own listed queries, which still enter
+at `R2` because a `.a.b` head can miss.
+
+**Nothing became unreachable, so nothing was deleted.** The reason is the same
+structural one #2472 recorded, seen from the other side: an admission to
+`path_context_single_native` removes a *reason* for one stage shape, not the
+arm. `.a?` remains a head no route can walk, so any construct placed after one
+still reaches its arm -- and the eager evaluator's structural arms
+(`Expr::Field`, `Expr::Pipe`, `Expr::Paren`, ...) run inside whatever does.
+Deleting an arm needs the `?` head and the fan-out head routed, not this list
+widened further.
+
 ## Result
 
-| Metric                                            | Before | After |
-|---------------------------------------------------|--------|-------|
-| Named handlers in `eval_stage_with_path_context`  | 43     | 43    |
-| ... proven REACHABLE by a live query               | --     | 43    |
-| ... proven UNREACHABLE                             | --     | 0     |
-| ... neither                                        | --     | 0     |
-| ... whose listed proof query moved off the gate    | --     | 14    |
-| `PINNED_ARM_COUNT`                                 | 43     | 43    |
+| Metric                                            | Before | After                 |
+|---------------------------------------------------|--------|-----------------------|
+| Named handlers in `eval_stage_with_path_context`  | 43     | 43                    |
+| ... proven REACHABLE by a live query               | --     | 43                    |
+| ... proven UNREACHABLE                             | --     | 0                     |
+| ... neither                                        | --     | 0                     |
+| ... whose listed proof query moved off the gate    | --     | 1 (#2473); 14 (#2472) |
+| `PINNED_ARM_COUNT`                                 | 43     | 43                    |
 
 Nothing is deletable at this point in the spine. Doors 2 and 3 are closed as
 of step 5, which is a precondition rather than a deletion: the eager evaluator
@@ -327,9 +414,19 @@ evaluator, with no second route to check.
   read without re-running would have claimed 14 deletable arms.
 - The `R2` cluster is now the *stage* shapes with no `owned_identity_rule`
   (`and`/`or`, `map`, `reduce`/`foreach`, `as`/`label`/`def`, the bounded
-  consumers) plus a bare `parent` operand. Those are what to migrate next for
-  this reason; widening the absent route again buys nothing, because it already
-  accepts every `rest` those stages are missing from.
+  consumers) plus a bare `parent` operand. #2473 gave `and`/`or` and
+  `reduce`/`foreach` native `eval_single` arms, which removes `R3` for them but
+  **not** `R2`: a native stage still hands over when the head can miss and no
+  route can name the position. Giving those stages an `owned_identity_rule` is
+  the remaining move for this reason; widening the absent route again buys
+  nothing, because it already accepts every `rest` those stages are missing
+  from.
+- **`?` at the head is now the single biggest source of `R2`.** It is excluded
+  from `path_context_is_navigational` on purpose (`?` in path context is not
+  `?` in a path expression), so `path_context_absent_split` finds an empty head
+  and declines, and the pipe goes eager whatever follows. Teaching the walk to
+  step `.a?` -- which means deciding what it does on a *scalar* input, where
+  `.a` errors and `.a?` yields nothing -- is what would empty that cluster.
 - The step-5 closure did *not* change what the sweep
   (`scripts/jq-path-context-oracle-sweep.sh`) sees for `file_index`. Its
   yq-mode cases run `succinctly yq FILTER one.yaml two.yaml` with no

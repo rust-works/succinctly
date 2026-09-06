@@ -2108,6 +2108,13 @@ fn test_arm_audit_proof_queries_are_unmoved_by_the_gate_2416() {
         (r".a[] | (key | length)", &["1"]),
         (r#".a? | [key] + ["x"]"#, &[r#"["a","x"]"#]),
         (r#".a? | (key + "x") | {z: .}"#, &[r#"{"z":"ax"}"#]),
+        // #2473's re-derived proof query, same precedent again: admitting
+        // `Expr::And`/`Expr::Or` to `path_context_single_native` moved A12's
+        // listed query (`.a.b | key == "b" and true`, just above) onto the
+        // generic route, so the audit re-derived one that still reaches the
+        // eager `Expr::And(..) | Expr::Or(..)` arm -- a `?` head, which no
+        // route can walk. Both spellings stay pinned.
+        (r#".a? | key == "a" and true"#, &["true"]),
     ];
     for (filter, expected) in rows {
         // `path + []` is the audit's H1 row spelled against `.a.b`.
@@ -2134,10 +2141,13 @@ fn test_arm_audit_proof_queries_are_unmoved_by_the_gate_2416() {
 ///
 /// Measured, not guessed: with the diversion instrumented, exactly these
 /// constructs got there, because `needs_path_context` deliberately does not
-/// recurse into `reduce`/`foreach`'s UPDATE and EXTRACT, into an assignment's
-/// right-hand side, or into `Expr::Object`'s entries -- so the enclosing
-/// program answers `false` and the inner pipe arrives with no routing
-/// decision made for it. The first four are `path_context_needs_eager ==
+/// recurse into `reduce`/`foreach`'s UPDATE and EXTRACT or into an
+/// assignment's right-hand side -- so the enclosing program answers `false`
+/// and the inner pipe arrives with no routing decision made for it.
+/// (`Expr::Object`'s entries were a third such construct when this was
+/// captured; #2473 gave `needs_path_context` an `Expr::Object` arm, so an
+/// object literal is routed like any other stage now and no longer arrives
+/// here undecided.) The first four are `path_context_needs_eager ==
 /// false` rows, i.e. the ones the door closure actually moves onto the
 /// generic evaluator.
 ///
