@@ -148,10 +148,28 @@ a: 1
 b: 1
 ```
 
-This is not a bug in the propagation pass — it is rule 4(a) applying to a second write shape
-that reaches the same unsound state `del(.a)` above does, discovered mechanically rather than
-special-cased: `enforce_anchor_soundness` runs unchanged afterwards and simply finds no
-`Declares` mark left for `x` to resolve either alias against.
+Discovered mechanically rather than special-cased: `enforce_anchor_soundness` runs
+unchanged afterwards and simply finds no `Declares` mark left for `x` to resolve either
+alias against.
+
+**Rule 4(b)**, on the same `propagate_assign_alias_marks` pass: a computed `value` side
+(`.c = (.b + 1)`) is not a static read of `.b`, so the pass leaves `.c` a plain scalar
+rather than aliasing it. Real yq does alias it, and the result is data loss — it prints
+`c: *x` but the value underneath is still `.b`'s own `1`, not the computed `2`:
+
+```bash
+$ printf 'a: &x 1\nb: *x\n' | yq '.c = (.b + 1)'
+a: &x 1
+b: *x
+c: *x
+$ printf 'a: &x 1\nb: *x\n' | yq '.c = (.b + 1)' | yq '.c'
+*x
+
+$ printf 'a: &x 1\nb: *x\n' | succinctly yq '.c = (.b + 1)'
+a: &x 1
+b: *x
+c: 2
+```
 
 A related, narrower gap sits in `select`/`if`'s condition-truthiness check
 (`push_generic_truthiness_cursor_error`, [src/jq/eval_generic.rs](../../../src/jq/eval_generic.rs)):

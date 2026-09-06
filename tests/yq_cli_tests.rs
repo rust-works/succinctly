@@ -25209,6 +25209,122 @@ fn test_yaml_assign_alias_onto_anchor_drops_both_2497() -> Result<()> {
     let (json, exit_code) = run_yq_stdin(".a = .b", input, &["-o=json", "-I=0"])?;
     assert_eq!(exit_code, 0);
     assert_eq!(json.trim(), r#"{"a":1,"b":1}"#, "values unchanged");
+
+    // Container variant: real yq's node-copy bug is identical here -- it
+    // prints `a: *x\nb: *x\n`, an alias with no `&x` anywhere (verified
+    // against the pinned binary), not the flow-style object either name
+    // ever held. succinctly drops both marks the same way as the scalar
+    // case, but because it never replaces `.a`'s own `CommentTree` node
+    // wholesale (only its `anchor` field), `.a` keeps the flow style its
+    // *own* pristine node carried (`{p: 1}`); `.b` was always an alias
+    // syntactically and never had a container style of its own to keep, so
+    // it falls back to the emitter's default block style once its mark is
+    // gone.
+    let input = "a: &x {p: 1}\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".a = .b", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: {p: 1}\nb:\n  p: 1\n");
+
+    let (round_tripped, exit_code) = run_yq_stdin(".", &output, &[])?;
+    assert_eq!(
+        exit_code, 0,
+        "succinctly must be able to re-read its own output"
+    );
+    assert_eq!(round_tripped, output);
+
+    let (json, exit_code) = run_yq_stdin(".a = .b", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(
+        json.trim(),
+        r#"{"a":{"p":1},"b":{"p":1}}"#,
+        "values unchanged"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_yaml_assign_from_alias_keeps_target_comment_2497() -> Result<()> {
+    // A plain `=` overwrites a go-yaml node's value in place, never the
+    // node itself -- so a target's own trailing comment survives an
+    // assignment that turns it into an alias, exactly as it survives any
+    // other scalar overwrite (`test_yaml_assign_to_anchor_keeps_anchor_
+    // and_alias_763` above). Verified against the pinned binary:
+    // `.c = .b` on `c: 2 # keep` prints `c: *x # keep`, not a bare `c: *x`.
+    let input = "a: &x 1\nb: *x\nc: 2 # keep\n";
+    let (output, exit_code) = run_yq_stdin(".c = .b", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: &x 1\nb: *x\nc: *x # keep\n");
+
+    let (json, exit_code) = run_yq_stdin(".c = .b", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(json.trim(), r#"{"a":1,"b":1,"c":1}"#, "values unchanged");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_assign_from_alias_through_passthrough_stages_2497() -> Result<()> {
+    // A pass-through stage (`.`, `select(true)`, `del(.z)`, a leading `.`)
+    // sitting next to a `.c = .b` assign in the same pipe must not block
+    // the mark propagation -- `collect_assign_chain` skips stages that
+    // aren't a plain `=` rather than bailing out of the whole pipe.
+    let input = "a: &x 1\nb: *x\nz: 9\n";
+    for (filter, expected) in [
+        (".c = .b | .", "a: &x 1\nb: *x\nz: 9\nc: *x\n"),
+        (".c = .b | select(true)", "a: &x 1\nb: *x\nz: 9\nc: *x\n"),
+        ("del(.z) | .c = .b", "a: &x 1\nb: *x\nc: *x\n"),
+        (". | .c = .b", "a: &x 1\nb: *x\nz: 9\nc: *x\n"),
+    ] {
+        let (output, exit_code) = run_yq_stdin(filter, input, &[])?;
+        assert_eq!(exit_code, 0, "filter: {filter}");
+        assert_eq!(output, expected, "filter: {filter}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_yaml_later_plain_assign_clears_alias_mark_2497() -> Result<()> {
+    // A plain `=` always replaces the target's node wholesale, so a stale
+    // `Aliases` mark must not survive a later overwrite just because the
+    // new value happens to render the same -- whether the mark came from
+    // an earlier stage in the same chain (`.c = .b | .c = 1`, `.c = .b |
+    // .c = .a`) or from the target's own pristine value (`.b = 1`, `.b =
+    // .a` on `b: *x`, where the literal/anchor-read RHS both happen to
+    // equal the value `.b` already aliased to). All four print a plain
+    // scalar in real yq.
+    let input = "a: &x 1\nb: *x\n";
+    for (filter, expected, expected_json) in [
+        (
+            ".c = .b | .c = 1",
+            "a: &x 1\nb: *x\nc: 1\n",
+            r#"{"a":1,"b":1,"c":1}"#,
+        ),
+        (
+            ".c = .b | .c = .a",
+            "a: &x 1\nb: *x\nc: 1\n",
+            r#"{"a":1,"b":1,"c":1}"#,
+        ),
+        (".b = 1", "a: &x 1\nb: 1\n", r#"{"a":1,"b":1}"#),
+        (".b = .a", "a: &x 1\nb: 1\n", r#"{"a":1,"b":1}"#),
+    ] {
+        let (output, exit_code) = run_yq_stdin(filter, input, &[])?;
+        assert_eq!(exit_code, 0, "filter: {filter}");
+        assert_eq!(output, expected, "filter: {filter}");
+
+        let (json, exit_code) = run_yq_stdin(filter, input, &["-o=json", "-I=0"])?;
+        assert_eq!(exit_code, 0, "filter: {filter}");
+        assert_eq!(
+            json.trim(),
+            expected_json,
+            "values unchanged, filter: {filter}"
+        );
+    }
+
+    // `.a = 5`: a `Declares` mark, unlike `Aliases`, is never cleared by
+    // this pass -- the anchor's own identity survives a value-only
+    // overwrite, matching real yq.
+    let (output, exit_code) = run_yq_stdin(".a = 5", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: &x 5\nb: *x\n");
     Ok(())
 }
 
