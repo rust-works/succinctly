@@ -13130,55 +13130,25 @@ enum AbsentRestRoute {
 /// evaluator itself: `rest` is evaluated from the walked *node*, so an eager
 /// evaluation of it would materialize a document re-rooted there and answer
 /// `key`/`path` against the wrong root. The identity route has no such
-/// requirement -- it evaluates `rest` itself, from a position it carries --
-/// which is exactly why it reaches the shapes decision 6 declines.
+/// requirement -- it evaluates `rest` itself, from a position it carries.
+///
+/// Until #2495, this also required `owned_identity_escapes_are_carried`: a
+/// computed bracket or `getpath` in `rest` lost a `halt`/`break` mid-stream
+/// and dropped a step's already-produced outputs on a later component's own
+/// error, both gaps in `owned_identity_values`/`eval_owned_identity_pipe`
+/// rather than anything specific to the absent route. Both are fixed now
+/// (`owned_identity_values` hands back its collected prefix *alongside* an
+/// escape instead of discarding it, and every `owned_identity_*` caller
+/// delivers that prefix before reporting the escape), so the decline is
+/// gone and `owned_identity_pipe_supported` alone decides.
 fn path_context_absent_rest_route(rest: &[Expr]) -> Option<AbsentRestRoute> {
     if path_context_absent_stages_resolvable(rest) && !path_context_needs_eager(rest) {
         return Some(AbsentRestRoute::Constants);
     }
-    if owned_identity_pipe_supported(rest) && owned_identity_escapes_are_carried(rest) {
+    if owned_identity_pipe_supported(rest) {
         return Some(AbsentRestRoute::OwnedIdentity);
     }
     None
-}
-
-/// Whether every *navigation* stage of `rest` carries an escape, and an
-/// already-emitted prefix, out of the owned identity pipe the way the eager
-/// route this replaces does.
-///
-/// Two gaps say no for a computed bracket or `getpath`, and only for those:
-/// [`owned_identity_values`] folds every non-error escape into "no more
-/// values" (so `[.a | .[halt_error] | key]` would exit 0 instead of 5), and
-/// [`eval_owned_identity_pipe`]'s navigation arm drops the outputs a step
-/// produced before it failed (so `.arr | .[(0,"a")] | key` would lose the
-/// `0` the first component answered). Every other navigation stage -- `.c`,
-/// `.[0]`, `.[]`, a literal slice -- has no sub-expression to escape from,
-/// and a computed bracket *inside* a ruled stage (`[.[halt]]`,
-/// `select(.[halt])`) is evaluated by `eval_each_owned`, which returns a
-/// `Flow` and carries both.
-///
-/// This is a refusal, not a fix: the same two gaps are live on the owned
-/// identity pipe's own route (`owned_identity_pipe_applies`), where they
-/// predate this one. Widening the absent route is not the place to close
-/// them, so a pipe that would newly meet them stays exactly where it was.
-///
-/// The recursion mirrors [`owned_identity_nav_supported`]'s -- `?`, `(..)`
-/// and a nested pipe are the only wrappers a navigation stage has -- so a
-/// shape admitted there is inspected here.
-fn owned_identity_escapes_are_carried(stages: &[Expr]) -> bool {
-    stages.iter().all(owned_identity_stage_escapes_are_carried)
-}
-
-/// [`owned_identity_escapes_are_carried`] for one stage.
-fn owned_identity_stage_escapes_are_carried(expr: &Expr) -> bool {
-    match strip_parens(expr) {
-        Expr::IndexExpr { .. } | Expr::SliceExpr { .. } | Expr::Builtin(Builtin::GetPath(_)) => {
-            false
-        }
-        Expr::Optional(inner) => owned_identity_stage_escapes_are_carried(inner),
-        Expr::Pipe(exprs) => exprs.iter().all(owned_identity_stage_escapes_are_carried),
-        _ => true,
-    }
 }
 
 /// The [`OwnedIdentity`] of an absent position (#2472).
@@ -15428,7 +15398,7 @@ fn owned_identity_step<S: EvalSemantics, V: DocumentValue>(
     id: &OwnedIdentity<V>,
     optional: bool,
     out: &mut Vec<(OwnedValue, OwnedIdentity<V>)>,
-) -> Result<(), EvalError> {
+) -> Result<(), Control> {
     match expr {
         Expr::Identity => {
             out.push((value.clone(), id.clone()));
@@ -15451,7 +15421,17 @@ fn owned_identity_step<S: EvalSemantics, V: DocumentValue>(
             for stage in exprs {
                 let mut next = Vec::new();
                 for (v, vid) in &current {
-                    owned_identity_step::<S, V>(stage, v, vid, optional, &mut next)?;
+                    // #2495: whatever `next` already holds for earlier
+                    // branches of `current` is real output, so it is
+                    // flushed into `out` before this stage's escape is
+                    // reported -- the same "deliver the prefix, then the
+                    // escape" rule this function's other arms follow.
+                    if let Err(control) =
+                        owned_identity_step::<S, V>(stage, v, vid, optional, &mut next)
+                    {
+                        out.extend(next);
+                        return Err(control);
+                    }
                 }
                 current = next;
             }
@@ -15464,7 +15444,7 @@ fn owned_identity_step<S: EvalSemantics, V: DocumentValue>(
             start_key,
             end_key,
         } => {
-            let values = owned_identity_values::<S>(expr, value, optional)?;
+            let (values, control) = owned_identity_values::<S>(expr, value, optional);
             if S::TAG == EvalTag::Yq {
                 out.extend(values.into_iter().map(|v| (v, id.clone())));
             } else {
@@ -15477,20 +15457,20 @@ fn owned_identity_step<S: EvalSemantics, V: DocumentValue>(
                         .map(|v| (v, id.child(&parent, component.clone()))),
                 );
             }
-            Ok(())
+            control.map_or(Ok(()), Err)
         }
         Expr::Field(name) => {
-            let values = owned_identity_values::<S>(expr, value, optional)?;
+            let (values, control) = owned_identity_values::<S>(expr, value, optional);
             let parent = Rc::new(value.clone());
             out.extend(
                 values
                     .into_iter()
                     .map(|v| (v, id.child(&parent, OwnedValue::String(name.clone())))),
             );
-            Ok(())
+            control.map_or(Ok(()), Err)
         }
         Expr::Index { idx, key } => {
-            let values = owned_identity_values::<S>(expr, value, optional)?;
+            let (values, control) = owned_identity_values::<S>(expr, value, optional);
             let mut component = index_component_value(*idx, key.as_ref());
             if let Some(elements) = value.as_array() {
                 if *idx < 0 && S::TAG == EvalTag::Yq {
@@ -15506,10 +15486,10 @@ fn owned_identity_step<S: EvalSemantics, V: DocumentValue>(
                     .into_iter()
                     .map(|v| (v, id.child(&parent, component.clone()))),
             );
-            Ok(())
+            control.map_or(Ok(()), Err)
         }
         Expr::Iterate => {
-            let values = owned_identity_values::<S>(expr, value, optional)?;
+            let (values, control) = owned_identity_values::<S>(expr, value, optional);
             let parent = Rc::new(value.clone());
             let components: Vec<OwnedValue> = match value {
                 OwnedValue::Array(items) => (0..items.len())
@@ -15530,7 +15510,7 @@ fn owned_identity_step<S: EvalSemantics, V: DocumentValue>(
                     .zip(components)
                     .map(|(v, component)| (v, id.child(&parent, component))),
             );
-            Ok(())
+            control.map_or(Ok(()), Err)
         }
         Expr::IndexExpr { .. } | Expr::SliceExpr { .. } => {
             owned_identity_computed_step::<S, V>(expr, value, id, false, optional, out)
@@ -15595,7 +15575,7 @@ fn owned_identity_computed_step<S: EvalSemantics, V: DocumentValue>(
     bracket_optional: bool,
     optional: bool,
     out: &mut Vec<(OwnedValue, OwnedIdentity<V>)>,
-) -> Result<(), EvalError> {
+) -> Result<(), Control> {
     // `bracket_optional` reproduces the `E[K]?` spelling exactly, so the
     // suppression the values see is the one the value evaluator applies.
     let wrap = |node: Expr| -> Expr {
@@ -15607,42 +15587,92 @@ fn owned_identity_computed_step<S: EvalSemantics, V: DocumentValue>(
     };
     match expr {
         Expr::IndexExpr { target, key } => {
-            let key_expr = owned_identity_resolve_component::<S, V>(key, id)?;
-            let keys = owned_identity_values::<S>(&key_expr, value, optional)?;
-            let values = owned_identity_values::<S>(
-                &wrap(Expr::IndexExpr {
-                    target: target.clone(),
-                    key: Box::new(key_expr),
-                }),
-                value,
-                optional,
-            )?;
+            let key_expr =
+                owned_identity_resolve_component::<S, V>(key, id).map_err(Control::Error)?;
+            let (keys, keys_control) = owned_identity_values::<S>(&key_expr, value, optional);
+            // #2495: re-running `key_expr` a second time to compute
+            // `values` (the pre-fix shape of this arm) doubles any side
+            // effect it has of its own -- `halt_error`/`debug`/`stderr`
+            // inside a computed bracket would fire twice for one logical
+            // evaluation. `owned_value_to_expr_literal` lets the *already*
+            // -computed `keys` stand in for a second run wherever every one
+            // of them round-trips through a `Literal` cleanly (every
+            // ordinary key does); only a key with no faithful `Literal` --
+            // an array or object, which can never index anything anyway --
+            // falls back to the original expression, where a second run is
+            // harmless (indexing errors, plain values, have no visible
+            // side effect to double). And when the key stream itself
+            // escaped (`keys_control` is `Some`), there is nothing left to
+            // index -- jq's own key-outer/target-inner model means the
+            // value stream never runs past where the key stream stopped --
+            // so `values` is skipped outright rather than re-evaluating
+            // `key_expr` a second time just to hit the same escape again.
+            let (values, values_control) = if keys_control.is_some() || keys.is_empty() {
+                (Vec::new(), None)
+            } else if let Some(literals) = keys
+                .iter()
+                .map(owned_value_to_expr_literal)
+                .collect::<Option<Vec<_>>>()
+            {
+                let value_key_expr = if let [only] = literals.as_slice() {
+                    Expr::Literal(only.clone())
+                } else {
+                    Expr::Comma(literals.into_iter().map(Expr::Literal).collect())
+                };
+                owned_identity_values::<S>(
+                    &wrap(Expr::IndexExpr {
+                        target: target.clone(),
+                        key: Box::new(value_key_expr),
+                    }),
+                    value,
+                    optional,
+                )
+            } else {
+                owned_identity_values::<S>(
+                    &wrap(Expr::IndexExpr {
+                        target: target.clone(),
+                        key: Box::new(key_expr),
+                    }),
+                    value,
+                    optional,
+                )
+            };
+            let control = combine_owned_identity_controls(keys_control, values_control);
             let Some((target_value, target_id)) =
-                owned_identity_operand::<S, V>(target, value, id, optional)?
+                owned_identity_operand::<S, V>(target, value, id, optional)
+                    .map_err(Control::Error)?
             else {
-                return Ok(());
+                return control.map_or(Ok(()), Err);
             };
             let parent = Rc::new(target_value.clone());
             // Zipped, like the sibling `Expr::Iterate` arm: the owned
             // evaluator yields exactly one value per key, and a mismatch
             // means the indexing raised or was suppressed, in which case the
-            // surplus components are unused.
+            // surplus components are unused. #2495: `out` gets every pair
+            // that zipped successfully *before* `control` is checked, so a
+            // key/value stream's own escape (a `halt` inside the key, a
+            // later key's indexing error) reaches the caller alongside
+            // whatever already zipped, not instead of it.
             for (v, k) in values.into_iter().zip(keys) {
                 let component = owned_index_component::<S>(&target_value, k);
                 out.push((v, target_id.child(&parent, component)));
             }
-            Ok(())
+            control.map_or(Ok(()), Err)
         }
         Expr::SliceExpr { target, start, end } => {
             let start_expr = match start {
-                Some(e) => Some(owned_identity_resolve_component::<S, V>(e, id)?),
+                Some(e) => {
+                    Some(owned_identity_resolve_component::<S, V>(e, id).map_err(Control::Error)?)
+                }
                 None => None,
             };
             let end_expr = match end {
-                Some(e) => Some(owned_identity_resolve_component::<S, V>(e, id)?),
+                Some(e) => {
+                    Some(owned_identity_resolve_component::<S, V>(e, id).map_err(Control::Error)?)
+                }
                 None => None,
             };
-            let values = owned_identity_values::<S>(
+            let (values, values_control) = owned_identity_values::<S>(
                 &wrap(Expr::SliceExpr {
                     target: target.clone(),
                     start: start_expr.clone().map(Box::new),
@@ -15650,24 +15680,25 @@ fn owned_identity_computed_step<S: EvalSemantics, V: DocumentValue>(
                 }),
                 value,
                 optional,
-            )?;
+            );
             let Some((target_value, target_id)) =
-                owned_identity_operand::<S, V>(target, value, id, optional)?
+                owned_identity_operand::<S, V>(target, value, id, optional)
+                    .map_err(Control::Error)?
             else {
-                return Ok(());
+                return values_control.map_or(Ok(()), Err);
             };
             if S::TAG == EvalTag::Yq {
                 out.extend(values.into_iter().map(|v| (v, target_id.clone())));
-                return Ok(());
+                return values_control.map_or(Ok(()), Err);
             }
-            let bound = |e: &Option<Expr>| -> Result<Vec<OwnedValue>, EvalError> {
+            let bound = |e: &Option<Expr>| -> (Vec<OwnedValue>, Option<Control>) {
                 match e {
                     Some(e) => owned_identity_values::<S>(e, value, optional),
-                    None => Ok(vec![OwnedValue::Null]),
+                    None => (vec![OwnedValue::Null], None),
                 }
             };
-            let starts = bound(&start_expr)?;
-            let ends = bound(&end_expr)?;
+            let (starts, starts_control) = bound(&start_expr);
+            let (ends, ends_control) = bound(&end_expr);
             let parent = Rc::new(target_value.clone());
             // `S` outer, `T` middle, `E` inner -- jq's own desugaring, which
             // is also the order the value evaluator emits in (confirmed
@@ -15680,7 +15711,11 @@ fn owned_identity_computed_step<S: EvalSemantics, V: DocumentValue>(
             for (v, component) in values.into_iter().zip(components) {
                 out.push((v, target_id.child(&parent, component)));
             }
-            Ok(())
+            let control = combine_owned_identity_controls(
+                combine_owned_identity_controls(values_control, starts_control),
+                ends_control,
+            );
+            control.map_or(Ok(()), Err)
         }
         other => unreachable!("not a computed navigation step: {other:?}"),
     }
@@ -15718,14 +15753,15 @@ fn owned_identity_getpath_step<S: EvalSemantics, V: DocumentValue>(
     id: &OwnedIdentity<V>,
     optional: bool,
     out: &mut Vec<(OwnedValue, OwnedIdentity<V>)>,
-) -> Result<(), EvalError> {
-    let path_expr = owned_identity_resolve_component::<S, V>(path_expr, id)?;
-    let paths = owned_identity_values::<S>(&path_expr, value, optional)?;
-    let values = owned_identity_values::<S>(
+) -> Result<(), Control> {
+    let path_expr =
+        owned_identity_resolve_component::<S, V>(path_expr, id).map_err(Control::Error)?;
+    let (paths, paths_control) = owned_identity_values::<S>(&path_expr, value, optional);
+    let (values, values_control) = owned_identity_values::<S>(
         &Expr::Builtin(Builtin::GetPath(Box::new(path_expr))),
         value,
         optional,
-    )?;
+    );
     // Zipped for the same reason the `Expr::IndexExpr` arm above is: a
     // non-array argument raises in the owned evaluator, which is where that
     // error text lives, and the surplus components are then unused.
@@ -15742,7 +15778,10 @@ fn owned_identity_getpath_step<S: EvalSemantics, V: DocumentValue>(
         }
         out.push((v, current_id));
     }
-    Ok(())
+    // #2495: `out` is populated with every pair that zipped successfully
+    // *before* this checks for an escape, so a `paths`/`values` control
+    // reaches the caller alongside the prefix rather than instead of it.
+    combine_owned_identity_controls(paths_control, values_control).map_or(Ok(()), Err)
 }
 
 /// The value at one path component of an owned container, or `null` -- the
@@ -15762,26 +15801,83 @@ fn owned_child_at(value: &OwnedValue, component: &OwnedValue) -> OwnedValue {
     }
 }
 
-/// Every output of `expr` over `value` in the ordinary owned evaluator.
+/// Every output of `expr` over `value` in the ordinary owned evaluator,
+/// plus the escape (if any) that ended the stream early.
+///
+/// Unlike this function's pre-#2495 `Result<Vec<OwnedValue>, EvalError>`
+/// shape, an escape does not discard `values`: `eval_each_owned` already
+/// pushes each output to the sink *before* signalling `Flow::Escaped` --
+/// the same "everything before it was already delivered" contract `Flow`'s
+/// own doc comment states -- so the prefix collected here is real output
+/// that must reach the caller alongside the escape, not vanish with it.
+/// Discarding it on any escape (folding `Halt`/`Break` into "no more
+/// values" same as plain exhaustion, and discarding a collected `Error`
+/// prefix together with the error) was the root cause of both of #2495's
+/// gaps: a `halt`/`break` inside a computed component disappearing
+/// entirely, and a value a step already answered being lost to a later
+/// component's own error.
 fn owned_identity_values<S: EvalSemantics>(
     expr: &Expr,
     value: &OwnedValue,
     optional: bool,
-) -> Result<Vec<OwnedValue>, EvalError> {
+) -> (Vec<OwnedValue>, Option<Control>) {
     let mut values = Vec::new();
-    match eval_each_owned::<S>(expr, value, optional, &mut |v| {
+    let flow = eval_each_owned::<S>(expr, value, optional, &mut |v| {
         values.push(v);
         Demand::Continue
-    }) {
-        Flow::Escaped(Control::Error(e)) => Err(e),
-        // A `break`/`halt` cannot come out of navigation; treat any other
-        // escape as "no more values" the way a collecting sink does.
-        _ => Ok(values),
+    });
+    match flow {
+        Flow::Escaped(control) => (values, Some(control)),
+        _ => (values, None),
+    }
+}
+
+/// Combines two navigation steps' optional escapes into the one the
+/// pipeline should report, per [`prefer_pending_control`]'s Halt >
+/// Error/Break > nothing ranking (#2495) -- used wherever a computed step
+/// evaluates two independent things that can each escape on their own
+/// (`.[K]`'s key and value streams, `.[S:T]`'s bounds and value stream,
+/// `getpath`'s path and value streams).
+fn combine_owned_identity_controls(a: Option<Control>, b: Option<Control>) -> Option<Control> {
+    match b {
+        Some(c) => prefer_pending_control(a, c),
+        None => a,
+    }
+}
+
+/// `v` as an `Expr::Literal`, or `None` for a value `Literal` cannot spell
+/// (`Array`/`Object`) -- used by [`owned_identity_computed_step`]'s
+/// `IndexExpr` arm (#2495) to stand an already-computed key back in for a
+/// second evaluation of its source expression, so a side-effecting key
+/// (`halt_error`, `debug`) fires once rather than once per use.
+fn owned_value_to_expr_literal(v: &OwnedValue) -> Option<Literal> {
+    match v {
+        OwnedValue::Null => Some(Literal::Null),
+        OwnedValue::Bool(b) => Some(Literal::Bool(*b)),
+        OwnedValue::Int(i) => Some(Literal::Int(*i)),
+        OwnedValue::Float(f) => Some(Literal::Float(*f)),
+        OwnedValue::String(s) => Some(Literal::String(s.clone())),
+        OwnedValue::NumberLiteral(repr, text) => {
+            Some(Literal::NumberLiteral(*repr, text.to_string()))
+        }
+        OwnedValue::Array(_) | OwnedValue::Object(_) => None,
     }
 }
 
 /// The value and identity of an operand (`.`, a literal, single-output
 /// navigation) evaluated over `value`; `None` when it produced nothing.
+///
+/// Stays `Result<_, EvalError>` rather than joining `owned_identity_step`'s
+/// `Control`-carrying cluster (#2495): the grammar
+/// `owned_identity_operand_supported` admits here -- `.`, a literal, or
+/// single-output `Field`/`Index`/`Slice` navigation, and `?`/`(...)`/a pipe
+/// of the same -- has no builtin call anywhere in it, so evaluating one
+/// cannot itself invoke `break`/`halt`; only an ordinary navigation error
+/// (a decode failure, a malformed container) is actually reachable. The
+/// `Break`/`Halt` arms below exist only so a future grammar widening fails
+/// loudly here instead of silently losing the escape -- mirroring the
+/// pre-`Control` synthetic-error fallback `error.rs`'s own doc comment
+/// describes for `Break` (`EvalError::new("break $label not in label")`).
 fn owned_identity_operand<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     value: &OwnedValue,
@@ -15793,7 +15889,18 @@ fn owned_identity_operand<S: EvalSemantics, V: DocumentValue>(
         return Ok(Some((literal_to_owned(lit), OwnedIdentity::detached())));
     }
     let mut out = Vec::new();
-    owned_identity_step::<S, V>(expr, value, id, optional, &mut out)?;
+    match owned_identity_step::<S, V>(expr, value, id, optional, &mut out) {
+        Ok(()) => {}
+        Err(Control::Error(e)) => return Err(e),
+        Err(Control::Break(label)) => {
+            return Err(EvalError::new(format!("break ${label} not in label")))
+        }
+        Err(Control::Halt(code)) => {
+            return Err(EvalError::new(format!(
+                "internal error: unexpected halt({code}) evaluating an owned-identity operand"
+            )))
+        }
+    }
     Ok(out.into_iter().next())
 }
 
@@ -16227,10 +16334,21 @@ fn eval_owned_identity_pipe<S: EvalSemantics, V: DocumentValue>(
     };
     if owned_identity_nav_supported(stage) {
         let mut out = Vec::new();
-        if let Err(e) = owned_identity_step::<S, V>(stage, &value, &id, optional, &mut out) {
-            return Flow::Escaped(Control::Error(e));
+        let step_result = owned_identity_step::<S, V>(stage, &value, &id, optional, &mut out);
+        // #2495: `out` holds every pair this stage already produced,
+        // regardless of whether it went on to succeed or escape -- deliver
+        // that prefix through `rest`/`sink` first (the same "everything
+        // before it was already delivered" contract `Flow::Escaped` states
+        // elsewhere in this file), and only then report the stage's own
+        // escape, if it had one.
+        match continue_owned_identity_items::<S, V>(rest, out, optional, sink) {
+            Flow::Exhausted => {}
+            other => return other,
         }
-        return continue_owned_identity_items::<S, V>(rest, out, optional, sink);
+        return match step_result {
+            Ok(()) => Flow::Exhausted,
+            Err(control) => Flow::Escaped(control),
+        };
     }
     match strip_parens(stage) {
         // #2471: the emitted key keeps the node's position, flagged so a

@@ -38802,3 +38802,73 @@ fn test_jq_length_of_a_number_is_unaffected_2453() -> Result<()> {
 
     Ok(())
 }
+
+/// #2495: the jq-mode counterpart of
+/// `yq_cli_tests::test_owned_identity_pipe_carries_control_and_prefix_2495`
+/// -- see that test's own doc comment for the full mechanism (a shared
+/// `EvalSemantics`-generic fix in `src/jq/eval_generic.rs`, so both modes
+/// hit the identical `owned_identity_*` code).
+///
+/// `halt_error`'s own exit code (5) and message-on-stderr behavior are real
+/// jq, confirmed live against jq 1.7.1: `echo '{"b":1}' | jq halt_error`
+/// exits 5 and prints exactly `{"b":1}` to stderr, once. `key` itself has
+/// no real jq definition (`key/0 is not defined`) -- a succinctly
+/// extension -- so only the halt/prefix mechanics are oracle-verified here,
+/// not the exact filters as a whole. The prefix-preservation half is
+/// independently confirmed on real jq without `key` at all: `echo
+/// '[1,2,3]' | jq -c '.[(0,"a")]'` prints `1` then raises `Cannot index
+/// array with string "a"` at exit 5 (jq 1.7.1) -- `key` reports the first
+/// component's *index* (`0`) instead of jq's own *value* (`1`) for that
+/// same component, but the "prefix survives the later component's error"
+/// rule is the same one.
+#[test]
+fn test_owned_identity_pipe_carries_control_and_prefix_2495() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_stdin_streams("[.a | .[halt_error] | key]", r#"{"a":{"b":1}}"#, &["-c"])?;
+    assert_eq!(code, 5, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(
+        stdout, "",
+        "a halted computed-bracket key must emit nothing"
+    );
+    assert_eq!(
+        stderr.trim_end(),
+        r#"{"b":1}"#,
+        "halt_error's message must appear exactly once, not doubled by a second key evaluation"
+    );
+
+    let (stdout, stderr, code) =
+        run_jq_stdin_streams(".arr | .[(0,\"a\")] | key", r#"{"arr":[1,2,3]}"#, &["-c"])?;
+    assert_eq!(code, 5, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(
+        stdout.trim_end(),
+        "0",
+        "the first component's already-answered key must survive the second component's error"
+    );
+    assert!(
+        stderr.contains("Cannot index array with string \"a\""),
+        "stderr={stderr:?}"
+    );
+
+    // Same two shapes routed through `owned_identity_pipe_applies` itself
+    // (via an intervening `Keeps`-rule stage) rather than the absent-
+    // position route above.
+    let (stdout, stderr, code) = run_jq_stdin_streams(
+        "[.a | tostring | .[halt_error] | key]",
+        r#"{"a":{"b":1}}"#,
+        &["-c"],
+    )?;
+    assert_eq!(code, 5, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(stderr.trim_end(), r#"{"b":1}"#);
+
+    let (stdout, stderr, code) = run_jq_stdin_streams(
+        ".arr | sort | .[(0,\"a\")] | key",
+        r#"{"arr":[3,1,2]}"#,
+        &["-c"],
+    )?;
+    assert_eq!(code, 5, "stdout={stdout:?} stderr={stderr:?}");
+    assert_eq!(stdout.trim_end(), "0");
+    assert!(stderr.contains("Cannot index array with string \"a\""));
+
+    Ok(())
+}
