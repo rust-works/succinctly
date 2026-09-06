@@ -1691,6 +1691,15 @@ impl OwnedValue {
         self.number_repr().is_some()
     }
 
+    /// Whether this value is a number (any of [`Self::is_number`]'s three
+    /// representations) or a [`Self::Bool`] -- the two scalar kinds
+    /// `arith_add`'s yq-mode string-concatenation arm accepts on the
+    /// non-`String` side (#2507: `0 + "x"`/`true + "x"` both concatenate in
+    /// real yq, `[1,2] + "x"`/`{} + "x"` do not).
+    pub(crate) fn is_number_or_bool(&self) -> bool {
+        self.is_number() || matches!(self, Self::Bool(_))
+    }
+
     /// Get the type name of this value.
     pub fn type_name(&self) -> &'static str {
         match self {

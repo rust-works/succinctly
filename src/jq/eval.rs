@@ -526,6 +526,52 @@ pub(crate) fn yq_object_key_stringify<S: EvalSemantics>(key: &OwnedValue) -> Opt
     }
 }
 
+/// yq mode only (#2507): whether `+` mixing a string with a number or
+/// boolean, in either order, concatenates instead of raising jq's `<type>
+/// and <type> cannot be added`.
+///
+/// Real yq's `+` has no notion of "wrong type" for this pairing at all --
+/// the non-string side is converted to its string spelling and appended.
+/// Captured live against yq v4.53.3 (`-o=json -I0`, `-n`):
+///
+/// | filter              | real yq   | filter              | real yq   |
+/// |---------------------|-----------|----------------------|-----------|
+/// | `0 + "x"`            | `"0x"`    | `"x" + 0`            | `"x0"`    |
+/// | `1.5 + "x"`          | `"1.5x"`  | `"x" + 1.5`          | `"x1.5"`  |
+/// | `1.0 + "x"`          | `"1.0x"`  | `"x" + 1.0`          | `"x1.0"`  |
+/// | `1e100 + "x"`        | `"1e100x"`| `"x" + 1e100`        | `"x1e100"`|
+/// | `(0-5) + "x"`        | `"-5x"`   | `"x" + (0-5)`        | `"x-5"`   |
+/// | `true + "x"`         | `"truex"` | `"x" + true`         | `"xtrue"` |
+/// | `false + "x"`        | `"falsex"`| `"x" + false`        | `"xfalse"`|
+///
+/// The `1.0`/`1e100` rows are why this reuses [`owned_to_string`] (the same
+/// conversion `tostring`/string interpolation already use) rather than a
+/// fresh `format!("{}", ...)`: a `NumberLiteral`'s exact source spelling
+/// must survive into the concatenation, the same way it survives into
+/// `tostring`.
+///
+/// **Scoped to non-container scalars only** -- confirmed live that `"x" +
+/// [1,2]`/`{} + "x"`/`"x" + {}` all still raise (`!!seq () cannot be added
+/// to a !!str ()`, and the object-arm's own mirrored wording), and `[1,2] +
+/// "x"` is a *different*, already-implemented rule (`arith_add`'s
+/// `S::ARRAY_PLUS_APPENDS` arm, #1119) that appends the string as a single
+/// new array element rather than concatenating text. `-`/`*` were captured
+/// alongside for completeness and need no fix: every scalar/string mismatch
+/// for those two still raises in real yq too (`0 - "x"`, `"x" - 0`, `true -
+/// "x"`, `true * "x"`, ... all error live), so `arith_sub`/`arith_mul`'s
+/// existing catch-all error arms already agree with the oracle. jq 1.7.1
+/// raises unconditionally for every row in the table above, which is what
+/// succinctly reproduced in both modes before this fix.
+///
+/// One definition consulted by [`arith_add`], the single function both
+/// evaluators' arithmetic fan-outs already route through (`eval_generic`'s
+/// own arithmetic arms import and call `arith_combine` directly rather than
+/// hand-rolling a second `+`/`-`/`*`/`/`/`%` implementation) -- CLAUDE.md's
+/// "duplicated predicates diverge silently" (#106).
+pub(crate) fn yq_scalar_string_concat_is_ok<S: EvalSemantics>() -> bool {
+    S::TAG == EvalTag::Yq
+}
+
 /// yq mode only (#2483): an ordering comparison (`<`/`<=`/`>`/`>=`) against a
 /// **real** `null` operand -- as opposed to [`yq_empty_operand_output`]'s
 /// zero-*output* operand, a distinct "null-ish" category per that function's
@@ -6967,6 +7013,27 @@ fn arith_add<S: EvalSemantics>(
                 (OwnedValue::Float(a), OwnedValue::Float(b)) => Ok(OwnedValue::Float(a + b)),
                 _ => unreachable!("both operands already confirmed numeric by the guard above"),
             }
+        }
+        // #2507 (yq mode only): a string mixed with a number or boolean, in
+        // either order, concatenates by converting the scalar to its string
+        // spelling -- see `yq_scalar_string_concat_is_ok`'s own doc comment
+        // for the full captured matrix and why `owned_to_string` (not a bare
+        // `format!`) is the right conversion here. Placed ahead of the
+        // final type-mismatch arm below, after every array/object/numeric
+        // arm above -- none of those match a `(String, scalar)`/`(scalar,
+        // String)` pairing, so ordering only matters against the catch-all.
+        (OwnedValue::String(mut s), other)
+            if yq_scalar_string_concat_is_ok::<S>() && other.is_number_or_bool() =>
+        {
+            s.push_str(&owned_to_string::<S>(&other));
+            Ok(OwnedValue::String(s))
+        }
+        (other, OwnedValue::String(s))
+            if yq_scalar_string_concat_is_ok::<S>() && other.is_number_or_bool() =>
+        {
+            let mut result = owned_to_string::<S>(&other);
+            result.push_str(&s);
+            Ok(OwnedValue::String(result))
         }
         // Type mismatch -- `left`/`right` are still the *original*,
         // uncollapsed operands here (the guard above never fires, so
