@@ -1739,6 +1739,31 @@ fn test_walk_vs_bridge_path_context_parity_2416() {
             ".a.zz | first(key)",
             ".a.zz | try (key) catch \"e\"",
             ".a.zz.yy | [path, parent]",
+            // #2558: `?` over navigation is a walkable head now, so the
+            // walk takes shapes that used to reach the bridge only. Both
+            // routes still have to answer them identically -- including the
+            // ones where the `?` actually suppresses (`.[0]?` on a mapping
+            // in jq mode, `.a?` on the array document).
+            ".a? | key",
+            ".a? | path",
+            ".a? | parent",
+            ".a?.b | key",
+            "(.a?) | key",
+            ".a? | [key, path]",
+            ".a? | (key, path)",
+            ".a?[] | key",
+            ".a[]? | key",
+            "[.a?[] | key]",
+            ".a? | select(key == \"a\")",
+            ".a? | select(true) | key",
+            ".a.zz? | key",
+            ".a.zz? | path",
+            ".a.zz? | [path, parent]",
+            ".d[9]? | key",
+            ".[0]? | key",
+            ".a? | key | tostring",
+            ".a? | first(key)",
+            ".a? | try (key) catch \"e\"",
         ] {
             assert_walk_bridge_parity(doc, filter);
         }
@@ -2091,9 +2116,12 @@ fn test_arm_audit_proof_queries_are_unmoved_by_the_gate_2416() {
         // fourteen rows' listed queries off the eager evaluator, so the
         // audit re-derived one apiece. Both spellings stay pinned, which is
         // what makes the move readable as "same outputs, different route".
-        // `?` is the reliable R2 head now: `path_context_is_navigational`
-        // excludes it, so the absent split's head stops before it and there
-        // is no position to route.
+        // `?` was the reliable R2 head when these were derived, because
+        // `path_context_is_navigational` excluded it. #2558 admitted it, so
+        // these rows now run on the walk, the absent route or the owned
+        // identity pipe -- their *outputs* are unchanged, which is the whole
+        // point of keeping them pinned, and the re-derived spellings that
+        // still reach each arm are at the end of this list.
         (r".a? | path + []", &[r#"["a"]"#]),
         (".a? | file_index + 1", &["1"]),
         (".a.b | (file_index | tostring)", &[r#""0""#]),
@@ -2115,6 +2143,32 @@ fn test_arm_audit_proof_queries_are_unmoved_by_the_gate_2416() {
         // eager `Expr::And(..) | Expr::Or(..)` arm -- a `?` head, which no
         // route can walk. Both spellings stay pinned.
         (r#".a? | key == "a" and true"#, &["true"]),
+        // #2558's re-derived proof queries, same precedent once more:
+        // `path_context_is_navigational` admits `?` over navigation now, so
+        // the nine rows whose listed query used a `?` head are routed rather
+        // than handed over -- the eight `?`-headed spellings just above and
+        // `.a? | key + "x"` further up all report no gate at all. The
+        // re-derivations keep the same *reason* (`R2`: a head that can miss
+        // and a stage no route can name a position for) with an `as` stage
+        // supplying the unroutable half instead of the `?`. Verified with
+        // the arms instrumented (2026-09-07, method in
+        // `docs/plan/path-context-arm-reachability.md`): `H1`, `H3`, `A12`,
+        // `A14`, `A21` and `A33` each fire on their row below, `H2` on the
+        // `.a.b | . as $x | key + "x"` row already present above, `A07` on
+        // its unchanged `.c[.n]? | key + 1`, and `A08` on the one `?` row
+        // here -- `?` over navigation is walkable, but a `?` head in front
+        // of a stage with no `owned_identity_rule` still lands on the eager
+        // evaluator's own `Expr::Optional` arm.
+        (r".a.b | . as $x | path + []", &[r#"["a","b"]"#]),
+        (r".a.b | . as $x | file_index + 1", &["1"]),
+        (r".a.b | . as $x | (key and parent)", &["true"]),
+        (r#".a.b | . as $x | (key + "x") | . == "bx""#, &["true"]),
+        (r#".a.b | . as $x | [key] + ["x"]"#, &[r#"["b","x"]"#]),
+        (
+            r#".a.b | . as $x | (key + "x") | {z: .}"#,
+            &[r#"{"z":"bx"}"#],
+        ),
+        (r".a? | . as $x | key", &[r#""a""#]),
     ];
     for (filter, expected) in rows {
         // `path + []` is the audit's H1 row spelled against `.a.b`.

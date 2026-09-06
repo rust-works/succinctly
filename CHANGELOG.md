@@ -21,6 +21,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inherited a walk that accepted `{"a" 1}`. Confirmed the YAML side doesn't
   move: the full comment/anchor/style corpus is byte-identical, since every
   new check is a no-op there by construction.
+- **An optional head (`.a? | key`, `.c[-1]? | path`) now reads path context
+  from the document node it stands on, instead of sending the whole pipe to
+  the eager path-context evaluator** (#2558, spine 2416).
+  `path_context_is_navigational` excluded `?`, so the absent split found an
+  empty head and declined, and `path_context_needs_eager` handed over whatever
+  followed. `?` over navigation moves the position exactly as the bare
+  navigation does and produces *no* position for the step it suppresses --
+  captured on a flow document and its block spelling from both pinned
+  oracles, which agree (`jq -c 'path(.s.b?)'` and `yq '.s.b? | key'` are both
+  empty; `yq '.[0]? | key'` on a mapping is `0` where jq suppresses the raise
+  to nothing). Two answers change and both move *towards* yq v4.53.3:
+  `.c[-1]? | key` on `c: [10, 20]` is `1`, the resolved index, where it used
+  to be `-1` (the index as written, which is jq mode's rule, not yq's), and
+  `.a? | .b = key` is `{"b":"a"}` where it used to be `{"b":1}` (the
+  assignment's right side had no position to read). `.c[-5]? | key` still
+  raises: a yq-mode negative index still negative after resolving, and a
+  string-decode failure, are the two errors `?` does not swallow.
 
 - **A stray `,` with zero real children in a *nested* container (`{"a": [,]}`,
   `{"a": {,}}`) now raises in two more materializers, matching real jq/yq**
