@@ -73,12 +73,46 @@ $ printf 'a: &x 1\nb: *x\n' | succinctly yq 'del(.a)'
 b: 1
 ```
 
-The equal-value clause also covers a genuine gap rather than papering over it: succinctly's
-alias sync is one-directional (anchor → aliases), so a write *through* an alias (`.b.p = 9`)
-updates only that position where real yq mutates the shared node. Emitting `*x` there would
-silently discard the write, so the mark is dropped and the computed value printed — rule
-4(b). True alias node identity remains unimplemented
-([#1351](https://github.com/rust-works/succinctly/issues/1351)).
+The equal-value clause is also the backstop for alias *node identity*
+([#1351](https://github.com/rust-works/succinctly/issues/1351)). Real yq treats `&x`/`*x` as
+one node: a write whose path passes *through* an alias and continues (`.b.p = 9` on `b: *x`)
+mutates the anchor's node and every position follows, while a path that ends exactly at the
+alias (`.b = 5`) rebinds that position only. succinctly's `jq::alias_identity` redirects such
+a through-path onto the anchor's own path before the write runs (transitively for an alias
+inside an anchored mapping that is itself aliased) and mirrors the result back into every
+alias slot that was still an untouched copy, so `b: *x` survives:
+
+```bash
+$ printf 'a: &x {p: 1, q: 2}\nb: *x\nc: *x\n' | succinctly yq '.b.p = 9'
+a: &x {p: 9, q: 2}
+b: *x
+c: *x
+$ printf 'a: &x {p: 1}\nb: *x\nc: *x\n' | succinctly yq -o=json -I=0 '.[] .p += 1'
+{"a":{"p":4},"b":{"p":4},"c":{"p":4}}        # three positions, one node: matches yq
+```
+
+The redirect is gated on *identity by equality*: it applies only while the alias position
+still holds the anchor's value, so a position rebound earlier in the pipe (`.b = 5 | .b.p =
+9`) is written positionally, as yq treats a rebound position. Two consequences are recorded
+divergences/limitations rather than matches:
+
+- **A value-producing update at an alias node is not discarded — rule 4(b).** Real yq
+  no-ops `.b |= . + 1`, `.b += 1`, `.b += [3]` and `.b |= . + {"r": 3}` at an alias node
+  (the document comes out unchanged) and errors on `.b |= reverse` / `.b |= keys` /
+  `.b *= {..}` (`node at path [b] is not an array (it's a )`). succinctly rebinds the
+  position with the computed value, consistent with `.b |= 5` (which yq also rebinds).
+  `.b |= (.p = 9)` and `.b |= del(.p)`, whose body is itself a write, mutate the shared node
+  in both tools.
+- **A declaration deleted earlier in the pipe leaves nothing to redirect to.**
+  `del(.a) | .b.p = 9` writes `b` positionally and `c` does not follow (yq prints `b: *x` /
+  `c: *x` with no `&x` anywhere — the unreadable-output case above). Likewise an alias
+  group's paths are recorded against the pristine document, so an array-shifting stage
+  ahead of the write (`del(.items[0]) | .items[0].n = 9`) leaves them one element off
+  ([#2501](https://github.com/rust-works/succinctly/issues/2501), the value-level twin of
+  #870).
+
+Wherever the redirect declines, the values differ and the equal-value clause drops the mark
+and prints the computed value, rather than emitting `*x` and discarding the write.
 
 A related, narrower gap sits in `select`/`if`'s condition-truthiness check
 (`push_generic_truthiness_cursor_error`, [src/jq/eval_generic.rs](../../../src/jq/eval_generic.rs)):
