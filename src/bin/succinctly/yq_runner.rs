@@ -25,7 +25,7 @@ use succinctly::jq::stream::StreamFailure;
 use succinctly::jq::{
     self, alias_identity, assert_value_tree_depth, is_alias_sensitive_assign,
     nesting_depth_exceeded_message, nonfinite_display_string, sync_aliased_paths, Builtin,
-    EvalError, Expr, NumberRepr, ObjectKey, OwnedValue, QueryResult, YqSemantics,
+    EvalError, Expr, Literal, NumberRepr, ObjectKey, OwnedValue, QueryResult, YqSemantics,
 };
 use succinctly::json::light::JsonCursor;
 use succinctly::json::JsonIndex;
@@ -1895,6 +1895,43 @@ struct WriteTarget {
 /// spelled with those two variants. [`Expr::Index`]'s `key` slot only
 /// carries a *spelling* for `path()` output; `idx` is what navigation —
 /// and therefore reconciliation — actually uses.
+/// The elements of an array literal's body: the parser stores `[a, b]` as
+/// `Array(Comma([a, b]))` and a one-element `[a]` as `Array(a)`.
+fn array_literal_items(inner: &Expr) -> Vec<&Expr> {
+    match inner {
+        Expr::Comma(items) => items.iter().collect(),
+        single => vec![single],
+    }
+}
+
+/// [`static_path_steps`] for a path spelled as an array literal of string
+/// and integer literals (`["arr", 0]`), the form `setpath`/`delpaths` take.
+fn literal_path_steps(expr: &Expr, out: &mut Vec<PathStep>) -> bool {
+    let Expr::Array(inner) = expr else {
+        return false;
+    };
+    array_literal_items(inner).iter().all(|item| match item {
+        Expr::Literal(Literal::String(key)) => {
+            out.push(PathStep::Key(key.clone()));
+            true
+        }
+        Expr::Literal(Literal::Int(idx)) => {
+            out.push(PathStep::Index(*idx));
+            true
+        }
+        // The parser keeps an integer literal's spelling (`NumberLiteral`,
+        // #1008); only a plain integer spelling names an index.
+        Expr::Literal(Literal::NumberLiteral(_, text)) => match text.parse::<i64>() {
+            Ok(idx) => {
+                out.push(PathStep::Index(idx));
+                true
+            }
+            Err(_) => false,
+        },
+        _ => false,
+    })
+}
+
 fn static_path_steps(expr: &Expr, out: &mut Vec<PathStep>) -> bool {
     match expr {
         Expr::Identity => true,
@@ -1920,7 +1957,8 @@ fn static_path_steps(expr: &Expr, out: &mut Vec<PathStep>) -> bool {
 /// while `.o = {"a": .o.a}` keeps it because that one is the original node
 /// arriving by a different route (both verified against yq v4.53.3).
 /// Provable closedness is the half of that distinction reachable without a
-/// shared-node value model (#1351).
+/// shared-node value model (#1351 closed the alias half of that model with a
+/// path redirect, not a shared node, so this half still stands alone).
 ///
 /// Deliberately one-directional: `true` means "certainly constructed", and
 /// anything not on this list answers `false` even when it happens to be
@@ -1997,6 +2035,47 @@ fn collect_write_targets(expr: &Expr) -> Option<Vec<WriteTarget>> {
             | Expr::CompoundAssign { path, .. }
             | Expr::AlternativeAssign { path, .. } => push(path, WriteKind::Set, false, out),
             Expr::Builtin(Builtin::Del(inner)) => push(inner, WriteKind::Del, false, out),
+            // `setpath(["a", 0]; v)` / `delpaths([["a", 0]])` name their
+            // paths as array literals (#1351 made both alias-sensitive, so
+            // they reach this walk). Only a literal path list is static; a
+            // computed one gives up the whole expression, as a computed
+            // `.[(.i)]` does above.
+            Expr::Builtin(Builtin::SetPath(path, value)) => {
+                let mut steps = Vec::new();
+                if !literal_path_steps(path, &mut steps) {
+                    return false;
+                }
+                out.push(WriteTarget {
+                    path: steps,
+                    kind: WriteKind::Set,
+                    fresh: is_closed_literal(value),
+                });
+                true
+            }
+            // Only a one-path list: yq applies `delpaths` sequentially (a
+            // second index resolves against the already-shortened array, so
+            // `[["arr",0],["arr",2]]` on three elements deletes one, verified
+            // live), which is not the simultaneous set `array_sources` models
+            // for `del(.a, .b)`; a longer list gives up as a non-static write.
+            Expr::Builtin(Builtin::DelPaths(paths)) => {
+                let Expr::Array(inner) = paths.as_ref() else {
+                    return false;
+                };
+                let items = array_literal_items(inner);
+                let [single] = items.as_slice() else {
+                    return false;
+                };
+                let mut steps = Vec::new();
+                if !literal_path_steps(single, &mut steps) {
+                    return false;
+                }
+                out.push(WriteTarget {
+                    path: steps,
+                    kind: WriteKind::Del,
+                    fresh: false,
+                });
+                true
+            }
             Expr::Identity
             | Expr::Builtin(
                 Builtin::Select(_) | Builtin::Empty | Builtin::Debug | Builtin::DebugMsg(_),
@@ -2335,8 +2414,9 @@ fn owned_value_align_hash(value: &OwnedValue) -> u64 {
 ///    children by value would let one key inherit a *different* key's
 ///    comment — the very misattribution #870 is about.
 ///
-/// Closing (1) and (2) properly needs the shared-node value model tracked
-/// by #1351 and #865.
+/// Closing (1) and (2) properly needs a node-identity model for the values
+/// themselves (#865; #1351's alias redirect gives anchors and aliases that
+/// identity, not arbitrary reshaped nodes).
 fn reconcile_presentation(
     pristine_value: &OwnedValue,
     pristine_tree: &CommentTree,
@@ -2586,14 +2666,15 @@ enum TreeStep<'a> {
 /// three in practice: `yq 'del(.a)'` on `a: &x 1\nb: *x` prints `b: *x`
 /// with no anchor left anywhere, and `yq` then rejects its own output with
 /// `unknown anchor 'x' referenced` (verified against the pinned binary).
-/// Rule 3 is also the backstop for the alias *value* model: since #1351 a
-/// write *through* an alias (`.b.p = 9`) is redirected onto the anchor's
+/// The rules are also the backstop for the alias *value* model: since #1351
+/// a write *through* an alias (`.b.p = 9`) is redirected onto the anchor's
 /// node (`jq::alias_identity`) and every alias slot follows, so the two
-/// sides agree and `b: *x` survives; wherever that redirect declines (the
-/// anchor was deleted earlier in the pipe, or a position was rebound and
-/// then written through) the values differ and the mark is dropped —
-/// printing `b: {p: 9}` (the value succinctly computed) instead of `b: *x`
-/// (which would discard the write entirely).
+/// sides agree and `b: *x` survives. Wherever that redirect declines, one of
+/// the rules drops the mark instead of letting `*x` discard the write: a
+/// position rebound and then written through no longer equals its anchor
+/// (rule 3), and an anchor deleted earlier in the pipe leaves no declaration
+/// at all (rule 1) — printing `b: {p: 9}` (the value succinctly computed)
+/// either way.
 ///
 /// Anchor *declarations* are never dropped: an unreferenced `&x` is valid
 /// YAML and real `yq` keeps it (`yq 'del(.b)'` still prints `a: &x 1`).

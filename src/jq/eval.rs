@@ -664,8 +664,8 @@ pub(crate) mod yq_read_only_context {
 #[cfg(feature = "std")]
 pub mod alias_identity {
     use super::{
-        get_value_at_path, is_alias_sensitive_assign, push_path_components, set_value_at_path,
-        unwrap_path_component, vec_with_capacity, Expr, OwnedValue,
+        get_value_at_path, propagate_anchor_writes, push_path_components, unwrap_path_component,
+        vec_with_capacity, Expr, OwnedValue,
     };
     use alloc::rc::Rc;
     use alloc::vec::Vec;
@@ -680,8 +680,8 @@ pub mod alias_identity {
     }
 
     impl AliasTable {
-        /// Build from `collect_alias_groups`'s output. Paths are plain
-        /// `String`/`Int` key sequences addressing the `OwnedValue` tree.
+        /// Builds a table from `collect_alias_groups`'s output. Paths are
+        /// plain `String`/`Int` key sequences addressing the `OwnedValue` tree.
         pub fn from_groups(groups: Vec<(Vec<OwnedValue>, Vec<Vec<OwnedValue>>)>) -> Self {
             Self { groups }
         }
@@ -742,7 +742,7 @@ pub mod alias_identity {
         }
     }
 
-    /// Install `table` for the caller's scope.
+    /// Installs `table` for the caller's scope.
     pub fn enter(table: AliasTable) -> Guard {
         let previous = TABLE.with(|t| t.borrow_mut().replace(Rc::new(table)));
         Guard(previous)
@@ -814,6 +814,21 @@ pub mod alias_identity {
         /// `del()`, whose single-path walker must not receive several
         /// paths and whose effect does not accumulate anyway.
         pub fan_out_iterate: bool,
+    }
+
+    impl Redirect {
+        /// `=`, compound/alternative assign, and `|=` with a value-producing
+        /// filter: through-writes only, iterates fanned out.
+        pub(crate) const THROUGH: Self = Self {
+            through_terminal: false,
+            fan_out_iterate: true,
+        };
+        /// `del()`, `setpath`, `delpaths`: through-writes only, one path in,
+        /// one path out.
+        pub(crate) const SINGLE: Self = Self {
+            through_terminal: false,
+            fan_out_iterate: false,
+        };
     }
 
     fn redirect_components(
@@ -915,14 +930,7 @@ pub mod alias_identity {
             return;
         };
         let mut paths = vec![rebuild(components)];
-        redirect_paths(
-            &mut paths,
-            doc,
-            Redirect {
-                through_terminal: false,
-                fan_out_iterate: false,
-            },
-        );
+        redirect_paths(&mut paths, doc, Redirect::SINGLE);
         let Some(redirected) = paths.pop() else {
             return;
         };
@@ -944,75 +952,27 @@ pub mod alias_identity {
 
     /// After one write expression has run, copy every anchor's new value into
     /// each alias slot that was still an untouched copy of that anchor before
-    /// the write, iterating to a fixpoint (bounded by the group count) so a
-    /// nested anchor's change reaches the outer anchor's aliases too. A slot
-    /// that was rebound earlier (`.b = 5 | .a.p = 9` keeps `b: 5`) or that no
-    /// longer resolves is never written.
+    /// the write -- see [`propagate_anchor_writes`], which this shares with
+    /// the CLI's end-of-pipe [`sync_aliased_paths`] so there is exactly one
+    /// propagation rule.
     ///
-    /// `pre` is the document the write expression started from — not the
-    /// pristine input of the whole pipe — which is what makes the "was a copy
+    /// `pre` is the document the write expression started from -- not the
+    /// pristine input of the whole pipe -- which is what makes the "was a copy
     /// before this write" test exact mid-pipe.
     pub(crate) fn mirror_after_write(pre: &OwnedValue, post: &mut OwnedValue) {
-        with_table(|table| {
-            // Per alias slot, the value it must still hold to be written:
-            // its pre-write value if that was a copy of the anchor's
-            // pre-write value, updated to whatever this pass writes.
-            let mut expected: Vec<Vec<Option<OwnedValue>>> = table
-                .groups
-                .iter()
-                .map(|(def, aliases)| {
-                    let def_pre = get_value_at_path(pre, def);
-                    aliases
-                        .iter()
-                        .map(|alias| {
-                            get_value_at_path(pre, alias).filter(|v| Some(v) == def_pre.as_ref())
-                        })
-                        .collect()
-                })
-                .collect();
-            for _ in 0..table.groups.len() {
-                let mut changed = false;
-                for (g, (def, aliases)) in table.groups.iter().enumerate() {
-                    let Some(new) = get_value_at_path(post, def) else {
-                        continue;
-                    };
-                    for (a, alias) in aliases.iter().enumerate() {
-                        let Some(want) = expected[g][a].as_ref() else {
-                            continue;
-                        };
-                        if *want == new {
-                            continue;
-                        }
-                        if get_value_at_path(post, alias).as_ref() != Some(want) {
-                            continue;
-                        }
-                        if let Ok(updated) = set_value_at_path(post.clone(), alias, new.clone()) {
-                            *post = updated;
-                            expected[g][a] = Some(new.clone());
-                            changed = true;
-                        }
-                    }
-                }
-                if !changed {
-                    break;
-                }
-            }
-        });
-    }
-
-    /// `|=`'s terminal rule needs the same "is this filter a shape-preserving
-    /// write" answer the CLI's alias-sync gate uses; re-exported here so both
-    /// read one definition.
-    pub(crate) fn update_filter_writes_through(filter: &Expr) -> bool {
-        is_alias_sensitive_assign(filter)
+        with_table(|table| propagate_anchor_writes(pre, post, &table.groups));
     }
 }
 
+/// `no_std` stand-in for the ambient alias-identity table: there is no
+/// thread-local to install one in, so nothing is ever active and every hook
+/// is a no-op (same limitation as `yq_read_only_context`).
 #[cfg(not(feature = "std"))]
 pub mod alias_identity {
     use super::{Expr, OwnedValue};
     use alloc::vec::Vec;
 
+    /// Always `false`: no table can be installed without `std`.
     pub fn active() -> bool {
         false
     }
@@ -1023,15 +983,22 @@ pub mod alias_identity {
         pub fan_out_iterate: bool,
     }
 
+    impl Redirect {
+        pub(crate) const THROUGH: Self = Self {
+            through_terminal: false,
+            fan_out_iterate: true,
+        };
+        pub(crate) const SINGLE: Self = Self {
+            through_terminal: false,
+            fan_out_iterate: false,
+        };
+    }
+
     pub(crate) fn redirect_paths(_paths: &mut Vec<Expr>, _doc: &OwnedValue, _opts: Redirect) {}
 
     pub(crate) fn redirect_concrete_path(_path: &mut Vec<OwnedValue>, _doc: &OwnedValue) {}
 
     pub(crate) fn mirror_after_write(_pre: &OwnedValue, _post: &mut OwnedValue) {}
-
-    pub(crate) fn update_filter_writes_through(_filter: &Expr) -> bool {
-        false
-    }
 }
 
 /// Whether `expr` is itself an assignment-family write: `.path = value`,
@@ -20323,14 +20290,7 @@ fn yq_assign_noop_check<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // #1351: a path descending through an alias position is the anchor's
     // own path -- redirect before the no-op classification so the check
     // and the write below agree on where the write lands.
-    alias_identity::redirect_paths(
-        &mut paths,
-        &pristine,
-        alias_identity::Redirect {
-            through_terminal: false,
-            fan_out_iterate: true,
-        },
-    );
+    alias_identity::redirect_paths(&mut paths, &pristine, alias_identity::Redirect::THROUGH);
     // Classified once per path and reused for both the total-noop and
     // rhs-unused decisions below, instead of walking each path twice via
     // separately-called `yq_assign_is_total_noop`/`yq_assign_rhs_unused`
@@ -20488,10 +20448,7 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             alias_identity::redirect_paths(
                 &mut paths,
                 &pristine,
-                alias_identity::Redirect {
-                    through_terminal: false,
-                    fan_out_iterate: true,
-                },
+                alias_identity::Redirect::THROUGH,
             );
             (pristine, paths)
         }
@@ -20592,7 +20549,7 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         &mut paths,
         &result,
         alias_identity::Redirect {
-            through_terminal: alias_identity::update_filter_writes_through(filter_expr),
+            through_terminal: is_alias_sensitive_assign(filter_expr),
             fan_out_iterate: true,
         },
     );
@@ -21040,14 +20997,7 @@ fn eval_update_multi<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // data-loss bug succinctly does not reproduce, rule 4(b)); one whose path
     // passes through an alias lands on the shared node.
     let mut paths = paths;
-    alias_identity::redirect_paths(
-        &mut paths,
-        &pristine,
-        alias_identity::Redirect {
-            through_terminal: false,
-            fan_out_iterate: true,
-        },
-    );
+    alias_identity::redirect_paths(&mut paths, &pristine, alias_identity::Redirect::THROUGH);
 
     fork_rhs_over_paths::<W, _>(
         pristine,
@@ -39375,45 +39325,99 @@ fn set_value_at_path(
     }
 }
 
+/// Copy every anchor's post-write value into each alias slot that was still
+/// an untouched copy of that anchor before the write (#711, #1351, #2498,
+/// #2499).
+///
+/// `groups` is `(anchor definition path, [alias paths...])` as
+/// `collect_alias_groups` builds it from the pristine document; `pre` and
+/// `post` are the document before and after one write (a single write
+/// expression for [`alias_identity::mirror_after_write`], the whole pipe for
+/// [`sync_aliased_paths`]). For each group whose anchor changed, an alias slot
+/// is overwritten only while its current value equals the value it held in
+/// `pre` *and* that value was the anchor's own `pre` value -- i.e. it is
+/// still the unmodified copy the alias resolved to. A slot that some earlier
+/// stage rebound (`.b = null | .a.p = 9` keeps `b: null`, #2499), deleted, or
+/// that no longer resolves is never written or autovivified. The group loop
+/// repeats until a pass writes nothing, bounded by the group count, so a
+/// nested anchor's change reaches the outer anchor's aliases whatever order
+/// the groups were collected in (#2498); a slot this function has just
+/// written is tracked as the new expected value, which is what lets the next
+/// pass update it again.
+fn propagate_anchor_writes(
+    pre: &OwnedValue,
+    post: &mut OwnedValue,
+    groups: &[(Vec<OwnedValue>, Vec<Vec<OwnedValue>>)],
+) {
+    // Per alias slot, the value it must still hold to be written: its
+    // pre-write value if that was a copy of the anchor's pre-write value,
+    // updated to whatever a pass writes.
+    let mut expected: Vec<Vec<Option<OwnedValue>>> = groups
+        .iter()
+        .map(|(def, aliases)| {
+            let def_pre = get_value_at_path(pre, def);
+            aliases
+                .iter()
+                .map(|alias| get_value_at_path(pre, alias).filter(|v| Some(v) == def_pre.as_ref()))
+                .collect()
+        })
+        .collect();
+    for _ in 0..groups.len() {
+        let mut changed = false;
+        for (g, (def, aliases)) in groups.iter().enumerate() {
+            let Some(new) = get_value_at_path(post, def) else {
+                continue;
+            };
+            for (a, alias) in aliases.iter().enumerate() {
+                let Some(want) = expected[g][a].as_ref() else {
+                    continue;
+                };
+                if *want == new {
+                    continue;
+                }
+                if get_value_at_path(post, alias).as_ref() != Some(want) {
+                    continue;
+                }
+                if let Ok(updated) = set_value_at_path(post.clone(), alias, new.clone()) {
+                    *post = updated;
+                    expected[g][a] = Some(new.clone());
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
 /// Propagate a write through a YAML anchor to every alias sharing it (#711).
 ///
 /// YAML anchor/alias pairs are the same node in the representation graph: a
 /// write through the anchor's own path must be visible through every alias
 /// that points to it, matching real `yq`. `OwnedValue` itself has no notion
-/// of shared identity, so this is applied as a post-process instead: `groups`
-/// is a list of `(anchor_definition_path, [alias_paths...])` pairs, computed
-/// by the caller from the pre-mutation document. For each group, if the
-/// value at the definition path differs between `pristine` (before the
-/// write) and `result` (after), every alias path is overwritten with a clone
-/// of the new value.
+/// of shared identity, so this is applied as a post-process over the whole
+/// pipe: `groups` is a list of `(anchor_definition_path, [alias_paths...])`
+/// pairs, computed by the caller from the pre-mutation document, and
+/// `pristine` is that document. The rule itself lives in
+/// [`propagate_anchor_writes`], shared with the per-write mirror the
+/// evaluator runs while an [`alias_identity`] table is installed (#1351) --
+/// after which this end-of-pipe pass finds nothing left to do. It stays as
+/// the one propagation step for callers that evaluate without the table.
 ///
 /// A group whose definition path no longer resolves in `result` (e.g. the
 /// anchored key was deleted) is left untouched, so its aliases keep their
 /// last-resolved value -- matching how a detached graph node behaves in real
-/// yq. Likewise, a write that lands on an alias path directly rather than
-/// the anchor's own path leaves every other member of the group alone, since
-/// the anchor's own value never changed.
+/// yq. A write that lands on an alias path directly rather than the anchor's
+/// own path leaves every other member of the group alone, since the anchor's
+/// own value never changed, and that rebound slot is itself never overwritten
+/// by a later anchor write (#2499).
 pub fn sync_aliased_paths(
     result: &mut OwnedValue,
     pristine: &OwnedValue,
     groups: &[(Vec<OwnedValue>, Vec<Vec<OwnedValue>>)],
 ) {
-    for (def_path, alias_paths) in groups {
-        let (Some(old), Some(new)) = (
-            get_value_at_path(pristine, def_path),
-            get_value_at_path(result, def_path),
-        ) else {
-            continue;
-        };
-        if old == new {
-            continue;
-        }
-        for alias_path in alias_paths {
-            if let Ok(updated) = set_value_at_path(result.clone(), alias_path, new.clone()) {
-                *result = updated;
-            }
-        }
-    }
+    propagate_anchor_writes(pristine, result, groups);
 }
 
 /// Builtin: setpath(path; value) - set value at path
@@ -41115,10 +41119,7 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // #1351: pre-write snapshot for the alias mirror, only while a table is
     // installed (never in jq mode).
     let del_pre = alias_identity::active().then(|| result.clone());
-    let del_redirect = alias_identity::Redirect {
-        through_terminal: false,
-        fan_out_iterate: false,
-    };
+    let del_redirect = alias_identity::Redirect::SINGLE;
 
     // yq's comma-grouped chained-slice del() pre-rewrite (#1223):
     // `resolve_dynamic_indexes`'s own generic navigation raises a hard type
@@ -84952,10 +84953,7 @@ mod tests {
             paths.iter().map(steps).collect()
         }
 
-        const THROUGH: alias_identity::Redirect = alias_identity::Redirect {
-            through_terminal: false,
-            fan_out_iterate: true,
-        };
+        const THROUGH: alias_identity::Redirect = alias_identity::Redirect::THROUGH;
 
         #[test]
         fn nothing_installed_is_a_no_op() {
@@ -85007,10 +85005,7 @@ mod tests {
                 redirected(".[].p", &doc, THROUGH),
                 vec![vec!["a", "p"], vec!["a", "p"], vec!["a", "p"]]
             );
-            let no_fan = alias_identity::Redirect {
-                through_terminal: false,
-                fan_out_iterate: false,
-            };
+            let no_fan = alias_identity::Redirect::SINGLE;
             assert_eq!(redirected(".[].p", &doc, no_fan), vec![vec!["[]", "p"]]);
             // No alias lives under `.a`, so its iterate is left to the walker.
             assert_eq!(
@@ -85046,6 +85041,47 @@ mod tests {
             assert_eq!(
                 redirected(".l[7].k", &doc, THROUGH),
                 vec![vec!["l", "7", "k"]]
+            );
+        }
+
+        #[test]
+        fn non_static_steps_stop_the_walk_and_odd_shapes_pass_through() {
+            let _guard = alias_identity::enter(table());
+            let doc = json(DOC);
+            // The root path has no components at all.
+            assert_eq!(redirected(".", &doc, THROUGH), vec![Vec::<String>::new()]);
+            // `.b` redirects first; the index step against the mapping at
+            // `.a` cannot be normalised, so the rest is left as written.
+            assert_eq!(
+                redirected(".b[0].p", &doc, THROUGH),
+                vec![vec!["a", "0", "p"]]
+            );
+            // A slice is never part of the static prefix.
+            assert_eq!(
+                steps(&{
+                    let mut paths = vec![parse(".b[0:1].p").unwrap()];
+                    alias_identity::redirect_paths(&mut paths, &doc, THROUGH);
+                    paths.pop().unwrap()
+                })
+                .len(),
+                3
+            );
+            // `.[]?` fans out like `.[]`, keeping the `?` on each element.
+            assert_eq!(
+                redirected(".[]?.p", &doc, THROUGH),
+                vec![vec!["a", "p"], vec!["a", "p"], vec!["a", "p"]]
+            );
+            // An alias recorded under a prefix that no longer holds a
+            // container: nothing to fan out over, the iterate is left alone.
+            let doc = json(r#"{"a":{"p":1,"q":2},"b":7,"c":{"p":1,"q":2}}"#);
+            let odd = alias_identity::AliasTable::from_groups(vec![(
+                path(&["a"]),
+                vec![path(&["b", "0"])],
+            )]);
+            let _inner = alias_identity::enter(odd);
+            assert_eq!(
+                redirected(".b[].p", &doc, THROUGH),
+                vec![vec!["b", "[]", "p"]]
             );
         }
 
