@@ -48,9 +48,9 @@ use super::eval::{
     slice_object_as_yq_children, slice_owned_value_read, streams_escaped_generator_prefix,
     substitute_bound_var, substitute_vars, suppress_or_raise, suppresses, tonumber_from_str,
     vec_with_capacity, yq_absent_key_read_is_empty, yq_empty_operand_output,
-    yq_negative_index_check, yq_numeric_index_on_object_is_null, yq_read_only_context,
-    BinaryFanoutRules, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
-    JqSemantics, LimitN, PathTrail, QueryResult, YqSemantics,
+    yq_negative_index_check, yq_numeric_index_on_object_is_null, yq_object_key_stringify,
+    yq_read_only_context, BinaryFanoutRules, Control, Demand, EmptyOperandOp, EvalError,
+    EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail, QueryResult, YqSemantics,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -12400,16 +12400,24 @@ fn build_object_entries_generic<S: EvalSemantics, V: DocumentValue>(
         let sole = sole && vals.len() == 1;
 
         for val in vals {
-            let OwnedValue::String(key_str) = &key else {
-                return Err(if optional {
-                    ObjectEscapeGeneric::Suppressed
-                } else {
-                    ObjectEscapeGeneric::Control(Control::Error(
-                        EvalError::cannot_use_as_object_key(&key),
-                    ))
-                });
+            // #2508 (yq mode): same rule as `eval::build_object_entries`'s
+            // own arm -- see `eval::yq_object_key_stringify`'s doc comment.
+            let key_str = match &key {
+                OwnedValue::String(s) => s.clone(),
+                _ => match yq_object_key_stringify::<S>(&key) {
+                    Some(s) => s,
+                    None => {
+                        return Err(if optional {
+                            ObjectEscapeGeneric::Suppressed
+                        } else {
+                            ObjectEscapeGeneric::Control(Control::Error(
+                                EvalError::cannot_use_as_object_key(&key),
+                            ))
+                        });
+                    }
+                },
             };
-            acc.push((key_str.clone(), val));
+            acc.push((key_str, val));
             let result =
                 build_object_entries_generic::<S, V>(rest, value, optional, cursor, sole, acc, out);
             acc.pop();
