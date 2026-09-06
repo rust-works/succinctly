@@ -983,13 +983,29 @@ pub fn to_owned_with_comments<V: DocumentValue>(
     value: &V,
     cursor: Option<&V::Cursor>,
 ) -> Result<(OwnedValue, CommentTree), EvalError> {
-    to_owned_with_comments_at_depth(value, cursor, 0)
+    to_owned_with_comments_at_depth(value, cursor, 0, false)
 }
 
+/// `under_alias`: whether some ancestor on the path from the root is itself
+/// an alias node -- i.e. whether the node currently being converted was
+/// only reached by resolving through a `YamlValue::Alias` to its target's
+/// own fields, rather than by walking the document's real tree shape.
+///
+/// Exists for #2500: `value.as_object()`/`as_array()` resolve straight
+/// through an alias to its target, so converting an alias node walks the
+/// *target*'s cursors for its children -- including any `&name` the target
+/// declares. Recording that declaration here would duplicate the one
+/// already recorded when the target's own (non-alias) position was
+/// converted, so a `Declares` mark found `under_alias` is dropped below.
+/// An `Aliases` mark found the same way is kept -- it's a genuine
+/// reference this document's writer still needs to resolve or drop on its
+/// own merits, e.g. `cfg: *base` nested inside an expanded `env: *env`
+/// copy must still round-trip as `*base`, not inline `base`'s value.
 fn to_owned_with_comments_at_depth<V: DocumentValue>(
     value: &V,
     cursor: Option<&V::Cursor>,
     depth: usize,
+    under_alias: bool,
 ) -> Result<(OwnedValue, CommentTree), EvalError> {
     assert_nesting_depth(depth);
     // The raw (`#`-prefixed) form, not the stripped `line_comment` builtin
@@ -1007,12 +1023,27 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
                 DocumentCursor::anchor(c).map(|name| AnchorMark::Declares(name.to_string()))
             })
     });
+    // Children (if any) are themselves `under_alias` when this node is --
+    // computed from `own_anchor` before #2500's `Declares` suppression
+    // below touches it, since suppression never changes whether *this*
+    // node is an alias.
+    let child_under_alias = under_alias || matches!(own_anchor, Some(AnchorMark::Aliases(_)));
+    // #2500: see this function's own doc comment above for why a
+    // `Declares` mark reached `under_alias` is not a source declaration --
+    // it's the anchor target's own mark, copied onto this alias-expanded
+    // position, and the document already carries the genuine one at the
+    // target's real (non-alias) position.
+    let own_anchor = if under_alias && matches!(own_anchor, Some(AnchorMark::Declares(_))) {
+        None
+    } else {
+        own_anchor
+    };
     let own_meta = NodeMeta {
         comment: own_comment,
         style: own_style,
         anchor: own_anchor,
     };
-    let (owned, tree) = if let Some(fields) = value.as_object() {
+    if let Some(fields) = value.as_object() {
         let mut map = IndexMap::new();
         let mut comment_map = IndexMap::new();
         let mut key_comment_map = IndexMap::new();
@@ -1046,6 +1077,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
                 &field.value,
                 Some(&field.value_cursor),
                 depth + 1,
+                child_under_alias,
             )?;
             map.insert(key.clone(), v);
             comment_map.insert(key.clone(), c);
@@ -1071,10 +1103,10 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
         if f.ends_unpaired() {
             return Err(f.malformed_member_error());
         }
-        (
+        Ok((
             OwnedValue::Object(map),
-            CommentTree::Object(own_meta.clone(), comment_map, key_comment_map),
-        )
+            CommentTree::Object(own_meta, comment_map, key_comment_map),
+        ))
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();
         let mut comment_items = Vec::new();
@@ -1083,51 +1115,30 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
         let mut elems = elements;
         while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
             let elem_value = elem_cursor.value();
-            let (v, c) =
-                to_owned_with_comments_at_depth(&elem_value, Some(&elem_cursor), depth + 1)?;
+            let (v, c) = to_owned_with_comments_at_depth(
+                &elem_value,
+                Some(&elem_cursor),
+                depth + 1,
+                child_under_alias,
+            )?;
             items.push(v);
             comment_items.push(c);
             elems = rest;
         }
-        (
+        Ok((
             OwnedValue::Array(items),
-            CommentTree::Array(own_meta.clone(), comment_items),
-        )
+            CommentTree::Array(own_meta, comment_items),
+        ))
     } else {
         // #2358: `value` is scalar here (the object/array arms above
         // return first), so `to_owned_at_depth`'s `cursor` parameter is
         // never consulted on this path either -- passed through from this
         // function's own parameter purely because it's already in scope,
         // not because it matters.
-        (
+        Ok((
             to_owned_at_depth(value, cursor, depth)?,
-            CommentTree::Leaf(own_meta.clone()),
-        )
-    };
-    // #2500: `value.as_object()`/`as_array()` resolve straight through a
-    // `YamlValue::Alias` to the anchor *target*'s fields, so the loops
-    // above -- when `value` is itself an alias node -- just walked the
-    // target's own cursors and built a full child `CommentTree` out of
-    // them, marks included. That copies the anchor's own `&name`
-    // declarations onto this alias position's subtree, where they sit
-    // dormant as long as the alias mark itself survives (the emitter
-    // checks `comments.alias_name()` before any value-shape dispatch and
-    // never descends into an aliased node's children at all) but
-    // resurface as a second, spurious declaration the moment a later
-    // write makes this position diverge from its anchor and
-    // `enforce_anchor_soundness` drops the `*name` mark, falling through
-    // to the ordinary container render.
-    //
-    // `owned` (the fully expanded value, needed everywhere downstream) is
-    // built above and left untouched; only the parallel comment tree is
-    // collapsed to a childless `Leaf` here, so a diverged alias renders
-    // its expanded copy with default style/no marks like any other
-    // computed subtree -- `CommentTree::field`/`at_index` already answer
-    // the empty tree for a `Leaf`'s "children".
-    if matches!(own_meta.anchor, Some(AnchorMark::Aliases(_))) {
-        Ok((owned, CommentTree::Leaf(own_meta)))
-    } else {
-        Ok((owned, tree))
+            CommentTree::Leaf(own_meta),
+        ))
     }
 }
 
@@ -23488,17 +23499,10 @@ mod tests {
         assert!(err.message.contains("Invalid JSON text"), "{err:?}");
     }
 
-    /// #2500: `value.as_object()`/`as_array()` resolve straight through a
-    /// `YamlValue::Alias` to the anchor target's own fields, so
-    /// `to_owned_with_comments_at_depth` used to recurse into those target
-    /// cursors and build a full child `CommentTree` for an alias position --
-    /// copying the anchor's own nested `&mark`s (here, `p`'s `&y`) onto the
-    /// alias node's subtree. The fix collapses an alias position's tree to a
-    /// childless `Leaf` carrying only its own `Aliases` mark: this asserts
-    /// that shape directly, independent of the write/render path the CLI
-    /// tests exercise end-to-end.
+    /// #2500: see `to_owned_with_comments_at_depth`'s own doc comment for
+    /// the `under_alias` mechanism this asserts directly.
     #[test]
-    fn test_to_owned_with_comments_alias_position_is_leaf_2500() {
+    fn test_to_owned_with_comments_alias_subtree_drops_copied_declares_2500() {
         use crate::yaml::YamlIndex;
 
         let yaml = b"a: &x\n  p: &y 1\n  q: *y\nb: *x\n";
@@ -23511,20 +23515,21 @@ mod tests {
 
         let (_owned, comments) = to_owned_with_comments(&value, Some(&mapping_cursor)).unwrap();
 
-        let b_tree = comments.field("b");
-        assert!(
-            matches!(
-                b_tree,
-                CommentTree::Leaf(NodeMeta {
-                    anchor: Some(AnchorMark::Aliases(name)),
-                    ..
-                }) if name == "x"
-            ),
-            "expected a childless Leaf carrying Aliases(\"x\"), got {b_tree:?}"
-        );
-        // A `Leaf`'s `field`/`at_index` fall back to the empty tree for any
-        // child -- confirming no nested `&y` mark survived underneath.
-        assert!(b_tree.field("p").anchor_mark().is_none());
+        // `.b` is an alias (`*x`) -- its own mark is kept...
+        assert!(matches!(
+            comments.field("b").anchor_mark(),
+            Some(AnchorMark::Aliases(name)) if name == "x"
+        ));
+        // ...but the `&y` declaration reached only by walking through `.b`'s
+        // expanded copy (`.b.p`) is the anchor target's own mark, already
+        // recorded at `.a.p`'s real position, so it must not survive here.
+        assert!(comments.field("b").field("p").declared_anchor().is_none());
+        // A nested *alias* found the same way is a genuine reference, not a
+        // copied declaration, so it is kept: `.b.q` still resolves to `*y`.
+        assert!(matches!(
+            comments.field("b").field("q").anchor_mark(),
+            Some(AnchorMark::Aliases(name)) if name == "y"
+        ));
     }
 
     /// `to_owned_key_shape`'s array/object branches (#626/#670/#903) are a
