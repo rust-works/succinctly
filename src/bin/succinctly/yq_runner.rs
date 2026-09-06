@@ -2844,7 +2844,12 @@ fn scan_anchor_soundness<'v, 'c>(
         // Spelled as a negated `matches!` rather than clippy's suggested
         // `is_none_or`, which is stable only since 1.82 and this crate's
         // MSRV is 1.73.
-        Some(AnchorMark::Aliases(name)) if !matches!(declared.get(name.as_str()), Some(d) if *d == value) =>
+        // `identical`, not `==` (#1360): jq value equality says `NaN` differs
+        // from itself, so an anchored `.nan` reported a divergence that never
+        // happened and lost its alias mark. It is also too loose in the other
+        // direction -- `Int(1) == Float(1.0)` -- and this gate is asking
+        // "would these render the same", not "are these jq-equal".
+        Some(AnchorMark::Aliases(name)) if !matches!(declared.get(name.as_str()), Some(d) if d.identical(value)) =>
         {
             unresolvable.push(path.clone());
         }
