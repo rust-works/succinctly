@@ -39400,7 +39400,7 @@ fn propagate_anchor_writes(
 /// pipe: `groups` is a list of `(anchor_definition_path, [alias_paths...])`
 /// pairs, computed by the caller from the pre-mutation document, and
 /// `pristine` is that document. The rule itself lives in
-/// [`propagate_anchor_writes`], shared with the per-write mirror the
+/// `propagate_anchor_writes` (private), shared with the per-write mirror the
 /// evaluator runs while an [`alias_identity`] table is installed (#1351) --
 /// after which this end-of-pipe pass finds nothing left to do. It stays as
 /// the one propagation step for callers that evaluate without the table.
