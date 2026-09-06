@@ -1839,6 +1839,33 @@ conclusion didn't: a function lacking its own checks by inspection can
 still be live-exploitable through a caller this investigation's own
 repro set didn't try.
 
+**Update (#2400): `owned_from_standard_json_at_depth`'s half re-checked with a wider net,
+this time confirmed structurally unreachable, not just "no live repro found yet".**
+#2349's own finding above ("a function lacking its own checks by inspection can still be
+live-exploitable through a caller this investigation's own repro set didn't try") made this
+half worth re-checking properly rather than leaving it on the same "not reproducible (so
+far)" footing #2349 turned out to be wrong about. Traced every live call site
+(`input`/`inputs`'s cursor-metadata-builtin bridge, and `query_result_to_generic`'s
+`path()`/`getpath`/`key`/`reduce`/`foreach` callers) and confirmed each one feeds this
+function bytes that are already clean by construction: `input`/`inputs` validates upfront
+in the input-reading pipeline before this function ever runs, and every other caller passes
+a fresh `to_json_for_reindex` re-serialization of an already-decoded `OwnedValue` -- text
+succinctly's own serializer produces, which by construction never carries a malformed
+delimiter. This is the structural difference from `push_generic_truthiness_cursor_error`'s
+real gap: that function walks the *original* document cursor directly, with no round-trip
+in between, so genuine source corruption reaches it; nothing here does. Recorded directly
+on the function (`src/jq/eval_generic.rs`) so a future re-check starts from "confirmed
+unreachable, here's why" rather than repeating this trace from scratch.
+
+The wider repro net used to check this did surface real jq divergences --
+`{"c":{"a":1,},"t":5} | .t as $x | $x` (also `reduce`/`foreach`, also
+`.t | path(.)`) answers `5`/`[]` where real jq's own eager, whole-document parser rejects
+the document outright before evaluation starts -- but these are the well-known,
+already-documented semi-indexing trade-off (`CLAUDE.md`'s "Semi-indexing performs minimal
+validation compared to full parsers" note): the query never touches the corrupted `.c` at
+all, so its being unvalidated is the intended lazy-validation behavior, not a gap in this
+function or any specific evaluator path. Not filed as a new issue on that basis.
+
 ## `has(key)`/`contains()` and `find()` get two more pre-existing gaps closed (#2288)
 
 Code review of #1995/PR #2287 found two further, unrelated gaps, both predating that PR:
