@@ -8157,6 +8157,16 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     match builtin {
         // Type functions
+        // #2516 (yq mode): `type` answers the YAML tag (`!!str`, `!!int`,
+        // `!!map`, ...), the same rule `Builtin::Tag` below already
+        // applies -- see `eval_generic::yq_type_tag`'s own doc comment for
+        // the full captured matrix (this "full"/no-cursor path can only
+        // ever answer one of the six built-in tags, never a custom one --
+        // that's `Builtin::Tag`'s own pre-existing, unconditional
+        // limitation here too, #1416).
+        Builtin::Type if S::TAG == EvalTag::Yq => {
+            QueryResult::Owned(OwnedValue::String(yaml_type_tag(&value).to_string()))
+        }
         Builtin::Type => {
             let type_name = match &value {
                 StandardJson::Null => "null",
@@ -23399,6 +23409,27 @@ fn owned_type_name(value: &OwnedValue) -> &'static str {
     }
 }
 
+/// [`yaml_type_tag`]'s `OwnedValue` counterpart (#2516), for the same
+/// six-tag no-custom-tag-info limitation that function's own doc comment
+/// explains -- an `OwnedValue` has no field for an explicit tag at all
+/// (#1416), so this is the untagged/implicit answer only. `eval_owned_pure`'s
+/// own `Builtin::Type` arm is the one caller.
+fn owned_yaml_type_tag(value: &OwnedValue) -> &'static str {
+    match value {
+        OwnedValue::Null => "!!null",
+        OwnedValue::Bool(_) => "!!bool",
+        OwnedValue::Int(_) => "!!int",
+        OwnedValue::Float(_) => "!!float",
+        OwnedValue::NumberLiteral(repr, _) => match repr {
+            NumberRepr::Int(_) => "!!int",
+            NumberRepr::Float(_) => "!!float",
+        },
+        OwnedValue::String(_) => "!!str",
+        OwnedValue::Array(_) => "!!seq",
+        OwnedValue::Object(_) => "!!map",
+    }
+}
+
 // =============================================================================
 // Computed keys in path expressions (#360)
 // =============================================================================
@@ -31458,8 +31489,17 @@ fn eval_owned_pure<S: EvalSemantics>(
         // `eval_builtin`'s `Builtin::Type` arm maps the cursor's own kind to
         // the same six names `owned_type_name` maps an `OwnedValue` to (its
         // seventh, `StandardJson::Error`, has no `OwnedValue` counterpart and
-        // cannot arise from a reindexed document).
-        Expr::Builtin(Builtin::Type) => Some(Ok(OwnedValue::String(owned_type_name(input).into()))),
+        // cannot arise from a reindexed document). #2516 (yq mode): the tag
+        // sibling `owned_yaml_type_tag`, same rule as `eval_builtin`'s own
+        // yq-mode `Builtin::Type` arm.
+        Expr::Builtin(Builtin::Type) => Some(Ok(OwnedValue::String(
+            if S::TAG == EvalTag::Yq {
+                owned_yaml_type_tag(input)
+            } else {
+                owned_type_name(input)
+            }
+            .into(),
+        ))),
         // Delegated rather than restated, so the navigation rules stay
         // single-sourced with the arms `eval_owned_fast_path_agrees_with_
         // index_object_by_name_and_index_array_by_position` already pins.

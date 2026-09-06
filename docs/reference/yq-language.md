@@ -97,6 +97,7 @@ These functions access YAML-specific metadata not available in JSON:
 | Function   | Description                        | Example Output                          |
 |------------|------------------------------------|-----------------------------------------|
 | `tag`      | YAML type tag                      | `!!str`, `!!int`, `!!map`               |
+| `type`     | Alias of `tag` in yq mode (#2516)  | `!!str`, `!!int`, `!!map`               |
 | `anchor`   | Anchor name for nodes with `&name` | `"myanchor"` or `""`                    |
 | `style`    | Scalar/collection style            | `"double"`, `"literal"`, `"flow"`       |
 | `kind`     | Node kind                          | `"scalar"`, `"seq"`, `"map"`, `"alias"` |
@@ -596,6 +597,7 @@ See [yq Remaining Work](../plan/yq-remaining.md) for incomplete features.
 4. **`--slurp`/`--eval-all` output has no comments** - both combine documents through the `OwnedValue` DOM (which carries no comment data) before evaluating, unlike the default per-document path
 5. **`--front-matter` position builtins use the extracted block's own coordinates** - `at_offset`, `at_position`, `line`, and `column` resolve against the extracted YAML slice, not the original file; a reported `line`/`column` is offset from the file's real line/column by the front-matter header's length
 6. **`--tab` output does not round-trip** - succinctly's own YAML reader (like the wider YAML 1.1/1.2 spec) forbids tab characters in indentation, so any nested `--tab` YAML output cannot be read back by `succinctly yq` itself, or by other spec-strict YAML parsers. Real yq v4.53.3 has no `--tab` flag at all (confirmed live: `unknown flag: --tab`), so this is a succinctly-only extension with no round-trip oracle to satisfy — it is write-only by design (#1684)
+7. **`type`/`tag` on an alias occurrence through a constructed array/object lose the alias distinction** (#2516) - real yq's `type`/`tag` answer `""` for an alias node (`*name`) rather than dereferencing to its target's tag, and succinctly matches that for a direct cursor-forwarded read (`.y | type`, `(.x, .y) | type`). Once the read goes through array/object *construction* (`[.x, .y] | map(type)`), succinctly's own construction step resets cursor/position context for its elements (the same reset `key`/`path` already get inside `{...}`/`[...]`, see note 3 above) before `type` ever runs, so the alias distinction is lost there and `type` answers the (dereferenced) tag instead of `""`. Real yq's own answer for that exact constructed shape happens to already be `""` for the alias element, so this specific combination is a residual divergence — captured in `tests/yq_cli_tests.rs`'s `test_yaml_explicit_tag_resolves_through_alias_903`
 
 ---
 
