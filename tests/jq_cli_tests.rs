@@ -38684,3 +38684,24 @@ fn test_jq_mode_update_zero_output_filter_still_deletes_2484() -> Result<()> {
     }
     Ok(())
 }
+
+/// #2471 (gate reason 1 of spine 2416): the jq-mode half of
+/// `yq_cli_tests::test_assignment_rhs_sees_the_input_position_2471` -- same
+/// extension caveat as the test above.
+#[test]
+fn test_assignment_rhs_sees_the_input_position_2471() -> Result<()> {
+    let input = r#"{"a":{"b":1,"e":2},"n":[1,2]}"#;
+    for (filter, expected) in [
+        (".a | .b = key", r#"{"b":"a","e":2}"#),
+        (".a | .b = path", r#"{"b":["a"],"e":2}"#),
+        (
+            ".a | to_entries | .[0] | .value = key",
+            r#"{"key":"b","value":0}"#,
+        ),
+    ] {
+        let (output, code) = run_jq_stdin(filter, input, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}`: {output:?}");
+        assert_eq!(output.trim_end(), expected, "`{filter}`");
+    }
+    Ok(())
+}

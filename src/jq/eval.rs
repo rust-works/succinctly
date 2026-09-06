@@ -1765,6 +1765,31 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         // for every element instead of resolving or erroring (#715
         // follow-up).
         Expr::Builtin(Builtin::Map(f)) => needs_path_context(f),
+        // `.b = key` (#2471, gate reason 1 of spine 2416): an assignment's
+        // right-hand side is evaluated against the assignment's own input --
+        // `eval_assign` hands it the same `value` the whole stage received --
+        // so a `key`/`path`/`file_index` in it needs the ambient position, the
+        // same reasoning `Expr::As` gives above. Captured from yq v4.53.3 on
+        // `a: {b: 1, e: 2}`: `.a | .b = key` is `{"b":"a","e":2}` and
+        // `.a | to_entries | .[0] | .value = key` is `{"key":"b","value":0}`,
+        // where succinctly left both untouched.
+        //
+        // The *left* side is deliberately excluded. It is a path expression,
+        // not a value one: `path_context_resolve_constants` rewrites a
+        // `parent` into an `Expr::TrackedVar` holding a whole materialized
+        // value, which is not a shape the assignment's path walker can take.
+        // A read reachable only through the left side (`.[key] = 1`) is
+        // therefore left where it was -- unrouted, and answered exactly as
+        // before -- rather than routed to a resolver that would refuse it.
+        //
+        // `Expr::Update`/`CompoundAssign`/`AlternativeAssign` are excluded for
+        // a different reason: their right side is evaluated against the value
+        // *at the path*, not against the stage's input, so it stands somewhere
+        // else entirely (yq v4.53.3: `.a | .b |= key` is `{"b":"b","e":2}`,
+        // where `.a | .b = key` is `{"b":"a","e":2}`). Admitting them here
+        // without a route that knows the target's position would resolve their
+        // reads against the wrong node.
+        Expr::Assign { value, .. } => needs_path_context(value),
         Expr::Pipe(exprs) => exprs.iter().any(needs_path_context),
         Expr::Paren(inner) => needs_path_context(inner),
         Expr::Optional(inner) => needs_path_context(inner),

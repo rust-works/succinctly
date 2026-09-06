@@ -12978,6 +12978,14 @@ fn path_context_resolvable(expr: &Expr, with_parent: bool) -> bool {
                     ObjectKey::Expr(key) => sub(key),
                 }
         }),
+        // #2471 (gate reason 1 of spine 2416): `eval_assign` evaluates an
+        // assignment's right-hand side against the same input the whole stage
+        // received, so a read inside it resolves against this position --
+        // exactly like `Expr::Object`'s value slots above. The left side is
+        // a *path* expression and is refused rather than rewritten, matching
+        // `needs_path_context`'s own arm (see its comment for why a
+        // `TrackedVar` cannot stand in a path).
+        Expr::Assign { path, value } => !needs_path_context(path) && sub(value),
         _ => false,
     }
 }
@@ -13398,6 +13406,13 @@ fn path_context_resolve_constants<S: EvalSemantics, V: DocumentValue>(
                 })
                 .collect::<Result<Vec<_>, EvalError>>()?,
         ),
+        // #2471: the rewriter's half of `path_context_resolvable`'s own
+        // `Expr::Assign` arm -- the right side only, the left one being
+        // refused there rather than rewritten.
+        Expr::Assign { path, value } => Expr::Assign {
+            path: path.clone(),
+            value: boxed(value)?,
+        },
         other => other.clone(),
     })
 }
@@ -24872,6 +24887,13 @@ mod tests {
         // owned identity pipe.
         assert!(!eager(".a | to_entries | .[(0,1)] | key"));
         assert!(!eager(".a | to_entries | .[(0,1)]? | path"));
+        // An assignment's right-hand side is a *constant* for a fixed
+        // position, so the pipe is answered before this gate is asked at
+        // all: `try_path_context_absent_sink` runs first and takes it, which
+        // is why the gate still reports `true` here and no marker fires in
+        // the eager evaluator for `.a.b | .c = key` (arm re-audit, #2471).
+        assert!(eager(".a.b | .c = key"));
+        assert!(path_context_absent_resolvable(&parse(".c = key").unwrap()));
         assert!(!eager(".a | to_entries | .[(0):(1)] | key"));
         assert!(!eager(".a | to_entries | .[(0):(1)]? | key"));
         assert!(!eager(".a | to_entries | .[.[0].key | length] | key"));
@@ -25099,6 +25121,14 @@ mod tests {
             "key | tostring",
             "select(true) | key",
             "(key)?",
+            // #2471 remainder: an assignment's right-hand side stands where
+            // the assignment's own input stands, so it resolves here like
+            // any other slot evaluated against the stage's input. The *left*
+            // side is refused rather than rewritten (a `TrackedVar` cannot
+            // stand in a path expression), which the third loop below pins.
+            ".c = key",
+            ".c = [key, path]",
+            ".c = file_index",
         ] {
             let expr = parse(filter).unwrap();
             assert!(
@@ -25119,6 +25149,22 @@ mod tests {
         // spell them -- as an `Expr::TrackedVar` around the ancestor's
         // value, not a literal -- so the second loop pins that the two
         // gates differ by `parent` and nothing else.
+        // #2471 remainder: a read reachable only through an assignment's
+        // *left* side is not routed at all -- `needs_path_context` stops at
+        // the right side, because there is no rewrite for a path expression
+        // (a `TrackedVar` holding a materialized ancestor is not a shape the
+        // assignment's path walker can take). The two gates above answer
+        // `true` for these trivially, having nothing to resolve, so
+        // `needs_path_context` is the assertion that carries the exclusion:
+        // pinned here so widening it to the left side without also giving
+        // the rewriter a story for that side fails loudly.
+        for filter in [".[key] = 1", ".[path[0]] = 1"] {
+            let expr = parse(filter).unwrap();
+            assert!(
+                !needs_path_context(&expr),
+                "`{filter}` reads only through a path expression; it must stay unrouted"
+            );
+        }
         for filter in ["parent", "parent(1)", "[path, parent]", "select(parent)"] {
             let expr = parse(filter).unwrap();
             assert!(
