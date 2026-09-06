@@ -119,11 +119,13 @@ consequences are recorded divergences/limitations rather than matches:
 Wherever the redirect declines, the values differ and the equal-value clause drops the mark
 and prints the computed value, rather than emitting `*x` and discarding the write.
 
-The redirect runs on the route that builds a `CommentTree` (stdout, `--split-exp`,
-`--front-matter`); `--inplace` and `--eval-all` evaluate without it, so `yq -i '.b.p = 9'`
-still writes `b` positionally and drops the marks — the value half of the
-[#1349](https://github.com/rust-works/succinctly/issues/1349) route gap. A multi-document
-stream applies the redirect and the anchor marks to the last document only
+The redirect runs wherever a write goes through `evaluate_yaml_cursor` — stdout,
+`--split-exp`, `--front-matter`, and since
+[#1349](https://github.com/rust-works/succinctly/issues/1349) `--inplace` too (`yq -i
+'.b.p = 9'` writes `a: &x {p: 9, q: 2}` / `b: *x` back to the file). `--eval-all`
+evaluates the collected documents without it, so `yq ea '.b.p = 9'` still writes `b`
+positionally and drops the marks. A multi-document stream applies the redirect and the
+anchor marks to the last document only
 ([#2520](https://github.com/rust-works/succinctly/issues/2520), pre-existing).
 
 A related, narrower gap sits in `select`/`if`'s condition-truthiness check
