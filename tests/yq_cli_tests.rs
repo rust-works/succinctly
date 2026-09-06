@@ -29971,7 +29971,7 @@ fn test_path_context_bypass_keeps_yq_float_fidelity_1909() -> Result<()> {
     // `10000000000000000000.0` materializes as a bare `Float` (not a
     // `NumberLiteral` — it is past what `is_preservable_float_literal`
     // keeps), which is exactly what `reindex_bridge_is_identity` refuses.
-    let (out, code) = run_yq_stdin("[path(..)]", doc, &["-o", "json", "-I0"])?;
+    let (out, code) = run_yq_stdin("[path(..)]", doc, &["--jq-extensions", "-o", "json", "-I0"])?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(
         out.trim(),
@@ -30084,7 +30084,7 @@ fn test_path_context_cursor_walk_composite_stages_2061() -> Result<()> {
         (".a|.|.b|key", AB, r#""b""#),
         (".a.b|.|parent|key", AB, r#""a""#),
     ] {
-        let (out, code) = run_yq_stdin(filter, input, &["-o", "json", "-I0"])?;
+        let (out, code) = run_yq_stdin(filter, input, &["--jq-extensions", "-o", "json", "-I0"])?;
         assert_eq!(code, 0, "`{filter}` on `{input}`: {out:?}");
         assert_eq!(out.trim(), want, "`{filter}` on `{input}`");
     }
@@ -30561,7 +30561,7 @@ fn fold_source_value_reuse_is_jq_mode_only_1872() -> Result<()> {
     let (_out, stderr, code) = run_yq_stdin_with_stderr(
         "path(foreach (.a.b) as $k (.; .))",
         "a: [1, 2]\n",
-        &["-o", "json"],
+        &["--jq-extensions", "-o", "json"],
     )?;
     assert_ne!(code, 0);
     assert!(
@@ -30574,7 +30574,7 @@ fn fold_source_value_reuse_is_jq_mode_only_1872() -> Result<()> {
     let (_out, stderr, code) = run_yq_stdin_with_stderr(
         "path(foreach (1,2,keys[]) as $k (.; .))",
         "a: 1\n",
-        &["-o", "json"],
+        &["--jq-extensions", "-o", "json"],
     )?;
     assert_ne!(code, 0);
     assert!(
@@ -30583,7 +30583,11 @@ fn fold_source_value_reuse_is_jq_mode_only_1872() -> Result<()> {
     );
 
     // A navigating source that resolves cleanly is unaffected either way.
-    let (out, code) = run_yq_stdin("path(reduce (.[]) as $k (.; .))", "a: 1\n", &["-o", "json"])?;
+    let (out, code) = run_yq_stdin(
+        "path(reduce (.[]) as $k (.; .))",
+        "a: 1\n",
+        &["--jq-extensions", "-o", "json"],
+    )?;
     assert_eq!(code, 0);
     assert_eq!(out.trim(), "[]");
 
@@ -30593,7 +30597,7 @@ fn fold_source_value_reuse_is_jq_mode_only_1872() -> Result<()> {
     let (_out, stderr, code) = run_yq_stdin_with_stderr(
         "path(foreach (1,2,(.a|tostring|halt_error(3))) as $k (.; .))",
         "a: 1\n",
-        &["-o", "json"],
+        &["--jq-extensions", "-o", "json"],
     )?;
     assert_eq!(code, 3, "stderr: {stderr}");
     assert_eq!(stderr, "1");
@@ -32129,12 +32133,11 @@ fn test_yq_iterate_path_context_non_container_is_noop_2346() -> Result<()> {
 
 /// #2346, `path_step_generic`: a distinct third `Expr::Iterate` site from
 /// the two above, backing `path(expr)`'s own cursor-native path-computation
-/// walk. `path` is a jq-only builtin succinctly does not gate behind
-/// `--jq-extensions` in yq mode (a separate, pre-existing gap, unrelated to
-/// this fix) -- reachable here without any extension flag.
+/// walk. `path(expr)` is jq-only surface, gated behind `--jq-extensions` in
+/// yq mode since #2430.
 #[test]
 fn test_yq_path_step_generic_non_container_is_noop_2346() -> Result<()> {
-    let (out, code) = run_yq_stdin("[path(.a[])]", "a: 5\n", &["-o", "json"])?;
+    let (out, code) = run_yq_stdin("[path(.a[])]", "a: 5\n", &["--jq-extensions", "-o", "json"])?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "[]");
     Ok(())
