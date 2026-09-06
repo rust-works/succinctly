@@ -340,12 +340,23 @@ Real yq's `sort_keys` diverges the same way when sorting would move an alias abo
 declaration — and succinctly's own `--sort-keys` currently *reproduces* that unsound output,
 because the soundness pass doesn't reach the streaming path (#1350). That is a bug against
 the rule, not a second exception to it, so the "never" above is the intent and #1350 is the
-one place it does not hold. The equal-value rule also contains a real gap rather than
-papering over it:
-succinctly's alias sync is one-directional (anchor → aliases), so a write *through* an
-alias (`.b.p = 9`) updates only `.b`, where yq mutates the shared node. Emitting `b: *x`
-there would silently discard the write, so the mark is dropped and the computed value
-printed instead. True alias node identity remains unimplemented.
+one place it does not hold.
+
+**A write through an alias reaches the shared node (#1351).** yq decides by *path shape*: a
+path that ends exactly at an alias (`.b = 5`, `.b |= 5`, `del(.b)`) rebinds that position;
+one that passes through it and continues (`.b.p = 9`, `del(.b.p)`, `.b[0] = 9`,
+`setpath(["b","p"]; 9)`) mutates the anchor's node, and every position follows. succinctly
+keeps its copy model and recovers this in `jq::alias_identity`: for an alias-sensitive write
+on an alias-bearing document, the write entry points redirect any resolved path whose proper
+prefix is an alias position onto the anchor's path (transitively, and only while the alias
+position still holds the anchor's value — a slot rebound earlier in the pipe is written
+positionally), then mirror the anchor's new value back into every alias slot that was still
+an untouched copy. Shared positions accumulate (`.[] .p += 1` over three positions is 4, as
+in yq). Two recorded divergences: yq silently *discards* a value-producing update at an
+alias node (`.b += 1`, `.b |= . + {..}`), which succinctly rebinds instead (rule 4(b)); and
+with the anchor deleted earlier in the pipe there is nothing to redirect to, so the write
+stays positional. The equal-value rule above is then the backstop: wherever the redirect
+declines, the values differ and the mark is dropped rather than discarding the write.
 
 ### jq Position-Based Navigation (succinctly extension)
 
