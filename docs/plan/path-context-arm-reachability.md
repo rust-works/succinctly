@@ -375,6 +375,76 @@ still reaches its arm -- and the eager evaluator's structural arms
 Deleting an arm needs the `?` head and the fan-out head routed, not this list
 widened further.
 
+## #2471 remainder: map-family bodies and an assignment's right side, and the pin still holds at 43
+
+The rest of [#2471](https://github.com/rust-works/succinctly/issues/2471) closed two
+shapes that were invisible to routing altogether, not merely handed to the eager
+evaluator: `needs_path_context` did not descend into a `map_values`/`with_entries`
+body, nor into an assignment's right-hand side, so no route was ever asked and
+`key`/`path` answered with nothing. Both now descend, and both have somewhere to go
+(ADR-0021 decision 7): an assignment's right side is a stage-wide constant, answered
+by the existing constant/identity rewrite; a map-family body is one position *per
+member*, answered by `eval_map_family_positioned` from the container's position plus
+the component.
+
+**`PINNED_ARM_COUNT` stays at 43,** and the argument is the same shape as #2471's own
+above. Re-run of the method with the five `R1` arms instrumented, each fed its proof
+query from the table (document `D`):
+
+| Id  | Proof query                                | Marker  | Output  |
+|-----|--------------------------------------------|---------|---------|
+| A04 | `.c[0:1] \| .[0] \| key + 1`                | fired   | `1`     |
+| A07 | `.c[.n]? \| key + 1`                        | fired   | `1`     |
+| A17 | `.a \| getpath(["b"]) \| . as $x \| key`    | fired   | `"b"`   |
+| A19 | `.c[.n] \| key + 1`                         | fired   | `1`     |
+| A20 | `.c[.n:.m] \| .[0] \| key + 1`              | fired   | `1`     |
+
+All five still fire with their pinned outputs, for the reason #2471's own section
+already gives: a computed bracket or a `getpath` at the *head* of a pipe is still a
+detaching stage with no `owned_identity_rule`, which this change does not touch.
+
+The two arms the change could plausibly have starved were instrumented in the same
+run, since the map-family stages used to reach the eager evaluator through them:
+
+| Id  | Proof query                | Marker  | Output    |
+|-----|----------------------------|---------|-----------|
+| A16 | `.a \| map(key + "x")`      | fired   | `["bx"]`  |
+| A18 | `.a[] \| (key \| length)`   | fired   | `1`       |
+
+`A16` (`Builtin::Map`) is deliberately kept reachable: a `map` over a *live* cursor is
+already exact on the eager route, so `path_context_needs_eager` admits only
+`map_values`/`with_entries` for a live head, and `map` reaches the positioned route
+only once its input has already left the cursor domain (`.a | to_entries | map(.value =
+key)`). Moving a correct answer to a new route buys nothing and risks something.
+
+The migration is real rather than nominal even so — with the same instrumentation,
+`.a | map_values(key)`, `.a | with_entries(.value = key)`, `.a | to_entries | map(.value
+= key)`, `.a | to_entries | map(key)`, `.a | map(key)` and `.a | .b = key` all fire *no*
+marker at all: none of them enters the eager evaluator any more. The instrumentation was
+reverted before this document was committed.
+
+### What the change is measured against
+
+A differential over 531 map-family and assignment queries (nine heads x three families
+x seventeen bodies, plus the assignment rows) on `a: {b: 1, e: 2}`, `n: [1, 2]`,
+`d: {x: {y: 3}, z: [4, 5]}`, `s: hi`, `u: null`, comparing the pre-change binary, the
+post-change binary and yq v4.53.3: **142 answers changed, 102 of them from disagreeing
+with yq to agreeing with it, and none the other way.** The remaining 40 are three
+pre-existing gaps this change makes *reachable* rather than causes, each demonstrable
+with no path context anywhere in the filter:
+
+- `map_values(select(...))` — real yq keeps a member whose filter produced nothing (its
+  zero-output update rule, #2484), succinctly drops it. `.a | map_values(select(. == 1))`
+  diverges identically. The new answer is strictly closer (`{"b":1}` where it was `{}`).
+- `with_entries(<body that is not an entry>)` — the body now produces a value where it
+  used to produce nothing, so `from_entries` refuses it. Real yq refuses too, with its own
+  wording, so the exit code now agrees where it previously did not.
+- `from_entries` on a non-string key — real yq stringifies (`.n | to_entries |
+  from_entries` is `{"0":1,"1":2}` in v4.53.3), succinctly raises `Cannot use number (0)
+  as object key` in both modes, matching jq 1.7.1. That refusal is now reachable from
+  `.a | with_entries(.key = key)`, which yq answers `{"0":1,"1":2}`. A separate yq
+  fidelity gap in `from_entries`, deliberately not fixed here.
+
 ## Result
 
 | Metric                                            | Before | After                 |
@@ -384,6 +454,7 @@ widened further.
 | ... proven UNREACHABLE                             | --     | 0                     |
 | ... neither                                        | --     | 0                     |
 | ... whose listed proof query moved off the gate    | --     | 1 (#2473); 14 (#2472) |
+| ... starved by #2471's remainder                   | --     | 0 (`A16`/`A18` re-run) |
 | `PINNED_ARM_COUNT`                                 | 43     | 43                    |
 
 Nothing is deletable at this point in the spine. Doors 2 and 3 are closed as
@@ -402,7 +473,9 @@ evaluator, with no second route to check.
   their literal-bound siblings (`Expr::Index`, `Expr::Slice` with folded bounds)
   are navigational. #2471 (section above) took the *owned-domain* half of that
   cluster and left all five arms reachable: what remains is the head-of-pipe
-  half, which needs the cursor walk to evaluate a computed component.
+  half, which needs the cursor walk to evaluate a computed component. #2471's
+  *remainder* (section above) closed the map-family and assignment-right-side
+  shapes and left all five reachable for the same reason.
 - `A24` (`Expr::Shared`) is only ever produced by `substitute_func_param`
   (`src/jq/eval.rs`), so it dies with `A23`/`A25` and not before.
 - `A38` (`Expr::Break`) cannot be reached without `A37` (`Expr::Label`): the
