@@ -1904,28 +1904,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fix at all (measured *worse* than the string case, ~36s at just 25,000
   elements) — tracked separately as #2152.
 
-- **`reduce`/`foreach`'s bare-accumulator UPDATE body is now genuinely
-  O(n), not just a smaller O(n²) constant** (#2157): `try_reduce_step_alternatives`/
-  `try_foreach_step_alternatives`'s own fold loops hold their accumulator
-  `state: OwnedValue` fully unaliased (confirmed: unconditionally
-  overwritten immediately after this call, no live borrow of the old value
-  survives), so a new `try_owned_accumulator_step` recognizes the same
-  `. + <literal>`-shaped body #2086 already matches but, unlike
-  `eval_owned_fast_path`'s `&OwnedValue` signature, moves `state` *by
-  value* straight into `arith_combine` — letting `arith_add`'s existing
-  in-place `push_str`/`extend`/object-merge reuse the accumulator's own
-  spare capacity instead of being handed a fresh exact-capacity clone every
-  step. `eval_owned_fast_path` itself (and its other 3 call sites) is
-  unchanged and still clones — this is a fold-loop-scoped fix, not a
-  signature change. Measured (`reduce range(N) as $x (""; . + "x") |
-  length`): N=6,250 → 6ms, 12,500 → 7ms, 25,000 → 10ms, 50,000 → 16ms,
-  99,999 → 29ms (was 6/9/18/38/135ms) — growth is now close to linear
-  instead of the previous ~2x-per-doubling signature. Bonus: since the new
-  helper reuses #2152's own `literal_shaped_expr_to_owned`, the
-  array/object-accumulator idioms it covers get the same by-value treatment
-  for free — `reduce range(25000) as $x ([]; . + [$x]) | length` dropped
-  from ~1.25s to ~0.013s (~96x), confirmed with matching output at every
-  size measured.
+- **`reduce`'s bare-accumulator UPDATE body is now genuinely O(n), not
+  just a smaller O(n²) constant** (#2157): `try_reduce_step_alternatives`'s
+  own fold loop holds its accumulator `state: OwnedValue` fully unaliased
+  (confirmed: unconditionally overwritten immediately after this call, no
+  live borrow of the old value survives), so a new
+  `try_owned_accumulator_step` recognizes the same `. + <literal>`-shaped
+  body #2086 already matches but, unlike `eval_owned_fast_path`'s
+  `&OwnedValue` signature, moves `state` *by value* straight into
+  `arith_combine` — letting `arith_add`'s existing in-place
+  `push_str`/`extend`/object-merge reuse the accumulator's own spare
+  capacity instead of being handed a fresh exact-capacity clone every step.
+  `eval_owned_fast_path` itself (and its other 3 call sites) is unchanged
+  and still clones — this is a fold-loop-scoped fix, not a signature
+  change. Measured (`reduce range(N) as $x (""; . + "x") | length`):
+  N=6,250 → 6ms, 12,500 → 7ms, 25,000 → 10ms, 50,000 → 16ms, 99,999 →
+  29ms (was 6/9/18/38/135ms) — growth is now close to linear instead of
+  the previous ~2x-per-doubling signature. Bonus: since the new helper
+  reuses #2152's own `literal_shaped_expr_to_owned`, the array/object-
+  accumulator idioms it covers get the same by-value treatment for free
+  — `reduce range(25000) as $x ([]; . + [$x]) | length` dropped from
+  ~1.25s to ~0.013s (~96x), confirmed with matching output at every size
+  measured.
+  **`foreach` shares the same `try_owned_accumulator_step` call (same
+  `try_reduce_step_alternatives`-mirrored reasoning applies to its own
+  `state`), but does *not* reach the same O(n) result**: unlike `reduce`,
+  every `foreach` step also has to hand `state` to EXTRACT (or push it to
+  `outputs` directly when EXTRACT is omitted) *before* the next step can
+  consume it — a second, structurally unavoidable read of the same value
+  that a bare by-value move can't eliminate. `try_foreach_step_alternatives`
+  moved from two full clones per step (one for that EXTRACT/output read,
+  one for the next `state`) down to one (review caught a first version of
+  this fix that still did `update_vals.last().cloned()` for `state` *after*
+  the EXTRACT loop needed to borrow it, paying both clones anyway and
+  getting no benefit at all) — a real but modest win (~7%, measured over 5
+  interleaved reps at N=99,999 with output discarded via `| empty`), not
+  an asymptotic one. `foreach`'s own EXTRACT evaluation is entirely
+  untouched by this issue and still round-trips through the reindex bridge
+  for any shape beyond `eval_owned_fast_path`'s narrow coverage (plain
+  `.`/field/index/`tostring`/this same arithmetic arm) — genuinely fixing
+  `foreach`'s own asymptotic behavior would need that bridge closed too,
+  out of scope here.
 
 - **A decode failure (invalid UTF-8, or a structurally malformed value) now
   raises instead of silently materializing as `null`, `""`, or a dropped
