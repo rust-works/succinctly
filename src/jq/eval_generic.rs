@@ -2808,18 +2808,12 @@ fn push_generic_truthiness_cursor_error<C: DocumentCursor>(c: &C, depth: usize) 
         // `to_owned_cursor_at_depth`'s own object arm runs after its loop
         // -- a stray `,` with no real field (`{,}`) or a trailing `,`
         // after the last real field (`{"a":1,}`) both passed silently
-        // here before this fix.
-        match last_field {
-            None => {
-                if !c.container_gap_ok(b'}') {
-                    return Some(Control::Error(c.malformed_delimiter_error()));
-                }
-            }
-            Some(value_cursor) => {
-                if !trailing_element_gap_ok(&value_cursor, b'}') {
-                    return Some(Control::Error(c.malformed_delimiter_error()));
-                }
-            }
+        // here before this fix. #2409: was a hand-inlined `match last_field`
+        // dispatch (the last hold-out of that duplicated shape); now the
+        // same `container_tail_gap_ok` its `to_owned_cursor_at_depth` sibling
+        // already calls.
+        if let Err(e) = container_tail_gap_ok(c, last_field.as_ref(), b'}') {
+            return Some(Control::Error(e));
         }
         None
     } else if let Some(elements) = value.as_array() {
@@ -2852,18 +2846,11 @@ fn push_generic_truthiness_cursor_error<C: DocumentCursor>(c: &C, depth: usize) 
         // #2349/#2211/#2243: same container/trailing-gap checks
         // `to_owned_cursor_at_depth`'s own array arm runs after its loop --
         // `[,]` (no real element) or `[1,]` (trailing `,`) both passed
-        // silently here before this fix.
-        match last_elem {
-            None => {
-                if !c.container_gap_ok(b']') {
-                    return Some(Control::Error(c.malformed_delimiter_error()));
-                }
-            }
-            Some(last) => {
-                if !trailing_element_gap_ok(&last, b']') {
-                    return Some(Control::Error(c.malformed_delimiter_error()));
-                }
-            }
+        // silently here before this fix. #2409: was a hand-inlined
+        // `match last_elem` dispatch; now the same `container_tail_gap_ok`
+        // its `to_owned_cursor_at_depth` sibling already calls.
+        if let Err(e) = container_tail_gap_ok(c, last_elem.as_ref(), b']') {
+            return Some(Control::Error(e));
         }
         None
     } else if let Some(reason) = value.string_decode_error() {
