@@ -102,8 +102,9 @@ consequences are recorded divergences/limitations rather than matches:
 
 - **A value-producing update at an alias node is not discarded — rule 4(b).** Real yq
   no-ops `.b |= . + 1`, `.b += 1`, `.b += [3]` and `.b |= . + {"r": 3}` at an alias node
-  (the document comes out unchanged) and errors on `.b |= reverse` / `.b |= keys` /
-  `.b *= {..}` (`node at path [b] is not an array (it's a )`). succinctly rebinds the
+  (the document comes out unchanged) and errors on `.b |= reverse` (`node at path [b] is
+  not an array (it's a )`), `.b |= keys` (`cannot get keys of , keys only works for maps
+  and arrays`) and `.b *= {..}` (`cannot multiply  with !!map`). succinctly rebinds the
   position with the computed value, consistent with `.b |= 5` (which yq also rebinds).
   `.b |= (.p = 9)` and `.b |= del(.p)`, whose body is itself a write, mutate the shared node
   in both tools.
@@ -117,6 +118,13 @@ consequences are recorded divergences/limitations rather than matches:
 
 Wherever the redirect declines, the values differ and the equal-value clause drops the mark
 and prints the computed value, rather than emitting `*x` and discarding the write.
+
+The redirect runs on the route that builds a `CommentTree` (stdout, `--split-exp`,
+`--front-matter`); `--inplace` and `--eval-all` evaluate without it, so `yq -i '.b.p = 9'`
+still writes `b` positionally and drops the marks — the value half of the
+[#1349](https://github.com/rust-works/succinctly/issues/1349) route gap. A multi-document
+stream applies the redirect and the anchor marks to the last document only
+([#2520](https://github.com/rust-works/succinctly/issues/2520), pre-existing).
 
 A related, narrower gap sits in `select`/`if`'s condition-truthiness check
 (`push_generic_truthiness_cursor_error`, [src/jq/eval_generic.rs](../../../src/jq/eval_generic.rs)):
