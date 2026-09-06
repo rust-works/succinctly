@@ -68698,8 +68698,34 @@ mod tests {
         let state = OwnedValue::String("untouched".to_string());
         match try_owned_accumulator_step::<JqSemantics>(&Expr::Identity, state, false) {
             Err(OwnedValue::String(s)) => assert_eq!(s, "untouched"),
-            other => panic!("expected Err(original state) unchanged, got {other:?}"),
+            // `Expr::Identity` never matches `owned_arith_accumulator_shape`'s
+            // `Arithmetic` pattern, so `Err(state)` unchanged is the only
+            // possible outcome here.
+            other => unreachable!("Expr::Identity never matches the Arithmetic shape: {other:?}"), // omni-dev: coverage tolerate-line reason="Expr::Identity never matches owned_arith_accumulator_shape (#2157)"
         }
+    }
+
+    #[test]
+    fn test_2157_try_owned_accumulator_step_suppresses_error_when_optional() {
+        // `try_owned_accumulator_step`'s `Err(_) if optional` arm mirrors
+        // `eval_owned_fast_path`'s own identical convention for this same
+        // `. + <literal>` shape (#2086) -- exercised directly here since no
+        // ordinary jq syntax reaches it *through* `reduce`/`foreach`'s own
+        // callers: `Expr::Try`/`Expr::Optional` never force `optional =
+        // true` into the expression they wrap (#693 -- see the `scalar_noop`
+        // binding's doc comment in `update_path` for the established
+        // precedent), so `(reduce ...)?` catches a per-step error via its
+        // own outer `eval_try`, not by setting this flag. Unit-level-only
+        // coverage, not jq-oracle-verifiable through any surface syntax.
+        let expr = Expr::Arithmetic {
+            op: ArithOp::Add,
+            left: Box::new(Expr::Identity),
+            right: Box::new(Expr::Literal(Literal::String("a".to_string()))),
+        };
+        let (vals, control) =
+            try_owned_accumulator_step::<JqSemantics>(&expr, OwnedValue::Int(1), true).unwrap();
+        assert!(vals.is_empty());
+        assert!(control.is_none());
     }
 
     #[test]
