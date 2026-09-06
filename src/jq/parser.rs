@@ -1218,7 +1218,10 @@ impl<'a> Parser<'a> {
                 // jq's `ExpD`, not `Exp`: the `,` here separates entries, so a
                 // value must stop at it or `{a: 1, b: 2}` reads `1, b` as one
                 // value. Use `(...)` to fan a value out: `{a: (1,2)}`.
-                self.parse_pipe_no_comma()?
+                // In yq mode this position also carries the `and`/`or` level,
+                // which yq ranks above `:` and `,` -- see
+                // `parse_pipe_no_comma_with_booleans` (#2506).
+                self.parse_pipe_no_comma_with_booleans()?
             } else {
                 // Shorthand: key must be literal identifier
                 match &key {
@@ -1995,7 +1998,7 @@ impl<'a> Parser<'a> {
         // comma-valued `n` re-invokes the whole builtin once per output.
         // That fanout isn't implemented here, so accepting a comma would
         // parse but silently misbehave — worse than today's parse error.
-        let n = self.parse_pipe_no_comma()?;
+        let n = self.parse_pipe_no_comma_with_booleans()?;
         self.skip_ws();
         // #2237 review: only `)` here is unambiguously a missing-2nd-arg
         // wrong-arity call -- rewinding on *any* non-`;` character (as an
@@ -4515,7 +4518,7 @@ impl<'a> Parser<'a> {
             // `n` deliberately stays restricted to non-comma — same rationale
             // as `parse_limit_expr`'s own `n`: real jq's `$n` parameter
             // convention isn't implemented here.
-            let n = self.parse_pipe_no_comma()?;
+            let n = self.parse_pipe_no_comma_with_booleans()?;
             self.skip_ws();
             self.expect(';')?;
             self.skip_ws();
@@ -4536,7 +4539,7 @@ impl<'a> Parser<'a> {
             // `n` deliberately stays restricted to non-comma — same rationale
             // as `parse_limit_expr`'s own `n` above: real jq's `$n` parameter
             // convention (per-output fanout) isn't implemented here.
-            let n = self.parse_pipe_no_comma()?;
+            let n = self.parse_pipe_no_comma_with_booleans()?;
             self.skip_ws();
             if self.peek() == Some(';') {
                 self.next();
@@ -4961,8 +4964,17 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse `and` expressions: `expr and expr`
+    ///
+    /// **jq mode only.** Real yq ranks `and`/`or` (`operation.go`'s
+    /// `Precedence: 20`, v4.53.3) *below* `|` (30), so in `Yq` mode the level
+    /// sits above the pipe chain in [`Self::parse_yq_boolean_expr`] instead
+    /// and this one must leave the keyword alone -- otherwise the inner level
+    /// would swallow it first and the outer one would never see it (#2506).
     fn parse_and(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.parse_comparison()?;
+        if self.mode == ParserMode::Yq {
+            return Ok(left);
+        }
         // Each iteration wraps `left` in another node, so this chain's own
         // length is AST depth even though the loop never recurses (#1156).
         let mut chain_depth = 0usize;
@@ -4984,8 +4996,14 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse `or` expressions: `expr or expr`
+    ///
+    /// **jq mode only**, for the reason [`Self::parse_and`] documents: yq puts
+    /// `or` at the same precedence as `and`, both below `|` (#2506).
     fn parse_or(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.parse_and()?;
+        if self.mode == ParserMode::Yq {
+            return Ok(left);
+        }
         // Each iteration wraps `left` in another node, so this chain's own
         // length is AST depth even though the loop never recurses (#1156).
         let mut chain_depth = 0usize;
@@ -5184,7 +5202,7 @@ impl<'a> Parser<'a> {
     /// [`Self::parse_expr`] under [`ParserMode::Yq`]. See that method's doc for
     /// the precedence numbers this encodes.
     fn parse_yq_comma_expr(&mut self) -> Result<Expr, ParseError> {
-        let first = self.parse_pipe_no_comma()?;
+        let first = self.parse_yq_boolean_expr()?;
         self.skip_ws();
 
         if self.peek() != Some(',') {
@@ -5196,7 +5214,7 @@ impl<'a> Parser<'a> {
         while self.peek() == Some(',') {
             self.next();
             self.skip_ws();
-            exprs.push(self.parse_pipe_no_comma()?);
+            exprs.push(self.parse_yq_boolean_expr()?);
             self.skip_ws();
         }
 
@@ -5239,6 +5257,102 @@ impl<'a> Parser<'a> {
         }
 
         Ok(Expr::comma(exprs))
+    }
+
+    /// Parse a yq-mode `and`/`or` chain: `chain and chain or chain ...`, where
+    /// each operand is a whole pipe chain.
+    ///
+    /// **yq mode only**, and the level [`Self::parse_and`]/[`Self::parse_or`]
+    /// step aside for. Real yq's precedence table
+    /// (`pkg/yqlib/operation.go`, v4.53.3) reads, loosest first,
+    ///
+    /// ```text
+    /// ,(10)  <  and/or(20)  <  |(30)  <  = == < (40)  <  + * // (42)  <  select(52)
+    /// ```
+    ///
+    /// where jq's `parser.y` reads `|  <  ,  <  //  <  =  <  or  <  and  <  ==`.
+    /// Two consequences, and between them they are the whole of #2506:
+    ///
+    /// 1. `|` binds *tighter* than `and`/`or` here, so `A | B and C` is
+    ///    `(A | B) and C`, not jq's `A | (B and C)`. `=` and `//` bind tighter
+    ///    too, so `X = Y and Z` is `(X = Y) and Z` and `X // Y or Z` is
+    ///    `(X // Y) or Z` -- both the opposite of jq. Captured live on
+    ///    `a: {b: 1, c: false}` / `x: true`: `yq '.a | true and .b'` is `false`
+    ///    (the right operand is `.b` *at the root*, absent) where jq's
+    ///    `.a | (true and .b)` is `true`, and `yq '.a.b // .a.zz or false'` is
+    ///    `true` where jq gives `1`.
+    ///
+    /// 2. `and` and `or` share one precedence, and yq's shunting yard
+    ///    (`expression_postfix.go`) pops only on *strictly* greater precedence,
+    ///    so an equal-precedence chain stays on the stack and nests to the
+    ///    **right**: `A and B or C` is `A and (B or C)`, where jq ranks `and`
+    ///    above `or` and gives `(A and B) or C`. Captured live:
+    ///    `yq 'false and true or true'` is `false`, jq's is `true`.
+    ///
+    /// The operands themselves are evaluated exactly as before -- this is a
+    /// grouping change only. Writing yq's grouping out with parentheses already
+    /// reproduced its answers here before this level existed (`(.a | true) and
+    /// .b` was `false` in both tools), which is what identified the divergence
+    /// as precedence rather than an operand-context rule (#2506; #2460's
+    /// empty-operand rule and #2470's read-only scope are unchanged).
+    ///
+    /// The fold is built iteratively rather than by recursing on the right, so
+    /// a long `a and b and c ...` chain costs stack depth only through
+    /// [`Self::check_expr_nesting`]'s own accounting, as
+    /// [`Self::parse_and`]'s loop already did (#1156).
+    fn parse_yq_boolean_expr(&mut self) -> Result<Expr, ParseError> {
+        let mut operands = vec![self.parse_pipe_no_comma()?];
+        let mut ops: Vec<bool> = Vec::new();
+
+        loop {
+            self.skip_ws();
+            let is_and = if self.matches_keyword("and") {
+                true
+            } else if self.matches_keyword("or") {
+                false
+            } else {
+                break;
+            };
+            self.consume_keyword(if is_and { "and" } else { "or" });
+            self.skip_ws();
+            ops.push(is_and);
+            self.check_expr_nesting(ops.len())?;
+            operands.push(self.parse_pipe_no_comma()?);
+        }
+
+        // Right-associative fold: the last operand is the innermost right-hand
+        // side, and each operator wraps the operand to its left around it.
+        let mut expr = operands
+            .pop()
+            .expect("parse_yq_boolean_expr always pushes a first operand");
+        while let Some(is_and) = ops.pop() {
+            let left = operands
+                .pop()
+                .expect("one operand more than operators by construction");
+            expr = if is_and {
+                Expr::And(Box::new(left), Box::new(expr))
+            } else {
+                Expr::Or(Box::new(left), Box::new(expr))
+            };
+        }
+        Ok(expr)
+    }
+
+    /// jq's `ExpD` production -- a pipe chain that stops at a comma -- plus
+    /// yq's own `and`/`or` level on top of it in `Yq` mode.
+    ///
+    /// The operand positions that parse at "pipe but not comma" precedence
+    /// (an object value, and `limit`/`skip`/`nth`'s leading count) sit *below*
+    /// a comma and so, in yq, below `and`/`or` as well: yq's `createMapOpType`
+    /// is precedence 15 and `,` is 10, both under `and`/`or`'s 20. Captured
+    /// live: `yq '{"k": .a | .b and .c}'` is `{"k":false}`, i.e.
+    /// `k: ((.a | .b) and .c)` (#2506). In jq mode this is exactly
+    /// [`Self::parse_pipe_no_comma`], unchanged.
+    fn parse_pipe_no_comma_with_booleans(&mut self) -> Result<Expr, ParseError> {
+        match self.mode {
+            ParserMode::Jq => self.parse_pipe_no_comma(),
+            ParserMode::Yq => self.parse_yq_boolean_expr(),
+        }
     }
 
     /// Parse a pipe expression: `stage | stage | ...`, where each stage is a
@@ -6227,6 +6341,78 @@ mod tests {
 
         // jq mode is untouched: `parse_comma_expr` has no collapse at all.
         assert_eq!(parse("., .").unwrap(), Expr::Comma(vec![id.clone(), id]));
+    }
+
+    #[test]
+    fn test_yq_mode_and_or_bind_looser_than_pipe_2506() {
+        let int = |i: i64| Expr::Literal(Literal::number_literal(i.to_string()));
+        let yq = |s: &str| parse_with_mode(s, ParserMode::Yq).unwrap();
+        let f = |n: &str| Expr::Field(n.into());
+        let and = |l: Expr, r: Expr| Expr::And(Box::new(l), Box::new(r));
+        let or = |l: Expr, r: Expr| Expr::Or(Box::new(l), Box::new(r));
+
+        // yq: `and`/`or` are precedence 20, `|` is 30 -- the pipe is consumed
+        // into the *left* operand. jq ranks `|` loosest, so the pipe wins.
+        assert_eq!(
+            yq(".a | 1 and .b"),
+            and(Expr::Pipe(vec![f("a"), int(1)]), f("b"))
+        );
+        assert_eq!(
+            parse(".a | 1 and .b").unwrap(),
+            Expr::Pipe(vec![f("a"), and(int(1), f("b"))])
+        );
+
+        // One precedence for both, popped only on strictly greater, so an
+        // `and`/`or` chain nests to the right in yq and to the left in jq.
+        assert_eq!(yq("1 and 2 or 3"), and(int(1), or(int(2), int(3))));
+        assert_eq!(
+            parse("1 and 2 or 3").unwrap(),
+            or(and(int(1), int(2)), int(3))
+        );
+        assert_eq!(yq("1 and 2 and 3"), and(int(1), and(int(2), int(3))));
+        assert_eq!(
+            parse("1 and 2 and 3").unwrap(),
+            and(and(int(1), int(2)), int(3))
+        );
+
+        // `,` (10) is still looser than `and`/`or` (20), in both modes, so a
+        // comma operand is a whole boolean chain.
+        assert_eq!(
+            yq("1 and 2, 3"),
+            Expr::Comma(vec![and(int(1), int(2)), int(3)])
+        );
+
+        // `//` (42) and `=` (40) outrank `and`/`or` in yq; in jq they are
+        // looser than `or`, so the two modes bracket these the other way.
+        assert_eq!(
+            yq(".a // .b or 1"),
+            or(
+                Expr::Alternative(Box::new(f("a")), Box::new(f("b"))),
+                int(1)
+            )
+        );
+        assert_eq!(
+            parse(".a // .b or 1").unwrap(),
+            Expr::Alternative(Box::new(f("a")), Box::new(or(f("b"), int(1))))
+        );
+
+        // Parentheses are a boundary the shunting yard cannot see across, so
+        // they restore jq's grouping -- which is what leaves `select(.x and
+        // .y)`, `[...]` contents and object values parsing per operand.
+        assert_eq!(
+            yq(".a | (1 and .b)"),
+            Expr::Pipe(vec![f("a"), Expr::Paren(Box::new(and(int(1), f("b")))),])
+        );
+
+        // An object value carries the level too (yq's `:` is precedence 15,
+        // under `and`/`or`'s 20), and still stops at the entry-separating `,`.
+        assert_eq!(
+            yq(r#"{"k": .a | .b and .c}"#),
+            Expr::Object(vec![ObjectEntry {
+                key: ObjectKey::Literal("k".into()),
+                value: and(Expr::Pipe(vec![f("a"), f("b")]), f("c")),
+            }])
+        );
     }
 
     #[test]

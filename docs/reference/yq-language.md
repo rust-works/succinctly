@@ -63,15 +63,22 @@ All features from the [jq Language Reference](jq-language.md) work with yq, incl
 - Format strings (`@json`, `@csv`, `@base64`, etc.)
 - Module system (`import`, `include`)
 
-### Operator precedence differs on `|` vs `,`
+### Operator precedence differs on `|`, `,` and `and`/`or`
 
 The [jq operator-precedence table](jq-language.md#operator-precedence) applies in
-yq mode **except for its two loosest levels, which are swapped** (#2420). Real
-yq's parser is a shunting-yard operator-precedence parser and its own table
-(`pkg/yqlib/operation.go`, v4.53.3) gives `pipeOpType` precedence 30 and
-`unionOpType` (`,`) precedence 10 — pipe binds *tighter* than comma, the
-opposite of jq's `parser.y`. `succinctly yq` follows yq, `succinctly jq`
-follows jq (ADR-0018 rule 2: the mode decides, not the input format):
+yq mode **except at its loosest levels, which yq orders differently** (#2420,
+#2506). Real yq's parser is a shunting-yard operator-precedence parser, and its
+own table (`pkg/yqlib/operation.go`, v4.53.3) reads, loosest first:
+
+```text
+,(10)  <  and/or(20)  <  |(30)  <  = == < (40)  <  + - * / // (42)  <  select map(52)
+```
+
+where jq's `parser.y` reads `|  <  ,  <  //  <  =  <  or  <  and  <  ==  <  + -  <  * /`.
+`succinctly yq` follows yq, `succinctly jq` follows jq (ADR-0018 rule 2: the
+mode decides, not the input format).
+
+#### `|` binds tighter than `,`
 
 | Filter               | `succinctly yq` / `yq` | `succinctly jq` / `jq` |
 |----------------------|------------------------|------------------------|
@@ -85,6 +92,36 @@ every nesting depth. Explicit parentheses restore jq's grouping, on either side
 of the comma, because they are a boundary the shunting yard cannot see across;
 construction brackets do not, since `[...]` scopes evaluation rather than
 precedence.
+
+#### `and`/`or` bind looser than `|`, `=` and `//`, and chain to the right
+
+yq ranks `and` and `or` at the *same* precedence (20), below `|` (30) and below
+`=`/`==` (40) and `//` (42) — all three the opposite way round from jq, where
+`|`, `,`, `//` and `=` are all looser than `or`/`and`. And because yq's
+shunting yard pops a stacked operator only on *strictly* greater precedence, an
+equal-precedence `and`/`or` chain nests to the **right**, where jq ranks `and`
+above `or` and chains to the left (#2506):
+
+| Filter                    | `succinctly yq` / `yq` | `succinctly jq` / `jq` |
+|---------------------------|------------------------|------------------------|
+| `.a \| true and .b`       | `false`                | `true`                 |
+| `.a \| true and .a.b`     | `true`                 | `false`                |
+| `.a \| .c or .b`          | `false`                | `true`                 |
+| `.x and .a \| .b`         | `true`                 | *(error)*              |
+| `.a.b // .a.zz or false`  | `true`                 | `1`                    |
+| `false and true or true`  | `false`                | `true`                 |
+
+(on `a: {b: 1, c: false}`/`x: true`.) `.a | true and .b` groups as
+`(.a | true) and .b`, so the right operand's `.b` is read at the *document
+root*, where it is absent — not at `.a`, where it is `1`. Writing the grouping
+out with parentheses gives the same answer in both tools: `.a | (true and .b)`
+is `true` everywhere, `(.a | true) and .b` is `false` everywhere. Nothing about
+how an operand is *evaluated* differs between the modes.
+
+A parenthesised argument is a boundary the shunting yard cannot see across, so
+the level reappears inside one and the common `select(.x and .y)` idiom is
+unaffected: `.items[] | select(.name and .value)` filters per element in both
+modes, exactly as in jq.
 
 ---
 

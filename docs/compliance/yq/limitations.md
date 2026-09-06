@@ -2162,49 +2162,49 @@ value. Every `parent` row that *reads* the node rather than embedding it — `pa
 cursor, not from a path, and no cursor reaches the filter. `.a | .b |= line` is `2` in real
 yq and `0` in succinctly — a separate, pre-existing gap, not one #2522 touches.
 
-### An `and`/`or` operand's evaluation context -- open (captured under [#2473](https://github.com/rust-works/succinctly/issues/2473))
+### An `and`/`or` operand's evaluation context -- resolved as precedence ([#2506](https://github.com/rust-works/succinctly/issues/2506)); a literal against an empty context remains a residual gap
 
-Real yq v4.53.3 does not evaluate an `and`/`or`'s **right** operand against the node the
-operator stands on -- it resolves it from the **document root** -- and it answers `false`
-for the whole expression whenever the operator's own input came from an absent
-navigation. succinctly evaluates both operands at the current node, in both modes.
+Captured under [#2473](https://github.com/rust-works/succinctly/issues/2473) as "real yq
+resolves an `and`/`or`'s right operand from the document root". That premise was wrong.
+The oracle capture for #2506 settled it with one probe:
 
-The divergence is not about path context: the first four rows contain no path-context
-builtin at all. It was found while making `and`/`or` with a path-context operand native
-(#2473, gate reason 3 of spine 2416), because a `key`/`parent` in the right operand makes
-it visible -- and it predates that change, which is why the rows are pinned as
-succinctly's own answers in `test_and_or_keep_path_context_2473`
-(`tests/yq_cli_tests.rs`) rather than encoded.
+```console
+$ yq -o=json -I0 '.a | (true and .b)' d.yaml     # true
+$ jq -c            '.a | (true and .b)' d.json   # true    <- identical
+$ yq -o=json -I0 '(.a | true) and .b'   d.yaml   # false
+$ jq -c            '(.a | true) and .b' d.json   # false   <- identical
+```
 
-Captured live (`-o=json -I0`) on `a: {b: 1}\nc: [10, 20]\n`:
+Once the grouping is written out, the two tools agree on every row. The divergence was
+**parser precedence**: `pkg/yqlib/operation.go` (v4.53.3) gives `and`/`or` `Precedence: 20`
+and `|` `Precedence: 30`, so `.a | true and .b` is `(.a | true) and .b` in yq and
+`.a | (true and .b)` in jq -- the right operand reaches the document root only because the
+pipe was consumed into the *left* operand. `=`/`==` (40) and `//` (42) also outrank
+`and`/`or` in yq where jq ranks them looser, and `and`/`or` share one precedence and chain
+right-associatively (yq's shunting yard pops only on strictly greater precedence).
 
-| filter                     | real yq | succinctly |
-|----------------------------|---------|------------|
-| `.a \| .b and true`         | `true`  | `true`     |
-| `.a \| true and .b`         | `false` | `true`     |
-| `.a \| true and .a.b`       | `true`  | `false`    |
-| `.c \| true and .[0]`       | `false` | `true`     |
-| `.a \| 0 + .b`              | `1`     | `1`        |
-| `.a \| (key) and true`      | `true`  | `true`     |
-| `.a \| true and (key)`      | `false` | `true`     |
-| `.a \| key and parent`      | `false` | `true`     |
+`succinctly yq` now implements that ladder (`parse_yq_boolean_expr`, `src/jq/parser.rs`);
+the rows are pinned in `test_and_or_keep_path_context_2473` and
+`test_yq_and_or_precedence_2506` (`tests/yq_cli_tests.rs`). No evaluator rule changed --
+#2460's empty-operand rule and #2470's read-only scope are what make the reparsed operands
+answer as they do, and both were already correct.
 
-Row 3 is the one that names the rule: `.a.b` resolved *at* `.a` is nothing, resolved at
-the root it is `1`. Row 5 shows arithmetic is not affected -- this is specific to
-`and`/`or`, and it is a different mechanism from the read-only rule the previous section
-describes (which is about a *missing key* inside an operand, not about which node the
-operand starts from).
+**Residual gap** ([#2540](https://github.com/rust-works/succinctly/issues/2540)). One row in the
+#2506 sweep is a different mechanism and still diverges:
 
-And on `a:\n  b: 1\n`, where the operator's input is an absent position:
+| filter                       | real yq | succinctly |
+|------------------------------|---------|------------|
+| `(.a.zz \| true) and true`   | `true`  | `false`    |
+| `(.a.zz \| 5) and true`      | `true`  | `false`    |
+| `(.a.zz \| [.]) and true`    | `true`  | `false`    |
+| `(.a.zz \| .) and true`      | `false` | `false`    |
+| `(.a.zz \| length) and true` | `false` | `false`    |
 
-| filter                              | real yq | succinctly |
-|-------------------------------------|---------|------------|
-| `.a.zz \| key == "zz"`               | `true`  | `true`     |
-| `.a.zz \| (key == "zz") and true`    | `false` | `true`     |
-| `.a.zz \| key and true`              | `false` | `true`     |
-
-The same comparison is `true` on its own and `false` as an `and` operand, so the operand
-is not being evaluated at the position the pipe reached.
+Inside `and`'s read-only scope `.a.zz` yields nothing, and yq's `valueOperator`
+(`operator_value.go:11-14`) special-cases an **empty** context by emitting the literal once
+anyway -- as do the `[...]` and `{...}` constructors. succinctly propagates the empty, so
+the left operand is empty and #2460's rule short-circuits to `false`. `.` and `length` loop
+the context and so stay empty in both tools.
 
 ### Ordering comparisons against a real `null` -- resolved for scalars ([#2483](https://github.com/rust-works/succinctly/issues/2483)); containers remain a residual gap
 
