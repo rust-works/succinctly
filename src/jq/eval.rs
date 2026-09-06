@@ -31757,9 +31757,10 @@ fn eval_owned_fast_path<S: EvalSemantics>(
         // notation threshold (#2456) -- confirmed live:
         // `succinctly jq -n '(2 * 1e16) | tostring'` gave `"2E+16"` where
         // real jq and every non-`-n` succinctly invocation gave `"2e+16"`.
-        Expr::Pipe(stages) if stages.len() == 1 => {
-            eval_owned_fast_path::<S>(&stages[0], input, optional)
-        }
+        Expr::Pipe(stages) => match stages.as_slice() {
+            [only] => eval_owned_fast_path::<S>(only, input, optional),
+            _ => None,
+        },
         Expr::Identity | Expr::Field(_) | Expr::Index { .. } => {
             eval_owned_navigation::<S>(expr, input, optional)
         }
