@@ -35491,6 +35491,86 @@ fn test_yaml_rebind_to_equal_value_is_indistinguishable_from_the_anchor_1351() -
 }
 
 #[test]
+fn test_yaml_anchor_write_after_rebind_leaves_the_rebound_slot_alone_1351() -> Result<()> {
+    // #2499's shapes: an alias slot rebound earlier in the pipe is no longer a
+    // copy of the anchor, so a later anchor write must not resync it. The
+    // per-write mirror and the end-of-pipe sync share one rule
+    // (`propagate_anchor_writes`), so neither pass clobbers `b`.
+    assert_yq_1351(
+        ".b = null | .a.p = 9",
+        ALIAS_MAP_DOC_1351,
+        "a: &x {p: 9, q: 2}\nb: null\nc: *x\n",
+        r#"{"a":{"p":9,"q":2},"b":null,"c":{"p":9,"q":2}}"#,
+    )?;
+    assert_yq_1351(
+        ".b = 5 | .a.p = 9",
+        ALIAS_MAP_DOC_1351,
+        "a: &x {p: 9, q: 2}\nb: 5\nc: *x\n",
+        r#"{"a":{"p":9,"q":2},"b":5,"c":{"p":9,"q":2}}"#,
+    )?;
+    assert_yq_1351(
+        "del(.b) | .a.p = 9",
+        ALIAS_MAP_DOC_1351,
+        "a: &x {p: 9, q: 2}\nc: *x\n",
+        r#"{"a":{"p":9,"q":2},"c":{"p":9,"q":2}}"#,
+    )?;
+    // A through-write followed by a rebind of the same position.
+    assert_yq_1351(
+        ".b.p = 9 | .b = 5",
+        ALIAS_MAP_DOC_1351,
+        "a: &x {p: 9, q: 2}\nb: 5\nc: *x\n",
+        r#"{"a":{"p":9,"q":2},"b":5,"c":{"p":9,"q":2}}"#,
+    )
+}
+
+#[test]
+fn test_yaml_through_write_then_anchor_write_keeps_every_slot_in_step_1351() -> Result<()> {
+    // A write that touched both positions (via `.[]`, or explicitly) must not
+    // read as a rebind: the later anchor-only write still reaches every alias.
+    for filter in [".[].p = 9 | .a.q = 7", ".a.p = 9 | .b.p = 9 | .a.q = 7"] {
+        assert_yq_1351(
+            filter,
+            ALIAS_MAP_DOC_1351,
+            "a: &x {p: 9, q: 7}\nb: *x\nc: *x\n",
+            r#"{"a":{"p":9,"q":7},"b":{"p":9,"q":7},"c":{"p":9,"q":7}}"#,
+        )?;
+    }
+    assert_yq_1351(
+        ".a.p = 9 | .b.q = 3",
+        ALIAS_MAP_DOC_1351,
+        "a: &x {p: 9, q: 3}\nb: *x\nc: *x\n",
+        r#"{"a":{"p":9,"q":3},"b":{"p":9,"q":3},"c":{"p":9,"q":3}}"#,
+    )?;
+    // Nested groups: the inner alias `q` is rebound by the second stage while
+    // the outer alias `b` still follows the anchor.
+    assert_yq_1351(
+        ".[].p = 9 | .a.q = 7",
+        "a: &x\n  p: &y 1\n  q: *y\nb: *x\n",
+        "a: &x\n  p: &y 9\n  q: 7\nb: *x\n",
+        r#"{"a":{"p":9,"q":7},"b":{"p":9,"q":7}}"#,
+    )
+}
+
+#[test]
+fn test_yaml_nested_groups_sync_to_a_fixpoint_1351() -> Result<()> {
+    // #2498's shapes: a write through the anchor whose change must reach an
+    // inner alias and then the outer alias, whichever order the groups were
+    // collected in.
+    assert_yq_1351(
+        ".a.p = 5",
+        "a: &x\n  p: &y 1\n  q: *y\nb: *x\n",
+        "a: &x\n  p: &y 5\n  q: *y\nb: *x\n",
+        r#"{"a":{"p":5,"q":5},"b":{"p":5,"q":5}}"#,
+    )?;
+    assert_yq_1351(
+        ".x = 5",
+        "x: &y 1\na: &x {q: *y}\nb: *x\n",
+        "x: &y 5\na: &x {q: *y}\nb: *x\n",
+        r#"{"x":5,"a":{"q":5},"b":{"q":5}}"#,
+    )
+}
+
+#[test]
 fn test_yaml_deleted_declaration_writes_positionally_1351() -> Result<()> {
     // Rule 7, a recorded limitation: with the anchor deleted earlier in the
     // pipe there is no declaration to redirect to, so `.b.p = 9` is
