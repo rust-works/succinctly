@@ -32265,6 +32265,65 @@ fn test_owned_identity_rules_match_yq_2416() -> Result<()> {
     Ok(())
 }
 
+/// Spine 2416 gate reason 3 (#2473) in yq mode: a `reduce`/`foreach` whose
+/// source or INIT reads path context, and the `range`/`repeat`/`while`/`until`
+/// family that stays extension-only.
+///
+/// **Real yq has none of this syntax.** Captured 2026-09-06 from v4.53.3 on
+/// `a:\n  b: 1\n  c: 2\nd:\n  - 10\n  - 20\n`:
+///
+/// ```text
+/// $ yq '.a[] | reduce (key) as $k (""; . + $k)'   Error: 1:8: lexer: invalid input text "reduce (key) as ..."
+/// $ yq '.a | [range(2) | key]'                    Error: 1:7: lexer: invalid input text "range(2) | key]"
+/// $ yq '.a | [limit(2; repeat(key))]'             Error: 1:7: lexer: invalid input text "limit(2; repeat(..."
+/// $ yq '.a | [1 | while(. < 3; . + 1)]'           Error: 1:11: lexer: invalid input text "while(. < 3; . +..."
+/// $ yq '.a | [1 | until(. > 2; . + 1)]'           Error: 1:11: lexer: invalid input text "until(. > 2; . +..."
+/// ```
+///
+/// So these are succinctly extensions in yq mode (ADR-0018 rule 5), and the
+/// rows below pin succinctly's own answers. `reduce`/`foreach` are documented
+/// extensions accepted without a flag (`docs/reference/yq-language.md`);
+/// `range`/`limit` are gated behind `--jq-extensions` (#1512), and the gating
+/// error is pinned here too. `while`/`until` are *not* gated, a pre-existing
+/// gap in that gate rather than anything #2473 touches.
+#[test]
+fn test_fold_and_loop_path_context_2473() -> Result<()> {
+    let args = &["-o=json", "-I=0"];
+    let doc = "a:\n  b: 1\n  c: 2\nd:\n  - 10\n  - 20\n";
+    for (filter, expected) in [
+        (".a[] | reduce (key) as $k (\"\"; . + $k)", "\"b\"\n\"c\""),
+        (
+            ".a | reduce (.[] | key) as $k ([]; . + [$k])",
+            "[\"b\",\"c\"]",
+        ),
+        (
+            ".a[] | foreach (key) as $k (\"\"; . + $k; [$k, .])",
+            "[\"b\",\"b\"]\n[\"c\",\"c\"]",
+        ),
+        (".a | reduce (1,2) as $x (key; [., $x])", "[[\"a\",1],2]"),
+        // UPDATE reads the accumulator, which has no position.
+        ("reduce .d[] as $x (.a; [.[] | key])", "[0,1]"),
+    ] {
+        let (output, code) = run_yq_stdin(filter, doc, args)?;
+        assert_eq!(code, 0, "`{filter}`: {output:?}");
+        assert_eq!(output.trim(), expected, "`{filter}`");
+    }
+    // `range`/`limit` need `--jq-extensions`; the loops do not.
+    let (output, code) = run_yq_stdin(".a | [range(2) | key]", doc, args)?;
+    assert_ne!(code, 0, "{output:?}");
+    let ext = &["-o=json", "-I=0", "--jq-extensions"];
+    for (filter, expected) in [
+        (".a | [range(2) | key]", "[\"a\",\"a\"]"),
+        (".a[] | [range(2) | key]", "[\"b\",\"b\"]\n[\"c\",\"c\"]"),
+        (".a | [limit(2; repeat(key))]", "[]"),
+    ] {
+        let (output, code) = run_yq_stdin(filter, doc, ext)?;
+        assert_eq!(code, 0, "`{filter}`: {output:?}");
+        assert_eq!(output.trim(), expected, "`{filter}`");
+    }
+    Ok(())
+}
+
 /// #1332's other half, closed by #2473 (gate reason 3 of spine 2416):
 /// `needs_path_context` now descends into `Expr::Object`, so a
 /// `key`/`parent`/`path` inside an object literal is *routed* like any other
