@@ -38744,3 +38744,61 @@ fn test_assignment_rhs_sees_the_input_position_2471() -> Result<()> {
     }
     Ok(())
 }
+
+/// #2453: the jq-mode counterpart of
+/// `yq_cli_tests::test_yq_length_of_a_number_is_its_rendered_width_2453` --
+/// jq's absolute-value rule for `length` of a number is unaffected by that
+/// fix (it only changed yq mode's rule, gated on `S::TAG == EvalTag::Yq` in
+/// the shared `numeric_length_owned`), and both the plain-navigation and
+/// materialized paths already agreed with each other before this fix, so
+/// there is no "was" value to contrast here the way the yq test has.
+///
+/// Every row live-captured against `/usr/bin/jq` 1.7.1 on
+/// `{"a":1,"b":22,"neg":-5,"negd":-22,"flt":0.5,"zero":0}`:
+///
+/// ```console
+/// $ jq '.a | length'                              # 1
+/// $ jq '.b | length'                               # 22   (absolute value, not rendered width)
+/// $ jq '.neg | length'                             # 5    (abs(-5))
+/// $ jq '.negd | length'                            # 22   (abs(-22))
+/// $ jq '.flt | length'                             # 0.5  (abs(0.5))
+/// $ jq -c '[.a, .b] | .[] | length'                # 1 / 22
+/// $ jq -c '(.a, .b) | [.] | .[0] | length'         # 1 / 22
+/// $ jq '.a + 0 | length'                           # 1
+/// $ jq '.b + 0 | length'                           # 22
+/// $ jq -c 'to_entries | .[].value | length'        # 1 / 22
+/// $ jq '(0 - .b) | length'                         # 22   (abs(-22))
+/// ```
+#[test]
+fn test_jq_length_of_a_number_is_unaffected_2453() -> Result<()> {
+    let doc = r#"{"a":1,"b":22,"neg":-5,"negd":-22,"flt":0.5,"zero":0}"#;
+
+    for (filter, expected) in [
+        (".a | length", "1"),
+        (".b | length", "22"),
+        (".neg | length", "5"),
+        (".negd | length", "22"),
+        (".flt | length", "0.5"),
+        (".zero | length", "0"),
+    ] {
+        let (out, code) = run_jq_stdin(filter, doc, &[])?;
+        assert_eq!(code, 0, "`{filter}`: {out:?}");
+        assert_eq!(out.trim(), expected, "`{filter}`");
+    }
+
+    let ab_doc = r#"{"a":1,"b":22}"#;
+    for (filter, expected) in [
+        ("[.a, .b] | .[] | length", "1\n22"),
+        ("(.a, .b) | [.] | .[0] | length", "1\n22"),
+        (".a + 0 | length", "1"),
+        (".b + 0 | length", "22"),
+        ("to_entries | .[].value | length", "1\n22"),
+        ("(0 - .b) | length", "22"),
+    ] {
+        let (out, code) = run_jq_stdin(filter, ab_doc, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}`: {out:?}");
+        assert_eq!(out.trim(), expected, "`{filter}`");
+    }
+
+    Ok(())
+}

@@ -8501,8 +8501,9 @@ fn builtin_length<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
         }
         StandardJson::Number(n) => {
-            // Length of a number is its absolute value.
-            // checked_abs: i64::MIN has no i64 absolute value; use f64
+            // Length of a number: jq's absolute-value rule, or the width
+            // of yq's own rendering -- see `numeric_length_owned`'s doc
+            // comment (#2453).
             if is_nan_sentinel(n.raw_bytes()) {
                 QueryResult::Owned(OwnedValue::Float(f64::NAN))
             } else if is_infinity_sentinel(n.raw_bytes()).is_some() {
@@ -8510,12 +8511,9 @@ fn builtin_length<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // same positive infinity (#1083/#1087).
                 QueryResult::Owned(OwnedValue::Float(f64::INFINITY))
             } else if let Ok(i) = n.as_i64() {
-                QueryResult::Owned(match i.checked_abs() {
-                    Some(a) => OwnedValue::Int(a),
-                    None => OwnedValue::Float(-(i as f64)),
-                })
+                QueryResult::Owned(numeric_length_owned::<S>(OwnedValue::Int(i)))
             } else if let Ok(f) = n.as_f64() {
-                QueryResult::Owned(OwnedValue::Float(f.abs()))
+                QueryResult::Owned(numeric_length_owned::<S>(OwnedValue::Float(f)))
             } else {
                 QueryResult::Owned(OwnedValue::Int(0))
             }
@@ -12134,6 +12132,50 @@ pub(crate) fn owned_to_string<S: EvalSemantics>(value: &OwnedValue) -> String {
         // `@csv`/`@tsv`/string interpolation on an array containing a
         // scientific-notation element all preserve it.
         OwnedValue::Array(_) | OwnedValue::Object(_) => owned_value_to_json::<S>(value),
+    }
+}
+
+/// `Builtin::Length` of a materialized (cursor-less) number: jq's own
+/// absolute-value rule, or the width of yq's own rendering (#2453) --
+/// consulted by both `builtin_length` (this file, the owned `StandardJson`
+/// path) and `eval_generic.rs`'s cursor-arm fallback (reached once
+/// `as_str()`/`as_array()`/`as_object()` have all declined), so the rule
+/// is one definition rather than two hand-copies that can drift apart
+/// (CLAUDE.md's "duplicated predicates diverge silently" case, and this
+/// exact issue's own root cause: the two sites already had drifted).
+///
+/// yq's cursor-backed path gets its own rule "for free" without ever
+/// calling this: a YAML scalar's raw source text is a `String` in that
+/// representation regardless of its resolved type, so `Length`'s
+/// `as_str()` check fires before either arm's numeric fallback runs, and
+/// the string arm's plain `chars().count()` already answers with the
+/// source spelling's width (confirmed live: `1e3`/`!!float 2` both answer
+/// with their raw text's width, not a re-rendering of the parsed value).
+/// This function is the *owned* counterpart for a value with no source
+/// text left to read -- computed via arithmetic, or threaded through an
+/// array/object literal, `to_entries`, a comma fan-out, ... (all of which
+/// call `numeric_display_string` for the same job in `tostring`/`@text`,
+/// so reusing it here keeps `length` and `tostring` from disagreeing on
+/// what a computed number renders as).
+///
+/// `value` must be `OwnedValue::Int` or `OwnedValue::Float`; any other
+/// variant is returned unchanged (both call sites only ever pass one of
+/// the two, and NaN/Infinity sentinels are intercepted before either call
+/// site reaches this, so `numeric_display_string`'s own non-finite
+/// handling is never exercised from here in practice).
+pub(crate) fn numeric_length_owned<S: EvalSemantics>(value: OwnedValue) -> OwnedValue {
+    if S::TAG == EvalTag::Yq {
+        let rendered = numeric_display_string::<S>(&value);
+        OwnedValue::Int(rendered.chars().count() as i64)
+    } else {
+        match value {
+            OwnedValue::Int(i) => match i.checked_abs() {
+                Some(a) => OwnedValue::Int(a),
+                None => OwnedValue::Float(-(i as f64)),
+            },
+            OwnedValue::Float(f) => OwnedValue::Float(f.abs()),
+            other => other,
+        }
     }
 }
 
