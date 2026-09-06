@@ -1348,6 +1348,14 @@ practice #2243's own issue text cites for not folding into #2211):
   already resolve a cursor" opportunity `eval_generic.rs` did, but neither was touched by
   #2358, whose scope named only that one function; tracked as #2403 rather than assumed
   to close the same way without checking.
+
+  **Update (#2403)**: confirmed and closed. Both functions had the identical shape --
+  `elem_cursor`/`field.value_cursor` already resolved in the recursive call and discarded
+  before the tail check -- and now thread it through the same way, via a shared
+  `tail_gap_ok` helper (`document.rs`) extracted in review rather than a third and fourth
+  hand-copy of the `container_tail_gap_ok`/`child_tail_gap_ok` dispatch. Only the true top
+  level (`to_owned`'s and `to_owned_canonicalizing_numbers`'s own depth-0 entry points, no
+  cursor to give) keeps the gap, matching `eval_generic.rs`'s own residual scope above.
 - **#2263**: `jq_runner.rs` still carries its own independent, hand-copied
   `trailing_gap_ok`/`scalar_end_pos` pair rather than the new trait methods --
   a cleanup, not a behavior gap, but the same "duplicated predicates diverge
