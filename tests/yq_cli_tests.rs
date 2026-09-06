@@ -25242,6 +25242,39 @@ fn test_yaml_assign_alias_onto_anchor_drops_both_2497() -> Result<()> {
     Ok(())
 }
 
+/// #2500: the alias position's `CommentTree` used to be built by recursing
+/// through the anchor *target*'s own cursors (`value.as_object()` resolves
+/// straight through a `YamlValue::Alias`), so it carried a copy of every
+/// mark the target declared -- here, `p`'s own `&y`. As long as the alias
+/// mark itself survives that copy sits dormant (the emitter never descends
+/// into an aliased node), but the write below makes `.b` diverge from `.a`,
+/// so `enforce_anchor_soundness` drops `.b`'s `*x` mark and the expanded
+/// copy renders through the ordinary object arm instead -- which used to
+/// resurface the copied `&y`, re-declaring it a second time in document
+/// order. Fixed by collapsing an alias position's tree to a childless
+/// `Leaf`, so the diverged expansion prints with no inherited marks at all.
+///
+/// Real yq writes *through* the alias here (issue 1351, out of scope for
+/// this fix) and would print `a: &x {p: &y 1, q: 5}` / `b: *x` -- but even
+/// under succinctly's copy-on-divergence model, the expected output has
+/// exactly one `&y`, never two.
+#[test]
+fn test_yaml_diverged_alias_prints_no_duplicate_anchor_2500() -> Result<()> {
+    let input = "a: &x\n  p: &y 1\n  q: *y\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".b.q = 5", input, &[])?;
+    assert_eq!(exit_code, 0, "output: {output:?}");
+    assert_eq!(
+        output, "a: &x\n  p: &y 1\n  q: *y\nb:\n  p: 1\n  q: 5\n",
+        "output: {output:?}"
+    );
+    assert_eq!(
+        output.matches("&y").count(),
+        1,
+        "expected exactly one &y declaration, output: {output:?}"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_yaml_assign_from_alias_keeps_target_comment_2497() -> Result<()> {
     // A plain `=` overwrites a go-yaml node's value in place, never the
@@ -25325,6 +25358,45 @@ fn test_yaml_later_plain_assign_clears_alias_mark_2497() -> Result<()> {
     let (output, exit_code) = run_yq_stdin(".a = 5", input, &[])?;
     assert_eq!(exit_code, 0);
     assert_eq!(output, "a: &x 5\nb: *x\n");
+    Ok(())
+}
+
+/// #2500's sibling repro: the alias sits inside a sequence item rather than
+/// a mapping field, exercising the array arm of the same recursion.
+#[test]
+fn test_yaml_diverged_alias_in_sequence_prints_no_duplicate_anchor_2500() -> Result<()> {
+    let input = "items:\n  - &t {n: &m 1, o: *m}\n  - *t\n";
+    let (output, exit_code) = run_yq_stdin(".items[1].o = 5", input, &[])?;
+    assert_eq!(exit_code, 0, "output: {output:?}");
+    assert_eq!(
+        output, "items:\n  - &t {n: &m 1, o: *m}\n  - n: 1\n    o: 5\n",
+        "output: {output:?}"
+    );
+    assert_eq!(
+        output.matches("&m").count(),
+        1,
+        "expected exactly one &m declaration, output: {output:?}"
+    );
+    Ok(())
+}
+
+/// #2500: the fix only changes the *side-tree* built for an alias position,
+/// never the value the writer/emitter renders when the alias mark itself
+/// survives -- `emit_yaml_value_at_depth` checks `comments.alias_name()`
+/// before any value-shape dispatch and never touches the (now-`Leaf`)
+/// children in that case, so a plain identity query over a document whose
+/// aliases never diverge must be byte-for-byte unaffected.
+#[test]
+fn test_yaml_alias_identity_output_unchanged_2500() -> Result<()> {
+    let input = "a: &x\n  p: &y 1\n  q: *y\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0, "output: {output:?}");
+    assert_eq!(output, input);
+
+    let input = "items:\n  - &t {n: &m 1, o: *m}\n  - *t\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0, "output: {output:?}");
+    assert_eq!(output, input);
     Ok(())
 }
 
