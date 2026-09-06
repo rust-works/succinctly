@@ -8305,6 +8305,21 @@ mod tests {
         parse(&format!("[{}]", vec!["1"; n].join(", "))).expect("a long comma list is not nesting");
     }
 
+    /// #2283: `parse_func_params`'s own malformed-syntax error, shared by
+    /// `parse_def_expr`/`parse_func_def_parts` -- pre-existing behavior
+    /// (unchanged by #2283) that had no direct test before the shared
+    /// helper's own review surfaced it as untested.
+    #[test]
+    fn test_func_params_malformed_separator_is_a_parse_error_2283() {
+        let err = parse("def f(a b): a; f(1;2)").expect_err("missing separator must error");
+        assert!(
+            err.message
+                .contains("expected ';', ',', or ')' in parameter list"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
     /// Control: just under the limit still parses, for the recursive and the
     /// iterative shape alike.
     #[test]

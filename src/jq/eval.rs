@@ -50475,7 +50475,7 @@ mod tests {
         ]);
         let substituted = substitute_var(&dollar_last, "a", &OwnedValue::Int(9));
         let Expr::FuncDef { body, .. } = &substituted else {
-            panic!("expected FuncDef");
+            unreachable!("FuncDef arm always returns FuncDef"); // omni-dev: coverage tolerate-line reason="substitute_var_impl's FuncDef arm always returns FuncDef (#2283)"
         };
         assert_eq!(
             **body,
@@ -50495,7 +50495,7 @@ mod tests {
         ]);
         let substituted = substitute_var(&dollar_first, "a", &OwnedValue::Int(9));
         let Expr::FuncDef { body, .. } = &substituted else {
-            panic!("expected FuncDef");
+            unreachable!("FuncDef arm always returns FuncDef"); // omni-dev: coverage tolerate-line reason="substitute_var_impl's FuncDef arm always returns FuncDef (#2283)"
         };
         assert_eq!(
             **body,
