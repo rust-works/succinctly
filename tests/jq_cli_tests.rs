@@ -22180,6 +22180,65 @@ fn test_jq_reduce_accumulator_unaffected_by_yq_float_fraction_fix_953() -> Resul
     Ok(())
 }
 
+/// #2456: a computed float past jq's own digit-count threshold
+/// (`decpt <= -4 || decpt > ndigits + 15`, see `jq_float_is_scientific`'s doc
+/// comment) now switches to scientific notation, matching real jq 1.7.1,
+/// instead of a bare `f.to_string()`'s full decimal expansion. Every case
+/// here (including the exact boundary crossings and multi-digit mantissas)
+/// is confirmed live against the pinned oracle.
+#[test]
+fn test_jq_computed_float_scientific_notation_threshold_2456() -> Result<()> {
+    for (filter, want) in [
+        // The issue's own repro.
+        (".a * 1e100", "1e+100"),
+        ("[.a * 1e100]", "[1e+100]"),
+        // Positive-exponent boundary: 1e15 stays decimal, 1e16 switches.
+        (".a * 1e15", "1000000000000000"),
+        (".a * 1e16", "1e+16"),
+        (".a * 1e17", "1e+17"),
+        // Multi-digit mantissa at and past the same boundary.
+        (".a * 1.5e15", "1500000000000000"),
+        (".a * 1.5e16", "15000000000000000"),
+        (".a * 1.5e17", "1.5e+17"),
+        // Negative-exponent boundary: 1e-4 stays decimal, 1e-5 switches.
+        (".a / 10000", "0.0001"),
+        (".a / 100000", "1e-05"),
+        (".a / 1000000", "1e-06"),
+        // Sign is preserved on both sides of the threshold.
+        (".a * -1e17", "-1e+17"),
+        (".a * -1e-5", "-1e-05"),
+        // A whole-number result at ordinary magnitude keeps jq's own
+        // "computed value loses the decimal point" rule (#953) unaffected.
+        (".a * 1.0", "1"),
+    ] {
+        let (out, code) = run_jq_stdin(filter, "{\"a\":1}", &["-c"])?;
+        assert_eq!(code, 0, "for {filter:?}: {out:?}");
+        assert_eq!(out.trim_end(), want, "for {filter:?}");
+    }
+    Ok(())
+}
+
+/// #2456: the same threshold applies through `tostring`/`@json`/string
+/// interpolation (`OwnedValue::number_str`'s `Float` arm), not just the
+/// reindex-bridge/JSON-output path above -- these used to disagree (the
+/// bridge already routed through `jq_bare_float_display`'s sibling call
+/// sites, `number_str` didn't).
+#[test]
+fn test_jq_computed_float_scientific_notation_tostring_2456() -> Result<()> {
+    for (filter, want) in [
+        (".a * 1e100 | tostring", "1e+100"),
+        (".a * 1e100 | @json", "1e+100"),
+        (r#""\(.a * 1e100)""#, "1e+100"),
+        (".a * 1e16 | tostring", "1e+16"),
+        (".a * 1e15 | tostring", "1000000000000000"),
+    ] {
+        let (out, code) = run_jq_stdin(filter, "{\"a\":1}", &[])?;
+        assert_eq!(code, 0, "for {filter:?}: {out:?}");
+        assert_eq!(out.trim(), format!("\"{want}\""), "for {filter:?}");
+    }
+    Ok(())
+}
+
 /// #1051: `builtin_stderr` gained an `S: EvalSemantics` parameter so yq mode
 /// can echo a `NumberLiteral` verbatim; confirm jq mode's own container
 /// formatting (`format_number_jq_compat`'s uppercase-`E` reformatting) is

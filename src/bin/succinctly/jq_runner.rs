@@ -21,9 +21,9 @@ use succinctly::jq::eval_generic::{
 };
 use succinctly::jq::walk::map_builtin_subexprs;
 use succinctly::jq::{
-    self, format_number_jq_compat, nonfinite_display_string, Builtin, EvalError, Expr,
-    FuncDefBound, JqSemantics, JqValue, OwnedValue, Program, StreamStats, UnresolvedCall,
-    MAX_VALUE_TREE_DEPTH,
+    self, format_number_jq_compat, jq_bare_float_display, nonfinite_display_string, Builtin,
+    EvalError, Expr, FuncDefBound, JqSemantics, JqValue, OwnedValue, Program, StreamStats,
+    UnresolvedCall, MAX_VALUE_TREE_DEPTH,
 };
 use succinctly::json::light::{preceding_gap_ok, JsonCursor, StandardJson};
 use succinctly::json::validate::{self, ValidationError};
@@ -5737,9 +5737,12 @@ impl LiteralFormatter for JqCompatFormatter {
         // such fallback text in real jq either and stays `null`. Reuses
         // #1075's `nonfinite_display_string` (the same NaN-vs-Infinity split
         // already pinned for jq's *text*-format path) rather than a fourth
-        // hand-rolled copy of the same two branches.
+        // hand-rolled copy of the same two branches. #2456: the finite arm
+        // used to be a bare `format!("{f}")`, which never switches to
+        // scientific notation past jq's own threshold -- `jq_bare_float_display`
+        // is the same formatter `OwnedValue::to_json` uses.
         if f.is_finite() {
-            format!("{f}")
+            jq_bare_float_display(f)
         } else {
             nonfinite_display_string::<JqSemantics>(f).to_string()
         }
@@ -5764,12 +5767,12 @@ impl LiteralFormatter for PreserveFormatter {
     }
 
     fn format_float(&self, f: f64) -> String {
-        // Same split as `JqCompatFormatter::format_float` above (#1087): a
-        // computed Infinity has no source literal for preserve mode to keep
-        // either, so both formatters need the identical jq-real-output rule
-        // here, not just the jq_compat one.
+        // Same split as `JqCompatFormatter::format_float` above (#1087, and
+        // #2456's finite-arm fix): a computed Infinity has no source literal
+        // for preserve mode to keep either, so both formatters need the
+        // identical jq-real-output rule here, not just the jq_compat one.
         if f.is_finite() {
-            format!("{f}")
+            jq_bare_float_display(f)
         } else {
             nonfinite_display_string::<JqSemantics>(f).to_string()
         }

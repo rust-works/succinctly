@@ -13,8 +13,8 @@ use succinctly::jq::escape::{
     write_json_body_yq, write_json_body_yq_ascii,
 };
 use succinctly::jq::{
-    assert_value_tree_depth, format_number_jq_compat, nonfinite_display_string, EvalError,
-    JqSemantics, NumberRepr, OwnedValue, StreamError,
+    assert_value_tree_depth, format_number_jq_compat, jq_bare_float_display,
+    nonfinite_display_string, EvalError, JqSemantics, NumberRepr, OwnedValue, StreamError,
 };
 use succinctly::yaml::format_float_with_fraction;
 pub use succinctly::yaml::format_float_yq;
@@ -606,7 +606,12 @@ fn format_json_impl(value: &OwnedValue, opts: &JsonFormatOpts, level: usize) -> 
                 format_float_yq(*f)
             } else {
                 match opts.float_style {
-                    FloatStyle::Shortest => f.to_string(),
+                    // #2456: was a bare `f.to_string()`, which never switches
+                    // to scientific notation -- `jq_bare_float_display` is
+                    // the same formatter `OwnedValue::to_json` and the M2
+                    // streaming writer use, so this CLI print path stops
+                    // diverging from them past the threshold.
+                    FloatStyle::Shortest => jq_bare_float_display(*f),
                     // Whole floats keep their decimal point at any magnitude;
                     // the old `<= i64::MAX` guard silently dropped it above
                     // that, disagreeing with the YAML writers (issue #169).

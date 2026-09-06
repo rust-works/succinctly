@@ -3531,9 +3531,10 @@ pub fn format_float_with_fraction(f: f64) -> String {
 ///
 /// The threshold and the `e+NN`/`e-NN` (lowercase, signed, exponent padded
 /// to at least 2 digits) spelling are both oracle-verified against real yq;
-/// this is yq's own threshold, distinct from jq mode's (which only
-/// reformats when the source literal itself already used exponent
-/// notation).
+/// this is yq's own fixed-magnitude threshold, distinct from jq mode's own
+/// digit-count threshold (`jq_float_is_scientific`/`jq_bare_float_display`,
+/// `src/jq/value.rs`, #2456) -- both reformat a genuinely computed float,
+/// just at different magnitudes and via a different rule shape.
 ///
 /// Lives here (not in the CLI binary) rather than only in
 /// `src/bin/succinctly/output.rs`, which now re-exports this under the
