@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`to_owned_with_comments_at_depth`'s object and array arms now run the same
+  #1677/#2211/#2243 delimiter checks their three sibling materializers always
+  had** (#2405). It used to run none at all beyond #1642's key-collision guard
+  and #1194's `ends_unpaired`; its array arm didn't even track `is_first`. Its
+  only *production* caller (`yq_runner.rs`) is YAML-only, where every one of
+  these checks is a trait-default no-op (`{a: 1,}` is valid YAML flow syntax),
+  so the omission was unreachable rather than divergent in shipped behaviour —
+  but `to_owned_with_comments` is `pub`, and this file's own JSON-typed test
+  already exercised it, so a future JSON-typed caller would have silently
+  inherited a walk that accepted `{"a" 1}`. Confirmed the YAML side doesn't
+  move: the full comment/anchor/style corpus is byte-identical, since every
+  new check is a no-op there by construction.
+
 - **A stray `,` with zero real children in a *nested* container (`{"a": [,]}`,
   `{"a": {,}}`) now raises in two more materializers, matching real jq/yq**
   (#2403). `eval_generic::to_owned_at_depth` already closed this gap for
