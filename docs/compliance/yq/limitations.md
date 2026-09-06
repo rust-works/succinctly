@@ -1847,7 +1847,7 @@ a value that isn't a snapshot of anything in the document -- a different kind of
 #2213's path-threading fix, which only ever continues with a value already known to be
 correct (`Null`, jq's own answer for what the missing/OOB read itself evaluates to).
 
-### An absent key read inside a read-only context — resolved (#2470); four neighbouring shapes remain
+### An absent key read inside a read-only context — resolved (#2470); two neighbouring shapes remain
 
 [#2460](https://github.com/rust-works/succinctly/issues/2460) gave yq mode real yq's rule
 for a binary operator whose operand produces **zero outputs**, and left two matrix cells
@@ -1880,24 +1880,28 @@ which inherits the ordinary auto-creating setting.
 
 Implemented once as `jq::eval::yq_read_only_context` (the ambient scope) plus
 `jq::eval::yq_absent_key_read_is_empty` (the mode gate), consulted by every navigation
-site in both evaluators, and `jq::eval::yq_empty_rhs_document` for the other half of the
-assignment rule: a zero-output right side still emits one document, with the target path
-auto-created and never written, so a new target survives as an explicit `null` while an
-existing one keeps its old value. Only **key** lookups are covered — real yq auto-creates
-through arrays even read-only (`.x = (.n[9] | key)` on `n: [1, 2]` is `x: 9`), so an
-out-of-range array index stays the ordinary `null` read.
+site in both evaluators, and `jq::eval::yq_prepare_assign_targets` for the other half of
+the assignment rule: a zero-output right side still emits one document, with the target
+path auto-created and never written, so a new target survives as an explicit `null` while
+an existing one keeps its old value. Only **key** lookups are covered — real yq
+auto-creates through arrays even read-only (`.x = (.n[9] | key)` on `n: [1, 2]` is
+`x: 9`), so an out-of-range array index stays the ordinary `null` read. succinctly
+answers `x: 9` there but does **not** write yq's padding back into `.n` (`{"n":[1,2],
+"x":9}` against yq's ten-element `n`) — a separate, pre-existing read-side gap, unchanged
+by #2470 and #2481 alike.
 
-Three neighbouring shapes were captured alongside and are **not** part of this rule;
-each is a separate divergence (two more, ordering comparisons against a real `null` and
-`|=` with a zero-output filter, were captured here too but are now resolved -- see
-[#2483](https://github.com/rust-works/succinctly/issues/2483) and
-[#2484](https://github.com/rust-works/succinctly/issues/2484) below):
+Two neighbouring shapes were captured alongside and are **not** part of this rule; each
+is a separate divergence (three more — ordering comparisons against a real `null`, `|=`
+with a zero-output filter, and the evaluation *order* of an assignment's two sides — were
+captured here too but are now resolved: see
+[#2483](https://github.com/rust-works/succinctly/issues/2483),
+[#2484](https://github.com/rust-works/succinctly/issues/2484) below, and the section
+immediately after this one):
 
 | filter                                    | input             | real yq        | succinctly                             |
 |-------------------------------------------|-------------------|----------------|----------------------------------------|
 | `.s.zzz`                                  | `s: x`            | *(nothing)*    | `Error: Cannot index string with string "zzz"` |
 | `.a \| with_entries(.value = key)`        | `a: {b: 1, e: 2}` | `{"b":0,"e":1}`| `{"b":1,"e":2}`                        |
-| `.x = (keys)`                             | `a: 1`            | `{"a":1,"x":["a","x"]}` | `{"a":1,"x":["a"]}`           |
 
 Row 1 is yq indexing a *scalar* with a key, which yields nothing everywhere, not only in
 a read-only context — it is what makes `.s.zzz + 1` also `1`. Row 2 is what `key` reports
@@ -1905,29 +1909,70 @@ for an element of a constructed array: real yq answers the index, succinctly has
 context for a value it built itself, so the `=` right side is empty and the write is
 skipped.
 
-Row 3 is an evaluation-*order* divergence that predates all of this and is unrelated to
-absent reads: real yq's `assignUpdateOperator` resolves (and auto-creates) the **left**
-side first, then evaluates the right side against the document that traversal has already
-mutated, so the right side can see the node the assignment is about to write into.
-succinctly evaluates the right side against the pristine input. `.x = (length)` on `a: 1`
-is `x: 2` in real yq and `x: 1` here for the same reason.
+### An assignment's target is created before its right side runs — resolved (#2481)
 
-That order is why four shapes that used to agree by coincidence now do not. `.zzz.q =
-(.zzz | key)` on `a: 1` is `zzz: {q: "zzz"}` in real yq because `.zzz` genuinely *exists*
-by the time the right side runs; succinctly's old answer matched only because its absent
-read fabricated a `null` node whose key happened to be spelled the same. With the read
-now correctly empty, the underlying order difference is what shows:
+Real yq's `assignUpdateOperator` (`pkg/yqlib/operator_assign.go`, v4.53.3) resolves and
+auto-creates the **left** side first, then evaluates the right side — through
+`ReadOnlyClone`, whose own half of the rule is #2470 above — against the document that
+traversal has already mutated. So the right side sees the node the assignment is about to
+write into. succinctly used to evaluate the right side against the pristine input;
+[#2481](https://github.com/rust-works/succinctly/issues/2481) closed that, and every row
+below now agrees with yq v4.53.3:
 
-| filter                    | input  | real yq              | succinctly          |
-|---------------------------|--------|----------------------|---------------------|
-| `.zzz.q = (.zzz \| key)`   | `a: 1` | `{"zzz":{"q":"zzz"}}`| `{"zzz":{"q":null}}`|
-| `.zzz.q += (.zzz \| key)`  | `a: 1` | `{"zzz":{"q":"zzz"}}`| `{"zzz":{"q":null}}`|
-| `.zzz.q -= (.zzz \| key)`  | `a: 1` | `{"zzz":{"q":"zzz"}}`| `{"zzz":{"q":null}}`|
-| `.zzz.q *= (.zzz \| key)`  | `a: 1` | *(error, exit 1)*    | `{"zzz":{"q":null}}`|
+| filter                    | input  | real yq (and now succinctly) | succinctly before #2481 |
+|---------------------------|--------|------------------------------|-------------------------|
+| `.x = (keys)`             | `a: 1` | `{"a":1,"x":["a","x"]}`      | `{"a":1,"x":["a"]}`     |
+| `.x = (length)`           | `a: 1` | `{"a":1,"x":2}`              | `{"a":1,"x":1}`         |
+| `.zzz.q = (.zzz \| key)`   | `a: 1` | `{"a":1,"zzz":{"q":"zzz"}}`  | `{"a":1,"zzz":{"q":null}}` |
+| `.zzz.q += (.zzz \| key)`  | `a: 1` | `{"a":1,"zzz":{"q":"zzz"}}`  | `{"a":1,"zzz":{"q":null}}` |
+| `.zzz.q -= (.zzz \| key)`  | `a: 1` | `{"a":1,"zzz":{"q":"zzz"}}`  | `{"a":1,"zzz":{"q":null}}` |
+| `(.x, .y) = (keys)`       | `a: 1` | both `["a","x","y"]`         | both `["a"]`            |
+| `.[2] = (length)`         | `[]`   | `[null,null,3]`              | `[null,null,0]`         |
 
-(the `a: 1` prefix elided). Closing these needs the right side evaluated against the
-left-vivified document, which is a change to the assignment model rather than to this
-rule -- and would move `.x = (keys)`/`.x = (length)` at the same time.
+`.zzz.q = (.zzz | key)` is the row that shows why this had to follow #2470 rather than
+precede it: succinctly's old answer matched yq only because its absent read fabricated a
+`null` node whose key happened to be spelled the same. Once that read was correctly
+empty, the underlying order difference was the only thing left holding the row up.
+
+`|=` is deliberately excluded: its filter runs through
+`context.SingleChildContext(candidate)`, per matched node with `.` bound to that node,
+not against the document — the same split #2470's table records.
+
+Implemented as `jq::eval::yq_prepare_assign_targets`, one definition shared by
+`eval_assign`, `eval_compound_assign` and `eval_alternative_assign`, which also carries
+#2470's zero-output-right-side document. Auto-creation is `path |= .` through the
+existing `update_path` walk rather than a second hand-written one, so yq's scalar-target
+no-op comes along for free (`.a.b = 1` on `a: 1` creates nothing and writes nothing,
+matching yq).
+
+Two consequences worth naming:
+
+- yq mode now resolves a **dynamic** left side before the right side too, which is real
+  yq's own order (`.[error("p")] = error("r")` reports `"p"`, where jq reports `"r"` —
+  the open half of [#1412](https://github.com/rust-works/succinctly/issues/1412)). Where
+  succinctly's left-side walk raises and real yq's does not, that error now surfaces
+  instead of the right side's: `(.a.x, .b.x) = error("boom")` on `a: 5\nb: {}` reports
+  `Cannot index number with string "x"`, where yq reports `boom`. The underlying gap is
+  pre-existing — a plain `(.a.x, .b.x) = 9` raises identically before and after — and is
+  #1412's comma-LHS half, not a new one.
+- A right side that reads the assignment's **own target** still diverges, because
+  succinctly has no node identity (the same limitation the anchor/alias section above
+  records). Real yq's right-side candidates are pointers into the document, so writing
+  through one and then assigning it to itself is a no-op; succinctly collects values and
+  applies the last. Live on `x: 5` (v4.53.3):
+
+  | filter                | real yq   | succinctly |
+  |-----------------------|-----------|------------|
+  | `.x = (1, .x)`        | `{"x":1}` | `{"x":5}`  |
+  | `.x = (1, .x, 2, .x)` | `{"x":2}` | `{"x":5}`  |
+  | `.x = (.x, 1)`        | `{"x":1}` | `{"x":1}`  |
+
+  Pre-existing on an existing target, and #2481 extends it to a *vivified* one, where
+  succinctly used to agree by coincidence: `.x = (1, .x)` on `a: 1` was `x: 1` only
+  because the absent `.x` read contributed nothing at all. Now that the target exists,
+  the read yields the vivified `null` and last-wins stores it (`x: null`, against yq's
+  `x: 1`). Pinned in both shapes in
+  `test_yq_assign_rhs_reading_its_own_target_lacks_node_identity_2481`.
 
 ### An `and`/`or` operand's evaluation context -- open (captured under [#2473](https://github.com/rust-works/succinctly/issues/2473))
 

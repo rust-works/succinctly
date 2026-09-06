@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`succinctly yq` now creates an assignment's target *before* evaluating its
+  right side, so the right side sees the mutated document** (#2481). Real yq's
+  `assignUpdateOperator` traverses the left side with auto-creation on and only
+  then evaluates the right side against the already-mutated document. Confirmed
+  live against yq v4.53.3 on `a: 1`: `.x = (keys)` is `{"a":1,"x":["a","x"]}`
+  and `.x = (length)` is `x: 2` (both listed/counted the target that did not
+  exist a moment earlier), `.zzz.q = (.zzz | key)` is `{"zzz":{"q":"zzz"}}`,
+  and `(.x, .y) = (keys)` gives both keys `["a","x","y"]`; on `[]`,
+  `.[2] = (length)` is `[null,null,3]` because the padding happens first. The
+  same applies to the compound forms real yq accepts (`+=`, `-=`, `*=`) and,
+  for internal consistency, to succinctly's own `/=`/`%=`/`//=` extensions;
+  `|=` is unchanged, since real yq evaluates its filter per matched node
+  instead. jq mode is unaffected and still evaluates its right side against
+  the pristine input (`.x = (keys)` is `{"a":1,"x":["a"]}` in jq 1.7.1).
+  Two knock-on effects: a *dynamic* left side is now resolved before the right
+  side in yq mode too — real yq's own order (#1412) — so a left-side walk that
+  raises where yq's does not now reports its own error rather than the right
+  side's; and a right side reading the assignment's own target
+  (`.x = (1, .x)`) still diverges, because succinctly has no node identity.
+  Both are recorded in `docs/compliance/yq/limitations.md`.
+
+### Fixed
+
 - **`succinctly yq`'s `|=` with a zero-output update filter now leaves an
   already-existing target completely untouched** (#2484). Confirmed live
   against yq v4.53.3: `.a |= (1 | select(false))` on `a: 1` stays `{"a":1}`,

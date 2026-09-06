@@ -20234,20 +20234,41 @@ fn test_yq_slice_assign_scalar_noop_still_propagates_rhs_error_unaffected_by_123
 }
 
 /// #1233 (deliberate non-goal, filed as #1412): a comma-grouped LHS where
-/// one branch is a genuine write must still evaluate (and propagate an
-/// error from) the RHS -- `yq_assign_is_total_noop`'s own gate
-/// (`!needs_path_prepass`) excludes every `Comma`-containing path from the
-/// fast path entirely, so this is really a regression guard on the
-/// *unchanged* existing flow, not new behavior.
+/// one branch is a genuine write skips `yq_assign_is_total_noop`'s fast
+/// path entirely -- its gate (`!needs_path_prepass`) excludes every
+/// `Comma`-containing path -- so the scalar branch (`.a.x` on `a: 5`)
+/// reaches the write and raises where real yq silently no-ops it.
+///
+/// That divergence is pre-existing and unchanged: a plain `(.a.x, .b.x) =
+/// 9` on the same input raises here both before and after #2481, while yq
+/// answers `{"a":5,"b":{"x":9}}` (v4.53.3). What #2481 did change is
+/// *which* error a failing RHS reports alongside it: the left side is now
+/// walked first, so its own failure surfaces instead of `boom`. Pinned as
+/// the observable consequence of that ordering, not as parity -- yq
+/// reports `boom` here, because its own left-side walk doesn't fail.
 #[test]
-fn test_yq_comma_lhs_mixed_noop_and_real_write_still_evaluates_rhs_1233() -> Result<()> {
+fn test_yq_comma_lhs_mixed_noop_and_real_write_raises_lhs_error_1233() -> Result<()> {
     let (_out, err, code) = run_yq_stdin_with_stderr(
         "(.a.x, .b.x) = error(\"boom\")",
         "a: 5\nb: {}\n",
         &["-o", "json"],
     )?;
     assert_ne!(code, 0);
-    assert!(err.contains("boom"), "err={err}");
+    assert!(
+        err.contains(r#"Cannot index number with string "x""#),
+        "err={err}"
+    );
+
+    // The same shape with a harmless RHS raises identically -- proof the
+    // error above is the pre-existing write-path gap surfacing earlier,
+    // not a new failure #2481 introduced.
+    let (_out, err, code) =
+        run_yq_stdin_with_stderr("(.a.x, .b.x) = 9", "a: 5\nb: {}\n", &["-o", "json"])?;
+    assert_ne!(code, 0);
+    assert!(
+        err.contains(r#"Cannot index number with string "x""#),
+        "err={err}"
+    );
     Ok(())
 }
 
@@ -25378,8 +25399,11 @@ fn test_yq_nonterminal_iterate_container_fanout_noop_1432() -> Result<()> {
 /// diverge from succinctly's in ways well outside #1432's own RHS-discard
 /// scope (live-verified against v4.53.3) --
 /// - a `Field` step hitting a real `Array` raises yq's own structural
-///   "cannot index array" error *before* the RHS ever evaluates, where
-///   succinctly evaluates the RHS first (`boom`);
+///   "cannot index array" error *before* the RHS ever evaluates. Since
+///   #2481 succinctly agrees on the ordering (the left side is resolved and
+///   auto-created before the right side runs), differing only in the
+///   message text -- so that shape asserts the structural error below,
+///   where it used to assert `boom`;
 /// - a genuinely out-of-range `Index` step *autovivifies* the array out
 ///   to that length in real yq (writing `null` padding, then fanning the
 ///   `Iterate` into the newly-created empty tail -- no error, no RHS
@@ -25387,10 +25411,14 @@ fn test_yq_nonterminal_iterate_container_fanout_noop_1432() -> Result<()> {
 ///   evaluates the RHS instead;
 /// - an `Index` step hitting a real `Object` coerces the index to a
 ///   string key and inserts it in real yq (`{"0": []}`), where
-///   succinctly has no such coercion and evaluates the RHS instead.
+///   succinctly has no such coercion and raises. Since #2481 it raises
+///   from the left-side walk (before the RHS), so that shape asserts the
+///   structural error below too -- it used to report `boom`. A harmless
+///   RHS raises the same error both before and after, which is what makes
+///   this an ordering change rather than a new failure.
 ///
-/// All three are pre-existing, unrelated write-path gaps (this exact
-/// catch-all replaces `navigate_read_only`'s own pre-existing `_ =>
+/// The remaining two are pre-existing, unrelated write-path gaps (this
+/// exact catch-all replaces `navigate_read_only`'s own pre-existing `_ =>
 /// Absent` for the identical shapes) -- out of scope here, not
 /// introduced or worsened by this fix. The fourth shape (`Index` hitting
 /// a genuine scalar) is the one case that *does* already match yq: a
@@ -25399,14 +25427,21 @@ fn test_yq_nonterminal_iterate_container_fanout_noop_1432() -> Result<()> {
 #[test]
 fn test_yq_assign_all_noop_mismatched_element_type_1432() -> Result<()> {
     // `Field` mid-prefix hits a real `Array` (wrong container type),
-    // with a `Field` still ahead of it in the prefix.
+    // with a `Field` still ahead of it in the prefix. #2481: the left
+    // side is walked before the right side, so its structural failure is
+    // what surfaces -- the same ordering real yq uses here (`cannot index
+    // array with 'b' (strconv.ParseInt: parsing "b": invalid syntax)`,
+    // v4.53.3), where this used to report `boom` instead.
     let (_out, err, code) = run_yq_stdin_with_stderr(
         ".a.b[].c = error(\"boom\")",
         "a:\n  - 1\n  - 2\n",
         &["-o", "json"],
     )?;
     assert_ne!(code, 0);
-    assert!(err.contains("boom"), "err={err}");
+    assert!(
+        err.contains(r#"Cannot index array with string "b""#),
+        "err={err}"
+    );
 
     // `Index` mid-prefix is out of range on a real `Array`, with an
     // `Index` still ahead of it in the prefix.
@@ -25429,7 +25464,14 @@ fn test_yq_assign_all_noop_mismatched_element_type_1432() -> Result<()> {
     let (_out, err, code) =
         run_yq_stdin_with_stderr(".a[0][].b = error(\"boom\")", "a: {}\n", &["-o", "json"])?;
     assert_ne!(code, 0);
-    assert!(err.contains("boom"), "err={err}");
+    assert!(err.contains("Cannot index object with number"), "err={err}");
+
+    // Same shape, harmless RHS: the identical error, before and after
+    // #2481 -- the write-path gap is pre-existing, only its ordering
+    // relative to the RHS moved.
+    let (_out, err, code) = run_yq_stdin_with_stderr(".a[0][].b = 9", "a: {}\n", &["-o", "json"])?;
+    assert_ne!(code, 0);
+    assert!(err.contains("Cannot index object with number"), "err={err}");
 
     Ok(())
 }
@@ -33278,7 +33320,8 @@ fn test_yq_absent_key_in_assign_rhs_yields_no_node_2470() -> Result<()> {
 /// unchanged row an assignment that skipped the write on an *existing*
 /// target. Captured with `1 | select(false)` -- a right side that is empty
 /// for reasons of its own -- so the rule is keyed on "produced nothing" and
-/// not on why. `jq::eval::yq_empty_rhs_document` implements it; jq mode is
+/// not on why. `jq::eval::yq_prepare_assign_targets` implements it (#2481
+/// moved the same walk ahead of the right side); jq mode is
 /// pinned to jq's own opposite answer (no document at all) in
 /// `test_jq_absent_key_and_empty_rhs_keep_jqs_own_answers_2470`.
 #[test]
@@ -33485,6 +33528,215 @@ fn test_jq_absent_key_and_empty_rhs_keep_jqs_own_answers_2470() -> Result<()> {
         (r".a.e -= (.zzz)", r"", 5),
     ] {
         let (out, stderr, code) = run_jq_stdin_with_stderr(filter, ABSENT_RHS_JSON_2470, &["-c"])?;
+        assert_eq!(
+            (out.trim(), code),
+            (want, want_code),
+            "`{filter}` -- stderr: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+// =============================================================================
+// #2481: yq resolves and auto-creates the assignment target before the RHS
+// =============================================================================
+
+/// The document every #2481 row runs against: one scalar key, so a `keys`
+/// or `length` in the right side changes its answer the moment the target
+/// is created. `yq -o=json -I0 FILTER` on this YAML, `/usr/bin/jq 1.7.1 -c
+/// FILTER` on `{"a":1}`.
+const VIVIFY_DOC_2481: &str = "a: 1\n";
+
+/// The same document as JSON, for the jq-mode control below.
+const VIVIFY_JSON_2481: &str = r#"{"a":1}"#;
+
+/// #2481: real yq's `assignUpdateOperator` (`pkg/yqlib/operator_assign.go`,
+/// v4.53.3) traverses the **left** side with auto-creation on and only then
+/// evaluates the right side, against the document that traversal already
+/// mutated. So `.x = (keys)` on `a: 1` lists `"x"` too, and `.x = (length)`
+/// counts it.
+///
+/// Every row is a live capture from yq v4.53.3 (`-o=json -I0`); jq's own
+/// opposite answers are pinned in
+/// `test_jq_assign_rhs_still_sees_the_pristine_input_2481` below.
+///
+/// This is what makes #2470's read-only rule observable rather than
+/// coincidental: `.zzz.q = (.zzz | key)` used to match yq only because an
+/// absent read fabricated a `null` node spelled `zzz`. With that read now
+/// correctly empty, the target genuinely existing by the time the right
+/// side runs is the only thing that can produce `"zzz"`.
+#[test]
+fn test_yq_assign_vivifies_target_before_rhs_2481() -> Result<()> {
+    for (filter, want) in [
+        (r".x = (keys)", r#"{"a":1,"x":["a","x"]}"#),
+        (r".x = (length)", r#"{"a":1,"x":2}"#),
+        // The vivified node is a real `null` the right side can read back,
+        // ask the key of, and ask the path of.
+        (r".x = (.x)", r#"{"a":1,"x":null}"#),
+        (r".x = (.x | key)", r#"{"a":1,"x":"x"}"#),
+        (r".x = (.x | path)", r#"{"a":1,"x":["x"]}"#),
+        // A whole missing chain is created, not just the leaf.
+        (r".zzz.q = (.zzz | key)", r#"{"a":1,"zzz":{"q":"zzz"}}"#),
+        (r".x.y = (.x | keys)", r#"{"a":1,"x":{"y":["y"]}}"#),
+        (r".x.y = ([..] | length)", r#"{"a":1,"x":{"y":4}}"#),
+        // ...but never *through* a scalar: yq's own field/index no-op
+        // (#1232) means nothing is created and nothing is written.
+        (r".a.b.c = (.a | keys)", r#"{"a":1}"#),
+        (r".a.b = 1", r#"{"a":1}"#),
+        // Every branch of a comma-grouped left side is created first, so
+        // both see both.
+        (
+            r"(.x, .y) = (keys)",
+            r#"{"a":1,"x":["a","x","y"],"y":["a","x","y"]}"#,
+        ),
+        (r"(.x, .y) = (length)", r#"{"a":1,"x":3,"y":3}"#),
+        // The compound operators real yq accepts share the rule.
+        (r".x += (keys)", r#"{"a":1,"x":["a","x"]}"#),
+        (r".x += (length)", r#"{"a":1,"x":2}"#),
+        (r".zzz.q += (.zzz | key)", r#"{"a":1,"zzz":{"q":"zzz"}}"#),
+        (r".zzz.q -= (.zzz | key)", r#"{"a":1,"zzz":{"q":"zzz"}}"#),
+    ] {
+        let (out, stderr, code) =
+            run_yq_stdin_with_stderr(filter, VIVIFY_DOC_2481, &["-o", "json", "-I", "0"])?;
+        assert_eq!(
+            (out.trim(), code),
+            (want, 0),
+            "`{filter}` -- stderr: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// #2481, the array half: an out-of-range index target is **padded** before
+/// the right side runs, so `length` counts the padding it just created.
+/// Captured on `[]` (yq v4.53.3, `-o=json -I0`); jq answers `[0]` and
+/// `[null,null,0]` for the first two, pinned below.
+#[test]
+fn test_yq_assign_vivify_pads_an_array_target_before_rhs_2481() -> Result<()> {
+    for (filter, want) in [
+        (r".[0] = (length)", r"[1]"),
+        (r".[2] = (length)", r"[null,null,3]"),
+    ] {
+        let (out, stderr, code) =
+            run_yq_stdin_with_stderr(filter, "[]\n", &["-o", "json", "-I", "0"])?;
+        assert_eq!(
+            (out.trim(), code),
+            (want, 0),
+            "`{filter}` -- stderr: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// #2481's write-side ordering, captured before it was encoded.
+///
+/// Real yq applies a multi-output right side **in sequence to one
+/// document** rather than forking one document per output (#1430's
+/// collapse-to-last, which #2481 leaves exactly as it was) -- so the value
+/// that survives is the last one. Every row here is a live capture from yq
+/// v4.53.3, and each is only interesting *because* the target is vivified:
+/// `keys`/`length` in the middle of the stream answer for the mutated
+/// document.
+///
+/// `|=` is the deliberate exception, and is unchanged: its filter runs
+/// through `context.SingleChildContext(candidate)`, i.e. per matched node
+/// with `.` bound to that node, so nothing about the document-level rule
+/// applies to it (#2470's own table row).
+#[test]
+fn test_yq_assign_vivify_multi_output_rhs_and_per_node_update_2481() -> Result<()> {
+    for (filter, want) in [
+        // Last output wins, once, one document -- not two.
+        (r".x = (keys, length)", r#"{"a":1,"x":2}"#),
+        (r".x = (keys, length, .a)", r#"{"a":1,"x":1}"#),
+        // An output *after* the first still reads the vivified document.
+        (r".y = (1, keys)", r#"{"a":1,"y":["a","y"]}"#),
+        // `|=` binds `.` to the (freshly created) node, not the document.
+        (r#".x |= (. // "d")"#, r#"{"a":1,"x":"d"}"#),
+    ] {
+        let (out, stderr, code) =
+            run_yq_stdin_with_stderr(filter, VIVIFY_DOC_2481, &["-o", "json", "-I", "0"])?;
+        assert_eq!(
+            (out.trim(), code),
+            (want, 0),
+            "`{filter}` -- stderr: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// #2481's remaining gap, pinned as succinctly's own answer rather than as
+/// parity: real yq's right-side candidates are *pointers into the document*,
+/// so a right side that reads the assignment's own target aliases the node
+/// the write is about to change, and assigning that node to itself is a
+/// no-op rather than a re-read of the pre-write value.
+///
+/// Live on `x: 5` (v4.53.3): `.x = (1, .x)` is `{"x":1}` -- the write of `1`
+/// mutates the very node the second candidate points at, so the second
+/// write stores `1` again. succinctly has no node identity (the same
+/// limitation the anchor/alias section of `docs/compliance/yq/limitations.md`
+/// records), so its collected right side is `[1, 5]` and the last value
+/// wins: `{"x":5}`.
+///
+/// That divergence is **pre-existing** -- `x: 5` is unchanged by #2481 -- but
+/// #2481 does extend it to a *vivified* target, where succinctly used to
+/// agree by coincidence: `.x = (1, .x)` on `a: 1` was `x: 1` only because
+/// the absent `.x` read contributed nothing at all, leaving `[1]`. Now that
+/// the target exists, the read yields the vivified `null` and the last-wins
+/// rule stores it. Pinned in both shapes so the gap cannot close silently.
+#[test]
+fn test_yq_assign_rhs_reading_its_own_target_lacks_node_identity_2481() -> Result<()> {
+    for (doc, filter, want) in [
+        // Pre-existing: yq `{"x":1}`.
+        ("x: 5\n", r".x = (1, .x)", r#"{"x":5}"#),
+        // Pre-existing: yq `{"x":2}`.
+        ("x: 5\n", r".x = (1, .x, 2, .x)", r#"{"x":5}"#),
+        // Agrees with yq: the last output is not a self-reference.
+        ("x: 5\n", r".x = (.x, 1)", r#"{"x":1}"#),
+        // Extended by #2481: yq `{"a":1,"x":1}`.
+        ("a: 1\n", r".x = (1, .x)", r#"{"a":1,"x":null}"#),
+    ] {
+        let (out, stderr, code) =
+            run_yq_stdin_with_stderr(filter, doc, &["-o", "json", "-I", "0"])?;
+        assert_eq!(
+            (out.trim(), code),
+            (want, 0),
+            "`{filter}` on `{doc}` -- stderr: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+/// #2481's jq-mode control: none of it applies there. jq's `_modify`
+/// evaluates `.x = f` as `f as $v | setpath(...)`, with `$v` bound against
+/// the **pristine** input, so `.x = (keys)` never lists `x` and a
+/// multi-output right side forks one document per output. Captured live
+/// from `/usr/bin/jq` 1.7.1 (the pinned oracle -- Homebrew's is 1.8.2).
+#[test]
+fn test_jq_assign_rhs_still_sees_the_pristine_input_2481() -> Result<()> {
+    for (filter, want, want_code) in [
+        (r".x = (keys)", r#"{"a":1,"x":["a"]}"#, 0),
+        (r".x = (length)", r#"{"a":1,"x":1}"#, 0),
+        (r".x = (.x | type)", r#"{"a":1,"x":"null"}"#, 0),
+        (r".x = ([paths])", r#"{"a":1,"x":[["a"]]}"#, 0),
+        (r".x += (keys)", r#"{"a":1,"x":["a"]}"#, 0),
+        (r"(.x,.y) = (length)", r#"{"a":1,"x":1,"y":1}"#, 0),
+        // Forks a whole document per output, where yq keeps only the last.
+        (
+            r".x = (keys, length)",
+            "{\"a\":1,\"x\":[\"a\"]}\n{\"a\":1,\"x\":1}",
+            0,
+        ),
+        // No node identity question to answer: `$v` is a value, and the
+        // second output is the pristine (absent) `.x`.
+        (
+            r".x = (1, .x)",
+            "{\"a\":1,\"x\":1}\n{\"a\":1,\"x\":null}",
+            0,
+        ),
+        // jq raises where yq creates: no auto-creation before the RHS.
+        (r".a.b.c = (.a | keys)", r"", 5),
+    ] {
+        let (out, stderr, code) = run_jq_stdin_with_stderr(filter, VIVIFY_JSON_2481, &["-c"])?;
         assert_eq!(
             (out.trim(), code),
             (want, want_code),
