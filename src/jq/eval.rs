@@ -38720,7 +38720,14 @@ fn propagate_anchor_writes(
             let def_pre = get_value_at_path(pre, def);
             aliases
                 .iter()
-                .map(|alias| get_value_at_path(pre, alias).filter(|v| Some(v) == def_pre.as_ref()))
+                .map(|alias| {
+                    // `identical`, not `==` (#1360): with jq equality an
+                    // anchored `.nan` never looks like a copy of itself, so
+                    // the slot is never propagated to and #763's gate then
+                    // drops its mark as diverged.
+                    get_value_at_path(pre, alias)
+                        .filter(|v| def_pre.as_ref().is_some_and(|d| v.identical(d)))
+                })
                 .collect()
         })
         .collect();
@@ -38734,10 +38741,14 @@ fn propagate_anchor_writes(
                 let Some(want) = expected[g][a].as_ref() else {
                     continue;
                 };
-                if *want == new {
+                if want.identical(&new) {
                     continue;
                 }
-                if get_value_at_path(post, alias).as_ref() != Some(want) {
+                // Same rule for "was this slot rebound by an earlier stage"
+                // (#2499): all three comparisons in this loop have to agree
+                // on what "unchanged" means, or a NaN slot is judged a copy
+                // by one and a divergence by another.
+                if !get_value_at_path(post, alias).is_some_and(|v| v.identical(want)) {
                     continue;
                 }
                 if let Ok(updated) = set_value_at_path(post.clone(), alias, new.clone()) {

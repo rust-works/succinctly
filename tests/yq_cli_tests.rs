@@ -40062,3 +40062,156 @@ mod issue_2091_def_and_binder_wrapped_writes {
         Ok(())
     }
 }
+
+// #1360: #763's soundness gate and #711's alias propagation both compared
+// values with `OwnedValue`'s **jq value equality**, under which `NaN` differs
+// from itself. An anchored `.nan` therefore reported a divergence that never
+// happened: the alias was never propagated to, and the gate then dropped its
+// `*x` mark as unresolvable.
+//
+// Own module rather than bare file end: the identical-trailing-`Ok(())`
+// context merge hazard that has bitten this repo for real (#2500).
+//
+// Every expectation is pinned real `yq` v4.53.3 output.
+// =============================================================================
+mod issue_1360_identity_not_jq_equality {
+    use super::*;
+
+    /// The issue's own repro.
+    ///
+    /// $ yq '.c = 1'  =>  a: &x .nan / b: *x / c: 1
+    #[test]
+    fn test_yaml_nan_anchor_alias_survives_unrelated_write_1360() -> Result<()> {
+        let (output, code) = run_yq_stdin(".c = 1", "a: &x .nan\nb: *x\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(output, "a: &x .nan\nb: *x\nc: 1\n");
+        Ok(())
+    }
+
+    /// A `NaN` *anywhere inside* an anchored container cost the whole subtree
+    /// its mark, not just the scalar holding it.
+    #[test]
+    fn test_yaml_nan_anchor_alias_survives_nested_1360() -> Result<()> {
+        for (input, expected) in [
+            (
+                "a: &x {p: .nan, q: 1}\nb: *x\n",
+                "a: &x {p: .nan, q: 1}\nb: *x\nc: 1\n",
+            ),
+            (
+                "a: &x [1.0, .nan, .inf]\nb: *x\n",
+                "a: &x [1.0, .nan, .inf]\nb: *x\nc: 1\n",
+            ),
+        ] {
+            let (output, code) = run_yq_stdin(".c = 1", input, &[])?;
+            assert_eq!(code, 0, "{input}");
+            assert_eq!(output, expected, "{input}");
+        }
+        Ok(())
+    }
+
+    /// The control that pins the cause to `NaN` rather than to floats in
+    /// general: `.inf` compares equal to itself and was always correct.
+    #[test]
+    fn test_yaml_inf_anchor_alias_control_1360() -> Result<()> {
+        for input in ["a: &x .inf\nb: *x\n", "a: &x -.inf\nb: *x\n"] {
+            let (output, code) = run_yq_stdin(".c = 1", input, &[])?;
+            assert_eq!(code, 0, "{input}");
+            assert!(output.ends_with("b: *x\nc: 1\n"), "{input}: {output}");
+        }
+        Ok(())
+    }
+
+    /// `-0.0` is jq-equal to `0.0` but does not render the same, so the
+    /// stricter rule must not mistake an anchored `-0.0` for a divergence
+    /// either.
+    #[test]
+    fn test_yaml_negative_zero_anchor_alias_unrelated_write_1360() -> Result<()> {
+        let (output, code) = run_yq_stdin(".c = 1", "a: &x -0.0\nb: *x\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(output, "a: &x -0.0\nb: *x\nc: 1\n");
+        Ok(())
+    }
+
+    /// **The regression guard for the propagation half.** `.a = 1.0` on
+    /// `a: &x 1` changes only the number's spelling. If the gate is strict
+    /// but the propagation still uses jq equality, the sync skips the alias
+    /// (`1 == 1.0`), the gate then sees `1.0` against `1`, and the mark is
+    /// dropped. Both must use the same rule.
+    ///
+    /// $ yq '.a = 1.0'  =>  a: &x 1.0 / b: *x
+    #[test]
+    fn test_yaml_assign_float_spelling_to_anchor_syncs_alias_1360() -> Result<()> {
+        let (output, code) = run_yq_stdin(".a = 1.0", "a: &x 1\nb: *x\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(output, "a: &x 1.0\nb: *x\n");
+        Ok(())
+    }
+
+    /// A write landing *on* the alias must not be discarded because the new
+    /// value happens to be jq-equal to the anchor's.
+    ///
+    /// These two pass by way of #1351's alias-identity rebinding rather than
+    /// the equality rule — a path ending exactly at an alias rebinds that
+    /// position — so they guard that interaction rather than this fix. Pinned
+    /// because the issue's own triage predicted them failing, and they are
+    /// the shape that would break first if either rule moved.
+    ///
+    /// $ yq '.b = -0.0'  =>  a: &x 0.0 / b: -0.0
+    /// $ yq '.b = 1.0'   =>  a: &x 1   / b: 1.0
+    #[test]
+    fn test_yaml_write_through_alias_spelling_not_discarded_1360() -> Result<()> {
+        for (input, filter, expected) in [
+            ("a: &x 0.0\nb: *x\n", ".b = -0.0", "a: &x 0.0\nb: -0.0\n"),
+            ("a: &x 1\nb: *x\n", ".b = 1.0", "a: &x 1\nb: 1.0\n"),
+        ] {
+            let (output, code) = run_yq_stdin(filter, input, &[])?;
+            assert_eq!(code, 0, "{filter}");
+            assert_eq!(output, expected, "{filter}");
+        }
+        Ok(())
+    }
+
+    /// A stricter rule must not start reporting divergences for numbers that
+    /// merely *round-trip* through the reindex bridge. The issue's triage
+    /// flagged this as the way the fix could backfire: if the bridge
+    /// collapsed an untouched `NumberLiteral` to a plain `Int`/`Float`,
+    /// strict identity would call every untouched number changed and drop its
+    /// mark.
+    #[test]
+    fn test_yaml_number_spellings_round_trip_under_strict_identity_1360() -> Result<()> {
+        for spelling in [
+            "1", "1.0", "0", "0.10", "3.140", "1e10", "1E+10", "-0.0", ".inf", "-.inf", ".nan",
+        ] {
+            let input = format!("a: &x {spelling}\nb: *x\n");
+            let (output, code) = run_yq_stdin(".c = 1", &input, &[])?;
+            assert_eq!(code, 0, "{spelling}");
+            assert_eq!(
+                output,
+                format!("a: &x {spelling}\nb: *x\nc: 1\n"),
+                "spelling {spelling} must survive untouched, mark included"
+            );
+        }
+        Ok(())
+    }
+
+    /// Ordinary values are unaffected: the change is about *which* comparison
+    /// the gate uses, not about which documents it accepts.
+    #[test]
+    fn test_yaml_ordinary_anchor_alias_unaffected_1360() -> Result<()> {
+        for (input, filter, expected) in [
+            ("a: &x 1\nb: *x\n", ".a = 99", "a: &x 99\nb: *x\n"),
+            ("a: &x 1\nb: *x\n", ".c = 3", "a: &x 1\nb: *x\nc: 3\n"),
+            ("a: &x {p: 1}\nb: *x\n", ".a.p = 9", "a: &x {p: 9}\nb: *x\n"),
+            (
+                "a: &x \"s\"\nb: *x\n",
+                ".c = 1",
+                "a: &x \"s\"\nb: *x\nc: 1\n",
+            ),
+        ] {
+            let (output, code) = run_yq_stdin(filter, input, &[])?;
+            assert_eq!(code, 0, "{filter}");
+            assert_eq!(output, expected, "{filter} on {input:?}");
+        }
+        Ok(())
+    }
+}

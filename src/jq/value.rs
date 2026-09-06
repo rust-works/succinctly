@@ -2720,6 +2720,89 @@ pub(crate) fn numeric_repr_cmp(a: NumberRepr, b: NumberRepr) -> core::cmp::Order
     }
 }
 
+impl OwnedValue {
+    /// Structural identity: would these two render *identically*?
+    ///
+    /// Deliberately stricter than [`PartialEq`], which is **jq value
+    /// equality** — `Int(1) == Float(1.0)`, `-0.0 == 0.0`, and `NaN` equal to
+    /// nothing at all, itself included. That is the right rule for jq's `==`
+    /// and the wrong one for asking "has this node changed?", which is what
+    /// #763's anchor-soundness gate and #711's alias propagation both need.
+    ///
+    /// The NaN case is the one that shows why (#1360). An anchored `.nan`
+    /// reports a divergence that never happened, so the alias is never
+    /// propagated to and its `*x` mark is then dropped as unresolvable:
+    ///
+    /// ```text
+    /// $ printf 'a: &x .nan\nb: *x\n' | yq            '.c = 1'   # b: *x
+    /// $ printf 'a: &x .nan\nb: *x\n' | succinctly yq '.c = 1'   # b: .nan
+    /// ```
+    ///
+    /// `.inf` is the control: it compares equal to itself and was already
+    /// correct, which is what pins the cause to NaN rather than to floats in
+    /// general.
+    ///
+    /// Floats compare by [`f64::to_bits`], not `total_cmp`: the same answers
+    /// on every case here, but it states the intent ("would render
+    /// identically") and sidesteps a `-0.0`/NaN-sign discussion. A number
+    /// keeps its own spelling, so `Int(1)` is not identical to `Float(1.0)`
+    /// nor to a `NumberLiteral` of either — a write that changes only the
+    /// spelling is a real change, and treating it as one is what stops it
+    /// being silently discarded.
+    ///
+    /// Objects compare by key **order** as well as content: `emit_yaml_value`
+    /// writes fields in order, so two orderings do not render identically
+    /// even though jq considers them equal.
+    ///
+    /// Panics past [`MAX_VALUE_TREE_DEPTH`] levels of nesting (#1005), like
+    /// the `PartialEq` beside it.
+    #[must_use]
+    pub fn identical(&self, other: &Self) -> bool {
+        owned_value_identical_at_depth(self, other, 0)
+    }
+}
+
+/// The recursion behind [`OwnedValue::identical`], carrying the depth guard
+/// its trait-shaped sibling cannot.
+fn owned_value_identical_at_depth(a: &OwnedValue, b: &OwnedValue, depth: usize) -> bool {
+    assert_value_tree_depth(depth);
+    /// Two number representations that would render identically.
+    fn repr_identical(a: NumberRepr, b: NumberRepr) -> bool {
+        match (a, b) {
+            (NumberRepr::Int(a), NumberRepr::Int(b)) => a == b,
+            (NumberRepr::Float(a), NumberRepr::Float(b)) => a.to_bits() == b.to_bits(),
+            // A number that reached `Int` and one that reached `Float` do not
+            // render the same way, whatever their values.
+            _ => false,
+        }
+    }
+    match (a, b) {
+        (OwnedValue::Null, OwnedValue::Null) => true,
+        (OwnedValue::Bool(a), OwnedValue::Bool(b)) => a == b,
+        (OwnedValue::Int(a), OwnedValue::Int(b)) => a == b,
+        (OwnedValue::Float(a), OwnedValue::Float(b)) => a.to_bits() == b.to_bits(),
+        (OwnedValue::NumberLiteral(ra, ta), OwnedValue::NumberLiteral(rb, tb)) => {
+            repr_identical(*ra, *rb) && ta == tb
+        }
+        (OwnedValue::String(a), OwnedValue::String(b)) => a == b,
+        (OwnedValue::Array(a), OwnedValue::Array(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(x, y)| owned_value_identical_at_depth(x, y, depth + 1))
+        }
+        (OwnedValue::Object(a), OwnedValue::Object(b)) => {
+            a.len() == b.len()
+                && a.iter().zip(b.iter()).all(|((ka, va), (kb, vb))| {
+                    ka == kb && owned_value_identical_at_depth(va, vb, depth + 1)
+                })
+        }
+        // Every cross-variant pair, the number ones included: `Int(1)` and
+        // `Float(1.0)` are jq-equal and do not render the same.
+        _ => false,
+    }
+}
+
 impl PartialEq for OwnedValue {
     fn eq(&self, other: &Self) -> bool {
         owned_value_eq_at_depth(self, other, 0)
@@ -5037,6 +5120,110 @@ mod tests {
                 !is_jq_canonical_number(raw.as_bytes()),
                 "{raw:?} is reformatted by jq and must not take the fast path"
             );
+        }
+    }
+
+    // -- #1360: structural identity vs jq value equality ------------------
+
+    /// The four places `identical` must be *stricter* than `==`, which is
+    /// the whole reason it exists: each of these pairs is jq-equal and does
+    /// not render the same way.
+    #[test]
+    fn identical_is_stricter_than_jq_equality_1360() {
+        let looser = [
+            // NaN is the case that motivated this: `==` says it differs from
+            // itself, so an anchored `.nan` reported a divergence that never
+            // happened.
+            (
+                OwnedValue::Float(f64::NAN),
+                OwnedValue::Float(f64::NAN),
+                true,
+            ),
+            // ...and these are jq-equal but render differently.
+            (OwnedValue::Float(-0.0), OwnedValue::Float(0.0), false),
+            (OwnedValue::Int(1), OwnedValue::Float(1.0), false),
+            (
+                OwnedValue::Int(1),
+                OwnedValue::NumberLiteral(NumberRepr::Int(1), "1".into()),
+                false,
+            ),
+        ];
+        for (a, b, want) in looser {
+            assert_eq!(
+                a.identical(&b),
+                want,
+                "identical({a:?}, {b:?}) should be {want}"
+            );
+        }
+
+        // The `==` answers these differ from, stated explicitly so a change
+        // to either rule shows up here.
+        assert_ne!(OwnedValue::Float(f64::NAN), OwnedValue::Float(f64::NAN));
+        assert_eq!(OwnedValue::Float(-0.0), OwnedValue::Float(0.0));
+        assert_eq!(OwnedValue::Int(1), OwnedValue::Float(1.0));
+    }
+
+    /// A `NumberLiteral` keeps its own source spelling, so two that parse to
+    /// the same number are not identical unless the text matches too.
+    #[test]
+    fn identical_compares_number_literal_spelling_1360() {
+        let lit = |r, t: &str| OwnedValue::NumberLiteral(r, t.into());
+        assert!(lit(NumberRepr::Float(1.0), "1.0").identical(&lit(NumberRepr::Float(1.0), "1.0")));
+        assert!(!lit(NumberRepr::Float(1.0), "1.0").identical(&lit(NumberRepr::Float(1.0), "1.00")));
+        assert!(!lit(NumberRepr::Int(1), "1").identical(&lit(NumberRepr::Float(1.0), "1.0")));
+        // NaN inside a literal repr is still reflexive under bit equality.
+        assert!(lit(NumberRepr::Float(f64::NAN), ".nan")
+            .identical(&lit(NumberRepr::Float(f64::NAN), ".nan")));
+    }
+
+    /// Containers recurse, and objects compare key **order** too: the emitter
+    /// writes fields in order, so two orderings do not render identically
+    /// even though jq considers them equal.
+    #[test]
+    fn identical_recurses_and_respects_key_order_1360() {
+        let nan_arr = || OwnedValue::Array(vec![OwnedValue::Float(f64::NAN)]);
+        assert!(nan_arr().identical(&nan_arr()));
+        assert_ne!(nan_arr(), nan_arr(), "jq equality still says otherwise");
+
+        let obj = |pairs: &[(&str, i64)]| {
+            OwnedValue::Object(
+                pairs
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), OwnedValue::Int(*v)))
+                    .collect(),
+            )
+        };
+        assert!(obj(&[("a", 1), ("b", 2)]).identical(&obj(&[("a", 1), ("b", 2)])));
+        assert!(!obj(&[("a", 1), ("b", 2)]).identical(&obj(&[("b", 2), ("a", 1)])));
+        // IndexMap equality is order-independent, so `==` disagrees here.
+        assert_eq!(obj(&[("a", 1), ("b", 2)]), obj(&[("b", 2), ("a", 1)]));
+        // Length and key names still matter.
+        assert!(!obj(&[("a", 1)]).identical(&obj(&[("a", 1), ("b", 2)])));
+        assert!(!obj(&[("a", 1)]).identical(&obj(&[("z", 1)])));
+    }
+
+    /// Every ordinary value is identical to itself -- the property the gate
+    /// actually relies on, and the one `==` broke for NaN.
+    #[test]
+    fn identical_is_reflexive_for_every_variant_1360() {
+        for v in [
+            OwnedValue::Null,
+            OwnedValue::Bool(true),
+            OwnedValue::Bool(false),
+            OwnedValue::Int(0),
+            OwnedValue::Int(-7),
+            OwnedValue::Float(0.0),
+            OwnedValue::Float(-0.0),
+            OwnedValue::Float(f64::INFINITY),
+            OwnedValue::Float(f64::NEG_INFINITY),
+            OwnedValue::Float(f64::NAN),
+            OwnedValue::NumberLiteral(NumberRepr::Float(f64::NAN), ".nan".into()),
+            OwnedValue::String(String::new()),
+            OwnedValue::String("s".into()),
+            OwnedValue::Array(Vec::new()),
+            OwnedValue::Object(indexmap::IndexMap::new()),
+        ] {
+            assert!(v.identical(&v), "not reflexive: {v:?}");
         }
     }
 }
