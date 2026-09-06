@@ -3723,7 +3723,8 @@ jq 1.7.1 still answers empty here, but only because its own unary minus
 collapses a literal this large to a `double` before `range` ever sees it
 (confirmed live: `jq -nc '-9223372036854775758'` prints
 `-9223372036854776000`, already rounded) -- an unrelated, pre-existing
-divergence (see the "Widened divergence" discussion below), not something
+divergence (see "Unary minus in filter text destroys literal preservation"
+below, #2357), not something
 #2219 changed. The pre-#2219 empty answer matched jq's only by coincidence
 of that unrelated quirk; feeding the same magnitudes in as *data* instead of
 literals (`echo '[-9223372036854775758,-9223372036854775808,-100]' | jq -c
@@ -3886,6 +3887,54 @@ described:
   large-but-safe integers to `f64`, as the `±2^53` gate did, or reproducing
   jq's own hang, as ADR-0018 does not require — is the worse failure mode
   for the realistic inputs this magnitude range covers).
+
+### Unary minus in filter text destroys literal preservation — accepted divergence, ADR-0018 rule 4c (#2357)
+
+Real jq preserves a number literal's exact source spelling through to output (`jq -n
+'1.0'` → `1.0`, `1e10` → `1E+10`), but a *unary minus written in the filter text* breaks
+that: `-1.0` is `negate(1.0)`, a computed `double`, not a preserved literal, so jq's own
+answer at extreme magnitude no longer matches the value as written. succinctly keeps the
+exact value regardless of a leading `-` in the filter. Confirmed live against jq 1.7.1:
+
+```console
+$ jq  -nc -- '-9223372036854775758'      # -9223372036854776000
+$ sjq -nc -- '-9223372036854775758'      # -9223372036854775758
+$ jq  -nc -- '-9007199254740993'         # -9007199254740992
+$ sjq -nc -- '-9007199254740993'         # -9007199254740993
+$ jq  -nc -- '-1.10'                     # -1.1  (agrees -- magnitude-specific)
+$ sjq -nc -- '-1.10'                     # -1.1
+```
+
+Only reachable above `2^53` (where a `double` can no longer hold the literal exactly) — the
+same magnitude floor the `range` divergence above starts at. It is specifically the
+*filter-text* unary minus: the identical value arriving as **data** keeps its exact spelling
+in both tools (unrelated to this divergence, and not the general large-integer class it might
+first look like):
+
+```console
+$ echo '[-9223372036854775758]' | jq  -c '.[0]'   # -9223372036854775758
+$ echo '[-9223372036854775758]' | sjq -c '.[0]'   # -9223372036854775758
+```
+
+**Why this is worth stating explicitly rather than leaving as an obvious consequence of
+jq's own parser:** it silently changes the answer of anything downstream of a negative
+literal at that magnitude, and it produced a real analysis error in this repo before this
+was recorded — the `range` divergence above (`range(-9223372036854775758;
+-9223372036854775808; -100)`) used to read as evidence that succinctly's overflow handling
+agreed with jq's, when the agreement was actually two independent bugs' outputs coinciding:
+jq's `[]` came entirely from unary minus collapsing `from` to exactly `i64::MIN` before
+`range` ever ran, not from anything `range` itself computed. Feeding the identical
+magnitudes in as data (where jq keeps its literals) already showed the two tools
+disagreeing on `range` itself, underneath the unary-minus coincidence.
+
+**Accepted rather than matched (ADR-0018 rule 4c):** succinctly already diverges
+deliberately and wholesale from jq's `double`-based number model above `2^53` for this
+whole magnitude class (see the `range` divergence above, and #2131/#2089) — including cases
+where matching jq would mean reproducing a genuine hang. Making unary minus specifically
+collapse to `double`, while every other operation in the same class keeps the exact value,
+would make succinctly's own behavior *less* internally consistent, not more, for a single
+operator's worth of parity. Pinned by
+`test_unary_minus_destroys_literal_preservation_2357` (`tests/jq_cli_tests.rs`).
 
 ### `--argjson`/`--jsonargs` still reject a bare trailing decimal point with no exponent (`1.`) — accepted divergence, ADR-0018 rule 4c (#2240)
 

@@ -37455,7 +37455,7 @@ fn test_m2_lazyseq_halt_prints_nothing_1576() -> Result<()> {
 /// apart at `~2^63` magnitude round to the *same* `f64` once real jq parses
 /// them (its own unary minus collapses a literal this large to a `double`
 /// before `range` ever sees it -- an unrelated, already-documented
-/// divergence, `docs/compliance/jq/limitations.md`'s #2131 section), so
+/// divergence, `docs/compliance/jq/limitations.md`'s #2357 section), so
 /// real jq's `while(. > $upto; . + $by)` never even emits its own starting
 /// value -- confirmed live against the pinned jq 1.7.1 oracle (empty
 /// output, exit 0). succinctly no longer matches that by coincidence: since
@@ -37477,6 +37477,29 @@ fn test_range_i64_overflow_keeps_exact_prefix_diverging_from_jq_2219() -> Result
         stdout, "-9223372036854775758\n",
         "expected the exact from value, kept rather than discarded (#2219)"
     );
+    Ok(())
+}
+
+/// #2357: real jq's unary minus destroys literal preservation above `2^53`
+/// (the operand becomes a computed `double`, not a preserved literal),
+/// where succinctly keeps the exact value -- accepted as a deliberate
+/// divergence (ADR-0018 rule 4c, `docs/compliance/jq/limitations.md`'s
+/// "Unary minus in filter text destroys literal preservation" section), for
+/// the same reason succinctly stays exact everywhere else above `2^53`
+/// rather than matching jq's `double`/`decNumber` model one operator at a
+/// time. `-1.10` is the magnitude-specific control: below `2^53`, `double`
+/// holds the value exactly either way, so the two tools still agree.
+#[test]
+fn test_unary_minus_destroys_literal_preservation_2357() -> Result<()> {
+    for (filter, want) in [
+        ("-9223372036854775758", "-9223372036854775758"),
+        ("-9007199254740993", "-9007199254740993"),
+        ("-1.10", "-1.1"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", "--", filter], None)?;
+        assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "for filter {filter:?}");
+    }
     Ok(())
 }
 
