@@ -25105,6 +25105,53 @@ fn test_yaml_sync_skips_deleted_alias_2499() -> Result<()> {
     Ok(())
 }
 
+// =============================================================================
+// #2498: `sync_aliased_paths`'s nested-group fixpoint -- an anchor whose
+// subtree contains another anchor/alias pair must have that inner sync's
+// own write picked up before the outer group's copy is finalized, however
+// many passes that takes. See issue 1351's design-plan case 3. Verified
+// live against Homebrew `yq` v4.53.3.
+// =============================================================================
+
+/// #2498: an anchor nested inside another anchor's subtree -- the inner
+/// alias must follow the outer sync to a fixpoint rather than freezing at
+/// whatever value the inner group held when the outer group's single pass
+/// ran. Live oracle: `.a.p = 5` on `a: &x {p: &y 1, q: *y}\nb: *x\n` gives
+/// `{"a":{"p":5,"q":5},"b":{"p":5,"q":5}}` -- `b`'s copy of `q` must be `5`,
+/// not the stale `1` a single, non-fixpoint pass would leave it at.
+#[test]
+fn test_yaml_sync_nested_anchor_inner_alias_follows_2498() -> Result<()> {
+    let input = "a: &x\n  p: &y 1\n  q: *y\nb: *x\n";
+
+    let (output, exit_code) = run_yq_stdin(".a.p = 5", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: &x\n  p: &y 5\n  q: *y\nb: *x\n");
+
+    let (output, exit_code) = run_yq_stdin(".a.p = 5", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":{"p":5,"q":5},"b":{"p":5,"q":5}}"#);
+    Ok(())
+}
+
+/// #2498: the inner def can also sit *outside* the outer anchor while its
+/// alias sits inside it, so depth-sorting the groups would not be enough --
+/// only a real fixpoint over the group loop handles this. Live oracle:
+/// `.x = 5` on `x: &y 1\na: &x {q: *y}\nb: *x\n` gives
+/// `{"x":5,"a":{"q":5},"b":{"q":5}}`.
+#[test]
+fn test_yaml_sync_inner_def_outside_outer_anchor_2498() -> Result<()> {
+    let input = "x: &y 1\na: &x {q: *y}\nb: *x\n";
+
+    let (output, exit_code) = run_yq_stdin(".x = 5", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "x: &y 5\na: &x {q: *y}\nb: *x\n");
+
+    let (output, exit_code) = run_yq_stdin(".x = 5", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"x":5,"a":{"q":5},"b":{"q":5}}"#);
+    Ok(())
+}
+
 /// #1201: `reduce`/`foreach`'s binding clause is parsed by the shared
 /// `parse_pattern`, which both `ParserMode`s reach, so full destructuring
 /// patterns land in yq mode too. There is no oracle to match here -- real yq

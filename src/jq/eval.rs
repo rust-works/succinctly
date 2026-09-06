@@ -38488,7 +38488,7 @@ fn set_value_at_path(
 /// by the caller from the pre-mutation document. For each group, if the
 /// value at the definition path differs between `pristine` (before the
 /// write) and `result` (after), every alias path is overwritten with a clone
-/// of the new value -- subject to the rule below.
+/// of the new value -- subject to the two rules below.
 ///
 /// A group whose definition path no longer resolves in `result` (e.g. the
 /// anchored key was deleted) is left untouched, so its aliases keep their
@@ -38502,8 +38502,8 @@ fn set_value_at_path(
 /// itself last put there (or, before any pass has touched it, the pristine
 /// value the alias originally resolved to). Per alias path, an `expected`
 /// value tracks that: it starts as the value at that path in `pristine`, and
-/// is updated to whatever this function writes there. A slot is only
-/// overwritten while its *current* value in `result` still equals its
+/// is updated to whatever this function writes there. A pass only
+/// overwrites a slot whose *current* value in `result` still equals its
 /// `expected` value; a slot that some earlier stage of the same pipe already
 /// rebound, deleted, or moved no longer matches and is left alone (`.b =
 /// null | .a.p = 9` keeps `b: null` rather than clobbering it with the
@@ -38511,6 +38511,25 @@ fn set_value_at_path(
 /// all (`get_value_at_path` returns `None`, e.g. `del(.b)` ran first) is
 /// skipped outright -- never autovivified or array-padded by
 /// `set_value_at_path`.
+///
+/// **Rule B -- fixpoint over nested groups (#2498).** A single pass over
+/// `groups` in `collect_alias_groups` order can leave an inner alias stale:
+/// if an anchored node contains another anchor/alias pair, the outer
+/// group's def-path value may only pick up the inner sync's write partway
+/// through (or not at all) depending on processing order, and the inner
+/// def can equally sit *outside* the node the outer alias copies into. So
+/// the whole group loop repeats to a fixpoint -- until a full pass writes
+/// nothing -- capped at `groups.len()` passes, which is exact because each
+/// pass can only add writes (so the value at any def path can change at
+/// most `groups.len()` times: once per group whose sync could possibly
+/// touch it) and a pass that changes nothing proves the rest would too.
+/// Rule A's per-slot `expected` value is exactly what makes a second pass
+/// correct here rather than re-triggering Rule A's own gate: once pass 1
+/// copies the outer anchor's value into its alias, that alias slot's
+/// `expected` is updated to the copied value, so pass 2 -- after the inner
+/// group changes the outer anchor's value again -- still recognizes the
+/// slot as an untouched copy and updates it, rather than mistaking the
+/// first pass's own write for an external rebind.
 pub fn sync_aliased_paths(
     result: &mut OwnedValue,
     pristine: &OwnedValue,
@@ -38530,36 +38549,45 @@ pub fn sync_aliased_paths(
         })
         .collect();
 
-    for (group_idx, (def_path, alias_paths)) in groups.iter().enumerate() {
-        let (Some(old), Some(new)) = (
-            get_value_at_path(pristine, def_path),
-            get_value_at_path(result, def_path),
-        ) else {
-            continue;
-        };
-        if old == new {
-            continue;
-        }
-        for (alias_idx, alias_path) in alias_paths.iter().enumerate() {
-            // Never autovivify or array-pad a slot that no longer resolves
-            // (e.g. `del(.b)` ran earlier in the pipe).
-            let Some(current) = get_value_at_path(result, alias_path) else {
+    // Rule B: repeat the group loop to a fixpoint, capped at `groups.len()`
+    // passes -- see the doc comment above for why that bound is exact.
+    for _ in 0..groups.len() {
+        let mut changed = false;
+        for (group_idx, (def_path, alias_paths)) in groups.iter().enumerate() {
+            let (Some(old), Some(new)) = (
+                get_value_at_path(pristine, def_path),
+                get_value_at_path(result, def_path),
+            ) else {
                 continue;
             };
-            // Rule A: only overwrite a slot that's still the untouched copy
-            // this function (or the initial pristine snapshot) last left
-            // there.
-            if expected[group_idx][alias_idx].as_ref() != Some(&current) {
+            if old == new {
                 continue;
             }
-            if current == new {
-                // Already in sync; nothing to write or re-track.
-                continue;
+            for (alias_idx, alias_path) in alias_paths.iter().enumerate() {
+                // Never autovivify or array-pad a slot that no longer
+                // resolves (e.g. `del(.b)` ran earlier in the pipe).
+                let Some(current) = get_value_at_path(result, alias_path) else {
+                    continue;
+                };
+                // Rule A: only overwrite a slot that's still the untouched
+                // copy this function (or the initial pristine snapshot)
+                // last left there.
+                if expected[group_idx][alias_idx].as_ref() != Some(&current) {
+                    continue;
+                }
+                if current == new {
+                    // Already in sync; nothing to write or re-track.
+                    continue;
+                }
+                if let Ok(updated) = set_value_at_path(result.clone(), alias_path, new.clone()) {
+                    *result = updated;
+                    expected[group_idx][alias_idx] = Some(new.clone());
+                    changed = true;
+                }
             }
-            if let Ok(updated) = set_value_at_path(result.clone(), alias_path, new.clone()) {
-                *result = updated;
-                expected[group_idx][alias_idx] = Some(new.clone());
-            }
+        }
+        if !changed {
+            break;
         }
     }
 }
@@ -68207,6 +68235,89 @@ mod tests {
             panic!("expected object");
         };
         assert!(!entries.contains_key("b"), "del(.b) must not be undone");
+    }
+
+    /// #2498: `sync_aliased_paths` must iterate nested groups to a
+    /// fixpoint. Mirrors the live oracle repro (`.a.p = 5` on
+    /// `a: &x {p: &y 1, q: *y}`, `b: *x`): the outer group (`x` -> `b`) is
+    /// processed before the inner one (`y` -> `a.q`) resolves, so a single
+    /// pass would copy `a`'s stale `q` into `b`. A second pass, made
+    /// possible by Rule A's per-slot `expected` tracking, must pick up the
+    /// inner group's own update and re-sync `b`.
+    #[test]
+    fn test_sync_aliased_paths_iterates_nested_groups_to_fixpoint_2498() {
+        let pristine = OwnedValue::Object(IndexMap::from([
+            (
+                "a".to_string(),
+                OwnedValue::Object(IndexMap::from([
+                    ("p".to_string(), OwnedValue::Int(1)),
+                    ("q".to_string(), OwnedValue::Int(1)),
+                ])),
+            ),
+            (
+                "b".to_string(),
+                OwnedValue::Object(IndexMap::from([
+                    ("p".to_string(), OwnedValue::Int(1)),
+                    ("q".to_string(), OwnedValue::Int(1)),
+                ])),
+            ),
+        ]));
+
+        // Simulate `.a.p = 5`: only `a.p` changes; `a.q` (the inner alias)
+        // and `b` (the outer alias) are both still their pristine copies.
+        let mut result = pristine.clone();
+        result = set_value_at_path(
+            result,
+            &[
+                OwnedValue::String("a".to_string()),
+                OwnedValue::String("p".to_string()),
+            ],
+            OwnedValue::Int(5),
+        )
+        .unwrap();
+
+        // Outer group (anchor `x`, def `a`, alias `b`) is listed before the
+        // inner group (anchor `y`, def `a.p`, alias `a.q`) -- the same
+        // document-order `collect_alias_groups` produces for this shape,
+        // and the ordering a single, non-fixpoint pass gets wrong.
+        let groups = vec![
+            (
+                vec![OwnedValue::String("a".to_string())],
+                vec![vec![OwnedValue::String("b".to_string())]],
+            ),
+            (
+                vec![
+                    OwnedValue::String("a".to_string()),
+                    OwnedValue::String("p".to_string()),
+                ],
+                vec![vec![
+                    OwnedValue::String("a".to_string()),
+                    OwnedValue::String("q".to_string()),
+                ]],
+            ),
+        ];
+
+        sync_aliased_paths(&mut result, &pristine, &groups);
+
+        assert_eq!(
+            result,
+            OwnedValue::Object(IndexMap::from([
+                (
+                    "a".to_string(),
+                    OwnedValue::Object(IndexMap::from([
+                        ("p".to_string(), OwnedValue::Int(5)),
+                        ("q".to_string(), OwnedValue::Int(5)),
+                    ])),
+                ),
+                (
+                    "b".to_string(),
+                    OwnedValue::Object(IndexMap::from([
+                        ("p".to_string(), OwnedValue::Int(5)),
+                        ("q".to_string(), OwnedValue::Int(5)),
+                    ])),
+                ),
+            ]))
+        );
     }
 
     /// `null` is the one value jq auto-vivifies, and it becomes whichever
