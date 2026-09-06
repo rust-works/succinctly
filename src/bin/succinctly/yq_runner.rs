@@ -13,8 +13,8 @@ use std::io::{BufWriter, IsTerminal, Read, Write};
 use std::path::Path;
 
 use succinctly::jq::document::{
-    child_tail_gap_ok, effective_keys, DisplayKeyGuard, DocumentCursor, DocumentElements,
-    DocumentFields, DocumentValue, IndentSpec, JsonConvention,
+    child_tail_gap_ok, container_tail_gap_ok, effective_keys, DisplayKeyGuard, DocumentCursor,
+    DocumentElements, DocumentFields, DocumentValue, IndentSpec, JsonConvention,
 };
 use succinctly::jq::escape::AsciiEscapeWriter;
 use succinctly::jq::eval_generic::{
@@ -1121,24 +1121,25 @@ fn gather_input_sources(
 /// CLI-reachable through `--slurp`/`--eval-all`/`--inplace
 /// --input-format json` (this function's only callers):
 /// `echo '[1,]' | succinctly yq --slurp --input-format json -o json '.[0]'`
-/// used to exit 0 with `1`, where real yq rejects it. `[,]`/`{,}` remain
-/// unchecked here: this function is never given a cursor for the
-/// *container itself*, only `value: &V`, so once a container's child walk
-/// is exhausted there is no cursor left to find its opening bracket from.
-/// `eval_generic::to_owned_at_depth` had the identical shape, but #2358
-/// found every one of its recursive call sites already resolves the
-/// child's own cursor for an unrelated reason and simply discards it --
-/// threading it through closed the gap there for every nested container.
-/// This function's own recursion (below) does the same "resolve, then
-/// discard" thing for its own #1677 checks -- untouched by #2358, whose
-/// own scope named only the `eval_generic.rs` function; tracked as #2403
-/// rather than assumed to close the same way without checking.
+/// used to exit 0 with `1`, where real yq rejects it.
+///
+/// `[,]`/`{,}` remain unchecked only at the *true top level*: the bare
+/// `value: &V` this function's own public entry point receives has no
+/// cursor for the container itself, so once a container's child walk is
+/// exhausted there is no cursor left to find its opening bracket from.
+/// `eval_generic::to_owned_at_depth` had the identical shape, and #2358
+/// closed it there by threading each recursive call's already-resolved
+/// child cursor through as the next level's container cursor -- #2403
+/// applies the same fix here (`to_owned_canonicalizing_numbers_at_depth`'s
+/// own `cursor` parameter below), closing the gap for every *nested*
+/// container the same way.
 fn to_owned_canonicalizing_numbers<V: DocumentValue>(value: &V) -> Result<OwnedValue, EvalError> {
-    to_owned_canonicalizing_numbers_at_depth(value, 0)
+    to_owned_canonicalizing_numbers_at_depth(value, None, 0)
 }
 
 fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
     value: &V,
+    cursor: Option<&V::Cursor>,
     depth: usize,
 ) -> Result<OwnedValue, EvalError> {
     // `check_nesting_depth` (256, matching `eval_generic::to_owned_at_depth`
@@ -1196,7 +1197,11 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
             let key = field.checked_key(&f, &map, &mut guard, is_first)?;
             map.insert(
                 key,
-                to_owned_canonicalizing_numbers_at_depth(&field.value, depth + 1)?,
+                to_owned_canonicalizing_numbers_at_depth(
+                    &field.value,
+                    Some(&field.value_cursor),
+                    depth + 1,
+                )?,
             );
             last_field = Some(field.value_cursor);
             f = rest;
@@ -1209,13 +1214,16 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
         if f.ends_unpaired() {
             return Err(f.malformed_member_error());
         }
-        // #2262/#1803: `child_tail_gap_ok` is the value-domain tail --
-        // `{"a":1,}` checked via the last real field's own cursor, `{,}`
-        // left unchecked because #2211's `container_gap_ok` needs a cursor
-        // for the container itself that this signature never receives. Its
-        // doc comment carries the full reasoning, which this site and
-        // `eval_generic::to_owned_at_depth` used to state twice.
-        child_tail_gap_ok(last_field.as_ref(), b'}')?;
+        // #2403: with `cursor` in hand (every level but the true top),
+        // `container_tail_gap_ok` closes #2211's `{,}` gap the same way
+        // `eval_generic::to_owned_at_depth` does since #2358 --
+        // `child_tail_gap_ok` alone (the `None` fallback, only ever hit at
+        // the true top level) still can't, for the reason this function's
+        // own doc comment above explains.
+        match cursor {
+            Some(c) => container_tail_gap_ok(c, last_field.as_ref(), b'}')?,
+            None => child_tail_gap_ok(last_field.as_ref(), b'}')?,
+        }
         OwnedValue::Object(map)
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();
@@ -1235,18 +1243,18 @@ fn to_owned_canonicalizing_numbers_at_depth<V: DocumentValue>(
             }
             items.push(to_owned_canonicalizing_numbers_at_depth(
                 &elem_cursor.value(),
+                Some(&elem_cursor),
                 depth + 1,
             )?);
             last_elem = Some(elem_cursor);
             elems = rest;
             is_first = false;
         }
-        // #2262: same reasoning as the object arm's own check above --
-        // `[,]` remains unchecked here (no container cursor available),
-        // but `[1,]` is, via the last real element's own cursor. This is
-        // the live, CLI-reachable fix: `echo '[1,]' | succinctly yq --slurp
-        // --input-format json -o json '.[0]'` used to exit 0 with `1`.
-        child_tail_gap_ok(last_elem.as_ref(), b']')?;
+        // #2403: same reasoning as the object arm's own check above.
+        match cursor {
+            Some(c) => container_tail_gap_ok(c, last_elem.as_ref(), b']')?,
+            None => child_tail_gap_ok(last_elem.as_ref(), b']')?,
+        }
         OwnedValue::Array(items)
     } else if value.is_null() {
         OwnedValue::Null
@@ -8193,6 +8201,78 @@ mod tests {
                 panic!("{json:?}: known gap -- silently accepted, got error {e:?}");
             }
         }
+    }
+
+    /// #2403: unlike the true top level (pinned above as a permanent,
+    /// documented gap), a *nested* stray `,` in an empty container now
+    /// raises -- every recursive call below the top level has a real cursor
+    /// to the child it just resolved, which #2403 threads through as this
+    /// function's own `cursor` parameter (the same fix #2358 already
+    /// applied to `eval_generic::to_owned_at_depth`) specifically so
+    /// `container_tail_gap_ok` (not `child_tail_gap_ok`'s weaker,
+    /// cursor-less fallback) can close #2211's `{,}`/`[,]` check one level
+    /// down. Confirmed live and CLI-reachable: `echo '{"a": [,]}' |
+    /// succinctly yq --slurp --input-format json -o json '.[0]'` used to
+    /// silently accept the document; real yq v4.53.3 rejects it.
+    #[test]
+    fn to_owned_canonicalizing_numbers_raises_on_nested_stray_comma_in_empty_container_2403() {
+        for json in [&br#"{"a": {,}}"#[..], &br#"{"a": [,]}"#[..]] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let err = to_owned_canonicalizing_numbers(&cursor.value())
+                .expect_err("a stray comma in a nested empty container is not JSON");
+            assert!(
+                err.message.contains("Invalid JSON text"),
+                "{json:?}: message: {}",
+                err.message
+            );
+        }
+    }
+
+    /// #2403 regression guard: the pre-existing nested trailing-comma check
+    /// (`{"a":1,}` / `[1,]`, #2262 -- already reachable at nested depth
+    /// before #2403, via the same `last_field`/`last_elem` cursor
+    /// `child_tail_gap_ok` always used) is unaffected by #2403 routing that
+    /// check through `container_tail_gap_ok` instead, one level down.
+    #[test]
+    fn to_owned_canonicalizing_numbers_raises_on_nested_trailing_comma_2403() {
+        for json in [&br#"{"a": {"b":1,}}"#[..], &br#"{"a": [1,]}"#[..]] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let err = to_owned_canonicalizing_numbers(&cursor.value())
+                .expect_err("a stray trailing comma after a real nested child is not JSON");
+            assert!(
+                err.message.contains("Invalid JSON text"),
+                "{json:?}: message: {}",
+                err.message
+            );
+        }
+    }
+
+    /// #2403: ordinary well-formed nested containers -- including a nested
+    /// empty container, the exact shape the new check above targets --
+    /// round-trip unaffected.
+    #[test]
+    fn to_owned_canonicalizing_numbers_wellformed_nested_containers_unaffected_2403() {
+        let json = br#"{"a": [1,2,{"b":3}], "c": {}, "d": []}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expected = OwnedValue::Object(IndexMap::from([
+            (
+                "a".to_string(),
+                OwnedValue::Array(vec![
+                    OwnedValue::Int(1),
+                    OwnedValue::Int(2),
+                    OwnedValue::Object(IndexMap::from([("b".to_string(), OwnedValue::Int(3))])),
+                ]),
+            ),
+            ("c".to_string(), OwnedValue::Object(IndexMap::new())),
+            ("d".to_string(), OwnedValue::Array(vec![])),
+        ]));
+        assert_eq!(
+            to_owned_canonicalizing_numbers(&cursor.value()).unwrap(),
+            expected
+        );
     }
 
     /// `depth` levels of single-child `CommentTree::Array` nesting, mirroring
