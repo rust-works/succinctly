@@ -1233,6 +1233,18 @@ produces a different *value* depending on whether it edited the file or printed 
 fast path already shared `stream_cursor!` with stdout, so this only ever concerned the
 fallback a non-M2-eligible filter reaches.
 
+**One fork remains between `-i` and stdout**, and it is deliberate. A document with two
+*complex* mapping keys whose display spellings collide (`? [1]\n: v1\n? [2]\n: v2`, both
+`""` per [#222](https://github.com/rust-works/succinctly/issues/222)) makes `-i` raise
+`object key "" is ambiguous` and leave the file untouched
+([#1749](https://github.com/rust-works/succinctly/issues/1749)'s guard), where stdout prints
+`'': v2` and drops the first entry silently. Real yq keeps *both* keys, so both routes
+diverge from it; `-i` diverges in the safe direction, since the alternative is destroying a
+key in the user's own file. Closing the stdout half needs `YamlValue::key_string_kind`'s
+classification on the `DocumentValue` trait — `resolve_display_key`'s generic
+`key_display_string_kind` flags only keys whose *decode* failed, and a complex key decodes
+cleanly to `""`.
+
 A JSON-sourced `-i` file stays on the materializing route deliberately: a `YamlIndex` accepts
 `[1,]` as a flow sequence, so rerouting it would reopen the hole
 [#2276](https://github.com/rust-works/succinctly/issues/2276) closed, and JSON has no

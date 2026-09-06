@@ -35001,7 +35001,14 @@ mod issue_1349_inplace_presentation {
     }
 
     /// The whole point of the fix stated as an invariant: for a YAML file,
-    /// `-i` must write exactly what the same filter prints to stdout.
+    /// `-i` writes exactly what the same filter prints to stdout.
+    ///
+    /// One deliberate exception, not covered here: two *complex* mapping
+    /// keys whose display spellings collide make `-i` raise and leave the
+    /// file alone (#1749's guard), where stdout silently drops one. Real yq
+    /// keeps both, so both routes diverge from it — `-i` in the safe
+    /// direction. Recorded in `compliance/yq/limitations.md`; pinned by
+    /// `test_yaml_native_dom_raises_on_colliding_complex_key_1749`.
     #[test]
     fn test_yq_inplace_matches_stdout_for_the_same_filter_1349() -> Result<()> {
         let cases = [
@@ -35043,6 +35050,129 @@ mod issue_1349_inplace_presentation {
             "[1,]",
             "the file must be left byte-identical"
         );
+        Ok(())
+    }
+
+    /// The walker `-i` uses to apply #1749's guard shares its
+    /// *classification* with `yaml_to_owned_value` (both call
+    /// `key_string_kind` + `DisplayKeyGuard::check`) but writes its own
+    /// *traversal*. Pins that the two agree, so the copy cannot drift:
+    /// `--slurp` drives `yaml_to_owned_value`, `-i` drives the walker, and
+    /// they must accept and reject exactly the same documents.
+    #[test]
+    fn validate_yaml_display_keys_agrees_with_yaml_to_owned_value_1349() -> Result<()> {
+        // (document, must_raise)
+        let cases = [
+            // Two complex keys, both displaying as "".
+            ("? [1,2]\n: a\n? [3,4]\n: b\n", true),
+            // Three of them: the guard fires at the second, not "eventually".
+            ("? [1,2]\n: a\n? [3,4]\n: b\n? [5,6]\n: c\n", true),
+            // Nested one level down inside a sequence.
+            ("outer:\n  - ? [1,2]\n    : a\n    ? [3,4]\n    : b\n", true),
+            // Nested inside another mapping.
+            (
+                "outer:\n  inner:\n    ? [1,2]\n    : a\n    ? [3,4]\n    : b\n",
+                true,
+            ),
+            // A genuine key colliding with a complex key's fallback spelling.
+            ("\"\": g\n? [1,2]\n: a\n", true),
+            // An *ordinary* repeated key still wins last, no raise.
+            ("a: 1\na: 2\n", false),
+            // A lone complex key has nothing to collide with.
+            ("? [1,2]\n: a\nb: 2\n", false),
+            // Two complex keys in *different* mappings do not collide.
+            ("x:\n  ? [1,2]\n  : a\ny:\n  ? [3,4]\n  : b\n", false),
+            ("plain: 1\nnested:\n  - 1\n  - two\n", false),
+        ];
+        for (doc, must_raise) in cases {
+            // `--slurp` with `.[0]`, not `.`: bare `.` under `--slurp`
+            // streams without ever materializing, so it never reaches
+            // `yaml_to_owned_value` at all. `.[0]` forces the DOM route --
+            // the same driver `test_yaml_native_dom_raises_on_colliding_complex_key_1749`
+            // uses, and for the same reason.
+            let (_out, slurp_err, slurp_code) =
+                run_yq_stdin_with_stderr(".[0]", doc, &["--slurp"])?;
+            // `-i -P` routes through the #1349 validation walker.
+            let mut file = NamedTempFile::new()?;
+            write!(file, "{doc}")?;
+            let out = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+                .arg("yq")
+                .args(["-i", "-P", "."])
+                .arg(file.path())
+                .stdin(Stdio::null())
+                .output()?;
+            let inplace_raised = !out.status.success();
+            let inplace_err = String::from_utf8_lossy(&out.stderr).to_string();
+
+            assert_eq!(
+                slurp_code == 1,
+                must_raise,
+                "--slurp on {doc:?}: stderr {slurp_err}"
+            );
+            assert_eq!(
+                inplace_raised, must_raise,
+                "-i on {doc:?}: stderr {inplace_err}"
+            );
+            if must_raise {
+                assert!(
+                    inplace_err.contains("ambiguous"),
+                    "-i on {doc:?} must name the ambiguity, got: {inplace_err}"
+                );
+                // A raise must never touch the file.
+                assert_eq!(std::fs::read_to_string(file.path())?, doc);
+            }
+        }
+        Ok(())
+    }
+
+    /// The JSON arm keeps its own `--doc` filtering and halt handling, which
+    /// #1349 moved rather than changed. Pinned because the move made them
+    /// newly-added lines with no coverage of their own, and because a JSON
+    /// `-i` file is exactly what must *not* drift onto the YAML route.
+    ///
+    /// All three answers are byte-identical to the pre-#1349 binary.
+    #[test]
+    fn test_yq_inplace_json_arm_keeps_doc_filter_and_halt_1349() -> Result<()> {
+        let json = "{\"a\":1,\"b\":2}";
+
+        // `--doc 0` selects the single JSON document; the write lands.
+        let mut file = NamedTempFile::new()?;
+        write!(file, "{json}")?;
+        let out = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .arg("yq")
+            .args(["-i", "-p", "json", "--doc", "0", ".a = 9"])
+            .arg(file.path())
+            .stdin(Stdio::null())
+            .output()?;
+        assert!(out.status.success());
+        assert_eq!(std::fs::read_to_string(file.path())?, "a: 9\nb: 2\n");
+
+        // `--doc 1` selects nothing -- `parse_input` yields exactly one
+        // document for JSON -- so the filter's `continue` fires and the file
+        // is truncated, the same way any legitimately-empty `-i` output is.
+        let mut file = NamedTempFile::new()?;
+        write!(file, "{json}")?;
+        let out = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .arg("yq")
+            .args(["-i", "-p", "json", "--doc", "1", ".a = 9"])
+            .arg(file.path())
+            .stdin(Stdio::null())
+            .output()?;
+        assert!(out.status.success());
+        assert_eq!(std::fs::read_to_string(file.path())?, "");
+
+        // A halt leaves the file byte-identical (#791), unlike an ordinary
+        // empty result above.
+        let mut file = NamedTempFile::new()?;
+        write!(file, "{json}")?;
+        let out = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .arg("yq")
+            .args(["-i", "-p", "json", "(.a = 9) | halt"])
+            .arg(file.path())
+            .stdin(Stdio::null())
+            .output()?;
+        assert!(out.status.success());
+        assert_eq!(std::fs::read_to_string(file.path())?, json);
         Ok(())
     }
 }
