@@ -911,7 +911,7 @@ pub mod alias_identity {
                             redirected.extend(components[i..].iter().cloned());
                             redirect_components(redirected, doc, table, opts, hops + 1, out);
                             return;
-                        }
+                        } // omni-dev: coverage tolerate-line reason="unreachable: def is always a collect_alias_groups anchor path, which step_to_expr never fails on (#1351)"
                     }
                 }
             }
@@ -932,7 +932,7 @@ pub mod alias_identity {
         let mut paths = vec![rebuild(components)];
         redirect_paths(&mut paths, doc, Redirect::SINGLE);
         let Some(redirected) = paths.pop() else {
-            return;
+            return; // omni-dev: coverage tolerate-line reason="unreachable: redirect_paths with Redirect::SINGLE always contributes exactly one output per input, so a 1-element paths always pops Some (#1351)"
         };
         let mut flat = Vec::new();
         push_path_components(&mut flat, &redirected);
@@ -941,11 +941,11 @@ pub mod alias_identity {
             .map(|c| match unwrap_path_component(c).0 {
                 Expr::Field(name) => Some(OwnedValue::String(name.clone())),
                 Expr::Index { idx, .. } => Some(OwnedValue::Int(*idx)),
-                _ => None,
+                _ => None, // omni-dev: coverage tolerate-line reason="unreachable: a concrete setpath/delpaths path's components are always Field/Index -- step_to_expr never produces another shape (#1351)"
             })
             .collect::<Option<Vec<OwnedValue>>>()
         else {
-            return;
+            return; // omni-dev: coverage tolerate-line reason="unreachable: the map above never yields None, since it only ever matches Field/Index (#1351)"
         };
         *path = concrete;
     }
@@ -85137,6 +85137,24 @@ mod tests {
             let mut with_slice = vec![OwnedValue::String("b".into()), slice.clone()];
             alias_identity::redirect_concrete_path(&mut with_slice, &doc);
             assert_eq!(with_slice, vec![OwnedValue::String("b".into()), slice]);
+        }
+
+        /// A concrete path's redirected components can land on an array
+        /// index, not just an object key -- `setpath`/`delpaths` addressing
+        /// a sequence alias (`l: [&s {p: 1}, *s]`) exercises the `Index` arm
+        /// of `redirect_concrete_path`'s own component-to-`OwnedValue` map,
+        /// same as an object key exercises the `Field` arm above.
+        #[test]
+        fn concrete_path_redirect_normalises_an_index_component_1351() {
+            let table = alias_identity::AliasTable::from_groups(vec![(
+                path(&["l", "0"]),
+                vec![path(&["l", "1"])],
+            )]);
+            let _guard = alias_identity::enter(table);
+            let doc = json(r#"{"l":[{"p":1},{"p":1}]}"#);
+            let mut p = path(&["l", "1", "p"]);
+            alias_identity::redirect_concrete_path(&mut p, &doc);
+            assert_eq!(p, path(&["l", "0", "p"]));
         }
 
         #[test]
