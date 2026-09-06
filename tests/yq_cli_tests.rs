@@ -35474,6 +35474,23 @@ fn test_yaml_rebound_alias_is_not_redirected_1351() -> Result<()> {
 }
 
 #[test]
+fn test_yaml_rebind_to_equal_value_is_indistinguishable_from_the_anchor_1351() -> Result<()> {
+    // DELIBERATE DIVERGENCE (docs/compliance/yq/limitations.md): the equality
+    // gate's one false positive. Real yq detaches `b` here (`b: {p: 1, q: 2}`);
+    // succinctly cannot tell a copy rebound to an equal value from an untouched
+    // one, so `b` follows the anchor.
+    for filter in [".b = .a | .a.p = 9", r#".b = {"p": 1, "q": 2} | .a.p = 9"#] {
+        assert_yq_1351(
+            filter,
+            "a: &x {p: 1, q: 2}\nb: *x\n",
+            "a: &x {p: 9, q: 2}\nb: *x\n",
+            r#"{"a":{"p":9,"q":2},"b":{"p":9,"q":2}}"#,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
 fn test_yaml_deleted_declaration_writes_positionally_1351() -> Result<()> {
     // Rule 7, a recorded limitation: with the anchor deleted earlier in the
     // pipe there is no declaration to redirect to, so `.b.p = 9` is

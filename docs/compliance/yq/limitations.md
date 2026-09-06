@@ -93,8 +93,12 @@ $ printf 'a: &x {p: 1}\nb: *x\nc: *x\n' | succinctly yq -o=json -I=0 '.[] .p += 
 
 The redirect is gated on *identity by equality*: it applies only while the alias position
 still holds the anchor's value, so a position rebound earlier in the pipe (`.b = 5 | .b.p =
-9`) is written positionally, as yq treats a rebound position. Two consequences are recorded
-divergences/limitations rather than matches:
+9`) is written positionally, as yq treats a rebound position. The gate's one false positive
+is a rebind to a value *equal* to the anchor's: `.b = .a | .a.p = 9` (or `.b = {"p": 1, "q":
+2} | .a.p = 9`) detaches `b` in yq (`b: {p: 1, q: 2}`), while succinctly cannot tell the
+rebound copy from an untouched one and keeps it in step (`b: *x`, value `{p: 9, q: 2}`). The
+written value is never affected, only which other positions follow it. Two further
+consequences are recorded divergences/limitations rather than matches:
 
 - **A value-producing update at an alias node is not discarded — rule 4(b).** Real yq
   no-ops `.b |= . + 1`, `.b += 1`, `.b += [3]` and `.b |= . + {"r": 3}` at an alias node
