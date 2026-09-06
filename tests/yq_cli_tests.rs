@@ -32965,30 +32965,18 @@ fn test_object_construction_keeps_path_context_2473() -> Result<()> {
 /// unchanged by this arm because both routes read it from
 /// `yq_empty_operand_output`.
 ///
-/// **One divergence stays, and it is not this arm's:** real yq evaluates an
-/// `and`/`or`'s *right* operand against the document **root**, not against the
-/// node the pipe stands on, and answers `false` outright when the operator's
-/// input came from an absent navigation. Captured on
-/// `a: {b: 1}\nc: [10, 20]\n` (and `a:\n  b: 1\n` for the last two):
-///
-/// ```text
-/// $ yq '.a | true and .b'                false   (`.b` resolved at the root)
-/// $ yq '.a | true and .a.b'              true
-/// $ yq '.c | true and .[0]'              false
-/// $ yq '.a | true and (key)'             false   (`key` at the root is nothing)
-/// $ yq '.a | key and parent'             false   (ditto for `parent`)
-/// $ yq '.a | .b and true'                true    (the *left* operand is not re-rooted)
-/// $ yq '.a | 0 + .b'                     1       (arithmetic is not re-rooted either)
-/// $ yq '.a.zz | key == "zz"'             true
-/// $ yq '.a.zz | (key == "zz") and true'  false   (same comparison, as an operand)
-/// ```
-///
-/// succinctly evaluates both operands at the current node in both modes, so
-/// it answers `true` for `.a | key and parent`. That predates this arm (the
-/// eager route answered `true` too) and is orthogonal to path context --
-/// `.a | true and .b` diverges with no path-context builtin anywhere -- so it
-/// is recorded in `docs/compliance/yq/limitations.md` ("An `and`/`or`
-/// operand's evaluation context") and pinned below rather than encoded.
+/// The rows below `a: {b: 1}\nc: [10, 20]\n` and `a:\n  b: 1\n` were pinned
+/// here as succinctly's *own* answers when this arm landed, under the reading
+/// that "real yq evaluates an `and`/`or`'s right operand against the document
+/// root". That reading was wrong, and #2506's capture replaced it: yq ranks
+/// `and`/`or` (`operation.go`'s `Precedence: 20`) **below** `|` (30), so
+/// `.a | true and .b` is `(.a | true) and .b` there and `.a | (true and .b)`
+/// in jq -- the right operand reaches the root only because the pipe was
+/// consumed into the left operand. Written out with parentheses the two tools
+/// already agreed, here included. `parse_yq_boolean_expr` (`src/jq/parser.rs`)
+/// now encodes that ladder, so every row matches real yq and they are asserted
+/// as such below; `test_yq_and_or_precedence_2506` covers the rest of the
+/// grouping shape (`=`, `//`, right-associative chaining).
 #[test]
 fn test_and_or_keep_path_context_2473() -> Result<()> {
     let args = &["-o=json", "-I=0"];
@@ -33014,34 +33002,163 @@ fn test_and_or_keep_path_context_2473() -> Result<()> {
         assert_eq!(code, 0, "`{filter}`: {output:?}");
         assert_eq!(output.trim(), expected, "`{filter}`");
     }
-    // The re-rooted-operand divergence above, pinned as succinctly's own
-    // answers so a future fix has to move these rows deliberately
-    // (`docs/compliance/yq/limitations.md`, "An `and`/`or` operand's
-    // evaluation context").
+    // Formerly the "re-rooted operand" divergence, now matching real yq via
+    // the #2506 precedence level. Every row re-captured live from yq v4.53.3.
     for (filter, expected) in [
         (".a | .b and true", "true"),
-        (".a | true and .b", "true"),
-        (".a | true and .a.b", "false"),
-        (".c | true and .[0]", "true"),
+        (".a | true and .b", "false"),
+        (".a | true and .a.b", "true"),
+        (".c | true and .[0]", "false"),
         (".a | 0 + .b", "1"),
         (".a | (key) and true", "true"),
-        (".a | true and (key)", "true"),
-        (".a | key and parent", "true"),
+        (".a | true and (key)", "false"),
+        (".a | key and parent", "false"),
     ] {
         let (output, code) = run_yq_stdin(filter, "a: {b: 1}\nc: [10, 20]\n", args)?;
         assert_eq!(code, 0, "`{filter}`: {output:?}");
         assert_eq!(output.trim(), expected, "`{filter}`");
     }
-    // The same divergence with the *input* coming from an absent navigation:
-    // real yq answers `false` for all three, succinctly `true`.
+    // The same rows with the operator's input coming from an absent
+    // navigation. `key == "zz"` on its own still answers `true`: only inside
+    // an `and`/`or` operand does #2470's read-only scope make `.a.zz` empty.
     for (filter, expected) in [
         (".a.zz | key == \"zz\"", "true"),
-        (".a.zz | (key == \"zz\") and true", "true"),
-        (".a.zz | key and true", "true"),
+        (".a.zz | (key == \"zz\") and true", "false"),
+        (".a.zz | key and true", "false"),
     ] {
         let (output, code) = run_yq_stdin(filter, "a:\n  b: 1\n", args)?;
         assert_eq!(code, 0, "`{filter}`: {output:?}");
         assert_eq!(output.trim(), expected, "`{filter}`");
+    }
+    Ok(())
+}
+
+/// yq ranks `and`/`or` below `|`, `=` and `//`, and chains them to the right
+/// (#2506).
+///
+/// `pkg/yqlib/operation.go` (v4.53.3) gives `and`/`or` `Precedence: 20`, `|`
+/// `30`, `=`/`==` `40` and `//` `42`; jq's `parser.y` ranks `|`, `,`, `//` and
+/// `=` *looser* than `or`/`and` and ranks `and` above `or`. yq's shunting yard
+/// pops a stacked operator only on strictly greater precedence, so an
+/// equal-precedence `and`/`or` chain nests right where jq's nests left.
+///
+/// The probe that identified this as precedence rather than an operand-context
+/// rule, and the reason no evaluator change was needed: with the grouping
+/// written out, both tools already agreed.
+///
+/// ```console
+/// $ yq '.a | (true and .b)'   # true      $ jq '.a | (true and .b)'   # true
+/// $ yq '(.a | true) and .b'   # false     $ jq '(.a | true) and .b'   # false
+/// ```
+///
+/// Every yq row below was captured live from Homebrew `yq` v4.53.3
+/// (`-o=json -I=0`) and every jq row from `/usr/bin/jq` 1.7.1 (`-c`).
+#[test]
+fn test_yq_and_or_precedence_2506() -> Result<()> {
+    let yq_args = &["-o=json", "-I=0"];
+    let doc = "a: {b: 1, c: false}\nx: true\n";
+    let json = r#"{"a": {"b": 1, "c": false}, "x": true}"#;
+
+    // `succinctly yq` == real yq.
+    for (filter, expected) in [
+        // `|` binds tighter, so the right operand is read at the root.
+        (".a | true and .b", "false"),
+        (".a | true and .a.b", "true"),
+        (".a | .b and true", "true"),
+        (".a | .b and .c", "false"),
+        (".a | .c or .b", "false"),
+        (".a | (.b == 1) and (.c == false)", "false"),
+        (".a | true and (. | .b)", "false"),
+        (".a | true and (.b | not)", "false"),
+        (".a | [.b, .c] | .[0] and .[1]", "false"),
+        (".[] | .b and .c", "false"),
+        (".x and .a | .b", "true"),
+        (".a.zz | (. == null) and true", "false"),
+        // Parentheses are a boundary the shunting yard cannot see across, so
+        // the level reappears inside one -- and `select`/`map` arguments,
+        // object values and `[...]` contents are all such boundaries. These
+        // are the rows the decision to implement turned on: the common
+        // `select(.x and .y)` idiom filters per element, exactly as in jq.
+        (".a | (.b and .c)", "false"),
+        (".a | (true and .b)", "true"),
+        ("(.a | true) and .b", "false"),
+        (".a | select(.b and .c)", ""),
+        (".a | select(.b)", r#"{"b":1,"c":false}"#),
+        ("select(.a.b and .a.c)", ""),
+        (".a | map(.b) and true", "true"),
+        (r#"{"k": .a.b and .a.c}"#, r#"{"k":false}"#),
+        (r#"{"k": .a | .b and .c}"#, r#"{"k":false}"#),
+        ("[.a.b and .a.c]", "[false]"),
+        // `=` (40) and `//` (42) outrank `and`/`or` (20) in yq; in jq both are
+        // looser than `or`, which is why these two rows move.
+        (".a.b // .a.zz or false", "true"),
+        (".a.zz = 1 and true", "true"),
+        // One precedence for both, popped only on strictly greater, so the
+        // chain nests right: `false and (true or true)`, not jq's
+        // `(false and true) or true`.
+        ("false and true or true", "false"),
+        ("true or false and false", "true"),
+        ("false or true and false", "false"),
+        ("true and false and true", "false"),
+        ("false or false or true", "true"),
+        // A binding's body is still a whole expression, unchanged by the level.
+        (".a as $x | $x.b and $x.c", "false"),
+    ] {
+        let (output, code) = run_yq_stdin(filter, doc, yq_args)?;
+        assert_eq!(code, 0, "yq `{filter}`: {output:?}");
+        assert_eq!(output.trim(), expected, "yq `{filter}`");
+    }
+
+    // `succinctly jq` keeps jq's ladder: `and` above `or`, both above `|`,
+    // `,`, `//` and `=`. Nothing below moves.
+    for (filter, expected) in [
+        (".a | true and .b", "true"),
+        (".a | true and .a.b", "false"),
+        (".a | .b and true", "true"),
+        (".a | .c or .b", "true"),
+        (".a | (.b == 1) and (.c == false)", "true"),
+        (".a | true and (. | .b)", "true"),
+        (".a | (true and .b)", "true"),
+        ("(.a | true) and .b", "false"),
+        (".a | select(.b and .c)", ""),
+        ("false and true or true", "true"),
+        ("true or false and false", "true"),
+        (".a.b // .a.zz or false", "1"),
+        (
+            ".a.zz = 1 and true",
+            r#"{"a":{"b":1,"c":false,"zz":true},"x":true}"#,
+        ),
+    ] {
+        let (output, code) = run_jq_stdin(filter, json, &["-c"])?;
+        assert_eq!(code, 0, "jq `{filter}`: {output:?}");
+        assert_eq!(output.trim(), expected, "jq `{filter}`");
+    }
+
+    // The idiom the decision hung on, over records: identical in both modes
+    // and identical to real jq/yq.
+    let recs_yaml =
+        "items:\n  - {name: alice, value: 1}\n  - {name: bob, value: null}\n  - {name: null, value: 3}\n";
+    let recs_json = r#"{"items":[{"name":"alice","value":1},{"name":"bob","value":null},{"name":null,"value":3}]}"#;
+    for (filter, expected) in [
+        (
+            ".items[] | select(.name and .value)",
+            r#"{"name":"alice","value":1}"#,
+        ),
+        (
+            ".items | map(select(.name and .value))",
+            r#"[{"name":"alice","value":1}]"#,
+        ),
+        (
+            ".items[] | select(.name or .value)",
+            "{\"name\":\"alice\",\"value\":1}\n{\"name\":\"bob\",\"value\":null}\n{\"name\":null,\"value\":3}",
+        ),
+    ] {
+        let (output, code) = run_yq_stdin(filter, recs_yaml, yq_args)?;
+        assert_eq!(code, 0, "yq `{filter}`: {output:?}");
+        assert_eq!(output.trim(), expected, "yq `{filter}`");
+        let (output, code) = run_jq_stdin(filter, recs_json, &["-c"])?;
+        assert_eq!(code, 0, "jq `{filter}`: {output:?}");
+        assert_eq!(output.trim(), expected, "jq `{filter}`");
     }
     Ok(())
 }
