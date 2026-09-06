@@ -16316,7 +16316,7 @@ fn eval_map_family_positioned<S: EvalSemantics, V: DocumentValue>(
         // `from_entries`, the one definition `eval::builtin_with_entries`
         // also ends in -- including its refusal of a key that is not a
         // string, and `?`'s suppression of that refusal.
-        MapFamily::WithEntries => match entries_to_object(array) {
+        MapFamily::WithEntries => match entries_to_object::<S, _>(array) {
             Ok(fields) => OwnedValue::Object(fields),
             Err(_) if optional => return Some(Flow::Exhausted),
             Err(e) => return Some(Flow::Escaped(Control::Error(e))),

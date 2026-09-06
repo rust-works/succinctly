@@ -36308,12 +36308,96 @@ fn test_yq_object_construction_scalar_key_stringify_2508() -> Result<()> {
         "{stderr}"
     );
 
-    // `from_entries` is a separate function (#2521), unaffected by this fix.
-    let (_out, stderr, code) = run_yq_stdin_with_stderr(
+    // `from_entries` is a separate function; #2521 gave it the same rule
+    // (`[{"key":0,"value":1}] | from_entries` is `{"0":1}` in real yq),
+    // pinned by its own test below.
+    let (output, code) = run_yq_stdin(
         r#"[{"key":0,"value":1}] | from_entries"#,
         "null",
-        &["-o", "json"],
+        &["-o", "json", "-I0"],
     )?;
+    assert_eq!(code, 0, "{output:?}");
+    assert_eq!(output.trim(), r#"{"0":1}"#);
+
+    Ok(())
+}
+
+/// #2521: `from_entries`/`with_entries` stringify a non-string *scalar* key
+/// instead of raising jq's `Cannot use <type> as object key` -- the same
+/// rule #2508 gave object construction, extended to `entries_to_object`
+/// (shared by both builtins, per its own doc comment: `with_entries(f)` is
+/// `from_entries(map(f))` in jq's own definition). Captured live from yq
+/// v4.53.3 (`-o=json -I0`) on `n: [1, 2]` and `a: {b: 1, e: 2}`:
+///
+/// ```text
+/// $ yq '.n | to_entries | from_entries'   {"0":1,"1":2}
+/// $ yq '.a | with_entries(.key = key)'    {"0":1,"1":2}
+/// $ yq '.n | with_entries(.value = key)'  {"0":0,"1":1}
+/// $ yq -n '[{"key":true,"value":1}] | from_entries'   {"true":1}
+/// $ yq -n '[{"key":null,"value":1}] | from_entries'   {"null":1}
+/// $ succinctly yq '.n | to_entries | from_entries'  Error: Cannot use number (0) as object key  (was, exit 1)
+/// ```
+///
+/// jq 1.7.1 also errors here (this is yq-only), so jq mode is untouched.
+///
+/// **Not fixed here, discovered alongside and documented instead:** real
+/// yq's own key/value lookup wants an exact, case-sensitive `"key"`/
+/// `"value"` field, rejecting every jq alias (`Key`/`name`/`Name`/`k`/`K`)
+/// succinctly still accepts in both modes, and has no truthy-fallback (a
+/// falsy `false`/`0`/`""` key is read directly, not treated as absent). See
+/// `docs/compliance/yq/limitations.md`'s own entry for the full matrix --
+/// a separate fix (`entry_key_and_value` needs its own `S` parameter),
+/// out of this issue's "give `entries_to_object` the `S` parameter" scope.
+///
+/// Fixed as `eval::entries_to_object` (now `S`-generic), consulted by
+/// `builtin_from_entries`/`builtin_with_entries` (this file) and
+/// `eval_generic`'s `MapFamily::WithEntries` arm.
+#[test]
+fn test_yq_from_entries_scalar_key_stringify_2521() -> Result<()> {
+    let args = &["-o", "json", "-I0"];
+    let doc = "n: [1, 2]\na: {b: 1, e: 2}\n";
+    for (filter, expected) in [
+        (".n | to_entries | from_entries", r#"{"0":1,"1":2}"#),
+        (".a | with_entries(.key = key)", r#"{"0":1,"1":2}"#),
+        (".n | with_entries(.value = key)", r#"{"0":0,"1":1}"#),
+    ] {
+        let (output, code) = run_yq_stdin(filter, doc, args)?;
+        assert_eq!(code, 0, "`{filter}`: {output:?}");
+        assert_eq!(output.trim(), expected, "`{filter}`");
+    }
+
+    // `false` deliberately excluded here: real yq answers `{"false":1}`, but
+    // succinctly's shared `entry_key_and_value` still applies jq's own
+    // truthy-fallback to the key lookup (a separate, documented, not-yet-fixed
+    // divergence -- see `docs/compliance/yq/limitations.md`), so `false`
+    // falls through to a null key there. `true`/`null`/a float all stay
+    // truthy, so they exercise only this issue's own stringification fix.
+    for (entry, expected) in [
+        (r#"{"key":true,"value":1}"#, r#"{"true":1}"#),
+        (r#"{"key":null,"value":1}"#, r#"{"null":1}"#),
+        (r#"{"key":1.5,"value":1}"#, r#"{"1.5":1}"#),
+    ] {
+        let filter = format!("[{entry}] | from_entries");
+        let (output, code) = run_yq_stdin(&filter, "", &["-o", "json", "-I0", "-n"])?;
+        assert_eq!(code, 0, "`{filter}`: {output:?}");
+        assert_eq!(output.trim(), expected, "`{filter}`");
+    }
+
+    // Array/object keys are out of scope (same #2508 exclusion) -- still raise.
+    let (_out, stderr, code) = run_yq_stdin_with_stderr(
+        r#"[{"key":[1,2],"value":1}] | from_entries"#,
+        "",
+        &["-o", "json", "-I0", "-n"],
+    )?;
+    assert_ne!(code, 0);
+    assert!(
+        stderr.contains("Cannot use") && stderr.contains("as object key"),
+        "{stderr}"
+    );
+
+    // jq mode is untouched.
+    let (_out, stderr, code) =
+        run_jq_stdin_with_stderr(r#"[{"key":0,"value":1}] | from_entries"#, "null", &["-n"])?;
     assert_ne!(code, 0);
     assert!(
         stderr.contains("Cannot use number (0) as object key"),

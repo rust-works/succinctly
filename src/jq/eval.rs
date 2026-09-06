@@ -465,9 +465,10 @@ pub(crate) fn yq_empty_operand_output(
     }
 }
 
-/// yq mode only (#2508): a non-string *scalar* object-construction key
-/// (`{(0): 1}`) stringifies instead of raising jq's `Cannot use <type> as
-/// object key`.
+/// yq mode only (#2508/#2521): a non-string *scalar* key -- an
+/// object-construction key (`{(0): 1}`) or a `from_entries`/`with_entries`
+/// entry's own `key` field -- stringifies instead of raising jq's `Cannot
+/// use <type> as object key`.
 ///
 /// `None` means "keep the existing behavior" -- either jq mode, or a key
 /// this rule does not cover (a real `String` never reaches the caller's own
@@ -476,20 +477,24 @@ pub(crate) fn yq_empty_operand_output(
 ///
 /// Captured live against yq v4.53.3 (`-o=json -I0`, `-n`):
 ///
-/// | filter             | real yq        |
-/// |---------------------|----------------|
-/// | `{(0): 1}`           | `{"0":1}`      |
-/// | `{(1.5): 1}`         | `{"1.5":1}`    |
-/// | `{(1.0): 1}`         | `{"1.0":1}`    |
-/// | `{(1e10): 1}`        | `{"1e10":1}`   |
-/// | `{(true): 1}`        | `{"true":1}`   |
-/// | `{(false): 1}`       | `{"false":1}`  |
-/// | `{(null): 1}`        | `{"null":1}`   |
+/// | filter                                            | real yq        |
+/// |-----------------------------------------------------|----------------|
+/// | `{(0): 1}`                                           | `{"0":1}`      |
+/// | `{(1.5): 1}`                                         | `{"1.5":1}`    |
+/// | `{(1.0): 1}`                                         | `{"1.0":1}`    |
+/// | `{(1e10): 1}`                                        | `{"1e10":1}`   |
+/// | `{(true): 1}`                                        | `{"true":1}`   |
+/// | `{(false): 1}`                                       | `{"false":1}`  |
+/// | `{(null): 1}`                                        | `{"null":1}`   |
+/// | `[1,2] \| to_entries \| from_entries`                | `{"0":1,"1":2}`|
+/// | `{a:1,e:2} \| with_entries(.key = key)`              | `{"0":1,"1":2}`|
+/// | `[{"key":true,"value":1}] \| from_entries`           | `{"true":1}`   |
+/// | `[{"key":null,"value":1}] \| from_entries`           | `{"null":1}`   |
 ///
 /// The `1.0`/`1e10` rows are why this reuses [`owned_to_string`] (the same
-/// conversion `tostring`/[`yq_scalar_string_concat_is_ok`]-style `+` already
-/// use) rather than a fresh `format!`: a `NumberLiteral`'s exact source
-/// spelling survives here too.
+/// conversion `tostring`/`+`'s own string-concatenation rule already use)
+/// rather than a fresh `format!`: a `NumberLiteral`'s exact source spelling
+/// survives here too.
 ///
 /// **Deliberately excludes `Array`/`Object` keys.** Real yq's own
 /// stringification there is a much deeper, likely-unintentional Go-internal
@@ -498,15 +503,16 @@ pub(crate) fn yq_empty_operand_output(
 /// string (`{([1,2,3]): 1}` and `{({"a":1}): 1}` are both `{"":1}`), while
 /// an empty object key is the one exception (`{({}): 1}` is `{"{}":1}`) --
 /// not `owned_to_string`'s own JSON-shaped answer for either case. That is
-/// a separate, much odder divergence than this issue's scope (which only
-/// asked to capture float/bool/null keys), so it is left raising rather
-/// than guessed at.
+/// a separate, much odder divergence than these two issues' scope, so it is
+/// left raising rather than guessed at.
 ///
 /// jq 1.7.1 raises unconditionally for every row above, so jq mode is
 /// untouched. One definition consulted by [`build_object_entries`] (this
-/// file's native fan-out) and `eval_generic::build_object_entries_generic`
-/// (the generic fan-out, already `S`-generic) -- CLAUDE.md's "duplicated
-/// predicates diverge silently" (#106).
+/// file's native object-construction fan-out), `entries_to_object` (shared
+/// by `from_entries`/`with_entries`, both evaluators), and
+/// `eval_generic::build_object_entries_generic` (the generic
+/// object-construction fan-out) -- CLAUDE.md's "duplicated predicates
+/// diverge silently" (#106).
 pub(crate) fn yq_object_key_stringify<S: EvalSemantics>(key: &OwnedValue) -> Option<String> {
     if S::TAG != EvalTag::Yq {
         return None;
@@ -11659,14 +11665,27 @@ fn entry_key_and_value(entry: &OwnedValue) -> Result<(OwnedValue, OwnedValue), E
 /// to look up `value`. Re-inserting a key keeps its original position and
 /// replaces its value, which is what jq's `add` over the mapped singletons
 /// does.
-pub(crate) fn entries_to_object<I: IntoIterator<Item = OwnedValue>>(
+///
+/// `S: EvalSemantics`-generic (#2521) so a non-string *scalar* key
+/// stringifies in yq mode instead of raising -- `[1,2] | to_entries |
+/// from_entries` is `{"0":1,"1":2}` in real yq, and `with_entries` shares
+/// this function per the doc comment above, so `.a | with_entries(.key =
+/// key)` on a mapping is `{"0":1,"1":2}` too (an entry's `key` is its
+/// *position*, a number). See [`yq_object_key_stringify`]'s own doc comment
+/// for the full captured matrix, including why an `Array`/`Object` key is
+/// excluded.
+pub(crate) fn entries_to_object<S: EvalSemantics, I: IntoIterator<Item = OwnedValue>>(
     entries: I,
 ) -> Result<IndexMap<String, OwnedValue>, EvalError> {
     let mut result = IndexMap::new();
     for entry in entries {
         let (key, value) = entry_key_and_value(&entry)?;
-        let OwnedValue::String(k) = key else {
-            return Err(EvalError::cannot_use_as_object_key(&key));
+        let k = match key {
+            OwnedValue::String(s) => s,
+            _ => match yq_object_key_stringify::<S>(&key) {
+                Some(s) => s,
+                None => return Err(EvalError::cannot_use_as_object_key(&key)),
+            },
         };
         result.insert(k, value);
     }
@@ -11712,7 +11731,7 @@ fn builtin_from_entries<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(entries) => entries,
         Err(e) => return suppress_or_raise(e, optional),
     };
-    match entries_to_object(entries) {
+    match entries_to_object::<S, _>(entries) {
         Ok(result) => QueryResult::Owned(OwnedValue::Object(result)),
         // The `?` suffix swallows the refusal outright in jq, as the arm
         // above already does for a non-array/non-object input. See
@@ -11800,7 +11819,7 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 
     // from_entries
-    match entries_to_object(transformed) {
+    match entries_to_object::<S, _>(transformed) {
         Ok(result) => QueryResult::Owned(OwnedValue::Object(result)),
         Err(_) if optional => QueryResult::None,
         Err(e) => e.into(),

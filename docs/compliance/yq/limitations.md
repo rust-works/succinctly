@@ -2964,6 +2964,43 @@ Three related divergences are **not** covered and stay open:
   multi-valued shape the oracle sweep exercises has either an empty prefix or an iterating
   one (`.a[]`), neither of which can yield an absent node, so the sweep is clean.
 
+### `from_entries`/`with_entries` accept jq's alias set and truthy-fallback where real yq wants an exact, case-sensitive `key`/`value` field — not chased ([#2521](https://github.com/rust-works/succinctly/issues/2521) discovered it, not fixed)
+
+Found while implementing #2521's own numeric-key stringification fix (`entries_to_object`
+now stringifies a scalar key via `yq_object_key_stringify`, matching real yq's `[1,2] |
+to_entries | from_entries` => `{"0":1,"1":2}`). A second, separate divergence surfaced
+alongside it in the same function, live-verified against yq v4.53.3 and left unfixed:
+
+```console
+$ yq -n '[{"key":1,"value":1}] | from_entries'    # {"1":1}
+$ yq -n '[{"Key":1,"value":1}] | from_entries'    # expected to find one 'key' entry but found 0 in position 0
+$ yq -n '[{"name":1,"value":1}] | from_entries'   # same error -- "name"/"Name"/"k"/"K" all rejected too
+$ yq -n '[{"key":1,"Value":9}] | from_entries'    # expected to find one 'value' entry but found 0 in position 0
+$ succinctly yq -n '[{"Key":1,"value":1}] | from_entries'   # {"1":1} -- accepts the jq alias
+```
+
+Real yq's own key/value lookup wants the exact, lowercase field name and nothing else --
+none of jq's alias set (`key`/`Key`/`name`/`Name`/`k`/`K` for the key half, `value`/`Value`
+for the value half) survives past `"key"`/`"value"` themselves. succinctly's
+`entry_key_and_value` (`src/jq/eval.rs`) is shared, unconditional code implementing jq's
+own alias chain (`ENTRY_KEY_ALIASES`) in both modes -- gating it per mode is a real,
+separate fix, not part of this issue's "give `entries_to_object` the `S` parameter" scope.
+
+A second, smaller wrinkle in the same function: jq's own `from_entries` definition reads
+`.key // .k // .name // ...` (a truthy-fallback chain, per real jq's own `builtin.jq`), so
+a *falsy* `.key` (`false`, `0`, `""`) is treated as absent and falls through the whole
+alias chain -- both jq 1.7.1 and succinctly agree there (`[{"key":false,"value":1}] |
+from_entries` is `Cannot use null (null) as object key` in both). Real yq has no such
+fallback: `.key` is read directly, so `[{"key":false,"value":1}] | from_entries` is
+`{"false":1}` there, not a null-key refusal. Both wrinkles are visible together because
+they share the same lookup path (`entry_key_and_value`'s `is_truthy()`-filtered
+`find_map` over `ENTRY_KEY_ALIASES`), but are two independent behaviors: the alias set
+and the truthy-vs-presence check.
+
+Not fixed here: `entry_key_and_value` has no `S: EvalSemantics` parameter today and adding
+one to change its alias list and presence check per mode is a proper follow-up, not a
+one-line change riding along with #2521's own stringification fix.
+
 ### Other categories
 
 Float and number formatting ([#1071](https://github.com/rust-works/succinctly/issues/1071),
