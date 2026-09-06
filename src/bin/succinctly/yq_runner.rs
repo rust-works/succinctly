@@ -8185,6 +8185,106 @@ mod tests {
         assert_eq!(targets_of(&Expr::Field("a".into())), None);
     }
 
+    fn setpath(path: Expr, value: Expr) -> Expr {
+        Expr::Builtin(Builtin::SetPath(Box::new(path), Box::new(value)))
+    }
+
+    fn delpaths(paths: Expr) -> Expr {
+        Expr::Builtin(Builtin::DelPaths(Box::new(paths)))
+    }
+
+    fn array_of(items: Vec<Expr>) -> Expr {
+        match <[Expr; 1]>::try_from(items) {
+            Ok([single]) => Expr::Array(Box::new(single)),
+            Err(items) => Expr::Array(Box::new(Expr::Comma(items))),
+        }
+    }
+
+    fn str_lit(s: &str) -> Expr {
+        Expr::Literal(Literal::String(s.into()))
+    }
+
+    /// `setpath`/`delpaths` name their path as an array literal of string
+    /// and integer keys (`literal_path_steps`); anything else -- a path
+    /// that isn't an array literal at all, a `delpaths` list that doesn't
+    /// hold exactly one path, or a path array containing something other
+    /// than a string/integer key -- makes the whole write unresolvable,
+    /// same as a computed bracket key does for `static_path_steps`.
+    #[test]
+    fn literal_path_steps_rejects_non_array_and_odd_items_870() {
+        // Not an array literal at all.
+        assert_eq!(targets_of(&setpath(Expr::Identity, Expr::Identity)), None);
+        assert_eq!(targets_of(&delpaths(Expr::Identity)), None);
+        // `delpaths`' own list holds a path that isn't an array literal.
+        assert_eq!(targets_of(&delpaths(array_of(vec![Expr::Identity]))), None);
+        // `delpaths` accepts only exactly one path per call.
+        assert_eq!(
+            targets_of(&delpaths(array_of(vec![
+                array_of(vec![str_lit("a")]),
+                array_of(vec![str_lit("b")]),
+            ]))),
+            None
+        );
+        // A path item that is neither a string nor an integer key.
+        assert_eq!(
+            targets_of(&setpath(
+                array_of(vec![str_lit("a"), Expr::Literal(Literal::Bool(true))]),
+                Expr::Identity,
+            )),
+            None
+        );
+    }
+
+    /// A plain `Literal::Int` path item -- reachable from a leading-zero
+    /// negative integer like `-01`, which fails JSON's number grammar and
+    /// so bypasses `NumberLiteral` (see `parse_number_literal`) -- names an
+    /// index exactly like the ordinary `NumberLiteral` spelling does.
+    #[test]
+    fn literal_path_steps_accepts_bare_int_literal_870() {
+        assert_eq!(
+            targets_of(&setpath(
+                array_of(vec![str_lit("a"), Expr::Literal(Literal::Int(-1))]),
+                Expr::Identity,
+            )),
+            Some(vec![(
+                vec![PathStep::Key("a".into()), PathStep::Index(-1)],
+                WriteKind::Set
+            )])
+        );
+    }
+
+    /// A `NumberLiteral` path item names an index only when its spelling
+    /// parses as a plain integer; a fractional spelling (`["a", 1.5]`, the
+    /// form a `setpath` path array can hold even though it never denotes a
+    /// real array slot) makes the whole path non-static instead of
+    /// truncating or otherwise guessing at an index.
+    #[test]
+    fn literal_path_steps_number_literal_int_ok_and_float_err_870() {
+        assert_eq!(
+            targets_of(&setpath(
+                array_of(vec![
+                    str_lit("a"),
+                    Expr::Literal(Literal::NumberLiteral(NumberRepr::Int(5), "5".into())),
+                ]),
+                Expr::Identity,
+            )),
+            Some(vec![(
+                vec![PathStep::Key("a".into()), PathStep::Index(5)],
+                WriteKind::Set
+            )])
+        );
+        assert_eq!(
+            targets_of(&setpath(
+                array_of(vec![
+                    str_lit("a"),
+                    Expr::Literal(Literal::NumberLiteral(NumberRepr::Float(1.5), "1.5".into())),
+                ]),
+                Expr::Identity,
+            )),
+            None
+        );
+    }
+
     /// A negative index resolves from the end, and an out-of-range one
     /// resolves to nothing rather than wrapping or clamping.
     #[test]
