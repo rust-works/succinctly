@@ -35636,3 +35636,56 @@ fn test_assignment_rhs_sees_the_input_position_2471() -> Result<()> {
     }
     Ok(())
 }
+
+/// #2471 (gate reason 1 of spine 2416): a map-family body stands at its own
+/// **member's** position, not at its container's.
+///
+/// `with_entries`'s member is an entry of the array `to_entries` built (so its
+/// key is the index), `map_values`'s is the object member itself (so its key is
+/// the field name). Every row was captured from yq v4.53.3 (`-o=json -I0`) on
+/// `MAP_FAMILY_DOC_2471`. Before this change `needs_path_context` did not
+/// descend into a map-family body at all, so no route was ever asked and every
+/// one of these answered with no position.
+const MAP_FAMILY_DOC_2471: &str = "a: {b: 1, e: 2}\nn: [1, 2]\n";
+
+const MAP_FAMILY_ROWS_2471: &[(&str, &str)] = &[
+    // The body sees the member.
+    (".a | map_values(key)", r#"{"b":"b","e":"e"}"#),
+    (".a | map_values(path)", r#"{"b":["a","b"],"e":["a","e"]}"#),
+    (".a | map_values(path | length)", r#"{"b":2,"e":2}"#),
+    (".a | map_values(file_index)", r#"{"b":0,"e":0}"#),
+    (".n | map_values(key)", "[0,1]"),
+    (".a | with_entries(.value = key)", r#"{"b":0,"e":1}"#),
+    (
+        ".a | with_entries(.value = path)",
+        r#"{"b":["a",0],"e":["a",1]}"#,
+    ),
+    (".a | with_entries(.value = file_index)", r#"{"b":0,"e":0}"#),
+    // ...including once the container has already left the cursor domain,
+    // where the member's position is the owned identity plus its component.
+    (
+        ".a | to_entries | map(.value = key)",
+        r#"[{"key":"b","value":0},{"key":"e","value":1}]"#,
+    ),
+    (".a | to_entries | map(key)", "[0,1]"),
+    (".a | to_entries | map(path)", r#"[["a",0],["a",1]]"#),
+    (".a | to_entries | map_values(key)", "[0,1]"),
+    // A body that reads nothing is unmoved: the stage never reaches the
+    // positioned route at all.
+    (
+        ".a | with_entries(.value = (.key | length))",
+        r#"{"b":1,"e":1}"#,
+    ),
+    (".a | map_values(.)", r#"{"b":1,"e":2}"#),
+];
+
+#[test]
+fn test_map_family_bodies_see_their_members_position_2471() -> Result<()> {
+    let args = &["-o", "json", "-I0"];
+    for (filter, expected) in MAP_FAMILY_ROWS_2471 {
+        let (output, code) = run_yq_stdin(filter, MAP_FAMILY_DOC_2471, args)?;
+        assert_eq!(code, 0, "`{filter}`: {output:?}");
+        assert_eq!(output.trim_end(), *expected, "`{filter}`");
+    }
+    Ok(())
+}

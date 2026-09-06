@@ -1765,6 +1765,19 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         // for every element instead of resolving or erroring (#715
         // follow-up).
         Expr::Builtin(Builtin::Map(f)) => needs_path_context(f),
+        // `map_values(f)`/`with_entries(f)` (#2471, gate reason 1 of spine
+        // 2416): the same recursion as `Builtin::Map` above, and the same
+        // omission it had before #715 -- `.a | map_values(key)` was never
+        // seen as a path-context pipe at all, so no route was ever asked and
+        // `key` answered with nothing (yq v4.53.3 answers `{"b":"b","e":"e"}`
+        // on `a: {b: 1, e: 2}`). Real yq evaluates a map-family body at each
+        // *member's* own position, not at the container's, which is why
+        // `path_context_resolvable` deliberately does **not** gain a matching
+        // arm: the constant-resolving routes would rewrite the body's `key`
+        // to the container's key. `map_family_body`/
+        // `eval_map_family_positioned` (`eval_generic.rs`) are what answer
+        // these instead.
+        Expr::Builtin(Builtin::MapValues(f) | Builtin::WithEntries(f)) => needs_path_context(f),
         // `.b = key` (#2471, gate reason 1 of spine 2416): an assignment's
         // right-hand side is evaluated against the assignment's own input --
         // `eval_assign` hands it the same `value` the whole stage received --
@@ -11579,7 +11592,7 @@ fn entry_key_and_value(entry: &OwnedValue) -> Result<(OwnedValue, OwnedValue), E
 /// to look up `value`. Re-inserting a key keeps its original position and
 /// replaces its value, which is what jq's `add` over the mapped singletons
 /// does.
-fn entries_to_object<I: IntoIterator<Item = OwnedValue>>(
+pub(crate) fn entries_to_object<I: IntoIterator<Item = OwnedValue>>(
     entries: I,
 ) -> Result<IndexMap<String, OwnedValue>, EvalError> {
     let mut result = IndexMap::new();

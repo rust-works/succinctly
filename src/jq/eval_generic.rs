@@ -38,7 +38,7 @@ use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, binary_fanout_rules, bind_def, bind_def_call,
     boolean_fanout_bools, cannot_reserve_cross_product, classify_limit_n, classify_nth_n,
     classify_parent_n, collapse_vec, collect_pattern_var_names, compare_values,
-    debug_assert_materialization_error, enter_def_call_frame, eval_each_owned,
+    debug_assert_materialization_error, enter_def_call_frame, entries_to_object, eval_each_owned,
     eval_foreach_with_values, eval_full as full_eval, eval_reduce_with_values,
     extract_pattern_bindings, fold_escaped_generator_prefix, format_owned,
     has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
@@ -12511,7 +12511,25 @@ pub(crate) fn path_context_needs_eager(exprs: &[Expr]) -> bool {
     let absent_routed = path_context_absent_split(exprs).is_some();
     for stage in exprs {
         if needs_path_context(stage) {
-            if !is_node || (can_absent && !absent_routed) || !path_context_stage_native(stage) {
+            // #2416 gate reason 1 (#2471): a `map_values`/`with_entries`
+            // whose *body* is what reads path context reads nothing at its
+            // own position -- `eval_builtin`'s own positioned arm evaluates
+            // that body once per member instead. So `can_absent` does not
+            // apply (an absent input has no members, and the body never
+            // runs), and `path_context_stage_native` is answered by that arm
+            // rather than by `path_context_single_native`'s closed list.
+            // What the stage still needs is a *live* input: the member
+            // positions come from the container's cursor. `map` is
+            // deliberately not admitted here -- its cursor-input shapes are
+            // already exact on the eager route (#2493), and moving a correct
+            // answer to a new route is risk with nothing to buy.
+            if !matches!(
+                map_family_positioned(stage),
+                Some((MapFamily::MapValues | MapFamily::WithEntries, _))
+            ) && (!is_node
+                || (can_absent && !absent_routed)
+                || !path_context_stage_native(stage))
+            {
                 return true;
             }
             is_node = path_context_stage_preserves_node(stage);
@@ -13586,6 +13604,37 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
+    // #2471 (gate reason 1 of spine 2416): a map-family body that reads path
+    // context is evaluated once per member, at the member's own position.
+    // Gated on `needs_path_context` so an ordinary `map_values(.+1)` never
+    // sees this route at all -- the shapes it takes over are exactly the ones
+    // that were answering with no position before it existed.
+    //
+    // A cursor is what makes the container's path knowable here; without one
+    // (the library's owned entry points) the stage falls through to the
+    // evaluation it already had. `to_owned_cursor` materializes the container
+    // the same way the fallback below would, so a decode failure surfaces
+    // from that fallback rather than being re-reported here.
+    if let Some((family, f)) = map_family_body(builtin) {
+        if needs_path_context(f) && path_context_absent_resolvable(f) {
+            if let Some(c) = cursor {
+                // STYLE-0012: neither raises nor suppresses -- a failure to
+                // materialize the container here hands the stage back to the
+                // ordinary evaluation below, which materializes the same
+                // container itself and reports (or suppresses, per its own
+                // `optional`) the identical failure. Answering it twice is
+                // what would change behaviour.
+                let container = to_owned_cursor(&c);
+                if let (Ok(container), Ok((path, _))) = (container, cursor_path_and_ancestors(&c)) {
+                    if let Some(result) = eval_map_family_positioned_result::<S, V>(
+                        family, f, &container, &path, optional,
+                    ) {
+                        return result;
+                    }
+                }
+            }
+        }
+    }
     match builtin {
         Builtin::Line => {
             let line = cursor.map_or(0, |c| c.line());
@@ -15315,7 +15364,16 @@ fn owned_identity_pipe_supported(stages: &[Expr]) -> bool {
             }
             _ => match owned_identity_rule(stage) {
                 Some(_) => {
-                    if needs_path_context(stage) && !owned_identity_stage_resolvable(stage) {
+                    // #2471: a map-family stage's body stands at each
+                    // *member's* position, which this pipe can name (the
+                    // identity plus the component), so it is admitted here
+                    // instead of being asked to resolve against the
+                    // container's own position -- see
+                    // `eval_map_family_positioned`.
+                    if needs_path_context(stage)
+                        && map_family_positioned(stage).is_none()
+                        && !owned_identity_stage_resolvable(stage)
+                    {
                         return false;
                     }
                 }
@@ -15917,6 +15975,235 @@ fn eval_owned_identity_alternative<S: EvalSemantics, V: DocumentValue>(
     owned_identity_operand::<S, V>(right, value, id, optional)
 }
 
+/// Which map-family builtin a stage is (#2471, gate reason 1 of spine 2416).
+///
+/// All three evaluate their body once per *member* of their input, so the
+/// position a `key`/`path`/`file_index` inside one reads is the member's, not
+/// the container's -- which is why they are answered here rather than by
+/// [`path_context_resolve_constants`]'s ordinary stage rewrite. Captured from
+/// yq v4.53.3 on `a: {b: 1, e: 2}`:
+///
+/// ```text
+/// .a | map_values(key)                {"b":"b","e":"e"}
+/// .a | map_values(path)               {"b":["a","b"],"e":["a","e"]}
+/// .a | with_entries(.value = key)     {"b":0,"e":1}
+/// .a | with_entries(.value = path)    {"b":["a",0],"e":["a",1]}
+/// .a | to_entries | map(.value = key) [{"key":"b","value":0},{"key":"e","value":1}]
+/// ```
+///
+/// `with_entries`'s member is an *entry* of the array `to_entries` built, so
+/// its key is the index; `map_values`'s is the object member itself, so its
+/// key is the field name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MapFamily {
+    /// `map(f)`: every output of `f`, over the members, in one fresh array.
+    Map,
+    /// `map_values(f)`: `f`'s *first* output replaces each member, and a
+    /// member whose `f` produced nothing is dropped -- exactly
+    /// `eval::builtin_map_values`'s own rule, which this route reproduces
+    /// rather than re-decides.
+    MapValues,
+    /// `with_entries(f)`: `to_entries | map(f) | from_entries`, the same
+    /// composition `eval::builtin_with_entries` is.
+    WithEntries,
+}
+
+/// The map-family builtin `builtin` is, with its body.
+fn map_family_body(builtin: &Builtin) -> Option<(MapFamily, &Expr)> {
+    Some(match builtin {
+        Builtin::Map(f) => (MapFamily::Map, f),
+        Builtin::MapValues(f) => (MapFamily::MapValues, f),
+        Builtin::WithEntries(f) => (MapFamily::WithEntries, f),
+        _ => return None,
+    })
+}
+
+/// Whether `stage` is a map-family stage whose body reads path context and
+/// whose reads can be resolved at each member's own position.
+///
+/// The body is gated by [`path_context_absent_resolvable`] -- the constants-
+/// only predicate -- deliberately, not by its `with_parent` sibling: a
+/// `parent` inside a map-family body is one of the shapes where real yq
+/// re-reads a container it is halfway through rewriting and prints a
+/// self-referential tree (`.a | map_values(parent)` on `a: {b: 1, e: 2}` is
+/// `{"b":{"b":{},"e":{"b":1,"e":{"b":1}}},...}` in v4.53.3). Refusing it here
+/// leaves those stages exactly where they already were, on the eager
+/// evaluator, rather than encoding a rewrite-order artefact as a rule.
+fn map_family_positioned(stage: &Expr) -> Option<(MapFamily, &Expr)> {
+    let Expr::Builtin(builtin) = strip_parens(stage) else {
+        return None;
+    };
+    let (family, f) = map_family_body(builtin)?;
+    (needs_path_context(f) && path_context_absent_resolvable(f)).then_some((family, f))
+}
+
+/// One `{"key": k, "value": v}` entry, as `to_entries` builds it.
+fn map_family_entry(key: OwnedValue, value: OwnedValue) -> OwnedValue {
+    let mut entry = IndexMap::with_capacity(2);
+    entry.insert("key".to_string(), key);
+    entry.insert("value".to_string(), value);
+    OwnedValue::Object(entry)
+}
+
+/// The `(component, member)` pairs a map-family stage's body runs over, or
+/// `None` where the input has no members at all.
+///
+/// `None` is not a refusal of the *value* -- it means the body never runs, so
+/// the position it would have read cannot be observed and the ordinary
+/// (unpositioned) evaluation of the whole builtin answers identically. Every
+/// mode-specific rule for a scalar input (`eval::builtin_map`'s yq no-op,
+/// #1907; `to_entries`'s "has no keys") therefore stays in exactly one place.
+fn map_family_members(
+    family: MapFamily,
+    container: &OwnedValue,
+) -> Option<Vec<(OwnedValue, OwnedValue)>> {
+    let members = match container {
+        OwnedValue::Object(fields) => fields
+            .iter()
+            .enumerate()
+            .map(|(i, (k, v))| match family {
+                MapFamily::WithEntries => (
+                    OwnedValue::Int(i as i64),
+                    map_family_entry(OwnedValue::String(k.clone()), v.clone()),
+                ),
+                _ => (OwnedValue::String(k.clone()), v.clone()),
+            })
+            .collect(),
+        OwnedValue::Array(elements) => elements
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let index = OwnedValue::Int(i as i64);
+                match family {
+                    MapFamily::WithEntries => (index.clone(), map_family_entry(index, v.clone())),
+                    _ => (index, v.clone()),
+                }
+            })
+            .collect(),
+        _ => return None,
+    };
+    Some(members)
+}
+
+/// Evaluate a map-family stage with its body positioned at each member
+/// (#2471, gate reason 1 of spine 2416).
+///
+/// `container_path` is the path of the input container, so member *i*'s own
+/// position is `container_path ++ [component]` and its `key` is `component`
+/// -- the two constants [`path_context_resolve_constants`] needs. The body is
+/// rewritten once per member and then handed to the ordinary owned evaluator,
+/// so every construct inside it keeps one definition; only the position is
+/// supplied here.
+///
+/// `None` means the input is not a container (see [`map_family_members`]) and
+/// the caller should evaluate the stage the ordinary way.
+fn eval_map_family_positioned<S: EvalSemantics, V: DocumentValue>(
+    family: MapFamily,
+    f: &Expr,
+    container: &OwnedValue,
+    container_path: &[OwnedValue],
+    optional: bool,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Option<Flow> {
+    let members = map_family_members(family, container)?;
+    // `map`/`with_entries` are array construction and `map_values` is object
+    // construction: all three are atomic in jq, so a control escaping any
+    // member's body discards the whole partly-built result rather than
+    // surfacing a prefix -- the same rule `eval::map_over`,
+    // `eval::builtin_map_values` and `eval::builtin_with_entries` each state.
+    let mut array: Vec<OwnedValue> = Vec::new();
+    let mut object = IndexMap::with_capacity(members.len());
+    for (component, member) in members {
+        let mut path = vec_with_capacity(container_path.len() + 1);
+        path.extend_from_slice(container_path);
+        path.push(component.clone());
+        let resolved = match path_context_resolve_constants::<S, V>(
+            f,
+            &PathContextAt {
+                key: Some(&component),
+                path: &path,
+                parent_from: None,
+            },
+        ) {
+            Ok(expr) => expr,
+            Err(e) => return Some(Flow::Escaped(Control::Error(e))),
+        };
+        let mut outputs: Vec<OwnedValue> = Vec::new();
+        if let Flow::Escaped(control) =
+            eval_each_owned::<S>(&resolved, &member, optional, &mut |v| {
+                outputs.push(v);
+                Demand::Continue
+            })
+        {
+            return Some(Flow::Escaped(control));
+        }
+        match family {
+            MapFamily::Map | MapFamily::WithEntries => array.extend(outputs),
+            MapFamily::MapValues => {
+                let Some(value) = outputs.into_iter().next() else {
+                    continue;
+                };
+                match &component {
+                    // An array input keeps its shape: the components are
+                    // indices, and a dropped member closes the gap, exactly
+                    // as `eval::builtin_map_values`' own array arm does.
+                    OwnedValue::Int(_) => array.push(value),
+                    _ => {
+                        object.insert(owned_to_string::<S>(&component), value);
+                    }
+                }
+            }
+        }
+    }
+    let result = match family {
+        MapFamily::Map => OwnedValue::Array(array),
+        MapFamily::MapValues => match container {
+            OwnedValue::Array(_) => OwnedValue::Array(array),
+            _ => OwnedValue::Object(object),
+        },
+        // `from_entries`, the one definition `eval::builtin_with_entries`
+        // also ends in -- including its refusal of a key that is not a
+        // string, and `?`'s suppression of that refusal.
+        MapFamily::WithEntries => match entries_to_object(array) {
+            Ok(fields) => OwnedValue::Object(fields),
+            Err(_) if optional => return Some(Flow::Exhausted),
+            Err(e) => return Some(Flow::Escaped(Control::Error(e))),
+        },
+    };
+    Some(match sink(result) {
+        Demand::Continue => Flow::Exhausted,
+        Demand::Stop => Flow::Stopped { pending: None },
+    })
+}
+
+/// [`eval_map_family_positioned`] for a caller that wants a `GenericResult`
+/// -- `eval_builtin`'s own entry, where the map-family stage is the one
+/// leaving the cursor domain and nothing follows it.
+fn eval_map_family_positioned_result<S: EvalSemantics, V: DocumentValue>(
+    family: MapFamily,
+    f: &Expr,
+    container: &OwnedValue,
+    container_path: &[OwnedValue],
+    optional: bool,
+) -> Option<GenericResult<V>> {
+    let mut collected: Vec<OwnedValue> = Vec::new();
+    let flow = eval_map_family_positioned::<S, V>(
+        family,
+        f,
+        container,
+        container_path,
+        optional,
+        &mut |v| {
+            collected.push(v);
+            Demand::Continue
+        },
+    )?;
+    Some(match flow {
+        Flow::Exhausted | Flow::Stopped { .. } => owned_vec_to_generic_result(collected),
+        Flow::Escaped(control) => partial_generic(collected, control),
+    })
+}
+
 /// The owned identity pipe (#2416 step 3): evaluate `stages` from an owned
 /// `value` whose position is `id`, answering `key`/`path`/`parent`/
 /// `parent(n)`/`file_index` from the identity and threading it through
@@ -16026,7 +16313,7 @@ fn eval_owned_identity_pipe<S: EvalSemantics, V: DocumentValue>(
                 stage
             };
             let mut downstream: Option<Flow> = None;
-            let upstream = eval_each_owned::<S>(stage_expr, &value, optional, &mut |output| {
+            let mut emit = |output: OwnedValue| -> Demand {
                 let flow = match owned_identity_after_stage::<S, V>(
                     stage, rule, &value, &id, &output, optional,
                 ) {
@@ -16053,7 +16340,28 @@ fn eval_owned_identity_pipe<S: EvalSemantics, V: DocumentValue>(
                         Demand::Stop
                     }
                 }
+            };
+            // #2471 (gate reason 1 of spine 2416): a map-family stage whose
+            // body reads path context runs that body once per *member*, at
+            // the member's own position -- `stage_expr`'s stage-wide rewrite
+            // above would have resolved those reads to the container's key
+            // instead, which is why `owned_identity_pipe_supported` admits
+            // such a stage without asking `owned_identity_stage_resolvable`.
+            // The output is placed by the stage's ordinary
+            // `owned_identity_rule` (`map` detaches, `map_values` keeps,
+            // `with_entries` detaches), so `rest` continues identically
+            // either way.
+            let positioned = map_family_positioned(stage).and_then(|(family, f)| {
+                let path = match id.path() {
+                    Ok(path) => path,
+                    Err(e) => return Some(Flow::Escaped(Control::Error(e))),
+                };
+                eval_map_family_positioned::<S, V>(family, f, &value, &path, optional, &mut emit)
             });
+            let upstream = match positioned {
+                Some(flow) => flow,
+                None => eval_each_owned::<S>(stage_expr, &value, optional, &mut emit),
+            };
             match downstream {
                 Some(flow) => flow,
                 None => upstream,
@@ -24887,6 +25195,14 @@ mod tests {
         // owned identity pipe.
         assert!(!eager(".a | to_entries | .[(0,1)] | key"));
         assert!(!eager(".a | to_entries | .[(0,1)]? | path"));
+        // #2471 remainder: a `map_values`/`with_entries` whose body is what
+        // reads path context is answered per member by `eval_builtin`'s own
+        // positioned arm, so a live head no longer sends it here -- not even
+        // one that can miss, since an absent input has no members and the
+        // body never runs.
+        assert!(!eager(".a | map_values(key)"));
+        assert!(!eager(".a | with_entries(.value = key)"));
+        assert!(!eager(".a | to_entries | map(.value = key)"));
         // An assignment's right-hand side is a *constant* for a fixed
         // position, so the pipe is answered before this gate is asked at
         // all: `try_path_context_absent_sink` runs first and takes it, which
@@ -24894,6 +25210,14 @@ mod tests {
         // the eager evaluator for `.a.b | .c = key` (arm re-audit, #2471).
         assert!(eager(".a.b | .c = key"));
         assert!(path_context_absent_resolvable(&parse(".c = key").unwrap()));
+        // ...but a body whose reads cannot be resolved at a member position
+        // (`parent`, which real yq answers from a container it is halfway
+        // through rewriting) stays exactly where it was.
+        assert!(eager(".a | map_values(parent)"));
+        assert!(eager(".a | with_entries(.value = parent)"));
+        // `map` is deliberately not admitted for a *live* head: its cursor
+        // shapes are already exact on the eager route (#2493).
+        assert!(eager(".a | map(key + \"x\")"));
         assert!(!eager(".a | to_entries | .[(0):(1)] | key"));
         assert!(!eager(".a | to_entries | .[(0):(1)]? | key"));
         assert!(!eager(".a | to_entries | .[.[0].key | length] | key"));
