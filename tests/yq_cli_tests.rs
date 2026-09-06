@@ -32427,24 +32427,29 @@ fn test_object_construction_keeps_path_context_2473() -> Result<()> {
 /// `yq_empty_operand_output`.
 ///
 /// **One divergence stays, and it is not this arm's:** real yq evaluates an
-/// `and`/`or` *operand* against the document **root**, not against the node
-/// the pipe stands on. Captured on `a: {b: 1}\nc: [10, 20]\n`:
+/// `and`/`or`'s *right* operand against the document **root**, not against the
+/// node the pipe stands on, and answers `false` outright when the operator's
+/// input came from an absent navigation. Captured on
+/// `a: {b: 1}\nc: [10, 20]\n` (and `a:\n  b: 1\n` for the last two):
 ///
 /// ```text
-/// $ yq '.a | true and .b'        false   (`.b` resolved at the root)
-/// $ yq '.a | true and .a.b'      true
-/// $ yq '.c | true and .[0]'      false
-/// $ yq '.a | true and (key)'     false   (`key` at the root is nothing)
-/// $ yq '.a | key and parent'     false   (ditto for `parent`)
-/// $ yq '.a | .b and true'        true    (the *left* operand is not re-rooted)
-/// $ yq '.a | 0 + .b'             1       (arithmetic is not re-rooted either)
+/// $ yq '.a | true and .b'                false   (`.b` resolved at the root)
+/// $ yq '.a | true and .a.b'              true
+/// $ yq '.c | true and .[0]'              false
+/// $ yq '.a | true and (key)'             false   (`key` at the root is nothing)
+/// $ yq '.a | key and parent'             false   (ditto for `parent`)
+/// $ yq '.a | .b and true'                true    (the *left* operand is not re-rooted)
+/// $ yq '.a | 0 + .b'                     1       (arithmetic is not re-rooted either)
+/// $ yq '.a.zz | key == "zz"'             true
+/// $ yq '.a.zz | (key == "zz") and true'  false   (same comparison, as an operand)
 /// ```
 ///
 /// succinctly evaluates both operands at the current node in both modes, so
 /// it answers `true` for `.a | key and parent`. That predates this arm (the
 /// eager route answered `true` too) and is orthogonal to path context --
 /// `.a | true and .b` diverges with no path-context builtin anywhere -- so it
-/// is recorded here rather than encoded.
+/// is recorded in `docs/compliance/yq/limitations.md` ("An `and`/`or`
+/// operand's evaluation context") and pinned below rather than encoded.
 #[test]
 fn test_and_or_keep_path_context_2473() -> Result<()> {
     let args = &["-o=json", "-I=0"];
@@ -32471,12 +32476,31 @@ fn test_and_or_keep_path_context_2473() -> Result<()> {
         assert_eq!(output.trim(), expected, "`{filter}`");
     }
     // The re-rooted-operand divergence above, pinned as succinctly's own
-    // answer so a future fix has to move this row deliberately.
+    // answers so a future fix has to move these rows deliberately
+    // (`docs/compliance/yq/limitations.md`, "An `and`/`or` operand's
+    // evaluation context").
     for (filter, expected) in [
-        (".a | key and parent", "true"),
+        (".a | .b and true", "true"),
         (".a | true and .b", "true"),
+        (".a | true and .a.b", "false"),
+        (".c | true and .[0]", "true"),
+        (".a | 0 + .b", "1"),
+        (".a | (key) and true", "true"),
+        (".a | true and (key)", "true"),
+        (".a | key and parent", "true"),
     ] {
         let (output, code) = run_yq_stdin(filter, "a: {b: 1}\nc: [10, 20]\n", args)?;
+        assert_eq!(code, 0, "`{filter}`: {output:?}");
+        assert_eq!(output.trim(), expected, "`{filter}`");
+    }
+    // The same divergence with the *input* coming from an absent navigation:
+    // real yq answers `false` for all three, succinctly `true`.
+    for (filter, expected) in [
+        (".a.zz | key == \"zz\"", "true"),
+        (".a.zz | (key == \"zz\") and true", "true"),
+        (".a.zz | key and true", "true"),
+    ] {
+        let (output, code) = run_yq_stdin(filter, "a:\n  b: 1\n", args)?;
         assert_eq!(code, 0, "`{filter}`: {output:?}");
         assert_eq!(output.trim(), expected, "`{filter}`");
     }

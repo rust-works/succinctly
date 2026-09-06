@@ -1929,6 +1929,50 @@ now correctly empty, the underlying order difference is what shows:
 left-vivified document, which is a change to the assignment model rather than to this
 rule -- and would move `.x = (keys)`/`.x = (length)` at the same time.
 
+### An `and`/`or` operand's evaluation context -- open (captured under [#2473](https://github.com/rust-works/succinctly/issues/2473))
+
+Real yq v4.53.3 does not evaluate an `and`/`or`'s **right** operand against the node the
+operator stands on -- it resolves it from the **document root** -- and it answers `false`
+for the whole expression whenever the operator's own input came from an absent
+navigation. succinctly evaluates both operands at the current node, in both modes.
+
+The divergence is not about path context: the first four rows contain no path-context
+builtin at all. It was found while making `and`/`or` with a path-context operand native
+(#2473, gate reason 3 of spine 2416), because a `key`/`parent` in the right operand makes
+it visible -- and it predates that change, which is why the rows are pinned as
+succinctly's own answers in `test_and_or_keep_path_context_2473`
+(`tests/yq_cli_tests.rs`) rather than encoded.
+
+Captured live (`-o=json -I0`) on `a: {b: 1}\nc: [10, 20]\n`:
+
+| filter                     | real yq | succinctly |
+|----------------------------|---------|------------|
+| `.a \| .b and true`         | `true`  | `true`     |
+| `.a \| true and .b`         | `false` | `true`     |
+| `.a \| true and .a.b`       | `true`  | `false`    |
+| `.c \| true and .[0]`       | `false` | `true`     |
+| `.a \| 0 + .b`              | `1`     | `1`        |
+| `.a \| (key) and true`      | `true`  | `true`     |
+| `.a \| true and (key)`      | `false` | `true`     |
+| `.a \| key and parent`      | `false` | `true`     |
+
+Row 3 is the one that names the rule: `.a.b` resolved *at* `.a` is nothing, resolved at
+the root it is `1`. Row 5 shows arithmetic is not affected -- this is specific to
+`and`/`or`, and it is a different mechanism from the read-only rule the previous section
+describes (which is about a *missing key* inside an operand, not about which node the
+operand starts from).
+
+And on `a:\n  b: 1\n`, where the operator's input is an absent position:
+
+| filter                              | real yq | succinctly |
+|-------------------------------------|---------|------------|
+| `.a.zz \| key == "zz"`               | `true`  | `true`     |
+| `.a.zz \| (key == "zz") and true`    | `false` | `true`     |
+| `.a.zz \| key and true`              | `false` | `true`     |
+
+The same comparison is `true` on its own and `false` as an `and` operand, so the operand
+is not being evaluated at the position the pipe reached.
+
 ### Ordering comparisons against a real `null` -- resolved for scalars ([#2483](https://github.com/rust-works/succinctly/issues/2483)); containers remain a residual gap
 
 Real yq v4.53.3's ordering comparators (`<`/`<=`/`>`/`>=`) treat a real `null` operand as
