@@ -5798,6 +5798,42 @@ fn fold_pipe_stages_sink<S: EvalSemantics, V: DocumentValue>(
                     sink,
                 );
             }
+            // #2543: `Expr::Format`/`Builtin::ToString` as the sole
+            // remaining stage route through `eval_on_owned` directly,
+            // instead of `eval_each_owned` wrapped in a single-element
+            // `Expr::Pipe`. `eval_on_owned` (this file) already
+            // special-cases exactly these two shapes immediately after a
+            // computed value to avoid rebaking its scientific-notation
+            // spelling as a document-sourced-looking literal on the JSON
+            // round-trip below it (#1054); the wrapped route missed both --
+            // `eval_owned_fast_path` (`eval.rs`) has no `Expr::Format` arm
+            // at all, and (before also being fixed there) didn't recognize
+            // a `Builtin::ToString` wrapped in a trivial `Expr::Pipe` as the
+            // same shape its own bare-`Builtin` arm matches. Confirmed live:
+            // `succinctly jq -n '(2 * 1e16) | @json'` gave `"2E+16"` (jq's
+            // literal-reformat convention) where real jq and every
+            // non-streaming succinctly path give `"2e+16"` (the
+            // computed-value convention).
+            //
+            // Deliberately narrower than "exactly one stage left": both
+            // matched shapes are single-output and side-effect-free once
+            // `o` is already computed, matching `eval_on_owned`'s own
+            // restriction exactly -- widening this to *any* one-stage
+            // remainder previously routed `(1, ("B"|stderr))` through the
+            // same eager `eval_on_owned` call, which has no demand signal
+            // to stop after the first output, so `first(1 | (1,
+            // ("B"|stderr)))` printed `B` where real jq (and this same
+            // pipe minus the trailing single-stage optimization) never
+            // evaluates the second comma branch at all. Caught by
+            // `test_short_circuit_side_effect_shapes_already_match_jq_820`.
+            GenericResult::Owned(o)
+                if matches!(
+                    &stages[j..],
+                    [Expr::Format(_) | Expr::Builtin(Builtin::ToString)]
+                ) =>
+            {
+                return drain_result_generic(eval_on_owned::<S, V>(&stages[j], o, optional), sink);
+            }
             GenericResult::Owned(o) => {
                 let rest_pipe = Expr::Pipe(stages[j..].to_vec());
                 return eval_each_owned::<S>(&rest_pipe, &o, optional, &mut |o| {
@@ -7463,6 +7499,29 @@ fn continue_pipe_element_generic<S: EvalSemantics, V: DocumentValue>(
         // re-deriving it here would just repeat that work.
         GenericItem::OneCursorValue(c, v) => {
             eval_each_pipe_generic::<S, V>(rest.stages(), v, optional, Some(c), sink)
+        }
+        // #2543: `Expr::Format`/`Builtin::ToString` as the sole remaining
+        // stage route through `eval_on_owned` directly rather than
+        // `rest.owned()`'s single-element `Expr::Pipe` wrapper -- see
+        // `fold_pipe_stages_sink`'s identical `Owned` arm above for the full
+        // rationale (`eval_on_owned`'s bypass for exactly these two shapes
+        // vs. `eval_owned_fast_path` having no `Expr::Format` arm at all),
+        // and for why this must stay narrower than "any one-stage
+        // remainder" -- `eval_on_owned` has no demand signal to stop early,
+        // so widening this let `first(1 | (1, ("B"|stderr)))` evaluate the
+        // second comma branch's `stderr` side effect, which real jq's own
+        // short-circuit never reaches. This is the call site a plain
+        // top-level pipe (`EXPR | tostring`/`EXPR | @json`/...) actually
+        // reaches -- `fold_pipe_stages_sink` itself is only entered from a
+        // `LazyKeys`/`LazyIndexRange`/`LazySeq` item elsewhere in this
+        // function.
+        GenericItem::Owned(o)
+            if matches!(
+                rest.stages(),
+                [Expr::Format(_) | Expr::Builtin(Builtin::ToString)]
+            ) =>
+        {
+            drain_result_generic(eval_on_owned::<S, V>(&rest.stages()[0], o, optional), sink)
         }
         GenericItem::Owned(o) => eval_each_owned::<S>(rest.owned(), &o, optional, &mut |o| {
             sink(GenericItem::Owned(o))

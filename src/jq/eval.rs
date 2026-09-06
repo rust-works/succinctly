@@ -31740,6 +31740,26 @@ fn eval_owned_fast_path<S: EvalSemantics>(
         }
     }
     match expr {
+        // #2543: a single-stage `Expr::Pipe` is semantically identical to
+        // its one stage, but `fold_pipe_stages_sink`'s `GenericResult::Owned`
+        // arm (`eval_generic.rs`) always wraps its remaining stages in
+        // `Expr::Pipe(...)` before calling `eval_each_owned` -- even when
+        // only one stage is left -- so a solitary `Builtin::ToString` (or
+        // any other shape this match recognizes) arrives here as
+        // `Expr::Pipe([Builtin::ToString])`, not the bare
+        // `Expr::Builtin(Builtin::ToString)` the arm below matches, and
+        // fell through to the round-trip fallback unconditionally under
+        // `-n`/any streaming (sink-based) evaluation. That round-trip
+        // reparses the computed value's JSON spelling as a
+        // document-sourced-*looking* number, so `tostring` on it echoed
+        // jq's *literal*-reformatting convention (uppercase `E`) instead of
+        // its *computed*-value one (lowercase `e`) past the scientific-
+        // notation threshold (#2456) -- confirmed live:
+        // `succinctly jq -n '(2 * 1e16) | tostring'` gave `"2E+16"` where
+        // real jq and every non-`-n` succinctly invocation gave `"2e+16"`.
+        Expr::Pipe(stages) if stages.len() == 1 => {
+            eval_owned_fast_path::<S>(&stages[0], input, optional)
+        }
         Expr::Identity | Expr::Field(_) | Expr::Index { .. } => {
             eval_owned_navigation::<S>(expr, input, optional)
         }

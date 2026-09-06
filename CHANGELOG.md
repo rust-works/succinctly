@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`succinctly jq -n`/`--null-input` now keeps a computed float's
+  scientific-notation spelling through `tostring`, a format function
+  (`@json`, `@csv`, ...), and string interpolation** (#2543). `-n` always
+  uses the sink-based streaming evaluator (unlike piped/file input, which
+  can pick the eager one instead), and that path routed a computed value
+  immediately followed by one of these into a JSON round-trip that rebaked
+  its already-correct spelling as a document-sourced-*looking* literal,
+  so jq's literal-preserving convention (uppercase `E`) applied instead of
+  its computed-value one (lowercase `e`): `succinctly jq -n '(2 * 1e16) |
+  tostring'` gave `"2E+16"` where real jq (and every non-`-n` succinctly
+  path) gives `"2e+16"`. Deliberately narrow, mirroring an existing bypass
+  one call site over (`eval_on_owned`'s own `Expr::Format`/`Builtin::
+  ToString` special-casing) rather than widened to any single remaining
+  pipe stage -- an earlier, broader version of this fix let `first(...)`
+  evaluate a comma's later branch it must never reach.
+
 - **`succinctly jq` now switches a computed float to scientific notation past
   jq's own magnitude/digit-count threshold, instead of always printing a full
   decimal expansion** (#2456). Confirmed live against jq 1.7.1: `.a * 1e100`
