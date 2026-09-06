@@ -12737,6 +12737,27 @@ fn path_context_single_native(expr: &Expr) -> bool {
         Expr::FuncDef { body, then, .. } => {
             path_context_single_native(body) && path_context_single_native(then)
         }
+        // Native since spine 2416 gate reason 3 (#2473): `eval_single`'s own
+        // `Expr::Reduce`/`Expr::Foreach` arms evaluate INIT and the source
+        // generator through `stream_owned_outputs_generic` *with the cursor*,
+        // so `.a[] | reduce (key) as $k (""; . + $k)` folds the per-element
+        // keys instead of bridging the whole fold to the eager evaluator.
+        // Guarded exactly as those arms are: a `repeat` anywhere in INPUT or
+        // INIT sends the construct to the wildcard bridge instead, where
+        // there is no cursor.
+        //
+        // UPDATE and EXTRACT are deliberately not checked. Both evaluate
+        // against the *accumulator* -- a value the fold built, with no
+        // document position -- which is why `needs_path_context` does not
+        // descend into them either (see its own `Expr::Reduce`/`Expr::Foreach`
+        // arms). A `key` there answers from no position on this route and on
+        // the eager one alike, so admitting the construct cannot move it.
+        Expr::Reduce { input, init, .. } | Expr::Foreach { input, init, .. } => {
+            !streams_unbounded(input)
+                && !streams_unbounded(init)
+                && path_context_single_native(input)
+                && path_context_single_native(init)
+        }
         // Native since #2416 phase 3: transparent to evaluation, so whatever
         // `inner` is decides.
         Expr::Shared(inner) => path_context_single_native(inner),
@@ -24969,6 +24990,24 @@ mod tests {
         // (#1332's other half), a bare `{k: key}` reaches this gate at all
         // for the first time, and is admitted for the same reason.
         assert!(eager(".[] | (key | tostring)"));
+        // Native since spine 2416 gate reason 3 (#2473): the generic
+        // `Expr::Reduce`/`Expr::Foreach` arms evaluate INPUT and INIT with
+        // the cursor, so a fold whose *source* reads the position no longer
+        // drags the pipe to the eager evaluator. UPDATE/EXTRACT run against
+        // the accumulator on either route, so they are not part of the gate.
+        assert!(!eager(".a[] | reduce (key) as $k (\"\"; . + $k)"));
+        assert!(!eager(".a[] | foreach (key) as $k (\"\"; . + $k; [$k, .])"));
+        assert!(!eager(".a[] | reduce (1,2) as $x (key; [., $x])"));
+        assert!(!eager(".a[] | [reduce (key) as $k (\"\"; . + $k)]"));
+        // `repeat` in INPUT or INIT sends the construct to the wildcard
+        // bridge instead of the native arm, so the gate refuses it too.
+        // (`repeat` in INPUT is not a row here: `needs_path_context` has no
+        // `Expr::Repeat` arm, so `reduce (repeat(key)) as ...` is not seen as
+        // a path-context stage at all and the gate is never asked -- the
+        // extension-only shape #2473 deliberately left alone, see
+        // `docs/plan/path-context-arm-reachability.md`.)
+        assert!(eager(".a[] | reduce (key) as $k (repeat(1); .)"));
+        assert!(eager(".a[] | foreach (key) as $k (repeat(1); .; .)"));
         assert!(!eager(".[] | (key | {k: .})"));
         assert!(!eager(".[] | {\"k\": key}"));
         assert!(!eager(".[] | {(key): 1}"));

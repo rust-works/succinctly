@@ -7522,6 +7522,104 @@ fn test_shared_keeps_path_context_2416() -> Result<()> {
     Ok(())
 }
 
+/// Spine 2416 gate reason 3 (#2473): a `reduce`/`foreach` whose *source* or
+/// INIT reads path context is native in `eval_single` -- those two slots are
+/// already evaluated through `stream_owned_outputs_generic` with the cursor,
+/// so admitting `Expr::Reduce`/`Expr::Foreach` to `path_context_single_native`
+/// takes the whole fold off the eager route.
+///
+/// UPDATE and EXTRACT are deliberately *not* part of that: both evaluate
+/// against the accumulator, a value the fold built with no document position,
+/// which is why `needs_path_context` does not descend into them either. A
+/// `key` there answers from no position on both routes -- the last two rows
+/// pin exactly that, unchanged.
+///
+/// No oracle in either direction: real yq's lexer rejects `reduce`/`foreach`
+/// outright (`1:1: lexer: invalid input text "reduce ..."`, v4.53.3, so
+/// succinctly's are documented extensions -- `docs/reference/yq-language.md`),
+/// and jq 1.7.1 has no `key`/`path`. Every row was captured on this PR's own
+/// pre-change build and is unchanged by the admission, which is what a route
+/// migration should look like.
+#[test]
+fn test_reduce_and_foreach_source_keeps_path_context_2473() -> Result<()> {
+    let doc = r#"{"a":{"b":1,"c":2},"d":[10,20]}"#;
+    for (filter, want) in [
+        (".a[] | reduce (key) as $k (\"\"; . + $k)", "\"b\"\n\"c\""),
+        (
+            ".a | reduce (.[] | key) as $k ([]; . + [$k])",
+            "[\"b\",\"c\"]",
+        ),
+        (
+            ".a[] | foreach (key) as $k (\"\"; . + $k; [$k, .])",
+            "[\"b\",\"b\"]\n[\"c\",\"c\"]",
+        ),
+        (
+            ".a[] | reduce (key, path[0]) as $k ([]; . + [$k])",
+            "[\"b\",\"a\"]\n[\"c\",\"a\"]",
+        ),
+        // INIT reads the position too.
+        (".a | reduce (1,2) as $x (key; [., $x])", "[[\"a\",1],2]"),
+        // `key` at the document root emits nothing, so the source is empty
+        // and `reduce` answers with INIT alone while `foreach` answers with
+        // nothing at all -- jq's own rule for an empty source.
+        ("reduce (key) as $k (\"\"; . + $k)", "\"\""),
+        ("foreach (key) as $k (\"\"; . + $k)", ""),
+        // UPDATE/EXTRACT read the accumulator, which has no position: `key`
+        // there is `null`, on this route and on the eager one alike.
+        ("reduce .d[] as $x (.a; [.[] | key])", "[0,1]"),
+        (
+            "foreach .[] as $x (0; . + 1; [$x, key])",
+            "[{\"b\":1,\"c\":2},null]\n[[10,20],null]",
+        ),
+    ] {
+        let (out, _, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "`{filter}`: {out:?}");
+        assert_eq!(out.trim(), want, "`{filter}`");
+    }
+    Ok(())
+}
+
+/// Spine 2416 gate reason 3 (#2473), the constructs deliberately left alone:
+/// `range`, `repeat`, `while` and `until` with a path-context builtin in the
+/// body.
+///
+/// Neither reference can express these. Real yq's lexer rejects all four
+/// (v4.53.3: `1:7: lexer: invalid input text "range(2) | key]"`, and the same
+/// for `limit`, `while`, `until`), and jq 1.7.1 has no `key`/`path` to put in
+/// them -- so there is no captured behaviour to migrate toward, only
+/// succinctly's own extension surface. They get no `path_context_single_native`
+/// arm; these rows pin what they answer today so a later change to the gate
+/// has to move them deliberately.
+///
+/// `range` and `limit` are additionally gated behind `--jq-extensions` in yq
+/// mode (#1512); `while`/`until` are not, which is a pre-existing gap in that
+/// gate rather than anything this change touches.
+#[test]
+fn test_range_repeat_while_until_stay_extension_only_2473() -> Result<()> {
+    let doc = r#"{"a":{"b":1,"c":2},"d":[10,20]}"#;
+    for (filter, want) in [
+        (".a | [range(2) | key]", "[\"a\",\"a\"]"),
+        (".a[] | [range(2) | key]", "[\"b\",\"b\"]\n[\"c\",\"c\"]"),
+        (".a | [range(2) | path]", "[[\"a\"],[\"a\"]]"),
+        // `repeat`'s body re-enters from its own previous output, which has
+        // no position -- hence `null`, not `"a"`.
+        (".a | [limit(2; repeat(key))]", "[null,null]"),
+        // `while`/`until` fold from a seed value, so `key` inside the update
+        // stands on that seed and answers nothing; the loops therefore stop
+        // on their first test.
+        (".a | [1 | while(. < 3; . + (key|length))]", "[1]"),
+        (".a | [1 | until(. > 2; . + (key|length))]", "[]"),
+        // A `range` that only *feeds* a later `key` still resolves against
+        // the constructed array, not the input node.
+        (".a | [range(2)] | map(key)", "[0,1]"),
+    ] {
+        let (out, _, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "`{filter}`: {out:?}");
+        assert_eq!(out.trim(), want, "`{filter}`");
+    }
+    Ok(())
+}
+
 /// #1332's other half, closed by #2473 (gate reason 3 of spine 2416), in jq
 /// mode. `needs_path_context` descends into `Expr::Object` now, so an object
 /// literal's key and value slots are routed like any other path-context read.
