@@ -35176,3 +35176,307 @@ mod issue_1349_inplace_presentation {
         Ok(())
     }
 }
+
+// Issue #1351: a write *through* an alias reaches the shared node
+//
+// Real yq models `&x`/`*x` as one node reachable from several positions, and
+// decides by *path shape* whether a write mutates that node or rebinds one
+// position: a path that ends exactly at an alias (`.b = 5`) rebinds it; a
+// path that passes through the alias and continues (`.b.p = 9`) lands on
+// the anchor's node and every position follows. succinctly recovers that
+// distinction with `jq::alias_identity`'s path redirect (installed by
+// `evaluate_yaml_cursor` for alias-sensitive writes) plus a post-write
+// mirror. Every expected string below was captured live from yq v4.53.3.
+// =============================================================================
+
+const ALIAS_MAP_DOC_1351: &str = "a: &x {p: 1, q: 2}\nb: *x\nc: *x\n";
+const ALIAS_SEQ_DOC_1351: &str = "a: &x [1, 2]\nb: *x\n";
+
+fn assert_yq_1351(filter: &str, input: &str, yaml: &str, json: &str) -> Result<()> {
+    let (output, exit_code) = run_yq_stdin(filter, input, &[])?;
+    assert_eq!(exit_code, 0, "yaml run of {filter}");
+    assert_eq!(output, yaml, "yaml output of {filter}");
+    let (output, exit_code) = run_yq_stdin(filter, input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0, "json run of {filter}");
+    assert_eq!(output.trim(), json, "json output of {filter}");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_write_through_alias_updates_shared_node_1351() -> Result<()> {
+    // The issue's own repro: yq mutates the anchor's node and keeps `b: *x`.
+    assert_yq_1351(
+        ".b.p = 9",
+        ALIAS_MAP_DOC_1351,
+        "a: &x {p: 9, q: 2}\nb: *x\nc: *x\n",
+        r#"{"a":{"p":9,"q":2},"b":{"p":9,"q":2},"c":{"p":9,"q":2}}"#,
+    )
+}
+
+#[test]
+fn test_yaml_write_through_alias_update_and_compound_1351() -> Result<()> {
+    for filter in [".b.p |= . + 1", ".b.p += 1"] {
+        assert_yq_1351(
+            filter,
+            ALIAS_MAP_DOC_1351,
+            "a: &x {p: 2, q: 2}\nb: *x\nc: *x\n",
+            r#"{"a":{"p":2,"q":2},"b":{"p":2,"q":2},"c":{"p":2,"q":2}}"#,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn test_yaml_del_through_alias_deletes_from_shared_node_1351() -> Result<()> {
+    assert_yq_1351(
+        "del(.b.p)",
+        ALIAS_MAP_DOC_1351,
+        "a: &x {q: 2}\nb: *x\nc: *x\n",
+        r#"{"a":{"q":2},"b":{"q":2},"c":{"q":2}}"#,
+    )?;
+    // A comma-grouped `del()` goes through the delete trie, which redirects
+    // each branch on its own.
+    assert_yq_1351(
+        "del(.b.p, .c.q)",
+        ALIAS_MAP_DOC_1351,
+        "a: &x {}\nb: *x\nc: *x\n",
+        r#"{"a":{},"b":{},"c":{}}"#,
+    )
+}
+
+#[test]
+fn test_yaml_new_key_through_alias_lands_on_shared_node_1351() -> Result<()> {
+    assert_yq_1351(
+        ".b.r = 3",
+        ALIAS_MAP_DOC_1351,
+        "a: &x {p: 1, q: 2, r: 3}\nb: *x\nc: *x\n",
+        r#"{"a":{"p":1,"q":2,"r":3},"b":{"p":1,"q":2,"r":3},"c":{"p":1,"q":2,"r":3}}"#,
+    )
+}
+
+#[test]
+fn test_yaml_setpath_and_delpaths_through_alias_1351() -> Result<()> {
+    assert_yq_1351(
+        r#"setpath(["b","p"]; 9)"#,
+        ALIAS_MAP_DOC_1351,
+        "a: &x {p: 9, q: 2}\nb: *x\nc: *x\n",
+        r#"{"a":{"p":9,"q":2},"b":{"p":9,"q":2},"c":{"p":9,"q":2}}"#,
+    )?;
+    assert_yq_1351(
+        r#"delpaths([["b","p"]])"#,
+        ALIAS_MAP_DOC_1351,
+        "a: &x {q: 2}\nb: *x\nc: *x\n",
+        r#"{"a":{"q":2},"b":{"q":2},"c":{"q":2}}"#,
+    )
+}
+
+#[test]
+fn test_yaml_write_through_alias_sequence_index_1351() -> Result<()> {
+    assert_yq_1351(
+        ".b[0] = 9",
+        ALIAS_SEQ_DOC_1351,
+        "a: &x [9, 2]\nb: *x\n",
+        r#"{"a":[9,2],"b":[9,2]}"#,
+    )?;
+    // A negative index is normalised against the container before the
+    // table lookup, so `.b[-1]` names the same slot as `.b[1]`.
+    assert_yq_1351(
+        ".b[-1] = 5",
+        ALIAS_SEQ_DOC_1351,
+        "a: &x [1, 5]\nb: *x\n",
+        r#"{"a":[1,5],"b":[1,5]}"#,
+    )?;
+    assert_yq_1351(
+        ".b[2] = 3",
+        ALIAS_SEQ_DOC_1351,
+        "a: &x [1, 2, 3]\nb: *x\n",
+        r#"{"a":[1,2,3],"b":[1,2,3]}"#,
+    )?;
+    assert_yq_1351(
+        "del(.b[0])",
+        ALIAS_SEQ_DOC_1351,
+        "a: &x [2]\nb: *x\n",
+        r#"{"a":[2],"b":[2]}"#,
+    )?;
+    // A container nested inside the aliased mapping.
+    assert_yq_1351(
+        ".b.s[0] = 9",
+        "a: &x {s: [1, 2]}\nb: *x\n",
+        "a: &x {s: [9, 2]}\nb: *x\n",
+        r#"{"a":{"s":[9,2]},"b":{"s":[9,2]}}"#,
+    )
+}
+
+#[test]
+fn test_yaml_write_through_alias_multi_hop_1351() -> Result<()> {
+    // `.b` aliases `a`, whose `q` aliases `x`: the redirect follows both hops.
+    assert_yq_1351(
+        ".b.q.z = 1",
+        "x: &y {z: 0}\na: &x {q: *y}\nb: *x\n",
+        "x: &y {z: 1}\na: &x {q: *y}\nb: *x\n",
+        r#"{"x":{"z":1},"a":{"q":{"z":1}},"b":{"q":{"z":1}}}"#,
+    )
+}
+
+#[test]
+fn test_yaml_write_through_alias_nested_anchor_1351() -> Result<()> {
+    let doc = "a: &x\n  p: &y 1\n  q: *y\nb: *x\n";
+    // Through the outer alias onto the inner anchor: the inner alias follows
+    // too, and the outer alias sees both changes (the mirror iterates to a
+    // fixpoint over the nested groups).
+    assert_yq_1351(
+        ".b.p = 5",
+        doc,
+        "a: &x\n  p: &y 5\n  q: *y\nb: *x\n",
+        r#"{"a":{"p":5,"q":5},"b":{"p":5,"q":5}}"#,
+    )?;
+    // Through the outer alias onto the inner *alias*: that terminal position
+    // rebinds (drops `*y`), and the outer alias still follows.
+    assert_yq_1351(
+        ".b.q = 5",
+        doc,
+        "a: &x\n  p: &y 1\n  q: 5\nb: *x\n",
+        r#"{"a":{"p":1,"q":5},"b":{"p":1,"q":5}}"#,
+    )
+}
+
+#[test]
+fn test_yaml_write_ending_at_alias_rebinds_that_position_1351() -> Result<()> {
+    // Rule 1: a path that ends exactly at the alias never redirects.
+    for filter in [".b = 5", ".b |= 5"] {
+        assert_yq_1351(
+            filter,
+            ALIAS_MAP_DOC_1351,
+            "a: &x {p: 1, q: 2}\nb: 5\nc: *x\n",
+            r#"{"a":{"p":1,"q":2},"b":5,"c":{"p":1,"q":2}}"#,
+        )?;
+    }
+    assert_yq_1351(
+        "del(.b)",
+        ALIAS_MAP_DOC_1351,
+        "a: &x {p: 1, q: 2}\nc: *x\n",
+        r#"{"a":{"p":1,"q":2},"c":{"p":1,"q":2}}"#,
+    )
+}
+
+#[test]
+fn test_yaml_update_body_write_at_alias_redirects_1351() -> Result<()> {
+    // Rule 4: `|=` whose filter is itself a shape-preserving write mutates the
+    // shared node in yq, unlike `.b |= 5` above.
+    assert_yq_1351(
+        ".b |= (.p = 9 | .q = 8)",
+        ALIAS_MAP_DOC_1351,
+        "a: &x {p: 9, q: 8}\nb: *x\nc: *x\n",
+        r#"{"a":{"p":9,"q":8},"b":{"p":9,"q":8},"c":{"p":9,"q":8}}"#,
+    )?;
+    assert_yq_1351(
+        ".b |= del(.p)",
+        ALIAS_MAP_DOC_1351,
+        "a: &x {q: 2}\nb: *x\nc: *x\n",
+        r#"{"a":{"q":2},"b":{"q":2},"c":{"q":2}}"#,
+    )
+}
+
+#[test]
+fn test_yaml_value_update_at_alias_rebinds_not_discarded_1351() -> Result<()> {
+    // Rule 5, a recorded divergence (docs/compliance/yq/limitations.md): real
+    // yq silently *discards* `.b |= . + 1` / `.b += 1` / `.b += [3]` /
+    // `.b |= . + {..}` at an alias node (it prints the document unchanged).
+    // succinctly rebinds the position with the computed value instead, the
+    // same as `.b |= 5`, rather than lose the write (rule 4(b)).
+    for filter in [".b |= . + 1", ".b += 1"] {
+        assert_yq_1351(
+            filter,
+            "a: &x 1\nb: *x\n",
+            "a: &x 1\nb: 2\n",
+            r#"{"a":1,"b":2}"#,
+        )?;
+    }
+    assert_yq_1351(
+        ".b += [3]",
+        ALIAS_SEQ_DOC_1351,
+        "a: &x [1, 2]\nb:\n  - 1\n  - 2\n  - 3\n",
+        r#"{"a":[1,2],"b":[1,2,3]}"#,
+    )?;
+    assert_yq_1351(
+        r#".b |= . + {"r": 3}"#,
+        ALIAS_MAP_DOC_1351,
+        "a: &x {p: 1, q: 2}\nb:\n  p: 1\n  q: 2\n  r: 3\nc: *x\n",
+        r#"{"a":{"p":1,"q":2},"b":{"p":1,"q":2,"r":3},"c":{"p":1,"q":2}}"#,
+    )
+}
+
+#[test]
+fn test_yaml_writes_accumulate_over_shared_positions_1351() -> Result<()> {
+    // Rule 6: three positions sharing one node take three increments.
+    assert_yq_1351(
+        ".[] .p += 1",
+        ALIAS_MAP_DOC_1351,
+        "a: &x {p: 4, q: 2}\nb: *x\nc: *x\n",
+        r#"{"a":{"p":4,"q":2},"b":{"p":4,"q":2},"c":{"p":4,"q":2}}"#,
+    )?;
+    let seq = "items:\n  - &t {n: 1}\n  - *t\n  - *t\n";
+    assert_yq_1351(
+        ".items[].n += 1",
+        seq,
+        "items:\n  - &t {n: 4}\n  - *t\n  - *t\n",
+        r#"{"items":[{"n":4},{"n":4},{"n":4}]}"#,
+    )?;
+    assert_yq_1351(
+        ".items[1].n = 9",
+        seq,
+        "items:\n  - &t {n: 9}\n  - *t\n  - *t\n",
+        r#"{"items":[{"n":9},{"n":9},{"n":9}]}"#,
+    )
+}
+
+#[test]
+fn test_yaml_pipe_of_writes_through_two_aliases_1351() -> Result<()> {
+    // The mirror runs after each write expression, so the second stage sees
+    // `c` still equal to the anchor and redirects too.
+    assert_yq_1351(
+        ".b.p = 9 | .c.q = 8",
+        ALIAS_MAP_DOC_1351,
+        "a: &x {p: 9, q: 8}\nb: *x\nc: *x\n",
+        r#"{"a":{"p":9,"q":8},"b":{"p":9,"q":8},"c":{"p":9,"q":8}}"#,
+    )
+}
+
+#[test]
+fn test_yaml_rebound_alias_is_not_redirected_1351() -> Result<()> {
+    // Rule 3: once `.b` has been rebound its value no longer equals the
+    // anchor's, so `.b.p = 9` is positional -- a yq-mode field write on a
+    // scalar is a no-op, leaving `b: 5`.
+    assert_yq_1351(
+        ".b = 5 | .b.p = 9",
+        ALIAS_MAP_DOC_1351,
+        "a: &x {p: 1, q: 2}\nb: 5\nc: *x\n",
+        r#"{"a":{"p":1,"q":2},"b":5,"c":{"p":1,"q":2}}"#,
+    )
+}
+
+#[test]
+fn test_yaml_deleted_declaration_writes_positionally_1351() -> Result<()> {
+    // Rule 7, a recorded limitation: with the anchor deleted earlier in the
+    // pipe there is no declaration to redirect to, so `.b.p = 9` is
+    // positional and `c` does not follow. Real yq prints `b: *x` / `c: *x`
+    // with no `&x` anywhere (a document it cannot read back, rule 4(a)).
+    let (output, exit_code) = run_yq_stdin("del(.a) | .b.p = 9", ALIAS_MAP_DOC_1351, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "b:\n  p: 9\n  q: 2\nc:\n  p: 1\n  q: 2\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_write_through_alias_leaves_json_input_alone_1351() -> Result<()> {
+    // JSON has no aliases: no table is installed and `.b.p = 9` writes `b`
+    // only, exactly as before.
+    let (output, exit_code) = run_yq_stdin(
+        ".b.p = 9",
+        r#"{"a": {"p": 1}, "b": {"p": 1}}"#,
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":{"p":1},"b":{"p":9}}"#);
+    Ok(())
+}

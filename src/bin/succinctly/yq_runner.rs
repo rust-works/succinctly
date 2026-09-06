@@ -23,9 +23,9 @@ use succinctly::jq::eval_generic::{
 };
 use succinctly::jq::stream::StreamFailure;
 use succinctly::jq::{
-    self, assert_value_tree_depth, nesting_depth_exceeded_message, nonfinite_display_string,
-    sync_aliased_paths, Builtin, EvalError, Expr, NumberRepr, ObjectKey, OwnedValue, QueryResult,
-    YqSemantics,
+    self, alias_identity, assert_value_tree_depth, is_alias_sensitive_assign,
+    nesting_depth_exceeded_message, nonfinite_display_string, sync_aliased_paths, Builtin,
+    EvalError, Expr, NumberRepr, ObjectKey, OwnedValue, QueryResult, YqSemantics,
 };
 use succinctly::json::light::JsonCursor;
 use succinctly::json::JsonIndex;
@@ -1769,75 +1769,10 @@ fn query_result_to_owned_values(
     }
 }
 
-/// Whether `expr` is itself an assignment-family write: `.path = value`,
-/// `|=`, a compound assign, `//=`, or `del(...)`. Unwraps `Paren`/`Optional`
-/// so `(.a = 1)?` still counts, and recurses into `Pipe` so a chain counts
-/// as soon as *any* stage writes.
-///
-/// Split out from [`is_alias_sensitive_assign`] so a pipe made entirely of
-/// pass-through stages (`select(true) | debug`, no write at all) doesn't
-/// pay for alias-sync snapshotting -- only a pipe that both preserves shape
-/// *and* actually writes somewhere needs the pristine-vs-result diff.
-fn contains_assign(expr: &Expr) -> bool {
-    match expr {
-        Expr::Assign { .. }
-        | Expr::Update { .. }
-        | Expr::CompoundAssign { .. }
-        | Expr::AlternativeAssign { .. }
-        | Expr::Builtin(Builtin::Del(_)) => true,
-        Expr::Paren(inner) | Expr::Optional(inner) => contains_assign(inner),
-        Expr::Pipe(stages) => stages.iter().any(contains_assign),
-        _ => false,
-    }
-}
-
-/// Whether `expr`'s top-level shape is "rewrite the document at specific
-/// paths, leaving everything else identical" -- the class of expression for
-/// which comparing a path's value before and after the write is meaningful.
-/// Unwraps `Paren`/`Optional` so `(.a = 1)?` still matches, and recurses into
-/// `Pipe` so a chain matches when every stage does, whether the stage is a
-/// write (`.a = 1 | .b = 2`) or one of a small allow-list of pass-through
-/// stages that provably either emit the input document completely unchanged
-/// or emit nothing at all: `.` (`Identity`), `select(...)`, `empty`,
-/// `debug`/`debug(msg)`. Mixing one into an assignment pipe (`.a = 1 |
-/// select(.a > 0)`, the guard-style `yq -i` idiom from #764) still leaves
-/// "the same path means the same thing" true for every document that comes
-/// out the other end, since none of these four ever rewrite or reshape the
-/// value they pass through -- unlike `map`, `select`'s own predicate or
-/// `debug`'s own message expression never appear in the pipeline's output,
-/// only their pass/fail or side-effect result does, so `contains_assign`
-/// deliberately does not recurse into either.
-///
-/// Used to gate the alias-sync post-process (#711): outside this class (a
-/// bare `map`, `.a, .b`, ...) the result document doesn't necessarily share
-/// the input's shape at all, so diffing "the same path" in both would be
-/// meaningless at best and could clobber it at worst. A pipe with a stage
-/// outside both the write list and this pass-through allow-list is
-/// conservatively excluded for the same reason -- verifying more stages
-/// preserve paths is left for a future extension, not assumed here.
-fn is_alias_sensitive_assign(expr: &Expr) -> bool {
-    fn is_shape_preserving(expr: &Expr) -> bool {
-        match expr {
-            Expr::Assign { .. }
-            | Expr::Update { .. }
-            | Expr::CompoundAssign { .. }
-            | Expr::AlternativeAssign { .. }
-            | Expr::Identity
-            | Expr::Builtin(
-                Builtin::Del(_)
-                | Builtin::Select(_)
-                | Builtin::Empty
-                | Builtin::Debug
-                | Builtin::DebugMsg(_),
-            ) => true,
-            Expr::Paren(inner) | Expr::Optional(inner) => is_shape_preserving(inner),
-            Expr::Pipe(stages) => stages.iter().all(is_shape_preserving),
-            _ => false,
-        }
-    }
-
-    is_shape_preserving(expr) && contains_assign(expr)
-}
+// `is_alias_sensitive_assign` (and its `contains_assign` half) moved into the
+// library (`jq::is_alias_sensitive_assign`, #1351) so the alias-identity
+// redirect's `|=` terminal rule and this file's alias-sync/presentation gates
+// read one definition.
 
 /// Walk `cursor`'s document collecting, for every anchor with at least one
 /// alias, its definition path and the path of every alias that resolves to
@@ -2651,12 +2586,14 @@ enum TreeStep<'a> {
 /// three in practice: `yq 'del(.a)'` on `a: &x 1\nb: *x` prints `b: *x`
 /// with no anchor left anywhere, and `yq` then rejects its own output with
 /// `unknown anchor 'x' referenced` (verified against the pinned binary).
-/// Rule 3 is also what keeps the gap in succinctly's own alias *value*
-/// model safe rather than wrong: a write *through* an alias (`.b.p = 9`)
-/// updates only `.b`, where real `yq` mutates the shared node, so the two
-/// sides no longer agree and the mark is dropped — printing `b: {p: 9}`
-/// (the value succinctly computed) instead of `b: *x` (which would discard
-/// the write entirely).
+/// Rule 3 is also the backstop for the alias *value* model: since #1351 a
+/// write *through* an alias (`.b.p = 9`) is redirected onto the anchor's
+/// node (`jq::alias_identity`) and every alias slot follows, so the two
+/// sides agree and `b: *x` survives; wherever that redirect declines (the
+/// anchor was deleted earlier in the pipe, or a position was rebound and
+/// then written through) the values differ and the mark is dropped —
+/// printing `b: {p: 9}` (the value succinctly computed) instead of `b: *x`
+/// (which would discard the write entirely).
 ///
 /// Anchor *declarations* are never dropped: an unreferenced `&x` is valid
 /// YAML and real `yq` keeps it (`yq 'del(.b)'` still prints `a: &x 1`).
@@ -2857,7 +2794,16 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
         .and_then(|_| collect_write_targets(expr))
         .unwrap_or_default();
 
+    // #1351: for the duration of the write, let the evaluator's write entry
+    // points see which positions share a node, so a path descending *through*
+    // an alias (`.b.p = 9` on `b: *x`) lands on the anchor's node and every
+    // alias slot follows -- see `jq::alias_identity`. Same gate as the sync
+    // context above: nothing is installed for a read or an alias-free document.
+    let alias_identity_guard = alias_sync_ctx.as_ref().map(|(_, groups)| {
+        alias_identity::enter(alias_identity::AliasTable::from_groups(groups.clone()))
+    });
     let result = eval_with_cursor_using::<YqSemantics, _>(expr, cursor);
+    drop(alias_identity_guard);
     // A value with no live cursor of its own (an assignment/`del()`
     // result, a computed value, ...) has no comment/style to read directly
     // - but if it came from a shape-preserving write, `presentation_sync_ctx`

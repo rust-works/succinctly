@@ -623,6 +623,496 @@ pub(crate) mod yq_read_only_context {
     }
 }
 
+/// Ambient alias-identity table for yq-mode writes (#1351 — the remaining half of
+/// ADR-0017's mechanism 2).
+///
+/// Real yq models `&x`/`*x` as **one node reachable from several positions**: a
+/// write whose path descends *through* an alias position and continues (`.b.p = 9`
+/// on `b: *x`) lands on the anchor's node and is visible at every position, while a
+/// write that *ends* at the alias (`.b = 5`) rebinds that one position. `OwnedValue`
+/// clones every alias independently, so the distinction is recovered here by path
+/// shape rather than by a shared node: the CLI installs, for the duration of one
+/// alias-sensitive write expression, the `(alias path -> anchor path)` table
+/// `collect_alias_groups` derived from the pristine document, and the write entry
+/// points consult it through two hooks — both no-ops when nothing is installed,
+/// which is every jq-mode evaluation and every yq read:
+///
+/// - `redirect_paths` rewrites each resolved write path whose **proper** prefix is
+///   an alias position onto the anchor's own path, transitively (an alias inside an
+///   anchored mapping that is itself aliased), and only while the alias position's
+///   current value still equals the anchor's — *identity by equality*, which is what
+///   lets a positional model stand in for a graph: a slot rebound earlier in the
+///   pipe (`.b = 5 | .b.p = 9`) no longer equals the anchor and is written
+///   positionally, exactly as yq treats a rebound position. A path that ends
+///   exactly at the alias is left alone (rule 1 of the plan on #1351).
+/// - `mirror_after_write` re-copies the anchor's post-write value into every
+///   alias slot that was still an untouched copy of the anchor *before* the write,
+///   so a later stage of the same pipe (`.b.p = 9 | .c.q = 8`) sees a consistent
+///   document. The CLI's end-of-pipe `sync_aliased_paths` then finds nothing left
+///   to do.
+///
+/// Verified live against yq v4.53.3 (see the plan on #1351 for the full matrix):
+/// `.b.p = 9`, `.b.p |= . + 1`, `del(.b.p)`, `.b.r = 3`, `.b[0] = 9` and
+/// `setpath(["b","p"]; 9)` all mutate the shared node; `.b = 5`, `.b |= 5`,
+/// `del(.b)` rebind/remove the position only; three positions sharing one node
+/// accumulate — `.[] .p += 1` over `a: &x {p: 1}` / `b: *x` / `c: *x` yields 4.
+///
+/// Same ambient shape (and `#[cfg(feature = "std")]` limitation) as
+/// `yq_read_only_context`: the sites that consult the table are many recursion
+/// levels below the site that installs it, and this codebase has no evaluation-
+/// environment parameter for it to ride on.
+#[cfg(feature = "std")]
+pub mod alias_identity {
+    use super::{
+        get_value_at_path, is_alias_sensitive_assign, push_path_components, set_value_at_path,
+        unwrap_path_component, Expr, OwnedValue,
+    };
+    use alloc::rc::Rc;
+    use alloc::vec::Vec;
+    use std::cell::RefCell;
+
+    /// One alias-sensitive write's view of which positions share a node.
+    #[derive(Debug, Clone)]
+    pub struct AliasTable {
+        /// `(anchor definition path, [alias paths...])`, one entry per anchor
+        /// that has at least one alias — the shape `sync_aliased_paths` takes.
+        groups: Vec<(Vec<OwnedValue>, Vec<Vec<OwnedValue>>)>,
+    }
+
+    impl AliasTable {
+        /// Build from `collect_alias_groups`'s output. Paths are plain
+        /// `String`/`Int` key sequences addressing the `OwnedValue` tree.
+        pub fn from_groups(groups: Vec<(Vec<OwnedValue>, Vec<Vec<OwnedValue>>)>) -> Self {
+            Self { groups }
+        }
+
+        /// The anchor path this exact alias position resolves to, if any.
+        fn anchor_for(&self, prefix: &[OwnedValue]) -> Option<&[OwnedValue]> {
+            self.groups.iter().find_map(|(def, aliases)| {
+                aliases
+                    .iter()
+                    .any(|a| a.as_slice() == prefix)
+                    .then(|| def.as_slice())
+            })
+        }
+
+        /// Whether any alias position lies strictly *below* `prefix` — the
+        /// only case in which fanning an `Iterate` out into per-element
+        /// paths can change what a write does.
+        fn has_alias_under(&self, prefix: &[OwnedValue]) -> bool {
+            self.groups.iter().any(|(_, aliases)| {
+                aliases
+                    .iter()
+                    .any(|a| a.len() > prefix.len() && a[..prefix.len()] == *prefix)
+            })
+        }
+
+        fn hop_bound(&self) -> usize {
+            self.groups
+                .iter()
+                .map(|(_, aliases)| aliases.len())
+                .sum::<usize>()
+                + 1
+        }
+    }
+
+    thread_local! {
+        static TABLE: RefCell<Option<Rc<AliasTable>>> = const { RefCell::new(None) };
+    }
+
+    /// Whether a table is installed for the current evaluation.
+    pub fn active() -> bool {
+        TABLE.with(|t| t.borrow().is_some())
+    }
+
+    fn with_table<R>(f: impl FnOnce(&AliasTable) -> R) -> Option<R> {
+        let table = TABLE.with(|t| t.borrow().clone())?;
+        Some(f(&table))
+    }
+
+    /// Restores the previous table on drop, so a nested or later evaluation
+    /// never inherits a table built for a different document.
+    #[must_use]
+    pub struct Guard(Option<Rc<AliasTable>>);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            TABLE.with(|t| *t.borrow_mut() = previous);
+        }
+    }
+
+    /// Install `table` for the caller's scope.
+    pub fn enter(table: AliasTable) -> Guard {
+        let previous = TABLE.with(|t| t.borrow_mut().replace(Rc::new(table)));
+        Guard(previous)
+    }
+
+    /// One concrete path step as the `Expr` component the write walkers take.
+    /// `None` for a component shape `collect_alias_groups` never produces.
+    fn step_to_expr(step: &OwnedValue) -> Option<Expr> {
+        match step {
+            OwnedValue::String(key) => Some(Expr::Field(key.clone())),
+            OwnedValue::Int(idx) => Some(Expr::Index {
+                idx: *idx,
+                key: None,
+            }),
+            _ => None,
+        }
+    }
+
+    fn rebuild(mut components: Vec<Expr>) -> Expr {
+        match components.len() {
+            0 => Expr::Identity,
+            1 => components.pop().expect("len checked"),
+            _ => Expr::Pipe(components),
+        }
+    }
+
+    /// Both positions resolve and hold equal values right now.
+    fn same_node(doc: &OwnedValue, a: &[OwnedValue], b: &[OwnedValue]) -> bool {
+        matches!(
+            (get_value_at_path(doc, a), get_value_at_path(doc, b)),
+            (Some(x), Some(y)) if x == y
+        )
+    }
+
+    /// Rewrite every path in `paths` per the rules above, against `doc` (the
+    /// document the paths were resolved on, before any write). A path may
+    /// fan out into several when an `Iterate` over a container holding
+    /// aliases is enumerated so each element can be redirected on its own.
+    ///
+    /// `through_terminal`: also redirect a path that ends *exactly* at an
+    /// alias position. `|=` passes `true` when its filter is itself a
+    /// shape-preserving write (`.b |= (.p = 9)`, `.b |= del(.p)`: yq mutates
+    /// the shared node), `false` otherwise — `.b |= 5` rebinds, and so does
+    /// every `=`/compound assign/`del()` whose path ends at the alias.
+    pub(crate) fn redirect_paths(paths: &mut Vec<Expr>, doc: &OwnedValue, opts: Redirect) {
+        with_table(|table| {
+            let mut out = Vec::with_capacity(paths.len());
+            for path in paths.drain(..) {
+                let mut components = Vec::new();
+                push_path_components(&mut components, &path);
+                redirect_components(components, doc, table, opts, 0, &mut out);
+            }
+            *paths = out;
+        });
+    }
+
+    /// Per-entry-point options for [`redirect_paths`].
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct Redirect {
+        /// Also redirect a path that ends *exactly* at an alias position.
+        /// Only `|=` with a shape-preserving write as its filter sets this
+        /// (`.b |= (.p = 9)`: yq mutates the shared node); `=`, compound
+        /// assigns, `.b |= 5` and `del(.b)` all rebind or remove the
+        /// position itself.
+        pub through_terminal: bool,
+        /// Fan an `Iterate` over a container holding aliases out into one
+        /// path per element, so each can be redirected on its own (rule 6:
+        /// `.[] .p += 1` over three shared positions is 4 in yq). Off for
+        /// `del()`, whose single-path walker must not receive several
+        /// paths and whose effect does not accumulate anyway.
+        pub fan_out_iterate: bool,
+    }
+
+    fn redirect_components(
+        components: Vec<Expr>,
+        doc: &OwnedValue,
+        table: &AliasTable,
+        opts: Redirect,
+        hops: usize,
+        out: &mut Vec<Expr>,
+    ) {
+        let mut prefix: Vec<OwnedValue> = Vec::new();
+        let mut i = 0;
+        while i < components.len() {
+            let (component, optional) = unwrap_path_component(&components[i]);
+            match component {
+                Expr::Field(name) => prefix.push(OwnedValue::String(name.clone())),
+                Expr::Index { idx, .. } => {
+                    // Normalise a negative index against the container it
+                    // indexes *now*, so `.b[-1]` and `.b[1]` name the same
+                    // slot in the table's non-negative coordinates.
+                    let Some(OwnedValue::Array(arr)) = get_value_at_path(doc, &prefix) else {
+                        break;
+                    };
+                    let len = arr.len() as i64;
+                    let norm = if *idx < 0 { *idx + len } else { *idx };
+                    if norm < 0 || norm >= len {
+                        break;
+                    }
+                    prefix.push(OwnedValue::Int(norm));
+                }
+                Expr::Iterate => {
+                    // Rule 6: several positions sharing one node accumulate
+                    // (`.[] .p += 1` over three shared positions is 4 in yq),
+                    // which needs each element to be a path of its own so it
+                    // can be redirected. Fan out only where it can matter —
+                    // an alias lives under this container — and only over a
+                    // container that exists now, leaving `null | .a[] = 1`-
+                    // style autovivification shapes to the walkers untouched.
+                    if opts.fan_out_iterate && table.has_alias_under(&prefix) {
+                        let wrap = |e: Expr| {
+                            if optional {
+                                Expr::Optional(Box::new(e))
+                            } else {
+                                e
+                            }
+                        };
+                        let elements: Vec<Expr> = match get_value_at_path(doc, &prefix) {
+                            Some(OwnedValue::Object(map)) => {
+                                map.keys().map(|k| wrap(Expr::Field(k.clone()))).collect()
+                            }
+                            Some(OwnedValue::Array(arr)) => (0..arr.len() as i64)
+                                .map(|idx| wrap(Expr::Index { idx, key: None }))
+                                .collect(),
+                            _ => Vec::new(),
+                        };
+                        if !elements.is_empty() {
+                            for element in elements {
+                                let mut fanned = components[..i].to_vec();
+                                fanned.push(element);
+                                fanned.extend(components[i + 1..].iter().cloned());
+                                redirect_components(fanned, doc, table, opts, hops, out);
+                            }
+                            return;
+                        }
+                    }
+                    break;
+                }
+                _ => break,
+            }
+            i += 1;
+            // Reaching here with `i == components.len()` means every component
+            // was static, so the whole path names one concrete position.
+            let is_proper_prefix = i < components.len();
+            if (is_proper_prefix || opts.through_terminal) && hops < table.hop_bound() {
+                if let Some(def) = table.anchor_for(&prefix) {
+                    if same_node(doc, &prefix, def) {
+                        if let Some(mut redirected) =
+                            def.iter().map(step_to_expr).collect::<Option<Vec<Expr>>>()
+                        {
+                            redirected.extend(components[i..].iter().cloned());
+                            redirect_components(redirected, doc, table, opts, hops + 1, out);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        out.push(rebuild(components));
+    }
+
+    /// Redirect one concrete (`String`/`Int`) path, the form `setpath`/
+    /// `delpaths` take. A slice descriptor or any other component shape
+    /// leaves the path untouched.
+    pub(crate) fn redirect_concrete_path(path: &mut Vec<OwnedValue>, doc: &OwnedValue) {
+        if !active() {
+            return;
+        }
+        let Some(components) = path.iter().map(step_to_expr).collect::<Option<Vec<Expr>>>() else {
+            return;
+        };
+        let mut paths = vec![rebuild(components)];
+        redirect_paths(
+            &mut paths,
+            doc,
+            Redirect {
+                through_terminal: false,
+                fan_out_iterate: false,
+            },
+        );
+        let Some(redirected) = paths.pop() else {
+            return;
+        };
+        let mut flat = Vec::new();
+        push_path_components(&mut flat, &redirected);
+        let Some(concrete) = flat
+            .iter()
+            .map(|c| match unwrap_path_component(c).0 {
+                Expr::Field(name) => Some(OwnedValue::String(name.clone())),
+                Expr::Index { idx, .. } => Some(OwnedValue::Int(*idx)),
+                _ => None,
+            })
+            .collect::<Option<Vec<OwnedValue>>>()
+        else {
+            return;
+        };
+        *path = concrete;
+    }
+
+    /// After one write expression has run, copy every anchor's new value into
+    /// each alias slot that was still an untouched copy of that anchor before
+    /// the write, iterating to a fixpoint (bounded by the group count) so a
+    /// nested anchor's change reaches the outer anchor's aliases too. A slot
+    /// that was rebound earlier (`.b = 5 | .a.p = 9` keeps `b: 5`) or that no
+    /// longer resolves is never written.
+    ///
+    /// `pre` is the document the write expression started from — not the
+    /// pristine input of the whole pipe — which is what makes the "was a copy
+    /// before this write" test exact mid-pipe.
+    pub(crate) fn mirror_after_write(pre: &OwnedValue, post: &mut OwnedValue) {
+        with_table(|table| {
+            // Per alias slot, the value it must still hold to be written:
+            // its pre-write value if that was a copy of the anchor's
+            // pre-write value, updated to whatever this pass writes.
+            let mut expected: Vec<Vec<Option<OwnedValue>>> = table
+                .groups
+                .iter()
+                .map(|(def, aliases)| {
+                    let def_pre = get_value_at_path(pre, def);
+                    aliases
+                        .iter()
+                        .map(|alias| {
+                            get_value_at_path(pre, alias).filter(|v| Some(v) == def_pre.as_ref())
+                        })
+                        .collect()
+                })
+                .collect();
+            for _ in 0..table.groups.len() {
+                let mut changed = false;
+                for (g, (def, aliases)) in table.groups.iter().enumerate() {
+                    let Some(new) = get_value_at_path(post, def) else {
+                        continue;
+                    };
+                    for (a, alias) in aliases.iter().enumerate() {
+                        let Some(want) = expected[g][a].as_ref() else {
+                            continue;
+                        };
+                        if *want == new {
+                            continue;
+                        }
+                        if get_value_at_path(post, alias).as_ref() != Some(want) {
+                            continue;
+                        }
+                        if let Ok(updated) = set_value_at_path(post.clone(), alias, new.clone()) {
+                            *post = updated;
+                            expected[g][a] = Some(new.clone());
+                            changed = true;
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// `|=`'s terminal rule needs the same "is this filter a shape-preserving
+    /// write" answer the CLI's alias-sync gate uses; re-exported here so both
+    /// read one definition.
+    pub(crate) fn update_filter_writes_through(filter: &Expr) -> bool {
+        is_alias_sensitive_assign(filter)
+    }
+}
+
+#[cfg(not(feature = "std"))]
+pub mod alias_identity {
+    use super::{Expr, OwnedValue};
+    use alloc::vec::Vec;
+
+    pub fn active() -> bool {
+        false
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct Redirect {
+        pub through_terminal: bool,
+        pub fan_out_iterate: bool,
+    }
+
+    pub(crate) fn redirect_paths(_paths: &mut Vec<Expr>, _doc: &OwnedValue, _opts: Redirect) {}
+
+    pub(crate) fn redirect_concrete_path(_path: &mut Vec<OwnedValue>, _doc: &OwnedValue) {}
+
+    pub(crate) fn mirror_after_write(_pre: &OwnedValue, _post: &mut OwnedValue) {}
+
+    pub(crate) fn update_filter_writes_through(_filter: &Expr) -> bool {
+        false
+    }
+}
+
+/// Whether `expr` is itself an assignment-family write: `.path = value`,
+/// `|=`, a compound assign, `//=`, `del(...)`, `setpath(...)` or
+/// `delpaths(...)` (the last two added by #1351: they write at a path exactly
+/// as `=`/`del()` do, so an alias-bearing document needs the same sync and
+/// redirect for them). Unwraps `Paren`/`Optional`
+/// so `(.a = 1)?` still counts, and recurses into `Pipe` so a chain counts
+/// as soon as *any* stage writes.
+///
+/// Split out from [`is_alias_sensitive_assign`] so a pipe made entirely of
+/// pass-through stages (`select(true) | debug`, no write at all) doesn't
+/// pay for alias-sync snapshotting -- only a pipe that both preserves shape
+/// *and* actually writes somewhere needs the pristine-vs-result diff.
+fn contains_assign(expr: &Expr) -> bool {
+    match expr {
+        Expr::Assign { .. }
+        | Expr::Update { .. }
+        | Expr::CompoundAssign { .. }
+        | Expr::AlternativeAssign { .. }
+        | Expr::Builtin(Builtin::Del(_) | Builtin::SetPath(..) | Builtin::DelPaths(_)) => true,
+        Expr::Paren(inner) | Expr::Optional(inner) => contains_assign(inner),
+        Expr::Pipe(stages) => stages.iter().any(contains_assign),
+        _ => false,
+    }
+}
+
+/// Whether `expr`'s top-level shape is "rewrite the document at specific
+/// paths, leaving everything else identical" -- the class of expression for
+/// which comparing a path's value before and after the write is meaningful.
+/// Unwraps `Paren`/`Optional` so `(.a = 1)?` still matches, and recurses into
+/// `Pipe` so a chain matches when every stage does, whether the stage is a
+/// write (`.a = 1 | .b = 2`) or one of a small allow-list of pass-through
+/// stages that provably either emit the input document completely unchanged
+/// or emit nothing at all: `.` (`Identity`), `select(...)`, `empty`,
+/// `debug`/`debug(msg)`. Mixing one into an assignment pipe (`.a = 1 |
+/// select(.a > 0)`, the guard-style `yq -i` idiom from #764) still leaves
+/// "the same path means the same thing" true for every document that comes
+/// out the other end, since none of these four ever rewrite or reshape the
+/// value they pass through -- unlike `map`, `select`'s own predicate or
+/// `debug`'s own message expression never appear in the pipeline's output,
+/// only their pass/fail or side-effect result does, so `contains_assign`
+/// deliberately does not recurse into either.
+///
+/// Used by the CLI (`yq_runner.rs`) to gate the alias-sync post-process
+/// (#711) and the presentation snapshot (#739), and by [`alias_identity`]
+/// for `|=`'s terminal rule (#1351): outside this class (a bare `map`,
+/// `.a, .b`, ...) the result document doesn't necessarily share the input's
+/// shape at all, so diffing "the same path" in both would be meaningless at
+/// best and could clobber it at worst. A pipe with a stage outside both the
+/// write list and this pass-through allow-list is conservatively excluded
+/// for the same reason -- verifying more stages preserve paths is left for a
+/// future extension, not assumed here. Lives in the library rather than the
+/// CLI so the two consumers cannot drift (#2091 tracks `def`-wrapped writes,
+/// which this predicate does not yet see through).
+pub fn is_alias_sensitive_assign(expr: &Expr) -> bool {
+    fn is_shape_preserving(expr: &Expr) -> bool {
+        match expr {
+            Expr::Assign { .. }
+            | Expr::Update { .. }
+            | Expr::CompoundAssign { .. }
+            | Expr::AlternativeAssign { .. }
+            | Expr::Identity
+            | Expr::Builtin(
+                Builtin::Del(_)
+                | Builtin::SetPath(..)
+                | Builtin::DelPaths(_)
+                | Builtin::Select(_)
+                | Builtin::Empty
+                | Builtin::Debug
+                | Builtin::DebugMsg(_),
+            ) => true,
+            Expr::Paren(inner) | Expr::Optional(inner) => is_shape_preserving(inner),
+            Expr::Pipe(stages) => stages.iter().all(is_shape_preserving),
+            _ => false,
+        }
+    }
+
+    is_shape_preserving(expr) && contains_assign(expr)
+}
+
 /// Whether a key lookup that found nothing must yield **no output** here,
 /// instead of the `null` node every other context reads back (#2470).
 ///
@@ -19824,10 +20314,21 @@ fn yq_assign_noop_check<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // fail in practice; falling back to `NotChecked` on the (unreachable)
     // `Err` arm just means the caller re-derives from scratch, same as
     // before this function existed.
-    let paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false) {
+    let mut paths = match resolve_dynamic_indexes::<S>(path_expr, &pristine, false) {
         Ok(paths) => paths,
         Err(_) => return Ok(YqAssignNoopCheck::NotChecked),
     };
+    // #1351: a path descending through an alias position is the anchor's
+    // own path -- redirect before the no-op classification so the check
+    // and the write below agree on where the write lands.
+    alias_identity::redirect_paths(
+        &mut paths,
+        &pristine,
+        alias_identity::Redirect {
+            through_terminal: false,
+            fan_out_iterate: true,
+        },
+    );
     // Classified once per path and reused for both the total-noop and
     // rhs-unused decisions below, instead of walking each path twice via
     // separately-called `yq_assign_is_total_noop`/`yq_assign_rhs_unused`
@@ -19979,6 +20480,17 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Err((_, EvalEscape::Error(_))) if optional => return QueryResult::None,
                 Err((_, escape)) => return escape.into(),
             };
+            let mut paths = paths;
+            // #1351: same redirect `yq_assign_noop_check` applies on its
+            // own arm -- a no-op here in jq mode (no table is ever installed).
+            alias_identity::redirect_paths(
+                &mut paths,
+                &pristine,
+                alias_identity::Redirect {
+                    through_terminal: false,
+                    fan_out_iterate: true,
+                },
+            );
             (pristine, paths)
         }
     };
@@ -20063,13 +20575,26 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // an outer `(.[-5] |= 9)?` needs exactly that swallowed. `update_path` is
     // always entered with `false` below; any `?` it still sees came from an
     // `Expr::Optional` node inside `path_expr` itself.
-    let paths = match resolve_dynamic_indexes::<S>(path_expr, &result, false) {
+    let mut paths = match resolve_dynamic_indexes::<S>(path_expr, &result, false) {
         Ok(paths) => paths,
         // `?` swallows only a genuine error; a halt always escapes — see the
         // matching comment in `eval_assign` (#791).
         Err((_, EvalEscape::Error(_))) if optional => return QueryResult::None,
         Err((_, escape)) => return escape.into(),
     };
+    // #1351: redirect through aliases. `|=` is the one operator whose
+    // *terminal* alias position is also redirected, and only when the filter
+    // is itself a shape-preserving write (`.b |= (.p = 9)` mutates the shared
+    // node in yq; `.b |= 5` rebinds the position) -- see `alias_identity`.
+    alias_identity::redirect_paths(
+        &mut paths,
+        &result,
+        alias_identity::Redirect {
+            through_terminal: alias_identity::update_filter_writes_through(filter_expr),
+            fan_out_iterate: true,
+        },
+    );
+    let pre = alias_identity::active().then(|| result.clone());
 
     // yq's slice-assignment no-op (#1101, generalized to any chain depth by
     // #1116) — `update_path` itself now no-ops the *write* whenever it
@@ -20095,6 +20620,9 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 other => other.into(),
             };
         }
+    }
+    if let Some(pre) = &pre {
+        alias_identity::mirror_after_write(pre, &mut result);
     }
 
     QueryResult::Owned(result)
@@ -20403,6 +20931,10 @@ fn fork_rhs_over_paths<'a, W: Clone + AsRef<[u64]>, State>(
     let rhs_last = rhs_values.len() - 1;
     let last_path = paths.len().saturating_sub(1);
     let mut docs: Vec<OwnedValue> = vec_with_capacity(rhs_values.len());
+    // #1351: the pre-write document, kept only while an alias table is
+    // installed, so each forked result can re-copy a written anchor into the
+    // alias slots that were still untouched copies of it.
+    let pre = alias_identity::active().then(|| pristine.clone());
     for (j, rhs_value) in rhs_values.into_iter().enumerate() {
         let mut result = if j == rhs_last {
             core::mem::replace(&mut pristine, OwnedValue::Null)
@@ -20421,6 +20953,9 @@ fn fork_rhs_over_paths<'a, W: Clone + AsRef<[u64]>, State>(
                     other => partial(docs, other.into()),
                 };
             }
+        }
+        if let Some(pre) = &pre {
+            alias_identity::mirror_after_write(pre, &mut result);
         }
         docs.push(result);
     }
@@ -20498,6 +21033,19 @@ fn eval_update_multi<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
     };
     let scalar_noop = scalar_slice_noop && S::TAG == EvalTag::Yq;
+    // #1351: a compound/alternative assign whose path *ends* at an alias
+    // rebinds that position (real yq discards the write outright there -- a
+    // data-loss bug succinctly does not reproduce, rule 4(b)); one whose path
+    // passes through an alias lands on the shared node.
+    let mut paths = paths;
+    alias_identity::redirect_paths(
+        &mut paths,
+        &pristine,
+        alias_identity::Redirect {
+            through_terminal: false,
+            fan_out_iterate: true,
+        },
+    );
 
     fork_rhs_over_paths::<W, _>(
         pristine,
@@ -38914,8 +39462,18 @@ fn builtin_setpath<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Ok(owned) => owned,
                 Err(e) => return suppress_or_raise(e, optional),
             };
+            // #1351: `setpath(["b","p"]; 9)` through an alias lands on the
+            // shared node, like `.b.p = 9`.
+            let mut path = path;
+            alias_identity::redirect_concrete_path(&mut path, &owned);
+            let pre = alias_identity::active().then(|| owned.clone());
             match set_value_at_path(owned, &path, new_val) {
-                Ok(result) => QueryResult::Owned(result),
+                Ok(mut result) => {
+                    if let Some(pre) = &pre {
+                        alias_identity::mirror_after_write(pre, &mut result);
+                    }
+                    QueryResult::Owned(result)
+                }
                 // An optional context swallows the refusal, as it does for
                 // every other builtin here.
                 Err(_) if optional => QueryResult::None,
@@ -40552,6 +41110,13 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `Expr::Optional` node baked into `path_expr`, which the walkers still
     // honor on their own.
     let mut result = to_owned_or_suppress!(&value, optional);
+    // #1351: pre-write snapshot for the alias mirror, only while a table is
+    // installed (never in jq mode).
+    let del_pre = alias_identity::active().then(|| result.clone());
+    let del_redirect = alias_identity::Redirect {
+        through_terminal: false,
+        fan_out_iterate: false,
+    };
 
     // yq's comma-grouped chained-slice del() pre-rewrite (#1223):
     // `resolve_dynamic_indexes`'s own generic navigation raises a hard type
@@ -40681,6 +41246,15 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // `filter_map`'s dropped sibling and `DropParent`'s truncated
                 // one both stop existing once branches share nodes.
                 let inserted = match slice_paths.get(index).and_then(Option::as_ref) {
+                    // #1351: a branch descending through an alias position
+                    // deletes from the shared node. Assembling the branch to
+                    // a flat `Expr` costs the O(depth) #1690 avoided, but only
+                    // while an alias table is installed.
+                    None if alias_identity::active() => {
+                        let mut exprs = vec![assemble_one_branch(branch)];
+                        alias_identity::redirect_paths(&mut exprs, &result, del_redirect);
+                        exprs.iter().try_for_each(|e| builder.insert_expr(e))
+                    }
                     None => builder.insert_branch(&branch.path),
                     Some(path) => match yq_del_slice_outcome(path, &result, false) {
                         YqDelSliceOutcome::DropParent(rewritten) => builder.insert_expr(&rewritten),
@@ -40713,7 +41287,12 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // walk below can take it by value.
         drop(resolved);
         return match delete_trie_apply(result, &trie, DELETE_TRIE_ROOT, S::TAG == EvalTag::Yq) {
-            Ok(result) => QueryResult::Owned(result),
+            Ok(mut result) => {
+                if let Some(pre) = &del_pre {
+                    alias_identity::mirror_after_write(pre, &mut result);
+                }
+                QueryResult::Owned(result)
+            }
             Err(_) if optional => QueryResult::None,
             Err(e) => e.into(),
         };
@@ -40729,6 +41308,10 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         DelPaths::Root => vec![Expr::Identity],
         DelPaths::Branches(branches) => assemble_path_branches(branches),
     };
+    // #1351: `del(.b.p)` on `b: *x` deletes from the anchor's node; `del(.b)`
+    // (a path ending at the alias) removes that position only.
+    let mut paths = paths;
+    alias_identity::redirect_paths(&mut paths, &result, del_redirect);
     debug_assert!(
         paths.len() <= 1,
         "a multi-path del() match set should have been merged into a DeleteTrie (#1690)"
@@ -40819,6 +41402,9 @@ fn builtin_del<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 QueryResult::Error(e)
             };
         }
+    }
+    if let Some(pre) = &del_pre {
+        alias_identity::mirror_after_write(pre, &mut result);
     }
     QueryResult::Owned(result)
 }
@@ -44907,6 +45493,20 @@ fn delpaths_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             return QueryResult::Error(EvalError::path_must_be_array_not(path.type_name()));
         }
     }
+    // #1351: a path descending through an alias position deletes from the
+    // shared node. The extra `to_owned` runs only while a table is installed.
+    let delpaths_pre = if alias_identity::active() {
+        to_owned(value).ok()
+    } else {
+        None
+    };
+    if let Some(doc) = &delpaths_pre {
+        for path in &mut paths {
+            if let OwnedValue::Array(path) = path {
+                alias_identity::redirect_concrete_path(path, doc);
+            }
+        }
+    }
 
     // A NaN component is dropped with the path around it, because it names no
     // element at any depth — `resolve_read_index` refuses it, as jq's `jv_get`
@@ -45072,7 +45672,12 @@ fn delpaths_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
     match result {
         Ok(_) if root_deleted => QueryResult::None,
-        Ok(v) => QueryResult::Owned(v),
+        Ok(mut v) => {
+            if let Some(pre) = &delpaths_pre {
+                alias_identity::mirror_after_write(pre, &mut v);
+            }
+            QueryResult::Owned(v)
+        }
         // #1746 review: a decode failure from `to_owned` must bypass
         // `optional` the same way every other converted call site does
         // (`eval_assign`/`eval_update`/`builtin_path`/`builtin_setpath`/
