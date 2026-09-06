@@ -38686,6 +38686,45 @@ fn test_jq_mode_update_zero_output_filter_still_deletes_2484() -> Result<()> {
 }
 
 /// #2471 (gate reason 1 of spine 2416): the jq-mode half of
+/// `yq_cli_tests::test_map_family_bodies_see_their_members_position_2471`.
+///
+/// `key`/`path`-with-no-argument are succinctly extensions in jq mode (real jq
+/// 1.7.1 refuses both: `key/0 is not defined`, `path/0 is not defined`), so
+/// there is no jq oracle for these rows -- what they pin is that the mode that
+/// *does* have an oracle and the mode that does not answer the same position,
+/// rather than the extension quietly drifting into a second model.
+/// `map_values(select(...))` is deliberately included as the one row where the
+/// two modes must **not** agree: jq's `map_values` drops a member whose filter
+/// produced nothing, which is jq's own documented rule and unrelated to the
+/// position the filter read.
+#[test]
+fn test_map_family_bodies_see_their_members_position_2471() -> Result<()> {
+    let input = r#"{"a":{"b":1,"e":2},"n":[1,2]}"#;
+    for (filter, expected) in [
+        (".a | map_values(key)", r#"{"b":"b","e":"e"}"#),
+        (".a | map_values(path)", r#"{"b":["a","b"],"e":["a","e"]}"#),
+        (".n | map_values(key)", "[0,1]"),
+        (".a | with_entries(.value = key)", r#"{"b":0,"e":1}"#),
+        (
+            ".a | with_entries(.value = path)",
+            r#"{"b":["a",0],"e":["a",1]}"#,
+        ),
+        (
+            ".a | to_entries | map(.value = key)",
+            r#"[{"key":"b","value":0},{"key":"e","value":1}]"#,
+        ),
+        // jq's own `map_values` rule, not a position: a member whose filter
+        // yields nothing is dropped.
+        (".a | map_values(select(key == \"b\"))", r#"{"b":1}"#),
+    ] {
+        let (output, code) = run_jq_stdin(filter, input, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}`: {output:?}");
+        assert_eq!(output.trim_end(), expected, "`{filter}`");
+    }
+    Ok(())
+}
+
+/// #2471 (gate reason 1 of spine 2416): the jq-mode half of
 /// `yq_cli_tests::test_assignment_rhs_sees_the_input_position_2471` -- same
 /// extension caveat as the test above.
 #[test]
