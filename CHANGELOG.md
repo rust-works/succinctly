@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`succinctly yq`'s `type` now answers the YAML tag (`!!str`, `!!int`,
+  `!!map`, ...), matching real yq's own `type`/`tag` alias, instead of jq's
+  type name (`"string"`, `"number"`, `"object"`, ...)** (#2516). Confirmed
+  live against yq v4.53.3: `type` on a mapping is `!!map`, `.a | type` on
+  `a: 1` is `!!int`, and an explicit tag — including a custom one — is
+  echoed back verbatim (`!mytag hello | type` is `!mytag`, not `!!str`).
+  `tag` gained a native cursor-aware implementation too (it used to fall
+  through to a path that lost custom-tag information the same way `type`
+  did before this fix). This is a behavior change for any `succinctly yq`
+  filter comparing `type`'s output against a jq-style string
+  (`type == "string"` now needs `type == "!!str"`); jq mode is unaffected.
+  See `docs/compliance/yq/limitations.md` for the full captured matrix and
+  a residual gap (an alias occurrence through a constructed array/object
+  loses the alias-vs-dereferenced distinction).
+
 ### Fixed
 
 - **`succinctly yq` now creates an assignment's target *before* evaluating its

@@ -3018,6 +3018,56 @@ Not fixed here: `entry_key_and_value` has no `S: EvalSemantics` parameter today 
 one to change its alias list and presence check per mode is a proper follow-up, not a
 one-line change riding along with #2521's own stringification fix.
 
+### `type` answered jq's type name instead of the YAML tag — resolved ([#2516](https://github.com/rust-works/succinctly/issues/2516)); an alias through a constructed array/object is a residual gap
+
+Real yq's `type` is a plain alias of `tag`: it answers the YAML tag (`!!str`, `!!int`,
+`!!map`, ...), not jq's type name (`"string"`, `"number"`, `"object"`, ...). succinctly
+reproduced jq's naming in yq mode too before this fix. Captured live against yq v4.53.3
+(`-o=json -I0`) on `a: 1`:
+
+```console
+$ yq 'type'          !!map        $ succinctly yq 'type'        object   (was)
+$ yq '.a | type'     !!int        $ succinctly yq '.a | type'   number   (was)
+$ yq 'tag'           !!map        (already correct — `tag` already answered the YAML tag)
+$ yq 'kind'          map          (unaffected — `kind` is a different builtin, not a `type` alias)
+```
+
+On other tagged/untagged scalars (`-n`, `--jq-extensions` makes no difference to any row):
+`!!str 1` => `!!str`; `!!int "5"` => `!!int`; `!!float 3` => `!!float`; `!!bool "yes"` =>
+`!!bool`; `!!null "~"` => `!!null`; a custom `!mytag hello` => `!mytag` (echoed back
+verbatim, not `!!str` — real yq has no notion of "recognized" vs "unrecognized" tags for
+this purpose); a quoted `"1"` => `!!str`.
+
+Fixed as `eval_generic::yq_type_tag` (the cursor-aware route, correct for both standard
+*and custom* explicit tags) and `eval::yaml_type_tag`/`owned_yaml_type_tag` (the two
+`OwnedValue`-only routes, implicit tags only — see below), consulted by `Builtin::Type`'s
+own yq-mode arm in both evaluators. `Builtin::Tag` gained a native cursor-aware arm in
+`eval_generic.rs` too (it previously fell to the generic reindex-bridge fallback, which
+already had this exact same-shaped custom-tag gap) — both builtins now agree with each
+other and with real yq.
+
+**Custom tags are only correct when a cursor is available** (the overwhelming majority of
+call sites — any read through a real YAML document). Once a value has left cursor
+tracking (materialized into an `OwnedValue`, e.g. after `map`/a computed expression, or
+under `-n`/`--slurp`/JSON input), a custom tag is unrecoverable — `OwnedValue` has no
+field for one at all, the same structural gap #1416 already documents. This is not a
+regression from this fix: `tag`'s own prior, unconditional (non-cursor) implementation
+already had the identical limitation; this fix only *adds* the cursor-aware case that
+real yq always has, it does not remove the old one.
+
+**A residual gap, discovered alongside, not fixed:** real yq's `type`/`tag` answer the
+empty string for an alias occurrence (`*name`) rather than dereferencing to its target's
+tag — confirmed live, `y: *a` where `a: &a !!str 1` gives `.y | type` => `""` while `.x |
+type` => `"!!str"`. succinctly's `yq_type_tag` matches this for a direct, cursor-forwarded
+read (checked via `DocumentCursor::is_alias` ahead of the explicit-tag lookup). It does
+**not** survive array/object *construction*, though: `[.x, .y] | map(type)` answers
+`["!!str","!!str"]` in succinctly against real yq's own `["!!str",""]`, because
+construction resets cursor/position context for its own elements before `type` ever runs
+— the same reset `key`/`path` already get inside `{...}`/`[...]` (this doc's own "Partial
+Implementation Notes" #3 in `docs/reference/yq-language.md`), not something new to this
+fix. `(.x, .y) | type` (no construction) answers correctly. See
+`tests/yq_cli_tests.rs`'s `test_yaml_explicit_tag_resolves_through_alias_903`.
+
 ### Other categories
 
 Float and number formatting ([#1071](https://github.com/rust-works/succinctly/issues/1071),

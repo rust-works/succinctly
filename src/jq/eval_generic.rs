@@ -727,6 +727,120 @@ fn tagged_type_name<V: DocumentValue>(value: &V, cursor: Option<V::Cursor>) -> &
         .map_or_else(|| value.type_name(), crate::yaml::ResolvedScalar::type_name)
 }
 
+/// The **untagged** YAML type tag (`!!str`, `!!int`, `!!map`, ...) for a
+/// value with no explicit tag of its own -- i.e. what real yq's implicit
+/// resolution rules would assign it. `as_i64`/`as_f64` already distinguish
+/// `!!int` from `!!float` the same way real YAML's own implicit-typing
+/// grammar does (a quoted `"1"` fails both, since [`DocumentValue::as_i64`]
+/// only recognizes an *unquoted* plain scalar as numeric -- confirmed live,
+/// `type` on a quoted `"1"` is `!!str` in real yq too).
+///
+/// Order matters: `is_null` and `as_bool` must run before the numeric
+/// checks (a `null`/boolean value never also answers a numeric probe, but
+/// checking defensively costs nothing and avoids relying on that
+/// invariant). `as_array`/`as_object` are last since every scalar arm above
+/// already excludes them.
+fn document_value_type_tag<V: DocumentValue>(value: &V) -> &'static str {
+    if value.is_null() {
+        "!!null"
+    } else if value.as_bool().is_some() {
+        "!!bool"
+    } else if value.as_i64().is_some() {
+        "!!int"
+    } else if value.as_f64().is_some() {
+        "!!float"
+    } else if value.as_str().is_some() {
+        "!!str"
+    } else if value.as_array().is_some() {
+        "!!seq"
+    } else if value.as_object().is_some() {
+        "!!map"
+    } else {
+        // Unreachable for every format shipped today (every `DocumentValue`
+        // is one of the eight cases above), kept as a safe default rather
+        // than a `panic!`/`unreachable!` -- see `EvalTag`'s own coverage
+        // philosophy for output-shape defaults.
+        "!!null"
+    }
+}
+
+/// yq mode only (#2516): real yq's `type` (and `tag`, which it is an alias
+/// of) answers the YAML tag, not jq's type name -- `.a | type` on `a: 1` is
+/// `"!!int"` in real yq, `"number"` in jq (and in succinctly before this
+/// fix, in both modes).
+///
+/// An explicit tag, if the cursor carries one, is echoed back **verbatim**
+/// -- this is what makes a *custom* tag work (`!mytag` stays `!mytag`, not
+/// jq's `"string"`/yq's implicit `!!str`): real yq has no notion of
+/// "recognized" vs "unrecognized" tags for this purpose, it just prints
+/// whatever was written. Only once there is no explicit tag at all does
+/// [`document_value_type_tag`]'s implicit resolution apply.
+///
+/// Captured live against yq v4.53.3 (`-o=json -I0`) on `a: 1`:
+///
+/// | filter                        | real yq   |
+/// |--------------------------------|-----------|
+/// | `type` (root, a mapping)       | `"!!map"` |
+/// | `.a \| type`                   | `"!!int"` |
+/// | `tag` (root)                   | `"!!map"` |
+/// | `kind` (root)                  | `"map"`   |
+///
+/// And on other tagged/untagged scalars (`-n`, `--jq-extensions` makes no
+/// difference to any row -- `type`/`tag` are core builtins in both modes,
+/// not gated jq-only surface):
+///
+/// | input                | `type`      |
+/// |------------------------|-------------|
+/// | `!!str 1`               | `"!!str"`   |
+/// | `!!int "5"`             | `"!!int"`   |
+/// | `!!float 3`             | `"!!float"` |
+/// | `!!bool "yes"`          | `"!!bool"`  |
+/// | `!!null "~"`            | `"!!null"`  |
+/// | `!mytag hello`          | `"!mytag"`  |
+/// | `"1"` (a quoted string) | `"!!str"`   |
+/// | `[1, 2]`                | `"!!seq"`   |
+///
+/// **An alias occurrence (`*name`) answers the empty string**, not its
+/// target's tag -- confirmed live: `y: *a` where `a: &a !!str 1` gives `.y |
+/// type` => `""` (and separately, `.y | kind` => `"alias"` there too, a
+/// pre-existing, unrelated `kind` gap this fix does not chase -- `kind`
+/// never gained a native cursor-aware arm here, so it still answers
+/// whatever the materialized/dereferenced value's structural shape is).
+/// Unlike every *value* accessor (`==`, arithmetic, `-o=json` output),
+/// which dereferences through an alias to its target (#903), `type`/`tag`
+/// do not. Checked via [`DocumentCursor::is_alias`] ahead of the
+/// explicit-tag lookup: an alias node cannot carry its own tag in valid
+/// YAML syntax, so this is a distinct rule, not a special case of the
+/// explicit-tag one.
+///
+/// **Only correct when a cursor is available** (the overwhelming majority
+/// of `type`/`tag` call sites -- any read through a real YAML document).
+/// Once a value has left cursor tracking (materialized into an
+/// `OwnedValue`, e.g. after `map`/a computed expression, or under `-n`/
+/// `--slurp`/JSON input), a custom tag is unrecoverable: `OwnedValue` has
+/// no field for it at all (the same structural gap #1416 already
+/// documents for anchor/alias-adjacent output), so [`eval::yaml_type_tag`]
+/// -- the sibling used on that path -- only ever answers one of the six
+/// built-in tags. Not a regression: `tag`'s own pre-existing, unconditional
+/// (non-cursor) implementation already had this exact limitation; this
+/// function only *adds* the cursor-aware case, which real yq always has.
+fn yq_type_tag<V: DocumentValue>(value: &V, cursor: Option<V::Cursor>) -> String {
+    if let Some(c) = cursor {
+        if c.is_alias() {
+            return String::new();
+        }
+        // `.map(str::to_string)` inside the closure, not chained outside
+        // it: `c` is a local `V::Cursor`, so a `&str` returned through
+        // `&c` (an elided-lifetime `&self` method) can't outlive this
+        // scope even though the underlying text can -- same constraint
+        // `tagged_type_name`'s own doc comment explains.
+        if let Some(tag) = c.explicit_tag().map(str::to_string) {
+            return tag;
+        }
+    }
+    document_value_type_tag(value).to_string()
+}
+
 /// Which YAML anchor/alias syntax a node carried in the source document
 /// (issue #763, ADR-0017's mechanism 2).
 ///
@@ -14020,10 +14134,26 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             cursor.map_or(GenericResult::One(value), GenericResult::OneCursor)
         }
 
+        // #2516 (yq mode): `type` answers the YAML tag, not jq's type name
+        // -- see `yq_type_tag`'s own doc comment for the full captured
+        // matrix. `Builtin::Tag`'s own arm just below reuses the identical
+        // function, so the two stay consistent with each other (real yq's
+        // own `type` is a plain alias of `tag`).
+        Builtin::Type if S::TAG == EvalTag::Yq => {
+            GenericResult::Owned(OwnedValue::String(yq_type_tag(&value, cursor)))
+        }
         Builtin::Type => {
             let type_name = tagged_type_name(&value, cursor);
             GenericResult::Owned(OwnedValue::String(type_name.to_string()))
         }
+
+        // #2516: native cursor-aware arm, so `tag` sees the real explicit
+        // tag text (including a custom one) the same way `type` now does
+        // above -- its previous behavior (falling to the generic `_`
+        // fallback below, which reindexes to JSON and loses cursor/tag
+        // info entirely) is what left `tag` wrong for a custom `!mytag` in
+        // the first place. See `yq_type_tag`'s own doc comment.
+        Builtin::Tag => GenericResult::Owned(OwnedValue::String(yq_type_tag(&value, cursor))),
 
         Builtin::Length => {
             if value.is_null() {

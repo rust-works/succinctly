@@ -6137,18 +6137,30 @@ fn test_yaml_default_output_preserves_the_literal_tag() -> Result<()> {
 /// `.a | type` still said `"number"`. `type` doesn't call `to_owned` at all
 /// (it reads `DocumentValue::type_name()` directly), so it needed its own
 /// fix (`tagged_type_name`) rather than inheriting `to_owned_cursor`'s.
+///
+/// #2516 updated this test's own expected values: `type` in yq mode now
+/// answers the YAML tag (`eval_generic::yq_type_tag`), not jq's type name
+/// -- so a tagged value's `type` is the tag itself (`"!!str"`, `"!!int"`,
+/// ...), and a custom tag (`!custom`) is echoed back verbatim rather than
+/// falling through to an implicit answer, both confirmed live against yq
+/// v4.53.3. `tagged_type_name` (this test's original subject, still used
+/// for `==`/arithmetic's own jq-style value resolution in
+/// `test_yaml_explicit_tag_eq_and_arithmetic_resolve_747` below) is
+/// unaffected -- `type`'s own routing changed, not the underlying tag
+/// resolution those other builtins still rely on.
 #[test]
 fn test_yaml_explicit_tag_type_resolves_747() -> Result<()> {
     for (name, input, expected) in [
-        ("str tag forces string", "a: !!str 1\n", "string"),
-        ("int tag forces number", "a: !!int \"5\"\n", "number"),
-        ("float tag forces number", "a: !!float \"5\"\n", "number"),
-        ("bool tag forces boolean", "a: !!bool \"yes\"\n", "boolean"),
-        ("null tag forces null", "a: !!null anything\n", "null"),
-        // A non-core-schema tag doesn't force anything — falls through to
-        // ordinary plain-scalar resolution, same as `resolve_tagged`'s
-        // `None` contract elsewhere in this file (#224).
-        ("custom tag is untouched", "a: !custom 1\n", "number"),
+        ("str tag answers !!str", "a: !!str 1\n", "!!str"),
+        ("int tag answers !!int", "a: !!int \"5\"\n", "!!int"),
+        ("float tag answers !!float", "a: !!float \"5\"\n", "!!float"),
+        ("bool tag answers !!bool", "a: !!bool \"yes\"\n", "!!bool"),
+        ("null tag answers !!null", "a: !!null anything\n", "!!null"),
+        // A custom tag is echoed back verbatim -- real yq has no notion of
+        // "recognized" vs "unrecognized" tags for `type`/`tag`'s own
+        // purposes (unlike the jq-style value-resolution `resolve_tagged`
+        // still does for `==`/arithmetic).
+        ("custom tag is echoed verbatim", "a: !custom 1\n", "!custom"),
     ] {
         let (output, exit_code) = run_yq_stdin(".a | type", input, &[])?;
         assert_eq!(exit_code, 0, "{name}: expected clean success");
@@ -6202,21 +6214,19 @@ fn test_yaml_explicit_tag_eq_and_arithmetic_resolve_747() -> Result<()> {
 /// same `eval_single` recursion as the tests above, so a tagged condition
 /// resolves correctly, and (since select is a passthrough) the untouched
 /// original value keeps its own tag on output.
+///
+/// #2516 updated the condition spelling: `type` answers the YAML tag in yq
+/// mode now, not jq's type name, so the condition compares against
+/// `"!!str"`/`"!!int"` rather than `"string"`/`"number"`.
 #[test]
 fn test_yaml_explicit_tag_select_condition_resolves_747() -> Result<()> {
-    let (output, exit_code) = run_yq_stdin(
-        r#"select(.a | type == "string")"#,
-        "a: !!str 1\nb: 2\n",
-        &[],
-    )?;
+    let (output, exit_code) =
+        run_yq_stdin(r#"select(.a | type == "!!str")"#, "a: !!str 1\nb: 2\n", &[])?;
     assert_eq!(exit_code, 0);
     assert_eq!(output.trim(), "a: !!str 1\nb: 2");
 
-    let (empty, exit_code) = run_yq_stdin(
-        r#"select(.a | type == "number")"#,
-        "a: !!str 1\nb: 2\n",
-        &[],
-    )?;
+    let (empty, exit_code) =
+        run_yq_stdin(r#"select(.a | type == "!!int")"#, "a: !!str 1\nb: 2\n", &[])?;
     assert_eq!(exit_code, 0);
     assert_eq!(empty.trim(), "");
 
@@ -6229,17 +6239,20 @@ fn test_yaml_explicit_tag_select_condition_resolves_747() -> Result<()> {
 /// cursor-threading pattern) rather than plain `to_owned`'s cursor-less
 /// `field.value`/`elems.uncons`, or only the top-level node's tag would ever
 /// be seen.
+///
+/// #2516 updated the expected values: `type` answers the YAML tag in yq
+/// mode now, so a nested tagged element's `type` is its own tag string.
 #[test]
 fn test_yaml_explicit_tag_resolves_when_nested_747() -> Result<()> {
     let input = "a:\n  - !!str 1\n  - !!int \"2\"\nb:\n  c: !!str 3\n";
 
     let (seq_types, code) = run_yq_stdin("[.a[] | type]", input, &["-o=json", "-I=0"])?;
     assert_eq!(code, 0);
-    assert_eq!(seq_types.trim(), r#"["string","number"]"#);
+    assert_eq!(seq_types.trim(), r#"["!!str","!!int"]"#);
 
     let (obj_type, code) = run_yq_stdin(".b.c | type", input, &[])?;
     assert_eq!(code, 0);
-    assert_eq!(obj_type.trim(), "string");
+    assert_eq!(obj_type.trim(), "!!str");
 
     Ok(())
 }
@@ -6249,17 +6262,33 @@ fn test_yaml_explicit_tag_resolves_when_nested_747() -> Result<()> {
 /// so `YamlCursor::explicit_tag()` must dereference through
 /// `YamlValue::Alias`'s `target` to the anchor definition's tag, the same
 /// way every other alias-transparent accessor on `YamlValue` already does
-/// (`as_bool`/`as_i64`/`as_f64`/`as_object`/`as_array`/`type_name`).
-/// Without that dereference, `.y`'s tag silently vanished even though the
-/// direct `.x` access (and `-o=json`'s cursor-streaming output) already
-/// resolved it correctly.
+/// (`as_bool`/`as_i64`/`as_f64`/`as_object`/`as_array`/`type_name`). This is
+/// still exactly what `==`/`+` (materializing through `to_owned_cursor`)
+/// need, and still what they get below.
+///
+/// #2516 changed what `type` itself does with that dereferenced tag,
+/// though: real yq's `type`/`tag` do **not** dereference through an alias
+/// at all -- an alias occurrence answers the empty string, confirmed live
+/// (`y: *a` where `a: &a !!str 1` gives `.y | type` => `""`, while `.x |
+/// type` => `"!!str"`). `eval_generic::yq_type_tag` checks
+/// `DocumentCursor::is_alias` ahead of the explicit-tag lookup for exactly
+/// this reason -- a distinct rule from the dereferencing every *value*
+/// accessor still does.
 #[test]
 fn test_yaml_explicit_tag_resolves_through_alias_903() -> Result<()> {
     let input = "x: &a !!str 1\ny: *a\n";
 
-    let (types, code) = run_yq_stdin("[.x, .y] | map(type)", input, &["-o=json", "-I=0"])?;
+    // `(.x, .y)`, not `[.x, .y] | map(...)`: array *construction* resets
+    // cursor/position context for its own elements (the same reset
+    // `key`/`path` get inside `{...}`/`[...]`, #2471's own precedent) --
+    // real yq's own `[.x, .y] | map(type)` is `["!!str",""]` too (matching
+    // succinctly once constructed), but that shape can't distinguish "yq
+    // has no alias concept there" from "succinctly's construction reset it"
+    // the way a direct comma-fanned read can. Not chased further here; see
+    // `docs/compliance/yq/limitations.md`'s own entry for the residual.
+    let (types, code) = run_yq_stdin("[(.x, .y) | type]", input, &["-o=json", "-I=0"])?;
     assert_eq!(code, 0);
-    assert_eq!(types.trim(), r#"["string","string"]"#);
+    assert_eq!(types.trim(), r#"["!!str",""]"#);
 
     let (eq, code) = run_yq_stdin(r#".y == "1""#, input, &[])?;
     assert_eq!(code, 0);
@@ -6353,7 +6382,7 @@ fn test_yaml_explicit_tag_resolves_in_to_entries_reverse_pivot_shuffle_903() -> 
         &["-o=json", "-I=0"],
     )?;
     assert_eq!(code, 0);
-    assert_eq!(shuffled_types.trim(), r#"["string","string"]"#);
+    assert_eq!(shuffled_types.trim(), r#"["!!str","!!str"]"#);
 
     Ok(())
 }
@@ -36684,6 +36713,72 @@ fn test_yq_scalar_string_concat_matrix_2507() -> Result<()> {
         assert_eq!(code, 0, "`{filter}`: {output:?}");
         assert_eq!(output.trim(), expected, "`{filter}`");
     }
+
+    Ok(())
+}
+
+/// #2516: `type` is a plain alias of `tag` in real yq -- it answers the
+/// YAML tag (`!!str`, `!!int`, `!!map`, ...), not jq's type name, where
+/// succinctly reproduced jq's naming in yq mode too before this fix.
+/// Captured live from yq v4.53.3 (`-o=json -I0`) on `a: 1`:
+///
+/// ```text
+/// $ yq 'type'                 !!map     $ succinctly yq 'type'        object  (was)
+/// $ yq '.a | type'            !!int     $ succinctly yq '.a | type'   number  (was)
+/// $ yq 'tag'                  !!map
+/// $ yq 'kind'                 map       (unaffected -- a different builtin)
+/// ```
+///
+/// And per-tag, on `!!str 1`/`!!int "5"`/`!!float 3`/`!!bool "yes"`/
+/// `!!null "~"`/a custom `!mytag hello`/a quoted `"1"`/`[1,2]` (each its own
+/// document, `--jq-extensions` on or off makes no difference to any row --
+/// `type` is a core builtin in both modes, not gated jq-only surface):
+/// `!!str`, `!!int`, `!!float`, `!!bool`, `!!null`, `!mytag`, `!!str`,
+/// `!!seq` respectively.
+///
+/// jq 1.7.1 has no tag concept at all (JSON input has no tags), so jq mode
+/// is untouched. Fixed as `eval_generic::yq_type_tag`/`eval::yaml_type_tag`/
+/// `eval::owned_yaml_type_tag`, consulted by `Builtin::Type`'s yq-mode arm
+/// in both evaluators (`Builtin::Tag` also gained a native cursor-aware arm
+/// in `eval_generic.rs`, so the two stay consistent with each other).
+#[test]
+fn test_yq_type_answers_the_yaml_tag_2516() -> Result<()> {
+    let args = &["-o", "json", "-I0"];
+
+    for (filter, expected) in [
+        ("type", r#""!!map""#),
+        (".a | type", r#""!!int""#),
+        ("tag", r#""!!map""#),
+        ("kind", r#""map""#),
+    ] {
+        let (output, code) = run_yq_stdin(filter, "a: 1\n", args)?;
+        assert_eq!(code, 0, "`{filter}`: {output:?}");
+        assert_eq!(output.trim(), expected, "`{filter}`");
+    }
+
+    for (doc, expected) in [
+        ("a: !!str 1\n", r#""!!str""#),
+        ("a: !!int \"5\"\n", r#""!!int""#),
+        ("a: !!float 3\n", r#""!!float""#),
+        ("a: !!bool \"yes\"\n", r#""!!bool""#),
+        ("a: !!null \"~\"\n", r#""!!null""#),
+        ("a: !mytag hello\n", r#""!mytag""#),
+        ("a: \"1\"\n", r#""!!str""#),
+        ("a: [1, 2]\n", r#""!!seq""#),
+    ] {
+        for extra in [[].as_slice(), ["--jq-extensions"].as_slice()] {
+            let mut full_args = args.to_vec();
+            full_args.extend_from_slice(extra);
+            let (output, code) = run_yq_stdin(".a | type", doc, &full_args)?;
+            assert_eq!(code, 0, "`{doc}` ({extra:?}): {output:?}");
+            assert_eq!(output.trim(), expected, "`{doc}` ({extra:?})");
+        }
+    }
+
+    // jq mode is untouched.
+    let (output, code) = run_jq_stdin(".a | type", r#"{"a":1}"#, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#""number""#);
 
     Ok(())
 }
