@@ -39839,3 +39839,261 @@ fn test_yq_map_scalar_passthrough_feeds_one_item_arms_2103() -> Result<()> {
 
     Ok(())
 }
+
+// =============================================================================
+// #2091: anchor/alias/comment preservation and #711's alias value sync were
+// invisible to any write wrapped in a binder or a user definition.
+// `contains_assign`/`is_shape_preserving` matched a small fixed set of AST
+// shapes, so `99 as $v | .a = $v` -- real yq syntax -- silently lost the
+// anchor, the comment *and* the alias's value.
+//
+// Own module rather than bare file end: the identical-trailing-`Ok(())`
+// merge hazard that actually bit #870 on rebase.
+//
+// Every `as` expectation is pinned real `yq` v4.53.3 output. `def` is not
+// yq syntax at all (its lexer rejects it), so those are pinned against the
+// bare equivalent the def wraps -- the invariant that actually matters.
+// =============================================================================
+mod issue_2091_def_and_binder_wrapped_writes {
+    use super::*;
+
+    /// `a: &x 1 # c` / `b: *x` — an anchor, a comment, and an alias whose
+    /// value must track the anchor's.
+    const DOC: &str = "a: &x 1 # c\nb: *x\n";
+
+    /// Real yq syntax, and the case that makes this a data bug rather than a
+    /// presentation one: before the fix `b` printed `1`, the stale pre-write
+    /// value, instead of tracking the anchor.
+    ///
+    /// $ yq '99 as $v | .a = $v'  =>  a: &x 99 # c / b: *x
+    #[test]
+    fn test_yaml_as_binding_assign_syncs_alias_2091() -> Result<()> {
+        for filter in ["99 as $v | .a = $v", ".a as $v | .a = 99"] {
+            let (output, code) = run_yq_stdin(filter, DOC, &[])?;
+            assert_eq!(code, 0, "{filter}");
+            assert_eq!(output, "a: &x 99 # c\nb: *x\n", "{filter}");
+        }
+        Ok(())
+    }
+
+    /// The same through a `def`. Not yq syntax, so the reference is the bare
+    /// write it wraps: wrapping must change nothing.
+    #[test]
+    fn test_yaml_def_wrapped_assign_syncs_alias_2091() -> Result<()> {
+        for (wrapped, bare) in [
+            ("def f: .a = 99; f", ".a = 99"),
+            ("def f: .b = 5; f", ".b = 5"),
+            ("def f: del(.b); f", "del(.b)"),
+        ] {
+            let (wrapped_out, wrapped_code) = run_yq_stdin(wrapped, DOC, &[])?;
+            let (bare_out, bare_code) = run_yq_stdin(bare, DOC, &[])?;
+            assert_eq!(wrapped_code, 0, "{wrapped}");
+            assert_eq!(bare_code, 0, "{bare}");
+            assert_eq!(wrapped_out, bare_out, "`{wrapped}` must equal `{bare}`");
+        }
+        // Concretely, for the first pair: anchor, comment and alias all kept.
+        let (output, _) = run_yq_stdin("def f: .a = 99; f", DOC, &[])?;
+        assert_eq!(output, "a: &x 99 # c\nb: *x\n");
+        Ok(())
+    }
+
+    /// A definition calling another definition resolves through both.
+    #[test]
+    fn test_yaml_def_calling_def_2091() -> Result<()> {
+        let (output, code) = run_yq_stdin("def g: .a = 99; def f: g; f", DOC, &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(output, "a: &x 99 # c\nb: *x\n");
+        Ok(())
+    }
+
+    /// The innermost definition of a shadowed name wins, so the walk must
+    /// resolve to `.b = 5`, not to the outer `.a = 99`.
+    #[test]
+    fn test_yaml_shadowed_def_resolves_innermost_2091() -> Result<()> {
+        let (shadowed, code) = run_yq_stdin("def f: .a = 99; def f: .b = 5; f", DOC, &[])?;
+        assert_eq!(code, 0);
+        let (bare, _) = run_yq_stdin(".b = 5", DOC, &[])?;
+        assert_eq!(shadowed, bare);
+        Ok(())
+    }
+
+    /// The negative case, and the reason "contains a `FuncDef`" cannot be the
+    /// rule: a def whose body *reshapes* the document must stay excluded.
+    /// `sync_aliased_paths` on a reshaped result diffs the same path across
+    /// two differently-shaped documents and can clobber values -- a false
+    /// positive here is data loss, not a wasted snapshot.
+    #[test]
+    fn test_yaml_def_map_body_is_not_treated_as_assign_2091() -> Result<()> {
+        for (filter, expected) in [
+            ("def f: map(.); f", "- 1\n- 1\n"),
+            ("def f: [.]; f", "- a: 1\n  b: 1\n"),
+        ] {
+            let (output, code) = run_yq_stdin(filter, DOC, &[])?;
+            assert_eq!(code, 0, "{filter}");
+            assert_eq!(output, expected, "{filter}");
+        }
+        Ok(())
+    }
+
+    /// A parameterised definition is excluded deliberately: its body refers
+    /// to parameters this walk does not substitute, so it cannot be judged
+    /// from the body alone. Pinned so the exclusion is a decision, not an
+    /// accident -- `b` staying `1` here is the pre-#2091 behaviour.
+    #[test]
+    fn test_yaml_def_with_params_is_excluded_2091() -> Result<()> {
+        let (output, code) = run_yq_stdin("def f(v): .a = v; f(99)", DOC, &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(output, "a: 99\nb: 1\n");
+        Ok(())
+    }
+
+    /// A self-recursive definition must terminate the *walk*, whatever the
+    /// evaluator then does with it. Without the expanding-set guard the
+    /// predicate would follow `f` into itself forever and hang before
+    /// evaluation ever started.
+    #[test]
+    fn test_yaml_self_recursive_def_gate_terminates_2091() -> Result<()> {
+        let (_output, _stderr, code) = run_yq_stdin_with_stderr("def f: f; f", DOC, &[])?;
+        // The evaluator's own recursion limit reports the error; the point is
+        // that we get here at all rather than hanging in the gate.
+        assert_eq!(code, 1);
+        Ok(())
+    }
+
+    /// `--jq-extensions` does not change any of this. The flag decides parse
+    /// acceptance; these predicates run after parsing, so a gated `def`
+    /// reaches them either way (#1887's triage flags `def` for gating).
+    #[test]
+    fn test_yaml_def_gate_is_independent_of_jq_extensions_2091() -> Result<()> {
+        for filter in [
+            "def f: .a = 99; f",
+            "99 as $v | .a = $v",
+            "def f: map(.); f",
+        ] {
+            let (plain, plain_code) = run_yq_stdin(filter, DOC, &[])?;
+            let (gated, gated_code) = run_yq_stdin(filter, DOC, &["--jq-extensions"])?;
+            assert_eq!(plain_code, gated_code, "{filter}");
+            assert_eq!(plain, gated, "{filter}");
+        }
+        Ok(())
+    }
+
+    // -- review round: the three ways widening the gate went wrong ---------
+
+    /// **`collect_write_targets` must follow the same wrappers as the gate.**
+    /// When the gate accepted a wrapped write but that walk did not,
+    /// `write_targets` came back empty and `reconcile_presentation` fell back
+    /// to the positional lockstep -- so #870's `del` remap stopped applying
+    /// and each survivor inherited the *deleted* element's comment. That
+    /// turns "no comments on a wrapped write" into "the wrong comments",
+    /// which `yq -i` then writes to disk.
+    ///
+    /// `1 as $v | del(.arr[0])` is real yq syntax:
+    /// $ yq '1 as $v | del(.arr[0])'  =>  arr:\n  - 2 # two\n  - 3 # three
+    #[test]
+    fn test_yaml_wrapped_del_keeps_870_remap_2091() -> Result<()> {
+        let doc = "arr:\n  - 1 # one\n  - 2 # two\n  - 3 # three\n";
+        let expected = "arr:\n  - 2 # two\n  - 3 # three\n";
+        for filter in [
+            "del(.arr[0])",
+            "def f: del(.arr[0]); f",
+            "1 as $v | del(.arr[0])",
+        ] {
+            let (output, code) = run_yq_stdin(filter, doc, &[])?;
+            assert_eq!(code, 0, "{filter}");
+            assert_eq!(output, expected, "{filter}");
+        }
+        Ok(())
+    }
+
+    /// The same for #870's closed-literal rule: a constructed literal
+    /// inherits nothing, wrapper or not.
+    ///
+    /// $ yq '.o = {"a": "1"}'  =>  o:\n  a: "1"     (no comment)
+    #[test]
+    fn test_yaml_wrapped_write_keeps_870_fresh_literal_rule_2091() -> Result<()> {
+        let doc = "o:\n  a: \"1\" # ca\n";
+        for filter in [".o = {\"a\": \"1\"}", "def f: .o = {\"a\": \"1\"}; f"] {
+            let (output, code) = run_yq_stdin(filter, doc, &[])?;
+            assert_eq!(code, 0, "{filter}");
+            assert_eq!(output, "o:\n  a: \"1\"\n", "{filter}");
+        }
+        Ok(())
+    }
+
+    /// **A name in a definition's body binds at the definition site**, not at
+    /// the call site. Resolving at the call site let `f` inside `g` bind to a
+    /// *later* `def f`, so a reshaping filter was classified as a
+    /// shape-preserving write and `sync_aliased_paths` clobbered a value:
+    /// `b` came out 2 where the filter computes 1.
+    ///
+    /// Not a scoping nicety -- a wrong *value* in the output.
+    #[test]
+    fn test_yaml_def_body_binds_at_definition_site_2091() -> Result<()> {
+        let doc = "a: &x 1\nb: *x\nc: 2\n";
+        let (wrapped, code) = run_yq_stdin(
+            "def f: {a: .c, b: .a, c: .b}; def g: f; def f: .a = 99; g",
+            doc,
+            &[],
+        )?;
+        assert_eq!(code, 0);
+        // `g` calls the `f` visible where `g` was written -- the reshaping
+        // one -- so the result is that filter's own output, unsynced.
+        let (direct, _) = run_yq_stdin("{a: .c, b: .a, c: .b}", doc, &[])?;
+        assert_eq!(wrapped, direct);
+        assert_eq!(wrapped, "a: 2\nb: 1\nc: 1\n");
+        Ok(())
+    }
+
+    /// Definition-site scoping must not break ordinary shadowing: a call
+    /// still resolves to the innermost definition visible *at the call*.
+    #[test]
+    fn test_yaml_shadowing_still_resolves_innermost_at_the_call_2091() -> Result<()> {
+        for (wrapped, bare) in [
+            ("def f: .a = 99; def f: .b = 5; f", ".b = 5"),
+            ("def g: .a = 99; def f: g; f", ".a = 99"),
+        ] {
+            let (w, wc) = run_yq_stdin(wrapped, DOC, &[])?;
+            let (b, bc) = run_yq_stdin(bare, DOC, &[])?;
+            assert_eq!(wc, 0, "{wrapped}");
+            assert_eq!(bc, 0, "{bare}");
+            assert_eq!(w, b, "`{wrapped}` must equal `{bare}`");
+        }
+        Ok(())
+    }
+
+    /// **The walk must not be exponential.** `def f1: f0|f0; def f2: f1|f1;
+    /// …` doubles the number of expansions per level; without memoizing a
+    /// body's answer, 24 levels of it in a 421-byte filter spent 5.1s on a
+    /// two-line document, and each further level doubled that.
+    ///
+    /// Memoizing is sound only *because* a body's scope is now fixed at its
+    /// definition site, which makes the answer a function of the body alone.
+    ///
+    /// The bound here is deliberately loose -- it is guarding against
+    /// exponential blowup, not measuring the machine. Pre-fix this filter
+    /// took over 5s; the evaluator's own (pre-existing, semantic) cost for it
+    /// is well under a second.
+    #[test]
+    fn test_yaml_def_gate_is_not_exponential_2091() -> Result<()> {
+        let mut filter = String::from("def f0: empty;");
+        let mut prev = String::from("f0");
+        for i in 1..=24 {
+            filter.push_str(&format!(" def f{i}: {prev}|{prev};"));
+            prev = format!("f{i}");
+        }
+        filter.push(' ');
+        filter.push_str(&prev);
+
+        let start = std::time::Instant::now();
+        let (_output, code) = run_yq_stdin(&filter, DOC, &[])?;
+        let elapsed = start.elapsed();
+        assert_eq!(code, 0);
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "24 nested doubling defs took {elapsed:?}; the gate is expanding \
+             each body more than once"
+        );
+        Ok(())
+    }
+}
