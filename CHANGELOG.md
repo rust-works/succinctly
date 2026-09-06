@@ -56,6 +56,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`eval_generic::push_generic_truthiness_cursor_error`'s object/array arms now call
+  `container_tail_gap_ok` instead of hand-inlining the `None`/`Some(last)`
+  container-vs-trailing-gap dispatch** (#2409). No behavior change: this was the last
+  hold-out of a dispatch shape that `to_owned_cursor_at_depth` (`eval_generic.rs`) and
+  `cursor_to_owned_at_depth` (`lazy.rs`) had already consolidated onto the same helper.
+  Also settles a minor, previously-inert inconsistency the two hand-inlined copies had —
+  both built their error from the container cursor even on the trailing-comma branch,
+  where `container_tail_gap_ok` (via `child_tail_gap_ok`) builds it from the last child
+  instead; byte-identical today (`JsonCursor`'s `malformed_delimiter_error()` override
+  reads the same whole-document `self.text` regardless of which node's cursor calls it,
+  and YAML never reaches either raise at all), but no longer a live divergence risk if a
+  future cursor type ever makes it position-sensitive.
+
 - **`succinctly yq`'s `type` now answers the YAML tag (`!!str`, `!!int`,
   `!!map`, ...), matching real yq's own `type`/`tag` alias, instead of jq's
   type name (`"string"`, `"number"`, `"object"`, ...)** (#2516). Confirmed
