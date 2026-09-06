@@ -434,13 +434,24 @@ impl<'a> Parser<'a> {
     /// before consuming the keyword, so a rejected keyword's position is
     /// still where the caller expects.
     fn reject_unless_jq_extensions(&self, name: &str) -> Result<(), ParseError> {
+        self.reject_unless_jq_extensions_at(name, self.pos)
+    }
+
+    /// Same as [`reject_unless_jq_extensions`], but reports the rejection at
+    /// an explicit position instead of the parser's current one. For a
+    /// keyword whose gated/ungated form can only be told apart by looking
+    /// past it (`path` vs. `path(f)`, #2430), the keyword must already be
+    /// consumed before that lookahead runs -- this lets the error still
+    /// point at the keyword's own start, matching every other gated name's
+    /// convention, instead of wherever the lookahead left `self.pos`.
+    fn reject_unless_jq_extensions_at(&self, name: &str, pos: usize) -> Result<(), ParseError> {
         if self.mode == ParserMode::Yq && !self.jq_extensions {
             return Err(ParseError::new(
                 format!(
                     "\"{name}\" is not part of yq's syntax; pass --jq-extensions to enable \
                      succinctly's jq-compatible builtin surface"
                 ),
-                self.pos,
+                pos,
             ));
         }
         Ok(())
@@ -3917,12 +3928,15 @@ impl<'a> Parser<'a> {
         // path(expr) - return the path to values selected by expr
         // path (no-arg, yq) - return the current traversal path
         if self.matches_keyword("path") {
+            let keyword_start = self.pos;
             self.consume_keyword("path");
             self.skip_ws();
             if self.peek() == Some('(') {
                 // path(expr) - jq style; real yq's `path` is nullary, so this
-                // form is jq-only surface in yq mode (#2430).
-                self.reject_unless_jq_extensions("path(f)")?;
+                // form is jq-only surface in yq mode (#2430). The gate/no-gate
+                // split can only be told apart by looking past the keyword,
+                // so report it at the keyword's own start rather than here.
+                self.reject_unless_jq_extensions_at("path(f)", keyword_start)?;
                 self.next();
                 self.skip_ws();
                 let expr = self.parse_expr()?;

@@ -949,8 +949,8 @@ same shared `path_step_generic`, but pass it different duplicate-key collapse fl
 call sites sit ~500 lines apart and the mismatch reads as an oversight without this:
 
 ```bash
-$ printf '{"a":1,"a":2}' | succinctly yq -o=json -I=0 '[path(.[])]'   # [["a"],["a"]]
-$ printf '{"a":1,"a":2}' | succinctly yq -o=json -I=0 '[.[] | key]'   # ["a"]
+$ printf '{"a":1,"a":2}' | succinctly yq --jq-extensions -o=json -I=0 '[path(.[])]'   # [["a"],["a"]]
+$ printf '{"a":1,"a":2}' | succinctly yq -o=json -I=0 '[.[] | key]'                   # ["a"]
 ```
 
 `key`/`path`/`parent` pass `true` unconditionally because they replace a bridge that used to
@@ -958,7 +958,8 @@ materialize into an `IndexMap` (which collapses structurally in both modes) — 
 (`["a"]` in v4.53.3). `path(f)` passes `S::COLLAPSE_DUPLICATE_KEYS` (the mode's own rule)
 instead, because it isn't replacing a materialization and has **no yq oracle at all**: real
 yq's `path` is the no-argument form only, so `path(f)` is a jq builtin succinctly exposes as
-an extension in yq mode, exempt from ADR-0018's divergence rule. In jq mode both walks agree
+an extension in yq mode (gated behind `--jq-extensions`, #2430), exempt from ADR-0018's
+divergence rule. In jq mode both walks agree
 with real jq 1.7.1 (`[["a"]]`). So the two flags are a recorded choice, not a bug — this
 entry (plus the cross-referencing doc comments on both functions) is what keeps a future
 reader from "fixing" the mismatch into a real divergence.
