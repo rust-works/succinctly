@@ -38872,3 +38872,68 @@ fn test_owned_identity_pipe_carries_control_and_prefix_2495() -> Result<()> {
 
     Ok(())
 }
+
+/// jq mode's half of #2522: everything real jq defines is untouched, and the
+/// succinctly-only reads answer the target's position there too.
+///
+/// jq 1.7.1 has no `key`, no bare `path` and no `parent` -- all three are
+/// succinctly extensions, and it rejects them outright:
+///
+/// ```console
+/// $ jq '.a | .b |= key'      jq: error: key/0 is not defined at <top-level>, line 1:
+/// $ jq '.a | .b |= path'     jq: error: path/0 is not defined at <top-level>, line 1:
+/// $ jq '.a | .b |= parent'   jq: error: parent/0 is not defined at <top-level>, line 1:
+/// ```
+///
+/// So there is no oracle to match for those, and ADR-0018's rule 5 leaves the
+/// answer to internal consistency: one definition of "the position an update
+/// filter stands at", shared by both modes.
+///
+/// What jq *does* define is pinned unchanged, captured from jq 1.7.1 on
+/// `{"a":{"b":1,"e":2}}`:
+///
+/// ```console
+/// $ jq -c '.a | .b |= path(.)'   {"b":[],"e":2}
+/// $ jq -c '.a | .b |= [paths]'   {"b":[],"e":2}
+/// $ jq -c '.a | .b |= .'         {"b":1,"e":2}
+/// $ jq -c '.a | .b += 1'         {"b":2,"e":2}
+/// ```
+///
+/// `path(.)` being `[]` is the point of the control: jq's `_modify` binds the
+/// filter's `.` to the target as a *fresh root*, so its own path tracking
+/// restarts there. That is a different builtin from the bare `path` this
+/// change positions (`Builtin::Path` with an argument, not
+/// `Builtin::PathNoArg`), and it must stay `[]`.
+#[test]
+fn test_jq_update_filter_position_is_a_succinctly_extension_2522() -> Result<()> {
+    let doc = r#"{"a":{"b":1,"e":2}}"#;
+
+    // Real jq's own shapes: unchanged by #2522.
+    for (filter, expected) in [
+        (".a | .b |= path(.)", r#"{"b":[],"e":2}"#),
+        (".a | .b |= [paths]", r#"{"b":[],"e":2}"#),
+        (".a | .b |= .", r#"{"b":1,"e":2}"#),
+        (".a | .b += 1", r#"{"b":2,"e":2}"#),
+    ] {
+        let (output, code) = run_jq_stdin(filter, doc, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}`: {output:?}");
+        assert_eq!(output.trim(), expected, "`{filter}`");
+    }
+
+    // The extensions, answered at the target's position like yq mode.
+    for (filter, expected) in [
+        (".a | .b |= key", r#"{"b":"b","e":2}"#),
+        (".a | .b |= path", r#"{"b":["a","b"],"e":2}"#),
+        (".a | .b |= (path|length)", r#"{"b":2,"e":2}"#),
+    ] {
+        let (output, code) = run_jq_stdin(filter, doc, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}`: {output:?}");
+        assert_eq!(output.trim(), expected, "`{filter}`");
+    }
+
+    let (output, code) = run_jq_stdin(".n[] |= key", r#"{"n":[1,2]}"#, &["-c"])?;
+    assert_eq!(code, 0, "{output:?}");
+    assert_eq!(output.trim(), r#"{"n":[0,1]}"#);
+
+    Ok(())
+}

@@ -4189,6 +4189,133 @@ pub(crate) fn with_file_origin<R>(table: &[usize], f: impl FnOnce() -> R) -> R {
     file_origin::with(table, f)
 }
 
+/// The absolute path of the value an assignment is being evaluated over
+/// (#2522), for the current thread.
+///
+/// `|=` and the compound assignments evaluate their right-hand side at the
+/// *target's* position, not at the assignment's input (yq v4.53.3: `.a | .b
+/// |= key` is `{"b":"b","e":2}`, where `.a | .b = key` is
+/// `{"b":"a","e":2}`). `eval::update_path` knows the components it walked to
+/// reach the target, but not where the value it was handed sits in the
+/// document -- an assignment reached mid-pipe (`.a | .b |= path`) has to
+/// answer `["a","b"]`, not `["b"]`.
+///
+/// That prefix is ambient for the same reason [`path_context_route`] and
+/// [`file_origin`] are: the assignment evaluators are several recursion
+/// levels below every entry point, reached through `eval_expr`'s ordinary
+/// dispatch from routes that do not share a single environment parameter.
+/// It composes, rather than overwriting: a bridge into the eager
+/// path-context evaluator restarts `current_path` at `[]` relative to the
+/// value it was handed, so `eval::eval_stage_with_path_context` installs
+/// *this* prefix followed by its own `current_path`, and `update_path`
+/// installs the target's own absolute path around the filter so a nested
+/// `|=` inside one continues from there.
+///
+/// `#[cfg(feature = "std")]` only, same rationale as its two siblings: a
+/// `no_std` embedding has no `thread_local!`, and there the prefix is always
+/// empty -- which is exactly the pre-#2522 answer, so the degradation is the
+/// old behaviour for a mid-pipe assignment rather than a wrong one.
+#[cfg(feature = "std")]
+mod path_base {
+    use super::OwnedValue;
+    use alloc::rc::Rc;
+    use alloc::vec::Vec;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static CURRENT: RefCell<Option<Rc<Vec<OwnedValue>>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn current() -> Option<Rc<Vec<OwnedValue>>> {
+        CURRENT.with(|c| c.borrow().clone())
+    }
+
+    /// Installs `base` for `f`'s dynamic extent, restoring the previous
+    /// value on the way out -- including when `f` escapes with a control.
+    pub(crate) fn with<R>(base: Rc<Vec<OwnedValue>>, f: impl FnOnce() -> R) -> R {
+        struct Restore(Option<Rc<Vec<OwnedValue>>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                CURRENT.with(|c| *c.borrow_mut() = self.0.take());
+            }
+        }
+        let _restore = Restore(CURRENT.with(|c| c.borrow_mut().replace(base)));
+        f()
+    }
+}
+
+#[cfg(not(feature = "std"))]
+mod path_base {
+    use super::OwnedValue;
+    use alloc::rc::Rc;
+    use alloc::vec::Vec;
+
+    pub(crate) fn current() -> Option<Rc<Vec<OwnedValue>>> {
+        None
+    }
+
+    pub(crate) fn with<R>(_base: Rc<Vec<OwnedValue>>, f: impl FnOnce() -> R) -> R {
+        f()
+    }
+}
+
+/// The ambient assignment position prefix, or `[]` where none is installed
+/// (every top-level evaluation, and every `no_std` build). See [`path_base`].
+pub(crate) fn current_path_base() -> Vec<OwnedValue> {
+    path_base::current().map_or_else(Vec::new, |base| (*base).clone())
+}
+
+/// Install `base` as the ambient assignment position prefix for `f` (#2522).
+///
+/// `prefix ++ base`, not `base`: see [`path_base`] for why the two compose.
+pub(crate) fn with_path_base<R>(base: &[OwnedValue], f: impl FnOnce() -> R) -> R {
+    let mut full = current_path_base();
+    full.extend_from_slice(base);
+    path_base::with(Rc::new(full), f)
+}
+
+/// Install `base` as the ambient assignment position prefix for `f`, without
+/// composing it with whatever prefix is already installed (#2522).
+///
+/// `eval::update_path` uses this for the filter's own evaluation: the path it
+/// installs is already absolute, having been built from the prefix it read.
+pub(crate) fn with_absolute_path_base<R>(base: Vec<OwnedValue>, f: impl FnOnce() -> R) -> R {
+    path_base::with(Rc::new(base), f)
+}
+
+/// Whether every path-context read in `expr` can be rewritten to the constant
+/// the position `expr` stands at answers, `parent`/`parent(n)` included
+/// (#2522). The gate `eval::update_path` gets its answer from, so the two
+/// evaluators share one definition of what an assignment filter can be
+/// positioned at.
+pub(crate) fn path_context_at_resolvable(expr: &Expr) -> bool {
+    path_context_resolvable(expr, ResolveAdmits::UPDATE_TARGET)
+}
+
+/// Rewrite every path-context read in `expr` to the constant the position
+/// `(key, path)` answers, with `parent_of` climbing `n` levels for
+/// `parent`/`parent(n)` (#2522).
+///
+/// `eval::update_path`'s entry into [`path_context_resolve_constants`] -- one
+/// definition of the rewrite, so an assignment filter positioned at its
+/// target answers `key`/`path`/`parent` exactly as a stage positioned by the
+/// owned identity pipe does.
+pub(crate) fn resolve_path_context_at<S: EvalSemantics>(
+    expr: &Expr,
+    key: Option<&OwnedValue>,
+    path: &[OwnedValue],
+    parent_of: &dyn Fn(usize) -> Result<Option<OwnedValue>, EvalError>,
+) -> Result<Expr, EvalError> {
+    path_context_resolve_constants::<S>(
+        expr,
+        &PathContextAt {
+            key,
+            path,
+            parent_of: Some(parent_of),
+        },
+    )
+}
+
 /// The ambient `--eval-all` file-origin table, if one is installed --
 /// `eval::eval_pipe_with_path_context`'s bridge into the eager evaluator's
 /// own `file_origin` parameter.
@@ -13158,7 +13285,7 @@ fn try_path_context_cursor_walk<S: EvalSemantics, V: DocumentValue>(
 /// therefore a refusal, not a fallback -- reached only with
 /// `needs_path_context` already true.
 fn path_context_absent_resolvable(expr: &Expr) -> bool {
-    path_context_resolvable(expr, false)
+    path_context_resolvable(expr, ResolveAdmits::CONSTANTS)
 }
 
 /// [`path_context_absent_resolvable`] with `parent`/`parent(n)` admitted
@@ -13167,35 +13294,78 @@ fn path_context_absent_resolvable(expr: &Expr) -> bool {
 /// -- `Expr::TrackedVar`, the one node that spells an arbitrary
 /// `OwnedValue`. See [`path_context_resolve_constants`]'s `Parent` arm.
 fn owned_identity_stage_resolvable(expr: &Expr) -> bool {
-    path_context_resolvable(expr, true)
+    path_context_resolvable(expr, ResolveAdmits::IDENTITY)
+}
+
+/// What [`path_context_resolvable`] admits, per caller.
+///
+/// Every consumer shares one recursion and one rewriter
+/// ([`path_context_resolve_constants`]); these are the two shapes a *caller*
+/// decides for itself, because admitting them changes which route a pipe
+/// takes rather than whether the rewrite is correct.
+#[derive(Clone, Copy)]
+struct ResolveAdmits {
+    /// `parent`/`parent(n)`: a document *node*, which no literal spells.
+    /// Only a caller carrying the ancestors can answer it.
+    parent: bool,
+    /// A read inside an arithmetic operand (`key + 10`). The rewriter has
+    /// handled this since #2471, but the absent and owned-identity gates
+    /// keep refusing it: `owned_identity_pipe_supported` has its own
+    /// `Expr::Arithmetic` arm, and widening the absent gate would move
+    /// pipes off the eager route with nothing to buy.
+    arithmetic: bool,
+}
+
+impl ResolveAdmits {
+    /// The absent route: constants only.
+    const CONSTANTS: Self = Self {
+        parent: false,
+        arithmetic: false,
+    };
+    /// The owned identity pipe, which carries the ancestors `parent` needs.
+    const IDENTITY: Self = Self {
+        parent: true,
+        arithmetic: false,
+    };
+    /// `eval::update_path`'s filter (#2522): the position is a named point in
+    /// a value the caller holds, so `parent` is answerable, and the filter is
+    /// rewritten in place rather than routed anywhere -- there is no route
+    /// for an arithmetic operand to be moved off.
+    const UPDATE_TARGET: Self = Self {
+        parent: true,
+        arithmetic: true,
+    };
 }
 
 /// The shared body of the two predicates above. `with_parent` is the *only*
 /// difference between them, so a construct admitted for one is admitted for
 /// the other and the rewriter's arms cover both call sites.
-fn path_context_resolvable(expr: &Expr, with_parent: bool) -> bool {
+fn path_context_resolvable(expr: &Expr, admits: ResolveAdmits) -> bool {
     if !needs_path_context(expr) {
         // Nothing to resolve. Whatever this is, it evaluates against the
         // `null` an absent position holds and answers exactly as it does on
         // the eager route, which navigated into the same `null`.
         return true;
     }
-    let sub = |e: &Expr| path_context_resolvable(e, with_parent);
+    let sub = |e: &Expr| path_context_resolvable(e, admits);
     match expr {
         Expr::Builtin(Builtin::Key | Builtin::PathNoArg | Builtin::FileIndex) => true,
         // #2472: a node, not a constant -- resolvable only where the caller
         // carries the identity to climb.
-        Expr::Builtin(Builtin::Parent) => with_parent,
+        Expr::Builtin(Builtin::Parent) => admits.parent,
         // `parent(n)` climbs `n` levels, and `n` has to be knowable without
         // evaluating a stream against a position that may not exist: the
         // same literal-only restriction `owned_identity_pipe_supported`
         // already places on a bare `parent(n)` stage.
-        Expr::Builtin(Builtin::ParentN(n)) => with_parent && matches!(**n, Expr::Literal(_)),
+        Expr::Builtin(Builtin::ParentN(n)) => admits.parent && matches!(**n, Expr::Literal(_)),
+        // #2522: `key + 10` inside a `|=` filter, admitted only where the
+        // rewrite happens in place -- see [`ResolveAdmits::arithmetic`].
+        Expr::Arithmetic { left, right, .. } => admits.arithmetic && sub(left) && sub(right),
         Expr::Paren(inner) | Expr::Array(inner) | Expr::Optional(inner) => sub(inner),
         Expr::FirstExpr(inner) | Expr::LastExpr(inner) => sub(inner),
         Expr::Builtin(Builtin::FirstStream(inner) | Builtin::LastStream(inner)) => sub(inner),
         Expr::Comma(exprs) => exprs.iter().all(sub),
-        Expr::Pipe(exprs) => path_context_stages_resolvable(exprs, with_parent),
+        Expr::Pipe(exprs) => path_context_stages_resolvable(exprs, admits),
         Expr::Builtin(Builtin::Select(cond)) => sub(cond),
         Expr::Limit { n, expr } => sub(n) && sub(expr),
         Expr::Try { expr, catch } => sub(expr) && catch.as_deref().map_or(true, sub),
@@ -13236,15 +13406,15 @@ fn path_context_resolvable(expr: &Expr, with_parent: bool) -> bool {
 /// the position only while the position has not moved, because the resolved
 /// constants describe one position and nothing carries a second one.
 fn path_context_absent_stages_resolvable(stages: &[Expr]) -> bool {
-    path_context_stages_resolvable(stages, false)
+    path_context_stages_resolvable(stages, ResolveAdmits::CONSTANTS)
 }
 
-/// [`path_context_absent_stages_resolvable`] with the `with_parent` knob
+/// [`path_context_absent_stages_resolvable`] with the [`ResolveAdmits`] knobs
 /// [`path_context_resolvable`] documents.
-fn path_context_stages_resolvable(stages: &[Expr], with_parent: bool) -> bool {
+fn path_context_stages_resolvable(stages: &[Expr], admits: ResolveAdmits) -> bool {
     let mut moved = false;
     for stage in stages {
-        if needs_path_context(stage) && (moved || !path_context_resolvable(stage, with_parent)) {
+        if needs_path_context(stage) && (moved || !path_context_resolvable(stage, admits)) {
             return false;
         }
         moved = moved || !path_context_absent_keeps_position(stage);
@@ -13455,27 +13625,31 @@ fn path_context_resolve_absent<S: EvalSemantics, V: DocumentValue>(
     // An absent position always has at least one component -- it took a
     // `.a`/`[i]` step to become absent -- so its key is the walk's own
     // `path.last()`.
-    path_context_resolve_constants::<S, V>(
+    path_context_resolve_constants::<S>(
         expr,
         &PathContextAt {
             key: pos.path.last(),
             path: &pos.path,
-            parent_from: None,
+            parent_of: None,
         },
     )
 }
 
 /// The position [`path_context_resolve_constants`] rewrites against.
 ///
-/// `key`/`path` are the constants the position answers. `parent_from` is
-/// the value and identity `parent`/`parent(n)` climb, carried only by the
-/// owned identity pipe -- the constant-only route leaves it `None`, and
-/// [`path_context_absent_resolvable`] refuses `parent` there, so the
+/// `key`/`path` are the constants the position answers. `parent_of` answers
+/// `parent`/`parent(n)`: `n` levels up, or `None` where there is nothing
+/// there. It is a callback rather than the climbing structure itself
+/// because two unrelated structures can answer it -- the owned identity
+/// pipe's [`OwnedIdentity`] (#2472) and `eval::update_path`'s pre-update
+/// snapshot of the value being written (#2522) -- and neither is a shape
+/// the other's route can build. The constant-only route leaves it `None`,
+/// and [`path_context_absent_resolvable`] refuses `parent` there, so the
 /// rewriter's `Parent` arms are unreachable with it unset.
-struct PathContextAt<'a, V: DocumentValue> {
+struct PathContextAt<'a> {
     key: Option<&'a OwnedValue>,
     path: &'a [OwnedValue],
-    parent_from: Option<(&'a OwnedValue, &'a OwnedIdentity<V>)>,
+    parent_of: Option<&'a dyn Fn(usize) -> Result<Option<OwnedValue>, EvalError>>,
 }
 
 /// [`path_context_resolve_absent`]'s worker, over the constants themselves:
@@ -13483,16 +13657,16 @@ struct PathContextAt<'a, V: DocumentValue> {
 /// detached owned root, #2416 step 3), and `path` is the full path. Shared
 /// with the owned identity pipe, whose `key`/`path` inside a `select`/`[..]`
 /// are constants for the same reason.
-fn path_context_resolve_constants<S: EvalSemantics, V: DocumentValue>(
+fn path_context_resolve_constants<S: EvalSemantics>(
     expr: &Expr,
-    at: &PathContextAt<'_, V>,
+    at: &PathContextAt<'_>,
 ) -> Result<Expr, EvalError> {
     if !needs_path_context(expr) {
         return Ok(expr.clone());
     }
     let (key, path) = (at.key, at.path);
     let boxed = |e: &Expr| -> Result<Box<Expr>, EvalError> {
-        Ok(Box::new(path_context_resolve_constants::<S, V>(e, at)?))
+        Ok(Box::new(path_context_resolve_constants::<S>(e, at)?))
     };
     Ok(match expr {
         Expr::Builtin(Builtin::Key) => match key {
@@ -13556,13 +13730,13 @@ fn path_context_resolve_constants<S: EvalSemantics, V: DocumentValue>(
         Expr::Comma(exprs) => Expr::Comma(
             exprs
                 .iter()
-                .map(|e| path_context_resolve_constants::<S, V>(e, at))
+                .map(|e| path_context_resolve_constants::<S>(e, at))
                 .collect::<Result<Vec<_>, _>>()?,
         ),
         Expr::Pipe(exprs) => Expr::Pipe(
             exprs
                 .iter()
-                .map(|e| path_context_resolve_constants::<S, V>(e, at))
+                .map(|e| path_context_resolve_constants::<S>(e, at))
                 .collect::<Result<Vec<_>, _>>()?,
         ),
         Expr::Limit { n, expr } => Expr::Limit {
@@ -13635,21 +13809,17 @@ fn path_context_resolve_constants<S: EvalSemantics, V: DocumentValue>(
 /// root, or a caller with no identity -- a shape
 /// [`path_context_absent_resolvable`] refuses, asserted rather than
 /// silently answered with `null`).
-fn path_context_resolve_parent<V: DocumentValue>(
-    at: &PathContextAt<'_, V>,
-    n: usize,
-) -> Result<Expr, EvalError> {
-    let Some((value, id)) = at.parent_from else {
+fn path_context_resolve_parent(at: &PathContextAt<'_>, n: usize) -> Result<Expr, EvalError> {
+    let Some(parent_of) = at.parent_of else {
         debug_assert!(
             false,
-            "path_context_absent_resolvable refuses parent without an identity"
+            "path_context_absent_resolvable refuses parent without an ancestor source"
         );
         return Ok(Expr::Builtin(Builtin::Empty));
     };
-    Ok(match owned_identity_ancestor(value, id, n) {
-        OwnedAncestor::Owned(v, _) => Expr::TrackedVar(Rc::new(v)),
-        OwnedAncestor::Node(c) => Expr::TrackedVar(Rc::new(to_owned_cursor(&c)?)),
-        OwnedAncestor::None => Expr::Builtin(Builtin::Empty),
+    Ok(match parent_of(n)? {
+        Some(v) => Expr::TrackedVar(Rc::new(v)),
+        None => Expr::Builtin(Builtin::Empty),
     })
 }
 
@@ -15778,7 +15948,7 @@ fn owned_identity_resolve_component<S: EvalSemantics, V: DocumentValue>(
     }
     let key = id.key()?;
     let path = id.path()?;
-    path_context_resolve_constants::<S, V>(
+    path_context_resolve_constants::<S>(
         expr,
         &PathContextAt {
             key: key.as_ref(),
@@ -15786,7 +15956,7 @@ fn owned_identity_resolve_component<S: EvalSemantics, V: DocumentValue>(
             // A computed component keeps the constant-only gate
             // ([`owned_identity_component_supported`]), so no `parent` can
             // appear in one.
-            parent_from: None,
+            parent_of: None,
         },
     )
 }
@@ -16445,7 +16615,7 @@ fn map_family_members(
 ///
 /// `None` means the input is not a container (see [`map_family_members`]) and
 /// the caller should evaluate the stage the ordinary way.
-fn eval_map_family_positioned<S: EvalSemantics, V: DocumentValue>(
+fn eval_map_family_positioned<S: EvalSemantics>(
     family: MapFamily,
     f: &Expr,
     container: &OwnedValue,
@@ -16465,12 +16635,12 @@ fn eval_map_family_positioned<S: EvalSemantics, V: DocumentValue>(
         let mut path = vec_with_capacity(container_path.len() + 1);
         path.extend_from_slice(container_path);
         path.push(component.clone());
-        let resolved = match path_context_resolve_constants::<S, V>(
+        let resolved = match path_context_resolve_constants::<S>(
             f,
             &PathContextAt {
                 key: Some(&component),
                 path: &path,
-                parent_from: None,
+                parent_of: None,
             },
         ) {
             Ok(expr) => expr,
@@ -16535,7 +16705,7 @@ fn eval_map_family_positioned_result<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
 ) -> Option<GenericResult<V>> {
     let mut collected: Vec<OwnedValue> = Vec::new();
-    let flow = eval_map_family_positioned::<S, V>(
+    let flow = eval_map_family_positioned::<S>(
         family,
         f,
         container,
@@ -16656,12 +16826,28 @@ fn eval_owned_identity_pipe<S: EvalSemantics, V: DocumentValue>(
                     (Ok(key), Ok(path)) => (key, path),
                     (Err(e), _) | (_, Err(e)) => return Flow::Escaped(Control::Error(e)),
                 };
-                resolved = match path_context_resolve_constants::<S, V>(
+                let parent_of = |n: usize| -> Result<Option<OwnedValue>, EvalError> {
+                    Ok(match owned_identity_ancestor(&value, &id, n) {
+                        OwnedAncestor::Owned(v, _) => Some(v),
+                        // STYLE-0012: a decode failure while materializing
+                        // the ancestor `parent` answers with raises whatever
+                        // `optional` says, exactly as it did when this same
+                        // call lived in `path_context_resolve_parent` (which
+                        // has no `optional` to consult). The rewrite has to
+                        // produce *some* literal for the `parent` it is
+                        // replacing; suppressing here would leave the read
+                        // unresolved and answer `null`, the silent fallback
+                        // ADR-0021 exists to end.
+                        OwnedAncestor::Node(c) => Some(to_owned_cursor(&c)?),
+                        OwnedAncestor::None => None,
+                    })
+                };
+                resolved = match path_context_resolve_constants::<S>(
                     stage,
                     &PathContextAt {
                         key: key.as_ref(),
                         path: &path,
-                        parent_from: Some((&value, &id)),
+                        parent_of: Some(&parent_of),
                     },
                 ) {
                     Ok(e) => e,
@@ -16715,7 +16901,7 @@ fn eval_owned_identity_pipe<S: EvalSemantics, V: DocumentValue>(
                     Ok(path) => path,
                     Err(e) => return Some(Flow::Escaped(Control::Error(e))),
                 };
-                eval_map_family_positioned::<S, V>(family, f, &value, &path, optional, &mut emit)
+                eval_map_family_positioned::<S>(family, f, &value, &path, optional, &mut emit)
             });
             let upstream = match positioned {
                 Some(flow) => flow,
@@ -25602,6 +25788,36 @@ mod tests {
         // the eager evaluator for `.a.b | .c = key` (arm re-audit, #2471).
         assert!(eager(".a.b | .c = key"));
         assert!(path_context_absent_resolvable(&parse(".c = key").unwrap()));
+        // #2522: `|=` and the compound assignments are *not* in that class.
+        // Their right side stands at the target, which no constant known at
+        // this stage's position describes, so both gates refuse them and the
+        // pipe reaches `eval::eval_stage_with_path_context`'s own assignment
+        // arm -- where the stage's position becomes the prefix `update_path`
+        // extends. Live-verified with the arm instrumented: `.a | .b |= key`
+        // and `.a | .b += key` both fire it.
+        assert!(eager(".a | .b |= key"));
+        assert!(eager(".a | .b += key"));
+        assert!(eager(".c[] | .x //= key"));
+        assert!(!path_context_absent_resolvable(
+            &parse(".c |= key").unwrap()
+        ));
+        assert!(!owned_identity_stage_resolvable(
+            &parse(".c |= key").unwrap()
+        ));
+        assert!(!path_context_absent_resolvable(
+            &parse(".c += key").unwrap()
+        ));
+        // ...but the filter itself resolves at a position `update_path` can
+        // name, which is what `path_context_at_resolvable` answers -- and it
+        // is the one gate that admits a read inside an arithmetic operand,
+        // because the rewrite happens in place with no route to move.
+        assert!(path_context_at_resolvable(&parse("key").unwrap()));
+        assert!(path_context_at_resolvable(&parse("parent | keys").unwrap()));
+        assert!(path_context_at_resolvable(&parse("key + 10").unwrap()));
+        assert!(!path_context_absent_resolvable(&parse("key + 10").unwrap()));
+        assert!(!owned_identity_stage_resolvable(
+            &parse("key + 10").unwrap()
+        ));
         // ...but a body whose reads cannot be resolved at a member position
         // (`parent`, which real yq answers from a container it is halfway
         // through rewriting) stays exactly where it was.
@@ -25898,6 +26114,65 @@ mod tests {
         assert!(!owned_identity_stage_resolvable(
             &parse("parent(1 + 0)").unwrap()
         ));
+    }
+
+    /// The same gate-and-rewriter agreement for `eval::update_path`'s own
+    /// admits set (#2522), which widens the shared gate twice -- `parent`
+    /// (it holds the ancestors) and an arithmetic operand (it rewrites in
+    /// place, with no route the operand could be moved off).
+    ///
+    /// The property is the one CLAUDE.md's "one definition, plus a test that
+    /// the call sites agree" asks for: a shape
+    /// [`path_context_at_resolvable`] admits must come out of
+    /// [`resolve_path_context_at`] with no path context left in it. A shape
+    /// admitted and not rewritten would answer `key` from nowhere, which is
+    /// exactly the pre-#2522 bug.
+    #[test]
+    fn update_target_resolution_clears_path_context_2522() {
+        let key = OwnedValue::String("b".to_string());
+        let path = vec![OwnedValue::String("a".to_string()), key.clone()];
+        let ancestor = OwnedValue::Int(7);
+        let parent_of = |n: usize| -> Result<Option<OwnedValue>, EvalError> {
+            Ok((n <= path.len()).then(|| ancestor.clone()))
+        };
+        for filter in [
+            "key",
+            "path",
+            "parent",
+            "parent(1)",
+            "(path|length)",
+            "[key, path]",
+            "(key, path)",
+            "select(key == \"b\")",
+            "if key == \"b\" then 1 else 2 end",
+            "key + 10",
+            "(key + 1) * 2",
+            "{k: key}",
+            "parent | keys",
+            "try (key) catch \"e\"",
+        ] {
+            let expr = parse(filter).unwrap();
+            assert!(
+                path_context_at_resolvable(&expr),
+                "gate refuses `{filter}`; drop the row or widen the gate"
+            );
+            let resolved =
+                resolve_path_context_at::<JqSemantics>(&expr, Some(&key), &path, &parent_of)
+                    .expect("the update-target rewrite cannot fail here");
+            assert!(
+                !needs_path_context(&resolved),
+                "`{filter}` resolved to `{resolved:?}`, which still needs path context"
+            );
+        }
+        // Still refused: a stage that moves the position before reading it,
+        // and a `parent(n)` whose hop count is not a literal.
+        for filter in [".x | key", "parent(1 + 0)", "map(key)"] {
+            let expr = parse(filter).unwrap();
+            assert!(
+                !path_context_at_resolvable(&expr),
+                "`{filter}` must stay unresolved, and so unpositioned"
+            );
+        }
     }
 
     /// The split's four static conditions, each pinned by a shape that trips

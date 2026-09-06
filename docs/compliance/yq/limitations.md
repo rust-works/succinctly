@@ -2102,6 +2102,65 @@ Two consequences worth naming:
   `x: 1`). Pinned in both shapes in
   `test_yq_assign_rhs_reading_its_own_target_lacks_node_identity_2481`.
 
+### An update filter's evaluation position — resolved (#2522); one `parent` row still diverges
+
+Real yq's `assignUpdateOperator` runs `|=`'s filter through
+`context.SingleChildContext(candidate)`, per matched node with `.` bound to that node — so
+`key`/`path`/`parent` inside the filter are the **target's**, not the assignment's input's.
+(A compound assignment is the other case: it evaluates its right side once, against the
+input, which is the `=` rule #2481 above records.) succinctly had no route that named the
+target's position, so every read in an update filter answered from nowhere: `key` produced
+nothing at all and the target was left untouched, `path` was `[]`.
+[#2522](https://github.com/rust-works/succinctly/issues/2522) closed that, and every row
+below now agrees with yq v4.53.3 (`-o=json -I0`, on `a: {b: 1, e: 2}` unless noted):
+
+| filter                                     | real yq (and now succinctly)         | succinctly before #2522 |
+|--------------------------------------------|--------------------------------------|--------------------------|
+| `.a \| .b \|= key`                           | `{"b":"b","e":2}`                    | `{"b":1,"e":2}`          |
+| `.a \| .b \|= path`                          | `{"b":["a","b"],"e":2}`              | `{"b":[],"e":2}`         |
+| `.a \| .b \|= (path\|join("/"))`              | `{"b":"a/b","e":2}`                  | `{"b":"","e":2}`         |
+| `.a.b \|= (path\|length)`                    | `{"a":{"b":2,"e":2}}`                | `{"a":{"b":0,"e":2}}`    |
+| `.a \| to_entries \| .[0] \| .value \|= path`  | `{"key":"b","value":["a",0,"value"]}` | `{"key":"b","value":[]}` |
+| `.a \| .zzz \|= key`                         | `{"b":1,"e":2,"zzz":"zzz"}`          | `{"b":1,"e":2,"zzz":null}` |
+| `.a \| (.b,.e) \|= key`                      | `{"b":"b","e":"e"}`                  | `{"b":1,"e":2}`          |
+| `.a \| .b \|= (parent\|keys)`                | `{"b":["b","e"],"e":2}`              | `{"b":1,"e":2}`          |
+| `.a \| .zzz \|= (parent\|keys)`              | `{"b":1,"e":2,"zzz":["b","e","zzz"]}` | `{"b":1,"e":2,"zzz":null}` |
+| `.a \| .b += key`                           | `{"b":"1a","e":2}`                   | `{"b":1,"e":2}`          |
+| `.a \| .b -= (key\|length)`                  | `{"b":0,"e":2}`                      | `{"b":1,"e":2}`          |
+| `.n[] \|= key` (on `n: [1, 2]`)             | `{"n":[0,1]}`                        | `{"n":[1,2]}`            |
+| `.n[] \|= path` (on `n: [1, 2]`)            | `{"n":[["n",0],["n",1]]}`            | `{"n":[[],[]]}`          |
+| `.n[] \|= (key + 10)` (on `n: [1, 2]`)      | `{"n":[10,11]}`                      | `{"n":[10,10]}`          |
+
+`.a | .zzz |= (parent|keys)` is the row that shows `parent` climbs a snapshot with the
+whole left side already auto-created: real yq resolves and vivifies its targets before any
+filter runs (#2481 above), so the key the write is about to fill is already in the parent
+the filter is handed.
+
+Implemented as `jq::eval::UpdatePos`, threaded through `update_path`/`update_path_steps` so
+the components the walk takes name the target, plus an ambient prefix
+(`jq::eval_generic::path_base`) for where the assignment's *input* itself sits — a
+mid-pipe `.a | .b |= path` has to answer `["a","b"]`, not `["b"]`. The rewrite is
+`path_context_resolve_constants`, the same one the owned identity pipe applies, so a
+position named here means what a position named anywhere else does.
+
+**The one row still divergent** is a bare `parent` written straight into its own target:
+
+| filter                | real yq                        | succinctly                     |
+|-----------------------|--------------------------------|--------------------------------|
+| `.a \| .b \|= parent`  | `{"b":{"b":{},"e":2},"e":2}`   | `{"b":{"b":1,"e":2},"e":2}`    |
+
+Real yq's `parent` is a *pointer* to the node it is in the middle of mutating, so assigning
+it into that node's own child makes the document self-referential and its printer emits the
+cycle truncated (`{}` at the second level). succinctly has no node identity (the same
+limitation the anchor/alias section above records), so it writes the parent's pre-write
+value. Every `parent` row that *reads* the node rather than embedding it — `parent|keys`,
+`parent|type`, `parent|length` — matches. Pinned in
+`test_yq_update_filter_reads_the_target_position_2522`.
+
+`line`/`column` inside an update filter are **not** covered: they are answered from a
+cursor, not from a path, and no cursor reaches the filter. `.a | .b |= line` is `2` in real
+yq and `0` in succinctly — a separate, pre-existing gap, not one #2522 touches.
+
 ### An `and`/`or` operand's evaluation context -- open (captured under [#2473](https://github.com/rust-works/succinctly/issues/2473))
 
 Real yq v4.53.3 does not evaluate an `and`/`or`'s **right** operand against the node the

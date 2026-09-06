@@ -36782,3 +36782,127 @@ fn test_yq_type_answers_the_yaml_tag_2516() -> Result<()> {
 
     Ok(())
 }
+
+/// `|=` and the compound assignments evaluate their right side at the
+/// *target's* position, not at the assignment's own input (#2522).
+///
+/// `=` reads the input's position (#2471): on `a: {b: 1, e: 2}`,
+/// `.a | .b = key` is `{"b":"a","e":2}` -- `"a"` is where `.a` stands. `|=`
+/// runs its filter with `.` bound to the *target*, and `key`/`path`/`parent`
+/// there are the target's. Succinctly had no route that named that position,
+/// so every read in an update filter answered from nowhere: `key` produced
+/// nothing and the target was left untouched, `path` was `[]`.
+///
+/// A compound assignment is the `=` case, not the `|=` one: it evaluates its
+/// right side once against the assignment's *input* and splices the resulting
+/// value into the `. op v` filter it builds.
+///
+/// Captured from yq v4.53.3 (`-o=json -I0`) on `a: {b: 1, e: 2}`:
+///
+/// ```console
+/// $ yq '.a | .b |= key'                            {"b":"b","e":2}
+/// $ yq '.a | .b |= path'                           {"b":["a","b"],"e":2}
+/// $ yq '.a | .b |= (path|length)'                  {"b":2,"e":2}
+/// $ yq '.a.b |= (path|length)'                     {"a":{"b":2,"e":2}}
+/// $ yq '.a | to_entries | .[0] | .value |= path'   {"key":"b","value":["a",0,"value"]}
+/// $ yq '.a | .b |= (path|join("/"))'               {"b":"a/b","e":2}
+/// $ yq '.a | .zzz |= key'                          {"b":1,"e":2,"zzz":"zzz"}
+/// $ yq '.a | (.b,.e) |= key'                       {"b":"b","e":"e"}
+/// $ yq '.a | .b |= (key,path)'                     {"b":"b","e":2}
+/// $ yq '.a | .b |= select(key == "b")'             {"b":1,"e":2}
+/// $ yq '.a | .b |= select(key == "zz")'            {"b":1,"e":2}
+/// $ yq '.a | .b |= (parent|keys)'                  {"b":["b","e"],"e":2}
+/// $ yq '.a | .b |= (parent|type)'                  {"b":"!!map","e":2}
+/// $ yq '.a | .zzz |= (parent|keys)'                {"b":1,"e":2,"zzz":["b","e","zzz"]}
+/// $ yq '.a | .b += key'                            {"b":"1a","e":2}
+/// $ yq '.a | .b -= (key|length)'                   {"b":0,"e":2}
+/// $ yq '.a | .b *= key'                            {"b":"a","e":2}
+/// $ yq '.a | .b = key'                             {"b":"a","e":2}    (control, #2471)
+/// ```
+///
+/// and on `n: [1, 2]`:
+///
+/// ```console
+/// $ yq '.n[] |= key'          {"n":[0,1]}
+/// $ yq '.n[] |= path'         {"n":[["n",0],["n",1]]}
+/// $ yq '.n[0] |= key'         {"n":[0,2]}
+/// $ yq '.n |= key'            {"n":"n"}
+/// $ yq '.n[] |= (key + 10)'   {"n":[10,11]}
+/// $ yq '.n[] |= (parent|length)'  {"n":[2,2]}
+/// ```
+///
+/// `.a | .zzz |= (parent|keys)` is why `parent` climbs a snapshot with the
+/// assignment's whole left side already auto-created: real yq resolves and
+/// vivifies its targets before any filter runs (#1412/#2481), so the key the
+/// write is about to fill is already in the parent it hands the filter.
+///
+/// `//=` is deliberately absent: it is not real yq syntax at all (v4.53.3
+/// answers `'|' expects 2 args but there is 1` for `.a | .b //= 5`), so its
+/// yq-mode behaviour here is judged by internal consistency with the `|=` it
+/// desugars to, the same way `eval_alternative_assign` already judges it.
+///
+/// The one row that still diverges is `.a | .b |= parent`, recorded in
+/// `docs/compliance/yq/limitations.md`: real yq writes the very node it is
+/// mutating into itself and prints the cycle truncated
+/// (`{"b":{"b":{},"e":2},"e":2}`), where succinctly writes the parent's
+/// pre-write value (`{"b":{"b":1,"e":2},"e":2}`). Every `parent` row that
+/// *reads* the node rather than embedding it (`parent|keys`, `parent|type`,
+/// `parent|length`) matches.
+#[test]
+fn test_yq_update_filter_reads_the_target_position_2522() -> Result<()> {
+    let args = &["-o", "json", "-I0"];
+    let map = "a:\n  b: 1\n  e: 2\n";
+    let seq = "n: [1, 2]\n";
+
+    for (filter, expected) in [
+        (".a | .b |= key", r#"{"b":"b","e":2}"#),
+        (".a | .b |= path", r#"{"b":["a","b"],"e":2}"#),
+        (".a | .b |= (path|length)", r#"{"b":2,"e":2}"#),
+        (".a.b |= (path|length)", r#"{"a":{"b":2,"e":2}}"#),
+        (
+            ".a | to_entries | .[0] | .value |= path",
+            r#"{"key":"b","value":["a",0,"value"]}"#,
+        ),
+        (".a | .b |= (path|join(\"/\"))", r#"{"b":"a/b","e":2}"#),
+        (".a | .zzz |= key", r#"{"b":1,"e":2,"zzz":"zzz"}"#),
+        (".a | (.b,.e) |= key", r#"{"b":"b","e":"e"}"#),
+        (".a | .b |= (key,path)", r#"{"b":"b","e":2}"#),
+        (".a | .b |= select(key == \"b\")", r#"{"b":1,"e":2}"#),
+        (".a | .b |= select(key == \"zz\")", r#"{"b":1,"e":2}"#),
+        (".a | .b |= (parent|keys)", r#"{"b":["b","e"],"e":2}"#),
+        (".a | .b |= (parent|type)", r#"{"b":"!!map","e":2}"#),
+        (
+            ".a | .zzz |= (parent|keys)",
+            r#"{"b":1,"e":2,"zzz":["b","e","zzz"]}"#,
+        ),
+        (".a | .b += key", r#"{"b":"1a","e":2}"#),
+        (".a | .b -= (key|length)", r#"{"b":0,"e":2}"#),
+        (".a | .b *= key", r#"{"b":"a","e":2}"#),
+        // Control: `=`'s right side still reads the *input's* position.
+        (".a | .b = key", r#"{"b":"a","e":2}"#),
+    ] {
+        let (output, code) = run_yq_stdin(filter, map, args)?;
+        assert_eq!(code, 0, "`{filter}`: {output:?}");
+        assert_eq!(output.trim(), expected, "`{filter}`");
+    }
+
+    for (filter, expected) in [
+        (".n[] |= key", r#"{"n":[0,1]}"#),
+        (".n[] |= path", r#"{"n":[["n",0],["n",1]]}"#),
+        (".n[0] |= key", r#"{"n":[0,2]}"#),
+        (".n |= key", r#"{"n":"n"}"#),
+        (".n[] |= (key + 10)", r#"{"n":[10,11]}"#),
+        (".n[] |= (parent|length)", r#"{"n":[2,2]}"#),
+    ] {
+        let (output, code) = run_yq_stdin(filter, seq, args)?;
+        assert_eq!(code, 0, "`{filter}`: {output:?}");
+        assert_eq!(output.trim(), expected, "`{filter}`");
+    }
+
+    // The recorded divergence, pinned so a change to it is deliberate.
+    let (output, code) = run_yq_stdin(".a | .b |= parent", map, args)?;
+    assert_eq!(code, 0, "{output:?}");
+    assert_eq!(output.trim(), r#"{"b":{"b":1,"e":2},"e":2}"#);
+
+    Ok(())
+}
