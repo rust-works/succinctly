@@ -38488,7 +38488,7 @@ fn set_value_at_path(
 /// by the caller from the pre-mutation document. For each group, if the
 /// value at the definition path differs between `pristine` (before the
 /// write) and `result` (after), every alias path is overwritten with a clone
-/// of the new value.
+/// of the new value -- subject to the rule below.
 ///
 /// A group whose definition path no longer resolves in `result` (e.g. the
 /// anchored key was deleted) is left untouched, so its aliases keep their
@@ -38496,12 +38496,41 @@ fn set_value_at_path(
 /// yq. Likewise, a write that lands on an alias path directly rather than
 /// the anchor's own path leaves every other member of the group alone, since
 /// the anchor's own value never changed.
+///
+/// **Rule A -- rebound-slot gate (#2499).** An alias slot is only a
+/// candidate for overwriting while it still holds the value this function
+/// itself last put there (or, before any pass has touched it, the pristine
+/// value the alias originally resolved to). Per alias path, an `expected`
+/// value tracks that: it starts as the value at that path in `pristine`, and
+/// is updated to whatever this function writes there. A slot is only
+/// overwritten while its *current* value in `result` still equals its
+/// `expected` value; a slot that some earlier stage of the same pipe already
+/// rebound, deleted, or moved no longer matches and is left alone (`.b =
+/// null | .a.p = 9` keeps `b: null` rather than clobbering it with the
+/// anchor's new value). A slot whose path no longer resolves in `result` at
+/// all (`get_value_at_path` returns `None`, e.g. `del(.b)` ran first) is
+/// skipped outright -- never autovivified or array-padded by
+/// `set_value_at_path`.
 pub fn sync_aliased_paths(
     result: &mut OwnedValue,
     pristine: &OwnedValue,
     groups: &[(Vec<OwnedValue>, Vec<Vec<OwnedValue>>)],
 ) {
-    for (def_path, alias_paths) in groups {
+    // Per-slot expected value (Rule A), indexed the same way as `groups`:
+    // `expected[i][j]` tracks alias `groups[i].1[j]`. Seeded from `pristine`
+    // since a fresh, never-yet-synced alias slot holds exactly the value it
+    // originally resolved to there.
+    let mut expected: Vec<Vec<Option<OwnedValue>>> = groups
+        .iter()
+        .map(|(_, alias_paths)| {
+            alias_paths
+                .iter()
+                .map(|alias_path| get_value_at_path(pristine, alias_path))
+                .collect()
+        })
+        .collect();
+
+    for (group_idx, (def_path, alias_paths)) in groups.iter().enumerate() {
         let (Some(old), Some(new)) = (
             get_value_at_path(pristine, def_path),
             get_value_at_path(result, def_path),
@@ -38511,9 +38540,25 @@ pub fn sync_aliased_paths(
         if old == new {
             continue;
         }
-        for alias_path in alias_paths {
+        for (alias_idx, alias_path) in alias_paths.iter().enumerate() {
+            // Never autovivify or array-pad a slot that no longer resolves
+            // (e.g. `del(.b)` ran earlier in the pipe).
+            let Some(current) = get_value_at_path(result, alias_path) else {
+                continue;
+            };
+            // Rule A: only overwrite a slot that's still the untouched copy
+            // this function (or the initial pristine snapshot) last left
+            // there.
+            if expected[group_idx][alias_idx].as_ref() != Some(&current) {
+                continue;
+            }
+            if current == new {
+                // Already in sync; nothing to write or re-track.
+                continue;
+            }
             if let Ok(updated) = set_value_at_path(result.clone(), alias_path, new.clone()) {
                 *result = updated;
+                expected[group_idx][alias_idx] = Some(new.clone());
             }
         }
     }
@@ -68040,6 +68085,128 @@ mod tests {
                 Err(r#"Cannot index string with string "b""#),
             ),
         ]);
+    }
+
+    /// #2499: `sync_aliased_paths`'s rebound-slot gate. An alias slot that
+    /// an earlier stage of the same pipe already rebound to a different
+    /// value (`b`) must be left alone by the def-path sync, while a slot
+    /// that's still the untouched copy (`c`) still gets updated. Mirrors
+    /// the live oracle repro (`.b = null | .a.p = 9` on `a: &x {p:1,q:2}`,
+    /// `b: *x`, `c: *x`) at the `OwnedValue` level, one step below the CLI.
+    #[test]
+    fn test_sync_aliased_paths_skips_rebound_slot_2499() {
+        let pristine = OwnedValue::Object(IndexMap::from([
+            (
+                "a".to_string(),
+                OwnedValue::Object(IndexMap::from([
+                    ("p".to_string(), OwnedValue::Int(1)),
+                    ("q".to_string(), OwnedValue::Int(2)),
+                ])),
+            ),
+            (
+                "b".to_string(),
+                OwnedValue::Object(IndexMap::from([
+                    ("p".to_string(), OwnedValue::Int(1)),
+                    ("q".to_string(), OwnedValue::Int(2)),
+                ])),
+            ),
+            (
+                "c".to_string(),
+                OwnedValue::Object(IndexMap::from([
+                    ("p".to_string(), OwnedValue::Int(1)),
+                    ("q".to_string(), OwnedValue::Int(2)),
+                ])),
+            ),
+        ]));
+
+        // Simulate the pipe's own two writes, as if `.b = null | .a.p = 9`
+        // already ran: `b` is rebound to `null`, `a.p` becomes `9`, `c` is
+        // still whatever the pristine copy was.
+        let mut result = pristine.clone();
+        result = set_value_at_path(
+            result,
+            &[OwnedValue::String("b".to_string())],
+            OwnedValue::Null,
+        )
+        .unwrap();
+        result = set_value_at_path(
+            result,
+            &[
+                OwnedValue::String("a".to_string()),
+                OwnedValue::String("p".to_string()),
+            ],
+            OwnedValue::Int(9),
+        )
+        .unwrap();
+
+        let groups = vec![(
+            vec![OwnedValue::String("a".to_string())],
+            vec![
+                vec![OwnedValue::String("b".to_string())],
+                vec![OwnedValue::String("c".to_string())],
+            ],
+        )];
+
+        sync_aliased_paths(&mut result, &pristine, &groups);
+
+        let OwnedValue::Object(entries) = &result else {
+            panic!("expected object");
+        };
+        // `b` was rebound earlier in the pipe -- the sync must leave it null.
+        assert_eq!(entries.get("b"), Some(&OwnedValue::Null));
+        // `c` was never touched -- it still gets synced to the new anchor value.
+        assert_eq!(
+            entries.get("c"),
+            Some(&OwnedValue::Object(IndexMap::from([
+                ("p".to_string(), OwnedValue::Int(9)),
+                ("q".to_string(), OwnedValue::Int(2)),
+            ])))
+        );
+    }
+
+    /// #2499: a slot whose path no longer resolves at all (`del(.b)` ran
+    /// earlier) must be skipped outright, never autovivified or
+    /// array-padded back into existence by the sync.
+    #[test]
+    fn test_sync_aliased_paths_skips_deleted_slot_2499() {
+        let pristine = OwnedValue::Object(IndexMap::from([
+            (
+                "a".to_string(),
+                OwnedValue::Object(IndexMap::from([("p".to_string(), OwnedValue::Int(1))])),
+            ),
+            (
+                "b".to_string(),
+                OwnedValue::Object(IndexMap::from([("p".to_string(), OwnedValue::Int(1))])),
+            ),
+        ]));
+
+        // Simulate `del(.b) | .a.p = 9`.
+        let OwnedValue::Object(mut entries) = pristine.clone() else {
+            unreachable!()
+        };
+        entries.shift_remove("b");
+        let mut result = OwnedValue::Object(entries);
+        result = set_value_at_path(
+            result,
+            &[
+                OwnedValue::String("a".to_string()),
+                OwnedValue::String("p".to_string()),
+            ],
+            OwnedValue::Int(9),
+        )
+        .unwrap();
+
+        let groups = vec![(
+            vec![OwnedValue::String("a".to_string())],
+            vec![vec![OwnedValue::String("b".to_string())]],
+        )];
+
+        sync_aliased_paths(&mut result, &pristine, &groups);
+
+        let OwnedValue::Object(entries) = &result else {
+            panic!("expected object");
+        };
+        assert!(!entries.contains_key("b"), "del(.b) must not be undone");
     }
 
     /// `null` is the one value jq auto-vivifies, and it becomes whichever

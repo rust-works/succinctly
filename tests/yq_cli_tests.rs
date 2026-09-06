@@ -25039,6 +25039,72 @@ fn test_yaml_nested_alias_mark_is_dropped_at_its_own_path_763() -> Result<()> {
     Ok(())
 }
 
+// =============================================================================
+// #2499: `sync_aliased_paths`'s rebound-slot gate -- an alias slot an
+// earlier stage of the same pipe already rebound, deleted, or moved must be
+// left alone by a later def-path sync. See issue 1351's design-plan finding
+// B1. Verified live against Homebrew `yq` v4.53.3.
+// =============================================================================
+
+/// #2499: an alias slot that an earlier stage of the same pipe already
+/// rebound to `null` must be left alone by a later def-path sync -- the
+/// write is not silently discarded. Live oracle: `.b = null | .a.p = 9` on
+/// `a: &x {p: 1, q: 2}\nb: *x\nc: *x\n` gives `a: &x {p: 9, q: 2}\nb:
+/// null\nc: *x\n` (`c`, never rebound, still syncs and keeps its `*x` mark).
+#[test]
+fn test_yaml_sync_skips_rebound_alias_null_2499() -> Result<()> {
+    let input = "a: &x {p: 1, q: 2}\nb: *x\nc: *x\n";
+
+    let (output, exit_code) = run_yq_stdin(".b = null | .a.p = 9", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: &x {p: 9, q: 2}\nb: null\nc: *x\n");
+
+    let (output, exit_code) = run_yq_stdin(".b = null | .a.p = 9", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(
+        output.trim(),
+        r#"{"a":{"p":9,"q":2},"b":null,"c":{"p":9,"q":2}}"#
+    );
+    Ok(())
+}
+
+/// #2499: same rebound-slot gate, this time rebinding to a plain scalar
+/// rather than `null`. Live oracle: `.b = 5 | .a.p = 9` keeps `b: 5`.
+#[test]
+fn test_yaml_sync_skips_rebound_alias_scalar_2499() -> Result<()> {
+    let input = "a: &x {p: 1, q: 2}\nb: *x\nc: *x\n";
+
+    let (output, exit_code) = run_yq_stdin(".b = 5 | .a.p = 9", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: &x {p: 9, q: 2}\nb: 5\nc: *x\n");
+
+    let (output, exit_code) = run_yq_stdin(".b = 5 | .a.p = 9", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(
+        output.trim(),
+        r#"{"a":{"p":9,"q":2},"b":5,"c":{"p":9,"q":2}}"#
+    );
+    Ok(())
+}
+
+/// #2499: a slot whose path no longer resolves at all (`del(.b)` ran
+/// earlier in the pipe) must be skipped outright, never autovivified or
+/// array-padded back into existence by a later def-path sync. Live oracle:
+/// `del(.b) | .a.p = 9` does not recreate `b`.
+#[test]
+fn test_yaml_sync_skips_deleted_alias_2499() -> Result<()> {
+    let input = "a: &x {p: 1, q: 2}\nb: *x\nc: *x\n";
+
+    let (output, exit_code) = run_yq_stdin("del(.b) | .a.p = 9", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: &x {p: 9, q: 2}\nc: *x\n");
+
+    let (output, exit_code) = run_yq_stdin("del(.b) | .a.p = 9", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":{"p":9,"q":2},"c":{"p":9,"q":2}}"#);
+    Ok(())
+}
+
 /// #1201: `reduce`/`foreach`'s binding clause is parsed by the shared
 /// `parse_pattern`, which both `ParserMode`s reach, so full destructuring
 /// patterns land in yq mode too. There is no oracle to match here -- real yq
