@@ -1157,30 +1157,22 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
         let mut key_comment_map = IndexMap::new();
         let mut guard = DisplayKeyGuard::default();
         let mut f = fields;
+        let mut is_first = true;
+        // #2405: retained past the loop so the trailing-gap check below has
+        // something to check from -- mirrors `to_owned_at_depth`'s own
+        // `last_field`.
+        let mut last_field: Option<V::Cursor> = None;
         while let Some((field, rest)) = f.uncons() {
-            // Same key handling as `to_owned_at_depth`, same reasons
-            // (#1247/#1642): preserve a decode-failure key via its raw
-            // source span; still raise on a key the format's grammar never
-            // allowed at all (#1194) -- this arm used to silently drop such
-            // a field instead of raising, the same swallow #1194 names.
-            //
-            // STYLE-0013: `resolve_display_key` directly, not
-            // `DocumentField::checked_key`, because this walk deliberately
-            // omits the delimiter half. Its only *production* caller is
-            // `yq_runner.rs`, where the value is always YAML and every
-            // #1677/#2211/#2243 check is a trait-default no-op (`{a: 1,}`
-            // is valid YAML flow syntax; real yq accepts it). So the
-            // omission is unreachable rather than divergent in shipped
-            // behaviour. It is not *provably* unreachable, though:
-            // `to_owned_with_comments` is `pub` and this file's own
-            // `test_json_to_owned_with_comments_uses_line_comment_raw_default`
-            // drives it with JSON, where those checks would fire. Adopting
-            // `checked_key` here is therefore a behaviour change for a
-            // JSON-typed caller, however desirable -- out of scope for
-            // #1803, which is behaviour-preserving by construction.
-            let Some(key) = resolve_display_key(&field.key, &map, &mut guard)? else {
-                return Err(f.malformed_member_error());
-            };
+            // #2405: same #1247/#1642 key resolution and #1677 key/value
+            // delimiter checks as `to_owned_at_depth`, via the one shared
+            // `DocumentField::checked_key` definition -- this walk used to
+            // omit the delimiter half entirely (see the removed STYLE-0013
+            // marker this replaced), unreachable only because its sole
+            // production caller (`yq_runner.rs`) is YAML-only, where every
+            // check below is a trait-default no-op. `to_owned_with_comments`
+            // is `pub`, so a future JSON-typed caller silently inherited a
+            // walk that accepted `{"a" 1}` -- closing that latent gap.
+            let key = field.checked_key(&f, &map, &mut guard, is_first)?;
             let (v, c) = to_owned_with_comments_at_depth(
                 &field.value,
                 Some(&field.value_cursor),
@@ -1206,11 +1198,17 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
                     field.value.is_null() && field.value.as_str().map_or(true, |s| s.is_empty());
                 key_comment_map.insert(key, (kc, value_absent));
             }
+            last_field = Some(field.value_cursor);
             f = rest;
+            is_first = false;
         }
         if f.ends_unpaired() {
             return Err(f.malformed_member_error());
         }
+        // #2405: same #2211/#2243 container/trailing-gap check
+        // `to_owned_at_depth` runs -- `cursor` is `None` only at the true
+        // top level, same residual gap its own doc comment describes.
+        tail_gap_ok(cursor, last_field.as_ref(), b'}')?;
         Ok((
             OwnedValue::Object(map),
             CommentTree::Object(own_meta, comment_map, key_comment_map),
@@ -1221,7 +1219,16 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
         // Iterate by cursor (`uncons_cursor`, not `uncons`, which yields
         // values only) so each element's own comment is reachable.
         let mut elems = elements;
+        let mut is_first = true;
+        // #2405: same reasoning as the object arm's own `last_field` above.
+        let mut last_elem: Option<V::Cursor> = None;
         while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
+            // #2405: same #1677 element-gap check `to_owned_at_depth` runs --
+            // this loop never tracked `is_first` before, so a missing or
+            // duplicate `,` between elements passed silently.
+            if !elem_cursor.element_gap_ok(is_first) {
+                return Err(elem_cursor.malformed_delimiter_error());
+            }
             let elem_value = elem_cursor.value();
             let (v, c) = to_owned_with_comments_at_depth(
                 &elem_value,
@@ -1231,8 +1238,12 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
             )?;
             items.push(v);
             comment_items.push(c);
+            last_elem = Some(elem_cursor);
             elems = rest;
+            is_first = false;
         }
+        // #2405: same reasoning as the object arm's own check above.
+        tail_gap_ok(cursor, last_elem.as_ref(), b']')?;
         Ok((
             OwnedValue::Array(items),
             CommentTree::Array(own_meta, comment_items),
@@ -20302,6 +20313,79 @@ mod tests {
         );
         assert_eq!(comments.own(), None);
         assert_eq!(comments.field("a").own(), None);
+    }
+
+    /// #2405: `to_owned_with_comments`'s object arm now runs the same
+    /// #1677 key/value delimiter check `to_owned_at_depth` does, via
+    /// `DocumentField::checked_key` -- a missing `:` between key and value
+    /// used to materialize silently for a JSON-typed caller (this walk's
+    /// only *production* caller is YAML-only, where the omission was
+    /// unreachable).
+    #[test]
+    fn test_json_to_owned_with_comments_raises_on_missing_key_value_delimiter_2405() {
+        let json = b"{\"a\" 1}";
+        let index = crate::json::JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        assert!(to_owned_with_comments(&value, Some(&cursor)).is_err());
+    }
+
+    /// #2405: same as above, for a missing/duplicate `,` between array
+    /// elements (the array arm never tracked `is_first` before this fix).
+    #[test]
+    fn test_json_to_owned_with_comments_raises_on_missing_delimiter_between_array_elements_2405() {
+        let json = b"[1 2]";
+        let index = crate::json::JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        assert!(to_owned_with_comments(&value, Some(&cursor)).is_err());
+    }
+
+    /// #2405: same as above, for #2211's stray-comma-in-empty-container
+    /// check (`{,}`/`[,]`), now reached via `tail_gap_ok`.
+    #[test]
+    fn test_json_to_owned_with_comments_raises_on_stray_comma_in_empty_container_2405() {
+        for json in [&b"{,}"[..], &b"[,]"[..]] {
+            let index = crate::json::JsonIndex::build(json);
+            let cursor = index.root(json);
+            let value = cursor.value();
+            assert!(to_owned_with_comments(&value, Some(&cursor)).is_err());
+        }
+    }
+
+    /// #2405: same as above, for #2243's trailing-comma-after-last-child
+    /// check (`{"a":1,}`/`[1,]`).
+    #[test]
+    fn test_json_to_owned_with_comments_raises_on_trailing_comma_2405() {
+        for json in [&b"{\"a\":1,}"[..], &b"[1,]"[..]] {
+            let index = crate::json::JsonIndex::build(json);
+            let cursor = index.root(json);
+            let value = cursor.value();
+            assert!(to_owned_with_comments(&value, Some(&cursor)).is_err());
+        }
+    }
+
+    /// #2405: well-formed nested containers are unaffected by any of the
+    /// four checks above -- mirrors #2358/#2403's own regression-guard
+    /// pattern for the sibling materializers.
+    #[test]
+    fn test_json_to_owned_with_comments_wellformed_containers_unaffected_2405() {
+        let json = b"{\"a\": [1, 2], \"b\": {}, \"c\": []}";
+        let index = crate::json::JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let (owned, _comments) = to_owned_with_comments(&value, Some(&cursor)).unwrap();
+        assert_eq!(
+            owned,
+            OwnedValue::Object(IndexMap::from([
+                (
+                    "a".to_string(),
+                    OwnedValue::Array(vec![OwnedValue::Int(1), OwnedValue::Int(2)])
+                ),
+                ("b".to_string(), OwnedValue::Object(IndexMap::new())),
+                ("c".to_string(), OwnedValue::Array(Vec::new())),
+            ]))
+        );
     }
 
     // Regression tests for #532: `line`/`column` returned 0 for anything
