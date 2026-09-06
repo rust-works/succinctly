@@ -35,7 +35,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::expr::{
     ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, FuncDefBound, Import, Include,
-    Literal, MergeFlags, MetaValue, ModuleMeta, NumberKey, ObjectEntry, ObjectKey, Pattern,
+    Literal, MergeFlags, MetaValue, ModuleMeta, NumberKey, ObjectEntry, ObjectKey, Param, Pattern,
     PatternEntry, Program, StringPart,
 };
 use super::value::{parse_i64_or_f64, NumberRepr};
@@ -2536,6 +2536,58 @@ impl<'a> Parser<'a> {
         Ok(Expr::Break(name))
     }
 
+    /// Parse a `def`'s optional `(PARAMS)` parameter list, one [`Param`]
+    /// per entry recording whether it was written `$`-style or bare --
+    /// #2283: the two shapes bind a call-site argument identically, but
+    /// answer a different outer-`$var`-shadowing question once a nested
+    /// `def` is involved (see `Param`'s own doc comment, `src/jq/expr.rs`).
+    /// One definition shared by `parse_def_expr`/`parse_func_def_parts`
+    /// instead of two independent copies of this loop, per this
+    /// codebase's own "duplicated predicates diverge silently" lesson
+    /// (#106) -- a first version of this exact fix had two copies and
+    /// nothing would have caught them drifting apart.
+    fn parse_func_params(&mut self) -> Result<Vec<Param>, ParseError> {
+        if self.peek() != Some('(') {
+            return Ok(Vec::new());
+        }
+        self.next();
+        self.skip_ws();
+        let mut params = Vec::new();
+
+        if self.peek() != Some(')') {
+            loop {
+                // Parameters can be $var or just var
+                let is_dollar = self.peek() == Some('$');
+                if is_dollar {
+                    self.next();
+                }
+                let name = self.parse_ident()?;
+                params.push(if is_dollar {
+                    Param::Dollar(name)
+                } else {
+                    Param::Bare(name)
+                });
+                self.skip_ws();
+
+                match self.peek() {
+                    Some(';' | ',') => {
+                        self.next();
+                        self.skip_ws();
+                    }
+                    Some(')') => break,
+                    _ => {
+                        return Err(ParseError::new(
+                            "expected ';', ',', or ')' in parameter list",
+                            self.pos,
+                        ));
+                    }
+                }
+            }
+        }
+        self.expect(')')?;
+        Ok(params)
+    }
+
     /// Parse a function definition.
     /// Syntax: def NAME: BODY; or def NAME(PARAMS): BODY;
     fn parse_def_expr(&mut self) -> Result<Expr, ParseError> {
@@ -2547,41 +2599,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
 
         // Parse optional parameters
-        let params = if self.peek() == Some('(') {
-            self.next();
-            self.skip_ws();
-            let mut params = Vec::new();
-
-            if self.peek() != Some(')') {
-                loop {
-                    // Parameters can be $var or just var
-                    if self.peek() == Some('$') {
-                        self.next();
-                    }
-                    let param = self.parse_ident()?;
-                    params.push(param);
-                    self.skip_ws();
-
-                    match self.peek() {
-                        Some(';' | ',') => {
-                            self.next();
-                            self.skip_ws();
-                        }
-                        Some(')') => break,
-                        _ => {
-                            return Err(ParseError::new(
-                                "expected ';', ',', or ')' in parameter list",
-                                self.pos,
-                            ));
-                        }
-                    }
-                }
-            }
-            self.expect(')')?;
-            params
-        } else {
-            Vec::new()
-        };
+        let params = self.parse_func_params()?;
 
         self.skip_ws();
         self.expect(':')?;
@@ -5569,7 +5587,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
 
         // Collect function definitions at module level
-        let mut defs: Vec<(String, Vec<String>, Expr)> = Vec::new();
+        let mut defs: Vec<(String, Vec<Param>, Expr)> = Vec::new();
 
         // Parse function definitions until we hit something that isn't one
         while self.matches_keyword("def") {
@@ -5601,7 +5619,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse just the function definition parts (name, params, body) without the "then" clause
-    fn parse_func_def_parts(&mut self) -> Result<(String, Vec<String>, Expr), ParseError> {
+    fn parse_func_def_parts(&mut self) -> Result<(String, Vec<Param>, Expr), ParseError> {
         self.consume_keyword("def");
         self.skip_ws();
 
@@ -5609,38 +5627,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
 
         // Parse optional parameters
-        let params = if self.peek() == Some('(') {
-            self.next();
-            self.skip_ws();
-            let mut params = Vec::new();
-            while self.peek() != Some(')') {
-                // Parameters can be $var or just var
-                if self.peek() == Some('$') {
-                    self.next();
-                }
-                let param = self.parse_ident()?;
-                params.push(param);
-                self.skip_ws();
-
-                match self.peek() {
-                    Some(';' | ',') => {
-                        self.next();
-                        self.skip_ws();
-                    }
-                    Some(')') => break,
-                    _ => {
-                        return Err(ParseError::new(
-                            "expected ';', ',', or ')' in parameter list",
-                            self.pos,
-                        ));
-                    }
-                }
-            }
-            self.expect(')')?;
-            params
-        } else {
-            Vec::new()
-        };
+        let params = self.parse_func_params()?;
 
         self.skip_ws();
         self.expect(':')?;
