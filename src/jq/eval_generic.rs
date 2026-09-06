@@ -1012,7 +1012,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
         style: own_style,
         anchor: own_anchor,
     };
-    if let Some(fields) = value.as_object() {
+    let (owned, tree) = if let Some(fields) = value.as_object() {
         let mut map = IndexMap::new();
         let mut comment_map = IndexMap::new();
         let mut key_comment_map = IndexMap::new();
@@ -1071,10 +1071,10 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
         if f.ends_unpaired() {
             return Err(f.malformed_member_error());
         }
-        Ok((
+        (
             OwnedValue::Object(map),
-            CommentTree::Object(own_meta, comment_map, key_comment_map),
-        ))
+            CommentTree::Object(own_meta.clone(), comment_map, key_comment_map),
+        )
     } else if let Some(elements) = value.as_array() {
         let mut items = Vec::new();
         let mut comment_items = Vec::new();
@@ -1089,20 +1089,45 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
             comment_items.push(c);
             elems = rest;
         }
-        Ok((
+        (
             OwnedValue::Array(items),
-            CommentTree::Array(own_meta, comment_items),
-        ))
+            CommentTree::Array(own_meta.clone(), comment_items),
+        )
     } else {
         // #2358: `value` is scalar here (the object/array arms above
         // return first), so `to_owned_at_depth`'s `cursor` parameter is
         // never consulted on this path either -- passed through from this
         // function's own parameter purely because it's already in scope,
         // not because it matters.
-        Ok((
+        (
             to_owned_at_depth(value, cursor, depth)?,
-            CommentTree::Leaf(own_meta),
-        ))
+            CommentTree::Leaf(own_meta.clone()),
+        )
+    };
+    // #2500: `value.as_object()`/`as_array()` resolve straight through a
+    // `YamlValue::Alias` to the anchor *target*'s fields, so the loops
+    // above -- when `value` is itself an alias node -- just walked the
+    // target's own cursors and built a full child `CommentTree` out of
+    // them, marks included. That copies the anchor's own `&name`
+    // declarations onto this alias position's subtree, where they sit
+    // dormant as long as the alias mark itself survives (the emitter
+    // checks `comments.alias_name()` before any value-shape dispatch and
+    // never descends into an aliased node's children at all) but
+    // resurface as a second, spurious declaration the moment a later
+    // write makes this position diverge from its anchor and
+    // `enforce_anchor_soundness` drops the `*name` mark, falling through
+    // to the ordinary container render.
+    //
+    // `owned` (the fully expanded value, needed everywhere downstream) is
+    // built above and left untouched; only the parallel comment tree is
+    // collapsed to a childless `Leaf` here, so a diverged alias renders
+    // its expanded copy with default style/no marks like any other
+    // computed subtree -- `CommentTree::field`/`at_index` already answer
+    // the empty tree for a `Leaf`'s "children".
+    if matches!(own_meta.anchor, Some(AnchorMark::Aliases(_))) {
+        Ok((owned, CommentTree::Leaf(own_meta)))
+    } else {
+        Ok((owned, tree))
     }
 }
 
@@ -23785,6 +23810,45 @@ mod tests {
         let err = to_owned_with_comments(&value, Some(&cursor))
             .expect_err("an unpaired member is not JSON");
         assert!(err.message.contains("Invalid JSON text"), "{err:?}");
+    }
+
+    /// #2500: `value.as_object()`/`as_array()` resolve straight through a
+    /// `YamlValue::Alias` to the anchor target's own fields, so
+    /// `to_owned_with_comments_at_depth` used to recurse into those target
+    /// cursors and build a full child `CommentTree` for an alias position --
+    /// copying the anchor's own nested `&mark`s (here, `p`'s `&y`) onto the
+    /// alias node's subtree. The fix collapses an alias position's tree to a
+    /// childless `Leaf` carrying only its own `Aliases` mark: this asserts
+    /// that shape directly, independent of the write/render path the CLI
+    /// tests exercise end-to-end.
+    #[test]
+    fn test_to_owned_with_comments_alias_position_is_leaf_2500() {
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"a: &x\n  p: &y 1\n  q: *y\nb: *x\n";
+        let index = YamlIndex::build(yaml).unwrap();
+        let cursor = index.root(yaml);
+        let mapping_cursor = cursor
+            .first_child()
+            .expect("YAML document should have content");
+        let value = mapping_cursor.value();
+
+        let (_owned, comments) = to_owned_with_comments(&value, Some(&mapping_cursor)).unwrap();
+
+        let b_tree = comments.field("b");
+        assert!(
+            matches!(
+                b_tree,
+                CommentTree::Leaf(NodeMeta {
+                    anchor: Some(AnchorMark::Aliases(name)),
+                    ..
+                }) if name == "x"
+            ),
+            "expected a childless Leaf carrying Aliases(\"x\"), got {b_tree:?}"
+        );
+        // A `Leaf`'s `field`/`at_index` fall back to the empty tree for any
+        // child -- confirming no nested `&y` mark survived underneath.
+        assert!(b_tree.field("p").anchor_mark().is_none());
     }
 
     /// `to_owned_key_shape`'s array/object branches (#626/#670/#903) are a
