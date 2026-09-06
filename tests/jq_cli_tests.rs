@@ -37925,6 +37925,31 @@ fn test_validate_only_gate_array_element_delimiter_2349() -> Result<()> {
     Ok(())
 }
 
+/// #2400: `owned_from_standard_json_at_depth` (`eval_generic.rs`) itself has
+/// none of the `#1677`/`#2211`/`#2243` delimiter checks its materializing
+/// sibling `to_owned_cursor_at_depth` runs -- safe only because every live
+/// caller (documented on the function directly) feeds it bytes already
+/// clean by construction: `input`/`inputs` specifically because the
+/// input-reading pipeline validates upfront, before the queue this builtin
+/// reads from is ever seeded. This pins that upstream validation itself,
+/// which is the actual thing standing between this class of document and
+/// silent corruption -- if a future change ever let a malformed document
+/// reach the `input`/`inputs` queue unvalidated, this test starts failing
+/// (exit 0 instead of raising) rather than the gap surfacing silently.
+#[test]
+fn test_input_queue_still_rejects_malformed_second_document_2400() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "[input, input]"], Some("1\n{\"a\":1,}\n"))?;
+    assert_ne!(
+        code, 0,
+        "a trailing comma in the second document should raise (stdout: {stdout:?})"
+    );
+    assert!(
+        stderr.contains("Invalid JSON"),
+        "expected a JSON validity error, stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
 /// #2375 jq-mode counterpart of
 /// `test_map_path_context_scalar_target_noops_in_yq_mode_2375`
 /// (`tests/yq_cli_tests.rs`): the non-container no-op that fix added to
