@@ -117,7 +117,8 @@ pub use resolve::{resolve_func_calls, resolve_func_calls_all, UnresolvedCall};
 pub use stream::{StreamError, StreamStats, StreamableValue};
 pub use value::{
     assert_value_tree_depth, format_number_jq_compat, jq_bare_float_display,
-    nesting_depth_exceeded_message, NumberRepr, OwnedValue, MAX_VALUE_TREE_DEPTH,
+    jq_float_is_scientific, nesting_depth_exceeded_message, NumberRepr, OwnedValue,
+    MAX_VALUE_TREE_DEPTH,
 };
 // `pub(crate)`, not `pub`: only `yaml::light`'s alias-chain resolvers (#1191
 // code review, #1193/PR #1314) need this from outside `jq::value` --
