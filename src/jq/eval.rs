@@ -1902,14 +1902,29 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         // therefore left where it was -- unrouted, and answered exactly as
         // before -- rather than routed to a resolver that would refuse it.
         //
-        // `Expr::Update`/`CompoundAssign`/`AlternativeAssign` are excluded for
-        // a different reason: their right side is evaluated against the value
-        // *at the path*, not against the stage's input, so it stands somewhere
-        // else entirely (yq v4.53.3: `.a | .b |= key` is `{"b":"b","e":2}`,
-        // where `.a | .b = key` is `{"b":"a","e":2}`). Admitting them here
-        // without a route that knows the target's position would resolve their
-        // reads against the wrong node.
         Expr::Assign { value, .. } => needs_path_context(value),
+        // `.b |= key` (#2522). `|=` is the one operator whose right side
+        // stands *at the target*, not at the stage's input (yq v4.53.3:
+        // `.a | .b |= key` is `{"b":"b","e":2}`, where `.a | .b = key` is
+        // `{"b":"a","e":2}`), so admitting it here is not enough on its own:
+        // `update_path` resolves the filter against the target's own
+        // position, and this arm exists so the *prefix* of that position --
+        // where the assignment's input itself sits -- reaches it, via
+        // `eval_stage_with_path_context`'s own arm below. Without it,
+        // `.a | .b |= path` answers `["b"]` instead of `["a","b"]`.
+        Expr::Update { filter, .. } => needs_path_context(filter),
+        // `.b += key` (#2522). A compound assignment evaluates its right side
+        // *once, against the assignment's input* -- `eval_compound_assign`
+        // splices the resulting value into the `. op v` filter it builds --
+        // so this is `Expr::Assign`'s case exactly, not `Expr::Update`'s
+        // (yq v4.53.3: `.a | .b += key` is `{"b":"1a","e":2}`, the input's
+        // `"a"` concatenated onto `1`, and `.a | .b -= (key|length)` is
+        // `{"b":0,"e":2}`). `//=` is not real yq syntax at all, and is
+        // admitted for internal consistency with the `|=` it desugars to,
+        // the same judgement `eval_alternative_assign` already records.
+        Expr::CompoundAssign { value, .. } | Expr::AlternativeAssign { value, .. } => {
+            needs_path_context(value)
+        }
         Expr::Pipe(exprs) => exprs.iter().any(needs_path_context),
         Expr::Paren(inner) => needs_path_context(inner),
         Expr::Optional(inner) => needs_path_context(inner),
@@ -20869,9 +20884,60 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // this flag.
     let scalar_noop = scalar_slice_noop && S::TAG == EvalTag::Yq;
 
+    // #2522: the position every target of this update stands at, assembled
+    // from the ambient prefix the routes above named (`eval_generic::
+    // path_base`) plus the components `update_path` walks. Both the snapshot
+    // and the gate are paid only for a filter that actually reads a position
+    // -- an ordinary `.a |= . + 1` clones nothing and resolves nothing.
+    let positioned = needs_path_context(filter_expr)
+        && super::eval_generic::path_context_at_resolvable(filter_expr);
+    let base = if positioned {
+        super::eval_generic::current_path_base()
+    } else {
+        Vec::new()
+    };
+    // `parent`'s source, and only built for a filter that actually climbs:
+    // every target auto-created, none of them written yet. `Expr::Identity`
+    // as the filter is exactly `yq_prepare_assign_targets`' own vivification
+    // pass -- it always produces one output, so no arm can delete anything,
+    // and what it leaves behind is the shape a `parent` inside the real
+    // filter is about to be handed. Named apart from `pre` above
+    // (`alias_identity`'s own snapshot, taken for a different reason and
+    // consumed after the loop).
+    let pre_update = (positioned && reads_parent(filter_expr)).then(|| {
+        let mut vivified = result.clone();
+        for path in &paths {
+            // A path that cannot even be walked contributes no vivification;
+            // the real write below raises for it in a moment either way, and
+            // reporting it from here would raise it before the filter that
+            // yq runs first has had its chance to escape.
+            let _ = update_path::<S>(
+                &mut vivified,
+                path,
+                &Expr::Identity,
+                false,
+                scalar_noop,
+                None,
+            );
+        }
+        vivified
+    });
+
     // Get current value at path, apply filter, and set back
     for path in &paths {
-        if let Err(escape) = update_path::<S>(&mut result, path, filter_expr, false, scalar_noop) {
+        let pos = positioned.then(|| UpdatePos {
+            path: base.clone(),
+            base_len: base.len(),
+            pre: pre_update.as_ref(),
+        });
+        if let Err(escape) = update_path::<S>(
+            &mut result,
+            path,
+            filter_expr,
+            false,
+            scalar_noop,
+            pos.as_ref(),
+        ) {
             return match escape {
                 EvalEscape::Error(_) if optional => QueryResult::None,
                 other => other.into(),
@@ -21148,9 +21214,16 @@ fn yq_prepare_assign_targets<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let pre_creation = alias_identity::active().then(|| pristine.clone());
     let mut doc = pristine;
     for path in &paths {
-        if let Err(escape) =
-            update_path::<S>(&mut doc, path, &Expr::Identity, false, scalar_slice_noop)
-        {
+        if let Err(escape) = update_path::<S>(
+            &mut doc,
+            path,
+            &Expr::Identity,
+            false,
+            scalar_slice_noop,
+            // `Expr::Identity` is the filter: it holds no path-context read,
+            // so there is no position for #2522 to resolve against here.
+            None,
+        ) {
             return Err(match escape {
                 EvalEscape::Error(_) if optional => QueryResult::None,
                 other => other.into(),
@@ -21319,7 +21392,15 @@ fn eval_update_multi<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         optional,
         build_filter,
         move |result, path, filter, _is_last_path| {
-            update_path::<S>(result, path, filter, false, scalar_noop).map(|_wrote| ())
+            // `None`: `filter` here is always `. op <value>` (or `. //
+            // <value>`) with the right side already evaluated into a literal
+            // by `collect_rhs_outputs` -- a compound assignment reads its
+            // right side at the *input's* position, not the target's (yq
+            // v4.53.3: `.a | .b += key` is `{"b":"1a","e":2}`, the input's
+            // `"a"`), and `eval_stage_with_path_context` resolves that before
+            // the value is ever collected. Nothing is left in `filter` for a
+            // target position to answer.
+            update_path::<S>(result, path, filter, false, scalar_noop, None).map(|_wrote| ())
         },
     )
 }
@@ -21623,9 +21704,26 @@ fn for_each_container_slot<E>(
     root: &mut OwnedValue,
     mut edit: impl FnMut(&mut OwnedValue) -> Result<(), E>,
 ) -> Option<Result<(), E>> {
+    for_each_container_entry(root, |_, slot| edit(slot))
+}
+
+/// [`for_each_container_slot`] with each slot's own path component -- an
+/// array index or an object key (#2522), which is what names the position an
+/// update filter fanned out by `.[]` stands at.
+fn for_each_container_entry<E>(
+    root: &mut OwnedValue,
+    mut edit: impl FnMut(OwnedValue, &mut OwnedValue) -> Result<(), E>,
+) -> Option<Result<(), E>> {
     match root {
-        OwnedValue::Array(arr) => Some(arr.iter_mut().try_for_each(&mut edit)),
-        OwnedValue::Object(map) => Some(map.values_mut().try_for_each(&mut edit)),
+        OwnedValue::Array(arr) => Some(
+            arr.iter_mut()
+                .enumerate()
+                .try_for_each(|(index, slot)| edit(OwnedValue::Int(index as i64), slot)),
+        ),
+        OwnedValue::Object(map) => Some(
+            map.iter_mut()
+                .try_for_each(|(key, slot)| edit(OwnedValue::String(key.clone()), slot)),
+        ),
         _ => None,
     }
 }
@@ -22660,6 +22758,173 @@ fn flatten_path_components(exprs: &[Expr]) -> Vec<Expr> {
     flat
 }
 
+/// Where the filter of a `|=` (or a desugared `op=`) stands (#2522).
+///
+/// Real yq evaluates an update filter at the *target's* position, not at the
+/// assignment's input: on `a: {b: 1, e: 2}`, `.a | .b |= key` is
+/// `{"b":"b","e":2}` and `.a | .b |= path` is `{"b":["a","b"],"e":2}`
+/// (captured from yq v4.53.3), where the same reads on the input side
+/// (`.a | .b = key`) answer `"a"`/`["a"]`. `update_path` is the one place
+/// that knows every component it walked to reach the target, so the position
+/// is assembled here and handed to
+/// [`resolve_path_context_at`](crate::jq::eval_generic::resolve_path_context_at)
+/// -- the same rewrite the owned identity pipe applies, so the two cannot
+/// disagree about what `key`/`path`/`parent` mean at a named position.
+///
+/// `path` is absolute: `base_len` marks where the update's *input* sits, a
+/// prefix that only the routes above `eval_update` know (see
+/// `eval_generic::path_base`). `pre` is what `parent`/`parent(n)` climb: the
+/// input with every target of this assignment auto-created but not yet
+/// written, which is the node a real yq `parent` is handed. Real yq resolves
+/// and vivifies its whole left side before any filter runs (#1412/#2481), so
+/// `.a | .zzz |= (parent|keys)` on `a: {b: 1, e: 2}` is
+/// `["b","e","zzz"]` there -- the key the write is about to fill is already
+/// in the parent. `None` where the filter reads no `parent` at all, which is
+/// what keeps an ordinary `.a |= key` from cloning the input.
+#[derive(Clone)]
+struct UpdatePos<'a> {
+    path: Vec<OwnedValue>,
+    base_len: usize,
+    pre: Option<&'a OwnedValue>,
+}
+
+impl<'a> UpdatePos<'a> {
+    /// The position of `component` inside the value this one describes.
+    fn child(&self, component: OwnedValue) -> Self {
+        let mut path = vec_with_capacity(self.path.len() + 1);
+        path.extend_from_slice(&self.path);
+        path.push(component);
+        Self {
+            path,
+            base_len: self.base_len,
+            pre: self.pre,
+        }
+    }
+
+    /// The whole run of `components` at once, for a chain walked without a
+    /// frame per level ([`update_path_steps`]'s fresh runs).
+    fn descend(&self, components: Vec<OwnedValue>) -> Self {
+        let mut path = vec_with_capacity(self.path.len() + components.len());
+        path.extend_from_slice(&self.path);
+        path.extend(components);
+        Self {
+            path,
+            base_len: self.base_len,
+            pre: self.pre,
+        }
+    }
+
+    /// `key`: the last component taken. `None` only at the update input's own
+    /// position (`. |= key`), where the component that named it belongs to
+    /// whatever produced that input and this walk never saw it.
+    fn key(&self) -> Option<&OwnedValue> {
+        (self.path.len() > self.base_len).then(|| self.path.last().expect("len checked"))
+    }
+
+    /// `parent(n)`: `n` levels up, read out of [`pre`](Self::pre).
+    ///
+    /// `None` above the update's input -- that node is outside the value
+    /// `update_path` was handed, and no route hands it one. `None` too for a
+    /// component that does not exist in `pre`: an ancestor reached only by
+    /// autovivification did not exist when the filter's position was named,
+    /// the same "nothing there" answer `parent` gives above the document root
+    /// (real yq vivifies instead, the pre-existing divergence #2435 records).
+    fn ancestor(&self, n: usize) -> Option<&'a OwnedValue> {
+        let depth = self.path.len() - self.base_len;
+        let keep = depth.checked_sub(n)?;
+        let mut cur = self.pre?;
+        for component in &self.path[self.base_len..self.base_len + keep] {
+            cur = owned_component(cur, component)?;
+        }
+        Some(cur)
+    }
+}
+
+/// One step into an owned container by a path component, or `None` where
+/// there is nothing there. [`UpdatePos::ancestor`]'s walk.
+fn owned_component<'a>(value: &'a OwnedValue, component: &OwnedValue) -> Option<&'a OwnedValue> {
+    match (value, component) {
+        (OwnedValue::Object(map), OwnedValue::String(name)) => map.get(name),
+        (OwnedValue::Array(arr), OwnedValue::Int(i)) => {
+            usize::try_from(*i).ok().and_then(|i| arr.get(i))
+        }
+        _ => None,
+    }
+}
+
+/// The position of `idx` inside an array of `len` elements, resolving a
+/// negative index the way `write_index` itself does.
+///
+/// `None` where no component names the slot: a negative index reaching past
+/// the front is an error `write_index` raises anyway, and no path component
+/// spells it in the meantime.
+fn index_child_pos<'a>(pos: Option<&UpdatePos<'a>>, idx: i64, len: usize) -> Option<UpdatePos<'a>> {
+    let pos = pos?;
+    let resolved = if idx < 0 {
+        i64::try_from(len)
+            .ok()?
+            .checked_add(idx)
+            .filter(|i| *i >= 0)?
+    } else {
+        idx
+    };
+    Some(pos.child(OwnedValue::Int(resolved)))
+}
+
+/// The position at the far end of a fresh `Field`/`Index` run
+/// ([`update_path_steps`]'s frame-free autovivification), which walks every
+/// component of `fresh` in one step.
+///
+/// Every container in a fresh run is created empty, so an `Index` there lands
+/// at `idx` itself -- `write_index` pads up to it. A negative one drops the
+/// position, exactly as [`index_child_pos`] does.
+fn fresh_run_pos<'a>(pos: Option<&UpdatePos<'a>>, fresh: &[Expr]) -> Option<UpdatePos<'a>> {
+    let pos = pos?;
+    let mut components = vec_with_capacity(fresh.len());
+    for step in fresh {
+        match unwrap_path_component(step).0 {
+            Expr::Field(name) => components.push(OwnedValue::String(name.clone())),
+            Expr::Index { idx, .. } if *idx >= 0 => components.push(OwnedValue::Int(*idx)),
+            _ => return None,
+        }
+    }
+    Some(pos.descend(components))
+}
+
+/// Whether `expr` climbs to an ancestor node -- the one path-context read
+/// [`UpdatePos`] needs a materialized snapshot for (#2522). `key` and `path`
+/// are functions of the position alone and cost nothing.
+fn reads_parent(expr: &Expr) -> bool {
+    any_subexpr(expr, &mut |e| {
+        matches!(e, Expr::Builtin(Builtin::Parent | Builtin::ParentN(_)))
+    })
+}
+
+/// [`UpdatePos`] rewritten into the filter it positions, or the filter
+/// unchanged where there is no position to rewrite against (#2522).
+///
+/// `Ok(None)` means "evaluate `filter_expr` as before": either it holds no
+/// path-context read at all, or no route named a position for this update.
+/// The resolvability gate is the caller's
+/// ([`eval_generic::path_context_at_resolvable`]) rather than a silent
+/// fallback here, so a shape the rewriter cannot express keeps exactly the
+/// answer it had.
+fn position_update_filter<S: EvalSemantics>(
+    filter_expr: &Expr,
+    pos: Option<&UpdatePos<'_>>,
+) -> Result<Option<Expr>, EvalError> {
+    let Some(pos) = pos else {
+        return Ok(None);
+    };
+    if !needs_path_context(filter_expr) {
+        return Ok(None);
+    }
+    let parent_of =
+        |n: usize| -> Result<Option<OwnedValue>, EvalError> { Ok(pos.ancestor(n).cloned()) };
+    super::eval_generic::resolve_path_context_at::<S>(filter_expr, pos.key(), &pos.path, &parent_of)
+        .map(Some)
+}
+
 /// Update a value at a path by applying a filter.
 ///
 /// Returns whether a real value reached `root` (#1877/#1894): `false` only
@@ -22682,6 +22947,7 @@ fn update_path<S: EvalSemantics>(
     filter_expr: &Expr,
     optional: bool,
     scalar_noop: bool,
+    pos: Option<&UpdatePos<'_>>,
 ) -> Result<bool, EvalEscape> {
     // yq's slice-write container no-op (#1142) is unconditional on the
     // operator, unlike `scalar_noop` (a caller-gated parameter, `false` for
@@ -22747,7 +23013,21 @@ fn update_path<S: EvalSemantics>(
             // autovivifies/pads *before* reaching here) -- so simply
             // skipping the assignment is exactly "leave it as it was", no
             // separate before/after snapshot needed.
-            let outputs = eval_owned_multi_first::<S>(filter_expr, root)?;
+            // #2522: the filter's own position, resolved into it before it
+            // runs. `with_absolute_path_base` then names that position for a
+            // nested assignment inside the filter (`.a | .b |= (.c |= path)`),
+            // which reaches `eval_update` through the ordinary dispatch with
+            // no parameter to ride on.
+            let positioned = position_update_filter::<S>(filter_expr, pos)?;
+            let filter_expr = positioned.as_ref().unwrap_or(filter_expr);
+            let outputs = match pos {
+                Some(pos) => {
+                    super::eval_generic::with_absolute_path_base(pos.path.clone(), || {
+                        eval_owned_multi_first::<S>(filter_expr, root)
+                    })?
+                }
+                None => eval_owned_multi_first::<S>(filter_expr, root)?,
+            };
             let wrote = !outputs.is_empty();
             if wrote || S::TAG != EvalTag::Yq {
                 *root = outputs.into_iter().next().unwrap_or(OwnedValue::Null);
@@ -22758,9 +23038,16 @@ fn update_path<S: EvalSemantics>(
             let root_was_null = matches!(root, OwnedValue::Null);
             autovivify_object(root);
             if let OwnedValue::Object(map) = root {
+                let child = pos.map(|pos| pos.child(OwnedValue::String(name.clone())));
                 let current = map.entry(name.clone()).or_insert(OwnedValue::Null);
-                let wrote =
-                    update_path::<S>(current, &Expr::Identity, filter_expr, optional, scalar_noop)?;
+                let wrote = update_path::<S>(
+                    current,
+                    &Expr::Identity,
+                    filter_expr,
+                    optional,
+                    scalar_noop,
+                    child.as_ref(),
+                )?;
                 // #1916 is jq-mode only. An update filter that produced no
                 // output at all (`.a |= empty`) deletes the key instead of
                 // leaving it `null` -- jq's `_modify` falls back to
@@ -22828,12 +23115,14 @@ fn update_path<S: EvalSemantics>(
                     // `.[10] |= select(false)` still pads all the way to
                     // index 10. Keep the original eager `write_index`
                     // call, unconditional on the filter's outcome.
+                    let child = index_child_pos(pos, *idx, arr.len());
                     update_path::<S>(
                         write_index(arr, *idx)?,
                         &Expr::Identity,
                         filter_expr,
                         optional,
                         scalar_noop,
+                        child.as_ref(),
                     )
                 } else {
                     // #1916: bounds-checking is deferred behind the
@@ -22852,12 +23141,15 @@ fn update_path<S: EvalSemantics>(
                     // empty update filter takes instead.
                     let wrote = match resolve_read_index(&OwnedValue::Int(*idx), arr.len()) {
                         Some(actual_idx) => {
+                            let child =
+                                pos.map(|pos| pos.child(OwnedValue::Int(actual_idx as i64)));
                             let wrote = update_path::<S>(
                                 &mut arr[actual_idx],
                                 &Expr::Identity,
                                 filter_expr,
                                 optional,
                                 scalar_noop,
+                                child.as_ref(),
                             )?;
                             if !wrote {
                                 arr.remove(actual_idx);
@@ -22875,12 +23167,14 @@ fn update_path<S: EvalSemantics>(
                             // matching `delpaths` silently skipping an
                             // out-of-range index either direction.
                             let mut scratch = OwnedValue::Null;
+                            let child = index_child_pos(pos, *idx, arr.len());
                             let wrote = update_path::<S>(
                                 &mut scratch,
                                 &Expr::Identity,
                                 filter_expr,
                                 optional,
                                 scalar_noop,
+                                child.as_ref(),
                             )?;
                             if wrote {
                                 *write_index(arr, *idx)? = scratch;
@@ -22914,13 +23208,15 @@ fn update_path<S: EvalSemantics>(
                     if S::TAG == EvalTag::Yq {
                         // #1916 is jq-mode only -- see the `Field` arm's
                         // comment above.
-                        for elem in arr.iter_mut() {
+                        for (index, elem) in arr.iter_mut().enumerate() {
+                            let child = pos.map(|pos| pos.child(OwnedValue::Int(index as i64)));
                             update_path::<S>(
                                 elem,
                                 &Expr::Identity,
                                 filter_expr,
                                 optional,
                                 scalar_noop,
+                                child.as_ref(),
                             )?;
                         }
                     } else {
@@ -22936,13 +23232,15 @@ fn update_path<S: EvalSemantics>(
                         // in place, since a `Vec::remove` per dropped
                         // element would be quadratic.
                         let mut retained = vec_with_capacity(arr.len());
-                        for mut elem in core::mem::take(arr) {
+                        for (index, mut elem) in core::mem::take(arr).into_iter().enumerate() {
+                            let child = pos.map(|pos| pos.child(OwnedValue::Int(index as i64)));
                             if update_path::<S>(
                                 &mut elem,
                                 &Expr::Identity,
                                 filter_expr,
                                 optional,
                                 scalar_noop,
+                                child.as_ref(),
                             )? {
                                 retained.push(elem);
                             }
@@ -22953,24 +23251,28 @@ fn update_path<S: EvalSemantics>(
                 }
                 OwnedValue::Object(map) => {
                     if S::TAG == EvalTag::Yq {
-                        for value in map.values_mut() {
+                        for (key, value) in map.iter_mut() {
+                            let child = pos.map(|pos| pos.child(OwnedValue::String(key.clone())));
                             update_path::<S>(
                                 value,
                                 &Expr::Identity,
                                 filter_expr,
                                 optional,
                                 scalar_noop,
+                                child.as_ref(),
                             )?;
                         }
                     } else {
                         let mut retained = IndexMap::with_capacity(map.len());
                         for (key, mut value) in core::mem::take(map) {
+                            let child = pos.map(|pos| pos.child(OwnedValue::String(key.clone())));
                             if update_path::<S>(
                                 &mut value,
                                 &Expr::Identity,
                                 filter_expr,
                                 optional,
                                 scalar_noop,
+                                child.as_ref(),
                             )? {
                                 retained.insert(key, value);
                             }
@@ -22984,13 +23286,15 @@ fn update_path<S: EvalSemantics>(
             }
         }
         Expr::Pipe(exprs) if !exprs.is_empty() => {
-            update_path_steps::<S>(root, exprs, filter_expr, optional, scalar_noop)
+            update_path_steps::<S>(root, exprs, filter_expr, optional, scalar_noop, pos)
         }
-        Expr::Optional(inner) => update_path::<S>(root, inner, filter_expr, true, scalar_noop),
+        Expr::Optional(inner) => update_path::<S>(root, inner, filter_expr, true, scalar_noop, pos),
         // `(EXPR)` at the top of a resolved path (e.g. `(.[0:1]) |= 99`) —
         // see `set_path`'s matching `Expr::Paren` arm for why this was
         // never needed before #1116.
-        Expr::Paren(inner) => update_path::<S>(root, inner, filter_expr, optional, scalar_noop),
+        Expr::Paren(inner) => {
+            update_path::<S>(root, inner, filter_expr, optional, scalar_noop, pos)
+        }
         // `.[a:b] |= f` runs `f` on the sub-array — not on each element — and
         // splices the answer back, so `[1,2,3] | .[1:2] |= . + ["q"]` is
         // `[1,2,"q",3]`. `f` may return an array of any length, but it has to
@@ -23009,7 +23313,23 @@ fn update_path<S: EvalSemantics>(
                 container_noop,
                 terminal_write: true,
             },
-            |sub| update_path::<S>(sub, &Expr::Identity, filter_expr, optional, scalar_noop),
+            // `None`: a slice has no path component to name it (real yq
+            // keeps the *container's* position for a slice, jq reports a
+            // `{"start":s,"end":e}` component -- see `OwnedIdentityRule::
+            // Slice`), and neither is the position of the sub-array this
+            // filter is handed. Left unpositioned rather than positioned
+            // wrongly; `.a[0:1] |= key` answers exactly as it did before
+            // #2522.
+            |sub| {
+                update_path::<S>(
+                    sub,
+                    &Expr::Identity,
+                    filter_expr,
+                    optional,
+                    scalar_noop,
+                    None,
+                )
+            },
         ),
         // Unreachable: `resolve_dynamic_indexes` rewrites every computed key
         // into a static component before this runs. Explicit rather than left
@@ -23074,6 +23394,7 @@ fn update_path_steps<S: EvalSemantics>(
     filter_expr: &Expr,
     optional: bool,
     scalar_noop: bool,
+    pos: Option<&UpdatePos<'_>>,
 ) -> Result<bool, EvalEscape> {
     // `undo_stranded`: #1428 is a jq-mode divergence, and deliberately stays
     // one -- real yq *wants* the chain a suppressed write leaves behind
@@ -23093,6 +23414,10 @@ fn update_path_steps<S: EvalSemantics>(
 
     let mut root = root;
     let mut steps = steps;
+    // #2522: extended in place as the loop peels components, so the
+    // frame-free walk this function exists to perform still names every
+    // position it passes through.
+    let mut pos = pos.cloned();
     loop {
         let (first, rest) = match steps {
             // Only ever reached via the fresh-run shortcut below, standing in
@@ -23103,9 +23428,25 @@ fn update_path_steps<S: EvalSemantics>(
             // between the two the way CLAUDE.md's "duplicated predicates
             // diverge silently" warns about.
             [] => {
-                return update_path::<S>(root, &Expr::Identity, filter_expr, optional, scalar_noop);
+                return update_path::<S>(
+                    root,
+                    &Expr::Identity,
+                    filter_expr,
+                    optional,
+                    scalar_noop,
+                    pos.as_ref(),
+                );
             }
-            [last] => return update_path::<S>(root, last, filter_expr, optional, scalar_noop),
+            [last] => {
+                return update_path::<S>(
+                    root,
+                    last,
+                    filter_expr,
+                    optional,
+                    scalar_noop,
+                    pos.as_ref(),
+                )
+            }
             [first, rest @ ..] => (first, rest),
         };
 
@@ -23151,6 +23492,7 @@ fn update_path_steps<S: EvalSemantics>(
                         unreachable!("already_exists only set true for an Object root")
                     };
                     root = map.entry(name.clone()).or_insert(OwnedValue::Null);
+                    pos = pos.map(|pos| pos.child(OwnedValue::String(name.clone())));
                     steps = rest;
                     continue;
                 }
@@ -23162,12 +23504,14 @@ fn update_path_steps<S: EvalSemantics>(
                 let run_len = 1 + fresh_run_len(rest);
                 let (fresh, remainder) = steps.split_at(run_len);
                 let mut scratch = OwnedValue::Null;
+                let inner = fresh_run_pos(pos.as_ref(), fresh);
                 let wrote = update_path_steps::<S>(
                     &mut scratch,
                     remainder,
                     filter_expr,
                     optional,
                     scalar_noop,
+                    inner.as_ref(),
                 )?;
                 if !wrote && undo_stranded {
                     // Nothing was ever really written -- leave the object
@@ -23226,6 +23570,7 @@ fn update_path_steps<S: EvalSemantics>(
                             unreachable!("actual_idx was only resolved for an Array root")
                         };
                         root = &mut arr[actual_idx];
+                        pos = pos.map(|pos| pos.child(OwnedValue::Int(actual_idx as i64)));
                         steps = rest;
                         continue;
                     }
@@ -23233,12 +23578,14 @@ fn update_path_steps<S: EvalSemantics>(
                 let run_len = 1 + fresh_run_len(rest);
                 let (fresh, remainder) = steps.split_at(run_len);
                 let mut scratch = OwnedValue::Null;
+                let inner = fresh_run_pos(pos.as_ref(), fresh);
                 let wrote = update_path_steps::<S>(
                     &mut scratch,
                     remainder,
                     filter_expr,
                     optional,
                     scalar_noop,
+                    inner.as_ref(),
                 )?;
                 if !wrote && undo_stranded {
                     // See the `Field` arm's matching comment above:
@@ -23265,9 +23612,18 @@ fn update_path_steps<S: EvalSemantics>(
                 if S::TAG == EvalTag::Yq {
                     autovivify_array(root);
                 }
-                let fanned = for_each_container_slot(root, |slot| {
-                    update_path_steps::<S>(slot, rest, filter_expr, optional, scalar_noop)
-                        .map(|_| ())
+                let outer = pos.clone();
+                let fanned = for_each_container_entry(root, |component, slot| {
+                    let child = outer.as_ref().map(|pos| pos.child(component));
+                    update_path_steps::<S>(
+                        slot,
+                        rest,
+                        filter_expr,
+                        optional,
+                        scalar_noop,
+                        child.as_ref(),
+                    )
+                    .map(|_| ())
                 });
                 return match fanned {
                     Some(result) => result.map(|()| true),
@@ -23280,7 +23636,14 @@ fn update_path_steps<S: EvalSemantics>(
             // rather than recursing on it alone, which would strand `rest`.
             Expr::Pipe(inner) => {
                 let spliced = splice_optional_group(inner, rest, here);
-                return update_path_steps::<S>(root, &spliced, filter_expr, optional, scalar_noop);
+                return update_path_steps::<S>(
+                    root,
+                    &spliced,
+                    filter_expr,
+                    optional,
+                    scalar_noop,
+                    pos.as_ref(),
+                );
             }
             Expr::Slice { start, end, .. } => {
                 return through_slice(
@@ -23297,7 +23660,11 @@ fn update_path_steps<S: EvalSemantics>(
                         // no need to allocate the `Pipe` just to check it.
                         terminal_write: rest.iter().all(is_effectively_identity),
                     },
-                    |sub| update_path_steps::<S>(sub, rest, filter_expr, optional, scalar_noop),
+                    // `None` for the same reason `update_path`'s own
+                    // `Expr::Slice` arm drops the position -- see its comment.
+                    |sub| {
+                        update_path_steps::<S>(sub, rest, filter_expr, optional, scalar_noop, None)
+                    },
                 );
             }
             // #2241: a *mid-chain* bare `.` (`.a | . | .b`) is a transparent
@@ -23317,7 +23684,9 @@ fn update_path_steps<S: EvalSemantics>(
                 steps = rest;
                 continue;
             }
-            _ => return update_path::<S>(root, first, filter_expr, here, scalar_noop),
+            _ => {
+                return update_path::<S>(root, first, filter_expr, here, scalar_noop, pos.as_ref())
+            }
         }
     }
 }
@@ -35066,6 +35435,56 @@ fn eval_and_continue_with_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>
     }
 }
 
+/// An assignment's right-hand side, rewritten to the constants the position
+/// `current_path` answers (#2522), or `None` where there is nothing to
+/// rewrite.
+///
+/// `=`'s own right side is deliberately not handled here: the generic
+/// evaluator's owned identity pipe already positions it (#2471), and moving a
+/// correct answer to a second route is risk with nothing to buy. `|=`'s
+/// filter is not handled here either, and cannot be -- it stands at the
+/// *target*, a position only `update_path` can name; this function's caller
+/// makes `current_path` ambient for that instead.
+fn resolve_assign_rhs_at<S: EvalSemantics>(
+    expr: &Expr,
+    root: &OwnedValue,
+    current_path: &[OwnedValue],
+) -> Result<Option<Expr>, EvalError> {
+    let (op, path, value) = match expr {
+        Expr::CompoundAssign { op, path, value } => (Some(*op), path, value),
+        Expr::AlternativeAssign { path, value } => (None, path, value),
+        _ => return Ok(None),
+    };
+    if !needs_path_context(value) || !super::eval_generic::path_context_at_resolvable(value) {
+        return Ok(None);
+    }
+    let parent_of = |n: usize| -> Result<Option<OwnedValue>, EvalError> {
+        let Some(keep) = current_path.len().checked_sub(n) else {
+            return Ok(None);
+        };
+        let mut cur = root;
+        for component in &current_path[..keep] {
+            let Some(next) = owned_component(cur, component) else {
+                return Ok(None);
+            };
+            cur = next;
+        }
+        Ok(Some(cur.clone()))
+    };
+    let resolved = super::eval_generic::resolve_path_context_at::<S>(
+        value,
+        current_path.last(),
+        current_path,
+        &parent_of,
+    )?;
+    let value = Box::new(resolved);
+    let path = path.clone();
+    Ok(Some(match op {
+        Some(op) => Expr::CompoundAssign { op, path, value },
+        None => Expr::AlternativeAssign { path, value },
+    }))
+}
+
 /// Evaluate `expr` against `value`, routing through the eager path-context
 /// evaluator only when `expr` itself needs it (#1978 code review) -- used by
 /// `Expr::Reduce`/`Expr::Foreach`'s own dispatch arms below, whose `input`
@@ -38512,6 +38931,41 @@ fn eval_stage_with_path_context<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // re-verified as redundant -- a direct `QueryResult::Break` here is
         // clearer than routing through the generic fallback's `Ok`/`Err`
         // dance regardless.
+        // #2522: an assignment whose right side reads a position. Two
+        // different positions are involved, and this arm supplies both:
+        //
+        // * a compound assignment (`+=`/`-=`/`*=`, and `//=`) evaluates its
+        //   right side once against *this* stage's input, so a read in it is
+        //   a constant for `current_path` and is resolved right here -- the
+        //   same rewrite the generic evaluator's owned identity pipe already
+        //   applies to `=`'s right side (#2471);
+        // * `|=` evaluates its filter at the *target*, a position only
+        //   `update_path` can name. What this arm supplies there is the
+        //   prefix -- `current_path` -- made ambient for the assignment's
+        //   dynamic extent, which `update_path` then extends with the
+        //   components it walks.
+        //
+        // Everything else about the assignment stays in the ordinary
+        // dispatch (`eval_and_continue_with_context`, the `_` arm's own
+        // call): only the position is added here.
+        Expr::Update { .. } | Expr::CompoundAssign { .. } | Expr::AlternativeAssign { .. } => {
+            let resolved = match resolve_assign_rhs_at::<S>(first, root, current_path) {
+                Ok(resolved) => resolved,
+                Err(e) => return QueryResult::Error(e),
+            };
+            let stage = resolved.as_ref().unwrap_or(first);
+            super::eval_generic::with_path_base(current_path, || {
+                eval_and_continue_with_context::<W, S>(
+                    stage,
+                    value,
+                    rest,
+                    root,
+                    file_origin,
+                    current_path,
+                    optional,
+                )
+            })
+        }
         Expr::Break(name) => QueryResult::Break(name.clone()),
         _ => {
             // For other expressions, evaluate normally and continue
@@ -79575,9 +80029,15 @@ mod tests {
         #[test]
         fn test_update_path_refuses_an_unresolved_key() {
             let mut root = OwnedValue::Null;
-            let err =
-                update_path::<JqSemantics>(&mut root, &unresolved(), &Expr::Identity, false, false)
-                    .unwrap_err();
+            let err = update_path::<JqSemantics>(
+                &mut root,
+                &unresolved(),
+                &Expr::Identity,
+                false,
+                false,
+                None,
+            )
+            .unwrap_err();
             let EvalEscape::Error(err) = err else {
                 panic!("expected EvalEscape::Error, got {err:?}");
             };
@@ -79692,9 +80152,15 @@ mod tests {
         #[test]
         fn test_update_path_refuses_an_unresolved_slice() {
             let mut root = OwnedValue::Null;
-            let err =
-                update_path::<JqSemantics>(&mut root, &unresolved(), &Expr::Identity, false, false)
-                    .unwrap_err();
+            let err = update_path::<JqSemantics>(
+                &mut root,
+                &unresolved(),
+                &Expr::Identity,
+                false,
+                false,
+                None,
+            )
+            .unwrap_err();
             let EvalEscape::Error(err) = err else {
                 panic!("expected EvalEscape::Error, got {err:?}");
             };
@@ -80816,6 +81282,7 @@ mod tests {
             &Expr::Identity,
             false,
             false,
+            None,
         );
         assert!(matches!(result, Err(EvalEscape::Error(_))));
     }

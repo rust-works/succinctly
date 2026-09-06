@@ -51,7 +51,17 @@ use syn::visit::{self, Visit};
 /// arm -- `tests/jq_path_context_single_door_guard.rs` keeps it that way.
 /// Closing them removed no arm's only route, so the pin did not move. Read
 /// that page before assuming an arm is deletable.
-const PINNED_ARM_COUNT: usize = 43;
+///
+/// 43 -> 44 (#2522): a new arm for `Expr::Update`/`CompoundAssign`/
+/// `AlternativeAssign`, which is not a migration -- nothing moved off the
+/// cursor walk, and no shape that used to reach another arm now reaches this
+/// one. Before it, an assignment stage fell to the `_` fallback, which
+/// evaluates it with no position at all; the arm supplies the two the
+/// assignment operators need (`current_path` as an ambient prefix for `|=`'s
+/// target, and the same position resolved into a compound assignment's right
+/// side). `docs/plan/path-context-arm-reachability.md` records its own live
+/// proof query and gate reason alongside the other 43.
+const PINNED_ARM_COUNT: usize = 44;
 
 const TARGET_FN: &str = "eval_stage_with_path_context";
 const EVAL_RS: &str = include_str!("../src/jq/eval.rs");
@@ -195,7 +205,7 @@ fn test_eval_stage_with_path_context_arm_split_is_pinned() {
     let count = count_in_source(EVAL_RS, TARGET_FN);
     assert_eq!(
         (count.pre_match_handlers, count.match_arms),
-        (5, 38),
+        (5, 39),
         "pre-match handlers / match arms moved: {count:?}"
     );
 }

@@ -1,15 +1,17 @@
 # Per-arm reachability of the eager path-context evaluator (spine 2416, steps 4-5)
 
 `eval_stage_with_path_context` (`src/jq/eval.rs`) is the eager, materialising
-path-context evaluator ADR-0021 is retiring. It handles 43 expression shapes by
-name -- 5 pre-match `if` handlers plus 38 arms of its top-level `match first`
+path-context evaluator ADR-0021 is retiring. It handles 44 expression shapes by
+name -- 5 pre-match `if` handlers plus 39 arms of its top-level `match first`
 (the split `tests/jq_path_context_arm_guard.rs` pins) -- and each one was added
 to fix a shape the generic evaluator could not answer.
 
-Step 4 asks, of every one of those 43: is there still a query that reaches it?
+Step 4 asks, of every one of those: is there still a query that reaches it?
 
-**Answer: all 43 are reachable.** None was deleted; `PINNED_ARM_COUNT` stays at
-43. The rest of this page is the evidence.
+**Answer: all of them are reachable.** None was deleted. `PINNED_ARM_COUNT` sat
+at 43 through step 5 and moved to 44 with #2522, which *added* an arm rather
+than migrating one (see its section below). The rest of this page is the
+evidence.
 
 ## Method
 
@@ -120,7 +122,7 @@ R3 and onto the generic route, which is what an admission to
 now. Re-derive this paragraph's examples after any further admission rather than
 trusting them.
 
-## The 43 handlers
+## The 44 handlers
 
 | #   | Handler (site in `eval_stage_with_path_context`)                   | Verdict   | Proof query (jq mode, document `D`)                   | Gate |
 |-----|--------------------------------------------------------------------|-----------|-------------------------------------------------------|------|
@@ -167,6 +169,7 @@ trusting them.
 | A36 | `Expr::Try { .. }`                                                 | REACHABLE | `.a.b \| try (key + "x") catch "e"`                   | R2   |
 | A37 | `Expr::Label { name, body }`                                       | REACHABLE | `.a.b \| label $out \| (key + "x", break $out)`       | R2   |
 | A38 | `Expr::Break(name)`                                                | REACHABLE | `.a.b \| label $out \| (key + "x", break $out)`       | R2   |
+| A39 | `Expr::Update \| CompoundAssign \| AlternativeAssign`               | REACHABLE | `.a \| .b \|= key`                                    | R2   |
 
 ## Step 1b: `Expr::Arithmetic` admitted, and the pin holds at 43
 
@@ -445,17 +448,98 @@ with no path context anywhere in the filter:
   `.a | with_entries(.key = key)`, which yq answers `{"0":1,"1":2}`. A separate yq
   fidelity gap in `from_entries`, deliberately not fixed here.
 
+## #2522: an assignment arm added, and the pin moves to 44
+
+`|=` evaluates its filter at the **target's** position, not at the assignment's
+input (yq v4.53.3, on `a: {b: 1, e: 2}`: `.a | .b |= key` is `{"b":"b","e":2}`,
+where `.a | .b = key` is `{"b":"a","e":2}`). `eval::update_path` is the only
+place that knows the components walked to reach a target, but not where the
+value it was handed sits in the document -- so `.a | .b |= path` had to answer
+`["a","b"]` with only `["b"]` in hand.
+
+`needs_path_context` therefore gained `Expr::Update`/`Expr::CompoundAssign`/
+`Expr::AlternativeAssign` arms (gated on their right side, so an ordinary
+`.a |= . + 1` routes exactly as before), and `eval_stage_with_path_context`
+gained `A39`, which supplies the two positions involved:
+
+- for a compound assignment, whose right side is evaluated **once against this
+  stage's input**, the reads in it are constants for `current_path` and are
+  rewritten there -- the same rewrite the owned identity pipe already applies to
+  `=`'s right side (#2471);
+- for `|=`, the stage's `current_path` becomes an ambient prefix
+  (`eval_generic::path_base`) that `update_path` extends with the components it
+  walks.
+
+**This is an addition, not a migration.** Nothing moved off the cursor walk, and
+no shape that used to reach another arm now reaches `A39`: before it, an
+assignment stage fell to the `_` fallback, which evaluates it with no position
+at all. `PINNED_ARM_COUNT` goes 43 -> 44 for that reason, which is the "raise it
+only in a PR that says why" case rule 2 of "Hygiene going forward" allows.
+
+### Reachability of `A39`, and of the other 43
+
+`A39` instrumented and run against `D`:
+
+| Proof query           | Marker | Gate            | Output      |
+|-----------------------|--------|-----------------|-------------|
+| `.a \| .b \|= key`      | fired  | `R2` (and `R3`) | `{"b":"b"}` |
+| `.a \| .b += key`      | fired  | `R2` (and `R3`) | error (`number (1) and string ("a") cannot be added`) |
+| `.c[] \| .x //= key`   | fired  | `R3`            | error (`Cannot index number with string "x"`) |
+
+The listed query for `A39` is the first row. `R3` also holds for it (an
+assignment stage is not in `path_context_single_native`), so the row is `R2`
+only in the sense every other `R2` row is: that is the disjunct that would fire
+on its own.
+
+No other row is starved: none of the 43 proof queries above contains an
+assignment operator, so none of them can have moved onto `A39`.
+
+### What the change is measured against
+
+A differential over 4,896 assignment queries (eight heads x four operators x nine
+targets x seventeen bodies) on `a: {b: 1, e: 2}`, `n: [1, 2]`,
+`d: {x: {y: 3}, z: [4, 5]}`, `s: hi`, `u: null`, comparing the pre-change binary,
+the post-change binary and yq v4.53.3: **1,859 answers changed, 1,460 of them
+from disagreeing with yq to agreeing with it, and none the other way**
+(agreement 2,449 -> 3,909 of 4,896). The 399 that changed without reaching
+agreement break down as:
+
+- **228** where both sides raise and only succinctly's own wording moved,
+  because the resolved value now appears in it: `.a | .b += path` reports
+  `number (1) and array (["a"]) cannot be added` where it used to say
+  `array ([])`. yq's wording (`!!seq (a) cannot be added to a !!int (a.b)`) is a
+  separate, pre-existing gap.
+- **110** where yq's own **lexer** rejects the filter (`{k: key}`, a bare `if`
+  inside an update filter), so there is no yq answer to agree with; succinctly
+  answers as a superset, exactly as it did for those spellings before.
+- **42** where both answer and the values differ. All are `parent` reached
+  somewhere succinctly cannot follow: through an auto-vivified chain
+  (`.a | .x.y |= (parent|type)` is `""` in yq, `!!map` here -- yq vivifies the
+  intermediate node as an untagged null, #2435's gap), or above a value a
+  previous stage rebuilt (`.a | to_entries | .[0] | .b += (parent|type)` is
+  `!!seq` in yq, `!!map` here -- the eager evaluator climbs the *original*
+  document at `current_path`, which `to_entries` has since replaced). Both were
+  `null` before the change, so none of the 42 is worse than it was.
+- **19** where yq errors and succinctly answers, unchanged in that respect
+  before and after.
+
+The jq-mode half of the same method -- 4,900 queries built only from filters real
+jq defines (`path(.)`, `[paths]`, `del(...)`, arithmetic), across seven
+operators including `/=`/`%=`/`//=` -- reports **0 changed** and 4,900/4,900
+agreement with jq 1.7.1 before and after.
+
 ## Result
 
 | Metric                                            | Before | After                 |
 |---------------------------------------------------|--------|-----------------------|
-| Named handlers in `eval_stage_with_path_context`  | 43     | 43                    |
-| ... proven REACHABLE by a live query               | --     | 43                    |
+| Named handlers in `eval_stage_with_path_context`  | 43     | 44 (`A39`, #2522)     |
+| ... proven REACHABLE by a live query               | --     | 44                    |
 | ... proven UNREACHABLE                             | --     | 0                     |
 | ... neither                                        | --     | 0                     |
 | ... whose listed proof query moved off the gate    | --     | 1 (#2473); 14 (#2472) |
 | ... starved by #2471's remainder                   | --     | 0 (`A16`/`A18` re-run) |
-| `PINNED_ARM_COUNT`                                 | 43     | 43                    |
+| ... starved by #2522                               | --     | 0 (no row's query assigns) |
+| `PINNED_ARM_COUNT`                                 | 43     | 44                    |
 
 Nothing is deletable at this point in the spine. Doors 2 and 3 are closed as
 of step 5, which is a precondition rather than a deletion: the eager evaluator
