@@ -10633,17 +10633,22 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                 };
                 process_one_key!(&k);
             }
-            GenericItem::OneCursor(c) => {
+            // `OneCursorValue` is folded in here rather than given its own
+            // arm: `continue_pipe_element_generic` -- the only producer of
+            // this shape (`each_lazy_keys_iterate_sink`'s `!sorted` arm,
+            // #1609) -- always consumes it internally (re-entering
+            // `eval_each_pipe_generic` with the paired value as the pipe's
+            // new current value) before any external sink, including this
+            // one, ever sees it; verified directly (a temporary probe in
+            // both this arm and `each_lazy_keys_iterate_sink` confirmed the
+            // producer runs but this arm never does). Handling it like
+            // `OneCursor` rather than `unreachable!()` costs nothing (one
+            // redundant `cursor.value()` resolve on a path that cannot
+            // execute) and stays correct even if a future refactor changes
+            // that wiring.
+            GenericItem::OneCursor(c) | GenericItem::OneCursorValue(c, _) => {
                 // STYLE-0012: key generator -- see the `One` arm above.
                 let k = match to_owned_key_shape_cursor(&c) {
-                    Ok(k) => k,
-                    Err(e) => escape_generic!(Control::Error(e)),
-                };
-                process_one_key!(&k);
-            }
-            GenericItem::OneCursorValue(_, v) => {
-                // STYLE-0012: key generator -- see the `One` arm above.
-                let k = match to_owned_key_shape(&v) {
                     Ok(k) => k,
                     Err(e) => escape_generic!(Control::Error(e)),
                 };
@@ -10696,9 +10701,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
         // of which set `terminal` before returning `Demand::Stop` -- so
         // `terminal` would already be `Some` and the check above would
         // already have returned.
-        Flow::Stopped { .. } => {
-            unreachable!("this function's own sink always sets `terminal` before Demand::Stop")
-        }
+        Flow::Stopped { .. } => unreachable!("sink always sets `terminal` before Demand::Stop"), // omni-dev: coverage tolerate-line reason="unreachable: escape_generic!/ensure_owned! set `terminal` before Demand::Stop; already returned above (#2138)"
         // #2326: the key stream's own escape -- real jq's key-outer/
         // target-inner model indexes each already-produced key as it flows
         // out, so `key`'s own escaped generator's prefix is real jq output
@@ -23005,6 +23008,136 @@ mod tests {
             summarize(br#"{"a":1,"b":2}"#, r#".[("missing", "a", "b")]"#),
             Summary::Values(vec!["null".to_string(), "1".to_string(), "2".to_string()])
         );
+    }
+
+    /// #2138's sink: a key delivered as `GenericItem::OneCursor` (the
+    /// `Expr::Field` arm's ordinary result -- not one of the natively-lazy
+    /// `eval_each_generic` shapes, so it reaches the sink through the eager
+    /// fallback) whose own value is undecodable. `cursors` is still empty
+    /// (this is the very first key), so the decode failure collapses to a
+    /// bare `GenericResult::Error`, not a `Partial`.
+    #[test]
+    fn generic_computed_index_key_one_cursor_decode_failure_2138() {
+        let json: &[u8] = b"{\"corrupt\":\"\xff\xfe\",\"a\":1}";
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(r".[.corrupt]").unwrap();
+        match eval_with_cursor(&expr, index.root(json)) {
+            GenericResult::Error(e) => assert!(e.is_decode_failure(), "{e:?}"),
+            other => panic!("expected decode Error, got {other:?}"),
+        }
+    }
+
+    /// #2138's sink: `keys_unsorted[]` as the key expression is a `Pipe` of
+    /// `LazyKeys` into `Expr::Iterate`, which `fold_pipe_stages_sink` routes
+    /// to `each_lazy_keys_iterate_sink` rather than materializing the whole
+    /// key array first -- a real `.[K]` key generator reaching that
+    /// streaming path for the first time. Its items reach this sink as
+    /// `GenericItem::OneCursor`, not `OneCursorValue`: the latter is
+    /// constructed only as an internal hand-off inside
+    /// `continue_pipe_element_generic` (which re-enters `eval_each_pipe_generic`
+    /// with the paired value as the pipe's new current value), and is fully
+    /// consumed there before reaching any external sink, this one included
+    /// -- confirmed directly, not just read off the source (see the merged
+    /// `OneCursor | OneCursorValue` arm's own comment above).
+    #[test]
+    fn generic_computed_index_key_via_keys_unsorted_iterate_2138() {
+        assert_eq!(
+            summarize(br#"{"a":1,"b":2}"#, ".[(keys_unsorted[])]"),
+            Summary::Values(vec!["1".to_string(), "2".to_string()])
+        );
+    }
+
+    /// #2138's sink: same `keys_unsorted[]` shape as the test above, but the
+    /// first field *name* itself is undecodable -- exercises the merged
+    /// `OneCursor | OneCursorValue` arm's `to_owned_key_shape_cursor`
+    /// failure path for a real `.[K]` key generator.
+    #[test]
+    fn generic_computed_index_key_via_keys_unsorted_undecodable_name_2138() {
+        let json: &[u8] = b"{\"\xff\xfe\":1,\"b\":2}";
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(".[(keys_unsorted[])]").unwrap();
+        match eval_with_cursor(&expr, index.root(json)) {
+            GenericResult::Error(e) => assert!(e.is_decode_failure(), "{e:?}"),
+            other => panic!("expected decode Error, got {other:?}"),
+        }
+    }
+
+    /// #2138's sink: a *bare* `keys_unsorted` (no trailing `[]`) as the key
+    /// expression is not followed by `Expr::Iterate`, so
+    /// `fold_pipe_stages_sink` never special-cases it -- it materializes to
+    /// one `GenericItem::LazyKeys` item instead, landing in the
+    /// `Owned`/`LazyKeys`/`LazyIndexRange`/`LazySeq` bucket that mirrors the
+    /// pre-#2138 `other => owned_or_err!(other.collect_owned())` catch-all
+    /// exactly (same eager `collect_owned()` call, same pre-existing
+    /// fallibility -- #2138 changes nothing about this arm's own coverage).
+    #[test]
+    fn generic_computed_index_key_via_bare_lazykeys_2138() {
+        assert_eq!(
+            summarize(br#"{"a":1,"b":2}"#, r".[(keys_unsorted)]"),
+            Summary::Error("Cannot index object with array".to_string())
+        );
+    }
+
+    /// #2138's tail: the key stream's own escape (not a per-key indexing
+    /// failure) with an already-undecodable cursor sitting in `cursors` from
+    /// an earlier key's *successful* (but still-lazy) indexing -- key `0`
+    /// indexes to a cursor over the undecodable string, never promoted to
+    /// `owned` since nothing forced it yet, then `error("x")` escapes the
+    /// key stream itself. `to_owned_all_cursors_checked` fails converting
+    /// that prefix, downgrading the key stream's own `Error` into this
+    /// decode failure (mirrors `escape_generic!`'s identical downgrade rule).
+    #[test]
+    fn generic_computed_index_key_stream_escape_with_undecodable_prefix_2138() {
+        let json: &[u8] = b"[\"\xff\xfe\",20,30]";
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(r#".[(0,error("x"))]"#).unwrap();
+        match eval_with_cursor(&expr, index.root(json)) {
+            GenericResult::Error(e) => assert!(e.is_decode_failure(), "{e:?}"),
+            other => panic!("expected decode Error, got {other:?}"),
+        }
+    }
+
+    /// #2138's tail: same undecodable-prefix scenario as the test above, but
+    /// the key stream's own escape is `halt`, not `error` -- `Halt` survives
+    /// a secondary promotion failure unconditionally (mirrors
+    /// `escape_generic!`'s identical Halt-survives rule), so the result is a
+    /// bare `GenericResult::Halt`, not a decode `Error`.
+    ///
+    /// `halt`'s own evaluation bridges through `bridge_to_full_evaluator`,
+    /// which eagerly materializes the *whole* ambient `.` -- so an ordinary
+    /// `.[(0,halt)]` on a document whose `.` itself is corrupt would surface
+    /// the decode failure there, before this function's own tail ever runs
+    /// (same gap `generic_ensure_owned_decode_failure_wins_over_
+    /// unreached_halt_2138` above documents for the ensure_owned! site).
+    /// `at_offset` sidesteps it exactly as that test does: `target` points
+    /// at the corrupt sibling independently of `.`'s own (clean) narrowing,
+    /// so `halt`'s bridge over `.a` succeeds trivially while `cursors` still
+    /// holds the corrupt element from key `0`'s own successful indexing.
+    #[test]
+    fn generic_computed_index_key_stream_halt_survives_undecodable_prefix_2138() {
+        let json: &[u8] = b"{\"a\":1,\"corrupt\":[\"\xff\xfe\",20,30]}";
+        let offset = json.iter().skip(1).position(|&b| b == b'[').unwrap() + 1;
+        let index = JsonIndex::build(json);
+        let expr_str = format!(r".a | at_offset({offset})[(0,halt)]");
+        let expr = crate::jq::parse(&expr_str).unwrap();
+        match eval_with_cursor(&expr, index.root(json)) {
+            GenericResult::Halt(0) => {}
+            other => panic!("expected Halt(0), got {other:?}"),
+        }
+    }
+
+    /// #2138's tail: a `break` in the key stream itself (not from a per-key
+    /// indexing failure) -- yq mode discards the prefix for `Break` exactly
+    /// as it does for `Error` (#2326), unlike `Halt`, which always survives.
+    #[test]
+    fn generic_computed_index_key_stream_break_discards_prefix_in_yq_mode_2138() {
+        let json: &[u8] = b"[10,20,30]";
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(r".[(1,break $out)]").unwrap();
+        match eval_with_cursor_using::<YqSemantics, _>(&expr, index.root(json)) {
+            GenericResult::Break(label) => assert_eq!(label, "out"),
+            other => panic!("expected bare Break, got {other:?}"),
+        }
     }
 
     #[test]
