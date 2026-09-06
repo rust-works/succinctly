@@ -35721,12 +35721,14 @@ fn test_yaml_rebind_to_equal_value_is_indistinguishable_from_the_anchor_1351() -
     // DELIBERATE DIVERGENCE (docs/compliance/yq/limitations.md): the equality
     // gate's one false positive. Real yq detaches `b` here (`b: {p: 1, q: 2}`);
     // succinctly cannot tell a copy rebound to an equal value from an untouched
-    // one, so `b` follows the anchor.
+    // one, so `b`'s *value* follows the anchor. Since #2497 the plain `=`
+    // clears the stale `*x` mark (its right-hand side is not an alias read),
+    // so the followed value prints expanded rather than as `b: *x`.
     for filter in [".b = .a | .a.p = 9", r#".b = {"p": 1, "q": 2} | .a.p = 9"#] {
         assert_yq_1351(
             filter,
             "a: &x {p: 1, q: 2}\nb: *x\n",
-            "a: &x {p: 9, q: 2}\nb: *x\n",
+            "a: &x {p: 9, q: 2}\nb:\n  p: 9\n  q: 2\n",
             r#"{"a":{"p":9,"q":2},"b":{"p":9,"q":2}}"#,
         )?;
     }

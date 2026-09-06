@@ -96,8 +96,9 @@ still holds the anchor's value, so a position rebound earlier in the pipe (`.b =
 9`) is written positionally, as yq treats a rebound position. The gate's one false positive
 is a rebind to a value *equal* to the anchor's: `.b = .a | .a.p = 9` (or `.b = {"p": 1, "q":
 2} | .a.p = 9`) detaches `b` in yq (`b: {p: 1, q: 2}`), while succinctly cannot tell the
-rebound copy from an untouched one and keeps it in step (`b: *x`, value `{p: 9, q: 2}`). The
-written value is never affected, only which other positions follow it. Two further
+rebound copy from an untouched one and keeps its value in step (`b: {p: 9, q: 2}`; the `*x`
+mark itself is cleared by the plain `=`, see the assignment rule below). The written value is
+never affected, only which other positions follow it. Two further
 consequences are recorded divergences/limitations rather than matches:
 
 - **A value-producing update at an alias node is not discarded — rule 4(b).** Real yq
