@@ -2450,7 +2450,11 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             then,
             bound,
         } => eval_func_def::<W, S>(name, params, body, then, bound, value, optional),
-        Expr::FuncCall { name, args, .. } => eval_func_call::<W>(name, args, value, optional),
+        Expr::FuncCall {
+            name,
+            args,
+            builtin_fallback,
+        } => eval_func_call::<W>(name, args, builtin_fallback.is_some(), value, optional),
 
         // #1371: a call already bound to its definition. Unlike `FuncCall`
         // above (which only ever errors, since an unbound call is a compile
@@ -49950,13 +49954,33 @@ fn substitute_func_param_in_builtin(
 fn eval_func_call<'a, W: Clone + AsRef<[u64]>>(
     name: &str,
     args: &[Expr],
+    unresolved_builtin_fallback: bool,
     _value: StandardJson<'a, W>,
     _optional: bool,
 ) -> QueryResult<'a, W> {
-    QueryResult::Error(EvalError::new(format!(
-        "undefined function: {name}/{}",
-        args.len()
-    )))
+    // #2402: a `builtin_fallback`-carrying node reaching evaluation at all
+    // means the caller skipped `resolve_func_calls`/`resolve_func_calls_all`
+    // -- see `Expr::FuncCall::builtin_fallback`'s own doc comment for the
+    // documented precondition. `args` is deliberately empty on such a node
+    // (the field's own invariant), so without this check the message below
+    // reads as an ordinary "no such builtin" typo report -- indistinguishable
+    // from a genuine bug in the caller's filter, when the real cause is a
+    // missing resolve call before evaluating a jq-mode-parsed `Expr`
+    // directly. No extra tree walk: this only enriches the message on a
+    // node that was already about to error either way.
+    let message = if unresolved_builtin_fallback {
+        format!(
+            "undefined function: {name}/{}: a `def {name}` elsewhere in this \
+             program means the parser deferred resolving this call site -- \
+             call `resolve_func_calls`/`resolve_func_calls_all` before \
+             evaluating a jq-mode-parsed `Expr` directly (see \
+             `Expr::FuncCall::builtin_fallback`'s doc comment)",
+            args.len()
+        )
+    } else {
+        format!("undefined function: {name}/{}", args.len())
+    };
+    QueryResult::Error(EvalError::new(message))
 }
 
 #[cfg(test)]
@@ -50000,6 +50024,54 @@ mod tests {
             Some(Control::Halt(c)) => format!("halt:{c}"),
         };
         (out, tag)
+    }
+
+    /// #2402: `eval`/`eval_lenient` (the public library API) skip
+    /// `resolve.rs`'s scope-tracking pass, so a `builtin_fallback`-carrying
+    /// `Expr::FuncCall` node -- built by the parser whenever a lexical
+    /// prescan flags a call site's name as possibly `def`'d elsewhere in the
+    /// program (#2036) -- reaches `eval_func_call` still unresolved. Before
+    /// this fix, that produced a plain "undefined function" message
+    /// indistinguishable from a genuine typo in the caller's filter; the
+    /// caller has no way to tell "you forgot to call `resolve_func_calls`
+    /// first" from "this name is really undefined". Confirms both halves:
+    /// resolving first recovers the real builtin (arity mismatch means the
+    /// `def` doesn't shadow this call site), and skipping it now names the
+    /// missing precondition explicitly instead of leaving the caller to
+    /// guess.
+    #[test]
+    fn test_eval_without_resolve_names_missing_precondition_2402() {
+        use crate::jq::resolve_func_calls_all;
+        use crate::json::JsonIndex;
+
+        let json: &[u8] = b"[1,2,3]";
+        let index = JsonIndex::build(json);
+
+        // Resolved first, per the documented precondition: the bare
+        // `length` call keeps its builtin meaning (`def length(x)` is a
+        // different arity, so it never shadows this call site) and
+        // evaluates the real array length.
+        let mut resolved = parse("def length(x): x; length").unwrap();
+        resolve_func_calls_all(&mut resolved);
+        match eval::<Vec<u64>, JqSemantics>(&resolved, index.root(json)) {
+            QueryResult::Owned(OwnedValue::Int(3)) => {}
+            other => panic!("expected Owned(Int(3)), got {other:?}"),
+        }
+
+        // Same source, evaluated directly without resolving first: the
+        // node's `builtin_fallback` is still `Some`, so this must name the
+        // actual cause instead of reporting a bare arity/name mismatch.
+        let unresolved = parse("def length(x): x; length").unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&unresolved, index.root(json)) {
+            QueryResult::Error(e) => {
+                assert!(
+                    e.message.contains("resolve_func_calls"),
+                    "expected the message to name the missing precondition, got: {}",
+                    e.message
+                );
+            }
+            other => panic!("expected an Error, got {other:?}"),
+        }
     }
 
     /// #1888: `catch_error_under_optional`'s full truth table, exercised
