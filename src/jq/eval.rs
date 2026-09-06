@@ -1109,6 +1109,172 @@ pub mod alias_identity {
     pub(crate) fn mirror_after_write(_pre: &OwnedValue, _post: &mut OwnedValue) {}
 }
 
+/// A user-defined function visible at some point of a scoped walk (#2091).
+///
+/// `pub` so the CLI's own `collect_write_targets` (`yq_runner.rs`) walks the
+/// same wrappers this module's predicates do. When those two disagreed, the
+/// gate accepted a wrapped write while the target walk declined it, leaving
+/// `reconcile_presentation` on its positional fallback and attributing
+/// comments to the wrong nodes -- one definition of "which wrappers a write
+/// can hide behind" is the point, the same reason #1351 moved the predicates
+/// here in the first place.
+#[derive(Clone, Copy)]
+pub struct VisibleDef<'e> {
+    /// The definition's name.
+    pub name: &'e str,
+    /// How many parameters it takes.
+    pub arity: usize,
+    /// Its body.
+    pub body: &'e Expr,
+    /// How many definitions were already in scope where *this* one was
+    /// written. Walking into its body restores exactly that set (plus this
+    /// definition itself, so a self-recursive call still resolves) — jq
+    /// scopes a name at its definition site, not at the call site.
+    pub outer: usize,
+}
+
+/// The definitions in scope while a write-shape walk descends an expression,
+/// plus the guards that keep it terminating and cheap (#2091).
+///
+/// `contains_assign`, [`is_alias_sensitive_assign`] and the CLI's
+/// `collect_write_targets` all carry one, rather than treating "contains a
+/// `FuncDef`" as an answer in itself. A false *positive* on shape-preservation
+/// is not merely a wasted snapshot: `sync_aliased_paths` diffs the same path
+/// across a *reshaped* document and can clobber values, which
+/// `def f: map(.); f` would do.
+#[derive(Default)]
+pub struct DefScope<'e> {
+    defs: Vec<VisibleDef<'e>>,
+    /// Bodies currently being expanded, by address. A definition that calls
+    /// itself (`def f: f; f`) would otherwise resolve forever.
+    expanding: Vec<usize>,
+    /// How many resolutions were refused because the body was already being
+    /// expanded. A result computed while this never moved does not depend on
+    /// the surrounding `expanding` set and is safe to memoize; one computed
+    /// across a cut is not.
+    cuts: u32,
+    /// Completed answers by body address. Without it the walk is exponential:
+    /// `def f1: f0|f0; def f2: f1|f1; …` doubles per level, and 24 levels of
+    /// that in a 421-byte filter took 5.1s against a two-line document.
+    ///
+    /// `BTreeMap`, not `HashMap`: this crate is `no_std` + `alloc`.
+    memo: BTreeMap<usize, bool>,
+}
+
+/// The address of an expression node, a cheap identity for the
+/// expanding-set and the memo.
+///
+/// A plain cast, not `core::ptr::from_ref`: that is stable only since 1.76
+/// and this crate's MSRV is 1.73 (`clippy::incompatible_msrv` is the only
+/// thing that catches the difference — it builds either way).
+#[must_use]
+pub fn expr_key(expr: &Expr) -> usize {
+    expr as *const Expr as usize
+}
+
+/// A [`VisibleDef`] for an already-bound [`Expr::DefCall`] (#1371), whose
+/// definition carries no recorded definition site.
+///
+/// `outer` is "keep whatever is visible here", the closest available
+/// approximation — and costs nothing in practice, since that arm is
+/// unreachable from any CLI filter string today: `DefCall` is installed when
+/// an enclosing `FuncDef` is *evaluated*, strictly after these predicates
+/// have run. Routing it through the same [`DefScope::in_def_body`] as an
+/// ordinary call keeps one recursion guard and one memo.
+#[must_use]
+pub fn bound_def(def: &FuncDefData, visible: usize) -> VisibleDef<'_> {
+    VisibleDef {
+        name: &def.name,
+        arity: 0,
+        body: &def.body,
+        outer: visible,
+    }
+}
+
+impl<'e> DefScope<'e> {
+    /// How many definitions are visible right now — the `outer` a definition
+    /// written at this point should record.
+    #[must_use]
+    pub fn depth(&self) -> usize {
+        self.defs.len()
+    }
+
+    /// The innermost definition of `name` taking `arity` arguments that is
+    /// visible here, if it is one a walk can follow.
+    ///
+    /// **Arity 0 only.** A parameterised definition's body refers to
+    /// parameters whose call-site expressions these walks do not substitute,
+    /// so `def f(v): .a = v; f(99)` cannot be judged from the body alone and
+    /// is excluded rather than guessed at.
+    #[must_use]
+    pub fn resolve(&self, name: &str, arity: usize) -> Option<VisibleDef<'e>> {
+        if arity != 0 {
+            return None;
+        }
+        self.defs
+            .iter()
+            .rev()
+            .find(|d| d.name == name && d.arity == 0)
+            .copied()
+    }
+
+    /// Run `f` with `def` in scope.
+    pub fn with_def(&mut self, def: VisibleDef<'e>, f: impl FnOnce(&mut Self) -> bool) -> bool {
+        self.defs.push(def);
+        let result = f(self);
+        self.defs.pop();
+        result
+    }
+
+    /// Walk into `def`'s body under *its own* scope: the definitions that
+    /// existed where it was written, plus itself.
+    ///
+    /// Resolving at the call site instead let a name inside a body bind to a
+    /// **later** definition. Not a cosmetic scoping nicety: on
+    /// `a: &x 1 / b: *x / c: 2`, `def f: {a: .c, b: .a, c: .b}; def g: f;
+    /// def f: .a = 99; g` mis-classified a reshaping filter as a
+    /// shape-preserving write, and the alias sync then rewrote `b` from 1 to
+    /// 2 — the exact clobber [`DefScope`]'s own doc comment warns about.
+    ///
+    /// `memoize` is false for a walk whose answer is not only its `bool` (the
+    /// CLI's target collection also appends output, which a cached `true`
+    /// would skip).
+    pub fn in_def_body(
+        &mut self,
+        def: VisibleDef<'e>,
+        memoize: bool,
+        f: impl FnOnce(&mut Self) -> bool,
+    ) -> bool {
+        let key = expr_key(def.body);
+        if memoize {
+            if let Some(&cached) = self.memo.get(&key) {
+                return cached;
+            }
+        }
+        if self.expanding.contains(&key) {
+            self.cuts += 1;
+            return false;
+        }
+        // Restore the definition's own scope: everything visible where it was
+        // written, plus the definition itself so recursion still resolves.
+        // Clamped because [`bound_def`] synthesizes `outer` as "keep whatever
+        // is visible here", which is one past the last real index.
+        let tail = self.defs.split_off((def.outer + 1).min(self.defs.len()));
+        self.expanding.push(key);
+        let cuts_before = self.cuts;
+        let result = f(self);
+        self.expanding.pop();
+        self.defs.extend(tail);
+        // Memoizing is sound *because* the scope is fixed at the definition
+        // site: the answer for a body is a function of that body alone. A
+        // result computed across a recursion cut is not.
+        if memoize && self.cuts == cuts_before {
+            self.memo.insert(key, result);
+        }
+        result
+    }
+}
+
 /// Whether `expr` is itself an assignment-family write: `.path = value`,
 /// `|=`, a compound assign, `//=`, `del(...)`, `setpath(...)` or
 /// `delpaths(...)` (the last two added by #1351: they write at a path exactly
@@ -1122,14 +1288,50 @@ pub mod alias_identity {
 /// pay for alias-sync snapshotting -- only a pipe that both preserves shape
 /// *and* actually writes somewhere needs the pristine-vs-result diff.
 fn contains_assign(expr: &Expr) -> bool {
+    contains_assign_scoped(expr, &mut DefScope::default())
+}
+
+fn contains_assign_scoped<'e>(expr: &'e Expr, scope: &mut DefScope<'e>) -> bool {
     match expr {
         Expr::Assign { .. }
         | Expr::Update { .. }
         | Expr::CompoundAssign { .. }
         | Expr::AlternativeAssign { .. }
         | Expr::Builtin(Builtin::Del(_) | Builtin::SetPath(..) | Builtin::DelPaths(_)) => true,
-        Expr::Paren(inner) | Expr::Optional(inner) => contains_assign(inner),
-        Expr::Pipe(stages) => stages.iter().any(contains_assign),
+        Expr::Paren(inner) | Expr::Optional(inner) => contains_assign_scoped(inner, scope),
+        Expr::Shared(inner) => contains_assign_scoped(inner, scope),
+        Expr::Pipe(stages) => stages
+            .iter()
+            .any(|stage| contains_assign_scoped(stage, scope)),
+        // Only the body reaches the output; the bound expression never does.
+        Expr::As { body, .. } | Expr::AsPattern { body, .. } => contains_assign_scoped(body, scope),
+        Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+            ..
+        } => {
+            let def = VisibleDef {
+                name,
+                arity: params.len(),
+                body,
+                outer: scope.depth(),
+            };
+            scope.with_def(def, |scope| contains_assign_scoped(then, scope))
+        }
+        Expr::FuncCall { name, args, .. } => scope.resolve(name, args.len()).is_some_and(|def| {
+            scope.in_def_body(def, true, |scope| contains_assign_scoped(def.body, scope))
+        }),
+        // Already bound to its definition (#1371); same rule as `FuncCall`.
+        Expr::DefCall { def, args, .. } => {
+            args.is_empty() && {
+                let bound = bound_def(def, scope.depth());
+                scope.in_def_body(bound, true, |scope| {
+                    contains_assign_scoped(&def.body, scope)
+                })
+            }
+        }
         _ => false,
     }
 }
@@ -1165,7 +1367,7 @@ fn contains_assign(expr: &Expr) -> bool {
 /// CLI so the two consumers cannot drift (#2091 tracks `def`-wrapped writes,
 /// which this predicate does not yet see through).
 pub fn is_alias_sensitive_assign(expr: &Expr) -> bool {
-    fn is_shape_preserving(expr: &Expr) -> bool {
+    fn is_shape_preserving<'e>(expr: &'e Expr, scope: &mut DefScope<'e>) -> bool {
         match expr {
             Expr::Assign { .. }
             | Expr::Update { .. }
@@ -1181,13 +1383,43 @@ pub fn is_alias_sensitive_assign(expr: &Expr) -> bool {
                 | Builtin::Debug
                 | Builtin::DebugMsg(_),
             ) => true,
-            Expr::Paren(inner) | Expr::Optional(inner) => is_shape_preserving(inner),
-            Expr::Pipe(stages) => stages.iter().all(is_shape_preserving),
+            Expr::Paren(inner) | Expr::Optional(inner) => is_shape_preserving(inner, scope),
+            Expr::Shared(inner) => is_shape_preserving(inner, scope),
+            Expr::Pipe(stages) => stages.iter().all(|stage| is_shape_preserving(stage, scope)),
+            Expr::As { body, .. } | Expr::AsPattern { body, .. } => {
+                is_shape_preserving(body, scope)
+            }
+            Expr::FuncDef {
+                name,
+                params,
+                body,
+                then,
+                ..
+            } => {
+                let def = VisibleDef {
+                    name,
+                    arity: params.len(),
+                    body,
+                    outer: scope.depth(),
+                };
+                scope.with_def(def, |scope| is_shape_preserving(then, scope))
+            }
+            Expr::FuncCall { name, args, .. } => {
+                scope.resolve(name, args.len()).is_some_and(|def| {
+                    scope.in_def_body(def, true, |scope| is_shape_preserving(def.body, scope))
+                })
+            }
+            Expr::DefCall { def, args, .. } => {
+                args.is_empty() && {
+                    let bound = bound_def(def, scope.depth());
+                    scope.in_def_body(bound, true, |scope| is_shape_preserving(&def.body, scope))
+                }
+            }
             _ => false,
         }
     }
 
-    is_shape_preserving(expr) && contains_assign(expr)
+    is_shape_preserving(expr, &mut DefScope::default()) && contains_assign(expr)
 }
 
 /// Whether a key lookup that found nothing must yield **no output** here,
@@ -85707,5 +85939,167 @@ mod tests {
             }
             assert!(!alias_identity::active());
         }
+    }
+
+    // -- #2091: the write-shape gate's wrapper following ------------------
+
+    fn assign_a_2091() -> Expr {
+        Expr::Assign {
+            path: Box::new(Expr::Field("a".into())),
+            value: Box::new(Expr::Literal(Literal::Int(99))),
+        }
+    }
+
+    /// A reshaping body, which must stay excluded through every wrapper: a
+    /// false positive here is not a wasted snapshot but an alias sync that
+    /// diffs two differently-shaped documents.
+    fn map_identity_2091() -> Expr {
+        Expr::Builtin(Builtin::Map(Box::new(Expr::Identity)))
+    }
+
+    fn def_call_2091(body: Expr, args: Vec<Expr>) -> Expr {
+        Expr::DefCall {
+            def: Rc::new(FuncDefData {
+                name: "f".into(),
+                params: if args.is_empty() {
+                    Vec::new()
+                } else {
+                    vec!["v".into()]
+                },
+                body,
+            }),
+            args,
+            frames: 0,
+            bound: BoundBody::default(),
+        }
+    }
+
+    /// `Expr::DefCall` (#1371's already-bound call) and `Expr::Shared` are
+    /// installed at *evaluation* time, strictly after this predicate has run,
+    /// so no filter string reaches these arms today. They are kept because
+    /// the ordering that makes them unreachable is not something this
+    /// predicate controls, and answering `false` there would silently drop
+    /// preservation rather than fail. Driven directly.
+    #[test]
+    fn def_call_is_judged_by_its_body_2091() {
+        let write = def_call_2091(assign_a_2091(), Vec::new());
+        assert!(contains_assign(&write));
+        assert!(is_alias_sensitive_assign(&write));
+
+        let reshape = def_call_2091(map_identity_2091(), Vec::new());
+        assert!(!contains_assign(&reshape));
+        assert!(!is_alias_sensitive_assign(&reshape));
+    }
+
+    /// A bound call *with* arguments is excluded for the same reason its
+    /// unbound form is: the body refers to parameters this walk does not
+    /// substitute.
+    #[test]
+    fn def_call_with_arguments_is_excluded_2091() {
+        let call = def_call_2091(assign_a_2091(), vec![Expr::Literal(Literal::Int(1))]);
+        assert!(!contains_assign(&call));
+        assert!(!is_alias_sensitive_assign(&call));
+    }
+
+    /// `Expr::Shared` is transparent: it must not change either answer, in
+    /// either direction.
+    #[test]
+    fn shared_wrapper_is_transparent_2091() {
+        let write = Expr::Shared(Rc::new(assign_a_2091()));
+        assert!(contains_assign(&write));
+        assert!(is_alias_sensitive_assign(&write));
+
+        let reshape = Expr::Shared(Rc::new(map_identity_2091()));
+        assert!(!contains_assign(&reshape));
+        assert!(!is_alias_sensitive_assign(&reshape));
+    }
+
+    /// Both halves must follow the *same* wrappers, since
+    /// `is_alias_sensitive_assign` is `is_shape_preserving && contains_assign`
+    /// -- a wrapper only one of them follows would make the pair answer
+    /// correctly for the wrong reason, and stop doing so the moment the other
+    /// side changed.
+    #[test]
+    fn both_predicate_halves_follow_the_same_wrappers_2091() {
+        for expr in [
+            Expr::Paren(Box::new(assign_a_2091())),
+            Expr::Optional(Box::new(assign_a_2091())),
+            Expr::Shared(Rc::new(assign_a_2091())),
+            Expr::As {
+                expr: Box::new(Expr::Literal(Literal::Int(99))),
+                var: "v".into(),
+                body: Box::new(assign_a_2091()),
+            },
+            def_call_2091(assign_a_2091(), Vec::new()),
+            Expr::FuncDef {
+                name: "f".into(),
+                params: Vec::new(),
+                body: Box::new(assign_a_2091()),
+                then: Box::new(Expr::FuncCall {
+                    name: "f".into(),
+                    args: Vec::new(),
+                    builtin_fallback: None,
+                }),
+                bound: FuncDefBound::default(),
+            },
+        ] {
+            assert!(contains_assign(&expr), "contains_assign: {expr:?}");
+            assert!(
+                is_alias_sensitive_assign(&expr),
+                "is_alias_sensitive_assign: {expr:?}"
+            );
+        }
+    }
+
+    /// A definition's body is scoped where it was *written*, not where it is
+    /// called, so `g`'s `f` is the reshaping one even though a write-shaped
+    /// `f` is defined later. Resolving at the call site instead classified a
+    /// reshaping filter as a shape-preserving write, and the alias sync then
+    /// clobbered a value (see the CLI-level `..._binds_at_definition_site_2091`).
+    #[test]
+    fn def_body_binds_at_its_definition_site_2091() {
+        let call = |name: &str| Expr::FuncCall {
+            name: name.into(),
+            args: Vec::new(),
+            builtin_fallback: None,
+        };
+        let def = |name: &str, body: Expr, then: Expr| Expr::FuncDef {
+            name: name.into(),
+            params: Vec::new(),
+            body: Box::new(body),
+            then: Box::new(then),
+            bound: FuncDefBound::default(),
+        };
+        // def f: map(.); def g: f; def f: .a = 99; g
+        let expr = def(
+            "f",
+            map_identity_2091(),
+            def("g", call("f"), def("f", assign_a_2091(), call("g"))),
+        );
+        assert!(
+            !is_alias_sensitive_assign(&expr),
+            "`g` must resolve `f` to the reshaping definition visible where \
+             `g` was written, not the later write-shaped one"
+        );
+    }
+
+    /// A self-recursive definition terminates the walk rather than resolving
+    /// forever.
+    #[test]
+    fn self_recursive_def_terminates_the_walk_2091() {
+        let call_f = || Expr::FuncCall {
+            name: "f".into(),
+            args: Vec::new(),
+            builtin_fallback: None,
+        };
+        let expr = Expr::FuncDef {
+            name: "f".into(),
+            params: Vec::new(),
+            body: Box::new(call_f()),
+            then: Box::new(call_f()),
+            bound: FuncDefBound::default(),
+        };
+        assert!(!contains_assign(&expr));
+        assert!(!is_alias_sensitive_assign(&expr));
     }
 }

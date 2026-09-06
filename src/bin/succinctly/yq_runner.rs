@@ -26,7 +26,8 @@ use succinctly::jq::stream::StreamFailure;
 use succinctly::jq::{
     self, alias_identity, assert_value_tree_depth, is_alias_sensitive_assign,
     nesting_depth_exceeded_message, nonfinite_display_string, sync_aliased_paths, Builtin,
-    EvalError, Expr, Literal, NumberRepr, ObjectKey, OwnedValue, QueryResult, YqSemantics,
+    DefScope, EvalError, Expr, Literal, NumberRepr, ObjectKey, OwnedValue, QueryResult,
+    YqSemantics,
 };
 use succinctly::json::light::JsonCursor;
 use succinctly::json::JsonIndex;
@@ -2050,7 +2051,7 @@ fn collect_write_targets(expr: &Expr) -> Option<Vec<WriteTarget>> {
         }
     }
 
-    fn walk(expr: &Expr, out: &mut Vec<WriteTarget>) -> bool {
+    fn walk<'e>(expr: &'e Expr, scope: &mut DefScope<'e>, out: &mut Vec<WriteTarget>) -> bool {
         match expr {
             // Only a plain `=` can be proved to write a constructed value:
             // `|=`'s filter and a compound assign's operator both read the
@@ -2107,14 +2108,54 @@ fn collect_write_targets(expr: &Expr) -> Option<Vec<WriteTarget>> {
             | Expr::Builtin(
                 Builtin::Select(_) | Builtin::Empty | Builtin::Debug | Builtin::DebugMsg(_),
             ) => true,
-            Expr::Paren(inner) | Expr::Optional(inner) => walk(inner, out),
-            Expr::Pipe(stages) => stages.iter().all(|s| walk(s, out)),
+            Expr::Paren(inner) | Expr::Optional(inner) => walk(inner, scope, out),
+            Expr::Shared(inner) => walk(inner, scope, out),
+            Expr::Pipe(stages) => stages.iter().all(|s| walk(s, scope, out)),
+            // #2091: exactly the wrappers `is_alias_sensitive_assign`
+            // follows. When the gate accepted a wrapped write and this walk
+            // did not, `write_targets` came back empty and
+            // `reconcile_presentation` silently fell back to the positional
+            // lockstep -- turning "no comments on a wrapped write" into "the
+            // *wrong* comments", which `-i` then writes to disk.
+            // `1 as $v | del(.arr[0])` is real yq syntax and printed
+            // `- 2 # one` where yq prints `- 2 # two`.
+            Expr::As { body, .. } | Expr::AsPattern { body, .. } => walk(body, scope, out),
+            Expr::FuncDef {
+                name,
+                params,
+                body,
+                then,
+                ..
+            } => {
+                let def = jq::VisibleDef {
+                    name,
+                    arity: params.len(),
+                    body,
+                    outer: scope.depth(),
+                };
+                scope.with_def(def, |scope| walk(then, scope, out))
+            }
+            // `memoize: false` -- unlike the two boolean predicates, this
+            // walk's answer is not only its `bool` but the targets it
+            // appended, and a cached `true` would skip appending them the
+            // second time.
+            Expr::FuncCall { name, args, .. } => {
+                scope.resolve(name, args.len()).is_some_and(|def| {
+                    scope.in_def_body(def, false, |scope| walk(def.body, scope, out))
+                })
+            }
+            Expr::DefCall { def, args, .. } => {
+                args.is_empty() && {
+                    let bound = jq::bound_def(def, scope.depth());
+                    scope.in_def_body(bound, false, |scope| walk(&def.body, scope, out))
+                }
+            }
             _ => false,
         }
     }
 
     let mut out = Vec::new();
-    if !walk(expr, &mut out) {
+    if !walk(expr, &mut DefScope::default(), &mut out) {
         return None;
     }
 
@@ -8852,5 +8893,104 @@ mod tests {
             set(Expr::Field("n".into()))
         ]))
         .is_some());
+    }
+
+    /// `collect_write_targets` must follow exactly the wrappers
+    /// `jq::is_alias_sensitive_assign` follows (#2091). When the gate
+    /// accepted a wrapped write while this walk declined it,
+    /// `write_targets` came back empty and `reconcile_presentation` silently
+    /// fell back to the positional lockstep -- attributing #870's comments to
+    /// the wrong nodes, which `-i` then wrote to disk.
+    ///
+    /// The two live in different crates now (#1351 moved the gate into the
+    /// library), which is exactly why this agreement needs a test rather than
+    /// proximity.
+    #[test]
+    fn collect_write_targets_follows_the_same_wrappers_2091() {
+        let del_arr0 = || {
+            Expr::Builtin(Builtin::Del(Box::new(Expr::Pipe(vec![
+                Expr::Field("arr".into()),
+                Expr::Index { idx: 0, key: None },
+            ]))))
+        };
+        let expected = Some(vec![(
+            vec![PathStep::Key("arr".into()), PathStep::Index(0)],
+            WriteKind::Del,
+        )]);
+        let of = |e: &Expr| {
+            collect_write_targets(e)
+                .map(|ts| ts.into_iter().map(|t| (t.path, t.kind)).collect::<Vec<_>>())
+        };
+        let bound_call = |body: Expr, args: Vec<Expr>| Expr::DefCall {
+            def: std::rc::Rc::new(succinctly::jq::FuncDefData {
+                name: "f".into(),
+                params: if args.is_empty() {
+                    Vec::new()
+                } else {
+                    vec!["v".into()]
+                },
+                body,
+            }),
+            args,
+            frames: 0,
+            bound: succinctly::jq::BoundBody::default(),
+        };
+
+        for wrapped in [
+            del_arr0(),
+            Expr::Shared(std::rc::Rc::new(del_arr0())),
+            Expr::As {
+                expr: Box::new(Expr::Literal(succinctly::jq::Literal::Int(1))),
+                var: "v".into(),
+                body: Box::new(del_arr0()),
+            },
+            bound_call(del_arr0(), Vec::new()),
+            Expr::FuncDef {
+                name: "f".into(),
+                params: Vec::new(),
+                body: Box::new(del_arr0()),
+                then: Box::new(Expr::FuncCall {
+                    name: "f".into(),
+                    args: Vec::new(),
+                    builtin_fallback: None,
+                }),
+                bound: succinctly::jq::FuncDefBound::default(),
+            },
+        ] {
+            assert_eq!(of(&wrapped), expected, "{wrapped:?}");
+            // ...and the gate must accept every one of them, or the two have
+            // drifted in the other direction.
+            assert!(
+                succinctly::jq::is_alias_sensitive_assign(&wrapped),
+                "gate declined what the target walk accepted: {wrapped:?}"
+            );
+        }
+
+        // Both must also *refuse* the same expressions, not merely accept the
+        // same ones.
+        for refused in [
+            bound_call(
+                del_arr0(),
+                vec![Expr::Literal(succinctly::jq::Literal::Int(1))],
+            ),
+            Expr::FuncDef {
+                name: "f".into(),
+                params: Vec::new(),
+                body: Box::new(Expr::FuncCall {
+                    name: "f".into(),
+                    args: Vec::new(),
+                    builtin_fallback: None,
+                }),
+                then: Box::new(Expr::FuncCall {
+                    name: "f".into(),
+                    args: Vec::new(),
+                    builtin_fallback: None,
+                }),
+                bound: succinctly::jq::FuncDefBound::default(),
+            },
+        ] {
+            assert_eq!(of(&refused), None, "{refused:?}");
+            assert!(!succinctly::jq::is_alias_sensitive_assign(&refused));
+        }
     }
 }
