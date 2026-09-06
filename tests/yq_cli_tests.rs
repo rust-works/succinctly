@@ -30652,6 +30652,37 @@ fn test_stderr_path_passthrough_reaches_yq_mode_2234() -> Result<()> {
     Ok(())
 }
 
+/// #2138: `eval.rs`'s own `eval_index_expr` -- reached via `-n`/`-R`/
+/// `--slurp`/`--inplace`/`--split-exp` (`yq_runner.rs`'s `evaluate_input`
+/// bridges to it for these, unlike ordinary streaming yq, which goes
+/// through the already-fixed `eval_generic.rs`) -- had the identical
+/// eager-key-materialization bug `eval_generic.rs`'s own #2138 fix closed,
+/// confirmed live before this test was added: `succinctly yq -n '[1,2,3] |
+/// .[(0,"x",error("boom"))]'` printed `Error: boom` instead of stopping at
+/// `"x"`'s own indexing error. `stderr` (a real yq builtin, unlike `debug`,
+/// which needs `--jq-extensions`) writes its input unconditionally the
+/// moment it's reached, so this discriminates "was the third branch
+/// reached at all" independent of which error message eventually
+/// surfaces -- see `jq_cli_tests.rs`'s sibling test on the `eval_generic.rs`
+/// side for why the final error alone can't tell pre-/post-fix apart.
+#[test]
+fn test_computed_index_key_side_effect_not_reached_after_earlier_key_error_eval_rs_2138(
+) -> Result<()> {
+    let (out, stderr, code) = run_yq_stdin_with_stderr(
+        r#"[1,2,3] | .[(0,"x",(stderr | error("boom")))]"#,
+        "",
+        &["-n"],
+    )?;
+    assert_eq!(code, 1, "out: {out:?}");
+    assert_eq!(
+        stderr.trim(),
+        "Error: Cannot index array with string \"x\"",
+        "key `\"x\"`'s own indexing error must stop the pull before the \
+         third branch's `stderr` ever runs"
+    );
+    Ok(())
+}
+
 /// #2254: a negative array index whose magnitude still exceeds the array
 /// length raises in real yq v4.53.3 (`index [N] out of range, array size is
 /// M`), where jq -- and yq's own positive-out-of-range case -- both treat it

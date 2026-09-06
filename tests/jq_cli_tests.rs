@@ -1941,6 +1941,39 @@ fn test_nan_key_reads_null_and_rejects_writes() -> Result<()> {
     Ok(())
 }
 
+/// #2138: a computed-index key generator's *own side effect* (not just its
+/// own error message) must never fire once an earlier key's indexing step
+/// has already escaped.
+///
+/// `[("a", 5, (debug | error("boom")))]`'s third branch prints `["DEBUG:",
+/// .]` to stderr, unconditionally, the moment it's evaluated at all -- so
+/// this discriminates "was the third branch reached" independent of what
+/// error message eventually surfaces (`escape_generic!`'s own priority
+/// rule already makes key `5`'s "Cannot index object with number" outrank
+/// a pending `error("boom")` in *either* the pre-#2138 eager-collection
+/// code or the post-#2138 lazy pull, so asserting on the final error alone
+/// cannot tell the two apart -- confirmed live against `3562c39c5`, #2138's
+/// immediate parent commit, before this test was added). Only the `debug`
+/// leak actually distinguishes them: pre-#2138 evaluated the whole key
+/// stream (including this branch) before any indexing began, so `debug`
+/// fired regardless of key `5`'s later error; post-#2138 stops pulling the
+/// key stream the moment key `5`'s own indexing raises, so `debug` is
+/// never reached.
+#[test]
+fn test_computed_index_key_side_effect_not_reached_after_earlier_key_error_2138() -> Result<()> {
+    let stderr = jq_stderr(r#".[("a", 5, (debug | error("boom")))]"#, r#"{"a":1}"#, &[])?;
+    assert!(
+        !stderr.contains("DEBUG:"),
+        "key `5`'s own indexing error must stop the pull before the third \
+         branch's `debug` ever runs, got stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Cannot index object with number"),
+        "expected key `5`'s own type error, got: {stderr}"
+    );
+    Ok(())
+}
+
 /// `?` suppresses a bad-key error rather than propagating it.
 ///
 /// Regression guard for the `eval_generic` fallback: routing an unhandled
