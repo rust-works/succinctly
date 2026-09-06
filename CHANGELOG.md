@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A stray `,` with zero real children in a *nested* container (`{"a": [,]}`,
+  `{"a": {,}}`) now raises in two more materializers, matching real jq/yq**
+  (#2403). `eval_generic::to_owned_at_depth` already closed this gap for
+  nested containers (#2358); `eval.rs`'s own separate `to_owned_at_depth`
+  (behind the public `succinctly::jq::eval` library API) and `yq_runner.rs`'s
+  `to_owned_canonicalizing_numbers_at_depth` (behind `succinctly yq
+  --slurp`/`--eval-all`/`--inplace --input-format json`) had the identical
+  shape but were never audited by that fix. Both now thread the same
+  already-resolved child cursor through as the next level's container
+  cursor, the same way #2358 did. Confirmed live and CLI-reachable for the
+  yq-mode case: `echo '{"a": [,]}' | succinctly yq --slurp --input-format
+  json -o json '.[0]'` used to silently accept the document; real yq
+  v4.53.3 rejects it. The *true top level* of both functions is unaffected
+  and remains a documented, permanent gap (no container cursor is ever
+  available there, by construction).
+
 - **`succinctly jq -n`/`--null-input` now keeps a computed float's
   scientific-notation spelling through `tostring`, a format function
   (`@json`, `@csv`, ...), and string interpolation** (#2543). `-n` always

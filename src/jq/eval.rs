@@ -39,9 +39,9 @@ use std::rc::Rc;
 use indexmap::IndexMap;
 
 use super::document::{
-    child_tail_gap_ok, effective_fields, effective_fields_checked, effective_keys,
-    effective_len_checked, key_display_string, key_display_string_kind, DisplayKeyGuard,
-    DocumentCursor, DocumentElements, DocumentFields,
+    child_tail_gap_ok, container_tail_gap_ok, effective_fields, effective_fields_checked,
+    effective_keys, effective_len_checked, key_display_string, key_display_string_kind,
+    DisplayKeyGuard, DocumentCursor, DocumentElements, DocumentFields,
 };
 use super::slice::{self, SliceBounds};
 use super::walk::{any_subexpr, map_builtin_subexprs, map_subexprs};
@@ -1605,18 +1605,16 @@ fn to_owned_lossy_at_depth<W: Clone + AsRef<[u64]>>(
 /// `OwnedValue` before this function ever runs on it -- but a real gap for
 /// a direct library caller of the public `succinctly::jq::eval` entry
 /// point). #2211's `container_gap_ok` (a stray `,` with *zero* real
-/// children, `[,]`/`{,}`) is not addable here: unlike
-/// `to_owned_cursor_at_depth`, this function is never given a cursor for
-/// the *container itself* (only `value: &StandardJson<'_, W>`), so once a
+/// children, `[,]`/`{,}`) remains unchecked only at the *true top level*:
+/// the bare `value: &StandardJson<'_, W>` this function's own public entry
+/// point receives has no cursor for the container itself, so once a
 /// container's child walk is exhausted there is no cursor left to find its
-/// opening bracket from -- the same limitation #2211 already documented for
-/// `jq_runner::standard_json_to_jq_value`'s identical value-only shape.
-/// `eval_generic::to_owned_at_depth` had this same shape too, but #2358
-/// found every one of its recursive call sites already resolves the
-/// child's own cursor for an unrelated reason and simply discards it --
-/// threading it through closed the gap there for nested containers. This
-/// function's own recursion likely has the identical opportunity;
-/// untouched here, out of #2358's own scope (tracked as #2403).
+/// opening bracket from. `eval_generic::to_owned_at_depth` had the
+/// identical shape, and #2358 closed it there by threading each recursive
+/// call's already-resolved child cursor through as the next level's
+/// container cursor -- #2403 applies the same fix here (`to_owned_at_depth`'s
+/// own `cursor` parameter below), closing the gap for every *nested*
+/// container the same way.
 ///
 /// A decode failure raised here is never suppressed by `?` — see
 /// [`suppresses`], and [`to_owned_or_suppress`] for the call-site idiom
@@ -1635,7 +1633,7 @@ fn to_owned_lossy_at_depth<W: Clone + AsRef<[u64]>>(
 /// [`DocumentValue`](super::document::DocumentValue) impl making the shared
 /// helper directly usable.
 fn to_owned<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) -> Result<OwnedValue, EvalError> {
-    let result = to_owned_at_depth(value, 0);
+    let result = to_owned_at_depth(value, None, 0);
     // #2334: asserted here, at the depth-0 entry point, not inside the
     // recursive `to_owned_at_depth` -- one assert per materialization rather
     // than one per node.
@@ -1645,6 +1643,7 @@ fn to_owned<W: Clone + AsRef<[u64]>>(value: &StandardJson<'_, W>) -> Result<Owne
 
 fn to_owned_at_depth<W: Clone + AsRef<[u64]>>(
     value: &StandardJson<'_, W>,
+    cursor: Option<&JsonCursor<'_, W>>,
     depth: usize,
 ) -> Result<OwnedValue, EvalError> {
     assert_value_tree_depth(depth);
@@ -1672,16 +1671,25 @@ fn to_owned_at_depth<W: Clone + AsRef<[u64]>>(
                 if !elem_cursor.element_gap_ok(is_first) {
                     return Err(elem_cursor.malformed_delimiter_error());
                 }
-                items.push(to_owned_at_depth(&elem_cursor.value(), depth + 1)?);
+                items.push(to_owned_at_depth(
+                    &elem_cursor.value(),
+                    Some(&elem_cursor),
+                    depth + 1,
+                )?);
                 last_elem = Some(elem_cursor);
                 elems = rest;
                 is_first = false;
             }
-            // #2262/#1803: the value-domain tail -- `[1,]` (#2243) checked
-            // via the last real element's own cursor, `[,]` (#2211) not,
-            // because no container cursor is ever in hand here. See
-            // `child_tail_gap_ok`'s own doc comment.
-            child_tail_gap_ok(last_elem.as_ref(), b']')?;
+            // #2403: with `cursor` in hand (every level but the true top),
+            // `container_tail_gap_ok` closes #2211's `[,]` gap the same way
+            // `eval_generic::to_owned_at_depth` does since #2358 --
+            // `child_tail_gap_ok` alone (the `None` fallback, only ever hit
+            // at the true top level) still can't, for the reason this
+            // function's own doc comment above explains.
+            match cursor {
+                Some(c) => container_tail_gap_ok(c, last_elem.as_ref(), b']')?,
+                None => child_tail_gap_ok(last_elem.as_ref(), b']')?,
+            }
             OwnedValue::Array(items)
         }
         StandardJson::Object(fields) => {
@@ -1713,7 +1721,10 @@ fn to_owned_at_depth<W: Clone + AsRef<[u64]>>(
                 // one shared call -- see `DocumentField::checked_key`. This
                 // function had none of the delimiter half before #2262.
                 let key = field.checked_key(&f, &map, &mut guard, is_first)?;
-                map.insert(key, to_owned_at_depth(&field.value, depth + 1)?);
+                map.insert(
+                    key,
+                    to_owned_at_depth(&field.value, Some(&field.value_cursor), depth + 1)?,
+                );
                 last_field = Some(field.value_cursor);
                 f = rest;
                 is_first = false;
@@ -1721,8 +1732,11 @@ fn to_owned_at_depth<W: Clone + AsRef<[u64]>>(
             if f.ends_unpaired() {
                 return Err(f.malformed_member_error());
             }
-            // #2262: same reasoning as the array arm's own check above.
-            child_tail_gap_ok(last_field.as_ref(), b'}')?;
+            // #2403: same reasoning as the array arm's own check above.
+            match cursor {
+                Some(c) => container_tail_gap_ok(c, last_field.as_ref(), b'}')?,
+                None => child_tail_gap_ok(last_field.as_ref(), b'}')?,
+            }
             OwnedValue::Object(map)
         }
         // #2286 review: this arm used to silently substitute `Null` for a
@@ -62205,6 +62219,80 @@ mod tests {
                 panic!("{json:?}: known gap -- silently accepted, got error {e:?}");
             }
         }
+    }
+
+    /// #2403: unlike the true top level (pinned above as a permanent,
+    /// documented gap), a *nested* stray `,` in an empty container now
+    /// raises -- every recursive call below the top level has a real
+    /// cursor to the child it just resolved, which #2403 threads through as
+    /// `to_owned_at_depth`'s own `cursor` parameter (the same fix #2358
+    /// already applied to `eval_generic::to_owned_at_depth`) specifically
+    /// so `container_tail_gap_ok` (not `child_tail_gap_ok`'s weaker,
+    /// cursor-less fallback) can close #2211's `{,}`/`[,]` check one level
+    /// down. Confirmed live against `/usr/bin/jq` 1.7.1: `{"a": {,}}` and
+    /// `{"a": [,]}` both exit 5 with a parse error.
+    #[test]
+    fn test_to_owned_raises_on_nested_stray_comma_in_empty_container_2403() {
+        for json in [br#"{"a": {,}}"#.as_slice(), br#"{"a": [,]}"#.as_slice()] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let err = to_owned(&cursor.value())
+                .expect_err("a stray comma in a nested empty container is not JSON");
+            assert!(
+                err.message.contains("Invalid JSON text"),
+                "{json:?}: message: {}",
+                err.message
+            );
+        }
+    }
+
+    /// #2403 regression guard: the pre-existing nested trailing-comma check
+    /// (`{"a":1,}` / `[1,]`, #2262 -- already reachable at nested depth
+    /// before #2403, via the same `last_field`/`last_elem` cursor
+    /// `child_tail_gap_ok` always used) is unaffected by #2403 routing that
+    /// check through `container_tail_gap_ok` instead, one level down.
+    #[test]
+    fn test_to_owned_raises_on_nested_trailing_comma_2403() {
+        for json in [
+            br#"{"a": {"b":1,}}"#.as_slice(),
+            br#"{"a": [1,]}"#.as_slice(),
+        ] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let err = to_owned(&cursor.value())
+                .expect_err("a stray trailing comma after a real nested child is not JSON");
+            assert!(
+                err.message.contains("Invalid JSON text"),
+                "{json:?}: message: {}",
+                err.message
+            );
+        }
+    }
+
+    /// #2403: ordinary well-formed nested containers -- including a nested
+    /// empty container, the exact shape the new check above targets --
+    /// round-trip unaffected.
+    #[test]
+    fn test_to_owned_wellformed_nested_containers_unaffected_2403() {
+        let json = br#"{"a": [1,2,{"b":3}], "c": {}, "d": []}"#;
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expected = OwnedValue::Object(IndexMap::from([
+            (
+                "a".to_string(),
+                OwnedValue::Array(vec![
+                    OwnedValue::from_number_literal("1"),
+                    OwnedValue::from_number_literal("2"),
+                    OwnedValue::Object(IndexMap::from([(
+                        "b".to_string(),
+                        OwnedValue::from_number_literal("3"),
+                    )])),
+                ]),
+            ),
+            ("c".to_string(), OwnedValue::Object(IndexMap::new())),
+            ("d".to_string(), OwnedValue::Array(vec![])),
+        ]));
+        assert_eq!(to_owned(&cursor.value()).unwrap(), expected);
     }
 
     /// #2262: well-formed arrays/objects (including a multi-element array
