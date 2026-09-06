@@ -665,7 +665,7 @@ pub(crate) mod yq_read_only_context {
 pub mod alias_identity {
     use super::{
         get_value_at_path, is_alias_sensitive_assign, push_path_components, set_value_at_path,
-        unwrap_path_component, Expr, OwnedValue,
+        unwrap_path_component, vec_with_capacity, Expr, OwnedValue,
     };
     use alloc::rc::Rc;
     use alloc::vec::Vec;
@@ -692,7 +692,7 @@ pub mod alias_identity {
                 aliases
                     .iter()
                     .any(|a| a.as_slice() == prefix)
-                    .then(|| def.as_slice())
+                    .then_some(def.as_slice())
             })
         }
 
@@ -789,7 +789,7 @@ pub mod alias_identity {
     /// every `=`/compound assign/`del()` whose path ends at the alias.
     pub(crate) fn redirect_paths(paths: &mut Vec<Expr>, doc: &OwnedValue, opts: Redirect) {
         with_table(|table| {
-            let mut out = Vec::with_capacity(paths.len());
+            let mut out = vec_with_capacity(paths.len());
             for path in paths.drain(..) {
                 let mut components = Vec::new();
                 push_path_components(&mut components, &path);
@@ -1059,9 +1059,11 @@ fn contains_assign(expr: &Expr) -> bool {
     }
 }
 
-/// Whether `expr`'s top-level shape is "rewrite the document at specific
-/// paths, leaving everything else identical" -- the class of expression for
-/// which comparing a path's value before and after the write is meaningful.
+/// Whether `expr` is a shape-preserving write: "rewrite the document at
+/// specific paths, leaving everything else identical".
+///
+/// That is the class of expression for which comparing a path's value before
+/// and after the write is meaningful.
 /// Unwraps `Paren`/`Optional` so `(.a = 1)?` still matches, and recurses into
 /// `Pipe` so a chain matches when every stage does, whether the stage is a
 /// write (`.a = 1 | .b = 2`) or one of a small allow-list of pass-through
@@ -45495,8 +45497,11 @@ fn delpaths_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
     // #1351: a path descending through an alias position deletes from the
     // shared node. The extra `to_owned` runs only while a table is installed.
+    // STYLE-0012: a probe, not the materialization -- a failure here just
+    // skips the redirect, and the `to_owned(value)` in `result` below (the
+    // site that decides) re-raises it exactly as before.
     let delpaths_pre = if alias_identity::active() {
-        to_owned(value).ok()
+        to_owned(value).ok() // STYLE-0012: probe only; the site below decides.
     } else {
         None
     };
