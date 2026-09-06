@@ -877,11 +877,24 @@ pub mod alias_identity {
         }
     }
 
-    /// Both positions resolve and hold equal values right now.
+    /// Both positions resolve and hold *identical* values right now — i.e.
+    /// this alias slot is still the untouched copy of its anchor, not one an
+    /// earlier stage rebound.
+    ///
+    /// `identical`, not `==` (#1360). Jq value equality gets this wrong in
+    /// both directions, and this gate decides whether a write is redirected
+    /// onto the shared node, so either way is a wrong *value* on the page:
+    ///
+    /// - `NaN` differs from itself under `==`, so `.b.p = 9` on
+    ///   `a: &x {p: .nan} / b: *x` failed to redirect and wrote only the
+    ///   copy, where real yq mutates the anchor;
+    /// - `{p: 1}` and `{p: 1.0}` are `==` but do not render alike, so
+    ///   `.b = {"p": 1.0} | .b.p = 9` redirected onto the anchor a slot the
+    ///   first stage had already rebound.
     fn same_node(doc: &OwnedValue, a: &[OwnedValue], b: &[OwnedValue]) -> bool {
         matches!(
             (get_value_at_path(doc, a), get_value_at_path(doc, b)),
-            (Some(x), Some(y)) if x == y
+            (Some(x), Some(y)) if x.identical(&y)
         )
     }
 

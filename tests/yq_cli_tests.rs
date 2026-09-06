@@ -40214,4 +40214,56 @@ mod issue_1360_identity_not_jq_equality {
         }
         Ok(())
     }
+
+    /// The **fourth** comparison, found in review: #1351's redirect gate
+    /// (`alias_identity::same_node`) decides whether a write through an alias
+    /// lands on the shared node, and it was still using jq equality. That is
+    /// a wrong *value* on the page, in both directions.
+    ///
+    /// NaN made the redirect fail, so the write hit only the copy:
+    /// $ yq '.b.p = 9' on `a: &x {p: .nan} / b: *x`  =>  a: &x {p: 9} / b: *x
+    #[test]
+    fn test_yaml_write_through_alias_redirects_past_nan_1360() -> Result<()> {
+        for (input, filter, expected) in [
+            (
+                "a: &x {p: .nan}\nb: *x\n",
+                ".b.p = 9",
+                "a: &x {p: 9}\nb: *x\n",
+            ),
+            (
+                "a: &x {p: .nan, q: 1}\nb: *x\n",
+                "del(.b.p)",
+                "a: &x {q: 1}\nb: *x\n",
+            ),
+            // The non-NaN control, which always worked -- it is what pins the
+            // cause to the comparison rather than to the redirect itself.
+            ("a: &x {p: 1}\nb: *x\n", ".b.p = 9", "a: &x {p: 9}\nb: *x\n"),
+        ] {
+            let (output, code) = run_yq_stdin(filter, input, &[])?;
+            assert_eq!(code, 0, "{filter}");
+            assert_eq!(output, expected, "{filter} on {input:?}");
+        }
+        Ok(())
+    }
+
+    /// The other direction of the same gate: `{p: 1}` and `{p: 1.0}` are
+    /// jq-equal but do not render alike, so a slot an earlier stage had
+    /// already rebound still looked like the anchor's own copy and the second
+    /// write was redirected onto the anchor.
+    ///
+    /// $ yq '.b = {"p": 1.0} | .b.p = 9'  =>  a: &x {p: 1} / b: {p: 9}
+    #[test]
+    fn test_yaml_rebound_alias_slot_is_not_redirected_1360() -> Result<()> {
+        let (output, code) =
+            run_yq_stdin(".b = {\"p\": 1.0} | .b.p = 9", "a: &x {p: 1}\nb: *x\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(output, "a: &x {p: 1}\nb:\n  p: 9\n");
+
+        // #2499's own control: a slot rebound to something plainly different
+        // was never redirected, and still is not.
+        let (output, code) = run_yq_stdin(".b = null | .a.p = 9", "a: &x {p: 1}\nb: *x\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(output, "a: &x {p: 9}\nb: null\n");
+        Ok(())
+    }
 }
