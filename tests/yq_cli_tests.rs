@@ -25255,7 +25255,8 @@ fn test_yaml_assign_alias_onto_anchor_drops_both_2497() -> Result<()> {
 /// (`.b.q = ...`) so the repro keeps diverging `.b` regardless of whether
 /// this branch or issue 1351's write-through-the-anchor fix is applying the
 /// write; real yq writes through the alias either way and would print
-/// `a: &x {p: &y 1, q: 7}` / `b: *x` here, out of scope for this fix.#[test]
+/// `a: &x {p: &y 1, q: 7}` / `b: *x` here, out of scope for this fix.
+#[test]
 fn test_yaml_diverged_alias_prints_no_duplicate_anchor_2500() -> Result<()> {
     let input = "a: &x\n  p: &y 1\n  q: *y\nb: *x\n";
     let (output, exit_code) = run_yq_stdin(r#".b = {"p": 1, "q": 7}"#, input, &[])?;
