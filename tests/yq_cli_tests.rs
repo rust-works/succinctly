@@ -13190,7 +13190,11 @@ fn test_top_level_map_lazy_seq_dom_fallback_725() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(output.trim(), "[2,3,4]");
 
-    let (output, stderr, code) = run_yq_stdin_with_stderr("map(. + 1)", "a: 1\nb: two\n", &[])?;
+    // #2507: a string element (`b: two`) no longer errors here -- `"two" +
+    // 1` concatenates to `"two1"` in real yq now that succinctly matches --
+    // so this uses an object element instead, which still raises (a
+    // number/object mismatch has no such rule).
+    let (output, stderr, code) = run_yq_stdin_with_stderr("map(. + 1)", "a: 1\nb: {}\n", &[])?;
     assert_eq!(code, 1);
     assert_eq!(output, "");
     assert!(stderr.contains("cannot be added"), "{stderr}");
@@ -36586,6 +36590,100 @@ fn test_yq_index_scalar_with_key_is_empty_2482() -> Result<()> {
     let (output, code) = run_yq_stdin(".s.zzz = 1", doc, &[])?;
     assert_eq!(code, 0);
     assert!(output.contains("s: x"), "got: {output:?}");
+
+    Ok(())
+}
+
+/// #2507: `+` mixing a string with a number or boolean, in either order,
+/// concatenates in real yq -- the non-string side is converted to its
+/// string spelling, the same conversion `tostring` uses (so a
+/// scientific-notation or trailing-`.0` literal survives verbatim). Captured
+/// live from yq v4.53.3 (`-o=json -I0`, `-n`):
+///
+/// ```text
+/// $ yq -n '0 + "x"'          "0x"        $ yq -n '"x" + 0'          "x0"
+/// $ yq -n '1.5 + "x"'        "1.5x"      $ yq -n '"x" + 1.5'        "x1.5"
+/// $ yq -n '1.0 + "x"'        "1.0x"      $ yq -n '"x" + 1.0'        "x1.0"
+/// $ yq -n '1e100 + "x"'      "1e100x"    $ yq -n '"x" + 1e100'      "x1e100"
+/// $ yq -n '(0-5) + "x"'      "-5x"       $ yq -n '"x" + (0-5)'      "x-5"
+/// $ yq -n 'true + "x"'       "truex"     $ yq -n '"x" + true'       "xtrue"
+/// $ yq -n 'false + "x"'      "falsex"    $ yq -n '"x" + false'      "xfalse"
+/// $ succinctly yq -n '0 + "x"'   Error: number (0) and string ("x") cannot be added  (was, exit 1)
+/// ```
+///
+/// `-`/`*` were captured alongside for completeness and need no fix: every
+/// scalar/string mismatch for those two still raises in real yq too (`0 -
+/// "x"`, `"x" - 0`, `true - "x"`, `true * "x"`, ... all error live), and a
+/// container (array/object) mixed with a string is unaffected either way --
+/// `"x" + [1,2]`/`{} + "x"`/`"x" + {}` all still raise, and `[1,2] + "x"` is
+/// the *different*, already-implemented array-append rule (#1119), not this
+/// one. jq 1.7.1 raises unconditionally for every row above, so jq mode is
+/// untouched.
+///
+/// Fixed as `eval::yq_scalar_string_concat_is_ok`, consulted by `arith_add`
+/// -- the single function both evaluators' arithmetic fan-outs already
+/// route through, so this is one definition, not two.
+#[test]
+fn test_yq_scalar_string_concat_matrix_2507() -> Result<()> {
+    let args = &["-o", "json", "-I0", "-n"];
+    for (filter, expected) in [
+        (r#"0 + "x""#, r#""0x""#),
+        (r#""x" + 0"#, r#""x0""#),
+        (r#"1.5 + "x""#, r#""1.5x""#),
+        (r#""x" + 1.5"#, r#""x1.5""#),
+        (r#"1.0 + "x""#, r#""1.0x""#),
+        (r#""x" + 1.0"#, r#""x1.0""#),
+        (r#"1e100 + "x""#, r#""1e100x""#),
+        (r#""x" + 1e100"#, r#""x1e100""#),
+        (r#"(0-5) + "x""#, r#""-5x""#),
+        (r#""x" + (0-5)"#, r#""x-5""#),
+        (r#"true + "x""#, r#""truex""#),
+        (r#""x" + true"#, r#""xtrue""#),
+        (r#"false + "x""#, r#""falsex""#),
+        (r#""x" + false"#, r#""xfalse""#),
+    ] {
+        let (output, code) = run_yq_stdin(filter, "", args)?;
+        assert_eq!(code, 0, "`{filter}`: {output:?}");
+        assert_eq!(output.trim(), expected, "`{filter}`");
+    }
+
+    // Containers are unaffected -- still raise on either side, and array +
+    // string is the separate, already-implemented append rule (#1119).
+    let (output, code) = run_yq_stdin(r#"[1,2] + "x""#, "", args)?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"[1,2,"x"]"#);
+
+    for filter in [r#""x" + [1,2]"#, r#"{} + "x""#, r#""x" + {}"#] {
+        let (_out, stderr, code) = run_yq_stdin_with_stderr(filter, "", args)?;
+        assert_ne!(code, 0, "`{filter}` should still error");
+        assert!(stderr.contains("cannot be added"), "`{filter}`: {stderr}");
+    }
+
+    // `-`/`*` are unaffected -- still raise on a scalar/string mismatch.
+    for filter in [
+        r#"0 - "x""#,
+        r#""x" - 0"#,
+        r#"true - "x""#,
+        r#""x" - true"#,
+        r#"true * "x""#,
+        r#""x" * true"#,
+    ] {
+        let (_out, stderr, code) = run_yq_stdin_with_stderr(filter, "", args)?;
+        assert_ne!(code, 0, "`{filter}` should still error");
+        assert!(
+            stderr.contains("cannot be subtracted") || stderr.contains("cannot be multiplied"),
+            "`{filter}`: {stderr}"
+        );
+    }
+
+    // `*` between a number and a string already repeats the string (a
+    // pre-existing, jq-compatible rule unrelated to this fix) -- pinned
+    // here so a future edit can't accidentally couple the two.
+    for (filter, expected) in [(r#"2 * "x""#, r#""xx""#), (r#""x" * 2"#, r#""xx""#)] {
+        let (output, code) = run_yq_stdin(filter, "", args)?;
+        assert_eq!(code, 0, "`{filter}`: {output:?}");
+        assert_eq!(output.trim(), expected, "`{filter}`");
+    }
 
     Ok(())
 }
