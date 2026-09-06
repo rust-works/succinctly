@@ -39129,3 +39129,83 @@ fn test_jq_update_filter_position_is_a_succinctly_extension_2522() -> Result<()>
 
     Ok(())
 }
+
+/// #2558 (spine 2416, gate reason 2): an optional head (`.a? | ...`) is
+/// walkable, in jq mode too.
+///
+/// jq 1.7.1 has no `key`/`path`-with-no-argument, so its half of the oracle
+/// is the *component* model `path(...)` reports -- which is what the walk's
+/// `Expr::Optional` step has to reproduce. Captured 2026-09-07 from
+/// `/usr/bin/jq` 1.7.1 on `{"a": {"b": 1}, "c": [10, 20], "s": "hi"}`:
+///
+/// ```text
+/// $ jq -c 'path(.a?)'        ["a"]
+/// $ jq -c 'path(.a.x?)'      ["a","x"]
+/// $ jq -c 'path(.[0]?)'      (nothing -- `.[0]` on an object raises, `?` suppresses)
+/// $ jq -c 'path(.s.b?)'      (nothing -- `.s.b` on a string raises, `?` suppresses)
+/// $ jq -c 'path(.c[0]?)'     ["c",0]
+/// $ jq -c 'path(.c[5]?)'     ["c",5]
+/// $ jq -c 'path(.c[-5]?)'    ["c",-5]
+/// $ jq -c 'path(.a?.b)'      ["a","b"]
+/// $ jq -c 'path((.a?))'      ["a"]
+/// $ jq -c '[path(.[0]?)]'    []
+/// $ jq -c '[path(.s.b?)]'    []
+/// $ jq -c '.a?'              {"b":1}
+/// $ jq -c '.s.b?'            (nothing)
+/// ```
+///
+/// The `key`/`path`/`parent` rows below are succinctly's jq-mode extension
+/// (`jq: error: key/0 is not defined` in real jq), so they follow yq's model
+/// for the *builtin* and jq's model for the *component* -- which is why
+/// `.c[-5]? | key` is `-5` here where yq mode raises: a negative index stays
+/// as written in jq mode (ADR-0021 decision 5), and the yq-only raise is what
+/// `EvalError::is_uncatchable_at_value_position` exempts from the `?`.
+#[test]
+fn test_optional_head_is_walkable_2558() -> Result<()> {
+    let doc = r#"{"a": {"b": 1}, "c": [10, 20], "s": "hi"}"#;
+    for (filter, want) in [
+        // The jq-captured half.
+        ("path(.a?)", "[\"a\"]"),
+        ("path(.a.x?)", "[\"a\",\"x\"]"),
+        ("path(.[0]?)", ""),
+        ("path(.s.b?)", ""),
+        ("path(.c[0]?)", "[\"c\",0]"),
+        ("path(.c[5]?)", "[\"c\",5]"),
+        ("path(.c[-5]?)", "[\"c\",-5]"),
+        ("path(.a?.b)", "[\"a\",\"b\"]"),
+        ("path((.a?))", "[\"a\"]"),
+        ("[path(.[0]?)]", "[]"),
+        ("[path(.s.b?)]", "[]"),
+        (".a?", "{\"b\":1}"),
+        (".s.b?", ""),
+        // The same positions, read through the extension builtins the walk
+        // now answers from a `?` head.
+        (".a? | key", "\"a\""),
+        (".a? | path", "[\"a\"]"),
+        (".a.x? | key", "\"x\""),
+        (".a.x? | path", "[\"a\",\"x\"]"),
+        (".[0]? | key", ""),
+        (".[0]? | path", ""),
+        (".s.b? | key", ""),
+        (".c[0]? | key", "0"),
+        (".c[5]? | key", "5"),
+        (".c[-5]? | key", "-5"),
+        (".a?.b | key", "\"b\""),
+        ("(.a?) | key", "\"a\""),
+        (".a? | select(key == \"a\")", "{\"b\":1}"),
+        (
+            ".a? | [path, parent]",
+            "[[\"a\"],{\"a\":{\"b\":1},\"c\":[10,20],\"s\":\"hi\"}]",
+        ),
+        (".a? | parent(2)", ""),
+        (".a? | .b = key", "{\"b\":\"a\"}"),
+        (".a?[] | key", "\"b\""),
+        (".a? | key + \"x\"", "\"ax\""),
+        (".[]? | key", "\"a\"\n\"c\"\n\"s\""),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "`{filter}`: {out:?} {err}");
+        assert_eq!(out.trim_end(), want, "`{filter}`");
+    }
+    Ok(())
+}

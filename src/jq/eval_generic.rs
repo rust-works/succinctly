@@ -12268,16 +12268,17 @@ fn path_step_pipe_generic<S: EvalSemantics, V: DocumentValue>(
 ///   semantics (#1449) that the walk does not model, so such a pipe is
 ///   refused here rather than discovered mid-walk.
 ///
-/// Two deliberate exclusions, both narrower than the `path()` predicate:
+/// One deliberate exclusion, narrower than the `path()` predicate:
+/// `parent(n)` with a computed `n`. `n` is evaluated against the *current*
+/// value, which the walk would have to materialize to do -- exactly the cost
+/// being removed. A literal covers the real uses.
 ///
-/// * `Expr::Optional`. `?` in path context is not the same rule as `?` in a
-///   path expression -- `eval_pipe_with_path_context_internal` gives it three
-///   separate arms, one of them a bracket carve-out shared with the plain
-///   evaluator. Reproducing that here would be re-deriving semantics rather
-///   than reusing them, so `?` defers.
-/// * `parent(n)` with a computed `n`. `n` is evaluated against the *current*
-///   value, which the walk would have to materialize to do -- exactly the
-///   cost being removed. A literal covers the real uses.
+/// `?` over navigation is **not** an exclusion since #2558 (spine 2416): a
+/// suppressed step is one the walk simply does not take, which is the same
+/// answer the eager evaluator's own `Expr::Optional` arm produces by
+/// catching. It is `path_context_is_navigational` that admits it, so the
+/// absent split's head takes it too -- and `?` at the head was the single
+/// biggest source of the gate's reason 2.
 ///
 /// `Expr::Array` is included so `[.[] | key]` -- whose outputs are one
 /// bounded array, not one per element -- stays on the walk too.
@@ -12310,6 +12311,14 @@ fn path_context_pipe_is_walkable(stages: &[Expr]) -> bool {
 fn path_context_is_navigational(expr: &Expr) -> bool {
     match expr {
         Expr::Identity | Expr::Iterate | Expr::Field(_) | Expr::Index { .. } => true,
+        // #2558: `?` over navigation moves the position exactly as the bare
+        // navigation does, and suppresses the step that raised instead of
+        // producing a position for it. `key`/`path` never see a `?` at all,
+        // so there is no second rule to re-derive -- the step's own arm in
+        // [`path_context_step_generic`] is the whole of it. `?` over
+        // anything else (`key?`, `(.a | tostring)?`) is not navigation and
+        // is not admitted here.
+        Expr::Optional(inner) => path_context_is_navigational(inner),
         Expr::Paren(inner) => path_context_is_navigational(inner),
         Expr::Pipe(exprs) | Expr::Comma(exprs) => exprs.iter().all(path_context_is_navigational),
         Expr::Builtin(Builtin::Parent) => true,
@@ -12337,7 +12346,12 @@ fn path_context_fans_out(expr: &Expr) -> bool {
         Expr::Iterate => true,
         Expr::Comma(exprs) => exprs.len() > 1 || exprs.iter().any(path_context_fans_out),
         Expr::Pipe(exprs) => exprs.iter().any(path_context_fans_out),
-        Expr::Paren(inner) | Expr::Array(inner) => path_context_fans_out(inner),
+        // `Expr::Optional` since #2558: `.[]?` became navigational there, so
+        // without this arm a suppressed iterate would hide the very fan-out
+        // this guard exists to refuse.
+        Expr::Paren(inner) | Expr::Array(inner) | Expr::Optional(inner) => {
+            path_context_fans_out(inner)
+        }
         _ => false,
     }
 }
@@ -12585,6 +12599,33 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             let n = classify_parent_n::<S>(&literal_to_owned(lit), pos.path.len())?;
             out.extend(path_context_hop(pos, n));
             Ok(())
+        }
+        // #2558: the same rule as `path_step_generic`'s own `Expr::Optional`
+        // arm, one level up so a whole *position* (path plus ancestors)
+        // survives -- the error is swallowed, the positions already reached
+        // are not. A suppressed step produces no position, which is what
+        // makes `.a? | key` on a scalar-valued `.a`'s child empty rather
+        // than absent: captured live on `{"a":{"b":1},"s":"hi"}`, jq 1.7.1's
+        // `path(.s.b?)` prints nothing and yq v4.53.3's `.s.b? | key` prints
+        // nothing, where the *unsuppressed* `.s.b` raises in jq mode.
+        //
+        // Two errors are not this `?`'s to swallow, and they are exactly the
+        // two the eager evaluator's own `Expr::Optional` arm exempts
+        // (`EvalError::is_uncatchable_at_value_position`, whose doc comment
+        // has the rationale): a yq-mode negative index still negative after
+        // resolving against the length (#2254) and a string-decode failure
+        // (#1620). `.c[-5]? | key` on `c: [10, 20]` is
+        // `Error: index [-5] out of range, array size is 2` in yq v4.53.3,
+        // and swallowing it here would have made this migration change the
+        // answer instead of the route.
+        Expr::Optional(inner) => {
+            let mut branch = Vec::new();
+            let stepped = path_context_step_generic::<S, V>(inner, pos, &mut branch);
+            out.append(&mut branch);
+            match stepped {
+                Err(e) if e.is_uncatchable_at_value_position() => Err(e),
+                _ => Ok(()),
+            }
         }
         other => unreachable!(
             "path_context_is_navigational admitted a stage the walk cannot step: {other:?}"
@@ -26099,8 +26140,16 @@ mod tests {
         assert!(!walkable("(.a | key) | .x"));
         assert!(!walkable("(key, .b) | .c"));
         assert!(!walkable("[.[] | key] | .[0]"));
+        // #2558: `?` over navigation is walkable -- the step it wraps is
+        // taken, or suppressed and no position produced.
+        assert!(walkable(".a? | key"));
+        assert!(walkable(".a?.b | path"));
+        assert!(walkable(".a | .b? | parent"));
+        assert!(walkable(".[]? | key"));
+        // ...but `?` over something that is not navigation still is not.
+        assert!(!walkable("key? | tostring"));
+        assert!(!walkable("(.a | tostring)? | key"));
         // Shapes the walk does not model at all.
-        assert!(!walkable(".a? | key"));
         assert!(!walkable(".a | parent(1 + 1)"));
         assert!(!walkable(".a | select(true) | key"));
         assert!(!walkable(".a | key | tostring"));
@@ -26129,6 +26178,15 @@ mod tests {
         assert_eq!(split(".[] | .k | parent"), None);
         assert_eq!(split(".[] | .k | parent | key"), Some((4, 0)));
         assert_eq!(split("(.a.x, .b.y) | parent"), None);
+        // #2558: `?` over navigation is navigational, so a `?` head is taken
+        // whole exactly as its bare spelling is -- and `.[]?` still counts as
+        // a fan-out, which is what `path_context_fans_out`'s own `Optional`
+        // arm is for.
+        assert_eq!(split(".a? | key"), Some((2, 0)));
+        assert_eq!(split(".a?.b | path"), Some((2, 0)));
+        assert_eq!(split(".a | .b? | parent | key"), Some((4, 0)));
+        assert_eq!(split(".[]? | .k | parent"), None);
+        assert_eq!(split(".[]? | .k | parent | key"), Some((4, 0)));
     }
 
     /// What the M2 gate asks: cursors end to end, never a computed tail.
@@ -26163,6 +26221,15 @@ mod tests {
             };
             path_context_needs_eager(&stages)
         };
+        // #2558: some rows below have to say *which* route answers, not only
+        // what the gate reports, because the gate is asked after the walk
+        // and the absent split have each had their turn.
+        fn pipe_stages(f: &str) -> Vec<Expr> {
+            let Expr::Pipe(stages) = parse(f).unwrap() else {
+                panic!("not a pipe: {f}")
+            };
+            stages
+        }
         // No path context at all: never the eager evaluator's business.
         assert!(!eager(".a | tostring"));
         // Generic: a navigational head that cannot miss, then a native stage.
@@ -26425,12 +26492,48 @@ mod tests {
             "`.x` can be absent"
         );
         assert!(!eager(".x[] | first(.a | parent | parent)"));
-        // Node-preserving stages carry the absent possibility along, but
-        // `?` is not one the absent split can walk: `path_context_is_
-        // navigational` excludes it (the walk's own documented exclusion --
-        // `?` in path context is not `?` in a path expression), so the head
-        // stops before it and there is no position to resolve against.
+        // #2558: `?` over navigation is navigational now, so a head that
+        // ends in one is routed like any other -- `docs/plan/path-context-
+        // arm-reachability.md`'s "`?` at the head is now the single biggest
+        // source of `R2`" no longer holds. Every one of these hands over
+        // before the change and does not after.
+        assert!(!eager(".a? | key + \"x\""));
+        assert!(!eager(".a? | [key] + [\"x\"]"));
+        assert!(!eager(".a? | select(key == \"a\")"));
+        assert!(!eager(".a? | [path, parent]"));
+        assert!(!eager(".a? | {\"k\": key}"));
+        assert!(!eager(".a? | key == \"a\" and true"));
+        assert!(!eager(".a? | if key == \"a\" then 1 else 2 end"));
+        assert!(!eager(".a? | first(key)"));
+        assert!(!eager(".a? | limit(1; key)"));
+        assert!(!eager(".a? | try key catch \"e\""));
+        assert!(!eager(".a? | tostring | key"));
+        assert!(!eager(".a? | to_entries | .[0] | key"));
+        assert!(!eager(".a? | file_index + 1"));
+        // A whole-pipe walk reports `true` here for the same reason
+        // `.a.b | key` does -- `path_context_absent_split` steps aside for a
+        // pipe the walk already takes, so `absent_routed` is `false` and the
+        // gate is never the route that answers. `path_context_walk_split`
+        // is where that is pinned (`..._takes_whole_head_or_nothing_2416`).
+        assert!(eager(".a? | key"));
+        assert!(path_context_walk_split(&pipe_stages(".a? | key")).is_some());
         assert!(eager(".a[5]? | key"));
+        assert!(path_context_walk_split(&pipe_stages(".a[5]? | key")).is_some());
+        // An assignment's right side is the `.a.b | .c = key` row above with
+        // a `?` head: the absent route answers it first, so the gate's own
+        // `true` is not the route taken.
+        assert!(eager(".a? | .b = key"));
+        assert!(path_context_absent_split(&pipe_stages(".a? | .b = key")).is_some());
+        // ...but only `?` over *navigation*: `?` over anything else is not a
+        // head the walk can step, so the pipe hands over exactly as before.
+        assert!(eager(".a | (key | tostring)? | key"));
+        // A `?` head does not rescue a stage no route can name a position
+        // for, nor a fan-out head -- the residue ADR-0021 records.
+        assert!(eager(".a? | .b |= key"));
+        assert!(eager(".a? | explode | key"));
+        assert!(eager(".a? | map(key + \"x\")"));
+        assert!(eager(".a? | . as $x | key"));
+        assert!(eager(".[]? | .k | select(key == \"k\")"));
         assert!(!eager(".a[] | select(true) | key"));
     }
 
@@ -26647,6 +26750,14 @@ mod tests {
         // Neither route: `explode` has no identity rule, so there is
         // nothing to carry the position through it.
         assert_eq!(split(".a.b | explode | key"), None);
+        // #2558: a `?` head is part of the navigational head now, so the
+        // split finds one instead of stopping before it and declining.
+        assert_eq!(split(".a? | select(key == \"a\")"), Some((1, 1, Constants)));
+        assert_eq!(split(".a? | [path, parent]"), Some((1, 1, OwnedIdentity)));
+        assert_eq!(split(".a.b? | tostring | key"), Some((1, 2, OwnedIdentity)));
+        // ...but a `?` head that fans out is refused by the same guard every
+        // other fan-out head is.
+        assert_eq!(split(".[]? | .k | select(key == \"k\")"), None);
     }
 
     /// The absent-reachability fold behind reason 2.
@@ -26668,6 +26779,12 @@ mod tests {
         assert!(can("(.a, .[])"), "either branch");
         assert!(can(".[] | .a"));
         assert!(!can("."), "the pipe's input is a real node");
+        // #2558: `?` forwards its inner step's answer, which is what makes a
+        // `?` head routable at all.
+        assert!(can(".a?"));
+        assert!(can(".a?.b"));
+        assert!(!can(".a?[]"));
+        assert!(!can(".[]?"));
     }
 
     /// `key`/`parent`/`path` as cursor properties, straight from the tree,

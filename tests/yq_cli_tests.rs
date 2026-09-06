@@ -30939,16 +30939,16 @@ fn test_negative_index_out_of_range_survives_path_context_2254() -> Result<()> {
     // unaffected by the fix -- `?` is still a true no-op for either, not
     // just for the error case. Real yq v4.53.3 answers `1` -- the
     // *resolved* index -- for `.a[-1]? | key` on a two-element sequence
-    // (captured live); the `-1` pinned here is the eager path-context
-    // evaluator's own path component, which this `?` spelling still
-    // reaches (spine 2416: `?` over an index can hit an absent node, whose
-    // path only that evaluator carries). The un-`?` spelling already
-    // answers `1` through the cursor walk -- see
-    // `test_negative_index_path_component_is_resolved_in_yq_mode_2416` --
-    // and this row flips when the eager evaluator retires.
+    // (captured live, re-confirmed 2026-09-07). This row used to pin `-1`,
+    // the eager path-context evaluator's own path component, with the note
+    // that it "flips when the eager evaluator retires": #2558 is that flip.
+    // `?` over navigation is walkable now (`path_context_is_navigational`),
+    // so this spelling reaches the same cursor walk the un-`?` spelling
+    // already did (`test_negative_index_path_component_is_resolved_in_yq_
+    // mode_2416`), and both answer `1`.
     let (out, code) = run_yq_stdin(".a[-1]? | key", "a: [1, 2]\n", &["-o", "json"])?;
     assert_eq!(code, 0);
-    assert_eq!(out.trim(), "-1");
+    assert_eq!(out.trim(), "1");
     let (out, code) = run_yq_stdin(".a[5]? | key", "a: [1, 2]\n", &["-o", "json"])?;
     assert_eq!(code, 0);
     assert_eq!(out.trim(), "5");
@@ -37083,5 +37083,129 @@ fn test_yq_update_filter_reads_the_target_position_2522() -> Result<()> {
     assert_eq!(code, 0, "{output:?}");
     assert_eq!(output.trim(), r#"{"b":{"b":1,"e":2},"e":2}"#);
 
+    Ok(())
+}
+
+/// The flow-style document `test_optional_head_is_walkable_2558` captures on.
+const OPTIONAL_HEAD_FLOW_2558: &str = "{\"a\": {\"b\": 1}, \"c\": [10, 20], \"s\": \"hi\"}\n";
+
+/// The block-style spelling of [`OPTIONAL_HEAD_FLOW_2558`]. Every row below
+/// was captured on both, and yq v4.53.3 answers them identically -- style is
+/// not part of this rule, and asserting on both is what says so.
+const OPTIONAL_HEAD_BLOCK_2558: &str = "a:\n  b: 1\nc:\n  - 10\n  - 20\ns: hi\n";
+
+/// #2558 (spine 2416, gate reason 2): an optional head (`.a? | ...`) is
+/// walkable.
+///
+/// `path_context_is_navigational` used to exclude `Expr::Optional`, so
+/// `path_context_absent_split` found an empty head, declined, and
+/// `path_context_needs_eager` handed the whole pipe to the eager evaluator --
+/// which `docs/plan/path-context-arm-reachability.md` had measured as reason
+/// 2's single biggest source. `?` over navigation reaches the same positions
+/// the bare navigation does and produces *no* position for the step it
+/// suppresses, which is one arm in `path_context_step_generic`, not a second
+/// set of semantics.
+///
+/// Captured 2026-09-07 from Homebrew yq v4.53.3 (`yq -o=json -I=0`), on both
+/// documents above, byte-identical between the two:
+///
+/// ```text
+/// $ yq '.a? | key'                  "a"
+/// $ yq '.a? | path'                 ["a"]
+/// $ yq '.a.x? | key'                "x"
+/// $ yq '.a.x? | path'               ["a","x"]
+/// $ yq '.[0]? | key'                0
+/// $ yq '.[0]? | path'               [0]
+/// $ yq '.a? | select(key == "a")'   {"b":1}
+/// $ yq '.a? | [path, parent]'       [["a"],{"a":{"b":1},"c":[10,20],"s":"hi"}]
+/// $ yq '.a?.b | key'                "b"
+/// $ yq '(.a?) | key'                "a"
+/// $ yq '.a? | parent(2)'            (nothing)
+/// $ yq '.a? | parent'               {"a":{"b":1},"c":[10,20],"s":"hi"}
+/// $ yq '.s? | key'                  "s"
+/// $ yq '.s.b? | key'                (nothing)
+/// $ yq '.s.b? | path'               (nothing)
+/// $ yq '.c[0]? | key'               0
+/// $ yq '.c[5]? | key'               5
+/// $ yq '.c[-1]? | key'              1
+/// $ yq '.c[-5]? | key'              Error: index [-5] out of range, array size is 2   (exit 1)
+/// $ yq '.a? | .b = key'             {"b":"a"}
+/// $ yq '.a?[] | key'                "b"
+/// $ yq '.a? | .x? | key'            "x"
+/// $ yq '.a? | key + "x"'            "ax"
+/// $ yq '.a? | [key] + ["x"]'        ["a","x"]
+/// $ yq '.a? | key == "a" and true'  true
+/// $ yq '.a? | file_index + 1'       1
+/// $ yq '.a? | path + []'            ["a"]
+/// $ yq '.a? | {"k": key}'           {"k":"a"}
+/// $ yq '.a? | [path, parent(2)]'    [["a"]]
+/// $ yq '.[]? | key'                 "a" "c" "s"
+/// $ yq '.a?[]? | key'               "b"
+/// ```
+///
+/// Two of these were wrong before the migration and are the reason it is a
+/// fidelity fix as well as a routing one: `.c[-1]? | key` answered `-1` (the
+/// eager evaluator reports the index as written; the walk resolves it against
+/// the length, ADR-0021 decision 5) and `.a? | .b = key` answered `{"b":1}`
+/// (the assignment's right side had no position to read, ADR-0021 decision 7
+/// via the absent route). Both agree with yq now.
+///
+/// `.c[-5]? | key` is the row that says the `?` does not swallow everything:
+/// a yq-mode negative index still negative after resolving is
+/// `EvalError::is_uncatchable_at_value_position`, exactly as the eager
+/// evaluator's own `Expr::Optional` arm has it (#2254).
+#[test]
+fn test_optional_head_is_walkable_2558() -> Result<()> {
+    let args = &["-o", "json", "-I0"];
+    for doc in [OPTIONAL_HEAD_FLOW_2558, OPTIONAL_HEAD_BLOCK_2558] {
+        for (filter, expected) in [
+            (".a? | key", "\"a\""),
+            (".a? | path", "[\"a\"]"),
+            (".a.x? | key", "\"x\""),
+            (".a.x? | path", "[\"a\",\"x\"]"),
+            (".[0]? | key", "0"),
+            (".[0]? | path", "[0]"),
+            (".a? | select(key == \"a\")", "{\"b\":1}"),
+            (
+                ".a? | [path, parent]",
+                "[[\"a\"],{\"a\":{\"b\":1},\"c\":[10,20],\"s\":\"hi\"}]",
+            ),
+            (".a?.b | key", "\"b\""),
+            ("(.a?) | key", "\"a\""),
+            (".a? | parent(2)", ""),
+            (
+                ".a? | parent",
+                "{\"a\":{\"b\":1},\"c\":[10,20],\"s\":\"hi\"}",
+            ),
+            (".s? | key", "\"s\""),
+            (".s.b? | key", ""),
+            (".s.b? | path", ""),
+            (".c[0]? | key", "0"),
+            (".c[5]? | key", "5"),
+            (".c[-1]? | key", "1"),
+            (".a? | .b = key", "{\"b\":\"a\"}"),
+            (".a?[] | key", "\"b\""),
+            (".a? | .x? | key", "\"x\""),
+            (".a? | key + \"x\"", "\"ax\""),
+            (".a? | [key] + [\"x\"]", "[\"a\",\"x\"]"),
+            (".a? | key == \"a\" and true", "true"),
+            (".a? | file_index + 1", "1"),
+            (".a? | path + []", "[\"a\"]"),
+            (".a? | {\"k\": key}", "{\"k\":\"a\"}"),
+            (".a? | [path, parent(2)]", "[[\"a\"]]"),
+            (".[]? | key", "\"a\"\n\"c\"\n\"s\""),
+            (".a?[]? | key", "\"b\""),
+        ] {
+            let (output, code) = run_yq_stdin(filter, doc, args)?;
+            assert_eq!(code, 0, "`{filter}` on `{doc}`: {output:?}");
+            assert_eq!(output.trim_end(), expected, "`{filter}` on `{doc}`");
+        }
+        let (output, stderr, code) = run_yq_stdin_with_stderr(".c[-5]? | key", doc, args)?;
+        assert_eq!(code, 1, "`{doc}`: {output:?} {stderr:?}");
+        assert!(
+            stderr.contains("index [-5] out of range, array size is 2"),
+            "`{doc}`: {stderr:?}"
+        );
+    }
     Ok(())
 }
