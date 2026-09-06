@@ -6439,21 +6439,122 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 // already reflects whether any real output happened.
                 !output_buffer.is_empty()
             } else {
-                // #2276: `parse_input_m2_parity`, not plain `parse_input` --
-                // this is `--inplace`'s own DOM fallback, reached exactly
-                // when its M2 fast path declines JSON-sourced input.
-                let inputs = parse_input_m2_parity(&input_bytes, format)?;
+                // Two routes to the same `Vec<Vec<ResultWithComments>>`,
+                // picked by the file's *resolved* format (#1349).
+                //
+                // A YAML-sourced file goes through
+                // `evaluate_yaml_direct_filtered`, the cursor-native
+                // evaluator the stdout path has always used, so `--inplace`
+                // finally preserves what every other route does: comments,
+                // flow style, anchor marks, and #711's alias value sync.
+                // Before this, `-i '.a = 99'` on `a: &x 1\nb: *x` wrote
+                // `b: 1` where the identical query on stdout wrote `b: *x` --
+                // the same filter silently producing a different *value*
+                // depending on whether it edited the file or printed it.
+                //
+                // JSON-sourced files deliberately stay on the materializing
+                // `parse_input_m2_parity` route. `evaluate_yaml_direct_filtered`
+                // builds a `YamlIndex`, which accepts `[1,]` as a YAML flow
+                // sequence, so rerouting them would reopen exactly the hole
+                // #2276 closed (see
+                // `test_yq_inplace_fast_path_rejects_trailing_comma_leaves_file_untouched_2276`).
+                // JSON carries no comments, anchors or block style, so it
+                // gives up nothing by staying put.
+                let (doc_results, is_multi_doc) = if format == InputFormat::Json {
+                    // #2276: `parse_input_m2_parity`, not plain `parse_input`
+                    // -- this is `--inplace`'s own DOM fallback, reached
+                    // exactly when its M2 fast path declines JSON-sourced
+                    // input.
+                    let inputs = parse_input_m2_parity(&input_bytes, format)?;
+                    // Count matching docs for multi-doc separator logic
+                    let matching_docs: usize = if let Some(target_doc) = args.document {
+                        usize::from(
+                            (global_doc_index..global_doc_index + inputs.len())
+                                .contains(&target_doc),
+                        )
+                    } else {
+                        inputs.len()
+                    };
+                    let mut collected = Vec::new();
+                    for (local_idx, input) in inputs.iter().enumerate() {
+                        let current_doc_index = global_doc_index + local_idx;
+                        // Apply --doc filter if specified
+                        if let Some(target_doc) = args.document {
+                            if current_doc_index != target_doc {
+                                continue;
+                            }
+                        }
+                        let results = evaluate_input(input, &program.expr, &mut sink)?;
+                        // A JSON-sourced result has no presentation to carry:
+                        // the empty tree is exactly what `output_value`
+                        // received here before #1349.
+                        collected.push(
+                            results
+                                .into_iter()
+                                .map(|v| (v, CommentTree::empty()))
+                                .collect::<Vec<ResultWithComments>>(),
+                        );
+                        // halt/halt_error (#791): evaluate no further
+                        // documents in this file. `evaluate_yaml_direct_filtered`
+                        // makes the same check internally for the YAML arm.
+                        if sink.halted().is_some() {
+                            break;
+                        }
+                    }
+                    global_doc_index += inputs.len();
+                    (collected, matching_docs > 1)
+                } else {
+                    // Validation gate, result discarded (#1349). This is the
+                    // *same* call this route already made before rerouting,
+                    // kept for everything it rejects that the cursor-native
+                    // evaluator does not: #1749's colliding complex/
+                    // undecodable mapping keys (two different sequence keys
+                    // both stringify to `""`, and `OwnedValue::Object`'s
+                    // `IndexMap` would silently drop one), and #2276's M2
+                    // nesting-depth parity check.
+                    //
+                    // The collision check cannot simply move to the
+                    // cursor-native walk: `resolve_display_key`'s generic
+                    // `key_display_string_kind` only flags a key whose
+                    // *decode* failed, while a YAML complex key decodes
+                    // cleanly to `""`. Classifying it needs `YamlValue`'s own
+                    // `key_string_kind` (#1749), which is not on the
+                    // `DocumentValue` trait -- so the cursor-native route
+                    // silently drops one of the two, which is exactly what
+                    // this gate exists to prevent. Re-deriving that
+                    // classification here instead would duplicate a
+                    // predicate that must not drift.
+                    //
+                    // Costs no more than before: this route already
+                    // materialized every document to evaluate it, and now
+                    // materializes them to validate instead.
+                    let _validated = parse_input_m2_parity(&input_bytes, format)?;
+
+                    let (collected, num_docs) = evaluate_yaml_direct_filtered(
+                        &input_bytes,
+                        &program.expr,
+                        // `doc_filter`'s `(target, global_offset)` is exactly
+                        // the `--doc` arithmetic the JSON arm above does by
+                        // hand.
+                        args.document.map(|target| (target, global_doc_index)),
+                        &mut sink,
+                        DirectEvalOptions {
+                            need_comments: output_config.output_format == OutputFormat::Yaml,
+                            strip_style: args.pretty_print,
+                            sort_keys: output_config.sort_keys,
+                            mark_json_sourced: false,
+                        },
+                    )?;
+                    global_doc_index += num_docs;
+                    // Documents that produced no results are dropped by
+                    // `evaluate_yaml_direct_filtered`, so this counts
+                    // documents that will actually emit -- the same measure
+                    // the stdout DOM path uses for its own separators.
+                    let is_multi_doc = collected.len() > 1;
+                    (collected, is_multi_doc)
+                };
 
                 let mut buf_writer = BufWriter::new(&mut output_buffer);
-                // Count matching docs for multi-doc separator logic
-                let matching_docs: usize = if let Some(target_doc) = args.document {
-                    usize::from(
-                        (global_doc_index..global_doc_index + inputs.len()).contains(&target_doc),
-                    )
-                } else {
-                    inputs.len()
-                };
-                let is_multi_doc = matching_docs > 1;
 
                 // `--front-matter=process` opens its own leading `---` fence
                 // here; the body's closing fence + body text are appended
@@ -6481,21 +6582,15 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                 // too" bug in the DOM branch went unreachable until this
                 // fix made `Auto` resolve to `Yaml` for real.
                 let mut any_doc_output_this_file = false;
-                for (local_idx, input) in inputs.iter().enumerate() {
-                    let current_doc_index = global_doc_index + local_idx;
-                    // Apply --doc filter if specified
-                    if let Some(target_doc) = args.document {
-                        if current_doc_index != target_doc {
-                            continue;
-                        }
-                    }
-
-                    let results = evaluate_input(input, &program.expr, &mut sink)?;
+                // `--doc` filtering and halt-checking both happened while
+                // `doc_results` was built (#1349), in whichever arm produced
+                // it -- this loop only writes.
+                for results in &doc_results {
                     // `output_config` was already shadowed to `use_color:
                     // false` above — reused here rather than building a
                     // second, parallel no-color config.
                     let mut doc_had_output = false;
-                    for result in results {
+                    for (result, comments) in results {
                         // For regular multi-doc (without split_doc), add ---
                         // before each doc's first real output — not
                         // unconditionally before the doc is even evaluated.
@@ -6539,36 +6634,21 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                         // --eval-all arm above).
                         let split_separator =
                             split_doc_state.write_separator(&mut buf_writer, &output_config)?;
-                        any_truthy |=
-                            !matches!(&result, OwnedValue::Null | OwnedValue::Bool(false));
+                        any_truthy |= !matches!(result, OwnedValue::Null | OwnedValue::Bool(false));
                         let separator = split_separator.or_else(|| {
                             defer_to_nul_check.then_some(DocSeparatorArgs {
                                 doc_streamed: &mut any_doc_output_this_file,
                                 no_doc: output_config.no_doc,
                             })
                         });
-                        output_value(
-                            &mut buf_writer,
-                            &result,
-                            &CommentTree::empty(),
-                            &output_config,
-                            separator,
-                        )?;
+                        output_value(&mut buf_writer, result, comments, &output_config, separator)?;
                         if defer_to_nul_check {
                             doc_had_output = true;
                         }
                         any_real_output = true;
                     }
-                    // halt/halt_error (#791): still write this file's buffer
-                    // so far (below, matching the "prefix already output
-                    // survives" rule elsewhere), but evaluate no further
-                    // documents in this file or any other.
-                    if sink.halted().is_some() {
-                        break;
-                    }
                 }
                 buf_writer.flush()?;
-                global_doc_index += inputs.len();
                 any_real_output
             };
 

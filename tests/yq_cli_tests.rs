@@ -14741,9 +14741,16 @@ fn test_front_matter_process_inplace_rewrites_file() -> Result<()> {
     assert!(output.status.success());
 
     let rewritten = std::fs::read_to_string(input_file.path())?;
+    // #1349: `tags: [a, b]` keeps its flow style, exactly as the stdout
+    // twin of this test above already asserted. Until `--inplace` was
+    // routed through the cursor-native evaluator, this test pinned the very
+    // divergence #1349 reports -- the same filter losing presentation only
+    // because it edited the file instead of printing it. Verified against
+    // the pinned real `yq` binary: `yq --front-matter process -i` leaves
+    // the flow sequence alone.
     assert_eq!(
         rewritten,
-        "---\ntitle: New\ntags:\n  - a\n  - b\n---\n# Body\n\nSome text.\n"
+        "---\ntitle: New\ntags: [a, b]\n---\n# Body\n\nSome text.\n"
     );
     Ok(())
 }
@@ -34864,6 +34871,178 @@ mod issue_870_position_shifting_writes {
         let (output, exit_code) = run_yq_stdin("del(.arr[0]) | .n = 2", input, &[])?;
         assert_eq!(exit_code, 0);
         assert_eq!(output, "arr:\n  - y # cy\nn: 2\n");
+        Ok(())
+    }
+}
+
+// =============================================================================
+// #1349: `--inplace`'s DOM fallback dropped comments, style and anchors, and
+// skipped #711's alias value sync — so the same filter produced a different
+// document, and in the alias case a different *value*, depending only on
+// whether it edited the file or printed it.
+//
+// In its own module rather than appended at bare file end: two branches each
+// adding a `-> Result<()>` test here otherwise present git with identical
+// trailing `    Ok(())\n}\n` context on both sides, which it merges into one
+// function short a closing brace (this happened for real on #870).
+//
+// Every expectation is the pinned real `yq` (v4.53.3) output for the same
+// input and filter, captured live via `yq -i`.
+// =============================================================================
+mod issue_1349_inplace_presentation {
+    use super::*;
+
+    /// Run `filter` over `contents` with `-i` plus `extra_args`, and return
+    /// what the file holds afterwards.
+    fn inplace(contents: &str, filter: &str, extra_args: &[&str]) -> Result<String> {
+        let mut file = NamedTempFile::new()?;
+        write!(file, "{contents}")?;
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .arg("yq")
+            .arg("-i")
+            .args(extra_args)
+            .arg(filter)
+            .arg(file.path())
+            .stdin(Stdio::null())
+            .output()?;
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(std::fs::read_to_string(file.path())?)
+    }
+
+    /// The headline case, and the reason this is "silent wrong data" rather
+    /// than a presentation gap: `-i` used to write `b: 1` where the same
+    /// filter on stdout wrote `b: *x`. The alias was resolved to a stale
+    /// copy of the *pre-write* value, so the file disagreed with the query.
+    ///
+    /// $ yq -i '.a = 99'  =>  a: &x 99 / b: *x
+    #[test]
+    fn test_yq_inplace_dom_path_syncs_alias_value_1349() -> Result<()> {
+        assert_eq!(
+            inplace("a: &x 1\nb: *x\n", ".a = 99", &[])?,
+            "a: &x 99\nb: *x\n"
+        );
+        Ok(())
+    }
+
+    /// The same document under `-o=json`, where the marks are expanded and
+    /// only the *value* is observable: `b` must be 9, not the stale 1.
+    ///
+    /// $ yq -i -o=json '.a = 9'  =>  {"a": 9, "b": 9}
+    #[test]
+    fn test_yq_inplace_dom_path_json_output_syncs_alias_1349() -> Result<()> {
+        let out = inplace("a: &x 1\nb: *x\n", ".a = 9", &["-o=json"])?;
+        assert_eq!(out.replace([' ', '\n'], ""), "{\"a\":9,\"b\":9}");
+        Ok(())
+    }
+
+    /// A trailing comment on an untouched sibling survives the write.
+    ///
+    /// $ yq -i '.a = 99'  =>  a: 99 # ca / b: 2 # cb
+    #[test]
+    fn test_yq_inplace_dom_path_keeps_comments_1349() -> Result<()> {
+        assert_eq!(
+            inplace("a: 1 # ca\nb: 2 # cb\n", ".a = 99", &[])?,
+            "a: 99 # ca\nb: 2 # cb\n"
+        );
+        Ok(())
+    }
+
+    /// Flow style on an untouched sibling survives; before #1349 `-i`
+    /// expanded it to block style.
+    ///
+    /// $ yq -i '.b = 9'  =>  a: {p: 1, q: 2} / b: 9
+    #[test]
+    fn test_yq_inplace_dom_path_keeps_flow_style_1349() -> Result<()> {
+        assert_eq!(
+            inplace("a: {p: 1, q: 2}\nb: 3\n", ".b = 9", &[])?,
+            "a: {p: 1, q: 2}\nb: 9\n"
+        );
+        Ok(())
+    }
+
+    /// Multi-document files keep each document's own comments, and the `---`
+    /// separator bookkeeping still works off the rerouted results.
+    ///
+    /// The trailing `a: 9` is not a duplicated document: `.a = 9` *creates*
+    /// `a` in the second document, which has none. Real yq prints exactly
+    /// this, and so does succinctly's own stdout path.
+    ///
+    /// $ yq -i '.a = 9'  =>  a: 9 # c1 / --- / b: 2 # c2 / a: 9
+    #[test]
+    fn test_yq_inplace_dom_path_multi_doc_1349() -> Result<()> {
+        assert_eq!(
+            inplace("a: 1 # c1\n---\nb: 2 # c2\n", ".a = 9", &[])?,
+            "a: 9 # c1\n---\nb: 2 # c2\na: 9\n"
+        );
+        // `|=` behaves the same way: the second document's absent `.a`
+        // updates from null, so it gains `a: 1`, and its own comment is
+        // untouched either way.
+        //
+        // $ yq -i '.a |= . + 1'  =>  a: 2 # c1 / --- / b: 2 # c2 / a: 1
+        assert_eq!(
+            inplace("a: 1 # c1\n---\nb: 2 # c2\n", ".a |= . + 1", &[])?,
+            "a: 2 # c1\n---\nb: 2 # c2\na: 1\n"
+        );
+        Ok(())
+    }
+
+    /// `del()` reaches the same rerouted path, and the anchor soundness pass
+    /// runs on it: `&x` is deleted, so `b`'s mark cannot resolve and the
+    /// value is printed instead (#763's documented divergence from yq, which
+    /// emits a dangling `*x` it cannot re-read).
+    #[test]
+    fn test_yq_inplace_dom_path_del_runs_anchor_soundness_1349() -> Result<()> {
+        assert_eq!(inplace("a: &x 1\nb: *x\n", "del(.a)", &[])?, "b: 1\n");
+        Ok(())
+    }
+
+    /// The whole point of the fix stated as an invariant: for a YAML file,
+    /// `-i` must write exactly what the same filter prints to stdout.
+    #[test]
+    fn test_yq_inplace_matches_stdout_for_the_same_filter_1349() -> Result<()> {
+        let cases = [
+            ("a: &x 1\nb: *x\n", ".a = 99"),
+            ("a: 1 # ca\nb: 2 # cb\n", ".a = 99"),
+            ("a: {p: 1, q: 2}\nb: 3\n", ".b = 9"),
+            ("a: &x 1\nb: *x\nc: 3\n", "del(.c)"),
+            ("list:\n  - x # cx\n  - y\n", ".list[1] = \"z\""),
+        ];
+        for (input, filter) in cases {
+            let (stdout, code) = run_yq_stdin(filter, input, &[])?;
+            assert_eq!(code, 0, "{filter}");
+            assert_eq!(
+                inplace(input, filter, &[])?,
+                stdout,
+                "-i and stdout must agree for `{filter}` on {input:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The JSON carve-out: a JSON-sourced `-i` file stays on the
+    /// materializing route, so #2276's trailing-comma rejection still holds.
+    /// Rerouting it through a `YamlIndex` would accept `[1,]` as a flow
+    /// sequence and silently rewrite the file.
+    #[test]
+    fn test_yq_inplace_json_source_still_rejects_trailing_comma_1349() -> Result<()> {
+        let mut file = NamedTempFile::new()?;
+        write!(file, "[1,]")?;
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .arg("yq")
+            .args(["-i", "-p=json", "."])
+            .arg(file.path())
+            .stdin(Stdio::null())
+            .output()?;
+        assert!(!output.status.success(), "must not accept `[1,]` as JSON");
+        assert_eq!(
+            std::fs::read_to_string(file.path())?,
+            "[1,]",
+            "the file must be left byte-identical"
+        );
         Ok(())
     }
 }
