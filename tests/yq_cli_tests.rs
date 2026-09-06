@@ -35840,3 +35840,44 @@ fn test_yaml_write_through_alias_leaves_json_input_alone_1351() -> Result<()> {
     assert_eq!(output.trim(), r#"{"a":{"p":1},"b":{"p":9}}"#);
     Ok(())
 }
+
+/// #2471 (gate reason 1 of spine 2416): an assignment's right-hand side stands
+/// where the **assignment's own input** stands.
+///
+/// `eval_assign` hands the right side the same value the whole stage received,
+/// so `.a | .b = key` writes `"a"` -- the key of `.a` -- and not `"b"`. Every
+/// row was captured from yq v4.53.3 (`-o=json -I0`) on
+/// `ASSIGN_RHS_DOC_2471`; before this change `needs_path_context` did not
+/// descend into an assignment's right side, so every one of them left the
+/// target untouched.
+const ASSIGN_RHS_DOC_2471: &str = "a: {b: 1, e: 2}\nn: [1, 2]\n";
+
+const ASSIGN_RHS_ROWS_2471: &[(&str, &str)] = &[
+    (".a | .b = key", r#"{"b":"a","e":2}"#),
+    (".a | .b = path", r#"{"b":["a"],"e":2}"#),
+    (".a.b | . = key", r#""b""#),
+    (".a.b | . = path", r#"["a","b"]"#),
+    (
+        ".a | to_entries | .[0] | .value = key",
+        r#"{"key":"b","value":0}"#,
+    ),
+    (
+        ".a | to_entries | .[0] | .value = path",
+        r#"{"key":"b","value":["a",0]}"#,
+    ),
+    (
+        ".a | to_entries | .[0] | .key = key",
+        r#"{"key":0,"value":1}"#,
+    ),
+];
+
+#[test]
+fn test_assignment_rhs_sees_the_input_position_2471() -> Result<()> {
+    let args = &["-o", "json", "-I0"];
+    for (filter, expected) in ASSIGN_RHS_ROWS_2471 {
+        let (output, code) = run_yq_stdin(filter, ASSIGN_RHS_DOC_2471, args)?;
+        assert_eq!(code, 0, "`{filter}`: {output:?}");
+        assert_eq!(output.trim_end(), *expected, "`{filter}`");
+    }
+    Ok(())
+}
