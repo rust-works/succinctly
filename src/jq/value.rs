@@ -490,14 +490,39 @@ pub fn format_number_jq_compat(raw: &[u8]) -> String {
 /// switches to exponential notation, so a computed value like `1e100` used to
 /// come out as a 101-digit decimal expansion where real jq 1.7.1 prints
 /// `1e+100`.
+///
+/// `f` must be finite, like [`jq_float_is_scientific`] -- NaN/Infinity have
+/// no JSON spelling here and must be special-cased by the caller (every
+/// current call site already does, via `is_nan()`/`is_infinite()` upstream).
 #[must_use]
 pub fn jq_bare_float_display(f: f64) -> String {
-    if !jq_float_is_scientific(f) {
+    // Parsed once and reused for both the threshold decision and the
+    // eventual render -- `jq_float_is_scientific` alone would need this same
+    // `format!("{f:e}")` a second time on every value that actually takes
+    // the scientific branch.
+    let (mantissa, exp) = jq_float_digits(f);
+    if !jq_float_is_scientific_from_digits(&mantissa, exp) {
         return f.to_string();
     }
-    // Only the scientific branch needs the exponential rendering -- an
-    // everyday-magnitude value never pays for a string it would immediately
-    // discard, matching yq's own `format_float_yq_with` (`src/yaml/light.rs`).
+    let sign = if exp < 0 { '-' } else { '+' };
+    format!("{mantissa}e{sign}{:02}", exp.unsigned_abs())
+}
+
+/// Splits `f`'s shortest round-tripping decimal (via Rust's own exponential
+/// formatter) into its normalized mantissa text and base-10 exponent --
+/// shared by [`jq_bare_float_display`] and [`jq_float_is_scientific`] so
+/// they agree on the same underlying digits by construction, not by two
+/// independent implementations kept in sync by hand.
+///
+/// `f` must be finite -- NaN/Infinity render as `"NaN"`/`"inf"` here, which
+/// contain no `'e'` and would panic the `split_once` below regardless of
+/// build profile, not just under `debug_assert`.
+fn jq_float_digits(f: f64) -> (String, i64) {
+    debug_assert!(
+        f.is_finite(),
+        "jq_float_digits requires a finite value; NaN/Infinity have no JSON \
+         spelling here and must be special-cased by the caller"
+    );
     let sci = format!("{f:e}");
     let (mantissa, exp_str) = sci
         .split_once('e')
@@ -505,8 +530,7 @@ pub fn jq_bare_float_display(f: f64) -> String {
     let exp: i64 = exp_str
         .parse()
         .expect("exponent from Rust's exponential formatter is always a valid i64");
-    let sign = if exp < 0 { '-' } else { '+' };
-    format!("{mantissa}e{sign}{:02}", exp.unsigned_abs())
+    (mantissa.to_string(), exp)
 }
 
 /// Whether real jq would spell a computed `f64` in scientific notation
@@ -521,25 +545,24 @@ pub fn jq_bare_float_display(f: f64) -> String {
 /// `decpt <= -4` or `decpt > ndigits + 15`. Oracle-verified against jq 1.7.1
 /// across a matrix of magnitudes and digit counts straddling both boundaries
 /// (`1e15`/`1e16`, `1e-4`/`1e-5`, and multi-digit mantissas at each) --
-/// pinned by `jq_float_is_scientific_agrees_with_the_pinned_oracle`.
+/// pinned by `test_jq_float_scientific_threshold_matches_pinned_oracle_2456`
+/// (via [`jq_bare_float_display`], which shares this exact decision).
 ///
 /// `f` must be finite; 0.0 always takes the ordinary branch (`{:e}` renders
 /// it `0e0`, `ndigits = 1`, `decpt = 1`, well inside the ordinary range).
 #[must_use]
-pub(crate) fn jq_float_is_scientific(f: f64) -> bool {
-    debug_assert!(
-        f.is_finite(),
-        "jq_float_is_scientific requires a finite value; NaN/Infinity have no \
-         JSON spelling here and must be special-cased by the caller"
-    );
-    let sci = format!("{f:e}");
-    let (mantissa, exp_str) = sci
-        .split_once('e')
-        .expect("Rust's exponential formatter always includes a lowercase 'e'");
+pub fn jq_float_is_scientific(f: f64) -> bool {
+    let (mantissa, exp) = jq_float_digits(f);
+    jq_float_is_scientific_from_digits(&mantissa, exp)
+}
+
+/// The threshold decision itself, taking [`jq_float_digits`]'s own output
+/// directly -- split out so [`jq_bare_float_display`] can reuse one parse of
+/// `f` for both the decision and the render, while [`jq_float_is_scientific`]
+/// stays available as a standalone predicate for anything that only needs
+/// the bool.
+fn jq_float_is_scientific_from_digits(mantissa: &str, exp: i64) -> bool {
     let ndigits = mantissa.bytes().filter(u8::is_ascii_digit).count() as i64;
-    let exp: i64 = exp_str
-        .parse()
-        .expect("exponent from Rust's exponential formatter is always a valid i64");
     let decpt = exp + 1;
     decpt <= -4 || decpt > ndigits + 15
 }
@@ -3280,6 +3303,12 @@ mod tests {
             (1e-6, "1e-06"),
             (0.0, "0"),
         ] {
+            let expect_scientific = want.contains('e');
+            assert_eq!(
+                jq_float_is_scientific(f),
+                expect_scientific,
+                "jq_float_is_scientific for {f:e}"
+            );
             assert_eq!(jq_bare_float_display(f), want, "for {f:e}");
             assert_eq!(
                 jq_bare_float_display(-f),
