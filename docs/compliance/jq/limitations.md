@@ -3263,65 +3263,64 @@ to answer it directly against the `OwnedValue` tree, reusing the same
 measured directly at `REDUCE_FOREACH_MAX_STEPS` (`100000`) after that fix:
 ~0.17s, down from ~7.8s, a ~45x constant-factor win.
 
-**This is not an asymptotic fix -- the fold remains O(n²) after #2086,
-just with a much smaller constant.** The new arm still calls `input.clone()`
-on the whole accumulator every step before handing it to `arith_combine`
-(`eval_owned_fast_path`'s `&OwnedValue` signature leaves no other option),
-and `String`/`Vec::clone()` allocates at exact capacity with no spare
-headroom, so the very next `push_str`/`extend` inside `arith_add`
-reallocates a second time regardless -- two O(current-size) copies per
-step either way, just memcpy instead of serialize/parse. Measured post-fix
-scaling curve (interleaved runs, net of process-startup floor,
-`reduce range(N) as $x (""; . + "x") | length`):
+**#2086 was not an asymptotic fix -- the fold remained O(n²), just with a
+much smaller constant** (the new arm still called `input.clone()` on the
+whole accumulator every step before handing it to `arith_combine`, since
+`eval_owned_fast_path`'s `&OwnedValue` signature left no other option, and
+`String`/`Vec::clone()` allocates at exact capacity with no spare headroom,
+so the very next `push_str`/`extend` inside `arith_add` reallocated a
+second time regardless -- two O(current-size) copies per step either way,
+just memcpy instead of serialize/parse).
 
-| N | net time | time/N |
+[#2157](https://github.com/rust-works/succinctly/issues/2157) fixed the
+remaining O(n²) shape for the two call sites that actually matter --
+`try_reduce_step_alternatives`/`try_foreach_step_alternatives`'s own fold
+loops, where the accumulator `state: OwnedValue` is confirmed unaliased
+(unconditionally overwritten immediately after this call, with no live
+borrow of the old value surviving) -- via a new `try_owned_accumulator_step`
+that recognizes the same `. + <literal>`-shaped UPDATE body
+(`owned_arith_accumulator_shape`) but, unlike `eval_owned_fast_path`, takes
+`state` *by value* and moves it straight into `arith_combine`, so
+`arith_add`'s in-place `push_str`/`extend`/`Object` merge can reuse the
+accumulator's own spare capacity instead of being handed a fresh
+exact-capacity clone every step. `eval_owned_fast_path`'s own arm (and its
+other 3 call sites -- `eval_each_owned`, `eval_owned_expr_full`,
+`eval_owned_input`, none of which hold state this unaliased) is deliberately
+left unchanged and still clones; the fix is scoped to the fold loop, not a
+signature change to the shared function.
+
+Measured post-fix scaling curve (`reduce range(N) as $x (""; . + "x") |
+length`, wall-clock via bash's `time` builtin, output verified identical to
+pre-fix at every N):
+
+| N | pre-#2157 | post-#2157 |
 |---|---|---|
-| 6,250 | 1.89ms | 0.30µs |
-| 12,500 | 4.74ms | 0.38µs |
-| 25,000 | 13.53ms | 0.54µs |
-| 50,000 | 35.24ms | 0.71µs |
-| 99,999 | 133.58ms | 1.34µs |
+| 6,250 | 6ms | 6ms |
+| 12,500 | 9ms | 7ms |
+| 25,000 | 18ms | 10ms |
+| 50,000 | 38ms | 16ms |
+| 99,999 | 135ms | 29ms |
 
-Per-step cost keeps rising (0.30µs -> 1.34µs, a 4.4x increase over a 16x
-range of N) and the last doubling (50,000 -> 99,999) costs ~3.8x -- both
-the signature of O(n²), not O(n) (which would show flat per-step cost and a
-~2x doubling ratio). Pushing further past `REDUCE_FOREACH_MAX_STEPS` (via
-array input rather than `range()`, which has its own separate cap) confirms
-the trend continues: 100,000 -> 200,000 -> 300,000 -> 400,000 elements
-measured 0.15s -> 0.47s -> 1.07s -> 2.9s, a ~19x wall-clock increase for a
-4x increase in N. A true O(n) fix needs the fold's already-fully-owned
-accumulator state (confirmed unaliased at the one call site that matters,
-`try_reduce_step_alternatives`) passed *by value* into arithmetic so
-`arith_add`'s existing in-place `push_str`/`extend` can reuse capacity
-instead of being handed a fresh clone every step -- out of scope for #2086
-since `eval_owned_fast_path` is shared by 3 call sites (`eval_each_owned`,
-`eval_owned_expr_full`, `eval_owned_input`) that all need `input` back on
-the fallback branch, not just the one new arm; tracked as
-[#2157](https://github.com/rust-works/succinctly/issues/2157).
+Pre-fix time roughly doubles-plus per doubling of N throughout (the O(n²)
+signature); post-fix growth is close to linear once the ~5-6ms
+process-startup floor is netted out (net time 6,250->99,999: ~1ms->~24ms,
+a 16x range of N for a ~24x time increase, vs. pre-fix's ~1ms->~130ms net,
+a ~130x increase over the same range).
 
-Array/object-accumulating shapes (`reduce ... as $x ([]; . + [$x])`) were
-**not** covered by #2086's fix at all -- after substitution the right-hand
-side is an `Expr::Array`/`Expr::Object` construction wrapping a `Literal`,
-not a bare `Literal` itself, so it fell through to the same slow path, and
-measured *worse* than the string case ever did (~36s at just 25,000
-elements). Closed by [#2152](https://github.com/rust-works/succinctly/issues/2152)'s
-`literal_shaped_expr_to_owned` (`eval.rs`), which extends the same
-`eval_owned_fast_path` arm to recognize an `Expr::Array`/`Expr::Object`
-right-hand side whose every leaf is itself a `Literal` (or, for a dynamic
-object key, resolves to one), converting it to an `OwnedValue` directly the
-same way `literal_to_owned` already does for the scalar case, then reusing
-`arith_combine` exactly as #2086's own arm does -- no new arithmetic
-semantics, only a new way to build the operand. Same "constant factor, not
-asymptotic" caveat as #2086's own fix above applies here too (still calls
-`input.clone()` per step, #2157's own residual is unchanged) -- measured
-directly: 25,000-element array accumulation dropped from ~38.8s to ~6.0-6.6s
-(~6x), and the analogous object-accumulator idiom
-(`reduce ... as $x ({}; . + {($x): v})`) went from *not completing inside
-60s* to ~6.3s at the same N. Interleaved A/B at two sizes confirms the same
-quadratic shape survives at a smaller constant, matching #2157's own
-finding for the string case (5,000: ~1.36s -> ~0.25s, 10,000: ~5.77s ->
-~0.91s -- before roughly quadruples per doubling of N, after roughly
-triples).
+**Bonus, not part of #2157's own stated scope**: `owned_arith_accumulator_shape`
+calls the same `literal_shaped_expr_to_owned` [#2152](https://github.com/rust-works/succinctly/issues/2152)
+already extended to recognize literal-shaped `Expr::Array`/`Expr::Object`
+right-hand sides, so the array/object-accumulator idioms #2152 closed at
+the *constant-factor* level (still cloning via `eval_owned_fast_path`) get
+the same by-value treatment at these two fold-loop call sites, for free --
+confirmed live: `reduce range(25000) as $x ([]; . + [$x]) | length` dropped
+from ~1.25s to ~0.013s (~96x), and `reduce (range(5000) | tostring) as $x
+({}; . + {($x): $x}) | length` dropped from ~0.42s to ~0.010s (~42x), both
+with output verified identical pre/post-fix. A dynamic object key that
+itself isn't literal-shaped after substitution (e.g. `($x | tostring)`
+evaluated *inside* the fold body rather than on the outer generator) still
+falls through to the slow general path in both builds -- `literal_shaped_expr_to_owned`
+was, and remains, unchanged by #2157.
 
 **One correction to the AST shape this issue's own text guessed, confirmed
 live via a debug probe against the real repro rather than assumed**: a
@@ -3394,10 +3393,12 @@ shape `eval_owned_fast_path` doesn't cover): `[0,""] | until(.[0] >= N;
 [.[0]+1, .[1] + "x"]) | .[1] | length` measures ~15-16s at N approaching the
 new `100000` ceiling in this build, against real jq's own apparently-linear
 ~0.1-0.2s at the same N (confirmed live). #2086's fix (see the previous
-section -- a constant-factor win, not an asymptotic one; #2157 tracks the
-remaining O(n²) shape) brought that analogous `reduce` figure down from
-~7.8s to ~0.17s for `reduce`/`foreach`'s *bare* accumulator shape
-(`. + <literal>`) -- but this `until`/`while` repro's own state is
+section -- a constant-factor win, not an asymptotic one; #2157 fixed the
+remaining O(n²) shape, but only at `reduce`/`foreach`'s own fold-loop call
+sites, not `eval_owned_fast_path` itself, so `until`/`while`'s separate
+step mechanism below is unaffected by it either way) brought that analogous
+`reduce` figure down from ~7.8s to ~0.17s for `reduce`/`foreach`'s *bare*
+accumulator shape (`. + <literal>`) -- but this `until`/`while` repro's own state is
 array-wrapped (`[.[0]+1, .[1] + "x"]`, since a loop needs a counter *and* an
 accumulator, unlike `reduce`/`foreach`'s cleanly separate INIT-vs-`$x`
 shape), so neither inner arithmetic's left operand is the bare `.`
