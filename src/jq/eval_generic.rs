@@ -43,14 +43,14 @@ use super::eval::{
     extract_pattern_bindings, fold_escaped_generator_prefix, format_owned,
     has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
     index_one_owned as index_owned_by_key, is_pure_chain_link, is_retryable_stop, literal_to_owned,
-    needs_path_context, numeric_key_to_array_index, numeric_key_to_index, owned_bound_to_i64,
-    owned_to_string, prefer_pending_control, slice_component_value, slice_object_as_yq_children,
-    slice_owned_value_read, streams_escaped_generator_prefix, substitute_bound_var,
-    substitute_vars, suppress_or_raise, suppresses, tonumber_from_str, vec_with_capacity,
-    yq_absent_key_read_is_empty, yq_empty_operand_output, yq_negative_index_check,
-    yq_numeric_index_on_object_is_null, yq_read_only_context, BinaryFanoutRules, Control, Demand,
-    EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail,
-    QueryResult, YqSemantics,
+    needs_path_context, numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned,
+    owned_bound_to_i64, owned_to_string, prefer_pending_control, slice_component_value,
+    slice_object_as_yq_children, slice_owned_value_read, streams_escaped_generator_prefix,
+    substitute_bound_var, substitute_vars, suppress_or_raise, suppresses, tonumber_from_str,
+    vec_with_capacity, yq_absent_key_read_is_empty, yq_empty_operand_output,
+    yq_negative_index_check, yq_numeric_index_on_object_is_null, yq_read_only_context,
+    BinaryFanoutRules, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
+    JqSemantics, LimitN, PathTrail, QueryResult, YqSemantics,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -13981,13 +13981,14 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     Err(err) => GenericResult::Error(err),
                 }
             } else if let Some(i) = value.as_i64() {
-                // checked_abs: i64::MIN has no i64 absolute value; use f64
-                GenericResult::Owned(match i.checked_abs() {
-                    Some(a) => OwnedValue::Int(a),
-                    None => OwnedValue::Float(-(i as f64)),
-                })
+                // Reached only for a value with no source text of its own
+                // to answer from (`as_str()` above already declined) --
+                // `numeric_length_owned`'s doc comment (`eval.rs`) has the
+                // full jq-vs-yq rule and why it's one shared definition
+                // (#2453).
+                GenericResult::Owned(numeric_length_owned::<S>(OwnedValue::Int(i)))
             } else if let Some(f) = value.as_f64() {
-                GenericResult::Owned(OwnedValue::Float(f.abs()))
+                GenericResult::Owned(numeric_length_owned::<S>(OwnedValue::Float(f)))
             } else {
                 decode_failure_or(&value, optional, || {
                     GenericResult::Error(EvalError::has_no_length(&to_owned_for_diagnostic(

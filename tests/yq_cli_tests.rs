@@ -35882,6 +35882,88 @@ fn test_assignment_rhs_sees_the_input_position_2471() -> Result<()> {
     Ok(())
 }
 
+/// #2453: `length` of a number disagreed between the plain-navigation path
+/// and any path that forces materialization first (a comma fan-out, an
+/// array/object literal, `to_entries`, arithmetic) -- the plain path used
+/// yq's own rule (the width of the number's rendering), the materialized
+/// path fell back to jq's absolute-value rule. Both now consult one
+/// definition (`numeric_length_owned` in `src/jq/eval.rs`): jq's
+/// absolute-value rule in jq mode, the character width of yq's own
+/// rendering in yq mode. A YAML scalar's raw source text answers directly
+/// when a cursor is still live (`22`'s own bytes are already `"22"`), so
+/// this rule only has work to do once that source text is gone.
+///
+/// Every row live-captured against yq v4.53.3 on
+/// `LENGTH_NUMBER_DOC_2453` (`a: 1`, `b: 22`, `neg: -5`, `negd: -22`,
+/// `flt: 0.5`, `exp: 1e3`, `ftag: !!float 2`, `qstr: "22"`, `zero: 0`):
+///
+/// ```text
+/// $ yq '.a | length'      => 1     $ yq '.b | length'    => 2
+/// $ yq '.neg | length'    => 2     $ yq '.negd | length' => 3
+/// $ yq '.flt | length'    => 3     $ yq '.exp | length'  => 3   (raw "1e3", not "1000")
+/// $ yq '.ftag | length'   => 1     $ yq '.qstr | length' => 2   (already a string, unaffected)
+/// $ yq '.zero | length'   => 1
+/// ```
+///
+/// And the shapes that force materialization before `length` runs, on
+/// `a: 1` / `b: 22`:
+///
+/// ```console
+/// $ yq -o=json -I0 '[.a, .b] | .[] | length'          # 1 / 2   (was 1 / 22 before this fix)
+/// $ yq -o=json -I0 '(.a, .b) | [.] | .[0] | length'    # 1 / 2   (was 1 / 22)
+/// $ yq '.a + 0 | length'                               # 1
+/// $ yq '.b + 0 | length'                               # 2       (was 22)
+/// $ yq -o=json -I0 'to_entries | .[].value | length'   # 1 / 2   (was 1 / 22)
+/// $ yq '(0 - .b) | length'                             # 3       (a computed negative: "-22")
+/// $ yq '(.b * 1.0) | length'                           # 2       (a computed float rendering as "22", not "22.0")
+/// $ yq '(1.5 + 1.5) | length'                          # 1       (a computed float rendering as "3", not "3.0")
+/// ```
+///
+/// jq mode is unchanged and pinned separately in `jq_cli_tests.rs`
+/// (`test_jq_length_of_a_number_is_unaffected_2453`) -- jq's absolute-value
+/// rule already agreed across both paths before this fix.
+const LENGTH_NUMBER_DOC_2453: &str =
+    "a: 1\nb: 22\nneg: -5\nnegd: -22\nflt: 0.5\nexp: 1e3\nftag: !!float 2\nqstr: \"22\"\nzero: 0\n";
+
+#[test]
+fn test_yq_length_of_a_number_is_its_rendered_width_2453() -> Result<()> {
+    let args = &["-o", "json", "-I0"];
+
+    for (filter, expected) in [
+        (".a | length", "1"),
+        (".b | length", "2"),
+        (".neg | length", "2"),
+        (".negd | length", "3"),
+        (".flt | length", "3"),
+        (".exp | length", "3"),
+        (".ftag | length", "1"),
+        (".qstr | length", "2"),
+        (".zero | length", "1"),
+    ] {
+        let (out, code) = run_yq_stdin(filter, LENGTH_NUMBER_DOC_2453, args)?;
+        assert_eq!(code, 0, "`{filter}`: {out:?}");
+        assert_eq!(out.trim(), expected, "`{filter}`");
+    }
+
+    let ab_doc = "a: 1\nb: 22\n";
+    for (filter, expected) in [
+        ("[.a, .b] | .[] | length", "1\n2"),
+        ("(.a, .b) | [.] | .[0] | length", "1\n2"),
+        (".a + 0 | length", "1"),
+        (".b + 0 | length", "2"),
+        ("to_entries | .[].value | length", "1\n2"),
+        ("(0 - .b) | length", "3"),
+        ("(.b * 1.0) | length", "2"),
+        ("(1.5 + 1.5) | length", "1"),
+    ] {
+        let (out, code) = run_yq_stdin(filter, ab_doc, args)?;
+        assert_eq!(code, 0, "`{filter}`: {out:?}");
+        assert_eq!(out.trim(), expected, "`{filter}`");
+    }
+
+    Ok(())
+}
+
 /// #2471 (gate reason 1 of spine 2416): a map-family body stands at its own
 /// **member's** position, not at its container's.
 ///
