@@ -35911,6 +35911,47 @@ fn test_yaml_nested_groups_sync_to_a_fixpoint_1351() -> Result<()> {
 }
 
 #[test]
+fn test_yaml_new_key_compound_and_comma_writes_through_alias_2530() -> Result<()> {
+    // #2530: #2481 creates an assignment's targets before its right-hand side
+    // runs; the redirect has to happen before that creation or the new key
+    // lands on the alias copy and the copy no longer equals the anchor.
+    // Every expected string captured from yq v4.53.3.
+    assert_yq_1351(
+        ".b.p += 1",
+        "a: &x {s: [1, 2]}\nb: *x\n",
+        "a: &x {s: [1, 2], p: 1}\nb: *x\n",
+        r#"{"a":{"s":[1,2],"p":1},"b":{"s":[1,2],"p":1}}"#,
+    )?;
+    assert_yq_1351(
+        "(.b, .c).p = 2",
+        ALIAS_MAP_DOC_1351,
+        "a: &x {p: 2, q: 2}\nb: *x\nc: *x\n",
+        r#"{"a":{"p":2,"q":2},"b":{"p":2,"q":2},"c":{"p":2,"q":2}}"#,
+    )?;
+    assert_yq_1351(
+        "(.b, .c).r = 3",
+        ALIAS_MAP_DOC_1351,
+        "a: &x {p: 1, q: 2, r: 3}\nb: *x\nc: *x\n",
+        r#"{"a":{"p":1,"q":2,"r":3},"b":{"p":1,"q":2,"r":3},"c":{"p":1,"q":2,"r":3}}"#,
+    )?;
+    // A new key written through the alias, then an anchor write: both slots
+    // stay in step because the created key was mirrored into the copy.
+    assert_yq_1351(
+        ".a.p = 9 | .b.p = 9 | .a.q = 7",
+        "a: &x {s: [1, 2]}\nb: *x\n",
+        "a: &x {s: [1, 2], p: 9, q: 7}\nb: *x\n",
+        r#"{"a":{"s":[1,2],"p":9,"q":7},"b":{"s":[1,2],"p":9,"q":7}}"#,
+    )?;
+    // Multi-hop with a new key on every position.
+    assert_yq_1351(
+        ".[] .p += 1",
+        "x: &y {z: 0}\na: &x {q: *y}\nb: *x\n",
+        "x: &y {z: 0, p: 1}\na: &x {q: *y, p: 2}\nb: *x\n",
+        r#"{"x":{"z":0,"p":1},"a":{"q":{"z":0,"p":1},"p":2},"b":{"q":{"z":0,"p":1},"p":2}}"#,
+    )
+}
+
+#[test]
 fn test_yaml_deleted_declaration_writes_positionally_1351() -> Result<()> {
     // Rule 7, a recorded limitation: with the anchor deleted earlier in the
     // pipe there is no declaration to redirect to, so `.b.p = 9` is
