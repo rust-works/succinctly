@@ -25370,12 +25370,11 @@ fn test_yaml_diverged_alias_in_sequence_prints_no_duplicate_anchor_2500() -> Res
 /// #2500: a nested *alias reference* reached through a diverged alias's
 /// expanded copy is not a copied declaration and must survive as `*base`,
 /// not inline the target's value -- see `to_owned_with_comments_at_depth`'s
-/// own doc comment for why only a `Declares` mark is dropped. `.prod.name`
-/// writes through the `prod` alias on this branch, diverging its expanded
-/// copy (issue 1351 will later redirect this particular write onto `.env`
-/// instead, at which point `.prod` would stay `*env` and never reach the
-/// expanded-copy path at all) -- named for the mechanism rather than this
-/// specific write shape so it keeps meaning either way.
+/// own doc comment for why only a `Declares` mark is dropped. With #1351's
+/// redirect a write through `.prod` lands on `.env`, so the copy is diverged
+/// here by deleting the declaration first (`del(.env)`): the later
+/// `.prod.name` write has nothing to redirect to and stays positional, and
+/// real yq prints the unreadable `prod: *env` for this shape.
 #[test]
 fn test_yaml_alias_subtree_keeps_nested_alias_marks_2500() -> Result<()> {
     let input = concat!(
@@ -25387,7 +25386,7 @@ fn test_yaml_alias_subtree_keeps_nested_alias_marks_2500() -> Result<()> {
         "  name: dev\n",
         "prod: *env\n",
     );
-    let (output, exit_code) = run_yq_stdin(r#".prod.name = "prod""#, input, &[])?;
+    let (output, exit_code) = run_yq_stdin(r#"del(.env) | .prod.name = "prod""#, input, &[])?;
     assert_eq!(exit_code, 0, "output: {output:?}");
     assert_eq!(
         output,
@@ -25395,9 +25394,6 @@ fn test_yaml_alias_subtree_keeps_nested_alias_marks_2500() -> Result<()> {
             "base: &base\n",
             "  host: h\n",
             "  port: 1\n",
-            "env: &env\n",
-            "  cfg: *base\n",
-            "  name: dev\n",
             "prod:\n",
             "  cfg: *base\n",
             "  name: prod\n",
