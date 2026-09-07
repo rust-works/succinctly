@@ -2199,8 +2199,9 @@ use crate::jq::document::{
 use crate::jq::escape::{write_json_body_jq, write_json_body_yq};
 use crate::jq::stream::{StreamFailure, StreamResult};
 use crate::jq::{
-    format_number_jq_compat, nesting_depth_exceeded_message, nonfinite_display_string, EvalError,
-    JqSemantics, OwnedValue, YqSemantics, MAX_VALUE_TREE_DEPTH,
+    format_number_jq_compat, is_jq_canonical_number, nesting_depth_exceeded_message,
+    nonfinite_display_string, EvalError, JqSemantics, OwnedValue, YqSemantics,
+    MAX_VALUE_TREE_DEPTH,
 };
 
 /// A [`JsonError`] as the uncatchable decode failure (#1620) every
@@ -3359,6 +3360,29 @@ fn write_json_number<Out: core::fmt::Write>(
             out.write_str(text)
         }
         JsonConvention::JqCompat => {
+            // #2206: echo the source span when the formatter would hand
+            // back exactly these bytes. `format_number_jq_compat` returns
+            // an owned `String` unconditionally, so without this every
+            // number in the document costs an allocation purely to
+            // reproduce itself -- several hundred thousand of them on a
+            // 10 MB array, and the single reason `-c .data` could not
+            // reach the raw-echo fast path's throughput (that path renders
+            // the same document 4x faster; measured on both a 7950X and an
+            // M4 Pro, #2206).
+            //
+            // `is_jq_canonical_number` answers "certainly unchanged" only,
+            // and is pinned against the formatter by
+            // `is_jq_canonical_number_agrees_with_the_formatter_2206`.
+            // Ahead of `is_valid_number` on purpose: the predicate proves
+            // RFC-validity itself, so a `true` skips both that scan and the
+            // formatter's allocation. Ordering it *after* the gate instead
+            // leaves the scan in place and measures as a net loss (#2206).
+            // ASCII digits only, so the span is valid UTF-8 by construction.
+            if is_jq_canonical_number(raw) {
+                if let Ok(text) = core::str::from_utf8(raw) {
+                    return out.write_str(text);
+                }
+            }
             if crate::json::validate::is_valid_number(raw) {
                 return out.write_str(&format_number_jq_compat(raw));
             }
