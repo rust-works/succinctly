@@ -989,6 +989,231 @@ shapes now:
 Nothing else. The instrumentation was reverted before this section was
 committed; nothing in the tree carries it.
 
+## Walk residue (spine 2416): every head the walk refused, and the pin still holds at 44
+
+The identity pass's "What still hands over" list above is this section's
+scope. Its members were enumerated first, with `path_context_needs_eager`'s
+`return true` sites and the three handover sites instrumented (a temporary
+trace to a file named by an environment variable, so the CLI suites' own
+stderr assertions kept their meaning), over the 44 re-derived proof queries,
+the four listed ones, the brief's member list, the sweep and the two CLI
+suites. Only a `HANDOVER` line counts (the caveat above: a `GATE` line alone
+is the absent route asking about `rest`). The distinct (reason, construct)
+pairs the base tree produced:
+
+| Reason | Construct                                                   | Proof queries                                                      |
+|--------|-------------------------------------------------------------|--------------------------------------------------------------------|
+| `R2`   | a computed `parent(n)` after a head that can miss            | 37 of the 44 re-derived rows (`.a.b \| parent(0+1) \| STAGE`)       |
+| `R2`   | a literal `parent` after a head that can miss                | `.a.b \| parent \| key + "x"` (found in the suites; not in the list) |
+| `R3`   | a computed `parent(n)` after a head that cannot miss         | `A05`                                                              |
+| `R1`   | a slice head, a `getpath` head                               | `A04`, `A20`, `A17`                                                |
+| `R1`   | a fan-out component, an escaping component                   | `A19`, `.c[halt] \| key`, `label $out \| .[break $out] \| key`      |
+| `R1`   | navigation inside a transparent wrapper at the head          | `(try .[] catch "C") \| key`, `(if true then .[] else empty end) \| key`, `(label $o \| .[]) \| key`, `(def f: .[]; f) \| key`, `first((.[], error("x"))) \| key`, `(.[], empty) \| key` |
+| `R1`   | `..`                                                        | `[.. \| key]` (#2428)                                              |
+| `R1`   | a builtin with no identity rule                              | `.a \| explode \| key`, `.a \| ltrimstr("x") \| [length, key]`, `.s \| sub("x";"y") \| key` |
+| `R1`   | a bare `$x` stage                                            | `. as $x \| $x \| key`                                             |
+| `R2`   | a call with a path-context argument (#1371's substitution)   | `A24`                                                              |
+| --     | a fan-out head that can miss                                 | `.[] \| .k \| select(key == "k")`, `[.[] \| .k \| parent] \| length` |
+
+A `repeat` in a fold's INIT/SOURCE (the brief's last item) does **not** hand
+over on the base: `.a.b | reduce (repeat(.)) as $r (0; . + 1) | key` and
+`.a.b | reduce (1) as $r (limit(1; repeat(.)); . + 1) | key` both report no
+gate line at all, the fold being answered natively since #2473.
+
+Every member but the last was closed, each by the smallest walk arm or rule
+(the captures are in `test_walk_residue_rows_match_yq_2416`,
+`tests/yq_cli_tests.rs`, and `test_walk_residue_constructs_jq_2416`,
+`tests/jq_cli_tests.rs`; the reference docs and ADR-0021 decision 7's last
+paragraph record the rules):
+
+- **The walk's step carries a `Control`** (`path_context_step_generic` returns
+  `Result<(), Control>`), so a component that halts or breaks is no longer
+  refused (`path_context_component_can_escape` is gone), and the prefix a
+  component stream produced before its escape is delivered first
+  (`path_context_component_values` returns the values *and* the control), with
+  yq mode's rule that the prefix is discarded on an `Error`/`Break` and kept on
+  a halt (`path_context_component_escape`, #2371/#2351/#2328).
+- **The transparent wrappers are stepped**: `try`/`?` (a `catch` handler's
+  outputs stand at the `try`'s own input, as owned nodes), `if` (its condition
+  evaluated at the position), `label`/`break`, `def`/a bound call (bound
+  exactly as evaluation binds them, up to the identity gate's unfold limit),
+  `first`/`limit` (branch by branch over a comma, so `first((.[], halt_error))`
+  never evaluates the halt), `last` (`null` at the position when empty),
+  `empty`, `error` and the halts. `path_context_is_navigational` admits each
+  on the same terms, and `path_context_fans_out`, `step_can_yield_absent` and
+  `path_context_stage_preserves_node` follow the body.
+- **`PathNode::Owned`**, the third variant: a slice (literal or computed,
+  `?` included), `getpath(p)` (every component taken by the literal step that
+  spells it, a `{"start":s,"end":e}` segment as jq's own slice) and `..`
+  (`path_context_step_recurse`, pre-order, `recurse(.[]?)`'s suppression) are
+  navigation. Navigation inside an owned node descends the value with the
+  components the owned identity pipe names (`owned_nav_children`, shared with
+  `owned_identity_step`), `path_context_absent_identity` builds the identity
+  through owned ancestors, and the absent route evaluates `rest` over the
+  owned value. The generic evaluator gained a cursor-threading `..` arm on
+  both routes (`each_recurse_cursor_generic`), which is what closed #2428's
+  sweep rows and the three `path_ctx_recurse_*` goldens.
+- **A fan-out component is a fan-out head**: `path_context_fans_out`'s
+  `IndexExpr`/`SliceExpr`/`GetPath`/`ParentN` arms read the component
+  (`path_context_component_fans_out`, with `[...]`/`{...}` as barriers so
+  `getpath(["a","b"])` is one path), the admission no longer excludes it, and
+  `path_context_needs_eager` asks `fanout_head_can_lose_position` *first*: a
+  head that fans out and can be absent after the fan-out is refused before the
+  owned identity pipe's gate can take it. That closed the pre-existing gap the
+  admission's comment named: `(.c[0], .c[5]) | tostring | key` answered `0`
+  alone on the base (the absent branch left the walk as a `null` with no
+  cursor) and answers `0`, `5` now, which is yq v4.53.3's answer.
+- **A computed `parent(n)`** is evaluated at the position on every route --
+  the walk, `eval_builtin` (with the cursor; `path_context_single_native`
+  admits it) and the owned identity pipe (through the prefetch hook, which
+  now returns values) -- one hop per output, in order, the fan-out the eager
+  evaluator gave `parent((1,2))` (it used to array-collapse the stream,
+  `docs/compliance/jq/limitations.md`'s fourth site). A literal `parent` after
+  a head that can miss went with it: the absent split walks a head when any
+  position it passes *through* can be absent (`head_passes_through_absent`),
+  not only when the final one can, and stops short of a stage that fans out
+  so the identity route runs the rest per position.
+- **Every builtin has an identity rule**, in an exhaustive match: the
+  yq-accepted ones captured from v4.53.3 (`all`, `anchor`, `document_index`,
+  `line_comment`, `split_doc`, `shuffle`, `trim`, `tonumber`, `to_unix`,
+  `match`, `capture`, `sub`, `unique_by`, `omit`, `pick`, every `@format` keep;
+  `now`, `env`/`strenv`, `load`, `pivot` detach), `first`/`last`/`nth(n)` as
+  the navigation jq defines them as, `min_by`/`max_by` as `Extremum`,
+  `input`/`inputs`/`nan`/`infinite`/`builtins`/`$__loc__` detached like a
+  literal, `at_offset`/`at_position` node-preserving on the cursor route, and
+  the jq-only rest keeping. `Range`/`Repeat`/`While`/`Until` keep, `$ENV` and
+  a module call detach.
+- **A bare `$x` stage** has `OwnedIdentityRule::Bound`: the input's position
+  when the bound value *is* the input (`. as $x | $x`), detached otherwise.
+  `Expr::Var` carries the rule before substitution so the gate can see through
+  a body; the rows real yq's node-valued variables answer differently are in
+  `docs/compliance/yq/limitations.md`.
+- **A call with a path-context argument** (`A24`) and any other transparent
+  construct with no rewriter arm are evaluated at the position through the
+  prefetch hook, where the owned identity pipe binds the call exactly as
+  evaluation does; the rewriter gained arms for `IndexExpr`/`SliceExpr`/
+  `getpath`/`error`, leaves a map-family stage and a `|=` as written, and its
+  `_` arm is an assertion again.
+
+**`PINNED_ARM_COUNT` stays at 44.** Re-run of the method above with the 44
+handlers instrumented (`ARMHIT`) on the post-change tree: every listed and
+re-derived proof query but the fan-out ones stops reaching any arm, and
+**all 44 arms are still reachable** -- through a fan-out head that can miss,
+which hands the *whole* pipe to the eager evaluator, so any stage after
+`.[] | .b?` runs the arm of its own shape there. The table carries one such
+re-derivation per arm (document `D` extended with `"s":"hi"`; `.[] | .b?`
+stands on `.a.b`, the position every previous re-derivation used, so the
+outputs are the listed ones):
+
+| Id  | Re-derived query (identity pass) | Re-derived query (walk residue) | Gate | Marker | Output |
+|-----|----------------------------------|---------------------------------|------|--------|--------|
+| H1 | `.a.b \| parent(0+1) \| path + []` | `.[] \| .b? \| path + []` | fan-out | fired | `["a","b"], ["u","b"]` |
+| H2 | `.a.b \| parent(0+1) \| (key and parent)` | `.[] \| .b? \| (key and parent)` | fan-out | fired | `true, false` |
+| H3 | `.a.b \| parent(0+1) \| file_index + 1` | `.[] \| .b? \| file_index + 1` | fan-out | fired | `1, 1` |
+| H4 | `.a.b \| parent(0+1) \| (key and parent)` | `.[] \| .b? \| (key and parent)` | fan-out | fired | `true, false` |
+| H5 | `.a.b \| parent(0+1) + {}` | `.[] \| .b? \| parent(0+1) + {}` | fan-out | fired | `{"b":1,"e":2}, {}` |
+| A01 | `.a.b \| parent(0+1) \| . \| key` | `.[] \| .b? \| . \| (key and parent)` | fan-out | fired | `true, false` |
+| A02 | `.a.b \| parent(0+1) + {}` | `.[] \| .b? \| (key and parent)` | fan-out | fired | `true, false` |
+| A03 | `.c[0] \| parent(0+1) \| key` | `.[] \| .[0]? \| (key and parent)` | fan-out | fired | `true, false` |
+| A04 | `.c[0:1] \| .[0] \| key + 1` | `.[] \| .[0:1]? \| .[0] \| key + 1` | fan-out | fired | `1` |
+| A05 | `.a[] \| parent(0+1) \| key` | `.[] \| .b? \| (key and parent)` | fan-out | fired | `true, false` |
+| A06 | `.a.b \| parent(0+1) \| (key and parent)` | `.[] \| .b? \| (key and parent)` | fan-out | fired | `true, false` |
+| A07 | `.c[.n]? \| parent(0+1) \| key` | `.[] \| .[(0+0)]? \| (key and parent)` | fan-out | fired | `true, false` |
+| A08 | `.a? \| parent(0+1) \| key` | `.[] \| .b? \| (key and parent)` | fan-out | fired | `true, false` |
+| A09 | `.a.b \| parent(0+1) \| -(key\|length)` | `.[] \| .b? \| -(key\|length)` | fan-out | fired | `-1, -1` |
+| A10 | `.a.b \| parent(0+1) + {}` | `.[] \| .b? \| (parent(0+1) \| .) \| (key and parent)` | fan-out | fired | `true, true` |
+| A11 | `.a.b \| parent(0+1) + {}` | `.[] \| .b? \| parent(0+1) + {}` | fan-out | fired | `{"b":1,"e":2}, {}` |
+| A12 | `.a.b \| parent(0+1) \| (key and parent)` | `.[] \| .b? \| (key and parent)` | fan-out | fired | `true, false` |
+| A13 | `.a.b \| parent(0+1) \| -(key\|length)` | `.[] \| .b? \| -(key\|length)` | fan-out | fired | `-1, -1` |
+| A14 | `.a.b \| parent(0+1) \| (key == "a")` | `.[] \| .b? \| (key == "b")` | fan-out | fired | `true, true` |
+| A15 | `.a.b \| parent(0+1) \| select(key == "a") \| key` | `.[] \| .b? \| select(key == "b") \| key` | fan-out | fired | `"b", "b"` |
+| A16 | `.a.b \| parent(0+1) \| map(key)` | `.[] \| .[0:1]? \| map(key)` | fan-out | fired | `[0]` |
+| A17 | `getpath(["a","b"]) \| (key and parent)` | `.[] \| getpath(["b"])? \| (key and parent)` | fan-out | fired | `true, false` |
+| A18 | `.a.b \| parent(0+1) \| -(key\|length)` | `.[] \| .b? \| -(key\|length)` | fan-out | fired | `-1, -1` |
+| A19 | `.c[(0,1)] \| (key and parent)` | `.c[(0,1)] \| (key and parent)` | fan-out | fired | `true, true` |
+| A20 | `.c[.n:.m] \| .[0] \| key + 1` | `.c[(0,1):2] \| .[0] \| (key and parent)` | fan-out | fired | `true, true` |
+| A21 | `.a.b \| parent(0+1) \| [key] + ["x"]` | `.[] \| .b? \| [key] + ["x"]` | fan-out | fired | `["b","x"], ["b","x"]` |
+| A22 | `.a.b \| parent(0+1) \| "\(key)"` | `.[] \| .b? \| "\(key)"` | fan-out | fired | `"b", "b"` |
+| A23 | `.a.b \| parent(0+1) \| def f: key; f + "x"` | `.[] \| .b? \| def f: key; f + "x"` | fan-out | fired | `"bx", "bx"` |
+| A24 | `def f(x): x; .a.b \| f(key) + "z"` | `def f(x): x; .[] \| .b? \| f(key) + "z"` | fan-out | fired | `"bz", "bz"` |
+| A25 | `.a.b \| parent(0+1) \| def f: key; f + "x"` | `.[] \| .b? \| def f: key; f + "x"` | fan-out | fired | `"bx", "bx"` |
+| A26 | `.a.b \| parent(0+1) \| . as $x \| key` | `.[] \| .b? \| . as $x \| key` | fan-out | fired | `"b", "b"` |
+| A27 | `.c[0] \| parent(0+1) \| . as [$x] \| key` | `.[] \| .[0:1]? \| . as [$x] \| key` | fan-out | fired | `{"start":0,"end":1}` |
+| A28 | `.a.b \| parent(0+1) \| limit(1; key + "x")` | `.[] \| .b? \| limit(1; key + "x")` | fan-out | fired | `"bx", "bx"` |
+| A29 | `.a.b \| parent(0+1) \| first(key + "x")` | `.[] \| .b? \| first(key + "x")` | fan-out | fired | `"bx", "bx"` |
+| A30 | `.a.b \| parent(0+1) \| last(key + "x")` | `.[] \| .b? \| last(key + "x")` | fan-out | fired | `"bx", "bx"` |
+| A31 | `.a.b \| parent(0+1) \| reduce (key) as $k (""; . + $k)` | `.[] \| .b? \| reduce (key) as $k (""; . + $k)` | fan-out | fired | `"b", "b"` |
+| A32 | `.a.b \| parent(0+1) \| foreach (key) as $k (""; . + $k)` | `.[] \| .b? \| foreach (key) as $k (""; . + $k)` | fan-out | fired | `"b", "b"` |
+| A33 | `.a.b \| parent(0+1) \| {z: key}` | `.[] \| .b? \| {z: key}` | fan-out | fired | `{"z":"b"}, {"z":"b"}` |
+| A34 | `.a.b \| parent(0+1) \| if key == "a" then key + "x" else "y" end` | `.[] \| .b? \| if key == "b" then key + "x" else "y" end` | fan-out | fired | `"bx", "bx"` |
+| A35 | `.a.b \| parent(0+1) \| (key + "x"), key` | `.[] \| .b? \| (key + "x"), key` | fan-out | fired | `"bx", "b", "bx", "b"` |
+| A36 | `.a.b \| parent(0+1) \| try (key + "x") catch "e"` | `.[] \| .b? \| try (key + "x") catch "e"` | fan-out | fired | `"bx", "bx"` |
+| A37 | `.a.b \| parent(0+1) \| label $out \| (key + "x", break $out)` | `.[] \| .b? \| label $out \| (key + "x", break $out)` | fan-out | fired | `"bx", "bx"` |
+| A38 | `.a.b \| parent(0+1) \| label $out \| (key + "x", break $out)` | `.[] \| .b? \| label $out \| (key + "x", break $out)` | fan-out | fired | `"bx", "bx"` |
+| A39 | `.a.b \| parent(0+1) \| .b \|= key` | `(.a, .x) \| .b \|= key` | fan-out | fired | `{"b":"b","e":2}, {"b":"b"}` |
+
+### What the change is measured against
+
+The construct matrix in the pass's capture set (`cap/` in the scratch
+directory: slices, fan-out components, comma and paren wrappers, `..`, every
+nullary builtin yq's lexer accepts at a present and an absent position and
+under `parent`, the argument-taking builtins on a second document, a bare
+`$x` after every binding shape, `parent(n)` at every literal) was captured
+from yq v4.53.3 and jq 1.7.1 first; 234 yq rows are captured for the
+constructs yq accepts, 207 match and are pinned in `WALK_RESIDUE_ROWS_2416`,
+and the 27 that do not are all recorded elsewhere (`first(f)` #2377; node-
+valued variables, `docs/compliance/yq/limitations.md`; a comma over an
+absent branch in yq's context-list model, #2451; the jq-modeled `fromjson`/
+`min`/`max`/`sort`/`to_entries` type errors). Against the base binary, 96
+of the 288-shape probe corpus moved, every one toward the reference or the
+model: the `..` family (48 rows, #2428), the slice family in yq mode (its
+container-position rule), `first`/`last`/`nth`/`min_by`/`max_by` to jq's
+own `path(f)` model, the detached builtins to nothing, the computed
+`parent(n)` fan-out, and the four jq-mode rows where the eager evaluator's
+`null` placeholder for `key` at the document root became the walk's nothing
+(`.a? | parent(0+1) | key`, `(try error("x") catch key) | key`, `(if key ==
+"a" then .a else .c end) | key`, `last(empty) | key` -- #2421's rule, the
+move `.a | 5 | key` made in the identity pass). The sweep
+(`scripts/jq-path-context-oracle-sweep.sh`) reports 0 unexpected
+divergences; its four `descend` manifest rows (`key`/`parent`/`path` under
+`..`, and `file_index`'s comma ordering) went stale and were removed.
+
+Tests moved, each with its capture: `test_parent_n_positive_infinite_still_overshoots_to_empty_object_1487`
+(`{}` to nothing: yq prints nothing for `.a.b | parent(3)`), the
+`.a? | parent(0+1) | key` row of `test_arm_audit_proof_queries_are_unmoved_by_the_gate_2416`
+(`null` to nothing, same rule), the `.d[(0+0):(0+1)] | key` and `[.. | path]`
+rows of `test_walk_vs_bridge_path_context_parity_2416` (the walk matches the
+oracle where the bridge does not: yq's slice keeps the container's position,
+and a duplicate mapping key is one position under `..`, `[[],["a"],["d"],
+["d",0],["d",1]]` in v4.53.3), and the routing pins in
+`path_context_needs_eager_pins_the_three_reasons_2416`,
+`path_context_absent_split_pins_its_four_conditions_2416`,
+`path_context_gate_admits_emitting_stages_only_last_2416` and
+`path_context_absent_resolution_clears_path_context_2416` for every shape the
+pass routed.
+
+### What still hands over
+
+Measured with the handover sites instrumented, on the proof queries, the
+probe corpus, the sweep and the CLI suites, `path_context_needs_eager`
+answers `true` for exactly these shapes now:
+
+- a **fan-out head that can miss**, followed by a read -- `.[] | .k |
+  select(key == "k")`, `[.[] | .k | parent] | length`, `.c[(0,5)] | tostring |
+  key`, `(.c[0], .c[5]) | tostring | key`, `.[] | .b? | parent` -- the residue
+  ADR-0021 decision 7 records, refused by `path_context_fans_out` at the two
+  routing sites and by `fanout_head_can_lose_position` at the gate (a fan-out
+  component counts, and so does a fan-out head whose *last* stage is the
+  `parent` read, since the head then has no `rest` for the absent route);
+- `at_offset`/`at_position` followed by a read, in the owned domain only
+  (`.a | at_offset(0) | key` raises `at_offset requires document cursor
+  context` on every route, base included);
+- the `--eval-all` shapes whose file table cannot be made ambient
+  (`FILE_ORIGIN_SCOPE_AVAILABLE`), unchanged.
+
+Nothing else. The instrumentation was reverted before this section was
+committed; nothing in the tree carries it.
+
 ## Result
 
 | Metric                                            | Before | After                 |
@@ -1004,13 +1229,16 @@ committed; nothing in the tree carries it.
 | ... starved by #2471's head-of-pipe half           | --     | 0 (`A07`/`A19` re-derived)       |
 | ... starved by #2563                                | --     | 0 (11 `as`-spelled rows re-derived) |
 | ... starved by the identity pass                    | --     | 0 (40 listed rows re-derived) |
+| ... starved by the walk residue                     | --     | 0 (all 44 re-derived through a fan-out head) |
 | `PINNED_ARM_COUNT`                                 | 43     | 44                    |
 
-Nothing is deletable at this point in the spine -- and the identity pass is
-the measurement that says why: with every *stage* shape given a rule, the 44
-arms are all still reached through the residual *heads* (a computed
-`parent(n)`, a fan-out component, a slice, a `getpath`), so what deletes them
-is the walk carrying those heads, not another stage rule. Doors 2 and 3 are
+Nothing is deletable at this point in the spine -- and the walk residue is
+the measurement that says why: with every *head* the walk refused now carried
+(the identity pass had already given every stage a rule), the 44 arms are all
+still reached through the one head that stays eager by design, a fan-out that
+can miss, which hands the whole pipe over and so runs the arm of every stage
+after it. What deletes them is the decision about that head (ADR-0021 decision
+8's exit condition), not another walk arm. Doors 2 and 3 are
 closed as of step 5, which is a precondition rather than a deletion: the eager evaluator
 shrinks when the generic evaluator gains native arms (widening
 `path_context_single_native`) and when the absent route widens. What the

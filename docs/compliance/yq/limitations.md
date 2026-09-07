@@ -3147,6 +3147,35 @@ Implementation Notes" #3 in `docs/reference/yq-language.md`), not something new 
 fix. `(.x, .y) | type` (no construction) answers correctly. See
 `tests/yq_cli_tests.rs`'s `test_yaml_explicit_tag_resolves_through_alias_903`.
 
+### A bound variable is a value, not the node it was bound to (spine 2416, walk residue)
+
+Real yq's variables hold *nodes*: `E as $x | body` binds the candidate nodes `E` produced,
+parent pointers and all, so a bare `$x` later in the pipe still knows where it came from.
+succinctly's binding substitutes the bound **value** into the body (`substitute_bound_var`,
+`src/jq/eval.rs`; ADR-0021 decision 7's rule for `as`), and a value has no position of its
+own. Captured from yq v4.53.3 on `a: {b: 1, e: 2}, ...` (`-o=json -I=0`):
+
+| filter                             | real yq      | succinctly |
+|------------------------------------|--------------|------------|
+| `.a.b as $x \| $x \| key`            | `"b"`        | (nothing)  |
+| `.a.b as $x \| $x \| path`           | `["a","b"]`  | `[]`       |
+| `.a.b as $x \| .a \| $x \| key`       | `"b"`        | (nothing)  |
+| `.a.b as $x \| $x \| parent \| key`   | `"a"`        | (nothing)  |
+| `. as $x \| $x \| key`               | (nothing)    | (nothing)  |
+| `.a \| . as $x \| $x \| key`          | `"a"`        | `"a"`      |
+| `.a.x as $x \| $x \| key`            | (nothing)    | (nothing)  |
+| `.a as $x \| $x \| .b \| key`         | `"b"`        | `"b"`      |
+
+The rows that agree are the ones a value can answer: the `. as $x` passthrough, where the
+bound value *is* the stage's input and `OwnedIdentityRule::Bound` keeps the input's position
+(the same value-equality test `resolve_node` applies to a `TrackedVar`'s `path()`
+trackability), a binding of an absent node, and navigation *inside* the bound value. The rows
+that diverge all bind a node other than `.` and then read its position through the variable.
+The divergence predates the walk residue (the eager evaluator printed nothing for the same
+rows); what that pass changed is the route, not the answer. Closing it needs bindings that
+carry an identity alongside the value, the same node-identity machinery the anchor/alias
+section above records as unimplemented.
+
 ### Other categories
 
 Float and number formatting ([#1071](https://github.com/rust-works/succinctly/issues/1071),

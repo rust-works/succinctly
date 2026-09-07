@@ -453,6 +453,12 @@ A `key`/`parent`/`path`/`file_index` read *after* a construct real yq's lexer re
 has no yq answer to match; `succinctly yq --jq-extensions` places such a value by the same
 tree-structural rules `succinctly jq` uses — see [jq Language Reference](jq-language.md#where-a-value-built-by-a-jq-only-construct-stands-spine-2416).
 
+Two related extensions, both placed by the same model: `parent(n)` accepts a *computed*
+`n` (real yq accepts only a literal -- `parent(0+1)` is `bad expression` in v4.53.3), one hop
+per output of `n`, and `..` carries path context to every node it reaches (`[.. | key]` is
+`["a","b","e","c",0,1,...]` in real yq; succinctly matched it only from spine 2416's walk
+residue on, #2428).
+
 ### Gated jq Builtins (--jq-extensions)
 
 Real yq's own lexer rejects a chunk of the jq language outright — these

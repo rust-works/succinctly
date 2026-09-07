@@ -322,6 +322,20 @@ the same tree-structural model ADR-0021 decision 7 gives every other stage
 | `reduce`/`foreach`                                          | The fold's output stands at the stage's own input, like `tostring` (`.a.b \| reduce (key) as $k (""; . + $k) \| path` is `["a","b"]`) |
 | `"..\\(..).."` string interpolation                          | Detached, like a literal: `.a.b \| "k=\\(key)" \| key` prints nothing (this one *is* captured from yq v4.53.3) |
 | `A and B`, `A or B`                                         | Where the left operand stood, like a comparison (captured from yq v4.53.3: `.a.b \| (parent and key) \| key` is `"a"`) |
+| `first`, `last`, `nth(n)` (nullary)                          | The navigation jq defines them as: `.[0]`, `.[-1]`, `.[n]` -- `path(.c \| first)` is `["c",0]`, `path(.c \| last)` is `["c",-1]`, `path(.c \| nth(1))` is `["c",1]` in jq 1.7.1, so `.c \| first \| key` is `0` |
+| `min_by(f)`, `max_by(f)`                                    | The child picked, at its own position, like `min`/`max` (captured from yq v4.53.3: `.c \| min \| key` is `0`) |
+| `getpath(p)`                                                | Navigation by every component of `p`: `path(getpath(["a","b"]))` is `["a","b"]` and `path(getpath(["x","y"]))` is `["x","y"]` in jq 1.7.1; a `{"start":s,"end":e}` segment is jq's own slice, with the descriptor as the component |
+| `..`, `recurse`                                             | Every node at its own position, in document order (`[path(..)]` in jq 1.7.1; `[.. \| key]` is `["a","b","e","c",0,1,...]` in yq v4.53.3, #2428) |
+| `parent(n)` with a computed `n`                             | `n` is evaluated at the position, one hop per output (`.a.b \| parent((1,2)) \| path` is `["a"]`, `[]`); real yq accepts only a literal `n` |
+| `E[S:T]` with computed bounds, `.[s:e]`                     | jq mode: the `{"start":s,"end":e}` component jq's own `path(.c[0:1])` names; yq mode: the container's position (`.c[0:1] \| .[0] \| path` is `["c",0]` in v4.53.3) |
+| `$x` (a bare bound variable as a stage)                     | Keeps the input's position when the bound value *is* the input (`.a \| . as $x \| $x \| key` is `"a"` in v4.53.3), detached otherwise -- see `docs/compliance/yq/limitations.md` for the rows real yq's node-valued variables answer differently |
+| `now`, `env`/`$ENV`/`strenv`, `input`/`inputs`, `load`, `pivot`, `nan`/`infinite`/`null`, `builtins`, `$__loc__`, `input_line_number` | Detached, like a literal (captured from yq v4.53.3 where it accepts the builtin: `.s \| now \| key`, `.n \| strenv(HOME) \| key`, `.n \| load("f.yaml") \| key` and `.p \| pivot \| key` all print nothing) |
+| Every other builtin                                         | Where the input stood, like `tostring` (captured from yq v4.53.3 for every builtin its lexer accepts -- `all`, `anchor`, `document_index`, `line_comment`, `split_doc`, `shuffle`, `trim`, `tonumber`, `to_unix`, `match`, `capture`, `sub`, `unique_by`, `omit`, `pick`, every `@format`, ...; the jq-only rest follow) |
+
+Since spine 2416's walk residue the transparent constructs are also *walked* when they
+head a pipe (`(try .[] catch "C") | key`, `first((.[], error("x"))) | key`, `(def f: .[];
+f) | key`), each output at the position its body reached, and a `catch` handler's outputs
+stand at the `try`'s own input.
 
 Before spine 2416's identity pass these constructs kept their whole pipe on the eager
 path-context evaluator, whose accumulated-path model answered `.a.b | (try key catch "c") |
