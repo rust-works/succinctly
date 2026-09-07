@@ -45,6 +45,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.big` already did, instead of being re-spelled `1E-301` by the reindex round
   trip it no longer takes.
 
+  Measured on the two pinned boxes, interleaved, medians of 7, output identity
+  gated (20 configurations, 0 differences on each). `.[][0] | key` and
+  `path(.)` on a 14 MB `users` document: **-68%** on an Apple M4 Pro (83 ->
+  27 ms) and **-62%** on a 7950X (124 -> 46 ms); on a 74 MB document, -70% and
+  -61%. A number-dense 20 MB array reads -23% and -37%, a string-dense one
+  -44% and -21%. `[.[][] | key] | length` -49% and -38%.
+
+  One caveat, measured rather than assumed: on the M4 Pro the getpath commit
+  also costs **+6.2%** on queries that contain no `getpath` at all (`length`,
+  `keys_unsorted[0]`, `.[][0]` -- uniform across 8 of 8 rows, against a
+  +-1.5% control floor). Three results place it in code layout rather than in
+  the new logic: the same binaries show no penalty on the 7950X (median
+  -0.11%), the penalty disappears on the same ARM box when both halves are
+  rebuilt with `codegen-units=1` (median +0.28%), and the affected queries
+  never execute the changed code. An `#[inline(never)]` on the new walk
+  removes it on ARM (-0.21%) and costs **+9.5%** on x86_64 for the same
+  unrelated queries, so it was measured and rejected rather than shipped:
+  cargo's default release profile splits this crate into 16 codegen units, and
+  the two architectures land on opposite sides of that split. Filed as #2603
+  rather than chased further with another guess.
+
 ### Fixed
 
 - **`key`/`path` (no arg) followed by more pipe stages no longer falls back
