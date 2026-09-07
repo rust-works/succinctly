@@ -116,9 +116,9 @@ pub use parser::{
 pub use resolve::{resolve_func_calls, resolve_func_calls_all, UnresolvedCall};
 pub use stream::{StreamError, StreamStats, StreamableValue};
 pub use value::{
-    assert_value_tree_depth, format_number_jq_compat, is_jq_canonical_number,
-    jq_bare_float_display, jq_float_is_scientific, nesting_depth_exceeded_message, NumberRepr,
-    OwnedValue, MAX_VALUE_TREE_DEPTH,
+    assert_value_tree_depth, format_number_jq_compat, jq_bare_float_display,
+    jq_float_is_scientific, nesting_depth_exceeded_message, NumberRepr, OwnedValue,
+    MAX_VALUE_TREE_DEPTH,
 };
 // `pub(crate)`, not `pub`: only `yaml::light`'s alias-chain resolvers (#1191
 // code review, #1193/PR #1314) need this from outside `jq::value` --
@@ -126,3 +126,9 @@ pub use value::{
 // depth-guard helper on docs.rs with no external caller to justify the
 // exposure.
 pub(crate) use value::assert_depth;
+// `pub(crate)` for the same reason (#2206): `json::light`'s number
+// writer is the only caller, and the predicate is an implementation
+// detail of `format_number_jq_compat`'s fast path -- not something an
+// external caller has any use for, and not a contract worth freezing on
+// docs.rs.
+pub(crate) use value::is_jq_canonical_number;
