@@ -176,6 +176,77 @@ fn strip_insignificant_leading_zero_and_plus(s: &str) -> String {
         None => format!("{sign}{canonical_int}"),
     }
 }
+/// Whether [`format_number_jq_compat`] would return `raw` byte-for-byte,
+/// so a writer can echo the source span instead of allocating a `String`
+/// per number (#2206).
+///
+/// The M2 streaming path re-renders every number through
+/// `format_number_jq_compat`, which allocates unconditionally -- even for
+/// the overwhelmingly common case of a number that is *already* in jq's
+/// canonical form and comes back unchanged. On a 10 MB document that is
+/// several hundred thousand allocations, and it is what kept `-c .data`
+/// from reaching the raw-echo fast path's speed (measured: the echo path
+/// renders the same document 4x faster).
+///
+/// Deliberately conservative -- it answers "certainly unchanged", never
+/// "probably". Anything with an exponent, a leading `+`, an insignificant
+/// leading zero, or an absent integer part (`.5`, #1171) returns `false`
+/// and takes the full formatter, so a `true` here is always safe to echo.
+///
+/// Kept adjacent to the formatter it predicts, and pinned against it by
+/// `is_jq_canonical_number_agrees_with_the_formatter_2206`, which asserts
+/// the two agree on every spelling in the formatter's own test corpus --
+/// the "duplicated predicates diverge silently" hazard (`CLAUDE.md`, #106)
+/// applies squarely to a fast-path predicate that restates a formatter's
+/// rules.
+#[must_use]
+pub fn is_jq_canonical_number(raw: &[u8]) -> bool {
+    // One pass that answers *both* questions the writer needs -- "is this a
+    // valid RFC 8259 number" and "would the formatter hand back these exact
+    // bytes" -- so a `true` lets the caller skip `is_valid_number` *and*
+    // `format_number_jq_compat` together.
+    //
+    // Answering only the second (#2206's first attempt) is worth nothing:
+    // the caller still has to run `is_valid_number` for the lenient spans,
+    // and a second full scan costs more than the allocation it saves --
+    // measured at +1.3% to +2.0% on a 7950X, i.e. a net loss. The scan, not
+    // the allocation, is the expensive half.
+    let mut i = 0usize;
+    let n = raw.len();
+    if i < n && raw[i] == b'-' {
+        i += 1;
+    }
+    // Integer part: `0` alone, or a non-zero leading digit. Both RFC 8259's
+    // rule and the canonical form the formatter would produce -- `007` and
+    // `+7` fail here, which is exactly when the formatter rewrites them.
+    let int_start = i;
+    if i < n && raw[i] == b'0' {
+        i += 1;
+    } else {
+        while i < n && raw[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+    if i == int_start {
+        return false;
+    }
+    // Fraction: a `.` must be followed by at least one digit. `1.` is a
+    // scanner-lenient span RFC 8259 rejects and the `from_number_bytes`
+    // fallback rewrites to `1`, so it must not reach the echo.
+    if i < n && raw[i] == b'.' {
+        i += 1;
+        let frac_start = i;
+        while i < n && raw[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == frac_start {
+            return false;
+        }
+    }
+    // Any exponent (or trailing junk like `1.2.3`) leaves the canonical
+    // set: the formatter has its own reformatting path for exponents.
+    i == n
+}
 
 /// Format a raw JSON number string the way jq itself would print it.
 ///
@@ -4530,5 +4601,101 @@ mod tests {
         let over_b = linear_array_nest(MAX_VALUE_TREE_DEPTH);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| over_a == over_b));
         assert!(result.is_err(), "== should panic at MAX_VALUE_TREE_DEPTH");
+    }
+
+    /// #2206: the fast-path predicate must agree with the formatter it
+    /// predicts, on every spelling either of them has an opinion about.
+    ///
+    /// `is_jq_canonical_number` restates part of
+    /// `format_number_jq_compat`'s rules so a writer can skip its
+    /// allocation. That is the "duplicated predicates diverge silently"
+    /// shape `CLAUDE.md` warns about (#106), and the divergence here would
+    /// be *silent wrong output* -- a number echoed verbatim that jq would
+    /// have reformatted. This asserts the exact contract the fast path
+    /// relies on: `true` implies the formatter is the identity.
+    ///
+    /// The reverse is deliberately not asserted. The predicate is allowed
+    /// to be conservative (say `false` where the formatter happens to be
+    /// the identity anyway); that only costs an allocation, never
+    /// correctness. Rows below marked `conservative` are exactly those.
+    #[test]
+    fn is_jq_canonical_number_agrees_with_the_formatter_2206() {
+        let corpus = [
+            // plain canonical spellings -- the case the fast path exists for
+            "0",
+            "1",
+            "42",
+            "-7",
+            "1000",
+            "0.5",
+            "-0.25",
+            "12.345",
+            "0.10",
+            "-0",
+            "123456789012345678",
+            "9.999",
+            // not canonical: the formatter rewrites these
+            "007",
+            "+7",
+            "-007",
+            "0007.5",
+            ".5",
+            "-.5",
+            "00",
+            "+0.5",
+            // exponent forms: the formatter has its own path for these
+            "1e100",
+            "1E5",
+            "1e-3",
+            "-2.5e+10",
+            "1E+100",
+            // degenerate / lenient spellings the scanner can still hand over
+            "",
+            "1.2.3",
+            "-",
+            "abc",
+        ];
+        for raw in corpus {
+            let bytes = raw.as_bytes();
+            let claims_canonical = is_jq_canonical_number(bytes);
+            // The writer consults the predicate only *inside* its
+            // `is_valid_number` gate, because a scanner-lenient span
+            // (`1.`) is sanitized by the `from_number_bytes` fallback
+            // rather than by the formatter -- and the formatter is the
+            // identity on `1.`, so a check against it alone would have
+            // called that row canonical. It is not: jq prints `1`. Asserting
+            // the same gate here keeps this test measuring the contract the
+            // writer actually relies on.
+            if !crate::json::validate::is_valid_number(bytes) {
+                continue;
+            }
+            let formatted = format_number_jq_compat(bytes);
+            if claims_canonical {
+                assert_eq!(
+                    formatted, raw,
+                    "is_jq_canonical_number({raw:?}) said the formatter is the \
+                     identity, but it returned {formatted:?} -- the fast path \
+                     would emit {raw:?} where jq prints {formatted:?}"
+                );
+            }
+        }
+    }
+
+    /// The predicate must actually fire on ordinary numbers, or #2206's
+    /// fast path is dead code that still passes the agreement test above.
+    #[test]
+    fn is_jq_canonical_number_accepts_ordinary_spellings_2206() {
+        for raw in ["0", "1", "42", "-7", "0.5", "-0.25", "12.345", "0.10"] {
+            assert!(
+                is_jq_canonical_number(raw.as_bytes()),
+                "{raw:?} is jq-canonical and must take the allocation-free path"
+            );
+        }
+        for raw in ["007", "+7", ".5", "1e100", "1E+100"] {
+            assert!(
+                !is_jq_canonical_number(raw.as_bytes()),
+                "{raw:?} is reformatted by jq and must not take the fast path"
+            );
+        }
     }
 }
