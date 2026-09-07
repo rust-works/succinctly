@@ -361,9 +361,16 @@ pub fn stream_owned_value_json_jq<W: core::fmt::Write>(
 ///
 /// That pairing is exactly what `--preserve-input` is documented to mean —
 /// keep the document's own number spelling — without the escape-table
-/// change it was never meant to carry. Differs from
-/// [`stream_owned_value_json_jq_output`] in that one argument alone, and
-/// from [`stream_owned_value_json`] only in the escape table.
+/// change it was never meant to carry.
+///
+/// Differs from [`stream_owned_value_json_jq_output`] in the finite-literal
+/// formatter alone. Against [`stream_owned_value_json`] the escape table is
+/// the *headline* difference but not the only one: this also keeps jq's
+/// float display (`jq_bare_float_display`, so a computed `1.0 + 2.0` prints
+/// `3`) and jq's infinite-value rules, rather than yq's
+/// `format_float_with_fraction`. All three are jq-mode rules, which is the
+/// point — this is jq's convention with one axis relaxed, not yq's with one
+/// axis tightened.
 pub(crate) fn stream_owned_value_json_jq_preserve_input<W: core::fmt::Write>(
     value: &OwnedValue,
     out: &mut W,
