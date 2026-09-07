@@ -2288,9 +2288,10 @@ comparison operands are not read-only, unlike an arithmetic/`and`/`or` operand u
 | `.zzz < 1`                                       | `false` |
 
 Fixed as `eval::yq_null_ordering_is_false`, consulted from `eval::apply_compare_op` --
-the one shared comparison-operator implementation all three evaluators (the ordinary
-cursor evaluator, the eager path-context evaluator, and the generic/CLI evaluator) already
-route through, so this is a single call site, not three.
+the one shared comparison-operator implementation every evaluator (the ordinary
+cursor evaluator, the generic/CLI evaluator, and -- until spine 2416's exit deleted it --
+the eager path-context evaluator) already routes through, so this is a single call site,
+not three.
 
 **Not reproduced: `null` against an array/object.** Real yq raises a Go-internal error
 there instead of answering at all, and the wording depends on operand *order* -- its

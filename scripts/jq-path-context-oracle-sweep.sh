@@ -2,12 +2,15 @@
 #
 # Oracle sweep for the *path-context* evaluators — #2416 phase 0's "net".
 #
-# #2416 retires the eager `eval_stage_with_path_context` (`src/jq/eval.rs`) by
+# Spine 2416 retired the eager path-context evaluator (`src/jq/eval.rs`) by
 # migrating its arms one at a time into `try_path_context_cursor_walk`
-# (`src/jq/eval_generic.rs`, #2061). Every migration has to be checked against
-# the **oracle**, not against the in-tree bridge it replaces: #2388 already
-# proved the two in-tree evaluators disagree with each other, so "the walk
-# matches the bridge" is not evidence that either matches jq/yq.
+# (`src/jq/eval_generic.rs`, #2061), and deleted it once the last head moved.
+# Every migration had to be checked against the **oracle**, not against the
+# in-tree bridge it replaced: #2388 already proved the two in-tree evaluators
+# disagreed with each other, so "the walk matches the bridge" was never
+# evidence that either matched jq/yq. The bridge is gone; the oracle is what
+# is left, and this sweep is how a future change to the surviving routes is
+# still checked against it.
 #
 # Promoted from `.ai/scratch/sweep-path-fold-differential.py`, which swept
 # `path(foreach|reduce ...)` against jq and classified diffs by direction. It
@@ -98,7 +101,7 @@ SUCC="${SUCC:-$REPO_ROOT/target/release/succinctly}"
 
 # Navigation prefixes. Each generated filter is `<prefix> | <outer>`, so the
 # leaf always sits at a non-root position with a real accumulated path — the
-# thing `eval_stage_with_path_context` exists to carry.
+# thing the path-context routes exist to carry.
 PREFIX_IDS=(root  field  iter    seqiter descend deep)
 PREFIX_TPL=('.'   '.a'   '.a[]'  '.d[]'  '..'    '.a.b')
 

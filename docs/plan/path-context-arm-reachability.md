@@ -1214,6 +1214,140 @@ answers `true` for exactly these shapes now:
 Nothing else. The instrumentation was reverted before this section was
 committed; nothing in the tree carries it.
 
+## Deleted (spine 2416, the exit): all 44 handlers, and the three doors
+
+Date: 2026-09-07. Decision: issue #2559 option 1 -- re-measure the fan-out-head
+penalty on current main and, if it holds up, accept it and delete the eager
+evaluator. It held up, in the direction the guard did not predict.
+
+**The measurement** (Apple M4 Pro, macOS 26.5.1, rustc 1.96.0, both binaries
+built with `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1`, 11 interleaved reps per
+row, a deterministic corpus of `k: {x: <int>}` records at 1/6/20 MB in both
+YAML and JSON; control floor base-vs-a-copy-of-itself is +-2%):
+
+| shape                                    | 1 MB | 6 MB | 20 MB | per element |
+|------------------------------------------|------|------|-------|-------------|
+| `[.[] \| .k.x \| parent] \| length` (yq)  | +12.6% | +11.3% | +10.0% | ~0.5 us |
+| ... the same in jq mode, on JSON          | +16.0% | +16.4% | +17.9% | ~0.6 us |
+| `[.[] \| .k \| select(key == "k")]` (yq) | +20.4% | +20.9% | +19.3% | ~1.0 us |
+| `[.[] \| .missing \| parent]` (yq)       | +48.1% | +48.0% | +47.1% | ~2.9 us |
+| `[.[] \| .k.x \| parent \| key]` control | -0.9% | -1.4% | -1.2% | -- |
+| `[.[] \| key]` control                   | -2.1% | -0.8% | -1.1% | -- |
+
+| peak RSS, 20 MB, `[.[] \| .k.x \| parent] \| length` | eager | walk | ratio |
+|---|---|---|---|
+| yq mode, YAML | 511.2 MB | 245.4 MB | **0.48x** |
+| jq mode, JSON | 479.3 MB | 256.7 MB | **0.54x** |
+
+Two things that measurement settles. The guard's comment recorded +23%/+27%
+at 1/6 MB on its own shape; it is +10-13% now, and the ratio *shrinks* with
+input size while the per-element cost stays flat -- so the term is per
+element, not super-linear, and a sequential-cursor reset forcing a rescan
+would have shown up as one or the other. And the mechanism is misattributed:
+**JSON, which has no `Cell<SequentialCursor>` at all, pays the same
+~0.5-0.6 us per element on the first two shapes**, so what the walk spends is
+its own per-position allocation (`path_context_step_generic` clones `path`
+and `ancestors` into a fresh `PathContextPos` per position, ~6-8 allocations
+per element for `.[] | .k.x`) -- #2572. Meanwhile the route the guard fell
+back to materialized the whole document as an `OwnedValue` and cost *twice*
+the peak RSS, which is the opposite of the memory the guard was written to
+save.
+
+**What was deleted.** `eval_stage_with_path_context` (2,579 lines, 44 named
+handlers) and `eval_pipe_with_path_context`/`_internal`; the seventeen helpers
+that existed only to feed them (`continue_rest_with_context`,
+`continue_rest_with_paths`, `continue_rest_with_fresh_root`,
+`continue_rest_with_borrowed_value`, `continue_one_paired`,
+`iterate_element_step`, `eval_and_continue_with_context`,
+`eval_index_expr_with_path_context`, `eval_slice_expr_with_path_context`,
+`eval_slice_bound_with_path_context`, `eval_getpath_with_path_context`,
+`eval_negate_with_path_context`, `eval_boolean_with_path_context`,
+`eval_bind_with_path_context`, `eval_binary_fanout_with_path_context`,
+`build_string_parts_with_context`, `eval_expr_needing_path_context`) plus the
+dead code the compiler then found (`accumulate_path_context_step`,
+`catch_error_under_optional`, `classify_path_context_stream`,
+`drain_path_context_stream`, `drain_path_context_stream_routed`,
+`get_value_at_owned_path`, `pair_outputs_with_path`,
+`path_context_string_part_outputs`, `path_probe_stage`, `probe_stages`,
+`resolve_ancestor_path`, `resolve_assign_rhs_at`, `split_probe_pair`, the
+`BareEscapeRoute` and `PathContextEscape` types, the `RawSliceBound` alias,
+`current_file_origin`); the fan-out guard (`path_context_fans_out`,
+`path_context_component_fans_out`, `path_context_emits_paths_only`,
+`fanout_head_can_lose_position`); the `PathContextRoute` enum, its ambient
+scope and `eval_with_cursor_using_route`; and both source-scanning guards,
+`tests/jq_path_context_arm_guard.rs` and
+`tests/jq_path_context_single_door_guard.rs`. `src/jq/eval.rs`: -5,673 lines
+(net -5,460 once the comment rewrites are counted). `src/jq/eval_generic.rs`:
+-538 (net -145: the detached route, the native `Expr::Negate` arm,
+`path_context_step_target` and `owned_identity_pipe_entry_stage` are new).
+
+**The three doors.** Door 1, the gate's routing use, is removed at all three
+sites (`eval::eval_path_context_pipe_owned`, `eval_single`'s `Expr::Pipe` arm,
+`eval_each_pipe_generic`); the predicate survives, renamed
+`path_context_needs_owned_position`, because the absent route still asks it of
+its own `rest` and `path_context_single_native` of a nested pipe -- it names
+no evaluator now. Door 2, a value `reindex_bridge_is_identity` refuses, takes
+`eval_path_context_pipe_detached`: the owned identity pipe at a detached root,
+which never serializes and places the value exactly as the reindexed root
+cursor would have. Measured, not assumed -- with the guard simply removed, a
+300-digit literal came back as `1E+299`, `1e19` as `NumberLiteral(1e19,
+"1e+19")` and a NaN as `null`. Door 3, `--eval-all`'s file-origin table under
+a build with no ambient scope, is closed by scoping `file_origin` on
+`any(feature = "std", test)` rather than on the `std` feature: `cargo test
+--no-default-features` (CI's `no_std` leg) links `std` under `cfg(test)`, so
+every `--eval-all` `file_index` there keeps answering from the table, and a
+genuine `no_std` embedding -- which no CLI reaches -- refuses rather than
+answering a silent `0`.
+
+**What moved, and why each move is defensible.** Nothing in the sweep (0
+unexpected divergences, no known-divergence bucket lost a row) and nothing in
+70 hand-checked A/B configurations of the fan-out corpus. Six pinned rows
+moved, each captured live:
+
+| row | before | after | capture |
+|---|---|---|---|
+| `.c[.neg] \| key` on `c: [10,20]`, `neg: -1` (jq mode) | `-1` | `1` | yq v4.53.3 answers `1`; the *literal* `.c[-1] \| key` already answered `1` since #2568, so the two spellings agreed with each other for the first time |
+| `.[] \| (1 as $x \| $x) \| file_index` (`--eval-all`) | `7`, `8` | `0`, `0` | `yq ea '[.[] \| (1 as $x \| $x) \| file_index]'` is `[0,0]`, where `(. as $x \| $x)` and `tostring` are both `[0,1]` -- the binding's own rule (`OwnedIdentityRule::Bound`) |
+| `.a.zz.yy \| [path, parent]`, jq mode only | `[[..],{}]` | `[[..],null]` | no jq oracle (`path/0 is not defined`); yq answers `[[..],{"yy":null}]` by vivifying (#2435), which neither route gives -- and yq *mode* already answered `null`, so the two modes agree now |
+| `syq --eval-all '.[0].a \| parent'` over a `.nan` document | `{}` | `null` | the same document without the NaN already answered `null` on both binaries: the `{}` was the eager route the NaN forced, and the change makes the NaN case agree with every other |
+| `.[] \| (label $out \| (1, break $out)) \| file_index` | `Owned(0)` | `ManyOwned([0])` | one output, same value, different `QueryResult` variant: the surviving route collects through a sink |
+| `.[] \| select(key == 1)` on a >256-char literal (library API only) | literal kept | `1E+299` | the *owned* evaluator's own round trip, reachable only for a caller-supplied `OwnedValue`; recorded in `docs/compliance/jq/limitations.md` |
+
+**Two bugs the deletion surfaced and this work fixed in the surviving route**,
+both of which the eager evaluator had been masking:
+
+- **Unary minus over a path-context operand.** `eval_negate_with_path_context`
+  was the eager arm (#1100); with it gone, `.[] | -(file_index)` fell to the
+  wildcard bridge, lost the position and answered `-0` per element.
+  `eval_single` gained an `Expr::Negate` arm that evaluates the operand with
+  the cursor, gated on `needs_path_context` for the same #1812 reason
+  `Expr::Arithmetic`'s is, and `path_context_single_native` admits it. Real yq
+  has no unary minus; the capture is its spelled twin, `yq ea '[.[] |
+  (file_index * -1)]'` = `[0,-1]` and `yq ea '[.[] | select((file_index * -1)
+  == -1)]'` = `[20]`.
+- **A computed bracket or slice whose *target* is not navigation.**
+  `(input)[("a","b")] | key` and `(([1,2],error("x")))[(0.5):(1.5)] | key`
+  (#2100's own pins) answered `null` once the eager evaluator's own
+  `current_path` was gone. `path_context_step_target` evaluates such a target
+  at the position and makes each output a detached `PathNode::Owned` root with
+  an empty path, which is the model the eager evaluator had -- it reset
+  `current_path` to `[]` for a value the query built.
+- **A rule-less first stage.** `.c[] | (. as $x | $x) | key` answered `null`
+  per element, because `identity_from_first` asks for an
+  `owned_identity_rule` and `as` has none (it splices its body rather than
+  producing a placeable value). `owned_identity_pipe_entry_stage` sends such a
+  pipe into the owned identity route at the cursor's own identity;
+  `owned_identity_pipe_applies` asks the same question, so `eval_single` and
+  `eval_each_pipe_generic` share one definition. yq v4.53.3 answers `0`, `1`
+  for that filter and `["c",0]`, `["c",1]` for its `path` twin.
+
+**What is left.** The per-position `Vec` clones the measurement attributes the
+cost to (#2572) -- format-independent, ~2-3 days, and the lever that reaches
+most of the remaining penalty; a separate cursor cell for the walk is the
+smaller half (its ceiling is the YAML-minus-JSON gap, ~1.2 us/elem of the
+absent-head shape's 2.9 and nothing measurable on the other two). Neither is
+this change's.
+
 ## Result
 
 | Metric                                            | Before | After                 |
@@ -1230,15 +1364,17 @@ committed; nothing in the tree carries it.
 | ... starved by #2563                                | --     | 0 (11 `as`-spelled rows re-derived) |
 | ... starved by the identity pass                    | --     | 0 (40 listed rows re-derived) |
 | ... starved by the walk residue                     | --     | 0 (all 44 re-derived through a fan-out head) |
-| `PINNED_ARM_COUNT`                                 | 43     | 44                    |
+| ... deleted by the exit (#2559)                     | --     | **all 44**            |
+| `PINNED_ARM_COUNT`                                 | 43     | 44, then **gone**     |
 
-Nothing is deletable at this point in the spine -- and the walk residue is
+Nothing was deletable at the walk-residue point in the spine -- and the walk residue is
 the measurement that says why: with every *head* the walk refused now carried
-(the identity pass had already given every stage a rule), the 44 arms are all
-still reached through the one head that stays eager by design, a fan-out that
-can miss, which hands the whole pipe over and so runs the arm of every stage
-after it. What deletes them is the decision about that head (ADR-0021 decision
-8's exit condition), not another walk arm. Doors 2 and 3 are
+(the identity pass had already given every stage a rule), the 44 arms were all
+still reached through the one head that stayed eager by design, a fan-out that
+can miss, which handed the whole pipe over and so ran the arm of every stage
+after it. What deleted them was the decision about that head (ADR-0021 decision
+8's exit condition, taken in #2559 and recorded in the "Deleted" section
+above), not another walk arm. Doors 2 and 3 are
 closed as of step 5, which is a precondition rather than a deletion: the eager evaluator
 shrinks when the generic evaluator gains native arms (widening
 `path_context_single_native`) and when the absent route widens. What the

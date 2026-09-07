@@ -444,7 +444,8 @@ bounds check now survives `?`, since padding is what makes the positive case suc
 than needing `?` to swallow a failure). No write operator produces `index N out of bounds
 (length M)` any more; a numeric index past the end is not an error jq raises, so there is no
 longer a positive case for succinctly's own wording to cover. The one remaining read-side
-producer -- `eval_stage_with_path_context`'s `Expr::Index` arm, reached only when a
+producer -- `eval_stage_with_path_context`'s `Expr::Index` arm (that evaluator was
+deleted by spine 2416's exit; the surviving routes inherit the rule), reached only when a
 path-context builtin (`key`/`parent`/`path`/`file_index`) sits downstream of an out-of-bounds
 `.[N]` -- was closed the same way by
 [#2213](https://github.com/rust-works/succinctly/issues/2213): the arm now continues with
@@ -3488,7 +3489,8 @@ narrower until/while-COND-specific issue for what is the same underlying
 gave generator-argument builtins real fan-out: a builtin whose argument is a
 generator now produces one output per argument output, matching real jq.
 Four call sites inside `eval_pipe_with_path_context_internal`
-(`src/jq/eval.rs`) -- `ParentN`'s own `n` argument, the `Expr::Builtin(_)`
+(`src/jq/eval.rs`; that evaluator was deleted by spine 2416's exit, and the
+surviving routes fan out natively) -- `ParentN`'s own `n` argument, the `Expr::Builtin(_)`
 arm, the `Expr::Object`/`Array`/`Literal` arm, and the generic `_` fallback
 -- were an explicit non-goal of that fix, since giving them the same real
 fan-out looked like a materially larger change
@@ -3506,7 +3508,9 @@ The first query (no `key`, so the ordinary fan-out-aware evaluator handles
 it) correctly produces 2 outputs, matching real jq's own fan-out for this
 exact query (confirmed against jq 1.7.1). The second query is identical
 except for the trailing `key`, which forces the whole pipe through
-`eval_pipe_with_path_context_internal` since `key` needs path tracking --
+`eval_pipe_with_path_context_internal` since `key` needed path tracking (that
+evaluator is gone since spine 2416's exit; the shape now fans out on the
+walk) --
 `key` itself has no jq oracle (succinctly extension), so this specific
 combination can't be demonstrated as a *jq* divergence in isolation, but it
 was a genuine, demonstrated internal inconsistency: the same sub-expression
@@ -4146,6 +4150,32 @@ consistent value instead of a silent `null`/hard-error split depending on fork p
 this is recorded now, with regression coverage in place, as an open question for whoever
 next has reason to attempt the real per-fork re-evaluation, rather than as either a queued
 fix or a closed decision.
+
+### A caller-supplied `OwnedValue` holding a NaN or an over-cap numeric literal can still be re-spelled by a stage the owned identity route hands to the owned evaluator (spine 2416's exit)
+
+`jq::eval_owned_with_file_index` is the one public entry that hands the
+path-context machinery an `OwnedValue` the caller built rather than one read
+from a document, so it is the only way a bare `Float`, a NaN, or a
+`NumberLiteral` longer than `REINDEX_LITERAL_LEN_CAP` (256 chars) can reach
+`eval::eval_path_context_pipe_owned`. That door refuses the reindex bridge for
+exactly those values (`reindex_bridge_is_identity`) and runs the pipe through
+`eval_generic::eval_path_context_pipe_detached` instead, which never
+serializes -- so `.[0] | parent`, `[.[0] | parent]` and `.[0] | parent | .[1]`
+all hand the literal back exactly as the caller spelled it
+(`test_owned_door_keeps_a_value_the_reindex_would_respell_2419`,
+`src/jq/eval.rs`).
+
+A stage that route hands to the *ordinary owned evaluator* -- `.[] |
+select(key == 1)`, whose `select` runs through `eval_owned_input_reindexed`
+-- still takes that evaluator's own `to_json_for_reindex` round trip, so a
+300-digit literal comes back as `1E+299` there. Until spine 2416's exit the
+eager path-context evaluator answered these shapes without any round trip;
+with it deleted, this is the residue. It is not reachable from either CLI: a
+document-read number materializes as a short `NumberLiteral`, and yq mode's
+`.nan` renders as `null`/`.nan` on both sides of the trip. Real jq has no
+`key`/`parent` at all, so there is no oracle for the shape; what changed is a
+spelling succinctly used to preserve internally. Fixing it means giving the
+owned evaluator a non-reindexing path, not this door.
 
 ## Provenance
 

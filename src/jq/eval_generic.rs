@@ -14102,7 +14102,7 @@ fn cursor_ancestor<C: DocumentCursor>(c: &C, n: usize) -> Option<C> {
 
 /// Whether a path-context pipe the walk declined needs an *owned position* --
 /// the owned identity pipe or the absent route's own rewrite -- rather than
-/// being answerable stage by stage from live cursors (#2416 phase 3).
+/// being answerable stage by stage from live cursors (spine 2416 phase 3).
 ///
 /// Until spine 2416's exit this was the gate into the eager evaluator, and
 /// `true` meant "hand the whole pipe over". That evaluator is gone and no

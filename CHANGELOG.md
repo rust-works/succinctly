@@ -132,6 +132,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   M2 streaming writer, which now all agree (they previously disagreed with
   each other, not just with the oracle). yq mode is unaffected.
 
+### Removed
+
+- **The eager path-context evaluator is gone** (spine 2416, closes #2559).
+  `eval::eval_stage_with_path_context` -- 2,579 lines and 44 named handlers
+  over an `OwnedValue` tree, the fifth walker ADR-0021 was opened to retire --
+  is deleted, together with `eval_pipe_with_path_context`, its 17 helper
+  functions (`continue_rest_with_context`, `eval_index_expr_with_path_context`,
+  `eval_slice_expr_with_path_context`, `drain_path_context_stream`,
+  `catch_error_under_optional`, ...), the `BareEscapeRoute`/
+  `PathContextEscape` types, the `PathContextRoute` walk-vs-bridge test seam
+  and `eval_with_cursor_using_route`, and the two source-scanning guards that
+  existed to police it (`tests/jq_path_context_arm_guard.rs`,
+  `tests/jq_path_context_single_door_guard.rs`). `src/jq/eval.rs` loses 5,673
+  lines (net -5,460 after the comment rewrites) and `src/jq/eval_generic.rs`
+  538 (net -145, the new detached route and native `Expr::Negate` arm
+  offsetting it). Every path-context pipe now runs on the
+  cursor walk, the absent route or the owned identity pipe. ADR-0021 decision
+  8's exit condition is recorded as met, with its measurement, in the ADR and
+  in `docs/plan/path-context-arm-reachability.md`.
+
+  `path_context_needs_eager` is renamed `path_context_needs_owned_position`:
+  it no longer names a second evaluator, only whether a pipe can be answered
+  from live cursors, which is what the absent route asks of its own `rest`.
+
 ### Changed
 
 - **`src/jq/parser.rs`'s wrong-arity rewind checkpoint is now two shared
@@ -151,6 +175,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-verified live against jq 1.7.1, per the issue's own explicit caution
   after two real regressions in this exact area during #2237. No behavior
   change.
+- **A fan-out head that reads path context runs on the cursor walk instead of
+  materializing the document** (spine 2416, #2559). `[.[] | .k.x | parent]`,
+  `[.[] | .k | select(key == "k")]` and `[.[] | .missing | parent]` were
+  refused by `path_context_fans_out` at both routing sites on the grounds that
+  materializing an ancestor per element is a backward jump against YAML's
+  `Cell<SequentialCursor>`. Re-measured on current main (Apple M4 Pro, 11
+  interleaved reps, `codegen-units=1`, 1/6/20 MB inputs): the mechanism is
+  misattributed -- JSON, which has no such cache, pays the same ~0.5 us per
+  element -- and the cost is the walk's own per-position `Vec` clones (#2572).
+  **Peak RSS halves**: 511 MB -> 245 MB (yq) and 479 MB -> 257 MB (jq) on a
+  20 MB input, because the route it fell back to materialized the whole
+  document as an `OwnedValue`. **Time**: +10-13% median on `[.[] | .k.x |
+  parent]` (the shape the guard's own comment measured at +23%/+27%), +20% on
+  `[.[] | .k | select(key == "k")]`, +38-51% on the absent-head shape. Output
+  is identical on all 70 A/B configurations of that corpus, and the two
+  control shapes (`[.[] | key]`, `[.[] | .k.x | parent | key]`) sit inside a
+  +-2% floor.
+  On x86 (AMD Ryzen 9 7950X, same method) the sign on the guard's own shape
+  flips: the walk is 4-8% faster on YAML and 9-14% faster on JSON at every
+  size, the select-by-key shape sits at the floor, the absent-head shape is
+  +25% YAML / +6-15% JSON, and peak RSS drops to a third (497 MB -> 162 MB).
 
 - **`eval_generic::eval_single` now pins its own unreachability claim with a
   `debug_assert`** (#2368, a #2334 follow-up). #2334's `owned_or_suppress!`/
