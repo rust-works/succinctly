@@ -1646,7 +1646,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// not free work to pay for twice per node. `known_value` skips this
     /// function's own initial `self.value()` resolve when `Some`; a `None`
     /// behaves exactly like [`stream_yaml_value`].
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // STYLE-0004: every param is threaded through this function's own recursion (it's `stream_yaml_value`'s own body, plus `known_value`); a struct would hide the 1:1 relationship each has to a specific rendering decision
     fn stream_yaml_value_at<Out: core::fmt::Write>(
         &self,
         known_value: Option<YamlValue<'a, W>>,
@@ -7222,6 +7222,13 @@ fn write_deferred_value<Out: core::fmt::Write, W: AsRef<[u64]>>(
     };
     let absent = resolved.as_ref().is_some_and(is_deferred_value_absent_at);
     let anchor = value.anchor();
+    // #1114 review: `explicit_tag()` internally re-resolves `self.value()`
+    // (to check for `YamlValue::Alias`), so the `absent` branch still pays
+    // for a second resolve here -- this fix only closes the gap on the
+    // common (non-absent) path below, not this rarer one. Left as a
+    // follow-up (#2617): threading `resolved` into `explicit_tag()` too
+    // would mean widening a public accessor's signature for a benefit only
+    // this one already-narrow branch needs.
     let tag = if absent { value.explicit_tag() } else { None };
     write_anchor_tag(out, anchor, tag)?;
     if !absent {
@@ -7430,6 +7437,11 @@ fn write_yaml_child_inline<W: AsRef<[u64]>, Out: core::fmt::Write>(
     let resolved = if container { None } else { Some(value.value()) };
     let absent = resolved.as_ref().is_some_and(is_deferred_value_absent_at);
     if container || absent {
+        // #1114 review: `explicit_tag()` internally re-resolves
+        // `self.value()` (to check for `YamlValue::Alias`) -- see
+        // `write_deferred_value`'s own identical note (#2617) for why this
+        // residual resolve on the `absent`/container path is left as a
+        // follow-up rather than fixed here.
         if let Some(tag) = value.explicit_tag() {
             out.write_str(tag)?;
             out.write_char(' ')?;
