@@ -199,6 +199,18 @@ impl StreamableValue for OwnedValue {
             JsonConvention::Preserve => {
                 stream_owned_value_json(self, out, 0, indent.width, indent.unit, sort_keys)
             }
+            // #2209: jq mode's `--preserve-input` keeps jq's escape table
+            // while still echoing source number spellings, so it can use
+            // neither of the two pre-existing streamers -- `Preserve`'s
+            // carries yq's table, `JqCompat`'s canonicalizes numbers.
+            JsonConvention::JqPreserveInput => stream_owned_value_json_jq_preserve_input(
+                self,
+                out,
+                0,
+                indent.width,
+                indent.unit,
+                sort_keys,
+            ),
             JsonConvention::JqCompat => stream_owned_value_json_jq_output(
                 self,
                 out,
@@ -339,6 +351,39 @@ pub fn stream_owned_value_json_jq<W: core::fmt::Write>(
         |negative| infinite_float_preview_text(negative).to_string(),
         preview_infinite_literal,
         format_number_jq_compat,
+    )
+}
+
+/// Stream an `OwnedValue` as JSON the way `jq --preserve-input` must
+/// (#2209): jq's escape table (`write_json_body_jq`, the mode's own rule),
+/// paired with `Preserve`'s verbatim finite-literal echo
+/// (`real_output_finite_literal`) instead of `format_number_jq_compat`.
+///
+/// That pairing is exactly what `--preserve-input` is documented to mean —
+/// keep the document's own number spelling — without the escape-table
+/// change it was never meant to carry. Differs from
+/// [`stream_owned_value_json_jq_output`] in that one argument alone, and
+/// from [`stream_owned_value_json`] only in the escape table.
+pub(crate) fn stream_owned_value_json_jq_preserve_input<W: core::fmt::Write>(
+    value: &OwnedValue,
+    out: &mut W,
+    current_indent: usize,
+    indent_spaces: usize,
+    unit: char,
+    sort_keys: bool,
+) -> core::fmt::Result {
+    stream_owned_value_json_with(
+        value,
+        out,
+        current_indent,
+        indent_spaces,
+        unit,
+        sort_keys,
+        write_json_body_jq,
+        jq_bare_float_display,
+        real_output_infinite_float,
+        real_output_infinite_literal,
+        real_output_finite_literal,
     )
 }
 

@@ -2479,7 +2479,13 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
         sort_keys: bool,
         numbers: JsonConvention,
     ) -> StreamResult {
-        if indent.is_compact() && !sort_keys && numbers == JsonConvention::Preserve {
+        // #2209: `preserves_source_values`, not `== Preserve` -- jq mode's
+        // `--preserve-input` echoes the source span verbatim exactly as yq
+        // does (that is what "preserve" means on this path, and it predates
+        // #2209), so it must keep this fast path rather than falling into
+        // the re-encoding writer below and losing both the speed and the
+        // verbatim spelling.
+        if indent.is_compact() && !sort_keys && numbers.preserves_source_values() {
             if let Some(bytes) = self.raw_bytes() {
                 // SAFETY: JSON input is valid UTF-8 (checked during indexing)
                 let s = core::str::from_utf8(bytes).map_err(|_| core::fmt::Error)?;
@@ -3255,9 +3261,14 @@ fn write_json_string_pretty<Out: core::fmt::Write>(
     }
     let decoded = s.as_str().map_err(json_decode_failure)?;
     out.write_char('"')?;
-    match numbers {
-        JsonConvention::Preserve => write_json_body_yq(out, &decoded)?,
-        JsonConvention::JqCompat => write_json_body_jq(out, &decoded)?,
+    // #2209: keyed on the escape-table axis alone, never on
+    // `== Preserve`. jq mode's `--preserve-input` (`JqPreserveInput`)
+    // preserves numbers and duplicate keys but keeps *jq's* table --
+    // selecting yq's here was the divergence that issue fixed.
+    if numbers.uses_jq_escape_table() {
+        write_json_body_jq(out, &decoded)?;
+    } else {
+        write_json_body_yq(out, &decoded)?;
     }
     Ok(out.write_char('"')?)
 }
@@ -3292,7 +3303,10 @@ fn write_json_number<Out: core::fmt::Write>(
 ) -> core::fmt::Result {
     let raw = n.raw_bytes();
     match numbers {
-        JsonConvention::Preserve => {
+        // #2209: both source-preserving conventions echo the spelling
+        // verbatim -- they differ only in escape table, which is no
+        // concern of a number literal's.
+        JsonConvention::Preserve | JsonConvention::JqPreserveInput => {
             let text = core::str::from_utf8(raw).map_err(|_| core::fmt::Error)?;
             out.write_str(text)
         }
@@ -4274,10 +4288,18 @@ mod tests {
     // #1576 coverage: `write_json_string_pretty`'s escaping arms. The
     // zero-copy fast path only fires for a span with no `\`, so an escaped
     // string is what reaches the decode-and-re-encode tail -- and the arm
-    // taken there is `numbers`'s, not the output format's. `Preserve` is
-    // reachable from the CLI as `succinctly jq --preserve-input` with any
-    // non-compact/sorting output style (compact `Preserve` short-circuits
-    // to the raw echo in `stream_json` before this writer is reached).
+    // taken there is `numbers`'s, not the output format's.
+    //
+    // #2209 corrected this comment's original claim that `Preserve` is
+    // "reachable from the CLI as `succinctly jq --preserve-input`": it is
+    // not, and believing it was is what let jq mode render strings through
+    // yq's table. `Preserve` reaches this writer only from `yq_runner.rs`
+    // (yq mode, which always passes it); jq mode passes `JqCompat`, or
+    // `JqPreserveInput` under `--preserve-input`. `\t` below is one of the
+    // code points both tables agree on, so this test is blind to that
+    // distinction by construction -- see
+    // `test_stream_json_escape_table_is_mode_not_preserve_input_2209` for
+    // the three code points where they differ.
     #[test]
     fn test_stream_json_escaped_string_both_conventions_1576() {
         let json = br#"{"a": "x\ty"}"#;
@@ -4303,6 +4325,72 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, "{\n  \"a\": \"x\\ty\"\n}");
+    }
+
+    /// #2209: the escape table is a *mode* rule, not a `--preserve-input`
+    /// one. `JqPreserveInput` must agree with `JqCompat` and differ from
+    /// `Preserve` on exactly the three code points the two tables disagree
+    /// on (0x08, 0x0c, DEL) -- the set pinned by `jq::escape`'s own
+    /// `conventions_differ_at_exactly_three_code_points`. Before #2209 jq
+    /// mode's `--preserve-input` selected `Preserve` and so produced the yq
+    /// column here, diverging from real jq on any navigation-only filter.
+    #[test]
+    fn test_stream_json_escape_table_is_mode_not_preserve_input_2209() {
+        // The backslashes keep `write_json_string_pretty`'s zero-copy echo
+        // from firing, so the re-encoding tail (the arm under test) runs.
+        let json = br#"{"a": "\b\f\u007f"}"#;
+        let index = JsonIndex::build(json);
+        let render = |numbers| {
+            let mut out = String::new();
+            index
+                .root(json)
+                .stream_json(&mut out, IndentSpec::spaces(2), false, numbers)
+                .unwrap();
+            out
+        };
+
+        let jq = render(JsonConvention::JqCompat);
+        let preserve_input = render(JsonConvention::JqPreserveInput);
+        let yq = render(JsonConvention::Preserve);
+
+        // jq's table: short forms kept, DEL escaped.
+        assert!(jq.contains("\\b"), "jq lost the short form: {jq}");
+        assert!(jq.contains("\\f"), "jq lost the short form: {jq}");
+        assert!(jq.contains("\\u007f"), "jq left DEL raw: {jq}");
+        // yq's table: long forms only, DEL left raw.
+        assert!(yq.contains("\\u0008"), "yq table: {yq}");
+        assert!(yq.contains("\\u000c"), "yq table: {yq}");
+        assert!(yq.contains('\u{7f}'), "yq must leave DEL raw: {yq}");
+
+        assert_eq!(
+            preserve_input, jq,
+            "--preserve-input must keep jq mode's own escape table"
+        );
+        assert_ne!(
+            preserve_input, yq,
+            "--preserve-input must never adopt yq's escape table"
+        );
+    }
+
+    /// #2209: the fix must not cost `--preserve-input` its actual job.
+    /// Number spellings still survive verbatim under both preserving
+    /// conventions, and are canonicalized only by `JqCompat`.
+    #[test]
+    fn test_stream_json_preserve_input_still_preserves_numbers_2209() {
+        let json = br#"{"n": 1e100}"#;
+        let index = JsonIndex::build(json);
+        let render = |numbers| {
+            let mut out = String::new();
+            index
+                .root(json)
+                .stream_json(&mut out, IndentSpec::spaces(2), false, numbers)
+                .unwrap();
+            out
+        };
+
+        assert!(render(JsonConvention::Preserve).contains("1e100"));
+        assert!(render(JsonConvention::JqPreserveInput).contains("1e100"));
+        assert!(render(JsonConvention::JqCompat).contains("1E+100"));
     }
 
     // #1576 coverage: `stream_json_sequence`'s empty case. `map(...)` over
