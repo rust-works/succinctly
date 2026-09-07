@@ -2541,9 +2541,24 @@ fn reconcile_presentation_at_depth(
             CommentTree::Array(own_meta, items)
         }
         // A kind change (container <-> scalar, or Object <-> Array) is a
-        // fresh node with no presentation memory of its own.
+        // fresh node with no presentation memory of its own -- except the
+        // anchor mark, which is identity rather than presentation: `&x`
+        // names the *position*, and the position survives the write just
+        // like it does in the both-scalars arm below (#1359). `Leaf` is
+        // correct even when `result_value` is itself a container: every
+        // descent into a child (`CommentTree::at_index`/`field`) already
+        // falls back to the empty tree for a non-matching variant, the same
+        // outcome a freshly-built `Array`/`Object` with empty children would
+        // give, and a kind-changed node's children carry no presentation
+        // memory of their own either way. Comment and style are still
+        // dropped, since neither describes anything that survived the kind
+        // change. [`enforce_anchor_soundness`], run afterwards, is what
+        // decides whether the carried mark is still emittable.
         (OwnedValue::Object(_) | OwnedValue::Array(_), _)
-        | (_, OwnedValue::Object(_) | OwnedValue::Array(_)) => CommentTree::empty(),
+        | (_, OwnedValue::Object(_) | OwnedValue::Array(_)) => CommentTree::Leaf(NodeMeta {
+            anchor: pristine_tree.meta().anchor.clone(),
+            ..NodeMeta::empty()
+        }),
         // Both scalars, any variant/value: same node, only its value
         // changed - its own comment, style and anchor mark survive. Real
         // `yq` keeps `&x` across `.a = 99` for the same reason it keeps the
