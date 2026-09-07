@@ -70,6 +70,18 @@ use syn::visit::{self, Visit};
 /// `docs/plan/path-context-arm-reachability.md`'s "Identity pass" section
 /// measures. The pin therefore stays; the next move is the walk's, not a
 /// stage rule's.
+///
+/// 44 -> 44 (spine 2416's walk residue): the walk carries every head it used
+/// to refuse -- a slice, a `getpath`, `..`, a fan-out or escaping component,
+/// the transparent wrappers, a computed `parent(n)` -- every builtin has an
+/// identity rule and a bare `$x` stage has one too, so
+/// `path_context_needs_eager` answers `true` only for a fan-out head that can
+/// miss (and the `--eval-all` table this build cannot make ambient). That
+/// head hands the *whole* pipe over, so every one of the 44 arms is still
+/// reachable through `.[] | .b? | STAGE` -- the "Walk residue" section of
+/// `docs/plan/path-context-arm-reachability.md` carries one such re-derivation
+/// per arm. The pin stays; what lowers it is the decision about that head
+/// (ADR-0021 decision 8's exit condition), not another walk arm.
 const PINNED_ARM_COUNT: usize = 44;
 
 const TARGET_FN: &str = "eval_stage_with_path_context";

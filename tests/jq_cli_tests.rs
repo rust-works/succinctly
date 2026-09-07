@@ -33980,15 +33980,22 @@ fn test_parent_n_nan_errors_instead_of_silent_self_reference_1487() -> Result<()
     Ok(())
 }
 
-/// A positive-infinity `n` still overshoots past root (`{}`) rather than
+/// A positive-infinity `n` still overshoots past root rather than
 /// erroring -- unlike negative/NaN, "more hops than the document has
-/// depth" is a legitimate, well-defined overshoot per
-/// `resolve_ancestor_path`, not a malformed argument.
+/// depth" is a legitimate, well-defined overshoot, not a malformed
+/// argument.
+///
+/// Spine 2416 (walk residue): the overshoot emits *nothing*, where the eager
+/// evaluator's `resolve_ancestor_path` printed a `{}` placeholder. A computed
+/// `n` is walked now, and the walk's rule for a hop above the document root
+/// is #2421's: real yq v4.53.3 prints nothing for `.a.b | parent(3)` (and `[]`
+/// for `[.a.b | parent(3)]`), jq has no `parent`, and the jq-mode extension
+/// follows yq -- the same move the literal `parent(3)` made in #2421.
 #[test]
 fn test_parent_n_positive_infinite_still_overshoots_to_empty_object_1487() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-c", ".a | parent(infinite)"], Some(r#"{"a":1}"#))?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
-    assert_eq!(stdout, "{}\n");
+    assert_eq!(stdout, "");
     Ok(())
 }
 
@@ -39754,6 +39761,177 @@ fn test_identity_pass_constructs_jq_2416() -> anyhow::Result<()> {
     ] {
         let (out, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
         assert_eq!(code, 0, "`{filter}`: {out:?} {err}");
+        assert_eq!(out.trim_end(), want, "`{filter}`");
+    }
+    Ok(())
+}
+
+/// Spine 2416's walk residue in jq mode. jq 1.7.1 has no `key`/`parent`/
+/// `path/0`, so every row is succinctly's own extension surface, pinned to
+/// the tree-structural model's answer (ADR-0021 decision 7; ADR-0018 rule 5)
+/// so the route change is readable: a slice head takes jq's own
+/// `path(.c[0:1])` component, `getpath` and `first`/`last`/`nth(n)` are the
+/// navigation jq's `path(f)` says they are (captured 2026-09-07: `path(.c |
+/// first)` is `["c",0]`, `path(.c | last)` is `["c",-1]`, `path(getpath(["x",
+/// "y"]))` is `["x","y"]`, `[path(..)]` lists every node), a transparent
+/// wrapper at the head is walked as its body is (`path((try .[] catch "C"))`
+/// and `path(first((.[], error("x"))))` in jq 1.7.1), a computed `parent(n)`
+/// hops once per output of `n`, and `key` at the document root emits
+/// nothing (#2421's rule, so `.a? | parent(0+1) | key` and `last(empty) |
+/// key` moved from the eager evaluator's `null` placeholder to nothing, the
+/// move `.a | 5 | key` made in the identity pass). Exit codes are pinned
+/// with the output: `.c[halt] | key` still exits `0` silently and a
+/// component's own `error` still raises through a bracket's `?`. Document:
+/// the JSON spelling of `tests/yq_cli_tests.rs`'s `IDENTITY_PASS_DOC_2416`.
+#[test]
+fn test_walk_residue_constructs_jq_2416() -> anyhow::Result<()> {
+    let doc = r#"{"a":{"b":1,"e":2},"c":[10,20],"n":0,"m":1,"s":"hi","u":null}"#;
+    for (filter, want, want_code) in [
+        // slice head, jq component
+        (".c[0:1] | .[0] | key + 1", "1", 0),
+        (".c[0:1] | .[0] | path", "[\"c\",{\"start\":0,\"end\":1},0]", 0),
+        (".c[0:1] | key", "{\"start\":0,\"end\":1}", 0),
+        (".c[0:1] | path", "[\"c\",{\"start\":0,\"end\":1}]", 0),
+        (".c[.n:.m] | .[0] | path", "[\"c\",{\"start\":0,\"end\":1},0]", 0),
+        (".c[.n:.m]? | .[0] | key", "0", 0),
+        (".x[0:1] | path", "[\"x\",{\"start\":0,\"end\":1}]", 0),
+        (".c[0:1] | .[0] | parent | path", "[\"c\",{\"start\":0,\"end\":1}]", 0),
+        (".c[0:1] | .[0] | parent(2) | key", "\"c\"", 0),
+        // getpath head
+        ("getpath([\"a\",\"b\"]) | key", "\"b\"", 0),
+        ("getpath([\"a\",\"b\"]) | (key and parent)", "true", 0),
+        ("getpath([\"a\",\"x\"]) | path", "[\"a\",\"x\"]", 0),
+        ("getpath([\"x\",\"y\"]) | path", "[\"x\",\"y\"]", 0),
+        ("getpath([\"a\",\"b\"]) | parent | key", "\"a\"", 0),
+        ("getpath([\"c\",-1]) | path", "[\"c\",-1]", 0),
+        ("getpath([\"c\",{\"start\":0,\"end\":1}]) | path", "[\"c\",{\"start\":0,\"end\":1}]", 0),
+        ("getpath([\"c\",{\"start\":0,\"end\":1}]) | .[0] | path", "[\"c\",{\"start\":0,\"end\":1},0]", 0),
+        ("getpath([]) | path", "[]", 0),
+        ("getpath(([\"a\"],[\"c\"])) | key", "\"a\"
+\"c\"", 0),
+        ("getpath([\"a\"]) | .b | key", "\"b\"", 0),
+        (".a | getpath([\"b\"]) | tostring | key", "\"b\"", 0),
+        // fan-out / escaping component
+        (".c[(0,1)] | key", "0
+1", 0),
+        (".[(\"a\",\"c\")] | key", "\"a\"
+\"c\"", 0),
+        (".c[halt] | key", "", 0),
+        ("label $out | .[break $out] | key", "", 0),
+        (".c[error(\"x\")]? | key", "", 5),
+        (".c[(0,5)] | tostring | key", "0
+5", 0),
+        ("(.c[0], .c[5]) | tostring | key", "0
+5", 0),
+        (".a.b | parent((1,2)) | path", "[\"a\"]
+[]", 0),
+        (".a.b | [parent((0,1)) | path]", "[[\"a\",\"b\"],[\"a\"]]", 0),
+        // transparent wrapper at the head
+        ("(try .[] catch \"C\") | key", "\"a\"
+\"c\"
+\"n\"
+\"m\"
+\"s\"
+\"u\"", 0),
+        ("(try error(\"x\") catch key) | key", "", 0),
+        (".a | (try error(\"x\") catch key) | key", "\"a\"", 0),
+        (".a | (try error(\"x\") catch .) | path", "[\"a\"]", 0),
+        ("(if true then .[] else empty end) | key", "\"a\"
+\"c\"
+\"n\"
+\"m\"
+\"s\"
+\"u\"", 0),
+        ("(if .n == 0 then .a else .c end) | key", "\"a\"", 0),
+        ("(if key == \"a\" then .a else .c end) | key", "", 0),
+        (".a | (if key == \"a\" then .b else .e end) | key", "\"b\"", 0),
+        ("(label $o | .[]) | key", "\"a\"
+\"c\"
+\"n\"
+\"m\"
+\"s\"
+\"u\"", 0),
+        ("(label $o | .[] | ., break $o) | key", "\"a\"", 0),
+        ("(def f: .[]; f) | key", "\"a\"
+\"c\"
+\"n\"
+\"m\"
+\"s\"
+\"u\"", 0),
+        ("(def f: .a; f | .b) | key", "\"b\"", 0),
+        ("(def f(g): g; f(.a | .b)) | key", "\"b\"", 0),
+        ("first((.[], error(\"x\"))) | key", "\"a\"", 0),
+        ("first(.[]) | key", "\"a\"", 0),
+        ("limit(2; .[]) | key", "\"a\"
+\"c\"", 0),
+        ("limit(0; .[]) | key", "", 0),
+        ("last(.[]) | key", "\"u\"", 0),
+        ("last(empty) | key", "", 0),
+        ("last(empty) | path", "[]", 0),
+        ("(.[], empty) | key", "\"a\"
+\"c\"
+\"n\"
+\"m\"
+\"s\"
+\"u\"", 0),
+        (".a | nth(0; .[]) | key", "\"a\"", 0),
+        // recursive descent
+        ("[.. | key]", "[\"a\",\"b\",\"e\",\"c\",0,1,\"n\",\"m\",\"s\",\"u\"]", 0),
+        ("[.. | path]", "[[],[\"a\"],[\"a\",\"b\"],[\"a\",\"e\"],[\"c\"],[\"c\",0],[\"c\",1],[\"n\"],[\"m\"],[\"s\"],[\"u\"]]", 0),
+        ("[.. | parent | key]", "[\"a\",\"a\",\"c\",\"c\"]", 0),
+        ("[.a | .. | key]", "[\"a\",\"b\",\"e\"]", 0),
+        ("[recurse | key]", "[\"a\",\"b\",\"e\",\"c\",0,1,\"n\",\"m\",\"s\",\"u\"]", 0),
+        ("[recurse(.[]?) | key]", "[]", 0),
+        (".. | select(key == \"b\")", "1", 0),
+        ("first(.. | key)", "\"a\"", 0),
+        // builtins with a rule
+        (".a | explode | key", "", 5),
+        (".a | ltrimstr(\"x\") | [length, key]", "[2,\"a\"]", 0),
+        (".s | sub(\"x\";\"y\") | key", "\"s\"", 0),
+        (".c | add | key", "\"c\"", 0),
+        (".c | first | key", "0", 0),
+        (".c | last | key", "-1", 0),
+        (".c | nth(1) | key", "1", 0),
+        (".c | min_by(.) | key", "0", 0),
+        (".c | max_by(.) | path", "[\"c\",1]", 0),
+        (".s | now | key", "", 0),
+        (".n | nan | key", "", 0),
+        (".n | $ENV | key", "", 0),
+        (".n | builtins | key", "", 0),
+        (".c | range(2) | key", "\"c\"
+\"c\"", 0),
+        (".c | limit(1; repeat(.)) | key", "\"c\"", 0),
+        (".s | splits(\"x\") | key", "\"s\"", 0),
+        (".c | tostream | key", "\"c\"
+\"c\"
+\"c\"", 0),
+        (".a | keys | key", "", 0),
+        (".c | @csv | key", "\"c\"", 0),
+        (".s | @html | key", "\"s\"", 0),
+        // computed parent(n)
+        (".a.b | parent(0+1) | key", "\"a\"", 0),
+        (".a.b | parent(key | length) | key", "\"a\"", 0),
+        (".a.b | parent(empty) | key", "", 0),
+        (".a.b | parent(0+1) + {}", "{\"b\":1,\"e\":2}", 0),
+        (".a.b | parent(0+1) | (key and parent)", "true", 0),
+        (".a.b | parent(0+1) | .b |= key", "{\"b\":\"b\",\"e\":2}", 0),
+        (".a? | parent(0+1) | key", "", 0),
+        (".a[] | parent(0+1) | key", "\"a\"
+\"a\"", 0),
+        (".a | parent(infinite)", "", 0),
+        // bare $x stage
+        (".a | . as $x | $x | key", "\"a\"", 0),
+        (".a | (. as $x | $x) | key", "\"a\"", 0),
+        (". as $x | $x | key", "", 0),
+        (".a.b as $x | $x | key", "", 0),
+        (".a | . as $x | $x | path", "[\"a\"]", 0),
+        (".c[] | . as $x | $x | key", "0
+1", 0),
+        ("def f(x): x; .a.b | f(key) + \"z\"", "\"bz\"", 0),
+        ("def f(x): [x]; .a.b | f(key)", "[\"b\"]", 0),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, want_code, "`{filter}`: {out:?} {err}");
         assert_eq!(out.trim_end(), want, "`{filter}`");
     }
     Ok(())

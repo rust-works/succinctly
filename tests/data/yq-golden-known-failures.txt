@@ -31,7 +31,4 @@ seq_item_double_outdent_rejected  yaml_parser  a block sequence continuation tha
 # *silent success* — yq exits 0 having printed nothing — which is why they
 # carry an expected.empty marker (see tests/yq_golden_tests.rs).
 
-path_ctx_recurse_path       descend_path   `[.. | path]` is all `[]`; recursive descent never threads the accumulated path into its outputs — #2416
-path_ctx_recurse_key        descend_path   `[.. | key]` is all `null`, same cause as path_ctx_recurse_path — #2416
-path_ctx_recurse_kind_path  descend_path   `[.. | select(kind == "scalar") | path]` is all `[]`, same cause as path_ctx_recurse_path — #2416
 path_ctx_path_with_arg      yq_gating      `path(.a)` answers `["a"]` and exits 0; real yq has no `path(f)` at all (only bare `path`) and rejects it with "bad expression, please check expression syntax" — #1512

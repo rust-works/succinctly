@@ -32939,6 +32939,169 @@ fn test_owned_identity_rules_match_yq_2416() -> Result<()> {
     Ok(())
 }
 
+/// Spine 2416's walk residue: the heads the walk used to refuse -- a slice,
+/// a fan-out component, a comma or paren wrapper, `..` (#2428), every
+/// builtin, a bare `$x` -- at a present position, an absent one, inside a
+/// nested pipe and after a synthesized node. Every row was captured from yq
+/// v4.53.3 (`yq -o=json -I=0 FILTER doc.yaml`) on `IDENTITY_PASS_DOC_2416` on
+/// 2026-09-07 (`cap/g1_slice.txt`, `g2_g3_g4.txt`, `g6_var.txt`,
+/// `g6_parentn.txt`, `g1_slice_parent.txt`, `g2_absent_fanout.txt` and
+/// `builtins0.txt` in the pass's capture set); 207 of the 234 rows yq accepts
+/// match, and the 27 that do not are all recorded elsewhere: real yq's
+/// `first(f)` (#2377), its node-valued variables (`.a.b as $x | $x | key`,
+/// `docs/compliance/yq/limitations.md`), a comma over an absent branch in
+/// yq's context-list model (`(.c[0], .c[5]) | key`, #2451), and the
+/// jq-modeled `fromjson`/`min`/`max`/`sort`/`to_entries` type errors on
+/// inputs real yq accepts (`docs/compliance/yq/limitations.md`).
+#[test]
+fn test_walk_residue_rows_match_yq_2416() -> Result<()> {
+    let args = &["-o", "json", "-I0"];
+    for (filter, expected) in WALK_RESIDUE_ROWS_2416 {
+        let (output, code) = run_yq_stdin(filter, IDENTITY_PASS_DOC_2416, args)?;
+        assert_eq!(code, 0, "{filter}: {output:?}");
+        assert_eq!(output.trim_end(), *expected, "{filter}");
+    }
+    // A duplicate mapping key is one position under `..`, as it is under
+    // `.[]` (#1385): captured from yq v4.53.3 on `a: 1, a: 2, d: [10, 20]`.
+    for (filter, expected) in [
+        ("[.. | path]", "[[],[\"a\"],[\"d\"],[\"d\",0],[\"d\",1]]"),
+        ("[.. | key]", "[\"a\",\"d\",0,1]"),
+        ("[.. | parent | key]", "[\"d\",\"d\"]"),
+    ] {
+        let (output, code) = run_yq_stdin(filter, "a: 1\na: 2\nd: [10, 20]\n", args)?;
+        assert_eq!(code, 0, "{filter}: {output:?}");
+        assert_eq!(output.trim_end(), expected, "{filter}");
+    }
+    Ok(())
+}
+
+/// See [`test_walk_residue_rows_match_yq_2416`].
+const WALK_RESIDUE_ROWS_2416: &[(&str, &str)] = &[
+    (".c[0:1] | .[0] | key", "0"),
+    (".c[0:1] | .[0] | path", "[\"c\",0]"),
+    (".c[0:1] | key", "\"c\""),
+    (".c[0:1] | path", "[\"c\"]"),
+    (".c[0:1] | parent | key", ""),
+    (".c[0:1] | .[0] | parent | key", "\"c\""),
+    (".c[0:1] | .[0] | parent | path", "[\"c\"]"),
+    (".c[0:1] | .[0] | parent(2) | key", ""),
+    (".c[1:] | .[0] | key", "0"),
+    (".c[1:] | .[0] | path", "[\"c\",0]"),
+    (".c[:1] | .[0] | path", "[\"c\",0]"),
+    (".c | .[0:1] | .[0] | path", "[\"c\",0]"),
+    (".c[0:1][0] | path", "[\"c\",0]"),
+    (".a.b[0:1] | key", "\"b\""),
+    (".s[0:1] | key", "\"s\""),
+    (".s[0:1] | path", "[\"s\"]"),
+    (".u[0:1] | key", "\"u\""),
+    (".x[0:1] | key", "\"x\""),
+    (".x[0:1] | path", "[\"x\"]"),
+    (".c[0:1] | .[0] | tostring | key", "0"),
+    (".c[0:1] | .[] | key", "0"),
+    (".c[0:1] | .[] | path", "[\"c\",0]"),
+    (".c[0:1] | length | key", "\"c\""),
+    (".c[5:6] | .[0] | key", "0"),
+    (".c[0:1] | .[3] | key", "3"),
+    (".c[0:1] | .[3] | path", "[\"c\",3]"),
+    (".c[0:1]? | .[0] | path", "[\"c\",0]"),
+    (".c[-1:] | .[0] | path", "[\"c\",0]"),
+    (".c[0:1] | parent", "{\"a\":{\"b\":1,\"e\":2},\"c\":[10,20],\"n\":0,\"m\":1,\"s\":\"hi\",\"u\":null}"),
+    (".c[0:1] | .[0] | parent | parent", "{\"a\":{\"b\":1,\"e\":2},\"c\":[10,20],\"n\":0,\"m\":1,\"s\":\"hi\",\"u\":null}"),
+    (".c[0:1] | .[0] | parent(2)", "{\"a\":{\"b\":1,\"e\":2},\"c\":[10,20],\"n\":0,\"m\":1,\"s\":\"hi\",\"u\":null}"),
+    (".c[(0,1)] | key", "0
+1"),
+    (".c[(0,1)] | path", "[\"c\",0]
+[\"c\",1]"),
+    (".[(\"a\",\"c\")] | key", "\"a\"
+\"c\""),
+    (".[(\"a\",\"c\")] | path", "[\"a\"]
+[\"c\"]"),
+    (".c[(0,1)] | parent | key", "\"c\"
+\"c\""),
+    (".a[(\"b\",\"x\")] | key", "\"b\"
+\"x\""),
+    (".a[(\"b\",\"x\")] | path", "[\"a\",\"b\"]
+[\"a\",\"x\"]"),
+    (".c[(0,5)] | key", "0
+5"),
+    (".c[(0,5)] | tostring | key", "0
+5"),
+    ("(.[]) | key", "\"a\"
+\"c\"
+\"n\"
+\"m\"
+\"s\"
+\"u\""),
+    ("(.c[], .a.b) | key", "0
+1
+\"b\""),
+    ("(.c[], .a.b) | path", "[\"c\",0]
+[\"c\",1]
+[\"a\",\"b\"]"),
+    ("(.[] | .[]?) | key", "\"b\"
+\"e\"
+0
+1"),
+    ("(.a | .b) | key", "\"b\""),
+    (".. | key", "\"a\"
+\"b\"
+\"e\"
+\"c\"
+0
+1
+\"n\"
+\"m\"
+\"s\"
+\"u\""),
+    ("[.. | key]", "[\"a\",\"b\",\"e\",\"c\",0,1,\"n\",\"m\",\"s\",\"u\"]"),
+    ("[.. | path]", "[[],[\"a\"],[\"a\",\"b\"],[\"a\",\"e\"],[\"c\"],[\"c\",0],[\"c\",1],[\"n\"],[\"m\"],[\"s\"],[\"u\"]]"),
+    ("[.. | parent | key]", "[\"a\",\"a\",\"c\",\"c\"]"),
+    ("[.a | .. | key]", "[\"a\",\"b\",\"e\"]"),
+    ("[.a | .. | path]", "[[\"a\"],[\"a\",\"b\"],[\"a\",\"e\"]]"),
+    ("[.c | .. | path]", "[[\"c\"],[\"c\",0],[\"c\",1]]"),
+    ("[.. | select(kind == \"scalar\") | path]", "[[\"a\",\"b\"],[\"a\",\"e\"],[\"c\",0],[\"c\",1],[\"n\"],[\"m\"],[\"s\"],[\"u\"]]"),
+    ("[.. | key | type]", "[\"!!str\",\"!!str\",\"!!str\",\"!!str\",\"!!int\",\"!!int\",\"!!str\",\"!!str\",\"!!str\",\"!!str\"]"),
+    ("[.a.b | .. | key]", "[\"b\"]"),
+    ("[.a.x | .. | key]", "[\"x\"]"),
+    ("[.. | parent | path]", "[[],[\"a\"],[\"a\"],[],[\"c\"],[\"c\"],[],[],[],[]]"),
+    ("[.. | select(key == \"b\")]", "[1]"),
+    ("[.. | select(key == \"b\") | path]", "[[\"a\",\"b\"]]"),
+    ("[.[] | .. | key]", "[\"a\",\"b\",\"e\",\"c\",0,1,\"n\",\"m\",\"s\",\"u\"]"),
+    ("[.[] | .. | path]", "[[\"a\"],[\"a\",\"b\"],[\"a\",\"e\"],[\"c\"],[\"c\",0],[\"c\",1],[\"n\"],[\"m\"],[\"s\"],[\"u\"]]"),
+    ("[.. | (key, path)]", "[\"a\",\"b\",\"e\",\"c\",0,1,\"n\",\"m\",\"s\",\"u\",[],[\"a\"],[\"a\",\"b\"],[\"a\",\"e\"],[\"c\"],[\"c\",0],[\"c\",1],[\"n\"],[\"m\"],[\"s\"],[\"u\"]]"),
+    (".s | anchor | key", "\"s\""),
+    (".s | column | key", "\"s\""),
+    (".s | document_index | key", "\"s\""),
+    (".s | line_comment | key", "\"s\""),
+    (".c | all | key", "\"c\""),
+    (".c | shuffle | key", "\"c\""),
+    (".s | split_doc | key", "\"s\""),
+    (".s | trim | key", "\"s\""),
+    (".s | now | key", ""),
+    (".s | now | path", "[]"),
+    (".s | tojson | key", "\"s\""),
+    (".s | tostring | path", "[\"s\"]"),
+    (".c | any | key", "\"c\""),
+    (".c | flatten | key", "\"c\""),
+    (".c | reverse | key", "\"c\""),
+    (".a | keys | key", ""),
+    (".c | keys | key", ""),
+    (".a | to_entries | key", "\"a\""),
+    (".c | min | key", "0"),
+    (".x | length | key", "\"x\""),
+    (".x | not | key", "\"x\""),
+    (".s | kind | parent | key", ""),
+    (". as $x | $x | key", ""),
+    (".a.x as $x | $x | key", ""),
+    (".a as $x | $x | .b | key", "\"b\""),
+    (".a.b | parent(1) | key", "\"a\""),
+    (".a.b | parent(3) | key", ""),
+    (".a.b | parent(0) | key", "\"b\""),
+    (".a.b | parent(-1) | key", ""),
+    (".c[] | parent(2)", "{\"a\":{\"b\":1,\"e\":2},\"c\":[10,20],\"n\":0,\"m\":1,\"s\":\"hi\",\"u\":null}
+{\"a\":{\"b\":1,\"e\":2},\"c\":[10,20],\"n\":0,\"m\":1,\"s\":\"hi\",\"u\":null}"),
+];
+
 /// The document behind [`IDENTITY_PASS_ROWS_2416`]: a mapping with two
 /// members, a sequence, scalars of every kind and a `null`, so a row can
 /// stand at a present position (`.a.b`), an absent one (`.a.x`, `.x`), a
