@@ -816,6 +816,21 @@ to clear — an idle M4 Pro reads +0.09% median with a per-row range of -1.8%..+
 that number, #332's +1.1% median across 22 workloads was arguable; with it, the consistent
 sign was decisive, and the fix was restructured before merge.
 
+**Vary the tool flags when the change is flag-sensitive.** The harness passes `yq -o <fmt>
+-I0` and nothing else. `--extra-args` replaces that flag list, so a run can exercise `-P`,
+`--tab`, `-S`, or a different indent width. It needs the `=` form, since argparse reads a
+leading `-` as a flag of its own:
+
+```bash
+scripts/ab-cli.py --before ./succ-base --after ./succ-head --corpus <dir> --extra-args='-I4 -P'
+```
+
+Do **not** assume `-I0` and `-I2` reach different writers: succinctly renders them
+identically (both 2-space block), so neither flag alone tells you whether the block-style or
+flow-style writer ran. What decides that is the *corpus* — the `flow` generator pattern
+versus the block-shaped ones — so cover both patterns rather than trusting an indent flag to
+do it (#1448, which first assumed the opposite and had to re-check).
+
 ### 1. Interleave the two binaries; never run all of A then all of B
 
 Alternate them **within** each repetition, then compare min-of-N and median:
