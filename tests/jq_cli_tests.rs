@@ -32074,7 +32074,9 @@ fn test_getpath_still_raises_on_an_undecodable_sibling_2053() -> Result<()> {
 ///
 /// Pins that this is defensive, not a behavior change: a document-wide
 /// decode failure (`\ud800`, matching `test_getpath_still_raises_on_an_
-/// undecodable_sibling_2053`'s own repro) still raises -- uncatchable, per
+/// undecodable_sibling_2053`'s own repro) still raises *on these
+/// materializing spellings* (see the note in the body about #2168's
+/// cursor-navigable `path(.d)`) -- uncatchable, per
 /// #2286 tagging every one of these materializations' error paths
 /// `is_decode_failure()` -- through a bare call, a trailing `?`, and a
 /// `try`/`catch` wrapped in its own outer `?` (the exact shape #2231's
@@ -32099,20 +32101,28 @@ fn test_optional_ignored_sites_2280() -> Result<()> {
         assert_eq!(stdout, "", "{filter}: stderr {stderr:?}");
     }
 
-    // `@json` is not a blanket rejection of the whole document -- unlike
-    // `path`/`getpath` (whose own whole-document validity gate is pinned by
-    // `test_path_still_raises_on_an_undecodable_sibling_2061`/
-    // `test_getpath_still_raises_on_an_undecodable_sibling_2053`, and still
-    // raises on the decodable `.d` field below, same as those two), `@json`
-    // materializes only the already-navigated sub-cursor, so `.d | @json`
-    // succeeds on this same document even though `.a` is undecodable.
+    // Every row above raises because it *materializes* -- `@json` its own
+    // navigated sub-cursor, and the two `path(if ...)`/`getpath` shapes the
+    // whole document, since neither is cursor-navigable. That is what this
+    // test is about, and it is unchanged by #2168.
+    //
+    // What #2168 changed is the row below: the *cursor-navigable* spelling
+    // of the same query no longer walks the whole document, so `path(.d)`
+    // answers where `path(if true then .d else null end)` still raises.
+    // The two spellings of one query disagreeing is the residue of this
+    // decision, recorded in `docs/compliance/jq/limitations.md`; the
+    // materializing fallback is the one that keeps the old behaviour.
     let (stdout, code) = run_jq_stdin(".d | @json", doc, &["-c"])?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), "\"5\"");
-    let (_, _, code) = run_jq_stdin_streams("path(.d)", doc, &["-c"])?;
-    assert_eq!(code, 5, "path()'s whole-document gate should still fire");
-    let (_, _, code) = run_jq_stdin_streams(r#"getpath(["d"])"#, doc, &["-c"])?;
-    assert_eq!(code, 5, "getpath()'s whole-document gate should still fire");
+    let (stdout, _, code) = run_jq_stdin_streams("path(.d)", doc, &["-c"])?;
+    assert_eq!(code, 0, "#2168: the cursor-navigable path() answers");
+    assert_eq!(stdout, "[\"d\"]\n");
+    let (_, _, code) = run_jq_stdin_streams("path(if true then .d else null end)", doc, &["-c"])?;
+    assert_eq!(
+        code, 5,
+        "the materializing fallback still validates what it materializes"
+    );
 
     Ok(())
 }
@@ -36742,9 +36752,11 @@ fn test_path_validity_walk_lazy_collision_map_2061() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(stdout, "[[\"a\"],[\"\\\\ud800\"],[\"b\"]]\n");
 
-    // A navigation that never visits the undecodable key still sees it,
-    // because the walk validates the whole document -- the behaviour #2061
-    // deliberately preserved rather than trading away for speed.
+    // A navigation that never visits the undecodable key answers normally.
+    // (Before #2168 this row passed for the opposite reason -- the walk
+    // validated the whole document and this particular key, being merely
+    // undecodable rather than *colliding*, was preserved rather than raised.
+    // Now nothing outside the navigated path is inspected at all.)
     let (stdout, code) = run_jq_stdin("path(.a)", r#"{"\ud800":1,"a":2}"#, &["-c"])?;
     assert_eq!(code, 0);
     assert_eq!(stdout, "[\"a\"]\n");
@@ -36752,43 +36764,188 @@ fn test_path_validity_walk_lazy_collision_map_2061() -> Result<()> {
     Ok(())
 }
 
-/// #2061: the collision the lazy map's guard exists to catch still raises --
-/// an undecodable key whose display spelling collides with a real key of that
-/// same name, which a display-keyed map cannot hold both of (#1642).
+/// #2168: the #1642 colliding-display-key raise was part of the same
+/// whole-document gate, so it too now fires only where the query touches the
+/// keys involved -- `path(.a)` answers where it used to raise `is ambiguous`.
 ///
+/// This reverses `test_path_validity_walk_still_raises_on_a_colliding_key_2061`.
+/// The collision is a property of *rendering two keys into one display map*,
+/// which a navigation to a third key never does; `keys_unsorted` on these same
+/// documents has always answered rather than raised, so the consistency rule
+/// #2168 settled makes `path`/`key` follow it.
+///
+/// The length agreement below is the point: whatever `keys_unsorted` is
+/// willing to list, `[path(.[])]` now names, element for element. (Their
+/// *spellings* still differ -- `keys_unsorted` echoes the raw source bytes,
+/// `path` reports the fallback display form -- which is #1385/#1642's own
+/// pre-existing divergence, pinned next door by
+/// `test_path_validity_walk_lazy_collision_map_2061`, not something this
+/// change moved.)
+///
+/// **No jq oracle:** real jq 1.7.1 rejects all three documents at parse time.
 /// Checked in all three positions relative to the clean key, since the lazy
-/// map only seeds itself from the prefix once a fallback key appears: getting
-/// the seeding wrong would turn one of these into a silent success.
+/// map only seeds itself from the prefix once a fallback key appears.
 #[test]
-fn test_path_validity_walk_still_raises_on_a_colliding_key_2061() -> Result<()> {
+fn test_path_answers_past_a_colliding_key_2168() -> Result<()> {
     for doc in [
         r#"{"\\ud800":1,"\ud800":2}"#,
         r#"{"\ud800":1,"\ud800":2}"#,
         r#"{"a":1,"\ud800":2,"\ud800":3}"#,
     ] {
         let (stdout, stderr, code) = run_jq_stdin_streams("path(.a)", doc, &["-c"])?;
-        assert_eq!(code, 5, "{doc}: stdout {stdout:?} stderr {stderr:?}");
-        assert_eq!(stdout, "", "{doc}");
-        assert!(stderr.contains("is ambiguous"), "{doc}: {stderr}");
+        assert_eq!(code, 0, "{doc}: stdout {stdout:?} stderr {stderr:?}");
+        assert_eq!(stdout, "[\"a\"]\n", "{doc}");
+
+        let (paths, _, code) = run_jq_stdin_streams("[path(.[])] | length", doc, &["-c"])?;
+        assert_eq!(code, 0, "{doc}");
+        let (keys, _, code) = run_jq_stdin_streams("keys_unsorted | length", doc, &["-c"])?;
+        assert_eq!(code, 0, "{doc}");
+        assert_eq!(
+            paths, keys,
+            "{doc}: [path(.[])] must name exactly the members keys_unsorted lists"
+        );
+    }
+
+    // The materializing routes are unchanged: rendering *is* the collision,
+    // so `-S` (sort keys, which must hold both in one map) still raises.
+    let (stdout, stderr, code) =
+        run_jq_stdin_streams(".", r#"{"\ud800":1,"\ud800":2}"#, &["-S", "-c"])?;
+    assert_eq!(code, 5, "stdout {stdout:?}");
+    assert!(stderr.contains("is ambiguous"), "{stderr}");
+
+    Ok(())
+}
+
+/// #2168: `path()` validates only the nodes it navigates through, so a
+/// `\uXXXX`-family decode failure in a *sibling* it never reaches no longer
+/// makes it raise -- the rule plain navigation already followed.
+///
+/// This reverses `test_path_still_raises_on_an_undecodable_sibling_2061`,
+/// which pinned the opposite. #2061 kept a whole-document gate here because
+/// the materialization it replaced had doubled as one; #2168 measured that
+/// gate at 67-75% of such a query's runtime and this project decided the
+/// consistency question it left open -- `.d` answered `5` on the same
+/// document `path(.d)` rejected.
+///
+/// **No jq oracle.** Real jq 1.7.1 rejects every document below at parse
+/// time (`Invalid \uXXXX\uXXXX surrogate pair escape`), for `.d` as much as
+/// for `path(.d)`, so it separates none of these rows; the contract pinned
+/// is succinctly's own lazy-validation rule (recorded as an ADR-0018
+/// divergence in `docs/compliance/jq/limitations.md`).
+#[test]
+fn test_path_answers_past_an_undecodable_sibling_2168() -> Result<()> {
+    for bad in [r"\ud800", r"\uZZZZ", r"\x", r"\u12"] {
+        let input = format!("{{\"a\":\"{bad}\",\"d\":5}}");
+
+        // The sibling is never navigated to: answer, don't raise.
+        let (stdout, stderr, code) = run_jq_stdin_streams("path(.d)", &input, &["-c"])?;
+        assert_eq!(code, 0, "{bad}: stdout {stdout:?} stderr {stderr:?}");
+        assert_eq!(stdout, "[\"d\"]\n", "{bad}");
+
+        // Landing *on* the undecodable node is still not a decode: `path`
+        // reports the position, and never reads the value there -- exactly
+        // as `.a` itself echoes the raw bytes at exit 0.
+        let (stdout, stderr, code) = run_jq_stdin_streams("path(.a)", &input, &["-c"])?;
+        assert_eq!(code, 0, "{bad}: stdout {stdout:?} stderr {stderr:?}");
+        assert_eq!(stdout, "[\"a\"]\n", "{bad}");
+
+        // Navigating *through* it does read it, and raises the same error
+        // the bare navigation does -- the touched-node control.
+        let (nav_out, nav_err, nav_code) = run_jq_stdin_streams(".a.b", &input, &["-c"])?;
+        let (stdout, stderr, code) = run_jq_stdin_streams("path(.a.b)", &input, &["-c"])?;
+        assert_eq!(code, 5, "{bad}: stdout {stdout:?} stderr {stderr:?}");
+        assert_eq!(stdout, "", "{bad}");
+        assert_eq!(
+            (stdout, stderr, code),
+            (nav_out, nav_err, nav_code),
+            "{bad}: path(.a.b) must fail exactly as .a.b does"
+        );
+
+        // Iterating over the undecodable scalar reaches it too
+        // (`path_step_generic`'s own `string_decode_error` arm, live since
+        // this change), where iterating over the *object* only names its
+        // children and stays clean.
+        let (stdout, stderr, code) = run_jq_stdin_streams("path(.a[])", &input, &["-c"])?;
+        assert_eq!(code, 5, "{bad}: stdout {stdout:?} stderr {stderr:?}");
+        assert!(
+            stderr.contains("invalid unicode escape sequence") || stderr.contains("invalid escape"),
+            "{bad}: {stderr}"
+        );
+        let (stdout, stderr, code) = run_jq_stdin_streams("[path(.[])]", &input, &["-c"])?;
+        assert_eq!(code, 0, "{bad}: stdout {stdout:?} stderr {stderr:?}");
+        assert_eq!(stdout, "[[\"a\"],[\"d\"]]\n", "{bad}");
     }
     Ok(())
 }
 
-/// #2061: a `\uXXXX`-family decode failure anywhere in the document still
-/// makes `path()` raise, unchanged from before this change.
+/// #2168's rule, stated once as a table: which builtins validate a node the
+/// query never reads, and which do not.
 ///
-/// This is the validity gate the cursor walk deliberately keeps: dropping it
-/// would have made `path()` roughly 8x faster still, but #1755/#1953 chose to
-/// raise on undecodable content rather than silently substitute, and a
-/// performance change is not the place to reverse that.
+/// The two halves of the decision belong next to each other, because the
+/// argument for it is their relationship. A builtin whose walk's domain *is*
+/// the value it tests or emits (`select`, the `sort_by` family) keeps the
+/// whole-subtree gate; one that only names or navigates to a position
+/// (`path`, `key`, `parent`) validates just what it touches, like plain
+/// navigation always has. Anything that materializes still validates
+/// everything it materializes.
+///
+/// **No jq oracle for any row:** real jq 1.7.1 rejects this document at parse
+/// time for every filter, `.d` included, so it cannot separate them. The
+/// contract is succinctly's own, recorded in
+/// `docs/compliance/jq/limitations.md`.
 #[test]
-fn test_path_still_raises_on_an_undecodable_sibling_2061() -> Result<()> {
-    for bad in [r"\ud800", r"\uZZZZ", r"\x", r"\u12"] {
-        let input = format!("{{\"a\":\"{bad}\",\"d\":5}}");
-        let (stdout, stderr, code) = run_jq_stdin_streams("path(.d)", &input, &["-c"])?;
-        assert_eq!(code, 5, "{bad}: stdout {stdout:?} stderr {stderr:?}");
-        assert_eq!(stdout, "", "{bad}");
+fn test_lazy_validation_boundary_2168() -> Result<()> {
+    let doc = r#"{"a":"\ud800","d":5}"#;
+
+    // Answers: never reads `.a`.
+    for (filter, want) in [
+        (".d", "5"),
+        ("keys", r#"["a","d"]"#),
+        ("length", "2"),
+        ("path(.d)", r#"["d"]"#),
+        (".d | key", r#""d""#),
+        (".d | path", r#"["d"]"#),
+        ("path(.a)", r#"["a"]"#),
+        (".a | key", r#""a""#),
+        ("[path(.[])]", r#"[["a"],["d"]]"#),
+        ("[.[] | key]", r#"["a","d"]"#),
+        ("[paths]", r#"[["a"],["d"]]"#),
+        ("select(.d) | .d", "5"),
+    ] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
+        assert_eq!(code, 0, "{filter}: stdout {stdout:?} stderr {stderr:?}");
+        assert_eq!(stdout.trim(), want, "{filter}");
     }
+
+    // Raises: reads `.a`, or emits/tests a subtree containing it.
+    for filter in [
+        ".a | length",    // reads the value
+        ".a | tostring",  // reads the value
+        "path(.a[])",     // iterating the scalar reads it
+        "to_entries",     // materializes every member
+        ". as $x | $x",   // materializes the binding
+        ".a |= 1",        // the write path materializes
+        "sort_by(.d)",    // the sort family keeps its gate
+        "[.[]] | length", // array construction materializes each element
+    ] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
+        assert_eq!(code, 5, "{filter}: stdout {stdout:?} stderr {stderr:?}");
+        assert!(
+            stderr.contains("invalid unicode escape sequence"),
+            "{filter}: {stderr:?}"
+        );
+    }
+
+    // `select` keeps its gate even though the value it tests is clean: the
+    // *condition's own subtree* is what it validates, and here that is the
+    // whole document (`select(.)` tests the root).
+    let (stdout, stderr, code) = run_jq_stdin_streams("select(.) | .d", doc, &["-c"])?;
+    assert_eq!(code, 5, "stdout {stdout:?} stderr {stderr:?}");
+    assert!(
+        stderr.contains("invalid unicode escape sequence"),
+        "{stderr:?}"
+    );
+
     Ok(())
 }
 
@@ -38637,15 +38794,22 @@ fn test_seq_wellformed_and_leniency_unaffected_by_checked_swap_2295() -> Result<
 }
 
 /// #2349: `push_generic_document_validation_error` -- the shared validation
-/// gate for `select`/`sort_by`/`unique_by`/`min_by`/`max_by`/`path()` -- had
-/// none of the `#1677`/`#2211`/`#2243` delimiter/gap checks its materializing
+/// gate for `select`/`sort_by`/`unique_by`/`min_by`/`max_by` -- had none of
+/// the `#1677`/`#2211`/`#2243` delimiter/gap checks its materializing
 /// siblings (`to_owned_cursor_at_depth` and friends) already run, so a
 /// document corrupted in a subtree the query only ever *validates* (never
 /// emits) passed silently instead of raising. Every row here is a document
-/// real jq rejects; before this fix, succinctly accepted all eight (exit 0)
+/// real jq rejects; before this fix, succinctly accepted all of them (exit 0)
 /// while the materializing control for the identical subtree already
 /// correctly raised. Repros and control verified live against `/usr/bin/jq`
 /// 1.7.1 in the issue's own filing.
+///
+/// `path()` was a seventh caller of that gate when this test was written, and
+/// its own row lived here. #2168 removed it from the gate -- naming a
+/// position never reads what is inside it -- so that row now lives in
+/// `test_path_answers_past_a_structural_fault_it_never_reads_2168`, asserting
+/// the opposite. The rows that remain are the builtins that still validate,
+/// because the subtree they walk is the value they test or emit.
 #[test]
 fn test_validate_only_gate_delimiter_checks_2349() -> Result<()> {
     let cases: &[(&str, &str, &str)] = &[
@@ -38668,11 +38832,6 @@ fn test_validate_only_gate_delimiter_checks_2349() -> Result<()> {
             "trailing comma in nested array element, min_by",
             r#"[{"a":2,"b":[1,]},{"a":1}]"#,
             "min_by(.a) | .a",
-        ),
-        (
-            "trailing comma in nested object, path()",
-            r#"{"c":{"a":1,}}"#,
-            "path(.c)",
         ),
         (
             "stray comma with no real field, object",
@@ -38709,6 +38868,46 @@ fn test_validate_only_gate_delimiter_checks_2349() -> Result<()> {
         run_jq_full(&["-c", "select(.c) | .t"], Some(r#"{"c":{"a":1},"t":5}"#))?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
     assert_eq!(stdout.trim(), "5");
+
+    Ok(())
+}
+
+/// #2168: `path()`'s row moved out of `test_validate_only_gate_delimiter_checks_2349`.
+///
+/// The structural checks (#1194/#1677/#2211/#2243) rode on the same
+/// whole-document gate as the decode-failure raise, so dropping that gate for
+/// cursor-resolved path queries drops them too: `path(.c)` on a document whose
+/// `.c` holds a trailing comma now answers, because naming a position never
+/// reads what is inside it. `select`/`sort_by` keep their gate and so keep
+/// these checks -- their remaining rows in that test are the control.
+///
+/// **No jq oracle:** real jq rejects `{"c":{"a":1,}}` at parse time whatever
+/// the filter, `.t` included, so it separates none of these rows. What it is
+/// consistent with is succinctly's own `.t`, which has always answered `5`
+/// here (`docs/compliance/jq/limitations.md`, the lazy-validation trade-off).
+#[test]
+fn test_path_answers_past_a_structural_fault_it_never_reads_2168() -> Result<()> {
+    let doc = r#"{"c":{"a":1,},"t":5}"#;
+
+    for (filter, want) in [
+        ("path(.t)", r#"["t"]"#),
+        (".t | key", r#""t""#),
+        ("path(.c)", r#"["c"]"#),
+        ("[path(.[])]", r#"[["c"],["t"]]"#),
+        (".t", "5"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "{filter}: stdout {stdout:?} stderr {stderr:?}");
+        assert_eq!(stdout.trim(), want, "{filter}");
+    }
+
+    // Reading into the corrupted subtree still raises, on every route that
+    // does read it -- the touched-node controls.
+    for filter in [".c", ".c.a", "select(.c) | .t", "sort_by(.c) | length"] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_ne!(code, 0, "{filter}: stdout {stdout:?}");
+        assert!(stderr.contains("Invalid JSON"), "{filter}: {stderr:?}");
+    }
 
     Ok(())
 }
