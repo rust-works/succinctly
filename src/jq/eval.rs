@@ -16175,6 +16175,30 @@ fn eval_sub_replacement<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `+`-operator wording (`"string (...) and number (...) cannot be
     // added"`) rather than a bespoke message. `stitch_replacement_rows`
     // (which holds the gap text) is what performs that `+`, via `arith_add`.
+    // #2165: plain `stream_outputs`, not `_checked`, is safe here -- confirmed
+    // by investigation, not assumed. `replacement_expr` runs with `.` bound to
+    // `captures` (see this function's own doc comment above), which is built
+    // by `capture_object` purely from `regex::Captures` substrings of the
+    // already-matched subject string; the `regex` crate operates on `&str`,
+    // so that subject was necessarily valid UTF-8 already, and every capture
+    // group is a clean substring of it (or absent). `captures` itself can
+    // therefore never carry undecodable content for `stream_outputs`'s
+    // unchecked fold to silently launder.
+    //
+    // The only way outer document content can reach `replacement_expr` at all
+    // is through a channel that already validates upstream, since jq's own
+    // dynamic scoping resets `.` to `captures` for this evaluation -- a bare
+    // (non-`$`) closure parameter is evaluated fresh against *this* `.`
+    // wherever referenced, so it cannot smuggle in a value tied to the
+    // caller's own `.` either. Live-verified against three shapes that do
+    // reach outer content: a `$var` bound via `. as $doc` (already checked at
+    // bind time per #1902/#1934), `input`/`inputs` (already checked at their
+    // own materialization), and a bare closure parameter capturing an outer
+    // field name (re-evaluated against `captures`, not the caller's `.`, so
+    // it never reaches the outer document at all) -- all three raise
+    // correctly today on an undecodable value, none of them through this
+    // function's own conversion. See `test_sub_replacement_decode_failure_*`
+    // below for the pinning tests.
     let materialized =
         eval_owned_input::<W, S>(replacement_expr, &captures, optional).materialize_cursor();
     let (values, trailing) = stream_outputs(materialized);

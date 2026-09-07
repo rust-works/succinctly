@@ -27503,6 +27503,74 @@ fn test_jq_nth_generic_still_surfaces_a_skipped_decode_failure_through_a_retry_2
     Ok(())
 }
 
+/// #2165: `eval_sub_replacement`'s own `stream_outputs` call (not `_checked`)
+/// was named alongside `fanout_arg`/`fanout_two_args` as a site sharing
+/// #2022's #1746-shaped bug (an unchecked fold silently substituting `""`
+/// for an undecodable value instead of raising). Investigation found the
+/// other two already fixed (by #1989, landed after #2165 was filed) and this
+/// one provably unreachable: `sub`/`gsub` evaluate their replacement filter
+/// with `.` bound to the match's `captures` object, built purely from
+/// already-decoded (`regex`-crate-validated) substrings -- `captures` itself
+/// can never carry undecodable content. The only way outer document data
+/// can reach the replacement at all is through a `$var` binding, which this
+/// test pins: `$doc.bad` is checked at bind time (`. as $doc`), so the
+/// decode failure still surfaces even though `eval_sub_replacement`'s own
+/// conversion never touches it.
+#[test]
+fn test_sub_replacement_via_bound_var_still_raises_on_decode_failure_2165() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[r#". as $doc | $doc.subject | sub("a"; $doc.bad)"#],
+        Some(r#"{"subject": "aa", "bad": "\x"}"#),
+    )
+    .expect("sub replacement via bound var repro runs");
+    assert_eq!(code, 5, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("invalid escape sequence"),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
+/// #2165 sibling: `input`/`inputs` is the other channel that can hand outer
+/// document content to a replacement filter without going through a `$var`.
+/// It is already checked at its own materialization, so this raises too,
+/// again without `eval_sub_replacement`'s own conversion ever seeing the
+/// undecodable value.
+#[test]
+fn test_sub_replacement_via_input_still_raises_on_decode_failure_2165() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&[r#"sub("a"; input)"#], Some("\"aa\"\n\"\\x\"\n"))
+        .expect("sub replacement via input() repro runs");
+    assert_eq!(code, 5, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("invalid escape sequence"),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
+/// #2165 sibling: a bare (non-`$`) closure parameter is jq's third channel
+/// for bringing outer-scoped content into a nested filter, but jq's dynamic
+/// scoping of `.` closes this one off entirely for `sub`'s replacement --
+/// `x` here is re-evaluated wherever referenced, against `.` at that point
+/// (`captures`, never the caller's own document), so `.bad` inside `wrap`'s
+/// body can never reach the outer, undecodable `.bad` field at all. This
+/// pins that unreachability directly: even with `bad` genuinely undecodable
+/// in the source document, the call succeeds, because `x` only ever sees
+/// `captures.bad` (absent, so `null`), not the outer field.
+#[test]
+fn test_sub_replacement_via_closure_param_cannot_reach_outer_decode_failure_2165() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &[r#"def wrap(x): .subject | gsub("a"; x); wrap(.bad)"#],
+        Some(r#"{"subject": "aa", "bad": "\x"}"#),
+    )
+    .expect("sub replacement via closure param repro runs");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "\"\"\n");
+    Ok(())
+}
+
 /// The carve-out keys off the `line`/`at_offset`/... *builtins*, so a field
 /// or key that merely spells one of their names must not trip it -- that
 /// would quietly switch a filter back to the eager path and undo #1504's own
