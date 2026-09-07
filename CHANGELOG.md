@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`succinctly yq`'s cursor-streaming identity output no longer drops an
+  anchor on a mapping key** (#1352): `&k key: 1` round-tripped as plain
+  `key: 1` even on a no-op `.` query. The parser already indexed a key
+  anchor (`Parser::record_key_anchor`), but `write_yaml_field_key`
+  (`src/yaml/light.rs`) never asked for it -- unlike
+  `write_yaml_child_inline`'s existing `&anchor ` prefix for a *value*'s
+  own anchor (#763), which this mirrors. Covers both block and flow
+  mapping styles, `--sort-keys`, and combines correctly with a value's own
+  separate anchor on the same field. **Residual, not fixed here**: the DOM
+  write path (`=`, `|=`, `del()`, `-P`, `--arg`) still drops a key's anchor
+  -- see #2598.
+
 - **`succinctly jq`'s default (compact) JSON output now escapes a raw DEL
   byte (`0x7f`) in a string value or object key, matching real jq** (#2591):
   a bare `0x7f` byte is legal unescaped in JSON source (RFC 8259 only

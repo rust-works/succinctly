@@ -7274,6 +7274,14 @@ fn compact_child_indent(
 
 /// Write a mapping field's key.
 ///
+/// A key anchor (`&k key: 1`) is written first, mirroring
+/// `write_yaml_child_inline`'s own `&anchor ` prefix for a *value*'s
+/// anchor (#763) -- #1352: the parser already records a key anchor
+/// (`Parser::record_key_anchor`), but this writer never asked for it, so
+/// `&k key: 1` round-tripped as plain `key: 1` even on identity output.
+/// This is the cursor-streaming path only; the DOM write path (`=`, `|=`,
+/// `del()`, `-P`, `--arg`) still drops a key's anchor -- see #2598.
+///
 /// An explicit source tag (`!!str`, `!custom`, …) is preserved verbatim,
 /// matching real `yq` (#224). Otherwise, a literal (unquoted) `<<` merge
 /// key is tagged with `!!merge `, again matching real yq (a quoted `"<<"`
@@ -7283,6 +7291,11 @@ fn write_yaml_field_key<W: AsRef<[u64]>, Out: core::fmt::Write>(
     out: &mut Out,
     field: YamlField<'_, W>,
 ) -> StreamResult {
+    if let Some(anchor) = field.key_cursor().anchor() {
+        out.write_char('&')?;
+        out.write_str(anchor)?;
+        out.write_char(' ')?;
+    }
     let key = field.key();
     if let YamlValue::String(s) = &key {
         if let Some(tag) = field.key_cursor().explicit_tag() {
