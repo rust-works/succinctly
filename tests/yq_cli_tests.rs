@@ -25355,6 +25355,66 @@ fn test_yaml_nested_write_through_alias_keeps_the_mark_763_1351() -> Result<()> 
 }
 
 // =============================================================================
+// #1359 - a write that changes an anchored node's *kind* (container <-> scalar,
+// or object <-> array) used to fall into `reconcile_presentation_at_depth`'s
+// "fresh node, no presentation memory" arm, which cleared the anchor mark
+// along with comment/style -- dropping `&x` (and detaching every `*x` alias
+// to it) even though the position, and hence the anchor, survives the write
+// exactly as it does for a same-kind write (the `..._763` tests above).
+// Every expected string is pinned against mikefarah/yq v4.53.3, run directly
+// against that binary.
+// =============================================================================
+
+#[test]
+fn test_yaml_kind_change_container_to_scalar_keeps_anchor_1359() -> Result<()> {
+    let input = "a: &x {p: 1}\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".a = 5", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: &x 5\nb: *x\n");
+
+    // The alias's own value stays in step with the anchor's new one --
+    // `sync_aliased_paths` mirrors it, which is what keeps
+    // `enforce_anchor_soundness`'s rule 3 (equal value) satisfied.
+    let (json, exit_code) = run_yq_stdin(".a = 5", input, &["-o=json", "-I=0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(json.trim(), r#"{"a":5,"b":5}"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_kind_change_scalar_to_container_keeps_anchor_1359() -> Result<()> {
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(r#".a = {"p": 1}"#, input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: &x\n  p: 1\nb: *x\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_kind_change_object_to_array_keeps_anchor_1359() -> Result<()> {
+    // Object <-> Array is a kind change too, not just container <-> scalar.
+    let input = "a: &x {p: 1}\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(".a = [1, 2]", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: &x\n  - 1\n  - 2\nb: *x\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_kind_change_at_alias_position_still_detaches_1359() -> Result<()> {
+    // Control: a kind-change write straight to the *alias* position (rather
+    // than the anchor) is the pre-existing #763 "ends at the alias" case --
+    // it detaches, same as a same-kind write there
+    // (`test_yaml_assign_to_alias_detaches_it_but_keeps_anchor_763` above).
+    // The kind-change arm must not change that.
+    let input = "a: &x 1\nb: *x\n";
+    let (output, exit_code) = run_yq_stdin(r#".b = {"p": 1}"#, input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: &x 1\nb:\n  p: 1\n");
+    Ok(())
+}
+
+// =============================================================================
 // #2497 (split from #1351's "case 2") - a plain assignment (`.c = .b`) whose
 // value is a static read of an aliased node must itself alias, matching real
 // yq's node-copy semantics: `propagate_assign_alias_marks` in
