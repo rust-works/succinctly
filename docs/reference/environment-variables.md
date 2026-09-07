@@ -172,17 +172,29 @@ SUCCINCTLY_EXPECT_SIMD=neon cargo test --test simd_expectation_tests            
 Keeps the input's own number spelling (`4e4` stays `4e4` instead of jq's `4E+4`) and keeps every
 occurrence of a repeated object key instead of collapsing it to one field.
 
-It does **not** change which string-escape table is used: `succinctly jq` always writes jq's own
-(`\b`/`\f` short forms, DEL escaped as `\u007f`), with or without this variable. Until #2209 it
-silently switched the cursor-streaming path to *yq's* table (long `\u0008`/`\u000c` forms, DEL left
-raw), which diverged from real jq on plain navigation filters like `.a`; the escape table is a
-property of the mode you invoked, not of this variable.
+It does **not** change which string-escape *table* is used: `succinctly jq` always writes jq's own
+(`\b`/`\f` short forms), with or without this variable. Until #2209 it silently switched the
+cursor-streaming path to *yq's* table (long `\u0008`/`\u000c` forms), which diverged from real jq
+on plain navigation filters like `.a`; the escape table is a property of the mode you invoked, not
+of this variable.
 
-One nuance follows from "preserve" being literal on the compact path: with `-c`, an unmodified value
-is echoed straight from the source bytes, so its escape spelling survives exactly as written. Pretty
-output re-encodes through jq's table instead, so a source `\u0008` prints as `\b` there. Both agree
-with real jq wherever real jq has an opinion; they differ only on input spellings jq itself would
-have normalized.
+It does still change escape *output* in one place, because "preserve" is literal on the compact
+path: with `-c`, an unmodified value is echoed straight from the source bytes, so whatever spelling
+the input used survives. Real jq would normalize it. On `{"a":"\u0008"}`:
+
+| command | output |
+|---------|--------|
+| `jq -c '.a'` | `"\b"` |
+| `succinctly jq -c '.a'` | `"\b"` |
+| `succinctly jq -c --preserve-input '.a'` | `"\u0008"` |
+| `succinctly jq --preserve-input '.a'` (pretty) | `"\b"` |
+
+That is this variable doing its job, not an escape-table choice — the compact path consults no
+table at all. Pretty output re-encodes, so it matches jq either way.
+
+Separately, and unrelated to this variable: a **raw** DEL byte present literally in the source is
+echoed through unescaped in every mode, where real jq prints `\u007f`. See
+[#2591](https://github.com/rust-works/succinctly/issues/2591).
 
 Accepts `1` or `true`, matched case-insensitively — so `TRUE` and `True` also work. Any other value,
 including `yes` and `0`, leaves the default alone. Equivalent to the `--preserve-input` flag; the flag

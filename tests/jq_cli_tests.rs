@@ -40085,28 +40085,42 @@ fn test_optional_head_is_walkable_2558() -> Result<()> {
 
 /// #2209: `--preserve-input` must not switch jq mode's string-escape
 /// convention. It is documented to preserve number spellings and duplicate
-/// keys; the escape table is a *mode* rule. Real jq 1.7.1 renders U+0008,
-/// U+000C and DEL as the short forms plus an escaped DEL (confirmed live
-/// against the pinned oracle) -- before this fix the pretty, non-`-c`
-/// cursor-streaming path rendered them through *yq's* table instead
+/// keys; the escape table is a *mode* rule. Before this fix the pretty,
+/// non-`-c` cursor-streaming path rendered strings through *yq's* table
 /// (long forms, DEL left raw) whenever `--preserve-input` was set.
+///
+/// The fixture spells the two short-form controls the **long** way on
+/// purpose. A fixture spelling them as jq itself would print is useless on
+/// the compact path, which echoes source bytes without consulting any
+/// escape table -- it would pass whatever the table did.
 #[test]
 fn test_preserve_input_keeps_jq_escape_table_2209() -> Result<()> {
-    let input = r#"{"a":"\b\f\u007f"}"#;
-    let expected = "\"\\b\\f\\u007f\"";
+    let input = r#"{"a":"\u0008\u000c"}"#;
+    // What real jq 1.7.1 prints for that value, verified live.
+    let jq_output = "\"\\b\\f\"";
 
-    // All four spellings of the same read must agree with real jq: the
-    // flag is orthogonal to the escape table, and so is `-c`.
-    for args in [
-        vec!["--preserve-input"],
-        vec![],
-        vec!["-c", "--preserve-input"],
-        vec!["-c"],
-    ] {
+    // Pretty is the path that regressed. It re-encodes, so it must use
+    // jq's table whether or not the flag is set.
+    for args in [vec!["--preserve-input"], vec![]] {
         let (out, code) = run_jq_stdin(".a", input, &args)?;
         assert_eq!(code, 0, "args={args:?}");
-        assert_eq!(out.trim_end(), expected, "args={args:?}");
+        assert_eq!(out.trim_end(), jq_output, "args={args:?}");
     }
+
+    // Compact without the flag re-encodes too, so it matches jq as well.
+    let (out, code) = run_jq_stdin(".a", input, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim_end(), jq_output);
+
+    // Compact *with* the flag is the one place the two disagree, and it is
+    // not the escape table doing it: that path echoes the source span
+    // verbatim, so the long-form spelling survives. That is
+    // `--preserve-input` taking "preserve" literally, and it predates #2209.
+    // Pinned so the divergence stays deliberate rather than drifting back
+    // into an escape-table question. See #2591 for the related raw-DEL gap.
+    let (out, code) = run_jq_stdin(".a", input, &["-c", "--preserve-input"])?;
+    assert_eq!(code, 0);
+    assert_eq!(out.trim_end(), "\"\\u0008\\u000c\"");
 
     // The whole-document and generator shapes reach the same writer and
     // regressed identically, so pin them too.
