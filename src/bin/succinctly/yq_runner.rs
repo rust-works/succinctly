@@ -19,7 +19,8 @@ use succinctly::jq::document::{
 use succinctly::jq::escape::AsciiEscapeWriter;
 use succinctly::jq::eval_generic::{
     check_nesting_depth, eval_with_cursor_using, to_owned as generic_to_owned,
-    to_owned_with_comments, AnchorMark, CommentTree, GenericResult, NodeMeta,
+    to_owned_cursor as generic_to_owned_cursor, to_owned_with_comments, AnchorMark, CommentTree,
+    GenericResult, NodeMeta,
 };
 use succinctly::jq::stream::StreamFailure;
 use succinctly::jq::{
@@ -3027,8 +3028,16 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     // any other (#1247): report it and yield no documents, exactly as the
     // `GenericResult::Error` arm below does.
     let has_aliases = cursor.index().has_aliases();
+    // #1982 (code review): cursor-aware, not `generic_to_owned(&cursor.value())`
+    // -- the same "real cursor in scope but discarded" shape as the two sites
+    // this PR fixed, so a tag-forced value's own pristine snapshot doesn't
+    // silently resolve to the untagged type. Verified inert in practice today
+    // (every alias-sensitive-assign scenario tried matched the oracle either
+    // way, since #1351's `alias_identity` live-mirroring already produces a
+    // correct value before this snapshot's own comparison runs) -- fixed
+    // anyway since it costs nothing and closes the same gap defensively.
     let alias_sync_ctx = match (is_alias_sensitive_assign(expr) && has_aliases)
-        .then(|| generic_to_owned(&cursor.value()))
+        .then(|| generic_to_owned_cursor(&cursor))
     {
         Some(pristine) => {
             let Some(pristine) = sink.materialize(DiagStyle::Yq, pristine, &no_location()) else {
@@ -3094,11 +3103,21 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     // alongside the `OwnedValue` one, just to carry comment text - wasted
     // work when the caller can't use it (`-o json`'s output never reads
     // `CommentTree` at all; see `output_value`'s JSON branch) (#710).
+    //
+    // #1982: the `need_comments == false` arm must still resolve through
+    // the *cursor* (`generic_to_owned_cursor`, #747's tag-aware
+    // materializer), not `generic_to_owned(&c.value())` -- the latter
+    // takes a bare value with no cursor attached, so an explicit tag
+    // (`!!str 5`, `!!int "5"`, ...) has nowhere to be read from and
+    // silently stops applying the moment `-o json` sets `need_comments`
+    // to `false`. Confirmed live against yq v4.53.3: `!!str 5` must stay
+    // the string `"5"` under `-P -o json` exactly as it does under `-P`'s
+    // YAML output, which already went through the cursor-aware path.
     let owned_with_comments = |c: &YamlCursor<'_, W>| {
         if need_comments {
             to_owned_with_comments(&c.value(), Some(c))
         } else {
-            generic_to_owned(&c.value()).map(&no_comments)
+            generic_to_owned_cursor(c).map(&no_comments)
         }
     };
 

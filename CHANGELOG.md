@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`succinctly yq`'s DOM output path now agrees with its streaming path on
+  explicit tags and two Unicode separators** (#1982, Medium severity):
+  1. **An explicit `!!str`/`!!int`/`!!bool`/`!!null` tag was silently lost
+     on any DOM-forcing route** (`-P`, `--arg`, `-r`/`-j`/`-0`,
+     `--eval-all`, `--split-exp`, ...) -- `a: !!str 5` under `-P -o json`
+     printed the number `5` instead of the string `"5"`, changing the
+     value's type, not just its rendering. `to_owned_with_comments_at_depth`
+     (`src/jq/eval_generic.rs`)'s scalar arm called the cursor-*blind*
+     `to_owned_at_depth` unconditionally, even with a real, tag-bearing
+     cursor already in scope; `evaluate_yaml_cursor`'s `need_comments ==
+     false` arm (`-o json`, which never reads `CommentTree`) had the same
+     gap via `generic_to_owned(&c.value())`. Both now resolve through the
+     cursor-aware `tagged_scalar_to_owned`/`generic_to_owned_cursor`,
+     matching what the streaming path already did (#747).
+  2. **U+2028/U+2029 (line/paragraph separator) were emitted raw** instead
+     of escaped to `\u2028`/`\u2029` -- confirmed live that real yq (v4.53.3)
+     always escapes both in JSON output, regardless of source (a YAML
+     `\L`/`\P` escape, a raw UTF-8 byte already in a quoted scalar, or one
+     present in JSON input); real jq leaves both raw, so this is yq-only.
+     `write_json_body_yq` (`src/jq/escape.rs`) gained this as its one
+     addition beyond the shared control-character table, gated on a cheap
+     `contains(0xE2)` byte-existence probe so the common ASCII-only span
+     stays on its existing SIMD-scanned fast path
+     (`conventions_differ_at_exactly_five_code_points`, up from three).
+  **Residual, not fixed here**: the M2 streaming path itself still emits a
+  *raw* (non-`\L`/`\P`-sourced) U+2028/U+2029 byte unescaped -- see #2607.
+
 - **`succinctly yq` no longer drops a redefined anchor's earlier
   declaration on re-emission** (#1353): `a: &x 1\nb: &x 2\nc: *x` used to
   print `a: 1` (the first `&x` silently gone) even though `c: *x` still

@@ -4095,6 +4095,60 @@ fn test_slurp_json_explicit_tag_through_dom_path() -> Result<()> {
     Ok(())
 }
 
+/// #1982: `-P` forces the DOM path through a *different* conversion
+/// (`to_owned_with_comments_at_depth`, via #765's comment-tracking
+/// `owned_with_comments` closure in `evaluate_yaml_cursor`) than the
+/// `--slurp` case above (`yaml_to_owned_value`) -- so #224's fix landing
+/// for one didn't cover the other. Before this fix, `-P -o json` on
+/// `a: !!str 5` silently changed the value's type: `{"a": 5}` (a number)
+/// instead of the string `{"a": "5"}` real yq gives, because the scalar
+/// arm of `to_owned_with_comments_at_depth` called the cursor-*blind*
+/// `to_owned_at_depth` unconditionally, even though a real, tag-bearing
+/// cursor was already in scope.
+#[test]
+fn test_pretty_print_explicit_str_tag_through_dom_path_1982() -> Result<()> {
+    let (output, code) = run_yq_stdin(".", "a: !!str 5\n", &["-P", "-o", "json"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "{\n  \"a\": \"5\"\n}");
+    Ok(())
+}
+
+/// #1982: sibling of the test above, covering the `need_comments == false`
+/// arm specifically -- `-o json`'s own output never reads `CommentTree`, so
+/// `evaluate_yaml_cursor`'s `owned_with_comments` closure skips
+/// `to_owned_with_comments` entirely and used to call the cursor-blind
+/// `generic_to_owned(&c.value())` instead, losing the tag exactly the same
+/// way. `-I0` alone (no `-P`) already forces materialization for `-o json`
+/// since M2 streaming only covers the identity query on a subset of
+/// shapes -- this pins the tag fix on that plainer, more common route too.
+#[test]
+fn test_output_json_explicit_int_tag_through_dom_path_1982() -> Result<()> {
+    let (output, code) = run_yq_stdin(".", "a: !!int \"5\"\n", &["-o", "json", "-I0"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"a":5}"#);
+    Ok(())
+}
+
+/// #1982 part 2: real yq (v4.53.3) unconditionally escapes U+2028/U+2029
+/// (line/paragraph separator) in JSON output -- confirmed live, and true
+/// regardless of whether the source was a YAML \L/\P escape or a raw
+/// UTF-8 byte already in the string. succinctly's streaming YAML->JSON
+/// transcoder already special-cased this for the \L/\P spelling
+/// (`stream_transcode_double_quoted_to_json`), but the DOM path's own JSON
+/// string escaper (`write_json_body_yq`) had no equivalent, so any
+/// DOM-forcing route (`-P`, `--arg`, ...) emitted the two separators raw.
+#[test]
+fn test_line_paragraph_separators_escaped_through_dom_path_1982() -> Result<()> {
+    let (output, code) = run_yq_stdin(
+        ".",
+        "a: \"x\\Ly\\Pz\"\n",
+        &["-o", "json", "-I0", "--arg", "unused", "x"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), r#"{"a":"x\u2028y\u2029z"}"#);
+    Ok(())
+}
+
 /// #224: sibling of the test above, but the explicit tag (`!custom`) isn't
 /// one of the 5 core-schema tags, so `resolve_tagged` returns `None` and
 /// `yaml_to_owned_value` must fall through past the tag check to the
