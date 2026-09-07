@@ -30887,6 +30887,62 @@ fn test_negative_index_path_component_is_resolved_in_yq_mode_2416() -> Result<()
     Ok(())
 }
 
+/// #2568: `path_step_generic`'s `Expr::Index` arm resolved a negative index
+/// to the yq-mode path *component* (the test above) but still looked the
+/// element up with the index **as written** (`usize::try_from(idx)`, always
+/// `None` for negative `idx`), so the walk stood on `PathNode::Absent`
+/// where the element existed -- `.c[-1] | [., key]` was `[null,1]` here,
+/// `[20,1]` in yq v4.53.3. Every row captured live from yq v4.53.3 on
+/// `c: [10, 20]`, present and out of range, on flow and block spellings,
+/// in an `as` body and after `?` (which does not suppress the yq
+/// out-of-range error -- #2254). The lookup fix is mode-independent (jq's
+/// own `.c[-1]` reads the last element too), pinned separately in
+/// `jq_cli_tests.rs`'s `test_negative_index_lookup_resolves_element_2568`.
+#[test]
+fn test_negative_index_lookup_resolves_element_in_yq_mode_2568() -> Result<()> {
+    for doc in ["c: [10, 20]\n", "c:\n  - 10\n  - 20\n"] {
+        for (filter, want) in [
+            (".c[-1] | [., key]", "[20,1]"),
+            (".c[-2] | [., key]", "[10,0]"),
+            (".c[-1] | path", r#"["c",1]"#),
+            (".c[-1] | . + 1", "21"),
+            (".c[-1] as $x | [$x, (.c[-1] | key)]", "[20,1]"),
+            (".c[-1]? | [., key]", "[20,1]"),
+        ] {
+            let (out, code) = run_yq_stdin(filter, doc, &["-o", "json", "-I0"])?;
+            assert_eq!(code, 0, "`{filter}` on {doc:?}: {out:?}");
+            assert_eq!(out.trim(), want, "`{filter}` on {doc:?}");
+        }
+
+        // Out of range: still absent, and real yq's own out-of-range error
+        // survives `?` unconditionally (#2254) -- both bare and `?`-suffixed
+        // reach the same yq_negative_index_check this fix left alone.
+        for filter in [".c[-3] | [., key]", ".c[-3]? | [., key]"] {
+            let (_, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &["-o", "json"])?;
+            assert_eq!(code, 1, "`{filter}` on {doc:?}: {stderr:?}");
+            assert_eq!(
+                stderr.trim(),
+                "Error: index [-3] out of range, array size is 2",
+                "`{filter}` on {doc:?}"
+            );
+        }
+    }
+
+    // Control: a numeric index on a mapping is untouched -- that's
+    // `yq_numeric_index_on_object_is_null`'s own branch (#2459), not the
+    // array branch this fix touches, so the component stays the written,
+    // unresolved index. Confirmed live against yq v4.53.3.
+    let (out, code) = run_yq_stdin(
+        ".c[-1] | [., key]",
+        "c:\n  x: 10\n  y: 20\n",
+        &["-o", "json", "-I0"],
+    )?;
+    assert_eq!(code, 0, "{out:?}");
+    assert_eq!(out.trim(), "[null,-1]");
+
+    Ok(())
+}
+
 /// #1332, closed by spine 2416's phase 3: object construction is native in
 /// the generic evaluator with the cursor threaded into every key and value,
 /// so `key` inside `{..}` answers the node's own key. Every row captured

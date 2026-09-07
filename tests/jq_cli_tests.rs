@@ -7934,6 +7934,75 @@ fn test_as_pattern_alternatives_path_context_still_a_known_gap_1663() -> Result<
     Ok(())
 }
 
+/// #2568: `path()`'s own component is untouched by the fix below -- it
+/// reports the index as written, jq 1.7.1's own convention (ADR-0018).
+/// Captured live from `/usr/bin/jq` 1.7.1 on `{"c":[10,20]}`:
+/// `path(.c[-1])` is `["c",-1]`, `path(.c[-2])` is `["c",-2]`,
+/// `path(.c[-3])` (out of range) is `["c",-3]` -- all three unchanged
+/// across the fix, since `path()` only ever reads the accumulated trail,
+/// never the node the walk stands on.
+#[test]
+fn test_negative_index_path_component_unaffected_by_lookup_fix_2568() -> Result<()> {
+    let doc = r#"{"c":[10,20]}"#;
+    for (filter, want) in [
+        ("path(.c[-1])", r#"["c",-1]"#),
+        ("path(.c[-2])", r#"["c",-2]"#),
+        ("path(.c[-3])", r#"["c",-3]"#),
+    ] {
+        let (stdout, _, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "`{filter}`: {stdout:?}");
+        assert_eq!(stdout.trim(), want, "`{filter}`");
+    }
+    Ok(())
+}
+
+/// #2568: `path_step_generic`'s `Expr::Index` arm resolved a negative index
+/// for the path component but looked the element up with the index as
+/// written (`usize::try_from(idx)`, always `None` for a negative `idx`), so
+/// the walk stood on `PathNode::Absent` where the element existed --
+/// mode-independent, since the lookup itself never depended on
+/// `S::TAG`. No jq oracle for `key` (a succinctly extension, real jq has
+/// none), so this pins the actual before/after rather than a reference
+/// answer; `path()`'s own component is unaffected (see the test above).
+/// Captured on this issue's own pre-fix build (`_verify-2568-prefix`,
+/// `7b4f4f4fe`): `.c[-1] | [., key]` was `[null,-1]`, `.c[-2] | [., key]`
+/// was `[null,-2]`, `.c[-1]? | [., key]` was `[null,-1]` -- all three
+/// stood on `PathNode::Absent`. Object/array construction's own `key`
+/// answers the node's own cursor position once the walk lands on a real
+/// cursor (`test_object_construction_keeps_path_context_2416`'s "key
+/// inside {..} answers the node's own key"), which is why `key` here
+/// reads `1`/`0` post-fix rather than the unresolved `-1`/`-2` `path()`
+/// keeps -- a documented consequence of landing on the right cursor, not
+/// a second convention this issue introduces. Out of range and the
+/// mapping control are both unaffected (`usize::try_from`/the object-index
+/// arm neither one touched).
+#[test]
+fn test_negative_index_lookup_resolves_element_2568() -> Result<()> {
+    let doc = r#"{"c":[10,20]}"#;
+    for (filter, want) in [
+        (".c[-1] | [., key]", "[20,1]"),
+        (".c[-2] | [., key]", "[10,0]"),
+        (".c[-3] | [., key]", "[null,-3]"),
+        (".c[-1]? | [., key]", "[20,1]"),
+    ] {
+        let (stdout, _, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "`{filter}`: {stdout:?}");
+        assert_eq!(stdout.trim(), want, "`{filter}`");
+    }
+
+    // Control: a numeric index on a mapping still raises in jq mode
+    // (`eval_generic.rs`'s object branch, untouched by this fix) --
+    // confirmed live against `/usr/bin/jq` 1.7.1.
+    let (_, stderr, code) = run_jq_full(&["-c", ".c[-1]"], Some(r#"{"c":{"x":10,"y":20}}"#))?;
+    assert_eq!(code, 5, "{stderr:?}");
+    assert!(
+        stderr.contains("Cannot index object with number"),
+        "{stderr:?}"
+    );
+
+    Ok(())
+}
+
 /// #1765 item 3: `Expr::Reduce`/`Expr::Foreach`'s `input`/`INIT` now resolve
 /// `key`/`parent`/`file_index` against the caller's own ambient position,
 /// mirroring `Expr::Limit`'s own hybrid dispatch above -- `input`/`INIT`
