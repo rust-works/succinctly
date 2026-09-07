@@ -4065,130 +4065,38 @@ fn takes_input_queue_bridge(expr: &Expr) -> bool {
         && !crate::jq::walk::uses_cursor_metadata_builtins(expr)
 }
 
-/// Which route a path-context pipe takes when `Expr::Pipe` finds a stage
-/// that `needs_path_context` (#2416 phase 0).
-///
-/// `try_path_context_cursor_walk` (#2061) answers `path`/`key`/`parent`/
-/// `file_index` straight from the cursors it walks; anything it does not
-/// model returns `None` and falls through to the **bridge**, which
-/// materializes the whole document with `to_owned_with_cursor` and hands it
-/// to `eval::eval_pipe_with_path_context`. The fallback is meant to be
-/// *output-identical*, which is precisely why nothing in the suite could see
-/// #2061's own lost optimization — patch coverage caught it instead.
-///
-/// #2416 migrates the eager evaluator's arms into the walk one at a time, so
-/// "walk and bridge agree" needs to become an assertion rather than an
-/// assumption. This enum is the axis that makes it testable:
-/// [`eval_with_cursor_using_route`] runs the same filter down the other
-/// route, and `tests/jq_evaluator_parity_tests.rs` compares the two.
-///
-/// `#[doc(hidden)]`: a test seam, not API. Production callers get
-/// [`WalkThenBridge`](PathContextRoute::WalkThenBridge), which is the default
-/// and the shipped behaviour.
-#[doc(hidden)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum PathContextRoute {
-    /// Try the cursor walk first, falling back to the materializing bridge
-    /// for any shape it does not model. The shipped behaviour.
-    #[default]
-    WalkThenBridge,
-    /// Skip the walk and go straight to the bridge.
-    ///
-    /// Always *correct* — the bridge is what every un-migrated arm already
-    /// reaches — but it costs an `OwnedValue` tree over the whole document,
-    /// which is the cost #2061 exists to remove. Test-only.
-    BridgeOnly,
-}
-
-/// Ambient [`PathContextRoute`] for the current thread.
-///
-/// Mirrors `eval.rs`'s own `ambient_frame_depth`/`remaining_inputs` shape (see
-/// their doc comments) rather than threading a parameter through every
-/// `eval_single`/`fold_pipe_stages` signature: the route is consulted at
-/// exactly one call site, several recursion levels below every public entry
-/// point, and this codebase has no environment parameter anywhere for it to
-/// ride on.
-///
-/// The read is one thread-local `Cell::get` per path-context pipe — a branch
-/// that already precedes an O(document) walk or an O(document) tree build, so
-/// it does not show up next to either. Nothing on the ordinary (no
-/// `needs_path_context` stage) path touches it at all.
-///
-/// `#[cfg(feature = "std")]` only, same rationale as its two siblings in
-/// `eval.rs`: a `no_std` embedding has no `thread_local!`. There the route is
-/// a compile-time constant and the gate folds away.
-#[cfg(feature = "std")]
-mod path_context_route {
-    use super::PathContextRoute;
-    use std::cell::Cell;
-
-    thread_local! {
-        static CURRENT: Cell<PathContextRoute> =
-            const { Cell::new(PathContextRoute::WalkThenBridge) };
-    }
-
-    pub(crate) fn get() -> PathContextRoute {
-        CURRENT.with(Cell::get)
-    }
-
-    /// Installs `route` for the caller's scope, restoring the previous value
-    /// on drop — so a call that has returned never leaks its route into a
-    /// sibling evaluation.
-    #[must_use]
-    pub(crate) struct Guard(PathContextRoute);
-
-    pub(crate) fn enter(route: PathContextRoute) -> Guard {
-        let previous = get();
-        CURRENT.with(|c| c.set(route));
-        Guard(previous)
-    }
-
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            CURRENT.with(|c| c.set(self.0));
-        }
-    }
-}
-
-#[cfg(not(feature = "std"))]
-mod path_context_route {
-    use super::PathContextRoute;
-
-    pub(crate) fn get() -> PathContextRoute {
-        PathContextRoute::WalkThenBridge
-    }
-
-    pub(crate) struct Guard;
-
-    pub(crate) fn enter(_route: PathContextRoute) -> Guard {
-        Guard
-    }
-}
-
 /// The `--eval-all` file-origin table for the current thread (#715, #2427).
 ///
 /// `--eval-all` combines every document from every input file into one array
 /// and answers `file_index` from a side table mapping each top-level array
 /// position to the file it came from. Before spine 2416 step 5 that table was
-/// a parameter threaded through `eval::eval_pipe_with_path_context_internal`,
-/// which is why `eval::eval_owned_with_file_index` had to call the eager
-/// evaluator directly -- the audit's "door 2"
+/// a parameter threaded through the eager path-context evaluator, which is
+/// why `eval::eval_owned_with_file_index` had to call that evaluator directly
+/// -- the audit's "door 2"
 /// (`docs/plan/path-context-arm-reachability.md`). The cursor route has no
 /// such parameter to thread: `file_index` is answered in `eval_builtin`,
 /// several recursion levels below any entry point and generic over a cursor
-/// type it cannot carry alongside. Same reasoning, and the same shape, as
-/// [`path_context_route`] above -- see its doc comment.
+/// type it cannot carry alongside, so an ambient scope is the only shape
+/// that reaches it.
 ///
-/// Scoped by [`with_file_origin`] and read by [`file_index_for_path`] and by
-/// `eval::eval_pipe_with_path_context`, so the cursor route, the absent
-/// route, the owned-identity route and the eager evaluator all answer
-/// `file_index` from one table instead of four.
+/// Scoped by [`with_file_origin`] and read by [`file_index_for_path`], so the
+/// cursor route, the absent route and the owned-identity route all answer
+/// `file_index` from one table instead of three.
 ///
 /// An `Rc<[usize]>` rather than a borrowed slice: a `thread_local!` cannot
 /// hold a lifetime, and the clone a read costs is a refcount bump, not the
 /// table. Reading never holds the `RefCell` borrow across the evaluation, so
 /// a nested [`with_file_origin`] cannot panic on a double borrow.
-#[cfg(feature = "std")]
+///
+/// Scoped on `any(feature = "std", test)` rather than on the `std` feature
+/// alone (spine 2416, the exit): with the eager evaluator deleted this is
+/// the only way the table reaches an answer, and `cargo test
+/// --no-default-features` -- CI's `no_std` leg -- builds the unit tests with
+/// `std` linked, so gating on the feature alone would have turned every
+/// `--eval-all` `file_index` there into a silent `0`. A genuine `no_std`
+/// embedding still has no thread-local; `eval::eval_owned_with_file_index`
+/// refuses there instead of answering `0`.
+#[cfg(any(feature = "std", test))]
 mod file_origin {
     use alloc::rc::Rc;
     use std::cell::RefCell;
@@ -4222,7 +4130,7 @@ mod file_origin {
     }
 }
 
-#[cfg(not(feature = "std"))]
+#[cfg(not(any(feature = "std", test)))]
 mod file_origin {
     use alloc::rc::Rc;
 
@@ -4238,18 +4146,6 @@ mod file_origin {
         false
     }
 }
-
-/// Whether this build can make a file-origin table ambient at all.
-///
-/// `false` without `std`: [`file_origin`]'s storage is a `thread_local!`, and
-/// a `no_std` embedding has none (same limitation as [`path_context_route`]
-/// and `eval.rs`'s `remaining_inputs`). The difference is that those two
-/// degrade into a slower-but-correct default, while an unreadable file-origin
-/// table would answer `file_index` as `0` -- a wrong answer, the #715 failure
-/// class. So `eval::eval_path_context_pipe_owned` consults this and keeps a
-/// pipe that *has* a table on the eager evaluator, where the table is an
-/// ordinary parameter, whenever the ambient cannot be read back.
-pub(crate) const FILE_ORIGIN_SCOPE_AVAILABLE: bool = cfg!(feature = "std");
 
 /// Install `table` as the ambient `--eval-all` file-origin table for `f`
 /// (#715, #2427). See [`file_origin`].
@@ -4271,14 +4167,12 @@ pub(crate) fn with_file_origin<R>(table: &[usize], f: impl FnOnce() -> R) -> R {
 /// document -- an assignment reached mid-pipe (`.a | .b |= path`) has to
 /// answer `["a","b"]`, not `["b"]`.
 ///
-/// That prefix is ambient for the same reason [`path_context_route`] and
-/// [`file_origin`] are: the assignment evaluators are several recursion
-/// levels below every entry point, reached through `eval_expr`'s ordinary
-/// dispatch from routes that do not share a single environment parameter.
-/// It composes, rather than overwriting: a bridge into the eager
-/// path-context evaluator restarts `current_path` at `[]` relative to the
-/// value it was handed, so `eval::eval_stage_with_path_context` installs
-/// *this* prefix followed by its own `current_path`, and `update_path`
+/// That prefix is ambient for the same reason [`file_origin`] is: the
+/// assignment evaluators are several recursion levels below every entry
+/// point, reached through `eval_expr`'s ordinary dispatch from routes that do
+/// not share a single environment parameter.
+/// It composes, rather than overwriting:
+/// `update_path`
 /// installs the target's own absolute path around the filter so a nested
 /// `|=` inside one continues from there.
 ///
@@ -4386,13 +4280,6 @@ pub(crate) fn resolve_path_context_at<S: EvalSemantics>(
             prefetch: None,
         },
     )
-}
-
-/// The ambient `--eval-all` file-origin table, if one is installed --
-/// `eval::eval_pipe_with_path_context`'s bridge into the eager evaluator's
-/// own `file_origin` parameter.
-pub(crate) fn current_file_origin() -> Option<alloc::rc::Rc<[usize]>> {
-    file_origin::current()
 }
 
 /// Where one input node came from: the index of the file it was read from
@@ -4518,7 +4405,7 @@ pub(crate) fn ambient_document_index() -> Option<i64> {
 /// whole document come from", unaffected by further navigation. `0` with no
 /// table (every route outside `--eval-all`) and `0` at the root, the same
 /// "0 outside supported context" contract `document_index` has, and the same
-/// expression `eval::eval_stage_with_path_context`'s own `Builtin::FileIndex`
+/// expression `eval::the deleted eager path-context evaluator`'s own `Builtin::FileIndex`
 /// handler computes from its `file_origin` parameter.
 fn file_index_for_path(path: &[OwnedValue]) -> i64 {
     if let Some(file) = ambient_file_index() {
@@ -4533,28 +4420,6 @@ fn file_index_for_path(path: &[OwnedValue]) -> i64 {
         .and_then(|i| table.get(i).copied())
         .and_then(|origin| i64::try_from(origin).ok())
         .unwrap_or(0)
-}
-
-/// Evaluate against a cursor with an explicit [`PathContextRoute`] (#2416).
-///
-/// Identical to [`eval_with_cursor_using`] except that `route` decides whether
-/// a path-context pipe may take the #2061 cursor walk or must go through the
-/// materializing bridge. The route is scoped to this call and restored on
-/// return, including on an early return from a control.
-///
-/// `#[doc(hidden)]`: the walk-vs-bridge differential axis in
-/// `tests/jq_evaluator_parity_tests.rs` needs to drive both routes from
-/// outside the crate, and `try_path_context_cursor_walk` /
-/// `path_context_is_cursor_walkable` are private. This is the minimum surface
-/// that buys that, rather than exposing either of them.
-#[doc(hidden)]
-pub fn eval_with_cursor_using_route<S: EvalSemantics, C: DocumentCursor>(
-    expr: &Expr,
-    cursor: C,
-    route: PathContextRoute,
-) -> GenericResult<C::Value> {
-    let _guard = path_context_route::enter(route);
-    eval_with_cursor_using::<S, C>(expr, cursor)
 }
 
 /// Evaluate an expression against a cursor.
@@ -4592,8 +4457,8 @@ pub fn eval_with_cursor_using<S: EvalSemantics, C: DocumentCursor>(
 /// `eval_pipe` (spine 2416, step 5 -- the audit's "door 3").
 ///
 /// `eval_pipe` used to send any pipe with a `needs_path_context` stage
-/// straight to `eval::eval_pipe_with_path_context`, bypassing
-/// [`path_context_needs_eager`] entirely. It now hands the pipe here
+/// straight to `eval::the deleted eager path-context evaluator`, bypassing
+/// [`path_context_needs_owned_position`] entirely. It now hands the pipe here
 /// instead, so the one gate decides which pipes the eager evaluator still
 /// owns -- see `eval::eval_path_context_pipe_owned` for the reindex that
 /// gives this call the root cursor `key`/`parent`/`path` are properties of.
@@ -6514,24 +6379,12 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 // answer `0`. Anything the walk does not model returns
                 // `None` and falls through to the bridge below, unchanged.
                 //
-                // #2416 phase 0: `PathContextRoute::BridgeOnly` skips the
-                // walk so the two routes can be diffed against each other
-                // (`tests/jq_evaluator_parity_tests.rs`). The bridge below is
-                // always correct, so the gate is one-directional: turning the
-                // walk off can lose an optimization, never an answer.
-                if path_context_route::get() == PathContextRoute::WalkThenBridge {
-                    if let Some(root) = cursor {
-                        if let Some(result) = try_path_context_cursor_walk::<S, V>(exprs, root) {
-                            return result;
-                        }
+                if let Some(root) = cursor {
+                    if let Some(result) = try_path_context_cursor_walk::<S, V>(exprs, root) {
+                        return result;
                     }
                 }
                 // #2416 step 2: a head that can land on an absent node.
-                // Outside the `PathContextRoute` gate above on purpose --
-                // that gate turns the *walk* off so the two routes can be
-                // diffed, and this is phase 3's absent half, not the walk:
-                // it is the only thing that answers these pipes exactly, so
-                // switching it off would change answers, not just cost.
                 if let Some(root) = cursor {
                     if let Some(result) = try_path_context_absent_walk::<S, V>(exprs, root) {
                         return result;
@@ -6546,38 +6399,6 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 // position entirely.
                 if cursor.is_none() {
                     let owned = owned_or_suppress!(to_owned_with_cursor(&value, None), optional);
-                    return eval_on_owned::<S, _>(&Expr::Pipe(exprs.clone()), owned, optional);
-                }
-                // #2416 phase 3: a pipe the walk declined runs here, in the
-                // generic evaluator with `key`/`parent`/`path` answered as
-                // cursor properties, unless `path_context_needs_eager` says
-                // only the eager evaluator can answer it.
-                if path_context_needs_eager(exprs) {
-                    let owned = owned_or_suppress!(to_owned_with_cursor(&value, cursor), optional);
-                    // #1909: straight into `eval.rs`'s path-context evaluator
-                    // with the tree we just built, rather than through
-                    // `eval_on_owned`'s reindex bridge -- which lands in
-                    // `eval::eval_pipe`, whose own `needs_path_context` gate
-                    // (the same predicate checked just above) materializes the
-                    // whole document a *second* time before calling exactly this
-                    // function. Only where that bridge was a semantic no-op
-                    // (`reindex_bridge_is_identity`); otherwise unchanged.
-                    //
-                    // `optional` is deliberately not threaded into the bypass,
-                    // for the same reason `eval_on_owned` doesn't thread it into
-                    // its own `full_eval` call: that entry point restarts every
-                    // evaluation at `false` regardless of what its caller
-                    // passed, so `false` is what the bridge actually delivered.
-                    if reindex_bridge_is_identity(&owned) {
-                        return query_result_to_generic::<V>(
-                            crate::jq::eval::eval_pipe_with_path_context::<Vec<u64>, S>(
-                                exprs,
-                                &owned,
-                                &[],
-                                false,
-                            ),
-                        );
-                    }
                     return eval_on_owned::<S, _>(&Expr::Pipe(exprs.clone()), owned, optional);
                 }
             }
@@ -6736,6 +6557,38 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             if needs_path_context(left) || needs_path_context(right) =>
         {
             collect_each_generic::<S, V>(expr, value, optional, cursor)
+        }
+
+        // Spine 2416 (the exit): unary minus over a path-context operand.
+        // The eager evaluator carried this as `eval_negate_with_path_context`
+        // (#1100) so `-file_index` mid-pipe read at the node; with that
+        // evaluator deleted the arm has to be here, evaluating the operand
+        // *with the cursor*. Without it the wildcard bridge below
+        // materializes the value, loses the position, and `.[] |
+        // -(file_index)` answers `-0` for every element.
+        //
+        // Real yq has no unary minus, so the capture is its spelled twin,
+        // live against v4.53.3 over two single-document files: `yq ea '[.[] |
+        // (file_index * -1)]'` is `[0,-1]` and `yq ea '[.[] |
+        // select((file_index * -1) == -1)]'` is `[20]` -- the read happens at
+        // the node either way.
+        //
+        // Gated on `needs_path_context` for the same #1812 reason as the
+        // `Expr::Arithmetic` arm above: an ungated arm would stop paying the
+        // bridge's ambient decode on a malformed document.
+        Expr::Negate(inner) if needs_path_context(inner) => {
+            let (values, control) =
+                stream_owned_outputs_generic::<S, V>(inner, value, optional, cursor);
+            let mut out: Vec<OwnedValue> = vec_with_capacity(values.len());
+            for v in values {
+                match crate::jq::eval::arith_negate::<S>(v) {
+                    Ok(negated) => out.push(negated),
+                    // Same rule as `eval::negate_fanout_core`: the prefix
+                    // already negated survives the type error.
+                    Err(e) => return finish_fork_generic(out, Some(Control::Error(e)), optional),
+                }
+            }
+            finish_fork_generic(out, control, optional)
         }
 
         // Spine 2416 gate reason 3 (#2473): `and`/`or` with a path-context
@@ -8449,29 +8302,55 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
     if exprs.iter().any(needs_path_context) {
         // #2416 phase 2: the cursor walk emits straight into `sink`, so a
         // path-context pipe is as lazy as any other stage here. Anything the
-        // walk's static gate declines takes the eager route below, unchanged
-        // -- and `PathContextRoute::BridgeOnly` forces it, for the walk-vs-
-        // bridge axis in `tests/jq_evaluator_parity_tests.rs`.
-        if path_context_route::get() == PathContextRoute::WalkThenBridge {
-            if let Some(root) = cursor {
-                if let Some(flow) = try_path_context_walk_sink::<S, V>(exprs, root, sink) {
-                    return flow;
-                }
+        // walk's static gate declines takes the absent route or the owned
+        // door below.
+        if let Some(root) = cursor {
+            if let Some(flow) = try_path_context_walk_sink::<S, V>(exprs, root, sink) {
+                return flow;
             }
         }
-        // #2416 step 2: see `eval_single`'s `Expr::Pipe` arm for why this
-        // sits outside the `PathContextRoute` gate above.
         if let Some(root) = cursor {
             if let Some(flow) = try_path_context_absent_sink::<S, V>(exprs, root, sink) {
                 return flow;
             }
         }
-        // #2416 phase 3: see `eval_single`'s `Expr::Pipe` arm -- the same
-        // gate, so both routes agree on which pipes the eager evaluator
-        // still owns; and the same cursor-less rule (spine 2416, identity
-        // pass), so a value with no position of its own takes the owned
-        // door from here too.
-        if cursor.is_none() || path_context_needs_eager(exprs) {
+        // spine 2416 (the exit): a leading stage the owned identity *pipe*
+        // can run at a position but no single `owned_identity_rule` can
+        // *place* -- an `as` binding, whose body is spliced rather than
+        // placed (#2563) -- used to hand the whole pipe to the eager
+        // evaluator, because `identity_from_first` below asks for a rule.
+        // Start the identity pipe from this node's own identity instead:
+        // `.c[] | (. as $x | $x) | key` is `0`, `1` and `.c[] | (. as $x |
+        // $x) | path` is `["c",0]`, `["c",1]` in yq v4.53.3 (captured live on
+        // `c: [10, 20]`), which is what the eager route answered and what
+        // the staged fallback below would lose.
+        if let Some(root) = cursor {
+            if exprs.first().is_some_and(owned_identity_pipe_entry_stage)
+                && owned_identity_pipe_supported(exprs)
+            {
+                // STYLE-0012: an undecodable node is the decode failure the
+                // whole query answers with (#1755), not something this
+                // route's ambient `?` may swallow -- the same rule the
+                // sibling owned door applies (`eval::eval_pipe`'s own
+                // `to_owned`, not `to_owned_lossy`).
+                let owned = match to_owned_cursor(&root) {
+                    Ok(v) => v,
+                    Err(e) => return Flow::Escaped(Control::Error(e)),
+                };
+                return eval_owned_identity_pipe::<S, V>(
+                    exprs,
+                    owned,
+                    OwnedIdentity::kept(root),
+                    optional,
+                    sink,
+                );
+            }
+        }
+        // spine 2416 (identity pass): a value with no position of its own
+        // takes the owned door (`eval::eval_path_context_pipe_owned`) from
+        // here too, exactly as it does from `eval_single`'s `Expr::Pipe`
+        // arm.
+        if cursor.is_none() {
             return drain_result_generic(
                 eval_single::<S, _>(&Expr::Pipe(exprs.to_vec()), value, optional, cursor),
                 sink,
@@ -12774,7 +12653,7 @@ fn path_context_is_navigational_at(expr: &Expr, unfolded: u8) -> bool {
         | Expr::RecursiveDescent
         | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => true,
         Expr::SliceExpr { target, start, end } => {
-            nav(target)
+            (nav(target) || path_context_component_walkable(target))
                 && start
                     .as_deref()
                     .map_or(true, path_context_component_walkable)
@@ -12857,12 +12736,24 @@ fn path_context_is_navigational_at(expr: &Expr, unfolded: u8) -> bool {
         // evaluator.
         // spine 2416 (walk residue): a component that fans out (`.c[(0,1)]`)
         // is admitted too -- one position per branch, which is the class
-        // `path_context_fans_out` sees (its `IndexExpr` arm reads the
+        // the deleted fan-out guard sees (its `IndexExpr` arm reads the
         // component now), so the routing sites' fan-out guard decides, and
-        // `path_context_needs_eager` keeps a fan-out head that can miss on
+        // `path_context_needs_owned_position` keeps a fan-out head that can miss on
         // the eager evaluator by design rather than on the gap a fan-out
         // over absent positions used to fall into.
-        Expr::IndexExpr { target, key } => nav(target) && path_context_component_walkable(key),
+        // spine 2416 (the exit): a target that is *not* navigation
+        // (`(input)["a"]`, `([1,2],error("x"))[0.5:1.5]`) is evaluated at the
+        // position and each of its outputs becomes a detached owned root, so
+        // the bracket's component still names the child it took. That is what
+        // the eager evaluator did with its own `current_path`, which it reset
+        // to `[]` for a value the query built -- `(input)[("a","b")] | key` is
+        // `"a"`, `"b"` and `(([1,2],error("x")))[(0.5):(1.5)] | key` is
+        // `{"start":0.5,"end":1.5}`, both pinned in `tests/jq_cli_tests.rs`
+        // since #2100. See [`path_context_step_target`].
+        Expr::IndexExpr { target, key } => {
+            (nav(target) || path_context_component_walkable(target))
+                && path_context_component_walkable(key)
+        }
         Expr::Paren(inner) => nav(inner),
         Expr::Pipe(exprs) | Expr::Comma(exprs) => exprs.iter().all(nav),
         Expr::Builtin(Builtin::Parent) => true,
@@ -12889,193 +12780,6 @@ fn path_context_is_navigational_at(expr: &Expr, unfolded: u8) -> bool {
 /// is carried out exactly as the eager route carried it (#2495).
 fn path_context_component_walkable(expr: &Expr) -> bool {
     owned_identity_component_supported(expr)
-}
-
-/// Whether a *component* -- a computed bracket's key, a slice bound, a
-/// `getpath` argument -- can produce more than one value, which makes the
-/// step it belongs to a fan-out (`.c[(0,1)]` is one position per branch).
-///
-/// Narrower than [`path_context_fans_out`]: an array or object literal
-/// collects whatever is inside it into one value, so `getpath(["a","b"])`
-/// is a single path, and a bounded consumer is single-output by
-/// construction. Anything the recursion does not name is judged by the
-/// generators it contains.
-fn path_context_component_fans_out(expr: &Expr) -> bool {
-    match expr {
-        Expr::Array(_)
-        | Expr::Object(_)
-        | Expr::Literal(_)
-        | Expr::TrackedVar(_)
-        | Expr::Format(_)
-        | Expr::StringInterpolation(_)
-        | Expr::Reduce { .. }
-        | Expr::FirstExpr(_)
-        | Expr::LastExpr(_)
-        | Expr::Identity
-        | Expr::Field(_)
-        | Expr::Index { .. }
-        | Expr::Slice { .. } => false,
-        Expr::Comma(exprs) => exprs.len() > 1 || exprs.iter().any(path_context_component_fans_out),
-        Expr::Pipe(exprs) => exprs.iter().any(path_context_component_fans_out),
-        Expr::Paren(inner) | Expr::Optional(inner) | Expr::Negate(inner) => {
-            path_context_component_fans_out(inner)
-        }
-        Expr::IndexExpr { target, key } => {
-            path_context_component_fans_out(target) || path_context_component_fans_out(key)
-        }
-        Expr::SliceExpr { target, start, end } => {
-            path_context_component_fans_out(target)
-                || start
-                    .as_deref()
-                    .is_some_and(path_context_component_fans_out)
-                || end.as_deref().is_some_and(path_context_component_fans_out)
-        }
-        Expr::Arithmetic { left, right, .. }
-        | Expr::Compare { left, right, .. }
-        | Expr::And(left, right)
-        | Expr::Or(left, right)
-        | Expr::Alternative(left, right) => {
-            path_context_component_fans_out(left) || path_context_component_fans_out(right)
-        }
-        Expr::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            path_context_component_fans_out(cond)
-                || path_context_component_fans_out(then_branch)
-                || path_context_component_fans_out(else_branch)
-        }
-        Expr::Try { expr, catch } => {
-            path_context_component_fans_out(expr)
-                || catch
-                    .as_deref()
-                    .is_some_and(path_context_component_fans_out)
-        }
-        Expr::Limit { expr, .. } => path_context_component_fans_out(expr),
-        Expr::Builtin(Builtin::Select(_)) => false,
-        other => crate::jq::walk::any_subexpr(other, &mut |e| {
-            matches!(
-                e,
-                Expr::Iterate
-                    | Expr::RecursiveDescent
-                    | Expr::Range { .. }
-                    | Expr::Repeat(_)
-                    | Expr::While { .. }
-                    | Expr::Until { .. }
-                    | Expr::Foreach { .. }
-                    | Expr::Builtin(
-                        Builtin::Recurse
-                            | Builtin::RecurseF(_)
-                            | Builtin::RecurseCond(..)
-                            | Builtin::Paths
-                            | Builtin::PathsFilter(_)
-                            | Builtin::LeafPaths
-                            | Builtin::Splits(_)
-                            | Builtin::SplitsFlags(..)
-                            | Builtin::Scan(_)
-                            | Builtin::ScanFlags(..)
-                            | Builtin::Inputs
-                    )
-            ) || matches!(e, Expr::Comma(exprs) if exprs.len() > 1)
-        }),
-    }
-}
-
-/// Whether a walked expression can emit more than one *materialized* value.
-///
-/// Materializing an ancestor is a **backward** jump against the document-wide
-/// `Cell<SequentialCursor>` in `AdvancePositions`/`CompactEndPositions`: it
-/// falls into `get_random`, which resets the incremental scan to position
-/// zero, so the next sequential call rescans from there. A fan-out that
-/// materializes once per element pays that reset once per element, where the
-/// bridge decodes the document forwards exactly once. Measured on YAML,
-/// `[.[] | .k.x | parent] | length` was +23%/+27% (1 MB/6 MB, M4 Pro).
-///
-/// The decision has to be **static**, taken before the O(document) validity
-/// gate runs. A dynamic "stop at the second materialization" cap was measured
-/// and came out *worse* than no guard at all -- +29%/+38% -- because bailing
-/// then pays the gate and a partial walk and *then* the whole bridge.
-fn path_context_fans_out(expr: &Expr) -> bool {
-    match expr {
-        Expr::Iterate
-        | Expr::RecursiveDescent
-        | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => true,
-        Expr::Comma(exprs) => exprs.len() > 1 || exprs.iter().any(path_context_fans_out),
-        Expr::Pipe(exprs) => exprs.iter().any(path_context_fans_out),
-        // `Expr::Optional` since #2558: `.[]?` became navigational there, so
-        // without this arm a suppressed iterate would hide the very fan-out
-        // this guard exists to refuse.
-        Expr::Paren(inner) | Expr::Array(inner) | Expr::Optional(inner) => {
-            path_context_fans_out(inner)
-        }
-        // #2471: a computed bracket fans out when its *target* does; since
-        // spine 2416's walk residue also when its *component* does
-        // (`.c[(0,1)]`, one position per branch), which is what lets
-        // `path_context_is_navigational` admit such a component and leave
-        // the decision to the routing sites' guard.
-        Expr::IndexExpr { target, key } => {
-            path_context_fans_out(target) || path_context_component_fans_out(key)
-        }
-        Expr::SliceExpr { target, start, end } => {
-            path_context_fans_out(target)
-                || start
-                    .as_deref()
-                    .is_some_and(path_context_component_fans_out)
-                || end.as_deref().is_some_and(path_context_component_fans_out)
-        }
-        Expr::Builtin(Builtin::GetPath(p)) => path_context_component_fans_out(p),
-        Expr::Builtin(Builtin::ParentN(n)) => path_context_component_fans_out(n),
-        // spine 2416 (walk residue): the transparent wrappers fan out when
-        // their body does; a bounded consumer of one output does not, and a
-        // `limit` is judged by its body since its count is a value.
-        Expr::Try { expr, catch } => {
-            path_context_fans_out(expr) || catch.as_deref().is_some_and(path_context_fans_out)
-        }
-        Expr::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            path_context_component_fans_out(cond)
-                || path_context_fans_out(then_branch)
-                || path_context_fans_out(else_branch)
-        }
-        Expr::Label { body, .. } => path_context_fans_out(body),
-        Expr::Limit { expr, .. } => path_context_fans_out(expr),
-        Expr::Shared(inner) => path_context_fans_out(inner),
-        Expr::FuncDef {
-            name,
-            params,
-            body,
-            then,
-            bound,
-        } => path_context_fans_out(&bind_def(name, &param_names(params), body, then, bound)),
-        Expr::DefCall {
-            def,
-            args,
-            frames,
-            bound,
-        } => bind_def_call(def, args, *frames, bound).is_ok_and(|b| path_context_fans_out(b)),
-        _ => false,
-    }
-}
-
-/// Whether every branch of `expr` ends in a stage that answers from the path
-/// itself (`key`/`path`) rather than by materializing the node it stands on.
-///
-/// A fan-out of these is free -- they emit a path component and decode
-/// nothing -- which is what keeps `[.[] | key]` and `[.[] | .k | parent |
-/// key]` on the fast path while `[.[] | .k | parent]` is handed back.
-fn path_context_emits_paths_only(expr: &Expr) -> bool {
-    match expr {
-        Expr::Builtin(Builtin::PathNoArg | Builtin::Key) => true,
-        Expr::Paren(inner) | Expr::Array(inner) => path_context_emits_paths_only(inner),
-        Expr::Comma(exprs) => exprs.iter().all(path_context_emits_paths_only),
-        // Only a pipe's last stage emits; the earlier ones just move.
-        Expr::Pipe(exprs) => exprs.last().is_some_and(path_context_emits_paths_only),
-        _ => false,
-    }
 }
 
 /// A position reached during a path-context walk: the node the path reached
@@ -13579,7 +13283,7 @@ fn path_context_step_computed_slice<S: EvalSemantics, V: DocumentValue>(
     let (starts, starts_control) = bound(start);
     let (ends, ends_control) = bound(end);
     let mut targets = Vec::new();
-    let stepped = path_context_step_generic::<S, V>(target, pos, &mut targets);
+    let stepped = path_context_step_target::<S, V>(target, pos, &mut targets);
     for s in &starts {
         for e in &ends {
             let slice = Expr::SliceExpr {
@@ -13857,6 +13561,41 @@ fn path_context_resolve_at_pos<S: EvalSemantics, V: DocumentValue>(
     )
 }
 
+/// The *target* of a computed bracket or slice, as positions (spine 2416,
+/// the exit).
+///
+/// Navigation is stepped, exactly as before. Anything else -- a container
+/// literal, `input`, a comma of them -- is a value the query *built*, so it
+/// stands at no document position at all: it is evaluated at `pos` (the same
+/// [`path_context_component_values`] a computed component is evaluated by, so
+/// a `key`/`path` inside it resolves to this position's constants) and each
+/// output becomes a detached [`PathNode::Owned`] root with an empty path.
+/// The bracket's component is then appended to *that*, which is the model the
+/// eager evaluator had: it reset its `current_path` to `[]` for a value the
+/// query built, so `(input)[("a","b")] | key` is `"a"`, `"b"` and
+/// `(([1,2],error("x")))[(0.5):(1.5)] | key` is `{"start":0.5,"end":1.5}`
+/// before the error (both pinned in `tests/jq_cli_tests.rs` since #2100).
+/// jq 1.7.1 has no `key` at all and real yq's lexer rejects the spelling, so
+/// the pins are succinctly's own; what the exit had to keep is the answer.
+fn path_context_step_target<S: EvalSemantics, V: DocumentValue>(
+    target: &Expr,
+    pos: &PathContextPos<V>,
+    out: &mut Vec<PathContextPos<V>>,
+) -> Result<(), Control> {
+    if path_context_is_navigational(target) {
+        return path_context_step_generic::<S, V>(target, pos, out);
+    }
+    let (values, control) = path_context_component_values::<S, V>(target, pos);
+    for value in values {
+        out.push(PathContextPos {
+            node: PathNode::Owned(Rc::new(value)),
+            path: Vec::new(),
+            ancestors: Vec::new(),
+        });
+    }
+    control.map_or(Ok(()), Err)
+}
+
 /// One computed-bracket step (`E[K]`, or `E[K]?` with `bracket_optional`),
 /// from `pos` (#2471).
 ///
@@ -13882,7 +13621,7 @@ fn path_context_step_computed_index<S: EvalSemantics, V: DocumentValue>(
     let produced_from = out.len();
     let (components, components_control) = path_context_component_values::<S, V>(key, pos);
     let mut targets = Vec::new();
-    let stepped = path_context_step_generic::<S, V>(target, pos, &mut targets);
+    let stepped = path_context_step_target::<S, V>(target, pos, &mut targets);
     for component in &components {
         for tpos in &targets {
             match path_component_step_expr(component) {
@@ -14043,7 +13782,26 @@ fn path_context_walk_generic<S: EvalSemantics, V: DocumentValue>(
         // there (#2421, captured live from v4.53.3), and jq has no `key` at
         // all, so its jq-mode extension follows yq. (The eager evaluator's
         // `null` is #2421's remaining half.)
+        //
+        // `key` is a property of the *node* (ADR-0021 decision 2) and the
+        // trail's last component normally spells it, so reading the trail is
+        // the O(1) answer. One case makes the two differ: jq mode keeps a
+        // negative array index as written, because `path(.c[-1])` is
+        // `["c",-1]` in jq 1.7.1 (decision 5), while the node it lands on is
+        // the element the index *resolves* to -- and that element's own key
+        // is `1`, which is what yq v4.53.3 answers for `.c[-1] | key` on
+        // `c: [10, 20]` (captured live; `[20,1]`, and `[10,0]` for `-2`).
+        // Only then is the sibling scan paid, so `[.[] | key]` keeps its
+        // per-element constant.
         Expr::Builtin(Builtin::Key) => match pos.path.last() {
+            Some(OwnedValue::Int(i)) if *i < 0 => match &pos.node {
+                PathNode::At(c) => match cursor_key(c) {
+                    Ok(Some(k)) => Ok(sink(GenericItem::Owned(k))),
+                    Ok(None) => Ok(Demand::Continue),
+                    Err(e) => Err(Control::Error(e)),
+                },
+                _ => Ok(sink(GenericItem::Owned(OwnedValue::Int(*i)))),
+            },
             Some(key) => Ok(sink(GenericItem::Owned(key.clone()))),
             None => Ok(Demand::Continue),
         },
@@ -14096,13 +13854,17 @@ fn path_context_walk_pipe<S: EvalSemantics, V: DocumentValue>(
 /// stage is walkable but whose later stages need path context in a way the
 /// walk does not model (`.a | key | tostring`) goes to the bridge whole.
 ///
-/// A fan-out that materializes a node per branch loses to the bridge on
-/// YAML, and that has to be decided here too, not mid-walk. A fan-out of
-/// `key`/`path` is free: they materialize nothing. Only a pipe's *last*
-/// stage emits; the earlier ones just move the position. Testing every
-/// stage instead rejected `(.a, .b) | key`, because stage 0's own branches
-/// are `Field`s -- a lost optimization the suite could not see, because
-/// falling back produces identical output.
+/// A fan-out head used to be refused here and left to the eager evaluator,
+/// on the grounds that materializing a node per branch is a backward jump
+/// against YAML's sequential cursor. Spine 2416's exit measurement
+/// disproved the mechanism and the deletion removed the alternative:
+/// JSON, which has no sequential-cursor cache at all, pays the same
+/// ~0.5us per element, so the cost is the walk's own per-position `Vec`
+/// clones (#2572), not the cursor cache -- and the eager route it fell back
+/// to peaked at *twice* the RSS (511 MB vs 245 MB on a 20 MB input). The
+/// walk now takes every head it can model; the accepted cost is +10-13% on
+/// `[.[] | .k.x | parent]`, +20% on `[.[] | .k | select(key == "k")]` and
+/// +38-51% on the absent-head shape (issue #2559).
 fn path_context_walk_split(exprs: &[Expr]) -> Option<(&[Expr], &[Expr])> {
     let first = exprs.first()?;
     let (walked, rest): (&[Expr], &[Expr]) = if path_context_pipe_is_walkable(exprs) {
@@ -14112,11 +13874,6 @@ fn path_context_walk_split(exprs: &[Expr]) -> Option<(&[Expr], &[Expr])> {
     } else {
         return None;
     };
-    if walked.iter().any(path_context_fans_out)
-        && !walked.last().is_some_and(path_context_emits_paths_only)
-    {
-        return None;
-    }
     Some((walked, rest))
 }
 
@@ -14343,11 +14100,21 @@ fn cursor_ancestor<C: DocumentCursor>(c: &C, n: usize) -> Option<C> {
     Some(cur)
 }
 
-/// Whether a path-context pipe the walk declined has to take the eager
-/// evaluator, or can run in the generic evaluator with the path-context
-/// builtins answered as cursor properties (#2416 phase 3).
+/// Whether a path-context pipe the walk declined needs an *owned position* --
+/// the owned identity pipe or the absent route's own rewrite -- rather than
+/// being answerable stage by stage from live cursors (#2416 phase 3).
 ///
-/// The generic route is exact exactly when every path-context builtin meets
+/// Until spine 2416's exit this was the gate into the eager evaluator, and
+/// `true` meant "hand the whole pipe over". That evaluator is gone and no
+/// route consults this to hand anything anywhere: what is left is the
+/// question the absent route asks of its own `rest`
+/// ([`path_context_absent_rest_route`], `try_path_context_absent_sink`) and
+/// that [`path_context_single_native`] asks of a nested pipe -- "can this run
+/// from the node itself?" A `true` there picks the identity route over the
+/// constant one, or keeps a nested pipe off the single-native list; it no
+/// longer names a second evaluator.
+///
+/// The cursor route is exact exactly when every path-context builtin meets
 /// the document node it stands on. The stages are folded left to right with
 /// two facts about the value entering the next stage -- is it a live node,
 /// and may it be an *absent* one -- and a path-context stage is admitted
@@ -14370,26 +14137,9 @@ fn cursor_ancestor<C: DocumentCursor>(c: &C, n: usize) -> Option<C> {
 ///
 /// `select(key == "a") | parent` stays generic: `select` emits its input
 /// node unchanged, so `parent` still stands on a live cursor.
-pub(crate) fn path_context_needs_eager(exprs: &[Expr]) -> bool {
+pub(crate) fn path_context_needs_owned_position(exprs: &[Expr]) -> bool {
     if !exprs.iter().any(needs_path_context) {
         return false;
-    }
-    // spine 2416 (walk residue): a fan-out head that can miss, followed by a
-    // read, is the residue ADR-0021 decision 7 keeps eager by design. Asked
-    // before the owned identity pipe's own gate, because that pipe would
-    // otherwise take `(.c[0], .c[5]) | tostring | key` and answer `0` alone
-    // where yq v4.53.3 answers `0` and `5`: an absent branch of a fan-out
-    // head leaves the walk as a `null` with no cursor, so nothing downstream
-    // can name its position. The two routing sites refuse the same head
-    // (`path_context_fans_out`), which is what makes this the whole of what
-    // the gate still answers `true` for.
-    let head_len = exprs
-        .iter()
-        .take_while(|stage| path_context_is_navigational(stage))
-        .count();
-    let (head, rest) = exprs.split_at(head_len);
-    if fanout_head_can_lose_position(head) && rest.iter().any(needs_path_context) {
-        return true;
     }
     // #2416 step 3: a pipe that leaves the cursor domain at a stage the
     // owned identity pipe can follow is answered there, whatever the stages
@@ -14517,30 +14267,6 @@ fn head_can_yield_absent(stages: &[Expr]) -> bool {
     stages
         .iter()
         .fold(false, |acc, e| step_can_yield_absent(e, acc))
-}
-
-/// Whether a navigational head that fans out can hand a later stage a
-/// position it has lost (spine 2416, walk residue): some step *after* the
-/// fan-out can be absent. An absent branch of a fan-out leaves the walk as a
-/// `null` with no cursor, so nothing downstream can name it -- `(.c[0],
-/// .c[5]) | tostring | key` and `.c[(0,5)] | tostring | key` are `0` and
-/// `5` in yq v4.53.3, and `.a[] | .k | parent | tostring | key` passes
-/// through the same absence -- where a head that fans out over *real* nodes
-/// only (`.a | .[] | tostring | key`: `.a`'s own absence yields no element)
-/// is exact on the per-element routes.
-fn fanout_head_can_lose_position(head: &[Expr]) -> bool {
-    let mut can_absent = false;
-    let mut seen_fanout = false;
-    for stage in head {
-        if path_context_fans_out(stage) {
-            seen_fanout = true;
-        }
-        can_absent = step_can_yield_absent(stage, can_absent);
-        if seen_fanout && can_absent {
-            return true;
-        }
-    }
-    false
 }
 
 /// Whether any position the head passes *through* can be absent (spine
@@ -14673,7 +14399,7 @@ fn path_context_single_native(expr: &Expr) -> bool {
             exprs.iter().all(path_context_single_native)
                 && (!exprs.iter().any(needs_path_context)
                     || path_context_walk_split(exprs).is_some()
-                    || !path_context_needs_eager(exprs))
+                    || !path_context_needs_owned_position(exprs))
         }
         Expr::Compare { left, right, .. } => {
             path_context_single_native(left) && path_context_single_native(right)
@@ -14689,6 +14415,10 @@ fn path_context_single_native(expr: &Expr) -> bool {
         Expr::Arithmetic { left, right, .. } => {
             path_context_single_native(left) && path_context_single_native(right)
         }
+        // Native since spine 2416's exit (`eval_single`'s own `Expr::Negate`
+        // arm, above): unary minus over a path-context operand is evaluated
+        // with the cursor, like the binary arithmetic just above.
+        Expr::Negate(inner) => path_context_single_native(inner),
         // Native since spine 2416 gate reason 3 (#2473): `eval_single`'s own
         // `Expr::And`/`Expr::Or` arms, above, over `eval_boolean_generic`.
         // Same `needs_path_context` gate and same reason as `Expr::Arithmetic`
@@ -14974,7 +14704,7 @@ fn try_path_context_cursor_walk<S: EvalSemantics, V: DocumentValue>(
 /// `parent`/`parent(n)` are deliberately **not** resolvable here: they
 /// answer with a document *node*, which no literal can spell. Reifying the
 /// materialized ancestor would pay exactly the per-node materialization
-/// [`path_context_fans_out`] exists to avoid, so a stage that reaches one
+/// the deleted fan-out guard exists to avoid, so a stage that reaches one
 /// from a possibly-absent position stays on the eager route (`.a.x.y |
 /// [path, parent]`) -- the one piece of the absent class this step leaves
 /// behind.
@@ -15259,7 +14989,7 @@ fn path_context_absent_keeps_position(expr: &Expr) -> bool {
 /// head whose position has to be walked, and the stages that read it.
 ///
 /// `None` leaves the pipe exactly where it was -- which, for every pipe this
-/// accepts, is the eager evaluator: [`path_context_needs_eager`] hands over
+/// accepts, is the eager evaluator: [`path_context_needs_owned_position`] hands over
 /// any pipe whose head can miss, and that is the reason this route exists to
 /// remove.
 ///
@@ -15269,9 +14999,6 @@ fn path_context_absent_keeps_position(expr: &Expr) -> bool {
 /// * the head can actually miss ([`head_can_yield_absent`]) -- a head that
 ///   cannot is already exact on the cursor route, and routing it here would
 ///   trade a lazy stage for an eagerly collected `Vec` of positions;
-/// * the head does not fan out, the same guard [`path_context_walk_split`]
-///   applies and for the same reason: one position per element is a `Vec`
-///   the size of the document;
 /// * every path-context builtin left in `rest` resolves against the walked
 ///   position ([`path_context_absent_stages_resolvable`]);
 /// * `rest` does not itself need the eager evaluator. That one is not
@@ -15288,14 +15015,15 @@ fn path_context_absent_split(exprs: &[Expr]) -> Option<(&[Expr], &[Expr], Absent
     if path_context_walk_split(exprs).is_some() {
         return None;
     }
-    // The head stops short of a stage that fans out (spine 2416, walk
-    // residue): a fan-out head is refused here whole, so a fan-out *after*
-    // the part that can miss (`.a | .[] | tostring | key`, `.a.b | label $o
-    // | (parent, break $o)`) is left to `rest`, where the identity route
-    // runs it per position, rather than turning the whole pipe away.
+    // The head is every leading navigational stage, a fan-out one included
+    // (spine 2416, the exit): the fan-out guard that used to stop the
+    // `take_while` short sent `.[] | .k | select(key == "k")` to the eager
+    // evaluator, which no longer exists. A fan-out *after* the part that can
+    // miss (`.a | .[] | tostring | key`) is still left to `rest`, where the
+    // identity route runs it per position.
     let head_len = exprs
         .iter()
-        .take_while(|stage| path_context_is_navigational(stage) && !path_context_fans_out(stage))
+        .take_while(|stage| path_context_is_navigational(stage))
         .count();
     let (head, rest) = exprs.split_at(head_len);
     if rest.is_empty() || !rest.iter().any(needs_path_context) {
@@ -15345,7 +15073,7 @@ enum AbsentRestRoute {
 /// delivers that prefix before reporting the escape), so the decline is
 /// gone and `owned_identity_pipe_supported` alone decides.
 fn path_context_absent_rest_route(rest: &[Expr]) -> Option<AbsentRestRoute> {
-    if path_context_absent_stages_resolvable(rest) && !path_context_needs_eager(rest) {
+    if path_context_absent_stages_resolvable(rest) && !path_context_needs_owned_position(rest) {
         return Some(AbsentRestRoute::Constants);
     }
     if owned_identity_pipe_supported(rest) {
@@ -15898,7 +15626,7 @@ fn try_path_context_absent_sink<S: EvalSemantics, V: DocumentValue>(
     // one; the identity route's own real positions are the shapes where it
     // cannot (`.c | key` moves the position `rest` reads), and those
     // materialize the node instead of re-rooting the document eagerly.
-    let rest_is_cursor_native = !path_context_needs_eager(rest);
+    let rest_is_cursor_native = !path_context_needs_owned_position(rest);
     for pos in &positions {
         let flow = match &pos.node {
             PathNode::At(c) if rest_is_cursor_native => {
@@ -18320,9 +18048,21 @@ fn owned_identity_pipe_supported_at(stages: &[Expr], unfolded: u8) -> bool {
 /// pipe can follow: the first non-node-preserving stage has a rule, does not
 /// itself read path context, and everything after it is
 /// [`owned_identity_pipe_supported`]. Decided statically, once, by
-/// [`path_context_needs_eager`]; `false` means the pipe is either entirely
+/// [`path_context_needs_owned_position`]; `false` means the pipe is either entirely
 /// in the cursor domain or still the eager evaluator's.
 fn owned_identity_pipe_applies(exprs: &[Expr]) -> bool {
+    // spine 2416 (the exit): a pipe whose *first* stage has no rule to place
+    // its output but which the identity route can run whole -- see
+    // [`owned_identity_pipe_entry_stage`]. `eval_single`'s `Expr::Pipe` arm
+    // sends such a pipe to `collect_each_generic`, which is what puts it on
+    // `eval_each_pipe_generic`'s own entry for the same shape, so the two
+    // routes share one definition instead of gaining a second.
+    if exprs.iter().any(needs_path_context)
+        && exprs.first().is_some_and(owned_identity_pipe_entry_stage)
+        && owned_identity_pipe_supported(exprs)
+    {
+        return true;
+    }
     for (i, stage) in exprs.iter().enumerate() {
         if path_context_is_navigational(stage) || path_context_stage_preserves_node(stage) {
             continue;
@@ -18333,6 +18073,28 @@ fn owned_identity_pipe_applies(exprs: &[Expr]) -> bool {
             && owned_identity_pipe_supported(rest);
     }
     false
+}
+
+/// Whether a pipe's *first* stage forces the whole pipe onto the owned
+/// identity route (spine 2416, the exit).
+///
+/// [`owned_identity_leaving_stage_supported`] asks for an
+/// [`owned_identity_rule`] because it has to *place* the value the stage
+/// produced. A stage with no rule is not automatically the eager
+/// evaluator's, though: `as` has none because it splices its body into the
+/// rest of the pipe rather than producing a placeable value, and
+/// `eval_owned_identity_as` (#2563) runs exactly that. With the eager
+/// evaluator deleted there is nowhere else for such a stage to go, so a pipe
+/// that starts with one and is otherwise [`owned_identity_pipe_supported`]
+/// enters the identity route at the cursor's own identity.
+///
+/// Navigation and node-preserving stages are excluded: the walk, the absent
+/// route and the ordinary staged driver already carry those, and routing
+/// them here would materialize a node none of them needs.
+fn owned_identity_pipe_entry_stage(stage: &Expr) -> bool {
+    !path_context_is_navigational(stage)
+        && !path_context_stage_preserves_node(stage)
+        && owned_identity_rule(stage).is_none()
 }
 
 /// Whether `stage` can be the one a pipe leaves the cursor domain at: it
@@ -19436,6 +19198,58 @@ fn eval_map_family_positioned_result<S: EvalSemantics, V: DocumentValue>(
     Some(match flow {
         Flow::Exhausted | Flow::Stopped { .. } => owned_vec_to_generic_result(collected),
         Flow::Escaped(control) => partial_generic(collected, control),
+    })
+}
+
+/// Evaluate a path-context pipe over an owned value the reindex bridge
+/// would re-spell (spine 2416, the exit; #2419).
+///
+/// `eval::eval_path_context_pipe_owned` normally gives a cursor-less owned
+/// value a position by serializing it into a throwaway document and taking
+/// that document's root cursor. That round trip is a semantic identity for
+/// almost every value ([`reindex_bridge_is_identity`]), but not for a bare
+/// `Float`, a NaN, or a numeric literal past [`REINDEX_LITERAL_LEN_CAP`]:
+/// `to_json_for_reindex`'s mode-forked formatter re-spells those, so
+/// `syq --eval-all '.[0] | .a | parent'` over a document holding `.nan`
+/// would print the ancestor with `null` in place of the NaN and `1e+19` in
+/// place of `10000000000000000000.0`. Those values used to be kept off the
+/// bridge by handing the pipe to the eager evaluator; with that evaluator
+/// deleted, they take this route instead.
+///
+/// The owned identity pipe is the exact replacement: it never serializes,
+/// and a detached root is precisely the position the reindexed root cursor
+/// would have had -- `key`/`parent` at the top emit nothing on both, and
+/// navigation inside descends with the same components
+/// ([`owned_nav_children`]). `None` when the pipe is one
+/// [`owned_identity_pipe_supported`] declines, which leaves the caller with
+/// the bridge it would otherwise have taken.
+pub(crate) fn eval_path_context_pipe_detached<S: EvalSemantics, V: DocumentValue>(
+    exprs: &[Expr],
+    owned: &OwnedValue,
+    optional: bool,
+) -> Option<GenericResult<V>> {
+    if !owned_identity_pipe_supported(exprs) {
+        return None;
+    }
+    let mut collected: Vec<GenericItem<V>> = Vec::new();
+    let flow = eval_owned_identity_pipe::<S, V>(
+        exprs,
+        owned.clone(),
+        OwnedIdentity::detached(),
+        optional,
+        &mut |item| {
+            collected.push(item);
+            Demand::Continue
+        },
+    );
+    Some(match flow {
+        Flow::Exhausted | Flow::Stopped { .. } => path_context_items_to_result(collected),
+        // Same accumulate-or-stop rule every other sink consumer applies
+        // (#400/#494): the outputs already produced survive the escape.
+        Flow::Escaped(control) => {
+            let (owned, failure) = path_context_items_to_owned(collected);
+            partial_generic(owned, failure.map_or(control, Control::Error))
+        }
     })
 }
 
@@ -29404,8 +29218,13 @@ mod tests {
         assert!(!walkable(".a | key | tostring"));
     }
 
-    /// The split behind both routes: whole pipe, head only, or nothing --
-    /// and the fan-out guard that hands a materializing fan-out back.
+    /// The split behind both routes: whole pipe, head only, or nothing.
+    ///
+    /// The fan-out guard this also pinned is gone with the eager evaluator
+    /// (spine 2416, the exit): a fan-out head that materializes a node per
+    /// branch is the walk's now, measured at +10-13% time and half the peak
+    /// RSS on `[.[] | .k.x | parent]` (issue #2559), so the three rows that
+    /// asserted `None` for one assert the split it takes instead.
     #[test]
     fn path_context_walk_split_takes_whole_head_or_nothing_2416() {
         let split = |f: &str| {
@@ -29422,19 +29241,18 @@ mod tests {
         assert_eq!(split("(.a | key) | tostring"), Some((1, 1)));
         // Nothing: the tail needs path context the walk cannot give it.
         assert_eq!(split(".a | key | tostring"), None);
-        // Fan-out that materializes a node per branch stays on the bridge;
-        // a fan-out of `key`/`path` is free.
-        assert_eq!(split(".[] | .k | parent"), None);
+        // A fan-out that materializes a node per branch is walked too since
+        // spine 2416's exit; it used to be refused here.
+        assert_eq!(split(".[] | .k | parent"), Some((3, 0)));
         assert_eq!(split(".[] | .k | parent | key"), Some((4, 0)));
-        assert_eq!(split("(.a.x, .b.y) | parent"), None);
+        assert_eq!(split("(.a.x, .b.y) | parent"), Some((2, 0)));
         // #2558: `?` over navigation is navigational, so a `?` head is taken
-        // whole exactly as its bare spelling is -- and `.[]?` still counts as
-        // a fan-out, which is what `path_context_fans_out`'s own `Optional`
-        // arm is for.
+        // whole exactly as its bare spelling is -- a suppressed `.[]?`
+        // fan-out included, now that the fan-out is not refused.
         assert_eq!(split(".a? | key"), Some((2, 0)));
         assert_eq!(split(".a?.b | path"), Some((2, 0)));
         assert_eq!(split(".a | .b? | parent | key"), Some((4, 0)));
-        assert_eq!(split(".[]? | .k | parent"), None);
+        assert_eq!(split(".[]? | .k | parent"), Some((3, 0)));
         assert_eq!(split(".[]? | .k | parent | key"), Some((4, 0)));
     }
 
@@ -29463,12 +29281,12 @@ mod tests {
     /// static reasons to stay eager is pinned, plus the shapes that now run
     /// generically.
     #[test]
-    fn path_context_needs_eager_pins_the_three_reasons_2416() {
+    fn path_context_needs_owned_position_pins_its_reasons_2416() {
         let eager = |f: &str| {
             let Expr::Pipe(stages) = parse(f).unwrap() else {
                 panic!("not a pipe: {f}")
             };
-            path_context_needs_eager(&stages)
+            path_context_needs_owned_position(&stages)
         };
         // #2558: some rows below have to say *which* route answers, not only
         // what the gate reports, because the gate is asked after the walk
@@ -29621,25 +29439,42 @@ mod tests {
         // real ancestor plus the components taken past it, which is exactly
         // an `OwnedIdentity`, so `parent` answers with a real node again
         // and the position may move after a non-navigational stage.
-        assert!(!eager(".a.b | [path, parent]"));
-        assert!(!eager(".a.b | [path, parent(2)]"));
+        //
+        // The two `[path, parent]` rows read `true` here since spine 2416's
+        // exit and that is no longer a routing statement: this predicate is
+        // asked *after* the walk has had its turn, and the walk takes a
+        // materializing fan-out now, so those two pipes are answered there
+        // (`path_context_absent_split` returns `None` for them, pinned in
+        // `path_context_absent_split_pins_its_four_conditions_2416`). What
+        // the rows still record is the predicate's own shape: a `parent`
+        // read after a head that can miss is not answerable from a live
+        // cursor alone, which is what makes the absent route prefer its
+        // identity half wherever that route *is* the one that runs.
+        assert!(eager(".a.b | [path, parent]"));
+        assert!(eager(".a.b | [path, parent(2)]"));
         assert!(!eager(".a.b | select(true) | .c | key"));
         assert!(!eager(".a.b | select(parent != null) | key"));
         assert!(!eager(".a.b | tostring | parent | key"));
-        // The third shape stays eager by design, and is the exit
-        // condition's residue ADR-0021 records: a fan-out head is one
-        // position per element, the memory guard `path_context_fans_out`
-        // documents and `path_context_walk_split` already applies.
+        // The third shape was the exit condition's residue ADR-0021 records:
+        // a fan-out head is one position per element, which the eager
+        // evaluator answered because materializing an ancestor per element
+        // was thought to cost a sequential-cursor reset. Issue #2559
+        // measured that on current main and disproved the mechanism (JSON,
+        // which has no such cache, pays the same per element) at +20% time
+        // and *half* the peak RSS, so the walk and the absent route take it
+        // and this predicate no longer answers `true` for it.
         assert!(
-            eager(".[] | .k | select(key == \"k\")"),
-            "a fan-out head collects one position per element"
+            !eager(".[] | .k | select(key == \"k\")"),
+            "a fan-out head is the walk's since spine 2416's exit"
         );
         // spine 2416 (walk residue): every builtin has an identity rule and
         // a computed `parent(n)` is evaluated at the position, so neither
         // shape hands over any more -- the absent route's identity half
         // carries both.
         assert!(!eager(".a.b | explode | key"));
-        assert!(!eager(".a.b | [path, parent(1 + 0)]"));
+        // Same `[path, parent]` note as above: the walk takes this one now,
+        // and the predicate's `true` is not a route.
+        assert!(eager(".a.b | [path, parent(1 + 0)]"));
         // #2416 phase 3, this PR: `as` is now single-native
         // (`collect_each_generic` over `each_as_generic`), so a pipe with it
         // as the last stage runs generically -- same admission `if`/`limit`/
@@ -29754,7 +29589,10 @@ mod tests {
         assert!(!eager(".a? | key + \"x\""));
         assert!(!eager(".a? | [key] + [\"x\"]"));
         assert!(!eager(".a? | select(key == \"a\")"));
-        assert!(!eager(".a? | [path, parent]"));
+        // Same `[path, parent]` note as the `.a.b` rows above: the walk
+        // takes a materializing fan-out since spine 2416's exit, so the
+        // `true` here is the predicate's shape and not a route.
+        assert!(eager(".a? | [path, parent]"));
         assert!(!eager(".a? | {\"k\": key}"));
         assert!(!eager(".a? | key == \"a\" and true"));
         assert!(!eager(".a? | if key == \"a\" then 1 else 2 end"));
@@ -29825,11 +29663,12 @@ mod tests {
         assert!(!eager(".a.b | (parent | key) as $k | key"));
         // Single-pattern destructuring binds through the same route as `as`
         // (identity pass); a `?//` chain is not a path-context stage at all
-        // (`needs_path_context` answers `false` for it) and the fan-out head
-        // stays where it was.
+        // (`needs_path_context` answers `false` for it), and the fan-out
+        // head that used to stay eager is the absent route's since spine
+        // 2416's exit, like its unsuppressed spelling above.
         assert!(!eager(".a.b | . as [$x] | key"));
         assert!(!eager(".a? | . as [$x] | key"));
-        assert!(eager(".[]? | .k | select(key == \"k\")"));
+        assert!(!eager(".[]? | .k | select(key == \"k\")"));
         assert!(!eager(".a[] | select(true) | key"));
         // #2471 (gate reason 1 of spine 2416), the head-of-pipe half: a
         // *computed* bracket is navigation the walk takes now, so a pipe
@@ -29867,17 +29706,17 @@ mod tests {
         // `Result<(), Control>` ...
         assert!(walked(".c[halt] | key"));
         assert!(path_context_is_navigational(&parse(".c[halt]").unwrap()));
-        // ... a component that *fans out* is a fan-out head
-        // (`path_context_fans_out` reads the component now): `.c[(0,1)] |
-        // key` is the walk's (paths-only fan-out), and a fan-out head that
-        // can miss followed by anything else stays eager *by design* --
-        // asked of the gate alone, as here, both report the residue
-        // (`fanout_head_can_lose_position`), which is also what closed the
-        // `(.c[0], .c[5]) | tostring | key` gap the old comment named ...
+        // ... a component that *fans out* is a fan-out head, which the walk
+        // and the absent route take since spine 2416's exit rather than the
+        // deleted evaluator. `.c[(0,1)] | key` is the walk's (paths-only
+        // fan-out); the two shapes that used to be the residue -- a fan-out
+        // head that can miss followed by a computed stage -- are the absent
+        // route's now, which is what keeps `(.c[0], .c[5]) | tostring | key`
+        // answering `0` and `5` (yq v4.53.3) rather than `0` alone.
         assert!(eager(".c[(0,1)] | key"));
         assert!(path_context_walk_split(&pipe_stages(".c[(0,1)] | key")).is_some());
-        assert!(eager(".c[(0,1)] | tostring | key"));
-        assert!(eager("(.c[0], .c[5]) | tostring | key"));
+        assert!(!eager(".c[(0,1)] | tostring | key"));
+        assert!(!eager("(.c[0], .c[5]) | tostring | key"));
         assert!(
             !eager(".a | .[] | tostring | key"),
             "no absence after the fan-out"
@@ -30107,14 +29946,27 @@ mod tests {
         // takes end to end: the walk's business, not this route's.
         assert_eq!(split(".a.b | key"), None);
         assert_eq!(split(".a.b | parent | key"), None);
-        // A fan-out head would collect one position per element -- the
-        // guard `path_context_walk_split` applies for the same memory
-        // reason, and the residue ADR-0021 records (#2472 shape 3).
-        assert_eq!(split(".[] | .k | select(key == \"k\")"), None);
-        // #2472 shapes 1 and 2: `parent` is not a constant, and navigation
-        // after a non-navigational stage moves the position the constants
-        // describe -- both are the owned identity pipe's now.
-        assert_eq!(split(".a.b | [path, parent]"), Some((1, 1, OwnedIdentity)));
+        // A fan-out head collects one position per element. That used to be
+        // refused here and handed to the eager evaluator; spine 2416's exit
+        // deleted that evaluator, and the measurement it was refused on
+        // (issue #2559) put the cost at +20% time and half the peak RSS on
+        // this exact shape, so the split takes it.
+        assert_eq!(
+            split(".[] | .k | select(key == \"k\")"),
+            Some((2, 1, Constants))
+        );
+        // #2472 shape 1 (`parent` is not a constant) is the *walk's* since
+        // spine 2416's exit: `[path, parent]` is a fan-out that materializes
+        // a node, which `path_context_walk_split` used to refuse and now
+        // takes end to end, so the absent split leaves it alone. Same answer
+        // either way -- `.a.zz.yy | [path, parent]` is
+        // `[["a","zz","yy"],null]` on both routes, and both differ from yq
+        // v4.53.3's `[["a","zz","yy"],{"yy":null}]`, which vivifies the
+        // missing key (#2435).
+        assert_eq!(split(".a.b | [path, parent]"), None);
+        // Shape 2 -- navigation after a non-navigational stage moves the
+        // position the constants describe -- is still the owned identity
+        // pipe's.
         assert_eq!(
             split(".a.b | select(true) | .c | key"),
             Some((1, 3, OwnedIdentity))
@@ -30132,11 +29984,14 @@ mod tests {
         // #2558: a `?` head is part of the navigational head now, so the
         // split finds one instead of stopping before it and declining.
         assert_eq!(split(".a? | select(key == \"a\")"), Some((1, 1, Constants)));
-        assert_eq!(split(".a? | [path, parent]"), Some((1, 1, OwnedIdentity)));
+        assert_eq!(split(".a? | [path, parent]"), None);
         assert_eq!(split(".a.b? | tostring | key"), Some((1, 2, OwnedIdentity)));
-        // ...but a `?` head that fans out is refused by the same guard every
-        // other fan-out head is.
-        assert_eq!(split(".[]? | .k | select(key == \"k\")"), None);
+        // ...and a `?` head that fans out is taken like every other fan-out
+        // head since the exit.
+        assert_eq!(
+            split(".[]? | .k | select(key == \"k\")"),
+            Some((2, 1, Constants))
+        );
     }
 
     /// The absent-reachability fold behind reason 2.

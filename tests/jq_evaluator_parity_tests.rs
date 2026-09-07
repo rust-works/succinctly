@@ -1579,80 +1579,49 @@ fn test_parity_fold_init_evaluated_before_source_2440() {
 }
 
 // ---------------------------------------------------------------------------
-// #2416 phase 0, axis three: the cursor walk vs the materializing bridge.
+// #2416 phase 0, axis three: the cursor walk -- once against the materializing
+// bridge, now against itself.
 //
 // The two axes above compare `eval.rs` with `eval_generic.rs`. Inside
-// `eval_generic.rs` there is a *third* pair that has to agree and had nothing
-// asserting it: a pipe stage that `needs_path_context` is answered either by
-// `try_path_context_cursor_walk` (#2061, straight from cursors) or, for any
-// shape the walk does not model, by the materializing bridge
-// (`to_owned_with_cursor` + `eval::eval_pipe_with_path_context`).
+// `eval_generic.rs` there used to be a *third* pair that had to agree and had
+// nothing asserting it: a pipe stage that `needs_path_context` was answered
+// either by `try_path_context_cursor_walk` (#2061, straight from cursors) or,
+// for any shape the walk did not model, by the materializing bridge
+// (`to_owned_with_cursor` + the eager path-context evaluator). The fallback
+// was *meant* to be output-identical -- which is exactly why nothing in the
+// suite could see #2061's own lost optimization; patch coverage caught it
+// instead -- so `PathContextRoute` made both routes drivable from here and
+// the tables below asserted "identical".
 //
-// #2416 migrates the eager evaluator's arms into the walk one at a time, and
-// the fallback is *meant* to be output-identical — which is exactly why
-// nothing in the suite could see #2061's own lost optimization; patch coverage
-// caught it instead. `PathContextRoute` makes the two routes drivable from
-// here so "identical" becomes an assertion.
-//
-// The walk is genuinely exercised by these cases, not merely offered: with the
-// route site instrumented, the two shape tables below reach 332 path-context
-// evaluations per route, and the walk answers 246 of them. The other 86 are
-// shapes `path_context_is_cursor_walkable` still refuses -- the migration's
-// own backlog. A test that only ever reached the bridge would pass while
-// proving nothing (#1599's lesson).
+// Spine 2416's exit deleted the bridge, and `PathContextRoute` with it. One
+// route is left, so there is no second answer to compare against and the
+// tables pin the surviving route's answer directly (a snapshot, because the
+// shape ring is ~130 filters over five documents in two modes). What the
+// oracle says about these shapes is pinned where it can be:
+// `scripts/jq-path-context-oracle-sweep.sh` and the `path_ctx_*` goldens in
+// both corpora, `test_walk_residue_rows_match_yq_2416` and
+// `test_owned_identity_rules_match_yq_2416` (`tests/yq_cli_tests.rs`), and
+// `test_arm_audit_proof_queries_are_unmoved_by_the_gate_2416` below. This
+// table's job is the one those cannot do: catch a silent move in a shape ring
+// wide enough to include the ones just outside what the walk models.
 // ---------------------------------------------------------------------------
 
-/// Outputs of the generic evaluator with the path-context route pinned.
-fn route_outputs<S: EvalSemantics>(
-    json: &[u8],
-    filter: &str,
-    route: eval_generic::PathContextRoute,
-) -> Vec<String> {
+/// Outputs of the generic evaluator, rendered for the snapshot -- an error is
+/// a row rather than a panic, so a shape that starts raising shows up as a
+/// diff instead of as a failed `expect`.
+fn route_outputs<S: EvalSemantics>(json: &[u8], filter: &str) -> String {
     let index = JsonIndex::build(json);
     let cursor = index.root(json);
     let expr = parse(filter).expect("parse failed");
-    eval_generic::eval_with_cursor_using_route::<S, _>(&expr, cursor, route)
-        .collect_owned()
-        .expect("materializes")
-        .iter()
-        .map(succinctly::jq::OwnedValue::to_json)
-        .collect()
-}
-
-/// Assert the cursor walk and the materializing bridge agree, in both modes.
-///
-/// Both modes on purpose: `key`/`parent`/`path` are yq builtins that
-/// `succinctly jq` also accepts as an extension, and the walk is shared, so a
-/// mode-specific regression in one route would otherwise only be visible in
-/// half the surface (#2226's lesson about a shared site with a per-mode gate).
-fn assert_walk_bridge_parity(json: &[u8], filter: &str) {
-    for (mode, walk, bridge) in [
-        (
-            "jq",
-            route_outputs::<JqSemantics>(
-                json,
-                filter,
-                eval_generic::PathContextRoute::WalkThenBridge,
-            ),
-            route_outputs::<JqSemantics>(json, filter, eval_generic::PathContextRoute::BridgeOnly),
-        ),
-        (
-            "yq",
-            route_outputs::<YqSemantics>(
-                json,
-                filter,
-                eval_generic::PathContextRoute::WalkThenBridge,
-            ),
-            route_outputs::<YqSemantics>(json, filter, eval_generic::PathContextRoute::BridgeOnly),
-        ),
-    ] {
-        assert_eq!(
-            walk,
-            bridge,
-            "path-context route drift ({mode} mode) for `{filter}` on `{}`:\n  \
-             walk   = {walk:?}\n  bridge = {bridge:?}",
-            String::from_utf8_lossy(json)
-        );
+    match eval_generic::eval_with_cursor_using::<S, _>(&expr, cursor).collect_owned() {
+        Ok(values) => {
+            let rendered: Vec<String> = values
+                .iter()
+                .map(succinctly::jq::OwnedValue::to_json)
+                .collect();
+            format!("[{}]", rendered.join(", "))
+        }
+        Err(e) => format!("ERR {e:?}"),
     }
 }
 
@@ -1660,12 +1629,13 @@ fn assert_walk_bridge_parity(json: &[u8], filter: &str) {
 /// outside it, over documents that exercise object keys, array indices,
 /// nesting and duplicate mapping keys.
 ///
-/// A shape the walk refuses is not a failure here — the bridge answers it and
-/// both routes agree trivially. That is the point of the one-directional gate
-/// #2416 phase 2 relies on: an un-migrated arm is a missed optimization, never
-/// a wrong answer. This test is what keeps that claim true as arms migrate.
+/// A shape the walk refuses is not a failure here -- the absent route, the
+/// owned identity pipe or the owned door answers it, and the snapshot records
+/// which answer that is. What this table catches is a *silent* move in any of
+/// them: with the bridge deleted there is no second route to cross-check
+/// against, so the row itself is the pin.
 #[test]
-fn test_walk_vs_bridge_path_context_parity_2416() {
+fn test_path_context_shape_ring_is_pinned_2416() {
     let docs: [&[u8]; 5] = [
         br#"{"a":{"b":1,"c":2},"d":[10,20]}"#,
         br#"{"a":{"b":{"e":1}},"d":[[1],[2]]}"#,
@@ -1673,7 +1643,9 @@ fn test_walk_vs_bridge_path_context_parity_2416() {
         br#"{"a":{"b":1,"b":2},"d":[10,20]}"#,
         br#"[{"k":1},{"k":2}]"#,
     ];
+    let mut rendered = String::new();
     for doc in docs {
+        let doc_text = core::str::from_utf8(doc).expect("ascii document");
         for filter in [
             // Leaves at the root, where the walk currently defers.
             "key",
@@ -1832,57 +1804,110 @@ fn test_walk_vs_bridge_path_context_parity_2416() {
             // agree" would pin the wrong answer, the same reason
             // `[.a[("b"+"")] | key]` is absent above. jq mode agrees on it
             // and is asserted separately below.
+            // The slice head, whose yq-mode answer is the container's
+            // position (`OwnedIdentityRule::Slice`, `.c[0:1] | key` is `"c"`
+            // in v4.53.3) and whose jq-mode answer names jq's own
+            // `{"start":0,"end":1}` component. Both are rows here now that
+            // there is no second route to disagree with.
+            ".d[(0+0):(0+1)] | key",
         ] {
-            assert_walk_bridge_parity(doc, filter);
+            use core::fmt::Write as _;
+            writeln!(
+                rendered,
+                "{doc_text}\n  jq  {filter}\n   => {}\n  yq  {filter}\n   => {}",
+                route_outputs::<JqSemantics>(doc, filter),
+                route_outputs::<YqSemantics>(doc, filter),
+            )
+            .expect("string write");
         }
-        // The slice head's jq-mode half (see the note in the list above).
-        let filter = ".d[(0+0):(0+1)] | key";
-        assert_eq!(
-            route_outputs::<JqSemantics>(
-                doc,
-                filter,
-                eval_generic::PathContextRoute::WalkThenBridge
-            ),
-            route_outputs::<JqSemantics>(doc, filter, eval_generic::PathContextRoute::BridgeOnly),
-            "path-context route drift (jq mode) for `{filter}`"
-        );
     }
+    insta::assert_snapshot!(rendered);
 }
 
-/// Float-carrying documents through both routes.
+/// Float-carrying documents: the document's own spelling has to survive.
 ///
-/// Until #2416 phase 2, `try_path_context_cursor_walk` deferred to the bridge
-/// whenever an emitted value failed `reindex_bridge_is_identity`, so the walk
-/// could never disagree with the bridge's `to_json_for_reindex` re-spelling
-/// of a bare float. Phase 2 deleted that fallback: the walk emits the cursor
-/// itself, and the CLI streams a whole-walk pipe from the cursor's own text
-/// (`m2_gate.rs`), which is where the document's spelling now survives --
+/// Until #2416 phase 2, `try_path_context_cursor_walk` deferred to the
+/// materializing bridge whenever an emitted value failed
+/// `reindex_bridge_is_identity`, so the walk could never disagree with the
+/// bridge's `to_json_for_reindex` re-spelling of a bare float. Phase 2
+/// deleted that fallback: the walk emits the cursor itself, and the CLI
+/// streams a whole-walk pipe from the cursor's own text (`m2_gate.rs`), which
+/// is where the document's spelling now survives --
 /// `test_path_context_bypass_keeps_yq_float_fidelity_1909` in
 /// `tests/yq_cli_tests.rs` pins that. The re-spelling was the bridge's, not
 /// the reference's: yq v4.53.3 preserves the source spelling in every probed
 /// case (#2419).
 ///
-/// Here both routes are read back through `collect_owned`, which materializes
-/// a cursor with the same value-level conversion the bridge used, so the two
-/// still agree on these documents; the assertion is that phase 2 changed the
-/// *route*, not the value the library hands back.
+/// Spine 2416's exit removed the bridge and the `BridgeOnly` axis this test
+/// used to drive, so what is asserted is no longer "the two routes agree" but
+/// the thing that mattered underneath it: every one of these outputs still
+/// carries the literal as the document spelled it. That is what
+/// `reindex_bridge_is_identity` still guards at the owned door
+/// (`eval::eval_path_context_pipe_owned`, which now sends a value the reindex
+/// would re-spell to the owned identity pipe instead of to the deleted
+/// evaluator).
 #[test]
-fn test_walk_vs_bridge_float_respelling_guard_2419() {
-    for doc in [
-        br#"{"a":{"b":1.50,"c":1e3},"d":[1e20,20]}"#.as_slice(),
-        br#"{"a":{"b":100000000000000000000,"c":2},"d":[10,20]}"#.as_slice(),
-        br#"{"a":{"b":10000000000000000000.0},"d":[1]}"#.as_slice(),
-    ] {
-        for filter in [
-            ".a | key",
-            ".a[] | key",
-            ".a[] | path",
-            ".a.b | parent",
-            ".a | .b | parent | .b | tostring",
-            "[.a[] | parent]",
-            "[.d[] | parent]",
-        ] {
-            assert_walk_bridge_parity(doc, filter);
+fn test_path_context_keeps_document_float_spelling_2419() {
+    // (document, filter, the single rendered output line -- identical in both
+    // modes). `1e3`/`1e20` render as `1E+3`/`1E+20` here and did on both
+    // routes before the deletion too: that is `OwnedValue::to_json`'s
+    // value-level rendering of a float `collect_owned` materialized, not a
+    // route's re-spelling. The rows that matter are the ones a re-spelling
+    // *would* have moved -- `1.50`, `100000000000000000000` and
+    // `10000000000000000000.0` all come back exactly as the document wrote
+    // them.
+    // (document, [(filter, the single rendered output line)]).
+    type SpellingCase<'a> = (&'a [u8], &'a [(&'a str, &'a str)]);
+    let cases: &[SpellingCase<'_>] = &[
+        (
+            br#"{"a":{"b":1.50,"c":1e3},"d":[1e20,20]}"#,
+            &[
+                (".a | key", r#"["a"]"#),
+                (".a[] | key", r#"["b", "c"]"#),
+                (".a[] | path", r#"[["a","b"], ["a","c"]]"#),
+                (".a.b | parent", r#"[{"b":1.50,"c":1E+3}]"#),
+                (".a | .b | parent | .b | tostring", r#"["1.50"]"#),
+                (
+                    "[.a[] | parent]",
+                    r#"[[{"b":1.50,"c":1E+3},{"b":1.50,"c":1E+3}]]"#,
+                ),
+                ("[.d[] | parent]", "[[[1E+20,20],[1E+20,20]]]"),
+            ],
+        ),
+        (
+            br#"{"a":{"b":100000000000000000000,"c":2},"d":[10,20]}"#,
+            &[
+                (".a.b | parent", r#"[{"b":100000000000000000000,"c":2}]"#),
+                (
+                    ".a | .b | parent | .b | tostring",
+                    r#"["100000000000000000000"]"#,
+                ),
+            ],
+        ),
+        (
+            br#"{"a":{"b":10000000000000000000.0},"d":[1]}"#,
+            &[
+                (".a.b | parent", r#"[{"b":10000000000000000000.0}]"#),
+                (
+                    ".a | .b | parent | .b | tostring",
+                    r#"["10000000000000000000.0"]"#,
+                ),
+            ],
+        ),
+    ];
+    for (doc, rows) in cases {
+        for (filter, want) in *rows {
+            let text = core::str::from_utf8(doc).expect("ascii");
+            assert_eq!(
+                route_outputs::<JqSemantics>(doc, filter),
+                *want,
+                "jq mode `{filter}` on `{text}`"
+            );
+            assert_eq!(
+                route_outputs::<YqSemantics>(doc, filter),
+                *want,
+                "yq mode `{filter}` on `{text}`"
+            );
         }
     }
 }
@@ -2099,11 +2124,11 @@ fn test_target_partial_prefix_path_context_sites_match_the_yq_gate_2451() {
 // Spine 2416 step 5: `eval::eval_pipe`'s path-context diversion
 //
 // `eval_pipe` used to send any pipe with a `needs_path_context` stage straight
-// to `eval::eval_pipe_with_path_context`, with no gate at all -- the third of
+// to the deleted eager path-context evaluator, with no gate at all -- the third of
 // the three routes into the eager evaluator that
 // `docs/plan/path-context-arm-reachability.md` found. It now hands the pipe to
 // `eval_generic` with a root cursor over a reindexed copy of its input, so
-// `path_context_needs_eager` decides, and the pipes that decision keeps eager
+// `path_context_needs_owned_position` decides, and the pipes that decision keeps eager
 // reach the same evaluator by the same values as before.
 //
 // Two things need pinning, and neither is visible to the walk-vs-bridge axis
@@ -2398,7 +2423,7 @@ fn test_arm_audit_proof_queries_are_unmoved_by_the_gate_2416() {
 /// (`Expr::Object`'s entries were a third such construct when this was
 /// captured; #2473 gave `needs_path_context` an `Expr::Object` arm, so an
 /// object literal is routed like any other stage now and no longer arrives
-/// here undecided.) The first four are `path_context_needs_eager ==
+/// here undecided.) The first four are `path_context_needs_owned_position ==
 /// false` rows, i.e. the ones the door closure actually moves onto the
 /// generic evaluator.
 ///
@@ -2439,7 +2464,7 @@ fn test_path_context_pipes_reaching_eval_pipe_are_unmoved_2416() {
             &[r#"{"a":{"b":1,"e":2},"c":[10,20],"x":"b"}"#],
         ),
         // `with_entries`'s inner filter, and `any/2`'s condition: both reach
-        // `eval_pipe` with `path_context_needs_eager == true`, so they still
+        // `eval_pipe` with `path_context_needs_owned_position == true`, so they still
         // take the eager evaluator -- pinned so the split between the two
         // answers is visible if the gate moves.
         (

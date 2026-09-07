@@ -1673,7 +1673,7 @@ fn test_yq_bare_path_ungated_2430() -> Result<()> {
 
 /// #1869's `Expr::Iterate` path-context fix (jq_cli_tests.rs's own
 /// `test_iterate_path_context_ambient_optional_keeps_prefix_not_skip_1869`)
-/// lives in `eval_pipe_with_path_context_internal`, generic over
+/// lives in the deleted eager path-context evaluator, generic over
 /// `EvalSemantics` and shared verbatim by both modes -- `key` (a jq-mode
 /// path-context builtin) reaches it in yq mode too, once gated open via
 /// `--jq-extensions`. #2073 then closed the wider gap #1869's own fix was
@@ -1697,7 +1697,7 @@ fn test_yq_iterate_path_context_ambient_optional_keeps_prefix_1869() -> Result<(
 }
 
 /// #1410's yq-mode twin. Like #1869's test just above, the fixed arm lives
-/// in `eval_pipe_with_path_context_internal` -- generic over `EvalSemantics`
+/// in the deleted eager path-context evaluator -- generic over `EvalSemantics`
 /// and shared verbatim by both modes -- and `eval_generic.rs` bridges the
 /// whole pipe there whenever `needs_path_context` fires, so yq reproduced
 /// the divergence identically. Before the fix this printed `"a"` and exited
@@ -1727,7 +1727,7 @@ fn test_yq_optional_index_key_error_escapes_path_context_1410() -> Result<()> {
 
 /// #2073's own repro, yq-mode twin of jq_cli_tests.rs's own
 /// `test_optional_ambient_no_longer_suppresses_rest_error_2073` -- the fixed
-/// arm lives in `eval_pipe_with_path_context_internal`, generic over
+/// arm lives in the deleted eager path-context evaluator, generic over
 /// `EvalSemantics` and shared verbatim by both modes. Before the fix this
 /// printed `0` and exited 0, silently suppressing `error("boom")` even
 /// though it is several stages downstream of the `?`, not inside it.
@@ -12395,7 +12395,7 @@ fn test_yq_halt_not_caught_by_try_catch_or_label() -> Result<()> {
 
 /// #791 follow-up: `map(f)`'s path-context evaluator (only reachable via
 /// `--eval-all` when `f` references `file_index`/`key`/`path`/`parent`, which
-/// routes through `eval_pipe_with_path_context_internal` instead of the
+/// routes through the deleted eager path-context evaluator instead of the
 /// ordinary `map_over`) discarded the partial array on a mid-map `Error`/
 /// `Break` but let a `Halt` leak the elements already mapped before it as if
 /// they were legitimate output. `map(f)` is array construction, atomic in jq
@@ -12885,7 +12885,7 @@ fn test_mid_chain_identity_does_not_discard_rest_of_write_path_yq_2241() -> Resu
 /// yq-mode counterpart to `jq_cli_tests.rs`'s
 /// `test_string_interpolation_path_context_builtins_1334`/
 /// `test_func_def_path_context_builtins_1306` -- both new
-/// `needs_path_context`/`eval_pipe_with_path_context_internal` arms
+/// `needs_path_context`/the deleted eager path-context evaluator arms
 /// (`StringInterpolation`, `FuncDef`) live on the shared `<S: EvalSemantics>`
 /// evaluator #554's fix above already established this file needs its own
 /// coverage for, not just `jq_cli_tests.rs`'s (a jq-scoped fix to shared
@@ -15712,10 +15712,10 @@ fn test_eval_all_file_index_bare() -> Result<()> {
 }
 
 /// Spine 2416 step 5: `--eval-all` reaches the eager evaluator only through
-/// `path_context_needs_eager` now, and the file-origin table follows it there.
+/// `path_context_needs_owned_position` now, and the file-origin table follows it there.
 ///
 /// `eval::eval_owned_with_file_index` used to call
-/// `eval_pipe_with_path_context_internal` directly, passing the table as an
+/// the deleted eager path-context evaluator directly, passing the table as an
 /// argument -- the audit's "door 2"
 /// (`docs/plan/path-context-arm-reachability.md`). It routes through the
 /// generic evaluator now, where `file_index` is a cursor property like `key`
@@ -15791,7 +15791,7 @@ fn test_eval_all_file_index_agrees_across_both_routes_2416() -> Result<()> {
 }
 
 /// Regression test for #822: `Expr::Arithmetic` inside
-/// `eval_pipe_with_path_context_internal` used to collapse a multi-output
+/// the deleted eager path-context evaluator used to collapse a multi-output
 /// operand to its first value whenever the pipe also needed path context
 /// (e.g. shared a comma with `file_index`) -- the same #768 bug class, in a
 /// call site #768 didn't touch.
@@ -15917,7 +15917,7 @@ fn test_eval_all_file_index_select_then_field() -> Result<()> {
 }
 
 /// Regression test: `needs_path_context` recurses into `Expr::If`, but
-/// `eval_pipe_with_path_context_internal` had no matching arm, so it fell
+/// the deleted eager path-context evaluator had no matching arm, so it fell
 /// into the generic (non-path-context) fallback and silently lost
 /// `file_index` for anything nested in `then`/`else` (#715 follow-up).
 #[test]
@@ -26670,7 +26670,7 @@ fn test_yq_string_interpolation_atomic_control_flow_1403() -> Result<()> {
 
 /// #1403 follow-up: `key`/`parent`/`file_index` route `\(...)` through a
 /// *second*, separate string-interpolation evaluator
-/// (`eval_pipe_with_path_context_internal`'s own `StringInterpolation` arm)
+/// (the deleted eager path-context evaluator's own `StringInterpolation` arm)
 /// that also needed the same jq-mode-only gate the plain-evaluator carve-out
 /// above already has -- yq mode must keep taking only the first value of a
 /// multi-valued slot here too, live-verified this crate's own already-fixed
@@ -26746,7 +26746,7 @@ fn test_yq_string_interpolation_path_context_empty_slot_1403() -> Result<()> {
 /// `break`/`halt_error` from a path-context slot in yq mode still discard
 /// the whole string atomically, whether or not an earlier slot already
 /// produced output -- exercising every remaining arm of the yq-only match
-/// this crate's `eval_pipe_with_path_context_internal` kept verbatim.
+/// this crate's the deleted eager path-context evaluator kept verbatim.
 #[test]
 fn test_yq_string_interpolation_path_context_control_flow_is_atomic_1403() -> Result<()> {
     // Bare `break`, no prior output within the slot.
@@ -26887,7 +26887,7 @@ fn test_yq_halt_error_empty_code_argument_produces_no_output_1408() -> Result<()
 
 /// #1476: `parent(n)` must agree with bare `parent` exactly at the root
 /// boundary (`n == current_path.len()`) in yq mode too, since both route
-/// through the same `eval_pipe_with_path_context_internal` shared by jq
+/// through the same the deleted eager path-context evaluator shared by jq
 /// and yq mode. Both `parent` and `parent(n)` *are* real yq builtins
 /// (confirmed live against yq v4.53.3 -- `parent` is one level up, exactly
 /// as here; #1487's own investigation corrected an earlier assumption in
@@ -27588,7 +27588,7 @@ fn test_yq_auto_output_mixed_format_separator_order_independent_1493() -> Result
 }
 
 /// #1409's `Comma` path-threading fix in yq mode too, since
-/// `eval_pipe_with_path_context_internal` is shared verbatim between jq
+/// the deleted eager path-context evaluator is shared verbatim between jq
 /// and yq (`key`/`parent` reachable in yq mode via its own `--eval-all`
 /// support) -- pins yq-mode parity so a future mode-specific edit has real
 /// CI signal here, not just in `jq_cli_tests.rs`.
@@ -30033,7 +30033,7 @@ fn test_yq_namespaced_call_arguments_are_still_resolved_1473() -> Result<()> {
 }
 
 /// #1909: `Builtin::Path` and the `Expr::Pipe` path-context arm now call
-/// `eval.rs`'s `builtin_path_on_owned`/`eval_pipe_with_path_context`
+/// `eval.rs`'s `builtin_path_on_owned`/the deleted eager path-context evaluator
 /// directly instead of routing through `eval_on_owned`'s serialize +
 /// re-index bridge. That bridge is also where `to_json_for_reindex`'s
 /// `S`-gated float formatter runs — the only thing applying yq's "a
@@ -31007,7 +31007,7 @@ fn test_negative_index_out_of_range_survives_path_context_2254() -> Result<()> {
     // A literal negative index wrapped in bare `?`, piped into a
     // path-context builtin (`key`) -- this doesn't match the dedicated
     // `Expr::Optional(IndexExpr | SliceExpr)` bracket-bypass arm (that's a
-    // different AST shape), so it falls to `eval_stage_with_path_context`'s
+    // different AST shape), so it falls to the deleted eager path-context evaluator's
     // *general* `Expr::Optional` arm, which unconditionally swallowed any
     // error before this fix (`.a[-5]? | key` wrongly exited 0 with no
     // output).
@@ -31100,7 +31100,7 @@ fn test_negative_index_out_of_range_survives_owned_target_computed_index_2254() 
     Ok(())
 }
 
-/// #2270: `eval_stage_with_path_context`'s `Expr::Try` arm had no
+/// #2270: the deleted eager path-context evaluator's `Expr::Try` arm had no
 /// uncatchable-error guard at all (unlike its `Expr::Optional` sibling,
 /// fixed by #2227) -- `try`/`catch` under `--eval-all`, combined with a
 /// path-context-triggering builtin elsewhere in the same pipeline
@@ -31183,7 +31183,7 @@ fn test_negative_index_out_of_range_survives_try_catch_partial_prefix_2270() -> 
     Ok(())
 }
 
-/// #2289 review: `eval_stage_with_path_context`'s `Expr::Optional`/
+/// #2289 review: the deleted eager path-context evaluator's `Expr::Optional`/
 /// `Expr::Try` arms must NOT treat `EvalError::is_invalid_path_expression()`
 /// as uncatchable the way `resolve_node`'s own path-tracking resolver
 /// correctly does -- this function runs whenever *any* sibling elsewhere in
@@ -32312,7 +32312,7 @@ fn test_yq_path_step_generic_non_container_is_noop_2346() -> Result<()> {
     Ok(())
 }
 
-/// #2375: `map(f)`'s *path-context* arm (`eval_stage_with_path_context`,
+/// #2375: `map(f)`'s *path-context* arm (the deleted eager path-context evaluator,
 /// `src/jq/eval.rs`) still raised `Cannot iterate over ...` on a
 /// non-container in yq mode, where the value-only `builtin_map` a few
 /// thousand lines above already applied #1907's rule. That arm is the one
@@ -35491,7 +35491,7 @@ fn test_yq_downcase_upcase_builtins_2462() -> Result<()> {
 /// evaluators at every site a numeric index reaches a real `Object`:
 /// `eval::index_array_by_position` (the literal-index and computed-key value
 /// route), `eval::eval_owned_navigation` (the pure/reindex-bridge fast
-/// path), `eval::eval_stage_with_path_context`'s and the computed-key loop's
+/// path), the deleted eager path-context evaluator's and the computed-key loop's
 /// own `Expr::Index`/owned-target arms (the eager path-context evaluator),
 /// and `eval_generic::index_one_generic`/`Expr::Index` inline arm/
 /// `path_step_generic` (the generic route spine 2416 introduced) -- one
@@ -37341,7 +37341,7 @@ fn test_yq_from_entries_scalar_key_stringify_2521() -> Result<()> {
 /// Fixed as `eval::yq_field_index_on_scalar_is_empty`, consulted by both
 /// evaluators at every scalar-target index site: `eval::
 /// index_object_by_name`/`index_array_by_position`/`index_one`/
-/// `eval_owned_navigation`/`eval_stage_with_path_context`'s `Expr::Field`/
+/// `eval_owned_navigation`/the deleted eager path-context evaluator's `Expr::Field`/
 /// `Expr::Index` arms, and `eval_generic`'s `eval_single`'s `Expr::Field`/
 /// `Expr::Index` arms, `index_one_generic`, and `path_step_generic`'s
 /// `Expr::Field`/`Expr::Index` arms -- one definition, several call sites
@@ -37726,7 +37726,7 @@ const COMPUTED_HEAD_BLOCK_2471: &str =
 /// `path_context_is_navigational` used to admit only a *literal*
 /// `Expr::Index`, so a pipe headed by `.c[.n]` left the cursor domain at a
 /// stage with no `owned_identity_rule`, `owned_identity_pipe_applies`
-/// declined, and `path_context_needs_eager` handed the whole pipe over --
+/// declined, and `path_context_needs_owned_position` handed the whole pipe over --
 /// gate reason 1, the disjunct `docs/plan/path-context-arm-reachability.md`
 /// attributes all five of its `R1` rows to. A computed bracket moves the
 /// position exactly as a literal one does; what is new is that the component
@@ -37845,7 +37845,7 @@ fn test_computed_bracket_head_is_walkable_2471() -> Result<()> {
 ///
 /// `path_context_is_navigational` used to exclude `Expr::Optional`, so
 /// `path_context_absent_split` found an empty head, declined, and
-/// `path_context_needs_eager` handed the whole pipe to the eager evaluator --
+/// `path_context_needs_owned_position` handed the whole pipe to the eager evaluator --
 /// which `docs/plan/path-context-arm-reachability.md` had measured as reason
 /// 2's single biggest source. `?` over navigation reaches the same positions
 /// the bare navigation does and produces *no* position for the step it

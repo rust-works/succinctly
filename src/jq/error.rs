@@ -1267,7 +1267,7 @@ impl EvalError {
     /// check next.
     ///
     /// The value-position dispatch points (`eval_try`/`each_try`/
-    /// `try_single_generic`/`each_try_generic`), and `eval_stage_with_path_context`'s
+    /// `try_single_generic`/`each_try_generic`), and the deleted eager path-context evaluator's
     /// own `Expr::Optional`/`Expr::Try` arms (#2270/#2289), deliberately do
     /// *not* switch to this predicate -- see
     /// [`Self::is_uncatchable_at_value_position`], which they all call
@@ -1286,13 +1286,13 @@ impl EvalError {
     /// widening a value-position dispatch point to the full
     /// `is_uncatchable()` would be an untested behavior change (#2254).
     /// Confirmed live against jq 1.7.1 that widening it is a *real* bug, not
-    /// just an untested one: `eval_stage_with_path_context`'s `Expr::Try`/
+    /// just an untested one: the deleted eager path-context evaluator's `Expr::Try`/
     /// `Expr::Optional` arms briefly used the broader `is_uncatchable()`
     /// (matching `resolve_node`'s own path-tracking-position precedent) and
     /// it wrongly made an ordinary `path(1)` call uncatchable merely because
     /// an unrelated sibling (`key`/`file_index`) elsewhere in the same pipe
     /// forced this function's own dispatch to run at all --
-    /// `eval_stage_with_path_context` is itself a value-position dispatcher
+    /// the deleted eager path-context evaluator is itself a value-position dispatcher
     /// for any branch that isn't actually a path expression, even though it
     /// happens to run inside path-context plumbing (#2270 review, #2289).
     ///
@@ -1300,7 +1300,7 @@ impl EvalError {
     /// rather than each hand-copying `is_decode_failure() ||
     /// is_yq_negative_index_error()`: `eval_try`/`each_try` (`eval.rs`),
     /// `try_single_generic`/`each_try_generic` (`eval_generic.rs`), and
-    /// `eval_stage_with_path_context`'s own `Expr::Optional`/`Expr::Try`
+    /// the deleted eager path-context evaluator's own `Expr::Optional`/`Expr::Try`
     /// arms (`eval.rs`).
     pub fn is_uncatchable_at_value_position(&self) -> bool {
         self.is_decode_failure() || self.is_yq_negative_index_error()
