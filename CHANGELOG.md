@@ -134,6 +134,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`src/jq/parser.rs`'s wrong-arity rewind checkpoint is now two shared
+  definitions instead of ~18 hand-copies** (#2391, a #2237 follow-up):
+  `expect_or_wrong_arity` for the eight dedicated special-form parsers
+  (`limit`/`until`/`while`/`repeat`/`first`/`last`/`range`/`error`, 15
+  sites, one more than the issue's own original count — `parse_error_expr`
+  gained a 15th copy after #2036 review, before this fix existed to catch
+  it) that resolve a mismatch via `rewind_to_wrong_arity_call`, and
+  `expect_or_none` for the `Result<Option<T>, ParseError>`-returning family
+  instead (`parse_required_single_arg`'s 2 sites, plus `env`'s own
+  hand-rolled duplicate of the identical block, 3 sites). Also settles the
+  issue's own noted "two spellings of the propagate-an-unreachable-Ok-Result
+  idiom" question as a side effect: both spellings now live only inside
+  these two helpers, in one consistent form. Every converted site's own
+  wrong-arity, valid-arity, shadowing, and yq-mode (no-rewind) behavior was
+  re-verified live against jq 1.7.1, per the issue's own explicit caution
+  after two real regressions in this exact area during #2237. No behavior
+  change.
+
 - **`eval_generic::eval_single` now pins its own unreachability claim with a
   `debug_assert`** (#2368, a #2334 follow-up). #2334's `owned_or_suppress!`/
   `Err(e) if suppresses(&e, optional)` routing in `fold_lazy_seq_stage`,

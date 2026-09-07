@@ -21107,6 +21107,9 @@ fn test_dedicated_parse_fn_wrong_arity_reports_not_defined_2237() -> Result<()> 
         ("repeat(1;2)", "repeat/2"),
         ("first(1;2)", "first/2"),
         ("last(1;2)", "last/2"),
+        // #2391: `error`'s own checkpoint (added later, by #2036 review
+        // round 2) was the one form this table never covered.
+        ("error(1;2)", "error/2"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
         assert_eq!(stdout, "", "{filter}: stderr {stderr:?}");
