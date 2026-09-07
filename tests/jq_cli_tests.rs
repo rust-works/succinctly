@@ -40082,3 +40082,45 @@ fn test_optional_head_is_walkable_2558() -> Result<()> {
     }
     Ok(())
 }
+
+/// #2209: `--preserve-input` must not switch jq mode's string-escape
+/// convention. It is documented to preserve number spellings and duplicate
+/// keys; the escape table is a *mode* rule. Real jq 1.7.1 renders U+0008,
+/// U+000C and DEL as the short forms plus an escaped DEL (confirmed live
+/// against the pinned oracle) -- before this fix the pretty, non-`-c`
+/// cursor-streaming path rendered them through *yq's* table instead
+/// (long forms, DEL left raw) whenever `--preserve-input` was set.
+#[test]
+fn test_preserve_input_keeps_jq_escape_table_2209() -> Result<()> {
+    let input = r#"{"a":"\b\f\u007f"}"#;
+    let expected = "\"\\b\\f\\u007f\"";
+
+    // All four spellings of the same read must agree with real jq: the
+    // flag is orthogonal to the escape table, and so is `-c`.
+    for args in [
+        vec!["--preserve-input"],
+        vec![],
+        vec!["-c", "--preserve-input"],
+        vec!["-c"],
+    ] {
+        let (out, code) = run_jq_stdin(".a", input, &args)?;
+        assert_eq!(code, 0, "args={args:?}");
+        assert_eq!(out.trim_end(), expected, "args={args:?}");
+    }
+
+    // The whole-document and generator shapes reach the same writer and
+    // regressed identically, so pin them too.
+    for filter in [".", "first(.a)"] {
+        let (out, code) = run_jq_stdin(filter, input, &["--preserve-input"])?;
+        assert_eq!(code, 0, "filter={filter}");
+        assert!(
+            out.contains("\\b"),
+            "filter={filter} lost jq's short form: {out}"
+        );
+        assert!(
+            !out.contains("\\u0008"),
+            "filter={filter} used yq's escape table: {out}"
+        );
+    }
+    Ok(())
+}

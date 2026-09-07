@@ -1342,10 +1342,16 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     // `output_config.jq_compat` already encodes the same
     // `--preserve-input`/`SUCCINCTLY_PRESERVE_INPUT=1` priority `JsonConvention`
     // needs (`OutputConfig::from_args`'s own doc comment).
+    // #2209: `JqPreserveInput`, never `Preserve` -- this is jq mode, and
+    // `Preserve` is yq's whole bundle, escape table included. Selecting it
+    // here made `--preserve-input` silently render strings through yq's
+    // table on the cursor-streaming path, a divergence from real jq that
+    // `--preserve-input` was never meant to cause (it is documented to
+    // affect number spelling and duplicate keys only).
     let json_numbers = if output_config.jq_compat {
         JsonConvention::JqCompat
     } else {
-        JsonConvention::Preserve
+        JsonConvention::JqPreserveInput
     };
 
     // Set up output writer

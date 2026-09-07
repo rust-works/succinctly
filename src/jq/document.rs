@@ -85,16 +85,34 @@ impl IndentSpec {
 /// Which value-formatting convention JSON streaming should use (#1576).
 ///
 /// Covers finite number literals, control-character escaping, and
-/// duplicate object keys -- the three things `--preserve-input`/
-/// `jq_compat` toggles together (ADR-0018 rule 5), so one enum selects all
-/// three rather than three independent parameters that are never
-/// independently selectable in practice.
+/// duplicate object keys. One enum selects all three rather than three
+/// independent parameters, because a *mode* picks the whole bundle at
+/// once -- but the bundle is per-mode, not per-flag: `--preserve-input`
+/// moves jq mode between two of these variants without ever reaching
+/// yq's, since the escape table is a mode rule (ADR-0018) and
+/// `--preserve-input` is documented to affect numbers and duplicate keys
+/// only (#2209).
 ///
 /// - `Preserve`: echo the document's source number spelling verbatim
 ///   (`1e100` stays `1e100`), use yq's escape table (no `\b`/`\f` short
 ///   forms, DEL left raw), and keep every occurrence of a repeated object
 ///   key -- real yq's own convention (#1008), and the only one
 ///   `yq_runner.rs` ever selects, since yq has no `jq_compat` concept.
+///   Despite the name, this is *yq's* bundle -- jq mode never selects it,
+///   not even under `--preserve-input` (see `JqPreserveInput`).
+/// - `JqPreserveInput`: jq mode's `--preserve-input`/
+///   `SUCCINCTLY_PRESERVE_INPUT=1`. Echoes the source number spelling and
+///   keeps repeated object keys, exactly like `Preserve` -- but uses
+///   **jq's** escape table, like `JqCompat`. The escape table is a mode
+///   rule, and `--preserve-input` is documented (`docs/reference/
+///   environment-variables.md`) to preserve numbers and escape sequences,
+///   never to adopt the *other* tool's escape convention. Before #2209
+///   `jq_runner.rs` selected `Preserve` here, which silently rendered jq
+///   mode's strings through yq's table on the cursor-streaming path
+///   (the `\b` short form widened to its `\u0008` long form, and DEL
+///   left raw) while every other jq-mode writer
+///   kept jq's -- a divergence from real jq visible on any
+///   navigation-only filter (`.a`, `.`, `first(.a)`).
 /// - `JqCompat`: canonicalize number literals the way real jq's own reader
 ///   does (`format_number_jq_compat` -- strips a redundant leading zero,
 ///   canonicalizes exponent notation), use jq's escape table (`\b`/`\f`
@@ -106,11 +124,36 @@ impl IndentSpec {
 ///   `format_number_jq_compat`'s reformatting, both already used by the
 ///   jq CLI's non-streaming `print_json` path. `jq_runner.rs` selects this
 ///   unless `--preserve-input`/`SUCCINCTLY_PRESERVE_INPUT=1` is set, in
-///   which case it selects `Preserve` instead.
+///   which case it selects `JqPreserveInput` instead (#2209 -- never
+///   `Preserve`, which would cross into yq's escape table).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JsonConvention {
     Preserve,
+    JqPreserveInput,
     JqCompat,
+}
+
+impl JsonConvention {
+    /// Whether number literals and repeated object keys are echoed from the
+    /// source rather than canonicalized/collapsed -- true for both of the
+    /// `--preserve-input`-shaped conventions, false only for `JqCompat`.
+    ///
+    /// Exists so the several sites that care about *that* axis alone don't
+    /// each have to spell out a two-variant pattern (and silently miss the
+    /// new variant the way a `== Preserve` check would, #2209).
+    #[must_use]
+    pub fn preserves_source_values(self) -> bool {
+        matches!(self, Self::Preserve | Self::JqPreserveInput)
+    }
+
+    /// Whether strings are escaped with jq's table (`\b`/`\f` short forms,
+    /// DEL escaped) rather than yq's. A *mode* rule, independent of
+    /// [`Self::preserves_source_values`] -- that independence is exactly
+    /// what #2209 fixed.
+    #[must_use]
+    pub fn uses_jq_escape_table(self) -> bool {
+        matches!(self, Self::JqCompat | Self::JqPreserveInput)
+    }
 }
 
 #[cfg(test)]
