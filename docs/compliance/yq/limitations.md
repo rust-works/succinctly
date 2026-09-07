@@ -2155,19 +2155,27 @@ mid-pipe `.a | .b |= path` has to answer `["a","b"]`, not `["b"]`. The rewrite i
 `path_context_resolve_constants`, the same one the owned identity pipe applies, so a
 position named here means what a position named anywhere else does.
 
-**The one row still divergent** is a bare `parent` written straight into its own target:
+**The rows still divergent** are a bare `parent` written straight into its own target, by
+`|=` or by `map_values`:
 
-| filter                | real yq                        | succinctly                     |
-|-----------------------|--------------------------------|--------------------------------|
-| `.a \| .b \|= parent`  | `{"b":{"b":{},"e":2},"e":2}`   | `{"b":{"b":1,"e":2},"e":2}`    |
+| filter                       | real yq                                                          | succinctly                                              |
+|------------------------------|------------------------------------------------------------------|---------------------------------------------------------|
+| `.a \| .b \|= parent`         | `{"b":{"b":{},"e":2},"e":2}`                                     | `{"b":{"b":1,"e":2},"e":2}`                             |
+| `.a \| map_values(parent)`    | `{"b":{"b":{},"e":{"b":1,"e":{"b":1}}},"e":{"b":1,"e":{"b":1}}}` | `{"b":{"b":1,"e":2},"e":{"b":1,"e":2}}`                 |
 
 Real yq's `parent` is a *pointer* to the node it is in the middle of mutating, so assigning
 it into that node's own child makes the document self-referential and its printer emits the
-cycle truncated (`{}` at the second level). succinctly has no node identity (the same
-limitation the anchor/alias section above records), so it writes the parent's pre-write
-value. Every `parent` row that *reads* the node rather than embedding it — `parent|keys`,
-`parent|type`, `parent|length` — matches. Pinned in
-`test_yq_update_filter_reads_the_target_position_2522`.
+cycle truncated (`{}` at the second level) — and `map_values` rewrites the container one
+member at a time, so its second member's `parent` already holds the first member's
+self-reference. succinctly has no node identity (the same limitation the anchor/alias
+section above records), so it writes the parent's pre-write value: the container as it was
+before the stage ran, for every member. Every `parent` row that *reads* the node rather
+than embedding it — `parent|keys`, `parent|type`, `parent|length`, `map_values(parent |
+length)` (`{"b":2,"e":2}` in both) — matches. Pinned in
+`test_yq_update_filter_reads_the_target_position_2522`; the `map_values` row was `{}` in
+succinctly until spine 2416's identity pass ran map-family bodies at each member's own
+position (before it, a `parent` inside such a body was refused by every route and answered
+from no position at all).
 
 `line`/`column` inside an update filter are **not** covered: they are answered from a
 cursor, not from a path, and no cursor reaches the filter. `.a | .b |= line` is `2` in real
