@@ -19407,15 +19407,9 @@ fn eval_slice_bound<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // (confirmed live against yq v4.53.3 -- `.[(0,"x"):3]` on `[10,20,30]`
     // rejects the bound outright, "expected to find 1 number, got 2
     // instead"), so there's no oracle basis for streaming a prefix here.
-    let mut converted = vec_with_capacity(raw.len());
-    for v in &raw {
-        match owned_bound_to_i64(v, round) {
-            Ok(i) => converted.push(i),
-            Err(e) if S::TAG == EvalTag::Yq => return Err(Control::Error(e)),
-            Err(e) => return Ok((converted, Some(Control::Error(e)))),
-        }
-    }
-    Ok((converted, escape))
+    let (converted, conv_escape) =
+        convert_slice_bounds::<S, Option<i64>, Control>(raw, round, |i, _v| i)?;
+    Ok((converted, conv_escape.or(escape)))
 }
 
 /// Classify a resolved bound value the way jq's slice descriptor does
@@ -19429,6 +19423,46 @@ pub(crate) fn owned_bound_to_i64(
     round: fn(f64) -> f64,
 ) -> Result<Option<i64>, EvalError> {
     Ok(SliceBounds::resolved_bound(v)?.map(|f| round(f) as i64))
+}
+
+/// Convert a slice bound generator's raw `OwnedValue` output to integers one
+/// value at a time, applying the shared yq-mode-gated priority rule
+/// [`eval_slice_bound`]/`eval_slice_bound_with_path_context`/
+/// `resolve_slice_bound` each used to hand-copy (#2410): a conversion
+/// failure unconditionally outranks any later-pending generator escape (it
+/// only ever touches a value the generator already produced, strictly
+/// before whatever triggered that escape in true generator order -- #2372's
+/// own rationale, re-verified for each caller against jq 1.7.1 in their own
+/// doc comments), except in yq mode, where real yq has no clean model for a
+/// computed comma-bound at all and a conversion failure escapes immediately
+/// instead of returning a `Partial`-shaped `Ok`.
+///
+/// `item` builds each caller's own per-value push shape from the resolved
+/// `Option<i64>` and the original value, taking the latter *by value* (not
+/// `&OwnedValue`, unlike the ask in #2410's own suggested signature) so a
+/// caller that keeps the value alongside its integer
+/// (`eval_slice_bound_with_path_context`'s `(OwnedValue, Option<i64>)`) can
+/// move it in for free -- `OwnedValue`'s derived `Clone` is a deep clone, so
+/// a by-reference signature would have forced one at that call site where
+/// none existed before. `E` is the caller's own escape/error wrapper type
+/// (`Control`/`EvalEscape`), built from `EvalError` via `From`. The returned
+/// `Option<E>` is only the conversion's own override; callers still combine
+/// it with whatever escape the generator itself produced (`.or(escape)`) --
+/// this helper has no visibility into that, only into `raw`.
+fn convert_slice_bounds<S: EvalSemantics, T, E: From<EvalError>>(
+    raw: Vec<OwnedValue>,
+    round: fn(f64) -> f64,
+    item: impl Fn(Option<i64>, OwnedValue) -> T,
+) -> Result<(Vec<T>, Option<E>), E> {
+    let mut converted = vec_with_capacity(raw.len());
+    for v in raw {
+        match owned_bound_to_i64(&v, round) {
+            Ok(i) => converted.push(item(i, v)),
+            Err(e) if S::TAG == EvalTag::Yq => return Err(E::from(e)),
+            Err(e) => return Ok((converted, Some(E::from(e)))),
+        }
+    }
+    Ok((converted, None))
 }
 
 /// Whether `target` is a genuine container -- `Array` or `Object`. The one
@@ -29439,15 +29473,15 @@ fn resolve_slice_bound<S: EvalSemantics>(
     if S::TAG == EvalTag::Yq && escape.is_some() {
         values = Vec::new();
     }
-    let mut resolved = vec_with_capacity(values.len());
-    for v in &values {
-        match owned_bound_to_i64(v, round) {
-            Ok(i) => resolved.push((i, numeric_slice_bound_key(v))),
-            Err(e) if S::TAG == EvalTag::Yq => return Err(EvalEscape::from(e)),
-            Err(e) => return Ok((resolved, Some(EvalEscape::from(e)))),
-        }
-    }
-    Ok((resolved, escape))
+    // #2385/#2410: mirrors `eval_slice_bound`'s identical fix (`eval.rs`,
+    // above) exactly, via the shared `convert_slice_bounds` -- see that
+    // function's own doc comment for the full rationale and live-oracle
+    // verification, not repeated here.
+    let (resolved, conv_escape) =
+        convert_slice_bounds::<S, ResolvedSliceBound, EvalEscape>(values, round, |i, v| {
+            (i, numeric_slice_bound_key(&v))
+        })?;
+    Ok((resolved, conv_escape.or(escape)))
 }
 
 /// Thread a value through a run of static path components, without expanding
@@ -36539,18 +36573,13 @@ fn eval_slice_bound_with_path_context<W: Clone + AsRef<[u64]>, S: EvalSemantics>
     if S::TAG == EvalTag::Yq && escape.is_some() {
         raw = Vec::new();
     }
-    // #2372: mirrors `eval_slice_bound`'s identical fix (`eval.rs`, above)
-    // exactly -- see that function's own doc comment for the full
-    // rationale and live-oracle verification, not repeated here.
-    let mut converted = vec_with_capacity(raw.len());
-    for v in raw {
-        match owned_bound_to_i64(&v, round) {
-            Ok(i) => converted.push((v, i)),
-            Err(e) if S::TAG == EvalTag::Yq => return Err(Control::Error(e)),
-            Err(e) => return Ok((converted, Some(Control::Error(e)))),
-        }
-    }
-    Ok((converted, escape))
+    // #2372/#2410: mirrors `eval_slice_bound`'s identical fix (`eval.rs`,
+    // above) exactly, via the shared `convert_slice_bounds` -- see that
+    // function's own doc comment for the full rationale and live-oracle
+    // verification, not repeated here.
+    let (converted, conv_escape) =
+        convert_slice_bounds::<S, RawSliceBound, Control>(raw, round, |i, v| (v, i))?;
+    Ok((converted, conv_escape.or(escape)))
 }
 
 /// [`eval_slice_expr`]'s path-context twin (#2100): reproduces its current
@@ -58793,6 +58822,52 @@ mod tests {
         yq_query!(b"[10,20,30]", r#".[(1,"x"):3] | key"#,
             QueryResult::Error(e) => {
                 assert!(e.message.contains("integer"), "{}", e.message);
+            }
+        );
+    }
+
+    /// #2410: cross-site agreement test for the "convert a slice bound
+    /// generator's output one value at a time, a conversion failure
+    /// unconditionally outranking a later-pending generator escape"
+    /// priority rule -- `eval_slice_bound`, `eval_slice_bound_with_path_
+    /// context`, and `resolve_slice_bound` each hand-copied this dispatch
+    /// independently (fixed by #2372/#2385 as the same gap was
+    /// rediscovered), and now share one definition (`convert_slice_bounds`).
+    /// Drives the identical document and comma-bound expression
+    /// (`(1,"x",error("y")):3` -- `1` converts fine, `"x"` fails conversion
+    /// before `error("y")` is ever reached) through all three call sites
+    /// and asserts they all keep their own already-produced prefix before
+    /// raising the identical conversion-failure error. Confirmed against jq
+    /// 1.7.1: `.[(1,"x",error("y")):3]` prints `[20,30]` before raising
+    /// "must be integers"; `path(.[(1,"x",error("y")):3])` prints
+    /// `[{"start":1,"end":3}]` (`.[(1,"x",error("y")):3] | key`'s own
+    /// expected prefix is unverifiable against a real oracle -- `key` has
+    /// none -- but is identical to `path()`'s single pair by construction,
+    /// per the existing sibling test above).
+    #[test]
+    fn slice_bound_conversion_sites_agree_on_double_fault_2410() {
+        // Site: `eval_slice_bound` (plain read).
+        query!(b"[10,20,30]", r#".[(1,"x",error("y")):3]"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(
+                    vs,
+                    vec![OwnedValue::Array(vec![OwnedValue::Int(20), OwnedValue::Int(30)])]
+                );
+                assert!(e.message.contains("integers"), "{}", e.message);
+            }
+        );
+        // Site: `eval_slice_bound_with_path_context` (via `key`).
+        query!(b"[10,20,30]", r#".[(1,"x",error("y")):3] | key"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"{"start":1,"end":3}"#]);
+                assert!(e.message.contains("integers"), "{}", e.message);
+            }
+        );
+        // Site: `resolve_slice_bound` (via `path()`).
+        query!(b"[10,20,30]", r#"path(.[(1,"x",error("y")):3])"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), [r#"[{"start":1,"end":3}]"#]);
+                assert!(e.message.contains("integers"), "{}", e.message);
             }
         );
     }

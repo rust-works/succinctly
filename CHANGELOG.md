@@ -117,6 +117,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`eval.rs`'s slice-bound-generator-to-integer conversion loop is now one
+  shared definition** (#2410), not three independent hand-copies
+  (`eval_slice_bound`, `eval_slice_bound_with_path_context`,
+  `resolve_slice_bound`) of the same "convert one value at a time; a
+  conversion failure unconditionally outranks a later-pending generator
+  escape, except in yq mode, which escapes immediately instead" priority
+  rule — fixed by #2372/#2385 as the same gap was independently
+  rediscovered at each site. New helper `convert_slice_bounds`, generic over
+  the per-site push shape and escape/error wrapper type
+  (`Control`/`EvalEscape`), collapses all three; a new cross-site test
+  drives the same document/bound expression through all three and asserts
+  they agree. No behavior change.
+
 - **`eval_generic::eval_index_expr`'s "promote `cursors`, preserving an
   in-flight `Control`'s priority over a secondary decode failure" dispatch is
   now one shared definition** (#2364), not three independent hand-copies
