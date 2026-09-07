@@ -34,6 +34,7 @@ use super::document::{
     value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors, DocumentCursor, DocumentElements,
     DocumentFields, DocumentValue, IndentSpec, JsonConvention,
 };
+use super::error::EvalEscape;
 use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, binary_fanout_rules, bind_def, bind_def_call,
     boolean_fanout_bools, cannot_reserve_cross_product, classify_limit_n, classify_nth_n,
@@ -48,15 +49,16 @@ use super::eval::{
     slice_component_value, slice_object_as_yq_children, slice_owned_value_read,
     streams_escaped_generator_prefix, substitute_bound_var, substitute_vars, suppress_or_raise,
     suppresses, tonumber_from_str, vec_with_capacity, yq_absent_key_read_is_empty,
-    yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_negative_index_check,
-    yq_numeric_index_on_object_is_null, yq_object_key_stringify, yq_read_only_context,
-    BinaryFanoutRules, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
-    JqSemantics, LimitN, PathTrail, QueryResult, YqSemantics,
+    yq_assign_rhs_document, yq_empty_operand_output, yq_field_index_on_scalar_is_empty,
+    yq_negative_index_check, yq_numeric_index_on_object_is_null, yq_object_key_stringify,
+    yq_read_only_context, BinaryFanoutRules, Control, Demand, EmptyOperandOp, EvalError,
+    EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail, QueryResult, YqSemantics,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
 use super::expr::{
-    Builtin, CompareOp, Expr, FormatType, Literal, NumberKey, ObjectEntry, ObjectKey, Pattern,
+    AssignOp, BoundBody, Builtin, CompareOp, Expr, FormatType, FuncDefData, Literal, NumberKey,
+    ObjectEntry, ObjectKey, Pattern, StringPart,
 };
 use super::slice::{literal_component_from_values, slice_str, SliceBounds};
 use super::value::{owned_value_eq, NumberRepr, OwnedValue};
@@ -4365,6 +4367,7 @@ pub(crate) fn resolve_path_context_at<S: EvalSemantics>(
             key,
             path,
             parent_of: Some(parent_of),
+            prefetch: None,
         },
     )
 }
@@ -6075,6 +6078,21 @@ fn try_single_generic<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
+    // A handler that reads path context stands at this stage's position
+    // (spine 2416, identity pass): the sink route's `each_try_generic` runs
+    // it from the cursor, so delegate to it rather than growing a second
+    // copy of that rule here.
+    if cursor.is_some() && catch.is_some_and(needs_path_context) {
+        return collect_each_generic::<S, V>(
+            &Expr::Try {
+                expr: Box::new(inner.clone()),
+                catch: catch.map(|c| Box::new(c.clone())),
+            },
+            value,
+            optional,
+            cursor,
+        );
+    }
     let run_catch = |payload: &OwnedValue| -> GenericResult<V> {
         match catch {
             Some(catch_expr) => eval_each_owned_collect::<S, V>(catch_expr, payload, optional),
@@ -6442,6 +6460,17 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                     if let Some(result) = try_path_context_absent_walk::<S, V>(exprs, root) {
                         return result;
                     }
+                }
+                // spine 2416 (identity pass): a value carried without its
+                // cursor has no position of its own to answer these from.
+                // The owned door (`eval::eval_path_context_pipe_owned`)
+                // gives it one -- a reindexed copy walked with a cursor --
+                // or hands it over, by this same gate; before this arm the
+                // gate alone decided, and a pipe it declined lost the
+                // position entirely.
+                if cursor.is_none() {
+                    let owned = owned_or_suppress!(to_owned_with_cursor(&value, None), optional);
+                    return eval_on_owned::<S, _>(&Expr::Pipe(exprs.clone()), owned, optional);
                 }
                 // #2416 phase 3: a pipe the walk declined runs here, in the
                 // generic evaluator with `key`/`parent`/`path` answered as
@@ -6880,6 +6909,19 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // unchanged for `body`, only binding the variable), so a `key`/
         // `parent`/`path` inside either answers as a cursor property instead
         // of bridging the whole construct to the eager evaluator.
+        // spine 2416 (identity pass): see `eval_each_generic`'s own arm for
+        // these five, reached through the same delegation `Expr::As` uses.
+        Expr::StringInterpolation(_)
+        | Expr::Assign { .. }
+        | Expr::CompoundAssign { .. }
+        | Expr::AlternativeAssign { .. }
+        | Expr::Update { .. }
+            if cursor.is_some()
+                && needs_path_context(expr)
+                && owned_identity_pipe_supported(core::slice::from_ref(expr)) =>
+        {
+            collect_each_generic::<S, V>(expr, value, optional, cursor)
+        }
         Expr::As { .. } => collect_each_generic::<S, V>(expr, value, optional, cursor),
 
         // #2416 phase 3: destructuring `as` natively via
@@ -7193,6 +7235,33 @@ fn drain_result_generic<V: DocumentValue>(
 /// only ones Stage 5 (`eval.rs`'s own widening) never reached; the seven
 /// shapes are pinned in `test_short_circuit_side_effect_shapes_already_match_jq_820`,
 /// not the leaks table.
+/// A stage that reads path context, run by the owned identity pipe from the
+/// node's own position (spine 2416, identity pass): the node is
+/// materialized once and the stage's reads are resolved against
+/// `OwnedIdentity::kept(cursor)`, so `.[] | "\\(key)"` and `.a | .b = key`
+/// answer from the cursor with no eager evaluator involved.
+fn eval_positioned_stage_generic<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    cursor: V::Cursor,
+    optional: bool,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    // STYLE-0012: the decode failure of the node this stage stands on is
+    // raised or suppressed as `optional` says -- the same choice the bridge
+    // this replaces made through `owned_or_suppress!`.
+    match to_owned_cursor(&cursor) {
+        Ok(owned) => eval_owned_identity_pipe::<S, V>(
+            core::slice::from_ref(expr),
+            owned,
+            OwnedIdentity::kept(cursor),
+            optional,
+            sink,
+        ),
+        Err(_) if optional => Flow::Exhausted,
+        Err(e) => Flow::Escaped(Control::Error(e)),
+    }
+}
+
 fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     value: V,
@@ -7374,6 +7443,22 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // See `each_limit_generic`'s own doc comment.
         Expr::Limit { n, expr } => {
             each_limit_generic::<S, V>(n, expr, value, optional, cursor, sink)
+        }
+
+        // spine 2416 (identity pass): a stage whose reads the owned identity
+        // pipe answers at the cursor's own position -- an interpolation slot
+        // or an assignment's right side is evaluated at the stage's input
+        // (like a `[...]` slot), a `|=` filter at its target.
+        Expr::StringInterpolation(_)
+        | Expr::Assign { .. }
+        | Expr::CompoundAssign { .. }
+        | Expr::AlternativeAssign { .. }
+        | Expr::Update { .. }
+            if cursor.is_some()
+                && needs_path_context(expr)
+                && owned_identity_pipe_supported(core::slice::from_ref(expr)) =>
+        {
+            eval_positioned_stage_generic::<S, V>(expr, cursor.expect("guarded"), optional, sink)
         }
 
         // #1597 part 2: `.[]` over an array, walked lazily -- see
@@ -7707,24 +7792,53 @@ fn each_try_generic<S: EvalSemantics, V: DocumentValue>(
         }
         Flow::Escaped(Control::Error(e)) => match catch {
             Some(catch_expr) => {
-                eval_each_owned::<S>(catch_expr, &e.payload(), optional, &mut |o| {
-                    sink(GenericItem::Owned(o))
-                })
+                run_try_handler_generic::<S, V>(catch_expr, e.payload(), optional, cursor, sink)
             }
             None => Flow::Exhausted,
         },
         Flow::Escaped(Control::Break(_)) => match catch {
-            Some(catch_expr) => {
-                eval_each_owned::<S>(catch_expr, &OwnedValue::Null, optional, &mut |o| {
-                    sink(GenericItem::Owned(o))
-                })
-            }
+            Some(catch_expr) => run_try_handler_generic::<S, V>(
+                catch_expr,
+                OwnedValue::Null,
+                optional,
+                cursor,
+                sink,
+            ),
             None => Flow::Exhausted,
         },
         // Halt is never caught (`Control`'s own guarantee); other terminal
         // shapes (`Exhausted`, `Stopped`) pass straight through.
         other => other,
     }
+}
+
+/// A `catch` handler over the error's payload. A handler that reads path
+/// context stands at the `try` stage's own position (spine 2416, identity
+/// pass): `.[] | try error("x") catch file_index` answers each element's
+/// file, as the eager evaluator did, by running the handler through the
+/// owned identity pipe from the cursor the stage stood on.
+fn run_try_handler_generic<S: EvalSemantics, V: DocumentValue>(
+    handler: &Expr,
+    payload: OwnedValue,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    if let Some(c) = cursor {
+        let stages = owned_identity_body_stages(handler);
+        if needs_path_context(handler) && owned_identity_pipe_supported(stages) {
+            return eval_owned_identity_pipe::<S, V>(
+                stages,
+                payload,
+                OwnedIdentity::kept(c),
+                optional,
+                sink,
+            );
+        }
+    }
+    eval_each_owned::<S>(handler, &payload, optional, &mut |o| {
+        sink(GenericItem::Owned(o))
+    })
 }
 
 /// Forces a #1194-class check on a still-lazy [`GenericItem`] *before* it
@@ -8230,8 +8344,10 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
         }
         // #2416 phase 3: see `eval_single`'s `Expr::Pipe` arm -- the same
         // gate, so both routes agree on which pipes the eager evaluator
-        // still owns.
-        if path_context_needs_eager(exprs) {
+        // still owns; and the same cursor-less rule (spine 2416, identity
+        // pass), so a value with no position of its own takes the owned
+        // door from here too.
+        if cursor.is_none() || path_context_needs_eager(exprs) {
             return drain_result_generic(
                 eval_single::<S, _>(&Expr::Pipe(exprs.to_vec()), value, optional, cursor),
                 sink,
@@ -8259,8 +8375,7 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
         rest.iter().any(needs_path_context)
             && !path_context_is_navigational(first)
             && !path_context_stage_preserves_node(first)
-            && (!needs_path_context(first) || owned_identity_emits_position(first))
-            && owned_identity_rule(first).is_some()
+            && owned_identity_leaving_stage_supported(first)
             && owned_identity_pipe_supported(rest)
     });
     // Same once-per-driver cache as `drive_pipe_elements_generic` (#1598):
@@ -12858,6 +12973,7 @@ fn path_context_component_values<S: EvalSemantics, V: DocumentValue>(
                 // `path_context_component_walkable` keeps the constant-only
                 // gate, so no `parent` can appear in a component.
                 parent_of: None,
+                prefetch: None,
             },
         )?;
         &resolved
@@ -13306,7 +13422,13 @@ pub(crate) fn path_context_needs_eager(exprs: &[Expr]) -> bool {
     // its own -- `try_path_context_absent_{sink,walk}` walk the head as
     // positions and resolve the rest's path-context builtins against
     // whichever one they reach. What that route declines still comes here.
-    let absent_routed = path_context_absent_split(exprs).is_some();
+    // spine 2416 (identity pass): a pipe the absent route accepts is
+    // answered there in full -- each position's `rest` runs on cursors, as
+    // constants, or through the owned identity pipe -- so no later stage
+    // can be this evaluator's, whatever the value has become by then.
+    if path_context_absent_split(exprs).is_some() {
+        return false;
+    }
     for stage in exprs {
         if needs_path_context(stage) {
             // #2416 gate reason 1 (#2471): a `map_values`/`with_entries`
@@ -13321,12 +13443,8 @@ pub(crate) fn path_context_needs_eager(exprs: &[Expr]) -> bool {
             // deliberately not admitted here -- its cursor-input shapes are
             // already exact on the eager route (#2493), and moving a correct
             // answer to a new route is risk with nothing to buy.
-            if !matches!(
-                map_family_positioned(stage),
-                Some((MapFamily::MapValues | MapFamily::WithEntries, _))
-            ) && (!is_node
-                || (can_absent && !absent_routed)
-                || !path_context_stage_native(stage))
+            if map_family_positioned(stage).is_none()
+                && (!is_node || can_absent || !path_context_stage_native(stage))
             {
                 return true;
             }
@@ -13577,7 +13695,35 @@ fn path_context_single_native(expr: &Expr) -> bool {
         // Native since #2416 phase 3: transparent to evaluation, so whatever
         // `inner` is decides.
         Expr::Shared(inner) => path_context_single_native(inner),
-        _ => false,
+        // spine 2416 (identity pass): a string interpolation and the
+        // assignment family are answered by `eval_positioned_stage_generic`
+        // -- every slot, or the right-hand side, is evaluated at the stage's
+        // own input with the cursor, exactly as a `[...]` slot is -- so a
+        // read inside one is native here. `|=`'s filter stands at the
+        // *target* and is positioned by `eval::update_path` from the ambient
+        // prefix that arm installs (#2522), so only its left side is asked.
+        Expr::StringInterpolation(parts) => parts.iter().all(|part| match part {
+            StringPart::Literal(_) => true,
+            StringPart::Expr(inner) => path_context_single_native(inner),
+        }),
+        Expr::Assign { path, value }
+        | Expr::CompoundAssign { path, value, .. }
+        | Expr::AlternativeAssign { path, value } => {
+            !needs_path_context(path) && path_context_single_native(value)
+        }
+        Expr::Update { path, .. } => !needs_path_context(path),
+        // spine 2416 (identity pass): a map-family stage whose body the
+        // owned identity pipe runs at each member's own position (see
+        // [`map_family_positioned`]).
+        Expr::Builtin(Builtin::Map(_) | Builtin::MapValues(_) | Builtin::WithEntries(_)) => {
+            map_family_positioned(expr).is_some()
+        }
+        // spine 2416 (identity pass): anything that reads no path context at
+        // all is native enough -- the cursor it may drop on the way through
+        // `eval_on_owned` is one nothing inside it asks for, and where its
+        // *output* stands is the enclosing pipe's question
+        // (`owned_identity_rule`), not this predicate's.
+        _ => !needs_path_context(expr),
     }
 }
 
@@ -13755,32 +13901,43 @@ struct ResolveAdmits {
     /// `parent`/`parent(n)`: a document *node*, which no literal spells.
     /// Only a caller carrying the ancestors can answer it.
     parent: bool,
-    /// A read inside an arithmetic operand (`key + 10`). The rewriter has
-    /// handled this since #2471, but the absent and owned-identity gates
-    /// keep refusing it: `owned_identity_pipe_supported` has its own
-    /// `Expr::Arithmetic` arm, and widening the absent gate would move
-    /// pipes off the eager route with nothing to buy.
-    arithmetic: bool,
+    /// A `|=` stage. Its filter is not rewritten here at all -- it stands
+    /// at the *target*, which `eval::update_path` positions from the
+    /// ambient prefix (#2522) -- so it is admitted only where the caller
+    /// installs that prefix around the evaluation (`with_path_base`): the
+    /// owned identity pipe and `update_path` itself. The constant route
+    /// evaluates a rewritten pipe with nothing installed, and asserts the
+    /// rewrite left no read behind.
+    update: bool,
+    /// A sub-expression the rewrite cannot resolve -- a pipe that moves
+    /// before it reads, a construct with no rewriter arm -- is admitted when
+    /// the owned identity pipe can evaluate it at the stage's position and
+    /// substitute its outputs ([`PathContextAt::prefetch`]). Only that pipe
+    /// supplies the evaluation, so only it admits the shape.
+    prefetch: bool,
 }
 
 impl ResolveAdmits {
     /// The absent route: constants only.
     const CONSTANTS: Self = Self {
         parent: false,
-        arithmetic: false,
+        update: false,
+        prefetch: false,
     };
-    /// The owned identity pipe, which carries the ancestors `parent` needs.
+    /// The owned identity pipe, which carries the ancestors `parent` needs
+    /// and installs its position for a `|=`.
     const IDENTITY: Self = Self {
         parent: true,
-        arithmetic: false,
+        update: true,
+        prefetch: true,
     };
     /// `eval::update_path`'s filter (#2522): the position is a named point in
     /// a value the caller holds, so `parent` is answerable, and the filter is
-    /// rewritten in place rather than routed anywhere -- there is no route
-    /// for an arithmetic operand to be moved off.
+    /// rewritten in place rather than routed anywhere.
     const UPDATE_TARGET: Self = Self {
         parent: true,
-        arithmetic: true,
+        update: true,
+        prefetch: false,
     };
 }
 
@@ -13805,14 +13962,20 @@ fn path_context_resolvable(expr: &Expr, admits: ResolveAdmits) -> bool {
         // same literal-only restriction `owned_identity_pipe_supported`
         // already places on a bare `parent(n)` stage.
         Expr::Builtin(Builtin::ParentN(n)) => admits.parent && matches!(**n, Expr::Literal(_)),
-        // #2522: `key + 10` inside a `|=` filter, admitted only where the
-        // rewrite happens in place -- see [`ResolveAdmits::arithmetic`].
-        Expr::Arithmetic { left, right, .. } => admits.arithmetic && sub(left) && sub(right),
+        // #2522 admitted a read inside an arithmetic operand for the in-place
+        // `|=` rewrite only; the identity pass (spine 2416) admits it on every
+        // route, since the rewriter has handled it since #2471 and what the
+        // refusal bought -- keeping such pipes on the eager evaluator -- is
+        // now exactly the cost.
+        Expr::Arithmetic { left, right, .. } => sub(left) && sub(right),
         Expr::Paren(inner) | Expr::Array(inner) | Expr::Optional(inner) => sub(inner),
         Expr::FirstExpr(inner) | Expr::LastExpr(inner) => sub(inner),
         Expr::Builtin(Builtin::FirstStream(inner) | Builtin::LastStream(inner)) => sub(inner),
         Expr::Comma(exprs) => exprs.iter().all(sub),
-        Expr::Pipe(exprs) => path_context_stages_resolvable(exprs, admits),
+        Expr::Pipe(exprs) => {
+            path_context_stages_resolvable(exprs, admits)
+                || (admits.prefetch && owned_identity_pipe_supported(exprs))
+        }
         Expr::Builtin(Builtin::Select(cond)) => sub(cond),
         Expr::Limit { n, expr } => sub(n) && sub(expr),
         Expr::Try { expr, catch } => sub(expr) && catch.as_deref().map_or(true, sub),
@@ -13845,6 +14008,47 @@ fn path_context_resolvable(expr: &Expr, admits: ResolveAdmits) -> bool {
         // `needs_path_context`'s own arm (see its comment for why a
         // `TrackedVar` cannot stand in a path).
         Expr::Assign { path, value } => !needs_path_context(path) && sub(value),
+        // spine 2416 (identity pass). Every arm below evaluates the
+        // sub-expressions it recurses into at the stage's own input, which
+        // is what makes a read inside them a constant for a fixed position:
+        // an interpolation slot (like an `Array` slot), a compound
+        // assignment's right side (`eval_compound_assign` evaluates it once
+        // against the input, #2522), a fold's SOURCE and INIT (UPDATE and
+        // EXTRACT stand at the accumulator and are never descended into,
+        // see `needs_path_context`), a `label` body, a binding's source and
+        // body (`eval_as` evaluates both against the same value), and a
+        // bound call's body and arguments. A pipe inside any of them is
+        // still held to [`path_context_stages_resolvable`]'s rule that a
+        // read may not follow a move.
+        Expr::StringInterpolation(parts) => parts.iter().all(|part| match part {
+            StringPart::Literal(_) => true,
+            StringPart::Expr(inner) => sub(inner),
+        }),
+        Expr::CompoundAssign { path, value, .. } | Expr::AlternativeAssign { path, value } => {
+            !needs_path_context(path) && sub(value)
+        }
+        Expr::Update { path, .. } => admits.update && !needs_path_context(path),
+        Expr::Reduce { input, init, .. } | Expr::Foreach { input, init, .. } => {
+            sub(input) && sub(init)
+        }
+        Expr::Label { body, .. } => sub(body),
+        Expr::As { expr, body, .. } => sub(expr) && sub(body),
+        Expr::AsPattern {
+            expr,
+            patterns,
+            body,
+        } => patterns.len() == 1 && sub(expr) && sub(body),
+        // A bound call's body is rewritten as a whole, so it must not call
+        // anything itself: a nested call would be rewritten against this
+        // stage's position too, and a recursive one would never end.
+        Expr::DefCall { def, args, .. } => {
+            !crate::jq::walk::any_subexpr(&def.body, &mut |e| {
+                matches!(e, Expr::DefCall { .. } | Expr::FuncCall { .. })
+            }) && sub(&def.body)
+                && args.iter().all(sub)
+        }
+        Expr::Shared(inner) => sub(inner),
+        Expr::Alternative(left, right) => sub(left) && sub(right),
         _ => false,
     }
 }
@@ -13894,6 +14098,20 @@ fn path_context_absent_keeps_position(expr: &Expr) -> bool {
         Expr::Pipe(exprs) | Expr::Comma(exprs) => {
             exprs.iter().all(path_context_absent_keeps_position)
         }
+        // spine 2416 (identity pass): the wrappers whose output *is* one of
+        // their body's outputs keep the position exactly when the body does.
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            path_context_absent_keeps_position(then_branch)
+                && path_context_absent_keeps_position(else_branch)
+        }
+        Expr::Label { body, .. } | Expr::As { body, .. } | Expr::AsPattern { body, .. } => {
+            path_context_absent_keeps_position(body)
+        }
+        Expr::Optional(inner) => path_context_absent_keeps_position(inner),
         _ => false,
     }
 }
@@ -14078,6 +14296,7 @@ fn path_context_resolve_absent<S: EvalSemantics, V: DocumentValue>(
             key: pos.path.last(),
             path: &pos.path,
             parent_of: None,
+            prefetch: None,
         },
     )
 }
@@ -14097,7 +14316,19 @@ struct PathContextAt<'a> {
     key: Option<&'a OwnedValue>,
     path: &'a [OwnedValue],
     parent_of: Option<&'a dyn Fn(usize) -> Result<Option<OwnedValue>, EvalError>>,
+    /// spine 2416 (identity pass): what to do with a sub-expression whose
+    /// reads the rewrite cannot resolve -- a pipe that moves before it reads
+    /// (`.zzz | key`), or a construct with no rewriter arm. The owned
+    /// identity pipe supplies one that *evaluates* the sub-expression at
+    /// the stage's own position and hands back a literal of its outputs
+    /// ([`owned_identity_prefetch`]); the constant route supplies none and
+    /// its gate refuses such shapes up front.
+    prefetch: Option<&'a PrefetchFn<'a>>,
 }
+
+/// [`PathContextAt::prefetch`]'s hook: a sub-expression in, the literal of
+/// its outputs at the position out.
+type PrefetchFn<'a> = dyn Fn(&Expr) -> Result<Expr, EvalError> + 'a;
 
 /// [`path_context_resolve_absent`]'s worker, over the constants themselves:
 /// `key` is `None` where it emits nothing (the document root, #2421, or a
@@ -14141,9 +14372,11 @@ fn path_context_resolve_constants<S: EvalSemantics>(
         // than switched to an unexercised `file_index_for_path(path)` call --
         // `path` here is absolute, so that is the one-line change to make the
         // moment a route does arrive with a table (#2427).
-        Expr::Builtin(Builtin::FileIndex) => {
-            Expr::Literal(Literal::Int(ambient_file_index().unwrap_or(0)))
-        }
+        // Reached with a table installed since spine 2416's identity pass
+        // (`--eval-all '.[] | try error("x") catch file_index'` resolves
+        // the handler here), so the position's own file it is -- `path` is
+        // absolute, which is what `file_index_for_path` reads.
+        Expr::Builtin(Builtin::FileIndex) => Expr::Literal(Literal::Int(file_index_for_path(path))),
         // #2472: `parent`/`parent(n)` inside a stage the owned identity
         // pipe evaluates as a whole (`[path, parent]`, `select(parent !=
         // null)`). The node they answer with is not a constant -- no
@@ -14180,6 +14413,24 @@ fn path_context_resolve_constants<S: EvalSemantics>(
                 .map(|e| path_context_resolve_constants::<S>(e, at))
                 .collect::<Result<Vec<_>, _>>()?,
         ),
+        // A pipe that moves before it reads cannot be rewritten against
+        // this one position; the owned identity pipe evaluates it there
+        // instead (`prefetch`), and the constant route's gate never admits
+        // it.
+        Expr::Pipe(exprs)
+            if !path_context_stages_resolvable(exprs, ResolveAdmits::UPDATE_TARGET) =>
+        {
+            match at.prefetch {
+                Some(prefetch) => prefetch(expr)?,
+                None => {
+                    debug_assert!(
+                        false,
+                        "path_context_resolvable refuses a moved read without a prefetch"
+                    );
+                    expr.clone()
+                }
+            }
+        }
         Expr::Pipe(exprs) => Expr::Pipe(
             exprs
                 .iter()
@@ -14246,6 +14497,95 @@ fn path_context_resolve_constants<S: EvalSemantics>(
             path: path.clone(),
             value: boxed(value)?,
         },
+        // spine 2416 (identity pass): the rewriter's half of
+        // [`path_context_resolvable`]'s arms of the same names. A `|=` is
+        // deliberately absent -- its filter is positioned by
+        // `eval::update_path` from the prefix the caller installs, never
+        // rewritten here -- so it falls to the `other` arm below unchanged.
+        Expr::StringInterpolation(parts) => Expr::StringInterpolation(
+            parts
+                .iter()
+                .map(|part| {
+                    Ok(match part {
+                        StringPart::Literal(s) => StringPart::Literal(s.clone()),
+                        StringPart::Expr(inner) => StringPart::Expr(boxed(inner)?),
+                    })
+                })
+                .collect::<Result<Vec<_>, EvalError>>()?,
+        ),
+        Expr::CompoundAssign { op, path, value } => Expr::CompoundAssign {
+            op: *op,
+            path: path.clone(),
+            value: boxed(value)?,
+        },
+        Expr::AlternativeAssign { path, value } => Expr::AlternativeAssign {
+            path: path.clone(),
+            value: boxed(value)?,
+        },
+        Expr::Reduce {
+            input,
+            patterns,
+            init,
+            update,
+        } => Expr::Reduce {
+            input: boxed(input)?,
+            patterns: patterns.clone(),
+            init: boxed(init)?,
+            update: update.clone(),
+        },
+        Expr::Foreach {
+            input,
+            patterns,
+            init,
+            update,
+            extract,
+        } => Expr::Foreach {
+            input: boxed(input)?,
+            patterns: patterns.clone(),
+            init: boxed(init)?,
+            update: update.clone(),
+            extract: extract.clone(),
+        },
+        Expr::Label { name, body } => Expr::Label {
+            name: name.clone(),
+            body: boxed(body)?,
+        },
+        Expr::As { expr, var, body } => Expr::As {
+            expr: boxed(expr)?,
+            var: var.clone(),
+            body: boxed(body)?,
+        },
+        Expr::AsPattern {
+            expr,
+            patterns,
+            body,
+        } => Expr::AsPattern {
+            expr: boxed(expr)?,
+            patterns: patterns.clone(),
+            body: boxed(body)?,
+        },
+        Expr::DefCall {
+            def,
+            args,
+            frames,
+            bound: _,
+        } => Expr::DefCall {
+            def: Rc::new(FuncDefData {
+                name: def.name.clone(),
+                params: def.params.clone(),
+                body: path_context_resolve_constants::<S>(&def.body, at)?,
+            }),
+            args: args
+                .iter()
+                .map(|arg| path_context_resolve_constants::<S>(arg, at))
+                .collect::<Result<Vec<_>, EvalError>>()?,
+            frames: *frames,
+            bound: BoundBody::default(),
+        },
+        Expr::Shared(inner) => {
+            Expr::Shared(Rc::new(path_context_resolve_constants::<S>(inner, at)?))
+        }
+        Expr::Alternative(left, right) => Expr::Alternative(boxed(left)?, boxed(right)?),
         other => other.clone(),
     })
 }
@@ -14426,22 +14766,23 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
     // evaluation it already had. `to_owned_cursor` materializes the container
     // the same way the fallback below would, so a decode failure surfaces
     // from that fallback rather than being re-reported here.
-    if let Some((family, f)) = map_family_body(builtin) {
-        if needs_path_context(f) && path_context_absent_resolvable(f) {
-            if let Some(c) = cursor {
-                // STYLE-0012: neither raises nor suppresses -- a failure to
-                // materialize the container here hands the stage back to the
-                // ordinary evaluation below, which materializes the same
-                // container itself and reports (or suppresses, per its own
-                // `optional`) the identical failure. Answering it twice is
-                // what would change behaviour.
-                let container = to_owned_cursor(&c);
-                if let (Ok(container), Ok((path, _))) = (container, cursor_path_and_ancestors(&c)) {
-                    if let Some(result) = eval_map_family_positioned_result::<S, V>(
-                        family, f, &container, &path, optional,
-                    ) {
-                        return result;
-                    }
+    if let Some((family, f)) = map_family_positioned_builtin(builtin) {
+        if let Some(c) = cursor {
+            // STYLE-0012: neither raises nor suppresses -- a failure to
+            // materialize the container here hands the stage back to the
+            // ordinary evaluation below, which materializes the same
+            // container itself and reports (or suppresses, per its own
+            // `optional`) the identical failure. Answering it twice is
+            // what would change behaviour.
+            if let Ok(container) = to_owned_cursor(&c) {
+                if let Some(result) = eval_map_family_positioned_result::<S, V>(
+                    family,
+                    f,
+                    &container,
+                    &OwnedIdentity::kept(c),
+                    optional,
+                ) {
+                    return result;
                 }
             }
         }
@@ -16000,8 +16341,33 @@ fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
         | Expr::Format(FormatType::Json)
         | Expr::Assign { .. }
         | Expr::Update { .. } => Keeps,
+        // spine 2416 (identity pass). A compound assignment is a write like
+        // `=`/`|=` (`.a | .b += key | key` is `"a"` in yq v4.53.3). A fold's
+        // output is a succinctly extension in yq mode -- its lexer rejects
+        // `reduce`/`foreach` -- placed where the eager evaluator always
+        // placed it, at the stage's own input (`.a.b | reduce (key) as $k
+        // (""; . + $k) | path` is `["a","b"]` in both modes today), which is
+        // the closest rule (`tostring`, `to_entries`: a value computed from
+        // the node stands where the node stood).
+        Expr::CompoundAssign { .. }
+        | Expr::AlternativeAssign { .. }
+        | Expr::Reduce { .. }
+        | Expr::Foreach { .. } => Keeps,
         Expr::Object(_) | Expr::Literal(_) => Detaches,
+        // spine 2416 (identity pass): a string built by interpolation is a
+        // fresh scalar, like a literal. Captured from yq v4.53.3 on
+        // `a: {b: 1}`: `.a.b | "k=\(key)" | key` prints nothing,
+        // `.a.b | "k=\(key)" | path` is `[]`, `.a.b | "\(key)" | parent`
+        // prints nothing.
+        Expr::StringInterpolation(_) => Detaches,
         Expr::Arithmetic { .. } | Expr::Compare { .. } | Expr::Negate(_) => LeftOperand,
+        // spine 2416 (identity pass): `and`/`or` stand where their left
+        // operand stood, like a comparison. Captured from yq v4.53.3 on
+        // `a: {b: 1, e: 2}`: `.a.b | (parent and key) | key` is `"a"`,
+        // `.a.b | (. and 1) | key` is `"b"`, `.a.b | (1 and 2) | key` and
+        // `.a.b | (false or parent) | key` print nothing, `.a.b | (parent or
+        // false) | path` is `["a"]`.
+        Expr::And(..) | Expr::Or(..) => LeftOperand,
         Expr::Alternative(..) => Alternative,
         Expr::Builtin(builtin) => match builtin {
             Builtin::ToString
@@ -16117,6 +16483,7 @@ fn owned_identity_operand_supported(expr: &Expr) -> bool {
     match expr {
         Expr::Identity
         | Expr::Literal(_)
+        | Expr::TrackedVar(_)
         | Expr::Field(_)
         | Expr::Index { .. }
         | Expr::Slice { .. } => true,
@@ -16133,7 +16500,7 @@ fn owned_identity_operand_supported(expr: &Expr) -> bool {
 /// and only the *left* one needs a nameable position, which
 /// [`OwnedIdentityRule::LeftOperand`] answers or declines on its own.
 fn owned_identity_operand_resolvable(expr: &Expr) -> bool {
-    !needs_path_context(expr) || path_context_absent_resolvable(expr)
+    !needs_path_context(expr) || owned_identity_stage_resolvable(expr)
 }
 
 /// An `as` stage's bind source (#2563). It is evaluated against the stage's
@@ -16145,7 +16512,7 @@ fn owned_identity_operand_resolvable(expr: &Expr) -> bool {
 /// `Expr::TrackedVar` holding a materialized value, and nothing about a
 /// binding needs that node.
 fn owned_identity_bind_supported(expr: &Expr) -> bool {
-    owned_identity_component_supported(expr)
+    owned_identity_stage_resolvable(expr)
 }
 
 /// The stages an `as` stage's body contributes to the pipe it is spliced
@@ -16174,6 +16541,18 @@ fn owned_identity_body_stages(body: &Expr) -> &[Expr] {
 /// still read it -- `key` alone flags its output as a key node, which
 /// answers a second `key` with nothing.
 fn owned_identity_pipe_supported(stages: &[Expr]) -> bool {
+    owned_identity_pipe_supported_at(stages, 0)
+}
+
+/// How many levels of `def` binding the static gate unfolds before giving
+/// up on a call: a self-recursive definition (`def f: f; f`) would otherwise
+/// keep it unfolding forever, and a body that deep is the eager evaluator's
+/// exactly as it was before this gate existed.
+const OWNED_IDENTITY_DEF_UNFOLD_LIMIT: u8 = 8;
+
+/// [`owned_identity_pipe_supported`], `unfolded` levels of `def` binding in.
+fn owned_identity_pipe_supported_at(stages: &[Expr], unfolded: u8) -> bool {
+    let body = |e: &Expr| owned_identity_pipe_supported_at(owned_identity_body_stages(e), unfolded);
     for stage in stages {
         if owned_identity_nav_supported(stage) {
             continue;
@@ -16192,14 +16571,25 @@ fn owned_identity_pipe_supported(stages: &[Expr]) -> bool {
             // resolves. `OwnedIdentityRule::LeftOperand` then places the
             // output: a bare `key` operand leaves it detached, a bare
             // `path`/`file_index` one leaves it where the node stood.
-            Expr::Arithmetic { left, right, .. } | Expr::Compare { left, right, .. } => {
+            Expr::Arithmetic { left, right, .. }
+            | Expr::Compare { left, right, .. }
+            | Expr::And(left, right)
+            | Expr::Or(left, right) => {
                 if needs_path_context(stage) {
                     if !owned_identity_operand_resolvable(left)
                         || !owned_identity_operand_resolvable(right)
                     {
                         return false;
                     }
-                } else if !owned_identity_operand_supported(left) {
+                } else if !owned_identity_operand_supported(left)
+                    && !owned_identity_pipe_supported_at(owned_identity_body_stages(left), unfolded)
+                {
+                    return false;
+                }
+            }
+            // A nested pipe is its stages, spliced in place.
+            Expr::Pipe(inner) => {
+                if !owned_identity_pipe_supported_at(inner, unfolded) {
                     return false;
                 }
             }
@@ -16208,13 +16598,25 @@ fn owned_identity_pipe_supported(stages: &[Expr]) -> bool {
                     if !owned_identity_operand_resolvable(inner) {
                         return false;
                     }
-                } else if !owned_identity_operand_supported(inner) {
+                } else if !owned_identity_operand_supported(inner)
+                    && !owned_identity_pipe_supported_at(
+                        owned_identity_body_stages(inner),
+                        unfolded,
+                    )
+                {
                     return false;
                 }
             }
+            // spine 2416 (identity pass): a read inside either side of `//`
+            // is resolved at this position before the alternative is taken
+            // (the rewrite spells it as a literal, which
+            // `owned_identity_operand` places as one).
             Expr::Alternative(left, right) => {
-                if needs_path_context(stage)
-                    || !owned_identity_operand_supported(left)
+                if needs_path_context(stage) {
+                    if !owned_identity_stage_resolvable(stage) {
+                        return false;
+                    }
+                } else if !owned_identity_operand_supported(left)
                     || !owned_identity_operand_supported(right)
                 {
                     return false;
@@ -16228,15 +16630,137 @@ fn owned_identity_pipe_supported(stages: &[Expr]) -> bool {
             // gated exactly as a stage written here would be. The bind
             // source is evaluated at this same position, so its own
             // `key`/`path`/`file_index` reads resolve to constants like a
-            // computed navigation component's do. `Expr::AsPattern`
-            // (destructuring, `?//`) is deliberately absent: its
-            // alternative-fallthrough rule lives in
-            // `each_pattern_alternatives_generic` and has no second
-            // definition here, so it keeps its pipe on the eager evaluator.
-            Expr::As { expr, body, .. } => {
-                if !owned_identity_bind_supported(expr)
-                    || !owned_identity_pipe_supported(owned_identity_body_stages(body))
+            // computed navigation component's do.
+            Expr::As { expr, body: b, .. } => {
+                if !owned_identity_bind_supported(expr) || !body(b) {
+                    return false;
+                }
+            }
+            // spine 2416 (identity pass): the transparent constructs. Each
+            // one's output *is* an output of a body evaluated at this same
+            // position, so the body is run through this pipe as stages
+            // (`eval_owned_identity_stages`) and every rule keeps its one
+            // definition. `if`'s condition and `limit`'s count are values
+            // read at this position; a `?//` chain has its fallthrough rule
+            // in `each_pattern_alternatives_generic` and no second one here.
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                if !owned_identity_stage_resolvable(cond)
+                    || !body(then_branch)
+                    || !body(else_branch)
                 {
+                    return false;
+                }
+            }
+            Expr::Comma(branches) => {
+                if !branches.iter().all(body) {
+                    return false;
+                }
+            }
+            Expr::Try { expr, catch } => {
+                if !body(expr) || !catch.as_deref().map_or(true, body) {
+                    return false;
+                }
+            }
+            Expr::Optional(inner) | Expr::FirstExpr(inner) | Expr::LastExpr(inner) => {
+                if !body(inner) {
+                    return false;
+                }
+            }
+            Expr::Label { body: b, .. } => {
+                if !body(b) {
+                    return false;
+                }
+            }
+            Expr::Limit { n, expr } => {
+                if !owned_identity_stage_resolvable(n) || !body(expr) {
+                    return false;
+                }
+            }
+            Expr::AsPattern {
+                expr,
+                patterns,
+                body: b,
+            } => {
+                if patterns.len() != 1 || !owned_identity_bind_supported(expr) || !body(b) {
+                    return false;
+                }
+            }
+            // A definition is bound exactly as evaluation binds it
+            // (`bind_def`/`bind_def_call` cache the result on the node), and
+            // the bound stages are gated like any other -- up to
+            // `OWNED_IDENTITY_DEF_UNFOLD_LIMIT` levels of call, past which a
+            // recursion stays on the eager evaluator.
+            Expr::FuncDef {
+                name,
+                params,
+                body: def_body,
+                then,
+                bound,
+            } => {
+                if unfolded >= OWNED_IDENTITY_DEF_UNFOLD_LIMIT {
+                    return false;
+                }
+                let installed = bind_def(name, &param_names(params), def_body, then, bound);
+                if !owned_identity_pipe_supported_at(
+                    owned_identity_body_stages(&installed),
+                    unfolded + 1,
+                ) {
+                    return false;
+                }
+            }
+            Expr::DefCall {
+                def,
+                args,
+                frames,
+                bound,
+            } => {
+                if unfolded >= OWNED_IDENTITY_DEF_UNFOLD_LIMIT {
+                    return false;
+                }
+                match bind_def_call(def, args, *frames, bound) {
+                    Ok(bound_body) => {
+                        if !owned_identity_pipe_supported_at(
+                            owned_identity_body_stages(bound_body),
+                            unfolded + 1,
+                        ) {
+                            return false;
+                        }
+                    }
+                    Err(_) => return false,
+                }
+            }
+            Expr::Shared(inner) => {
+                if !body(inner) {
+                    return false;
+                }
+            }
+            // A stage that produces nothing -- `empty`, `error`, `halt`,
+            // `break` -- places nothing, so it has no rule to need.
+            Expr::Break(_)
+            | Expr::Error(_)
+            | Expr::Builtin(
+                Builtin::Empty | Builtin::Halt | Builtin::HaltError | Builtin::HaltErrorCode(_),
+            ) => {}
+            // spine 2416 (identity pass): a write. `=` and the compound
+            // operators evaluate their right side at this position (a read
+            // inside it resolves, or is prefetched through this pipe); `|=`'s
+            // filter stands at the target and is positioned by
+            // `eval::update_path` from the prefix the ruled arm installs.
+            Expr::Assign { path, value }
+            | Expr::CompoundAssign { path, value, .. }
+            | Expr::AlternativeAssign { path, value } => {
+                if needs_path_context(path)
+                    || (needs_path_context(value) && !owned_identity_stage_resolvable(value))
+                {
+                    return false;
+                }
+            }
+            Expr::Update { path, .. } => {
+                if needs_path_context(path) {
                     return false;
                 }
             }
@@ -16275,11 +16799,26 @@ fn owned_identity_pipe_applies(exprs: &[Expr]) -> bool {
         }
         let rest = &exprs[i + 1..];
         return rest.iter().any(needs_path_context)
-            && (!needs_path_context(stage) || owned_identity_emits_position(stage))
-            && owned_identity_rule(stage).is_some()
+            && owned_identity_leaving_stage_supported(stage)
             && owned_identity_pipe_supported(rest);
     }
     false
+}
+
+/// Whether `stage` can be the one a pipe leaves the cursor domain at: it
+/// has a rule that places its output, and it can be evaluated from the
+/// cursor exactly -- either it reads no path context, is a bare read
+/// (#2471), or (spine 2416, identity pass) is a stage the generic evaluator
+/// answers natively at the cursor's position *and* the owned identity pipe
+/// would accept as its own (`[key]`, `"\\(key)"`, `.b = key`).
+/// [`owned_identity_pipe_applies`] and `eval_each_pipe_generic`'s own
+/// `identity_from_first` share it so the gate and the driver agree.
+fn owned_identity_leaving_stage_supported(stage: &Expr) -> bool {
+    owned_identity_rule(stage).is_some()
+        && (!needs_path_context(stage)
+            || owned_identity_emits_position(stage)
+            || (path_context_stage_native(stage)
+                && owned_identity_pipe_supported(core::slice::from_ref(stage))))
 }
 
 /// Whether a stage *is* a bare path-context read (#2471). Such a stage reads
@@ -16454,6 +16993,7 @@ fn owned_identity_resolve_component<S: EvalSemantics, V: DocumentValue>(
             // ([`owned_identity_component_supported`]), so no `parent` can
             // appear in one.
             parent_of: None,
+            prefetch: None,
         },
     )
 }
@@ -16795,6 +17335,39 @@ fn owned_identity_operand<S: EvalSemantics, V: DocumentValue>(
     if let Expr::Literal(lit) = expr {
         return Ok(Some((literal_to_owned(lit), OwnedIdentity::detached())));
     }
+    // A value the rewrite spelled in place (spine 2416, identity pass): a
+    // literal like any other, with no position of its own.
+    if let Expr::TrackedVar(v) = expr {
+        return Ok(Some(((**v).clone(), OwnedIdentity::detached())));
+    }
+    // spine 2416 (identity pass): an operand outside the navigation grammar
+    // -- `parent`, `(parent | length)`, `(key | tostring)` -- is run through
+    // this pipe as stages, and its first output's identity is the answer.
+    // The stage itself already evaluated the operand for its *value*, so an
+    // impure operand runs twice here; the grammar above never had one.
+    if !owned_identity_operand_supported(expr) {
+        let mut first: Option<(OwnedValue, OwnedIdentity<V>)> = None;
+        let flow = eval_owned_identity_stages::<S, V>(
+            owned_identity_body_stages(expr),
+            value.clone(),
+            id.clone(),
+            optional,
+            OwnedIdentityTail::Pairs(&mut |v, vid| {
+                first = Some((v, vid));
+                Flow::Stopped { pending: None }
+            }),
+        );
+        return match flow {
+            Flow::Escaped(Control::Error(e)) => Err(e),
+            Flow::Escaped(Control::Break(label)) => {
+                Err(EvalError::new(format!("break ${label} not in label")))
+            }
+            Flow::Escaped(Control::Halt(code)) => Err(EvalError::new(format!(
+                "internal error: unexpected halt({code}) evaluating an owned-identity operand"
+            ))),
+            Flow::Exhausted | Flow::Stopped { .. } => Ok(first),
+        };
+    }
     let mut out = Vec::new();
     match owned_identity_step::<S, V>(expr, value, id, optional, &mut out) {
         Ok(()) => {}
@@ -16869,10 +17442,15 @@ fn owned_identity_placed_by<S: EvalSemantics, V: DocumentValue>(
             }
         }
         OwnedIdentityRule::LeftOperand => {
-            let (Expr::Arithmetic { left, .. } | Expr::Compare { left, .. } | Expr::Negate(left)) =
-                strip_parens(stage)
+            let (Expr::Arithmetic { left, .. }
+            | Expr::Compare { left, .. }
+            | Expr::Negate(left)
+            | Expr::And(left, _)
+            | Expr::Or(left, _)) = strip_parens(stage)
             else {
-                unreachable!("LeftOperand is assigned to arithmetic, comparison and negation only")
+                unreachable!(
+                    "LeftOperand is assigned to arithmetic, comparison, negation, and/or only"
+                )
             };
             let left = strip_parens(left);
             // #2471 sub-item 5: a *bare* path-context read as the left
@@ -16893,16 +17471,34 @@ fn owned_identity_placed_by<S: EvalSemantics, V: DocumentValue>(
             // `.a.c | tostring | (key + "x") | path` => `["a","cx"]`, a path
             // naming a node that does not exist -- an artifact of yq
             // mutating the key node in place. succinctly answers `[]`.)
+            //
+            // A comparison or `and`/`or` over a *document* key node stands
+            // where the node stood (spine 2416, identity pass): `.a.b |
+            // (key == "b") | key` is `"b"` and `.a.b | (key and 1) | path`
+            // is `["a","b"]` in yq v4.53.3, where the same stages over an
+            // entry's synthesized key node (`to_entries | .[0] | (key and
+            // 1) | key`) print nothing, as arithmetic over either does.
             if owned_identity_emits_position(left) {
                 return Ok(if matches!(left, Expr::Builtin(Builtin::Key)) {
-                    None
+                    let synthesized = id.base.is_none() || !id.ancestors.is_empty();
+                    let arithmetic = matches!(
+                        strip_parens(stage),
+                        Expr::Arithmetic { .. } | Expr::Negate(_)
+                    );
+                    if synthesized || arithmetic {
+                        None
+                    } else {
+                        Some(id.clone())
+                    }
                 } else {
                     Some(id.clone())
                 });
             }
             // A resolved read the rule cannot name (`[key] + 1`, `empty` at
             // the document root) has no position either.
-            if !owned_identity_operand_supported(left) {
+            if !owned_identity_operand_supported(left)
+                && !owned_identity_pipe_supported(owned_identity_body_stages(left))
+            {
                 return Ok(None);
             }
             owned_identity_operand::<S, V>(left, value, id, optional)?.map(|(_, oid)| oid)
@@ -16978,24 +17574,31 @@ fn eval_owned_identity_as<S: EvalSemantics, V: DocumentValue>(
     value: &OwnedValue,
     id: &OwnedIdentity<V>,
     optional: bool,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    mut tail: OwnedIdentityTail<'_, V>,
 ) -> Flow {
     // The source stands where this stage stands, so its reads are constants
     // -- the same rewrite a computed navigation component gets, and the same
     // predicate gated it (`owned_identity_bind_supported`).
-    let resolved = match owned_identity_resolve_component::<S, V>(bind, id) {
+    let escaped = core::cell::RefCell::new(None);
+    let resolved = match owned_identity_resolve_at::<S, V>(bind, value, id, optional, &escaped) {
         Ok(e) => e,
         Err(e) => return Flow::Escaped(Control::Error(e)),
     };
     let (bound_values, control) = owned_identity_values::<S>(&resolved, value, optional);
+    let control = control.or_else(|| escaped.into_inner());
     for bound in bound_values {
         // `bind`, not `resolved`: `is_identity_passthrough` is a question
         // about what the user wrote, and the rewrite only replaces reads
         // inside it.
         let substituted = substitute_bound_var(bind, body, var, &bound);
-        let mut stages: Vec<Expr> = owned_identity_body_stages(&substituted).to_vec();
-        stages.extend_from_slice(rest);
-        match eval_owned_identity_pipe::<S, V>(&stages, value.clone(), id.clone(), optional, sink) {
+        match eval_owned_identity_spliced::<S, V>(
+            &substituted,
+            rest,
+            value.clone(),
+            id.clone(),
+            optional,
+            tail.reborrow(),
+        ) {
             Flow::Exhausted => {}
             other => return other,
         }
@@ -17013,10 +17616,10 @@ fn continue_owned_identity_items<S: EvalSemantics, V: DocumentValue>(
     rest: &[Expr],
     items: impl IntoIterator<Item = (OwnedValue, OwnedIdentity<V>)>,
     optional: bool,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    mut tail: OwnedIdentityTail<'_, V>,
 ) -> Flow {
     for (v, vid) in items {
-        match eval_owned_identity_pipe::<S, V>(rest, v, vid, optional, sink) {
+        match eval_owned_identity_stages::<S, V>(rest, v, vid, optional, tail.reborrow()) {
             Flow::Exhausted => {}
             other => return other,
         }
@@ -17034,15 +17637,35 @@ fn continue_owned_identity_ancestor<S: EvalSemantics, V: DocumentValue>(
     id: &OwnedIdentity<V>,
     n: usize,
     optional: bool,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    tail: OwnedIdentityTail<'_, V>,
 ) -> Flow {
     match owned_identity_ancestor(value, id, n) {
         OwnedAncestor::Owned(v, vid) => {
-            eval_owned_identity_pipe::<S, V>(rest, v, vid, optional, sink)
+            eval_owned_identity_stages::<S, V>(rest, v, vid, optional, tail)
         }
-        OwnedAncestor::Node(c) => {
-            eval_each_pipe_generic::<S, V>(rest, c.value(), optional, Some(c), sink)
-        }
+        OwnedAncestor::Node(c) => match tail {
+            OwnedIdentityTail::Sink(sink) => {
+                eval_each_pipe_generic::<S, V>(rest, c.value(), optional, Some(c), sink)
+            }
+            // An enclosing stage still needs the identity of every output
+            // (spine 2416, identity pass): the node is materialized once and
+            // the rest of the pipe continues here, from its position.
+            // STYLE-0012: a decode failure of the ancestor `parent` climbed
+            // to raises regardless of `optional`, exactly as the same
+            // materialization does in `path_context_resolve_parent` -- the
+            // climb has to answer with *some* node, and suppressing here
+            // would silently end the pipe at a position that exists.
+            pairs @ OwnedIdentityTail::Pairs(_) => match to_owned_cursor(&c) {
+                Ok(v) => eval_owned_identity_stages::<S, V>(
+                    rest,
+                    v,
+                    OwnedIdentity::kept(c),
+                    optional,
+                    pairs,
+                ),
+                Err(e) => Flow::Escaped(Control::Error(e)),
+            },
+        },
         OwnedAncestor::None => Flow::Exhausted,
     }
 }
@@ -17122,8 +17745,18 @@ fn map_family_positioned(stage: &Expr) -> Option<(MapFamily, &Expr)> {
     let Expr::Builtin(builtin) = strip_parens(stage) else {
         return None;
     };
+    map_family_positioned_builtin(builtin)
+}
+
+/// [`map_family_positioned`] for the builtin itself, which is what
+/// `eval_builtin` holds: the body reads path context and every stage of it
+/// is one the owned identity pipe runs, so it can be run at each member's
+/// position (spine 2416, identity pass -- until then the body was rewritten
+/// to constants, which refused `parent` and any read after a navigation).
+fn map_family_positioned_builtin(builtin: &Builtin) -> Option<(MapFamily, &Expr)> {
     let (family, f) = map_family_body(builtin)?;
-    (needs_path_context(f) && path_context_absent_resolvable(f)).then_some((family, f))
+    (needs_path_context(f) && owned_identity_pipe_supported(owned_identity_body_stages(f)))
+        .then_some((family, f))
 }
 
 /// One `{"key": k, "value": v}` entry, as `to_entries` builds it.
@@ -17186,44 +17819,41 @@ fn map_family_members(
 ///
 /// `None` means the input is not a container (see [`map_family_members`]) and
 /// the caller should evaluate the stage the ordinary way.
-fn eval_map_family_positioned<S: EvalSemantics>(
+fn eval_map_family_positioned<S: EvalSemantics, V: DocumentValue>(
     family: MapFamily,
     f: &Expr,
     container: &OwnedValue,
-    container_path: &[OwnedValue],
+    id: &OwnedIdentity<V>,
     optional: bool,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Option<Flow> {
     let members = map_family_members(family, container)?;
-    // `map`/`with_entries` are array construction and `map_values` is object
-    // construction: all three are atomic in jq, so a control escaping any
-    // member's body discards the whole partly-built result rather than
-    // surfacing a prefix -- the same rule `eval::map_over`,
-    // `eval::builtin_map_values` and `eval::builtin_with_entries` each state.
+    // `with_entries`'s member is an entry of the array `to_entries` built,
+    // which stands where the container stood (`to_entries` keeps); the
+    // other two families run over the container's own members.
+    let parent: Rc<OwnedValue> = match family {
+        MapFamily::WithEntries => Rc::new(OwnedValue::Array(
+            members.iter().map(|(_, member)| member.clone()).collect(),
+        )),
+        MapFamily::Map | MapFamily::MapValues => Rc::new(container.clone()),
+    };
+    let stages = owned_identity_body_stages(f);
     let mut array: Vec<OwnedValue> = Vec::new();
     let mut object = IndexMap::with_capacity(members.len());
     for (component, member) in members {
-        let mut path = vec_with_capacity(container_path.len() + 1);
-        path.extend_from_slice(container_path);
-        path.push(component.clone());
-        let resolved = match path_context_resolve_constants::<S>(
-            f,
-            &PathContextAt {
-                key: Some(&component),
-                path: &path,
-                parent_of: None,
-            },
-        ) {
-            Ok(expr) => expr,
-            Err(e) => return Some(Flow::Escaped(Control::Error(e))),
-        };
+        let member_id = id.child(&parent, component.clone());
         let mut outputs: Vec<OwnedValue> = Vec::new();
-        if let Flow::Escaped(control) =
-            eval_each_owned::<S>(&resolved, &member, optional, &mut |v| {
+        let flow = eval_owned_identity_stages::<S, V>(
+            stages,
+            member,
+            member_id,
+            optional,
+            OwnedIdentityTail::Pairs(&mut |v, _| {
                 outputs.push(v);
-                Demand::Continue
-            })
-        {
+                Flow::Exhausted
+            }),
+        );
+        if let Flow::Escaped(control) = flow {
             return Some(Flow::Escaped(control));
         }
         match family {
@@ -17233,9 +17863,6 @@ fn eval_map_family_positioned<S: EvalSemantics>(
                     continue;
                 };
                 match &component {
-                    // An array input keeps its shape: the components are
-                    // indices, and a dropped member closes the gap, exactly
-                    // as `eval::builtin_map_values`' own array arm does.
                     OwnedValue::Int(_) => array.push(value),
                     _ => {
                         object.insert(owned_to_string::<S>(&component), value);
@@ -17250,9 +17877,6 @@ fn eval_map_family_positioned<S: EvalSemantics>(
             OwnedValue::Array(_) => OwnedValue::Array(array),
             _ => OwnedValue::Object(object),
         },
-        // `from_entries`, the one definition `eval::builtin_with_entries`
-        // also ends in -- including its refusal of a key that is not a
-        // string, and `?`'s suppression of that refusal.
         MapFamily::WithEntries => match entries_to_object::<S, _>(array) {
             Ok(fields) => OwnedValue::Object(fields),
             Err(_) if optional => return Some(Flow::Exhausted),
@@ -17272,21 +17896,14 @@ fn eval_map_family_positioned_result<S: EvalSemantics, V: DocumentValue>(
     family: MapFamily,
     f: &Expr,
     container: &OwnedValue,
-    container_path: &[OwnedValue],
+    id: &OwnedIdentity<V>,
     optional: bool,
 ) -> Option<GenericResult<V>> {
     let mut collected: Vec<OwnedValue> = Vec::new();
-    let flow = eval_map_family_positioned::<S>(
-        family,
-        f,
-        container,
-        container_path,
-        optional,
-        &mut |v| {
-            collected.push(v);
-            Demand::Continue
-        },
-    )?;
+    let flow = eval_map_family_positioned::<S, V>(family, f, container, id, optional, &mut |v| {
+        collected.push(v);
+        Demand::Continue
+    })?;
     Some(match flow {
         Flow::Exhausted | Flow::Stopped { .. } => owned_vec_to_generic_result(collected),
         Flow::Escaped(control) => partial_generic(collected, control),
@@ -17310,19 +17927,341 @@ fn eval_owned_identity_pipe<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Flow {
+    eval_owned_identity_stages::<S, V>(stages, value, id, optional, OwnedIdentityTail::Sink(sink))
+}
+
+/// Where an owned identity pipe's outputs go once its stages are exhausted
+/// (spine 2416, identity pass).
+enum OwnedIdentityTail<'a, V: DocumentValue> {
+    /// The pipe's outputs are values: the identity has done its work.
+    Sink(&'a mut dyn FnMut(GenericItem<V>) -> Demand),
+    /// An enclosing stage continues from each `(value, identity)` pair --
+    /// a bounded consumer counting its body's outputs, a `try` that has to
+    /// tell its body's errors from the rest of the pipe's, a map-family
+    /// stage collecting a member's outputs.
+    Pairs(&'a mut dyn FnMut(OwnedValue, OwnedIdentity<V>) -> Flow),
+}
+
+impl<V: DocumentValue> OwnedIdentityTail<'_, V> {
+    fn reborrow(&mut self) -> OwnedIdentityTail<'_, V> {
+        match self {
+            OwnedIdentityTail::Sink(sink) => OwnedIdentityTail::Sink(&mut **sink),
+            OwnedIdentityTail::Pairs(pairs) => OwnedIdentityTail::Pairs(&mut **pairs),
+        }
+    }
+
+    fn emit(&mut self, value: OwnedValue, id: OwnedIdentity<V>) -> Flow {
+        match self {
+            OwnedIdentityTail::Sink(sink) => {
+                push_one_generic(GenericItem::Owned(value), &mut **sink)
+            }
+            OwnedIdentityTail::Pairs(pairs) => pairs(value, id),
+        }
+    }
+}
+
+/// `body`'s stages spliced in front of `rest`, run from `(value, id)`: the
+/// shape every transparent construct reduces to (an `as` body, an `if`
+/// branch, a comma branch, a bound call's body), so every stage rule keeps
+/// one definition.
+fn eval_owned_identity_spliced<S: EvalSemantics, V: DocumentValue>(
+    body: &Expr,
+    rest: &[Expr],
+    value: OwnedValue,
+    id: OwnedIdentity<V>,
+    optional: bool,
+    tail: OwnedIdentityTail<'_, V>,
+) -> Flow {
+    let mut stages: Vec<Expr> = owned_identity_body_stages(body).to_vec();
+    stages.extend_from_slice(rest);
+    eval_owned_identity_stages::<S, V>(&stages, value, id, optional, tail)
+}
+
+/// `body`'s stages run from `(value, id)`, with `rest` continued from each
+/// output -- and the body's own escape kept apart from one raised in `rest`:
+/// `Ok(flow)` is the body's, `Err(control)` is `rest`'s. What `try`,
+/// `label` and the bounded consumers need, since each of them scopes only
+/// the body.
+fn eval_owned_identity_scoped<S: EvalSemantics, V: DocumentValue>(
+    body: &Expr,
+    rest: &[Expr],
+    value: OwnedValue,
+    id: OwnedIdentity<V>,
+    optional: bool,
+    tail: &mut OwnedIdentityTail<'_, V>,
+) -> Result<Flow, Control> {
+    let mut rest_escape: Option<Control> = None;
+    let flow = eval_owned_identity_stages::<S, V>(
+        owned_identity_body_stages(body),
+        value,
+        id,
+        optional,
+        OwnedIdentityTail::Pairs(&mut |v, vid| match eval_owned_identity_stages::<S, V>(
+            rest,
+            v,
+            vid,
+            optional,
+            tail.reborrow(),
+        ) {
+            Flow::Escaped(control) => {
+                rest_escape = Some(control);
+                Flow::Stopped { pending: None }
+            }
+            other => other,
+        }),
+    );
+    match rest_escape {
+        Some(control) => Err(control),
+        None => Ok(flow),
+    }
+}
+
+/// `try body catch handler` / `body?` over an owned value with identity:
+/// the body's outputs continue into `rest`; a catchable error in the body
+/// (not in `rest`) runs the handler over the error's payload -- at this
+/// stage's own position, the closest rule for a value real yq cannot
+/// express (its lexer rejects `try`) and what the eager evaluator answered
+/// (`.a.b | (try error("x") catch .) | key` is `"b"` in both modes) -- and a
+/// `break` runs it over `null`, exactly as `each_try_generic` does.
+fn eval_owned_identity_try<S: EvalSemantics, V: DocumentValue>(
+    body: &Expr,
+    catch: Option<&Expr>,
+    rest: &[Expr],
+    value: OwnedValue,
+    id: OwnedIdentity<V>,
+    optional: bool,
+    mut tail: OwnedIdentityTail<'_, V>,
+) -> Flow {
+    let flow = match eval_owned_identity_scoped::<S, V>(
+        body,
+        rest,
+        value,
+        id.clone(),
+        optional,
+        &mut tail,
+    ) {
+        Ok(flow) => flow,
+        Err(control) => return Flow::Escaped(control),
+    };
+    let payload = match flow {
+        Flow::Escaped(Control::Error(e)) if e.is_uncatchable_at_value_position() => {
+            return Flow::Escaped(Control::Error(e))
+        }
+        Flow::Escaped(Control::Error(e)) => e.payload(),
+        Flow::Escaped(Control::Break(_)) => OwnedValue::Null,
+        other => return other,
+    };
+    let Some(handler) = catch else {
+        return Flow::Exhausted;
+    };
+    // #1409: the handler's outputs stay at the ambient position, whatever
+    // the handler navigated inside the payload -- the payload is not a node
+    // of the document, so a path descended into it would name nothing
+    // (`.a | (try error({"b":9}) catch .b) | path` is `["a"]`). Its reads
+    // still resolve at that position, which is where the handler runs from.
+    let mut rest_escape: Option<Control> = None;
+    let flow = eval_owned_identity_stages::<S, V>(
+        owned_identity_body_stages(handler),
+        payload,
+        id.clone(),
+        optional,
+        OwnedIdentityTail::Pairs(&mut |v, _| match eval_owned_identity_stages::<S, V>(
+            rest,
+            v,
+            id.clone(),
+            optional,
+            tail.reborrow(),
+        ) {
+            Flow::Escaped(control) => {
+                rest_escape = Some(control);
+                Flow::Stopped { pending: None }
+            }
+            other => other,
+        }),
+    );
+    match rest_escape {
+        Some(control) => Flow::Escaped(control),
+        None => flow,
+    }
+}
+
+/// `limit(n; body)` / `first(body)` over an owned value with identity: at
+/// most `take` outputs of the body (all of them for `None`), each continued
+/// into `rest` before the next is pulled -- the same order
+/// `each_limit_with_n_generic` delivers.
+fn eval_owned_identity_bounded<S: EvalSemantics, V: DocumentValue>(
+    body: &Expr,
+    take: Option<usize>,
+    rest: &[Expr],
+    value: OwnedValue,
+    id: OwnedIdentity<V>,
+    optional: bool,
+    tail: &mut OwnedIdentityTail<'_, V>,
+) -> Flow {
+    if take == Some(0) {
+        return Flow::Exhausted;
+    }
+    let mut count = 0usize;
+    let mut rest_escape: Option<Control> = None;
+    let mut rest_stopped: Option<Flow> = None;
+    let flow = eval_owned_identity_stages::<S, V>(
+        owned_identity_body_stages(body),
+        value,
+        id,
+        optional,
+        OwnedIdentityTail::Pairs(&mut |v, vid| {
+            count += 1;
+            match eval_owned_identity_stages::<S, V>(rest, v, vid, optional, tail.reborrow()) {
+                Flow::Exhausted => {
+                    if take.is_some_and(|n| count >= n) {
+                        Flow::Stopped { pending: None }
+                    } else {
+                        Flow::Exhausted
+                    }
+                }
+                Flow::Escaped(control) => {
+                    rest_escape = Some(control);
+                    Flow::Stopped { pending: None }
+                }
+                stopped => {
+                    rest_stopped = Some(stopped);
+                    Flow::Stopped { pending: None }
+                }
+            }
+        }),
+    );
+    if let Some(control) = rest_escape {
+        return Flow::Escaped(control);
+    }
+    if let Some(stopped) = rest_stopped {
+        return stopped;
+    }
+    match flow {
+        Flow::Stopped { .. } | Flow::Exhausted => Flow::Exhausted,
+        Flow::Escaped(control) => Flow::Escaped(control),
+    }
+}
+
+/// `stage`'s path-context reads rewritten to what this position answers:
+/// `key`/`path`/`file_index` as constants, `parent`/`parent(n)` as the
+/// ancestor the identity holds, and a sub-expression the rewrite cannot
+/// resolve -- a pipe that moves before it reads -- as the literal of its
+/// outputs, evaluated here through this same pipe
+/// ([`owned_identity_prefetch`]). An escape such an evaluation raised is
+/// left in `escaped` for the caller to report once the stage has delivered
+/// what the prefix produced.
+fn owned_identity_resolve_at<S: EvalSemantics, V: DocumentValue>(
+    stage: &Expr,
+    value: &OwnedValue,
+    id: &OwnedIdentity<V>,
+    optional: bool,
+    escaped: &core::cell::RefCell<Option<Control>>,
+) -> Result<Expr, EvalError> {
+    if !needs_path_context(stage) {
+        return Ok(stage.clone());
+    }
+    let key = id.key()?;
+    let path = id.path()?;
+    let parent_of = |n: usize| -> Result<Option<OwnedValue>, EvalError> {
+        Ok(match owned_identity_ancestor(value, id, n) {
+            OwnedAncestor::Owned(v, _) => Some(v),
+            // STYLE-0012: a decode failure while materializing the ancestor
+            // `parent` answers with raises whatever `optional` says, exactly
+            // as it did when this same call lived in
+            // `path_context_resolve_parent` (which has no `optional` to
+            // consult). The rewrite has to produce *some* literal for the
+            // `parent` it is replacing; suppressing here would leave the
+            // read unresolved and answer `null`, the silent fallback
+            // ADR-0021 exists to end.
+            OwnedAncestor::Node(c) => Some(to_owned_cursor(&c)?),
+            OwnedAncestor::None => None,
+        })
+    };
+    let prefetch = |sub: &Expr| -> Result<Expr, EvalError> {
+        owned_identity_prefetch::<S, V>(sub, value, id, optional, escaped)
+    };
+    path_context_resolve_constants::<S>(
+        stage,
+        &PathContextAt {
+            key: key.as_ref(),
+            path: &path,
+            parent_of: Some(&parent_of),
+            prefetch: Some(&prefetch),
+        },
+    )
+}
+
+/// `sub` evaluated at `(value, id)` through this pipe, as a literal of its
+/// outputs (`empty` for none, a comma of them for several) -- the
+/// [`PathContextAt::prefetch`] hook. Nothing runs after an earlier prefetch
+/// escaped: the stage stops where the escape stops it.
+fn owned_identity_prefetch<S: EvalSemantics, V: DocumentValue>(
+    sub: &Expr,
+    value: &OwnedValue,
+    id: &OwnedIdentity<V>,
+    optional: bool,
+    escaped: &core::cell::RefCell<Option<Control>>,
+) -> Result<Expr, EvalError> {
+    if escaped.borrow().is_some() {
+        return Ok(Expr::Builtin(Builtin::Empty));
+    }
+    let mut values: Vec<Expr> = Vec::new();
+    let flow = eval_owned_identity_stages::<S, V>(
+        owned_identity_body_stages(sub),
+        value.clone(),
+        id.clone(),
+        optional,
+        OwnedIdentityTail::Pairs(&mut |v, _| {
+            values.push(Expr::TrackedVar(Rc::new(v)));
+            Flow::Exhausted
+        }),
+    );
+    if let Flow::Escaped(control) = flow {
+        *escaped.borrow_mut() = Some(control);
+    }
+    Ok(match values.len() {
+        0 => Expr::Builtin(Builtin::Empty),
+        1 => values.pop().expect("len checked"),
+        _ => Expr::Comma(values),
+    })
+}
+
+/// A stage's own flow, with an escape one of its prefetches left behind
+/// reported after everything the stage delivered -- the "deliver the
+/// prefix, then the escape" rule this route follows (#2495).
+fn owned_identity_after_prefetch(
+    flow: Flow,
+    escaped: core::cell::RefCell<Option<Control>>,
+) -> Flow {
+    match (flow, escaped.into_inner()) {
+        (Flow::Exhausted, Some(control)) => Flow::Escaped(control),
+        (flow, _) => flow,
+    }
+}
+
+/// The stages of an owned identity pipe, run from `(value, id)` and ending
+/// in `tail` (spine 2416 step 3; the transparent constructs and the tail
+/// since the identity pass).
+fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
+    stages: &[Expr],
+    value: OwnedValue,
+    id: OwnedIdentity<V>,
+    optional: bool,
+    mut tail: OwnedIdentityTail<'_, V>,
+) -> Flow {
     let Some((stage, rest)) = stages.split_first() else {
-        return push_one_generic(GenericItem::Owned(value), sink);
+        return tail.emit(value, id);
     };
     if owned_identity_nav_supported(stage) {
         let mut out = Vec::new();
         let step_result = owned_identity_step::<S, V>(stage, &value, &id, optional, &mut out);
         // #2495: `out` holds every pair this stage already produced,
         // regardless of whether it went on to succeed or escape -- deliver
-        // that prefix through `rest`/`sink` first (the same "everything
+        // that prefix through `rest`/`tail` first (the same "everything
         // before it was already delivered" contract `Flow::Escaped` states
         // elsewhere in this file), and only then report the stage's own
         // escape, if it had one.
-        match continue_owned_identity_items::<S, V>(rest, out, optional, sink) {
+        match continue_owned_identity_items::<S, V>(rest, out, optional, tail.reborrow()) {
             Flow::Exhausted => {}
             other => return other,
         }
@@ -17336,31 +18275,42 @@ fn eval_owned_identity_pipe<S: EvalSemantics, V: DocumentValue>(
         // second `key` emits nothing -- `id.key()` answers `None` for a key
         // node, which is exactly yq's own `.a.b | key | key`.
         Expr::Builtin(Builtin::Key) => match id.key() {
-            Ok(Some(key)) => {
-                eval_owned_identity_pipe::<S, V>(rest, key, id.with_key_node(true), optional, sink)
-            }
+            Ok(Some(key)) => eval_owned_identity_stages::<S, V>(
+                rest,
+                key,
+                id.with_key_node(true),
+                optional,
+                tail,
+            ),
             Ok(None) => Flow::Exhausted,
             Err(e) => Flow::Escaped(Control::Error(e)),
         },
         Expr::Builtin(Builtin::PathNoArg) => match id.path() {
-            Ok(path) => {
-                eval_owned_identity_pipe::<S, V>(rest, OwnedValue::Array(path), id, optional, sink)
-            }
+            Ok(path) => eval_owned_identity_stages::<S, V>(
+                rest,
+                OwnedValue::Array(path),
+                id,
+                optional,
+                tail,
+            ),
             Err(e) => Flow::Escaped(Control::Error(e)),
         },
-        // Same measured status as `path_context_resolve_constants`'s own
-        // `FileIndex` arm (see its comment): the table exists now, this route
-        // is not reached with one installed, and `id.path()` is what to feed
-        // `file_index_for_path` when it is.
-        Expr::Builtin(Builtin::FileIndex) => eval_owned_identity_pipe::<S, V>(
-            rest,
-            OwnedValue::Int(ambient_file_index().unwrap_or(0)),
-            id,
-            optional,
-            sink,
-        ),
+        // #2427's table, read by path: this route *is* reached with one
+        // installed since the identity pass (`--eval-all '.[] |
+        // map(file_index)'` runs the body here), so the answer is the
+        // position's file, not the ambient constant.
+        Expr::Builtin(Builtin::FileIndex) => match id.path() {
+            Ok(path) => eval_owned_identity_stages::<S, V>(
+                rest,
+                OwnedValue::Int(file_index_for_path(&path)),
+                id,
+                optional,
+                tail,
+            ),
+            Err(e) => Flow::Escaped(Control::Error(e)),
+        },
         Expr::Builtin(Builtin::Parent) => {
-            continue_owned_identity_ancestor::<S, V>(rest, &value, &id, 1, optional, sink)
+            continue_owned_identity_ancestor::<S, V>(rest, &value, &id, 1, optional, tail)
         }
         Expr::Builtin(Builtin::ParentN(n_expr)) => {
             let Expr::Literal(lit) = &**n_expr else {
@@ -17373,58 +18323,315 @@ fn eval_owned_identity_pipe<S: EvalSemantics, V: DocumentValue>(
                 Ok(n) => n,
                 Err(e) => return Flow::Escaped(Control::Error(e)),
             };
-            continue_owned_identity_ancestor::<S, V>(rest, &value, &id, n, optional, sink)
+            continue_owned_identity_ancestor::<S, V>(rest, &value, &id, n, optional, tail)
         }
         Expr::Alternative(left, right) => {
-            match eval_owned_identity_alternative::<S, V>(left, right, &value, &id, optional) {
-                Ok(Some((v, vid))) => {
-                    eval_owned_identity_pipe::<S, V>(rest, v, vid, optional, sink)
-                }
-                Ok(None) => Flow::Exhausted,
-                Err(e) => Flow::Escaped(Control::Error(e)),
-            }
+            // spine 2416 (identity pass): a read inside either side is
+            // resolved at this position first; the rewrite spells it as a
+            // literal, which `owned_identity_operand` places as one.
+            let escaped = core::cell::RefCell::new(None);
+            let resolved;
+            let (left, right) = if needs_path_context(stage) {
+                resolved =
+                    match owned_identity_resolve_at::<S, V>(stage, &value, &id, optional, &escaped)
+                    {
+                        Ok(e) => e,
+                        Err(e) => return Flow::Escaped(Control::Error(e)),
+                    };
+                let Expr::Alternative(l, r) = strip_parens(&resolved) else {
+                    unreachable!("the rewrite keeps a node's own kind")
+                };
+                (&**l, &**r)
+            } else {
+                (&**left, &**right)
+            };
+            let flow =
+                match eval_owned_identity_alternative::<S, V>(left, right, &value, &id, optional) {
+                    Ok(Some((v, vid))) => {
+                        eval_owned_identity_stages::<S, V>(rest, v, vid, optional, tail)
+                    }
+                    Ok(None) => Flow::Exhausted,
+                    Err(e) => Flow::Escaped(Control::Error(e)),
+                };
+            owned_identity_after_prefetch(flow, escaped)
         }
         // spine 2416 (#2563): the binding keeps this stage's identity for
         // its body -- see [`eval_owned_identity_as`].
         Expr::As { expr, var, body } => {
-            eval_owned_identity_as::<S, V>(expr, var, body, rest, &value, &id, optional, sink)
+            eval_owned_identity_as::<S, V>(expr, var, body, rest, &value, &id, optional, tail)
         }
+        // spine 2416 (identity pass): the transparent constructs. Each
+        // output *is* an output of a body evaluated at this same position,
+        // so the body's stages are run through this pipe and `rest`
+        // continues from whatever they produce, identity and all.
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            let escaped = core::cell::RefCell::new(None);
+            let resolved =
+                match owned_identity_resolve_at::<S, V>(cond, &value, &id, optional, &escaped) {
+                    Ok(e) => e,
+                    Err(e) => return Flow::Escaped(Control::Error(e)),
+                };
+            let (conds, control) = owned_identity_values::<S>(&resolved, &value, optional);
+            for c in conds {
+                let branch = if c.is_truthy() {
+                    then_branch
+                } else {
+                    else_branch
+                };
+                match eval_owned_identity_spliced::<S, V>(
+                    branch,
+                    rest,
+                    value.clone(),
+                    id.clone(),
+                    optional,
+                    tail.reborrow(),
+                ) {
+                    Flow::Exhausted => {}
+                    other => return other,
+                }
+            }
+            match control.or_else(|| escaped.into_inner()) {
+                Some(control) => Flow::Escaped(control),
+                None => Flow::Exhausted,
+            }
+        }
+        Expr::Comma(branches) => {
+            for branch in branches {
+                match eval_owned_identity_spliced::<S, V>(
+                    branch,
+                    rest,
+                    value.clone(),
+                    id.clone(),
+                    optional,
+                    tail.reborrow(),
+                ) {
+                    Flow::Exhausted => {}
+                    other => return other,
+                }
+            }
+            Flow::Exhausted
+        }
+        Expr::Try { expr, catch } => {
+            eval_owned_identity_try::<S, V>(expr, catch.as_deref(), rest, value, id, optional, tail)
+        }
+        Expr::Optional(inner) => {
+            eval_owned_identity_try::<S, V>(inner, None, rest, value, id, optional, tail)
+        }
+        Expr::Label { name, body } => {
+            match eval_owned_identity_scoped::<S, V>(body, rest, value, id, optional, &mut tail) {
+                Ok(Flow::Escaped(Control::Break(label))) if label == *name => Flow::Exhausted,
+                Ok(flow) => flow,
+                Err(control) => Flow::Escaped(control),
+            }
+        }
+        Expr::Limit { n, expr } => {
+            let escaped = core::cell::RefCell::new(None);
+            let resolved =
+                match owned_identity_resolve_at::<S, V>(n, &value, &id, optional, &escaped) {
+                    Ok(e) => e,
+                    Err(e) => return Flow::Escaped(Control::Error(e)),
+                };
+            let (counts, control) = owned_identity_values::<S>(&resolved, &value, optional);
+            for n_value in counts {
+                let take = match classify_limit_n(n_value) {
+                    Ok(LimitN::Unlimited) => None,
+                    Ok(LimitN::Take(n)) => Some(n),
+                    Err(e) => return Flow::Escaped(Control::Error(e)),
+                };
+                match eval_owned_identity_bounded::<S, V>(
+                    expr,
+                    take,
+                    rest,
+                    value.clone(),
+                    id.clone(),
+                    optional,
+                    &mut tail,
+                ) {
+                    Flow::Exhausted => {}
+                    other => return other,
+                }
+            }
+            match control.or_else(|| escaped.into_inner()) {
+                Some(control) => Flow::Escaped(control),
+                None => Flow::Exhausted,
+            }
+        }
+        Expr::FirstExpr(inner) => eval_owned_identity_bounded::<S, V>(
+            inner,
+            Some(1),
+            rest,
+            value,
+            id,
+            optional,
+            &mut tail,
+        ),
+        // `last(body)` is jq 1.7.1's `reduce body as $x (null; $x)`: the
+        // last output, or `null` at this same position when there was none
+        // (`.a | last(empty) | key` is `"a"`, pinned since #1521).
+        Expr::LastExpr(inner) => {
+            let mut last: Option<(OwnedValue, OwnedIdentity<V>)> = None;
+            let flow = eval_owned_identity_stages::<S, V>(
+                owned_identity_body_stages(inner),
+                value,
+                id.clone(),
+                optional,
+                OwnedIdentityTail::Pairs(&mut |v, vid| {
+                    last = Some((v, vid));
+                    Flow::Exhausted
+                }),
+            );
+            if let Flow::Escaped(control) = flow {
+                return Flow::Escaped(control);
+            }
+            let (v, vid) = last.unwrap_or((OwnedValue::Null, id));
+            eval_owned_identity_stages::<S, V>(rest, v, vid, optional, tail)
+        }
+        Expr::AsPattern {
+            expr,
+            patterns,
+            body,
+        } => {
+            let [pattern] = patterns.as_slice() else {
+                unreachable!("owned_identity_pipe_supported admits a single pattern only")
+            };
+            let escaped = core::cell::RefCell::new(None);
+            let resolved =
+                match owned_identity_resolve_at::<S, V>(expr, &value, &id, optional, &escaped) {
+                    Ok(e) => e,
+                    Err(e) => return Flow::Escaped(Control::Error(e)),
+                };
+            let (bound_values, control) = owned_identity_values::<S>(&resolved, &value, optional);
+            let control = control.or_else(|| escaped.into_inner());
+            let mut names: Vec<String> = Vec::new();
+            collect_pattern_var_names(pattern, &mut names);
+            names.sort_unstable();
+            names.dedup();
+            let null = OwnedValue::Null;
+            for bound in bound_values {
+                let bindings = match extract_pattern_bindings(pattern, &bound, false) {
+                    Ok(b) => b,
+                    Err(e) => return Flow::Escaped(Control::Error(e)),
+                };
+                let substituted = substitute_vars(
+                    body,
+                    as_var_refs(&bindings).chain(
+                        names
+                            .iter()
+                            .filter(|name| !bindings.iter().any(|(n, _)| n == *name))
+                            .map(|name| (name.as_str(), &null)),
+                    ),
+                );
+                match eval_owned_identity_spliced::<S, V>(
+                    &substituted,
+                    rest,
+                    value.clone(),
+                    id.clone(),
+                    optional,
+                    tail.reborrow(),
+                ) {
+                    Flow::Exhausted => {}
+                    other => return other,
+                }
+            }
+            match control {
+                Some(control) => Flow::Escaped(control),
+                None => Flow::Exhausted,
+            }
+        }
+        // A definition binds exactly as `eval_each_generic`'s own arms bind
+        // it, and the bound expression is one more body at this position.
+        Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+            bound,
+        } => {
+            let installed = bind_def(name, &param_names(params), body, then, bound);
+            eval_owned_identity_spliced::<S, V>(&installed, rest, value, id, optional, tail)
+        }
+        Expr::DefCall {
+            def,
+            args,
+            frames,
+            bound,
+        } => match bind_def_call(def, args, *frames, bound) {
+            Ok(bound_body) => {
+                let _guard = enter_def_call_frame(*frames);
+                eval_owned_identity_spliced::<S, V>(bound_body, rest, value, id, optional, tail)
+            }
+            Err(e) => Flow::Escaped(Control::Error(e)),
+        },
+        Expr::Shared(inner) => {
+            eval_owned_identity_spliced::<S, V>(inner, rest, value, id, optional, tail)
+        }
+        Expr::Pipe(_) => {
+            eval_owned_identity_spliced::<S, V>(stage, rest, value, id, optional, tail)
+        }
+        Expr::Break(name) => Flow::Escaped(Control::Break(name.clone())),
+        // Nothing to place: the ordinary evaluator raises what these raise.
+        Expr::Error(_)
+        | Expr::Builtin(
+            Builtin::Empty | Builtin::Halt | Builtin::HaltError | Builtin::HaltErrorCode(_),
+        ) => eval_each_owned::<S>(stage, &value, optional, &mut |_| Demand::Continue),
         _ => {
             let Some(rule) = owned_identity_rule(stage) else {
                 unreachable!("owned_identity_pipe_supported admits ruled stages only")
             };
             // A `key`/`path`/`file_index` inside the stage (`select(key ==
             // 0)`, `[key, path]`) is a constant for a fixed identity, the
-            // same resolution the absent route applies (#2416 step 2).
+            // same resolution the absent route applies (spine 2416 step 2); a
+            // `parent` is the ancestor the identity holds, and a read the
+            // rewrite cannot reach is prefetched through this same pipe.
+            let escaped = core::cell::RefCell::new(None);
             let resolved;
             let stage_expr = if needs_path_context(stage) {
-                let (key, path) = match (id.key(), id.path()) {
-                    (Ok(key), Ok(path)) => (key, path),
-                    (Err(e), _) | (_, Err(e)) => return Flow::Escaped(Control::Error(e)),
+                // An assignment's right side is evaluated the way
+                // `eval_assign`/`eval_compound_assign`/`eval_alternative_assign`
+                // evaluate it: against the input with the targets already
+                // created (#2481, `yq_assign_rhs_document`) and inside real
+                // yq's read-only context, where a key lookup that finds
+                // nothing yields no node (#2470, the scope
+                // `eval::collect_rhs_outputs` enters). A read prefetched
+                // through this pipe has to see both.
+                let assign = match strip_parens(stage) {
+                    Expr::Assign { path, value: rhs }
+                    | Expr::AlternativeAssign { path, value: rhs } => Some((path, rhs, true)),
+                    Expr::CompoundAssign {
+                        op,
+                        path,
+                        value: rhs,
+                    } => Some((path, rhs, matches!(op, AssignOp::Add))),
+                    _ => None,
                 };
-                let parent_of = |n: usize| -> Result<Option<OwnedValue>, EvalError> {
-                    Ok(match owned_identity_ancestor(&value, &id, n) {
-                        OwnedAncestor::Owned(v, _) => Some(v),
-                        // STYLE-0012: a decode failure while materializing
-                        // the ancestor `parent` answers with raises whatever
-                        // `optional` says, exactly as it did when this same
-                        // call lived in `path_context_resolve_parent` (which
-                        // has no `optional` to consult). The rewrite has to
-                        // produce *some* literal for the `parent` it is
-                        // replacing; suppressing here would leave the read
-                        // unresolved and answer `null`, the silent fallback
-                        // ADR-0021 exists to end.
-                        OwnedAncestor::Node(c) => Some(to_owned_cursor(&c)?),
-                        OwnedAncestor::None => None,
-                    })
+                let rhs_document = match assign {
+                    Some((path, rhs, scalar_slice_noop)) => {
+                        match yq_assign_rhs_document::<S>(path, rhs, &value, scalar_slice_noop) {
+                            Ok(doc) => doc,
+                            Err(EvalEscape::Error(_)) if optional => return Flow::Exhausted,
+                            Err(EvalEscape::Error(e)) => return Flow::Escaped(Control::Error(e)),
+                            Err(EvalEscape::Break(label)) => {
+                                return Flow::Escaped(Control::Break(label))
+                            }
+                            Err(EvalEscape::Halt(code)) => {
+                                return Flow::Escaped(Control::Halt(code))
+                            }
+                        }
+                    }
+                    None => None,
                 };
-                resolved = match path_context_resolve_constants::<S>(
+                let _read_only = (S::READ_ONLY_ABSENT_KEY_IS_EMPTY && assign.is_some())
+                    .then(yq_read_only_context::enter);
+                resolved = match owned_identity_resolve_at::<S, V>(
                     stage,
-                    &PathContextAt {
-                        key: key.as_ref(),
-                        path: &path,
-                        parent_of: Some(&parent_of),
-                    },
+                    rhs_document.as_ref().unwrap_or(&value),
+                    &id,
+                    optional,
+                    &escaped,
                 ) {
                     Ok(e) => e,
                     Err(e) => return Flow::Escaped(Control::Error(e)),
@@ -17438,19 +18645,23 @@ fn eval_owned_identity_pipe<S: EvalSemantics, V: DocumentValue>(
                 let flow = match owned_identity_after_stage::<S, V>(
                     stage, rule, &value, &id, &output, optional,
                 ) {
-                    Ok(Some(oid)) => {
-                        eval_owned_identity_pipe::<S, V>(rest, output, oid, optional, sink)
-                    }
+                    Ok(Some(oid)) => eval_owned_identity_stages::<S, V>(
+                        rest,
+                        output,
+                        oid,
+                        optional,
+                        tail.reborrow(),
+                    ),
                     // The rule could not place the output (a left operand
                     // that produced nothing, an extremum of a scalar): real
                     // yq has no position for it either, so it continues
                     // detached.
-                    Ok(None) => eval_owned_identity_pipe::<S, V>(
+                    Ok(None) => eval_owned_identity_stages::<S, V>(
                         rest,
                         output,
                         OwnedIdentity::detached(),
                         optional,
-                        sink,
+                        tail.reborrow(),
                     ),
                     Err(e) => Flow::Escaped(Control::Error(e)),
                 };
@@ -17473,19 +18684,33 @@ fn eval_owned_identity_pipe<S: EvalSemantics, V: DocumentValue>(
             // `with_entries` detaches), so `rest` continues identically
             // either way.
             let positioned = map_family_positioned(stage).and_then(|(family, f)| {
-                let path = match id.path() {
-                    Ok(path) => path,
-                    Err(e) => return Some(Flow::Escaped(Control::Error(e))),
-                };
-                eval_map_family_positioned::<S>(family, f, &value, &path, optional, &mut emit)
+                eval_map_family_positioned::<S, V>(family, f, &value, &id, optional, &mut emit)
             });
             let upstream = match positioned {
                 Some(flow) => flow,
+                // #2522: a `|=` filter stands at the *target*, which
+                // `eval::update_path` names from the ambient prefix -- this
+                // stage's own position, installed for exactly this
+                // evaluation, as the eager evaluator's assignment arm did.
+                None if matches!(
+                    strip_parens(stage),
+                    Expr::Update { .. }
+                        | Expr::CompoundAssign { .. }
+                        | Expr::AlternativeAssign { .. }
+                ) =>
+                {
+                    match id.path() {
+                        Ok(path) => with_path_base(&path, || {
+                            eval_each_owned::<S>(stage_expr, &value, optional, &mut emit)
+                        }),
+                        Err(e) => Flow::Escaped(Control::Error(e)),
+                    }
+                }
                 None => eval_each_owned::<S>(stage_expr, &value, optional, &mut emit),
             };
             match downstream {
                 Some(flow) => flow,
-                None => upstream,
+                None => owned_identity_after_prefetch(upstream, escaped),
             }
         }
     }
@@ -26743,50 +27968,42 @@ mod tests {
         assert!(!eager(".a | with_entries(.value = key)"));
         assert!(!eager(".a | to_entries | map(.value = key)"));
         // An assignment's right-hand side is a *constant* for a fixed
-        // position, so the pipe is answered before this gate is asked at
-        // all: `try_path_context_absent_sink` runs first and takes it, which
-        // is why the gate still reports `true` here and no marker fires in
-        // the eager evaluator for `.a.b | .c = key` (arm re-audit, #2471).
-        assert!(eager(".a.b | .c = key"));
+        // position (#2471), and since spine 2416's identity pass the whole
+        // assignment family is single-native (`eval_positioned_stage_generic`)
+        // and a stage of the owned identity pipe, so none of these reaches
+        // this gate's `true` any more: `=` and the compound operators
+        // resolve their right side at the stage's position, `|=` installs
+        // that position as the prefix `eval::update_path` extends (#2522).
+        assert!(!eager(".a.b | .c = key"));
         assert!(path_context_absent_resolvable(&parse(".c = key").unwrap()));
-        // #2522: `|=` and the compound assignments are *not* in that class.
-        // Their right side stands at the target, which no constant known at
-        // this stage's position describes, so both gates refuse them and the
-        // pipe reaches `eval::eval_stage_with_path_context`'s own assignment
-        // arm -- where the stage's position becomes the prefix `update_path`
-        // extends. Live-verified with the arm instrumented: `.a | .b |= key`
-        // and `.a | .b += key` both fire it.
-        assert!(eager(".a | .b |= key"));
-        assert!(eager(".a | .b += key"));
-        assert!(eager(".c[] | .x //= key"));
+        assert!(!eager(".a | .b |= key"));
+        assert!(!eager(".a | .b += key"));
+        assert!(!eager(".c[] | .x //= key"));
+        // The constant route still refuses a `|=`: nothing there installs
+        // the prefix its filter is positioned from. The identity route does.
         assert!(!path_context_absent_resolvable(
             &parse(".c |= key").unwrap()
         ));
-        assert!(!owned_identity_stage_resolvable(
+        assert!(owned_identity_stage_resolvable(
             &parse(".c |= key").unwrap()
         ));
-        assert!(!path_context_absent_resolvable(
-            &parse(".c += key").unwrap()
-        ));
-        // ...but the filter itself resolves at a position `update_path` can
-        // name, which is what `path_context_at_resolvable` answers -- and it
-        // is the one gate that admits a read inside an arithmetic operand,
-        // because the rewrite happens in place with no route to move.
+        assert!(path_context_absent_resolvable(&parse(".c += key").unwrap()));
+        // The filter itself resolves at a position `update_path` can name,
+        // which is what `path_context_at_resolvable` answers. A read inside
+        // an arithmetic operand is admitted by every gate since the identity
+        // pass (#2522 had admitted it for the in-place rewrite only).
         assert!(path_context_at_resolvable(&parse("key").unwrap()));
         assert!(path_context_at_resolvable(&parse("parent | keys").unwrap()));
         assert!(path_context_at_resolvable(&parse("key + 10").unwrap()));
-        assert!(!path_context_absent_resolvable(&parse("key + 10").unwrap()));
-        assert!(!owned_identity_stage_resolvable(
-            &parse("key + 10").unwrap()
-        ));
-        // ...but a body whose reads cannot be resolved at a member position
-        // (`parent`, which real yq answers from a container it is halfway
-        // through rewriting) stays exactly where it was.
-        assert!(eager(".a | map_values(parent)"));
-        assert!(eager(".a | with_entries(.value = parent)"));
-        // `map` is deliberately not admitted for a *live* head: its cursor
-        // shapes are already exact on the eager route (#2493).
-        assert!(eager(".a | map(key + \"x\")"));
+        assert!(path_context_absent_resolvable(&parse("key + 10").unwrap()));
+        assert!(owned_identity_stage_resolvable(&parse("key + 10").unwrap()));
+        // A map-family body runs through the owned identity pipe at each
+        // member's position since the identity pass, `parent` included
+        // (the member's parent is the container the pipe holds), and `map`
+        // is admitted for a live head like the other two.
+        assert!(!eager(".a | map_values(parent)"));
+        assert!(!eager(".a | with_entries(.value = parent)"));
+        assert!(!eager(".a | map(key + \"x\")"));
         assert!(!eager(".a | to_entries | .[(0):(1)] | key"));
         assert!(!eager(".a | to_entries | .[(0):(1)]? | key"));
         assert!(!eager(".a | to_entries | .[.[0].key | length] | key"));
@@ -26810,10 +28027,10 @@ mod tests {
         // reads path context, or where a later stage does so in a shape the
         // constants cannot express.
         assert!(eager(".a | explode | key"), "no identity rule");
-        assert!(
-            eager(".a | [key] | .[0] | path"),
-            "the stage reads path context"
-        );
+        // A stage that itself reads path context is a stage of the owned
+        // identity pipe since the identity pass (the read is a constant at
+        // the head's position), so this shape is the absent route's now.
+        assert!(!eager(".a | [key] | .[0] | path"));
         // #2471 sub-item 5: a read *inside* an arithmetic or comparison
         // operand is a constant for a fixed identity, so the stage is
         // admitted now that #2460's empty-operand rule and #2470's
@@ -26822,12 +28039,10 @@ mod tests {
         assert!(!eager(".a | to_entries | .[0] | key == 0"));
         assert!(!eager(".a | to_entries | .[0] | path + []"));
         assert!(!eager(".a | tostring | key + \"x\""));
-        // ...but an operand whose own read the constants cannot express
-        // still hands the pipe over.
-        assert!(
-            eager(".a | to_entries | .[0] | parent + {}"),
-            "parent is not a constant"
-        );
+        // ...and an operand that reads `parent` is placed by running the
+        // operand through the pipe itself (spine 2416, identity pass), so
+        // it no longer hands the pipe over either.
+        assert!(!eager(".a | to_entries | .[0] | parent + {}"));
         // #2416 step 2: a head that can reach an absent node is no longer a
         // reason on its own -- `path_context_absent_split` walks the head as
         // positions and resolves the rest's `key`/`path`/`file_index`
@@ -26904,12 +28119,16 @@ mod tests {
         // ...but `select`/`parent` keep the node, so a later builtin is fine.
         assert!(!eager(".[] | select(key == \"a\") | parent | key"));
         assert!(!eager(".a[] | select(key != \"c\") | parent"));
-        // A stage built from something that bridges mid-expression. Object
-        // construction is native, so `(key | {k: .})` is admitted -- and
-        // since #2473 gave `needs_path_context` its own `Expr::Object` arm
-        // (#1332's other half), a bare `{k: key}` reaches this gate at all
-        // for the first time, and is admitted for the same reason.
-        assert!(eager(".[] | (key | tostring)"));
+        // A stage built from a builtin that reads nothing itself is native
+        // since spine 2416's identity pass (`path_context_single_native`'s
+        // `!needs_path_context` fallback): the nested pipe is the owned
+        // identity pipe's (`key` keeps the node's position, `tostring`
+        // keeps it again). Object construction is native, so `(key | {k:
+        // .})` is admitted -- and since #2473 gave `needs_path_context` its
+        // own `Expr::Object` arm (#1332's other half), a bare `{k: key}`
+        // reaches this gate at all for the first time, and is admitted for
+        // the same reason.
+        assert!(!eager(".[] | (key | tostring)"));
         // Native since spine 2416 gate reason 3 (#2473): the generic
         // `Expr::Reduce`/`Expr::Foreach` arms evaluate INPUT and INIT with
         // the cursor, so a fold whose *source* reads the position no longer
@@ -26933,10 +28152,10 @@ mod tests {
         assert!(!eager(".[] | {(key): 1}"));
         assert!(!eager(".[] | {\"k\": key, \"p\": path}"));
         assert!(!eager(".[] | {\"k\": (key + \"x\")}"));
-        // ...but a value expression that is not itself single-native keeps
-        // the construction on the eager route, the same closed-list rule
-        // every other arm follows.
-        assert!(eager(".[] | {\"k\": (key | tostring)}"));
+        // ...and a value expression built from a nested pipe the owned
+        // identity pipe answers is admitted too (identity pass), where a
+        // computed `limit` count still is not.
+        assert!(!eager(".[] | {\"k\": (key | tostring)}"));
         assert!(!eager(".[] | if key == \"a\" then . else empty end"));
         assert!(!eager(".[] | limit(1; .[] | key)"));
         assert!(eager(".[] | limit(1 + 0; key)"), "computed n");
@@ -26949,18 +28168,18 @@ mod tests {
         assert!(!eager(".[] | (key == \"a\") or false"));
         assert!(!eager(".[] | key and parent"));
         assert!(!eager(".[] | {\"k\": (key and true)}"));
-        // ...and an operand that is not itself single-native still keeps the
-        // whole pipe on the eager route, the same closed-list discipline
-        // every other arm follows.
-        assert!(eager(".[] | (key | tostring) and true"));
+        // ...an operand that is a nested pipe is native since the identity
+        // pass (the owned identity pipe answers it), while a computed
+        // `parent(n)` still keeps the pipe on the eager route -- the hop
+        // count would have to be evaluated against a position that may not
+        // exist.
+        assert!(!eager(".[] | (key | tostring) and true"));
         assert!(eager(".[] | parent(1 + 0)"));
-        // A nested pipe that would itself fall to the eager evaluator from a
-        // re-rooted input keeps the outer pipe eager too.
-        assert!(eager(".x | first(.a | tostring | key)"));
-        assert!(
-            eager(".x | first(.a | parent | parent)"),
-            "`.x` can be absent"
-        );
+        // A bounded consumer's body is run through the owned identity pipe
+        // (identity pass), so a head that can miss no longer keeps the
+        // outer pipe eager on the body's account.
+        assert!(!eager(".x | first(.a | tostring | key)"));
+        assert!(!eager(".x | first(.a | parent | parent)"));
         assert!(!eager(".x[] | first(.a | parent | parent)"));
         // #2558: `?` over navigation is navigational now, so a head that
         // ends in one is routed like any other -- `docs/plan/path-context-
@@ -26990,18 +28209,18 @@ mod tests {
         assert!(eager(".a[5]? | key"));
         assert!(path_context_walk_split(&pipe_stages(".a[5]? | key")).is_some());
         // An assignment's right side is the `.a.b | .c = key` row above with
-        // a `?` head: the absent route answers it first, so the gate's own
-        // `true` is not the route taken.
-        assert!(eager(".a? | .b = key"));
+        // a `?` head: the absent route answers it.
+        assert!(!eager(".a? | .b = key"));
         assert!(path_context_absent_split(&pipe_stages(".a? | .b = key")).is_some());
-        // ...but only `?` over *navigation*: `?` over anything else is not a
-        // head the walk can step, so the pipe hands over exactly as before.
-        assert!(eager(".a | (key | tostring)? | key"));
+        // `?` over a non-navigational stage is a `try` with no handler in
+        // the owned identity pipe (identity pass), so it is routed too.
+        assert!(!eager(".a | (key | tostring)? | key"));
         // A `?` head does not rescue a stage no route can name a position
-        // for, nor a fan-out head -- the residue ADR-0021 records.
-        assert!(eager(".a? | .b |= key"));
+        // for -- a builtin with no identity rule -- while `|=` and a `map`
+        // body are that pipe's since the identity pass.
+        assert!(!eager(".a? | .b |= key"));
         assert!(eager(".a? | explode | key"));
-        assert!(eager(".a? | map(key + \"x\")"));
+        assert!(!eager(".a? | map(key + \"x\")"));
         // #2563: an `as` stage has an identity rule now -- the binding keeps
         // the input's position for its body -- so a `?` head no longer keeps
         // the pipe eager just because the stage after it binds a variable.
@@ -27017,35 +28236,35 @@ mod tests {
         assert!(!eager(".a.b | (key) as $k | key"));
         assert!(!eager(".c[.n] | . as $x | key"));
         assert!(!eager(".c[.n]? | . as $x | key"));
-        // A `getpath` head is not navigation the walk models, so `is_node`
-        // is already false by the time the `as` stage is reached and the
-        // gate answers `true` -- but the absent route takes the pipe first
-        // now, the same "the gate is not the route that answers" split the
-        // `?`-headed rows above record.
-        assert!(eager(".a | getpath([\"b\"]) | . as $x | key"));
+        // A `getpath` head is not navigation the walk models, but it is
+        // navigation in the owned domain (#2471): the absent route takes the
+        // pipe, materializes `.a` once and continues from there, and a pipe
+        // the absent route takes is never this evaluator's (identity pass).
+        assert!(!eager(".a | getpath([\"b\"]) | . as $x | key"));
         assert!(
             path_context_absent_split(&pipe_stages(".a | getpath([\"b\"]) | . as $x | key"))
                 .is_some()
         );
-        // ...but only where the *body* is itself something this pipe can
-        // follow. A body stage with no `owned_identity_rule` keeps the whole
-        // pipe eager exactly as it did before, and so does a bare `$x` stage
-        // (`Expr::Var` has no rule before substitution and `Expr::TrackedVar`
-        // has none after, so the gate refuses it either way).
-        assert!(eager(".a.b | . as $x | (key and parent)"));
-        assert!(eager(".a.b | . as $x | map(key + \"x\")"));
+        // ...and so is every body the identity pass gave a rule or an arm to
+        // (`and`/`or`, a `map` body, a fold, a `label`), while a bare `$x`
+        // stage still keeps the whole pipe eager (`Expr::Var` has no rule
+        // before substitution and `Expr::TrackedVar` has none after, so the
+        // gate refuses it either way).
+        assert!(!eager(".a.b | . as $x | (key and parent)"));
+        assert!(!eager(".a.b | . as $x | map(key + \"x\")"));
         assert!(eager(".a.b | . as $x | $x | key"));
-        assert!(eager(".a.b | . as $x | reduce (key) as $k (\"\"; . + $k)"));
-        assert!(eager(".a.b | . as $x | label $o | (key, break $o)"));
-        // A bind source whose own reads cannot be resolved at this position
-        // (`parent` is a node, not a constant) is refused too.
-        assert!(eager(".a.b | (parent | key) as $k | key"));
-        // Destructuring and `?//` keep their pipes on the eager evaluator:
-        // `Expr::AsPattern`'s alternative-fallthrough rule has one
-        // definition (`each_pattern_alternatives_generic`) and no second one
-        // here.
-        assert!(eager(".a.b | . as [$x] | key"));
-        assert!(eager(".a? | . as [$x] | key"));
+        assert!(!eager(".a.b | . as $x | reduce (key) as $k (\"\"; . + $k)"));
+        assert!(!eager(".a.b | . as $x | label $o | (key, break $o)"));
+        // A bind source that reads `parent` resolves at this position too
+        // (identity pass: the source is rewritten with the ancestors the
+        // identity holds, like any other stage).
+        assert!(!eager(".a.b | (parent | key) as $k | key"));
+        // Single-pattern destructuring binds through the same route as `as`
+        // (identity pass); a `?//` chain is not a path-context stage at all
+        // (`needs_path_context` answers `false` for it) and the fan-out head
+        // stays where it was.
+        assert!(!eager(".a.b | . as [$x] | key"));
+        assert!(!eager(".a? | . as [$x] | key"));
         assert!(eager(".[]? | .k | select(key == \"k\")"));
         assert!(!eager(".a[] | select(true) | key"));
         // #2471 (gate reason 1 of spine 2416), the head-of-pipe half: a
