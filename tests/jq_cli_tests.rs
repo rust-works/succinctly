@@ -21578,6 +21578,41 @@ fn test_key_then_more_stages_does_not_blow_up_2149() -> Result<()> {
     Ok(())
 }
 
+/// #2149 review: an earlier draft of the fix matched the emitting stage
+/// with a bare `Expr::Builtin(Key | PathNoArg)` pattern instead of the
+/// file's own general `path_context_is_cursor_walkable` predicate (which
+/// already treats `(key)`/`[key]`/`(key, path)` as equally walkable
+/// wherever an emitting stage is accepted elsewhere in this gate) --
+/// leaving `.[] | (key) | tostring`, one paren away from the shape
+/// `test_key_then_more_stages_does_not_blow_up_2149` pins, reproducing the
+/// exact same O(n^2) blowup: live-verified during review at 0.04s (fixed)
+/// vs 32.9s (the narrower draft) on a 100,000-element array, byte-identical
+/// output either way. Pinned the same way as its sibling test.
+#[test]
+fn test_parenthesized_key_then_more_stages_does_not_blow_up_2149() -> Result<()> {
+    let n = 100_000;
+    let input = format!(
+        "[{}]",
+        (0..n)
+            .map(|i| format!("{{\"a\":{i}}}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let start = std::time::Instant::now();
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".[] | (key) | tostring"], Some(&input))?;
+    let elapsed = start.elapsed();
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    let lines: Vec<&str> = stdout.trim_end().lines().collect();
+    assert_eq!(lines.len(), n);
+    assert_eq!(lines[0], "\"0\"");
+    assert_eq!(lines[n - 1], format!("\"{}\"", n - 1));
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "{n} elements of `.[] | (key) | tostring` took {elapsed:?} -- O(n^2) regressed"
+    );
+    Ok(())
+}
+
 /// #2036 review, round 2: a genuinely empty `NAME()` must stay a syntax
 /// error even once `NAME` is a shadow candidate -- an earlier draft's
 /// arity-mismatch fallback (`Self::parse_func_call_or_error`) accepted `()`
