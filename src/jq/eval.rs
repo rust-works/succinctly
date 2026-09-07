@@ -14969,7 +14969,7 @@ fn builtin_fromjsonstream<W: Clone + AsRef<[u64]>>(
 /// but a read that lands nowhere is not an error: jq answers `null` for an
 /// index past either end, and for NaN, which reaches no element at all.
 /// `None` is that "no such element".
-fn resolve_read_index(key: &OwnedValue, len: usize) -> Option<usize> {
+pub(crate) fn resolve_read_index(key: &OwnedValue, len: usize) -> Option<usize> {
     // `as` saturates, so ±inf lands past the end and reads as `null`; NaN
     // returns `None` here same as it does from `numeric_key_to_index`.
     let index = numeric_key_to_index(key)?;
@@ -15097,7 +15097,23 @@ pub(crate) fn getpath_walk_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             QueryResult::Error(EvalError::path_must_be_array())
         };
     };
+    getpath_walk_owned_segments::<W, S>(root, path, optional)
+}
 
+/// [`getpath_walk_owned`]'s loop over an already-unwrapped path, so a walk
+/// can start partway along one.
+///
+/// Split out for #2168: `eval_generic`'s `getpath` walks the document with
+/// cursors now, and hands control back here at the first segment the cursor
+/// walk cannot answer without a value in hand -- a slice descriptor. That
+/// caller materializes the *one* node it has reached and passes the
+/// remaining segments, so this table stays the single definition of what
+/// every step means, rather than being partially restated over cursors.
+pub(crate) fn getpath_walk_owned_segments<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    root: &OwnedValue,
+    path: &[OwnedValue],
+    optional: bool,
+) -> QueryResult<'a, W> {
     let mut current: Cow<'_, OwnedValue> = Cow::Borrowed(root);
 
     for segment in path {
@@ -50607,7 +50623,6 @@ mod tests {
             (&b"[\"\xff\xfe\"]"[..], "all(.>0)"),
             (&b"[\"\xff\xfe\"]"[..], "any(.[]; true)"),
             (&b"[\"\xff\xfe\"]"[..], "all(.[]; true)"),
-            (&b"[\"\xff\xfe\"]"[..], ".[] | key"),
             (&b"[[\"\xff\xfe\"]]"[..], "combinations"),
             (&b"[\"\xff\xfe\"]"[..], "combinations(2)"),
             (&b"\"\xff\xfe\""[..], "debug"),
@@ -50628,6 +50643,18 @@ mod tests {
                 QueryResult::Error(e) if e.is_decode_failure() => {}
             );
         }
+
+        // `.[] | key` was in the list above until #2168. It names element 0's
+        // position and never reads the element, so it now answers `0` -- the
+        // same rule `.[]` itself already followed here, which echoes these raw
+        // bytes rather than raising. The row is kept, asserting the new
+        // answer, rather than deleted: the list's point is which builtins read
+        // a value, and this is the one that stopped.
+        query!(
+            &b"[\"\xff\xfe\"]"[..],
+            ".[] | key",
+            QueryResult::Owned(OwnedValue::Int(0)) => {}
+        );
 
         // `eval_single`'s yq-mode object slice arm is gated on
         // `S::TAG == EvalTag::Yq`, so `yq_query!`'s error pattern (which

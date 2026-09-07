@@ -32025,31 +32025,259 @@ fn test_jq_getpath_fanout_all_outputs_still_resolve_1532() -> Result<()> {
     Ok(())
 }
 
-/// #2053: `eval_generic.rs`'s new native `Builtin::GetPath` bypass arm still
-/// materializes and validates the whole document exactly once before ever
-/// walking a path -- the same rule `test_path_still_raises_on_an_
-/// undecodable_sibling_2061` pins for `path()`. `getpath(["d"])` never
-/// reaches `.a`, but a `\uXXXX`-family decode failure anywhere in the
-/// document still raises, matching real jq's own eager whole-document parse
-/// (#1755/#1953) -- unlike plain navigation (`.d`, `keys`, `length`), which
-/// only decode what they touch and succeed on this same document. This is
-/// the whole-document validity gate the issue's fix explicitly could not
-/// drop: a naive cursor walk straight to `.d` would silently accept a
-/// document both real jq and `main` currently reject.
+/// #2168: `getpath(P)` reads only the nodes it navigates to, so an
+/// undecodable *sibling* no longer makes it raise -- and landing on the
+/// undecodable node itself is not a read either.
+///
+/// This reverses `test_getpath_still_raises_on_an_undecodable_sibling_2053`,
+/// whose own doc comment called the whole-document materialization behind it
+/// the gate "the issue's fix explicitly could not drop". #2168 dropped it:
+/// `.d` had always answered `5` on this document, and two spellings of one
+/// read disagreeing is the shape #1629/#1642 exist to remove.
+///
+/// Most rows are asserted against the *bare navigation* they spell rather
+/// than against a literal, because that agreement is the property being
+/// pinned -- `getpath(["a"])` and `.a` now match byte for byte, stderr and
+/// exit code included, on a document jq will not parse at all.
+///
+/// **No jq oracle:** real jq 1.7.1 rejects all four documents at parse time,
+/// for `.d` as much as for `getpath(["d"])`.
 #[test]
-fn test_getpath_still_raises_on_an_undecodable_sibling_2053() -> Result<()> {
+fn test_getpath_touches_only_the_nodes_it_navigates_2168() -> Result<()> {
     for bad in [r"\ud800", r"\uZZZZ", r"\x", r"\u12"] {
         let input = format!("{{\"a\":\"{bad}\",\"d\":5}}");
-        let (stdout, stderr, code) = run_jq_stdin_streams("getpath([\"d\"])", &input, &["-c"])?;
-        assert_eq!(code, 5, "{bad}: stdout {stdout:?} stderr {stderr:?}");
-        assert_eq!(stdout, "", "{bad}");
+
+        // The sibling is never navigated to.
+        let (stdout, stderr, code) = run_jq_stdin_streams(r#"getpath(["d"])"#, &input, &["-c"])?;
+        assert_eq!(code, 0, "{bad}: stdout {stdout:?} stderr {stderr:?}");
+        assert_eq!(stdout.trim(), "5", "{bad}");
+
+        // Each `getpath` spelling answers exactly as the navigation it
+        // spells -- including landing *on* the undecodable node (raw bytes,
+        // exit 0), reading it (`| length` raises), and navigating through
+        // it (the type error, not a decode failure).
+        for (getpath_filter, nav_filter) in [
+            (r#"getpath(["a"])"#, ".a"),
+            (r#"getpath(["a"]) | length"#, ".a | length"),
+            (r#"getpath(["a","x"])"#, ".a.x"),
+            (r#"getpath(["d"])"#, ".d"),
+        ] {
+            let got = run_jq_stdin_streams(getpath_filter, &input, &["-c"])?;
+            let want = run_jq_stdin_streams(nav_filter, &input, &["-c"])?;
+            assert_eq!(
+                got, want,
+                "{bad}: `{getpath_filter}` must answer exactly as `{nav_filter}`"
+            );
+        }
+
+        // Spelled out rather than left to the pairing above, so a future
+        // change that made *both* sides silently succeed still fails here.
+        // (The message differs by escape shape -- `\x` is "invalid escape
+        // sequence in string", the `\u` family "invalid unicode escape
+        // sequence" -- so this matches the substring they share.)
+        let (_, stderr, code) =
+            run_jq_stdin_streams(r#"getpath(["a"]) | length"#, &input, &["-c"])?;
+        assert_eq!(code, 5, "{bad}: stderr {stderr:?}");
+        assert!(stderr.contains("escape sequence"), "{bad}: {stderr:?}");
     }
 
-    // The raise above is `getpath`-specific, not a blanket rejection of the
-    // document -- plain navigation over the same input still succeeds.
-    let (stdout, code) = run_jq_stdin(".d", r#"{"a":"\ud800","d":5}"#, &["-c"])?;
+    Ok(())
+}
+
+/// #2168: the cursor walk answers every step exactly as jq 1.7.1 does.
+///
+/// `getpath`'s step rules stopped being one table when this builtin started
+/// walking cursors, so this pins the seam. Two segment shapes are taken over
+/// cursors (a string key into an object, a number into an array); a slice
+/// descriptor hands the rest of the path to the owned table
+/// (`eval::getpath_walk_owned_segments`) after materializing the one node it
+/// reached; everything else is a type error raised from the cursor. A row
+/// landing in the wrong one of those three is what this catches.
+///
+/// Every expectation was captured live from `/usr/bin/jq` 1.7.1 on the
+/// document below, e.g.:
+///
+/// ```console
+/// $ printf '%s' '{"a":[1,2],"s":"str","n":5,"o":{"k":1}}' | jq -c 'getpath(["a",-1])'
+/// 2
+/// $ printf '%s' '{"a":[1,2],"s":"str","n":5,"o":{"k":1}}' | jq -c 'getpath(["n",0])'
+/// jq: error (at <stdin>:0): Cannot index number with number
+/// ```
+#[test]
+fn test_getpath_cursor_walk_matches_jq_2168() -> Result<()> {
+    let doc = r#"{"a":[1,2],"s":"str","n":5,"o":{"k":1}}"#;
+
+    // (filter, jq's stdout) -- rows jq answers.
+    for (filter, want) in [
+        (r"getpath([])", doc),
+        (r#"getpath(["a"])"#, "[1,2]"),
+        (r#"getpath(["o"])"#, r#"{"k":1}"#),
+        (r#"getpath(["o","k"])"#, "1"),
+        (r#"getpath(["a",0])"#, "1"),
+        (r#"getpath(["a",-1])"#, "2"),
+        (r#"getpath(["a",1.5])"#, "2"),
+        (r#"getpath(["a",-9])"#, "null"),
+        (r#"getpath(["b","c"])"#, "null"),
+        (r#"getpath(["o","zz"])"#, "null"),
+        (r#"getpath(["o","zz","yy"])"#, "null"),
+        (r#"getpath(["a",{"start":0,"end":1}])"#, "[1]"),
+        (r#"getpath(["s",{"start":0,"end":1}])"#, r#""s""#),
+    ] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
+        assert_eq!(code, 0, "{filter}: stdout {stdout:?} stderr {stderr:?}");
+        assert_eq!(stdout.trim(), want, "{filter}");
+    }
+
+    // (filter, jq's message) -- rows jq refuses.
+    for (filter, want) in [
+        (r#"getpath("a")"#, "Path must be specified as an array"),
+        (r"getpath([0])", "Cannot index object with number"),
+        (r"getpath([nan])", "Cannot index object with number"),
+        (r"getpath([true])", "Cannot index object with boolean"),
+        (r"getpath([null])", "Cannot index object with null"),
+        (r"getpath([[1]])", "Cannot index object with array"),
+        (
+            r#"getpath([{"start":0}])"#,
+            "Cannot index object with object",
+        ),
+        (
+            r#"getpath(["a","c"])"#,
+            r#"Cannot index array with string "c""#,
+        ),
+        (
+            r#"getpath(["s","x"])"#,
+            r#"Cannot index string with string "x""#,
+        ),
+        (
+            r#"getpath(["n","x"])"#,
+            r#"Cannot index number with string "x""#,
+        ),
+        (r#"getpath(["n",0])"#, "Cannot index number with number"),
+        (
+            r#"getpath(["a",{"start":"x"}])"#,
+            "Array/string slice indices must be integers",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
+        assert_eq!(code, 5, "{filter}: stdout {stdout:?} stderr {stderr:?}");
+        assert!(stderr.contains(want), "{filter}: {stderr:?}");
+    }
+
+    Ok(())
+}
+
+/// #2168: a document number reached through `getpath` keeps its source
+/// spelling, because the walk hands back the document's own node.
+///
+/// This is the one row where #2168 moved `getpath` *away* from real jq, and
+/// it did so by moving it onto succinctly's own `.big`. A `NumberLiteral`
+/// longer than `REINDEX_LITERAL_LEN_CAP` used to disqualify the whole
+/// document from the native arm (`reindex_bridge_is_identity`), sending the
+/// call through the reindex round trip, which re-spells it: jq prints
+/// `1E-301`, and so did `getpath(["big"])`, while `.big` on the same
+/// document printed all 303 characters. Preserving a document number's
+/// written form is deliberate (`DocumentValue::number_literal`, #387/#966),
+/// so the round trip was the odd one out, not `.big`.
+///
+/// jq 1.7.1 prints `1E-301` for **both** spellings, so this trades one
+/// divergence for internal agreement rather than removing one; recorded in
+/// `docs/compliance/jq/limitations.md`.
+#[test]
+fn test_getpath_keeps_a_document_numbers_spelling_2168() -> Result<()> {
+    let long_literal = "0.".to_string() + &"0".repeat(300) + "1";
+    let doc = format!(r#"{{"a":1,"big":{long_literal}}}"#);
+
+    let (via_getpath, _, code) = run_jq_stdin_streams(r#"getpath(["big"])"#, &doc, &["-c"])?;
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "5");
+    let (via_nav, _, code) = run_jq_stdin_streams(".big", &doc, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        via_getpath, via_nav,
+        "getpath must spell a document number the way the bare read does"
+    );
+    assert_eq!(via_getpath.trim(), long_literal, "the source spelling");
+
+    // The short sibling in the same document is unaffected either way.
+    let (stdout, _, code) = run_jq_stdin_streams(r#"getpath(["a"])"#, &doc, &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "1");
+
+    Ok(())
+}
+
+/// #2168: reporting a type error costs no materialization either.
+///
+/// The cursor walk raises `Cannot index ...` straight from the node it is
+/// standing on, so the error arrives even on a document that could not be
+/// materialized at all. Before #2168 this same query answered with a decode
+/// failure, because building the tree came first and never got as far as
+/// noticing the path was ill-typed. This is the row that would regress if a
+/// later change routed type errors through the owned table for convenience:
+/// it would materialize the root to word the message.
+#[test]
+fn test_getpath_type_error_does_not_materialize_the_root_2168() -> Result<()> {
+    let doc = r#"{"a":"\ud800"}"#;
+
+    let (stdout, stderr, code) = run_jq_stdin_streams("getpath([0])", doc, &["-c"])?;
+    assert_eq!(code, 5, "stdout {stdout:?}");
+    assert!(
+        stderr.contains("Cannot index object with number"),
+        "expected the type error, not a decode failure: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("invalid unicode escape sequence"),
+        "the root must not have been materialized: {stderr:?}"
+    );
+
+    Ok(())
+}
+
+/// #2168: `?` on a `getpath` the cursor walk answers suppresses exactly what
+/// it suppressed before, and exactly what jq suppresses.
+///
+/// Every row is jq 1.7.1's own answer, captured live, and every row was also
+/// checked against the pre-#2168 binary: all three agree. Worth pinning
+/// anyway, because the mechanism underneath changed. Suppression here is
+/// `try`'s -- `Expr::Optional` catches an ordinary error around the whole
+/// call -- while the arm *also* threads an `optional` parameter into the
+/// walk for the per-step decision. Only the first is reachable through this
+/// syntax (the documented `Map`/`Select` precedent, see
+/// `test_optional_ignored_sites_2280`), so these rows pin the reachable
+/// behaviour and leave the threaded parameter as the defensive thing it is.
+///
+/// The `.s.x?` row is the point of comparison: `getpath(["s","x"])?` is the
+/// same read, and now suppresses the same way.
+#[test]
+fn test_getpath_optional_matches_jq_on_the_cursor_walk_2168() -> Result<()> {
+    let doc = r#"{"a":[1,2],"s":"str"}"#;
+
+    for (filter, want_code, want_stdout) in [
+        (r#"getpath(["s","x"])"#, 5, ""),
+        (r#"getpath(["s","x"])?"#, 0, ""),
+        (r".s.x", 5, ""),
+        (r".s.x?", 0, ""),
+        (r#"getpath(["a",{"start":"x"}])"#, 5, ""),
+        (r#"getpath(["a",{"start":"x"}])?"#, 0, ""),
+        (r#"getpath(["a",0])"#, 0, "1"),
+        (r#"getpath(["a",0])?"#, 0, "1"),
+    ] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
+        assert_eq!(
+            code, want_code,
+            "{filter}: stdout {stdout:?} stderr {stderr:?}"
+        );
+        assert_eq!(stdout.trim(), want_stdout, "{filter}");
+    }
+
+    // A decode failure is never suppressible (#1620), and `getpath` reaching
+    // one through the cursor walk is no exception.
+    let (stdout, stderr, code) = run_jq_stdin_streams(
+        r#"(getpath(["a"]) | length)?"#,
+        r#"{"a":"\ud800"}"#,
+        &["-c"],
+    )?;
+    assert_eq!(code, 5, "stdout {stdout:?} stderr {stderr:?}");
+    assert!(stderr.contains("escape sequence"), "{stderr:?}");
 
     Ok(())
 }
@@ -32075,8 +32303,9 @@ fn test_getpath_still_raises_on_an_undecodable_sibling_2053() -> Result<()> {
 /// Pins that this is defensive, not a behavior change: a document-wide
 /// decode failure (`\ud800`, matching `test_getpath_still_raises_on_an_
 /// undecodable_sibling_2053`'s own repro) still raises *on these
-/// materializing spellings* (see the note in the body about #2168's
-/// cursor-navigable `path(.d)`) -- uncatchable, per
+/// materializing spellings* (see the notes in the body about #2168's
+/// cursor-navigable `path(.d)`, and about `getpath`'s rows leaving this
+/// test entirely) -- uncatchable, per
 /// #2286 tagging every one of these materializations' error paths
 /// `is_decode_failure()` -- through a bare call, a trailing `?`, and a
 /// `try`/`catch` wrapped in its own outer `?` (the exact shape #2231's
@@ -32092,9 +32321,6 @@ fn test_optional_ignored_sites_2280() -> Result<()> {
         "path(if true then .a else null end)",
         "path(if true then .a else null end)?",
         r#"(try path(if true then .a else null end) catch "CAUGHT")?"#,
-        r#"getpath(["a"])"#,
-        r#"getpath(["a"])?"#,
-        r#"(try getpath(["a"]) catch "CAUGHT")?"#,
     ] {
         let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
         assert_eq!(code, 5, "{filter}: stdout {stdout:?} stderr {stderr:?}");
@@ -32123,6 +32349,20 @@ fn test_optional_ignored_sites_2280() -> Result<()> {
         code, 5,
         "the materializing fallback still validates what it materializes"
     );
+
+    // `getpath`'s three rows left this test with #2168: it walks cursors
+    // now, so it has no materialization for `optional` to be ignored *by*,
+    // and every spelling below answers. `test_getpath_touches_only_the_
+    // nodes_it_navigates_2168` owns them.
+    for filter in [
+        r#"getpath(["a"])"#,
+        r#"getpath(["a"])?"#,
+        r#"(try getpath(["a"]) catch "CAUGHT")?"#,
+        r#"getpath(["d"])"#,
+    ] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
+        assert_eq!(code, 0, "{filter}: stdout {stdout:?} stderr {stderr:?}");
+    }
 
     Ok(())
 }
@@ -32410,10 +32650,13 @@ fn test_style_0012_routed_sites_still_raise_2334() -> Result<()> {
 }
 
 /// #2053, constraint 2 from the issue that split this fix off from #1909:
-/// `path_expr` must be evaluated exactly once, on *both* branches
-/// `eval_generic.rs`'s new native `Builtin::GetPath` arm can take -- the
-/// `reindex_bridge_is_identity`-gated bypass, and the pre-existing
-/// reindex-round-trip fallback kept for its numeric edge cases. A withdrawn
+/// `path_expr` must be evaluated exactly once, on every branch
+/// `eval_generic.rs`'s native `Builtin::GetPath` arm can take. #2168
+/// replaced those branches (the `reindex_bridge_is_identity`-gated bypass
+/// and its reindex-round-trip fallback are both gone) with a cursor walk and
+/// its mid-path hand-off to the owned table, so the rows below moved with
+/// them -- the constraint itself is unchanged, and is why neither rewrite
+/// was allowed to probe. A withdrawn
 /// earlier attempt at this fix (PR #2045) probed `path_expr`'s output shape
 /// and, on a shape it didn't recognise, discarded the probe and fell back to
 /// evaluating the whole unmodified expression a second time -- firing any
@@ -32435,36 +32678,45 @@ fn test_getpath_path_expr_evaluated_exactly_once_2053() -> Result<()> {
         "stderr: {stderr:?}"
     );
 
-    // Fallback branch: a `NumberLiteral` past `REINDEX_LITERAL_LEN_CAP`
-    // (256 chars) anywhere in the document makes `reindex_bridge_is_identity`
-    // return `false`, sending this call through the pre-existing
-    // reindex-round-trip path (`eval_on_owned` -> `eval::builtin_getpath` ->
-    // `fanout_arg`) instead -- the other place this property has to hold,
-    // since that path's own single evaluation of `path_expr` was left
-    // untouched by this fix.
-    let long_literal = "0.".to_string() + &"0".repeat(300) + "1";
-    let input = format!(r#"{{"a":1,"big":{long_literal}}}"#);
-    let (stdout, stderr, code) =
-        run_jq_stdin_streams(r#"getpath(("MARK2053"|stderr))"#, &input, &["-c"])?;
-    assert_eq!(code, 5, "stdout {stdout:?} stderr {stderr:?}");
+    // The other branch, since #2168: a slice descriptor sends the walk into
+    // the owned table partway along the path, so the whole expression is
+    // evaluated on a route that materializes a node mid-flight. The mark
+    // must still appear once, and the answer must still be jq's.
+    let (stdout, stderr, code) = run_jq_stdin_streams(
+        r#"getpath(("MARK2053"|stderr|["a",{"start":0,"end":1}]))"#,
+        r#"{"a":[1,2]}"#,
+        &["-c"],
+    )?;
+    assert_eq!(code, 0, "stdout {stdout:?} stderr {stderr:?}");
+    assert_eq!(stdout.trim(), "[1]", "stderr: {stderr:?}");
     assert_eq!(stderr.matches("MARK2053").count(), 1, "stderr: {stderr:?}");
-    assert!(
-        stderr.contains("Path must be specified as an array"),
-        "stderr: {stderr:?}"
-    );
+
+    // A generator path is the third shape that could double-fire: each
+    // resolved path drives its own walk, but the expression producing them
+    // runs once.
+    let (stdout, stderr, code) = run_jq_stdin_streams(
+        r#"[getpath(("MARK2053"|stderr|(["a"],["a",0])))]"#,
+        r#"{"a":[1,2]}"#,
+        &["-c"],
+    )?;
+    assert_eq!(code, 0, "stdout {stdout:?} stderr {stderr:?}");
+    assert_eq!(stdout.trim(), "[[1,2],1]", "stderr: {stderr:?}");
+    assert_eq!(stderr.matches("MARK2053").count(), 1, "stderr: {stderr:?}");
 
     Ok(())
 }
 
 /// #2053: a generator path (`getpath((["a"],["b"],["a"]))`) resolves every
-/// branch correctly off the *same* materialized root -- the native bypass
-/// arm's `owned: &OwnedValue` is shared (borrowed via `Cow`, never mutated)
-/// across every one of `fanout_arg_generic`'s per-path calls into
-/// `eval::getpath_walk_owned`, rather than re-materialized per path the way
-/// `eval::getpath_one_path` used to. Revisiting the same path twice (`["a"]`
-/// here) is a regression check for that sharing: nothing about walking it
-/// once should leave the shared root in a state where walking it again
-/// produces something different.
+/// branch correctly. #2053 pinned this against a *shared materialized root*
+/// (one `OwnedValue`, borrowed per path, replacing `eval::getpath_one_path`'s
+/// re-materialization per path); since #2168 there is no root tree at all and
+/// each path is its own cursor walk from the same document position. Both
+/// designs have to answer this identically, which is why the test outlives
+/// the mechanism it was written for. Revisiting the same path twice (`["a"]`
+/// here) remains the regression check: walking it once must leave nothing
+/// behind that changes the second walk (the walk holds a `Cell` sequential
+/// hint on the index since PR #2578, which is exactly the kind of state this
+/// row would catch).
 #[test]
 fn test_getpath_generator_path_shares_one_materialization_2053() -> Result<()> {
     let (stdout, code) = run_jq_stdin(
