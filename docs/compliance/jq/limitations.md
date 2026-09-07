@@ -1142,8 +1142,9 @@ ones). Two different checks are in play, and their coverage differs:
   `flatten`, and every assignment RHS, among others) — not the wholesale gap the previous
   revision of this paragraph implied.
 - **#1902 widened this to `. as $var`/`reduce`/`foreach`.** Their bound/INIT/input value and
-  body-output conversions switched from the lossy `to_owned_lossy`/`promote_borrowed` to
-  `to_owned`/`promote_borrowed_checked` — so a #1194 malformed member or #1642
+  body-output conversions switched from a lossy fold (`to_owned_lossy`, and the multi-value
+  promotion path this file no longer keeps an unchecked twin of) to the checked
+  `to_owned`/`promote_borrowed` — so a #1194 malformed member or #1642
   collision key that used to be silently dropped (`reduce . as $x (0; .+1)` on `{"a":1,"b"}`
   used to succeed with `1`) now raises there too, same as the builtins listed above. Not a new
   divergence unique to #1902: this is `to_owned`'s own established contract from
@@ -1156,8 +1157,8 @@ ones). Two different checks are in play, and their coverage differs:
   `One`/`Many` arms use the lossy `to_owned_lossy`, so `builtin_fromstream`'s
   `result.collect_owned()` fallback silently substituted `""` for an undecodable event leaf
   instead of raising — found via a research audit for #1989 that classified every bare
-  `to_owned(` call site in this file. Fixed by routing through the pre-existing
-  `stream_outputs_checked` (already had the exact `(Vec<OwnedValue>, Option<Control>)` shape
+  `to_owned(` call site in this file. Fixed by routing through the pre-existing checked
+  `stream_outputs` (already had the exact `(Vec<OwnedValue>, Option<Control>)` shape
   the call site destructures into) rather than adding a new function.
   `builtin_truncate_stream` has the identical `collect_owned` call shape but is safe by
   construction, not just untested: its `stream_expr` is evaluated against the same ambient

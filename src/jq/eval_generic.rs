@@ -540,7 +540,7 @@ pub fn to_owned_all_cursors<'a, C: DocumentCursor + 'a>(
 /// `escape_generic!`, `ensure_owned!` (#2340), the `pending_control`
 /// finalizer (#2381), and the target `Partial` arm's
 /// own promotion -- its callers so far). Mirrors `eval.rs`'s
-/// `promote_borrowed_checked` (#1897) -- the same fix, and the same `&[C]`
+/// `promote_borrowed` (#1897) -- the same fix, and the same `&[C]`
 /// (not a generic `IntoIterator`) so `cursors.len()` is available to
 /// pre-size `acc` via `vec_with_capacity`, same as that sibling does.
 fn to_owned_all_cursors_checked<C: DocumentCursor>(
@@ -9805,7 +9805,7 @@ fn limit_or_nth_uses_live_input_queue(n_expr: &Expr, expr: &Expr) -> bool {
 /// Materialize every output of `expr` through the *generic* evaluator,
 /// alongside whatever control terminated the stream.
 ///
-/// The generic twin of `eval::stream_outputs_checked`, and the whole of
+/// The generic twin of `eval::stream_outputs`, and the whole of
 /// #1687's `reduce`/`foreach` fix: those two constructs had no arm in this
 /// file at all, so every `reduce`/`foreach` query bridged the entire document
 /// into an `OwnedValue` before `input` was so much as looked at -- and
@@ -9865,7 +9865,7 @@ fn stream_owned_outputs_generic<S: EvalSemantics, V: DocumentValue>(
                 Demand::Continue
             }
             // The prefix already converted is kept, matching
-            // `stream_outputs_checked`'s `promote_borrowed_checked` arm.
+            // `stream_outputs`'s `promote_borrowed` arm.
             Err(control) => {
                 decode_err = Some(control);
                 Demand::Stop
@@ -10507,7 +10507,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
     // error, same as `resolve_terminal_prefix`'s matching arm. #2145: the
     // secondary failure can't discard the *prefix* either -- uses the
     // prefix-preserving `to_owned_all_cursors_checked` (mirroring `eval.rs`'s
-    // `promote_borrowed_checked`) instead of the all-or-nothing
+    // `promote_borrowed`) instead of the all-or-nothing
     // `to_owned_all_cursors`, so whatever converted before the failing
     // cursor survives into the reported `Partial` the same way it already
     // does on `eval.rs`'s equivalent path.
