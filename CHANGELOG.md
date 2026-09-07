@@ -257,6 +257,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   -1.4%** (M4 Pro, clearly outside this corpus's own -0.3%..+0.1% noise
   floor), within noise on Zen 4 (-0.2% to -0.3%, inside a -1.0%..+0.9%
   noise floor) — output byte-identical before/after in every run.
+- **Closed the same `explicit_tag()` double-resolve on the common
+  (non-absent) streaming path -- the much hotter sibling #2617 left for a
+  follow-up** (#2619): five call sites on this crate's "flagship streaming
+  path" (`stream_yaml_value_at`, `stream_json_value`, `write_json_to`,
+  `tag()`, `is_falsy`) already match a cursor's resolved value into
+  `YamlValue::String` -- proving it isn't an alias -- then call the
+  un-optimized `explicit_tag()` anyway, paying for a second resolve on
+  every string-valued node regardless of whether a tag is even present.
+  All five now call `explicit_tag_at(None)` instead. Unlike #2617's rare
+  trigger shape, this hits the overwhelming majority of real YAML scalars.
+  Measured via interleaved A/B on the pinned boxes, `yq '.'` over a
+  5-60MB array of small records (`yaml generate -p users`, #1114's own
+  corpus shape): **-23.6% to -24.5%** (M4 Pro), **-29.2% to -30.0%**
+  (Zen 4), output byte-identical before/after in every run.
 
 ### Removed
 
