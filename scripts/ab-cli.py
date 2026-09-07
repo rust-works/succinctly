@@ -24,6 +24,7 @@ import glob
 import hashlib
 import os
 import re
+import shlex
 import shutil
 import statistics
 import subprocess
@@ -53,6 +54,13 @@ def parse_args(argv=None):
     p.add_argument("--tool", default="yq", help="succinctly subcommand (default: yq)")
     p.add_argument("--queries", nargs="*", default=[".", ".[]"], help="queries to time")
     p.add_argument("--output", default="json", help="-o format passed to the tool")
+    p.add_argument("--extra-args", default=None,
+                   help="extra flags passed to the tool before the query, as one "
+                        "shell-quoted string. Must use the '=' form, since argparse reads a "
+                        "leading '-' as a flag: --extra-args='-I2 -P'. Defaults to '-I0' for "
+                        "--tool yq and nothing otherwise. yq's -I0 drives every value down "
+                        "the flow-style branches, so a change that only affects block-style "
+                        "rendering measures as neutral unless this is set (#1448)")
     p.add_argument("--reps", type=int, default=7, help="repetitions per configuration")
     p.add_argument("--control", action="store_true",
                    help="time --before against a copy of itself (noise floor)")
@@ -168,10 +176,18 @@ def run_text(cmd):
         return ""
 
 
+def tool_extra_args(args):
+    """`--extra-args` if given, else the per-tool default (rule 4: identical on both sides)."""
+    if args.extra_args is not None:
+        return shlex.split(args.extra_args)
+    return ["-I0"] if args.tool == "yq" else []
+
+
 def command(binary, args, query, path):
+    extra = tool_extra_args(args)
     if args.tool == "yq":
-        return [binary, args.tool, "-o", args.output, "-I0", query, path]
-    return [binary, args.tool, query, path]
+        return [binary, args.tool, "-o", args.output, *extra, query, path]
+    return [binary, args.tool, *extra, query, path]
 
 
 def digest(binary, args, query, path):
@@ -263,6 +279,7 @@ def main(argv=None):
     if status:
         print(status)
     print(f"inputs={len(inputs)} queries={args.queries} reps={args.reps}")
+    print(f"tool={args.tool} -o {args.output} extra-args={tool_extra_args(args)}")
     print()
 
     if not args.no_identity:
