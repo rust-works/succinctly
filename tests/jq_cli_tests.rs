@@ -27822,8 +27822,9 @@ fn test_jq_nth_generic_still_surfaces_a_skipped_decode_failure_through_a_retry_2
     Ok(())
 }
 
-/// #2165: `eval_sub_replacement`'s own `stream_outputs` call (not `_checked`)
-/// was named alongside `fanout_arg`/`fanout_two_args` as a site sharing
+/// #2165: `eval_sub_replacement`'s own `stream_outputs_lossy` call (the
+/// unchecked variant) was named alongside `fanout_arg`/`fanout_two_args` as
+/// a site sharing
 /// #2022's #1746-shaped bug (an unchecked fold silently substituting `""`
 /// for an undecodable value instead of raising). Investigation found the
 /// other two already fixed (by #1989, landed after #2165 was filed) and this

@@ -18710,284 +18710,289 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // `break 'process_one_key` instead: "this key contributes
             // nothing, stop processing it" reads the same either way.
             'process_one_key: {
-        let target_result = eval_single::<W, S>(target, value.clone(), false).materialize_cursor();
-        // Normalized once per key so the two index loops below (Borrowed vs
-        // Owned) are the only place `index_one`/`index_one_owned` are
-        // called, exactly as before -- just now run once per key instead of
-        // once overall.
-        enum KeyTargets<'a, W> {
-            Borrowed(Vec<StandardJson<'a, W>>),
-            Owned(Vec<OwnedValue>),
-        }
-        let key_targets = match target_result {
-            QueryResult::One(v) => KeyTargets::Borrowed(vec![v]),
-            QueryResult::Many(vs) => KeyTargets::Borrowed(vs),
-            QueryResult::Owned(v) => KeyTargets::Owned(vec![v]),
-            QueryResult::ManyOwned(vs) => KeyTargets::Owned(vs),
-            // Zero outputs for *this* key indexes to zero results for it —
-            // not an error, break, or halt — so this key simply contributes
-            // nothing and the loop moves on to the next one (#2032: unlike
-            // the old once-for-all-keys evaluation, this no longer implies
-            // every other key is empty too).
-            QueryResult::None => break 'process_one_key,
-            QueryResult::Error(e) => escape_with_prefix!(Control::Error(e)),
-            QueryResult::Break(label) => escape_with_prefix!(Control::Break(label)),
-            QueryResult::Halt(code) => escape_with_prefix!(Control::Halt(code)),
-            QueryResult::OneCursor(_) => {
-                unreachable!("materialize_cursor should have converted this")
-            }
-            // #2226: `target`'s own generator produced `vs` before its own
-            // mid-stream escape -- real jq's key-outer/target-inner model
-            // indexes each already-produced value by `k` as it flows out,
-            // the same per-value operation the `Owned`/`Borrowed` arms
-            // below already apply to a *successful* target result, so
-            // indexing an escaped generator's own partial prefix *is* real
-            // jq behavior (confirmed live: `0 as $k | ([1,2],[3,4],
-            // error("x"))[$k]` prints `1` then `3` before raising). This is
-            // jq-only (review finding): real yq does *not* stream a target's
-            // own escaped generator's prefix at all -- live-verified against
-            // yq v4.53.3, `0 as $k | ([1,2],[3,4],error("x"))[$k]` prints
-            // only `Error: x`, no prefix -- so yq mode keeps the old
-            // conservative discard here, exactly like the Error/Break/Halt
-            // arms above (matches ADR-0018's "the mode decides" rule; the
-            // pre-#2226 code's discard-everything behavior happened to
-            // already agree with real yq here, which this gate now
-            // preserves deliberately instead of by accident).
-            //
-            // Mirrors `KeyTargets::Owned`'s own loop below exactly (this
-            // prefix is already `Vec<OwnedValue>`, the same shape `Owned`
-            // handles): an indexing failure on an earlier-produced value
-            // fires before `target`'s own later escape ever would in the
-            // real generator order, so it outranks `control` here the same
-            // way a later key's index error already outranks an earlier
-            // key's pending halt in the `Owned`/`Borrowed` arms; only once
-            // every value in `vs` indexes cleanly does `control` --
-            // `target`'s own termination -- get to fire.
-            //
-            // #2374: the gate/fold/escape tail is now
-            // [`fold_escaped_generator_prefix`], shared with this file's
-            // `eval_slice_expr` and both of `eval_generic.rs`'s siblings,
-            // rather than a fourth hand-written copy. The `Owned` loop's
-            // `yq_negative_index_error` check is *not* carried into it: it
-            // is unreachable past the gate by construction
-            // (`yq_negative_index_check_core` returns `None` for every
-            // `S::TAG != EvalTag::Yq`), and it was only ever here "for
-            // structural parity", which the shared macro now supplies for
-            // real.
-            QueryResult::Partial(vs, control) => {
-                fold_escaped_generator_prefix! {
-                    semantics: S,
-                    escape: escape_with_prefix,
-                    prefix: vs,
-                    control: control,
-                    promote: {
-                        if owned.is_none() {
-                            owned = Some(
-                                match promote_borrowed(core::mem::take(&mut borrowed)) {
-                                    Ok(v) => v,
-                                    // An earlier key's own undecodable value
-                                    // predates this key's target generator in
-                                    // real evaluation order, so it outranks
-                                    // `control` too -- except when `control`
-                                    // is an uncatchable `Halt`, which must
-                                    // survive a promotion failure untouched,
-                                    // same rule `resolve_terminal_prefix`
-                                    // enforces for every other escape in this
-                                    // function (#987/#1832); `vs` is never
-                                    // attempted here either way, matching that
-                                    // helper's own `extra` never being touched
-                                    // on its `Err` branch.
-                                    //
-                                    // Not live-repro-tested (review):
-                                    // `target` is one fixed expression
-                                    // re-evaluated fresh per key against the
-                                    // same document, so whether a given key's
-                                    // evaluation is a clean success
-                                    // (populating `borrowed`) or a `Partial`
-                                    // (reaching this arm) is a deterministic
-                                    // function of `(target, value)` alone, not
-                                    // of which key is current -- an *earlier*
-                                    // key populating `borrowed` and a *later*
-                                    // key hitting this arm therefore requires
-                                    // `target` itself to behave
-                                    // non-deterministically across the two
-                                    // calls. The one stateful builtin that
-                                    // could do that, `input`, always returns
-                                    // an owned value (`builtin_input`'s own
-                                    // `owned_vec_to_result`), so it can never
-                                    // populate `borrowed` in the first place.
-                                    // Kept anyway, matching
-                                    // `resolve_terminal_prefix`'s own
-                                    // identical defensive handling, in case a
-                                    // future stateful mechanism changes this.
-                                    Err((prefix, e)) => {
-                                        let control = match control {
-                                            Control::Halt(_) => control,
-                                            Control::Error(_) | Control::Break(_) => {
-                                                Control::Error(e)
+                let target_result =
+                    eval_single::<W, S>(target, value.clone(), false).materialize_cursor();
+                // Normalized once per key so the two index loops below (Borrowed vs
+                // Owned) are the only place `index_one`/`index_one_owned` are
+                // called, exactly as before -- just now run once per key instead of
+                // once overall.
+                enum KeyTargets<'a, W> {
+                    Borrowed(Vec<StandardJson<'a, W>>),
+                    Owned(Vec<OwnedValue>),
+                }
+                let key_targets = match target_result {
+                    QueryResult::One(v) => KeyTargets::Borrowed(vec![v]),
+                    QueryResult::Many(vs) => KeyTargets::Borrowed(vs),
+                    QueryResult::Owned(v) => KeyTargets::Owned(vec![v]),
+                    QueryResult::ManyOwned(vs) => KeyTargets::Owned(vs),
+                    // Zero outputs for *this* key indexes to zero results for it —
+                    // not an error, break, or halt — so this key simply contributes
+                    // nothing and the loop moves on to the next one (#2032: unlike
+                    // the old once-for-all-keys evaluation, this no longer implies
+                    // every other key is empty too).
+                    QueryResult::None => break 'process_one_key,
+                    QueryResult::Error(e) => escape_with_prefix!(Control::Error(e)),
+                    QueryResult::Break(label) => escape_with_prefix!(Control::Break(label)),
+                    QueryResult::Halt(code) => escape_with_prefix!(Control::Halt(code)),
+                    QueryResult::OneCursor(_) => {
+                        unreachable!("materialize_cursor should have converted this")
+                    }
+                    // #2226: `target`'s own generator produced `vs` before its own
+                    // mid-stream escape -- real jq's key-outer/target-inner model
+                    // indexes each already-produced value by `k` as it flows out,
+                    // the same per-value operation the `Owned`/`Borrowed` arms
+                    // below already apply to a *successful* target result, so
+                    // indexing an escaped generator's own partial prefix *is* real
+                    // jq behavior (confirmed live: `0 as $k | ([1,2],[3,4],
+                    // error("x"))[$k]` prints `1` then `3` before raising). This is
+                    // jq-only (review finding): real yq does *not* stream a target's
+                    // own escaped generator's prefix at all -- live-verified against
+                    // yq v4.53.3, `0 as $k | ([1,2],[3,4],error("x"))[$k]` prints
+                    // only `Error: x`, no prefix -- so yq mode keeps the old
+                    // conservative discard here, exactly like the Error/Break/Halt
+                    // arms above (matches ADR-0018's "the mode decides" rule; the
+                    // pre-#2226 code's discard-everything behavior happened to
+                    // already agree with real yq here, which this gate now
+                    // preserves deliberately instead of by accident).
+                    //
+                    // Mirrors `KeyTargets::Owned`'s own loop below exactly (this
+                    // prefix is already `Vec<OwnedValue>`, the same shape `Owned`
+                    // handles): an indexing failure on an earlier-produced value
+                    // fires before `target`'s own later escape ever would in the
+                    // real generator order, so it outranks `control` here the same
+                    // way a later key's index error already outranks an earlier
+                    // key's pending halt in the `Owned`/`Borrowed` arms; only once
+                    // every value in `vs` indexes cleanly does `control` --
+                    // `target`'s own termination -- get to fire.
+                    //
+                    // #2374: the gate/fold/escape tail is now
+                    // [`fold_escaped_generator_prefix`], shared with this file's
+                    // `eval_slice_expr` and both of `eval_generic.rs`'s siblings,
+                    // rather than a fourth hand-written copy. The `Owned` loop's
+                    // `yq_negative_index_error` check is *not* carried into it: it
+                    // is unreachable past the gate by construction
+                    // (`yq_negative_index_check_core` returns `None` for every
+                    // `S::TAG != EvalTag::Yq`), and it was only ever here "for
+                    // structural parity", which the shared macro now supplies for
+                    // real.
+                    QueryResult::Partial(vs, control) => {
+                        fold_escaped_generator_prefix! {
+                            semantics: S,
+                            escape: escape_with_prefix,
+                            prefix: vs,
+                            control: control,
+                            promote: {
+                                if owned.is_none() {
+                                    owned = Some(
+                                        match promote_borrowed(core::mem::take(&mut borrowed)) {
+                                            Ok(v) => v,
+                                            // An earlier key's own undecodable value
+                                            // predates this key's target generator in
+                                            // real evaluation order, so it outranks
+                                            // `control` too -- except when `control`
+                                            // is an uncatchable `Halt`, which must
+                                            // survive a promotion failure untouched,
+                                            // same rule `resolve_terminal_prefix`
+                                            // enforces for every other escape in this
+                                            // function (#987/#1832); `vs` is never
+                                            // attempted here either way, matching that
+                                            // helper's own `extra` never being touched
+                                            // on its `Err` branch.
+                                            //
+                                            // Not live-repro-tested (review):
+                                            // `target` is one fixed expression
+                                            // re-evaluated fresh per key against the
+                                            // same document, so whether a given key's
+                                            // evaluation is a clean success
+                                            // (populating `borrowed`) or a `Partial`
+                                            // (reaching this arm) is a deterministic
+                                            // function of `(target, value)` alone, not
+                                            // of which key is current -- an *earlier*
+                                            // key populating `borrowed` and a *later*
+                                            // key hitting this arm therefore requires
+                                            // `target` itself to behave
+                                            // non-deterministically across the two
+                                            // calls. The one stateful builtin that
+                                            // could do that, `input`, always returns
+                                            // an owned value (`builtin_input`'s own
+                                            // `owned_vec_to_result`), so it can never
+                                            // populate `borrowed` in the first place.
+                                            // Kept anyway, matching
+                                            // `resolve_terminal_prefix`'s own
+                                            // identical defensive handling, in case a
+                                            // future stateful mechanism changes this.
+                                            Err((prefix, e)) => {
+                                                let control = match control {
+                                                    Control::Halt(_) => control,
+                                                    Control::Error(_) | Control::Break(_) => {
+                                                        Control::Error(e)
+                                                    }
+                                                };
+                                                // #2138: this `promote:` block runs
+                                                // from inside the per-key sink,
+                                                // which can only answer `Demand` --
+                                                // see `escape_with_prefix!`'s own
+                                                // doc comment above for why this
+                                                // parks the answer in `terminal`
+                                                // instead of `return`ing a
+                                                // `QueryResult` directly.
+                                                terminal = Some(partial(prefix, control));
+                                                return Demand::Stop;
                                             }
-                                        };
-                                        // #2138: this `promote:` block runs
-                                        // from inside the per-key sink,
-                                        // which can only answer `Demand` --
-                                        // see `escape_with_prefix!`'s own
-                                        // doc comment above for why this
-                                        // parks the answer in `terminal`
-                                        // instead of `return`ing a
-                                        // `QueryResult` directly.
-                                        terminal = Some(partial(prefix, control));
-                                        return Demand::Stop;
-                                    }
-                                },
-                            );
+                                        },
+                                    );
+                                }
+                            },
+                            accumulator: owned.as_mut().expect("promoted by the block above"),
+                            fold: |t| index_one_owned(t, k, optional),
                         }
-                    },
-                    accumulator: owned.as_mut().expect("promoted by the block above"),
-                    fold: |t| index_one_owned(t, k, optional),
-                }
-            }
-        };
-        match key_targets {
-            KeyTargets::Borrowed(ts) => {
-                // Reserved once per key, ahead of that key's own indexing
-                // loop, rather than once for the whole `keys x targets`
-                // product up front (#1670's `try_reserve_product`, no
-                // longer computable now that `target`'s own length can vary
-                // per key, #2032) -- still a fallible check ahead of every
-                // push in this batch, just distributed across keys instead
-                // of collected into one. Reserved on whichever accumulator
-                // is *currently* live (`owned`, once any earlier key has
-                // promoted it; `borrowed` otherwise) rather than
-                // unconditionally on `borrowed` -- `push_promoted` below
-                // routes every push in this batch to `owned` once it is
-                // `Some`, and a stale key kind can't tell a reservation
-                // where to land on its own (review finding: reserving on
-                // `borrowed` while a prior key had already promoted `owned`
-                // guarded a `Vec` this batch never touches, leaving the one
-                // it actually pushed into unguarded).
-                let reserved = match &mut owned {
-                    Some(acc) => acc.try_reserve(ts.len()),
-                    None => borrowed.try_reserve(ts.len()),
+                    }
                 };
-                if reserved.is_err() {
-                    escape_with_prefix!(Control::Error(cannot_reserve_cross_product(&[ts.len()])));
-                }
-                for t in &ts {
-                    match index_one::<W, S>(t.clone(), k, optional) {
-                        // `resolve_terminal_prefix`, not unchecked `to_owned_lossy`
-                        // (#1897): an undecodable string already accumulated
-                        // must raise `EvalError::decode_failure` on
-                        // promotion, not silently become `""` -- the same
-                        // #1746/#1755/#1790/#1832 shape this file's other
-                        // terminal-control prefixes already guard against.
-                        QueryResult::One(v) => {
-                            if let Err(e) =
-                                push_promoted(core::iter::once(v), &mut borrowed, &mut owned)
-                            {
+                match key_targets {
+                    KeyTargets::Borrowed(ts) => {
+                        // Reserved once per key, ahead of that key's own indexing
+                        // loop, rather than once for the whole `keys x targets`
+                        // product up front (#1670's `try_reserve_product`, no
+                        // longer computable now that `target`'s own length can vary
+                        // per key, #2032) -- still a fallible check ahead of every
+                        // push in this batch, just distributed across keys instead
+                        // of collected into one. Reserved on whichever accumulator
+                        // is *currently* live (`owned`, once any earlier key has
+                        // promoted it; `borrowed` otherwise) rather than
+                        // unconditionally on `borrowed` -- `push_promoted` below
+                        // routes every push in this batch to `owned` once it is
+                        // `Some`, and a stale key kind can't tell a reservation
+                        // where to land on its own (review finding: reserving on
+                        // `borrowed` while a prior key had already promoted `owned`
+                        // guarded a `Vec` this batch never touches, leaving the one
+                        // it actually pushed into unguarded).
+                        let reserved = match &mut owned {
+                            Some(acc) => acc.try_reserve(ts.len()),
+                            None => borrowed.try_reserve(ts.len()),
+                        };
+                        if reserved.is_err() {
+                            escape_with_prefix!(Control::Error(cannot_reserve_cross_product(&[
+                                ts.len()
+                            ])));
+                        }
+                        for t in &ts {
+                            match index_one::<W, S>(t.clone(), k, optional) {
+                                // `resolve_terminal_prefix`, not unchecked `to_owned_lossy`
+                                // (#1897): an undecodable string already accumulated
+                                // must raise `EvalError::decode_failure` on
+                                // promotion, not silently become `""` -- the same
+                                // #1746/#1755/#1790/#1832 shape this file's other
+                                // terminal-control prefixes already guard against.
+                                QueryResult::One(v) => {
+                                    if let Err(e) = push_promoted(
+                                        core::iter::once(v),
+                                        &mut borrowed,
+                                        &mut owned,
+                                    ) {
+                                        escape_with_prefix!(Control::Error(e));
+                                    }
+                                }
+                                QueryResult::None => {}
+                                // A later key's index error outranks an earlier
+                                // key's still-pending halt (verified against jq
+                                // 1.7.1/1.8.2: `{"a":1} | .[("a", 5, halt)]` prints
+                                // `1`, then the "Cannot index object with number"
+                                // error, and never reaches `halt` — jq's
+                                // interleaved key/index evaluation means the error
+                                // fires before the generator ever produces the
+                                // `halt` key). The already-indexed prefix must
+                                // still survive as `Partial`, matching real jq's
+                                // output instead of vanishing.
+                                QueryResult::Error(e) => escape_with_prefix!(Control::Error(e)),
+                                // #2182: was a wildcard `_ =>` -- verified by tracing
+                                // both of `index_one`'s callees (`index_object_by_name`,
+                                // `index_array_by_position`) exhaustively: every arm in
+                                // both resolves to `One`/`None`/`Error`, so this is a
+                                // provably closed set today. Spelled out per-variant so
+                                // a future `QueryResult` variant this callee starts
+                                // returning is a compile error here, not a silent
+                                // absorption into a catch-all.
+                                QueryResult::OneCursor(_)
+                                | QueryResult::Many(_)
+                                | QueryResult::Owned(_)
+                                | QueryResult::ManyOwned(_)
+                                | QueryResult::Break(_)
+                                | QueryResult::Halt(_)
+                                | QueryResult::Partial(..) => {
+                                    unreachable!("index_one yields only One/None/Error")
+                                }
+                            }
+                        }
+                    }
+                    KeyTargets::Owned(ts) => {
+                        // Ensures `owned` exists *before* reserving onto it, rather
+                        // than relying on `promote_and_extend`'s own lazy per-item
+                        // promotion (review finding: that promotion sizes the
+                        // freshly-converted `Vec` for `borrowed`'s existing length
+                        // only, with no knowledge of this batch's own `ts.len()`
+                        // pending pushes, so a `try_reserve` gated on `owned`
+                        // already being `Some` skipped the very first Owned-kind
+                        // key entirely). `promote_borrowed` mirrors what
+                        // `promote_and_extend`/`push_promoted` already do
+                        // internally for this exact conversion (#353/#1755/#1790).
+                        if owned.is_none() {
+                            owned = Some(match promote_borrowed(core::mem::take(&mut borrowed)) {
+                                Ok(v) => v,
+                                // #2138: this secondary promotion failure used
+                                // to have to choose between a pending
+                                // key-stream `Halt` and this decode failure's
+                                // own `Error` -- that question is gone along
+                                // with `pending_control` itself: keys are no
+                                // longer materialized ahead of indexing, so by
+                                // the time any key's own per-key work runs
+                                // here, the key stream has not produced
+                                // anything *after* this key for there to be a
+                                // pending event about. This decode failure is
+                                // simply the only event in play, and (per
+                                // `escape_with_prefix!`'s own doc comment
+                                // above) is reported via `terminal`, not a bare
+                                // `return`, since this runs from inside the
+                                // per-key sink.
+                                Err((prefix, e)) => {
+                                    terminal = Some(partial(prefix, Control::Error(e)));
+                                    return Demand::Stop;
+                                }
+                            });
+                        }
+                        let acc = owned.as_mut().expect("just ensured Some");
+                        if acc.try_reserve(ts.len()).is_err() {
+                            escape_with_prefix!(Control::Error(cannot_reserve_cross_product(&[
+                                ts.len()
+                            ])));
+                        }
+                        for t in &ts {
+                            // #2254 review: checked ahead of `index_one_owned`,
+                            // which has no notion of this yq-only rule -- see
+                            // `yq_negative_index_error`'s own doc comment for why
+                            // it isn't threaded into that function instead.
+                            // Unconditional, not gated on `optional` -- the sibling
+                            // `Borrowed` loop above is already unconditional here
+                            // (via `index_one` -> `index_array_by_position`), and
+                            // this arm silently diverging from it under `optional`
+                            // was a real, live-reproducible bug this same review
+                            // caught (`--slurp` with a computed key against an
+                            // owned/constructed array target).
+                            if let Some(e) = yq_negative_index_error::<S>(t, k) {
                                 escape_with_prefix!(Control::Error(e));
                             }
-                        }
-                        QueryResult::None => {}
-                        // A later key's index error outranks an earlier
-                        // key's still-pending halt (verified against jq
-                        // 1.7.1/1.8.2: `{"a":1} | .[("a", 5, halt)]` prints
-                        // `1`, then the "Cannot index object with number"
-                        // error, and never reaches `halt` — jq's
-                        // interleaved key/index evaluation means the error
-                        // fires before the generator ever produces the
-                        // `halt` key). The already-indexed prefix must
-                        // still survive as `Partial`, matching real jq's
-                        // output instead of vanishing.
-                        QueryResult::Error(e) => escape_with_prefix!(Control::Error(e)),
-                        // #2182: was a wildcard `_ =>` -- verified by tracing
-                        // both of `index_one`'s callees (`index_object_by_name`,
-                        // `index_array_by_position`) exhaustively: every arm in
-                        // both resolves to `One`/`None`/`Error`, so this is a
-                        // provably closed set today. Spelled out per-variant so
-                        // a future `QueryResult` variant this callee starts
-                        // returning is a compile error here, not a silent
-                        // absorption into a catch-all.
-                        QueryResult::OneCursor(_)
-                        | QueryResult::Many(_)
-                        | QueryResult::Owned(_)
-                        | QueryResult::ManyOwned(_)
-                        | QueryResult::Break(_)
-                        | QueryResult::Halt(_)
-                        | QueryResult::Partial(..) => {
-                            unreachable!("index_one yields only One/None/Error")
-                        }
-                    }
-                }
-            }
-            KeyTargets::Owned(ts) => {
-                // Ensures `owned` exists *before* reserving onto it, rather
-                // than relying on `promote_and_extend`'s own lazy per-item
-                // promotion (review finding: that promotion sizes the
-                // freshly-converted `Vec` for `borrowed`'s existing length
-                // only, with no knowledge of this batch's own `ts.len()`
-                // pending pushes, so a `try_reserve` gated on `owned`
-                // already being `Some` skipped the very first Owned-kind
-                // key entirely). `promote_borrowed` mirrors what
-                // `promote_and_extend`/`push_promoted` already do
-                // internally for this exact conversion (#353/#1755/#1790).
-                if owned.is_none() {
-                    owned = Some(
-                        match promote_borrowed(core::mem::take(&mut borrowed)) {
-                            Ok(v) => v,
-                            // #2138: this secondary promotion failure used
-                            // to have to choose between a pending
-                            // key-stream `Halt` and this decode failure's
-                            // own `Error` -- that question is gone along
-                            // with `pending_control` itself: keys are no
-                            // longer materialized ahead of indexing, so by
-                            // the time any key's own per-key work runs
-                            // here, the key stream has not produced
-                            // anything *after* this key for there to be a
-                            // pending event about. This decode failure is
-                            // simply the only event in play, and (per
-                            // `escape_with_prefix!`'s own doc comment
-                            // above) is reported via `terminal`, not a bare
-                            // `return`, since this runs from inside the
-                            // per-key sink.
-                            Err((prefix, e)) => {
-                                terminal = Some(partial(prefix, Control::Error(e)));
-                                return Demand::Stop;
+                            match index_one_owned(t, k, optional) {
+                                Ok(Some(v)) => owned.as_mut().expect("still Some").push(v),
+                                Ok(None) => {}
+                                // Same reasoning as the `Borrowed` arm above: a
+                                // later key's index error outranks an earlier key's
+                                // pending halt, and the already-indexed prefix
+                                // survives it.
+                                Err(e) => escape_with_prefix!(Control::Error(e)),
                             }
-                        },
-                    );
-                }
-                let acc = owned.as_mut().expect("just ensured Some");
-                if acc.try_reserve(ts.len()).is_err() {
-                    escape_with_prefix!(Control::Error(cannot_reserve_cross_product(&[ts.len()])));
-                }
-                for t in &ts {
-                    // #2254 review: checked ahead of `index_one_owned`,
-                    // which has no notion of this yq-only rule -- see
-                    // `yq_negative_index_error`'s own doc comment for why
-                    // it isn't threaded into that function instead.
-                    // Unconditional, not gated on `optional` -- the sibling
-                    // `Borrowed` loop above is already unconditional here
-                    // (via `index_one` -> `index_array_by_position`), and
-                    // this arm silently diverging from it under `optional`
-                    // was a real, live-reproducible bug this same review
-                    // caught (`--slurp` with a computed key against an
-                    // owned/constructed array target).
-                    if let Some(e) = yq_negative_index_error::<S>(t, k) {
-                        escape_with_prefix!(Control::Error(e));
-                    }
-                    match index_one_owned(t, k, optional) {
-                        Ok(Some(v)) => owned.as_mut().expect("still Some").push(v),
-                        Ok(None) => {}
-                        // Same reasoning as the `Borrowed` arm above: a
-                        // later key's index error outranks an earlier key's
-                        // pending halt, and the already-indexed prefix
-                        // survives it.
-                        Err(e) => escape_with_prefix!(Control::Error(e)),
+                        }
                     }
                 }
-            }
-        }
-        } // closes 'process_one_key: { ... }
+            } // closes 'process_one_key: { ... }
         }};
     }
 
@@ -33324,8 +33329,7 @@ fn limit_with_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // flushed `pending_first`'s decode failure over the
                 // argument's trailing control, and the same shape `eval_as`'s
                 // own bound-control-vs-fallback match already uses.
-                let final_control =
-                    push_owned_values(result, &mut prefix).unwrap_or(control);
+                let final_control = push_owned_values(result, &mut prefix).unwrap_or(control);
                 partial(prefix, final_control)
             }
         }
@@ -41188,8 +41192,7 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // it used to be silently lossy-substituted and only then reach
     // `range_num`'s ordinary, `optional`-suppressible type error. Pinned by
     // `test_builtin_combinations_n_raises_on_undecodable_n_expr_2196`.
-    let (n_values, trailing) =
-        stream_outputs(eval_single::<W, S>(n_expr, value.clone(), optional));
+    let (n_values, trailing) = stream_outputs(eval_single::<W, S>(n_expr, value.clone(), optional));
 
     // Array construction drops its prefix when its generator escapes, so a
     // trailing break/error aborts the whole call with no output -- verified
@@ -50412,7 +50415,7 @@ mod tests {
     /// one malformed-member object exercises the exact arm the `One`-only
     /// repro above cannot reach.
     #[test]
-    fn test_eval_reduce_input_many_promote_borrowed_checked_error_respects_optional_unless_decode_failure_1934(
+    fn test_eval_reduce_input_many_promote_borrowed_error_respects_optional_unless_decode_failure_1934(
     ) {
         let json: &[u8] = br#"[{"a":1,"b"}]"#;
         let index = JsonIndex::build(json);
