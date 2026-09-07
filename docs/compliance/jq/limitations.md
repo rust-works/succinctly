@@ -1842,7 +1842,9 @@ apparently validates upstream, matching what this entry found). `select`,
 this same function without that upstream validation, and a trailing-comma/
 missing-colon/stray-comma corruption in a subtree the query only ever
 validates (never emits) silently passed — `{"c":{"a":1,},"t":5} |
-select(.c) | .t` answered `5` instead of raising, confirmed live. See
+select(.c) | .t` answered `5` instead of raising, confirmed live. (`path()` left
+that list again in #2168, which decided that naming a position should not
+validate what is inside it; `select`/`sort_by` keep the checks this fix added.) See
 this doc's "The validate-only traversal..." entry in `CHANGELOG.md` for
 the fix; the underlying lesson stands even though this specific
 conclusion didn't: a function lacking its own checks by inspection can
@@ -2941,7 +2943,11 @@ shows #1653's original ordering.
 That is not a leftover: the eager evaluator's `to_owned_with_cursor` on the ambient value
 doubles as a validity gate (#1194's structural checks, #1642's colliding-display-key raise)
 and also decides an undecodable key's spelling, and `eval_each_generic`'s native arms (#1596)
-do neither. Streaming such a filter would drop those checks.
+do neither. Streaming such a filter would drop those checks. (#2168 settled the same
+question for `path`/`key`/`parent`/`getpath` — see its entry below — but not this one: there
+the gate stood in front of a *navigation* that could carry the rule itself, where this one
+stands in front of a filter that forwards the root value unchanged, and the spelling half is
+untouched either way.)
 [#2103](https://github.com/rust-works/succinctly/issues/2103) tracks separating the two jobs;
 until it lands, those shapes stay on the eager route.
 
@@ -4177,6 +4183,89 @@ document-read number materializes as a short `NumberLiteral`, and yq mode's
 `key`/`parent` at all, so there is no oracle for the shape; what changed is a
 spelling succinctly used to preserve internally. Fixing it means giving the
 owned evaluator a non-reindexing path, not this door.
+
+### `path`/`key`/`parent`/`getpath` validate only what they touch — no carve-out; recorded on its merits (#2168)
+
+These four read a position rather than a value, and as of
+[#2168](https://github.com/rust-works/succinctly/issues/2168) they inspect only the nodes
+they navigate through. A corrupted value elsewhere in the document — an undecodable escape,
+a trailing comma, a colliding undecodable key — no longer makes them raise:
+
+```console
+$ printf '%s' '{"a":"\ud800","d":5}' | succinctly jq -c 'path(.d)'
+["d"]
+$ printf '%s' '{"a":"\ud800","d":5}' | succinctly jq -c 'getpath(["d"])'
+5
+$ printf '%s' '{"c":{"a":1,},"t":5}' | succinctly jq -c '.t | key'
+"t"
+```
+
+Real jq 1.7.1 rejects every one of those documents while parsing it, before any filter runs,
+and so does real yq v4.53.3 on the YAML spelling. So the reference separates none of these
+rows — it answers *nothing* here, `.d` included — and ADR-0018's decision order reaches its
+third step with no fidelity argument on either side. What decided it is internal
+consistency, and succinctly's own plain navigation had already set the rule: `.d` answered
+`5` on the first document and `.t` answered `5` on the second, long before `path(.d)` and
+`.t | key` refused them. Two spellings of one read disagreeing is the shape
+[#1629](https://github.com/rust-works/succinctly/issues/1629)/[#1642](https://github.com/rust-works/succinctly/issues/1642)
+exist to remove.
+
+The gate they lost was never a decision about these builtins. Until
+[#2151](https://github.com/rust-works/succinctly/issues/2151) they materialized the whole
+document to answer, and that materialization doubled as the #1755/#1953 validity check; when
+the tree went, an equivalent whole-document walk was kept in its place specifically so a
+performance change would not move semantics. #2168 measured what that cost — 67-75% of such
+a query's runtime, making `.[0] | key` 3.0-4.1x the price of the `.[0]` it wraps — and took
+the semantics question on its own.
+
+**What still validates.** The rule is about reading, not about the builtin's name:
+
+| shape | behaviour | why |
+|---|---|---|
+| `path(.d)`, `.d \| key`, `.d \| parent`, `getpath(["d"])` | answer | never read `.a` |
+| `path(.a)`, `getpath(["a"])` | answer, echoing raw bytes like `.a` | naming a position is not reading it |
+| `getpath(["a"]) \| length`, `path(.a[])`, `.a[] \| key` | raise | the value is read |
+| `path(if . then .d else null end)`, `path(.d \| select(true))`, `path(..)` | raise | not cursor-navigable; the fallback materializes, and validates all of it |
+| `select(f)`, `sort_by(f)`, `unique_by(f)`, `min_by(f)`, `max_by(f)` | raise | the subtree walked *is* the value tested or emitted |
+| `to_entries`, `map_values(f)`, `. as $x`, `.a \|= 1`, `[.[]]` | raise | materialize |
+
+The two `path(...)` spellings disagreeing is the residue of this change, not an oversight:
+the materializing fallback validates everything it materializes, which is the same rule
+applied to a route that reads the whole document.
+
+**What else stopped firing.** The #1194/#1677/#2211/#2243 structural checks and #1642's
+colliding-display-key raise rode on the same walk, so they no longer fire for these builtins
+on a subtree the query never reads. `[path(.[])]` now names exactly the members
+`keys_unsorted` lists, element for element, on a document with two undecodable keys of the
+same display spelling — where before, one answered and the other raised. The materializing
+routes (`-S`, `-s`, `.,.`) still raise on that document, because rendering both keys into
+one map is what the collision *is*.
+
+**One row moved away from jq.** A `NumberLiteral` longer than `REINDEX_LITERAL_LEN_CAP`
+disqualified a document from `getpath`'s native arm, sending the call through the reindex
+round trip, which re-spells it. jq prints `1E-301` for a 303-character literal and so did
+`getpath(["big"])`; `.big` printed all 303 characters, because preserving a document
+number's written form is deliberate (`DocumentValue::number_literal`,
+[#387](https://github.com/rust-works/succinctly/issues/387)/[#966](https://github.com/rust-works/succinctly/issues/966)).
+Both spellings now print the source form. This trades a coincidental agreement with jq for
+agreement with succinctly's own read of the same node; the pre-existing divergence it joins
+is the entry above on the owned route's re-spelling.
+
+Pinned by `test_lazy_validation_boundary_2168` (the table above, as one test),
+`test_path_answers_past_an_undecodable_sibling_2168`,
+`test_path_answers_past_a_colliding_key_2168`,
+`test_path_answers_past_a_structural_fault_it_never_reads_2168`,
+`test_getpath_touches_only_the_nodes_it_navigates_2168`,
+`test_getpath_cursor_walk_matches_jq_2168`,
+`test_getpath_keeps_a_document_numbers_spelling_2168` (`tests/jq_cli_tests.rs`), and
+`test_path_context_cursor_walk_skips_an_undecodable_sibling_2168` plus its yq-mode sibling
+(`tests/yq_cli_tests.rs`).
+
+**Still open.** [#2103](https://github.com/rust-works/succinctly/issues/2103) — the eager
+and streaming evaluators disagree about validating the *ambient* value, which is a different
+question this decision informs rather than closes: the eager route's own
+`to_owned_with_cursor` still validates a whole document that a streaming arm would not, and
+which spelling an undecodable key gets is still undecided.
 
 ## Provenance
 

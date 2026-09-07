@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`path()`, `key`, `parent` and `getpath()` now validate only the nodes they
+  navigate through, instead of the whole document** (#2168): on
+  `{"a":"\ud800","d":5}`, `path(.d)` and `getpath(["d"])` answer where they
+  used to raise `invalid unicode escape sequence` — matching `.d`, which has
+  always answered `5` on that document. The same applies to a structural fault
+  (`{"c":{"a":1,},"t":5} | .t | key`) and to #1642's colliding-undecodable-key
+  raise; `[path(.[])]` now names exactly the members `keys_unsorted` lists.
+  Reading the value still raises (`getpath(["a"]) | length`, `path(.a[])`), as
+  does every route that materializes — `select`, `sort_by`/`unique_by`/
+  `min_by`/`max_by`, `to_entries`, `.a |= 1`, and `path()`'s own fallback for a
+  filter shape it cannot walk with cursors.
+
+  The whole-document walk was inherited, not chosen: until #2151 these builtins
+  materialized the document to answer, that tree doubled as #1755/#1953's
+  validity gate, and #2061/#2151 kept an equivalent walk rather than move
+  semantics inside a performance change. It cost 67-75% of such a query's
+  runtime, making `.[0] | key` 3.0-4.1x the price of the `.[0]` it wraps. Real
+  jq 1.7.1 and yq v4.53.3 reject every affected document while parsing it — for
+  `.d` as much as for `path(.d)` — so ADR-0018's decision order reaches its
+  third step with no fidelity argument either way, and internal consistency
+  decides; `.d` had already set the rule. Recorded in
+  [docs/compliance/jq/limitations.md](docs/compliance/jq/limitations.md).
+
+  `getpath` was rewritten to walk cursors to get there (a string key into an
+  object, a number into an array; a slice descriptor materializes the one node
+  it has reached and hands the rest of the path to the owned table, which stays
+  the single definition of every step's meaning). It now costs what the
+  navigation it spells costs: `getpath([0])` on a 300 K-element array is 0.02 s
+  and 11.9 MiB against `.[0]`'s 0.02 s and 11.7 MiB, down from 0.06 s and
+  38.4 MiB. All 25 of its step rows were re-verified against jq 1.7.1, and the
+  #2053 constraint that `path_expr` is evaluated exactly once still holds on
+  every branch. One row moved away from jq as a consequence: an over-cap
+  numeric literal read through `getpath` now keeps its source spelling, as
+  `.big` already did, instead of being re-spelled `1E-301` by the reindex round
+  trip it no longer takes.
+
 ### Fixed
 
 - **`key`/`path` (no arg) followed by more pipe stages no longer falls back
@@ -52,6 +90,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      (`conventions_differ_at_exactly_five_code_points`, up from three).
   **Residual, not fixed here**: the M2 streaming path itself still emits a
   *raw* (non-`\L`/`\P`-sourced) U+2028/U+2029 byte unescaped -- see #2607.
+
+- **`at_offset(f)`/`at_position(f; g)` accept an argument navigated from the
+  document** (#2168): `at_offset(.n)` and `at_position(.l; .c)` errored with
+  `at_offset requires a non-negative integer` on a document that plainly has
+  the integer at `.n`, while the same argument spelled `getpath(["n"])`
+  worked. The arm already accepted a document-sourced number; it just had no
+  case for one arriving as a cursor, which `.n` produces and `getpath` did
+  not. Found by #2168's own change breaking the `getpath` spelling (three
+  copies of the argument match, now one `position_arg_integer`), which is how
+  the older gap in the other two surfaced.
 
 - **`succinctly yq` no longer drops a redefined anchor's earlier
   declaration on re-emission** (#1353): `a: &x 1\nb: &x 2\nc: *x` used to

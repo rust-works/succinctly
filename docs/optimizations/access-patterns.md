@@ -246,6 +246,14 @@ document: document-order walk 3.00 (mean and max), `.users[] | .name` 3.12 mean
 / 5 max (a draft that only reused the seed going forward left this shape's two
 backward asks per element at 23 probes each).
 
+#2168's second half then removed the walk from these queries altogether:
+`path`/`key`/`parent`/`getpath` validate only the nodes they navigate through
+now, so the shapes this seed was tuned for no longer traverse the document at
+all. The seed still pays for itself on everything that does walk in document
+order -- identity output, `to_owned`, `.[]` iteration, `select` and the
+`sort_by` family's own validation -- which is where the non-`key` rows below
+were always measured.
+
 End to end, Apple M4 Pro, interleaved A/B with output identity gated, medians of
 7 (PR #2578): `.[][0] | key` on a 14 MB `users` document 131.6 -> 84.6 ms
 (-36%), the same on a 20 MB `numbers` array 151.8 -> 84.5 ms (-44%), identity
