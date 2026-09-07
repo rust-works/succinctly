@@ -133,12 +133,10 @@ impl YamlIndex<Vec<u64>> {
         let ib_rank = build_ib_rank(&semi.ib);
         let containers_rank = build_containers_rank(&semi.containers);
 
-        // Build reverse anchor mapping (bp_pos → anchor_name)
-        let bp_to_anchor: BTreeMap<usize, String> = semi
-            .anchors
-            .iter()
-            .map(|(name, &bp_pos)| (bp_pos, name.clone()))
-            .collect();
+        // #1353: `semi.bp_to_anchor` is populated directly by the parser,
+        // one entry per `&name` declaration -- not derived from `semi.anchors`
+        // (name → position, last-wins) by inversion, which would silently
+        // drop every declaration but the final one when a name is redefined.
 
         // Convert bp_to_text to compact storage when positions are monotonic
         let open_positions = OpenPositions::build(&semi.bp_to_text, ib_len);
@@ -155,7 +153,7 @@ impl YamlIndex<Vec<u64>> {
             containers: semi.containers,
             containers_rank,
             anchors: semi.anchors,
-            bp_to_anchor,
+            bp_to_anchor: semi.bp_to_anchor,
             aliases: semi.aliases,
             tags: semi.tags,
             line_comments: semi.line_comments,
@@ -189,7 +187,12 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         let ib_rank = build_ib_rank(ib.as_ref());
         let containers_rank = build_containers_rank(containers.as_ref());
 
-        // Build reverse anchor mapping
+        // Build reverse anchor mapping. Derived from `anchors` (name →
+        // position, last-wins) by inversion rather than #1353's per-
+        // declaration tracking: this constructor takes a pre-built
+        // `anchors` map with no per-declaration history left to recover,
+        // and (like `line_comments` below) has no caller in this codebase
+        // today to regress on a redefined-anchor input.
         let bp_to_anchor: BTreeMap<usize, String> = anchors
             .iter()
             .map(|(name, &bp_pos)| (bp_pos, name.clone()))

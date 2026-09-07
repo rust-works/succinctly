@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`succinctly yq` no longer drops a redefined anchor's earlier
+  declaration on re-emission** (#1353): `a: &x 1\nb: &x 2\nc: *x` used to
+  print `a: 1` (the first `&x` silently gone) even though `c: *x` still
+  correctly resolved to `2` -- values were always right, only the earlier
+  `&x` syntax was lost on output. `YamlIndex`'s reverse anchor map
+  (`bp_to_anchor`) used to be built by inverting the forward map (`anchors`:
+  name -> position, last-wins by design, since that's the correct
+  resolution rule for an alias), so redefining a name silently discarded
+  every earlier declaration's position along with it. Fixed by having the
+  parser populate `bp_to_anchor` directly at each `&name` site
+  (`parse_anchor`/`record_key_anchor`), one entry per declaration, instead
+  of deriving it from the last-wins map. Since both the cursor-streaming
+  path and the DOM write path read the same `YamlCursor::anchor()` ->
+  `get_anchor_name`, this one fix covers both -- including combining
+  correctly with #1352's key-anchor fix on a redefined key anchor.
+
 - **`succinctly yq`'s cursor-streaming identity output no longer drops an
   anchor on a mapping key** (#1352): `&k key: 1` round-tripped as plain
   `key: 1` even on a no-op `.` query. The parser already indexed a key
