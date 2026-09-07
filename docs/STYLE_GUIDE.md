@@ -611,6 +611,34 @@ child_tail_gap_ok(last_elem.as_ref(), b']')?;              // no container curso
 container_tail_gap_ok(cursor, last_elem.as_ref(), b']')?;  // container cursor in hand
 ```
 
+### The tail is a separate decision, with its own marker (#2404)
+
+A walk that validates its members must also validate its tail. That half is enforced
+separately, by `style_0013_tail_gap_is_routed_or_exempted`, and exempted separately with
+`// STYLE-0013-TAIL:` -- **a `// STYLE-0013:` marker does not exempt the tail.**
+
+The two are split because they fail independently and the tail half is the one that gets
+forgotten: #2349's fix hand-copied *both* halves, and it was the member half that got the
+attention. Five of the six walks the tail rule currently exempts already carried a member
+marker, so a shared marker would have let a decision nobody made stand in for one that
+matters.
+
+The tail rule asks nothing of a walk that does not validate members -- the unchecked
+`len`/`keys`/`collect_cursors` fast paths, `json::light`'s streaming writers and the
+YAML-only walks are all out of scope without needing a marker each. If your walk *does*
+check its children, end it in a tail helper:
+
+```rust
+tail_gap_ok(cursor, last.as_ref(), b'}')?;            // cursor or not, dispatches for you
+container_tail_gap_ok(c, last.as_ref(), b'}')?;       // holds a container cursor
+child_tail_gap_ok(last.as_ref(), b'}')?;              // children only
+```
+
+Prefer `container_tail_gap_ok`/`tail_gap_ok` when a container cursor is in scope:
+`child_tail_gap_ok` is documented as unable to see the zero-child `{,}`/`[,]` case, and
+hand-rolling its one-armed body inherits that blind spot -- which is exactly how #2594's
+live divergence survived #2211.
+
 A site that genuinely cannot route carries a `// STYLE-0013:` citation with a specific
 reason -- the same traceability STYLE-0004 requires of a lint suppression and STYLE-0012 of
 an unrouted materialization. "It is fine" is not a reason; name what the site needs that the

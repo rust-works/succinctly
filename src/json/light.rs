@@ -1259,6 +1259,13 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
     where
         W: Clone,
     {
+        // STYLE-0013-TAIL: hand-rolls `child_tail_gap_ok`'s single `Some(last)`
+        // arm rather than calling it, because this walk raises
+        // `malformed_json_text` (carrying the document text) where the helper
+        // raises `malformed_delimiter_error` -- swapping it changes the message
+        // on inputs that already error. It therefore also inherits that helper's
+        // documented blind spot: the zero-child `{,}` case, which only
+        // `container_tail_gap_ok`'s `None` arm sees. Tracked as #2594.
         let mut fields = *self;
         // (key's own text start, winning field, is this field the object's
         // first) -- same bookkeeping `find_cursor` keeps, needed so the
@@ -1363,6 +1370,9 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
     where
         W: Clone,
     {
+        // STYLE-0013-TAIL: `find`'s cursor-returning twin, exempt for the same
+        // two reasons -- a different error value than the helper raises, and the
+        // same inherited zero-child `{,}` blind spot. Tracked as #2594.
         let mut fields = *self;
         // (key's own text start, value cursor, is this field the object's
         // first) for the winning candidate seen so far.
