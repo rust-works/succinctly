@@ -13761,7 +13761,7 @@ fn path_context_emitting_value<V: DocumentValue>(
             Some(key) => Ok(Some(key.clone())),
             None => Ok(None),
         },
-        _ => unreachable!("path_context_emitting_value called on a non-Key/PathNoArg expr"),
+        _ => unreachable!("path_context_emitting_value called on a non-Key/PathNoArg expr"), // omni-dev: coverage tolerate-line reason="unreachable: the sole caller (path_context_walk_generic's merged arm) only invokes this after matching Expr::Builtin(PathNoArg | Key) itself (#2149)"
     }
 }
 
@@ -13837,7 +13837,7 @@ fn path_context_walk_generic<S: EvalSemantics, V: DocumentValue>(
             match path_context_emitting_value(expr, pos) {
                 Ok(Some(v)) => Ok(sink(GenericItem::Owned(v))),
                 Ok(None) => Ok(Demand::Continue),
-                Err(e) => Err(Control::Error(e)),
+                Err(e) => Err(Control::Error(e)), // omni-dev: coverage tolerate-line reason="cursor_key's malformed-member-key error path, pre-existing before #2149's refactor merged this arm with PathNoArg's -- reachable only via the negative-index special case landing on an undecodable object key, not this fix's own scope"
             }
         }
         _ => {
