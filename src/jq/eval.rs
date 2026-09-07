@@ -16197,8 +16197,10 @@ fn eval_sub_replacement<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // field name (re-evaluated against `captures`, not the caller's `.`, so
     // it never reaches the outer document at all) -- all three raise
     // correctly today on an undecodable value, none of them through this
-    // function's own conversion. See `test_sub_replacement_decode_failure_*`
-    // below for the pinning tests.
+    // function's own conversion. See `test_sub_replacement_via_bound_var_*`,
+    // `test_sub_replacement_via_input_*`, and
+    // `test_sub_replacement_via_closure_param_*` in `tests/jq_cli_tests.rs`
+    // for the pinning tests.
     let materialized =
         eval_owned_input::<W, S>(replacement_expr, &captures, optional).materialize_cursor();
     let (values, trailing) = stream_outputs(materialized);
