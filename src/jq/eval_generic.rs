@@ -16122,6 +16122,36 @@ fn owned_identity_operand_resolvable(expr: &Expr) -> bool {
     !needs_path_context(expr) || path_context_absent_resolvable(expr)
 }
 
+/// An `as` stage's bind source (#2563). It is evaluated against the stage's
+/// *own* input -- the input whose position `id` describes -- so a
+/// `key`/`path`/`file_index` inside one is a constant for a fixed identity,
+/// resolved by the same rewrite a computed navigation component's reads get
+/// ([`owned_identity_resolve_component`]). `parent` is refused for the same
+/// reason it is refused in a component: the rewrite spells it as an
+/// `Expr::TrackedVar` holding a materialized value, and nothing about a
+/// binding needs that node.
+fn owned_identity_bind_supported(expr: &Expr) -> bool {
+    owned_identity_component_supported(expr)
+}
+
+/// The stages an `as` stage's body contributes to the pipe it is spliced
+/// into (#2563).
+///
+/// One definition so the gate ([`owned_identity_pipe_supported`]) and the
+/// evaluator ([`eval_owned_identity_as`]) split the body the same way: the
+/// gate sees it unsubstituted (`$x`) and the evaluator sees it with the
+/// bound value in place, and substitution never changes a *stage's* own node
+/// kind. The one node it does replace outright is a bare `Expr::Var`, which
+/// has no [`owned_identity_rule`] before substitution and none after
+/// (`Expr::TrackedVar` has none either), so such a stage is refused by the
+/// gate and the evaluator never meets it.
+fn owned_identity_body_stages(body: &Expr) -> &[Expr] {
+    match strip_parens(body) {
+        Expr::Pipe(stages) => stages,
+        other => core::slice::from_ref(other),
+    }
+}
+
 /// The static gate for the owned identity pipe: every stage of `stages` is
 /// navigation, a path-context builtin answered from the identity, or a stage
 /// with an [`owned_identity_rule`] whose own path-context builtins (if any)
@@ -16172,6 +16202,26 @@ fn owned_identity_pipe_supported(stages: &[Expr]) -> bool {
                 if needs_path_context(stage)
                     || !owned_identity_operand_supported(left)
                     || !owned_identity_operand_supported(right)
+                {
+                    return false;
+                }
+            }
+            // spine 2416 (#2563): an `as` stage keeps the input's identity
+            // for its body -- the body's `.` is the node this stage stands
+            // on, which is exactly what both references do (`.a.b | . as $x
+            // | key` is `"b"` in yq v4.53.3) -- so the body is spliced into
+            // this pipe with `$var` substituted and every stage of it is
+            // gated exactly as a stage written here would be. The bind
+            // source is evaluated at this same position, so its own
+            // `key`/`path`/`file_index` reads resolve to constants like a
+            // computed navigation component's do. `Expr::AsPattern`
+            // (destructuring, `?//`) is deliberately absent: its
+            // alternative-fallthrough rule lives in
+            // `each_pattern_alternatives_generic` and has no second
+            // definition here, so it keeps its pipe on the eager evaluator.
+            Expr::As { expr, body, .. } => {
+                if !owned_identity_bind_supported(expr)
+                    || !owned_identity_pipe_supported(owned_identity_body_stages(body))
                 {
                     return false;
                 }
@@ -16868,6 +16918,80 @@ fn owned_identity_placed_by<S: EvalSemantics, V: DocumentValue>(
     })
 }
 
+/// An `as` stage inside the owned identity pipe (#2563).
+///
+/// ADR-0021 decision 7's rule for a binding: the stage keeps the input's
+/// identity for its body -- the body's `.` is the node the stage stood on --
+/// and the bound variable is a *value*, substituted into the body exactly as
+/// the generic route's `each_as_generic` already does
+/// (`substitute_bound_var`, so a `. as $x` source still marks its uses
+/// `Expr::TrackedVar` and stays a `path()` trackability candidate). The
+/// substituted body is then spliced in front of `rest` and run through this
+/// same pipe, which is what keeps one definition of every stage rule instead
+/// of a second evaluator for what follows a binding.
+///
+/// Captured from yq v4.53.3 on `{a: {b: 1}, c: [10, 20], n: 0, m: 1}` (flow
+/// and block spellings alike; the full capture is
+/// `test_as_binding_keeps_the_input_identity_2563` in `tests/yq_cli_tests.rs`):
+///
+/// ```text
+/// .a.b | . as $x | key                    "b"
+/// .a.b | . as $x | path                   ["a","b"]
+/// .a.b | . as $x | parent | key           "a"
+/// .a.b | . as $x | [$x, key]              [1,"b"]
+/// .a.b | (. as $x | key) | . + "y"        "by"
+/// .a.b | . as $x | . as $y | key          "b"
+/// .a | to_entries | .[0] | . as $e | key  0
+/// .a? | . as $x | key                     "a"
+/// ```
+///
+/// The bind source's own outputs are collected before the body runs, the
+/// same eager bind `each_as_generic` performs, and an escape it raised is
+/// reported after every value it did produce -- the "deliver the prefix,
+/// then the escape" rule the rest of this route follows (#2495).
+#[allow(clippy::too_many_arguments)] // STYLE-0004: the four parts of the
+                                     // binding (`bind`/`var`/`body`/`rest`)
+                                     // plus this route's own
+                                     // value/identity/optional/sink quartet,
+                                     // every one threaded straight into the
+                                     // recursive `eval_owned_identity_pipe`
+                                     // call below.
+fn eval_owned_identity_as<S: EvalSemantics, V: DocumentValue>(
+    bind: &Expr,
+    var: &str,
+    body: &Expr,
+    rest: &[Expr],
+    value: &OwnedValue,
+    id: &OwnedIdentity<V>,
+    optional: bool,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    // The source stands where this stage stands, so its reads are constants
+    // -- the same rewrite a computed navigation component gets, and the same
+    // predicate gated it (`owned_identity_bind_supported`).
+    let resolved = match owned_identity_resolve_component::<S, V>(bind, id) {
+        Ok(e) => e,
+        Err(e) => return Flow::Escaped(Control::Error(e)),
+    };
+    let (bound_values, control) = owned_identity_values::<S>(&resolved, value, optional);
+    for bound in bound_values {
+        // `bind`, not `resolved`: `is_identity_passthrough` is a question
+        // about what the user wrote, and the rewrite only replaces reads
+        // inside it.
+        let substituted = substitute_bound_var(bind, body, var, &bound);
+        let mut stages: Vec<Expr> = owned_identity_body_stages(&substituted).to_vec();
+        stages.extend_from_slice(rest);
+        match eval_owned_identity_pipe::<S, V>(&stages, value.clone(), id.clone(), optional, sink) {
+            Flow::Exhausted => {}
+            other => return other,
+        }
+    }
+    match control {
+        Some(control) => Flow::Escaped(control),
+        None => Flow::Exhausted,
+    }
+}
+
 /// Continue a pipe from one owned value carrying its identity, honouring
 /// `sink`'s demand. Escapes from a downstream stage are carried out through
 /// `pending`, the same way [`eval_each_pipe_generic`]'s own driver does.
@@ -17245,6 +17369,11 @@ fn eval_owned_identity_pipe<S: EvalSemantics, V: DocumentValue>(
                 Ok(None) => Flow::Exhausted,
                 Err(e) => Flow::Escaped(Control::Error(e)),
             }
+        }
+        // spine 2416 (#2563): the binding keeps this stage's identity for
+        // its body -- see [`eval_owned_identity_as`].
+        Expr::As { expr, var, body } => {
+            eval_owned_identity_as::<S, V>(expr, var, body, rest, &value, &id, optional, sink)
         }
         _ => {
             let Some(rule) = owned_identity_rule(stage) else {
@@ -26859,7 +26988,50 @@ mod tests {
         assert!(eager(".a? | .b |= key"));
         assert!(eager(".a? | explode | key"));
         assert!(eager(".a? | map(key + \"x\")"));
-        assert!(eager(".a? | . as $x | key"));
+        // #2563: an `as` stage has an identity rule now -- the binding keeps
+        // the input's position for its body -- so a `?` head no longer keeps
+        // the pipe eager just because the stage after it binds a variable.
+        assert!(!eager(".a? | . as $x | key"));
+        assert!(!eager(".a.b | . as $x | key + \"x\""));
+        assert!(!eager(".a.b | . as $x | path + []"));
+        assert!(!eager(".a.b | . as $x | file_index + 1"));
+        assert!(!eager(".a.b | . as $x | [key] + [\"x\"]"));
+        assert!(!eager(".a.b | . as $x | (key + \"x\") | . == \"bx\""));
+        assert!(!eager(".a.b | . as $x | (key + \"x\") | {\"z\": .}"));
+        assert!(!eager(".a.b | . as $x | . as $y | key"));
+        assert!(!eager(".a.b | (. as $x | key) | . + \"y\""));
+        assert!(!eager(".a.b | (key) as $k | key"));
+        assert!(!eager(".c[.n] | . as $x | key"));
+        assert!(!eager(".c[.n]? | . as $x | key"));
+        // A `getpath` head is not navigation the walk models, so `is_node`
+        // is already false by the time the `as` stage is reached and the
+        // gate answers `true` -- but the absent route takes the pipe first
+        // now, the same "the gate is not the route that answers" split the
+        // `?`-headed rows above record.
+        assert!(eager(".a | getpath([\"b\"]) | . as $x | key"));
+        assert!(
+            path_context_absent_split(&pipe_stages(".a | getpath([\"b\"]) | . as $x | key"))
+                .is_some()
+        );
+        // ...but only where the *body* is itself something this pipe can
+        // follow. A body stage with no `owned_identity_rule` keeps the whole
+        // pipe eager exactly as it did before, and so does a bare `$x` stage
+        // (`Expr::Var` has no rule before substitution and `Expr::TrackedVar`
+        // has none after, so the gate refuses it either way).
+        assert!(eager(".a.b | . as $x | (key and parent)"));
+        assert!(eager(".a.b | . as $x | map(key + \"x\")"));
+        assert!(eager(".a.b | . as $x | $x | key"));
+        assert!(eager(".a.b | . as $x | reduce (key) as $k (\"\"; . + $k)"));
+        assert!(eager(".a.b | . as $x | label $o | (key, break $o)"));
+        // A bind source whose own reads cannot be resolved at this position
+        // (`parent` is a node, not a constant) is refused too.
+        assert!(eager(".a.b | (parent | key) as $k | key"));
+        // Destructuring and `?//` keep their pipes on the eager evaluator:
+        // `Expr::AsPattern`'s alternative-fallthrough rule has one
+        // definition (`each_pattern_alternatives_generic`) and no second one
+        // here.
+        assert!(eager(".a.b | . as [$x] | key"));
+        assert!(eager(".a? | . as [$x] | key"));
         assert!(eager(".[]? | .k | select(key == \"k\")"));
         assert!(!eager(".a[] | select(true) | key"));
         // #2471 (gate reason 1 of spine 2416), the head-of-pipe half: a

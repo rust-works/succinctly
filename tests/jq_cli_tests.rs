@@ -39264,6 +39264,95 @@ fn test_jq_update_filter_position_is_a_succinctly_extension_2522() -> Result<()>
 /// The `key`/`path`/`parent` rows are succinctly's jq-mode extension
 /// (`jq: error: key/0 is not defined` in real jq), so they follow yq's model
 /// for the builtin and jq's for the component.
+/// spine 2416 (#2563): an `as` stage keeps the input's identity for its body.
+///
+/// `owned_identity_rule` had no entry for `Expr::As`, so once a pipe had left
+/// the cursor domain -- an absent position, a value a stage had rebuilt -- a
+/// binding made `owned_identity_pipe_supported` decline and the gate handed
+/// the whole pipe to the eager evaluator. The rule is that the body's `.` is
+/// the node the stage stood on and the bound variable is a value: the body is
+/// spliced into the pipe with `$var` substituted the way `each_as_generic`
+/// already substitutes it.
+///
+/// jq 1.7.1 has no `key`/`parent`/`path/0` to capture, so what it pins here is
+/// that a binding is *transparent to a path expression* -- `path(...)` and
+/// `paths` see through it -- and that the destructuring spellings bind what jq
+/// binds. Captured 2026-09-07 from `/usr/bin/jq` 1.7.1 (`jq -c`) on the
+/// document below:
+///
+/// ```text
+/// $ jq 'path(. as $x | .a)'               ["a"]
+/// $ jq 'path(.a as $x | .c)'              ["c"]
+/// $ jq 'path(. as $x | $x | .a)'          ["a"]
+/// $ jq 'path(.a | . as $x | .b)'          ["a","b"]
+/// $ jq 'path(.a.b | . as $x | .)'         ["a","b"]
+/// $ jq '.a | . as $x | [paths]'           [["b"]]
+/// $ jq '[.a | . as $x | paths]'           [["b"]]
+/// $ jq '.a.b | . as $x | $x'              1
+/// $ jq '.a | . as {b: $b} | $b'           1
+/// $ jq '.c | . as [$x] | $x'              10
+/// $ jq '.c | . as {b: $b} ?// [$b] | $b'  10
+/// $ jq '.zzz as $v | [$v]'                [null]
+/// $ jq '.a.b | . as $x | del(.)'          null
+/// ```
+///
+/// The `key`/`path` rows below are succinctly's own extension surface (real
+/// jq answers `key/0 is not defined`), pinned so the route change is readable
+/// as "same answers, different route": every one of them is unchanged from
+/// before #2563, which is the whole claim.
+#[test]
+fn test_as_binding_keeps_the_input_identity_2563() -> anyhow::Result<()> {
+    let doc = r#"{"a":{"b":1},"c":[10,20],"n":0,"m":1,"s":"hi"}"#;
+    for (filter, want) in [
+        // The jq-captured half.
+        ("path(. as $x | .a)", "[\"a\"]"),
+        ("path(.a as $x | .c)", "[\"c\"]"),
+        ("path(. as $x | $x | .a)", "[\"a\"]"),
+        ("path(.a | . as $x | .b)", "[\"a\",\"b\"]"),
+        ("path(.a.b | . as $x | .)", "[\"a\",\"b\"]"),
+        (".a | . as $x | [paths]", "[[\"b\"]]"),
+        ("[.a | . as $x | paths]", "[[\"b\"]]"),
+        (".a.b | . as $x | $x", "1"),
+        (".a | . as {b: $b} | $b", "1"),
+        (".c | . as [$x] | $x", "10"),
+        (".c | . as {b: $b} ?// [$b] | $b", "10"),
+        (".zzz as $v | [$v]", "[null]"),
+        (".a.b | . as $x | del(.)", "null"),
+        // The same positions through the extension builtins the identity
+        // route now answers across a binding.
+        (".a.b | . as $x | key", "\"b\""),
+        (".a.b | . as $x | path", "[\"a\",\"b\"]"),
+        (".a.b | . as $x | key + \"x\"", "\"bx\""),
+        (".a.b | . as $x | path + []", "[\"a\",\"b\"]"),
+        (".a.b | . as $x | file_index + 1", "1"),
+        (".a.b | . as $x | [key] + [\"x\"]", "[\"b\",\"x\"]"),
+        (".a.b | . as $x | parent | key", "\"a\""),
+        (".a.b | . as $x | [$x, key]", "[1,\"b\"]"),
+        (".a.b | (. as $x | key) | . + \"y\"", "\"by\""),
+        (".a.b | . as $x | . as $y | key", "\"b\""),
+        (".a? | . as $x | key", "\"a\""),
+        (".a.x | . as $x | path", "[\"a\",\"x\"]"),
+        (".c[.n] | . as $x | key", "0"),
+        (".c[.n]? | . as $x | key", "0"),
+        (".a | to_entries | .[0] | . as $e | key", "0"),
+        // The `KeyNode` rule (#2471) reached across a binding: `key` keeps the
+        // position, a *second* `key` emits nothing.
+        (".a.b | . as $x | key | key", ""),
+        (".a.b | . as $x | key | path", "[\"a\",\"b\"]"),
+        (".a.b | . as $x | tostring | key", "\"b\""),
+        // A body stage with no `owned_identity_rule` keeps the whole pipe on
+        // the eager evaluator; its answers are unchanged either way, which is
+        // what makes the refusal free.
+        (".a.b | . as $x | (key and parent)", "true"),
+        (".c | . as [$x] | key + \"x\"", "\"cx\""),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "`{filter}`: {out:?} {err}");
+        assert_eq!(out.trim_end(), want, "`{filter}`");
+    }
+    Ok(())
+}
+
 #[test]
 fn test_computed_bracket_head_is_walkable_2471() -> anyhow::Result<()> {
     let doc = r#"{"a":{"b":1},"c":[10,20],"n":0,"m":1,"s":"hi","k":"b","neg":-1}"#;

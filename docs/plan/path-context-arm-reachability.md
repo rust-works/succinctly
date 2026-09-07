@@ -128,9 +128,9 @@ trusting them.
 
 | #   | Handler (site in `eval_stage_with_path_context`)                   | Verdict   | Proof query (jq mode, document `D`)                   | Gate |
 |-----|--------------------------------------------------------------------|-----------|-------------------------------------------------------|------|
-| H1  | pre-match `if matches!(first, Expr::Builtin(Builtin::PathNoArg))`  | REACHABLE | `.a.b \| . as $x \| path + []`                         | R2   |
-| H2  | pre-match `if matches!(first, Expr::Builtin(Builtin::Key))`        | REACHABLE | `.a.b \| . as $x \| key + "x"`                         | R2   |
-| H3  | pre-match `if matches!(first, Expr::Builtin(Builtin::FileIndex))`  | REACHABLE | `.a.b \| . as $x \| file_index + 1`                    | R2   |
+| H1  | pre-match `if matches!(first, Expr::Builtin(Builtin::PathNoArg))`  | REACHABLE | `.a.b \| reduce (path) as $p ([]; . + $p) \| . + ["x"]` | R2   |
+| H2  | pre-match `if matches!(first, Expr::Builtin(Builtin::Key))`        | REACHABLE | `.a.b \| reduce (key) as $k (""; . + $k) \| . + "x"`   | R2   |
+| H3  | pre-match `if matches!(first, Expr::Builtin(Builtin::FileIndex))`  | REACHABLE | `.a.b \| reduce (file_index) as $f (0; . + $f) \| . + 1` | R2 |
 | H4  | pre-match `if matches!(first, Expr::Builtin(Builtin::Parent))`     | REACHABLE | `.a.b \| parent + {}`                                 | R2   |
 | H5  | pre-match `if let Expr::Builtin(Builtin::ParentN(n_expr)) = first` | REACHABLE | `.a.b \| parent(0+1) + {}`                            | R2   |
 | A01 | `Expr::Identity`                                                   | REACHABLE | `.a.b \| . \| parent + {}`                            | R2   |
@@ -139,33 +139,33 @@ trusting them.
 | A04 | `Expr::Slice { .. }`                                               | REACHABLE | `.c[0:1] \| .[0] \| key + 1`                          | R1   |
 | A05 | `Expr::Iterate`                                                    | REACHABLE | `.a[] \| (key \| tostring)`                            | R3   |
 | A06 | `Expr::Paren(inner)`                                               | REACHABLE | `.a.b \| (parent) + {}`                               | R2   |
-| A07 | `Expr::Optional(inner) if IndexExpr/SliceExpr`                     | REACHABLE | `.c[.n]? \| . as $x \| key`                            | R2   |
-| A08 | `Expr::Optional(inner)`                                            | REACHABLE | `.a? \| . as $x \| key`                                | R2   |
-| A09 | `Expr::Pipe(inner) if rest.is_empty()`                             | REACHABLE | `.a.b \| -(key\|length)`                              | R2   |
+| A07 | `Expr::Optional(inner) if IndexExpr/SliceExpr`                     | REACHABLE | `.c[.n]? \| (key and parent)`                          | R2   |
+| A08 | `Expr::Optional(inner)`                                            | REACHABLE | `.a? \| (key and parent)`                              | R2   |
+| A09 | `Expr::Pipe(inner) if rest.is_empty()`                             | REACHABLE | `.a[] \| (key \| tostring)`                            | R3   |
 | A10 | `Expr::Pipe(inner)`                                                | REACHABLE | `.a.b \| parent + {}`                                 | R2   |
 | A11 | `Expr::Arithmetic { .. }`                                          | REACHABLE | `.a.b \| parent + {}`                                 | R2   |
 | A12 | `Expr::And(..) \| Expr::Or(..)`                                    | REACHABLE | `.a.b \| . as $x \| (key and parent)`                  | R2   |
-| A13 | `Expr::Negate(operand)`                                            | REACHABLE | `.a.b \| -(key\|length)`                              | R2   |
-| A14 | `Expr::Compare { .. }`                                             | REACHABLE | `.a.b \| . as $x \| (key + "x") \| . == "bx"`          | R2   |
+| A13 | `Expr::Negate(operand)`                                            | REACHABLE | `.a.b \| -(parent\|length)`                            | R2   |
+| A14 | `Expr::Compare { .. }`                                             | REACHABLE | `.a.b \| (parent \| length) == 1`                      | R2   |
 | A15 | `Expr::Builtin(Builtin::Select(cond))`                             | REACHABLE | `.a.b \| select(key == "b") \| parent + {}`           | R2   |
 | A16 | `Expr::Builtin(Builtin::Map(f))`                                   | REACHABLE | `.a \| map(key + "x")`                                | R2   |
-| A17 | `Expr::Builtin(Builtin::GetPath(path_expr))`                       | REACHABLE | `.a \| getpath(["b"]) \| . as $x \| key`              | R1   |
+| A17 | `Expr::Builtin(Builtin::GetPath(path_expr))`                       | REACHABLE | `.a \| getpath(["b"]) \| (key and parent)`            | R1   |
 | A18 | `Expr::Builtin(_)`                                                 | REACHABLE | `.a[] \| (key \| length)`                             | R3   |
-| A19 | `Expr::IndexExpr { target, key }`                                  | REACHABLE | `.c[.n] \| . as $x \| key`                             | R2   |
+| A19 | `Expr::IndexExpr { target, key }`                                  | REACHABLE | `.c[.n] \| (key and parent)`                           | R2   |
 | A20 | `Expr::SliceExpr { target, start, end }`                           | REACHABLE | `.c[.n:.m] \| .[0] \| key + 1`                        | R1   |
-| A21 | `Expr::Array(inner) if needs_path_context(inner)`                  | REACHABLE | `.a.b \| . as $x \| [key] + ["x"]`                     | R2   |
+| A21 | `Expr::Array(inner) if needs_path_context(inner)`                  | REACHABLE | `.a.b \| [(key and parent)] + ["x"]`                   | R2   |
 | A22 | `Expr::StringInterpolation(parts) if ..`                           | REACHABLE | `.a.b \| ("\(key)") \| . + "x"`                       | R2   |
 | A23 | `Expr::DefCall { .. }`                                             | REACHABLE | `def f: key; .a.b \| f + "x"`                         | R2   |
 | A24 | `Expr::Shared(inner)`                                              | REACHABLE | `def f(x): x; .a.b \| f(key) + "z"`                   | R2   |
 | A25 | `Expr::FuncDef { .. }`                                             | REACHABLE | `.a.b \| def f: key; f + "x"`                         | R2   |
-| A26 | `Expr::As { .. } if ..`                                            | REACHABLE | `.a.b \| . as $x \| key + "x"`                        | R2   |
+| A26 | `Expr::As { .. } if ..`                                            | REACHABLE | `.a.b \| . as $x \| (key and parent)`                  | R2   |
 | A27 | `Expr::AsPattern { .. } if ..`                                     | REACHABLE | `.c \| . as [$x] \| key + "x"`                        | R2   |
 | A28 | `Expr::Limit { n, expr } if ..`                                    | REACHABLE | `.a.b \| limit(1; key + "x")`                         | R2   |
 | A29 | `Expr::FirstExpr(expr) if ..`                                      | REACHABLE | `.a.b \| first(key + "x")`                            | R2   |
 | A30 | `Expr::LastExpr(expr) if ..`                                       | REACHABLE | `.a.b \| last(key + "x")`                             | R2   |
 | A31 | `Expr::Reduce { .. } if ..`                                        | REACHABLE | `.a.b \| reduce (key) as $k (""; . + $k) \| . + "x"`  | R2   |
 | A32 | `Expr::Foreach { .. } if ..`                                       | REACHABLE | `.a.b \| foreach (key) as $k (""; . + $k) \| . + "x"` | R2   |
-| A33 | `Expr::Object(_) \| Expr::Array(_) \| Expr::Literal(_)`            | REACHABLE | `.a.b \| . as $x \| (key + "x") \| {z: .}`             | R2   |
+| A33 | `Expr::Object(_) \| Expr::Array(_) \| Expr::Literal(_)`            | REACHABLE | `.a.b \| . as $x \| (key and parent) \| {z: .}`         | R2   |
 | A34 | `Expr::If { .. }`                                                  | REACHABLE | `.a.b \| if key == "b" then key + "x" else "y" end`   | R2   |
 | A35 | `Expr::Comma(exprs)`                                               | REACHABLE | `.a.b \| (key + "x"), key`                            | R2   |
 | A36 | `Expr::Try { .. }`                                                 | REACHABLE | `.a.b \| try (key + "x") catch "e"`                   | R2   |
@@ -742,6 +742,116 @@ number with string "b"` on the eager route, whose `Expr::IndexExpr` arm never go
 scalar rule. The walk is the side that matches the oracle, so the row is not asserted as
 "the routes agree"; the eager arm's missing rule is a separate fix.
 
+## #2563: an `as` binding gets an identity rule, and the pin still holds at 44
+
+[#2563](https://github.com/rust-works/succinctly/issues/2563) is the first of the
+`R2` cluster's *stage* shapes -- the ones with no `owned_identity_rule`, which the
+"Notes for the next migration" section below names as the remaining move for that
+reason. Every re-derived proof query the last three sections produced was spelled
+through the same shape (`.a.b | . as $x | key`), because `Expr::As` had no rule: a
+binding made `owned_identity_pipe_supported` decline, so `path_context_absent_split`
+found no route for `rest` and the gate handed the whole pipe over.
+
+An `as` stage keeps the input's identity for its body -- the body's `.` is the node
+the stage stood on, which is what real yq does (`.a.b | . as $x | key` is `"b"` in
+v4.53.3, `. as $x | parent | key` is `"a"`) -- and the bound variable is a value.
+`eval_owned_identity_as` evaluates the bind source at the stage's own position (its
+`key`/`path`/`file_index` reads resolve to constants, the same rewrite a computed
+navigation component gets), substitutes each bound value into the body with the
+`substitute_bound_var` the generic route already uses, and splices the substituted
+body in front of `rest` through the same pipe -- so every stage rule stays a single
+definition. `Expr::AsPattern` (destructuring, `?//`) is deliberately **not**
+admitted: its alternative-fallthrough rule lives in
+`each_pattern_alternatives_generic` and has no second definition here, and real yq's
+lexer rejects both spellings outright.
+
+**`PINNED_ARM_COUNT` stays at 44.** Re-run of the method above on the post-change
+tree, with all 44 handlers *and* the gate's three disjuncts instrumented, against a
+pre-change build of the same worktree (base `b05069ad5`) instrumented identically --
+so "moved" is measured, not inferred. Eleven of the 44 listed proof queries stop
+reaching any arm; **all eleven arms are still reachable** and the table above now
+carries the re-derived query for each (outputs pinned in
+`test_arm_audit_proof_queries_are_unmoved_by_the_gate_2416` alongside the old
+spellings). Document `D`:
+
+| Id  | Listed query before                         | Re-derived query                                       | Gate | Marker | Output          |
+|-----|---------------------------------------------|--------------------------------------------------------|------|--------|-----------------|
+| H1  | `.a.b \| . as $x \| path + []`               | `.a.b \| reduce (path) as $p ([]; . + $p) \| . + ["x"]` | R2   | fired  | `["a","b","x"]` |
+| H2  | `.a.b \| . as $x \| key + "x"`               | `.a.b \| reduce (key) as $k (""; . + $k) \| . + "x"`    | R2   | fired  | `"bx"`          |
+| H3  | `.a.b \| . as $x \| file_index + 1`          | `.a.b \| reduce (file_index) as $f (0; . + $f) \| . + 1` | R2  | fired  | `1`             |
+| A07 | `.c[.n]? \| . as $x \| key`                  | `.c[.n]? \| (key and parent)`                           | R2   | fired  | `true`          |
+| A08 | `.a? \| . as $x \| key`                      | `.a? \| (key and parent)`                               | R2   | fired  | `true`          |
+| A14 | `.a.b \| . as $x \| (key + "x") \| . == "bx"` | `.a.b \| (parent \| length) == 1`                       | R2   | fired  | `true`          |
+| A17 | `.a \| getpath(["b"]) \| . as $x \| key`     | `.a \| getpath(["b"]) \| (key and parent)`              | R1   | fired  | `true`          |
+| A19 | `.c[.n] \| . as $x \| key`                   | `.c[.n] \| (key and parent)`                            | R2   | fired  | `true`          |
+| A21 | `.a.b \| . as $x \| [key] + ["x"]`           | `.a.b \| [(key and parent)] + ["x"]`                    | R2   | fired  | `[true,"x"]`    |
+| A26 | `.a.b \| . as $x \| key + "x"`               | `.a.b \| . as $x \| (key and parent)`                   | R2   | fired  | `true`          |
+| A33 | `.a.b \| . as $x \| (key + "x") \| {z: .}`   | `.a.b \| . as $x \| (key and parent) \| {z: .}`         | R2   | fired  | `{"z":true}`    |
+
+Two things this run found that the change did **not** cause, recorded because they
+were wrong on the page rather than in the code:
+
+- **`A09` and `A13` were already stale.** Their listed query
+  (`.a.b | -(key|length)`) reaches *no* arm on the pre-change build either -- the
+  gate's `R3` marker fires from `path_context_single_native`'s own nested
+  consultation (the caveat below), while the pipe itself is answered by the owned
+  identity pipe, which has had an `Expr::Negate` arm since #2471. Both are still
+  reachable and both are re-derived above: `A09` on `.a[] | (key | tostring)`
+  (`R3`, `"b"`) and `A13` on `.a.b | -(parent|length)` (`R2`, `-1`), a `parent`
+  *operand* being the one read no route can name a position for.
+- **`A26` is the arm the migration was aimed at and it survives.** `and`/`or` has
+  no `owned_identity_rule`, so a body built from one still keeps the binding's
+  whole pipe eager, and the eager `Expr::As` arm is what steps the binding once it
+  does. The same holds for `map`, `reduce`/`foreach`, `label`/`def` and the bounded
+  consumers -- the rest of the `R2` stage cluster. **This change lowers no arm's
+  reachability to zero**, and the reason is the same structural one #2472 and #2473
+  recorded: an admission removes a *reason* for one stage shape, not the arm.
+
+The other 33 rows report the same disjunct and the same output they reported before,
+verified in the same run.
+
+### What the change is measured against
+
+A differential over 2,544 queries per mode (sixteen heads x five binders x
+thirty-three bodies, minus the `$x` rows whose binder does not bind one) on
+`{"a":{"b":1,"e":2},"c":[10,20],"n":0,"m":1,"s":"hi","u":null}`, comparing the
+pre-change binary, the post-change binary and the oracle. In yq mode: **136 answers
+changed, 114 of them from disagreeing with yq v4.53.3 to agreeing with it, 5 read as
+moving away and 17 changed without reaching agreement.**
+
+All 5 "away" rows and 11 of the 17 "neither" rows have the same head, `.c[-1]`, and
+the same cause -- a pre-existing walk defect this change makes reachable rather than
+introduces. `path_step_generic`'s `Expr::Index` arm resolves a negative index for the
+path *component* (`.c[-1] | key` is `1`, ADR-0021 decision 5) but still looks the
+element up with the index **as written** (`usize::try_from(idx)`, which fails for a
+negative `idx`), so the position it produces is `PathNode::Absent` and the value
+`rest` reads is `null`. It is demonstrable with no `as` anywhere in the filter, on
+the pre-change binary: `.c[-1] | [., key]` is `[null,1]` where yq answers `[20,1]`.
+The `as` rule routes more shapes through that position, so `.c[-1] | . as $x |
+map(key)` goes from `20` (eager, right) to `[]` (walked, wrong). Even on that head
+the change is net positive (48 toward, 5 away, 11 neither -- the `key` resolution
+dominates); fixing the lookup is a separate correctness change with its own
+differential, not part of this migration.
+
+The remaining 6 "neither" rows are two shapes, both sanctioned: four are
+`.a.x.y | ... | parent` answering `null` where the eager route answered `{}`, which
+ADR-0021 decision 7 records as the same answer for the same position (#2472), and
+two are `key | key` after a `getpath` head now applying `OwnedIdentityRule::KeyNode`
+(`.a.b | key | key` prints nothing in yq v4.53.3, where the eager evaluator prints
+`"b"`).
+
+The jq-mode half of the same matrix reports **168 changed**, of which 68 share the
+`.c[-1]` head above. jq 1.7.1 defines none of `key`/`parent`/`path/0`, so there is no
+oracle row to classify the rest against; what it *does* define -- `path(...)`,
+`paths`, destructuring and `?//` binding -- is pinned unchanged in
+`test_as_binding_keeps_the_input_identity_2563` (`tests/jq_cli_tests.rs`), all
+thirteen rows captured from `/usr/bin/jq` 1.7.1. The yq-mode captures are in the
+same-named test in `tests/yq_cli_tests.rs`, on a flow document and its block
+spelling, which yq answers identically.
+
+The instrumentation was reverted before this document was committed; nothing in the
+tree carries it.
+
 ## Result
 
 | Metric                                            | Before | After                 |
@@ -755,6 +865,7 @@ scalar rule. The walk is the side that matches the oracle, so the row is not ass
 | ... starved by #2522                               | --     | 0 (no row's query assigns) |
 | ... starved by #2558                               | --     | 0 (9 `?`-headed rows re-derived) |
 | ... starved by #2471's head-of-pipe half           | --     | 0 (`A07`/`A19` re-derived)       |
+| ... starved by #2563                                | --     | 0 (11 `as`-spelled rows re-derived) |
 | `PINNED_ARM_COUNT`                                 | 43     | 44                    |
 
 Nothing is deletable at this point in the spine. Doors 2 and 3 are closed as
@@ -788,14 +899,25 @@ evaluator, with no second route to check.
   rows needed a re-derived query and *none* of them was unreachable, so a table
   read without re-running would have claimed 14 deletable arms.
 - The `R2` cluster is now the *stage* shapes with no `owned_identity_rule`
-  (`and`/`or`, `map`, `reduce`/`foreach`, `as`/`label`/`def`, the bounded
-  consumers) plus a bare `parent` operand. #2473 gave `and`/`or` and
+  (`and`/`or`, `map`, `reduce`/`foreach`, `label`/`def`, `as PATTERN`, the
+  bounded consumers) plus a bare `parent` operand. #2473 gave `and`/`or` and
   `reduce`/`foreach` native `eval_single` arms, which removes `R3` for them but
   **not** `R2`: a native stage still hands over when the head can miss and no
   route can name the position. Giving those stages an `owned_identity_rule` is
   the remaining move for this reason; widening the absent route again buys
   nothing, because it already accepts every `rest` those stages are missing
-  from.
+  from. **`as $var` came off that list with #2563** (section above), and it is
+  the worked example of what such a rule buys and what it does not: eleven of
+  the 44 proof queries had to be re-derived and not one arm died, because every
+  other member of the cluster is still a body an `as` can hold.
+- **A defect this page's method surfaced, not caused (#2563's differential).**
+  `path_step_generic`'s `Expr::Index` arm resolves a negative index for the path
+  *component* but looks the element up with the index as written, so the walk
+  stands on `PathNode::Absent` where the element exists: on `c: [10, 20]`,
+  `.c[-1] | [., key]` is `[null,1]` here and `[20,1]` in yq v4.53.3, with no
+  `as`, no computed bracket and no `?` in the filter. It predates #2563 and is
+  reproducible on `b05069ad5`; every route that widens makes it reachable from
+  more shapes.
 - **`?` at the head was the single biggest source of `R2`; #2558 closed it.**
   It is admitted to `path_context_is_navigational` now, and what it does on a
   *scalar* input is the question that had to be answered: the step is

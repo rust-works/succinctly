@@ -37094,6 +37094,14 @@ const OPTIONAL_HEAD_FLOW_2558: &str = "{\"a\": {\"b\": 1}, \"c\": [10, 20], \"s\
 /// not part of this rule, and asserting on both is what says so.
 const OPTIONAL_HEAD_BLOCK_2558: &str = "a:\n  b: 1\nc:\n  - 10\n  - 20\ns: hi\n";
 
+/// The flow-style document #2563's `as`-binding rows were captured on.
+const AS_BINDING_FLOW_2563: &str =
+    "{\"a\": {\"b\": 1}, \"c\": [10, 20], \"n\": 0, \"m\": 1, \"s\": \"hi\"}\n";
+
+/// The block-style spelling of [`AS_BINDING_FLOW_2563`]. Every row below was
+/// captured on both and yq v4.53.3 answers them identically.
+const AS_BINDING_BLOCK_2563: &str = "a:\n  b: 1\nc:\n  - 10\n  - 20\nn: 0\nm: 1\ns: hi\n";
+
 /// The flow-style document #2471's computed-bracket rows were captured on.
 const COMPUTED_HEAD_FLOW_2471: &str =
     "{\"a\": {\"b\": 1}, \"c\": [10, 20], \"n\": 0, \"m\": 1, \"s\": \"hi\", \"k\": \"b\", \"neg\": -1}\n";
@@ -37335,6 +37343,116 @@ fn test_optional_head_is_walkable_2558() -> Result<()> {
             stderr.contains("index [-5] out of range, array size is 2"),
             "`{doc}`: {stderr:?}"
         );
+    }
+    Ok(())
+}
+
+/// spine 2416 (#2563): an `as` stage keeps the input's identity for its body.
+///
+/// `owned_identity_rule` had no entry for `Expr::As`, so once a pipe had left
+/// the cursor domain -- an absent position, a value a stage had rebuilt -- a
+/// binding made `owned_identity_pipe_supported` decline and the gate handed
+/// the whole pipe to the eager evaluator. The rule real yq shows is that the
+/// body's `.` is the node the stage stood on: `key`/`path`/`parent` inside the
+/// body answer exactly as they do without the binding, and the bound variable
+/// is a value spliced in.
+///
+/// Captured 2026-09-07 from Homebrew yq v4.53.3 (`yq -o=json -I=0`), on both
+/// documents above, byte-identical between the two:
+///
+/// ```text
+/// $ yq '.a.b | . as $x | key'                        "b"
+/// $ yq '.a.b | . as $x | path'                       ["a","b"]
+/// $ yq '.a.b | . as $x | key + "x"'                  "bx"
+/// $ yq '.a.b | . as $x | path + []'                  ["a","b"]
+/// $ yq '.a.b | . as $x | file_index + 1'             1
+/// $ yq '.a.b | . as $x | [key] + ["x"]'              ["b","x"]
+/// $ yq '.a.b | . as $x | parent'                     {"b":1}
+/// $ yq '.a.b | . as $x | parent | key'               "a"
+/// $ yq '.a.b | . as $x | [$x, key]'                  [1,"b"]
+/// $ yq '.a.b | . as $x | ($x | key)'                 "b"
+/// $ yq '.a.b | (. as $x | key) | . + "y"'            "by"
+/// $ yq '.a.b | . as $x | . as $y | key'              "b"
+/// $ yq '.a.b | . as $x | select(key == "b") | path'  ["a","b"]
+/// $ yq '.a? | . as $x | key'                         "a"
+/// $ yq '.a? | . as $x | path'                        ["a"]
+/// $ yq '.a.x | . as $x | key'                        "x"
+/// $ yq '.a.x | . as $x | path'                       ["a","x"]
+/// $ yq '.c[.n] | . as $x | key'                      0
+/// $ yq '.c[.n]? | . as $x | key'                     0
+/// $ yq '.a | to_entries | .[0] | . as $e | key'      0
+/// $ yq '.a.b | . as $x | key | key'                  (nothing)
+/// $ yq '.a.b | . as $x | tostring | key'             "b"
+/// $ yq '.a.b | . as $x | length'                     1
+/// $ yq '. as $x | key'                               (nothing)
+/// $ yq '. as $x | path'                              []
+/// $ yq '.a.b as $x | $x'                             1
+/// $ yq '.c[] | . as $x | key'                        0 1
+/// $ yq '.a.b | . as $x | (key and parent)'           true
+/// ```
+///
+/// `.a.b | . as $x | key | key` is the row the migration *changes*: it
+/// answered `"b"` before, because the eager evaluator has no key-node flag,
+/// and matches yq's own nothing now (#2471's `OwnedIdentityRule::KeyNode`,
+/// reached across a binding for the first time).
+///
+/// Four rows captured in the same run are **not** asserted here, because they
+/// diverge from yq before this change as much as after it -- none is caused by
+/// the `as` rule, and each is reproducible with a binding that reads no path
+/// context at all:
+///
+/// ```text
+/// $ yq '.zzz as $v | [$v]'            []          succinctly [null]  (#2470/#2481)
+/// $ yq '(.zzz | key) as $k | $k'      (nothing)   succinctly "zzz"
+/// $ yq '(.zzz | key) as $k | $k + 1'  1           succinctly "zzz1"
+/// $ yq '.a.b | .c as $x | key'        "b"         succinctly (nothing)
+/// ```
+///
+/// The first three are yq's read-only-context rule for a key lookup that finds
+/// nothing (#2470), which succinctly applies to the *walk* but not to a bind
+/// source evaluated by the ordinary owned evaluator; the fourth is the same
+/// rule for a bind source that indexes a scalar (#2482).
+#[test]
+fn test_as_binding_keeps_the_input_identity_2563() -> Result<()> {
+    let args = &["-o", "json", "-I0"];
+    for doc in [AS_BINDING_FLOW_2563, AS_BINDING_BLOCK_2563] {
+        for (filter, expected) in [
+            (".a.b | . as $x | key", "\"b\""),
+            (".a.b | . as $x | path", "[\"a\",\"b\"]"),
+            (".a.b | . as $x | key + \"x\"", "\"bx\""),
+            (".a.b | . as $x | path + []", "[\"a\",\"b\"]"),
+            (".a.b | . as $x | file_index + 1", "1"),
+            (".a.b | . as $x | [key] + [\"x\"]", "[\"b\",\"x\"]"),
+            (".a.b | . as $x | parent", "{\"b\":1}"),
+            (".a.b | . as $x | parent | key", "\"a\""),
+            (".a.b | . as $x | [$x, key]", "[1,\"b\"]"),
+            (".a.b | . as $x | ($x | key)", "\"b\""),
+            (".a.b | (. as $x | key) | . + \"y\"", "\"by\""),
+            (".a.b | . as $x | . as $y | key", "\"b\""),
+            (
+                ".a.b | . as $x | select(key == \"b\") | path",
+                "[\"a\",\"b\"]",
+            ),
+            (".a? | . as $x | key", "\"a\""),
+            (".a? | . as $x | path", "[\"a\"]"),
+            (".a.x | . as $x | key", "\"x\""),
+            (".a.x | . as $x | path", "[\"a\",\"x\"]"),
+            (".c[.n] | . as $x | key", "0"),
+            (".c[.n]? | . as $x | key", "0"),
+            (".a | to_entries | .[0] | . as $e | key", "0"),
+            (".a.b | . as $x | key | key", ""),
+            (".a.b | . as $x | tostring | key", "\"b\""),
+            (".a.b | . as $x | length", "1"),
+            (". as $x | key", ""),
+            (". as $x | path", "[]"),
+            (".a.b as $x | $x", "1"),
+            (".c[] | . as $x | key", "0\n1"),
+            (".a.b | . as $x | (key and parent)", "true"),
+        ] {
+            let (output, code) = run_yq_stdin(filter, doc, args)?;
+            assert_eq!(code, 0, "`{filter}` on `{doc}`: {output:?}");
+            assert_eq!(output.trim_end(), expected, "`{filter}` on `{doc}`");
+        }
     }
     Ok(())
 }

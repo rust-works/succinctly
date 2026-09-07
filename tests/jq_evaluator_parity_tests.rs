@@ -2234,6 +2234,42 @@ fn test_arm_audit_proof_queries_are_unmoved_by_the_gate_2416() {
         // their unchanged listed queries above.
         (r".c[.n] | . as $x | key", &["0"]),
         (r".c[.n]? | . as $x | key", &["0"]),
+        // #2563's re-derived proof queries, same precedent once more: an
+        // `as` stage has an `owned_identity_rule` now (the binding keeps the
+        // input's position for its body), so every `as`-spelled row above --
+        // the eight #2558 re-derivations, the two #2471 head-of-pipe ones,
+        // `.a.b | . as $x | key + "x"` and
+        // `.a | getpath(["b"]) | . as $x | key` -- reports no arm at all.
+        // Eleven rows needed a new spelling; all eleven keep their outputs,
+        // which is what makes the move readable as "same outputs, different
+        // route". Verified with the arms instrumented (2026-09-07, method in
+        // `docs/plan/path-context-arm-reachability.md`): `H1`, `H3`, `A07`,
+        // `A08`, `A13`, `A14`, `A17`, `A19`, `A21` and `A33` each fire on
+        // their row below; `H2` fires on the
+        // `.a.b | reduce (key) as $k ("";  . + $k) | . + "x"` row already
+        // present above, `A09` on `.a[] | (key | tostring)`, and `A26` on
+        // `.a.b | . as $x | (key and parent)` above -- `and`/`or` has no
+        // `owned_identity_rule`, so a body built from one still keeps the
+        // binding's whole pipe on the eager evaluator.
+        (
+            r#".a.b | reduce (path) as $p ([]; . + $p) | . + ["x"]"#,
+            &[r#"["a","b","x"]"#],
+        ),
+        (
+            r".a.b | reduce (file_index) as $f (0; . + $f) | . + 1",
+            &["1"],
+        ),
+        (r".c[.n]? | (key and parent)", &["true"]),
+        (r".a? | (key and parent)", &["true"]),
+        (r".a.b | -(parent|length)", &["-1"]),
+        (r".a.b | (parent | length) == 1", &["true"]),
+        (r#".a | getpath(["b"]) | (key and parent)"#, &["true"]),
+        (r".c[.n] | (key and parent)", &["true"]),
+        (r#".a.b | [(key and parent)] + ["x"]"#, &[r#"[true,"x"]"#]),
+        (
+            r".a.b | . as $x | (key and parent) | {z: .}",
+            &[r#"{"z":true}"#],
+        ),
     ];
     for (filter, expected) in rows {
         // `path + []` is the audit's H1 row spelled against `.a.b`.
