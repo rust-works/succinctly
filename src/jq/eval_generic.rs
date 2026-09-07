@@ -12084,10 +12084,22 @@ fn path_walk_generic<S: EvalSemantics, V: DocumentValue>(
             // `path(.a?)` on an array still emits nothing, because there the
             // error comes before anything is produced -- which is the case
             // the discarded-branch version was checked against.
+            //
+            // #1620: a `decode_failure` is the one error `?` never swallows
+            // -- same rule as `Err(e) if e.is_decode_failure()` elsewhere in
+            // this file. Before #2168 this arm's inner call could not
+            // return one (the whole-document pre-walk always raised it
+            // first), so the unconditional `let _ =` was never wrong; now
+            // that the pre-walk is gone, `path(.a[]?)` on an undecodable
+            // string reached it silently, diverging from plain `.a[]?`
+            // navigation, which does raise.
             let mut branch = Vec::new();
-            let _ = path_walk_generic::<S, V>(inner, node, path, &mut branch);
+            let result = path_walk_generic::<S, V>(inner, node, path, &mut branch);
             out.append(&mut branch);
-            Ok(())
+            match result {
+                Err(e) if e.is_decode_failure() => Err(e),
+                _ => Ok(()),
+            }
         }
         Expr::Comma(exprs) => {
             for e in exprs {
@@ -12391,9 +12403,13 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
                     // identical `decode_failure` before the walk started.
                     // That pre-walk is gone; this is now the place
                     // `path(.a[])`/`.a[] | key` on `{"a":"\ud800"}` raise,
-                    // and the reason `[path(.[])]` still rejects a document
-                    // whose undecodable scalar the iteration reaches while
-                    // `path(.d)` no longer rejects one it never touches.
+                    // and the reason `[path(.[][])]` still rejects a
+                    // document whose undecodable scalar the iteration
+                    // reaches while `path(.d)` no longer rejects one it
+                    // never touches. A single-level `[path(.[])]` does not
+                    // reach this arm at all -- iterating an object/array
+                    // only decodes keys and yields child cursors, it never
+                    // decodes a child scalar's own string content.
                     Err(EvalError::decode_failure(reason))
                 } else if S::TAG == EvalTag::Yq {
                     // #2346: see this arm's `PathNode::Absent` sibling
@@ -12436,12 +12452,20 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
         }
         Expr::Optional(inner) => {
             // Same rule as `path_walk_generic`'s own `Optional` arm: the
-            // error is swallowed, the positions already reached are not.
+            // error is swallowed, the positions already reached are not --
+            // except a `decode_failure` (#1620), which `?` never swallows.
+            // This arm was unreachable before #2168 (the whole-document
+            // pre-walk always raised first); now that it is live, the
+            // unguarded discard let `path((.a[]?)|.x)` answer past an
+            // undecodable string that plain `(.a[])|.x` still raises on.
             let mut branch = Vec::new();
-            let _ =
+            let result =
                 path_step_generic::<S, V>(inner, node, path, collapse_duplicate_keys, &mut branch);
             out.append(&mut branch);
-            Ok(())
+            match result {
+                Err(e) if e.is_decode_failure() => Err(e),
+                _ => Ok(()),
+            }
         }
         // `path_expr_is_cursor_navigable` gates every caller, so nothing else
         // can arrive here.
@@ -13435,66 +13459,128 @@ fn getpath_walk_cursor<S: EvalSemantics, V: DocumentValue>(
             return GenericResult::Owned(OwnedValue::Null);
         }
 
-        if let (Some(fields), OwnedValue::String(key)) = (v.as_object(), segment) {
-            // `find_cursor`, not a hand-rolled scan: it carries the
-            // last-duplicate-wins rule and the #1677/#1995 member checks
-            // for the field it returns, so a corrupted member on the read
-            // path still raises here (STYLE-0013's routed form).
-            match fields.find_cursor(key) {
-                Ok(Some(field)) => {
-                    c = field;
-                    continue;
+        // Dispatch on the segment's own kind before touching `v` at all,
+        // rather than trying every accessor and letting the pattern/filter
+        // discard the ones that don't apply: `is_null`/`as_object`/
+        // `as_array` each independently walk a YAML alias's full chain
+        // (`resolve_alias_chain`), so calling the one the segment can't
+        // possibly use just to throw its result away paid for that walk
+        // for nothing (up to 3x per segment on an aliased node, once here
+        // and again in whichever accessor did apply).
+        match segment {
+            OwnedValue::String(key) => {
+                if let Some(fields) = v.as_object() {
+                    // `find_cursor`, not a hand-rolled scan: it carries the
+                    // last-duplicate-wins rule and the #1677/#1995 member
+                    // checks for the field it returns, so a corrupted
+                    // member on the read path still raises here
+                    // (STYLE-0013's routed form).
+                    return match fields.find_cursor(key) {
+                        Ok(Some(field)) => {
+                            c = field;
+                            continue;
+                        }
+                        Ok(None) => GenericResult::Owned(OwnedValue::Null),
+                        Err(e) if suppresses(&e, optional) => GenericResult::None,
+                        Err(e) => GenericResult::Error(e),
+                    };
                 }
-                Ok(None) => return GenericResult::Owned(OwnedValue::Null),
-                Err(e) if suppresses(&e, optional) => return GenericResult::None,
-                Err(e) => return GenericResult::Error(e),
             }
-        }
-
-        let segment_is_numeric = matches!(
-            segment,
-            OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)
-        );
-        if let Some(elements) = v.as_array().filter(|_| segment_is_numeric) {
-            let len = match elements.len_checked() {
-                Ok(len) => len,
-                Err(e) if suppresses(&e, optional) => return GenericResult::None,
-                Err(e) => return GenericResult::Error(e),
-            };
-            // `resolve_read_index` is jq's own rule, shared with the owned
-            // table rather than restated: a float truncates, a negative
-            // index counts back from the end, and anything landing outside
-            // either end -- NaN included -- reads as `null`.
-            match crate::jq::eval::resolve_read_index(segment, len)
-                .and_then(|idx| elements.get_cursor(idx))
-            {
-                Some(element) => {
-                    c = element;
-                    continue;
+            OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
+                if let Some(elements) = v.as_array() {
+                    let len = match elements.len_checked() {
+                        Ok(len) => len,
+                        Err(e) if suppresses(&e, optional) => return GenericResult::None,
+                        Err(e) => return GenericResult::Error(e),
+                    };
+                    // `resolve_read_index` is jq's own rule, shared with the
+                    // owned table rather than restated: a float truncates,
+                    // a negative index counts back from the end, and
+                    // anything landing outside either end -- NaN included
+                    // -- reads as `null`.
+                    return match crate::jq::eval::resolve_read_index(segment, len)
+                        .and_then(|idx| elements.get_cursor(idx))
+                    {
+                        Some(element) => {
+                            c = element;
+                            continue;
+                        }
+                        None => GenericResult::Owned(OwnedValue::Null),
+                    };
                 }
-                None => return GenericResult::Owned(OwnedValue::Null),
             }
+            // A slice descriptor (`{"start":s,"end":e}`) builds a value the
+            // document does not contain, so the walk stops being a
+            // navigation here.
+            OwnedValue::Object(desc) => {
+                // Array fast path: materialize only the elements the slice
+                // keeps, not the whole container. Slicing is the one shape
+                // that would otherwise defeat this walk's own point --
+                // `getpath(["items", {"start":0,"end":1}])` on a 300K-
+                // element array answering a 1-element slice by deep-cloning
+                // all 300K elements first, the exact whole-container cost
+                // this function exists to avoid (see its own doc comment
+                // above).
+                if let Some(elements) = v.as_array() {
+                    let len = match elements.len_checked() {
+                        Ok(len) => len,
+                        Err(e) if suppresses(&e, optional) => return GenericResult::None,
+                        Err(e) => return GenericResult::Error(e),
+                    };
+                    let range = match SliceBounds::from_descriptor(desc) {
+                        Ok(bounds) => bounds.resolve(len),
+                        Err(_) if optional => return GenericResult::None,
+                        Err(e) => return GenericResult::Error(e),
+                    };
+                    let mut items = vec_with_capacity(range.len());
+                    for idx in range {
+                        // `len_checked`/`resolve` already bound every index
+                        // in `range` to `[0, len)`, so `get_cursor` cannot
+                        // miss here.
+                        let Some(elem) = elements.get_cursor(idx) else {
+                            break;
+                        };
+                        match to_owned_cursor(&elem) {
+                            Ok(owned_elem) => items.push(owned_elem),
+                            Err(e) if suppresses(&e, optional) => return GenericResult::None,
+                            Err(e) => return GenericResult::Error(e),
+                        }
+                    }
+                    let sliced = OwnedValue::Array(items);
+                    return if let Some(rest) = segments.get(i + 1..).filter(|r| !r.is_empty()) {
+                        query_result_to_generic::<V>(
+                            crate::jq::eval::getpath_walk_owned_segments::<Vec<u64>, S>(
+                                &sliced, rest, optional,
+                            ),
+                        )
+                    } else {
+                        GenericResult::Owned(sliced)
+                    };
+                }
+
+                // Not an array: string slicing and yq's object slicing
+                // (#1102) are rarer and smaller in practice, so materialize
+                // just this node -- not the root -- and let the owned table
+                // finish the remaining segments, keeping exactly one
+                // definition of every step past here.
+                let owned = owned_or_suppress!(to_owned_cursor(&c), optional);
+                return query_result_to_generic::<V>(
+                    crate::jq::eval::getpath_walk_owned_segments::<Vec<u64>, S>(
+                        &owned,
+                        &segments[i..],
+                        optional,
+                    ),
+                );
+            }
+            _ => {}
         }
 
-        // A slice descriptor (`{"start":s,"end":e}`) builds a value the
-        // document does not contain, so the walk stops being a navigation
-        // here. Materialize just this node -- not the root -- and let the
-        // owned table finish the remaining segments, so array slicing,
-        // string slicing, yq's object slicing (#1102) and every subsequent
-        // step keep exactly one definition.
-        if matches!(segment, OwnedValue::Object(_)) {
-            let owned = owned_or_suppress!(to_owned_cursor(&c), optional);
-            return query_result_to_generic::<V>(crate::jq::eval::getpath_walk_owned_segments::<
-                Vec<u64>,
-                S,
-            >(&owned, &segments[i..], optional));
-        }
-
-        // Everything else is the owned table's own `_` arm: a type error,
-        // reported with the same helper it uses so both routes word it
-        // identically. `tagged_type_name` rather than `type_name` for the
-        // reason every other cursor-side type error uses it -- an explicit
-        // YAML tag decides the name (#747).
+        // Everything else -- including a segment kind above whose accessor
+        // found `v` isn't that shape -- is the owned table's own `_` arm: a
+        // type error, reported with the same helper it uses so both routes
+        // word it identically. `tagged_type_name` rather than `type_name`
+        // for the reason every other cursor-side type error uses it -- an
+        // explicit YAML tag decides the name (#747).
         return if optional {
             GenericResult::None
         } else {
