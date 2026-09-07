@@ -38,6 +38,26 @@
 //! error-tag semantics and on whether an outer layer already double-catches,
 //! neither of which is visible from the call site. It only demands that
 //! somebody made the decision and wrote it down.
+//! # #2369: what the routing window can and cannot see
+//!
+//! "Routed" is decided by proximity, not data flow -- and #2369 tightened
+//! one half of that and measured the other away.
+//!
+//! **Closed.** The window is now clipped to the expression that *consumes*
+//! the call's `Result` (its enclosing `match`/`if`, when the call is in the
+//! scrutinee), not merely to 20 lines. The median consumer is 4 lines, so an
+//! unrelated `suppresses(` written below a single-materialization function
+//! no longer reads as routing -- the case #2334 left structurally open.
+//! Only the scrutinee counts: a call in a match *arm* is produced there, not
+//! consumed there, and clipping those flagged four correctly-routed sites.
+//!
+//! **Left open, deliberately.** Materializers in functions that take no
+//! `optional` are still invisible. #2369 proposed requiring each to name its
+//! adjudicating caller in its doc comment; measured, that is 51 functions,
+//! many of which *are* the materializers (`to_owned`, `into_owned`,
+//! `to_owned_at_depth`). Enforcing it would be the open-ended tooling
+//! project #2334 warned against for a convention STYLE-0012 already states.
+//! This paragraph is the record of where the gate stops.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -167,6 +187,14 @@ const EXEMPT_MARKER: &str = "STYLE-0012:";
 /// defer their unwrap into a closure (#1800) -- uses the `// STYLE-0012:`
 /// marker to say so instead; that escape hatch is why this can stay a simple
 /// window rather than a data-flow analysis.
+///
+/// #2369: this is no longer the only bound. A site whose `Result` is
+/// consumed by a `match`/`if` -- the dominant shape, `match to_owned(..) {
+/// Ok(v) => v, Err(e) => return suppress_or_raise(e, optional) }` -- also
+/// clips its window to that expression, whose median span is 4 lines against
+/// this 20. Only the scrutinee counts as consumed: a materializer inside a
+/// match *arm* is produced there, not consumed there, and its routing
+/// legitimately sits at a later fold. See [`Site::consumer`].
 const WINDOW_AFTER: usize = 20;
 
 /// A marker is looked for in the contiguous run of comment (and blank) lines
@@ -222,6 +250,15 @@ struct Site {
     body_end: usize,
     /// First line of the enclosing function's body, so the marker walk can be.
     body_start: usize,
+    /// Line range of the innermost `match`/`if` enclosing this call -- the
+    /// expression that actually consumes its `Result`, when there is one.
+    ///
+    /// #2369: the routing window is clipped to this as well as to the 20-line
+    /// bound, because the two answer different questions. Twenty lines asks
+    /// "is a `suppress_or_raise` written nearby"; this asks "is it written in
+    /// the expression that handles *this* call". The median consumer is 4
+    /// lines against a window of 20, so it is the far tighter of the two.
+    consumer: Option<(usize, usize)>,
 }
 
 /// One frame of the enclosing-function stack.
@@ -253,6 +290,9 @@ struct Audit<'a> {
     dishonest_underscore_fns: Vec<String>,
     /// Every raw site, resolved in a second pass -- see [`Audit::resolve`].
     candidates: Vec<Site>,
+    /// Line ranges of the `match`/`if` expressions currently open around the
+    /// walk, innermost last (#2369).
+    consumers: Vec<(usize, usize)>,
 }
 
 impl<'a> Audit<'a> {
@@ -264,6 +304,7 @@ impl<'a> Audit<'a> {
             sites_examined: 0,
             dishonest_underscore_fns: Vec::new(),
             candidates: Vec::new(),
+            consumers: Vec::new(),
         }
     }
 
@@ -314,6 +355,7 @@ impl<'a> Audit<'a> {
                 .to_string(),
             body_start: frame.body_start,
             body_end: frame.body_end,
+            consumer: self.consumers.last().copied(),
         });
     }
 
@@ -338,9 +380,15 @@ impl<'a> Audit<'a> {
                 .copied()
                 .find(|l| *l > site.line)
                 .unwrap_or(usize::MAX);
+            // #2369: also clip to the consuming `match`/`if`, when there is
+            // one. Only ever narrows -- a site with no consumer keeps exactly
+            // the previous bound -- so this cannot start excusing anything it
+            // did not excuse before.
+            let consumer_end = site.consumer.map_or(usize::MAX, |(_, end)| end);
             let after_end = (idx + WINDOW_AFTER)
                 .min(site.body_end)
                 .min(next_site.saturating_sub(1))
+                .min(consumer_end)
                 .min(lines.len())
                 .max(idx + 1);
             let after = lines[idx..after_end].join("\n");
@@ -498,6 +546,43 @@ impl<'ast> Visit<'ast> for Audit<'_> {
         self.push_fn(&node.sig, body);
         visit::visit_trait_item_fn(self, node);
         self.stack.pop();
+    }
+
+    fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
+        // Only the *scrutinee* is inside the consumer: `match to_owned(..)`
+        // is handled by its own arms, so clipping the window to the match is
+        // right. A call in an arm is a different relationship -- there the
+        // match is the call's *producer*, and its `Result` is typically
+        // collected and consumed by a later `match items` fold well outside
+        // this span (`builtin_add`, `builtin_flatten`, `builtin_from_entries`
+        // are all that shape). Clipping those was wrong, and flagged four
+        // correctly-routed sites when this rule first went in.
+        let sp = node.span();
+        self.consumers.push((sp.start().line, sp.end().line));
+        self.visit_expr(&node.expr);
+        self.consumers.pop();
+        for arm in &node.arms {
+            visit::visit_arm(self, arm);
+        }
+        for attr in &node.attrs {
+            visit::visit_attribute(self, attr);
+        }
+    }
+
+    fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
+        // Same split as `visit_expr_match`: the condition consumes, the
+        // branches do not.
+        let sp = node.span();
+        self.consumers.push((sp.start().line, sp.end().line));
+        self.visit_expr(&node.cond);
+        self.consumers.pop();
+        visit::visit_block(self, &node.then_branch);
+        if let Some((_, else_branch)) = &node.else_branch {
+            self.visit_expr(else_branch);
+        }
+        for attr in &node.attrs {
+            visit::visit_attribute(self, attr);
+        }
     }
 
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
@@ -824,5 +909,102 @@ fn test_to_owned_checked_has_no_call_sites_outside_its_own_definition_2367() {
          reasoned treatment) before adding one.",
         violations.len(),
         violations.join("\n"),
+    );
+}
+
+/// Run the audit over an inline fixture rather than the real sources.
+///
+/// #2369 added the first fixture-driven tests to this file. Until then it
+/// only ever scanned `SOURCES`, which makes a *tightening* impossible to
+/// demonstrate: the tree is expected to be clean, so "still clean" is the
+/// same observation before and after. A rule that catches nothing and a rule
+/// that catches everything both pass that check.
+fn audit_fixture(src: &str) -> Vec<Site> {
+    let file = syn::parse_file(src).expect("fixture parses");
+    let mut audit = Audit::new(src);
+    audit.visit_file(&file);
+    audit.resolve()
+}
+
+/// #2369 blind spot (1): in a function with a single materialization, any
+/// `suppresses(` in the next twenty lines read as routing, even when it
+/// belonged to an unrelated value.
+///
+/// Here the `match` that consumes the `to_owned` handles neither arm by
+/// suppressing, and the `suppresses(` below belongs to something else
+/// entirely. The 20-line window alone accepts this; clipping to the
+/// consuming expression does not.
+#[test]
+fn test_routing_outside_the_consuming_match_is_flagged_2369() {
+    let src = r"
+        fn walks(v: &V, optional: bool) -> QueryResult {
+            let owned = match to_owned(v) {
+                Ok(x) => x,
+                Err(_e) => return QueryResult::None,
+            };
+            let other = compute_something_else();
+            if suppresses(&other, optional) {
+                return QueryResult::None;
+            }
+            QueryResult::Owned(owned)
+        }
+    ";
+    let sites = audit_fixture(src);
+    assert_eq!(
+        sites.len(),
+        1,
+        "an unrelated `suppresses(` below the consuming match must not excuse \
+         the call: {:?}",
+        sites.iter().map(|s| s.line).collect::<Vec<_>>()
+    );
+    assert_eq!(sites[0].func, "walks");
+}
+
+/// The shape the rule must keep accepting: the consuming `match` routes in
+/// its own `Err` arm. This is how nearly every real site is written.
+#[test]
+fn test_routing_inside_the_consuming_match_is_accepted_2369() {
+    let src = r"
+        fn walks(v: &V, optional: bool) -> QueryResult {
+            let owned = match to_owned(v) {
+                Ok(x) => x,
+                Err(e) => return suppress_or_raise(e, optional),
+            };
+            QueryResult::Owned(owned)
+        }
+    ";
+    assert!(
+        audit_fixture(src).is_empty(),
+        "routing in the consuming match's own arm must be accepted"
+    );
+}
+
+/// The refinement that makes the clip safe: a materializer inside a match
+/// **arm** is not consumed by that match -- the match is its *producer*, and
+/// the `Result` it builds is consumed by a later fold.
+///
+/// Clipping those to the enclosing match flagged four correctly-routed real
+/// sites (`builtin_add`, `builtin_flatten`, `builtin_from_entries`, and
+/// `eval_error`), three of which already carried a `// STYLE-0012:` marker
+/// saying exactly this. Only the scrutinee is inside the consumer.
+#[test]
+fn test_a_call_in_a_match_arm_is_not_clipped_to_that_match_2369() {
+    let src = r"
+        fn folds(v: &V, optional: bool) -> QueryResult {
+            let items: Result<Vec<O>, E> = match v {
+                Array(elements) => elements.map(|e| to_owned(&e)).collect(),
+                _ => return QueryResult::None,
+            };
+            let items = match items {
+                Ok(i) => i,
+                Err(e) => return suppress_or_raise(e, optional),
+            };
+            QueryResult::Owned(items)
+        }
+    ";
+    assert!(
+        audit_fixture(src).is_empty(),
+        "a call in a match *arm* is produced there, not consumed there -- its \
+         routing legitimately lives at the later fold"
     );
 }
