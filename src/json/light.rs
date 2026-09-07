@@ -45,7 +45,7 @@ use alloc::{borrow::Cow, string::String, vec::Vec};
 #[cfg(test)]
 use std::borrow::Cow;
 
-use core::cell::OnceCell;
+use core::cell::{Cell, OnceCell};
 
 use crate::trees::BalancedParens;
 use crate::util::broadword::select_in_word;
@@ -62,7 +62,7 @@ use crate::util::broadword::select_in_word;
 ///
 /// Use [`JsonIndex::build`] to create an owned index from JSON text,
 /// or [`JsonIndex::from_parts`] to create from pre-existing index data.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct JsonIndex<W = Vec<u64>> {
     /// Interest bits - marks positions of structural characters and value starts
     ib: W,
@@ -79,6 +79,58 @@ pub struct JsonIndex<W = Vec<u64>> {
     /// builtin and the locate CLIs — so building it during `build()` would
     /// charge every jq query for something almost no query reads (#228).
     lines: OnceCell<crate::text::LineIndex>,
+    /// Where the previous [`ib_select1_sequential`](JsonIndex::ib_select1_sequential)
+    /// lookup landed, so the next forward lookup can start its gallop there
+    /// instead of from the fixed `rank / 8` estimate (#2168).
+    ///
+    /// Same shape as YAML's `AdvancePositions` sequential cursor (O1): a
+    /// `Cell` on the shared index, written by `&self` methods. This struct
+    /// already holds a `core::cell::OnceCell` (`lines`), so it was never
+    /// `Sync`; the `Cell` adds no new constraint.
+    ///
+    /// Deliberately left out of `Debug` (hand-written below): it changes on
+    /// every navigation, so a derived impl would make `{:?}` of an index --
+    /// or of any `JsonCursor`, which prints its index -- differ between two
+    /// cursors that reached the same node by different routes. YAML's
+    /// `AdvancePositions` cache has that exact trap on record.
+    seq_hint: Cell<SeqHint>,
+}
+
+impl<W: core::fmt::Debug> core::fmt::Debug for JsonIndex<W> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("JsonIndex")
+            .field("ib", &self.ib)
+            .field("ib_len", &self.ib_len)
+            .field("ib_rank", &self.ib_rank)
+            .field("bp", &self.bp)
+            .field("lines", &self.lines)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The state behind [`JsonIndex::ib_select1_sequential`]: the rank the last
+/// lookup answered and the text position it answered with.
+///
+/// Advisory except for the exact-repeat case. A seed derived from a stale
+/// `pos` is still a legal seed for [`JsonIndex::ib_select1_from`], whose
+/// gallop-then-bisect is exact for any seed -- the cache can only change how
+/// many `ib_rank` probes a lookup costs, never what it answers. The one
+/// answer it *does* supply directly is for `k == rank`, where `pos` is the
+/// value the same deterministic search returned a moment ago.
+#[derive(Clone, Copy, Debug)]
+struct SeqHint {
+    /// `u32::MAX` means "no previous lookup" -- a rank the index cannot hold,
+    /// since every constructor asserts `ib_len <= u32::MAX` (#188).
+    rank: u32,
+    /// Fits: a `Some` from `ib_select1_from` is `< ib_len <= u32::MAX`.
+    pos: u32,
+}
+
+impl SeqHint {
+    const NONE: Self = Self {
+        rank: u32::MAX,
+        pos: 0,
+    };
 }
 
 /// Build cumulative popcount index for IB.
@@ -140,6 +192,7 @@ impl JsonIndex<Vec<u64>> {
             ib_rank,
             bp: BalancedParens::new(semi.bp, bp_bit_count),
             lines: OnceCell::new(),
+            seq_hint: Cell::new(SeqHint::NONE),
         }
     }
 }
@@ -178,6 +231,7 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
             ib_rank,
             bp: BalancedParens::from_words(bp, bp_len),
             lines: OnceCell::new(),
+            seq_hint: Cell::new(SeqHint::NONE),
         }
     }
 
@@ -289,7 +343,7 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
 
         // #40: count `ib_rank` probes so this path's cost can be compared with
         // the word-scan sites. Starts at 1 for the `hint_rank` probe below.
-        #[cfg(feature = "select-stats")]
+        #[cfg(any(feature = "select-stats", test))]
         let mut probes = 1usize;
 
         // Clamp hint to valid range
@@ -307,7 +361,7 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
 
             // Gallop forward: double the step size until we overshoot
             loop {
-                #[cfg(feature = "select-stats")]
+                #[cfg(any(feature = "select-stats", test))]
                 {
                     probes += 1;
                 }
@@ -328,7 +382,7 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
 
             // Gallop backward
             loop {
-                #[cfg(feature = "select-stats")]
+                #[cfg(any(feature = "select-stats", test))]
                 {
                     probes += 1;
                 }
@@ -348,7 +402,7 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
         let mut lo = lo;
         let mut hi = hi;
         while lo < hi {
-            #[cfg(feature = "select-stats")]
+            #[cfg(any(feature = "select-stats", test))]
             {
                 probes += 1;
             }
@@ -360,7 +414,7 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
             }
         }
 
-        #[cfg(feature = "select-stats")]
+        #[cfg(any(feature = "select-stats", test))]
         crate::util::select_stats::record(
             crate::util::select_stats::Site::JsonIbSelectFrom,
             probes,
@@ -381,6 +435,90 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
         } else {
             None
         }
+    }
+
+    /// [`ib_select1_from`](Self::ib_select1_from) seeded from the previous
+    /// call through this method (#2168).
+    ///
+    /// `ib_select1_from` needs a starting word. The seed this method replaced
+    /// was the fixed estimate `k / 8`, which assumes eight interest bits per
+    /// 64-byte word; real documents drift from that (a node-dense array of
+    /// short numbers has ~12, one of long strings far fewer), and once the
+    /// estimate is `d` words off every lookup pays an O(log d) gallop before
+    /// it can bisect -- `docs/optimizations/select-scan.md` had already
+    /// measured that at ~17 probes per call on the real-workload corpus.
+    ///
+    /// The seed is now extrapolated from the last answer at the document's
+    /// own density: `last_word + (k - last_rank) * words / ones`, in either
+    /// direction, or `k * words / ones` when nothing has been asked yet. For
+    /// a document-order walk (`JsonCursor::text_position` from `to_owned`,
+    /// the #1755/#1953 validity walk, streaming output, `.[]` iteration) the
+    /// next rank is one or two above the last, so the seed is the answer's
+    /// own word or the one after it and the gallop is O(1) amortized. A
+    /// backward ask -- the value after its key in `find_cursor`, a `parent`
+    /// step, a root ask from `key` between two elements -- extrapolates the
+    /// same way, which is why this is not forward-only: a forward-only draft
+    /// fell back to `k / 8` on every backward ask and measured the common
+    /// `.users[] | .name` shape at ~23 probes for each of its two backward
+    /// asks per element (review of PR #2578). Random access after a
+    /// sequential run lands near the true word for any document whose
+    /// density is roughly uniform, which is a strictly better fallback than
+    /// `k / 8` for the same reason.
+    ///
+    /// An exact repeat (`k == last_rank`) answers from the cache without
+    /// probing at all, the way YAML's `AdvancePositions` `last_ib_arg` fast
+    /// path does; `DocumentCursor` callers routinely ask the same node twice
+    /// (`text_position()` then `value()`).
+    ///
+    /// Cost is a function of how far the seed is from the true word, not a
+    /// constant: `1 + ~2 log2(gap)` probes. Consecutive interest bits within
+    /// a few words of each other (any document of short scalars) cost 3;
+    /// a document of 64 KB strings, where consecutive bits are ~1000 words
+    /// apart, costs ~20 -- still below the ~33 the fixed estimate needs
+    /// there, because the extrapolation absorbs the density.
+    #[inline]
+    pub fn ib_select1_sequential(&self, k: usize) -> Option<usize> {
+        let last = self.seq_hint.get();
+        if last.rank != u32::MAX && k == last.rank as usize {
+            return Some(last.pos as usize);
+        }
+        let hint = self.seed_word(k, last);
+        let result = self.ib_select1_from(k, hint);
+        if let Some(pos) = result {
+            // Both fit: a `Some` means `k < ones <= ib_len` and
+            // `pos < ib_len`, and every constructor asserts
+            // `ib_len <= u32::MAX` (#188).
+            self.seq_hint.set(SeqHint {
+                rank: k as u32,
+                pos: pos as u32,
+            });
+        }
+        result
+    }
+
+    /// The starting word for [`ib_select1_sequential`](Self::ib_select1_sequential):
+    /// the last answer's word, moved by the rank delta at the document's
+    /// mean bits-per-word, or the delta from rank 0 when there is no last
+    /// answer. Always in `0..words`, which `ib_select1_from` requires.
+    ///
+    /// `u64`/`i64` arithmetic throughout: `k * words` reaches 2^58 on a
+    /// 4 GB document, which a 32-bit `usize` cannot hold.
+    #[inline]
+    fn seed_word(&self, k: usize, last: SeqHint) -> usize {
+        let words = self.ib.as_ref().len();
+        let ones = *self.ib_rank.last().unwrap_or(&0) as u64;
+        if words == 0 || ones == 0 {
+            return 0;
+        }
+        let (from_rank, from_word) = if last.rank == u32::MAX {
+            (0i64, 0i64)
+        } else {
+            (i64::from(last.rank), i64::from(last.pos / 64))
+        };
+        let delta = k as i64 - from_rank;
+        // `delta * words` is at most 2^32 * 2^26 in magnitude; no overflow.
+        let seed = from_word + delta * words as i64 / ones as i64;
+        seed.clamp(0, words as i64 - 1) as usize
     }
 
     /// Perform select1 on the IB using pure binary search.
@@ -566,13 +704,12 @@ impl<'a, W: AsRef<[u64]>> JsonCursor<'a, W> {
         // Use BP's O(1) rank1 function instead of linear scan
         let rank = self.index.bp().rank1(self.bp_pos);
 
-        // Use rank / 8 as a hint for where to start searching in IB.
-        // JSON typically has ~7-8 structural characters per 64 bytes,
-        // so rank / 8 is a reasonable estimate of the word index.
-        // For sequential traversal, this gives O(log d) instead of O(log n)
-        // where d is the distance from the hint.
-        let hint = rank / 8;
-        self.index.ib_select1_from(rank, hint)
+        // Seeded from the previous lookup rather than the fixed `rank / 8`
+        // estimate this used to pass to `ib_select1_from` directly: a
+        // document-order walk resolves every node's position in turn, and
+        // the estimate's drift on node-dense input made each of those a
+        // gallop (#2168, see `ib_select1_sequential`).
+        self.index.ib_select1_sequential(rank)
     }
 
     /// Get the 1-based line number of this node's position in the JSON text.
@@ -3595,6 +3732,209 @@ fn stream_json_yaml_double_quoted<Out: core::fmt::Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A node-dense document for the #2168 tests below: ~12 interest bits
+    /// per 64-byte word in the number array, where the old fixed `rank / 8`
+    /// seed for `ib_select1_from` drifted furthest from the true word, plus
+    /// an object section so the walk covers keys and nested containers.
+    fn dense_document_2168() -> Vec<u8> {
+        let mut json = String::from("{\"numbers\":[");
+        for i in 0..4000 {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push_str(&i.to_string());
+        }
+        json.push_str("],\"objects\":[");
+        for i in 0..800 {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push_str(&format!(
+                "{{\"a\":{i},\"b\":\"s{i}\",\"c\":[{i},null,true]}}"
+            ));
+        }
+        json.push_str("]}");
+        json.into_bytes()
+    }
+
+    /// Every open paren in BP, in document order, as cursors -- the same
+    /// order `to_owned`, the #1755/#1953 validity walk and streaming output
+    /// resolve positions in.
+    fn document_order_cursors(root: JsonCursor<'_, Vec<u64>>) -> Vec<JsonCursor<'_, Vec<u64>>> {
+        let mut out = Vec::new();
+        let mut stack = vec![root];
+        while let Some(c) = stack.pop() {
+            out.push(c);
+            // Push siblings first so children come off the stack before them.
+            if let Some(next) = c.next_sibling() {
+                stack.push(next);
+            }
+            if let Some(child) = c.first_child() {
+                stack.push(child);
+            }
+        }
+        out
+    }
+
+    /// `ib_select1_sequential` is `ib_select1_from` with a seed extrapolated
+    /// from the previous call (#2168). The seed is advisory -- gallop-then-
+    /// bisect is exact for any seed -- so the answer must match the pure
+    /// binary search `ib_select1` for every rank, in every access order:
+    /// forward, backward, and a scrambled order whose jumps land the seed
+    /// well off the true word. The exact-repeat fast path is covered by the
+    /// mechanism test below; the scrambled stride here revisits nothing.
+    #[test]
+    fn test_ib_select1_sequential_agrees_with_binary_search_in_every_order_2168() {
+        let json = dense_document_2168();
+        let index = JsonIndex::build(&json);
+        let ones = index.ib_rank1(index.ib_len());
+        assert!(
+            ones > 5000,
+            "document is not node-dense: {ones} interest bits"
+        );
+
+        for k in 0..ones {
+            assert_eq!(
+                index.ib_select1_sequential(k),
+                index.ib_select1(k),
+                "forward, rank {k}"
+            );
+        }
+        for k in (0..ones).rev() {
+            assert_eq!(
+                index.ib_select1_sequential(k),
+                index.ib_select1(k),
+                "backward, rank {k}"
+            );
+        }
+        // Deterministic scramble: a full-period LCG over 0..ones is overkill,
+        // a large stride coprime with `ones` visits every rank once.
+        let stride = 7919usize;
+        let mut k = 0usize;
+        for _ in 0..ones {
+            assert_eq!(
+                index.ib_select1_sequential(k),
+                index.ib_select1(k),
+                "scrambled, rank {k}"
+            );
+            k = (k + stride) % ones;
+        }
+        // Past the last set bit: both must decline, and the miss must not
+        // poison the seed for the lookup after it.
+        assert_eq!(index.ib_select1_sequential(ones), None);
+        assert_eq!(index.ib_select1(ones), None);
+        assert_eq!(index.ib_select1_sequential(0), index.ib_select1(0));
+    }
+
+    /// The cursor-level twin: a document-order walk's `text_position()`s
+    /// through the seeded path equal the pure-binary-search positions, and
+    /// so do positions asked *out* of order afterwards -- a `parent` step
+    /// back to an ancestor, a re-walk from the root.
+    #[test]
+    fn test_text_position_document_walk_matches_random_access_2168() {
+        let json = dense_document_2168();
+        let index = JsonIndex::build(&json);
+        let cursors = document_order_cursors(index.root(&json));
+        assert!(cursors.len() > 5000);
+
+        let expected: Vec<Option<usize>> = cursors
+            .iter()
+            .map(|c| index.ib_select1(index.bp().rank1(c.bp_pos)))
+            .collect();
+        for (c, want) in cursors.iter().zip(&expected) {
+            assert_eq!(c.text_position(), *want);
+        }
+        // Backward: the root, then every ancestor-shaped jump the walk above
+        // left the seed pointing past.
+        for (c, want) in cursors.iter().zip(&expected).rev() {
+            assert_eq!(c.text_position(), *want);
+        }
+        // Positions really are document order, so the seed was exercised
+        // rather than trivially reset at every step.
+        let positions: Vec<usize> = expected.iter().map(|p| p.unwrap()).collect();
+        assert!(positions.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// The mechanism, not just the answer (#2168). The two tests above pass
+    /// for *any* seed policy, since gallop-then-bisect is exact whatever it
+    /// starts from; this one counts `ib_rank` probes, which is the only
+    /// thing the seed changes. The counter is compiled under `cfg(test)` as
+    /// well as `select-stats`, so this runs in every `cargo test` -- a
+    /// version gated on the feature alone would never have run in CI.
+    ///
+    /// On this document the fixed `rank / 8` estimate this replaced sits up
+    /// to ~150 words from the true one and costs ~15 probes per lookup (a
+    /// gallop of ~8 and a bisect of ~7); reverting to it, or seeding from
+    /// the wrong unit (`pos` for a word), fails the bounds below.
+    #[test]
+    fn test_sequential_walk_costs_constant_probes_per_lookup_2168() {
+        use crate::util::select_stats::{reset, snapshot, Site};
+        let json = dense_document_2168();
+        let index = JsonIndex::build(&json);
+        let cursors = document_order_cursors(index.root(&json));
+
+        // Document order: consecutive ranks, seed is the last answer's word.
+        reset();
+        for c in &cursors {
+            let _ = c.text_position();
+        }
+        let forward = snapshot(Site::JsonIbSelectFrom);
+        assert_eq!(forward.calls(), cursors.len() as u64);
+        assert!(
+            forward.max() <= 6,
+            "a seeded document-order lookup should never need more than 6 probes; max was {}",
+            forward.max()
+        );
+
+        // Reverse order: the seed extrapolates backward just as well -- a
+        // draft that only reused the seed going forward fell back to
+        // `rank / 8` here and paid ~15.
+        reset();
+        for c in cursors.iter().rev() {
+            let _ = c.text_position();
+        }
+        let backward = snapshot(Site::JsonIbSelectFrom);
+        assert!(
+            backward.max() <= 6,
+            "a seeded reverse-order lookup should never need more than 6 probes; max was {}",
+            backward.max()
+        );
+
+        // An exact repeat answers from the cache: no probe is recorded at
+        // all. A fresh index, so the root's rank is not already the cached
+        // one from the reverse walk above.
+        let fresh = JsonIndex::build(&json);
+        let fresh_cursors = document_order_cursors(fresh.root(&json));
+        reset();
+        for c in &fresh_cursors {
+            let _ = c.text_position();
+            let _ = c.text_position();
+        }
+        let repeated = snapshot(Site::JsonIbSelectFrom);
+        assert_eq!(
+            repeated.calls(),
+            fresh_cursors.len() as u64,
+            "a repeated ask must not probe"
+        );
+
+        // Root then last, alternating -- the shape a base-node `key` between
+        // two elements produces. Extrapolating from rank 0 at the document's
+        // density lands near the last bit; a seed that stored the root's
+        // word and galloped from there paid ~35.
+        let ones = index.ib_rank1(index.ib_len());
+        reset();
+        for _ in 0..64 {
+            let _ = index.ib_select1_sequential(0);
+            let _ = index.ib_select1_sequential(ones - 1);
+        }
+        let alternating = snapshot(Site::JsonIbSelectFrom);
+        assert!(
+            alternating.max() <= 8,
+            "a root/last alternation should stay within 8 probes; max was {}",
+            alternating.max()
+        );
+    }
 
     #[test]
     fn test_build_index() {

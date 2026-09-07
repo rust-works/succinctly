@@ -221,6 +221,38 @@ pub fn ib_select1_from(&self, k: u64, hint: usize) -> Option<u64> {
 - Sequential: 3.1x faster (335 µs → 102 µs)
 - Random: 1.39x faster (due to better initial guess)
 
+**The hint is only as good as its source** (#2168). `JsonCursor::text_position`
+originally seeded `ib_select1_from` with the fixed estimate `rank / 8`, which
+assumes eight interest bits per 64-byte word. A node-dense array of short
+numbers has ~12, a document of long strings far fewer, so on real input the
+estimate drifted by up to hundreds of words and every lookup in a document-order
+walk paid the full O(log d) gallop -- [select-scan.md](select-scan.md) had already
+measured it at ~17 probes per call on the real-workload corpus, and a profile put
+it at over half the cost of the #1755/#1953 validity walk.
+
+`JsonIndex::ib_select1_sequential` now seeds from the previous answer,
+extrapolated at the document's own mean density in either direction
+(`last_word + (rank - last_rank) * words / ones`, a `Cell` on the index in the
+shape of YAML's `AdvancePositions` cursor), and answers an exact repeat of the
+last rank from the cache without probing. The seed is exact by construction:
+gallop-then-bisect is correct for any seed, so a stale one costs probes, never
+an answer. Cost is `1 + ~2 log2(gap)` probes where `gap` is the seed's distance
+from the true word -- 3 for any document of short scalars in document order,
+~20 for a document of 64 KB strings (consecutive bits ~1000 words apart, against
+~33 for the fixed estimate there), and ~16 for random access on a file whose
+density drifts along its length (the `users` generator's records grow in digit
+count), against ~25 before. Measured probes per lookup on a 4 MB `users`
+document: document-order walk 3.00 (mean and max), `.users[] | .name` 3.12 mean
+/ 5 max (a draft that only reused the seed going forward left this shape's two
+backward asks per element at 23 probes each).
+
+End to end, Apple M4 Pro, interleaved A/B with output identity gated, medians of
+7 (PR #2578): `.[][0] | key` on a 14 MB `users` document 131.6 -> 84.6 ms
+(-36%), the same on a 20 MB `numbers` array 151.8 -> 84.5 ms (-44%), identity
+`.` on the 14 MB file 186.0 -> 144.2 ms (-22%), `[.[][] | key] | length` 167.7
+-> 117.3 ms (-30%); the navigation-only control `keys_unsorted[0]` moved -1.3%,
+inside the harness's own noise floor.
+
 ---
 
 ## Temporal Locality

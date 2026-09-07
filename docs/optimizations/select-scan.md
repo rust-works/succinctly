@@ -43,6 +43,12 @@ Sharply bimodal: half the calls are trivial, but **99% of the words popcounted
 happen in scans of 4+ words**. Counting calls alone would have rejected this;
 counting work said proceed. That is why `select-stats` reports both.
 
+The `json/light ib_select1_from` row predates #2168 (PR #2578), which replaced that
+walk's fixed `rank / 8` seed with one extrapolated from the previous answer: the
+same document-order walk now measures ~3 probes per call (see
+[access-patterns.md](access-patterns.md)). Regenerate this table before relying on
+that row.
+
 Four of the five scan sites recorded nothing at all — `BitVec::select1`,
 BP's select support (`WithSelect::select1`, superseded by `WithCsPoppy::select1`
 in #64) and `EliasFano::select1` are reached only by `locate` tooling or have no
