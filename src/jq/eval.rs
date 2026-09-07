@@ -1918,7 +1918,7 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         // `update_path` resolves the filter against the target's own
         // position, and this arm exists so the *prefix* of that position --
         // where the assignment's input itself sits -- reaches it, via
-        // the deleted eager path-context evaluator's own arm below. Without it,
+        // the deleted eager path-context evaluator's own arm. Without it,
         // `.a | .b |= path` answers `["b"]` instead of `["a","b"]`.
         Expr::Update { filter, .. } => needs_path_context(filter),
         // `.b += key` (#2522). A compound assignment evaluates its right side
@@ -1939,7 +1939,7 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         // `first(expr)`/`last(expr)` (#2074): same reasoning as `Limit`
         // above -- whatever the wrapped expression needs, the wrapper
         // needs too. Paired with matching arms in
-        // the deleted eager path-context evaluator below, the same pairing
+        // the deleted eager path-context evaluator, the same pairing
         // `Label` (#715) and `FuncDef` (#1306) each required.
         Expr::FirstExpr(inner) | Expr::LastExpr(inner) => needs_path_context(inner),
         Expr::Comma(exprs) => exprs.iter().any(needs_path_context),
