@@ -305,6 +305,30 @@ These enable IDE integration and programmatic navigation to specific document po
 
 ---
 
+### Where a value built by a jq-only construct stands (spine 2416)
+
+`key`, `parent`, `parent(n)`, `path` and `file_index` are yq builtins that `succinctly jq`
+accepts as an extension, and real yq's lexer rejects `if`/`then`/`else`, `try`/`catch`, a
+postfix `?`, `label`/`break`, `def`, `reduce`, `foreach`, `limit`, `last` and destructuring
+`as` outright (each confirmed live against v4.53.3, 2026-09-07). So a path-context read
+*after* one of those constructs has no oracle in either mode, and succinctly answers it from
+the same tree-structural model ADR-0021 decision 7 gives every other stage
+(`owned_identity_rule` and the owned identity pipe in `src/jq/eval_generic.rs`):
+
+| Construct                                                   | Where its output stands                                                                                     |
+|-------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------|
+| `if c then A else B end`, `(A, B)`, `try A catch B`, `A?`, `label $l \| A`, `def f: ..; A`, `f` (a bound call), `limit(n; A)`, `first(A)`, `last(A)`, `E as [$x] \| A` | Transparent: each output stands exactly where the same output of `A` (or `B`) stands on its own — `.a.b \| if key == "b" then key + "x" else "y" end \| key` prints nothing because `.a.b \| (key + "x") \| key` does; `.a.b \| (label $o \| parent) \| key` is `"a"` because `parent \| key` is |
+| `try A catch B` (handler ran), `last(empty)` (`null` in jq 1.7.1)         | The handler's outputs, and `last`'s `null`, stand at the stage's own input                                  |
+| `reduce`/`foreach`                                          | The fold's output stands at the stage's own input, like `tostring` (`.a.b \| reduce (key) as $k (""; . + $k) \| path` is `["a","b"]`) |
+| `"..\\(..).."` string interpolation                          | Detached, like a literal: `.a.b \| "k=\\(key)" \| key` prints nothing (this one *is* captured from yq v4.53.3) |
+| `A and B`, `A or B`                                         | Where the left operand stood, like a comparison (captured from yq v4.53.3: `.a.b \| (parent and key) \| key` is `"a"`) |
+
+Before spine 2416's identity pass these constructs kept their whole pipe on the eager
+path-context evaluator, whose accumulated-path model answered `.a.b | (try key catch "c") |
+key` with `"b"` where the un-wrapped `.a.b | key | key` already printed nothing; the rows
+that moved are pinned in `test_identity_pass_constructs_jq_2416` (`tests/jq_cli_tests.rs`)
+and the yq-mode captures in `test_owned_identity_rules_match_yq_2416` (`tests/yq_cli_tests.rs`).
+
 ## Operator Precedence
 
 Loosest first, matching jq's `parser.y`:

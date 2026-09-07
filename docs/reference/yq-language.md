@@ -446,6 +446,13 @@ succinctly yq 'at_offset(10)' config.yaml
 succinctly yq 'at_position(5; 3)' config.yaml
 ```
 
+### Path context through jq-only constructs
+
+A `key`/`parent`/`path`/`file_index` read *after* a construct real yq's lexer rejects
+(`if`, `try`, `?`, `label`, `def`, `reduce`, `foreach`, `limit`, `last`, destructuring `as`)
+has no yq answer to match; `succinctly yq --jq-extensions` places such a value by the same
+tree-structural rules `succinctly jq` uses — see [jq Language Reference](jq-language.md#where-a-value-built-by-a-jq-only-construct-stands-spine-2416).
+
 ### Gated jq Builtins (--jq-extensions)
 
 Real yq's own lexer rejects a chunk of the jq language outright — these

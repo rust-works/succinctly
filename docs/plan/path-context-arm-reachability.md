@@ -128,50 +128,50 @@ trusting them.
 
 | #   | Handler (site in `eval_stage_with_path_context`)                   | Verdict   | Proof query (jq mode, document `D`)                   | Gate |
 |-----|--------------------------------------------------------------------|-----------|-------------------------------------------------------|------|
-| H1  | pre-match `if matches!(first, Expr::Builtin(Builtin::PathNoArg))`  | REACHABLE | `.a.b \| reduce (path) as $p ([]; . + $p) \| . + ["x"]` | R2   |
-| H2  | pre-match `if matches!(first, Expr::Builtin(Builtin::Key))`        | REACHABLE | `.a.b \| reduce (key) as $k (""; . + $k) \| . + "x"`   | R2   |
-| H3  | pre-match `if matches!(first, Expr::Builtin(Builtin::FileIndex))`  | REACHABLE | `.a.b \| reduce (file_index) as $f (0; . + $f) \| . + 1` | R2 |
-| H4  | pre-match `if matches!(first, Expr::Builtin(Builtin::Parent))`     | REACHABLE | `.a.b \| parent + {}`                                 | R2   |
+| H1  | pre-match `if matches!(first, Expr::Builtin(Builtin::PathNoArg))`  | REACHABLE | `.a.b \| parent(0+1) \| path + []` | R2   |
+| H2  | pre-match `if matches!(first, Expr::Builtin(Builtin::Key))`        | REACHABLE | `.a.b \| parent(0+1) \| (key and parent)`   | R2   |
+| H3  | pre-match `if matches!(first, Expr::Builtin(Builtin::FileIndex))`  | REACHABLE | `.a.b \| parent(0+1) \| file_index + 1` | R2 |
+| H4  | pre-match `if matches!(first, Expr::Builtin(Builtin::Parent))`     | REACHABLE | `.a.b \| parent(0+1) \| (key and parent)`                                 | R2   |
 | H5  | pre-match `if let Expr::Builtin(Builtin::ParentN(n_expr)) = first` | REACHABLE | `.a.b \| parent(0+1) + {}`                            | R2   |
-| A01 | `Expr::Identity`                                                   | REACHABLE | `.a.b \| . \| parent + {}`                            | R2   |
-| A02 | `Expr::Field(name)`                                                | REACHABLE | `.a.b \| parent + {}`                                 | R2   |
-| A03 | `Expr::Index { idx, key }`                                         | REACHABLE | `.c[0] \| parent + []`                                | R2   |
+| A01 | `Expr::Identity`                                                   | REACHABLE | `.a.b \| parent(0+1) \| . \| key`                            | R2   |
+| A02 | `Expr::Field(name)`                                                | REACHABLE | `.a.b \| parent(0+1) + {}`                                 | R2   |
+| A03 | `Expr::Index { idx, key }`                                         | REACHABLE | `.c[0] \| parent(0+1) \| key`                                | R2   |
 | A04 | `Expr::Slice { .. }`                                               | REACHABLE | `.c[0:1] \| .[0] \| key + 1`                          | R1   |
-| A05 | `Expr::Iterate`                                                    | REACHABLE | `.a[] \| (key \| tostring)`                            | R3   |
-| A06 | `Expr::Paren(inner)`                                               | REACHABLE | `.a.b \| (parent) + {}`                               | R2   |
-| A07 | `Expr::Optional(inner) if IndexExpr/SliceExpr`                     | REACHABLE | `.c[.n]? \| (key and parent)`                          | R2   |
-| A08 | `Expr::Optional(inner)`                                            | REACHABLE | `.a? \| (key and parent)`                              | R2   |
-| A09 | `Expr::Pipe(inner) if rest.is_empty()`                             | REACHABLE | `.a[] \| (key \| tostring)`                            | R3   |
-| A10 | `Expr::Pipe(inner)`                                                | REACHABLE | `.a.b \| parent + {}`                                 | R2   |
-| A11 | `Expr::Arithmetic { .. }`                                          | REACHABLE | `.a.b \| parent + {}`                                 | R2   |
-| A12 | `Expr::And(..) \| Expr::Or(..)`                                    | REACHABLE | `.a.b \| . as $x \| (key and parent)`                  | R2   |
-| A13 | `Expr::Negate(operand)`                                            | REACHABLE | `.a.b \| -(parent\|length)`                            | R2   |
-| A14 | `Expr::Compare { .. }`                                             | REACHABLE | `.a.b \| (parent \| length) == 1`                      | R2   |
-| A15 | `Expr::Builtin(Builtin::Select(cond))`                             | REACHABLE | `.a.b \| select(key == "b") \| parent + {}`           | R2   |
-| A16 | `Expr::Builtin(Builtin::Map(f))`                                   | REACHABLE | `.a \| map(key + "x")`                                | R2   |
-| A17 | `Expr::Builtin(Builtin::GetPath(path_expr))`                       | REACHABLE | `.a \| getpath(["b"]) \| (key and parent)`            | R1   |
-| A18 | `Expr::Builtin(_)`                                                 | REACHABLE | `.a[] \| (key \| length)`                             | R3   |
-| A19 | `Expr::IndexExpr { target, key }`                                  | REACHABLE | `.c[.n] \| (key and parent)`                           | R2   |
+| A05 | `Expr::Iterate`                                                    | REACHABLE | `.a[] \| parent(0+1) \| key`                            | R3   |
+| A06 | `Expr::Paren(inner)`                                               | REACHABLE | `.a.b \| parent(0+1) \| (key and parent)`                               | R2   |
+| A07 | `Expr::Optional(inner) if IndexExpr/SliceExpr`                     | REACHABLE | `.c[.n]? \| parent(0+1) \| key`                          | R2   |
+| A08 | `Expr::Optional(inner)`                                            | REACHABLE | `.a? \| parent(0+1) \| key`                              | R2   |
+| A09 | `Expr::Pipe(inner) if rest.is_empty()`                             | REACHABLE | `.a.b \| parent(0+1) \| -(key\|length)`                            | R2   |
+| A10 | `Expr::Pipe(inner)`                                                | REACHABLE | `.a.b \| parent(0+1) + {}`                                 | R2   |
+| A11 | `Expr::Arithmetic { .. }`                                          | REACHABLE | `.a.b \| parent(0+1) + {}`                                 | R2   |
+| A12 | `Expr::And(..) \| Expr::Or(..)`                                    | REACHABLE | `.a.b \| parent(0+1) \| (key and parent)`                  | R2   |
+| A13 | `Expr::Negate(operand)`                                            | REACHABLE | `.a.b \| parent(0+1) \| -(key\|length)`                            | R2   |
+| A14 | `Expr::Compare { .. }`                                             | REACHABLE | `.a.b \| parent(0+1) \| (key == "a")`                      | R2   |
+| A15 | `Expr::Builtin(Builtin::Select(cond))`                             | REACHABLE | `.a.b \| parent(0+1) \| select(key == "a") \| key`           | R2   |
+| A16 | `Expr::Builtin(Builtin::Map(f))`                                   | REACHABLE | `.a.b \| parent(0+1) \| map(key)`                                | R2   |
+| A17 | `Expr::Builtin(Builtin::GetPath(path_expr))`                       | REACHABLE | `getpath(["a","b"]) \| (key and parent)`            | R1   |
+| A18 | `Expr::Builtin(_)`                                                 | REACHABLE | `.a.b \| parent(0+1) \| -(key\|length)`                             | R2   |
+| A19 | `Expr::IndexExpr { target, key }`                                  | REACHABLE | `.c[(0,1)] \| (key and parent)`                           | R1   |
 | A20 | `Expr::SliceExpr { target, start, end }`                           | REACHABLE | `.c[.n:.m] \| .[0] \| key + 1`                        | R1   |
-| A21 | `Expr::Array(inner) if needs_path_context(inner)`                  | REACHABLE | `.a.b \| [(key and parent)] + ["x"]`                   | R2   |
-| A22 | `Expr::StringInterpolation(parts) if ..`                           | REACHABLE | `.a.b \| ("\(key)") \| . + "x"`                       | R2   |
-| A23 | `Expr::DefCall { .. }`                                             | REACHABLE | `def f: key; .a.b \| f + "x"`                         | R2   |
+| A21 | `Expr::Array(inner) if needs_path_context(inner)`                  | REACHABLE | `.a.b \| parent(0+1) \| [key] + ["x"]`                   | R2   |
+| A22 | `Expr::StringInterpolation(parts) if ..`                           | REACHABLE | `.a.b \| parent(0+1) \| "\(key)"`                       | R2   |
+| A23 | `Expr::DefCall { .. }`                                             | REACHABLE | `.a.b \| parent(0+1) \| def f: key; f + "x"`                         | R2   |
 | A24 | `Expr::Shared(inner)`                                              | REACHABLE | `def f(x): x; .a.b \| f(key) + "z"`                   | R2   |
-| A25 | `Expr::FuncDef { .. }`                                             | REACHABLE | `.a.b \| def f: key; f + "x"`                         | R2   |
-| A26 | `Expr::As { .. } if ..`                                            | REACHABLE | `.a.b \| . as $x \| (key and parent)`                  | R2   |
-| A27 | `Expr::AsPattern { .. } if ..`                                     | REACHABLE | `.c \| . as [$x] \| key + "x"`                        | R2   |
-| A28 | `Expr::Limit { n, expr } if ..`                                    | REACHABLE | `.a.b \| limit(1; key + "x")`                         | R2   |
-| A29 | `Expr::FirstExpr(expr) if ..`                                      | REACHABLE | `.a.b \| first(key + "x")`                            | R2   |
-| A30 | `Expr::LastExpr(expr) if ..`                                       | REACHABLE | `.a.b \| last(key + "x")`                             | R2   |
-| A31 | `Expr::Reduce { .. } if ..`                                        | REACHABLE | `.a.b \| reduce (key) as $k (""; . + $k) \| . + "x"`  | R2   |
-| A32 | `Expr::Foreach { .. } if ..`                                       | REACHABLE | `.a.b \| foreach (key) as $k (""; . + $k) \| . + "x"` | R2   |
-| A33 | `Expr::Object(_) \| Expr::Array(_) \| Expr::Literal(_)`            | REACHABLE | `.a.b \| . as $x \| (key and parent) \| {z: .}`         | R2   |
-| A34 | `Expr::If { .. }`                                                  | REACHABLE | `.a.b \| if key == "b" then key + "x" else "y" end`   | R2   |
-| A35 | `Expr::Comma(exprs)`                                               | REACHABLE | `.a.b \| (key + "x"), key`                            | R2   |
-| A36 | `Expr::Try { .. }`                                                 | REACHABLE | `.a.b \| try (key + "x") catch "e"`                   | R2   |
-| A37 | `Expr::Label { name, body }`                                       | REACHABLE | `.a.b \| label $out \| (key + "x", break $out)`       | R2   |
-| A38 | `Expr::Break(name)`                                                | REACHABLE | `.a.b \| label $out \| (key + "x", break $out)`       | R2   |
-| A39 | `Expr::Update \| CompoundAssign \| AlternativeAssign`               | REACHABLE | `.a \| .b \|= key`                                    | R2   |
+| A25 | `Expr::FuncDef { .. }`                                             | REACHABLE | `.a.b \| parent(0+1) \| def f: key; f + "x"`                         | R2   |
+| A26 | `Expr::As { .. } if ..`                                            | REACHABLE | `.a.b \| parent(0+1) \| . as $x \| key`                  | R2   |
+| A27 | `Expr::AsPattern { .. } if ..`                                     | REACHABLE | `.c[0] \| parent(0+1) \| . as [$x] \| key`                        | R2   |
+| A28 | `Expr::Limit { n, expr } if ..`                                    | REACHABLE | `.a.b \| parent(0+1) \| limit(1; key + "x")`                         | R2   |
+| A29 | `Expr::FirstExpr(expr) if ..`                                      | REACHABLE | `.a.b \| parent(0+1) \| first(key + "x")`                            | R2   |
+| A30 | `Expr::LastExpr(expr) if ..`                                       | REACHABLE | `.a.b \| parent(0+1) \| last(key + "x")`                             | R2   |
+| A31 | `Expr::Reduce { .. } if ..`                                        | REACHABLE | `.a.b \| parent(0+1) \| reduce (key) as $k (""; . + $k)`  | R2   |
+| A32 | `Expr::Foreach { .. } if ..`                                       | REACHABLE | `.a.b \| parent(0+1) \| foreach (key) as $k (""; . + $k)` | R2   |
+| A33 | `Expr::Object(_) \| Expr::Array(_) \| Expr::Literal(_)`            | REACHABLE | `.a.b \| parent(0+1) \| {z: key}`         | R2   |
+| A34 | `Expr::If { .. }`                                                  | REACHABLE | `.a.b \| parent(0+1) \| if key == "a" then key + "x" else "y" end`   | R2   |
+| A35 | `Expr::Comma(exprs)`                                               | REACHABLE | `.a.b \| parent(0+1) \| (key + "x"), key`                            | R2   |
+| A36 | `Expr::Try { .. }`                                                 | REACHABLE | `.a.b \| parent(0+1) \| try (key + "x") catch "e"`                   | R2   |
+| A37 | `Expr::Label { name, body }`                                       | REACHABLE | `.a.b \| parent(0+1) \| label $out \| (key + "x", break $out)`       | R2   |
+| A38 | `Expr::Break(name)`                                                | REACHABLE | `.a.b \| parent(0+1) \| label $out \| (key + "x", break $out)`       | R2   |
+| A39 | `Expr::Update \| CompoundAssign \| AlternativeAssign`               | REACHABLE | `.a.b \| parent(0+1) \| .b \|= key`                                    | R2   |
 
 ## Step 1b: `Expr::Arithmetic` admitted, and the pin holds at 43
 
@@ -852,6 +852,143 @@ spelling, which yq answers identically.
 The instrumentation was reverted before this document was committed; nothing in the
 tree carries it.
 
+## Identity pass (spine 2416): every stage shape gets a rule, and the pin still holds at 44
+
+The identity pass closes the `R2` stage cluster the #2563 section left -- every
+stage shape with no `owned_identity_rule` -- and most of `R3`: `if`, comma,
+`try`/`?`, `label`/`break`, `limit`/`first`/`last`, single-pattern destructuring,
+`def`/`DefCall`/`Shared`, a nested pipe and the map-family bodies are run through
+the owned identity pipe as stages (`eval_owned_identity_stages`, with a
+pair-emitting `OwnedIdentityTail` so a bounded consumer or a `try` can continue
+`rest` from each output's identity); `and`/`or` got a `LeftOperand` rule and
+string interpolation `Detaches` (both captured from yq v4.53.3), folds and the
+compound assignments `Keeps`; a `parent` operand is placed by running the operand
+through the pipe; an assignment's right side is evaluated at the position against
+the vivified document (#2481) inside the read-only scope (#2470); a nested pipe
+that moves before it reads is prefetched at the position
+(`PathContextAt::prefetch`). `path_context_single_native` admits anything that
+reads no path context, the assignment family and string interpolation
+(`eval_positioned_stage_generic`), and a pipe the absent route accepts is never
+this evaluator's. A cursor-less pipe takes the owned door instead of being
+decided by the gate alone.
+
+**`PINNED_ARM_COUNT` stays at 44.** Re-run of the method above on the post-change
+tree with all 44 handlers, the gate's three disjuncts *and* the three handover
+sites instrumented (`HANDOVER`, so a depth-1 gate line that is only the absent
+route asking about `rest` is not mistaken for a handover), against the base
+(`36ed01506`) instrumented identically. **Forty of the 44 listed proof queries
+stop reaching any arm** (33 of the 72 distinct queries in
+`test_arm_audit_proof_queries_are_unmoved_by_the_gate_2416` report no arm at
+all); **all 44 arms are still reachable**, and the table above carries the
+re-derived query for each. What re-derives them is the residue this pass leaves
+(next section): a computed `parent(n)` (`parent(0+1)`, refused by every route
+because the hop count would be evaluated against a position that may not
+exist), a fan-out component (`.c[(0,1)]`), a slice head, a `getpath` head.
+Outputs are pinned alongside the old spellings. Document `D`:
+
+| Id  | Listed query before | Re-derived query | Gate | Marker | Output |
+|-----|---------------------|------------------|------|--------|--------|
+| H1 | `.a.b \| reduce (path) as $p ([]; . + $p) \| . + ["x"]` | `.a.b \| parent(0+1) \| path + []` | R2 | fired | `["a"]` |
+| H2 | `.a.b \| reduce (key) as $k (""; . + $k) \| . + "x"` | `.a.b \| parent(0+1) \| (key and parent)` | R2 | fired | `true` |
+| H3 | `.a.b \| reduce (file_index) as $f (0; . + $f) \| . + 1` | `.a.b \| parent(0+1) \| file_index + 1` | R2 | fired | `1` |
+| H4 | `.a.b \| parent + {}` | `.a.b \| parent(0+1) \| (key and parent)` | R2 | fired | `true` |
+| A01 | `.a.b \| . \| parent + {}` | `.a.b \| parent(0+1) \| . \| key` | R2 | fired | `"a"` |
+| A02 | `.a.b \| parent + {}` | `.a.b \| parent(0+1) + {}` | R2 | fired | `{"b":1}` |
+| A03 | `.c[0] \| parent + []` | `.c[0] \| parent(0+1) \| key` | R2 | fired | `"c"` |
+| A05 | `.a[] \| (key \| tostring)` | `.a[] \| parent(0+1) \| key` | R3 | fired | `"a"` |
+| A06 | `.a.b \| (parent) + {}` | `.a.b \| parent(0+1) \| (key and parent)` | R2 | fired | `true` |
+| A07 | `.c[.n]? \| (key and parent)` | `.c[.n]? \| parent(0+1) \| key` | R2 | fired | `"c"` |
+| A08 | `.a? \| (key and parent)` | `.a? \| parent(0+1) \| key` | R2 | fired | `null` |
+| A09 | `.a[] \| (key \| tostring)` | `.a.b \| parent(0+1) \| -(key\|length)` | R2 | fired | `-1` |
+| A10 | `.a.b \| parent + {}` | `.a.b \| parent(0+1) + {}` | R2 | fired | `{"b":1}` |
+| A11 | `.a.b \| parent + {}` | `.a.b \| parent(0+1) + {}` | R2 | fired | `{"b":1}` |
+| A12 | `.a.b \| . as $x \| (key and parent)` | `.a.b \| parent(0+1) \| (key and parent)` | R2 | fired | `true` |
+| A13 | `.a.b \| -(parent\|length)` | `.a.b \| parent(0+1) \| -(key\|length)` | R2 | fired | `-1` |
+| A14 | `.a.b \| (parent \| length) == 1` | `.a.b \| parent(0+1) \| (key == "a")` | R2 | fired | `true` |
+| A15 | `.a.b \| select(key == "b") \| parent + {}` | `.a.b \| parent(0+1) \| select(key == "a") \| key` | R2 | fired | `"a"` |
+| A16 | `.a \| map(key + "x")` | `.a.b \| parent(0+1) \| map(key)` | R2 | fired | `["b"]` |
+| A17 | `.a \| getpath(["b"]) \| (key and parent)` | `getpath(["a","b"]) \| (key and parent)` | R1 | fired | `true` |
+| A18 | `.a[] \| (key \| length)` | `.a.b \| parent(0+1) \| -(key\|length)` | R2 | fired | `-1` |
+| A19 | `.c[.n] \| (key and parent)` | `.c[(0,1)] \| (key and parent)` | R1 | fired | `true, true` |
+| A21 | `.a.b \| [(key and parent)] + ["x"]` | `.a.b \| parent(0+1) \| [key] + ["x"]` | R2 | fired | `["a","x"]` |
+| A22 | `.a.b \| ("\(key)") \| . + "x"` | `.a.b \| parent(0+1) \| "\(key)"` | R2 | fired | `"a"` |
+| A23 | `def f: key; .a.b \| f + "x"` | `.a.b \| parent(0+1) \| def f: key; f + "x"` | R2 | fired | `"ax"` |
+| A25 | `.a.b \| def f: key; f + "x"` | `.a.b \| parent(0+1) \| def f: key; f + "x"` | R2 | fired | `"ax"` |
+| A26 | `.a.b \| . as $x \| (key and parent)` | `.a.b \| parent(0+1) \| . as $x \| key` | R2 | fired | `"a"` |
+| A27 | `.c \| . as [$x] \| key + "x"` | `.c[0] \| parent(0+1) \| . as [$x] \| key` | R2 | fired | `"c"` |
+| A28 | `.a.b \| limit(1; key + "x")` | `.a.b \| parent(0+1) \| limit(1; key + "x")` | R2 | fired | `"ax"` |
+| A29 | `.a.b \| first(key + "x")` | `.a.b \| parent(0+1) \| first(key + "x")` | R2 | fired | `"ax"` |
+| A30 | `.a.b \| last(key + "x")` | `.a.b \| parent(0+1) \| last(key + "x")` | R2 | fired | `"ax"` |
+| A31 | `.a.b \| reduce (key) as $k (""; . + $k) \| . + "x"` | `.a.b \| parent(0+1) \| reduce (key) as $k (""; . + $k)` | R2 | fired | `"a"` |
+| A32 | `.a.b \| foreach (key) as $k (""; . + $k) \| . + "x"` | `.a.b \| parent(0+1) \| foreach (key) as $k (""; . + $k)` | R2 | fired | `"a"` |
+| A33 | `.a.b \| . as $x \| (key and parent) \| {z: .}` | `.a.b \| parent(0+1) \| {z: key}` | R2 | fired | `{"z":"a"}` |
+| A34 | `.a.b \| if key == "b" then key + "x" else "y" end` | `.a.b \| parent(0+1) \| if key == "a" then key + "x" else "y" end` | R2 | fired | `"ax"` |
+| A35 | `.a.b \| (key + "x"), key` | `.a.b \| parent(0+1) \| (key + "x"), key` | R2 | fired | `"ax", "a"` |
+| A36 | `.a.b \| try (key + "x") catch "e"` | `.a.b \| parent(0+1) \| try (key + "x") catch "e"` | R2 | fired | `"ax"` |
+| A37 | `.a.b \| label $out \| (key + "x", break $out)` | `.a.b \| parent(0+1) \| label $out \| (key + "x", break $out)` | R2 | fired | `"ax"` |
+| A38 | `.a.b \| label $out \| (key + "x", break $out)` | `.a.b \| parent(0+1) \| label $out \| (key + "x", break $out)` | R2 | fired | `"ax"` |
+| A39 | `.a \| .b \|= key` | `.a.b \| parent(0+1) \| .b \|= key` | R2 | fired | `{"b":"b"}` |
+
+`H5`, `A04`, `A20` and `A24` keep their listed queries (a computed `parent(n)`
+head, the two slice heads and a call with a path-context *argument* -- the
+last one is reached through `Expr::Shared`, and #1371's substitution is what
+the walk still has no arm for).
+
+### What the change is measured against
+
+The construct matrix in the pass's capture set (`cap/ext1.txt`: every construct
+above in a pipe with a read after it, at a present position, an absent one,
+inside an `as` body and after a synthesized node), run in both modes against
+the base binary and yq v4.53.3: **29 rows moved toward yq, none away**, and 39
+changed where yq's lexer rejects the construct (every one of them to the answer
+the tree-structural model gives the un-wrapped stage -- `.a.b | (try key catch
+"c") | key` prints nothing now because `.a.b | key | key` already did). 212 yq
+rows were captured for the constructs yq does accept; 202 match and are pinned
+in `IDENTITY_PASS_ROWS_2416` (`tests/yq_cli_tests.rs`), and the 10 that do not
+are all pre-existing divergences, identical on the base binary (#2377, #2428,
+#2435, container-in-string formatting, `.b |= parent` and `map_values(parent)`
+-- the last recorded in `docs/compliance/yq/limitations.md` by this pass, since
+it was `{}` before and is a visible artefact now -- and `. |= key`). The sweep
+(`scripts/jq-path-context-oracle-sweep.sh`) reports 0 unexpected divergences on
+the same manifest.
+
+Three jq-mode extension assertions moved (`.a | (def f: 5; f) | key`,
+`.a | "\(key)" | key` and the `"\(key, ..)" | key` rows of #1403), each from
+`null` to nothing: jq 1.7.1 has no `key`, the same binary already printed
+nothing for `.a | 5 | key` and `.a | "x" | key`, and yq v4.53.3 prints nothing
+for `.a.b | "k=\(key)" | key`. The routing pins in
+`path_context_needs_eager_pins_the_three_reasons_2416` flipped for every shape
+the pass moved.
+
+### What still hands over
+
+Measured with the handover sites instrumented, on the proof queries, the sweep
+and the CLI suites, `path_context_needs_eager` answers `true` for exactly these
+shapes now:
+
+- a **fan-out head** with a stage after it that is not native at the cursor
+  (`.[] | .k | select(key == "k")`, `[.[] | .k | parent] | length`) -- the residue
+  ADR-0021 decision 7 records, refused by `path_context_fans_out` at the two
+  routing sites;
+- a **fan-out component** (`.c[(0,1)] | key`, `.[("a","b")] | key`) and a
+  component that can **escape** (`.c[halt] | key`, `.[break $out]`): `R1`,
+  because `path_context_is_navigational` refuses both;
+- a **slice head** (`.c[0:1] | .[0] | key + 1`, `.c[.n:.m] | ...`) and a
+  **`getpath` head** (`getpath(["a","b"]) | key`): `R1`, the third `PathNode`
+  variant the previous notes name -- not attempted here, since every one of them
+  is answered by the walk's *absence* rather than by any evaluator's model;
+- **`..`** (`[.. | key]`): `R1`, #2428's known divergence, untouched;
+- a **builtin with no identity rule** (`.a | explode | key`, `ltrimstr(..) |
+  [length, key]`, `sub("x";"y") | key`): `R1`;
+- a **computed `parent(n)`** (`parent(0+1)`), a **bare `$x` stage** after a
+  binding (`. as $x | $x | key`), and a **`repeat` in a fold's INPUT/INIT**: `R2`/`R3`
+  by the closed lists;
+- the `--eval-all` shapes whose file table cannot be made ambient
+  (`FILE_ORIGIN_SCOPE_AVAILABLE`), unchanged.
+
+Nothing else. The instrumentation was reverted before this section was
+committed; nothing in the tree carries it.
+
 ## Result
 
 | Metric                                            | Before | After                 |
@@ -866,10 +1003,15 @@ tree carries it.
 | ... starved by #2558                               | --     | 0 (9 `?`-headed rows re-derived) |
 | ... starved by #2471's head-of-pipe half           | --     | 0 (`A07`/`A19` re-derived)       |
 | ... starved by #2563                                | --     | 0 (11 `as`-spelled rows re-derived) |
+| ... starved by the identity pass                    | --     | 0 (40 listed rows re-derived) |
 | `PINNED_ARM_COUNT`                                 | 43     | 44                    |
 
-Nothing is deletable at this point in the spine. Doors 2 and 3 are closed as
-of step 5, which is a precondition rather than a deletion: the eager evaluator
+Nothing is deletable at this point in the spine -- and the identity pass is
+the measurement that says why: with every *stage* shape given a rule, the 44
+arms are all still reached through the residual *heads* (a computed
+`parent(n)`, a fan-out component, a slice, a `getpath`), so what deletes them
+is the walk carrying those heads, not another stage rule. Doors 2 and 3 are
+closed as of step 5, which is a precondition rather than a deletion: the eager evaluator
 shrinks when the generic evaluator gains native arms (widening
 `path_context_single_native`) and when the absent route widens. What the
 closure buys is that `path_context_needs_eager` is now the whole answer to
