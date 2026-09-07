@@ -25,6 +25,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `get_anchor_name`, this one fix covers both -- including combining
   correctly with #1352's key-anchor fix on a redefined key anchor.
 
+- **`succinctly yq`'s DOM write path (`=`, `|=`, `+=`, ...) no longer drops
+  an anchor when the write changes a node's kind** (#1359): a write that
+  turned an anchored container into a scalar (or vice versa), or an object
+  into an array, hit `reconcile_presentation_at_depth`'s "fresh node, no
+  presentation memory" arm, which cleared `&x` along with comment/style --
+  taking every `*x` alias to it down too, since nothing declared the name
+  any more. Real yq keeps the anchor across a kind change for the same
+  reason it keeps it across a same-kind write: the write replaces the
+  node's *value*, not its *identity*. Fixed by carrying an anchor
+  *declaration* through the kind-change arm unconditionally (matching the
+  same-kind arm just below it), and an *alias* mark only when the written
+  node was not itself a write target -- i.e. its kind changed purely as a
+  side effect of mirroring its anchor's own new value, not because it was
+  rebound directly. The latter distinction (found in code review) matters
+  because `propagate_assign_alias_marks` (#2497) only re-derives a stale
+  alias mark after a plain `=`/chain-of-`=` write; without it, a `|=`/`+=`
+  write landing exactly at an alias position could wrongly keep `*x` if a
+  later stage in the same pipe happened to give the position the same
+  value its anchor ended up with.
+
 - **`succinctly yq`'s cursor-streaming identity output no longer drops an
   anchor on a mapping key** (#1352): `&k key: 1` round-tripped as plain
   `key: 1` even on a no-op `.` query. The parser already indexed a key
