@@ -1845,30 +1845,27 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let msg_expr = self.parse_expr()?;
             self.skip_ws();
-            if self.peek() != Some(')') {
-                // #2036 review round 2: unlike the other 7 shadowable
-                // special forms (until/limit/while/repeat/range/first/last),
-                // this arm used to propagate `Err` straight from `expect`
-                // for a wrong-arity `error(a;b)` call, relying on
-                // `parse_shadowable_special_form`'s own
-                // `retry_shadow_candidate_as_generic_call` fallback to
-                // recover it as a generic call. That fallback re-parses
-                // `input[start_pos..]` from scratch *in addition to* the
-                // `parse_expr()` call just above, which had already fully
-                // (and, for a nested wrong-arity shadow candidate,
-                // recursively-and-also-retried) parsed the same content --
-                // doubling the parse work at every nesting level and
-                // exhausting `shadow_retry_budget` at a depth as shallow as
-                // 7 for a legitimate, non-adversarial nested `def
-                // error(a;b): ...` shadow. Matching #2110/#2237's own
-                // internal-rewind pattern here (`rewind_to_wrong_arity_call`)
-                // instead removes this arm from that fallback path entirely,
-                // exactly as it already does for the other 7 forms.
-                if self.mode == ParserMode::Jq {
-                    return self.rewind_to_wrong_arity_call(start_pos);
-                }
-                self.expect(')')?;
-                unreachable!();
+            // #2036 review round 2: unlike the other 7 shadowable special
+            // forms (until/limit/while/repeat/range/first/last), this arm
+            // used to propagate `Err` straight from `expect` for a
+            // wrong-arity `error(a;b)` call, relying on
+            // `parse_shadowable_special_form`'s own
+            // `retry_shadow_candidate_as_generic_call` fallback to recover
+            // it as a generic call. That fallback re-parses
+            // `input[start_pos..]` from scratch *in addition to* the
+            // `parse_expr()` call just above, which had already fully (and,
+            // for a nested wrong-arity shadow candidate,
+            // recursively-and-also-retried) parsed the same content --
+            // doubling the parse work at every nesting level and exhausting
+            // `shadow_retry_budget` at a depth as shallow as 7 for a
+            // legitimate, non-adversarial nested `def error(a;b): ...`
+            // shadow. Matching #2110/#2237's own internal-rewind pattern
+            // here (`rewind_to_wrong_arity_call`, via
+            // `expect_or_wrong_arity`, #2391) instead removes this arm from
+            // that fallback path entirely, exactly as it already does for
+            // the other 7 forms.
+            if let Err(early) = self.expect_or_wrong_arity(')', start_pos) {
+                return early;
             }
             self.next();
             Some(Box::new(msg_expr))
@@ -1984,12 +1981,8 @@ impl<'a> Parser<'a> {
         let start_pos = self.pos;
         self.consume_keyword("limit");
         self.skip_ws();
-        if self.peek() != Some('(') {
-            if self.mode == ParserMode::Jq {
-                return self.rewind_to_wrong_arity_call(start_pos);
-            }
-            self.expect('(')?;
-            unreachable!();
+        if let Err(early) = self.expect_or_wrong_arity('(', start_pos) {
+            return early;
         }
         self.next();
         self.skip_ws();
@@ -2017,12 +2010,8 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         let expr = self.parse_expr()?;
         self.skip_ws();
-        if self.peek() != Some(')') {
-            if self.mode == ParserMode::Jq {
-                return self.rewind_to_wrong_arity_call(start_pos);
-            }
-            self.expect(')')?;
-            unreachable!();
+        if let Err(early) = self.expect_or_wrong_arity(')', start_pos) {
+            return early;
         }
         self.next();
 
@@ -2041,34 +2030,22 @@ impl<'a> Parser<'a> {
         let start_pos = self.pos;
         self.consume_keyword("until");
         self.skip_ws();
-        if self.peek() != Some('(') {
-            if self.mode == ParserMode::Jq {
-                return self.rewind_to_wrong_arity_call(start_pos);
-            }
-            self.expect('(')?;
-            unreachable!();
+        if let Err(early) = self.expect_or_wrong_arity('(', start_pos) {
+            return early;
         }
         self.next();
         self.skip_ws();
         let cond = self.parse_expr()?;
         self.skip_ws();
-        if self.peek() != Some(';') {
-            if self.mode == ParserMode::Jq {
-                return self.rewind_to_wrong_arity_call(start_pos);
-            }
-            self.expect(';')?;
-            unreachable!();
+        if let Err(early) = self.expect_or_wrong_arity(';', start_pos) {
+            return early;
         }
         self.next();
         self.skip_ws();
         let update = self.parse_expr()?;
         self.skip_ws();
-        if self.peek() != Some(')') {
-            if self.mode == ParserMode::Jq {
-                return self.rewind_to_wrong_arity_call(start_pos);
-            }
-            self.expect(')')?;
-            unreachable!();
+        if let Err(early) = self.expect_or_wrong_arity(')', start_pos) {
+            return early;
         }
         self.next();
 
@@ -2087,34 +2064,22 @@ impl<'a> Parser<'a> {
         let start_pos = self.pos;
         self.consume_keyword("while");
         self.skip_ws();
-        if self.peek() != Some('(') {
-            if self.mode == ParserMode::Jq {
-                return self.rewind_to_wrong_arity_call(start_pos);
-            }
-            self.expect('(')?;
-            unreachable!();
+        if let Err(early) = self.expect_or_wrong_arity('(', start_pos) {
+            return early;
         }
         self.next();
         self.skip_ws();
         let cond = self.parse_expr()?;
         self.skip_ws();
-        if self.peek() != Some(';') {
-            if self.mode == ParserMode::Jq {
-                return self.rewind_to_wrong_arity_call(start_pos);
-            }
-            self.expect(';')?;
-            unreachable!();
+        if let Err(early) = self.expect_or_wrong_arity(';', start_pos) {
+            return early;
         }
         self.next();
         self.skip_ws();
         let update = self.parse_expr()?;
         self.skip_ws();
-        if self.peek() != Some(')') {
-            if self.mode == ParserMode::Jq {
-                return self.rewind_to_wrong_arity_call(start_pos);
-            }
-            self.expect(')')?;
-            unreachable!();
+        if let Err(early) = self.expect_or_wrong_arity(')', start_pos) {
+            return early;
         }
         self.next();
 
@@ -2133,23 +2098,15 @@ impl<'a> Parser<'a> {
         let start_pos = self.pos;
         self.consume_keyword("repeat");
         self.skip_ws();
-        if self.peek() != Some('(') {
-            if self.mode == ParserMode::Jq {
-                return self.rewind_to_wrong_arity_call(start_pos);
-            }
-            self.expect('(')?;
-            unreachable!();
+        if let Err(early) = self.expect_or_wrong_arity('(', start_pos) {
+            return early;
         }
         self.next();
         self.skip_ws();
         let expr = self.parse_expr()?;
         self.skip_ws();
-        if self.peek() != Some(')') {
-            if self.mode == ParserMode::Jq {
-                return self.rewind_to_wrong_arity_call(start_pos);
-            }
-            self.expect(')')?;
-            unreachable!();
+        if let Err(early) = self.expect_or_wrong_arity(')', start_pos) {
+            return early;
         }
         self.next();
 
@@ -2172,12 +2129,8 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let expr = self.parse_expr()?;
             self.skip_ws();
-            if self.peek() != Some(')') {
-                if self.mode == ParserMode::Jq {
-                    return self.rewind_to_wrong_arity_call(start_pos);
-                }
-                self.expect(')')?;
-                unreachable!();
+            if let Err(early) = self.expect_or_wrong_arity(')', start_pos) {
+                return early;
             }
             self.next();
             Ok(Expr::FirstExpr(Box::new(expr)))
@@ -2199,12 +2152,8 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let expr = self.parse_expr()?;
             self.skip_ws();
-            if self.peek() != Some(')') {
-                if self.mode == ParserMode::Jq {
-                    return self.rewind_to_wrong_arity_call(start_pos);
-                }
-                self.expect(')')?;
-                unreachable!();
+            if let Err(early) = self.expect_or_wrong_arity(')', start_pos) {
+                return early;
             }
             self.next();
             Ok(Expr::LastExpr(Box::new(expr)))
@@ -2226,12 +2175,8 @@ impl<'a> Parser<'a> {
         let start_pos = self.pos;
         self.consume_keyword("range");
         self.skip_ws();
-        if self.peek() != Some('(') {
-            if self.mode == ParserMode::Jq {
-                return self.rewind_to_wrong_arity_call(start_pos);
-            }
-            self.expect('(')?;
-            unreachable!();
+        if let Err(early) = self.expect_or_wrong_arity('(', start_pos) {
+            return early;
         }
         self.next();
         self.skip_ws();
@@ -2294,12 +2239,8 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         let step = self.parse_expr()?;
         self.skip_ws();
-        if self.peek() != Some(')') {
-            if self.mode == ParserMode::Jq {
-                return self.rewind_to_wrong_arity_call(start_pos);
-            }
-            self.expect(')')?;
-            unreachable!();
+        if let Err(early) = self.expect_or_wrong_arity(')', start_pos) {
+            return early;
         }
         self.next();
 
@@ -2709,6 +2650,58 @@ impl<'a> Parser<'a> {
         self.parse_postfix(call)
     }
 
+    /// One shared definition of the 7-line argument-boundary checkpoint
+    /// hand-copied at ~15 sites (#2391) across the eight dedicated
+    /// special-form parsers that resolve a mismatch via
+    /// [`Self::rewind_to_wrong_arity_call`] (`parse_limit_expr`/
+    /// `parse_until_expr`/`parse_while_expr`/`parse_repeat_expr`/
+    /// `parse_first_expr`/`parse_last_expr`/`parse_range_expr`/
+    /// `parse_error_expr`): `if self.peek() != Some(expected) { if jq mode,
+    /// rewind and resolve as a (possibly shadowed) wrong-arity call;
+    /// otherwise raise `expect`'s own natural error }`.
+    ///
+    /// Returns `Ok(())` when the check passes -- the caller still owns its
+    /// own `self.next()` to actually consume `expected`, unchanged from
+    /// every site's original shape -- or `Err(result)` carrying exactly
+    /// what the caller should immediately `return`: `if let Err(early) =
+    /// self.expect_or_wrong_arity(expected, start_pos) { return early; }`.
+    fn expect_or_wrong_arity(
+        &mut self,
+        expected: char,
+        start_pos: usize,
+    ) -> Result<(), Result<Expr, ParseError>> {
+        if self.peek() == Some(expected) {
+            return Ok(());
+        }
+        if self.mode == ParserMode::Jq {
+            return Err(self.rewind_to_wrong_arity_call(start_pos));
+        }
+        Err(self.expect(expected).map(|()| unreachable!()))
+    }
+
+    /// [`Self::expect_or_wrong_arity`]'s sibling for the
+    /// `Result<Option<T>, ParseError>`-returning family instead
+    /// (`Self::parse_required_single_arg`, `env`'s own `env(VAR)` parsing,
+    /// #2391): a mismatch rewinds to `start_pos` and signals "not a match"
+    /// (`Ok(None)`) in jq mode, letting the caller's own shadow-candidate
+    /// fallback resolve it, rather than resolving the wrong-arity call
+    /// itself the way `expect_or_wrong_arity` does. yq mode raises
+    /// `expect`'s own natural error, same as its sibling.
+    fn expect_or_none<T>(
+        &mut self,
+        expected: char,
+        start_pos: usize,
+    ) -> Result<(), Result<Option<T>, ParseError>> {
+        if self.peek() == Some(expected) {
+            return Ok(());
+        }
+        if self.mode == ParserMode::Jq {
+            self.pos = start_pos;
+            return Err(Ok(None));
+        }
+        Err(self.expect(expected).map(|()| unreachable!()))
+    }
+
     /// Parse a format string: @text, @json, @uri, @dsv(delimiter), etc.
     fn parse_format_string(&mut self) -> Result<Expr, ParseError> {
         self.expect('@')?;
@@ -2911,25 +2904,18 @@ impl<'a> Parser<'a> {
     /// fix -- yq mode keeps the pre-#2237 raw ParseError unchanged.
     fn parse_required_single_arg(&mut self, start_pos: usize) -> Result<Option<Expr>, ParseError> {
         self.skip_ws();
-        if self.peek() != Some('(') {
-            if self.mode == ParserMode::Jq {
-                self.pos = start_pos;
-                return Ok(None);
-            }
-            // Not a rewind case (yq mode) -- `expect` raises the identical
-            // error the pre-#2237 unconditional `self.expect('(')?` did.
-            return self.expect('(').map(|()| unreachable!());
+        // #2391: `expect_or_none` -- yq mode's own not-a-rewind-case raises
+        // the identical error the pre-#2237 unconditional `self.expect('(')?`
+        // did, same as before this helper existed.
+        if let Err(early) = self.expect_or_none('(', start_pos) {
+            return early;
         }
         self.next();
         self.skip_ws();
         let arg = self.parse_expr()?;
         self.skip_ws();
-        if self.peek() != Some(')') {
-            if self.mode == ParserMode::Jq {
-                self.pos = start_pos;
-                return Ok(None);
-            }
-            return self.expect(')').map(|()| unreachable!());
+        if let Err(early) = self.expect_or_none(')', start_pos) {
+            return early;
         }
         self.next();
         Ok(Some(arg))
@@ -4262,12 +4248,10 @@ impl<'a> Parser<'a> {
                     }
                 };
                 self.skip_ws();
-                if self.peek() != Some(')') {
-                    if self.mode == ParserMode::Jq {
-                        self.pos = keyword_start;
-                        return Ok(None);
-                    }
-                    return self.expect(')').map(|()| unreachable!());
+                // #2391: expect_or_none -- same shared checkpoint
+                // `parse_required_single_arg` uses.
+                if let Err(early) = self.expect_or_none(')', keyword_start) {
+                    return early;
                 }
                 self.next();
                 return Ok(Some(Builtin::EnvObject(var_name)));
