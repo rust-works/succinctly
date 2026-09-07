@@ -2904,6 +2904,21 @@ fn test_default_json_output_escapes_nul_and_does_not_error() -> Result<()> {
 /// 0x7f byte in the Rust source (a `\x7f` escape), not a JSON `\u007f`
 /// escape sequence in the input text -- the latter would already contain
 /// a backslash and take the slow, always-correct path, testing nothing.
+/// #1982: real jq leaves U+2028/U+2029 (line/paragraph separator) raw in
+/// JSON output (confirmed live against jq 1.7.1) -- only yq's own
+/// convention escapes them (see the yq-mode sibling tests in
+/// yq_cli_tests.rs). Pins that write_json_body_yq's new escaping (added
+/// for #1982) is genuinely yq-scoped and never leaked into the shared
+/// control-character table write_json_body_jq also uses.
+#[test]
+fn test_line_paragraph_separators_stay_raw_in_jq_mode_1982() -> Result<()> {
+    let input = "{\"a\": \"x\u{2028}y\u{2029}z\"}";
+    let (out, _, code) = run_jq_full(&["-c", "."], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "{\"a\":\"x\u{2028}y\u{2029}z\"}\n", "stdout: {out:?}");
+    Ok(())
+}
+
 #[test]
 fn test_default_json_output_escapes_raw_del_byte_in_value_2591() -> Result<()> {
     let input = "{\"a\": \"xy\"}";

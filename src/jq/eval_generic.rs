@@ -1315,15 +1315,25 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
             CommentTree::Array(own_meta, comment_items),
         ))
     } else {
-        // #2358: `value` is scalar here (the object/array arms above
-        // return first), so `to_owned_at_depth`'s `cursor` parameter is
-        // never consulted on this path either -- passed through from this
-        // function's own parameter purely because it's already in scope,
-        // not because it matters.
-        Ok((
-            to_owned_at_depth(value, cursor, depth)?,
-            CommentTree::Leaf(own_meta),
-        ))
+        // #1982: unlike the container arms above (where `cursor` is only
+        // consulted for `tail_gap_ok`, per #2358's comment there), a
+        // scalar leaf's cursor matters on its own merits --
+        // `explicit_tag()` forces a specific resolution (`!!str 5` is the
+        // string `"5"`, not the number `5`, #224) that `to_owned_at_depth`'s
+        // value-only dispatch has no way to see (the tag lives on the
+        // cursor's `bp_pos`, not on the extracted `YamlValue` -- #747).
+        // Mirrors `to_owned_cursor_at_depth`'s own scalar arm, via the same
+        // shared `tagged_scalar_to_owned`, falling back to
+        // `to_owned_at_depth` when no tag applies (untagged, or a tag
+        // `resolve_tagged` doesn't recognize).
+        let owned = match cursor
+            .and_then(|c| c.explicit_tag())
+            .and_then(|tag| tagged_scalar_to_owned(tag, value))
+        {
+            Some(owned) => owned,
+            None => to_owned_at_depth(value, cursor, depth)?,
+        };
+        Ok((owned, CommentTree::Leaf(own_meta)))
     }
 }
 

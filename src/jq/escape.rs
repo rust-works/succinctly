@@ -5,9 +5,12 @@
 //! module is that single definition; every writer in the crate and in the CLI
 //! routes here rather than open-coding a `match` over `char`.
 //!
-//! See [`write_json_body_jq`] for the table both conventions are pinned to, and
-//! `conventions_differ_at_exactly_three_code_points` in this module's tests for
-//! the assertion that keeps them from drifting apart again (#385).
+//! See [`write_json_body_jq`] for the control-character table both
+//! conventions are pinned to, [`write_json_body_yq`] for yq's one addition
+//! beyond it (U+2028/U+2029, #1982), and
+//! `conventions_differ_at_exactly_five_code_points` in this module's tests
+//! for the assertion that keeps all five from drifting apart again (#385,
+//! #1982).
 
 #[cfg(not(test))]
 use alloc::string::String;
@@ -66,8 +69,11 @@ fn write_bmp_u_escape<W: Write>(out: &mut W, cp: u32) -> core::fmt::Result {
 /// | `0x80..=0x9f` (C1)   | raw            | raw            |
 /// | other non-ASCII      | raw            | raw            |
 ///
-/// The two conventions therefore differ at exactly three code points: `0x08`,
-/// `0x0c` and `0x7f`.
+/// The two conventions therefore differ at exactly three code points within
+/// this control-character table: `0x08`, `0x0c` and `0x7f`. Two more lie
+/// outside it entirely -- U+2028/U+2029, yq's own addition documented on
+/// [`write_json_body_yq`] (#1982) -- for five differences in total, per
+/// `conventions_differ_at_exactly_five_code_points`.
 ///
 /// The C1 row is the one that cost a bug (#385): `char::is_control()` is true
 /// for U+0080–U+009F, so branching on it escapes characters JSON does not
@@ -119,6 +125,25 @@ pub fn write_json_body_jq_ascii<W: Write>(out: &mut W, s: &str) -> core::fmt::Re
 /// (O3, #87): [`find_json_escape`] looks for `"`, `\` and `< 0x20`, which is
 /// exactly yq's escape set, and everything between two hits is copied as one
 /// span.
+///
+/// U+2028/U+2029 (line/paragraph separator) are yq's one addition beyond
+/// that set (#1982) — confirmed live against `mikefarah/yq` v4.53.3 that it
+/// always escapes them to `\u2028`/`\u2029` in JSON output, regardless of
+/// source (a YAML `\L`/`\P` escape, a raw UTF-8 byte in a quoted scalar, or
+/// one already present in JSON input); real jq leaves both raw, so
+/// [`write_json_body_jq`] is untouched. Each is a 3-byte UTF-8 sequence
+/// (`E2 80 A8`/`E2 80 A9`), so neither can trip `find_json_escape`'s
+/// single-byte scan (every one of `"`, `\`, `< 0x20` is a distinct byte
+/// value, and both separators' bytes are all `>= 0x80`) — a span the scan
+/// reports as escape-free is copied here byte for byte, so it still needs
+/// its own check. Gated on a cheap `contains(0xE2)` byte-existence probe
+/// first (mirroring this module's `contains_cr` precheck): only the lead
+/// byte both separators share with a broad swath of otherwise-ordinary
+/// non-ASCII text (curly quotes, em dash, bullets, ...), so almost every
+/// span skips the per-character walk entirely, and the two-hit case this
+/// exists for is rare enough in real documents that paying for it with a
+/// linear scan (rather than widening the shared SIMD scanner every caller
+/// of `find_json_escape` pays for) is the right trade.
 pub fn write_json_body_yq<W: Write>(out: &mut W, s: &str) -> core::fmt::Result {
     let bytes = s.as_bytes();
     let len = bytes.len();
@@ -128,7 +153,7 @@ pub fn write_json_body_yq<W: Write>(out: &mut W, s: &str) -> core::fmt::Result {
         let escape_pos = find_json_escape(bytes, i);
 
         if i < escape_pos {
-            out.write_str(&s[i..escape_pos])?;
+            write_yq_span_escaping_separators(out, &s[i..escape_pos])?;
         }
 
         i = escape_pos;
@@ -149,6 +174,31 @@ pub fn write_json_body_yq<W: Write>(out: &mut W, s: &str) -> core::fmt::Result {
         }
     }
 
+    Ok(())
+}
+
+/// Write a span [`write_json_body_yq`] has already confirmed contains none
+/// of `"`, `\` or a `< 0x20` control -- so the only thing left to check is
+/// U+2028/U+2029 (see that function's own doc comment). The `contains`
+/// probe is byte-level (not `char`), which is sound here: UTF-8 guarantees
+/// no other code point's encoding contains the standalone byte `0xE2` in a
+/// position that would false-positive this into the slow path incorrectly
+/// escaping something -- the slow path re-walks by `char` and only ever
+/// matches the two exact code points, so a same-byte false trigger (e.g.
+/// U+2014 em dash, U+2022 bullet) just costs an extra linear pass, never a
+/// wrong escape.
+#[inline]
+fn write_yq_span_escaping_separators<W: Write>(out: &mut W, span: &str) -> core::fmt::Result {
+    if !span.as_bytes().contains(&0xE2) {
+        return out.write_str(span);
+    }
+    for c in span.chars() {
+        match c {
+            '\u{2028}' => out.write_str("\\u2028")?,
+            '\u{2029}' => out.write_str("\\u2029")?,
+            c => out.write_char(c)?,
+        }
+    }
     Ok(())
 }
 
@@ -332,10 +382,11 @@ mod tests {
 
     /// Every code point the two conventions have to agree or disagree on:
     /// all of Latin-1 (C0, printable ASCII, DEL, C1, high Latin-1), a
-    /// multi-byte BMP character, a line separator, and an astral one.
+    /// multi-byte BMP character, the two separators (#1982), and an astral
+    /// one.
     fn corpus() -> Vec<char> {
         let mut cs: Vec<char> = (0u32..=0xFF).map(|c| char::from_u32(c).unwrap()).collect();
-        cs.extend(['é', '\u{2028}', '😀']);
+        cs.extend(['é', '\u{2028}', '\u{2029}', '😀']);
         cs
     }
 
@@ -343,8 +394,12 @@ mod tests {
     /// test that pins the delta. Asserting only that they *agree* would pass if
     /// both writers broke the same way, so this asserts the disagreement set
     /// exactly — and the next test asserts what each side renders there.
+    ///
+    /// Five, not three (#1982 added U+2028/U+2029 to yq's own table --
+    /// confirmed live against `mikefarah/yq` v4.53.3 that it escapes both
+    /// unconditionally in JSON output, where real jq leaves both raw).
     #[test]
-    fn conventions_differ_at_exactly_three_code_points() {
+    fn conventions_differ_at_exactly_five_code_points() {
         let mut differ: Vec<char> = Vec::new();
         for c in corpus() {
             let s = String::from(c);
@@ -352,16 +407,27 @@ mod tests {
                 differ.push(c);
             }
         }
-        assert_eq!(differ, vec!['\u{8}', '\u{c}', '\u{7f}']);
+        assert_eq!(
+            differ,
+            vec!['\u{8}', '\u{c}', '\u{7f}', '\u{2028}', '\u{2029}']
+        );
     }
 
     #[test]
-    fn the_three_differences_render_as_documented() {
+    fn all_five_differences_render_as_documented() {
         assert_eq!((jq("\u{8}"), yq("\u{8}")), ("\\b".into(), "\\u0008".into()));
         assert_eq!((jq("\u{c}"), yq("\u{c}")), ("\\f".into(), "\\u000c".into()));
         assert_eq!(
             (jq("\u{7f}"), yq("\u{7f}")),
             ("\\u007f".into(), "\u{7f}".into())
+        );
+        assert_eq!(
+            (jq("\u{2028}"), yq("\u{2028}")),
+            ("\u{2028}".into(), "\\u2028".into())
+        );
+        assert_eq!(
+            (jq("\u{2029}"), yq("\u{2029}")),
+            ("\u{2029}".into(), "\\u2029".into())
         );
     }
 

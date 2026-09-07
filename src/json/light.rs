@@ -3270,8 +3270,11 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
 /// under yq's own convention (`Preserve`), which agrees with source on
 /// every byte legal unescaped in JSON -- but jq's convention (`JqCompat`)
 /// diverges from that at exactly one such byte, DEL (`0x7f`, #2591:
-/// `jq::escape`'s own `conventions_differ_at_exactly_three_code_points`
-/// names all three differences; the other two, backspace/form-feed, always
+/// `jq::escape`'s own `conventions_differ_at_exactly_five_code_points`
+/// names all five differences (three within the control-character range
+/// this comment's own claim is scoped to, plus two multi-byte separators,
+/// #1982, that are out of scope for a single-*byte* fast path like this
+/// one); the other two control-range differences, backspace/form-feed, always
 /// arrive pre-escaped with a `\` and so never reach this fast path at all).
 /// `del_unsafe` below is what keeps a `JqCompat` span containing a raw DEL
 /// byte off this path. **Three call sites in
@@ -4377,9 +4380,11 @@ mod tests {
 
     /// #2209: the escape table is a *mode* rule, not a `--preserve-input`
     /// one. `JqPreserveInput` must agree with `JqCompat` and differ from
-    /// `Preserve` on exactly the three code points the two tables disagree
-    /// on (0x08, 0x0c, DEL) -- the set pinned by `jq::escape`'s own
-    /// `conventions_differ_at_exactly_three_code_points`. Before #2209 jq
+    /// `Preserve` on exactly the three control-range code points the two
+    /// tables disagree on (0x08, 0x0c, DEL) -- three of the five pinned by
+    /// `jq::escape`'s own `conventions_differ_at_exactly_five_code_points`
+    /// (the other two, U+2028/U+2029, are multi-byte and out of scope for
+    /// this control-range check). Before #2209 jq
     /// mode's `--preserve-input` selected `Preserve` and so produced the yq
     /// column here, diverging from real jq on any navigation-only filter.
     #[test]
