@@ -2708,18 +2708,21 @@ fn push_generic_owned_values<V: DocumentValue>(
 /// colliding-decode-failure-key -- and if so, the `Control::Error` a
 /// caller should raise.
 ///
-/// The shared document-validation gate behind five call sites spanning
-/// four feature families -- `select`'s truthiness check
+/// The shared document-validation gate behind three call sites spanning
+/// two feature families -- `select`'s truthiness check
 /// (`push_generic_truthiness`, the only one actually about truthiness;
 /// see its own doc comment for why it falls through to
-/// [`DocumentCursor::is_falsy`]'s silent "not falsy" default otherwise),
-/// `sort_by`/`unique_by`/`min_by`/`max_by`'s comparison key
-/// (`key_elements_generic`), the path-context fast path
-/// (`path_context_root`), and `path(...)` (`eval_builtin`) -- not a
-/// truthiness-specific helper despite this function's former name
-/// (#2413): each of those five callers needs the #1247/#1194 validation
-/// below without ever materializing an `OwnedValue` for the subtree it's
-/// validating.
+/// [`DocumentCursor::is_falsy`]'s silent "not falsy" default otherwise)
+/// and `sort_by`/`unique_by`/`min_by`/`max_by`'s comparison key
+/// (`key_elements_generic`) -- not a truthiness-specific helper despite
+/// this function's former name (#2413): each of those callers needs the
+/// #1247/#1194 validation below without ever materializing an
+/// `OwnedValue` for the subtree it's validating. In both, the subtree
+/// walked is the value the query tests or emits. The path-context walk
+/// (`path_context_root`) and `path(...)` (`eval_builtin`) used to be the
+/// other two callers, running this over the *whole document* to answer a
+/// bounded query; #2168 (direction 2) dropped that, so they validate only
+/// the nodes they navigate through, like `.d` does.
 ///
 /// This is [`to_owned_cursor_at_depth`]'s own traversal and validation
 /// (same object/array unconsing, same key-collision guard) -- but it
@@ -12381,21 +12384,16 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
                     // priority order as `scalar_fallback`/
                     // `decode_failure_or` elsewhere in this fix.
                     //
-                    // Currently unreachable via this function's only caller
-                    // (`Builtin::Path`, `eval_generic.rs`): confirmed via a
-                    // temporary debug probe that `path_step_generic` is
-                    // never even entered for a document containing an
-                    // undecodable scalar, because that caller's own
-                    // `push_generic_document_validation_error` pre-walk
-                    // (#1755/#1953's "validity gate", a whole-*document*
-                    // check run before any cursor walk) already raises the
-                    // identical `decode_failure` first, regardless of
-                    // whether the query's own path ever touches that
-                    // scalar. Kept anyway, matching the equivalent
-                    // defensive arm in `decode_failure_or`/`scalar_fallback`
-                    // elsewhere in this fix -- correct if a future caller of
-                    // this function ever reaches it without that same
-                    // upfront gate.
+                    // Live since #2168 (direction 2). This arm was written
+                    // defensively and documented as unreachable, because
+                    // every caller ran `push_generic_document_validation_
+                    // error` over the whole document first and raised the
+                    // identical `decode_failure` before the walk started.
+                    // That pre-walk is gone; this is now the place
+                    // `path(.a[])`/`.a[] | key` on `{"a":"\ud800"}` raise,
+                    // and the reason `[path(.[])]` still rejects a document
+                    // whose undecodable scalar the iteration reaches while
+                    // `path(.d)` no longer rejects one it never touches.
                     Err(EvalError::decode_failure(reason))
                 } else if S::TAG == EvalTag::Yq {
                     // #2346: see this arm's `PathNode::Absent` sibling
@@ -14656,16 +14654,25 @@ fn path_context_single_native(expr: &Expr) -> bool {
     }
 }
 
-/// The root position of a walk, once the document has passed the same
-/// validity gate the bridge's `to_owned_with_cursor` doubles as (#1755/#1953):
-/// dropping it would make these pipes start accepting documents they reject
-/// today. `push_generic_document_validation_error` is that same traversal and
-/// validation with the `OwnedValue` construction removed -- the same gate
-/// `Builtin::Path` runs, for the same reason.
+/// The root position of a walk.
+///
+/// No whole-document validation runs here (#2168, direction 2). Until then
+/// this ran `push_generic_document_validation_error` over the entire input
+/// before the first step, inherited from the bridge's `to_owned_with_cursor`
+/// that #2151 replaced: an O(document) traversal charged to answer
+/// `.[0] | key`, and 67-75% of that query's runtime on a 20 MB input. The
+/// rule now is the one plain navigation already followed -- `key`/`path`/
+/// `parent` validate only the nodes they navigate through or materialize,
+/// so `.d.e | key` answers on `{"a":"\ud800","d":{"e":5}}` exactly as `.d.e`
+/// does, and `.a | length` still raises. The per-node checks live in the
+/// step itself (`path_step_generic`: `find_cursor`'s #1677 delimiter scan,
+/// `effective_fields_checked`/`collect_cursors_checked`, the Iterate arm's
+/// `string_decode_error` raise). Real jq and yq both reject such a document
+/// at parse time, so every option here is an ADR-0018 divergence and the
+/// tie-break is internal consistency; recorded in
+/// `docs/compliance/jq/limitations.md`. `select` and the `sort_by` family
+/// keep their gate: the value they test or emit *is* the walk's domain.
 fn path_context_root<V: DocumentValue>(root: V::Cursor) -> Result<PathContextPos<V>, Control> {
-    if let Some(control) = push_generic_document_validation_error(&root, 0) {
-        return Err(control);
-    }
     // The walk's input is not always the document root: a nested pipe
     // (`first(.a | parent | parent)`) is walked from the node the outer
     // stage handed it (#2416 phase 3). `path`/`parent` are absolute, so the
@@ -16820,21 +16827,20 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // on the document's *structure* along the path, never on a value
             // that has to be computed, so it can be walked with cursors.
             //
-            // The whole-document walk is not skipped, only the tree build:
-            // `to_owned_with_cursor` doubles as a validity gate (#1755/
-            // #1953), and dropping it would make `path(.d)` start accepting
-            // documents it rejects today. `push_generic_document_validation_error`
-            // is that same traversal and validation with the `OwnedValue`
-            // construction removed, so error behaviour is unchanged while the
-            // allocation is not paid.
+            // #2168 (direction 2): no whole-document validation runs before
+            // the walk any more. #2061 kept one (`push_generic_document_
+            // validation_error` over the entire input, the traversal
+            // `to_owned_with_cursor` had doubled as) so that `path(.d)` went
+            // on rejecting `{"a":"\ud800","d":5}`; that cost O(document) to
+            // answer a bounded query and was most of `path(.)`'s runtime.
+            // The rule is now the one `.d` already followed: validate only
+            // the nodes the walk navigates through, via `path_step_generic`'s
+            // own per-node checks. The owned fallback below, for a shape
+            // `path_expr_is_cursor_navigable` refuses, still materializes the
+            // whole document and therefore still raises on it -- that
+            // boundary is recorded with the rest of the decision in
+            // `docs/compliance/jq/limitations.md`.
             if let Some(root) = cursor.filter(|_| path_expr_is_cursor_navigable(path_expr)) {
-                if let Some(control) = push_generic_document_validation_error(&root, 0) {
-                    return match control {
-                        Control::Error(e) => GenericResult::Error(e),
-                        Control::Break(label) => GenericResult::Break(label),
-                        Control::Halt(code) => GenericResult::Halt(code),
-                    };
-                }
                 let mut out = Vec::new();
                 return match path_walk_generic::<S, V>(
                     path_expr,

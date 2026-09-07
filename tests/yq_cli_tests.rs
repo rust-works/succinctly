@@ -30475,34 +30475,83 @@ fn test_path_context_cursor_walk_falls_back_2061() -> Result<()> {
     Ok(())
 }
 
-/// #2061: the validity gate is kept, only the tree build is dropped.
+/// #2168: the path-context walk (`key`/`path`/`parent`) validates only the
+/// nodes it navigates through -- an undecodable *sibling* it never visits no
+/// longer raises.
 ///
-/// `to_owned_with_cursor` doubles as a decode-failure gate (#1755/#1953), so
-/// a walk that reached the answer without decoding everything would silently
-/// start accepting documents these pipes reject today.
-/// `push_generic_document_validation_error` is that same traversal and
-/// validation without the `OwnedValue` construction.
+/// This reverses `test_path_context_cursor_walk_keeps_the_validity_gate_2061`.
+/// #2061 kept a whole-document gate here (`push_generic_document_validation_
+/// error`, the traversal the `to_owned_with_cursor` it replaced had doubled
+/// as); #2168 measured it at 67-75% of such a query's runtime and settled the
+/// consistency question it left open, since `.d.e` itself always answered on
+/// exactly these documents.
+///
+/// **No jq oracle** (`key`/`parent` are succinctly extensions in the first
+/// place, and real jq 1.7.1 rejects every document below at parse time). The
+/// contract pinned is succinctly's own lazy-validation rule, recorded in
+/// `docs/compliance/jq/limitations.md`.
 #[test]
-fn test_path_context_cursor_walk_keeps_the_validity_gate_2061() -> Result<()> {
-    // An undecodable *sibling* the walk never visits still raises.
+fn test_path_context_cursor_walk_skips_an_undecodable_sibling_2168() -> Result<()> {
     for input in [
         r#"{"a":"\ud800","d":{"e":5}}"#,
         r#"{"a":"\uZZZZ","d":{"e":5}}"#,
         r#"{"a":"\x","d":{"e":5}}"#,
         r#"{"a":"\u12","d":{"e":5}}"#,
     ] {
-        for filter in [".d.e | key", ".d.e | path", ".d.e | parent"] {
+        for (filter, want) in [
+            (".d.e | key", r#""e""#),
+            (".d.e | path", r#"["d","e"]"#),
+            (".d.e | parent", r#"{"e":5}"#),
+        ] {
             let (out, code) = run_jq_stdin(filter, input, &["-c"])?;
-            assert_ne!(code, 0, "`{filter}` on `{input}` must still raise: {out:?}");
-            assert_eq!(out, "", "`{filter}` on `{input}`");
+            assert_eq!(code, 0, "`{filter}` on `{input}`: {out:?}");
+            assert_eq!(out.trim(), want, "`{filter}` on `{input}`");
         }
+
+        // The node the query *does* read is still validated: reading the
+        // undecodable value raises exactly as the bare navigation does.
+        let (out, code) = run_jq_stdin(".a | length", input, &["-c"])?;
+        assert_ne!(code, 0, "`.a | length` on `{input}` must raise: {out:?}");
     }
 
-    // A well-formed document with the same shape answers normally, so the
-    // gate is not simply rejecting everything.
+    // A well-formed document with the same shape is unchanged.
     let (out, code) = run_jq_stdin(".d.e | key", r#"{"a":"ok","d":{"e":5}}"#, &["-c"])?;
     assert_eq!(code, 0);
     assert_eq!(out.trim(), r#""e""#);
+
+    Ok(())
+}
+
+/// #2168, yq mode: the same rule, reached through `succinctly yq` rather than
+/// `succinctly jq`, since the walk is one generic implementation shared by
+/// both modes (ADR-0018 rule 2's shared-builtin hazard -- a change verified
+/// in one mode has to be verified in the other).
+///
+/// **No yq oracle:** real yq v4.53.3 rejects this document while *scanning*
+/// it (`found invalid Unicode character escape code`), for `.d` as much as
+/// for `.d.e | key`, so it separates none of these rows.
+#[test]
+fn test_path_context_walk_skips_an_undecodable_sibling_yq_mode_2168() -> Result<()> {
+    let doc = "a: \"\\ud800\"\nd:\n  e: 5\n";
+    let args = ["-o=json", "-I=0"];
+
+    for (filter, want) in [
+        (".d.e | key", r#""e""#),
+        (".d.e | path", r#"["d","e"]"#),
+        (".d.e | parent", r#"{"e":5}"#),
+        (".d", r#"{"e":5}"#),
+    ] {
+        let (out, code) = run_yq_stdin(filter, doc, &args)?;
+        assert_eq!(code, 0, "`{filter}`: {out:?}");
+        assert_eq!(out.trim(), want, "`{filter}`");
+    }
+
+    // Reading the undecodable scalar still raises, and so does the gate the
+    // sort family keeps -- the two halves of the #2168 decision, side by side.
+    for filter in [".a", ".a | length", "sort_by(.d) | length"] {
+        let (out, code) = run_yq_stdin(filter, doc, &args)?;
+        assert_ne!(code, 0, "`{filter}` must raise: {out:?}");
+    }
 
     Ok(())
 }
