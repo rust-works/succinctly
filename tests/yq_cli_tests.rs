@@ -34194,6 +34194,58 @@ fn test_yq_all_four_empty_operand_shapes_are_indistinguishable_2460() -> Result<
     Ok(())
 }
 
+/// #2540: a literal or constructor `and`/`or` operand still yields its own
+/// one node even when the pipe stage feeding it produced zero nodes under
+/// `and`/`or`'s own read-only context (#2470) -- real yq's `valueOperator`/
+/// `operator_collect.go`/`operator_create_map.go` each special-case a
+/// zero-node context by re-emitting a node anyway, where `.`/`length`
+/// (`operator_self.go`, a plain loop) do not and correctly stay empty.
+///
+/// Captured live against Homebrew `yq` v4.53.3 on `a: {b: 1, c: false}\nx:
+/// true`, the same document and filters #2540's own issue body pins.
+#[test]
+fn test_yq_empty_context_literal_or_constructor_and_operand_2540() -> Result<()> {
+    const DOC: &str = "a:\n  b: 1\n  c: false\nx: true\n";
+    for (filter, want) in [
+        (r"(.a.zz | true) and true", "true"),
+        (r"(.a.zz | 5) and true", "true"),
+        (r#"(.a.zz | "s") and true"#, "true"),
+        (r"(.a.zz | [.]) and true", "true"),
+        (r#"(.a.zz | {"k":1}) and true"#, "true"),
+        (r"(.a.zz | .) and true", "false"),
+        (r"(.a.zz | length) and true", "false"),
+    ] {
+        let (out, _, code) = run_yq_stdin_with_stderr(filter, DOC, &["-o", "json", "-I", "0"])?;
+        assert_eq!(out.trim(), want, "`{filter}`");
+        assert_eq!(code, 0, "`{filter}`");
+    }
+    Ok(())
+}
+
+/// #2540 sibling: the disqualifying shapes that must still stay empty --
+/// `[.a]`/`[1,2]` (an array always re-emits, but the array constructor's own
+/// zero-node special case is independent of what its body would have
+/// produced) and `{"k": .}`/`{"k": 1, "j": .}` (an object re-emits only when
+/// *every* field value also independently qualifies; one disqualifying
+/// field voids the whole object, not just that field -- unlike an array,
+/// which never propagates its body's own emptiness at all). Captured live
+/// against yq v4.53.3.
+#[test]
+fn test_yq_empty_context_constructor_value_shapes_2540() -> Result<()> {
+    const DOC: &str = "a:\n  b: 1\n";
+    for (filter, want) in [
+        (r"(.a.zz | [.a]) and true", "true"),
+        (r"(.a.zz | [1,2]) and true", "true"),
+        (r#"(.a.zz | {"k": .}) and true"#, "false"),
+        (r#"(.a.zz | {"k": 1, "j": .}) and true"#, "false"),
+    ] {
+        let (out, _, code) = run_yq_stdin_with_stderr(filter, DOC, &["-o", "json", "-I", "0"])?;
+        assert_eq!(out.trim(), want, "`{filter}`");
+        assert_eq!(code, 0, "`{filter}`");
+    }
+    Ok(())
+}
+
 // =============================================================================
 // #2470: yq's read-only evaluation context (`Context.DontAutoCreate`)
 // =============================================================================
