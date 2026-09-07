@@ -21444,7 +21444,7 @@ fn yq_prepare_assign_targets<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // Same `optional` policy, in the same order, as `eval_assign`'s own
     // jq-mode arm: a non-decode-failure `to_owned` error and a path
     // resolution error are both swallowed by an outer `?`, a halt never is.
-    let (pristine, mut paths) = match resolved {
+    let (pristine, paths) = match resolved {
         Some(pair) => pair,
         None => {
             let pristine = match to_owned(input) {
@@ -21459,12 +21459,24 @@ fn yq_prepare_assign_targets<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             (pristine, paths)
         }
     };
-    // Change detection costs a second copy of the whole document, and only
-    // ever buys something for a right side that can read one. A bare
-    // literal (`.a = 5`, the overwhelmingly common shape) cannot, so it
-    // skips the copy outright and reports `created: false` -- correct by
-    // construction, since `rhs_document`'s only consumer is the right side
-    // that literal has already been proved independent of.
+    match yq_assign_targets_from::<S>(pristine, paths, value_expr, scalar_slice_noop) {
+        Ok(targets) => Ok(Some(targets)),
+        Err(EvalEscape::Error(_)) if optional => Err(QueryResult::None),
+        Err(other) => Err(other.into()),
+    }
+}
+
+/// [`yq_prepare_assign_targets`] once the input is owned and the targets are
+/// resolved: creates every target in a working copy and says whether that
+/// changed anything. Split out (spine 2416, identity pass) so an evaluator
+/// holding an owned input -- the owned identity pipe -- can ask the same
+/// question through [`yq_assign_rhs_document`].
+fn yq_assign_targets_from<S: EvalSemantics>(
+    pristine: OwnedValue,
+    mut paths: Vec<Expr>,
+    value_expr: &Expr,
+    scalar_slice_noop: bool,
+) -> Result<YqAssignTargets, EvalEscape> {
     // #2530: redirect through aliases *before* the targets are created, so a
     // new key under `b: *x` is created on the anchor's node, not on the
     // copy -- otherwise the copy no longer equals the anchor and the write's
@@ -21472,6 +21484,12 @@ fn yq_prepare_assign_targets<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // paths `yq_assign_noop_check` already redirected, and a no-op in jq
     // mode, where no table is ever installed.
     alias_identity::redirect_paths(&mut paths, &pristine, alias_identity::Redirect::THROUGH);
+    // Change detection costs a second copy of the whole document, and only
+    // ever buys something for a right side that can read one. A bare
+    // literal (`.a = 5`, the overwhelmingly common shape) cannot, so it
+    // skips the copy outright and reports `created: false` -- correct by
+    // construction, since `rhs_document`'s only consumer is the right side
+    // that literal has already been proved independent of.
     let before = (!matches!(
         super::eval_generic::strip_parens(value_expr),
         Expr::Literal(_)
@@ -21480,34 +21498,49 @@ fn yq_prepare_assign_targets<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let pre_creation = alias_identity::active().then(|| pristine.clone());
     let mut doc = pristine;
     for path in &paths {
-        if let Err(escape) = update_path::<S>(
+        update_path::<S>(
             &mut doc,
             path,
             &Expr::Identity,
             false,
             scalar_slice_noop,
-            // `Expr::Identity` is the filter: it holds no path-context read,
-            // so there is no position for #2522 to resolve against here.
             None,
-        ) {
-            return Err(match escape {
-                EvalEscape::Error(_) if optional => QueryResult::None,
-                other => other.into(),
-            });
-        }
+        )?;
     }
     let created = before.is_some_and(|before| doc != before);
-    // #2530: the created slot is part of the shared node, so every alias copy
-    // gets it too -- keeping the copies equal to the anchor for the write
-    // that follows and for later pipe stages.
     if let Some(pre) = &pre_creation {
         alias_identity::mirror_after_write(pre, &mut doc);
     }
-    Ok(Some(YqAssignTargets {
+    Ok(YqAssignTargets {
         doc,
         paths,
         created,
-    }))
+    })
+}
+
+/// The document a yq-mode assignment's right side reads (#2481): the input
+/// with `path_expr`'s targets created, or `None` where creating them changed
+/// nothing (the right side then reads the input as it is). `None` in jq mode
+/// too. The owned identity pipe's entry into the same rule
+/// `eval_assign`/`eval_compound_assign`/`eval_alternative_assign` apply
+/// through [`yq_prepare_assign_targets`], so a right side evaluated at a
+/// position (spine 2416) sees the same vivified target the eager route's
+/// did.
+pub(crate) fn yq_assign_rhs_document<S: EvalSemantics>(
+    path_expr: &Expr,
+    value_expr: &Expr,
+    input: &OwnedValue,
+    scalar_slice_noop: bool,
+) -> Result<Option<OwnedValue>, EvalEscape> {
+    if S::TAG != EvalTag::Yq {
+        return Ok(None);
+    }
+    let paths = match resolve_dynamic_indexes::<S>(path_expr, input, false) {
+        Ok(paths) => paths,
+        Err((_, escape)) => return Err(escape),
+    };
+    let targets = yq_assign_targets_from::<S>(input.clone(), paths, value_expr, scalar_slice_noop)?;
+    Ok(targets.rhs_document().cloned())
 }
 
 /// Shared RHS-fork loop for `eval_assign`/`eval_compound_assign`/
