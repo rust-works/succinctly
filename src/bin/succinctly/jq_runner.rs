@@ -5353,11 +5353,13 @@ fn standard_json_to_jq_value<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     parent_cursor: &JsonCursor<'a, W>,
 ) -> Result<JqValue<'a, W>, EvalError> {
-    // STYLE-0013-TAIL: no tail helper is callable here -- this is the true
-    // top level, the one entry point with no cursor to give (the same
-    // documented gap `owned_from_standard_json_at_depth`'s own comment
-    // describes: there is nothing to reconstruct once nothing was ever
-    // passed). The resulting zero-child `{,}` acceptance is #2594.
+    // STYLE-0013-TAIL: `child_tail_gap_ok` is callable (both arms hold a
+    // child cursor) and would close the trailing-comma half. Only the
+    // zero-child half is genuinely blocked: that needs a *container* cursor,
+    // and this is the true top level -- the one entry point with none to
+    // give, the same documented gap `owned_from_standard_json_at_depth`'s
+    // own comment describes. Wiring in the callable half is a behaviour
+    // change; tracked with the rest in #2594.
     // STYLE-0013: `preceding_gap_ok` directly, not `key_delimiter_ok`/
     // `value_delimiter_ok` -- this is the CLI-crate lazy materializer, not
     // `DocumentFields`-generic, and its array/object arms below already
@@ -5905,11 +5907,13 @@ fn validate_json_delimiters<W: Clone + AsRef<[u64]>>(
     cursor: &JsonCursor<'_, W>,
     depth: usize,
 ) -> core::result::Result<(), EvalError> {
-    // STYLE-0013-TAIL: merges the empty-container and trailing-comma cases
-    // into one computed `gap_start` fed to `trailing_element_gap_ok`, rather
-    // than dispatching on `Option<last>` the way the helpers do -- so it
-    // cannot call one without restructuring the walk. The empty case is not
-    // actually covered by that merge; see #2594.
+    // STYLE-0013-TAIL: this walk does check both halves -- `gap_start` is
+    // `open_pos + 1` when no child was seen (`container_gap_ok`'s own body)
+    // and the last child's gap end otherwise -- but through
+    // `DocumentCursor::trailing_element_gap_ok(gap_start, ..)` with a
+    // pre-resolved position, which no `Option<last>`-dispatching helper in
+    // `TAIL_ROUTES` can express. Not a #2594 site: the empty case is
+    // covered here.
     // STYLE-0013: `preceding_gap_ok` directly, in both the array and
     // object arms below -- this is the CLI's own cold-path validator
     // (this function's own doc comment above explains why it exists
@@ -6113,11 +6117,13 @@ where
     Out: Write,
     Wrd: Clone + AsRef<[u64]>,
 {
-    // STYLE-0013-TAIL: same merged `gap_start` shape as
-    // `validate_json_delimiters` above, and the same #2594 gap. Whether this
-    // function's measured per-member perf rationale (#1643/#1676, cited in
-    // its `// STYLE-0013:` exemption) extends to the tail is a separate
-    // question -- the tail is one check per container, not per member.
+    // STYLE-0013-TAIL: same pre-resolved-position shape as
+    // `validate_json_delimiters` above -- an explicit `is_empty()` arm
+    // checking `trailing_element_gap_ok(open_pos + 1, ..)`, which is
+    // `container_gap_ok`'s body, and a `last_gap_end` arm for the rest. Both
+    // halves are covered, so this is not a #2594 site; it simply cannot
+    // route through a helper that dispatches on `Option<last>` instead of
+    // taking the gap position it already holds.
     // STYLE-0013: the object arm below calls `preceding_gap_ok` directly,
     // not `key_delimiter_ok`/`value_delimiter_ok` -- this is the streaming
     // writer's own single-walk validate-then-write pass (#1643), reusing

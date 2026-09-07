@@ -188,9 +188,21 @@ const TAIL_PRIMITIVES: &[&str] = &[
 ///
 /// `uncons`/`uncons_cursor`/`uncons_key` are the three cursor-domain
 /// spellings; `children`/`cursor_iter` are the two iterator-domain ones.
-/// A `for x in <already-materialized Vec>` loop is deliberately *not* a walk
-/// here: its members were validated wherever that `Vec` was built, and the
-/// tail with them.
+///
+/// A `for x in <collection bound earlier>` loop is **out of scope**, and this
+/// is the rule's known boundary rather than a claim that such loops are
+/// safe. An earlier draft of this comment justified the carve-out by saying
+/// those members were validated wherever the collection was built; review
+/// showed that is false for at least one site -- `eval_builtin`'s
+/// `to_entries` arm validates members inside the loop and hand-rolls its own
+/// tail, and is invisible here because its iterator is a local binding, not
+/// a call this scan can see in the loop head.
+///
+/// Covering it needs the binding traced back to its initializer, which is
+/// real dataflow rather than the syntactic match everything else here does.
+/// Left out deliberately: the shape this rule was written for is the
+/// cursor-domain walk, where all six of its current findings live. The gap
+/// is recorded in #2594 rather than papered over.
 const WALK_METHODS: &[&str] = &[
     "uncons",
     "uncons_cursor",
@@ -247,16 +259,28 @@ struct Frame {
     /// that -- see `test_marker_does_not_leak_across_function_boundaries`.
     body_start: usize,
     body_end: usize,
-    /// Set when a loop in this function heads on one of [`WALK_METHODS`].
-    walks_children: bool,
+    /// How many loops in this function head on one of [`WALK_METHODS`].
+    ///
+    /// A count, not a flag: a function with an object arm and an array arm
+    /// has two walks and owes two tail checks. A single boolean let either
+    /// arm's tail check exempt the other, so deleting `to_owned_at_depth`'s
+    /// array-arm `tail_gap_ok` -- reintroducing #2211's `[,]` exactly --
+    /// left the audit green. Found in review of this rule; pinned by
+    /// `test_tail_audit_counts_each_arm_separately_2404`.
+    walk_loops: usize,
     /// Set when this function validates members at all (see
     /// [`MEMBER_VALIDATION`]) -- routed or hand-rolled, both count.
     validates_members: bool,
-    /// Set when this function ends its walk in one of [`TAIL_ROUTES`].
-    routes_tail: bool,
+    /// How many [`TAIL_ROUTES`] calls this function makes, compared against
+    /// `walk_loops` rather than merely being non-zero.
+    tail_routes: usize,
     /// Line of the first walk loop, for the violation report -- the loop is
     /// the thing missing a tail, so it is the useful place to point.
     walk_line: usize,
+    /// Line ranges of `fn` items nested inside this one, excluded from the
+    /// marker scan so a marker belonging to a nested helper cannot exempt
+    /// its enclosing walk.
+    nested: Vec<(usize, usize)>,
 }
 
 struct Audit<'a> {
@@ -348,7 +372,18 @@ fn is_tail_marker_line(line: &str) -> bool {
 fn tail_marker_in_body(lines: &[&str], frame: &Frame) -> bool {
     let lo = frame.body_start.saturating_sub(1);
     let hi = frame.body_end.min(lines.len());
-    lines[lo..hi].iter().any(|l| is_tail_marker_line(l))
+    (lo..hi).any(|i| {
+        let line_no = i + 1;
+        // A marker inside a nested `fn` belongs to that helper, not to the
+        // walk that happens to enclose it. The member rule's own
+        // `test_nested_fn_does_not_inherit_the_parent_marker` pins the
+        // other direction; this is the same principle read upwards.
+        let in_nested = frame
+            .nested
+            .iter()
+            .any(|(s, e)| line_no >= *s && line_no <= *e);
+        !in_nested && is_tail_marker_line(lines[i])
+    })
 }
 
 /// Whether an expression subtree contains a call to one of
@@ -395,10 +430,11 @@ impl<'a> Audit<'a> {
             name,
             body_start: body.start().line,
             body_end: body.end().line,
-            walks_children: false,
+            walk_loops: 0,
             validates_members: false,
-            routes_tail: false,
+            tail_routes: 0,
             walk_line: 0,
+            nested: Vec::new(),
         });
     }
 
@@ -412,6 +448,9 @@ impl<'a> Audit<'a> {
         let Some(frame) = self.stack.pop() else {
             return;
         };
+        if let Some(parent) = self.stack.last_mut() {
+            parent.nested.push((frame.body_start, frame.body_end));
+        }
         // A definition of one of the primitives or helpers is not a walk
         // that owes a tail check -- it is the thing the walk routes through.
         if MEMBER_VALIDATION.contains(&frame.name.as_str())
@@ -420,11 +459,11 @@ impl<'a> Audit<'a> {
         {
             return;
         }
-        if !(frame.walks_children && frame.validates_members) {
+        if !(frame.walk_loops > 0 && frame.validates_members) {
             return;
         }
         self.walks_examined += 1;
-        if frame.routes_tail || tail_marker_in_body(&self.lines, &frame) {
+        if frame.tail_routes >= frame.walk_loops || tail_marker_in_body(&self.lines, &frame) {
             return;
         }
         self.tail_violations.push(Site {
@@ -446,16 +485,18 @@ impl<'a> Audit<'a> {
         let Some(frame) = self.stack.last_mut() else {
             return;
         };
-        if is_walk_head && !frame.walks_children {
-            frame.walks_children = true;
-            frame.walk_line = line_of(expr.span());
+        if is_walk_head {
+            if frame.walk_loops == 0 {
+                frame.walk_line = line_of(expr.span());
+            }
+            frame.walk_loops += 1;
         }
         if let Some(name) = callee {
             if MEMBER_VALIDATION.contains(&name.as_str()) {
                 frame.validates_members = true;
             }
             if TAIL_ROUTES.contains(&name.as_str()) {
-                frame.routes_tail = true;
+                frame.tail_routes += 1;
             }
         }
     }
@@ -1008,4 +1049,84 @@ fn test_tail_marker_does_not_leak_across_function_boundaries_2404() {
     assert_eq!(audit.walks_examined, 2);
     assert_eq!(audit.tail_violations.len(), 1);
     assert_eq!(audit.tail_violations[0].func, "unmarked_walk");
+}
+
+/// A function with an object arm and an array arm has **two** walks and owes
+/// **two** tail checks.
+///
+/// Found in review: with `routes_tail` as one boolean, either arm's tail
+/// check exempted the other. Deleting `to_owned_at_depth`'s array-arm
+/// `tail_gap_ok` -- reintroducing #2211's `[,]` bug exactly -- left the audit
+/// green. Verified by mutation that the counting form catches it.
+#[test]
+fn test_tail_audit_counts_each_arm_separately_2404() {
+    let src = r"
+        fn two_arms<F: DocumentFields>(v: &V) -> Result<(), EvalError> {
+            match v {
+                Object(fields) => {
+                    let mut f = fields.clone();
+                    let mut last = None;
+                    while let Some((field, rest)) = f.uncons() {
+                        field.delimiters_ok(&cursor)?;
+                        last = Some(field.value_cursor);
+                        f = rest;
+                    }
+                    tail_gap_ok(cursor, last.as_ref(), b'}')?;
+                }
+                Array(elems) => {
+                    let mut e = elems.clone();
+                    let mut last = None;
+                    while let Some((elem, rest)) = e.uncons_cursor() {
+                        elem.delimiters_ok(&cursor)?;
+                        last = Some(elem);
+                        e = rest;
+                    }
+                }
+            }
+            Ok(())
+        }
+    ";
+    let parsed = syn::parse_file(src).expect("fixture parses");
+    let mut audit = Audit::new("fixture.rs", src);
+    audit.visit_file(&parsed);
+    assert_eq!(audit.walks_examined, 1, "one function, examined once");
+    assert_eq!(
+        audit.tail_violations.len(),
+        1,
+        "two walks and one tail check must not pass -- the array arm is unguarded"
+    );
+}
+
+/// A marker inside a nested `fn` belongs to that helper, not to the walk
+/// enclosing it.
+///
+/// `test_nested_fn_does_not_inherit_the_parent_marker` pins the downward
+/// direction for the member rule; this is the same principle read upwards,
+/// and it was a real hole -- the frame's line range spans its nested items,
+/// so an unrelated nested marker silently exempted the outer walk.
+#[test]
+fn test_tail_marker_in_a_nested_fn_does_not_exempt_the_outer_walk_2404() {
+    let src = r"
+        fn outer_walk<F: DocumentFields>(fields: &F) -> Result<(), EvalError> {
+            fn inner_helper() -> bool {
+                // STYLE-0013-TAIL: this helper has no walk of its own.
+                true
+            }
+            let mut f = fields.clone();
+            while let Some((field, rest)) = f.uncons() {
+                field.delimiters_ok(&cursor)?;
+                f = rest;
+            }
+            Ok(())
+        }
+    ";
+    let parsed = syn::parse_file(src).expect("fixture parses");
+    let mut audit = Audit::new("fixture.rs", src);
+    audit.visit_file(&parsed);
+    assert_eq!(
+        audit.tail_violations.len(),
+        1,
+        "the nested helper's marker must not exempt `outer_walk`"
+    );
+    assert_eq!(audit.tail_violations[0].func, "outer_walk");
 }
