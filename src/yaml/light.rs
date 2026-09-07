@@ -1903,6 +1903,12 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             // through the shared helper (#1828): this is
                             // the only one of its four original callers
                             // that ever had a comment to place.
+                            // #2619: `value` is already proven non-`Alias`
+                            // by the `is_yaml_cursor_container(&value)`
+                            // guard above (a structural check -- an alias
+                            // node is never a container), so both
+                            // `explicit_tag()` calls below skip a second
+                            // resolve via `explicit_tag_at(None)`.
                             if let Some(comment) = field.key_cursor().line_comment_raw() {
                                 write_line_comment(out, Some(comment))?;
                                 // Same anchor/tag rendering as the `else`
@@ -1915,10 +1921,10 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                     out,
                                     '\n',
                                     value.anchor(),
-                                    value.explicit_tag(),
+                                    value.explicit_tag_at(None),
                                 )?;
                             } else {
-                                write_anchor_tag(out, value.anchor(), value.explicit_tag())?;
+                                write_anchor_tag(out, value.anchor(), value.explicit_tag_at(None))?;
                             }
                             out.write_char('\n')?;
                             // #1485: steps from `recursion_base`, not
@@ -2059,7 +2065,11 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                         let style = cursor.style();
                         if is_yaml_cursor_container(&cursor) && style != "flow" {
                             let anchor = cursor.anchor();
-                            let tag = cursor.explicit_tag();
+                            // #2619: `is_yaml_cursor_container` above already
+                            // proves `cursor` isn't `Alias` (structural, an
+                            // alias node is never a container), so `None`
+                            // skips a second resolve.
+                            let tag = cursor.explicit_tag_at(None);
                             if anchor.is_some() || tag.is_some() {
                                 out.write_char('-')?;
                                 write_anchor_tag(out, anchor, tag)?;
@@ -2524,20 +2534,23 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         self.explicit_tag_at(Some(&self.value()))
     }
 
-    /// Internal sibling of [`Self::explicit_tag`] for the two write-path call
-    /// sites in this module that already know whether this cursor is an
-    /// alias without a fresh [`Self::value`] call (#1114 review, #2617). Not
-    /// `pub`, deliberately: unlike [`Self::stream_yaml_value_at`], where
-    /// `None` always falls back to a full resolve and so is unconditionally
-    /// safe, `None` here skips the alias check outright with no fallback --
-    /// safe only when the caller can already prove the cursor isn't an
-    /// alias (see call sites below), not a general-purpose default. Pass
-    /// `Some(&resolved)` when a prior `value()` call already produced it
-    /// (e.g. `write_deferred_value`'s `resolved` local on its `absent`
-    /// branch), or `None` only when that proof holds (e.g.
-    /// `write_yaml_child_inline`'s `container` branch: `is_container()` is a
-    /// structural bitvector check, and a container position can never be an
-    /// alias).
+    /// Internal sibling of [`Self::explicit_tag`] for this module's call
+    /// sites that already know whether this cursor is an alias without a
+    /// fresh [`Self::value`] call (#1114 review, #2617, #2619) -- both
+    /// write paths (e.g. `write_deferred_value`) and read/query paths
+    /// (e.g. `tag()`, `is_falsy`) alike; nothing about the proof is
+    /// specific to writing. Not `pub`, deliberately: unlike
+    /// [`Self::stream_yaml_value_at`], where `None` always falls back to a
+    /// full resolve and so is unconditionally safe, `None` here skips the
+    /// alias check outright with no fallback -- safe only when the caller
+    /// can already prove the cursor isn't an alias, not a general-purpose
+    /// default. Pass `Some(&resolved)` when a prior `value()` call already
+    /// produced it (e.g. `write_deferred_value`'s `resolved` local on its
+    /// `absent` branch), or `None` when the proof is purely structural --
+    /// either a matched `YamlValue::String` on this same cursor (an alias
+    /// node parses to `YamlValue::Alias`, never `String`), or
+    /// `is_container()`/`is_yaml_cursor_container()` (a bitvector check;
+    /// a container position can never be an alias).
     #[inline]
     fn explicit_tag_at(&self, known_value: Option<&YamlValue<'a, W>>) -> Option<&str> {
         if let Some(YamlValue::Alias { target, .. }) = known_value {
@@ -7398,7 +7411,10 @@ fn write_yaml_field_key<W: AsRef<[u64]>, Out: core::fmt::Write>(
     }
     let key = field.key();
     if let YamlValue::String(s) = &key {
-        if let Some(tag) = field.key_cursor().explicit_tag() {
+        // #2619: `field.key_cursor().value()` is `key`, already matched
+        // `String` just above -- `field.key_cursor()` returns a `Copy` of
+        // the same cursor, so `None` skips a second resolve.
+        if let Some(tag) = field.key_cursor().explicit_tag_at(None) {
             out.write_str(tag)?;
             out.write_char(' ')?;
         } else if matches!(s, YamlString::Unquoted { .. })
@@ -7700,7 +7716,9 @@ where
             let style = cursor.style();
             if is_yaml_cursor_container(&cursor) && style != "flow" {
                 let anchor = cursor.anchor();
-                let tag = cursor.explicit_tag();
+                // #2619: `is_yaml_cursor_container` above already proves
+                // `cursor` isn't `Alias`, so `None` skips a second resolve.
+                let tag = cursor.explicit_tag_at(None);
                 if anchor.is_some() || tag.is_some() {
                     out.write_char('-')?;
                     write_anchor_tag(out, anchor, tag)?;
