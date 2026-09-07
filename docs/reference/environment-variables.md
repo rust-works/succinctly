@@ -169,8 +169,20 @@ SUCCINCTLY_EXPECT_SIMD=neon cargo test --test simd_expectation_tests            
 
 ### `SUCCINCTLY_PRESERVE_INPUT`
 
-Keeps the original formatting of numbers and escape sequences from the input, instead of normalizing
-them the way jq does (`4e4` → `4E+4`, `\b` → an escape sequence).
+Keeps the input's own number spelling (`4e4` stays `4e4` instead of jq's `4E+4`) and keeps every
+occurrence of a repeated object key instead of collapsing it to one field.
+
+It does **not** change which string-escape table is used: `succinctly jq` always writes jq's own
+(`\b`/`\f` short forms, DEL escaped as `\u007f`), with or without this variable. Until #2209 it
+silently switched the cursor-streaming path to *yq's* table (long `\u0008`/`\u000c` forms, DEL left
+raw), which diverged from real jq on plain navigation filters like `.a`; the escape table is a
+property of the mode you invoked, not of this variable.
+
+One nuance follows from "preserve" being literal on the compact path: with `-c`, an unmodified value
+is echoed straight from the source bytes, so its escape spelling survives exactly as written. Pretty
+output re-encodes through jq's table instead, so a source `\u0008` prints as `\b` there. Both agree
+with real jq wherever real jq has an opinion; they differ only on input spellings jq itself would
+have normalized.
 
 Accepts `1` or `true`, matched case-insensitively — so `TRUE` and `True` also work. Any other value,
 including `yes` and `0`, leaves the default alone. Equivalent to the `--preserve-input` flag; the flag
