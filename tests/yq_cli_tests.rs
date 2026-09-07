@@ -1492,6 +1492,31 @@ fn test_yq_mode_single_arg_builtin_wrong_arity_unaffected_by_2237() -> Result<()
     Ok(())
 }
 
+/// #2389 sibling of the #2237 test above: the same carve-out for the 12
+/// more single-required-arg builtins #2389 converted to
+/// `parse_required_single_arg`, pinned via `map` (ungated, reachable in
+/// default yq mode -- unlike `getpath`/`walk`/`isempty` among the 12, which
+/// need `--jq-extensions` and are unaffected either way by this check).
+#[test]
+fn test_yq_mode_single_arg_builtin_wrong_arity_unaffected_by_2389() -> Result<()> {
+    let (out, stderr, code) = run_yq_stdin_with_stderr("map", "a: 1\n", &[])?;
+    assert_eq!(out, "", "stderr: {stderr}");
+    assert!(
+        stderr.contains("parse error: parse error at position 3: expected '(', found end of input"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(code, 1, "stderr: {stderr}");
+
+    let (out, stderr, code) = run_yq_stdin_with_stderr("map(1;2)", "a: 1\n", &[])?;
+    assert_eq!(out, "", "stderr: {stderr}");
+    assert!(
+        stderr.contains("parse error: parse error at position 5: expected ')', found ';'"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(code, 1, "stderr: {stderr}");
+    Ok(())
+}
+
 /// #2225 (review): the read-mode fix reaches yq mode too, not just jq mode
 /// -- `stderr` fires twice, once per start value, confirming `end` is
 /// re-evaluated fresh per `s` through `eval_generic::eval_slice_expr`
