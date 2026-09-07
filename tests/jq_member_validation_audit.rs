@@ -170,7 +170,7 @@ struct Audit<'a> {
 ///
 /// Function-level, not "the comment block attached to the call": a walk that
 /// cannot route is exempt *as a walk*, and its reason is one paragraph, not
-/// one per primitive it touches. `push_generic_truthiness_cursor_error` is
+/// one per primitive it touches. `push_generic_document_validation_error` is
 /// the case that settles it -- one exemption, two `resolve_display_key`
 /// calls, and requiring the paragraph twice would say less, not more.
 ///
@@ -191,7 +191,7 @@ fn marker_in_body(lines: &[&str], frame: &Frame) -> bool {
 /// `#[allow]` citations and STYLE-0012's exemptions are both written this
 /// way), and requiring it is load-bearing rather than pedantic: the first
 /// draft of this file used `contains`, and a sentence in
-/// `push_generic_truthiness_cursor_error`'s own comment -- "This marker is
+/// `push_generic_document_validation_error`'s own comment -- "This marker is
 /// the point of STYLE-0013: ..." -- silently exempted that function. The
 /// audit passed with its real marker deleted. A gate that a rule's own
 /// *explanation* can satisfy is not a gate; see
@@ -469,7 +469,7 @@ fn test_nested_fn_does_not_inherit_the_parent_marker() {
 ///
 /// Not hypothetical: this is the false negative the first draft of this file
 /// actually had, found by deleting a real marker from
-/// `push_generic_truthiness_cursor_error` and watching the audit stay green,
+/// `push_generic_document_validation_error` and watching the audit stay green,
 /// because that function's own explanation contains the words "the point of
 /// STYLE-0013:". The rule's rationale is exactly the prose most likely to
 /// name the rule, so this is the failure mode a `contains` check is *most*

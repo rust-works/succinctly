@@ -1824,7 +1824,7 @@ and differently-shaped problem than this section's own fixes):
 
 Two further leads from the same sweep were investigated and **not**
 reproduced live (so not reported as confirmed bugs, only as ruled out) at
-the time: `push_generic_truthiness_cursor_error` (`if COND then ... end`
+the time: `push_generic_document_validation_error` (`if COND then ... end`
 on a container condition) and `owned_from_standard_json_at_depth` (the
 `input`/`inputs`-with-cursor-metadata-builtins bridge, #1504) both lack
 their own internal gap checks by inspection, but every constructed repro
@@ -1833,7 +1833,7 @@ against each (`{"a":[1,2,3,]} | if .a then ... end`;
 something upstream of either function already validates for the shapes
 tried. Not chased further given no live reproduction *of those specific
 repros* — **update (#2349): a live, CLI-reachable gap in
-`push_generic_truthiness_cursor_error` was found and fixed after all**,
+`push_generic_document_validation_error` was found and fixed after all**,
 just not via `if...then...end` (whose own `Control::from(cond)` path
 apparently validates upstream, matching what this entry found). `select`,
 `sort_by`/`unique_by`/`min_by`/`max_by`, and `path()` all route through
@@ -1859,7 +1859,7 @@ function bytes that are already clean by construction: `input`/`inputs` validate
 in the input-reading pipeline before this function ever runs, and every other caller passes
 a fresh `to_json_for_reindex` re-serialization of an already-decoded `OwnedValue` -- text
 succinctly's own serializer produces, which by construction never carries a malformed
-delimiter. This is the structural difference from `push_generic_truthiness_cursor_error`'s
+delimiter. This is the structural difference from `push_generic_document_validation_error`'s
 real gap: that function walks the *original* document cursor directly, with no round-trip
 in between, so genuine source corruption reaches it; nothing here does. Recorded directly
 on the function (`src/jq/eval_generic.rs`) so a future re-check starts from "confirmed
