@@ -13742,11 +13742,11 @@ fn path_component_step_expr(component: &OwnedValue) -> Option<Expr> {
     })
 }
 
-/// `key`/`path` (no arg)'s value at `pos` -- shared by
-/// `path_context_walk_generic`'s own terminal arm and
-/// `path_context_walk_pipe`'s emitting-stage-then-more-stages case (#2149).
-/// `Ok(None)` only for `key` at the document root, which emits nothing
-/// (see the caller's own doc comment for why).
+/// `key`/`path` (no arg)'s value at `pos` -- the sole caller is
+/// `path_context_walk_generic`'s own terminal arm, extracted only to keep
+/// that arm's body short once `PathNoArg`/`Key` were merged into one match
+/// arm (#2149). `Ok(None)` only for `key` at the document root, which
+/// emits nothing (see the caller's own doc comment for why).
 fn path_context_emitting_value<V: DocumentValue>(
     expr: &Expr,
     pos: &PathContextPos<V>,
@@ -13922,30 +13922,47 @@ fn path_context_walk_split(exprs: &[Expr]) -> Option<(&[Expr], &[Expr])> {
     Some((walked, rest))
 }
 
-/// (#2149) The length of a walkable prefix ending on `key`/`path` (no arg),
-/// for a pipe where that isn't already `exprs`'s bare first stage (the
-/// branch just above covers that case): a navigational run immediately
-/// followed by one emitting stage, with a `rest` that needs no path context
-/// of its own -- the same `!rest.iter().any(needs_path_context)` condition
-/// the first-stage-only branch already applies, generalized to a longer
-/// walked prefix.
+/// (#2149) The length of a walkable prefix ending on an emitting stage
+/// ([`path_context_is_cursor_walkable`] -- `key`/`path` bare or wrapped in
+/// `(..)`/`[..]`/a comma, exactly the shapes already admitted as a walkable
+/// pipe's *last* stage everywhere else in this file), for a pipe where that
+/// isn't already `exprs`'s bare first stage (the branch just above covers
+/// that case): a navigational run immediately followed by one such stage,
+/// with a `rest` that needs no path context of its own -- the same
+/// `!rest.iter().any(needs_path_context)` condition the first-stage-only
+/// branch already applies, generalized to a longer walked prefix. Reusing
+/// [`path_context_is_cursor_walkable`] rather than matching `Key`/
+/// `PathNoArg` directly matters: an earlier draft of this function did the
+/// latter and left `.[] | (key) | tostring` -- syntactically trivial to
+/// write, semantically identical to the fixed `.[] | key | tostring` --
+/// reproducing the exact O(n^2) blowup this fix exists to close, just one
+/// paren away (review caught this live: 0.04s vs 32.9s on a 100K-element
+/// array, byte-identical output either way).
 ///
 /// `rest` containing a *second* `key`/`path`/`parent` is refused rather
-/// than resolved: real yq's own answer for that shape does not settle into
-/// one coherent rule to reproduce (`key | key` is empty, `key | (key +
+/// than resolved -- not a judgment call but a structural one: the sink this
+/// walked prefix hands `rest` to ([`try_path_context_walk_sink`]/
+/// [`try_path_context_cursor_walk`]) evaluates it over the *plain emitted
+/// value*, with the cursor and trail already gone
+/// ([`path_context_pipe_is_walkable`]'s own doc: an emitting stage "may sit
+/// only as a pipe's *last* stage"), so a later path-context builtin has no
+/// position left to answer from regardless of what rule it should follow.
+/// (For what it's worth, real yq's own answer for that shape doesn't settle
+/// into one coherent rule either: `key | key` is empty, `key | (key +
 /// 100)` is a constant unrelated to the element, `key | path` wraps the
-/// value itself in an array -- all live-verified against v4.53.3), so it
-/// stays on the bridge, matching this function's own one-directional
-/// contract (declining costs an optimization, never an answer).
+/// value itself in an array -- all live-verified against v4.53.3 -- so
+/// there would be nothing to reproduce here even with a position to answer
+/// from.) Matching this function's own one-directional contract (declining
+/// costs an optimization, never an answer), the shape stays on the bridge.
 fn path_context_walked_emitting_prefix_len(exprs: &[Expr]) -> Option<usize> {
     let idx = exprs
         .iter()
         .position(|stage| !path_context_is_navigational(stage))?;
-    if idx == 0 || !matches!(exprs[idx], Expr::Builtin(Builtin::PathNoArg | Builtin::Key)) {
+    if !path_context_is_cursor_walkable(&exprs[idx]) {
         return None;
     }
     let rest = &exprs[idx + 1..];
-    if rest.is_empty() || rest.iter().any(needs_path_context) {
+    if rest.iter().any(needs_path_context) {
         return None;
     }
     Some(idx + 1)
