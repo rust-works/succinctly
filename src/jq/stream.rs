@@ -1798,6 +1798,50 @@ mod tests {
         assert_eq!(buf, "null");
     }
 
+    /// #2209: `JqPreserveInput` is jq mode under `--preserve-input` --
+    /// jq's escape table paired with the source number spelling. It is the
+    /// one convention neither pre-existing owned-value streamer could
+    /// express: `Preserve` carries yq's table, `JqCompat` canonicalizes
+    /// numbers.
+    ///
+    /// Covers `stream_owned_value_json_jq_preserve_input`, which no CLI
+    /// filter currently reaches -- every M2-eligible jq-mode filter that
+    /// produces an `OwnedValue` today falls back to the DOM path. It is
+    /// still live behind `GenericResult::stream_json`'s owned arms, which
+    /// forward whatever convention the runner selected, so the arm is
+    /// pinned here rather than left to a future filter to discover.
+    #[test]
+    fn test_stream_json_jq_preserve_input_pairs_jq_escapes_with_source_numbers_2209() {
+        // Number axis: the source spelling survives, as under `Preserve`,
+        // and is canonicalized only by `JqCompat`.
+        let literal = || OwnedValue::NumberLiteral(NumberRepr::Float(1.2e3), "1.2e3".into());
+        for (numbers, expected) in [
+            (JsonConvention::Preserve, "1.2e3"),
+            (JsonConvention::JqPreserveInput, "1.2e3"),
+            (JsonConvention::JqCompat, "1.2E+3"),
+        ] {
+            let mut buf = String::new();
+            literal()
+                .stream_json(&mut buf, IndentSpec::COMPACT, false, numbers)
+                .unwrap();
+            assert_eq!(buf, expected, "{numbers:?} number spelling");
+        }
+
+        // Escape axis: jq's table, unlike `Preserve`'s. U+0008 and DEL are
+        // two of the three code points the tables disagree on.
+        let s = || OwnedValue::String("\u{8}x\u{7f}".into());
+        for (numbers, expected) in [
+            (JsonConvention::JqCompat, "\"\\bx\\u007f\""),
+            (JsonConvention::JqPreserveInput, "\"\\bx\\u007f\""),
+            (JsonConvention::Preserve, "\"\\u0008x\u{7f}\""),
+        ] {
+            let mut buf = String::new();
+            s().stream_json(&mut buf, IndentSpec::COMPACT, false, numbers)
+                .unwrap();
+            assert_eq!(buf, expected, "{numbers:?} escape table");
+        }
+    }
+
     /// #930: unlike real output (above), jq's error-message value previews
     /// (`stream_owned_value_json_jq`, used by `describe()`/`dump_truncated()`
     /// in `src/jq/error.rs`) aren't constrained by RFC 8259 - jq's own
