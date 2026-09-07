@@ -1519,7 +1519,7 @@ fn type_name<W>(value: &StandardJson<'_, W>) -> &'static str {
 /// exclusively by an already-owned or reindexed document, where no
 /// undecodable borrowed string can exist. `to_owned_for_error_message` was
 /// considered and rejected as the name: roughly a third of the call sites
-/// (`QueryResult::collect_owned`, `push_owned_values`, `Item::into_owned_lossy`,
+/// (`QueryResult::collect_owned`, `push_owned_values_lossy`, `Item::into_owned_lossy`,
 /// the `Partial` folds) are not error-message contexts at all, and a name
 /// that is a lie at a third of its sites is worse than one that simply
 /// names the hazard.
@@ -2160,7 +2160,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // apparently missed when #1755 patched that one). Mirrors
                 // that `Object` arm's own single `to_owned` call
                 // (code review, #1941: an earlier version of this fix used
-                // `promote_borrowed_checked` instead, built for a different
+                // `promote_borrowed` instead, built for a different
                 // shape -- accumulating a partial prefix for a fan-out
                 // stream to report on error -- that this single-aggregate-
                 // value arm has no use for and was discarding unconditionally).
@@ -2639,7 +2639,7 @@ fn eval_comma<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // e.g. `[.a, 1]`) used to promote the borrowed branch's
             // undecodable string to `""` here, silently, the moment the
             // owned sibling forced the promotion. `push_promoted`/
-            // `promote_borrowed_checked` are the same helpers
+            // `promote_borrowed` are the same helpers
             // `eval_pipe`'s identical `Many`-branch promotion uses
             // (#1755/#1843's own instance of this exact bug shape).
             QueryResult::One(v) => {
@@ -2825,7 +2825,7 @@ enum ObjectEscape {
 /// [`partial`] produces. [`result_to_owned_full`]'s dedicated
 /// `Partial(_, Halt) => Err(Halt)` arm exists only because *that* function
 /// keeps a single value and so has no honest prefix to emit alongside it.
-fn stream_outputs<W: Clone + AsRef<[u64]>>(
+fn stream_outputs_lossy<W: Clone + AsRef<[u64]>>(
     result: QueryResult<'_, W>,
 ) -> (Vec<OwnedValue>, Option<Control>) {
     match result {
@@ -2837,8 +2837,8 @@ fn stream_outputs<W: Clone + AsRef<[u64]>>(
     }
 }
 
-/// The [`to_owned`]/[`promote_borrowed_checked`] counterpart to
-/// [`stream_outputs`]: identical fold, except a decode failure discovered
+/// The [`to_owned`]/[`promote_borrowed`] counterpart to
+/// [`stream_outputs_lossy`]: identical fold, except a decode failure discovered
 /// while materializing an output becomes part of the returned `Control`
 /// too, not just an escape `result` already carried going in. #1902/#1934
 /// item 4: this exact `QueryResult` -> `(Vec<OwnedValue>, Option<Control>)`
@@ -2868,7 +2868,7 @@ fn stream_outputs<W: Clone + AsRef<[u64]>>(
 /// concern at all (object construction's key/value slots and jq-mode string
 /// interpolation, #2022; `fanout_arg`, #2023) -- the count above is about
 /// this one bound-value shape specifically, not a total call-site census.
-fn stream_outputs_checked<W: Clone + AsRef<[u64]>>(
+fn stream_outputs<W: Clone + AsRef<[u64]>>(
     result: QueryResult<'_, W>,
 ) -> (Vec<OwnedValue>, Option<Control>) {
     match result.materialize_cursor() {
@@ -2877,7 +2877,7 @@ fn stream_outputs_checked<W: Clone + AsRef<[u64]>>(
             Err(e) => (Vec::new(), Some(Control::Error(e))),
         },
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
-        QueryResult::Many(vs) => match promote_borrowed_checked(vs) {
+        QueryResult::Many(vs) => match promote_borrowed(vs) {
             Ok(vs) => (vs, None),
             Err((prefix, e)) => (prefix, Some(Control::Error(e))),
         },
@@ -2904,7 +2904,7 @@ impl From<Control> for ObjectEscape {
 /// How [`build_object_entries`] evaluates one key or value slot of an object
 /// literal: every output the slot produced, plus a deferred escape if its own
 /// generator terminated in an error, a break or a halt --
-/// [`stream_outputs_checked`]'s pair, which both strategies wrap (#2473).
+/// [`stream_outputs`]'s pair, which both strategies wrap (#2473).
 type ObjectSlotEvaluator<'a> = dyn FnMut(&Expr) -> (Vec<OwnedValue>, Option<Control>) + 'a;
 
 /// Emit one object per combination of the remaining entries' key/value outputs.
@@ -2922,7 +2922,7 @@ type ObjectSlotEvaluator<'a> = dyn FnMut(&Expr) -> (Vec<OwnedValue>, Option<Cont
 /// - the key's string-ness is checked at assembly time, after the value is in
 ///   hand, so `{(.n): empty}` with a numeric `.n` raises nothing and
 ///   `{(.n): error("VAL")}` reports `VAL` rather than the key-type error;
-/// - a key or value generator's own deferred control (see [`stream_outputs`])
+/// - a key or value generator's own deferred control (see [`stream_outputs_lossy`])
 ///   is checked only after its whole prefix loop has run to completion, and
 ///   is then returned via `?` — which unwinds every enclosing loop immediately
 ///   rather than resuming them, matching jq's own all-or-nothing backtracking:
@@ -2982,8 +2982,8 @@ fn build_object_entries<S: EvalSemantics>(
 
     let (keys, key_trailing) = match &entry.key {
         ObjectKey::Literal(s) => (vec![OwnedValue::String(s.clone())], None),
-        // #2022: the strategies are `stream_outputs_checked`-wrapped, not
-        // `stream_outputs` -- an undecodable computed key must raise, not
+        // #2022: the strategies are `stream_outputs`-wrapped, not
+        // `stream_outputs_lossy` -- an undecodable computed key must raise, not
         // silently materialize as `""`.
         ObjectKey::Expr(key_expr) => eval_operand(key_expr),
     };
@@ -3053,7 +3053,7 @@ fn eval_object_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     eval_object_construction_with::<W, S>(
         entries,
-        &mut |expr| stream_outputs_checked(eval_single::<W, S>(expr, value.clone(), optional)),
+        &mut |expr| stream_outputs(eval_single::<W, S>(expr, value.clone(), optional)),
         optional,
     )
 }
@@ -3150,7 +3150,7 @@ fn collect_recursive<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// whichever promotion point set `owned` -- every push after that point
 /// goes to `owned`, never back to `borrowed`), otherwise checked-promoting
 /// whatever's left in `borrowed` for the first time via the existing
-/// [`promote_borrowed_checked`]. `extra` is appended on success -- the
+/// [`promote_borrowed`]. `extra` is appended on success -- the
 /// `Partial(vs, control)` arm's own already-produced `vs`; every other
 /// caller passes an empty `Vec`.
 ///
@@ -3161,7 +3161,7 @@ fn collect_recursive<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// evaluation would have raised on it first. Returns the shorter,
 /// successfully-converted prefix paired with the decode error in place of
 /// `control`, the same "keep the prefix, earliest error wins" rule
-/// `push_promoted`/`promote_borrowed_checked` already established for the
+/// `push_promoted`/`promote_borrowed` already established for the
 /// main promotion path (#1755/#1790) -- this is that rule's other half, for
 /// the terminal-control path those two never covered. Before this fix,
 /// `borrowed`'s conversion here ran through unchecked `to_owned_lossy`, silently
@@ -3180,7 +3180,7 @@ fn collect_recursive<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// and keeps going. Converting one into the other here would silently
 /// resume processing a real CLI invocation meant to stop, not just violate
 /// an abstract rule. The halt is kept, but the corrupted element (and
-/// anything `promote_borrowed_checked` never reached past it) is dropped
+/// anything `promote_borrowed` never reached past it) is dropped
 /// from the reported prefix rather than leaking the old `""` substitution
 /// -- neither silently wrong output nor a silently downgraded halt.
 fn resolve_terminal_prefix<W: Clone + AsRef<[u64]>>(
@@ -3189,7 +3189,7 @@ fn resolve_terminal_prefix<W: Clone + AsRef<[u64]>>(
     extra: Vec<OwnedValue>,
     control: Control,
 ) -> (Vec<OwnedValue>, Control) {
-    match owned.map_or_else(|| promote_borrowed_checked(borrowed), Ok) {
+    match owned.map_or_else(|| promote_borrowed(borrowed), Ok) {
         Ok(mut prefix) => {
             prefix.extend(extra);
             (prefix, control)
@@ -3752,17 +3752,17 @@ where
     B: FnMut(OwnedValue) -> QueryResult<'a, W>,
 {
     if !matches!(fanout, ArgFanout::All) {
-        // #2023: `stream_outputs_checked`, not `stream_outputs` -- this
+        // #2023: `stream_outputs`, not `stream_outputs_lossy` -- this
         // eager path (every non-`All` gate, i.e. every yq-mode builtin
         // routed through `ArgFanout::yq_native`/`reject_many_in_yq`/etc.)
         // shares the identical #1746-shaped bug the `All` lazy sink above
-        // was fixed for: `stream_outputs`'s own fold uses unchecked
+        // was fixed for: `stream_outputs_lossy`'s own fold uses unchecked
         // `to_owned_lossy` via `QueryResult::collect_owned`, silently substituting
         // `""` for an undecodable argument instead of raising. Confirmed
         // live: `succinctly yq 'has(.b)'` on an undecodable `.b` answered
         // `false` instead of raising, pre-fix.
         let (mut args, trailing) =
-            stream_outputs_checked(eval_single::<W, S>(arg_expr, value.clone(), optional));
+            stream_outputs(eval_single::<W, S>(arg_expr, value.clone(), optional));
         if clear_values_when_yq_argument_escaped(&mut args, &trailing) {
             // Fall through with no values: the `match trailing` below turns
             // the escape into a bare `Error`/`Break`/`Halt`.
@@ -3774,7 +3774,7 @@ where
         }
         let mut out: Vec<OwnedValue> = Vec::new();
         for arg in args {
-            if let Some(control) = push_owned_values_checked(body(arg), &mut out) {
+            if let Some(control) = push_owned_values(body(arg), &mut out) {
                 return partial(out, control);
             }
         }
@@ -3806,7 +3806,7 @@ where
             Ok(v) => v,
             Err(e) => {
                 if let Some(previous) = pending_first.take() {
-                    if let Some(control) = push_owned_values_checked(previous, &mut out) {
+                    if let Some(control) = push_owned_values(previous, &mut out) {
                         body_control = Some(control);
                         return Demand::Stop;
                     }
@@ -3816,7 +3816,7 @@ where
             }
         };
         if let Some(previous) = pending_first.take() {
-            if let Some(control) = push_owned_values_checked(previous, &mut out) {
+            if let Some(control) = push_owned_values(previous, &mut out) {
                 body_control = Some(control);
                 return Demand::Stop;
             }
@@ -3827,14 +3827,14 @@ where
         // or an escaping first result would be parked and the sink would ask
         // for another value anyway -- which is the bug this arm exists to fix.
         if result.is_escape() {
-            if let Some(control) = push_owned_values_checked(result, &mut out) {
+            if let Some(control) = push_owned_values(result, &mut out) {
                 body_control = Some(control);
             }
             return Demand::Stop;
         }
         if out.is_empty() && pending_first.is_none() {
             pending_first = Some(result);
-        } else if let Some(control) = push_owned_values_checked(result, &mut out) {
+        } else if let Some(control) = push_owned_values(result, &mut out) {
             body_control = Some(control);
             return Demand::Stop;
         }
@@ -3861,7 +3861,7 @@ where
         // of it.
         Flow::Escaped(control) => {
             if let Some(previous) = pending_first.take() {
-                if let Some(body_control) = push_owned_values_checked(previous, &mut out) {
+                if let Some(body_control) = push_owned_values(previous, &mut out) {
                     return partial(out, body_control);
                 }
             }
@@ -3947,16 +3947,16 @@ fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         return fanout_two_args_lazy::<W, S, _>(outer, inner, value, optional, body);
     }
 
-    // #1989: `stream_outputs_checked`, not `stream_outputs` -- the same
+    // #1989: `stream_outputs`, not `stream_outputs_lossy` -- the same
     // #1746-shaped bug #2023 fixed at `fanout_arg`'s own eager path, at the
-    // two-argument twin it left behind. `stream_outputs`'s fold materializes
+    // two-argument twin it left behind. `stream_outputs_lossy`'s fold materializes
     // through `QueryResult::collect_owned`, which uses the unchecked
     // conversion and so silently substitutes `""` for an undecodable
     // argument instead of raising -- the argument then gets used as though
     // that empty string were the real value (a path element, a pattern, a
     // set of regex flags).
     let (mut outers, outer_trailing) =
-        stream_outputs_checked(eval_single::<W, S>(outer, value.clone(), optional));
+        stream_outputs(eval_single::<W, S>(outer, value.clone(), optional));
     if let Err(e) = apply_arg_fanout(fanout, &mut outers) {
         // #1533's other half. Two things had to be established live against
         // the pinned yq v4.53.3 oracle, not assumed:
@@ -3984,7 +3984,7 @@ fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // not an extra one, with the same side-effect profile the loop's
         // first iteration would have had.
         let (mut probe_inners, probe_inner_trailing) =
-            stream_outputs_checked(eval_single::<W, S>(inner, value.clone(), optional));
+            stream_outputs(eval_single::<W, S>(inner, value.clone(), optional));
         if let Err(inner_e) = apply_arg_fanout(fanout, &mut probe_inners) {
             return match probe_inner_trailing {
                 Some(inner_control) => partial(Vec::new(), inner_control),
@@ -3994,7 +3994,7 @@ fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #1989: inner's own trailing control still has to be checked even
         // when `apply_arg_fanout` succeeds on `probe_inners` -- which it
         // always does on an empty vec, since `RejectMany`'s own guard is
-        // `len() > 1`. A decode failure captured by `stream_outputs_checked`
+        // `len() > 1`. A decode failure captured by `stream_outputs`
         // (empty vec, `Some(Control::Error(_))`) is exactly this shape, and
         // without this check it was silently discarded in favor of outer's
         // own plain, `?`-suppressible violation message -- the same "inner
@@ -4013,7 +4013,7 @@ fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut out: Vec<OwnedValue> = Vec::new();
     for o in outers {
         let (mut inners, inner_trailing) =
-            stream_outputs_checked(eval_single::<W, S>(inner, value.clone(), optional));
+            stream_outputs(eval_single::<W, S>(inner, value.clone(), optional));
         if let Err(e) = apply_arg_fanout(fanout, &mut inners) {
             // Same reasoning as the outer slot above.
             return match inner_trailing {
@@ -4023,7 +4023,7 @@ fn fanout_two_args<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
 
         for i in inners {
-            if let Some(control) = push_owned_values_checked(body(o.clone(), i), &mut out) {
+            if let Some(control) = push_owned_values(body(o.clone(), i), &mut out) {
                 return partial(out, control);
             }
         }
@@ -4111,7 +4111,7 @@ where
                 Ok(v) => v,
                 Err(demand) => return demand,
             };
-            match push_owned_values_checked(body(o.clone(), i), &mut out) {
+            match push_owned_values(body(o.clone(), i), &mut out) {
                 Some(control) => {
                     escape = Some(control);
                     Demand::Stop
@@ -4332,7 +4332,7 @@ fn prepend<W: Clone + AsRef<[u64]>>(
             prefix.push(v);
             owned_vec_to_result(prefix)
         }
-        QueryResult::Many(vs) => match promote_borrowed_checked(vs) {
+        QueryResult::Many(vs) => match promote_borrowed(vs) {
             Ok(owned) => {
                 prefix.extend(owned);
                 owned_vec_to_result(prefix)
@@ -4550,7 +4550,7 @@ fn bools_to_result<'a, W: Clone + AsRef<[u64]>>(bools: Vec<bool>) -> QueryResult
 /// does. Used by [`eval_binary_fanout`] (#768) to fork an arithmetic/
 /// comparison operand into all of its outputs, mirroring how `push_truthiness`
 /// already forks `and`/`or`'s operands.
-fn push_owned_values<W: Clone + AsRef<[u64]>>(
+fn push_owned_values_lossy<W: Clone + AsRef<[u64]>>(
     result: QueryResult<'_, W>,
     out: &mut Vec<OwnedValue>,
 ) -> Option<Control> {
@@ -4572,16 +4572,16 @@ fn push_owned_values<W: Clone + AsRef<[u64]>>(
     None
 }
 
-/// The [`to_owned`]/[`promote_borrowed_checked`] counterpart to
-/// [`push_owned_values`]: identical push, except a decode failure
+/// The [`to_owned`]/[`promote_borrowed`] counterpart to
+/// [`push_owned_values_lossy`]: identical push, except a decode failure
 /// discovered while materializing an output is treated exactly like an
 /// ordinary trailing error -- returned as `Some(Control::Error(_))`, with
 /// whatever was already successfully converted staying in `out`. #1934
 /// item 4: collapses `eval_as`'s per-bound-value body loop (the sibling
-/// duplication `stream_outputs_checked` doesn't cover, since this one
+/// duplication `stream_outputs` doesn't cover, since this one
 /// pushes into a caller-owned accumulator across a loop rather than
 /// returning a fresh pair) into one definition.
-fn push_owned_values_checked<W: Clone + AsRef<[u64]>>(
+fn push_owned_values<W: Clone + AsRef<[u64]>>(
     result: QueryResult<'_, W>,
     out: &mut Vec<OwnedValue>,
 ) -> Option<Control> {
@@ -4592,7 +4592,7 @@ fn push_owned_values_checked<W: Clone + AsRef<[u64]>>(
         },
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
         QueryResult::Owned(v) => out.push(v),
-        QueryResult::Many(vs) => match promote_borrowed_checked(vs) {
+        QueryResult::Many(vs) => match promote_borrowed(vs) {
             Ok(vs) => out.extend(vs),
             Err((prefix, e)) => {
                 out.extend(prefix);
@@ -4781,8 +4781,8 @@ pub(crate) enum Flow {
 ///
 /// **The invariant that makes the whole design incremental:** for a sink that
 /// always answers [`Demand::Continue`], this delivers exactly the values
-/// [`push_owned_values`] would collect, in the same order, and reports the
-/// same terminal [`Control`]. It *is* `push_owned_values` plus a demand check
+/// [`push_owned_values_lossy`] would collect, in the same order, and reports the
+/// same terminal [`Control`]. It *is* `push_owned_values_lossy` plus a demand check
 /// between values, minus the `to_owned_lossy` on borrowed items. So an un-lazified
 /// arm is a missed optimization, never a behaviour change — and a lazy arm can
 /// only shrink the set of sub-expressions evaluated, never reorder or alter
@@ -4845,7 +4845,7 @@ fn drain_result<'a, W: Clone + AsRef<[u64]>>(
         QueryResult::Halt(code) => Flow::Escaped(Control::Halt(code)),
         // `partial()` guarantees the prefix is produced *before* the control
         // and is never empty, so it is delivered first — exactly as
-        // `push_owned_values` already delivers it. A sink that stops
+        // `push_owned_values_lossy` already delivers it. A sink that stops
         // part-way through carries the control it never reached forward as
         // `pending`, rather than dropping it outright: this is the one
         // `Flow::Stopped` shape that can carry a real payload (see
@@ -5303,7 +5303,7 @@ fn each_label<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 fn materialize_bound_values<W: Clone + AsRef<[u64]>>(
     bound_result: QueryResult<'_, W>,
 ) -> Result<(Vec<OwnedValue>, Option<Control>), Flow> {
-    // #1902: to_owned/promote_borrowed_checked, not to_owned_lossy -- the
+    // #1902: to_owned/promote_borrowed, not to_owned_lossy -- the
     // lazy twin of the same bug `eval_as`'s own bound-value conversion had.
     // A checked-conversion failure folds into the trailing control exactly
     // like an ordinary `Partial`'s control (the `Partial` arm below).
@@ -5313,7 +5313,7 @@ fn materialize_bound_values<W: Clone + AsRef<[u64]>>(
             Err(e) => Ok((Vec::new(), Some(Control::Error(e)))),
         },
         QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
-        QueryResult::Many(vs) => match promote_borrowed_checked(vs) {
+        QueryResult::Many(vs) => match promote_borrowed(vs) {
             Ok(vs) => Ok((vs, None)),
             Err((prefix, e)) => Ok((prefix, Some(Control::Error(e)))),
         },
@@ -5786,7 +5786,7 @@ fn each_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Demand-driven twin of [`eval_range`] (#1556): drives `from`, `to`, and
-/// `step` through [`eval_each`] instead of `stream_outputs`, so a wrapping
+/// `step` through [`eval_each`] instead of `stream_outputs_lossy`, so a wrapping
 /// consumer's [`Demand::Stop`] reaches *inside* the bound expressions
 /// themselves, not just the values `range` finally emits. Nesting order is
 /// unchanged from `eval_range`'s own doc comment: `from` outer, `to`
@@ -6050,7 +6050,7 @@ fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ///
 /// The all-`Borrowed` fast path defers decoding rather than doing any
 /// itself, so there's nothing to check yet there -- the eventual consumer,
-/// e.g. [`push_owned_values_checked`], is what raises. But the mixed/owned
+/// e.g. [`push_owned_values`], is what raises. But the mixed/owned
 /// branch used to convert every item through bare [`Item::into_owned_lossy`]
 /// unconditionally, silently substituting `""` for an undecodable item
 /// instead of raising (#2024 code review) -- the #1746-shaped bug one layer
@@ -6322,7 +6322,7 @@ fn eval_fanout<'a, W: Clone + AsRef<[u64]>>(
 
     for bit in bits {
         match body(bit).materialize_cursor() {
-            // #1832: push_promoted/promote_borrowed_checked, not unchecked
+            // #1832: push_promoted/promote_borrowed, not unchecked
             // to_owned_lossy -- eval_fanout had the identical #1755/#1790
             // silently-corrupt-on-promotion bug shape already fixed for
             // eval_pipe/eval_comma, just never applied here.
@@ -6812,14 +6812,14 @@ where
     W: Clone + AsRef<[u64]>,
 {
     let mut vals = Vec::new();
-    // #1989: `push_owned_values_checked`, not `push_owned_values` -- unary
+    // #1989: `push_owned_values`, not `push_owned_values_lossy` -- unary
     // minus is not an error-message context, it consumes the value. With
     // the unchecked push an undecodable operand became `""` and then fell
     // into `arith_negate`'s own type error, which *renders* it: `-.a` on an
     // undecodable `.a` reported `string ("") cannot be negated` (a
     // catchable, `?`-suppressible error naming content the document never
     // held) instead of the decode failure, which `?` may not suppress.
-    let control = push_owned_values_checked(operand_result, &mut vals);
+    let control = push_owned_values(operand_result, &mut vals);
 
     let mut out: Vec<OwnedValue> = Vec::new();
     for val in vals {
@@ -12077,18 +12077,18 @@ fn owned_to_json_bytes<S: EvalSemantics>(value: &OwnedValue) -> Vec<u8> {
 /// Materialize a `\(...)` slot's own outputs as rendered strings, plus a
 /// deferred escape if its generator terminates in an error/break/halt.
 ///
-/// Reuses [`stream_outputs_checked`] (already fully general -- it just
+/// Reuses [`stream_outputs`] (already fully general -- it just
 /// unpacks a `QueryResult` into `(Vec<OwnedValue>, Option<Control>)` with no
 /// object-specific coupling) and stringifies each output the same way a
 /// single-valued slot already did (`owned_to_string`).
 ///
-/// #2022: checked, not the bare [`stream_outputs`] this used before -- an
+/// #2022: checked, not the bare [`stream_outputs_lossy`] this used before -- an
 /// undecodable `\(...)` slot value must raise, not silently interpolate as
 /// `""`, matching the yq-mode single-value fast path #1972 already fixed.
 fn string_part_outputs<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     result: QueryResult<'_, W>,
 ) -> (Vec<String>, Option<Control>) {
-    let (values, control) = stream_outputs_checked(result);
+    let (values, control) = stream_outputs(result);
     (values.iter().map(owned_to_string::<S>).collect(), control)
 }
 
@@ -16249,14 +16249,14 @@ fn eval_sub_replacement<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `+`-operator wording (`"string (...) and number (...) cannot be
     // added"`) rather than a bespoke message. `stitch_replacement_rows`
     // (which holds the gap text) is what performs that `+`, via `arith_add`.
-    // #2165: plain `stream_outputs`, not `_checked`, is safe here -- confirmed
+    // #2165: plain `stream_outputs_lossy`, not `_checked`, is safe here -- confirmed
     // by investigation, not assumed. `replacement_expr` runs with `.` bound to
     // `captures` (see this function's own doc comment above), which is built
     // by `capture_object` purely from `regex::Captures` substrings of the
     // already-matched subject string; the `regex` crate operates on `&str`,
     // so that subject was necessarily valid UTF-8 already, and every capture
     // group is a clean substring of it (or absent). `captures` itself can
-    // therefore never carry undecodable content for `stream_outputs`'s
+    // therefore never carry undecodable content for `stream_outputs_lossy`'s
     // unchecked fold to silently launder.
     //
     // The only way outer document content can reach `replacement_expr` at all
@@ -16277,7 +16277,7 @@ fn eval_sub_replacement<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // for the pinning tests.
     let materialized =
         eval_owned_input::<W, S>(replacement_expr, &captures, optional).materialize_cursor();
-    let (values, trailing) = stream_outputs(materialized);
+    let (values, trailing) = stream_outputs_lossy(materialized);
     if let Some(control) = trailing {
         return Err(partial(Vec::new(), control));
     }
@@ -17089,13 +17089,13 @@ fn fanout_regex_pattern_with_collected_flags<'a, W: Clone + AsRef<[u64]>, S: Eva
         |raw_pattern| {
             // Re-evaluated per pattern, matching jq: the array construction
             // holding `flags` sits inside `$re`'s own binding.
-            // #1989: `stream_outputs_checked` -- an undecodable `flags`
+            // #1989: `stream_outputs` -- an undecodable `flags`
             // argument (`splits(","; .flags)`) used to be materialized as
-            // `""` by `stream_outputs`'s unchecked fold and then applied as
+            // `""` by `stream_outputs_lossy`'s unchecked fold and then applied as
             // "no flags at all", silently answering with the wrong match
             // semantics instead of raising.
             let (raw_flags_values, trailing) =
-                stream_outputs_checked(eval_single::<W, S>(flags_expr, value.clone(), optional));
+                stream_outputs(eval_single::<W, S>(flags_expr, value.clone(), optional));
             let mut resolved_pattern: Option<String> = None;
             let mut flags = vec_with_capacity(raw_flags_values.len());
             for raw_flags in raw_flags_values {
@@ -17640,7 +17640,7 @@ fn push_promoted<'a, W: Clone + AsRef<[u64]>>(
 /// `Many` arm (#1908), whose catch-handler result has no `Owned`/`ManyOwned`
 /// sibling to wait for. Returns whatever converted successfully so far as
 /// the `Err` payload's own prefix.
-fn promote_borrowed_checked<W: Clone + AsRef<[u64]>>(
+fn promote_borrowed<W: Clone + AsRef<[u64]>>(
     borrowed: Vec<StandardJson<'_, W>>,
 ) -> Result<Vec<OwnedValue>, (Vec<OwnedValue>, EvalError)> {
     let mut acc = vec_with_capacity(borrowed.len());
@@ -17654,7 +17654,7 @@ fn promote_borrowed_checked<W: Clone + AsRef<[u64]>>(
 }
 
 /// Promote `*owned` from `*borrowed` on first use (via
-/// [`promote_borrowed_checked`]), then extend it with `values` -- the
+/// [`promote_borrowed`]), then extend it with `values` -- the
 /// `Owned`/`ManyOwned` arm of `eval_comma`/`eval_fanout`/`eval_pipe`'s
 /// identical `Many`-branch loops (#1832 review: `eval_fanout`'s own copy of
 /// this exact block was independently written a third time when its
@@ -17663,14 +17663,14 @@ fn promote_borrowed_checked<W: Clone + AsRef<[u64]>>(
 /// `borrowed` is left empty either way: either it never had anything (the
 /// `Some` branch, `owned` already promoted by an earlier call), or
 /// `core::mem::take` already moved everything out of it into
-/// `promote_borrowed_checked`.
+/// `promote_borrowed`.
 fn promote_and_extend<W: Clone + AsRef<[u64]>>(
     borrowed: &mut Vec<StandardJson<'_, W>>,
     owned: &mut Option<Vec<OwnedValue>>,
     values: impl IntoIterator<Item = OwnedValue>,
 ) -> Result<(), (Vec<OwnedValue>, EvalError)> {
     if owned.is_none() {
-        *owned = Some(promote_borrowed_checked(core::mem::take(borrowed))?);
+        *owned = Some(promote_borrowed(core::mem::take(borrowed))?);
     }
     owned.as_mut().unwrap().extend(values);
     Ok(())
@@ -18783,7 +18783,7 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     promote: {
                         if owned.is_none() {
                             owned = Some(
-                                match promote_borrowed_checked(core::mem::take(&mut borrowed)) {
+                                match promote_borrowed(core::mem::take(&mut borrowed)) {
                                     Ok(v) => v,
                                     // An earlier key's own undecodable value
                                     // predates this key's target generator in
@@ -18927,12 +18927,12 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // only, with no knowledge of this batch's own `ts.len()`
                 // pending pushes, so a `try_reserve` gated on `owned`
                 // already being `Some` skipped the very first Owned-kind
-                // key entirely). `promote_borrowed_checked` mirrors what
+                // key entirely). `promote_borrowed` mirrors what
                 // `promote_and_extend`/`push_promoted` already do
                 // internally for this exact conversion (#353/#1755/#1790).
                 if owned.is_none() {
                     owned = Some(
-                        match promote_borrowed_checked(core::mem::take(&mut borrowed)) {
+                        match promote_borrowed(core::mem::take(&mut borrowed)) {
                             Ok(v) => v,
                             // #2138: this secondary promotion failure used
                             // to have to choose between a pending
@@ -24441,7 +24441,7 @@ fn eval_owned_multi_first<S: EvalSemantics>(
 /// function decide that policy themselves; it isn't part of this function's
 /// own contract.
 ///
-/// Built on [`push_owned_values`] (the same "keep every value, surface the
+/// Built on [`push_owned_values_lossy`] (the same "keep every value, surface the
 /// terminal escape separately" primitive [`eval_binary_fanout`] already
 /// uses) rather than a second hand-rolled match over `QueryResult`, so
 /// there is exactly one implementation of that shape in this file.
@@ -24460,7 +24460,7 @@ fn eval_owned_multi_keep_partial<S: EvalSemantics>(
 ) -> (Vec<OwnedValue>, Option<EvalEscape>) {
     let result = eval_owned_input::<Vec<u64>, S>(expr, input, false);
     let mut out = Vec::new();
-    let escape = push_owned_values(result, &mut out).map(EvalEscape::from);
+    let escape = push_owned_values_lossy(result, &mut out).map(EvalEscape::from);
     (out, escape)
 }
 
@@ -26725,7 +26725,7 @@ fn resolve_leaf<'a, S: EvalSemantics>(
         // destroy — so this keeps an always-`Continue` sink. That makes it
         // provably byte-identical to the eager `eval_owned_multi_keep_partial`
         // this replaced: `eval_each_owned`/`drain_result` mirror
-        // `eval_owned_input`/`push_owned_values` exactly when the sink never
+        // `eval_owned_input`/`push_owned_values_lossy` exactly when the sink never
         // answers `Stop` (`drain_result`'s own doc comment states that
         // invariant).
         let mut values = Vec::new();
@@ -31397,16 +31397,16 @@ fn eval_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // generator processes each bound value as it's produced:
     // `(1,2,error("x")) as $v | $v + 10` is `11`, `12`, then the error — so
     // the bind expression's own control is held until that loop over its
-    // prefix has run its course. #1902/#1934: [`stream_outputs_checked`]
+    // prefix has run its course. #1902/#1934: [`stream_outputs`]
     // folds a checked-conversion failure into `bound_control` exactly like
     // an ordinary `Partial`'s control (the comment above) -- an undecodable
     // bound value used to silently become `""` here instead of raising; the
     // already-converted prefix still runs through the body below before the
     // decode failure surfaces as the terminal control.
-    let (bound_values, bound_control) = stream_outputs_checked(bound_result.materialize_cursor());
+    let (bound_values, bound_control) = stream_outputs(bound_result.materialize_cursor());
 
     // For each bound value, substitute and evaluate the body. #1902/#1934:
-    // [`push_owned_values_checked`] folds an undecodable body output into
+    // [`push_owned_values`] folds an undecodable body output into
     // its returned `Control` the same way an ordinary trailing error would
     // be -- returning immediately, before any later bound value's own body
     // ever runs, restores the "earlier undecodable value preempts a later
@@ -31417,7 +31417,7 @@ fn eval_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         let substituted_body = substitute_bound_var(expr, body, var, &bound_val);
         let body_result = eval_single::<W, S>(&substituted_body, value.clone(), optional);
         // The outputs already produced no longer vanish (#400, #494).
-        if let Some(control) = push_owned_values_checked(body_result, &mut all_results) {
+        if let Some(control) = push_owned_values(body_result, &mut all_results) {
             return partial(all_results, control);
         }
     }
@@ -31614,7 +31614,7 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // [`eval_reduce_with_values`]. `path()`'s own resolver already ordered
     // the two this way (#2388).
     //
-    // #1902/#1934: `stream_outputs_checked` (to_owned/promote_borrowed_checked,
+    // #1902/#1934: `stream_outputs` (to_owned/promote_borrowed,
     // not to_owned_lossy) -- an undecodable INIT output used to silently
     // become `""` instead of raising. A `Partial` INIT stream still forks
     // over the prefix it did produce; a bare `Error`/`Break`/`Halt` folds to
@@ -31630,7 +31630,7 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // execution over the source (#534): `reduce (1,2) as $x ((10,20); .+$x)`
     // is `13`, `23`, one result per INIT output.
     let init_result = eval_single::<W, S>(init, value.clone(), optional);
-    let (init_values, init_control) = stream_outputs_checked(init_result.materialize_cursor());
+    let (init_values, init_control) = stream_outputs(init_result.materialize_cursor());
 
     eval_reduce_with_values::<W, S, _>(
         patterns,
@@ -31639,7 +31639,7 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         init_control,
         optional,
         || {
-            // #1902/#1934: to_owned/promote_borrowed_checked, not to_owned_lossy --
+            // #1902/#1934: to_owned/promote_borrowed, not to_owned_lossy --
             // an undecodable input element used to silently become `""` instead
             // of raising. A decode failure is never suppressed by `optional`
             // (#1620), matching the "drop the prefix, propagate unconditionally"
@@ -31670,7 +31670,7 @@ fn eval_reduce<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     Err(e) => Err(suppress_or_raise(e, optional)),
                 },
                 QueryResult::OneCursor(_) => unreachable!(),
-                QueryResult::Many(vs) => match promote_borrowed_checked(vs) {
+                QueryResult::Many(vs) => match promote_borrowed(vs) {
                     Ok(vs) => Ok(vs),
                     Err((_, e)) => Err(suppress_or_raise(e, optional)),
                 },
@@ -33012,8 +33012,8 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `foreach halt_error as $x (empty; .)` exits 0 without halting, because
     // a zero-output INIT never pulls the source at all.
     //
-    // #1902: `stream_outputs_checked` gives INIT the same checked conversion
-    // (`to_owned`/`promote_borrowed_checked`, not `to_owned_lossy`) the
+    // #1902: `stream_outputs` gives INIT the same checked conversion
+    // (`to_owned`/`promote_borrowed`, not `to_owned_lossy`) the
     // source gets below, folding a bare `Error`/`Break`/`Halt` into
     // `init_control` with an empty prefix. That fold is exactly what the old
     // hand-rolled arms here did *except* for their `input_control.or(..)`
@@ -33031,7 +33031,7 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // .+$x)]` is `[11,13,21,23]`, the concatenation of one independent run
     // per INIT output.
     let init_result = eval_single::<W, S>(init, value.clone(), optional);
-    let (init_values, init_control) = stream_outputs_checked(init_result.materialize_cursor());
+    let (init_values, init_control) = stream_outputs(init_result.materialize_cursor());
 
     eval_foreach_with_values::<W, S, _>(
         patterns,
@@ -33048,7 +33048,7 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // stream's own control is carried alongside the prefix rather
             // than replacing it.
             //
-            // #1902: to_owned/promote_borrowed_checked, not to_owned_lossy --
+            // #1902: to_owned/promote_borrowed, not to_owned_lossy --
             // a checked-conversion failure folds into `input_control` exactly
             // like an ordinary `Partial`'s control: the already-decoded prefix
             // is still iterated before the decode failure surfaces as the
@@ -33062,7 +33062,7 @@ fn eval_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     Err(e) => Ok((Vec::new(), Some(Control::Error(e)))),
                 },
                 QueryResult::OneCursor(_) => unreachable!(),
-                QueryResult::Many(vs) => match promote_borrowed_checked(vs) {
+                QueryResult::Many(vs) => match promote_borrowed(vs) {
                     Ok(vs) => Ok((vs, None)),
                     Err((prefix, e)) => Ok((prefix, Some(Control::Error(e)))),
                 },
@@ -33325,7 +33325,7 @@ fn limit_with_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // argument's trailing control, and the same shape `eval_as`'s
                 // own bound-control-vs-fallback match already uses.
                 let final_control =
-                    push_owned_values_checked(result, &mut prefix).unwrap_or(control);
+                    push_owned_values(result, &mut prefix).unwrap_or(control);
                 partial(prefix, final_control)
             }
         }
@@ -33869,7 +33869,7 @@ impl RangeNum {
 /// Classify one already-resolved bound value as a [`RangeNum`].
 ///
 /// Was a `QueryResult` matcher with its own `Halt`/`Break`/`Partial` arms;
-/// since #1279 gave `range` a real fan-out, [`stream_outputs`] owns those and
+/// since #1279 gave `range` a real fan-out, [`stream_outputs_lossy`] owns those and
 /// this is left as a pure per-value classifier.
 fn range_num(value: &OwnedValue) -> Result<RangeNum, EvalError> {
     match value {
@@ -35147,17 +35147,17 @@ fn builtin_fromstream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // instead of halting (#791).
         QueryResult::Halt(code) => return QueryResult::Halt(code),
         QueryResult::Partial(vs, control) => (vs, Some(control)),
-        // #2188: `stream_outputs_checked`, not bare `collect_owned` --
+        // #2188: `stream_outputs`, not bare `collect_owned` --
         // `collect_owned`'s `One`/`Many` arms use unchecked `to_owned_lossy`,
         // silently substituting `""` for an undecodable event leaf instead
         // of raising, the same #1746-shaped bug this whole family has
-        // already been fixed for elsewhere. `stream_outputs_checked` gives
+        // already been fixed for elsewhere. `stream_outputs` gives
         // the identical `(Vec<OwnedValue>, Option<Control>)` shape this
         // match already destructures into, so no call-site restructuring is
         // needed -- its own `Error`/`Break`/`Halt`/`Partial` arms are simply
         // unreachable here, since this match's own arms above already
         // intercept those variants before `result` can carry one.
-        result => stream_outputs_checked(result),
+        result => stream_outputs(result),
     };
 
     let mut outputs = Vec::new();
@@ -41176,8 +41176,8 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // is #1408's own requirement for this builtin, subsumed here rather than
     // dropped: it is the array constructor's answer, not the `x as $x |`
     // zero-fanout "produce nothing" every other builtin in this family gets.
-    // #2196: `stream_outputs_checked`, not the bare unchecked twin -- the
-    // last document-value-fed `stream_outputs` call site in this file left
+    // #2196: `stream_outputs`, not the bare unchecked twin -- the
+    // last document-value-fed `stream_outputs_lossy` call site in this file left
     // over after #1989 converted `fanout_two_args`'s two and
     // `fanout_regex_pattern_with_collected_flags`'s one. A real behavior
     // change, not a no-op: when *collection* itself succeeds, `range_num`
@@ -41189,7 +41189,7 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `range_num`'s ordinary, `optional`-suppressible type error. Pinned by
     // `test_builtin_combinations_n_raises_on_undecodable_n_expr_2196`.
     let (n_values, trailing) =
-        stream_outputs_checked(eval_single::<W, S>(n_expr, value.clone(), optional));
+        stream_outputs(eval_single::<W, S>(n_expr, value.clone(), optional));
 
     // Array construction drops its prefix when its generator escapes, so a
     // trailing break/error aborts the whole call with no output -- verified
@@ -42455,7 +42455,7 @@ fn builtin_exp2<W: Clone + AsRef<[u64]>>(
 /// The per-value half of `get_number_from_result`, which used to match a whole
 /// `QueryResult` and so collapsed a generator argument to its first output --
 /// `[pow((2,3);2)]` errored "expected number" where jq answers `[4,9]`
-/// (#1279). `stream_outputs` now owns the Halt/Break/Partial arms that
+/// (#1279). `stream_outputs_lossy` now owns the Halt/Break/Partial arms that
 /// function carried.
 /// `Err(None)` means an `optional` context swallowed the type mismatch, so the
 /// caller yields no output; `Err(Some(e))` is a real error.
@@ -44059,12 +44059,12 @@ fn eval_as_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // destructured and run through the body below, same as `eval_as`; the
     // bind's own control is held until that loop has run its course.
     //
-    // #1902/#1934: [`stream_outputs_checked`] -- the destructuring twin of
+    // #1902/#1934: [`stream_outputs`] -- the destructuring twin of
     // the same bug `eval_as`'s own bound-value conversion had (`. as [$a] |
     // ...`/`. as {k: $a} | ...`, not just `. as $a | ...`). A
     // checked-conversion failure folds into `bound_control` exactly like an
     // ordinary `Partial`'s control.
-    let (bound_values, bound_control) = stream_outputs_checked(bound_result.materialize_cursor());
+    let (bound_values, bound_control) = stream_outputs(bound_result.materialize_cursor());
 
     // Every variable name any alternative might bind -- a var referenced in
     // the body but bound only by an alternative that didn't end up matching
@@ -45627,7 +45627,7 @@ mod tests {
             Flow::Exhausted | Flow::Stopped { .. } => result,
             Flow::Escaped(control) => {
                 let mut prefix = Vec::new();
-                push_owned_values(result, &mut prefix);
+                push_owned_values_lossy(result, &mut prefix);
                 partial(prefix, control)
             }
         }
@@ -45637,7 +45637,7 @@ mod tests {
     /// carries, plus a tag for however it terminated.
     fn normalize<W: Clone + AsRef<[u64]>>(r: QueryResult<'_, W>) -> (Vec<OwnedValue>, String) {
         let mut out = Vec::new();
-        let control = push_owned_values(r, &mut out);
+        let control = push_owned_values_lossy(r, &mut out);
         let tag = match control {
             None => "ok".to_string(),
             Some(Control::Error(e)) => format!("error:{}", e.message),
@@ -46879,7 +46879,7 @@ mod tests {
 
     /// #1932: `eval_single`'s `Expr::Slice` arm, in the
     /// `StandardJson::Array` case, used an unchecked `to_owned_lossy` per element
-    /// instead of `promote_borrowed_checked` -- the same #1755 bug shape
+    /// instead of `promote_borrowed` -- the same #1755 bug shape
     /// already fixed for the adjacent `StandardJson::Object` arm a few
     /// lines below, missed on the array arm at the time. Exercised via
     /// `eval.rs`'s own library-API dispatch (`query!`), not the CLI, same as
@@ -47279,12 +47279,12 @@ mod tests {
     }
 
     /// #2196 review: `builtin_combinations_n`'s switch from unchecked
-    /// `stream_outputs` to `stream_outputs_checked` (closing this file's
+    /// `stream_outputs_lossy` to `stream_outputs` (closing this file's
     /// last document-value-fed unchecked call site) means an undecodable
     /// `n_expr` output -- not just a structurally malformed *document*, the
     /// shape the test above covers -- now raises too, unconditionally, the
     /// same "decode failure bypasses optional" rule this file's other
-    /// `stream_outputs_checked` sites already follow. `n_expr` evaluates to
+    /// `stream_outputs` sites already follow. `n_expr` evaluates to
     /// a plain undecodable string, so `range_num` (which would otherwise
     /// classify it as a content-free "not numeric" type error, suppressible
     /// under `optional`) never gets the chance to run at all.
@@ -48424,11 +48424,11 @@ mod tests {
     }
 
     /// #2022: object construction's computed-key slot fed its key generator's
-    /// output through `stream_outputs` (bare `to_owned_lossy`, via `collect_owned`),
+    /// output through `stream_outputs_lossy` (bare `to_owned_lossy`, via `collect_owned`),
     /// silently substituting `""` for an undecodable key instead of raising --
     /// the same #1746/#1972 shape already fixed at the sibling call sites
-    /// above, unreachable here only because `stream_outputs` (not
-    /// `stream_outputs_checked`) was doing the folding.
+    /// above, unreachable here only because `stream_outputs_lossy` (not
+    /// `stream_outputs`) was doing the folding.
     #[test]
     fn test_object_construction_key_raises_on_decode_failure_2022() {
         query!(
@@ -48799,7 +48799,7 @@ mod tests {
 
     /// #1790 positive control: a heterogeneous comma with valid data is
     /// unaffected by routing through `push_promoted`/
-    /// `promote_borrowed_checked`.
+    /// `promote_borrowed`.
     #[test]
     fn test_eval_comma_heterogeneous_valid_data_unaffected_1790() {
         query!(br#"{"a":"x"}"#, "[.a, 1]",
@@ -48828,7 +48828,7 @@ mod tests {
         );
     }
 
-    /// #1790: `promote_borrowed_checked`'s failure path via the
+    /// #1790: `promote_borrowed`'s failure path via the
     /// `ManyOwned` arm specifically (not `Owned`) -- a comma of two owned
     /// literals (`(1,2)`) forces the *first* promotion of an
     /// already-borrowed, undecodable branch.
@@ -48845,7 +48845,7 @@ mod tests {
     /// `Partial`) shared the identical unchecked-`to_owned_lossy` promotion bug
     /// #1790 fixed for the main promotion path, just reached via
     /// `merge_owned` (now `resolve_terminal_prefix`) instead of
-    /// `push_promoted`/`promote_borrowed_checked` directly -- an
+    /// `push_promoted`/`promote_borrowed` directly -- an
     /// undecodable *earlier* branch never gets checked before a *later*
     /// branch's own error/break/halt forces the prefix to be built. The
     /// earlier, still-unchecked decode failure must win over the later
@@ -50371,7 +50371,7 @@ mod tests {
     }
 
     /// #1934 item 3 (revised by #2286): `eval_reduce`'s `input` arm treats
-    /// every `to_owned`/`promote_borrowed_checked` failure as
+    /// every `to_owned`/`promote_borrowed` failure as
     /// unconditionally fatal -- including a #1194 malformed-member error
     /// (`{"a":1,"b"}`, a trailing unpaired object member JSON's own
     /// semi-index accepts), which #2286 tagged `is_decode_failure()` so it
@@ -50407,7 +50407,7 @@ mod tests {
     }
 
     /// Sibling of the test above for the `QueryResult::Many` arm
-    /// (`promote_borrowed_checked`, not `to_owned`): `.[]` always
+    /// (`promote_borrowed`, not `to_owned`): `.[]` always
     /// returns `Many`, even for a single-element array, so iterating over
     /// one malformed-member object exercises the exact arm the `One`-only
     /// repro above cannot reach.
@@ -50614,7 +50614,7 @@ mod tests {
         // `push_promoted`'s own `Some(acc)` branch: a `One` result arrives
         // *after* promotion has already happened (a prior sibling forced
         // `owned` to `Some`), so the undecodable third element is checked
-        // there, not in `promote_borrowed_checked`. `Partial` (not a bare
+        // there, not in `promote_borrowed`. `Partial` (not a bare
         // `Error`) because two valid outputs already reached the caller
         // before the third element's failure -- matching #400's "keep
         // what already piped through" policy.
@@ -50633,7 +50633,7 @@ mod tests {
             }
         );
         // Positive control for the same shape: valid data reaches both
-        // `promote_borrowed_checked`'s `Ok` arm (owned = Some(acc)) and
+        // `promote_borrowed`'s `Ok` arm (owned = Some(acc)) and
         // the subsequent `ManyOwned`/`push_promoted` extends.
         query!(
             &b"[1, 2, 3]"[..],
@@ -51028,10 +51028,10 @@ mod tests {
     /// (`fanout_arg`'s `ArgFanout::All` path). yq mode routes `has` through
     /// `ArgFanout::yq_native` = `FirstOnly` (not `All`), the *eager* branch
     /// at the top of `fanout_arg` -- a second, independent gap review found:
-    /// that branch used unchecked `stream_outputs`/`collect_owned` and had
+    /// that branch used unchecked `stream_outputs_lossy`/`collect_owned` and had
     /// the identical bug, live-confirmed via `succinctly yq 'has(.b)'`
     /// answering `false` instead of raising, pre-fix. Fixed by routing that
-    /// branch through `stream_outputs_checked` too.
+    /// branch through `stream_outputs` too.
     #[test]
     fn test_fanout_arg_eager_branch_item_to_owned_raises_decode_failure_yq_2023() {
         yq_query!(
@@ -51044,7 +51044,7 @@ mod tests {
     }
 
     /// #2024: `fanout_arg`'s lazy (`ArgFanout::All`) sink pushed `body`'s own
-    /// *result* through bare `push_owned_values`, not `_checked` -- a
+    /// *result* through bare `push_owned_values_lossy`, not `_checked` -- a
     /// different gap from #2023's (which fixed the *argument*-decoding side
     /// of this same function). `[1,"\xff\xfe"] | nth((0,1))` isolates it:
     /// `nth`'s `body` is `.[n]`, so `n=0` decodes cleanly (`1`, buffered as
@@ -51069,7 +51069,7 @@ mod tests {
 
     /// #2024: `limit_with_n`'s `Flow::Escaped` arm (fewer than `n` outputs
     /// produced before the generator's own terminator fired) converted its
-    /// pre-escape prefix via bare `push_owned_values` too, discarding
+    /// pre-escape prefix via bare `push_owned_values_lossy` too, discarding
     /// whatever control the conversion itself raised. `limit(3; (.a,
     /// error("x")))` on `{"a":"<bad>"}` collects the single undecodable `.a`
     /// into `taken` before `error("x")` fires (`satisfied` is false, since
@@ -54093,7 +54093,7 @@ mod tests {
     // The routes below were read out of the code, not copied from the issue:
     // #2216's own table listed `Expr::Reduce`'s arm as a fourth hand-rolled
     // copy of the classification, but that arm already delegates to
-    // `stream_outputs_checked` and folds *every* control (bare or trailing)
+    // `stream_outputs` and folds *every* control (bare or trailing)
     // into one decision, so it is not a routing site at all. It is pinned
     // below anyway, because #2416 migrates it alongside `Expr::Foreach`'s.
 
@@ -76822,7 +76822,7 @@ mod tests {
         // `QueryResult::collect_owned`'s `Halt` arm (#791). Every internal
         // caller of `collect_owned()` in this file already intercepts
         // `QueryResult::Halt` explicitly *before* falling into the generic
-        // `other => other.collect_owned()` branch -- see `stream_outputs`
+        // `other => other.collect_owned()` branch -- see `stream_outputs_lossy`
         // (matches `Halt` itself before its `other` fallback),
         // `eval_owned_multi`/`eval_owned_multi_first` (both match `Halt`
         // before their `other => Ok(other.collect_owned())` arm), and
@@ -80846,7 +80846,7 @@ mod tests {
 
     /// #1989 cluster 1: `fanout_two_args`'s eager (non-`ArgFanout::All`,
     /// i.e. yq-gated) path folded both argument slots through the unchecked
-    /// `stream_outputs`, so an undecodable argument silently materialized as
+    /// `stream_outputs_lossy`, so an undecodable argument silently materialized as
     /// `""` and was then *used* -- exactly the bug shape #2023 already fixed
     /// at `fanout_arg`'s own eager path and left behind here. Pre-fix,
     /// `setpath(.a; 1)` on an undecodable `.a` reported the ordinary
@@ -80899,7 +80899,7 @@ mod tests {
 
     /// #1989 cluster 1, the other half:
     /// `fanout_regex_pattern_with_collected_flags` evaluated its `flags`
-    /// slot through the unchecked `stream_outputs` too, so an undecodable
+    /// slot through the unchecked `stream_outputs_lossy` too, so an undecodable
     /// flags value became `""` -- i.e. "no flags at all" -- and the call
     /// carried on with the wrong match semantics instead of raising.
     ///
@@ -81246,7 +81246,7 @@ mod tests {
     }
 
     /// #1989 cluster 5: unary minus consumes its operand, so
-    /// `negate_fanout_core`'s unchecked `push_owned_values` turned an
+    /// `negate_fanout_core`'s unchecked `push_owned_values_lossy` turned an
     /// undecodable operand into `""` and then fell into `arith_negate`'s own
     /// type error, which *renders* the value -- reporting `string ("")
     /// cannot be negated`, a catchable, `?`-suppressible error naming
