@@ -1624,7 +1624,41 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         known_not_flow: bool,
         recursion_base: &str,
     ) -> StreamResult {
-        match self.value() {
+        self.stream_yaml_value_at(
+            None,
+            out,
+            indent,
+            indent_spaces,
+            unit,
+            sort_keys,
+            known_not_flow,
+            recursion_base,
+        )
+    }
+
+    /// [`stream_yaml_value`], for a caller that has already resolved this
+    /// cursor's own value (#1114) -- e.g. `write_deferred_value`, which must
+    /// resolve it anyway to classify absence via `is_deferred_value_absent_at`,
+    /// then immediately triggered a second, redundant resolve here on the
+    /// common (non-absent) path: `value()` is a real cost on this crate's
+    /// flagship streaming path (container/text-position checks, a byte scan,
+    /// and -- for a property-prefixed value -- skipping past the anchor/tag),
+    /// not free work to pay for twice per node. `known_value` skips this
+    /// function's own initial `self.value()` resolve when `Some`; a `None`
+    /// behaves exactly like [`stream_yaml_value`].
+    #[allow(clippy::too_many_arguments)]
+    fn stream_yaml_value_at<Out: core::fmt::Write>(
+        &self,
+        known_value: Option<YamlValue<'a, W>>,
+        out: &mut Out,
+        indent: &str,
+        indent_spaces: usize,
+        unit: char,
+        sort_keys: bool,
+        known_not_flow: bool,
+        recursion_base: &str,
+    ) -> StreamResult {
+        match known_value.unwrap_or_else(|| self.value()) {
             YamlValue::Null => Ok(out.write_str("null")?),
             YamlValue::String(s) => {
                 // YAML output (unlike JSON) has tag syntax, so an explicit
@@ -7050,9 +7084,9 @@ fn is_yaml_cursor_container<W: AsRef<[u64]>>(cursor: &YamlCursor<'_, W>) -> bool
     cursor.is_container() && cursor.first_child().is_some()
 }
 
-/// Whether a mapping field's value cursor is a deferred value that
-/// materialized as nothing at all - a sibling key follows at the same or
-/// lower indent, or EOF (issue #765).
+/// Whether a mapping field's value is a deferred value that materialized as
+/// nothing at all - a sibling key follows at the same or lower indent, or
+/// EOF (issue #765).
 ///
 /// Deliberately checks the resolved value's *text*, not general semantic
 /// nullness - a folded scalar continuation that merely *reads* as null
@@ -7064,8 +7098,16 @@ fn is_yaml_cursor_container<W: AsRef<[u64]>>(cursor: &YamlCursor<'_, W>) -> bool
 /// in the source (e.g. the next sibling key's own text), so `raw_bytes()`
 /// reads that unrelated text instead of reporting emptiness. `value()`'s
 /// `String`/`Null` classification does not have that problem.
-fn is_deferred_value_absent<W: AsRef<[u64]>>(value: &YamlCursor<'_, W>) -> bool {
-    match value.value() {
+///
+/// Takes an already-resolved `YamlValue`, not a `YamlCursor` (#1114):
+/// `write_deferred_value`/`write_yaml_child_inline` both classify absence
+/// and then, unconditionally on the common (non-absent) path, resolve the
+/// same cursor a second time via `stream_yaml_value`'s own internal
+/// `value()` call. Threading the already-resolved value through both, via
+/// this and [`YamlCursor::stream_yaml_value_at`], removes that redundant
+/// resolve entirely rather than just moving it.
+fn is_deferred_value_absent_at<W: AsRef<[u64]>>(value: &YamlValue<'_, W>) -> bool {
+    match value {
         YamlValue::Null => true,
         YamlValue::String(s) => s.is_unquoted() && s.as_str().map_or(true, |t| t.is_empty()),
         _ => false,
@@ -7167,8 +7209,18 @@ fn write_deferred_value<Out: core::fmt::Write, W: AsRef<[u64]>>(
 ) -> StreamResult {
     // Same container short-circuit as `write_yaml_child_inline` (#1448):
     // `value()` -- and so `resolve_merge_keys` -- is not worth running for a
-    // shape `is_deferred_value_absent` can only ever answer `false` for.
-    let absent = !value.is_container() && is_deferred_value_absent(value);
+    // shape `is_deferred_value_absent_at` can only ever answer `false` for.
+    //
+    // #1114: resolved (at most) once here rather than once for the absence
+    // check and again, unconditionally, inside `stream_yaml_value` on the
+    // common (non-absent) path -- `resolved` is threaded into both
+    // `is_deferred_value_absent_at` and `stream_yaml_value_at` below.
+    let resolved = if value.is_container() {
+        None
+    } else {
+        Some(value.value())
+    };
+    let absent = resolved.as_ref().is_some_and(is_deferred_value_absent_at);
     let anchor = value.anchor();
     let tag = if absent { value.explicit_tag() } else { None };
     write_anchor_tag(out, anchor, tag)?;
@@ -7179,7 +7231,8 @@ fn write_deferred_value<Out: core::fmt::Write, W: AsRef<[u64]>>(
         // present (`: value` or `: &anchor value`), matching the original,
         // un-extracted logic's `|| !absent` conditions byte-for-byte.
         out.write_char(' ')?;
-        value.stream_yaml_value(
+        value.stream_yaml_value_at(
+            resolved,
             out,
             child_indent,
             indent_spaces,
@@ -7353,23 +7406,29 @@ fn write_yaml_child_inline<W: AsRef<[u64]>, Out: core::fmt::Write>(
     // same bug, and there's no separate scalar dispatch for an empty
     // container to collide with.
     //
-    // `absent` is derived only once the value is known *not* to be a
-    // container, which is pure saving: `is_deferred_value_absent` calls
-    // `value()`, and on a mapping that runs `resolve_merge_keys` -- a walk
-    // over every field, allocating, even with no `<<` key present. #1448
-    // asked for this to be benchmarked before being changed; a probe with
-    // the check removed outright measured 11.4% on a flow-heavy 4 MB
-    // document, of which this recovers 3.0%.
+    // `resolved`/`absent` are derived only once the value is known *not* to
+    // be a container, which is pure saving: `value()` (below), on a
+    // mapping, runs `resolve_merge_keys` -- a walk over every field,
+    // allocating, even with no `<<` key present. #1448 asked for this to be
+    // benchmarked before being changed; a probe with the check removed
+    // outright measured 11.4% on a flow-heavy 4 MB document, of which this
+    // recovers 3.0%.
     //
-    // The safety of hard-coding `false` for a container is a property of
-    // `value()`, *not* of the predicate: `value()` short-circuits
-    // `is_container()` and returns `Sequence`/`Mapping` before it can reach
-    // any other arm, so `is_deferred_value_absent` was already returning
-    // `false` for every container. (The predicate itself answers `true` for
-    // `Null`, so "it only says yes for an empty unquoted string" would be
-    // the wrong reason -- review caught that phrasing here.)
+    // The safety of hard-coding `None`/`false` for a container is a
+    // property of `value()`, *not* of the predicate: `value()`
+    // short-circuits `is_container()` and returns `Sequence`/`Mapping`
+    // before it can reach any other arm, so `is_deferred_value_absent_at`
+    // was already returning `false` for every container's resolved value.
+    // (The predicate itself answers `true` for `Null`, so "it only says yes
+    // for an empty unquoted string" would be the wrong reason -- review
+    // caught that phrasing here.)
     let container = value.is_container();
-    let absent = !container && is_deferred_value_absent(&value);
+    // #1114: resolved (at most) once here rather than once for the absence
+    // check and again, unconditionally, inside `stream_yaml_value` on the
+    // common (non-absent) path below -- see `write_deferred_value`'s own
+    // identical fix for the full rationale.
+    let resolved = if container { None } else { Some(value.value()) };
+    let absent = resolved.as_ref().is_some_and(is_deferred_value_absent_at);
     if container || absent {
         if let Some(tag) = value.explicit_tag() {
             out.write_str(tag)?;
@@ -7391,7 +7450,7 @@ fn write_yaml_child_inline<W: AsRef<[u64]>, Out: core::fmt::Write>(
     if absent {
         return Ok(out.write_str("''")?);
     }
-    value.stream_yaml_value(out, "", 0, unit, sort_keys, false, "")
+    value.stream_yaml_value_at(resolved, out, "", 0, unit, sort_keys, false, "")
 }
 
 /// Write a trailing same-line comment after a value, if present (issue
