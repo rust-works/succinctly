@@ -25414,6 +25414,29 @@ fn test_yaml_kind_change_at_alias_position_still_detaches_1359() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_yaml_kind_change_via_update_assign_at_alias_position_detaches_1359() -> Result<()> {
+    // Found in review of this issue's own fix. `.b |= 5` is a kind-change
+    // write (object -> scalar) ending exactly at the alias position, same
+    // as the `=` control above, but reached through `|=` instead --
+    // `propagate_assign_alias_marks` (#2497) only re-derives the mark for a
+    // plain `=`/chain-of-`=`, so a first version of this fix that carried
+    // any `Aliases` mark through the kind-change arm unconditionally relied
+    // on `enforce_anchor_soundness`'s value-equality check as the only
+    // backstop here -- unsound, since a later stage in the same pipe
+    // (`.a = 5`) can coincidentally give `.b` the same value `.a` ends up
+    // with, wrongly keeping `*x`. `c` is a second, untouched alias to the
+    // same anchor: it must keep referring to `&x` even though its own kind
+    // also changes (object -> scalar) as a side effect of mirroring `.a`'s
+    // new value -- the fix must tell "this position was itself written"
+    // from "this position's kind changed only because its anchor's did".
+    let input = "a: &x {p: 1}\nb: *x\nc: *x\n";
+    let (output, exit_code) = run_yq_stdin(".b |= 5 | .a = 5", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: &x 5\nb: 5\nc: *x\n");
+    Ok(())
+}
+
 // =============================================================================
 // #2497 (split from #1351's "case 2") - a plain assignment (`.c = .b`) whose
 // value is a static read of an aliased node must itself alias, matching real
