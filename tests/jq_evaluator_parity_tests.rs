@@ -1714,7 +1714,16 @@ fn test_walk_vs_bridge_path_context_parity_2416() {
             "(.a[] | key)?",
             "label $o | (.a[] | key, break $o)",
             ".a[] | key as $k | $k",
-            "[.. | path]",
+            // `[.. | path]` is deliberately *not* here since spine 2416's
+            // walk residue: the walk yields one position per mapping key
+            // (`collapse_duplicate_keys`, the same rule `[.[] | key]` already
+            // follows here), which is what real yq v4.53.3 prints for `[.. |
+            // path]` on `a: 1, a: 2, d: [10, 20]` (`[[],["a"],["d"],["d",0],
+            // ["d",1]]`), where the eager bridge's recurse arm lists the
+            // duplicate twice -- so on the duplicate-key documents the routes
+            // disagree and the walk is the side that matches the oracle.
+            // Pinned against yq in `test_walk_residue_rows_match_yq_2416`
+            // (`tests/yq_cli_tests.rs`).
             // #2416 step 2: heads that can land on an absent node. Some of
             // these miss on some of the documents above and not on others,
             // which is the point -- the absent route walks the head as
@@ -1809,16 +1818,34 @@ fn test_walk_vs_bridge_path_context_parity_2416() {
             ".zz[(0+0)] | key",
             ".zz[(0+0)] | path",
             ".a[(0+0)] | key",
-            // The three shapes the head admission refuses, kept here so the
-            // routes are asserted to agree on them too: a component that can
-            // escape, one that fans out, and a slice or `getpath` head.
+            // A fan-out component and a `getpath` head, walked since spine
+            // 2416's walk residue; the routes still agree on them.
             ".d[(0,1)] | key",
             ".d[(0,1)] | path",
-            ".d[(0+0):(0+1)] | key",
             "getpath([\"a\"]) | key",
+            // `.d[(0+0):(0+1)] | key` is deliberately *not* here since the
+            // walk residue: the walk applies yq mode's slice rule (the
+            // container's position, `.c[0:1] | key` is `"c"` in v4.53.3,
+            // `OwnedIdentityRule::Slice`) where the eager bridge still names
+            // jq's `{"start":0,"end":1}` component in both modes -- the walk
+            // is the side that matches the oracle, so pinning "the routes
+            // agree" would pin the wrong answer, the same reason
+            // `[.a[("b"+"")] | key]` is absent above. jq mode agrees on it
+            // and is asserted separately below.
         ] {
             assert_walk_bridge_parity(doc, filter);
         }
+        // The slice head's jq-mode half (see the note in the list above).
+        let filter = ".d[(0+0):(0+1)] | key";
+        assert_eq!(
+            route_outputs::<JqSemantics>(
+                doc,
+                filter,
+                eval_generic::PathContextRoute::WalkThenBridge
+            ),
+            route_outputs::<JqSemantics>(doc, filter, eval_generic::PathContextRoute::BridgeOnly),
+            "path-context route drift (jq mode) for `{filter}`"
+        );
     }
 }
 
@@ -2288,7 +2315,14 @@ fn test_arm_audit_proof_queries_are_unmoved_by_the_gate_2416() {
         (r".c[0] | parent(0+1) | key", &[r#""c""#]),
         (r".a[] | parent(0+1) | key", &[r#""a""#]),
         (r".c[.n]? | parent(0+1) | key", &[r#""c""#]),
-        (r".a? | parent(0+1) | key", &["null"]),
+        // spine 2416 (walk residue): a computed `parent(n)` is walked, and
+        // the walk's `key` at the document root emits nothing (#2421's rule:
+        // yq v4.53.3 prints nothing for `.a | parent(1) | key`, jq has no
+        // `key`, and the jq-mode extension follows) where the eager
+        // evaluator printed its `null` placeholder -- the same move
+        // `.a | 5 | key` made in the identity pass. Re-pinned to the walk's
+        // answer; the arm it proved (`A08`) has a fan-out re-derivation below.
+        (r".a? | parent(0+1) | key", &[]),
         (r".a.b | parent(0+1) | -(key|length)", &["-1"]),
         (r#".a.b | parent(0+1) | (key == "a")"#, &["true"]),
         (
