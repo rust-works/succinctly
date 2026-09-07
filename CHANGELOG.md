@@ -246,6 +246,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `terminus` Zen 4), `yq '.'` over a 20-60MB array of small records:
   **-14.2% to -14.7%** (M4 Pro), **-14.2% to -14.4%** (Zen 4), output
   byte-identical before/after in every run.
+- **Closed a smaller residual of #1114 on the rarer absent/container
+  deferred-value path** (#2617): `explicit_tag()` still re-resolved a
+  cursor's value internally (to check for `YamlValue::Alias`) even when the
+  caller already had it in hand, or structurally knew a container position
+  can never be an alias. `explicit_tag_at` now takes that value (or `None`
+  for a container) directly. As expected from the much rarer trigger shape,
+  the measured win is far smaller than #1114's: interleaved A/B on the
+  pinned boxes, `yq '.'` over a 5-60MB flow-heavy document: **-0.7% to
+  -1.4%** (M4 Pro, clearly outside this corpus's own -0.3%..+0.1% noise
+  floor), within noise on Zen 4 (-0.2% to -0.3%, inside a -1.0%..+0.9%
+  noise floor) — output byte-identical before/after in every run.
 
 ### Removed
 
