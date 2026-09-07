@@ -2280,6 +2280,27 @@ fn test_select_and_materialize_agree_on_corruption_1645() -> Result<()> {
             5,
             expect_stderr,
         );
+        // #2350: two more consumers of the same validation gate (#1755/
+        // #2069, #1953), added alongside the original three so this fixed
+        // list's own coverage doesn't lag the generated fuzzer's.
+        assert_jq_raises(
+            label,
+            "sort_by(.bad)",
+            &[],
+            "sort_by(.bad)",
+            doc,
+            5,
+            expect_stderr,
+        );
+        assert_jq_raises(
+            label,
+            "path(.bad)",
+            &["-c"],
+            "path(.bad)",
+            doc,
+            5,
+            expect_stderr,
+        );
     }
     Ok(())
 }
@@ -2297,36 +2318,105 @@ enum FuzzContainer {
 }
 
 /// The three malformation kinds [`test_select_and_materialize_agree_on_corruption_1645`]'s
-/// fixed case list covers, as a generatable enum.
+/// fixed case list covers, plus the delimiter/gap kinds #2350 added: #1962's
+/// net could only ever generate a bad *scalar* or a key collision, so it was
+/// categorically unable to reach the shape #2349 actually diverged on (a
+/// malformed *delimiter*) -- widening this alphabet, not the case count, is
+/// the fix (#2041 made the same point about a different fuzzer).
 #[derive(Debug, Clone, Copy)]
 enum FuzzMalformation {
     DecodeFailure,
     StructuralError,
     Collision,
+    /// #1677: a missing `,` between two object members.
+    MissingCommaObject,
+    /// #1677: a doubled `,` between two object members.
+    DoubledCommaObject,
+    /// #1677: a missing `,` between two array elements. A distinct check
+    /// (`DocumentElements::element_gap_ok`) from the object-member one
+    /// above, on its own call site (`elem_cursor.element_gap_ok`) -- code
+    /// review found the array side missing from this enum's first draft,
+    /// verified live to be a genuine, independent gap (temporarily
+    /// disabling just that one check reproduced #2349's exact divergence
+    /// shape and both this file's corruption-consistency tests still
+    /// passed, unable to see it).
+    MissingCommaArray,
+    /// #1677: a doubled `,` between two array elements -- array-side twin
+    /// of `DoubledCommaObject`, same reasoning as `MissingCommaArray`.
+    DoubledCommaArray,
+    /// #1677: a missing `:` before an object member's value.
+    MissingColon,
+    /// #1677: a doubled `:` before an object member's value.
+    DoubledColon,
+    /// #2211: a stray `,` with no real member at all, object-shaped (`{,}`).
+    EmptyStrayCommaObject,
+    /// #2211: a stray `,` with no real member at all, array-shaped (`[,]`).
+    EmptyStrayCommaArray,
+    /// #2243/#2262: a trailing stray `,` after a genuine last member,
+    /// object-shaped (`{"a":1,}`).
+    TrailingStrayCommaObject,
+    /// #2243/#2262: a trailing stray `,` after a genuine last element,
+    /// array-shaped (`[1,]`).
+    TrailingStrayCommaArray,
 }
 
 impl FuzzMalformation {
-    /// The JSON text substituted at the leaf position -- a raw malformed
-    /// *value* for the first two kinds, a whole malformed *object* (two
-    /// colliding decode-failure keys, #1642) for the third, since a
-    /// collision isn't expressible as a single scalar value.
+    /// The JSON text substituted at the leaf position.
+    ///
+    /// A raw malformed *value* for `DecodeFailure`/`StructuralError`, a whole
+    /// malformed *object* (two colliding decode-failure keys, #1642) for
+    /// `Collision`, since a collision isn't expressible as a single scalar
+    /// value -- and, for the delimiter/gap kinds, a whole malformed
+    /// *container* snippet. `fuzz_wrap_json` only ever concatenates this text
+    /// into a larger string, so it doesn't care whether "the leaf" is a bad
+    /// scalar or a bad container: the delimiter/gap kinds plant their own
+    /// corruption at whatever depth `path` chooses for free, with no change
+    /// to that function needed.
     fn leaf_json(self) -> &'static str {
         match self {
             Self::DecodeFailure => r#""\x""#,
             Self::StructuralError => "xyz123",
             Self::Collision => r#"{"\ud800":1,"\ud800":2}"#,
+            Self::MissingCommaObject => r#"{"a":1 "b":2}"#,
+            Self::DoubledCommaObject => r#"{"a":1,, "b":2}"#,
+            Self::MissingCommaArray => "[1 2]",
+            Self::DoubledCommaArray => "[1,,2]",
+            Self::MissingColon => r#"{"a" 1}"#,
+            Self::DoubledColon => r#"{"a"::1}"#,
+            Self::EmptyStrayCommaObject => "{,}",
+            Self::EmptyStrayCommaArray => "[,]",
+            Self::TrailingStrayCommaObject => r#"{"a":1,}"#,
+            Self::TrailingStrayCommaArray => "[1,]",
         }
     }
 
-    /// The stderr substring every one of the three CLI paths must raise,
-    /// matching [`test_select_and_materialize_agree_on_corruption_1645`]'s
-    /// own three constants -- stable across nesting depth/shape, since the
-    /// underlying `EvalError`'s message never mentions its own position.
+    /// The stderr substring every one of the driven CLI paths must raise.
+    ///
+    /// The first three match
+    /// [`test_select_and_materialize_agree_on_corruption_1645`]'s own three
+    /// constants -- stable across nesting depth/shape, since the underlying
+    /// `EvalError`'s message never mentions its own position. The delimiter/
+    /// gap kinds all route through the same JSON-text validator
+    /// (`EvalError::malformed_json_text`) regardless of which specific
+    /// delimiter is wrong, so they share its one common prefix rather than
+    /// each pinning the validator's own more specific (and more fragile)
+    /// wording -- confirmed live, every kind's actual message starts with
+    /// this exact text.
     fn expect_stderr(self) -> &'static str {
         match self {
             Self::DecodeFailure => "invalid escape sequence",
             Self::StructuralError => "unexpected character",
             Self::Collision => "ambiguous",
+            Self::MissingCommaObject
+            | Self::DoubledCommaObject
+            | Self::MissingCommaArray
+            | Self::DoubledCommaArray
+            | Self::MissingColon
+            | Self::DoubledColon
+            | Self::EmptyStrayCommaObject
+            | Self::EmptyStrayCommaArray
+            | Self::TrailingStrayCommaObject
+            | Self::TrailingStrayCommaArray => "Invalid JSON text",
         }
     }
 }
@@ -2360,7 +2450,7 @@ fn fuzz_build_json_doc(path: &[FuzzContainer], malformation: FuzzMalformation) -
 // `test_select_and_materialize_agree_on_corruption_1645`'s hand-picked
 // 7-case list (3 malformation kinds x up to 2 nesting depths) to
 // proptest-generated nesting paths of 0-4 arbitrary `Array`/`Object`
-// containers, crossed with all 3 malformation kinds -- the same "generate
+// containers, crossed with all malformation kinds -- the same "generate
 // nesting depth/shape, run the same CLI battery, assert consistency" design
 // the issue asked for, so a divergence at a depth/shape combination the
 // fixed list never happened to hit still gets caught. Kept alongside
@@ -2369,12 +2459,19 @@ fn fuzz_build_json_doc(path: &[FuzzContainer], malformation: FuzzMalformation) -
 // human-readable coverage while adding generated coverage would be a
 // regression in debuggability, not just redundant.
 //
+// #2350 widened this from 3 malformation kinds to 13 (adding the delimiter/
+// gap corruptions #1962's original net was categorically unable to express
+// -- the exact class #2349's live divergence turned out to be) and from 3
+// driven CLI paths to 5 (`sort_by`/`path()` joined `select`/`-Sc`/`-e` as
+// consumers of the same validation gate, #1755/#2069/#1953).
+//
 // `ProptestConfig::with_cases` is turned down from proptest's own default
-// (256) because this drives three real subprocess spawns per case (a
+// (256) because this drives five real subprocess spawns per case (a
 // `Command::new(env!("CARGO_BIN_EXE_succinctly"))` per
 // `run_jq_full`/`assert_jq_raises` call, unlike proptest's usual in-process
-// property) -- 48 cases x 3 spawns is already ~3x this file's entire
-// pre-existing corruption-consistency coverage in one property.
+// property) -- 48 cases x 5 spawns is already a large fraction of this
+// file's entire pre-existing corruption-consistency coverage in one
+// property.
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(48))]
 
@@ -2388,6 +2485,16 @@ proptest! {
             Just(FuzzMalformation::DecodeFailure),
             Just(FuzzMalformation::StructuralError),
             Just(FuzzMalformation::Collision),
+            Just(FuzzMalformation::MissingCommaObject),
+            Just(FuzzMalformation::DoubledCommaObject),
+            Just(FuzzMalformation::MissingCommaArray),
+            Just(FuzzMalformation::DoubledCommaArray),
+            Just(FuzzMalformation::MissingColon),
+            Just(FuzzMalformation::DoubledColon),
+            Just(FuzzMalformation::EmptyStrayCommaObject),
+            Just(FuzzMalformation::EmptyStrayCommaArray),
+            Just(FuzzMalformation::TrailingStrayCommaObject),
+            Just(FuzzMalformation::TrailingStrayCommaArray),
         ],
     ) {
         let doc = fuzz_build_json_doc(&path, malformation);
@@ -2405,6 +2512,8 @@ proptest! {
             5,
             expect_stderr,
         );
+        assert_jq_raises(&label, "sort_by(.bad)", &[], "sort_by(.bad)", &doc, 5, expect_stderr);
+        assert_jq_raises(&label, "path(.bad)", &["-c"], "path(.bad)", &doc, 5, expect_stderr);
     }
 }
 
