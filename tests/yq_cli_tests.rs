@@ -6136,6 +6136,43 @@ fn test_yaml_anchor_on_compact_mapping_key_binds_to_key() -> Result<()> {
 }
 
 #[test]
+fn test_yaml_mapping_key_anchor_survives_identity_output_1352() -> Result<()> {
+    // #1352: `Parser::record_key_anchor` already indexed a key anchor, but
+    // `write_yaml_field_key` never asked for it, so `&k key: 1` round-tripped
+    // as plain `key: 1` even on a no-op identity query -- matching real yq
+    // (v4.53.3) means the anchor must survive `.` unchanged. Block style
+    // (this case) and flow style are separate call sites in the writer
+    // (block-mapping vs flow-mapping loops both call `write_yaml_field_key`),
+    // so both get their own case here.
+    let input = "&k key: 1\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "&k key: 1\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_mapping_key_anchor_survives_flow_identity_output_1352() -> Result<()> {
+    let input = "{&k key: 1}\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "{&k key: 1}\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_mapping_key_anchor_and_value_anchor_together_1352() -> Result<()> {
+    // A key anchor and its value's own separate anchor (#763) must both
+    // survive together -- the key fix must not disturb the pre-existing
+    // value-anchor mechanism.
+    let input = "&k1 key: &v1 1\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "&k1 key: &v1 1\n");
+    Ok(())
+}
+
+#[test]
 fn test_yaml_anchored_tag_in_seq_item_resolves() -> Result<()> {
     // Consuming the anchor before dispatching means the tag is seen rather
     // than absorbed into a plain scalar, so `- &a !!str x` resolves to the
