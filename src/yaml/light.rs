@@ -2511,18 +2511,22 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         self.explicit_tag_at(Some(&self.value()))
     }
 
-    /// Sibling of [`Self::explicit_tag`] for a caller that already knows
-    /// whether this cursor is an alias without a fresh [`Self::value`] call
-    /// (#1114 review, #2617). Pass `Some(&resolved)` when a prior `value()`
-    /// call already produced it (e.g. `write_deferred_value`'s `resolved`
-    /// local on its `absent` branch), or `None` when the cursor is
-    /// structurally known not to be an alias without resolving at all (e.g.
+    /// Internal sibling of [`Self::explicit_tag`] for the two write-path call
+    /// sites in this module that already know whether this cursor is an
+    /// alias without a fresh [`Self::value`] call (#1114 review, #2617). Not
+    /// `pub`, deliberately: unlike [`Self::stream_yaml_value_at`], where
+    /// `None` always falls back to a full resolve and so is unconditionally
+    /// safe, `None` here skips the alias check outright with no fallback --
+    /// safe only when the caller can already prove the cursor isn't an
+    /// alias (see call sites below), not a general-purpose default. Pass
+    /// `Some(&resolved)` when a prior `value()` call already produced it
+    /// (e.g. `write_deferred_value`'s `resolved` local on its `absent`
+    /// branch), or `None` only when that proof holds (e.g.
     /// `write_yaml_child_inline`'s `container` branch: `is_container()` is a
     /// structural bitvector check, and a container position can never be an
-    /// alias) — `None` skips straight to the non-alias fallback exactly as
-    /// `Some(non_alias_value)` would, just without paying for the resolve.
+    /// alias).
     #[inline]
-    pub fn explicit_tag_at(&self, known_value: Option<&YamlValue<'a, W>>) -> Option<&str> {
+    fn explicit_tag_at(&self, known_value: Option<&YamlValue<'a, W>>) -> Option<&str> {
         if let Some(YamlValue::Alias { target, .. }) = known_value {
             // Not `target.and_then(|t| t.explicit_tag())`: `t` is a local
             // `YamlCursor` moved into the closure, so a call through `&t`
