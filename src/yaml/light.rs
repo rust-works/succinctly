@@ -2508,7 +2508,22 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// `explicit_tag` was the one left out (#903 review).
     #[inline]
     pub fn explicit_tag(&self) -> Option<&str> {
-        if let YamlValue::Alias { target, .. } = self.value() {
+        self.explicit_tag_at(Some(&self.value()))
+    }
+
+    /// Sibling of [`Self::explicit_tag`] for a caller that already knows
+    /// whether this cursor is an alias without a fresh [`Self::value`] call
+    /// (#1114 review, #2617). Pass `Some(&resolved)` when a prior `value()`
+    /// call already produced it (e.g. `write_deferred_value`'s `resolved`
+    /// local on its `absent` branch), or `None` when the cursor is
+    /// structurally known not to be an alias without resolving at all (e.g.
+    /// `write_yaml_child_inline`'s `container` branch: `is_container()` is a
+    /// structural bitvector check, and a container position can never be an
+    /// alias) — `None` skips straight to the non-alias fallback exactly as
+    /// `Some(non_alias_value)` would, just without paying for the resolve.
+    #[inline]
+    pub fn explicit_tag_at(&self, known_value: Option<&YamlValue<'a, W>>) -> Option<&str> {
+        if let Some(YamlValue::Alias { target, .. }) = known_value {
             // Not `target.and_then(|t| t.explicit_tag())`: `t` is a local
             // `YamlCursor` moved into the closure, so a call through `&t`
             // ties the returned `&str` to that closure-local borrow even
@@ -2517,7 +2532,7 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             // the elided lifetime resolves to `'a`, matching every other
             // `Alias` arm in this file that recurses via the cursor itself
             // rather than a getter call on it.
-            return target.and_then(|t| t.index.get_tag(t.bp_pos));
+            return (*target).and_then(|t| t.index.get_tag(t.bp_pos));
         }
         self.index.get_tag(self.bp_pos)
     }
@@ -7222,14 +7237,16 @@ fn write_deferred_value<Out: core::fmt::Write, W: AsRef<[u64]>>(
     };
     let absent = resolved.as_ref().is_some_and(is_deferred_value_absent_at);
     let anchor = value.anchor();
-    // #1114 review: `explicit_tag()` internally re-resolves `self.value()`
-    // (to check for `YamlValue::Alias`), so the `absent` branch still pays
-    // for a second resolve here -- this fix only closes the gap on the
-    // common (non-absent) path below, not this rarer one. Left as a
-    // follow-up (#2617): threading `resolved` into `explicit_tag()` too
-    // would mean widening a public accessor's signature for a benefit only
-    // this one already-narrow branch needs.
-    let tag = if absent { value.explicit_tag() } else { None };
+    // #1114 review, closed by #2617: `explicit_tag()` used to re-resolve
+    // `self.value()` internally (to check for `YamlValue::Alias`), paying
+    // for a second resolve on this `absent` branch even though `resolved`
+    // was already in hand. `explicit_tag_at` takes the already-resolved
+    // value directly instead.
+    let tag = if absent {
+        value.explicit_tag_at(resolved.as_ref())
+    } else {
+        None
+    };
     write_anchor_tag(out, anchor, tag)?;
     if !absent {
         // Neither `write_anchor_tag` nor the anchor/tag it may have
@@ -7437,12 +7454,12 @@ fn write_yaml_child_inline<W: AsRef<[u64]>, Out: core::fmt::Write>(
     let resolved = if container { None } else { Some(value.value()) };
     let absent = resolved.as_ref().is_some_and(is_deferred_value_absent_at);
     if container || absent {
-        // #1114 review: `explicit_tag()` internally re-resolves
-        // `self.value()` (to check for `YamlValue::Alias`) -- see
-        // `write_deferred_value`'s own identical note (#2617) for why this
-        // residual resolve on the `absent`/container path is left as a
-        // follow-up rather than fixed here.
-        if let Some(tag) = value.explicit_tag() {
+        // #1114 review, closed by #2617: `explicit_tag()` used to re-resolve
+        // `self.value()` internally on both this branch's shapes -- `resolved`
+        // is `None` for a container (never an alias, `is_container()` is a
+        // structural check independent of resolving) and `Some(v)` for the
+        // `absent` case, exactly matching `explicit_tag_at`'s own contract.
+        if let Some(tag) = value.explicit_tag_at(resolved.as_ref()) {
             out.write_str(tag)?;
             out.write_char(' ')?;
         }
