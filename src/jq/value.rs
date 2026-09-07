@@ -200,7 +200,7 @@ fn strip_insignificant_leading_zero_and_plus(s: &str) -> String {
 /// applies squarely to a fast-path predicate that restates a formatter's
 /// rules.
 #[must_use]
-pub fn is_jq_canonical_number(raw: &[u8]) -> bool {
+pub(crate) fn is_jq_canonical_number(raw: &[u8]) -> bool {
     // One pass that answers *both* questions the writer needs -- "is this a
     // valid RFC 8259 number" and "would the formatter hand back these exact
     // bytes" -- so a `true` lets the caller skip `is_valid_number` *and*
@@ -4649,8 +4649,17 @@ mod tests {
             "1e-3",
             "-2.5e+10",
             "1E+100",
-            // degenerate / lenient spellings the scanner can still hand over
+            // degenerate / lenient spellings the scanner can still hand
+            // over. `1.`/`01.` are the ones that matter most: the formatter
+            // is the *identity* on them, so a predicate checked only against
+            // it would call them canonical -- but jq prints `1`, because the
+            // writer's real fallback for an RFC-invalid span is
+            // `from_number_bytes`, not the formatter. That is the bug the
+            // first version of this fix shipped.
             "",
+            "1.",
+            "01.",
+            "-1.",
             "1.2.3",
             "-",
             "abc",
@@ -4658,14 +4667,23 @@ mod tests {
         for raw in corpus {
             let bytes = raw.as_bytes();
             let claims_canonical = is_jq_canonical_number(bytes);
-            // The writer consults the predicate only *inside* its
-            // `is_valid_number` gate, because a scanner-lenient span
-            // (`1.`) is sanitized by the `from_number_bytes` fallback
-            // rather than by the formatter -- and the formatter is the
-            // identity on `1.`, so a check against it alone would have
-            // called that row canonical. It is not: jq prints `1`. Asserting
-            // the same gate here keeps this test measuring the contract the
-            // writer actually relies on.
+            // The writer runs the predicate *ahead* of its
+            // `is_valid_number` gate, so "claims canonical" must imply
+            // "is a valid number" -- otherwise a scanner-lenient span
+            // (`1.`, `007`, `.5`, `1.2.3`) would be echoed verbatim where
+            // jq reformats it. This is the half the first version of this
+            // fix got wrong (`{"a":1.}` printed `1.`), so assert it
+            // directly rather than letting the skip below hide it.
+            assert!(
+                !claims_canonical || crate::json::validate::is_valid_number(bytes),
+                "is_jq_canonical_number({raw:?}) accepted a span \
+                 `is_valid_number` rejects -- the writer would echo it \
+                 verbatim, ahead of the fallback that sanitizes it"
+            );
+            // Beyond that implication the formatter has no opinion worth
+            // comparing on an invalid span: it is the identity on `1.`,
+            // while the writer's actual fallback (`from_number_bytes`)
+            // renders `1`.
             if !crate::json::validate::is_valid_number(bytes) {
                 continue;
             }
