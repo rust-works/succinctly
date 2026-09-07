@@ -27471,6 +27471,38 @@ fn test_jq_nth_still_evaluates_a_skipped_output_that_would_error_1607() -> Resul
     Ok(())
 }
 
+/// #2199: the sibling of #1607 above, but in the *generic* evaluator's
+/// `nth_with_n_generic` (reached here via the `?//` alternative operator,
+/// which forces the eager `eval.rs` path to hand off) rather than the
+/// native fast path. `nth`'s own force-decode of a *skipped* item (`.a`,
+/// structurally a string token but holding `\x` -- not a valid JSON escape,
+/// matching `test_select_raises_on_decode_failure_instead_of_silently_truthy_1645`'s
+/// trigger shape) used to fail via a bare `Demand::Stop`, indistinguishable
+/// from an ordinary "consumer got what it wanted" signal. `?//`'s own
+/// retry-decision code read that `Stop` as license to retry the next
+/// alternative, whose own (trivially successful) output then inherited the
+/// `seen` counter's progress from the first, wrongly-aborted attempt and was
+/// mistaken for the wanted index -- silently answering `100` (jq's own
+/// `nth($n;f) == last(limit($n+1;f))` desugaring instead requires this
+/// skipped output's own failure to surface, exactly as the non-generic path
+/// already guarantees above).
+#[test]
+fn test_jq_nth_generic_still_surfaces_a_skipped_decode_failure_through_a_retry_2199() -> Result<()>
+{
+    let (stdout, stderr, code) = run_jq_full(
+        &["nth(1; [.p] as $x ?// [$x] | (if ($x|type)==\"array\" then .a else 100 end), 9)"],
+        Some(r#"{"a": "\x", "p": 1}"#),
+    )
+    .expect("nth generic-evaluator skipped-decode-failure repro runs");
+    assert_eq!(code, 5, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("invalid escape sequence"),
+        "stderr: {stderr}"
+    );
+    Ok(())
+}
+
 /// The carve-out keys off the `line`/`at_offset`/... *builtins*, so a field
 /// or key that merely spells one of their names must not trip it -- that
 /// would quietly switch a filter back to the eager path and undo #1504's own

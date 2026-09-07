@@ -10012,17 +10012,38 @@ fn nth_with_n_generic<S: EvalSemantics, V: DocumentValue>(
         }
         Demand::Continue
     });
-    // Mirrors `each_take_nth` + its caller's own priority exactly: a
-    // captured item at index `n` always wins, even over a trailing escape
-    // from beyond that point (and, by construction, over `skipped_err` too
-    // -- once `wanted` is set the sink returns `Demand::Stop` immediately,
-    // so no later item, and no `skipped_err`, can still be pending);
-    // short of reaching index `n` at all, whatever ended the pull
-    // (exhaustion, a skipped item's own forced failure, or the generator's
-    // own escape before index `n`) decides. The *wanted* item alone is
-    // kept cursor-backed ([`generic_item_to_result`], #607's own
+    // #2199: `skipped_err` is checked *before* `wanted`, reversing this
+    // function's own prior order -- the comment that used to sit here
+    // claimed "by construction, over `skipped_err` too -- once `wanted` is
+    // set the sink returns `Demand::Stop` immediately, so no later item,
+    // and no `skipped_err`, can still be pending". True for a single,
+    // non-retried pull (the sink is never re-entered after its own
+    // `Demand::Stop`), but false the moment `expr` contains a `?//`: a
+    // *retryable*-looking `Demand::Stop` (`Demand` carries no payload
+    // distinguishing "consumer satisfied" from "this skipped item's forced
+    // decode genuinely failed") lets `each_pattern_alternatives_generic`
+    // retry the next alternative through this exact same sink closure,
+    // which can then populate `wanted` from that (illegitimate) retry --
+    // leaving `skipped_err` still `Some` from the first alternative's own
+    // unrelated failure, silently discarded by the old `!wanted.is_empty()`
+    // check firing first. Confirmed live: `nth(1; [.p] as $x ?// [$x] |
+    // (if ($x|type)=="array" then .a else 100 end), 9)` over
+    // `{"a": <undecodable>, "p": 1}` used to answer `Ok([100])` (alt2's
+    // own value, wanted populated); it must raise the decode failure
+    // instead, since jq's own rule (`is_decode_failure()`, never
+    // retryable, `is_last` or not) means alt2 should never have run at
+    // all. This only reorders the *check*, not the pull itself -- a fuller
+    // fix would need `Demand` to carry the failure so the retry itself
+    // never happens (tracked as a follow-up; the illegitimate retry's own
+    // side effects, if any, still run today, they just can no longer win).
+    // A captured item at index `n` still wins over a *trailing* escape
+    // from beyond that point (`take_stopping_items_to_generic_result`,
+    // #1519) -- kept cursor-backed ([`generic_item_to_result`], #607's own
     // conversion) rather than forced through `OwnedValue`, so a duplicate
     // key *inside* it survives too, not just across the walk to reach it.
+    if let Some(control) = skipped_err {
+        return partial_generic(Vec::new(), control);
+    }
     if !wanted.is_empty() {
         // #1519: a later `?//` alternative's own error is genuinely reached by
         // jq after an earlier one answered, so it raises rather than being
@@ -10030,13 +10051,9 @@ fn nth_with_n_generic<S: EvalSemantics, V: DocumentValue>(
         // `first` and `nth` share.
         return take_stopping_items_to_generic_result(wanted, flow);
     }
-    if let Some(control) = skipped_err {
-        partial_generic(Vec::new(), control)
-    } else {
-        match flow {
-            Flow::Stopped { .. } | Flow::Exhausted => GenericResult::None,
-            Flow::Escaped(control) => partial_generic(Vec::new(), control),
-        }
+    match flow {
+        Flow::Stopped { .. } | Flow::Exhausted => GenericResult::None,
+        Flow::Escaped(control) => partial_generic(Vec::new(), control),
     }
 }
 
