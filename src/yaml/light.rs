@@ -1666,7 +1666,12 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 // real `yq`, which re-emits `!!str 1`/`!!int "5"`/`!custom v`
                 // as-is rather than only letting the tag affect resolution
                 // (#224).
-                if let Some(tag) = self.explicit_tag() {
+                //
+                // #2619: `self` -- the match subject just above -- is
+                // already proven non-`Alias` by having matched `String`
+                // here, so `explicit_tag_at(None)` skips straight to the
+                // non-alias fallback with no second `value()` resolve.
+                if let Some(tag) = self.explicit_tag_at(None) {
                     out.write_str(tag)?;
                     out.write_char(' ')?;
                 }
@@ -2172,7 +2177,11 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                 // number 5, not the string "5" - so it's checked before the
                 // direct transcoding optimization below, which otherwise
                 // always treats a quoted/block scalar as a string (#224).
-                if let Some(explicit) = self.explicit_tag() {
+                //
+                // #2619: `self.value()` above already proved `self` isn't
+                // `Alias` by matching `String`, so `None` skips a second
+                // resolve entirely.
+                if let Some(explicit) = self.explicit_tag_at(None) {
                     if let Ok(str_val) = s.as_str() {
                         if let Some(resolved) = resolve_tagged(&str_val, explicit) {
                             return Ok(stream_resolved_scalar_as_json(
@@ -2341,7 +2350,11 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
             YamlValue::String(s) => {
                 // An explicit core-schema tag forces resolution regardless of
                 // quoting style - see the mirrored check in `stream_json_value` (#224).
-                if let Some(explicit) = self.explicit_tag() {
+                //
+                // #2619: `self.value()` above already proved `self` isn't
+                // `Alias` by matching `String`, so `None` skips a second
+                // resolve entirely.
+                if let Some(explicit) = self.explicit_tag_at(None) {
                     if let Ok(str_val) = s.as_str() {
                         if let Some(resolved) = resolve_tagged(&str_val, explicit) {
                             write_resolved_scalar_as_json(
@@ -2838,7 +2851,10 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         match self.value() {
             YamlValue::Null => "!!null",
             YamlValue::String(s) => {
-                if let Some(explicit) = self.explicit_tag() {
+                // #2619: `self.value()` above already proved `self` isn't
+                // `Alias` by matching `String`, so `None` skips a second
+                // resolve entirely.
+                if let Some(explicit) = self.explicit_tag_at(None) {
                     if let Ok(str_val) = s.as_str() {
                         if let Some(resolved) = resolve_tagged(&str_val, explicit) {
                             return resolved.tag();
@@ -6595,7 +6611,10 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
                 let Ok(str_val) = s.as_str() else {
                     return false;
                 };
-                if let Some(explicit) = self.explicit_tag() {
+                // #2619: `self.value()` above already proved `self` isn't
+                // `Alias` by matching `String`, so `None` skips a second
+                // resolve entirely.
+                if let Some(explicit) = self.explicit_tag_at(None) {
                     if let Some(resolved) = resolve_tagged(&str_val, explicit) {
                         return matches!(
                             resolved,
