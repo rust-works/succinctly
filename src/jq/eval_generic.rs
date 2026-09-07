@@ -6482,6 +6482,15 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // which collapses duplicate mapping keys (#614).
         Expr::Paren(inner) => eval_single::<S, _>(inner, value, optional, cursor),
 
+        // spine 2416 (walk residue; #2428): `..` over a live node keeps every
+        // node's cursor on this route too -- the non-sink twin of
+        // `eval_each_generic`'s own arm, so `.. | {"k": key}` answers the
+        // same on the CLI's DOM path as in the sink pipeline.
+        Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown)
+            if cursor.is_some() =>
+        {
+            collect_each_generic::<S, V>(expr, value, optional, cursor)
+        }
         Expr::Pipe(exprs) => {
             // #2451 rule 1: the branch-major union walk lives on the sink
             // route, so the non-sink route reaches the *same* function
@@ -7557,8 +7566,56 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // the whole pull loop against `V: DocumentValue` directly.
         Expr::Repeat(f) => each_repeat_generic::<S, V>(f, value, optional, cursor, sink),
 
+        // spine 2416 (walk residue; #2428): `..` over a live node emits every
+        // node as its own cursor, so a stage after it reads `key`/`path`/
+        // `parent` as cursor properties instead of losing them to the
+        // `OwnedValue` round trip the wildcard below would take.
+        Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown)
+            if cursor.is_some() =>
+        {
+            each_recurse_cursor_generic::<S, V>(cursor.expect("guarded"), sink)
+        }
+
         _ => drain_result_generic(eval_single::<S, V>(expr, value, optional, cursor), sink),
     }
+}
+
+/// `..` from a cursor: the node, then every descendant in document order,
+/// each delivered as a live cursor (spine 2416, walk residue). `..` is
+/// `recurse(.[]?)`, so a node whose members cannot be listed ends its own
+/// branch silently -- except for the decode failure `?` never catches
+/// (#1620), which escapes.
+fn each_recurse_cursor_generic<S: EvalSemantics, V: DocumentValue>(
+    cursor: V::Cursor,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    if matches!(sink(GenericItem::OneCursor(cursor)), Demand::Stop) {
+        return Flow::Stopped { pending: None };
+    }
+    let mut children: Vec<(Rc<PathTrail>, PathNode<V>)> = Vec::new();
+    let stepped = path_step_generic::<S, V>(
+        &Expr::Iterate,
+        &PathNode::At(cursor),
+        &PathTrail::from_slice(&[]),
+        S::COLLAPSE_DUPLICATE_KEYS,
+        &mut children,
+    );
+    match stepped {
+        Ok(()) => {}
+        Err(e) if e.is_uncatchable_at_value_position() => return Flow::Escaped(Control::Error(e)),
+        // `.[]?`: a scalar, or a malformed container, ends the branch.
+        Err(_) => {}
+    }
+    for (_, child) in children {
+        let PathNode::At(c) = child else {
+            unreachable!("a step from a live node reaches live children")
+        };
+        match each_recurse_cursor_generic::<S, V>(c, sink) {
+            Flow::Exhausted => {}
+            other => return other,
+        }
+    }
+    Flow::Exhausted
 }
 
 /// Demand-driven `Expr::Repeat` arm for the generic evaluator (#2014) --
@@ -12036,6 +12093,14 @@ fn path_expr_is_cursor_navigable(expr: &Expr) -> bool {
 enum PathNode<V: DocumentValue> {
     At(V::Cursor),
     Absent,
+    /// A value that is not a document node, standing at a position (spine
+    /// 2416, walk residue): the array a slice built, a `catch` handler's
+    /// output, the `null` of a `last(empty)`. It is what lets the walk keep
+    /// going through a slice or a `getpath` head instead of refusing them --
+    /// navigation inside it descends the owned value with the same component
+    /// rules the owned identity pipe applies ([`owned_nav_children`]), and
+    /// `parent` climbs back through the ancestors as for any other node.
+    Owned(Rc<OwnedValue>),
 }
 
 impl<V: DocumentValue> Clone for PathNode<V> {
@@ -12043,6 +12108,7 @@ impl<V: DocumentValue> Clone for PathNode<V> {
         match self {
             Self::At(c) => Self::At(*c),
             Self::Absent => Self::Absent,
+            Self::Owned(v) => Self::Owned(Rc::clone(v)),
         }
     }
 }
@@ -12057,6 +12123,7 @@ fn path_node_type_name<V: DocumentValue>(node: &PathNode<V>) -> &'static str {
             tagged_type_name(&v, Some(*c))
         }
         PathNode::Absent => "null",
+        PathNode::Owned(v) => v.type_name(),
     }
 }
 
@@ -12200,6 +12267,14 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
 ) -> Result<(), EvalError> {
     // See `path_walk_generic`'s own doc comment (#2058 code review).
     assert_nesting_depth(path.depth());
+    // spine 2416 (walk residue): a step from an owned value descends the
+    // value itself, with the components the owned identity pipe would name.
+    // Only the path-context walk produces such a node (`path()`'s own walk
+    // admits no slice), so the cursor arms below never see one.
+    if let (PathNode::Owned(v), Expr::Field(_) | Expr::Index { .. } | Expr::Iterate) = (node, expr)
+    {
+        return path_step_owned::<S, V>(expr, v, path, out);
+    }
     match expr {
         Expr::Identity => {
             out.push((Rc::clone(path), node.clone()));
@@ -12211,6 +12286,7 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
         Expr::Field(name) => {
             let next = match node {
                 PathNode::Absent => PathNode::Absent,
+                PathNode::Owned(_) => unreachable!("owned nodes step through path_step_owned"),
                 PathNode::At(c) => {
                     let v = c.value();
                     if v.is_null() {
@@ -12277,6 +12353,7 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
             let mut component = index_component_value(idx, key);
             let next = match node {
                 PathNode::Absent => PathNode::Absent,
+                PathNode::Owned(_) => unreachable!("owned nodes step through path_step_owned"),
                 PathNode::At(c) => {
                     let v = c.value();
                     if v.is_null() {
@@ -12363,6 +12440,7 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
                 EvalTag::Jq,
                 &OwnedValue::Null,
             )),
+            PathNode::Owned(_) => unreachable!("owned nodes step through path_step_owned"),
             PathNode::At(c) => {
                 let v = c.value();
                 if let Some(fields) = v.as_object() {
@@ -12476,6 +12554,108 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
+/// One literal navigation step (`.a`, `.[i]`, `.[]`) from an owned value in
+/// the path-context walk (spine 2416, walk residue): the children
+/// [`owned_nav_children`] names, each an owned node at the extended path.
+fn path_step_owned<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    value: &Rc<OwnedValue>,
+    path: &Rc<PathTrail>,
+    out: &mut Vec<(Rc<PathTrail>, PathNode<V>)>,
+) -> Result<(), EvalError> {
+    let (children, control) = owned_nav_children::<S>(expr, value, false);
+    for (component, child) in children {
+        let next_path = match component {
+            Some(component) => PathTrail::extend(path, component),
+            None => Rc::clone(path),
+        };
+        out.push((next_path, PathNode::Owned(Rc::new(child))));
+    }
+    match control {
+        None => Ok(()),
+        Some(Control::Error(e)) => Err(e),
+        Some(other) => {
+            unreachable!("literal navigation over an owned value cannot break or halt: {other:?}")
+        }
+    }
+}
+
+/// The children one literal navigation step (`.a`, `.[i]`, `.[]`, `.[s:e]`)
+/// reaches inside an owned value, each with the path component it was
+/// reached by -- `None` where the step keeps the position, which is yq's
+/// rule for a slice ([`OwnedIdentityRule::Slice`]).
+///
+/// One definition for the owned identity pipe ([`owned_identity_step`]) and
+/// the path-context walk's owned nodes ([`path_step_owned`]), so the two
+/// cannot disagree about a component. The *values* come from the ordinary
+/// owned evaluator, so every error message, `null` on a missing key and
+/// mode-specific indexing rule is the one the rest of the pipeline already
+/// produces; only the component is derived here.
+fn owned_nav_children<S: EvalSemantics>(
+    expr: &Expr,
+    value: &OwnedValue,
+    optional: bool,
+) -> (Vec<(Option<OwnedValue>, OwnedValue)>, Option<Control>) {
+    let (values, control) = owned_identity_values::<S>(expr, value, optional);
+    let children = match expr {
+        // Mode decides the slice component (ADR-0018): real yq keeps the
+        // container's position (`.c[0:1] | path` is `["c"]`, `.c[0:1] | .[0]
+        // | path` is `["c",0]`, captured from v4.53.3), while jq mode follows
+        // jq's own `path(.c[0:1])`, `["c",{"start":0,"end":1}]`.
+        Expr::Slice {
+            start,
+            end,
+            start_key,
+            end_key,
+        } => {
+            let component = (S::TAG != EvalTag::Yq)
+                .then(|| slice_component_value(*start, start_key.as_ref(), *end, end_key.as_ref()));
+            values.into_iter().map(|v| (component.clone(), v)).collect()
+        }
+        Expr::Field(name) => values
+            .into_iter()
+            .map(|v| (Some(OwnedValue::String(name.clone())), v))
+            .collect(),
+        Expr::Index { idx, key } => {
+            let mut component = index_component_value(*idx, key.as_ref());
+            if let Some(elements) = value.as_array() {
+                if *idx < 0 && S::TAG == EvalTag::Yq {
+                    let resolved = elements.len() as i64 + *idx;
+                    if resolved >= 0 {
+                        component = OwnedValue::Int(resolved);
+                    }
+                }
+            }
+            values
+                .into_iter()
+                .map(|v| (Some(component.clone()), v))
+                .collect()
+        }
+        Expr::Iterate => {
+            let components: Vec<OwnedValue> = match value {
+                OwnedValue::Array(items) => (0..items.len())
+                    .map(|i| OwnedValue::Int(i as i64))
+                    .collect(),
+                OwnedValue::Object(map) => {
+                    map.keys().map(|k| OwnedValue::String(k.clone())).collect()
+                }
+                _ => Vec::new(),
+            };
+            // The owned evaluator yields exactly one value per member; a
+            // mismatch means the input was not a container after all (an
+            // error or, under `?`, nothing), in which case the components
+            // are unused.
+            values
+                .into_iter()
+                .zip(components)
+                .map(|(v, component)| (Some(component), v))
+                .collect()
+        }
+        other => unreachable!("not a literal navigation step: {other:?}"),
+    };
+    (children, control)
+}
+
 /// [`path_step_generic`]'s own `Expr::Pipe` case, split out the same way
 /// [`path_walk_pipe_generic`] is (#2058): a nested nested pipe reached as one
 /// step inside an *outer* pipe (`path(((.a|.b)|.c))`, see the doc comment
@@ -12575,8 +12755,81 @@ fn path_context_pipe_is_walkable(stages: &[Expr]) -> bool {
 /// function's `unreachable!` arm -- a shape admitted here that the step
 /// cannot take is a bug, not a fallback.
 fn path_context_is_navigational(expr: &Expr) -> bool {
+    path_context_is_navigational_at(expr, 0)
+}
+
+/// [`path_context_is_navigational`], `unfolded` levels of `def` binding in
+/// -- the same bound the owned identity pipe's gate applies
+/// (`OWNED_IDENTITY_DEF_UNFOLD_LIMIT`), so a self-recursive definition at
+/// the head of a pipe is refused rather than unfolded forever.
+fn path_context_is_navigational_at(expr: &Expr, unfolded: u8) -> bool {
+    let nav = |e: &Expr| path_context_is_navigational_at(e, unfolded);
     match expr {
         Expr::Identity | Expr::Iterate | Expr::Field(_) | Expr::Index { .. } => true,
+        // spine 2416 (walk residue): the heads the walk used to refuse, all
+        // stepped through `PathNode::Owned` now -- a slice (literal or
+        // computed, `?` included), `getpath(p)` and recursive descent
+        // (#2428). See the step's own arms for the captures.
+        Expr::Slice { .. }
+        | Expr::RecursiveDescent
+        | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => true,
+        Expr::SliceExpr { target, start, end } => {
+            nav(target)
+                && start
+                    .as_deref()
+                    .map_or(true, path_context_component_walkable)
+                && end.as_deref().map_or(true, path_context_component_walkable)
+        }
+        Expr::Builtin(Builtin::GetPath(path_expr)) => path_context_component_walkable(path_expr),
+        // spine 2416 (walk residue): the transparent wrappers step their
+        // body; what they evaluate besides it (`if`'s condition, `limit`'s
+        // count, a `catch` handler, an `error` message) is evaluated at the
+        // position exactly as a computed bracket's component is. A `break`,
+        // `empty`, `error` or halt produces no position of its own and is
+        // stepped for the escape it raises. A definition is bound exactly as
+        // evaluation binds it and the bound body gated like any other, up to
+        // the unfold limit.
+        Expr::Try { expr, catch } => {
+            nav(expr)
+                && catch
+                    .as_deref()
+                    .map_or(true, path_context_component_walkable)
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => path_context_component_walkable(cond) && nav(then_branch) && nav(else_branch),
+        Expr::Label { body, .. } => nav(body),
+        Expr::Break(_) | Expr::Builtin(Builtin::Empty | Builtin::Halt | Builtin::HaltError) => true,
+        Expr::Builtin(Builtin::HaltErrorCode(code)) => path_context_component_walkable(code),
+        Expr::Error(msg) => msg.as_deref().map_or(true, path_context_component_walkable),
+        Expr::FirstExpr(inner) | Expr::LastExpr(inner) => nav(inner),
+        Expr::Shared(inner) => nav(inner),
+        Expr::Limit { n, expr } => path_context_component_walkable(n) && nav(expr),
+        Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+            bound,
+        } => {
+            unfolded < OWNED_IDENTITY_DEF_UNFOLD_LIMIT
+                && path_context_is_navigational_at(
+                    &bind_def(name, &param_names(params), body, then, bound),
+                    unfolded + 1,
+                )
+        }
+        Expr::DefCall {
+            def,
+            args,
+            frames,
+            bound,
+        } => {
+            unfolded < OWNED_IDENTITY_DEF_UNFOLD_LIMIT
+                && bind_def_call(def, args, *frames, bound)
+                    .is_ok_and(|b| path_context_is_navigational_at(b, unfolded + 1))
+        }
         // #2558: `?` over navigation moves the position exactly as the bare
         // navigation does, and suppresses the step that raised instead of
         // producing a position for it. `key`/`path` never see a `?` at all,
@@ -12584,7 +12837,7 @@ fn path_context_is_navigational(expr: &Expr) -> bool {
         // [`path_context_step_generic`] is the whole of it. `?` over
         // anything else (`key?`, `(.a | tostring)?`) is not navigation and
         // is not admitted here.
-        Expr::Optional(inner) => path_context_is_navigational(inner),
+        Expr::Optional(inner) => nav(inner),
         // #2471 (gate reason 1 of spine 2416): a *computed* bracket moves the
         // position exactly as a literal `Expr::Index` does -- the component
         // is one more value to evaluate, not a different kind of step. The
@@ -12602,24 +12855,22 @@ fn path_context_is_navigational(expr: &Expr) -> bool {
         // cursor or an absent position. They stay on the routes that carry an
         // owned value: the owned identity pipe (#2493) and the eager
         // evaluator.
-        Expr::IndexExpr { target, key } => {
-            path_context_is_navigational(target)
-                && path_context_component_walkable(key)
-                // The component must also be single-branch. A comma inside
-                // one makes the bracket a *fan-out* head, and a fan-out head
-                // standing on **absent** positions already loses its position
-                // once the pipe leaves the walk: `(.c[0], .c[1]) | key` on
-                // `c: []` prints nothing here where yq v4.53.3 answers `0`
-                // and `1`, with no computed bracket anywhere in it. Admitting
-                // one would route `.c[(0,1)] | tostring | key` -- which the
-                // eager evaluator answers correctly -- onto that gap, so it
-                // stays where it is.
-                && !path_context_fans_out(key)
-        }
-        Expr::Paren(inner) => path_context_is_navigational(inner),
-        Expr::Pipe(exprs) | Expr::Comma(exprs) => exprs.iter().all(path_context_is_navigational),
+        // spine 2416 (walk residue): a component that fans out (`.c[(0,1)]`)
+        // is admitted too -- one position per branch, which is the class
+        // `path_context_fans_out` sees (its `IndexExpr` arm reads the
+        // component now), so the routing sites' fan-out guard decides, and
+        // `path_context_needs_eager` keeps a fan-out head that can miss on
+        // the eager evaluator by design rather than on the gap a fan-out
+        // over absent positions used to fall into.
+        Expr::IndexExpr { target, key } => nav(target) && path_context_component_walkable(key),
+        Expr::Paren(inner) => nav(inner),
+        Expr::Pipe(exprs) | Expr::Comma(exprs) => exprs.iter().all(nav),
         Expr::Builtin(Builtin::Parent) => true,
-        Expr::Builtin(Builtin::ParentN(n)) => matches!(**n, Expr::Literal(_)),
+        // spine 2416 (walk residue): a computed `n` is evaluated at the
+        // position, like a computed bracket's component.
+        Expr::Builtin(Builtin::ParentN(n)) => {
+            matches!(**n, Expr::Literal(_)) || path_context_component_walkable(n)
+        }
         _ => false,
     }
 }
@@ -12627,31 +12878,108 @@ fn path_context_is_navigational(expr: &Expr) -> bool {
 /// A computed navigation component (`.[K]`) the *walk* can evaluate at a
 /// position (#2471).
 ///
-/// Two conditions. The first is [`owned_identity_component_supported`], the
-/// same predicate the owned identity pipe asks of the same component: a read
+/// One condition: [`owned_identity_component_supported`], the same
+/// predicate the owned identity pipe asks of the same component -- a read
 /// inside it resolves to the constants the position answers with, and
 /// anything that reads nothing is evaluated as written.
 ///
-/// The second is that evaluating it cannot *escape*. The walk's step returns
-/// `Result<(), EvalError>`, which has no room for `Control::Halt` or
-/// `Control::Break`, so a component that can raise one stays on the eager
-/// route -- where #2495's `Control` plumbing already adjudicates it, and
-/// where `.c[halt] | key` still exits silently rather than turning a halt
-/// into an error.
+/// A component that can *escape* (`.c[halt]`, `.[break $out]`) is not
+/// refused since spine 2416's walk residue: the walk's step returns
+/// `Result<(), Control>`, so a halt or a break raised while evaluating one
+/// is carried out exactly as the eager route carried it (#2495).
 fn path_context_component_walkable(expr: &Expr) -> bool {
-    owned_identity_component_supported(expr) && !path_context_component_can_escape(expr)
+    owned_identity_component_supported(expr)
 }
 
-/// Whether evaluating `expr` can end the program or jump to a label -- see
-/// [`path_context_component_walkable`] for why the walk refuses one.
-fn path_context_component_can_escape(expr: &Expr) -> bool {
-    crate::jq::walk::any_subexpr(expr, &mut |e| {
-        matches!(
-            e,
-            Expr::Break(_)
-                | Expr::Builtin(Builtin::Halt | Builtin::HaltError | Builtin::HaltErrorCode(_))
-        )
-    })
+/// Whether a *component* -- a computed bracket's key, a slice bound, a
+/// `getpath` argument -- can produce more than one value, which makes the
+/// step it belongs to a fan-out (`.c[(0,1)]` is one position per branch).
+///
+/// Narrower than [`path_context_fans_out`]: an array or object literal
+/// collects whatever is inside it into one value, so `getpath(["a","b"])`
+/// is a single path, and a bounded consumer is single-output by
+/// construction. Anything the recursion does not name is judged by the
+/// generators it contains.
+fn path_context_component_fans_out(expr: &Expr) -> bool {
+    match expr {
+        Expr::Array(_)
+        | Expr::Object(_)
+        | Expr::Literal(_)
+        | Expr::TrackedVar(_)
+        | Expr::Format(_)
+        | Expr::StringInterpolation(_)
+        | Expr::Reduce { .. }
+        | Expr::FirstExpr(_)
+        | Expr::LastExpr(_)
+        | Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Slice { .. } => false,
+        Expr::Comma(exprs) => exprs.len() > 1 || exprs.iter().any(path_context_component_fans_out),
+        Expr::Pipe(exprs) => exprs.iter().any(path_context_component_fans_out),
+        Expr::Paren(inner) | Expr::Optional(inner) | Expr::Negate(inner) => {
+            path_context_component_fans_out(inner)
+        }
+        Expr::IndexExpr { target, key } => {
+            path_context_component_fans_out(target) || path_context_component_fans_out(key)
+        }
+        Expr::SliceExpr { target, start, end } => {
+            path_context_component_fans_out(target)
+                || start
+                    .as_deref()
+                    .is_some_and(path_context_component_fans_out)
+                || end.as_deref().is_some_and(path_context_component_fans_out)
+        }
+        Expr::Arithmetic { left, right, .. }
+        | Expr::Compare { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::Alternative(left, right) => {
+            path_context_component_fans_out(left) || path_context_component_fans_out(right)
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            path_context_component_fans_out(cond)
+                || path_context_component_fans_out(then_branch)
+                || path_context_component_fans_out(else_branch)
+        }
+        Expr::Try { expr, catch } => {
+            path_context_component_fans_out(expr)
+                || catch
+                    .as_deref()
+                    .is_some_and(path_context_component_fans_out)
+        }
+        Expr::Limit { expr, .. } => path_context_component_fans_out(expr),
+        Expr::Builtin(Builtin::Select(_)) => false,
+        other => crate::jq::walk::any_subexpr(other, &mut |e| {
+            matches!(
+                e,
+                Expr::Iterate
+                    | Expr::RecursiveDescent
+                    | Expr::Range { .. }
+                    | Expr::Repeat(_)
+                    | Expr::While { .. }
+                    | Expr::Until { .. }
+                    | Expr::Foreach { .. }
+                    | Expr::Builtin(
+                        Builtin::Recurse
+                            | Builtin::RecurseF(_)
+                            | Builtin::RecurseCond(..)
+                            | Builtin::Paths
+                            | Builtin::PathsFilter(_)
+                            | Builtin::LeafPaths
+                            | Builtin::Splits(_)
+                            | Builtin::SplitsFlags(..)
+                            | Builtin::Scan(_)
+                            | Builtin::ScanFlags(..)
+                            | Builtin::Inputs
+                    )
+            ) || matches!(e, Expr::Comma(exprs) if exprs.len() > 1)
+        }),
+    }
 }
 
 /// Whether a walked expression can emit more than one *materialized* value.
@@ -12670,7 +12998,9 @@ fn path_context_component_can_escape(expr: &Expr) -> bool {
 /// then pays the gate and a partial walk and *then* the whole bridge.
 fn path_context_fans_out(expr: &Expr) -> bool {
     match expr {
-        Expr::Iterate => true,
+        Expr::Iterate
+        | Expr::RecursiveDescent
+        | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => true,
         Expr::Comma(exprs) => exprs.len() > 1 || exprs.iter().any(path_context_fans_out),
         Expr::Pipe(exprs) => exprs.iter().any(path_context_fans_out),
         // `Expr::Optional` since #2558: `.[]?` became navigational there, so
@@ -12679,11 +13009,54 @@ fn path_context_fans_out(expr: &Expr) -> bool {
         Expr::Paren(inner) | Expr::Array(inner) | Expr::Optional(inner) => {
             path_context_fans_out(inner)
         }
-        // #2471: a computed bracket fans out exactly when its *target*
-        // does. Its component cannot: `path_context_is_navigational` admits
-        // one only when `path_context_fans_out` already answers `false` for
-        // it, which is what keeps this arm about the target alone.
-        Expr::IndexExpr { target, .. } => path_context_fans_out(target),
+        // #2471: a computed bracket fans out when its *target* does; since
+        // spine 2416's walk residue also when its *component* does
+        // (`.c[(0,1)]`, one position per branch), which is what lets
+        // `path_context_is_navigational` admit such a component and leave
+        // the decision to the routing sites' guard.
+        Expr::IndexExpr { target, key } => {
+            path_context_fans_out(target) || path_context_component_fans_out(key)
+        }
+        Expr::SliceExpr { target, start, end } => {
+            path_context_fans_out(target)
+                || start
+                    .as_deref()
+                    .is_some_and(path_context_component_fans_out)
+                || end.as_deref().is_some_and(path_context_component_fans_out)
+        }
+        Expr::Builtin(Builtin::GetPath(p)) => path_context_component_fans_out(p),
+        Expr::Builtin(Builtin::ParentN(n)) => path_context_component_fans_out(n),
+        // spine 2416 (walk residue): the transparent wrappers fan out when
+        // their body does; a bounded consumer of one output does not, and a
+        // `limit` is judged by its body since its count is a value.
+        Expr::Try { expr, catch } => {
+            path_context_fans_out(expr) || catch.as_deref().is_some_and(path_context_fans_out)
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            path_context_component_fans_out(cond)
+                || path_context_fans_out(then_branch)
+                || path_context_fans_out(else_branch)
+        }
+        Expr::Label { body, .. } => path_context_fans_out(body),
+        Expr::Limit { expr, .. } => path_context_fans_out(expr),
+        Expr::Shared(inner) => path_context_fans_out(inner),
+        Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+            bound,
+        } => path_context_fans_out(&bind_def(name, &param_names(params), body, then, bound)),
+        Expr::DefCall {
+            def,
+            args,
+            frames,
+            bound,
+        } => bind_def_call(def, args, *frames, bound).is_ok_and(|b| path_context_fans_out(b)),
         _ => false,
     }
 }
@@ -12755,6 +13128,7 @@ fn path_context_emit_node<V: DocumentValue>(node: &PathNode<V>) -> GenericItem<V
     match node {
         PathNode::At(c) => GenericItem::OneCursor(*c),
         PathNode::Absent => GenericItem::Owned(OwnedValue::Null),
+        PathNode::Owned(v) => GenericItem::Owned((**v).clone()),
     }
 }
 
@@ -12860,7 +13234,7 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     pos: &PathContextPos<V>,
     out: &mut Vec<PathContextPos<V>>,
-) -> Result<(), EvalError> {
+) -> Result<(), Control> {
     match expr {
         Expr::Identity => {
             out.push(pos.clone());
@@ -12897,7 +13271,7 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
                     ancestors,
                 });
             }
-            stepped
+            stepped.map_err(Control::Error)
         }
         Expr::Comma(exprs) => {
             for e in exprs {
@@ -12924,13 +13298,23 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             out.extend(path_context_hop(pos, 1));
             Ok(())
         }
+        // spine 2416 (walk residue): `n` is evaluated at the position like
+        // a computed bracket's component -- one hop per output, in order --
+        // rather than being restricted to a literal. Real yq accepts only a
+        // literal (`parent(0+1)` is `bad expression` in v4.53.3) and jq has
+        // no `parent`, so a computed `n` is a succinctly extension in both
+        // modes, placed as the eager evaluator always placed it: `n` against
+        // the current value, then the hop.
         Expr::Builtin(Builtin::ParentN(n_expr)) => {
-            let Expr::Literal(lit) = &**n_expr else {
-                unreachable!("path_context_is_navigational admits parent(n) only with a literal n")
-            };
-            let n = classify_parent_n::<S>(&literal_to_owned(lit), pos.path.len())?;
-            out.extend(path_context_hop(pos, n));
-            Ok(())
+            let produced_from = out.len();
+            let (counts, control) = path_context_component_values::<S, V>(n_expr, pos);
+            for n_value in counts {
+                let n = classify_parent_n::<S>(&n_value, pos.path.len()).map_err(Control::Error)?;
+                out.extend(path_context_hop(pos, n));
+            }
+            control.map_or(Ok(()), |c| {
+                Err(path_context_component_escape::<S, V>(out, produced_from, c))
+            })
         }
         // #2471: `E[K]` and its `?`-guarded spelling. The `?` covers the
         // *indexing* step alone, never the component's or the target's own
@@ -12950,6 +13334,21 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
         Expr::IndexExpr { target, key } => {
             path_context_step_computed_index::<S, V>(target, key, false, pos, out)
         }
+        // spine 2416 (walk residue): `E[S:T]?`, ahead of the generic
+        // `Expr::Optional` arm for the same reason as `E[K]?` above.
+        Expr::Optional(inner) if matches!(&**inner, Expr::SliceExpr { .. }) => {
+            let Expr::SliceExpr { target, start, end } = &**inner else {
+                unreachable!("the guard above restricts inner to SliceExpr")
+            };
+            path_context_step_computed_slice::<S, V>(
+                target,
+                start.as_deref(),
+                end.as_deref(),
+                true,
+                pos,
+                out,
+            )
+        }
         // #2558: the same rule as `path_step_generic`'s own `Expr::Optional`
         // arm, one level up so a whole *position* (path plus ancestors)
         // survives -- the error is swallowed, the positions already reached
@@ -12968,19 +13367,494 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
         // `Error: index [-5] out of range, array size is 2` in yq v4.53.3,
         // and swallowing it here would have made this migration change the
         // answer instead of the route.
-        Expr::Optional(inner) => {
-            let mut branch = Vec::new();
-            let stepped = path_context_step_generic::<S, V>(inner, pos, &mut branch);
-            out.append(&mut branch);
-            match stepped {
-                Err(e) if e.is_uncatchable_at_value_position() => Err(e),
-                _ => Ok(()),
+        Expr::Optional(inner) => path_context_step_try::<S, V>(inner, None, pos, out),
+        // spine 2416 (walk residue): a slice, a `getpath` and recursive
+        // descent -- the heads the walk used to refuse because they can land
+        // on a value that is not a document node, which `PathNode::Owned`
+        // now carries.
+        Expr::Slice { .. } => path_context_step_owned_nav::<S, V>(expr, pos, out),
+        Expr::SliceExpr { target, start, end } => path_context_step_computed_slice::<S, V>(
+            target,
+            start.as_deref(),
+            end.as_deref(),
+            false,
+            pos,
+            out,
+        ),
+        Expr::Builtin(Builtin::GetPath(path_expr)) => {
+            path_context_step_getpath::<S, V>(path_expr, pos, out)
+        }
+        Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => {
+            path_context_step_recurse::<S, V>(pos, out)
+        }
+        // spine 2416 (walk residue): the transparent wrappers, at the head
+        // of a pipe or anywhere else in it. Each one's positions *are* the
+        // positions its body reaches, so the body is stepped and the wrapper
+        // only decides what happens around it -- exactly the shape
+        // `eval_owned_identity_stages` gives the same constructs in the
+        // owned domain, and what jq's own `path(f)` answers for every one of
+        // them (captured from jq 1.7.1: `path((try .[] catch "C"))`,
+        // `path(if true then .[] else empty end)`, `path(label $o | .[])`,
+        // `path(def f: .[]; f)`, `path(first((.[], error("x"))))` and
+        // `path((.[], empty))` all list the element paths). Real yq's lexer
+        // rejects every one of these but the comma, so in yq mode they are
+        // extensions following the same tree-structural model.
+        Expr::Try { expr, catch } => {
+            path_context_step_try::<S, V>(expr, catch.as_deref(), pos, out)
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            let produced_from = out.len();
+            let (conds, control) = path_context_component_values::<S, V>(cond, pos);
+            for c in conds {
+                let branch = if c.is_truthy() {
+                    then_branch
+                } else {
+                    else_branch
+                };
+                path_context_step_generic::<S, V>(branch, pos, out)?;
             }
+            control.map_or(Ok(()), |c| {
+                Err(path_context_component_escape::<S, V>(out, produced_from, c))
+            })
+        }
+        Expr::Label { name, body } => match path_context_step_generic::<S, V>(body, pos, out) {
+            Err(Control::Break(label)) if label == *name => Ok(()),
+            other => other,
+        },
+        Expr::Break(name) => Err(Control::Break(name.clone())),
+        Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+            bound,
+        } => {
+            let installed = bind_def(name, &param_names(params), body, then, bound);
+            path_context_step_generic::<S, V>(&installed, pos, out)
+        }
+        Expr::DefCall {
+            def,
+            args,
+            frames,
+            bound,
+        } => match bind_def_call(def, args, *frames, bound) {
+            Ok(bound_body) => {
+                let _guard = enter_def_call_frame(*frames);
+                path_context_step_generic::<S, V>(bound_body, pos, out)
+            }
+            Err(e) => Err(Control::Error(e)),
+        },
+        Expr::Shared(inner) => path_context_step_generic::<S, V>(inner, pos, out),
+        Expr::FirstExpr(inner) => path_context_step_bounded::<S, V>(inner, Some(1), pos, out),
+        Expr::Limit { n, expr } => {
+            let produced_from = out.len();
+            let (counts, control) = path_context_component_values::<S, V>(n, pos);
+            for n_value in counts {
+                let take = match classify_limit_n(n_value) {
+                    Ok(LimitN::Unlimited) => None,
+                    Ok(LimitN::Take(n)) => Some(n),
+                    Err(e) => return Err(Control::Error(e)),
+                };
+                path_context_step_bounded::<S, V>(expr, take, pos, out)?;
+            }
+            control.map_or(Ok(()), |c| {
+                Err(path_context_component_escape::<S, V>(out, produced_from, c))
+            })
+        }
+        // `last(body)` is jq 1.7.1's `reduce body as $x (null; $x)`: the
+        // last position, or `null` at this same position when there was
+        // none -- the answer `eval_owned_identity_stages` gives it.
+        Expr::LastExpr(inner) => {
+            let mut branch = Vec::new();
+            path_context_step_generic::<S, V>(inner, pos, &mut branch)?;
+            match branch.pop() {
+                Some(last) => out.push(last),
+                None => out.push(PathContextPos {
+                    node: PathNode::Owned(Rc::new(OwnedValue::Null)),
+                    path: pos.path.clone(),
+                    ancestors: pos.ancestors.clone(),
+                }),
+            }
+            Ok(())
+        }
+        Expr::Builtin(Builtin::Empty) => Ok(()),
+        // A stage that produces nothing but an escape: evaluated at the
+        // position so its message can read `key`/`path`, and whatever it
+        // raises is the step's own escape.
+        Expr::Error(_)
+        | Expr::Builtin(Builtin::Halt | Builtin::HaltError | Builtin::HaltErrorCode(_)) => {
+            let (values, control) = path_context_component_values::<S, V>(expr, pos);
+            for v in values {
+                out.push(PathContextPos {
+                    node: PathNode::Owned(Rc::new(v)),
+                    path: pos.path.clone(),
+                    ancestors: pos.ancestors.clone(),
+                });
+            }
+            control.map_or(Ok(()), Err)
         }
         other => unreachable!(
             "path_context_is_navigational admitted a stage the walk cannot step: {other:?}"
         ),
     }
+}
+
+/// One literal navigation step that may leave the cursor domain -- a slice
+/// -- from any node (spine 2416, walk residue). A live node is materialized
+/// once and the step descends the owned value ([`owned_nav_children`]);
+/// each child is an owned node at the component's path, or at the same
+/// path where the step keeps the position (yq's slice).
+fn path_context_step_owned_nav<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    pos: &PathContextPos<V>,
+    out: &mut Vec<PathContextPos<V>>,
+) -> Result<(), Control> {
+    let value: Rc<OwnedValue> = match &pos.node {
+        PathNode::At(c) => Rc::new(to_owned_cursor(c).map_err(Control::Error)?),
+        PathNode::Absent => Rc::new(OwnedValue::Null),
+        PathNode::Owned(v) => Rc::clone(v),
+    };
+    let (children, control) = owned_nav_children::<S>(expr, &value, false);
+    path_context_push_owned_children(pos, children, out);
+    control.map_or(Ok(()), Err)
+}
+
+/// Push the owned children of `pos` as positions: a child reached by a
+/// component stands one level below `pos`, a child that kept the position
+/// (yq's slice) stands where `pos` stood, with the same ancestors.
+fn path_context_push_owned_children<V: DocumentValue>(
+    pos: &PathContextPos<V>,
+    children: Vec<(Option<OwnedValue>, OwnedValue)>,
+    out: &mut Vec<PathContextPos<V>>,
+) {
+    for (component, child) in children {
+        let node = PathNode::Owned(Rc::new(child));
+        match component {
+            Some(component) => {
+                let mut path = pos.path.clone();
+                path.push(component);
+                let mut ancestors = pos.ancestors.clone();
+                ancestors.push(pos.node.clone());
+                out.push(PathContextPos {
+                    node,
+                    path,
+                    ancestors,
+                });
+            }
+            None => out.push(PathContextPos {
+                node,
+                path: pos.path.clone(),
+                ancestors: pos.ancestors.clone(),
+            }),
+        }
+    }
+}
+
+/// `E[S:T]` (or `E[S:T]?` with `bracket_optional`) as one walk step, from
+/// `pos`. jq compiles it as `S as $s | T as $t | E | .[$s:$t]`: the bounds
+/// are evaluated against this stage's own input, outer, and the target is
+/// stepped inner -- the order [`owned_identity_computed_step`] follows for
+/// the same shape in the owned domain. Each `(s, t)` pair is applied to each
+/// target position as a literal slice of its materialized value, so the
+/// mode's slice rule has one definition ([`owned_nav_children`]).
+fn path_context_step_computed_slice<S: EvalSemantics, V: DocumentValue>(
+    target: &Expr,
+    start: Option<&Expr>,
+    end: Option<&Expr>,
+    bracket_optional: bool,
+    pos: &PathContextPos<V>,
+    out: &mut Vec<PathContextPos<V>>,
+) -> Result<(), Control> {
+    let bound = |e: Option<&Expr>| -> (Vec<OwnedValue>, Option<Control>) {
+        match e {
+            Some(e) => path_context_component_values::<S, V>(e, pos),
+            None => (vec![OwnedValue::Null], None),
+        }
+    };
+    let produced_from = out.len();
+    let (starts, starts_control) = bound(start);
+    let (ends, ends_control) = bound(end);
+    let mut targets = Vec::new();
+    let stepped = path_context_step_generic::<S, V>(target, pos, &mut targets);
+    for s in &starts {
+        for e in &ends {
+            let slice = Expr::SliceExpr {
+                target: Box::new(Expr::Identity),
+                start: Some(Box::new(Expr::TrackedVar(Rc::new(s.clone())))),
+                end: Some(Box::new(Expr::TrackedVar(Rc::new(e.clone())))),
+            };
+            let slice = if bracket_optional {
+                Expr::Optional(Box::new(slice))
+            } else {
+                slice
+            };
+            let component = (S::TAG != EvalTag::Yq)
+                .then(|| literal_component_from_values(s.clone(), e.clone()));
+            for tpos in &targets {
+                let value: Rc<OwnedValue> = match &tpos.node {
+                    PathNode::At(c) => Rc::new(to_owned_cursor(c).map_err(Control::Error)?),
+                    PathNode::Absent => Rc::new(OwnedValue::Null),
+                    PathNode::Owned(v) => Rc::clone(v),
+                };
+                let (values, control) = owned_identity_values::<S>(&slice, &value, false);
+                path_context_push_owned_children(
+                    tpos,
+                    values.into_iter().map(|v| (component.clone(), v)).collect(),
+                    out,
+                );
+                if let Some(control) = control {
+                    return Err(control);
+                }
+            }
+        }
+        // An escape in the end stream is raised once per start, after the
+        // slices that start produced (`S` outer, `T` middle, jq's own order).
+        if let Some(control) = &ends_control {
+            return Err(path_context_component_escape::<S, V>(
+                out,
+                produced_from,
+                control.clone(),
+            ));
+        }
+    }
+    if let Some(control) = starts_control {
+        return Err(path_context_component_escape::<S, V>(
+            out,
+            produced_from,
+            control,
+        ));
+    }
+    stepped.map_err(|c| path_context_component_escape::<S, V>(out, produced_from, c))
+}
+
+/// `getpath(p)` as one walk step from `pos` (spine 2416, walk residue):
+/// every component of each path `p` produces is taken by the literal step
+/// that spells it, so a chain that lands on a document node keeps its
+/// cursor and an absent component is an absent position, exactly as `.a.b`
+/// would reach them. jq's own model, captured from jq 1.7.1:
+/// `path(getpath(["a","b"]))` is `["a","b"]`, `path(getpath(["x","y"]))` is
+/// `["x","y"]`, `path(getpath(["s","y"]))` raises `Cannot index string with
+/// string "y"` and `path(getpath(["c",-1]))` is `["c",-1]`. A slice
+/// descriptor segment (`{"start":s,"end":e}`) is jq's own slice, taken over
+/// the materialized node with its descriptor as the component
+/// (`path(getpath(["c",{"start":0,"end":1}]))` is that descriptor). Real
+/// yq's lexer rejects `getpath`, so in yq mode this is an extension behind
+/// `--jq-extensions` (#1512) following the same model.
+fn path_context_step_getpath<S: EvalSemantics, V: DocumentValue>(
+    path_expr: &Expr,
+    pos: &PathContextPos<V>,
+    out: &mut Vec<PathContextPos<V>>,
+) -> Result<(), Control> {
+    let produced_from = out.len();
+    let (paths, paths_control) = path_context_component_values::<S, V>(path_expr, pos);
+    for path in paths {
+        let OwnedValue::Array(components) = path else {
+            return Err(Control::Error(EvalError::path_must_be_array()));
+        };
+        let mut current = vec![pos.clone()];
+        for component in components {
+            let mut next = Vec::new();
+            for cpos in &current {
+                match path_component_step_expr(&component) {
+                    Some(step) => path_context_step_generic::<S, V>(&step, cpos, &mut next)?,
+                    None if matches!(component, OwnedValue::Object(_)) => {
+                        let value: Rc<OwnedValue> = match &cpos.node {
+                            PathNode::At(c) => Rc::new(to_owned_cursor(c).map_err(Control::Error)?),
+                            PathNode::Absent => Rc::new(OwnedValue::Null),
+                            PathNode::Owned(v) => Rc::clone(v),
+                        };
+                        let segment = Expr::Builtin(Builtin::GetPath(Box::new(Expr::TrackedVar(
+                            Rc::new(OwnedValue::Array(vec![component.clone()])),
+                        ))));
+                        let (values, control) = owned_identity_values::<S>(&segment, &value, false);
+                        path_context_push_owned_children(
+                            cpos,
+                            values
+                                .into_iter()
+                                .map(|v| (Some(component.clone()), v))
+                                .collect(),
+                            &mut next,
+                        );
+                        if let Some(control) = control {
+                            return Err(control);
+                        }
+                    }
+                    None => {
+                        return Err(Control::Error(EvalError::cannot_index(
+                            path_node_type_name::<V>(&cpos.node),
+                            &component,
+                        )))
+                    }
+                }
+            }
+            current = next;
+        }
+        out.append(&mut current);
+    }
+    paths_control.map_or(Ok(()), |c| {
+        Err(path_context_component_escape::<S, V>(out, produced_from, c))
+    })
+}
+
+/// `..` as one walk step from `pos` (spine 2416, walk residue; #2428): the
+/// node itself, then every descendant in document order, each at its own
+/// position -- `recurse(.[]?)`, so a node that cannot be iterated ends its
+/// own branch silently. Captured from yq v4.53.3 on `a: {b: 1, e: 2}, c:
+/// [10, 20], ...`: `[.. | key]` is `["a","b","e","c",0,1,"n","m","s","u"]`
+/// (the root's `key` emits nothing, #2421), `[.. | path]` starts with `[]`,
+/// and `[.. | parent | key]` is `["a","a","c","c"]`; jq 1.7.1's
+/// `[path(..)]` lists the same positions in the same order.
+fn path_context_step_recurse<S: EvalSemantics, V: DocumentValue>(
+    pos: &PathContextPos<V>,
+    out: &mut Vec<PathContextPos<V>>,
+) -> Result<(), Control> {
+    assert_nesting_depth(pos.path.len());
+    out.push(pos.clone());
+    let mut children = Vec::new();
+    path_context_step_try::<S, V>(&Expr::Iterate, None, pos, &mut children)?;
+    for child in &children {
+        path_context_step_recurse::<S, V>(child, out)?;
+    }
+    Ok(())
+}
+
+/// `try body catch handler` / `body?` as one walk step (spine 2416, walk
+/// residue). The positions the body reached before an error are kept -- the
+/// walk never un-emits -- and a catchable error then runs the handler over
+/// its payload *at this stage's own position*, each output an owned node
+/// standing where the `try` stood (the rule `eval_owned_identity_try`
+/// applies in the owned domain, and #1409's for a handler that navigates
+/// inside the payload). A `break` runs the handler over `null`, as
+/// `each_try_generic` does; a halt and the two errors
+/// `EvalError::is_uncatchable_at_value_position` names are never caught.
+fn path_context_step_try<S: EvalSemantics, V: DocumentValue>(
+    body: &Expr,
+    catch: Option<&Expr>,
+    pos: &PathContextPos<V>,
+    out: &mut Vec<PathContextPos<V>>,
+) -> Result<(), Control> {
+    let mut branch = Vec::new();
+    let stepped = path_context_step_generic::<S, V>(body, pos, &mut branch);
+    out.append(&mut branch);
+    let payload = match stepped {
+        Ok(()) => return Ok(()),
+        Err(Control::Error(e)) if e.is_uncatchable_at_value_position() => {
+            return Err(Control::Error(e))
+        }
+        Err(Control::Error(e)) => e.payload(),
+        Err(Control::Break(_)) => OwnedValue::Null,
+        Err(halt @ Control::Halt(_)) => return Err(halt),
+    };
+    let Some(handler) = catch else {
+        return Ok(());
+    };
+    let resolved = path_context_resolve_at_pos::<S, V>(handler, pos).map_err(Control::Error)?;
+    let (values, control) = owned_identity_values::<S>(&resolved, &payload, false);
+    for v in values {
+        out.push(PathContextPos {
+            node: PathNode::Owned(Rc::new(v)),
+            path: pos.path.clone(),
+            ancestors: pos.ancestors.clone(),
+        });
+    }
+    control.map_or(Ok(()), Err)
+}
+
+/// `first(body)` / `limit(n; body)` as one walk step: at most `take`
+/// positions of the body (all of them for `None`).
+///
+/// The walk's step is eager -- it collects every position a stage reaches
+/// before the next stage runs -- so a bound is applied branch by branch
+/// where the body is a comma, and the branches past the bound are never
+/// stepped: `first((.[], halt_error))` stops after the first element, as jq
+/// does, rather than evaluating the `halt_error` it would never reach. A
+/// body that is not a comma is stepped whole and truncated; an escape it
+/// raised *after* the bound was met is dropped, which is what jq's own
+/// `first(f)` (`label $out | f | ., break $out`) does with an error the
+/// generator would only have raised past the output it stopped at
+/// (`path(first((.[], error("x"))))` is `["a"]` in jq 1.7.1, exit 0).
+fn path_context_step_bounded<S: EvalSemantics, V: DocumentValue>(
+    body: &Expr,
+    take: Option<usize>,
+    pos: &PathContextPos<V>,
+    out: &mut Vec<PathContextPos<V>>,
+) -> Result<(), Control> {
+    if take == Some(0) {
+        return Ok(());
+    }
+    let mut branch = Vec::new();
+    let stepped = match strip_parens(body) {
+        Expr::Comma(branches) => {
+            let mut stepped = Ok(());
+            for b in branches {
+                if take.is_some_and(|n| branch.len() >= n) {
+                    break;
+                }
+                stepped = path_context_step_generic::<S, V>(b, pos, &mut branch);
+                if stepped.is_err() {
+                    break;
+                }
+            }
+            stepped
+        }
+        _ => path_context_step_generic::<S, V>(body, pos, &mut branch),
+    };
+    let satisfied = take.is_some_and(|n| branch.len() >= n);
+    if let Some(n) = take {
+        branch.truncate(n);
+    }
+    out.append(&mut branch);
+    if satisfied {
+        Ok(())
+    } else {
+        stepped
+    }
+}
+
+/// Report a step's generator escape -- a key or bound stream's, or the
+/// bracket target's own -- after the positions it produced, applying yq
+/// mode's rule for a generator that fails part-way (#2371, #2351, #2328):
+/// real yq discards the keys already indexed when the key stream raises
+/// (`.[("a","b",error("x"))] | key` on `a: 1, b: 2` prints only `Error: x`
+/// in v4.53.3) and the targets already indexed when the target raises,
+/// while jq keeps both (`{"a":1,"b":2} | .[("a","b",error("x"))]` prints
+/// `1`, `2`, then raises in 1.7.1). A halt keeps them in both modes.
+/// `produced_from` is `out`'s length before the step ran.
+fn path_context_component_escape<S: EvalSemantics, V: DocumentValue>(
+    out: &mut Vec<PathContextPos<V>>,
+    produced_from: usize,
+    control: Control,
+) -> Control {
+    if S::TAG == EvalTag::Yq && !matches!(control, Control::Halt(_)) {
+        out.truncate(produced_from);
+    }
+    control
+}
+
+/// `expr`'s `key`/`path`/`file_index` reads rewritten to the constants `pos`
+/// answers -- the same [`path_context_resolve_constants`] every other route
+/// uses, with no `parent` source: the walk's gate
+/// ([`path_context_component_walkable`]) admits constant-only reads.
+fn path_context_resolve_at_pos<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    pos: &PathContextPos<V>,
+) -> Result<Expr, EvalError> {
+    if !needs_path_context(expr) {
+        return Ok(expr.clone());
+    }
+    path_context_resolve_constants::<S>(
+        expr,
+        &PathContextAt {
+            key: pos.path.last(),
+            path: &pos.path,
+            parent_of: None,
+            prefetch: None,
+        },
+    )
 }
 
 /// One computed-bracket step (`E[K]`, or `E[K]?` with `bracket_optional`),
@@ -13004,8 +13878,9 @@ fn path_context_step_computed_index<S: EvalSemantics, V: DocumentValue>(
     bracket_optional: bool,
     pos: &PathContextPos<V>,
     out: &mut Vec<PathContextPos<V>>,
-) -> Result<(), EvalError> {
-    let components = path_context_component_values::<S, V>(key, pos)?;
+) -> Result<(), Control> {
+    let produced_from = out.len();
+    let (components, components_control) = path_context_component_values::<S, V>(key, pos);
     let mut targets = Vec::new();
     let stepped = path_context_step_generic::<S, V>(target, pos, &mut targets);
     for component in &components {
@@ -13026,15 +13901,28 @@ fn path_context_step_computed_index<S: EvalSemantics, V: DocumentValue>(
                 // is empty, `.c[null] | key` raises.
                 None if bracket_optional => {}
                 None => {
-                    return Err(EvalError::cannot_index(
+                    return Err(Control::Error(EvalError::cannot_index(
                         path_node_type_name::<V>(&tpos.node),
                         component,
-                    ))
+                    )))
                 }
             }
         }
     }
-    stepped
+    // The key stream's own escape (a `halt` after some keys, #1897) is
+    // reported after every position the keys before it reached -- jq's
+    // key-outer/target-inner order -- and the target's after that.
+    if let Some(control) = components_control {
+        return Err(path_context_component_escape::<S, V>(
+            out,
+            produced_from,
+            control,
+        ));
+    }
+    // The target's own escape after some targets (#2328: `(.a,.b,error("x"))
+    // [(0+0)] | key` prints only `Error: x` in yq v4.53.3, `0`, `0` and then
+    // the error in jq mode) takes the same mode split.
+    stepped.map_err(|c| path_context_component_escape::<S, V>(out, produced_from, c))
 }
 
 /// Every value a computed component takes at `pos` (#2471).
@@ -13048,34 +13936,24 @@ fn path_context_step_computed_index<S: EvalSemantics, V: DocumentValue>(
 fn path_context_component_values<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     pos: &PathContextPos<V>,
-) -> Result<Vec<OwnedValue>, EvalError> {
-    let resolved;
-    let expr = if needs_path_context(expr) {
-        resolved = path_context_resolve_constants::<S>(
-            expr,
-            &PathContextAt {
-                key: pos.path.last(),
-                path: &pos.path,
-                // `path_context_component_walkable` keeps the constant-only
-                // gate, so no `parent` can appear in a component.
-                parent_of: None,
-                prefetch: None,
-            },
-        )?;
-        &resolved
-    } else {
-        expr
+) -> (Vec<OwnedValue>, Option<Control>) {
+    // `path_context_component_walkable` keeps the constant-only gate, so no
+    // `parent` can appear in a component.
+    let expr = match path_context_resolve_at_pos::<S, V>(expr, pos) {
+        Ok(e) => e,
+        Err(e) => return (Vec::new(), Some(Control::Error(e))),
     };
-    let (values, control) = match &pos.node {
-        PathNode::At(c) => stream_owned_outputs_generic::<S, V>(expr, c.value(), false, Some(*c)),
-        PathNode::Absent => owned_identity_values::<S>(expr, &OwnedValue::Null, false),
-    };
-    match control {
-        None => Ok(values),
-        Some(Control::Error(e)) => Err(e),
-        // `path_context_component_walkable` refuses a component that can
-        // halt or break, which is the whole of what is left.
-        Some(other) => unreachable!("a walkable component cannot escape: {other:?}"),
+    // spine 2416 (walk residue): a component that halts or breaks is no
+    // longer refused -- the step carries a `Control`, so `.c[halt] | key`
+    // exits silently and `.[break $out] | key` unwinds to its label here
+    // exactly as they did on the eager route (#2495). The values produced
+    // *before* the escape are real output (`.[("a","b",halt)] | key` prints
+    // both keys and then halts, #1897), so they come back alongside it and
+    // every caller takes them before reporting the escape.
+    match &pos.node {
+        PathNode::At(c) => stream_owned_outputs_generic::<S, V>(&expr, c.value(), false, Some(*c)),
+        PathNode::Absent => owned_identity_values::<S>(&expr, &OwnedValue::Null, false),
+        PathNode::Owned(v) => owned_identity_values::<S>(&expr, v, false),
     }
 }
 
@@ -13119,7 +13997,7 @@ fn path_context_walk_generic<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     pos: &PathContextPos<V>,
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
-) -> Result<Demand, EvalError> {
+) -> Result<Demand, Control> {
     match expr {
         Expr::Paren(inner) => path_context_walk_generic::<S, V>(inner, pos, sink),
         Expr::Pipe(exprs) => path_context_walk_pipe::<S, V>(exprs, pos, sink),
@@ -13153,7 +14031,7 @@ fn path_context_walk_generic<S: EvalSemantics, V: DocumentValue>(
                 }
             });
             if let Some(e) = failure {
-                return Err(e);
+                return Err(Control::Error(e));
             }
             walked?;
             Ok(sink(GenericItem::Owned(OwnedValue::Array(items))))
@@ -13188,7 +14066,7 @@ fn path_context_walk_pipe<S: EvalSemantics, V: DocumentValue>(
     exprs: &[Expr],
     pos: &PathContextPos<V>,
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
-) -> Result<Demand, EvalError> {
+) -> Result<Demand, Control> {
     match exprs.split_first() {
         None => Ok(sink(path_context_emit_node(&pos.node))),
         Some((first, [])) => path_context_walk_generic::<S, V>(first, pos, sink),
@@ -13496,6 +14374,23 @@ pub(crate) fn path_context_needs_eager(exprs: &[Expr]) -> bool {
     if !exprs.iter().any(needs_path_context) {
         return false;
     }
+    // spine 2416 (walk residue): a fan-out head that can miss, followed by a
+    // read, is the residue ADR-0021 decision 7 keeps eager by design. Asked
+    // before the owned identity pipe's own gate, because that pipe would
+    // otherwise take `(.c[0], .c[5]) | tostring | key` and answer `0` alone
+    // where yq v4.53.3 answers `0` and `5`: an absent branch of a fan-out
+    // head leaves the walk as a `null` with no cursor, so nothing downstream
+    // can name its position. The two routing sites refuse the same head
+    // (`path_context_fans_out`), which is what makes this the whole of what
+    // the gate still answers `true` for.
+    let head_len = exprs
+        .iter()
+        .take_while(|stage| path_context_is_navigational(stage))
+        .count();
+    let (head, rest) = exprs.split_at(head_len);
+    if fanout_head_can_lose_position(head) && rest.iter().any(needs_path_context) {
+        return true;
+    }
     // #2416 step 3: a pipe that leaves the cursor domain at a stage the
     // owned identity pipe can follow is answered there, whatever the stages
     // after it are.
@@ -13559,6 +14454,9 @@ fn step_can_yield_absent(expr: &Expr, incoming: bool) -> bool {
     match expr {
         Expr::Field(_) | Expr::Index { .. } => true,
         Expr::Iterate | Expr::Builtin(Builtin::Parent | Builtin::ParentN(_)) => false,
+        // `at_offset`/`at_position` land on a real document node or raise;
+        // they never produce an absent position (spine 2416, walk residue).
+        Expr::Builtin(Builtin::AtOffset(_) | Builtin::AtPosition(..)) => false,
         Expr::Identity | Expr::Builtin(Builtin::Select(_)) => incoming,
         Expr::Paren(inner)
         | Expr::Optional(inner)
@@ -13573,15 +14471,93 @@ fn step_can_yield_absent(expr: &Expr, incoming: bool) -> bool {
             .iter()
             .fold(incoming, |acc, e| step_can_yield_absent(e, acc)),
         Expr::Comma(exprs) => exprs.iter().any(|e| step_can_yield_absent(e, incoming)),
+        // spine 2416 (walk residue): the wrappers the walk steps. A branch or
+        // a bound body answers for the wrapper; `..` emits its input and real
+        // descendants; a `break`, `empty`, `error` or halt emits nothing.
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            step_can_yield_absent(then_branch, incoming)
+                || step_can_yield_absent(else_branch, incoming)
+        }
+        Expr::Label { body, .. } => step_can_yield_absent(body, incoming),
+        Expr::Shared(inner) => step_can_yield_absent(inner, incoming),
+        Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => incoming,
+        Expr::Break(_)
+        | Expr::Error(_)
+        | Expr::Builtin(
+            Builtin::Empty | Builtin::Halt | Builtin::HaltError | Builtin::HaltErrorCode(_),
+        ) => false,
+        Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+            bound,
+        } => step_can_yield_absent(
+            &bind_def(name, &param_names(params), body, then, bound),
+            incoming,
+        ),
+        Expr::DefCall {
+            def,
+            args,
+            frames,
+            bound,
+        } => bind_def_call(def, args, *frames, bound)
+            .map_or(true, |b| step_can_yield_absent(b, incoming)),
         _ => true,
     }
 }
 
-/// [`step_can_yield_absent`] folded over a navigational head.
+/// [`step_can_yield_absent`] folded over a navigational head: whether the
+/// position the head *ends* on can be absent.
 fn head_can_yield_absent(stages: &[Expr]) -> bool {
     stages
         .iter()
         .fold(false, |acc, e| step_can_yield_absent(e, acc))
+}
+
+/// Whether a navigational head that fans out can hand a later stage a
+/// position it has lost (spine 2416, walk residue): some step *after* the
+/// fan-out can be absent. An absent branch of a fan-out leaves the walk as a
+/// `null` with no cursor, so nothing downstream can name it -- `(.c[0],
+/// .c[5]) | tostring | key` and `.c[(0,5)] | tostring | key` are `0` and
+/// `5` in yq v4.53.3, and `.a[] | .k | parent | tostring | key` passes
+/// through the same absence -- where a head that fans out over *real* nodes
+/// only (`.a | .[] | tostring | key`: `.a`'s own absence yields no element)
+/// is exact on the per-element routes.
+fn fanout_head_can_lose_position(head: &[Expr]) -> bool {
+    let mut can_absent = false;
+    let mut seen_fanout = false;
+    for stage in head {
+        if path_context_fans_out(stage) {
+            seen_fanout = true;
+        }
+        can_absent = step_can_yield_absent(stage, can_absent);
+        if seen_fanout && can_absent {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether any position the head passes *through* can be absent (spine
+/// 2416, walk residue) -- the condition for walking the head as positions
+/// at all. `.a.b | parent | key + "x"` ends on the real `.a` whatever `.a.b`
+/// is, but only a walk carries `.a.b`'s absence through the hop: the
+/// generic route hands `parent` a `null` with no cursor and loses the
+/// position, which is what kept every `parent`-after-a-miss pipe eager.
+fn head_passes_through_absent(stages: &[Expr]) -> bool {
+    let mut can_absent = false;
+    for stage in stages {
+        can_absent = step_can_yield_absent(stage, can_absent);
+        if can_absent {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether a native path-context stage emits the node it was given (or a
@@ -13594,6 +14570,10 @@ fn path_context_stage_preserves_node(expr: &Expr) -> bool {
     match expr {
         Expr::Identity | Expr::Field(_) | Expr::Index { .. } | Expr::Iterate => true,
         Expr::Builtin(Builtin::Select(_) | Builtin::Parent | Builtin::ParentN(_)) => true,
+        // spine 2416 (walk residue): the position-based navigation
+        // extensions emit the document node they jumped to, as a cursor, so
+        // a read after them stands on a live node.
+        Expr::Builtin(Builtin::AtOffset(_) | Builtin::AtPosition(..)) => true,
         Expr::Paren(inner) | Expr::Optional(inner) => path_context_stage_preserves_node(inner),
         Expr::FirstExpr(inner) | Expr::LastExpr(inner) => path_context_stage_preserves_node(inner),
         Expr::Limit { expr, .. } => path_context_stage_preserves_node(expr),
@@ -13609,6 +14589,45 @@ fn path_context_stage_preserves_node(expr: &Expr) -> bool {
         Expr::Pipe(exprs) | Expr::Comma(exprs) => {
             exprs.iter().all(path_context_stage_preserves_node)
         }
+        // spine 2416 (walk residue): the wrappers the walk steps preserve
+        // the node when every body they can emit from does; the constructs
+        // that emit nothing preserve it trivially.
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            path_context_stage_preserves_node(then_branch)
+                && path_context_stage_preserves_node(else_branch)
+        }
+        Expr::Label { body, .. } => path_context_stage_preserves_node(body),
+        Expr::Shared(inner) => path_context_stage_preserves_node(inner),
+        Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => true,
+        Expr::Break(_)
+        | Expr::Error(_)
+        | Expr::Builtin(
+            Builtin::Empty | Builtin::Halt | Builtin::HaltError | Builtin::HaltErrorCode(_),
+        ) => true,
+        Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+            bound,
+        } => path_context_stage_preserves_node(&bind_def(
+            name,
+            &param_names(params),
+            body,
+            then,
+            bound,
+        )),
+        Expr::DefCall {
+            def,
+            args,
+            frames,
+            bound,
+        } => bind_def_call(def, args, *frames, bound)
+            .is_ok_and(|b| path_context_stage_preserves_node(b)),
         _ => false,
     }
 }
@@ -13694,7 +14713,10 @@ fn path_context_single_native(expr: &Expr) -> bool {
             | Builtin::FileIndex
             | Builtin::Empty,
         ) => true,
-        Expr::Builtin(Builtin::ParentN(n)) => matches!(**n, Expr::Literal(_)),
+        // spine 2416 (walk residue): `eval_builtin`'s own `ParentN` arm
+        // evaluates a computed `n` against the value *with the cursor*, so
+        // a read inside it is native here on the same terms as any operand.
+        Expr::Builtin(Builtin::ParentN(n)) => path_context_single_native(n),
         Expr::Builtin(Builtin::Select(cond)) => path_context_single_native(cond),
         // Native in `eval_single` via `collect_each_generic` over
         // `each_if_generic`; every sub-expression is single-evaluated.
@@ -13879,7 +14901,7 @@ fn try_path_context_walk_sink<S: EvalSemantics, V: DocumentValue>(
         (_, Some(flow)) => flow,
         (Ok(Demand::Stop), None) => Flow::Stopped { pending: None },
         (Ok(Demand::Continue), None) => Flow::Exhausted,
-        (Err(e), None) => Flow::Escaped(Control::Error(e)),
+        (Err(control), None) => Flow::Escaped(control),
     })
 }
 
@@ -13919,9 +14941,9 @@ fn try_path_context_cursor_walk<S: EvalSemantics, V: DocumentValue>(
         // never un-emits an output it already produced. A decode failure
         // while rendering that prefix replaces the walk's own error, the
         // same secondary-failure rule `resolve_terminal_prefix` applies.
-        Err(e) => {
+        Err(control) => {
             let (prefix, failure) = path_context_items_to_owned(items);
-            partial_generic(prefix, Control::Error(failure.unwrap_or(e)))
+            partial_generic(prefix, failure.map_or(control, Control::Error))
         }
     };
     Some(if rest.is_empty() {
@@ -14043,11 +15065,16 @@ fn path_context_resolvable(expr: &Expr, admits: ResolveAdmits) -> bool {
         // #2472: a node, not a constant -- resolvable only where the caller
         // carries the identity to climb.
         Expr::Builtin(Builtin::Parent) => admits.parent,
-        // `parent(n)` climbs `n` levels, and `n` has to be knowable without
-        // evaluating a stream against a position that may not exist: the
-        // same literal-only restriction `owned_identity_pipe_supported`
-        // already places on a bare `parent(n)` stage.
-        Expr::Builtin(Builtin::ParentN(n)) => admits.parent && matches!(**n, Expr::Literal(_)),
+        // `parent(n)` climbs `n` levels. A literal `n` is known up front; a
+        // computed one (spine 2416, walk residue) is evaluated at the
+        // position through the prefetch hook, so only the caller that
+        // supplies one -- the owned identity pipe -- admits it.
+        Expr::Builtin(Builtin::ParentN(n)) => {
+            admits.parent
+                && (matches!(**n, Expr::Literal(_))
+                    || (admits.prefetch
+                        && owned_identity_pipe_supported(owned_identity_body_stages(n))))
+        }
         // #2522 admitted a read inside an arithmetic operand for the in-place
         // `|=` rewrite only; the identity pass (spine 2416) admits it on every
         // route, since the rewriter has handled it since #2471 and what the
@@ -14126,15 +15153,41 @@ fn path_context_resolvable(expr: &Expr, admits: ResolveAdmits) -> bool {
         } => patterns.len() == 1 && sub(expr) && sub(body),
         // A bound call's body is rewritten as a whole, so it must not call
         // anything itself: a nested call would be rewritten against this
-        // stage's position too, and a recursive one would never end.
+        // stage's position too, and a recursive one would never end. A
+        // body that does call something -- a parameter (`def f(x): x;
+        // f(key)`, #1371's substitution) or another definition -- is
+        // evaluated at the position instead (spine 2416, walk residue),
+        // where the owned identity pipe binds the call exactly as
+        // evaluation does; only the caller that supplies that evaluation
+        // admits it.
         Expr::DefCall { def, args, .. } => {
-            !crate::jq::walk::any_subexpr(&def.body, &mut |e| {
+            if crate::jq::walk::any_subexpr(&def.body, &mut |e| {
                 matches!(e, Expr::DefCall { .. } | Expr::FuncCall { .. })
-            }) && sub(&def.body)
-                && args.iter().all(sub)
+            }) {
+                admits.prefetch && owned_identity_pipe_supported(owned_identity_body_stages(expr))
+            } else {
+                sub(&def.body) && args.iter().all(sub)
+            }
         }
         Expr::Shared(inner) => sub(inner),
         Expr::Alternative(left, right) => sub(left) && sub(right),
+        // spine 2416 (walk residue): the navigation shapes' target and
+        // components, a `getpath` argument and an `error` message are all
+        // evaluated against the stage's own input (see the rewriter's arms of
+        // the same names).
+        Expr::IndexExpr { target, key } => sub(target) && sub(key),
+        Expr::SliceExpr { target, start, end } => {
+            sub(target) && start.as_deref().map_or(true, sub) && end.as_deref().map_or(true, sub)
+        }
+        Expr::Builtin(Builtin::GetPath(path_expr)) => sub(path_expr),
+        Expr::Error(msg) => msg.as_deref().map_or(true, sub),
+        // A definition is transparent and has no rewriter arm: evaluated at
+        // the position through the prefetch hook, where the owned identity
+        // pipe binds it exactly as evaluation does; only the caller that
+        // supplies that evaluation admits it.
+        Expr::FuncDef { .. } => {
+            admits.prefetch && owned_identity_pipe_supported(owned_identity_body_stages(expr))
+        }
         _ => false,
     }
 }
@@ -14235,15 +15288,20 @@ fn path_context_absent_split(exprs: &[Expr]) -> Option<(&[Expr], &[Expr], Absent
     if path_context_walk_split(exprs).is_some() {
         return None;
     }
+    // The head stops short of a stage that fans out (spine 2416, walk
+    // residue): a fan-out head is refused here whole, so a fan-out *after*
+    // the part that can miss (`.a | .[] | tostring | key`, `.a.b | label $o
+    // | (parent, break $o)`) is left to `rest`, where the identity route
+    // runs it per position, rather than turning the whole pipe away.
     let head_len = exprs
         .iter()
-        .take_while(|stage| path_context_is_navigational(stage))
+        .take_while(|stage| path_context_is_navigational(stage) && !path_context_fans_out(stage))
         .count();
     let (head, rest) = exprs.split_at(head_len);
     if rest.is_empty() || !rest.iter().any(needs_path_context) {
         return None;
     }
-    if !head_can_yield_absent(head) || head.iter().any(path_context_fans_out) {
+    if !head_passes_through_absent(head) {
         return None;
     }
     let route = path_context_absent_rest_route(rest)?;
@@ -14331,12 +15389,18 @@ fn path_context_absent_identity<V: DocumentValue>(
     let PathNode::At(base) = pos.ancestors[base_index] else {
         unreachable!("rposition matched a live cursor")
     };
-    let base_value = Rc::new(to_owned_cursor(&base)?);
-    let absent = Rc::new(OwnedValue::Null);
+    let mut parent = Rc::new(to_owned_cursor(&base)?);
     let mut id = OwnedIdentity::kept(base);
     for (i, component) in pos.path[base_index..].iter().enumerate() {
-        let parent = if i == 0 { &base_value } else { &absent };
-        id = id.child(parent, component.clone());
+        id = id.child(&parent, component.clone());
+        // spine 2416 (walk residue): an owned ancestor below the base (the
+        // array a slice built) is the parent value its own children hang
+        // under; everything else below the base is absent, which is `null`.
+        parent = match pos.ancestors.get(base_index + i + 1) {
+            Some(PathNode::Owned(v)) => Rc::clone(v),
+            Some(PathNode::At(_)) => unreachable!("a live ancestor above the deepest live one"),
+            Some(PathNode::Absent) | None => Rc::new(OwnedValue::Null),
+        };
     }
     Ok(id)
 }
@@ -14412,9 +15476,9 @@ struct PathContextAt<'a> {
     prefetch: Option<&'a PrefetchFn<'a>>,
 }
 
-/// [`PathContextAt::prefetch`]'s hook: a sub-expression in, the literal of
-/// its outputs at the position out.
-type PrefetchFn<'a> = dyn Fn(&Expr) -> Result<Expr, EvalError> + 'a;
+/// [`PathContextAt::prefetch`]'s hook: a sub-expression in, its outputs at
+/// the position out ([`prefetched_literal`] spells them as an expression).
+type PrefetchFn<'a> = dyn Fn(&Expr) -> Result<Vec<OwnedValue>, EvalError> + 'a;
 
 /// [`path_context_resolve_absent`]'s worker, over the constants themselves:
 /// `key` is `None` where it emits nothing (the document root, #2421, or a
@@ -14474,11 +15538,27 @@ fn path_context_resolve_constants<S: EvalSemantics>(
         // arm gives (#2421).
         Expr::Builtin(Builtin::Parent) => path_context_resolve_parent(at, 1)?,
         Expr::Builtin(Builtin::ParentN(n_expr)) => {
-            let Expr::Literal(lit) = &**n_expr else {
-                unreachable!("path_context_resolvable admits a literal n only")
+            let counts = match &**n_expr {
+                Expr::Literal(lit) => vec![literal_to_owned(lit)],
+                // spine 2416 (walk residue): a computed `n`, evaluated at
+                // the position -- one ancestor per output, in order.
+                other => match at.prefetch {
+                    Some(prefetch) => prefetch(other)?,
+                    None => unreachable!(
+                        "path_context_resolvable admits a computed n only with a prefetch"
+                    ),
+                },
             };
-            let n = classify_parent_n::<S>(&literal_to_owned(lit), path.len())?;
-            path_context_resolve_parent(at, n)?
+            let mut ancestors: Vec<Expr> = Vec::new();
+            for n_value in counts {
+                let n = classify_parent_n::<S>(&n_value, path.len())?;
+                ancestors.push(path_context_resolve_parent(at, n)?);
+            }
+            match ancestors.len() {
+                0 => Expr::Builtin(Builtin::Empty),
+                1 => ancestors.pop().expect("len checked"),
+                _ => Expr::Comma(ancestors),
+            }
         }
         Expr::Paren(inner) => Expr::Paren(boxed(inner)?),
         Expr::Array(inner) => Expr::Array(boxed(inner)?),
@@ -14507,11 +15587,67 @@ fn path_context_resolve_constants<S: EvalSemantics>(
             if !path_context_stages_resolvable(exprs, ResolveAdmits::UPDATE_TARGET) =>
         {
             match at.prefetch {
-                Some(prefetch) => prefetch(expr)?,
+                Some(prefetch) => prefetched_literal(prefetch(expr)?),
                 None => {
                     debug_assert!(
                         false,
                         "path_context_resolvable refuses a moved read without a prefetch"
+                    );
+                    expr.clone()
+                }
+            }
+        }
+        // spine 2416 (walk residue): the navigation shapes evaluate their
+        // target and components against the stage's own input (jq compiles
+        // `E[K]` as `K as $k | E | .[$k]`), so a read inside either is a
+        // constant here; a `getpath` argument and an `error` message the
+        // same.
+        Expr::IndexExpr { target, key } => Expr::IndexExpr {
+            target: boxed(target)?,
+            key: boxed(key)?,
+        },
+        Expr::SliceExpr { target, start, end } => Expr::SliceExpr {
+            target: boxed(target)?,
+            start: start.as_deref().map(boxed).transpose()?,
+            end: end.as_deref().map(boxed).transpose()?,
+        },
+        Expr::Builtin(Builtin::GetPath(path_expr)) => {
+            Expr::Builtin(Builtin::GetPath(boxed(path_expr)?))
+        }
+        Expr::Error(msg) => Expr::Error(msg.as_deref().map(boxed).transpose()?),
+        // A map-family stage is left as written: its body is positioned per
+        // member by `eval_map_family_positioned`, never rewritten against
+        // the container's own position (#2471).
+        Expr::Builtin(Builtin::Map(_) | Builtin::MapValues(_) | Builtin::WithEntries(_)) => {
+            expr.clone()
+        }
+        // A definition is a transparent construct with no rewriter arm of
+        // its own: evaluated at the position through the prefetch hook,
+        // where the owned identity pipe binds it exactly as evaluation does.
+        Expr::FuncDef { .. } => match at.prefetch {
+            Some(prefetch) => prefetched_literal(prefetch(expr)?),
+            None => {
+                debug_assert!(
+                    false,
+                    "path_context_resolvable refuses a definition without a prefetch"
+                );
+                expr.clone()
+            }
+        },
+        // spine 2416 (walk residue): a bound call whose body calls something
+        // is evaluated at the position rather than rewritten as a whole --
+        // see [`path_context_resolvable`]'s arm of the same name.
+        Expr::DefCall { def, .. }
+            if crate::jq::walk::any_subexpr(&def.body, &mut |e| {
+                matches!(e, Expr::DefCall { .. } | Expr::FuncCall { .. })
+            }) =>
+        {
+            match at.prefetch {
+                Some(prefetch) => prefetched_literal(prefetch(expr)?),
+                None => {
+                    debug_assert!(
+                        false,
+                        "path_context_resolvable refuses a nested call without a prefetch"
                     );
                     expr.clone()
                 }
@@ -14672,8 +15808,38 @@ fn path_context_resolve_constants<S: EvalSemantics>(
             Expr::Shared(Rc::new(path_context_resolve_constants::<S>(inner, at)?))
         }
         Expr::Alternative(left, right) => Expr::Alternative(boxed(left)?, boxed(right)?),
-        other => other.clone(),
+        // A `|=` is left as written: its filter stands at the *target* and is
+        // positioned by `eval::update_path` from the prefix the caller
+        // installs (#2522), never rewritten here -- and never prefetched,
+        // which would evaluate the whole update to resolve it and arrive
+        // back here.
+        Expr::Update { .. } => expr.clone(),
+        // Reached only for a construct `needs_path_context` descends into
+        // and no arm above spells; every gate refuses such a shape
+        // ([`path_context_resolvable`]'s own `_` arm), so this is the
+        // assertion, not a fallback.
+        other => {
+            debug_assert!(
+                false,
+                "path_context_resolvable refuses a construct with no rewriter arm: {other:?}"
+            );
+            other.clone()
+        }
     })
+}
+
+/// The literal of a prefetched sub-expression's outputs: `empty` for none,
+/// the value for one, a comma of them for several.
+fn prefetched_literal(values: Vec<OwnedValue>) -> Expr {
+    let mut values: Vec<Expr> = values
+        .into_iter()
+        .map(|v| Expr::TrackedVar(Rc::new(v)))
+        .collect();
+    match values.len() {
+        0 => Expr::Builtin(Builtin::Empty),
+        1 => values.pop().expect("len checked"),
+        _ => Expr::Comma(values),
+    }
 }
 
 /// The literal `parent(n)` answers with at `at`, for
@@ -14748,24 +15914,36 @@ fn try_path_context_absent_sink<S: EvalSemantics, V: DocumentValue>(
                 ),
                 Err(e) => Flow::Escaped(Control::Error(e)),
             },
-            PathNode::Absent => match route {
-                AbsentRestRoute::Constants => {
-                    match path_context_resolve_absent_stages::<S, V>(rest, pos) {
-                        Ok(resolved) => {
-                            eval_each_owned::<S>(&resolved, &OwnedValue::Null, false, &mut |v| {
-                                sink(GenericItem::Owned(v))
-                            })
+            // spine 2416 (walk residue): an owned node (`PathNode::Owned`)
+            // is answered exactly as an absent one, over its own value
+            // instead of `null` -- its position is the same shape, the
+            // deepest live ancestor plus the components taken past it.
+            PathNode::Absent | PathNode::Owned(_) => {
+                let owned: OwnedValue = match &pos.node {
+                    PathNode::Owned(v) => (**v).clone(),
+                    _ => OwnedValue::Null,
+                };
+                match route {
+                    AbsentRestRoute::Constants => {
+                        match path_context_resolve_absent_stages::<S, V>(rest, pos) {
+                            Ok(resolved) => {
+                                eval_each_owned::<S>(&resolved, &owned, false, &mut |v| {
+                                    sink(GenericItem::Owned(v))
+                                })
+                            }
+                            Err(e) => Flow::Escaped(Control::Error(e)),
                         }
-                        Err(e) => Flow::Escaped(Control::Error(e)),
+                    }
+                    AbsentRestRoute::OwnedIdentity => {
+                        match path_context_absent_identity::<V>(pos) {
+                            Ok(id) => {
+                                eval_owned_identity_pipe::<S, V>(rest, owned, id, false, sink)
+                            }
+                            Err(e) => Flow::Escaped(Control::Error(e)),
+                        }
                     }
                 }
-                AbsentRestRoute::OwnedIdentity => match path_context_absent_identity::<V>(pos) {
-                    Ok(id) => {
-                        eval_owned_identity_pipe::<S, V>(rest, OwnedValue::Null, id, false, sink)
-                    }
-                    Err(e) => Flow::Escaped(Control::Error(e)),
-                },
-            },
+            }
         };
         match flow {
             Flow::Exhausted => {}
@@ -14774,7 +15952,7 @@ fn try_path_context_absent_sink<S: EvalSemantics, V: DocumentValue>(
     }
     Some(match stepped {
         Ok(()) => Flow::Exhausted,
-        Err(e) => Flow::Escaped(Control::Error(e)),
+        Err(control) => Flow::Escaped(control),
     })
 }
 
@@ -15842,7 +17020,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 return match path_walk_generic::<S, V>(
                     path_expr,
                     &PathNode::At(root),
-                    &PathTrail::root(),
+                    &PathTrail::from_slice(&[]),
                     &mut out,
                 ) {
                     Ok(()) => owned_vec_to_generic_result(out),
@@ -16146,20 +17324,49 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             .expect("guarded")
             .document_parent()
             .map_or(GenericResult::None, GenericResult::OneCursor),
-        // Only a literal `n` is answered here (`path_context_single_native`
-        // admits nothing else): a computed `n` is evaluated against the
-        // current value by the eager arm, which keeps that shape.
-        Builtin::ParentN(n_expr) if cursor.is_some() && matches!(**n_expr, Expr::Literal(_)) => {
+        // spine 2416 (walk residue): `n` is evaluated against the current
+        // value with the cursor, one hop per output, so a computed `n` is
+        // answered here too (it used to be the eager evaluator's alone).
+        Builtin::ParentN(n_expr) if cursor.is_some() => {
             let c = cursor.expect("guarded");
-            let Expr::Literal(lit) = &**n_expr else {
-                unreachable!("guarded")
+            let depth = match cursor_path_and_ancestors(&c) {
+                Ok((path, _)) => path.len(),
+                Err(e) => return GenericResult::Error(e),
             };
-            let depth = cursor_path_and_ancestors(&c).map(|(path, _)| path.len());
-            match depth.and_then(|depth| classify_parent_n::<S>(&literal_to_owned(lit), depth)) {
-                Ok(n) => {
-                    cursor_ancestor(&c, n).map_or(GenericResult::None, GenericResult::OneCursor)
+            let (counts, control) =
+                stream_owned_outputs_generic::<S, V>(n_expr, value, optional, cursor);
+            let mut ancestors: Vec<V::Cursor> = Vec::new();
+            let mut failure = control;
+            for n_value in counts {
+                if failure.is_some() {
+                    break;
                 }
-                Err(e) => GenericResult::Error(e),
+                match classify_parent_n::<S>(&n_value, depth) {
+                    Ok(n) => ancestors.extend(cursor_ancestor(&c, n)),
+                    Err(e) => failure = Some(Control::Error(e)),
+                }
+            }
+            match failure {
+                None => match ancestors.len() {
+                    0 => GenericResult::None,
+                    1 => GenericResult::OneCursor(ancestors[0]),
+                    _ => GenericResult::ManyCursor(ancestors),
+                },
+                Some(control) => {
+                    let mut prefix = vec_with_capacity(ancestors.len());
+                    for a in ancestors {
+                        // STYLE-0012: a decode failure while rendering an
+                        // ancestor already produced before `n`'s own escape
+                        // is the error, whatever `optional` says -- the
+                        // secondary-failure rule `path_context_items_to_owned`
+                        // and `resolve_terminal_prefix` apply.
+                        match to_owned_cursor(&a) {
+                            Ok(v) => prefix.push(v),
+                            Err(e) => return partial_generic(prefix, Control::Error(e)),
+                        }
+                    }
+                    partial_generic(prefix, control)
+                }
             }
         }
         // #2427: answered from the ambient `--eval-all` file-origin table
@@ -16414,19 +17621,48 @@ enum OwnedIdentityRule {
     /// `.a.b | key | tostring | key` is `"b"` again (any other rule builds
     /// an ordinary node at the same position, which clears the flag).
     KeyNode,
+    /// A bare bound variable as a stage (`$x`, spine 2416's walk residue):
+    /// the value keeps the position when it *is* the stage's input (the
+    /// `. as $x | $x` passthrough) and is detached otherwise -- the same
+    /// value-equality rule `resolve_node` applies to a `TrackedVar`'s
+    /// `path()` trackability. Captured from yq v4.53.3 on `a: {b: 1, e:
+    /// 2}`: `.a | . as $x | $x | key` is `"a"`, `. as $x | $x | key` prints
+    /// nothing (the root, #2421) and `.a.x as $x | $x | key` prints nothing.
+    /// yq's variables hold *nodes*, so `.a.b as $x | $x | key` is `"b"`
+    /// there where the bound value here is a value with no position; that
+    /// divergence predates this rule and is recorded in
+    /// `docs/compliance/yq/limitations.md`.
+    Bound,
 }
 
 fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
     use OwnedIdentityRule::{
-        Alternative, Detaches, DetachesContainer, Extremum, Keeps, KeyNode, LeftOperand, Slice,
+        Alternative, Bound, Detaches, DetachesContainer, Extremum, Keeps, KeyNode, LeftOperand,
+        Slice,
     };
     Some(match strip_parens(stage) {
         Expr::Slice { .. } => Slice,
+        // spine 2416 (walk residue): every format keeps, captured from yq
+        // v4.53.3 on `n: "42"`: `.n | @base64 | key`, `@base64d`, `@json`,
+        // `@csv`, `@sh`, `@uri`, `@tsv`, `@yaml` and `@props` all answer
+        // `"n"` (`@html`/`@text` are jq-only and follow).
         Expr::Array(_)
         | Expr::Not
-        | Expr::Format(FormatType::Json)
+        | Expr::Format(_)
         | Expr::Assign { .. }
         | Expr::Update { .. } => Keeps,
+        // A bound variable's use is a value by the time it is evaluated
+        // (`substitute_bound_var` replaces it before the body runs); the
+        // gate sees the body *before* the binding, so a bare `$x` stage is
+        // ruled here for what it will be.
+        Expr::TrackedVar(_) | Expr::Var(_) => Bound,
+        // spine 2416 (walk residue): the succinctly extensions neither
+        // reference can express (`range`/`repeat`/`while`/`until`), placed
+        // where the eager evaluator always placed them, at the stage's own
+        // input; `$__loc__`, `$ENV`, an unbound `$x` or `f` (which raise)
+        // and a module call start detached, like a literal.
+        Expr::Range { .. } | Expr::Repeat(_) | Expr::While { .. } | Expr::Until { .. } => Keeps,
+        Expr::Loc { .. } | Expr::Env | Expr::NamespacedCall { .. } => Detaches,
         // spine 2416 (identity pass). A compound assignment is a write like
         // `=`/`|=` (`.a | .b += key | key` is `"a"` in yq v4.53.3). A fold's
         // output is a succinctly extension in yq mode -- its lexer rejects
@@ -16455,6 +17691,9 @@ fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
         // false) | path` is `["a"]`.
         Expr::And(..) | Expr::Or(..) => LeftOperand,
         Expr::Alternative(..) => Alternative,
+        // The builtin match is exhaustive on purpose (spine 2416, walk
+        // residue): a new builtin is a compile error here, not a silent
+        // hand-over to an evaluator that no longer exists to answer it.
         Expr::Builtin(builtin) => match builtin {
             Builtin::ToString
             | Builtin::ToJson
@@ -16485,7 +17724,180 @@ fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
             | Builtin::Column
             | Builtin::Del(_)
             | Builtin::Select(_) => Keeps,
+            // spine 2416 (walk residue), captured from yq v4.53.3 (`.s | F
+            // | key` is `"s"`, `.s | F | path` is `["s"]`, `.x | F | key` is
+            // `"x"` where `F` accepts the value; the capture set is the
+            // pass's `cap/builtins0.txt`/`builtins1.txt`): `all`, `anchor`,
+            // `document_index`, `line_comment`, `split_doc`, `shuffle`,
+            // `trim`, `tonumber`, `to_unix`, `match`, `capture`, `sub`,
+            // `unique_by`, `omit`, `pick`, `to_json`... every one keeps.
+            Builtin::All
+            | Builtin::Anchor
+            | Builtin::DocumentIndex
+            | Builtin::LineComment
+            | Builtin::SplitDoc
+            | Builtin::Shuffle
+            | Builtin::Trim
+            | Builtin::ToNumber
+            | Builtin::ToUnix
+            | Builtin::Match(_)
+            | Builtin::MatchFlags(..)
+            | Builtin::Capture(_)
+            | Builtin::CaptureFlags(..)
+            | Builtin::Sub(..)
+            | Builtin::SubFlags(..)
+            | Builtin::TestFlags(..)
+            | Builtin::UniqueBy(_)
+            | Builtin::Omit(_)
+            | Builtin::Pick(_) => Keeps,
+            // The jq-only surface (real yq's lexer rejects each of these):
+            // a value computed from the node stands where the node stood,
+            // the model every captured `Keeps` row above follows and the
+            // placement the eager evaluator gave them.
+            Builtin::Abs
+            | Builtin::Acos
+            | Builtin::Acosh
+            | Builtin::Add
+            | Builtin::AllCond(..)
+            | Builtin::AllF(_)
+            | Builtin::AnyCond(..)
+            | Builtin::AnyF(_)
+            | Builtin::Arrays
+            | Builtin::Asin
+            | Builtin::Asinh
+            | Builtin::Atan
+            | Builtin::Atan2(..)
+            | Builtin::Atanh
+            | Builtin::BSearch(_)
+            | Builtin::Booleans
+            | Builtin::Ceil
+            | Builtin::Combinations
+            | Builtin::CombinationsN(_)
+            | Builtin::Cos
+            | Builtin::Cosh
+            | Builtin::Debug
+            | Builtin::DebugMsg(_)
+            | Builtin::DelPaths(_)
+            | Builtin::Endswith(_)
+            | Builtin::Exp
+            | Builtin::Exp10
+            | Builtin::Exp2
+            | Builtin::Explode
+            | Builtin::Fabs
+            | Builtin::Finites
+            | Builtin::FirstStream(_)
+            | Builtin::FlattenDepth(_)
+            | Builtin::Floor
+            | Builtin::FromJsonStream
+            | Builtin::FromStream(_)
+            | Builtin::FromUnix
+            | Builtin::Fromdate
+            | Builtin::Fromdateiso8601
+            | Builtin::Gmtime
+            | Builtin::Gsub(..)
+            | Builtin::GsubFlags(..)
+            | Builtin::Implode
+            | Builtin::In(_)
+            | Builtin::Index(_)
+            | Builtin::Indices(_)
+            | Builtin::Inside(_)
+            | Builtin::IsArray
+            | Builtin::IsBoolean
+            | Builtin::IsEmpty(_)
+            | Builtin::IsFinite
+            | Builtin::IsInfinite
+            | Builtin::IsNan
+            | Builtin::IsNormal
+            | Builtin::IsNull
+            | Builtin::IsNumber
+            | Builtin::IsObject
+            | Builtin::IsString
+            | Builtin::IsValid(_)
+            | Builtin::Iterables
+            | Builtin::LastStream(_)
+            | Builtin::LeafPaths
+            | Builtin::Limit(..)
+            | Builtin::Localtime
+            | Builtin::Log
+            | Builtin::Log10
+            | Builtin::Log2
+            | Builtin::Ltrim
+            | Builtin::Ltrimstr(_)
+            | Builtin::Mktime
+            | Builtin::Normals
+            | Builtin::NthStream(..)
+            | Builtin::Nulls
+            | Builtin::Numbers
+            | Builtin::Objects
+            | Builtin::Path(_)
+            | Builtin::Paths
+            | Builtin::PathsFilter(_)
+            | Builtin::Pow(..)
+            | Builtin::RecurseCond(..)
+            | Builtin::RecurseF(_)
+            | Builtin::Rindex(_)
+            | Builtin::Round
+            | Builtin::Rtrim
+            | Builtin::Rtrimstr(_)
+            | Builtin::Scalars
+            | Builtin::Scan(_)
+            | Builtin::ScanFlags(..)
+            | Builtin::SetPath(..)
+            | Builtin::Sin
+            | Builtin::Sinh
+            | Builtin::Skip(..)
+            | Builtin::SplitRegex(..)
+            | Builtin::Splits(_)
+            | Builtin::SplitsFlags(..)
+            | Builtin::Sqrt
+            | Builtin::Startswith(_)
+            | Builtin::Stderr
+            | Builtin::Strftime(_)
+            | Builtin::Strings
+            | Builtin::Strptime(_)
+            | Builtin::Tan
+            | Builtin::Tanh
+            | Builtin::ToBoolean
+            | Builtin::ToJsonStream
+            | Builtin::ToStream
+            | Builtin::Todate
+            | Builtin::Todateiso8601
+            | Builtin::Transpose
+            | Builtin::Trunc
+            | Builtin::TruncateStream(_)
+            | Builtin::Tz(_)
+            | Builtin::UpperIn(_)
+            | Builtin::UpperInSrc(..)
+            | Builtin::UpperIndex(_)
+            | Builtin::UpperIndexStream(..)
+            | Builtin::Utf8ByteLength
+            | Builtin::Values
+            | Builtin::Walk(_) => Keeps,
+            // A fresh tree with no relation to the input (spine 2416, walk
+            // residue). Captured from yq v4.53.3: `.s | now | key` prints
+            // nothing and `now | path` is `[]`, `.n | strenv(HOME) | key`
+            // and `env(HOME)` print nothing, `.n | load("f.yaml") | key`
+            // prints nothing (and `.a | key` inside it is `"a"`), `.p |
+            // pivot | path` is `[]`. `input`/`inputs` are another document,
+            // like `load`; `nan`/`infinite`/`null`, `builtins`,
+            // `$__loc__`-style metadata and `input_line_number` are
+            // literals, like any literal.
             Builtin::Keys | Builtin::KeysUnsorted | Builtin::WithEntries(_) => Detaches,
+            Builtin::Now
+            | Builtin::Env
+            | Builtin::EnvObject(_)
+            | Builtin::EnvVar(_)
+            | Builtin::StrEnv(_)
+            | Builtin::Load(_)
+            | Builtin::Pivot
+            | Builtin::Input
+            | Builtin::Inputs
+            | Builtin::InputLineNumber
+            | Builtin::Builtins
+            | Builtin::ModuleMeta
+            | Builtin::Nan
+            | Builtin::Infinite
+            | Builtin::NullLit => Detaches,
             // #2471: `key`/`path`/`file_index` replace the value with a
             // fresh scalar that keeps the node's position, so a later
             // path-context read is answered from the identity instead of
@@ -16494,8 +17906,29 @@ fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
             Builtin::Key => KeyNode,
             Builtin::PathNoArg | Builtin::FileIndex => Keeps,
             Builtin::Map(_) => DetachesContainer,
-            Builtin::Min | Builtin::Max => Extremum,
-            _ => return None,
+            // `min_by`/`max_by` pick a child exactly as `min`/`max` do
+            // (jq-only; the model is the captured `min`/`max` rule).
+            Builtin::Min | Builtin::Max | Builtin::MinBy(_) | Builtin::MaxBy(_) => Extremum,
+            // Navigation ([`owned_identity_nav_supported`]) and the stages
+            // `eval_owned_identity_stages` answers itself: no rule to need.
+            Builtin::GetPath(_)
+            | Builtin::First
+            | Builtin::Last
+            | Builtin::Nth(_)
+            | Builtin::Recurse
+            | Builtin::RecurseDown
+            // `at_offset`/`at_position` jump to another *document* node,
+            // answered from the cursor (`eval_builtin`) -- a node-preserving
+            // stage on the cursor route, and an error in the owned domain,
+            // which has no offsets to jump to.
+            | Builtin::AtOffset(_)
+            | Builtin::AtPosition(..)
+            | Builtin::Parent
+            | Builtin::ParentN(_)
+            | Builtin::Empty
+            | Builtin::Halt
+            | Builtin::HaltError
+            | Builtin::HaltErrorCode(_) => return None,
         },
         _ => return None,
     })
@@ -16547,6 +17980,15 @@ fn owned_identity_nav_supported(expr: &Expr) -> bool {
         // components; jq's own `path(getpath(["a","b"]))` is `["a","b"]`
         // (captured from jq 1.7.1), i.e. every component is taken.
         Expr::Builtin(Builtin::GetPath(path_expr)) => owned_identity_component_supported(path_expr),
+        // spine 2416 (walk residue): jq defines `first` as `.[0]`, `last` as
+        // `.[-1]` and `nth(n)` as `.[n]` (`path(.c | first)` is `["c",0]`,
+        // `path(.c | last)` is `["c",-1]`, `path(.c | nth(1))` is `["c",1]`,
+        // captured from jq 1.7.1), so they are the navigation they desugar
+        // to; real yq's lexer rejects all three. `..` is every descendant at
+        // its own position (#2428).
+        Expr::Builtin(Builtin::First | Builtin::Last) => true,
+        Expr::Builtin(Builtin::Nth(n)) => owned_identity_component_supported(n),
+        Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => true,
         Expr::Optional(inner) | Expr::Paren(inner) => owned_identity_nav_supported(inner),
         Expr::Pipe(exprs) => exprs.iter().all(owned_identity_nav_supported),
         _ => false,
@@ -16650,7 +18092,9 @@ fn owned_identity_pipe_supported_at(stages: &[Expr], unfolded: u8) -> bool {
             // ending the pipe here.
             Expr::Builtin(Builtin::Key | Builtin::PathNoArg | Builtin::FileIndex) => {}
             Expr::Builtin(Builtin::Parent) => {}
-            Expr::Builtin(Builtin::ParentN(n)) if matches!(**n, Expr::Literal(_)) => {}
+            // spine 2416 (walk residue): `n` is a value read at this
+            // position -- a constant, or a read the rewrite resolves here.
+            Expr::Builtin(Builtin::ParentN(n)) if owned_identity_stage_resolvable(n) => {}
             // #2471 sub-item 5: a read inside an operand is a constant for
             // a fixed identity -- the same rewrite the ruled `_` arm below
             // already applies -- so the stage is admitted when every operand
@@ -16970,78 +18414,19 @@ fn owned_identity_step<S: EvalSemantics, V: DocumentValue>(
             out.extend(current);
             Ok(())
         }
-        Expr::Slice {
-            start,
-            end,
-            start_key,
-            end_key,
-        } => {
-            let (values, control) = owned_identity_values::<S>(expr, value, optional);
-            if S::TAG == EvalTag::Yq {
-                out.extend(values.into_iter().map(|v| (v, id.clone())));
-            } else {
-                let parent = Rc::new(value.clone());
-                let component =
-                    slice_component_value(*start, start_key.as_ref(), *end, end_key.as_ref());
-                out.extend(
-                    values
-                        .into_iter()
-                        .map(|v| (v, id.child(&parent, component.clone()))),
-                );
-            }
-            control.map_or(Ok(()), Err)
-        }
-        Expr::Field(name) => {
-            let (values, control) = owned_identity_values::<S>(expr, value, optional);
+        // The four literal steps share [`owned_nav_children`] with the
+        // path-context walk's owned nodes: a component named here is the
+        // component named there.
+        Expr::Slice { .. } | Expr::Field(_) | Expr::Index { .. } | Expr::Iterate => {
+            let (children, control) = owned_nav_children::<S>(expr, value, optional);
             let parent = Rc::new(value.clone());
-            out.extend(
-                values
-                    .into_iter()
-                    .map(|v| (v, id.child(&parent, OwnedValue::String(name.clone())))),
-            );
-            control.map_or(Ok(()), Err)
-        }
-        Expr::Index { idx, key } => {
-            let (values, control) = owned_identity_values::<S>(expr, value, optional);
-            let mut component = index_component_value(*idx, key.as_ref());
-            if let Some(elements) = value.as_array() {
-                if *idx < 0 && S::TAG == EvalTag::Yq {
-                    let resolved = elements.len() as i64 + *idx;
-                    if resolved >= 0 {
-                        component = OwnedValue::Int(resolved);
-                    }
-                }
-            }
-            let parent = Rc::new(value.clone());
-            out.extend(
-                values
-                    .into_iter()
-                    .map(|v| (v, id.child(&parent, component.clone()))),
-            );
-            control.map_or(Ok(()), Err)
-        }
-        Expr::Iterate => {
-            let (values, control) = owned_identity_values::<S>(expr, value, optional);
-            let parent = Rc::new(value.clone());
-            let components: Vec<OwnedValue> = match value {
-                OwnedValue::Array(items) => (0..items.len())
-                    .map(|i| OwnedValue::Int(i as i64))
-                    .collect(),
-                OwnedValue::Object(map) => {
-                    map.keys().map(|k| OwnedValue::String(k.clone())).collect()
-                }
-                _ => Vec::new(),
-            };
-            // The owned evaluator yields exactly one value per member; a
-            // mismatch means the input was not a container after all (an
-            // error or, under `?`, nothing), in which case the components
-            // are unused.
-            out.extend(
-                values
-                    .into_iter()
-                    .zip(components)
-                    .map(|(v, component)| (v, id.child(&parent, component))),
-            );
+            out.extend(children.into_iter().map(|(component, v)| {
+                let vid = match component {
+                    Some(component) => id.child(&parent, component),
+                    None => id.clone(),
+                };
+                (v, vid)
+            }));
             control.map_or(Ok(()), Err)
         }
         Expr::IndexExpr { .. } | Expr::SliceExpr { .. } => {
@@ -17050,7 +18435,60 @@ fn owned_identity_step<S: EvalSemantics, V: DocumentValue>(
         Expr::Builtin(Builtin::GetPath(path_expr)) => {
             owned_identity_getpath_step::<S, V>(path_expr, value, id, optional, out)
         }
+        // spine 2416 (walk residue): the navigation `first`/`last`/`nth(n)`
+        // desugar to -- see `owned_identity_nav_supported`.
+        Expr::Builtin(Builtin::First) => owned_identity_step::<S, V>(
+            &Expr::Index { idx: 0, key: None },
+            value,
+            id,
+            optional,
+            out,
+        ),
+        Expr::Builtin(Builtin::Last) => owned_identity_step::<S, V>(
+            &Expr::Index { idx: -1, key: None },
+            value,
+            id,
+            optional,
+            out,
+        ),
+        Expr::Builtin(Builtin::Nth(n)) => owned_identity_computed_step::<S, V>(
+            &Expr::IndexExpr {
+                target: Box::new(Expr::Identity),
+                key: n.clone(),
+            },
+            value,
+            id,
+            false,
+            optional,
+            out,
+        ),
+        Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => {
+            owned_identity_recurse_step::<S, V>(value, id, out);
+            Ok(())
+        }
         _ => unreachable!("owned_identity_nav_supported admits no other shape"),
+    }
+}
+
+/// `..` over an owned value with identity (spine 2416, walk residue): the
+/// value itself, then every descendant in document order, each at its own
+/// position -- `recurse(.[]?)`, so a scalar ends its branch silently. The
+/// same order [`path_context_step_recurse`] gives the walk's nodes.
+fn owned_identity_recurse_step<S: EvalSemantics, V: DocumentValue>(
+    value: &OwnedValue,
+    id: &OwnedIdentity<V>,
+    out: &mut Vec<(OwnedValue, OwnedIdentity<V>)>,
+) {
+    assert_nesting_depth(id.ancestors.len());
+    out.push((value.clone(), id.clone()));
+    let (children, _suppressed) = owned_nav_children::<S>(&Expr::Iterate, value, true);
+    let parent = Rc::new(value.clone());
+    for (component, child) in children {
+        let child_id = match component {
+            Some(component) => id.child(&parent, component),
+            None => id.clone(),
+        };
+        owned_identity_recurse_step::<S, V>(&child, &child_id, out);
     }
 }
 
@@ -17500,6 +18938,11 @@ fn owned_identity_placed_by<S: EvalSemantics, V: DocumentValue>(
 ) -> Result<Option<OwnedIdentity<V>>, EvalError> {
     Ok(match rule {
         OwnedIdentityRule::Keeps | OwnedIdentityRule::KeyNode => Some(id.clone()),
+        OwnedIdentityRule::Bound => Some(if owned_value_eq::<S>(output, value) {
+            id.clone()
+        } else {
+            OwnedIdentity::detached()
+        }),
         OwnedIdentityRule::Slice => {
             let Expr::Slice {
                 start,
@@ -18263,7 +19706,7 @@ fn owned_identity_resolve_at<S: EvalSemantics, V: DocumentValue>(
             OwnedAncestor::None => None,
         })
     };
-    let prefetch = |sub: &Expr| -> Result<Expr, EvalError> {
+    let prefetch = |sub: &Expr| -> Result<Vec<OwnedValue>, EvalError> {
         owned_identity_prefetch::<S, V>(sub, value, id, optional, escaped)
     };
     path_context_resolve_constants::<S>(
@@ -18287,29 +19730,25 @@ fn owned_identity_prefetch<S: EvalSemantics, V: DocumentValue>(
     id: &OwnedIdentity<V>,
     optional: bool,
     escaped: &core::cell::RefCell<Option<Control>>,
-) -> Result<Expr, EvalError> {
+) -> Result<Vec<OwnedValue>, EvalError> {
     if escaped.borrow().is_some() {
-        return Ok(Expr::Builtin(Builtin::Empty));
+        return Ok(Vec::new());
     }
-    let mut values: Vec<Expr> = Vec::new();
+    let mut values: Vec<OwnedValue> = Vec::new();
     let flow = eval_owned_identity_stages::<S, V>(
         owned_identity_body_stages(sub),
         value.clone(),
         id.clone(),
         optional,
         OwnedIdentityTail::Pairs(&mut |v, _| {
-            values.push(Expr::TrackedVar(Rc::new(v)));
+            values.push(v);
             Flow::Exhausted
         }),
     );
     if let Flow::Escaped(control) = flow {
         *escaped.borrow_mut() = Some(control);
     }
-    Ok(match values.len() {
-        0 => Expr::Builtin(Builtin::Empty),
-        1 => values.pop().expect("len checked"),
-        _ => Expr::Comma(values),
-    })
+    Ok(values)
 }
 
 /// A stage's own flow, with an escape one of its prefetches left behind
@@ -18398,18 +19837,42 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
         Expr::Builtin(Builtin::Parent) => {
             continue_owned_identity_ancestor::<S, V>(rest, &value, &id, 1, optional, tail)
         }
+        // spine 2416 (walk residue): one hop per output of `n`, evaluated
+        // at this position -- the fan-out the eager evaluator gave
+        // `parent((1,2))` (`.a.b | parent((1,2)) | path` is `["a"]`, `[]`).
         Expr::Builtin(Builtin::ParentN(n_expr)) => {
-            let Expr::Literal(lit) = &**n_expr else {
-                unreachable!("owned_identity_pipe_supported admits a literal n only")
-            };
-            let n = match id
-                .path()
-                .and_then(|path| classify_parent_n::<S>(&literal_to_owned(lit), path.len()))
-            {
-                Ok(n) => n,
+            let escaped = core::cell::RefCell::new(None);
+            let resolved =
+                match owned_identity_resolve_at::<S, V>(n_expr, &value, &id, optional, &escaped) {
+                    Ok(e) => e,
+                    Err(e) => return Flow::Escaped(Control::Error(e)),
+                };
+            let (counts, control) = owned_identity_values::<S>(&resolved, &value, optional);
+            let depth = match id.path() {
+                Ok(path) => path.len(),
                 Err(e) => return Flow::Escaped(Control::Error(e)),
             };
-            continue_owned_identity_ancestor::<S, V>(rest, &value, &id, n, optional, tail)
+            for n_value in counts {
+                let n = match classify_parent_n::<S>(&n_value, depth) {
+                    Ok(n) => n,
+                    Err(e) => return Flow::Escaped(Control::Error(e)),
+                };
+                match continue_owned_identity_ancestor::<S, V>(
+                    rest,
+                    &value,
+                    &id,
+                    n,
+                    optional,
+                    tail.reborrow(),
+                ) {
+                    Flow::Exhausted => {}
+                    other => return other,
+                }
+            }
+            match control.or_else(|| escaped.into_inner()) {
+                Some(control) => Flow::Escaped(control),
+                None => Flow::Exhausted,
+            }
         }
         Expr::Alternative(left, right) => {
             // spine 2416 (identity pass): a read inside either side is
@@ -18865,7 +20328,10 @@ fn owned_identity_leaving_cursor<S: EvalSemantics, V: DocumentValue>(
         } else {
             id
         })),
-        OwnedIdentityRule::LeftOperand | OwnedIdentityRule::Extremum | OwnedIdentityRule::Slice => {
+        OwnedIdentityRule::LeftOperand
+        | OwnedIdentityRule::Extremum
+        | OwnedIdentityRule::Slice
+        | OwnedIdentityRule::Bound => {
             // STYLE-0012: the stage that produced `output` already
             // materialized this node under the same `optional`, so a decode
             // failure here cannot be the first one seen; it raises as the
@@ -27930,8 +29396,10 @@ mod tests {
         // ...but `?` over something that is not navigation still is not.
         assert!(!walkable("key? | tostring"));
         assert!(!walkable("(.a | tostring)? | key"));
+        // A computed `parent(n)` is walkable since spine 2416's walk residue
+        // (`n` is evaluated at the position like a bracket's component).
+        assert!(walkable(".a | parent(1 + 1)"));
         // Shapes the walk does not model at all.
-        assert!(!walkable(".a | parent(1 + 1)"));
         assert!(!walkable(".a | select(true) | key"));
         assert!(!walkable(".a | key | tostring"));
     }
@@ -28112,7 +29580,10 @@ mod tests {
         // ...and stays eager where it has no rule, where the stage itself
         // reads path context, or where a later stage does so in a shape the
         // constants cannot express.
-        assert!(eager(".a | explode | key"), "no identity rule");
+        // Every builtin has an identity rule since spine 2416's walk residue
+        // (`explode` is jq-only and keeps, like every scalar-producing
+        // builtin), so no builtin stage hands over any more.
+        assert!(!eager(".a | explode | key"));
         // A stage that itself reads path context is a stage of the owned
         // identity pipe since the identity pass (the read is a constant at
         // the head's position), so this shape is the absent route's now.
@@ -28163,13 +29634,12 @@ mod tests {
             eager(".[] | .k | select(key == \"k\")"),
             "a fan-out head collects one position per element"
         );
-        // A stage with no identity rule still has nothing to carry the
-        // position through it, on either route.
-        assert!(eager(".a.b | explode | key"), "no identity rule");
-        // `parent(n)` with a computed `n` is refused by both routes: the
-        // hop count would have to be evaluated against a position that may
-        // not exist.
-        assert!(eager(".a.b | [path, parent(1 + 0)]"));
+        // spine 2416 (walk residue): every builtin has an identity rule and
+        // a computed `parent(n)` is evaluated at the position, so neither
+        // shape hands over any more -- the absent route's identity half
+        // carries both.
+        assert!(!eager(".a.b | explode | key"));
+        assert!(!eager(".a.b | [path, parent(1 + 0)]"));
         // #2416 phase 3, this PR: `as` is now single-native
         // (`collect_each_generic` over `each_as_generic`), so a pipe with it
         // as the last stage runs generically -- same admission `if`/`limit`/
@@ -28255,17 +29725,26 @@ mod tests {
         assert!(!eager(".[] | key and parent"));
         assert!(!eager(".[] | {\"k\": (key and true)}"));
         // ...an operand that is a nested pipe is native since the identity
-        // pass (the owned identity pipe answers it), while a computed
-        // `parent(n)` still keeps the pipe on the eager route -- the hop
-        // count would have to be evaluated against a position that may not
-        // exist.
+        // pass (the owned identity pipe answers it), and a computed
+        // `parent(n)` is evaluated at the position since spine 2416's walk
+        // residue (`eval_builtin` runs `n` with the cursor), so neither keeps
+        // the pipe eager.
         assert!(!eager(".[] | (key | tostring) and true"));
-        assert!(eager(".[] | parent(1 + 0)"));
+        assert!(!eager(".[] | parent(1 + 0)"));
         // A bounded consumer's body is run through the owned identity pipe
         // (identity pass), so a head that can miss no longer keeps the
         // outer pipe eager on the body's account.
         assert!(!eager(".x | first(.a | tostring | key)"));
-        assert!(!eager(".x | first(.a | parent | parent)"));
+        // ...while a `first` over pure navigation is *navigation* since spine
+        // 2416's walk residue, so the whole pipe is the walk's and the absent
+        // route leaves it there. Asked of the gate alone, as here, it is a
+        // `parent` read after a head that can miss -- the answer the gate
+        // has to keep giving for the bridge-only parity route, where the
+        // walk is switched off (`tests/jq_evaluator_parity_tests.rs`).
+        assert!(eager(".x | first(.a | parent | parent)"));
+        assert!(
+            path_context_walk_split(&pipe_stages(".x | first(.a | parent | parent)")).is_some()
+        );
         assert!(!eager(".x[] | first(.a | parent | parent)"));
         // #2558: `?` over navigation is navigational now, so a head that
         // ends in one is routed like any other -- `docs/plan/path-context-
@@ -28301,11 +29780,10 @@ mod tests {
         // `?` over a non-navigational stage is a `try` with no handler in
         // the owned identity pipe (identity pass), so it is routed too.
         assert!(!eager(".a | (key | tostring)? | key"));
-        // A `?` head does not rescue a stage no route can name a position
-        // for -- a builtin with no identity rule -- while `|=` and a `map`
-        // body are that pipe's since the identity pass.
+        // `|=`, a `map` body and (since spine 2416's walk residue) every
+        // builtin are the identity route's after a `?` head.
         assert!(!eager(".a? | .b |= key"));
-        assert!(eager(".a? | explode | key"));
+        assert!(!eager(".a? | explode | key"));
         assert!(!eager(".a? | map(key + \"x\")"));
         // #2563: an `as` stage has an identity rule now -- the binding keeps
         // the input's position for its body -- so a `?` head no longer keeps
@@ -28332,13 +29810,13 @@ mod tests {
                 .is_some()
         );
         // ...and so is every body the identity pass gave a rule or an arm to
-        // (`and`/`or`, a `map` body, a fold, a `label`), while a bare `$x`
-        // stage still keeps the whole pipe eager (`Expr::Var` has no rule
-        // before substitution and `Expr::TrackedVar` has none after, so the
-        // gate refuses it either way).
+        // (`and`/`or`, a `map` body, a fold, a `label`), and a bare `$x`
+        // stage since spine 2416's walk residue (`OwnedIdentityRule::Bound`:
+        // the gate sees `Expr::Var` before the binding runs, the evaluator
+        // the `Expr::TrackedVar` substitution leaves, and both are ruled).
         assert!(!eager(".a.b | . as $x | (key and parent)"));
         assert!(!eager(".a.b | . as $x | map(key + \"x\")"));
-        assert!(eager(".a.b | . as $x | $x | key"));
+        assert!(!eager(".a.b | . as $x | $x | key"));
         assert!(!eager(".a.b | . as $x | reduce (key) as $k (\"\"; . + $k)"));
         assert!(!eager(".a.b | . as $x | label $o | (key, break $o)"));
         // A bind source that reads `parent` resolves at this position too
@@ -28379,28 +29857,57 @@ mod tests {
         assert!(!eager(".c[.n] | tostring | key"));
         assert!(!eager(".c[.n] | select(key == 0)"));
         assert!(!eager(".c[.n] | {k: key}"));
-        // Three shapes stay exactly where they were, each for its own
-        // reason. A component that can *escape* has no room in the walk's
-        // `Result<(), EvalError>` step ...
-        assert!(eager(".c[halt] | key"));
-        // ... a component that *fans out* would make the bracket a fan-out
-        // head, and a fan-out head over absent positions loses its position
-        // once the pipe leaves the walk (`(.c[0], .c[1]) | key` on `c: []`
-        // is empty with no computed bracket in it at all) ...
+        // spine 2416 (walk residue): the three head shapes the admission
+        // used to refuse are walked now. As with `.c[.n] | key` above, a
+        // whole-walkable pipe is the walk's, and asked of the gate *alone* it
+        // still reports the head that can miss (the bridge-only parity
+        // route's answer); `walked` is the half that says which route runs.
+        let walked = |f: &str| path_context_walk_split(&pipe_stages(f)).is_some();
+        // A component that can *escape* is carried by the step's
+        // `Result<(), Control>` ...
+        assert!(walked(".c[halt] | key"));
+        assert!(path_context_is_navigational(&parse(".c[halt]").unwrap()));
+        // ... a component that *fans out* is a fan-out head
+        // (`path_context_fans_out` reads the component now): `.c[(0,1)] |
+        // key` is the walk's (paths-only fan-out), and a fan-out head that
+        // can miss followed by anything else stays eager *by design* --
+        // asked of the gate alone, as here, both report the residue
+        // (`fanout_head_can_lose_position`), which is also what closed the
+        // `(.c[0], .c[5]) | tostring | key` gap the old comment named ...
         assert!(eager(".c[(0,1)] | key"));
+        assert!(path_context_walk_split(&pipe_stages(".c[(0,1)] | key")).is_some());
         assert!(eager(".c[(0,1)] | tostring | key"));
-        // ... and a slice or a `getpath` can land on a value that is not a
-        // document node at all, which `PathNode` cannot carry.
-        assert!(eager(".c[.n:.m] | key"));
-        assert!(eager(".c[.n:.m] | .[0] | key"));
-        assert!(eager(".c[0:1] | .[0] | key + 1"));
-        assert!(eager("getpath([\"a\",\"b\"]) | key"));
-        assert!(!path_context_is_navigational(&parse(".c[.n:.m]").unwrap()));
-        assert!(!path_context_is_navigational(
+        assert!(eager("(.c[0], .c[5]) | tostring | key"));
+        assert!(
+            !eager(".a | .[] | tostring | key"),
+            "no absence after the fan-out"
+        );
+        // ... and a slice or a `getpath` head stands on `PathNode::Owned`.
+        assert!(walked(".c[.n:.m] | key"));
+        assert!(walked(".c[.n:.m] | .[0] | key"));
+        assert!(!eager(".c[0:1] | .[0] | key + 1"), "the absent route's");
+        assert!(walked("getpath([\"a\",\"b\"]) | key"));
+        assert!(path_context_is_navigational(&parse(".c[.n:.m]").unwrap()));
+        assert!(path_context_is_navigational(
             &parse("getpath([\"a\"])").unwrap()
         ));
         assert!(path_context_is_navigational(&parse(".c[.n]").unwrap()));
         assert!(path_context_is_navigational(&parse(".c[.n]?").unwrap()));
+        // The other heads the walk residue carries: `..` (#2428), the
+        // transparent wrappers, and a computed `parent(n)` -- and a builtin
+        // with no rule is no longer a shape at all.
+        assert!(walked(". | [.. | key]"));
+        assert!(walked(".a | [.. | key]"));
+        assert!(!eager(".. | {\"k\": key}"));
+        assert!(walked("(try .[] catch \"C\") | key"));
+        assert!(!eager("first((.[], error(\"x\"))) | key"));
+        assert!(!eager("(def f: .[]; f) | key"));
+        assert!(walked(".a.b | parent(0+1) | key"));
+        assert!(!eager(".a.b | parent(0+1) | (key and parent)"));
+        assert!(!eager(".a.b | parent | key + \"x\""));
+        assert!(!eager(".s | sub(\"x\";\"y\") | key"));
+        assert!(!eager(".a | . as $x | $x | key"));
+        assert!(!eager(".a.b | def f(x): x; f(key) + \"z\""));
     }
 
     /// The absent route's gate and its rewriter are two descriptions of one
@@ -28501,10 +30008,14 @@ mod tests {
                 "`{filter}` is the identity route's business (#2472)"
             );
         }
-        // A `parent(n)` whose `n` is not a literal is refused by both: the
-        // hop count would have to be evaluated against a position that may
-        // not exist.
-        assert!(!owned_identity_stage_resolvable(
+        // A `parent(n)` whose `n` is not a literal is the identity route's
+        // since spine 2416's walk residue -- `n` is evaluated at the position
+        // through the prefetch hook -- and still refused by the constant
+        // route, which has no evaluation to offer.
+        assert!(owned_identity_stage_resolvable(
+            &parse("parent(1 + 0)").unwrap()
+        ));
+        assert!(!path_context_absent_resolvable(
             &parse("parent(1 + 0)").unwrap()
         ));
     }
@@ -28613,9 +30124,11 @@ mod tests {
         // refuses it and the identity route, which evaluates `rest` itself
         // from a position it carries, takes it.
         assert_eq!(split(".a.b | tostring | key"), Some((1, 2, OwnedIdentity)));
-        // Neither route: `explode` has no identity rule, so there is
-        // nothing to carry the position through it.
-        assert_eq!(split(".a.b | explode | key"), None);
+        // `explode` has an identity rule since spine 2416's walk residue
+        // (every builtin has one; it is jq-only, and keeps like every other
+        // scalar-producing builtin), so the identity route carries the
+        // position through it.
+        assert_eq!(split(".a.b | explode | key"), Some((1, 2, OwnedIdentity)));
         // #2558: a `?` head is part of the navigational head now, so the
         // split finds one instead of stopping before it and declining.
         assert_eq!(split(".a? | select(key == \"a\")"), Some((1, 1, Constants)));
