@@ -21532,6 +21532,52 @@ fn test_def_shadow_deep_nesting_does_not_blow_up_2036() -> Result<()> {
     Ok(())
 }
 
+/// #2149: `key`/`path` (no arg) followed by more stages in the same pipe
+/// used to refuse the fast cursor walk entirely and fall back to
+/// materializing the whole document once per element -- `cursor_key`'s
+/// array arm answers "what index am I" with a sibling scan from the
+/// array's first element every time, so `.[] | key | tostring` cost
+/// O(position) per element, O(n) calls, O(n^2) total. Live-verified
+/// before the fix: a 200,000-element array took ~131s user time for
+/// `.[] | key | tostring` against ~0.6s for `.[] | key` alone -- a ~220x
+/// slowdown from one stage, confirming O(n^2) rather than a constant-factor
+/// cost (a ~100x growth in input size should cost ~100x more for O(n), but
+/// cost ~10,000x more for O(n^2); the actual ~131s/0.6s stands in between
+/// because `.[] | key` alone is not the true O(n) baseline for this
+/// comparison, only a sibling data point). Pinned as a timing regression
+/// guard, the same shape `test_def_shadow_deep_nesting_does_not_blow_up_2036`
+/// uses: a size a true O(n^2) blowup would multiply into tens of seconds,
+/// generous margin against a working O(n) fix.
+#[test]
+fn test_key_then_more_stages_does_not_blow_up_2149() -> Result<()> {
+    let n = 100_000;
+    let input = format!(
+        "[{}]",
+        (0..n)
+            .map(|i| format!("{{\"a\":{i}}}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let start = std::time::Instant::now();
+    let (stdout, stderr, code) = run_jq_full(&["-c", ".[] | key | tostring"], Some(&input))?;
+    let elapsed = start.elapsed();
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    let lines: Vec<&str> = stdout.trim_end().lines().collect();
+    assert_eq!(lines.len(), n);
+    assert_eq!(lines[0], "\"0\"");
+    assert_eq!(lines[n - 1], format!("\"{}\"", n - 1));
+    // See this test's own doc comment: a true O(n^2) regression at this
+    // size would cost tens of seconds, not merely approach this bound --
+    // extrapolating the live pre-fix measurement (~131s at 200,000
+    // elements) to 100,000 elements is ~33s. A working O(n) fix finishes
+    // in well under a second even under CI contention.
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "{n} elements of `.[] | key | tostring` took {elapsed:?} -- O(n^2) regressed"
+    );
+    Ok(())
+}
+
 /// #2036 review, round 2: a genuinely empty `NAME()` must stay a syntax
 /// error even once `NAME` is a shadow candidate -- an earlier draft's
 /// arity-mismatch fallback (`Self::parse_func_call_or_error`) accepted `()`
