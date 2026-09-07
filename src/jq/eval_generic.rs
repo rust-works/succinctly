@@ -13742,6 +13742,29 @@ fn path_component_step_expr(component: &OwnedValue) -> Option<Expr> {
     })
 }
 
+/// `key`/`path` (no arg)'s value at `pos` -- shared by
+/// `path_context_walk_generic`'s own terminal arm and
+/// `path_context_walk_pipe`'s emitting-stage-then-more-stages case (#2149).
+/// `Ok(None)` only for `key` at the document root, which emits nothing
+/// (see the caller's own doc comment for why).
+fn path_context_emitting_value<V: DocumentValue>(
+    expr: &Expr,
+    pos: &PathContextPos<V>,
+) -> Result<Option<OwnedValue>, EvalError> {
+    match expr {
+        Expr::Builtin(Builtin::PathNoArg) => Ok(Some(OwnedValue::Array(pos.path.clone()))),
+        Expr::Builtin(Builtin::Key) => match pos.path.last() {
+            Some(OwnedValue::Int(i)) if *i < 0 => match &pos.node {
+                PathNode::At(c) => cursor_key(c),
+                _ => Ok(Some(OwnedValue::Int(*i))),
+            },
+            Some(key) => Ok(Some(key.clone())),
+            None => Ok(None),
+        },
+        _ => unreachable!("path_context_emitting_value called on a non-Key/PathNoArg expr"),
+    }
+}
+
 /// Walk one emitting expression from `pos`, delivering each output to `sink`
 /// as it is produced.
 ///
@@ -13793,13 +13816,11 @@ fn path_context_walk_generic<S: EvalSemantics, V: DocumentValue>(
             walked?;
             Ok(sink(GenericItem::Owned(OwnedValue::Array(items))))
         }
-        Expr::Builtin(Builtin::PathNoArg) => Ok(sink(GenericItem::Owned(OwnedValue::Array(
-            pos.path.clone(),
-        )))),
         // `key` at the document root emits nothing: real yq prints nothing
         // there (#2421, captured live from v4.53.3), and jq has no `key` at
         // all, so its jq-mode extension follows yq. (The eager evaluator's
-        // `null` is #2421's remaining half.)
+        // `null` is #2421's remaining half.) `path` never has this case --
+        // the root's own path is `[]`, not absent.
         //
         // `key` is a property of the *node* (ADR-0021 decision 2) and the
         // trail's last component normally spells it, so reading the trail is
@@ -13810,19 +13831,15 @@ fn path_context_walk_generic<S: EvalSemantics, V: DocumentValue>(
         // is `1`, which is what yq v4.53.3 answers for `.c[-1] | key` on
         // `c: [10, 20]` (captured live; `[20,1]`, and `[10,0]` for `-2`).
         // Only then is the sibling scan paid, so `[.[] | key]` keeps its
-        // per-element constant.
-        Expr::Builtin(Builtin::Key) => match pos.path.last() {
-            Some(OwnedValue::Int(i)) if *i < 0 => match &pos.node {
-                PathNode::At(c) => match cursor_key(c) {
-                    Ok(Some(k)) => Ok(sink(GenericItem::Owned(k))),
-                    Ok(None) => Ok(Demand::Continue),
-                    Err(e) => Err(Control::Error(e)),
-                },
-                _ => Ok(sink(GenericItem::Owned(OwnedValue::Int(*i)))),
-            },
-            Some(key) => Ok(sink(GenericItem::Owned(key.clone()))),
-            None => Ok(Demand::Continue),
-        },
+        // per-element constant. Shared with `path_context_walk_pipe`'s own
+        // `Key`/`PathNoArg`-then-more-stages case (#2149).
+        Expr::Builtin(Builtin::PathNoArg | Builtin::Key) => {
+            match path_context_emitting_value(expr, pos) {
+                Ok(Some(v)) => Ok(sink(GenericItem::Owned(v))),
+                Ok(None) => Ok(Demand::Continue),
+                Err(e) => Err(Control::Error(e)),
+            }
+        }
         _ => {
             let mut heads = Vec::new();
             let stepped = path_context_step_generic::<S, V>(expr, pos, &mut heads);
@@ -13867,10 +13884,14 @@ fn path_context_walk_pipe<S: EvalSemantics, V: DocumentValue>(
 /// whole pipe to the materializing bridge. Decided entirely before any
 /// output, which is what lets the walk emit to a sink at all.
 ///
-/// Two shapes are walked: every stage (then `rest` is empty), or just the
-/// first stage when nothing after it needs path context. A pipe whose first
-/// stage is walkable but whose later stages need path context in a way the
-/// walk does not model (`.a | key | tostring`) goes to the bridge whole.
+/// Three shapes are walked: every stage (then `rest` is empty); just the
+/// first stage when nothing after it needs path context; or (#2149) a
+/// longer navigational run ending on `key`/`path` (no arg), again when
+/// nothing after it needs path context -- `.a | key | tostring` no longer
+/// goes to the bridge whole just because `tostring` follows `key`; only a
+/// *second* path-context builtin in `rest` still does (see
+/// [`path_context_walked_emitting_prefix_len`]'s own doc for why that
+/// narrower shape stays refused).
 ///
 /// A fan-out head used to be refused here and left to the eager evaluator,
 /// on the grounds that materializing a node per branch is a backward jump
@@ -13890,9 +13911,39 @@ fn path_context_walk_split(exprs: &[Expr]) -> Option<(&[Expr], &[Expr])> {
     } else if path_context_is_cursor_walkable(first) && !exprs[1..].iter().any(needs_path_context) {
         (&exprs[..1], &exprs[1..])
     } else {
-        return None;
+        let len = path_context_walked_emitting_prefix_len(exprs)?;
+        (&exprs[..len], &exprs[len..])
     };
     Some((walked, rest))
+}
+
+/// (#2149) The length of a walkable prefix ending on `key`/`path` (no arg),
+/// for a pipe where that isn't already `exprs`'s bare first stage (the
+/// branch just above covers that case): a navigational run immediately
+/// followed by one emitting stage, with a `rest` that needs no path context
+/// of its own -- the same `!rest.iter().any(needs_path_context)` condition
+/// the first-stage-only branch already applies, generalized to a longer
+/// walked prefix.
+///
+/// `rest` containing a *second* `key`/`path`/`parent` is refused rather
+/// than resolved: real yq's own answer for that shape does not settle into
+/// one coherent rule to reproduce (`key | key` is empty, `key | (key +
+/// 100)` is a constant unrelated to the element, `key | path` wraps the
+/// value itself in an array -- all live-verified against v4.53.3), so it
+/// stays on the bridge, matching this function's own one-directional
+/// contract (declining costs an optimization, never an answer).
+fn path_context_walked_emitting_prefix_len(exprs: &[Expr]) -> Option<usize> {
+    let idx = exprs
+        .iter()
+        .position(|stage| !path_context_is_navigational(stage))?;
+    if idx == 0 || !matches!(exprs[idx], Expr::Builtin(Builtin::PathNoArg | Builtin::Key)) {
+        return None;
+    }
+    let rest = &exprs[idx + 1..];
+    if rest.is_empty() || rest.iter().any(needs_path_context) {
+        return None;
+    }
+    Some(idx + 1)
 }
 
 /// Whether a pipe carrying path context streams cursors end to end: the
@@ -29257,8 +29308,21 @@ mod tests {
         // path context at all is the callers' question, asked before the
         // split; a plain `.a | tostring` never reaches it.)
         assert_eq!(split("(.a | key) | tostring"), Some((1, 1)));
-        // Nothing: the tail needs path context the walk cannot give it.
-        assert_eq!(split(".a | key | tostring"), None);
+        // #2149: the walk takes `key`/`path` (no arg) followed by more
+        // stages too, as long as the tail needs no path context of its own
+        // -- `.a | key | tostring` no longer goes to the bridge whole just
+        // because `tostring` follows `key` (the O(n^2) shape the issue
+        // reported: on a 200K-element array, `.[] | key | tostring` fell
+        // to the materializing bridge once per element).
+        assert_eq!(split(".a | key | tostring"), Some((2, 1)));
+        // Nothing: a *second* path-context builtin in the tail still isn't
+        // resolved -- real yq's own answer for that shape doesn't settle
+        // into one coherent rule (live-verified against v4.53.3: `key |
+        // key` is empty, `key | (key + 100)` is a constant unrelated to
+        // the element, `key | path` wraps the value itself), so it's left
+        // on the bridge rather than guessed at.
+        assert_eq!(split(".a | key | key"), None);
+        assert_eq!(split(".a | key | (key + 1)"), None);
         // A fan-out that materializes a node per branch is walked too since
         // spine 2416's exit; it used to be refused here.
         assert_eq!(split(".[] | .k | parent"), Some((3, 0)));
@@ -29443,11 +29507,24 @@ mod tests {
         assert!(!eager(".a.b | select(key == \"b\")"));
         assert!(!eager(".a | select(true) | key"));
         assert!(!eager(".a.b | if key == \"b\" then 1 else 2 end"));
-        assert!(!eager(".a.b | key | tostring"));
-        // `[key, path]` has no row here: the *walk* takes it end to end
-        // (`path_context_is_cursor_walkable` admits `[..]`, and its fan-out
-        // is paths-only), so it never reached the eager evaluator to begin
-        // with -- `path_context_absent_split` leaves those alone.
+        // `.a.b | key | tostring` has no row here either, as of #2149: the
+        // *walk* now takes `key`/`path` followed by a `rest` needing no
+        // path context of its own end to end
+        // (`path_context_walk_split`), so `path_context_absent_split`
+        // defers to it (its own guard, "if `path_context_walk_split`
+        // succeeds, return `None`") and this function is never reached for
+        // it in real dispatch either (`path_context_single_native`'s own
+        // `Expr::Pipe` arm checks `path_context_walk_split(exprs).is_some()`
+        // before this function, short-circuiting `||`). Calling `eager`
+        // directly on it, bypassing that ordering, now answers `true` --
+        // not a regression, just this pinned function's own isolated
+        // answer for an input no real caller reaches it with anymore,
+        // exactly the caveat this test's own header comment states.
+        //
+        // `[key, path]` has no row here either: the *walk* takes it end to
+        // end (`path_context_is_cursor_walkable` admits `[..]`, and its
+        // fan-out is paths-only), so it never reached the eager evaluator
+        // to begin with -- `path_context_absent_split` leaves those alone.
         assert!(
             !eager(".a[] | select(true) | key"),
             "iterate cannot yield absent"

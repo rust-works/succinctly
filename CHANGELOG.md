@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`key`/`path` (no arg) followed by more pipe stages no longer falls back
+  to materializing the whole document once per element** (#2149, follow-up
+  to #2061). `.[] | key | tostring` (and any pipe shaped the same way,
+  provided nothing after `key`/`path` itself needs path context) used to
+  fail the fast cursor walk's static gate just because a stage followed
+  `key`/`path`, falling to a per-element `cursor_key` sibling scan that
+  costs O(position) per call -- O(n) calls, O(n^2) total. The gate
+  (`path_context_walk_split` in `src/jq/eval_generic.rs`) now recognizes a
+  navigational run ending on `key`/`path` as a walkable prefix too, the
+  same way it already recognized a single navigational first stage.
+  Live-verified: a 200,000-element array's `.[] | key | tostring` dropped
+  from ~131s user time to well under a second. A pipe with a *second*
+  `key`/`path`/`parent` after the first still falls back deliberately --
+  real yq's own answer for that shape doesn't settle into one coherent
+  rule to reproduce (`key | key` is empty, `key | (key + 100)` is a
+  constant unrelated to the element, `key | path` wraps the value itself,
+  all live-verified against v4.53.3).
 - **`succinctly yq`'s DOM output path now agrees with its streaming path on
   explicit tags and two Unicode separators** (#1982, Medium severity):
   1. **An explicit `!!str`/`!!int`/`!!bool`/`!!null` tag was silently lost
