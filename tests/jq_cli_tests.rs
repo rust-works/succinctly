@@ -2893,6 +2893,56 @@ fn test_default_json_output_escapes_nul_and_does_not_error() -> Result<()> {
     Ok(())
 }
 
+/// #2591: a raw (unescaped) 0x7f DEL byte inside a JSON string is valid
+/// JSON -- unlike the 0x00-0x1f control range, RFC 8259 doesn't require it
+/// to be escaped in the *source* -- but real jq's own output-side escape
+/// table always re-encodes it when re-emitting the string (confirmed live
+/// against jq 1.7.1). succinctly's default (compact, M2) output path used
+/// to have a zero-copy fast path that only checked for a *source*
+/// backslash before echoing raw bytes verbatim, so a DEL byte with no
+/// accompanying backslash sailed through unescaped. Uses an actual raw
+/// 0x7f byte in the Rust source (a `\x7f` escape), not a JSON `\u007f`
+/// escape sequence in the input text -- the latter would already contain
+/// a backslash and take the slow, always-correct path, testing nothing.
+#[test]
+fn test_default_json_output_escapes_raw_del_byte_in_value_2591() -> Result<()> {
+    let input = "{\"a\": \"xy\"}";
+    let (out, _, code) = run_jq_full(&[".a"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "\"x\\u007fy\"\n", "stdout: {out:?}");
+    Ok(())
+}
+
+/// #2591: same bug, but for an *object key* rather than a string value --
+/// a distinct fast-path call site (`PreparedField`'s own zero-copy check
+/// in `src/bin/succinctly/jq_runner.rs`) with the same shape of fix.
+#[test]
+fn test_default_json_output_escapes_raw_del_byte_in_key_2591() -> Result<()> {
+    let input = "{\"xy\": 1}";
+    let (out, _, code) = run_jq_full(&["-c", "."], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "{\"x\\u007fy\":1}\n", "stdout: {out:?}");
+    Ok(())
+}
+
+/// #2591 (code review): `--preserve-input` selects the same
+/// `JsonConvention::Preserve` real yq uses (DEL left raw), not jq's own
+/// `JqCompat` table -- a DEL-bearing key must stay raw under this flag
+/// even though the identical key escapes under plain (non-preserve)
+/// default output, per the sibling test above. This is the regression the
+/// review agent caught: `write_object_key`'s zero-copy fast path first
+/// gated `has_del` unconditionally, which fixed default jq_compat output
+/// but broke this flag by forcing every DEL-bearing key through the
+/// jq-table slow path regardless of the active convention.
+#[test]
+fn test_preserve_input_leaves_raw_del_byte_in_key_unescaped_2591() -> Result<()> {
+    let input = "{\"xy\": \"v\"}";
+    let (out, _, code) = run_jq_full(&["--preserve-input", "-c", "."], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "{\"xy\": \"v\"}\n", "stdout: {out:?}");
+    Ok(())
+}
+
 /// #1830: real jq flushes each result as it's produced and errors on
 /// first sighting a NUL, rather than buffering the whole multi-result
 /// stream before writing anything -- confirmed live against jq 1.7.1:

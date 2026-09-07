@@ -62,6 +62,21 @@ fn run_yq_stdin_with_stderr(
     Ok((stdout, stderr, exit_code))
 }
 
+/// #2591: real yq's own `Preserve` output convention leaves a raw DEL byte
+/// unescaped (confirmed live against yq v4.53.3) -- unlike jq's
+/// `JqCompat` table, which always escapes it. The fix to
+/// `write_json_string_pretty` (`src/json/light.rs`) gates its stricter
+/// check on `numbers == JsonConvention::JqCompat` specifically, so this
+/// must not regress: `del_unsafe` must never fire in yq mode.
+#[test]
+fn test_yq_mode_leaves_raw_del_byte_unescaped_2591() -> Result<()> {
+    let input = "a: \"xy\"\n";
+    let (out, err, code) = run_yq_stdin_with_stderr(".", input, &["-o=json", "-I", "0"])?;
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out, "{\"a\":\"xy\"}\n", "stdout: {out:?}");
+    Ok(())
+}
+
 /// `run_yq_stdin_with_stderr`'s raw-bytes counterpart, for input that isn't
 /// valid UTF-8 -- deliberately not `unsafe { str::from_utf8_unchecked(...) }`
 /// over an invalid byte sequence, which is real UB even when the only thing

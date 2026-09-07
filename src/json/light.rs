@@ -1683,32 +1683,47 @@ impl<'a> JsonString<'a> {
         &self.text[self.start..end]
     }
 
-    /// The raw source span (quotes included) *and* whether it contains a
-    /// backslash escape, in a single scan.
+    /// The raw source span (quotes included), whether it contains a
+    /// backslash escape, and whether it contains a raw DEL byte (`0x7f`),
+    /// in a single scan.
     ///
-    /// A caller that needs both -- the JSON printer, which writes the span
-    /// verbatim when nothing needs decoding, and the duplicate-key probe
-    /// (#1385), which may compare raw spans only while nothing is escaped --
-    /// would otherwise pay two passes over the same bytes:
-    /// [`raw_bytes`](Self::raw_bytes) scans for the closing quote and
-    /// `contains(&b'\\')` scans again. The quote scan already has to
-    /// recognise every backslash in order to skip what it escapes, so
-    /// reporting it is free. Measured worth 7-10% of `sjq '.'` on a 10 MB
-    /// document, which is the entire cost of the probe.
-    pub fn raw_and_escaped(&self) -> (&'a [u8], bool) {
+    /// A caller that needs several of these -- the JSON printer, which
+    /// writes the span verbatim when nothing needs decoding, and the
+    /// duplicate-key probe (#1385), which may compare raw spans only while
+    /// nothing is escaped -- would otherwise pay separate passes over the
+    /// same bytes: [`raw_bytes`](Self::raw_bytes) scans for the closing
+    /// quote, `contains(&b'\\')` scans again, and a DEL check would be a
+    /// third. The quote scan already visits every byte to recognise a
+    /// backslash and skip what it escapes, so reporting both is free.
+    /// Measured worth 7-10% of `sjq '.'` on a 10 MB document (the escape
+    /// flag alone), which is the entire cost of the probe.
+    ///
+    /// `has_del` exists for #2591: DEL is legal raw (unescaped) JSON source,
+    /// but jq's own escape table (unlike yq's) still escapes it to
+    /// `\u007f` on output -- a span with no backslash is *not* safe to echo
+    /// verbatim under jq's convention if it also contains a raw DEL byte.
+    /// Never part of a multi-byte UTF-8 sequence (every continuation/lead
+    /// byte is `>= 0x80`), so a bare byte-equality check is correct with no
+    /// encoding awareness needed.
+    pub fn raw_and_escaped(&self) -> (&'a [u8], bool, bool) {
         let mut i = self.start + 1; // skip the opening quote
         let mut escaped = false;
+        let mut has_del = false;
         while i < self.text.len() {
             match self.text[i] {
-                b'"' => return (&self.text[self.start..=i], escaped),
+                b'"' => return (&self.text[self.start..=i], escaped, has_del),
                 b'\\' => {
                     escaped = true;
                     i += 2;
                 }
+                0x7f => {
+                    has_del = true;
+                    i += 1;
+                }
                 _ => i += 1,
             }
         }
-        (&self.text[self.start..], escaped)
+        (&self.text[self.start..], escaped, has_del)
     }
 
     /// Decode the string value.
@@ -2724,7 +2739,12 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
     fn key_raw_unescaped(&self) -> Option<&[u8]> {
         match self {
             StandardJson::String(s) => {
-                let (raw, escaped) = s.raw_and_escaped();
+                // `has_del` (#2591) doesn't matter here: this probe hashes
+                // the *decoded* content for duplicate-key comparison, and a
+                // raw DEL byte's decoded value is itself either way -- the
+                // convention-specific re-escaping question it exists for is
+                // strictly an output concern.
+                let (raw, escaped, _has_del) = s.raw_and_escaped();
                 // A well-formed span is `"..."`; anything shorter than the
                 // two quotes is a truncated document, and has no content to
                 // hand back.
@@ -3234,18 +3254,34 @@ fn stream_json_pretty<W: AsRef<[u64]> + Clone, Out: core::fmt::Write>(
 /// Write a JSON string value using `numbers`'s escaping convention
 /// (`write_json_body_jq`/`write_json_body_yq`).
 ///
-/// Zero-copy fast path, mirroring `src/bin/succinctly/jq_runner.rs`'s own
-/// `print_json`: a span with no `\` escape needs no re-encoding under
-/// *either* convention (both tables agree on every byte that can appear
-/// unescaped in valid JSON source, DEL included -- see `print_json`'s own
-/// long-standing identical choice not to special-case it), so it's echoed
-/// verbatim, quotes and all.
+/// Zero-copy fast path: a span with no `\` escape needs no re-encoding
+/// under yq's own convention (`Preserve`), which agrees with source on
+/// every byte legal unescaped in JSON -- but jq's convention (`JqCompat`)
+/// diverges from that at exactly one such byte, DEL (`0x7f`, #2591:
+/// `jq::escape`'s own `conventions_differ_at_exactly_three_code_points`
+/// names all three differences; the other two, backspace/form-feed, always
+/// arrive pre-escaped with a `\` and so never reach this fast path at all).
+/// `del_unsafe` below is what keeps a `JqCompat` span containing a raw DEL
+/// byte off this path. **Three call sites in
+/// `src/bin/succinctly/jq_runner.rs`'s own `print_json` (`.[]`-streamed
+/// values, and both `keys_unsorted` key-printing loops) share this exact
+/// bug shape today, deliberately left unfixed by #2591 to keep it narrowly
+/// scoped -- tracked in #2592.**
 fn write_json_string_pretty<Out: core::fmt::Write>(
     out: &mut Out,
     s: JsonString<'_>,
     numbers: JsonConvention,
 ) -> StreamResult {
-    let (raw, escaped) = s.raw_and_escaped();
+    let (raw, escaped, has_del) = s.raw_and_escaped();
+    // #2591: a raw DEL byte needs no backslash to be legal JSON source, but
+    // jq's own escape table (unlike yq's -- `Preserve`) still escapes it on
+    // output. The two conventions agree on every *other* byte legal
+    // unescaped in source, so this is the one case the fast path below
+    // can't take unconditionally under `JqCompat`. `has_del` comes free
+    // from `raw_and_escaped`'s own existing scan (already visiting every
+    // byte of the span to find a backslash), so this check costs nothing
+    // beyond what that scan already pays for every span, escaped or not.
+    let del_unsafe = has_del && numbers == JsonConvention::JqCompat;
     // Unlike `print_json`'s own zero-copy check (`std::io::Write`, which
     // passes bytes through unvalidated), this writer is `core::fmt::Write`
     // -- a `str`-oriented trait -- so invalid UTF-8 in an unescaped span
@@ -3254,7 +3290,7 @@ fn write_json_string_pretty<Out: core::fmt::Write>(
     // bare `core::fmt::Error` right here) keeps this a proper diagnosable
     // decode failure via `json_decode_failure`, matching #1615 -- not a
     // second, worse way for the same class of bad input to go undiagnosed.
-    if !escaped {
+    if !escaped && !del_unsafe {
         if let Ok(text) = core::str::from_utf8(raw) {
             return Ok(out.write_str(text)?);
         }
