@@ -173,7 +173,7 @@ c: 2
 ```
 
 A related, narrower gap sits in `select`/`if`'s condition-truthiness check
-(`push_generic_truthiness_cursor_error`, [src/jq/eval_generic.rs](../../../src/jq/eval_generic.rs)):
+(`push_generic_document_validation_error`, [src/jq/eval_generic.rs](../../../src/jq/eval_generic.rs)):
 it does not walk into a *container* reached through an alias, so a decode failure reachable
 only that way no longer raises
 ([#1804](https://github.com/rust-works/succinctly/issues/1804), fixed a real `O(2^N)` cost

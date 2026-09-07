@@ -1495,7 +1495,7 @@ impl DisplayKeyGuard {
 /// `to_owned`/`materialize` raise instead of silently dropping one of them.
 ///
 /// Shared by `eval_generic.rs`'s three `to_owned*_at_depth` conversions,
-/// its validate-only `push_generic_truthiness_cursor_error` (#1645),
+/// its validate-only `push_generic_document_validation_error` (#1645),
 /// `lazy.rs`'s `cursor_to_owned_at_depth`, and `succinctly-cli`'s
 /// `yq_runner.rs` `--input-format json` bridge (`pub` for that reason,
 /// same as [`DisplayKeyGuard`] and [`key_display_string`] before it) -- one
@@ -2846,7 +2846,7 @@ impl<V: DocumentValue, C: DocumentCursor> DocumentField<V, C> {
     /// leaving a sibling behind (#1975 found this walk missing from the CLI
     /// bridge; #2349 fixed the validate-only walk's own delimiter gap,
     /// directly via `key_delimiter_ok`/`value_delimiter_ok` rather than
-    /// through this method -- see `push_generic_truthiness_cursor_error`'s
+    /// through this method -- see `push_generic_document_validation_error`'s
     /// own STYLE-0013 note for why it still can't take the key half).
     /// `resolve_display_key`'s own doc already tracked the key half as a
     /// recurring cost; this method covers the delimiter half with it, so a

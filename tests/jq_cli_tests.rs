@@ -2188,7 +2188,7 @@ fn assert_jq_raises(
     );
 }
 
-/// #1645 code review: `push_generic_truthiness_cursor_error` is a second,
+/// #1645 code review: `push_generic_document_validation_error` is a second,
 /// hand-copied implementation of the same "walk and raise on corruption"
 /// predicate `to_owned_at_depth`/`to_owned_cursor_at_depth`/
 /// `cursor_to_owned_at_depth` (`lazy.rs`) already implement for
@@ -2197,7 +2197,7 @@ fn assert_jq_raises(
 /// site agrees, not just that each is individually correct (see the
 /// `testing` skill and CLAUDE.md's "Duplicated predicates diverge silently"
 /// note, #106). #1803 extended this from 2 sites to 3: `select(.bad) | .keep`
-/// (`push_generic_truthiness_cursor_error`), `-Sc .bad` (`to_owned_at_depth`,
+/// (`push_generic_document_validation_error`), `-Sc .bad` (`to_owned_at_depth`,
 /// confirmed live via temporary tracing -- `-S` does *not* route through the
 /// cursor-aware sibling despite the name resemblance), and `-e .bad`
 /// (`cursor_to_owned_at_depth`, `lazy.rs` -- a JSON-only fourth
@@ -31664,7 +31664,7 @@ fn test_getpath_still_raises_on_an_undecodable_sibling_2053() -> Result<()> {
 ///
 /// `path(.a)` alone would not exercise `Builtin::Path`'s fixed line: a bare
 /// `Expr::Field` is cursor-navigable (`path_expr_is_cursor_navigable`), so
-/// it takes the pre-existing fast path (`push_generic_truthiness_cursor_error`)
+/// it takes the pre-existing fast path (`push_generic_document_validation_error`)
 /// instead, never reaching the fallback this PR changed -- confirmed live
 /// with temporary debug instrumentation during review. `path(if true then
 /// .a else null end)` is not cursor-navigable (`Expr::If` isn't in that
@@ -37995,7 +37995,7 @@ fn test_seq_wellformed_and_leniency_unaffected_by_checked_swap_2295() -> Result<
     Ok(())
 }
 
-/// #2349: `push_generic_truthiness_cursor_error` -- the shared validation
+/// #2349: `push_generic_document_validation_error` -- the shared validation
 /// gate for `select`/`sort_by`/`unique_by`/`min_by`/`max_by`/`path()` -- had
 /// none of the `#1677`/`#2211`/`#2243` delimiter/gap checks its materializing
 /// siblings (`to_owned_cursor_at_depth` and friends) already run, so a

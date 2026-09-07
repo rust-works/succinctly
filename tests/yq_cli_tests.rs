@@ -2318,7 +2318,7 @@ fn assert_yq_raises(
     );
 }
 
-/// #1803: `select(.bad) | .keep` (`push_generic_truthiness_cursor_error`)
+/// #1803: `select(.bad) | .keep` (`push_generic_document_validation_error`)
 /// and a write op (`.keep = 9`, which forces the YAML DOM path per ADR-0017
 /// -- `to_owned_with_comments_at_depth`/`to_owned_at_depth`/
 /// `to_owned_cursor_at_depth` all get exercised together building it,
@@ -29092,7 +29092,7 @@ fn test_select_resolves_alias_falsiness_1645() -> Result<()> {
 }
 
 /// #1645 code review: every JSON-side corruption regression test
-/// (`tests/jq_cli_tests.rs`) has no YAML sibling -- `push_generic_truthiness_cursor_error`
+/// (`tests/jq_cli_tests.rs`) has no YAML sibling -- `push_generic_document_validation_error`
 /// is generic over `DocumentCursor` and reached identically by the yq
 /// evaluator, but nothing pinned that `select()` actually raises on a YAML
 /// decode failure nested inside its condition's container, only that it
@@ -29133,7 +29133,7 @@ fn test_select_raises_on_yaml_decode_failure_nested_in_container_1645() -> Resul
 
 /// #1804: a document shaped as a chain of anchors each referencing the
 /// previous one twice (`aN: &aN [*a(N-1), *a(N-1)]`) made
-/// `push_generic_truthiness_cursor_error`'s subtree walk cost `O(2^N)` --
+/// `push_generic_document_validation_error`'s subtree walk cost `O(2^N)` --
 /// every `select`/`if` condition unconditionally re-descended into both
 /// copies of each alias target. `DocumentCursor::is_alias` now short-circuits
 /// the walk at an alias node instead of resolving through it, since jq's own
@@ -29197,7 +29197,7 @@ fn test_select_and_if_truthiness_flat_over_alias_fanout_1804() -> Result<()> {
 ///
 /// Covers both container shapes -- the object branch and the array branch
 /// each carry their own `c.is_alias()` short-circuit in
-/// `push_generic_truthiness_cursor_error`, so an array-only test would
+/// `push_generic_document_validation_error`, so an array-only test would
 /// leave the object branch's check unexercised.
 #[test]
 fn test_select_no_longer_raises_on_decode_failure_reachable_only_via_alias_1804() -> Result<()> {
@@ -30199,7 +30199,7 @@ fn test_path_context_cursor_walk_falls_back_2061() -> Result<()> {
 /// `to_owned_with_cursor` doubles as a decode-failure gate (#1755/#1953), so
 /// a walk that reached the answer without decoding everything would silently
 /// start accepting documents these pipes reject today.
-/// `push_generic_truthiness_cursor_error` is that same traversal and
+/// `push_generic_document_validation_error` is that same traversal and
 /// validation without the `OwnedValue` construction.
 #[test]
 fn test_path_context_cursor_walk_keeps_the_validity_gate_2061() -> Result<()> {

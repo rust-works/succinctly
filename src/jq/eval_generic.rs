@@ -2666,13 +2666,24 @@ fn push_generic_owned_values<V: DocumentValue>(
 }
 
 /// Whether `c`'s subtree, at any depth, contains a value that cannot be
-/// honestly answered "truthy or falsy" at all -- a decode failure (a
-/// string token whose bytes don't decode), a structural error (a token
-/// the semi-index accepted as a span but couldn't classify, #1194), or a
-/// #1642 colliding-decode-failure-key -- and if so, the `Control::Error`
-/// a caller should raise instead of falling through to
-/// [`DocumentCursor::is_falsy`]'s own silent "not falsy" default for
-/// exactly these cases.
+/// honestly materialized at all -- a decode failure (a string token whose
+/// bytes don't decode), a structural error (a token the semi-index
+/// accepted as a span but couldn't classify, #1194), or a #1642
+/// colliding-decode-failure-key -- and if so, the `Control::Error` a
+/// caller should raise.
+///
+/// The shared document-validation gate behind five call sites spanning
+/// four feature families -- `select`'s truthiness check
+/// (`push_generic_truthiness`, the only one actually about truthiness;
+/// see its own doc comment for why it falls through to
+/// [`DocumentCursor::is_falsy`]'s silent "not falsy" default otherwise),
+/// `sort_by`/`unique_by`/`min_by`/`max_by`'s comparison key
+/// (`key_elements_generic`), the path-context fast path
+/// (`path_context_root`), and `path(...)` (`eval_builtin`) -- not a
+/// truthiness-specific helper despite this function's former name
+/// (#2413): each of those five callers needs the #1247/#1194 validation
+/// below without ever materializing an `OwnedValue` for the subtree it's
+/// validating.
 ///
 /// This is [`to_owned_cursor_at_depth`]'s own traversal and validation
 /// (same object/array unconsing, same key-collision guard) -- but it
@@ -2690,19 +2701,22 @@ fn push_generic_owned_values<V: DocumentValue>(
 /// or vice versa (`tagged_scalar_to_owned` requires `as_str()` to already
 /// have succeeded), so skipping it here cannot skip a real raise.
 ///
-/// For a scalar condition this keeps #1645's O(1) win in full: neither
-/// this walk nor `is_falsy()` afterward materializes anything. For a
-/// container condition, jq's own truthiness rule needs none of this --
-/// any object/array is unconditionally truthy regardless of contents --
-/// but this walk still visits the whole subtree anyway, because a
-/// corrupted value can be anywhere inside it and the #1247/#1194
-/// invariant this function exists to enforce is a property of the whole
-/// subtree, not of the truthiness question alone. That walk still
-/// allocates one `String` per object key (`resolve_display_key`'s own
-/// #1642 guard), so "no allocation" only ever describes the *value*
-/// side (no `OwnedValue`/`Vec` payload) -- not a claim that a
-/// container-shaped condition is free.
-fn push_generic_truthiness_cursor_error<C: DocumentCursor>(c: &C, depth: usize) -> Option<Control> {
+/// For `push_generic_truthiness`'s own scalar condition, this keeps
+/// #1645's O(1) win in full: neither this walk nor `is_falsy()` afterward
+/// materializes anything. For a container condition there, jq's own
+/// truthiness rule needs none of this -- any object/array is
+/// unconditionally truthy regardless of contents -- but this walk still
+/// visits the whole subtree anyway, because a corrupted value can be
+/// anywhere inside it and the #1247/#1194 invariant this function exists
+/// to enforce is a property of the whole subtree, whichever of the five
+/// callers is asking. That walk still allocates one `String` per object
+/// key (`resolve_display_key`'s own #1642 guard), so "no allocation" only
+/// ever describes the *value* side (no `OwnedValue`/`Vec` payload) -- not
+/// a claim that a container-shaped subtree is free.
+fn push_generic_document_validation_error<C: DocumentCursor>(
+    c: &C,
+    depth: usize,
+) -> Option<Control> {
     assert_nesting_depth(depth);
     let value = c.value();
     if let Some(fields) = value.as_object() {
@@ -2845,7 +2859,7 @@ fn push_generic_truthiness_cursor_error<C: DocumentCursor>(c: &C, depth: usize) 
             }
             index += 1;
             if let Some(control) =
-                push_generic_truthiness_cursor_error(&field.value_cursor, depth + 1)
+                push_generic_document_validation_error(&field.value_cursor, depth + 1)
             {
                 return Some(control);
             }
@@ -2887,7 +2901,7 @@ fn push_generic_truthiness_cursor_error<C: DocumentCursor>(c: &C, depth: usize) 
             if !elem_cursor.element_gap_ok(is_first) {
                 return Some(Control::Error(elem_cursor.malformed_delimiter_error()));
             }
-            if let Some(control) = push_generic_truthiness_cursor_error(&elem_cursor, depth + 1) {
+            if let Some(control) = push_generic_document_validation_error(&elem_cursor, depth + 1) {
                 return Some(control);
             }
             last_elem = Some(elem_cursor);
@@ -2909,7 +2923,7 @@ fn push_generic_truthiness_cursor_error<C: DocumentCursor>(c: &C, depth: usize) 
     } else if value.is_error() {
         // #2286: `decode_failure`, not `new` -- see `to_owned_at_depth`'s
         // own `is_error()` arm above for the full rationale; this is the
-        // truthiness-check sibling of that same class.
+        // validate-only sibling of that same class.
         Some(Control::Error(EvalError::decode_failure(
             value
                 .error_message()
@@ -2941,7 +2955,7 @@ fn push_generic_truthiness<V: DocumentValue>(
         // first, same as `to_owned_at_depth`'s own two checks in the same
         // order, just without materializing on the ordinary-value path.
         GenericResult::OneCursor(c) => {
-            if let Some(control) = push_generic_truthiness_cursor_error(&c, 0) {
+            if let Some(control) = push_generic_document_validation_error(&c, 0) {
                 return Some(control);
             }
             // `select`'s condition truthiness is about the real value, not
@@ -2958,7 +2972,7 @@ fn push_generic_truthiness<V: DocumentValue>(
         }
         GenericResult::ManyCursor(cs) => {
             for c in &cs {
-                if let Some(control) = push_generic_truthiness_cursor_error(c, 0) {
+                if let Some(control) = push_generic_document_validation_error(c, 0) {
                     return Some(control);
                 }
                 out.push(!c.is_falsy(JsonConvention::Preserve));
@@ -11652,7 +11666,7 @@ fn sort_key_generic<S: EvalSemantics, V: DocumentValue>(
 ///
 /// **Both arms carry `eval.rs`'s #1755 rule**, by different means: the `None`
 /// arm's own conversion is already the checked one, and the `Some(f)` arm
-/// runs `push_generic_truthiness_cursor_error` -- the same validation with the
+/// runs `push_generic_document_validation_error` -- the same validation with the
 /// `OwnedValue` construction removed. #2069 filed this as an accepted gap on
 /// the grounds that no live repro was known and the check would cost a full
 /// decode per element; both premises were wrong. The repro is
@@ -11680,7 +11694,7 @@ fn key_elements_generic<S: EvalSemantics, V: DocumentValue>(
                 // the bad element never reaches the output, so nothing else
                 // would ever have surfaced it.
                 //
-                // `push_generic_truthiness_cursor_error`, not
+                // `push_generic_document_validation_error`, not
                 // `to_owned_cursor`: it is that function's own traversal and
                 // validation with the `OwnedValue` construction removed, so
                 // the `_by` forms keep the point of this arm -- never
@@ -11688,7 +11702,7 @@ fn key_elements_generic<S: EvalSemantics, V: DocumentValue>(
                 // still raising on one that cannot be decoded. (Not free: it
                 // still allocates one `String` per object key, per
                 // `resolve_display_key`'s #1642 guard.)
-                if let Some(control) = push_generic_truthiness_cursor_error(&cursor, 0) {
+                if let Some(control) = push_generic_document_validation_error(&cursor, 0) {
                     return Err(control);
                 }
                 sort_key_generic::<S, V>(f, &cursor, optional)?
@@ -11743,7 +11757,7 @@ fn reordering_may_keep_cursors<V: DocumentValue>(cursor: Option<&V::Cursor>) -> 
 /// `key_elements_generic`'s `to_owned_cursor` materialization, on the premise
 /// that this was that materialization's only error channel. It is not:
 /// `key_elements_generic` funnels three things into this `Control` --
-/// `push_generic_truthiness_cursor_error`, `to_owned_cursor`, and
+/// `push_generic_document_validation_error`, `to_owned_cursor`, and
 /// `sort_key_generic`, which carries out *whatever the user's key filter
 /// raised* (`sort_by(error("x"))`, `min_by(.a)` on an array, ...).
 ///
@@ -12196,7 +12210,7 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
                     // temporary debug probe that `path_step_generic` is
                     // never even entered for a document containing an
                     // undecodable scalar, because that caller's own
-                    // `push_generic_truthiness_cursor_error` pre-walk
+                    // `push_generic_document_validation_error` pre-walk
                     // (#1755/#1953's "validity gate", a whole-*document*
                     // check run before any cursor walk) already raises the
                     // identical `decode_failure` first, regardless of
@@ -13570,11 +13584,11 @@ fn path_context_single_native(expr: &Expr) -> bool {
 /// The root position of a walk, once the document has passed the same
 /// validity gate the bridge's `to_owned_with_cursor` doubles as (#1755/#1953):
 /// dropping it would make these pipes start accepting documents they reject
-/// today. `push_generic_truthiness_cursor_error` is that same traversal and
+/// today. `push_generic_document_validation_error` is that same traversal and
 /// validation with the `OwnedValue` construction removed -- the same gate
 /// `Builtin::Path` runs, for the same reason.
 fn path_context_root<V: DocumentValue>(root: V::Cursor) -> Result<PathContextPos<V>, Control> {
-    if let Some(control) = push_generic_truthiness_cursor_error(&root, 0) {
+    if let Some(control) = push_generic_document_validation_error(&root, 0) {
         return Err(control);
     }
     // The walk's input is not always the document root: a nested pipe
@@ -15385,12 +15399,12 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // The whole-document walk is not skipped, only the tree build:
             // `to_owned_with_cursor` doubles as a validity gate (#1755/
             // #1953), and dropping it would make `path(.d)` start accepting
-            // documents it rejects today. `push_generic_truthiness_cursor_error`
+            // documents it rejects today. `push_generic_document_validation_error`
             // is that same traversal and validation with the `OwnedValue`
             // construction removed, so error behaviour is unchanged while the
             // allocation is not paid.
             if let Some(root) = cursor.filter(|_| path_expr_is_cursor_navigable(path_expr)) {
-                if let Some(control) = push_generic_truthiness_cursor_error(&root, 0) {
+                if let Some(control) = push_generic_document_validation_error(&root, 0) {
                     return match control {
                         Control::Error(e) => GenericResult::Error(e),
                         Control::Break(label) => GenericResult::Break(label),

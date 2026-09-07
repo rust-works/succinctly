@@ -130,6 +130,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drives the same document/bound expression through all three and asserts
   they agree. No behavior change.
 
+- **`eval_generic.rs`'s `push_generic_truthiness_cursor_error` renamed to
+  `push_generic_document_validation_error`** (#2413). The function is the
+  shared document-validation gate behind five call sites spanning four
+  feature families (`select`'s truthiness check, `sort_by`/`unique_by`/
+  `min_by`/`max_by`'s comparison key, the path-context fast path, and
+  `path(...)`), and only the first of those is actually about truthiness —
+  the old name had already cost real coverage once (#2211/#2243 each added a
+  delimiter check to "the materializers" without noticing this walk, later
+  fixed by #2349) and left the function's own doc comment spending a
+  paragraph walking the name back. Purely mechanical everywhere except the
+  function's own doc comment, which is rewritten to lead with the shared
+  gate and its five callers, scoping the truthiness-specific reasoning to
+  the one caller it actually describes rather than stating it as the
+  function's own general property. No behavior change.
+
 - **`eval_generic::eval_index_expr`'s "promote `cursors`, preserving an
   in-flight `Control`'s priority over a secondary decode failure" dispatch is
   now one shared definition** (#2364), not three independent hand-copies
@@ -144,7 +159,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cross-site test drives the same double-fault document/target through all
   three reachable ones and asserts they agree. No behavior change.
 
-- **`eval_generic::push_generic_truthiness_cursor_error`'s object/array arms now call
+- **`eval_generic::push_generic_document_validation_error`'s object/array arms now call
   `container_tail_gap_ok` instead of hand-inlining the `None`/`Some(last)`
   container-vs-trailing-gap dispatch** (#2409). No behavior change: this was the last
   hold-out of a dispatch shape that `to_owned_cursor_at_depth` (`eval_generic.rs`) and
@@ -793,7 +808,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The validate-only traversal backing `select`/`sort_by`/`unique_by`/`min_by`/`max_by`/
   `path()` silently accepted invalid JSON in a subtree it only ever validates, never
-  materializes** (#2349, split out of #1803). `push_generic_truthiness_cursor_error`
+  materializes** (#2349, split out of #1803). `push_generic_document_validation_error`
   (`src/jq/eval_generic.rs`) is the shared validation gate for all six builtins, and both
   `path()` call sites' own doc comments claim it runs "that same traversal and validation"
   as the materializing `to_owned_cursor_at_depth` — but three follow-ups since it was
@@ -809,7 +824,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Error: Invalid JSON text: expected string key, found '}'
   ```
 
-  Fixed by adding the missing checks to `push_generic_truthiness_cursor_error`'s own
+  Fixed by adding the missing checks to `push_generic_document_validation_error`'s own
   object/array walk, mirroring `to_owned_cursor_at_depth`'s structure exactly (`is_first`/
   last-cursor tracking, `key_delimiter_ok`/`value_delimiter_ok` per object field,
   `preceding_delimiter_ok` per array element, `container_gap_ok`/`trailing_element_gap_ok`

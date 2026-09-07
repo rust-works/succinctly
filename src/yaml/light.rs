@@ -6914,7 +6914,7 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
             // `is_null`'s convention) but there is no real message to
             // return, so this falls to `None` -- every caller of this pair
             // already has its own fallback wording for a missing message
-            // (e.g. `push_generic_truthiness_cursor_error`'s
+            // (e.g. `push_generic_document_validation_error`'s
             // `unwrap_or("malformed value in document")`).
             YamlValue::Alias { target, .. } => {
                 target.and_then(|t| t.resolve_alias_chain()?.error_message())
