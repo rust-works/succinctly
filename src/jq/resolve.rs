@@ -51,14 +51,14 @@
 //! | `def f(g): g(1); f(.)` | error `g/1` — a param binds arity 0 only |
 //! | `def f: 1; def g: f; def f: 2; g` | `1` — later same-arity def shadows |
 //!
-//! The parser strips the `$` from a `$`-prefixed parameter (`parse_def_expr`,
-//! `src/jq/parser.rs`), so `def f($a)` and `def f(a)` both arrive here as
-//! `params: ["a"]`. Binding the bare name at arity 0 is right for both:
-//! jq's `def f($a): …` desugars to `def f(a): a as $a | …`, which leaves `a`
-//! callable.
+//! `Expr::FuncDef::params` distinguishes `def f($a)` from `def f(a)` (`Param`,
+//! `src/jq/expr.rs` -- #2283), but this pass only ever needs
+//! [`Param::name`](super::Param::name), the bare identifier either spelling
+//! binds: jq's `def f($a): …` desugars to `def f(a): a as $a | …`, which
+//! leaves `a` callable at arity 0 regardless of which spelling was written.
 
 use alloc::rc::Rc;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use super::walk::{builtin_kids, map_builtin_subexprs, BuiltinKids};
