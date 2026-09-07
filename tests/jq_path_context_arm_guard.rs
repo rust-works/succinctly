@@ -61,6 +61,15 @@ use syn::visit::{self, Visit};
 /// target, and the same position resolved into a compound assignment's right
 /// side). `docs/plan/path-context-arm-reachability.md` records its own live
 /// proof query and gate reason alongside the other 43.
+///
+/// 44 -> 44 (spine 2416's identity pass): every stage shape gained a rule or
+/// an arm in the owned identity pipe, forty of the 44 listed proof queries
+/// stopped reaching any arm, and not one arm became unreachable -- each is
+/// still reached through a head no route carries (a computed `parent(n)`, a
+/// fan-out component, a slice, a `getpath`), which is what
+/// `docs/plan/path-context-arm-reachability.md`'s "Identity pass" section
+/// measures. The pin therefore stays; the next move is the walk's, not a
+/// stage rule's.
 const PINNED_ARM_COUNT: usize = 44;
 
 const TARGET_FN: &str = "eval_stage_with_path_context";

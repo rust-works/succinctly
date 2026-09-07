@@ -8906,12 +8906,17 @@ fn test_string_interpolation_path_context_builtins_1334() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(stdout.trim(), r#""[a] parent={\"a\":1}""#);
 
-    // Nested inside a longer pipe: `rest` after the string must see the
-    // newly constructed string as its fresh root (path reset), mirroring
-    // #1302's identical array-literal assertion.
+    // Nested inside a longer pipe: `rest` after the string sees a detached
+    // value -- a string built by interpolation is a fresh scalar like a
+    // literal (ADR-0021 decision 7; `OwnedIdentityRule::Detaches`), so
+    // `key` emits nothing, exactly as `.a | "x" | key` and `.a | 5 | key`
+    // already do on this binary in jq mode. Captured from yq v4.53.3 on
+    // `a: {b: 1}`: `.a.b | "k=\(key)" | key` prints nothing, `| path` is
+    // `[]`. (Was `null` while the eager evaluator answered this shape with
+    // its own path reset -- spine 2416's identity pass.)
     let (stdout, _, code) = run_jq_full(&["-c", ".a | \"\\(key)\" | key"], Some(r#"{"a":1}"#))?;
     assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "null");
+    assert_eq!(stdout.trim(), "");
 
     // A plain string (no path-context builtin inside) takes the original,
     // unmodified code path and must be entirely unaffected.
@@ -9085,11 +9090,20 @@ fn test_string_interpolation_path_context_builtin_optional_is_atomic_1334() -> R
 #[test]
 fn test_string_interpolation_path_context_fanout_continues_rest_1403() -> Result<()> {
     // Two combinations, each independently continuing through `| key` --
-    // both must see the fresh (empty) path, not the enclosing object's.
+    // both are detached strings (see
+    // `test_string_interpolation_path_context_builtins_1334`), so neither
+    // sees the enclosing object's key: `| length` in place of `| key`
+    // proves both combinations reached `rest`.
     let (stdout, _, code) =
         run_jq_full(&["-c", ".a | \"\\(key, key)\" | key"], Some(r#"{"a":1}"#))?;
     assert_eq!(code, 0);
-    assert_eq!(stdout, "null\nnull\n");
+    assert_eq!(stdout, "");
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | \"\\(key, key)\" | length"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "1\n1\n");
 
     // A single slot that succeeds once before erroring: the successful
     // combination still streams through `| key` (fresh root -> null)
@@ -9097,11 +9111,11 @@ fn test_string_interpolation_path_context_fanout_continues_rest_1403() -> Result
     // a plain literal standing in for `key`:
     // `null | "\(1,error("boom"))" | length` prints `1` then errors.
     let (stdout, stderr, code) = run_jq_full(
-        &["-c", ".a | \"\\(key, error(\"boom\"))\" | key"],
+        &["-c", ".a | \"\\(key, error(\"boom\"))\" | length"],
         Some(r#"{"a":1}"#),
     )?;
     assert_eq!(code, 5);
-    assert_eq!(stdout, "null\n");
+    assert_eq!(stdout, "1\n");
     assert!(stderr.contains("boom"), "stderr: {stderr}");
 
     // An error in a *non-outermost* slot (the first of two, since parts
@@ -9125,16 +9139,22 @@ fn test_string_interpolation_path_context_fanout_continues_rest_1403() -> Result
     // structurally by `Expr::Optional`'s own arm one level up (not by an
     // ambient `optional` reaching this arm's internal gate, the pre-#2073
     // mechanism). Same already-built prefix (`out`) either way, still paired
-    // with the *fresh, empty* path a built string always continues `rest`
-    // from (`continue_rest_with_fresh_root` -- a string is not a document
-    // node), so `key` after the `?` still resolves against that empty path
-    // and still yields `null`, matching the tail-position `?` cases above.
+    // with a detached string (a built string is not a document node), so
+    // `key` after the `?` emits nothing, matching the tail-position `?`
+    // cases above (spine 2416's identity pass; `| length` shows the prefix
+    // did reach `rest`).
     let (stdout, _, code) = run_jq_full(
         &["-c", ".a | (\"\\(key, error(\"boom\"))\")? | key"],
         Some(r#"{"a":1}"#),
     )?;
     assert_eq!(code, 0);
-    assert_eq!(stdout, "null\n");
+    assert_eq!(stdout, "");
+    let (stdout, _, code) = run_jq_full(
+        &["-c", ".a | (\"\\(key, error(\"boom\"))\")? | length"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "1\n");
 
     // `rest` itself fails on a fanned-out combination with no trailing
     // control of the interpolation's own (a plain `ManyOwned` result):
@@ -9214,11 +9234,15 @@ fn test_func_def_path_context_builtins_1306() -> Result<()> {
     // `continue_rest_with_context` branch.
     let (stdout, _, code) = run_jq_full(&["-c", ".a | (def f: 5; f) | key"], Some(r#"{"a":1}"#))?;
     assert_eq!(code, 0);
-    // #1409: `null`, not `"a"` -- `f`'s output is the literal `5`, a fresh
-    // root with no path, exactly as the un-wrapped `.a | 5 | key` already
-    // reports. (Real yq emits *no* output at all there, a separate,
-    // pre-existing divergence this assertion isn't about.)
-    assert_eq!(stdout.trim(), "null");
+    // #1409: not `"a"` -- `f`'s output is the literal `5`, a detached value
+    // with no position. Nothing, not `null`, since spine 2416's identity
+    // pass: the bound body is one more stage of the owned identity pipe,
+    // where a literal detaches (ADR-0021 decision 7), exactly as the
+    // un-wrapped `.a | 5 | key` already reports on this same binary in jq
+    // mode -- the eager evaluator's `null` here was its own "fresh root"
+    // answer, not a rule any other route gave. (Real yq emits no output
+    // there either; jq itself has no `key`, so there is no oracle row.)
+    assert_eq!(stdout.trim(), "");
 
     Ok(())
 }
@@ -39462,6 +39486,202 @@ fn test_as_binding_keeps_the_input_identity_2563() -> anyhow::Result<()> {
         // what makes the refusal free.
         (".a.b | . as $x | (key and parent)", "true"),
         (".c | . as [$x] | key + \"x\"", "\"cx\""),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "`{filter}`: {out:?} {err}");
+        assert_eq!(out.trim_end(), want, "`{filter}`");
+    }
+    Ok(())
+}
+
+/// Spine 2416's identity pass in jq mode. jq 1.7.1 has no `key`/`parent`/
+/// `path/0`, so every row here is succinctly's own extension surface, pinned
+/// so the route change is readable: the first table is unchanged from
+/// before the pass ("same answers, different route"), the second is the
+/// rows that moved, each to the answer the tree-structural model the other
+/// rules already give (ADR-0021 decision 7; ADR-0018 rule 5) -- a value
+/// built by `if`/`try`/`label`/`def`/`limit`/`first`/`last`/`"\\(..)"` is
+/// placed by the same rule as the un-wrapped stage (`.a.b | (key + "x") |
+/// key` printed nothing before the pass, so `if .. then key + "x" .. | key`
+/// prints nothing now), a `parent` operand places the output at the
+/// ancestor (`.a.b | parent + {} | key` is `"a"`, which is also yq v4.53.3's
+/// answer), and a `map` over a container detaches its output (yq: `.a |
+/// map(key + "x") | key` prints nothing). Captured 2026-09-07 on the JSON
+/// spelling of `tests/yq_cli_tests.rs`'s `IDENTITY_PASS_DOC_2416`.
+#[test]
+fn test_identity_pass_constructs_jq_2416() -> anyhow::Result<()> {
+    let doc = r#"{"a":{"b":1,"e":2},"c":[10,20],"n":0,"m":1,"s":"hi","u":null}"#;
+    // Unchanged by the pass.
+    for (filter, want) in [
+        (".a.b | (key + \"x\") | key", ""),
+        (".a.b | (key + \"x\") | path", "[]"),
+        (".a.b | (key and 1) | key", "\"b\""),
+        (".a.b | (try key catch \"c\") | path", "[\"a\",\"b\"]"),
+        (".a.b | (try error(\"x\") catch .) | key", "\"b\""),
+        (".a.b | (try error(\"x\") catch .) | path", "[\"a\",\"b\"]"),
+        (".a.b | (try (.e) catch \"c\") | key", "\"b\""),
+        (".a.b | (key)? | path", "[\"a\",\"b\"]"),
+        (".a.b | (error(\"x\"))? | key", ""),
+        (".a.b | (label $o | key) | path", "[\"a\",\"b\"]"),
+        (".a.b | (label $o | parent) | key", "\"a\""),
+        (".a.b | reduce (key) as $k (\"\"; . + $k) | key", "\"b\""),
+        (
+            ".a.b | reduce (key) as $k (\"\"; . + $k) | path",
+            "[\"a\",\"b\"]",
+        ),
+        (
+            ".a.b | reduce (key) as $k (\"\"; . + $k) | parent | key",
+            "\"a\"",
+        ),
+        (".a.b | reduce (1,2) as $x (parent; .) | key", "\"b\""),
+        (
+            ".a.b | reduce (1,2) as $x (parent; .) | path",
+            "[\"a\",\"b\"]",
+        ),
+        (".a.b | foreach (key) as $k (\"\"; . + $k) | key", "\"b\""),
+        (
+            ".a.b | foreach (key) as $k (\"\"; . + $k) | path",
+            "[\"a\",\"b\"]",
+        ),
+        (
+            ".a.b | foreach (1,2) as $x (parent; .) | key",
+            "\"b\"\n\"b\"",
+        ),
+        ("def f: key; .a.b | f | path", "[\"a\",\"b\"]"),
+        (".a.b | def f: parent; f | key", "\"a\""),
+        (".a.b | def f: parent; f | path", "[\"a\"]"),
+        ("def f(x): x; .a.b | f(parent) | key", "\"a\""),
+        (".c | . as [$x] | key", "\"c\""),
+        (".c | . as [$x] | path", "[\"c\"]"),
+        (".a | . as {b: $x} | key", "\"a\""),
+        (".a.b | limit(1; key) | path", "[\"a\",\"b\"]"),
+        (".a.b | limit(1; parent) | key", "\"a\""),
+        (".a.b | first(parent) | key", "\"a\""),
+        (".a.b | last(key, parent) | key", "\"a\""),
+        (".a.b | last(parent) | key", "\"a\""),
+        (".a.b | nth(1; key, parent) | key", "\"b\""),
+        (
+            ".a.b | if key == \"b\" then parent else \"y\" end | key",
+            "\"a\"",
+        ),
+        (
+            ".a.b | if key == \"z\" then parent else \"y\" end | path",
+            "[]",
+        ),
+        (
+            ".a.b | if key == \"z\" then parent else . end | path",
+            "[\"a\",\"b\"]",
+        ),
+        (".a.b | \"k=\\(key)\" | path", "[]"),
+        (".a.b | (key, parent) | path", "[\"a\",\"b\"]\n[\"a\"]"),
+        (".a.b | (path, parent) | path", "[\"a\",\"b\"]\n[\"a\"]"),
+        (".a.b | (1, parent) | path", "[]\n[\"a\"]"),
+        (".a.b | [(key and parent)] + [\"x\"] | key", "\"b\""),
+        (
+            ".a.b | [(key and parent)] + [\"x\"] | path",
+            "[\"a\",\"b\"]",
+        ),
+        (".a.b | (key | tostring) | key", "\"b\""),
+        (".a.b | (key | length) | key", "\"b\""),
+        (".a.b | (file_index | tostring) | key", "\"b\""),
+        (".a.b | (file_index | tostring) | path", "[\"a\",\"b\"]"),
+        (".a.b | . as $x | (key and parent) | key", "\"b\""),
+        (".a.b | . as $x | (key and parent) | path", "[\"a\",\"b\"]"),
+        (".a.b | . as $x | (key and parent) | {z: .} | path", "[]"),
+        (".a | map(key + \"x\") | .[0] | key", "0"),
+        (".a | map(parent)", "[{\"b\":1,\"e\":2},{\"b\":1,\"e\":2}]"),
+        (".a | map(parent | key)", "[\"a\",\"a\"]"),
+        (
+            ".a | map(parent(2) | keys)",
+            "[[\"a\",\"c\",\"m\",\"n\",\"s\",\"u\"],[\"a\",\"c\",\"m\",\"n\",\"s\",\"u\"]]",
+        ),
+        (".c | map(key)", "[0,1]"),
+        (".a | map(. as $x | key)", "[\"b\",\"e\"]"),
+        (".a | map(select(key == \"b\")) | key", ""),
+        (".a | map(key) | .[0] | parent | key", ""),
+        (".a | .b |= key | key", "\"a\""),
+        (".a | .b |= key | path", "[\"a\"]"),
+        (".a | .b += (key | length) | key", "\"a\""),
+        (".a | .b |= (parent | keys) | key", "\"a\""),
+        (".a.x | .b |= key", "{\"b\":\"b\"}"),
+        (".a.x | .b |= path", "{\"b\":[\"a\",\"x\",\"b\"]}"),
+        (".a.x | .b |= key | key", "\"x\""),
+        (".a.x | .b |= key | path", "[\"a\",\"x\"]"),
+        (".a.x | .b += key", "{\"b\":\"x\"}"),
+        (".a.x | .b += key | key", "\"x\""),
+        (".a | . as $v | .b |= key | key", "\"a\""),
+        (".a | (.b, .e) |= key | key", "\"a\""),
+        (".a | .b |= (key, path) | key", "\"a\""),
+        (".a | .b |= select(key == \"b\") | key", "\"a\""),
+        (".a | .b |= parent | key", "\"a\""),
+        (".a | .b //= key | key", "\"a\""),
+        (".a.x | .b //= key", "{\"b\":\"x\"}"),
+        (".a.x | {\"k\": key}", "{\"k\":\"x\"}"),
+        (".a.x | {\"k\": key} | key", ""),
+        (".a.x | {\"k\": path} | path", "[]"),
+        (".a.x | {\"k\": parent} | key", ""),
+        (".a.b | {\"k\": key} | .k | key", "\"k\""),
+        (".a.b | {\"k\": key} | .k | path", "[\"k\"]"),
+        (".a.x | {(key): 1}", "{\"x\":1}"),
+        (".a.x | {(key): 1} | key", ""),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "`{filter}`: {out:?} {err}");
+        assert_eq!(out.trim_end(), want, "`{filter}`");
+    }
+    // Moved by the pass (the eager evaluator's accumulated-path answer
+    // before it; the identity rules' answer now).
+    for (filter, want) in [
+        (".a.b | (key == \"b\") | key", "\"b\""),
+        (".a.b | (try key catch \"c\") | key", ""),
+        (".a.x | (try key catch \"c\") | key", ""),
+        (".a.b | (key)? | key", ""),
+        (".a.b | label $o | (key, break $o) | key", ""),
+        (".a.b | (label $o | key) | key", ""),
+        ("def f: key; .a.b | f | key", ""),
+        (".a.b | def f: key; f | key", ""),
+        ("def f(x): x; .a.b | f(key) | key", ""),
+        (".c | . as [$x] | (key + \"x\") | key", ""),
+        (".a | . as {b: $x} | parent | key", ""),
+        (".a.b | limit(1; key) | key", ""),
+        (".a.b | limit(1; key, parent) | key", ""),
+        (".a.b | first(key) | key", ""),
+        (".a.b | first(key, parent) | key", ""),
+        (".a.b | last(key) | key", ""),
+        (
+            ".a.b | if key == \"b\" then key + \"x\" else \"y\" end | key",
+            "",
+        ),
+        (
+            ".a.b | if key == \"b\" then key + \"x\" else \"y\" end | path",
+            "[]",
+        ),
+        (
+            ".a.b | if key == \"z\" then parent else \"y\" end | key",
+            "",
+        ),
+        (".a.b | \"k=\\(key)\" | key", ""),
+        (".a.b | \"k=\\(key)\" | parent", ""),
+        (".a.b | \"\\(key)\" | key", ""),
+        (".a.b | (key, path) | key", "\"b\""),
+        (".a.b | (key, parent) | key", "\"a\""),
+        (".a.b | (parent | length) == 2 | key", "\"a\""),
+        (".a.b | (parent | length) == 2 | path", "[\"a\"]"),
+        (".a.b | parent + {} | key", "\"a\""),
+        (".a.b | parent + {} | path", "[\"a\"]"),
+        (".a.b | -(parent|length) | key", "\"a\""),
+        (".a.b | -(parent|length) | path", "[\"a\"]"),
+        (".a.b | -(key|length) | key", "\"b\""),
+        (".a.b | . as $x | (key and parent) | {z: .} | key", ""),
+        (".a | map(key + \"x\") | key", ""),
+        (".a | map(key + \"x\") | path", "[]"),
+        (".a | map(key + \"x\") | .[0] | path", "[0]"),
+        (".a | map(key + \"x\") | .[0] | parent | key", ""),
+        (
+            ".a | map_values(parent)",
+            "{\"b\":{\"b\":1,\"e\":2},\"e\":{\"b\":1,\"e\":2}}",
+        ),
+        (".a | map_values(parent | length)", "{\"b\":2,\"e\":2}"),
     ] {
         let (out, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
         assert_eq!(code, 0, "`{filter}`: {out:?} {err}");
