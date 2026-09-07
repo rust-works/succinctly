@@ -6227,7 +6227,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                     | Expr::SliceExpr { .. }
                     | Expr::Builtin(Builtin::Map(_) | Builtin::Select(_))
             ),
-        "eval_single called with optional=true for an expr with no known unreachable-via-parser exemption: {expr:?}"
+        "eval_single called with optional=true for an expr with no known unreachable-via-parser exemption: {expr:?}" // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the #2368 pin itself, only formatted if the assert's own condition is false (#2368)"
     );
     match expr {
         // Forward the cursor when we have one, so a bare `line`/`column`
