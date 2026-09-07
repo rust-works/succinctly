@@ -117,6 +117,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`eval_generic::eval_index_expr`'s "promote `cursors`, preserving an
+  in-flight `Control`'s priority over a secondary decode failure" dispatch is
+  now one shared definition** (#2364), not three independent hand-copies
+  (`escape_generic!`, the key stream's own `Flow::Escaped` tail, and part of
+  `ensure_owned!`/the `KeyTargets::Partial` arm's promotion) — each
+  independently fixed by #2145/#2340/an earlier review finding as the same
+  "double fault" gap (converting an already-running prefix fails on top of
+  the original escape) was rediscovered at each site. New helpers
+  `downgrade_control_on_promotion_failure` and
+  `resolve_terminal_prefix_generic` (mirroring `eval.rs`'s own
+  `resolve_terminal_prefix`) collapse three of the four sites; a new
+  cross-site test drives the same double-fault document/target through all
+  three reachable ones and asserts they agree. No behavior change.
+
 - **`eval_generic::push_generic_truthiness_cursor_error`'s object/array arms now call
   `container_tail_gap_ok` instead of hand-inlining the `None`/`Some(last)`
   container-vs-trailing-gap dispatch** (#2409). No behavior change: this was the last

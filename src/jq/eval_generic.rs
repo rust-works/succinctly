@@ -530,6 +530,44 @@ fn to_owned_all_cursors_checked<C: DocumentCursor>(
     Ok(acc)
 }
 
+/// The `Control` a secondary decode failure (converting an already-running
+/// `cursors` prefix) should report, given the `control` already in flight
+/// when it fired -- mirrors `eval::resolve_terminal_prefix`'s identical
+/// Halt-survives/Error-downgrade rule (#2364; see that function's own doc
+/// comment for the full rationale): an uncatchable `Halt` must not be
+/// silently turned into a catchable decode error just because rendering its
+/// own already-abandoned prefix hit an unrelated problem, but `Error`/
+/// `Break` simply downgrade to the new one.
+fn downgrade_control_on_promotion_failure(control: Control, e: EvalError) -> Control {
+    match control {
+        Control::Halt(code) => Control::Halt(code),
+        Control::Error(_) | Control::Break(_) => Control::Error(e),
+    }
+}
+
+/// Generic-evaluator counterpart of `eval::resolve_terminal_prefix` (#2364):
+/// promotes `cursors` into a checked `Vec<OwnedValue>` via
+/// [`to_owned_all_cursors_checked`], applying
+/// [`downgrade_control_on_promotion_failure`] to `control` on a secondary
+/// failure. Used at the two `eval_index_expr` sites that always escape once
+/// this resolves, regardless of outcome (`escape_generic!`, and the key
+/// stream's own `Flow::Escaped` tail) -- see `downgrade_control_on_promotion_
+/// failure`'s doc comment for why `Halt` needs different treatment than a
+/// bare `Result` would give it. The `Partial`-arm promotion one level in
+/// (inside `fold_escaped_generator_prefix!`'s `promote:` block) needs to
+/// distinguish success (continue running) from failure (escape) rather than
+/// always doing the latter, so it calls `downgrade_control_on_promotion_
+/// failure` directly instead of this wrapper.
+fn resolve_terminal_prefix_generic<C: DocumentCursor>(
+    cursors: &[C],
+    control: Control,
+) -> (Vec<OwnedValue>, Control) {
+    match to_owned_all_cursors_checked(cursors) {
+        Ok(vs) => (vs, control),
+        Err((prefix, e)) => (prefix, downgrade_control_on_promotion_failure(control, e)),
+    }
+}
+
 fn to_owned_cursor_at_depth<C: DocumentCursor>(
     cursor: &C,
     depth: usize,
@@ -10330,20 +10368,14 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
     macro_rules! escape_generic {
         ($control:expr) => {{
             let control = $control;
-            let out = if any_owned {
-                core::mem::take(&mut owned)
+            // #2364: `resolve_terminal_prefix_generic` is the one shared
+            // definition of "promote `cursors`, preserving `control`'s
+            // priority over a secondary decode failure" -- this used to be
+            // written out inline here.
+            let (out, control) = if any_owned {
+                (core::mem::take(&mut owned), control)
             } else {
-                match to_owned_all_cursors_checked(&cursors) {
-                    Ok(vs) => vs,
-                    Err((prefix, e)) => {
-                        let control = match control {
-                            Control::Halt(code) => Control::Halt(code),
-                            Control::Error(_) | Control::Break(_) => Control::Error(e),
-                        };
-                        terminal = Some(partial_generic(prefix, control));
-                        return Demand::Stop;
-                    }
-                }
+                resolve_terminal_prefix_generic(&cursors, control)
             };
             terminal = Some(partial_generic(out, control));
             return Demand::Stop;
@@ -10503,20 +10535,28 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                             // on a `Partial` whose prefix must survive, so the
                             // `eval_try`/`Expr::Optional` boundary suppresses
                             // it, not this site.
+                            //
+                            // #2364: `downgrade_control_on_promotion_failure`
+                            // is the same Halt-survives rule
+                            // `escape_generic!` shares via
+                            // `resolve_terminal_prefix_generic` -- called
+                            // directly here (not through that wrapper)
+                            // because this site, unlike `escape_generic!`,
+                            // needs to distinguish success (fall through,
+                            // keep running) from failure (escape).
                             owned = match to_owned_all_cursors_checked(&cursors) {
                                 Ok(vs) => vs,
                                 Err((prefix, e)) => {
-                                    let control = match control {
-                                        Control::Halt(code) => Control::Halt(code),
-                                        Control::Error(_) | Control::Break(_) => Control::Error(e),
-                                    };
                                     // #2138: this `promote:` block runs from
                                     // inside the per-key sink, which can only
                                     // answer `Demand` -- see `escape_generic!`'s
                                     // own doc comment above for why this parks
                                     // the answer in `terminal` instead of
                                     // `return`ing a `GenericResult` directly.
-                                    terminal = Some(partial_generic(prefix, control));
+                                    terminal = Some(partial_generic(
+                                        prefix,
+                                        downgrade_control_on_promotion_failure(control, e),
+                                    ));
                                     return Demand::Stop;
                                 }
                             };
@@ -10832,26 +10872,18 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                 return GenericResult::Break(label)
             }
             control => {
-                let out = if any_owned {
-                    owned
+                // STYLE-0012: prefix-preserving by design, per the comment
+                // above -- an `Error` rides out on a `Partial` whose prefix
+                // must survive, so the `eval_try`/`Expr::Optional` boundary
+                // suppresses it, not this site; a `Halt` deliberately
+                // discards the conversion error rather than raising or
+                // suppressing it. #2364: same
+                // `resolve_terminal_prefix_generic` the `escape_generic!`
+                // arm this mirrors now shares.
+                let (out, control) = if any_owned {
+                    (owned, control)
                 } else {
-                    // STYLE-0012: prefix-preserving by design, per the
-                    // comment above -- an `Error` rides out on a `Partial`
-                    // whose prefix must survive, so the `eval_try`/
-                    // `Expr::Optional` boundary suppresses it, not this
-                    // site; a `Halt` deliberately discards the conversion
-                    // error rather than raising or suppressing it. Same
-                    // reasoning as the `escape_generic!` arm this mirrors.
-                    match to_owned_all_cursors_checked(&cursors) {
-                        Ok(vs) => vs,
-                        Err((prefix, e)) => {
-                            let control = match control {
-                                Control::Halt(code) => Control::Halt(code),
-                                Control::Error(_) | Control::Break(_) => Control::Error(e),
-                            };
-                            return partial_generic(prefix, control);
-                        }
-                    }
+                    resolve_terminal_prefix_generic(&cursors, control)
                 };
                 return partial_generic(out, control);
             }
@@ -23401,6 +23433,75 @@ mod tests {
             }
             other => panic!("expected Partial([\"ok\"], decode Error), got {other:?}"),
         }
+    }
+
+    /// #2364: `eval_index_expr` had this same "promote `cursors`, preserving
+    /// an in-flight `control`'s priority over a secondary decode failure"
+    /// dispatch hand-copied at three reachable sites (`escape_generic!`, the
+    /// `ensure_owned!` macro, and the key stream's own `Flow::Escaped` tail
+    /// -- a fourth, `KeyTargets::Partial`'s own `promote:` block, is
+    /// defensive/unreachable, per its own doc comment). Now that all three
+    /// share one definition (`resolve_terminal_prefix_generic`/
+    /// `downgrade_control_on_promotion_failure`), this drives the same
+    /// underlying document through all three (target `.arr[]` throughout,
+    /// so `cursors` genuinely holds both the "ok" and undecodable cursors
+    /// by the time each scenario's own escape fires -- unlike a comma
+    /// target such as `(.arr[0],.arr[1])`, which forces an eager owned
+    /// conversion up front and so never reaches the checked-conversion path
+    /// this test means to exercise at all) and asserts they agree on the
+    /// same `Partial(["ok"], Error(decode failure))` shape; only the second
+    /// key (the event that triggers each scenario's own escape) differs.
+    /// `ensure_owned!`'s scenario reuses
+    /// `generic_ensure_owned_keeps_convertible_prefix_on_double_fault_2340`'s
+    /// document/target/keys verbatim; the third exercises a scenario neither
+    /// existing test covers: the *key expression itself* escaping
+    /// (`error("boom")`), not the target or its indexing step. Confirmed
+    /// against jq 1.7.1 for the non-corrupted shape:
+    /// `{"arr":[{"bad":"ok"},{"bad":"safe"}]} | .arr[][("bad",5)]` prints
+    /// `"ok"`, `"safe"` before raising "Cannot index object with number",
+    /// and `.arr[][("bad",error("boom"))]` prints `"ok"`, `"safe"` before
+    /// raising `"boom"`.
+    #[test]
+    fn generic_index_expr_promotion_sites_agree_on_double_fault_2364() {
+        let json: &[u8] = b"{\"arr\":[{\"bad\":\"ok\"},{\"bad\":\"\xff\xfe\"}]}";
+        let index = JsonIndex::build(json);
+
+        let assert_ok_prefix_then_decode_error = |expr_str: &str| {
+            let expr = crate::jq::parse(expr_str).unwrap();
+            match eval_with_cursor(&expr, index.root(json)) {
+                GenericResult::Partial(vs, Control::Error(e)) => {
+                    assert_eq!(vs, vec![OwnedValue::String("ok".to_string())], "{expr_str}");
+                    assert!(e.is_decode_failure(), "{expr_str}: {e:?}");
+                }
+                other => {
+                    panic!("{expr_str}: expected Partial([\"ok\"], decode Error), got {other:?}")
+                }
+            }
+        };
+
+        // Site: `escape_generic!`, via a later key's target-index failing
+        // (indexing an object by a number). Deliberately `.arr[]`, not
+        // `(.arr[0],.arr[1])` (the sibling `..._2145` test's own target):
+        // that comma shape forces an eager owned conversion of the whole
+        // target up front, so it reaches this scenario through a different
+        // path entirely (`KeyTargets::Partial`'s trivially-succeeding
+        // `promote:`, `cursors` still empty, then `escape_generic!`'s
+        // `any_owned == true` branch) and never calls the checked-conversion
+        // path this test means to exercise (review finding, confirmed via
+        // temporary tracing). `.arr[]` stays lazy per key, so `cursors`
+        // genuinely holds both cursors by the time key `5` fails.
+        assert_ok_prefix_then_decode_error(r#".arr[][("bad",5)]"#);
+
+        // Site: `ensure_owned!`, via a later key's target-index resolving to
+        // a fresh owned value (an absent field reads as `null`) -- same
+        // scenario as
+        // `generic_ensure_owned_keeps_convertible_prefix_on_double_fault_2340`.
+        assert_ok_prefix_then_decode_error(r#".arr[][("bad","missing")]"#);
+
+        // Site: the key stream's own `Flow::Escaped` tail -- the *key*
+        // expression itself escapes (`error("boom")`), independent of the
+        // target or its indexing.
+        assert_ok_prefix_then_decode_error(r#".arr[][("bad",error("boom"))]"#);
     }
 
     /// #2340 review round 2 originally found a case where an already-pending
