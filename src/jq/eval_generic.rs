@@ -3,6 +3,22 @@
 //! This module provides a document-agnostic evaluator that works with any type
 //! implementing the `DocumentValue` trait, enabling direct evaluation of both
 //! JSON and YAML without intermediate conversion.
+//!
+//! **`optional` handling is currently unexercised outside four exempted expr
+//! shapes (#2368).** `eval_single`'s own doc comment carries the pinning
+//! `debug_assert`, the exemption list (`Expr::IndexExpr`/`Expr::SliceExpr`,
+//! and the older, separate `Builtin::Map`/`Builtin::Select` case), and the
+//! full rationale; the short version is that no parser-driven query today
+//! reaches this file's native dispatch with `optional = true` for any other
+//! expression shape, so `#2334`'s `owned_or_suppress!`/
+//! `suppresses(&e, optional)` routing in `fold_lazy_seq_stage`,
+//! `Shuffle`/`Pivot`/`ToEntries`, `each_repeat_generic`, `slice_one_generic`,
+//! and `finish_fork_generic` is correct-looking but untested dead code.
+//! Before adding a second dispatch path that forces `optional = true` for
+//! anything outside that exemption list, read `eval_single`'s own doc
+//! comment and re-audit every one of those sites by hand -- the debug assert
+//! will catch that it happened, not whether each site's own suppression
+//! logic is actually correct for the case that just went live.
 
 // #1670: see `eval.rs`'s own copy of this attribute for the full
 // rationale. Use `crate::jq::eval::vec_with_capacity`/`string_with_capacity`
@@ -6156,12 +6172,63 @@ fn try_single_generic<S: EvalSemantics, V: DocumentValue>(
 }
 
 /// Evaluate a single expression against a value with optional cursor context.
+///
+/// **`optional = true` is unreachable here for every `expr` shape except the
+/// four named in the assert below (#2368, a #2334 follow-up).**
+/// `Expr::IndexExpr`/`Expr::SliceExpr` are reached via the
+/// `Expr::Optional(inner) if matches!(**inner, IndexExpr | SliceExpr)` arm
+/// below, the *only* call site in this file's whole recursive dispatch that
+/// ever passes `true` instead of forwarding the ambient `optional`.
+/// `Expr::Builtin(Builtin::Map(_))`/`Expr::Builtin(Builtin::Select(_))` are a
+/// separate, older exemption (#693/#725): both are provably unreachable with
+/// `optional = true` through the parser for the identical reason (`map(f)?`/
+/// `select(cond)?` parse to `Expr::Optional(Builtin::Map/Select(..))`, which
+/// falls to the generic `Expr::Optional` catch-all further below -- ambient
+/// `optional`, never forced -- not the `IndexExpr`/`SliceExpr`-only special
+/// case), and each is pinned by calling this function directly with
+/// `optional: true` from a unit test (`Builtin::Map`'s own
+/// `..._is_unreachable_via_parser_725` test calls this exact function this
+/// way; `Builtin::Select`'s sibling arm carries the identical comment
+/// without yet having its own such test).
+///
+/// Beyond those four, #693 first claimed unreachability broadly, #2334
+/// re-confirmed it with a `debug_assert!(!optional)` probe, and #2334's
+/// review confirmed it a third time from a different angle (an instrumented
+/// `sort_family_control` call counter, `optional = true`, recorded zero hits
+/// across the full `jq_cli_tests` + `yq_cli_tests` suites). The
+/// `owned_or_suppress!` conversions and `Err(e) if suppresses(&e, optional)`
+/// guards #2334 added to `fold_lazy_seq_stage`, `Shuffle`/`Pivot`/
+/// `ToEntries`, `each_repeat_generic`, `slice_one_generic`, and
+/// `finish_fork_generic` are therefore all dead code today, by design --
+/// correct-looking, kept for the day a second dispatch path forces
+/// `optional = true` for one of them, but untested and
+/// unreviewable-for-blast-radius until that day arrives (see #2368 for the
+/// full risk: #2334's own review caught one of those sites,
+/// `sort_family_control`, suppressing `sort_by(error("x"))`, an
+/// authorization `optional` never actually granted it). This assert is the
+/// pin: it fires the moment a fifth expr shape reaches here with
+/// `optional = true`, pointing straight back here instead of leaving it to
+/// be rediscovered by reading. Add a new expr shape to the exemption list
+/// only alongside the same due diligence #693/#725/#2334 each did for
+/// theirs -- a live repro proving the parser really can reach it, or a
+/// direct-call unit test proving the caller-side handling is correct for
+/// the day it does.
 fn eval_single<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     value: V,
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
+    debug_assert!(
+        !optional
+            || matches!(
+                expr,
+                Expr::IndexExpr { .. }
+                    | Expr::SliceExpr { .. }
+                    | Expr::Builtin(Builtin::Map(_) | Builtin::Select(_))
+            ),
+        "eval_single called with optional=true for an expr with no known unreachable-via-parser exemption: {expr:?}"
+    );
     match expr {
         // Forward the cursor when we have one, so a bare `line`/`column`
         // downstream of a no-op navigation step (`. | line`) still resolves

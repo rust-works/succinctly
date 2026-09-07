@@ -117,6 +117,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`eval_generic::eval_single` now pins its own unreachability claim with a
+  `debug_assert`** (#2368, a #2334 follow-up). #2334's `owned_or_suppress!`/
+  `Err(e) if suppresses(&e, optional)` routing in `fold_lazy_seq_stage`,
+  `Shuffle`/`Pivot`/`ToEntries`, `each_repeat_generic`, `slice_one_generic`,
+  and `finish_fork_generic` is correct-looking but untested dead code
+  today — no parser-driven query
+  reaches any of it with `optional = true` (confirmed three independent
+  ways across #693/#2334/#2334's own review). The assert fires the moment a
+  future dispatch path changes that for any expr shape outside the four
+  already-known exemptions (`Expr::IndexExpr`/`Expr::SliceExpr`, and the
+  separate, older `Builtin::Map`/`Builtin::Select` case from #693/#725),
+  rather than leaving that discovery to a future reviewer reading a
+  12k-line file. No behavior change.
+
 - **`eval.rs`'s slice-bound-generator-to-integer conversion loop is now one
   shared definition** (#2410), not three independent hand-copies
   (`eval_slice_bound`, `eval_slice_bound_with_path_context`,
