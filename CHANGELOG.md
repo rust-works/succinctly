@@ -232,6 +232,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   M2 streaming writer, which now all agree (they previously disagreed with
   each other, not just with the oracle). yq mode is unaffected.
 
+### Performance
+
+- **`succinctly yq`'s streaming write path no longer resolves a scalar
+  mapping field's (or flow-mapping field's) value twice** (#1114): every
+  ordinary `key: value` field wrote its value by first resolving it once to
+  classify a deferred value as absent, then, unconditionally on the common
+  non-absent path, resolved the identical cursor a second time inside the
+  value-streaming call itself. The two call sites (`write_deferred_value`,
+  `write_yaml_child_inline`) now resolve at most once per field and thread
+  that value through both the classification and the streaming write.
+  Measured via interleaved A/B on the pinned boxes (`johns-mac-mini` M4 Pro,
+  `terminus` Zen 4), `yq '.'` over a 20-60MB array of small records:
+  **-14.2% to -14.7%** (M4 Pro), **-14.2% to -14.4%** (Zen 4), output
+  byte-identical before/after in every run.
+
 ### Removed
 
 - **The eager path-context evaluator is gone** (spine 2416, closes #2559).
