@@ -13351,6 +13351,167 @@ fn path_context_step_computed_slice<S: EvalSemantics, V: DocumentValue>(
     stepped.map_err(|c| path_context_component_escape::<S, V>(out, produced_from, c))
 }
 
+/// The integer argument of a position-navigation builtin (`at_offset`,
+/// `at_position`), from whichever result shape its argument expression
+/// produced. `None` means "not an integer", which each caller turns into its
+/// own message.
+///
+/// One definition for what were three copies of the same match, because
+/// #2168 had to add an arm to all of them and CLAUDE.md's rule about
+/// duplicated predicates diverging silently is exactly this shape. The new
+/// arm is `OneCursor`: `getpath(["n"])` answered with an `OwnedValue` until
+/// #2168 gave it a cursor walk, so `at_offset(getpath(["n"]))` -- which
+/// worked, and is pinned by
+/// `test_at_offset_and_at_position_accept_a_document_sourced_argument` --
+/// stopped being recognised. Reading the integer through the cursor restores
+/// it, and closes the gap that regression exposed: a plainly navigated
+/// argument (`at_offset(.n)`) never worked either, for want of this same arm,
+/// and nothing had noticed because no test spelled it.
+fn position_arg_integer<V: DocumentValue>(result: &GenericResult<V>) -> Option<i64> {
+    match result {
+        GenericResult::Owned(v) => v.as_i64(),
+        GenericResult::One(v) => v.as_i64(),
+        GenericResult::OneCursor(c) => c.value().as_i64(),
+        _ => None,
+    }
+}
+
+/// `getpath(p)` walked over cursors, resolving one already-evaluated path
+/// against the document without materializing it (#2168).
+///
+/// This is the read `.a[0].b` performs, spelled as data, and it now costs
+/// the same. Until #2168 this builtin materialized the **whole document**
+/// first: `getpath([0])` on a 300 K-element array cost 0.085 s and 75 MiB
+/// against `.[0]`'s 0.018 s and 10.7 MiB, to answer with one number. That
+/// tree was not waste at the time -- it doubled as the #1755/#1953 validity
+/// gate, so `{"a":"\ud800","d":5} | getpath(["d"])` raised where the same
+/// document's `.d` answered `5`. #2168 settled that inconsistency the other
+/// way: a read validates what it reads. See `path_context_root` for the
+/// same decision on `path`/`key`/`parent`, and
+/// `docs/compliance/jq/limitations.md` for the ADR-0018 record.
+///
+/// The step table below is deliberately **not** `path_step_generic`'s.
+/// That walk answers "where would this navigation land", under the mode's
+/// own navigation rules -- yq's negative-index raise (#2254), its
+/// absent-key and scalar-index no-ops (#2470/#2482), its numeric-index-on-
+/// mapping `null` (#2459). `getpath`'s contract is
+/// [`crate::jq::eval::getpath_walk_owned_segments`]'s table, which has none
+/// of those (its only mode fork is the yq object-slice arm, #1102), so this
+/// mirrors that one instead. Where the two would disagree the owned table
+/// wins, because it is what this builtin answered before and what
+/// `eval.rs`'s own route still answers.
+///
+/// Only two segment shapes are taken here -- a string key into an object, a
+/// number into an array -- because only those name a node the document
+/// already holds. A slice descriptor *computes* a value that is nowhere in
+/// the document, so at the first one this materializes the single node it
+/// has reached and hands the remaining segments back to the owned table.
+/// Every other pairing is a type error, raised straight from the cursor so
+/// that reporting it costs no materialization either (`getpath([0])` on a
+/// large object says `Cannot index object with number` without building
+/// it).
+fn getpath_walk_cursor<S: EvalSemantics, V: DocumentValue>(
+    root: V::Cursor,
+    path: &OwnedValue,
+    optional: bool,
+) -> GenericResult<V> {
+    let OwnedValue::Array(segments) = path else {
+        return if optional {
+            GenericResult::None
+        } else {
+            GenericResult::Error(EvalError::path_must_be_array())
+        };
+    };
+
+    let mut c = root;
+    for (i, segment) in segments.iter().enumerate() {
+        let v = c.value();
+
+        // jq: `null | getpath(["a"])` is `null`, and so is every deeper
+        // segment past it -- the owned table's own first arm, which also
+        // absorbs the "key not found" and "index out of range" exits below
+        // by walking on from a `null`.
+        if v.is_null() {
+            return GenericResult::Owned(OwnedValue::Null);
+        }
+
+        if let (Some(fields), OwnedValue::String(key)) = (v.as_object(), segment) {
+            // `find_cursor`, not a hand-rolled scan: it carries the
+            // last-duplicate-wins rule and the #1677/#1995 member checks
+            // for the field it returns, so a corrupted member on the read
+            // path still raises here (STYLE-0013's routed form).
+            match fields.find_cursor(key) {
+                Ok(Some(field)) => {
+                    c = field;
+                    continue;
+                }
+                Ok(None) => return GenericResult::Owned(OwnedValue::Null),
+                Err(e) if suppresses(&e, optional) => return GenericResult::None,
+                Err(e) => return GenericResult::Error(e),
+            }
+        }
+
+        let segment_is_numeric = matches!(
+            segment,
+            OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..)
+        );
+        if let Some(elements) = v.as_array().filter(|_| segment_is_numeric) {
+            let len = match elements.len_checked() {
+                Ok(len) => len,
+                Err(e) if suppresses(&e, optional) => return GenericResult::None,
+                Err(e) => return GenericResult::Error(e),
+            };
+            // `resolve_read_index` is jq's own rule, shared with the owned
+            // table rather than restated: a float truncates, a negative
+            // index counts back from the end, and anything landing outside
+            // either end -- NaN included -- reads as `null`.
+            match crate::jq::eval::resolve_read_index(segment, len)
+                .and_then(|idx| elements.get_cursor(idx))
+            {
+                Some(element) => {
+                    c = element;
+                    continue;
+                }
+                None => return GenericResult::Owned(OwnedValue::Null),
+            }
+        }
+
+        // A slice descriptor (`{"start":s,"end":e}`) builds a value the
+        // document does not contain, so the walk stops being a navigation
+        // here. Materialize just this node -- not the root -- and let the
+        // owned table finish the remaining segments, so array slicing,
+        // string slicing, yq's object slicing (#1102) and every subsequent
+        // step keep exactly one definition.
+        if matches!(segment, OwnedValue::Object(_)) {
+            let owned = owned_or_suppress!(to_owned_cursor(&c), optional);
+            return query_result_to_generic::<V>(crate::jq::eval::getpath_walk_owned_segments::<
+                Vec<u64>,
+                S,
+            >(&owned, &segments[i..], optional));
+        }
+
+        // Everything else is the owned table's own `_` arm: a type error,
+        // reported with the same helper it uses so both routes word it
+        // identically. `tagged_type_name` rather than `type_name` for the
+        // reason every other cursor-side type error uses it -- an explicit
+        // YAML tag decides the name (#747).
+        return if optional {
+            GenericResult::None
+        } else {
+            GenericResult::Error(EvalError::cannot_index(
+                tagged_type_name(&v, Some(c)),
+                segment,
+            ))
+        };
+    }
+
+    // Landed on a real document node, so hand back its cursor: `getpath`
+    // then behaves exactly as the navigation it spells, down to echoing a
+    // string this evaluator would refuse to decode (`getpath(["a"])` and
+    // `.a` agree byte for byte, and both raise once something reads it).
+    GenericResult::OneCursor(c)
+}
+
 /// `getpath(p)` as one walk step from `pos` (spine 2416, walk residue):
 /// every component of each path `p` produces is taken by the literal step
 /// that spells it, so a chain that lands on a document node keeps its
@@ -16881,66 +17042,59 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             eval_on_owned::<S, _>(&Expr::Builtin(builtin.clone()), owned, optional)
         }
 
-        // #2053: mirrors `Builtin::Path`'s #1909 treatment above -- the `_`
-        // fallback below pays a materialize + re-serialize + re-index round
-        // trip of `value` *and* a second whole-document decode inside
-        // `eval::getpath_one_path`'s own `to_owned`, just to answer
-        // a single node lookup. Unlike `Path`, `getpath`'s root
-        // materialization is not waste to begin with (#1755/#1953): it is
-        // the exact same validity gate `to_owned_with_cursor` below already
-        // pays for -- `{"a":"\ud800","d":5} | getpath(["d"])` must still
-        // raise even though the walk never reaches `.a`, where `.d`/`keys`/
-        // `length` on the same document do not. Only the *second* decode
-        // and the reindex round trip go, not the first.
+        // #2168: `getpath(P)` reads one node, and now costs one read.
         //
-        // The bypass-vs-fallback decision below is made purely from
-        // `owned`'s own shape (`reindex_bridge_is_identity`), *before*
-        // `path_expr` is touched at all. A withdrawn earlier attempt at
-        // this fix (PR #2045) instead probed `path_expr`'s output shape and
-        // fell back to a second, full re-evaluation when the probe didn't
-        // fit a recognized pattern, which fired any side effect inside
-        // `path_expr` twice: `getpath(("a"|stderr))` printed `aa` instead
-        // of jq's `a`. `fanout_arg_generic` is the fix for that shape
-        // (#1687, already used by `limit`/`nth`/`has` above): it drives
-        // `path_expr` lazily, exactly once, against the *original* cursor
-        // `value` -- so a `path_expr` that never touches `.` (the
-        // overwhelmingly common `getpath([0])`/`getpath(["a","b"])` shape)
-        // costs nothing extra beyond evaluating a small literal, and one
-        // that does touch `.` reads it through the same cheap cursor
-        // navigation any other builtin's argument already gets, rather than
-        // a second reindex of the whole document.
+        // Two rewrites got it here. #2053 removed a materialize +
+        // re-serialize + re-index round trip and a second whole-document
+        // decode, leaving a single materialization of `value`; that one was
+        // load-bearing, because it doubled as the #1755/#1953 validity gate
+        // -- `{"a":"\ud800","d":5} | getpath(["d"])` raised on it, where
+        // the same document's `.d` answered `5`. #2168 decided that
+        // inconsistency in `.d`'s favour (see `path_context_root` for the
+        // same call on `path`/`key`/`parent`), which is what lets the tree
+        // go: `getpath_walk_cursor` navigates to the node and validates
+        // only what it reads on the way.
         //
-        // Each resolved path then walks `owned` -- already materialized
-        // above -- directly via `getpath_walk_owned`, which is
-        // `eval::getpath_one_path`'s own walk with its `to_owned`
-        // call lifted out (mirrors `builtin_path_on_owned`'s identical
-        // relationship to `builtin_path`). `optional` is threaded through
-        // for real here, unlike `Path`/`Key`/`Parent`/`FileIndex`'s
-        // hardcoded `false` above -- `getpath_walk_owned` uses it to decide
-        // whether an indexing failure partway through a path raises or
-        // suppresses, so hardcoding it would be a real correctness risk if
-        // dispatch ever changed to reach here with `optional = true`.
-        // Review found no such reachable path today (`Expr::Optional`'s
-        // catch-all evaluates its inner expression at the *ambient*
-        // `optional`, same as the already-documented `Map`/`Select`
-        // precedent at `test_generic_plain_map_optional_on_non_container_is_unreachable_via_parser_725`,
-        // so `getpath(P)?` never actually forces `optional = true` into
-        // this arm) -- confirmed by swapping in a hardcoded `false` here
-        // and finding it byte-identical across the full `getpath` test
-        // suite. Threading it for real costs nothing and removes the
-        // dependency on that reachability analysis staying true, so it
-        // stays -- but it is defensive, not currently load-bearing.
-        Builtin::GetPath(path_expr) => {
-            // #2280: owned_or_suppress!, not owned_or_err! -- this arm's own
-            // walk below already threads `optional` "for real" into
-            // `getpath_walk_owned`'s per-step suppress/raise decision, so
-            // leaving the initial materialization unconditional was an
-            // inconsistency inside the very arm whose comment documents the
-            // opposite intent. Defensive today for the same #2286 reason as
-            // the `Path` arm above -- see `test_optional_ignored_sites_2280`.
-            let owned = owned_or_suppress!(to_owned_with_cursor(&value, cursor), optional);
-            if reindex_bridge_is_identity(&owned) {
-                return fanout_arg_generic::<S, V, _>(
+        // `fanout_arg_generic` stays exactly as #2053 left it, and for its
+        // reason: it drives `path_expr` lazily and **exactly once** against
+        // the original cursor. A withdrawn earlier attempt (PR #2045)
+        // probed `path_expr`'s output shape and re-evaluated the whole
+        // expression on a fallback, firing any side effect inside it twice
+        // (`getpath(("a"|stderr))` printed `aa` where jq prints `a`).
+        // Nothing here probes, so nothing re-evaluates.
+        //
+        // `reindex_bridge_is_identity` and the `eval_on_owned` fallback are
+        // gone from this arm with the tree they guarded. Their job was to
+        // keep a value whose spelling the reindex round trip would not
+        // survive (a float, a NaN, an over-cap literal) on the bridge that
+        // produced it; a cursor walk re-spells nothing, so a landed node
+        // now prints its own source bytes -- which is what `.a` reading the
+        // same node has always printed. `Builtin::Path` above still uses
+        // the predicate for its own fallback.
+        //
+        // `optional` is threaded for real, as #2053 threaded it: the walk
+        // consults it per step to decide whether an indexing failure raises
+        // or suppresses. No dispatch reaches this arm with `optional =
+        // true` today (`Expr::Optional`'s catch-all evaluates its inner
+        // expression at the *ambient* `optional`, the documented `Map`/
+        // `Select` precedent), so this remains defensive rather than
+        // load-bearing -- see `test_optional_ignored_sites_2280`.
+        Builtin::GetPath(path_expr) => match cursor {
+            Some(root) => fanout_arg_generic::<S, V, _>(
+                path_expr,
+                value.clone(),
+                optional,
+                cursor,
+                |path_owned| getpath_walk_cursor::<S, V>(root, &path_owned, optional),
+            ),
+            // A computed input has no position in any document, so there is
+            // nothing to walk and nothing this arm could validate lazily:
+            // the value is already in hand, and the owned table reads it
+            // directly. Materialized once, outside the fan-out, so a
+            // generator path still pays for it once (#2053).
+            None => {
+                let owned = owned_or_suppress!(to_owned(&value), optional);
+                fanout_arg_generic::<S, V, _>(
                     path_expr,
                     value.clone(),
                     optional,
@@ -16953,10 +17107,9 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                             &owned, &path_owned, optional
                         ))
                     },
-                );
+                )
             }
-            eval_on_owned::<S, _>(&Expr::Builtin(builtin.clone()), owned, optional)
-        }
+        },
 
         Builtin::Empty => GenericResult::None,
 
@@ -17003,23 +17156,8 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         Builtin::AtOffset(offset_expr) => {
             // Evaluate the offset expression
             let offset_result = eval_single::<S, _>(offset_expr, value.clone(), false, cursor);
-            let offset = match offset_result {
-                GenericResult::Owned(v) => match v.as_i64() {
-                    Some(i) if i >= 0 => i as usize,
-                    _ => {
-                        return GenericResult::Error(EvalError::new(
-                            "at_offset requires a non-negative integer".to_string(),
-                        ))
-                    }
-                },
-                GenericResult::One(v) => match v.as_i64() {
-                    Some(i) if i >= 0 => i as usize,
-                    _ => {
-                        return GenericResult::Error(EvalError::new(
-                            "at_offset requires a non-negative integer".to_string(),
-                        ))
-                    }
-                },
+            let offset = match position_arg_integer(&offset_result) {
+                Some(i) if i >= 0 => i as usize,
                 _ => {
                     return GenericResult::Error(EvalError::new(
                         "at_offset requires a non-negative integer".to_string(),
@@ -17050,23 +17188,8 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         Builtin::AtPosition(line_expr, col_expr) => {
             // Evaluate the line expression
             let line_result = eval_single::<S, _>(line_expr, value.clone(), false, cursor);
-            let line = match line_result {
-                GenericResult::Owned(v) => match v.as_i64() {
-                    Some(i) if i > 0 => i as usize,
-                    _ => {
-                        return GenericResult::Error(EvalError::new(
-                            "at_position requires positive integers for line".to_string(),
-                        ))
-                    }
-                },
-                GenericResult::One(v) => match v.as_i64() {
-                    Some(i) if i > 0 => i as usize,
-                    _ => {
-                        return GenericResult::Error(EvalError::new(
-                            "at_position requires positive integers for line".to_string(),
-                        ))
-                    }
-                },
+            let line = match position_arg_integer(&line_result) {
+                Some(i) if i > 0 => i as usize,
                 _ => {
                     return GenericResult::Error(EvalError::new(
                         "at_position requires positive integers for line".to_string(),
@@ -17076,23 +17199,8 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 
             // Evaluate the column expression
             let col_result = eval_single::<S, _>(col_expr, value.clone(), false, cursor);
-            let col = match col_result {
-                GenericResult::Owned(v) => match v.as_i64() {
-                    Some(i) if i > 0 => i as usize,
-                    _ => {
-                        return GenericResult::Error(EvalError::new(
-                            "at_position requires positive integers for column".to_string(),
-                        ))
-                    }
-                },
-                GenericResult::One(v) => match v.as_i64() {
-                    Some(i) if i > 0 => i as usize,
-                    _ => {
-                        return GenericResult::Error(EvalError::new(
-                            "at_position requires positive integers for column".to_string(),
-                        ))
-                    }
-                },
+            let col = match position_arg_integer(&col_result) {
+                Some(i) if i > 0 => i as usize,
                 _ => {
                     return GenericResult::Error(EvalError::new(
                         "at_position requires positive integers for column".to_string(),
@@ -24341,40 +24449,59 @@ mod tests {
     #[test]
     fn test_at_offset_and_at_position_accept_a_document_sourced_argument() {
         // #387 wraps a materialized document number in `OwnedValue::NumberLiteral`
-        // instead of plain `Int`, so `getpath` (which returns `Owned`, not a lazy
-        // cursor) now hands `AtOffset`/`AtPosition` a `NumberLiteral` -- unhandled
-        // here previously, it fell to the `_` arm and errored "requires a
+        // instead of plain `Int`, so `getpath` (which returned `Owned`, not a lazy
+        // cursor) handed `AtOffset`/`AtPosition` a `NumberLiteral` -- unhandled
+        // here originally, it fell to the `_` arm and errored "requires a
         // non-negative integer" even though the value was a perfectly good 0.
+        //
+        // #2168 broke this test by giving `getpath` a cursor walk: the argument
+        // stopped arriving as an `OwnedValue` at all, and the `_` arm caught it
+        // again. `position_arg_integer` is the fix, and the `.n`/`.l`/`.c` rows
+        // below are the gap that regression exposed -- a plainly navigated
+        // argument had never worked either, and no test had spelled one, so the
+        // arm's "document-sourced" claim was only ever half true.
         let json = br#"{"n": 2, "l": 1, "c": 1}"#;
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
 
-        let via_getpath = crate::jq::parse(r#"at_offset(getpath(["n"]))"#).unwrap();
-        let via_literal = crate::jq::parse("at_offset(2)").unwrap();
-        assert_eq!(
-            eval_with_cursor(&via_getpath, cursor)
+        let answer = |src: &str| {
+            let expr = crate::jq::parse(src).unwrap();
+            eval_with_cursor(&expr, cursor)
                 .into_owned()
                 .unwrap()
-                .unwrap(),
-            eval_with_cursor(&via_literal, cursor)
-                .into_owned()
                 .unwrap()
-                .unwrap(),
-        );
+        };
 
-        let via_getpath =
-            crate::jq::parse(r#"at_position(getpath(["l"]); getpath(["c"]))"#).unwrap();
-        let via_literal = crate::jq::parse("at_position(1; 1)").unwrap();
+        let want_offset = answer("at_offset(2)");
+        assert_eq!(answer(r#"at_offset(getpath(["n"]))"#), want_offset);
+        assert_eq!(answer("at_offset(.n)"), want_offset);
+
+        let want_position = answer("at_position(1; 1)");
         assert_eq!(
-            eval_with_cursor(&via_getpath, cursor)
-                .into_owned()
-                .unwrap()
-                .unwrap(),
-            eval_with_cursor(&via_literal, cursor)
-                .into_owned()
-                .unwrap()
-                .unwrap(),
+            answer(r#"at_position(getpath(["l"]); getpath(["c"]))"#),
+            want_position
         );
+        assert_eq!(answer("at_position(.l; .c)"), want_position);
+
+        // A non-integer argument is still refused, from every shape: the new
+        // arm reads an integer through a cursor, it does not coerce one.
+        // (`into_owned` renders an `Error` as `Ok(None)` -- see its own arms
+        // -- so the result is matched directly rather than through it. That
+        // rendering is also what made this test's original failure show up as
+        // an `Option::unwrap` panic rather than an error.)
+        for src in [
+            r#"at_offset(".")"#,
+            "at_offset(-1)",
+            "at_offset(.missing)",
+            "at_position(.n; 0)",
+        ] {
+            let expr = crate::jq::parse(src).unwrap();
+            let result = eval_with_cursor(&expr, cursor);
+            assert!(
+                matches!(result, GenericResult::Error(_)),
+                "{src} must still be refused, got {result:?}"
+            );
+        }
     }
 
     #[test]

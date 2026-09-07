@@ -19438,6 +19438,59 @@ fn test_object_slice_getpath_malformed_descriptor_errors_1102() -> Result<()> {
     Ok(())
 }
 
+/// #2168, yq mode: `getpath` walks cursors now, and every step still answers
+/// from `eval::getpath_walk_owned_segments`'s table rather than the yq
+/// *navigation* rules.
+///
+/// The distinction is load-bearing and easy to lose. `path_step_generic` --
+/// the walk behind `.a[-5] | key` -- applies real yq's own rules: a negative
+/// index that stays negative raises (#2254), a numeric index on a mapping is
+/// an absent position (#2459), indexing a scalar is a silent no-op (#2482).
+/// `getpath`'s table has none of them: those rows are `null`, an error, and
+/// an error respectively. Reusing the navigation walk to save code would
+/// have changed all three, so this pins them.
+///
+/// `getpath` is a jq builtin real yq's lexer rejects outright, so it is a
+/// succinctly extension behind `--jq-extensions` (#1512, ADR-0018 rule 5) and
+/// there is no yq oracle for any row. What is pinned is that #2168 left every
+/// answer exactly as the materializing implementation gave it -- verified
+/// row-for-row against the pre-#2168 binary.
+#[test]
+fn test_getpath_keeps_the_owned_table_in_yq_mode_2168() -> Result<()> {
+    let doc = "a: [1, 2]\ns: x\no:\n  k: 1\n";
+    let args = ["-o=json", "-I=0", "--jq-extensions"];
+
+    for (filter, want) in [
+        // Not yq's negative-index raise: out of range reads as `null`.
+        (r#"getpath(["a",-5])"#, "null"),
+        (r#"getpath(["a",0])"#, "1"),
+        (r#"getpath(["o","k"])"#, "1"),
+        // The yq-only object-slice arm (#1102) still reached, through the
+        // walk's hand-off to the owned table.
+        (r#"getpath(["a",{"start":0,"end":1}])"#, "[1]"),
+        (r#"getpath(["o",{"start":0,"end":1}])"#, r#"["k"]"#),
+    ] {
+        let (out, code) = run_yq_stdin(filter, doc, &args)?;
+        assert_eq!(code, 0, "{filter}: {out:?}");
+        assert_eq!(out.trim(), want, "{filter}");
+    }
+
+    for (filter, want) in [
+        // Not yq's scalar-index no-op, and not its mapping-index `null`.
+        (
+            r#"getpath(["s","x"])"#,
+            r#"Cannot index string with string "x""#,
+        ),
+        (r#"getpath(["o",0])"#, "Cannot index object with number"),
+    ] {
+        let (_out, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &args)?;
+        assert_eq!(code, 1, "{filter}: stderr {stderr}");
+        assert!(stderr.contains(want), "{filter}: {stderr}");
+    }
+
+    Ok(())
+}
+
 /// Known, deliberate gap: slicing an object with a genuine duplicate YAML
 /// key silently collapses it, the same root cause as this repo's other
 /// duplicate-mapping-key gaps (`OwnedValue::Object`'s `IndexMap`
