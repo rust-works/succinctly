@@ -4203,10 +4203,12 @@ $ printf '%s' '{"c":{"a":1,},"t":5}' | succinctly jq -c '.t | key'
 Real jq 1.7.1 rejects every one of those documents while parsing it, before any filter runs,
 and so does real yq v4.53.3 on the YAML spelling. So the reference separates none of these
 rows — it answers *nothing* here, `.d` included — and ADR-0018's decision order reaches its
-third step with no fidelity argument on either side. What decided it is internal
-consistency, and succinctly's own plain navigation had already set the rule: `.d` answered
-`5` on the first document and `.t` answered `5` on the second, long before `path(.d)` and
-`.t | key` refused them. Two spellings of one read disagreeing is the shape
+third step with no fidelity argument on either side. That step is performance and memory
+(ADR-0018's #2416 amendment): #2168 measured the pre-walk gate at 67-75% of such a query's
+runtime, making `.[0] | key` cost 3.0-4.1x the `.[0]` it wraps, and dropping it settles the
+tie. It also restores the internal consistency succinctly's own plain navigation had already
+set: `.d` answered `5` on the first document and `.t` answered `5` on the second, long before
+`path(.d)` and `.t | key` refused them. Two spellings of one read disagreeing is the shape
 [#1629](https://github.com/rust-works/succinctly/issues/1629)/[#1642](https://github.com/rust-works/succinctly/issues/1642)
 exist to remove.
 
@@ -4241,14 +4243,18 @@ same display spelling — where before, one answered and the other raised. The m
 routes (`-S`, `-s`, `.,.`) still raise on that document, because rendering both keys into
 one map is what the collision *is*.
 
-**One row moved away from jq.** A `NumberLiteral` longer than `REINDEX_LITERAL_LEN_CAP`
-disqualified a document from `getpath`'s native arm, sending the call through the reindex
-round trip, which re-spells it. jq prints `1E-301` for a 303-character literal and so did
-`getpath(["big"])`; `.big` printed all 303 characters, because preserving a document
-number's written form is deliberate (`DocumentValue::number_literal`,
+**One row moved away from jq, with no ADR-0018 carve-out.** A `NumberLiteral` longer than
+`REINDEX_LITERAL_LEN_CAP` disqualified a document from `getpath`'s native arm, sending the
+call through the reindex round trip, which re-spells it. jq prints `1E-301` for a
+303-character literal and so did `getpath(["big"])`; `.big` printed all 303 characters,
+because preserving a document number's written form is deliberate
+(`DocumentValue::number_literal`,
 [#387](https://github.com/rust-works/succinctly/issues/387)/[#966](https://github.com/rust-works/succinctly/issues/966)).
-Both spellings now print the source form. This trades a coincidental agreement with jq for
-agreement with succinctly's own read of the same node; the pre-existing divergence it joins
+Both spellings now print the source form. No rule-4 condition applies here, so ADR-0018's
+decision order does not license preferring this on its own terms — absent an exemption, step
+2 says the reference's `1E-301` should have stood. This is recorded as an accepted, if
+imperfect, side effect of unifying `getpath`'s number handling with `.big`'s rather than as a
+decision the order above actually reaches; the pre-existing divergence it joins
 is the entry above on the owned route's re-spelling.
 
 Pinned by `test_lazy_validation_boundary_2168` (the table above, as one test),

@@ -19491,6 +19491,32 @@ fn test_getpath_keeps_the_owned_table_in_yq_mode_2168() -> Result<()> {
     Ok(())
 }
 
+/// #2168 (review follow-up): `getpath` still resolves an alias node
+/// correctly after `getpath_walk_cursor`'s segment-kind dispatch was
+/// rewritten to call `v.as_object()`/`v.as_array()` at most once per step
+/// (previously both were tried unconditionally every step, each
+/// independently re-walking a `YamlValue::Alias`'s full `resolve_alias_chain`
+/// -- a real cost, not just a redundant call, but not a correctness question
+/// either way). Pins that indexing through `*seq`/`*map` still lands on the
+/// aliased node's own children, one segment kind at a time.
+#[test]
+fn test_getpath_resolves_through_an_alias_2168() -> Result<()> {
+    let doc = "seq: &s [1, 2, 3]\nseq_alias: *s\nmap: &m\n  k: 1\nmap_alias: *m\n";
+    let args = ["-o=json", "-I=0", "--jq-extensions"];
+
+    for (filter, want) in [
+        (r#"getpath(["seq_alias",1])"#, "2"),
+        (r#"getpath(["map_alias","k"])"#, "1"),
+        (r#"getpath(["seq_alias",{"start":0,"end":2}])"#, "[1,2]"),
+    ] {
+        let (out, code) = run_yq_stdin(filter, doc, &args)?;
+        assert_eq!(code, 0, "{filter}: {out:?}");
+        assert_eq!(out.trim(), want, "{filter}");
+    }
+
+    Ok(())
+}
+
 /// Known, deliberate gap: slicing an object with a genuine duplicate YAML
 /// key silently collapses it, the same root cause as this repo's other
 /// duplicate-mapping-key gaps (`OwnedValue::Object`'s `IndexMap`

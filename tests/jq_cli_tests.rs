@@ -37130,6 +37130,46 @@ fn test_path_answers_past_an_undecodable_sibling_2168() -> Result<()> {
     Ok(())
 }
 
+/// #2168 (caught in review, not by the issue itself): `?` must never swallow
+/// a decode failure inside a `path(...)` expression, the same #1620 rule
+/// plain navigation already follows.
+///
+/// `path_walk_generic`'s and `path_step_generic`'s `Expr::Optional` arms
+/// each discard *every* error from their inner walk unconditionally
+/// (`let _ = ...`). Before this issue's own pre-walk gate was removed, an
+/// undecodable string always raised earlier, in the whole-document walk, so
+/// neither arm's discard was ever reachable with a `decode_failure` in hand.
+/// Once the gate came off, both arms went live with the wrong rule: swallow
+/// everything, `decode_failure` included.
+#[test]
+fn test_path_optional_still_raises_a_decode_failure_2168() -> Result<()> {
+    let doc = r#"{"a":"\ud800","d":5}"#;
+
+    for (filter, plain_nav) in [
+        // `Expr::Optional` reached directly from `path_walk_generic`'s own
+        // entry point.
+        ("path(.a[]?)", ".a[]?"),
+        // `Expr::Optional` as a pipe head, reached from
+        // `path_step_generic`'s sibling arm instead.
+        ("path((.a[]?)|.x)", "(.a[]?)|.x"),
+    ] {
+        let (_, nav_err, nav_code) = run_jq_stdin_streams(plain_nav, doc, &["-c"])?;
+        assert_eq!(nav_code, 5, "sanity: {plain_nav} itself must still raise");
+
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
+        assert_eq!(
+            code, 5,
+            "{filter}: `?` swallowed a decode failure -- stdout {stdout:?} stderr {stderr:?} \
+             (plain nav {plain_nav} raised {nav_err:?})"
+        );
+        assert!(
+            stderr.contains("invalid unicode escape sequence") || stderr.contains("invalid escape"),
+            "{filter}: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #2168's rule, stated once as a table: which builtins validate a node the
 /// query never reads, and which do not.
 ///
