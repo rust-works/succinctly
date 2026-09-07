@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`succinctly jq`'s default (compact) JSON output now escapes a raw DEL
+  byte (`0x7f`) in a string value or object key, matching real jq** (#2591):
+  a bare `0x7f` byte is legal unescaped in JSON source (RFC 8259 only
+  requires escaping `0x00`-`0x1f`), but real jq's own output-side escape
+  table still re-encodes it to `\u007f` when re-emitting the string
+  (confirmed live against jq 1.7.1). The zero-copy fast path that echoes an
+  unescaped source span verbatim only checked for a source backslash, so a
+  DEL byte with no backslash sailed straight through as a raw, uncounted
+  byte. Fixed by extending `JsonString::raw_and_escaped()` with a `has_del`
+  flag — computed inside the same existing per-byte scan, at no additional
+  pass — consulted by `write_json_string_pretty` (`src/json/light.rs`),
+  gated on the active `JsonConvention` being `JqCompat`, and by
+  `PreparedField`'s key-printing fast path
+  (`src/bin/succinctly/jq_runner.rs`), gated on `config.jq_compat` — so
+  yq's `Preserve` convention (which real yq also leaves DEL raw under),
+  and jq's own `--preserve-input`/`SUCCINCTLY_PRESERVE_INPUT=1` flag
+  (which selects that same `Preserve` convention), are both unaffected.
+  The `jq_runner.rs` gate was initially applied unconditionally rather
+  than on `config.jq_compat`, which silently broke `--preserve-input`
+  output for DEL-bearing keys — caught in review before merge. **Residual,
+  not fixed here**: three sibling call sites in
+  `jq_runner.rs` sharing the identical bug shape (`.[]`-streamed values,
+  both `keys_unsorted` key-printing loops) were left out to keep this fix
+  narrowly scoped — see #2592.
+
 - **`succinctly yq`'s `and`/`or` now agrees with real yq when a literal or
   constructor operand's own upstream pipe stage produced zero nodes inside
   `and`/`or`'s read-only context (#2470)** (#2540): `(.a.zz | true) and true`

@@ -626,6 +626,18 @@ struct PreparedField<'a> {
     raw: &'a [u8],
     /// Whether that span contains a backslash escape.
     escaped: bool,
+    /// Whether that span contains a raw DEL byte (`0x7f`) -- #2591: legal
+    /// unescaped in JSON source, but jq's own escape table still escapes it
+    /// on output, unlike a plain backslash-free span otherwise. This file is
+    /// jq mode only (`succinctly yq` has its own separate runner), but it is
+    /// *not* jq-convention only: `--preserve-input`/`SUCCINCTLY_PRESERVE_INPUT=1`
+    /// make this same runner select `JsonConvention::Preserve` (the same
+    /// convention yq uses, DEL left raw) for number formatting, and key
+    /// escaping must agree -- so `write_object_key` gates this on
+    /// `config.jq_compat` exactly like `write_json_string_pretty`'s twin
+    /// fix in `src/json/light.rs` gates on the active `JsonConvention`, not
+    /// unconditionally.
+    has_del: bool,
 }
 
 /// The `(text, index)` pair every cursor in one document shares, hoisted out
@@ -797,7 +809,7 @@ fn write_object_key<Out: Write, W: Clone + AsRef<[u64]>>(
     let StandardJson::String(key) = frame.cursor(field.key_bp).value() else {
         return Err(MalformedJsonError(EvalError::malformed_json_text(frame.text)).into());
     };
-    if !config.ascii_output && !field.escaped {
+    if !(config.ascii_output || field.escaped || field.has_del && config.jq_compat) {
         out.write_all(field.raw)?;
     } else if let Ok(decoded) = key.as_str() {
         out.write_all(b"\"")?;
@@ -6422,13 +6434,14 @@ where
                             // which would re-derive it.
                             last_gap_end = value_start
                                 .and_then(|s| field.value_cursor().value_at(s).scalar_text_end(s));
-                            let (raw, escaped) = k.raw_and_escaped();
+                            let (raw, escaped, has_del) = k.raw_and_escaped();
                             scratch.push(PreparedField {
                                 key_bp: field.key_cursor().bp_position(),
                                 value_bp: field.value_cursor().bp_position(),
                                 value_start: value_start.unwrap_or(usize::MAX),
                                 raw,
                                 escaped,
+                                has_del,
                             });
                             remaining = rest;
                             field_index += 1;
