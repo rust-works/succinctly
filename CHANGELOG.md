@@ -21,6 +21,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inherited a walk that accepted `{"a" 1}`. Confirmed the YAML side doesn't
   move: the full comment/anchor/style corpus is byte-identical, since every
   new check is a no-op there by construction.
+- **A computed bracket at the head of a pipe (`.c[.n] | key`, `.a[.k] | path`,
+  `.c[.n]? | key`) now reads path context from the document node it stands on,
+  instead of sending the whole pipe to the eager path-context evaluator**
+  (#2471, spine 2416). `path_context_is_navigational` admitted only a
+  *literal* `Expr::Index`, so a computed bracket was a detaching stage with no
+  identity rule and `path_context_needs_eager` handed the pipe over -- gate
+  reason 1's last lever. The component is evaluated at the walked position
+  (against the node's cursor, or against the `null` an absent position holds)
+  following jq's own `K as $k | E | .[$k]` model, and each component is then
+  taken by the *literal* `Expr::Field`/`Expr::Index` step that spells it, so
+  every mode-specific indexing rule keeps one definition. Rows captured from
+  Homebrew yq v4.53.3 and `/usr/bin/jq` 1.7.1 on a flow document and its block
+  spelling, which yq answers identically.
+
+  Five yq-mode answers change and every one moves *towards* yq v4.53.3:
+  `.c[-1 as a computed index] | key` (`.c[.neg] | key` on `c: [10, 20]`) is
+  `1`, the resolved index, where it used to be `-1` -- the literal `.c[-1] |
+  key` already answered `1`, so the two spellings had disagreed with each
+  other; `.s[.n] | key` and `.c[.n][.n] | key` on a scalar target print
+  nothing where they used to raise `Cannot index string/number with number`;
+  `(.a[("z"+"z")] | key) + "!"` is `"!"` where it used to be `"zz!"` (an
+  absent key read inside an operand produces nothing); and `.c[.n] | key |
+  key` prints nothing where it used to print `0`. jq mode is unchanged on
+  every `path(...)` row -- a negative index stays as written, a numeric index
+  on an object still raises, and a string index on a scalar still raises.
+
+  A slice (`.c[.n:.m]`) and `getpath(p)` at the head are deliberately *not*
+  walkable: both can stand on a value that is not a document node, which the
+  walk's `PathNode` cannot carry. Nor is a component that can `halt`/`break`,
+  nor one that fans out.
+
 - **An optional head (`.a? | key`, `.c[-1]? | path`) now reads path context
   from the document node it stands on, instead of sending the whole pipe to
   the eager path-context evaluator** (#2558, spine 2416).

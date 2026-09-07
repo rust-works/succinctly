@@ -37094,6 +37094,135 @@ const OPTIONAL_HEAD_FLOW_2558: &str = "{\"a\": {\"b\": 1}, \"c\": [10, 20], \"s\
 /// not part of this rule, and asserting on both is what says so.
 const OPTIONAL_HEAD_BLOCK_2558: &str = "a:\n  b: 1\nc:\n  - 10\n  - 20\ns: hi\n";
 
+/// The flow-style document #2471's computed-bracket rows were captured on.
+const COMPUTED_HEAD_FLOW_2471: &str =
+    "{\"a\": {\"b\": 1}, \"c\": [10, 20], \"n\": 0, \"m\": 1, \"s\": \"hi\", \"k\": \"b\", \"neg\": -1}\n";
+
+/// The block-style spelling of [`COMPUTED_HEAD_FLOW_2471`]. Every row below
+/// was captured on both and yq v4.53.3 answers them identically.
+const COMPUTED_HEAD_BLOCK_2471: &str =
+    "a:\n  b: 1\nc:\n  - 10\n  - 20\nn: 0\nm: 1\ns: hi\nk: b\nneg: -1\n";
+
+/// #2471 (spine 2416, gate reason 1): a *computed* bracket at the head of a
+/// pipe (`.c[.n] | ...`) is walkable.
+///
+/// `path_context_is_navigational` used to admit only a *literal*
+/// `Expr::Index`, so a pipe headed by `.c[.n]` left the cursor domain at a
+/// stage with no `owned_identity_rule`, `owned_identity_pipe_applies`
+/// declined, and `path_context_needs_eager` handed the whole pipe over --
+/// gate reason 1, the disjunct `docs/plan/path-context-arm-reachability.md`
+/// attributes all five of its `R1` rows to. A computed bracket moves the
+/// position exactly as a literal one does; what is new is that the component
+/// is a value to evaluate first, against the stage's own input (jq's
+/// `K as $k | E | .[$k]` model). Each component is then taken by the walk's
+/// *literal* `Expr::Field`/`Expr::Index` step, which is what keeps every
+/// mode-specific rule -- negative-index resolution (#2254), a numeric index
+/// on a mapping (#2459), a scalar target (#2482), an absent key in a
+/// read-only context (#2470) -- one definition rather than a second copy.
+///
+/// Captured 2026-09-07 from Homebrew yq v4.53.3 (`yq -o=json -I0`), on both
+/// documents above, byte-identical between the two:
+///
+/// ```text
+/// $ yq '.c[.n] | key'                    0
+/// $ yq '.c[.n] | path'                   ["c",0]
+/// $ yq '.c[.n] | key + 1'                1
+/// $ yq '.c[.n]? | key'                   0
+/// $ yq '.c[.n]? | path'                  ["c",0]
+/// $ yq '.a[.k] | key'                    "b"
+/// $ yq '.a[.k] | path'                   ["a","b"]
+/// $ yq '.c[(0,1)] | key'                 0 1
+/// $ yq '.c[.n] | .x? | key'              (nothing)
+/// $ yq '.zz[.n] | key'                   0
+/// $ yq '.zz[.n] | path'                  ["zz",0]
+/// $ yq '.c[9] | key'                     9
+/// $ yq '.a[.a.b] | key'                  1
+/// $ yq '.a[.a.b] | path'                 ["a",1]
+/// $ yq '.c[.neg] | key'                  1
+/// $ yq '.c[.neg] | path'                 ["c",1]
+/// $ yq '.c[.n] | key | key'              (nothing)
+/// $ yq '.c[.n] | parent | key'           "c"
+/// $ yq '.s[.n] | key'                    (nothing)
+/// $ yq '.c[.n] | [key, path]'            [0,["c",0]]
+/// $ yq '.c[.n] | {"k": key}'             {"k":0}
+/// $ yq '.a[("z"+"z")] | key'             "zz"
+/// $ yq '(.a[("z"+"z")] | key) + "!"'     "!"
+/// $ yq '.c[.n] | tostring | key'         0
+/// $ yq '.c[.n] | select(key == 0)'       10
+/// $ yq '.c[.n] | . as $x | key'          0
+/// $ yq '.c[.n] | file_index + 1'         1
+/// $ yq '.c[.n] | path + []'              ["c",0]
+/// $ yq '.c[.n] | key == 0 and true'      true
+/// $ yq '.c[.m] | parent | key'           "c"
+/// $ yq '.c[.n][.n] | key'                (nothing)
+/// ```
+///
+/// Five of these were wrong before the migration, which is why it is a
+/// fidelity fix as well as a routing one -- and every one is a yq-mode rule
+/// the walk gets by spelling the component as a literal step:
+///
+/// * `.c[.neg] | key` answered `-1` (the eager evaluator reports a computed
+///   index as written; `.c[-1] | key` already answered `1`, so the two
+///   spellings disagreed with each other as well as with yq);
+/// * `.s[.n] | key` and `.c[.n][.n] | key` raised `Cannot index string/number
+///   with number` (#2482: a scalar has no fields in yq's model, so the step
+///   produces no position at all);
+/// * `(.a[("z"+"z")] | key) + "!"` answered `"zz!"` (#2470: an absent key
+///   read inside an operand produces nothing, so yq's zero-output-operand
+///   rule leaves `"!"`);
+/// * `.c[.n] | key | key` answered `0` (#2471's own `KeyNode` rule, reached
+///   from a computed head for the first time).
+///
+/// `.c[.n:.m]` has no row here on purpose: real yq cannot parse a slice with
+/// computed bounds at all (`Error: cannot index array with 'n'
+/// (strconv.ParseInt: parsing "n": invalid syntax)`), so there is no oracle
+/// for it, and it is deliberately not walkable -- a slice builds a fresh
+/// container, which `PathNode` has no cursor for.
+#[test]
+fn test_computed_bracket_head_is_walkable_2471() -> Result<()> {
+    let args = &["-o", "json", "-I0"];
+    for doc in [COMPUTED_HEAD_FLOW_2471, COMPUTED_HEAD_BLOCK_2471] {
+        for (filter, expected) in [
+            (".c[.n] | key", "0"),
+            (".c[.n] | path", "[\"c\",0]"),
+            (".c[.n] | key + 1", "1"),
+            (".c[.n]? | key", "0"),
+            (".c[.n]? | path", "[\"c\",0]"),
+            (".a[.k] | key", "\"b\""),
+            (".a[.k] | path", "[\"a\",\"b\"]"),
+            (".c[(0,1)] | key", "0\n1"),
+            (".c[.n] | .x? | key", ""),
+            (".zz[.n] | key", "0"),
+            (".zz[.n] | path", "[\"zz\",0]"),
+            (".c[9] | key", "9"),
+            (".a[.a.b] | key", "1"),
+            (".a[.a.b] | path", "[\"a\",1]"),
+            (".c[.neg] | key", "1"),
+            (".c[.neg] | path", "[\"c\",1]"),
+            (".c[.n] | key | key", ""),
+            (".c[.n] | parent | key", "\"c\""),
+            (".s[.n] | key", ""),
+            (".c[.n] | [key, path]", "[0,[\"c\",0]]"),
+            (".c[.n] | {\"k\": key}", "{\"k\":0}"),
+            (".a[(\"z\"+\"z\")] | key", "\"zz\""),
+            ("(.a[(\"z\"+\"z\")] | key) + \"!\"", "\"!\""),
+            (".c[.n] | tostring | key", "0"),
+            (".c[.n] | select(key == 0)", "10"),
+            (".c[.n] | . as $x | key", "0"),
+            (".c[.n] | file_index + 1", "1"),
+            (".c[.n] | path + []", "[\"c\",0]"),
+            (".c[.n] | key == 0 and true", "true"),
+            (".c[.m] | parent | key", "\"c\""),
+            (".c[.n][.n] | key", ""),
+        ] {
+            let (output, code) = run_yq_stdin(filter, doc, args)?;
+            assert_eq!(code, 0, "`{filter}` on `{doc}`: {output:?}");
+            assert_eq!(output.trim_end(), expected, "`{filter}` on `{doc}`");
+        }
+    }
+    Ok(())
+}
+
 /// #2558 (spine 2416, gate reason 2): an optional head (`.a? | ...`) is
 /// walkable.
 ///

@@ -1764,6 +1764,58 @@ fn test_walk_vs_bridge_path_context_parity_2416() {
             ".a? | key | tostring",
             ".a? | first(key)",
             ".a? | try (key) catch \"e\"",
+            // #2471: a computed bracket is a walkable head now, so the walk
+            // takes these where only the bridge used to. The components are
+            // spelled so the parser cannot fold them back to a literal
+            // `Expr::Index`/`Expr::Field` (`.d[(0)]` and `.a[("b")]` both
+            // fold, `.d[(0+0)]` and `.a[("b"+"")]` do not), which is what
+            // makes them exercise the new arm rather than the old one.
+            ".d[(0+0)] | key",
+            ".d[(0+0)] | path",
+            ".d[(0+0)] | parent",
+            ".d[(0+0)] | file_index",
+            ".d[(0+1)]? | key",
+            ".d[(9+0)] | key",
+            ".d[(9+0)] | path",
+            ".d[(0+0)] | parent | key",
+            ".d[(0+0)][(0+0)] | key",
+            ".d[(0+0)] | [key, path]",
+            ".d[(0+0)] | (key, path)",
+            ".a[(\"b\"+\"\")] | key",
+            ".a[(\"b\"+\"\")] | path",
+            ".a[(\"b\"+\"\")] | parent",
+            ".a[(\"b\"+\"\")]? | key",
+            ".a[(\"z\"+\"z\")] | key",
+            ".a[(\"z\"+\"z\")] | path",
+            ".a[(\"z\"+\"z\")] | [key, path]",
+            ".a[(\"b\"+\"\")] | key | tostring",
+            ".a[(\"b\"+\"\")] | select(true) | key",
+            ".a[(\"b\"+\"\")] | first(key)",
+            ".a[(\"b\"+\"\")] | try (key) catch \"e\"",
+            // `[.a[("b"+"")] | key]` is deliberately *not* here. On the
+            // scalar-valued `{"a":1,"a":2,...}` document below, yq mode's
+            // #2482 rule (a scalar has no fields, so the step produces no
+            // position at all) is applied by the walk -- through the literal
+            // `Expr::Field` step the component is spelled as -- and not by
+            // the eager `Expr::IndexExpr` arm, which still raises `Cannot
+            // index number with string "b"`. The walk is the side that
+            // matches the oracle (`yq -o=json -I0 '[.a["b"] | key]'` on
+            // `a: 1` is `[]` in v4.53.3, and succinctly's own *value* route
+            // already answers `[]` for `[.a[("b"+"")]]`), so this is an
+            // eager-route gap the migration exposes rather than a walk bug;
+            // pinning it as "the routes agree" would pin the wrong answer.
+            // The bare `.a[("b"+"")] | key` spelling above does agree,
+            // because there the eager route yields no output either.
+            ".zz[(0+0)] | key",
+            ".zz[(0+0)] | path",
+            ".a[(0+0)] | key",
+            // The three shapes the head admission refuses, kept here so the
+            // routes are asserted to agree on them too: a component that can
+            // escape, one that fans out, and a slice or `getpath` head.
+            ".d[(0,1)] | key",
+            ".d[(0,1)] | path",
+            ".d[(0+0):(0+1)] | key",
+            "getpath([\"a\"]) | key",
         ] {
             assert_walk_bridge_parity(doc, filter);
         }
@@ -2169,6 +2221,19 @@ fn test_arm_audit_proof_queries_are_unmoved_by_the_gate_2416() {
             &[r#"{"z":"bx"}"#],
         ),
         (r".a? | . as $x | key", &[r#""a""#]),
+        // #2471's head-of-pipe half, same precedent once more: a *computed*
+        // bracket is navigation the walk takes now, so `A19`'s listed query
+        // (`.c[.n] | key + 1`) and `A07`'s (`.c[.n]? | key + 1`) are answered
+        // by the absent route and report no arm at all. Both re-derivations
+        // keep the same head and put an `as` stage -- which has no
+        // `owned_identity_rule` -- where the arithmetic was, so the reason
+        // moves from `R1` to `R2` while the arm is unchanged. Verified with
+        // the arms instrumented (2026-09-07, method in
+        // `docs/plan/path-context-arm-reachability.md`): `A19` fires on the
+        // first row, `A07` on the second, and `A04`/`A17`/`A20` still fire on
+        // their unchanged listed queries above.
+        (r".c[.n] | . as $x | key", &["0"]),
+        (r".c[.n]? | . as $x | key", &["0"]),
     ];
     for (filter, expected) in rows {
         // `path + []` is the audit's H1 row spelled against `.a.b`.

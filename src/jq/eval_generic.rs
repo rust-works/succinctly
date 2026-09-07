@@ -55,7 +55,9 @@ use super::eval::{
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
-use super::expr::{Builtin, CompareOp, Expr, FormatType, Literal, ObjectEntry, ObjectKey, Pattern};
+use super::expr::{
+    Builtin, CompareOp, Expr, FormatType, Literal, NumberKey, ObjectEntry, ObjectKey, Pattern,
+};
 use super::slice::{literal_component_from_values, slice_str, SliceBounds};
 use super::value::{owned_value_eq, NumberRepr, OwnedValue};
 use crate::json::JsonIndex;
@@ -12319,12 +12321,73 @@ fn path_context_is_navigational(expr: &Expr) -> bool {
         // anything else (`key?`, `(.a | tostring)?`) is not navigation and
         // is not admitted here.
         Expr::Optional(inner) => path_context_is_navigational(inner),
+        // #2471 (gate reason 1 of spine 2416): a *computed* bracket moves the
+        // position exactly as a literal `Expr::Index` does -- the component
+        // is one more value to evaluate, not a different kind of step. The
+        // target has to be navigation the walk can take first, and the
+        // component has to be something the walk can evaluate at a position
+        // ([`path_context_component_walkable`]).
+        //
+        // `Expr::SliceExpr` and `getpath(p)` are deliberately *not* admitted
+        // here. Both can land on a value that is not a document node at all
+        // -- a slice builds a fresh container, and a `getpath` segment may be
+        // jq's own `{"start":s,"end":e}` slice descriptor
+        // (`eval::getpath_walk_owned`'s `Object`-segment arms) -- and a
+        // walked stage may have to *emit* the node it stands on
+        // (`path_context_emit_node`), which `PathNode` can only do for a
+        // cursor or an absent position. They stay on the routes that carry an
+        // owned value: the owned identity pipe (#2493) and the eager
+        // evaluator.
+        Expr::IndexExpr { target, key } => {
+            path_context_is_navigational(target)
+                && path_context_component_walkable(key)
+                // The component must also be single-branch. A comma inside
+                // one makes the bracket a *fan-out* head, and a fan-out head
+                // standing on **absent** positions already loses its position
+                // once the pipe leaves the walk: `(.c[0], .c[1]) | key` on
+                // `c: []` prints nothing here where yq v4.53.3 answers `0`
+                // and `1`, with no computed bracket anywhere in it. Admitting
+                // one would route `.c[(0,1)] | tostring | key` -- which the
+                // eager evaluator answers correctly -- onto that gap, so it
+                // stays where it is.
+                && !path_context_fans_out(key)
+        }
         Expr::Paren(inner) => path_context_is_navigational(inner),
         Expr::Pipe(exprs) | Expr::Comma(exprs) => exprs.iter().all(path_context_is_navigational),
         Expr::Builtin(Builtin::Parent) => true,
         Expr::Builtin(Builtin::ParentN(n)) => matches!(**n, Expr::Literal(_)),
         _ => false,
     }
+}
+
+/// A computed navigation component (`.[K]`) the *walk* can evaluate at a
+/// position (#2471).
+///
+/// Two conditions. The first is [`owned_identity_component_supported`], the
+/// same predicate the owned identity pipe asks of the same component: a read
+/// inside it resolves to the constants the position answers with, and
+/// anything that reads nothing is evaluated as written.
+///
+/// The second is that evaluating it cannot *escape*. The walk's step returns
+/// `Result<(), EvalError>`, which has no room for `Control::Halt` or
+/// `Control::Break`, so a component that can raise one stays on the eager
+/// route -- where #2495's `Control` plumbing already adjudicates it, and
+/// where `.c[halt] | key` still exits silently rather than turning a halt
+/// into an error.
+fn path_context_component_walkable(expr: &Expr) -> bool {
+    owned_identity_component_supported(expr) && !path_context_component_can_escape(expr)
+}
+
+/// Whether evaluating `expr` can end the program or jump to a label -- see
+/// [`path_context_component_walkable`] for why the walk refuses one.
+fn path_context_component_can_escape(expr: &Expr) -> bool {
+    crate::jq::walk::any_subexpr(expr, &mut |e| {
+        matches!(
+            e,
+            Expr::Break(_)
+                | Expr::Builtin(Builtin::Halt | Builtin::HaltError | Builtin::HaltErrorCode(_))
+        )
+    })
 }
 
 /// Whether a walked expression can emit more than one *materialized* value.
@@ -12352,6 +12415,11 @@ fn path_context_fans_out(expr: &Expr) -> bool {
         Expr::Paren(inner) | Expr::Array(inner) | Expr::Optional(inner) => {
             path_context_fans_out(inner)
         }
+        // #2471: a computed bracket fans out exactly when its *target*
+        // does. Its component cannot: `path_context_is_navigational` admits
+        // one only when `path_context_fans_out` already answers `false` for
+        // it, which is what keeps this arm about the target alone.
+        Expr::IndexExpr { target, .. } => path_context_fans_out(target),
         _ => false,
     }
 }
@@ -12600,6 +12668,24 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             out.extend(path_context_hop(pos, n));
             Ok(())
         }
+        // #2471: `E[K]` and its `?`-guarded spelling. The `?` covers the
+        // *indexing* step alone, never the component's or the target's own
+        // evaluation -- the same split `owned_identity_step` draws for the
+        // owned domain, and the same one the eager evaluator's own
+        // `Expr::Optional(IndexExpr)` arm draws (`bracket_optional: true`
+        // with the key and target still at `optional: false`). So this arm
+        // has to sit ahead of the generic `Expr::Optional` one below, which
+        // would otherwise swallow a component's own error:
+        // `.c[error("x")]? | key` raises in both modes.
+        Expr::Optional(inner) if matches!(&**inner, Expr::IndexExpr { .. }) => {
+            let Expr::IndexExpr { target, key } = &**inner else {
+                unreachable!("the guard above restricts inner to IndexExpr")
+            };
+            path_context_step_computed_index::<S, V>(target, key, true, pos, out)
+        }
+        Expr::IndexExpr { target, key } => {
+            path_context_step_computed_index::<S, V>(target, key, false, pos, out)
+        }
         // #2558: the same rule as `path_step_generic`'s own `Expr::Optional`
         // arm, one level up so a whole *position* (path plus ancestors)
         // survives -- the error is swallowed, the positions already reached
@@ -12631,6 +12717,129 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             "path_context_is_navigational admitted a stage the walk cannot step: {other:?}"
         ),
     }
+}
+
+/// One computed-bracket step (`E[K]`, or `E[K]?` with `bracket_optional`),
+/// from `pos` (#2471).
+///
+/// jq compiles `E[K]` as `K as $k | E | .[$k]`: the component stream is
+/// evaluated against *this stage's own input*, outer, and the target is
+/// stepped inner. `.a[.a.b]` therefore reads `.a.b` from the position the
+/// bracket stands at, not from `.a`.
+///
+/// Each component is then taken by the walk's *literal* navigation arms, via
+/// the `Expr::Field`/`Expr::Index` node that spells it
+/// ([`path_component_step_expr`]). That is what keeps every mode-specific
+/// rule -- yq's negative-index resolution (#2254), its numeric index on a
+/// mapping (#2459), its scalar target (#2482) and its absent key in a
+/// read-only context (#2470) -- one definition rather than a second copy
+/// that could drift from the literal spelling's.
+fn path_context_step_computed_index<S: EvalSemantics, V: DocumentValue>(
+    target: &Expr,
+    key: &Expr,
+    bracket_optional: bool,
+    pos: &PathContextPos<V>,
+    out: &mut Vec<PathContextPos<V>>,
+) -> Result<(), EvalError> {
+    let components = path_context_component_values::<S, V>(key, pos)?;
+    let mut targets = Vec::new();
+    let stepped = path_context_step_generic::<S, V>(target, pos, &mut targets);
+    for component in &components {
+        for tpos in &targets {
+            match path_component_step_expr(component) {
+                Some(step) => {
+                    let step = if bracket_optional {
+                        Expr::Optional(Box::new(step))
+                    } else {
+                        step
+                    };
+                    path_context_step_generic::<S, V>(&step, tpos, out)?;
+                }
+                // A component no navigation can take (`null`, a boolean, a
+                // container): the same error the value route raises, from
+                // the same constructor, and suppressed by this bracket's own
+                // `?` exactly as an indexing error is -- `.c[null]? | key`
+                // is empty, `.c[null] | key` raises.
+                None if bracket_optional => {}
+                None => {
+                    return Err(EvalError::cannot_index(
+                        path_node_type_name::<V>(&tpos.node),
+                        component,
+                    ))
+                }
+            }
+        }
+    }
+    stepped
+}
+
+/// Every value a computed component takes at `pos` (#2471).
+///
+/// A `key`/`path` inside the component is a constant for this position, and
+/// is rewritten by the same [`path_context_resolve_constants`] the absent
+/// route and the owned identity pipe use. A live position evaluates the
+/// component against its own cursor; an absent one evaluates it against the
+/// `null` it holds, which is what the owned identity pipe does with the same
+/// component.
+fn path_context_component_values<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    pos: &PathContextPos<V>,
+) -> Result<Vec<OwnedValue>, EvalError> {
+    let resolved;
+    let expr = if needs_path_context(expr) {
+        resolved = path_context_resolve_constants::<S>(
+            expr,
+            &PathContextAt {
+                key: pos.path.last(),
+                path: &pos.path,
+                // `path_context_component_walkable` keeps the constant-only
+                // gate, so no `parent` can appear in a component.
+                parent_of: None,
+            },
+        )?;
+        &resolved
+    } else {
+        expr
+    };
+    let (values, control) = match &pos.node {
+        PathNode::At(c) => stream_owned_outputs_generic::<S, V>(expr, c.value(), false, Some(*c)),
+        PathNode::Absent => owned_identity_values::<S>(expr, &OwnedValue::Null, false),
+    };
+    match control {
+        None => Ok(values),
+        Some(Control::Error(e)) => Err(e),
+        // `path_context_component_walkable` refuses a component that can
+        // halt or break, which is the whole of what is left.
+        Some(other) => unreachable!("a walkable component cannot escape: {other:?}"),
+    }
+}
+
+/// The literal navigation step that takes `component`, or `None` for a value
+/// no navigation can take (#2471).
+///
+/// The spelling matters: a float component keeps its own rendering in the
+/// path (`path(.c[(1.0)])` is `["c",1.0]` in jq 1.7.1), which is exactly
+/// what [`NumberKey`] carries for a literal float bracket, so the synthesized
+/// node reuses it rather than re-deriving a second rendering rule.
+fn path_component_step_expr(component: &OwnedValue) -> Option<Expr> {
+    Some(match component {
+        OwnedValue::String(s) => Expr::Field(s.clone()),
+        OwnedValue::Int(i) => Expr::Index { idx: *i, key: None },
+        OwnedValue::Float(f) => Expr::Index {
+            idx: *f as i64,
+            key: Some(NumberKey::Float(*f)),
+        },
+        // An integer-spelled literal renders identically to its own `i64`,
+        // which is why `NumberKey` has no `Int` arm -- see its doc comment.
+        OwnedValue::NumberLiteral(NumberRepr::Int(i), _) => Expr::Index { idx: *i, key: None },
+        OwnedValue::NumberLiteral(NumberRepr::Float(f), text) => Expr::Index {
+            idx: *f as i64,
+            key: Some(NumberKey::Literal(*f, text.to_string().into_boxed_str())),
+        },
+        OwnedValue::Null | OwnedValue::Bool(_) | OwnedValue::Array(_) | OwnedValue::Object(_) => {
+            return None
+        }
+    })
 }
 
 /// Walk one emitting expression from `pos`, delivering each output to `sink`
@@ -26535,6 +26744,54 @@ mod tests {
         assert!(eager(".a? | . as $x | key"));
         assert!(eager(".[]? | .k | select(key == \"k\")"));
         assert!(!eager(".a[] | select(true) | key"));
+        // #2471 (gate reason 1 of spine 2416), the head-of-pipe half: a
+        // *computed* bracket is navigation the walk takes now, so a pipe
+        // headed by one is routed exactly like `.c[0] | ...`. The whole-pipe
+        // rows report `true` here for the same reason `.a? | key` does above
+        // -- the walk already took them, so the gate is never the route that
+        // answers.
+        assert!(eager(".c[.n] | key"));
+        assert!(path_context_walk_split(&pipe_stages(".c[.n] | key")).is_some());
+        assert!(eager(".c[.n] | path"));
+        assert!(path_context_walk_split(&pipe_stages(".c[.n] | path")).is_some());
+        assert!(eager(".c[.n]? | key"));
+        assert!(path_context_walk_split(&pipe_stages(".c[.n]? | key")).is_some());
+        assert!(eager(".c[.n] | [key, path]"));
+        assert!(path_context_walk_split(&pipe_stages(".c[.n] | [key, path]")).is_some());
+        assert!(eager(".c[.n] | parent | key"));
+        assert!(path_context_walk_split(&pipe_stages(".c[.n] | parent | key")).is_some());
+        // ...and a rest the walk does not model is answered by the absent
+        // route or the owned identity pipe, not by the eager evaluator --
+        // which is what takes `.c[.n] | key + 1` (`A19`'s listed proof query
+        // until this change) and `.c[.n]? | key + 1` (`A07`'s) off it.
+        assert!(!eager(".c[.n] | key + 1"));
+        assert!(!eager(".c[.n]? | key + 1"));
+        assert!(!eager(".c[.n] | key | key"));
+        assert!(!eager(".c[.n] | tostring | key"));
+        assert!(!eager(".c[.n] | select(key == 0)"));
+        assert!(!eager(".c[.n] | {k: key}"));
+        // Three shapes stay exactly where they were, each for its own
+        // reason. A component that can *escape* has no room in the walk's
+        // `Result<(), EvalError>` step ...
+        assert!(eager(".c[halt] | key"));
+        // ... a component that *fans out* would make the bracket a fan-out
+        // head, and a fan-out head over absent positions loses its position
+        // once the pipe leaves the walk (`(.c[0], .c[1]) | key` on `c: []`
+        // is empty with no computed bracket in it at all) ...
+        assert!(eager(".c[(0,1)] | key"));
+        assert!(eager(".c[(0,1)] | tostring | key"));
+        // ... and a slice or a `getpath` can land on a value that is not a
+        // document node at all, which `PathNode` cannot carry.
+        assert!(eager(".c[.n:.m] | key"));
+        assert!(eager(".c[.n:.m] | .[0] | key"));
+        assert!(eager(".c[0:1] | .[0] | key + 1"));
+        assert!(eager("getpath([\"a\",\"b\"]) | key"));
+        assert!(!path_context_is_navigational(&parse(".c[.n:.m]").unwrap()));
+        assert!(!path_context_is_navigational(
+            &parse("getpath([\"a\"])").unwrap()
+        ));
+        assert!(path_context_is_navigational(&parse(".c[.n]").unwrap()));
+        assert!(path_context_is_navigational(&parse(".c[.n]?").unwrap()));
     }
 
     /// The absent route's gate and its rewriter are two descriptions of one
