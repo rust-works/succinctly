@@ -2,7 +2,7 @@
 //!
 //! `scripts/jq-path-context-oracle-sweep.sh` is #2416 phase 0's oracle-backed
 //! net: it sweeps path-context shapes against pinned `jq` 1.7.1 and pinned
-//! `yq` v4.53.3 so a migrated arm of `eval_stage_with_path_context` that
+//! `yq` v4.53.3 so a migrated arm of the deleted eager path-context evaluator that
 //! answers differently from the *reference* fails, rather than merely
 //! differently from the in-tree bridge (which #2388 showed is itself not a
 //! trustworthy reference).
@@ -38,7 +38,8 @@
 //! the `cli` legs in `.github/workflows/ci.yml` run an explicit `--test` list
 //! that this file is not on. A `#![cfg(feature = "cli")]` here would compile
 //! it away on every leg that does run it, leaving a guard that never guards
-//! (`tests/jq_path_context_arm_guard.rs` is ungated for the same reason).
+//! (`tests/jq_path_context_arm_guard.rs` was ungated for the same reason,
+//! until spine 2416's exit deleted it with the evaluator it counted).
 //!
 //! Run with: cargo test --test jq_path_context_alphabet_tests
 

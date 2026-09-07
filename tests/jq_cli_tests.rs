@@ -5566,7 +5566,7 @@ fn test_parent_propagates_halt_in_n_argument() -> Result<()> {
 
 #[test]
 fn test_path_context_optional_does_not_swallow_halt_in_builtin_arm() -> Result<()> {
-    // `eval_pipe_with_path_context_internal`'s `Expr::Builtin` arm (reached
+    // the deleted eager path-context evaluator's `Expr::Builtin` arm (reached
     // whenever a pipe needs `key`/`parent`/`file_index`/`path` tracking) used
     // to check `optional` before checking for a smuggled-back halt, the same
     // shape of bug `ParentN` had one arm over. Verified live against jq
@@ -7489,7 +7489,7 @@ fn test_label_keeps_path_context_2416() -> Result<()> {
 /// node (installed by `bind_def` on first evaluation of the enclosing
 /// `FuncDef`, never produced by the parser), so unlike `As`/`AsPattern`/
 /// `Label` above it cannot be pinned as a bare `Expr::Pipe` stage in
-/// `path_context_needs_eager_pins_the_three_reasons_2416` -- this CLI test
+/// `path_context_needs_owned_position_pins_its_reasons_2416` -- this CLI test
 /// is the construct's coverage.
 #[test]
 fn test_def_call_keeps_path_context_2416() -> Result<()> {
@@ -7533,7 +7533,7 @@ fn test_func_def_keeps_path_context_2416() -> Result<()> {
 /// `Expr::DefCall`, `Expr::Shared` is a runtime-only node (only ever
 /// synthesized when a call's argument is substituted into its callee's
 /// body), never produced by a fresh `parse()`, so it has no row in
-/// `path_context_needs_eager_pins_the_three_reasons_2416`; this CLI test is
+/// `path_context_needs_owned_position_pins_its_reasons_2416`; this CLI test is
 /// its coverage.
 #[test]
 fn test_shared_keeps_path_context_2416() -> Result<()> {
@@ -8179,7 +8179,7 @@ fn test_limit_path_context_resolves_1765() -> Result<()> {
 }
 
 /// #2074: `Expr::FirstExpr`/`Expr::LastExpr` had no arm in either
-/// `needs_path_context` or `eval_pipe_with_path_context_internal`, so
+/// `needs_path_context` or the deleted eager path-context evaluator, so
 /// `first(key)`/`last(key)` silently answered `null` where the sibling
 /// `limit(1; key)` (tested above) answered correctly.
 #[test]
@@ -8271,7 +8271,7 @@ fn test_first_last_expr_path_context_resolves_2074() -> Result<()> {
     // a `Partial` -- is a structurally distinct case from the
     // Comma-accumulation shapes above: the very first (only) body stage
     // itself terminates before any output is ever collected, so
-    // `eval_pipe_with_path_context_internal` never reaches
+    // the deleted eager path-context evaluator never reaches
     // `accumulate_path_context_step` at all for this pipe.
     let (stdout, _, code) = run_jq_full(&["-c", ".a | first(empty) | key"], Some(r#"{"a":1}"#))?;
     assert_eq!(code, 0);
@@ -8346,7 +8346,7 @@ fn test_first_last_expr_path_context_resolves_2074() -> Result<()> {
 }
 
 /// #2215: a literal `Expr::Slice` (`.[0:3]`, both bounds constant) had no
-/// arm in `eval_stage_with_path_context`, so it fell to the generic
+/// arm in the deleted eager path-context evaluator, so it fell to the generic
 /// catch-all and left `current_path` unextended -- `key`/`path` named the
 /// *container*, not the slice. `path(.a[0:3])` (routed through `walk_path`
 /// instead) already got this right, so that's the reference matched here,
@@ -8469,7 +8469,7 @@ fn test_literal_slice_parent_ancestor_resolves_2215() -> Result<()> {
 }
 
 /// #1964 (found in review of the `Expr::Limit` path-context fix above, then
-/// fixed by #1964 itself): `eval_pipe_with_path_context_internal`'s
+/// fixed by #1964 itself): the deleted eager path-context evaluator's
 /// `Expr::Comma` arm routes every branch through this same evaluator,
 /// including a branch that doesn't need path context at all (`range(0;5)`),
 /// which used to fall to the generic `Expr::Builtin(_)` catch-all's
@@ -8567,7 +8567,7 @@ fn test_as_pattern_qmark_slash_slash_chain_does_not_collapse_cardinality_1765() 
 /// array-wrapped instead of comma-joined -- silently lost path context and
 /// stubbed to `null`, even though `needs_path_context` already recursed
 /// into the structurally-identical `Comma` wrapper. Fixing just the
-/// recursion wasn't enough on its own: `eval_pipe_with_path_context_internal`'s
+/// recursion wasn't enough on its own: the deleted eager path-context evaluator's
 /// array-construction arm built the array via the plain, context-less
 /// evaluator, so `key`/`parent`/`file_index` nested inside `[...]` needed a
 /// second, dedicated fix to route through the path-context evaluator during
@@ -9259,7 +9259,7 @@ fn test_string_interpolation_path_context_fanout_continues_rest_1403() -> Result
 /// pipe fell to the plain evaluator, which has no path tracking, and `key`
 /// stubbed to `null` regardless of what preceded the `def`. Recursing into
 /// `body`/`then` fixes the *routing* decision; a second, dedicated
-/// `eval_pipe_with_path_context_internal` arm was needed too (mirroring
+/// the deleted eager path-context evaluator arm was needed too (mirroring
 /// #1302's two-part shape again) because the plain evaluator's own
 /// `eval_func_def` unconditionally evaluates the expanded `then` via
 /// `eval_single`, which would otherwise still drop path context even once
@@ -9375,7 +9375,7 @@ fn test_func_def_key_comma_sibling_independence_is_not_a_bug_1306() -> Result<()
     Ok(())
 }
 
-/// `Expr::Optional`'s own dispatch in `eval_pipe_with_path_context_internal`
+/// `Expr::Optional`'s own dispatch in the deleted eager path-context evaluator
 /// broadcast `optional=true` into whatever it wrapped, with no catch of its
 /// own -- unlike the plain evaluator's `Expr::Optional` (`eval_try`) and the
 /// Array arm's own fix above (#1302). Two distinct symptoms, both from the
@@ -9454,7 +9454,7 @@ fn test_optional_dispatch_catches_atomically_not_broadcast_1335() -> Result<()> 
 /// #1405: `needs_path_context` didn't recurse into `Expr::And`/`Expr::Or`,
 /// so `key`/`parent`/`file_index` nested inside `and`/`or` silently stubbed
 /// instead of resolving -- the whole expression never routed through
-/// `eval_pipe_with_path_context_internal` at all. `key` alone (outside the
+/// the deleted eager path-context evaluator at all. `key` alone (outside the
 /// `and`) resolving correctly is what isolates this to `and`/`or`
 /// specifically, not `key` itself. This is also the actual root cause
 /// behind #1335's own posted repro, noted in that test's own doc comment
@@ -16305,7 +16305,7 @@ fn test_isvalid_propagates_break_through_paths_filter() -> Result<()> {
 
 /// #833: a `key`/`parent`/`path` (or any other path-context-triggering)
 /// pipe stage ahead of `isvalid`/`isempty` routes their argument through
-/// `eval_pipe_with_path_context_internal`'s generic `Expr::Builtin`
+/// the deleted eager path-context evaluator's generic `Expr::Builtin`
 /// fallback -> `eval_builtin_owned` -> `eval_owned_expr`, not through
 /// `eval_single`'s ordinary dispatch -- a genuinely different call path
 /// from every other test in this file, which all evaluate `isvalid`/
@@ -16419,7 +16419,7 @@ fn test_parent_n_argument_error_swallow_threaded_through_rest() -> Result<()> {
 }
 
 /// Companion to `test_path_context_optional_does_not_swallow_halt_in_builtin_arm`:
-/// that test proves a halt escapes `eval_pipe_with_path_context_internal`'s
+/// that test proves a halt escapes the deleted eager path-context evaluator's
 /// `Expr::Builtin` arm even under `?`.
 ///
 /// This test used to pin the sibling `Err(EvalEscape::Error(_)) if optional`
@@ -16462,7 +16462,7 @@ fn test_path_context_object_literal_arm_still_swallows_ordinary_error_under_opti
     Ok(())
 }
 
-/// `eval_pipe_with_path_context_internal`'s `Expr::If` arm unpacks
+/// the deleted eager path-context evaluator's `Expr::If` arm unpacks
 /// `cond_result` into `(cond_values, cond_control)` before running any
 /// branch; this targets its `QueryResult::Halt(code) => (Vec::new(),
 /// Some(Control::Halt(code)))` case -- `cond` itself halting with zero
@@ -16485,7 +16485,7 @@ fn test_path_context_if_arm_converts_bare_halt_from_cond() -> Result<()> {
 }
 
 /// Companion to the `Expr::Builtin`/object-literal arms above: targets
-/// `eval_pipe_with_path_context_internal`'s final catch-all `_` arm
+/// the deleted eager path-context evaluator's final catch-all `_` arm
 /// (reached for expression kinds with no dedicated handling here, e.g. `X
 /// as $v | BODY`). Same #1045/#1280 history as
 /// `test_path_context_builtin_arm_still_swallows_ordinary_error_under_optional`
@@ -21770,7 +21770,7 @@ fn test_func_def_forward_arity_reference_in_own_body_1473() -> Result<()> {
     Ok(())
 }
 
-/// #1376: `eval_pipe_with_path_context_internal`'s own `Expr::FuncDef` arm
+/// #1376: the deleted eager path-context evaluator's own `Expr::FuncDef` arm
 /// (`src/jq/eval.rs`) is a *second*, independent call site into the same
 /// `expand_func_calls`/arity-overload logic -- a query built entirely from
 /// non-path-context queries (like this file's other `_1376` tests) never
@@ -26272,7 +26272,7 @@ fn test_getpath_strftime_strptime_tz_load_optional_type_mismatch_suppresses_1045
 }
 
 /// Companion to the test above: actually reaches each builtin's own
-/// `Ok(Some(_)) if optional` guard directly, via `eval_pipe_with_path_context_internal`'s
+/// `Ok(Some(_)) if optional` guard directly, via the deleted eager path-context evaluator's
 /// `Expr::Optional` arm, which -- unlike `eval_single`'s (see the test
 /// above) -- forces `optional = true` directly onto the wrapped node
 /// instead of going through `eval_try`'s catch-afterward semantics. `key`
@@ -26376,7 +26376,7 @@ fn test_path_context_builtin_arm_multi_output_fans_out_1964() -> Result<()> {
     Ok(())
 }
 
-/// #1937/#1964: the `Expr::Builtin(_)` arm (`eval_pipe_with_path_context_internal`)
+/// #1937/#1964: the `Expr::Builtin(_)` arm (the deleted eager path-context evaluator)
 /// backs far more than argument-fan-out builtins -- `recurse` (`Builtin::Recurse`)
 /// is a *zero*-arg generator reached through this same arm whenever a
 /// sibling `key`/`parent`/`file_index` forces the whole pipe through
@@ -35991,7 +35991,7 @@ fn test_compile_error_with_unread_stdin_is_not_a_broken_pipe_2057() -> Result<()
 /// #1409: an isolated sub-expression's outputs must continue the rest of
 /// the pipe from *their own* path, not the ambient pre-isolation one.
 ///
-/// Several arms of `eval_pipe_with_path_context_internal` evaluate a
+/// Several arms of the deleted eager path-context evaluator evaluate a
 /// sub-expression with an empty `rest` -- because the construct scopes
 /// something `rest` must stay outside of -- and only afterwards continue the
 /// real `rest`. `Field`/`Index`/`Iterate` build an updated path only when
@@ -38271,7 +38271,7 @@ fn test_input_queue_still_rejects_malformed_second_document_2400() -> Result<()>
 /// #2375 jq-mode counterpart of
 /// `test_map_path_context_scalar_target_noops_in_yq_mode_2375`
 /// (`tests/yq_cli_tests.rs`): the non-container no-op that fix added to
-/// `eval_stage_with_path_context`'s `Builtin::Map` arm is gated on
+/// the deleted eager path-context evaluator's `Builtin::Map` arm is gated on
 /// `S::TAG == EvalTag::Yq`, so jq mode must keep raising. Real jq has no
 /// `key` builtin at all, so the oracle capture uses `map(. + 1)` and jq's
 /// own value path, which reaches the same error (jq 1.7.1):
@@ -39968,7 +39968,20 @@ fn test_computed_bracket_head_is_walkable_2471() -> anyhow::Result<()> {
         (".zz[.n] | key", "0"),
         (".zz[.n] | path", "[\"zz\",0]"),
         (".c[9] | key", "9"),
-        (".c[.neg] | key", "-1"),
+        // spine 2416 (the exit): `key` is the *node's* key, so a negative
+        // index answers the element's resolved position -- `1` for `.c[-1]`
+        // on a two-element array. This row read `-1` until the walk started
+        // taking the whole pipe: `path_step_generic` keeps a negative index
+        // as written for the *path component* in jq mode (jq 1.7.1's
+        // `path(.c[-1])` is `["c",-1]`, the row below), and the walk used to
+        // read `key` straight off that component. Captured live from yq
+        // v4.53.3 on `c: [10, 20]`, `neg: -1`: `.c[.neg] | key` is `1` and
+        // `.c[-1] | key` is `1`, which is also what the literal spelling
+        // already answered here since #2568
+        // (`test_negative_index_lookup_resolves_element_2568`) -- so this
+        // move makes the two spellings agree on the answer the reference
+        // gives. `path` is unaffected and stays jq's own convention.
+        (".c[.neg] | key", "1"),
         (".c[.neg] | path", "[\"c\",-1]"),
         (".c[.n] | .x? | key", ""),
         (".c[.n] | parent | key", "\"c\""),

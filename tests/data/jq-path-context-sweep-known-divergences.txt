@@ -31,7 +31,7 @@
 yq/*/first/*/*        yq_first        real yq's first(f) ignores its argument and yields the first child — #2377
 
 # `{"k": key}`/`{"k": path}`/`{"k": parent}` answer null/[]/{} at every
-# position: `eval_pipe_with_path_context_internal` has no `Expr::Object` arm,
+# position: the deleted eager path-context evaluator has no `Expr::Object` arm,
 # so the whole object construction falls to the context-dropping fallback.
 
 # `file_index` itself agrees everywhere since #2427: the ordinary multi-file
