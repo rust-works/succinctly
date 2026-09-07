@@ -39196,6 +39196,105 @@ fn test_jq_update_filter_position_is_a_succinctly_extension_2522() -> Result<()>
     Ok(())
 }
 
+/// #2471 (spine 2416, gate reason 1): a *computed* bracket at the head of a
+/// pipe (`.c[.n] | ...`) is walkable, in jq mode too.
+///
+/// jq 1.7.1 has no `key`/`path`-with-no-argument, so its half of the oracle
+/// is the *component* model `path(...)` reports -- which is what the walk's
+/// computed-bracket step has to reproduce, component for component. Captured
+/// 2026-09-07 from `/usr/bin/jq` 1.7.1 on
+/// `{"a":{"b":1},"c":[10,20],"n":0,"m":1,"s":"hi","k":"b","neg":-1}`:
+///
+/// ```text
+/// $ jq -c 'path(.c[.n])'            ["c",0]
+/// $ jq -c '[path(.c[(0,1)])]'       [["c",0],["c",1]]
+/// $ jq -c 'path(.c[.n]?)'           ["c",0]
+/// $ jq -c '[path(.zz[.n])]'         [["zz",0]]
+/// $ jq -c 'path(.c[9])'             ["c",9]
+/// $ jq -c 'path(.a[.k])'            ["a","b"]
+/// $ jq -c 'path(.a[("z"+"z")])'     ["a","zz"]
+/// $ jq -c 'path(.c[.neg])'          ["c",-1]
+/// $ jq -c 'path(.a[.a.b])'          Cannot index object with number  (exit 5)
+/// $ jq -c '[path(.s[.n])]'          Cannot index string with number  (exit 5)
+/// $ jq -c '[path(.c[.n] | .x?)]'    []
+/// $ jq -c '.c[.n]'                  10
+/// $ jq -c '.a[.k]'                  1
+/// ```
+///
+/// The two rows jq raises on are the mode split this migration must not blur:
+/// a negative index stays as written in jq mode (`["c",-1]`, where yq resolves
+/// it to `["c",1]`), a numeric index on an object raises here (where yq reads
+/// it as an absent position), and a string index on a scalar raises here
+/// (where yq produces no position at all). The walk gets all three by
+/// spelling each component as the *literal* `Expr::Field`/`Expr::Index` step
+/// that carries the mode rule already, rather than re-deriving one.
+///
+/// The `key`/`path`/`parent` rows are succinctly's jq-mode extension
+/// (`jq: error: key/0 is not defined` in real jq), so they follow yq's model
+/// for the builtin and jq's for the component.
+#[test]
+fn test_computed_bracket_head_is_walkable_2471() -> anyhow::Result<()> {
+    let doc = r#"{"a":{"b":1},"c":[10,20],"n":0,"m":1,"s":"hi","k":"b","neg":-1}"#;
+    for (filter, want) in [
+        // The jq-captured half.
+        ("path(.c[.n])", "[\"c\",0]"),
+        ("[path(.c[(0,1)])]", "[[\"c\",0],[\"c\",1]]"),
+        ("path(.c[.n]?)", "[\"c\",0]"),
+        ("[path(.zz[.n])]", "[[\"zz\",0]]"),
+        ("path(.c[9])", "[\"c\",9]"),
+        ("path(.a[.k])", "[\"a\",\"b\"]"),
+        ("path(.a[(\"z\"+\"z\")])", "[\"a\",\"zz\"]"),
+        ("path(.c[.neg])", "[\"c\",-1]"),
+        ("[path(.c[.n] | .x?)]", "[]"),
+        (".c[.n]", "10"),
+        (".a[.k]", "1"),
+        // The same positions through the extension builtins the walk now
+        // answers from a computed head.
+        (".c[.n] | key", "0"),
+        (".c[.n] | path", "[\"c\",0]"),
+        (".c[.n]? | key", "0"),
+        (".c[.n]? | path", "[\"c\",0]"),
+        (".a[.k] | key", "\"b\""),
+        (".a[.k] | path", "[\"a\",\"b\"]"),
+        (".c[(0,1)] | key", "0\n1"),
+        (".zz[.n] | key", "0"),
+        (".zz[.n] | path", "[\"zz\",0]"),
+        (".c[9] | key", "9"),
+        (".c[.neg] | key", "-1"),
+        (".c[.neg] | path", "[\"c\",-1]"),
+        (".c[.n] | .x? | key", ""),
+        (".c[.n] | parent | key", "\"c\""),
+        (".c[.n] | [key, path]", "[0,[\"c\",0]]"),
+        (".c[.n] | key + 1", "1"),
+        (".c[.n] | tostring | key", "0"),
+        (".c[.n] | . as $x | key", "0"),
+        (".c[.n] | select(key == 0)", "10"),
+        (".c[.n] | file_index + 1", "1"),
+        // #2471 sub-item 3's `KeyNode` rule, reached from a computed head for
+        // the first time: `key` keeps the position but a *second* `key` emits
+        // nothing (yq v4.53.3: `.c[.n] | key | key` prints nothing).
+        (".c[.n] | key | key", ""),
+        (".c[.n] | key | path", "[\"c\",0]"),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "`{filter}`: {out:?} {err}");
+        assert_eq!(out.trim_end(), want, "`{filter}`");
+    }
+    // The three rows real jq raises on, which the walk must keep raising in
+    // jq mode.
+    for (filter, message) in [
+        ("path(.a[.a.b])", "Cannot index object with number"),
+        (".a[.a.b] | key", "Cannot index object with number"),
+        ("[path(.s[.n])]", "Cannot index string with number"),
+        (".s[.n] | key", "Cannot index string with number"),
+    ] {
+        let (_out, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 5, "`{filter}`: {err}");
+        assert!(err.contains(message), "`{filter}`: {err}");
+    }
+    Ok(())
+}
+
 /// #2558 (spine 2416, gate reason 2): an optional head (`.a? | ...`) is
 /// walkable, in jq mode too.
 ///

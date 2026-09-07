@@ -139,7 +139,7 @@ trusting them.
 | A04 | `Expr::Slice { .. }`                                               | REACHABLE | `.c[0:1] \| .[0] \| key + 1`                          | R1   |
 | A05 | `Expr::Iterate`                                                    | REACHABLE | `.a[] \| (key \| tostring)`                            | R3   |
 | A06 | `Expr::Paren(inner)`                                               | REACHABLE | `.a.b \| (parent) + {}`                               | R2   |
-| A07 | `Expr::Optional(inner) if IndexExpr/SliceExpr`                     | REACHABLE | `.c[.n]? \| key + 1`                                  | R1   |
+| A07 | `Expr::Optional(inner) if IndexExpr/SliceExpr`                     | REACHABLE | `.c[.n]? \| . as $x \| key`                            | R2   |
 | A08 | `Expr::Optional(inner)`                                            | REACHABLE | `.a? \| . as $x \| key`                                | R2   |
 | A09 | `Expr::Pipe(inner) if rest.is_empty()`                             | REACHABLE | `.a.b \| -(key\|length)`                              | R2   |
 | A10 | `Expr::Pipe(inner)`                                                | REACHABLE | `.a.b \| parent + {}`                                 | R2   |
@@ -151,7 +151,7 @@ trusting them.
 | A16 | `Expr::Builtin(Builtin::Map(f))`                                   | REACHABLE | `.a \| map(key + "x")`                                | R2   |
 | A17 | `Expr::Builtin(Builtin::GetPath(path_expr))`                       | REACHABLE | `.a \| getpath(["b"]) \| . as $x \| key`              | R1   |
 | A18 | `Expr::Builtin(_)`                                                 | REACHABLE | `.a[] \| (key \| length)`                             | R3   |
-| A19 | `Expr::IndexExpr { target, key }`                                  | REACHABLE | `.c[.n] \| key + 1`                                   | R1   |
+| A19 | `Expr::IndexExpr { target, key }`                                  | REACHABLE | `.c[.n] \| . as $x \| key`                             | R2   |
 | A20 | `Expr::SliceExpr { target, start, end }`                           | REACHABLE | `.c[.n:.m] \| .[0] \| key + 1`                        | R1   |
 | A21 | `Expr::Array(inner) if needs_path_context(inner)`                  | REACHABLE | `.a.b \| . as $x \| [key] + ["x"]`                     | R2   |
 | A22 | `Expr::StringInterpolation(parts) if ..`                           | REACHABLE | `.a.b \| ("\(key)") \| . + "x"`                       | R2   |
@@ -242,6 +242,14 @@ component -- which it cannot do uniformly, because an *absent* position
 (`PathNode::Absent`) carries no cursor to evaluate the component against. That
 is the next step for this cluster, and it is what would make the five `R1` rows
 unreachable.
+
+*(Superseded by "#2471 remainder: a computed bracket at the head" below. The
+absent position is not the obstacle it looks like here -- the component is
+evaluated against the `null` such a position holds, exactly as the owned
+identity pipe does -- and the walk took `Expr::IndexExpr` on those terms. Two
+of the five rows still fire and three of them never could: a slice and a
+`getpath` can stand on a value that is not a document node at all, which is the
+real obstacle and is `PathNode`'s, not the component's.)*
 
 ## #2472: gate reason 2 narrowed, and the pin still holds at 43
 
@@ -599,7 +607,9 @@ Three things are worth recording about the re-run:
   *computed* bracket, which `path_context_is_navigational` still does not admit
   (an absent `PathNode` carries no cursor to evaluate the component against).
   That is #2471's own "next step for this cluster" and is not what #2558
-  changed; its gate is `R1`, not `R2`, and both are unmoved.
+  changed; its gate is `R1`, not `R2`, and both are unmoved. *(That step landed:
+  see "#2471 remainder: a computed bracket at the head" below, where `A07`'s
+  query is re-derived to `.c[.n]? | . as $x | key` and its gate moves to `R2`.)*
 - **`A08` is still reachable, and by a `?` head.** `?` over navigation being
   *walkable* does not make a pipe routable: `.a? | . as $x | key` still hands
   over, because `as` has no `owned_identity_rule`, and the eager evaluator's
@@ -629,6 +639,109 @@ path` prints `R1` and `R2` and hits no arm. The `ARMHIT` markers, not the
 `GATE` ones, are what says a handler ran; the `Gate` column records the
 disjunct that fired for a query the markers confirm got there.
 
+## #2471 remainder: a computed bracket at the head, and the pin still holds at 44
+
+The last of [#2471](https://github.com/rust-works/succinctly/issues/2471)'s list, and
+the lever every one of the five `R1` rows above named: a *computed* bracket standing at
+the **head** of a pipe. `path_context_is_navigational` admitted only a literal
+`Expr::Index`, so `.c[.n] | key` left the cursor domain at a stage with no
+`owned_identity_rule` and the gate handed the whole pipe over.
+
+`Expr::IndexExpr` is navigation there now. The component is one more value to evaluate
+-- against the stage's *own* input, jq's `K as $k | E | .[$k]` model (`.a[.a.b]` reads
+`.a.b` from the position the bracket stands at, not from `.a`) -- and each component it
+produces is then taken by the walk's **literal** `Expr::Field`/`Expr::Index` step, spelled
+as the node that carries it (`path_component_step_expr`). That is the whole of the
+change's fidelity argument: every mode-specific indexing rule -- yq's negative-index
+resolution (#2254), its numeric index on a mapping (#2459), its scalar target (#2482),
+its absent key inside a read-only operand (#2470), and jq's raises for the same three --
+stays one definition instead of being re-derived for the computed spelling.
+
+Three shapes are deliberately **not** admitted, each for a reason the walk's own data
+model gives:
+
+- **`Expr::SliceExpr` and `getpath(p)`.** Both can land on a value that is not a document
+  node: a slice builds a fresh container, and a `getpath` segment may be jq's own
+  `{"start":s,"end":e}` descriptor (`eval::getpath_walk_owned`'s `Object`-segment arms).
+  A walked stage may have to *emit* the node it stands on (`path_context_emit_node`), and
+  `PathNode` carries only a cursor or an absence -- `.a.b | parent | .[0:1]` would emit
+  the container instead of the slice. They stay on the owned identity pipe (#2493) and
+  the eager evaluator, which carry an owned value.
+- **A component that can escape** (`.c[halt] | key`). The walk's step returns
+  `Result<(), EvalError>`, which has no room for `Control::Halt`/`Control::Break`;
+  #2495's `Control` plumbing lives on the eager route, so a component containing
+  `halt`/`halt_error`/`break` stays there and `.c[halt] | key` still exits silently.
+- **A component that fans out** (`.c[(0,1)] | tostring | key`). A comma inside the
+  component makes the bracket a fan-out head, and a fan-out head standing on *absent*
+  positions loses its position once the pipe leaves the walk. That is pre-existing and
+  demonstrable with no computed bracket anywhere in the filter: on `c: []`,
+  `(.c[0], .c[1]) | key` prints nothing here where yq v4.53.3 answers `0` and `1`.
+  Admitting one would have moved `.c[(0,1)] | tostring | key` -- which the eager
+  evaluator answers correctly -- onto that gap, so it is refused instead. Measured: the
+  admission cost four rows that moved *away* from yq, and refusing it costs nothing (the
+  same shapes keep their pre-change answers).
+
+**`PINNED_ARM_COUNT` stays at 44.** Re-run of the method above on the post-change tree,
+with the five `R1` arms and the gate's three disjuncts instrumented, each arm fed its
+listed proof query (document `D`):
+
+| Id  | Listed query before          | Re-derived query               | Gate | Marker | Output |
+|-----|------------------------------|--------------------------------|------|--------|--------|
+| A04 | `.c[0:1] \| .[0] \| key + 1`    | unchanged                      | R1   | fired  | `1`    |
+| A07 | `.c[.n]? \| key + 1`          | `.c[.n]? \| . as $x \| key`       | R2   | fired  | `0`    |
+| A17 | `.a \| getpath(["b"]) \| . as $x \| key` | unchanged           | R1   | fired  | `"b"`  |
+| A19 | `.c[.n] \| key + 1`           | `.c[.n] \| . as $x \| key`        | R2   | fired  | `0`    |
+| A20 | `.c[.n:.m] \| .[0] \| key + 1`  | unchanged                      | R1   | fired  | `1`    |
+
+`A04`, `A17` and `A20` are unaffected because their heads are the three shapes the
+admission refuses. `A07` and `A19` needed re-derivation for the reason every earlier
+re-derivation in this document needed one: their listed queries now report **no gate at
+all** -- `.c[.n] | key + 1` and `.c[.n]? | key + 1` are answered by the absent route,
+because a computed bracket is a navigational head the absent split can take. The
+re-derivations keep the same head and put an `as` stage -- which has no
+`owned_identity_rule` -- where the arithmetic was, so the reason moves from `R1` to `R2`
+while the arm is unchanged. Both spellings are pinned in
+`test_arm_audit_proof_queries_are_unmoved_by_the_gate_2416`.
+
+Two more `R1` proof queries were confirmed alongside, both still firing their arm on the
+post-change tree: `.c[(0,1)] | key + 1` fires `A19` at `R1` and `.c[(0,1)]? | key + 1`
+fires `A07` at `R1` -- the refused fan-out component keeping the original reason intact.
+
+**Nothing became unreachable, so nothing was deleted**, and the reason is structural: the
+change adds an `Expr::IndexExpr` arm to `path_context_is_navigational`,
+`path_context_fans_out` and `path_context_step_generic` and nothing else, so a pipe with
+no `Expr::IndexExpr` anywhere in it is routed *identically* before and after. That is why
+the 39 rows whose listed query has no computed bracket need no re-derivation and none was
+done. The instrumentation was reverted before this document was committed.
+
+### What the change is measured against
+
+A differential over 2,070 queries (nineteen computed-bracket heads x eighteen tails plus
+a tail of assignment, `path()` and nested-bracket shapes) on
+`{"a":{"b":1,"e":2},"c":[10,20,30],"n":0,"m":2,"s":"hi","u":null,"d":{...},"k":"b",
+"neg":-1}` and on `{"c":[],"a":{},"n":0}`, in both modes and in both YAML and JSON
+spellings: **154 answers changed** before the fan-out component was refused, **57 after**.
+Classified three-way against yq v4.53.3 on the yq-mode half: **42 moved from disagreeing
+with yq to agreeing with it, 11 changed without reaching agreement, and 4 read as moving
+away** -- of which two are filters yq's own lexer rejects (`try ... catch`, `{k: key}`),
+so there is no yq answer to move away from, and the other two are the *literal*
+spelling's own pre-existing gap, reached by the computed spelling for the first time:
+on `c: []`, `.c[0] | parent | key | path` and `.c[0] | parent | tostring | key` print
+nothing here (and `["c"]` / `"c"` in yq) before this change as much as after it.
+
+The five yq-mode rows the change *fixes* are pinned in
+`test_computed_bracket_head_is_walkable_2471` (`tests/yq_cli_tests.rs`), with the capture
+for each; the jq-mode half of the same test pins the ten `path(...)` rows real jq 1.7.1
+answers, all unchanged.
+
+One walk-versus-bridge divergence is left open rather than pinned, and is recorded in
+`test_walk_vs_bridge_path_context_parity_2416`'s own comment: `[.a[("b"+"")] | key]` on a
+scalar-valued `.a` is `[]` on the walk (matching yq v4.53.3, and matching succinctly's own
+*value* route, which already answers `[]` for `[.a[("b"+"")]]`) and raises `Cannot index
+number with string "b"` on the eager route, whose `Expr::IndexExpr` arm never got #2482's
+scalar rule. The walk is the side that matches the oracle, so the row is not asserted as
+"the routes agree"; the eager arm's missing rule is a separate fix.
+
 ## Result
 
 | Metric                                            | Before | After                 |
@@ -641,6 +754,7 @@ disjunct that fired for a query the markers confirm got there.
 | ... starved by #2471's remainder                   | --     | 0 (`A16`/`A18` re-run) |
 | ... starved by #2522                               | --     | 0 (no row's query assigns) |
 | ... starved by #2558                               | --     | 0 (9 `?`-headed rows re-derived) |
+| ... starved by #2471's head-of-pipe half           | --     | 0 (`A07`/`A19` re-derived)       |
 | `PINNED_ARM_COUNT`                                 | 43     | 44                    |
 
 Nothing is deletable at this point in the spine. Doors 2 and 3 are closed as
@@ -654,14 +768,16 @@ evaluator, with no second route to check.
 ### Notes for the next migration
 
 - The five `R1` rows (`A04`, `A07`, `A17`, `A19`, `A20`) are the detached-value
-  reason and are the cheapest cluster to attack: `Expr::Slice`, `Expr::IndexExpr`
-  and `Expr::SliceExpr` are missing from `path_context_single_native` even though
-  their literal-bound siblings (`Expr::Index`, `Expr::Slice` with folded bounds)
-  are navigational. #2471 (section above) took the *owned-domain* half of that
-  cluster and left all five arms reachable: what remains is the head-of-pipe
-  half, which needs the cursor walk to evaluate a computed component. #2471's
-  *remainder* (section above) closed the map-family and assignment-right-side
-  shapes and left all five reachable for the same reason.
+  reason. #2471 took it in three passes -- the owned-domain half, the map-family
+  and assignment-right-side shapes, and the head-of-pipe computed bracket
+  (sections above) -- and all five arms are still reachable after all three.
+  What is left of the cluster is the two head shapes the walk's `PathNode`
+  cannot carry: `Expr::Slice`/`Expr::SliceExpr` (`A04`, `A20`) and `getpath(p)`
+  (`A17`), both of which can stand on a value that is not a document node.
+  Giving the walk a third `PathNode` variant for an owned value is what would
+  make those reachable by the walk; `A07`/`A19` need the *stage* shapes behind
+  a computed head (`as`, and a fan-out component) migrated, not this head
+  admission widened.
 - `A24` (`Expr::Shared`) is only ever produced by `substitute_func_param`
   (`src/jq/eval.rs`), so it dies with `A23`/`A25` and not before.
 - `A38` (`Expr::Break`) cannot be reached without `A37` (`Expr::Label`): the
