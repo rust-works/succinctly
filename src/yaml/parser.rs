@@ -112,6 +112,11 @@ pub struct SemiIndex {
     pub ty_len: usize,
     /// Anchor definitions: anchor name → BP position of the anchored value
     pub anchors: BTreeMap<String, usize>,
+    /// Reverse anchor mapping: BP position → its own anchor name, one entry
+    /// per `&name` declaration in source order (#1353) -- see the identically
+    /// named `Parser` field's doc comment for why this isn't derived from
+    /// `anchors` above by inversion.
+    pub bp_to_anchor: BTreeMap<usize, String>,
     /// Alias references: BP position of alias → target BP position (resolved at parse time)
     pub aliases: BTreeMap<usize, usize>,
     /// Explicit source tags: BP position → raw tag text (see [`YamlIndex::get_tag`](super::index::YamlIndex::get_tag))
@@ -173,8 +178,20 @@ struct Parser<'a, const HAS_CR: bool> {
     current_type: Option<NodeType>,
 
     // Anchor and alias tracking
-    /// Anchors collected during parsing: name → bp_pos of anchored value
+    /// Anchors collected during parsing: name → bp_pos of anchored value.
+    /// Last-wins on a redefined name, which is exactly the resolution rule
+    /// an alias needs (YAML: an alias refers to the most recent preceding
+    /// anchor of that name) — see `bp_to_anchor` below for the position
+    /// that rule intentionally discards.
     anchors: BTreeMap<String, usize>,
+    /// Reverse anchor mapping: bp_pos of the anchored value/key → its own
+    /// anchor name (#1353). Populated directly at each `&name` site
+    /// (`parse_anchor`/`record_key_anchor`), *not* derived from `anchors`
+    /// by inversion — inverting a last-wins map would silently lose every
+    /// declaration but the final one when a name is redefined, dropping
+    /// `&x` from `a: &x 1\nb: &x 2\nc: *x` on re-emission even though `a`'s
+    /// own declaration is still in the source and real yq keeps it.
+    bp_to_anchor: BTreeMap<usize, String>,
     /// Aliases collected during parsing: bp_pos → target bp_pos (resolved at parse time)
     aliases: BTreeMap<usize, usize>,
     /// Explicit source tags collected during parsing: bp_pos → raw tag text
@@ -297,6 +314,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             type_stack: Vec::with_capacity(32),
             current_type: None,
             anchors: BTreeMap::new(),
+            bp_to_anchor: BTreeMap::new(),
             aliases: BTreeMap::new(),
             tags: BTreeMap::new(),
             pending_property_bp: None,
@@ -4963,6 +4981,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         // YAML allows anchor redefinition - later definitions override earlier ones
         // Store placeholder - will be updated when value BP is opened
         self.anchors.insert(name.clone(), self.bp_pos);
+        // #1353: recorded per-declaration, alongside (not derived from) the
+        // last-wins `anchors` map above -- see `bp_to_anchor`'s own doc
+        // comment.
+        self.bp_to_anchor.insert(self.bp_pos, name.clone());
         self.pending_property_bp = Some(self.bp_pos);
 
         Ok(name)
@@ -4984,7 +5006,9 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         self.advance();
         let name = self.parse_anchor_name()?;
         self.skip_inline_whitespace();
-        self.anchors.insert(name, self.bp_pos - 1);
+        self.anchors.insert(name.clone(), self.bp_pos - 1);
+        // #1353: see `parse_anchor`'s own matching insert above.
+        self.bp_to_anchor.insert(self.bp_pos - 1, name);
         self.pending_property_bp = Some(self.bp_pos - 1);
         Ok(())
     }
@@ -5308,6 +5332,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             bp_len: self.bp_pos,
             ty_len: self.ty_pos,
             anchors: core::mem::take(&mut self.anchors),
+            bp_to_anchor: core::mem::take(&mut self.bp_to_anchor),
             aliases: core::mem::take(&mut self.aliases),
             tags: core::mem::take(&mut self.tags),
             line_comments: core::mem::take(&mut self.line_comments),

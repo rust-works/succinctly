@@ -6173,6 +6173,44 @@ fn test_yaml_mapping_key_anchor_and_value_anchor_together_1352() -> Result<()> {
 }
 
 #[test]
+fn test_yaml_redefined_anchor_keeps_earlier_declaration_on_identity_output_1353() -> Result<()> {
+    // #1353: `bp_to_anchor` used to be built by inverting the last-wins
+    // `anchors` (name -> position) map, so a redefined `&x` silently lost
+    // its *first* declaration on re-emission even though the value (and
+    // the alias resolution) were both correct. Real yq keeps every
+    // declaration.
+    let input = "a: &x 1\nb: &x 2\nc: *x\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: &x 1\nb: &x 2\nc: *x\n");
+    Ok(())
+}
+
+#[test]
+fn test_yaml_redefined_anchor_resolves_to_most_recent_value_1353() -> Result<()> {
+    // The fix must not disturb alias *resolution* (last-wins is the correct
+    // rule for that, unlike re-emission) -- `c` must still read 2, not 1.
+    let input = "a: &x 1\nb: &x 2\nc: *x\n";
+    let (output, exit_code) = run_yq_stdin(".", input, &["-o", "json", "-I", "0"])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output.trim(), r#"{"a":1,"b":2,"c":2}"#);
+    Ok(())
+}
+
+#[test]
+fn test_yaml_redefined_anchor_survives_dom_write_path_1353() -> Result<()> {
+    // The DOM write path (a write forces it) reads the same
+    // `YamlCursor::anchor()`/`get_anchor_name` this fix touches, so an
+    // unrelated write elsewhere in the document must not disturb either
+    // redefined declaration.
+    let input = "a: &x 1\nb: &x 2\nc: *x\nd: 3\n";
+    let (output, exit_code) = run_yq_stdin(".d = 5", input, &[])?;
+    assert_eq!(exit_code, 0);
+    assert_eq!(output, "a: &x 1\nb: &x 2\nc: *x\nd: 5\n");
+    Ok(())
+}
+
+#[test]
 fn test_yaml_anchored_tag_in_seq_item_resolves() -> Result<()> {
     // Consuming the anchor before dispatching means the tag is seen rather
     // than absorbed into a plain scalar, so `- &a !!str x` resolves to the
