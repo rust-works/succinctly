@@ -2581,10 +2581,25 @@ pub(crate) fn yq_empty_context_literal_or_constructor(expr: &Expr) -> Option<Own
             for entry in entries {
                 let key = match &entry.key {
                     ObjectKey::Literal(s) => s.clone(),
-                    ObjectKey::Expr(k) => match yq_empty_context_literal_or_constructor(k)? {
-                        OwnedValue::String(s) => s,
-                        _ => return None,
-                    },
+                    // #2540 review: a dynamic key's own qualifying value
+                    // still has to become a `String` the same way any other
+                    // object-construction key does (#2508/#2521) -- a
+                    // numeric/bool/null key stringifies rather than
+                    // disqualifying the object; only a genuinely
+                    // non-stringifiable key (`Array`/`Object`, which
+                    // `yq_object_key_stringify` already refuses) does that.
+                    // `YqSemantics` unconditionally, not a generic `S`: this
+                    // whole function only ever runs under `rules.read_only`,
+                    // which is yq-only by construction (see this function's
+                    // own doc comment), so there is no jq-mode call to get
+                    // this wrong for.
+                    ObjectKey::Expr(k) => {
+                        let v = yq_empty_context_literal_or_constructor(k)?;
+                        match &v {
+                            OwnedValue::String(s) => s.clone(),
+                            _ => yq_object_key_stringify::<YqSemantics>(&v)?,
+                        }
+                    }
                 };
                 let value = yq_empty_context_literal_or_constructor(&entry.value)?;
                 map.insert(key, value);

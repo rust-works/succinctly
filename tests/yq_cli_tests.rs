@@ -34250,10 +34250,12 @@ fn test_yq_empty_context_constructor_value_shapes_2540() -> Result<()> {
 /// (`boolean_fanout_bools`'s second call site, reached only once the left
 /// operand's own truthiness does not already short-circuit the pairing) --
 /// the two tests above only ever put the interesting expression on the
-/// left. Also covers a dynamic object key (`{(EXPR): v}`): a literal key
-/// expression qualifies like any other literal, but a key expression that
-/// itself propagates the empty context (`.b | tostring` against the same
-/// zero-node upstream) voids the whole object, exactly like a
+/// left. Also covers a dynamic object key (`{(EXPR): v}`): a literal string
+/// key expression qualifies like any other literal, a literal *numeric* key
+/// stringifies the same way any other object-construction key does
+/// (#2508/#2521) rather than disqualifying the object, and a key expression
+/// that itself propagates the empty context (`.b | tostring` against the
+/// same zero-node upstream) voids the whole object, exactly like a
 /// disqualifying *value* does. Captured live against yq v4.53.3.
 #[test]
 fn test_yq_empty_context_literal_or_constructor_right_operand_and_dynamic_key_2540() -> Result<()> {
@@ -34262,6 +34264,7 @@ fn test_yq_empty_context_literal_or_constructor_right_operand_and_dynamic_key_25
         (r"true and (.a.zz | true)", "true"),
         (r"false or (.a.zz | true)", "true"),
         (r#"(.a.zz | {("k"): 1}) and true"#, "true"),
+        (r"(.a.zz | {(5): 1}) and true", "true"),
         (r"(.a.zz | {(.b|tostring): 1}) and true", "false"),
     ] {
         let (out, _, code) = run_yq_stdin_with_stderr(filter, DOC, &["-o", "json", "-I", "0"])?;
