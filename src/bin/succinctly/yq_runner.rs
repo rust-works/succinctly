@@ -2541,10 +2541,10 @@ fn reconcile_presentation_at_depth(
             CommentTree::Array(own_meta, items)
         }
         // A kind change (container <-> scalar, or Object <-> Array) is a
-        // fresh node with no presentation memory of its own -- except the
-        // anchor mark, which is identity rather than presentation: `&x`
-        // names the *position*, and the position survives the write just
-        // like it does in the both-scalars arm below (#1359). `Leaf` is
+        // fresh node with no presentation memory of its own -- except an
+        // anchor *declaration*, which is identity rather than presentation:
+        // `&x` names the *position*, and the position survives the write
+        // just like it does in the both-scalars arm below (#1359). `Leaf` is
         // correct even when `result_value` is itself a container: every
         // descent into a child (`CommentTree::at_index`/`field`) already
         // falls back to the empty tree for a non-matching variant, the same
@@ -2553,12 +2553,40 @@ fn reconcile_presentation_at_depth(
         // memory of their own either way. Comment and style are still
         // dropped, since neither describes anything that survived the kind
         // change. [`enforce_anchor_soundness`], run afterwards, is what
-        // decides whether the carried mark is still emittable.
+        // decides whether a carried `Declares` mark is still emittable.
+        //
+        // An `Aliases` mark is handled differently (found in review): unlike
+        // a declaration, it isn't this node's own identity, it's a reference
+        // to someone else's. A write landing exactly *at* an alias position
+        // is a rebind that drops the reference -- the same rule the
+        // both-scalars arm's own doc comment cites via #1351 -- so it only
+        // survives here when this position was never itself a write target,
+        // i.e. its kind changed purely as a side effect of mirroring its
+        // anchor's own new value (an "untouched copy", #1351's own term).
+        // Checking `targets` rather than always dropping the mark matters:
+        // an untouched alias elsewhere in the same document (`c: *x` when
+        // only `.a`/`.b` are written) must keep referring to its anchor.
+        // Checking it rather than always *keeping* the mark matters too --
+        // for a target ending exactly here, [`propagate_assign_alias_marks`]
+        // (#2497) actively re-derives the mark after a plain `=`/chain-of-`=`
+        // write, but it does not cover `|=`/`+=`/other compound writes, which
+        // would otherwise have only `enforce_anchor_soundness`'s coincidental
+        // value-equality check as a backstop -- unsound, since
+        // `.b |= 5 | .a = 5` on `b: *x` can make `.b`'s freshly-written value
+        // equal `.a`'s by coincidence, wrongly keeping `*x`.
         (OwnedValue::Object(_) | OwnedValue::Array(_), _)
-        | (_, OwnedValue::Object(_) | OwnedValue::Array(_)) => CommentTree::Leaf(NodeMeta {
-            anchor: pristine_tree.meta().anchor.clone(),
-            ..NodeMeta::empty()
-        }),
+        | (_, OwnedValue::Object(_) | OwnedValue::Array(_)) => {
+            let is_write_target = targets.iter().any(|(steps, ..)| steps.is_empty());
+            let anchor = match &pristine_tree.meta().anchor {
+                mark @ Some(AnchorMark::Declares(_)) => mark.clone(),
+                mark @ Some(AnchorMark::Aliases(_)) if !is_write_target => mark.clone(),
+                _ => None,
+            };
+            CommentTree::Leaf(NodeMeta {
+                anchor,
+                ..NodeMeta::empty()
+            })
+        }
         // Both scalars, any variant/value: same node, only its value
         // changed - its own comment, style and anchor mark survive. Real
         // `yq` keeps `&x` across `.a = 99` for the same reason it keeps the
