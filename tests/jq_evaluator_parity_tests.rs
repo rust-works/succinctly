@@ -2270,6 +2270,68 @@ fn test_arm_audit_proof_queries_are_unmoved_by_the_gate_2416() {
             r".a.b | . as $x | (key and parent) | {z: .}",
             &[r#"{"z":true}"#],
         ),
+        // Spine 2416's identity pass, same precedent once more: every stage
+        // shape has a rule or an arm in the owned identity pipe now, so
+        // forty of the listed proof queries above report no arm at all.
+        // What still reaches an arm is a *head* no route carries -- a
+        // computed `parent(n)` (`parent(0+1)`, refused by every route), a
+        // fan-out component, a slice, a `getpath` -- so each re-derivation
+        // below puts one of those in front of the stage the arm handles.
+        // Verified with the arms instrumented (2026-09-07, method in
+        // `docs/plan/path-context-arm-reachability.md`): every one of the 44
+        // arms fires on its row there, and all 44 are still reachable.
+        (r".a.b | parent(0+1) | path + []", &[r#"["a"]"#]),
+        (r".a.b | parent(0+1) | (key and parent)", &["true"]),
+        (r".a.b | parent(0+1) | file_index + 1", &["1"]),
+        (r".a.b | parent(0+1) | . | key", &[r#""a""#]),
+        (r".a.b | parent(0+1) + {}", &[r#"{"b":1}"#]),
+        (r".c[0] | parent(0+1) | key", &[r#""c""#]),
+        (r".a[] | parent(0+1) | key", &[r#""a""#]),
+        (r".c[.n]? | parent(0+1) | key", &[r#""c""#]),
+        (r".a? | parent(0+1) | key", &["null"]),
+        (r".a.b | parent(0+1) | -(key|length)", &["-1"]),
+        (r#".a.b | parent(0+1) | (key == "a")"#, &["true"]),
+        (
+            r#".a.b | parent(0+1) | select(key == "a") | key"#,
+            &[r#""a""#],
+        ),
+        (r".a.b | parent(0+1) | map(key)", &[r#"["b"]"#]),
+        (r#"getpath(["a","b"]) | (key and parent)"#, &["true"]),
+        (r".c[(0,1)] | (key and parent)", &["true", "true"]),
+        (r#".a.b | parent(0+1) | [key] + ["x"]"#, &[r#"["a","x"]"#]),
+        (r#".a.b | parent(0+1) | "\(key)""#, &[r#""a""#]),
+        (r#".a.b | parent(0+1) | def f: key; f + "x""#, &[r#""ax""#]),
+        (r".a.b | parent(0+1) | . as $x | key", &[r#""a""#]),
+        (r".c[0] | parent(0+1) | . as [$x] | key", &[r#""c""#]),
+        (r#".a.b | parent(0+1) | limit(1; key + "x")"#, &[r#""ax""#]),
+        (r#".a.b | parent(0+1) | first(key + "x")"#, &[r#""ax""#]),
+        (r#".a.b | parent(0+1) | last(key + "x")"#, &[r#""ax""#]),
+        (
+            r#".a.b | parent(0+1) | reduce (key) as $k (""; . + $k)"#,
+            &[r#""a""#],
+        ),
+        (
+            r#".a.b | parent(0+1) | foreach (key) as $k (""; . + $k)"#,
+            &[r#""a""#],
+        ),
+        (r".a.b | parent(0+1) | {z: key}", &[r#"{"z":"a"}"#]),
+        (
+            r#".a.b | parent(0+1) | if key == "a" then key + "x" else "y" end"#,
+            &[r#""ax""#],
+        ),
+        (
+            r#".a.b | parent(0+1) | (key + "x"), key"#,
+            &[r#""ax""#, r#""a""#],
+        ),
+        (
+            r#".a.b | parent(0+1) | try (key + "x") catch "e""#,
+            &[r#""ax""#],
+        ),
+        (
+            r#".a.b | parent(0+1) | label $out | (key + "x", break $out)"#,
+            &[r#""ax""#],
+        ),
+        (r".a.b | parent(0+1) | .b |= key", &[r#"{"b":"b"}"#]),
     ];
     for (filter, expected) in rows {
         // `path + []` is the audit's H1 row spelled against `.a.b`.
