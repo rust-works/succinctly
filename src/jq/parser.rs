@@ -3277,24 +3277,18 @@ impl<'a> Parser<'a> {
         // Map functions
         if self.matches_keyword("map_values") {
             // Check map_values before map
+            let keyword_start = self.pos;
             self.consume_keyword("map_values");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let f = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::MapValues(Box::new(f))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|f| Builtin::MapValues(Box::new(f))));
         }
         if self.matches_keyword("map") {
+            let keyword_start = self.pos;
             self.consume_keyword("map");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let f = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::Map(Box::new(f))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|f| Builtin::Map(Box::new(f))));
         }
 
         // Reduction functions (no arguments)
@@ -3634,24 +3628,18 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Scan(Box::new(re))));
         }
         if self.matches_keyword("join") {
+            let keyword_start = self.pos;
             self.consume_keyword("join");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let s = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::Join(Box::new(s))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|s| Builtin::Join(Box::new(s))));
         }
         if self.matches_keyword("contains") {
+            let keyword_start = self.pos;
             self.consume_keyword("contains");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let b = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::Contains(Box::new(b))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|b| Builtin::Contains(Box::new(b))));
         }
         if self.matches_keyword("inside") {
             self.reject_unless_jq_extensions("inside")?;
@@ -3688,25 +3676,19 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::Flatten));
         }
         if self.matches_keyword("group_by") {
+            let keyword_start = self.pos;
             self.consume_keyword("group_by");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let f = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::GroupBy(Box::new(f))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|f| Builtin::GroupBy(Box::new(f))));
         }
         // Check unique_by before unique
         if self.matches_keyword("unique_by") {
+            let keyword_start = self.pos;
             self.consume_keyword("unique_by");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let f = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::UniqueBy(Box::new(f))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|f| Builtin::UniqueBy(Box::new(f))));
         }
         if self.matches_keyword("unique") {
             self.consume_keyword("unique");
@@ -3735,14 +3717,11 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::FromEntries));
         }
         if self.matches_keyword("with_entries") {
+            let keyword_start = self.pos;
             self.consume_keyword("with_entries");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let f = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::WithEntries(Box::new(f))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|f| Builtin::WithEntries(Box::new(f))));
         }
 
         // Phase 6: Type Conversions
@@ -3886,14 +3865,11 @@ impl<'a> Parser<'a> {
         }
         if self.matches_keyword("getpath") {
             self.reject_unless_jq_extensions("getpath")?;
+            let keyword_start = self.pos;
             self.consume_keyword("getpath");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let path = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::GetPath(Box::new(path))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|path| Builtin::GetPath(Box::new(path))));
         }
 
         // Phase 8: Advanced Control Flow Builtins
@@ -3923,14 +3899,11 @@ impl<'a> Parser<'a> {
         // walk(f)
         if self.matches_keyword("walk") {
             self.reject_unless_jq_extensions("walk")?;
+            let keyword_start = self.pos;
             self.consume_keyword("walk");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let f = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::Walk(Box::new(f))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|f| Builtin::Walk(Box::new(f))));
         }
 
         // isvalid(expr)
@@ -4023,25 +3996,19 @@ impl<'a> Parser<'a> {
         }
         // delpaths(paths)
         if self.matches_keyword("delpaths") {
+            let keyword_start = self.pos;
             self.consume_keyword("delpaths");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let paths = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::DelPaths(Box::new(paths))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|paths| Builtin::DelPaths(Box::new(paths))));
         }
         // del(path) - delete value at path
         if self.matches_keyword("del") {
+            let keyword_start = self.pos;
             self.consume_keyword("del");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let path = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::Del(Box::new(path))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|path| Builtin::Del(Box::new(path))));
         }
 
         // Phase 10: Math Functions
@@ -4578,14 +4545,11 @@ impl<'a> Parser<'a> {
         // isempty(expr) - returns true if expr produces no outputs
         if self.matches_keyword("isempty") {
             self.reject_unless_jq_extensions("isempty")?;
+            let keyword_start = self.pos;
             self.consume_keyword("isempty");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let expr = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::IsEmpty(Box::new(expr))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|expr| Builtin::IsEmpty(Box::new(expr))));
         }
 
         // Phase 14: Recursive traversal (extends Phase 8)
