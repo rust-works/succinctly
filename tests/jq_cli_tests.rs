@@ -20916,6 +20916,55 @@ fn test_single_arg_builtin_wrong_arity_reports_not_defined_2237() -> Result<()> 
     Ok(())
 }
 
+/// #2389: the first batch of ~40 further `try_parse_builtin` sites sharing
+/// #2237's own inline `self.expect('(')?`/`self.parse_expr()?`/
+/// `self.expect(')')?` shape, each individually oracle-verified (not a
+/// blind sweep, per that issue's own caution) before converting to
+/// `parse_required_single_arg`. All twelve are genuinely single-required-arg
+/// builtins with no comma-restricted argument, optional second argument, or
+/// other complication `has`/`select`/`min_by` didn't already have -- see
+/// #2389 for the full site survey and why the remaining sites (fixed/
+/// optional multi-arg builtins, and `strenv`'s bare-identifier argument)
+/// are out of scope for this same conversion.
+#[test]
+fn test_more_single_arg_builtins_wrong_arity_reports_not_defined_2389() -> Result<()> {
+    for (filter, name) in [
+        ("map", "map/0"),
+        ("map(1;2)", "map/2"),
+        ("map_values", "map_values/0"),
+        ("map_values(1;2)", "map_values/2"),
+        ("with_entries", "with_entries/0"),
+        ("with_entries(1;2)", "with_entries/2"),
+        ("walk", "walk/0"),
+        ("walk(1;2)", "walk/2"),
+        ("del", "del/0"),
+        ("del(1;2)", "del/2"),
+        ("delpaths", "delpaths/0"),
+        ("delpaths(1;2)", "delpaths/2"),
+        ("getpath", "getpath/0"),
+        ("getpath(1;2)", "getpath/2"),
+        ("group_by", "group_by/0"),
+        ("group_by(1;2)", "group_by/2"),
+        ("unique_by", "unique_by/0"),
+        ("unique_by(1;2)", "unique_by/2"),
+        ("join", "join/0"),
+        ("join(1;2)", "join/2"),
+        ("contains", "contains/0"),
+        ("contains(1;2)", "contains/2"),
+        ("isempty", "isempty/0"),
+        ("isempty(1;2)", "isempty/2"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(stdout, "", "{filter}: stderr {stderr:?}");
+        assert!(
+            stderr.contains(&format!("{name} is not defined at <top-level>, line 1:")),
+            "{filter}: stderr {stderr:?}"
+        );
+        assert_eq!(code, 3, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+    }
+    Ok(())
+}
+
 /// #2036: a user `def` can shadow a builtin of the same name, matching
 /// real jq -- the parser previously lowered a recognized builtin name to a
 /// typed `Expr::Builtin`/special-form node at parse time, before any `def`
