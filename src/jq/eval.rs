@@ -2533,6 +2533,69 @@ pub(crate) fn literal_to_owned(lit: &Literal) -> OwnedValue {
     OwnedValue::from(lit.clone())
 }
 
+/// **yq's "a literal or constructor against an empty context still yields
+/// one node" rule** (#2540), consulted only inside a
+/// [read-only context](yq_read_only_context) (#2470) when the operand
+/// expression produced zero outputs, right before that emptiness would
+/// otherwise reach [`yq_empty_operand_output`]'s (#2460) table. Shared
+/// between both evaluators (`eval.rs`'s [`read_only_operand_strategy`] and
+/// `eval_generic.rs`'s `read_only_operand_strategy_generic`) since it is
+/// pure `Expr` classification with no cursor/document dependency at all.
+///
+/// Real yq's `valueOperator` special-cases an empty `context.MatchingNodes`
+/// by re-emitting a copy of the literal node itself rather than looping zero
+/// times (`operator_value.go`); `[...]`/`{...}` share the identical
+/// zero-node special case in their own operators (`operator_collect.go`/
+/// `operator_create_map.go`), but **not identically** -- verified live
+/// against yq v4.53.3 with `.x = (.a.zz | EXPR)` on a document where `.a.zz`
+/// is genuinely absent (not `null`):
+///
+/// | `EXPR`            | produces (not "empty" for #2460's purposes) |
+/// |-------------------|----------------------------------------------|
+/// | `true`/`5`/`"s"`  | itself, unconditionally                       |
+/// | `[.]`/`[.a]`/`[1,2]` | `[]`, **regardless of the array's own body** -- it loops zero times over the (empty) context, but the collected array is still emitted once |
+/// | `{"k": 1}`        | `{"k": 1}` -- every field's value also independently qualifies |
+/// | `{"k": .}`        | nothing -- `.` does not have this special case (it propagates the emptiness, matching `operator_self.go`'s "return input context unchanged"), so the *whole* object construction aborts, not just that one field |
+/// | `{"k": 1, "j": .}` | nothing -- one disqualifying field is enough; this is not a per-field union |
+/// | `.`/`length`/any other filter | nothing (propagates, matching the pre-existing #2460 oracle rows for `key`/`parent`) |
+///
+/// A `Pipe` recurses into its own *last* stage only: a pipe's overall
+/// "what does the tail produce given an empty upstream" is governed
+/// entirely by the tail's own rule once every earlier stage has already
+/// contributed nothing, mirroring how yq's own pipe operator hands the
+/// (empty) context straight to the next operator without accumulating
+/// anything from a stage that produced zero nodes.
+///
+/// Deliberately does not special-case `Expr::Shared` (native since #2416
+/// phase 3, transparent to evaluation): unwrapping it here would be correct
+/// but is not exercised by any known query shape yet, so it is left for
+/// whoever hits it live rather than guessed at.
+pub(crate) fn yq_empty_context_literal_or_constructor(expr: &Expr) -> Option<OwnedValue> {
+    match super::eval_generic::strip_parens(expr) {
+        Expr::Literal(lit) => Some(literal_to_owned(lit)),
+        // Regardless of `body`: the collected array is emitted once even
+        // when its own body loops zero times over the empty context.
+        Expr::Array(_) => Some(OwnedValue::Array(Vec::new())),
+        Expr::Object(entries) => {
+            let mut map = IndexMap::new();
+            for entry in entries {
+                let key = match &entry.key {
+                    ObjectKey::Literal(s) => s.clone(),
+                    ObjectKey::Expr(k) => match yq_empty_context_literal_or_constructor(k)? {
+                        OwnedValue::String(s) => s,
+                        _ => return None,
+                    },
+                };
+                let value = yq_empty_context_literal_or_constructor(&entry.value)?;
+                map.insert(key, value);
+            }
+            Some(OwnedValue::Object(map))
+        }
+        Expr::Pipe(stages) => yq_empty_context_literal_or_constructor(stages.last()?),
+        _ => None,
+    }
+}
+
 /// Evaluate a comma expression (multiple outputs).
 fn eval_comma<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     exprs: &[Expr],
@@ -6889,8 +6952,24 @@ pub(crate) fn boolean_fanout_bools(
     // falls through to the other operand's own truthiness. The rule lives in
     // `yq_empty_operand_output`, not here, so `and`/`or` and the arithmetic/
     // comparison fanout share one definition of "this operand was empty".
+    //
+    // #2540: except that a literal/constructor operand was never really
+    // "empty" in real yq's own model to begin with -- its own operator
+    // special-cases a zero-node context and re-emits one node anyway (see
+    // `yq_empty_context_literal_or_constructor`'s own doc comment). Checked
+    // only when `rules.read_only` is set: this "empty" only exists because
+    // `and`/`or`'s own read-only context turned `.a.zz` into zero nodes in
+    // the first place (#2470), so the same gate that created the emptiness
+    // is what decides whether this rule can override it.
     if left_bools.is_empty() && left_control.is_none() {
-        left_bools.extend(empty_boolean_operand(rules.empty));
+        match rules
+            .read_only
+            .then(|| yq_empty_context_literal_or_constructor(left))
+            .flatten()
+        {
+            Some(v) => left_bools.push(v.is_truthy()),
+            None => left_bools.extend(empty_boolean_operand(rules.empty)),
+        }
     }
 
     let mut out = vec_with_capacity(left_bools.len());
@@ -6904,7 +6983,15 @@ pub(crate) fn boolean_fanout_bools(
             return (out, Some(control));
         }
         if out.len() == before {
-            out.extend(empty_boolean_operand(rules.empty));
+            // #2540: same rationale as the left-operand check above.
+            match rules
+                .read_only
+                .then(|| yq_empty_context_literal_or_constructor(right))
+                .flatten()
+            {
+                Some(v) => out.push(v.is_truthy()),
+                None => out.extend(empty_boolean_operand(rules.empty)),
+            }
         }
     }
 

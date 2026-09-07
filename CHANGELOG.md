@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`succinctly yq`'s `and`/`or` now agrees with real yq when a literal or
+  constructor operand's own upstream pipe stage produced zero nodes inside
+  `and`/`or`'s read-only context (#2470)** (#2540): `(.a.zz | true) and true`
+  was `false`, where real yq gives `true`. Real yq's `valueOperator`/
+  `operator_collect.go`/`operator_create_map.go` each special-case a
+  zero-node context by
+  re-emitting a node anyway — a literal always, an array unconditionally as
+  `[]` regardless of its own body, an object only when every field value also
+  independently qualifies — where `.`/`length` (a plain loop) correctly stay
+  empty. Fixed via a new pure `Expr` classifier,
+  `yq_empty_context_literal_or_constructor`, consulted by the one shared
+  `boolean_fanout_bools` both evaluators already call for `and`/`or`. Gated
+  on the read-only scope, so jq mode is unaffected. **Residual, not fixed
+  here**: `=`'s right side is reachable through the identical mechanism but
+  evaluates through a separate code path this fix does not reach — see
+  `docs/compliance/yq/limitations.md`.
+
 - **`to_owned_with_comments_at_depth`'s object and array arms now run the same
   #1677/#2211/#2243 delimiter checks their three sibling materializers always
   had** (#2405). It used to run none at all beyond #1642's key-collision guard

@@ -2049,7 +2049,45 @@ comment for the full call-site list and `tests/yq_cli_tests.rs`'s
 unaffected (it keeps its own separate, unconditional-null rule), and a real container
 target keeps its own structural error.
 
-### An assignment's target is created before its right side runs — resolved (#2481)
+### An `and`/`or` operand's evaluation context — resolved for `and`/`or` (#2540); `=`'s right side remains open
+
+A literal or constructor is not really "empty" against a read-only, zero-node context in
+real yq the way `.`/`length`/a plain navigational read are: `valueOperator`
+(`pkg/yqlib/operator_value.go`) special-cases an empty `context.MatchingNodes` by
+re-emitting a copy of the literal node instead of looping zero times, and `[...]`/`{...}`
+(`operator_collect.go`/`operator_create_map.go`) carry the identical special case in their
+own operators — but not identically to each other. Captured live against yq v4.53.3 on
+`a: {b: 1}` (`.a.zz` genuinely absent, not `null`):
+
+| `EXPR` in `(.a.zz \| EXPR) and true` | produces (not "empty" for #2460's rule) |
+|---|---|
+| `true` / `5` / `"s"` | itself, unconditionally |
+| `[.]` / `[.a]` / `[1,2]` | `[]`, **regardless of the array's own body** — it loops zero times over the empty context, but the collected array is still emitted once |
+| `{"k": 1}` | `{"k": 1}` — every field's value also independently qualifies |
+| `{"k": .}` | nothing — `.` does not have this special case (`operator_self.go` returns its input context unchanged), so the *whole* object construction aborts, not just that field |
+| `{"k": 1, "j": .}` | nothing — one disqualifying field is enough; this is not a per-field union |
+| `.` / `length` / any other filter | nothing (propagates, matching the pre-existing #2460 oracle rows for `key`/`parent`) |
+
+Before [#2540](https://github.com/rust-works/succinctly/issues/2540), succinctly propagated
+the zero-node emptiness straight through the pipe for every `EXPR` shape, so `and`'s left
+operand registered as empty and #2460's own empty-operand rule short-circuited to `false`
+without ever consulting the literal/constructor's real value: `(.a.zz | true) and true` was
+`false` instead of `true`. Fixed as `jq::eval::yq_empty_context_literal_or_constructor`, a
+pure `Expr` classifier (recursing into a pipe's own last stage, and into an object's field
+values) shared by both evaluators through `jq::eval::boolean_fanout_bools` — the one
+definition `and`/`or` in both evaluators already share for #2460's own rule. Gated on
+`rules.read_only`, so jq mode and comparison operands are untouched. See
+`tests/yq_cli_tests.rs`'s `test_yq_empty_context_literal_or_constructor_and_operand_2540`
+and `test_yq_empty_context_constructor_value_shapes_2540` for the full captured matrix.
+
+**Residual, not yet fixed:** the issue's own prose also names `=`'s right side as reachable
+through the identical `DontAutoCreate` mechanism (#2470), and it is — `.x = (.a.zz | true)`
+is `x: true` in real yq, `x: 5` (i.e. unchanged) in succinctly (confirmed live against
+v4.53.3) — but `=`'s right side evaluates through a completely different code path
+(`jq::eval::yq_prepare_assign_targets`/`resolve_dynamic_indexes`, not
+`boolean_fanout_bools`) that #2540 did not touch. Tracked as a follow-up rather than folded
+in here, since fixing it needs its own trace through that separate mechanism, not a second
+call to the same classifier.
 
 Real yq's `assignUpdateOperator` (`pkg/yqlib/operator_assign.go`, v4.53.3) resolves and
 auto-creates the **left** side first, then evaluates the right side — through
@@ -2208,22 +2246,24 @@ the rows are pinned in `test_and_or_keep_path_context_2473` and
 #2460's empty-operand rule and #2470's read-only scope are what make the reparsed operands
 answer as they do, and both were already correct.
 
-**Residual gap** ([#2540](https://github.com/rust-works/succinctly/issues/2540)). One row in the
-#2506 sweep is a different mechanism and still diverges:
+**Resolved** ([#2540](https://github.com/rust-works/succinctly/issues/2540)). One row in the
+#2506 sweep was a different mechanism and diverged:
 
-| filter                       | real yq | succinctly |
-|------------------------------|---------|------------|
-| `(.a.zz \| true) and true`   | `true`  | `false`    |
-| `(.a.zz \| 5) and true`      | `true`  | `false`    |
-| `(.a.zz \| [.]) and true`    | `true`  | `false`    |
-| `(.a.zz \| .) and true`      | `false` | `false`    |
-| `(.a.zz \| length) and true` | `false` | `false`    |
+| filter                       | real yq | succinctly (before #2540) |
+|------------------------------|---------|----------------------------|
+| `(.a.zz \| true) and true`   | `true`  | `false`                     |
+| `(.a.zz \| 5) and true`      | `true`  | `false`                     |
+| `(.a.zz \| [.]) and true`    | `true`  | `false`                     |
+| `(.a.zz \| .) and true`      | `false` | `false`                     |
+| `(.a.zz \| length) and true` | `false` | `false`                     |
 
 Inside `and`'s read-only scope `.a.zz` yields nothing, and yq's `valueOperator`
 (`operator_value.go:11-14`) special-cases an **empty** context by emitting the literal once
-anyway -- as do the `[...]` and `{...}` constructors. succinctly propagates the empty, so
-the left operand is empty and #2460's rule short-circuits to `false`. `.` and `length` loop
-the context and so stay empty in both tools.
+anyway -- as do the `[...]` and `{...}` constructors. succinctly used to propagate the
+empty, so the left operand registered as empty and #2460's rule short-circuited to
+`false`; `.` and `length` loop the context and so correctly stayed empty in both tools
+throughout. See "An `and`/`or` operand's evaluation context" above (#2470's section) for
+the fix and its own residual (`=`'s right side, a separate code path #2540 did not reach).
 
 ### Ordering comparisons against a real `null` -- resolved for scalars ([#2483](https://github.com/rust-works/succinctly/issues/2483)); containers remain a residual gap
 
