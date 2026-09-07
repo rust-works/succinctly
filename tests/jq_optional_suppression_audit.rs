@@ -511,6 +511,42 @@ impl TokenStreamString for syn::Attribute {
     }
 }
 
+/// Whether any arm/branch of a consuming `match`/`if` *terminates* -- returns
+/// out -- rather than yielding a value.
+///
+/// This is what separates a consumer that **handles** the `Result` from one
+/// that merely **forwards** it (#2369 review). Only the former may clip the
+/// routing window:
+///
+/// ```text
+/// match to_owned(v) { Ok(x) => x, Err(e) => return suppress_or_raise(..) }
+///                                          ^^^^^^ handles: routing is here
+/// match to_owned(v) { Ok(x) => Ok(x), Err(e) => Err(e) }
+///                                               ^^^^^^ forwards: routing is
+///                                                      at a later fold
+/// ```
+///
+/// Clipping the forwarding shape flagged a correctly-routed site. No site in
+/// either evaluator is written that way today, but the audit would have been
+/// wrong the moment one was -- and its failure message would have told the
+/// author to mark a site that is in fact routed.
+fn any_arm_terminates(arms: &[&syn::Expr]) -> bool {
+    struct Ret(bool);
+    impl<'ast> Visit<'ast> for Ret {
+        fn visit_expr_return(&mut self, _n: &'ast syn::ExprReturn) {
+            self.0 = true;
+        }
+        fn visit_item_fn(&mut self, _n: &'ast syn::ItemFn) {
+            // A `return` inside a nested closure/fn belongs to that body.
+        }
+    }
+    arms.iter().any(|a| {
+        let mut r = Ret(false);
+        r.visit_expr(a);
+        r.0
+    })
+}
+
 impl<'ast> Visit<'ast> for Audit<'_> {
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
         // `#[cfg(test)] mod tests` -- unit tests legitimately call the
@@ -557,10 +593,16 @@ impl<'ast> Visit<'ast> for Audit<'_> {
         // this span (`builtin_add`, `builtin_flatten`, `builtin_from_entries`
         // are all that shape). Clipping those was wrong, and flagged four
         // correctly-routed sites when this rule first went in.
+        let bodies: Vec<&syn::Expr> = node.arms.iter().map(|a| &*a.body).collect();
+        let clip = any_arm_terminates(&bodies);
         let sp = node.span();
-        self.consumers.push((sp.start().line, sp.end().line));
+        if clip {
+            self.consumers.push((sp.start().line, sp.end().line));
+        }
         self.visit_expr(&node.expr);
-        self.consumers.pop();
+        if clip {
+            self.consumers.pop();
+        }
         for arm in &node.arms {
             visit::visit_arm(self, arm);
         }
@@ -572,10 +614,24 @@ impl<'ast> Visit<'ast> for Audit<'_> {
     fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
         // Same split as `visit_expr_match`: the condition consumes, the
         // branches do not.
+        let then_expr = syn::Expr::Block(syn::ExprBlock {
+            attrs: Vec::new(),
+            label: None,
+            block: node.then_branch.clone(),
+        });
+        let mut bodies: Vec<&syn::Expr> = vec![&then_expr];
+        if let Some((_, e)) = &node.else_branch {
+            bodies.push(e);
+        }
+        let clip = any_arm_terminates(&bodies);
         let sp = node.span();
-        self.consumers.push((sp.start().line, sp.end().line));
+        if clip {
+            self.consumers.push((sp.start().line, sp.end().line));
+        }
         self.visit_expr(&node.cond);
-        self.consumers.pop();
+        if clip {
+            self.consumers.pop();
+        }
         visit::visit_block(self, &node.then_branch);
         if let Some((_, else_branch)) = &node.else_branch {
             self.visit_expr(else_branch);
@@ -1006,5 +1062,39 @@ fn test_a_call_in_a_match_arm_is_not_clipped_to_that_match_2369() {
         audit_fixture(src).is_empty(),
         "a call in a match *arm* is produced there, not consumed there -- its \
          routing legitimately lives at the later fold"
+    );
+}
+
+/// A consuming `match` that *forwards* the error instead of handling it must
+/// not clip the window either (#2369 review).
+///
+/// The arms here yield a `Result` rather than returning out, so the routing
+/// legitimately sits at the later fold -- the mirror of the match-*arm* case,
+/// and equally a false positive when clipped. The discriminator is whether
+/// any arm terminates: `Err(e) => return suppress_or_raise(..)` handles,
+/// `Err(e) => Err(e)` forwards.
+///
+/// No site in either evaluator is written this way today, so this fixture is
+/// the only thing standing between a future refactor into that shape and an
+/// audit failure telling its author to mark a site that is already routed.
+#[test]
+fn test_a_forwarding_consumer_does_not_clip_the_window_2369() {
+    let src = r"
+        fn fwd(v: &V, optional: bool) -> QueryResult {
+            let r = match to_owned(v) {
+                Ok(x) => Ok(x),
+                Err(e) => Err(e),
+            };
+            let r = match r {
+                Ok(x) => x,
+                Err(e) => return suppress_or_raise(e, optional),
+            };
+            QueryResult::Owned(r)
+        }
+    ";
+    assert!(
+        audit_fixture(src).is_empty(),
+        "a consumer that forwards its error must not clip -- the routing is \
+         at the later fold that actually handles it"
     );
 }
