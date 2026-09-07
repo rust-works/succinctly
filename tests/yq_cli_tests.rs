@@ -1517,6 +1517,35 @@ fn test_yq_mode_single_arg_builtin_wrong_arity_unaffected_by_2389() -> Result<()
     Ok(())
 }
 
+/// #2391 (review, patch-coverage gap): yq mode's own no-rewind branch,
+/// pinned for two sites the two tests above don't reach --
+/// `expect_or_wrong_arity`'s own yq-mode arm (never previously exercised
+/// for any of the eight dedicated special-form parsers in yq mode; `limit`
+/// stands in for all eight, which share the one definition) and `env`'s
+/// own hand-rolled second checkpoint (structurally identical to, but a
+/// distinct call site from, `parse_required_single_arg`'s own two sites
+/// the #2237/#2389 tests above already cover).
+#[test]
+fn test_yq_mode_wrong_arity_checkpoints_unaffected_by_2391() -> Result<()> {
+    let (out, stderr, code) =
+        run_yq_stdin_with_stderr("limit(1;2;3)", "a: 1\n", &["--jq-extensions"])?;
+    assert_eq!(out, "", "stderr: {stderr}");
+    assert!(
+        stderr.contains("parse error: parse error at position 9: expected ')', found ';'"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(code, 1, "stderr: {stderr}");
+
+    let (out, stderr, code) = run_yq_stdin_with_stderr("env(FOO;BAR)", "a: 1\n", &[])?;
+    assert_eq!(out, "", "stderr: {stderr}");
+    assert!(
+        stderr.contains("parse error: parse error at position 7: expected ')', found ';'"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(code, 1, "stderr: {stderr}");
+    Ok(())
+}
+
 /// #2225 (review): the read-mode fix reaches yq mode too, not just jq mode
 /// -- `stderr` fires twice, once per start value, confirming `end` is
 /// re-evaluated fresh per `s` through `eval_generic::eval_slice_expr`
