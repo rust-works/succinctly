@@ -12233,11 +12233,30 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
                             if S::TAG == EvalTag::Yq && resolved >= 0 {
                                 component = OwnedValue::Int(resolved);
                             }
+                            // #2568: the element the walk stands on has to be
+                            // the element the *resolved* index names, not the
+                            // index as written -- `usize::try_from(idx)` here
+                            // always failed for a negative `idx`, so the walk
+                            // stood on `PathNode::Absent` even when the
+                            // resolved position existed (`.c[-1] | [., key]`
+                            // was `[null,1]` where yq answers `[20,1]`,
+                            // mode-independent since jq's own `.c[-1]` reads
+                            // the last element too). `resolved as usize`
+                            // mirrors the value-side `Expr::Index` arm above
+                            // (this file, `resolved as usize` on `elements`):
+                            // a still-negative `resolved` in jq mode (out of
+                            // range, no raise there) wraps to a huge `usize`
+                            // that `get_cursor` simply misses, same as an
+                            // ordinary out-of-bounds read.
+                            elements
+                                .get_cursor(resolved as usize)
+                                .map_or(PathNode::Absent, PathNode::At)
+                        } else {
+                            usize::try_from(idx)
+                                .ok()
+                                .and_then(|i| elements.get_cursor(i))
+                                .map_or(PathNode::Absent, PathNode::At)
                         }
-                        usize::try_from(idx)
-                            .ok()
-                            .and_then(|i| elements.get_cursor(i))
-                            .map_or(PathNode::Absent, PathNode::At)
                     } else if v.as_object().is_some() && yq_numeric_index_on_object_is_null::<S>() {
                         // #2459: yq mode only -- a numeric index on a
                         // mapping is an absent position, same as the
