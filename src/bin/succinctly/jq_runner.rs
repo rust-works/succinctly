@@ -5353,6 +5353,11 @@ fn standard_json_to_jq_value<'a, W: Clone + AsRef<[u64]>>(
     value: StandardJson<'a, W>,
     parent_cursor: &JsonCursor<'a, W>,
 ) -> Result<JqValue<'a, W>, EvalError> {
+    // STYLE-0013-TAIL: no tail helper is callable here -- this is the true
+    // top level, the one entry point with no cursor to give (the same
+    // documented gap `owned_from_standard_json_at_depth`'s own comment
+    // describes: there is nothing to reconstruct once nothing was ever
+    // passed). The resulting zero-child `{,}` acceptance is #2594.
     // STYLE-0013: `preceding_gap_ok` directly, not `key_delimiter_ok`/
     // `value_delimiter_ok` -- this is the CLI-crate lazy materializer, not
     // `DocumentFields`-generic, and its array/object arms below already
@@ -5900,6 +5905,11 @@ fn validate_json_delimiters<W: Clone + AsRef<[u64]>>(
     cursor: &JsonCursor<'_, W>,
     depth: usize,
 ) -> core::result::Result<(), EvalError> {
+    // STYLE-0013-TAIL: merges the empty-container and trailing-comma cases
+    // into one computed `gap_start` fed to `trailing_element_gap_ok`, rather
+    // than dispatching on `Option<last>` the way the helpers do -- so it
+    // cannot call one without restructuring the walk. The empty case is not
+    // actually covered by that merge; see #2594.
     // STYLE-0013: `preceding_gap_ok` directly, in both the array and
     // object arms below -- this is the CLI's own cold-path validator
     // (this function's own doc comment above explains why it exists
@@ -6103,6 +6113,11 @@ where
     Out: Write,
     Wrd: Clone + AsRef<[u64]>,
 {
+    // STYLE-0013-TAIL: same merged `gap_start` shape as
+    // `validate_json_delimiters` above, and the same #2594 gap. Whether this
+    // function's measured per-member perf rationale (#1643/#1676, cited in
+    // its `// STYLE-0013:` exemption) extends to the tail is a separate
+    // question -- the tail is one check per container, not per member.
     // STYLE-0013: the object arm below calls `preceding_gap_ok` directly,
     // not `key_delimiter_ok`/`value_delimiter_ok` -- this is the streaming
     // writer's own single-walk validate-then-write pass (#1643), reusing

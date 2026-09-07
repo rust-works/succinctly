@@ -314,6 +314,12 @@ pub fn to_owned<V: DocumentValue>(value: &V) -> Result<OwnedValue, EvalError> {
 /// `ends_unpaired` alone would be O(1), but it sees only a trailing orphan,
 /// never a bad key.
 fn malformed_object_member<F: DocumentFields>(fields: &F) -> Option<EvalError> {
+    // STYLE-0013-TAIL: a key-only walk (`uncons_key`) with neither a value
+    // cursor nor a container cursor, so none of the tail helpers is callable
+    // here -- they all take at least one. Its tail check is the
+    // `ends_unpaired()` below, which is the only one available at this
+    // resolution and catches a trailing orphan but not a zero-child `{,}`
+    // gap. That residue is #2594, reachable through `to_entries`.
     let mut walk = fields.clone();
     let mut is_first = true;
     while let Some((key, cursor, rest)) = walk.uncons_key() {
