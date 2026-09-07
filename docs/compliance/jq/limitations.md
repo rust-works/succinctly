@@ -3481,7 +3481,7 @@ Tracked as [#2152](https://github.com/rust-works/succinctly/issues/2152)
 narrower until/while-COND-specific issue for what is the same underlying
 "which `Expr` shapes does `eval_owned_fast_path` cover" question.
 
-### A generator-argument expression used to fan out normally, then silently narrow to a single array the moment `key`/`parent`/`file_index` showed up anywhere else in the same pipe -- fixed for 3 of 4 sites
+### A generator-argument expression used to fan out normally, then silently narrow to a single array the moment `key`/`parent`/`file_index` showed up anywhere else in the same pipe -- fixed for all 4 sites
 
 [#1277](https://github.com/rust-works/succinctly/issues/1277)'s clusters 1-3
 (closed by [#1522](https://github.com/rust-works/succinctly/issues/1522)/[#1279](https://github.com/rust-works/succinctly/issues/1279))
@@ -3608,11 +3608,17 @@ longer fires for this query -- the suppression now happens one level up, in
 `Partial`. Nothing left in the path-context evaluator produces
 `optional == true` at all; see #2212.
 
-**One site remains unfixed**: `ParentN`'s own `n` argument (`parent((1,2))`
-still array-collapses `n` to `[1,2]`, then errors on the wrong type -- a
-narrower, lower-traffic case than the three arms fixed above, not attempted
-here). Full fan-out for it, if ever needed, remains out of scope per
-#1522's design doc.
+**The fourth site, `ParentN`'s own `n` argument, fans out since spine 2416's
+walk residue.** `parent((1,2))` used to array-collapse `n` to `[1,2]` and
+then error on the wrong type (`expected number, got array`); a computed `n`
+is evaluated at the position now, on every route -- the walk
+(`path_context_step_generic`), the owned identity pipe and `eval_builtin`
+-- with one hop per output, in order: `.a.b | parent((1,2)) | path` is
+`["a"]` then `[]`, and `.a.b | [parent((0,1)) | path]` is
+`[["a","b"],["a"]]`. Neither reference can express the shape (jq has no
+`parent`; real yq accepts only a literal `n`, `parent(0+1)` is `bad
+expression` in v4.53.3), so this is the tree-structural model's answer, the
+same one a computed bracket's component stream gets.
 
 ### `range`'s own accumulation cap (#2089): a resource-exhaustion guard, now raising instead of silently truncating
 
