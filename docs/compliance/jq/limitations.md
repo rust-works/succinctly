@@ -2942,27 +2942,60 @@ already matches jq exactly. All three rows are pinned in
 `eval_boolean` (and `eval_boolean_generic`) through the lazy strategy the shared loop already
 accepts, which is a separate change from WP2a's own rows.
 
-**What still diverges.** The stop only reaches the `?//` if every construct between the consumer
-and the bind *forwards demand* into it rather than materializing it. None of the constructs below
-do today, so these still answer once where jq answers twice. `first(...)` reaches
-`eval_generic.rs`'s native arm and `isempty(...)` bridges wholesale to `eval.rs`'s `eval_each`, and
-the two arm sets have already drifted (`range`'s bound below), so every row is confirmed under both
-— see the full matrix in `test_nested_short_circuit_consumer_hides_the_stop_2180`
-(`tests/jq_cli_tests.rs`) and `scripts/jq-alt-retry-oracle-sweep.sh`. [#2180](https://github.com/rust-works/succinctly/issues/2180)'s plan
-(2026-09-08) found this residual is wider than the four constructs originally filed here:
+**`if`'s condition, `as`/`as`-pattern's bound source, `select`, unary minus, an index key, string
+interpolation, an object value and `range`'s bound no longer diverge either — #2180 WP2b closed that
+group.** `each_if`/`each_if_generic` now drive `cond` through the sink, and `each_as`/
+`each_as_pattern` (plus their generic twins) drive the bound source through
+`fanout_arg_each`/`fanout_arg_each_generic` — the same demand-forwarding argument fan-out `nth`'s
+own `n` already used — so `materialize_bound_values` and its generic twin are gone. New arms:
+`Builtin::Select` (`each_select`/`each_select_generic`, native and cursor-preserving in both files,
+since `select` never changes position), `Expr::Negate` (`each_negate`; the generic side bridges the
+non-path-context case through `bridge_to_each_owned_flow` and leaves the existing
+`needs_path_context`-gated native arm alone), `Expr::IndexExpr`'s key (`each_index_expr`/
+`each_index_expr_generic`, jq mode only — yq mode's key stream keeps its retroactive
+discard-on-later-escape rule, which a sink push that has already been delivered cannot undo),
+`Expr::StringInterpolation` (jq mode only, bridged — yq mode is not a fan-out generator there at
+all) and `Expr::Object` (`each_object_entries`/`each_object_value`, native in both files,
+mirroring `build_object_entries`'s own entries-recurse/key-encloses-value nesting).
+`eval_each_generic` also gained the `Expr::Range` arm `eval.rs`'s `each_range` (#1556) already
+had, closing the one row the two arm sets had drifted on. Every row confirmed live against
+jq 1.7.1 under both wrappers:
 
-| filter                                                                                                      | jq 1.7.1        | succinctly jq |
-|-------------------------------------------------------------------------------------------------------------|-----------------|---------------|
-| `[first(if (1 as $x ?// $y \| 1) then 5 else 6 end)]`                                                       | `[5,5]`         | `[5]`         |
-| `[first((1 as $x ?// $y \| 1) as $v \| $v)]`, `... as [$a] ?// $a \| $a`                                    | `[1,1]`         | `[1]`         |
-| `[first(select((1 as $x ?// $y \| 1) == 1))]`                                                               | `[1,1]`         | `[1]`         |
-| `[first(-(1 as $x ?// $y \| 1))]`                                                                           | `[-1,-1]`       | `[-1]`        |
-| `[1] \| [first(.[(1 as $x ?// $y \| 1)-1])]`                                                                | `[1,1]`         | `[1]`         |
-| `[first("\(1 as $x ?// $y \| 1)")]`                                                                         | `["1","1"]`     | `["1"]`       |
-| `[first({a:(1 as $x ?// $y \| 1)} \| .a)]`                                                                  | `[1,1]`         | `[1]`         |
-| `[first(range((1 as $x ?// $y \| 1); 3))]` (generic route only)                                             | `[1,1]`         | `[1]`         |
-| `[first(foreach (1) as $x ?// $y (0;.+1;.), "z")]`                                                          | `[1,2]`         | `[1]`         |
-| `1 \| [isempty(foreach (1 as $x ?// $y \| 1) as $v (0; .+$v; .))]` (source, not pattern)                    | `[false,false]` | `[false]`     |
+| filter                                                                                      | jq 1.7.1 and `succinctly jq` |
+|---------------------------------------------------------------------------------------------|------------------------------|
+| `[first(if (1 as $x ?// $y \| 1) then 5 else 6 end)]`                                       | `[5,5]`                      |
+| `[first((1 as $x ?// $y \| 1) as $v \| $v)]`, `... as [$a] ?// $a \| $a`                    | `[1,1]`                      |
+| `[first(select((1 as $x ?// $y \| 1) == 1))]`                                               | `[1,1]`                      |
+| `[first(-(1 as $x ?// $y \| 1))]`                                                           | `[-1,-1]`                    |
+| `[1] \| [first(.[(1 as $x ?// $y \| 1)-1])]`                                                | `[1,1]`                      |
+| `[first("\(1 as $x ?// $y \| 1)")]`                                                         | `["1","1"]`                  |
+| `[first({a:(1 as $x ?// $y \| 1)} \| .a)]`                                                  | `[1,1]`                      |
+| `[first(range((1 as $x ?// $y \| 1); 3))]`                                                  | `[1,1]`                      |
+
+One over-stopping trap in this group is worth stating, because it is the opposite of a leak:
+`first({a:1, b:(("B"|stderr), 2)} | .a)` writes `B` in jq **and** in succinctly. Object
+construction cannot deliver any combination until every entry has produced its first value
+(key encloses value, entries recurse left to right), so `b`'s side effect genuinely fires even
+though `b` is never read — a lazy `Object` arm that skipped it would be wrong. Pinned alongside
+the closed leaks (`first(if (true, ("B"|stderr)) then 1 else 2 end)`,
+`first((1, ("B"|stderr)) as $v | $v)`, `first(select((true, ("B"|stderr))))`, and the
+destructive `input` spellings) in `test_short_circuit_side_effect_shapes_already_match_jq_820`.
+
+**What still diverges: `foreach`, and only `foreach`.** The stop only reaches the `?//` if every
+construct between the consumer and the bind *forwards demand* into it rather than materializing
+it, and `foreach` is the one construct left that does not — it is eager-only in both evaluators
+(`eval_foreach`/`eval_foreach_with_values`), so it evaluates its source to completion and its
+own `?//` pattern retry never sees a wrapping consumer's stop. `first(...)` reaches
+`eval_generic.rs`'s native arm and `isempty(...)` bridges wholesale to `eval.rs`'s `eval_each`, so
+both rows are confirmed under both — see the full matrix in
+`test_nested_short_circuit_consumer_hides_the_stop_2180` (`tests/jq_cli_tests.rs`) and
+`scripts/jq-alt-retry-oracle-sweep.sh`, whose only remaining attributed rows are these
+([#2180](https://github.com/rust-works/succinctly/issues/2180) WP3):
+
+| filter                                                                                      | jq 1.7.1        | succinctly jq |
+|---------------------------------------------------------------------------------------------|-----------------|---------------|
+| `[first(foreach (1) as $x ?// $y (0;.+1;.), "z")]`                                          | `[1,2]`         | `[1]`         |
+| `1 \| [isempty(foreach (1 as $x ?// $y \| 1) as $v (0; .+$v; .))]` (source, not pattern)    | `[false,false]` | `[false]`     |
 
 **Two rows recorded here as of #2180's filing have since closed** — the issue text was stale on
 them. `1 | [label $o | (1 as $x ?// $y | 5) | (., break $o)]` closed at
@@ -2977,13 +3010,12 @@ owned evaluator, which lost the cursor a `break` needs to unwind through on its 
 a side effect, with no `?//`-specific work at either commit. Neither is the pipe rework the
 original filing guessed at.
 
-The cause is uniform and is not about `?//` at all: `if`'s
-condition, `as`/`as`-pattern's bound source, `select`, unary minus, an index key, string
-interpolation, an object value, `range`'s bound (`eval_generic.rs`'s twin only — `eval.rs`'s own
-`each_range` already forwards demand, so `isempty(range(...))` already matches while
-`first(range(...))` doesn't) and `foreach` each lack a demand-forwarding
-`eval_each`/`eval_each_generic` arm, so they evaluate the bind eagerly and absorb the stop before
-it can reach `each_pattern_alternatives`.
+The cause is the same one every closed group above had, and it is not about `?//` at all:
+`foreach` lacks a demand-forwarding `eval_each`/`eval_each_generic` arm, so it evaluates the bind
+eagerly and absorbs the stop before it can reach `each_pattern_alternatives`. The one difference
+from the closed groups is that `foreach`'s *own* `?//` (its pattern position) must treat the
+sink's stop exactly as it already treats a `Control::Break` — retry the next alternative with the
+state threaded through, which is why jq's answer above is `[1,2]` and not `[1,1]`.
 
 `limit` was the one consumer that already had such an arm (`each_limit`, #1462/#1596), and it was
 exactly the one that worked when nested — `1 | [first(limit(1; 1 as $x ?// $y | 1))]` was `[1,1]` in
@@ -3002,10 +3034,11 @@ This is the same missing-lazy-arm class as items 9 and 10 of
 [`docs/plan/jq-lazy-generator-consumers.md`](../../plan/jq-lazy-generator-consumers.md), tracked
 in [#2180](https://github.com/rust-works/succinctly/issues/2180), whose own plan (2026-09-08)
 splits the residual into four work packages — WP1 (nested consumers, **landed**), WP2a
-(`//`/`and`/`or`, **landed**), WP2b (the remaining eager sub-expression sites), WP3 (`foreach`) —
-each closing its own rows. WP1 took `scripts/jq-alt-retry-oracle-sweep.sh` from 93 known
-divergences attributed to it to none (612 cases, 0 unexpected, 258 known across WP2a/WP2b/WP3);
-WP2a then took its own 96 to none (612 cases, 0 unexpected, 162 known across WP2b/WP3). Both left
+(`//`/`and`/`or`, **landed**), WP2b (the remaining eager sub-expression sites, **landed**), WP3
+(`foreach`) — each closing its own rows. WP1 took `scripts/jq-alt-retry-oracle-sweep.sh` from 93
+known divergences attributed to it to none (612 cases, 0 unexpected, 258 known across
+WP2a/WP2b/WP3); WP2a then took its own 96 to none (162 known across WP2b/WP3); WP2b took its own
+144 to none (612 cases, 0 unexpected, 18 known, all WP3's `foreach`). All three left
 `scripts/jq-fanout-oracle-sweep.sh` at 490/490.
 
 Unrelated to the other `?//` divergence recorded above
