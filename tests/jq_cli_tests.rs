@@ -30761,6 +30761,88 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
             "",
             0,
         ),
+        // ---- closed by #2180 WP3 ----
+        // `each_foreach`/`each_foreach_generic` drive the source through
+        // `eval_each`/`eval_each_generic` one element at a time, and each
+        // step's EXTRACT through `eval_each_owned`, so a wrapping consumer's
+        // stop reaches both. Every row captured live against jq 1.7.1.
+        //
+        // The source's second element is never pulled: `first` is satisfied
+        // by the step the first element produced.
+        (
+            &["-cn", r#"first(foreach (1, ("B"|stderr)) as $x (0; .+1))"#],
+            None,
+            "1\n",
+            "",
+            0,
+        ),
+        // EXTRACT's second output, likewise -- the stop lands inside EXTRACT
+        // itself, which is why EXTRACT had to be driven rather than
+        // collected.
+        (
+            &[
+                "-cn",
+                r#"first(foreach (1) as $x (0; .+1; ., ("E"|stderr)))"#,
+            ],
+            None,
+            "1\n",
+            "",
+            0,
+        ),
+        // The over-stopping guard for that same arm: a side effect *before*
+        // EXTRACT's first output is genuinely reached, in jq and here.
+        (
+            &[
+                "-cn",
+                r#"first(foreach (1) as $x (0; .+1; ("E"|stderr), .))"#,
+            ],
+            None,
+            "\"E\"\n",
+            "E",
+            0,
+        ),
+        // The destructive `input` spelling of the source row above, pinning
+        // *values* rather than I/O ordering: the eagerly-drained source ate
+        // `"a"` from the process-global queue and left the trailing `input`
+        // answering `"b"`.
+        (
+            &["-cn", r"[first(foreach (1, input) as $x (0; .+$x)), input]"],
+            Some(r#""a" "b""#),
+            "[1,\"a\"]\n",
+            "",
+            0,
+        ),
+        // Moved here from `test_short_circuit_side_effect_leaks_820_932_987`
+        // by #2180 WP3, which is what closed them. The pair used to pin
+        // `binary_fanout_each`'s inner/outer `Flow::Stopped { pending }`
+        // asymmetry, using `foreach` because it was the last construct with
+        // no demand-forwarding arm and so still reached the eager fallback
+        // that *produces* a `pending`. With `Expr::Foreach` given an arm the
+        // fallback is gone, the trailing `halt_error` is never evaluated at
+        // all, and both spellings now answer exactly as jq 1.7.1 does --
+        // captured live. The asymmetry itself is unchanged (see
+        // `Flow::Stopped`'s own doc comment); it simply has no `foreach`
+        // repro left.
+        (
+            &[
+                "-cn",
+                r#"path(1 == (foreach (1,2,3) as $x (null; $x; if $x==1 then $x else ("x"|halt_error(3)) end)))"#,
+            ],
+            None,
+            "",
+            "jq: error (at <unknown>): Invalid path expression with result true",
+            5,
+        ),
+        (
+            &[
+                "-cn",
+                r#"path((foreach (1,2,3) as $x (null; $x; if $x==1 then $x else ("x"|halt_error(3)) end)) == 1)"#,
+            ],
+            None,
+            "",
+            "jq: error (at <unknown>): Invalid path expression with result true",
+            5,
+        ),
     ];
 
     for (args, stdin, want_out, want_err, want_code) in cases {
@@ -30855,47 +30937,43 @@ fn test_generator_argument_backtracking_still_evaluates_the_tail_1279() -> Resul
 #[test]
 fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
     let cases: &[SideEffectCase] = &[
-        // ---- `binary_fanout_each`'s inner/outer `pending` asymmetry -------
-        // (code review, #1462): `resolve_leaf` is the one consumer that
-        // reads `Flow::Stopped`'s `pending`, and this pair pins the
-        // left/right asymmetry that falls out of `binary_fanout_each`'s
-        // `abort.unwrap_or(outer)` -- an already-triggered `Halt` an eager
-        // fallback operand raised survives from the INNER (left) operand and
-        // is dropped from the OUTER (right) one. The original pair pinning
-        // this (an `if`-wrapped `halt_error`) stopped demonstrating it once
-        // Stage 5 gave `Expr::If` a native lazy arm -- `if` no longer falls
-        // back to eager `eval_single` at all, so `halt_error` is never
-        // reached and both rows now agree with jq (moved into
-        // `test_short_circuit_side_effect_shapes_already_match_jq_820`).
-        // `foreach` has no Stage 5 arm and still falls back the same way, so
-        // it reproduces the identical asymmetry live.
+        // ---- #2180 WP3's own residual: `foreach`'s UPDATE and INIT -------
+        // WP3 drove `foreach`'s *source* and its *EXTRACT* through the
+        // demand-forwarding sinks; UPDATE and INIT stay eager, so a side
+        // effect in either still fires where jq never reaches it. Both
+        // captured live against jq 1.7.1, which writes nothing in either
+        // case.
         //
-        // Right operand (outer): pending dropped, so the path error wins --
-        // jq's own exit code and message, plus the stray `x` this eager
-        // fallback still leaks (jq's own `path()` never evaluates the
-        // trailing `halt_error` at all).
+        // UPDATE: driving it means reshaping
+        // `fold_step_via_accumulator_or_fork`, which `reduce`'s own O(n)
+        // accumulator fix (#2157) shares -- a separate change from WP3's
+        // rows, and the one remaining `?//`-visible position (see
+        // `test_nested_short_circuit_consumer_hides_the_stop_2180`'s WP3
+        // residual rows).
         (
             &[
                 "-cn",
-                r#"path(1 == (foreach (1,2,3) as $x (null; $x; if $x==1 then $x else ("x"|halt_error(3)) end)))"#,
+                r#"first(foreach (1) as $x (0; (.+1, ("U"|stderr)); .))"#,
             ],
             None,
-            "",
-            "xjq: error (at <unknown>): Invalid path expression with result true",
-            5,
+            "1\n",
+            "U",
+            0,
         ),
-        // Left operand (inner): pending kept, so the already-triggered halt
-        // wins and the path error is never raised. jq: exit 5, same message
-        // as the row above.
+        // INIT: its fan-out is jq's outermost loop (#534) and it must be
+        // evaluated before the source is ever pulled (#2440), so `each_foreach`
+        // collects it exactly as `eval_foreach` does. `first` never explores
+        // the second fork, and jq never evaluates the INIT output that would
+        // have seeded it.
         (
             &[
                 "-cn",
-                r#"path((foreach (1,2,3) as $x (null; $x; if $x==1 then $x else ("x"|halt_error(3)) end)) == 1)"#,
+                r#"first(foreach (1) as $x ((0, ("I"|stderr)); .+1))"#,
             ],
             None,
-            "",
-            "x",
-            3,
+            "1\n",
+            "I",
+            0,
         ),
         // ---- #2180 WP2a's own residual: the EAGER `and`/`or` route -------
         // The `Expr::Compare` situation between #1459 and #1481, one
@@ -32110,31 +32188,158 @@ fn test_nested_short_circuit_consumer_hides_the_stop_2180() -> Result<()> {
             "[false,false]",
             "matches jq",
         ),
-        // ==== WP3: foreach ====
-        // The only genuinely new mechanism -- `each_foreach`'s sink `Stop`
-        // must be treated exactly as `Control::Break` is today
-        // (`is_retryable_stop`), with foreach's own state threading intact
-        // (the source row is `[1,2]`, not `[1,1]`: the retried
-        // alternative's UPDATE runs on the already-updated state).
+        // ==== WP3: foreach -- CLOSED (source, pattern and EXTRACT) ====
+        // The only genuinely new mechanism. `each_foreach`/
+        // `each_foreach_generic` drive the source through `eval_each`/
+        // `eval_each_generic` one element at a time and each step's EXTRACT
+        // through `eval_each_owned`, over one shared fold loop
+        // (`foreach_fork`); the sink's `Demand::Stop` is then treated by
+        // `foreach`'s own `?//` exactly as an escaping `Control::Break` is
+        // (`is_retryable_stop` beside `is_retryable_control`), **with the
+        // same state threading** -- the pattern rows are `[1,2]`, not
+        // `[1,1]`, because the retried alternative's UPDATE runs on the
+        // already-updated accumulator.
+        //
+        // The `?//` in the pattern position.
         (
             "[first(foreach (1) as $x ?// $y (0;.+1;.), \"z\")]".to_string(),
-            "[1]",
-            "jq: [1,2]",
+            "[1,2]",
+            "matches jq",
         ),
         (
             "[isempty(foreach (1) as $x ?// $y (0;.+1;.), \"z\")]".to_string(),
-            "[false]",
-            "jq: [false,false]",
+            "[false,false]",
+            "matches jq",
+        ),
+        // EXTRACT omitted is EXTRACT `.`, so the stop lands at the same
+        // position and takes the same rule.
+        (
+            "[first(foreach (1) as $x ?// $y (0;.+1))]".to_string(),
+            "[1,2]",
+            "matches jq",
         ),
         (
-            format!("[first(foreach ({G}) as $v (0; .+$v; .))]"),
+            "[isempty(foreach (1) as $x ?// $y (0;.+1))]".to_string(),
+            "[false,false]",
+            "matches jq",
+        ),
+        // A multi-output EXTRACT: the retry is seeded with the *stopped*
+        // EXTRACT call's own input (#1458's state-threading rule, which the
+        // stop inherits), so the second alternative still answers `2`.
+        (
+            "[first(foreach (1) as $x ?// $y (0;.+1;., 99))]".to_string(),
+            "[1,2]",
+            "matches jq",
+        ),
+        (
+            "[isempty(foreach (1) as $x ?// $y (0;.+1;., 99))]".to_string(),
+            "[false,false]",
+            "matches jq",
+        ),
+        // Three alternatives, the middle one a destructuring pattern that
+        // cannot match a number: it is skipped without consuming a retry.
+        (
+            "[first(foreach (1) as $x ?// [$y] ?// $z (0;.+1;.))]".to_string(),
+            "[1,2]",
+            "matches jq",
+        ),
+        (
+            "[isempty(foreach (1) as $x ?// [$y] ?// $z (0;.+1;.))]".to_string(),
+            "[false,false]",
+            "matches jq",
+        ),
+        // The *first* alternative failing to match leaves only the last one,
+        // whose stop is not retryable -- so this answers once, not twice.
+        (
+            "[first(foreach (1) as [$x] ?// $y (0;.+1;.), \"z\")]".to_string(),
             "[1]",
-            "jq: [1,2]",
+            "matches jq",
+        ),
+        (
+            "[isempty(foreach (1) as [$x] ?// $y (0;.+1;.), \"z\")]".to_string(),
+            "[false]",
+            "matches jq",
+        ),
+        // The `?//` in the source position: the stop has to leave the fold
+        // entirely and reach the source generator, and the retried source
+        // element then runs the *next* fold step against the state the
+        // stopped one left behind.
+        (
+            format!("[first(foreach ({G}) as $v (0; .+$v; .))]"),
+            "[1,2]",
+            "matches jq",
         ),
         (
             format!("[isempty(foreach ({G}) as $v (0; .+$v; .))]"),
+            "[false,false]",
+            "matches jq",
+        ),
+        // The `?//` in the EXTRACT position.
+        (
+            format!("[first(foreach (1) as $v (0; .; ({G})))]"),
+            "[1,1]",
+            "matches jq",
+        ),
+        (
+            format!("[isempty(foreach (1) as $v (0; .; ({G})))]"),
+            "[false,false]",
+            "matches jq",
+        ),
+        // Both at once: EXTRACT's own chain answers twice per `foreach`
+        // alternative, and there are two of those.
+        (
+            "[first(foreach (1) as $x ?// $y (0; .+1; (1 as $a ?// $b | .)))]".to_string(),
+            "[1,1,2,2]",
+            "matches jq",
+        ),
+        (
+            "[isempty(foreach (1) as $x ?// $y (0; .+1; (1 as $a ?// $b | .)))]".to_string(),
+            "[false,false,false,false]",
+            "matches jq",
+        ),
+        // A generator INIT (#534) still fans out eagerly and outermost, but
+        // the stop reaching the pattern's `?//` inside the *first* fork
+        // still retries -- and then ends the whole `foreach`, so the `100`
+        // fork is never attempted.
+        (
+            "[first(foreach (1) as $x ?// $y ((0,100); .+1; .))]".to_string(),
+            "[1,2]",
+            "matches jq",
+        ),
+        (
+            "[isempty(foreach (1) as $x ?// $y ((0,100); .+1; .))]".to_string(),
+            "[false,false]",
+            "matches jq",
+        ),
+        // ==== WP3's residual: `foreach`'s UPDATE and INIT positions ====
+        // Still diverging, and deliberately so. Driving UPDATE means
+        // reshaping `fold_step_via_accumulator_or_fork`, which `reduce`'s own
+        // O(n) accumulator fix (#2157) shares; INIT's fan-out is jq's
+        // outermost loop (#534) and must be evaluated before the source is
+        // pulled at all (#2440), so `each_foreach` collects it exactly as
+        // `eval_foreach` does. Both are recorded in
+        // `docs/compliance/jq/limitations.md`, and their side-effect
+        // spellings are pinned in
+        // `test_short_circuit_side_effect_leaks_820_932_987`.
+        (
+            format!("[first(foreach (1) as $v (0; . + ({G})))]"),
+            "[1]",
+            "jq: [1,1] -- the `?//` sits in UPDATE",
+        ),
+        (
+            format!("[isempty(foreach (1) as $v (0; . + ({G})))]"),
             "[false]",
-            "jq: [false,false]",
+            "jq: [false,false] -- the `?//` sits in UPDATE",
+        ),
+        (
+            format!("[first(foreach (1) as $v (({G}); .+1; .))]"),
+            "[2]",
+            "jq: [2,2] -- the `?//` sits in INIT",
+        ),
+        (
+            format!("[isempty(foreach (1) as $v (({G}); .+1; .))]"),
+            "[false]",
+            "jq: [false,false] -- the `?//` sits in INIT",
         ),
         // ==== Confirmed correct, deliberately out of scope (#2180 §4) ====
         // A break cannot re-enter an already-collected array/fold, and

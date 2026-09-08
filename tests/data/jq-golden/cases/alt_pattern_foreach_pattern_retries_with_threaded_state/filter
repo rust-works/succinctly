@@ -1,0 +1,1 @@
+[first(foreach (1) as $x ?// $y (0;.+1;.), "z")]

@@ -48963,6 +48963,65 @@ mod tests {
             (b"null", "if true then -(1, 2) else 9 end"),
             (b"null", "try ((1, error(\"x\")) as $v | $v) catch 9"),
             (b"null", "[isempty({a:(1,2)} | .a)]"),
+            // #2180 WP3: `each_foreach` drives the source through
+            // `eval_each` and each step's EXTRACT through `eval_each_owned`,
+            // so it is a second implementation of the fold `eval_foreach`
+            // owns -- exactly the drift risk this differential exists for.
+            // Every case is side-effect free, so an always-`Continue` sink
+            // must deliver identical values in identical order, including
+            // each terminator.
+            //
+            // The source: multi-output, `empty` (no step at all),
+            // error-after-prefix, `break`-after-prefix, and a `?//` chain in
+            // the source itself.
+            (b"null", "foreach (1, 2, 3) as $x (0; . + $x; .)"),
+            (b"null", "foreach empty as $x (0; . + $x; .)"),
+            (b"null", "foreach (1, 2, error(\"x\")) as $x (0; . + $x; .)"),
+            (b"null", "label $o | foreach (1, break $o) as $x (0; . + $x; .)"),
+            (b"null", "foreach (1 as $x ?// $y | 1) as $v (0; . + $v; .)"),
+            // UPDATE and EXTRACT fan-out, and an `empty` EXTRACT (the step
+            // still advances the accumulator but emits nothing).
+            (b"null", "foreach (1, 2) as $x (0; . + $x, . + 10; .)"),
+            (b"null", "foreach (1, 2) as $x (0; . + $x; ., . * 100)"),
+            (b"null", "foreach (1, 2) as $x (0; . + $x; empty)"),
+            (b"null", "foreach (1, 2) as $x (0; . + $x; if . == 1 then empty else . end)"),
+            // EXTRACT terminators, which the driven EXTRACT now reports as a
+            // `Flow` rather than a collected trailing control.
+            (b"null", "foreach (1, 2) as $x (0; . + $x; ., error(\"x\"))"),
+            (b"null", "label $o | foreach (1, 2) as $x (0; . + $x; ., break $o)"),
+            // The `?//` pattern chain: both alternatives matching (the
+            // second is only reached when something retries), and the first
+            // one failing to match so it is skipped outright.
+            (b"null", "foreach (1, 2) as $x ?// $y (0; . + 1; .)"),
+            (b"null", "foreach (1, 2) as [$x] ?// $y (0; . + 1; .)"),
+            (b"[[1],[2]]", "foreach .[] as [$x] ?// $y (0; . + $x; [$x, $y, .])"),
+            // A `?//` chain whose EXTRACT errors, which is #1458's own
+            // state-threading rule -- the retried alternative resumes from
+            // the failed EXTRACT call's own input.
+            (
+                b"[{\"a\":1}]",
+                "foreach .[] as {a:$x} ?// {a:$y} (0; .+1, .+2; if . == 2 then error(\"boom\") else [$x,$y,.] end)",
+            ),
+            // A generator INIT (#534): one independent run over the source
+            // per INIT output, which is what the lazy path's record-and-
+            // replay of the source has to reproduce exactly.
+            (b"null", "foreach (1, 2) as $x ((10, 20); . + $x; .)"),
+            (b"null", "foreach (1, 2) as $x ((10, 20); . + $x)"),
+            (b"null", "foreach (1, 2) as $x (empty; . + $x; .)"),
+            (b"null", "foreach (1, 2) as $x ((10, error(\"x\")); . + $x; .)"),
+            // EXTRACT omitted entirely (jq's `(init; update; .)`).
+            (b"null", "foreach (1, 2, 3) as $x (0; . + $x)"),
+            // Nested in the other lazy arms, and against a real document.
+            (b"[1,2,3]", "foreach .[] as $x (0; . + $x; .)"),
+            (b"[1,2,3]", "[first(foreach .[] as $x (0; . + $x; .))]"),
+            (b"[1,2,3]", "[limit(2; foreach .[] as $x (0; . + $x; .))]"),
+            (b"null", "[isempty(foreach (1, 2) as $x (0; . + $x; .))]"),
+            // `reduce` needs no arm of its own -- it emits one value -- but
+            // it shares `foreach`'s step machinery, so it is pinned here too.
+            (b"null", "reduce (1, 2, 3) as $x (0; . + $x)"),
+            (b"null", "reduce (1 as $x ?// $y | 1) as $v (0; . + $v)"),
+            (b"null", "[first(reduce (1 as $x ?// $y | 1) as $v (0; . + $v))]"),
+            (b"null", "reduce (1, error(\"x\")) as $x (0; . + $x)"),
         ];
 
         for (json, src) in cases {
