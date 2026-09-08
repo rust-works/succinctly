@@ -32094,8 +32094,12 @@ fn test_jq_getpath_fanout_all_outputs_still_resolve_1532() -> Result<()> {
 /// pinned -- `getpath(["a"])` and `.a` now match byte for byte, stderr and
 /// exit code included, on a document jq will not parse at all.
 ///
-/// **No jq oracle:** real jq 1.7.1 rejects all four documents at parse time,
-/// for `.d` as much as for `getpath(["d"])`.
+/// **Diverges from jq, deliberately.** Real jq 1.7.1 rejects all four
+/// documents at parse time, so the `getpath(["d"])` rows here used to match
+/// its outcome and no longer do. It rejects `.d` too, which succinctly has
+/// always answered, so what this buys is one answer per document rather than
+/// one per spelling. `docs/compliance/jq/limitations.md` records it, and why
+/// ADR-0018's decision order does not license it.
 #[test]
 fn test_getpath_touches_only_the_nodes_it_navigates_2168() -> Result<()> {
     for bad in [r"\ud800", r"\uZZZZ", r"\x", r"\u12"] {
@@ -37088,9 +37092,13 @@ fn test_path_validity_walk_lazy_collision_map_2061() -> Result<()> {
 /// `test_path_validity_walk_lazy_collision_map_2061`, not something this
 /// change moved.)
 ///
-/// **No jq oracle:** real jq 1.7.1 rejects all three documents at parse time.
-/// Checked in all three positions relative to the clean key, since the lazy
-/// map only seeds itself from the prefix once a fallback key appears.
+/// **Diverges from jq, deliberately:** real jq 1.7.1 rejects all three
+/// documents at parse time, so `path(.a)` here used to match its outcome and
+/// no longer does. `keys_unsorted` on the same documents has always answered,
+/// which is the consistency being bought; see
+/// `docs/compliance/jq/limitations.md`. Checked in all three positions
+/// relative to the clean key, since the lazy map only seeds itself from the
+/// prefix once a fallback key appears.
 #[test]
 fn test_path_answers_past_a_colliding_key_2168() -> Result<()> {
     for doc in [
@@ -37133,11 +37141,13 @@ fn test_path_answers_past_a_colliding_key_2168() -> Result<()> {
 /// consistency question it left open -- `.d` answered `5` on the same
 /// document `path(.d)` rejected.
 ///
-/// **No jq oracle.** Real jq 1.7.1 rejects every document below at parse
-/// time (`Invalid \uXXXX\uXXXX surrogate pair escape`), for `.d` as much as
-/// for `path(.d)`, so it separates none of these rows; the contract pinned
-/// is succinctly's own lazy-validation rule (recorded as an ADR-0018
-/// divergence in `docs/compliance/jq/limitations.md`).
+/// **Diverges from jq, deliberately.** Real jq 1.7.1 rejects every document
+/// below at parse time (`Invalid \uXXXX\uXXXX surrogate pair escape`), so
+/// the `path(.d)` rows here used to *match* jq's outcome and no longer do.
+/// jq rejects `.d` on the same documents too, which succinctly has always
+/// answered, so the choice was between diverging uniformly and diverging by
+/// spelling. Recorded, with why ADR-0018's decision order does not license
+/// it, in `docs/compliance/jq/limitations.md`.
 #[test]
 fn test_path_answers_past_an_undecodable_sibling_2168() -> Result<()> {
     for bad in [r"\ud800", r"\uZZZZ", r"\x", r"\u12"] {
@@ -37235,9 +37245,12 @@ fn test_path_optional_still_raises_a_decode_failure_2168() -> Result<()> {
 /// navigation always has. Anything that materializes still validates
 /// everything it materializes.
 ///
-/// **No jq oracle for any row:** real jq 1.7.1 rejects this document at parse
-/// time for every filter, `.d` included, so it cannot separate them. The
-/// contract is succinctly's own, recorded in
+/// **Every row diverges from jq**, which rejects this document at parse time
+/// whatever the filter -- including the rows that raise, since succinctly
+/// raises for a different reason and at a different stage. What changed with
+/// #2168 is that the answering column grew: `path`/`key`/`getpath` moved into
+/// it, giving up an agreement with jq's outcome that `.d` never had. The
+/// contract pinned is succinctly's own, recorded with its cost in
 /// `docs/compliance/jq/limitations.md`.
 #[test]
 fn test_lazy_validation_boundary_2168() -> Result<()> {
@@ -39227,10 +39240,12 @@ fn test_validate_only_gate_delimiter_checks_2349() -> Result<()> {
 /// reads what is inside it. `select`/`sort_by` keep their gate and so keep
 /// these checks -- their remaining rows in that test are the control.
 ///
-/// **No jq oracle:** real jq rejects `{"c":{"a":1,}}` at parse time whatever
-/// the filter, `.t` included, so it separates none of these rows. What it is
-/// consistent with is succinctly's own `.t`, which has always answered `5`
-/// here (`docs/compliance/jq/limitations.md`, the lazy-validation trade-off).
+/// **Diverges from jq, deliberately:** real jq rejects `{"c":{"a":1,}}` at
+/// parse time whatever the filter, so the `path` rows here used to match its
+/// outcome and no longer do. jq rejects `.t` too, which succinctly has always
+/// answered `5`, so what this buys is one answer per document instead of one
+/// per spelling (`docs/compliance/jq/limitations.md`, which records why the
+/// decision order does not license it).
 #[test]
 fn test_path_answers_past_a_structural_fault_it_never_reads_2168() -> Result<()> {
     let doc = r#"{"c":{"a":1,},"t":5}"#;

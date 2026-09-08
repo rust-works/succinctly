@@ -4200,25 +4200,66 @@ $ printf '%s' '{"c":{"a":1,},"t":5}' | succinctly jq -c '.t | key'
 "t"
 ```
 
-Real jq 1.7.1 rejects every one of those documents while parsing it, before any filter runs,
-and so does real yq v4.53.3 on the YAML spelling. So the reference separates none of these
-rows — it answers *nothing* here, `.d` included — and ADR-0018's decision order reaches its
-third step with no fidelity argument on either side. That step is performance and memory
-(ADR-0018's #2416 amendment): #2168 measured the pre-walk gate at 67-75% of such a query's
-runtime, making `.[0] | key` cost 3.0-4.1x the `.[0]` it wraps, and dropping it settles the
-tie. It also restores the internal consistency succinctly's own plain navigation had already
-set: `.d` answered `5` on the first document and `.t` answered `5` on the second, long before
-`path(.d)` and `.t | key` refused them. Two spellings of one read disagreeing is the shape
-[#1629](https://github.com/rust-works/succinctly/issues/1629)/[#1642](https://github.com/rust-works/succinctly/issues/1642)
-exist to remove.
+**This loses fidelity that succinctly previously had, and the decision order does not
+license it.** An earlier draft of this entry claimed the reference "separates none of these
+rows", so that the order fell through to its performance step. That was wrong, and the
+correction is the important part of this record. Real jq 1.7.1 rejects every document above
+while parsing it, before any filter runs, and real yq v4.53.3 does the same on the YAML
+spelling — so the reference does have a behaviour here, and it is *reject*. Measured against
+the pinned binaries:
 
-The gate they lost was never a decision about these builtins. Until
-[#2151](https://github.com/rust-works/succinctly/issues/2151) they materialized the whole
-document to answer, and that materialization doubled as the #1755/#1953 validity check; when
-the tree went, an equivalent whole-document walk was kept in its place specifically so a
-performance change would not move semantics. #2168 measured what that cost — 67-75% of such
-a query's runtime, making `.[0] | key` 3.0-4.1x the price of the `.[0]` it wraps — and took
-the semantics question on its own.
+| filter on `{"a":"\ud800","d":5}` | jq 1.7.1 | succinctly before #2168 | succinctly after |
+|---|---|---|---|
+| `.d` | error | `5` — already diverged | `5` |
+| `path(.d)` | error | error — **matched jq** | `["d"]` — **diverges** |
+| `getpath(["d"])` | error | error — **matched jq** | `5` — **diverges** |
+
+Step 2 of ADR-0018's decision order therefore *does* separate the two options, and it favours
+the behaviour being given up: keeping the gate matched jq's observable outcome on those rows,
+and dropping it does not. The performance step is never reached. No rule-4 condition applies
+either — the output is readable, nothing is corrupted or discarded, and neither choice takes
+the process down. **This is a deliberate divergence taken against the order's own answer**,
+on the same footing as this section's other two entries recorded on their merits rather than
+under a carve-out.
+
+`key` and `parent` are the exception within the exception: neither is a jq builtin at all
+(`jq: error: key/0 is not defined`, exit 3), so for those two there is no jq oracle and no
+fidelity to lose. Only `path` and `getpath` are real divergences from jq. All four diverge
+from yq, which has `key`/`parent` and rejects these documents too.
+
+**Why it was taken anyway.** Three reasons, none of which is "the order allowed it":
+
+1. *The agreement being given up was an accident of an implementation detail.* Until
+   [#2151](https://github.com/rust-works/succinctly/issues/2151) these builtins materialized
+   the whole document to answer, and that materialization doubled as the #1755/#1953 validity
+   check. When the tree went, an equivalent whole-document walk was kept in its place
+   specifically so a performance change would not move semantics
+   ([#2061](https://github.com/rust-works/succinctly/issues/2061),
+   [#2075](https://github.com/rust-works/succinctly/issues/2075) and #2151 each say so, and
+   each declined the semantics question as the project's to answer). No one ever decided that
+   `path()` should validate: it re-derived jq's rejection as a side effect, for a different
+   reason than jq has, and only for the spellings that happened to materialize.
+2. *It made one read's answer depend on how it was spelled.* `.d` answered `5` and `path(.d)`
+   refused, on the same document, in the same run. Nothing can depend on that coherently — a
+   caller wanting jq's rejection would have to route through `path` and avoid `.d` — and it is
+   the shape [#1629](https://github.com/rust-works/succinctly/issues/1629)/[#1642](https://github.com/rust-works/succinctly/issues/1642)
+   exist to remove.
+3. *It cost 67-75% of such a query's runtime*, making `.[0] | key` 3.0-4.1x the price of the
+   `.[0]` it wraps. That is what made the question worth asking, but it is a reason for
+   acting, not a licence under the order.
+
+**The context that makes the loss survivable, and its limit.** succinctly already diverges on
+this whole class of document, through `.d` itself, and has since long before #2168: the
+semi-index accepts input jq's parser rejects, deliberately and at a measured price — always-on
+strict validation costs two thirds of the runtime of a cheap navigation query
+([`docs/plan/decode-failure-routing.md`](../../plan/decode-failure-routing.md), "Why not
+upfront validation for everyone"), which is the trade `CLAUDE.md`'s own "minimal validation"
+note describes. So the real choice was never "match jq or not" but "diverge uniformly, or
+diverge in a way that depends on the spelling". That is context, **not** a licence: ADR-0018's
+scope note explicitly warns that an evaluator behaviour may not be reframed as a spec-level
+input question to escape rule 4, and this entry does not claim otherwise. A user who wants
+jq's rejection has `--validate` and `succinctly json validate`, which run at roughly 1 GB/s —
+an order of magnitude cheaper than the walk this removes.
 
 **What still validates.** The rule is about reading, not about the builtin's name:
 
