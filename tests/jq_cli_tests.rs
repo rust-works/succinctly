@@ -265,6 +265,31 @@ fn spawn_jq_with_env(
     )
 }
 
+/// `run_jq_full`'s own env-setting sibling (#2103): forcing
+/// `SUCCINCTLY_JQ_M2_EVAL=stream`/`eager` to pin which evaluator answers a
+/// query needs a `Command` that both sets environment variables (like
+/// `spawn_jq_with_env`) and decodes stdout/stderr to `String` (like
+/// `run_jq_full`) -- neither existing helper does both, and `spawn_jq_with_env`
+/// only takes one variable. Modelled directly on `spawn_jq`'s own `Command`
+/// construction, `.envs(...)` swapped in for the (absent) single `.env(...)`.
+fn run_jq_full_env(
+    env: &[(&str, &str)],
+    args: &[&str],
+    input: Option<&str>,
+) -> Result<(String, String, i32)> {
+    let (output, exit_code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command.arg("jq").args(args).envs(env.iter().copied());
+            command
+        },
+        input.map(str::as_bytes),
+    )?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    Ok((stdout, stderr, exit_code))
+}
+
 /// Helper to run jq with null input (-n)
 fn run_jq_null(filter: &str, extra_args: &[&str]) -> Result<(String, i32)> {
     let mut args: Vec<&str> = vec!["-n"];
@@ -3777,6 +3802,91 @@ fn test_materializing_route_raises_on_colliding_decode_failure_keys_1642() -> Re
         "ordinary duplicate key should not raise, stderr: {err}"
     );
     assert_eq!(out.trim(), "{\"a\":2}");
+
+    Ok(())
+}
+
+/// #2103: `eval_each_pipe_generic`'s empty-`exprs` tail used to drop
+/// `cursor` and fall back to `GenericItem::One(value)` on the theory (its
+/// old comment, removed by this fix) that an empty `Expr::Pipe` "never
+/// actually reaches zero length in practice." It does: a bare
+/// `keys_unsorted[]` drives `each_lazy_keys_iterate_sink`'s streaming
+/// `!sorted` arm (#1565/#1770), whose `rest` is `[]`, and every key lands
+/// here via `continue_pipe_element_generic`'s `OneCursorValue` arm with
+/// `cursor = Some(_)`. Dropping the cursor forced a second, *validating*
+/// decode of the key on the way back out -- for an undecodable key (a lone
+/// UTF-16 surrogate `\ud800`, or an invalid `\q` escape) that raised on the
+/// demand-driven (streaming) evaluator where the eager/materializing route
+/// already echoed the raw source bytes verbatim, per the #1247/#1385/#1642
+/// preservation rule. The fix re-pairs `cursor` with the already-decoded
+/// `value` into `GenericItem::OneCursorValue` (#1609's variant, reused
+/// rather than re-decoded) instead of discarding the cursor, so nothing
+/// forces that second decode.
+///
+/// The raw spelling, not a `\uXXXX`-normalized one, is the correct
+/// expectation: the value is never materialized on this path (that's the
+/// whole point of streaming), so what comes back out is whatever the
+/// source bytes were.
+///
+/// Checked two ways per case so this can't pass by both routes
+/// independently landing on the same wrong answer: against the literal
+/// expected raw stdout, and against the eager route's own output for the
+/// same (document, filter), captured in this same test via
+/// `SUCCINCTLY_JQ_M2_EVAL=eager` (`run_jq_full_env`, new for #2103 --
+/// `run_jq_full` has no way to set an environment variable, and
+/// `spawn_jq_with_env` only takes one).
+///
+/// `limit(2; keys_unsorted[])` is included alongside the bare `.[]` form
+/// since it exercises the same `rest == []` arm through a different
+/// consumer. Its *eager* twin is not a usable cross-check: the eager route
+/// materializes `limit`'s results through `standard_json_to_jq_value`,
+/// which decodes the key and raises -- the "`limit(1; keys_unsorted[])`
+/// decodes" inconsistency the issue's first comment recorded, and the
+/// reason the eager M2 route is retired rather than kept (#2103). So the
+/// eager cross-check below covers the bare `keys_unsorted[]` case only.
+#[test]
+fn test_streaming_keys_unsorted_iterate_echoes_undecodable_key_raw_2103() -> Result<()> {
+    let cases = [
+        (r#"{"\ud800":1,"b":2}"#, "\"\\ud800\"\n\"b\"\n"),
+        (r#"{"a\q":1,"b":2}"#, "\"a\\q\"\n\"b\"\n"),
+    ];
+
+    for (doc, expected) in cases {
+        for filter in ["keys_unsorted[]", "limit(2; keys_unsorted[])"] {
+            let (stream_out, stream_err, stream_code) =
+                run_jq_full_env(&[("SUCCINCTLY_JQ_M2_EVAL", "stream")], &[filter], Some(doc))?;
+            assert_eq!(
+                stream_code, 0,
+                "doc {doc:?}, filter {filter:?}: streaming should not raise, stderr: {stream_err}"
+            );
+            assert!(
+                stream_err.is_empty(),
+                "doc {doc:?}, filter {filter:?}: streaming stderr should be empty, got: {stream_err}"
+            );
+            assert_eq!(
+                stream_out, expected,
+                "doc {doc:?}, filter {filter:?}: streaming should echo the raw source spelling"
+            );
+        }
+
+        // Eager cross-check for the un-limited case: this is the route
+        // that already got it right, so it's the strongest available
+        // confirmation that "raw spelling" is correct here, not an
+        // artefact of this test's own expectations.
+        let (eager_out, eager_err, eager_code) = run_jq_full_env(
+            &[("SUCCINCTLY_JQ_M2_EVAL", "eager")],
+            &["keys_unsorted[]"],
+            Some(doc),
+        )?;
+        assert_eq!(
+            eager_code, 0,
+            "doc {doc:?}: eager keys_unsorted[] should succeed, stderr: {eager_err}"
+        );
+        assert_eq!(
+            eager_out, expected,
+            "doc {doc:?}: eager and streaming must agree on the raw spelling"
+        );
+    }
 
     Ok(())
 }
