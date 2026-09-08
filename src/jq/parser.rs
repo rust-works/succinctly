@@ -305,6 +305,12 @@ struct Parser<'a> {
 pub struct CallSite {
     /// The called name, exactly as written at the call site.
     pub name: String,
+    /// How many arguments this call site passed.
+    ///
+    /// Matched alongside `name` so a diagnostic for `f/1` is not attributed to
+    /// a *different*, perfectly resolvable `f/2` earlier in the source
+    /// (#2085 review, finding 2).
+    pub arity: usize,
     /// Byte offset of the identifier's first byte in the parsed source.
     pub offset: usize,
 }
@@ -321,10 +327,18 @@ pub struct CallSite {
 ///
 /// Records only the generic `parse_func_call_or_error` shape — the one that
 /// produces a call `resolve.rs` can fail to resolve. A builtin, a special
-/// form, or a `def` never reaches that path, so this table contains call
-/// sites and nothing else: an object key, a `$`-variable or a string that
-/// merely spells the same identifier is absent by construction, which is the
-/// whole point.
+/// form, or a `def` never reaches that path, so an object key, a
+/// `$`-variable, a `.field` or a string that merely spells the same
+/// identifier is absent from this table, which is the whole point.
+///
+/// **It is a table of *calls*, not of *failing* calls**, and it carries no
+/// scope information — the parser has none. So a call that resolved perfectly
+/// well can still be matched against an unresolved diagnostic for the same
+/// name. `arity` narrows that (an `f/1` diagnostic will not take an `f/2`
+/// site), but same-name *and* same-arity calls that differ only by lexical
+/// scope cannot be told apart here: in `(def f: 1; f) | f` both sites are
+/// `f/0` and only the second fails. Distinguishing those needs positions
+/// threaded through `resolve.rs` itself, which is tracked separately.
 ///
 /// Returns whatever was collected before any parse error, since the caller is
 /// already reporting a failure and a partial table still beats a text search.
@@ -2680,6 +2694,7 @@ impl<'a> Parser<'a> {
         // for the name and find an unrelated same-spelling occurrence.
         self.call_sites.push(CallSite {
             name: name.clone(),
+            arity: args.len(),
             offset: start_pos,
         });
         Ok(Expr::FuncCall {
