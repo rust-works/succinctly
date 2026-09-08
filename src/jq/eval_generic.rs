@@ -3097,6 +3097,144 @@ fn push_generic_truthiness<V: DocumentValue>(
     None
 }
 
+/// Materialize the truthy prefix a [`retain_truthy_generic`] arm had already
+/// kept, so a control that terminated the stream mid-way can still carry it
+/// (#400's rule, via [`partial_generic`]).
+///
+/// Only the borrowed-value/borrowed-cursor arms need this: `GenericResult::
+/// Partial` can only hold `OwnedValue`, so the kept prefix has to leave the
+/// document domain at exactly this point and nowhere else -- which is why the
+/// retaining arms accumulate `V`/`V::Cursor` and call this only on the
+/// terminating branch, instead of converting as they go and losing the
+/// cursors `//` exists to keep. A prefix element that fails to convert
+/// replaces the terminating control with its own error, the same precedence
+/// [`flatten_generic_results`] uses when materializing a batch.
+fn owned_prefix_partial<V: DocumentValue, T>(
+    kept: &[T],
+    to_owned_one: impl Fn(&T) -> Result<OwnedValue, EvalError>,
+    control: Control,
+) -> GenericResult<V> {
+    let mut prefix = vec_with_capacity(kept.len());
+    for item in kept {
+        match to_owned_one(item) {
+            Ok(v) => prefix.push(v),
+            Err(e) => return GenericResult::Error(e),
+        }
+    }
+    partial_generic(prefix, control)
+}
+
+/// Keep only the truthy outputs of a stream, cursor-backed where they were
+/// cursor-backed — the *filtering* twin of [`push_generic_truthiness`] just
+/// above, and the generic evaluator's mirror of [`super::eval::retain_truthy`]
+/// (#2476).
+///
+/// Every arm answers truthiness by exactly the rule its
+/// `push_generic_truthiness` counterpart uses, so `//` and `and`/`or`/`not`
+/// cannot drift apart on what "truthy" means: `OneCursor`/`ManyCursor` run
+/// [`push_generic_document_validation_error`] first and then read
+/// `is_falsy(Preserve)` (so a #1194/#1247/#1642 document raises here as it
+/// does under `select`, and a malformed *number* stays truthy);
+/// `LazyKeys`/`LazyIndexRange` are array-shaped and therefore always truthy
+/// without materializing; `LazySeq` must still be pulled, because it runs
+/// arbitrary `map(f)` whose failure has to surface rather than be reported as
+/// "truthy" before the array is known to exist at all.
+///
+/// The difference from `push_generic_truthiness` is what it does with a
+/// surviving output: it returns it *unchanged*, still an `OneCursor`/
+/// `ManyCursor` into the source document, which is what lets `.a // .b` in yq
+/// mode print whatever a bare `.b` would print. The eager
+/// [`super::eval::retain_truthy`] cannot do that -- its first act is
+/// `materialize_cursor()` -- which is precisely the loss `//` used to take by
+/// bridging.
+///
+/// A terminating `Error`/`Break`/`Halt` is returned as-is and a `Partial`
+/// keeps its control with its own prefix filtered, matching
+/// `super::eval::retain_truthy`'s `Partial` arm and #400's rule: `(1, false,
+/// error("x")) // 2` is `1` and then the error, not `1 false`.
+fn retain_truthy_generic<V: DocumentValue>(result: GenericResult<V>) -> GenericResult<V> {
+    match result {
+        GenericResult::One(v) => match to_owned(&v) {
+            Ok(owned) if owned.is_truthy() => GenericResult::One(v),
+            Ok(_) => GenericResult::None,
+            Err(e) => GenericResult::Error(e),
+        },
+        GenericResult::OneCursor(c) => {
+            if let Some(control) = push_generic_document_validation_error(&c, 0) {
+                return partial_generic(Vec::new(), control);
+            }
+            if c.is_falsy(JsonConvention::Preserve) {
+                GenericResult::None
+            } else {
+                GenericResult::OneCursor(c)
+            }
+        }
+        GenericResult::Many(vs) => {
+            let mut kept: Vec<V> = Vec::new();
+            for v in vs {
+                match to_owned(&v) {
+                    Ok(owned) => {
+                        if owned.is_truthy() {
+                            kept.push(v);
+                        }
+                    }
+                    Err(e) => return owned_prefix_partial(&kept, to_owned, Control::Error(e)),
+                }
+            }
+            collapse_vec(
+                kept,
+                || GenericResult::None,
+                GenericResult::One,
+                GenericResult::Many,
+            )
+        }
+        GenericResult::ManyCursor(cs) => {
+            let mut kept: Vec<V::Cursor> = Vec::new();
+            for c in cs {
+                if let Some(control) = push_generic_document_validation_error(&c, 0) {
+                    return owned_prefix_partial(&kept, to_owned_cursor, control);
+                }
+                if !c.is_falsy(JsonConvention::Preserve) {
+                    kept.push(c);
+                }
+            }
+            cursor_vec_to_generic_result(kept)
+        }
+        // Always truthy, and returned untouched so a `keys // []` keeps the
+        // laziness #140/#684 gave it.
+        result @ (GenericResult::LazyKeys { .. } | GenericResult::LazyIndexRange(_)) => result,
+        // Pulled rather than passed through, for the reason
+        // `push_generic_truthiness`'s own `LazySeq` arm gives: the array is
+        // truthy *if it can be built*, and a `map(f)` that fails has to say
+        // so here. `materialize_atomic` already returns the built array, so
+        // handing that back loses nothing but the laziness the pull just
+        // ended anyway.
+        GenericResult::LazySeq(seq) => match seq.materialize_atomic() {
+            Ok(array) => GenericResult::Owned(array),
+            Err(control) => partial_generic(Vec::new(), control),
+        },
+        GenericResult::None => GenericResult::None,
+        GenericResult::Owned(v) => {
+            if v.is_truthy() {
+                GenericResult::Owned(v)
+            } else {
+                GenericResult::None
+            }
+        }
+        GenericResult::ManyOwned(mut vs) => {
+            vs.retain(OwnedValue::is_truthy);
+            owned_vec_to_generic_result(vs)
+        }
+        GenericResult::Partial(mut vs, control) => {
+            vs.retain(OwnedValue::is_truthy);
+            partial_generic(vs, control)
+        }
+        result @ (GenericResult::Error(_) | GenericResult::Break(_) | GenericResult::Halt(_)) => {
+            result
+        }
+    }
+}
+
 /// Flatten a batch of per-element results into one `Vec<OwnedValue>`.
 ///
 /// A bare `Error`/`Break`/`Partial` must never appear in `items` — callers
@@ -6715,6 +6853,70 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 return partial_generic(Vec::new(), control);
             }
             GenericResult::Owned(OwnedValue::Bool(!bits[0]))
+        }
+
+        // `//` had no native arm at all, so like `Expr::Not` above it fell to
+        // the wildcard bridge unconditionally -- there was no
+        // `needs_path_context` gate to lose, and no shape that escaped the
+        // cost. The bridge's first act is `to_owned_with_cursor` on the
+        // *ambient* value, `O(2^N)` on an alias fan-out document (#2476), and
+        // it is charged before either operand runs, so `(false // 1)` paid it
+        // exactly as `(.aN // 1)` did. `ambient_validation_error` is that
+        // materialization's raise without the value -- unconditional here,
+        // because the whole construct is the "shape that used to bridge" its
+        // doc comment names.
+        //
+        // Below it, `eval::eval_alternative` mirrored arm for arm, with
+        // `retain_truthy_generic` (the cursor-preserving twin of
+        // `eval::retain_truthy`) in place of the eager filter: keep the left's
+        // truthy outputs, let a `break` escape the operator, propagate an
+        // error rather than substituting for it (#160 -- `?` on the left is
+        // how you ask for substitution, `.a? // 3`), and evaluate the right
+        // only when nothing truthy survived. `false // (null, 7)` is `null, 7`
+        // because the right's outputs are emitted unfiltered, which falls out
+        // of only the left going through the filter.
+        //
+        // The surviving outputs stay `OneCursor`/`ManyCursor` into the source
+        // document, so this is a visible fidelity gain as well as a speedup,
+        // not only a faster route to the same bytes. Measured on `a: null`
+        // with `.a // .b`, before this arm vs after vs yq v4.53.3: an
+        // anchored flow mapping `b: &x {c: 1, d: 2}` printed as an expanded
+        // block mapping and now prints `&x {c: 1, d: 2}` as yq does; a plain
+        // flow mapping keeps its flow style; a trailing `c: 1 # trailing`
+        // keeps its comment. What `//` does NOT gain is anything a bare `.b`
+        // does not already have -- a comment on its own line above `c: 1` is
+        // still dropped, and duplicate mapping keys still collapse -- because
+        // this arm's whole contribution is handing `.b`'s own result through
+        // untouched. Those two remain gaps in the `.b` route itself.
+        //
+        // Evaluating the operands through `eval_single` *with the cursor* is a
+        // second, larger gain: while this bridged, both operands ran against a
+        // document re-rooted at this stage's input, so `key`/`parent` resolved
+        // to nothing there -- and "nothing" is not truthy, so `//` silently
+        // substituted the other side for it. `.a | (key // 1)` was `1` and is
+        // now `a`, yq v4.53.3's own answer
+        // (`test_alternative_operands_read_the_real_position_2476`). What that
+        // test's own comment records as still unreached is deliberate:
+        // `needs_path_context` has no `Expr::Alternative` arm, so a pipe whose
+        // only path-context read sits inside a `//` is still never routed to
+        // path-context evaluation, and this arm does not change that table.
+        Expr::Alternative(left, right) => {
+            if let Some(control) = ambient_validation_error::<V>(cursor) {
+                return partial_generic(Vec::new(), control);
+            }
+            match retain_truthy_generic(eval_single::<S, V>(left, value.clone(), optional, cursor))
+            {
+                // A `break` escapes the operator rather than selecting a branch.
+                GenericResult::Break(label) => GenericResult::Break(label),
+                // No truthy output on the left, so the right side answers.
+                GenericResult::None => eval_single::<S, V>(right, value, optional, cursor),
+                // An error on the left propagates, matching jq 1.7.1:
+                // `(error("x")) // 1` exits 5, and so does
+                // `(null, error("x")) // 2` -- nothing truthy survived, but
+                // the right side still never runs.
+                error @ GenericResult::Error(_) => error,
+                kept => kept,
+            }
         }
 
         // Array construction: collect every output of the inner expression
