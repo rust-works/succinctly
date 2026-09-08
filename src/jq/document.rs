@@ -804,6 +804,52 @@ pub trait DocumentValue: Sized + Clone {
         self.as_str()
     }
 
+    /// This key's decoded string *and* the reason it would not decode, from
+    /// one decode rather than two.
+    ///
+    /// The same three outcomes a key-displaying caller already has to tell
+    /// apart, fused into one call:
+    ///
+    /// - `Err(reason)` -- the span is a string token whose bytes will not
+    ///   decode, exactly [`string_decode_error`](Self::string_decode_error)'s
+    ///   `Some(reason)` (#1247).
+    /// - `Ok(None)` -- a key the format's *grammar* never allowed, exactly
+    ///   [`key_string`](Self::key_string)'s `None` (#1194). Still raises.
+    /// - `Ok(Some(key))` -- the decoded key.
+    ///
+    /// Asking those two accessors separately costs two full decodes of the
+    /// same bytes on the *success* path, because neither format caches:
+    /// `string_decode_error` and `key_string` both resolve through the same
+    /// `as_str()`, which re-scans for the closing quote and, for a key
+    /// holding any escape, re-runs the decode into a fresh allocation
+    /// (#965 item 10). Every query that displays object keys pays it per
+    /// key -- `keys`, `keys_unsorted`, `.`, `to_entries`, `-S` -- so the
+    /// saving is on ordinary well-formed documents, not just malformed ones.
+    ///
+    /// Returns `&'static str` rather than an `EvalError` for the same reason
+    /// `string_decode_error` does: the check stays allocation-free and
+    /// `no_std`-compatible, with each format's own error type owning the
+    /// wording. A caller that needs a real error wraps it
+    /// (`EvalError::decode_failure`).
+    ///
+    /// The default is literally the two-call sequence it replaces, so an
+    /// implementation that does not override it is unchanged. `StandardJson`
+    /// and `YamlValue` override it to decode once; `YamlValue` keeps the
+    /// two-call path for its `Alias` arm alone, where the two accessors
+    /// genuinely disagree (see its override).
+    ///
+    /// Do not reach for this ahead of
+    /// [`key_raw_unescaped`](Self::key_raw_unescaped) in a caller that has
+    /// that fast path available: it decodes, and `key_hash_of` measured
+    /// +10-12% on `wide_keys_unsorted` when a decoding check was tried
+    /// before the raw span.
+    fn decoded_key_str(&self) -> Result<Option<Cow<'_, str>>, &'static str> {
+        if let Some(reason) = self.string_decode_error() {
+            return Err(reason);
+        }
+        Ok(self.key_string())
+    }
+
     /// This value's raw source bytes when it is a string key whose span
     /// needs no decoding -- byte-identical to what
     /// [`key_string`](Self::key_string) would return.
@@ -1457,23 +1503,30 @@ pub fn key_display_string<V: DocumentValue>(key: &V) -> Option<Cow<'_, str>> {
 /// [`key_display_string`], plus whether the string is the decode-failure
 /// **fallback** spelling (`true`) rather than a genuine decode (`false`).
 ///
-/// Must check `string_decode_error()` *first*, not `key_string()`: YAML's
-/// `key_string()` override never returns `None` at all (#222 -- a complex
-/// or undecodable key stringifies to `""` rather than being dropped), so
-/// checking it first would make every YAML decode-failure key silently
-/// report `is_fallback = false`, indistinguishable from a genuine key
-/// spelled `""`. JSON's two checks happen to be redundant with each other
-/// (`string_decode_error()` and `key_string()` both resolve via the same
-/// `as_str()`), but the order has to serve both formats' actual contracts,
-/// not just the cheaper one.
+/// The decode failure must beat the stringification, not the other way
+/// round: YAML's `key_string()` override never returns `None` at all (#222
+/// -- a complex or undecodable key stringifies to `""` rather than being
+/// dropped), so consulting it first would make every YAML decode-failure
+/// key silently report `is_fallback = false`, indistinguishable from a
+/// genuine key spelled `""`.
+///
+/// That ordering is no longer written here. It is
+/// [`DocumentValue::decoded_key_str`]'s contract -- one call, which returns
+/// the failure and the decoded key from a single decode instead of paying
+/// for two independent decodes of the same bytes on every well-formed key
+/// (#965 item 10). Callers that want the ordering right cannot now get it
+/// wrong by writing the two calls in the wrong sequence, because there is
+/// only one call.
 pub(crate) fn key_display_string_kind<V: DocumentValue>(key: &V) -> Option<(Cow<'_, str>, bool)> {
-    if key.string_decode_error().is_some() {
-        let fallback = key
-            .key_raw_source_span()
-            .map_or(Cow::Borrowed(""), String::from_utf8_lossy);
-        return Some((fallback, true));
+    match key.decoded_key_str() {
+        Err(_reason) => {
+            let fallback = key
+                .key_raw_source_span()
+                .map_or(Cow::Borrowed(""), String::from_utf8_lossy);
+            Some((fallback, true))
+        }
+        Ok(decoded) => decoded.map(|key| (key, false)),
     }
-    key.key_string().map(|key| (key, false))
 }
 
 /// Guards a display-keyed `IndexMap` (`to_owned`/`materialize`, #1642)
@@ -3530,5 +3583,151 @@ mod tail_gap_receiver_tests {
         let empty_index = JsonIndex::build(empty);
         let empty_root = empty_index.root(empty);
         container_tail_gap_ok(&empty_root, None, b'}').expect("an empty `{}` is well-formed");
+    }
+}
+
+/// #965 item 10: `key_display_string_kind` now asks
+/// [`DocumentValue::decoded_key_str`] once where it used to ask
+/// `string_decode_error()` and `key_string()` separately, decoding the same
+/// key bytes twice on every well-formed key.
+///
+/// The saving is only legitimate if the fused accessor answers *identically*
+/// on every shape either format can produce, so this pins the whole matrix
+/// rather than the happy path: both formats' plain, escaped-but-decodable
+/// and undecodable keys, JSON's #1194 structurally-invalid key, and every
+/// YAML variant that reaches the `""` fallback by a different route (#222).
+/// Each case is written against `key_display_string_kind`'s own
+/// `(spelling, is_fallback)` output, which is what callers actually consume.
+#[cfg(test)]
+mod decoded_key_str_tests {
+    use super::{key_display_string_kind, DocumentValue};
+    use crate::json::JsonIndex;
+    use crate::yaml::YamlIndex;
+
+    /// `key_display_string_kind` of the first field's key of a JSON object.
+    fn json_first_key(json: &[u8]) -> Option<(String, bool)> {
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let fields = cursor.value().as_object().expect("an object");
+        let (field, _) = fields.uncons().expect("at least one field");
+        key_display_string_kind(&field.key()).map(|(key, fallback)| (key.into_owned(), fallback))
+    }
+
+    /// `json_first_key` for a single-document YAML mapping.
+    fn yaml_first_key(yaml: &[u8]) -> Option<(String, bool)> {
+        yaml_nth_key(yaml, 0)
+    }
+
+    /// `yaml_first_key` for the `nth` field, so an alias key can be reached
+    /// past the field that declares the anchor it names.
+    fn yaml_nth_key(yaml: &[u8], nth: usize) -> Option<(String, bool)> {
+        let index = YamlIndex::build(yaml).expect("valid YAML");
+        let cursor = index.root(yaml);
+        let mapping = cursor.first_child().expect("document content");
+        let mut fields = mapping.value().as_object().expect("a mapping");
+        for _ in 0..nth {
+            let (_, rest) = fields.uncons().expect("enough fields");
+            fields = rest;
+        }
+        let (field, _) = fields.uncons().expect("enough fields");
+        key_display_string_kind(&field.key()).map(|(key, fallback)| (key.into_owned(), fallback))
+    }
+
+    #[test]
+    fn json_plain_key_decodes_once_and_is_not_a_fallback_965() {
+        assert_eq!(
+            json_first_key(br#"{"a":1}"#),
+            Some(("a".to_string(), false))
+        );
+    }
+
+    /// The case the second decode was most expensive for: an escape forces
+    /// `decode_escapes` to allocate, and the old two-call path allocated
+    /// twice.
+    #[test]
+    fn json_escaped_key_that_decodes_is_not_a_fallback_965() {
+        assert_eq!(
+            json_first_key(br#"{"aAb":1}"#),
+            Some(("aAb".to_string(), false))
+        );
+    }
+
+    #[test]
+    fn json_invalid_escape_key_still_falls_back_to_its_raw_span_965() {
+        assert_eq!(
+            json_first_key(br#"{"a\q":1}"#),
+            Some(("a\\q".to_string(), true))
+        );
+    }
+
+    #[test]
+    fn json_lone_surrogate_key_still_falls_back_to_its_raw_span_965() {
+        assert_eq!(
+            json_first_key(br#"{"\ud800":1}"#),
+            Some(("\\ud800".to_string(), true))
+        );
+    }
+
+    /// A key the grammar never allowed (#1194) must stay `None` -- the
+    /// caller's cue to raise -- and must not be confused with a decode
+    /// failure now that both travel through one accessor.
+    #[test]
+    fn json_non_string_key_still_reports_none_965() {
+        assert_eq!(json_first_key(br"{123: 1}"), None);
+    }
+
+    #[test]
+    fn yaml_plain_key_decodes_once_and_is_not_a_fallback_965() {
+        assert_eq!(yaml_first_key(b"a: 1\n"), Some(("a".to_string(), false)));
+    }
+
+    #[test]
+    fn yaml_escaped_key_that_decodes_is_not_a_fallback_965() {
+        assert_eq!(
+            yaml_first_key(b"\"a\\u0041b\": 1\n"),
+            Some(("aAb".to_string(), false))
+        );
+    }
+
+    /// YAML has no `key_raw_source_span` override, so its decode-failure
+    /// fallback is the empty spelling rather than JSON's raw span -- the
+    /// asymmetry #1678 depends on, unchanged.
+    #[test]
+    fn yaml_undecodable_key_still_falls_back_to_empty_965() {
+        assert_eq!(
+            yaml_first_key(b"\"a\\qb\": 1\n"),
+            Some((String::new(), true))
+        );
+    }
+
+    /// An alias key resolves exactly one hop, the depth `keys`/`.` themselves
+    /// resolve to (#1739). The `Alias` arm deliberately keeps the two-call
+    /// path, so this pins that keeping it changed nothing.
+    #[test]
+    fn yaml_alias_key_to_a_string_resolves_one_hop_965() {
+        assert_eq!(
+            yaml_nth_key(b"a: &x foo\n*x: 1\n", 1),
+            Some(("foo".to_string(), false))
+        );
+    }
+
+    /// An alias to a non-scalar has no scalar spelling, so #222's rule
+    /// applies: it stringifies to `""` rather than being dropped, and that
+    /// `""` is *not* a decode-failure fallback.
+    #[test]
+    fn yaml_alias_key_to_a_mapping_stringifies_to_empty_965() {
+        assert_eq!(
+            yaml_nth_key(b"a: &x {p: 1}\n*x: 1\n", 1),
+            Some((String::new(), false))
+        );
+    }
+
+    /// #222 again, by the other route: an explicit complex key.
+    #[test]
+    fn yaml_complex_key_stringifies_to_empty_965() {
+        assert_eq!(
+            yaml_first_key(b"? [1, 2]\n: 1\n"),
+            Some((String::new(), false))
+        );
     }
 }
