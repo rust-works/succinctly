@@ -257,6 +257,17 @@ struct Parser<'a> {
     pattern_depth: usize,
     /// Current `Expr` recursion depth; see [`MAX_EXPR_DEPTH`].
     expr_depth: usize,
+    /// Every ordinary `Expr::FuncCall` site this parse has built, with the
+    /// byte offset of its own identifier (#2085).
+    ///
+    /// A side table rather than a field on `Expr`: the position is only ever
+    /// wanted on the compile-error path, and keeping it out of the AST leaves
+    /// `Expr`'s size, `Debug` and `PartialEq` untouched. Recorded in parse
+    /// order, which for this recursive-descent parser is source order --
+    /// [`collect_call_sites`] sorts and dedupes by offset anyway, so a
+    /// rewind-and-retry (#2110/#2237) that re-parses one call cannot produce
+    /// a duplicate entry.
+    call_sites: Vec<CallSite>,
     /// #2036 Direction 3: every identifier that appears anywhere after a
     /// `def` keyword in `input`, computed once by [`collect_def_names`] at
     /// construction. A cheap, deliberately *imprecise* over-approximation
@@ -284,6 +295,51 @@ struct Parser<'a> {
     shadow_retry_budget: usize,
 }
 
+/// Where one ordinary function call's identifier begins in the filter source
+/// (#2085).
+///
+/// Produced by [`collect_call_sites`] and consumed only by the CLI's
+/// unresolved-call diagnostic, which needs to point at the *call* rather than
+/// at any occurrence of the name's spelling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallSite {
+    /// The called name, exactly as written at the call site.
+    pub name: String,
+    /// Byte offset of the identifier's first byte in the parsed source.
+    pub offset: usize,
+}
+
+/// Every ordinary function-call site in `input`, in source order (#2085).
+///
+/// Re-parses `input` purely to recover positions the AST does not carry. That
+/// is deliberate: this is only ever called on the compile-error path, once,
+/// immediately before the process aborts with a diagnostic — so a second parse
+/// costs nothing anyone waits on, and in exchange `Expr` keeps its size,
+/// `Debug` and `PartialEq` exactly as they are. #2085's own suggested
+/// "parallel position table built during parsing, never embedded in `Expr`
+/// itself".
+///
+/// Records only the generic `parse_func_call_or_error` shape — the one that
+/// produces a call `resolve.rs` can fail to resolve. A builtin, a special
+/// form, or a `def` never reaches that path, so this table contains call
+/// sites and nothing else: an object key, a `$`-variable or a string that
+/// merely spells the same identifier is absent by construction, which is the
+/// whole point.
+///
+/// Returns whatever was collected before any parse error, since the caller is
+/// already reporting a failure and a partial table still beats a text search.
+/// Note the parse is *not* guaranteed to succeed here even when the caller's
+/// own parse did: the caller may have parsed with different options. Callers
+/// pass the same `mode`/`jq_extensions` they used.
+pub fn collect_call_sites(input: &str, mode: ParserMode, jq_extensions: bool) -> Vec<CallSite> {
+    let mut parser = Parser::with_mode_and_extensions(input, mode, jq_extensions);
+    let _ = parser.parse_program();
+    let mut sites = core::mem::take(&mut parser.call_sites);
+    sites.sort_by_key(|c| c.offset);
+    sites.dedup_by_key(|c| c.offset);
+    sites
+}
+
 /// See [`Parser::shadow_retry_budget`].
 const SHADOW_RETRY_BUDGET: usize = 64;
 
@@ -297,6 +353,7 @@ impl<'a> Parser<'a> {
             jq_extensions: false,
             pattern_depth: 0,
             expr_depth: 0,
+            call_sites: Vec::new(),
             shadowable_defs: collect_def_names(input),
             shadow_retry_budget: SHADOW_RETRY_BUDGET,
         }
@@ -310,6 +367,7 @@ impl<'a> Parser<'a> {
             jq_extensions,
             pattern_depth: 0,
             expr_depth: 0,
+            call_sites: Vec::new(),
             shadowable_defs: collect_def_names(input),
             shadow_retry_budget: SHADOW_RETRY_BUDGET,
         }
@@ -2569,7 +2627,7 @@ impl<'a> Parser<'a> {
     /// Parse a function call or return an error for unknown identifier.
     /// Function call syntax: NAME or NAME(args; args; ...) or NAMESPACE::NAME(args)
     fn parse_func_call_or_error(&mut self) -> Result<Expr, ParseError> {
-        let _start_pos = self.pos;
+        let start_pos = self.pos;
         let name = self.parse_ident()?;
         self.skip_ws();
 
@@ -2616,6 +2674,14 @@ impl<'a> Parser<'a> {
         // Return as function call - the evaluator will check if it's defined
         // Note: for known identifiers that aren't functions, we'd have returned earlier
         // So if we reach here, it's either a user-defined function call or an error
+        //
+        // #2085: record where this call's identifier actually started, so an
+        // unresolved-call diagnostic can cite the call rather than text-search
+        // for the name and find an unrelated same-spelling occurrence.
+        self.call_sites.push(CallSite {
+            name: name.clone(),
+            offset: start_pos,
+        });
         Ok(Expr::FuncCall {
             name,
             args,
