@@ -61,8 +61,8 @@ use super::eval::{
     has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
     index_one_owned as index_owned_by_key, is_pure_chain_link, is_retryable_stop, literal_to_owned,
     needs_path_context, numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned,
-    owned_bound_to_i64, owned_to_string, param_names, prefer_pending_control,
-    slice_component_value, slice_object_as_yq_children, slice_owned_value_read,
+    owned_bound_to_i64, owned_to_expr, owned_to_string, param_names, prefer_pending_control,
+    select_emits, slice_component_value, slice_object_as_yq_children, slice_owned_value_read,
     streams_escaped_generator_prefix, substitute_bound_var_from, substitute_vars,
     suppress_or_raise, suppresses, tonumber_from_str, vec_with_capacity,
     yq_absent_key_read_is_empty, yq_assign_rhs_document, yq_empty_operand_output,
@@ -7885,6 +7885,63 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink)
         }
 
+        // #2180 WP2b: the remaining eager sub-expression sites, mirroring
+        // `eval.rs`'s own new arm set -- see that file's `eval_each` match
+        // arm for the live-captured oracle rows every one of these closes.
+        //
+        // `select`/`IndexExpr`/`Object` get native, cursor-preserving arms
+        // (`select` never changes position; `IndexExpr`'s target and
+        // `Object`'s own construction were already native and unconditional
+        // in `eval_single`, so bridging them here would be a regression, not
+        // a fix -- every reach of either through *any* lazy consumer today
+        // already keeps full cursor/duplicate-key fidelity, since
+        // `eval_each_generic`'s wildcard falls to `eval_single`'s own native
+        // arm). `Negate` and `StringInterpolation` mirror `eval_single`'s own
+        // `needs_path_context` gate immediately below: a path-context operand
+        // keeps the pre-existing native arm (untouched, still eager -- no
+        // established lazy twin for either of *those* shapes exists yet),
+        // and everything else takes the demand-forwarding owned bridge,
+        // exactly the wildcard it already took before this change, minus the
+        // eagerness.
+        Expr::Builtin(Builtin::Select(cond)) => {
+            each_select_generic::<S, V>(cond, value, cursor, sink)
+        }
+        // jq mode only -- see `each_index_expr_generic`'s own doc comment
+        // for why yq mode keeps the pre-existing eager fallback below.
+        Expr::IndexExpr { target, key } if streams_escaped_generator_prefix::<S>() => {
+            each_index_expr_generic::<S, V>(target, key, value, optional, cursor, sink)
+        }
+        Expr::Object(entries) => {
+            let mut acc = Vec::new();
+            each_object_entries_generic::<S, V>(entries, value, optional, cursor, &mut acc, sink)
+        }
+        Expr::Negate(operand) if !needs_path_context(operand) => {
+            bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink)
+        }
+        // jq mode only -- yq mode's string interpolation isn't a fan-out
+        // generator at all (`eval::eval_string_interpolation`'s own doc
+        // comment), so it stays on the pre-existing eager fallback below,
+        // matching `eval.rs`'s own jq-mode gate.
+        Expr::StringInterpolation(_) if S::TAG != EvalTag::Yq => {
+            bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink)
+        }
+        // -- #1556's `eval.rs` twin, mirrored here at last (#2180 WP2b): the
+        // one construct the two arm sets had already drifted on --
+        // `eval.rs`'s own `each_range` has forwarded demand through
+        // `from`/`to`/`step` since #1556, but this file had no arm at all,
+        // so `isempty(range((G); 3))` (routed to `eval.rs`) already matched
+        // jq while `first(range((G); 3))` (native to this file) didn't.
+        // `range`'s own outputs are always computed numbers, never a
+        // document node, so the demand-forwarding owned bridge costs nothing
+        // the eager fallback it replaces didn't already pay -- the same
+        // `isempty`/`any`/`IN` reasoning `bridge_to_each_owned_flow`'s own
+        // doc comment gives. Captured live against jq 1.7.1, input `1`:
+        // `[first(range((1 as $x ?// $y | 1); 3))]` is `[1,1]`, where the
+        // eager fallback answered `[1]`.
+        Expr::Range { .. } => {
+            bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink)
+        }
+
         // spine 2416 (walk residue; #2428): `..` over a live node emits every
         // node as its own cursor, so a stage after it reads `key`/`path`/
         // `parent` as cursor properties instead of losing them to the
@@ -8137,17 +8194,22 @@ fn continue_pipe_element_generic<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
-/// Lazy twin of `eval::each_if` (#1596): `cond` is evaluated eagerly --
-/// branch *selection* was already lazy (a fanout over `cond`'s own outputs
-/// picks the taken branch per bit) -- but each taken branch's own body is
-/// now pushed through [`eval_each_generic`] rather than materialized via
-/// `eval_single`, so a generator inside it honours the wrapping consumer's
-/// demand (`first(if true then (1,("B"|stderr)) else 9 end)` no longer
-/// evaluates the `stderr` candidate). Mirrors `eval.rs`'s `each_if`
-/// bit-by-bit walk over every one of `cond`'s outputs (multi-output `cond`,
-/// e.g. `if (true,false) then "a" else "b" end`, #378) minus the
-/// borrowed/owned accumulator -- `sink` *is* the accumulator here, same as
-/// `eval_each_generic`'s own `Comma` arm.
+/// Lazy twin of `eval::each_if` (#1596, widened by #2180 WP2b): both `cond`
+/// and each taken branch's own body are now pushed through
+/// [`eval_each_generic`], so a generator *anywhere* in the expression --
+/// including a `?//` bind sitting in `cond` itself -- honours the wrapping
+/// consumer's demand.
+///
+/// `cond` used to be collected eagerly via `eval_single` before #1462's
+/// `eval.rs` twin reconsidered that same scope (see `eval::each_if`'s own
+/// doc comment for the fuller rationale and the live-captured row this
+/// closes: `[first(if (1 as $x ?// $y | 1) then 5 else 6 end)]` is `[5,5]`
+/// in jq 1.7.1, was `[5]`). Mirrors `eval.rs`'s own bit-by-bit walk over
+/// every one of `cond`'s outputs (multi-output `cond`, e.g. `if (true,false)
+/// then "a" else "b" end`, #378), with the same out-of-band escape channel
+/// [`each_alternative`]/`fanout_arg_each` already use for "a nested
+/// `eval_each_generic` call answers only `Demand`, so its own `Escaped`/
+/// `Stopped` has to be parked separately".
 fn each_if_generic<S: EvalSemantics, V: DocumentValue>(
     cond: &Expr,
     then_branch: &Expr,
@@ -8157,21 +8219,36 @@ fn each_if_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Flow {
-    let cond_result = eval_single::<S, V>(cond, value.clone(), optional, cursor);
-    let mut bits: Vec<bool> = Vec::new();
-    let cond_control = push_generic_truthiness(cond_result, &mut bits);
-
-    for bit in bits {
-        let branch = if bit { then_branch } else { else_branch };
+    let mut outer_stopped = false;
+    let mut escape: Option<Control> = None;
+    let cond_flow = eval_each_generic::<S, V>(cond, value.clone(), optional, cursor, &mut |item| {
+        let truthy = match generic_item_truthiness(item) {
+            Ok(b) => b,
+            Err(control) => {
+                escape = Some(control);
+                return Demand::Stop;
+            }
+        };
+        let branch = if truthy { then_branch } else { else_branch };
         match eval_each_generic::<S, V>(branch, value.clone(), optional, cursor, sink) {
-            Flow::Exhausted => {}
-            stopped_or_escaped => return stopped_or_escaped,
+            Flow::Exhausted => Demand::Continue,
+            Flow::Stopped { .. } => {
+                outer_stopped = true;
+                Demand::Stop
+            }
+            Flow::Escaped(control) => {
+                escape = Some(control);
+                Demand::Stop
+            }
         }
-    }
+    });
 
-    match cond_control {
+    if outer_stopped {
+        return cond_flow;
+    }
+    match escape {
         Some(control) => Flow::Escaped(control),
-        None => Flow::Exhausted,
+        None => cond_flow,
     }
 }
 
@@ -8352,59 +8429,6 @@ fn each_label_generic<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
-/// Generic-evaluator twin of `eval::materialize_bound_values` (#1596):
-/// unpacks a bind expression's own [`GenericResult`] into the values
-/// [`each_as_generic`]/[`each_as_pattern_generic`] loop the shared
-/// `body`/pattern-match logic over, plus the control the bind itself trails
-/// (#400, #494: a `Partial` bind still has its produced prefix bound and run
-/// through the body). `Err(flow)` carries the caller's own early return for a
-/// bind that produced no values at all, or that raised without producing
-/// any -- mirroring that function's `Err(Flow::Exhausted)`/bare-error arms.
-///
-/// [`push_generic_owned_values`] plays the role `eval::materialize_bound_values`'s
-/// own `QueryResult` match plays there: it already folds every `GenericResult`
-/// shape (including the three lazy variants, via `materialize_lazy`) into
-/// `(Vec<OwnedValue>, Option<Control>)`, so this wrapper only needs the
-/// empty-vs-non-empty split `eval.rs`'s version encodes as separate arms.
-/// Shared by both [`each_as_generic`] and [`each_as_pattern_generic`] (code
-/// review, #1596) rather than each inlining its own copy of this split --
-/// the same duplication `eval::materialize_bound_values`'s own doc comment
-/// says it was extracted to eliminate between `eval::each_as`/`eval::each_as_pattern`.
-fn materialize_bound_values_generic<V: DocumentValue>(
-    bound_result: GenericResult<V>,
-) -> Result<(Vec<OwnedValue>, Option<Control>), Flow> {
-    let mut bound_values: Vec<OwnedValue> = Vec::new();
-    let bound_control = push_generic_owned_values(bound_result, &mut bound_values);
-    if bound_values.is_empty() {
-        return Err(match bound_control {
-            Some(control) => Flow::Escaped(control),
-            None => Flow::Exhausted,
-        });
-    }
-    Ok((bound_values, bound_control))
-}
-
-/// [`materialize_bound_values_generic`] keeping, per bound value, the node
-/// it came from (#2072): a cursor the bind produced names its own node (a
-/// `. as $x` passthrough evaluates to the ambient cursor, so it is covered),
-/// and a value the bind built has no origin, so the body then sees exactly
-/// what it saw before.
-fn materialize_bound_values_with_origin<V: DocumentValue>(
-    bound_result: GenericResult<V>,
-) -> Result<(Vec<BoundValue>, Option<Control>), Flow> {
-    let mut out: Vec<BoundValue> = Vec::new();
-    let control = fold_generic_owned_values(bound_result, &mut |v, c| {
-        out.push((v, c.map(bind_origin_of_cursor)));
-    });
-    if out.is_empty() {
-        return Err(match control {
-            Some(control) => Flow::Escaped(control),
-            None => Flow::Exhausted,
-        });
-    }
-    Ok((out, control))
-}
-
 /// A bound value and, when the binding could tell, the node it came from.
 type BoundValue = (OwnedValue, Option<BindOrigin>);
 
@@ -8504,14 +8528,30 @@ fn bound_var_identity<S: EvalSemantics, V: DocumentValue>(
         })
 }
 
-/// Lazy twin of `eval::each_as` (#1596): the bind expression (`expr`) is
-/// evaluated eagerly, exactly as `eval::each_as` already does -- this fix is
-/// scoped to what runs *per bound value*, not to the binding itself. Each
-/// bound value's `body` is then pushed through [`eval_each_generic`] rather
-/// than materialized, so `isempty((1,2) as $x | ($x, ("B"|stderr)))`-shaped
-/// binds no longer evaluate the `stderr` branch. The parser reserves this
-/// bare-`$var` node for `Expr::As`; [`each_as_pattern_generic`] below is its
+/// Lazy twin of `eval::each_as` (#1596, widened by #2180 WP2b): the bind
+/// expression (`expr`) now runs through
+/// [`fanout_arg_each_generic_with_origin`] instead of `eval_single` + a
+/// collecting conversion -- the same demand-forwarding argument fan-out
+/// [`each_nth_generic`] already uses for `nth`'s `n` -- so a `?//` bind
+/// sitting in the *source* itself also sees a wrapping consumer's
+/// [`Demand::Stop`]: `[first((1 as $x ?// $y | 1) as $v | $v)]` is `[1,1]` in
+/// jq 1.7.1, was `[1]` (captured live, input `1`; see `eval::each_as`'s own
+/// doc comment for the fuller rationale, identical here). The origin variant
+/// (rather than plain [`fanout_arg_each_generic`], which
+/// [`each_as_pattern_generic`] below uses) is needed here and not there:
+/// only a bare `$var` bind has a single node worth tracking, and that node
+/// (#2072) still reaches [`substitute_bound_var_from`] unchanged by this
+/// widening. Each bound value's `body` is still pushed through
+/// [`eval_each_generic`] rather than materialized, unchanged from #1596.
+/// The parser reserves this bare-`$var` node for `Expr::As`;
+/// [`each_as_pattern_generic`] below is its
 /// destructuring sibling (`Expr::AsPattern`, `?//`-chains included).
+///
+/// #2563's owned-identity rule for `as` bindings lives entirely in this
+/// file's separate fast-path gate (`owned_identity_rule`/
+/// `eval_owned_identity_as`), reached *before* this function is ever called,
+/// so it is untouched by this change (verified live:
+/// `test_as_binding_keeps_the_input_identity_2563` still passes).
 fn each_as_generic<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     var: &str,
@@ -8521,31 +8561,26 @@ fn each_as_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Flow {
-    let bound_result = eval_single::<S, V>(expr, value.clone(), optional, cursor);
-    let (bound_values, bound_control) = match materialize_bound_values_with_origin(bound_result) {
-        Ok(pair) => pair,
-        Err(flow) => return flow,
-    };
-
-    for (bound_val, origin) in bound_values {
-        let substituted_body = substitute_bound_var_from(expr, body, var, &bound_val, origin);
-        match eval_each_generic::<S, V>(&substituted_body, value.clone(), optional, cursor, sink) {
-            Flow::Exhausted => {}
-            other => return other,
-        }
-    }
-
-    match bound_control {
-        Some(control) => Flow::Escaped(control),
-        None => Flow::Exhausted,
-    }
+    fanout_arg_each_generic_with_origin::<S, V, _>(
+        expr,
+        value.clone(),
+        optional,
+        cursor,
+        |bound_val, origin| {
+            let substituted_body = substitute_bound_var_from(expr, body, var, &bound_val, origin);
+            eval_each_generic::<S, V>(&substituted_body, value.clone(), optional, cursor, sink)
+        },
+    )
 }
 
-/// Lazy twin of `eval::each_as_pattern` (#1596): the bind expression
-/// (`expr`) is evaluated eagerly, exactly as `eval::each_as_pattern` already
-/// does -- same reasoning as [`each_as_generic`] above, its non-destructuring
-/// sibling. Each bound value's `body` (after `?//`-alternative substitution)
-/// is then pushed through [`eval_each_generic`] rather than materialized.
+/// Lazy twin of `eval::each_as_pattern` (#2180 WP2b widens #1596 the same
+/// way [`each_as_generic`] above does): the bind expression (`expr`) now
+/// runs through [`fanout_arg_each_generic`] instead of `eval_single` + a
+/// collecting conversion, so a `?//` bind in the *source* is demand-forwarded
+/// too, not just one nested in a `?//`-alternative's own `body` (which
+/// [`each_pattern_alternatives_generic`] already covered). `[first((1 as $x
+/// ?// $y | 1) as [$a] ?// $a | $a)]` is `[1,1]` in jq 1.7.1, was `[1]`
+/// (captured live, input `1`).
 fn each_as_pattern_generic<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     patterns: &[Pattern],
@@ -8555,12 +8590,6 @@ fn each_as_pattern_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Flow {
-    let bound_result = eval_single::<S, V>(expr, value.clone(), optional, cursor);
-    let (bound_values, bound_control) = match materialize_bound_values_generic(bound_result) {
-        Ok(pair) => pair,
-        Err(flow) => return flow,
-    };
-
     let mut all_var_names: Vec<String> = Vec::new();
     for pattern in patterns {
         collect_pattern_var_names(pattern, &mut all_var_names);
@@ -8568,8 +8597,8 @@ fn each_as_pattern_generic<S: EvalSemantics, V: DocumentValue>(
     all_var_names.sort_unstable();
     all_var_names.dedup();
 
-    for bound_val in bound_values {
-        match each_pattern_alternatives_generic::<S, V>(
+    fanout_arg_each_generic::<S, V, _>(expr, value.clone(), optional, cursor, |bound_val| {
+        each_pattern_alternatives_generic::<S, V>(
             patterns,
             &all_var_names,
             body,
@@ -8578,16 +8607,8 @@ fn each_as_pattern_generic<S: EvalSemantics, V: DocumentValue>(
             optional,
             cursor,
             sink,
-        ) {
-            Flow::Exhausted => {}
-            other => return other,
-        }
-    }
-
-    match bound_control {
-        Some(control) => Flow::Escaped(control),
-        None => Flow::Exhausted,
-    }
+        )
+    })
 }
 
 /// Sink-based twin of `eval::each_pattern_alternatives` (#1596): same
@@ -8974,6 +8995,391 @@ fn each_nth_generic<S: EvalSemantics, V: DocumentValue>(
         }
         finish_short_circuit(outer_stopped, flow)
     })
+}
+
+/// Demand-forwarding twin of `eval_builtin`'s own native `Builtin::Select`
+/// arm (#2180 WP2b): `select(cond)` with `cond`'s own truthy-driven
+/// republishes pushed to `sink` as they are decided, instead of collected
+/// into a batch (`bits: Vec<bool>` -> `truthy_count` -> `pass_n`). Native
+/// rather than routed through [`bridge_to_each_owned_flow`], for the same
+/// #607 duplicate-key-fidelity reason [`each_first_generic`] stays native:
+/// `select` never changes position -- every truthy output *is* the input
+/// node -- so the ambient `cursor` (if any) is forwarded to every push
+/// unchanged rather than materializing the whole document to answer a
+/// question the input node already carries.
+///
+/// `cond`'s own `optional` is hardcoded `false` here, matching the eager
+/// arm's identical hardcoding (its own comment: `select(...)?` never reaches
+/// this dispatch with `optional = true` after #693, since it isn't
+/// `IndexExpr`/`SliceExpr`).
+///
+/// [`select_emits`] is the same per-bit gate [`eval::each_select`] uses:
+/// `cond` still runs to completion regardless of mode, since
+/// `already_emitted` only silences further *pushes*, not further pulls --
+/// under `S::SELECT_EMITS_ONCE_IF_ANY_TRUTHY` (yq, #1613) the republish
+/// count collapses to at most one, matching the eager arm's own
+/// `usize::from(bits.iter().any(...))` reduction (same total count, just
+/// decided incrementally instead of after a full collection -- observably
+/// identical for a never-stopping sink, and *more* faithful to jq's own
+/// per-output generator interleaving for a stopping one or a side-effecting
+/// `cond`). Captured live against jq 1.7.1, input `1`:
+/// `[first(select((1 as $x ?// $y | 1) == 1))]` is `[1,1]`, where the eager
+/// fallback answered `[1]`.
+fn each_select_generic<S: EvalSemantics, V: DocumentValue>(
+    cond: &Expr,
+    value: V,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    let mut already_emitted = false;
+    let mut escape: Option<Control> = None;
+    let flow = eval_each_generic::<S, V>(cond, value.clone(), false, cursor, &mut |item| {
+        let truthy = match generic_item_truthiness(item) {
+            Ok(b) => b,
+            Err(control) => {
+                escape = Some(control);
+                return Demand::Stop;
+            }
+        };
+        if !select_emits::<S>(truthy, &mut already_emitted) {
+            return Demand::Continue;
+        }
+        match cursor {
+            Some(c) => sink(GenericItem::OneCursor(c)),
+            None => sink(GenericItem::One(value.clone())),
+        }
+    });
+    match escape {
+        Some(control) => Flow::Escaped(control),
+        None => flow,
+    }
+}
+
+/// Demand-forwarding twin of `eval::each_index_expr` (#2180 WP2b), reusing
+/// this file's own [`eval_index_expr`] unchanged the identical way: each
+/// already-computed key is spliced back into the AST as a literal
+/// single-valued key expression ([`owned_to_expr`]) and handed to
+/// [`eval_index_expr`] for that one key alone, so `target`'s own
+/// re-evaluation-per-key (#2032), negative-index checks and `Partial`-fold
+/// machinery are untouched -- only the *key stream* itself is now driven
+/// through [`eval_each_generic`] instead of collected first.
+///
+/// jq mode only, gated the same way and for the same reason as `eval.rs`'s
+/// own function: `eval_index_expr`'s yq-mode rule retroactively discards
+/// *every* already-produced key's result when a *later* key in the same
+/// generator raises `Error`/`Break`
+/// ([`streams_escaped_generator_prefix`], #2326), which an
+/// already-delivered `sink` push cannot undo. See that function's own doc
+/// comment for the fuller rationale -- identical here, just against
+/// `GenericItem` instead of `Item`.
+///
+/// A `GenericItem` produced by the key stream can itself be a
+/// deferred multi-value shape (`Owned`/`LazyKeys`/`LazyIndexRange`/
+/// `LazySeq`) that bundles several logical keys into one push -- mirrors
+/// this file's own [`eval_index_expr`], which materializes those the same
+/// way (`generic_item_to_result(item).collect_owned()`) before looping over
+/// them one key at a time.
+fn each_index_expr_generic<S: EvalSemantics, V: DocumentValue>(
+    target: &Expr,
+    key: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    let mut outer_stopped = false;
+    let mut escape: Option<Control> = None;
+
+    let flow =
+        eval_each_generic::<S, V>(key, value.clone(), false, cursor, &mut |item| match item {
+            GenericItem::One(v) => {
+                let k = match to_owned_key_shape(&v) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        escape = Some(Control::Error(e));
+                        return Demand::Stop;
+                    }
+                };
+                if process_index_key::<S, V>(
+                    target,
+                    &k,
+                    value.clone(),
+                    optional,
+                    cursor,
+                    sink,
+                    &mut outer_stopped,
+                    &mut escape,
+                ) {
+                    Demand::Continue
+                } else {
+                    Demand::Stop
+                }
+            }
+            GenericItem::OneCursor(c) | GenericItem::OneCursorValue(c, _) => {
+                let k = match to_owned_key_shape_cursor(&c) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        escape = Some(Control::Error(e));
+                        return Demand::Stop;
+                    }
+                };
+                if process_index_key::<S, V>(
+                    target,
+                    &k,
+                    value.clone(),
+                    optional,
+                    cursor,
+                    sink,
+                    &mut outer_stopped,
+                    &mut escape,
+                ) {
+                    Demand::Continue
+                } else {
+                    Demand::Stop
+                }
+            }
+            item @ (GenericItem::Owned(_)
+            | GenericItem::LazyKeys { .. }
+            | GenericItem::LazyIndexRange(_)
+            | GenericItem::LazySeq(_)) => {
+                let ks = match generic_item_to_result(item).collect_owned() {
+                    Ok(ks) => ks,
+                    Err(e) => {
+                        escape = Some(Control::Error(e));
+                        return Demand::Stop;
+                    }
+                };
+                for k in &ks {
+                    if !process_index_key::<S, V>(
+                        target,
+                        k,
+                        value.clone(),
+                        optional,
+                        cursor,
+                        sink,
+                        &mut outer_stopped,
+                        &mut escape,
+                    ) {
+                        return Demand::Stop;
+                    }
+                }
+                Demand::Continue
+            }
+        });
+
+    if outer_stopped {
+        return flow;
+    }
+    match escape {
+        Some(control) => Flow::Escaped(control),
+        None => flow,
+    }
+}
+
+/// One already-computed key, indexed against `target` via
+/// [`eval_index_expr`] (unchanged) and forwarded to `sink` --
+/// [`each_index_expr_generic`]'s per-key body, split out as a free function
+/// taking `sink`/`outer_stopped`/`escape` as explicit `&mut` parameters
+/// rather than a closure capturing them: the borrow checker will not let one
+/// closure both drive [`eval_each_generic`]'s own sink *and* be called
+/// (mutably capturing the same state) from inside it.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: every parameter is threaded straight
+                                     // through to one `eval_index_expr` + `drain_result_generic`
+                                     // call; a struct would just rename the same fields.
+fn process_index_key<S: EvalSemantics, V: DocumentValue>(
+    target: &Expr,
+    k: &OwnedValue,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    outer_stopped: &mut bool,
+    escape: &mut Option<Control>,
+) -> bool {
+    let literal_key = owned_to_expr(k);
+    let one_key_result = eval_index_expr::<S, V>(target, &literal_key, value, optional, cursor);
+    match drain_result_generic(one_key_result, sink) {
+        Flow::Exhausted => true,
+        Flow::Stopped { .. } => {
+            *outer_stopped = true;
+            false
+        }
+        Flow::Escaped(control) => {
+            *escape = Some(control);
+            false
+        }
+    }
+}
+
+/// Demand-forwarding twin of `eval::build_object_entries`'s generic sibling,
+/// [`build_object_entries_generic`] (#2180 WP2b): one object per combination
+/// of key/value outputs, pushed to `sink` as each combination completes
+/// instead of collected into `out`. Same recursion, same entries-recurse/
+/// key-encloses-value nesting order (see `eval::each_object_entries`'s own
+/// doc comment for the live oracle capture pinning it), but a key/value slot
+/// is now driven through [`eval_each_generic`] -- with the ambient `cursor`
+/// still threaded in, exactly as [`build_object_entries_generic`]'s own
+/// `eval_single` calls already do, so `key`/`parent`/`path` inside a slot
+/// still resolve against this stage's own position -- instead of
+/// `push_generic_owned_values(eval_single(...))`, so a `?//` bind inside a
+/// slot sees a wrapping consumer's [`Demand::Stop`] while it is still the
+/// live top of the call stack. Every slot output is still converted to an
+/// `OwnedValue` immediately either way (`generic_item_into_owned`, the sink
+/// twin of `push_generic_owned_values`'s per-item `to_owned`/
+/// `to_owned_cursor`) -- object construction always builds a fresh composite
+/// value, so there is no live cursor to preserve for a constructed field the
+/// way `each_select_generic`'s own input-node passthrough needs one.
+/// Captured live against jq 1.7.1: `[first({a:(1 as $x ?// $y | 1)} | .a)]`
+/// is `[1,1]`, where the eager fallback answered `[1]`.
+///
+/// Same deliberately-accepted simplification as `eval::each_object_entries`
+/// for a non-string key that can't stringify under an ambient `optional`:
+/// treated as "this one key contributes nothing" rather than
+/// `build_object_entries_generic`'s own `ObjectEscapeGeneric::Suppressed`
+/// (discard every combination already produced) -- see that function's own
+/// doc comment for why this is unreached in practice, not merely untested.
+fn each_object_entries_generic<S: EvalSemantics, V: DocumentValue>(
+    entries: &[ObjectEntry],
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    acc: &mut Vec<(String, OwnedValue)>,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    let Some((entry, rest)) = entries.split_first() else {
+        let object: IndexMap<String, OwnedValue> = acc.iter().cloned().collect();
+        return match sink(GenericItem::Owned(OwnedValue::Object(object))) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped { pending: None },
+        };
+    };
+
+    match &entry.key {
+        ObjectKey::Literal(name) => each_object_value_generic::<S, V>(
+            name.clone(),
+            &entry.value,
+            rest,
+            value,
+            optional,
+            cursor,
+            acc,
+            sink,
+        ),
+        ObjectKey::Expr(key_expr) => {
+            let mut outer_stopped = false;
+            let mut escape: Option<Control> = None;
+            let flow =
+                eval_each_generic::<S, V>(key_expr, value.clone(), optional, cursor, &mut |item| {
+                    let key_owned = match generic_item_into_owned(item) {
+                        Ok(v) => v,
+                        Err(control) => {
+                            escape = Some(control);
+                            return Demand::Stop;
+                        }
+                    };
+                    let key_str = match &key_owned {
+                        OwnedValue::String(s) => s.clone(),
+                        _ => match yq_object_key_stringify::<S>(&key_owned) {
+                            Some(s) => s,
+                            None => {
+                                if optional {
+                                    return Demand::Continue;
+                                }
+                                escape = Some(Control::Error(EvalError::cannot_use_as_object_key(
+                                    &key_owned,
+                                )));
+                                return Demand::Stop;
+                            }
+                        },
+                    };
+                    match each_object_value_generic::<S, V>(
+                        key_str,
+                        &entry.value,
+                        rest,
+                        value.clone(),
+                        optional,
+                        cursor,
+                        acc,
+                        sink,
+                    ) {
+                        Flow::Exhausted => Demand::Continue,
+                        Flow::Stopped { .. } => {
+                            outer_stopped = true;
+                            Demand::Stop
+                        }
+                        Flow::Escaped(control) => {
+                            escape = Some(control);
+                            Demand::Stop
+                        }
+                    }
+                });
+            if outer_stopped {
+                return flow;
+            }
+            match escape {
+                Some(control) => Flow::Escaped(control),
+                None => flow,
+            }
+        }
+    }
+}
+
+/// [`each_object_entries_generic`]'s value-slot half -- see that function's
+/// own doc comment.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors `build_object_entries_generic`'s
+                                     // own 7-argument shape plus the sink -- every param is
+                                     // threaded straight through the recursion, a struct
+                                     // would just rename the same fields.
+fn each_object_value_generic<S: EvalSemantics, V: DocumentValue>(
+    key: String,
+    value_expr: &Expr,
+    rest: &[ObjectEntry],
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    acc: &mut Vec<(String, OwnedValue)>,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    let mut outer_stopped = false;
+    let mut escape: Option<Control> = None;
+    let flow =
+        eval_each_generic::<S, V>(value_expr, value.clone(), optional, cursor, &mut |item| {
+            let val_owned = match generic_item_into_owned(item) {
+                Ok(v) => v,
+                Err(control) => {
+                    escape = Some(control);
+                    return Demand::Stop;
+                }
+            };
+            acc.push((key.clone(), val_owned));
+            let result = each_object_entries_generic::<S, V>(
+                rest,
+                value.clone(),
+                optional,
+                cursor,
+                acc,
+                sink,
+            );
+            acc.pop();
+            match result {
+                Flow::Exhausted => Demand::Continue,
+                Flow::Stopped { .. } => {
+                    outer_stopped = true;
+                    Demand::Stop
+                }
+                Flow::Escaped(control) => {
+                    escape = Some(control);
+                    Demand::Stop
+                }
+            }
+        });
+    if outer_stopped {
+        return flow;
+    }
+    match escape {
+        Some(control) => Flow::Escaped(control),
+        None => flow,
+    }
 }
 
 /// Generic-evaluator twin of `eval::eval_each_pipe` (#1461): the "stop
@@ -9937,6 +10343,33 @@ fn generic_item_into_owned<V: DocumentValue>(item: GenericItem<V>) -> Result<Own
     }
 }
 
+/// [`generic_item_into_owned`]'s twin for a binding site that wants the
+/// document node a value came from alongside it (#2072), when the item
+/// carried a cursor at all -- an `OneCursor`/`OneCursorValue` item names its
+/// own node, exactly as [`fold_generic_owned_values`]'s `push` callback
+/// already does for the eager path; every other arm carries no origin, same
+/// as there. [`fanout_arg_each_generic_with_origin`]'s only caller.
+fn generic_item_into_owned_with_origin<V: DocumentValue>(
+    item: GenericItem<V>,
+) -> Result<(OwnedValue, Option<BindOrigin>), Control> {
+    match generic_item_to_result(item).materialize_lazy() {
+        GenericResult::One(v) => Ok((to_owned(&v).map_err(Control::Error)?, None)),
+        GenericResult::OneCursor(c) => {
+            let owned = to_owned_cursor(&c).map_err(Control::Error)?;
+            Ok((owned, Some(bind_origin_of_cursor(&c))))
+        }
+        GenericResult::Owned(v) => Ok((v, None)),
+        GenericResult::Error(e) => Err(Control::Error(e)),
+        GenericResult::Break(label) => Err(Control::Break(label)),
+        GenericResult::Halt(code) => Err(Control::Halt(code)),
+        // Same six-arm exhaustiveness argument as `generic_item_into_owned`
+        // above -- see its own trailing comment for the full reasoning.
+        _ => {
+            unreachable!("a single GenericItem never materializes to a multi-output or lazy shape")
+        }
+    }
+}
+
 /// Generic-evaluator twin of `eval::binary_fanout_each` (#1481): the one
 /// right-outer/left-inner fanout loop for the `V: DocumentValue`-generic
 /// evaluator, parameterized over *how* an operand is enumerated -- reusing
@@ -10700,6 +11133,62 @@ where
             // The downstream consumer said stop. Its verdict outranks the
             // argument generator's, exactly as it does inside
             // `each_limit_generic`'s own inner sink.
+            Flow::Stopped { .. } => {
+                consumer_stopped = true;
+                Demand::Stop
+            }
+            Flow::Escaped(control) => {
+                escape = Some(control);
+                Demand::Stop
+            }
+        }
+    });
+
+    match escape {
+        Some(control) => Flow::Escaped(control),
+        // `pending` is dropped for the reason every other lazy consumer
+        // drops it: it belongs to an eager fallback jq would never reach.
+        None if consumer_stopped => Flow::Stopped { pending: None },
+        None => flow,
+    }
+}
+
+/// [`fanout_arg_each_generic`]'s twin for [`each_as_generic`] alone: same
+/// demand-forwarding fan-out over `arg_expr`'s outputs, but `body` also
+/// receives the document node each value came from (#2072), via
+/// [`generic_item_into_owned_with_origin`] in place of
+/// [`generic_item_into_owned`]. Not shared with [`each_as_pattern_generic`]
+/// -- a pattern bind has no single node to name, so it fans out through
+/// plain [`fanout_arg_each_generic`] instead.
+fn fanout_arg_each_generic_with_origin<S: EvalSemantics, V: DocumentValue, B>(
+    arg_expr: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    mut body: B,
+) -> Flow
+where
+    B: FnMut(OwnedValue, Option<BindOrigin>) -> Flow,
+{
+    // Tracked out-of-band for the usual reason: the sink can only answer
+    // `Demand`, so "why did the pull stop" has to be recorded beside it.
+    let mut escape: Option<Control> = None;
+    let mut consumer_stopped = false;
+
+    let flow = eval_each_generic::<S, V>(arg_expr, value, optional, cursor, &mut |item| {
+        let (owned, origin) = match generic_item_into_owned_with_origin(item) {
+            Ok(pair) => pair,
+            Err(control) => {
+                escape = Some(control);
+                return Demand::Stop;
+            }
+        };
+        match body(owned, origin) {
+            // This bound value's own walk finished; go on to the next one.
+            Flow::Exhausted => Demand::Continue,
+            // The downstream consumer said stop. Its verdict outranks the
+            // argument generator's, exactly as it does in
+            // `fanout_arg_each_generic` above.
             Flow::Stopped { .. } => {
                 consumer_stopped = true;
                 Demand::Stop
