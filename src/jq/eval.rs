@@ -4709,6 +4709,21 @@ impl<W: Clone + AsRef<[u64]>> Item<'_, W> {
         self.into_owned_lossy()
     }
 
+    /// Truthiness of this item, without decoding it (#2180 WP2a).
+    ///
+    /// The sink-side twin of the per-output half of [`push_truthiness`], and
+    /// deliberately as non-committal as [`eval_not`] already is about the
+    /// same question: only `null`/`false` are falsy in jq, so a borrowed
+    /// string's *content* never changes the verdict and an undecodable one
+    /// must not raise here (#1820). [`each_alternative`] and
+    /// [`each_boolean`] are the callers.
+    fn is_truthy(&self) -> bool {
+        match self {
+            Item::Borrowed(v) => json_is_truthy(v),
+            Item::Owned(v) => v.is_truthy(),
+        }
+    }
+
     /// Fallible twin of [`Self::into_owned_lossy`], raising
     /// [`EvalError::decode_failure`] on an undecodable borrowed string
     /// instead of silently substituting `""` (#1972) -- used where the
@@ -5225,6 +5240,33 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Expr::Builtin(Builtin::UpperInSrc(src, s)) => {
             each_upper_in_src::<W, S>(src, s, value, optional, sink)
         }
+
+        // #2180 WP2a: `//`, `and` and `or` -- the three operators that sit
+        // between a short-circuiting consumer and a `?//` bind and, before
+        // this, materialized the bind through the `_` fallback below instead
+        // of forwarding demand into it. All four `and`/`or` operand
+        // positions and both `//` sides were divergent; captured live
+        // against jq 1.7.1, input `1`, with `G` = `1 as $x ?// $y | 1`:
+        //
+        // ```text
+        // [first((1 as $x ?// $y | 5)//9)]  [5,5]        was [5]
+        // [first(null // (G))]              [1,1]        was [1]
+        // [first((G) and true)]             [true,true]  was [true]
+        // [first(true and (G))]             [true,true]  was [true]
+        // [first((G) or false)]             [true,true]  was [true]
+        // [first(false or (G))]             [true,true]  was [true]
+        // ```
+        //
+        // Both arms also close ordinary side-effect leaks of the shape
+        // Stage 2 closed elsewhere, with no `?//` in sight -- also captured
+        // live: `[first((1, ("B"|debug)) // 9)]` and
+        // `[first((false,false) // ("A"|debug, "B"|debug))]` each ran a
+        // `debug` jq never reaches.
+        Expr::Alternative(left, right) => {
+            each_alternative::<W, S>(left, right, value, optional, sink)
+        }
+        Expr::And(left, right) => each_boolean::<W, S>(left, right, value, optional, false, sink),
+        Expr::Or(left, right) => each_boolean::<W, S>(left, right, value, optional, true, sink),
 
         _ => drain_result(eval_single::<W, S>(expr, value, optional), sink),
     }
@@ -6221,6 +6263,124 @@ fn each_upper_in_src<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     each_any_all_gen_cond::<W, S>(&gen, &Expr::Identity, value, optional, true, sink)
 }
 
+/// Demand-forwarding twin of [`eval_alternative`] (#2180 WP2a): jq's `//`
+/// with the truthy left outputs pushed to `sink` as they are produced
+/// instead of collected, so a wrapping consumer's [`Demand::Stop`] reaches
+/// the left operand -- and, with it, a `?//` bind inside it, which
+/// [`each_pattern_alternatives`] retries on exactly that signal (#1519).
+///
+/// **Every rule is [`eval_alternative`]/[`retain_truthy`]'s, restated for a
+/// pushed rather than a collected stream** -- all re-captured live against
+/// jq 1.7.1 before this arm was written:
+///
+/// ```text
+/// (1,false,null,3) // 2            1, 3            truthy outputs pass, falsy ones are dropped
+/// (false,null) // (5,6)            5, 6            no truthy left output -> the right side answers
+/// false // (null,7)                null, 7         the right side is emitted UNfiltered
+/// empty // 7                       7               an empty left is "no truthy output" too
+/// (1,2) // error("y")              1, 2            the right side is not evaluated at all
+/// (1,false,error("x")) // 2        1, then error   a left error propagates AFTER the truthy prefix
+/// (false, error("x")) // 9         error           ... and does not select the right side either
+/// label $o | ((false, break $o) // 9)   nothing    a break escapes the operator, it does not select
+/// ```
+///
+/// The `forwarded > 0` test is `retain_truthy` + [`eval_alternative`]'s
+/// `QueryResult::None` arm fused: "did the left produce a truthy output"
+/// is the only thing that decision ever needed, and counting it as the
+/// outputs go past is cheaper than the filtered `Vec` it replaces.
+///
+/// `outer_stopped` short-circuits the whole close: the consumer, not the
+/// left operand, is why production ended, so its verdict propagates
+/// verbatim -- including a [`Flow::Escaped`] a `?//` retry turned it into,
+/// which is [`finish_short_circuit`]'s third rule (a retry that reaches a
+/// failing alternative must still raise, `cc3cf4bdd`). Answering `9` there
+/// because "the left forwarded nothing" would be wrong twice over: nothing
+/// was forwarded only because the consumer stopped asking.
+fn each_alternative<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    left: &Expr,
+    right: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    let mut forwarded = 0usize;
+    let mut outer_stopped = false;
+    let left_flow = eval_each::<W, S>(left, value.clone(), optional, &mut |item| {
+        // `retain_truthy`, one output at a time -- a falsy output is dropped
+        // and the left operand keeps producing, exactly as the filtered
+        // `Vec` did.
+        if !item.is_truthy() {
+            return Demand::Continue;
+        }
+        forwarded += 1;
+        if sink(item) == Demand::Stop {
+            outer_stopped = true;
+            Demand::Stop
+        } else {
+            Demand::Continue
+        }
+    });
+
+    if outer_stopped {
+        return left_flow;
+    }
+    match left_flow {
+        // `eval_alternative`'s `Break`/`Error` arms and `retain_truthy`'s
+        // `Partial` rule collapse into one here, because `Flow` has already
+        // delivered the prefix: whatever the left ended in propagates, and
+        // the right side is not consulted. `Halt` rides the same arm, as
+        // `Control`'s own pass-through guarantee requires.
+        Flow::Escaped(control) => Flow::Escaped(control),
+        // At least one truthy output was forwarded, so `//` is answered.
+        // (A `Flow::Stopped` with no `outer_stopped` cannot come from the
+        // sink above; folded in with `Exhausted` rather than given an
+        // `unreachable!()`, the same defensive choice `binary_fanout_core`
+        // makes.)
+        Flow::Exhausted | Flow::Stopped { .. } if forwarded > 0 => Flow::Exhausted,
+        // No truthy output at all: the right side answers, and its outputs
+        // go to `sink` unfiltered.
+        Flow::Exhausted | Flow::Stopped { .. } => eval_each::<W, S>(right, value, optional, sink),
+    }
+}
+
+/// Demand-forwarding twin of [`eval_boolean`] (#2180 WP2a) -- `and`/`or`
+/// with each pairing's boolean pushed to `sink` as it is decided.
+///
+/// The loop is [`boolean_fanout_each`]'s, shared with the eager route; this
+/// only supplies [`eval_each`] as the operand strategy (so the left
+/// operand's outputs and the right operand's per-output re-evaluations both
+/// stop when the consumer does) and adapts the `bool` the loop speaks to the
+/// `Item` the consumer expects. See [`boolean_fanout_each`] for the oracle
+/// rows that pinned the loop shape and the short-circuit rule, and
+/// [`eval_each`]'s own `Expr::And`/`Expr::Or` arms for the `?//` rows this
+/// closes.
+///
+/// `optional` is forwarded to the operands, matching [`eval_boolean`]'s own
+/// `eval_single` strategy rather than `eval_each_generic`'s hardcoded
+/// `false` for a comparison operand -- this arm shadows `eval_boolean`, so
+/// it has to make the same choice `eval_boolean` does.
+fn each_boolean<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    left: &Expr,
+    right: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    short_circuit: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    boolean_fanout_each(
+        |operand, bit_sink| {
+            eval_each::<W, S>(operand, value.clone(), optional, &mut |item| {
+                bit_sink(item.is_truthy())
+            })
+        },
+        left,
+        right,
+        short_circuit,
+        binary_fanout_rules::<S>(EmptyOperandOp::Boolean),
+        &mut |bit| sink(Item::Owned(OwnedValue::Bool(bit))),
+    )
+}
+
 /// Demand-driven twin of [`eval_range`] (#1556): drives `from`, `to`, and
 /// `step` through [`eval_each`] instead of `stream_outputs_lossy`, so a wrapping
 /// consumer's [`Demand::Stop`] reaches *inside* the bound expressions
@@ -7171,11 +7331,18 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>>(
 /// `suspend` on the way into the sink is what makes `.zzz + 1 | .yyy` keep
 /// reading `.yyy` normally, and what lets the *inner* operand's own wrapped
 /// call re-enter the scope from scratch.
-fn read_only_operand_strategy<'a, W: Clone + AsRef<[u64]>>(
+///
+/// Generic in the item type `I` rather than fixed to [`Item`] (#2180 WP2a):
+/// [`binary_fanout_each`] enumerates whole operand values, while
+/// [`boolean_fanout_each`] enumerates one truthiness `bool` per operand
+/// output, and both need the identical enter/suspend pairing. Before WP2a
+/// `and`/`or` applied it by hand inside [`boolean_fanout_bools`], which is
+/// how it came to cover only the operand call and not the sink.
+fn read_only_operand_strategy<I>(
     rules: BinaryFanoutRules,
-    each_operand: impl Fn(&Expr, &mut dyn FnMut(Item<'a, W>) -> Demand) -> Flow,
-) -> impl Fn(&Expr, &mut dyn FnMut(Item<'a, W>) -> Demand) -> Flow {
-    move |expr: &Expr, sink: &mut dyn FnMut(Item<'a, W>) -> Demand| {
+    each_operand: impl Fn(&Expr, &mut dyn FnMut(I) -> Demand) -> Flow,
+) -> impl Fn(&Expr, &mut dyn FnMut(I) -> Demand) -> Flow {
+    move |expr: &Expr, sink: &mut dyn FnMut(I) -> Demand| {
         if !rules.read_only {
             return each_operand(expr, sink);
         }
@@ -7314,7 +7481,7 @@ fn eval_negate<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// pairing has failed. `eval_operand` closes over whichever evaluator
 /// (plain vs. path-context) its caller wants.
 fn boolean_fanout_core<'a, W: Clone + AsRef<[u64]>>(
-    mut eval_operand: impl FnMut(&Expr) -> QueryResult<'a, W>,
+    eval_operand: impl Fn(&Expr) -> QueryResult<'a, W>,
     left: &Expr,
     right: &Expr,
     short_circuit: bool,
@@ -7347,78 +7514,275 @@ fn boolean_fanout_core<'a, W: Clone + AsRef<[u64]>>(
 /// [`binary_fanout_core`] and `eval_generic::binary_fanout_each_generic`
 /// already follow for arithmetic and comparison.
 pub(crate) fn boolean_fanout_bools(
-    mut push_operand: impl FnMut(&Expr, &mut Vec<bool>) -> Option<Control>,
+    push_operand: impl Fn(&Expr, &mut Vec<bool>) -> Option<Control>,
     left: &Expr,
     right: &Expr,
     short_circuit: bool,
     rules: BinaryFanoutRules,
 ) -> (Vec<bool>, Option<Control>) {
+    let mut out: Vec<bool> = Vec::new();
+    let flow = boolean_fanout_each(
+        // The eager operand strategy: evaluate the whole operand, then
+        // replay its bits through the demand-driven loop. The replay is
+        // what re-enters this same strategy for the *other* operand, so
+        // `push_operand` has to be `Fn` rather than `FnMut` -- exactly the
+        // re-entrancy note [`binary_fanout_each`]'s own `each_operand`
+        // carries. Both existing callers already supply an `Fn`.
+        |expr, bit_sink| {
+            let mut bools = Vec::new();
+            let control = push_operand(expr, &mut bools);
+            for bit in bools {
+                if bit_sink(bit) == Demand::Stop {
+                    return Flow::Stopped { pending: None };
+                }
+            }
+            match control {
+                Some(control) => Flow::Escaped(control),
+                None => Flow::Exhausted,
+            }
+        },
+        left,
+        right,
+        short_circuit,
+        rules,
+        &mut |bit| {
+            out.push(bit);
+            Demand::Continue
+        },
+    );
+
+    match flow {
+        // This sink never stops, so `Stopped` cannot occur -- folded in with
+        // `Exhausted` rather than given an `unreachable!()`, the same
+        // defensive choice [`binary_fanout_core`] makes for its own
+        // impossible `Stopped`.
+        Flow::Exhausted | Flow::Stopped { .. } => (out, None),
+        Flow::Escaped(control) => (out, Some(control)),
+    }
+}
+
+/// **The one definition of the `and`/`or` fanout loop** (#2180 WP2a),
+/// written against the demand-driven sink and parameterized over *how* an
+/// operand's truthiness bits are enumerated -- the same split
+/// [`binary_fanout_each`] already makes for `Compare`/`Arithmetic`
+/// (#1459/#1481), and for the same reason: #768 fixed a bug in the
+/// arithmetic fanout that the then-duplicated path-context copy
+/// independently re-acquired and had to be fixed again for #822. A second
+/// copy of *this* loop for the lazy arms would have been a second chance at
+/// the same drift.
+///
+/// The strategy differs by caller, never the loop:
+///
+/// * [`boolean_fanout_bools`] passes the eager one (evaluate the whole
+///   operand into a `Vec<bool>`, then replay), which is what the two
+///   collecting callers -- [`eval_boolean`] and
+///   `eval_generic::eval_boolean_generic` -- had before WP2a and still have.
+/// * [`each_boolean`] and `eval_generic::each_boolean_generic` pass
+///   [`eval_each`]/`eval_each_generic`, so a wrapping consumer's
+///   [`Demand::Stop`] reaches *inside* an operand -- and, with it, a `?//`
+///   bind in there ([#1519](https://github.com/rust-works/succinctly/issues/1519)'s
+///   retry-on-stop rule). Captured live against jq 1.7.1, input `1`:
+///   `[first((1 as $x ?// $y | 1) and true)]` is `[true,true]`, and so are
+///   the `true and (...)`, `(...) or false` and `false or (...)` spellings;
+///   all four answered once before this arm existed.
+///
+/// **Loop shape, captured from the oracle rather than assumed** (jq 1.7.1,
+/// `-cn`; `debug` writes each output's line twice for a comma branch in
+/// *both* tools, so read the sequence, not the repeat count):
+///
+/// ```text
+/// [("A"|debug, "B"|debug) and ("C"|debug, "D"|debug)]   -> [true,true,true,true]
+///   jq stderr:  A A  C C D  B  C C D      <- left outer, right re-run per left output
+///   before WP2a: A A B  C C D  C C D      <- left finished first, then the pairings
+/// [(false,true) and ("C"|debug)]  -> [false,true],  stderr: C   (once, not twice)
+/// [(true,false) or  ("C"|debug)]  -> [true,true],   stderr: C
+/// [("A"|debug,"B"|debug) or ("C"|debug,"D"|debug)] -> [true,true], stderr: A A B
+/// ```
+///
+/// So: the **left** operand is the outer loop; a left output whose
+/// truthiness equals `short_circuit` (`false` for `and`, `true` for `or`)
+/// contributes that boolean *without evaluating the right operand at all*
+/// (which is what makes `false and error("x")` answer `false`); every other
+/// left output re-evaluates the whole right operand and contributes one
+/// boolean per right output. The eager strategy cannot show the
+/// interleaving -- it has already finished the left operand before the first
+/// pairing -- so only the lazy arms move to jq's own order here.
+///
+/// Controls follow [`boolean_fanout_bools`]'s pre-WP2a rules unchanged
+/// (#400/#494): a *left* escape fires only after the ordinary per-output
+/// loop has run its course, so `(true,error("x")) and false` still emits
+/// `false` and *then* raises; a *right* escape ends the whole expression at
+/// once, since jq's generator stops asking for further left outputs once one
+/// pairing has failed.
+pub(crate) fn boolean_fanout_each(
+    each_operand: impl Fn(&Expr, &mut dyn FnMut(bool) -> Demand) -> Flow,
+    left: &Expr,
+    right: &Expr,
+    short_circuit: bool,
+    rules: BinaryFanoutRules,
+    sink: &mut dyn FnMut(bool) -> Demand,
+) -> Flow {
     // #2470 (yq mode): `and`/`or` evaluate both operands read-only, exactly
     // like arithmetic -- `(.zzz | key) and true` is `false` in real yq while
-    // `"zzz" and true` is `true`. Both operand strategies are eager (a whole
-    // result per call, not a sink), so there is nothing to suspend: the scope
-    // covers only the call itself, and the truthiness push inside it does no
-    // key lookup for `yq_absent_key_read_is_empty` to answer.
-    let mut push_operand = move |expr: &Expr, bools: &mut Vec<bool>| {
-        if !rules.read_only {
-            return push_operand(expr, bools);
-        }
-        let _scope = yq_read_only_context::enter();
-        push_operand(expr, bools)
-    };
-    let mut left_bools = Vec::new();
-    let left_control = push_operand(left, &mut left_bools);
-    // #2460 (yq mode only): an operand that produced *zero* outputs
-    // contributes one `false` truthiness value, which is the whole of yq's
-    // captured `and`/`or` behaviour -- `and` then short-circuits to `false`
-    // without consulting the other side (yq's inconsistency 4), and `or`
-    // falls through to the other operand's own truthiness. The rule lives in
-    // `yq_empty_operand_output`, not here, so `and`/`or` and the arithmetic/
-    // comparison fanout share one definition of "this operand was empty".
-    //
-    // #2540: except that a literal/constructor operand was never really
-    // "empty" in real yq's own model to begin with -- its own operator
-    // special-cases a zero-node context and re-emits one node anyway (see
-    // `yq_empty_context_literal_or_constructor`'s own doc comment). Checked
-    // only when `rules.read_only` is set: this "empty" only exists because
-    // `and`/`or`'s own read-only context turned `.a.zz` into zero nodes in
-    // the first place (#2470), so the same gate that created the emptiness
-    // is what decides whether this rule can override it.
-    if left_bools.is_empty() && left_control.is_none() {
-        match rules
-            .read_only
-            .then(|| yq_empty_context_literal_or_constructor(left))
-            .flatten()
-        {
-            Some(v) => left_bools.push(v.is_truthy()),
-            None => left_bools.extend(empty_boolean_operand(rules.empty)),
-        }
-    }
+    // `"zzz" and true` is `true`. Shared with `binary_fanout_each` since
+    // #2180 WP2a; before that this file applied the scope by hand inside
+    // `boolean_fanout_bools`, around the operand call only, which is why the
+    // `suspend` half was missing there.
+    let each_operand = read_only_operand_strategy(rules, each_operand);
+    // Why the fanout ended, recorded out-of-band because the driving closure
+    // can only answer `Demand` -- the same shape `binary_fanout_each`'s own
+    // `abort` uses.
+    let mut abort: Option<Control> = None;
+    let mut outer_stopped = false;
+    let mut left_seen = 0usize;
 
-    let mut out = vec_with_capacity(left_bools.len());
-    for left_bool in left_bools {
-        if left_bool == short_circuit {
-            out.push(short_circuit);
-            continue;
-        }
-        let before = out.len();
-        if let Some(control) = push_operand(right, &mut out) {
-            return (out, Some(control));
-        }
-        if out.len() == before {
-            // #2540: same rationale as the left-operand check above.
-            match rules
-                .read_only
-                .then(|| yq_empty_context_literal_or_constructor(right))
-                .flatten()
-            {
-                Some(v) => out.push(v.is_truthy()),
-                None => out.extend(empty_boolean_operand(rules.empty)),
+    let mut flow = each_operand(left, &mut |left_bit| {
+        left_seen += 1;
+        boolean_pair_left_bit(
+            left_bit,
+            right,
+            short_circuit,
+            rules,
+            &each_operand,
+            sink,
+            &mut abort,
+            &mut outer_stopped,
+        )
+    });
+
+    // #2460/#2540 (yq mode only): the left operand produced *zero* outputs,
+    // so it contributes one synthesized truthiness bit, which then runs
+    // through the identical pairing body above rather than a second
+    // spelling of it. See [`empty_boolean_operand_bit`] for which bit, and
+    // why a literal/constructor operand is not "empty" at all.
+    if left_seen == 0 && abort.is_none() && matches!(flow, Flow::Exhausted) {
+        if let Some(bit) = empty_boolean_operand_bit(left, rules) {
+            let demand = boolean_pair_left_bit(
+                bit,
+                right,
+                short_circuit,
+                rules,
+                &each_operand,
+                sink,
+                &mut abort,
+                &mut outer_stopped,
+            );
+            if demand == Demand::Stop && abort.is_none() {
+                flow = Flow::Stopped { pending: None };
             }
         }
     }
 
-    (out, left_control)
+    match abort {
+        Some(control) => Flow::Escaped(control),
+        // `and`/`or` never stop on their own account -- the short circuit
+        // skips one *pairing*, it does not end the stream -- so every stop
+        // reaching here is the wrapping consumer's, and
+        // [`finish_short_circuit`] propagates it (and whatever a `?//` retry
+        // turned it into) verbatim.
+        None => finish_short_circuit(outer_stopped, flow),
+    }
+}
+
+/// One left-operand truthiness bit, paired against the right operand --
+/// [`boolean_fanout_each`]'s loop body, split out as a free function so the
+/// ordinary drive and the #2460 synthesized-empty-left bit run the *same*
+/// body rather than two copies of it (the borrow checker will not let one
+/// closure be both the drive's sink and callable again afterwards).
+#[allow(clippy::too_many_arguments)]
+fn boolean_pair_left_bit(
+    left_bit: bool,
+    right: &Expr,
+    short_circuit: bool,
+    rules: BinaryFanoutRules,
+    each_operand: &impl Fn(&Expr, &mut dyn FnMut(bool) -> Demand) -> Flow,
+    sink: &mut dyn FnMut(bool) -> Demand,
+    abort: &mut Option<Control>,
+    outer_stopped: &mut bool,
+) -> Demand {
+    // The short circuit: `false and _` / `true or _` contributes its own
+    // boolean without consulting the right operand at all. Oracle rows in
+    // [`boolean_fanout_each`]'s doc comment.
+    if left_bit == short_circuit {
+        return if sink(short_circuit) == Demand::Stop {
+            *outer_stopped = true;
+            Demand::Stop
+        } else {
+            Demand::Continue
+        };
+    }
+
+    let mut right_seen = 0usize;
+    let right_flow = each_operand(right, &mut |right_bit| {
+        right_seen += 1;
+        sink(right_bit)
+    });
+
+    // #2460/#2540 (yq mode only), the right-operand half -- same rule and
+    // same gate as the left one, only reachable once the right operand ran
+    // to exhaustion (an operand that escaped or was stopped part-way is not
+    // "empty"), exactly as `binary_fanout_each`'s own `inner_seen == 0`
+    // check requires.
+    if right_seen == 0 && matches!(right_flow, Flow::Exhausted) {
+        if let Some(bit) = empty_boolean_operand_bit(right, rules) {
+            if sink(bit) == Demand::Stop {
+                *outer_stopped = true;
+                return Demand::Stop;
+            }
+        }
+    }
+
+    match right_flow {
+        Flow::Exhausted => Demand::Continue,
+        // The consumer's own demand, which ends the outer loop for the same
+        // reason `binary_fanout_each`'s inner `Stopped` does. The right
+        // operand's driving closure above returns `Stop` only when `sink`
+        // does, so this is always the wrapping consumer's verdict.
+        Flow::Stopped { .. } => {
+            *outer_stopped = true;
+            Demand::Stop
+        }
+        // A right-operand escape ends the whole expression immediately,
+        // discarding the left operand's own trailing control -- the
+        // sink-world spelling of the pre-WP2a `return (out, Some(control))`
+        // (#400/#494).
+        Flow::Escaped(control) => {
+            *abort = Some(control);
+            Demand::Stop
+        }
+    }
+}
+
+/// The truthiness bit a *zero-output* `and`/`or` operand contributes, or
+/// `None` for "contribute nothing" (jq mode, always).
+///
+/// Two rules, in the order [`boolean_fanout_bools`] applied them before
+/// #2180 WP2a lifted them out of its loop:
+///
+/// * #2540 -- a literal/constructor operand was never really "empty" in real
+///   yq's own model to begin with; its operator special-cases a zero-node
+///   context and re-emits one node anyway (see
+///   [`yq_empty_context_literal_or_constructor`]). Checked only when
+///   `rules.read_only` is set: this "empty" only exists because `and`/`or`'s
+///   own read-only context turned `.a.zz` into zero nodes in the first place
+///   (#2470), so the same gate that created the emptiness decides whether
+///   this rule can override it.
+/// * #2460 -- otherwise the operand contributes one `false`, which is the
+///   whole of yq's captured `and`/`or` behaviour: `and` then short-circuits
+///   to `false` without consulting the other side (yq's inconsistency 4),
+///   and `or` falls through to the other operand's own truthiness. The rule
+///   itself lives in [`yq_empty_operand_output`], so `and`/`or` and the
+///   arithmetic/comparison fanout share one definition of "this operand was
+///   empty".
+fn empty_boolean_operand_bit(operand: &Expr, rules: BinaryFanoutRules) -> Option<bool> {
+    match rules
+        .read_only
+        .then(|| yq_empty_context_literal_or_constructor(operand))
+        .flatten()
+    {
+        Some(v) => Some(v.is_truthy()),
+        None => empty_boolean_operand(rules.empty),
+    }
 }
 
 /// Backs `eval_arithmetic`/`eval_compare`. Operands are evaluated through
@@ -47600,6 +47964,81 @@ mod tests {
             (b"null", "[nth(1; 1 as $x ?// $y | 5, 6)]"),
             (b"null", "[isempty(1 as $x ?// $y | 5)]"),
             (b"null", "[any(1 as $x ?// $y | true; .)]"),
+            // #2180 WP2a: `//`, `and` and `or` gained native lazy arms
+            // (`each_alternative`, `each_boolean`). This differential is
+            // what guards them against drifting from the eager siblings
+            // they now shadow -- `eval_alternative`/`retain_truthy` and
+            // `eval_boolean`/`boolean_fanout_core`. Every case is
+            // side-effect free, so an always-`Continue` sink must deliver
+            // identical values in identical order; `and`/`or`'s *operand
+            // interleaving* legitimately differs between the two strategies
+            // (see [`drain_result`]'s own caveat for `Expr::Compare`), which
+            // is exactly why nothing here uses `stderr`/`input`.
+            //
+            // `//`: the truthy filter, the "no truthy output" fallback, the
+            // right side's own outputs being emitted unfiltered, and every
+            // terminator on both sides.
+            (b"null", "1 // 2"),
+            (b"null", "(1, false, null, 3) // 2"),
+            (b"null", "(false, null) // (5, 6)"),
+            (b"null", "false // (null, 7)"),
+            (b"null", "empty // 7"),
+            (b"null", "empty // empty"),
+            (b"null", "(1, 2) // error(\"y\")"),
+            (b"null", "(1, false, error(\"x\")) // 2"),
+            (b"null", "(false, error(\"x\")) // 9"),
+            (b"null", "error(\"x\") // 9"),
+            (b"null", "(false, null) // error(\"y\")"),
+            (b"null", "label $o | ((break $o) // 9)"),
+            (b"null", "label $o | ((false, break $o) // 9)"),
+            (b"null", "label $o | ((1, break $o, 2) // 9)"),
+            (b"null", "label $o | ((false, false) // (1, break $o))"),
+            (b"null", "(1, false) // halt_error(3)"),
+            (b"[1,2,3]", ".[] // 9"),
+            (b"{\"a\":1}", ".a // .missing"),
+            (b"{\"a\":1}", ".missing // .a"),
+            // `and`/`or`: the short circuit per left output, multi-output
+            // operands on both sides, the `empty` operand rows, and every
+            // terminator on both sides.
+            (b"null", "true and true"),
+            (b"null", "false and error(\"x\")"),
+            (b"null", "true or error(\"x\")"),
+            (b"null", "(true, false) and (true, false)"),
+            (b"null", "(true, false) or (true, false)"),
+            (b"null", "(1, null) and (2, false)"),
+            (b"null", "empty and true"),
+            (b"null", "true and empty"),
+            (b"null", "empty or true"),
+            (b"null", "true or empty"),
+            (b"null", "empty and empty"),
+            (b"null", "(true, error(\"x\")) and false"),
+            (b"null", "true and (false, error(\"x\"))"),
+            (b"null", "error(\"x\") and true"),
+            (b"null", "false or (true, error(\"x\"))"),
+            (b"null", "label $o | ((true, break $o) and true)"),
+            (b"null", "label $o | (true and (false, break $o))"),
+            (b"null", "label $o | (false or (true, break $o))"),
+            (b"null", "true and halt_error(3)"),
+            (b"[1,2,3]", "(.[] > 1) and true"),
+            (b"{\"a\":1,\"b\":2}", "(.a == 1) or (.b == 9)"),
+            // Nested inside each other and inside the other lazy arms, so
+            // both arms are reached indirectly too.
+            (b"null", "((1, false) // 9) and true"),
+            (b"null", "(true and false) // 9"),
+            (b"null", "[limit(2; (1, 2, 3) // 9)]"),
+            (b"null", "if true then (false // 7) else 9 end"),
+            (b"null", "try ((false, error(\"x\")) // 9) catch 9"),
+            (b"null", "[first((1, 2) // 9)]"),
+            (b"null", "[isempty(false // 9)]"),
+            // Under a `?//` chain -- the shape WP2a exists for. An
+            // always-`Continue` sink must still agree with the eager path.
+            (b"null", "[(1 as $x ?// $y | 5) // 9]"),
+            (b"null", "[(1 as $x ?// $y | false) // 9]"),
+            (b"null", "[null // (1 as $x ?// $y | 1)]"),
+            (b"null", "[(1 as $x ?// $y | 1) and true]"),
+            (b"null", "[true and (1 as $x ?// $y | 1)]"),
+            (b"null", "[(1 as $x ?// $y | 1) or false]"),
+            (b"null", "[false or (1 as $x ?// $y | 1)]"),
         ];
 
         for (json, src) in cases {
