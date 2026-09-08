@@ -76,6 +76,66 @@ impl Param {
     }
 }
 
+/// The payload of an [`Expr::TrackedVar`] marker: the frozen value and
+/// where it was bound (#2042).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tracked {
+    /// The bound value, frozen at bind time.
+    pub value: OwnedValue,
+    /// How `resolve_node` may certify this snapshot against the path
+    /// register -- see [`Origin`].
+    pub origin: Origin,
+}
+
+/// How an [`Expr::TrackedVar`] snapshot may be recognised in path position
+/// (#2042).
+///
+/// jq's own rule is `jv_identical`: a `$var` is usable where the path
+/// register currently points exactly when its value *is* the very same
+/// node the register holds. `OwnedValue` has no node identity, so the
+/// resolver models it two ways:
+///
+/// - [`Origin::Snapshot`] -- the #844/#1466 witness: the value was frozen
+///   from `.` itself (an identity-passthrough binding) or from a fold's
+///   own source element, and is recognised by *value equality plus the
+///   fact that it was never rebuilt*. Sound only while a value-equal
+///   ambient is necessarily the same node, which a root snapshot against
+///   its own proper descendants guarantees (a finite tree cannot contain
+///   itself) -- see #2642 for the rebuilt-copy hole this still has.
+/// - [`Origin::At`] -- the #2042 witness for a binding whose source
+///   *navigated*: the resolver invocation the binding happened in, and the
+///   absolute path (within that invocation) the source resolved to. In a
+///   tree, two nodes are the same node iff they sit at the same path, so
+///   the marker is certified only where the register's own absolute path
+///   equals `path` *and* the invocation matches -- a nested `path()` call
+///   is a second invocation with its own root, and a path from one is
+///   meaningless in the other.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Origin {
+    /// Frozen from the ambient input itself; certified by value equality
+    /// (the pre-#2042 rule, unchanged).
+    Snapshot,
+    /// Frozen from a navigated position; certified by node identity.
+    At {
+        /// The resolver invocation (one `path()`/`del()`/assignment target
+        /// resolution) the binding was made in.
+        invocation: u64,
+        /// The bound node's absolute path within that invocation.
+        path: super::eval::BindPath,
+    },
+}
+
+impl Tracked {
+    /// A marker certified by value equality -- the pre-#2042 shape every
+    /// non-`as` construction site still uses.
+    pub fn snapshot(value: OwnedValue) -> Rc<Self> {
+        Rc::new(Self {
+            value,
+            origin: Origin::Snapshot,
+        })
+    }
+}
+
 /// A jq expression representing a query path.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
@@ -334,7 +394,15 @@ pub enum Expr {
     /// O(1) refcount bump, so the snapshot is allocated once at the outer
     /// binding and shared, not repeatedly re-copied, by every inner
     /// iteration that re-embeds it.
-    TrackedVar(Rc<OwnedValue>),
+    ///
+    /// #2042: the snapshot also records where it was bound
+    /// ([`Tracked::origin`]), so a variable bound from a *navigated*
+    /// position (`.a as $y`) can be certified against the path register
+    /// by node identity rather than by value alone -- two distinct nodes
+    /// holding equal values must not be confused (`path(.a as $y | .c |
+    /// $y)` refuses in jq). Still one `Rc` wide, so `size_of::<Expr>()`
+    /// does not move.
+    TrackedVar(Rc<Tracked>),
 
     /// Location reference: `$__loc__`
     /// Returns `{"file": "<stdin>", "line": N}` where N is the 1-based line number

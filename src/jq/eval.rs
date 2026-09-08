@@ -364,7 +364,8 @@ use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
 
 use super::expr::{
     ArithOp, AssignOp, BoundBody, Builtin, CompareOp, Expr, FormatType, FuncDefBound, FuncDefData,
-    Literal, MergeFlags, NumberKey, ObjectEntry, ObjectKey, Param, Pattern, StringPart,
+    Literal, MergeFlags, NumberKey, ObjectEntry, ObjectKey, Origin, Param, Pattern, StringPart,
+    Tracked,
 };
 use super::value::{
     assert_value_tree_depth, cmp_f64, infinite_float_preview_text, is_infinity_sentinel,
@@ -2400,7 +2401,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Outside `path()`/`del()`/assignment resolution this is just an
         // ordinary bound value -- `resolve_node`'s own `Expr::TrackedVar`
         // arm is what actually decides path-trackability.
-        Expr::TrackedVar(v) => QueryResult::Owned((**v).clone()),
+        Expr::TrackedVar(v) => QueryResult::Owned(v.value.clone()),
         Expr::Loc { line } => {
             // $__loc__ returns {"file": "<stdin>", "line": N}
             // where N is the 1-based line number in the jq filter source
@@ -24661,8 +24662,151 @@ pub(crate) fn slice_component_value(
 /// touches a path — `Rc` needs no new parameters anywhere, which is the
 /// entire point of #1285/#1286's prior migration to a named `PathBranch`
 /// struct: this is a field-type change, not a signature-churning rewrite.
+/// One resolver invocation's identity and the absolute position within it
+/// that the current node sits at (#2042) -- the frame an [`Origin::At`]
+/// marker is certified against.
+///
+/// `invocation` is fresh per resolver entry ([`Frame::enter`]): a nested
+/// `path()` evaluated inside a leaf is a second invocation whose root is
+/// some inner node, and a marker bound in the outer invocation must not
+/// match a path from the inner one (`path(.a as $y | .x | path(.a | $y))`
+/// refuses in jq; the inner `["a"]` is `.x.a`, a different node).
+///
+/// `at` is the absolute path, from this invocation's root, of the position
+/// the path register currently points at: the ambient value itself while
+/// the branch is trackable, or the carried register's own position once a
+/// non-navigating stage has stepped off it (a literal never moves the
+/// register, so `resolve_seq_stage`'s `prefix` stays where the register
+/// is). `None` means the position is not provable -- the safe default,
+/// under which a navigated marker is never certified. Every recursion
+/// site that resolves against a *different* value passes `None` unless it
+/// can extend `at` by a path it built itself; a site that gets this wrong
+/// in the `Some` direction fabricates a path jq refuses, which is the
+/// direction `del()`/`=` then write through, so the default is chosen so
+/// that omission can only ever cost an acceptance, never invent one.
+///
+/// `at` starts as `None` for a program that cannot bind a variable from a
+/// navigated position at all ([`Frame::enter`]'s syntactic gate), so the
+/// per-stage extension below is free for the ordinary write workloads
+/// (`.[] |= f`, `del(.[] | select(..))`) that never use one.
+#[derive(Debug, Clone)]
+pub(crate) struct Frame {
+    invocation: u64,
+    at: Option<Rc<PathPrefix>>,
+}
+
+/// Next [`Frame::invocation`]. A plain atomic rather than a
+/// `thread_local!` so `no_std` embeddings get distinct invocations too.
+static NEXT_INVOCATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+impl Frame {
+    /// A fresh invocation, rooted at `expr`'s input.
+    fn enter(expr: &Expr) -> Self {
+        let invocation = NEXT_INVOCATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let at = may_bind_navigated(expr).then(PathPrefix::root);
+        Self { invocation, at }
+    }
+
+    /// The same invocation at a position this caller cannot prove.
+    fn unknown(&self) -> Self {
+        Self {
+            invocation: self.invocation,
+            at: None,
+        }
+    }
+
+    /// The same invocation, `path` further along from `at`.
+    fn extend(&self, path: &Rc<PathPrefix>) -> Self {
+        let at = self.at.as_ref().map(|at| {
+            if path.depth() == 0 {
+                Rc::clone(at)
+            } else {
+                PathPrefix::extend_many(at, path.to_vec())
+            }
+        });
+        Self {
+            invocation: self.invocation,
+            at,
+        }
+    }
+
+    /// The [`Origin`] for a binding whose source resolved to `path` (relative
+    /// to this frame's position), or `None` when the position is not
+    /// provable and the binding therefore gets no marker.
+    fn origin_at(&self, path: &Rc<PathPrefix>) -> Option<Origin> {
+        self.extend(path).at.map(|path| Origin::At {
+            invocation: self.invocation,
+            path: BindPath(path),
+        })
+    }
+
+    /// Whether a marker with `origin` names exactly this frame's position.
+    /// A [`Origin::Snapshot`] marker carries no position and is always
+    /// admitted here -- its own rule (value equality) is the caller's.
+    fn certifies(&self, origin: &Origin) -> bool {
+        match origin {
+            Origin::Snapshot => true,
+            Origin::At { invocation, path } => {
+                *invocation == self.invocation && self.at.as_ref().is_some_and(|at| *at == path.0)
+            }
+        }
+    }
+}
+
+/// Whether resolving `expr` can bind a variable from a navigated position
+/// -- the syntactic gate on [`Frame::enter`]'s `at`. Any `as` counts, and so
+/// does anything that can hide one: a call or `def` is inlined only as the
+/// resolver reaches it, and an [`Expr::Shared`] argument is opaque to
+/// [`any_subexpr`].
+fn may_bind_navigated(expr: &Expr) -> bool {
+    any_subexpr(expr, &mut |e| {
+        matches!(
+            e,
+            Expr::As { .. }
+                | Expr::AsPattern { .. }
+                | Expr::DefCall { .. }
+                | Expr::FuncCall { .. }
+                | Expr::NamespacedCall { .. }
+                | Expr::FuncDef { .. }
+                | Expr::Shared(_)
+        )
+    })
+}
+
+/// A branch's provenance mark (#1466, generalised by #2042): whether its
+/// value is a frozen variable snapshot rather than something freshly
+/// constructed, and -- for a snapshot bound from a navigated position --
+/// where it was bound.
+///
+/// `Marked(Origin::Snapshot)` is exactly the pre-#2042 `snapshot: true`;
+/// `Marked(Origin::At { .. })` is a navigated marker's mark, recognised
+/// only by [`Frame::certifies`]. Threaded as an ambient parameter alongside
+/// `trackable` through every "passes a value through without navigating"
+/// arm (#1591), because a mark that degraded to the value-only rule on the
+/// way through `select(true)` would let `path(.a as $y | .c | 5 | $y |
+/// select(true))` re-establish at `.c` by value -- the exact confusion
+/// #2042 exists to rule out.
+#[derive(Debug, Clone, PartialEq, Default)]
+enum Snapshot {
+    #[default]
+    No,
+    Marked(Origin),
+}
+
+impl Snapshot {
+    fn is_marked(&self) -> bool {
+        matches!(self, Self::Marked(_))
+    }
+}
+
+/// An [`Origin::At`] marker's absolute bind path (#2042) -- a
+/// [`PathPrefix`] behind a public newtype, so `Expr` (public) can carry it
+/// without exposing the resolver's own path representation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BindPath(Rc<PathPrefix>);
+
 #[derive(Debug, PartialEq)]
-enum PathPrefix {
+pub(crate) enum PathPrefix {
     /// The empty path — `.`, or the root of a fresh chain.
     Root,
     Node {
@@ -24910,7 +25054,7 @@ struct PathBranch<'a> {
     /// rebuilt, so jq would still be holding the same pointer. Without it
     /// `FoldRegister` could only compare values, which promoted every
     /// reconstruction that happened to land on the same value (#1466).
-    snapshot: bool,
+    snapshot: Snapshot,
     /// The value jq's own path *register* (`value_at_path`) holds, when it
     /// is still live at `self.path` but this branch's `value` has moved off
     /// it (#1573).
@@ -24959,7 +25103,7 @@ impl<'a> PathBranch<'a> {
             path,
             value,
             trackable,
-            snapshot: false,
+            snapshot: Snapshot::No,
             // A navigation step's own value is the register (or it is
             // untracked with no register knowledge to pass on) — either
             // way nothing extra to record here (#1573).
@@ -24991,13 +25135,13 @@ impl<'a> PathBranch<'a> {
         path: Rc<PathPrefix>,
         value: Cow<'a, OwnedValue>,
         trackable: bool,
-        snapshot: bool,
+        snapshot: Snapshot,
     ) -> Self {
         Self {
             path,
             value,
             trackable,
-            snapshot: snapshot && !trackable,
+            snapshot: if trackable { Snapshot::No } else { snapshot },
             // #1573: `passthrough` hands a value straight through without
             // navigating, so a live register would survive it — but every
             // one of its call sites sits *inside* a single resolve step,
@@ -25019,19 +25163,20 @@ impl<'a> PathBranch<'a> {
             path: PathPrefix::root(),
             value,
             trackable: false,
-            snapshot: false,
+            snapshot: Snapshot::No,
             register: None,
         }
     }
 
     /// Build an untracked branch that is nonetheless a *frozen variable
-    /// snapshot*, not a reconstruction — see the `snapshot` field (#1466).
-    fn snapshot(value: Cow<'a, OwnedValue>) -> Self {
+    /// snapshot*, not a reconstruction — see the `snapshot` field (#1466);
+    /// `origin` says how it may be recognised (#2042).
+    fn marked(origin: Origin, value: Cow<'a, OwnedValue>) -> Self {
         Self {
             path: PathPrefix::root(),
             value,
             trackable: false,
-            snapshot: true,
+            snapshot: Snapshot::Marked(origin),
             register: None,
         }
     }
@@ -25039,11 +25184,10 @@ impl<'a> PathBranch<'a> {
     /// Rebuild as `untracked`/`snapshot` according to `snapshot`, for the
     /// sites that demote a branch but must not lose its provenance — see
     /// `FoldRegister::relocate` and `resolve_foreach`'s own emission (#1466).
-    fn demoted(snapshot: bool, value: Cow<'a, OwnedValue>) -> Self {
-        if snapshot {
-            Self::snapshot(value)
-        } else {
-            Self::untracked(value)
+    fn demoted(snapshot: Snapshot, value: Cow<'a, OwnedValue>) -> Self {
+        match snapshot {
+            Snapshot::Marked(origin) => Self::marked(origin, value),
+            Snapshot::No => Self::untracked(value),
         }
     }
 
@@ -25058,11 +25202,22 @@ impl<'a> PathBranch<'a> {
     /// shapes, so only the non-primitive `PathBranch::untracked` path is
     /// reachable — but that is a fact about `resolve_leaf`, not about this
     /// type, and it should not be the thing keeping the invariant true.
-    fn into_snapshot(self) -> Self {
+    ///
+    /// #2042: keeps the branch's `register` (the pre-#2042 `into_snapshot`
+    /// rebuilt the branch and dropped it). A navigated marker met from a
+    /// still-trackable position it does not name is not certified here, but
+    /// `resolve_seq_stage` may still re-establish it through the register
+    /// that `resolve_leaf` just recorded -- jq's `jv_identical` admits a
+    /// `null`/`true`/`false` from anywhere, so `path(.a as $y | .c | $y)` on
+    /// `{"a":true,"c":true}` is `["c"]`.
+    fn into_marked(self, origin: &Origin) -> Self {
         if self.trackable {
             self
         } else {
-            Self::snapshot(self.value)
+            Self {
+                snapshot: Snapshot::Marked(origin.clone()),
+                ..self
+            }
         }
     }
 
@@ -25267,14 +25422,14 @@ fn drain_path_result<'a>(
 fn emit_passthrough<'a>(
     value: &'a OwnedValue,
     trackable: bool,
-    snapshot: bool,
+    snapshot: &Snapshot,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
     let branch = PathBranch::passthrough(
         PathPrefix::root(),
         Cow::Borrowed(value),
         trackable,
-        snapshot,
+        snapshot.clone(),
     );
     match sink(branch) {
         Demand::Continue => ResolveFlow::Exhausted,
@@ -25394,11 +25549,13 @@ fn resolve_iterate_sink<'a, S: EvalSemantics>(
 /// and it is what drops a trailing escape the consumer never reached
 /// (jq's `def first(f): label $out | (f, break $out);` never resumes `f`).
 /// Only a stop the *downstream* sink asked for propagates.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: `frame` (#2042) joins `trackable`/`snapshot` as the resolver's third threaded ambient
 fn resolve_bounded_sink<'a, S: EvalSemantics>(
     expr: &Expr,
     value: &'a OwnedValue,
     trackable: bool,
-    snapshot: bool,
+    snapshot: &Snapshot,
+    frame: &Frame,
     keep: Keep,
     n: usize,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
@@ -25413,6 +25570,7 @@ fn resolve_bounded_sink<'a, S: EvalSemantics>(
         value,
         trackable,
         snapshot,
+        frame,
         keep.at_most(n),
         &mut |branch| {
             emitted += 1;
@@ -25463,7 +25621,8 @@ fn resolve_repeat_sink<'a, S: EvalSemantics>(
     f: &Expr,
     value: &'a OwnedValue,
     trackable: bool,
-    snapshot: bool,
+    snapshot: &Snapshot,
+    frame: &Frame,
     keep: Keep,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
@@ -25472,19 +25631,20 @@ fn resolve_repeat_sink<'a, S: EvalSemantics>(
     for _ in 0..MAX_ITERATIONS {
         let mut stopped = false;
         let mut over_budget = false;
-        let flow = resolve_node_sink::<S>(f, value, trackable, snapshot, keep, &mut |branch| {
-            if budget == 0 {
-                over_budget = true;
-                return Demand::Stop;
-            }
-            budget -= 1;
-            if sink(branch) == Demand::Stop {
-                stopped = true;
-                Demand::Stop
-            } else {
-                Demand::Continue
-            }
-        });
+        let flow =
+            resolve_node_sink::<S>(f, value, trackable, snapshot, frame, keep, &mut |branch| {
+                if budget == 0 {
+                    over_budget = true;
+                    return Demand::Stop;
+                }
+                budget -= 1;
+                if sink(branch) == Demand::Stop {
+                    stopped = true;
+                    Demand::Stop
+                } else {
+                    Demand::Continue
+                }
+            });
         if over_budget {
             return ResolveFlow::Escaped(
                 EvalError::new("repeat: maximum iterations exceeded".to_string()).into(),
@@ -25511,12 +25671,14 @@ fn resolve_repeat_sink<'a, S: EvalSemantics>(
 /// rather than collapsing to `Null`'s unlimited passthrough (verified live
 /// against jq 1.7.1: `path(limit(empty; .a,.b))` on `{"a":1,"b":2}` produces
 /// nothing, exit 0).
+#[allow(clippy::too_many_arguments)] // STYLE-0004: `frame` (#2042) joins `trackable`/`snapshot` as the resolver's third threaded ambient
 fn resolve_limit_sink<'a, S: EvalSemantics>(
     n_expr: &Expr,
     expr: &Expr,
     value: &'a OwnedValue,
     trackable: bool,
-    snapshot: bool,
+    snapshot: &Snapshot,
+    frame: &Frame,
     keep: Keep,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
@@ -25524,10 +25686,10 @@ fn resolve_limit_sink<'a, S: EvalSemantics>(
     for n_value in n_values {
         let flow = match classify_limit_n(n_value) {
             Ok(LimitN::Unlimited) => {
-                resolve_node_sink::<S>(expr, value, trackable, snapshot, keep, sink)
+                resolve_node_sink::<S>(expr, value, trackable, snapshot, frame, keep, sink)
             }
             Ok(LimitN::Take(n)) => {
-                resolve_bounded_sink::<S>(expr, value, trackable, snapshot, keep, n, sink)
+                resolve_bounded_sink::<S>(expr, value, trackable, snapshot, frame, keep, n, sink)
             }
             Err(e) => return ResolveFlow::Escaped(e.into()),
         };
@@ -25567,12 +25729,14 @@ fn resolve_limit_sink<'a, S: EvalSemantics>(
 /// `n` is the outer loop and `classify_nth_n` is shared with
 /// `builtin_nth_stream`, for the same anti-drift reason
 /// [`resolve_limit_sink`] shares `classify_limit_n`.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: `frame` (#2042) joins `trackable`/`snapshot` as the resolver's third threaded ambient
 fn resolve_nth_sink<'a, S: EvalSemantics>(
     n_expr: &Expr,
     expr: &Expr,
     value: &'a OwnedValue,
     trackable: bool,
-    snapshot: bool,
+    snapshot: &Snapshot,
+    frame: &Frame,
     keep: Keep,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
@@ -25589,6 +25753,7 @@ fn resolve_nth_sink<'a, S: EvalSemantics>(
             value,
             trackable,
             snapshot,
+            frame,
             keep.at_most(n.saturating_add(1)),
             &mut |branch| {
                 if skipped < n {
@@ -25623,11 +25788,12 @@ fn resolve_node<'a, S: EvalSemantics>(
     expr: &Expr,
     value: &'a OwnedValue,
     trackable: bool,
-    snapshot: bool,
+    snapshot: &Snapshot,
+    frame: &Frame,
     keep: Keep,
 ) -> PathResolveResult<'a> {
     let mut out = Vec::new();
-    let flow = resolve_node_sink::<S>(expr, value, trackable, snapshot, keep, &mut |b| {
+    let flow = resolve_node_sink::<S>(expr, value, trackable, snapshot, frame, keep, &mut |b| {
         out.push(b);
         Demand::Continue
     });
@@ -25671,7 +25837,8 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
     expr: &Expr,
     value: &'a OwnedValue,
     trackable: bool,
-    snapshot: bool,
+    snapshot: &Snapshot,
+    frame: &Frame,
     keep: Keep,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
@@ -25679,9 +25846,11 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // `None`: an ordinary pipe has no externally-known register to
         // inject (#2046) — see `resolve_seq`'s own doc comment.
         Expr::Pipe(exprs) => {
-            resolve_seq_sink::<S>(exprs, value, trackable, snapshot, keep, None, sink)
+            resolve_seq_sink::<S>(exprs, value, trackable, snapshot, frame, keep, None, sink)
         }
-        Expr::Paren(inner) => resolve_node_sink::<S>(inner, value, trackable, snapshot, keep, sink),
+        Expr::Paren(inner) => {
+            resolve_node_sink::<S>(inner, value, trackable, snapshot, frame, keep, sink)
+        }
         // #1371: `path(f)` has to see *through* a call to whatever its body
         // navigates, exactly as it did when the body was substituted in
         // before evaluation began. Binding the call here and resolving the
@@ -25699,18 +25868,20 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             frames,
             bound,
         } => match bind_def_call(def, args, *frames, bound) {
-            Ok(bound) => resolve_node_sink::<S>(bound, value, trackable, snapshot, keep, sink),
+            Ok(bound) => {
+                resolve_node_sink::<S>(bound, value, trackable, snapshot, frame, keep, sink)
+            }
             Err(e) => ResolveFlow::Escaped(e.into()),
         },
         // Transparent, like `Paren`: the wrapped argument is ordinary code
         // whose own navigation is exactly as trackable here as it would be
         // written out in place.
         Expr::Shared(inner) => {
-            resolve_node_sink::<S>(inner, value, trackable, snapshot, keep, sink)
+            resolve_node_sink::<S>(inner, value, trackable, snapshot, frame, keep, sink)
         }
         Expr::Comma(exprs) => {
             for e in exprs {
-                match resolve_node_sink::<S>(e, value, trackable, snapshot, keep, sink) {
+                match resolve_node_sink::<S>(e, value, trackable, snapshot, frame, keep, sink) {
                     ResolveFlow::Exhausted => {}
                     other => return other,
                 }
@@ -25818,7 +25989,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             let (cond_outputs, escape) = eval_owned_multi_keep_partial::<S>(cond, value);
             resolve_cond_fork_sink(cond_outputs, escape, |truthy| {
                 let branch = if truthy { then_branch } else { else_branch };
-                resolve_node_sink::<S>(branch, value, trackable, snapshot, keep, sink)
+                resolve_node_sink::<S>(branch, value, trackable, snapshot, frame, keep, sink)
             })
         }
         // `try expr catch handler` (and `expr?`, sugar for `try expr`):
@@ -25838,15 +26009,15 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // below now raises it correctly by marking the handler's payload
         // untracked, #843.)
         Expr::Try { expr, catch } => {
-            match resolve_node_sink::<S>(expr, value, trackable, snapshot, keep, sink) {
+            match resolve_node_sink::<S>(expr, value, trackable, snapshot, frame, keep, sink) {
                 ResolveFlow::Escaped(EvalEscape::Error(e)) if !e.is_uncatchable() => {
                     drain_path_result(
-                        resolve_catch::<S>(catch.as_deref(), Vec::new(), e.payload(), keep),
+                        resolve_catch::<S>(catch.as_deref(), Vec::new(), e.payload(), frame, keep),
                         sink,
                     )
                 }
                 ResolveFlow::Escaped(EvalEscape::Break(_)) => drain_path_result(
-                    resolve_catch::<S>(catch.as_deref(), Vec::new(), OwnedValue::Null, keep),
+                    resolve_catch::<S>(catch.as_deref(), Vec::new(), OwnedValue::Null, frame, keep),
                     sink,
                 ),
                 other => other,
@@ -25867,7 +26038,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // further out) is not this arm's to catch, so it propagates
         // unchanged along with every other escape.
         Expr::Label { name, body } => {
-            match resolve_node_sink::<S>(body, value, trackable, snapshot, keep, sink) {
+            match resolve_node_sink::<S>(body, value, trackable, snapshot, frame, keep, sink) {
                 ResolveFlow::Escaped(EvalEscape::Break(label)) if label == *name => {
                     ResolveFlow::Exhausted
                 }
@@ -25888,11 +26059,28 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // `path((1, halt_error(3)) as $x | .a)` on `{"a":1}` prints `["a"]`
         // before halting — the `$x=1` iteration's own `body` resolution
         // completing — not nothing.
+        //
+        // #2042: the source is resolved in path position too (see
+        // [`resolve_bind_source`]) so a binding from a navigated position
+        // gets an `Origin::At` marker carrying where it was bound. That
+        // resolution is a witness only -- jq evaluates an `as` source with
+        // path tracking suspended (`subexp_nest > 0`), so the source never
+        // moves the register (`path(.a as $y | .b)` is `["b"]`) and never
+        // raises a path error of its own; the body still resolves against
+        // this arm's own `value`, `trackable` and `frame`, exactly as before.
         Expr::As { expr, var, body } => {
-            let (bound_values, trailing) = eval_owned_expr_fork::<S>(expr, value, false);
-            for bound in bound_values {
-                let substituted = substitute_bound_var(expr, body, var, &bound);
-                match resolve_node_sink::<S>(&substituted, value, trackable, snapshot, keep, sink) {
+            let (bound_values, trailing) = resolve_bind_source::<S>(expr, value, trackable, frame);
+            for (bound, origin) in bound_values {
+                let substituted = substitute_bound_var_at(expr, body, var, &bound, origin);
+                match resolve_node_sink::<S>(
+                    &substituted,
+                    value,
+                    trackable,
+                    snapshot,
+                    frame,
+                    keep,
+                    sink,
+                ) {
                     ResolveFlow::Exhausted => {}
                     other => return other,
                 }
@@ -25964,7 +26152,9 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // syntactically `limit`/`first`'s direct child (#1952). Verified live
         // against jq 1.7.1: `{"a":1} | path(limit(2; if true then repeat(.)
         // else empty end))` is `[]`, `[]`.
-        Expr::Repeat(f) => resolve_repeat_sink::<S>(f, value, trackable, snapshot, keep, sink),
+        Expr::Repeat(f) => {
+            resolve_repeat_sink::<S>(f, value, trackable, snapshot, frame, keep, sink)
+        }
 
         // `first(f)` keeps only the first branch `f` resolves to, which is
         // exactly `limit(1; f)` for path-tracking purposes (#1935).
@@ -25976,7 +26166,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // `builtin_first_stream_propagates_bare_halt`'s own doc comment
         // documents and tests `Builtin::FirstStream` directly.
         Expr::FirstExpr(inner) | Expr::Builtin(Builtin::FirstStream(inner)) => {
-            resolve_bounded_sink::<S>(inner, value, trackable, snapshot, keep, 1, sink)
+            resolve_bounded_sink::<S>(inner, value, trackable, snapshot, frame, keep, 1, sink)
         }
 
         // `limit(n; f)` uses the same `n`-conversion rule as `eval_limit`, so
@@ -25989,17 +26179,17 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // exhaustiveness/parity with the value-mode arm, not
         // coverage-testable through this dispatch.
         Expr::Limit { n, expr } => {
-            resolve_limit_sink::<S>(n, expr, value, trackable, snapshot, keep, sink)
+            resolve_limit_sink::<S>(n, expr, value, trackable, snapshot, frame, keep, sink)
         }
         Expr::Builtin(Builtin::Limit(n, expr)) => {
-            resolve_limit_sink::<S>(n, expr, value, trackable, snapshot, keep, sink)
+            resolve_limit_sink::<S>(n, expr, value, trackable, snapshot, frame, keep, sink)
         }
 
         // `nth(n; f)` (#1952). `Builtin::NthStream` is what a CLI `nth(n; f)`
         // parses to; `Expr::NthExpr` is parser-unreachable but constructible
         // by `eval_generic`'s own rewrites, so both spell the same arm.
         Expr::NthExpr { n, expr } | Expr::Builtin(Builtin::NthStream(n, expr)) => {
-            resolve_nth_sink::<S>(n, expr, value, trackable, snapshot, keep, sink)
+            resolve_nth_sink::<S>(n, expr, value, trackable, snapshot, frame, keep, sink)
         }
 
         // Every remaining shape still resolves eagerly and reaches the sink
@@ -26007,7 +26197,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // result for an always-`Continue` sink -- so this is a missed
         // optimization for a bounded consumer, never a behaviour change.
         other => drain_path_result(
-            resolve_node_eager::<S>(other, value, trackable, snapshot, keep),
+            resolve_node_eager::<S>(other, value, trackable, snapshot, frame, keep),
             sink,
         ),
     }
@@ -26023,7 +26213,8 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
     expr: &Expr,
     value: &'a OwnedValue,
     trackable: bool,
-    snapshot: bool,
+    snapshot: &Snapshot,
+    frame: &Frame,
     keep: Keep,
 ) -> PathResolveResult<'a> {
     match expr {
@@ -26043,14 +26234,14 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
             // a path expression and nothing else until #367 — but when it can,
             // this arm still wants to see only the bare shape.
             Expr::IndexExpr { target, key } => {
-                resolve_index_expr::<S>(target, key, value, true, trackable, keep)
+                resolve_index_expr::<S>(target, key, value, true, trackable, frame, keep)
             }
 
             // `E[S:T]?` is the same bare shape for slice bounds: only a
             // failure to *slice* is covered, never `E`, `S`, or `T`'s own
             // evaluation — see `resolve_slice_expr`'s doc comment.
             Expr::SliceExpr { target, start, end } => {
-                resolve_slice_expr::<S>(target, start, end, value, true, trackable, keep)
+                resolve_slice_expr::<S>(target, start, end, value, true, trackable, frame, keep)
             }
 
             // Every other `?`-wrapped node (`.foo?`, `.[0]?`, ...): evaluation
@@ -26113,28 +26304,29 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
                     inner.as_ref(),
                     Expr::Field(_) | Expr::Index { .. } | Expr::Iterate | Expr::Slice { .. }
                 );
-                let branches = match resolve_node::<S>(inner, value, trackable, snapshot, keep) {
-                    Ok(branches) => branches,
-                    // Only a genuine collection failure prunes to the
-                    // already-resolved prefix: `halt`/`halt_error(n)` is
-                    // never caught by `?`, in path expressions any more than
-                    // in value position (#791), an invalid-path-expression
-                    // complaint survives `?` too (#530), a decode failure
-                    // does as well -- matching the sibling `Expr::Try` arm's
-                    // `is_uncatchable()` guard, since `expr?` is documented
-                    // sugar for `try expr` and the two must agree (#1746) --
-                    // and — only for a bare navigation primitive — so does
-                    // #843's "near attempt" complaint.
-                    Err((prefix, EvalEscape::Error(e)))
-                        if !(e.is_uncatchable()
-                            || (bare_navigation_primitive
-                                && e.is_untracked_navigation_error())) =>
-                    {
-                        prefix
-                    }
-                    Err((prefix, EvalEscape::Break(_))) => prefix,
-                    Err(escape) => return Err(escape),
-                };
+                let branches =
+                    match resolve_node::<S>(inner, value, trackable, snapshot, frame, keep) {
+                        Ok(branches) => branches,
+                        // Only a genuine collection failure prunes to the
+                        // already-resolved prefix: `halt`/`halt_error(n)` is
+                        // never caught by `?`, in path expressions any more than
+                        // in value position (#791), an invalid-path-expression
+                        // complaint survives `?` too (#530), a decode failure
+                        // does as well -- matching the sibling `Expr::Try` arm's
+                        // `is_uncatchable()` guard, since `expr?` is documented
+                        // sugar for `try expr` and the two must agree (#1746) --
+                        // and — only for a bare navigation primitive — so does
+                        // #843's "near attempt" complaint.
+                        Err((prefix, EvalEscape::Error(e)))
+                            if !(e.is_uncatchable()
+                                || (bare_navigation_primitive
+                                    && e.is_untracked_navigation_error())) =>
+                        {
+                            prefix
+                        }
+                        Err((prefix, EvalEscape::Break(_))) => prefix,
+                        Err(escape) => return Err(escape),
+                    };
                 Ok(branches
                     .into_iter()
                     .map(
@@ -26186,11 +26378,11 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
         },
 
         Expr::IndexExpr { target, key } => {
-            resolve_index_expr::<S>(target, key, value, false, trackable, keep)
+            resolve_index_expr::<S>(target, key, value, false, trackable, frame, keep)
         }
 
         Expr::SliceExpr { target, start, end } => {
-            resolve_slice_expr::<S>(target, start, end, value, false, trackable, keep)
+            resolve_slice_expr::<S>(target, start, end, value, false, trackable, frame, keep)
         }
 
         // Every spelling here (`..`, bare `recurse`/`recurse(f)`/
@@ -26225,7 +26417,7 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
             | Builtin::RecurseDown
             | Builtin::RecurseF(_)
             | Builtin::RecurseCond(_, _),
-        ) if !trackable && !snapshot => Err(recurse_untracked_error(value)),
+        ) if !trackable && !snapshot.is_marked() => Err(recurse_untracked_error(value)),
 
         // `..` fans out to every node in the tree (pre-order, self before
         // children), so each needs its own Field/Index chain rather than the
@@ -26251,10 +26443,10 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
         // same reason as just above. `resolve_recurse` itself asserts this
         // rather than re-deriving it (#843 review).
         Expr::Builtin(Builtin::RecurseF(f)) => {
-            resolve_recurse::<S>(f, None, value, trackable, snapshot, keep)
+            resolve_recurse::<S>(f, None, value, trackable, snapshot, frame, keep)
         }
         Expr::Builtin(Builtin::RecurseCond(f, cond)) => {
-            resolve_recurse::<S>(f, Some(cond), value, trackable, snapshot, keep)
+            resolve_recurse::<S>(f, Some(cond), value, trackable, snapshot, frame, keep)
         }
 
         // `a // b`: resolve `a`, keep only its truthy branches — jq's `//`
@@ -26298,16 +26490,16 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
         Expr::Alternative(left, right) => {
             if let Expr::Literal(lit) = unwrap_paren(left) {
                 if !literal_to_owned(lit).is_truthy() {
-                    return resolve_node::<S>(right, value, trackable, snapshot, keep);
+                    return resolve_node::<S>(right, value, trackable, snapshot, frame, keep);
                 }
             }
             let branches: Vec<PathBranch<'a>> =
-                resolve_node::<S>(left, value, trackable, snapshot, keep)?
+                resolve_node::<S>(left, value, trackable, snapshot, frame, keep)?
                     .into_iter()
                     .filter(|b| b.value.is_truthy())
                     .collect();
             if branches.is_empty() {
-                resolve_node::<S>(right, value, trackable, snapshot, keep)
+                resolve_node::<S>(right, value, trackable, snapshot, frame, keep)
             } else {
                 Ok(branches)
             }
@@ -26371,6 +26563,7 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
                 value,
                 trackable,
                 snapshot,
+                frame,
                 keep,
             ),
             _ => resolve_leaf::<S>(expr, value, trackable, snapshot, keep),
@@ -26391,6 +26584,7 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
                 value,
                 trackable,
                 snapshot,
+                frame,
                 keep,
             ),
             _ => resolve_leaf::<S>(expr, value, trackable, snapshot, keep),
@@ -26419,8 +26613,14 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
         // somewhere other than the ambient input can still recognise it.
         // Nothing outside `FoldRegister` reads the flag, so this cannot
         // widen acceptance anywhere else.
-        Expr::TrackedVar(marker_value) => {
-            if trackable && marker_value.as_ref() == value {
+        // #2042: a marker bound from a navigated position (`Origin::At`) is
+        // certified by node identity -- the frame's own absolute position
+        // must be the one the binding resolved to -- never by value alone,
+        // since `.a` and `.c` can hold equal values and jq refuses
+        // `path(.a as $y | .c | $y)`. A `Origin::Snapshot` marker keeps the
+        // value rule above (`Frame::certifies` admits it unconditionally).
+        Expr::TrackedVar(marker) => {
+            if trackable && marker.value == *value && frame.certifies(&marker.origin) {
                 Ok(vec![PathBranch::new(
                     PathPrefix::root(),
                     Cow::Borrowed(value),
@@ -26439,7 +26639,7 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
                 resolve_leaf::<S>(expr, value, trackable, snapshot, keep).map(|branches| {
                     branches
                         .into_iter()
-                        .map(PathBranch::into_snapshot)
+                        .map(|b| b.into_marked(&marker.origin))
                         .collect()
                 })
             }
@@ -26553,7 +26753,7 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
                     // `path(try (.a, error([1,2,3])) catch getpath([]))`
                     // still raises "Invalid path expression with result
                     // [1,2,3]", just via that later check instead of here.
-                    if !trackable && !snapshot && keys.is_empty() {
+                    if !trackable && !snapshot.is_marked() && keys.is_empty() {
                         arg_escape = Some(EvalError::invalid_path_expression(value).into());
                         break;
                     }
@@ -26604,7 +26804,11 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
                         components,
                         current,
                         trackable,
-                        snapshot && keys.is_empty(),
+                        if keys.is_empty() {
+                            snapshot.clone()
+                        } else {
+                            Snapshot::No
+                        },
                     ));
                 }
                 // The argument's own trailing escape only fires once the
@@ -26703,7 +26907,7 @@ fn resolve_leaf<'a, S: EvalSemantics>(
     expr: &Expr,
     value: &'a OwnedValue,
     trackable: bool,
-    snapshot: bool,
+    snapshot: &Snapshot,
     keep: Keep,
 ) -> PathResolveResult<'a> {
     if !trackable {
@@ -26727,7 +26931,7 @@ fn resolve_leaf<'a, S: EvalSemantics>(
                 PathPrefix::root(),
                 Cow::Borrowed(value),
                 false,
-                snapshot,
+                snapshot.clone(),
             )]);
         }
     }
@@ -26987,16 +27191,16 @@ fn untracked_branches(
 /// `push_recursive_branches` never sees `snapshot` at all, so it keeps
 /// building every branch with `PathBranch::new`'s hardcoded `false` for
 /// those, and only the one root entry is patched afterward.
-fn resolve_recursive_descent(
-    value: &OwnedValue,
+fn resolve_recursive_descent<'a>(
+    value: &'a OwnedValue,
     trackable: bool,
-    snapshot: bool,
-) -> Vec<PathBranch<'_>> {
+    snapshot: &Snapshot,
+) -> Vec<PathBranch<'a>> {
     let mut out = Vec::new();
     push_recursive_branches(&PathPrefix::root(), value, trackable, &mut out);
-    if snapshot {
+    if snapshot.is_marked() {
         if let Some(root) = out.first_mut() {
-            root.snapshot = true;
+            root.snapshot = snapshot.clone();
         }
     }
     out
@@ -27087,12 +27291,13 @@ fn resolve_against_cow<'a, S: EvalSemantics>(
     expr: &Expr,
     current: Cow<'a, OwnedValue>,
     trackable: bool,
-    snapshot: bool,
+    snapshot: &Snapshot,
+    frame: &Frame,
     keep: Keep,
 ) -> PathResolveResult<'a> {
     match current {
-        Cow::Borrowed(r) => resolve_node::<S>(expr, r, trackable, snapshot, keep),
-        Cow::Owned(v) => match resolve_node::<S>(expr, &v, trackable, snapshot, keep) {
+        Cow::Borrowed(r) => resolve_node::<S>(expr, r, trackable, snapshot, frame, keep),
+        Cow::Owned(v) => match resolve_node::<S>(expr, &v, trackable, snapshot, frame, keep) {
             Ok(branches) => Ok(branches
                 .into_iter()
                 .map(PathBranch::into_owned_value)
@@ -27113,18 +27318,21 @@ fn resolve_against_cow_sink<'a, S: EvalSemantics>(
     expr: &Expr,
     current: Cow<'a, OwnedValue>,
     trackable: bool,
-    snapshot: bool,
+    snapshot: &Snapshot,
+    frame: &Frame,
     keep: Keep,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
     match current {
-        Cow::Borrowed(r) => resolve_node_sink::<S>(expr, r, trackable, snapshot, keep, sink),
+        Cow::Borrowed(r) => resolve_node_sink::<S>(expr, r, trackable, snapshot, frame, keep, sink),
         // Resolution can only borrow from this local copy, so every branch
         // is forced back to `Cow::Owned` before it can escape the borrow --
         // exactly the clone cost this path always paid, neither more nor less.
-        Cow::Owned(v) => resolve_node_sink::<S>(expr, &v, trackable, snapshot, keep, &mut |b| {
-            sink(b.into_owned_value())
-        }),
+        Cow::Owned(v) => {
+            resolve_node_sink::<S>(expr, &v, trackable, snapshot, frame, keep, &mut |b| {
+                sink(b.into_owned_value())
+            })
+        }
     }
 }
 
@@ -27251,7 +27459,13 @@ fn cannot_move_register(expr: &Expr) -> bool {
                     None => true,
                 }
         }
-        Expr::As { expr, body, .. } => cannot_move_register(expr) && cannot_move_register(body),
+        // #2042: only the *body* can move the register. jq evaluates an
+        // `as` source with path tracking suspended (`subexp_nest > 0`), so
+        // whatever it navigates leaves the register where it was --
+        // confirmed live, `path(.a as $y | .b)` on `{"a":{"b":1},"b":2}` is
+        // `["b"]`, and `path(([{"a":1}] | .[0] | .a) as $y | .)` is `[]`
+        // where the same navigation as a stage would raise.
+        Expr::As { body, .. } => cannot_move_register(body),
 
         // `error` raises; it navigates nothing. Its message expression is
         // still evaluated, so that recurses. Needed by the escaping-prefix
@@ -27321,8 +27535,18 @@ fn cannot_move_register(expr: &Expr) -> bool {
 /// Kept as one function precisely because it is now consulted from two
 /// unrelated places: a second, hand-inlined copy of this rule would be free
 /// to drift from jq's without either copy's tests noticing.
-fn register_identical(register: &OwnedValue, value: &OwnedValue, snapshot: bool) -> bool {
-    value == register && (snapshot || matches!(*value, OwnedValue::Null | OwnedValue::Bool(_)))
+fn register_identical(
+    register: &OwnedValue,
+    register_frame: &Frame,
+    value: &OwnedValue,
+    snapshot: &Snapshot,
+) -> bool {
+    value == register
+        && (matches!(*value, OwnedValue::Null | OwnedValue::Bool(_))
+            || match snapshot {
+                Snapshot::No => false,
+                Snapshot::Marked(origin) => register_frame.certifies(origin),
+            })
 }
 
 /// The register `path()`-tracking compares each `reduce`/`foreach` fold
@@ -27364,6 +27588,9 @@ struct FoldRegister {
     path: Rc<PathPrefix>,
     value: OwnedValue,
     trackable: bool,
+    /// The register's absolute position (#2042): the fold's own frame
+    /// extended by `path`, or unknown once the register has been lost.
+    frame: Frame,
 }
 
 impl FoldRegister {
@@ -27385,6 +27612,7 @@ impl FoldRegister {
         init_branch: &PathBranch<'_>,
         value: &OwnedValue,
         trackable: bool,
+        frame: &Frame,
     ) -> (Self, OwnedValue) {
         let acc = init_branch.value.clone().into_owned();
         let reg = if init_branch.trackable {
@@ -27392,12 +27620,14 @@ impl FoldRegister {
                 path: Rc::clone(&init_branch.path),
                 value: acc.clone(),
                 trackable: true,
+                frame: frame.extend(&init_branch.path),
             }
         } else {
             Self {
                 path: PathPrefix::root(),
                 value: value.clone(),
                 trackable,
+                frame: frame.clone(),
             }
         };
         (reg, acc)
@@ -27418,9 +27648,9 @@ impl FoldRegister {
     /// register" without a second `identical()` call here. `None` (no
     /// branch survived a step, or this is a fresh accumulator with nothing
     /// to compare) answers `(false, false)`.
-    fn branch_provenance(&self, branch: Option<&PathBranch<'_>>) -> (bool, bool) {
+    fn branch_provenance(&self, branch: Option<&PathBranch<'_>>) -> (bool, Snapshot) {
         let at_register = branch.is_some_and(|b| b.trackable && b.path == self.path);
-        let snapshot = branch.is_some_and(|b| b.snapshot);
+        let snapshot = branch.map_or(Snapshot::No, |b| b.snapshot.clone());
         (at_register, snapshot)
     }
 
@@ -27476,21 +27706,32 @@ impl FoldRegister {
         expr: &Expr,
         input: OwnedValue,
         at_register: bool,
-        snapshot: bool,
+        snapshot: &Snapshot,
         keep: Keep,
     ) -> PathResolveResult<'a> {
         let tr = self.trackable && at_register;
+        // #2042: the register's own position is what a navigated marker in
+        // UPDATE/EXTRACT is certified against -- whether or not the
+        // accumulator itself currently sits there (the seed below carries
+        // the register for exactly that case). A lost register has no
+        // position to offer.
+        let update_frame = if self.trackable {
+            self.frame.clone()
+        } else {
+            self.frame.unknown()
+        };
         let resolved = if let Expr::Pipe(exprs) = unwrap_paren(expr) {
             resolve_seq::<S>(
                 exprs,
                 &input,
                 tr,
                 snapshot,
+                &update_frame,
                 keep,
                 self.trackable.then_some(&self.value),
             )
         } else {
-            resolve_node::<S>(expr, &input, tr, snapshot, keep)
+            resolve_node::<S>(expr, &input, tr, snapshot, &update_frame, keep)
         };
         let owned = match resolved {
             Ok(branches) => Ok(branches
@@ -27528,7 +27769,8 @@ impl FoldRegister {
     /// and `=`/`|=`/`del()` through it wrote to a document jq leaves
     /// untouched.
     fn identical(&self, branch: &PathBranch<'_>) -> bool {
-        self.trackable && register_identical(&self.value, &branch.value, branch.snapshot)
+        self.trackable
+            && register_identical(&self.value, &self.frame, &branch.value, &branch.snapshot)
     }
 
     fn relocate<'a>(&self, branches: Vec<PathBranch<'a>>) -> Vec<PathBranch<'a>> {
@@ -27606,24 +27848,27 @@ impl FoldRegister {
     /// direction-classified differential fuzz showing zero
     /// accept-where-jq-refuses cases) is not satisfiable while a known
     /// instance of that exact class sits live in the same subsystem.
-    fn advance(&self, branch: &PathBranch<'_>, update_expr: &Expr) -> Self {
+    fn advance(&self, branch: &PathBranch<'_>, update_expr: &Expr, fold_frame: &Frame) -> Self {
         if branch.trackable {
             Self {
                 path: Rc::clone(&branch.path),
                 value: branch.value.clone().into_owned(),
                 trackable: true,
+                frame: fold_frame.extend(&branch.path),
             }
         } else if cannot_move_register(update_expr) {
             Self {
                 path: Rc::clone(&self.path),
                 value: self.value.clone(),
                 trackable: self.trackable,
+                frame: self.frame.clone(),
             }
         } else {
             Self {
                 path: PathPrefix::root(),
                 value: OwnedValue::Null,
                 trackable: false,
+                frame: self.frame.unknown(),
             }
         }
     }
@@ -27731,7 +27976,8 @@ fn resolve_fold_source<S: EvalSemantics>(
     source: &Expr,
     value: &OwnedValue,
     trackable: bool,
-    snapshot: bool,
+    snapshot: &Snapshot,
+    frame: &Frame,
 ) -> (Vec<FoldSourceValue>, Option<Control>) {
     let has_navigation = any_subexpr(source, &mut |e| {
         matches!(
@@ -27748,7 +27994,7 @@ fn resolve_fold_source<S: EvalSemantics>(
     } else {
         Keep::First
     };
-    let resolved = resolve_node::<S>(source, value, trackable, snapshot, keep);
+    let resolved = resolve_node::<S>(source, value, trackable, snapshot, frame, keep);
     if S::TAG != EvalTag::Jq {
         // Yq: branches discarded, only the fatal escape kept (#1467's
         // original shape) -- see this function's doc comment.
@@ -27817,6 +28063,146 @@ struct FoldSourceValue {
 /// [`resolve_node`] at all (yq mode, and a source with no navigation
 /// shape) -- their values carry no path-navigation provenance to seed a
 /// per-step register from.
+/// Evaluate an `as`-binding's source in path position, for
+/// `resolve_node`'s `Expr::As` arm (#2042): each bound value paired with
+/// the [`Origin`] its marker should carry -- `Some(Origin::At { .. })` when
+/// the source navigated to a real path from a provable position, `None`
+/// otherwise (the caller then applies the pre-#2042 `is_identity_passthrough`
+/// rule, which is what a plain `. as $x` still gets).
+///
+/// The path-mode resolution is a **witness, not the evaluation**: real jq
+/// runs an `as` source with path tracking suspended, so it never raises a
+/// path error and never moves the register. Accordingly:
+///
+/// - an untracked-navigation error from the resolver (`([1]|first|.a) as
+///   $y` navigates a computed value, which the resolver refuses but jq
+///   evaluates fine) falls back to the value evaluator, with no origins --
+///   the one place the source is evaluated twice, and only when it
+///   navigated inside a construction; any other escape keeps the
+///   resolver's own prefix and escape, whose partial-prefix contract
+///   already mirrors `eval_owned_expr_fork`'s (`path((.a, error("x")) as
+///   $y | .a | $y)` prints `["a"]` before raising `x`, as jq does);
+/// - a source that is itself a navigated marker (`$y as $z`, `($y) as $z`)
+///   binds the very same node, so `$z` inherits `$y`'s origin outright;
+/// - anything that cannot yield an origin -- yq mode, an untracked ambient,
+///   an unknown frame position, a source with no navigation in it -- goes
+///   straight to the value evaluator, unchanged from before #2042.
+fn resolve_bind_source<S: EvalSemantics>(
+    source: &Expr,
+    value: &OwnedValue,
+    trackable: bool,
+    frame: &Frame,
+) -> (Vec<(OwnedValue, Option<Origin>)>, Option<Control>) {
+    let by_value = || {
+        let (values, control) = eval_owned_expr_fork::<S>(source, value, false);
+        (values.into_iter().map(|v| (v, None)).collect(), control)
+    };
+    if S::TAG != EvalTag::Jq {
+        return by_value();
+    }
+    if let Expr::TrackedVar(marker) = unwrap_paren(source) {
+        if matches!(marker.origin, Origin::At { .. }) {
+            return (
+                vec![(marker.value.clone(), Some(marker.origin.clone()))],
+                None,
+            );
+        }
+    }
+    // `$y | .b` (and `($y | .b)`, `$y.b`): the source navigates *from* a
+    // navigated marker's own node, so it is re-rooted there -- resolved
+    // against the marker's value in a frame sitting at the marker's own
+    // absolute path, in the marker's own invocation. In a tree the node
+    // reached that way is unique, so `($y | .b) as $w | .a.b | $w` binds
+    // `$w` to exactly `.a.b`'s node (jq `["a","b"]`). Any other head falls
+    // to the ordinary resolution below, against this arm's own `value`.
+    if let Expr::Pipe(stages) = unwrap_paren(source) {
+        if let Some((Expr::TrackedVar(marker), rest)) =
+            stages.split_first().map(|(h, r)| (unwrap_paren(h), r))
+        {
+            if let Origin::At { invocation, path } = &marker.origin {
+                let rerooted = Frame {
+                    invocation: *invocation,
+                    at: Some(Rc::clone(&path.0)),
+                };
+                let rest = Expr::Pipe(rest.to_vec());
+                return resolve_bind_source_in::<S>(
+                    &rest,
+                    &marker.value,
+                    true,
+                    &rerooted,
+                    by_value,
+                );
+            }
+        }
+    }
+    if !trackable || frame.at.is_none() || !source_navigates(source) {
+        return by_value();
+    }
+    resolve_bind_source_in::<S>(source, value, trackable, frame, by_value)
+}
+
+/// [`resolve_bind_source`]'s path-mode resolution proper, against `value`
+/// sitting at `frame`; `by_value` is the fallback for an untracked
+/// navigation the resolver refuses but jq's suspended tracking evaluates.
+fn resolve_bind_source_in<S: EvalSemantics>(
+    source: &Expr,
+    value: &OwnedValue,
+    trackable: bool,
+    frame: &Frame,
+    by_value: impl Fn() -> (Vec<(OwnedValue, Option<Origin>)>, Option<Control>),
+) -> (Vec<(OwnedValue, Option<Origin>)>, Option<Control>) {
+    let bind = |b: PathBranch<'_>| {
+        let origin = if b.trackable {
+            frame.origin_at(&b.path)
+        } else {
+            None
+        };
+        (b.value.into_owned(), origin)
+    };
+    match resolve_node::<S>(
+        source,
+        value,
+        trackable,
+        &Snapshot::No,
+        frame,
+        Keep::AtMost(usize::MAX),
+    ) {
+        Ok(branches) => (branches.into_iter().map(bind).collect(), None),
+        Err((_, EvalEscape::Error(e))) if e.is_untracked_navigation_error() => by_value(),
+        Err((prefix, escape)) => (
+            prefix.into_iter().map(bind).collect(),
+            Some(Control::from(escape)),
+        ),
+    }
+}
+
+/// Whether `source` contains any navigation at all -- the cheap gate on
+/// [`resolve_bind_source`]'s path-mode resolution. Wider than
+/// [`resolve_fold_source`]'s (`getpath`, computed index/slice and the
+/// recurse family included), since here the only cost of a `true` is a
+/// path-mode walk whose errors fall back anyway.
+fn source_navigates(source: &Expr) -> bool {
+    any_subexpr(source, &mut |e| {
+        matches!(
+            e,
+            Expr::Field(_)
+                | Expr::Index { .. }
+                | Expr::Slice { .. }
+                | Expr::Iterate
+                | Expr::IndexExpr { .. }
+                | Expr::SliceExpr { .. }
+                | Expr::RecursiveDescent
+                | Expr::Builtin(
+                    Builtin::GetPath(_)
+                        | Builtin::Recurse
+                        | Builtin::RecurseDown
+                        | Builtin::RecurseF(_)
+                        | Builtin::RecurseCond(_, _)
+                )
+        )
+    })
+}
+
 fn no_fold_register(values: Vec<OwnedValue>) -> Vec<FoldSourceValue> {
     values
         .into_iter()
@@ -27834,7 +28220,10 @@ fn no_fold_register(values: Vec<OwnedValue>) -> Vec<FoldSourceValue> {
 struct FoldSourceAmbient<'v> {
     value: &'v OwnedValue,
     trackable: bool,
-    snapshot: bool,
+    snapshot: Snapshot,
+    /// The frame `value` sits in (#2042): the fold's own for the document
+    /// ambient, unknown for the later forks' `null`.
+    frame: Frame,
     /// Whether a trackable SOURCE branch's own path is *relative to*
     /// `reg.path` rather than absolute, so [`relocate_source_registers`]
     /// has to rebase it. Only ever `true` on a `null`-ambient fork whose
@@ -27892,7 +28281,8 @@ fn fold_source_ambient<'v>(
     value: &'v OwnedValue,
     null: &'v OwnedValue,
     trackable: bool,
-    snapshot: bool,
+    snapshot: &Snapshot,
+    frame: &Frame,
 ) -> FoldSourceAmbient<'v> {
     if fork_index == 0 {
         // #2031: `doc_branch` stands for the document itself (SOURCE's own
@@ -27912,13 +28302,14 @@ fn fold_source_ambient<'v>(
             PathPrefix::root(),
             Cow::Borrowed(value),
             trackable,
-            snapshot,
+            snapshot.clone(),
         );
         let (source_trackable, source_snapshot) = reg.branch_provenance(Some(&doc_branch));
         return FoldSourceAmbient {
             value,
             trackable: source_trackable,
             snapshot: source_snapshot,
+            frame: frame.clone(),
             relocate: false,
         };
     }
@@ -27928,11 +28319,13 @@ fn fold_source_ambient<'v>(
     // "does the register recognise a `null`", which is a *value* question
     // `register_identical` owns. `snapshot: false` -- a freshly-substituted
     // `null` is not a frozen `$var` binding.
-    let at_register = reg.trackable && register_identical(&reg.value, null, false);
+    let at_register =
+        reg.trackable && register_identical(&reg.value, &reg.frame, null, &Snapshot::No);
     FoldSourceAmbient {
         value: null,
         trackable: at_register,
-        snapshot: false,
+        snapshot: Snapshot::No,
+        frame: frame.unknown(),
         relocate: at_register && reg.path.depth() > 0,
     }
 }
@@ -27985,7 +28378,8 @@ fn resolve_reduce<'a, S: EvalSemantics>(
     update: &Expr,
     value: &'a OwnedValue,
     trackable: bool,
-    snapshot: bool,
+    snapshot: &Snapshot,
+    frame: &Frame,
     keep: Keep,
 ) -> PathResolveResult<'a> {
     // INIT resolved first, before SOURCE (#2031, reordered from the
@@ -28003,7 +28397,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
     // nothing ever runs an UPDATE step to overwrite it (an empty `input`
     // stream — see `acc_snapshot` below).
     let (init_branches, init_escape) =
-        match resolve_node::<S>(init, value, trackable, snapshot, keep) {
+        match resolve_node::<S>(init, value, trackable, snapshot, frame, keep) {
             Ok(branches) => (branches, None),
             Err((prefix, e)) => (prefix, Some(e)),
         };
@@ -28019,14 +28413,21 @@ fn resolve_reduce<'a, S: EvalSemantics>(
     // `null` ambient back as a borrow rather than allocating one per fork.
     let null_ambient = OwnedValue::Null;
     for (fork_index, init_branch) in init_branches.iter().enumerate() {
-        let (reg, acc) = FoldRegister::enter(init_branch, value, trackable);
+        let (reg, acc) = FoldRegister::enter(init_branch, value, trackable, frame);
 
         // #2031: SOURCE runs immediately after INIT against the same
         // shared register real jq threads through the whole construct.
         // #2388: and only the *first* INIT fork sees the fold's own input
         // as that SOURCE's ambient `.` -- see `fold_source_ambient`.
-        let ambient =
-            fold_source_ambient(fork_index, &reg, value, &null_ambient, trackable, snapshot);
+        let ambient = fold_source_ambient(
+            fork_index,
+            &reg,
+            value,
+            &null_ambient,
+            trackable,
+            snapshot,
+            frame,
+        );
         // Mirrors `eval_reduce`'s own source-stream handling: `reduce`'s
         // output is always single-shot, so a `Partial` input just extracts
         // the control and drops the prefix (there's no path-tracking
@@ -28036,8 +28437,13 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         // `foreach` has a prefix to stream first (#1872). Whatever earlier
         // INIT forks already emitted into `out` survives, same as any
         // other mid-loop abort below.
-        let (mut input_values, input_escape) =
-            resolve_fold_source::<S>(input, ambient.value, ambient.trackable, ambient.snapshot);
+        let (mut input_values, input_escape) = resolve_fold_source::<S>(
+            input,
+            ambient.value,
+            ambient.trackable,
+            &ambient.snapshot,
+            &ambient.frame,
+        );
         if ambient.relocate {
             relocate_source_registers(&mut input_values, &reg.path);
         }
@@ -28087,7 +28493,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         // register's own seeding (`enter`) is the `acc == reg.value` case,
         // which is a genuine navigation to the register's own path.
         let mut acc_at_register = init_branch.trackable;
-        let mut acc_snapshot = init_branch.snapshot;
+        let mut acc_snapshot = init_branch.snapshot.clone();
         let mut aborted: Option<Control> = None;
         // #2031: unlike `resolve_foreach` below, every step here is checked
         // against the fold's own persistent `reg`, never a per-step
@@ -28122,7 +28528,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                 }
             };
             let acc_input = acc.take().unwrap_or(OwnedValue::Null);
-            match reg.resolve::<S>(substituted, acc_input, acc_at_register, acc_snapshot, keep) {
+            match reg.resolve::<S>(substituted, acc_input, acc_at_register, &acc_snapshot, keep) {
                 Ok(branches) => {
                     // Only the last output of a multi-output UPDATE
                     // becomes the new accumulator (same rule as
@@ -28236,7 +28642,8 @@ fn resolve_foreach<'a, S: EvalSemantics>(
     extract: Option<&Expr>,
     value: &'a OwnedValue,
     trackable: bool,
-    snapshot: bool,
+    snapshot: &Snapshot,
+    frame: &Frame,
     keep: Keep,
 ) -> PathResolveResult<'a> {
     // Ambient `snapshot` threaded the same way `resolve_reduce` threads it
@@ -28245,7 +28652,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
     // `resolve_reduce` and for the same reason — see that function's own
     // doc comment.
     let (init_branches, init_escape) =
-        match resolve_node::<S>(init, value, trackable, snapshot, keep) {
+        match resolve_node::<S>(init, value, trackable, snapshot, frame, keep) {
             Ok(branches) => (branches, None),
             Err((prefix, e)) => (prefix, Some(e)),
         };
@@ -28258,21 +28665,33 @@ fn resolve_foreach<'a, S: EvalSemantics>(
     // #2388: see `resolve_reduce`'s identical hoist.
     let null_ambient = OwnedValue::Null;
     for (fork_index, init_branch) in init_branches.iter().enumerate() {
-        let (reg, mut state) = FoldRegister::enter(init_branch, value, trackable);
+        let (reg, mut state) = FoldRegister::enter(init_branch, value, trackable, frame);
 
         // #2031/#2388: see `resolve_reduce`'s identical derivation —
         // SOURCE's own ambient value, trackability and snapshot mark are
         // all recomputed per INIT fork from wherever that fork's own
         // register stands after INIT ran.
-        let ambient =
-            fold_source_ambient(fork_index, &reg, value, &null_ambient, trackable, snapshot);
+        let ambient = fold_source_ambient(
+            fork_index,
+            &reg,
+            value,
+            &null_ambient,
+            trackable,
+            snapshot,
+            frame,
+        );
         // Unlike `reduce`, a `Partial` source stream's own prefix is
         // iterated below — mirrors `eval_foreach`'s identical rule, and
         // #1467's path-check escape is now just another such trailing
         // control rather than a short-circuit ahead of this call, which is
         // what lets the elements produced before it still stream (#1872).
-        let (mut input_values, input_control) =
-            resolve_fold_source::<S>(input, ambient.value, ambient.trackable, ambient.snapshot);
+        let (mut input_values, input_control) = resolve_fold_source::<S>(
+            input,
+            ambient.value,
+            ambient.trackable,
+            &ambient.snapshot,
+            &ambient.frame,
+        );
         if ambient.relocate {
             relocate_source_registers(&mut input_values, &reg.path);
         }
@@ -28316,7 +28735,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
         // own doc comment for why this can no longer be re-derived from a
         // bare `==` inside `resolve` itself.
         let mut state_at_register = init_branch.trackable;
-        let mut state_snapshot = init_branch.snapshot;
+        let mut state_snapshot = init_branch.snapshot.clone();
         let mut aborted: Option<Control> = None;
         'input: for (elem, step) in input_values.iter().zip(&substituted) {
             if let Some(control) = charge_budget(&mut budget, "foreach") {
@@ -28338,8 +28757,14 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                         path: Rc::clone(path),
                         value: elem.value.clone(),
                         trackable: true,
+                        frame: frame.extend(path),
                     };
-                    let at_register = register_identical(&step_reg.value, &state, state_snapshot);
+                    let at_register = register_identical(
+                        &step_reg.value,
+                        &step_reg.frame,
+                        &state,
+                        &state_snapshot,
+                    );
                     (step_reg, at_register)
                 }
                 // #2161: `state_at_register` cannot come from the previous
@@ -28409,18 +28834,19 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                         path: Rc::clone(&reg.path),
                         value: reg.value.clone(),
                         trackable: reg.trackable,
+                        frame: reg.frame.clone(),
                     },
                     state_at_register
                         || (S::TAG == EvalTag::Jq
                             && reg.trackable
-                            && register_identical(&reg.value, &state, state_snapshot)),
+                            && register_identical(&reg.value, &reg.frame, &state, &state_snapshot)),
                 ),
             };
             let update_branches = match active_reg.resolve::<S>(
                 substituted_update,
                 state,
                 active_at_register,
-                state_snapshot,
+                &state_snapshot,
                 keep,
             ) {
                 Ok(branches) => branches,
@@ -28435,7 +28861,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                         aborted = Some(control);
                         break 'input;
                     }
-                    let extract_reg = active_reg.advance(update_branch, substituted_update);
+                    let extract_reg = active_reg.advance(update_branch, substituted_update, frame);
                     // `update_branch` is itself already relocated (it's
                     // `active_reg.resolve()`'s own output above), and
                     // `advance()` built `extract_reg` from this same
@@ -28449,7 +28875,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                         ext_expr,
                         update_branch.value.clone().into_owned(),
                         extract_at_register,
-                        extract_snapshot,
+                        &extract_snapshot,
                         keep,
                     ) {
                         Ok(branches) => out.extend(branches),
@@ -28472,7 +28898,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                     // another fold (#1466) — same rule as `relocate`'s own
                     // demotion arm.
                     out.push(PathBranch::demoted(
-                        update_branch.snapshot,
+                        update_branch.snapshot.clone(),
                         update_branch.value.clone(),
                     ));
                 }
@@ -28563,6 +28989,7 @@ fn resolve_catch<'a, S: EvalSemantics>(
     catch: Option<&Expr>,
     prefix: Vec<PathBranch<'a>>,
     payload: OwnedValue,
+    frame: &Frame,
     keep: Keep,
 ) -> PathResolveResult<'a> {
     let Some(catch_expr) = catch else {
@@ -28571,7 +28998,14 @@ fn resolve_catch<'a, S: EvalSemantics>(
     let mut out = prefix;
     // A caught error/break payload is never a snapshot (#1591): jq's own
     // handler binding is unrelated to any `$x` frozen elsewhere in scope.
-    match resolve_against_cow::<S>(catch_expr, Cow::Owned(payload), false, false, keep) {
+    match resolve_against_cow::<S>(
+        catch_expr,
+        Cow::Owned(payload),
+        false,
+        &Snapshot::No,
+        &frame.unknown(),
+        keep,
+    ) {
         Ok(branches) => out.extend(branches),
         Err((branches, e)) => {
             out.extend(branches);
@@ -28786,7 +29220,8 @@ fn resolve_recurse<'a, S: EvalSemantics>(
     cond: Option<&Expr>,
     value: &'a OwnedValue,
     trackable: bool,
-    snapshot: bool,
+    snapshot: &Snapshot,
+    frame: &Frame,
     keep: Keep,
 ) -> PathResolveResult<'a> {
     // Every caller in `resolve_node` already short-circuits on the shared
@@ -28804,7 +29239,7 @@ fn resolve_recurse<'a, S: EvalSemantics>(
     // an invariant that only lives in a comment is one a later edit can
     // quietly break).
     debug_assert!(
-        trackable || snapshot,
+        trackable || snapshot.is_marked(),
         "resolve_recurse called with trackable=false, snapshot=false; the \
          untracked recurse-family guard in resolve_node should have caught \
          this first"
@@ -28818,7 +29253,7 @@ fn resolve_recurse<'a, S: EvalSemantics>(
         PathPrefix::root(),
         Cow::Borrowed(value),
         trackable,
-        snapshot,
+        snapshot.clone(),
     )];
     // Set by `queue_recurse_children` once `f` itself ends in an
     // error/break/halt — see that function's doc comment (#842).
@@ -28864,7 +29299,7 @@ fn resolve_recurse<'a, S: EvalSemantics>(
             // Carried, not assumed `false` (#1591): this is the value the
             // caller actually observes, so it is the one whose provenance a
             // downstream `FoldRegister` reads.
-            snapshot: node_snapshot,
+            snapshot: node_snapshot.clone(),
         });
 
         let is_null_current = matches!(current.as_ref(), OwnedValue::Null);
@@ -28892,11 +29327,17 @@ fn resolve_recurse<'a, S: EvalSemantics>(
         // parameter (#1591): `f` is resolved against *this* node, whichever
         // one was just popped, and that node's own mark is what a
         // pass-through arm inside `f` (e.g. a bare `.`) must inherit.
-        let (children, mut deferred_error) =
-            match resolve_against_cow::<S>(f, current, node_trackable, node_snapshot, keep) {
-                Ok(children) => (children, None),
-                Err((partial_children, e)) => (partial_children, Some(e)),
-            };
+        let (children, mut deferred_error) = match resolve_against_cow::<S>(
+            f,
+            current,
+            node_trackable,
+            &node_snapshot,
+            &frame.unknown(),
+            keep,
+        ) {
+            Ok(children) => (children, None),
+            Err((partial_children, e)) => (partial_children, Some(e)),
+        };
 
         // Collected in encounter order, then pushed onto `stack` reversed
         // (see the doc comment above) so the first entry here is the next
@@ -28972,7 +29413,7 @@ fn resolve_recurse<'a, S: EvalSemantics>(
                                 // Same propagation as the `None` arm above
                                 // (#1591); `cond` gates whether the child is
                                 // queued, not where its value came from.
-                                snapshot: child_snapshot,
+                                snapshot: child_snapshot.clone(),
                             });
                         })
                     {
@@ -29100,6 +29541,7 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
     value: &'a OwnedValue,
     optional: bool,
     trackable: bool,
+    frame: &Frame,
     keep: Keep,
 ) -> PathResolveResult<'a> {
     // Keeps `key`'s partial prefix (not `eval_owned_multi`'s all-or-nothing)
@@ -29192,11 +29634,11 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
         // breaks the frozen-pointer identity regardless of ambient) — so
         // `false` here is provably unobservable, not a real decision
         // (#1591).
-        let (branches, this_escape) = match resolve_node::<S>(target, value, trackable, false, keep)
-        {
-            Ok(branches) => (branches, None),
-            Err((prefix, e)) => (prefix, Some(e)),
-        };
+        let (branches, this_escape) =
+            match resolve_node::<S>(target, value, trackable, &Snapshot::No, frame, keep) {
+                Ok(branches) => (branches, None),
+                Err((prefix, e)) => (prefix, Some(e)),
+            };
 
         // #843: `target` can also resolve successfully with `trackable:
         // false` through `Builtin::GetPath`'s own deliberate exemption
@@ -29357,6 +29799,7 @@ fn resolve_index_expr<'a, S: EvalSemantics>(
 ///   bound (`Array/string slice indices must be integers` is not swallowed
 ///   either) — unlike [`resolve_index_expr`]'s `key_to_path_component`,
 ///   whose optional-gated type check is *not* the shape to copy here.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: `frame` (#2042) joins `trackable`/`snapshot` as the resolver's third threaded ambient
 fn resolve_slice_expr<'a, S: EvalSemantics>(
     target: &Expr,
     start: &Option<Box<Expr>>,
@@ -29364,6 +29807,7 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
     value: &'a OwnedValue,
     optional: bool,
     trackable: bool,
+    frame: &Frame,
     keep: Keep,
 ) -> PathResolveResult<'a> {
     let (starts, starts_escape) =
@@ -29501,7 +29945,7 @@ fn resolve_slice_expr<'a, S: EvalSemantics>(
         let mut target_escape: Option<EvalEscape> = None;
         for (e, e_key) in &ends {
             let (branches, this_escape) =
-                match resolve_node::<S>(target, value, trackable, false, keep) {
+                match resolve_node::<S>(target, value, trackable, &Snapshot::No, frame, keep) {
                     Ok(branches) => (branches, None),
                     Err((prefix, e)) => (prefix, Some(e)),
                 };
@@ -29991,7 +30435,11 @@ fn apply_static_tail_one<'a, S: EvalSemantics>(
         // variable snapshot survives it unchanged; a non-empty one
         // navigated *into* the value and so produced a different one,
         // which is no longer the snapshot (#1466).
-        snapshot: snapshot && tail.is_empty(),
+        snapshot: if tail.is_empty() {
+            snapshot
+        } else {
+            Snapshot::No
+        },
         // The register survives for exactly the same reason, and fails
         // to for a different one: an empty tail navigates nothing, so a
         // register live at `prefix` is still live here; a non-empty one
@@ -30010,7 +30458,7 @@ fn apply_static_tail_one<'a, S: EvalSemantics>(
 /// now a per-call eligibility decision (`trackable_step_register_eligible`)
 /// computed once by the caller and threaded through, not a fact bundled
 /// alongside these three.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct StepRegisterFacts {
     /// Did this step contribute path components of its own?
     navigated: bool,
@@ -30019,7 +30467,7 @@ struct StepRegisterFacts {
     stage_preserves_register: bool,
     /// Is the step's output a frozen `as`-binding snapshot
     /// ([`PathBranch::snapshot`])?
-    step_snapshot: bool,
+    step_snapshot: Snapshot,
 }
 
 /// Whether a still-trackable branch's own step -- one that itself drops out
@@ -30113,13 +30561,16 @@ fn trackable_step_register_eligible<S: EvalSemantics>(branch_trackable: bool) ->
 /// costs an accepted path jq refuses — the dangerous direction, and why
 /// every clause above is a conjunct rather than a heuristic.
 fn reestablishes_register(
-    facts: StepRegisterFacts,
+    facts: &StepRegisterFacts,
     register: Option<&OwnedValue>,
+    register_frame: &Frame,
     resulting: &OwnedValue,
 ) -> bool {
     !facts.navigated
         && facts.stage_preserves_register
-        && register.is_some_and(|reg| register_identical(reg, resulting, facts.step_snapshot))
+        && register.is_some_and(|reg| {
+            register_identical(reg, register_frame, resulting, &facts.step_snapshot)
+        })
 }
 
 /// The path register to hand to the next pipe stage (#1573).
@@ -30166,7 +30617,7 @@ fn reestablishes_register(
 /// (a still-trackable branch never had anything carried), so this still
 /// answers `None`, matching pre-#2044 behavior exactly.
 fn carry_register<'a>(
-    facts: StepRegisterFacts,
+    facts: &StepRegisterFacts,
     reestablished: bool,
     trackable_step_eligible: bool,
     carried: &Option<Cow<'a, OwnedValue>>,
@@ -30227,11 +30678,13 @@ fn carry_register<'a>(
 /// `snapshot`: once seeded, `reestablishes_register`/`carry_register`'s
 /// already-tested stage-to-stage rules take over unchanged, so this adds one
 /// new *source* for the carried register, not a new rule for recognising it.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: `frame` (#2042) joins `trackable`/`snapshot` as the resolver's third threaded ambient
 fn resolve_seq_sink<'a, S: EvalSemantics>(
     exprs: &[Expr],
     value: &'a OwnedValue,
     trackable: bool,
-    snapshot: bool,
+    snapshot: &Snapshot,
+    frame: &Frame,
     keep: Keep,
     register: Option<&'a OwnedValue>,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
@@ -30294,7 +30747,11 @@ fn resolve_seq_sink<'a, S: EvalSemantics>(
         // so `end` is `value` handed straight back, still whatever ambient
         // snapshot it already was. A non-empty `flat` genuinely navigated,
         // which breaks the frozen-pointer identity regardless of ambient.
-        let branch_snapshot = snapshot && flat.is_empty();
+        let branch_snapshot = if flat.is_empty() {
+            snapshot.clone()
+        } else {
+            Snapshot::No
+        };
         let branch = PathBranch::passthrough(
             PathPrefix::from_components(flat),
             Cow::Owned(end),
@@ -30327,14 +30784,14 @@ fn resolve_seq_sink<'a, S: EvalSemantics>(
         PathPrefix::root(),
         Cow::Borrowed(value),
         trackable,
-        snapshot,
+        snapshot.clone(),
     )
     .with_register(if trackable {
         None
     } else {
         register.map(Cow::Borrowed)
     });
-    resolve_seq_stage::<S>(&flat, last_dynamic, 0, seed, keep, sink)
+    resolve_seq_stage::<S>(&flat, last_dynamic, 0, seed, frame, keep, sink)
 }
 
 /// Collecting adapter over [`resolve_seq_sink`], for the callers that still
@@ -30343,7 +30800,8 @@ fn resolve_seq<'a, S: EvalSemantics>(
     exprs: &[Expr],
     value: &'a OwnedValue,
     trackable: bool,
-    snapshot: bool,
+    snapshot: &Snapshot,
+    frame: &Frame,
     keep: Keep,
     register: Option<&'a OwnedValue>,
 ) -> PathResolveResult<'a> {
@@ -30353,6 +30811,7 @@ fn resolve_seq<'a, S: EvalSemantics>(
         value,
         trackable,
         snapshot,
+        frame,
         keep,
         register,
         &mut |b| {
@@ -30378,6 +30837,7 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
     last_dynamic: usize,
     stage_index: usize,
     branch: PathBranch<'a>,
+    frame: &Frame,
     keep: Keep,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
@@ -30456,12 +30916,19 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
     // because jq threads an already-yielded value all the way through the
     // rest of the pipe before it ever backtracks to try this stage's next
     // alternative.
+    // #2042: where this stage's input sits, absolutely -- the branch's own
+    // position while trackable, the carried register's once a
+    // non-navigating stage has stepped off it (`prefix` does not advance
+    // for those). What an `Origin::At` marker met in this stage, directly
+    // or through a passthrough, is certified against.
+    let stage_frame = frame.extend(&prefix);
     let mut downstream: Option<ResolveFlow> = None;
     let flow = resolve_against_cow_sink::<S>(
         element,
         current,
         branch_trackable,
-        branch_snapshot,
+        &branch_snapshot,
+        &stage_frame,
         stage_keep,
         &mut |step| {
             let PathBranch {
@@ -30474,7 +30941,7 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
             let facts = StepRegisterFacts {
                 navigated: components.depth() > 0,
                 stage_preserves_register,
-                step_snapshot,
+                step_snapshot: step_snapshot.clone(),
             };
             // The register entering this step (#2044): while the branch
             // was still trackable, the register was `current` itself,
@@ -30493,7 +30960,8 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
             } else {
                 carried_register.as_deref()
             };
-            let reestablished = reestablishes_register(facts, register_entering, &resulting);
+            let reestablished =
+                reestablishes_register(&facts, register_entering, &stage_frame, &resulting);
             let path = if reestablished {
                 Rc::clone(&prefix)
             } else {
@@ -30501,7 +30969,7 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
             };
             let placed = PathBranch {
                 register: carry_register(
-                    facts,
+                    &facts,
                     reestablished,
                     trackable_step_eligible,
                     &carried_register,
@@ -30535,9 +31003,21 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
                 // type's invariant is that `snapshot` implies
                 // `!trackable`: a certified snapshot has resolved to a
                 // real path and needs no second marker (#1573).
-                snapshot: step_snapshot && !reestablished,
+                snapshot: if reestablished {
+                    Snapshot::No
+                } else {
+                    step_snapshot
+                },
             };
-            match resolve_seq_stage::<S>(flat, last_dynamic, stage_index + 1, placed, keep, sink) {
+            match resolve_seq_stage::<S>(
+                flat,
+                last_dynamic,
+                stage_index + 1,
+                placed,
+                frame,
+                keep,
+                sink,
+            ) {
                 ResolveFlow::Exhausted => Demand::Continue,
                 other => {
                     downstream = Some(other);
@@ -30814,7 +31294,14 @@ fn resolve_del_path_branches<'a, S: EvalSemantics>(
     // `$x` snapshot, so ambient `snapshot` starts `false` (#1591), same as
     // `resolve_dynamic_indexes`'s own top-level entry.
     match reject_untracked_prefix_too(
-        resolve_node::<S>(expr, input, true, false, Keep::First),
+        resolve_node::<S>(
+            expr,
+            input,
+            true,
+            &Snapshot::No,
+            &Frame::enter(expr),
+            Keep::First,
+        ),
         false,
         false,
     ) {
@@ -30996,7 +31483,14 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
         // same as it does at this function's other top-level entry point
         // below (#1591).
         return match reject_untracked_prefix_too(
-            resolve_node::<S>(expr, input, true, false, Keep::First),
+            resolve_node::<S>(
+                expr,
+                input,
+                true,
+                &Snapshot::No,
+                &Frame::enter(expr),
+                Keep::First,
+            ),
             false,
             skip_untracked,
         ) {
@@ -31011,7 +31505,14 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
         _ => Expr::Pipe(flat),
     };
     match reject_untracked_prefix_too(
-        resolve_node::<S>(&reduced_expr, input, true, false, Keep::First),
+        resolve_node::<S>(
+            &reduced_expr,
+            input,
+            true,
+            &Snapshot::No,
+            &Frame::enter(&reduced_expr),
+            Keep::First,
+        ),
         true,
         skip_untracked,
     ) {
@@ -31154,7 +31655,11 @@ pub(crate) fn as_var_refs(
 /// jq's actual rule takes a syntactic passthrough, not mere value equality.
 fn is_identity_passthrough(expr: &Expr) -> bool {
     match unwrap_paren(expr) {
-        Expr::Identity | Expr::TrackedVar(_) => true,
+        Expr::Identity => true,
+        // #2042: only a marker frozen from `.` itself is a passthrough of
+        // `.`; one bound from a navigated position is that *node*, and a
+        // binding from it inherits its origin instead (`resolve_bind_source`).
+        Expr::TrackedVar(marker) => matches!(marker.origin, Origin::Snapshot),
         Expr::If {
             then_branch,
             else_branch,
@@ -31171,7 +31676,7 @@ fn is_identity_passthrough(expr: &Expr) -> bool {
 /// `--arg`/`--argjson` splicing, and any `as`-binding whose source isn't a
 /// statically-verified passthrough of `.` (see `is_identity_passthrough`).
 fn substitute_var(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr {
-    substitute_var_impl(expr, var_name, replacement, false)
+    substitute_var_impl(expr, var_name, replacement, None)
 }
 
 /// Like `substitute_var`, but marks the replacement as an `Expr::TrackedVar`
@@ -31182,7 +31687,7 @@ fn substitute_var(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr
 /// ambient position, so wrapping here is a necessary but not sufficient
 /// condition for the substituted variable to end up trackable (#844).
 fn substitute_var_tracked(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr {
-    substitute_var_impl(expr, var_name, replacement, true)
+    substitute_var_impl(expr, var_name, replacement, Some(&Origin::Snapshot))
 }
 
 /// Substitute `bound` for `$var_name` in `body`, choosing between
@@ -31204,15 +31709,31 @@ pub(crate) fn substitute_bound_var(
     var_name: &str,
     bound: &OwnedValue,
 ) -> Expr {
+    substitute_bound_var_at(bind_expr, body, var_name, bound, None)
+}
+
+/// [`substitute_bound_var`] with the #2042 witness: a binding whose source
+/// resolved to a navigated position (`origin` from [`resolve_bind_source`])
+/// gets an `Origin::At` marker; an identity passthrough keeps its
+/// `Origin::Snapshot` one; anything else is substituted as a plain value.
+fn substitute_bound_var_at(
+    bind_expr: &Expr,
+    body: &Expr,
+    var_name: &str,
+    bound: &OwnedValue,
+    origin: Option<Origin>,
+) -> Expr {
     if is_identity_passthrough(bind_expr) {
         substitute_var_tracked(body, var_name, bound)
+    } else if let Some(origin) = origin {
+        substitute_var_impl(body, var_name, bound, Some(&origin))
     } else {
         substitute_var(body, var_name, bound)
     }
 }
 
 /// Substitute a variable in an expression with a value.
-/// Returns a new expression with the variable replaced. `mark_trackable`
+/// Returns a new expression with the variable replaced. `mark`
 /// selects whether a substituted `$var_name` becomes an `Expr::TrackedVar`
 /// (path()-trackability candidate) or a plain value-construction node --
 /// see `substitute_var`/`substitute_var_tracked` above, the only two
@@ -31221,7 +31742,7 @@ fn substitute_var_impl(
     expr: &Expr,
     var_name: &str,
     replacement: &OwnedValue,
-    mark_trackable: bool,
+    mark: Option<&Origin>,
 ) -> Expr {
     match expr {
         // #1371: opaque, in both directions. A `Shared` holds an argument the
@@ -31232,32 +31753,24 @@ fn substitute_var_impl(
         // would also re-walk every argument from every level below on each
         // binding, which is the O(depth^2) traversal this design removes.
         Expr::Shared(inner) => Expr::Shared(Rc::clone(inner)),
-        Expr::Var(name) if name == var_name => {
-            if mark_trackable {
-                Expr::TrackedVar(Rc::new(replacement.clone()))
-            } else {
-                owned_to_expr(replacement)
-            }
-        }
+        Expr::Var(name) if name == var_name => match mark {
+            Some(origin) => Expr::TrackedVar(Rc::new(Tracked {
+                value: replacement.clone(),
+                origin: origin.clone(),
+            })),
+            None => owned_to_expr(replacement),
+        },
         // #2095: does not recurse into `msg` -- see `map_subexprs`'s own doc
         // comment (`src/jq/walk.rs`) on its `Expr::Error` arm for why this is
         // preserved as a likely latent gap rather than fixed here.
         Expr::Error(msg) => Expr::Error(msg.clone()),
-        Expr::Builtin(b) => Expr::Builtin(substitute_var_in_builtin(
-            b,
-            var_name,
-            replacement,
-            mark_trackable,
-        )),
+        Expr::Builtin(b) => {
+            Expr::Builtin(substitute_var_in_builtin(b, var_name, replacement, mark))
+        }
         // Phase 8 expressions
         // Don't substitute if this `as` binds the same variable (shadowing)
         Expr::As { expr, var, body } if var == var_name => Expr::As {
-            expr: Box::new(substitute_var_impl(
-                expr,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
+            expr: Box::new(substitute_var_impl(expr, var_name, replacement, mark)),
             var: var.clone(),
             body: body.clone(), // Don't substitute in body - shadowed
         },
@@ -31272,19 +31785,9 @@ fn substitute_var_impl(
             init,
             update,
         } if patterns.iter().any(|p| pattern_binds_var(p, var_name)) => Expr::Reduce {
-            input: Box::new(substitute_var_impl(
-                input,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
+            input: Box::new(substitute_var_impl(input, var_name, replacement, mark)),
             patterns: patterns.clone(),
-            init: Box::new(substitute_var_impl(
-                init,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
+            init: Box::new(substitute_var_impl(init, var_name, replacement, mark)),
             update: update.clone(), // shadowed
         },
         Expr::Foreach {
@@ -31294,19 +31797,9 @@ fn substitute_var_impl(
             update,
             extract,
         } if patterns.iter().any(|p| pattern_binds_var(p, var_name)) => Expr::Foreach {
-            input: Box::new(substitute_var_impl(
-                input,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
+            input: Box::new(substitute_var_impl(input, var_name, replacement, mark)),
             patterns: patterns.clone(),
-            init: Box::new(substitute_var_impl(
-                init,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
+            init: Box::new(substitute_var_impl(init, var_name, replacement, mark)),
             update: update.clone(),
             extract: extract.clone(),
         },
@@ -31319,12 +31812,7 @@ fn substitute_var_impl(
             patterns,
             body,
         } if patterns.iter().any(|p| pattern_binds_var(p, var_name)) => Expr::AsPattern {
-            expr: Box::new(substitute_var_impl(
-                expr,
-                var_name,
-                replacement,
-                mark_trackable,
-            )),
+            expr: Box::new(substitute_var_impl(expr, var_name, replacement, mark)),
             patterns: patterns.clone(),
             body: body.clone(),
         },
@@ -31374,19 +31862,9 @@ fn substitute_var_impl(
                 body: if shadowed {
                     body.clone()
                 } else {
-                    Box::new(substitute_var_impl(
-                        body,
-                        var_name,
-                        replacement,
-                        mark_trackable,
-                    ))
+                    Box::new(substitute_var_impl(body, var_name, replacement, mark))
                 },
-                then: Box::new(substitute_var_impl(
-                    then,
-                    var_name,
-                    replacement,
-                    mark_trackable,
-                )),
+                then: Box::new(substitute_var_impl(then, var_name, replacement, mark)),
                 // Rebuilt above (`body`/`then` may have changed), so any
                 // cache computed against the old node is stale (#2094).
                 bound: FuncDefBound::default(),
@@ -31407,7 +31885,7 @@ fn substitute_var_impl(
         // `install_def_calls`'s own `DefCall` policy) that stay explicit
         // above/in each caller instead of ever reaching it.
         _ => map_subexprs(expr, &mut |sub| {
-            substitute_var_impl(sub, var_name, replacement, mark_trackable)
+            substitute_var_impl(sub, var_name, replacement, mark)
         }),
     }
 }
@@ -31428,10 +31906,10 @@ fn substitute_var_in_builtin(
     builtin: &Builtin,
     var_name: &str,
     replacement: &OwnedValue,
-    mark_trackable: bool,
+    mark: Option<&Origin>,
 ) -> Builtin {
     map_builtin_subexprs(builtin, &mut |e| {
-        substitute_var_impl(e, var_name, replacement, mark_trackable)
+        substitute_var_impl(e, var_name, replacement, mark)
     })
 }
 
@@ -79634,6 +80112,11 @@ mod tests {
             r"path(. as $x | (if 1 then 5 else 6 end) | $x)",
             r"path(. as $x | (try 5) | $x)",
             r"path(. as $x | (5 // 6) | $x)",
+            // #2042: an `as` source runs with jq's path tracking suspended,
+            // so only the binding's *body* can move the register --
+            // `path(([{"a":1}] | .[0] | .a) as $y | .)` is `[]` in jq where
+            // the same navigation as a stage raises. Refused before #2042.
+            r"path(. as $x | (.a as $q | 1) | $x)",
         ] {
             assert_eq!(outputs(br#"{"a":{"b":1}}"#, filter), ["[]"], "{filter}");
         }
@@ -79652,14 +80135,16 @@ mod tests {
     /// constructed `{"k":null}`, so carrying the register through the first
     /// construction answered a pipeline jq had already refused. A `def` and
     /// a call are excluded because resolving a call to its body is not
-    /// something this predicate can do from a name.
+    /// something this predicate can do from a name. (An `as` whose *source*
+    /// navigates used to be listed here too; #2042 established that jq
+    /// suspends tracking for the source, so it moved to the accepting list
+    /// above.)
     #[test]
     fn test_navigating_construction_and_def_cost_a_refusal_1573() {
         for filter in [
             r"path(. as $x | [.a] | $x)",
             "path(. as $x | { k: .a } | $x)",
             r#"path(. as $x | ("\(.a)") | $x)"#,
-            r"path(. as $x | (.a as $q | 1) | $x)",
             r"path(. as $x | (def f: 5; f) | $x)",
         ] {
             query!(br#"{"a":{"b":1}}"#, filter,
@@ -79670,20 +80155,481 @@ mod tests {
         }
     }
 
-    /// A variable bound from a *navigated* position still has no marker at
-    /// all (`substitute_bound_var`'s `is_identity_passthrough` gate), so it
-    /// keeps refusing regardless of the register. This is the half of #1573
-    /// the register does not close, pinned here so widening the gate later
-    /// has to come back and update this test deliberately rather than
-    /// silently flipping it — see the issue for why the marker needs a
-    /// bind-time path before that widening is sound.
+    /// #2042: a variable bound from a *navigated* position (`.a as $y`) is
+    /// certified in path position by node identity -- the resolver
+    /// invocation and absolute bind path its `Expr::TrackedVar` marker
+    /// carries (`Origin::At`) must be the path register's own -- never by
+    /// value alone. Every row here was captured live from jq 1.7.1
+    /// (`scripts/jq-bind-origin-oracle-sweep.sh` is the same matrix against
+    /// the built binary, direction-classified); the rows are the shapes
+    /// where value equality and node identity disagree, or where the frame
+    /// a bind path was recorded in matters (nested pipes, nested `as`, a
+    /// nested `path()` invocation, folds).
+    ///
+    /// Each filter is evaluated wrapped as `[FILTER] | tojson`, so a row's
+    /// expectation is jq's own `-c '[FILTER]'` line verbatim.
+    fn bind_origin_outputs(json: &[u8], filter: &str) -> Result<String, EvalError> {
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = parse(&format!("[{filter}] | tojson")).unwrap();
+        match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+            QueryResult::Owned(OwnedValue::String(s)) => Ok(s),
+            QueryResult::Error(e) => Err(e),
+            other => panic!("{filter}: unexpected result {other:?}"),
+        }
+    }
+
     #[test]
-    fn test_path_navigated_binding_still_refused_pending_gate_1573() {
-        query!(br#"{"a":{"b":1}}"#, r"path(.a as $y | .a | $y)",
-            QueryResult::Error(e) => {
-                assert!(e.is_invalid_path_expression());
+    fn test_path_bind_origin_matrix_accepts_2042() {
+        // (input, filter, jq 1.7.1's `-c '[FILTER]'`)
+        let rows: &[(&[u8], &str, &str)] = &[
+            // same-node-sibling-pipe
+            (
+                br#"{"a":{"b":1},"c":{"b":1}}"#,
+                "path(.a as $y | .a | $y)",
+                r#"[["a"]]"#,
+            ),
+            // navigate-after-var
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | .a | $y.b)",
+                r#"[["a","b"]]"#,
+            ),
+            // rebind-between
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | .a | . as $w | $y)",
+                r#"[["a"]]"#,
+            ),
+            // first-between
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | first(.a) | $y)",
+                r#"[["a"]]"#,
+            ),
+            // literal-between
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | .a | 5 | $y)",
+                r#"[["a"]]"#,
+            ),
+            // literal-between-navigate
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | .a | 5 | $y.b)",
+                r#"[["a","b"]]"#,
+            ),
+            // reduce-init-same-node
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | reduce (1) as $i (.a; $y))",
+                r#"[["a"]]"#,
+            ),
+            // reduce-after-navigate
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | .a | reduce (1) as $i (.; $y))",
+                r#"[["a"]]"#,
+            ),
+            // reduce-literal-then-var
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | reduce (1) as $i (.a; 5 | $y))",
+                r#"[["a"]]"#,
+            ),
+            // foreach-init-same-node
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | foreach (1) as $i (.a; $y))",
+                r#"[["a"]]"#,
+            ),
+            // foreach-after-navigate
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | .a | foreach (1) as $i (0; $y; .))",
+                r#"[["a"]]"#,
+            ),
+            // select-passthrough
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | .a | select(true) | $y)",
+                r#"[["a"]]"#,
+            ),
+            // if-passthrough
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | .a | if true then $y else 1 end)",
+                r#"[["a"]]"#,
+            ),
+            // literal-then-if
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | .a | 5 | if true then $y else 1 end)",
+                r#"[["a"]]"#,
+            ),
+            // literal-then-var-then-select
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | .a | 5 | $y | select(true))",
+                r#"[["a"]]"#,
+            ),
+            // literal-then-paren-pipe
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | .a | 5 | ($y | select(true)))",
+                r#"[["a"]]"#,
+            ),
+            // paren-navigate
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | .a | ($y | .b))",
+                r#"[["a","b"]]"#,
+            ),
+            // try-passthrough
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | try .a catch 1 | $y)",
+                r#"[["a"]]"#,
+            ),
+            // label-passthrough
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | label $out | .a | $y)",
+                r#"[["a"]]"#,
+            ),
+            // var-twice
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | .a | $y | $y)",
+                r#"[["a"]]"#,
+            ),
+            // comma-after-var
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | .a | ($y, .b))",
+                r#"[["a"],["a","b"]]"#,
+            ),
+            // comma-stage
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | (.a, .a) | $y)",
+                r#"[["a"],["a"]]"#,
+            ),
+            // chain-rebind
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | .a | $y as $z | $z)",
+                r#"[["a"]]"#,
+            ),
+            // chain-navigate-source
+            (
+                br#"{"a":{"b":{"c":1}}}"#,
+                "path(.a as $y | ($y | .b) as $w | .a.b | $w)",
+                r#"[["a","b"]]"#,
+            ),
+            // chain-field-source
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | .a | $y.b as $z | .b | $z)",
+                r#"[["a","b"]]"#,
+            ),
+            // inner-binding-outer-var
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | .a | .b as $z | $y)",
+                r#"[["a"]]"#,
+            ),
+            // source-with-navigation
+            (
+                br#"{"a":{"b":1}}"#,
+                "path((.a | .b) as $y | .a.b | $y)",
+                r#"[["a","b"]]"#,
+            ),
+            // source-getpath
+            (
+                br#"{"a":{"b":1}}"#,
+                r#"path(getpath(["a"]) as $y | .a | $y)"#,
+                r#"[["a"]]"#,
+            ),
+            // source-iterate
+            (
+                br#"{"a":[{"b":1}]}"#,
+                "path(.a[] as $y | .a[0] | $y)",
+                r#"[["a",0]]"#,
+            ),
+            // source-index
+            (
+                br#"{"a":[[1],[2]]}"#,
+                "path(.a[0] as $y | .a[0] | $y)",
+                r#"[["a",0]]"#,
+            ),
+            // source-suspended-tracking
+            (
+                br#"{"a":{"b":1}}"#,
+                r#"path(([{"a":1}] | .[0] | .a) as $y | .)"#,
+                r"[[]]",
+            ),
+            // source-does-not-move-register
+            (
+                br#"{"a":{"b":1},"b":2}"#,
+                "path(.a as $y | .b)",
+                r#"[["b"]]"#,
+            ),
+            // source-does-not-move-register-identity
+            (br#"{"a":{"b":1},"b":2}"#, "path(.a as $y | .)", r"[[]]"),
+            // nested-pipe-same-node
+            (
+                br#"{"a":{"b":1},"x":{"a":{"b":1}}}"#,
+                "path(.x | (.a as $y | .a | $y))",
+                r#"[["x","a"]]"#,
+            ),
+            // shadow-inner-same
+            (
+                br#"{"a":{"b":1},"c":{"b":1}}"#,
+                "path(.c as $z | .a as $y | .c | $z)",
+                r#"[["c"]]"#,
+            ),
+            // bool-sibling
+            (
+                br#"{"a":true,"c":true}"#,
+                "path(.a as $y | .c | $y)",
+                r#"[["c"]]"#,
+            ),
+            // null-sibling
+            (
+                br#"{"a":null,"c":null}"#,
+                "path(.a as $y | .c | $y)",
+                r#"[["c"]]"#,
+            ),
+            // del-same-node
+            (
+                br#"{"a":{"b":1},"c":{"b":1}}"#,
+                "del(.a as $y | .a | $y)",
+                r#"[{"c":{"b":1}}]"#,
+            ),
+            // assign-same-node
+            (
+                br#"{"a":{"b":1},"c":{"b":1}}"#,
+                "(.a as $y | .a | $y.b) = 9",
+                r#"[{"a":{"b":9},"c":{"b":1}}]"#,
+            ),
+            // update-same-node
+            (
+                br#"{"a":{"b":1},"c":{"b":1}}"#,
+                "(.a as $y | .a | $y.b) |= . + 1",
+                r#"[{"a":{"b":2},"c":{"b":1}}]"#,
+            ),
+        ];
+        for (input, filter, expected) in rows {
+            match bind_origin_outputs(input, filter) {
+                Ok(got) => assert_eq!(got, *expected, "{filter}"),
+                Err(e) => panic!(
+                    "{filter}: refused where jq answers {expected}: {}",
+                    e.message
+                ),
             }
-        );
+        }
+    }
+
+    /// The refusing half of the matrix: every row is a shape where a
+    /// value-only witness would fabricate a path (an equal-valued sibling,
+    /// a bind path from a different frame or invocation, a register that
+    /// moved), and jq refuses. This is the direction `del()`/`=` would then
+    /// write through, so each row is asserted to raise a path error.
+    #[test]
+    fn test_path_bind_origin_matrix_refuses_2042() {
+        let rows: &[(&[u8], &str)] = &[
+            // equal-sibling-pipe
+            (br#"{"a":{"b":1},"c":{"b":1}}"#, "path(.a as $y | .c | $y)"),
+            // bare-var-at-root
+            (br#"{"a":{"b":1}}"#, "path(.a as $y | $y)"),
+            // different-value-sibling
+            (br#"{"a":{"b":1},"d":{"b":2}}"#, "path(.a as $y | .d | $y)"),
+            // register-moved-by-field
+            (br#"{"a":{"b":1}}"#, "path(.a as $y | .a | .b | $y)"),
+            // reduce-init-root
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | reduce (1) as $i (.; $y))",
+            ),
+            // reduce-init-equal-sibling
+            (
+                br#"{"a":{"b":1},"c":{"b":1}}"#,
+                "path(.a as $y | reduce (1) as $i (.c; $y))",
+            ),
+            // reduce-literal-then-var-sibling
+            (
+                br#"{"a":{"b":1},"c":{"b":1}}"#,
+                "path(.a as $y | reduce (1) as $i (.c; 5 | $y))",
+            ),
+            // if-passthrough-sibling
+            (
+                br#"{"a":{"b":1},"c":{"b":1}}"#,
+                "path(.a as $y | .c | if true then $y else 1 end)",
+            ),
+            // literal-then-var-then-select-sibling
+            (
+                br#"{"a":{"b":1},"c":{"b":1}}"#,
+                "path(.a as $y | .c | 5 | $y | select(true))",
+            ),
+            // paren-pipe-sibling
+            (
+                br#"{"a":{"b":1},"c":{"b":1}}"#,
+                "path(.a as $y | .c | ($y | select(true)))",
+            ),
+            // paren-navigate-sibling
+            (
+                br#"{"a":{"b":1},"c":{"b":1}}"#,
+                "path(.a as $y | .c | ($y | .b))",
+            ),
+            // comma-stage-sibling
+            (
+                br#"{"a":{"b":1},"c":{"b":1}}"#,
+                "[path(.a as $y | (.a, .c) | $y)]",
+            ),
+            // chain-rebind-sibling
+            (
+                br#"{"a":{"b":1},"c":{"b":1}}"#,
+                "path(.a as $y | .a | $y as $z | .c | $z)",
+            ),
+            // chain-field-source-after-var
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | .a | $y | .b as $z | $z)",
+            ),
+            // inner-binding-outer-var-sibling
+            (
+                br#"{"a":{"b":1},"c":{"b":1}}"#,
+                "path(.a as $y | .c | .b as $z | $y)",
+            ),
+            // source-iterate-equal-elements
+            (
+                br#"{"a":[{"b":1},{"b":1}]}"#,
+                "path(.a[] as $y | .a[] | $y)",
+            ),
+            // source-index-equal-sibling
+            (
+                br#"{"a":[{"b":1},{"b":1}]}"#,
+                "path(.a[0] as $y | .a[1] | $y)",
+            ),
+            // source-comma
+            (
+                br#"{"a":{"b":1},"c":{"b":1}}"#,
+                "path((.a, .c) as $y | .a | $y)",
+            ),
+            // root-var-after-navigated-binding
+            (br#"{"a":{"b":1}}"#, "path(. as $x | .a as $y | .a | $x)"),
+            // nested-as-frame
+            (
+                br#"{"a":{"b":1},"x":{"c":0,"b":1}}"#,
+                "path(.a as $y | .x | (.c as $z | $y))",
+            ),
+            // nested-pipe-frame
+            (
+                br#"{"a":{"b":1},"x":{"a":{"b":1}}}"#,
+                "path(.a as $y | .x | (.a | $y))",
+            ),
+            // nested-path-invocation
+            (
+                br#"{"a":{"b":1},"x":{"a":{"b":1}}}"#,
+                "path(.a as $y | .x | path(.a | $y))",
+            ),
+            // nested-as-in-update
+            (
+                br#"{"a":{"b":{"c":1}}}"#,
+                "path(reduce (1) as $i (.a; (.b as $q | .b | $q)))",
+            ),
+            // shadow-inner-sibling
+            (
+                br#"{"a":{"b":1},"c":{"b":1}}"#,
+                "path(.a as $y | .c as $z | .c | $y)",
+            ),
+            // number-sibling
+            (br#"{"a":1,"c":1}"#, "path(.a as $y | .c | $y)"),
+            // string-sibling
+            (br#"{"a":"s","c":"s"}"#, "path(.a as $y | .c | $y)"),
+            // construction-between
+            (br#"{"a":{"b":1}}"#, "path(.a as $y | [.a] | .[0] | $y)"),
+            // object-construction-between
+            (br#"{"a":{"b":1}}"#, "path(.a as $y | {k: .a} | .k | $y)"),
+            // tojson-between-sibling
+            (
+                br#"{"a":{"b":1},"c":{"b":1}}"#,
+                "path(.a as $y | .c | tojson | fromjson | $y)",
+            ),
+            // del-equal-sibling
+            (br#"{"a":{"b":1},"c":{"b":1}}"#, "del(.a as $y | .c | $y)"),
+            // assign-equal-sibling
+            (
+                br#"{"a":{"b":1},"c":{"b":1}}"#,
+                "(.a as $y | .c | $y.b) = 9",
+            ),
+            // multi-binding-partial
+            (br#"[{"b":1},{"b":1}]"#, "path(.[] as $y | .[0] | $y)"),
+            // value-mode-binding-other-frame
+            (
+                br#"{"a":{"b":1},"x":{"a":{"b":1}}}"#,
+                ".a as $y | .x | path(.a | $y)",
+            ),
+        ];
+        for (input, filter) in rows {
+            match bind_origin_outputs(input, filter) {
+                Err(e) => assert!(
+                    e.is_invalid_path_expression() || e.is_untracked_navigation_error(),
+                    "{filter}: {}",
+                    e.message
+                ),
+                Ok(got) => panic!("{filter}: answered {got} where jq refuses"),
+            }
+        }
+    }
+
+    /// Deliberately refuse-only rows (jq answers, succinctly refuses), each
+    /// pinned so that closing one is a visible edit here rather than a
+    /// silent flip: a value-mode binding has no path (`eval_as` never
+    /// resolves its source; the accepting-direction twin of #2642),
+    /// `tojson`/`fromjson` are not on `cannot_move_register`'s proven
+    /// allowlist (#2041), a `def` inside `path()` resolves as an opaque leaf,
+    /// and a source navigating inside a construction is refused by the
+    /// resolver where jq's suspended tracking allows it, so it binds a
+    /// plain value.
+    #[test]
+    fn test_path_bind_origin_matrix_refuse_only_2042() {
+        // (input, filter, what jq 1.7.1 answers)
+        let rows: &[(&[u8], &str, &str)] = &[
+            // value-mode-binding-same-node
+            (
+                br#"{"a":{"b":1}}"#,
+                ".a as $y | path(.a | $y)",
+                r#"[["a"]]"#,
+            ),
+            // tojson-between
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | .a | tojson | fromjson | $y)",
+                r#"[["a"]]"#,
+            ),
+            // def-body-in-path
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | def f: $y; .a | f)",
+                r#"[["a"]]"#,
+            ),
+            // source-rebuilt-container
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | ([$y] | .[0]) as $z | .a | $z)",
+                r#"[["a"]]"#,
+            ),
+        ];
+        for (input, filter, jq_answer) in rows {
+            match bind_origin_outputs(input, filter) {
+                Err(e) => assert!(e.is_invalid_path_expression(), "{filter}: {}", e.message),
+                Ok(got) => panic!(
+                    "{filter}: now answers {got} (jq: {jq_answer}) -- move it to the accepting matrix"
+                ),
+            }
+        }
     }
 
     /// #2044: `reestablishes_register`'s `!branch_trackable` conjunct
@@ -80845,17 +81791,15 @@ mod tests {
     /// jq's own answers, confirmed live, are in the comments.
     #[test]
     fn test_fold_register_known_refusals_1466() {
-        // jq: ["a"] — `$y` is the document's own `.a`.
+        // jq: ["a"] — `$y` is the document's own `.a`. Refused until #2042
+        // gave a navigated binding an `Origin::At` marker; answered since.
         for filter in [
             "path(.a as $y | reduce (1) as $i (.a; $y))",
             "path(.a as $y | foreach (1) as $i (.a; $y))",
         ] {
             query!(br#"{"a":{"b":1}}"#, filter,
-                QueryResult::Error(e) => {
-                    assert_eq!(
-                        e.message, r#"Invalid path expression with result {"b":1}"#,
-                        "{filter}"
-                    );
+                QueryResult::Owned(OwnedValue::Array(path)) => {
+                    assert_eq!(path, vec![OwnedValue::String("a".to_string())], "{filter}");
                 }
             );
         }
@@ -80890,23 +81834,24 @@ mod tests {
         );
     }
 
-    /// `PathBranch::into_snapshot` keeps the type's `snapshot` implies
+    /// `PathBranch::into_marked` keeps the type's `snapshot` implies
     /// `!trackable` invariant, which is the whole reason it is a method
-    /// rather than an inline `PathBranch::snapshot(b.value)` at its one call
-    /// site. That site cannot reach the trackable case today, so this is the
-    /// only thing holding the guard honest.
+    /// rather than an inline `PathBranch::marked(origin, b.value)` at its
+    /// one call site. That site cannot reach the trackable case today, so
+    /// this is the only thing holding the guard honest.
     #[test]
     fn into_snapshot_marks_only_an_untracked_branch_1466() {
-        let untracked = PathBranch::untracked(Cow::Owned(OwnedValue::Int(1))).into_snapshot();
-        assert!(untracked.snapshot && !untracked.trackable);
+        let untracked =
+            PathBranch::untracked(Cow::Owned(OwnedValue::Int(1))).into_marked(&Origin::Snapshot);
+        assert!(untracked.snapshot.is_marked() && !untracked.trackable);
 
         let navigated = PathBranch::new(
             PathPrefix::from_components([Expr::Field("a".into())]),
             Cow::Owned(OwnedValue::Int(1)),
             true,
         )
-        .into_snapshot();
-        assert!(navigated.trackable && !navigated.snapshot);
+        .into_marked(&Origin::Snapshot);
+        assert!(navigated.trackable && !navigated.snapshot.is_marked());
         assert_eq!(navigated.path.to_vec(), vec![Expr::Field("a".into())]);
     }
 
