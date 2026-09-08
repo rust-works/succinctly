@@ -850,6 +850,7 @@ pub trait DocumentValue: Sized + Clone {
         }
         Ok(self.key_string())
     }
+    // omni-dev: coverage end
 
     /// This value's raw source bytes when it is a string key whose span
     /// needs no decoding -- byte-identical to what
