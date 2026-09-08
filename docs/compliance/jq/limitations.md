@@ -740,6 +740,20 @@ is the revert that established what the other one costs.
    confirmed pre-existing (reproduces byte-for-byte on the commit before #2042), not caused by
    this change.
 
+   [#2072](https://github.com/rust-works/succinctly/issues/2072) supplied the missing
+   half of that but deliberately did not spend it here. `Expr::TrackedVar` now carries a
+   `BoundVar` (`src/jq/expr.rs`) whose `origin: Option<BindOrigin>` names the node the
+   value was bound from — a `DocumentCursor::node_id` plus the owning document's
+   `document_token`, or an owned-tree position — so the bind-time node *is* available at
+   every `TrackedVar` the resolver meets. The `path()` resolver still consults only
+   `BoundVar::tracked`, the `is_identity_passthrough` bit moved onto the node by #2072,
+   and never `origin`: a navigated binding therefore resolves exactly as the bare literal
+   it used to be spliced as, and every jq-mode row still matches jq 1.7.1. The widening
+   this bullet describes is what #2042 is for — it now needs a rule for *when* an origin
+   certifies the register (`path(.a as $y | .c | $y)` must keep refusing, since jq's own
+   `jv_identical` compares the register's pointer, not the bind site), not a new place to
+   get the node from.
+
 2. **`?//`-alternatives folds aren't path-tracked at all** (refuse-only) —
    `path(. as $x \| reduce (1) as $y ?// $z (0; $x))` on `{"a":1}` is `[]` in jq; succinctly
    refuses. [#1365](https://github.com/rust-works/succinctly/issues/1365) (`?//`-alternatives

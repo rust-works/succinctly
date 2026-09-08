@@ -80,6 +80,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An `as`-bound variable now stands at the node it was bound from, instead of
+  being a value with no position** (#2072). Real yq's variables hold *nodes*,
+  parent pointers and all, so `.a.b as $x | $x | key` is `"b"` there;
+  succinctly substituted the bound value into the body, so every position
+  builtin read through `$x` answered from the ambient node or from nothing at
+  all. `Expr::TrackedVar` now carries a `BoundVar` whose `BindOrigin` names the
+  bind-time node -- a `DocumentCursor::node_id` plus the owning document's
+  `document_token`, or an owned-tree position -- and the use sites re-resolve
+  it to a live cursor. All eight rows that
+  [docs/compliance/yq/limitations.md](docs/compliance/yq/limitations.md)
+  recorded as diverging now match yq v4.53.3, including the two that bind one
+  of a pair of equal-valued siblings and then read the other -- which no
+  value-equality approximation can tell apart.
+
+  **`line`/`column` come with it.** They are cursor-only -- no accumulated path
+  can produce them -- so `.a as $x | $x | line` answered `0` before and answers
+  the node's real line now (`2` on `a: {b: 1, e: 2}` / `c: {b: 1}`, as yq
+  does), as does `column`.
+
+  **YAML anchors and style survive a binding.** ADR-0017's preservation rides
+  the node, so re-materialising `$x` as a value defeated it: `.b as $x | $x` on
+  `b: &anc [1, 2]` printed a plain two-line block sequence and now prints
+  `&anc [1, 2]`, matching yq.
+
+  **A pre-existing abort is closed.** `. as $x | ($x.a[0] + 1) | path` hit the
+  owned identity pipe's `unreachable!`, because its operand grammar admitted a
+  pipe headed by a variable that the navigation step could not take. The step
+  takes it now: `["a",0]`, as yq answers.
+
+  jq mode is unchanged by design -- `path()`'s resolver honours only
+  `BoundVar::tracked` and never the origin, so every jq-mode row still matches
+  jq 1.7.1 and #2042 (the jq-mode half) stays open with the bind-time node now
+  available to it. Writes through a variable stay refused in both modes.
+
+  Measured on the same machine, interleaved per repetition, outputs identical:
+  `.[] as $x | ...` over 2.4 MB and 24 MB arrays runs **18-38% faster**, since
+  a binding now shares one `Rc` instead of re-spelling its value at every
+  occurrence and a `$x` use no longer takes the reindex bridge.
 - **`key`/`path` (no arg) followed by more pipe stages no longer falls back
   to materializing the whole document once per element** (#2149, follow-up
   to #2061). `.[] | key | tostring` (and any pipe shaped the same way,

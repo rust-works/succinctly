@@ -18280,15 +18280,28 @@ enum OwnedIdentityRule {
     /// an ordinary node at the same position, which clears the flag).
     KeyNode,
     /// A bare bound variable as a stage (`$x`, spine 2416's walk residue):
-    /// the value keeps the position when it *is* the stage's input (the
-    /// `. as $x | $x` passthrough) and is detached otherwise -- the same
-    /// value-equality rule `resolve_node` applies to a `TrackedVar`'s
-    /// `path()` trackability. Captured from yq v4.53.3 on `a: {b: 1, e:
-    /// 2}`: `.a | . as $x | $x | key` is `"a"`, `. as $x | $x | key` prints
-    /// nothing (the root, #2421) and `.a.x as $x | $x | key` prints nothing.
-    /// yq's variables hold *nodes*, so `.a.b as $x | $x | key` is `"b"`
-    /// there where the bound value here is a value with no position; that
-    /// divergence predates this rule and is recorded in
+    /// the variable stands at the node it was bound from. Since #2072 the
+    /// binding records that node on its own `Expr::TrackedVar`
+    /// (`BoundVar::origin`), and this rule rebuilds the identity from it --
+    /// so `.a.b as $x | $x | key` is `"b"`, as it is in yq v4.53.3, where
+    /// the re-materialised value used to have no position at all.
+    ///
+    /// **Value equality is the fallback, not the rule.** A binding made
+    /// where no cursor domain exists carries no origin (`eval.rs`'s
+    /// `each_as`/`eval_as`, the identity pass's own rewrites), and so does
+    /// one whose origin names a node of a *different* document -- the
+    /// `document_token` check rejects it rather than trusting a
+    /// same-numbered position of the wrong tree. Both fall back to the
+    /// pre-#2072 rule: keep the position when the bound value *is* the
+    /// stage's input (the `. as $x | $x` passthrough), detach otherwise --
+    /// the same value-equality test `resolve_node` applies to a
+    /// `TrackedVar`'s `path()` trackability.
+    ///
+    /// Captured from yq v4.53.3 on `a: {b: 1, e: 2}`: `.a | . as $x | $x |
+    /// key` is `"a"`, `. as $x | $x | key` prints nothing (the root,
+    /// #2421), `.a.x as $x | $x | key` prints nothing, and `.a.b as $x | $x
+    /// | key` is `"b"`. The residues #2072 leaves -- a variable bound from
+    /// an absent key, and an alias binding's flow style -- are recorded in
     /// `docs/compliance/yq/limitations.md`.
     Bound,
 }
@@ -18715,10 +18728,11 @@ fn owned_identity_bind_supported(expr: &Expr) -> bool {
 /// evaluator ([`eval_owned_identity_as`]) split the body the same way: the
 /// gate sees it unsubstituted (`$x`) and the evaluator sees it with the
 /// bound value in place, and substitution never changes a *stage's* own node
-/// kind. The one node it does replace outright is a bare `Expr::Var`, which
-/// has no [`owned_identity_rule`] before substitution and none after
-/// (`Expr::TrackedVar` has none either), so such a stage is refused by the
-/// gate and the evaluator never meets it.
+/// kind. The one node it does replace outright is a bare `Expr::Var`, and
+/// both spellings are ruled the same way -- [`OwnedIdentityRule::Bound`]
+/// for `Expr::Var` and for the `Expr::TrackedVar` substitution turns it
+/// into (`cdfce8ada`, then #2072's origin) -- so the gate admits such a
+/// stage before substitution exactly when it admits it after.
 fn owned_identity_body_stages(body: &Expr) -> &[Expr] {
     match strip_parens(body) {
         Expr::Pipe(stages) => stages,
