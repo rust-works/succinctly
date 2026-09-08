@@ -7358,10 +7358,18 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
 /// it for duplicate-key hashing), so pairing that value with its cursor
 /// here lets [`continue_pipe_element_generic`] skip a second, identical
 /// `V::Cursor::value()` resolve -- for YAML specifically not a cheap
-/// re-read but a full scalar decode (#1609). **Do not use this variant
-/// anywhere else.** Every other `OneCursor` site (`.[]` iteration via
-/// `uncons_cursor`, etc.) has no value decoded yet, so pairing one in would
-/// be new cost, not a freebie -- `OneCursor` alone stays correct there.
+/// re-read but a full scalar decode (#1609). Every other `OneCursor` site
+/// (`.[]` iteration via `uncons_cursor`, etc.) has no value decoded yet, so
+/// pairing one in would be new cost, not a freebie -- `OneCursor` alone
+/// stays correct there.
+///
+/// `eval_each_pipe_generic`'s own empty-`exprs` tail (reached when `rest`
+/// is `[]`, i.e. a bare `keys_unsorted[]`) re-pairs the same cursor and
+/// value it was handed rather than decomposing to `One(value)`: the pair
+/// still originated at the one construction site above, just carried
+/// through `continue_pipe_element_generic`'s destructuring as two separate
+/// parameters. Re-pairing there preserves the key's raw source span for an
+/// undecodable key, instead of forcing a second, validating decode (#2103).
 enum GenericItem<V: DocumentValue> {
     One(V),
     OneCursor(V::Cursor),
@@ -8831,11 +8839,20 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
     }
 
     let Some((first, rest)) = exprs.split_first() else {
-        // Same behaviour as `eval_single`'s own empty-pipe short-circuit:
-        // `value`'s cursor, if any, is not preserved -- an empty `Expr::Pipe`
-        // is not a shape real syntax produces, only a synthesized "rest"
-        // slice that never actually reaches zero length in practice.
-        return push_one_generic(GenericItem::One(value), sink);
+        // This slice *does* reach zero length in practice: a bare
+        // `keys_unsorted[]` drives `each_lazy_keys_iterate_sink`'s `!sorted`
+        // arm, whose `rest` is `[]`, and every key cursor lands here via
+        // `continue_pipe_element_generic`'s `OneCursorValue` arm (#1565,
+        // #1770). Dropping `cursor` and pushing the already-decoded `value`
+        // used to force a second, implicit decode downstream -- for an
+        // undecodable key (`\ud800` inside `"..."`) that raised on the
+        // streaming evaluator while the eager route echoed the raw source
+        // bytes verbatim (#1247/#1385/#1642). Preserve the cursor so an
+        // undecodable key is echoed raw here too, instead of decoded (#2103).
+        return match cursor {
+            Some(c) => push_one_generic(GenericItem::OneCursorValue(c, value), sink),
+            None => push_one_generic(GenericItem::One(value), sink),
+        };
     };
     if rest.is_empty() {
         return eval_each_generic::<S, V>(first, value, optional, cursor, sink);
