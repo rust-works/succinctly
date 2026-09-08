@@ -3814,53 +3814,6 @@ fn parse_json_stream_strict(s: &str) -> Result<Vec<OwnedValue>> {
     Ok(values)
 }
 
-/// Parse JSON sequence format (RFC 7464) (`--seq`).
-/// Input is split on RS (0x1E) characters, each segment parsed as JSON.
-/// Parse failures are silently ignored (per RFC 7464 recommendation).
-///
-/// Preserves number-literal source fidelity the same way `parse_json_value`
-/// does for `--argjson` (#1058, extended here to `--seq`, #1093): each
-/// segment is already isolated by the RS split, so a validate-then-
-/// materialize step can validate and materialize the same segment text
-/// directly -- no boundary-tracking needed, unlike `parse_json_stream`
-/// above.
-///
-/// Validates via the crate's own zero-allocation RFC 8259 grammar
-/// validator (`json::validate::validate`, already used by `--validate`/
-/// `json validate`) rather than `validate_and_materialize_json`'s
-/// `serde_json::Value`-tree-based check (#1267) -- `--seq` is a streaming,
-/// record-oriented format, so a discarded parse tree's allocation cost is
-/// paid once per record rather than a bounded number of times per run the
-/// way `--argjson`/`--jsonargs` pay it. Measured (500k-record stream,
-/// interleaved A/B, 5 reps -- real jq's own baseline is ~0.47s either way):
-/// a real but modest ~10-20% improvement (median ~1.30s -> ~1.15s), not the
-/// dramatic win a first, non-interleaved measurement suggested (1.38s ->
-/// 1.56s, i.e. apparently *worse* -- sequential-halves noise, the exact
-/// trap this repo's own benchmarking guide warns about). The remaining gap
-/// to real jq is dominated by something else entirely, out of this issue's
-/// own scope.
-///
-/// This also fixes a real, jq-observable divergence, not just a speed one:
-/// `json::validate::validate` is a pure grammar check with no `f64`-range
-/// rejection, unlike `serde_json::Value` -- so a magnitude-overflowing
-/// literal (`1e400`) that used to silently drop as an "unparseable" record
-/// now materializes correctly (`1E+400`, matching real jq's own primary-
-/// document-input behavior, live-verified) instead. `validate_json_str`
-/// (used by `--argjson` and this function's own leading-zero retry below)
-/// keeps its `serde_json::Value`-based magnitude rejection unchanged --
-/// this fix is scoped to `parse_json_seq`'s own hot path only; see #1267's
-/// own text for why extending it to the shared `--argjson` helper too
-/// isn't attempted here (that path's error-message text is user-visible
-/// and untouched by this issue).
-///
-/// Also retries a failed segment with its leading zeros stripped before
-/// giving up on it, mirroring `parse_json_value`'s own `--argjson` retry
-/// (#1094, extended here to `--seq`, #1243) -- real jq's own number parser
-/// tolerates a leading zero (`007`) that strict JSON doesn't, so `007e5`
-/// silently dropping as an unparseable record (RFC 7464's own recommended
-/// failure mode -- but only for content that's actually malformed, not for
-/// a shape jq itself accepts) was a real, jq-observable divergence, not a
-/// spelling nit.
 /// Build the values (and, when `!slurp`, one `(source, line)` location per
 /// value) for `--seq` input across the whole file list at once (#1571).
 ///
@@ -4068,6 +4021,55 @@ fn remap_ends_to_locations(
 /// existed here too until its own last caller (this function's own
 /// predecessor) was replaced -- removed rather than kept unused, per its
 /// own three unit tests now calling this function directly instead.
+///
+/// The rationale below described the `parse_json_seq` wrapper named
+/// above and outlived it, left stacked on `build_seq_values`'s own
+/// docs where it read as one comment describing the wrong function.
+/// Moved here, where the behaviour it describes actually lives (#1723).
+///
+/// Preserves number-literal source fidelity the same way `parse_json_value`
+/// does for `--argjson` (#1058, extended here to `--seq`, #1093): each
+/// segment is already isolated by the RS split, so a validate-then-
+/// materialize step can validate and materialize the same segment text
+/// directly -- no boundary-tracking needed, unlike `parse_json_stream`
+/// above.
+///
+/// Validates via the crate's own zero-allocation RFC 8259 grammar
+/// validator (`json::validate::validate`, already used by `--validate`/
+/// `json validate`) rather than `validate_and_materialize_json`'s
+/// `serde_json::Value`-tree-based check (#1267) -- `--seq` is a streaming,
+/// record-oriented format, so a discarded parse tree's allocation cost is
+/// paid once per record rather than a bounded number of times per run the
+/// way `--argjson`/`--jsonargs` pay it. Measured (500k-record stream,
+/// interleaved A/B, 5 reps -- real jq's own baseline is ~0.47s either way):
+/// a real but modest ~10-20% improvement (median ~1.30s -> ~1.15s), not the
+/// dramatic win a first, non-interleaved measurement suggested (1.38s ->
+/// 1.56s, i.e. apparently *worse* -- sequential-halves noise, the exact
+/// trap this repo's own benchmarking guide warns about). The remaining gap
+/// to real jq is dominated by something else entirely, out of this issue's
+/// own scope.
+///
+/// This also fixes a real, jq-observable divergence, not just a speed one:
+/// `json::validate::validate` is a pure grammar check with no `f64`-range
+/// rejection, unlike `serde_json::Value` -- so a magnitude-overflowing
+/// literal (`1e400`) that used to silently drop as an "unparseable" record
+/// now materializes correctly (`1E+400`, matching real jq's own primary-
+/// document-input behavior, live-verified) instead. `validate_json_str`
+/// (used by `--argjson` and this function's own leading-zero retry below)
+/// keeps its `serde_json::Value`-based magnitude rejection unchanged --
+/// this fix is scoped to `parse_json_seq`'s own hot path only; see #1267's
+/// own text for why extending it to the shared `--argjson` helper too
+/// isn't attempted here (that path's error-message text is user-visible
+/// and untouched by this issue).
+///
+/// Also retries a failed segment with its leading zeros stripped before
+/// giving up on it, mirroring `parse_json_value`'s own `--argjson` retry
+/// (#1094, extended here to `--seq`, #1243) -- real jq's own number parser
+/// tolerates a leading zero (`007`) that strict JSON doesn't, so `007e5`
+/// silently dropping as an unparseable record (RFC 7464's own recommended
+/// failure mode -- but only for content that's actually malformed, not for
+/// a shape jq itself accepts) was a real, jq-observable divergence, not a
+/// spelling nit.
 fn parse_json_seq_with_ends(s: &str) -> Vec<(OwnedValue, usize)> {
     let bytes = s.as_bytes();
     const RS: u8 = 0x1e;
