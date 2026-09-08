@@ -792,7 +792,10 @@ fn yaml_to_owned_value<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> Result<Own
                 .as_str()
                 .map_err(|e| anyhow::anyhow!("invalid YAML string: {e}"))?;
 
-            if let Some(explicit) = cursor.explicit_tag() {
+            // #2621: `cursor.value()` above already proved `cursor` isn't
+            // `Alias` by matching `String`, so `None` skips a second
+            // resolve.
+            if let Some(explicit) = cursor.explicit_tag_at(None) {
                 if let Some(resolved) = resolve_tagged(&str_value, explicit) {
                     return Ok(resolved.to_owned_value_for_json_bridge(str_value));
                 }

@@ -41007,7 +41007,10 @@ fn yaml_value_to_owned_checked<W: Clone + AsRef<[u64]>>(
                 Err(e) => return Err(EvalError::decode_failure(e.message())),
             };
 
-            if let Some(explicit) = cursor.explicit_tag() {
+            // #2621: `cursor.value()` above already proved `cursor` isn't
+            // `Alias` by matching `String`, so `None` skips a second
+            // resolve.
+            if let Some(explicit) = cursor.explicit_tag_at(None) {
                 if let Some(resolved) = resolve_tagged(&str_value, explicit) {
                     return Ok(resolved.to_owned_value(str_value));
                 }

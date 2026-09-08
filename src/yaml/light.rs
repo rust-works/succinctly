@@ -2534,25 +2534,27 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         self.explicit_tag_at(Some(&self.value()))
     }
 
-    /// Internal sibling of [`Self::explicit_tag`] for this module's call
-    /// sites that already know whether this cursor is an alias without a
-    /// fresh [`Self::value`] call (#1114 review, #2617, #2619) -- both
-    /// write paths (e.g. `write_deferred_value`) and read/query paths
-    /// (e.g. `tag()`, `is_falsy`) alike; nothing about the proof is
-    /// specific to writing. Not `pub`, deliberately: unlike
-    /// [`Self::stream_yaml_value_at`], where `None` always falls back to a
-    /// full resolve and so is unconditionally safe, `None` here skips the
-    /// alias check outright with no fallback -- safe only when the caller
-    /// can already prove the cursor isn't an alias, not a general-purpose
-    /// default. Pass `Some(&resolved)` when a prior `value()` call already
-    /// produced it (e.g. `write_deferred_value`'s `resolved` local on its
-    /// `absent` branch), or `None` when the proof is purely structural --
-    /// either a matched `YamlValue::String` on this same cursor (an alias
-    /// node parses to `YamlValue::Alias`, never `String`), or
-    /// `is_container()`/`is_yaml_cursor_container()` (a bitvector check;
-    /// a container position can never be an alias).
+    /// Sibling of [`Self::explicit_tag`] for a caller that already knows
+    /// whether this cursor is an alias without a fresh [`Self::value`] call
+    /// (#1114 review, #2617, #2619, #2621) -- write paths (e.g.
+    /// `write_deferred_value`), read/query paths (e.g. `tag()`,
+    /// `is_falsy`), and cross-crate owned-value conversion (e.g.
+    /// `src/jq/eval.rs`'s `yaml_value_to_owned_checked`, the `succinctly`
+    /// binary's own `yaml_to_owned_value`) alike; nothing about the proof
+    /// is specific to any one of those. `pub`, but **not** a
+    /// general-purpose default: unlike [`Self::stream_yaml_value_at`],
+    /// where `None` always falls back to a full resolve and so is
+    /// unconditionally safe, `None` here skips the alias check outright
+    /// with no fallback -- safe only when the caller can already prove the
+    /// cursor isn't an alias. Pass `Some(&resolved)` when a prior
+    /// `value()` call already produced it (e.g. `write_deferred_value`'s
+    /// `resolved` local on its `absent` branch), or `None` when the proof
+    /// is purely structural -- either a matched `YamlValue::String` on
+    /// this same cursor (an alias node parses to `YamlValue::Alias`, never
+    /// `String`), or `is_container()`/`is_yaml_cursor_container()` (a
+    /// bitvector check; a container position can never be an alias).
     #[inline]
-    fn explicit_tag_at(&self, known_value: Option<&YamlValue<'a, W>>) -> Option<&str> {
+    pub fn explicit_tag_at(&self, known_value: Option<&YamlValue<'a, W>>) -> Option<&str> {
         if let Some(YamlValue::Alias { target, .. }) = known_value {
             // Not `target.and_then(|t| t.explicit_tag())`: `t` is a local
             // `YamlCursor` moved into the closure, so a call through `&t`
