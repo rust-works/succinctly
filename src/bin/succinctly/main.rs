@@ -2399,6 +2399,7 @@ mod generators;
 mod jq_bench;
 mod jq_locate;
 mod jq_runner;
+mod jq_seq_reader;
 mod json_validate;
 mod m2_gate;
 mod output;

@@ -2289,9 +2289,19 @@ fn get_inputs(
     // "ignoring parse error" wording there would misrepresent succinctly's
     // separate, still-unfixed non-fatal behavior as though it now matched
     // jq; left silent instead until that's fixed properly.
+    //
+    // The two arms are exactly disjoint: `seq_no_rs_byte_warning` answers
+    // `Some` only for a stream with no RS byte anywhere, which is the one
+    // case `jq_seq_reader` is not asked about (#1723). Raw bytes, before
+    // the UTF-8 substitution below, because jq counts columns in bytes.
     if args.seq && !args.raw_input && args.input_dsv.is_none() && !args.null_input {
-        if let Some(warning) = seq_no_rs_byte_warning(&raw_bytes) {
-            eprintln!("{warning}");
+        match seq_no_rs_byte_warning(&raw_bytes) {
+            Some(warning) => eprintln!("{warning}"),
+            None => {
+                for warning in crate::jq_seq_reader::parse_warnings(&raw_bytes) {
+                    eprintln!("{warning}");
+                }
+            }
         }
     }
 
@@ -4471,28 +4481,22 @@ fn seq_stream_trailing_record_is_dropped(raw_inputs: &[(Option<usize>, String)])
 fn seq_no_rs_byte_warning(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> Option<String> {
     let mut line = 1usize;
     let mut column = 0usize;
-    let mut bytes_seen = 0usize;
-    for (_, raw) in raw_bytes {
-        let bytes = if bytes_seen == 0 {
-            raw.strip_prefix(crate::front_matter::UTF8_BOM)
-                .unwrap_or(raw)
-        } else {
-            raw.as_slice()
-        };
-        for &b in bytes {
-            if b == ASCII_RS {
-                return None;
-            }
-            if b == b'\n' {
-                line += 1;
-                column = 0;
-            } else {
-                column += 1;
-            }
+    // Shares `stream_bytes` with `jq_seq_reader`, which walks this same
+    // stream to classify the templates that apply once an RS *is* present
+    // (#1723) -- the two must agree on BOM handling and on where a column
+    // starts, so they read the stream through one iterator.
+    for b in crate::jq_seq_reader::stream_bytes(raw_bytes) {
+        if b == ASCII_RS {
+            return None;
         }
-        bytes_seen += raw.len();
+        if b == b'\n' {
+            line += 1;
+            column = 0;
+        } else {
+            column += 1;
+        }
     }
-    if bytes_seen == 0 && raw_bytes.is_empty() {
+    if raw_bytes.is_empty() {
         return None;
     }
     Some(format!(
