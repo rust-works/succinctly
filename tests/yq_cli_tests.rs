@@ -38903,6 +38903,193 @@ fn test_alternative_over_alias_fanout_completes_2476() -> Result<()> {
     Ok(())
 }
 
+/// #2476: bare `any`/`all` over the same alias fan-out `and`/`or`/`not`/`//`
+/// were fixed against. Neither had an arm in `eval_builtin` at all, so both
+/// fell to its `_` wildcard, whose first act is `to_owned_with_cursor` on
+/// the value they were applied to -- `O(2^N)` when that value is the
+/// fan-out. `any_all_generic` validates the input once with the walk
+/// (`push_generic_document_validation_error`, which #1804 stops at a
+/// container alias) and then answers from `is_falsy` alone, so the first
+/// element decides.
+///
+/// Asserts completion and the correct value, not a wall-clock bound -- same
+/// rationale as `test_alternative_over_alias_fanout_completes_2476` above (a
+/// regression hangs the suite rather than failing an assert). N=22 here for
+/// the same reason it is 22 there; the release binary at N=22 went from
+/// 5.95s to 0.02s on an Apple M-series.
+///
+/// `[.a22] | any` is deliberately absent: array construction materializes
+/// its outputs by design (the output *is* the expanded tree), so that shape
+/// is out of scope for this fix and would still hang.
+#[test]
+fn test_any_all_over_alias_fanout_completes_2476() -> Result<()> {
+    let mut doc = String::from("a0: &a0 leaf\n");
+    for i in 1..=22 {
+        doc.push_str(&format!("a{i}: &a{i} [*a{}, *a{}]\n", i - 1, i - 1));
+    }
+
+    for (filter, want) in [
+        // The fan-out's first element is a truthy container, so `any` stops
+        // there and `all` finds no falsy element in the two it walks.
+        (".a22 | any", "true"),
+        (".a22 | all", "true"),
+        // The input is itself an alias here, which is the shape the walk
+        // short-circuits on outright.
+        (".a22[0] | any", "true"),
+        (".a22[0] | all", "true"),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, &doc, &[])?;
+        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), want, "`{filter}` -- stderr: {stderr:?}");
+    }
+
+    Ok(())
+}
+
+/// #2476: `any`/`all` reject a non-array input in yq mode, and the native
+/// arm has to keep doing so -- with real yq's own wording, and with the
+/// #1901 arm *order* that puts the rejection ahead of `optional` (an
+/// earlier version of the eager code had them the other way round, which
+/// made `any?` on a `!!map` silently answer nothing).
+///
+/// Every row captured live from yq v4.53.3:
+///
+/// ```text
+/// {a: 1} | any   Error: any only supports arrays, was !!map     (exit 1)
+/// {a: 1} | all   Error: all only supports arrays, was !!map     (exit 1)
+/// 1 | any        Error: any only supports arrays, was !!int     (exit 1)
+/// null | any     Error: any only supports arrays, was !!null    (exit 1)
+/// "s" | any      Error: any only supports arrays, was !!str     (exit 1)
+/// true | any     Error: any only supports arrays, was !!bool    (exit 1)
+/// [1] | any      true                                           (exit 0)
+/// [] | any       false                                          (exit 0)
+/// [] | all       true                                           (exit 0)
+/// [null, 1] | any  true    [null, 1] | all  false               (exit 0)
+/// ```
+///
+/// `!!int`/`!!null`/... is the *untagged* tag (`document_value_type_tag`,
+/// the generic twin of `eval::yaml_type_tag`), which is what real yq's
+/// message quotes -- not `tag`'s cursor-aware answer.
+#[test]
+fn test_any_all_reject_non_arrays_in_yq_mode_2476() -> Result<()> {
+    for (doc, filter, want_tag) in [
+        ("a: 1\n", "any", "!!map"),
+        ("a: 1\n", "all", "!!map"),
+        ("1\n", "any", "!!int"),
+        ("1\n", "all", "!!int"),
+        ("null\n", "any", "!!null"),
+        ("null\n", "all", "!!null"),
+        ("\"s\"\n", "any", "!!str"),
+        ("true\n", "any", "!!bool"),
+        ("1.5\n", "any", "!!float"),
+    ] {
+        let (_, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &[])?;
+        assert_eq!(code, 1, "`{filter}` on {doc:?} -- stderr: {stderr:?}");
+        let name = if filter == "any" { "any" } else { "all" };
+        assert!(
+            stderr.contains(&format!("{name} only supports arrays, was {want_tag}")),
+            "`{filter}` on {doc:?} -- stderr: {stderr}"
+        );
+    }
+
+    // Arrays answer, with yq's own truthiness (`null` is falsy, `0` is not).
+    for (doc, filter, want) in [
+        ("[1]\n", "any", "true"),
+        ("[1]\n", "all", "true"),
+        ("[]\n", "any", "false"),
+        ("[]\n", "all", "true"),
+        ("[null, 1]\n", "any", "true"),
+        ("[null, 1]\n", "all", "false"),
+        ("[0]\n", "any", "true"),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &[])?;
+        assert_eq!(code, 0, "`{filter}` on {doc:?} -- stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), want, "`{filter}` on {doc:?}");
+    }
+
+    // #1901's arm order: `?` does not get to swallow the rejection ahead of
+    // it, but it does suppress the type error itself once reached -- the
+    // same split the before-this-change bridge produced (`{a: 1} | any?`
+    // and `1 | any?` are both empty at exit 0).
+    for doc in ["a: 1\n", "1\n"] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr("any?", doc, &[])?;
+        assert_eq!(code, 0, "{doc:?} -- stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), "", "{doc:?}");
+    }
+
+    Ok(())
+}
+
+/// #2476: `any`/`all` now share #1804's accepted trade-off, exactly as the
+/// `not` and `//` arms of this same issue do.
+///
+/// `any_all_generic` validates its input with
+/// `push_generic_document_validation_error` -- and that walk deliberately
+/// does not descend into a container reached through an alias, because
+/// doing so is what costs `O(2^N)` on a fan-out. The scan that follows
+/// reads `is_falsy`, which materializes nothing. So a decode failure
+/// reachable *only* through an alias to a container no longer raises from
+/// `any`/`all`: `.b | any` on the document below exited 1 with "invalid
+/// escape sequence" before this change (via the bridge's materialization)
+/// and is `true` at exit 0 after it. Both halves verified against a release
+/// build of the parent commit and of this one.
+///
+/// Everything that still raises is pinned here too, so the trade-off cannot
+/// silently widen: visiting the anchor directly, materializing through the
+/// alias, and the scalar-alias sibling #1804's own short-circuit
+/// deliberately excludes.
+///
+/// Real yq rejects this document at parse time (`yq` v4.53.3 refuses the
+/// `\q` escape outright), so there is no yq behaviour to match either way.
+/// Recorded in `docs/compliance/yq/limitations.md` under #1804.
+#[test]
+fn test_any_all_no_longer_raise_on_decode_failure_behind_a_container_alias_2476() -> Result<()> {
+    let doc = "a: &a [\"bad\\qc\"]\nb: *a\n";
+
+    // `.b` is an alias to a container: the walk stops at it, and the scan
+    // reads the one element's truthiness without decoding it.
+    for (filter, want) in [(".b | any", "true"), (".b | all", "true")] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &[])?;
+        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), want, "`{filter}` -- stderr: {stderr:?}");
+    }
+
+    // Visiting the anchor itself still raises -- it is not an alias, so the
+    // walk descends into its element and decodes the string.
+    for filter in [".a | any", ".a | all"] {
+        let (_, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &[])?;
+        assert_ne!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert!(
+            stderr.contains("invalid escape sequence"),
+            "`{filter}` -- stderr: {stderr}"
+        );
+    }
+
+    // Materializing through the alias still raises.
+    let (_, stderr, code) = run_yq_stdin_with_stderr(".b[0]", doc, &[])?;
+    assert_ne!(code, 0, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("invalid escape sequence"),
+        "stderr: {stderr}"
+    );
+
+    // The scalar-alias sibling: `.b`'s target is a bare scalar, not a
+    // container, so #1804's short-circuit does not apply. The walk decodes
+    // it and raises before the yq-mode "only supports arrays" rejection the
+    // scalar would otherwise get -- decode failure wins (#1620/#1989).
+    let scalar_doc = "a: &a \"bad\\qc\"\nb: *a\n";
+    for filter in [".b | any", ".b | all"] {
+        let (_, stderr, code) = run_yq_stdin_with_stderr(filter, scalar_doc, &[])?;
+        assert_ne!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert!(
+            stderr.contains("invalid escape sequence"),
+            "`{filter}` -- stderr: {stderr}"
+        );
+    }
+
+    Ok(())
+}
+
 /// #2476: the native `//` arm hands the left's surviving outputs -- and the
 /// right's, when the left had none -- straight through as
 /// `OneCursor`/`ManyCursor`, where the bridge used to materialize them into
