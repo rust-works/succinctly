@@ -108,8 +108,10 @@ one of them needs checking against the other.** The residual — constructs that
 bind before the stop can reach it (`//`, a nested `first(...)`, `foreach`, a parenthesised bind
 whose break comes from a downstream pipe stage) — is items 9/10's own missing-lazy-arm class,
 not a `?//` question, and is tracked as
-[#2180](https://github.com/rust-works/succinctly/issues/2180), whose WP1 and WP2a have since
-closed the nested-consumer and `//`/`and`/`or` parts of it (see item 10).
+[#2180](https://github.com/rust-works/succinctly/issues/2180), whose four work packages have all
+since landed — nested consumers, `//`/`and`/`or`, the remaining eager sub-expression sites, and
+`foreach` (see item 10). What survives them is `foreach`'s own UPDATE and INIT positions, which
+that item records.
 
 **Option (c), scoped.** `first`/`last` were the *only* `eval_generic.rs` consumers with a
 native, cursor-preserving fast-path arm shadowing `eval.rs`'s already-lazy implementation
@@ -1410,7 +1412,7 @@ the reasoning behind each placement:
     - **WP3** — `foreach`, the only genuinely new mechanism: the sink's `Demand::Stop` must be
       treated exactly as `Control::Break` is today (`is_retryable_stop`), with foreach's own
       state threading intact (a retried alternative's UPDATE runs on the already-updated state,
-      not a fresh one).
+      not a fresh one). **Landed** — see below.
 
     **WP1 landed**, and its 93 sweep rows closed exactly as the work-package split predicted —
     no change to `each_pattern_alternatives`/`each_pattern_alternatives_generic` at all, only
@@ -1513,3 +1515,47 @@ the reasoning behind each placement:
       so `fanout_arg_each` needed no change; the cost of WP1 having got that abstraction right
       was one fewer mechanism here. `each_as`'s doc comment used to justify the eager source by
       analogy to `each_if`'s eager `cond`; both justifications were pre-#1519 and both are gone.
+
+    **WP3 landed**, closing the last 18 sweep rows attributed to this issue. The sweep now runs
+    648 cases (WP3 added pattern-position and EXTRACT-position wrapper entries) at **0 unexpected,
+    0 known**, with `scripts/jq-fanout-oracle-sweep.sh` still 490/490. `eval.rs` gained
+    `each_foreach` and `eval_generic.rs` a native `each_foreach_generic`, both driving the source
+    through `eval_each`/`eval_each_generic` one element at a time;
+    `try_foreach_step_alternatives` now drives each step's EXTRACT through `eval_each_owned` and
+    pushes its outputs as they are produced, and its `outputs: &mut Vec<OwnedValue>` parameter
+    became a `Demand`-answering sink. Four findings:
+
+    - **The stop-as-break rule extended to state threading with no exception anywhere the
+      oracle could show one.** `foreach`'s `?//` retries on `Flow::Stopped` under
+      `is_retryable_stop`, and the retried alternative resumes from the accumulator the stopped
+      attempt already produced @EM@ `[first(foreach (1) as $x ?// $y (0;.+1;.), "z")]` is `[1,2]`,
+      not `[1,1]`. That is exactly #1458's rule for a `Control::Break` escaping EXTRACT (the
+      retry is seeded with the failed EXTRACT call's own input), and the composed row
+      `[first(foreach (1) as $x ?// $y (0; .+1; (1 as $a ?// $b | .)))]` = `[1,1,2,2]` was
+      predicted by the implementation before it was captured, then confirmed. The plan flagged a
+      possible divergence between the stop rule and the break rule as the case to stop and report
+      on; there was none.
+    - **One step loop, parameterised over the source strategy @EM@ and the parameter that made it
+      possible was the *substituted row*, not the source value.** The eager path hoists a whole
+      substitution matrix outside the INIT-fork loop (#695) and the lazy path structurally
+      cannot, so a core taking source values would have forced one side to give that up.
+      `foreach_fork` takes a `drive_source` closure that hands over already-substituted rows
+      instead: `eval_foreach_with_values` walks its matrix, `each_foreach`/`each_foreach_generic`
+      substitute per element as it arrives (`substitute_foreach_steps`, lifted out of the matrix
+      build), and neither pays for the other's shape.
+    - **A stop always ends the whole `foreach`, which is what makes INIT fan-out cheap to keep
+      eager.** `[first(foreach (1) as $x ?// $y ((0,100); .+1; .))]` is `[1,2]`: the `100` fork is
+      never attempted. So the first INIT fork can drive the source lazily while recording what it
+      saw, and later forks replay the recording @EM@ sound *because* a later fork is only ever
+      reached when the first ran the source to exhaustion. Re-driving instead would have
+      re-evaluated the source's side effects and re-popped `input`, a behaviour change the eager
+      path does not have.
+    - **Two positions inside `foreach` are left eager on purpose, and the sweep deliberately does
+      not carry them.** A `?//` in **UPDATE** (`[first(foreach (1) as $v (0; . + G))]` is `[1,1]`
+      in jq, `[1]` here) needs `fold_step_via_accumulator_or_fork` reshaped into a sink, and that
+      helper is shared with `reduce`'s own O(n) accumulator fix (#2157) @EM@ its outputs are
+      simultaneously the fold's next state. A `?//` in **INIT** (`[2,2]` in jq, `[2]` here) would
+      mean making jq's outermost loop (#534) lazy, which also has to stay ahead of the source
+      (#2440). Both are pinned as CLI rows rather than swept, so the sweep keeps its
+      0-unexpected/0-known contract; see
+      [`docs/compliance/jq/limitations.md`](../compliance/jq/limitations.md).

@@ -2981,21 +2981,77 @@ the closed leaks (`first(if (true, ("B"|stderr)) then 1 else 2 end)`,
 `first((1, ("B"|stderr)) as $v | $v)`, `first(select((true, ("B"|stderr))))`, and the
 destructive `input` spellings) in `test_short_circuit_side_effect_shapes_already_match_jq_820`.
 
-**What still diverges: `foreach`, and only `foreach`.** The stop only reaches the `?//` if every
-construct between the consumer and the bind *forwards demand* into it rather than materializing
-it, and `foreach` is the one construct left that does not — it is eager-only in both evaluators
-(`eval_foreach`/`eval_foreach_with_values`), so it evaluates its source to completion and its
-own `?//` pattern retry never sees a wrapping consumer's stop. `first(...)` reaches
-`eval_generic.rs`'s native arm and `isempty(...)` bridges wholesale to `eval.rs`'s `eval_each`, so
-both rows are confirmed under both — see the full matrix in
-`test_nested_short_circuit_consumer_hides_the_stop_2180` (`tests/jq_cli_tests.rs`) and
-`scripts/jq-alt-retry-oracle-sweep.sh`, whose only remaining attributed rows are these
-([#2180](https://github.com/rust-works/succinctly/issues/2180) WP3):
+**`foreach` no longer diverges in its source, its pattern or its EXTRACT — #2180 WP3 closed
+that group, and with it the last of the originally-filed rows.** `each_foreach` (`src/jq/eval.rs`)
+and `each_foreach_generic` (`src/jq/eval_generic.rs`) drive the source through
+`eval_each`/`eval_each_generic` one element at a time, and `try_foreach_step_alternatives` drives
+each step's EXTRACT through `eval_each_owned`, pushing its outputs as they are produced. Both
+evaluators share one fold loop, `foreach_fork`, parameterised over the source strategy —
+`eval_foreach_with_values` passes the collecting one (its pre-built substitution matrix plus the
+source stream's own trailing control) and the two new arms pass the lazy drive — so the eager
+and demand-driven `foreach` cannot drift on `?//` state threading.
 
-| filter                                                                                      | jq 1.7.1        | succinctly jq |
-|---------------------------------------------------------------------------------------------|-----------------|---------------|
-| `[first(foreach (1) as $x ?// $y (0;.+1;.), "z")]`                                          | `[1,2]`         | `[1]`         |
-| `1 \| [isempty(foreach (1 as $x ?// $y \| 1) as $v (0; .+$v; .))]` (source, not pattern)    | `[false,false]` | `[false]`     |
+**The rule this group turns on: a sink's `Demand::Stop` is `Control::Break` in different clothes,
+state threading included.** `foreach`'s own `?//` retries on the stop under `is_retryable_stop`,
+the sibling of `is_retryable_control`, and the retried alternative resumes from the accumulator
+the stopped attempt had already produced — which is why jq answers `[1,2]` and not `[1,1]`. That
+is the same state-threading rule #1458 established for a `Control::Break` escaping EXTRACT (the
+retry is seeded with the failed EXTRACT call's own input), and the oracle never showed the two
+rules differing anywhere. Every row confirmed live against jq 1.7.1 under both wrappers, input
+`1`:
+
+| filter                                                                                       | jq 1.7.1 and `succinctly jq` |
+|------------------------------------------------------------------------------------------------|------------------------------|
+| `[first(foreach (1) as $x ?// $y (0;.+1;.), "z")]`, `[first(foreach (1) as $x ?// $y (0;.+1))]` | `[1,2]`                      |
+| `[first(foreach (1) as $x ?// $y (0;.+1;., 99))]`                                              | `[1,2]`                      |
+| `[first(foreach (1 as $x ?// $y \| 1) as $v (0; .+$v; .))]` (source, not pattern)               | `[1,2]`                      |
+| `[isempty(foreach (1 as $x ?// $y \| 1) as $v (0; .+$v; .))]`                                   | `[false,false]`              |
+| `[first(foreach (1) as $v (0; .; (1 as $x ?// $y \| 1)))]` (EXTRACT)                            | `[1,1]`                      |
+| `[first(foreach (1) as $x ?// $y (0; .+1; (1 as $a ?// $b \| .)))]` (both)                      | `[1,1,2,2]`                  |
+| `[first(foreach (1) as $x ?// $y ((0,100); .+1; .))]` (generator INIT)                          | `[1,2]`                      |
+| `[first(foreach (1) as [$x] ?// $y (0;.+1;.), "z")]` (first alternative cannot match)           | `[1]`                        |
+
+The last two rows are the group's own rules, which the plain rows do not pin. A generator INIT
+still fans out eagerly and outermost (#534), but a stop inside the *first* fork still reaches the
+pattern's `?//`, and then ends the whole `foreach` — the `100` fork is never attempted. And a
+first alternative that cannot match the source element is skipped without consuming a retry,
+leaving only the last one, whose stop is not retryable at all.
+
+WP3 closed ordinary side-effect leaks with the same arms: `first(foreach (1, ("B"|stderr)) as $x
+(0; .+1))` and `first(foreach (1) as $x (0; .+1; ., ("E"|stderr)))` each ran a branch jq never
+reaches, and the destructive `input` spelling `[first(foreach (1, input) as $x (0; .+$x)), input]`
+over `"a" "b"` was `[1,"b"]` where jq answers `[1,"a"]`. Its over-stopping guard is pinned
+alongside them: a side effect *before* EXTRACT's first output (`first(foreach (1) as $x (0; .+1;
+("E"|stderr), .))`) is genuinely reached, in jq and here. All in
+`test_short_circuit_side_effect_shapes_already_match_jq_820`, together with the `path(...)`
+/`halt_error` pair that used to pin `binary_fanout_each`'s inner/outer `Flow::Stopped { pending }`
+asymmetry — that pair used `foreach` precisely because it was the last construct still reaching
+the eager fallback that *produces* a `pending`, and with the arm in place both spellings now match
+jq exactly. The asymmetry itself is unchanged; it simply has no `foreach` repro left.
+
+**What still diverges: `foreach`'s UPDATE and its INIT, and only those.** Two positions inside
+`foreach` are still evaluated eagerly, so a `?//` bind in either never sees the stop, and a side
+effect in either fires where jq never reaches it. Confirmed live under both wrappers:
+
+| filter                                                                     | jq 1.7.1        | succinctly jq   |
+|------------------------------------------------------------------------------|-----------------|-----------------|
+| `[first(foreach (1) as $v (0; . + (1 as $x ?// $y \| 1)))]` (UPDATE)         | `[1,1]`         | `[1]`           |
+| `[isempty(foreach (1) as $v (0; . + (1 as $x ?// $y \| 1)))]`                | `[false,false]` | `[false]`       |
+| `[first(foreach (1) as $v ((1 as $x ?// $y \| 1); .+1; .))]` (INIT)          | `[2,2]`         | `[2]`           |
+| `[isempty(foreach (1) as $v ((1 as $x ?// $y \| 1); .+1; .))]`               | `[false,false]` | `[false]`       |
+| `first(foreach (1) as $x (0; (.+1, ("U"\|stderr)); .))` (stderr in UPDATE)   | no write        | writes `U`      |
+| `first(foreach (1) as $x ((0, ("I"\|stderr)); .+1))` (stderr in INIT)        | no write        | writes `I`      |
+
+Both are deliberate. Driving **UPDATE** means reshaping `fold_step_via_accumulator_or_fork`,
+which `reduce`'s own O(n) accumulator fix (#2157) shares, and whose outputs are simultaneously
+the fold's next state — a separate change from WP3's rows. **INIT** is jq's outermost loop
+(#534: each INIT output is an independent run over the source) and must be evaluated before the
+source is ever pulled (#2440: `foreach halt_error as $x (empty; .)` exits 0), so both
+`eval_foreach` and `each_foreach` collect it. The rows above are pinned in
+`test_nested_short_circuit_consumer_hides_the_stop_2180` and
+`test_short_circuit_side_effect_leaks_820_932_987` (`tests/jq_cli_tests.rs`); they are
+deliberately *not* in `scripts/jq-alt-retry-oracle-sweep.sh`, which reports 0 unexpected and 0
+known over 648 cases and would lose that contract if permanent divergences were swept.
 
 **Two rows recorded here as of #2180's filing have since closed** — the issue text was stale on
 them. `1 | [label $o | (1 as $x ?// $y | 5) | (., break $o)]` closed at
@@ -3010,12 +3066,11 @@ owned evaluator, which lost the cursor a `break` needs to unwind through on its 
 a side effect, with no `?//`-specific work at either commit. Neither is the pipe rework the
 original filing guessed at.
 
-The cause is the same one every closed group above had, and it is not about `?//` at all:
-`foreach` lacks a demand-forwarding `eval_each`/`eval_each_generic` arm, so it evaluates the bind
-eagerly and absorbs the stop before it can reach `each_pattern_alternatives`. The one difference
-from the closed groups is that `foreach`'s *own* `?//` (its pattern position) must treat the
-sink's stop exactly as it already treats a `Control::Break` — retry the next alternative with the
-state threaded through, which is why jq's answer above is `[1,2]` and not `[1,1]`.
+The cause was the same one every closed group above had, and it was not about `?//` at all:
+`foreach` lacked a demand-forwarding `eval_each`/`eval_each_generic` arm, so it evaluated the bind
+eagerly and absorbed the stop before it could reach `each_pattern_alternatives`. No work package
+in this issue changed `each_pattern_alternatives`/`each_pattern_alternatives_generic` at all —
+each one only gave its constructs the arm `limit` already had.
 
 `limit` was the one consumer that already had such an arm (`each_limit`, #1462/#1596), and it was
 exactly the one that worked when nested — `1 | [first(limit(1; 1 as $x ?// $y | 1))]` was `[1,1]` in
@@ -3033,13 +3088,14 @@ argument the way the diverging constructs above do.
 This is the same missing-lazy-arm class as items 9 and 10 of
 [`docs/plan/jq-lazy-generator-consumers.md`](../../plan/jq-lazy-generator-consumers.md), tracked
 in [#2180](https://github.com/rust-works/succinctly/issues/2180), whose own plan (2026-09-08)
-splits the residual into four work packages — WP1 (nested consumers, **landed**), WP2a
-(`//`/`and`/`or`, **landed**), WP2b (the remaining eager sub-expression sites, **landed**), WP3
-(`foreach`) — each closing its own rows. WP1 took `scripts/jq-alt-retry-oracle-sweep.sh` from 93
-known divergences attributed to it to none (612 cases, 0 unexpected, 258 known across
-WP2a/WP2b/WP3); WP2a then took its own 96 to none (162 known across WP2b/WP3); WP2b took its own
-144 to none (612 cases, 0 unexpected, 18 known, all WP3's `foreach`). All three left
-`scripts/jq-fanout-oracle-sweep.sh` at 490/490.
+split the residual into four work packages — WP1 (nested consumers), WP2a (`//`/`and`/`or`), WP2b
+(the remaining eager sub-expression sites) and WP3 (`foreach`) — each closing its own rows, and
+**all four have landed**. WP1 took `scripts/jq-alt-retry-oracle-sweep.sh` from 93 known
+divergences attributed to it to none (612 cases, 0 unexpected, 258 known across WP2a/WP2b/WP3);
+WP2a then took its own 96 to none (162 known across WP2b/WP3); WP2b took its own 144 to none (612
+cases, 0 unexpected, 18 known, all WP3's `foreach`); WP3 took the last 18 to none and added
+pattern-position and EXTRACT-position wrapper entries, leaving **648 cases, 0 unexpected, 0
+known**. All four left `scripts/jq-fanout-oracle-sweep.sh` at 490/490.
 
 Unrelated to the other `?//` divergence recorded above
 ([#1365](https://github.com/rust-works/succinctly/issues/1365), `?//`-alternatives folds not being
