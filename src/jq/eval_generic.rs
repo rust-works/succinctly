@@ -74,7 +74,7 @@ use super::eval::{
 use super::expr::FuncDefBound;
 use super::expr::{
     AssignOp, BoundBody, Builtin, CompareOp, Expr, FormatType, FuncDefData, Literal, NumberKey,
-    ObjectEntry, ObjectKey, Pattern, StringPart, Tracked,
+    ObjectEntry, ObjectKey, Pattern, StringPart,
 };
 use super::slice::{literal_component_from_values, slice_str, SliceBounds};
 use super::value::{owned_value_eq, NumberRepr, OwnedValue};
@@ -13643,8 +13643,8 @@ fn path_context_step_computed_slice<S: EvalSemantics, V: DocumentValue>(
         for e in &ends {
             let slice = Expr::SliceExpr {
                 target: Box::new(Expr::Identity),
-                start: Some(Box::new(Expr::TrackedVar(Tracked::snapshot(s.clone())))),
-                end: Some(Box::new(Expr::TrackedVar(Tracked::snapshot(e.clone())))),
+                start: Some(Box::new(Expr::tracked_value(s.clone()))),
+                end: Some(Box::new(Expr::tracked_value(e.clone()))),
             };
             let slice = if bracket_optional {
                 Expr::Optional(Box::new(slice))
@@ -13949,9 +13949,9 @@ fn path_context_step_getpath<S: EvalSemantics, V: DocumentValue>(
                             PathNode::Absent => Rc::new(OwnedValue::Null),
                             PathNode::Owned(v) => Rc::clone(v),
                         };
-                        let segment = Expr::Builtin(Builtin::GetPath(Box::new(Expr::TrackedVar(
-                            Tracked::snapshot(OwnedValue::Array(vec![component.clone()])),
-                        ))));
+                        let segment = Expr::Builtin(Builtin::GetPath(Box::new(
+                            Expr::tracked_value(OwnedValue::Array(vec![component.clone()])),
+                        )));
                         let (values, control) = owned_identity_values::<S>(&segment, &value, false);
                         path_context_push_owned_children(
                             cpos,
@@ -16229,10 +16229,7 @@ fn path_context_resolve_constants<S: EvalSemantics>(
 /// The literal of a prefetched sub-expression's outputs: `empty` for none,
 /// the value for one, a comma of them for several.
 fn prefetched_literal(values: Vec<OwnedValue>) -> Expr {
-    let mut values: Vec<Expr> = values
-        .into_iter()
-        .map(|v| Expr::TrackedVar(Tracked::snapshot(v)))
-        .collect();
+    let mut values: Vec<Expr> = values.into_iter().map(Expr::tracked_value).collect();
     match values.len() {
         0 => Expr::Builtin(Builtin::Empty),
         1 => values.pop().expect("len checked"),
@@ -16255,7 +16252,7 @@ fn path_context_resolve_parent(at: &PathContextAt<'_>, n: usize) -> Result<Expr,
         return Ok(Expr::Builtin(Builtin::Empty));
     };
     Ok(match parent_of(n)? {
-        Some(v) => Expr::TrackedVar(Tracked::snapshot(v)),
+        Some(v) => Expr::tracked_value(v),
         None => Expr::Builtin(Builtin::Empty),
     })
 }
