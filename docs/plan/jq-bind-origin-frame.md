@@ -159,7 +159,8 @@ was never the register moving in the first place.
 Interleaved A/B on the pinned boxes (Apple M4 Pro, AMD Ryzen 9 7950X; 11 reps + warm-up,
 min and median; `users` corpora at 1 MB and 10 MB; base `main @ baa26d72e`), with cachegrind
 instruction counts on the 7950X at 1 MB. Output was byte-identical on all 29 workload×size
-pairs per machine, both rounds.
+pairs per machine in every round. Wall clock is the shipped head's; the instruction drift is
+the final head's (rebased onto `4b1ebba80`), after the fixes described below.
 
 | workload                                                    | 7950X Δ med    | M4 Pro Δ med   | Ir drift, 1 MB |
 | ----------------------------------------------------------- | -------------- | -------------- | -------------- |
@@ -167,9 +168,9 @@ pairs per machine, both rounds.
 | `del(.users[] \| select(.score < 100))`                     | +1.2 … +2.0%   | +0.8 … +1.5%   | +0.17%         |
 | `[paths] \| length`                                         | +0.6%          | +0.2%          | −0.00%         |
 | `[path(.users[] \| .age)] \| length`                       | +0.5 … +3.0%   | **−25 … −31%** | −0.00%         |
-| `(.users[] \| . as $r \| .score) \|= 1`                   | +2.3 … +4.0%   | −0.5 … +0.3%   | +1.62%         |
-| `(.users[] \| . as $r \| $r.score) = 1`                    | +2.7 … +4.9%   | +1.3 … +1.8%   | +1.61%         |
-| `del(.users[] \| .score as $y \| select($y < 100))`        | +5.1 … +6.7%   | +7.0 … +8.8%   | +5.51%         |
+| `(.users[] \| . as $r \| .score) \|= 1`                   | +0.6 … +1.7%   | +2.9 … +3.9%   | +0.55%         |
+| `(.users[] \| . as $r \| $r.score) = 1`                    | −0.3 … −1.4%   | −2.1 … +0.1%   | +0.79%         |
+| `del(.users[] \| .score as $y \| select($y < 100))`        | −0.6 … −0.8%   | +0.3 … +3.2%   | +0.45%         |
 | `[path(.users[] \| .score as $y \| .age)]` (100 KB/300 KB) | −2.3 … −6.2%   | −0.0 … −0.5%   | —              |
 
 Three findings, in order of what they cost:
@@ -187,8 +188,21 @@ Three findings, in order of what they cost:
   literal, so every branch went through `to_json_for_reindex` + `JsonIndex::build`. Admitting
   the marker there (`da36d45bb`) cut it to **+5.5% instructions, +5 … +9% wall clock**; the
   demand gate (`var_reaches_path_position`) then removes the witness itself for that shape,
-  since `$y` never leaves `select(..)`. The `. as $r` shapes' +1.6% instructions is the
-  per-stage `Frame::extend` on a gate-true target, recorded, not chased.
+  since `$y` never leaves `select(..)`: **+0.45% instructions**, wall clock inside each run's
+  own offset. The `. as $r` shapes cost +1.6% instructions at the first cut (the per-stage
+  `Frame::extend` on a gate-true target); sharing one `Rc<Tracked>` per binding took the `=`
+  row to +0.8%, but built eagerly it cloned an unused `$r` and pushed the `|=` row to +4.5% —
+  the one row the third round moved backwards — until the marker was made lazy (built on the
+  first occurrence): **+0.55%**.
+- **CI's x86 perf-guard read +5.3% / +5.2% on the two identity queries** against its merge-base
+  build, while the ARM guard on the same head read −0.0 … −0.3% and terminus read +0.0% on the
+  same two trees. Holding the source constant and changing only
+  `CARGO_PROFILE_RELEASE_CODEGEN_UNITS` (16 → 1) reproduces exactly those two queries at
+  +5.6% / +5.4%, and `cg_annotate` puts the whole delta in `json/light.rs`, `trees/bp.rs`,
+  `document.rs` and `memcpy` — functions present as a symbol in one build and inlined away in
+  the other. A `.` query never enters the resolver, and no symbol from `eval.rs` appears in its
+  profile. The identity queries are codegen-layout-sensitive at about the guard's own 5%
+  threshold; recorded on [#2655](https://github.com/rust-works/succinctly/issues/2655).
 - **perf-guard passed at −0.0% on all six queries, both rounds** — and could not have seen
   either the regression or its fix, because its matrix has no `path()`/`del()`/assignment
   target and no `as`. [#2655](https://github.com/rust-works/succinctly/issues/2655) adds the
