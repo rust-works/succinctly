@@ -38292,3 +38292,48 @@ fn test_as_binding_keeps_the_input_identity_2563() -> Result<()> {
     }
     Ok(())
 }
+
+/// #2161's yq-mode gate. The `foreach` fold register fix lets a step whose
+/// accumulator is still the register's own value re-enter the register
+/// instead of refusing — which on the *write* side turns a refusal into a
+/// write. yq must not take that half.
+///
+/// Same rule, and the same reason, as `trackable_step_register_eligible`'s
+/// existing mode gate: real yq no-ops a field access against a scalar rather
+/// than navigating through it, so writing here would be silent data
+/// corruption rather than the fidelity win it is in jq mode. Confirmed live
+/// against yq v4.53.3 on the non-fold analogue, which is as close as the
+/// oracle gets (real yq's lexer rejects `foreach` outright):
+///
+/// ```console
+/// $ printf 'null\n' | yq '(null | .a) = 5'
+/// null
+/// ```
+///
+/// jq mode keeps the write — `jq -n '(foreach (1) as $k (null; .a)) = 5'` is
+/// `{"a":5}`, and `succinctly jq` matches it — so this is a mode divergence,
+/// not a missing fix. Pinned here because the un-gated version of #2161
+/// silently produced `a: 5` and only review caught it.
+#[test]
+fn test_foreach_register_reentry_is_jq_mode_only_on_the_write_side_2161() -> Result<()> {
+    for filter in [
+        "(foreach (1) as $k (null; .a)) = 5",
+        "(foreach (1,2) as $k (null; .a)) = 5",
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "null\n", &[])?;
+        assert_eq!(
+            code, 1,
+            "`{filter}` -- stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert!(
+            stdout.trim().is_empty(),
+            "`{filter}` must not write: stdout: {stdout:?}"
+        );
+        assert!(
+            stderr.contains("Invalid path expression"),
+            "`{filter}` -- stderr: {stderr:?}"
+        );
+    }
+
+    Ok(())
+}

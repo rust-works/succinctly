@@ -28126,6 +28126,16 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                     // every step *without* its own source-derived register
                     // (including reduce's own final emission below) is
                     // still checked against.
+                    //
+                    // **#2161**: `resolve_foreach`'s equivalent site no
+                    // longer treats provenance as the whole rule -- it also
+                    // consults `register_identical`, so a step whose
+                    // accumulator is still the register's own value
+                    // re-enters it. This site was deliberately left alone
+                    // (fixing it moves 696 more cases onto jq, measured),
+                    // so `path(reduce (1,2) as $k (.b; .a))` on `{"a":1}`
+                    // still refuses where the `foreach` spelling succeeds.
+                    // Tracked at #2632.
                     let last = branches.into_iter().last();
                     (acc_at_register, acc_snapshot) = reg.branch_provenance(last.as_ref());
                     acc = last.map(|b| b.value.into_owned());
@@ -28187,6 +28197,16 @@ fn resolve_reduce<'a, S: EvalSemantics>(
 /// EXTRACT) rather than folded away, and the source stream's own trailing
 /// control is applied per-fork after that fork's own inner loop (#534
 /// follow-up), not deferred until every fork has run.
+///
+/// **#2161 adds a fourth difference, and it is a divergence from
+/// [`resolve_reduce`] rather than a shared rule**: this function re-enters
+/// the fixed register on every source element, deciding each step's
+/// `at_register` from jq's own `jv_identical(current_input, value_at_path)`
+/// (via [`register_identical`]) *as well as* the previous step's
+/// [`FoldRegister::branch_provenance`]. `resolve_reduce`'s own carry-forward
+/// still uses provenance alone, so `path(reduce (1,2) as $k (.b; .a))` on
+/// `{"a":1}` still refuses where the `foreach` spelling now succeeds --
+/// tracked at #2632, not an intended asymmetry.
 #[allow(clippy::too_many_arguments)] // STYLE-0004: `snapshot` (#1591) joins `trackable` as the
                                      // ambient pair threaded verbatim through every one of
                                      // `resolve_node`'s ~20 recursive call sites in this file; a
@@ -28338,6 +28358,21 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                 // `true` for a `null`/`bool` accumulator. Dropping either
                 // half regresses one of the two shapes below.
                 //
+                // **jq mode only**, for exactly the reason
+                // [`trackable_step_register_eligible`] gates its own
+                // re-establishment the same way: the new half turns a step
+                // that would have refused into one that navigates, and on
+                // the *write* side that is a write where yq no-ops. Live
+                // against yq v4.53.3, `(null | .a) = 5` on `null` is a
+                // no-op, so `(foreach (1) as $k (null; .a)) = 5` writing
+                // `a: 5` would be exactly the silent corruption that gate's
+                // doc comment calls "a worse outcome than the refusal it
+                // would replace". yq mode therefore stays refuse-only here,
+                // as it already is for the single-step and carried-forward
+                // shapes. The carried half is left ungated: it is the
+                // pre-existing behaviour, not something this change
+                // introduces.
+                //
                 // Live against jq 1.7.1, on `{"a":1}`:
                 //
                 // ```console
@@ -28360,7 +28395,8 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                         trackable: reg.trackable,
                     },
                     state_at_register
-                        || (reg.trackable
+                        || (S::TAG == EvalTag::Jq
+                            && reg.trackable
                             && register_identical(&reg.value, &state, state_snapshot)),
                 ),
             };
