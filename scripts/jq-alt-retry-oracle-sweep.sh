@@ -98,17 +98,21 @@ G_VARIANTS=(
 # unexpected by definition. Delete a row's WP_TAG (blank it) once that work
 # package lands; its rows must then match jq or the sweep will fail loudly.
 W_ENTRIES=(
-  # -- WP1: nested consumers (each_first/each_nth/each_isempty/
-  #    each_any_all_gen_cond/each_upper_in gain a demand-forwarding arm) --
-  'nested-first::WP1::first(__G__)'
-  'nested-nth::WP1::nth(0; __G__)'
-  'nested-isempty::WP1::isempty(__G__)'
-  'nested-any::WP1::any(__G__; .)'
-  'nested-IN::WP1::IN(__G__)'
-  'nested-IN-src::WP1::IN(1; __G__)'
+  # -- WP1: CLOSED. each_first/each_nth/each_isempty/
+  #    each_any_all_gen_cond/each_upper_in (eval.rs) and
+  #    each_first_generic/each_nth_generic + bridge_to_each_owned_flow
+  #    (eval_generic.rs) all forward demand now, so these rows must match
+  #    jq -- their WP_TAG is blanked and any divergence here is unexpected
+  #    by definition. --
+  'nested-first::::first(__G__)'
+  'nested-nth::::nth(0; __G__)'
+  'nested-isempty::::isempty(__G__)'
+  'nested-any::::any(__G__; .)'
+  'nested-IN::::IN(__G__)'
+  'nested-IN-src::::IN(1; __G__)'
   # -- confirmed correct: limit is the one consumer that already
-  #    demand-forwards (each_limit, #1462/#1596); the worked example WP1
-  #    copies. --
+  #    demand-forwarded before WP1 (each_limit, #1462/#1596); the worked
+  #    example WP1's five arms copy. --
   'nested-limit::::limit(1; __G__)'
   # -- WP2a: `//`, `and`, `or` (each_alternative + boolean_fanout_core) --
   'alt-fallback::WP2a::(__G__)//9'

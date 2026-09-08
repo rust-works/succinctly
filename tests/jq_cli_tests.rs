@@ -31499,10 +31499,12 @@ fn test_as_pattern_alternatives_retry_under_a_wrapping_consumer_1519() -> Result
 /// between a short-circuiting consumer and a `?//` bind is a visible
 /// one-instead-of-two, split across four work packages.
 ///
-/// `limit` is the control: it is the only consumer with a demand-forwarding
-/// `eval_each` arm (`each_limit`, #1462/#1596), and it is the only one that
-/// works when nested. That contrast is the evidence the cause is the missing
-/// arm and not `?//` itself, so it is pinned here rather than only described.
+/// `limit` was the control: before WP1 it was the only consumer with a
+/// demand-forwarding `eval_each` arm (`each_limit`, #1462/#1596), and it was
+/// the only one that worked when nested. That contrast is the evidence the
+/// cause is the missing arm and not `?//` itself, so it is pinned here rather
+/// than only described -- and WP1 acted on it, giving `first`/`nth`/
+/// `isempty`/`any`/`all`/`IN` the same arm and closing their whole group.
 ///
 /// This is a characterization test of a *known divergence*: the `want` column
 /// is succinctly's current answer, with jq 1.7.1's given per row (captured
@@ -31536,54 +31538,81 @@ fn test_nested_short_circuit_consumer_hides_the_stop_2180() -> Result<()> {
         (format!("[first({G})]"), "[1,1]", "matches jq"),
         (format!("[IN({G})]"), "[true,true]", "matches jq"),
         (format!("[isempty({G})]"), "[false,false]", "matches jq"),
-        // ==== WP1: nested consumers ====
+        // ==== WP1: nested consumers -- CLOSED ====
         // `each_first`/`each_nth`/`each_isempty`/`each_any_all_gen_cond`/
-        // `each_upper_in` in `eval.rs` need a demand-forwarding `eval_each`
-        // arm, `each_limit`'s exact protocol. Flip this whole group to jq's
-        // answer once WP1 lands (both evaluators -- `IN`/`isempty`/`any`
-        // bridge wholesale to `eval.rs` today per the plan, so the generic
-        // side inherits the fix from the same arms).
-        (format!("[first(first({G}))]"), "[1]", "jq: [1,1]"),
+        // `each_upper_in` (`eval.rs`) and `each_first_generic`/
+        // `each_nth_generic` + `bridge_to_each_owned_flow`
+        // (`eval_generic.rs`) all forward demand now, following
+        // `each_limit`'s protocol, so this whole group answers once per
+        // `?//` alternative exactly as jq 1.7.1 does. Both wrappers had to
+        // be fixed, not one: `first(...)` reaches `eval_generic.rs`'s own
+        // native arm while `isempty(...)` bridges to `eval.rs`.
+        (format!("[first(first({G}))]"), "[1,1]", "matches jq"),
         (
             format!("[isempty(first({G}))]"),
-            "[false]",
-            "jq: [false,false]",
+            "[false,false]",
+            "matches jq",
         ),
-        (format!("[first(nth(0; {G}))]"), "[1]", "jq: [1,1]"),
+        (format!("[first(nth(0; {G}))]"), "[1,1]", "matches jq"),
         (
             format!("[isempty(nth(0; {G}))]"),
-            "[false]",
-            "jq: [false,false]",
+            "[false,false]",
+            "matches jq",
         ),
         (
             format!("[first(isempty({G}))]"),
-            "[false]",
-            "jq: [false,false]",
+            "[false,false]",
+            "matches jq",
         ),
         (
             format!("[isempty(isempty({G}))]"),
-            "[false]",
-            "jq: [false,false]",
+            "[false,false]",
+            "matches jq",
         ),
-        (format!("[first(any({G}; .))]"), "[true]", "jq: [true,true]"),
+        (format!("[first(any({G}; .))]"), "[true,true]", "matches jq"),
         (
             format!("[isempty(any({G}; .))]"),
-            "[false]",
-            "jq: [false,false]",
+            "[false,false]",
+            "matches jq",
         ),
-        (format!("[first(IN({G}))]"), "[true]", "jq: [true,true]"),
-        (
-            format!("[isempty(IN({G}))]"),
-            "[false]",
-            "jq: [false,false]",
-        ),
-        (format!("[first(IN(1; {G}))]"), "[true]", "jq: [true,true]"),
+        (format!("[first(IN({G}))]"), "[true,true]", "matches jq"),
+        (format!("[isempty(IN({G}))]"), "[false,false]", "matches jq"),
+        (format!("[first(IN(1; {G}))]"), "[true,true]", "matches jq"),
         (
             format!("[isempty(IN(1; {G}))]"),
-            "[false]",
-            "jq: [false,false]",
+            "[false,false]",
+            "matches jq",
         ),
-        (format!("[limit(1; IN({G}))]"), "[true]", "jq: [true,true]"),
+        (format!("[limit(1; IN({G}))]"), "[true,true]", "matches jq"),
+        // WP1's own trailing-identity rule, which no other group exercises:
+        // the outer consumer's stop unwinds into the `?//`, the retried
+        // (last) alternative runs `g` dry, and *that* exhaustion reaches
+        // `isempty`'s trailing `, true`. Captured live against jq 1.7.1,
+        // input `1` -- `[false,true]`, not `[false]` and not
+        // `[false,false]`.
+        (
+            "[first(isempty([1] as [$x] ?// $x | if ($x|type)==\"number\" \
+             then 9 else empty end))]"
+                .to_string(),
+            "[false,true]",
+            "matches jq -- the identity element fires even after the outer \
+             sink stopped",
+        ),
+        // WP1's `n`-argument fan-out, likewise unique to this group: `n` is
+        // the outer loop, so a wrapping consumer's stop must reach it too
+        // and leave the `$n=1` binding unexplored -- while a bare
+        // `nth((0,1); ...)` still walks `expr` once per `n`. Both captured
+        // live against jq 1.7.1.
+        (
+            "[first(nth((0,1); (10,20)))]".to_string(),
+            "[10]",
+            "matches jq -- the wrapping stop reaches nth's own n argument",
+        ),
+        (
+            "[nth((0,1); (10,20))]".to_string(),
+            "[10,20]",
+            "matches jq -- one full walk of expr per n",
+        ),
         // ==== WP2a: `//`, `and`, `or` ====
         // `each_alternative` needs a demand-forwarding `left`/truthy-filter
         // sink, and `And`/`Or` need `boolean_fanout_core` parameterised the
