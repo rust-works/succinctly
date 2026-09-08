@@ -2888,6 +2888,60 @@ though the outer sink already said stop. `nth`'s `n` fan-out follows the same de
 `[first(nth((0,1); (10,20)))]` is `[10]` in both (the `$n=1` binding is never explored), while
 a bare `[nth((0,1); (10,20))]` is still `[10,20]`.
 
+**`//`, `and` and `or` no longer diverge either — #2180 WP2a closed that group.** `//`
+(`Expr::Alternative`) gained `each_alternative` in `src/jq/eval.rs`: a truthy-filter sink over the
+left operand (`retain_truthy`'s rule, one output at a time) that forwards every surviving output
+to the wrapping consumer and evaluates the right side only when the left forwarded nothing and ran
+to exhaustion. `and`/`or` gained `each_boolean`, over a new **shared** demand-driven
+`boolean_fanout_each` — the `and`/`or` twin of what #1459/#1481 did to `binary_fanout_core` for
+`Compare`/`Arithmetic`: one loop, parameterised over how an operand's truthiness bits are
+enumerated, with the pre-existing eager callers (`eval_boolean`, `eval_generic.rs`'s
+`eval_boolean_generic`) passing the collecting strategy and the new arms passing
+`eval_each`/`eval_each_generic`. `eval_each_generic` gained its own
+`Expr::Alternative`/`Expr::And`/`Expr::Or` arms too, since `first(...)` never reaches `eval.rs`'s.
+Every row confirmed live against jq 1.7.1 under both wrappers, input `1`:
+
+| filter                                                                                                      | jq 1.7.1 and `succinctly jq` |
+|-------------------------------------------------------------------------------------------------------------|------------------------------|
+| `[first((1 as $x ?// $y \| 5)//9)]`, `[isempty(...)]`                                                       | `[5,5]` / `[false,false]`    |
+| `[first(null // (1 as $x ?// $y \| 1))]`                                                                    | `[1,1]`                      |
+| `[first((1 as $x ?// $y \| 1) and true)]`, `... true and (...)`, `... (...) or false`, `... false or (...)` | `[true,true]`                |
+| `[first((1 as $x ?// $y \| false, 5) // 9)]`                                                                | `[5,5]`                      |
+| `[first((1 as $x ?// $y \| false) // 9)]`                                                                   | `[9]`                        |
+| `[first(false and (1 as $x ?// $y \| 1))]`, `[first(true or (...))]`                                        | `[false]` / `[true]`         |
+
+The last two rows are the group's own rules, which the `?//` rows alone do not pin. `//` still
+*filters*: a falsy output does not answer, so the bind keeps being retried; and with no truthy
+output at all the right side answers exactly once, because the consumer's stop never reached the
+bind in the first place. `and`/`or` still genuinely short-circuit per left output: a falsy left
+(`and`) or truthy left (`or`) never evaluates the other operand, so no bind inside it is ever
+retried.
+
+WP2a also closed ordinary side-effect leaks of the shape Stage 2 closed elsewhere, with no `?//`
+involved — `first((1, ("B"|stderr)) // 9)`, `first((false,false) // (("A"|stderr), ("B"|stderr)))`
+and all four `and`/`or` operand positions each ran a branch jq never reaches. Those rows, plus the
+destructive `input` spellings (`[first((1, input) // 9), input]` was `[1,"b"]`, jq's `[1,"a"]`),
+are pinned in `test_short_circuit_side_effect_shapes_already_match_jq_820`.
+
+**The loop shape was captured, not assumed.** jq 1.7.1, `-cn`:
+`[("A"|debug, "B"|debug) and ("C"|debug, "D"|debug)]` writes `A A C C D B C C D` to stderr — the
+**left** operand is the outer loop and the right one is re-evaluated per non-short-circuiting left
+output, interleaved. succinctly's eager route wrote `A A B C C D C C D` (left finished first) and
+still does for a bare top-level `and`/`or`; only the lazy arms move to jq's order, exactly as
+`Expr::Compare` did between #1459 and #1481. `[(false,true) and ("C"|debug)]` writes `C` once, not
+twice, which is the short-circuit rule.
+
+That leaves one **new, narrower residual**, the `and`/`or` half of what #1481 did for
+`eval_binary_fanout`: `eval_boolean` still passes the eager operand strategy, so a *bare*
+top-level `[("A"|stderr,"B"|stderr) and ("C"|stderr,"D"|stderr)]` writes `AABCCDCCD` where jq
+writes `AACCDBCCD`. The delivered values are identical for side-effect-free operands, and the same
+expression reached through a lazy consumer (`first(...)`) or as a binary operand (`0 + (...)`)
+already matches jq exactly. All three rows are pinned in
+`test_short_circuit_side_effect_leaks_820_932_987` and
+`test_short_circuit_side_effect_shapes_already_match_jq_820`; closing it means routing
+`eval_boolean` (and `eval_boolean_generic`) through the lazy strategy the shared loop already
+accepts, which is a separate change from WP2a's own rows.
+
 **What still diverges.** The stop only reaches the `?//` if every construct between the consumer
 and the bind *forwards demand* into it rather than materializing it. None of the constructs below
 do today, so these still answer once where jq answers twice. `first(...)` reaches
@@ -2899,9 +2953,6 @@ the two arm sets have already drifted (`range`'s bound below), so every row is c
 
 | filter                                                                                                      | jq 1.7.1        | succinctly jq |
 |-------------------------------------------------------------------------------------------------------------|-----------------|---------------|
-| `[first((1 as $x ?// $y \| 5)//9)]`                                                                         | `[5,5]`         | `[5]`         |
-| `[first(null // (1 as $x ?// $y \| 1))]`                                                                    | `[1,1]`         | `[1]`         |
-| `[first((1 as $x ?// $y \| 1) and true)]`, `... true and (...)`, `... (...) or false`, `... false or (...)` | `[true,true]`   | `[true]`      |
 | `[first(if (1 as $x ?// $y \| 1) then 5 else 6 end)]`                                                       | `[5,5]`         | `[5]`         |
 | `[first((1 as $x ?// $y \| 1) as $v \| $v)]`, `... as [$a] ?// $a \| $a`                                    | `[1,1]`         | `[1]`         |
 | `[first(select((1 as $x ?// $y \| 1) == 1))]`                                                               | `[1,1]`         | `[1]`         |
@@ -2926,7 +2977,7 @@ owned evaluator, which lost the cursor a `break` needs to unwind through on its 
 a side effect, with no `?//`-specific work at either commit. Neither is the pipe rework the
 original filing guessed at.
 
-The cause is uniform and is not about `?//` at all: `//` (`Expr::Alternative`), `and`/`or`, `if`'s
+The cause is uniform and is not about `?//` at all: `if`'s
 condition, `as`/`as`-pattern's bound source, `select`, unary minus, an index key, string
 interpolation, an object value, `range`'s bound (`eval_generic.rs`'s twin only — `eval.rs`'s own
 `each_range` already forwards demand, so `isempty(range(...))` already matches while
@@ -2951,10 +3002,11 @@ This is the same missing-lazy-arm class as items 9 and 10 of
 [`docs/plan/jq-lazy-generator-consumers.md`](../../plan/jq-lazy-generator-consumers.md), tracked
 in [#2180](https://github.com/rust-works/succinctly/issues/2180), whose own plan (2026-09-08)
 splits the residual into four work packages — WP1 (nested consumers, **landed**), WP2a
-(`//`/`and`/`or`), WP2b (the remaining eager sub-expression sites), WP3 (`foreach`) — each
-closing its own rows. WP1 took `scripts/jq-alt-retry-oracle-sweep.sh` from 93 known
-divergences attributed to it to none (612 cases, 0 unexpected, 258 known across WP2a/WP2b/WP3),
-and left `scripts/jq-fanout-oracle-sweep.sh` at 490/490.
+(`//`/`and`/`or`, **landed**), WP2b (the remaining eager sub-expression sites), WP3 (`foreach`) —
+each closing its own rows. WP1 took `scripts/jq-alt-retry-oracle-sweep.sh` from 93 known
+divergences attributed to it to none (612 cases, 0 unexpected, 258 known across WP2a/WP2b/WP3);
+WP2a then took its own 96 to none (612 cases, 0 unexpected, 162 known across WP2b/WP3). Both left
+`scripts/jq-fanout-oracle-sweep.sh` at 490/490.
 
 Unrelated to the other `?//` divergence recorded above
 ([#1365](https://github.com/rust-works/succinctly/issues/1365), `?//`-alternatives folds not being

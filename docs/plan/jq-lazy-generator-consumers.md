@@ -108,8 +108,8 @@ one of them needs checking against the other.** The residual — constructs that
 bind before the stop can reach it (`//`, a nested `first(...)`, `foreach`, a parenthesised bind
 whose break comes from a downstream pipe stage) — is items 9/10's own missing-lazy-arm class,
 not a `?//` question, and is tracked as
-[#2180](https://github.com/rust-works/succinctly/issues/2180), whose WP1 has since closed the
-nested-consumer part of it (see item 10).
+[#2180](https://github.com/rust-works/succinctly/issues/2180), whose WP1 and WP2a have since
+closed the nested-consumer and `//`/`and`/`or` parts of it (see item 10).
 
 **Option (c), scoped.** `first`/`last` were the *only* `eval_generic.rs` consumers with a
 native, cursor-preserving fast-path arm shadowing `eval.rs`'s already-lazy implementation
@@ -1402,7 +1402,7 @@ the reasoning behind each placement:
       `each_any_all_gen_cond`/`each_upper_in` in `eval.rs`, `each_limit`'s exact protocol.
     - **WP2a** — `//`, `and`, `or`: `each_alternative`'s truthy-filter sink, and
       `boolean_fanout_core` parameterised over the operand strategy the way `binary_fanout_each`
-      was for `Compare`/`Arithmetic` (#1459/#1481).
+      was for `Compare`/`Arithmetic` (#1459/#1481). **Landed** — see below.
     - **WP2b** — the remaining eager sub-expression sites (`each_if`'s `cond`,
       `each_as`/`each_as_pattern`'s source, new arms for `Select`/`Negate`/`IndexExpr`/
       `StringInterpolation`/`Object`, plus mirroring `each_range` into `eval_each_generic`) —
@@ -1447,3 +1447,34 @@ the reasoning behind each placement:
       `[nth((0,1); (10,20))]` is still `[10,20]`. That is why WP1 needed `fanout_arg_each` and
       not just a sink over `expr` — and it closed item 9's own `first(nth((0,1); ...))` row as a
       side effect.
+
+    **WP2a landed**, closing its own 96 sweep rows (612 cases, 0 unexpected, 162 known left
+    across WP2b/WP3) with, again, no change to `each_pattern_alternatives` at all. `eval.rs`
+    gained `each_alternative` — `retain_truthy`'s filter applied one output at a time, the
+    right side evaluated only when the left forwarded nothing *and* ran to exhaustion, and
+    `finish_short_circuit`'s outer-stop rule in front of both — and `each_boolean`, over a new
+    shared `boolean_fanout_each`; `eval_each_generic` gained `Expr::Alternative`/`Expr::And`/
+    `Expr::Or` arms, the last two mirroring `eval_single`'s own `needs_path_context` gate so a
+    path-context operand keeps its cursor (`each_boolean_generic`) while everything else takes
+    `bridge_to_each_owned_flow`. Three findings:
+
+    - **The `and`/`or` loop shape had to be captured, not inferred from the eager code.**
+      `[("A"|debug, "B"|debug) and ("C"|debug, "D"|debug)]` writes `A A C C D B C C D` in jq
+      1.7.1: **left** operand outer, right re-evaluated per non-short-circuiting left output,
+      interleaved. succinctly's eager route wrote `A A B C C D C C D` — left finished first —
+      and still does for a bare top-level `and`/`or`; only the lazy arms move to jq's order.
+      That is precisely the `Expr::Compare` situation between #1459 and #1481, and the same
+      follow-up (route the eager callers through the lazy strategy too) is still available.
+    - **`boolean_fanout_bools`'s collected `Vec<bool>` was hiding a rule split.** Its
+      empty-operand handling (#2460/#2540) ran on the collected left bits *outside* the pairing
+      loop, so lifting the loop into a sink meant the synthesized bit had to re-enter the same
+      pairing body rather than a second copy of it — `boolean_pair_left_bit` is a free function
+      for exactly that reason (the borrow checker will not let one closure be both the drive's
+      sink and callable again after it).
+    - **The read-only scope (#2470) moved with the loop, and gained its missing half.**
+      `boolean_fanout_bools` applied `yq_read_only_context::enter()` around the operand call
+      only, correct while both strategies were eager; the shared core now uses
+      `read_only_operand_strategy` — generified over the item type so `binary_fanout_each`'s
+      whole-value sink and `boolean_fanout_each`'s `bool` sink share one definition — which
+      also `suspend()`s on the way into the sink, so a lazy operand's downstream consumer does
+      not inherit a scope belonging to the operand expression alone.
