@@ -15,6 +15,10 @@ built succinctly binary and classified by direction:
     mismatch     both answer, differently (or both refuse with different
                  emitted prefixes)
     refuse-only  jq answers, succinctly refuses  -- safe, reported as a count
+    refuse-early both refuse, and what succinctly emitted before refusing is
+                 a strict prefix of what jq emitted: a refusal on an earlier
+                 binding of a multi-output source (the same safe direction
+                 as refuse-only, counted separately so it stays visible)
 
 **The alphabet is part of the claim** (#2041): a pool that cannot emit the
 shape a bug lives in proves nothing. `--self-test` prints the pools so a
@@ -109,6 +113,9 @@ def classify(j, s):
     if je == se and jo == so: return "agree"
     if je != 0 and se == 0: return "fabricate"
     if je == 0 and se != 0: return "refuse-only"
+    if je != 0 and se != 0:
+        jl, sl = jo.splitlines(), so.splitlines()
+        if len(sl) < len(jl) and jl[:len(sl)] == sl: return "refuse-early"
     return "mismatch"
 
 def main():
@@ -134,7 +141,7 @@ def main():
             print(f"{name} ({len(pool)}): " + " ; ".join(pool))
         return 0
     rng = random.Random(a.seed)
-    kinds = ["agree", "fabricate", "mismatch", "refuse-only", "fabricate-baseline", "mismatch-baseline", "timeout"]
+    kinds = ["agree", "fabricate", "mismatch", "refuse-only", "refuse-early", "fabricate-baseline", "mismatch-baseline", "timeout"]
     counts = {k: 0 for k in kinds}
     examples = {k: [] for k in kinds}
     for _ in range(a.n):
