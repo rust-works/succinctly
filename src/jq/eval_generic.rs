@@ -57,7 +57,7 @@ use super::eval::{
     classify_parent_n, collapse_vec, collect_pattern_var_names, compare_values,
     debug_assert_materialization_error, enter_def_call_frame, entries_to_object, eval_each_owned,
     eval_foreach_with_values, eval_full as full_eval, eval_reduce_with_values,
-    extract_pattern_bindings, fold_escaped_generator_prefix, format_owned,
+    extract_pattern_bindings, finish_short_circuit, fold_escaped_generator_prefix, format_owned,
     has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
     index_one_owned as index_owned_by_key, is_pure_chain_link, is_retryable_stop, literal_to_owned,
     needs_path_context, numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned,
@@ -2226,6 +2226,47 @@ fn bridge_to_full_evaluator_flow<S: EvalSemantics, V: DocumentValue>(
     // `GenericResult::None`'s sink-free semantics elsewhere in this file.
     match to_owned_with_cursor(&value, cursor) {
         Ok(owned) => drain_result_generic(eval_on_owned::<S, V>(expr, owned, optional), sink),
+        Err(e) if suppresses(&e, optional) => Flow::Exhausted,
+        Err(e) => Flow::Escaped(Control::Error(e)),
+    }
+}
+
+/// Demand-forwarding twin of [`bridge_to_full_evaluator_flow`] (#2180 WP1):
+/// same materialize step, but the program is handed to `eval.rs`'s
+/// *demand-driven* [`eval_each_owned`] instead of its eager `eval_on_owned`,
+/// so a wrapping consumer's [`Demand::Stop`] survives the crossing.
+///
+/// **Nothing is lost relative to the eager bridge it replaces at its call
+/// sites, and that is checkable rather than asserted.** Both funnel through
+/// `to_owned_with_cursor`, so both collapse a duplicate mapping key at the
+/// same point (#607 -- see [`bridge_to_full_evaluator`]'s own "lossy by
+/// construction" note), and both then reserialize + reindex the same owned
+/// snapshot (`eval_on_owned` and [`eval_each_owned`] each do
+/// `to_json_for_reindex` + `JsonIndex::build`). The only difference is which
+/// `eval.rs` entry point runs on the far side: `eval_full` collects, while
+/// `eval_each` forwards. No `input_queue_is_active` guard is needed for the
+/// same reason: `eval_each` is the side of that bridge #1504 wanted -- it
+/// carries the native lazy `Builtin::Inputs` arm the eager path does not --
+/// so this direction can only improve input interleaving, never regress it.
+///
+/// Used for the three consumers this module has no native arm for at all
+/// (`isempty`, `any`/`all(gen; cond)`, `IN`), which already bridged
+/// wholesale to `eval.rs` before #2180 -- writing generic twins for them
+/// would have duplicated `eval.rs`'s five sinks for no cursor to preserve:
+/// all three answer with a computed `OwnedValue::Bool`, never a document
+/// node. `first`/`nth` are the opposite case and keep their native,
+/// cursor-preserving arms ([`each_first_generic`], [`each_nth_generic`]).
+fn bridge_to_each_owned_flow<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    value: V,
+    cursor: Option<V::Cursor>,
+    optional: bool,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    match to_owned_with_cursor(&value, cursor) {
+        Ok(owned) => {
+            eval_each_owned::<S>(expr, &owned, optional, &mut |v| sink(GenericItem::Owned(v)))
+        }
         Err(e) if suppresses(&e, optional) => Flow::Exhausted,
         Err(e) => Flow::Escaped(Control::Error(e)),
     }
@@ -7781,6 +7822,34 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // the whole pull loop against `V: DocumentValue` directly.
         Expr::Repeat(f) => each_repeat_generic::<S, V>(f, value, optional, cursor, sink),
 
+        // #2180 WP1: the nested short-circuiting consumers, mirroring
+        // `eval.rs`'s own new arm set. Route matters here and always has --
+        // a bare `first(...)` at the CLI is intercepted by this module's
+        // native `Expr::FirstExpr` arm and drives `eval_each_generic`, while
+        // `isempty(...)` has no native arm at all and bridges wholesale to
+        // `eval.rs` -- so a fix landing in one file is not evidence it
+        // landed in the other, and every row was confirmed under both
+        // wrappers (`scripts/jq-alt-retry-oracle-sweep.sh` crosses all six
+        // consumers with all six wrappers).
+        //
+        // `first`/`nth` get native, cursor-preserving arms; `isempty`,
+        // `any`/`all(gen; cond)` and `IN` take the demand-forwarding owned
+        // bridge, since all three answer with a computed boolean and have no
+        // cursor to preserve -- see [`bridge_to_each_owned_flow`]'s own doc
+        // comment for why that crossing loses nothing the eager bridge they
+        // already took did not.
+        Expr::FirstExpr(inner) => each_first_generic::<S, V>(inner, value, optional, cursor, sink),
+        Expr::NthExpr { n, expr: inner } | Expr::Builtin(Builtin::NthStream(n, inner)) => {
+            each_nth_generic::<S, V>(n, inner, value, optional, cursor, sink)
+        }
+        Expr::Builtin(
+            Builtin::IsEmpty(_)
+            | Builtin::AnyCond(..)
+            | Builtin::AllCond(..)
+            | Builtin::UpperIn(_)
+            | Builtin::UpperInSrc(..),
+        ) => bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink),
+
         // spine 2416 (walk residue; #2428): `..` over a live node emits every
         // node as its own cursor, so a stage after it reads `key`/`path`/
         // `parent` as cursor properties instead of losing them to the
@@ -8741,6 +8810,135 @@ fn each_limit_with_n_generic<S: EvalSemantics, V: DocumentValue>(
         Flow::Stopped { .. } | Flow::Exhausted => Flow::Exhausted,
         Flow::Escaped(control) => Flow::Escaped(control),
     }
+}
+
+/// Demand-forwarding twin of [`eval_first_or_last_generic`]'s `first` half
+/// (#2180 WP1) -- the generic-evaluator mirror of `eval::each_first`, and the
+/// arm `eval_each_generic` was missing for `Expr::FirstExpr`.
+///
+/// `first(...)` is the one wrapper that reaches this module's own native fast
+/// path rather than bridging to `eval.rs`, so a fix landing only in
+/// `eval.rs`'s `eval_each` closes `isempty(first(G))` and leaves
+/// `first(first(G))` diverging -- both routes have to be fixed, and both were
+/// captured live against jq 1.7.1 (input `1`, `G` = `1 as $x ?// $y | 1`):
+/// `[first(first(G))]` and `[first(nth(0; G))]` are `[1,1]`,
+/// `[isempty(first(G))]` and `[isempty(nth(0; G))]` are `[false,false]`.
+///
+/// Native rather than routed through [`bridge_to_each_owned_flow`] on
+/// purpose: `first` preserves its selected output's cursor, and with it
+/// #607's duplicate-key fidelity (see [`eval_first_or_last_generic`]'s own
+/// doc comment) -- the bridge would collapse both. The `input`/`inputs`
+/// guard that function carries is kept for the same #1309 reason, but takes
+/// the *lazy* bridge: `eval.rs`'s `eval_each` has the native
+/// `Builtin::Inputs` arm this module still lacks, so handing the whole
+/// `first(...)` over there is what stops the shared queue being drained.
+fn each_first_generic<S: EvalSemantics, V: DocumentValue>(
+    inner: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    if crate::jq::input_queue_is_active() && crate::jq::walk::uses_input_builtins(inner) {
+        return bridge_to_each_owned_flow::<S, V>(
+            &Expr::FirstExpr(Box::new(inner.clone())),
+            value,
+            cursor,
+            optional,
+            sink,
+        );
+    }
+
+    let mut outer_stopped = false;
+    let flow = eval_each_generic::<S, V>(inner, value, optional, cursor, &mut |item| {
+        if sink(item) == Demand::Stop {
+            outer_stopped = true;
+        }
+        // jq's `break $out`, unconditionally -- `first` is satisfied by its
+        // one output whether or not the wrapping consumer is.
+        Demand::Stop
+    });
+    finish_short_circuit(outer_stopped, flow)
+}
+
+/// Demand-forwarding twin of [`eval_nth_generic`]/[`nth_with_n_generic`]
+/// (#2180 WP1) -- the generic-evaluator mirror of `eval::each_nth`, and the
+/// arm `eval_each_generic` was missing for `Builtin::NthStream`/
+/// `Expr::NthExpr`.
+///
+/// Reproduces `nth_with_n_generic` line for line except that the kept item is
+/// pushed to `sink` as it is produced rather than collected, so every rule
+/// that function documents still applies here: `>=` rather than `==` with
+/// `seen` rising across a `?//` retry (#1519), `n` as the OUTER loop driven
+/// through [`fanout_arg_each_generic`] (#1687), the
+/// [`limit_or_nth_uses_live_input_queue`] deferral (#1309), and the forced
+/// decode of a *skipped* item, whose lazy `GenericItem::LazySeq` computation
+/// must still run for its errors even though its value is discarded (#1607).
+///
+/// **#2199's ordering is kept, and #2567 is unchanged by this arm.** A
+/// skipped item's forced decode failure is reported ahead of anything a
+/// subsequent (illegitimate) `?//` retry produced, exactly as
+/// `nth_with_n_generic` does -- `Demand` still carries no payload letting
+/// [`each_pattern_alternatives_generic`] tell that failure apart from an
+/// ordinary "consumer satisfied" stop, so the retry itself still happens and
+/// still runs its own side effects. That is #2567's remaining gap, on the
+/// shared retry-decision path rather than in either `nth`, and this arm
+/// neither widens nor narrows it.
+fn each_nth_generic<S: EvalSemantics, V: DocumentValue>(
+    n_expr: &Expr,
+    expr: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    if limit_or_nth_uses_live_input_queue(n_expr, expr) {
+        return bridge_to_each_owned_flow::<S, V>(
+            &Expr::Builtin(Builtin::NthStream(
+                Box::new(n_expr.clone()),
+                Box::new(expr.clone()),
+            )),
+            value,
+            cursor,
+            optional,
+            sink,
+        );
+    }
+
+    fanout_arg_each_generic::<S, V, _>(n_expr, value.clone(), optional, cursor, |n_value| {
+        let n = match classify_nth_n(n_value) {
+            Ok(n) => n,
+            Err(e) => return Flow::Escaped(Control::Error(e)),
+        };
+        let mut seen = 0usize;
+        let mut outer_stopped = false;
+        let mut skipped_err: Option<Control> = None;
+        let flow = eval_each_generic::<S, V>(expr, value.clone(), optional, cursor, &mut |item| {
+            let at_or_past = seen >= n;
+            seen += 1;
+            if at_or_past {
+                if sink(item) == Demand::Stop {
+                    outer_stopped = true;
+                }
+                return Demand::Stop;
+            }
+            // #1607: a skipped output is genuinely produced by jq's own
+            // `last(limit($n + 1; f))` desugaring, so its lazy computation
+            // still has to run for its errors -- see `nth_with_n_generic`.
+            if let Err(control) = generic_item_into_owned(item) {
+                skipped_err = Some(control);
+                return Demand::Stop;
+            }
+            Demand::Continue
+        });
+        // #2199: checked before the flow, so a skipped item's decode failure
+        // cannot lose to whatever an illegitimate `?//` retry went on to
+        // produce through this same sink.
+        if let Some(control) = skipped_err {
+            return Flow::Escaped(control);
+        }
+        finish_short_circuit(outer_stopped, flow)
+    })
 }
 
 /// Generic-evaluator twin of `eval::eval_each_pipe` (#1461): the "stop
