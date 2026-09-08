@@ -4873,26 +4873,41 @@ fn drain_result<'a, W: Clone + AsRef<[u64]>>(
 /// Native lazy arms: `Comma`, `Pipe`, `Paren`, `Builtin::PathsFilter`
 /// (#987, Stage 3), `Compare` (#1459, Stage 4), -- #1462, Stage 5 --
 /// `If`, `Try`/`Optional`, `Label`, `As`, `AsPattern`, `FuncDef` and `Limit`,
-/// and -- #1556 -- `Range`. Everything else falls back to `eval_single` +
-/// [`drain_result`]. `Paren`
+/// -- #1556 -- `Range`, and -- #2180 WP1 -- the nested short-circuiting
+/// consumers `FirstExpr`, `NthExpr`/`Builtin::NthStream`, `Builtin::IsEmpty`,
+/// `Builtin::AnyCond`/`AllCond` and `Builtin::UpperIn`/`UpperInSrc`.
+/// Everything else falls back to `eval_single` + [`drain_result`]. `Paren`
 /// is not optional cosmetics: `isempty(...)` consumes only its own
 /// parentheses, so `isempty((1, stderr))` is `IsEmpty(Paren(Comma(..)))` and
 /// without this arm the fix would be a coin flip on spelling.
 ///
-/// **Why `FirstExpr`/`NthExpr` get no arm here, unlike `Limit`** (#1462):
-/// `first(f)`/`nth(n;f)` already emit *at most one* output no matter how
-/// large `f` is, and `each_take_first`/`each_take_nth` (Stage 2) already
-/// drive that single output through their own `eval_each` call on `f` --
-/// so a *wrapping* consumer's demand has nothing left to shrink; the one
-/// item either satisfies it or doesn't. `limit(n; f)` is different in kind:
+/// **`FirstExpr`/`NthExpr` were deliberately given no arm at #1462, and that
+/// reasoning has since been overtaken by #1519.** It ran: `first(f)`/
+/// `nth(n;f)` emit *at most one* output no matter how large `f` is, and
+/// `each_take_first`/`each_take_nth` (Stage 2) already drive that single
+/// output through their own `eval_each` call on `f`, so a *wrapping*
+/// consumer's demand has nothing left to shrink -- the one item either
+/// satisfies it or doesn't. That held while a consumer's satisfaction was
+/// unobservable. [#1519](https://github.com/rust-works/succinctly/issues/1519)
+/// made `?//` retry the next alternative on exactly that satisfaction
+/// signal ([`is_retryable_stop`]), so "at most one output" became "one output
+/// *per alternative*" -- and the count now depends on whether the stop
+/// reaches [`each_pattern_alternatives`] at all. Collecting the item and
+/// handing back a finished [`QueryResult`] absorbs it: `[first(first(1 as $x
+/// ?// $y | 1))]` answered `[1]` where jq 1.7.1 answers `[1,1]` (captured
+/// live, input `1`). #2180 WP1 gave all five consumers the arm, and the
+/// contrast that proved the mechanism still stands -- `limit`, the one
+/// consumer that already had a demand-forwarding arm, was the one that
+/// already worked when nested.
+///
+/// `Limit`'s own arm remains different in kind and is not subsumed by that:
 /// it forwards up to `n` outputs downstream, and Stage 2's `each_take_n`
 /// only bounded evaluation against its *own* `n`, not against whatever a
 /// wrapping consumer might want fewer of -- confirmed live,
-/// `isempty(nth(0; limit(3; 1, ("B"|stderr))))` leaked before this arm
-/// existed even though neither `FirstExpr` nor `NthExpr` needed one:
+/// `isempty(nth(0; limit(3; 1, ("B"|stderr))))` leaked before that arm
+/// existed even though neither `FirstExpr` nor `NthExpr` needed one then:
 /// `each_take_nth` already called `eval_each` on `Limit{3, G}`, and it was
-/// *that* callee falling back to eager `drain_result` that leaked --
-/// wiring `Limit` alone fixes every nesting of it.
+/// *that* callee falling back to eager `drain_result` that leaked.
 fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     value: StandardJson<'a, W>,
@@ -5162,6 +5177,54 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // matching jq exactly; a `repeat(f)` with no such wrapper is just
         // as genuinely unbounded here as it is in real jq.
         Expr::Repeat(expr) => each_repeat::<W, S>(expr, value, optional, sink),
+
+        // #2180 WP1: the *nested* short-circuiting consumers. `limit` had
+        // the only demand-forwarding arm here, and it was the only consumer
+        // that worked when nested inside another one -- that contrast is
+        // the direct evidence the cause is the missing arm and not `?//`
+        // itself. Every construct between a consumer and a `?//` bind that
+        // materializes instead of forwarding demand absorbs the stop
+        // `each_pattern_alternatives` retries on (#1519), so each of these
+        // answered once where jq 1.7.1 answers once per alternative. All
+        // rows captured live against the pinned oracle, input `1`, with
+        // `G` = `1 as $x ?// $y | 1`:
+        //
+        // ```text
+        // [first(first(G))]   [1,1]         was [1]
+        // [first(nth(0; G))]  [1,1]         was [1]
+        // [first(isempty(G))] [false,false] was [false]
+        // [first(any(G; .))]  [true,true]   was [true]
+        // [first(IN(G))]      [true,true]   was [true]
+        // [first(IN(1; G))]   [true,true]   was [true]
+        // ```
+        //
+        // Each arm is `each_limit`'s protocol with that consumer's own
+        // satisfaction rule substituted for the `n` cap -- see the five
+        // functions' own doc comments. `Expr::LastExpr` deliberately gets
+        // none: `last` cannot short-circuit at all (it must exhaust the
+        // stream to know which output was last), so there is no stop for it
+        // to forward, and `[first(last(G))]` already matches jq at `[1]`.
+        Expr::FirstExpr(inner) => each_first::<W, S>(inner, value, optional, sink),
+        // A CLI `nth(n; f)` always parses to `Builtin::NthStream`;
+        // `Expr::NthExpr` is parser-unreachable but constructible (see
+        // `eval_nth_expr`'s own doc comment), so both spellings route here
+        // for the same reason `eval_single` gives them one shared arm.
+        Expr::NthExpr { n, expr: inner } | Expr::Builtin(Builtin::NthStream(n, inner)) => {
+            each_nth::<W, S>(n, inner, value, optional, sink)
+        }
+        Expr::Builtin(Builtin::IsEmpty(inner)) => {
+            each_isempty::<W, S>(inner, value, optional, sink)
+        }
+        Expr::Builtin(Builtin::AnyCond(gen, cond)) => {
+            each_any_all_gen_cond::<W, S>(gen, cond, value, optional, true, sink)
+        }
+        Expr::Builtin(Builtin::AllCond(gen, cond)) => {
+            each_any_all_gen_cond::<W, S>(gen, cond, value, optional, false, sink)
+        }
+        Expr::Builtin(Builtin::UpperIn(s)) => each_upper_in::<W, S>(s, value, optional, sink),
+        Expr::Builtin(Builtin::UpperInSrc(src, s)) => {
+            each_upper_in_src::<W, S>(src, s, value, optional, sink)
+        }
 
         _ => drain_result(eval_single::<W, S>(expr, value, optional), sink),
     }
@@ -5784,6 +5847,378 @@ fn each_limit<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // arm (`[limit(3; 1,2,error("x"),4)]` raises).
         Flow::Escaped(control) => Flow::Escaped(control),
     }
+}
+
+/// Shared tail for #2180 WP1's demand-forwarding consumer arms
+/// ([`each_first`], [`each_nth`]), lifted from [`each_limit`]'s own
+/// three-way close so the arms cannot drift apart on it.
+///
+/// * `outer_stopped` -- the *wrapping* `sink` asked to stop, so its verdict
+///   (and whatever `pending` came with it) is propagated verbatim, exactly
+///   as [`each_limit`] does.
+/// * our own stop -- jq's `break $out`, caught by the consumer's own label,
+///   so it must not look like an escape to whatever encloses this call:
+///   [`Flow::Exhausted`].
+/// * an escape -- propagated. Items already pushed into `sink` stand in
+///   front of it, which is [`take_stopping_items_to_result`]'s "a `?//`
+///   retry that reached a failing alternative must still raise" rule
+///   (#1519) expressed in sink terms: the prefix is already delivered, so
+///   returning the control verbatim *is* that function's
+///   `partial(prefix, control)`.
+pub(crate) fn finish_short_circuit(outer_stopped: bool, flow: Flow) -> Flow {
+    if outer_stopped {
+        return flow;
+    }
+    match flow {
+        Flow::Stopped { .. } | Flow::Exhausted => Flow::Exhausted,
+        Flow::Escaped(control) => Flow::Escaped(control),
+    }
+}
+
+/// Sink-side twin of [`counted_bool_flow_to_result`] (#2180 WP1), shared by
+/// [`each_isempty`], [`each_any_all_gen_cond`] and [`each_upper_in`] for the
+/// same reason its eager sibling is shared: three transcriptions of the same
+/// `label $out | (... break $out), <identity>` macro shape must not drift on
+/// the terminal rule.
+///
+/// The decisive answers were already pushed into `sink` by the caller's own
+/// loop (one per delivered match, so a `?//` chain answers once per
+/// alternative that decided, #1519); this only resolves what happens *after*
+/// the generator ends:
+///
+/// * [`Flow::Exhausted`] -- jq's trailing `, true` in `def isempty(g): label
+///   $out | (g|false, break $out), true;` (and `any`/`all`/`IN`'s own
+///   identity element), reached exactly when no `break` is left unwinding.
+///   **It fires even when the outer sink already stopped**, which is the one
+///   place this tail deliberately differs from [`finish_short_circuit`]:
+///   captured live against jq 1.7.1, `[first(isempty([1] as [$x] ?// $x | if
+///   ($x|type)=="number" then 9 else empty end))]` is `[false,true]`, not
+///   `[false]` -- the outer `first`'s own break unwinds into the `?//`,
+///   which retries the last alternative, and *that* alternative's exhaustion
+///   is what reaches the `, true`.
+/// * [`Flow::Stopped`] -- the outer sink's verdict if it fired, otherwise our
+///   own `break $out`, which collapses to [`Flow::Exhausted`] just as it does
+///   in [`finish_short_circuit`].
+/// * [`Flow::Escaped`] -- propagated, with whatever was already delivered
+///   standing in front of it (`counted_bool_flow_to_result`'s own `partial`).
+fn counted_bool_flow_to_flow<'a, W: Clone + AsRef<[u64]>>(
+    identity: bool,
+    outer_stopped: bool,
+    flow: Flow,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    match flow {
+        Flow::Exhausted => match sink(Item::Owned(OwnedValue::Bool(identity))) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped { pending: None },
+        },
+        stopped @ Flow::Stopped { .. } if outer_stopped => stopped,
+        Flow::Stopped { .. } => Flow::Exhausted,
+        Flow::Escaped(control) => Flow::Escaped(control),
+    }
+}
+
+/// Demand-forwarding twin of [`eval_first_expr`] (#2180 WP1): jq's
+/// `def first(f): label $out | (f, break $out);` transcribed as a sink
+/// rather than a `Vec`.
+///
+/// [`each_take_first`] already stops `f` after one output, but it *collects*
+/// that output and hands a finished [`QueryResult`] back, so a wrapping
+/// consumer's own [`Demand::Stop`] landed on [`drain_result`] and never
+/// reached the generator. Outside a `?//` chain that is invisible -- `first`
+/// emits one value either way. Inside one it changes the answer, because
+/// [`each_pattern_alternatives`] retries the next alternative on exactly that
+/// stop (#1519): `[first(first(1 as $x ?// $y | 5, 6))]` is `[5,5]` in jq
+/// 1.7.1 and was `[5]` here, and `[first(first(1 as $x ?// $y | 1))]` is
+/// `[1,1]` where it was `[1]` (both captured live against the pinned oracle,
+/// input `1`).
+fn each_first<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    let mut outer_stopped = false;
+    let flow = eval_each::<W, S>(expr, value, optional, &mut |item| {
+        if sink(item) == Demand::Stop {
+            outer_stopped = true;
+        }
+        // jq's `break $out`, unconditionally: `first` is satisfied by the
+        // one output whether or not the wrapping consumer is.
+        Demand::Stop
+    });
+    finish_short_circuit(outer_stopped, flow)
+}
+
+/// Demand-forwarding twin of [`fanout_arg`]'s [`ArgFanout::All`] loop
+/// (#2180 WP1) -- the argument-fan-out primitive [`each_nth`] needs, and the
+/// exact shape `eval_generic.rs`'s own `fanout_arg_each_generic` already has
+/// (#1687). `body` returns a [`Flow`] instead of a [`QueryResult`] because
+/// its outputs go straight to the ultimate consumer's sink rather than being
+/// collected here.
+///
+/// [`fanout_arg`]'s rules survive unchanged: `body` runs against argument
+/// value N before N+1 is evaluated (rule 4), a `body` escape stops the pull
+/// there (rule 2), and the argument's own trailing control fires only after
+/// everything `body` already produced (rule 1 -- automatic here, since those
+/// outputs were pushed as they were made). What is new is the third
+/// termination reason a collecting fan-out cannot have: the *downstream*
+/// consumer saying stop, which outranks the argument generator's own verdict
+/// exactly as it does inside [`each_limit`]'s inner sink.
+///
+/// Only [`ArgFanout::All`] is modelled: every yq gate is deliberately eager
+/// (see [`fanout_arg`]'s own doc comment), and `nth` is jq-only -- real yq's
+/// lexer rejects it -- so no gated caller can reach this.
+fn fanout_arg_each<W: Clone + AsRef<[u64]>, S: EvalSemantics, B>(
+    arg_expr: &Expr,
+    value: StandardJson<'_, W>,
+    optional: bool,
+    mut body: B,
+) -> Flow
+where
+    B: FnMut(OwnedValue) -> Flow,
+{
+    // Tracked out-of-band for the usual reason: the sink can only answer
+    // `Demand`, so "why did the pull stop" has to be recorded beside it.
+    let mut escape: Option<Control> = None;
+    let mut consumer_stopped = false;
+
+    let flow = eval_each::<W, S>(arg_expr, value, optional, &mut |item| {
+        // #2023's rule, same as `fanout_arg`'s own lazy sink: an undecodable
+        // argument value raises rather than silently becoming `""`.
+        let owned = match item.into_owned() {
+            Ok(v) => v,
+            Err(e) => {
+                escape = Some(Control::Error(e));
+                return Demand::Stop;
+            }
+        };
+        match body(owned) {
+            // This argument value's own walk finished; go on to the next.
+            Flow::Exhausted => Demand::Continue,
+            Flow::Stopped { .. } => {
+                consumer_stopped = true;
+                Demand::Stop
+            }
+            Flow::Escaped(control) => {
+                escape = Some(control);
+                Demand::Stop
+            }
+        }
+    });
+
+    match escape {
+        Some(control) => Flow::Escaped(control),
+        // `pending` is dropped for the reason every other lazy consumer
+        // drops it: it belongs to an eager fallback jq would never reach.
+        None if consumer_stopped => Flow::Stopped { pending: None },
+        None => flow,
+    }
+}
+
+/// Demand-forwarding twin of [`builtin_nth_stream`]/[`eval_nth_expr`]
+/// (#2180 WP1): the same "pull until index `n`, emit, then break" macro
+/// [`each_take_nth`] transcribes, with the kept output pushed to `sink` as it
+/// is produced instead of collected.
+///
+/// The index test is `>=`, not `==`, and `seen` deliberately keeps rising
+/// across a `?//` retry -- see [`each_take_nth`]'s own doc comment for jq's
+/// counter model and the `[nth(1; 1 as $x ?// $y | 5, 6)]` == `[6,5]` row
+/// that pins it. Reached through a wrapping consumer, that same model gives
+/// `[first(nth(0; 1 as $x ?// $y | 1))]` == `[1,1]` (jq 1.7.1, captured live,
+/// input `1`), where the eager fallback answered `[1]`.
+///
+/// `n` is the OUTER loop, driven through [`fanout_arg_each`] rather than a
+/// single eager `eval_single`, so a wrapping consumer's stop reaches the
+/// argument too: `[first(nth((0,1); (10,20)))]` is `[10]` in jq 1.7.1 -- the
+/// `$n=1` binding is never explored -- while `[nth((0,1); (10,20))]` alone is
+/// still `[10,20]`, one full walk per `n` (both captured live).
+///
+/// Unlike `eval_generic.rs`'s `nth_with_n_generic`, this does **not** force a
+/// *skipped* item's decode: `eval.rs`'s [`Item`]s are only ever borrowed or
+/// already-owned, never a lazy chain that still owes evaluation, so there is
+/// nothing to force and none of #2199/#2567's skipped-item retry problem
+/// arises on this side.
+fn each_nth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    n_expr: &Expr,
+    expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    fanout_arg_each::<W, S, _>(n_expr, value.clone(), optional, |n_owned| {
+        let n = match classify_nth_n(n_owned) {
+            Ok(n) => n,
+            Err(e) => return Flow::Escaped(Control::Error(e)),
+        };
+        let mut seen = 0usize;
+        let mut outer_stopped = false;
+        let flow = eval_each::<W, S>(expr, value.clone(), optional, &mut |item| {
+            let at_or_past = seen >= n;
+            seen += 1;
+            if at_or_past {
+                if sink(item) == Demand::Stop {
+                    outer_stopped = true;
+                }
+                Demand::Stop
+            } else {
+                Demand::Continue
+            }
+        });
+        finish_short_circuit(outer_stopped, flow)
+    })
+}
+
+/// Demand-forwarding twin of [`builtin_isempty`] (#2180 WP1): jq's
+/// `def isempty(g): label $out | (g|false, break $out), true;` transcribed as
+/// a sink, so a wrapping consumer's [`Demand::Stop`] reaches `g` -- and, with
+/// it, a `?//` bind inside `g`.
+///
+/// `false` is pushed once per output `g` hands over (jq's `g|false`) and
+/// `true` once on exhaustion (jq's trailing `, true`), exactly the
+/// count-plus-identity shape [`builtin_isempty`] resolves through
+/// [`counted_bool_flow_to_result`]; the terminal rule is shared here through
+/// [`counted_bool_flow_to_flow`]. Captured live against jq 1.7.1 (input `1`):
+/// `[first(isempty(1 as $x ?// $y | 1))]` and `[isempty(isempty(1 as $x ?//
+/// $y | 1))]` are both `[false,false]`, where the eager fallback answered
+/// `[false]`.
+fn each_isempty<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    let mut outer_stopped = false;
+    let flow = eval_each::<W, S>(expr, value, optional, &mut |_item| {
+        if sink(Item::Owned(OwnedValue::Bool(false))) == Demand::Stop {
+            outer_stopped = true;
+        }
+        Demand::Stop
+    });
+    counted_bool_flow_to_flow(true, outer_stopped, flow, sink)
+}
+
+/// Demand-forwarding twin of [`any_all_gen_cond`] (#2180 WP1) -- `any(gen;
+/// cond)`/`all(gen; cond)` with the decisive answer pushed to `sink` as it is
+/// found rather than collected.
+///
+/// Every rule that function documents is reproduced verbatim, because they
+/// are the same rules: `cond` is probed per output *as `gen` produces it*
+/// (#932), a decisive element short-circuits `gen`, `probe_escape` is a
+/// per-attempt channel cleared on every genuine match so an
+/// already-retried-past alternative's `cond` error cannot outrank a later
+/// alternative's real verdict (#1519), and it is folded into the flow exactly
+/// once, at the end, so the shared terminal rule only ever reasons about one
+/// escape channel (#2204). The generator still runs on the owned bridge
+/// ([`eval_each_owned`]) rather than the cursor, for the duplicate-key and
+/// number-spelling reason `any_all_gen_cond` gives.
+///
+/// Captured live against jq 1.7.1 (input `1`): `[first(any(1 as $x ?// $y |
+/// 1; .))]` is `[true,true]` and `[isempty(any(1 as $x ?// $y | 1; .))]` is
+/// `[false,false]`, where the eager fallback answered `[true]`/`[false]`.
+fn each_any_all_gen_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    gen: &Expr,
+    cond: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    target_truthy: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    // `to_owned_or_suppress!` returns a `QueryResult`; this arm answers in
+    // `Flow`, so the same suppress-or-raise decision is spelled out (#2001).
+    let owned = match to_owned(&value) {
+        Ok(v) => v,
+        Err(e) if suppresses(&e, optional) => return Flow::Exhausted,
+        Err(e) => return Flow::Escaped(Control::Error(e)),
+    };
+
+    let mut outer_stopped = false;
+    let mut probe_escape: Option<Control> = None;
+    let flow = eval_each_owned::<S>(
+        gen,
+        &owned,
+        optional,
+        &mut |elem| match any_all_probe_element::<S>(cond, &elem, target_truthy) {
+            Ok(true) => {
+                probe_escape = None;
+                if sink(Item::Owned(OwnedValue::Bool(target_truthy))) == Demand::Stop {
+                    outer_stopped = true;
+                }
+                Demand::Stop
+            }
+            Ok(false) => Demand::Continue,
+            Err(control) => {
+                probe_escape = Some(control);
+                Demand::Stop
+            }
+        },
+    );
+
+    let effective_flow = match (flow, probe_escape) {
+        (Flow::Stopped { .. }, Some(control)) => Flow::Escaped(control),
+        (flow, _) => flow,
+    };
+    counted_bool_flow_to_flow(!target_truthy, outer_stopped, effective_flow, sink)
+}
+
+/// Demand-forwarding twin of [`builtin_upper_in`] (#2180 WP1) -- `IN(s)`,
+/// jq's `any(s == .; .)`, with the `true` pushed to `sink` as the matching
+/// candidate is found rather than collected.
+///
+/// Same equality rule (`owned_value_eq::<S>`, so yq mode's strict Int/Float
+/// distinction is honoured), same `optional` threading for `s`'s own
+/// generator errors, and the same count-plus-identity terminal shape
+/// ([`counted_bool_flow_to_flow`]) as its eager sibling. Captured live
+/// against jq 1.7.1 (input `1`): `[first(IN(1 as $x ?// $y | 1))]` is
+/// `[true,true]` and `[limit(1; IN(1 as $x ?// $y | 1))]` is `[true,true]`,
+/// where the eager fallback answered `[true]`.
+fn each_upper_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    s: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    let current = match to_owned(&value) {
+        Ok(v) => v,
+        Err(e) if suppresses(&e, optional) => return Flow::Exhausted,
+        Err(e) => return Flow::Escaped(Control::Error(e)),
+    };
+
+    let mut outer_stopped = false;
+    let flow = eval_each_owned::<S>(s, &current, optional, &mut |candidate| {
+        if owned_value_eq::<S>(&candidate, &current) {
+            if sink(Item::Owned(OwnedValue::Bool(true))) == Demand::Stop {
+                outer_stopped = true;
+            }
+            Demand::Stop
+        } else {
+            Demand::Continue
+        }
+    });
+    counted_bool_flow_to_flow(false, outer_stopped, flow, sink)
+}
+
+/// Demand-forwarding twin of [`builtin_upper_in_src`] (#2180 WP1) -- `IN(src;
+/// s)` is `any(src == s; .)`, so it synthesizes the identical
+/// `Expr::Compare` its eager sibling does and hands it to
+/// [`each_any_all_gen_cond`]. The synthesized comparison is itself already
+/// demand-aware (`eval_each`'s `Expr::Compare` arm, #1459), so the whole nest
+/// stays lazy. Captured live against jq 1.7.1 (input `1`):
+/// `[first(IN(1; 1 as $x ?// $y | 1))]` is `[true,true]`, where the eager
+/// fallback answered `[true]`.
+fn each_upper_in_src<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    src: &Expr,
+    s: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    let gen = Expr::Compare {
+        op: CompareOp::Eq,
+        left: Box::new(src.clone()),
+        right: Box::new(s.clone()),
+    };
+    each_any_all_gen_cond::<W, S>(&gen, &Expr::Identity, value, optional, true, sink)
 }
 
 /// Demand-driven twin of [`eval_range`] (#1556): drives `from`, `to`, and
@@ -47104,6 +47539,67 @@ mod tests {
             (b"null", "[limit(2; range(1;10))]"),
             (b"null", "if true then range(1;4) else 9 end"),
             (b"null", "try range(1; \"x\") catch 9"),
+            // #2180 WP1: the nested short-circuiting consumers gained native
+            // lazy arms (`each_first`, `each_nth`, `each_isempty`,
+            // `each_any_all_gen_cond`, `each_upper_in`/`each_upper_in_src`).
+            // This differential is what guards each against drifting from
+            // the eager sibling it now shadows -- `eval_first_expr`,
+            // `builtin_nth_stream`, `builtin_isempty`, `any_all_gen_cond`,
+            // `builtin_upper_in`/`builtin_upper_in_src`. Every case is
+            // side-effect free, so an always-`Continue` sink must deliver
+            // identical values in identical order; the *stopping* behaviour
+            // these arms exist for is the CLI tests' and the `?//` oracle
+            // sweep's job.
+            (b"null", "first(1, 2, 3)"),
+            (b"null", "first(empty)"),
+            (b"null", "first(error(\"x\"))"),
+            (b"null", "first(1, error(\"x\"))"),
+            (b"null", "label $o | first(break $o, 1)"),
+            (b"[1,2,3]", "first(.[])"),
+            (b"null", "nth(1; 10, 20, 30)"),
+            (b"null", "nth(0; empty)"),
+            (b"null", "nth(5; 1, 2)"),
+            (b"null", "nth(-1; 1, 2)"),
+            (b"null", "nth(\"x\"; 1, 2)"),
+            (b"null", "[nth((0,1); 10, 20, 30)]"),
+            (b"null", "nth(empty; 1, 2)"),
+            (b"null", "nth(1; 1, error(\"x\"), 3)"),
+            (b"null", "isempty(empty)"),
+            (b"null", "isempty(1, 2)"),
+            (b"null", "isempty(error(\"x\"))"),
+            (b"null", "isempty(1, error(\"x\"))"),
+            (b"[1,2,3]", "isempty(.[])"),
+            (b"null", "any(1, 2; . > 1)"),
+            (b"null", "any(1, 2; . > 5)"),
+            (b"null", "any(empty; .)"),
+            (b"null", "all(1, 2; . > 0)"),
+            (b"null", "all(1, 2; . > 1)"),
+            (b"null", "all(empty; .)"),
+            (b"null", "any(1, error(\"x\"); . > 5)"),
+            (b"null", "any(1, 2; error(\"x\"))"),
+            (b"1", "IN(1, 2)"),
+            (b"1", "IN(2, 3)"),
+            (b"1", "IN(empty)"),
+            (b"1", "IN(2, error(\"x\"))"),
+            (b"1", "IN(1; 1, 2)"),
+            (b"1", "IN(1; 2, 3)"),
+            // Nested inside each other and inside the other lazy arms, so
+            // each arm is reached indirectly too -- the shape WP1 exists for.
+            (b"null", "[first(first(1, 2))]"),
+            (b"null", "[first(nth(0; 1, 2))]"),
+            (b"null", "[first(isempty(1, 2))]"),
+            (b"1", "[first(IN(1, 2))]"),
+            (b"null", "[isempty(isempty(1, 2))]"),
+            (b"null", "[limit(2; first(1, 2))]"),
+            (b"null", "if true then first(1, 2) else 9 end"),
+            (b"null", "try first(error(\"x\")) catch 9"),
+            // Under a `?//` chain, where an outer consumer's stop is
+            // observable in the output count (#1519) -- an always-`Continue`
+            // sink must still agree with the eager path here.
+            (b"null", "[first(1 as $x ?// $y | 5, 6)]"),
+            (b"null", "[nth(1; 1 as $x ?// $y | 5, 6)]"),
+            (b"null", "[isempty(1 as $x ?// $y | 5)]"),
+            (b"null", "[any(1 as $x ?// $y | true; .)]"),
         ];
 
         for (json, src) in cases {
