@@ -12587,6 +12587,93 @@ mod tests {
         assert_eq!(value_tag(b"key: !custom v"), "!!str");
     }
 
+    /// [`YamlCursor::explicit_tag`] and its `explicit_tag_at` core across
+    /// every shape that decides whether the alias branch is taken (#1448).
+    ///
+    /// `explicit_tag_at` returns the tag at the node's own `bp_pos` unless
+    /// the value handed to it is an `Alias`, in which case it dereferences
+    /// to the anchor's tag (#903). The cases below pin both arms, plus the
+    /// two shapes where the answer is *not* derivable from `bp_pos` alone --
+    /// a sequence-item wrapper around an alias, and an alias to a tagged
+    /// anchor. A narrowing of that logic to a direct `index.aliases` lookup
+    /// keyed on `bp_pos` would answer `None` for the wrapper case, a silent
+    /// tag loss; the final assertion is what catches it.
+    #[test]
+    fn test_explicit_tag_alias_and_wrapper_paths_1448() {
+        fn tag_of_first_value(yaml: &[u8]) -> Option<String> {
+            let index = YamlIndex::build(yaml).unwrap();
+            let root = index.root(yaml);
+            if let YamlValue::Mapping(fields) = first_doc(root) {
+                if let Some(field) = fields.into_iter().next() {
+                    return field.value_cursor().explicit_tag().map(String::from);
+                }
+            }
+            panic!("no first field in {:?}", core::str::from_utf8(yaml));
+        }
+        fn tag_of_field(yaml: &[u8], want: &str) -> Option<String> {
+            let index = YamlIndex::build(yaml).unwrap();
+            let root = index.root(yaml);
+            if let YamlValue::Mapping(fields) = first_doc(root) {
+                for field in fields {
+                    if matches!(field.key().as_str(), Some(k) if k == want) {
+                        return field.value_cursor().explicit_tag().map(String::from);
+                    }
+                }
+            }
+            panic!("no field {want:?} in {:?}", core::str::from_utf8(yaml));
+        }
+
+        // No alias anywhere: the tag comes straight from this node.
+        assert_eq!(
+            tag_of_first_value(b"a: !!str 1\n").as_deref(),
+            Some("!!str")
+        );
+        assert_eq!(tag_of_first_value(b"a: 1\n"), None);
+
+        // A container's `value()` returns Mapping/Sequence before it can reach
+        // its `*` arm, so it is never an `Alias` -- even here, where an alias
+        // does exist elsewhere in the document.
+        let tagged_containers = b"a: &z 1\nm: !!map\n  k: *z\ns: !!seq\n  - *z\n";
+        assert_eq!(
+            tag_of_field(tagged_containers, "m").as_deref(),
+            Some("!!map")
+        );
+        assert_eq!(
+            tag_of_field(tagged_containers, "s").as_deref(),
+            Some("!!seq")
+        );
+
+        // An alias node carries no tag of its own, so #903's transparency
+        // must dereference to the anchor's tag.
+        assert_eq!(
+            tag_of_field(b"a: &x !!str 1\nb: *x\n", "b").as_deref(),
+            Some("!!str")
+        );
+        // ... and an alias to an untagged anchor still has no tag.
+        assert_eq!(tag_of_field(b"a: &x 1\nb: *x\n", "b"), None);
+
+        // A sequence-item *wrapper* around an alias. The wrapper is not a
+        // container and holds no tag at its own `bp_pos`, so the answer can
+        // only come from letting `value()` recurse into the child and
+        // dereference. This is the case the tempting narrowing to a direct
+        // `index.aliases`/`get_tag` lookup keyed on `bp_pos` would silently
+        // answer `None` for -- see this method's own doc comment.
+        let wrapped = b"a: &x !!str 1\nitems:\n  - *x\n";
+        let index = YamlIndex::build(wrapped).unwrap();
+        let root = index.root(wrapped);
+        let mut wrapper_tag = None;
+        if let YamlValue::Mapping(fields) = first_doc(root) {
+            for field in fields {
+                if matches!(field.key().as_str(), Some(k) if k == "items") {
+                    let seq = field.value_cursor();
+                    let item = seq.first_child().expect("sequence has an item");
+                    wrapper_tag = item.explicit_tag().map(String::from);
+                }
+            }
+        }
+        assert_eq!(wrapper_tag.as_deref(), Some("!!str"));
+    }
+
     /// `is_falsy` (the `DocumentCursor` trait method backing `select`,
     /// `if/then/else`, and `//`) must honor an explicit tag's resolution, not
     /// the scalar's own quoting - a quoted non-empty string is ordinarily
