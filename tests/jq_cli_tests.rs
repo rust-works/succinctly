@@ -5027,19 +5027,27 @@ fn test_seq_no_rs_byte_warns_1525() -> Result<()> {
     Ok(())
 }
 
-/// #1525: a malformed record that *does* start with an RS byte must not
-/// trigger the "no RS byte" warning above -- it's silently dropped per
-/// RFC 7464 (#1093/#1267), with no diagnostic, exactly as before this fix
-/// (jq's own warning for this shape uses a different message template
-/// entirely -- "Invalid numeric literal ... (need RS to resync)" or
-/// "Unfinished string/JSON term at EOF" depending on how it's malformed --
-/// deliberately not attempted here, tracked separately as #1723).
+/// #1525/#1723: a malformed record that *does* start with an RS byte gets
+/// jq's mid-stream templates, never the "no RS byte" one above (#1525
+/// deliberately left this silent; #1723 implemented it).
+///
+/// Three warnings for one record, not one, and that is the point: jq
+/// resets to the top level and resumes at the very next byte rather than
+/// skipping to the next RS, so `not`, `valid` and `json` are each rejected
+/// in turn. The `(need RS to resync)` the message promises never happens
+/// -- see [`super`]'s `jq_seq_reader` for why. Captured from
+/// `/usr/bin/jq` 1.7.1.
 #[test]
-fn test_seq_malformed_record_with_rs_byte_does_not_warn_1525() -> Result<()> {
+fn test_seq_malformed_record_with_rs_byte_warns_1723() -> Result<()> {
     let (stdout, stderr, code) =
         run_jq_full(&["--seq", "-c", "."], Some("\u{1e}not valid json\n")).unwrap();
     assert_eq!(code, 0);
-    assert_eq!(stderr, "");
+    assert_eq!(
+        stderr,
+        "jq: ignoring parse error: Invalid numeric literal at line 1, column 5 (need RS to resync)\n\
+         jq: ignoring parse error: Invalid numeric literal at line 1, column 11 (need RS to resync)\n\
+         jq: ignoring parse error: Invalid numeric literal at line 2, column 0 (need RS to resync)\n"
+    );
     assert_eq!(stdout, "");
     Ok(())
 }
