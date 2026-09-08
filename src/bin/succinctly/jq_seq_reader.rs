@@ -240,6 +240,9 @@ impl Reader {
                 return Err("Truncated value");
             }
             self.check_literal()?;
+            // Unreachable in practice, and kept because jq has it: a
+            // completed top-level value is cleared by `check_done` the
+            // moment it completes, so nothing is ever still pending here.
             if self.st == St::Normal && self.check_done() {
                 return Ok(());
             }
@@ -357,6 +360,9 @@ impl Reader {
                     return Err("Expected value before ','");
                 }
                 match self.stack.last() {
+                    // Same as the RS branch above: at the top level the
+                    // pending value is already gone, so the `is_none`
+                    // check has answered first. jq has the arm; so do we.
                     None => return Err("',' not as part of an object or array"),
                     Some(Frame::Array { .. }) => {
                         if let Some(Frame::Array { nonempty }) = self.stack.last_mut() {
@@ -415,6 +421,7 @@ impl Reader {
                 self.stack.pop();
                 self.next = Some(Kind::Object);
             }
+            // Only `classify`'s `Structure` bytes reach this function.
             _ => {}
         }
         Ok(())
@@ -483,6 +490,9 @@ impl Reader {
                 }
                 continue;
             }
+            // Unreachable: a trailing `\\` puts the scanner in
+            // `StrEscape`, so the next byte is consumed as the escaped one
+            // and the string cannot end here. jq carries the arm anyway.
             if i >= buf.len() {
                 return Err("Expected escape character at end of string");
             }
@@ -945,6 +955,65 @@ mod tests {
                 "Unfinished JSON term at EOF at line 1, column 301".to_string(),
             ],
         );
+    }
+
+    /// The remaining `parse_token` categories, each needing a value already
+    /// in hand when the structural byte arrives -- which only happens
+    /// inside a container, since a completed top-level value is handed off
+    /// and cleared before the next byte is read.
+    #[test]
+    fn structural_errors_needing_a_pending_value_1723() {
+        assert_warnings(
+            b"\x1e[1[",
+            &["Expected separator between values at line 1, column 4 (need RS to resync)"],
+        );
+        assert_warnings(
+            b"\x1e[1:",
+            &["':' not as part of an object at line 1, column 4 (need RS to resync)"],
+        );
+        assert_warnings(
+            b"\x1e{\"a\"}",
+            &["Objects must consist of key:value pairs at line 1, column 6 (need RS to resync)"],
+        );
+        assert_warnings(
+            b"\x1e[}",
+            &["Unmatched '}' at line 1, column 3 (need RS to resync)"],
+        );
+    }
+
+    /// A token longer than the buffer's initial growth step, and the
+    /// ordinary two-character escapes -- neither reaches a diagnostic, so
+    /// what is asserted is that neither invents one.
+    #[test]
+    fn long_tokens_and_plain_escapes_1723() {
+        // 256 exactly fills the buffer's first growth step, which is the
+        // one length at which `check_literal`'s own NUL write has to grow
+        // it again; 300 then exercises a second growth during scanning.
+        for (digits, column) in [(256usize, 257usize), (300, 301)] {
+            let mut input = vec![ASCII_RS];
+            input.extend(std::iter::repeat_n(b'9', digits));
+            assert_eq!(
+                warnings(&[&input]),
+                [format!(
+                    "Potentially truncated top-level numeric value at EOF at line 1, column {column}"
+                )],
+            );
+        }
+        assert_warnings(b"\x1e\"a\\nb\\t\\\\\\/\\\"\\b\\f\\rc\"", &[]);
+    }
+
+    /// #1525's template, reached through the model rather than
+    /// `seq_no_rs_byte_warning`: with no RS byte anywhere, jq's parser is
+    /// still waiting for one when EOF arrives. The wired call site routes
+    /// this case to #1525's helper instead, so the two never both fire.
+    #[test]
+    fn no_rs_byte_anywhere_abandons_at_eof_1723() {
+        assert_warnings(
+            b"1 2",
+            &["Unfinished abandoned text at EOF at line 1, column 3"],
+        );
+        // Newlines still advance the line counter while waiting for an RS.
+        assert_warnings(b"junk\nmore\x1e\"ok\"\n", &[]);
     }
 
     /// Content before the first RS byte is discarded without a word: jq's
