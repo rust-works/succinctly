@@ -2668,29 +2668,46 @@ fn push_generic_owned_values<V: DocumentValue>(
     result: GenericResult<V>,
     out: &mut Vec<OwnedValue>,
 ) -> Option<Control> {
+    fold_generic_owned_values(result, &mut |v, _| out.push(v))
+}
+
+/// [`push_generic_owned_values`]'s fold: every value `result` holds, in
+/// order, each with the cursor it came from when it came from one (#2072 --
+/// the binding sites keep that cursor as the value's origin). Stops at the
+/// first escape and hands it back; the values before it were delivered.
+fn fold_generic_owned_values<V: DocumentValue>(
+    result: GenericResult<V>,
+    push: &mut dyn FnMut(OwnedValue, Option<&V::Cursor>),
+) -> Option<Control> {
     match result.materialize_lazy() {
         // A decode failure here is an uncaught error like any other the
         // `GenericResult::Error` arm below already forwards (#1247).
-        GenericResult::One(v) => out.push(push_or_control!(to_owned(&v))),
-        GenericResult::OneCursor(c) => out.push(push_or_control!(to_owned_cursor(&c))),
+        GenericResult::One(v) => push(push_or_control!(to_owned(&v)), None),
+        GenericResult::OneCursor(c) => push(push_or_control!(to_owned_cursor(&c)), Some(&c)),
         GenericResult::Many(vs) => {
             for v in &vs {
-                out.push(push_or_control!(to_owned(v)));
+                push(push_or_control!(to_owned(v)), None);
             }
         }
         GenericResult::ManyCursor(cs) => {
             for c in &cs {
-                out.push(push_or_control!(to_owned_cursor(c)));
+                push(push_or_control!(to_owned_cursor(c)), Some(c));
             }
         }
         GenericResult::None => {}
-        GenericResult::Owned(v) => out.push(v),
-        GenericResult::ManyOwned(vs) => out.extend(vs),
+        GenericResult::Owned(v) => push(v, None),
+        GenericResult::ManyOwned(vs) => {
+            for v in vs {
+                push(v, None);
+            }
+        }
         GenericResult::Error(e) => return Some(Control::Error(e)),
         GenericResult::Break(label) => return Some(Control::Break(label)),
         GenericResult::Halt(code) => return Some(Control::Halt(code)),
         GenericResult::Partial(vs, control) => {
-            out.extend(vs);
+            for v in vs {
+                push(v, None);
+            }
             return Some(control);
         }
         GenericResult::LazyKeys { .. }
@@ -8254,67 +8271,17 @@ fn materialize_bound_values_generic<V: DocumentValue>(
 }
 
 /// [`materialize_bound_values_generic`] keeping, per bound value, the node
-/// it came from (#2072): a cursor the bind produced names its own node, and
-/// a `. as $x` passthrough names the ambient one. A value the bind built
-/// (`Owned`, or a `V` reached some other way) has no origin, and the body
-/// then sees exactly what it saw before.
+/// it came from (#2072): a cursor the bind produced names its own node (a
+/// `. as $x` passthrough evaluates to the ambient cursor, so it is covered),
+/// and a value the bind built has no origin, so the body then sees exactly
+/// what it saw before.
 fn materialize_bound_values_with_origin<V: DocumentValue>(
-    bind: &Expr,
     bound_result: GenericResult<V>,
-    cursor: Option<V::Cursor>,
 ) -> Result<(Vec<BoundValue>, Option<Control>), Flow> {
-    let passthrough = matches!(strip_parens(bind), Expr::Identity)
-        .then(|| cursor.map(|c| bind_origin_of_cursor(&c)))
-        .flatten();
     let mut out: Vec<BoundValue> = Vec::new();
-    let mut control = None;
-    match bound_result.materialize_lazy() {
-        GenericResult::One(v) => match to_owned(&v) {
-            Ok(v) => out.push((v, passthrough)),
-            Err(e) => control = Some(Control::Error(e)),
-        },
-        GenericResult::OneCursor(c) => match to_owned_cursor(&c) {
-            Ok(v) => out.push((v, Some(bind_origin_of_cursor(&c)))),
-            Err(e) => control = Some(Control::Error(e)),
-        },
-        GenericResult::Many(vs) => {
-            for v in &vs {
-                match to_owned(v) {
-                    Ok(v) => out.push((v, None)),
-                    Err(e) => {
-                        control = Some(Control::Error(e));
-                        break;
-                    }
-                }
-            }
-        }
-        GenericResult::ManyCursor(cs) => {
-            for c in &cs {
-                match to_owned_cursor(c) {
-                    Ok(v) => out.push((v, Some(bind_origin_of_cursor(c)))),
-                    Err(e) => {
-                        control = Some(Control::Error(e));
-                        break;
-                    }
-                }
-            }
-        }
-        GenericResult::None => {}
-        GenericResult::Owned(v) => out.push((v, None)),
-        GenericResult::ManyOwned(vs) => out.extend(vs.into_iter().map(|v| (v, None))),
-        GenericResult::Error(e) => control = Some(Control::Error(e)),
-        GenericResult::Break(label) => control = Some(Control::Break(label)),
-        GenericResult::Halt(code) => control = Some(Control::Halt(code)),
-        GenericResult::Partial(vs, c) => {
-            out.extend(vs.into_iter().map(|v| (v, None)));
-            control = Some(c);
-        }
-        GenericResult::LazyKeys { .. }
-        | GenericResult::LazyIndexRange(_)
-        | GenericResult::LazySeq(_) => {
-            unreachable!("materialize_lazy() already normalized every lazy variant")
-        }
-    }
+    let control = fold_generic_owned_values(bound_result, &mut |v, c| {
+        out.push((v, c.map(bind_origin_of_cursor)));
+    });
     if out.is_empty() {
         return Err(match control {
             Some(control) => Flow::Escaped(control),
@@ -8399,6 +8366,30 @@ fn identity_from_origin<V: DocumentValue>(
     }
 }
 
+/// The identity a bound variable stands at (#2072): rebuilt from its origin
+/// when it has one this pipe can resolve, else -- a variable bound where no
+/// cursor domain exists, or from a node of another document -- the rule
+/// `OwnedIdentityRule::Bound` always applied: the input's own position when
+/// the bound value *is* the input, detached otherwise. One definition for the
+/// `Bound` rule, the navigation step and the operand identity, so the three
+/// cannot drift.
+fn bound_var_identity<S: EvalSemantics, V: DocumentValue>(
+    origin: Option<&BindOrigin>,
+    bound: &OwnedValue,
+    input: &OwnedValue,
+    id: &OwnedIdentity<V>,
+) -> OwnedIdentity<V> {
+    origin
+        .and_then(|origin| identity_from_origin::<V>(origin, id.base.as_ref()))
+        .unwrap_or_else(|| {
+            if owned_value_eq::<S>(bound, input) {
+                id.clone()
+            } else {
+                OwnedIdentity::detached()
+            }
+        })
+}
+
 /// Lazy twin of `eval::each_as` (#1596): the bind expression (`expr`) is
 /// evaluated eagerly, exactly as `eval::each_as` already does -- this fix is
 /// scoped to what runs *per bound value*, not to the binding itself. Each
@@ -8417,11 +8408,10 @@ fn each_as_generic<S: EvalSemantics, V: DocumentValue>(
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Flow {
     let bound_result = eval_single::<S, V>(expr, value.clone(), optional, cursor);
-    let (bound_values, bound_control) =
-        match materialize_bound_values_with_origin(expr, bound_result, cursor) {
-            Ok(pair) => pair,
-            Err(flow) => return flow,
-        };
+    let (bound_values, bound_control) = match materialize_bound_values_with_origin(bound_result) {
+        Ok(pair) => pair,
+        Err(flow) => return flow,
+    };
 
     for (bound_val, origin) in bound_values {
         let substituted_body = substitute_bound_var_from(expr, body, var, &bound_val, origin);
@@ -19097,17 +19087,7 @@ fn owned_identity_step<S: EvalSemantics, V: DocumentValue>(
         // it keeps the input's position only when it *is* the input, the
         // same rule `OwnedIdentityRule::Bound` applies.
         Expr::TrackedVar(var) => {
-            let vid = var
-                .node
-                .as_ref()
-                .and_then(|origin| identity_from_origin::<V>(origin, id.base.as_ref()))
-                .unwrap_or_else(|| {
-                    if owned_value_eq::<S>(&var.value, value) {
-                        id.clone()
-                    } else {
-                        OwnedIdentity::detached()
-                    }
-                });
+            let vid = bound_var_identity::<S, V>(var.node.as_ref(), &var.value, value, id);
             out.push((var.value.clone(), vid));
             Ok(())
         }
@@ -19595,11 +19575,7 @@ fn owned_identity_operand<S: EvalSemantics, V: DocumentValue>(
     // that knows where it was bound stands there (#2072: `.a as $x | ($x +
     // [4]) | path` is `["a"]` in yq v4.53.3, the left operand's node).
     if let Expr::TrackedVar(v) = expr {
-        let vid = v
-            .node
-            .as_ref()
-            .and_then(|origin| identity_from_origin::<V>(origin, id.base.as_ref()))
-            .unwrap_or_else(OwnedIdentity::detached);
+        let vid = bound_var_identity::<S, V>(v.node.as_ref(), &v.value, value, id);
         return Ok(Some((v.value.clone(), vid)));
     }
     // spine 2416 (identity pass): an operand outside the navigation grammar
@@ -19662,7 +19638,13 @@ fn owned_identity_after_stage<S: EvalSemantics, V: DocumentValue>(
     // an input `key` left behind is cleared here -- `.a.b | key | tostring |
     // key` is `"b"` again in yq v4.53.3.
     let placed = owned_identity_placed_by::<S, V>(stage, rule, value, id, output, optional)?;
-    Ok(placed.map(|id| id.with_key_node(rule == OwnedIdentityRule::KeyNode)))
+    Ok(placed.map(|placed| match rule {
+        // #2072: a bound variable stands at the node it was bound from, key
+        // node or not -- the flag is the bound identity's own, not this
+        // stage's to clear.
+        OwnedIdentityRule::Bound => placed,
+        _ => placed.with_key_node(rule == OwnedIdentityRule::KeyNode),
+    }))
 }
 
 /// [`owned_identity_after_stage`] before the key-node flag is applied.
@@ -19679,22 +19661,13 @@ fn owned_identity_placed_by<S: EvalSemantics, V: DocumentValue>(
         // #2072: a variable that knows where it was bound stands there. One
         // that does not -- bound by a site with no cursor domain, or from a
         // node of another document -- keeps the value-equality rule.
-        OwnedIdentityRule::Bound => Some(
-            match strip_parens(stage) {
-                Expr::TrackedVar(var) => var
-                    .node
-                    .as_ref()
-                    .and_then(|origin| identity_from_origin::<V>(origin, id.base.as_ref())),
+        OwnedIdentityRule::Bound => {
+            let origin = match strip_parens(stage) {
+                Expr::TrackedVar(var) => var.node.as_ref(),
                 _ => None,
-            }
-            .unwrap_or_else(|| {
-                if owned_value_eq::<S>(output, value) {
-                    id.clone()
-                } else {
-                    OwnedIdentity::detached()
-                }
-            }),
-        ),
+            };
+            Some(bound_var_identity::<S, V>(origin, output, value, id))
+        }
         OwnedIdentityRule::Slice => {
             let Expr::Slice {
                 start,
