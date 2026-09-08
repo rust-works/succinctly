@@ -18,6 +18,14 @@
 # not durable. This is that sweep generalised — both modes, both oracles, and
 # an alphabet that can actually emit the shapes #2416 is about.
 #
+# #2072 step 0 (2026-09-08) widened the prefix alphabet with `bind_*` entries:
+# a leaf reached through an `as`-bound variable (`.a as $x | $x | <leaf>`)
+# rather than by direct navigation, so the sweep can find any case where
+# `substitute_bound_var`'s re-materialisation of the bound value erases the
+# node identity a leaf like `key`/`path`/`parent` depends on. See
+# `tests/data/jq-path-context-sweep-known-divergences.txt`'s own `bind_`
+# entries for what is already on record from that widening.
+#
 # **The generator alphabet is part of the claim.** A fuzzer whose pool cannot
 # emit the shape a bug lives in proves nothing (#2041). The alphabet here is a
 # full cross product of
@@ -102,8 +110,18 @@ SUCC="${SUCC:-$REPO_ROOT/target/release/succinctly}"
 # Navigation prefixes. Each generated filter is `<prefix> | <outer>`, so the
 # leaf always sits at a non-root position with a real accumulated path — the
 # thing the path-context routes exist to carry.
-PREFIX_IDS=(root  field  iter    seqiter descend deep)
-PREFIX_TPL=('.'   '.a'   '.a[]'  '.d[]'  '..'    '.a.b')
+#
+# The `bind_*` prefixes (#2072) route the leaf through an `as`-bound variable
+# instead of navigating directly: `substitute_bound_var` re-materialises the
+# bound value as a literal, so a leaf read through `$x` sees no node identity
+# at all where a leaf read through direct navigation does. `bind_cross`
+# binds at one array position and reads the leaf after moving to a sibling,
+# so a value-equality approximation of identity (the two elements are both
+# integers but different ones) cannot accidentally pass by coincidence the
+# way `bind_root`/`bind_field` could if the bound value happened to equal
+# the ambient one.
+PREFIX_IDS=(root  field  iter    seqiter descend deep   bind_root       bind_field        bind_iter          bind_seqiter       bind_cross)
+PREFIX_TPL=('.'   '.a'   '.a[]'  '.d[]'  '..'    '.a.b' '. as $x | $x'  '.a as $x | $x'   '.a[] as $x | $x'  '.d[] as $x | $x'  '.d[0] as $x | .d[1] | $x')
 
 # Path-context leaves, per mode.
 #
