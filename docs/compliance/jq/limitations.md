@@ -2813,23 +2813,26 @@ bindings (`$n=1` keeps `expr`'s first output alone; `$n=2` keeps its first two, 
 `("B"|stderr)`'s own value ends up in the array too), so exploring `expr`'s second output
 there is correct in both tools.
 
-**Two shapes still diverge**, both because they never reach that fan-out — verified live
-against jq 1.7.1, and unchanged by #1687:
+**One shape still diverges** — verified live against jq 1.7.1, and unchanged by #1687:
 
 | filter                                       | jq 1.7.1 | `succinctly jq` |
 |----------------------------------------------|----------|-----------------|
 | `isempty(limit((1,("N"\|debug)); 42))`        | no stderr | writes `["DEBUG:","N"]` |
-| `first(nth((0,1); (1, ("B"\|stderr))))`       | no stderr | writes `B`      |
 
 `isempty` has no native arm in `eval_generic.rs` at all, so the whole expression is
 evaluated by `eval.rs`, whose own `each_limit` still classifies `n` with a single eager
-`eval_single` rather than a fan-out. `nth` has an eager native arm but no sink-side
-(`each_`) twin, so a wrapping `first` has nothing to push its demand into. Both are the
-same shape of gap `limit` had before #1687 and both are fixable the same way — port
-`fanout_arg` to `eval::each_limit`, and give `nth` an `each_nth_generic` — neither of which
-is `limit`'s own scope. Tracked in
+`eval_single` rather than a fan-out. It is the same shape of gap `limit` had before #1687
+and is fixable the same way — port `fanout_arg` to `eval::each_limit`, which is not
+`limit`'s own scope. Tracked in
 [`docs/plan/jq-lazy-generator-consumers.md`](../../plan/jq-lazy-generator-consumers.md)
 (item 9).
+
+Its sibling `first(nth((0,1); (1, ("B"\|stderr))))` — recorded here as also writing `B` —
+**closed as a side effect of #2180 WP1**: `nth` gained both the sink-side twin it lacked
+(`each_nth`/`each_nth_generic`) and, with it, a demand-forwarding fan-out over its own `n`
+(`fanout_arg_each`, the `eval.rs` mirror of `fanout_arg_each_generic`), so the wrapping
+`first`'s stop now reaches the `$n=1` binding and neither tool writes anything. Confirmed
+live against jq 1.7.1.
 
 ## A `?//`-alternatives bind sees a short-circuiting consumer's stop only when nothing materializes it first
 
@@ -2860,9 +2863,34 @@ jq 1.7.1 and pinned as golden fixtures (`tests/data/jq-golden/cases/alt_pattern_
 | `[any(1 as $x ?// $y \| true; .)]`                         | `[true,true]`                |
 | `1 as $x ?// $y \| 5` (no consumer)                        | `5`                          |
 
+**A nested short-circuiting consumer no longer diverges — #2180 WP1 closed that whole group.**
+`first`, `nth`, `isempty`, `any`/`all(gen; cond)` and `IN(s)`/`IN(src; s)` each gained the
+demand-forwarding arm `limit` already had, in both evaluators: `each_first`, `each_nth`,
+`each_isempty`, `each_any_all_gen_cond` and `each_upper_in`/`each_upper_in_src` in
+`src/jq/eval.rs` (sharing `finish_short_circuit` and `counted_bool_flow_to_flow`, plus
+`fanout_arg_each` for `nth`'s own `n` argument), and `each_first_generic`/`each_nth_generic`
+plus `bridge_to_each_owned_flow` in `src/jq/eval_generic.rs`. Every one of these now matches
+jq 1.7.1 under both wrappers (captured live, input `1`):
+
+| filter                                                                           | jq 1.7.1 and `succinctly jq` |
+|------------------------------------------------------------------------------------|------------------------------|
+| `[first(first(1 as $x ?// $y \| 1))]`, `... nth(0; ...)`                            | `[1,1]`                      |
+| `[isempty(first(...))]`, `[isempty(nth(0; ...))]`                                  | `[false,false]`              |
+| `[first(isempty(...))]`, `[isempty(isempty(...))]`                                 | `[false,false]`              |
+| `[first(any(...; .))]`                                                             | `[true,true]`                |
+| `[first(IN(...))]`, `[first(IN(1; ...))]`, `[limit(1; IN(...))]`                   | `[true,true]`                |
+| `[first(isempty([1] as [$x] ?// $x \| if ($x\|type)=="number" then 9 else empty end))]` | `[false,true]`          |
+
+The last row is the rule the group's shared terminal helper exists for: the outer consumer's
+stop unwinds into the `?//`, the retried final alternative runs the generator dry, and *that*
+exhaustion is what reaches `isempty`'s trailing `, true` — so the identity element fires even
+though the outer sink already said stop. `nth`'s `n` fan-out follows the same demand rule:
+`[first(nth((0,1); (10,20)))]` is `[10]` in both (the `$n=1` binding is never explored), while
+a bare `[nth((0,1); (10,20))]` is still `[10,20]`.
+
 **What still diverges.** The stop only reaches the `?//` if every construct between the consumer
 and the bind *forwards demand* into it rather than materializing it. None of the constructs below
-do today, outside `limit`, so these still answer once where jq answers twice. `first(...)` reaches
+do today, so these still answer once where jq answers twice. `first(...)` reaches
 `eval_generic.rs`'s native arm and `isempty(...)` bridges wholesale to `eval.rs`'s `eval_each`, and
 the two arm sets have already drifted (`range`'s bound below), so every row is confirmed under both
 — see the full matrix in `test_nested_short_circuit_consumer_hides_the_stop_2180`
@@ -2874,10 +2902,6 @@ the two arm sets have already drifted (`range`'s bound below), so every row is c
 | `[first((1 as $x ?// $y \| 5)//9)]`                                                                         | `[5,5]`         | `[5]`         |
 | `[first(null // (1 as $x ?// $y \| 1))]`                                                                    | `[1,1]`         | `[1]`         |
 | `[first((1 as $x ?// $y \| 1) and true)]`, `... true and (...)`, `... (...) or false`, `... false or (...)` | `[true,true]`   | `[true]`      |
-| `[first(first(1 as $x ?// $y \| 1))]`, `... nth(0; ...)`                                                    | `[1,1]`         | `[1]`         |
-| `[first(isempty(1 as $x ?// $y \| 1))]`, `[isempty(isempty(...))]`                                          | `[false,false]` | `[false]`     |
-| `[first(any(1 as $x ?// $y \| 1; .))]`                                                                      | `[true,true]`   | `[true]`      |
-| `[first(IN(1 as $x ?// $y \| 1))]`, `[first(IN(1; ...))]`, `[limit(1; IN(...))]`                            | `[true,true]`   | `[true]`      |
 | `[first(if (1 as $x ?// $y \| 1) then 5 else 6 end)]`                                                       | `[5,5]`         | `[5]`         |
 | `[first((1 as $x ?// $y \| 1) as $v \| $v)]`, `... as [$a] ?// $a \| $a`                                    | `[1,1]`         | `[1]`         |
 | `[first(select((1 as $x ?// $y \| 1) == 1))]`                                                               | `[1,1]`         | `[1]`         |
@@ -2906,15 +2930,17 @@ The cause is uniform and is not about `?//` at all: `//` (`Expr::Alternative`), 
 condition, `as`/`as`-pattern's bound source, `select`, unary minus, an index key, string
 interpolation, an object value, `range`'s bound (`eval_generic.rs`'s twin only — `eval.rs`'s own
 `each_range` already forwards demand, so `isempty(range(...))` already matches while
-`first(range(...))` doesn't), `foreach`, and a **nested short-circuiting consumer** each lack a
-demand-forwarding `eval_each`/`eval_each_generic` arm, so they evaluate the bind eagerly and absorb
-the stop before it can reach `each_pattern_alternatives`.
+`first(range(...))` doesn't) and `foreach` each lack a demand-forwarding
+`eval_each`/`eval_each_generic` arm, so they evaluate the bind eagerly and absorb the stop before
+it can reach `each_pattern_alternatives`.
 
-`limit` is the one consumer that already has such an arm (`each_limit`, #1462/#1596), and it is
-exactly the one that works when nested — `1 | [first(limit(1; 1 as $x ?// $y | 1))]` is `[1,1]` in
-both, while substituting any other consumer for the inner `limit` diverges. That contrast is the
-direct evidence for the mechanism, and it means each construct closes its own row by gaining an
-arm, with no further `?//` work. Demand-forwarding and unparenthesised spellings likewise all
+`limit` was the one consumer that already had such an arm (`each_limit`, #1462/#1596), and it was
+exactly the one that worked when nested — `1 | [first(limit(1; 1 as $x ?// $y | 1))]` was `[1,1]` in
+both, while substituting any other consumer for the inner `limit` diverged. That contrast is the
+direct evidence for the mechanism, and WP1 acted on it: giving the other five consumers the same
+arm closed their rows with no `?//`-specific work at all, exactly as predicted, which is the
+strongest confirmation available that each remaining construct closes its own row the same way.
+Demand-forwarding and unparenthesised spellings likewise all
 already match (`[first((1 as $x ?// $y | 5)|.)]`, `[first(if true then 1 as $x ?// $y | 5 else 9
 end)]`, `[first(limit(5; 1 as $x ?// $y | 5))]`, `[label $o | 1 as $x ?// $y | (5, break $o)]`), as
 do collectors, `reduce`, `last`, `try`/`?`, `+`/`==` (`binary_fanout_each`), `def`/`DefCall`, and
@@ -2924,8 +2950,11 @@ argument the way the diverging constructs above do.
 This is the same missing-lazy-arm class as items 9 and 10 of
 [`docs/plan/jq-lazy-generator-consumers.md`](../../plan/jq-lazy-generator-consumers.md), tracked
 in [#2180](https://github.com/rust-works/succinctly/issues/2180), whose own plan (2026-09-08)
-splits the residual above into four work packages — WP1 (nested consumers), WP2a (`//`/`and`/`or`),
-WP2b (the remaining eager sub-expression sites), WP3 (`foreach`) — each closing its own rows.
+splits the residual into four work packages — WP1 (nested consumers, **landed**), WP2a
+(`//`/`and`/`or`), WP2b (the remaining eager sub-expression sites), WP3 (`foreach`) — each
+closing its own rows. WP1 took `scripts/jq-alt-retry-oracle-sweep.sh` from 93 known
+divergences attributed to it to none (612 cases, 0 unexpected, 258 known across WP2a/WP2b/WP3),
+and left `scripts/jq-fanout-oracle-sweep.sh` at 490/490.
 
 Unrelated to the other `?//` divergence recorded above
 ([#1365](https://github.com/rust-works/succinctly/issues/1365), `?//`-alternatives folds not being

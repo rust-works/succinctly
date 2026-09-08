@@ -108,7 +108,8 @@ one of them needs checking against the other.** The residual — constructs that
 bind before the stop can reach it (`//`, a nested `first(...)`, `foreach`, a parenthesised bind
 whose break comes from a downstream pipe stage) — is items 9/10's own missing-lazy-arm class,
 not a `?//` question, and is tracked as
-[#2180](https://github.com/rust-works/succinctly/issues/2180).
+[#2180](https://github.com/rust-works/succinctly/issues/2180), whose WP1 has since closed the
+nested-consumer part of it (see item 10).
 
 **Option (c), scoped.** `first`/`last` were the *only* `eval_generic.rs` consumers with a
 native, cursor-preserving fast-path arm shadowing `eval.rs`'s already-lazy implementation
@@ -1351,8 +1352,11 @@ the reasoning behind each placement:
    `test_first_over_limit_generator_n_is_never_evaluated_1596`, pinning zero. The `isempty`
    sibling above is untouched and remains the residual: `isempty` has no native arm in
    `eval_generic.rs`, so it is evaluated wholly by `eval.rs`, whose `each_limit` still
-   classifies `n` with one eager `eval_single`. `first(nth((0,1); ...))` is the same gap for
-   `nth`, which has no sink-side twin.
+   classifies `n` with one eager `eval_single`. `first(nth((0,1); ...))` was the same gap for
+   `nth`, which had no sink-side twin — **closed by #2180 WP1**, which gave `nth` one
+   (`each_nth`/`each_nth_generic`) and, with it, `fanout_arg_each`, the `eval.rs` mirror of
+   `fanout_arg_each_generic` that drives `n` demand-first. Porting the same helper into
+   `each_limit` is what remains of this item.
 
    Verified with `scripts/jq-fanout-oracle-sweep.sh`, which went from 20 known-gap cases
    attributed to this issue to 0 divergences (490/490 matching pinned jq 1.7.1); its now-dead
@@ -1407,3 +1411,39 @@ the reasoning behind each placement:
       treated exactly as `Control::Break` is today (`is_retryable_stop`), with foreach's own
       state threading intact (a retried alternative's UPDATE runs on the already-updated state,
       not a fresh one).
+
+    **WP1 landed**, and its 93 sweep rows closed exactly as the work-package split predicted —
+    no change to `each_pattern_alternatives`/`each_pattern_alternatives_generic` at all, only
+    the missing arms. `eval.rs` gained `each_first`, `each_nth`, `each_isempty`,
+    `each_any_all_gen_cond` and `each_upper_in`/`each_upper_in_src`, sharing
+    `finish_short_circuit` (the outer-stop/own-stop/escape close lifted from `each_limit`) and
+    `counted_bool_flow_to_flow` (the sink twin of `counted_bool_flow_to_result`);
+    `eval_each_generic` gained native, cursor-preserving `each_first_generic` and
+    `each_nth_generic`.
+
+    Three findings worth carrying into WP2a/WP2b/WP3:
+
+    - **The bridge-vs-twin question has a per-consumer answer, and it is decidable by what the
+      consumer can emit.** `isempty`, `any`/`all(gen; cond)` and `IN` answer with a computed
+      `OwnedValue::Bool` and never a document node, so routing them through the new
+      `bridge_to_each_owned_flow` (the demand-forwarding twin of
+      `bridge_to_full_evaluator_flow`) costs nothing the eager bridge those three already took
+      did not — both funnel through `to_owned_with_cursor` and both reindex the same owned
+      snapshot, so #607's duplicate-key collapse happens at the identical point either way, and
+      the far side is strictly better for `input`/`inputs` because `eval_each` carries the
+      native `Builtin::Inputs` arm `eval_on_owned` does not. `first`/`nth` are the opposite case
+      — they select and forward a *document node* — so they need native twins.
+    - **`each_limit`'s three-way close is not universal: a consumer with a trailing identity
+      element needs a fourth rule.** `isempty`'s `, true` (and `any`/`all`/`IN`'s identity)
+      fires on the generator's exhaustion *even when the outer sink already stopped*, because
+      the outer stop unwinds into the `?//`, the retried final alternative runs the generator
+      dry, and that exhaustion is what reaches it. Captured live:
+      `[first(isempty([1] as [$x] ?// $x | if ($x|type)=="number" then 9 else empty end))]` is
+      `[false,true]`. Copying `each_limit`'s `if outer_stopped { return flow; }` verbatim would
+      have answered `[false]`.
+    - **An argument position is part of the demand path, not just the generator position.**
+      `nth`'s `n` is jq's outer loop, so a wrapping consumer's stop has to reach it too:
+      `[first(nth((0,1); (10,20)))]` is `[10]`, the `$n=1` binding never explored, while a bare
+      `[nth((0,1); (10,20))]` is still `[10,20]`. That is why WP1 needed `fanout_arg_each` and
+      not just a sink over `expr` — and it closed item 9's own `first(nth((0,1); ...))` row as a
+      side effect.
