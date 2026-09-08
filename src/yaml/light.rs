@@ -3593,7 +3593,11 @@ fn write_i64<W: core::fmt::Write>(output: &mut W, mut n: i64) -> core::fmt::Resu
 /// yq's own root-only decimal-point-dropping rule.
 #[must_use]
 pub fn format_float_with_fraction(f: f64) -> String {
-    let mut buf = f.to_string();
+    // #2542: Rust's shortest-round-trip formatter and real yq's own dtoa
+    // (Go's `strconv.FormatFloat`) can disagree on the rare exact decimal
+    // tie -- see `crate::jq::correct_shortest_decimal_tiebreak`'s own doc
+    // comment, which this and every other yq float formatter below share.
+    let mut buf = crate::jq::correct_shortest_decimal_tiebreak(f, f.to_string(), 0);
     if !buf.as_bytes().contains(&b'.') {
         buf.push_str(".0");
     }
@@ -3666,7 +3670,10 @@ pub fn format_float_yq(f: f64) -> String {
 /// `f` must be finite, like [`format_float_yq`].
 #[must_use]
 pub fn format_float_yq_yaml(f: f64) -> String {
-    format_float_yq_with(f, |f| f.to_string())
+    // #2542: same tie-break correction as `format_float_with_fraction`.
+    format_float_yq_with(f, |f| {
+        crate::jq::correct_shortest_decimal_tiebreak(f, f.to_string(), 0)
+    })
 }
 
 /// [`format_float_yq_yaml`] for a computed float at any **nested**
@@ -3731,6 +3738,14 @@ fn format_float_yq_with(f: f64, ordinary_magnitude: impl FnOnce(f64) -> String) 
     let exp: i32 = exp_str
         .parse()
         .expect("exponent from Rust's exponential formatter is always a valid i32");
+    // #2542: unlike jq mode's own scientific threshold (only reachable at
+    // magnitudes where `e >= 0` in `correct_shortest_decimal_tiebreak`'s own
+    // sense, which provably excludes a tie -- see that function's doc
+    // comment), yq's fixed `>= 1e6` threshold is *not* high enough to rule
+    // this out: a value like `1e10` is well past yq's threshold but nowhere
+    // near `2^52`, so the same tie-break correction applies here too.
+    let mantissa =
+        crate::jq::correct_shortest_decimal_tiebreak(f, mantissa.to_string(), exp.into());
     let sign = if exp < 0 { '-' } else { '+' };
     format!("{mantissa}e{sign}{:02}", exp.abs())
 }
@@ -14206,6 +14221,56 @@ mod tests {
         assert_eq!(format_float_yq_yaml(-1_500_000.0), "-1.5e+06");
         assert_eq!(format_float_yq_yaml(1e100), "1e+100");
         assert_eq!(format_float_yq_yaml(1e-100), "1e-100");
+    }
+
+    /// #2542: yq's own float formatters share `jq_bare_float_display`'s
+    /// exact-tie correction (`crate::jq::correct_shortest_decimal_tiebreak`)
+    /// -- all three call sites (`format_float_with_fraction`'s and
+    /// `format_float_yq_yaml`'s ordinary-magnitude paths, and
+    /// `format_float_yq_with`'s shared scientific branch) are exercised
+    /// here. Every expectation is live-verified against Homebrew `yq`
+    /// v4.53.3.
+    #[test]
+    // The extra digit on `98.617071468694625` is deliberate, not accidental
+    // over-precision: it's exactly what places the parsed `f64` on the
+    // tie this test exercises (one ULP short of it would miss the tie
+    // entirely).
+    #[allow(clippy::excessive_precision)]
+    fn test_format_float_yq_tiebreak_matches_pinned_oracle_2542() {
+        // Ordinary magnitude, below yq's `1e6` scientific threshold.
+        let ordinary_tie = 1.0 * 98.617071468694625;
+        assert_eq!(
+            format_float_with_fraction(ordinary_tie),
+            "98.61707146869462"
+        );
+        assert_eq!(format_float_yq_yaml(ordinary_tie), "98.61707146869462");
+
+        // Past yq's threshold (`>= 1e6`) but still `e < 0` in
+        // `is_exact_midpoint`'s own sense (yq's fixed threshold is far
+        // below `2^52`, unlike jq's digit-count threshold -- see
+        // `format_float_yq_with`'s own doc comment) -- a genuine tie yq's
+        // *large*-magnitude scientific branch is not immune to.
+        let large_scientific_tie = 1.0 * 1902377798806906.2;
+        assert_eq!(
+            format_float_yq(large_scientific_tie),
+            "1.9023777988069062e+15"
+        );
+        assert_eq!(
+            format_float_yq_yaml(large_scientific_tie),
+            "1.9023777988069062e+15"
+        );
+
+        // Small-magnitude scientific tie (`2^-25`, one ULP off its own
+        // exact `...3125e-8` midpoint).
+        let small_scientific_tie = 1.0 * 2.9802322387695313e-8;
+        assert_eq!(
+            format_float_yq(small_scientific_tie),
+            "2.9802322387695312e-08"
+        );
+        assert_eq!(
+            format_float_yq_yaml(small_scientific_tie),
+            "2.9802322387695312e-08"
+        );
     }
 
     /// [`format_float_yq_yaml_nested`]'s tag rule (#1090), pinned against

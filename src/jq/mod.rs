@@ -132,3 +132,11 @@ pub(crate) use value::assert_depth;
 // external caller has any use for, and not a contract worth freezing on
 // docs.rs.
 pub(crate) use value::is_jq_canonical_number;
+// `pub(crate)` (#2542): `yaml::light`'s yq-mode float formatters
+// (`format_float_with_fraction`, `format_float_yq_yaml`,
+// `format_float_yq_with`) share this exact-tie correction with
+// `jq_bare_float_display` above -- both jq's and yq's own dtoa references
+// were independently confirmed to break the same Rust-formatter tie the
+// same way, so this is one shared implementation, not a public API
+// surface either mode's callers reach directly.
+pub(crate) use value::correct_shortest_decimal_tiebreak;
