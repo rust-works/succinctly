@@ -2188,6 +2188,37 @@ fn assert_jq_raises(
     );
 }
 
+/// [`assert_jq_raises`]'s opposite number, for the one consumer of the same
+/// corrupted documents that must *not* raise since #2168: a filter that only
+/// names a position never reads what is inside it.
+///
+/// Asserts the answer, not just exit 0, for the same reason its sibling
+/// asserts the message rather than the code -- "did not raise" and "produced
+/// the right path" are different claims, and only the second one would catch
+/// a walk that silently stopped emitting.
+fn assert_jq_answers(
+    label: &str,
+    op_label: &str,
+    extra_args: &[&str],
+    filter: &str,
+    doc: &str,
+    expect_stdout: &str,
+) {
+    let mut args: Vec<&str> = extra_args.to_vec();
+    args.push(filter);
+    let (out, err, actual_code) = run_jq_full(&args, Some(doc))
+        .unwrap_or_else(|e| panic!("[{label}] {op_label} run failed: {e}"));
+    assert_eq!(
+        actual_code, 0,
+        "[{label}] {op_label} must answer\nstdout: {out:?}\nstderr: {err:?}"
+    );
+    assert_eq!(
+        out.trim(),
+        expect_stdout,
+        "[{label}] {op_label} answer\nstderr: {err:?}"
+    );
+}
+
 /// #1645 code review: `push_generic_document_validation_error` is a second,
 /// hand-copied implementation of the same "walk and raise on corruption"
 /// predicate `to_owned_at_depth`/`to_owned_cursor_at_depth`/
@@ -2292,14 +2323,22 @@ fn test_select_and_materialize_agree_on_corruption_1645() -> Result<()> {
             5,
             expect_stderr,
         );
-        assert_jq_raises(
+        // #2168: `path(.bad)` is the one row here that must *not* raise. It
+        // names a position and never reads the value at it, and every
+        // corruption in this list lives inside `.bad`'s value -- so it now
+        // follows the rule `.keep` on these same documents always did. The
+        // four rows above keep the gate: three materialize, and `sort_by`
+        // walks the element it reorders. Keeping it in this list rather than
+        // deleting it is the point: the list's job is pinning that every
+        // consumer of one document agrees, and "agrees" now includes knowing
+        // which side of the line each one is on.
+        assert_jq_answers(
             label,
             "path(.bad)",
             &["-c"],
             "path(.bad)",
             doc,
-            5,
-            expect_stderr,
+            r#"["bad"]"#,
         );
     }
     Ok(())
@@ -2465,6 +2504,12 @@ fn fuzz_build_json_doc(path: &[FuzzContainer], malformation: FuzzMalformation) -
 // driven CLI paths to 5 (`sort_by`/`path()` joined `select`/`-Sc`/`-e` as
 // consumers of the same validation gate, #1755/#2069/#1953).
 //
+// #2168 then split those 5 into 4 + 1: `path()` stopped consuming that gate
+// and now asserts the opposite (it must answer), so this property pins the
+// *boundary* between the two behaviours rather than one shared behaviour.
+// That is the more valuable shape -- a change that moved a builtin to the
+// wrong side of the line now fails here whichever direction it moved.
+//
 // `ProptestConfig::with_cases` is turned down from proptest's own default
 // (256) because this drives five real subprocess spawns per case (a
 // `Command::new(env!("CARGO_BIN_EXE_succinctly"))` per
@@ -2513,7 +2558,16 @@ proptest! {
             expect_stderr,
         );
         assert_jq_raises(&label, "sort_by(.bad)", &[], "sort_by(.bad)", &doc, 5, expect_stderr);
-        assert_jq_raises(&label, "path(.bad)", &["-c"], "path(.bad)", &doc, 5, expect_stderr);
+        // #2168: `path(.bad)` left the "must raise" battery above. It names
+        // a position and never reads the value there, and every corruption
+        // this fuzzer builds lives *inside* `.bad`'s value, so it answers --
+        // the same rule `.keep` on these documents has always followed. The
+        // four consumers above keep the gate: three materialize, and
+        // `sort_by` walks the element it reorders. This row is what caught
+        // the mismatch when #2168 landed: the property was written against
+        // the old contract and this generator reached a shape the
+        // hand-written tests did not.
+        assert_jq_answers(&label, "path(.bad)", &["-c"], "path(.bad)", &doc, r#"["bad"]"#);
     }
 }
 
