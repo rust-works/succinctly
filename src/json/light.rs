@@ -2193,8 +2193,9 @@ pub type BorrowedJsonCursor<'a> = JsonCursor<'a, &'a [u64]>;
 // ============================================================================
 
 use crate::jq::document::{
-    effective_fields_checked, key_is_malformed, trailing_element_gap_ok, DocumentCursor,
-    DocumentElements, DocumentField, DocumentFields, DocumentValue, IndentSpec, JsonConvention,
+    document_token_of, effective_fields_checked, key_is_malformed, trailing_element_gap_ok,
+    DocumentCursor, DocumentElements, DocumentField, DocumentFields, DocumentValue, IndentSpec,
+    JsonConvention,
 };
 use crate::jq::escape::{write_json_body_jq, write_json_body_yq};
 use crate::jq::stream::{StreamFailure, StreamResult};
@@ -2400,6 +2401,32 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for JsonCursor<'a, W> {
     #[inline]
     fn is_container(&self) -> bool {
         JsonCursor::is_container(self)
+    }
+
+    /// #2072: a JSON cursor is `(text, index, bp_pos)`, and the first two
+    /// are the document -- so the BP position alone is the node identity
+    /// [`same_node`](DocumentCursor::same_node) just above compares.
+    #[inline]
+    fn node_id(&self) -> usize {
+        self.bp_pos
+    }
+
+    /// #2072: `BalancedParens::is_open` answers `false` past the end of the
+    /// vector, so one call rejects both an out-of-range id and a closing
+    /// position -- the two ways an id can fail to name a node here.
+    #[inline]
+    fn at_node_id(&self, id: usize) -> Option<Self> {
+        self.index
+            .bp()
+            .is_open(id)
+            .then(|| JsonCursor::from_bp_position(self.index, self.text, id))
+    }
+
+    /// #2072: `text` is a borrow of the same buffer the index was built
+    /// from, so the index alone identifies the document.
+    #[inline]
+    fn document_token(&self) -> usize {
+        document_token_of(self.index, self.index.bp().len())
     }
 
     #[inline]
@@ -6145,5 +6172,126 @@ mod tests {
     fn test_nested_number_span_absorbs_dangling_exponent_marker_1218() {
         assert_eq!(nested_number_span(b"5e", 0), 2);
         assert_eq!(nested_number_span(b"1E", 0), 2);
+    }
+
+    /// #2072 step 1: the `'static` handle round-trips on *every* node of a
+    /// nested document -- the root object, nested arrays and objects, and
+    /// each scalar leaf -- and re-basing from an unrelated cursor of the
+    /// same document (the root) lands on the same node as re-basing from the
+    /// cursor itself. That second half is the whole point of the handle: the
+    /// AST that will store one has long since lost the cursor it came from,
+    /// and can only offer whatever cursor is ambient at the point of use.
+    #[test]
+    fn node_id_round_trips_for_every_node_2072() {
+        let json: &[u8] = br#"{"a":[1,2,{"b":null}],"c":{"d":"e","f":[true,false]},"g":[],"h":{}}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let cursors = document_order_cursors(root);
+        assert!(
+            cursors.len() > 10,
+            "the fixture must be big enough to be worth walking, got {}",
+            cursors.len()
+        );
+
+        for c in &cursors {
+            let id = c.node_id();
+            let back = c
+                .at_node_id(id)
+                .expect("a node's own id always names a node in its own document");
+            assert!(
+                back.same_node(c),
+                "id {id} re-resolved to bp {} instead of {}",
+                back.node_id(),
+                id
+            );
+            assert_eq!(back.node_id(), id, "the round trip must be idempotent");
+
+            let from_root = root
+                .at_node_id(id)
+                .expect("any cursor of the document rebases the same id");
+            assert!(
+                from_root.same_node(c),
+                "rebasing id {id} from the root landed elsewhere"
+            );
+        }
+
+        // Distinct nodes must get distinct ids, or `same_node` and equality
+        // of ids would not be the same relation.
+        let mut ids: Vec<usize> = cursors.iter().map(DocumentCursor::node_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), cursors.len(), "two distinct nodes shared an id");
+    }
+
+    /// #2072 step 1: an id that does not name a node -- a *closing*
+    /// parenthesis, or anything past the end of the BP vector -- is `None`,
+    /// never a cursor onto some neighbouring node. Every open position, by
+    /// contrast, is a real node, which is why one `is_open` check is the
+    /// whole implementation.
+    #[test]
+    fn at_node_id_rejects_closing_and_out_of_range_ids_2072() {
+        let json: &[u8] = br#"{"a":[1,2],"b":"c"}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let bp = index.bp();
+
+        let mut closes = 0usize;
+        let mut opens = 0usize;
+        for id in 0..bp.len() {
+            match root.at_node_id(id) {
+                Some(c) => {
+                    assert!(bp.is_open(id), "position {id} is a close but resolved");
+                    assert_eq!(c.node_id(), id);
+                    opens += 1;
+                }
+                None => {
+                    assert!(
+                        !bp.is_open(id),
+                        "position {id} is an open but did not resolve"
+                    );
+                    closes += 1;
+                }
+            }
+        }
+        assert!(opens > 0 && closes > 0, "the fixture must contain both");
+
+        assert!(root.at_node_id(bp.len()).is_none(), "one past the end");
+        assert!(
+            root.at_node_id(bp.len() + 1000).is_none(),
+            "far past the end"
+        );
+        assert!(
+            root.at_node_id(usize::MAX).is_none(),
+            "no overflow, just None"
+        );
+    }
+
+    /// #2072 step 1: the token is constant across a document and differs
+    /// between two documents that are alive at the same time -- including
+    /// two indices built from *identical* bytes, which is exactly the shape
+    /// the reindex bridge produces and the shape a value-based check could
+    /// not tell apart.
+    #[test]
+    fn document_token_is_per_index_not_per_node_2072() {
+        let json: &[u8] = br#"{"a":[1,2],"b":"c"}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        let token = root.document_token();
+        for c in document_order_cursors(root) {
+            assert_eq!(
+                c.document_token(),
+                token,
+                "bp {} disagreed about its own document",
+                c.node_id()
+            );
+        }
+
+        let same_bytes: &[u8] = br#"{"a":[1,2],"b":"c"}"#;
+        let other = JsonIndex::build(same_bytes);
+        assert_ne!(
+            token,
+            other.root(same_bytes).document_token(),
+            "two live indices over equal bytes are still two documents"
+        );
     }
 }
