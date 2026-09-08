@@ -32340,6 +32340,166 @@ fn test_getpath_optional_matches_jq_on_the_cursor_walk_2168() -> Result<()> {
     Ok(())
 }
 
+/// #2168 coverage: the shapes `getpath`'s cursor walk answers or raises on
+/// *without* materializing the root, one row per step of the walk that has
+/// its own exit.
+///
+/// The walk replaced a whole-document materialization, so every step it now
+/// takes is code the old arm never had. `test_getpath_cursor_walk_matches_jq_2168`
+/// covers the well-formed navigation; this covers the four exits that only a
+/// corrupted or `null`-bearing document reaches, each against jq 1.7.1's own
+/// outcome (captured live).
+///
+/// jq's messages differ on the corrupted rows -- it rejects those documents
+/// at parse time and never gets as far as `getpath` -- so only the
+/// raise-vs-answer outcome is compared there, which is the same latitude
+/// `test_path_answers_past_a_structural_fault_it_never_reads_2168` takes.
+#[test]
+fn test_getpath_cursor_walk_corrupted_and_null_shapes_2168() -> Result<()> {
+    // `null` mid-path: jq walks on from it and answers `null`, at any depth
+    // and for either segment kind (real jq 1.7.1 agrees on both rows).
+    for filter in [r#"getpath(["a","b"])"#, r#"getpath(["a",0])"#] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, r#"{"a":null}"#, &["-c"])?;
+        assert_eq!(code, 0, "{filter}: stdout {stdout:?} stderr {stderr:?}");
+        assert_eq!(stdout.trim(), "null", "{filter}");
+    }
+
+    // Each row: a document whose corruption sits on the path the walk
+    // actually takes, so the step that reads it raises rather than silently
+    // walking past. `find_cursor`'s member check, `len_checked`'s element
+    // check, and the slice arm's per-element materialization are three
+    // separate checks inside the walk, hence three documents.
+    for (desc, doc, filter) in [
+        (
+            "malformed member on the navigated object",
+            r#"{"c":{"a":1,},"t":5}"#,
+            r#"getpath(["c","a"])"#,
+        ),
+        (
+            "malformed element in the indexed array",
+            r#"{"a":[1,,2],"t":5}"#,
+            r#"getpath(["a",0])"#,
+        ),
+        (
+            "malformed element in the sliced array",
+            r#"{"a":[1,,2],"t":5}"#,
+            r#"getpath(["a",{"start":0,"end":1}])"#,
+        ),
+        (
+            "undecodable element kept by the slice",
+            r#"{"a":["\ud800","b"]}"#,
+            r#"getpath(["a",{"start":0,"end":1}])"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
+        assert_ne!(code, 0, "{desc}: {filter} must raise, stdout {stdout:?}");
+        assert_eq!(stdout, "", "{desc}: {filter}, stderr {stderr:?}");
+    }
+
+    // The controls: the same two walk steps on clean documents, and a slice
+    // whose kept elements exclude the corrupted one -- the second is what
+    // makes the rows above claims about *what the walk touched*, not just
+    // "this document is bad somewhere".
+    for (desc, doc, filter, want) in [
+        (
+            "clean member",
+            r#"{"c":{"a":1},"t":5}"#,
+            r#"getpath(["c","a"])"#,
+            "1",
+        ),
+        (
+            "clean element",
+            r#"{"a":[1,2]}"#,
+            r#"getpath(["a",0])"#,
+            "1",
+        ),
+        (
+            "clean slice",
+            r#"{"a":[1,2]}"#,
+            r#"getpath(["a",{"start":0,"end":1}])"#,
+            "[1]",
+        ),
+        (
+            "slice past the undecodable element",
+            r#"{"a":["\ud800","b"]}"#,
+            r#"getpath(["a",{"start":1,"end":2}])"#,
+            r#"["b"]"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
+        assert_eq!(code, 0, "{desc}: stdout {stdout:?} stderr {stderr:?}");
+        assert_eq!(stdout.trim(), want, "{desc}");
+    }
+
+    Ok(())
+}
+
+/// #2168 coverage: `position_arg_integer` -- one definition for what were
+/// three copies of `at_offset`/`at_position`'s argument match -- rejects
+/// every result shape that is not a single integer.
+///
+/// The `_ => None` arm is the one this pins: an argument expression that
+/// produces *no* output, or *several*, is neither an integer nor a
+/// non-integer value, and before the shapes were unified each of the three
+/// copies had to get that right on its own. These are succinctly extensions,
+/// so there is no jq oracle for the wording -- the exit code and the
+/// message this evaluator already chose are what is being held still.
+#[test]
+fn test_position_builtin_argument_shapes_2168() -> Result<()> {
+    let doc = r#"{"a":[1,2]}"#;
+
+    for (filter, want_err) in [
+        // `_ => None`: empty and multi-output arguments.
+        (
+            "at_offset(empty)",
+            "at_offset requires a non-negative integer",
+        ),
+        (
+            "at_offset(1,2)",
+            "at_offset requires a non-negative integer",
+        ),
+        (
+            "at_position(empty; 1)",
+            "at_position requires positive integers for line",
+        ),
+        (
+            "at_position(1; empty)",
+            "at_position requires positive integers for column",
+        ),
+        // A single output that is not an integer, and an out-of-domain one:
+        // the same arm's `Some(i)` guards.
+        (
+            "at_offset(\"x\")",
+            "at_offset requires a non-negative integer",
+        ),
+        ("at_offset(-1)", "at_offset requires a non-negative integer"),
+        (
+            "at_position(0; 1)",
+            "at_position requires positive integers for line",
+        ),
+        (
+            "at_position(1; 0)",
+            "at_position requires positive integers for column",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
+        assert_eq!(code, 5, "{filter}: stdout {stdout:?} stderr {stderr:?}");
+        assert!(stderr.contains(want_err), "{filter}: {stderr:?}");
+    }
+
+    // The control: a document-sourced integer argument still works, through
+    // both the cursor shape (`.a[0]`) and `getpath`'s own (#2168's new
+    // `OneCursor` arm, already pinned by
+    // `test_at_offset_and_at_position_accept_a_document_sourced_argument`).
+    for filter in ["at_offset(.a[0])", r#"at_offset(getpath(["a",0]))"#] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
+        assert_eq!(code, 0, "{filter}: stdout {stdout:?} stderr {stderr:?}");
+        assert_eq!(stdout.trim(), r#""a""#, "{filter}");
+    }
+
+    Ok(())
+}
+
 /// #2280: `eval_generic.rs`'s `Expr::Format` arm (every `@format` builtin --
 /// this is the arm the CLI's default jq/yq dispatch actually reaches;
 /// `eval.rs`'s own sibling `eval_format` is library-API/reindex-bridge-only,
@@ -37126,6 +37286,74 @@ fn test_path_answers_past_a_colliding_key_2168() -> Result<()> {
         run_jq_stdin_streams(".", r#"{"\ud800":1,"\ud800":2}"#, &["-S", "-c"])?;
     assert_eq!(code, 5, "stdout {stdout:?}");
     assert!(stderr.contains("is ambiguous"), "{stderr}");
+
+    Ok(())
+}
+
+/// #2168 coverage: the validation gate's own **lazy collision map** still
+/// seeds itself from the prefix, on the consumers that kept the gate.
+///
+/// `push_generic_document_validation_error` builds the #1642 display-key map
+/// only from the point a decode-failure ("fallback") key first appears
+/// (#2061), then re-walks the object's earlier keys to seed it. Until #2168,
+/// `path()` was the query that reached that seeding re-walk; `path()` left
+/// the gate with this issue (see
+/// `test_path_answers_past_a_colliding_key_2168` next door, which is the
+/// same three documents on the other side of the line), and the four
+/// consumers that kept it are what still reach it.
+///
+/// The fallback key must sit at index >= 1 for the re-walk to run at all --
+/// at index 0 there is no prefix to seed from, which is the shape the sibling
+/// test's `-S` row already covers. Getting the seeding wrong turns one of
+/// these into a silent success, which is what #2061 wrote the
+/// three-position corpus for in the first place.
+///
+/// **Diverges from jq, deliberately** in the same direction and for the same
+/// reason as every other row on these documents: real jq 1.7.1 rejects all
+/// three at parse time, filter irrelevant.
+#[test]
+fn test_validation_gate_seeds_the_collision_map_prefix_2168() -> Result<()> {
+    // A clean key first, then the colliding pair: the map is seeded from
+    // index 0 only once the fallback at index 1 is met.
+    for inner in [
+        r#"{"a":1,"\ud800":2,"\ud800":3}"#,
+        r#"{"a":1,"\\ud800":2,"\ud800":3}"#,
+    ] {
+        let doc = format!(r#"{{"c":{inner},"t":5}}"#);
+
+        // `select` reaches the gate through its `OneCursor` truthiness arm.
+        let (stdout, stderr, code) = run_jq_stdin_streams("select(.c) | .t", &doc, &["-c"])?;
+        assert_eq!(code, 5, "select on {doc}: stdout {stdout:?}");
+        assert!(stderr.contains("is ambiguous"), "select: {stderr}");
+
+        // `sort_by` reaches it through the `_by` forms' own call, on an
+        // element it only reorders and never materializes (#1755) -- a
+        // second call site for one walk. The array wrapper has to be the
+        // *document*, not a `[...]` construction: collecting into one would
+        // materialize the element here and raise from there instead, which
+        // would pin nothing about this gate.
+        let array_doc = format!("[{inner}]");
+        let (stdout, stderr, code) =
+            run_jq_stdin_streams("sort_by(.a) | length", &array_doc, &["-c"])?;
+        assert_eq!(code, 5, "sort_by on {array_doc}: stdout {stdout:?}");
+        assert!(stderr.contains("is ambiguous"), "sort_by: {stderr}");
+
+        // The control, and the point of the whole #2168 split: the same
+        // document, the same colliding pair, on a query that only names
+        // positions -- it answers.
+        let (stdout, stderr, code) = run_jq_stdin_streams("path(.t)", &doc, &["-c"])?;
+        assert_eq!(code, 0, "path(.t) on {doc}: stderr {stderr:?}");
+        assert_eq!(stdout.trim(), r#"["t"]"#);
+    }
+
+    // No collision, same shape: a fallback key at index 1 whose display
+    // spelling is unique seeds the map and finds nothing, so the gate must
+    // stay quiet. Without this the rows above would pass for a gate that
+    // raised on any fallback key at all.
+    let doc = r#"{"c":{"a":1,"\ud800":2},"t":5}"#;
+    let (stdout, stderr, code) = run_jq_stdin_streams("select(.c) | .t", doc, &["-c"])?;
+    assert_eq!(code, 0, "stdout {stdout:?} stderr {stderr:?}");
+    assert_eq!(stdout.trim(), "5");
 
     Ok(())
 }

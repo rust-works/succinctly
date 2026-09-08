@@ -13538,7 +13538,7 @@ fn getpath_walk_cursor<S: EvalSemantics, V: DocumentValue>(
                         // in `range` to `[0, len)`, so `get_cursor` cannot
                         // miss here.
                         let Some(elem) = elements.get_cursor(idx) else {
-                            break;
+                            break; // omni-dev: coverage tolerate-line reason="unreachable: `len_checked` and `SliceBounds::resolve` already bound every index in `range` to `[0, len)`, so `get_cursor` cannot miss (#2168)"
                         };
                         match to_owned_cursor(&elem) {
                             Ok(owned_elem) => items.push(owned_elem),
@@ -30402,5 +30402,123 @@ mod tests {
             cursor_ancestor(&at(".a.b[1]"), 4).is_none(),
             "above the root"
         );
+    }
+
+    /// #2168 coverage: `getpath_walk_cursor`'s `optional` parameter is
+    /// threaded "for real" -- seven of its exits consult it to decide
+    /// suppress-vs-raise -- but no CLI dispatch reaches the arm with
+    /// `optional = true` (`Expr::Optional`'s catch-all evaluates its inner
+    /// expression at the *ambient* `optional`, the documented `Map`/`Select`
+    /// precedent; see `Builtin::GetPath`'s own comment and
+    /// `test_optional_ignored_sites_2280`). Called directly, for the same
+    /// reason `test_generic_tostring_and_wildcard_respect_optional_2231`
+    /// calls `eval_builtin` directly: the behaviour is defensive, so nothing
+    /// behavioural can pin it, and left unpinned a later edit could drop the
+    /// threading with every test still green.
+    ///
+    /// Only three of those seven can actually behave differently, and they
+    /// are the three shapes below: the ones whose error is *not* a
+    /// materialization failure. The other four are the
+    /// `Err(e) if suppresses(&e, optional)` arms, and they are deliberately
+    /// not pinned here, because there is nothing to pin -- every error
+    /// `find_cursor`/`len_checked`/`to_owned_cursor` raise is
+    /// `decode_failure`-tagged (#2334's `debug_assert_materialization_error`
+    /// asserts exactly that), so the guard is always false and both settings
+    /// raise. `test_getpath_cursor_walk_corrupted_and_null_shapes_2168`
+    /// (`tests/jq_cli_tests.rs`) drives all four with real corrupted
+    /// documents, which is what keeps the guard itself live code.
+    #[test]
+    fn test_getpath_walk_cursor_threads_optional_2168() {
+        use crate::json::JsonIndex;
+        let json: &[u8] = br#"{"a":[1,2],"n":1}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        // Not an array at all: `Path must be specified as an array`.
+        let not_a_path = OwnedValue::Int(0);
+        // A slice descriptor whose bounds are not integers:
+        // `Array/string slice indices must be integers`.
+        let bad_slice = OwnedValue::Array(vec![
+            OwnedValue::String("a".into()),
+            OwnedValue::Object(
+                core::iter::once(("start".to_string(), OwnedValue::String("x".into()))).collect(),
+            ),
+        ]);
+        // A segment whose kind the node cannot take: `Cannot index number
+        // with string "b"`.
+        let type_error = OwnedValue::Array(vec![
+            OwnedValue::String("n".into()),
+            OwnedValue::String("b".into()),
+        ]);
+
+        for (label, path) in [
+            ("non-array path", &not_a_path),
+            ("slice bounds", &bad_slice),
+            ("type error", &type_error),
+        ] {
+            match getpath_walk_cursor::<JqSemantics, crate::json::light::StandardJson<'_, Vec<u64>>>(
+                root, path, false,
+            ) {
+                GenericResult::Error(e) => {
+                    assert!(
+                        !e.is_decode_failure(),
+                        "[{label}] must be an ordinary error, not a decode failure: {e:?}"
+                    );
+                }
+                other => panic!("[{label}] expected a raise at optional=false, got: {other:?}"),
+            }
+            match getpath_walk_cursor::<JqSemantics, crate::json::light::StandardJson<'_, Vec<u64>>>(
+                root, path, true,
+            ) {
+                GenericResult::None => {}
+                other => panic!("[{label}] expected suppression at optional=true, got: {other:?}"),
+            }
+        }
+    }
+
+    /// #2168 coverage: `try_path_context_cursor_walk`'s own
+    /// `path_context_root` escape arm.
+    ///
+    /// Before this issue, `path_context_root` ran
+    /// `push_generic_document_validation_error` over the whole input, so any
+    /// corrupted document reached this arm. #2168 removed that gate, leaving
+    /// [`cursor_path_and_ancestors`] as the only thing that can still fail
+    /// here -- and it fails only when an *ancestor's own key* is not
+    /// string-shaped (#1995), which every CLI navigation to such a node trips
+    /// over earlier -- `find_cursor` and `.[]`'s own walk both raise before
+    /// the nested pipe starts, on all ~25 spellings tried under temporary
+    /// instrumentation during this review.
+    /// The non-sink route's own doc comment names `eval_with_cursor` as its
+    /// other caller, so that is the door used here.
+    #[test]
+    fn test_path_context_root_escape_on_a_non_string_ancestor_key_2168() {
+        use crate::json::JsonIndex;
+        // `.x`'s object has a numeric key, so the node under it has an
+        // ancestor whose key has no display spelling at all.
+        let json: &[u8] = br#"{"x":{1:{"z":3}}}"#;
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+
+        let outer = root.value().as_object().expect("root is an object");
+        let (x_field, _) = DocumentFields::uncons(&outer).expect("root has one field");
+        let inner = x_field
+            .value_cursor
+            .value()
+            .as_object()
+            .expect(".x is an object");
+        let (bad_field, _) = DocumentFields::uncons(&inner).expect(".x has one field");
+        assert!(
+            key_display_string(&bad_field.key).is_none(),
+            "the fixture's point is a key with no display spelling"
+        );
+
+        let expr = parse(". | key").expect("parses");
+        match eval_with_cursor(&expr, bad_field.value_cursor) {
+            GenericResult::Error(e) => assert!(
+                e.is_decode_failure(),
+                "a malformed member is a decode failure: {e:?}"
+            ),
+            other => panic!("expected the walk's root to escape, got: {other:?}"),
+        }
     }
 }
