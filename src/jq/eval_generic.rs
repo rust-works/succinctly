@@ -14915,9 +14915,12 @@ fn path_context_single_native(expr: &Expr) -> bool {
 /// step itself (`path_step_generic`: `find_cursor`'s #1677 delimiter scan,
 /// `effective_fields_checked`/`collect_cursors_checked`, the Iterate arm's
 /// `string_decode_error` raise). Real jq and yq both reject such a document
-/// at parse time, so every option here is an ADR-0018 divergence and the
-/// tie-break is internal consistency; recorded in
-/// `docs/compliance/jq/limitations.md`. `select` and the `sort_by` family
+/// at parse time, and until #2168 these builtins raised too -- so this gave
+/// up an agreement with the reference that plain navigation never had.
+/// ADR-0018's decision order does not license that (step 2 favours the old
+/// behaviour, and no rule-4 condition applies); it is a divergence taken on
+/// its merits and recorded as one in `docs/compliance/jq/limitations.md`,
+/// which carries the reasons. `select` and the `sort_by` family
 /// keep their gate: the value they test or emit *is* the walk's domain.
 fn path_context_root<V: DocumentValue>(root: V::Cursor) -> Result<PathContextPos<V>, Control> {
     // The walk's input is not always the document root: a nested pipe

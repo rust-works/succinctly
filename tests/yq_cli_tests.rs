@@ -30606,9 +30606,12 @@ fn test_path_context_cursor_walk_skips_an_undecodable_sibling_2168() -> Result<(
 /// both modes (ADR-0018 rule 2's shared-builtin hazard -- a change verified
 /// in one mode has to be verified in the other).
 ///
-/// **No yq oracle:** real yq v4.53.3 rejects this document while *scanning*
-/// it (`found invalid Unicode character escape code`), for `.d` as much as
-/// for `.d.e | key`, so it separates none of these rows.
+/// **Diverges from yq, deliberately:** real yq v4.53.3 rejects this document
+/// while *scanning* it (`found invalid Unicode character escape code`), so
+/// these rows used to match its outcome and no longer do. It rejects `.d`
+/// too, which succinctly has always answered, so the choice was between
+/// diverging uniformly and diverging by spelling; recorded in
+/// `docs/compliance/jq/limitations.md`.
 #[test]
 fn test_path_context_walk_skips_an_undecodable_sibling_yq_mode_2168() -> Result<()> {
     let doc = "a: \"\\ud800\"\nd:\n  e: 5\n";

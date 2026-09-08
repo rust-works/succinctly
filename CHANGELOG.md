@@ -21,16 +21,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `min_by`/`max_by`, `to_entries`, `.a |= 1`, and `path()`'s own fallback for a
   filter shape it cannot walk with cursors.
 
-  The whole-document walk was inherited, not chosen: until #2151 these builtins
-  materialized the document to answer, that tree doubled as #1755/#1953's
-  validity gate, and #2061/#2151 kept an equivalent walk rather than move
-  semantics inside a performance change. It cost 67-75% of such a query's
-  runtime, making `.[0] | key` 3.0-4.1x the price of the `.[0]` it wraps. Real
-  jq 1.7.1 and yq v4.53.3 reject every affected document while parsing it — for
-  `.d` as much as for `path(.d)` — so ADR-0018's decision order reaches its
-  third step with no fidelity argument either way, and internal consistency
-  decides; `.d` had already set the rule. Recorded in
+  **This is a deliberate divergence from jq, and a newly introduced one.**
+  Real jq rejects these documents while parsing them, so `path(.d)` and
+  `getpath(["d"])` raising *matched* jq's observable outcome, and now they do
+  not. ADR-0018's decision order does not license the change — its step 2
+  favours the behaviour being given up, and no rule-4 condition applies — so
+  it is recorded on its merits, against the order's own answer, in
   [docs/compliance/jq/limitations.md](docs/compliance/jq/limitations.md).
+  (`key`/`parent` are exempt from that half: neither is a jq builtin, so there
+  is no jq oracle for them. All four diverge from yq, which has both.)
+
+  It was taken anyway because the agreement being given up was an accident of
+  an implementation detail rather than a decision: until #2151 these builtins
+  materialized the document to answer, that tree doubled as #1755/#1953's
+  validity gate, and #2061/#2075/#2151 each kept an equivalent walk rather
+  than move semantics inside a performance change, each recording that the
+  question was the project's to answer. The result made one read's answer
+  depend on its spelling — `.d` answered `5` where `path(.d)` refused, same
+  document, same run — and cost 67-75% of such a query's runtime, making
+  `.[0] | key` 3.0-4.1x the price of the `.[0]` it wraps. succinctly already
+  diverges on this whole class of document through `.d` itself, deliberately
+  and at a measured price, so the real choice was between diverging uniformly
+  and diverging according to how the read was spelled.
 
   `getpath` was rewritten to walk cursors to get there (a string key into an
   object, a number into an array; a slice descriptor materializes the one node
