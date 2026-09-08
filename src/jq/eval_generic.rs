@@ -6660,25 +6660,29 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             finish_fork_generic(out, control, optional)
         }
 
-        // Spine 2416 gate reason 3 (#2473): `and`/`or` with a path-context
-        // operand, through `eval_boolean_generic` -- `eval::boolean_fanout_bools`
-        // with `eval_single` *plus the cursor* as the operand strategy. Without
+        // Spine 2416 gate reason 3 (#2473): `and`/`or` through
+        // `eval_boolean_generic` -- `eval::boolean_fanout_bools` with
+        // `eval_single` *plus the cursor* as the operand strategy. Without
         // this arm `.[] | key == "a" and true` fell to the wildcard bridge
         // below, which materializes the ambient value and hands the eager
         // evaluator a document re-rooted at this stage's input.
         //
-        // **Gated on `needs_path_context`, for the same reason the
-        // `Expr::Arithmetic` arm above is** (and the `Expr::Compare` arm is
-        // not): the bridge's ambient materialization is what makes
-        // `try (1+1) catch "x"` fail on a #1194-malformed document, and
-        // `test_try_catch_contains_a_genuinely_catchable_malformed_key_error_1812`
-        // pins that. An `and`/`or` that reads no path context stays on the
-        // bridge and keeps paying the decode; one that does could not have
-        // stood on a malformed document's root and survived the walk anyway.
-        Expr::And(left, right) if needs_path_context(left) || needs_path_context(right) => {
+        // Ungated since #2476. The arm used to be gated on
+        // `needs_path_context` (as `Expr::Arithmetic` above still is) purely
+        // to keep the bridge's *ambient* materialization on the shapes that
+        // do not read a position, because that materialization is what makes
+        // `try (1+1) catch "x"` raise on a malformed document. It also made
+        // every such `and`/`or` -- `true and true` included, operands
+        // irrelevant -- cost the size of the expanded document, which is
+        // exponential on an alias fan-out (#2476). `eval_boolean_generic`
+        // now runs the same raise as a validation walk that builds nothing,
+        // on exactly the shape that used to bridge; see
+        // `ambient_validation_error` for why that is the same raise-set and
+        // why the path-context shape is deliberately not charged for it.
+        Expr::And(left, right) => {
             eval_boolean_generic::<S, V>(left, right, false, value, optional, cursor)
         }
-        Expr::Or(left, right) if needs_path_context(left) || needs_path_context(right) => {
+        Expr::Or(left, right) => {
             eval_boolean_generic::<S, V>(left, right, true, value, optional, cursor)
         }
 
@@ -9561,6 +9565,19 @@ fn eval_boolean_generic<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
+    // #2476: the one place the two arms above share, so the rule is stated
+    // once. A shape with no path-context operand is the shape that used to
+    // fall to the wildcard bridge, and the bridge's ambient materialization
+    // is what raised on a malformed document for an expression that reads
+    // nothing (`try (1+1) catch "x"`, #1812). `ambient_validation_error` is
+    // that raise without the value -- read its doc comment for the parity
+    // evidence and for why an operand that *does* read path context is not
+    // charged the walk (it never paid the materialization either).
+    if !needs_path_context(left) && !needs_path_context(right) {
+        if let Some(control) = ambient_validation_error::<V>(cursor) {
+            return partial_generic(Vec::new(), control);
+        }
+    }
     let (bools, control) = boolean_fanout_bools(
         |operand, out| {
             push_generic_truthiness(
@@ -14805,11 +14822,18 @@ fn path_context_single_native(expr: &Expr) -> bool {
         Expr::Negate(inner) => path_context_single_native(inner),
         // Native since spine 2416 gate reason 3 (#2473): `eval_single`'s own
         // `Expr::And`/`Expr::Or` arms, above, over `eval_boolean_generic`.
-        // Same `needs_path_context` gate and same reason as `Expr::Arithmetic`
-        // just above, and the loop those arms run is `eval::boolean_fanout_bools`,
-        // so #2460's rule for an operand that produces zero outputs -- `key and
-        // true` at the document root is `false` in real yq, not nothing -- is
-        // the same definition on this route as on the eager one.
+        // Those arms lost their `needs_path_context` gate in #2476 -- the
+        // ambient decode the gate preserved is now `ambient_validation_error`,
+        // a walk that builds nothing -- so the admission no longer depends on
+        // that gate at all. This entry is unchanged and stays recursive for
+        // the other half of the question: `eval_boolean_generic` evaluates
+        // each operand through `eval_single`, so an operand outside this
+        // closed list bridges *there* and reads its position as `null`,
+        // exactly as for `Expr::Arithmetic` just above.
+        // The loop those arms run is `eval::boolean_fanout_bools`, so #2460's
+        // rule for an operand that produces zero outputs -- `key and true` at
+        // the document root is `false` in real yq, not nothing -- is the same
+        // definition on this route as on the eager one.
         Expr::And(left, right) | Expr::Or(left, right) => {
             path_context_single_native(left) && path_context_single_native(right)
         }

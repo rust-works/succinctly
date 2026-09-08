@@ -29579,13 +29579,14 @@ fn test_select_raises_on_yaml_decode_failure_nested_in_container_1645() -> Resul
 /// N=30 would not finish within any reasonable bound); post-fix, N=30
 /// completes in single-digit milliseconds.
 ///
-/// `if`/`select` only -- `and`/`or`/`not`/`//`/`any` are NOT fixed by this
-/// change (confirmed live: `.a20 and true` still took 109s at N=26) because
-/// `eval_single` has no native arm for them and they bridge through
-/// `full_eval` (the eager/materializing evaluator), which this walk is never
-/// consulted from. That gap is tracked separately, coupled to the #2416
-/// migration that would need to give them a native arm the way `if` already
-/// has one.
+/// `if`/`select` only, when this landed -- `and`/`or`/`not`/`//`/`any` were
+/// NOT fixed by it (confirmed live then: `.a20 and true` still took 109s at
+/// N=26), because `eval_single` had no native arm for them and they bridged
+/// through `full_eval` (the eager/materializing evaluator), which this walk
+/// is never consulted from. #2476 closed that for `and`/`or` by ungating
+/// their native arms and running this same walk from them
+/// (`test_and_or_over_alias_fanout_completes_2476` below); the remaining
+/// constructs are still tracked there.
 #[test]
 fn test_select_and_if_truthiness_flat_over_alias_fanout_1804() -> Result<()> {
     let mut doc = String::from("a0: &a0 leaf\n");
@@ -38659,5 +38660,111 @@ fn test_ambient_validation_agrees_with_bridge_2476() -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// #2476: `and`/`or` over an alias fan-out completes in milliseconds.
+///
+/// `eval_single`'s `Expr::And`/`Expr::Or` arms were gated on
+/// `needs_path_context`, so an `and`/`or` whose operands read no position
+/// fell to the wildcard bridge, and the bridge's first act is to materialize
+/// the *ambient* value. On this document (#1804's shape: `aN: &aN [*a(N-1),
+/// *a(N-1)]`) the root contains `aN`, so the cost was `O(2^N)` for every
+/// such expression whatever its operands read -- `true and true` blew up as
+/// badly as `.aN and true`. The arms are ungated now and run
+/// `ambient_validation_error`, the walk `select`/`if` already used, which
+/// #1804 taught not to descend through an alias.
+///
+/// Measured on the two binaries either side of the change, N=24,
+/// `.a24 and true`: 42.5s before, 0.01s after. This test uses N=22 and
+/// asserts no wall-clock bound -- a regression to `O(2^N)` announces itself
+/// by hanging the suite, and a threshold would only add flakiness under this
+/// suite's own subprocess contention.
+///
+/// `true and true` and `.a0 and true` are rows here on purpose: they never
+/// touch `a22`, and pre-fix they were just as exponential, which is the
+/// whole point about *where* the cost came from.
+#[test]
+fn test_and_or_over_alias_fanout_completes_2476() -> Result<()> {
+    let mut doc = String::from("a0: &a0 leaf\n");
+    for i in 1..=22 {
+        doc.push_str(&format!("a{i}: &a{i} [*a{}, *a{}]\n", i - 1, i - 1));
+    }
+
+    for filter in [
+        ".a22 and true",
+        ".a22 or false",
+        "true and true",
+        ".a0 and true",
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, &doc, &[])?;
+        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), "true", "`{filter}` -- stderr: {stderr:?}");
+    }
+
+    Ok(())
+}
+
+/// #2476's one behaviour change: #1804's accepted trade-off, now shared by
+/// `and`/`or`.
+///
+/// The ungated arms answer through `ambient_validation_error`, which is
+/// `push_generic_document_validation_error` -- and since #1804 that walk
+/// does not descend into a container reached through an alias (that
+/// short-circuit is exactly what makes it `O(N)` on the fan-out where the
+/// bridge is `O(2^N)`). So a decode failure reachable *only* through such an
+/// alias no longer raises from an `and`/`or` at that position, where the
+/// bridge's materialization used to raise. `select(.b) | 1` already answered
+/// `1` on this document before #2476
+/// (`test_select_no_longer_raises_on_decode_failure_reachable_only_via_alias_1804`),
+/// so this is the two routes converging, not a new class of silence.
+///
+/// Everything that actually reads the value still raises, and both are
+/// asserted below: `.b[0]` materializes through the alias, and
+/// `.a | (true and true)` starts its walk at the *anchor*, which is not an
+/// alias node, so the walk descends and finds the failure. Real yq rejects
+/// this whole document at parse time ("found unknown escape character",
+/// confirmed live against v4.53.3), so there is no yq behaviour to match
+/// either way.
+#[test]
+fn test_and_or_no_longer_raise_through_a_container_alias_2476() -> Result<()> {
+    let doc = "a: &a [\"bad\\qc\"]\nb: *a\n";
+
+    // The alias position: the walk stops at the alias, so the boolean
+    // answers instead of raising. This is the row that changed (exit 1
+    // before, exit 0 now).
+    for filter in [".b | (true and true)", ".b | (false or true)"] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &[])?;
+        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), "true", "`{filter}` -- stderr: {stderr:?}");
+    }
+
+    // Reading through the alias still raises...
+    let (_, stderr, code) = run_yq_stdin_with_stderr(".b[0]", doc, &[])?;
+    assert_ne!(code, 0, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("invalid escape sequence"),
+        "stderr: {stderr}"
+    );
+
+    // ...and so does the same boolean at the anchor itself.
+    let (_, stderr, code) = run_yq_stdin_with_stderr(".a | (true and true)", doc, &[])?;
+    assert_ne!(code, 0, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("invalid escape sequence"),
+        "stderr: {stderr}"
+    );
+
+    // The document root reaches the anchor without going through an alias,
+    // so a root-level `and` raises too -- the corpus test's own
+    // "anchored container" row, restated here so the three positions this
+    // test cares about sit together.
+    let (_, stderr, code) = run_yq_stdin_with_stderr("true and true", doc, &[])?;
+    assert_ne!(code, 0, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("invalid escape sequence"),
+        "stderr: {stderr}"
+    );
+
     Ok(())
 }

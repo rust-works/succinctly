@@ -41768,3 +41768,44 @@ fn test_ambient_validation_agrees_with_bridge_2476() -> Result<()> {
     }
     Ok(())
 }
+
+/// #2476: `eval_single`'s `Expr::And`/`Expr::Or` arms lost their
+/// `needs_path_context` gate, and the gate existed for exactly one reason --
+/// an `and`/`or` reading no path context fell to the wildcard bridge, whose
+/// ambient `to_owned_with_cursor` is what rejects a malformed document for a
+/// query that never reads `.` (#1812: real jq rejects the whole document for
+/// every query). The arm runs `ambient_validation_error` in its place, so
+/// this pins the raise *through the ungated arm* rather than through the
+/// bridge that used to carry it.
+///
+/// `test_try_catch_contains_a_genuinely_catchable_malformed_key_error_1812`
+/// pins the catchability rule and
+/// `test_ambient_validation_agrees_with_bridge_2476` pins the whole
+/// raise-set across every malformed-document class; this is the focused
+/// sibling that sits next to the fan-out repro the ungating exists for
+/// (`test_and_or_over_alias_fanout_completes_2476` in
+/// `tests/yq_cli_tests.rs`), so a regression names itself.
+#[test]
+fn test_and_or_still_raise_on_a_malformed_document_2476() -> Result<()> {
+    for filter in [
+        "true and true",
+        ". and true",
+        "false or true",
+        // Short-circuiting cannot skip the check: it runs before the
+        // operands, exactly where the bridge's materialization used to.
+        "true or false",
+        "false and true",
+    ] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, "{123: 1}", &[])?;
+        assert_eq!(
+            code, 5,
+            "`{filter}` must still reject the document -- stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "`{filter}` -- stderr: {stderr}"
+        );
+    }
+
+    Ok(())
+}
