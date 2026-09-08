@@ -395,6 +395,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`eval_generic.rs`'s `yq_type_tag`); closing it needs the same accessor
   added to the trait, a larger change than this follow-up's own scope.
   Output byte-identical before/after in every run.
+- **`and`/`or`/`not`/`//`/zero-arity `any`/`all` no longer materialize the
+  ambient document on an alias-heavy input** (#2476): each used to fall to
+  `eval_single`'s wildcard bridge -- `and`/`or` only when neither operand
+  needed path context, `not`/`//`/`any`/`all` unconditionally, since none of
+  the four had a native arm at all -- whose first act is
+  `to_owned_with_cursor` on the *ambient* value. On a document shaped as a
+  chain of anchors each referencing the previous one twice (`aN: &aN
+  [*a(N-1), *a(N-1)]`), that cost is `O(2^N)` regardless of what the
+  operands read: `true and true` was exactly as slow as `.aN and true`.
+  Every one of these now runs a single `O(N)` ambient validation walk
+  (`push_generic_document_validation_error`, the same one `select`/`if`
+  already used, alias-aware since #1804) and evaluates natively. Interleaved
+  A/B, release build, Apple M5 Max, `chain20.yaml` (N=20, `succinctly yq`,
+  median of 3): `.a20 and true` 1.48s -> 5.4ms, `.a20 or false` 1.49s ->
+  5.5ms, `.a20 | not` 0.73s -> 5.4ms, `(.a20 // 1) | length` 1.91s -> 5.4ms,
+  `.a20 | any` 0.84s -> 5.4ms, `.a20 | all` 0.91s -> 5.6ms, `true and true`
+  1.51s -> 5.7ms -- output identical before/after on every row, and N=22
+  completes in ~5ms where the baseline needs several seconds (a single
+  baseline run at N=22 measured 5.9s for both `true and true` and `.a22 and
+  true`, confirming the cost is operand-independent at that size too).
+  Ordinary (non-alias) input is not just neutral but faster, since the
+  bridge's materialization was never alias-specific: interleaved A/B over a
+  2MB `users` array (10 reps, min/median, output identical throughout),
+  `[.users[] | select(.active and .score)] | length` is -22%/-20% under
+  `succinctly yq` and -30%/-28% under `succinctly jq`, `[.users[] | (.score
+  // 0)] | length` is -39%/-41% and -55%/-54%, `.users | any`/`.users | all`
+  are -51%/-53% and -65%/-72% (yq), -65%/-64% and -73%/-72% (jq); plain `.`
+  identity is unaffected (+1.8%/-1.6% median, inside this run's own +1.2%
+  control-binary-vs-itself noise floor on this machine). `//`'s surviving
+  left-hand output also now keeps its cursor instead of an owned copy, so
+  `.a // .b` on YAML keeps anchors, flow style and comments the way a bare
+  `.b` already did, and an operand like `(key // 1)` now reads the real
+  position instead of always answering the fallback. One shared behaviour
+  change, #1804's own accepted trade-off now covering these constructs too:
+  a decode failure reachable only through a container alias no longer
+  raises from an ambient-scoped `not`/`//`/`any`/`all` (or `and`/`or` when
+  neither operand itself navigates) -- see
+  [docs/compliance/yq/limitations.md](docs/compliance/yq/limitations.md).
+  The sibling spellings `any(cond)`/`any(gen;cond)`/`isvalid`/`while`/
+  `until` remain bridged, left as follow-ups.
 
 ### Removed
 
