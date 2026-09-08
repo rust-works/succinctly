@@ -193,6 +193,28 @@ mod indent_spec_tests {
     }
 }
 
+/// Derive a [`DocumentCursor::document_token`] from the index a cursor
+/// borrows and that index's BP bit length (#2072).
+///
+/// One definition rather than one per format, so the two cannot drift into
+/// disagreeing about what "same document" means. The address alone already
+/// separates any two indices that are alive at once; the bit length is
+/// mixed in as a cheap second opinion for the one case an address cannot
+/// cover -- an index dropped and another built in its place. The address is
+/// rotated by half a word first, so its low alignment bits (always zero,
+/// and so carrying no information) end up in the high half rather than
+/// sitting where the length is xored in. See
+/// [`DocumentCursor::document_token`]'s own doc comment for why this is
+/// deliberately not a security boundary.
+#[inline]
+#[must_use]
+pub fn document_token_of<T>(index: &T, bp_bit_len: usize) -> usize {
+    // `core::ptr::from_ref` would say this more clearly but is stable only
+    // since 1.76, past this crate's 1.73 MSRV.
+    let addr = core::ptr::addr_of!(*index) as usize;
+    addr.rotate_left(usize::BITS / 2) ^ bp_bit_len
+}
+
 /// A cursor for navigating an indexed document.
 ///
 /// Provides tree navigation operations that work in O(1) time
@@ -227,6 +249,57 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     fn same_node(&self, other: &Self) -> bool {
         self.text_position() == other.text_position()
     }
+
+    /// A `'static` handle naming this node within its document: O(1) both
+    /// ways, stable for the life of the index, and equal for two cursors of
+    /// one document exactly when [`same_node`](Self::same_node) holds
+    /// (#2072).
+    ///
+    /// Both indexed formats answer with the cursor's own
+    /// balanced-parentheses position, because that *is* the whole of their
+    /// cursor identity: a `JsonCursor`/`YamlCursor` is `(text, index,
+    /// bp_pos)`, and the first two name the *document*, which
+    /// [`document_token`](Self::document_token) fingerprints instead. Two
+    /// consequences worth stating, since both looked at first like they
+    /// might need packing into the `usize` and neither does: a YAML stream's
+    /// documents share one BP vector, so a node of document 0 and a node of
+    /// document 1 can never collide; and a YAML alias has its own opening
+    /// position, distinct from the anchor it resolves to, so an id captured
+    /// at `*x` re-resolves to `*x` rather than to `&x`.
+    ///
+    /// A handle is only meaningful against the document it came from. Store
+    /// it with [`document_token`](Self::document_token) wherever an
+    /// unrelated document could later read it back.
+    fn node_id(&self) -> usize;
+
+    /// The cursor for `id` in *this cursor's* document, or `None` if `id`
+    /// does not name a node there -- out of range, or a position that is not
+    /// a node's opening parenthesis (#2072).
+    ///
+    /// `self` contributes only the document: any cursor of that document
+    /// answers identically, whatever node it happens to stand on. The
+    /// contract is `c.at_node_id(c.node_id())` == `Some(c')` with
+    /// `c'.same_node(&c)`, for every cursor `c`.
+    fn at_node_id(&self, id: usize) -> Option<Self>;
+
+    /// A fingerprint of the document this cursor belongs to, so a
+    /// [`node_id`](Self::node_id) captured from one document is never
+    /// applied to another (#2072): the reindex bridge
+    /// (`eval::eval_path_context_pipe_owned`) and `--eval-all` both build
+    /// throwaway documents, whose BP positions mean something else entirely
+    /// while remaining perfectly in range.
+    ///
+    /// Two cursors of one document agree; two documents that are both alive
+    /// disagree with overwhelming probability.
+    ///
+    /// **Not a security boundary.** It is derived from the index's address
+    /// and its BP bit length, so an index that is dropped and another
+    /// allocated in its place can reuse an address, and a caller that
+    /// fabricates a token defeats the check outright. It exists to catch the
+    /// accidental cross-document reuse the reindex bridge makes easy, and a
+    /// mismatch is always recoverable -- the caller falls back to the value
+    /// it already holds, never to an unsound answer.
+    fn document_token(&self) -> usize;
 
     /// Check if this cursor points to a container (array or object).
     fn is_container(&self) -> bool;
@@ -3874,5 +3947,85 @@ mod decoded_key_str_tests {
                 fields = rest;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod node_id_reindex_tests {
+    use super::DocumentCursor;
+    use crate::jq::value::OwnedValue;
+    use crate::jq::JqSemantics;
+    use crate::json::JsonIndex;
+
+    /// #2072 step 1: the throwaway document the reindex bridge builds
+    /// (`eval::eval_path_context_pipe_owned`, and the same shape
+    /// `--eval-all` goes through) gets its own token, so a `node_id`
+    /// captured against the *source* document can be recognised as
+    /// inapplicable there.
+    ///
+    /// The second half of the test is why the check has to be a token and
+    /// cannot be a range test or a `same_node` comparison: BP positions are
+    /// per-document integers, so an id from the source document is very
+    /// often in range over in the throwaway one, names a different node
+    /// there, and `same_node` -- which compares tree positions and has no
+    /// notion of *which* tree -- cheerfully says the two are the same node.
+    /// Nothing but the token separates them.
+    #[test]
+    fn a_reindexed_document_gets_its_own_token_2072() {
+        let json: &[u8] = br#"{"a":[1,2,3],"b":{"c":4}}"#;
+        let source = JsonIndex::build(json);
+        let source_root = source.root(json);
+
+        // The bridge's own two lines: an owned value, re-serialized with
+        // `to_json_for_reindex` (not `to_json`, #561), re-indexed as a
+        // fresh document.
+        let owned = OwnedValue::Array(vec![
+            OwnedValue::Int(1),
+            OwnedValue::Int(2),
+            OwnedValue::Int(3),
+        ]);
+        let reindexed_text = owned.to_json_for_reindex::<JqSemantics>();
+        let reindexed_bytes = reindexed_text.as_bytes();
+        let reindexed = JsonIndex::build(reindexed_bytes);
+        let reindexed_root = reindexed.root(reindexed_bytes);
+
+        assert_ne!(
+            source_root.document_token(),
+            reindexed_root.document_token(),
+            "the throwaway document must not answer to the source's token"
+        );
+        assert_eq!(
+            reindexed_root.document_token(),
+            reindexed_root
+                .first_child()
+                .expect("the reindexed array has children")
+                .document_token(),
+            "but it must agree with itself"
+        );
+
+        // An id that resolves in *both* documents to nodes at different
+        // text positions -- i.e. genuinely different nodes.
+        let confusable = (0..source.bp().len()).find(|&id| {
+            match (source_root.at_node_id(id), reindexed_root.at_node_id(id)) {
+                (Some(a), Some(b)) => a.text_position() != b.text_position(),
+                _ => false,
+            }
+        });
+        let id = confusable.expect(
+            "two JSON documents this different must share at least one in-range BP position",
+        );
+        let from_source = source_root.at_node_id(id).expect("in range here");
+        let from_reindexed = reindexed_root.at_node_id(id).expect("and in range there");
+        assert!(
+            from_source.same_node(&from_reindexed),
+            "`same_node` compares tree positions and cannot see the document -- if this ever \
+             stops holding, the comment above and `document_token`'s reason for existing both \
+             need revisiting"
+        );
+        assert_ne!(
+            from_source.document_token(),
+            from_reindexed.document_token(),
+            "the token is the only thing that separates them"
+        );
     }
 }

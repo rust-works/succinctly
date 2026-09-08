@@ -6328,8 +6328,8 @@ impl core::fmt::Display for YamlNumberError {
 
 use crate::jq::assert_depth;
 use crate::jq::document::{
-    DocumentCursor, DocumentElements, DocumentField, DocumentFields, DocumentValue, IndentSpec,
-    JsonConvention,
+    document_token_of, DocumentCursor, DocumentElements, DocumentField, DocumentFields,
+    DocumentValue, IndentSpec, JsonConvention,
 };
 use crate::jq::stream::{StreamFailure, StreamResult};
 use crate::jq::EvalError;
@@ -6473,6 +6473,40 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     #[inline]
     fn is_container(&self) -> bool {
         YamlCursor::is_container(self)
+    }
+
+    /// #2072: as for JSON, the BP position is the whole node identity. A
+    /// multi-document stream is one index over one BP vector -- the stream
+    /// root is position 0 and each `---` document is one of its children --
+    /// so ids from different documents of one stream are already distinct
+    /// without packing a document number alongside. An alias node likewise
+    /// has its own opening position (that is what
+    /// [`is_alias`](DocumentCursor::is_alias) reads), so an id captured at
+    /// `*x` re-resolves to `*x`, not to the `&x` its value comes from.
+    #[inline]
+    fn node_id(&self) -> usize {
+        self.bp_pos
+    }
+
+    /// #2072: see `JsonCursor`'s copy of this -- one
+    /// `is_open` call rejects both an out-of-range id and a closing
+    /// position. Every open position in a YAML index is a constructible
+    /// cursor, including the stream root, a document root and a block
+    /// sequence item's `-` wrapper.
+    #[inline]
+    fn at_node_id(&self, id: usize) -> Option<Self> {
+        self.index
+            .bp()
+            .is_open(id)
+            .then(|| YamlCursor::new(self.index, self.text, id))
+    }
+
+    /// #2072: one index spans the whole `---`-separated stream, so every
+    /// document in one file shares a token; two files under `--eval-all`
+    /// have two indices and so two tokens.
+    #[inline]
+    fn document_token(&self) -> usize {
+        document_token_of(self.index, self.index.bp().len())
     }
 
     #[inline]
@@ -14454,5 +14488,234 @@ mod tests {
                 scalar.tag()
             );
         }
+    }
+
+    /// Every node of the subtree rooted at `root`, reached by BP navigation
+    /// alone (so the walk is independent of the `at_node_id` it is used to
+    /// test). Each node is visited exactly once; the order is a pre-order
+    /// with siblings deferred, which is all these tests need. `root`'s own
+    /// siblings are deliberately *not* followed -- in a `---` stream each
+    /// document is a sibling of the next, and a walk that ran on would blur
+    /// the document boundary these tests are checking. #2072.
+    fn all_cursors_2072(root: YamlCursor<'_>) -> Vec<YamlCursor<'_>> {
+        let mut out = vec![root];
+        let mut stack: Vec<YamlCursor<'_>> = root.first_child().into_iter().collect();
+        while let Some(c) = stack.pop() {
+            out.push(c);
+            if let Some(next) = c.next_sibling() {
+                stack.push(next);
+            }
+            if let Some(child) = c.first_child() {
+                stack.push(child);
+            }
+        }
+        out
+    }
+
+    /// #2072 step 1: the round trip lands back on `same_node` for every node
+    /// of a block document -- mappings nested inside sequence items, the
+    /// `-` item wrappers themselves, scalars, and the stream and document
+    /// roots -- and rebasing the same id from an unrelated cursor of the
+    /// document gives the same answer.
+    #[test]
+    fn node_id_round_trips_for_every_node_2072() {
+        let yaml = "\
+top:
+  - name: a
+    tags: [x, y]
+  - name: b
+    nested:
+      deep: 1
+      list:
+        - 2
+        - 3
+empty: {}
+plain: hello
+";
+        let index = YamlIndex::build(yaml.as_bytes()).unwrap();
+        let root = index.root(yaml.as_bytes());
+        let cursors = all_cursors_2072(root);
+        assert!(
+            cursors.len() > 15,
+            "the fixture must be big enough to be worth walking, got {}",
+            cursors.len()
+        );
+
+        for c in &cursors {
+            let id = c.node_id();
+            let back = c
+                .at_node_id(id)
+                .expect("a node's own id always names a node in its own document");
+            assert!(
+                back.same_node(c),
+                "id {id} re-resolved to bp {}",
+                back.node_id()
+            );
+            let from_root = root
+                .at_node_id(id)
+                .expect("any cursor of the document rebases the same id");
+            assert!(
+                from_root.same_node(c),
+                "rebasing id {id} from the stream root landed elsewhere"
+            );
+        }
+
+        let mut ids: Vec<usize> = cursors.iter().map(DocumentCursor::node_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), cursors.len(), "two distinct nodes shared an id");
+    }
+
+    /// #2072 step 1: a `---`-separated stream is one index over one BP
+    /// vector, so ids from document 0 and document 1 cannot collide and each
+    /// re-resolves inside its own document. This is the case a naive
+    /// per-document numbering would have needed to pack into the `usize`,
+    /// and the reason it does not.
+    #[test]
+    fn node_ids_do_not_collide_across_stream_documents_2072() {
+        let yaml = "a: 1\nb: [2, 3]\n---\na: 1\nb: [2, 3]\n---\nc: 4\n";
+        let index = YamlIndex::build(yaml.as_bytes()).unwrap();
+        let root = index.root(yaml.as_bytes());
+
+        let mut docs = Vec::new();
+        let mut doc = root.first_child();
+        while let Some(c) = doc {
+            docs.push(c);
+            doc = c.next_sibling();
+        }
+        assert_eq!(docs.len(), 3, "three documents in the stream");
+        // The first two documents are byte-identical, so nothing about the
+        // *values* could tell their nodes apart -- only the position can.
+        assert_eq!(docs[0].document_index(), Some(0));
+        assert_eq!(docs[1].document_index(), Some(1));
+        assert_eq!(docs[2].document_index(), Some(2));
+
+        let mut seen: Vec<(usize, usize)> = Vec::new();
+        for (expected_doc, d) in docs.iter().enumerate() {
+            for c in all_cursors_2072(*d) {
+                let id = c.node_id();
+                let back = c.at_node_id(id).expect("round trip");
+                assert!(back.same_node(&c));
+                assert_eq!(
+                    back.document_index(),
+                    Some(expected_doc),
+                    "id {id} re-resolved into the wrong document"
+                );
+                seen.push((expected_doc, id));
+            }
+        }
+
+        let mut ids: Vec<usize> = seen.iter().map(|&(_, id)| id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            seen.len(),
+            "an id was reused across two documents of one stream"
+        );
+    }
+
+    /// #2072 step 1: an alias has its own opening position, so an id
+    /// captured at `*x` re-resolves to `*x` -- still an alias, still
+    /// distinct from the `&x` node whose value it borrows. A handle that
+    /// silently resolved through to the anchor would lose exactly the
+    /// alias/anchor mark ADR-0017 preserves on output.
+    #[test]
+    fn alias_node_id_round_trips_to_the_alias_not_the_anchor_2072() {
+        let yaml = "a: &x [1]\nb: *x\n";
+        let index = YamlIndex::build(yaml.as_bytes()).unwrap();
+        let anchor = top_level_cursor(&index, yaml, "a");
+        let alias = top_level_cursor(&index, yaml, "b");
+
+        assert_eq!(anchor.anchor(), Some("x"), "`.a` carries the anchor");
+        assert!(alias.is_alias(), "`.b` is the alias node itself");
+        assert_ne!(
+            anchor.node_id(),
+            alias.node_id(),
+            "the anchor and the alias are two nodes"
+        );
+
+        let back = alias.at_node_id(alias.node_id()).expect("round trip");
+        assert!(back.same_node(&alias));
+        assert!(
+            back.is_alias(),
+            "the round trip must not land on the anchor"
+        );
+        assert_eq!(back.alias(), Some("x"));
+
+        let anchor_back = alias
+            .at_node_id(anchor.node_id())
+            .expect("the anchor is a node of the same document");
+        assert!(anchor_back.same_node(&anchor));
+        assert!(!anchor_back.is_alias());
+    }
+
+    /// #2072 step 1: closing positions and out-of-range ids resolve to
+    /// `None`, never to a neighbouring node -- the YAML half of the JSON
+    /// test of the same name.
+    #[test]
+    fn at_node_id_rejects_closing_and_out_of_range_ids_2072() {
+        let yaml = "a: 1\nb:\n  - 2\n  - c: 3\n";
+        let index = YamlIndex::build(yaml.as_bytes()).unwrap();
+        let root = index.root(yaml.as_bytes());
+        let bp = index.bp();
+
+        let mut opens = 0usize;
+        let mut closes = 0usize;
+        for id in 0..bp.len() {
+            match root.at_node_id(id) {
+                Some(c) => {
+                    assert!(bp.is_open(id), "position {id} is a close but resolved");
+                    assert_eq!(c.node_id(), id);
+                    opens += 1;
+                }
+                None => {
+                    assert!(
+                        !bp.is_open(id),
+                        "position {id} is an open but did not resolve"
+                    );
+                    closes += 1;
+                }
+            }
+        }
+        assert!(opens > 0 && closes > 0, "the fixture must contain both");
+
+        assert!(root.at_node_id(bp.len()).is_none(), "one past the end");
+        assert!(
+            root.at_node_id(bp.len() + 1000).is_none(),
+            "far past the end"
+        );
+        assert!(
+            root.at_node_id(usize::MAX).is_none(),
+            "no overflow, just None"
+        );
+    }
+
+    /// #2072 step 1: one index spans the whole `---` stream, so every
+    /// document in one file shares a token; two live indices over identical
+    /// bytes -- what `--eval-all` and the reindex bridge both produce -- do
+    /// not.
+    #[test]
+    fn document_token_is_per_index_not_per_stream_document_2072() {
+        let yaml = "a: 1\n---\na: 1\n";
+        let index = YamlIndex::build(yaml.as_bytes()).unwrap();
+        let root = index.root(yaml.as_bytes());
+        let token = root.document_token();
+        for c in all_cursors_2072(root) {
+            assert_eq!(
+                c.document_token(),
+                token,
+                "bp {} disagreed about its own document",
+                c.node_id()
+            );
+        }
+
+        let same_bytes = "a: 1\n---\na: 1\n";
+        let other = YamlIndex::build(same_bytes.as_bytes()).unwrap();
+        assert_ne!(
+            token,
+            other.root(same_bytes.as_bytes()).document_token(),
+            "two live indices over equal bytes are still two documents"
+        );
     }
 }
