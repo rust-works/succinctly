@@ -1,0 +1,1 @@
+[isempty(foreach (1 as $x ?// $y | 1) as $v (0; .+$v; .))]

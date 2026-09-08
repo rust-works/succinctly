@@ -21,10 +21,20 @@
 # decides each of those PRs, per the plan's own recommendation.
 #
 # **What this is not**: it does not attempt every filter shape from #2180's
-# probing (e.g. the `foreach ... as $x ?// $y (...)` *pattern*-position row,
-# whose own `?//` bind can't be represented as a separable __G__ substitution
-# the way every other row's *source*-position bind can) -- those rows are
-# pinned directly as CLI test cases instead. See tests/jq_cli_tests.rs.
+# probing. Two kinds of row stay in tests/jq_cli_tests.rs only:
+#
+#   * The `foreach ... as $x ?// $y (...)` *pattern*-position bind, which
+#     can't be a separable __G__ substitution the way every other row's
+#     *source*-position bind can. WP3 added it anyway, as a constant
+#     template (see the `foreach-pattern` entry below) -- the three G
+#     variants then generate three identical cases per consumer, which is
+#     harmless and keeps the construct in the same table as its siblings.
+#   * `foreach`'s UPDATE and INIT positions, which WP3 deliberately left
+#     eager (see docs/compliance/jq/limitations.md). Sweeping them would
+#     report permanent "known" divergences and defeat this script's
+#     0-unexpected/0-known contract, so they are pinned as CLI rows in
+#     tests/jq_cli_tests.rs's
+#     test_nested_short_circuit_consumer_hides_the_stop_2180 instead.
 #
 # **Design note, vs. jq-fanout-oracle-sweep.sh's classify_divergence**: that
 # script's classify_divergence greps the generated filter text for a known
@@ -140,9 +150,20 @@ W_ENTRIES=(
   'string-interp::::"\(__G__)"'
   'object-value::::{a:(__G__)} | .a'
   'range-bound::::range((__G__); 3)'
-  # -- WP3: foreach (source position; the pattern-position row is pinned
-  #    directly as a CLI test, see the header note above) --
-  'foreach-source::WP3::foreach (__G__) as $v (0; .+$v; .)'
+  # -- WP3: CLOSED. each_foreach (eval.rs) and each_foreach_generic
+  #    (eval_generic.rs) drive the source through eval_each/eval_each_generic
+  #    and each step's EXTRACT through eval_each_owned, over the one shared
+  #    fold loop foreach_fork; the sink's Demand::Stop is treated by
+  #    foreach's own ?// exactly as an escaping Control::Break is, with the
+  #    same state threading -- so these rows must match jq now and any
+  #    divergence here is unexpected by definition. UPDATE and INIT stay
+  #    eager and are pinned as CLI rows instead (header note above). --
+  'foreach-source::::foreach (__G__) as $v (0; .+$v; .)'
+  # The pattern-position bind: __G__ does not appear (foreach's own `?//` is
+  # the bind under test), so the three G variants generate three identical
+  # cases per consumer. See the header note.
+  'foreach-pattern::::foreach (1) as $x ?// $y (0; .+1; .)'
+  'foreach-extract::::foreach (1) as $v (0; .; (__G__))'
   # -- confirmed correct, deliberately out of scope (limitations.md) --
   'collector::::[(__G__)] | .[]'
   'reduce::::reduce (__G__) as $v (0; .+$v)'
