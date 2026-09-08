@@ -3755,25 +3755,36 @@ fn test_paths_and_leaf_paths_raise_on_structurally_malformed_key_1829() -> Resul
     Ok(())
 }
 
-/// #1642 follow-up: `to_owned`/`materialize` (`-S`, `-s`, a multi-result
-/// filter like `.,.`) build an `IndexMap<String, _>` keyed by
-/// `key_display_string`'s fallback. Two *different* decode-failure keys can
-/// share that fallback spelling (byte-identical raw escapes, or two
-/// separate bad `\u` escapes that both lossy-decode to U+FFFD), and #1385
-/// forbids treating them as the same key -- but the map cannot hold two
-/// entries under one string. Before this fix that silently kept only the
-/// last value (worse than #1247's original raise, which turned into
-/// quieter data loss instead of louder consistency); now it raises. See
-/// `DisplayKeyGuard` in `src/jq/document.rs`.
+/// #1642 follow-up: `to_owned`/`materialize` (`-S`, `-s`) build an
+/// `IndexMap<String, _>` keyed by `key_display_string`'s fallback. Two
+/// *different* decode-failure keys can share that fallback spelling
+/// (byte-identical raw escapes, or two separate bad `\u` escapes that both
+/// lossy-decode to U+FFFD), and #1385 forbids treating them as the same key
+/// -- but the map cannot hold two entries under one string. Before this fix
+/// that silently kept only the last value (worse than #1247's original
+/// raise, which turned into quieter data loss instead of louder
+/// consistency); now it raises. See `DisplayKeyGuard` in
+/// `src/jq/document.rs`.
+///
+/// `.,.` was a third raising route here until #2103. It no longer is, and
+/// the reason is not that the guard weakened: `.,.` forwards the **root
+/// cursor** to the printer, twice, and never builds the `IndexMap` the
+/// collision is *about*. It only raised because the eager M2 route
+/// materialized the ambient value through `to_owned_with_cursor` before
+/// evaluating anything, so every filter paid for a map nothing had asked
+/// for. With every M2 filter streaming (#2103), `.,.` echoes the raw source
+/// bytes exactly as `.` already did -- pinned explicitly below, so the row
+/// leaving the raising loop is a recorded expectation rather than a
+/// silently dropped assertion. Real jq 1.7.1 rejects this document at parse
+/// time (exit 5, `Invalid \uXXXX\uXXXX surrogate pair escape`) for `.`,
+/// `.,.` and `-S .` alike; succinctly's divergence on `.` predates #2103 and
+/// `.,.` has now joined it. `-S`/`-s` still raise, because rendering both
+/// keys into one map is what the collision is.
 #[test]
 fn test_materializing_route_raises_on_colliding_decode_failure_keys_1642() -> Result<()> {
     let dup_doc = r#"{"\ud800":1,"\ud800":2}"#;
 
-    for args in [
-        &["-Sc", "."][..],
-        &["-c", "-s", "."][..],
-        &["-c", ".,."][..],
-    ] {
+    for args in [&["-Sc", "."][..], &["-c", "-s", "."][..]] {
         let (out, err, code) = run_jq_full(args, Some(dup_doc))?;
         assert_ne!(
             code, 0,
@@ -3781,6 +3792,18 @@ fn test_materializing_route_raises_on_colliding_decode_failure_keys_1642() -> Re
         );
         assert!(err.contains("ambiguous"), "args {args:?}, stderr: {err}");
     }
+
+    // #2103: `.,.` streams the root cursor straight to the printer, so it
+    // echoes the document's own bytes twice at exit 0 -- no map, no
+    // collision, nothing to raise about.
+    let (out, err, code) = run_jq_full(&["-c", ".,."], Some(dup_doc))?;
+    assert_eq!(code, 0, "`.,.` should not raise since #2103, stderr: {err}");
+    assert!(err.is_empty(), "`.,.` stderr should be empty, got: {err}");
+    assert_eq!(
+        out,
+        format!("{dup_doc}\n{dup_doc}\n"),
+        "`.,.` should echo the raw source bytes twice"
+    );
 
     // A single decode-failure key still preserves fine under the same
     // routes -- no false positive from the new guard.
@@ -3887,6 +3910,140 @@ fn test_streaming_keys_unsorted_iterate_echoes_undecodable_key_raw_2103() -> Res
             "doc {doc:?}: eager and streaming must agree on the raw spelling"
         );
     }
+
+    Ok(())
+}
+
+/// #2103: every M2 filter streams, and **a filter validates only what it
+/// reads**.
+///
+/// What the eager route did: `eval_single`'s wildcard arm materialized the
+/// ambient value through `to_owned_with_cursor` before evaluating anything,
+/// and that one call was doing two jobs beyond producing a value --
+/// validating the whole document (#1194's structural checks, #1642's
+/// colliding-display-key raise) and choosing an undecodable key's spelling.
+/// The M2 route was gated to keep any filter whose eager twin was that
+/// wildcard off the demand-driven evaluator, precisely so the two routes
+/// could not disagree about whether a document was acceptable.
+///
+/// Why that was an accident, not a decision: nobody chose that `1+1` should
+/// validate its input. The check fired because the bridge needed an
+/// `OwnedValue` to hand to `eval.rs`, and only for the spellings that
+/// happened to reach the wildcard -- so on `{"\ud800":1,"\ud800":2}` one
+/// binary answered `.`, `.b`, `length`, `keys` and `label $x | .` at exit 0
+/// while `.,.`, `1+1`, `debug` and `if . then . else . end` exited 5. That
+/// "the spelling of the filter decides whether the document is valid" shape
+/// is what #1629/#1642/#2168 exist to remove.
+///
+/// The rule, inherited verbatim from #2168's entry: a filter that navigates
+/// to a position validates only what it reads; one that materializes
+/// validates everything it materializes. `1+1` and `try (1+1)` read nothing,
+/// so they validate nothing and answer `2`. `.,.` forwards the root cursor
+/// to the printer, which walks it exactly as `.` does -- so a *structural*
+/// fault is still found where the walk reaches it (the `{123:1,"b":2}`
+/// control below still exits 5 under `.,.`, as under `.`), while a colliding
+/// undecodable key, which the walk never has to resolve, is echoed raw.
+/// `-S`/`-s` still raise on that document, because building one
+/// `String`-keyed map out of both keys is what the collision *is*.
+///
+/// **jq 1.7.1's answer is exit 5 on every row in the first table**, captured
+/// live from the pinned `/usr/bin/jq`: it is a full validating parser and
+/// rejects each of these documents before any filter runs (`Object keys must
+/// be strings`, `Objects must consist of key:value pairs`, `Invalid numeric
+/// literal`, `Expected separator between values`, `Expected value before
+/// ','`, `Invalid \uXXXX\uXXXX surrogate pair escape`). So this is a
+/// deliberate divergence taken against ADR-0018's decision order -- step 2
+/// separates the options and favours the behaviour being given up -- and it
+/// is recorded on its merits in `docs/compliance/jq/limitations.md` under
+/// "Every M2 filter streams", alongside #2168's entry. A user who wants
+/// jq's rejection has `--validate` and `succinctly json validate`.
+///
+/// The controls in the second half are what make this test discriminate
+/// rather than merely record: if the change had disabled document
+/// validation wholesale instead of moving it behind what the filter reads,
+/// `.`, `length` and `.,.` on `{123:1,"b":2}` and `-S .` on the colliding
+/// document would all have stopped raising too.
+#[test]
+fn test_root_forwarding_filters_stream_without_validating_2103() -> Result<()> {
+    // Reads nothing, so validates nothing -- on every malformed shape the
+    // codebase keeps deliberately distinct (#1194 non-string key, #1194
+    // unpaired tail, #1194 malformed tail member, #1677 missing `:`, #1597
+    // stray `,`) plus #1642's colliding undecodable keys. jq: exit 5, all 18.
+    for doc in [
+        r#"{123:1,"b":2}"#,
+        r#"{"a":1,"b"}"#,
+        r#"{"a":1, invalid}"#,
+        r#"{"a" 1, "b":2}"#,
+        r"[1,,3]",
+        r#"{"\ud800":1,"\ud800":2}"#,
+    ] {
+        for filter in ["1+1", "try (1+1)", r#"try (1+1) catch "x""#] {
+            let (out, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
+            assert_eq!(code, 0, "doc {doc:?} filter {filter:?}, stderr: {err}");
+            assert!(
+                err.is_empty(),
+                "doc {doc:?} filter {filter:?}, stderr: {err}"
+            );
+            assert_eq!(out, "2\n", "doc {doc:?} filter {filter:?}");
+        }
+    }
+
+    // The 19th row: `.,.` on the colliding document forwards the root
+    // cursor to the printer twice and never builds the map the collision is
+    // about. jq: exit 5.
+    let dup_doc = r#"{"\ud800":1,"\ud800":2}"#;
+    let (out, err, code) = run_jq_full(&["-c", ".,."], Some(dup_doc))?;
+    assert_eq!(code, 0, "`.,.` on {dup_doc:?}, stderr: {err}");
+    assert!(err.is_empty(), "`.,.` on {dup_doc:?}, stderr: {err}");
+    assert_eq!(out, format!("{dup_doc}\n{dup_doc}\n"));
+
+    // --- Controls: these must NOT have moved. ---
+
+    // A structural fault is still found by the walk that reaches it, for
+    // every filter that actually reads the document -- `.,.` included,
+    // because the printer walks the root cursor it was handed.
+    let malformed = r#"{123:1,"b":2}"#;
+    for filter in [".", "length", ".,."] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(malformed))?;
+        assert_eq!(code, 5, "filter {filter:?} must still raise, out: {out:?}");
+        assert!(
+            err.contains("Invalid JSON text"),
+            "filter {filter:?}, stderr: {err}"
+        );
+    }
+
+    // Materializing into one `String`-keyed map still raises on the
+    // collision -- the #1642 guard is untouched.
+    let (out, err, code) = run_jq_full(&["-Sc", "."], Some(dup_doc))?;
+    assert_eq!(code, 5, "`-S .` must still raise, out: {out:?}");
+    assert!(err.contains("ambiguous"), "stderr: {err}");
+
+    // --- Spelling: raw where nothing materializes, doubled where it does. ---
+
+    // `.,.` echoes the source bytes, exactly as `.` does.
+    let single_doc = r#"{"\ud800":1,"b":2}"#;
+    let (out, err, code) = run_jq_full(&["-c", ".,."], Some(single_doc))?;
+    assert_eq!(code, 0, "stderr: {err}");
+    assert!(err.is_empty(), "stderr: {err}");
+    assert_eq!(out, format!("{single_doc}\n{single_doc}\n"));
+
+    // `(., debug)` gets *both* spellings out of one filter, and that is
+    // consistent under the rule rather than a third spelling: `.` forwards
+    // the cursor (raw), while `debug` materializes its input to build the
+    // `["DEBUG:", ...]` message and then forwards what it built (doubled),
+    // on stdout as well as stderr.
+    let (out, err, code) = run_jq_full(&["-c", "(., debug)"], Some(single_doc))?;
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(
+        out,
+        concat!(
+            r#"{"\ud800":1,"b":2}"#,
+            "\n",
+            r#"{"\\ud800":1,"b":2}"#,
+            "\n"
+        )
+    );
+    assert_eq!(err, concat!(r#"["DEBUG:",{"\\ud800":1,"b":2}]"#, "\n"));
 
     Ok(())
 }
@@ -9029,9 +9186,24 @@ fn test_as_pattern_single_pattern_path_context_resolves_1765() -> Result<()> {
 /// {x:$v} ?// [$v] | key)` answers for the *ambient* `.`, the document root,
 /// each of the two times the chain runs, not for the bound `.a[]` element.
 /// `key`/`parent` at or above the root emit nothing (#2421), so the old
-/// stubbed `"null"` pair is now correctly empty. Cardinality is still
-/// preserved -- zero outputs both times, not one array -- just as `"0"\n"0"`
-/// still is when a computed stage keeps the pair alive.
+/// stubbed `"null"` pair is now correctly empty.
+///
+/// **The cardinality guard's own filter changed under #2103**, which routed
+/// every M2 filter through the demand-driven evaluator. It used to be
+/// `(... | key) + 0 | tostring`, expecting `"0"\n"0"`: the eager route's
+/// `needs_path_context` fallback stubbed the empty `key` back into a `null`
+/// that `+ 0` then turned into `0`, twice. That was the eager route
+/// contradicting itself -- every other spelling of the same thing
+/// (`key`, `key + 0`, `.a[] as {x:$v} | key + 0`) was already empty on
+/// *both* routes -- and streaming makes it consistent: an empty `key` stays
+/// empty through the arithmetic. `key` is a succinctly extension with no
+/// oracle at all (`/usr/bin/jq` 1.7.1: `key/0 is not defined`), so the
+/// guard now uses `$v` in the same position instead: it keeps the exact
+/// property #1765 is about -- a `?//` chain inside an `Arithmetic` position
+/// must emit two separate results, not one collapsed `[0,0]`-shaped array
+/// -- and, unlike the `key` form, is byte-identical to real jq
+/// (`"1"\n"2"`, captured live). The empty `key + 0` row is kept below so
+/// the behaviour that moved is pinned rather than dropped.
 #[test]
 fn test_as_pattern_qmark_slash_slash_chain_does_not_collapse_cardinality_1765() -> Result<()> {
     let (stdout, _, code) = run_jq_full(
@@ -9041,12 +9213,23 @@ fn test_as_pattern_qmark_slash_slash_chain_does_not_collapse_cardinality_1765() 
     assert_eq!(code, 0);
     assert_eq!(stdout, "");
 
+    // The cardinality guard: two separate outputs out of an `Arithmetic`
+    // position, not one collapsed array. Oracle-verified against jq 1.7.1.
+    let (stdout, _, code) = run_jq_full(
+        &["-c", "(.a[] as {x:$v} ?// [$v] | $v) + 0 | tostring"],
+        Some(r#"{"a":[{"x":1},{"x":2}]}"#),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "\"1\"\n\"2\"\n");
+
+    // #2103: an empty `key` now stays empty through the arithmetic, instead
+    // of the eager route's stubbed `null + 0` pair.
     let (stdout, _, code) = run_jq_full(
         &["-c", "(.a[] as {x:$v} ?// [$v] | key) + 0 | tostring"],
         Some(r#"{"a":[{"x":1},{"x":2}]}"#),
     )?;
     assert_eq!(code, 0);
-    assert_eq!(stdout, "\"0\"\n\"0\"\n");
+    assert_eq!(stdout, "");
 
     Ok(())
 }
@@ -23797,18 +23980,37 @@ fn test_jq_keys_unsorted_on_malformed_object_errors_1194() -> Result<()> {
 /// walk for free, matching real jq (verified live against pinned jq 1.7.1),
 /// which refuses to even parse a document with a non-string key -- so every
 /// access into it raises, not just the ones that touch the bad member.
+///
+/// #2103 changed one cell of the raising table, and only the *stdout
+/// prefix* half of it. Since every M2 filter streams, `keys_unsorted[]` on
+/// `{"a":1, invalid}` -- whose fault is a *trailing* orphan, invisible to
+/// the up-front head check and caught only by
+/// `DistinctKeyCursors::ended_unpaired` once the walk exhausts -- writes
+/// the one key it already confirmed good before raising. Exit code (5) and
+/// diagnostic are unchanged, and the same filter on `{123: 1, "b": 2}`,
+/// where the head check does fire up front, still prints nothing at all.
+/// That is the established "#1770/#1653 prefix before a lazily-detected
+/// fault" shape, asserted explicitly rather than folded into the loop so
+/// the difference between the two documents stays visible.
 #[test]
 fn test_jq_keys_unsorted_positional_walked_arms_raise_1629() -> Result<()> {
     for input in [r#"{123: 1, "b": 2}"#, r#"{"a":1, invalid}"#] {
-        for filter in [
-            "keys_unsorted[]",
-            "keys_unsorted | last",
-            "keys_unsorted[-1]",
-        ] {
+        for filter in ["keys_unsorted | last", "keys_unsorted[-1]"] {
             let (out, _stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
             assert_eq!(code, 5, "{filter} on {input}: out: {out:?}");
             assert!(out.trim().is_empty(), "{filter} on {input}: out: {out:?}");
         }
+    }
+
+    // `keys_unsorted[]` raises on both, but only the trailing-orphan
+    // document gets far enough to have written a key first (#2103).
+    for (input, expected_prefix) in [
+        (r#"{123: 1, "b": 2}"#, ""),
+        (r#"{"a":1, invalid}"#, "\"a\"\n"),
+    ] {
+        let (out, _stderr, code) = run_jq_full(&["-c", "keys_unsorted[]"], Some(input))?;
+        assert_eq!(code, 5, "keys_unsorted[] on {input}: out: {out:?}");
+        assert_eq!(out, expected_prefix, "keys_unsorted[] on {input}");
     }
 
     // A well-formed object still answers normally on all three -- the fix
@@ -23833,15 +24035,17 @@ fn test_jq_keys_unsorted_positional_walked_arms_raise_1629() -> Result<()> {
     // code review before merge; verified live that a genuine duplicate
     // alone still answers normally (the second assertion below).
     let malformed_with_duplicate = r#"{"a":1,"a":2,"b"}"#;
-    for filter in [
-        "keys_unsorted | last",
-        "keys_unsorted[-1]",
-        "keys_unsorted[]",
-    ] {
+    for filter in ["keys_unsorted | last", "keys_unsorted[-1]"] {
         let (out, _stderr, code) = run_jq_full(&["-c", filter], Some(malformed_with_duplicate))?;
         assert_eq!(code, 5, "{filter}: out: {out:?}");
         assert!(out.trim().is_empty(), "{filter}: out: {out:?}");
     }
+    // `keys_unsorted[]` raises on the same document, streaming the one
+    // collapsed key it confirmed first (#2103, as above).
+    let (out, _stderr, code) =
+        run_jq_full(&["-c", "keys_unsorted[]"], Some(malformed_with_duplicate))?;
+    assert_eq!(code, 5, "out: {out:?}");
+    assert_eq!(out, "\"a\"\n");
     let duplicate_only = r#"{"a":1,"a":2,"b":3}"#;
     let (out, _stderr, code) = run_jq_full(&["-c", "keys_unsorted | last"], Some(duplicate_only))?;
     assert_eq!((out.trim(), code), ("\"b\"", 0));
@@ -24556,10 +24760,12 @@ fn test_jq_trailing_comma_after_container_last_child_still_a_known_gap_1676() ->
     Ok(())
 }
 
-/// #2211: `evaluate_bytes_lazy` (the `JqValue`-iterator-based default path
-/// used for a non-cursor-transparent filter -- `if`/arithmetic/function
-/// calls/anything `expr_is_cursor_transparent` answers `false` for) never
-/// checked a container's own "apparently empty" delimiter gap at all, unlike
+/// #2211: `eval_generic`'s wildcard materializing bridge (the fallback for
+/// a filter with no native streaming arm -- `if`/arithmetic/function calls;
+/// reached through `evaluate_bytes_lazy` when #2211 landed, and through
+/// `evaluate_bytes_streaming`'s own fallback since #2103 retired that route)
+/// never checked a container's own "apparently empty" delimiter gap at all,
+/// unlike
 /// `print_json`'s identical check (#1676) that the cursor-transparent `.`
 /// path above already exercises. `eval_generic::to_owned_cursor_at_depth`'s
 /// array/object loops only ever validate the delimiter *preceding a real
@@ -24715,28 +24921,32 @@ fn test_jq_lazy_path_trailing_comma_after_container_last_child_still_a_known_gap
 /// comma after a real last element/field, for both the array (`[1,]`) and
 /// object (`{"a":1,}`) shapes.
 ///
-/// Every query here writes *nothing* to stdout before the error --
-/// `length`/`to_entries`/`keys`/`.a`/`keys_unsorted | last`/
-/// `keys_unsorted[-1]`/`keys_unsorted[]` all resolve to a single owned
-/// result or a fully-collected `Vec` before anything is printed, so a
-/// mid-walk failure never leaks a partial value. `.[]` and bare
-/// `keys_unsorted` are exercised separately below -- both are genuinely
-/// *streaming* writers that can (and, on this exact input, do) emit a
-/// real prefix before discovering the terminal fault, the same
-/// established "partial output before an error surfaces" shape already
-/// pinned for `limit(3;.[])` on `[1,2,,4]`
+/// Every query in the first loop writes *nothing* to stdout before the
+/// error -- `length`/`to_entries`/`keys`/`.a`/`keys_unsorted | last`/
+/// `keys_unsorted[-1]` all resolve to a single owned result or a
+/// fully-collected `Vec` before anything is printed, so a mid-walk failure
+/// never leaks a partial value. `.[]`, bare `keys_unsorted` and (since
+/// #2103) `keys_unsorted[]` are the streaming writers: each can, and on
+/// this exact input does, emit a real prefix before discovering the
+/// terminal fault -- the same established "partial output before an error
+/// surfaces" shape already pinned for `limit(3;.[])` on `[1,2,,4]`
 /// (`docs/compliance/jq/limitations.md`'s "truncating consumer of a plain
-/// array `.[]`" section) -- not a new divergence this fix introduces.
+/// array `.[]`" section), not a new divergence.
+///
+/// `keys_unsorted[]` moved into that group under #2103. It is not a
+/// weakened check: exit code (5) and diagnostic are unchanged, and the
+/// prefix appears only because the filter now streams instead of taking
+/// the eager M2 route that collected every key before printing any. It is
+/// asserted explicitly below rather than dropped.
 #[test]
 fn test_jq_cursor_transparent_fast_paths_reject_trailing_comma_2261() -> Result<()> {
     for (input, query) in [
         (r"[1,]", "length"),
-        (r"[1,]", "to_entries"),
         (r#"{"a":1,}"#, "keys"),
-        (r#"{"a":1,}"#, "keys_unsorted[]"),
         (r#"{"a":1,}"#, "keys_unsorted | last"),
         (r#"{"a":1,}"#, "keys_unsorted[-1]"),
         (r#"{"a":1,}"#, "to_entries"),
+        (r"[1,]", "to_entries"),
         (r#"{"a":1,}"#, ".a"),
         (r#"{"a":1,}"#, ".nonexistent"),
     ] {
@@ -24754,6 +24964,14 @@ fn test_jq_cursor_transparent_fast_paths_reject_trailing_comma_2261() -> Result<
             "input={input} query={query}: stderr: {stderr:?}"
         );
     }
+
+    // #2103: `keys_unsorted[]` streams, so the one confirmed-good key is
+    // already on stdout when the trailing comma is found. Same exit code,
+    // same diagnostic.
+    let (out, stderr, code) = run_jq_full(&["-c", "keys_unsorted[]"], Some(r#"{"a":1,}"#))?;
+    assert_eq!(code, 5, "out: {out:?}, stderr: {stderr:?}");
+    assert_eq!(out, "\"a\"\n", "the one real key should still stream");
+    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr:?}");
 
     Ok(())
 }
@@ -25221,18 +25439,21 @@ fn test_jq_length_and_index_leading_comma_gap_still_raises_2261() -> Result<()> 
     Ok(())
 }
 
-/// #2261: `.x | keys_unsorted[]` is a *different* code path from bare
+/// #2261: `.x | keys_unsorted[]` was a *different* code path from bare
 /// `keys_unsorted[]` (pinned as part of
 /// `test_jq_cursor_transparent_fast_paths_reject_trailing_comma_2261`
-/// above): a bare `keys_unsorted[]` isn't cursor-transparent
-/// (`Builtin::KeysUnsorted` alone isn't root-safe) and takes the eager
-/// route (`fold_lazy_keys_stage`/`distinct_key_cursors_checked`), but once
-/// a pipe's first stage already descends off the root (`.x`, `Expr::Field`,
-/// one of `expr_descends`'s own matched shapes), `jq_runner.rs`'s
-/// `expr_is_cursor_transparent` admits everything after it unconditionally
-/// -- so this reaches the *demand-aware* sink
-/// (`each_lazy_keys_iterate_sink`, driven through `eval_each_with_cursor`)
-/// instead. Confirmed this is a genuinely different route (a code-review
+/// above) when this was written: a bare `keys_unsorted[]` wasn't
+/// cursor-transparent (`Builtin::KeysUnsorted` alone wasn't root-safe) and
+/// took the eager route
+/// (`fold_lazy_keys_stage`/`distinct_key_cursors_checked`), while a pipe
+/// whose first stage already descends off the root (`.x`, `Expr::Field`)
+/// was admitted past `jq_runner.rs`'s M2 gate and reached the
+/// *demand-aware* sink (`each_lazy_keys_iterate_sink`, driven through
+/// `eval_each_with_cursor`) instead. #2103 deleted that gate, so both
+/// spellings reach the demand-aware sink today and this row is a pinned
+/// shape rather than a route discriminator -- the sibling test above pins
+/// the bare form's own (now streaming) answer on the same fault.
+/// Confirmed this was a genuinely different route (a code-review
 /// correction on this fix's first draft, which had wrongly attributed this
 /// test to `stream_lazy_keys_json` in `src/jq/stream.rs` -- that writer
 /// turns out to be excluded from `succinctly jq`'s own M2 output gate
@@ -33422,11 +33643,23 @@ fn test_undecodable_object_key_does_not_hide_later_fields_1247() {
 /// depending on which pipeline shape reached it, exactly the inconsistency
 /// #1642 exists to close. It now agrees with the bare path: the key
 /// survives via its raw source span rather than being dropped *or* raised
-/// on. `keys` (sorted) always needed a full decode to sort by, so it goes
-/// through the identical fallback and now agrees too -- properly
-/// re-escaped this time, since it is a real materialized `String`, not a
-/// byte-verbatim echo (a literal `\` in the source doubles to `\\`, unlike
-/// bare `keys_unsorted`'s raw echo).
+/// on.
+///
+/// **#2103 made that agreement exact, spelling included.** `keys_unsorted,
+/// length` used to print the re-escaped `["\\ud800","b"]` while bare
+/// `keys_unsorted` printed the raw `["\ud800","b"]` -- agreement on
+/// presence and count, but not on bytes, because the comma sent the whole
+/// filter to the eager M2 route, which materialized. Every M2 filter
+/// streams now, so `keys_unsorted`'s own lazy raw-byte writer serves both
+/// spellings and the two are byte-identical. That follows the rule #2103
+/// records: raw source bytes wherever the value is never materialized, the
+/// `key_display_string` fallback (source `\` doubled) wherever it is.
+/// `keys` (sorted) is the "wherever it is" half -- it always needed a full
+/// decode to sort by, so it still goes through the fallback and still
+/// prints the re-escaped form, pinned unchanged below. Real jq 1.7.1
+/// rejects this document outright (exit 5, `Invalid \uXXXX\uXXXX surrogate
+/// pair escape`); succinctly's answering at all here is the older #1247
+/// preservation divergence, not something #2103 introduced.
 #[test]
 fn test_undecodable_key_in_materialized_keys_unsorted_agrees_with_bare_1642() {
     let input = r#"{"\ud800": 1, "b": 2}"#;
@@ -33434,10 +33667,17 @@ fn test_undecodable_key_in_materialized_keys_unsorted_agrees_with_bare_1642() {
     let (stdout, stderr, code) = run_jq_full(&["-c", "keys_unsorted, length"], Some(input))
         .unwrap_or_else(|e| panic!("`keys_unsorted, length` failed to run: {e}"));
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(stdout.trim(), "[\"\\ud800\",\"b\"]\n2", "stderr: {stderr}");
+
+    // The bare form, byte for byte -- the "agrees with bare" this test is
+    // named for is now literal agreement, not just agreement on content.
+    let (bare, stderr, code) = run_jq_full(&["-c", "keys_unsorted"], Some(input))
+        .unwrap_or_else(|e| panic!("`keys_unsorted` failed to run: {e}"));
+    assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(
-        stdout.trim(),
-        "[\"\\\\ud800\",\"b\"]\n2",
-        "stderr: {stderr}"
+        stdout.lines().next(),
+        bare.lines().next(),
+        "comma-joined and bare `keys_unsorted` must print identical bytes"
     );
 
     let (stdout, stderr, code) = run_jq_full(&["-c", "keys"], Some(input))
@@ -33794,36 +34034,56 @@ fn test_ordinary_type_error_still_suppressed_and_caught_1620() {
 /// failure from `Expr::Try`'s own ambient-materialization side effect
 /// rather than anything in its own body).
 ///
-/// #2286 revises what "genuinely catchable" means for this specific key:
+/// #2286 revised what "genuinely catchable" means for this specific key:
 /// live-verified that real jq treats a document-level #1194 fault as an
 /// unconditional parse error for *every* query on that document, including
 /// ones that never reference the malformed region at all (`sort?`, `1+1`)
 /// -- jq's parser rejects the whole document before any filter runs. Once
 /// #2286 tagged this error `is_decode_failure()`, succinctly's own
-/// behavior converged on that: all three shapes below now correctly exit 5
-/// uncaught, matching jq exactly (an *improvement* on #1812's own
-/// oracle-fidelity, not a regression -- #1812 never claimed `sort?`
-/// silently succeeding was correct, only that it was inconsistent with the
-/// `try` case).
+/// behavior converged on that: all three shapes exited 5 uncaught, matching
+/// jq exactly.
+///
+/// #2103 keeps only the `sort?` half of that convergence. The rule it
+/// records is **a filter validates only what it reads**: `sort` reaches the
+/// malformed key as part of its own reordering walk, so it still raises;
+/// `1+1` never touches `.` at all, and the exit 5 it used to produce came
+/// entirely from the eager M2 route materializing the ambient value through
+/// `to_owned_with_cursor` before the filter ran -- a side effect of needing
+/// a value to bridge with, never a decision that `1+1` should validate its
+/// input. With the M2 gate gone, `try (1+1) catch "x"` and bare
+/// `try (1+1)` answer `2` at exit 0.
+///
+/// jq 1.7.1's own answer on this document is exit 5 for all three
+/// (`jq: parse error: Object keys must be strings at line 1, column 5`),
+/// captured live. The two rows below that no longer match it are therefore
+/// a deliberate divergence, recorded on its merits in
+/// `docs/compliance/jq/limitations.md` under "Every M2 filter streams";
+/// `test_root_forwarding_filters_stream_without_validating_2103` pins the
+/// full table it belongs to. #1812's own point survives unchanged: the
+/// three shapes still agree with each other about *why* they answer as they
+/// do, which is the inconsistency #1812 was filed about.
 #[test]
 fn test_try_catch_contains_a_genuinely_catchable_malformed_key_error_1812() -> Result<()> {
     let doc = "{123: 1}";
 
+    // `sort` walks the object to reorder it, so it reaches the malformed
+    // key and raises -- unchanged by #2103, and still jq's own answer.
     let (stdout, stderr, code) = run_jq_full(&["-c", "sort?"], Some(doc))?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr}");
     assert!(stdout.trim().is_empty(), "stdout: {stdout:?}");
     assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr}");
 
+    // `1+1` reads nothing, so since #2103 it validates nothing. jq exits 5.
     let (stdout, stderr, code) = run_jq_full(&["-c", r#"try (1+1) catch "x""#], Some(doc))?;
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr}");
-    assert!(stdout.trim().is_empty(), "stdout: {stdout:?}");
-    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr}");
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr}");
+    assert_eq!(stdout, "2\n", "stdout: {stdout:?}");
+    assert!(stderr.is_empty(), "stderr: {stderr}");
 
-    // Bare `try`, no `catch` handler: still raises, same as the two above.
+    // Bare `try`, no `catch` handler: same, for the same reason.
     let (stdout, stderr, code) = run_jq_full(&["-c", "try (1+1)"], Some(doc))?;
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr}");
-    assert!(stdout.trim().is_empty(), "stdout: {stdout:?}");
-    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr}");
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr}");
+    assert_eq!(stdout, "2\n", "stdout: {stdout:?}");
+    assert!(stderr.is_empty(), "stderr: {stderr}");
 
     Ok(())
 }
@@ -35637,14 +35897,19 @@ fn test_field_index_iterate_delete_on_empty_update_filter_1916() -> Result<()> {
 ///
 /// The `-n` and `--slurp` forms were the first routes to stream (PR #1892).
 /// The M2 rows -- a document read from stdin, the CLI's default -- were added
-/// once that route was gated on `expr_is_cursor_transparent` and streamed
+/// once that route was gated on a cursor-transparency predicate and streamed
 /// too: `.[]|debug` is the shape the issue was filed about, and the `stderr`,
 /// `error` and `halt_error` rows check that a side effect mid-generator lands
 /// between the outputs either side of it rather than ahead of all of them.
 ///
-/// A filter the gate rejects still batches. That is not asserted here; it is
-/// recorded in `docs/compliance/jq/limitations.md` and tracked by #2103,
-/// which owns the evaluator divergence the gate exists to avoid.
+/// #2103 removed that gate: **every** M2 filter streams now, including the
+/// root-forwarding shapes the gate used to keep on the eager route, which
+/// therefore used to batch. The last three rows are exactly those shapes,
+/// and each one visibly reorders under the old route -- verified by running
+/// them against the retained `SUCCINCTLY_JQ_M2_EVAL=eager` hook, which
+/// produces `["DEBUG:",1]` *before* the first `1`, `[1,2][1,2]` before the
+/// first `[1,2]`, and `["DEBUG:",1]` before `2` respectively. So they
+/// discriminate the fix rather than merely passing alongside it.
 #[test]
 fn test_unbuffered_interleaves_stdout_and_stderr_1653() -> Result<()> {
     // (args, stdin, combined stdout+stderr, exit code) -- all four captured
@@ -35751,6 +36016,34 @@ fn test_unbuffered_interleaves_stdout_and_stderr_1653() -> Result<()> {
             Some("[1,2]"),
             "1\n2\n",
             5,
+        ),
+        // #2103's newly-admitted shapes, all at the *root*: before the gate
+        // came off, each of these fell to the eager route and batched.
+        //
+        // A root-forwarding comma with `debug` in the middle. Eager order
+        // was `["DEBUG:",1]` first, ahead of both stdout `1`s.
+        (
+            vec!["--unbuffered", "-c", ". , debug, ."],
+            Some("1"),
+            "1\n[\"DEBUG:\",1]\n1\n1\n",
+            0,
+        ),
+        // The same shape with `stderr`, whose newline-less write makes the
+        // interleaving unmistakable: eager put `[1,2][1,2]` first.
+        (
+            vec!["--unbuffered", "-c", "(., stderr)"],
+            Some("[1,2]"),
+            "[1,2]\n[1,2][1,2]\n",
+            0,
+        ),
+        // A filter whose first branch reads nothing at all -- the class
+        // #2103's validity divergence is about. Eager order was
+        // `["DEBUG:",1]`, `2`, `1`.
+        (
+            vec!["--unbuffered", "-c", "1+1, debug"],
+            Some("1"),
+            "2\n[\"DEBUG:\",1]\n1\n",
+            0,
         ),
     ] {
         let (combined, code) = run_jq_interleaved(&args, input)?;

@@ -1589,17 +1589,26 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
         let use_identity_fast_path = expr.is_identity() && output_config.can_use_raw_identity();
         // #1653: stream each output as the evaluator produces it, so a
         // `debug`/`stderr` side effect interleaves with stdout the way real
-        // jq's lazy generator does. Gated on `expr_is_cursor_transparent`,
-        // whose doc comment explains what the demand-driven evaluator would
-        // otherwise change beyond ordering, and why the set is measured
-        // (`scripts/jq-m2-streaming-sweep.sh`) rather than reasoned out.
-        // `SUCCINCTLY_JQ_M2_EVAL` overrides the gate in either direction so
-        // that sweep can diff both routes out of one binary; it is a
-        // verification hook, not a supported interface.
+        // jq's lazy generator does. Since #2103 that is unconditional --
+        // *every* M2 filter streams. The `expr_is_cursor_transparent` gate
+        // that used to stand here kept a root-forwarding filter (`.,.`,
+        // `1+1`, `try (1+1)`) on the eager route because that route's
+        // `to_owned_with_cursor` doubled as a whole-document validity check;
+        // #2103 recorded the consequence of dropping it as a deliberate
+        // divergence: **a filter validates only what it reads**, so `1+1` on
+        // a malformed document now answers `2` at exit 0 where jq 1.7.1
+        // exits 5. See "Every M2 filter streams" in
+        // `docs/compliance/jq/limitations.md` for the 19 rows and the
+        // reasoning, and `scripts/jq-m2-streaming-sweep.sh` for the sweep
+        // that measures them.
+        //
+        // `SUCCINCTLY_JQ_M2_EVAL=eager` still forces the old eager route out
+        // of the same binary; it is a verification hook kept only until
+        // #2103's phase 3 deletes it, never a supported interface.
         let use_streaming = match m2_eval_override().as_deref() {
             Some("stream") => true,
             Some("eager") => false,
-            _ => expr_is_cursor_transparent(&expr),
+            _ => true,
         };
 
         for (idx, raw) in raw_inputs.iter().enumerate() {
@@ -4646,99 +4655,14 @@ fn nesting_depth_panic_message(payload: &(dyn core::any::Any + Send)) -> Option<
         .then(|| text.to_string())
 }
 
-/// Whether every value this filter can emit is either a *proper descendant*
-/// cursor or a freshly-built value -- never the ambient root cursor forwarded
-/// on, and never an object key pulled from a lazy keys walk.
-///
-/// This is the gate on #1653's M2 streaming flip. Routing a filter through
-/// the demand-driven evaluator is not only an ordering change: the eager
-/// `eval_single`'s wildcard materializes the ambient value via
-/// `to_owned_with_cursor`, and that call is doing two jobs beyond producing a
-/// value -- validating the document (#1194's structural checks, #1642's
-/// colliding-display-key raise) and choosing an undecodable key's spelling.
-/// `eval_each_generic`'s native arms (#1596) do neither, so a filter whose
-/// eager twin is that wildcard answers differently on the two routes. #2103
-/// tracks splitting those two jobs apart; until it lands, such a filter stays
-/// on the eager route and only the shapes below stream.
-///
-/// The set is derived from `scripts/jq-m2-streaming-sweep.sh`, not from
-/// first principles: every shape admitted here measures byte-identical on
-/// stdout, stderr and exit code across both routes, on all eleven of the
-/// sweep's documents. Note `.a, .b` is admitted while `.,.` is not -- the
-/// divergence tracks the *root* cursor, not the comma -- which is why
-/// `Expr::Comma` is admitted only when no branch can yield the root.
-///
-/// Conservative by construction: a shape left out merely keeps today's
-/// batching, so the cost of omission is a missed improvement, never a wrong
-/// answer. `keys`/`length`/`to_entries`/`first(...)` all measure clean and
-/// are still omitted, because admitting builtins wholesale would also admit
-/// `keys_unsorted[]`, which does not.
-fn expr_is_cursor_transparent(expr: &jq::Expr) -> bool {
-    // A pipe is free from its first *descending* stage onwards. Past `.[]` or
-    // `.a` the ambient value is a proper descendant, so a downstream branch
-    // forwarding it is not forwarding the root, and the divergence this gate
-    // exists for cannot arise. Measured, not assumed: every `.[] | ...` and
-    // `.a | ...` shape in the sweep -- including `(., debug)`, `if`, `try`,
-    // `label`, `def`, `1+1`, the very shapes that diverge at the root -- is
-    // byte-identical on both routes across all eleven documents.
-    if let jq::Expr::Pipe(stages) = expr {
-        if let Some(cut) = stages.iter().position(expr_descends) {
-            return stages[..cut].iter().all(expr_is_root_safe);
-        }
-    }
-    expr_is_root_safe(expr)
-}
-
-/// Whether this stage necessarily moves off the ambient value onto a child
-/// (or onto a freshly-built `null` for a missing field), so nothing after it
-/// can still be holding the root cursor.
-fn expr_descends(expr: &jq::Expr) -> bool {
-    match expr {
-        jq::Expr::Field(_) | jq::Expr::Index { .. } | jq::Expr::Iterate => true,
-        jq::Expr::Paren(inner) => expr_descends(inner),
-        _ => false,
-    }
-}
-
-/// The conservative set for a filter still operating on the root: every shape
-/// here emits either a descendant cursor or a freshly-built value, never the
-/// ambient root cursor forwarded on through an arm whose eager twin would
-/// have materialized it.
-fn expr_is_root_safe(expr: &jq::Expr) -> bool {
-    match expr {
-        jq::Expr::Identity | jq::Expr::Field(_) | jq::Expr::Index { .. } | jq::Expr::Iterate => {
-            true
-        }
-        // `debug` forwards its input untouched, so it is root-safe for the
-        // same reason `.` is -- and it is the builtin #1653's own repro
-        // (`.[] | debug`) is built from.
-        jq::Expr::Builtin(jq::Builtin::Debug) => true,
-        jq::Expr::Paren(inner) => expr_is_root_safe(inner),
-        jq::Expr::Pipe(stages) => stages.iter().all(expr_is_root_safe),
-        jq::Expr::Comma(branches) => branches
-            .iter()
-            .all(|b| !expr_can_yield_root(b) && expr_is_root_safe(b)),
-        _ => false,
-    }
-}
-
-/// Whether `expr` can emit the ambient value unchanged. Only used to keep a
-/// root-forwarding branch out of an otherwise-root-safe `Expr::Comma`:
-/// `.,.` and `(., debug)` are exactly the shapes whose eager twin
-/// materializes, and so exactly the ones that diverge.
-fn expr_can_yield_root(expr: &jq::Expr) -> bool {
-    match expr {
-        jq::Expr::Identity | jq::Expr::Builtin(jq::Builtin::Debug) => true,
-        jq::Expr::Paren(inner) => expr_can_yield_root(inner),
-        jq::Expr::Pipe(stages) => stages.iter().all(expr_can_yield_root),
-        jq::Expr::Comma(branches) => branches.iter().any(expr_can_yield_root),
-        _ => false,
-    }
-}
-
-/// Read `SUCCINCTLY_JQ_M2_EVAL` (#1653). See its use in
-/// [`evaluate_bytes_lazy`]; `scripts/jq-m2-streaming-sweep.sh` is the only
-/// intended caller.
+/// Read `SUCCINCTLY_JQ_M2_EVAL` (#1653), the eager-vs-streaming override
+/// consulted where `use_streaming` is decided. Since #2103 only `eager`
+/// changes anything -- it is the sole remaining way to reach
+/// [`evaluate_bytes_lazy`] -- and nothing in the tree sets it except
+/// `tests/jq_cli_tests.rs`'s own eager cross-checks; `scripts/jq-m2-streaming-sweep.sh`
+/// stopped using it when it became a single-route sweep. A verification hook,
+/// never a supported interface, deleted with the eager route in #2103's
+/// phase 3.
 fn m2_eval_override() -> Option<String> {
     std::env::var("SUCCINCTLY_JQ_M2_EVAL").ok()
 }
@@ -4754,9 +4678,12 @@ type JqValueSink<'a, 'w> = dyn FnMut(&mut ErrorSink, JqValue<'a, Vec<u64>>) -> R
 ///
 /// The eager half of #1653's migration: it evaluates the whole filter before
 /// the caller writes any of it, so a `debug`/`stderr` side effect reaches
-/// stderr ahead of stdout output that was logically produced first. Reached
-/// only by filters [`expr_is_cursor_transparent`] rejects; everything else
-/// goes through [`evaluate_bytes_streaming`].
+/// stderr ahead of stdout output that was logically produced first. Since
+/// #2103 no shipped filter reaches it -- every M2 filter goes through
+/// [`evaluate_bytes_streaming`] -- and it survives only for
+/// `SUCCINCTLY_JQ_M2_EVAL=eager`, the verification hook
+/// `scripts/jq-m2-streaming-sweep.sh` used to diff the two routes out of one
+/// binary. #2103's phase 3 deletes it.
 fn evaluate_bytes_lazy<'a>(
     json_bytes: &'a [u8],
     expr: &jq::Expr,

@@ -393,9 +393,12 @@ pub trait DocumentCursor: Sized + Copy + Clone {
     /// pair closed for the CLI's cursor-native writers (#1676) and this
     /// closes for `crate::jq::eval_generic::to_owned_cursor_at_depth` (a
     /// private function, not linkable here) -- and
-    /// therefore every `evaluate_bytes_lazy`-reachable filter that isn't one
-    /// of that evaluator's natively-matched shapes, e.g. `if`/arithmetic/
-    /// function calls) -- the one materializing conversion that still
+    /// therefore every filter that falls to `eval_single`'s wildcard bridge
+    /// rather than one of that evaluator's natively-matched shapes, e.g.
+    /// `if`/arithmetic/function calls -- reached via `evaluate_bytes_lazy`
+    /// when this was written, and via `evaluate_bytes_streaming`'s own
+    /// fallback since #2103 retired that route) -- the one materializing
+    /// conversion that still
     /// silently accepted `[,]` as `[]` because it held a per-child cursor at
     /// every point except the empty case, where there is no child cursor to
     /// hold.

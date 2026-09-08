@@ -1,41 +1,48 @@
 #!/usr/bin/env bash
 #
-# Eager-vs-streaming parity sweep for the jq M2 lazy path (#1653).
+# jq M2 streaming sweep: the shipped route vs the pinned jq oracle (#1653,
+# #2103).
 #
-# #1653 wants the M2 route -- a JSON document read from a file or stdin, the
+# ## What it found
+#
+# #1653 wanted the M2 route -- a JSON document read from a file or stdin, the
 # CLI's default -- to write each output as the evaluator produces it, so
-# stdout and stderr interleave the way real jq's lazy generator does. PR
-# #1892 converted every other route; the M2 one still calls the *eager*
-# `eval_with_cursor`. Switching it to the demand-driven `eval_each_with_cursor`
-# is not just an ordering change: the eager evaluator's materializing arms
-# double as a validity gate, so arms that stream natively skip #1194/#1642
-# checks their eager twins performed as a side effect of building an
-# `OwnedValue`. An earlier attempt at the switch was reverted for exactly
-# that reason.
+# stdout and stderr interleave the way real jq's lazy generator does. That is
+# not only an ordering change: the eager evaluator's `to_owned_with_cursor`
+# doubled as a validity gate, so a filter with a native streaming arm skipped
+# #1194/#1642 checks its eager twin performed as a side effect of building an
+# `OwnedValue`. This sweep is what measured that. It ran each (document,
+# filter) case on both routes plus the oracle, and the set it reported -- 19
+# rows where the eager route matched jq's exit 5 and the streaming route
+# answered at exit 0, all of them a filter that reads nothing it validates --
+# is the set #2103 decided.
 #
-# This sweep separates the two variables. It runs each (document, filter)
-# case three ways -- the eager route, the route the build actually ships, and
-# the pinned jq oracle -- and reports:
+# #2103 took the streaming answer: **a filter validates only what it reads**,
+# recorded on its merits (against ADR-0018's own decision order, which favours
+# the behaviour given up) in `docs/compliance/jq/limitations.md` under "Every
+# M2 filter streams". There is now one route, so there is nothing left to diff
+# route-against-route.
 #
-# By default the second leg is the **shipped** route, so `0 unexpected` means
-# "the `expr_is_cursor_transparent` gate admits nothing that changes an
-# answer". Pass `--forced-stream` to make it stream *every* filter regardless
-# of the gate: that is the diagnostic view, and what it reports is the set of
-# divergences the gate exists to avoid -- i.e. #2103's worklist. Shrinking
-# that set is what lets the gate widen.
+# ## What it guards now
 #
-#   * PARITY divergences: eager vs streaming disagree on stdout/stderr/exit.
-#     **These are the gate.** Every one is a check the streaming route lost
-#     (or gained). Expected result: `0 unexpected`.
-#   * ORACLE rows: informational. Succinctly is a semi-index and detects a
-#     malformed document only opportunistically, where jq -- a full
-#     validating parser -- rejects every document below at parse time, exit
-#     5, whatever the filter. So most oracle columns read `jq=5 succ=0`
-#     already, on both routes, and closing those is not this issue's job.
-#     The rule that matters: **a cell must not move from 5 to 0.**
+# One leg -- the shipped binary, no environment overrides -- against pinned jq
+# 1.7.1, over the same DOCS x FILTERS the flip was measured on (kept verbatim:
+# they are the measured shapes, not an illustrative sample). Each case
+# contributes one line to a checked-in golden table:
 #
-# Both routes are driven out of one binary via `SUCCINCTLY_JQ_M2_EVAL`, so a
-# single build measures both and the comparison cannot drift on a stale half.
+#     <doc>\t<filter>\t<jq exit>\t<succinctly exit>\t<succinctly stdout, newlines as |>
+#
+# Without `--update` the freshly-generated table is diffed against the golden
+# and any difference fails. So what this catches is a cell moving from jq's
+# exit code to a different one, or output changing, on the shapes where
+# succinctly's lazy detection matches jq today.
+#
+# Most `jq=5 succ=0` cells in the golden are *not* regressions and never were:
+# succinctly is a semi-index and detects a malformed document only
+# opportunistically, where jq is a full validating parser and rejects every
+# malformed document below at parse time whatever the filter. The golden
+# records where each cell stands so a *move* is visible; it does not claim the
+# cells agree.
 #
 # This is a verification tool, not a CI gate -- same standing as its sibling
 # scripts/jq-fanout-oracle-sweep.sh. The pinned rows in tests/jq_cli_tests.rs
@@ -43,20 +50,23 @@
 #
 # Usage:
 #   cargo build --release --features cli
-#   ./scripts/jq-m2-streaming-sweep.sh [--forced-stream] [path-to-succinctly-binary]
+#   ./scripts/jq-m2-streaming-sweep.sh [--update] [path-to-succinctly-binary]
+#
+#   --update   regenerate scripts/jq-m2-streaming-sweep.expected in place
+#              instead of comparing against it. Inspect the diff before
+#              committing it: every changed row is a behaviour change.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PIN="$(cat "$REPO_ROOT/tests/data/jq-golden/JQ_VERSION")"
+GOLDEN="$REPO_ROOT/scripts/jq-m2-streaming-sweep.expected"
 
-# Empty = let the build's own gate decide (the shipped route); "stream" =
-# force every filter through the demand-driven evaluator.
-STREAM_LEG=""
+UPDATE=0
 ARGS=()
 for arg in "$@"; do
   case "$arg" in
-    --forced-stream) STREAM_LEG=stream ;;
+    --update) UPDATE=1 ;;
     *) ARGS+=("$arg") ;;
   esac
 done
@@ -78,7 +88,7 @@ else
   echo "error: no jq matching pin $PIN found at /usr/bin/jq or on PATH" >&2
   exit 1
 fi
-echo "oracle: $JQ ($("$JQ" --version)), succinctly: $SUCC, second leg: ${STREAM_LEG:-shipped gate}" >&2
+echo "oracle: $JQ ($("$JQ" --version)), succinctly: $SUCC" >&2
 
 WORK="$(mktemp -d -t jq-m2-sweep)"
 trap 'rm -rf "$WORK"' EXIT
@@ -102,18 +112,19 @@ DOCS=(
   '{"a\q":1,"b":2}'                    # invalid escape in key
 )
 
-# Filters. Two groups, and the split is the point of the sweep.
+# Filters. The two groups below were the point of the sweep while there were
+# two routes to compare, and are kept because they are the shapes the flip was
+# measured on:
 #
-#   * "transparent": shapes whose *eager* twin also forwards a cursor without
-#     materializing, so they answer identically on both routes today and must
-#     keep doing so — these are the hot default route and may not slow down.
-#   * "materializing": shapes whose eager twin falls to `eval_single`'s
-#     wildcard, which materializes the ambient value via `to_owned_with_cursor`
-#     and so validates the document as a side effect, while `eval_each_generic`
-#     has a native streaming arm that does not. This is where the lost checks
-#     live.
+#   * shapes whose eager twin also forwarded a cursor without materializing,
+#     so they answered identically on both routes — the hot default route,
+#     which may not change;
+#   * shapes whose eager twin fell to `eval_single`'s wildcard, materializing
+#     the ambient value via `to_owned_with_cursor` and validating the document
+#     as a side effect, where `eval_each_generic` has a native streaming arm
+#     that does not. That group is where #2103's 19 rows live.
 FILTERS=(
-  # transparent
+  # forwarded a cursor on both routes
   '.'
   '.a'
   '.b'
@@ -128,7 +139,7 @@ FILTERS=(
   'limit(1; keys_unsorted[])'
   'limit(2; keys_unsorted[])'
   'first(.[])'
-  # materializing / native-streaming-arm shapes
+  # materializing eager twin / native streaming arm
   '.,.'
   'if . then . else . end'
   'try .'
@@ -149,7 +160,7 @@ FILTERS=(
   '(., debug)'
   # descended shapes: after a first stage that descends, the ambient value is
   # a proper descendant, so a branch forwarding it is not forwarding the root.
-  # These decide how far past the root the streaming gate can safely reach.
+  # These measured how far past the root the streaming route could reach.
   '.[]|debug'
   '.[] | (., debug)'
   '.[] | .,.'
@@ -166,76 +177,22 @@ FILTERS=(
   '.[] | tostring'
 )
 
-# Attribute a parity divergence to an already-tracked, deliberately-accepted
-# gap, or return 1 for "this is new, look at it". Keep every entry tied to an
-# issue number.
-classify_parity() {
-  local doc="$1" filter="$2" eager_out="$3" stream_out="$4" eager_code="$5" stream_code="$6"
-
-  # #1770, generalised by #1653: the streaming route finds a document fault
-  # only when the walk reaches it, so outputs produced *before* the fault are
-  # already on stdout when it raises, where the eager route returned a single
-  # `Error` and printed nothing. The exit code still agrees. Real jq prints
-  # nothing either -- it rejects the document at parse time -- so this is a
-  # divergence from jq on stdout content, accepted for the same reason #1770
-  # accepted `limit(2; keys_unsorted[])` emitting `"a"` alongside exit 5.
-  if [[ "$eager_code" == "$stream_code" && -z "$eager_out" && -n "$stream_out" ]]; then
-    echo '#1770/#1653 (prefix produced before a lazily-detected document fault)'
-    return 0
-  fi
-
-  return 1
-}
-
-total=0
-parity_diverged=0
-parity_unexpected=0
-oracle_regressed=0
-parity_log=""
-oracle_log=""
-declare -a known_labels=()
+ACTUAL="$WORK/actual.tsv"
+: > "$ACTUAL"
 
 run_case() {
   local doc="$1" filter="$2"
-  total=$((total + 1))
   printf '%s' "$doc" > "$DOC_FILE"
 
-  local jq_out jq_code eager_out eager_err eager_code stream_out stream_err stream_code
+  local jq_code succ_out succ_code
 
-  jq_out="$("$JQ" -c "$filter" "$DOC_FILE" 2>/dev/null)" && jq_code=0 || jq_code=$?
+  "$JQ" -c "$filter" "$DOC_FILE" >/dev/null 2>&1 && jq_code=0 || jq_code=$?
 
-  eager_out="$(SUCCINCTLY_JQ_M2_EVAL=eager "$SUCC" jq -c "$filter" "$DOC_FILE" 2>"$WORK/e.err")" \
-    && eager_code=0 || eager_code=$?
-  eager_err="$(cat "$WORK/e.err")"
+  succ_out="$("$SUCC" jq -c "$filter" "$DOC_FILE" 2>/dev/null)" && succ_code=0 || succ_code=$?
 
-  stream_out="$(SUCCINCTLY_JQ_M2_EVAL="$STREAM_LEG" "$SUCC" jq -c "$filter" "$DOC_FILE" 2>"$WORK/s.err")" \
-    && stream_code=0 || stream_code=$?
-  stream_err="$(cat "$WORK/s.err")"
-
-  # Paths appear in diagnostics; strip them so the two legs are comparable.
-  eager_err="${eager_err//$DOC_FILE/DOC}"
-  stream_err="${stream_err//$DOC_FILE/DOC}"
-
-  if [[ "$eager_out" != "$stream_out" || "$eager_err" != "$stream_err" || "$eager_code" != "$stream_code" ]]; then
-    parity_diverged=$((parity_diverged + 1))
-    local known
-    if known="$(classify_parity "$doc" "$filter" "$eager_out" "$stream_out" "$eager_code" "$stream_code")"; then
-      known_labels+=("$known")
-    else
-      parity_unexpected=$((parity_unexpected + 1))
-      parity_log+="[parity] doc=$doc filter=$filter
-  eager:   out=$(printf '%s' "$eager_out" | tr '\n' '|') err=$eager_err exit=$eager_code
-  stream:  out=$(printf '%s' "$stream_out" | tr '\n' '|') err=$stream_err exit=$stream_code
-"
-    fi
-  fi
-
-  # Directional oracle check: a cell may move toward jq, never away.
-  if [[ "$eager_code" == "$jq_code" && "$stream_code" != "$jq_code" ]]; then
-    oracle_regressed=$((oracle_regressed + 1))
-    oracle_log+="[oracle] doc=$doc filter=$filter — eager matched jq ($jq_code), streaming did not ($stream_code)
-"
-  fi
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    "$doc" "$filter" "$jq_code" "$succ_code" \
+    "$(printf '%s' "$succ_out" | tr '\n' '|')" >> "$ACTUAL"
 }
 
 for doc in "${DOCS[@]}"; do
@@ -244,13 +201,26 @@ for doc in "${DOCS[@]}"; do
   done
 done
 
-printf '%s' "$parity_log"
-printf '%s' "$oracle_log"
-echo "== $total cases: $parity_unexpected unexpected parity divergence(s), $((parity_diverged - parity_unexpected)) known, $oracle_regressed oracle regression(s) =="
-if ((parity_diverged > parity_unexpected)); then
-  printf '%s\n' "${known_labels[@]}" | sort | uniq -c | sed 's/^/   known: /'
+total="$(wc -l < "$ACTUAL" | tr -d ' ')"
+
+if ((UPDATE)); then
+  cp "$ACTUAL" "$GOLDEN"
+  echo "== $total cases written to $GOLDEN =="
+  exit 0
 fi
-if ((parity_unexpected > 0 || oracle_regressed > 0)); then
-  echo "FAIL: $parity_unexpected unexpected parity divergence(s), $oracle_regressed oracle regression(s) — see above" >&2
+
+if [[ ! -f "$GOLDEN" ]]; then
+  echo "error: golden table $GOLDEN not found — run with --update to create it" >&2
   exit 1
 fi
+
+if diff -u "$GOLDEN" "$ACTUAL" > "$WORK/diff.txt"; then
+  echo "== $total cases: table matches $(basename "$GOLDEN") =="
+  exit 0
+fi
+
+sed -e "s#$GOLDEN#expected#" -e "s#$ACTUAL#actual#" "$WORK/diff.txt"
+changed="$(grep -c '^[+-][^+-]' "$WORK/diff.txt" || true)"
+echo "FAIL: $total cases, $changed changed line(s) vs $(basename "$GOLDEN") — see the diff above." >&2
+echo "      Each one is a behaviour change: re-derive it, then re-run with --update." >&2
+exit 1
