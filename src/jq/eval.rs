@@ -41027,10 +41027,10 @@ fn yaml_value_to_owned_checked<W: Clone + AsRef<[u64]>>(
         YamlValue::Sequence(mut elements) => {
             let mut items = Vec::new();
             // `uncons_resolved_cursor`, not `uncons_cursor`: the recursive
-            // call's own `cursor.explicit_tag()` above doesn't resolve a
-            // bare `-` sequence-item wrapper itself, so an unresolved
-            // cursor here would silently drop an explicit tag on a
-            // bare-dash-deferred scalar loaded via the `load()` builtin
+            // call's own `cursor.explicit_tag_at(None)` above doesn't
+            // resolve a bare `-` sequence-item wrapper itself, so an
+            // unresolved cursor here would silently drop an explicit tag
+            // on a bare-dash-deferred scalar loaded via the `load()` builtin
             // (#835).
             while let Some((elem_cursor, rest)) = elements.uncons_resolved_cursor() {
                 items.push(yaml_value_to_owned_checked(elem_cursor)?);

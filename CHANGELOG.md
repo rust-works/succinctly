@@ -308,8 +308,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dwarfs a single skipped cursor resolve here, unlike the allocation-light
   streaming write path. Landed anyway for the same reason #1114's
   redundancy was worth finding in the first place -- a genuine, provably
-  unnecessary resolve, now closed everywhere in the crate it's reachable
-  from -- not for a performance claim this workload doesn't support.
+  unnecessary resolve -- not for a performance claim this workload doesn't
+  support. One more site with the same shape remains, behind the generic
+  `DocumentCursor` trait rather than a concrete `YamlCursor`
+  (`eval_generic.rs`'s `yq_type_tag`); closing it needs the same accessor
+  added to the trait, a larger change than this follow-up's own scope.
   Output byte-identical before/after in every run.
 
 ### Removed
