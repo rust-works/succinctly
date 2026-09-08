@@ -843,6 +843,7 @@ pub trait DocumentValue: Sized + Clone {
     /// that fast path available: it decodes, and `key_hash_of` measured
     /// +10-12% on `wide_keys_unsorted` when a decoding check was tried
     /// before the raw span.
+    // omni-dev: coverage tolerate reason="unreachable: both implementors (StandardJson, YamlValue) override this to decode once; the default exists as the contract a future implementor inherits, and is deliberately the two-call sequence it replaces (#965)"
     fn decoded_key_str(&self) -> Result<Option<Cow<'_, str>>, &'static str> {
         if let Some(reason) = self.string_decode_error() {
             return Err(reason);
@@ -3719,6 +3720,19 @@ mod decoded_key_str_tests {
         assert_eq!(
             yaml_nth_key(b"a: &x {p: 1}\n*x: 1\n", 1),
             Some((String::new(), false))
+        );
+    }
+
+    /// An alias key whose target will not *decode* is a decode failure, not
+    /// a #222 stringification -- the one YAML shape that reaches the
+    /// `Alias` arm's preserved `string_decode_error` call and returns
+    /// `Err`. Distinguishable from the case above only by `is_fallback`,
+    /// since YAML has no raw-span override and both spell `""`.
+    #[test]
+    fn yaml_alias_key_to_an_undecodable_string_is_a_decode_failure_965() {
+        assert_eq!(
+            yaml_nth_key(b"a: &x \"b\\qc\"\n*x: 1\n", 1),
+            Some((String::new(), true))
         );
     }
 
