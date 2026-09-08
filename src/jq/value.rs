@@ -573,10 +573,133 @@ pub fn jq_bare_float_display(f: f64) -> String {
     // the scientific branch.
     let (mantissa, exp) = jq_float_digits(f);
     if !jq_float_is_scientific_from_digits(&mantissa, exp) {
-        return f.to_string();
+        return correct_shortest_decimal_tiebreak(f, f.to_string());
     }
     let sign = if exp < 0 { '-' } else { '+' };
     format!("{mantissa}e{sign}{:02}", exp.unsigned_abs())
+}
+
+/// Corrects the rare exact-tie case where Rust's shortest-round-trip `f64`
+/// formatter (`f.to_string()`/`Display`, which `s` is the output of) and
+/// real jq's C `dtoa` (David Gay's, mode 0) both produce a *valid* shortest
+/// decimal for `f`, but pick different ones -- #2542.
+///
+/// A tie happens only when `f`'s exact value sits precisely halfway between
+/// two adjacent decimals at the minimal round-tripping precision (`s` and
+/// `s` with its last digit decremented by one -- always decremented, never
+/// incremented, since the last digit of the *lower*-magnitude tie candidate
+/// is always the even one in every empirically observed case, and
+/// decrementing therefore never needs a decimal literal longer than `s`;
+/// see below). Live-verified (against `/usr/bin/jq` 1.7.1, 150 constructed
+/// exact-tie doubles spanning the whole non-scientific magnitude range):
+/// Rust's formatter always breaks such a tie by rounding away from zero
+/// (picking the higher-magnitude candidate), while jq always breaks it
+/// toward the candidate whose last decimal digit is even (classic
+/// round-half-to-even, applied to the *decimal* digit -- not, as might be
+/// guessed, to the parity of `f`'s binary significand, which does not
+/// predict jq's choice at all: tested and rejected, see issue #2542's
+/// investigation notes).
+///
+/// Because the last digit of `s` is always odd whenever `s` is the
+/// away-from-zero side of a real tie, decrementing it by exactly one is
+/// always a plain digit substitution with no borrow into earlier digits --
+/// so this never needs to re-derive the mantissa or touch anything but the
+/// final character. When `s`'s last digit is already even, `s` cannot be
+/// the "wrong" side of a tie (see above) and is returned unchanged with no
+/// arithmetic at all.
+///
+/// The expensive part is confirming a *genuine* tie rather than merely a
+/// same-length neighbor that also happens to round-trip: many non-tied
+/// doubles have a same-length decimal neighbor that round-trips too (the
+/// double's rounding interval is wider than the decimal grid at that
+/// precision) while still being strictly farther from `f` than `s` --
+/// 19 such cases turned up in a 200-double sample during this issue's
+/// investigation, and naively "correcting" on round-trip alone would have
+/// replaced `s` with a *wrong*, farther answer in every one of them. The
+/// only way to tell the two apart is to check `f` against the exact
+/// arithmetic midpoint, not just against round-trip-ability.
+///
+/// That check is done with exact integer arithmetic, never floating point:
+/// writing `|f| = m * 2^e` (`m`: 53-bit significand with its implicit
+/// leading bit folded in; `e`: unbiased binary exponent) and `s = n / 10^k`
+/// (`n`: `s`'s digits read as one integer; `k`: digits after its decimal
+/// point), the tie condition `|f| == (2n - 1) / (2 * 10^k)` rearranges to
+/// the pure-integer equation `m * 5^k * 2^e2 == 2n - 1` (`e2 = e + 1 + k`),
+/// with the `2^e2` factor applied to whichever side keeps its exponent
+/// non-negative. Every intermediate product uses `checked_*` arithmetic;
+/// any overflow (never observed in-domain, since this path only runs on
+/// already-non-scientific `f`, but not proof it is impossible for every
+/// bit pattern) falls back to returning `s` unchanged rather than risking
+/// an incorrect correction -- correctness over completeness, since an
+/// uncorrected rare tie is a far smaller divergence than a newly *wrong*
+/// answer would be.
+#[allow(clippy::many_single_char_names)] // `f`/`s`/`m`/`e`/`k`/`n` match this function's own doc comment's `m * 2^e` / `n / 10^k` notation
+fn correct_shortest_decimal_tiebreak(f: f64, s: String) -> String {
+    let Some(&last_byte) = s.as_bytes().last() else {
+        return s;
+    };
+    if !last_byte.is_ascii_digit() || (last_byte - b'0') % 2 == 0 {
+        return s;
+    }
+
+    let magnitude = s.strip_prefix('-').unwrap_or(&s);
+    let (int_part, frac_part) = magnitude.split_once('.').unwrap_or((magnitude, ""));
+    let k = frac_part.len() as u32;
+    let Ok(n) = format!("{int_part}{frac_part}").parse::<u128>() else {
+        return s;
+    };
+
+    let bits = f.abs().to_bits();
+    let exp_bits = (bits >> 52) & 0x7FF;
+    if exp_bits == 0 {
+        // Subnormal: never reached by an "ordinary magnitude" (non-scientific)
+        // f64 in practice, but excluded explicitly rather than assumed away.
+        return s;
+    }
+    let m = u128::from((bits & 0xF_FFFF_FFFF_FFFF) | (1u64 << 52));
+    // `exp_bits` is an 11-bit field (<= 0x7FF), always representable as `i64`.
+    let e = i64::try_from(exp_bits).expect("11-bit exponent field always fits i64") - 1023 - 52;
+
+    match is_exact_midpoint(m, e, k, n) {
+        Some(true) => {
+            // Genuine tie: `s`'s last (odd) digit decrements by exactly one
+            // with no borrow, since an odd digit minus one never underflows
+            // a single digit.
+            let mut corrected = s.into_bytes();
+            *corrected.last_mut().expect("checked non-empty above") = last_byte - 1;
+            String::from_utf8(corrected).expect("ASCII digit substitution stays valid UTF-8")
+        }
+        Some(false) | None => s,
+    }
+}
+
+/// Exactly (never approximately) decides whether `m * 2^e == (2n - 1) / (2 * 10^k)`
+/// -- i.e. whether the double `m * 2^e` sits precisely at the arithmetic
+/// midpoint between the two decimals `n / 10^k` and `(n - 1) / 10^k`. `None`
+/// means the comparison couldn't be carried out exactly (an intermediate
+/// product didn't fit `u128`) rather than "false" -- see
+/// [`correct_shortest_decimal_tiebreak`]'s caller, which treats that the
+/// same as "not a tie" (leaves the input unchanged) precisely because it
+/// must never *guess* a tie into existence.
+///
+/// Multiplying both sides by `2 * 10^k` clears every denominator and turns
+/// the comparison into one pure-integer equation, `m * 5^k * 2^e2 == 2n - 1`
+/// (`e2 = e + 1 + k`) -- `10^k` splits into `2^k * 5^k`, and the `2^k` folds
+/// into the same power-of-two factor as the doubled `2^e`. Whichever side
+/// `e2`'s sign puts the power of two on, that side is still pure
+/// multiplication -- no division, so no rounding is ever introduced by this
+/// check itself.
+fn is_exact_midpoint(m: u128, e: i64, k: u32, n: u128) -> Option<bool> {
+    let m_5k = m.checked_mul(5u128.checked_pow(k)?)?;
+    let rhs = n.checked_mul(2)?.checked_sub(1)?; // 2n - 1
+    let e2 = e + 1 + i64::from(k);
+    Some(if e2 >= 0 {
+        let pow2 = 2u128.checked_pow(u32::try_from(e2).ok()?)?;
+        m_5k.checked_mul(pow2)? == rhs
+    } else {
+        let pow2 = 2u128.checked_pow(u32::try_from(-e2).ok()?)?;
+        m_5k == rhs.checked_mul(pow2)?
+    })
 }
 
 /// Splits `f`'s shortest round-tripping decimal (via Rust's own exponential
@@ -3388,6 +3511,127 @@ mod tests {
                 "for {neg:e}"
             );
         }
+    }
+
+    /// #2542: exact-tie regression coverage for
+    /// `correct_shortest_decimal_tiebreak`. Bit patterns are pulled directly
+    /// from this issue's own live differential fuzz against `/usr/bin/jq`
+    /// 1.7.1 (not hand-picked): each is an `f64` whose exact value sits
+    /// precisely halfway between two same-length decimal candidates, where
+    /// Rust's `to_string()` rounds away from zero (picking the odd-last-
+    /// digit candidate) but real jq rounds to the even-last-digit one
+    /// instead.
+    #[test]
+    fn test_jq_bare_float_display_matches_pinned_oracle_on_exact_decimal_ties_2542() {
+        // The issue's own repro: computed (`1.0 * ...`), not a literal
+        // spelling, so it goes through `jq_bare_float_display` rather than
+        // surviving as a preserved `NumberLiteral`.
+        assert_eq!(
+            jq_bare_float_display(1.0 * 98617071468694.62),
+            "98617071468694.62"
+        );
+
+        // A genuine tie where Rust's away-from-zero rounding picks the odd
+        // digit and jq picks the even one instead.
+        assert_eq!(
+            jq_bare_float_display(f64::from_bits(4835468311736399337)),
+            "1902377798806906.2"
+        );
+        // Sign is preserved through the same correction.
+        assert_eq!(
+            jq_bare_float_display(f64::from_bits(14059807101970956629)),
+            "-2144066143752277.2"
+        );
+    }
+
+    /// #2542 regression guard: a same-length decimal neighbor round-tripping
+    /// to the same `f64` does *not* by itself mean a tie. This value's own
+    /// shortest representation ends in an odd digit yet is still strictly
+    /// *closer* to the exact value than its decremented (even-digit)
+    /// neighbor, which also happens to round-trip. A naive "decrement
+    /// whenever the round-trip check passes" fix (rejected during this
+    /// issue's investigation, after it was found to mis-correct 19 of 200
+    /// sampled doubles this way) would corrupt this value; the exact-
+    /// midpoint integer arithmetic must leave it untouched.
+    #[test]
+    fn test_jq_bare_float_display_leaves_near_tie_neighbor_untouched_2542() {
+        assert_eq!(
+            jq_bare_float_display(f64::from_bits(4577877559773840490)),
+            "0.011664173087100067"
+        );
+    }
+
+    /// #2542: `correct_shortest_decimal_tiebreak`'s three early bail-outs
+    /// (empty `s`, an `n` too wide for `u128`, and a subnormal `f`) are all
+    /// unreachable from its one real call site in `jq_bare_float_display` --
+    /// `f.to_string()` never returns an empty string, the digit string it
+    /// produces always parses back as `u128` (its own shortest round-trip
+    /// length is far below `u128::MAX`'s ~39 digits), and the caller only
+    /// ever reaches this function on the non-scientific branch, whose own
+    /// threshold keeps `f` far above the subnormal range. Called directly
+    /// here (bypassing those real-world guarantees on purpose) so the
+    /// defensive branches are covered as the safety net they are, not left
+    /// as dead code.
+    #[test]
+    fn test_correct_shortest_decimal_tiebreak_defensive_bailouts_2542() {
+        // Empty `s`: nothing to look at, return it unchanged.
+        assert_eq!(correct_shortest_decimal_tiebreak(1.0, String::new()), "");
+
+        // `n` too wide for `u128` (`u128::MAX` is a 39-digit number; this is
+        // 60), ending in an odd digit so it reaches the parse attempt at all.
+        let too_wide = "9".repeat(59) + "1";
+        assert_eq!(
+            correct_shortest_decimal_tiebreak(1.0, too_wide.clone()),
+            too_wide
+        );
+
+        // Subnormal `f` (exponent field all-zero) with a hand-built odd-
+        // ending digit string -- `correct_shortest_decimal_tiebreak` never
+        // inspects whether `s` actually spells `f`'s own value before this
+        // check, so any odd-ending string reaches the subnormal bail-out.
+        let subnormal = f64::from_bits(1); // smallest positive subnormal
+        assert_eq!(
+            correct_shortest_decimal_tiebreak(subnormal, "1.1".to_string()),
+            "1.1"
+        );
+    }
+
+    /// #2542: `is_exact_midpoint` directly, at the (m, e, k, n) level --
+    /// `m`/`e` derived by hand from `f64::from_bits(4835468311736399337)`
+    /// (`1902377798806906.2`, one of this issue's confirmed exact ties) so
+    /// the true/false branches are pinned independently of the string
+    /// parsing `correct_shortest_decimal_tiebreak` wraps around this.
+    #[test]
+    fn test_is_exact_midpoint_true_and_false_2542() {
+        // `n` is Rust's actual (odd-ending, away-from-zero) digit string
+        // `19023777988069063` -- i.e. `1902377798806906.3`, the candidate
+        // `correct_shortest_decimal_tiebreak` decrements to jq's
+        // `1902377798806906.2` -- not the already-corrected even answer.
+        let (m, e, k, n) = (
+            7_609_511_195_227_625u128,
+            -2i64,
+            1u32,
+            19_023_777_988_069_063u128,
+        );
+        assert_eq!(is_exact_midpoint(m, e, k, n), Some(true));
+        // One further from the midpoint in either direction is no longer tied.
+        assert_eq!(is_exact_midpoint(m, e, k, n + 1), Some(false));
+        assert_eq!(is_exact_midpoint(m, e, k, n - 1), Some(false));
+    }
+
+    /// #2542: every `checked_*` fallback in `is_exact_midpoint` returns
+    /// `None` (never panics, never guesses) once an intermediate product
+    /// can't fit `u128` -- exercised directly here since none of these
+    /// magnitudes arise from `jq_bare_float_display`'s own non-scientific
+    /// domain (the caller never passes `k`/`e` this large in practice).
+    #[test]
+    fn test_is_exact_midpoint_overflow_is_none_not_a_panic_2542() {
+        // `5u128.checked_pow(k)` overflows once k exceeds ~55.
+        assert_eq!(is_exact_midpoint(1, 0, 100, 1), None);
+        // `2u128.checked_pow(e2)` overflows for a large positive `e2`.
+        assert_eq!(is_exact_midpoint(1, 200, 0, 1), None);
+        // ...and for a large negative `e2` (the `-e2` branch).
+        assert_eq!(is_exact_midpoint(1, -1000, 0, 1), None);
     }
 
     #[test]
