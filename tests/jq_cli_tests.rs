@@ -41855,3 +41855,125 @@ fn test_not_truthiness_table_2476() -> Result<()> {
     }
     Ok(())
 }
+
+/// #2476: `//`'s jq semantics table, after `Expr::Alternative` gained its own
+/// native arm in `eval_single` (it had none before, so it fell to the
+/// wildcard bridge unconditionally). Every row was captured live from the
+/// pinned oracle `/usr/bin/jq` 1.7.1 before being written down here, and the
+/// arm mirrors `eval::eval_alternative`, which these rows already held for
+/// the bridged route -- so the table's real job is to pin that the *native*
+/// route did not drift from either.
+///
+/// The rules the rows encode: `//` emits every left output that is neither
+/// `null` nor `false` (`0`, `""`, `[]` are all truthy in jq, so they answer
+/// and the right side never runs); the right side runs only when *no* truthy
+/// left output survived, and its own outputs are then emitted unfiltered
+/// (`false // (null, 7)` is `null, 7`, not `7`).
+#[test]
+fn test_alternative_truthiness_table_2476() -> Result<()> {
+    for (filter, input, want) in [
+        ("null // 1", "null", "1"),
+        ("false // 1", "null", "1"),
+        ("0 // 1", "null", "0"),
+        ("\"\" // 1", "null", "\"\""),
+        ("[] // 1", "null", "[]"),
+        // Truthy outputs are kept one by one, not collapsed to the first.
+        ("(null, 2, false, 3) // 9", "null", "2\n3"),
+        // The right side is emitted unfiltered -- `null` survives there.
+        ("false // (null, 7)", "null", "null\n7"),
+        // An empty left stream is "no truthy output", so the right answers.
+        ("empty // 1", "null", "1"),
+        (".a // .b", "{\"a\": null, \"b\": 5}", "5"),
+        // `0` is truthy, so `.b` is never reached.
+        (".a // .b", "{\"a\": 0, \"b\": 5}", "0"),
+        // `?` on the left is how an error is turned into "no output" -- `.a`
+        // on an array raises, and the suppressed stream lets `1` answer.
+        (".a? // 1", "[1]", "1"),
+        // Filtering happens per output of the left, `.[]` included.
+        (".[] // 1", "[null, 1]", "1"),
+    ] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, input, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}` on {input} -- stderr: {stderr:?}");
+        assert_eq!(
+            stdout.trim(),
+            want,
+            "`{filter}` on {input} -- stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #2476: the control-flow half of `//`'s semantics, split out from the value
+/// table above because these rows are about exit codes and stderr rather than
+/// stdout. Captured live from `/usr/bin/jq` 1.7.1.
+///
+/// An error on the left *propagates* -- `//` substitutes for a falsy or
+/// absent output, never for a raised one -- and that holds even when nothing
+/// truthy survived, which is the row that proves the right side is not
+/// reached (`(null, error("x")) // 2` prints no `2`). A `break` escapes the
+/// operator entirely rather than selecting a branch. `(1, error("x")) // 2`
+/// is #400's rule: the truthy prefix is kept and *then* the error terminates
+/// the stream.
+#[test]
+fn test_alternative_control_flow_2476() -> Result<()> {
+    // jq 1.7.1: exit 5, stdout empty, `jq: error (at <stdin>:0): x`.
+    let (stdout, stderr, code) = run_jq_stdin_streams("(error(\"x\")) // 1", "null", &["-c"])?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), "", "stderr: {stderr:?}");
+    assert!(stderr.contains('x'), "stderr: {stderr}");
+
+    // jq 1.7.1: exit 5, stdout `1`, same diagnostic -- the truthy prefix
+    // survives the error that follows it.
+    let (stdout, stderr, code) = run_jq_stdin_streams("(1, error(\"x\")) // 2", "null", &["-c"])?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), "1", "stderr: {stderr:?}");
+
+    // jq 1.7.1: exit 5, stdout empty. Nothing truthy survived, but `2` is
+    // still never printed -- an error is not an absent output.
+    let (stdout, stderr, code) =
+        run_jq_stdin_streams("(null, error(\"x\")) // 2", "null", &["-c"])?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), "", "stderr: {stderr:?}");
+
+    // jq 1.7.1: exit 0, no output at all -- the `break` escapes `//` rather
+    // than being read as "no truthy output" and selecting `1`.
+    let (stdout, stderr, code) =
+        run_jq_stdin_streams("label $out | (break $out) // 1", "null", &["-c"])?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), "", "stderr: {stderr:?}");
+
+    Ok(())
+}
+
+/// #2476: `//`'s sibling of `test_not_still_raises_on_a_malformed_document_2476`
+/// just above. `Expr::Alternative` had no native arm at all, so unlike
+/// `and`/`or` there was no `needs_path_context` gate to drop -- the new arm
+/// calls `ambient_validation_error` unconditionally, because the whole
+/// construct is the "shape that used to bridge". These rows pin that the walk
+/// raises where the bridge's ambient materialization did: a #1194 malformed
+/// object key (raised for `false // 1`, which reads nothing at all, exactly
+/// as real jq rejects the document for every query), and a #1247 decode
+/// failure the walk actually visits.
+#[test]
+fn test_alternative_still_raises_on_a_malformed_document_2476() -> Result<()> {
+    for filter in ["false // 1", ".a // 1"] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, "{123: 1}", &[])?;
+        assert_eq!(
+            code, 5,
+            "`{filter}` -- stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "`{filter}` -- stderr: {stderr}"
+        );
+    }
+
+    let (stdout, stderr, code) = run_jq_stdin_streams("(.[0] // 1)", "[\"\\x\"]", &[])?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("invalid escape sequence"),
+        "stderr: {stderr}"
+    );
+
+    Ok(())
+}

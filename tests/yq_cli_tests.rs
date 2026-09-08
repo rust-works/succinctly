@@ -38860,3 +38860,187 @@ fn test_not_no_longer_raises_through_a_container_alias_2476() -> Result<()> {
 
     Ok(())
 }
+
+/// #2476: `//` over the same alias fan-out `and`/`or`/`not` were fixed
+/// against. Like `not`, `Expr::Alternative` had no native arm in
+/// `eval_single` at all -- and so no `needs_path_context` gate to lose --
+/// which meant every `//` fell to the wildcard bridge and paid its `O(2^N)`
+/// ambient materialization before either operand ran. `(false // 1)` is the
+/// row that makes that concrete: it reads nothing, and it still took as long
+/// as `(.a22 // 1)` did.
+///
+/// Asserts completion and the correct value, not a wall-clock bound -- same
+/// rationale as `test_not_over_alias_fanout_completes_2476` above (a
+/// regression hangs the suite rather than failing an assert). N=22 here for
+/// the same reason it is 22 there; the release binary at N=24 went from 40.5s
+/// to 0.73s on an Apple M-series.
+#[test]
+fn test_alternative_over_alias_fanout_completes_2476() -> Result<()> {
+    let mut doc = String::from("a0: &a0 leaf\n");
+    for i in 1..=22 {
+        doc.push_str(&format!("a{i}: &a{i} [*a{}, *a{}]\n", i - 1, i - 1));
+    }
+
+    for (filter, want) in [
+        // The fan-out itself is truthy, so `1` never answers; `length` then
+        // reads the two-element array through the cursor `//` handed on.
+        ("(.a22 // 1) | length", "2"),
+        // Same filter without the parens -- `//` binds tighter than `|`.
+        (".a22 // 1 | length", "2"),
+        // An absent left output falls through to the right...
+        ("(.missing // 1)", "1"),
+        // ...as does a falsy one that reads nothing at all. This row paid
+        // the full fan-out before this change.
+        ("(false // 1)", "1"),
+        // A truthy scalar answers for itself.
+        ("(.a0 // 1)", "leaf"),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, &doc, &[])?;
+        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), want, "`{filter}` -- stderr: {stderr:?}");
+    }
+
+    Ok(())
+}
+
+/// #2476: the native `//` arm hands the left's surviving outputs -- and the
+/// right's, when the left had none -- straight through as
+/// `OneCursor`/`ManyCursor`, where the bridge used to materialize them into
+/// an `OwnedValue` first. In yq mode that is a fidelity gain, not just a
+/// speedup: everything the cursor carries survives.
+///
+/// Captured live from yq v4.53.3 on this exact document: `.a // .b` prints
+/// `&x {c: 1, d: 2} # trailing` -- anchor, flow style and trailing comment
+/// all intact. succinctly printed an expanded block mapping (`c: 1` / `d: 2`,
+/// no anchor, no comment) before this change and prints yq's line
+/// byte-for-byte after it, so this moves toward the oracle. The `.b` row
+/// asserts the reason: `//` gains nothing of its own here, it simply stops
+/// destroying what a bare `.b` already produced.
+#[test]
+fn test_alternative_keeps_the_cursor_it_hands_on_2476() -> Result<()> {
+    let doc = "a: null\nb: &x {c: 1, d: 2} # trailing\n";
+    let want = "&x {c: 1, d: 2} # trailing";
+
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(".a // .b", doc, &[])?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), want, "stderr: {stderr:?}");
+
+    // The same bytes a bare `.b` gives -- `//` is now transparent to it.
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(".b", doc, &[])?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), want, "stderr: {stderr:?}");
+
+    // And the surviving *left* output is cursor-backed too, not only the
+    // fallback: here `.b` is truthy, so it answers from the left position.
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(".b // 1", doc, &[])?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), want, "stderr: {stderr:?}");
+
+    Ok(())
+}
+
+/// #2476's second fidelity gain from the native `//` arm, and the one that
+/// changes an *answer* rather than a rendering: an operand that reads the
+/// ambient position now reads the real one.
+///
+/// While `//` bridged, both operands were handed to the eager evaluator
+/// against a document re-rooted at this stage's input, so `key`/`parent`
+/// resolved to nothing there -- and since "nothing" is not truthy, `//`
+/// substituted the right side for it. Evaluating the left through
+/// `eval_single` *with the cursor* is what fixes this: it reaches the same
+/// `Expr::Builtin(Builtin::Key)`/`Builtin::Parent` arms `key` alone already
+/// used. Every row below was captured live from yq v4.53.3 and is what
+/// succinctly now prints; the "before" column is recorded here because it was
+/// silently wrong rather than an error:
+///
+/// | filter                    | yq v4.53.3        | before  |
+/// |---------------------------|-------------------|---------|
+/// | `.a \| (key // 1)`        | `a`               | `1`     |
+/// | `.a.b \| (key // "x")`    | `b`               | `x`     |
+/// | `.a \| (parent // 1)`     | `a: {b: 1, e: 2}` | `1`     |
+/// | `.a \| (.missing // key)` | `a`               | (empty) |
+///
+/// One shape this does *not* reach, unchanged in either direction:
+/// `.a | to_entries | .[] | (key // 99)` is `0`, `1` in yq and `99`, `99`
+/// here, before and after. `needs_path_context` has no `Expr::Alternative`
+/// arm at all (it falls to that function's `_ => false`), so a pipe whose
+/// only path-context read is inside a `//` is never routed to path-context
+/// evaluation, and `to_entries` has already left the cursor domain by then.
+/// That is #715/#1405's recursion list, not this arm's, and deliberately not
+/// touched here -- #2416 pins that table.
+#[test]
+fn test_alternative_operands_read_the_real_position_2476() -> Result<()> {
+    let doc = "a: {b: 1, e: 2}\n";
+
+    for (filter, want) in [
+        (".a | (key // 1)", "a"),
+        (".a.b | (key // \"x\")", "b"),
+        (".a | (parent // 1)", "a: {b: 1, e: 2}"),
+        // `key` on the *right* side answers too: `.missing` is absent, so
+        // the fallback runs, and it runs at the same position.
+        (".a | (.missing // key)", "a"),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &[])?;
+        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), want, "`{filter}` -- stderr: {stderr:?}");
+    }
+
+    Ok(())
+}
+
+/// #2476's `//` sibling of
+/// `test_not_no_longer_raises_through_a_container_alias_2476` just above.
+/// The native arm's `ambient_validation_error` call is
+/// `push_generic_document_validation_error`, and since #1804 that walk does
+/// not descend into a container reached through an alias -- the short-circuit
+/// that makes it `O(N)` where the bridge is `O(2^N)`. So `//` inherits the
+/// identical accepted trade-off: a decode failure reachable *only* through a
+/// container-target alias no longer raises from a `//` standing at that alias
+/// position.
+///
+/// Everything that actually reads the value still raises: the anchor itself,
+/// materializing through the alias, and the scalar-target sibling (#1804
+/// scoped its short-circuit to containers, since resolving a scalar alias is
+/// O(1) and never part of the fan-out). Real yq rejects both documents at
+/// parse time (confirmed live against v4.53.3), so there is no yq behaviour
+/// to match either way.
+#[test]
+fn test_alternative_no_longer_raises_through_a_container_alias_2476() -> Result<()> {
+    let doc = "a: &a [\"bad\\qc\"]\nb: *a\n";
+
+    // The alias position: the walk stops at the alias, so the array is
+    // truthy and answers for itself. This is the row that changed (exit 1
+    // before, exit 0 now).
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(".b | (. // 1) | length", doc, &[])?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), "1", "stderr: {stderr:?}");
+
+    // Visiting the anchor itself still raises.
+    let (_, stderr, code) = run_yq_stdin_with_stderr(".a | (. // 1)", doc, &[])?;
+    assert_ne!(code, 0, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("invalid escape sequence"),
+        "stderr: {stderr}"
+    );
+
+    // Materializing through the alias still raises.
+    let (_, stderr, code) = run_yq_stdin_with_stderr(".b[0]", doc, &[])?;
+    assert_ne!(code, 0, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("invalid escape sequence"),
+        "stderr: {stderr}"
+    );
+
+    // The scalar-alias sibling: `.b`'s target is a bare scalar, not a
+    // container, so #1804's short-circuit does not apply and `//` still
+    // raises there.
+    let scalar_doc = "a: &a \"bad\\qc\"\nb: *a\n";
+    let (_, stderr, code) = run_yq_stdin_with_stderr(".b | (. // 1)", scalar_doc, &[])?;
+    assert_ne!(code, 0, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("invalid escape sequence"),
+        "stderr: {stderr}"
+    );
+
+    Ok(())
+}
