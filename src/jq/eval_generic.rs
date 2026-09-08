@@ -74,7 +74,7 @@ use super::eval::{
 use super::expr::FuncDefBound;
 use super::expr::{
     AssignOp, BoundBody, Builtin, CompareOp, Expr, FormatType, FuncDefData, Literal, NumberKey,
-    ObjectEntry, ObjectKey, Pattern, StringPart,
+    ObjectEntry, ObjectKey, Pattern, StringPart, Tracked,
 };
 use super::slice::{literal_component_from_values, slice_str, SliceBounds};
 use super::value::{owned_value_eq, NumberRepr, OwnedValue};
@@ -13328,8 +13328,8 @@ fn path_context_step_computed_slice<S: EvalSemantics, V: DocumentValue>(
         for e in &ends {
             let slice = Expr::SliceExpr {
                 target: Box::new(Expr::Identity),
-                start: Some(Box::new(Expr::TrackedVar(Rc::new(s.clone())))),
-                end: Some(Box::new(Expr::TrackedVar(Rc::new(e.clone())))),
+                start: Some(Box::new(Expr::TrackedVar(Tracked::snapshot(s.clone())))),
+                end: Some(Box::new(Expr::TrackedVar(Tracked::snapshot(e.clone())))),
             };
             let slice = if bracket_optional {
                 Expr::Optional(Box::new(slice))
@@ -13635,7 +13635,7 @@ fn path_context_step_getpath<S: EvalSemantics, V: DocumentValue>(
                             PathNode::Owned(v) => Rc::clone(v),
                         };
                         let segment = Expr::Builtin(Builtin::GetPath(Box::new(Expr::TrackedVar(
-                            Rc::new(OwnedValue::Array(vec![component.clone()])),
+                            Tracked::snapshot(OwnedValue::Array(vec![component.clone()])),
                         ))));
                         let (values, control) = owned_identity_values::<S>(&segment, &value, false);
                         path_context_push_owned_children(
@@ -15909,7 +15909,7 @@ fn path_context_resolve_constants<S: EvalSemantics>(
 fn prefetched_literal(values: Vec<OwnedValue>) -> Expr {
     let mut values: Vec<Expr> = values
         .into_iter()
-        .map(|v| Expr::TrackedVar(Rc::new(v)))
+        .map(|v| Expr::TrackedVar(Tracked::snapshot(v)))
         .collect();
     match values.len() {
         0 => Expr::Builtin(Builtin::Empty),
@@ -15933,7 +15933,7 @@ fn path_context_resolve_parent(at: &PathContextAt<'_>, n: usize) -> Result<Expr,
         return Ok(Expr::Builtin(Builtin::Empty));
     };
     Ok(match parent_of(n)? {
-        Some(v) => Expr::TrackedVar(Rc::new(v)),
+        Some(v) => Expr::TrackedVar(Tracked::snapshot(v)),
         None => Expr::Builtin(Builtin::Empty),
     })
 }
@@ -18918,7 +18918,7 @@ fn owned_identity_operand<S: EvalSemantics, V: DocumentValue>(
     // A value the rewrite spelled in place (spine 2416, identity pass): a
     // literal like any other, with no position of its own.
     if let Expr::TrackedVar(v) = expr {
-        return Ok(Some(((**v).clone(), OwnedIdentity::detached())));
+        return Ok(Some((v.value.clone(), OwnedIdentity::detached())));
     }
     // spine 2416 (identity pass): an operand outside the navigation grammar
     // -- `parent`, `(parent | length)`, `(key | tostring)` -- is run through
