@@ -363,9 +363,9 @@ impl EvalSemantics for YqSemantics {
 use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
 
 use super::expr::{
-    ArithOp, AssignOp, BoundBody, Builtin, CompareOp, Expr, FormatType, FuncDefBound, FuncDefData,
-    Literal, MergeFlags, NumberKey, ObjectEntry, ObjectKey, Origin, Param, Pattern, StringPart,
-    Tracked,
+    ArithOp, AssignOp, BindOrigin, BoundBody, Builtin, CompareOp, Expr, FormatType, FuncDefBound,
+    FuncDefData, Literal, MergeFlags, NumberKey, ObjectEntry, ObjectKey, Origin, Param, Pattern,
+    StringPart, Tracked,
 };
 use super::value::{
     assert_value_tree_depth, cmp_f64, infinite_float_preview_text, is_infinity_sentinel,
@@ -24758,12 +24758,16 @@ impl Frame {
     /// Whether a marker with `origin` names exactly this frame's position.
     /// A [`Origin::Snapshot`] marker carries no position and is always
     /// admitted here -- its own rule (value equality) is the caller's.
+    /// [`Origin::Untracked`] (#2072: a navigated bind made outside any
+    /// resolver invocation) never certifies -- there is no invocation for it
+    /// to have been made in.
     fn certifies(&self, origin: &Origin) -> bool {
         match origin {
             Origin::Snapshot => true,
             Origin::At { invocation, path } => {
                 *invocation == self.invocation && self.at.as_ref().is_some_and(|at| *at == path.0)
             }
+            Origin::Untracked => false,
         }
     }
 }
@@ -26096,7 +26100,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             let (bound_values, trailing) =
                 resolve_bind_source::<S>(expr, body, var, value, trackable, frame);
             for (bound, origin) in bound_values {
-                let substituted = substitute_bound_var_at(expr, body, var, &bound, origin);
+                let substituted = substitute_bound_var_at(expr, body, var, &bound, origin, None);
                 match resolve_node_sink::<S>(
                     &substituted,
                     value,
@@ -26644,6 +26648,10 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
         // since `.a` and `.c` can hold equal values and jq refuses
         // `path(.a as $y | .c | $y)`. A `Origin::Snapshot` marker keeps the
         // value rule above (`Frame::certifies` admits it unconditionally).
+        // `Origin::Untracked` (#2072: a navigated binding wrapped only for
+        // the cursor routes' sake, made outside any resolver invocation)
+        // never certifies, so this refuses exactly as it did before #2072
+        // gave every `as` binding a `TrackedVar` wrapper.
         Expr::TrackedVar(marker) => {
             if trackable && marker.value == *value && frame.certifies(&marker.origin) {
                 Ok(vec![PathBranch::new(
@@ -31859,7 +31867,7 @@ fn substitute_var(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr
 /// ambient position, so wrapping here is a necessary but not sufficient
 /// condition for the substituted variable to end up trackable (#844).
 fn substitute_var_tracked(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr {
-    let marker = LazyMarker::new(replacement, Origin::Snapshot);
+    let marker = LazyMarker::new(replacement, Origin::Snapshot, None);
     substitute_var_impl(expr, var_name, replacement, Some(&marker))
 }
 
@@ -31870,17 +31878,24 @@ fn substitute_var_tracked(expr: &Expr, var_name: &str, replacement: &OwnedValue)
 /// common `|=` target shape) is not cloned at all, which an eagerly built
 /// marker cost +2.9 pp of instructions on `(.users[] | . as $r | .score)
 /// |= 1`.
+///
+/// `node` is the #2072 cursor-identity witness, carried alongside `origin`
+/// (the #2042 path()-register witness) rather than folded into it -- a
+/// binding can know its document node with no resolver invocation to
+/// certify `origin` against, and vice versa (see [`Origin::Untracked`]).
 struct LazyMarker<'a> {
     value: &'a OwnedValue,
     origin: Origin,
+    node: Option<BindOrigin>,
     built: core::cell::OnceCell<Rc<Tracked>>,
 }
 
 impl<'a> LazyMarker<'a> {
-    fn new(value: &'a OwnedValue, origin: Origin) -> Self {
+    fn new(value: &'a OwnedValue, origin: Origin, node: Option<BindOrigin>) -> Self {
         Self {
             value,
             origin,
+            node,
             built: core::cell::OnceCell::new(),
         }
     }
@@ -31890,6 +31905,7 @@ impl<'a> LazyMarker<'a> {
             Rc::new(Tracked {
                 value: self.value.clone(),
                 origin: self.origin.clone(),
+                node: self.node.clone(),
             })
         }))
     }
@@ -31914,28 +31930,56 @@ pub(crate) fn substitute_bound_var(
     var_name: &str,
     bound: &OwnedValue,
 ) -> Expr {
-    substitute_bound_var_at(bind_expr, body, var_name, bound, None)
+    substitute_bound_var_at(bind_expr, body, var_name, bound, None, None)
 }
 
-/// [`substitute_bound_var`] with the #2042 witness: a binding whose source
-/// resolved to a navigated position (`origin` from [`resolve_bind_source`])
-/// gets an `Origin::At` marker; an identity passthrough keeps its
-/// `Origin::Snapshot` one; anything else is substituted as a plain value.
+/// [`substitute_bound_var`] for a binding site that knows the document node
+/// or owned-tree position the value was bound from (#2072), read by the
+/// cursor routes (`key`/`path`/`parent`/`line`/`column`/`file_index`, YAML
+/// anchor and style marks) rather than by `resolve_node`. Without one this
+/// is `substitute_bound_var`.
+#[allow(dead_code)] // consumed by the bind sites in the next commit (#2072 step 3)
+pub(crate) fn substitute_bound_var_from(
+    bind_expr: &Expr,
+    body: &Expr,
+    var_name: &str,
+    bound: &OwnedValue,
+    node: Option<BindOrigin>,
+) -> Expr {
+    substitute_bound_var_at(bind_expr, body, var_name, bound, None, node)
+}
+
+/// [`substitute_bound_var`]/[`substitute_bound_var_from`]'s shared core.
+///
+/// An identity passthrough always gets `Origin::Snapshot`, `origin`
+/// notwithstanding -- the #844 value-equality rule applies regardless of
+/// what a navigated sibling binding would have gotten. Otherwise an
+/// explicit `origin` (the #2042 witness: a navigated source resolved
+/// *inside* a `path()`/`del()`/assignment invocation, from
+/// [`resolve_bind_source`]) is kept as-is. With neither but a `node` (the
+/// #2072 witness: a navigated source outside any resolver invocation), the
+/// marker is `Origin::Untracked` -- carried for the cursor routes only,
+/// never certified by `resolve_node`. With none of the three this is a
+/// plain, unwrapped literal substitution, same as `substitute_var`.
 fn substitute_bound_var_at(
     bind_expr: &Expr,
     body: &Expr,
     var_name: &str,
     bound: &OwnedValue,
     origin: Option<Origin>,
+    node: Option<BindOrigin>,
 ) -> Expr {
-    if is_identity_passthrough(bind_expr) {
-        substitute_var_tracked(body, var_name, bound)
+    let origin = if is_identity_passthrough(bind_expr) {
+        Origin::Snapshot
     } else if let Some(origin) = origin {
-        let marker = LazyMarker::new(bound, origin);
-        substitute_var_impl(body, var_name, bound, Some(&marker))
+        origin
+    } else if node.is_some() {
+        Origin::Untracked
     } else {
-        substitute_var(body, var_name, bound)
-    }
+        return substitute_var(body, var_name, bound);
+    };
+    let marker = LazyMarker::new(bound, origin, node);
+    substitute_var_impl(body, var_name, bound, Some(&marker))
 }
 
 /// Substitute a variable in an expression with a value.
@@ -52851,7 +52895,7 @@ mod tests {
             let parsed = parse(src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
             for origin in &origins {
                 for bound in &values {
-                    let marker = LazyMarker::new(bound, origin.clone());
+                    let marker = LazyMarker::new(bound, origin.clone(), None);
                     let expr = substitute_var_impl(&parsed, "y", bound, Some(&marker));
                     assert!(
                         is_owned_pure_expr(&expr),
@@ -81188,6 +81232,94 @@ mod tests {
                 var_reaches_path_position(&expr, "y"),
                 "{src:?} should take the witness"
             );
+        }
+    }
+
+    /// #2072 step 2: a binding that knows the node it was bound from splices
+    /// one shared `Expr::TrackedVar` carrying it (`Tracked::node`), but that
+    /// node is for the cursor routes only. Here in the `path()` resolver the
+    /// payload's `origin` -- `Origin::Snapshot` iff `is_identity_passthrough`
+    /// of the bind source, the same gate as before -- is what decides, so a
+    /// *navigated* binding gets `Origin::Untracked` and resolves exactly like
+    /// the literal it used to be spliced as (refuses, as
+    /// `test_path_navigated_binding_still_refused_pending_gate_1573` pins
+    /// against jq 1.7.1) and only a passthrough snapshot is certified against
+    /// the ambient position. #2042's `Origin::At` is the resolver's own
+    /// bind-time path witness, made only inside a resolver invocation
+    /// (`resolve_bind_source`); this test is what keeps the #1466 class
+    /// closed for a binding made outside one.
+    #[test]
+    fn test_origin_bearing_binding_keeps_the_resolver_contract_2072() {
+        let doc = br#"{"a":{"b":1},"c":{"b":1}}"#;
+        let inner = OwnedValue::object_from([("b".to_string(), OwnedValue::Int(1))]);
+        let root = OwnedValue::object_from([
+            ("a".to_string(), inner.clone()),
+            ("c".to_string(), inner.clone()),
+        ]);
+        let body = parse("$y").unwrap();
+        let node = BindOrigin::Node {
+            node: 3,
+            document: 7,
+        };
+
+        // Shape: navigated bind source -> Origin::Untracked, node kept.
+        let navigated = substitute_bound_var_from(
+            &parse(".a").unwrap(),
+            &body,
+            "y",
+            &inner,
+            Some(node.clone()),
+        );
+        let Expr::TrackedVar(var) = &navigated else {
+            panic!("expected a TrackedVar, got {navigated:?}");
+        };
+        assert_eq!(var.origin, Origin::Untracked);
+        assert_eq!(var.node, Some(node.clone()));
+        assert_eq!(var.value, inner);
+        assert!(!is_identity_passthrough(&navigated));
+
+        // Shape: passthrough bind source -> Origin::Snapshot, node kept.
+        let passthrough =
+            substitute_bound_var_from(&parse(".").unwrap(), &body, "y", &root, Some(node.clone()));
+        let Expr::TrackedVar(var) = &passthrough else {
+            panic!("expected a TrackedVar, got {passthrough:?}");
+        };
+        assert_eq!(var.origin, Origin::Snapshot);
+        assert_eq!(var.node, Some(node));
+        assert!(is_identity_passthrough(&passthrough));
+
+        // Shape: no node -> today's spelling, a literal AST.
+        let literal = substitute_bound_var_from(&parse(".a").unwrap(), &body, "y", &inner, None);
+        assert!(matches!(literal, Expr::Object(_)), "got {literal:?}");
+
+        // Resolver: `path(<var>)` with the ambient input equal to the value.
+        let index = JsonIndex::build(doc);
+        let path_of = |var: Expr| {
+            let cursor = index.root(doc);
+            let expr = Expr::Builtin(Builtin::Path(Box::new(var)));
+            eval::<Vec<u64>, JqSemantics>(&expr, cursor)
+        };
+        // A tracked root snapshot certifies against the root: `path(. as $x
+        // | $x)` is `[]` in jq 1.7.1.
+        match path_of(passthrough) {
+            QueryResult::Owned(OwnedValue::Array(path)) => assert!(path.is_empty()),
+            other => panic!("expected [], got {other:?}"),
+        }
+        // The same value, untracked, is a literal to the resolver whatever
+        // node it carries -- refused, not certified by value equality.
+        let untracked_root = substitute_bound_var_from(
+            &parse(".a").unwrap(),
+            &body,
+            "y",
+            &root,
+            Some(BindOrigin::Node {
+                node: 0,
+                document: 7,
+            }),
+        );
+        match path_of(untracked_root) {
+            QueryResult::Error(e) => assert!(e.is_invalid_path_expression()),
+            other => panic!("expected a refusal, got {other:?}"),
         }
     }
 

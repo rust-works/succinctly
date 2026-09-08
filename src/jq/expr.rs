@@ -77,7 +77,7 @@ impl Param {
 }
 
 /// The payload of an [`Expr::TrackedVar`] marker: the frozen value and
-/// where it was bound (#2042).
+/// where it was bound (#2042, #2072).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tracked {
     /// The bound value, frozen at bind time.
@@ -85,6 +85,16 @@ pub struct Tracked {
     /// How `resolve_node` may certify this snapshot against the path
     /// register -- see [`Origin`].
     pub origin: Origin,
+    /// The document node or owned-tree position the value was bound from,
+    /// when the binding site could tell (#2072). Read by the cursor routes
+    /// (`key`/`path`/`parent`/`line`/`column`/`file_index`, YAML anchor and
+    /// style marks) so a bound variable answers them the way real yq's
+    /// node-backed variables do -- never by `resolve_node`, which reads
+    /// `origin` above instead. The two are independent: a binding can carry
+    /// a `node` with no `Origin::At` at all, since only a bind made *inside*
+    /// a `path()`/`del()`/assignment resolution has a resolver invocation to
+    /// certify against (see [`Origin::Untracked`]).
+    pub node: Option<BindOrigin>,
 }
 
 /// How an [`Expr::TrackedVar`] snapshot may be recognised in path position
@@ -93,7 +103,7 @@ pub struct Tracked {
 /// jq's own rule is `jv_identical`: a `$var` is usable where the path
 /// register currently points exactly when its value *is* the very same
 /// node the register holds. `OwnedValue` has no node identity, so the
-/// resolver models it two ways:
+/// resolver models it three ways:
 ///
 /// - [`Origin::Snapshot`] -- the #844/#1466 witness: the value was frozen
 ///   from `.` itself (an identity-passthrough binding) or from a fold's
@@ -103,19 +113,28 @@ pub struct Tracked {
 ///   its own proper descendants guarantees (a finite tree cannot contain
 ///   itself) -- see #2642 for the rebuilt-copy hole this still has.
 /// - [`Origin::At`] -- the #2042 witness for a binding whose source
-///   *navigated*: the resolver invocation the binding happened in, and the
-///   absolute path (within that invocation) the source resolved to. In a
-///   tree, two nodes are the same node iff they sit at the same path, so
-///   the marker is certified only where the register's own absolute path
-///   equals `path` *and* the invocation matches -- a nested `path()` call
-///   is a second invocation with its own root, and a path from one is
-///   meaningless in the other.
+///   *navigated*, made inside a `path()`/`del()`/assignment resolution: the
+///   resolver invocation the binding happened in, and the absolute path
+///   (within that invocation) the source resolved to. In a tree, two nodes
+///   are the same node iff they sit at the same path, so the marker is
+///   certified only where the register's own absolute path equals `path`
+///   *and* the invocation matches -- a nested `path()` call is a second
+///   invocation with its own root, and a path from one is meaningless in
+///   the other.
+/// - [`Origin::Untracked`] -- the #2072 witness for a binding whose source
+///   navigated, made *outside* any resolver invocation (an ordinary `as`
+///   binding, not one syntactically inside `path()`'s argument): there is
+///   no invocation to certify against, so this marker always refuses,
+///   exactly as an un-wrapped literal did before #2072 gave every `as`
+///   binding a `TrackedVar` wrapper so its `Tracked::node` could carry
+///   cursor identity. `path(.a as $y | .c | $y)` still refuses, matching jq.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Origin {
     /// Frozen from the ambient input itself; certified by value equality
     /// (the pre-#2042 rule, unchanged).
     Snapshot,
-    /// Frozen from a navigated position; certified by node identity.
+    /// Frozen from a navigated position inside a resolver invocation;
+    /// certified by node identity.
     At {
         /// The resolver invocation (one `path()`/`del()`/assignment target
         /// resolution) the binding was made in.
@@ -123,6 +142,9 @@ pub enum Origin {
         /// The bound node's absolute path within that invocation.
         path: super::eval::BindPath,
     },
+    /// Frozen from a navigated position outside any resolver invocation
+    /// (#2072); never certified.
+    Untracked,
 }
 
 impl Tracked {
@@ -132,8 +154,37 @@ impl Tracked {
         Rc::new(Self {
             value,
             origin: Origin::Snapshot,
+            node: None,
         })
     }
+}
+
+/// Where an `as`-bound value came from, when the binding could tell (#2072).
+///
+/// Real yq's variables hold *nodes* -- parent pointers, anchors and style
+/// included -- so a bare `$x` later in the pipe still knows where it came
+/// from. succinctly substitutes the bound *value* into the body, and an
+/// `Expr` outlives the document borrow, so a cursor cannot ride along: what
+/// can is this `'static` description of the node, re-resolved to a live
+/// cursor at the point of use (`DocumentCursor::at_node_id`) and applied
+/// only to a cursor of the same document (`DocumentCursor::document_token`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum BindOrigin {
+    /// A document node: its `DocumentCursor::node_id` and the
+    /// `document_token` of the document it belongs to.
+    Node { node: usize, document: usize },
+    /// A value inside an owned tree (ADR-0021 decision 7): the document node
+    /// whose position the owned root inherited, if any, and the chain of
+    /// owned ancestors descended through to reach the value -- each with the
+    /// component taken -- exactly as `OwnedIdentity` holds them.
+    Owned {
+        base: Option<(usize, usize)>,
+        chain: Vec<(Rc<OwnedValue>, OwnedValue)>,
+        /// The value *is* an emitted `key` (#2471): a second `key` on it
+        /// emits nothing, so the flag has to survive the binding
+        /// (`.a.b | key as $x | $x | key` prints nothing in yq v4.53.3).
+        key_node: bool,
+    },
 }
 
 /// A jq expression representing a query path.
@@ -402,6 +453,11 @@ pub enum Expr {
     /// holding equal values must not be confused (`path(.a as $y | .c |
     /// $y)` refuses in jq). Still one `Rc` wide, so `size_of::<Expr>()`
     /// does not move.
+    ///
+    /// The payload also carries the document node or owned-tree position
+    /// the value was bound from, when the binding site could tell
+    /// (`Tracked::node`, #2072) -- read by the cursor routes, independent
+    /// of whether `origin` certifies against `path()`'s register.
     TrackedVar(Rc<Tracked>),
 
     /// Location reference: `$__loc__`
@@ -1728,6 +1784,14 @@ pub enum Literal {
 }
 
 impl Expr {
+    /// Spell an arbitrary value in place as a passthrough snapshot with no
+    /// bound node -- the one node that can hold a value no literal syntax
+    /// spells (a `NumberLiteral` with its own text, a value above the
+    /// reindex cap).
+    pub fn tracked_value(value: OwnedValue) -> Self {
+        Self::TrackedVar(Tracked::snapshot(value))
+    }
+
     /// Whether this is a static slice path component.
     ///
     /// One definition for the callers that only need "is this a slice", so
