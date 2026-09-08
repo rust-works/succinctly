@@ -5308,6 +5308,27 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let mut acc = Vec::new();
             each_object_entries::<W, S>(entries, value, optional, &mut acc, sink)
         }
+        // #2180 WP3. No `needs_path_context` gate, for the same reason
+        // `eval_single`'s own `Expr::Foreach` arm has none: a query that
+        // reads path context anywhere never reaches this evaluator at all
+        // (`eval` routes the whole thing to `eval_generic.rs` up front), so
+        // there is no diversion here to preserve.
+        Expr::Foreach {
+            input,
+            patterns,
+            init,
+            update,
+            extract,
+        } => each_foreach::<W, S>(
+            input,
+            patterns,
+            init,
+            update,
+            extract.as_deref(),
+            value,
+            optional,
+            sink,
+        ),
 
         _ => drain_result(eval_single::<W, S>(expr, value, optional), sink),
     }
@@ -34936,11 +34957,28 @@ pub(crate) fn is_retryable_stop(is_last: bool) -> bool {
 /// alternative, still propagate immediately -- unretryable, same as
 /// UPDATE's own rule.
 ///
-/// Appends every EXTRACT (or bare UPDATE, when EXTRACT is absent) output
-/// straight into `outputs` (mirroring `eval_foreach`'s own "the steps
-/// already produced don't vanish", #494) and charges `budget` once per
-/// UPDATE bind attempted plus once per EXTRACT call, matching the
+/// Pushes every EXTRACT (or bare UPDATE, when EXTRACT is absent) output
+/// straight into `sink` as it is produced (mirroring `eval_foreach`'s own
+/// "the steps already produced don't vanish", #494) and charges `budget`
+/// once per UPDATE bind attempted plus once per EXTRACT call, matching the
 /// pre-#1365 accounting.
+///
+/// `sink` is a `Demand`-answering sink rather than the `&mut
+/// Vec<OwnedValue>` it was before #2180 WP3, and that is the whole of this
+/// function's share of that fix. [`eval_foreach_with_values`] passes a
+/// collecting sink that never stops, so its behaviour is unchanged;
+/// [`each_foreach`] passes the wrapping consumer's own sink, and a
+/// [`Demand::Stop`] coming back out of it is then treated *exactly* as an
+/// escaping `Control::Break` is at the same position -- retry the next
+/// `?//` alternative ([`is_retryable_stop`], the sibling of
+/// [`is_retryable_control`]) **with the state threaded through**, which is
+/// why `[first(foreach (1) as $x ?// $y (0;.+1;.), "z")]` is `[1,2]` in jq
+/// 1.7.1 and not `[1,1]`: the retried alternative's UPDATE runs on the
+/// already-updated accumulator. `Flow::Stopped` and an escaping `break` are
+/// the same event in different clothes (#1519), so a rule stated for one
+/// holds for the other; every row this function's stop arms were written
+/// against was captured live, and none of them needed the two rules to
+/// differ.
 ///
 /// Takes each alternative already destructured and substituted
 /// (`substituted_steps`, one `(UPDATE, EXTRACT)` pair per pattern, `Err`
@@ -34949,15 +34987,44 @@ pub(crate) fn is_retryable_stop(is_last: bool) -> bool {
 /// [`try_reduce_step_alternatives`]'s own matrix parameter: this is
 /// independent of any accumulator/INIT fork, so the caller hoists it once
 /// per input element outside the INIT-fork loop (#695).
-type ForeachStepAlternative = Result<(Expr, Option<Expr>), EvalError>;
+pub(crate) type ForeachStepAlternative = Result<(Expr, Option<Expr>), EvalError>;
+
+/// [`foreach_fork`]'s per-element callback: one already-substituted source
+/// row in, the fold's demand for another one out. Spelled including its own
+/// `&mut` so the trait object's lifetime stays tied to the reference's, the
+/// way the unaliased `&mut dyn FnMut(..)` it replaces already did -- split
+/// into two independent lifetimes, a source strategy closure stops being
+/// higher-ranked enough to pass.
+pub(crate) type ForeachRowSink<'a> = &'a mut dyn FnMut(&[ForeachStepAlternative]) -> Demand;
+
+/// How one `foreach` step ended, when it did not simply run to completion
+/// (#2180 WP3) -- the return of [`try_foreach_step_alternatives`], widened
+/// from a bare `Option<Control>` so a consumer's satisfaction and a real
+/// escape stay structurally distinct.
+///
+/// Kept as an enum for the reason [`Flow`]'s own doc comment gives for not
+/// being `(bool, Option<Control>)`: "escaped" and "the consumer said stop"
+/// are answered differently by every caller, so the wrong one must not be
+/// writable by accident. [`eval_foreach_with_values`] can only ever observe
+/// `Escaped` -- its sink collects and never stops -- while [`each_foreach`]
+/// observes both.
+pub(crate) enum ForeachStepEnd {
+    /// A control escaped UPDATE or EXTRACT (or the budget ran out, or the
+    /// last alternative's pattern failed to match) and no remaining `?//`
+    /// alternative was allowed to retry it ([`is_retryable_control`]).
+    Escaped(Control),
+    /// The consumer's sink answered [`Demand::Stop`] and no remaining `?//`
+    /// alternative was allowed to retry it ([`is_retryable_stop`]).
+    Stopped,
+}
 
 fn try_foreach_step_alternatives<S: EvalSemantics>(
     substituted_steps: &[ForeachStepAlternative],
     state_input: OwnedValue,
     optional: bool,
     budget: &mut usize,
-    outputs: &mut Vec<OwnedValue>,
-) -> (OwnedValue, Option<Control>) {
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> (OwnedValue, Option<ForeachStepEnd>) {
     let last_idx = substituted_steps.len() - 1;
     let mut state = state_input;
 
@@ -34968,14 +35035,17 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
             Ok(pair) => pair,
             Err(e) => {
                 if is_last {
-                    return (state, Some(Control::Error(e.clone())));
+                    return (
+                        state,
+                        Some(ForeachStepEnd::Escaped(Control::Error(e.clone()))),
+                    );
                 }
                 continue;
             }
         };
 
         if let Some(control) = charge_budget(budget, "foreach") {
-            return (state, Some(control));
+            return (state, Some(ForeachStepEnd::Escaped(control)));
         }
 
         // #2157: `state` is fed into `fold_step_via_accumulator_or_fork` by
@@ -35018,19 +35088,57 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                 if let Some(control) = charge_budget(budget, "foreach") {
                     // `state` was already moved into `fold_step_via_accumulator_or_fork`
                     // above and not yet reassigned (that happens after this
-                    // loop) -- `Null` stands in for it here since the caller
-                    // discards whatever `state` a `Some(control)` return
-                    // carries once it aborts the fold (confirmed at this
-                    // function's own call site: `state = new_state;` runs,
-                    // but `state` is never read again once `step_control`
-                    // is `Some`, the fork just `break`s).
-                    return (OwnedValue::Null, Some(control));
+                    // loop), so the accumulator this step is standing on is
+                    // `update_val` -- which is also the state a `?//` retry
+                    // at this same position would resume from (#1458). The
+                    // eager caller discards it (it aborts the fold), but the
+                    // lazy one can be re-entered by a `?//` retry in the
+                    // *source* generator after this return, and then it is
+                    // the register jq's own fold would still be holding
+                    // (#2180 WP3).
+                    return (update_val.clone(), Some(ForeachStepEnd::Escaped(control)));
                 }
-                let (ext_vals, ext_control) =
-                    eval_owned_expr_fork::<S>(ext_expr, update_val, optional);
-                outputs.extend(ext_vals);
-                match ext_control {
-                    None => {}
+                // #2180 WP3: EXTRACT is *driven* through the demand-forwarding
+                // [`eval_each_owned`] rather than collected by
+                // `eval_owned_expr_fork` and spliced in afterwards, so a
+                // wrapping consumer's [`Demand::Stop`] reaches EXTRACT's own
+                // generator -- and, with it, any `?//` bind inside it.
+                // Live against jq 1.7.1, input `1`:
+                // `[first(foreach (1) as $x ?// $y (0; .+1; (1 as $a ?// $b |
+                // .)))]` is `[1,1,2,2]` (EXTRACT's own chain answers twice per
+                // foreach alternative), and
+                // `first(foreach (1) as $x (0; .+1; ., ("E"|stderr)))` writes
+                // nothing to stderr -- both were `[1]` and a leaked `E` while
+                // this call collected first and pushed afterwards.
+                //
+                // The outputs still reach the consumer before this step's own
+                // terminator does, which is what `outputs.extend(..)` before
+                // reading `ext_control` used to encode positionally (#494):
+                // here they are simply already pushed by the time the `Flow`
+                // is inspected.
+                let ext_flow = eval_each_owned::<S>(ext_expr, update_val, optional, sink);
+                match ext_flow {
+                    Flow::Exhausted => {}
+                    // The stop is jq's escaping `break` in different clothes,
+                    // so it takes `Control::Break`'s own rule at this exact
+                    // position -- retry the next alternative, seeded with the
+                    // failed EXTRACT call's own input, not a fresh state
+                    // ([`is_retryable_stop`], the arm below, and #1519's
+                    // lesson). That is why
+                    // `[first(foreach (1) as $x ?// $y (0;.+1;.), "z")]` is
+                    // `[1,2]` in jq 1.7.1 and not `[1,1]`: UPDATE ran once on
+                    // state `0` giving `1`, and the retried alternative runs
+                    // UPDATE again on that `1`, giving `2`.
+                    Flow::Stopped { .. } if is_retryable_stop(is_last) => {
+                        state = update_val.clone();
+                        continue 'alternatives;
+                    }
+                    // Nothing left to fall through to: the stop is this
+                    // step's terminator, and `update_val` is the accumulator
+                    // it leaves behind (see the budget arm above).
+                    Flow::Stopped { .. } => {
+                        return (update_val.clone(), Some(ForeachStepEnd::Stopped));
+                    }
                     // #1458: real jq retries here too, but with a state-
                     // threading rule found nowhere else in this file -- the
                     // *next* alternative's UPDATE resumes from this failed
@@ -35046,16 +35154,27 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                     // matching the doc comment's oracle repro, where the
                     // retry re-runs UPDATE wholesale rather than resuming
                     // this attempt's own remaining outputs.
-                    Some(control) if is_retryable_control(&control, is_last) => {
+                    Flow::Escaped(control) if is_retryable_control(&control, is_last) => {
                         state = update_val.clone();
                         continue 'alternatives;
                     }
-                    // Same moved-`state`/discarded-on-abort reasoning as the
-                    // budget-check return above.
-                    Some(control) => return (OwnedValue::Null, Some(control)),
+                    // Same accumulator-on-abort reasoning as the budget-check
+                    // return above.
+                    Flow::Escaped(control) => {
+                        return (update_val.clone(), Some(ForeachStepEnd::Escaped(control)));
+                    }
                 }
-            } else {
-                outputs.push(update_val.clone());
+            } else if sink(update_val.clone()) == Demand::Stop {
+                // EXTRACT omitted is EXTRACT `.` (jq desugars `foreach f as $x
+                // (init; update)` to `(init; update; .)`), so the stop lands
+                // at the identical position and takes the identical rule --
+                // live-verified, `[first(foreach (1) as $x ?// $y (0;.+1))]`
+                // is `[1,2]`, the same answer the explicit-`.` spelling gives.
+                if is_retryable_stop(is_last) {
+                    state = update_val.clone();
+                    continue 'alternatives;
+                }
+                return (update_val.clone(), Some(ForeachStepEnd::Stopped));
             }
         }
 
@@ -35071,7 +35190,7 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
         match update_control {
             None => return (state, None),
             Some(control) if is_retryable_control(&control, is_last) => continue,
-            Some(control) => return (state, Some(control)),
+            Some(control) => return (state, Some(ForeachStepEnd::Escaped(control))),
         }
     }
 
@@ -35219,47 +35338,27 @@ where
         Err(escaped) => return escaped,
     };
 
-    // Every name any alternative could bind (#1365) -- same convention as
-    // `eval_reduce`'s own hoist.
-    let mut all_var_names: Vec<String> = Vec::new();
-    for pattern in patterns {
-        collect_pattern_var_names(pattern, &mut all_var_names);
-    }
-    all_var_names.sort_unstable();
-    all_var_names.dedup();
+    let all_var_names = foreach_pattern_var_names(patterns);
 
     // Same matrix hoist as `eval_reduce`'s own (#695) -- see there for the
     // full rationale -- generalized to also carry EXTRACT alongside
-    // UPDATE, since both are destructured against the same bindings.
+    // UPDATE, since both are destructured against the same bindings. The
+    // per-element substitution itself lives in [`substitute_foreach_steps`]
+    // since #2180 WP3, so the demand-driven path -- which sees one element
+    // at a time and can never hoist a matrix -- shares it rather than
+    // copying it.
     let invert_dedup = patterns.len() > 1;
     let substituted_steps_matrix: Vec<Vec<ForeachStepAlternative>> = input_values
         .iter()
         .map(|input_val| {
-            patterns
-                .iter()
-                .map(|pattern| {
-                    let bindings = extract_pattern_bindings(pattern, input_val, invert_dedup)?;
-                    // #1368: bound and null-filled names never overlap (the
-                    // filter below excludes anything `bindings` already
-                    // covers), so fold order between the two groups can't
-                    // matter -- one `substitute_vars` call via `as_var_refs`
-                    // replaces the old `substitute_bindings` call plus a
-                    // separate manual null-fill loop.
-                    let null_value = OwnedValue::Null;
-                    let null_fill = |expr: &Expr| {
-                        substitute_vars(
-                            expr,
-                            as_var_refs(&bindings).chain(
-                                all_var_names
-                                    .iter()
-                                    .filter(|name| !bindings.iter().any(|(n, _)| n == *name))
-                                    .map(|name| (name.as_str(), &null_value)),
-                            ),
-                        )
-                    };
-                    Ok((null_fill(update), extract.map(null_fill)))
-                })
-                .collect()
+            substitute_foreach_steps(
+                patterns,
+                &all_var_names,
+                update,
+                extract,
+                input_val,
+                invert_dedup,
+            )
         })
         .collect();
 
@@ -35268,29 +35367,52 @@ where
     // per-branch" accounting `WHILE_UNTIL_MAX_STEPS` uses.
     let mut budget = REDUCE_FOREACH_MAX_STEPS;
     for init_val in init_values {
-        let mut state = init_val;
-        let mut aborted: Option<Control> = None;
-        for row in &substituted_steps_matrix {
-            let (new_state, step_control) =
-                try_foreach_step_alternatives::<S>(row, state, optional, &mut budget, &mut outputs);
-            state = new_state;
-            if let Some(control) = step_control {
-                aborted = Some(control);
-                break;
-            }
-        }
-        // The source stream's own trailing control belongs to *this* fork
-        // too, not just whichever fork happens to run last (#534 follow-up):
-        // jq's search hits it while advancing this fork's own iteration over
-        // `input`, aborting the entire foreach before any untried INIT fork
-        // is ever attempted. Deferring it until after every fork had already
-        // run let later, never-should-have-started forks contribute output
-        // jq never produces — verified: `foreach (1,2,error("x")) as $x
-        // ((10,20); .+$x)` is `11`, `13`, then the error; the second INIT
-        // fork (`20`) is never reached, whereas the old code tried it anyway.
-        let aborted = aborted.or_else(|| input_control.clone());
-        if let Some(control) = aborted {
-            return finish_fork(outputs, Some(control), optional);
+        let flow = foreach_fork::<S>(
+            init_val,
+            optional,
+            &mut budget,
+            // The collecting source strategy: every row is already built, so
+            // this hands them over in order and then reports the source
+            // stream's own trailing control as the drive's terminator.
+            //
+            // That control belongs to *this* fork too, not just whichever
+            // fork happens to run last (#534 follow-up): jq's search hits it
+            // while advancing this fork's own iteration over `input`,
+            // aborting the entire foreach before any untried INIT fork is
+            // ever attempted. Deferring it until after every fork had already
+            // run let later, never-should-have-started forks contribute
+            // output jq never produces — verified: `foreach (1,2,error("x"))
+            // as $x ((10,20); .+$x)` is `11`, `13`, then the error; the second
+            // INIT fork (`20`) is never reached, whereas the pre-#534 code
+            // tried it anyway.
+            &mut |per_row| {
+                for row in &substituted_steps_matrix {
+                    if per_row(row) == Demand::Stop {
+                        // The step itself ended; `foreach_fork` already holds
+                        // the reason and it outranks whatever this returns.
+                        return Flow::Exhausted;
+                    }
+                }
+                match input_control.clone() {
+                    Some(control) => Flow::Escaped(control),
+                    None => Flow::Exhausted,
+                }
+            },
+            &mut |v| {
+                outputs.push(v);
+                Demand::Continue
+            },
+        );
+        match flow {
+            Flow::Exhausted => {}
+            // Not reachable through this caller: the collecting sink above
+            // never answers `Demand::Stop`, and `foreach_fork` reports
+            // `Stopped` only when something did. Answered rather than
+            // `unreachable!`d, with the same answer the demand-driven path
+            // gives that signal — a stop ends the whole `foreach`, so no
+            // untried INIT fork runs after one.
+            Flow::Stopped { .. } => break,
+            Flow::Escaped(control) => return finish_fork(outputs, Some(control), optional),
         }
     }
 
@@ -35298,6 +35420,291 @@ where
     // `init_values.is_empty()` guard above) ran to completion without
     // aborting — the only trailing control left to apply is INIT's own.
     finish_fork(outputs, init_control, optional)
+}
+
+/// Every name any of `patterns`' alternatives could bind (#1365) -- same
+/// convention as `eval_reduce`'s own hoist, shared by
+/// [`eval_foreach_with_values`] and [`each_foreach`] (#2180 WP3) so the two
+/// cannot disagree about which names get null-filled.
+pub(crate) fn foreach_pattern_var_names(patterns: &[Pattern]) -> Vec<String> {
+    let mut all_var_names: Vec<String> = Vec::new();
+    for pattern in patterns {
+        collect_pattern_var_names(pattern, &mut all_var_names);
+    }
+    all_var_names.sort_unstable();
+    all_var_names.dedup();
+    all_var_names
+}
+
+/// Destructure one source element against every `?//` alternative and
+/// substitute the resulting bindings into UPDATE/EXTRACT — one
+/// [`ForeachStepAlternative`] per pattern, `Err` where that pattern failed to
+/// match.
+///
+/// Lifted out of [`eval_foreach_with_values`]'s matrix build (#2180 WP3) so
+/// the demand-driven path, which sees source elements one at a time and can
+/// therefore never hoist a whole matrix, shares this rather than growing a
+/// second copy of it (#768/#822).
+pub(crate) fn substitute_foreach_steps(
+    patterns: &[Pattern],
+    all_var_names: &[String],
+    update: &Expr,
+    extract: Option<&Expr>,
+    input_val: &OwnedValue,
+    invert_dedup: bool,
+) -> Vec<ForeachStepAlternative> {
+    patterns
+        .iter()
+        .map(|pattern| {
+            let bindings = extract_pattern_bindings(pattern, input_val, invert_dedup)?;
+            // #1368: bound and null-filled names never overlap (the
+            // filter below excludes anything `bindings` already
+            // covers), so fold order between the two groups can't
+            // matter -- one `substitute_vars` call via `as_var_refs`
+            // replaces the old `substitute_bindings` call plus a
+            // separate manual null-fill loop.
+            let null_value = OwnedValue::Null;
+            let null_fill = |expr: &Expr| {
+                substitute_vars(
+                    expr,
+                    as_var_refs(&bindings).chain(
+                        all_var_names
+                            .iter()
+                            .filter(|name| !bindings.iter().any(|(n, _)| n == *name))
+                            .map(|name| (name.as_str(), &null_value)),
+                    ),
+                )
+            };
+            Ok((null_fill(update), extract.map(null_fill)))
+        })
+        .collect()
+}
+
+/// One INIT fork's whole fold over the source — **the** `foreach` step loop,
+/// parameterised over how the source is driven (#2180 WP3).
+///
+/// `drive_source` is handed a per-element callback and calls it once per
+/// already-substituted source row, in order, returning how the source itself
+/// ended. [`eval_foreach_with_values`] passes a strategy that walks its
+/// pre-built matrix and then reports the source stream's own trailing
+/// control; [`each_foreach`] passes one that drives the source expression
+/// through [`eval_each`], substituting each element as it arrives. That is
+/// the entire difference between the eager and the demand-driven `foreach`:
+/// there is one step loop, and it is this one (#768/#822 — a second copy
+/// would be free to drift on `?//` state threading, which is exactly the rule
+/// #1365/#1458/#1519/#2180 keep amending).
+///
+/// The step's own verdict outranks the source's: a step that escaped, or that
+/// the consumer stopped, aborts the fork whatever `drive_source` goes on to
+/// report, mirroring the pre-#2180 `aborted.or_else(|| input_control)`
+/// precedence exactly. `pending` is dropped on a stop for the reason every
+/// other lazy consumer drops it — it belongs to an eager fallback jq would
+/// never have reached.
+pub(crate) fn foreach_fork<S: EvalSemantics>(
+    init_val: OwnedValue,
+    optional: bool,
+    budget: &mut usize,
+    drive_source: &mut dyn FnMut(ForeachRowSink<'_>) -> Flow,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Flow {
+    let mut state = init_val;
+    // Recorded out-of-band for the usual reason: the per-element callback can
+    // only answer `Demand`, so "why did the fold stop" has to be kept beside
+    // it. Cleared on entry to *every* step, not just the first, because a
+    // `?//` in the source generator re-enters this callback after a stop has
+    // already been reported once (#1519's retry, seen from the consuming
+    // side) and it is the later step's verdict that counts.
+    let mut ended: Option<ForeachStepEnd> = None;
+
+    let flow = drive_source(&mut |row| {
+        ended = None;
+        let step_state = core::mem::replace(&mut state, OwnedValue::Null);
+        let (new_state, step_end) =
+            try_foreach_step_alternatives::<S>(row, step_state, optional, budget, sink);
+        state = new_state;
+        match step_end {
+            None => Demand::Continue,
+            Some(end) => {
+                ended = Some(end);
+                Demand::Stop
+            }
+        }
+    });
+
+    match ended {
+        Some(ForeachStepEnd::Escaped(control)) => Flow::Escaped(control),
+        Some(ForeachStepEnd::Stopped) => Flow::Stopped { pending: None },
+        None => flow,
+    }
+}
+
+/// [`finish_fork`] in [`Flow`] terms (#2180 WP3): the outputs are already
+/// delivered by the time a demand-driven fork construct finishes, so only the
+/// trailing control is left to adjudicate — and it is adjudicated by exactly
+/// the rule `finish_fork` applies, [`suppresses`] included, so an ambient `?`
+/// silences an ordinary trailing error here and never silences a decode
+/// failure (#1620/#1902).
+pub(crate) fn finish_fork_flow(control: Option<Control>, optional: bool) -> Flow {
+    match control {
+        None => Flow::Exhausted,
+        Some(Control::Error(ref e)) if suppresses(e, optional) => Flow::Exhausted,
+        Some(control) => Flow::Escaped(control),
+    }
+}
+
+/// Demand-forwarding twin of [`eval_foreach`] (#2180 WP3): the source is
+/// driven through [`eval_each`] one element at a time and each step's
+/// EXTRACT (or bare UPDATE) output is pushed straight to `sink`, so a
+/// wrapping consumer's [`Demand::Stop`] reaches the source generator — and,
+/// with it, a `?//` bind sitting in it — instead of landing on
+/// [`drain_result`] after `foreach` had already materialized its whole
+/// answer.
+///
+/// **jq's semantics, transcribed.** `foreach` is a fold that emits per step:
+/// INIT seeds an accumulator, each source element runs UPDATE against it and
+/// then EXTRACT against every UPDATE output, and every EXTRACT output is an
+/// output of the whole construct. The consumer's `break` therefore unwinds
+/// from *inside* the fold, and any `?//` on its way out reads it as "this
+/// alternative failed, try the next" — jq's `?//` does not distinguish a
+/// label declared outside the whole bind from one declared inside it (#1519).
+///
+/// **The stop-as-break state-threading rule.** A sink's `Demand::Stop` is
+/// treated by `foreach`'s own `?//` exactly as an escaping `Control::Break`
+/// is ([`is_retryable_stop`] beside [`is_retryable_control`]), *with the same
+/// state threading*: the retried alternative resumes from the accumulator the
+/// stopped attempt had already produced, not from a fresh one. Captured live
+/// against jq 1.7.1, input `1`:
+///
+/// | filter | jq 1.7.1 |
+/// |---|---|
+/// | `[first(foreach (1) as $x ?// $y (0;.+1;.), "z")]` | `[1,2]` |
+/// | `[first(foreach (1) as $x ?// $y (0;.+1))]` | `[1,2]` |
+/// | `[first(foreach (1) as $x ?// $y (0;.+1;., 99))]` | `[1,2]` |
+/// | `[first(foreach (1 as $x ?// $y \| 1) as $v (0; .+$v; .))]` | `[1,2]` |
+/// | `[isempty(foreach (1 as $x ?// $y \| 1) as $v (0; .+$v; .))]` | `[false,false]` |
+/// | `[first(foreach (1) as $x ?// $y (0; .+1; (1 as $a ?// $b \| .)))]` | `[1,1,2,2]` |
+///
+/// `[1,2]` and not `[1,1]` is the whole point: UPDATE ran once on state `0`
+/// giving `1`, and the retried alternative runs UPDATE again on that `1`,
+/// giving `2`. The last row shows the rule composing — EXTRACT's own chain
+/// answers twice per `foreach` alternative. Every one of these rows was
+/// captured from the pinned oracle, and none needed the stop rule and the
+/// `break` rule to differ.
+///
+/// Two positions deliberately stay eager, and both are recorded as residuals
+/// in `docs/compliance/jq/limitations.md`: **INIT** (its fan-out is jq's
+/// outermost loop, #534, and it must be evaluated before the source is ever
+/// pulled, #2440 — so it is collected here, exactly as [`eval_foreach`]
+/// collects it) and **UPDATE** (driving it demands reshaping
+/// [`fold_step_via_accumulator_or_fork`], which `reduce`'s own O(n)
+/// accumulator fix shares).
+///
+/// The INIT fan-out loop stays outer, so the source has to be re-offered per
+/// fork; the first fork drives it lazily and records what it saw, and later
+/// forks replay that recording. Nothing is re-evaluated, because a later fork
+/// is only ever reached when the first ran the source to exhaustion: a step
+/// that escaped or that the consumer stopped ends the whole `foreach`
+/// (verified: `[first(foreach (1) as $x ?// $y ((0,100); .+1; .))]` is
+/// `[1,2]`, the `100` fork never attempted).
+#[allow(clippy::too_many_arguments)]
+fn each_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    input: &Expr,
+    patterns: &[Pattern],
+    init: &Expr,
+    update: &Expr,
+    extract: Option<&Expr>,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    // INIT first, source second (#2440), and with the same checked
+    // conversion [`eval_foreach`] gives it (#1902) — a zero-output INIT
+    // leaves the source unevaluated entirely, side effects included, which is
+    // why `foreach halt_error as $x (empty; .)` exits 0.
+    let init_result = eval_single::<W, S>(init, value.clone(), optional);
+    let (init_values, init_control) = stream_outputs(init_result.materialize_cursor());
+    if init_values.is_empty() {
+        return finish_fork_flow(init_control, optional);
+    }
+
+    let all_var_names = foreach_pattern_var_names(patterns);
+    let invert_dedup = patterns.len() > 1;
+
+    let mut recorded: Vec<OwnedValue> = Vec::new();
+    let mut drove_once = false;
+    // Shared across every INIT fork (#695), same as the eager path.
+    let mut budget = REDUCE_FOREACH_MAX_STEPS;
+
+    let mut drive = |per_row: &mut dyn FnMut(&[ForeachStepAlternative]) -> Demand| -> Flow {
+        if drove_once {
+            // Replay (see this function's own doc comment): reached only
+            // after a complete first drive, so there is no trailing control
+            // left to re-report.
+            for input_val in &recorded {
+                let row = substitute_foreach_steps(
+                    patterns,
+                    &all_var_names,
+                    update,
+                    extract,
+                    input_val,
+                    invert_dedup,
+                );
+                if per_row(&row) == Demand::Stop {
+                    return Flow::Exhausted;
+                }
+            }
+            return Flow::Exhausted;
+        }
+        drove_once = true;
+
+        // Tracked out-of-band for the usual reason: the sink can only answer
+        // `Demand`, so an undecodable source element's error has to be
+        // recorded beside it. It folds into the drive's terminator exactly as
+        // `eval_foreach`'s own `promote_borrowed` failure folds into
+        // `input_control` — the already-iterated prefix stands in front of it
+        // (#1902).
+        let mut escape: Option<Control> = None;
+        let flow = eval_each::<W, S>(input, value.clone(), optional, &mut |item| {
+            let input_val = match item.into_owned() {
+                Ok(v) => v,
+                Err(e) => {
+                    escape = Some(Control::Error(e));
+                    return Demand::Stop;
+                }
+            };
+            let row = substitute_foreach_steps(
+                patterns,
+                &all_var_names,
+                update,
+                extract,
+                &input_val,
+                invert_dedup,
+            );
+            let demand = per_row(&row);
+            recorded.push(input_val);
+            demand
+        });
+        match escape {
+            Some(control) => Flow::Escaped(control),
+            None => flow,
+        }
+    };
+
+    for init_val in init_values {
+        let flow = foreach_fork::<S>(init_val, optional, &mut budget, &mut drive, &mut |v| {
+            sink(Item::Owned(v))
+        });
+        match flow {
+            Flow::Exhausted => {}
+            // A stop ends the whole `foreach`, untried INIT forks included —
+            // jq's break unwinds past every one of them. `pending` is dropped
+            // for the reason every other lazy consumer drops it.
+            Flow::Stopped { .. } => return Flow::Stopped { pending: None },
+            Flow::Escaped(control) => return finish_fork_flow(Some(control), optional),
+        }
+    }
+
+    finish_fork_flow(init_control, optional)
 }
 
 /// Evaluate `limit(n; expr)` - take first n outputs.

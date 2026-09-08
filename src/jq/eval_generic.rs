@@ -57,19 +57,20 @@ use super::eval::{
     classify_nth_n, classify_parent_n, collapse_vec, collect_pattern_var_names, compare_values,
     debug_assert_materialization_error, enter_def_call_frame, entries_to_object, eval_each_owned,
     eval_foreach_with_values, eval_full as full_eval, eval_reduce_with_values,
-    extract_pattern_bindings, finish_short_circuit, fold_escaped_generator_prefix, format_owned,
+    extract_pattern_bindings, finish_fork_flow, finish_short_circuit,
+    fold_escaped_generator_prefix, foreach_fork, foreach_pattern_var_names, format_owned,
     has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
     index_one_owned as index_owned_by_key, is_pure_chain_link, is_retryable_stop, literal_to_owned,
     needs_path_context, numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned,
     owned_bound_to_i64, owned_to_expr, owned_to_string, param_names, prefer_pending_control,
     select_emits, slice_component_value, slice_object_as_yq_children, slice_owned_value_read,
-    streams_escaped_generator_prefix, substitute_bound_var_from, substitute_vars,
-    suppress_or_raise, suppresses, tonumber_from_str, vec_with_capacity,
+    streams_escaped_generator_prefix, substitute_bound_var_from, substitute_foreach_steps,
+    substitute_vars, suppress_or_raise, suppresses, tonumber_from_str, vec_with_capacity,
     yq_absent_key_read_is_empty, yq_assign_rhs_document, yq_empty_operand_output,
     yq_field_index_on_scalar_is_empty, yq_negative_index_check, yq_numeric_index_on_object_is_null,
     yq_object_key_stringify, yq_read_only_context, BinaryFanoutRules, Control, Demand,
-    EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail,
-    QueryResult, YqSemantics,
+    EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, ForeachStepAlternative, JqSemantics,
+    LimitN, PathTrail, QueryResult, YqSemantics, REDUCE_FOREACH_MAX_STEPS,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -7942,6 +7943,33 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink)
         }
 
+        // #2180 WP3: `foreach`'s own demand-forwarding arm, native rather
+        // than bridged for the same reason this file's eager `Expr::Foreach`
+        // arm is native — `stream_owned_outputs_generic` recovers source
+        // elements this evaluator can see and `eval.rs` cannot (#1687's
+        // duplicate-key fidelity), and a wholesale bridge would collapse them
+        // at `to_owned_with_cursor` before the fold ever ran. Gated on the
+        // same `streams_unbounded` pair the eager arm uses, so an unbounded
+        // source/INIT still falls through to the wildcard below and reaches
+        // `eval.rs`'s bounded evaluation exactly as before.
+        Expr::Foreach {
+            input,
+            patterns,
+            init,
+            update,
+            extract,
+        } if !streams_unbounded(input) && !streams_unbounded(init) => each_foreach_generic::<S, V>(
+            input,
+            patterns,
+            init,
+            update,
+            extract.as_deref(),
+            value,
+            optional,
+            cursor,
+            sink,
+        ),
+
         // spine 2416 (walk residue; #2428): `..` over a live node emits every
         // node as its own cursor, so a stage after it reads `key`/`path`/
         // `parent` as cursor properties instead of losing them to the
@@ -7954,6 +7982,111 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
 
         _ => drain_result_generic(eval_single::<S, V>(expr, value, optional, cursor), sink),
     }
+}
+
+/// Generic-evaluator twin of `eval::each_foreach` (#2180 WP3) — see that
+/// function's doc comment for jq's semantics, the stop-as-break state-
+/// threading rule and the oracle rows that pinned it. Everything below the
+/// source is shared code (`foreach_fork`, `try_foreach_step_alternatives`,
+/// `substitute_foreach_steps`), so the two evaluators cannot drift on the
+/// fold itself; only INIT and the source drive differ, and both differ
+/// exactly as this file's eager `Expr::Foreach` arm already differs from
+/// `eval::eval_foreach`'s.
+///
+/// Both routes need the arm and both are exercised by every row: a bare
+/// `first(...)` is intercepted by this file's own native `FirstExpr` arm and
+/// drives `eval_each_generic`, while `isempty(...)` has no native arm here
+/// and reaches `eval.rs`'s `eval_each` instead.
+#[allow(clippy::too_many_arguments)]
+fn each_foreach_generic<S: EvalSemantics, V: DocumentValue>(
+    input: &Expr,
+    patterns: &[Pattern],
+    init: &Expr,
+    update: &Expr,
+    extract: Option<&Expr>,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    // INIT first, source second (#2440), same as the eager arm above it.
+    let (init_values, init_control) =
+        stream_owned_outputs_generic::<S, V>(init, value.clone(), optional, cursor);
+    if init_values.is_empty() {
+        return finish_fork_flow(init_control, optional);
+    }
+
+    let all_var_names = foreach_pattern_var_names(patterns);
+    let invert_dedup = patterns.len() > 1;
+
+    let mut recorded: Vec<OwnedValue> = Vec::new();
+    let mut drove_once = false;
+    let mut budget = REDUCE_FOREACH_MAX_STEPS;
+
+    let mut drive = |per_row: &mut dyn FnMut(&[ForeachStepAlternative]) -> Demand| -> Flow {
+        if drove_once {
+            // Replay for INIT forks after the first, reached only once the
+            // first drive ran the source to exhaustion — see
+            // `eval::each_foreach`'s own doc comment.
+            for input_val in &recorded {
+                let row = substitute_foreach_steps(
+                    patterns,
+                    &all_var_names,
+                    update,
+                    extract,
+                    input_val,
+                    invert_dedup,
+                );
+                if per_row(&row) == Demand::Stop {
+                    return Flow::Exhausted;
+                }
+            }
+            return Flow::Exhausted;
+        }
+        drove_once = true;
+
+        // Out-of-band, same as `stream_owned_outputs_generic`'s own
+        // `decode_err`: the already-iterated prefix stands in front of an
+        // undecodable element's error.
+        let mut escape: Option<Control> = None;
+        let flow = eval_each_generic::<S, V>(input, value.clone(), optional, cursor, &mut |item| {
+            let input_val = match generic_item_into_owned(item) {
+                Ok(v) => v,
+                Err(control) => {
+                    escape = Some(control);
+                    return Demand::Stop;
+                }
+            };
+            let row = substitute_foreach_steps(
+                patterns,
+                &all_var_names,
+                update,
+                extract,
+                &input_val,
+                invert_dedup,
+            );
+            let demand = per_row(&row);
+            recorded.push(input_val);
+            demand
+        });
+        match escape {
+            Some(control) => Flow::Escaped(control),
+            None => flow,
+        }
+    };
+
+    for init_val in init_values {
+        let flow = foreach_fork::<S>(init_val, optional, &mut budget, &mut drive, &mut |v| {
+            sink(GenericItem::Owned(v))
+        });
+        match flow {
+            Flow::Exhausted => {}
+            Flow::Stopped { .. } => return Flow::Stopped { pending: None },
+            Flow::Escaped(control) => return finish_fork_flow(Some(control), optional),
+        }
+    }
+
+    finish_fork_flow(init_control, optional)
 }
 
 /// `..` from a cursor: the node, then every descendant in document order,
