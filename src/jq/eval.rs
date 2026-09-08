@@ -2847,8 +2847,11 @@ fn stream_outputs_lossy<W: Clone + AsRef<[u64]>>(
 /// conversion, `eval_reduce`'s INIT conversion, and `eval_as_pattern`'s
 /// bound-value conversion -- three of the sites the "duplicated predicates
 /// diverge silently" lesson (#106) warns against, collapsed into this one
-/// definition, the checked twin of [`materialize_bound_values`]'s own
-/// consolidation of the *lazy* (`each_as`/`each_as_pattern`) family.
+/// definition. #2180 WP2b later moved the *lazy* (`each_as`/`each_as_pattern`)
+/// family's own bound-value conversion onto [`fanout_arg_each`]'s identical
+/// checked conversion (`Item::into_owned`, #2023) instead of a dedicated
+/// `materialize_bound_values` helper -- see those two functions' own doc
+/// comments.
 ///
 /// Not applied at every site with this shape: `eval_reduce`'s and
 /// `eval_foreach`'s own `input` conversions, and `eval_foreach`'s INIT
@@ -4888,10 +4891,14 @@ fn drain_result<'a, W: Clone + AsRef<[u64]>>(
 /// Native lazy arms: `Comma`, `Pipe`, `Paren`, `Builtin::PathsFilter`
 /// (#987, Stage 3), `Compare` (#1459, Stage 4), -- #1462, Stage 5 --
 /// `If`, `Try`/`Optional`, `Label`, `As`, `AsPattern`, `FuncDef` and `Limit`,
-/// -- #1556 -- `Range`, and -- #2180 WP1 -- the nested short-circuiting
+/// -- #1556 -- `Range`, -- #2180 WP1 -- the nested short-circuiting
 /// consumers `FirstExpr`, `NthExpr`/`Builtin::NthStream`, `Builtin::IsEmpty`,
-/// `Builtin::AnyCond`/`AllCond` and `Builtin::UpperIn`/`UpperInSrc`.
-/// Everything else falls back to `eval_single` + [`drain_result`]. `Paren`
+/// `Builtin::AnyCond`/`AllCond` and `Builtin::UpperIn`/`UpperInSrc`,
+/// -- #2180 WP2a -- `Alternative`, `And` and `Or`, and -- #2180 WP2b --
+/// `Builtin::Select`, `Negate`, `IndexExpr` (its key only; see
+/// [`each_index_expr`]), `StringInterpolation` (jq mode only; see
+/// [`each_string_parts`]) and `Object`. Everything else falls back to
+/// `eval_single` + [`drain_result`]. `Paren`
 /// is not optional cosmetics: `isempty(...)` consumes only its own
 /// parentheses, so `isempty((1, stderr))` is `IsEmpty(Paren(Comma(..)))` and
 /// without this arm the fix would be a coin flip on spelling.
@@ -5268,21 +5275,61 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Expr::And(left, right) => each_boolean::<W, S>(left, right, value, optional, false, sink),
         Expr::Or(left, right) => each_boolean::<W, S>(left, right, value, optional, true, sink),
 
+        // #2180 WP2b: the remaining eager sub-expression sites -- every one
+        // of these fell to the eager `_` fallback below, so a `?//` bind
+        // sitting inside `select`'s condition, unary minus's operand, an
+        // index key, a string-interpolation slot or an object entry
+        // materialized the bind and swallowed a wrapping consumer's stop the
+        // same way the constructs WP1/WP2a fixed did. All rows captured live
+        // against jq 1.7.1, input `1`, `G` = `1 as $x ?// $y | 1`:
+        //
+        // ```text
+        // [first(select((G) == 1))]        [1,1]        was [1]
+        // [first(-(G))]                    [-1,-1]      was [-1]
+        // [1] | [first(.[(G)-1])]          [1,1]        was [1]
+        // [first("\(G)")]                  ["1","1"]    was ["1"]
+        // [first({a:(G)} | .a)]            [1,1]        was [1]
+        // ```
+        Expr::Builtin(Builtin::Select(cond)) => each_select::<W, S>(cond, value, optional, sink),
+        Expr::Negate(operand) => each_negate::<W, S>(operand, value, optional, sink),
+        // jq mode only -- see `each_index_expr`'s own doc comment for why yq
+        // mode keeps the pre-existing eager fallback below instead.
+        Expr::IndexExpr { target, key } if streams_escaped_generator_prefix::<S>() => {
+            each_index_expr::<W, S>(target, key, value, optional, sink)
+        }
+        // jq mode only -- yq mode's string interpolation isn't a fan-out
+        // generator at all (see `eval_string_interpolation`'s own doc
+        // comment), so it keeps the pre-existing eager fallback below.
+        Expr::StringInterpolation(parts) if S::TAG != EvalTag::Yq => {
+            let mut slots: Vec<String> = alloc::vec![String::new(); parts.len()];
+            each_string_parts::<W, S>(parts, value, optional, &mut slots, sink)
+        }
+        Expr::Object(entries) => {
+            let mut acc = Vec::new();
+            each_object_entries::<W, S>(entries, value, optional, &mut acc, sink)
+        }
+
         _ => drain_result(eval_single::<W, S>(expr, value, optional), sink),
     }
 }
 
-/// Lazy twin of [`eval_if`]: `cond` is evaluated eagerly (branch selection
-/// was already lazy -- `eval_fanout` only ever evaluates the taken branch),
-/// but the taken branch's own body is pushed through `eval_each` rather than
-/// materialized via `eval_single`, so a generator inside it honours the
-/// wrapping consumer's demand (#1462: `first(if true then (1,("B"|stderr))
-/// else 9 end)` no longer evaluates the `stderr` branch).
+/// Lazy twin of [`eval_if`] (#1462, widened by #2180 WP2b): both `cond` and
+/// the taken branch's own body are pushed through `eval_each` now, so a
+/// generator *anywhere* in the expression -- including a `?//` bind sitting
+/// in `cond` itself -- honours the wrapping consumer's demand.
 ///
-/// Mirrors `eval_fanout`'s own bit-by-bit walk (multi-output `cond`, e.g.
-/// `if (true,false) then "a" else "b" end`, #378) minus the borrowed/owned
-/// accumulator -- the sink *is* the accumulator here, same as `eval_each`'s
-/// `Comma` arm.
+/// `cond` used to be collected eagerly via `eval_single` before #1462's own
+/// scope was reconsidered: branch *selection* was already lazy (`eval_fanout`
+/// only ever evaluates the taken branch), but collecting `cond` first meant a
+/// wrapping consumer's [`Demand::Stop`] never reached [`each_pattern_alternatives`]
+/// if it were sitting inside `cond` -- `[first(if (1 as $x ?// $y | 1) then 5
+/// else 6 end)]` answered `[5]` where jq 1.7.1 answers `[5,5]` (captured
+/// live, input `1`). Driving `cond` through `eval_each` directly closes that
+/// without a new mechanism: mirrors `eval_fanout`'s own bit-by-bit walk
+/// (multi-output `cond`, e.g. `if (true,false) then "a" else "b" end`, #378),
+/// with the escape channel [`fanout_arg_each`]/[`each_alternative`] already
+/// use for "a nested `eval_each` call answers only `Demand`, so its own
+/// `Escaped`/`Stopped` has to be parked out of band".
 fn each_if<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     cond: &Expr,
     then_branch: &Expr,
@@ -5291,21 +5338,33 @@ fn each_if<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
-    let cond_result = eval_single::<W, S>(cond, value.clone(), optional);
-    let mut bits: Vec<bool> = Vec::new();
-    let cond_control = push_truthiness(cond_result, &mut bits);
-
-    for bit in bits {
-        let branch = if bit { then_branch } else { else_branch };
+    let mut outer_stopped = false;
+    let mut escape: Option<Control> = None;
+    let cond_flow = eval_each::<W, S>(cond, value.clone(), optional, &mut |item| {
+        let branch = if item.is_truthy() {
+            then_branch
+        } else {
+            else_branch
+        };
         match eval_each::<W, S>(branch, value.clone(), optional, sink) {
-            Flow::Exhausted => {}
-            stopped_or_escaped => return stopped_or_escaped,
+            Flow::Exhausted => Demand::Continue,
+            Flow::Stopped { .. } => {
+                outer_stopped = true;
+                Demand::Stop
+            }
+            Flow::Escaped(control) => {
+                escape = Some(control);
+                Demand::Stop
+            }
         }
-    }
+    });
 
-    match cond_control {
+    if outer_stopped {
+        return cond_flow;
+    }
+    match escape {
         Some(control) => Flow::Escaped(control),
-        None => Flow::Exhausted,
+        None => cond_flow,
     }
 }
 
@@ -5394,54 +5453,29 @@ fn each_label<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
-/// Materialize a bind expression's own `QueryResult` into the values
-/// [`each_as`]/[`each_as_pattern`] loop the shared `body`/pattern-match logic
-/// over, plus the control the bind itself trails (`#400`/`#494`: a
-/// `Partial` bind still has its produced prefix bound and run through the
-/// body, exactly as `eval_as`/`eval_as_pattern` already do). `Err(flow)`
-/// carries the caller's own early return for a bind that produced no
-/// values at all, or that raised without producing any.
+/// Lazy twin of [`eval_as`] (#1462, widened by #2180 WP2b): the bind
+/// expression (`expr`) now runs through [`fanout_arg_each`] -- the same
+/// demand-forwarding argument fan-out [`each_nth`] already uses for `nth`'s
+/// `n` -- instead of `eval_single` + a collecting conversion, so a `?//`
+/// bind sitting in the *source* itself (not just per bound value's `body`)
+/// also sees a wrapping consumer's [`Demand::Stop`]: `[first((1 as $x ?// $y
+/// | 1) as $v | $v)]` is `[1,1]` in jq 1.7.1, was `[1]` (captured live, input
+/// `1`). Each bound value's `body` is still pushed through `eval_each` rather
+/// than materialized, unchanged from #1462, so
+/// `isempty(1 as $x | (1,("B"|stderr)))` still doesn't evaluate the `stderr`
+/// branch. The parser reserves this bare-`$var` node for `Expr::As`;
+/// [`each_as_pattern`] below is its destructuring sibling (`Expr::AsPattern`,
+/// `?//`-chains included).
 ///
-/// Shared by both (code review, #1462) -- this exact `QueryResult` ->
-/// `(Vec<OwnedValue>, Option<Control>)` unpacking was already duplicated
-/// between the eager `eval_as`/`eval_as_pattern`; this collapses all four
-/// copies (the eager pair plus their two new lazy twins) into one.
-fn materialize_bound_values<W: Clone + AsRef<[u64]>>(
-    bound_result: QueryResult<'_, W>,
-) -> Result<(Vec<OwnedValue>, Option<Control>), Flow> {
-    // #1902: to_owned/promote_borrowed, not to_owned_lossy -- the
-    // lazy twin of the same bug `eval_as`'s own bound-value conversion had.
-    // A checked-conversion failure folds into the trailing control exactly
-    // like an ordinary `Partial`'s control (the `Partial` arm below).
-    match bound_result.materialize_cursor() {
-        QueryResult::One(v) => match to_owned(&v) {
-            Ok(v) => Ok((vec![v], None)),
-            Err(e) => Ok((Vec::new(), Some(Control::Error(e)))),
-        },
-        QueryResult::OneCursor(_) => unreachable!("materialize_cursor removes OneCursor"),
-        QueryResult::Many(vs) => match promote_borrowed(vs) {
-            Ok(vs) => Ok((vs, None)),
-            Err((prefix, e)) => Ok((prefix, Some(Control::Error(e)))),
-        },
-        QueryResult::Owned(v) => Ok((vec![v], None)),
-        QueryResult::ManyOwned(vs) => Ok((vs, None)),
-        QueryResult::None => Err(Flow::Exhausted),
-        QueryResult::Error(e) => Err(Flow::Escaped(Control::Error(e))),
-        QueryResult::Break(label) => Err(Flow::Escaped(Control::Break(label))),
-        QueryResult::Halt(code) => Err(Flow::Escaped(Control::Halt(code))),
-        QueryResult::Partial(vs, control) => Ok((vs, Some(control))),
-    }
-}
-
-/// Lazy twin of [`eval_as`] (#1462): the bind expression (`expr`) is
-/// evaluated eagerly, exactly as `eval_as` already does -- mirroring
-/// `each_if`'s decision to leave `cond` eager, this fix is scoped to what
-/// runs *per bound value*, not to the binding itself. Each bound value's
-/// `body` is then pushed through `eval_each` rather than materialized via
-/// `eval_single`, so `isempty(1 as $x | (1,("B"|stderr)))` no longer
-/// evaluates the `stderr` branch. The parser reserves this bare-`$var` node
-/// for `Expr::As`; [`each_as_pattern`] below is its destructuring sibling
-/// (`Expr::AsPattern`, `?//`-chains included).
+/// [`fanout_arg_each`]'s own rules carry over exactly, because its checked
+/// conversion (`Item::into_owned`, #2023) is the identical `to_owned`/
+/// `promote_borrowed` conversion (#1902) the pre-#2180 collecting helper
+/// used -- a decode failure raises rather than silently becoming `""` either
+/// way, and the already-converted prefix survives it. #2563's owned-identity
+/// rule for `as` bindings lives entirely in `eval_generic.rs`'s separate fast-path
+/// gate (`owned_identity_rule`/`eval_owned_identity_as`), reached *before*
+/// this function is ever called, so it is untouched by this change (verified
+/// live: `test_as_binding_keeps_the_input_identity_2563` still passes).
 fn each_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     var: &str,
@@ -5450,33 +5484,25 @@ fn each_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
-    let bound_result = eval_single::<W, S>(expr, value.clone(), optional);
-    let (bound_values, bound_control) = match materialize_bound_values(bound_result) {
-        Ok(pair) => pair,
-        Err(flow) => return flow,
-    };
-
-    for bound_val in bound_values {
+    fanout_arg_each::<W, S, _>(expr, value.clone(), optional, |bound_val| {
         let substituted_body = substitute_bound_var(expr, body, var, &bound_val);
-        match eval_each::<W, S>(&substituted_body, value.clone(), optional, sink) {
-            Flow::Exhausted => {}
-            other => return other,
-        }
-    }
-
-    match bound_control {
-        Some(control) => Flow::Escaped(control),
-        None => Flow::Exhausted,
-    }
+        eval_each::<W, S>(&substituted_body, value.clone(), optional, sink)
+    })
 }
 
-/// Lazy twin of [`eval_as_pattern`]: the bind expression (`expr`) is
-/// evaluated eagerly, exactly as `eval_as_pattern` already does -- same
-/// reasoning as [`each_as`] above, its non-destructuring sibling. Each bound
-/// value's `body` (after `?//`-alternative substitution) is then pushed
-/// through `eval_each` rather than materialized, so
-/// `isempty([$x] as [$a] | (1,("B"|stderr)))`-shaped destructuring binds no
-/// longer evaluate a trailing `stderr` branch either.
+/// Lazy twin of [`eval_as_pattern`] (#2180 WP2b widens #1462 the same way
+/// [`each_as`] above does): the bind expression (`expr`) now runs through
+/// [`fanout_arg_each`] instead of `eval_single` + a collecting conversion,
+/// so a `?//` bind in the *source* is demand-forwarded too, not just one
+/// nested in a `?//`-alternative's own `body` (which
+/// [`each_pattern_alternatives`] already covered). `[first((1 as $x ?// $y |
+/// 1) as [$a] ?// $a | $a)]` is `[1,1]` in jq 1.7.1, was `[1]` (captured
+/// live, input `1`). Each bound value's `body` (after `?//`-alternative
+/// substitution) is still pushed through [`each_pattern_alternatives`]'s own
+/// `eval_each`-based dispatch, unchanged from #1462/#1519. The deferred
+/// escape that used to be `bound_control` is now covered by
+/// [`fanout_arg_each`]'s own rule that the argument's trailing control fires
+/// only after every bound value's `body` has already run.
 fn each_as_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     patterns: &[Pattern],
@@ -5485,12 +5511,6 @@ fn each_as_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
-    let bound_result = eval_single::<W, S>(expr, value.clone(), optional);
-    let (bound_values, bound_control) = match materialize_bound_values(bound_result) {
-        Ok(pair) => pair,
-        Err(flow) => return flow,
-    };
-
     let mut all_var_names: Vec<String> = Vec::new();
     for pattern in patterns {
         collect_pattern_var_names(pattern, &mut all_var_names);
@@ -5498,8 +5518,8 @@ fn each_as_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     all_var_names.sort_unstable();
     all_var_names.dedup();
 
-    for bound_val in bound_values {
-        match each_pattern_alternatives::<W, S>(
+    fanout_arg_each::<W, S, _>(expr, value.clone(), optional, |bound_val| {
+        each_pattern_alternatives::<W, S>(
             patterns,
             &all_var_names,
             body,
@@ -5507,16 +5527,8 @@ fn each_as_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             &value,
             optional,
             sink,
-        ) {
-            Flow::Exhausted => {}
-            other => return other,
-        }
-    }
-
-    match bound_control {
-        Some(control) => Flow::Escaped(control),
-        None => Flow::Exhausted,
-    }
+        )
+    })
 }
 
 /// Sink-based twin of [`try_pattern_alternatives`]: same `?//`-alternative
@@ -6381,6 +6393,417 @@ fn each_boolean<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     )
 }
 
+/// Demand-forwarding twin of [`builtin_select`] (#2180 WP2b): `select(cond)`
+/// with `cond`'s own truthy-driven republishes pushed to `sink` as they are
+/// decided, instead of collected via [`eval_fanout`]. Same shape as
+/// [`each_if`]'s own `cond` loop -- `select` never short-circuits on its own
+/// (no consumer-satisfaction reason to stop), so once `cond` is driven
+/// through `eval_each` the sink's own `Demand` *is* the answer this function
+/// hands back to `eval_each`'s caller, with nothing left to fold afterward.
+///
+/// `select_emits` is unchanged: a truthy `cond` output republishes `value`
+/// (one push per truthy bit in jq mode, collapsing to at most one under
+/// `S::SELECT_EMITS_ONCE_IF_ANY_TRUTHY` in yq mode, #1613) -- `cond` still
+/// runs to completion either way, since `already_emitted` only silences
+/// further *pushes*, not further pulls. Captured live against jq 1.7.1,
+/// input `1`: `[first(select((1 as $x ?// $y | 1) == 1))]` is `[1,1]`, where
+/// the eager fallback answered `[1]`.
+fn each_select<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    cond: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    let mut already_emitted = false;
+    eval_each::<W, S>(cond, value.clone(), optional, &mut |item| {
+        if select_emits::<S>(item.is_truthy(), &mut already_emitted) {
+            sink(Item::Borrowed(value.clone()))
+        } else {
+            Demand::Continue
+        }
+    })
+}
+
+/// Demand-forwarding twin of [`eval_negate`]/[`negate_fanout_core`] (#2180
+/// WP2b): unary minus with each negated output pushed to `sink` as it is
+/// computed, instead of collected via [`push_owned_values`]. Same checked
+/// conversion (`Item::into_owned`, #1989's `to_owned`/`push_owned_values`
+/// rule -- an undecodable operand must raise, not silently become `""` and
+/// then fail `arith_negate`'s own type check instead) and the same
+/// `finish_fork`/`suppresses` optional-suppression rule for `arith_negate`'s
+/// own type error, restated for a pushed stream: the already-negated prefix
+/// survives either kind of failure, exactly as [`finish_fork`] does for the
+/// collected one. Captured live against jq 1.7.1, input `1`:
+/// `[first(-(1 as $x ?// $y | 1))]` is `[-1,-1]`, where the eager fallback
+/// answered `[-1]`.
+fn each_negate<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    operand: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    let mut outer_stopped = false;
+    let mut escape: Option<Control> = None;
+    let flow = eval_each::<W, S>(operand, value, optional, &mut |item| {
+        let owned = match item.into_owned() {
+            Ok(v) => v,
+            Err(e) => {
+                escape = Some(Control::Error(e));
+                return Demand::Stop;
+            }
+        };
+        match arith_negate::<S>(owned) {
+            Ok(negated) => {
+                if sink(Item::Owned(negated)) == Demand::Stop {
+                    outer_stopped = true;
+                    Demand::Stop
+                } else {
+                    Demand::Continue
+                }
+            }
+            Err(e) => {
+                escape = Some(Control::Error(e));
+                Demand::Stop
+            }
+        }
+    });
+
+    if outer_stopped {
+        return flow;
+    }
+    let control = escape.or(match flow {
+        Flow::Exhausted | Flow::Stopped { .. } => None,
+        Flow::Escaped(control) => Some(control),
+    });
+    match control {
+        None => Flow::Exhausted,
+        // #1902 family rule (`suppresses`): a decode failure is never
+        // suppressed by an ambient `optional`, unlike `arith_negate`'s own
+        // type error or the operand's own trailing control -- matches
+        // `finish_fork`'s identical guard.
+        Some(Control::Error(ref e)) if suppresses(e, optional) => Flow::Exhausted,
+        Some(control) => Flow::Escaped(control),
+    }
+}
+
+/// Demand-forwarding twin of [`eval_index_expr`]'s own key stream (#2180
+/// WP2b): `.[key_expr]` with each already-produced key's indexed result
+/// pushed to `sink` as it is computed. `eval_index_expr`'s #2138 fix already
+/// pulls `key` lazily, one output at a time, but its own per-key sink is a
+/// purely local accumulator (`borrowed`/`owned`) that never forwards an
+/// *external* consumer's demand -- by the time a fully-assembled `borrowed`/
+/// `owned` result reaches a wrapping `first`, `key`'s own generator (and any
+/// `?//` bind inside it) has already returned, with nothing left to retry.
+/// Captured live against jq 1.7.1: `[1] | [first(.[(1 as $x ?// $y | 1)-1])]`
+/// is `[1,1]`, where the eager fallback answered `[1]`.
+///
+/// **jq mode only.** Every already-computed key's result is delivered to
+/// `sink` the moment it is known, which is precisely the one thing
+/// [`eval_index_expr`]'s own yq-mode rule forbids: a *later* key in the same
+/// generator raising `Error`/`Break` must retroactively discard every
+/// earlier key's own result too
+/// ([`streams_escaped_generator_prefix`], #2326) -- an already-delivered
+/// `sink` push cannot be recalled to honour that. No row in this issue's
+/// sweep is yq mode (`scripts/jq-alt-retry-oracle-sweep.sh` only ever runs
+/// `succinctly jq`), so yq mode keeps the pre-existing eager fallback
+/// (`eval_index_expr` via `eval_single`) unchanged, and its own
+/// retroactive-discard test coverage is untouched by this function.
+///
+/// Reuses [`eval_index_expr`] unchanged rather than re-deriving its
+/// target/negative-index/`Partial`-fold machinery a second time: each key
+/// item is converted to an `OwnedValue` exactly as the original per-key sink
+/// does (`to_owned_key_shape` for a borrowed key, unchanged for an owned
+/// one), spliced back in as a *literal* single-valued key expression
+/// ([`owned_to_expr`]), and handed to [`eval_index_expr`] for that one key
+/// alone -- which still re-evaluates `target` fresh per key (#2032) and keeps
+/// every existing negative-index/partial-target rule, since it is the same
+/// function, just called once per externally-visible key instead of once for
+/// the whole key stream.
+fn each_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    target: &Expr,
+    key: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    let mut outer_stopped = false;
+    let mut escape: Option<Control> = None;
+    let flow = eval_each::<W, S>(key, value.clone(), false, &mut |item| {
+        let k = match item {
+            Item::Borrowed(v) => match to_owned_key_shape(&v) {
+                Ok(k) => k,
+                Err(e) => {
+                    escape = Some(Control::Error(e));
+                    return Demand::Stop;
+                }
+            },
+            Item::Owned(o) => o,
+        };
+        let literal_key = owned_to_expr(&k);
+        let one_key_result = eval_index_expr::<W, S>(target, &literal_key, value.clone(), optional);
+        match drain_result(one_key_result, sink) {
+            Flow::Exhausted => Demand::Continue,
+            Flow::Stopped { .. } => {
+                outer_stopped = true;
+                Demand::Stop
+            }
+            Flow::Escaped(control) => {
+                escape = Some(control);
+                Demand::Stop
+            }
+        }
+    });
+
+    if outer_stopped {
+        return flow;
+    }
+    match escape {
+        Some(control) => Flow::Escaped(control),
+        None => flow,
+    }
+}
+
+/// Demand-forwarding twin of [`build_string_parts`] (#2180 WP2b), jq mode
+/// only -- yq mode's own string interpolation isn't a fan-out generator at
+/// all (see [`eval_string_interpolation`]'s own doc comment), so it never
+/// reaches this function; `eval_each`'s own `Expr::StringInterpolation` arm
+/// gates on that before calling in.
+///
+/// Reproduces `build_string_parts`'s recursion exactly -- `parts` shrinks
+/// from the *right* via `split_last`, so the last slot's loop is outermost
+/// and the first slot innermost, confirmed live against jq 1.7.1:
+/// `"\(1,2)-\(3,4)"` yields `"1-3","2-3","1-4","2-4"` (see
+/// [`string_part_outputs`]'s own doc comment for the fuller oracle capture)
+/// -- with each combination's completed string pushed to `sink` as it is
+/// built, and a slot's own generator driven through `eval_each` instead of
+/// `eval_single` so a `?//` bind inside it sees a wrapping consumer's
+/// [`Demand::Stop`]. Captured live: `[first("\(1 as $x ?// $y | 1)")]` is
+/// `["1","1"]`, where the eager fallback answered `["1"]`.
+fn each_string_parts<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    parts: &[StringPart],
+    value: StandardJson<'a, W>,
+    optional: bool,
+    slots: &mut [String],
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    let Some((part, rest)) = parts.split_last() else {
+        return match sink(Item::Owned(OwnedValue::String(slots.concat()))) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped { pending: None },
+        };
+    };
+    let idx = rest.len();
+
+    match part {
+        StringPart::Literal(s) => {
+            slots[idx].clone_from(s);
+            each_string_parts::<W, S>(rest, value, optional, slots, sink)
+        }
+        StringPart::Expr(expr) => {
+            let mut outer_stopped = false;
+            let mut escape: Option<Control> = None;
+            let flow = eval_each::<W, S>(expr, value.clone(), optional, &mut |item| {
+                let owned = match item.into_owned() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        escape = Some(Control::Error(e));
+                        return Demand::Stop;
+                    }
+                };
+                slots[idx] = owned_to_string::<S>(&owned);
+                match each_string_parts::<W, S>(rest, value.clone(), optional, slots, sink) {
+                    Flow::Exhausted => Demand::Continue,
+                    Flow::Stopped { .. } => {
+                        outer_stopped = true;
+                        Demand::Stop
+                    }
+                    Flow::Escaped(control) => {
+                        escape = Some(control);
+                        Demand::Stop
+                    }
+                }
+            });
+            if outer_stopped {
+                return flow;
+            }
+            match escape {
+                Some(control) => Flow::Escaped(control),
+                None => flow,
+            }
+        }
+    }
+}
+
+/// Demand-forwarding twin of [`build_object_entries`] (#2180 WP2b): one
+/// object per combination of key/value outputs, pushed to `sink` as each
+/// combination completes instead of collected into `out`. Same
+/// entries-recurse/key-encloses-value nesting -- confirmed live against jq
+/// 1.7.1 that `[{("A"|debug):("C"|debug), ("B"|debug):("D"|debug)}]` writes
+/// `A C B D` to stderr, in source order, matching `build_object_entries`'s
+/// own `split_first` recursion (entry 1 is outermost, the last entry varies
+/// fastest -- see that function's own doc comment for the full multi-output
+/// capture) -- but a key/value slot is now driven through `eval_each` instead
+/// of `stream_outputs(eval_single(...))`, so a `?//` bind inside a slot sees
+/// a wrapping consumer's [`Demand::Stop`] *while it is still the live top of
+/// the call stack*. An eagerly-collected slot cannot forward that: by the
+/// time its collected `Vec` reaches `sink`, [`each_pattern_alternatives`] has
+/// already returned and there is nothing left to retry. Captured live:
+/// `[first({a:(1 as $x ?// $y | 1)} | .a)]` is `[1,1]`, where the eager
+/// fallback answered `[1]`.
+///
+/// **One simplification, deliberately accepted, from `build_object_entries`'s
+/// own `optional`-guarded non-string-key rule.** That function discards
+/// *every* combination already collected (not just this key's) when a
+/// non-string key can't stringify under an ambient `optional` --
+/// `ObjectEscape::None`, not a `Partial`. A streaming sink cannot un-deliver
+/// what it has already pushed, so this function instead treats that case as
+/// "this one key contributes nothing" (`Demand::Continue`), leaving any
+/// earlier combination already delivered in place. `optional` reaches
+/// `Object` construction only through a contrived nesting no query in this
+/// project's suite constructs (`Expr::Optional`'s own dispatch forwards the
+/// *ambient* `optional` rather than forcing it, #693, and `Object` is not one
+/// of the direct-dispatch exemptions that force it `true`), so this is
+/// unreached in practice rather than merely untested -- flagged here rather
+/// than silently changed.
+///
+/// No mode split needed, unlike [`each_index_expr`]'s key stream: object
+/// construction's control ordering is the same in both jq and yq mode
+/// (`build_object_entries` has no [`streams_escaped_generator_prefix`] gate
+/// at all).
+fn each_object_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    entries: &[super::expr::ObjectEntry],
+    value: StandardJson<'a, W>,
+    optional: bool,
+    acc: &mut Vec<(String, OwnedValue)>,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    let Some((entry, rest)) = entries.split_first() else {
+        let object: IndexMap<String, OwnedValue> = acc.iter().cloned().collect();
+        return match sink(Item::Owned(OwnedValue::Object(object))) {
+            Demand::Continue => Flow::Exhausted,
+            Demand::Stop => Flow::Stopped { pending: None },
+        };
+    };
+
+    match &entry.key {
+        ObjectKey::Literal(name) => {
+            each_object_value::<W, S>(name.clone(), &entry.value, rest, value, optional, acc, sink)
+        }
+        ObjectKey::Expr(key_expr) => {
+            let mut outer_stopped = false;
+            let mut escape: Option<Control> = None;
+            let flow = eval_each::<W, S>(key_expr, value.clone(), optional, &mut |item| {
+                // #2022: `into_owned`, not the lossy conversion -- an
+                // undecodable computed key must raise, matching
+                // `stream_outputs`'s own checked conversion.
+                let key_owned = match item.into_owned() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        escape = Some(Control::Error(e));
+                        return Demand::Stop;
+                    }
+                };
+                let key_str = match &key_owned {
+                    OwnedValue::String(s) => s.clone(),
+                    _ => match yq_object_key_stringify::<S>(&key_owned) {
+                        Some(s) => s,
+                        None => {
+                            if optional {
+                                // See this function's own doc comment: the
+                                // eager `ObjectEscape::None` rule (discard
+                                // everything) is deliberately not reproduced.
+                                return Demand::Continue;
+                            }
+                            escape = Some(Control::Error(EvalError::cannot_use_as_object_key(
+                                &key_owned,
+                            )));
+                            return Demand::Stop;
+                        }
+                    },
+                };
+                match each_object_value::<W, S>(
+                    key_str,
+                    &entry.value,
+                    rest,
+                    value.clone(),
+                    optional,
+                    acc,
+                    sink,
+                ) {
+                    Flow::Exhausted => Demand::Continue,
+                    Flow::Stopped { .. } => {
+                        outer_stopped = true;
+                        Demand::Stop
+                    }
+                    Flow::Escaped(control) => {
+                        escape = Some(control);
+                        Demand::Stop
+                    }
+                }
+            });
+            if outer_stopped {
+                return flow;
+            }
+            match escape {
+                Some(control) => Flow::Escaped(control),
+                None => flow,
+            }
+        }
+    }
+}
+
+/// [`each_object_entries`]'s value-slot half: drives one entry's `value_expr`
+/// through `eval_each`, and for each output pushes `(key, value)` onto `acc`
+/// and recurses into `rest` -- the value loop `build_object_entries`'s own
+/// `for val in vals` runs, restated for a pushed stream.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors `build_object_entries`'s own
+                                     // 7-argument shape plus the sink -- every param is
+                                     // threaded straight through the recursion, a struct
+                                     // would just rename the same fields.
+fn each_object_value<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    key: String,
+    value_expr: &Expr,
+    rest: &[super::expr::ObjectEntry],
+    value: StandardJson<'a, W>,
+    optional: bool,
+    acc: &mut Vec<(String, OwnedValue)>,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    let mut outer_stopped = false;
+    let mut escape: Option<Control> = None;
+    let flow = eval_each::<W, S>(value_expr, value.clone(), optional, &mut |item| {
+        // #2022: same checked conversion as the key slot above.
+        let val_owned = match item.into_owned() {
+            Ok(v) => v,
+            Err(e) => {
+                escape = Some(Control::Error(e));
+                return Demand::Stop;
+            }
+        };
+        acc.push((key.clone(), val_owned));
+        let result = each_object_entries::<W, S>(rest, value.clone(), optional, acc, sink);
+        acc.pop();
+        match result {
+            Flow::Exhausted => Demand::Continue,
+            Flow::Stopped { .. } => {
+                outer_stopped = true;
+                Demand::Stop
+            }
+            Flow::Escaped(control) => {
+                escape = Some(control);
+                Demand::Stop
+            }
+        }
+    });
+    if outer_stopped {
+        return flow;
+    }
+    match escape {
+        Some(control) => Flow::Escaped(control),
+        None => flow,
+    }
+}
+
 /// Demand-driven twin of [`eval_range`] (#1556): drives `from`, `to`, and
 /// `step` through [`eval_each`] instead of `stream_outputs_lossy`, so a wrapping
 /// consumer's [`Demand::Stop`] reaches *inside* the bound expressions
@@ -7003,12 +7426,15 @@ fn eval_fanout<'a, W: Clone + AsRef<[u64]>>(
 /// "duplicated predicates diverge silently" shape CLAUDE.md's #106 lesson
 /// warns about (echoed by this file's own `ArgFanout`/`apply_arg_fanout`,
 /// #1537, the precedent for pulling a repeated gate into one place instead).
-/// `eval_generic.rs`'s native `Select` arm computes the analogous
+/// `eval_generic.rs`'s native, *eager* `Select` arm computes the analogous
 /// `truthy_count` differently, as a one-shot reduction over an
 /// already-fully-collected `Vec<bool>` rather than a per-bit gate, so it
 /// isn't a caller of this helper -- see its own comment for why that shape
-/// doesn't unify cleanly with this one.
-fn select_emits<S: EvalSemantics>(truthy: bool, already_emitted: &mut bool) -> bool {
+/// doesn't unify cleanly with this one. `pub(crate)` since #2180 WP2b: that
+/// file's new *lazy* twin, `each_select_generic`, streams one output per
+/// truthy bit exactly as this function's own caller (`each_select`) does,
+/// so it reuses this gate directly instead of re-deriving it.
+pub(crate) fn select_emits<S: EvalSemantics>(truthy: bool, already_emitted: &mut bool) -> bool {
     if !truthy || (S::SELECT_EMITS_ONCE_IF_ANY_TRUTHY && *already_emitted) {
         return false;
     }
@@ -32960,7 +33386,12 @@ fn substitute_var_in_builtin(
 }
 
 /// Convert an OwnedValue to an Expr, preserving complex types.
-fn owned_to_expr(value: &OwnedValue) -> Expr {
+///
+/// `pub(crate)` since #2180 WP2b: `eval_generic.rs`'s own
+/// `each_index_expr_generic` reuses this to splice one already-computed key
+/// back into `eval_index_expr`'s unchanged key argument, the same way this
+/// file's own `each_index_expr` does.
+pub(crate) fn owned_to_expr(value: &OwnedValue) -> Expr {
     owned_to_expr_at_depth(value, 0)
 }
 
@@ -51807,16 +52238,19 @@ mod tests {
 
     /// #1902 review: `eval_as`'s eager bound-value fix has three siblings
     /// sharing the identical unpacking shape that were initially missed --
-    /// `materialize_bound_values` (the lazy twin backing `first`/`limit`/
-    /// `isempty` over an `as` bind, via `each_as`) and `eval_as_pattern`
+    /// `each_as` (the lazy twin backing `first`/`limit`/`isempty` over an
+    /// `as` bind; its own bound-value conversion moved onto
+    /// [`fanout_arg_each`] at #2180 WP2b, still the same checked
+    /// `to_owned`/`promote_borrowed`-shaped conversion) and `eval_as_pattern`
     /// (the destructuring spelling, `. as [$v] | ...` / `. as {k:$v} | ...`)
     /// -- confirmed live during review to still silently substitute `""`
     /// after the initial fix, since `.a as $v | $v` alone doesn't exercise
     /// either path.
     #[test]
     fn test_eval_as_lazy_and_destructuring_siblings_raise_on_decode_failure_1902() {
-        // `each_as`, via `first`'s lazy sink -- `materialize_bound_values`'s
-        // `QueryResult::One` arm.
+        // `each_as`, via `first`'s lazy sink -- `fanout_arg_each`'s own
+        // per-item conversion (#2180 WP2b; was `materialize_bound_values`'s
+        // `QueryResult::One` arm before this function existed).
         query!(
             b"{\"a\": \"\xff\xfe\"}",
             "first(.a as $v | $v)",
@@ -51846,9 +52280,9 @@ mod tests {
             ".obj as {k: $v} | $v",
             QueryResult::Error(e) => assert!(e.is_decode_failure())
         );
-        // `each_as`'s `materialize_bound_values` call, `QueryResult::Many`
-        // arm with a non-empty prefix: `.arr[]` binds two values, the
-        // first (valid) converts before the second (corrupted) fails.
+        // `each_as`'s `fanout_arg_each` drive, a non-empty prefix: `.arr[]`
+        // binds two values, the first (valid) converts before the second
+        // (corrupted) fails.
         query!(
             b"{\"arr\": [\"ok\", \"\xff\xfe\"]}",
             "[limit(2; .arr[] as $v | $v)]",
