@@ -42198,3 +42198,87 @@ fn test_alternative_still_raises_on_a_malformed_document_2476() -> Result<()> {
 
     Ok(())
 }
+
+/// #2072 step 0: jq mode's half of the oracle matrix for "a bound variable
+/// does not carry its node identity" (yq mode's half lives in
+/// `yq_cli_tests.rs`'s `test_bound_variable_carries_node_identity_2072`).
+/// Every row here **already passes** — the plan's own live probe confirmed
+/// jq mode is not wrong: real jq refuses `$x` inside `path()` unless it is
+/// `jv_identical` to the register, and `substitute_bound_var`'s
+/// `is_identity_passthrough` gate already reproduces that refuse/accept
+/// split exactly. This test exists so step 3's cross-cutting `Expr::TrackedVar`
+/// payload change (`BoundVar`/`BindOrigin`) cannot regress jq mode while
+/// fixing yq mode — every row is asserted against jq 1.7.1's *own* answer,
+/// captured live 2026-09-08, both stdout and (for the error rows) the exact
+/// stderr message and exit code.
+///
+/// Two shapes are deliberately excluded, both belonging to #2042 instead:
+/// `path(.a as $y | .a | $y)` (the register survives a re-navigation through
+/// an unrelated field — #2042's own headline case) and the destructuring
+/// register quirk `. as {a:$q} | ...` (jq's destructuring bind moves its
+/// register in a way plain `as $x` does not).
+#[test]
+fn test_path_through_bound_variable_matches_jq_2072() -> Result<()> {
+    let input = r#"{"a":[1,2,3]}"#;
+
+    // Rows real jq resolves to a path (or a plain value for `del`).
+    for (filter, expected) in [
+        ("path(. as $x | .[])", "[\"a\"]\n"),
+        (".a | path(. as $x | .[])", "[0]\n[1]\n[2]\n"),
+        ("path(.a | (. as $x | $x))", "[\"a\"]\n"),
+        ("path(1 as $x | .a)", "[\"a\"]\n"),
+        ("path(.a as $x | .a)", "[\"a\"]\n"),
+        ("del(.a as $x | .a[0])", "{\"a\":[2,3]}\n"),
+        (
+            "path(foreach .a[] as $i (.; .; $i))",
+            "[\"a\",0]\n[\"a\",1]\n[\"a\",2]\n",
+        ),
+        ("path(.a as $x | .a // $x)", "[\"a\"]\n"),
+        ("path(. as $x | 5 | $x)", "[]\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "`{filter}`: stderr={stderr}");
+        assert_eq!(stdout, expected, "`{filter}`");
+    }
+
+    // Rows real jq refuses outright: `$x` is not `jv_identical` to the
+    // register at the point it is read, so `path()`/`=` raise rather than
+    // resolve. Exit code 5 and the exact message, matching neighbouring
+    // `path()` error tests in this file.
+    for (filter, expected_stderr) in [
+        (
+            "path(.a as $x | $x)",
+            "Invalid path expression with result [1,2,3]",
+        ),
+        (
+            "path(.a as $x | $x[0])",
+            "Invalid path expression near attempt to access element 0 of [1,2,3]",
+        ),
+        (
+            "path(.a | (.[] as $x | $x))",
+            "Invalid path expression with result 1",
+        ),
+        (
+            "path(1 as $x | $x)",
+            "Invalid path expression with result 1",
+        ),
+        (
+            "(.a as $x | $x[0]) = 9",
+            "Invalid path expression near attempt to access element 0 of [1,2,3]",
+        ),
+        (
+            "path(.a as $x | $x // .a)",
+            "Invalid path expression with result [1,2,3]",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 5, "`{filter}`: stdout={stdout} stderr={stderr}");
+        assert!(stdout.is_empty(), "`{filter}` must not print: {stdout}");
+        assert!(
+            stderr.contains(expected_stderr),
+            "`{filter}` -- stderr: {stderr}"
+        );
+    }
+
+    Ok(())
+}
