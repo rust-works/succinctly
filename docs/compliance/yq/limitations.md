@@ -3097,7 +3097,7 @@ mode decides; `succinctly jq` keeps jq's model unchanged):
    loops the left operand's matches outermost and re-evaluates the right operand inside
    that loop, so `(.a.c, .b.c) + (1, 10)` is `4 13 6 15` where jq gives `4 6 13 15`.
 
-Three related divergences are **not** covered and stay open:
+Four related divergences are **not** covered and stay open:
 
 - **`EvaluateTogether`** ([#2427](https://github.com/rust-works/succinctly/issues/2427)) is
   what makes `[...]` collect once across documents and binary operators go cartesian under
@@ -3115,6 +3115,23 @@ Three related divergences are **not** covered and stay open:
   operands. Shared-node assignment is the same missing mechanism as the alias-node identity
   [the anchor-soundness section](#anchor-soundness-never-emit-yaml-we-cannot-read-back--rule-4a)
   records.
+- **An operand that is a bare variable.** Rule 2's pointer guard fires for a `$var`
+  operand too, and much harder than for `.`: real yq drops a union branch whose value comes
+  from a bare variable, and collapses a whole fan-out piped into one. Found by #2072's
+  differential fuzz and minimised to a *literal* binding, so it is not about node identity
+  and #2072 does not touch it (confirmed live against v4.53.3 on `a: {b: 1}` / `c: {b: 1}`):
+
+  ```console
+  $ yq          '5 as $x | 1, $x'          # 1          <- the `$x` branch is dropped
+  $ succinctly yq '5 as $x | 1, $x'        # 1 5
+  $ yq          '5 as $x | (1,2,3) | $x'   # 5          <- three inputs, one output
+  $ succinctly yq '5 as $x | (1,2,3) | $x' # 5 5 5
+  ```
+
+  A variable in the *first* branch is kept (`5 as $x | $x, 1` is `5 1` in both), which is
+  what places this with rule 2's backing-list comparison rather than with variables as such.
+  Not chased: collapsing a fan-out to one output is the direction that loses data, and
+  nothing in the corpus needs it.
 - **A missing-key stage in front of a union.** Rule 1 carries its context list as cursors,
   and an absent position (`.a.x` where `x` is not a key) is not a cursor, so a pipe whose
   prefix can land on one keeps spine 2416's path-context walk instead — which is exact for
@@ -3210,34 +3227,105 @@ Implementation Notes" #3 in `docs/reference/yq-language.md`), not something new 
 fix. `(.x, .y) | type` (no construction) answers correctly. See
 `tests/yq_cli_tests.rs`'s `test_yaml_explicit_tag_resolves_through_alias_903`.
 
-### A bound variable is a value, not the node it was bound to (spine 2416, walk residue)
+### A bound variable is a value, not the node it was bound to — resolved ([#2072](https://github.com/rust-works/succinctly/issues/2072)); an absent-key binding and an alias's flow style are residual gaps
 
 Real yq's variables hold *nodes*: `E as $x | body` binds the candidate nodes `E` produced,
 parent pointers and all, so a bare `$x` later in the pipe still knows where it came from.
-succinctly's binding substitutes the bound **value** into the body (`substitute_bound_var`,
-`src/jq/eval.rs`; ADR-0021 decision 7's rule for `as`), and a value has no position of its
-own. Captured from yq v4.53.3 on `a: {b: 1, e: 2}, ...` (`-o=json -I=0`):
+succinctly used to substitute the bound **value** into the body (`substitute_bound_var`,
+[src/jq/eval.rs](../../../src/jq/eval.rs)), and a value has no position of its own, so
+every position builtin read through `$x` answered from the ambient node or from nothing at
+all. #2072 closed that: `Expr::TrackedVar` now carries a `BoundVar` whose `BindOrigin`
+names the node the value came from — a document node as its
+`DocumentCursor::node_id` plus the owning document's `document_token`, or an owned-tree
+position for a binding made inside the owned identity pipe — and the use sites re-resolve
+it to a live cursor (`each_as_generic`, the path-context walk's variable step, and
+`OwnedIdentityRule::Bound`, all in
+[src/jq/eval_generic.rs](../../../src/jq/eval_generic.rs)). The value-equality
+approximation survives only as the fallback for a binding made where no cursor domain
+exists, and the document token is checked before an id is trusted, so a variable bound in
+one document and used in another (`--eval-all`, the reindex bridge) falls back to its
+value rather than to a same-numbered node of the wrong tree.
 
-| filter                             | real yq      | succinctly |
-|------------------------------------|--------------|------------|
-| `.a.b as $x \| $x \| key`            | `"b"`        | (nothing)  |
-| `.a.b as $x \| $x \| path`           | `["a","b"]`  | `[]`       |
-| `.a.b as $x \| .a \| $x \| key`       | `"b"`        | (nothing)  |
-| `.a.b as $x \| $x \| parent \| key`   | `"a"`        | (nothing)  |
-| `. as $x \| $x \| key`               | (nothing)    | (nothing)  |
-| `.a \| . as $x \| $x \| key`          | `"a"`        | `"a"`      |
-| `.a.x as $x \| $x \| key`            | (nothing)    | (nothing)  |
-| `.a as $x \| $x \| .b \| key`         | `"b"`        | `"b"`      |
+Re-captured 2026-09-08 from yq v4.53.3 (`-o=json -I=0`) on `a: {b: 1, e: 2}` /
+`c: {b: 1}` — the same eight rows the open version of this section listed, every one of
+them now agreeing:
 
-The rows that agree are the ones a value can answer: the `. as $x` passthrough, where the
-bound value *is* the stage's input and `OwnedIdentityRule::Bound` keeps the input's position
-(the same value-equality test `resolve_node` applies to a `TrackedVar`'s `path()`
-trackability), a binding of an absent node, and navigation *inside* the bound value. The rows
-that diverge all bind a node other than `.` and then read its position through the variable.
-The divergence predates the walk residue (the eager evaluator printed nothing for the same
-rows); what that pass changed is the route, not the answer. Closing it needs bindings that
-carry an identity alongside the value, the same node-identity machinery the anchor/alias
-section above records as unimplemented.
+| filter                              | real yq     | succinctly  |
+|-------------------------------------|-------------|-------------|
+| `.a.b as $x \| $x \| key`           | `"b"`       | `"b"`       |
+| `.a.b as $x \| $x \| path`          | `["a","b"]` | `["a","b"]` |
+| `.a.b as $x \| .a \| $x \| key`     | `"b"`       | `"b"`       |
+| `.a.b as $x \| $x \| parent \| key` | `"a"`       | `"a"`       |
+| `. as $x \| $x \| key`              | (nothing)   | (nothing)   |
+| `.a \| . as $x \| $x \| key`        | `"a"`       | `"a"`       |
+| `.a.x as $x \| $x \| key`           | (nothing)   | (nothing)   |
+| `.a as $x \| $x \| .b \| key`       | `"b"`       | `"b"`       |
+
+`line`/`column` agree too (`.a as $x | $x | line` is `2` and `| column` is `3` in both on
+that document), which the value model could not answer at all: they are cursor-only and are
+never derivable from an accumulated path.
+
+Two read-side residues remain, both of them predating #2072 and neither caused by the
+binding carrying an origin; the write side is unchanged and still refuse-only (below).
+
+**A variable bound from an absent key.** Real yq's `as` binds a *candidate list*, and a key
+lookup that finds nothing contributes no candidate, so the whole body is skipped — while
+the same key read without a binding is `null` at a real position. succinctly's value model
+has no absent-versus-null distinction to bind, so the variable stands at the missing key's
+position. Captured on `a: {b: 1}` / `c: {b: 1}` (`-o=json -I=0`):
+
+```console
+$ yq          '.c | (.a as $x | $x)'          # (nothing)
+$ succinctly yq '.c | (.a as $x | $x)'        # null
+$ yq          '.c | (.a as $x | $x) | path'   # (nothing)
+$ succinctly yq '.c | (.a as $x | $x) | path' # ["c","a"]
+$ yq          '.c | .a | path'                # ["c","a"]   <- unbound, both tools agree
+```
+
+This is the same read-only-context rule for a key lookup that finds nothing that
+`test_as_binding_keeps_the_input_identity_2563` already records for
+`.zzz as $v | [$v]` ([#2470](https://github.com/rust-works/succinctly/issues/2470)/[#2481](https://github.com/rust-works/succinctly/issues/2481)),
+reached through a bind source rather than through the walk.
+
+**An anchor's flow style read through an alias binding.** Captured on
+`a: "1" # keep` / `b: &anc [1, 2]` / `c: *anc` (YAML output):
+
+```console
+$ yq          '.b as $x | $x'   # &anc [1, 2]
+$ succinctly yq '.b as $x | $x' # &anc [1, 2]   <- the anchor and its flow style survive
+$ yq          '.c as $x | $x'   # *anc
+$ succinctly yq '.c as $x | $x' # - 1
+                                # - 2
+$ succinctly yq '.c'            # [1, 2]        <- unbound, the flow style survives
+```
+
+The `*anc` half is the anchor-soundness rule working as intended, not a gap: real yq emits
+an alias whose anchor appears nowhere in the output and cannot read its own answer back
+([the anchor-soundness section](#anchor-soundness-never-emit-yaml-we-cannot-read-back--rule-4a),
+rule 4(a)). What *is* a gap is the flow style: `.c` alone prints
+`[1, 2]`, and through the binding the alias's origin resolves to the alias node, whose own
+style mark is not the anchor node's, so the value is re-emitted in block style.
+
+**Writes through a variable are refuse-only.** Real yq's `as` copies the node into the
+variable, so a write through `$x` mutates the copy and the document is left alone; the
+copy is observable only if the same expression reads `$x` back. succinctly refuses the
+path expression outright. Captured on `a: [1, 2, 3]`:
+
+| filter                          | real yq (exit 0) | succinctly      |
+|---------------------------------|------------------|-----------------|
+| `.a as $x \| $x[0] = 9`         | `a: [1, 2, 3]`   | refuses, exit 1 |
+| `.a as $x \| del($x[0])`        | `a: [1, 2, 3]`   | refuses, exit 1 |
+| `.a as $x \| $x[0] \|= 9`       | `a: [1, 2, 3]`   | refuses, exit 1 |
+| `.a as $x \| $x[0] \|= 9 \| $x` | `[9, 2, 3]`      | refuses, exit 1 |
+
+succinctly's refusal is `Error: Invalid path expression near attempt to access element 0
+of [1,2,3]` in every row.
+
+Refuse-only is the permitted direction (ADR-0018 rule 4): the document is untouched under
+`-i` as well. #2072 deliberately did not change it — jq's `path()` resolver honours only
+`BoundVar::tracked` and never the origin, so nothing a cursor-emitting `$x` does can turn
+`$x[0] = 9` into a document write. `succinctly jq` matches jq 1.7.1 here exactly (both
+raise `Invalid path expression …`, exit 5) and is not affected.
 
 ### Other categories
 
