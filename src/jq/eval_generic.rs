@@ -3118,7 +3118,7 @@ fn owned_prefix_partial<V: DocumentValue, T>(
     for item in kept {
         match to_owned_one(item) {
             Ok(v) => prefix.push(v),
-            Err(e) => return GenericResult::Error(e),
+            Err(e) => return GenericResult::Error(e), // omni-dev: coverage tolerate-line reason="unreachable: both call sites only place already-successfully-converted items into `kept` before this re-converts them via the same pure `to_owned`/`to_owned_cursor` function, which cannot fail the second time on the same input (#2661)"
         }
     }
     partial_generic(prefix, control)
@@ -26097,6 +26097,121 @@ mod tests {
             result.collect_owned().unwrap(),
             vec![OwnedValue::Int(1), OwnedValue::Int(1)]
         );
+    }
+
+    /// `retain_truthy_generic`'s bare `GenericResult::One` arm (#2476) --
+    /// distinct from its `OneCursor` sibling every CLI-level `//` test
+    /// exercises: `Expr::Identity` only answers `One(value)` when the ambient
+    /// cursor is already `None` (`eval_single`'s own arm:
+    /// `cursor.map_or(GenericResult::One(value), GenericResult::OneCursor)`),
+    /// and the CLI's `eval_each_with_cursor` always starts from `Some` (see
+    /// `test_json_multi_stage_pipe_first_stage_bare_one_without_cursor`'s own
+    /// doc comment for the same reachability argument). Only the cursor-less
+    /// `eval()` entry point used here reaches it.
+    ///
+    /// A truthy `.` survives the `//` filter unchanged; a falsy one is
+    /// dropped, so the right side answers instead -- mirroring `retain_truthy
+    /// _generic`'s `OneCursor` arm one level up.
+    #[test]
+    fn test_generic_alternative_one_arm_truthy_and_falsy_2476() {
+        let json = br"1";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let result = eval(&crate::jq::parse(". // 5").unwrap(), value);
+        assert!(matches!(result, GenericResult::One(_)));
+        assert_eq!(result.collect_owned().unwrap(), vec![OwnedValue::Int(1)]);
+
+        let json = br"false";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let result = eval(&crate::jq::parse(". // 5").unwrap(), value);
+        assert!(
+            matches!(
+                result,
+                GenericResult::Owned(OwnedValue::NumberLiteral(NumberRepr::Int(5), _))
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// `retain_truthy_generic`'s bare `One` arm's own error branch: a
+    /// genuinely undecodable scalar (not reached through any cursor, so
+    /// neither `ambient_validation_error` nor an `OneCursor`-style walk ever
+    /// runs) still has to raise from `to_owned(&v)` rather than being
+    /// silently treated as truthy.
+    #[test]
+    fn test_generic_alternative_one_arm_decode_error_2476() {
+        let json = br#""bad\qc""#;
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let result = eval(&crate::jq::parse(". // 5").unwrap(), value);
+        assert!(result.is_error(), "{result:?}");
+    }
+
+    /// `retain_truthy_generic`'s bare `GenericResult::Many` arm (#2476) --
+    /// the `Vec<V>` sibling of the `One` arm just above, reachable the same
+    /// way: only from the cursor-less `eval()` entry point, via `select`'s
+    /// own cursor-less multi-output shape (same source
+    /// `test_generic_result_collect_owned_bare_many_variant` above uses).
+    ///
+    /// Every output is a copy of the same input, so both truthy (`1`, kept
+    /// as `Many`) and falsy (`false`, filtered down to `None` so the right
+    /// side answers) are exercised by varying the input rather than the
+    /// generator.
+    #[test]
+    fn test_generic_alternative_many_arm_truthy_and_falsy_2476() {
+        let json = br"1";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let result = eval(&crate::jq::parse("select(true,true) // 5").unwrap(), value);
+        assert!(matches!(result, GenericResult::Many(_)), "{result:?}");
+        assert_eq!(
+            result.collect_owned().unwrap(),
+            vec![OwnedValue::Int(1), OwnedValue::Int(1)]
+        );
+
+        let json = br"false";
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let result = eval(&crate::jq::parse("select(true,true) // 5").unwrap(), value);
+        assert!(
+            matches!(
+                result,
+                GenericResult::Owned(OwnedValue::NumberLiteral(NumberRepr::Int(5), _))
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// `retain_truthy_generic`'s bare `Many` arm's own error branch --
+    /// `owned_prefix_partial`'s other call site (`ManyCursor`'s is pinned by
+    /// `test_alternative_manycursor_validation_error_keeps_prefix_2476` in
+    /// `tests/yq_cli_tests.rs`). Deliberately *not* `.[]`: `Expr::Iterate`
+    /// always answers `ManyCursor` (`collect_cursors_checked` derives a
+    /// cursor per element regardless of whether the ambient root carried
+    /// one), so it would silently exercise the `ManyCursor` arm above
+    /// instead -- an earlier version of this test made exactly that
+    /// mistake, passing on the right externally-visible shape
+    /// (`owned_prefix_partial` is `to_owned`/`to_owned_cursor`-generic, so
+    /// both arms produce an identical `Partial` here) while covering the
+    /// wrong line.
+    ///
+    /// `select(true,true)`'s bare-`Many` arm only ever repeats *the same*
+    /// input value (`pass_n`'s `(n, None) => Many(repeat(value.clone())...)`
+    /// in `eval_builtin`'s own `Builtin::Select` arm), so there is no way to
+    /// keep a truthy element ahead of a distinct failing one the way the
+    /// `ManyCursor` sibling test does -- a malformed root fails on the very
+    /// first copy, with `kept` still empty. `owned_prefix_partial`'s own
+    /// loop body (the part that walks a *non-empty* `kept`) is already
+    /// covered via that `ManyCursor` sibling; this test's job is only line
+    /// 3181 itself (`Many`'s own `Err` arm).
+    #[test]
+    fn test_generic_alternative_many_arm_decode_error_2476() {
+        let json = br#""bad\qc""#;
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let result = eval(&crate::jq::parse("select(true,true) // 5").unwrap(), value);
+        assert!(result.is_error(), "{result:?}");
     }
 
     #[test]

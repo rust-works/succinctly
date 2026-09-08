@@ -39231,3 +39231,112 @@ fn test_alternative_no_longer_raises_through_a_container_alias_2476() -> Result<
 
     Ok(())
 }
+
+/// `retain_truthy_generic`'s `OneCursor` arm (`eval_generic.rs`) runs its own
+/// `push_generic_document_validation_error` call over the `//`'s *left*
+/// operand specifically, separately from the `ambient_validation_error` call
+/// that guards the whole `Expr::Alternative` arm before either operand runs.
+/// Every existing `//`-and-alias test lands on `ambient_validation_error`
+/// instead, because in each of them the left operand's cursor is the same
+/// position as the ambient `.` (`(. // 1)`, `(key // 1)`, ...) -- so the two
+/// checks always agree and the `OneCursor` arm's own check never gets to
+/// disagree with the ambient one.
+///
+/// This document splits the two: the ambient position (`.a`, an object with
+/// one field aliasing a corrupted array) is not itself an alias, so its walk
+/// descends one level and stops at the field's alias cursor (#1804's
+/// short-circuit) without ever reaching the array -- clean. The left operand
+/// (`.q[0]`) navigates *through* that alias into the array's own corrupted
+/// element, a plain scalar cursor with no alias short-circuit of its own, so
+/// only the `OneCursor` arm's check can catch it.
+#[test]
+fn test_alternative_onecursor_validation_error_differs_from_ambient_2476() -> Result<()> {
+    let doc = "x: &X [\"bad\\qc\"]\na:\n  q: *X\n";
+
+    let (_, stderr, code) = run_yq_stdin_with_stderr(".a | (.q[0] // 1)", doc, &[])?;
+    assert_ne!(code, 0, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("invalid escape sequence"),
+        "stderr: {stderr}"
+    );
+
+    Ok(())
+}
+
+/// `retain_truthy_generic`'s `ManyCursor` arm (`.[] // ...`, a fan-out
+/// through the left operand) hits a validation error partway through the
+/// fan-out, after at least one earlier element was already kept as truthy --
+/// exercising `owned_prefix_partial` (materializing that kept prefix into the
+/// `Partial` this stage terminates with) rather than just the arm's clean
+/// exhaustion path every other `//`-fan-out test takes.
+///
+/// Same alias-navigation shape as
+/// `test_alternative_onecursor_validation_error_differs_from_ambient_2476`
+/// just above, but `.q[]` instead of `.q[0]`: the ambient `.a` still stops at
+/// the field's alias short-circuit (clean), while the fan-out walks each
+/// array element's own cursor directly. `"ok"` streams out before the error,
+/// matching #400's rule (a generator's truthy prefix survives a
+/// mid-stream raise) -- `select`'s own `test_alternative_no_longer_raises_
+/// through_a_container_alias_2476` sibling never exercises this because its
+/// document has only one, single-element array.
+#[test]
+fn test_alternative_manycursor_validation_error_keeps_prefix_2476() -> Result<()> {
+    let doc = "x: &X [\"ok\", \"bad\\qc\"]\na:\n  q: *X\n";
+
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(".a | (.q[] // 1)", doc, &[])?;
+    assert_ne!(code, 0, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("invalid escape sequence"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(stdout.trim(), "ok", "stdout: {stdout:?}");
+
+    Ok(())
+}
+
+/// `retain_truthy_generic`'s `LazyKeys`/`LazyIndexRange` arm: both are
+/// returned from `//`'s left operand untouched, without materializing --
+/// `keys`/`keys_unsorted` on either an object or an array is unconditionally
+/// truthy (#140/#684), so `//` never even needs to look at what's inside.
+/// One row per variant, since they are two different `GenericResult` arms
+/// sharing one match pattern.
+#[test]
+fn test_alternative_lazy_keys_passthrough_2476() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr(".a | (keys // [])", "a:\n  x: 1\n  y: 2\n", &[])?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), "- x\n- y", "stdout: {stdout:?}");
+
+    let (stdout, stderr, code) =
+        run_yq_stdin_with_stderr(".a | (keys // [])", "a: [1, 2, 3]\n", &[])?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), "- 0\n- 1\n- 2", "stdout: {stdout:?}");
+
+    Ok(())
+}
+
+/// `retain_truthy_generic`'s `LazySeq` arm: `map(f)`'s result must still be
+/// *pulled* (unlike the `LazyKeys`/`LazyIndexRange` arm just above) because
+/// `f` runs arbitrary code that can fail -- `materialize_atomic`'s `Err`
+/// has to surface as the `//`'s own answer rather than being silently
+/// treated as "truthy" before the array is known to exist. The happy path
+/// (`Ok`) hands back the built array as an owned value; the failing path
+/// (`Err`) turns into a `Partial` with the error as its control.
+#[test]
+fn test_alternative_lazy_seq_materializes_before_truthiness_2476() -> Result<()> {
+    let doc = "a: [1, 2, 3]\n";
+
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(".a | (map(.+1) // [])", doc, &[])?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), "- 2\n- 3\n- 4", "stdout: {stdout:?}");
+
+    let (_, stderr, code) = run_yq_stdin_with_stderr(
+        ".a | (map(if . == 2 then error(\"boom\") else . end) // [])",
+        doc,
+        &[],
+    )?;
+    assert_ne!(code, 0, "stderr: {stderr:?}");
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
+
+    Ok(())
+}
