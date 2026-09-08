@@ -38436,7 +38436,10 @@ fn test_optional_head_is_walkable_2558() -> Result<()> {
 /// Four rows captured in the same run are **not** asserted here, because they
 /// diverge from yq before this change as much as after it -- none is caused by
 /// the `as` rule, and each is reproducible with a binding that reads no path
-/// context at all:
+/// context at all. Re-captured 2026-09-09 against yq v4.53.3 on both documents
+/// after #2072 gave bindings a node identity; all four still diverge, and for
+/// the same reason as before -- they are about what a bind source *produces*,
+/// not about where the produced value stood:
 ///
 /// ```text
 /// $ yq '.zzz as $v | [$v]'            []          succinctly [null]  (#2470/#2481)
@@ -38448,7 +38451,11 @@ fn test_optional_head_is_walkable_2558() -> Result<()> {
 /// The first three are yq's read-only-context rule for a key lookup that finds
 /// nothing (#2470), which succinctly applies to the *walk* but not to a bind
 /// source evaluated by the ordinary owned evaluator; the fourth is the same
-/// rule for a bind source that indexes a scalar (#2482).
+/// rule for a bind source that indexes a scalar (#2482). The first is also the
+/// absent-key residue `docs/compliance/yq/limitations.md` records against
+/// #2072 (`.c | (.a as $x | $x)`): real yq binds a candidate *list*, and a key
+/// lookup that finds nothing contributes no candidate, so the body never runs
+/// -- succinctly's value model has no absent-versus-null to bind.
 #[test]
 fn test_as_binding_keeps_the_input_identity_2563() -> Result<()> {
     let args = &["-o", "json", "-I0"];
@@ -39410,36 +39417,40 @@ const BOUND_VAR_DUP_VALUE_DOC_2072: &str = "a: {b: 1}\nc: {b: 1}\n";
 /// comment and anchor/alias mark survive a bind (ADR-0017).
 const BOUND_VAR_ANCHOR_DOC_2072: &str = "a: \"1\" # keep\nb: &anc [1, 2]\nc: *anc\n";
 
-/// #2072: a bound variable (`$x`) is re-materialised as a *value* by
+/// #2072: a bound variable (`$x`) used to be re-materialised as a *value* by
 /// `substitute_bound_var`, not kept as the node it was bound from — so every
 /// cursor property read through `$x` (`key`, `path`, `parent`, `line`,
-/// `column`, `document_index`) either answers as if `$x` were the document
-/// root, or (today) answers nothing at all. This test is the property, not
-/// the fix: it pins real yq's own answers, which step 3 of #2072 has to
-/// reproduce, and records what succinctly answers *today* (2026-09-08, this
-/// worktree at `baa26d72e`) so the diff step 3 must close is visible without
-/// re-running the capture.
+/// `column`, `document_index`) either answered as if `$x` were the document
+/// root, or answered nothing at all. `Expr::TrackedVar` now carries a
+/// `BoundVar::origin` naming the bind-time node, and the use sites re-resolve
+/// it to a live cursor.
 ///
-/// | filter (on `BOUND_VAR_ARRAY_DOC_2072`)        | real yq                | succinctly today |
-/// |------------------------------------------------|-------------------------|-------------------|
-/// | `.a \| (.[] as $x \| $x) \| key`                | `0` `1` `2`             | (nothing)         |
-/// | `.a \| (.[] as $x \| $x) \| path`               | `["a",0]` `["a",1]` `["a",2]` | `[]` `[]` `[]` |
-/// | `.a as $x \| $x \| path`                        | `["a"]`                 | `[]`              |
-/// | `.a[0] as $x \| .a[1] \| $x \| path`             | `["a",0]`                | `[]`              |
-/// | `.a[0] as $x \| .a[1] \| $x \| key`              | `0`                     | (nothing)         |
-/// | `.a as $x \| $x \| .[] \| path`                  | `["a",0]` `["a",1]` `["a",2]` | `[0]` `[1]` `[2]` |
-/// | `.a as $x \| $x \| parent`                       | `{"a":[1,2,3]}`          | (nothing)         |
-/// | `.a as $x \| $x \| parent(1) \| keys`             | `["a"]`                 | (nothing)         |
-/// | `.a as $x \| $x \| line`                         | `1`                     | `0`               |
-/// | `.a as $x \| $x \| column`                       | `4`                     | `0`               |
-/// | `.a as $x \| $x \| document_index`               | `0`                     | `0` (matches)     |
-/// | `.a as $x \| ($x \| .[0]) \| path`                | `["a",0]`                | `[0]`             |
-/// | `.a as $x \| ($x + [4]) \| path`                  | `["a"]`                 | `[]`              |
-/// | `.a as $x \| ($x \| length) \| path`              | `["a"]`                 | `[]`              |
-/// | `1 as $x \| $x \| path`                          | `[]`                    | `[]` (matches)    |
-/// | `1 as $x \| .a \| $x \| path`                     | `[]`                    | `[]` (matches)    |
-/// | `.a \| (. as $x \| $x) \| path`                   | `["a"]`                 | `["a"]` (matches) |
-/// | `.a \| (. as $x \| $x[0]) \| path`                | `["a",0]`                | `["a",0]` (matches) |
+/// The tables below are the oracle capture (2026-09-08, yq v4.53.3), with the
+/// pre-fix column kept so the diff #2072 closed stays legible without
+/// re-running it. Every "before" answer that differs from real yq is one this
+/// test now asserts real yq's value for; the exceptions are called out under
+/// each table.
+///
+/// | filter (on `BOUND_VAR_ARRAY_DOC_2072`) | real yq                       | succinctly before #2072 |
+/// |----------------------------------------|-------------------------------|-------------------------|
+/// | `.a \| (.[] as $x \| $x) \| key`       | `0` `1` `2`                   | (nothing)               |
+/// | `.a \| (.[] as $x \| $x) \| path`      | `["a",0]` `["a",1]` `["a",2]` | `[]` `[]` `[]`          |
+/// | `.a as $x \| $x \| path`               | `["a"]`                       | `[]`                    |
+/// | `.a[0] as $x \| .a[1] \| $x \| path`   | `["a",0]`                     | `[]`                    |
+/// | `.a[0] as $x \| .a[1] \| $x \| key`    | `0`                           | (nothing)               |
+/// | `.a as $x \| $x \| .[] \| path`        | `["a",0]` `["a",1]` `["a",2]` | `[0]` `[1]` `[2]`       |
+/// | `.a as $x \| $x \| parent`             | `{"a":[1,2,3]}`               | (nothing)               |
+/// | `.a as $x \| $x \| parent(1) \| keys`  | `["a"]`                       | (nothing)               |
+/// | `.a as $x \| $x \| line`               | `1`                           | `0`                     |
+/// | `.a as $x \| $x \| column`             | `4`                           | `0`                     |
+/// | `.a as $x \| $x \| document_index`     | `0`                           | `0` (matches)           |
+/// | `.a as $x \| ($x \| .[0]) \| path`     | `["a",0]`                     | `[0]`                   |
+/// | `.a as $x \| ($x + [4]) \| path`       | `["a"]`                       | `[]`                    |
+/// | `.a as $x \| ($x \| length) \| path`   | `["a"]`                       | `[]`                    |
+/// | `1 as $x \| $x \| path`                | `[]`                          | `[]` (matches)          |
+/// | `1 as $x \| .a \| $x \| path`          | `[]`                          | `[]` (matches)          |
+/// | `.a \| (. as $x \| $x) \| path`        | `["a"]`                       | `["a"]` (matches)       |
+/// | `.a \| (. as $x \| $x[0]) \| path`     | `["a",0]`                     | `["a",0]` (matches)     |
 ///
 /// `parent(n)` (`n=1`) is real yq's own spelling for an explicit depth, and
 /// is identical to bare `parent` at depth 1 — confirmed live (`yq
@@ -39447,36 +39458,47 @@ const BOUND_VAR_ANCHOR_DOC_2072: &str = "a: \"1\" # keep\nb: &anc [1, 2]\nc: *an
 /// `documentIndex` are accepted by real yq; `document_index` is used
 /// throughout since that is what succinctly's own `-o=json` capture used.
 ///
-/// | filter (on `BOUND_VAR_DUP_VALUE_DOC_2072`)      | real yq                | succinctly today |
-/// |---------------------------------------------------|-------------------------|-------------------|
-/// | `.a as $x \| .c \| $x \| path`                     | `["a"]`                 | `[]`              |
-/// | `.a as $x \| .c \| $x \| key`                      | `"a"`                   | (nothing)         |
-/// | `.a as $x \| .c \| $x \| .b \| path`                | `["a","b"]`              | `["b"]`           |
-/// | `.c \| (.a as $x \| $x) \| path`                    | (nothing — see below)   | `[]`              |
+/// | filter (on `BOUND_VAR_DUP_VALUE_DOC_2072`) | real yq               | succinctly before #2072 |
+/// |--------------------------------------------|-----------------------|-------------------------|
+/// | `.a as $x \| .c \| $x \| path`             | `["a"]`               | `[]`                    |
+/// | `.a as $x \| .c \| $x \| key`              | `"a"`                 | (nothing)               |
+/// | `.a as $x \| .c \| $x \| .b \| path`       | `["a","b"]`           | `["b"]`                 |
+/// | `.c \| (.a as $x \| $x) \| path`           | (nothing — see below) | `[]`                    |
 ///
-/// The last row is a genuine yq quirk, not a typo: `.c` is `{b: 1}`, which
-/// has no `.a`, so `.c | .a` alone answers `null` — but `.c | (.a as $x |
-/// $x)` (binding that same absent value to `$x` and re-emitting it) answers
-/// **nothing at all**, 0 bytes of output, confirmed live with `| wc -c`.
-/// Binding an absent value does not behave like re-emitting it unbound.
-/// succinctly disagrees either way: `.c | (.a as $x | $x)` there answers
-/// `null` (matching the unbound form), so `| path` on it is `[]`, not empty.
+/// The last row is a genuine yq quirk, not a typo, and is the one residue
+/// #2072 does **not** close: `.c` is `{b: 1}`, which has no `.a`, so
+/// `.c | .a` alone answers `null` — but `.c | (.a as $x | $x)` (binding that
+/// same absent value to `$x` and re-emitting it) answers **nothing at all**,
+/// 0 bytes of output, confirmed live with `| wc -c`. Real yq's `as` binds a
+/// candidate *list*, and a key lookup that finds nothing contributes no
+/// candidate, so the body never runs. succinctly's value model has no
+/// absent-versus-null distinction to bind, so the variable stands at the
+/// missing key's position: `.c | (.a as $x | $x)` is `null` (matching the
+/// unbound form) and `| path` is `["c","a"]` — the same path `.c | .a | path`
+/// answers in *both* tools. Recorded in `docs/compliance/yq/limitations.md`.
 ///
-/// | filter (on `BOUND_VAR_ANCHOR_DOC_2072`, YAML out) | real yq        | succinctly today   |
-/// |------------------------------------------------------|------------------|-----------------------|
-/// | `.b as $x \| $x`                                      | `&anc [1, 2]`    | `- 1` / `- 2` (anchor + flow style lost) |
-/// | `.c as $x \| $x`                                      | `*anc`           | `- 1` / `- 2` (alias expanded, block style) |
-/// | `.a as $x \| $x`                                      | `1`              | `1` (matches — see note) |
+/// | filter (on `BOUND_VAR_ANCHOR_DOC_2072`, YAML out) | real yq       | succinctly before #2072                     |
+/// |---------------------------------------------------|---------------|---------------------------------------------|
+/// | `.b as $x \| $x`                                  | `&anc [1, 2]` | `- 1` / `- 2` (anchor + flow style lost)    |
+/// | `.c as $x \| $x`                                  | `*anc`        | `- 1` / `- 2` (alias expanded, block style) |
+/// | `.a as $x \| $x`                                  | `1`           | `1` (matched already — see note)            |
 ///
-/// The `.a` row matches only because real yq's *plain* output already prints
-/// a lone top-level scalar unquoted regardless of binding (`.a` alone is
-/// also `1`, not `"1"`) — not evidence the comment survived. It does not:
-/// `.a | line_comment` is `keep` both directly and through `.a as $x | $x |
-/// line_comment` in real yq, but succinctly's own `.a as $x | $x |
-/// line_comment` answers **nothing** where `.a | line_comment` answers
-/// `keep` — the comment is dropped by the bind today, confirmed live but not
-/// asserted here (it is exercised through `#[ignore]`d coverage above, not a
-/// distinct oracle row, since `line_comment` was not in the requested list).
+/// The `.b` row is the anchor half of ADR-0017's preservation reaching a
+/// binding for the first time: `&anc [1, 2]` now, mark and flow style
+/// together. The `.c` row stays divergent for two independent reasons, both
+/// recorded in `docs/compliance/yq/limitations.md`. Real yq's `*anc` is
+/// output it cannot read back — no `&anc` appears anywhere in it — which the
+/// anchor-soundness rule (ADR-0018 rule 4(a)) forbids succinctly from
+/// emitting; and the alias binding's origin names the *alias* node, whose own
+/// style mark is not the anchor node's, so the value comes out in block style
+/// where the unbound `.c` prints `[1, 2]`. Only the second half is a gap.
+///
+/// The `.a` row matched already because real yq's *plain* output prints a
+/// lone top-level scalar unquoted regardless of binding (`.a` alone is also
+/// `1`, not `"1"`). The trailing comment, which used to be dropped by the
+/// bind, now survives it: `.a as $x | $x | line_comment` is `keep` in both
+/// tools, as `.a | line_comment` already was (captured live 2026-09-09; not
+/// asserted here, since `line_comment` was not in the requested oracle list).
 #[test]
 fn test_bound_variable_carries_node_identity_2072() -> Result<()> {
     let args = &["-o", "json", "-I0"];
@@ -39556,19 +39578,22 @@ fn test_bound_variable_carries_node_identity_2072() -> Result<()> {
 /// produced a `---` separator (compact `-I0` JSON has none — the separator
 /// is a plain-output convention), so none appears below.
 ///
-/// | filter                              | real yq   | succinctly today | passes today? |
-/// |--------------------------------------|-------------|---------------------|------------------|
-/// | `.x as $v \| $v \| fileIndex`         | `0` / `1`   | `0` / `1`            | yes              |
-/// | `.x as $v \| $v \| path`              | `["x"]` / `["x"]` | `[]` / `[]`     | no               |
-/// | `.x as $v \| .x \| $v \| line`         | `1` / `1`   | `0` / `0`            | no               |
-/// | `.x as $v \| 5 \| $v \| fileIndex`     | `0` / `1`   | `0` / `1`            | yes              |
-/// | `. as $v \| $v \| fileIndex`           | `0` / `1`   | `0` / `1`            | yes              |
+/// | filter                             | real yq           | passed before #2072? |
+/// |------------------------------------|-------------------|----------------------|
+/// | `.x as $v \| $v \| fileIndex`      | `0` / `1`         | yes                  |
+/// | `.x as $v \| $v \| path`           | `["x"]` / `["x"]` | no (was `[]` / `[]`) |
+/// | `.x as $v \| .x \| $v \| line`     | `1` / `1`         | no (was `0` / `0`)   |
+/// | `.x as $v \| 5 \| $v \| fileIndex` | `0` / `1`         | yes                  |
+/// | `. as $v \| $v \| fileIndex`       | `0` / `1`         | yes                  |
 ///
-/// The three passing rows are exactly the `OwnedIdentityRule::Bound`
-/// passthrough case the plan describes: `$v`'s bound value equals the
-/// stage's own input (or the file-scope arithmetic doesn't need a position
-/// at all), so the value-equality approximation happens to agree with real
-/// node identity. `path` and `line` need the actual node and diverge.
+/// The three rows that already passed are exactly the
+/// `OwnedIdentityRule::Bound` passthrough case: `$v`'s bound value equals the
+/// stage's own input (or the file-scope arithmetic doesn't need a position at
+/// all), so the value-equality approximation happened to agree with real node
+/// identity. `path` and `line` need the actual node, and #2072's `BindOrigin`
+/// is what supplies it — including across files, where the origin's
+/// `document_token` is what keeps a node id captured in `f1.yaml` from being
+/// applied to the same-numbered position of `f2.yaml`.
 #[test]
 fn test_bound_variable_eval_all_rows_2072() -> Result<()> {
     let mut f1 = NamedTempFile::new()?;
@@ -39660,6 +39685,51 @@ fn test_write_through_bound_variable_stays_refused_2072() -> Result<()> {
             before, after,
             "`{filter}` -i must leave the file byte-identical"
         );
+    }
+
+    Ok(())
+}
+
+/// #2072 closed a pre-existing **abort**, not only a wrong answer: a pipe
+/// headed by a bound variable and then navigated inside an arithmetic operand
+/// (`$x.a[0] + 1`) was admitted by the owned identity pipe's operand grammar
+/// (`owned_identity_operand_supported` accepts a `Expr::Pipe` of navigation)
+/// but could not be *taken* by its navigation step, which reached an
+/// `unreachable!`. The step takes a variable-headed pipe now.
+///
+/// Captured live 2026-09-09 from Homebrew yq v4.53.3 on `a: [1, 2, 3]`
+/// (`yq -o=json -I=0`):
+///
+/// ```console
+/// $ yq '. as $x | ($x.a[0] + 1)'          2
+/// $ yq '. as $x | ($x.a[0] + 1) | path'   ["a",0]
+/// $ yq '. as $x | ($x.a[0] + 1) | key'    0
+/// $ yq '.a as $x | ($x[0] + 1) | key'     0
+/// $ yq '.a as $x | ($x[0] + 1) | path'    ["a",0]
+/// ```
+///
+/// The answers are `OwnedIdentityRule::LeftOperand`'s: the sum stands where
+/// its left operand stood, and the left operand is the node `$x` was bound
+/// from, navigated. A crash is not an answer at all, so this is pinned
+/// separately from the read-side matrix above — a regression here would show
+/// as a non-zero exit and an abort message, which
+/// `run_yq_stdin_with_stderr`'s own exit-code check reports.
+#[test]
+fn test_bound_variable_operand_pipe_does_not_abort_2072() -> Result<()> {
+    for (filter, expected) in [
+        (". as $x | ($x.a[0] + 1)", "2"),
+        (". as $x | ($x.a[0] + 1) | path", "[\"a\",0]"),
+        (". as $x | ($x.a[0] + 1) | key", "0"),
+        (".a as $x | ($x[0] + 1) | key", "0"),
+        (".a as $x | ($x[0] + 1) | path", "[\"a\",0]"),
+    ] {
+        let (stdout, stderr, code) =
+            run_yq_stdin_with_stderr(filter, BOUND_VAR_ARRAY_DOC_2072, &["-o", "json", "-I0"])?;
+        assert_eq!(
+            code, 0,
+            "`{filter}` -- stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert_eq!(stdout.trim_end(), expected, "`{filter}`");
     }
 
     Ok(())

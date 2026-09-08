@@ -37041,13 +37041,19 @@ fn test_isolated_subexpr_threads_per_output_path_1409() -> Result<()> {
         ".a | limit(3; .[]) | key",
         // `As` reaches its own path-context arm only when `expr` or `body`
         // needs path context on its own; `select(key >= 0)` is what routes
-        // this shape there. The bare `. as $x | .[]` form is a separate,
-        // still-open routing gap (#2072): widening the guard to consult
-        // `rest` reaches it, but regresses `.x as $v | $v | file_index`,
-        // because `substitute_bound_var` re-materialises the bound value as
-        // a literal and erases the node identity real yq keeps.
+        // this shape there.
         ".a | (. as $x | (.[] | select(key >= 0))) | key",
         ".a | (. as [$x] | (.[] | select(key >= 0))) | key",
+        // The bare spellings were a routing gap until #2072: widening the
+        // guard to consult `rest` reached them, but regressed
+        // `.x as $v | $v | file_index`, because `substitute_bound_var`
+        // re-materialised the bound value as a literal and erased the node
+        // identity real yq keeps. A binding now carries that identity
+        // (`BoundVar::origin`), so both spellings thread per-output paths
+        // and `file_index` still answers. `yq '.a | (. as $x | .[]) | key'`
+        // on `a: [1,2,3]` is `0 1 2` on yq v4.53.3, captured 2026-09-08.
+        ".a | (. as $x | .[]) | key",
+        ".a | (. as [$x] | .[]) | key",
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(code, 0, "{filter}: {stderr}");

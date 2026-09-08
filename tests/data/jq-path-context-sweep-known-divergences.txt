@@ -54,22 +54,24 @@ yq/*/first/*/*        yq_first        real yq's first(f) ignores its argument an
 # `descend_path` rows that stood here (`key`/`parent`/`path` under `..`) went
 # with it.
 
-# #2072: a leaf read through an `as`-bound variable (`.a as $x | $x | key`,
-# the `bind_*` prefix family added 2026-09-08) sees no node identity at all —
-# `substitute_bound_var` re-materialises `$x` as a value, not the node it was
-# bound from. `bind_root` (`. as $x | $x`) is exempt: the bound value there
-# equals the ambient input exactly, so the existing value-equality
-# passthrough (`OwnedIdentityRule::Bound`) happens to agree with real
-# identity by coincidence. `select`'s own `path`-leaf combination is exempt
-# too: `select((path) != null)` only asks whether the produced path is
-# non-null, which is true either way, so nothing observes the wrong path
-# value there. Every other `key`/`parent`/`path` row under a `bind_*` prefix
-# does diverge, `file_index` does not (it is exactly the value-equality
-# passthrough case `test_bound_variable_eval_all_rows_2072` documents as
-# already passing).
-yq/key/*/plain/bind_*      bind_identity   a bound variable ($x) carries no node identity — key answers wrong or nothing — #2072
-yq/parent/*/plain/bind_*   bind_identity   a bound variable ($x) carries no node identity — parent answers wrong or nothing — #2072
-yq/path/*/plain/bind_*     bind_identity   a bound variable ($x) carries no node identity — path answers `[]` instead of the real path — #2072
+# #2072 (closed 2026-09-08): a leaf read through an `as`-bound variable
+# (`.a as $x | $x | key`, the `bind_*` prefix family added by #2072 step 0)
+# used to see no node identity at all — `substitute_bound_var` re-materialised
+# `$x` as a value, not the node it was bound from — so every `key`/`parent`/
+# `path` row under a `bind_*` prefix diverged. Three glob entries stood here
+# for that. A bound variable now carries a `BindOrigin` and re-emits the live
+# node, so the whole family agrees with yq v4.53.3 and the entries were
+# removed: this sweep's own two-sided staleness check is what forced their
+# removal rather than letting the fix be absorbed by them. `file_index` never
+# diverged (it is the value-equality passthrough case
+# `test_bound_variable_eval_all_rows_2072` documents as already passing).
+#
+# Two `as`-binding residues #2072 leaves are *not* reachable from this
+# alphabet, so they have no entry here: a variable bound from an absent key
+# (yq emits nothing where succinctly binds `null`) and the flow style of an
+# anchor node read through an alias binding. Both are pinned by
+# `test_bound_variable_carries_node_identity_2072` and recorded in
+# `docs/compliance/yq/limitations.md`.
 
 # --- jq mode ----------------------------------------------------------------
 
