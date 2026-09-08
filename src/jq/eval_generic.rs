@@ -53,8 +53,8 @@ use super::document::{
 use super::error::EvalEscape;
 use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, binary_fanout_rules, bind_def, bind_def_call,
-    boolean_fanout_bools, cannot_reserve_cross_product, classify_limit_n, classify_nth_n,
-    classify_parent_n, collapse_vec, collect_pattern_var_names, compare_values,
+    boolean_fanout_bools, boolean_fanout_each, cannot_reserve_cross_product, classify_limit_n,
+    classify_nth_n, classify_parent_n, collapse_vec, collect_pattern_var_names, compare_values,
     debug_assert_materialization_error, enter_def_call_frame, entries_to_object, eval_each_owned,
     eval_foreach_with_values, eval_full as full_eval, eval_reduce_with_values,
     extract_pattern_bindings, finish_short_circuit, fold_escaped_generator_prefix, format_owned,
@@ -7850,6 +7850,41 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             | Builtin::UpperInSrc(..),
         ) => bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink),
 
+        // #2180 WP2a: `and`/`or` with a path-context operand, mirroring
+        // `eval_single`'s own gated `Expr::And`/`Expr::Or` pair above --
+        // same gate, same reason (#1812: the bridge's ambient
+        // materialization is what makes `try (1+1) catch "x"` fail on a
+        // #1194-malformed document, and a path-context operand could not
+        // have stood on such a document and survived the walk anyway). The
+        // ungated spelling would have silently taken `.[] | key == "a" and
+        // true` off its cursor when it is reached through a lazy consumer.
+        Expr::And(left, right) if needs_path_context(left) || needs_path_context(right) => {
+            each_boolean_generic::<S, V>(left, right, false, value, optional, cursor, sink)
+        }
+        Expr::Or(left, right) if needs_path_context(left) || needs_path_context(right) => {
+            each_boolean_generic::<S, V>(left, right, true, value, optional, cursor, sink)
+        }
+        // #2180 WP2a: everything else `and`/`or`, and `//` at any position,
+        // takes the demand-forwarding owned bridge -- which is *exactly*
+        // what these three already did, minus the demand. `Expr::And`/
+        // `Expr::Or` without path context fell to the `_` fallback below,
+        // whose `eval_single` in turn falls to its own wildcard bridge;
+        // `Expr::Alternative` has no native arm in `eval_single` at all, so
+        // it took that same wildcard for every input. Both wildcards are
+        // `to_owned_with_cursor` + reindex + `eval.rs`, which is
+        // [`bridge_to_each_owned_flow`]'s own body with `eval_full` in place
+        // of `eval_each` -- so nothing is lost by crossing here instead, and
+        // the far side now carries `eval.rs`'s new `each_alternative`/
+        // `each_boolean` arms. Rows captured live against jq 1.7.1 (input
+        // `1`, `G` = `1 as $x ?// $y | 1`): `[first((1 as $x ?// $y |
+        // 5)//9)]` is `[5,5]`, `[first(null // (G))]` is `[1,1]`, and all
+        // four `and`/`or` operand positions are `[true,true]` -- each
+        // answered once before this arm existed, on this route as well as
+        // `eval.rs`'s.
+        Expr::And(..) | Expr::Or(..) | Expr::Alternative(..) => {
+            bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink)
+        }
+
         // spine 2416 (walk residue; #2428): `..` over a live node emits every
         // node as its own cursor, so a stage after it reads `key`/`path`/
         // `parent` as cursor properties instead of losing them to the
@@ -10216,6 +10251,79 @@ fn eval_boolean_generic<S: EvalSemantics, V: DocumentValue>(
         Some(control) => partial_generic(outputs, control),
         None => owned_vec_to_generic_result(outputs),
     }
+}
+
+/// Truthiness of one [`GenericItem`], as the `bool`
+/// [`eval::boolean_fanout_each`] speaks (#2180 WP2a).
+///
+/// Routed through [`generic_item_to_result`] + [`push_generic_truthiness`]
+/// rather than a fourth per-variant `match`: those two already answer this
+/// question for every shape an item can take -- including the cursor's own
+/// O(1) `is_falsy` fast path and the #1247/#1194 validation raise that has
+/// to come before it, and `LazySeq`'s materialize-to-find-out failure -- and
+/// a copy here would be the "duplicated predicates diverge silently" shape
+/// this project has been bitten by before (#106).
+fn generic_item_truthiness<V: DocumentValue>(item: GenericItem<V>) -> Result<bool, Control> {
+    let mut bits = Vec::new();
+    match push_generic_truthiness(generic_item_to_result(item), &mut bits) {
+        Some(control) => Err(control),
+        // One item is one output, so exactly one bit -- `false` stands in
+        // for the by-construction-unreachable empty case rather than a
+        // panic, the same defensive choice `binary_fanout_core` makes for
+        // its own impossible `Flow::Stopped`.
+        None => Ok(bits.first().copied().unwrap_or(false)),
+    }
+}
+
+/// Demand-forwarding twin of [`eval_boolean_generic`] (#2180 WP2a), for an
+/// `and`/`or` whose operands read path context.
+///
+/// The loop is `eval::boolean_fanout_each`, shared with every other route
+/// (see its own doc comment for the oracle rows that pinned the left-outer
+/// nesting and the short-circuit rule); this supplies
+/// [`eval_each_generic`] *plus the cursor* as the operand strategy, so
+/// `key`/`parent`/`path` inside an operand still resolve against the node
+/// this stage stands on while a wrapping consumer's [`Demand::Stop`] reaches
+/// through to a generator -- or a `?//` bind (#1519) -- inside it.
+///
+/// The escape channel is per-strategy-call, not shared: a truthiness probe
+/// that fails (`generic_item_truthiness`'s `Err`) can only answer `Demand`
+/// to the loop, so the control it carries is recorded beside the drive and
+/// folded in as this operand's own `Flow::Escaped` -- the same out-of-band
+/// shape `fanout_arg_each`/`each_any_all_gen_cond` use in `eval.rs`.
+fn each_boolean_generic<S: EvalSemantics, V: DocumentValue>(
+    left: &Expr,
+    right: &Expr,
+    short_circuit: bool,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    boolean_fanout_each(
+        |operand, bit_sink| {
+            let mut escape: Option<Control> = None;
+            let flow =
+                eval_each_generic::<S, V>(operand, value.clone(), optional, cursor, &mut |item| {
+                    match generic_item_truthiness(item) {
+                        Ok(bit) => bit_sink(bit),
+                        Err(control) => {
+                            escape = Some(control);
+                            Demand::Stop
+                        }
+                    }
+                });
+            match escape {
+                Some(control) => Flow::Escaped(control),
+                None => flow,
+            }
+        },
+        left,
+        right,
+        short_circuit,
+        binary_fanout_rules::<S>(EmptyOperandOp::Boolean),
+        &mut |bit| sink(GenericItem::Owned(OwnedValue::Bool(bit))),
+    )
 }
 
 /// Shared resolution of [`each_take_first_generic`]'s and
