@@ -396,7 +396,7 @@ pub enum Expr {
     /// iteration that re-embeds it.
     ///
     /// #2042: the snapshot also records where it was bound
-    /// ([`Tracked::origin`]), so a variable bound from a *navigated*
+    /// (`Tracked::origin`), so a variable bound from a *navigated*
     /// position (`.a as $y`) can be certified against the path register
     /// by node identity rather than by value alone -- two distinct nodes
     /// holding equal values must not be confused (`path(.a as $y | .c |
