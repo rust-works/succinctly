@@ -54,23 +54,25 @@ use super::error::EvalEscape;
 use super::eval::{
     apply_compare_op, arith_combine, as_var_refs, binary_fanout_rules, bind_def, bind_def_call,
     boolean_fanout_bools, boolean_fanout_each, cannot_reserve_cross_product, classify_limit_n,
-    classify_nth_n, classify_parent_n, collapse_vec, collect_pattern_var_names, compare_values,
-    debug_assert_materialization_error, enter_def_call_frame, entries_to_object, eval_each_owned,
-    eval_foreach_with_values, eval_full as full_eval, eval_reduce_with_values,
-    extract_pattern_bindings, finish_fork_flow, finish_short_circuit,
-    fold_escaped_generator_prefix, foreach_fork, foreach_pattern_var_names, format_owned,
-    has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
+    classify_nth_n, classify_parent_n, clear_nonretryable_stop, collapse_vec,
+    collect_pattern_var_names, compare_values, debug_assert_materialization_error,
+    enter_def_call_frame, entries_to_object, eval_each_owned, eval_foreach_with_values,
+    eval_full as full_eval, eval_reduce_with_values, extract_pattern_bindings, finish_fork_flow,
+    finish_short_circuit, fold_escaped_generator_prefix, foreach_fork, foreach_pattern_var_names,
+    format_owned, has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
     index_one_owned as index_owned_by_key, is_pure_chain_link, is_retryable_stop, literal_to_owned,
-    needs_path_context, numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned,
-    owned_bound_to_i64, owned_to_expr, owned_to_string, param_names, prefer_pending_control,
-    select_emits, slice_component_value, slice_object_as_yq_children, slice_owned_value_read,
-    streams_escaped_generator_prefix, substitute_bound_var_from, substitute_foreach_steps,
-    substitute_vars, suppress_or_raise, suppresses, tonumber_from_str, vec_with_capacity,
-    yq_absent_key_read_is_empty, yq_assign_rhs_document, yq_empty_operand_output,
-    yq_field_index_on_scalar_is_empty, yq_negative_index_check, yq_numeric_index_on_object_is_null,
-    yq_object_key_stringify, yq_read_only_context, BinaryFanoutRules, Control, Demand,
-    EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, ForeachStepAlternative, JqSemantics,
-    LimitN, PathTrail, QueryResult, YqSemantics, REDUCE_FOREACH_MAX_STEPS,
+    mark_nonretryable_escape, needs_path_context, numeric_key_to_array_index, numeric_key_to_index,
+    numeric_length_owned, owned_bound_to_i64, owned_to_expr, owned_to_string, param_names,
+    prefer_pending_control, resume_from_escape, select_emits, slice_component_value,
+    slice_object_as_yq_children, slice_owned_value_read, stop_with_downstream, stop_with_error,
+    stop_with_escape, streams_escaped_generator_prefix, substitute_bound_var_from,
+    substitute_foreach_steps, substitute_vars, suppress_or_raise, suppresses, tonumber_from_str,
+    vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
+    yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_negative_index_check,
+    yq_numeric_index_on_object_is_null, yq_object_key_stringify, yq_read_only_context,
+    BinaryFanoutRules, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
+    ForeachStepAlternative, JqSemantics, LimitN, PathTrail, QueryResult, YqSemantics,
+    REDUCE_FOREACH_MAX_STEPS,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -8052,10 +8054,7 @@ fn each_foreach_generic<S: EvalSemantics, V: DocumentValue>(
         let flow = eval_each_generic::<S, V>(input, value.clone(), optional, cursor, &mut |item| {
             let input_val = match generic_item_into_owned(item) {
                 Ok(v) => v,
-                Err(control) => {
-                    escape = Some(control);
-                    return Demand::Stop;
-                }
+                Err(control) => return stop_with_escape(&mut escape, control),
             };
             let row = substitute_foreach_steps(
                 patterns,
@@ -8069,10 +8068,7 @@ fn each_foreach_generic<S: EvalSemantics, V: DocumentValue>(
             recorded.push(input_val);
             demand
         });
-        match escape {
-            Some(control) => Flow::Escaped(control),
-            None => flow,
-        }
+        resume_from_escape(escape, flow)
     };
 
     for init_val in init_values {
@@ -8357,10 +8353,7 @@ fn each_if_generic<S: EvalSemantics, V: DocumentValue>(
     let cond_flow = eval_each_generic::<S, V>(cond, value.clone(), optional, cursor, &mut |item| {
         let truthy = match generic_item_truthiness(item) {
             Ok(b) => b,
-            Err(control) => {
-                escape = Some(control);
-                return Demand::Stop;
-            }
+            Err(control) => return stop_with_escape(&mut escape, control),
         };
         let branch = if truthy { then_branch } else { else_branch };
         match eval_each_generic::<S, V>(branch, value.clone(), optional, cursor, sink) {
@@ -8369,10 +8362,7 @@ fn each_if_generic<S: EvalSemantics, V: DocumentValue>(
                 outer_stopped = true;
                 Demand::Stop
             }
-            Flow::Escaped(control) => {
-                escape = Some(control);
-                Demand::Stop
-            }
+            Flow::Escaped(control) => stop_with_escape(&mut escape, control),
         }
     });
 
@@ -8425,10 +8415,7 @@ fn each_try_generic<S: EvalSemantics, V: DocumentValue>(
     let flow = eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| {
         match check_lazy_item_for_try(item) {
             Ok(item) => sink(item),
-            Err(control) => {
-                lazy_fault = Some(control);
-                Demand::Stop
-            }
+            Err(control) => stop_with_escape(&mut lazy_fault, control),
         }
     });
     let flow = match lazy_fault {
@@ -8819,6 +8806,10 @@ fn each_pattern_alternatives_generic<S: EvalSemantics, V: DocumentValue>(
         );
 
         let mut lazy_fault: Option<Control> = None;
+        // #2180 WP3 review: one attempt, one clear -- see
+        // `eval::each_pattern_alternatives`'s identical call and
+        // `eval::nonretryable_stop`.
+        clear_nonretryable_stop();
         let flow = eval_each_generic::<S, V>(
             &substituted_body,
             value.clone(),
@@ -8826,16 +8817,10 @@ fn each_pattern_alternatives_generic<S: EvalSemantics, V: DocumentValue>(
             cursor,
             &mut |item| match check_lazy_item_for_try(item) {
                 Ok(item) => sink(item),
-                Err(control) => {
-                    lazy_fault = Some(control);
-                    Demand::Stop
-                }
+                Err(control) => stop_with_escape(&mut lazy_fault, control),
             },
         );
-        let flow = match lazy_fault {
-            Some(control) => Flow::Escaped(control),
-            None => flow,
-        };
+        let flow = resume_from_escape(lazy_fault, flow);
 
         match flow {
             Flow::Exhausted => return Flow::Exhausted,
@@ -9115,8 +9100,7 @@ fn each_nth_generic<S: EvalSemantics, V: DocumentValue>(
             // `last(limit($n + 1; f))` desugaring, so its lazy computation
             // still has to run for its errors -- see `nth_with_n_generic`.
             if let Err(control) = generic_item_into_owned(item) {
-                skipped_err = Some(control);
-                return Demand::Stop;
+                return stop_with_escape(&mut skipped_err, control);
             }
             Demand::Continue
         });
@@ -9169,10 +9153,7 @@ fn each_select_generic<S: EvalSemantics, V: DocumentValue>(
     let flow = eval_each_generic::<S, V>(cond, value.clone(), false, cursor, &mut |item| {
         let truthy = match generic_item_truthiness(item) {
             Ok(b) => b,
-            Err(control) => {
-                escape = Some(control);
-                return Demand::Stop;
-            }
+            Err(control) => return stop_with_escape(&mut escape, control),
         };
         if !select_emits::<S>(truthy, &mut already_emitted) {
             return Demand::Continue;
@@ -9182,10 +9163,7 @@ fn each_select_generic<S: EvalSemantics, V: DocumentValue>(
             None => sink(GenericItem::One(value.clone())),
         }
     });
-    match escape {
-        Some(control) => Flow::Escaped(control),
-        None => flow,
-    }
+    resume_from_escape(escape, flow)
 }
 
 /// Demand-forwarding twin of `eval::each_index_expr` (#2180 WP2b), reusing
@@ -9234,10 +9212,7 @@ fn each_index_expr_generic<S: EvalSemantics, V: DocumentValue>(
                 // `eval_index_expr_generic`'s own `One` arm.
                 let k = match to_owned_key_shape(&v) {
                     Ok(k) => k,
-                    Err(e) => {
-                        escape = Some(Control::Error(e));
-                        return Demand::Stop;
-                    }
+                    Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
                 };
                 if process_index_key::<S, V>(
                     target,
@@ -9258,10 +9233,7 @@ fn each_index_expr_generic<S: EvalSemantics, V: DocumentValue>(
                 // STYLE-0012: key generator -- see the `One` arm above.
                 let k = match to_owned_key_shape_cursor(&c) {
                     Ok(k) => k,
-                    Err(e) => {
-                        escape = Some(Control::Error(e));
-                        return Demand::Stop;
-                    }
+                    Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
                 };
                 if process_index_key::<S, V>(
                     target,
@@ -9284,10 +9256,7 @@ fn each_index_expr_generic<S: EvalSemantics, V: DocumentValue>(
             | GenericItem::LazySeq(_)) => {
                 let ks = match generic_item_to_result(item).collect_owned() {
                     Ok(ks) => ks,
-                    Err(e) => {
-                        escape = Some(Control::Error(e));
-                        return Demand::Stop;
-                    }
+                    Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
                 };
                 for k in &ks {
                     if !process_index_key::<S, V>(
@@ -9310,10 +9279,7 @@ fn each_index_expr_generic<S: EvalSemantics, V: DocumentValue>(
     if outer_stopped {
         return flow;
     }
-    match escape {
-        Some(control) => Flow::Escaped(control),
-        None => flow,
-    }
+    resume_from_escape(escape, flow)
 }
 
 /// One already-computed key, indexed against `target` via
@@ -9345,7 +9311,7 @@ fn process_index_key<S: EvalSemantics, V: DocumentValue>(
             false
         }
         Flow::Escaped(control) => {
-            *escape = Some(control);
+            stop_with_escape(escape, control);
             false
         }
     }
@@ -9412,10 +9378,7 @@ fn each_object_entries_generic<S: EvalSemantics, V: DocumentValue>(
                 eval_each_generic::<S, V>(key_expr, value.clone(), optional, cursor, &mut |item| {
                     let key_owned = match generic_item_into_owned(item) {
                         Ok(v) => v,
-                        Err(control) => {
-                            escape = Some(control);
-                            return Demand::Stop;
-                        }
+                        Err(control) => return stop_with_escape(&mut escape, control),
                     };
                     let key_str = match &key_owned {
                         OwnedValue::String(s) => s.clone(),
@@ -9425,10 +9388,10 @@ fn each_object_entries_generic<S: EvalSemantics, V: DocumentValue>(
                                 if optional {
                                     return Demand::Continue;
                                 }
-                                escape = Some(Control::Error(EvalError::cannot_use_as_object_key(
-                                    &key_owned,
-                                )));
-                                return Demand::Stop;
+                                return stop_with_escape(
+                                    &mut escape,
+                                    Control::Error(EvalError::cannot_use_as_object_key(&key_owned)),
+                                );
                             }
                         },
                     };
@@ -9447,19 +9410,13 @@ fn each_object_entries_generic<S: EvalSemantics, V: DocumentValue>(
                             outer_stopped = true;
                             Demand::Stop
                         }
-                        Flow::Escaped(control) => {
-                            escape = Some(control);
-                            Demand::Stop
-                        }
+                        Flow::Escaped(control) => stop_with_escape(&mut escape, control),
                     }
                 });
             if outer_stopped {
                 return flow;
             }
-            match escape {
-                Some(control) => Flow::Escaped(control),
-                None => flow,
-            }
+            resume_from_escape(escape, flow)
         }
     }
 }
@@ -9486,10 +9443,7 @@ fn each_object_value_generic<S: EvalSemantics, V: DocumentValue>(
         eval_each_generic::<S, V>(value_expr, value.clone(), optional, cursor, &mut |item| {
             let val_owned = match generic_item_into_owned(item) {
                 Ok(v) => v,
-                Err(control) => {
-                    escape = Some(control);
-                    return Demand::Stop;
-                }
+                Err(control) => return stop_with_escape(&mut escape, control),
             };
             acc.push((key.clone(), val_owned));
             let result = each_object_entries_generic::<S, V>(
@@ -9507,19 +9461,13 @@ fn each_object_value_generic<S: EvalSemantics, V: DocumentValue>(
                     outer_stopped = true;
                     Demand::Stop
                 }
-                Flow::Escaped(control) => {
-                    escape = Some(control);
-                    Demand::Stop
-                }
+                Flow::Escaped(control) => stop_with_escape(&mut escape, control),
             }
         });
     if outer_stopped {
         return flow;
     }
-    match escape {
-        Some(control) => Flow::Escaped(control),
-        None => flow,
-    }
+    resume_from_escape(escape, flow)
 }
 
 /// Generic-evaluator twin of `eval::eval_each_pipe` (#1461): the "stop
@@ -9676,10 +9624,7 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
             };
             match flow {
                 Flow::Exhausted => Demand::Continue,
-                other => {
-                    downstream = Some(other);
-                    Demand::Stop
-                }
+                other => stop_with_downstream(&mut downstream, other),
             }
         };
         eval_each_generic::<S, V>(first, value, optional, cursor, &mut driver)
@@ -9908,10 +9853,7 @@ fn collect_yq_context<S: EvalSemantics, V: DocumentValue>(
                 out.push(entry);
                 Demand::Continue
             }
-            Err(control) => {
-                stray = Some(control);
-                Demand::Stop
-            }
+            Err(control) => stop_with_escape(&mut stray, control),
         }
     });
     match (stray, flow) {
@@ -10158,10 +10100,7 @@ fn collect_together<S: EvalSemantics, V: DocumentValue>(
                     merged.push(other);
                     Demand::Continue
                 }
-                Err(control) => {
-                    stray = Some(control);
-                    Demand::Stop
-                }
+                Err(control) => stop_with_escape(&mut stray, control),
             }
         });
         if let Some(control) = stray {
@@ -10218,10 +10157,7 @@ fn cross_together<S: EvalSemantics, V: DocumentValue>(
             produced.push(entry);
             Demand::Continue
         }
-        Err(control) => {
-            stray = Some(control);
-            Demand::Stop
-        }
+        Err(control) => stop_with_escape(&mut stray, control),
     };
     let flow = match stage {
         Expr::Compare { op, left, right } => binary_fanout_each_generic::<V>(
@@ -10556,10 +10492,7 @@ fn binary_fanout_each_generic<V: DocumentValue>(
         outer_seen += 1;
         let outer_val = match generic_item_into_owned(outer_item) {
             Ok(v) => v,
-            Err(control) => {
-                abort = Some(Flow::Escaped(control));
-                return Demand::Stop;
-            }
+            Err(control) => return stop_with_downstream(&mut abort, Flow::Escaped(control)),
         };
 
         let mut inner_seen = 0usize;
@@ -10567,10 +10500,7 @@ fn binary_fanout_each_generic<V: DocumentValue>(
             inner_seen += 1;
             let inner_val = match generic_item_into_owned(inner_item) {
                 Ok(v) => v,
-                Err(control) => {
-                    abort = Some(Flow::Escaped(control));
-                    return Demand::Stop;
-                }
+                Err(control) => return stop_with_downstream(&mut abort, Flow::Escaped(control)),
             };
             let (left_val, right_val) = if rules.left_major {
                 (outer_val.clone(), inner_val)
@@ -10611,8 +10541,7 @@ fn binary_fanout_each_generic<V: DocumentValue>(
             if let Some(op) = rules.empty {
                 if let Some(v) = yq_empty_operand_output(op, Some(&outer_val)) {
                     if matches!(sink(GenericItem::Owned(v)), Demand::Stop) {
-                        abort = Some(Flow::Stopped { pending: None });
-                        return Demand::Stop;
+                        return stop_with_downstream(&mut abort, Flow::Stopped { pending: None });
                     }
                 }
             }
@@ -10620,10 +10549,7 @@ fn binary_fanout_each_generic<V: DocumentValue>(
 
         match inner {
             Flow::Exhausted => Demand::Continue,
-            other => {
-                abort = Some(other);
-                Demand::Stop
-            }
+            other => stop_with_downstream(&mut abort, other),
         }
     });
 
@@ -10673,10 +10599,7 @@ fn empty_outer_operand_pass_generic<V: DocumentValue>(
         other_seen += 1;
         let other_val = match generic_item_into_owned(other_item) {
             Ok(v) => v,
-            Err(control) => {
-                abort = Some(Flow::Escaped(control));
-                return Demand::Stop;
-            }
+            Err(control) => return stop_with_downstream(&mut abort, Flow::Escaped(control)),
         };
         match yq_empty_operand_output(op, Some(&other_val)) {
             Some(v) => sink(GenericItem::Owned(v)),
@@ -10753,10 +10676,7 @@ fn eval_compare_generic<S: EvalSemantics, V: DocumentValue>(
                     out.push(v);
                     Demand::Continue
                 }
-                Err(control) => {
-                    stray = Some(control);
-                    Demand::Stop
-                }
+                Err(control) => stop_with_escape(&mut stray, control),
             }
         },
     );
@@ -10880,16 +10800,10 @@ fn each_boolean_generic<S: EvalSemantics, V: DocumentValue>(
                 eval_each_generic::<S, V>(operand, value.clone(), optional, cursor, &mut |item| {
                     match generic_item_truthiness(item) {
                         Ok(bit) => bit_sink(bit),
-                        Err(control) => {
-                            escape = Some(control);
-                            Demand::Stop
-                        }
+                        Err(control) => stop_with_escape(&mut escape, control),
                     }
                 });
-            match escape {
-                Some(control) => Flow::Escaped(control),
-                None => flow,
-            }
+            resume_from_escape(escape, flow)
         },
         left,
         right,
@@ -11231,10 +11145,7 @@ fn stream_owned_outputs_generic<S: EvalSemantics, V: DocumentValue>(
             }
             // The prefix already converted is kept, matching
             // `stream_outputs`'s `promote_borrowed` arm.
-            Err(control) => {
-                decode_err = Some(control);
-                Demand::Stop
-            }
+            Err(control) => stop_with_escape(&mut decode_err, control),
         }
     });
     let control = decode_err.or(match flow {
@@ -11262,10 +11173,7 @@ where
     let flow = eval_each_generic::<S, V>(arg_expr, value, optional, cursor, &mut |item| {
         let owned = match generic_item_into_owned(item) {
             Ok(owned) => owned,
-            Err(control) => {
-                escape = Some(control);
-                return Demand::Stop;
-            }
+            Err(control) => return stop_with_escape(&mut escape, control),
         };
         match body(owned) {
             // This `n`'s own walk finished; go on to the next one.
@@ -11277,10 +11185,7 @@ where
                 consumer_stopped = true;
                 Demand::Stop
             }
-            Flow::Escaped(control) => {
-                escape = Some(control);
-                Demand::Stop
-            }
+            Flow::Escaped(control) => stop_with_escape(&mut escape, control),
         }
     });
 
@@ -11370,15 +11275,11 @@ where
     let flow = eval_each_generic::<S, V>(arg_expr, value, optional, cursor, &mut |item| {
         let owned = match generic_item_into_owned(item) {
             Ok(owned) => owned,
-            Err(control) => {
-                decode_err = Some(control);
-                return Demand::Stop;
-            }
+            Err(control) => return stop_with_escape(&mut decode_err, control),
         };
         if let Some(previous) = pending_first.take() {
             if let Some(control) = push_generic_owned_values(previous, &mut out) {
-                body_control = Some(control);
-                return Demand::Stop;
+                return stop_with_escape(&mut body_control, control);
             }
         }
         let result = body(owned);
@@ -11395,8 +11296,7 @@ where
         if out.is_empty() && pending_first.is_none() {
             pending_first = Some(result);
         } else if let Some(control) = push_generic_owned_values(result, &mut out) {
-            body_control = Some(control);
-            return Demand::Stop;
+            return stop_with_escape(&mut body_control, control);
         }
         Demand::Continue
     });
@@ -11616,8 +11516,7 @@ fn nth_with_n_generic<S: EvalSemantics, V: DocumentValue>(
         // from `[2]` instead of erroring. The item *at* index `n` is
         // deliberately exempted from this force -- see below.
         if let Err(control) = generic_item_into_owned(item) {
-            skipped_err = Some(control);
-            return Demand::Stop;
+            return stop_with_escape(&mut skipped_err, control);
         }
         Demand::Continue
     });
@@ -11950,6 +11849,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
             } else {
                 resolve_terminal_prefix_generic(&cursors, control)
             };
+            mark_nonretryable_escape(&control);
             terminal = Some(partial_generic(out, control));
             return Demand::Stop;
         }};
@@ -11982,7 +11882,9 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
                 owned = match to_owned_all_cursors_checked(&cursors) {
                     Ok(vs) => vs,
                     Err((prefix, e)) => {
-                        terminal = Some(partial_generic(prefix, Control::Error(e)));
+                        let control = Control::Error(e);
+                        mark_nonretryable_escape(&control);
+                        terminal = Some(partial_generic(prefix, control));
                         return Demand::Stop;
                     }
                 };
@@ -15497,10 +15399,7 @@ fn path_context_walk_generic<S: EvalSemantics, V: DocumentValue>(
                         items.push(v);
                         Demand::Continue
                     }
-                    Err(e) => {
-                        failure = Some(e);
-                        Demand::Stop
-                    }
+                    Err(e) => stop_with_error(&mut failure, e),
                 }
             });
             if let Some(e) = failure {
@@ -16421,10 +16320,7 @@ fn try_path_context_walk_sink<S: EvalSemantics, V: DocumentValue>(
         // stop or escape ends the walk, and is what the caller sees.
         match continue_pipe_element_generic::<S, V>(item, &mut rest_pipe, false, sink) {
             Flow::Exhausted => Demand::Continue,
-            other => {
-                downstream = Some(other);
-                Demand::Stop
-            }
+            other => stop_with_downstream(&mut downstream, other),
         }
     });
     Some(match (walked_result, downstream) {
@@ -21300,6 +21196,12 @@ fn eval_owned_identity_scoped<S: EvalSemantics, V: DocumentValue>(
             tail.reborrow(),
         ) {
             Flow::Escaped(control) => {
+                // #2180 WP3 review: this stage stashes an escape and
+                // signals `Stopped` rather than answering `Demand::Stop`,
+                // so it carries the same non-retryable classification
+                // `eval::stop_with_escape` applies -- see
+                // `eval::mark_nonretryable_escape`.
+                mark_nonretryable_escape(&control);
                 rest_escape = Some(control);
                 Flow::Stopped { pending: None }
             }
@@ -21369,16 +21271,19 @@ fn eval_owned_identity_try<S: EvalSemantics, V: DocumentValue>(
             tail.reborrow(),
         ) {
             Flow::Escaped(control) => {
+                // #2180 WP3 review: this stage stashes an escape and
+                // signals `Stopped` rather than answering `Demand::Stop`,
+                // so it carries the same non-retryable classification
+                // `eval::stop_with_escape` applies -- see
+                // `eval::mark_nonretryable_escape`.
+                mark_nonretryable_escape(&control);
                 rest_escape = Some(control);
                 Flow::Stopped { pending: None }
             }
             other => other,
         }),
     );
-    match rest_escape {
-        Some(control) => Flow::Escaped(control),
-        None => flow,
-    }
+    resume_from_escape(rest_escape, flow)
 }
 
 /// `limit(n; body)` / `first(body)` over an owned value with identity: at
@@ -21416,6 +21321,12 @@ fn eval_owned_identity_bounded<S: EvalSemantics, V: DocumentValue>(
                     }
                 }
                 Flow::Escaped(control) => {
+                    // #2180 WP3 review: this stage stashes an escape and
+                    // signals `Stopped` rather than answering `Demand::Stop`,
+                    // so it carries the same non-retryable classification
+                    // `eval::stop_with_escape` applies -- see
+                    // `eval::mark_nonretryable_escape`.
+                    mark_nonretryable_escape(&control);
                     rest_escape = Some(control);
                     Flow::Stopped { pending: None }
                 }
@@ -21983,10 +21894,7 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                 };
                 match flow {
                     Flow::Exhausted => Demand::Continue,
-                    other => {
-                        downstream = Some(other);
-                        Demand::Stop
-                    }
+                    other => stop_with_downstream(&mut downstream, other),
                 }
             };
             // #2471 (gate reason 1 of spine 2416): a map-family stage whose
