@@ -31493,7 +31493,11 @@ fn test_as_pattern_alternatives_retry_under_a_wrapping_consumer_1519() -> Result
 /// `?//` bind if every construct in between *forwards demand* into it. A
 /// nested short-circuiting consumer does not -- it materializes its result, so
 /// the outer consumer's `Demand::Stop` lands on `drain_result` and never
-/// reaches `each_pattern_alternatives`.
+/// reaches `each_pattern_alternatives`. #2180's plan (2026-09-08,
+/// re-verified at `baa26d72e`) found the class is wider than the four
+/// constructs originally filed: every eager `eval_single` call on the path
+/// between a short-circuiting consumer and a `?//` bind is a visible
+/// one-instead-of-two, split across four work packages.
 ///
 /// `limit` is the control: it is the only consumer with a demand-forwarding
 /// `eval_each` arm (`each_limit`, #1462/#1596), and it is the only one that
@@ -31501,39 +31505,334 @@ fn test_as_pattern_alternatives_retry_under_a_wrapping_consumer_1519() -> Result
 /// arm and not `?//` itself, so it is pinned here rather than only described.
 ///
 /// This is a characterization test of a *known divergence*: the `want` column
-/// is succinctly's current answer, with jq 1.7.1's given per row. When #2180
-/// gives a construct its lazy arm, that row starts matching jq and this test
-/// must be updated -- which is the point.
+/// is succinctly's current answer, with jq 1.7.1's given per row (captured
+/// live against the pinned oracle, input `1`). Every row is evaluated under
+/// both outer wrappers that can reach it -- `first(...)` (the CLI's native
+/// `eval_generic.rs` arm) and `isempty(...)` (no native generic arm, so it
+/// bridges wholesale to `eval.rs`'s `eval_each`) -- since the two arm sets
+/// have already drifted (`Range`) and a fix landing in one file is not
+/// evidence it landed in the other. When a work package gives its
+/// constructs a demand-forwarding arm, its whole group starts matching jq
+/// and must be updated -- which is the point; each group below is commented
+/// with the work package that closes it.
 #[test]
 fn test_nested_short_circuit_consumer_hides_the_stop_2180() -> Result<()> {
-    // `G` is the generator under test in every row below.
+    // `G` is the generator under test in every row below, unless a row needs
+    // its own bind shape (a three-alternative chain, a destructuring
+    // pattern, or a literal producing `5` to match the issue's own wording).
     const G: &str = "1 as $x ?// $y | 1";
 
     let cases: &[(String, &str, &str)] = &[
-        // The control: `limit` forwards demand, so the retry still happens and
-        // succinctly already matches jq here.
+        // ---- Control: `limit` already demand-forwards (#1462/#1596) ----
+        // The worked example every work package below copies.
         (format!("[first(limit(1; {G}))]"), "[1,1]", "matches jq"),
-        // Every other consumer materializes, so the outer stop is absorbed.
+        (
+            format!("[isempty(limit(1; {G}))]"),
+            "[false,false]",
+            "matches jq",
+        ),
+        // ---- Single-level is correct throughout ----
+        // It is the *nesting* that breaks it, not the bind itself.
+        (format!("[first({G})]"), "[1,1]", "matches jq"),
+        (format!("[IN({G})]"), "[true,true]", "matches jq"),
+        (format!("[isempty({G})]"), "[false,false]", "matches jq"),
+        // ==== WP1: nested consumers ====
+        // `each_first`/`each_nth`/`each_isempty`/`each_any_all_gen_cond`/
+        // `each_upper_in` in `eval.rs` need a demand-forwarding `eval_each`
+        // arm, `each_limit`'s exact protocol. Flip this whole group to jq's
+        // answer once WP1 lands (both evaluators -- `IN`/`isempty`/`any`
+        // bridge wholesale to `eval.rs` today per the plan, so the generic
+        // side inherits the fix from the same arms).
         (format!("[first(first({G}))]"), "[1]", "jq: [1,1]"),
+        (
+            format!("[isempty(first({G}))]"),
+            "[false]",
+            "jq: [false,false]",
+        ),
         (format!("[first(nth(0; {G}))]"), "[1]", "jq: [1,1]"),
+        (
+            format!("[isempty(nth(0; {G}))]"),
+            "[false]",
+            "jq: [false,false]",
+        ),
         (
             format!("[first(isempty({G}))]"),
             "[false]",
             "jq: [false,false]",
         ),
-        (format!("[first(any({G}; .))]"), "[true]", "jq: [true,true]"),
-        (format!("[first(IN({G}))]"), "[true]", "jq: [true,true]"),
         (
             format!("[isempty(isempty({G}))]"),
             "[false]",
             "jq: [false,false]",
         ),
+        (format!("[first(any({G}; .))]"), "[true]", "jq: [true,true]"),
+        (
+            format!("[isempty(any({G}; .))]"),
+            "[false]",
+            "jq: [false,false]",
+        ),
+        (format!("[first(IN({G}))]"), "[true]", "jq: [true,true]"),
+        (
+            format!("[isempty(IN({G}))]"),
+            "[false]",
+            "jq: [false,false]",
+        ),
+        (format!("[first(IN(1; {G}))]"), "[true]", "jq: [true,true]"),
+        (
+            format!("[isempty(IN(1; {G}))]"),
+            "[false]",
+            "jq: [false,false]",
+        ),
         (format!("[limit(1; IN({G}))]"), "[true]", "jq: [true,true]"),
-        // Single-level is correct throughout -- it is the nesting that breaks
-        // it, not the bind.
-        (format!("[first({G})]"), "[1,1]", "matches jq"),
-        (format!("[IN({G})]"), "[true,true]", "matches jq"),
-        (format!("[isempty({G})]"), "[false,false]", "matches jq"),
+        // ==== WP2a: `//`, `and`, `or` ====
+        // `each_alternative` needs a demand-forwarding `left`/truthy-filter
+        // sink, and `And`/`Or` need `boolean_fanout_core` parameterised the
+        // way `binary_fanout_each` was for `Compare`/`Arithmetic`
+        // (#1459/#1481). Flip this whole group once WP2a lands.
+        (
+            "[first((1 as $x ?// $y | 5)//9)]".to_string(),
+            "[5]",
+            "jq: [5,5]",
+        ),
+        (
+            "[isempty((1 as $x ?// $y | 5)//9)]".to_string(),
+            "[false]",
+            "jq: [false,false]",
+        ),
+        (format!("[first(null // ({G}))]"), "[1]", "jq: [1,1]"),
+        (
+            format!("[isempty(null // ({G}))]"),
+            "[false]",
+            "jq: [false,false]",
+        ),
+        (
+            format!("[first(({G}) and true)]"),
+            "[true]",
+            "jq: [true,true]",
+        ),
+        (
+            format!("[isempty(({G}) and true)]"),
+            "[false]",
+            "jq: [false,false]",
+        ),
+        (
+            format!("[first(true and ({G}))]"),
+            "[true]",
+            "jq: [true,true]",
+        ),
+        (
+            format!("[isempty(true and ({G}))]"),
+            "[false]",
+            "jq: [false,false]",
+        ),
+        (
+            format!("[first(({G}) or false)]"),
+            "[true]",
+            "jq: [true,true]",
+        ),
+        (
+            format!("[isempty(({G}) or false)]"),
+            "[false]",
+            "jq: [false,false]",
+        ),
+        (
+            format!("[first(false or ({G}))]"),
+            "[true]",
+            "jq: [true,true]",
+        ),
+        (
+            format!("[isempty(false or ({G}))]"),
+            "[false]",
+            "jq: [false,false]",
+        ),
+        // ==== WP2b: eager sub-expression sites ====
+        // `each_if`'s `cond`, `each_as`/`each_as_pattern`'s bound source,
+        // and new arms for `Select`, `Negate`, `IndexExpr` (key),
+        // `StringInterpolation`, `Object` (values) -- mechanical once
+        // WP1/WP2a set the pattern. `range`'s bound is generic-route-only
+        // (see the control row below): `eval.rs` already has `each_range`,
+        // the generic twin was never mirrored, so `isempty(...)` (which
+        // bridges to `eval.rs`) already matches while `first(...)` (native
+        // generic route) does not.
+        (
+            format!("[first(if ({G}) then 5 else 6 end)]"),
+            "[5]",
+            "jq: [5,5]",
+        ),
+        (
+            format!("[isempty(if ({G}) then 5 else 6 end)]"),
+            "[false]",
+            "jq: [false,false]",
+        ),
+        (format!("[first(({G}) as $v | $v)]"), "[1]", "jq: [1,1]"),
+        (
+            format!("[isempty(({G}) as $v | $v)]"),
+            "[false]",
+            "jq: [false,false]",
+        ),
+        (
+            format!("[first(({G}) as [$a] ?// $a | $a)]"),
+            "[1]",
+            "jq: [1,1]",
+        ),
+        (
+            format!("[isempty(({G}) as [$a] ?// $a | $a)]"),
+            "[false]",
+            "jq: [false,false]",
+        ),
+        (format!("[first(select(({G}) == 1))]"), "[1]", "jq: [1,1]"),
+        (
+            format!("[isempty(select(({G}) == 1))]"),
+            "[false]",
+            "jq: [false,false]",
+        ),
+        (format!("[first(-({G}))]"), "[-1]", "jq: [-1,-1]"),
+        (format!("[isempty(-({G}))]"), "[false]", "jq: [false,false]"),
+        (format!("[1] | [first(.[({G})-1])]"), "[1]", "jq: [1,1]"),
+        (
+            format!("[1] | [isempty(.[({G})-1])]"),
+            "[false]",
+            "jq: [false,false]",
+        ),
+        (
+            format!("[first(\"\\({G})\")]"),
+            "[\"1\"]",
+            "jq: [\"1\",\"1\"]",
+        ),
+        (
+            format!("[isempty(\"\\({G})\")]"),
+            "[false]",
+            "jq: [false,false]",
+        ),
+        (format!("[first({{a:({G})}} | .a)]"), "[1]", "jq: [1,1]"),
+        (
+            format!("[isempty({{a:({G})}} | .a)]"),
+            "[false]",
+            "jq: [false,false]",
+        ),
+        (format!("[first(range(({G}); 3))]"), "[1]", "jq: [1,1]"),
+        (
+            // Generic-route-only divergence: `isempty(...)` bridges to
+            // `eval.rs`'s own `each_range`, which already forwards demand,
+            // so this row is a control, not part of WP2b's residual.
+            format!("[isempty(range(({G}); 3))]"),
+            "[false,false]",
+            "matches jq -- eval.rs's each_range already forwards demand; \
+             only the eval_generic.rs twin is missing (see WP2b)",
+        ),
+        // ==== WP3: foreach ====
+        // The only genuinely new mechanism -- `each_foreach`'s sink `Stop`
+        // must be treated exactly as `Control::Break` is today
+        // (`is_retryable_stop`), with foreach's own state threading intact
+        // (the source row is `[1,2]`, not `[1,1]`: the retried
+        // alternative's UPDATE runs on the already-updated state).
+        (
+            "[first(foreach (1) as $x ?// $y (0;.+1;.), \"z\")]".to_string(),
+            "[1]",
+            "jq: [1,2]",
+        ),
+        (
+            "[isempty(foreach (1) as $x ?// $y (0;.+1;.), \"z\")]".to_string(),
+            "[false]",
+            "jq: [false,false]",
+        ),
+        (
+            format!("[first(foreach ({G}) as $v (0; .+$v; .))]"),
+            "[1]",
+            "jq: [1,2]",
+        ),
+        (
+            format!("[isempty(foreach ({G}) as $v (0; .+$v; .))]"),
+            "[false]",
+            "jq: [false,false]",
+        ),
+        // ==== Confirmed correct, deliberately out of scope (#2180 §4) ====
+        // A break cannot re-enter an already-collected array/fold, and
+        // these constructs' existing arms already forward demand.
+        (
+            format!("[first([({G})] | .[])]"),
+            "[1]",
+            "matches jq -- a break cannot re-enter an already-collected array",
+        ),
+        (format!("[isempty([({G})] | .[])]"), "[false]", "matches jq"),
+        (
+            format!("[first(reduce ({G}) as $v (0; .+$v))]"),
+            "[1]",
+            "matches jq -- reduce always folds to one value",
+        ),
+        (
+            format!("[isempty(reduce ({G}) as $v (0; .+$v))]"),
+            "[false]",
+            "matches jq",
+        ),
+        (
+            format!("[first(last({G}))]"),
+            "[1]",
+            "matches jq -- last always answers one value",
+        ),
+        (format!("[isempty(last({G}))]"), "[false]", "matches jq"),
+        (format!("[first(({G})?)]"), "[1,1]", "matches jq"),
+        (format!("[isempty(({G})?)]"), "[false,false]", "matches jq"),
+        (
+            format!("[first(({G}) | .)]"),
+            "[1,1]",
+            "matches jq -- pipe demand-forwards",
+        ),
+        (
+            format!("[isempty(({G}) | .)]"),
+            "[false,false]",
+            "matches jq",
+        ),
+        (
+            format!("[first(({G}) + 0)]"),
+            "[1,1]",
+            "matches jq -- binary_fanout_each",
+        ),
+        (
+            format!("[isempty(({G}) + 0)]"),
+            "[false,false]",
+            "matches jq",
+        ),
+        (
+            format!("[first(def f: {G}; f)]"),
+            "[1,1]",
+            "matches jq -- DefCall demand-forwards",
+        ),
+        (
+            format!("[isempty(def f: {G}; f)]"),
+            "[false,false]",
+            "matches jq",
+        ),
+        (
+            format!("[first(if true then ({G}) else 9 end)]"),
+            "[1,1]",
+            "matches jq -- only if's condition is eager, not its branches",
+        ),
+        (
+            format!("[isempty(if true then ({G}) else 9 end)]"),
+            "[false,false]",
+            "matches jq",
+        ),
+        (
+            format!("[first(({G}) | tostring)]"),
+            "[\"1\",\"1\"]",
+            "matches jq",
+        ),
+        (
+            format!("[isempty(({G}) | tostring)]"),
+            "[false,false]",
+            "matches jq",
+        ),
+        (
+            format!("[first(({G}) | not)]"),
+            "[false,false]",
+            "matches jq",
+        ),
+        (
+            format!("[isempty(({G}) | not)]"),
+            "[false,false]",
+            "matches jq",
+        ),
     ];
 
     for (filter, want, note) in cases {
@@ -31547,6 +31846,41 @@ fn test_nested_short_circuit_consumer_hides_the_stop_2180() -> Result<()> {
             *want,
             "`{filter}` ({note}) changed -- if #2180 gave this construct a \
              demand-forwarding lazy arm, update this row to jq's answer"
+        );
+    }
+
+    // ---- Already closed since #2180 was filed (WP0 bisect) ----
+    // The issue text and limitations.md were stale on these two: something
+    // between 2026-09-02 and `baa26d72e` closed the pipe-stage boundary.
+    // Bisected live (WP0): each row closed by a *different* commit, both
+    // part of spine 2416's `eval_generic.rs` migration, not the pipe rework
+    // the plan's own guess named.
+    let closed_cases: &[(&str, &str, &str)] = &[
+        (
+            "[label $o | (1 as $x ?// $y | 5) | (., break $o)]",
+            "[5,5]",
+            "closed by bcb41f74f (\"feat(jq): route `label` through the \
+             generic evaluator (spine 2416)\")",
+        ),
+        (
+            "def m(g): label $o | g | ., break $o; [m(1 as $x ?// $y | 5, 6)]",
+            "[5,5]",
+            "closed by 8809f2b85 (\"feat(jq): route bound function calls \
+             through the generic evaluator (spine 2416)\")",
+        ),
+    ];
+    for (filter, want, note) in closed_cases {
+        // `-cn`, matching how the plan captured these two rows: neither
+        // reads `.`, so a real input is unnecessary here (unlike the main
+        // loop above, which needs `IN(s)` to have something to compare
+        // against).
+        let (stdout, stderr, code) = run_jq_full(&["-cn", filter], None)?;
+        assert_eq!(code, 0, "`{filter}` stderr: {stderr:?}");
+        assert_eq!(
+            stdout.trim_end(),
+            *want,
+            "`{filter}` ({note}) changed -- this row was pinned as a \
+             closed-since-filing control, not a live divergence"
         );
     }
     Ok(())
