@@ -561,7 +561,7 @@ impl Reader {
 fn unhex4(bytes: &[u8]) -> Option<u32> {
     let mut value = 0u32;
     for &b in bytes {
-        value = (value << 4) | u32::from((b as char).to_digit(16)?);
+        value = (value << 4) | (b as char).to_digit(16)?;
     }
     Some(value)
 }
@@ -608,7 +608,9 @@ fn number_is_valid(token: &[u8]) -> bool {
         Some(i) => (&mantissa[..i], Some(&mantissa[i + 1..])),
         None => (mantissa, None),
     };
-    if integer.is_empty() && fraction.is_none_or(<[u8]>::is_empty) {
+    // `map_or(true, ..)` rather than `is_none_or`: the crate's MSRV is
+    // 1.73 and `Option::is_none_or` is 1.82.
+    if integer.is_empty() && fraction.map_or(true, <[u8]>::is_empty) {
         return false;
     }
     if !integer.iter().all(u8::is_ascii_digit) {
@@ -663,7 +665,10 @@ mod tests {
     #[test]
     fn templates_match_the_oracle_1723() {
         // Real EOF, mid-value.
-        assert_warnings(b"\x1e\"abc", &["Unfinished string at EOF at line 1, column 5"]);
+        assert_warnings(
+            b"\x1e\"abc",
+            &["Unfinished string at EOF at line 1, column 5"],
+        );
         assert_warnings(
             b"\x1e[1,2\n",
             &["Unfinished JSON term at EOF at line 2, column 0"],
@@ -673,7 +678,10 @@ mod tests {
             &["Unfinished JSON term at EOF at line 1, column 7"],
         );
         assert_warnings(b"\x1etru", &["Invalid literal at EOF at line 1, column 4"]);
-        assert_warnings(b"\x1e-", &["Invalid numeric literal at EOF at line 1, column 2"]);
+        assert_warnings(
+            b"\x1e-",
+            &["Invalid numeric literal at EOF at line 1, column 2"],
+        );
         assert_warnings(
             b"\x1e1e",
             &["Invalid numeric literal at EOF at line 1, column 3"],
@@ -718,7 +726,10 @@ mod tests {
             b"\x1e\"unterminated\x1e\"ok\"\n",
             &["Truncated value at line 1, column 15"],
         );
-        assert_warnings(b"\x1e[1,2\x1e\"ok\"\n", &["Truncated value at line 1, column 6"]);
+        assert_warnings(
+            b"\x1e[1,2\x1e\"ok\"\n",
+            &["Truncated value at line 1, column 6"],
+        );
     }
 
     /// A container error leaves the stack behind, and the object/array
@@ -811,7 +822,13 @@ mod tests {
                 "{accepted:?} should parse as a number, got {got:?}"
             );
         }
-        for rejected in [&b"\x1e1e"[..], b"\x1e1e+", b"\x1e-", b"\x1e1.2.3", b"\x1e0x10"] {
+        for rejected in [
+            &b"\x1e1e"[..],
+            b"\x1e1e+",
+            b"\x1e-",
+            b"\x1e1.2.3",
+            b"\x1e0x10",
+        ] {
             let got = warnings(&[rejected]);
             assert!(
                 got[0].starts_with("Invalid numeric literal at EOF"),
@@ -826,7 +843,10 @@ mod tests {
     #[test]
     fn keyword_path_depends_on_the_second_buffer_byte_1723() {
         assert_warnings(b"\x1enul", &["Invalid literal at EOF at line 1, column 4"]);
-        assert_warnings(b"\x1en", &["Invalid numeric literal at EOF at line 1, column 2"]);
+        assert_warnings(
+            b"\x1en",
+            &["Invalid numeric literal at EOF at line 1, column 2"],
+        );
         // `iu` leaves a `u` at index 1, so the following bare `n` is
         // measured against `null` -- jq reads the stale byte (#1723).
         assert_warnings(

@@ -2802,43 +2802,98 @@ skipped item's decode in the first place. Fixing this needs `Demand` (or an equi
 let a sink mark its own stop as unretryable, which is a real design change rather than a local
 one, so it is tracked separately instead of folded into this fix.
 
-## `--seq`'s malformed-record warning covers one of jq's several message shapes
+## `--seq`'s malformed-record warnings match jq; the values it prints are still a subset
 
 Real jq warns on stderr ("`jq: ignoring parse error: ...`") whenever it silently drops a
 malformed `--seq` (RFC 7464) record; `succinctly jq` used to drop the record with no
 diagnostic at all. [#1525](https://github.com/rust-works/succinctly/issues/1525) added the
-warning for exactly one of jq's message templates: content with no RS byte anywhere in the
-input, where jq's own reader never resyncs onto anything and reports the abandonment
+warning for one of jq's message templates: content with no RS byte anywhere in the
+input, where jq's own reader never syncs onto anything and reports the abandonment
 unconditionally at EOF ("`Unfinished abandoned text at EOF at line L, column C`") regardless
-of what the content actually is, even fully valid JSON:
+of what the content actually is, even fully valid JSON.
+[#1723](https://github.com/rust-works/succinctly/issues/1723) added all the rest.
 
 ```
 $ printf '1 2' | jq --seq -c '.'                  # jq:          jq: ignoring parse error: Unfinished abandoned text at EOF at line 1, column 3
 $ printf '1 2' | succinctly jq --seq -c '.'       # succinctly:  same (#1525)
 ```
 
-A malformed record that *does* start with an RS byte gets one of at least three other jq
-message templates instead, depending on exactly how it's malformed — none implemented yet:
+**The messages are not a property of the record; they are a property of where jq's reader
+gave up.** Four earlier attempts looked for a table mapping "what is wrong with this record"
+onto jq's wording and correctly concluded that no such table exists — the *same* malformed
+record draws different messages depending on whether jq reached real EOF, an RS byte, or an
+ordinary byte first. `src/bin/succinctly/jq_seq_reader.rs` models jq's own scanner instead,
+and composes the message from three facts:
+
+| detected on | rendering |
+|---|---|
+| an ordinary byte | `{category} at line L, column C (need RS to resync)` |
+| real EOF | `{category} at EOF at line L, column C` |
+| an RS byte | `Truncated value` (or `Potentially truncated top-level numeric value`) |
 
 ```
-$ printf '\x1e"unterminated\n' | jq --seq -c '.'
+$ printf '\x1e"unterminated\n' | succinctly jq --seq -c '.'
 jq: ignoring parse error: Unfinished string at EOF at line 2, column 0
-$ printf '\x1e[1,2\n'          | jq --seq -c '.'
+$ printf '\x1e[1,2\n'          | succinctly jq --seq -c '.'
 jq: ignoring parse error: Unfinished JSON term at EOF at line 2, column 0
-$ printf '\x1exyz\n'           | jq --seq -c '.'
+$ printf '\x1exyz\n'           | succinctly jq --seq -c '.'
 jq: ignoring parse error: Invalid numeric literal at line 2, column 0 (need RS to resync)
+$ printf '\x1e"a\x1e"ok"\n'    | succinctly jq --seq -c '.'
+jq: ignoring parse error: Truncated value at line 1, column 4
 ```
 
-`succinctly jq --seq` emits nothing on stderr for any of these, and its *output* also
-diverges: real jq emits the values it managed to read before the malformed point, while
-succinctly drops the whole record.
+Two pieces of jq's own wording are misleading, and are reproduced rather than corrected
+(ADR-0018's bug-for-bug default):
+
+- **`(need RS to resync)` never resyncs.** jq's `jv_parse.c` assigns
+  `JV_PARSER_WAITING_FOR_RS` and *then* calls `parser_reset()`, which writes
+  `JV_PARSER_NORMAL` straight back over it. Parsing resumes at the very next byte, so one
+  record can warn several times and content after the error is still read:
+  ```
+  $ printf '\x1enot valid json\n' | jq --seq -c '.'   # three warnings, one record
+  $ printf '\x1e} 5\n'            | jq --seq -c '.'   # warns, then prints 5
+  ```
+- **jq's numbers are decNumber's, not RFC 8259's.** `1.`, `.5`, `+1`, `nan`, `NaN5`, `snan`
+  and `-Infinity` are all numbers to `--seq`'s parser, while `1e` and `1.2.3` are not.
+
+There is also a genuine quirk in jq's classifier that succinctly matches: `check_literal`
+reads `tokenbuf[1]` without consulting `tokenpos`, so a bare `n` is measured against
+whatever byte an earlier token left behind. `printf '\x1en'` reports `Invalid numeric
+literal`, but the same `n` after an `iu` token reports `Invalid literal`.
+
+**The output side has not changed and still diverges**: real jq emits the values it read
+before the malformed point, while succinctly drops the whole record. Only the diagnostic was
+implemented, so stderr now matches where stdout does not.
 
 ```
 $ printf '\x1e1 {invalid\n' | jq            --seq -c '.'   # warns, then prints 1
-$ printf '\x1e1 {invalid\n' | succinctly jq --seq -c '.'   # prints nothing
+$ printf '\x1e1 {invalid\n' | succinctly jq --seq -c '.'   # warns identically, prints nothing
 $ printf '\x1e1,2\n'        | jq            --seq -c '.'   # prints 2
 $ printf '\x1e1,2\n'        | succinctly jq --seq -c '.'   # prints nothing
 ```
+
+Verified by `scripts/jq-seq-oracle-sweep.py`, which compares stderr, stdout and exit code
+jointly: **0 stderr mismatches and 0 stdout supersets** over 3,062 generated streams per
+seed.
+
+Two `--seq` divergences that remain are artifacts of jq's 4096-byte `fgets` *line reader*
+rather than its parser, and neither is reachable from a newline-terminated stream:
+
+1. A trailing unterminated RS-record after an earlier newline is dropped unread below the
+   buffer boundary and parsed above it (`printf '\x1e1\n\x1e{bad'` is silent, the same input
+   with 4,100 bytes of padding warns) — the value-side half of this is the same artifact
+   already described below.
+2. A record yielding no value makes jq's `jv_parser_next` return invalid-with-no-message,
+   which its input loop reads as end-of-input and stops the whole stream — but only when it
+   lands in the buffer that hit EOF. `printf '\x1e\x1e"a"'` prints nothing in real jq;
+   `printf '\x1e\x1e{"a":1}\n'` prints the object.
+
+Running the sweep with `--expect-artifacts` puts these shapes back: 28 of 3,063 streams
+diverge, and every one is attributable to those two artifacts — none unexplained.
+
+Real-time interleaving of the warnings against stdout is also not reproduced: succinctly
+materializes `--seq` input before evaluating, so all warnings precede all values. jq's
+default block-buffered stdout produces the same ordering, but `jq --unbuffered` does not.
 
 **The divergence from *this* rule is one-directional: succinctly's output is a subset of
 jq's, not a superset** -- 0 superset violations across 6,000 randomly generated single
@@ -2880,10 +2935,17 @@ only `3` -- a bare literal is as truncatable as a bare number. Both directions a
 
 A record holding several *well-formed* values is likewise unaffected: #1723 fixed
 `succinctly jq --seq` dropping those in full (`\x1e1 "x" [2]\n` is three outputs, as in real
-jq), which was silent data loss rather than a diagnostic gap. Matching these needs enough
-of jq's own incremental-parser failure classification to know which of its internal states a
-segment would have failed in, not just whether it parses — deliberately deferred, tracked in
-[#1723](https://github.com/rust-works/succinctly/issues/1723).
+jq), which was silent data loss rather than a diagnostic gap.
+
+Emitting the *prefix* of a partially-readable record is what remains. It needs the same
+answer the diagnostics needed — where jq's parser gave up — and
+[`jq_seq_reader`](../../../src/bin/succinctly/jq_seq_reader.rs) now has it, so this is no
+longer blocked on the classification problem; it is deferred on risk. Getting a message
+wrong costs a cosmetic stderr line, while getting an emission wrong fabricates output, which
+is exactly what the reverted attempt above did. Switching the value path onto the same model
+is tracked separately, and should be gated on
+[`scripts/jq-seq-oracle-sweep.py`](../../../scripts/jq-seq-oracle-sweep.py) continuing to
+report zero stdout supersets.
 
 A second, narrower gap `succinctly jq --seq` also deliberately stays silent on: `-n`
 combined with a filter that forces a real read (`input`/`inputs`) turns the identical
