@@ -293,6 +293,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   9-site version; the originally-measured 5-site subset on that box read
   -29.2% to -30.0%, which the added sites are not expected to reduce.
   Output byte-identical before/after in every run.
+- **Reused the same `explicit_tag_at` fix at two more call sites outside
+  `yaml::light`** (#2621, follow-up to #2619's own review): `src/jq/
+  eval.rs`'s `yaml_value_to_owned_checked` and the `succinctly` binary's
+  `yaml_to_owned_value` (owned-value/DOM conversion, e.g. `-P`, `load()`)
+  had the identical redundant `explicit_tag()` resolve on an
+  already-proven-non-alias cursor. `explicit_tag_at` is now `pub` (it
+  needed to reach a separate binary crate, not just another module in the
+  same crate) and both sites call it. Unlike the streaming paths #2619
+  closed, this one measured as noise on both pinned boxes (interleaved
+  manual A/B, `yq -P '.'` over a 20MB array of small records): effectively
+  flat on M4 Pro, a hair slower within noise on Zen 4. DOM conversion's own
+  allocation cost (`IndexMap`/`Vec`/`String` construction per node)
+  dwarfs a single skipped cursor resolve here, unlike the allocation-light
+  streaming write path. Landed anyway for the same reason #1114's
+  redundancy was worth finding in the first place -- a genuine, provably
+  unnecessary resolve, now closed everywhere in the crate it's reachable
+  from -- not for a performance claim this workload doesn't support.
+  Output byte-identical before/after in every run.
 
 ### Removed
 
