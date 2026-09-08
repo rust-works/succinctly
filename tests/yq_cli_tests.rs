@@ -19517,6 +19517,75 @@ fn test_getpath_resolves_through_an_alias_2168() -> Result<()> {
     Ok(())
 }
 
+/// #2168 coverage, yq mode: the two arms that only a value with **no cursor**
+/// reaches.
+///
+/// A pipe stage that yields `GenericResult::One` -- a document value detached
+/// from its position -- hands the next stage `cursor = None`. yq's own
+/// `map` on a scalar is the shortest spelling of that (`map` passes a
+/// non-container through unchanged, #1820, where jq raises), so `.a | map(.)`
+/// is a value-without-a-position built out of live document nodes.
+///
+/// Both arms below are what that reaches:
+///
+/// * `position_arg_integer`'s `One` arm. #2168 unified `at_offset`'s and
+///   `at_position`'s three copies of this match into one function precisely
+///   because it had to add an arm to all of them; the `One` shape is the one
+///   no `at_offset(...)` spelling in the suite happened to produce.
+/// * `Builtin::GetPath`'s cursor-less arm. With a cursor, #2168 walks
+///   (`getpath_walk_cursor`); without one there is no position to walk from,
+///   so the value is materialized once, outside the fan-out, and
+///   `eval::getpath_walk_owned` reads it -- the pre-#2168 behaviour, kept
+///   exactly, for the one input shape that still needs it.
+///
+/// `getpath` is behind `--jq-extensions` in yq mode (#1512); `at_offset` is a
+/// succinctly extension in both modes. Neither has a yq oracle.
+#[test]
+fn test_position_arg_and_getpath_without_a_cursor_2168() -> Result<()> {
+    let doc = "a: 3\nb:\n  k: 1\n";
+
+    // `position_arg_integer`'s `One` arm: byte offset 3 of "a: 3\n..." is
+    // the `3`, so the answer doubles as proof the integer arrived intact.
+    let (out, code) = run_yq_stdin("at_offset(.a | map(.))", doc, &["-o=json", "-I=0"])?;
+    assert_eq!(code, 0, "{out:?}");
+    assert_eq!(out.trim(), "3");
+
+    // `Builtin::GetPath`'s cursor-less arm, answering and raising.
+    let args = ["-o=json", "-I=0", "--jq-extensions"];
+    for (filter, want) in [
+        (".a | map(.) | getpath([])", "3"),
+        (".b | map(.) | getpath([0])", "1"),
+    ] {
+        let (out, code) = run_yq_stdin(filter, doc, &args)?;
+        assert_eq!(code, 0, "{filter}: {out:?}");
+        assert_eq!(out.trim(), want, "{filter}");
+    }
+    for (filter, want) in [
+        (
+            ".a | map(.) | getpath(\"x\")",
+            "Path must be specified as an array",
+        ),
+        (
+            r#".a | map(.) | getpath(["x"])"#,
+            r#"Cannot index number with string "x""#,
+        ),
+    ] {
+        let (_out, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &args)?;
+        assert_eq!(code, 1, "{filter}: stderr {stderr}");
+        assert!(stderr.contains(want), "{filter}: {stderr}");
+    }
+
+    // The control: the same reads *with* a cursor take the walk instead, and
+    // agree on every answer.
+    for (filter, want) in [(r#"getpath(["a"])"#, "3"), (r#"getpath(["b","k"])"#, "1")] {
+        let (out, code) = run_yq_stdin(filter, doc, &args)?;
+        assert_eq!(code, 0, "{filter}: {out:?}");
+        assert_eq!(out.trim(), want, "{filter}");
+    }
+
+    Ok(())
+}
+
 /// Known, deliberate gap: slicing an object with a genuine duplicate YAML
 /// key silently collapses it, the same root cause as this repo's other
 /// duplicate-mapping-key gaps (`OwnedValue::Object`'s `IndexMap`
