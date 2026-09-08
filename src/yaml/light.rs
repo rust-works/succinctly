@@ -6949,6 +6949,38 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for YamlValue<'a, W> {
         Some(YamlValue::key_string(self))
     }
 
+    /// One `as_str()` for both answers on the `String` arm, where the trait
+    /// default would run two (#965 item 10). `YamlString::as_str` caches
+    /// nothing -- each call re-finds the closing quote, makes up to three
+    /// `contains()` passes to decide whether decoding is needed, and
+    /// allocates afresh when it is.
+    ///
+    /// The `Alias` arm deliberately keeps the two-call path. The two
+    /// accessors it would fuse do not agree there:
+    /// `string_decode_error` resolves the *whole* alias chain (#1191),
+    /// while `key_string`/`key_string_kind` resolve a single hop
+    /// (`target.value()`), so a 2+-hop alias key that decodes perfectly
+    /// well still reports the `""` fallback. Answering that arm from one
+    /// accessor would change what such a key renders as; that divergence
+    /// is real but is not #965's to decide, so this preserves it exactly.
+    ///
+    /// `Ok(Some(""))` for every other variant is #222's rule -- a complex
+    /// key stringifies rather than being dropped -- and matches what
+    /// `key_string()` returns for them today. Reaching it does not consult
+    /// `string_decode_error`, which is `None` for those variants anyway.
+    fn decoded_key_str(&self) -> Result<Option<Cow<'_, str>>, &'static str> {
+        match self {
+            YamlValue::String(s) => s.as_str().map(Some).map_err(YamlStringError::message),
+            YamlValue::Alias { .. } => {
+                if let Some(reason) = self.string_decode_error() {
+                    return Err(reason);
+                }
+                Ok(Some(YamlValue::key_string(self)))
+            }
+            _ => Ok(Some(Cow::Borrowed(""))),
+        }
+    }
+
     fn as_object(&self) -> Option<Self::Fields> {
         match self {
             YamlValue::Mapping(fields) => Some(fields.clone()),

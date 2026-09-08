@@ -2778,6 +2778,25 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentValue for StandardJson<'a, W> {
         }
     }
 
+    /// One `as_str()` for both answers, where the trait default would run
+    /// two (#965 item 10).
+    ///
+    /// This type does not override `key_string()`, so it inherits
+    /// `as_str()` there -- meaning the default `decoded_key_str` decodes the
+    /// same span twice on the success path, discarding the first `Cow`
+    /// entirely. `JsonString::as_str` caches nothing: each call re-scans for
+    /// the closing quote, re-scans for a backslash, re-validates UTF-8, and
+    /// for an escaped key allocates a fresh `decode_escapes` buffer.
+    ///
+    /// `Ok(None)` for a non-`String` key preserves `key_string()`'s `None`
+    /// -- the #1194 fault a caller still has to raise on.
+    fn decoded_key_str(&self) -> Result<Option<Cow<'_, str>>, &'static str> {
+        match self {
+            StandardJson::String(s) => s.as_str().map(Some).map_err(JsonError::message),
+            _ => Ok(None),
+        }
+    }
+
     /// Unlike [`key_raw_unescaped`](Self::key_raw_unescaped), this answers
     /// for an escaped span too -- including one whose escape is invalid --
     /// since it exists only as a display fallback for a key that fails to
