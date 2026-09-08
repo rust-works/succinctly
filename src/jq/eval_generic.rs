@@ -16394,6 +16394,121 @@ fn try_path_context_absent_walk<S: EvalSemantics, V: DocumentValue>(
     Some(partial_generic(owned, control))
 }
 
+/// `any`/`all` (zero-arity) over the cursor, instead of through the
+/// wildcard bridge's ambient materialization (#2476).
+///
+/// Neither builtin had an arm in [`eval_builtin`] at all, so both fell to
+/// its `_` wildcard, whose first act is `to_owned_with_cursor` on the value
+/// they were applied to. On an alias fan-out document (`aN: &aN [*a(N-1),
+/// *a(N-1)]`) that expansion is `O(2^N)`: `.a22 | any` took 5.95s on an
+/// Apple M-series release build where the same answer is one `is_falsy`
+/// probe on the first element.
+///
+/// **Validate once, then scan** -- deliberately *not* "validate each element
+/// as the scan reaches it". The bridge materialized the whole container
+/// before `builtin_any` ran, so an element the early exit never reaches
+/// still raised: `[true, "\x"] | any` exits 5, and real jq agrees for the
+/// stronger reason that it rejects the whole document at parse time
+/// (captured live from jq 1.7.1: `jq: parse error: Invalid escape at line 1,
+/// column 11`, and the same for `[false, "\x"] | all`). Checking per element
+/// with early exit would answer `true` there and drop a raise both
+/// references make. So [`push_generic_document_validation_error`] runs over
+/// the whole input first -- the same raise-set without the value, `O(N)` on
+/// the fan-out because of #1804's alias short-circuit -- and the loop below
+/// is then pure `is_falsy`, which materializes nothing and keeps the early
+/// exit `any_all_over` has always had.
+///
+/// It follows that this arm shares #1804's accepted trade-off, exactly as
+/// the `not`/`//` arms of this same issue do: a decode failure reachable
+/// *only* through an alias to a container no longer raises from `any`/`all`
+/// either (`a: &a ["bad\qc"]` / `b: *a` with `.b | any` is `true` at exit 0
+/// where it exited 1 before). `.a | any` and `.b[0]` still raise. Real yq
+/// rejects that document at parse time, so there is no yq behaviour to
+/// match.
+///
+/// Mode split mirrored arm for arm from [`super::eval::builtin_any`]/
+/// [`super::eval::builtin_all`], including the arm *order* #1901's review
+/// fixed there: the yq rejection must precede any `optional` wildcard, or
+/// `any?` on a `!!map` silently answers nothing instead of raising. The
+/// generic side spells `scalar_fallback` as [`decode_failure_or`], which is
+/// the same "decode failure wins over `optional`" precedence (#1620/#1989),
+/// and [`document_value_type_tag`] is [`super::eval::yaml_type_tag`]'s
+/// generic twin -- the *untagged* tag, which is what real yq's message
+/// quotes. Captured from yq v4.53.3: `{a: 1} | any` is `Error: any only
+/// supports arrays, was !!map`, and `1`/`null`/`"s"`/`true` give `!!int`/
+/// `!!null`/`!!str`/`!!bool`. jq mode iterates an object's *values* instead
+/// (#422), through [`effective_fields_checked`] with the mode's own
+/// duplicate-key rule, because the bridge collapsed duplicates on the way
+/// into `OwnedValue` and jq keeps the last occurrence:
+/// `{"a":true,"a":false} | any` is `false` in jq 1.7.1, not `true`.
+///
+/// `target_truthy` is the single bit that separates the two builtins, the
+/// same parameter [`super::eval::any_all_over`] takes: `any` stops at the
+/// first truthy element, `all` at the first falsy one, and an exhausted
+/// container answers `!target_truthy`.
+fn any_all_generic<S: EvalSemantics, V: DocumentValue>(
+    value: &V,
+    optional: bool,
+    cursor: V::Cursor,
+    name: &str,
+    target_truthy: bool,
+) -> GenericResult<V> {
+    if let Some(control) = push_generic_document_validation_error(&cursor, 0) {
+        return partial_generic(Vec::new(), control);
+    }
+    let answer = |b: bool| GenericResult::Owned(OwnedValue::Bool(b));
+    // One closure called from both the object arm and the scalar arm, not
+    // two copies of the same call -- `builtin_any`'s own `yq_reject_non_array`
+    // for the same reason (#1901 review).
+    let yq_reject_non_array = || {
+        decode_failure_or(value, optional, || {
+            GenericResult::Error(EvalError::yq_only_supports_arrays(
+                name,
+                document_value_type_tag(value),
+            ))
+        })
+    };
+    if let Some(elements) = value.as_array() {
+        let mut elems = elements;
+        while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
+            // `Preserve`, the same convention `push_generic_truthiness`/
+            // `retain_truthy_generic` read truthiness under, so `any`/`all`
+            // and `select`/`//`/`not` cannot drift on what truthy means.
+            let truthy = !elem_cursor.is_falsy(JsonConvention::Preserve);
+            if truthy == target_truthy {
+                return answer(target_truthy);
+            }
+            elems = rest;
+        }
+        answer(!target_truthy)
+    } else if let Some(fields) = value.as_object() {
+        if S::TAG == EvalTag::Yq {
+            return yq_reject_non_array();
+        }
+        match effective_fields_checked(&fields, S::COLLAPSE_DUPLICATE_KEYS) {
+            Ok(fields) => {
+                for field in fields {
+                    let truthy = !field.value_cursor.is_falsy(JsonConvention::Preserve);
+                    if truthy == target_truthy {
+                        return answer(target_truthy);
+                    }
+                }
+                answer(!target_truthy)
+            }
+            Err(err) => GenericResult::Error(err),
+        }
+    } else if S::TAG == EvalTag::Yq {
+        yq_reject_non_array()
+    } else {
+        decode_failure_or(value, optional, || {
+            GenericResult::Error(EvalError::cannot_iterate_with(
+                S::TAG,
+                &to_owned_for_diagnostic(value, Some(cursor)),
+            ))
+        })
+    }
+}
+
 fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
     builtin: &Builtin,
     value: V,
@@ -17707,6 +17822,24 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 Ok((path, _)) => GenericResult::Owned(OwnedValue::Int(file_index_for_path(&path))),
                 Err(e) => GenericResult::Error(e),
             }
+        }
+
+        // #2476: both were falling to the `_` wildcard below, whose ambient
+        // `to_owned_with_cursor` is `O(2^N)` on an alias fan-out.
+        //
+        // Gated on `cursor.is_some()` because the wildcard is already the
+        // right answer without one: the value is then already owned,
+        // `to_owned_with_cursor(&value, None)` cannot fail, and
+        // `eval_on_owned` runs `builtin_any`/`builtin_all` themselves. A
+        // second copy of their mode split here -- a decision tree #422/
+        // #1755/#1901/#1989 have each corrected once already -- would be
+        // two definitions of one behaviour for no speedup at all.
+        Builtin::Any if cursor.is_some() => {
+            any_all_generic::<S, V>(&value, optional, cursor.expect("guarded"), "any", true)
+        }
+
+        Builtin::All if cursor.is_some() => {
+            any_all_generic::<S, V>(&value, optional, cursor.expect("guarded"), "all", false)
         }
 
         _ => {

@@ -41856,6 +41856,227 @@ fn test_not_truthiness_table_2476() -> Result<()> {
     Ok(())
 }
 
+/// #2476: bare `any`/`all` answer from the cursor now (`any_all_generic`),
+/// where both used to fall to `eval_builtin`'s `_` wildcard and its ambient
+/// `to_owned_with_cursor`. This pins the truthiness and type tables the new
+/// arm has to reproduce, every row captured live from jq 1.7.1:
+///
+/// ```text
+/// [] | any                   false      [] | all                   true
+/// [null] | any               false      [null] | all               false
+/// [0] | any                  true       [0] | all                  true
+/// [false,false] | any        false      [true,"A"] | all           true
+/// {"a":false,"b":1} | any    true       {"a":false,"b":1} | all    false
+/// 1 | any      exit 5, Cannot iterate over number (1)
+/// "s" | any    exit 5, Cannot iterate over string ("s")
+/// null | any   exit 5, Cannot iterate over null (null)
+/// true | any   exit 5, Cannot iterate over boolean (true)
+/// ```
+///
+/// The object rows are #422: jq's `any` is `[.[] | .]` folded, and `.[]`
+/// over an object iterates its *values*, so an object is accepted here
+/// (real yq rejects it -- `test_any_all_reject_non_arrays_in_yq_mode_2476`
+/// in `tests/yq_cli_tests.rs` has that half).
+///
+/// The duplicate-key rows are why the native arm goes through
+/// `effective_fields_checked` with the mode's own collapse rule rather than
+/// walking every field: the bridge collapsed duplicates on the way into
+/// `OwnedValue`, and jq keeps the *last* occurrence. Captured live:
+/// `{"a":true,"a":false} | any` is `false`, not `true`, and
+/// `{"a":false,"a":true} | all` is `true`, not `false`.
+#[test]
+fn test_any_all_truthiness_table_2476() -> Result<()> {
+    for (doc, filter, want) in [
+        ("[]", "any", "false"),
+        ("[]", "all", "true"),
+        ("[null]", "any", "false"),
+        ("[null]", "all", "false"),
+        ("[0]", "any", "true"),
+        ("[0]", "all", "true"),
+        ("[false,false]", "any", "false"),
+        ("[false,false]", "all", "false"),
+        (r#"[true,"A"]"#, "any", "true"),
+        (r#"[true,"A"]"#, "all", "true"),
+        (r#"{"a":false,"b":1}"#, "any", "true"),
+        (r#"{"a":false,"b":1}"#, "all", "false"),
+        // Duplicate keys collapse to the last value before either builtin
+        // sees them (jq mode only).
+        (r#"{"a":true,"a":false}"#, "any", "false"),
+        (r#"{"a":true,"a":false}"#, "all", "false"),
+        (r#"{"a":false,"a":true}"#, "any", "true"),
+        (r#"{"a":false,"a":true}"#, "all", "true"),
+    ] {
+        let (stdout, code) = run_jq_stdin(filter, doc, &["-c"])?;
+        assert_eq!(code, 0, "`{filter}` on {doc}");
+        assert_eq!(stdout.trim(), want, "`{filter}` on {doc}");
+    }
+
+    // Every non-container raises, with the value quoted back.
+    for (doc, want) in [
+        ("1", "Cannot iterate over number (1)"),
+        (r#""s""#, r#"Cannot iterate over string ("s")"#),
+        ("null", "Cannot iterate over null (null)"),
+        ("true", "Cannot iterate over boolean (true)"),
+    ] {
+        for filter in ["any", "all"] {
+            let (_stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+            assert_eq!(code, 5, "`{filter}` on {doc} -- stderr: {stderr}");
+            assert!(
+                stderr.contains(want),
+                "`{filter}` on {doc} -- stderr {stderr} lacks {want:?}"
+            );
+        }
+    }
+
+    // `?` suppresses the *type* error (`1 | any?` is empty at exit 0), the
+    // same split the bridge produced before this change. The decode-failure
+    // half is `test_any_all_still_reject_a_malformed_document_2476` below.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "any?"], Some("1"))?;
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "");
+
+    Ok(())
+}
+
+/// #2476: `any_all_generic` validates its whole input *before* the scan,
+/// rather than checking each element as the early exit reaches it. This is
+/// the test that decides that shape.
+///
+/// The bridge materialized the whole container before `builtin_any` ran, so
+/// an element the early exit never reaches still raised. Real jq agrees, for
+/// the stronger reason that it rejects the entire document at parse time --
+/// captured live from jq 1.7.1:
+///
+/// ```text
+/// echo '[true, "\x"]'  | jq any   jq: parse error: Invalid escape at line 1, column 11
+/// echo '[false, "\x"]' | jq all   jq: parse error: Invalid escape at line 1, column 12
+/// echo '{123: 1}'      | jq any   jq: parse error: Object keys must be strings at line 1, column 5
+/// ```
+///
+/// Per-element validation with early exit would answer `true` for the first
+/// row (the deciding element comes first) and drop a raise both the bridge
+/// and real jq make. Hence: one `push_generic_document_validation_error`
+/// over the input, then a pure `is_falsy` scan.
+///
+/// `?` does not rescue any of these: a decode failure and a #1194 structural
+/// error both outrank `optional` (#1620/#1989), and the validation walk is
+/// not routed through `optional` at all -- same as the `//` arm's own
+/// `ambient_validation_error` call.
+#[test]
+fn test_any_all_still_reject_a_malformed_document_2476() -> Result<()> {
+    for (doc, filter, want) in [
+        // The deciding element comes *first*; the raise still wins.
+        (r#"[true, "\x"]"#, "any", "invalid escape sequence"),
+        (r#"[false, "\x"]"#, "all", "invalid escape sequence"),
+        (r#"[true, "\x"]"#, "all", "invalid escape sequence"),
+        (r#"[false, "\x"]"#, "any", "invalid escape sequence"),
+        ("{123: 1}", "any", "Invalid JSON text"),
+        ("{123: 1}", "all", "Invalid JSON text"),
+    ] {
+        for spelling in [filter.to_string(), format!("{filter}?")] {
+            let (_stdout, stderr, code) = run_jq_full(&["-c", &spelling], Some(doc))?;
+            assert_eq!(code, 5, "`{spelling}` on {doc} -- stderr: {stderr}");
+            assert!(
+                stderr.contains(want),
+                "`{spelling}` on {doc} -- stderr {stderr} lacks {want:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// #2476: the container half of `test_ambient_validation_agrees_with_bridge_2476`,
+/// for `any`/`all`.
+///
+/// Kept separate rather than folded in as two more probes there: that
+/// corpus includes scalar and `null` roots, where `any`/`all` raise a *type*
+/// error of their own and would break the "every probe agrees" assertion for
+/// reasons that have nothing to do with the validation walk. Every row here
+/// is a container, so the only thing that can decide the exit code is the
+/// walk -- and it has to decide it the same way `select(.) | 1` does.
+///
+/// Asserts the explicit expected code as well as agreement, for the reason
+/// the sibling gives: agreement alone would also pass if both routes
+/// silently stopped raising.
+#[test]
+fn test_any_all_ambient_validation_agrees_with_bridge_2476() -> Result<()> {
+    // (label, document, expected exit code, expected stderr substring)
+    let corpus: &[(&str, &str, i32, &str)] = &[
+        ("#1194 non-string key", "{123: 1}", 5, "expected string key"),
+        (
+            "decode failure, in array",
+            r#"["\x"]"#,
+            5,
+            "invalid escape sequence",
+        ),
+        (
+            "structural error, in array",
+            "[xyz123]",
+            5,
+            "unexpected character",
+        ),
+        (
+            "#1642 colliding undecodable keys",
+            r#"{"\ud800":1,"\ud800":2}"#,
+            5,
+            "is ambiguous",
+        ),
+        (
+            "#2211 trailing comma, array",
+            "[1,]",
+            5,
+            "expected JSON value, found ']'",
+        ),
+        (
+            "#2243 lone comma, array",
+            "[,]",
+            5,
+            "expected JSON value, found ','",
+        ),
+        (
+            "#2349 missing comma, array",
+            "[1 2]",
+            5,
+            "expected ',' or ']'",
+        ),
+        (
+            "#2211 trailing comma, nested",
+            r#"{"a":[1,]}"#,
+            5,
+            "expected JSON value, found ']'",
+        ),
+        ("duplicate key (valid)", r#"{"a":1,"a":2}"#, 0, ""),
+        ("well-formed", r#"{"a":[1,{"b":"c"}]}"#, 0, ""),
+    ];
+    // The reference route first; `any`/`all` after.
+    let probes = ["select(.) | 1", "any | 1", "all | 1"];
+    for (label, doc, want_code, want_stderr) in corpus {
+        let mut seen: Vec<(String, i32, String)> = Vec::new();
+        for probe in probes {
+            let (_stdout, stderr, code) = run_jq_full(&["-c", probe], Some(doc))?;
+            let first = stderr.lines().next().unwrap_or("").to_string();
+            assert_eq!(
+                code, *want_code,
+                "[{label}] `{probe}`: exit {code}, want {want_code}\nstderr: {stderr}"
+            );
+            assert!(
+                first.contains(want_stderr),
+                "[{label}] `{probe}`: stderr {first:?} lacks {want_stderr:?}"
+            );
+            seen.push((probe.to_string(), code, first));
+        }
+        let (_, ref_code, ref_first) = &seen[0];
+        for (probe, code, first) in &seen[1..] {
+            assert_eq!(
+                (code, first),
+                (ref_code, ref_first),
+                "[{label}] `{probe}` disagrees with `select(.) | 1`"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// #2476: `//`'s jq semantics table, after `Expr::Alternative` gained its own
 /// native arm in `eval_single` (it had none before, so it fell to the
 /// wildcard bridge unconditionally). Every row was captured live from the
