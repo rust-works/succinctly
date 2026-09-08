@@ -41354,7 +41354,10 @@ fn test_walk_residue_constructs_jq_2416() -> anyhow::Result<()> {
         (".a | . as $x | $x | key", "\"a\"", 0),
         (".a | (. as $x | $x) | key", "\"a\"", 0),
         (". as $x | $x | key", "", 0),
-        (".a.b as $x | $x | key", "", 0),
+        // #2072: the variable stands at the node it was bound from, so this
+        // answers `"b"` like yq v4.53.3 (it printed nothing while a binding
+        // substituted a bare value).
+        (".a.b as $x | $x | key", "\"b\"", 0),
         (".a | . as $x | $x | path", "[\"a\"]", 0),
         (".c[] | . as $x | $x | key", "0
 1", 0),

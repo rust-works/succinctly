@@ -31938,7 +31938,6 @@ pub(crate) fn substitute_bound_var(
 /// cursor routes (`key`/`path`/`parent`/`line`/`column`/`file_index`, YAML
 /// anchor and style marks) rather than by `resolve_node`. Without one this
 /// is `substitute_bound_var`.
-#[allow(dead_code)] // consumed by the bind sites in the next commit (#2072 step 3)
 pub(crate) fn substitute_bound_var_from(
     bind_expr: &Expr,
     body: &Expr,
