@@ -114,13 +114,16 @@ W_ENTRIES=(
   #    demand-forwarded before WP1 (each_limit, #1462/#1596); the worked
   #    example WP1's five arms copy. --
   'nested-limit::::limit(1; __G__)'
-  # -- WP2a: `//`, `and`, `or` (each_alternative + boolean_fanout_core) --
-  'alt-fallback::WP2a::(__G__)//9'
-  'alt-right::WP2a::null // (__G__)'
-  'and-left::WP2a::(__G__) and true'
-  'and-right::WP2a::true and (__G__)'
-  'or-left::WP2a::(__G__) or false'
-  'or-right::WP2a::false or (__G__)'
+  # -- WP2a: CLOSED. each_alternative and each_boolean (eval.rs, the
+  #    latter over the new shared demand-driven boolean_fanout_each), plus
+  #    eval_each_generic's own Alternative/And/Or arms -- so these rows must
+  #    match jq now and any divergence here is unexpected by definition. --
+  'alt-fallback::::(__G__)//9'
+  'alt-right::::null // (__G__)'
+  'and-left::::(__G__) and true'
+  'and-right::::true and (__G__)'
+  'or-left::::(__G__) or false'
+  'or-right::::false or (__G__)'
   # -- WP2b: eager sub-expression sites --
   'if-cond::WP2b::if (__G__) then 5 else 6 end'
   'as-source::WP2b::(__G__) as $v | $v'
