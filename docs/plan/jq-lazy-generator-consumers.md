@@ -1360,3 +1360,50 @@ the reasoning behind each placement:
    never puts a generator in `limit`'s `n` argument specifically (only in `expr`), so it could
    not have caught the `each_limit_generic` double-evaluation on its own -- the dedicated CLI
    test above is what actually pins that fix.
+
+10. **[#2180](https://github.com/rust-works/succinctly/issues/2180)** — a `?//`-alternatives
+    bind sees a short-circuiting consumer's `Demand::Stop`/`break` only when nothing between the
+    consumer and the bind materializes it first. #932's own fix ([#1519](https://github.com/rust-works/succinctly/issues/1519))
+    made `each_pattern_alternatives`/`each_pattern_alternatives_generic` retry on that stop the
+    same way they already retried on `Control::Break`, which made the *output count* depend for
+    the first time on whether the stop actually reaches the bind — every eager `eval_single` call
+    still sitting on that path is therefore a newly-visible one-instead-of-two, not a new bug.
+    `limit` is the one consumer with a demand-forwarding `eval_each` arm already (`each_limit`,
+    #1462/#1596) and is the only one that works nested; every other consumer, and several
+    non-consumer constructs, still materialize the bind and swallow the stop.
+
+    **Re-probing at implementation time (2026-09-08) found the affected class is wider than the
+    four constructs originally filed** — `//`, a `label`/`break` pipe stage, `foreach`, and a
+    nested consumer. Re-verifying against the pinned oracle turned up `and`/`or`, `if`'s
+    condition, `as`/`as`-pattern's bound source, `select`, unary minus, an index key, string
+    interpolation, an object value, and `range`'s bound (the `eval_generic.rs` twin only —
+    `eval.rs`'s own `each_range` already forwards demand) as the same missing-arm class, and
+    found that two of the originally-filed rows (the `label`/`break` pipe stage, and the
+    equivalent reached through a bound function call) had already closed as a side effect of
+    spine 2416's `eval_generic.rs` migration (`Expr::Label`/`Expr::DefCall` no longer bridge
+    their whole construct to the eager evaluator, which is what had been losing the cursor a
+    `break` needs to unwind through) — see
+    [`docs/compliance/jq/limitations.md`](../compliance/jq/limitations.md)'s entry of the same
+    name for the full, live-verified table.
+
+    Split into five work packages, each closing its own rows independently and each gated on the
+    same oracle sweep (`scripts/jq-alt-retry-oracle-sweep.sh`, modelled on this document's own
+    sweep methodology) rather than on `?//` work specifically — no row here needs any change to
+    `each_pattern_alternatives` itself, only a demand-forwarding arm for the construct sitting on
+    top of it, `each_limit`'s already-shipped shape:
+
+    - **WP0** — characterize the full matrix (both evaluator routes), bisect and pin the two
+      already-closed rows, add the oracle sweep, de-stale the docs. No production code.
+    - **WP1** — nested consumers: `each_first`/`each_nth`/`each_isempty`/
+      `each_any_all_gen_cond`/`each_upper_in` in `eval.rs`, `each_limit`'s exact protocol.
+    - **WP2a** — `//`, `and`, `or`: `each_alternative`'s truthy-filter sink, and
+      `boolean_fanout_core` parameterised over the operand strategy the way `binary_fanout_each`
+      was for `Compare`/`Arithmetic` (#1459/#1481).
+    - **WP2b** — the remaining eager sub-expression sites (`each_if`'s `cond`,
+      `each_as`/`each_as_pattern`'s source, new arms for `Select`/`Negate`/`IndexExpr`/
+      `StringInterpolation`/`Object`, plus mirroring `each_range` into `eval_each_generic`) —
+      mechanical once WP1/WP2a establish the pattern.
+    - **WP3** — `foreach`, the only genuinely new mechanism: the sink's `Demand::Stop` must be
+      treated exactly as `Control::Break` is today (`is_retryable_stop`), with foreach's own
+      state threading intact (a retried alternative's UPDATE runs on the already-updated state,
+      not a fresh one).
