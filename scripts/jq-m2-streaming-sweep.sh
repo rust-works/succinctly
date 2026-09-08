@@ -110,6 +110,7 @@ DOCS=(
   '{"\ud800":1,"\ud800":2}'            # #1642 colliding undecodable keys
   '{"\ud800":1,"b":2}'                 # single undecodable key (preserved)
   '{"a\q":1,"b":2}'                    # invalid escape in key
+  '[{"x":"\ud800"}]'                # #2103 lone-surrogate value in an element
 )
 
 # Filters. The two groups below were the point of the sweep while there were
@@ -139,6 +140,10 @@ FILTERS=(
   'limit(1; keys_unsorted[])'
   'limit(2; keys_unsorted[])'
   'first(.[])'
+  'map(.x)'
+  'map(.x) | .[]'
+  'first(map(.x) | .[])'
+  'limit(1; map(.x) | .[])'
   # materializing eager twin / native streaming arm
   '.,.'
   'if . then . else . end'
