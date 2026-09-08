@@ -1406,7 +1406,7 @@ the reasoning behind each placement:
     - **WP2b** — the remaining eager sub-expression sites (`each_if`'s `cond`,
       `each_as`/`each_as_pattern`'s source, new arms for `Select`/`Negate`/`IndexExpr`/
       `StringInterpolation`/`Object`, plus mirroring `each_range` into `eval_each_generic`) —
-      mechanical once WP1/WP2a establish the pattern.
+      mechanical once WP1/WP2a establish the pattern. **Landed** — see below.
     - **WP3** — `foreach`, the only genuinely new mechanism: the sink's `Demand::Stop` must be
       treated exactly as `Control::Break` is today (`is_retryable_stop`), with foreach's own
       state threading intact (a retried alternative's UPDATE runs on the already-updated state,
@@ -1478,3 +1478,38 @@ the reasoning behind each placement:
       whole-value sink and `boolean_fanout_each`'s `bool` sink share one definition — which
       also `suspend()`s on the way into the sink, so a lazy operand's downstream consumer does
       not inherit a scope belonging to the operand expression alone.
+
+    **WP2b landed**, closing its own 144 sweep rows (612 cases, 0 unexpected, 18 known, all of
+    them WP3's `foreach`), again with no change to `each_pattern_alternatives`. `each_if`/
+    `each_if_generic` now drive `cond` through the sink, and `each_as`/`each_as_pattern` (with
+    their generic twins) drive the bound source through `fanout_arg_each`/
+    `fanout_arg_each_generic` — WP1's `nth`-argument fan-out reused as-is — which made
+    `materialize_bound_values` and its generic twin dead code, now removed. New arms:
+    `Builtin::Select` (`each_select`/`each_select_generic`, native and cursor-preserving in both
+    files), `Expr::Negate` (`each_negate`; the generic side bridges only the non-path-context
+    case and keeps its `needs_path_context`-gated native arm), `Expr::IndexExpr`'s key
+    (`each_index_expr`/`each_index_expr_generic`), `Expr::StringInterpolation` (bridged) and
+    `Expr::Object` (`each_object_entries`/`each_object_value`, native in both files), plus the
+    `Expr::Range` arm `eval_each_generic` had been missing since #1556. Three findings:
+
+    - **Two of the new arms are jq-mode only, gated on `EvalSemantics`, and the gate is a rule
+      not a shortcut.** yq mode's index-key stream keeps a retroactive discard-on-later-escape
+      rule (a later escape in the key generator withdraws keys already produced), and a sink
+      push that has already been delivered cannot be withdrawn — so `IndexExpr` keeps the eager
+      fallback there. yq mode's string interpolation is not a fan-out generator at all, so
+      there is nothing to forward. Both stay on the eager path in yq mode by design; the sweep
+      is jq-mode only and cannot see either, which is why the gate is spelled out here.
+    - **`Object` is the one construct in this issue with a genuine over-stopping trap, and the
+      differential test is what proves the arm respects it.** `first({a:1, b:(("B"|stderr), 2)}
+      | .a)` writes `B` in jq: construction cannot deliver any combination until every entry has
+      its first value (key encloses value, entries recurse left to right), so a value that is
+      never read still runs. An arm that "helpfully" skipped unread entries would deliver the
+      right value with the wrong side effects; `each_object_entries` mirrors
+      `build_object_entries`'s nesting exactly, and `eval_each_with_a_never_stopping_sink_matches_eval_single_820`
+      pins multi-output keys, multi-output values, `empty`-short-circuits-the-rest, and
+      error-after-prefix per entry.
+    - **The bound-source arm fell out of WP1's argument fan-out for free.** `as`'s source and
+      `nth`'s `n` are the same shape — an argument position that is part of the demand path —
+      so `fanout_arg_each` needed no change; the cost of WP1 having got that abstraction right
+      was one fewer mechanism here. `each_as`'s doc comment used to justify the eager source by
+      analogy to `each_if`'s eager `cond`; both justifications were pre-#1519 and both are gone.
