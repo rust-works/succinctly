@@ -1587,29 +1587,14 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
 
         // Check if we can use the identity fast path (raw bytes output, no materialization)
         let use_identity_fast_path = expr.is_identity() && output_config.can_use_raw_identity();
-        // #1653: stream each output as the evaluator produces it, so a
-        // `debug`/`stderr` side effect interleaves with stdout the way real
-        // jq's lazy generator does. Since #2103 that is unconditional --
-        // *every* M2 filter streams. The `expr_is_cursor_transparent` gate
-        // that used to stand here kept a root-forwarding filter (`.,.`,
-        // `1+1`, `try (1+1)`) on the eager route because that route's
-        // `to_owned_with_cursor` doubled as a whole-document validity check;
-        // #2103 recorded the consequence of dropping it as a deliberate
-        // divergence: **a filter validates only what it reads**, so `1+1` on
-        // a malformed document now answers `2` at exit 0 where jq 1.7.1
-        // exits 5. See "Every M2 filter streams" in
-        // `docs/compliance/jq/limitations.md` for the 19 rows and the
-        // reasoning, and `scripts/jq-m2-streaming-sweep.sh` for the sweep
-        // that measures them.
-        //
-        // `SUCCINCTLY_JQ_M2_EVAL=eager` still forces the old eager route out
-        // of the same binary; it is a verification hook kept only until
-        // #2103's phase 3 deletes it, never a supported interface.
-        let use_streaming = match m2_eval_override().as_deref() {
-            Some("stream") => true,
-            Some("eager") => false,
-            _ => true,
-        };
+        // #1653 introduced streaming, gated so only a cursor-transparent
+        // filter took it; #2103 dropped the gate, so every M2 filter streams
+        // unconditionally now. That means a filter validates only what it
+        // reads: `1+1` on a malformed document answers `2` at exit 0 where
+        // jq 1.7.1 exits 5. See "Every M2 filter streams" in
+        // `docs/compliance/jq/limitations.md` for the full list of affected
+        // rows and the reasoning, and `scripts/jq-m2-streaming-sweep.sh` for
+        // the sweep that measures them.
 
         for (idx, raw) in raw_inputs.iter().enumerate() {
             let filename: Option<String> = files.get(idx).map(|p| p.to_string_lossy().to_string());
@@ -1792,26 +1777,14 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
                             )?;
                             Ok(!stop)
                         };
-                    if use_streaming {
-                        evaluate_bytes_streaming(
-                            json_bytes,
-                            &expr,
-                            &index,
-                            &at,
-                            &mut sink,
-                            &mut on_value,
-                        )
-                    } else {
-                        // Consume results to free memory after each value is written
-                        for result in evaluate_bytes_lazy(json_bytes, &expr, &index, &at, &mut sink)
-                        {
-                            if !on_value(&mut sink, result)? {
-                                break;
-                            }
-                            // result is dropped here, freeing its memory immediately
-                        }
-                        Ok(())
-                    }
+                    evaluate_bytes_streaming(
+                        json_bytes,
+                        &expr,
+                        &index,
+                        &at,
+                        &mut sink,
+                        &mut on_value,
+                    )
                 }));
                 match outcome {
                     Ok(written) => written?,
@@ -4655,47 +4628,9 @@ fn nesting_depth_panic_message(payload: &(dyn core::any::Any + Send)) -> Option<
         .then(|| text.to_string())
 }
 
-/// Read `SUCCINCTLY_JQ_M2_EVAL` (#1653), the eager-vs-streaming override
-/// consulted where `use_streaming` is decided. Since #2103 only `eager`
-/// changes anything -- it is the sole remaining way to reach
-/// [`evaluate_bytes_lazy`] -- and nothing in the tree sets it except
-/// `tests/jq_cli_tests.rs`'s own eager cross-checks; `scripts/jq-m2-streaming-sweep.sh`
-/// stopped using it when it became a single-route sweep. A verification hook,
-/// never a supported interface, deleted with the eager route in #2103's
-/// phase 3.
-fn m2_eval_override() -> Option<String> {
-    std::env::var("SUCCINCTLY_JQ_M2_EVAL").ok()
-}
-
 /// One M2 output, handed to the caller's writer. Named so the `&mut dyn`
 /// spelling below stays inside clippy's `type_complexity` budget.
 type JqValueSink<'a, 'w> = dyn FnMut(&mut ErrorSink, JqValue<'a, Vec<u64>>) -> Result<bool> + 'w;
-
-/// Evaluate expression against raw JSON bytes, returning lazy JqValues.
-///
-/// This function preserves original number formatting by working directly
-/// with the source bytes instead of parsing through serde_json.
-///
-/// The eager half of #1653's migration: it evaluates the whole filter before
-/// the caller writes any of it, so a `debug`/`stderr` side effect reaches
-/// stderr ahead of stdout output that was logically produced first. Since
-/// #2103 no shipped filter reaches it -- every M2 filter goes through
-/// [`evaluate_bytes_streaming`] -- and it survives only for
-/// `SUCCINCTLY_JQ_M2_EVAL=eager`, the verification hook
-/// `scripts/jq-m2-streaming-sweep.sh` used to diff the two routes out of one
-/// binary. #2103's phase 3 deletes it.
-fn evaluate_bytes_lazy<'a>(
-    json_bytes: &'a [u8],
-    expr: &jq::Expr,
-    index: &'a JsonIndex,
-    at: &InputLocation,
-    sink: &mut ErrorSink,
-) -> Vec<JqValue<'a, Vec<u64>>> {
-    let cursor = index.root(json_bytes);
-    // Use eval_with_cursor to preserve cursor context for position-based navigation
-    let result = eval_with_cursor(expr, cursor);
-    generic_result_to_jq_values(result, cursor, at, sink)
-}
 
 /// Writes the newline jq puts after every top-level output value. Generic
 /// over `W: core::fmt::Write` so the same function works as
@@ -4782,8 +4717,8 @@ fn m2_json_fallback_safe(expr: &Expr) -> bool {
 
 /// Evaluate one JSON document through the M2 fast path (#1576): stream
 /// straight from `GenericResult`'s cursors instead of the materializing
-/// `generic_result_to_jq_values`/`print_json` stack `evaluate_bytes_lazy`/
-/// `evaluate_bytes_streaming` feed. Only reached when the caller's own
+/// `generic_result_to_jq_values`/`print_json` stack that feeds
+/// [`evaluate_bytes_streaming`]. Only reached when the caller's own
 /// `can_json_fast_path` (AST shape + flags) already holds -- which,
 /// crucially, only admits expressions [`m2_json_fallback_safe`] confirms
 /// produce *at most one* top-level result (`map`/`sort`/etc., plain
@@ -4794,8 +4729,8 @@ fn m2_json_fallback_safe(expr: &Expr) -> bool {
 /// `halt_error` was requested) and the caller should move to the next
 /// document; `Ok(false)` when this path detected a malformed/undecodable
 /// document and deliberately wrote *nothing*, so the caller should fall
-/// back to the general `evaluate_bytes_lazy`/`evaluate_bytes_streaming`
-/// path for this one document instead of reporting from here.
+/// back to the general [`evaluate_bytes_streaming`] path for this one
+/// document instead of reporting from here.
 ///
 /// **Why fall back rather than report directly** (#1576 review): jq's own
 /// `print_json`/`to_owned_cursor`/`DistinctKeyCursors` stack has
