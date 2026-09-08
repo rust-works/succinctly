@@ -2861,22 +2861,54 @@ jq 1.7.1 and pinned as golden fixtures (`tests/data/jq-golden/cases/alt_pattern_
 | `1 as $x ?// $y \| 5` (no consumer)                        | `5`                          |
 
 **What still diverges.** The stop only reaches the `?//` if every construct between the consumer
-and the bind *forwards demand* into it rather than materializing it. Three do not, so these still
-answer once where jq answers twice:
+and the bind *forwards demand* into it rather than materializing it. None of the constructs below
+do today, outside `limit`, so these still answer once where jq answers twice. `first(...)` reaches
+`eval_generic.rs`'s native arm and `isempty(...)` bridges wholesale to `eval.rs`'s `eval_each`, and
+the two arm sets have already drifted (`range`'s bound below), so every row is confirmed under both
+— see the full matrix in `test_nested_short_circuit_consumer_hides_the_stop_2180`
+(`tests/jq_cli_tests.rs`) and `scripts/jq-alt-retry-oracle-sweep.sh`. [#2180](https://github.com/rust-works/succinctly/issues/2180)'s plan
+(2026-09-08) found this residual is wider than the four constructs originally filed here:
 
-| filter                                                         | jq 1.7.1        | succinctly jq |
-|-----------------------------------------------------------------|-----------------|---------------|
-| `[first((1 as $x ?// $y \| 5)//9)]`                             | `[5,5]`         | `[5]`         |
-| `[label $o \| (1 as $x ?// $y \| 5) \| (., break $o)]`          | `[5,5]`         | `[5]`         |
-| `[first(foreach (1) as $x ?// $y (0;.+1;.), "z")]`              | `[1,2]`         | `[1]`         |
-| `1 \| [first(first(1 as $x ?// $y \| 1))]`                      | `[1,1]`         | `[1]`         |
-| `1 \| [first(isempty(1 as $x ?// $y \| 1))]`                    | `[false,false]` | `[false]`     |
-| `1 \| [first(IN(1 as $x ?// $y \| 1))]`                         | `[true,true]`   | `[true]`      |
+| filter                                                                                                      | jq 1.7.1        | succinctly jq |
+|-------------------------------------------------------------------------------------------------------------|-----------------|---------------|
+| `[first((1 as $x ?// $y \| 5)//9)]`                                                                         | `[5,5]`         | `[5]`         |
+| `[first(null // (1 as $x ?// $y \| 1))]`                                                                    | `[1,1]`         | `[1]`         |
+| `[first((1 as $x ?// $y \| 1) and true)]`, `... true and (...)`, `... (...) or false`, `... false or (...)` | `[true,true]`   | `[true]`      |
+| `[first(first(1 as $x ?// $y \| 1))]`, `... nth(0; ...)`                                                    | `[1,1]`         | `[1]`         |
+| `[first(isempty(1 as $x ?// $y \| 1))]`, `[isempty(isempty(...))]`                                          | `[false,false]` | `[false]`     |
+| `[first(any(1 as $x ?// $y \| 1; .))]`                                                                      | `[true,true]`   | `[true]`      |
+| `[first(IN(1 as $x ?// $y \| 1))]`, `[first(IN(1; ...))]`, `[limit(1; IN(...))]`                            | `[true,true]`   | `[true]`      |
+| `[first(if (1 as $x ?// $y \| 1) then 5 else 6 end)]`                                                       | `[5,5]`         | `[5]`         |
+| `[first((1 as $x ?// $y \| 1) as $v \| $v)]`, `... as [$a] ?// $a \| $a`                                    | `[1,1]`         | `[1]`         |
+| `[first(select((1 as $x ?// $y \| 1) == 1))]`                                                               | `[1,1]`         | `[1]`         |
+| `[first(-(1 as $x ?// $y \| 1))]`                                                                           | `[-1,-1]`       | `[-1]`        |
+| `[1] \| [first(.[(1 as $x ?// $y \| 1)-1])]`                                                                | `[1,1]`         | `[1]`         |
+| `[first("\(1 as $x ?// $y \| 1)")]`                                                                         | `["1","1"]`     | `["1"]`       |
+| `[first({a:(1 as $x ?// $y \| 1)} \| .a)]`                                                                  | `[1,1]`         | `[1]`         |
+| `[first(range((1 as $x ?// $y \| 1); 3))]` (generic route only)                                             | `[1,1]`         | `[1]`         |
+| `[first(foreach (1) as $x ?// $y (0;.+1;.), "z")]`                                                          | `[1,2]`         | `[1]`         |
+| `1 \| [isempty(foreach (1 as $x ?// $y \| 1) as $v (0; .+$v; .))]` (source, not pattern)                    | `[false,false]` | `[false]`     |
 
-The cause is uniform and is not about `?//` at all: each of `//`, `foreach`, a parenthesised bind
-whose break arrives from a *downstream* pipe stage, and a **nested short-circuiting consumer**
-lacks a demand-forwarding `eval_each` arm, so it evaluates the bind eagerly and absorbs the stop
-before it can reach `each_pattern_alternatives`.
+**Two rows recorded here as of #2180's filing have since closed** — the issue text was stale on
+them. `1 | [label $o | (1 as $x ?// $y | 5) | (., break $o)]` closed at
+[`bcb41f74f`](https://github.com/rust-works/succinctly/commit/bcb41f74f49a64953f66cf03fab41c84899b1629)
+("route `label` through the generic evaluator", spine 2416), and
+`def m(g): label $o | g | ., break $o; [m(1 as $x ?// $y | 5, 6)]` closed separately at
+[`8809f2b85`](https://github.com/rust-works/succinctly/commit/8809f2b85dd156491882792613004851eba71dc4)
+("route bound function calls through the generic evaluator", spine 2416) — both bisected live
+(#2180 WP0): `Expr::Label`/`Expr::DefCall` previously bridged their whole construct to the eager,
+owned evaluator, which lost the cursor a `break` needs to unwind through on its way back to
+`each_pattern_alternatives_generic`; routing them natively through `eval_generic.rs` fixed that as
+a side effect, with no `?//`-specific work at either commit. Neither is the pipe rework the
+original filing guessed at.
+
+The cause is uniform and is not about `?//` at all: `//` (`Expr::Alternative`), `and`/`or`, `if`'s
+condition, `as`/`as`-pattern's bound source, `select`, unary minus, an index key, string
+interpolation, an object value, `range`'s bound (`eval_generic.rs`'s twin only — `eval.rs`'s own
+`each_range` already forwards demand, so `isempty(range(...))` already matches while
+`first(range(...))` doesn't), `foreach`, and a **nested short-circuiting consumer** each lack a
+demand-forwarding `eval_each`/`eval_each_generic` arm, so they evaluate the bind eagerly and absorb
+the stop before it can reach `each_pattern_alternatives`.
 
 `limit` is the one consumer that already has such an arm (`each_limit`, #1462/#1596), and it is
 exactly the one that works when nested — `1 | [first(limit(1; 1 as $x ?// $y | 1))]` is `[1,1]` in
@@ -2884,10 +2916,16 @@ both, while substituting any other consumer for the inner `limit` diverges. That
 direct evidence for the mechanism, and it means each construct closes its own row by gaining an
 arm, with no further `?//` work. Demand-forwarding and unparenthesised spellings likewise all
 already match (`[first((1 as $x ?// $y | 5)|.)]`, `[first(if true then 1 as $x ?// $y | 5 else 9
-end)]`, `[first(limit(5; 1 as $x ?// $y | 5))]`, `[label $o | 1 as $x ?// $y | (5, break $o)]`).
+end)]`, `[first(limit(5; 1 as $x ?// $y | 5))]`, `[label $o | 1 as $x ?// $y | (5, break $o)]`), as
+do collectors, `reduce`, `last`, `try`/`?`, `+`/`==` (`binary_fanout_each`), `def`/`DefCall`, and
+`if`'s *branches* (as opposed to its condition) — none of those materialize their generator
+argument the way the diverging constructs above do.
+
 This is the same missing-lazy-arm class as items 9 and 10 of
 [`docs/plan/jq-lazy-generator-consumers.md`](../../plan/jq-lazy-generator-consumers.md), tracked
-in [#2180](https://github.com/rust-works/succinctly/issues/2180).
+in [#2180](https://github.com/rust-works/succinctly/issues/2180), whose own plan (2026-09-08)
+splits the residual above into four work packages — WP1 (nested consumers), WP2a (`//`/`and`/`or`),
+WP2b (the remaining eager sub-expression sites), WP3 (`foreach`) — each closing its own rows.
 
 Unrelated to the other `?//` divergence recorded above
 ([#1365](https://github.com/rust-works/succinctly/issues/1365), `?//`-alternatives folds not being
