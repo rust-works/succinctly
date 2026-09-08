@@ -597,14 +597,19 @@ is the revert that established what the other one costs.
    the resolver as one opaque computed value. Assuming those left the register alone made
    `path(. as $x \| ([.a]\|first) \| $x)` answer `[]` where jq refuses, and `=`/`|=`/`del()`
    then wrote through the fabricated path, so the allowlist is deliberately narrow and
-   everything outside it drops the register. Three shapes jq answers therefore refuse here:
+   everything outside it drops the register. Two shapes jq answers therefore refuse here:
    a construction or interpolation that itself navigates
    (`path(. as $x \| [.a] \| $x)`, `{k:.a}`, `"\(.a)"` — excluded because jq *also* raises
    for a `.a` applied to a computed value, which this resolver never sees inside a
    construction: `path(. as $x \| {k:.a} \| [.a] \| $x)` raises in jq on the second `.a`),
-   an `as` whose bind source navigates, and a `def` whose body is a constant
-   (`path(. as $x \| (def f: 5; f) \| $x)` — resolving a call to its body is not something a
-   syntactic predicate can do from a name). All three are refuse-only.
+   and a `def` whose body is a constant (`path(. as $x \| (def f: 5; f) \| $x)` — resolving a
+   call to its body is not something a syntactic predicate can do from a name). Both are
+   refuse-only. (A third shape used to sit here too — an `as` whose bind source navigates —
+   but [#2042](https://github.com/rust-works/succinctly/issues/2042) established that jq
+   evaluates an `as` source with path tracking suspended, so the source alone never moves the
+   register; `cannot_move_register`'s `Expr::As` arm now consults only the body, and
+   `path(. as $x \| (.a as $q \| 1) \| $x)` — the shape that used to cost this exclusion — is
+   jq's `[]`, matched, not refused. See below.)
 
    A fourth case, the `null`/`false` half of `register_identical` applied one stage earlier
    than succinctly used to reach — `path(.a \| null)` on `{"a":null}` and `path(.a \| false)`
@@ -623,7 +628,7 @@ is the revert that established what the other one costs.
    write-through answer to yq mode here would silently corrupt data (confirmed live against
    yq v4.53.3: `(null \| .a) = 5` on `null` is a no-op, not the write jq's own `{"a":5}`
    answer would become) rather than merely refuse, which is the direction ADR-0018 never
-   permits. Refuse-only for yq mode remains pre-existing and tracked the same way the three
+   permits. Refuse-only for yq mode remains pre-existing and tracked the same way the two
    shapes above are.
 
    **#2046 review finding, also closed**: `FoldRegister::advance` — which builds `foreach`'s
@@ -645,16 +650,65 @@ is the revert that established what the other one costs.
    accept-where-jq-refuses cases) would not have been satisfiable while leaving a *known*
    instance of exactly that class in the same subsystem.
 
-   Separately, a variable bound from a *navigated* position (`.a as $y`) still carries no
-   marker at all, because `substitute_var_tracked` remains gated on
-   `is_identity_passthrough` — so `path(.a as $y \| reduce (1) as $i (.a; $y))`, jq `["a"]`,
-   refuses too. That gate **cannot simply be widened**: measured against jq 1.7.1, doing so
-   makes `path(.a as $y \| .c \| $y)` on `{"a":{"b":1},"c":{"b":1}}` answer `["c"]` where jq
-   refuses — reopening the accept-where-jq-refuses class #1466 closed, since
-   `register_identical`'s provenance bit records "never rebuilt", not "from *this*
-   position", and `OwnedValue` has no node identity. The marker needs a bind-time path
-   first; tracked as [#2042](https://github.com/rust-works/succinctly/issues/2042). Golden
-   `fold_register_var_from_navigated_binding`.
+   Separately, a variable bound from a *navigated* position (`.a as $y`) used to carry no
+   marker at all, so `path(.a as $y \| reduce (1) as $i (.a; $y))`, jq `["a"]`, refused too —
+   and the naive fix (widen `substitute_var_tracked`'s gate to cover it) reopens the
+   accept-where-jq-refuses class #1466 closed: `path(.a as $y \| .c \| $y)` on
+   `{"a":{"b":1},"c":{"b":1}}` would answer `["c"]` where jq refuses, since
+   `register_identical`'s old provenance bit recorded "never rebuilt", not "from *this*
+   position", and `OwnedValue` has no node identity to tell the two equal-valued siblings
+   apart. **Closed by [#2042](https://github.com/rust-works/succinctly/issues/2042)**, which
+   gave the marker a bind-time path: `Expr::TrackedVar`'s payload
+   (`Tracked { value, origin }`, `src/jq/expr.rs`) carries an `Origin`, either
+   `Origin::Snapshot` (the pre-#2042 value witness `. as $x` still uses, unchanged) or
+   `Origin::At { invocation, path }` — the resolver invocation the binding was made in (one
+   `path()`/`del()`/assignment-target resolution; a nested `path()` is a second invocation
+   with its own root) and the absolute path the source resolved to within it. The path
+   register's own absolute position is tracked per-invocation as a `Frame`
+   (`src/jq/eval.rs`), threaded alongside `trackable`/`snapshot` through the same recursive
+   dispatch; `Frame::certifies` admits an `Origin::At` marker only where its
+   `(invocation, path)` matches the frame's own exactly, and admits `Origin::Snapshot`
+   unconditionally, leaving that half of `register_identical`'s rule as it was. A `null`/
+   `true`/`false` is still admitted by value regardless of origin (jq's own unallocated `jv`
+   rule) — a third disjunct alongside the two origin checks, not a replacement for either.
+
+   The bind path itself comes from resolving the `as` source in path position
+   (`resolve_bind_source`, `src/jq/eval.rs`) as a witness only: jq evaluates an `as` source
+   with path tracking suspended, so the source never moves the register
+   (`path(.a as $y \| .b)` is `["b"]`) and never raises a path error of its own — the body
+   still resolves against the arm's own ambient value, trackability and frame, exactly as
+   before #2042. `cannot_move_register`'s `Expr::As` arm follows the same evidence and now
+   consults only the body (see above), so `path(. as $x \| (.a as $q \| 1) \| $x)` — listed
+   above as a refuse-only cost of the register-carry allowlist — is now jq's `[]` too: an
+   `as` source can no longer block carrying the register through it, because it was never the
+   register moving in the first place.
+
+   `path(.a as $y \| .a \| $y)` on `{"a":{"b":1},"c":{"b":1}}` now answers jq's `["a"]`; the
+   equal-valued sibling `path(.a as $y \| .c \| $y)` still refuses — exactly the #1466 class
+   the frame witness exists to keep closed, now for navigated bindings too. yq mode is
+   unchanged: `substitute_bound_var`'s widening is jq-mode only
+   ([#2643](https://github.com/rust-works/succinctly/issues/2643)).
+
+   Four rows stay refuse-only, each pinned in `test_path_bind_origin_matrix_refuse_only_2042`
+   (`src/jq/eval.rs`) and `scripts/jq-bind-origin-oracle-sweep.sh`'s own `REFUSE_ONLY` list:
+
+   | Filter                                               | jq      | Why succinctly still refuses                                                                                                                      |
+   |------------------------------------------------------|---------|---------------------------------------------------------------------------------------------------------------------------------------------------|
+   | `.a as $y \| path(.a \| $y)`                         | `["a"]` | value-mode binding — `eval_as` never resolves its source in path position; the accepting-direction twin of #2642                                  |
+   | `path(.a as $y \| .a \| tojson \| fromjson \| $y)`   | `["a"]` | `tojson`/`fromjson` are not on `cannot_move_register`'s proven allowlist (#2041)                                                                  |
+   | `path(.a as $y \| def f: $y; .a \| f)`               | `["a"]` | a `def` inside `path()` resolves as an opaque leaf                                                                                                |
+   | `path(.a as $y \| ([$y] \| .[0]) as $z \| .a \| $z)` | `["a"]` | the source navigates inside a construction, which the resolver refuses where jq's suspended tracking allows it, so it falls back to a plain value |
+
+   Two related divergences are pre-existing and out of scope for #2042, tracked separately:
+   [#2642](https://github.com/rust-works/succinctly/issues/2642) — the *root* `Origin::Snapshot`
+   marker already fabricates a path across a rebuilt-copy boundary (`. as $x \| {a:1} \|
+   ($x.a) = 9` on `{"a":1}` writes `{"a":9}`, jq refuses) — the same bug class as #1466,
+   reached via a rebuild instead of a sibling; not widened or fixed by #2042. And
+   [#2646](https://github.com/rust-works/succinctly/issues/2646) — `first`/`last`/`add`
+   navigating inside their own jq-level definitions against a *constructed* value inside
+   `path()` never raise, found by `scripts/jq-bind-origin-fuzz.py`'s differential fuzz and
+   confirmed pre-existing (reproduces byte-for-byte on the commit before #2042), not caused by
+   this change.
 
 2. **`?//`-alternatives folds aren't path-tracked at all** (refuse-only) —
    `path(. as $x \| reduce (1) as $y ?// $z (0; $x))` on `{"a":1}` is `[]` in jq; succinctly

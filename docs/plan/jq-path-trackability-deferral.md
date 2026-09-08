@@ -487,3 +487,11 @@ rigorous *oracle differential* gate:
 Not yet filed. Once this document is reviewed, file one implementation issue per stage above
 (mirroring #700 → #724/#725's own slice-per-issue pattern), linking back to this document and
 to #986/#989 for the original repros.
+
+[#2042](https://github.com/rust-works/succinctly/issues/2042) shipped a related but distinct
+widening in the same neighbourhood — a `$var` bound from a *navigated* position can now be
+certified in path position by node identity, not just the identity-passthrough `. as $x` case
+this document's own deferred-checks problem sits next to. See
+[`docs/plan/jq-bind-origin-frame.md`](jq-bind-origin-frame.md) for that design (the frame
+witness, why value equality alone fabricates, and what's still refuse-only) — implemented,
+not deferred, so it isn't itself a follow-up issue to file from here.
