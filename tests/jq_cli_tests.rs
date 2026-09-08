@@ -5172,6 +5172,29 @@ fn test_seq_warning_columns_count_raw_bytes_1723() -> Result<()> {
     Ok(())
 }
 
+/// #1723: a malformed BOM (a prefix that starts one and then contradicts
+/// it) costs jq a `parser_reset` that leaves it reading rather than
+/// waiting for an RS -- so even a stream with *no* RS byte anywhere gets
+/// one of this issue's mid-stream templates through `get_inputs`'s
+/// `bom_malformed` filter, never #1525's "no RS byte" one. Exercised only
+/// by `scripts/jq-seq-oracle-sweep.py`'s `HAND` corpus until now; pinned
+/// here so a regression in that filter fails CI rather than only a manual
+/// sweep. Captured from `/usr/bin/jq` 1.7.1.
+#[test]
+fn test_seq_malformed_bom_with_no_rs_byte_warns_1723() -> Result<()> {
+    for input in [&b"\xef\xbb1 2"[..], b"\xef1 2"] {
+        let (output, code) = spawn_jq(&["--seq", "-c", "."], Some(input))?;
+        assert_eq!(code, 0);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "jq: ignoring parse error: Potentially truncated top-level numeric value at EOF at line 1, column 3\n",
+            "input {input:?}"
+        );
+        assert_eq!(output.stdout, b"", "input {input:?}");
+    }
+    Ok(())
+}
+
 /// #1525: an RS-less file combined with an RS-containing one triggers no
 /// warning at all when the RS-less file is *empty* -- real jq treats the
 /// whole `--seq` input as one continuous stream, and the RS-containing
