@@ -53,41 +53,84 @@ const ASCII_RS: u8 = 0x1e;
 /// 256 nested `[` parse and the 257th reports `Exceeds depth limit`.
 const MAX_PARSING_DEPTH: usize = 256;
 
-/// Every byte of the input stream, as jq's parser sees it: all sources
-/// concatenated, with one leading UTF-8 BOM consumed but *not* counted
-/// (jq strips it in `jv_parser_set_buf`, before the scanner's column
-/// counter ever sees it).
+/// What jq's `jv_parser_set_buf` consumes as a leading BOM, over all
+/// sources concatenated.
+///
+/// jq consumes the matching *prefix* byte by byte, so a partial BOM is
+/// eaten even though it never completes one. Those bytes never reach the
+/// scanner, so they never advance a column either -- getting this wrong
+/// shifts every position in the stream.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BomPrefix {
+    /// Bytes jq swallowed before parsing began.
+    consumed: usize,
+    /// A prefix that started a BOM and then contradicted it. jq flags this
+    /// (`bom_strip_position = 0xff`) and thereafter re-runs `parser_reset`
+    /// at the top of every `jv_parser_next` -- which, through the same
+    /// clobber described above, leaves the parser in `Normal` rather than
+    /// `WaitingForRs`. So a malformed BOM makes jq read the bytes before
+    /// the first RS as a record, where it would normally discard them.
+    pub(crate) malformed: bool,
+}
+
+pub(crate) fn bom_prefix(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> BomPrefix {
+    let mut consumed = 0;
+    for byte in raw_bytes.iter().flat_map(|(_, raw)| raw.iter().copied()) {
+        if consumed == UTF8_BOM.len() || byte != UTF8_BOM[consumed] {
+            // A mismatch at offset 0 just means "no BOM here"; one after a
+            // partial match is the malformed case. Running out of input
+            // mid-BOM is neither -- jq is still waiting for the rest.
+            return BomPrefix {
+                consumed,
+                malformed: consumed > 0 && consumed < UTF8_BOM.len(),
+            };
+        }
+        consumed += 1;
+    }
+    BomPrefix {
+        consumed,
+        malformed: false,
+    }
+}
+
+/// Every byte of the input stream, as jq's scanner sees it: all sources
+/// concatenated, with [`bom_prefix`]'s bytes already removed.
 ///
 /// Shared with [`super::jq_runner::seq_no_rs_byte_warning`] so the two
 /// walkers over this same stream cannot drift apart on BOM handling.
-/// The BOM is stripped from the first *non-empty* source rather than the
-/// first source: jq's `bom_strip_position` advances over the concatenated
-/// stream, so an empty leading file leaves the next file's BOM still at
-/// the stream's start.
 pub(crate) fn stream_bytes(
     raw_bytes: &[(Option<usize>, Vec<u8>)],
 ) -> impl Iterator<Item = u8> + '_ {
-    let mut seen_any = false;
     raw_bytes
         .iter()
-        .flat_map(move |(_, raw)| {
-            let bytes = if seen_any {
-                raw.as_slice()
-            } else {
-                raw.strip_prefix(UTF8_BOM).unwrap_or(raw)
-            };
-            seen_any |= !raw.is_empty();
-            bytes
-        })
-        .copied()
+        .flat_map(|(_, raw)| raw.iter().copied())
+        .skip(bom_prefix(raw_bytes).consumed)
 }
 
-/// Every `jq: ignoring parse error: ...` line real jq would write for this
-/// `--seq` stream, in order.
-pub(crate) fn parse_warnings(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> Vec<String> {
-    let mut reader = Reader::new();
+/// Hands `emit` every `jq: ignoring parse error: ...` line real jq would
+/// write for this `--seq` stream, in order.
+///
+/// A sink rather than a `Vec`: an adversarial stream can warn once per
+/// byte, and collecting those first cost ~140x the input in peak RSS
+/// (2 MB of `}` measured at 286 MB, against jq's 2.4 MB). Streaming them
+/// keeps the reader flat.
+pub(crate) fn for_each_warning(raw_bytes: &[(Option<usize>, Vec<u8>)], emit: &mut dyn FnMut(&str)) {
+    let bom = bom_prefix(raw_bytes);
+    // With a malformed BOM jq re-runs `parser_reset` at the top of *every*
+    // `jv_parser_next` -- including the call for the empty final buffer
+    // that a newline-terminated stream produces, since `fgets` stops at
+    // the newline without reaching EOF. That reset wipes the accumulated
+    // state before the EOF branch can report on it, so no `at EOF` warning
+    // survives. A stream not ending in a newline hits EOF in the same read
+    // and does report one.
+    let ends_with_newline = raw_bytes
+        .iter()
+        .rev()
+        .find_map(|(_, raw)| raw.last().copied())
+        == Some(b'\n');
+    let mut reader = Reader::new(bom, emit);
+    reader.suppress_eof_warning = bom.malformed && ends_with_newline;
     reader.run(stream_bytes(raw_bytes));
-    reader.warnings
 }
 
 /// The kinds jq's parser distinguishes while classifying a failure. It
@@ -140,7 +183,7 @@ fn classify(c: u8) -> Cls {
     }
 }
 
-struct Reader {
+struct Reader<'a> {
     line: usize,
     column: usize,
     st: St,
@@ -157,27 +200,49 @@ struct Reader {
     token_len: usize,
     next: Option<Kind>,
     last_ch_was_ws: bool,
-    warnings: Vec<String>,
+    /// A malformed BOM makes jq re-run `parser_reset` at the top of every
+    /// `jv_parser_next`. That call returns on each value, on each error,
+    /// and when the buffer runs out -- and jq refills a line at a time --
+    /// so under this flag the parser is wiped after every value and every
+    /// newline as well. An unterminated string therefore stops swallowing
+    /// the rest of the stream, and `\x1e9"-si-\n` reports on `-si-`
+    /// because emitting `9` dropped the string it had just opened.
+    resets_per_call: bool,
+    /// Set by [`Reader::check_done`] when a value was handed off, which is
+    /// one of the points jq's reader returns at.
+    produced_value: bool,
+    /// See [`for_each_warning`]: a malformed BOM plus a newline-terminated
+    /// stream means jq's own EOF report is wiped before it is written.
+    suppress_eof_warning: bool,
+    emit: &'a mut dyn FnMut(&str),
 }
 
-impl Reader {
-    fn new() -> Self {
+impl<'a> Reader<'a> {
+    fn new(bom: BomPrefix, emit: &'a mut dyn FnMut(&str)) -> Self {
         Self {
             line: 1,
             column: 0,
-            st: St::WaitingForRs,
+            // A malformed BOM has already cost jq a `parser_reset`, so it
+            // starts in `Normal` and reads pre-RS bytes as a record.
+            st: if bom.malformed {
+                St::Normal
+            } else {
+                St::WaitingForRs
+            },
             stack: Vec::new(),
             token_buf: Vec::new(),
             token_len: 0,
             next: None,
             last_ch_was_ws: false,
-            warnings: Vec::new(),
+            resets_per_call: bom.malformed,
+            produced_value: false,
+            suppress_eof_warning: false,
+            emit,
         }
     }
 
     fn warn(&mut self, body: &str) {
-        self.warnings
-            .push(format!("jq: ignoring parse error: {body}"));
+        (self.emit)(&format!("jq: ignoring parse error: {body}"));
     }
 
     /// jq's `parser_reset`. Note it restores `Normal` -- including over a
@@ -214,7 +279,10 @@ impl Reader {
                     ));
                 }
                 self.reset();
+            } else if self.resets_per_call && (self.produced_value || ch == b'\n') {
+                self.reset();
             }
+            self.produced_value = false;
         }
         self.finish();
     }
@@ -311,6 +379,7 @@ impl Reader {
     fn check_done(&mut self) -> bool {
         if self.stack.is_empty() && self.next.is_some() {
             self.next = None;
+            self.produced_value = true;
             true
         } else {
             false
@@ -531,6 +600,9 @@ impl Reader {
     /// sets `p->eof` before reaching any of these, so the reader never
     /// runs again.
     fn finish(&mut self) {
+        if self.suppress_eof_warning {
+            return;
+        }
         let (line, column) = (self.line, self.column);
         if self.st == St::WaitingForRs {
             // #1525's template. Unreachable from the wired call site,
@@ -654,14 +726,15 @@ mod tests {
     fn warnings(sources: &[&[u8]]) -> Vec<String> {
         let owned: Vec<(Option<usize>, Vec<u8>)> =
             sources.iter().map(|s| (None, s.to_vec())).collect();
-        parse_warnings(&owned)
-            .into_iter()
-            .map(|w| {
+        let mut got = Vec::new();
+        for_each_warning(&owned, &mut |w| {
+            got.push(
                 w.strip_prefix("jq: ignoring parse error: ")
                     .expect("every warning carries jq's prefix")
-                    .to_string()
-            })
-            .collect()
+                    .to_string(),
+            );
+        });
+        got
     }
 
     fn assert_warnings(input: &[u8], expected: &[&str]) {
@@ -921,6 +994,71 @@ mod tests {
         assert_eq!(
             warnings(&[b"\x1e[1,", b"2\n"]),
             ["Unfinished JSON term at EOF at line 2, column 0"],
+        );
+    }
+
+    /// A BOM prefix that never completes is still *consumed*, and it costs
+    /// jq a `parser_reset` that leaves it reading rather than waiting for
+    /// an RS byte. Both halves matter: forget the first and every column
+    /// in the stream shifts, forget the second and the pre-RS content is
+    /// discarded when jq would have parsed it. All captured from
+    /// `/usr/bin/jq` 1.7.1.
+    #[test]
+    fn malformed_bom_is_consumed_and_starts_the_parser_reading_1723() {
+        assert_warnings(
+            b"\xef\xbb\x1e[1,]\n",
+            &["Expected another array element at line 1, column 5 (need RS to resync)"],
+        );
+        // Read as a record, so this is *not* #1525's abandoned-text
+        // template even though the stream holds no RS byte at all.
+        for input in [&b"\xef\xbb1 2"[..], b"\xef1 2"] {
+            assert_warnings(
+                input,
+                &["Potentially truncated top-level numeric value at EOF at line 1, column 3"],
+            );
+        }
+        // A stream that simply runs out mid-BOM is not malformed -- jq is
+        // still waiting for the rest of it, and has consumed no content.
+        for input in [&b"\xef"[..], b"\xef\xbb"] {
+            assert_warnings(
+                input,
+                &["Unfinished abandoned text at EOF at line 1, column 0"],
+            );
+        }
+    }
+
+    /// After a malformed BOM jq's parser is wiped at the top of every
+    /// `jv_parser_next`, so it never carries state across a value, a
+    /// newline, or the end of input. All captured from `/usr/bin/jq` 1.7.1.
+    #[test]
+    fn malformed_bom_wipes_the_parser_on_every_read_1723() {
+        // Emitting `9` drops the string opened in the same breath, so the
+        // next line's `-si-` is read as a token rather than swallowed.
+        assert_warnings(
+            b"\xef\x1exl+uita[9\"-si-\n",
+            &[
+                "Invalid numeric literal at line 1, column 9 (need RS to resync)",
+                "Invalid numeric literal at line 2, column 0 (need RS to resync)",
+            ],
+        );
+        // A newline does the same: the unterminated string ends with the
+        // line instead of eating the rest of the stream.
+        assert_warnings(
+            b"\xef\x1e:\"[:x:0r.\\ {\n:s-\\ba\n",
+            &[
+                "Expected string key before ':' at line 1, column 2 (need RS to resync)",
+                "Expected string key before ':' at line 2, column 1 (need RS to resync)",
+                "Invalid numeric literal at line 3, column 0 (need RS to resync)",
+            ],
+        );
+        // And the wipe reaches the empty final buffer a newline-terminated
+        // stream produces, so no `at EOF` report survives at all.
+        assert_warnings(
+            b"\xef\x1er  -{\"f+\n",
+            &[
+                "Invalid numeric literal at line 1, column 3 (need RS to resync)",
+                "Invalid numeric literal at line 1, column 6 (need RS to resync)",
+            ],
         );
     }
 

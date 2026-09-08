@@ -33,6 +33,8 @@ parser, and neither survives into a newline-terminated stream:
 2. A record yielding no value makes `jv_parser_next` return
    invalid-with-no-message, which jq's input loop reads as end-of-input --
    but only when it lands in the buffer that hit EOF.
+3. `jq_util_input_read_more` measures the chunk with `strlen`, so a NUL
+   byte truncates the input -- but only in a chunk holding no newline.
 
 `--expect-artifacts` re-enables the shapes that trip them, for confirming
 they are still the only divergences.
@@ -62,6 +64,12 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 # small enough that random strings collide into real JSON shapes often.
 ALPHABET = b'\x1e{}[]",:0-9abfilnrstuxe \n\\.-+'
 
+# BOM prefixes are their own dimension: jq consumes the matching prefix of
+# one *without counting it*, and a prefix that starts a BOM and then
+# contradicts it costs jq a parser_reset. A review found both, precisely
+# because an earlier version of this generator had no 0xef in its alphabet.
+BOM_PREFIXES = [b"", b"", b"", b"", b"\xef\xbb\xbf", b"\xef\xbb", b"\xef"]
+
 # Shapes worth keeping regardless of what the generator happens to produce:
 # every template the issue named, plus the ones earlier sessions got wrong.
 HAND = [
@@ -77,7 +85,8 @@ HAND = [
     b'\x1e"\\q"', b'\x1e"\\u00"', b'\x1e"\\uZZZZ"', b'\x1e"\\ud800"',
     b'\x1e"\\ud800\\u0041"', b'\x1e"a\x01b"', b'\x1e{"a", "b"}', b"\x1e[1 2]",
     b"\x1e:", b"\x1e,", b"\x1enan", b"\x1einf", b"\x1esnan", b"\x1enul",
-    b"\x1en", b"\x1e+1", b"\x1e[[1],]", b'\x1e{"a":1,}', b"\xef\xbb\xbf\x1e}",
+    b"\x1en", b"\x1e+1", b"\x1e[[1],]", b'\x1e{"a":1,}', b"\xef\xbb\xbf\x1e}", b"\xef\xbb\x1e[1,]\n", b"\xef\xbb1 2",
+    b"\xef1 2", b"\xef", b"\xef\xbb",
     b'\x1e"a"\x1e"b"', b"\x1e[1,2]}\n", b"\x1e{}}\n", b"\x1etrue,[1]",
     b"\x1e5-3 7", b"\x1e1-2\n",
 ]
@@ -125,6 +134,14 @@ def run(argv, data):
         os.unlink(path)
 
 
+def malformed_bom(data):
+    """A prefix that starts a BOM and then contradicts it. jq consumes the
+    matched bytes and thereafter re-runs `parser_reset` at the top of every
+    `jv_parser_next`, which leaves the parser reading rather than waiting
+    for an RS byte."""
+    return data[:1] == b"\xef" and not data.startswith(b"\xef\xbb\xbf")
+
+
 def stops_early(data):
     """Whether jq's input loop ends the stream before reading it all.
 
@@ -132,15 +149,30 @@ def stops_early(data):
     return invalid-with-no-message, which the loop reads as end-of-input --
     but only in the call that performed the final read. With no newline the
     whole input is one buffer, so that reduces to "the first record yields
-    nothing"."""
-    if b"\n" in data or data.count(RS) < 2:
+    nothing".
+
+    After a malformed BOM the first record is the content *before* the
+    first RS, since the parser is no longer waiting for one -- which is why
+    `\xef\x1e...` stops immediately where `\x1e...` would not."""
+    if b"\n" in data or RS not in data:
         return False
-    return data.split(RS)[1].strip(b" \t\r") in (b"", b'"')
+    if malformed_bom(data):
+        consumed = 2 if data.startswith(b"\xef\xbb") else 1
+        first = data[consumed:].split(RS)[0]
+    elif data.count(RS) < 2:
+        return False
+    else:
+        first = data.split(RS)[1]
+    return first.strip(b" \t\r") in (b"", b'"')
 
 
 def artifact(data):
+    if b"\x00" in data and b"\n" not in data.split(b"\x00", 1)[0]:
+        return True  # strlen truncation, artifact 3
     if RS not in data:
-        return True  # #1525's separate no-RS-byte template
+        # #1525's separate template -- except after a malformed BOM, which
+        # makes jq read the stream rather than abandon it, so those stay in.
+        return not malformed_bom(data)
     if stops_early(data):
         return True
     if b"\n" not in data:
@@ -158,10 +190,10 @@ def random_cases(count, seed, allow_artifacts):
             cases.append(body)
         elif rng.random() < 0.7:
             body = bytes(rng.choice(ALPHABET) for _ in range(rng.randint(1, 24)))
-            cases.append(RS + body + b"\n")
+            cases.append(rng.choice(BOM_PREFIXES) + RS + body + b"\n")
         else:
             body = bytes(rng.choice(plain) for _ in range(rng.randint(1, 24)))
-            cases.append(RS + body)
+            cases.append(rng.choice(BOM_PREFIXES) + RS + body)
     return cases
 
 

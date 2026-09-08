@@ -2295,13 +2295,16 @@ fn get_inputs(
     // case `jq_seq_reader` is not asked about (#1723). Raw bytes, before
     // the UTF-8 substitution below, because jq counts columns in bytes.
     if args.seq && !args.raw_input && args.input_dsv.is_none() && !args.null_input {
-        match seq_no_rs_byte_warning(&raw_bytes) {
+        // A *malformed* BOM is the one case where "no RS byte anywhere"
+        // does not imply #1525's template: it costs jq a `parser_reset`
+        // that leaves the parser reading rather than waiting for an RS, so
+        // the reader owns that case too (#1723).
+        let bom_malformed = crate::jq_seq_reader::bom_prefix(&raw_bytes).malformed;
+        match seq_no_rs_byte_warning(&raw_bytes).filter(|_| !bom_malformed) {
             Some(warning) => eprintln!("{warning}"),
-            None => {
-                for warning in crate::jq_seq_reader::parse_warnings(&raw_bytes) {
-                    eprintln!("{warning}");
-                }
-            }
+            None => crate::jq_seq_reader::for_each_warning(&raw_bytes, &mut |warning| {
+                eprintln!("{warning}");
+            }),
         }
     }
 
