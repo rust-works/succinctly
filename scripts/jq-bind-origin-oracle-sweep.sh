@@ -158,6 +158,10 @@ optional-source-spelling	{"a":{"b":1}}	path(.a? as $y | .a | $y)
 negative-index-spelling	[{"b":1},{"b":1}]	path(.[0] as $y | .[-2] | $y)
 full-slice-is-the-array	{"a":[1,2,3]}	path(.a[0:3] as $y | .a | $y)
 marker-not-at-head	{"a":{"b":1}}	path(.a as $y | (.c | $y | .b) as $w | .a.b | $w)
+slice-spelling	{"a":[1,2,3]}	path(.a[1:] as $y | .a[1:3] | $y)
+catch-handler-var	{"a":{"b":1}}	path(.a as $y | .a | try error("x") catch $y)
+destructure-stage	{"a":{"b":1},"c":{"b":1}}	path(.a as $y | .a | . as [$q] ?// $q | $y)
+literal-then-fold-untracked-init	{"a":{"b":1},"c":{"b":1}}	path(.a as $y | .a | 5 | reduce (1) as $i (0; $y))
 CASES_EOF
 )
 
@@ -173,7 +177,11 @@ if-source:the witness grammar is pure navigation; an if source binds by value
 optional-source-spelling:a ? component never matches a plain one on either side (path spelling, not node identity)
 negative-index-spelling:a negative index is stored as written, so .[-2] never matches .[0]'s path
 full-slice-is-the-array:jq's full slice is the array itself; the bind path ends in a slice component, .a does not
-marker-not-at-head:a marker is re-rooted only at the head of a source; elsewhere it is certified against the ambient position"
+marker-not-at-head:a marker is re-rooted only at the head of a source; elsewhere it is certified against the ambient position
+slice-spelling:jq's .a[1:] and .a[1:3] of a 3-array are the same jv; the slice components differ, so the spelling never matches (open-ended twin of full-slice-is-the-array)
+catch-handler-var:the handler resolves under an unknown frame and a raising try stage does not carry the register; pre-existing, the root marker refuses too
+destructure-stage:an ?// destructuring stage resolves as an opaque leaf and drops the register; pre-existing, the root marker refuses too
+literal-then-fold-untracked-init:after a literal the register is only carried, and a fold with an untracked INIT seeds its register from the ambient literal; pre-existing, the root marker refuses too"
 
 if [[ "${1:-}" == "--list-cases" ]]; then
   printf '%s\n' "$CASES"

@@ -80891,7 +80891,12 @@ mod tests {
     /// allowlist (#2041), a `def` inside `path()` resolves as an opaque leaf,
     /// and a source navigating inside a construction is refused by the
     /// resolver where jq's suspended tracking allows it, so it binds a
-    /// plain value.
+    /// plain value. The last four rows (#2042 review) are not about the
+    /// origin at all: three are carried-register gaps a root `. as $x`
+    /// marker hits identically (`path(. as $x | try error("x") catch $x)`,
+    /// `path(. as $x | . as [$q] ?// $q | $x)` and
+    /// `path(. as $x | 5 | reduce (1) as $i (0; $x))` all refuse where jq
+    /// answers `[]`), and one is slice spelling.
     #[test]
     fn test_path_bind_origin_matrix_refuse_only_2042() {
         // (input, filter, what jq 1.7.1 answers)
@@ -80964,6 +80969,40 @@ mod tests {
                 br#"{"a":{"b":1}}"#,
                 "path(.a as $y | (.c | $y | .b) as $w | .a.b | $w)",
                 r#"[["a","b"]]"#,
+            ),
+            // slice-spelling: jq's `.a[1:]` and `.a[1:3]` of a 3-array are
+            // the same jv (same offset and length); the path components
+            // differ, so the spelling never matches -- the open-ended twin
+            // of full-slice-is-the-array
+            (
+                br#"{"a":[1,2,3]}"#,
+                "path(.a[1:] as $y | .a[1:3] | $y)",
+                r#"[["a",{"start":1,"end":3}]]"#,
+            ),
+            // catch-handler-var: the handler resolves against the error
+            // payload under an unknown frame, and a raising `try` stage does
+            // not carry the register (pre-existing: the root-marker
+            // spelling refuses too)
+            (
+                br#"{"a":{"b":1}}"#,
+                r#"path(.a as $y | .a | try error("x") catch $y)"#,
+                r#"[["a"]]"#,
+            ),
+            // destructure-stage: an `?//` destructuring stage resolves as an
+            // opaque leaf and drops the register (pre-existing, as above)
+            (
+                br#"{"a":{"b":1},"c":{"b":1}}"#,
+                "path(.a as $y | .a | . as [$q] ?// $q | $y)",
+                r#"[["a"]]"#,
+            ),
+            // literal-then-fold-untracked-init: after `5` the register is
+            // only carried, and a fold whose INIT is untracked seeds its own
+            // register from the ambient literal, not the carried one
+            // (pre-existing, as above)
+            (
+                br#"{"a":{"b":1},"c":{"b":1}}"#,
+                "path(.a as $y | .a | 5 | reduce (1) as $i (0; $y))",
+                r#"[["a"]]"#,
             ),
         ];
         for (input, filter, jq_answer) in rows {
