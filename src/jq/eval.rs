@@ -31859,8 +31859,40 @@ fn substitute_var(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr
 /// ambient position, so wrapping here is a necessary but not sufficient
 /// condition for the substituted variable to end up trackable (#844).
 fn substitute_var_tracked(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr {
-    let marker = Tracked::snapshot(replacement.clone());
+    let marker = LazyMarker::new(replacement, Origin::Snapshot);
     substitute_var_impl(expr, var_name, replacement, Some(&marker))
+}
+
+/// The one `Expr::TrackedVar` marker a binding substitutes at every
+/// occurrence of its `$var`, built on the first occurrence only (#2042
+/// review): a bound sub-document used k times in `body` is cloned once,
+/// not k times -- and a `$r` bound and never used (`. as $r | .score`, the
+/// common `|=` target shape) is not cloned at all, which an eagerly built
+/// marker cost +2.9 pp of instructions on `(.users[] | . as $r | .score)
+/// |= 1`.
+struct LazyMarker<'a> {
+    value: &'a OwnedValue,
+    origin: Origin,
+    built: core::cell::OnceCell<Rc<Tracked>>,
+}
+
+impl<'a> LazyMarker<'a> {
+    fn new(value: &'a OwnedValue, origin: Origin) -> Self {
+        Self {
+            value,
+            origin,
+            built: core::cell::OnceCell::new(),
+        }
+    }
+
+    fn get(&self) -> Rc<Tracked> {
+        Rc::clone(self.built.get_or_init(|| {
+            Rc::new(Tracked {
+                value: self.value.clone(),
+                origin: self.origin.clone(),
+            })
+        }))
+    }
 }
 
 /// Substitute `bound` for `$var_name` in `body`, choosing between
@@ -31899,13 +31931,7 @@ fn substitute_bound_var_at(
     if is_identity_passthrough(bind_expr) {
         substitute_var_tracked(body, var_name, bound)
     } else if let Some(origin) = origin {
-        // One marker per binding, shared by every occurrence (#2042
-        // review): a bound sub-document used k times in `body` is cloned
-        // once, not k times.
-        let marker = Rc::new(Tracked {
-            value: bound.clone(),
-            origin,
-        });
+        let marker = LazyMarker::new(bound, origin);
         substitute_var_impl(body, var_name, bound, Some(&marker))
     } else {
         substitute_var(body, var_name, bound)
@@ -31915,15 +31941,15 @@ fn substitute_bound_var_at(
 /// Substitute a variable in an expression with a value.
 /// Returns a new expression with the variable replaced. `mark`
 /// selects whether a substituted `$var_name` becomes an `Expr::TrackedVar`
-/// sharing that one marker (path()-trackability candidate) or a plain
-/// value-construction node --
+/// sharing that one lazily built marker (path()-trackability candidate)
+/// or a plain value-construction node --
 /// see `substitute_var`/`substitute_var_tracked` above, the only two
 /// callers that should pass a literal `false`/`true` here.
 fn substitute_var_impl(
     expr: &Expr,
     var_name: &str,
     replacement: &OwnedValue,
-    mark: Option<&Rc<Tracked>>,
+    mark: Option<&LazyMarker<'_>>,
 ) -> Expr {
     match expr {
         // #1371: opaque, in both directions. A `Shared` holds an argument the
@@ -31935,7 +31961,7 @@ fn substitute_var_impl(
         // binding, which is the O(depth^2) traversal this design removes.
         Expr::Shared(inner) => Expr::Shared(Rc::clone(inner)),
         Expr::Var(name) if name == var_name => match mark {
-            Some(marker) => Expr::TrackedVar(Rc::clone(marker)),
+            Some(marker) => Expr::TrackedVar(marker.get()),
             None => owned_to_expr(replacement),
         },
         // #2095: does not recurse into `msg` -- see `map_subexprs`'s own doc
@@ -32084,7 +32110,7 @@ fn substitute_var_in_builtin(
     builtin: &Builtin,
     var_name: &str,
     replacement: &OwnedValue,
-    mark: Option<&Rc<Tracked>>,
+    mark: Option<&LazyMarker<'_>>,
 ) -> Builtin {
     map_builtin_subexprs(builtin, &mut |e| {
         substitute_var_impl(e, var_name, replacement, mark)
@@ -52825,10 +52851,7 @@ mod tests {
             let parsed = parse(src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
             for origin in &origins {
                 for bound in &values {
-                    let marker = Rc::new(Tracked {
-                        value: bound.clone(),
-                        origin: origin.clone(),
-                    });
+                    let marker = LazyMarker::new(bound, origin.clone());
                     let expr = substitute_var_impl(&parsed, "y", bound, Some(&marker));
                     assert!(
                         is_owned_pure_expr(&expr),
