@@ -194,6 +194,28 @@ Scoped to a *container* alias target only: a bare scalar-target alias (`a: &a "b
 still raises from `select`/`if` exactly as before, since resolving one scalar costs `O(1)`
 and was never part of the cost this fix removes.
 
+**[#2476](https://github.com/rust-works/succinctly/issues/2476)** extends this same
+trade-off to `not`, `//`, and zero-arity `any`/`all` at an alias position — the same
+O(2^N) fan-out cost `select`/`if` were fixed for, since all four used to reach it only by
+falling to `eval_single`'s wildcard bridge (which materializes the *ambient* value before
+running), and now instead run `push_generic_truthiness` directly, the same call `select`/`if`
+already used:
+
+```bash
+$ printf 'a: &a ["bad\\q"]\nb: *a\n' | succinctly yq '.b | not'
+false
+$ printf 'a: &a ["bad\\q"]\nb: *a\n' | succinctly yq '.b[0]'
+Error: invalid escape sequence
+```
+
+`and`/`or` share it only in the same ambient-scoped shape `select`/`if` use, where neither
+operand itself navigates (`.b | (true and true)` answers `true`, not raising). A bare `.b and
+true` does not share it: `.b` as a direct operand needs path context, so that expression still
+runs through the pre-existing native evaluator (`eval_boolean_generic`'s path-context branch,
+present since #2473 and untouched by #2476), which resolves `.b`'s path and raises exactly as
+`.b[0]` does. Real yq rejects this whole document at parse time either way, so there is no yq
+behaviour to match for any of these constructs.
+
 **Resolved ([#1350](https://github.com/rust-works/succinctly/issues/1350)).**
 `enforce_anchor_soundness` takes a `sort_keys` argument and has always handled it correctly
 on the DOM path; the cursor-streaming path used to never call it, reproducing the unsound
