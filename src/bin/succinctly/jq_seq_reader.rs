@@ -634,3 +634,305 @@ fn strip_prefix_ignore_ascii_case<'a>(bytes: &'a [u8], prefix: &[u8]) -> Option<
     head.eq_ignore_ascii_case(prefix)
         .then(|| &bytes[prefix.len()..])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn warnings(sources: &[&[u8]]) -> Vec<String> {
+        let owned: Vec<(Option<usize>, Vec<u8>)> =
+            sources.iter().map(|s| (None, s.to_vec())).collect();
+        parse_warnings(&owned)
+            .into_iter()
+            .map(|w| {
+                w.strip_prefix("jq: ignoring parse error: ")
+                    .expect("every warning carries jq's prefix")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn assert_warnings(input: &[u8], expected: &[&str]) {
+        assert_eq!(warnings(&[input]), expected, "input: {input:?}");
+    }
+
+    /// Every message template, captured from `/usr/bin/jq` 1.7.1. The
+    /// three renderings are all here: `at EOF` (real end of input), a
+    /// bare `(need RS to resync)` (an ordinary byte), and the `Truncated
+    /// value` collapse (an RS byte).
+    #[test]
+    fn templates_match_the_oracle_1723() {
+        // Real EOF, mid-value.
+        assert_warnings(b"\x1e\"abc", &["Unfinished string at EOF at line 1, column 5"]);
+        assert_warnings(
+            b"\x1e[1,2\n",
+            &["Unfinished JSON term at EOF at line 2, column 0"],
+        );
+        assert_warnings(
+            b"\x1e{\"a\":1",
+            &["Unfinished JSON term at EOF at line 1, column 7"],
+        );
+        assert_warnings(b"\x1etru", &["Invalid literal at EOF at line 1, column 4"]);
+        assert_warnings(b"\x1e-", &["Invalid numeric literal at EOF at line 1, column 2"]);
+        assert_warnings(
+            b"\x1e1e",
+            &["Invalid numeric literal at EOF at line 1, column 3"],
+        );
+
+        // Mid-buffer, on an ordinary byte.
+        assert_warnings(
+            b"\x1exyz\n",
+            &["Invalid numeric literal at line 2, column 0 (need RS to resync)"],
+        );
+        assert_warnings(
+            b"\x1e[1,]",
+            &["Expected another array element at line 1, column 5 (need RS to resync)"],
+        );
+        assert_warnings(
+            b"\x1e{\"a\":1,}",
+            &["Expected another key-value pair at line 1, column 9 (need RS to resync)"],
+        );
+        assert_warnings(
+            b"\x1e}",
+            &["Unmatched '}' at line 1, column 2 (need RS to resync)"],
+        );
+        assert_warnings(
+            b"\x1e]",
+            &["Unmatched ']' at line 1, column 2 (need RS to resync)"],
+        );
+        assert_warnings(
+            b"\x1e[1 2]",
+            &["Expected separator between values at line 1, column 6 (need RS to resync)"],
+        );
+        assert_warnings(
+            b"\x1e:",
+            &["Expected string key before ':' at line 1, column 2 (need RS to resync)"],
+        );
+        assert_warnings(
+            b"\x1e,",
+            &["Expected value before ',' at line 1, column 2 (need RS to resync)"],
+        );
+
+        // An RS byte, mid-value.
+        assert_warnings(
+            b"\x1e\"unterminated\x1e\"ok\"\n",
+            &["Truncated value at line 1, column 15"],
+        );
+        assert_warnings(b"\x1e[1,2\x1e\"ok\"\n", &["Truncated value at line 1, column 6"]);
+    }
+
+    /// A container error leaves the stack behind, and the object/array
+    /// distinction picks the message -- both of these report twice
+    /// because jq resumes rather than resyncing.
+    #[test]
+    fn container_errors_and_their_continuations_1723() {
+        assert_warnings(
+            b"\x1e{1:2}",
+            &[
+                "Object keys must be strings at line 1, column 4 (need RS to resync)",
+                "Unmatched '}' at line 1, column 6 (need RS to resync)",
+            ],
+        );
+        assert_warnings(
+            b"\x1e{\"a\", \"b\"}",
+            &[
+                "Objects must consist of key:value pairs at line 1, column 6 (need RS to resync)",
+                "Unmatched '}' at line 1, column 11 (need RS to resync)",
+            ],
+        );
+        assert_warnings(
+            b"\x1e{,}\n",
+            &[
+                "Expected value before ',' at line 1, column 3 (need RS to resync)",
+                "Unmatched '}' at line 1, column 4 (need RS to resync)",
+            ],
+        );
+    }
+
+    /// Every string-escape category `found_string` can raise.
+    #[test]
+    fn string_escape_errors_1723() {
+        assert_warnings(
+            b"\x1e\"\\q\"",
+            &["Invalid escape at line 1, column 5 (need RS to resync)"],
+        );
+        assert_warnings(
+            b"\x1e\"\\u00\"",
+            &["Invalid \\uXXXX escape at line 1, column 7 (need RS to resync)"],
+        );
+        assert_warnings(
+            b"\x1e\"\\uZZZZ\"",
+            &["Invalid characters in \\uXXXX escape at line 1, column 9 (need RS to resync)"],
+        );
+        assert_warnings(
+            b"\x1e\"\\ud800\"",
+            &["Invalid \\uXXXX\\uXXXX surrogate pair escape at line 1, column 9 (need RS to resync)"],
+        );
+        assert_warnings(
+            b"\x1e\"\\ud800\\u0041\"",
+            &[
+                "Invalid \\uXXXX\\uXXXX surrogate pair escape at line 1, column 15 (need RS to resync)",
+            ],
+        );
+        assert_warnings(
+            b"\x1e\"a\x01b\"",
+            &[
+                "Invalid string: control characters from U+0000 through U+001F must be escaped at line 1, column 6 (need RS to resync)",
+            ],
+        );
+        // A well-formed surrogate pair is not an error.
+        assert_warnings(b"\x1e\"\\ud800\\udc00\" ", &[]);
+    }
+
+    /// jq's number grammar is decNumber's, not RFC 8259's. Getting this
+    /// wrong swaps "Invalid numeric literal" for "Potentially truncated
+    /// top-level numeric value" and vice versa.
+    #[test]
+    fn number_grammar_is_decnumbers_1723() {
+        for accepted in [
+            &b"\x1e1."[..],
+            b"\x1e.5",
+            b"\x1e+1",
+            b"\x1e01",
+            b"\x1enan",
+            b"\x1eNaN5",
+            b"\x1esnan",
+            b"\x1einf",
+            b"\x1e-Infinity",
+        ] {
+            let got = warnings(&[accepted]);
+            assert_eq!(
+                got.len(),
+                1,
+                "expected the truncated-number template for {accepted:?}, got {got:?}"
+            );
+            assert!(
+                got[0].starts_with("Potentially truncated top-level numeric value at EOF"),
+                "{accepted:?} should parse as a number, got {got:?}"
+            );
+        }
+        for rejected in [&b"\x1e1e"[..], b"\x1e1e+", b"\x1e-", b"\x1e1.2.3", b"\x1e0x10"] {
+            let got = warnings(&[rejected]);
+            assert!(
+                got[0].starts_with("Invalid numeric literal at EOF"),
+                "{rejected:?} should not parse as a number, got {got:?}"
+            );
+        }
+    }
+
+    /// `nu` takes jq's keyword path while a bare `n` falls through to the
+    /// number parser -- and a one-character number token NUL-terminates
+    /// itself, which is what keeps a later `n` on the number path too.
+    #[test]
+    fn keyword_path_depends_on_the_second_buffer_byte_1723() {
+        assert_warnings(b"\x1enul", &["Invalid literal at EOF at line 1, column 4"]);
+        assert_warnings(b"\x1en", &["Invalid numeric literal at EOF at line 1, column 2"]);
+        // `iu` leaves a `u` at index 1, so the following bare `n` is
+        // measured against `null` -- jq reads the stale byte (#1723).
+        assert_warnings(
+            b"\x1eiu\"n",
+            &[
+                "Invalid numeric literal at line 1, column 4 (need RS to resync)",
+                "Invalid literal at EOF at line 1, column 5",
+            ],
+        );
+    }
+
+    /// A completed top-level value is handed off and cleared, so trailing
+    /// garbage is reported on its own rather than as a separator error.
+    #[test]
+    fn complete_value_then_garbage_1723() {
+        assert_warnings(
+            b"\x1e{}extra",
+            &["Invalid numeric literal at EOF at line 1, column 8"],
+        );
+        assert_warnings(
+            b"\x1e[1,2]extra",
+            &["Invalid numeric literal at EOF at line 1, column 11"],
+        );
+    }
+
+    /// The RS collapse spares a pending top-level number, and a
+    /// mid-buffer error that already fired outranks it.
+    #[test]
+    fn rs_collapse_exceptions_1723() {
+        assert_warnings(
+            b"\x1e1.\x1e\"ok\"\n",
+            &["Potentially truncated top-level numeric value at line 1, column 4"],
+        );
+        assert_warnings(
+            b"\x1e[1,]\x1e\"ok\"\n",
+            &["Expected another array element at line 1, column 5 (need RS to resync)"],
+        );
+    }
+
+    /// Trailing whitespace resolves an otherwise-ambiguous bare number.
+    #[test]
+    fn trailing_bare_number_is_ambiguous_only_unterminated_1723() {
+        assert_warnings(
+            b"\x1e1 2",
+            &["Potentially truncated top-level numeric value at EOF at line 1, column 4"],
+        );
+        assert_warnings(b"\x1e1 2 ", &[]);
+    }
+
+    /// Columns count raw bytes, not characters, and never reset across
+    /// input files.
+    #[test]
+    fn positions_count_bytes_and_span_files_1723() {
+        assert_warnings(
+            b"\x1e\xff]",
+            &["Invalid numeric literal at line 1, column 3 (need RS to resync)"],
+        );
+        assert_warnings(
+            b"\x1e\xc3\xa9]",
+            &["Invalid numeric literal at line 1, column 4 (need RS to resync)"],
+        );
+        assert_eq!(
+            warnings(&[b"\x1e[1,", b"2\n"]),
+            ["Unfinished JSON term at EOF at line 2, column 0"],
+        );
+    }
+
+    /// One leading BOM is consumed without advancing the column, and only
+    /// at the stream's start -- an empty leading source does not use it up.
+    #[test]
+    fn bom_is_consumed_but_not_counted_1723() {
+        assert_warnings(
+            b"\xef\xbb\xbf\x1e}",
+            &["Unmatched '}' at line 1, column 2 (need RS to resync)"],
+        );
+        assert_eq!(
+            warnings(&[b"", b"\xef\xbb\xbf\x1e}"]),
+            ["Unmatched '}' at line 1, column 2 (need RS to resync)"],
+        );
+        // A second BOM is ordinary content.
+        assert_warnings(
+            b"\xef\xbb\xbf\x1e\xef\xbb\xbf]",
+            &["Invalid numeric literal at line 1, column 5 (need RS to resync)"],
+        );
+    }
+
+    #[test]
+    fn depth_limit_matches_jq_1723() {
+        let mut input = vec![ASCII_RS];
+        input.extend(std::iter::repeat_n(b'[', 300));
+        assert_eq!(
+            warnings(&[&input]),
+            [
+                "Exceeds depth limit for parsing at line 1, column 258 (need RS to resync)"
+                    .to_string(),
+                "Unfinished JSON term at EOF at line 1, column 301".to_string(),
+            ],
+        );
+    }
+
+    /// Content before the first RS byte is discarded without a word: jq's
+    /// `--seq` parser starts out waiting for one.
+    #[test]
+    fn content_before_the_first_rs_is_silent_1723() {
+        assert_warnings(b"garbage\x1e\"ok\"\n", &[]);
+        assert_warnings(b"\x1e\"ok\"\n", &[]);
+        assert_warnings(b"\x1e{\"a\": [1, 2]}\n", &[]);
+    }
+}

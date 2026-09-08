@@ -5052,6 +5052,126 @@ fn test_seq_malformed_record_with_rs_byte_warns_1723() -> Result<()> {
     Ok(())
 }
 
+/// #1723: the mid-stream templates end to end, through the CLI rather
+/// than the reader in isolation -- these are the shapes the issue was
+/// filed for. Captured from `/usr/bin/jq` 1.7.1.
+#[test]
+fn test_seq_midstream_warning_templates_1723() -> Result<()> {
+    let cases: &[(&str, &str)] = &[
+        (
+            "\u{1e}\"unterminated\n",
+            "Unfinished string at EOF at line 2, column 0",
+        ),
+        (
+            "\u{1e}[1,2\n",
+            "Unfinished JSON term at EOF at line 2, column 0",
+        ),
+        (
+            "\u{1e}xyz\n",
+            "Invalid numeric literal at line 2, column 0 (need RS to resync)",
+        ),
+        (
+            "\u{1e}{invalid\n",
+            "Invalid numeric literal at line 2, column 0 (need RS to resync)",
+        ),
+        ("\u{1e}tru", "Invalid literal at EOF at line 1, column 4"),
+        (
+            "\u{1e}1.",
+            "Potentially truncated top-level numeric value at EOF at line 1, column 3",
+        ),
+        (
+            "\u{1e}[1,]",
+            "Expected another array element at line 1, column 5 (need RS to resync)",
+        ),
+        (
+            "\u{1e}}",
+            "Unmatched '}' at line 1, column 2 (need RS to resync)",
+        ),
+        (
+            "\u{1e}\"unterminated\u{1e}\"ok\"\n",
+            "Truncated value at line 1, column 15",
+        ),
+    ];
+    for (input, expected) in cases {
+        let (_stdout, stderr, code) = run_jq_full(&["--seq", "-c", "."], Some(input)).unwrap();
+        assert_eq!(code, 0, "input {input:?} stderr: {stderr}");
+        assert_eq!(
+            stderr,
+            format!("jq: ignoring parse error: {expected}\n"),
+            "input {input:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #1723: `--slurp` reaches the same warning site, and a malformed record
+/// between two good ones neither stops the slurp nor loses them.
+#[test]
+fn test_seq_warns_under_slurp_1723() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["--seq", "-s", "-c", "."],
+        Some("\u{1e}1\n\u{1e}}\n\u{1e}2\n"),
+    )
+    .unwrap();
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(
+        stderr,
+        "jq: ignoring parse error: Unmatched '}' at line 2, column 2 (need RS to resync)\n"
+    );
+    assert_eq!(stdout.trim(), "\u{1e}[1,2]");
+    Ok(())
+}
+
+/// #1723: the modes #1525 deliberately kept silent stay silent -- `-R`
+/// takes over raw-text handling, DSV content holds no RFC 7464 records,
+/// and `-n` turns this into a fatal error in real jq that succinctly does
+/// not implement (see `test_seq_null_input_with_inputs_does_not_warn_1525`).
+#[test]
+fn test_seq_warning_guards_still_suppress_1723() -> Result<()> {
+    for args in [
+        &["-R", "--seq", "-c", "."][..],
+        &["-n", "--seq", "-c", "[inputs]"][..],
+    ] {
+        let (_stdout, stderr, code) = run_jq_full(args, Some("\u{1e}not valid json\n")).unwrap();
+        assert_eq!(code, 0, "args {args:?} stderr: {stderr}");
+        assert_eq!(stderr, "", "args {args:?}");
+    }
+    Ok(())
+}
+
+/// #1723: columns count raw bytes, so a byte that is not valid UTF-8 --
+/// substituted with U+FFFD before the value path ever sees it -- still
+/// advances the column by exactly one.
+#[test]
+fn test_seq_warning_columns_count_raw_bytes_1723() -> Result<()> {
+    // A non-UTF-8 byte is an ordinary token character to jq's scanner, so
+    // `]` ends a token that fails to parse rather than being unmatched --
+    // the column is the point of the comparison either way.
+    for (input, expected) in [
+        (
+            &b"\x1e\xff]"[..],
+            "Invalid numeric literal at line 1, column 3 (need RS to resync)",
+        ),
+        (
+            &b"\x1e\xc3\xa9]"[..],
+            "Invalid numeric literal at line 1, column 4 (need RS to resync)",
+        ),
+        (
+            &b"\x1e]"[..],
+            "Unmatched ']' at line 1, column 2 (need RS to resync)",
+        ),
+    ] {
+        let (output, code) = spawn_jq(&["--seq", "-c", "."], Some(input))?;
+        assert_eq!(code, 0);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            format!("jq: ignoring parse error: {expected}\n"),
+            "input {input:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #1525: an RS-less file combined with an RS-containing one triggers no
 /// warning at all when the RS-less file is *empty* -- real jq treats the
 /// whole `--seq` input as one continuous stream, and the RS-containing
