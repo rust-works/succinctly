@@ -677,7 +677,26 @@ is the revert that established what the other one costs.
    with path tracking suspended, so the source never moves the register
    (`path(.a as $y \| .b)` is `["b"]`) and never raises a path error of its own — the body
    still resolves against the arm's own ambient value, trackability and frame, exactly as
-   before #2042. `cannot_move_register`'s `Expr::As` arm follows the same evidence and now
+   before #2042. The witness therefore runs only where it is provably the same computation
+   as value evaluation: for a source on the closed pure-navigation grammar
+   (`is_pure_navigation` — `.`, `.a`, `.[n]`, a slice, `.[]`, `..`/`recurse`, `getpath` of a
+   literal, pipes and commas of those, a literal, `error`), and only when `$var` can reach a
+   position the resolver dispatches on in the body (`var_reaches_path_position`; a `$y` used
+   only inside `select(..)`, an `if` condition or an operand gains nothing from an origin).
+   Any other source — `try`, `?`, `//`, `select`, `if`, `first`, a construction, a builtin —
+   binds by value with no origin, exactly as before #2042. The first cut ran the witness on
+   every source and relied on its refusal escaping to a value-mode fallback; the review
+   showed that a `try`/`?`/`//` *inside* the source caught that refusal (jq never raises it)
+   and bound the handler's value — `del(([1] \| try .[0] catch "c") as $y \| .[$y\|tostring])`
+   deleted key `"c"` where jq deletes `"1"` — that `getpath`/`..` on a construction raised the
+   resolver's other refusal kind as a real error, and that the fallback repeated every side
+   effect (`input` consumed twice). On the closed grammar none of those can happen.
+
+   A slice witnesses a node only for a non-empty array (`slice_witnesses_node`): jq's
+   `jv_identical` is allocation identity, and a non-empty array slice shares its parent's
+   buffer while an empty one (`.a[1:1]`, `.a[5:9]`) is a fresh `jv_array()` and a string slice
+   a fresh string — `path(.a[0:2] as $y \| .a[0:2] \| $y)` on `{"a":[1,2,3]}` is
+   `["a",{"start":0,"end":2}]` in both, and `.a[1:1]` refuses in both. `cannot_move_register`'s `Expr::As` arm follows the same evidence and now
    consults only the body (see above), so `path(. as $x \| (.a as $q \| 1) \| $x)` — listed
    above as a refuse-only cost of the register-carry allowlist — is now jq's `[]` too: an
    `as` source can no longer block carrying the register through it, because it was never the
@@ -689,15 +708,22 @@ is the revert that established what the other one costs.
    unchanged: `substitute_bound_var`'s widening is jq-mode only
    ([#2643](https://github.com/rust-works/succinctly/issues/2643)).
 
-   Four rows stay refuse-only, each pinned in `test_path_bind_origin_matrix_refuse_only_2042`
+   Eleven rows stay refuse-only, each pinned in `test_path_bind_origin_matrix_refuse_only_2042`
    (`src/jq/eval.rs`) and `scripts/jq-bind-origin-oracle-sweep.sh`'s own `REFUSE_ONLY` list:
 
-   | Filter                                               | jq      | Why succinctly still refuses                                                                                                                      |
-   |------------------------------------------------------|---------|---------------------------------------------------------------------------------------------------------------------------------------------------|
-   | `.a as $y \| path(.a \| $y)`                         | `["a"]` | value-mode binding — `eval_as` never resolves its source in path position; the accepting-direction twin of #2642                                  |
-   | `path(.a as $y \| .a \| tojson \| fromjson \| $y)`   | `["a"]` | `tojson`/`fromjson` are not on `cannot_move_register`'s proven allowlist (#2041)                                                                  |
-   | `path(.a as $y \| def f: $y; .a \| f)`               | `["a"]` | a `def` inside `path()` resolves as an opaque leaf                                                                                                |
-   | `path(.a as $y \| ([$y] \| .[0]) as $z \| .a \| $z)` | `["a"]` | the source navigates inside a construction, which the resolver refuses where jq's suspended tracking allows it, so it falls back to a plain value |
+   | Filter                                                   | jq          | Why succinctly still refuses                                                                                                                          |
+   | -------------------------------------------------------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+   | `.a as $y \| path(.a \| $y)`                             | `["a"]`     | value-mode binding — `eval_as` never resolves its source in path position; the accepting-direction twin of #2642                                      |
+   | `path(.a as $y \| .a \| tojson \| fromjson \| $y)`       | `["a"]`     | `tojson`/`fromjson` are not on `cannot_move_register`'s proven allowlist (#2041)                                                                      |
+   | `path(.a as $y \| def f: $y; .a \| f)`                   | `["a"]`     | a `def` inside `path()` resolves as an opaque leaf                                                                                                    |
+   | `path(.a as $y \| ([$y] \| .[0]) as $z \| .a \| $z)`     | `["a"]`     | the source navigates inside a construction, which the resolver refuses where jq's suspended tracking allows it, so it falls back to a plain value     |
+   | `path((.a \| select(.b)) as $y \| .a \| $y)`             | `["a"]`     | the witness grammar is pure navigation; a `select`-wrapped source binds by value                                                                      |
+   | `path((.a // 1) as $y \| .a \| $y)`                      | `["a"]`     | same: a `//` source binds by value                                                                                                                    |
+   | `path((if .a then .a else .b end) as $y \| .a \| $y)`    | `["a"]`     | same: an `if` source binds by value                                                                                                                   |
+   | `path(.a? as $y \| .a \| $y)`                            | `["a"]`     | a `?` step is a distinct path component, so it never matches the plain spelling on either side (spelling, not node identity)                          |
+   | `path(.[0] as $y \| .[-2] \| $y)` on `[{"b":1},{"b":1}]` | `[-2]`      | a negative index is stored as written, so `.[-2]` never matches `.[0]`'s path                                                                         |
+   | `path(.a[0:3] as $y \| .a \| $y)` on `{"a":[1,2,3]}`     | `["a"]`     | jq's full slice *is* the array; the bind path ends in a slice component and `.a` does not                                                             |
+   | `path(.a as $y \| (.c \| $y \| .b) as $w \| .a.b \| $w)` | `["a","b"]` | a marker is re-rooted only at the head of a source (`$y.b as $w`, `(($y \| .b) \| .c) as $w`); elsewhere it is certified against the ambient position |
 
    Two related divergences are pre-existing and out of scope for #2042, tracked separately:
    [#2642](https://github.com/rust-works/succinctly/issues/2642) — the *root* `Origin::Snapshot`
