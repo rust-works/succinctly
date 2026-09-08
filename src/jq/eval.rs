@@ -32806,11 +32806,22 @@ fn eval_owned_navigation<S: EvalSemantics>(
 /// The `_ => false` catch-all is what makes adding a variant to [`Expr`] safe
 /// by default: a new variant is not fast-pathed until someone opts it in here
 /// *and* gives [`eval_owned_pure`] an arm for it.
+///
+/// `Expr::TrackedVar` is a literal for this purpose (#2042): a substituted
+/// `$var` holding an already-owned value, which the slow path's own
+/// `eval_single` arm hands back as `QueryResult::Owned(v.value.clone())`
+/// without reading the input at all. Before #2042 only a `. as $x`
+/// binding put one here (`substitute_var_tracked`); now every binding
+/// resolved in path position with a provable origin does, so
+/// `del(.[] | .score as $y | select($y < 100))` would otherwise reindex
+/// the whole branch per element for a condition that reads none of it --
+/// measured at +21% (7950X) / +31% (M4 Pro) on that shape.
 fn is_owned_pure_expr(expr: &Expr) -> bool {
     match expr {
         Expr::Identity
         | Expr::Not
         | Expr::Literal(_)
+        | Expr::TrackedVar(_)
         | Expr::Field(_)
         | Expr::Index { .. }
         | Expr::Builtin(Builtin::Type) => true,
@@ -32852,6 +32863,7 @@ fn produces_fresh_value(expr: &Expr) -> bool {
     match expr {
         Expr::Not
         | Expr::Literal(_)
+        | Expr::TrackedVar(_)
         | Expr::Builtin(Builtin::Type)
         | Expr::Compare { .. }
         | Expr::And(_, _)
@@ -32927,6 +32939,12 @@ fn eval_owned_pure<S: EvalSemantics>(
         Expr::Paren(inner) => eval_owned_pure::<S>(inner, input),
         // `eval_single`'s own `Expr::Literal` arm, verbatim.
         Expr::Literal(lit) => Some(Ok(literal_to_owned(lit))),
+        // `eval_single`'s own `Expr::TrackedVar` arm, verbatim (#2042). The
+        // bridge returns this same clone as `QueryResult::Owned`, which
+        // `detach_from_temp_document` passes through untouched, so unlike
+        // a navigated subvalue no spelling can change on the way -- which
+        // is why [`produces_fresh_value`] admits it too.
+        Expr::TrackedVar(marker) => Some(Ok(marker.value.clone())),
         // `eval_not`'s rule: truthiness excludes exactly `null`/`false`, and
         // `OwnedValue::is_truthy` is the same predicate `json_is_truthy`
         // implements over a cursor.
@@ -52587,6 +52605,82 @@ mod tests {
                     fast, bridge,
                     "yq mode: {src:?} on {value:?} disagrees with the reindex bridge"
                 );
+            }
+        }
+    }
+
+    /// #2042: a substituted `$var` (`Expr::TrackedVar`, which no source text
+    /// parses to -- only `substitute_var_impl` builds one) is fast-pathed
+    /// like the literal it stands in for, and agrees with the bridge on
+    /// every value it can hold, both as the expression's own result and as
+    /// a comparison/boolean operand, under both origins a marker can carry.
+    /// The marker's value ranges over the same spellings as the input so
+    /// the `NumberLiteral`-vs-`Int` representation claim
+    /// (`produces_fresh_value`) is diffed on the marker's own value, not
+    /// only the input's.
+    #[test]
+    fn eval_owned_pure_agrees_with_the_reindex_bridge_on_tracked_vars_2042() {
+        let shapes = [
+            "$y",
+            "$y < 100",
+            ".a == $y",
+            "$y == .",
+            "$y | . == 1",
+            "($y | .a) == 1",
+            "$y and .b",
+            ".a or $y",
+            "$y | type",
+            "($y) != $y",
+        ];
+        let origins = [
+            Origin::Snapshot,
+            Origin::At {
+                invocation: 7,
+                path: BindPath(PathPrefix::extend(
+                    &PathPrefix::root(),
+                    Expr::Field("a".to_string()),
+                )),
+            },
+        ];
+        let values = pure_value_matrix();
+        for src in shapes {
+            let parsed = parse(src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
+            for origin in &origins {
+                for bound in &values {
+                    let expr = substitute_var_impl(&parsed, "y", bound, Some(origin));
+                    assert!(
+                        is_owned_pure_expr(&expr),
+                        "{src:?} with $y := {bound:?} should be fast-pathable: {expr:?}"
+                    );
+                    assert!(
+                        is_owned_pure_composite(&expr),
+                        "{src:?} with $y := {bound:?} should reach eval_owned_pure: {expr:?}"
+                    );
+                    for value in &values {
+                        let fast = debug_normalize(eval_owned_input::<Vec<u64>, JqSemantics>(
+                            &expr, value, false,
+                        ));
+                        let bridge = debug_normalize(eval_owned_input_reindexed::<
+                            Vec<u64>,
+                            JqSemantics,
+                        >(&expr, value, false));
+                        assert_eq!(
+                            fast, bridge,
+                            "jq mode: {src:?} with $y := {bound:?} on {value:?} disagrees with the bridge"
+                        );
+                        let fast = debug_normalize(eval_owned_input::<Vec<u64>, YqSemantics>(
+                            &expr, value, false,
+                        ));
+                        let bridge = debug_normalize(eval_owned_input_reindexed::<
+                            Vec<u64>,
+                            YqSemantics,
+                        >(&expr, value, false));
+                        assert_eq!(
+                            fast, bridge,
+                            "yq mode: {src:?} with $y := {bound:?} on {value:?} disagrees with the bridge"
+                        );
+                    }
+                }
             }
         }
     }
