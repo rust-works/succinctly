@@ -3811,18 +3811,15 @@ where
             Err(e) => {
                 if let Some(previous) = pending_first.take() {
                     if let Some(control) = push_owned_values(previous, &mut out) {
-                        body_control = Some(control);
-                        return Demand::Stop;
+                        return stop_with_escape(&mut body_control, control);
                     }
                 }
-                body_control = Some(Control::Error(e));
-                return Demand::Stop;
+                return stop_with_escape(&mut body_control, Control::Error(e));
             }
         };
         if let Some(previous) = pending_first.take() {
             if let Some(control) = push_owned_values(previous, &mut out) {
-                body_control = Some(control);
-                return Demand::Stop;
+                return stop_with_escape(&mut body_control, control);
             }
         }
         let result = body(owned);
@@ -3839,8 +3836,7 @@ where
         if out.is_empty() && pending_first.is_none() {
             pending_first = Some(result);
         } else if let Some(control) = push_owned_values(result, &mut out) {
-            body_control = Some(control);
-            return Demand::Stop;
+            return stop_with_escape(&mut body_control, control);
         }
         Demand::Continue
     });
@@ -4076,10 +4072,7 @@ fn checked_or_stop<W: Clone + AsRef<[u64]>>(
 ) -> Result<OwnedValue, Demand> {
     match item.into_owned() {
         Ok(v) => Ok(v),
-        Err(e) => {
-            *escape = Some(Control::Error(e));
-            Err(Demand::Stop)
-        }
+        Err(e) => Err(stop_with_escape(escape, Control::Error(e))),
     }
 }
 
@@ -4116,10 +4109,7 @@ where
                 Err(demand) => return demand,
             };
             match push_owned_values(body(o.clone(), i), &mut out) {
-                Some(control) => {
-                    escape = Some(control);
-                    Demand::Stop
-                }
+                Some(control) => stop_with_escape(&mut escape, control),
                 None => Demand::Continue,
             }
         });
@@ -4128,10 +4118,7 @@ where
             // `body` already recorded its own control above.
             Flow::Stopped { .. } => Demand::Stop,
             // The inner generator's own control unwinds the outer loop too.
-            Flow::Escaped(control) => {
-                escape = Some(control);
-                Demand::Stop
-            }
+            Flow::Escaped(control) => stop_with_escape(&mut escape, control),
         }
     });
 
@@ -5373,10 +5360,7 @@ fn each_if<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 outer_stopped = true;
                 Demand::Stop
             }
-            Flow::Escaped(control) => {
-                escape = Some(control);
-                Demand::Stop
-            }
+            Flow::Escaped(control) => stop_with_escape(&mut escape, control),
         }
     });
 
@@ -5610,6 +5594,11 @@ fn each_pattern_alternatives<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             ),
         );
 
+        // #2180 WP3 review: cleared per attempt, so what the retry decision
+        // below reads is exactly "did this attempt's own evaluation end in a
+        // `Halt`/decode failure a driver had to stash out-of-band" -- see
+        // [`nonretryable_stop`].
+        clear_nonretryable_stop();
         match eval_each::<W, S>(&substituted_body, value.clone(), optional, sink) {
             Flow::Exhausted => return Flow::Exhausted,
             // #1519: a satisfied consumer is jq's escaping `break`, so it
@@ -6063,10 +6052,7 @@ where
         // argument value raises rather than silently becoming `""`.
         let owned = match item.into_owned() {
             Ok(v) => v,
-            Err(e) => {
-                escape = Some(Control::Error(e));
-                return Demand::Stop;
-            }
+            Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
         };
         match body(owned) {
             // This argument value's own walk finished; go on to the next.
@@ -6075,10 +6061,7 @@ where
                 consumer_stopped = true;
                 Demand::Stop
             }
-            Flow::Escaped(control) => {
-                escape = Some(control);
-                Demand::Stop
-            }
+            Flow::Escaped(control) => stop_with_escape(&mut escape, control),
         }
     });
 
@@ -6222,10 +6205,7 @@ fn each_any_all_gen_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Demand::Stop
             }
             Ok(false) => Demand::Continue,
-            Err(control) => {
-                probe_escape = Some(control);
-                Demand::Stop
-            }
+            Err(control) => stop_with_escape(&mut probe_escape, control),
         },
     );
 
@@ -6468,10 +6448,7 @@ fn each_negate<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let flow = eval_each::<W, S>(operand, value, optional, &mut |item| {
         let owned = match item.into_owned() {
             Ok(v) => v,
-            Err(e) => {
-                escape = Some(Control::Error(e));
-                return Demand::Stop;
-            }
+            Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
         };
         match arith_negate::<S>(owned) {
             Ok(negated) => {
@@ -6482,10 +6459,7 @@ fn each_negate<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     Demand::Continue
                 }
             }
-            Err(e) => {
-                escape = Some(Control::Error(e));
-                Demand::Stop
-            }
+            Err(e) => stop_with_escape(&mut escape, Control::Error(e)),
         }
     });
 
@@ -6558,10 +6532,7 @@ fn each_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // reason, as `eval_index_expr`'s own `Item::Borrowed` arm.
             Item::Borrowed(v) => match to_owned_key_shape(&v) {
                 Ok(k) => k,
-                Err(e) => {
-                    escape = Some(Control::Error(e));
-                    return Demand::Stop;
-                }
+                Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
             },
             Item::Owned(o) => o,
         };
@@ -6573,20 +6544,14 @@ fn each_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 outer_stopped = true;
                 Demand::Stop
             }
-            Flow::Escaped(control) => {
-                escape = Some(control);
-                Demand::Stop
-            }
+            Flow::Escaped(control) => stop_with_escape(&mut escape, control),
         }
     });
 
     if outer_stopped {
         return flow;
     }
-    match escape {
-        Some(control) => Flow::Escaped(control),
-        None => flow,
-    }
+    resume_from_escape(escape, flow)
 }
 
 /// Demand-forwarding twin of [`build_string_parts`] (#2180 WP2b), jq mode
@@ -6631,10 +6596,7 @@ fn each_string_parts<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let flow = eval_each::<W, S>(expr, value.clone(), optional, &mut |item| {
                 let owned = match item.into_owned() {
                     Ok(v) => v,
-                    Err(e) => {
-                        escape = Some(Control::Error(e));
-                        return Demand::Stop;
-                    }
+                    Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
                 };
                 slots[idx] = owned_to_string::<S>(&owned);
                 match each_string_parts::<W, S>(rest, value.clone(), optional, slots, sink) {
@@ -6643,19 +6605,13 @@ fn each_string_parts<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         outer_stopped = true;
                         Demand::Stop
                     }
-                    Flow::Escaped(control) => {
-                        escape = Some(control);
-                        Demand::Stop
-                    }
+                    Flow::Escaped(control) => stop_with_escape(&mut escape, control),
                 }
             });
             if outer_stopped {
                 return flow;
             }
-            match escape {
-                Some(control) => Flow::Escaped(control),
-                None => flow,
-            }
+            resume_from_escape(escape, flow)
         }
     }
 }
@@ -6724,10 +6680,7 @@ fn each_object_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 // `stream_outputs`'s own checked conversion.
                 let key_owned = match item.into_owned() {
                     Ok(v) => v,
-                    Err(e) => {
-                        escape = Some(Control::Error(e));
-                        return Demand::Stop;
-                    }
+                    Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
                 };
                 let key_str = match &key_owned {
                     OwnedValue::String(s) => s.clone(),
@@ -6740,10 +6693,10 @@ fn each_object_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                                 // everything) is deliberately not reproduced.
                                 return Demand::Continue;
                             }
-                            escape = Some(Control::Error(EvalError::cannot_use_as_object_key(
-                                &key_owned,
-                            )));
-                            return Demand::Stop;
+                            return stop_with_escape(
+                                &mut escape,
+                                Control::Error(EvalError::cannot_use_as_object_key(&key_owned)),
+                            );
                         }
                     },
                 };
@@ -6761,19 +6714,13 @@ fn each_object_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         outer_stopped = true;
                         Demand::Stop
                     }
-                    Flow::Escaped(control) => {
-                        escape = Some(control);
-                        Demand::Stop
-                    }
+                    Flow::Escaped(control) => stop_with_escape(&mut escape, control),
                 }
             });
             if outer_stopped {
                 return flow;
             }
-            match escape {
-                Some(control) => Flow::Escaped(control),
-                None => flow,
-            }
+            resume_from_escape(escape, flow)
         }
     }
 }
@@ -6801,10 +6748,7 @@ fn each_object_value<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #2022: same checked conversion as the key slot above.
         let val_owned = match item.into_owned() {
             Ok(v) => v,
-            Err(e) => {
-                escape = Some(Control::Error(e));
-                return Demand::Stop;
-            }
+            Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
         };
         acc.push((key.clone(), val_owned));
         let result = each_object_entries::<W, S>(rest, value.clone(), optional, acc, sink);
@@ -6815,19 +6759,13 @@ fn each_object_value<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 outer_stopped = true;
                 Demand::Stop
             }
-            Flow::Escaped(control) => {
-                escape = Some(control);
-                Demand::Stop
-            }
+            Flow::Escaped(control) => stop_with_escape(&mut escape, control),
         }
     });
     if outer_stopped {
         return flow;
     }
-    match escape {
-        Some(control) => Flow::Escaped(control),
-        None => flow,
-    }
+    resume_from_escape(escape, flow)
 }
 
 /// Demand-driven twin of [`eval_range`] (#1556): drives `from`, `to`, and
@@ -6909,8 +6847,7 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         };
         match drain_result(one, sink) {
             Flow::Exhausted if truncated => {
-                escape.set(Some(Control::Error(range_max_exceeded_error())));
-                Demand::Stop
+                stop_with_escape_cell(&escape, Control::Error(range_max_exceeded_error()))
             }
             Flow::Exhausted => Demand::Continue,
             Flow::Stopped { .. } => {
@@ -6930,8 +6867,7 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         let from_val = match range_num(&item_to_owned(from_item)) {
             Ok(n) => n,
             Err(e) => {
-                escape.set(Some(Control::Error(e)));
-                return Demand::Stop;
+                return stop_with_escape_cell(&escape, Control::Error(e));
             }
         };
 
@@ -6952,8 +6888,7 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let to_val = match range_num(&item_to_owned(to_item)) {
                 Ok(n) => n,
                 Err(e) => {
-                    escape.set(Some(Control::Error(e)));
-                    return Demand::Stop;
+                    return stop_with_escape_cell(&escape, Control::Error(e));
                 }
             };
 
@@ -6965,8 +6900,7 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                             let step_val = match range_num(&item_to_owned(step_item)) {
                                 Ok(n) => n,
                                 Err(e) => {
-                                    escape.set(Some(Control::Error(e)));
-                                    return Demand::Stop;
+                                    return stop_with_escape_cell(&escape, Control::Error(e));
                                 }
                             };
                             emit(from_val, to_val, step_val)
@@ -6974,10 +6908,7 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     match step_flow {
                         Flow::Exhausted => Demand::Continue,
                         Flow::Stopped { .. } => Demand::Stop,
-                        Flow::Escaped(control) => {
-                            escape.set(Some(control));
-                            Demand::Stop
-                        }
+                        Flow::Escaped(control) => stop_with_escape_cell(&escape, control),
                     }
                 }
             }
@@ -6986,10 +6917,7 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         match to_flow {
             Flow::Exhausted => Demand::Continue,
             Flow::Stopped { .. } => Demand::Stop,
-            Flow::Escaped(control) => {
-                escape.set(Some(control));
-                Demand::Stop
-            }
+            Flow::Escaped(control) => stop_with_escape_cell(&escape, control),
         }
     });
 
@@ -7069,10 +6997,7 @@ fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
             match flow {
                 Flow::Exhausted => Demand::Continue,
-                other => {
-                    downstream = Some(other);
-                    Demand::Stop
-                }
+                other => stop_with_downstream(&mut downstream, other),
             }
         };
         eval_each::<W, S>(first, value, optional, &mut driver)
@@ -7592,10 +7517,8 @@ fn checked_fanout_operand<W: Clone + AsRef<[u64]>>(
     item: Item<'_, W>,
     abort: &mut Option<Flow>,
 ) -> Result<OwnedValue, Demand> {
-    item.into_owned().map_err(|e| {
-        *abort = Some(Flow::Escaped(Control::Error(e)));
-        Demand::Stop
-    })
+    item.into_owned()
+        .map_err(|e| stop_with_downstream(abort, Flow::Escaped(Control::Error(e))))
 }
 
 fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>>(
@@ -7704,8 +7627,7 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>>(
             if let Some(op) = rules.empty {
                 if let Some(v) = yq_empty_operand_output(op, Some(&outer_val)) {
                     if matches!(sink(Item::Owned(v)), Demand::Stop) {
-                        abort = Some(Flow::Stopped { pending: None });
-                        return Demand::Stop;
+                        return stop_with_downstream(&mut abort, Flow::Stopped { pending: None });
                     }
                 }
             }
@@ -7720,10 +7642,7 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>>(
             // raises rather than answering `true`). `Stopped` is the
             // consumer's own demand, which ends the outer loop for the same
             // reason `eval_each_pipe`'s downstream stop ends stage 1.
-            other => {
-                abort = Some(other);
-                Demand::Stop
-            }
+            other => stop_with_downstream(&mut abort, other),
         }
     });
 
@@ -7739,13 +7658,13 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>>(
     // jq's own `path()` is lazy end to end, never evaluates the trailing
     // `halt_error`, and raises its "Invalid path expression" instead:
     //
-    //     path(1 == (foreach (1,2,3) as $x (null; $x;
-    //         if $x==1 then $x else ("x"|halt_error(3)) end)))
+    //     path(1 == (0 | recurse(
+    //         if . < 1 then .+1 else ("x"|halt_error(3)) end)))
     //         jq       exit 5, the path error       (nothing on stderr)
-    //         this     exit 5, the path error       (stray `x`: `foreach`
-    //                                                 has no Stage 5 arm)
-    //     path((foreach (1,2,3) as $x (null; $x;
-    //         if $x==1 then $x else ("x"|halt_error(3)) end)) == 1)
+    //         this     exit 5, the path error       (stray `x`: `recurse`
+    //                                                 has no lazy arm)
+    //     path((0 | recurse(
+    //         if . < 1 then .+1 else ("x"|halt_error(3)) end)) == 1)
     //         jq       exit 5, the path error
     //         this     exit 3, the halt wins        <- inner keeps `pending`
     //
@@ -7755,14 +7674,14 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>>(
     // outer `pending` instead would move the first row back to exit 3, away
     // from jq.
     //
-    // The example above uses `foreach` rather than `if`: this asymmetry
-    // needs an operand that still falls back to eager `eval_single`, and
-    // Stage 5 (#1462) gave `Expr::If` its own native lazy arm, so an
-    // `if`-wrapped `halt_error` no longer reaches this eager fallback at
-    // all -- both such rows now agree with jq outright (moved into
-    // `test_short_circuit_side_effect_shapes_already_match_jq_820`).
-    // `foreach` has no Stage 5 arm and still falls back the same way this
-    // comment always meant to illustrate.
+    // The example above needs an operand that still falls back to eager
+    // `eval_single`, since that fallback is the only thing that *produces* a
+    // `pending`. It used `if` until Stage 5 (#1462) gave `Expr::If` a native
+    // lazy arm, then `foreach` until #2180 WP3 gave `Expr::Foreach` one
+    // (both such row pairs moved into
+    // `test_short_circuit_side_effect_shapes_already_match_jq_820` as they
+    // closed). `eval_each` has no `Builtin::Recurse` arm, so `recurse` falls
+    // back the same way this comment has always meant to illustrate.
     if let (Some(op), 0, None, Flow::Exhausted) = (rules.empty, outer_seen, &abort, &outer) {
         // #2460 (yq mode only): the *outer* operand produced nothing, so the
         // loop above never ran and the inner one was never evaluated at all.
@@ -8198,10 +8117,7 @@ fn boolean_pair_left_bit(
         // discarding the left operand's own trailing control -- the
         // sink-world spelling of the pre-WP2a `return (out, Some(control))`
         // (#400/#494).
-        Flow::Escaped(control) => {
-            *abort = Some(control);
-            Demand::Stop
-        }
+        Flow::Escaped(control) => stop_with_escape(abort, control),
     }
 }
 
@@ -11170,10 +11086,7 @@ fn any_all_gen_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Demand::Stop
             }
             Ok(false) => Demand::Continue,
-            Err(control) => {
-                probe_escape = Some(control);
-                Demand::Stop
-            }
+            Err(control) => stop_with_escape(&mut probe_escape, control),
         },
     );
 
@@ -19940,6 +19853,7 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Vec::new(),
                 $control,
             );
+            mark_nonretryable_escape(&control);
             terminal = Some(partial(prefix, control));
             return Demand::Stop;
         }};
@@ -20104,6 +20018,7 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                                                 // parks the answer in `terminal`
                                                 // instead of `return`ing a
                                                 // `QueryResult` directly.
+                                                mark_nonretryable_escape(&control);
                                                 terminal = Some(partial(prefix, control));
                                                 return Demand::Stop;
                                             }
@@ -20222,7 +20137,9 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                                 // `return`, since this runs from inside the
                                 // per-key sink.
                                 Err((prefix, e)) => {
-                                    terminal = Some(partial(prefix, Control::Error(e)));
+                                    let control = Control::Error(e);
+                                    mark_nonretryable_escape(&control);
+                                    terminal = Some(partial(prefix, control));
                                     return Demand::Stop;
                                 }
                             });
@@ -34911,15 +34828,204 @@ fn is_retryable_control(control: &Control, is_last: bool) -> bool {
 /// through a `?//` already matched jq), and only this stop-shaped sibling
 /// signal was missing.
 ///
-/// Taking `is_last` alone rather than a `&Control` is deliberate: a stop
-/// carries no control to classify, and the decode-failure and `Halt`
-/// exclusions that make [`is_retryable_control`] a `match` cannot arise from
-/// a stop -- both are `Flow::Escaped`, never `Flow::Stopped`. The rule still
-/// lives in a named function next to its sibling rather than open-coded at
-/// the two call sites, because duplicated `?//` classifiers in this file have
-/// drifted twice already (#1313, #1457).
+/// Taking `is_last` alone rather than a `&Control` was deliberate while a
+/// stop carried no classifiable reason at all. #2180 WP3 review found that
+/// it can: a driver that stashes an escape out-of-band and answers
+/// [`Demand::Stop`] hands the `?//` a bare stop even when the reason behind
+/// it was a `Halt` or a decode failure -- both of which
+/// [`is_retryable_control`] refuses to retry, `is_last` or not. That reason
+/// travels beside the stop in [`nonretryable_stop`], set by
+/// [`stop_with_escape`], so the two classifiers agree on `Halt` and decode
+/// failures however the escape happens to be spelled. Captured live against
+/// jq 1.7.1, input `1`:
+/// `first((1 as $x ?// $y | 1) as $v | ("h"|halt_error(3)))` writes `h`
+/// once, not twice, and
+/// `[limit(10; foreach (1 as $x ?// $y | 1) as $v ((0, 100); if . == 0 then
+/// ("x"|halt_error(3)) else "OK:\(.)" end; .))]` halts instead of having the
+/// retry swallow the halt outright. An ordinary `Error` and a `Break` still
+/// *do* retry through a source `?//`
+/// (`[limit(1; (1 as $x ?// $y | 1) | ("e"|stderr) | error("boom"))]` writes
+/// `e` twice in jq too), which is why this consults
+/// [`is_retryable_control`]'s rule rather than refusing every escape-backed
+/// stop.
+///
+/// The rule lives in a named function next to its sibling rather than
+/// open-coded at the call sites, because duplicated `?//` classifiers in this
+/// file have drifted twice already (#1313, #1457) -- and putting the
+/// side-channel check *here*, rather than at
+/// [`each_pattern_alternatives`]'s own `Flow::Stopped` arm, is what makes
+/// [`try_foreach_step_alternatives`]'s and
+/// `each_pattern_alternatives_generic`'s retry decisions inherit it for
+/// free. Open issue #2567 asked for exactly this mechanism ("a shared
+/// non-retryable stop signal any sink can set, consulted at the
+/// `Flow::Stopped { pending }` retry-decision point before deciding to
+/// retry") for `nth`'s skipped-item decode failure; it is implemented once,
+/// here.
 pub(crate) fn is_retryable_stop(is_last: bool) -> bool {
-    !is_last
+    !is_last && !nonretryable_stop::is_set()
+}
+
+/// The reason behind a [`Flow::Stopped`], for the one question a `?//`
+/// alternative asks about it: may it be retried?
+///
+/// A sink can only answer [`Demand`], so a driver that ends a drive because
+/// something *escaped* -- a decode failure on the value it was handed, a
+/// `Halt` from the stage it piped into -- has to stash that escape beside
+/// the drive and answer [`Demand::Stop`] (the `escape`/`downstream`/`ended`
+/// idiom this file uses in roughly forty places). Everything between that
+/// driver and the `?//` sees only `Flow::Stopped { pending: None }`, so
+/// #1519's retry fires and the halted alternative runs a second time --
+/// `first((1 as $x ?// $y | 1) as $v | ("h"|halt_error(3)))` wrote `h` twice
+/// where jq 1.7.1 writes it once, and in one shape the halt was swallowed
+/// entirely (see [`is_retryable_stop`] for both captured rows).
+///
+/// Widening [`Demand`] or [`Flow::Stopped`] to carry the bit would mean
+/// touching every one of this file's `Flow::Stopped { pending: None }`
+/// construction sites, each of which would have to propagate a bit it has no
+/// opinion about; the escape's *reason* is ambient to the unwind, not part of
+/// any one arm's contract. So it rides beside the stack the way
+/// [`ambient_frame_depth`] and `remaining_inputs` already do -- see
+/// `ambient_frame_depth`'s own doc comment for that precedent and for the
+/// `#[cfg(feature = "std")]` split below.
+///
+/// **The flag is cleared on entry to every `?//` alternative attempt**
+/// ([`clear_nonretryable_stop`]), not by whoever set it. That makes the value
+/// read at a retry decision exactly "did something set it while *this*
+/// alternative was being evaluated", which is the property the rule needs,
+/// and it makes a stale flag structurally unobservable rather than merely
+/// unlikely. [`resume_from_escape`] clears it too, where a driver's reclaim
+/// has that shape, so the flag's lifetime is normally just the unwind.
+#[cfg(feature = "std")]
+mod nonretryable_stop {
+    use std::cell::Cell;
+
+    thread_local! {
+        static SET: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn set() {
+        SET.with(|f| f.set(true));
+    }
+
+    pub(crate) fn clear() {
+        SET.with(|f| f.set(false));
+    }
+
+    pub(crate) fn is_set() -> bool {
+        SET.with(Cell::get)
+    }
+}
+
+/// `no_std` has no `thread_local!`, so the side channel is never set and
+/// every escape-backed stop stays retryable there -- exactly as it was
+/// before #2180 WP3, not worse. Same trade-off, and the same reasoning, as
+/// [`ambient_frame_depth`]'s own `no_std` half; the CLI (the only surface
+/// that can observe a `halt_error` exit code at all) always builds with
+/// `std`.
+#[cfg(not(feature = "std"))]
+mod nonretryable_stop {
+    pub(crate) fn set() {}
+
+    pub(crate) fn clear() {}
+
+    pub(crate) fn is_set() -> bool {
+        false
+    }
+}
+
+/// Stash `control` as this driver's out-of-band escape and answer
+/// [`Demand::Stop`], recording in [`nonretryable_stop`] whether the escape
+/// is one a `?//` may not retry.
+///
+/// The single definition of the "stash an escape, answer stop" idiom, so
+/// there is one place that decides what such a stop means to a `?//`
+/// (#2180 WP3 review, #2567). `is_last: false` is passed to
+/// [`is_retryable_control`] on purpose: this asks the position-independent
+/// half of that rule -- `Halt` and decode failures, the two escapes that
+/// never retry wherever they land -- and leaves the `is_last` half to the
+/// `?//` that will actually make the decision.
+pub(crate) fn stop_with_escape(slot: &mut Option<Control>, control: Control) -> Demand {
+    mark_nonretryable_escape(&control);
+    *slot = Some(control);
+    Demand::Stop
+}
+
+/// The one definition of "a `?//` may not retry past this escape, wherever
+/// it lands" -- `Halt` and decode failures, [`is_retryable_control`]'s two
+/// position-independent exclusions.
+///
+/// [`stop_with_escape`], [`stop_with_escape_cell`] and
+/// [`stop_with_downstream`] cover every driver whose slot holds a `Control`
+/// or a whole `Flow`; four drivers keep a shape none of those fit -- a
+/// `ForeachStepEnd` in [`foreach_fork`], and `eval_generic.rs`'s three
+/// owned-identity stages, which answer `Flow::Stopped` directly rather than
+/// `Demand::Stop` -- and call this beside their own store instead of growing
+/// an adapter each. The *rule* is still in one place, which is what drifted
+/// twice before (#1313, #1457).
+pub(crate) fn mark_nonretryable_escape(control: &Control) {
+    if !is_retryable_control(control, false) {
+        nonretryable_stop::set();
+    }
+}
+
+/// [`stop_with_escape`] for the pipe-shaped drivers whose out-of-band slot
+/// holds a whole [`Flow`] rather than a bare [`Control`] -- the downstream
+/// stage's verdict, which may itself be a `Stopped` some deeper driver has
+/// already classified.
+pub(crate) fn stop_with_downstream(slot: &mut Option<Flow>, flow: Flow) -> Demand {
+    if let Flow::Escaped(ref control) = flow {
+        mark_nonretryable_escape(control);
+    }
+    *slot = Some(flow);
+    Demand::Stop
+}
+
+/// [`stop_with_escape`] for [`each_range`], whose out-of-band slot is a
+/// `Cell<Option<Control>>` (its emit closure is called from two nested sink
+/// levels, so the slot is shared by `&` rather than `&mut`).
+pub(crate) fn stop_with_escape_cell(
+    slot: &core::cell::Cell<Option<Control>>,
+    control: Control,
+) -> Demand {
+    mark_nonretryable_escape(&control);
+    slot.set(Some(control));
+    Demand::Stop
+}
+
+/// [`stop_with_escape`] for the one driver whose out-of-band slot holds a
+/// bare [`EvalError`] rather than a whole [`Control`]
+/// (`path_context_walk_generic`). Round-trips through [`stop_with_escape`]
+/// rather than re-testing `is_decode_failure()` here: that half of the rule
+/// drifting independently is exactly what [`mark_nonretryable_escape`]
+/// exists to prevent.
+pub(crate) fn stop_with_error(slot: &mut Option<EvalError>, error: EvalError) -> Demand {
+    let mut control = None;
+    let demand = stop_with_escape(&mut control, Control::Error(error));
+    match control {
+        Some(Control::Error(error)) => *slot = Some(error),
+        _ => unreachable!("stop_with_escape stores exactly the control it was handed"),
+    }
+    demand
+}
+
+/// Take a driver's stashed escape back out as a [`Flow::Escaped`], or fall
+/// back to the drive's own verdict -- the reclaim half of
+/// [`stop_with_escape`], clearing the side channel it set.
+pub(crate) fn resume_from_escape(slot: Option<Control>, flow: Flow) -> Flow {
+    match slot {
+        Some(control) => {
+            nonretryable_stop::clear();
+            Flow::Escaped(control)
+        }
+        None => flow,
+    }
+}
+
+/// Clear the non-retryable-stop side channel on entry to one `?//`
+/// alternative's attempt. See [`nonretryable_stop`] for why the clear lives
+/// here rather than at whoever set the flag.
+pub(crate) fn clear_nonretryable_stop() {
+    nonretryable_stop::clear();
 }
 
 /// Try each `?//`-separated pattern alternative (#1365) for one `foreach`
@@ -35043,6 +35149,12 @@ fn try_foreach_step_alternatives<S: EvalSemantics>(
                 continue;
             }
         };
+
+        // #2180 WP3 review: one attempt, one clear -- see
+        // [`each_pattern_alternatives`]'s identical call and
+        // [`nonretryable_stop`] for why the flag is cleared here rather than
+        // by whoever set it.
+        clear_nonretryable_stop();
 
         if let Some(control) = charge_budget(budget, "foreach") {
             return (state, Some(ForeachStepEnd::Escaped(control)));
@@ -35525,6 +35637,16 @@ pub(crate) fn foreach_fork<S: EvalSemantics>(
         match step_end {
             None => Demand::Continue,
             Some(end) => {
+                // #2180 WP3 review: `ended` is this driver's out-of-band
+                // escape slot, so an escape reaching it carries the same
+                // non-retryable classification [`stop_with_escape`] applies
+                // to `Option<Control>` slots -- without it, a source-side
+                // `?//` retried a step that had already halted, running (and
+                // in one shape swallowing) the halt a second time. See
+                // [`mark_nonretryable_escape`].
+                if let ForeachStepEnd::Escaped(ref control) = end {
+                    mark_nonretryable_escape(control);
+                }
                 ended = Some(end);
                 Demand::Stop
             }
@@ -35667,10 +35789,7 @@ fn each_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         let flow = eval_each::<W, S>(input, value.clone(), optional, &mut |item| {
             let input_val = match item.into_owned() {
                 Ok(v) => v,
-                Err(e) => {
-                    escape = Some(Control::Error(e));
-                    return Demand::Stop;
-                }
+                Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
             };
             let row = substitute_foreach_steps(
                 patterns,
@@ -35684,10 +35803,7 @@ fn each_foreach<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             recorded.push(input_val);
             demand
         });
-        match escape {
-            Some(control) => Flow::Escaped(control),
-            None => flow,
-        }
+        resume_from_escape(escape, flow)
     };
 
     for init_val in init_values {

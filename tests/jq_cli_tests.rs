@@ -30843,6 +30843,94 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
             "jq: error (at <unknown>): Invalid path expression with result true",
             5,
         ),
+        // ---- #2180 WP3 review: a `Halt` behind a stop is not retryable ---
+        // A driver that ends its drive because something *escaped* has to
+        // stash that escape out of band and answer `Demand::Stop` (the
+        // `escape`/`downstream`/`ended` idiom), so every `?//` between it
+        // and the consumer used to see a bare `Flow::Stopped` and retry
+        // #1519's retry -- running the halted alternative a second time, and
+        // in the `limit(10; foreach ...)` row below losing the halt
+        // altogether. `stop_with_escape` now records `is_retryable_control`'s
+        // two position-independent exclusions (`Halt`, decode failure) in
+        // `nonretryable_stop`, which `is_retryable_stop` consults. All
+        // captured live against jq 1.7.1 (`-cn`), stdout and stderr
+        // separately.
+        //
+        // The pipe driver's own row -- pre-existing, not introduced by WP3.
+        (
+            &[
+                "-cn",
+                r#"[limit(1; (1 as $x ?// $y | 1) | ("h"|halt_error(3)))]"#,
+            ],
+            None,
+            "",
+            "h",
+            3,
+        ),
+        // The `as`-source driver (`fanout_arg_each`, WP2b).
+        (
+            &[
+                "-cn",
+                r#"first((1 as $x ?// $y | 1) as $v | ("h"|halt_error(3)))"#,
+            ],
+            None,
+            "",
+            "h",
+            3,
+        ),
+        // `foreach_fork`'s own `ended` slot: the halt escapes UPDATE, and
+        // the source's `?//` used to re-offer the same element to a second
+        // alternative that halted again.
+        (
+            &[
+                "-cn",
+                r#"foreach (1 as $x ?// $y | 1) as $v (0; ("h"|halt_error(3)))"#,
+            ],
+            None,
+            "",
+            "h",
+            3,
+        ),
+        // Same, with a side effect in front of the halt so the doubling is
+        // visible as `EHEH` rather than only in the halt message.
+        (
+            &[
+                "-cn",
+                r#"first(foreach (1 as $x ?// $y | 1) as $v (0; ("E"|stderr) | ("H"|halt_error(3)); .))"#,
+            ],
+            None,
+            "",
+            "EH",
+            3,
+        ),
+        // The shape where the retry did not merely repeat the halt but
+        // *swallowed* it: the retried alternative succeeded, `foreach_fork`
+        // cleared its own `ended` on the next step, and the whole fold went
+        // on to answer with exit 0.
+        (
+            &[
+                "-cn",
+                r#"[limit(10; foreach (1 as $x ?// $y | 1) as $v ((0, 100); if . == 0 then ("x"|halt_error(3)) else "OK:\(.)" end; .))]"#,
+            ],
+            None,
+            "",
+            "x",
+            3,
+        ),
+        // The control, and the reason this consults `is_retryable_control`
+        // rather than refusing every escape-backed stop: an ordinary
+        // `error` (and a `break`) genuinely DOES retry through a source
+        // `?//` in jq, so `e` is written twice here in both.
+        (
+            &[
+                "-cn",
+                r#"[limit(1; (1 as $x ?// $y | 1) | ("e"|stderr) | error("boom"))]"#,
+            ],
+            None,
+            "",
+            "eejq: error (at <unknown>): boom",
+            5,
+        ),
     ];
 
     for (args, stdin, want_out, want_err, want_code) in cases {
@@ -31002,6 +31090,45 @@ fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
             "[true,true,true,true]\n",
             "AABCCDCCD",
             0,
+        ),
+        // ---- `binary_fanout_each`'s inner/outer `pending` asymmetry ------
+        // `Flow::Stopped { pending }` is dropped by every lazy consumer but
+        // one: `binary_fanout_each` has two operands and so can be handed
+        // two `pending`s, and it keeps the *inner* (left) operand's while
+        // dropping the *outer* (right) one's -- see `Flow::Stopped`'s own
+        // doc comment. #2180 WP3 gave `Expr::Foreach` a demand-forwarding
+        // arm, which removed the eager fallback the pair that used to pin
+        // this asymmetry depended on (those rows moved to
+        // `test_short_circuit_side_effect_shapes_already_match_jq_820`), so
+        // these two took over: `eval_each` has no `Builtin::Recurse` arm, so
+        // `recurse` still reaches the eager fallback that *produces* a
+        // `pending`. Both captured live against jq 1.7.1, which raises the
+        // path error with no stderr in either spelling.
+        //
+        // Inner (left) operand keeps its `pending`: the halt wins outright.
+        (
+            &[
+                "-cn",
+                r#"path((0 | recurse(if . < 1 then .+1 else ("x"|halt_error(3)) end)) == 1)"#,
+            ],
+            None,
+            "",
+            "x",
+            3,
+        ),
+        // Outer (right) operand drops its `pending`: the halt's stderr write
+        // has already happened, but the halt itself is discarded and the
+        // path error surfaces instead -- so succinctly writes a stray `x`
+        // that jq never does.
+        (
+            &[
+                "-cn",
+                r#"path(1 == (0 | recurse(if . < 1 then .+1 else ("x"|halt_error(3)) end)))"#,
+            ],
+            None,
+            "",
+            "xjq: error (at <unknown>): Invalid path expression with result false",
+            5,
         ),
     ];
 
