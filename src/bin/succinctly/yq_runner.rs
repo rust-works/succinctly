@@ -841,8 +841,8 @@ fn yaml_to_owned_value<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> Result<Own
             let mut arr = Vec::new();
             let mut rest = elements;
             // `uncons_resolved_cursor`, not `uncons_cursor`: the recursive
-            // call's own `cursor.explicit_tag()` above doesn't resolve a
-            // bare `-` sequence-item wrapper itself (see
+            // call's own `cursor.explicit_tag_at(None)` above doesn't
+            // resolve a bare `-` sequence-item wrapper itself (see
             // `YamlCursor::anchor`'s doc comment for why), so an
             // unresolved cursor here would silently drop an explicit tag
             // on a bare-dash-deferred scalar (#835).
