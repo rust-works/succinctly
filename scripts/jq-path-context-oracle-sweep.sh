@@ -20,11 +20,12 @@
 #
 # #2072 step 0 (2026-09-08) widened the prefix alphabet with `bind_*` entries:
 # a leaf reached through an `as`-bound variable (`.a as $x | $x | <leaf>`)
-# rather than by direct navigation, so the sweep can find any case where
-# `substitute_bound_var`'s re-materialisation of the bound value erases the
-# node identity a leaf like `key`/`path`/`parent` depends on. See
-# `tests/data/jq-path-context-sweep-known-divergences.txt`'s own `bind_`
-# entries for what is already on record from that widening.
+# rather than by direct navigation, so the sweep can find any case where a
+# binding erases the node identity a leaf like `key`/`path`/`parent` depends
+# on. That widening recorded three divergence classes; #2072 step 3 gave a
+# binding a `BindOrigin` and step 4 removed all three, which is what this
+# sweep's two-sided staleness check exists to force. The prefixes stay: they
+# are now the regression net for that fix.
 #
 # **The generator alphabet is part of the claim.** A fuzzer whose pool cannot
 # emit the shape a bug lives in proves nothing (#2041). The alphabet here is a
@@ -112,14 +113,16 @@ SUCC="${SUCC:-$REPO_ROOT/target/release/succinctly}"
 # thing the path-context routes exist to carry.
 #
 # The `bind_*` prefixes (#2072) route the leaf through an `as`-bound variable
-# instead of navigating directly: `substitute_bound_var` re-materialises the
-# bound value as a literal, so a leaf read through `$x` sees no node identity
-# at all where a leaf read through direct navigation does. `bind_cross`
-# binds at one array position and reads the leaf after moving to a sibling,
-# so a value-equality approximation of identity (the two elements are both
-# integers but different ones) cannot accidentally pass by coincidence the
-# way `bind_root`/`bind_field` could if the bound value happened to equal
-# the ambient one.
+# instead of navigating directly. Before #2072 a bound variable was
+# re-materialised as a literal, so a leaf read through `$x` saw no node
+# identity at all where a leaf read through direct navigation did; it now
+# carries a `BindOrigin` and answers the same as the direct read.
+# `bind_cross` binds at one array position and reads the leaf after moving to
+# a sibling, so a value-equality approximation of identity (the two elements
+# are both integers but different ones) cannot accidentally pass by
+# coincidence the way `bind_root`/`bind_field` could if the bound value
+# happened to equal the ambient one -- which is what makes these prefixes a
+# real regression net rather than a restatement of the direct rows.
 PREFIX_IDS=(root  field  iter    seqiter descend deep   bind_root       bind_field        bind_iter          bind_seqiter       bind_cross)
 PREFIX_TPL=('.'   '.a'   '.a[]'  '.d[]'  '..'    '.a.b' '. as $x | $x'  '.a as $x | $x'   '.a[] as $x | $x'  '.d[] as $x | $x'  '.d[0] as $x | .d[1] | $x')
 
