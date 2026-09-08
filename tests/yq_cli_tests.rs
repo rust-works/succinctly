@@ -38768,3 +38768,95 @@ fn test_and_or_no_longer_raise_through_a_container_alias_2476() -> Result<()> {
 
     Ok(())
 }
+
+/// #2476: `not` over the same alias fan-out `and`/`or` were fixed against.
+/// `not` never had a `needs_path_context` gate to lose (it has no operand,
+/// only the ambient `.`), so before this change it fell to the wildcard
+/// bridge unconditionally and paid the same `O(2^N)` materialization at
+/// every one of these positions. This test asserts completion (a regression
+/// hangs the suite) and the correct truthiness, not a wall-clock bound --
+/// same rationale as `test_and_or_over_alias_fanout_completes_2476` above.
+///
+/// `.a22[0] | not` and `not` at the root are worth spelling out: the first
+/// lands the cursor *on* an alias node directly (`.a22`'s own two children
+/// are `*a21`), so the walk stops at depth 1 without ever entering the
+/// fan-out; the second starts at the document root, which is not itself an
+/// alias, but every one of its 23 top-level values whose children are alias
+/// nodes stops there too -- so both are `O(N)`, not `O(1)` or `O(2^N)`.
+#[test]
+fn test_not_over_alias_fanout_completes_2476() -> Result<()> {
+    let mut doc = String::from("a0: &a0 leaf\n");
+    for i in 1..=22 {
+        doc.push_str(&format!("a{i}: &a{i} [*a{}, *a{}]\n", i - 1, i - 1));
+    }
+
+    for (filter, want) in [
+        (".a22 | not", "false"),
+        (".a22[0] | not", "false"),
+        (".a0 | not", "false"),
+        ("null | not", "true"),
+        ("not", "false"),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, &doc, &[])?;
+        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), want, "`{filter}` -- stderr: {stderr:?}");
+    }
+
+    Ok(())
+}
+
+/// #2476's `not` sibling of
+/// `test_and_or_no_longer_raise_through_a_container_alias_2476`: `not`
+/// shares the same `push_generic_truthiness` walk `and`/`or` do (inline,
+/// via its `OneCursor` arm), so it inherits #1804's identical trade-off. A
+/// decode failure reachable *only* through a container-target alias no
+/// longer raises from `not` at that alias position; visiting the anchor
+/// directly, or materializing through the alias, still raises.
+///
+/// The second document is the scalar-target sibling from
+/// `test_select_still_raises_on_decode_failure_reachable_only_via_scalar_alias_1804`:
+/// #1804 scoped its short-circuit to a *container* reached through an alias,
+/// not a bare scalar one -- resolving a scalar alias is O(1), never part of
+/// the fan-out this issue fixes -- so `.b | not` still raises there. Real yq
+/// rejects both documents at parse time (confirmed live against v4.53.3), so
+/// there is no yq behaviour to match either way.
+#[test]
+fn test_not_no_longer_raises_through_a_container_alias_2476() -> Result<()> {
+    let doc = "a: &a [\"bad\\qc\"]\nb: *a\n";
+
+    // The alias position: the walk stops at the alias, so `not` answers
+    // instead of raising. This is the row that changed (exit 1 before, exit
+    // 0 now).
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(".b | not", doc, &[])?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), "false", "stderr: {stderr:?}");
+
+    // Visiting the anchor itself still raises.
+    let (_, stderr, code) = run_yq_stdin_with_stderr(".a | not", doc, &[])?;
+    assert_ne!(code, 0, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("invalid escape sequence"),
+        "stderr: {stderr}"
+    );
+
+    // Materializing through the alias still raises.
+    let (_, stderr, code) = run_yq_stdin_with_stderr(".b[0]", doc, &[])?;
+    assert_ne!(code, 0, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("invalid escape sequence"),
+        "stderr: {stderr}"
+    );
+
+    // The scalar-alias sibling: `.b`'s target is a bare scalar, not a
+    // container, so #1804's short-circuit does not apply and `.b | not`
+    // still raises.
+    let scalar_doc = "a: &a \"bad\\qc\"\nb: *a\n";
+    let (_, stderr, code) = run_yq_stdin_with_stderr(".b | not", scalar_doc, &[])?;
+    assert_ne!(code, 0, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("invalid escape sequence"),
+        "stderr: {stderr}"
+    );
+
+    Ok(())
+}

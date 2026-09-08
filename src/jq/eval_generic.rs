@@ -6686,6 +6686,37 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             eval_boolean_generic::<S, V>(left, right, true, value, optional, cursor)
         }
 
+        // `not` is unary and reads only the ambient value -- it has no
+        // operand for a `needs_path_context` gate to key on, so it fell to
+        // the wildcard bridge below unconditionally, paying the same
+        // alias-fan-out cost as the ungated `and`/`or` above (#2476). `not`
+        // is exactly the truthiness of `.`, negated, and
+        // `push_generic_truthiness` already computes that truthiness for
+        // the identity result: its `OneCursor` arm runs
+        // `push_generic_document_validation_error` over the ambient cursor
+        // before reading `is_falsy`, which IS the raise the bridge's
+        // `to_owned_with_cursor` used to produce -- see
+        // `ambient_validation_error`'s doc comment for the parity evidence.
+        // So unlike the `And`/`Or` arms above, this needs no separate
+        // `ambient_validation_error` call; the walk is already inline in
+        // the truthiness check it was going to do anyway.
+        //
+        // `eval::eval_not`'s own comment argues a container that merely
+        // *holds* an undecodable string should answer `false` rather than
+        // raise. That argument doesn't change what the CLI does here: it
+        // raised before this arm existed (via the bridge's decode) and
+        // still raises now (via the same decode, run as a walk instead of
+        // a materialization), so this is a faster route to the same
+        // raise-set, not a behaviour change.
+        Expr::Not => {
+            let identity = cursor.map_or(GenericResult::One(value), GenericResult::OneCursor);
+            let mut bits = vec_with_capacity(1);
+            if let Some(control) = push_generic_truthiness(identity, &mut bits) {
+                return partial_generic(Vec::new(), control);
+            }
+            GenericResult::Owned(OwnedValue::Bool(!bits[0]))
+        }
+
         // Array construction: collect every output of the inner expression
         // into one array. Handled natively (mirrors `eval::eval_array_construction`)
         // so a builtin with its own cursor-native, duplicate-key-preserving fix
