@@ -38292,3 +38292,45 @@ fn test_as_binding_keeps_the_input_identity_2563() -> Result<()> {
     }
     Ok(())
 }
+
+/// #2581 companion: the second half of `Expr::Compare`'s new gate.
+///
+/// #2581 gave `Expr::Compare` the same `needs_path_context` gate its
+/// `Expr::Arithmetic`/`Expr::And`/`Expr::Or` siblings already carry, so an
+/// ungated comparison falls through to the wildcard bridge and pays the
+/// ambient decode that makes a document-level malformation raise the way
+/// real jq's eager parse does. `needs_path_context` alone is not a
+/// sufficient gate, though: a comparison over a *cursor-metadata* builtin
+/// (`di`, `line`, `column`, ...) reads no path context, yet cannot survive
+/// the bridge either -- its re-serialize-and-reindex round trip answers
+/// `di` from a fixed-default stub instead of the live document index, the
+/// same carve-out `eval_using`'s own doc comment records for
+/// `input`/`inputs`. Without `uses_cursor_metadata_builtins` in the gate,
+/// `select(di == 1)` over a multi-document stream picks the wrong documents.
+///
+/// Every row captured live against yq v4.53.3.
+///
+/// The three sibling arms carry only the `needs_path_context` half and look
+/// equally exposed to the same bug; that is unconfirmed and tracked at
+/// #2584 rather than widened speculatively alongside this fix.
+#[test]
+fn test_compare_over_document_index_keeps_native_arm_2581() -> Result<()> {
+    let doc = "a: 1\n---\na: 2\n---\na: 3\n";
+
+    for (filter, want) in [
+        ("select(di == 0) | .a", "1"),
+        ("select(di == 1) | .a", "2"),
+        ("select(di == 2) | .a", "3"),
+        ("select(di >= 1) | .a", "2\n---\n3"),
+        ("select(di != 1) | .a", "1\n---\n3"),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, doc, &[])?;
+        assert_eq!(
+            (stdout.trim_end(), code),
+            (want, 0),
+            "`{filter}` diverged from yq v4.53.3"
+        );
+    }
+
+    Ok(())
+}

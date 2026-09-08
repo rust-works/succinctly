@@ -6546,7 +6546,43 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // so `("A"|stderr) == (("B"|stderr), ("C"|stderr))` now writes
         // `B A C A`, matching jq, instead of finishing right first (`B C A
         // A`).
-        Expr::Compare { op, left, right } => {
+        //
+        // **Gated on `needs_path_context`, like the `Expr::Arithmetic`/
+        // `Expr::And`/`Expr::Or` arms below** (#2581). This arm was ungated
+        // until then, which is the "pre-existing gap" those arms' own
+        // comments used to name: `1==1` on a #1194-malformed document
+        // (`{123: 1}`) answered `true`, where jq raises the document's own
+        // parse error on *every* query over it, including one that reads
+        // nothing. Live against jq 1.7.1:
+        //
+        // ```console
+        // $ printf '{123: 1}' | jq -c '1==1'
+        // jq: parse error: Object keys must be strings at line 1, column 5
+        // $ printf '{"a": {"bad": "\x"}, "b": 5}' | jq -c '.b == .b'
+        // jq: parse error: Invalid escape at line 1, column 18
+        // ```
+        //
+        // The gate keeps a comparison that reads no path context on the
+        // wildcard bridge, whose ambient materialization is what surfaces
+        // that decode failure; one that does read path context could not
+        // have stood on a malformed document's root and survived the walk
+        // anyway, and keeps the native arm.
+        //
+        // `uses_cursor_metadata_builtins` is the second half of the gate for
+        // the reason `eval_using`'s own doc comment already records for
+        // `input`/`inputs`: the bridge's re-serialize-and-reindex round trip
+        // cannot preserve a cursor-metadata builtin's real identity, so
+        // `select(di == 1)` over a multi-document stream would answer from a
+        // fixed-default stub instead of the live document index. The three
+        // sibling arms below carry only the `needs_path_context` half and
+        // look equally exposed -- unconfirmed, and tracked at #2584 rather
+        // than widened speculatively here.
+        Expr::Compare { op, left, right }
+            if needs_path_context(left)
+                || needs_path_context(right)
+                || crate::jq::walk::uses_cursor_metadata_builtins(left)
+                || crate::jq::walk::uses_cursor_metadata_builtins(right) =>
+        {
             eval_compare_generic::<S, V>(*op, left, right, value, optional, cursor)
         }
 
@@ -6557,7 +6593,7 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // eager bridge used to hand it `null + 10`. That is what admits
         // `Expr::Arithmetic` to `path_context_single_native`.
         //
-        // **Gated on `needs_path_context`, unlike the `Expr::Compare` arm
+        // **Gated on `needs_path_context`, like the `Expr::Compare` arm
         // above.** The eager bridge materializes the ambient value on its
         // way through, and for a #1194-malformed document (`{123: 1}`) that
         // materialization is the decode failure jq answers *every* query on
@@ -6568,9 +6604,9 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // arithmetic that reads no path context on the bridge, where it
         // still pays the ambient decode; arithmetic that does read path
         // context could not have been on a malformed document's root and
-        // survived the walk anyway. (`Expr::Compare`'s own arm already
-        // diverges here -- `1==1` on `{123: 1}` answers `true` -- which is a
-        // pre-existing gap, not one this arm widens.)
+        // survived the walk anyway. (`Expr::Compare`'s own arm carried
+        // exactly this gap -- `1==1` on `{123: 1}` answered `true` -- until
+        // #2581 gave it the same gate; see its comment above.)
         Expr::Arithmetic { left, right, .. }
             if needs_path_context(left) || needs_path_context(right) =>
         {
@@ -6617,8 +6653,8 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // evaluator a document re-rooted at this stage's input.
         //
         // **Gated on `needs_path_context`, for the same reason the
-        // `Expr::Arithmetic` arm above is** (and the `Expr::Compare` arm is
-        // not): the bridge's ambient materialization is what makes
+        // `Expr::Arithmetic` and `Expr::Compare` arms above are**: the
+        // bridge's ambient materialization is what makes
         // `try (1+1) catch "x"` fail on a #1194-malformed document, and
         // `test_try_catch_contains_a_genuinely_catchable_malformed_key_error_1812`
         // pins that. An `and`/`or` that reads no path context stays on the

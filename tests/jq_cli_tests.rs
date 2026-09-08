@@ -30859,13 +30859,53 @@ fn test_as_pattern_alternatives_retry_under_a_wrapping_consumer_1519() -> Result
         // span, matching `test_select_raises_on_decode_failure_instead_of_silently_truthy_1645`'s
         // shape) -- the already-decoded first item must survive as a
         // `Partial`, not be discarded by the second's bare error.
+        //
+        // #2581 moved the condition off `==`. With `Expr::Compare` now
+        // carrying the same `needs_path_context` gate as its
+        // `Arithmetic`/`And`/`Or` siblings, `$x == 1` reads no path
+        // context and so routes through the wildcard bridge, whose
+        // ambient materialization raises this document's decode failure
+        // before the `then` branch ever produces its item -- which is why
+        // the `==` spelling is pinned separately just below, at jq's own
+        // answer, rather than here. A bare truthiness test keeps the
+        // laziness this row is actually about.
+        (
+            &[
+                "-c",
+                r#"nth(0; 1 as $x ?// $y | (if $x then "ok" else .bad end))"#,
+            ],
+            Some(r#"{"bad": "\x"}"#),
+            "\"ok\"\n",
+            "jq: error (at <stdin>:0): invalid escape sequence in string",
+            5,
+        ),
+        // The `==` spelling of the row above, kept as its own case because
+        // #2581's gate changes what it does. **This row is a real jq 1.7.1
+        // capture and the row above is not** -- jq parses a document
+        // eagerly, so `{"bad": "\x"}` fails before any filter runs and
+        // *neither* spelling streams a prefix there:
+        //
+        // ```console
+        // $ printf '{"bad": "\x"}' | jq -c 'nth(0; 1 as $x ?// $y | (if $x == 1 then "ok" else .bad end))'
+        // jq: parse error: Invalid escape at line 1, column 12   # exit 5, empty stdout
+        // ```
+        //
+        // Before #2581 this row expected `"ok"` on stdout and was carried
+        // under this test's "every row is the real jq answer" header,
+        // which it never satisfied. succinctly now matches jq on stdout
+        // and exit code; the message text still differs, since the lazy
+        // index reports the failure at the span rather than as an
+        // up-front parse error. The prefix-streaming behaviour the old
+        // expectation encoded survives on the bare-truthiness row above,
+        // alongside its established sibling
+        // `test_array_iterate_lazy_limit_streams_confirmed_prefix_before_reaching_malformed_comma_1597`.
         (
             &[
                 "-c",
                 r#"nth(0; 1 as $x ?// $y | (if $x == 1 then "ok" else .bad end))"#,
             ],
             Some(r#"{"bad": "\x"}"#),
-            "\"ok\"\n",
+            "",
             "jq: error (at <stdin>:0): invalid escape sequence in string",
             5,
         ),
@@ -33083,6 +33123,84 @@ fn test_try_catch_contains_a_genuinely_catchable_malformed_key_error_1812() -> R
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr}");
     assert!(stdout.trim().is_empty(), "stdout: {stdout:?}");
     assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr}");
+
+    Ok(())
+}
+
+/// #2581: `Expr::Compare`'s native arm (`eval_compare_generic`) was the one
+/// member of its family left ungated, which the `Expr::Arithmetic`/
+/// `Expr::And`/`Expr::Or` arms' own comments named as a known, pre-existing
+/// exception ("`1==1` on `{123: 1}` answers `true` -- a pre-existing gap,
+/// not one this arm widens"). This test closes it: a comparison reading no
+/// path context now falls through to the wildcard bridge, whose ambient
+/// materialization surfaces the document-level decode failure that jq
+/// answers *every* query on such a document with.
+///
+/// Both shapes captured live against jq 1.7.1:
+///
+/// ```console
+/// $ printf '{123: 1}' | jq -c '1==1'
+/// jq: parse error: Object keys must be strings at line 1, column 5
+/// $ printf '{"a": {"bad": "\x"}, "b": 5}' | jq -c '.b == .b'
+/// jq: parse error: Invalid escape at line 1, column 18
+/// ```
+///
+/// succinctly's message text differs (the lazy index reports at the span,
+/// not as an up-front parse error) but the raise, the empty stdout and the
+/// exit code now match. `sort?` on the same documents already raised
+/// correctly before this fix, which is what confirmed the gap was specific
+/// to `Compare`'s own dispatch arm rather than an architectural limit.
+#[test]
+fn test_compare_raises_on_document_level_decode_failure_2581() -> Result<()> {
+    // #1194's malformed (non-string) object key.
+    for filter in ["1==1", r#"try (1==1) catch "x""#, "1 != 2", "1 < 2"] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("{123: 1}"))?;
+        assert_eq!(code, 5, "`{filter}` -- stdout: {stdout:?} stderr: {stderr}");
+        assert!(stdout.trim().is_empty(), "`{filter}` -- stdout: {stdout:?}");
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "`{filter}` -- stderr: {stderr}"
+        );
+    }
+
+    // #1746/#2173's invalid-escape shape, including a comparison whose
+    // operands do read the document but never reach the malformed region.
+    for filter in ["1==1", ".b == .b", ".b == 5"] {
+        let (stdout, stderr, code) =
+            run_jq_full(&["-c", filter], Some(r#"{"a": {"bad": "\x"}, "b": 5}"#))?;
+        assert_eq!(code, 5, "`{filter}` -- stdout: {stdout:?} stderr: {stderr}");
+        assert!(stdout.trim().is_empty(), "`{filter}` -- stdout: {stdout:?}");
+        assert!(
+            stderr.contains("invalid escape sequence"),
+            "`{filter}` -- stderr: {stderr}"
+        );
+    }
+
+    // Control: a well-formed document is untouched by the gate.
+    for (filter, want) in [
+        ("1==1", "true\n"),
+        (".b == 5", "true\n"),
+        (".b == .b", "true\n"),
+        ("1 < 2", "true\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a": 1, "b": 5}"#))?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (want, 0),
+            "`{filter}` -- stderr: {stderr}"
+        );
+    }
+
+    // Control: a comparison that *does* read path context keeps the native
+    // arm, so `key` still answers per-element rather than from a value the
+    // bridge re-rooted.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", r#"[.[] | key == "a"]"#], Some(r#"{"a":1,"b":2}"#))?;
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("[true,false]\n", 0),
+        "stderr: {stderr}"
+    );
 
     Ok(())
 }
