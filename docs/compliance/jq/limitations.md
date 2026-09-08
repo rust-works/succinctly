@@ -3109,11 +3109,11 @@ filter, so the reference *does* have a behaviour here and it is *reject*. Measur
 `scripts/jq-m2-streaming-sweep.sh` against the pinned binary — 19 rows, all of them a filter
 that reads nothing:
 
-| filter | document | jq 1.7.1 | eager route (before) | streaming route (now) |
-|---|---|---|---|---|
-| `1+1`, `try (1+1)`, `try (1+1) catch "x"` | `{123:1,"b":2}`, `{"a":1,"b"}`, `{"a":1, invalid}`, `{"a" 1, "b":2}`, `[1,,3]` | error | error — **matched jq** | `2` — **diverges** |
-| `1+1`, `try (1+1)`, `try (1+1) catch "x"` | `{"\ud800":1,"\ud800":2}` | error | error — **matched jq** | `2` — **diverges** |
-| `.,.` | `{"\ud800":1,"\ud800":2}` | error | error — **matched jq** | echoes twice — **diverges** |
+| filter                                    | document                                                                        | jq 1.7.1 | eager route (before)   | streaming route (now)      |
+|-------------------------------------------|---------------------------------------------------------------------------------|----------|------------------------|----------------------------|
+| `1+1`, `try (1+1)`, `try (1+1) catch "x"` | `{123:1,"b":2}`, `{"a":1,"b"}`, `{"a":1, invalid}`, `{"a" 1, "b":2}`, `[1,,3]` | error    | error — **matched jq** | `2` — **diverges**         |
+| `1+1`, `try (1+1)`, `try (1+1) catch "x"` | `{"\ud800":1,"\ud800":2}`                                                       | error    | error — **matched jq** | `2` — **diverges**         |
+| `.,.`                                     | `{"\ud800":1,"\ud800":2}`                                                       | error    | error — **matched jq** | echoes twice — **diverges** |
 
 Step 2 of ADR-0018's decision order therefore separates the two options and favours the
 behaviour being given up. No rule-4 condition applies — the output is readable, nothing is
@@ -3148,6 +3148,37 @@ answered at exit 0 on the eager route, as the matrix in 2 above records.)
 The context that makes the loss survivable is the one #2168's entry states: succinctly
 already diverges on this whole class of document through `.` itself, deliberately, and a
 user who wants jq's rejection has `--validate` and `succinctly json validate`.
+
+**The materializing flag routes still validate whatever the filter.** `-S`, `-a`, `-s`, `-C`
+and the `-n`/`input` bridge do not take the M2 route at all: `evaluate_input_streaming`
+materializes the whole input into an `OwnedValue` *before* evaluating, so on those routes
+`1+1` on `{123:1,"b":2}` still exits 5, exactly as it did before #2103, while the default
+route answers `2`. `-e` streams like the default but materializes each *output* to decide the
+exit status, so `-e '.,.'` on `{"\ud800":1,"\ud800":2}` still raises the collision where
+`-c '.,.'` echoes. Both are the rule applied to a route that materializes — the flag routes
+materialize the input, `-e` the outputs — not an exception to it, but they make the answer
+depend on a flag in the way this entry's point 2 objects to for filters, and by the same
+accident: those routes materialize the input because they always did, not because `-S '1+1'`
+needs it. Recorded here so the dependence is stated rather than discovered; moving those
+routes onto cursors so they too validate only what they read is
+[#2662](https://github.com/rust-works/succinctly/issues/2662).
+Pinned by `test_materializing_flag_routes_still_validate_2103`.
+
+**Two `first`/`limit` value spellings moved too, and belong to this same divergence.** On
+`[{"x":"\ud800"}]` — an element whose `.x` is a lone high surrogate, which jq rejects at
+parse time for every spelling — `first(map(.x) | .[])` and `limit(1; map(.x) | .[])` now echo
+the raw value at exit 0, where `main` raised. This is not a new decision: succinctly echoes a
+decode-failure value raw on navigation and validates only on materialization
+([`docs/plan/decode-failure-routing.md`](../../plan/decode-failure-routing.md)), so `.[].x`,
+`first(.[].x)` and the fused `map(.x) | .[]` already echoed this value at exit 0 on `main`
+and on `baa26d72e`, while `map(.x)` alone (which materializes the array) raised and still
+does. Only `first`/`limit` *wrapping* the fused stream used to fall to a materializing path —
+so `main` echoed `map(.x) | .[]` but raised `first(map(.x) | .[])` on the same document, the
+spelling-dependence #1629/#1642/#2168 exist to remove. Making them echo is the #2168 answer
+(diverge uniformly, not by spelling), the same one the `path`/`getpath` entry below took;
+restoring validation here would reintroduce the inconsistency. Pinned by
+`test_first_limit_echo_a_decode_failure_value_like_navigation_2103`, and covered in the
+sweep by the `[{"x":"\ud800"}]` document.
 
 **The spelling half.** The other job the eager bridge did was pick an undecodable key's
 spelling. No new spelling was introduced; the rule the #1642 entry above already states

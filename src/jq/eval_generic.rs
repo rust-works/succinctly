@@ -7352,8 +7352,8 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
 /// (see `LazyElem`'s own comment above for why that is deliberate here too).
 ///
 /// `OneCursorValue(V::Cursor, V)` has no [`GenericResult`] counterpart --
-/// it exists purely as a per-item optimization at one construction site,
-/// [`each_lazy_keys_iterate_sink`]'s `!sorted` arm. `DistinctKeyCursors`
+/// it exists purely as a per-item optimization whose pair originates at one
+/// site, [`each_lazy_keys_iterate_sink`]'s `!sorted` arm. `DistinctKeyCursors`
 /// already decodes each key's value as a side effect of walking (it needs
 /// it for duplicate-key hashing), so pairing that value with its cursor
 /// here lets [`continue_pipe_element_generic`] skip a second, identical
@@ -7373,8 +7373,10 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
 enum GenericItem<V: DocumentValue> {
     One(V),
     OneCursor(V::Cursor),
-    /// See the enum doc comment -- only ever constructed by
-    /// [`each_lazy_keys_iterate_sink`]'s streaming `keys_unsorted` arm.
+    /// See the enum doc comment -- built by [`each_lazy_keys_iterate_sink`]'s
+    /// streaming `keys_unsorted` arm, and re-paired from that arm's own
+    /// cursor and value by `eval_each_pipe_generic`'s empty-stages tail
+    /// (#2103); no other site decodes a value it could pair in for free.
     OneCursorValue(V::Cursor, V),
     Owned(OwnedValue),
     LazyKeys {
@@ -10740,7 +10742,9 @@ fn nth_with_n_generic<S: EvalSemantics, V: DocumentValue>(
 /// `OneCursorValue` gets its own arm rather than folding into the
 /// cursor-only one below: its value is always an already-decoded key
 /// string, the exact thing `each_lazy_keys_iterate_sink`'s `!sorted` arm
-/// (its one construction site, #1514/#1609) exists to avoid re-decoding.
+/// (where the pair originates, #1514/#1609; `eval_each_pipe_generic`'s
+/// empty-stages tail re-pairs that same value, #2103) exists to avoid
+/// re-decoding.
 /// Collapsing straight to `ManyCursor` would throw that decode away, only
 /// for `cursor_vec_to_generic_result`'s eventual `to_owned_cursor` to redo
 /// it later -- fine once for `first`/`last` (`generic_item_to_result`'s own

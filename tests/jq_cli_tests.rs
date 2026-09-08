@@ -3996,6 +3996,127 @@ fn test_root_forwarding_filters_stream_without_validating_2103() -> Result<()> {
     Ok(())
 }
 
+/// #2103 (code review): the decision that a filter validates only what it
+/// reads is a property of the M2 route, and the M2 route is not the only
+/// one. `-S`, `-a`, `-s`, `-C` and the `-n`/`input` bridge go through
+/// `evaluate_input_streaming`, which materializes the whole input into an
+/// `OwnedValue` *before* evaluating -- so on those routes `1+1` on a
+/// malformed document still exits 5, exactly as every route did before
+/// #2103, while the default route answers `2`. `-e` streams like the
+/// default but materializes each *output* to decide the exit status, so
+/// `-e '.,.'` on the colliding-key document still raises where `-c '.,.'`
+/// echoes. All of that is the recorded rule applied to a route that
+/// materializes; what this test pins is that the dependence on the flag
+/// exists and is stated (`docs/compliance/jq/limitations.md`, "The
+/// materializing flag routes still validate whatever the filter"), so a
+/// change to it -- in either direction -- is a deliberate one. Every
+/// exit-5 row here matches jq 1.7.1's own parse-time rejection; the
+/// exit-0 rows are the #2103 divergence. Tracked for a real fix by #2662.
+#[test]
+fn test_materializing_flag_routes_still_validate_2103() -> Result<()> {
+    let structural = r#"{123:1,"b":2}"#;
+    let colliding = r#"{"\ud800":1,"\ud800":2}"#;
+
+    for doc in [structural, colliding] {
+        for filter in ["1+1", r#"try (1+1) catch "x""#] {
+            // The default route: the #2103 divergence.
+            let (out, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
+            assert_eq!(
+                (out.as_str(), code),
+                ("2\n", 0),
+                "{filter} on {doc}: stderr {err}"
+            );
+
+            // The flag routes that materialize the input first still refuse.
+            for flags in [&["-Sc"][..], &["-ac"], &["-sc"], &["-Cc"]] {
+                let mut args = flags.to_vec();
+                args.push(filter);
+                let (out, err, code) = run_jq_full(&args, Some(doc))?;
+                assert_eq!(
+                    code, 5,
+                    "{flags:?} {filter} on {doc}: out {out:?} stderr {err}"
+                );
+                assert!(out.is_empty(), "{flags:?} {filter} on {doc}: out {out:?}");
+            }
+            let bridged = format!("input | {filter}");
+            let (out, err, code) = run_jq_full(&["-nc", &bridged], Some(doc))?;
+            assert_eq!(code, 5, "-n {bridged} on {doc}: out {out:?} stderr {err}");
+            assert!(out.is_empty(), "-n {bridged} on {doc}: out {out:?}");
+        }
+    }
+
+    // `-e` materializes the outputs, not the input: `1+1` answers, `.,.`
+    // (whose output *is* the colliding document) raises.
+    let (out, _, code) = run_jq_full(&["-ce", "1+1"], Some(colliding))?;
+    assert_eq!((out.as_str(), code), ("2\n", 0));
+    let (out, err, code) = run_jq_full(&["-ce", ".,."], Some(colliding))?;
+    assert_eq!(code, 5, "out {out:?} stderr {err}");
+    assert!(err.contains("ambiguous"), "stderr: {err}");
+    let (out, _, code) = run_jq_full(&["-c", ".,."], Some(colliding))?;
+    assert_eq!(code, 0, "control: the default route echoes, out {out:?}");
+
+    Ok(())
+}
+
+/// #2103 (code review, finding 1): the empty-pipe cursor fix (commit 1) and
+/// the gate deletion (commit 2) also moved two *value*-position spellings,
+/// not just the object-key `keys_unsorted[]` case commit 1 was filed for.
+/// On `[{"x":"\ud800"}]` -- an element whose `.x` is a lone high surrogate,
+/// which real jq rejects at parse time for *every* spelling -- `first(map(.x)
+/// | .[])` moved 5 -> 0 at commit 1 and `limit(1; map(.x) | .[])` at commit
+/// 2, both now echoing the raw source bytes at exit 0.
+///
+/// This is the same divergence the rest of #2103 records, reaching two more
+/// spellings, not a new one -- and restoring validation here would *undo*
+/// #2168's rule rather than uphold it. succinctly echoes a decode-failure
+/// value raw on navigation and degrades/raises only on materialization
+/// (`docs/plan/decode-failure-routing.md`); on this document `.[].x`,
+/// `first(.[].x)` and `map(.x) | .[]` already echoed at exit 0 on `main`
+/// and on `baa26d72e`, while `map(.x)` alone (which materializes the array)
+/// raised. Only `first`/`limit` *wrapping* the fused `map(.x) | .[]` stream
+/// used to fall to a materializing path and raise -- so `main` echoed
+/// `map(.x) | .[]` but raised `first(map(.x) | .[])` on one document, the
+/// exact spelling-dependence #1629/#1642/#2168 exist to remove. These rows
+/// make the two consistent with the navigation they wrap; the value is
+/// echoed byte-identically to `.[].x`.
+///
+/// Attribution verified by building `baa26d72e` (commit 1's parent) and
+/// `main` (`4b1ebba80`, which carries #965's key-decode rewrite): both raise
+/// `first(map(.x) | .[])`, so #965 is not the cause and the move is this
+/// PR's -- recorded rather than absorbed.
+#[test]
+fn test_first_limit_echo_a_decode_failure_value_like_navigation_2103() -> Result<()> {
+    let doc = r#"[{"x":"\ud800"}]"#;
+    let raw = "\"\\ud800\"\n";
+
+    // Controls, echoing on every binary since before this PR -- navigation
+    // to a decode-failure value emits it raw, it is not materialized.
+    for filter in [".[].x", "first(.[].x)", "map(.x) | .[]"] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!((out.as_str(), code), (raw, 0), "{filter}: stderr {err}");
+    }
+
+    // The two spellings this PR moved: `first`/`limit` over the fused
+    // `map(.x) | .[]` stream now echo the same value, instead of raising.
+    for filter in ["first(map(.x) | .[])", "limit(1; map(.x) | .[])"] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!((out.as_str(), code), (raw, 0), "{filter}: stderr {err}");
+    }
+
+    // `map(.x)` alone still materializes the array and so still validates --
+    // unchanged, and the boundary that keeps this a navigation rule, not a
+    // blanket "never validate a value" one.
+    let (out, _err, code) = run_jq_full(&["-c", "map(.x)"], Some(doc))?;
+    assert_eq!(code, 5, "map(.x) must still raise: out {out:?}");
+    assert!(out.is_empty());
+
+    // The invalid-escape value variant echoes raw the same way.
+    let (out, err, code) = run_jq_full(&["-c", "first(map(.x) | .[])"], Some(r#"[{"x":"a\q"}]"#))?;
+    assert_eq!((out.as_str(), code), ("\"a\\q\"\n", 0), "stderr {err}");
+
+    Ok(())
+}
+
 /// #1813: `colliding_display_key_error` (#1642) is built via
 /// `EvalError::decode_failure`, whose contract says the result "must never
 /// be suppressed by `?` or caught by `try`/`catch`" -- but `is_decode_failure`
