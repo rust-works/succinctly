@@ -28306,13 +28306,62 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                     let at_register = register_identical(&step_reg.value, &state, state_snapshot);
                     (step_reg, at_register)
                 }
+                // #2161: `state_at_register` cannot come from the previous
+                // step's `branch_provenance`, which answers "did the last
+                // UPDATE branch end *at* the register's own path". The
+                // register is fixed for the whole fold and UPDATE almost
+                // always navigates away from it, so that answer is `false`
+                // from step 2 onward and every later step refuses its own
+                // navigation as untracked -- even though real jq re-enters
+                // each step from the register, not from the previous step's
+                // result.
+                //
+                // The register's own doc comment already states the model
+                // ("fixed once per INIT fork -- never advances across
+                // source-element iterations"): what decides a step is jq's
+                // `jv_identical(current_input, value_at_path)`, i.e. whether
+                // the accumulator coming into this step is still the
+                // register's own value. That is exactly the check the
+                // `Some(path)` arm above already performs via
+                // `register_identical`, and it is the missing *second* way
+                // a step can be at the register.
+                //
+                // It has to be an `||` rather than a replacement, because
+                // neither answer subsumes the other. `register_identical`
+                // demands `snapshot || Null | Bool` -- structural equality
+                // is not jq's pointer identity, so a container counts only
+                // when it is known to be the frozen node itself. So it
+                // answers `false` for step 1 of an object-valued register,
+                // where the carried `init_branch.trackable` is the correct
+                // `true`; and the carried provenance answers `false` from
+                // step 2 onward, where the identity check is the correct
+                // `true` for a `null`/`bool` accumulator. Dropping either
+                // half regresses one of the two shapes below.
+                //
+                // Live against jq 1.7.1, on `{"a":1}`:
+                //
+                // ```console
+                // $ jq -c 'path(foreach (1,2,3) as $k (.b; .a))'
+                // ["b","a"]
+                // ["b","a"]
+                // ["b","a"]
+                // ```
+                //
+                // and on `{"a":1,"b":{"a":{"a":9}}}` the same filter emits
+                // `["b","a"]` once and then raises "attempt to access
+                // element \"a\" of {\"a\":9}" -- the accumulator has stopped
+                // being the register's value, so step 2 is genuinely
+                // untracked. Both fall out of the identity check; neither
+                // falls out of the path comparison.
                 None => (
                     FoldRegister {
                         path: Rc::clone(&reg.path),
                         value: reg.value.clone(),
                         trackable: reg.trackable,
                     },
-                    state_at_register,
+                    state_at_register
+                        || (reg.trackable
+                            && register_identical(&reg.value, &state, state_snapshot)),
                 ),
             };
             let update_branches = match active_reg.resolve::<S>(

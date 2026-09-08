@@ -37675,6 +37675,106 @@ fn test_foreach_source_navigation_clobbers_register_2031() -> Result<()> {
     Ok(())
 }
 
+/// #2161: the fold register is fixed for the whole fold ("never advances
+/// across source-element iterations" -- see `register_identical`'s own doc
+/// comment), so every step re-enters UPDATE *from the register*, not from
+/// the previous step's result. `resolve_foreach` carried the next step's
+/// `at_register` from `FoldRegister::branch_provenance`, which answers "did
+/// the last UPDATE branch end at the register's own path" -- almost always
+/// `false`, since UPDATE's whole job is to navigate away from it. So step 1
+/// resolved and every later step refused its own identical navigation as
+/// untracked.
+///
+/// jq's actual rule is `jv_identical(current_input, value_at_path)`: a step
+/// is at the register when the accumulator coming into it is still the
+/// register's value. Both shapes below are live jq 1.7.1 captures, and they
+/// are what pins the fix to an `||` of the two checks rather than a swap --
+/// the first needs the identity half (a `null` accumulator keeps re-entering
+/// the register), the second needs the carried half (step 1 of an
+/// object-valued register, which structural equality alone will not accept
+/// as jq's pointer identity).
+#[test]
+fn test_foreach_reenters_register_every_step_not_just_the_first_2161() -> Result<()> {
+    // `.b` is absent, so the accumulator stays `null` -- identical to the
+    // register's own value at every step, so all three steps navigate.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(foreach (1,2,3) as $k (.b; .a))"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("[\"b\",\"a\"]\n[\"b\",\"a\"]\n[\"b\",\"a\"]\n", 0),
+        "stderr: {stderr:?}"
+    );
+
+    // A deeper UPDATE repeats the same way.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(foreach (1,2) as $k (.b; .a.c))"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("[\"b\",\"a\",\"c\"]\n[\"b\",\"a\",\"c\"]\n", 0),
+        "stderr: {stderr:?}"
+    );
+
+    // The counterpart that must still raise: once the accumulator stops
+    // being the register's value, the step is genuinely untracked. jq emits
+    // the first path, then raises naming the *accumulator*, not the
+    // register.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(foreach (1,2,3) as $k (.b; .a))"],
+        Some(r#"{"a":1,"b":{"a":{"a":9}}}"#),
+    )?;
+    assert_eq!(stdout, "[\"b\",\"a\"]\n", "stderr: {stderr:?}");
+    assert!(
+        stderr.contains(r#"attempt to access element "a" of {"a":9}"#),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+
+    // Same shape one level deeper, to pin that the raise names the step's
+    // own input rather than anything about the register.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(foreach (1,2,3) as $k (.b; .a.a))"],
+        Some(r#"{"a":1,"b":{"a":{"a":9}}}"#),
+    )?;
+    assert_eq!(stdout, "[\"b\",\"a\",\"a\"]\n", "stderr: {stderr:?}");
+    assert!(
+        stderr.contains(r#"attempt to access element "a" of 9"#),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+
+    // A non-navigating UPDATE leaves the accumulator *at* the register, so
+    // the carried-provenance half keeps answering `true` -- three plain
+    // `["b"]`, no raise, even though the value is an object.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(foreach (1,2,3) as $k (.b; .))"],
+        Some(r#"{"a":1,"b":{"a":{"a":9}}}"#),
+    )?;
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("[\"b\"]\n[\"b\"]\n[\"b\"]\n", 0),
+        "stderr: {stderr:?}"
+    );
+
+    // INIT navigating to the document root behaves the same way: step 1
+    // tracks, step 2's accumulator (`1`) is no longer the register.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(foreach (1,2) as $k (.; .a))"],
+        Some(r#"{"a":1,"b":{"a":{"a":9}}}"#),
+    )?;
+    assert_eq!(stdout, "[\"a\"]\n", "stderr: {stderr:?}");
+    assert!(
+        stderr.contains(r#"attempt to access element "a" of 1"#),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+
+    Ok(())
+}
+
 /// #2031's mixed-source variant: a source with *some* trackable branches
 /// and some untracked ones must still stream every branch before the
 /// trackable one, exactly as an all-untracked source already did (#1872) --
