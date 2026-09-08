@@ -30652,6 +30652,115 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
             "AACCjq: error (at <unknown>): number (0) and boolean (true) cannot be added",
             5,
         ),
+        // ---- closed by #2180 WP2b ----
+        // `each_if`'s `cond`, `each_as`/`each_as_pattern`'s bound source, and
+        // the new `Select`/`Negate`/`IndexExpr`(key)/`StringInterpolation`/
+        // `Object` arms all now drive through `eval_each`/`eval_each_generic`
+        // instead of collecting first, so a wrapping consumer's stop reaches
+        // the trailing side effect the same way it already does for `//`/
+        // `and`/`or`. Every row captured live against jq 1.7.1.
+        //
+        // `if`'s condition: the truthy first output already satisfies
+        // `first` via the taken branch, so `cond`'s own second output is
+        // never explored.
+        (
+            &["-cn", r#"first(if (true, ("B"|stderr)) then 1 else 2 end)"#],
+            None,
+            "1\n",
+            "",
+            0,
+        ),
+        // `as`'s bound source: same shape, one level removed -- `first` is
+        // satisfied by the first bound value's `body`, so the source's own
+        // second output is never pulled.
+        (
+            &["-cn", r#"first((1, ("B"|stderr)) as $v | $v)"#],
+            None,
+            "1\n",
+            "",
+            0,
+        ),
+        // `select`'s condition, likewise.
+        (
+            &["-cn", r#"first(select((true, ("B"|stderr))))"#],
+            None,
+            "null\n",
+            "",
+            0,
+        ),
+        // Unary minus's operand.
+        (
+            &["-cn", r#"first(-((1, ("B"|stderr))))"#],
+            None,
+            "-1\n",
+            "",
+            0,
+        ),
+        // An index key: the first key already satisfies `first`, so a
+        // second key generated after it is never reached.
+        (
+            &["-c", r#"first(.[(0, ("B"|stderr))])"#],
+            Some("[1,2,3]"),
+            "1\n",
+            "",
+            0,
+        ),
+        // A string-interpolation slot.
+        (
+            &["-cn", r#"first("\((1,("B"|stderr)))")"#],
+            None,
+            "\"1\"\n",
+            "",
+            0,
+        ),
+        // An object value slot, demanded field only: `first` is satisfied by
+        // the entry's first value, so a second value generated after it is
+        // never reached.
+        (
+            &["-cn", r#"first({a:(1,("B"|stderr))} | .a)"#],
+            None,
+            "1\n",
+            "",
+            0,
+        ),
+        // The over-stopping trap for `Object`: `.a` is the only field read,
+        // but object construction cannot deliver *any* combination until
+        // every entry (including `b`, key-encloses-value, entries recurse
+        // left to right) has produced its own first value -- `b`'s side
+        // effect genuinely fires even though `b` itself is never read.
+        (
+            &["-cn", r#"first({a:1, b:(("B"|stderr), 2)} | .a)"#],
+            None,
+            "1\n",
+            "B",
+            0,
+        ),
+        // A computed object *key*'s own side effect, for the same reason.
+        (
+            &["-cn", r#"first({(("k"|stderr),"other"): 1} | .k)"#],
+            None,
+            "1\n",
+            "k",
+            0,
+        ),
+        // The destructive `input` probes, pinning *values* rather than I/O
+        // ordering: an eagerly-collected bind source/object slot would have
+        // eaten `"a"` from the process-global queue, leaving the trailing
+        // `input` to answer `"b"`.
+        (
+            &["-cn", r"[first((1, input) as $v | $v), input]"],
+            Some(r#""a" "b""#),
+            "[1,\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            &["-cn", r"[first({a:(1, input)} | .a), input]"],
+            Some(r#""a" "b""#),
+            "[1,\"a\"]\n",
+            "",
+            0,
+        ),
     ];
 
     for (args, stdin, want_out, want_err, want_code) in cases {
@@ -31898,80 +32007,108 @@ fn test_nested_short_circuit_consumer_hides_the_stop_2180() -> Result<()> {
             "[true]",
             "matches jq -- a truthy left short-circuits `or` the same way",
         ),
-        // ==== WP2b: eager sub-expression sites ====
-        // `each_if`'s `cond`, `each_as`/`each_as_pattern`'s bound source,
-        // and new arms for `Select`, `Negate`, `IndexExpr` (key),
-        // `StringInterpolation`, `Object` (values) -- mechanical once
-        // WP1/WP2a set the pattern. `range`'s bound is generic-route-only
-        // (see the control row below): `eval.rs` already has `each_range`,
-        // the generic twin was never mirrored, so `isempty(...)` (which
-        // bridges to `eval.rs`) already matches while `first(...)` (native
-        // generic route) does not.
+        // ==== WP2b: eager sub-expression sites -- CLOSED ====
+        // `each_if`'s `cond` and `each_as`/`each_as_pattern`'s bound source
+        // now drive through `eval_each`/`eval_each_generic` (via
+        // `fanout_arg_each`/`fanout_arg_each_generic`, the same
+        // demand-forwarding argument fan-out `nth`'s own `n` already used)
+        // instead of being collected first. New arms: `Builtin::Select`
+        // (native, cursor-preserving in both files -- `select` never
+        // changes position), `Expr::Negate` (the generic side bridges the
+        // non-path-context case, leaving the existing
+        // `needs_path_context`-gated native arm untouched), `Expr::IndexExpr`
+        // (key only, jq mode only -- see `eval::each_index_expr`'s own doc
+        // comment for why yq mode's retroactive discard-on-later-escape rule
+        // keeps the pre-existing eager fallback), `Expr::StringInterpolation`
+        // (jq mode only, bridged -- yq mode isn't a fan-out generator at
+        // all) and `Expr::Object` (native in both files, mirroring
+        // `build_object_entries`'s own entries-recurse/key-encloses-value
+        // nesting). `eval_each_generic` also gained an `Expr::Range` arm
+        // (bridged), mirroring `eval.rs`'s own `each_range` (#1556) -- the
+        // one construct the two arm sets had already drifted on, which is
+        // why the `isempty(range(...))` row below already matched jq before
+        // this group closed while `first(range(...))` didn't.
         (
             format!("[first(if ({G}) then 5 else 6 end)]"),
-            "[5]",
-            "jq: [5,5]",
+            "[5,5]",
+            "matches jq",
         ),
         (
             format!("[isempty(if ({G}) then 5 else 6 end)]"),
-            "[false]",
-            "jq: [false,false]",
+            "[false,false]",
+            "matches jq",
         ),
-        (format!("[first(({G}) as $v | $v)]"), "[1]", "jq: [1,1]"),
+        (
+            format!("[first(({G}) as $v | $v)]"),
+            "[1,1]",
+            "matches jq",
+        ),
         (
             format!("[isempty(({G}) as $v | $v)]"),
-            "[false]",
-            "jq: [false,false]",
+            "[false,false]",
+            "matches jq",
         ),
         (
             format!("[first(({G}) as [$a] ?// $a | $a)]"),
-            "[1]",
-            "jq: [1,1]",
+            "[1,1]",
+            "matches jq",
         ),
         (
             format!("[isempty(({G}) as [$a] ?// $a | $a)]"),
-            "[false]",
-            "jq: [false,false]",
+            "[false,false]",
+            "matches jq",
         ),
-        (format!("[first(select(({G}) == 1))]"), "[1]", "jq: [1,1]"),
+        (
+            format!("[first(select(({G}) == 1))]"),
+            "[1,1]",
+            "matches jq",
+        ),
         (
             format!("[isempty(select(({G}) == 1))]"),
-            "[false]",
-            "jq: [false,false]",
+            "[false,false]",
+            "matches jq",
         ),
-        (format!("[first(-({G}))]"), "[-1]", "jq: [-1,-1]"),
-        (format!("[isempty(-({G}))]"), "[false]", "jq: [false,false]"),
-        (format!("[1] | [first(.[({G})-1])]"), "[1]", "jq: [1,1]"),
+        (format!("[first(-({G}))]"), "[-1,-1]", "matches jq"),
+        (
+            format!("[isempty(-({G}))]"),
+            "[false,false]",
+            "matches jq",
+        ),
+        (format!("[1] | [first(.[({G})-1])]"), "[1,1]", "matches jq"),
         (
             format!("[1] | [isempty(.[({G})-1])]"),
-            "[false]",
-            "jq: [false,false]",
+            "[false,false]",
+            "matches jq",
         ),
         (
             format!("[first(\"\\({G})\")]"),
-            "[\"1\"]",
-            "jq: [\"1\",\"1\"]",
+            "[\"1\",\"1\"]",
+            "matches jq",
         ),
         (
             format!("[isempty(\"\\({G})\")]"),
-            "[false]",
-            "jq: [false,false]",
+            "[false,false]",
+            "matches jq",
         ),
-        (format!("[first({{a:({G})}} | .a)]"), "[1]", "jq: [1,1]"),
+        (
+            format!("[first({{a:({G})}} | .a)]"),
+            "[1,1]",
+            "matches jq",
+        ),
         (
             format!("[isempty({{a:({G})}} | .a)]"),
-            "[false]",
-            "jq: [false,false]",
+            "[false,false]",
+            "matches jq",
         ),
-        (format!("[first(range(({G}); 3))]"), "[1]", "jq: [1,1]"),
         (
-            // Generic-route-only divergence: `isempty(...)` bridges to
-            // `eval.rs`'s own `each_range`, which already forwards demand,
-            // so this row is a control, not part of WP2b's residual.
+            format!("[first(range(({G}); 3))]"),
+            "[1,1]",
+            "matches jq",
+        ),
+        (
             format!("[isempty(range(({G}); 3))]"),
             "[false,false]",
-            "matches jq -- eval.rs's each_range already forwards demand; \
-             only the eval_generic.rs twin is missing (see WP2b)",
+            "matches jq",
         ),
         // ==== WP3: foreach ====
         // The only genuinely new mechanism -- `each_foreach`'s sink `Stop`

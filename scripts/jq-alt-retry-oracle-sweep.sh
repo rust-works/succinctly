@@ -124,16 +124,22 @@ W_ENTRIES=(
   'and-right::::true and (__G__)'
   'or-left::::(__G__) or false'
   'or-right::::false or (__G__)'
-  # -- WP2b: eager sub-expression sites --
-  'if-cond::WP2b::if (__G__) then 5 else 6 end'
-  'as-source::WP2b::(__G__) as $v | $v'
-  'as-pattern-source::WP2b::(__G__) as [$a] ?// $a | $a'
-  'select-arg::WP2b::select((__G__) == 1)'
-  'negate::WP2b::-(__G__)'
-  'index-key::WP2b::([1]) as $arr | $arr[(__G__)-1]'
-  'string-interp::WP2b::"\(__G__)"'
-  'object-value::WP2b::{a:(__G__)} | .a'
-  'range-bound::WP2b::range((__G__); 3)'
+  # -- WP2b: CLOSED. each_if/each_as/each_as_pattern (+ generic twins) now
+  #    drive cond/the bound source through eval_each; Select, Negate,
+  #    IndexExpr (key), StringInterpolation and Object all gained
+  #    demand-forwarding arms in both files, and eval_each_generic gained
+  #    the Range arm eval.rs's each_range already had (#1556) -- so these
+  #    rows must match jq now and any divergence here is unexpected by
+  #    definition. --
+  'if-cond::::if (__G__) then 5 else 6 end'
+  'as-source::::(__G__) as $v | $v'
+  'as-pattern-source::::(__G__) as [$a] ?// $a | $a'
+  'select-arg::::select((__G__) == 1)'
+  'negate::::-(__G__)'
+  'index-key::::([1]) as $arr | $arr[(__G__)-1]'
+  'string-interp::::"\(__G__)"'
+  'object-value::::{a:(__G__)} | .a'
+  'range-bound::::range((__G__); 3)'
   # -- WP3: foreach (source position; the pattern-position row is pinned
   #    directly as a CLI test, see the header note above) --
   'foreach-source::WP3::foreach (__G__) as $v (0; .+$v; .)'

@@ -6530,6 +6530,11 @@ fn each_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut escape: Option<Control> = None;
     let flow = eval_each::<W, S>(key, value.clone(), false, &mut |item| {
         let k = match item {
+            // STYLE-0012: this materializes the *key* generator's output,
+            // evaluated with a hardcoded `optional: false` in the `eval_each`
+            // call above -- `.[k]?` suppresses only its own final index step,
+            // never an error raised while computing `k`. Same exemption, same
+            // reason, as `eval_index_expr`'s own `Item::Borrowed` arm.
             Item::Borrowed(v) => match to_owned_key_shape(&v) {
                 Ok(k) => k,
                 Err(e) => {
@@ -48470,6 +48475,87 @@ mod tests {
             (b"null", "[true and (1 as $x ?// $y | 1)]"),
             (b"null", "[(1 as $x ?// $y | 1) or false]"),
             (b"null", "[false or (1 as $x ?// $y | 1)]"),
+            // #2180 WP2b: `each_if`'s `cond` and `each_as`/`each_as_pattern`'s
+            // bound source now drive through `eval_each` too, and `Select`,
+            // `Negate`, `IndexExpr` (key), `StringInterpolation` and `Object`
+            // gained native lazy arms of their own. This differential is
+            // what guards every one of them against drifting from the eager
+            // sibling it now shadows -- `eval_if`, `eval_as`/
+            // `eval_as_pattern`, `builtin_select`, `eval_negate`,
+            // `eval_index_expr`, `eval_string_interpolation`,
+            // `eval_object_construction`. Every case is side-effect free, so
+            // an always-`Continue` sink must deliver identical values in
+            // identical order.
+            //
+            // `if`'s condition: multi-output, `empty`, error-after-prefix,
+            // `break`, and a `?//` chain sitting in `cond` itself.
+            (b"null", "if (true, false) then 1 else 2 end"),
+            (b"null", "if empty then 1 else 2 end"),
+            (b"null", "if (true, error(\"x\")) then 1 else 2 end"),
+            (b"null", "label $o | if (true, break $o) then 1 else 2 end"),
+            (b"null", "if (1 as $x ?// $y | true) then 5 else 6 end"),
+            // `as`'s bound source: multi-output, `empty`, error-after-prefix,
+            // `break`, and a `?//` chain in the *source* itself -- the row
+            // this arm's own fix is about.
+            (b"null", "(1, 2) as $v | $v"),
+            (b"null", "empty as $v | $v"),
+            (b"null", "(1, error(\"x\")) as $v | $v"),
+            (b"null", "label $o | (1, break $o) as $v | $v"),
+            (b"null", "(1 as $x ?// $y | 5) as $v | $v"),
+            // `as-pattern`'s bound source, same shapes.
+            (b"null", "([1], [2]) as [$a] | $a"),
+            (b"null", "label $o | ([1], break $o) as [$a] | $a"),
+            (b"null", "(1 as $x ?// $y | [5]) as [$a] ?// $a | $a"),
+            // `select`'s condition: multiple truthy bits, `empty` (no bit at
+            // all), error-after-prefix, `break`, and a `?//` chain.
+            (b"1", "select(true, true)"),
+            (b"1", "select(empty)"),
+            (b"1", "select(true, error(\"x\"))"),
+            (b"1", "label $o | select(true, break $o)"),
+            (b"1", "select(1 as $x ?// $y | true)"),
+            // Unary minus's operand: multi-output, `empty`, an operand-type
+            // error after a successfully negated prefix, error-after-prefix
+            // from the operand's own generator, `break`, and a `?//` chain.
+            (b"null", "-(1, 2)"),
+            (b"null", "-(empty)"),
+            (b"null", "-(1, \"a\")"),
+            (b"null", "-(1, error(\"x\"))"),
+            (b"null", "label $o | -(1, break $o)"),
+            (b"null", "-(1 as $x ?// $y | 1)"),
+            // An index key: multiple keys, `empty` (target never evaluated),
+            // error-after-prefix, `break`, and a `?//` chain.
+            (b"[10,20,30]", ".[(0, 1)]"),
+            (b"[10,20]", ".[(empty)]"),
+            (b"[10,20]", ".[(0, error(\"x\"))]"),
+            (b"[10,20]", "label $o | .[(0, break $o)]"),
+            (b"[10]", ".[(1 as $x ?// $y | 1)-1]"),
+            // A string-interpolation slot: multiple parts (nesting order
+            // pinned live against jq 1.7.1, `build_string_parts`'s own doc
+            // comment), `empty`, error-after-prefix, `break`, and a `?//`
+            // chain.
+            (b"null", "\"\\(1,2)-\\(3,4)\""),
+            (b"null", "\"\\(empty)\""),
+            (b"null", r#""\(1,error("x"))""#),
+            (b"null", "label $o | \"\\(1, break $o)\""),
+            (b"null", "\"\\(1 as $x ?// $y | 1)\""),
+            // Object construction: multiple entries (nesting order pinned
+            // live against jq 1.7.1, `build_object_entries`'s own doc
+            // comment: entries recurse, key encloses value, last entry
+            // varies fastest), a multi-output key, `empty` in a value
+            // (short-circuits every entry to its right), error-after-prefix
+            // in a value, `break` in a value, and a `?//` chain in a value.
+            (b"null", "{a:(1,2), b:(3,4)}"),
+            (b"null", "{(\"a\",\"b\"): 1}"),
+            (b"null", "{a:empty, b:error(\"unreached\")}"),
+            (b"null", "{a:(1, error(\"x\"))}"),
+            (b"null", "label $o | {a:(1, break $o)}"),
+            (b"null", "{a:(1 as $x ?// $y | 1)}"),
+            // Nested inside each other and inside the other lazy arms, so
+            // every new arm is reached indirectly too.
+            (b"[1,2,3]", "[first(select((.[] > 1)))]"),
+            (b"null", "if true then -(1, 2) else 9 end"),
+            (b"null", "try ((1, error(\"x\")) as $v | $v) catch 9"),
+            (b"null", "[isempty({a:(1,2)} | .a)]"),
         ];
 
         for (json, src) in cases {
