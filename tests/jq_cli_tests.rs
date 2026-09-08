@@ -265,31 +265,6 @@ fn spawn_jq_with_env(
     )
 }
 
-/// `run_jq_full`'s own env-setting sibling (#2103): forcing
-/// `SUCCINCTLY_JQ_M2_EVAL=stream`/`eager` to pin which evaluator answers a
-/// query needs a `Command` that both sets environment variables (like
-/// `spawn_jq_with_env`) and decodes stdout/stderr to `String` (like
-/// `run_jq_full`) -- neither existing helper does both, and `spawn_jq_with_env`
-/// only takes one variable. Modelled directly on `spawn_jq`'s own `Command`
-/// construction, `.envs(...)` swapped in for the (absent) single `.env(...)`.
-fn run_jq_full_env(
-    env: &[(&str, &str)],
-    args: &[&str],
-    input: Option<&str>,
-) -> Result<(String, String, i32)> {
-    let (output, exit_code) = spawn_with_signal_retry(
-        || {
-            let mut command = Command::new(succinctly_bin());
-            command.arg("jq").args(args).envs(env.iter().copied());
-            command
-        },
-        input.map(str::as_bytes),
-    )?;
-    let stdout = String::from_utf8(output.stdout)?;
-    let stderr = String::from_utf8(output.stderr)?;
-    Ok((stdout, stderr, exit_code))
-}
-
 /// Helper to run jq with null input (-n)
 fn run_jq_null(filter: &str, extra_args: &[&str]) -> Result<(String, i32)> {
     let mut args: Vec<&str> = vec!["-n"];
@@ -3851,22 +3826,14 @@ fn test_materializing_route_raises_on_colliding_decode_failure_keys_1642() -> Re
 /// whole point of streaming), so what comes back out is whatever the
 /// source bytes were.
 ///
-/// Checked two ways per case so this can't pass by both routes
-/// independently landing on the same wrong answer: against the literal
-/// expected raw stdout, and against the eager route's own output for the
-/// same (document, filter), captured in this same test via
-/// `SUCCINCTLY_JQ_M2_EVAL=eager` (`run_jq_full_env`, new for #2103 --
-/// `run_jq_full` has no way to set an environment variable, and
-/// `spawn_jq_with_env` only takes one).
-///
 /// `limit(2; keys_unsorted[])` is included alongside the bare `.[]` form
 /// since it exercises the same `rest == []` arm through a different
-/// consumer. Its *eager* twin is not a usable cross-check: the eager route
-/// materializes `limit`'s results through `standard_json_to_jq_value`,
-/// which decodes the key and raises -- the "`limit(1; keys_unsorted[])`
-/// decodes" inconsistency the issue's first comment recorded, and the
-/// reason the eager M2 route is retired rather than kept (#2103). So the
-/// eager cross-check below covers the bare `keys_unsorted[]` case only.
+/// consumer.
+///
+/// This used to also cross-check against the eager route via
+/// `SUCCINCTLY_JQ_M2_EVAL=eager` (`run_jq_full_env`); that route and the env
+/// var were deleted once #2103's phase 3 made streaming the only M2 route,
+/// so this now just pins the shipped output through `run_jq_full`.
 #[test]
 fn test_streaming_keys_unsorted_iterate_echoes_undecodable_key_raw_2103() -> Result<()> {
     let cases = [
@@ -3876,39 +3843,20 @@ fn test_streaming_keys_unsorted_iterate_echoes_undecodable_key_raw_2103() -> Res
 
     for (doc, expected) in cases {
         for filter in ["keys_unsorted[]", "limit(2; keys_unsorted[])"] {
-            let (stream_out, stream_err, stream_code) =
-                run_jq_full_env(&[("SUCCINCTLY_JQ_M2_EVAL", "stream")], &[filter], Some(doc))?;
+            let (out, err, code) = run_jq_full(&[filter], Some(doc))?;
             assert_eq!(
-                stream_code, 0,
-                "doc {doc:?}, filter {filter:?}: streaming should not raise, stderr: {stream_err}"
+                code, 0,
+                "doc {doc:?}, filter {filter:?}: should not raise, stderr: {err}"
             );
             assert!(
-                stream_err.is_empty(),
-                "doc {doc:?}, filter {filter:?}: streaming stderr should be empty, got: {stream_err}"
+                err.is_empty(),
+                "doc {doc:?}, filter {filter:?}: stderr should be empty, got: {err}"
             );
             assert_eq!(
-                stream_out, expected,
-                "doc {doc:?}, filter {filter:?}: streaming should echo the raw source spelling"
+                out, expected,
+                "doc {doc:?}, filter {filter:?}: should echo the raw source spelling"
             );
         }
-
-        // Eager cross-check for the un-limited case: this is the route
-        // that already got it right, so it's the strongest available
-        // confirmation that "raw spelling" is correct here, not an
-        // artefact of this test's own expectations.
-        let (eager_out, eager_err, eager_code) = run_jq_full_env(
-            &[("SUCCINCTLY_JQ_M2_EVAL", "eager")],
-            &["keys_unsorted[]"],
-            Some(doc),
-        )?;
-        assert_eq!(
-            eager_code, 0,
-            "doc {doc:?}: eager keys_unsorted[] should succeed, stderr: {eager_err}"
-        );
-        assert_eq!(
-            eager_out, expected,
-            "doc {doc:?}: eager and streaming must agree on the raw spelling"
-        );
     }
 
     Ok(())
@@ -6770,9 +6718,9 @@ fn test_computed_index_target_error_after_pending_halt_still_streams_prefix() ->
 fn test_693_optional_around_stream_stops_at_the_first_error() -> Result<()> {
     // The `jq`/`yq` CLIs' default path evaluates through `eval_generic`'s
     // native cursor-based evaluator (`jq_runner.rs`'s `evaluate_input`/
-    // `evaluate_bytes_lazy`), not the `eval.rs`-level `eval()` API directly
-    // — so a fix that only touched `eval.rs` would leave this reachable
-    // through the shipped binary. Verified against jq 1.7.1: `jq -n '[1,2,3]
+    // `evaluate_bytes_streaming`), not the `eval.rs`-level `eval()` API
+    // directly — so a fix that only touched `eval.rs` would leave this
+    // reachable through the shipped binary. Verified against jq 1.7.1: `jq -n '[1,2,3]
     // | (.[] | if .==2 then error("boom") else . end)?'` prints only `1`.
     // Pre-#693 this codebase's binary printed `1` and `3` (the masked error
     // at the second element self-suppressed instead of stopping the
@@ -11498,7 +11446,7 @@ fn test_lazyseq_map_halt_propagates_through_evaluate_input_sort_keys_path() -> R
     // engine: `LazyKeys | map(f)` stays lazy instead of materializing
     // eagerly), and `-S` (sort_keys) forces `can_use_lazy_path` false,
     // routing evaluation through `evaluate_input` instead of
-    // `evaluate_bytes_lazy`. Verified against jq 1.7.1: `jq -S
+    // `evaluate_bytes_streaming`. Verified against jq 1.7.1: `jq -S
     // 'keys_unsorted | map(if . == "a" then halt_error(3) else . end)'` on
     // `{"a":1,"b":2}` exits 3 with no stdout and stderr `a` (the halted
     // value, a string, printed raw).
@@ -11520,9 +11468,9 @@ fn test_lazyseq_map_halt_propagates_through_default_lazy_path() -> Result<()> {
     // `generic_result_to_jq_values`'s `GenericResult::LazySeq(seq) => match
     // seq.materialize_atomic() { ... Err(jq::Control::Halt(code)) =>
     // sink.request_halt(code) ... }` arm (jq_runner.rs) is reached from the
-    // *default* lazy-bytes CLI path (`evaluate_bytes_lazy`, used for plain
-    // stdin/file input with none of -S/-s/-R/--color-output/--ascii-output/
-    // --input-dsv set) -- a distinct site from `evaluate_input`'s own copy
+    // *default* streaming-bytes CLI path (`evaluate_bytes_streaming`, used
+    // for plain stdin/file input with none of -S/-s/-R/--color-output/
+    // --ascii-output/--input-dsv set) -- a distinct site from `evaluate_input`'s own copy
     // of this match (tested above), since the two functions build the
     // `JqValue`/`OwnedValue` output representations independently.
     // Verified against jq 1.7.1: `jq 'keys_unsorted | map(if . == "a" then
@@ -23205,9 +23153,10 @@ fn test_jq_computed_float_scientific_notation_tostring_2456() -> Result<()> {
 
 /// #2543: `--null-input` (`-n`) mode's own top-level evaluation entry point
 /// (`evaluate_input_streaming`, always the sink-based/streaming evaluator --
-/// unlike file/piped input, which can pick the eager evaluator instead)
-/// reached a *different* bug than #2456 fixed: a computed value immediately
-/// followed by `tostring`/a format function/string interpolation was routed
+/// unlike file/piped input, which could pick the eager evaluator instead
+/// before #2103 retired that route) reached a *different* bug than #2456
+/// fixed: a computed value immediately followed by `tostring`/a format
+/// function/string interpolation was routed
 /// through `eval_each_owned` wrapped in a single-element `Expr::Pipe`, which
 /// `eval_owned_fast_path` (`eval.rs`) didn't recognize as the same shape its
 /// own bare-`Builtin(ToString)` arm matches (and had no `Expr::Format` arm
@@ -35905,11 +35854,11 @@ fn test_field_index_iterate_delete_on_empty_update_filter_1916() -> Result<()> {
 /// #2103 removed that gate: **every** M2 filter streams now, including the
 /// root-forwarding shapes the gate used to keep on the eager route, which
 /// therefore used to batch. The last three rows are exactly those shapes,
-/// and each one visibly reorders under the old route -- verified by running
-/// them against the retained `SUCCINCTLY_JQ_M2_EVAL=eager` hook, which
-/// produces `["DEBUG:",1]` *before* the first `1`, `[1,2][1,2]` before the
-/// first `[1,2]`, and `["DEBUG:",1]` before `2` respectively. So they
-/// discriminate the fix rather than merely passing alongside it.
+/// and each one visibly reordered under the old route -- verified at the
+/// time by running them against the (now-deleted) `SUCCINCTLY_JQ_M2_EVAL=eager`
+/// hook, which produced `["DEBUG:",1]` *before* the first `1`, `[1,2][1,2]`
+/// before the first `[1,2]`, and `["DEBUG:",1]` before `2` respectively. So
+/// they discriminate the fix rather than merely passing alongside it.
 #[test]
 fn test_unbuffered_interleaves_stdout_and_stderr_1653() -> Result<()> {
     // (args, stdin, combined stdout+stderr, exit code) -- all four captured
