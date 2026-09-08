@@ -35652,17 +35652,27 @@ fn test_unresolved_call_line_comes_from_the_call_not_a_name_match_2085() -> Resu
     Ok(())
 }
 
-/// #2085 companion: the two properties the positional lookup must not lose.
+/// #2085 companion: the three properties the positional lookup must not lose.
 ///
-/// A repeated undefined name still walks its own successive call sites in
-/// source order rather than repeating the first, and a name with no call site
-/// recorded at all (here, one reached only through the `builtin_fallback`
-/// wrong-arity path) still falls back to the text search rather than dropping
-/// the line marker. Both captured live from jq 1.7.1.
+/// **Repeat**: a repeated undefined name walks its own successive call sites
+/// in source order rather than repeating the first.
+///
+/// **Arity**: an `f/1` diagnostic must not take a perfectly *resolvable*
+/// `f/2` call site. The table records calls, not failures, and carries no
+/// scope information, so arity is what separates same-name sites.
+///
+/// **Fallback**: a call with no entry in the table at all — one inlined from
+/// an `include`d module, which has no occurrence in the filter text — still
+/// drops the line marker rather than inventing a position. This needs a real
+/// module: the first version of this test used a single-line filter, where
+/// the table path and the fallback path both answer "line 1", so it could not
+/// tell them apart and missed a regression that re-reported an already-used
+/// position (#2085 review, finding 1).
+///
+/// Every expectation is a live jq 1.7.1 capture.
 #[test]
-fn test_unresolved_call_positional_lookup_keeps_repeat_and_fallback_2085() -> Result<()> {
-    // Two distinct calls to the same undefined name, on different lines: each
-    // diagnostic cites its own line, not the first one twice.
+fn test_unresolved_call_positional_lookup_keeps_repeat_arity_and_fallback_2085() -> Result<()> {
+    // Repeat: two calls to the same undefined name on different lines.
     let (stdout, stderr, code) = run_jq_full(&["-c", "nosuch\n| nosuch"], Some("null"))?;
     assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "");
@@ -35671,7 +35681,18 @@ fn test_unresolved_call_positional_lookup_keeps_repeat_and_fallback_2085() -> Re
         "each call should cite its own line -- stderr: {stderr:?}"
     );
 
-    // Wrong-arity call of a real `def`: still located, still line 1.
+    // Arity: the resolvable `f/2` on line 2 must not be cited for the
+    // failing `f/1` on line 3.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "def f(a;b): a;\nf(1;2)\n| f(1)"], Some("null"))?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("f/1 is not defined at <top-level>, line 3:"),
+        "stderr: {stderr:?}"
+    );
+
+    // Wrong-arity call of a real `def`, single line: still located.
     let (stdout, stderr, code) = run_jq_full(
         &["-c", "def f(x): x; if false then f(1;2;3) else 1 end"],
         Some("null"),
@@ -35681,6 +35702,29 @@ fn test_unresolved_call_positional_lookup_keeps_repeat_and_fallback_2085() -> Re
     assert!(
         stderr.contains("f/3 is not defined at <top-level>, line 1:"),
         "stderr: {stderr:?}"
+    );
+
+    // Fallback: the module's own `nosuch` has no occurrence in the filter, so
+    // it must be reported with no line marker while the filter's own `nosuch`
+    // on line 3 keeps its position. jq reports only its own; what matters
+    // here is that the second error does not repeat line 3's marker.
+    let dir = tempfile::TempDir::new()?;
+    std::fs::write(dir.path().join("m.jq"), "def helper: nosuch;\n")?;
+    let lib = dir.path().to_string_lossy().to_string();
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "-L", &lib, "include \"m\";\nhelper\n| nosuch"],
+        Some("null"),
+    )?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert_eq!(
+        stderr.matches("line 3:").count(),
+        1,
+        "the module's own error must not re-use the filter call's line -- stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("nosuch/0 is not defined at <top-level>\n"),
+        "the module call should be reported with no line marker -- stderr: {stderr:?}"
     );
 
     Ok(())

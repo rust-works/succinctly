@@ -1072,13 +1072,27 @@ fn report_unresolved_calls(unresolved: &[UnresolvedCall], filter: &str) {
 
     for UnresolvedCall { name, arity } in unresolved {
         let taken = consumed.entry(name.as_str()).or_insert(0);
+        // Matched on arity as well as name (#2085 review, finding 2): an
+        // `f/1` diagnostic must not take a perfectly resolvable `f/2` call
+        // site earlier in the source. `def f(a;b): a; f(1;2) | f(1)` cited
+        // the `f(1;2)` on line 2 instead of the failing `f(1)` on line 3.
         let from_table = call_sites
             .iter()
-            .filter(|c| c.name == *name)
+            .filter(|c| c.name == *name && c.arity == *arity)
             .nth(*taken)
             .map(|c| c.offset);
         if let Some(offset) = from_table {
             *taken += 1;
+            // Keep the fallback's own cursor in step (#2085 review, finding
+            // 1). These are two counters over the same name, and letting
+            // them drift re-reports a position already used: once the table
+            // runs out -- exactly the module case, where a call inlined from
+            // `include`/`~/.jq` has no occurrence in `filter` at all -- the
+            // fallback would restart from offset 0 and invent a line for a
+            // call that has none. With `def helper: nosuch;` in a module,
+            // `include "m"; helper | nosuch` printed the `line 3` marker
+            // twice rather than leaving the module's own error unmarked.
+            resume_from.insert(name.as_str(), offset + name.len());
             let (line_no, line_text, column) = line_at_offset(filter, offset);
             eprintln!("jq: error: {name}/{arity} is not defined at <top-level>, line {line_no}:");
             eprintln!("{line_text}{}", " ".repeat(column));
@@ -1116,25 +1130,6 @@ fn report_unresolved_calls(unresolved: &[UnresolvedCall], filter: &str) {
 /// search for `f` does not match the `f` inside `first` — but `::` is allowed
 /// on the left, since a namespaced call arrives here as `ns::f` while the
 /// source spells the two halves either side of the separator.
-/// The 1-based line number, that line's text, and the 0-based column, for a
-/// byte `offset` into `filter` (#2085).
-///
-/// The positional counterpart of [`locate_identifier_from`]'s own line
-/// arithmetic, for an offset that is already known to be a real call site
-/// rather than one that had to be searched for.
-fn line_at_offset(filter: &str, offset: usize) -> (usize, String, usize) {
-    let line_start = filter[..offset].rfind('\n').map_or(0, |i| i + 1);
-    let line_no = filter[..line_start].matches('\n').count() + 1;
-    let line_end = filter[line_start..]
-        .find('\n')
-        .map_or(filter.len(), |i| line_start + i);
-    (
-        line_no,
-        filter[line_start..line_end].to_string(),
-        offset - line_start,
-    )
-}
-
 fn locate_identifier_from(
     filter: &str,
     name: &str,
@@ -1173,6 +1168,25 @@ fn locate_identifier_from(
         start - line_start,
         start + name.len(),
     ))
+}
+
+/// The 1-based line number, that line's text, and the 0-based column, for a
+/// byte `offset` into `filter` (#2085).
+///
+/// The positional counterpart of [`locate_identifier_from`]'s own line
+/// arithmetic, for an offset that is already known to be a real call site
+/// rather than one that had to be searched for.
+fn line_at_offset(filter: &str, offset: usize) -> (usize, String, usize) {
+    let line_start = filter[..offset].rfind('\n').map_or(0, |i| i + 1);
+    let line_no = filter[..line_start].matches('\n').count() + 1;
+    let line_end = filter[line_start..]
+        .find('\n')
+        .map_or(filter.len(), |i| line_start + i);
+    (
+        line_no,
+        filter[line_start..line_end].to_string(),
+        offset - line_start,
+    )
 }
 
 /// Extract the line containing an error for display.
