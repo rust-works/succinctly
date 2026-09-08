@@ -1174,7 +1174,13 @@ $ echo '{"a\q":1,"b":2}' | sjq -c 'keys_unsorted'
 
 Both spellings agree the key is present and the count is 2 — the literal escaping
 differing between a raw-byte echo and a materialized value is an inherent property of the
-two representations, not a new inconsistency #1642 introduces.
+two representations, not a new inconsistency #1642 introduces. Since
+[#2103](https://github.com/rust-works/succinctly/issues/2103) that is the stated rule rather
+than an observation: **an undecodable key is echoed as its raw source bytes wherever the
+value is never materialized, and as `key_display_string`'s fallback (the source `\` doubled)
+wherever it is.** Which of the two a filter gets follows from whether it materializes, never
+from which evaluator route it took — see the #2103 entry under "Real-time stdout/stderr
+interleaving".
 
 `paths` and `leaf_paths` agree with the same five now too: both were left on the
 pre-#1642 `field.key_str()` (`None` for a decode-failure key, indistinguishable from
@@ -1330,9 +1336,11 @@ member*, with every member present otherwise well-formed -- is a distinct
 malformed-delimiter shape from #1677's missing/doubled `,`/`:` between two
 members above, and from #2211's `[,]`/`{,}` (a stray `,` with **no** real
 member at all). #2243 closed it for `eval_generic::to_owned_cursor_at_depth`
-(the materializer behind the `evaluate_bytes_lazy`/non-cursor-transparent
-path -- `if`/arithmetic/function calls, anything `expr_is_cursor_transparent`
-answers `false` for, same gate #2211 used) by adding
+(the materializer behind what was then the `evaluate_bytes_lazy`/
+non-cursor-transparent path -- `if`/arithmetic/function calls, anything
+`expr_is_cursor_transparent` answered `false` for, same gate #2211 used; both
+are gone since #2103, and the same materializer now backs `eval_single`'s
+wildcard bridge for the shapes without a native streaming arm) by adding
 `DocumentCursor::trailing_element_gap_ok`/`DocumentValue::scalar_text_end` to
 the shared trait system ([src/jq/document.rs](../../../src/jq/document.rs)),
 implemented for JSON by reusing the CLI printer's own existing
@@ -1556,14 +1564,16 @@ one-line addition once `DistinctKeyCursors::trailing_gap_ok` existed:
 writer behind a *bare* `keys_unsorted`), `eval_generic.rs`'s own
 `walk_distinct_keys_checked`/`Expr::Builtin(Builtin::Last)` arm (covering
 `keys_unsorted[]`/`keys_unsorted[-1]` and `keys_unsorted | last` respectively,
-reached through `eval_single`'s eager path since `keys_unsorted` alone is not
-one of `jq_runner.rs`'s own `expr_is_cursor_transparent` shapes), and
-`each_lazy_keys_iterate_sink`'s own `!sorted` branch (the demand-aware sink,
-reached once a pipe's *first* stage already descends off the root --
-`.x | keys_unsorted[]`, where `.x`'s own `Expr::Field` shape is one of
-`expr_descends`'s matched cases, so `expr_is_cursor_transparent` admits
-everything after it unconditionally, taking the M2/`eval_each_with_cursor`
-route instead of the eager one).
+reached through `eval_single`'s eager path when #2261 landed, since
+`keys_unsorted` alone was not one of the shapes `jq_runner.rs`'s M2 gate
+admitted), and `each_lazy_keys_iterate_sink`'s own `!sorted` branch (the
+demand-aware sink, reached back then only once a pipe's *first* stage already
+descended off the root -- `.x | keys_unsorted[]`, whose `Expr::Field` first
+stage the gate treated as descending and so admitted everything after
+unconditionally, taking the M2/`eval_each_with_cursor` route instead of the
+eager one). Since #2103 there is no gate and every M2 filter takes that
+demand-aware route, so both spellings reach the sink; each site keeps its own
+check because each is still reachable from some caller.
 
 `stream_lazy_keys_json` (`src/jq/stream.rs`) also received the same
 one-line addition, but **turns out not to be reachable from either shipped
@@ -1571,9 +1581,10 @@ CLI today, the identical shape `test_stream_lazy_keys_honors_collapse_1514`'s
 own review already established for this exact function**: `succinctly jq`
 excludes bare `Builtin::KeysUnsorted` from its own M2 *output* gate
 unconditionally (`m2_json_fallback_safe`, `jq_runner.rs` -- a *different*
-gate from `expr_is_cursor_transparent` above, which only controls eager-vs-
-demand-aware *evaluation*, not which writer prints the result), regardless of
-AST shape, so this function is never invoked from `succinctly jq` at all.
+gate from the eager-vs-demand-aware *evaluation* one described above, which
+#2103 removed; this one decides which writer prints the result and is still
+in place), regardless of AST shape, so this function is never invoked from
+`succinctly jq` at all.
 `succinctly yq --input-format json` has no such exclusion and does reach
 this function, but only with YAML-sourced `fields` (JSON parses through
 `YamlIndex` there, per #1975/#2262's own account), whose `trailing_gap_ok`
@@ -3079,29 +3090,103 @@ $ echo '[1,2]' | succinctly jq --unbuffered -c '.[]|debug'   2>&1     # same
 Two things about the M2 path are worth stating, because neither is obvious from the output
 above.
 
-### The M2 path streams only a cursor-transparent filter
+### Every M2 filter streams — a filter validates only what it reads; recorded on its merits (#2103)
 
-`expr_is_cursor_transparent` (jq_runner.rs) gates it. A filter that can emit the **root**
-cursor unchanged through an arm whose eager twin would have materialized it — `.,.`,
-`(., debug)`, `label $x | .`, `def f: .; f`, `try (1+1)`, `1+1` — still batches, and so still
-shows #1653's original ordering.
+Until [#2103](https://github.com/rust-works/succinctly/issues/2103) the M2 path streamed
+only a *cursor-transparent* filter (`expr_is_cursor_transparent`, since deleted). A filter
+that could emit the **root** cursor unchanged, or never read it at all — `.,.`, `(., debug)`,
+`try (1+1)`, `1+1` — stayed on the eager evaluator, whose wildcard arm materializes the
+ambient value through `to_owned_with_cursor` before bridging into `eval.rs`. That one call
+was doing two jobs beyond producing a value: **validating the document** (#1194's structural
+checks, #1642's colliding-display-key raise) and **choosing an undecodable key's spelling**
+(a materialized `String`, so a source `\` doubles). The demand-driven evaluator's native
+arms (#1596) do neither, so the two routes disagreed and the gate kept the disagreeing
+shapes eager. Every filter now streams; the gate and the eager M2 route are gone.
 
-That is not a leftover: the eager evaluator's `to_owned_with_cursor` on the ambient value
-doubles as a validity gate (#1194's structural checks, #1642's colliding-display-key raise)
-and also decides an undecodable key's spelling, and `eval_each_generic`'s native arms (#1596)
-do neither. Streaming such a filter would drop those checks. (#2168 settled the same
-question for `path`/`key`/`parent`/`getpath` — see its entry below — but not this one: there
-the gate stood in front of a *navigation* that could carry the rule itself, where this one
-stands in front of a filter that forwards the root value unchanged, and the spelling half is
-untouched either way.)
-[#2103](https://github.com/rust-works/succinctly/issues/2103) tracks separating the two jobs;
-until it lands, those shapes stay on the eager route.
+**This loses fidelity that succinctly previously had, and the decision order does not
+license it.** Real jq 1.7.1 rejects every document below at parse time, exit 5, whatever the
+filter, so the reference *does* have a behaviour here and it is *reject*. Measured with
+`scripts/jq-m2-streaming-sweep.sh` against the pinned binary — 19 rows, all of them a filter
+that reads nothing:
 
-The gate reaches further than the root, though: past a first stage that *descends* (`.[]`,
-`.a`, `.[0]`) the ambient value is a proper descendant, so everything downstream streams —
-`.[] | (., stderr)`, `.[] | if … end`, `.users[] | .name` all interleave. The set is measured
-by `scripts/jq-m2-streaming-sweep.sh`, which diffs both routes against each other and against
-pinned jq 1.7.1, not derived from first principles.
+| filter | document | jq 1.7.1 | eager route (before) | streaming route (now) |
+|---|---|---|---|---|
+| `1+1`, `try (1+1)`, `try (1+1) catch "x"` | `{123:1,"b":2}`, `{"a":1,"b"}`, `{"a":1, invalid}`, `{"a" 1, "b":2}`, `[1,,3]` | error | error — **matched jq** | `2` — **diverges** |
+| `1+1`, `try (1+1)`, `try (1+1) catch "x"` | `{"\ud800":1,"\ud800":2}` | error | error — **matched jq** | `2` — **diverges** |
+| `.,.` | `{"\ud800":1,"\ud800":2}` | error | error — **matched jq** | echoes twice — **diverges** |
+
+Step 2 of ADR-0018's decision order therefore separates the two options and favours the
+behaviour being given up. No rule-4 condition applies — the output is readable, nothing is
+corrupted or discarded, and neither choice takes the process down. **This is a deliberate
+divergence taken against the order's own answer**, on the same footing as the
+`path`/`getpath` entry below (#2168), and for the same three reasons:
+
+1. *The agreement being given up was an accident.* `to_owned_with_cursor` validated because
+   it needed a value to bridge with, not because anyone decided `1+1` should validate its
+   input. The check fired only for the spellings that happened to reach the wildcard arm.
+2. *It made the answer depend on how the filter was spelled.* On `{"\ud800":1,"\ud800":2}`,
+   one binary answered `.` (echo), `.b` (`null`), `length` (`2`), `keys`, and `label $x | .`
+   at exit 0, while `.,.`, `1+1`, `debug`, `if . then . else . end` and `. as $x | $x` all
+   exited 5 with `object key "\ud800" is ambiguous`. That is the shape #1629/#1642/#2168
+   exist to remove.
+3. *It cost a whole-document materialization on a filter that reads nothing.* 10 MB
+   `json generate` input, indicative single runs: `.,.` went from 0.40 s / 374 MB RSS on the
+   eager route to 0.18 s / 25 MB streaming; `1+1` from 0.23 s / 237 MB to 0.01 s / 20 MB.
+
+The rule #2168 recorded — *a builtin that navigates to a position validates only what it
+reads; one that materializes validates everything it materializes* — is what decides this.
+`1+1` reads nothing and validates nothing. `.,.` forwards the root cursor to the printer,
+which walks it exactly as `.` does, so a structural fault is still found where the walk
+reaches it (`{123:1,"b":2}` still exits 5 under `.,.`, as under `.`) and a colliding
+undecodable key, which the walk never has to resolve, is echoed as `.` echoes it. A filter
+whose only route is still the wildcard bridge — `. as $x | $x`, `if . then . else . end`,
+`[.]`, `{k: .}`, anything without a native streaming arm — still materializes and so still
+validates, which is the same rule applied to a route that reads the whole document, not an
+exception to it. (`label $x | .` is *not* one of those: it has a native arm and already
+answered at exit 0 on the eager route, as the matrix in 2 above records.)
+
+The context that makes the loss survivable is the one #2168's entry states: succinctly
+already diverges on this whole class of document through `.` itself, deliberately, and a
+user who wants jq's rejection has `--validate` and `succinctly json validate`.
+
+**The spelling half.** The other job the eager bridge did was pick an undecodable key's
+spelling. No new spelling was introduced; the rule the #1642 entry above already states
+applies: **raw source bytes wherever the value is never materialized, `key_display_string`'s
+fallback (the source `\` doubled) wherever it is.** `.,.` now echoes `{"\ud800":1,"b":2}`
+byte-for-byte, like `.`; `-S`, `-s`, `keys` and `debug`'s stderr line still print
+`"\\ud800"`, because each builds a `String`-keyed map. `(., debug)` therefore prints the raw
+form for `.` and the doubled form for everything `debug` emits, its stdout pass-through
+included — consistent under the rule, since `debug` materializes its input to build the
+message and forwards what it built. Unifying on raw everywhere would need a raw-key
+representation carried through both evaluators, the printers and `yq_runner`'s bridge;
+unifying on doubled is the lossy direction and would put materialization back on the hot
+path. Neither is planned. A third spelling — the streaming route *raising* `invalid unicode
+escape sequence` on `keys_unsorted[]` — was a bug, not a candidate:
+`eval_each_pipe_generic`'s empty-stages arm dropped the cursor and decoded the key. Fixed in
+the same change.
+
+Six further cells move off jq's exit 5 as a consequence of that rule, beyond the 19 rows
+above: `limit(1; keys_unsorted[])` and `limit(2; keys_unsorted[])` on each of
+`{"\ud800":1,"\ud800":2}`, `{"\ud800":1,"b":2}` and `{"a\q":1,"b":2}` now echo the key raw
+at exit 0, where the eager route materialized `limit`'s results through
+`standard_json_to_jq_value`, decoded the key and raised. That is exactly the inconsistency
+the issue's first comment recorded — bare `keys_unsorted[]` echoing while
+`limit(1; keys_unsorted[])` decoded, on one binary, one document — and it goes away with the
+route that caused it. They are counted separately from the 19 because they follow from the
+spelling rule, not from the validity decision.
+
+Pinned by `test_streaming_keys_unsorted_iterate_echoes_undecodable_key_raw_2103`,
+`test_root_forwarding_filters_stream_without_validating_2103` and the revised rows of
+`test_materializing_route_raises_on_colliding_decode_failure_keys_1642` and
+`test_try_catch_contains_a_genuinely_catchable_malformed_key_error_1812`
+(`tests/jq_cli_tests.rs`). `scripts/jq-m2-streaming-sweep.sh`, which found the divergence,
+lost its route-against-route comparison along with the eager route. It now runs the one
+shipped route against pinned jq 1.7.1 over the same documents and filters and records every
+cell — jq's exit code, succinctly's exit code, succinctly's stdout — in a checked-in golden
+table, `scripts/jq-m2-streaming-sweep.expected` (`--update` regenerates it). A clean run is
+a table that matches; any cell that moves, in either direction, fails with a diff. The rows
+above are in that table at their post-#2103 values, so they are pinned rather than merely
+tolerated.
 
 ### A fault found by walking to it leaves the prefix on stdout
 
@@ -4427,8 +4512,9 @@ colliding-display-key raise rode on the same walk, so they no longer fire for th
 on a subtree the query never reads. `[path(.[])]` now names exactly the members
 `keys_unsorted` lists, element for element, on a document with two undecodable keys of the
 same display spelling — where before, one answered and the other raised. The materializing
-routes (`-S`, `-s`, `.,.`) still raise on that document, because rendering both keys into
-one map is what the collision *is*.
+routes (`-S`, `-s`) still raise on that document, because rendering both keys into one map
+is what the collision *is*; `.,.` no longer does, since #2103 it forwards the cursor to the
+printer without building a map (see its entry above).
 
 **One row moved away from jq, with no ADR-0018 carve-out.** A `NumberLiteral` longer than
 `REINDEX_LITERAL_LEN_CAP` disqualified a document from `getpath`'s native arm, sending the
@@ -4454,11 +4540,11 @@ Pinned by `test_lazy_validation_boundary_2168` (the table above, as one test),
 `test_path_context_cursor_walk_skips_an_undecodable_sibling_2168` plus its yq-mode sibling
 (`tests/yq_cli_tests.rs`).
 
-**Still open.** [#2103](https://github.com/rust-works/succinctly/issues/2103) — the eager
-and streaming evaluators disagree about validating the *ambient* value, which is a different
-question this decision informs rather than closes: the eager route's own
-`to_owned_with_cursor` still validates a whole document that a streaming arm would not, and
-which spelling an undecodable key gets is still undecided.
+**Settled since.** [#2103](https://github.com/rust-works/succinctly/issues/2103) applied
+this rule to the *ambient* value: the eager M2 route's `to_owned_with_cursor` validated a
+whole document that a streaming arm never read, and the M2 path was gated to keep the two
+from disagreeing. The gate is gone; the entry under "Real-time stdout/stderr interleaving"
+records the 19 rows that moved away from jq and the spelling rule it left in place.
 
 ## Provenance
 
