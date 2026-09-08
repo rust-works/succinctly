@@ -9093,6 +9093,12 @@ fn each_index_expr_generic<S: EvalSemantics, V: DocumentValue>(
     let flow =
         eval_each_generic::<S, V>(key, value.clone(), false, cursor, &mut |item| match item {
             GenericItem::One(v) => {
+                // STYLE-0012: this materializes the *key* generator's output,
+                // evaluated with a hardcoded `optional: false` in the
+                // `eval_each_generic` call above -- `.[k]?` suppresses only
+                // its own final index step, never an error raised while
+                // computing `k`. Same exemption, same reason, as
+                // `eval_index_expr_generic`'s own `One` arm.
                 let k = match to_owned_key_shape(&v) {
                     Ok(k) => k,
                     Err(e) => {
@@ -9116,6 +9122,7 @@ fn each_index_expr_generic<S: EvalSemantics, V: DocumentValue>(
                 }
             }
             GenericItem::OneCursor(c) | GenericItem::OneCursorValue(c, _) => {
+                // STYLE-0012: key generator -- see the `One` arm above.
                 let k = match to_owned_key_shape_cursor(&c) {
                     Ok(k) => k,
                     Err(e) => {

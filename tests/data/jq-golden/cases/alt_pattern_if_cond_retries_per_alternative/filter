@@ -1,0 +1,1 @@
+[first(if (1 as $x ?// $y | 1) then 5 else 6 end)]
