@@ -41809,3 +41809,49 @@ fn test_and_or_still_raise_on_a_malformed_document_2476() -> Result<()> {
 
     Ok(())
 }
+
+/// #2476: `not` gets its own native arm in `eval_single` (it never had a
+/// `needs_path_context` gate to lose -- it has no operand, only the ambient
+/// `.` -- so before this change it fell to the wildcard bridge
+/// unconditionally). This is `not`'s own sibling of
+/// `test_and_or_still_raise_on_a_malformed_document_2476` just above: the
+/// bridge's ambient decode is now `push_generic_truthiness`'s own validation
+/// walk (inline, no separate `ambient_validation_error` call needed -- see
+/// the arm's comment in `eval_generic.rs`), and it must still raise on
+/// exactly the same two shapes -- a #1194 malformed root, and a decode
+/// failure the walk actually has to visit through a `.[]` fan-out.
+#[test]
+fn test_not_still_raises_on_a_malformed_document_2476() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_stdin_streams("not", "{123: 1}", &[])?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr}");
+
+    let (stdout, stderr, code) = run_jq_stdin_streams(".[] | not", "[\"\\x\"]", &[])?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("invalid escape sequence"),
+        "stderr: {stderr}"
+    );
+
+    Ok(())
+}
+
+/// #2476: `not`'s jq truthiness table, unaffected by the native arm (only
+/// `null`/`false` are falsy in jq -- `0`, `""`, and `[]` are all truthy, so
+/// `not` on them is `false`). Verified live against the pinned oracle
+/// `/usr/bin/jq` 1.7.1 for every row before writing it down here.
+#[test]
+fn test_not_truthiness_table_2476() -> Result<()> {
+    for (input, want) in [
+        ("null", "true"),
+        ("false", "true"),
+        ("0", "false"),
+        ("\"\"", "false"),
+        ("[]", "false"),
+    ] {
+        let (stdout, code) = run_jq_stdin("not", input, &[])?;
+        assert_eq!(code, 0, "input={input}");
+        assert_eq!(stdout.trim(), want, "input={input}");
+    }
+    Ok(())
+}
