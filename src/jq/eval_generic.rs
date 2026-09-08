@@ -2973,6 +2973,54 @@ fn push_generic_document_validation_error<C: DocumentCursor>(
     }
 }
 
+/// The wildcard bridge's ambient materialization, as a check that builds
+/// nothing (#2476).
+///
+/// `eval_single`'s `_` arm materializes the *ambient* value
+/// (`to_owned_with_cursor`) before handing the expression to the eager
+/// evaluator, and that materialization is where a malformed document raises
+/// for a query that never reads `.`: jq rejects the whole document for every
+/// query, and `test_try_catch_contains_a_genuinely_catchable_malformed_key_error_1812`
+/// pins `try (1+1) catch "x"` on `{123: 1}` exiting 5. The `Expr::And`/
+/// `Expr::Or`/`Expr::Arithmetic`/`Expr::Negate` arms were gated on
+/// `needs_path_context` purely to keep that raise (see their comments), so
+/// every ungated shape stayed on the bridge. But the materialization costs
+/// the size of the *expanded* value, and on a document shaped as an alias
+/// fan-out (`aN: &aN [*a(N-1), *a(N-1)]`) the root contains `aN`, so every
+/// bridged expression at the root -- `true and true`, `1+1`, `not`, `//`,
+/// `any` -- cost `O(2^N)` whatever its operands read (#2476).
+///
+/// This is the same raise without the value. [`push_generic_document_validation_error`]
+/// is `to_owned_cursor_at_depth`'s own traversal and checks (decode failures,
+/// #1194 structural errors, #1642 key collisions, #2211/#2243/#2349 comma
+/// gaps, the #998 depth guard) building no `OwnedValue`, and since #1804 it
+/// does not descend into a container reached through an alias -- which is
+/// what makes it `O(N)` on the fan-out where the bridge is `O(2^N)`.
+/// Verified against the bridge over a corpus spanning every class those
+/// checks cover, in both modes and for both cursor types
+/// (`test_ambient_validation_agrees_with_bridge_2476` in
+/// `tests/jq_cli_tests.rs` and its yq twin): identical exit code and message
+/// on every row. The one shape that differs by construction is #1804's
+/// accepted trade-off, now shared by every arm that calls this: a decode
+/// failure reachable *only* through an alias to a container no longer raises
+/// from these arms either (recorded in `docs/compliance/yq/limitations.md`).
+///
+/// `None` without a cursor: `to_owned_with_cursor(&value, None)` on an
+/// already-owned value cannot fail, so the bridge had nothing to raise there
+/// either. A document deeper than `MAX_NESTING_DEPTH` panics inside the walk
+/// exactly as it panicked inside the bridge's materialization (#2627, tracked,
+/// route-independent).
+///
+/// Call this only on the shape that used to bridge (`!needs_path_context`
+/// for a gated arm; unconditionally for an arm that had no native route at
+/// all): an operand that reads path context could not have stood on a
+/// malformed document's root and survived the walk to it anyway, and that
+/// shape never paid the decode, so charging it a walk now would be a new
+/// cost, not a replaced one.
+fn ambient_validation_error<V: DocumentValue>(cursor: Option<V::Cursor>) -> Option<Control> {
+    cursor.and_then(|c| push_generic_document_validation_error(&c, 0))
+}
+
 /// Append one truthiness bit per output of a `GenericResult` stream to
 /// `out`. Mirrors [`super::eval::push_truthiness`] for the generic
 /// evaluator's cursor-aware result type — used to fan `select`'s condition

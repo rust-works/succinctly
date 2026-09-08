@@ -38537,3 +38537,127 @@ fn test_foreach_register_reentry_is_jq_mode_only_on_the_write_side_2161() -> Res
 
     Ok(())
 }
+
+/// #2476, yq twin of `test_ambient_validation_agrees_with_bridge_2476` in
+/// `tests/jq_cli_tests.rs`: the same corpus through the YAML cursor (and, for
+/// the JSON-syntax rows, through yq's own reading of them -- most of the
+/// JSON comma-gap shapes are *valid* YAML plain scalars, so those rows pin
+/// exit 0 on every probe rather than a raise). See the jq test for what the
+/// corpus is for and why agreement alone is not the assertion.
+#[test]
+fn test_ambient_validation_agrees_with_bridge_2476() -> Result<()> {
+    let deep200 = format!("{}1{}\n", "[".repeat(100), "]".repeat(100));
+    // (label, document, expected exit code, expected stderr substring)
+    let corpus: &[(&str, &str, i32, &str)] = &[
+        (
+            "decode failure, mapping value",
+            "a: \"bad\\q\"\n",
+            1,
+            "invalid escape sequence",
+        ),
+        (
+            "decode failure, in flow sequence",
+            "a: [\"bad\\q\"]\n",
+            1,
+            "invalid escape sequence",
+        ),
+        (
+            "decode failure, anchored container (root walk reaches the anchor)",
+            "a: &a [\"bad\\q\"]\nb: *a\n",
+            1,
+            "invalid escape sequence",
+        ),
+        (
+            "decode failure, anchored scalar",
+            "a: &a \"bad\\q\"\nb: *a\n",
+            1,
+            "invalid escape sequence",
+        ),
+        (
+            "decode failure, block sequence",
+            "- \"bad\\q\"\n",
+            1,
+            "invalid escape sequence",
+        ),
+        (
+            "decode failure, root scalar",
+            "\"bad\\q\"\n",
+            1,
+            "invalid escape sequence",
+        ),
+        (
+            "decode failure, nested mapping",
+            "a:\n  b:\n    c: \"bad\\q\"\n",
+            1,
+            "invalid escape sequence",
+        ),
+        (
+            "decode failure, explicitly tagged",
+            "a: !!int \"bad\\q\"\n",
+            1,
+            "invalid escape sequence",
+        ),
+        (
+            "#1642 colliding undecodable keys (JSON syntax)",
+            "{\"\\ud800\":1,\"\\ud800\":2}",
+            1,
+            "is ambiguous",
+        ),
+        (
+            "#1642 single undecodable key (JSON syntax)",
+            "{\"\\ud800\": 1, \"b\": 2}",
+            0,
+            "",
+        ),
+        ("#1194 shape is a valid YAML mapping", "{123: 1}", 0, ""),
+        (
+            "JSON structural error is a valid plain scalar",
+            "[xyz123]",
+            0,
+            "",
+        ),
+        ("JSON trailing comma is valid YAML flow", "[1,]", 0, ""),
+        ("JSON lone comma is valid YAML flow", "[,]", 0, ""),
+        ("duplicate keys (valid)", "a: 1\na: 2\n", 0, ""),
+        ("flow trailing comma", "a: [1,]\n", 0, ""),
+        ("flow mapping trailing comma", "a: {b: 1,}\n", 0, ""),
+        ("deep, within the guard", deep200.as_str(), 0, ""),
+        ("null root", "null\n", 0, ""),
+        ("false root", "false\n", 0, ""),
+        ("well-formed", "a: [1, {b: c}]\n", 0, ""),
+    ];
+    let probes = [
+        "select(.) | 1",
+        "true and true",
+        "false or true",
+        ". and true",
+        "not",
+        "false // 1",
+        "(.a? // 1) | 1",
+    ];
+    for (label, doc, want_code, want_stderr) in corpus {
+        let mut seen: Vec<(String, i32, String)> = Vec::new();
+        for probe in probes {
+            let (_stdout, stderr, code) = run_yq_stdin_with_stderr(probe, doc, &[])?;
+            let first = stderr.lines().next().unwrap_or("").to_string();
+            assert_eq!(
+                code, *want_code,
+                "[{label}] `{probe}`: exit {code}, want {want_code}\nstderr: {stderr}"
+            );
+            assert!(
+                first.contains(want_stderr),
+                "[{label}] `{probe}`: stderr {first:?} lacks {want_stderr:?}"
+            );
+            seen.push((probe.to_string(), code, first));
+        }
+        let (_, ref_code, ref_first) = &seen[0];
+        for (probe, code, first) in &seen[1..] {
+            assert_eq!(
+                (code, first),
+                (ref_code, ref_first),
+                "[{label}] `{probe}` disagrees with `select(.) | 1`"
+            );
+        }
+    }
+    Ok(())
+}

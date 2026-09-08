@@ -41579,3 +41579,192 @@ fn test_preserve_input_keeps_jq_escape_table_2209() -> Result<()> {
     }
     Ok(())
 }
+
+/// #2476: `eval_single`'s wildcard bridge materializes the *ambient* value
+/// before the eager evaluator runs, and that materialization is what makes a
+/// query that never reads `.` still raise on a malformed document (#1812:
+/// jq rejects the whole document for every query). The native arms that
+/// replace the bridge for `and`/`or`/`not`/`//` run
+/// `ambient_validation_error` -- `push_generic_document_validation_error`,
+/// the walk `select(.)`/`if` already use -- instead. This corpus pins that
+/// the two raise identically: every malformed-document class the checks
+/// cover, each probed through the reference route (`select(.)`) and through
+/// every construct that used to bridge, asserting the same exit code and
+/// the same first stderr line, *and* the exit code the row must have
+/// (agreement alone would also pass if both routes silently stopped
+/// raising).
+///
+/// Rows this deliberately leaves out: a `>256`-deep document (both routes
+/// panic, #2627) and an empty document (exit 0 on every probe, nothing to
+/// pin). The alias-to-container shape is #1804's accepted trade-off and is
+/// pinned by its own test instead of here.
+#[test]
+fn test_ambient_validation_agrees_with_bridge_2476() -> Result<()> {
+    let deep200 = format!("{}1{}", "[".repeat(200), "]".repeat(200));
+    // (label, document, expected exit code, expected stderr substring)
+    let corpus: &[(&str, &str, i32, &str)] = &[
+        ("#1194 non-string key", "{123: 1}", 5, "expected string key"),
+        (
+            "decode failure, top level",
+            r#"{"bad": "\x", "keep": 5}"#,
+            5,
+            "invalid escape sequence",
+        ),
+        (
+            "decode failure, in array",
+            r#"["\x"]"#,
+            5,
+            "invalid escape sequence",
+        ),
+        (
+            "decode failure, root scalar",
+            r#""\x""#,
+            5,
+            "invalid escape sequence",
+        ),
+        (
+            "decode failure, nested object",
+            r#"{"bad": {"x": "\x"}, "keep": 5}"#,
+            5,
+            "invalid escape sequence",
+        ),
+        (
+            "structural error, top level",
+            r#"{"bad": xyz123, "keep": 5}"#,
+            5,
+            "unexpected character",
+        ),
+        (
+            "structural error, in array",
+            "[xyz123]",
+            5,
+            "unexpected character",
+        ),
+        ("structural error, root", "xyz123", 5, "Invalid JSON text"),
+        (
+            "#1642 colliding undecodable keys",
+            r#"{"\ud800":1,"\ud800":2}"#,
+            5,
+            "is ambiguous",
+        ),
+        (
+            "#1642 single undecodable key",
+            r#"{"\ud800": 1, "b": 2}"#,
+            0,
+            "",
+        ),
+        ("undecodable key, no collision", r#"{"a\q":1,"b":2}"#, 0, ""),
+        (
+            "#2211 trailing comma, array",
+            "[1,]",
+            5,
+            "expected JSON value, found ']'",
+        ),
+        (
+            "#2211 trailing comma, object",
+            r#"{"a":1,}"#,
+            5,
+            "expected string key, found '}'",
+        ),
+        (
+            "#2243 lone comma, array",
+            "[,]",
+            5,
+            "expected JSON value, found ','",
+        ),
+        (
+            "#2243 lone comma, object",
+            "{,}",
+            5,
+            "expected string key, found ','",
+        ),
+        (
+            "#2349 missing comma, array",
+            "[1 2]",
+            5,
+            "expected ',' or ']'",
+        ),
+        (
+            "#2349 double comma, array",
+            "[1,,2]",
+            5,
+            "expected JSON value, found ','",
+        ),
+        (
+            "#2349 missing comma, object",
+            r#"{"a":1 "b":2}"#,
+            5,
+            "expected ',' or '}'",
+        ),
+        (
+            "#2349 double comma, object",
+            r#"{"a":1,,"b":2}"#,
+            5,
+            "expected string key, found ','",
+        ),
+        (
+            "#2211 trailing comma, nested",
+            r#"{"a":[1,]}"#,
+            5,
+            "expected JSON value, found ']'",
+        ),
+        (
+            "#2243 lone comma, nested",
+            "[[,]]",
+            5,
+            "expected JSON value, found ','",
+        ),
+        ("#966 leading zero (sanitized, not raised)", "[01]", 0, ""),
+        (
+            "#966 two-dot number (sanitized, not raised)",
+            "[1..2]",
+            0,
+            "",
+        ),
+        ("deep, within the guard", deep200.as_str(), 0, ""),
+        ("duplicate key (valid)", r#"{"a":1,"a":2}"#, 0, ""),
+        ("unterminated array", "[1,2", 5, "Invalid JSON text"),
+        ("unterminated string", r#"["a"#, 5, "Invalid JSON text"),
+        ("missing colon", r#"{"a" 1}"#, 5, "expected ':'"),
+        ("bad literal", "[nul]", 5, "invalid null"),
+        ("trailing garbage", "[1] x", 5, "Invalid JSON text"),
+        ("null root", "null", 0, ""),
+        ("false root", "false", 0, ""),
+        ("well-formed", r#"{"a":[1,{"b":"c"}]}"#, 0, ""),
+    ];
+    // The reference route first; every construct that used to bridge after.
+    let probes = [
+        "select(.) | 1",
+        "true and true",
+        "false or true",
+        ". and true",
+        "not",
+        "false // 1",
+        "(.a? // 1) | 1",
+    ];
+    for (label, doc, want_code, want_stderr) in corpus {
+        let mut seen: Vec<(String, i32, String)> = Vec::new();
+        for probe in probes {
+            let (_stdout, stderr, code) = run_jq_full(&["-c", probe], Some(doc))?;
+            let first = stderr.lines().next().unwrap_or("").to_string();
+            assert_eq!(
+                code, *want_code,
+                "[{label}] `{probe}`: exit {code}, want {want_code}\nstderr: {stderr}"
+            );
+            assert!(
+                first.contains(want_stderr),
+                "[{label}] `{probe}`: stderr {first:?} lacks {want_stderr:?}"
+            );
+            seen.push((probe.to_string(), code, first));
+        }
+        let (_, ref_code, ref_first) = &seen[0];
+        for (probe, code, first) in &seen[1..] {
+            assert_eq!(
+                (code, first),
+                (ref_code, ref_first),
+                "[{label}] `{probe}` disagrees with `select(.) | 1`"
+            );
+        }
+    }
+    Ok(())
+}
