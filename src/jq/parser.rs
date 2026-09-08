@@ -338,7 +338,7 @@ pub struct CallSite {
 /// site), but same-name *and* same-arity calls that differ only by lexical
 /// scope cannot be told apart here: in `(def f: 1; f) | f` both sites are
 /// `f/0` and only the second fails. Distinguishing those needs positions
-/// threaded through `resolve.rs` itself, which is tracked separately.
+/// threaded through `resolve.rs` itself, tracked at #2635.
 ///
 /// Returns whatever was collected before any parse error, since the caller is
 /// already reporting a failure and a partial table still beats a text search.
