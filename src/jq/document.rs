@@ -842,7 +842,9 @@ pub trait DocumentValue: Sized + Clone {
     /// [`key_raw_unescaped`](Self::key_raw_unescaped) in a caller that has
     /// that fast path available: it decodes, and `key_hash_of` measured
     /// +10-12% on `wide_keys_unsorted` when a decoding check was tried
-    /// before the raw span.
+    /// before the raw span. *Below* that probe it is the right call --
+    /// `key_hash_of` uses it there, and YAML, which has no raw-span
+    /// override at all, reaches it for every key.
     // omni-dev: coverage tolerate reason="unreachable: both implementors (StandardJson, YamlValue) override this to decode once; the default exists as the contract a future implementor inherits, and is deliberately the two-call sequence it replaces (#965)"
     fn decoded_key_str(&self) -> Result<Option<Cow<'_, str>>, &'static str> {
         if let Some(reason) = self.string_decode_error() {
@@ -1423,27 +1425,36 @@ fn ascii_key_hash(key: &[u8]) -> Option<u64> {
 /// `wide_keys_unsorted` (+10-12%) when this was tried in that order.
 ///
 /// Once off that fast path (an escape, non-ASCII bytes, or no raw span at
-/// all -- YAML never has one), checks `string_decode_error` before falling
-/// to [`key_string`](DocumentValue::key_string): YAML's `key_string()`
-/// override never returns `None` at all (#222 -- a complex or undecodable
-/// key stringifies to `""` rather than being dropped), so a YAML
-/// decode-failure key would otherwise hash its `""` fallback like a real
-/// key and silently collapse with any other undecodable key in the same
-/// object under `collapse: true` (#1385's "never a duplicate" rule exists
-/// precisely to prevent that) -- the same ordering
-/// [`key_display_string_kind`] already uses for the display-string case.
-/// A no-op for JSON off the fast path: its two checks are redundant with
-/// each other (both resolve via `as_str`), just no longer free to reach.
+/// all -- YAML never has one), asks
+/// [`decoded_key_str`](DocumentValue::decoded_key_str), which answers both
+/// halves of the old `string_decode_error()`-then-`key_string()` pair from
+/// one decode. It preserves that pair's *order*, which is what matters
+/// here: YAML's `key_string()` override never returns `None` at all (#222
+/// -- a complex or undecodable key stringifies to `""` rather than being
+/// dropped), so a YAML decode-failure key would otherwise hash its `""`
+/// fallback like a real key and silently collapse with any other
+/// undecodable key in the same object under `collapse: true` (#1385's
+/// "never a duplicate" rule exists precisely to prevent that). `Err` and
+/// `Ok(None)` both mean "no reliable identity" and both map to `None`,
+/// exactly as the two separate checks did.
+///
+/// The fused call goes *after* the raw-span probe, never before it: the
+/// +10-12% above is the cost of reaching any decode ahead of that fast
+/// path, and `decoded_key_str` is a decode. Below it, the saving is real
+/// and is YAML's in particular -- YAML has no `key_raw_unescaped`
+/// override, so every YAML key hash lands here and used to pay two full
+/// `YamlString` decodes (#965 item 10, the same redundancy
+/// [`key_display_string_kind`] shed).
 fn key_hash_of<V: DocumentValue>(key: &V) -> Option<u64> {
     if let Some(raw) = key.key_raw_unescaped() {
         if let Some(hash) = ascii_key_hash(raw) {
             return Some(hash);
         }
     }
-    if key.string_decode_error().is_some() {
-        return None;
-    }
-    key.key_string().map(|key| key_hash(key.as_bytes()))
+    key.decoded_key_str()
+        .ok()
+        .flatten()
+        .map(|key| key_hash(key.as_bytes()))
 }
 
 /// [`key_hash_of`] for a caller holding a whole field.
@@ -1467,17 +1478,18 @@ fn field_key_hash<V: DocumentValue, C: DocumentCursor>(field: &DocumentField<V, 
 /// than `None` for a key with no scalar form), so this costs YAML one
 /// predicate on a branch it never takes.
 ///
-/// `key_string()` first, `string_decode_error()` only on its `None` (#1677
-/// perf-guard finding): the ordinary case -- a key that decodes fine --
-/// answers from that one call alone, instead of paying for two independent
-/// full decodes of the same bytes (`key_string()`'s own `as_str()` and a
-/// second, separate `as_str()` inside `string_decode_error()`). Equivalent
-/// to the original `dec_err.is_none() && key_str.is_none()`: whenever
-/// `key_string()` is `Some`, that conjunction is already `false` regardless
-/// of `string_decode_error()`, so short-circuiting on it first changes
-/// nothing observable, only which (redundant) call gets skipped.
+/// This *is* [`decoded_key_str`](DocumentValue::decoded_key_str)'s middle
+/// outcome, so it asks for it directly rather than reconstructing it from
+/// two accessors: `Ok(None)` is defined as "the grammar never allowed this
+/// key", `Err` is #1247's decode failure, and `Ok(Some(_))` is an ordinary
+/// key. That is the same predicate the earlier
+/// `key_string().is_none() && string_decode_error().is_none()` computed --
+/// whenever `key_string()` is `Some`, the conjunction is already `false`
+/// regardless of the other call -- and it is one decode on *every* input
+/// rather than #1677's one-or-two, since the malformed path no longer
+/// needs a second, separate `as_str()` to confirm the cause.
 pub(crate) fn key_is_malformed<V: DocumentValue>(key: &V) -> bool {
-    key.key_string().is_none() && key.string_decode_error().is_none()
+    matches!(key.decoded_key_str(), Ok(None))
 }
 
 /// The string to show for a key, substituting a best-effort fallback when
@@ -3602,7 +3614,10 @@ mod tail_gap_receiver_tests {
 /// `(spelling, is_fallback)` output, which is what callers actually consume.
 #[cfg(test)]
 mod decoded_key_str_tests {
-    use super::{key_display_string_kind, DocumentValue};
+    use super::{
+        ascii_key_hash, key_display_string_kind, key_hash, key_hash_of, key_is_malformed,
+        DocumentValue,
+    };
     use crate::json::JsonIndex;
     use crate::yaml::YamlIndex;
 
@@ -3615,13 +3630,13 @@ mod decoded_key_str_tests {
         key_display_string_kind(&field.key()).map(|(key, fallback)| (key.into_owned(), fallback))
     }
 
-    /// `json_first_key` for a single-document YAML mapping.
+    /// [`json_first_key`]'s counterpart for a single-document YAML mapping.
     fn yaml_first_key(yaml: &[u8]) -> Option<(String, bool)> {
         yaml_nth_key(yaml, 0)
     }
 
-    /// `yaml_first_key` for the `nth` field, so an alias key can be reached
-    /// past the field that declares the anchor it names.
+    /// [`yaml_first_key`] generalised to the `nth` field, so an alias key
+    /// can be reached past the field that declares the anchor it names.
     fn yaml_nth_key(yaml: &[u8], nth: usize) -> Option<(String, bool)> {
         let index = YamlIndex::build(yaml).expect("valid YAML");
         let cursor = index.root(yaml);
@@ -3744,5 +3759,120 @@ mod decoded_key_str_tests {
             yaml_first_key(b"? [1, 2]\n: 1\n"),
             Some((String::new(), false))
         );
+    }
+
+    /// `key_hash_of` and `key_is_malformed` answered from the same
+    /// `string_decode_error()`/`key_string()` pair `key_display_string_kind`
+    /// did, in two *different* hand-written orders, and both now ask
+    /// `decoded_key_str` instead (#965 item 10).
+    ///
+    /// Both feed identity decisions -- `key_hash_of` decides what
+    /// `collapse: true` treats as a duplicate (#1385's "a key that will not
+    /// decode is never a duplicate"), `key_is_malformed` decides what raises
+    /// as #1194 -- so an answer that shifts on any key shape is a silent
+    /// data bug, not a cosmetic one. This asserts against the *pre-fusion
+    /// bodies*, recomputed inline, rather than against expected constants:
+    /// a constant would pin what the new code does, not that it still
+    /// agrees with what the old code did.
+    fn assert_fused_predicates_match_the_pair<V: DocumentValue>(key: &V, label: &str) {
+        // `key_hash_of`'s pre-fusion body, raw-span fast path included --
+        // that probe is unchanged, but the tail has to agree *behind* it.
+        let was_hash = if let Some(hash) = key.key_raw_unescaped().and_then(ascii_key_hash) {
+            Some(hash)
+        } else if key.string_decode_error().is_some() {
+            None
+        } else {
+            key.key_string().map(|k| key_hash(k.as_bytes()))
+        };
+        assert_eq!(
+            was_hash,
+            key_hash_of(key),
+            "key_hash_of disagrees on {label}"
+        );
+
+        // `key_is_malformed`'s pre-fusion body (#1677's reversed order).
+        let was_malformed = key.key_string().is_none() && key.string_decode_error().is_none();
+        assert_eq!(
+            was_malformed,
+            key_is_malformed(key),
+            "key_is_malformed disagrees on {label}"
+        );
+    }
+
+    /// Every JSON key shape the two predicates can be handed: escape-free
+    /// ASCII (the #1514 raw-span fast path), non-ASCII and escaped keys
+    /// (which fall past it), both decode-failure families, and the #1194
+    /// non-string key.
+    #[test]
+    fn json_fused_predicates_match_the_old_pair_965() {
+        for key in [
+            r#""a""#,
+            r#""""#,
+            r#""\u0041""#,
+            r#""a\/b""#,
+            r#""\\""#,
+            r#""\n""#,
+            r#""\u0000""#,
+            r#""\uD83D\uDE00""#,
+            "\"\u{e9}\"",
+            "\"\u{1f600}\"",
+            r#""\q""#,
+            r#""\ud800""#,
+            r#""\udfff""#,
+            r#""\ud800x""#,
+            r#""\uZZZZ""#,
+            r#""\u""#,
+            "123",
+            "true",
+            "null",
+        ] {
+            let doc = alloc::format!("{{{key}:1}}");
+            let bytes = doc.as_bytes();
+            let index = JsonIndex::build(bytes);
+            let cursor = index.root(bytes);
+            let fields = cursor.value().as_object().expect("an object");
+            let (field, _) = fields.uncons().expect("at least one field");
+            assert_fused_predicates_match_the_pair(&field.key(), key);
+        }
+    }
+
+    /// The YAML half, which matters more: YAML has no `key_raw_unescaped`
+    /// override, so *every* key here lands on the fused call rather than the
+    /// fast path. Covers both #222 fallback routes (complex key, alias to a
+    /// non-scalar), the alias-to-string hop, and an alias whose target will
+    /// not decode.
+    #[test]
+    fn yaml_fused_predicates_match_the_old_pair_965() {
+        for doc in [
+            "a: 1\n",
+            "\"\": 1\n",
+            "\"a\\u0041b\": 1\n",
+            "'sq': 1\n",
+            "123: 1\n",
+            "true: 1\n",
+            "null: 1\n",
+            "~: 1\n",
+            "\"\\\\\": 1\n",
+            "\"\\n\": 1\n",
+            "\"a\\qb\": 1\n",
+            "\"\\ud800\": 1\n",
+            "? [1, 2]\n: 1\n",
+            "? {a: 1}\n: 1\n",
+            "a: &x foo\n*x: 1\n",
+            "a: &x {p: 1}\n*x: 1\n",
+            "a: &x [1]\n*x: 1\n",
+            "a: &x null\n*x: 1\n",
+            "a: &x \"b\\qc\"\n*x: 1\n",
+        ] {
+            let bytes = doc.as_bytes();
+            let index = YamlIndex::build(bytes).expect("valid YAML");
+            let cursor = index.root(bytes);
+            let mapping = cursor.first_child().expect("document content");
+            let mut fields = mapping.value().as_object().expect("a mapping");
+            while let Some((field, rest)) = fields.uncons() {
+                assert_fused_predicates_match_the_pair(&field.key(), doc);
+                fields = rest;
+            }
+        }
     }
 }
