@@ -1023,27 +1023,28 @@ fn print_validation_error(err: &ValidationError, input: &[u8], filename: Option<
 /// jq: 1 compile error
 /// ```
 ///
-/// **Each line is located by searching `filter` for the offending identifier,
-/// not read off the AST** — `Expr::FuncCall` carries no source position, and
-/// adding one would perturb `format!("{body:?}").len()`, which #1381's
-/// `MAX_FUNC_EXPANSION_WEIGHTED_COST` is calibrated against. To still locate a
-/// *repeated* undefined name's calls individually rather than always citing
-/// the first occurrence, each successive lookup for the same name resumes the
-/// search right after the previous one's match — matching jq's own output
-/// whenever `resolve_func_calls_all`'s traversal order (which follows source
-/// order for every existing `Expr` variant) agrees with a left-to-right
-/// textual scan.
+/// **Each line is read off a real call-site position where one exists**
+/// (#2085). `Expr::FuncCall` still carries no source position — adding one
+/// would grow `Expr` and perturb its `Debug`/`PartialEq` — so `call_sites`
+/// is the parallel table [`jq::collect_call_sites`] builds during a parse
+/// instead, holding the byte offset of every *call*'s own identifier. Because
+/// only the generic call-parsing path records into it, an object key, a
+/// `$`-variable, or a string that merely spells the same identifier is absent
+/// from it by construction.
 ///
-/// **This is a textual heuristic, not a positional proof, and it can misfire
-/// even when traversal order agrees with text order**: `locate_identifier_from`
-/// matches any occurrence of the name's spelling, not specifically a call
-/// site, so an unrelated same-spelling occurrence earlier in the source (an
-/// object key, a variable) is indistinguishable from the real one to a pure
-/// text scan. `{nosuch: 1} | nosuch` cites the harmless object key on line 1
-/// instead of the actual failing call on line 2 — a pre-existing gap from
-/// #1473, not something this resumed-search scheme introduces or fixes.
-/// Tracked separately as #2085. Closing it for real needs the same source position on `Expr::FuncCall`
-/// this whole approach exists to avoid adding.
+/// That closes the misfire this used to have. Before #2085 every line was
+/// found by searching `filter` for the offending identifier, which matched any
+/// occurrence of the spelling rather than a call specifically — so
+/// `{nosuch: 1} | nosuch` cited the harmless object key on line 1 instead of
+/// the failing call on line 2 (jq 1.7.1 says line 2).
+///
+/// **The text search is still the fallback**, for the cases the table cannot
+/// answer: a call inlined from an `include`d module or `~/.jq` has no
+/// occurrence in `filter`, and a filter whose own parse differed from the one
+/// `collect_call_sites` performs may under-record. Repeated undefined names
+/// are still matched positionally against the table in source order, and the
+/// fallback keeps its own resume-after-previous-match behaviour so a repeated
+/// name still finds its own occurrence rather than repeating the first.
 ///
 /// A filter whose failing call came from an `include`d module or `~/.jq` has
 /// no occurrence in `filter` at all, and drops the line marker and source
@@ -1057,10 +1058,33 @@ fn print_validation_error(err: &ValidationError, input: &[u8], filename: Option<
 fn report_unresolved_calls(unresolved: &[UnresolvedCall], filter: &str) {
     // Byte offset to resume searching from, per name, so a second call to the
     // same undefined name finds its own occurrence rather than repeating the
-    // first one's.
+    // first one's. Used only by the text-search fallback below.
     let mut resume_from: HashMap<&str, usize> = HashMap::new();
 
+    // #2085: real positions for the calls this filter's own text contains.
+    // Only consulted on this error path, so the extra parse is never on
+    // anyone's hot path -- see `jq::collect_call_sites`.
+    let call_sites = jq::collect_call_sites(filter, jq::ParserMode::Jq, true);
+    // How many calls of each name we have already reported, so a repeated
+    // undefined name walks its own successive call sites in source order --
+    // the same rule `resume_from` gives the fallback.
+    let mut consumed: HashMap<&str, usize> = HashMap::new();
+
     for UnresolvedCall { name, arity } in unresolved {
+        let taken = consumed.entry(name.as_str()).or_insert(0);
+        let from_table = call_sites
+            .iter()
+            .filter(|c| c.name == *name)
+            .nth(*taken)
+            .map(|c| c.offset);
+        if let Some(offset) = from_table {
+            *taken += 1;
+            let (line_no, line_text, column) = line_at_offset(filter, offset);
+            eprintln!("jq: error: {name}/{arity} is not defined at <top-level>, line {line_no}:");
+            eprintln!("{line_text}{}", " ".repeat(column));
+            continue;
+        }
+
         let start_from = resume_from.get(name.as_str()).copied().unwrap_or(0);
 
         match locate_identifier_from(filter, name, start_from) {
@@ -1092,6 +1116,25 @@ fn report_unresolved_calls(unresolved: &[UnresolvedCall], filter: &str) {
 /// search for `f` does not match the `f` inside `first` — but `::` is allowed
 /// on the left, since a namespaced call arrives here as `ns::f` while the
 /// source spells the two halves either side of the separator.
+/// The 1-based line number, that line's text, and the 0-based column, for a
+/// byte `offset` into `filter` (#2085).
+///
+/// The positional counterpart of [`locate_identifier_from`]'s own line
+/// arithmetic, for an offset that is already known to be a real call site
+/// rather than one that had to be searched for.
+fn line_at_offset(filter: &str, offset: usize) -> (usize, String, usize) {
+    let line_start = filter[..offset].rfind('\n').map_or(0, |i| i + 1);
+    let line_no = filter[..line_start].matches('\n').count() + 1;
+    let line_end = filter[line_start..]
+        .find('\n')
+        .map_or(filter.len(), |i| line_start + i);
+    (
+        line_no,
+        filter[line_start..line_end].to_string(),
+        offset - line_start,
+    )
+}
+
 fn locate_identifier_from(
     filter: &str,
     name: &str,

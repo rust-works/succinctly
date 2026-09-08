@@ -35597,6 +35597,95 @@ fn test_modulemeta_always_errors_like_jq_2111() -> Result<()> {
     Ok(())
 }
 
+/// #2085: an unresolved call's reported line comes from a real call-site
+/// position, not from a text search for the name's spelling.
+///
+/// Before this, `report_unresolved_calls` located each line by scanning
+/// `filter` for the offending identifier, which matched *any* occurrence --
+/// so an object key, a `$`-variable, a `.field` or a string literal spelling
+/// the same name earlier in the source was indistinguishable from the real
+/// call and got cited instead. `jq::collect_call_sites` now supplies the byte
+/// offset of each genuine call, and only the generic call-parsing path
+/// records into it, so those decoys are absent by construction.
+///
+/// Every expectation below is a live jq 1.7.1 capture. All twelve rows failed
+/// before the fix; a matrix of 25 unresolved-call shapes went from 13/25 to
+/// 25/25 matching jq, with none regressing.
+#[test]
+fn test_unresolved_call_line_comes_from_the_call_not_a_name_match_2085() -> Result<()> {
+    // (filter, expected line number)
+    let cases: &[(&str, usize)] = &[
+        // The issue's own repro: an object key on line 1, the real call on 2.
+        ("{nosuch: 1}\n| nosuch", 2),
+        // A quoted key spells it too, and is equally not a call.
+        ("{\"nosuch\": 1}\n| nosuch", 2),
+        // A string literal that merely contains the name.
+        ("\"nosuch\"\n| nosuch", 2),
+        // A `$`-bound variable of the same spelling.
+        (". as $nosuch\n| nosuch", 2),
+        // A field access of the same spelling.
+        (".nosuch\n| nosuch", 2),
+        // The decoy nested one level down, still not a call.
+        ("{a: {nosuch: 1}}\n| nosuch", 2),
+        // A decoy key alongside other keys.
+        ("{nosuch: 1, other: 2}\n| nosuch", 2),
+        // With arguments, so the call is `nosuch/1` rather than `nosuch/0`.
+        ("{nosuch: 1}\n| nosuch(1)", 2),
+    ];
+
+    for (filter, want_line) in cases {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("null"))?;
+        assert_eq!(
+            code, 3,
+            "`{filter}` -- stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert_eq!(
+            stdout, "",
+            "`{filter}` -- a compile error produces no output"
+        );
+        assert!(
+            stderr.contains(&format!("is not defined at <top-level>, line {want_line}:")),
+            "`{filter}` should cite line {want_line} -- stderr: {stderr:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// #2085 companion: the two properties the positional lookup must not lose.
+///
+/// A repeated undefined name still walks its own successive call sites in
+/// source order rather than repeating the first, and a name with no call site
+/// recorded at all (here, one reached only through the `builtin_fallback`
+/// wrong-arity path) still falls back to the text search rather than dropping
+/// the line marker. Both captured live from jq 1.7.1.
+#[test]
+fn test_unresolved_call_positional_lookup_keeps_repeat_and_fallback_2085() -> Result<()> {
+    // Two distinct calls to the same undefined name, on different lines: each
+    // diagnostic cites its own line, not the first one twice.
+    let (stdout, stderr, code) = run_jq_full(&["-c", "nosuch\n| nosuch"], Some("null"))?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("line 1:") && stderr.contains("line 2:"),
+        "each call should cite its own line -- stderr: {stderr:?}"
+    );
+
+    // Wrong-arity call of a real `def`: still located, still line 1.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "def f(x): x; if false then f(1;2;3) else 1 end"],
+        Some("null"),
+    )?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("f/3 is not defined at <top-level>, line 1:"),
+        "stderr: {stderr:?}"
+    );
+
+    Ok(())
+}
+
 /// An unresolvable call in a branch that is never taken still fails, and fails
 /// before any input is read. jq: `f/3 is not defined`, exit 3.
 #[test]
