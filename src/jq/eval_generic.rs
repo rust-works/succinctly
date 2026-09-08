@@ -63,18 +63,19 @@ use super::eval::{
     needs_path_context, numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned,
     owned_bound_to_i64, owned_to_string, param_names, prefer_pending_control,
     slice_component_value, slice_object_as_yq_children, slice_owned_value_read,
-    streams_escaped_generator_prefix, substitute_bound_var, substitute_vars, suppress_or_raise,
-    suppresses, tonumber_from_str, vec_with_capacity, yq_absent_key_read_is_empty,
-    yq_assign_rhs_document, yq_empty_operand_output, yq_field_index_on_scalar_is_empty,
-    yq_negative_index_check, yq_numeric_index_on_object_is_null, yq_object_key_stringify,
-    yq_read_only_context, BinaryFanoutRules, Control, Demand, EmptyOperandOp, EvalError,
-    EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail, QueryResult, YqSemantics,
+    streams_escaped_generator_prefix, substitute_bound_var_from, substitute_vars,
+    suppress_or_raise, suppresses, tonumber_from_str, vec_with_capacity,
+    yq_absent_key_read_is_empty, yq_assign_rhs_document, yq_empty_operand_output,
+    yq_field_index_on_scalar_is_empty, yq_negative_index_check, yq_numeric_index_on_object_is_null,
+    yq_object_key_stringify, yq_read_only_context, BinaryFanoutRules, Control, Demand,
+    EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail,
+    QueryResult, YqSemantics,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
 use super::expr::{
-    AssignOp, BoundBody, Builtin, CompareOp, Expr, FormatType, FuncDefData, Literal, NumberKey,
-    ObjectEntry, ObjectKey, Pattern, StringPart,
+    AssignOp, BindOrigin, BoundBody, Builtin, CompareOp, Expr, FormatType, FuncDefData, Literal,
+    NumberKey, ObjectEntry, ObjectKey, Pattern, StringPart,
 };
 use super::slice::{literal_component_from_values, slice_str, SliceBounds};
 use super::value::{owned_value_eq, NumberRepr, OwnedValue};
@@ -6717,6 +6718,17 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // to the shared conversion now instead.
         Expr::Literal(lit) => GenericResult::Owned(literal_to_owned(lit)),
 
+        // A bound variable (#2072): the node it was bound from when the
+        // binding could tell and it belongs to this cursor's document --
+        // emitted as that live cursor, so every cursor property (`key`,
+        // `path`, `line`, `file_index`, a YAML anchor or style mark) answers
+        // itself -- else the frozen value. Before this arm the node fell to
+        // the `_` bridge below and paid a reindex round trip per use.
+        Expr::TrackedVar(var) => match cursor.and_then(|c| bind_origin_cursor(&var.node, &c)) {
+            Some(c) => GenericResult::OneCursor(c),
+            None => GenericResult::Owned(var.value.clone()),
+        },
+
         // Formats are pure functions of the value, so evaluate them here rather
         // than falling through to the catch-all, which would serialize the
         // value to JSON and rebuild a `JsonIndex` for every one (#124).
@@ -8241,6 +8253,152 @@ fn materialize_bound_values_generic<V: DocumentValue>(
     Ok((bound_values, bound_control))
 }
 
+/// [`materialize_bound_values_generic`] keeping, per bound value, the node
+/// it came from (#2072): a cursor the bind produced names its own node, and
+/// a `. as $x` passthrough names the ambient one. A value the bind built
+/// (`Owned`, or a `V` reached some other way) has no origin, and the body
+/// then sees exactly what it saw before.
+fn materialize_bound_values_with_origin<V: DocumentValue>(
+    bind: &Expr,
+    bound_result: GenericResult<V>,
+    cursor: Option<V::Cursor>,
+) -> Result<(Vec<BoundValue>, Option<Control>), Flow> {
+    let passthrough = matches!(strip_parens(bind), Expr::Identity)
+        .then(|| cursor.map(|c| bind_origin_of_cursor(&c)))
+        .flatten();
+    let mut out: Vec<BoundValue> = Vec::new();
+    let mut control = None;
+    match bound_result.materialize_lazy() {
+        GenericResult::One(v) => match to_owned(&v) {
+            Ok(v) => out.push((v, passthrough)),
+            Err(e) => control = Some(Control::Error(e)),
+        },
+        GenericResult::OneCursor(c) => match to_owned_cursor(&c) {
+            Ok(v) => out.push((v, Some(bind_origin_of_cursor(&c)))),
+            Err(e) => control = Some(Control::Error(e)),
+        },
+        GenericResult::Many(vs) => {
+            for v in &vs {
+                match to_owned(v) {
+                    Ok(v) => out.push((v, None)),
+                    Err(e) => {
+                        control = Some(Control::Error(e));
+                        break;
+                    }
+                }
+            }
+        }
+        GenericResult::ManyCursor(cs) => {
+            for c in &cs {
+                match to_owned_cursor(c) {
+                    Ok(v) => out.push((v, Some(bind_origin_of_cursor(c)))),
+                    Err(e) => {
+                        control = Some(Control::Error(e));
+                        break;
+                    }
+                }
+            }
+        }
+        GenericResult::None => {}
+        GenericResult::Owned(v) => out.push((v, None)),
+        GenericResult::ManyOwned(vs) => out.extend(vs.into_iter().map(|v| (v, None))),
+        GenericResult::Error(e) => control = Some(Control::Error(e)),
+        GenericResult::Break(label) => control = Some(Control::Break(label)),
+        GenericResult::Halt(code) => control = Some(Control::Halt(code)),
+        GenericResult::Partial(vs, c) => {
+            out.extend(vs.into_iter().map(|v| (v, None)));
+            control = Some(c);
+        }
+        GenericResult::LazyKeys { .. }
+        | GenericResult::LazyIndexRange(_)
+        | GenericResult::LazySeq(_) => {
+            unreachable!("materialize_lazy() already normalized every lazy variant")
+        }
+    }
+    if out.is_empty() {
+        return Err(match control {
+            Some(control) => Flow::Escaped(control),
+            None => Flow::Exhausted,
+        });
+    }
+    Ok((out, control))
+}
+
+/// A bound value and, when the binding could tell, the node it came from.
+type BoundValue = (OwnedValue, Option<BindOrigin>);
+
+/// The origin of a value bound from a document node (#2072).
+fn bind_origin_of_cursor<C: DocumentCursor>(c: &C) -> BindOrigin {
+    BindOrigin::Node {
+        node: c.node_id(),
+        document: c.document_token(),
+    }
+}
+
+/// The origin of a value bound inside the owned identity pipe (#2072): the
+/// identity itself, with its base cursor reduced to the id the AST can hold.
+fn bind_origin_of_identity<V: DocumentValue>(id: &OwnedIdentity<V>) -> BindOrigin {
+    BindOrigin::Owned {
+        base: id.base.map(|c| (c.node_id(), c.document_token())),
+        chain: id.ancestors.clone(),
+        key_node: id.key_node,
+    }
+}
+
+/// The live cursor a `BindOrigin::Node` names, if `anchor` belongs to the
+/// same document. The token is checked *before* the id is trusted: BP
+/// positions are per-document integers, so an id from one document is
+/// usually in range in another and `same_node` cannot tell them apart
+/// (`node_id_reindex_tests`, `src/jq/document.rs`).
+fn bind_origin_cursor<C: DocumentCursor>(origin: &Option<BindOrigin>, anchor: &C) -> Option<C> {
+    match origin {
+        Some(BindOrigin::Node { node, document }) if *document == anchor.document_token() => {
+            anchor.at_node_id(*node)
+        }
+        _ => None,
+    }
+}
+
+/// The identity a bound variable stands at (#2072), rebuilt from its origin:
+/// a document node is `kept` at that node, an owned-tree position is the
+/// identity the bind recorded. `None` when the origin names a node of a
+/// document `anchor` is not a cursor of (or there is no anchor at all), so
+/// the caller falls back to the value-equality rule.
+fn identity_from_origin<V: DocumentValue>(
+    origin: &BindOrigin,
+    anchor: Option<&V::Cursor>,
+) -> Option<OwnedIdentity<V>> {
+    match origin {
+        BindOrigin::Node { .. } => {
+            bind_origin_cursor(&Some(origin.clone()), anchor?).map(OwnedIdentity::kept)
+        }
+        BindOrigin::Owned {
+            base: None,
+            chain,
+            key_node,
+        } => Some(OwnedIdentity {
+            base: None,
+            ancestors: chain.clone(),
+            key_node: *key_node,
+        }),
+        BindOrigin::Owned {
+            base: Some((node, document)),
+            chain,
+            key_node,
+        } => {
+            let anchor = anchor?;
+            if anchor.document_token() != *document {
+                return None;
+            }
+            Some(OwnedIdentity {
+                base: Some(anchor.at_node_id(*node)?),
+                ancestors: chain.clone(),
+                key_node: *key_node,
+            })
+        }
+    }
+}
+
 /// Lazy twin of `eval::each_as` (#1596): the bind expression (`expr`) is
 /// evaluated eagerly, exactly as `eval::each_as` already does -- this fix is
 /// scoped to what runs *per bound value*, not to the binding itself. Each
@@ -8259,13 +8417,14 @@ fn each_as_generic<S: EvalSemantics, V: DocumentValue>(
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Flow {
     let bound_result = eval_single::<S, V>(expr, value.clone(), optional, cursor);
-    let (bound_values, bound_control) = match materialize_bound_values_generic(bound_result) {
-        Ok(pair) => pair,
-        Err(flow) => return flow,
-    };
+    let (bound_values, bound_control) =
+        match materialize_bound_values_with_origin(expr, bound_result, cursor) {
+            Ok(pair) => pair,
+            Err(flow) => return flow,
+        };
 
-    for bound_val in bound_values {
-        let substituted_body = substitute_bound_var(expr, body, var, &bound_val);
+    for (bound_val, origin) in bound_values {
+        let substituted_body = substitute_bound_var_from(expr, body, var, &bound_val, origin);
         match eval_each_generic::<S, V>(&substituted_body, value.clone(), optional, cursor, sink) {
             Flow::Exhausted => {}
             other => return other,
@@ -13000,6 +13159,10 @@ fn path_context_is_navigational_at(expr: &Expr, unfolded: u8) -> bool {
     let nav = |e: &Expr| path_context_is_navigational_at(e, unfolded);
     match expr {
         Expr::Identity | Expr::Iterate | Expr::Field(_) | Expr::Index { .. } => true,
+        // #2072: a bound variable that knows the document node it came from
+        // moves the position there (or to a detached copy of its value when
+        // the node is another document's).
+        Expr::TrackedVar(var) => matches!(var.node, Some(BindOrigin::Node { .. })),
         // spine 2416 (walk residue): the heads the walk used to refuse, all
         // stepped through `PathNode::Owned` now -- a slice (literal or
         // computed, `?` included), `getpath(p)` and recursive descent
@@ -13297,6 +13460,27 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
     match expr {
         Expr::Identity => {
             out.push(pos.clone());
+            Ok(())
+        }
+        // #2072: step to the node the variable was bound from -- its path
+        // and ancestors climbed from the cursor itself, as for any walk
+        // input -- or, when that node is not in this document, to a
+        // detached copy of the value.
+        Expr::TrackedVar(var) => {
+            let anchor = core::iter::once(&pos.node)
+                .chain(pos.ancestors.iter())
+                .find_map(|n| match n {
+                    PathNode::At(c) => Some(*c),
+                    PathNode::Absent | PathNode::Owned(_) => None,
+                });
+            match anchor.and_then(|a| bind_origin_cursor(&var.node, &a)) {
+                Some(c) => out.push(path_context_root::<V>(c)?),
+                None => out.push(PathContextPos {
+                    node: PathNode::Owned(Rc::new(var.value.clone())),
+                    path: Vec::new(),
+                    ancestors: Vec::new(),
+                }),
+            }
             Ok(())
         }
         Expr::Paren(inner) => path_context_step_generic::<S, V>(inner, pos, out),
@@ -18431,6 +18615,13 @@ fn owned_identity_nav_supported(expr: &Expr) -> bool {
         | Expr::Index { .. }
         | Expr::Iterate
         | Expr::Slice { .. } => true,
+        // #2072: a bound variable is a step to the node it was bound from
+        // (or to its detached value), so `$x[0]`/`$x.a` -- a pipe with the
+        // variable at its head, which `owned_identity_operand_supported`
+        // already admitted -- can be stepped rather than hitting the
+        // `unreachable!` below (`. as $x | ($x.a[0] + 1) | path` used to
+        // abort the process).
+        Expr::TrackedVar(_) => true,
         // #2471: a *computed* component is navigation here too. The
         // component expression is evaluated against this stage's own input
         // -- the input whose position `id` describes -- so a `key`/`path`
@@ -18886,6 +19077,24 @@ fn owned_identity_step<S: EvalSemantics, V: DocumentValue>(
     match expr {
         Expr::Identity => {
             out.push((value.clone(), id.clone()));
+            Ok(())
+        }
+        // #2072: the variable stands where it was bound; without an origin
+        // it keeps the input's position only when it *is* the input, the
+        // same rule `OwnedIdentityRule::Bound` applies.
+        Expr::TrackedVar(var) => {
+            let vid = var
+                .node
+                .as_ref()
+                .and_then(|origin| identity_from_origin::<V>(origin, id.base.as_ref()))
+                .unwrap_or_else(|| {
+                    if owned_value_eq::<S>(&var.value, value) {
+                        id.clone()
+                    } else {
+                        OwnedIdentity::detached()
+                    }
+                });
+            out.push((var.value.clone(), vid));
             Ok(())
         }
         // The bare `E[K]?` / `E[S:T]?` spelling: its `?` covers the
@@ -19367,10 +19576,17 @@ fn owned_identity_operand<S: EvalSemantics, V: DocumentValue>(
     if let Expr::Literal(lit) = expr {
         return Ok(Some((literal_to_owned(lit), OwnedIdentity::detached())));
     }
-    // A value the rewrite spelled in place (spine 2416, identity pass): a
-    // literal like any other, with no position of its own.
+    // A value the rewrite spelled in place (spine 2416, identity pass) is a
+    // literal like any other, with no position of its own; a bound variable
+    // that knows where it was bound stands there (#2072: `.a as $x | ($x +
+    // [4]) | path` is `["a"]` in yq v4.53.3, the left operand's node).
     if let Expr::TrackedVar(v) = expr {
-        return Ok(Some((v.value.clone(), OwnedIdentity::detached())));
+        let vid = v
+            .node
+            .as_ref()
+            .and_then(|origin| identity_from_origin::<V>(origin, id.base.as_ref()))
+            .unwrap_or_else(OwnedIdentity::detached);
+        return Ok(Some((v.value.clone(), vid)));
     }
     // spine 2416 (identity pass): an operand outside the navigation grammar
     // -- `parent`, `(parent | length)`, `(key | tostring)` -- is run through
@@ -19446,11 +19662,25 @@ fn owned_identity_placed_by<S: EvalSemantics, V: DocumentValue>(
 ) -> Result<Option<OwnedIdentity<V>>, EvalError> {
     Ok(match rule {
         OwnedIdentityRule::Keeps | OwnedIdentityRule::KeyNode => Some(id.clone()),
-        OwnedIdentityRule::Bound => Some(if owned_value_eq::<S>(output, value) {
-            id.clone()
-        } else {
-            OwnedIdentity::detached()
-        }),
+        // #2072: a variable that knows where it was bound stands there. One
+        // that does not -- bound by a site with no cursor domain, or from a
+        // node of another document -- keeps the value-equality rule.
+        OwnedIdentityRule::Bound => Some(
+            match strip_parens(stage) {
+                Expr::TrackedVar(var) => var
+                    .node
+                    .as_ref()
+                    .and_then(|origin| identity_from_origin::<V>(origin, id.base.as_ref())),
+                _ => None,
+            }
+            .unwrap_or_else(|| {
+                if owned_value_eq::<S>(output, value) {
+                    id.clone()
+                } else {
+                    OwnedIdentity::detached()
+                }
+            }),
+        ),
         OwnedIdentityRule::Slice => {
             let Expr::Slice {
                 start,
@@ -19565,6 +19795,47 @@ fn owned_identity_placed_by<S: EvalSemantics, V: DocumentValue>(
     })
 }
 
+/// The values an `as` stage's bind source produces at `(value, id)`, each
+/// with the identity it stands at when the source can run as stages of this
+/// pipe (#2072) -- so `.[] as $x` inside `.a` binds every element at
+/// `["a", i]`, and `$x` later stands there. A source the stage gate does not
+/// admit as stages is resolved the way it was before, for its values only,
+/// and its variable carries no origin.
+fn owned_identity_bind_values<S: EvalSemantics, V: DocumentValue>(
+    bind: &Expr,
+    value: &OwnedValue,
+    id: &OwnedIdentity<V>,
+    optional: bool,
+) -> (Vec<BoundValue>, Option<Control>) {
+    let stages = owned_identity_body_stages(bind);
+    if owned_identity_pipe_supported(stages) {
+        let mut pairs: Vec<BoundValue> = Vec::new();
+        let flow = eval_owned_identity_stages::<S, V>(
+            stages,
+            value.clone(),
+            id.clone(),
+            optional,
+            OwnedIdentityTail::Pairs(&mut |v, vid| {
+                pairs.push((v, Some(bind_origin_of_identity(&vid))));
+                Flow::Exhausted
+            }),
+        );
+        let control = match flow {
+            Flow::Exhausted | Flow::Stopped { .. } => None,
+            Flow::Escaped(control) => Some(control),
+        };
+        return (pairs, control);
+    }
+    let escaped = core::cell::RefCell::new(None);
+    let resolved = match owned_identity_resolve_at::<S, V>(bind, value, id, optional, &escaped) {
+        Ok(e) => e,
+        Err(e) => return (Vec::new(), Some(Control::Error(e))),
+    };
+    let (values, control) = owned_identity_values::<S>(&resolved, value, optional);
+    let control = control.or_else(|| escaped.into_inner());
+    (values.into_iter().map(|v| (v, None)).collect(), control)
+}
+
 /// An `as` stage inside the owned identity pipe (#2563).
 ///
 /// ADR-0021 decision 7's rule for a binding: the stage keeps the input's
@@ -19616,18 +19887,11 @@ fn eval_owned_identity_as<S: EvalSemantics, V: DocumentValue>(
     // The source stands where this stage stands, so its reads are constants
     // -- the same rewrite a computed navigation component gets, and the same
     // predicate gated it (`owned_identity_bind_supported`).
-    let escaped = core::cell::RefCell::new(None);
-    let resolved = match owned_identity_resolve_at::<S, V>(bind, value, id, optional, &escaped) {
-        Ok(e) => e,
-        Err(e) => return Flow::Escaped(Control::Error(e)),
-    };
-    let (bound_values, control) = owned_identity_values::<S>(&resolved, value, optional);
-    let control = control.or_else(|| escaped.into_inner());
-    for bound in bound_values {
-        // `bind`, not `resolved`: `is_identity_passthrough` is a question
-        // about what the user wrote, and the rewrite only replaces reads
-        // inside it.
-        let substituted = substitute_bound_var(bind, body, var, &bound);
+    let (bound_values, control) = owned_identity_bind_values::<S, V>(bind, value, id, optional);
+    for (bound, origin) in bound_values {
+        // `bind`, not the rewritten source: `is_identity_passthrough` is a
+        // question about what the user wrote.
+        let substituted = substitute_bound_var_from(bind, body, var, &bound, origin);
         match eval_owned_identity_spliced::<S, V>(
             &substituted,
             rest,
