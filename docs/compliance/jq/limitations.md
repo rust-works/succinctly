@@ -2887,9 +2887,27 @@ rather than its parser, and neither is reachable from a newline-terminated strea
    which its input loop reads as end-of-input and stops the whole stream — but only when it
    lands in the buffer that hit EOF. `printf '\x1e\x1e"a"'` prints nothing in real jq;
    `printf '\x1e\x1e{"a":1}\n'` prints the object.
+3. `jq_util_input_read_more` measures each chunk with `strlen`, so a NUL byte truncates the
+   input — again only in a chunk holding no newline. `printf '\x1eA+\x008e'` reports at
+   column 3 in real jq (which stopped at the NUL) and column 6 here.
 
 Running the sweep with `--expect-artifacts` puts these shapes back: 28 of 3,063 streams
-diverge, and every one is attributable to those two artifacts — none unexplained.
+diverge, and every one is attributable to those artifacts — none unexplained.
+
+A **malformed** BOM — a byte sequence that begins one and then contradicts it, such as
+`\xef\xbb` — is *not* in that category and is matched exactly. jq consumes the bytes that did
+match without counting them as columns, and then re-runs `parser_reset` at the top of every
+read, which leaves it parsing the bytes before the first RS instead of discarding them and
+wipes its state after every value, every newline, and at end of input:
+
+```
+$ printf '\xef\xbb1 2' | jq --seq -c '.'   # Potentially truncated top-level numeric value at EOF at line 1, column 3
+                                          # -- not the abandoned-text template, despite no RS byte anywhere
+```
+
+`succinctly jq` reproduces all of that on stderr. Its *stdout* still diverges for this shape
+in the pre-existing direction described above: real jq prints the `1` it read, succinctly
+drops the pre-RS content.
 
 Real-time interleaving of the warnings against stdout is also not reproduced: succinctly
 materializes `--seq` input before evaluating, so all warnings precede all values. jq's
