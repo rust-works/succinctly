@@ -44,12 +44,26 @@ SOURCES = [
     ("([.a] | .[0])", False), ("(.a | tojson | fromjson)", False), ("(.a, .c)", False),
     (".arr[]?", False), (".arr[0]?", False), ("($p | .b?)", True), ("$p", True),
     ("([$p] | .[0])", True), ("(if true then $p else . end)", True),
+    # #2042 review: error-catching wrappers around a navigation of a
+    # computed value (the resolver's own refusal must not be catchable),
+    # the recurse/getpath refusal kind, slices of every kind, negative
+    # indices, and marker heads behind nested pipes or later in the pipe.
+    ("(try (.a | tostring | .[0:1]) catch \"x\")", False), ("((.a | tostring | .[0:1])?)", False),
+    ("(([1] | .[0])? // \"alt\")", False), ("(try ([1] | .[0]) catch \"c\")", False),
+    ("([1,[2]] | ..)", False), ("([1] | getpath([]))", False), ("(.a | ..)", False),
+    (".arr[0:1]?", False), (".arr[1:1]?", False), (".a[0:1]?", False), (".arr[-1]?", False),
+    (".a[0:3]?", False), ("(.a | select(.b?))", False), ("(.a // 1)", False),
+    ("(if .a then .a else .c end)", False), (".a?", False),
+    ("($p.b? | .c?)", True), ("(($p | .b?) | .c?)", True), ("(.c | $p | .b?)", True),
+    ("(try $p.b? catch \"X\")", True), ("(5 | $p | .b?)", True), ("($p | ..)", True),
+    ("($p[0:1]?)", True),
 ]
 NAV = [".a", ".c", ".x", ".x.a", ".b?", ".arr[0]?", ".arr[]?"]
 LITERAL = ["5", "null", "true", "\"z\""]
 PASSTHROUGH = ["select(true)", "if true then . else 1 end", "try . catch 1", "(label $out | .)", ". as $q | ."]
 MOVES = ["([.a] | first)", "{k: .a}", "[.a]", "(tojson | fromjson)", "([1] | first)"]
 USES = ["$v", "$v.b?", "($v | select(true))", "(if true then $v else 1 end)", "($v | .b?)",
+        "$v[0:1]?", "(.a[0:1]? | $v)", "(.arr[-1]? | $v)", "recurse(if . == $v and type == \"object\" then $v.b? else empty end)",
         "$v as $w | $w", "reduce (1) as $i (.; $v)", "reduce (1) as $i (.a; $v)", "reduce (1) as $i (.a; 5 | $v)",
         "foreach (1) as $i (0; $v; .)", "($v, .b?)", "(.x | (.a | $v))", "(.x | (.c as $z | $v))",
         "path(.a | $v)", "(($v | .b?) as $w | .b? | $w)", "(.b? as $z | $v)", "($v | $v)"]
@@ -81,11 +95,17 @@ def program(rng):
     return wrap % body
 
 def run(cmd, data):
-    p = subprocess.run(cmd, input=data.encode(), capture_output=True, timeout=30)
+    try:
+        p = subprocess.run(cmd, input=data.encode(), capture_output=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        # A shape either binary loops on (jq's `recurse` on a self-similar
+        # value, say) is not a direction finding; counted, never failed on.
+        return 124, "TIMEOUT"
     return p.returncode, p.stdout.decode(errors="replace")
 
 def classify(j, s):
     (je, jo), (se, so) = j, s
+    if je == 124 or se == 124: return "timeout"
     if je == se and jo == so: return "agree"
     if je != 0 and se == 0: return "fabricate"
     if je == 0 and se != 0: return "refuse-only"
@@ -104,13 +124,17 @@ def main():
     ap.add_argument("--show", type=int, default=8)
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
+    pin = open("tests/data/jq-golden/JQ_VERSION").read().strip()
+    version = subprocess.run([a.jq, "--version"], capture_output=True, text=True).stdout.strip()
+    if not version.startswith(pin):
+        sys.exit(f"error: {a.jq} is not the pinned oracle ({pin}): {version!r}")
     if a.self_test:
         for name, pool in [("SOURCES", [s for s, _ in SOURCES]), ("NAV", NAV), ("LITERAL", LITERAL),
                            ("PASSTHROUGH", PASSTHROUGH), ("MOVES", MOVES), ("USES", USES)]:
             print(f"{name} ({len(pool)}): " + " ; ".join(pool))
         return 0
     rng = random.Random(a.seed)
-    kinds = ["agree", "fabricate", "mismatch", "refuse-only", "fabricate-baseline", "mismatch-baseline"]
+    kinds = ["agree", "fabricate", "mismatch", "refuse-only", "fabricate-baseline", "mismatch-baseline", "timeout"]
     counts = {k: 0 for k in kinds}
     examples = {k: [] for k in kinds}
     for _ in range(a.n):

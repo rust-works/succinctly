@@ -24696,15 +24696,26 @@ pub(crate) struct Frame {
 }
 
 /// Next [`Frame::invocation`]. A plain atomic rather than a
-/// `thread_local!` so `no_std` embeddings get distinct invocations too.
-static NEXT_INVOCATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+/// `thread_local!` so `no_std` embeddings get distinct invocations too, and
+/// `AtomicUsize` rather than `AtomicU64` so targets without 64-bit atomics
+/// still build (#2042 review).
+static NEXT_INVOCATION: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(1);
 
 impl Frame {
     /// A fresh invocation, rooted at `expr`'s input.
     fn enter(expr: &Expr) -> Self {
-        let invocation = NEXT_INVOCATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let invocation = NEXT_INVOCATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed) as u64;
         let at = may_bind_navigated(expr).then(PathPrefix::root);
         Self { invocation, at }
+    }
+
+    /// `invocation`, at the absolute position `path` -- how a marker-headed
+    /// `as` source is re-rooted at the marker's own node.
+    fn at(invocation: u64, path: Rc<PathPrefix>) -> Self {
+        Self {
+            invocation,
+            at: Some(path),
+        }
     }
 
     /// The same invocation at a position this caller cannot prove.
@@ -24715,11 +24726,15 @@ impl Frame {
         }
     }
 
-    /// The same invocation, `path` further along from `at`.
+    /// The same invocation, `path` further along from `at`. Free at the
+    /// invocation root, where `path` already is the absolute path, and
+    /// for an empty `path`; otherwise one node per component of `path`.
     fn extend(&self, path: &Rc<PathPrefix>) -> Self {
         let at = self.at.as_ref().map(|at| {
             if path.depth() == 0 {
                 Rc::clone(at)
+            } else if at.depth() == 0 {
+                Rc::clone(path)
             } else {
                 PathPrefix::extend_many(at, path.to_vec())
             }
@@ -24755,20 +24770,21 @@ impl Frame {
 
 /// Whether resolving `expr` can bind a variable from a navigated position
 /// -- the syntactic gate on [`Frame::enter`]'s `at`. Any `as` counts, and so
-/// does anything that can hide one: a call or `def` is inlined only as the
-/// resolver reaches it, and an [`Expr::Shared`] argument is opaque to
-/// [`any_subexpr`].
+/// does a call whose definition lies outside `expr` (`FuncCall`/
+/// `NamespacedCall`, inlined only as the resolver reaches it). A `def`, an
+/// already-resolved `DefCall` and a `Shared` argument are *not* opaque:
+/// [`any_subexpr`] descends into all three, so an `as` inside them is found
+/// here directly (#2042 review -- an earlier version listed them too, which
+/// switched the per-stage `Frame::extend` on for `def`-carrying targets
+/// with no binding in them at all).
 fn may_bind_navigated(expr: &Expr) -> bool {
     any_subexpr(expr, &mut |e| {
         matches!(
             e,
             Expr::As { .. }
                 | Expr::AsPattern { .. }
-                | Expr::DefCall { .. }
                 | Expr::FuncCall { .. }
                 | Expr::NamespacedCall { .. }
-                | Expr::FuncDef { .. }
-                | Expr::Shared(_)
         )
     })
 }
@@ -24821,6 +24837,14 @@ pub(crate) enum PathPrefix {
 }
 
 impl PathPrefix {
+    /// The innermost component, or `None` at the root.
+    fn last(&self) -> Option<&Expr> {
+        match self {
+            Self::Root => None,
+            Self::Node { component, .. } => Some(component),
+        }
+    }
+
     /// A fresh, empty chain. Not a shared singleton: this crate is
     /// `no_std`-compatible (no `thread_local`/`once_cell`-style sharing
     /// available), and re-allocating one `Root` node per fresh chain is O(1)
@@ -26069,7 +26093,8 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // raises a path error of its own; the body still resolves against
         // this arm's own `value`, `trackable` and `frame`, exactly as before.
         Expr::As { expr, var, body } => {
-            let (bound_values, trailing) = resolve_bind_source::<S>(expr, value, trackable, frame);
+            let (bound_values, trailing) =
+                resolve_bind_source::<S>(expr, body, var, value, trackable, frame);
             for (bound, origin) in bound_values {
                 let substituted = substitute_bound_var_at(expr, body, var, &bound, origin);
                 match resolve_node_sink::<S>(
@@ -28071,24 +28096,38 @@ struct FoldSourceValue {
 /// rule, which is what a plain `. as $x` still gets).
 ///
 /// The path-mode resolution is a **witness, not the evaluation**: real jq
-/// runs an `as` source with path tracking suspended, so it never raises a
-/// path error and never moves the register. Accordingly:
+/// runs an `as` source with path tracking suspended, so it never moves the
+/// register and never raises a path error of its own. The witness therefore
+/// runs only where it is provably the same computation as value
+/// evaluation, and only where it can matter:
 ///
-/// - an untracked-navigation error from the resolver (`([1]|first|.a) as
-///   $y` navigates a computed value, which the resolver refuses but jq
-///   evaluates fine) falls back to the value evaluator, with no origins --
-///   the one place the source is evaluated twice, and only when it
-///   navigated inside a construction; any other escape keeps the
-///   resolver's own prefix and escape, whose partial-prefix contract
+/// - jq mode only, and only when `$var` can reach a position the resolver
+///   dispatches on in `body` ([`var_reaches_path_position`]) -- otherwise
+///   the origin could never be consulted;
+/// - only for a source on the closed pure-navigation grammar
+///   ([`is_pure_navigation`]), against a tracked value at a known
+///   position; anything else -- `try`, `?`, `//`, `select`, a construction,
+///   a builtin -- binds by value, with no origin, exactly as before #2042.
+///   On that grammar the resolver's one refusal is a slice of a non-array
+///   (`.a[1:2]` on a string, which jq allows), and the fallback re-runs
+///   the source by value with nothing to repeat; any other escape keeps
+///   the resolver's own prefix and escape, whose partial-prefix contract
 ///   already mirrors `eval_owned_expr_fork`'s (`path((.a, error("x")) as
 ///   $y | .a | $y)` prints `["a"]` before raising `x`, as jq does);
-/// - a source that is itself a navigated marker (`$y as $z`, `($y) as $z`)
-///   binds the very same node, so `$z` inherits `$y`'s origin outright;
-/// - anything that cannot yield an origin -- yq mode, an untracked ambient,
-///   an unknown frame position, a source with no navigation in it -- goes
-///   straight to the value evaluator, unchanged from before #2042.
+/// - a source headed by a navigated marker (`$y as $z`, `$y.b as $z`,
+///   `(($y | .b) | .c) as $w`, [`marker_headed`]) binds the marker's own
+///   node, or a pure-navigation continuation from it: the rest is resolved
+///   against the marker's value in a frame sitting at the marker's own
+///   absolute path, in the marker's own invocation. In a tree the node
+///   reached that way is unique, so `($y | .b) as $w | .a.b | $w` binds
+///   `$w` to exactly `.a.b`'s node (jq `["a","b"]`). A marker anywhere
+///   but the head (`(.c | $y | .b) as $w`) falls to the ordinary
+///   resolution below, which certifies it against the ambient position
+///   -- a refusal where jq answers, listed with the refuse-only rows.
 fn resolve_bind_source<S: EvalSemantics>(
     source: &Expr,
+    body: &Expr,
+    var: &str,
     value: &OwnedValue,
     trackable: bool,
     frame: &Frame,
@@ -28097,45 +28136,26 @@ fn resolve_bind_source<S: EvalSemantics>(
         let (values, control) = eval_owned_expr_fork::<S>(source, value, false);
         (values.into_iter().map(|v| (v, None)).collect(), control)
     };
-    if S::TAG != EvalTag::Jq {
+    if S::TAG != EvalTag::Jq || !var_reaches_path_position(body, var) {
         return by_value();
     }
-    if let Expr::TrackedVar(marker) = unwrap_paren(source) {
-        if matches!(marker.origin, Origin::At { .. }) {
-            return (
-                vec![(marker.value.clone(), Some(marker.origin.clone()))],
-                None,
-            );
-        }
-    }
-    // `$y | .b` (and `($y | .b)`, `$y.b`): the source navigates *from* a
-    // navigated marker's own node, so it is re-rooted there -- resolved
-    // against the marker's value in a frame sitting at the marker's own
-    // absolute path, in the marker's own invocation. In a tree the node
-    // reached that way is unique, so `($y | .b) as $w | .a.b | $w` binds
-    // `$w` to exactly `.a.b`'s node (jq `["a","b"]`). Any other head falls
-    // to the ordinary resolution below, against this arm's own `value`.
-    if let Expr::Pipe(stages) = unwrap_paren(source) {
-        if let Some((Expr::TrackedVar(marker), rest)) =
-            stages.split_first().map(|(h, r)| (unwrap_paren(h), r))
-        {
-            if let Origin::At { invocation, path } = &marker.origin {
-                let rerooted = Frame {
-                    invocation: *invocation,
-                    at: Some(Rc::clone(&path.0)),
-                };
-                let rest = Expr::Pipe(rest.to_vec());
-                return resolve_bind_source_in::<S>(
-                    &rest,
-                    &marker.value,
-                    true,
-                    &rerooted,
-                    by_value,
+    if let Some((marker, rest)) = marker_headed(source) {
+        if let Origin::At { invocation, path } = &marker.origin {
+            if rest.is_empty() {
+                return (
+                    vec![(marker.value.clone(), Some(marker.origin.clone()))],
+                    None,
                 );
             }
+            let rest = Expr::Pipe(rest);
+            if !is_pure_navigation(&rest) {
+                return by_value();
+            }
+            let rerooted = Frame::at(*invocation, Rc::clone(&path.0));
+            return resolve_bind_source_in::<S>(&rest, &marker.value, true, &rerooted, by_value);
         }
     }
-    if !trackable || frame.at.is_none() || !source_navigates(source) {
+    if !trackable || frame.at.is_none() || !is_pure_navigation(source) || !navigates(source) {
         return by_value();
     }
     resolve_bind_source_in::<S>(source, value, trackable, frame, by_value)
@@ -28152,7 +28172,7 @@ fn resolve_bind_source_in<S: EvalSemantics>(
     by_value: impl Fn() -> (Vec<(OwnedValue, Option<Origin>)>, Option<Control>),
 ) -> (Vec<(OwnedValue, Option<Origin>)>, Option<Control>) {
     let bind = |b: PathBranch<'_>| {
-        let origin = if b.trackable {
+        let origin = if b.trackable && slice_witnesses_node(&b.path, &b.value) {
             frame.origin_at(&b.path)
         } else {
             None
@@ -28168,7 +28188,14 @@ fn resolve_bind_source_in<S: EvalSemantics>(
         Keep::AtMost(usize::MAX),
     ) {
         Ok(branches) => (branches.into_iter().map(bind).collect(), None),
-        Err((_, EvalEscape::Error(e))) if e.is_untracked_navigation_error() => by_value(),
+        // Either of the resolver's own refusal kinds is an artefact here
+        // (jq raises no path error inside a source at all), and on the
+        // witness grammar it always escapes -- nothing in it catches.
+        Err((_, EvalEscape::Error(e)))
+            if e.is_untracked_navigation_error() || e.is_invalid_path_expression() =>
+        {
+            by_value()
+        }
         Err((prefix, escape)) => (
             prefix.into_iter().map(bind).collect(),
             Some(Control::from(escape)),
@@ -28176,12 +28203,60 @@ fn resolve_bind_source_in<S: EvalSemantics>(
     }
 }
 
-/// Whether `source` contains any navigation at all -- the cheap gate on
-/// [`resolve_bind_source`]'s path-mode resolution. Wider than
-/// [`resolve_fold_source`]'s (`getpath`, computed index/slice and the
-/// recurse family included), since here the only cost of a `true` is a
-/// path-mode walk whose errors fall back anyway.
-fn source_navigates(source: &Expr) -> bool {
+/// Whether every node of `source` is one the resolver walks exactly as the
+/// value evaluator does -- the closed grammar gating [`resolve_bind_source`]'s
+/// path-mode witness (#2042 review). Real jq runs an `as` source with path
+/// tracking suspended, so the witness is only sound where the resolver can
+/// neither raise, catch, nor repeat anything value evaluation would not:
+///
+/// - a `try`/`?`/`//` inside the source would *catch* the resolver's own
+///   untracked-navigation refusal (an artefact jq never raises) and bind
+///   the handler's value: `del(([1] | try .[0] catch "c") as $y |
+///   .[$y|tostring])` deleted key `"c"` where jq deletes `"1"`;
+/// - `getpath`/`recurse`/`..` on a constructed value raise the resolver's
+///   *other* refusal kind, which no fallback classified, so `path(([1] | ..)
+///   as $y | .)` errored where jq prints `[]`;
+/// - a fallback that re-evaluates the source after the witness already ran
+///   its leaves repeats every side effect (`input` consumed twice, `debug`
+///   printed twice) and every computed stage (+25% on `(.tags | map(.) |
+///   .[0]) as $y`).
+///
+/// Navigation has none of those, and neither does a literal, an array of
+/// them (admitted so `getpath(["a"])` -- navigation with a literal
+/// argument -- is in), or `error` (raised once, in the witness, and
+/// propagated with the prefix already bound: `path((.a, error("x")) as $y
+/// | .a | $y)` prints `["a"]` then raises, as jq does): nothing here
+/// catches an error, and nothing has a side effect, so every refusal the
+/// resolver raises on this grammar escapes to [`resolve_bind_source_in`]'s
+/// fallback, which re-runs the source by value with nothing to repeat. Everything else binds by value
+/// with no origin -- the safe direction (a refusal, never a fabrication);
+/// the shapes that costs are listed with the refuse-only rows in
+/// `docs/compliance/jq/limitations.md`.
+fn is_pure_navigation(source: &Expr) -> bool {
+    !any_subexpr(source, &mut |e| {
+        !matches!(
+            e,
+            Expr::Identity
+                | Expr::Field(_)
+                | Expr::Index { .. }
+                | Expr::Slice { .. }
+                | Expr::Iterate
+                | Expr::RecursiveDescent
+                | Expr::Pipe(_)
+                | Expr::Comma(_)
+                | Expr::Paren(_)
+                | Expr::TrackedVar(_)
+                | Expr::Literal(_)
+                | Expr::Array(_)
+                | Expr::Error(_)
+                | Expr::Builtin(Builtin::GetPath(_) | Builtin::Recurse)
+        )
+    })
+}
+
+/// Whether `source` navigates at all: a bare `.` (or a marker) resolves to
+/// its input and yields nothing a plain value binding does not.
+fn navigates(source: &Expr) -> bool {
     any_subexpr(source, &mut |e| {
         matches!(
             e,
@@ -28189,18 +28264,104 @@ fn source_navigates(source: &Expr) -> bool {
                 | Expr::Index { .. }
                 | Expr::Slice { .. }
                 | Expr::Iterate
-                | Expr::IndexExpr { .. }
-                | Expr::SliceExpr { .. }
                 | Expr::RecursiveDescent
-                | Expr::Builtin(
-                    Builtin::GetPath(_)
-                        | Builtin::Recurse
-                        | Builtin::RecurseDown
-                        | Builtin::RecurseF(_)
-                        | Builtin::RecurseCond(_, _)
-                )
+                | Expr::Builtin(Builtin::GetPath(_) | Builtin::Recurse)
         )
     })
+}
+
+/// Whether `$var` can reach a position `resolve_node` dispatches on in
+/// `body` -- the demand gate on [`resolve_bind_source`]'s witness (#2042
+/// review). A marker is only ever consulted by the resolver's own
+/// `Expr::TrackedVar` arm (and the register/fold rules fed from it), so a
+/// body that uses `$var` purely in value position -- `select($y < 100)`,
+/// an `if` condition, an operand -- gains nothing from an origin, and the
+/// common `del(.[] | .score as $y | select($y < 100))` skips the witness
+/// entirely. Conservative: a shape this does not model counts any
+/// occurrence at all, and a wrong `true` costs only the witness, never a
+/// path (a marker with an origin is certified, not trusted).
+fn var_reaches_path_position(body: &Expr, var: &str) -> bool {
+    match body {
+        Expr::Var(name) => name == var,
+        // Value-only positions: the resolver evaluates these by value, and
+        // a marker there is exactly the literal it stands in for.
+        Expr::Builtin(Builtin::Select(_))
+        | Expr::Compare { .. }
+        | Expr::Arithmetic { .. }
+        | Expr::And(_, _)
+        | Expr::Or(_, _)
+        | Expr::Not => false,
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            var_reaches_path_position(then_branch, var)
+                || var_reaches_path_position(else_branch, var)
+        }
+        Expr::Pipe(stages) | Expr::Comma(stages) => stages
+            .iter()
+            .any(|stage| var_reaches_path_position(stage, var)),
+        Expr::Paren(inner) | Expr::Optional(inner) => var_reaches_path_position(inner, var),
+        Expr::As {
+            expr,
+            var: bound,
+            body,
+        } => {
+            var_reaches_path_position(expr, var)
+                || (bound != var && var_reaches_path_position(body, var))
+        }
+        Expr::Try { expr, catch } => {
+            var_reaches_path_position(expr, var)
+                || catch
+                    .as_deref()
+                    .is_some_and(|handler| var_reaches_path_position(handler, var))
+        }
+        Expr::Alternative(left, right) => {
+            var_reaches_path_position(left, var) || var_reaches_path_position(right, var)
+        }
+        Expr::Label { body, .. } => var_reaches_path_position(body, var),
+        other => any_subexpr(other, &mut |e| matches!(e, Expr::Var(name) if name == var)),
+    }
+}
+
+/// `source` as `$marker | rest...` with every paren and nested pipe head
+/// flattened (`$y.b | .c` parses as `Pipe([Pipe([$y, .b]), .c])`), or
+/// `None` when its head is not a marker. `rest` is empty for a bare `$y`.
+fn marker_headed(source: &Expr) -> Option<(&Rc<Tracked>, Vec<Expr>)> {
+    let mut head = unwrap_paren(source);
+    let mut rest: Vec<&Expr> = Vec::new();
+    loop {
+        match head {
+            Expr::Pipe(stages) => {
+                let (first, tail) = stages.split_first()?;
+                rest.splice(0..0, tail.iter());
+                head = unwrap_paren(first);
+            }
+            Expr::TrackedVar(marker) => {
+                return Some((marker, rest.into_iter().cloned().collect()));
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// jq's `jv_identical` on a slice result (#2042 review): a non-empty array
+/// slice shares its parent's buffer (offset and size adjusted), so the next
+/// visit to the same path is the same node again; an empty one is a fresh
+/// `jv_array()` and a string slice a fresh string, never identical to
+/// anything. Confirmed live against jq 1.7.1 on `{"a":[1,2,3]}`:
+/// `path(.a[0:2] as $y | .a[0:2] | $y)` is `["a",{"start":0,"end":2}]`,
+/// while `.a[1:1]`, `.a[5:9]` and a string's `.a[1:2]` all refuse. A path
+/// ending in a slice therefore witnesses a node only for a non-empty array
+/// (`null` needs no origin -- it is admitted by value everywhere).
+fn slice_witnesses_node(path: &PathPrefix, value: &OwnedValue) -> bool {
+    match path.last() {
+        Some(Expr::Slice { .. } | Expr::SliceExpr { .. }) => {
+            matches!(value, OwnedValue::Array(items) if !items.is_empty())
+        }
+        _ => true,
+    }
 }
 
 fn no_fold_register(values: Vec<OwnedValue>) -> Vec<FoldSourceValue> {
@@ -29327,12 +29488,23 @@ fn resolve_recurse<'a, S: EvalSemantics>(
         // parameter (#1591): `f` is resolved against *this* node, whichever
         // one was just popped, and that node's own mark is what a
         // pass-through arm inside `f` (e.g. a bare `.`) must inherit.
+        // `f` runs against the popped node, whose position is provable
+        // right here: `prefix` is its own path from this call's input
+        // (#2042 review) -- the same "extend by a path this site built
+        // itself" rule `resolve_seq_stage` applies per stage, so
+        // `path(.a as $y | .a | recurse(if . == $y then $y.b else empty
+        // end))` certifies `$y` at `["a"]` (jq `["a"]`, `["a","b"]`).
+        let node_frame = if node_trackable {
+            frame.extend(&prefix)
+        } else {
+            frame.unknown()
+        };
         let (children, mut deferred_error) = match resolve_against_cow::<S>(
             f,
             current,
             node_trackable,
             &node_snapshot,
-            &frame.unknown(),
+            &node_frame,
             keep,
         ) {
             Ok(children) => (children, None),
@@ -31687,7 +31859,8 @@ fn substitute_var(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr
 /// ambient position, so wrapping here is a necessary but not sufficient
 /// condition for the substituted variable to end up trackable (#844).
 fn substitute_var_tracked(expr: &Expr, var_name: &str, replacement: &OwnedValue) -> Expr {
-    substitute_var_impl(expr, var_name, replacement, Some(&Origin::Snapshot))
+    let marker = Tracked::snapshot(replacement.clone());
+    substitute_var_impl(expr, var_name, replacement, Some(&marker))
 }
 
 /// Substitute `bound` for `$var_name` in `body`, choosing between
@@ -31726,7 +31899,14 @@ fn substitute_bound_var_at(
     if is_identity_passthrough(bind_expr) {
         substitute_var_tracked(body, var_name, bound)
     } else if let Some(origin) = origin {
-        substitute_var_impl(body, var_name, bound, Some(&origin))
+        // One marker per binding, shared by every occurrence (#2042
+        // review): a bound sub-document used k times in `body` is cloned
+        // once, not k times.
+        let marker = Rc::new(Tracked {
+            value: bound.clone(),
+            origin,
+        });
+        substitute_var_impl(body, var_name, bound, Some(&marker))
     } else {
         substitute_var(body, var_name, bound)
     }
@@ -31735,14 +31915,15 @@ fn substitute_bound_var_at(
 /// Substitute a variable in an expression with a value.
 /// Returns a new expression with the variable replaced. `mark`
 /// selects whether a substituted `$var_name` becomes an `Expr::TrackedVar`
-/// (path()-trackability candidate) or a plain value-construction node --
+/// sharing that one marker (path()-trackability candidate) or a plain
+/// value-construction node --
 /// see `substitute_var`/`substitute_var_tracked` above, the only two
 /// callers that should pass a literal `false`/`true` here.
 fn substitute_var_impl(
     expr: &Expr,
     var_name: &str,
     replacement: &OwnedValue,
-    mark: Option<&Origin>,
+    mark: Option<&Rc<Tracked>>,
 ) -> Expr {
     match expr {
         // #1371: opaque, in both directions. A `Shared` holds an argument the
@@ -31754,10 +31935,7 @@ fn substitute_var_impl(
         // binding, which is the O(depth^2) traversal this design removes.
         Expr::Shared(inner) => Expr::Shared(Rc::clone(inner)),
         Expr::Var(name) if name == var_name => match mark {
-            Some(origin) => Expr::TrackedVar(Rc::new(Tracked {
-                value: replacement.clone(),
-                origin: origin.clone(),
-            })),
+            Some(marker) => Expr::TrackedVar(Rc::clone(marker)),
             None => owned_to_expr(replacement),
         },
         // #2095: does not recurse into `msg` -- see `map_subexprs`'s own doc
@@ -31906,7 +32084,7 @@ fn substitute_var_in_builtin(
     builtin: &Builtin,
     var_name: &str,
     replacement: &OwnedValue,
-    mark: Option<&Origin>,
+    mark: Option<&Rc<Tracked>>,
 ) -> Builtin {
     map_builtin_subexprs(builtin, &mut |e| {
         substitute_var_impl(e, var_name, replacement, mark)
@@ -52647,7 +52825,11 @@ mod tests {
             let parsed = parse(src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
             for origin in &origins {
                 for bound in &values {
-                    let expr = substitute_var_impl(&parsed, "y", bound, Some(origin));
+                    let marker = Rc::new(Tracked {
+                        value: bound.clone(),
+                        origin: origin.clone(),
+                    });
+                    let expr = substitute_var_impl(&parsed, "y", bound, Some(&marker));
                     assert!(
                         is_owned_pure_expr(&expr),
                         "{src:?} with $y := {bound:?} should be fast-pathable: {expr:?}"
@@ -80715,6 +80897,51 @@ mod tests {
                 "path(.a as $y | ([$y] | .[0]) as $z | .a | $z)",
                 r#"[["a"]]"#,
             ),
+            // The witness grammar is pure navigation (#2042 review), so a
+            // source wrapped in `select`/`//`/`if`/`?` binds by value.
+            // select-wrapped-source
+            (
+                br#"{"a":{"b":1}}"#,
+                "path((.a | select(.b)) as $y | .a | $y)",
+                r#"[["a"]]"#,
+            ),
+            // alternative-source
+            (
+                br#"{"a":{"b":1}}"#,
+                "path((.a // 1) as $y | .a | $y)",
+                r#"[["a"]]"#,
+            ),
+            // if-source
+            (
+                br#"{"a":{"b":1}}"#,
+                "path((if .a then .a else .b end) as $y | .a | $y)",
+                r#"[["a"]]"#,
+            ),
+            // optional-source-spelling (a `?` component never matches a
+            // plain one, whichever side it is on)
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a? as $y | .a | $y)",
+                r#"[["a"]]"#,
+            ),
+            // negative-index-spelling
+            (
+                br#"[{"b":1},{"b":1}]"#,
+                "path(.[0] as $y | .[-2] | $y)",
+                r"[[-2]]",
+            ),
+            // full-slice-is-the-array (jq's `.a[0:3]` of a 3-array is `.a`)
+            (
+                br#"{"a":[1,2,3]}"#,
+                "path(.a[0:3] as $y | .a | $y)",
+                r#"[["a"]]"#,
+            ),
+            // marker-not-at-head
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | (.c | $y | .b) as $w | .a.b | $w)",
+                r#"[["a","b"]]"#,
+            ),
         ];
         for (input, filter, jq_answer) in rows {
             match bind_origin_outputs(input, filter) {
@@ -80723,6 +80950,182 @@ mod tests {
                     "{filter}: now answers {got} (jq: {jq_answer}) -- move it to the accepting matrix"
                 ),
             }
+        }
+    }
+
+    /// #2042 review: the witness resolve is gated to pure-navigation
+    /// sources ([`is_pure_navigation`]), so a source that could catch or
+    /// re-raise the resolver's own refusals binds by value exactly as
+    /// before #2042. Each row was a wrong binding, a spurious error, a
+    /// dropped output, or a write to the wrong key on the first cut; jq
+    /// 1.7.1 answers are the expected values, and `$y` sits in value
+    /// position only, so agreeing means the *binding* is right.
+    #[test]
+    fn test_bind_source_outside_pure_navigation_binds_by_value_2042() {
+        let rows: &[(&[u8], &str, &str)] = &[
+            // try-catches-artefact
+            (
+                br#"{"a":{"b":1},"c":1,"d":2}"#,
+                r#"path((try (.a | tostring | .[0:1]) catch "x") as $y | if $y == "{" then .c else .d end)"#,
+                r#"[["c"]]"#,
+            ),
+            // optional-swallows-artefact
+            (
+                br#"{"a":{"b":1},"c":1,"d":2}"#,
+                r#"path(((.a | tostring | .[0:1])?) as $y | if $y == "{" then .c else .d end)"#,
+                r#"[["c"]]"#,
+            ),
+            // try-on-constructed
+            (
+                br#"{"a":{"b":1}}"#,
+                r#"path((try ([1]|.[0]) catch "c") as $y | if $y == 1 then . else error("wrong") end)"#,
+                r"[[]]",
+            ),
+            // handlerless-try-on-constructed, a write
+            (
+                br#"{"1":true,"c":true}"#,
+                r"del(([1] | try .[0]) as $y | .[$y|tostring])",
+                r#"[{"c":true}]"#,
+            ),
+            // recurse-on-literal
+            (br#"{"a":1}"#, "path((1 | ..) as $y | .a)", r#"[["a"]]"#),
+            // recurse-on-constructed
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | ([1,[2]] | ..) as $z | .)",
+                r"[[],[],[],[]]",
+            ),
+            // getpath-on-constructed
+            (
+                br#"{"a":1}"#,
+                "path(([1] | getpath([])) as $y | .)",
+                r"[[]]",
+            ),
+        ];
+        for (input, filter, want) in rows {
+            let got = bind_origin_outputs(input, filter)
+                .unwrap_or_else(|e| panic!("{filter}: {}", e.message));
+            assert_eq!(got, *want, "{filter}");
+        }
+    }
+
+    /// #2042 review: a slice witnesses a node only for a non-empty array
+    /// ([`slice_witnesses_node`]); an empty or string slice is a fresh
+    /// value in jq, and the first cut certified -- and wrote through --
+    /// both.
+    #[test]
+    fn test_slice_binding_witnesses_a_node_only_for_a_nonempty_array_2042() {
+        for (input, filter, want) in [
+            (
+                br#"{"a":[1,2,3]}"# as &[u8],
+                "path(.a[0:2] as $y | .a[0:2] | $y)",
+                r#"[["a",{"start":0,"end":2}]]"#,
+            ),
+            (
+                br#"{"a":[1,2,3]}"#,
+                "path(.a[1:] as $y | .a[1:] | $y)",
+                r#"[["a",{"start":1,"end":null}]]"#,
+            ),
+            // null: admitted by value, no origin needed
+            (
+                br#"{"a":null}"#,
+                "path(.a[1:2] as $y | .a[1:2] | $y)",
+                r#"[["a",{"start":1,"end":2}]]"#,
+            ),
+        ] {
+            let got = bind_origin_outputs(input, filter)
+                .unwrap_or_else(|e| panic!("{filter}: {}", e.message));
+            assert_eq!(got, want, "{filter}");
+        }
+        for (input, filter) in [
+            (
+                br#"{"a":[1,2,3]}"# as &[u8],
+                "path(.a[1:1] as $y | .a[1:1] | $y)",
+            ),
+            (br#"{"a":[1,2,3]}"#, "path(.a[5:9] as $y | .a[5:9] | $y)"),
+            (br#"{"a":"hello"}"#, "path(.a[1:2] as $y | .a[1:2] | $y)"),
+            (br#"{"a":[1,2,3]}"#, "(.a[1:1] as $y | .a[1:1] | $y) = [9]"),
+        ] {
+            match bind_origin_outputs(input, filter) {
+                Err(e) => assert!(e.is_invalid_path_expression(), "{filter}: {}", e.message),
+                Ok(got) => panic!("{filter}: fabricated {got} (jq refuses)"),
+            }
+        }
+    }
+
+    /// #2042 review: a marker-headed source is re-rooted through nested
+    /// pipe heads too ([`marker_headed`]) -- `$y.b | .c` parses as
+    /// `Pipe([Pipe([$y, .b]), .c])`, which the first cut did not unwrap --
+    /// and a `recurse` body certifies a marker at the node it visits.
+    #[test]
+    fn test_marker_rerooting_and_recurse_frames_2042() {
+        for (input, filter, want) in [
+            (
+                br#"{"a":{"b":{"c":1}}}"# as &[u8],
+                "path(.a as $y | ($y.b | .c) as $w | .a.b.c | $w)",
+                r#"[["a","b","c"]]"#,
+            ),
+            (
+                br#"{"a":{"b":{"c":1}}}"#,
+                "path(.a as $y | (($y | .b) | .c) as $w | .a.b.c | $w)",
+                r#"[["a","b","c"]]"#,
+            ),
+            (
+                br#"{"a":{"b":1}}"#,
+                "path(.a as $y | .a | recurse(if . == $y then $y.b else empty end))",
+                r#"[["a"],["a","b"]]"#,
+            ),
+            (
+                br#"{"a":{"b":1}}"#,
+                "del(.a as $y | .a | recurse(if . == $y then $y.b else empty end))",
+                r"[{}]",
+            ),
+        ] {
+            let got = bind_origin_outputs(input, filter)
+                .unwrap_or_else(|e| panic!("{filter}: {}", e.message));
+            assert_eq!(got, want, "{filter}");
+        }
+    }
+
+    /// #2042 review: the demand gate. `$y` in value position only
+    /// (`select`, `if` condition, operands) needs no witness; anywhere the
+    /// resolver dispatches on it does.
+    #[test]
+    fn var_reaches_path_position_models_value_only_positions_2042() {
+        let no = [
+            "select($y < 100)",
+            "select(.a == $y)",
+            "if $y then .a else .b end",
+            "select($y | .b == 1)",
+            ".a | select(. == $y)",
+            ".c as $y | $y",
+        ];
+        let yes = [
+            "$y",
+            ".a | $y",
+            "if .a then $y else .b end",
+            "$y.b",
+            "($y | .b) as $w | .a.b | $w",
+            "select(.a) | $y",
+            "reduce (1) as $i (.a; $y)",
+            "getpath($y)",
+            "try $y catch .a",
+            ".a // $y",
+            ".c as $z | $y",
+        ];
+        for src in no {
+            let expr = parse(src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
+            assert!(
+                !var_reaches_path_position(&expr, "y"),
+                "{src:?} should skip the witness"
+            );
+        }
+        for src in yes {
+            let expr = parse(src).unwrap_or_else(|e| panic!("parse {src:?}: {e:?}"));
+            assert!(
+                var_reaches_path_position(&expr, "y"),
+                "{src:?} should take the witness"
+            );
         }
     }
 
