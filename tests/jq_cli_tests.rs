@@ -30490,6 +30490,168 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
             "",
             0,
         ),
+        // ---- closed by #2180 WP2a ----
+        // `//`, `and` and `or` gained demand-forwarding `eval_each`/
+        // `eval_each_generic` arms (`each_alternative`, `each_boolean` over
+        // the new shared `boolean_fanout_each`), so a wrapping consumer's
+        // stop now reaches *inside* an operand instead of landing on the
+        // materialized answer. These rows are the ordinary side-effect half
+        // of that -- no `?//` in sight; the `?//`-retry half, whose output
+        // *count* changes, is `test_nested_short_circuit_consumer_hides_the_stop_2180`.
+        // Every row captured live against jq 1.7.1.
+        //
+        // `//`, left side: the truthy first output satisfies `first`, so the
+        // comma's second branch is never evaluated.
+        (
+            &["-cn", r#"first((1, ("B"|stderr)) // 9)"#],
+            None,
+            "1\n",
+            "",
+            0,
+        ),
+        (
+            &["-cn", r#"isempty((1, ("B"|stderr)) // 9)"#],
+            None,
+            "false\n",
+            "",
+            0,
+        ),
+        // `//`, right side: the left produced no truthy output, so the right
+        // side runs -- and must itself stop on the output that satisfies the
+        // consumer. `A` is genuinely reached (it *is* the answer); `B` is
+        // not. The over-stopping trap for this arm.
+        (
+            &[
+                "-cn",
+                r#"first((false,false) // (("A"|stderr), ("B"|stderr)))"#,
+            ],
+            None,
+            "\"A\"\n",
+            "A",
+            0,
+        ),
+        // `and`/`or`, both operand positions.
+        (
+            &["-cn", r#"first((1, ("B"|stderr)) and true)"#],
+            None,
+            "true\n",
+            "",
+            0,
+        ),
+        (
+            &["-cn", r#"first(true and (1, ("B"|stderr)))"#],
+            None,
+            "true\n",
+            "",
+            0,
+        ),
+        (
+            &["-cn", r#"first(false or (1, ("B"|stderr)))"#],
+            None,
+            "true\n",
+            "",
+            0,
+        ),
+        // The short circuit is still a *genuine* one, not a demand artefact:
+        // `false and _` / `true or _` never consult the other operand at all,
+        // with or without a wrapping consumer.
+        (
+            &["-cn", r#"[(false, true) and ("B"|stderr)]"#],
+            None,
+            "[false,true]\n",
+            "B",
+            0,
+        ),
+        // `?//` under each of the three, with a side effect *after* the
+        // output that satisfies the consumer: the stop now unwinds into the
+        // bind (so the retried alternative answers a second time, #1519) and
+        // the trailing `stderr` is never reached on either pass.
+        (
+            &["-cn", r#"first((1 as $x ?// $y | (5, ("B"|stderr))) // 9)"#],
+            None,
+            "5\n5\n",
+            "",
+            0,
+        ),
+        (
+            &[
+                "-cn",
+                r#"first((1 as $x ?// $y | (true, ("B"|stderr))) and true)"#,
+            ],
+            None,
+            "true\ntrue\n",
+            "",
+            0,
+        ),
+        (
+            &[
+                "-cn",
+                r#"first(false or (1 as $x ?// $y | (true, ("B"|stderr))))"#,
+            ],
+            None,
+            "true\ntrue\n",
+            "",
+            0,
+        ),
+        // The destructive `input` probe, which pins *values* rather than I/O
+        // ordering: an eagerly-evaluated discarded branch would have eaten
+        // `"a"` from the process-global queue, leaving the trailing `input`
+        // to answer `"b"`.
+        (
+            &["-cn", r"[first((1, input) // 9), input]"],
+            Some(r#""a" "b""#),
+            "[1,\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            &["-cn", r"[first(false // (1, input)), input]"],
+            Some(r#""a" "b""#),
+            "[1,\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            &["-cn", r"[first((1, input) and true), input]"],
+            Some(r#""a" "b""#),
+            "[true,\"a\"]\n",
+            "",
+            0,
+        ),
+        (
+            &["-cn", r"[first(true and (1, input)), input]"],
+            Some(r#""a" "b""#),
+            "[true,\"a\"]\n",
+            "",
+            0,
+        ),
+        // The lazy arm's *interleaved* operand order -- the `and`/`or` twin
+        // of the `Expr::Compare` row above, and the only rows that catch a
+        // silent regression back to the eager left-first order. jq re-runs
+        // the right operand per non-short-circuiting left output; reached
+        // through a consumer (first row) or as a binary operand (second),
+        // `and` now does too. The bare top-level spelling still does not --
+        // that residual is pinned in the leaks table.
+        (
+            &[
+                "-cn",
+                r#"[first(("A"|stderr, "B"|stderr) and ("C"|stderr, "D"|stderr))]"#,
+            ],
+            None,
+            "[true]\n",
+            "AACC",
+            0,
+        ),
+        (
+            &[
+                "-cn",
+                r#"[0 + (("A"|stderr, "B"|stderr) and ("C"|stderr, "D"|stderr))]"#,
+            ],
+            None,
+            "",
+            "AACCjq: error (at <unknown>): number (0) and boolean (true) cannot be added",
+            5,
+        ),
     ];
 
     for (args, stdin, want_out, want_err, want_code) in cases {
@@ -30625,6 +30787,34 @@ fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
             "",
             "x",
             3,
+        ),
+        // ---- #2180 WP2a's own residual: the EAGER `and`/`or` route -------
+        // The `Expr::Compare` situation between #1459 and #1481, one
+        // operator over. WP2a gave `and`/`or` a demand-forwarding
+        // `eval_each` arm sharing one loop with the eager route, but left
+        // `eval_boolean` passing the *eager* operand strategy, so a bare
+        // top-level `and`/`or` still finishes its left operand before the
+        // first pairing where jq interleaves. Captured live against jq
+        // 1.7.1 (`stderr` writes a comma's first branch twice in both
+        // tools, so read the sequence, not the repeat count):
+        //
+        //   jq          A A  C C D  B  C C D   <- right re-run per left output
+        //   succinctly  A A B  C C D  C C D    <- left finished first
+        //
+        // Reaching the same expression through a lazy consumer or as a
+        // binary operand already agrees with jq -- see the two matching
+        // rows in `test_short_circuit_side_effect_shapes_already_match_jq_820`.
+        // Closing this is the `eval_boolean`-side half #1481 did for
+        // `eval_binary_fanout`, not WP2a's scope.
+        (
+            &[
+                "-cn",
+                r#"[("A"|stderr, "B"|stderr) and ("C"|stderr, "D"|stderr)]"#,
+            ],
+            None,
+            "[true,true,true,true]\n",
+            "AABCCDCCD",
+            0,
         ),
     ];
 
@@ -31613,66 +31803,100 @@ fn test_nested_short_circuit_consumer_hides_the_stop_2180() -> Result<()> {
             "[10,20]",
             "matches jq -- one full walk of expr per n",
         ),
-        // ==== WP2a: `//`, `and`, `or` ====
-        // `each_alternative` needs a demand-forwarding `left`/truthy-filter
-        // sink, and `And`/`Or` need `boolean_fanout_core` parameterised the
-        // way `binary_fanout_each` was for `Compare`/`Arithmetic`
-        // (#1459/#1481). Flip this whole group once WP2a lands.
+        // ==== WP2a: `//`, `and`, `or` -- CLOSED ====
+        // `each_alternative` (a truthy-filter sink over `left`, then the
+        // right side only if nothing truthy was forwarded) and
+        // `each_boolean` over the new shared, demand-driven
+        // `boolean_fanout_each` -- the `and`/`or` twin of what #1459/#1481
+        // did to `binary_fanout_core` for `Compare`/`Arithmetic`. Both
+        // evaluators, as always: `eval_each_generic` gained its own
+        // `Expr::Alternative`/`Expr::And`/`Expr::Or` arms too, since
+        // `first(...)` never reaches `eval.rs`'s.
         (
             "[first((1 as $x ?// $y | 5)//9)]".to_string(),
-            "[5]",
-            "jq: [5,5]",
+            "[5,5]",
+            "matches jq",
         ),
         (
             "[isempty((1 as $x ?// $y | 5)//9)]".to_string(),
-            "[false]",
-            "jq: [false,false]",
+            "[false,false]",
+            "matches jq",
         ),
-        (format!("[first(null // ({G}))]"), "[1]", "jq: [1,1]"),
+        (format!("[first(null // ({G}))]"), "[1,1]", "matches jq"),
         (
             format!("[isempty(null // ({G}))]"),
-            "[false]",
-            "jq: [false,false]",
+            "[false,false]",
+            "matches jq",
         ),
         (
             format!("[first(({G}) and true)]"),
-            "[true]",
-            "jq: [true,true]",
+            "[true,true]",
+            "matches jq",
         ),
         (
             format!("[isempty(({G}) and true)]"),
-            "[false]",
-            "jq: [false,false]",
+            "[false,false]",
+            "matches jq",
         ),
         (
             format!("[first(true and ({G}))]"),
-            "[true]",
-            "jq: [true,true]",
+            "[true,true]",
+            "matches jq",
         ),
         (
             format!("[isempty(true and ({G}))]"),
-            "[false]",
-            "jq: [false,false]",
+            "[false,false]",
+            "matches jq",
         ),
         (
             format!("[first(({G}) or false)]"),
-            "[true]",
-            "jq: [true,true]",
+            "[true,true]",
+            "matches jq",
         ),
         (
             format!("[isempty(({G}) or false)]"),
-            "[false]",
-            "jq: [false,false]",
+            "[false,false]",
+            "matches jq",
         ),
         (
             format!("[first(false or ({G}))]"),
-            "[true]",
-            "jq: [true,true]",
+            "[true,true]",
+            "matches jq",
         ),
         (
             format!("[isempty(false or ({G}))]"),
+            "[false,false]",
+            "matches jq",
+        ),
+        // WP2a's own rules, which no other group exercises. `//` keeps
+        // `retain_truthy`'s filter and `eval_alternative`'s error/break
+        // policy while forwarding demand, and the right side is still
+        // emitted unfiltered; `and`/`or` still short-circuit per left
+        // output. All captured live against jq 1.7.1 with input `1`.
+        (
+            "[first((1 as $x ?// $y | false, 5) // 9)]".to_string(),
+            "[5,5]",
+            "matches jq -- a falsy output is filtered, the bind still retries",
+        ),
+        (
+            "[first((1 as $x ?// $y | false) // 9)]".to_string(),
+            "[9]",
+            "matches jq -- no truthy left output, so the right side answers              once (the stop never reaches the bind)",
+        ),
+        (
+            format!("[first((({G}) and true) // 9)]"),
+            "[true,true]",
+            "matches jq -- the stop travels through both new arms at once",
+        ),
+        (
+            format!("[first(false and ({G}))]"),
             "[false]",
-            "jq: [false,false]",
+            "matches jq -- a falsy left short-circuits, so the bind is never              evaluated at all",
+        ),
+        (
+            format!("[first(true or ({G}))]"),
+            "[true]",
+            "matches jq -- a truthy left short-circuits `or` the same way",
         ),
         // ==== WP2b: eager sub-expression sites ====
         // `each_if`'s `cond`, `each_as`/`each_as_pattern`'s bound source,

@@ -1,0 +1,1 @@
+[first(null // (1 as $x ?// $y | 1))]
