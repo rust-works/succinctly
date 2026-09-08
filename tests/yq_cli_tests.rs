@@ -39504,6 +39504,16 @@ fn test_bound_variable_carries_node_identity_2072() -> Result<()> {
     let args = &["-o", "json", "-I0"];
 
     for (filter, expected) in [
+        // Review of the #2072 branch: a bound *key node* keeps its flag. yq
+        // v4.53.3: `.a[0] | key as $x | $x | key` prints nothing (a key has
+        // no key of its own, as `.a[0] | key | key`), `| tostring | key` is
+        // `0` again (any other rule builds an ordinary node at the same
+        // position) and `| parent | key` is `"a"`. `BindOrigin::Owned`
+        // dropped the flag at first, so the first row printed `0`.
+        (".a[0] | key as $x | $x | key", ""),
+        (".a | (.[0] | key) as $x | $x | key", ""),
+        (".a[0] | key as $x | $x | tostring | key", "0"),
+        (".a[0] | key as $x | $x | parent | key", "\"a\""),
         (".a | (.[] as $x | $x) | key", "0\n1\n2"),
         (
             ".a | (.[] as $x | $x) | path",
