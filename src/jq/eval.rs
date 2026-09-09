@@ -27717,8 +27717,12 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // everything but a null/bool register, but an artefact nonetheless
         // -- which a `?//` retry must never act on: it would land on the
         // wrong alternative, and `del`/`=` would write through it. A single
-        // pattern may still raise that refusal (jq's own wording and exit
-        // code); a chain falls through untouched.
+        // pattern may still raise that refusal -- jq's own outcome, and its
+        // own wording wherever the source really is off the register (a
+        // certified marker on an untracked stage, `path(. as $x | 5 | $x as
+        // {a:$q} | .)`, refuses here at the first step where jq walks and
+        // refuses at `PATH_END`, so both refuse, differently worded); a
+        // chain falls through untouched.
         Expr::AsPattern {
             expr,
             patterns,
@@ -28469,6 +28473,17 @@ fn flatten_components(components: Vec<Expr>) -> Expr {
 /// nothing, so it neither grants nor removes trackability, nor, for the
 /// same reason, the snapshot provenance a `$x` inside it carries (#1466),
 /// nor a live path register (#1573) -- all three pass through unchanged.
+///
+/// #2649: a `?` over something that navigated nothing (`$x?`, `.?`, `5?`)
+/// contributes no component either, so its path stays the root rather than
+/// becoming a one-element `Optional(Pipe([]))`. The wrapped spelling
+/// assembled to the same output (`strip_resolved_optional`), but its depth
+/// of one counted as *navigation* in `resolve_seq_stage`'s register facts,
+/// which is why `$x?` could never re-establish a carried register the way
+/// `$x` does (`path(. as $x | 5 | $x?)` is jq's `[]`; `path(.b as $y | .b |
+/// 5 | $y? | .c)` is `["b","c"]`), and why `5?` dropped a register jq never
+/// moved. jq's `?` is `try`, which touches neither the path nor
+/// `value_at_path`; only the components underneath do.
 fn wrap_optional_branch(branch: PathBranch<'_>) -> PathBranch<'_> {
     let PathBranch {
         path: components,
@@ -28477,6 +28492,15 @@ fn wrap_optional_branch(branch: PathBranch<'_>) -> PathBranch<'_> {
         snapshot,
         register,
     } = branch;
+    if components.depth() == 0 {
+        return PathBranch {
+            path: PathPrefix::root(),
+            value,
+            register,
+            trackable,
+            snapshot,
+        };
+    }
     // `depth()`/`last()` are O(1); the O(depth) `to_vec()` flatten only runs
     // in the `depth() != 1` arm, which is unreached *today* (see below).
     let inner_path = if components.depth() == 1 {
@@ -30011,8 +30035,10 @@ fn walk_pattern_step(
 /// - **entry order**: object entries run in source order
 ///   (`gen_object_matcher`), array elements in **reverse** index order --
 ///   `gen_array_matcher` nests each earlier element *after* the later one,
-///   so `path(.a as [$x,$y] | x)` on `[1,2,3]` refuses at element `0`, not
-///   `1`.
+///   so `path(. as [$x,$y] | x)` on `[1,2,3]` refuses at element `0` (the
+///   step for index `1` ran first and moved the register), while `path(.a as
+///   [$x,$y] | x)` on `{"a":[1,2,3]}` refuses at element `1` -- the source is
+///   not the register, so the very first step fails.
 /// - **`{$b: P}` is one step**: the entry binds `$b` to `V[b]` and then runs
 ///   `P` on that same value (one `INDEX` in jq's compilation), where an
 ///   explicit `{b:$m, b:$n}` performs two and refuses at the second.
@@ -30090,7 +30116,6 @@ fn walk_pattern(
     }
 }
 
-/// Whether `pattern` performs at least one tracked index step, i.e. whether
 /// The `Expr::AsPattern` arm of [`resolve_node_sink`] (#2649): jq's
 /// destructuring bind in path position. The arm's own comment gives the jq
 /// model, [`walk_pattern`] the per-step rule; this function drives the

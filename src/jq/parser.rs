@@ -2433,10 +2433,18 @@ impl<'a> Parser<'a> {
 
                 let mut entries = Vec::new();
 
-                // Empty object pattern
+                // `{}` is a syntax error in jq 1.7.1 (`unexpected '}'`, exit
+                // 3): its grammar has no empty `ObjPats`. Accepting it used to
+                // be harmless in value mode (no bindings, body runs), but in
+                // path position a pattern with no step would seed the body at
+                // the untouched register and `path(. as {} | .)` would answer
+                // `[]` -- and `del(. as {} | .)` write -- where jq never
+                // compiles (#2649 review).
                 if self.peek() == Some('}') {
-                    self.next();
-                    return Ok(Pattern::Object(entries));
+                    return Err(ParseError::new(
+                        "expected a pattern entry ($var, key: pattern) in object pattern",
+                        self.pos,
+                    ));
                 }
 
                 loop {
@@ -2538,10 +2546,13 @@ impl<'a> Parser<'a> {
 
                 let mut patterns = Vec::new();
 
-                // Empty array pattern
+                // `[]` is a syntax error in jq 1.7.1 too (`unexpected ']'`);
+                // see the object case above.
                 if self.peek() == Some(']') {
-                    self.next();
-                    return Ok(Pattern::Array(patterns));
+                    return Err(ParseError::new(
+                        "expected a pattern ($var, {key: $var}, or [$var]) in array pattern",
+                        self.pos,
+                    ));
                 }
 
                 loop {

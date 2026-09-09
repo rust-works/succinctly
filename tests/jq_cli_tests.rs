@@ -45065,6 +45065,58 @@ fn test_destructuring_moves_path_register_2649() -> Result<()> {
         assert_eq!(stdout, "[\"a\"]\n", "`{filter}`");
     }
 
+    // Review findings (#2649), both captured from jq 1.7.1 the same way.
+    //
+    // A `?` over a stage that navigates nothing (`$x?`, `5?`) is jq's `try`
+    // and touches neither the path nor the register, so a marker under it
+    // re-establishes exactly as the bare marker does and a literal under it
+    // carries the register. The resolver used to wrap such a stage's empty
+    // path in a one-component `Optional`, which counted as navigation and
+    // dropped the register -- pre-existing for plain `as` too (`$y?` below),
+    // fixed alongside this issue because `push_path_components` splices
+    // `($q | .x)?` into `$q? | .x?`.
+    for (input, filter, expected) in [
+        (d, "path(. as {a:$q} | $q? | .[0])", "[\"a\",0]\n"),
+        (d, "path(. as {a:$q} | ($q | .x)?)", ""),
+        (
+            d,
+            "del(. as {a:$q} | ($q | .x)?)",
+            "{\"a\":[1,2,3],\"b\":{\"c\":5}}\n",
+        ),
+        (d, "path(. as $x | 5 | $x?)", "[]\n"),
+        (d, "path(. as $x | 5 | $x? | .a)", "[\"a\"]\n"),
+        (d, "path(.b as $y | .b | 5 | $y? | .c)", "[\"b\",\"c\"]\n"),
+        (d, "path(.b as $y | .b | 5? | $y)", "[\"b\"]\n"),
+        (d, "path(.?)", "[]\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "`{filter}`: stderr={stderr}");
+        assert_eq!(stdout, expected, "`{filter}`");
+    }
+
+    // An empty `{}`/`[]` pattern is a syntax error in jq (`unexpected '}'` /
+    // `unexpected ']'`, exit 3). succinctly used to parse it; in path
+    // position a pattern with no step would have seeded the body at the
+    // untouched register and `path(. as {} | .)` answered `[]` -- and
+    // `del(. as {} | .)` wrote -- where jq never compiles. Rejected at parse
+    // time now, in every position.
+    for filter in [
+        ". as {} | .",
+        ". as [] | .",
+        ". as {a:[]} | .",
+        "path(. as {} | .)",
+        "del(. as [] | .)",
+        "reduce .a[] as [] (0; .)",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(d))?;
+        assert_eq!(code, 3, "`{filter}`: stdout={stdout} stderr={stderr}");
+        assert!(stdout.is_empty(), "`{filter}` must not print: {stdout}");
+        assert!(
+            stderr.contains("compile error"),
+            "`{filter}`: expected a compile error, got: {stderr}"
+        );
+    }
+
     Ok(())
 }
 
