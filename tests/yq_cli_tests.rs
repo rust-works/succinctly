@@ -39294,6 +39294,43 @@ fn test_alternative_manycursor_validation_error_keeps_prefix_2476() -> Result<()
     Ok(())
 }
 
+/// `owned_prefix_partial`'s own `Err` arm (`src/jq/eval_generic.rs`) --
+/// #2661 tagged this branch unreachable on the premise that `kept` only ever
+/// holds already-successfully-converted items, but that premise doesn't hold
+/// for `retain_truthy_generic`'s `ManyCursor` arm: it only runs the cheap
+/// [`push_generic_document_validation_error`] walk before keeping a cursor,
+/// and that walk stops at a container-target alias (#1804) without
+/// descending into it -- so a kept item can be an alias to a corrupt
+/// container, passing the cheap check while its real materialization still
+/// fails.
+///
+/// `*X` (an alias to an object with two different decode-failure keys that
+/// collide under YAML's shared `""` display fallback, #1642) is the first
+/// `.q[]` element and passes the cheap check -- container aliases are
+/// truthy regardless of contents -- so it lands in `kept`. The second
+/// element is a plain (non-aliased) decode failure, which the cheap check
+/// does catch and which becomes this fan-out's terminating `control`.
+/// `owned_prefix_partial` then re-converts `kept` for real via
+/// `to_owned_cursor`, which has no alias short-circuit: it dereferences `*X`
+/// and hits the #1642 collision instead, replacing the terminating
+/// `control` with its own error -- the precedence the function's own doc
+/// comment already claims (mirroring [`flatten_generic_results`]), just via
+/// a different element than any existing test exercised. Pinning this as
+/// the intended, documented behavior, not proposing a change to it.
+#[test]
+fn test_alternative_manycursor_prefix_conversion_error_2476() -> Result<()> {
+    let doc = "x: &X {\"a\\qb\": 1, \"c\\qd\": 2}\ny: &Y [*X, \"bad\\qe\"]\na:\n  q: *Y\n";
+
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(".a | (.q[] // 1)", doc, &[])?;
+    assert_ne!(code, 0, "stderr: {stderr:?}");
+    // The re-conversion's own error (`*X`'s #1642 collision), not the
+    // fan-out's original terminating control (`"bad\qe"`'s escape error).
+    assert!(stderr.contains("ambiguous"), "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "", "stdout: {stdout:?}");
+
+    Ok(())
+}
+
 /// `retain_truthy_generic`'s `LazyKeys`/`LazyIndexRange` arm: both are
 /// returned from `//`'s left operand untouched, without materializing --
 /// `keys`/`keys_unsorted` on either an object or an array is unconditionally
