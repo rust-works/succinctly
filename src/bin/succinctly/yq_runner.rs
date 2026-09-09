@@ -3274,7 +3274,7 @@ fn plain_scalar_text(value: &OwnedValue) -> Option<String> {
 /// is too short.
 fn meta_path_from_value(path: &OwnedValue, current: &OwnedValue) -> Option<Vec<MetaPathStep>> {
     let OwnedValue::Array(steps) = path else {
-        return None;
+        return None; // omni-dev: coverage tolerate-line reason="unreachable: `path` is always the raw output of the `path(TARGET)` builtin evaluated a few lines up in `resolve_one_meta_assign` -- `path/1` is a jq/yq language invariant that always answers an array of path components (see `Expr::Builtin(Builtin::PathNoArg) => Ok(Some(OwnedValue::Array(..)))` in eval_generic.rs), never any other shape (#798)"
     };
     let mut out = Vec::with_capacity(steps.len());
     for step in steps {
@@ -3374,7 +3374,7 @@ fn count_meta_assigns(expr: &Expr) -> usize {
 fn flatten_pipe_stages<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
     match expr {
         Expr::Paren(inner) | Expr::Optional(inner) => flatten_pipe_stages(inner, out),
-        Expr::Shared(inner) => flatten_pipe_stages(inner, out),
+        Expr::Shared(inner) => flatten_pipe_stages(inner, out), // omni-dev: coverage tolerate-line reason="unreachable: `resolve_meta_assign_writes` runs `expr` through this before any evaluation begins (see its own doc comment), and `Expr::Shared` is never constructed by the parser -- only at eval time, by function-call argument substitution (`substitute_func_param` in eval.rs) -- so a pre-evaluation AST can never contain one here (#798)"
         Expr::Pipe(stages) => stages.iter().for_each(|s| flatten_pipe_stages(s, out)),
         Expr::FuncDef { then, .. } => flatten_pipe_stages(then, out),
         _ => out.push(expr),
