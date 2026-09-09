@@ -13951,16 +13951,17 @@ mod meta_assign_798 {
         Ok(())
     }
 
-    /// [`plain_scalar_text`]'s plain `Int`/`Float` arms specifically (as
-    /// opposed to `NumberLiteral`, which is what a number read straight off
-    /// the page decodes to, per this codebase's own type-preservation
-    /// design -- P10 in `CLAUDE.md`): a number that reaches the target
-    /// *computed* by an earlier pipe stage, rather than read directly from
-    /// the document, loses its source spelling and decodes as a plain
-    /// `Int`/`Float` instead. Both still stringify the same way, live-
-    /// verified against pinned yq.
+    /// A `style = "double"` target reached through a preceding shape-
+    /// preserving `=` whose right-hand side is computed (`.a + 0`), not
+    /// read straight off the page -- every arithmetic/length construction
+    /// tried still decodes as `OwnedValue::NumberLiteral` at this call site
+    /// (preserving *some* spelling, just not the document's original one),
+    /// same as the direct-read case above; [`plain_scalar_text`]'s own bare
+    /// `Int`/`Float` arms exist for a value shape this evaluator's own
+    /// output path doesn't appear to produce. Live-verified against pinned
+    /// yq.
     #[test]
-    fn style_assign_double_on_a_computed_int_or_float_scalar() -> Result<()> {
+    fn style_assign_double_on_a_computed_scalar() -> Result<()> {
         let (out, code) = run_yq_stdin(".a = (.a + 0) | .a style = \"double\"", "a: 5\n", &[])?;
         assert_eq!(code, 0);
         assert_eq!(out, "a: \"5\"\n");
