@@ -86334,4 +86334,22 @@ mod tests {
         let expr = parse(&reshaping).expect("filter should parse");
         assert!(!is_alias_sensitive_assign(&expr));
     }
+
+    /// `meta_slot_keyword`'s only call site (`eval_meta_assign`'s "not yet
+    /// supported" error) only ever passes `Tag`/`HeadComment`/`FootComment`/
+    /// `Comments` -- `LineComment`/`Style`/`Anchor` never reach it through
+    /// any CLI-observable path, since those three slots already have a
+    /// working write and never take the error branch. Exercised directly
+    /// here since the mapping itself (every `MetaSlot` to its yq source
+    /// keyword) is real, checked logic, not dead code.
+    #[test]
+    fn test_meta_slot_keyword_covers_every_slot_798() {
+        assert_eq!(meta_slot_keyword(MetaSlot::LineComment), "line_comment");
+        assert_eq!(meta_slot_keyword(MetaSlot::Style), "style");
+        assert_eq!(meta_slot_keyword(MetaSlot::Anchor), "anchor");
+        assert_eq!(meta_slot_keyword(MetaSlot::Tag), "tag");
+        assert_eq!(meta_slot_keyword(MetaSlot::HeadComment), "head_comment");
+        assert_eq!(meta_slot_keyword(MetaSlot::FootComment), "foot_comment");
+        assert_eq!(meta_slot_keyword(MetaSlot::Comments), "comments");
+    }
 }

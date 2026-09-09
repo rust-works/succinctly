@@ -422,6 +422,7 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
         // #798: yq-mode-only grammar (the parser never produces this in jq
         // mode, where namespaced calls/imports live), but still rewritten
         // for consistency with every other assignment-family variant above.
+        // omni-dev: coverage tolerate reason="unreachable: `try_parse_meta_op` only fires under `ParserMode::Yq` (src/jq/parser.rs), and `rewrite_namespaced_calls` is only reached via `ModuleProcessor::process_program`, which jq_runner's own jq-mode `run` is the sole caller of -- so a `MetaAssign` node can never reach this function (#798)"
         Expr::MetaAssign {
             target,
             slot,
@@ -433,6 +434,7 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
             value: Box::new(rewrite_namespaced_calls(*value)),
             is_update,
         },
+        // omni-dev: coverage end
         // Label-break
         Expr::Label { name, body } => Expr::Label {
             name,
