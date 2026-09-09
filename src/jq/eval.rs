@@ -85088,6 +85088,187 @@ mod tests {
         }
     }
 
+    /// #2649: `Expr::AsPattern`'s accepting rows, via the same
+    /// `bind_origin_outputs` helper the #2042 matrix above uses (it wraps
+    /// the filter as `[FILTER] | tojson`, so each expectation is jq 1.7.1's
+    /// own `-c '[FILTER]'` line). A subset of the CLI test's exhaustive
+    /// table (`tests/jq_cli_tests.rs`'s `test_destructuring_moves_path_register_2649`),
+    /// chosen to cover: a single object step, nested object entries, the
+    /// one-step `{$b: P}` bind-and-recurse form, reverse-order array
+    /// stepping, `?//` alternative fallback (both a pattern-step retry and
+    /// a body that never even needs one), a `null` register carried
+    /// through a second entry, and a write (`del`).
+    #[test]
+    fn test_path_destructure_matrix_accepts_2649() {
+        // (input, filter, jq 1.7.1's `-c '[FILTER]'`)
+        let rows: &[(&[u8], &str, &str)] = &[
+            (
+                br#"{"a":[1,2,3],"b":{"c":5}}"#,
+                "path(. as {a:$q} | $q)",
+                r#"[["a"]]"#,
+            ),
+            (
+                br#"{"a":[1,2,3],"b":{"c":5}}"#,
+                "path(. as {a:$q} | $q[0])",
+                r#"[["a",0]]"#,
+            ),
+            (
+                br#"{"a":[1,2,3],"b":{"c":5}}"#,
+                "path(. as {b:{c:$r}} | $r)",
+                r#"[["b","c"]]"#,
+            ),
+            (
+                br#"{"a":[1,2,3],"b":{"c":5}}"#,
+                "path(. as {b:$b} | $b.c)",
+                r#"[["b","c"]]"#,
+            ),
+            (
+                br#"{"a":[1,2,3],"b":{"c":5}}"#,
+                "path(. as {$a} | $a)",
+                r#"[["a"]]"#,
+            ),
+            (
+                br#"{"a":[1,2,3],"b":{"c":5}}"#,
+                "path(. as {$b: {c:$x}} | $x)",
+                r#"[["b","c"]]"#,
+            ),
+            (
+                br#"{"a":[1,2,3],"b":{"c":5}}"#,
+                "path(. as {a:[$h]} | $h)",
+                r#"[["a",0]]"#,
+            ),
+            (br"[[1,2],[3,4]]", "path(. as [[$a]] | $a)", r"[[0,0]]"),
+            (br"[[1,2],[3,4]]", "path(. as [$a] | $a[1])", r"[[0,1]]"),
+            (
+                br#"{"a":[1,2,3],"b":{"c":5}}"#,
+                "path(. as {a:$q} ?// [$q] | $q)",
+                r#"[["a"]]"#,
+            ),
+            (
+                br#"{"a":[1,2,3],"b":{"c":5}}"#,
+                "path(. as {a:$q, x:{y:$z}} ?// {b:$r} | $r)",
+                r#"[["b"]]"#,
+            ),
+            (br"null", "path(. as {a:$q,b:$r} | $r)", r#"[["a","b"]]"#),
+            (
+                br#"{"a":[1,2,3],"b":{"c":5}}"#,
+                "del(. as {a:$q} | $q)",
+                r#"[{"b":{"c":5}}]"#,
+            ),
+        ];
+        for (input, filter, expected) in rows {
+            match bind_origin_outputs(input, filter) {
+                Ok(got) => assert_eq!(got, *expected, "{filter}"),
+                Err(e) => panic!(
+                    "{filter}: refused where jq answers {expected}: {}",
+                    e.message
+                ),
+            }
+        }
+    }
+
+    /// #2649: `Expr::AsPattern`'s refusing rows -- a pattern step whose
+    /// input is not `jv_identical` to the register raises
+    /// [`EvalError::is_untracked_navigation_error`] (jq's own "near attempt
+    /// to access"); a terminal untracked value in body position raises
+    /// [`EvalError::is_invalid_path_expression`] (jq's "with result").
+    /// `path(. as {a:$q} | ($q | .[0]) as [$z] | $z)` pins the identity
+    /// check running *before* the kind check: the seed is `1` (not an
+    /// array), yet jq's message is the near-access wording, not "Cannot
+    /// index number".
+    #[test]
+    fn test_path_destructure_matrix_refuses_2649() {
+        // (input, filter, which predicate jq's own wording corresponds to)
+        let rows: &[(&[u8], &str, bool)] = &[
+            // untracked-navigation (near-access)
+            (
+                br#"{"a":[1,2,3],"b":{"c":5}}"#,
+                "path(. as {a:$q} | .a)",
+                true,
+            ),
+            (
+                br#"{"a":[1,2,3],"b":{"c":5}}"#,
+                "path(. as {a:$q, b:$r} | $r)",
+                true,
+            ),
+            (
+                br#"{"a":[1,2,3],"b":{"c":5}}"#,
+                "path(.a as [$x,$y] | $y)",
+                true,
+            ),
+            (
+                br#"{"a":[1,2,3],"b":{"c":5}}"#,
+                "path(. as {a:[$h, $i]} | $i)",
+                true,
+            ),
+            (
+                br#"{"a":[1,2,3],"b":{"c":5}}"#,
+                "path(. as {a:$q} | ($q | .[0]) as [$z] | $z)",
+                true,
+            ),
+            // invalid-path-expression (terminal)
+            (
+                br#"{"a":[1,2,3],"b":{"c":5}}"#,
+                "path(. as {a:$q} | .)",
+                false,
+            ),
+            (
+                br#"{"a":[1,2,3],"b":{"c":5}}"#,
+                "path(. as {$b: {c:$x}} | $b)",
+                false,
+            ),
+            (
+                br#"{"a":[1,2,3],"b":{"c":5}}"#,
+                "path(. as {a:$q} | 1)",
+                false,
+            ),
+        ];
+        for (input, filter, is_near_access) in rows {
+            match bind_origin_outputs(input, filter) {
+                Err(e) if *is_near_access => {
+                    assert!(e.is_untracked_navigation_error(), "{filter}: {}", e.message)
+                }
+                Err(e) => assert!(e.is_invalid_path_expression(), "{filter}: {}", e.message),
+                Ok(got) => panic!("{filter}: answered {got} where jq refuses"),
+            }
+        }
+    }
+
+    /// #2649 code review: the new `Expr::AsPattern` arm is jq-mode-only
+    /// (real yq v4.53.3's own lexer rejects any destructuring pattern
+    /// outright, so there is no yq oracle to match — see the design's
+    /// "Design" section 3's preamble). `path()` itself needs no
+    /// `--jq-extensions` gate in yq mode (`test_reestablishes_register_stays_jq_mode_only_read_2044`
+    /// above pins that), and `yq_query!` always parses with
+    /// `jq_extensions: true` regardless, so this exercises the same
+    /// `YqSemantics` evaluator path a real `--jq-extensions` CLI
+    /// invocation would take.
+    ///
+    /// What was actually observed (verified live on this build, both
+    /// before and unaffected by the fix): every one of these filters --
+    /// including `$q`, which jq 1.7.1 *accepts* in jq mode -- evaluates to
+    /// `QueryResult::None` in yq mode, not `QueryResult::Error`. That is
+    /// the pre-existing "current fall-through" the design's preamble
+    /// describes: `needs_path_context` routes any `path(...)` call through
+    /// the generic evaluator, and that bridge has no case for a `Pattern`
+    /// other than a single bare `Var` (yq mode's own supported shape,
+    /// #2042/#2044) -- an object/array pattern falls out of every arm it
+    /// tries and yields no path at all, silently, rather than raising.
+    #[test]
+    fn test_as_pattern_arm_is_jq_mode_only_2649() {
+        let d = br#"{"a":[1,2,3],"b":{"c":5}}"#;
+        for filter in [
+            "path(. as {a:$q} | $q)",
+            "path(. as {a:$q} | .a)",
+            "path(. as {a:$q} | 1)",
+            "path(. as {a:$q} | .)",
+        ] {
+            yq_query!(d, filter,
+                QueryResult::None => {}
+            );
+        }
+    }
+
     /// #2042 review: the witness resolve is gated to pure-navigation
     /// sources ([`is_pure_navigation`]), so a source that could catch or
     /// re-raise the resolver's own refusals binds by value exactly as

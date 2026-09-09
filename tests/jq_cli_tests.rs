@@ -44575,11 +44575,12 @@ fn test_alternative_still_raises_on_a_malformed_document_2476() -> Result<()> {
 /// captured live 2026-09-08, both stdout and (for the error rows) the exact
 /// stderr message and exit code.
 ///
-/// Two shapes are deliberately excluded, both belonging to #2042 instead:
+/// One shape is deliberately excluded, belonging to #2042 instead:
 /// `path(.a as $y | .a | $y)` (the register survives a re-navigation through
-/// an unrelated field — #2042's own headline case) and the destructuring
+/// an unrelated field — #2042's own headline case). The destructuring
 /// register quirk `. as {a:$q} | ...` (jq's destructuring bind moves its
-/// register in a way plain `as $x` does not).
+/// register in a way plain `as $x` does not) has its own matrix in
+/// [`test_destructuring_moves_path_register_2649`] below.
 #[test]
 fn test_path_through_bound_variable_matches_jq_2072() -> Result<()> {
     let input = r#"{"a":[1,2,3]}"#;
@@ -44641,6 +44642,252 @@ fn test_path_through_bound_variable_matches_jq_2072() -> Result<()> {
             stderr.contains(expected_stderr),
             "`{filter}` -- stderr: {stderr}"
         );
+    }
+
+    Ok(())
+}
+
+/// #2649: jq compiles `SRC as PATTERN | BODY` so that `SRC` runs with path
+/// tracking *suspended* (like [`test_path_through_bound_variable_matches_jq_2072`]'s
+/// plain `as $x`, above), but every step *inside* `PATTERN` runs *tracked*:
+/// each object key / array index the pattern walks moves the path register
+/// one step, in source order for object entries and **reverse** index order
+/// for array elements (jq builds its array matcher right-to-left, so the
+/// last element is attempted from the register first). Every row below was
+/// captured live against `/usr/bin/jq` 1.7.1 on 2026-09-10 -- stdout
+/// (`-c`) verbatim for the accepting rows, and the exact stderr message
+/// plus exit code for the refusing ones.
+#[test]
+fn test_destructuring_moves_path_register_2649() -> Result<()> {
+    let d = r#"{"a":[1,2,3],"b":{"c":5}}"#;
+
+    // Rows real jq resolves to a path (or a plain value for `del`/assignment).
+    for (input, filter, expected) in [
+        (d, "path(. as {a:$q} | $q)", "[\"a\"]\n"),
+        (d, "path(. as {a:$q} | $q[0])", "[\"a\",0]\n"),
+        (d, "path(. as {b:{c:$r}} | $r)", "[\"b\",\"c\"]\n"),
+        (d, "path(. as {b:$b} | $b.c)", "[\"b\",\"c\"]\n"),
+        (d, "path(. as {$a} | $a)", "[\"a\"]\n"),
+        (d, "path(. as {$b: {c:$x}} | $x)", "[\"b\",\"c\"]\n"),
+        (d, "path(. as {a:[$h]} | $h)", "[\"a\",0]\n"),
+        ("[[1,2],[3,4]]", "path(. as [[$a]] | $a)", "[0,0]\n"),
+        ("[[1,2],[3,4]]", "path(. as [$a] | $a[1])", "[0,1]\n"),
+        (
+            d,
+            "path(. as {a:$q} | $q | .[])",
+            "[\"a\",0]\n[\"a\",1]\n[\"a\",2]\n",
+        ),
+        (
+            d,
+            "path(. as {a:$q} | $q | recurse)",
+            "[\"a\"]\n[\"a\",0]\n[\"a\",1]\n[\"a\",2]\n",
+        ),
+        (
+            d,
+            "path(. as {a:$q} | $q | .[1:])",
+            "[\"a\",{\"start\":1,\"end\":null}]\n",
+        ),
+        (d, "path(. as {a:$q} | $q | getpath([0]))", "[\"a\",0]\n"),
+        (d, "path(. as {a:$q} | $q | select(length>0))", "[\"a\"]\n"),
+        (d, "path(. as {a:$q} | . as $r | $q)", "[\"a\"]\n"),
+        (d, "path(. as {a:$q} | $q as $z | $z)", "[\"a\"]\n"),
+        (d, "path(. as {a:$q} ?// [$q] | $q)", "[\"a\"]\n"),
+        (d, "path(. as [$q] ?// {a:$q} | $q)", "[\"a\"]\n"),
+        (
+            d,
+            "path(. as {a:$q, x:{y:$z}} ?// {b:$r} | $r)",
+            "[\"b\"]\n",
+        ),
+        (d, "path(. as {a:$q} ?// $r | $q)", "[\"a\"]\n"),
+        (d, "path(. as {a:$q} ?// {a:$q} | $q)", "[\"a\"]\n"),
+        (d, "path((. as {a:$q} | $q) | .[0])", "[\"a\",0]\n"),
+        (d, "path(.b | . as {c:$v} | $v)", "[\"b\",\"c\"]\n"),
+        (d, "path(.a | . as [$h] | $h)", "[\"a\",0]\n"),
+        (d, "path(.a as $z | . as {a:$h} | $z)", "[\"a\"]\n"),
+        (d, "path(. as {a:$q} | .b as $z | $q)", "[\"a\"]\n"),
+        (r#"{"a":null}"#, "path(. as {a:$q} | null)", "[\"a\"]\n"),
+        (r#"{"a":true}"#, "path(. as {a:$q} | true)", "[\"a\"]\n"),
+        ("null", "path(. as {a:$q} | .)", "[\"a\"]\n"),
+        ("null", "path(. as {a:$q,b:$r} | $r)", "[\"a\",\"b\"]\n"),
+        ("{}", "path(. as {a:{b:$q}} | $q)", "[\"a\",\"b\"]\n"),
+        (d, "del(. as {a:$q} | $q)", "{\"b\":{\"c\":5}}\n"),
+        (d, "(. as {a:$q} | $q) = 9", "{\"a\":9,\"b\":{\"c\":5}}\n"),
+        (
+            d,
+            "(. as {a:$q} | $q[1]) += 10",
+            "{\"a\":[1,12,3],\"b\":{\"c\":5}}\n",
+        ),
+        (
+            d,
+            "(. as {a:$q} | $q) |= length",
+            "{\"a\":3,\"b\":{\"c\":5}}\n",
+        ),
+        (
+            d,
+            "try path(. as {a:$q} | .a) catch \"caught\"",
+            "\"caught\"\n",
+        ),
+        (d, "[path(. as {a:$q} | .a)?]", "[]\n"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "`{filter}`: stderr={stderr}");
+        assert_eq!(stdout, expected, "`{filter}`");
+    }
+
+    // Rows real jq refuses outright: the pattern step's input is not
+    // `jv_identical` to the register (near-access), or the body's own
+    // result is untracked (terminal "with result"/kind-mismatch). Exit
+    // code 5 and the exact message.
+    for (input, filter, expected_stderr) in [
+        (
+            d,
+            "path(. as {a:$q} | .a)",
+            "Invalid path expression near attempt to access element \"a\" of {\"a\":[1,2,3],\"b\":{\"c\":5}}",
+        ),
+        (
+            d,
+            "path(. as {a:$q} | .)",
+            "Invalid path expression with result {\"a\":[1,2,3],\"b\":{\"c\":5}}",
+        ),
+        (
+            d,
+            "path(. as {a:$q} | .b)",
+            "Invalid path expression near attempt to access element \"b\" of {\"a\":[1,2,3],\"b\":{\"c\":5}}",
+        ),
+        (
+            d,
+            "path(. as {a:$q, b:$r} | $r)",
+            "Invalid path expression near attempt to access element \"b\" of {\"a\":[1,2,3],\"b\":{\"c\":5}}",
+        ),
+        (
+            d,
+            "path(. as {a:$q, b:$r} | .)",
+            "Invalid path expression near attempt to access element \"b\" of {\"a\":[1,2,3],\"b\":{\"c\":5}}",
+        ),
+        (
+            d,
+            "path(.a as [$x,$y] | $y)",
+            "Invalid path expression near attempt to access element 1 of [1,2,3]",
+        ),
+        (
+            d,
+            "path(. as {a:[$h, $i]} | $i)",
+            "Invalid path expression near attempt to access element 0 of [1,2,3]",
+        ),
+        (
+            "[[1,2],[3,4]]",
+            "path(. as [[$a,$b]] | $a)",
+            "Invalid path expression near attempt to access element 0 of [1,2]",
+        ),
+        (
+            d,
+            "[path(.b as {c:$v} | $v)]",
+            "Invalid path expression near attempt to access element \"c\" of {\"c\":5}",
+        ),
+        (
+            // Explicit duplicate key (`{b:$m, b:$n}`) is two INDEX steps, not
+            // one (unlike `{$b: P}` below), so the second one refuses.
+            d,
+            "path(. as {b:$m, b:$n} | $n)",
+            "Invalid path expression near attempt to access element \"b\" of {\"a\":[1,2,3],\"b\":{\"c\":5}}",
+        ),
+        (
+            d,
+            "path(. as {$b: {c:$x}} | $b)",
+            "Invalid path expression with result {\"c\":5}",
+        ),
+        (d, "path(. as {a:$q} | 1)", "Invalid path expression with result 1"),
+        (
+            d,
+            "path(. as {a:$q} | ($q|length))",
+            "Invalid path expression with result 3",
+        ),
+        (
+            // The identity check precedes the kind check: the seed for
+            // `[$z]` is `1` (`$q|.[0]`), which is not `jv_identical` to
+            // anything, so the near-access wording wins over "cannot index".
+            d,
+            "path(. as {a:$q} | ($q | .[0]) as [$z] | $z)",
+            "Invalid path expression near attempt to access element 0 of 1",
+        ),
+        (
+            d,
+            "path(. as {a:$q} | $q | . as {x:$m} | .)",
+            "Cannot index array with string \"x\"",
+        ),
+        (
+            "[1]",
+            "path(. as [$q, $r] | null)",
+            "Invalid path expression near attempt to access element 0 of [1]",
+        ),
+        (
+            d,
+            "path(. as {a:$q} ?// {b:$r} | .a)",
+            "Invalid path expression near attempt to access element \"a\" of {\"a\":[1,2,3],\"b\":{\"c\":5}}",
+        ),
+        (
+            d,
+            "path(. as {a:$q} ?// {b:$r} | error(\"boom\"))",
+            "boom",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 5, "`{filter}`: stdout={stdout} stderr={stderr}");
+        assert!(stdout.is_empty(), "`{filter}` must not print: {stdout}");
+        assert!(
+            stderr.contains(expected_stderr),
+            "`{filter}` -- stderr: {stderr}"
+        );
+    }
+
+    // Refuse-only pins: rows where real jq *answers* (comment gives jq's
+    // own `-c` output) but succinctly must still refuse rather than risk a
+    // fabricated path. `?//`'s retry-on-body-error semantics (jq falls to
+    // the next alternative on a path error raised *inside* the body, not
+    // just on a pattern-step error) are exactly the shape the design's
+    // "artefact guard" (see `docs/compliance/jq/limitations.md`) declines
+    // to reproduce, because the resolver itself raises refusals jq never
+    // does (an untracked stage cannot certify a marker source) and cannot
+    // tell those apart from a genuine jq path error -- retrying on both
+    // alike risks landing on the wrong alternative and fabricating a path
+    // a write would then corrupt data through. Exit 5 and empty stdout are
+    // the only assertions; each row is otherwise a pure jq answer, not a
+    // succinctly one.
+    for (input, filter) in [
+        // jq: ["a",0]
+        (
+            r#"{"a":[1,2,3]}"#,
+            "path(. as {a:$q} ?// $z | if $q then $q[0] else $z end)",
+        ),
+        // jq: {"a":[2,3]}
+        (
+            r#"{"a":[1,2,3]}"#,
+            "del(. as {a:$q} ?// $z | if $q then $q[0] else $z end)",
+        ),
+        // jq: ["a"]
+        (
+            d,
+            "path(. as $x | 5 | $x as {a:$q} ?// $z | if $q then $q else $z end)",
+        ),
+        // jq: ["a"]
+        (d, "path(. as {a:$q} | .a as $z | $z)"),
+        // jq: ["b"]
+        (d, "path(. as {a:$q} ?// {b:$r} | $r)"),
+        // jq: ["a"]
+        (d, "path(. as {a:$q} ?// $z | .a)"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 5, "`{filter}`: stdout={stdout} stderr={stderr}");
+        assert!(stdout.is_empty(), "`{filter}` must not print: {stdout}");
+    }
+
+    // The other invocation route (`-n`, no stdin): jq's `-n` seeds `.` as
+    // `null`, so these are the same two rows as the `null` accept-table
+    // entries above, just reached through the CLI's other input path.
+    for filter in ["path(. as {a:$q} | $q)", "path(. as {a:$q} | .)"] {
+        let (stdout, stderr, code) = run_jq_full(&["-n", "-c", filter], None)?;
+        assert_eq!(code, 0, "`{filter}`: stderr={stderr}");
+        assert_eq!(stdout, "[\"a\"]\n", "`{filter}`");
     }
 
     Ok(())
