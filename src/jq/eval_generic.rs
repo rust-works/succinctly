@@ -8853,7 +8853,7 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
         // undecodable key is echoed raw here too, instead of decoded (#2103).
         return match cursor {
             Some(c) => push_one_generic(GenericItem::OneCursorValue(c, value), sink),
-            None => push_one_generic(GenericItem::One(value), sink),
+            None => push_one_generic(GenericItem::One(value), sink), // omni-dev: coverage tolerate-line reason="unreachable: every producer that reaches this empty-`exprs` tail (`each_lazy_keys_iterate_sink`'s `sorted`/`!sorted` arms, `each_lazy_index_range_iterate_sink`, `each_lazy_seq_iterate_sink`) yields `OneCursorValue`/`OneCursor`/`Owned`, never a cursorless `GenericItem::One` -- so `cursor` is always `Some` here; kept for exhaustiveness/symmetry with the `Some` arm (#2103)"
         };
     };
     if rest.is_empty() {
