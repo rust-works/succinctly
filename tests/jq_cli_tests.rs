@@ -16644,6 +16644,12 @@ fn test_repeat_eager_fallback_raises_instead_of_silently_truncating_2014() -> Re
         "reduce repeat(1) as $x (0; .+1)",
         "foreach repeat(1) as $x (0; .+1)",
         "last(repeat(1))",
+        // #2180 WP3 shipped `each_foreach` without the `streams_unbounded`
+        // gate its generic twin already had, so this one fell through to
+        // `foreach`'s own step budget and reported that message instead.
+        // WP3's review gated both arms identically; changing which cap
+        // fires is a separate decision, and real jq hangs on this shape too.
+        "all(foreach repeat(1) as $x (0; .+1); . > 0)",
     ] {
         let (_, stderr, code) = run_jq_full(&["-c", query], Some("null"))?;
         assert_eq!(code, 5, "query {query:?}, stderr: {stderr}");
@@ -30931,6 +30937,47 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
             "eejq: error (at <unknown>): boom",
             5,
         ),
+        // ---- #2180 WP3 review: one source drive per INIT fork -----------
+        // jq re-evaluates the source generator for each INIT output (#534's
+        // "one independent run per INIT output", side effects included), so
+        // `B` is written twice. WP3 recorded the first fork's elements and
+        // replayed them for the rest, which wrote it once -- a pre-existing
+        // eager-path divergence WP3 inherited rather than introduced, and
+        // the same recording that lost a later fork's own `?//` retry (see
+        // `test_nested_short_circuit_consumer_hides_the_stop_2180`).
+        // Captured live against jq 1.7.1.
+        (
+            &["-cn", r#"[foreach (1, ("B"|stderr)) as $x ((0,100); .+1)]"#],
+            None,
+            "[1,2,101,102]\n",
+            "BB",
+            0,
+        ),
+        // #2440's two ordering rows, re-pinned here because the review moved
+        // every `foreach` entry point onto one core and the ordering they
+        // pin -- INIT evaluated before the source is ever pulled -- is now
+        // enforced in exactly one place (`foreach_forks`' own
+        // `init_values.is_empty()` guard). INIT's error outranks the
+        // source's...
+        (
+            &[
+                "-cn",
+                r#"foreach (1, error("in")) as $x (error("init"); .)"#,
+            ],
+            None,
+            "",
+            "jq: error (at <unknown>): init",
+            5,
+        ),
+        // ...and a zero-output INIT leaves the source unevaluated entirely,
+        // so the process does not halt.
+        (
+            &["-cn", "foreach halt_error as $x (empty; .)"],
+            None,
+            "",
+            "",
+            0,
+        ),
     ];
 
     for (args, stdin, want_out, want_err, want_code) in cases {
@@ -32320,7 +32367,7 @@ fn test_nested_short_circuit_consumer_hides_the_stop_2180() -> Result<()> {
         // `each_foreach_generic` drive the source through `eval_each`/
         // `eval_each_generic` one element at a time and each step's EXTRACT
         // through `eval_each_owned`, over one shared fold loop
-        // (`foreach_fork`); the sink's `Demand::Stop` is then treated by
+        // (`foreach_forks`); the sink's `Demand::Stop` is then treated by
         // `foreach`'s own `?//` exactly as an escaping `Control::Break` is
         // (`is_retryable_stop` beside `is_retryable_control`), **with the
         // same state threading** -- the pattern rows are `[1,2]`, not
@@ -32436,6 +32483,55 @@ fn test_nested_short_circuit_consumer_hides_the_stop_2180() -> Result<()> {
         (
             "[isempty(foreach (1) as $x ?// $y ((0,100); .+1; .))]".to_string(),
             "[false,false]",
+            "matches jq",
+        ),
+        // ---- WP3 review: later INIT forks drive the source afresh -------
+        // WP3 drove the source lazily for the *first* INIT fork only and
+        // replayed a recording for the rest, on the reasoning that a later
+        // fork is only reached when the first ran the source to exhaustion.
+        // True for the fold's own termination, false for `?//`: a later
+        // fork's consumer stop has to reach the source bind just as the
+        // first fork's does, and the recording also double-counted any
+        // element a source-side `?//` re-offered. `foreach_forks` re-drives
+        // instead (jq does too: `[foreach (1, ("B"|stderr)) as $x ((0,100);
+        // .+1)]` writes `B` twice, pinned in
+        // `test_short_circuit_side_effect_shapes_already_match_jq_820`).
+        // All four captured live against jq 1.7.1.
+        //
+        // Two forks, two source elements, and a stop inside each fork: the
+        // replay answered `[1,3,101]`, losing the second fork's own retry.
+        (
+            format!("[limit(3; foreach ({G}, 2) as $v ((0,100); .+$v; .))]"),
+            "[1,3,101,102]",
+            "matches jq",
+        ),
+        // A step error retried through the source `?//` re-offers the same
+        // element; `recorded.push` ran once per offer, so the second fork
+        // replayed it twice (`[1,6,7]`, `["OK:null","OK:100","OK:OK:100"]`).
+        (
+            format!(
+                "[limit(10; foreach ({G}) as $v ((0, 5); if . == 0 then error(\"boom\") else .+1 end; .))]"
+            ),
+            "[1,6]",
+            "matches jq",
+        ),
+        (
+            format!(
+                "[limit(10; foreach ({G}) as $v ((0, 100); if . == 0 then error(\"x\") else \"OK:\\(.)\" end; .))]"
+            ),
+            "[\"OK:null\",\"OK:100\"]",
+            "matches jq",
+        ),
+        // The route split the same review flagged: the *eager* route
+        // (`[...]` collecting, no wrapping consumer) materialized the source
+        // before the fold ran, so a step escape had no `?//` left to retry
+        // and this raised `x` where every lazy spelling answered
+        // `["OK:null"]`. Both routes now drive the source the same way.
+        (
+            format!(
+                "[foreach ({G}) as $v (0; if . == 0 then error(\"x\") else \"OK:\\(.)\" end; .)]"
+            ),
+            "[\"OK:null\"]",
             "matches jq",
         ),
         // ==== WP3's residual: `foreach`'s UPDATE and INIT positions ====
