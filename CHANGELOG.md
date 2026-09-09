@@ -80,6 +80,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `def` loaded through `include` or `~/.jq` can now shadow a builtin of the
+  same name** (#2395, a #2036 follow-up). `jq -L . -nc 'include "mylib"; length'`
+  with `def length: "shadowed-from-module";` in the module answered `0` -- the
+  builtin -- where real jq answers `"shadowed-from-module"`. Every kind of
+  shadowable name was affected: ordinary builtins (`length`, `keys`, `type`,
+  `map`, `empty`, ...), the `not` keyword, the fixed-arity special forms
+  (`error`, `select`, `first`, `limit`, `path`, `getpath`), and `range`'s
+  one-argument sugar. `~/.jq`'s own defs were affected identically.
+
+  #2036 collects shadow-candidate names by scanning *the text being parsed*, and
+  the main filter's text can never contain an included module's `def`s: module
+  bodies are separate texts, loaded and inlined by `ModuleLoader::process_program`
+  only after that parse has finished. So `length` lowered straight to a builtin
+  node, and `resolve.rs`'s scope-aware check -- which by then would have found
+  the module's `FuncDef` plainly in scope -- had no call site to reconsider.
+
+  Fixed by feeding the names back into a second parse rather than rewriting the
+  assembled tree, which is the issue's own suggested direction but needs a
+  `Builtin` -> name map the crate does not have, and could not recover `range`'s
+  arity, whose sugar marker is itself only emitted for a name already known to be
+  a candidate. The loader now reports the def names that will land *unqualified*
+  in scope (`ModuleLoader::unqualified_def_names`), and the runner re-parses the
+  filter with those added via the new
+  `jq::parse_program_with_extra_shadowable_defs`. Widening the candidate set is
+  monotone -- it can only add a fallback wrapper to a parse that already
+  succeeded, or a retry to one that already failed -- so the second parse cannot
+  reject a program the first accepted. `load_module` memoizes, so nothing is read
+  or parsed twice; a filter with no `include` and no `~/.jq` skips the second
+  parse entirely and pays nothing.
+
+  `import "m" as ns` is deliberately excluded, matching jq: those defs enter
+  scope only as `ns::name`, so a bare `length` there is still the builtin
+  (`m::length` reaches the module's, and already did). Arity sensitivity carries
+  over from #2036 unchanged -- a module defining only `length/1` leaves the
+  zero-arity builtin intact -- as do the two scope boundaries: a `def` in the
+  main filter still beats a module's, and `include` is still not transitive.
+  `succinctly yq` is unaffected; it has no `-L` and never builds a module loader.
+
 - **An `as`-bound variable now stands at the node it was bound from, instead of
   being a value with no position** (#2072). Real yq's variables hold *nodes*,
   parent pointers and all, so `.a.b as $x | $x | key` is `"b"` there;

@@ -22346,6 +22346,249 @@ fn test_def_shadow_nested_error_wrong_arity_realistic_depth_2036() -> Result<()>
     Ok(())
 }
 
+// =============================================================================
+// #2395: a `def` loaded via include/~/.jq can shadow a builtin
+// =============================================================================
+
+/// #2395: write `contents` as `mod.jq` in a fresh temp dir and run
+/// `succinctly jq -L <dir> <args...>`.
+///
+/// The `TempDir` is created, used and dropped inside this call, so the module
+/// file outlives the spawn (and nothing else). `-L` takes the path as an
+/// `OsStr`, which `run_jq_full`'s `&[&str]` cannot carry, so this goes through
+/// the raw `Command` builder the way `test_include_directive` already does.
+fn run_jq_with_module(contents: &str, args: &[&str]) -> Result<(String, String, i32)> {
+    let temp_dir = tempfile::tempdir()?;
+    std::fs::write(temp_dir.path().join("mod.jq"), contents)?;
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command.args(["jq", "-L"]).arg(temp_dir.path()).args(args);
+            command
+        },
+        None,
+    )?;
+    Ok((
+        String::from_utf8(output.stdout)?,
+        String::from_utf8(output.stderr)?,
+        code,
+    ))
+}
+
+/// #2395: a `def` arriving through `include` shadows a builtin of the same
+/// name, exactly as one written in the filter itself already does (#2036).
+///
+/// #2036's shadow-candidate set is a scan of the text being parsed, and the
+/// main filter's text can never contain an included module's `def`s -- module
+/// bodies are separate texts, loaded and inlined only after that parse. So
+/// every one of these lowered straight to a builtin node and the scope-aware
+/// resolve pass never saw a call site to reconsider, however plainly the
+/// module's `def` was in scope by then.
+///
+/// The table spans all four sites that consult the candidate set: ordinary
+/// builtins (`length`, `keys`, `type`, ...), the `not` keyword, the
+/// fixed-arity special forms (`error`, `first`, `limit`), and `range`'s
+/// one-argument sugar, whose arity marker is itself only emitted for a
+/// shadow candidate. Every expected value captured live from jq 1.7.1.
+#[test]
+fn test_include_def_shadows_builtin_2395() -> Result<()> {
+    let module = concat!(
+        "def length: \"s-length\";\n",
+        "def not: \"s-not\";\n",
+        "def map(f): \"s-map\";\n",
+        "def empty: \"s-empty\";\n",
+        "def error: \"s-error\";\n",
+        "def select(f): \"s-select\";\n",
+        "def first(f): \"s-first\";\n",
+        "def limit(n;f): \"s-limit\";\n",
+        "def path(f): \"s-path\";\n",
+        "def getpath(p): \"s-getpath\";\n",
+        "def keys: \"s-keys\";\n",
+        "def tostring: \"s-tostring\";\n",
+        "def type: \"s-type\";\n",
+        "def recurse: \"s-recurse\";\n",
+        "def range(n): \"s-range\";\n",
+    );
+    for (call, want) in [
+        ("length", r#"["s-length"]"#),
+        ("true|not", r#"["s-not"]"#),
+        ("[1,2]|map(.)", r#"["s-map"]"#),
+        ("empty", r#"["s-empty"]"#),
+        ("error", r#"["s-error"]"#),
+        ("select(.)", r#"["s-select"]"#),
+        ("first(1,2)", r#"["s-first"]"#),
+        ("limit(1;1,2)", r#"["s-limit"]"#),
+        ("path(.a)", r#"["s-path"]"#),
+        (r#"getpath(["a"])"#, r#"["s-getpath"]"#),
+        ("keys", r#"["s-keys"]"#),
+        ("tostring", r#"["s-tostring"]"#),
+        ("type", r#"["s-type"]"#),
+        ("recurse", r#"["s-recurse"]"#),
+        ("range(3)", r#"["s-range"]"#),
+    ] {
+        let filter = format!(r#"include "mod"; [{call}]"#);
+        let (stdout, stderr, code) = run_jq_with_module(module, &["-nc", &filter])?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "{filter}");
+    }
+    Ok(())
+}
+
+/// #2395: the `~/.jq` half of the same gap. Its defs are inlined under their
+/// bare names just like an `include`d module's, and were equally invisible to
+/// the prescan.
+#[test]
+fn test_home_jq_def_shadows_builtin_2395() -> Result<()> {
+    let temp_home = tempfile::tempdir()?;
+    std::fs::write(
+        temp_home.path().join(".jq"),
+        "def length: \"dotjq-length\";\ndef error: \"dotjq-error\";\n",
+    )?;
+    for (call, want) in [
+        ("length", r#"["dotjq-length"]"#),
+        ("error", r#"["dotjq-error"]"#),
+    ] {
+        let filter = format!("[{call}]");
+        let (output, code) = spawn_jq_with_env(&["-nc", &filter], "HOME", temp_home.path(), None)?;
+        let stdout = String::from_utf8(output.stdout)?;
+        let stderr = String::from_utf8(output.stderr)?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "{filter}");
+    }
+    Ok(())
+}
+
+/// #2395: `import "m" as ns` must *not* shadow, and the exclusion is
+/// deliberate rather than an oversight -- jq puts an imported module's defs in
+/// scope only as `ns::name`, so a bare `length` there is still the builtin
+/// (confirmed live against jq 1.7.1, which prints `0` and `"s-length"` for
+/// these two). The fix therefore feeds only `include`/`~/.jq` names into the
+/// parser's candidate set, never `imports`.
+#[test]
+fn test_import_namespace_def_does_not_shadow_builtin_2395() -> Result<()> {
+    let module = "def length: \"s-length\";\n";
+    for (filter, want) in [
+        (r#"import "mod" as m; length"#, "0"),
+        (r#"import "mod" as m; m::length"#, r#""s-length""#),
+    ] {
+        let (stdout, stderr, code) = run_jq_with_module(module, &["-nc", filter])?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "{filter}");
+    }
+    Ok(())
+}
+
+/// #2395: module-sourced shadowing is arity-sensitive in exactly the way
+/// same-file shadowing already is (#2036) -- a module that defines only
+/// `length/1` leaves the zero-arity builtin `length` intact, and one that
+/// defines only `limit/3` leaves the builtin `limit/2` intact. Both values
+/// captured from jq 1.7.1.
+///
+/// This is the part that would have been lost had the fix rewritten the
+/// assembled tree instead of re-parsing: the arity a wrapped call reports is
+/// derived from the shape the parser stashed, and for `range` the one-argument
+/// sugar's marker is only emitted when the name is already a candidate.
+#[test]
+fn test_module_def_shadow_respects_arity_2395() -> Result<()> {
+    let module = "def length(f): \"s-length-1\";\ndef limit(a;b;c): \"s-limit-3\";\n";
+    for (call, want) in [
+        ("length", "[0]"),
+        ("length(1)", r#"["s-length-1"]"#),
+        ("limit(1;1,2)", "[1]"),
+        ("limit(1;2;3)", r#"["s-limit-3"]"#),
+    ] {
+        let filter = format!(r#"include "mod"; [{call}]"#);
+        let (stdout, stderr, code) = run_jq_with_module(module, &["-nc", &filter])?;
+        assert_eq!(code, 0, "{filter}: stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "{filter}");
+    }
+    Ok(())
+}
+
+/// #2395 regression guard: a `def` in the main filter still beats a module's
+/// `def` of the same name (the module's is the outer scope), and a module
+/// included by *another* module does not reach the main filter's scope at all
+/// -- `include` is not transitive. Both confirmed live against jq 1.7.1;
+/// neither changed with this fix, and both are the cases a too-eager candidate
+/// set would break.
+#[test]
+fn test_module_shadow_scope_boundaries_unchanged_2395() -> Result<()> {
+    let module = "def length: \"s-length\";\n";
+    let (stdout, stderr, code) = run_jq_with_module(
+        module,
+        &["-nc", r#"include "mod"; def length: "main"; length"#],
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), r#""main""#);
+
+    // main -> outer -> inner: `inner`'s `def length` must not reach here.
+    let temp_dir = tempfile::tempdir()?;
+    std::fs::write(temp_dir.path().join("inner.jq"), "def length: \"inner\";\n")?;
+    std::fs::write(
+        temp_dir.path().join("outer.jq"),
+        "include \"inner\";\ndef outerfn: \"outer\";\n",
+    )?;
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command
+                .args(["jq", "-L"])
+                .arg(temp_dir.path())
+                .args(["-nc", r#"include "outer"; [length, outerfn]"#]);
+            command
+        },
+        None,
+    )?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), r#"[0,"outer"]"#);
+    Ok(())
+}
+
+/// #2395 regression guard: an unresolvable module is still the same compile
+/// error with the same exit code, now that the loader runs one step earlier
+/// (the shadow-name collection resolves every `include` before the re-parse,
+/// where previously `process_program` was the first to touch them).
+#[test]
+fn test_module_not_found_still_reports_module_error_2395() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-nc", r#"include "nosuchmod"; 1"#], None)?;
+    assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("module error") && stderr.contains("nosuchmod"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #2395 guard against re-opening #2036's own confirmed parser DoS: a shadow
+/// candidate nested `depth` deep must not cost `O(2^depth)`. The candidate
+/// name here reaches the parser from a module rather than the filter text, so
+/// this is the module-sourced twin of
+/// `test_def_shadow_deep_nesting_does_not_blow_up_2036` -- and it additionally
+/// exercises the second parse the fix introduces, since both parses see the
+/// nesting.
+#[test]
+fn test_module_def_shadow_deep_nesting_does_not_blow_up_2395() -> Result<()> {
+    let depth = 60;
+    let filter = format!(
+        r#"include "mod"; {}.{}"#,
+        "first(".repeat(depth),
+        ")".repeat(depth)
+    );
+    let start = std::time::Instant::now();
+    let (stdout, stderr, code) =
+        run_jq_with_module("def first(f): \"s-first\";\n", &["-nc", &filter])?;
+    let elapsed = start.elapsed();
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), r#""s-first""#);
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "60-level nesting took {elapsed:?}; the parse is blowing up exponentially again"
+    );
+    Ok(())
+}
+
 /// #1376: `succinctly jq` now supports arity overloading, matching real
 /// jq -- `def f(x): ...` and `def f(x;y): ...` are distinct functions
 /// (`f/1` and `f/2`), and both stay callable after the second definition.

@@ -391,6 +391,32 @@ impl<'a> Parser<'a> {
     }
 
     fn with_mode_and_extensions(input: &'a str, mode: ParserMode, jq_extensions: bool) -> Self {
+        Self::with_mode_extensions_and_extra_defs(input, mode, jq_extensions, &BTreeSet::new())
+    }
+
+    /// Like [`Self::with_mode_and_extensions`], but seeds
+    /// [`Self::shadowable_defs`] with `extra` on top of `input`'s own
+    /// [`collect_def_names`] scan (#2395).
+    ///
+    /// `input` is only ever the *main filter's* text, so its own scan cannot
+    /// see a `def` that arrives through `include` or `~/.jq` -- those module
+    /// bodies are separate texts, loaded and inlined after this parse
+    /// finishes. `extra` is how the caller hands those names in.
+    ///
+    /// It is an over-approximation on exactly the same terms as
+    /// `collect_def_names`'s own output: a name in `extra` that turns out not
+    /// to be in scope at a given call site costs one wasted double-parse
+    /// there and nothing more, because `resolve.rs`'s scope-aware check is
+    /// still what decides, per call site, whether the name is genuinely
+    /// shadowed.
+    fn with_mode_extensions_and_extra_defs(
+        input: &'a str,
+        mode: ParserMode,
+        jq_extensions: bool,
+        extra: &BTreeSet<String>,
+    ) -> Self {
+        let mut shadowable_defs = collect_def_names(input);
+        shadowable_defs.extend(extra.iter().cloned());
         Parser {
             input,
             pos: 0,
@@ -399,7 +425,7 @@ impl<'a> Parser<'a> {
             pattern_depth: 0,
             expr_depth: 0,
             call_sites: Vec::new(),
-            shadowable_defs: collect_def_names(input),
+            shadowable_defs,
             shadow_retry_budget: SHADOW_RETRY_BUDGET,
         }
     }
@@ -6206,7 +6232,56 @@ pub fn parse_program_with_mode_and_extensions(
     mode: ParserMode,
     jq_extensions: bool,
 ) -> Result<Program, ParseError> {
-    let mut parser = Parser::with_mode_and_extensions(input, mode, jq_extensions);
+    parse_program_with_extra_shadowable_defs(input, mode, jq_extensions, &BTreeSet::new())
+}
+
+/// Parse a complete jq program, additionally treating every name in `extra`
+/// as one a `def` in this program might shadow a builtin at (#2395).
+///
+/// [`parse_program`] and friends derive that set from `input` alone, which is
+/// correct for a `def` written in the filter itself but blind to one that
+/// arrives through `include` or `~/.jq`: those module bodies are separate
+/// texts, loaded and inlined only *after* the main filter has been parsed.
+/// Without their names, a call like `length` in `include "m"; length` lowers
+/// straight to a builtin node and never becomes a call site the
+/// scope-aware resolve pass could reconsider. The module loader collects the
+/// names that will land unqualified in scope and passes them here.
+///
+/// `extra` is an over-approximation on the same terms as the parser's own
+/// internal scan: a name that turns out not to be in scope at a given call
+/// site costs one wasted double-parse there and never a wrong answer, since
+/// [`resolve_func_calls`](crate::jq::resolve_func_calls) still decides
+/// shadowing per call site. Widening the set is monotone for parsing too --
+/// it can only add a fallback wrapper to a parse that already succeeded, or a
+/// retry to one that already failed -- so this never rejects a program
+/// [`parse_program_with_mode_and_extensions`] accepts.
+///
+/// # Examples
+///
+/// ```
+/// use std::collections::BTreeSet;
+/// use succinctly::jq::{parse_program_with_extra_shadowable_defs, ParserMode};
+///
+/// // `length` is not a def anywhere in this text, so the plain entry point
+/// // lowers it to the builtin; naming it in `extra` defers the decision to
+/// // the resolve pass instead.
+/// let extra = BTreeSet::from(["length".to_string()]);
+/// let prog = parse_program_with_extra_shadowable_defs(
+///     r#"include "m"; length"#,
+///     ParserMode::Jq,
+///     false,
+///     &extra,
+/// )
+/// .unwrap();
+/// assert_eq!(prog.includes.len(), 1);
+/// ```
+pub fn parse_program_with_extra_shadowable_defs(
+    input: &str,
+    mode: ParserMode,
+    jq_extensions: bool,
+    extra: &BTreeSet<String>,
+) -> Result<Program, ParseError> {
+    let mut parser = Parser::with_mode_extensions_and_extra_defs(input, mode, jq_extensions, extra);
     let program = parser.parse_program()?;
 
     // Ensure we consumed all input

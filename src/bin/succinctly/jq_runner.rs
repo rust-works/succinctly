@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 use indexmap::IndexMap;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -151,6 +151,38 @@ impl ModuleLoader {
             .insert(module_path.to_string(), defs.clone());
 
         Ok(defs)
+    }
+
+    /// Every def name this program's modules will put into the main filter's
+    /// scope *unqualified*, for seeding the parser's shadow-candidate set
+    /// (#2395).
+    ///
+    /// That is `~/.jq`'s own defs plus every `include`d module's defs --
+    /// exactly the two sources [`Self::process_program`] inlines under their
+    /// bare names. `program.imports` is deliberately excluded: those defs are
+    /// inlined as `ns::name`, and real jq agrees they do not shadow
+    /// (`import "m" as m; length` is the builtin `length` even when the module
+    /// defines one; only `m::length` reaches the module's).
+    ///
+    /// Loading here rather than in `process_program` costs nothing:
+    /// [`Self::load_module`] memoizes on the module path, so the later
+    /// `process_program` re-reads and re-parses nothing. A module that cannot
+    /// be resolved fails here instead of there, one step earlier but still
+    /// after the main filter has parsed, so the caller's error and exit code
+    /// are unchanged.
+    pub fn unqualified_def_names(&mut self, program: &Program) -> Result<BTreeSet<String>> {
+        let mut names: BTreeSet<String> = self
+            .auto_loaded_defs
+            .iter()
+            .map(|(name, _, _)| name.clone())
+            .collect();
+
+        for include in &program.includes {
+            let defs = self.load_module(&include.path)?;
+            names.extend(defs.into_iter().map(|(name, _, _)| name));
+        }
+
+        Ok(names)
     }
 
     /// Process imports and includes, returning the modified expression with all functions defined.
@@ -1302,6 +1334,48 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     // that names an undefined function, and one that includes a missing module
     // are all "jq could not compile this program".
     let mut module_loader = ModuleLoader::new(&args.library_path);
+
+    // #2395: re-parse the filter once the module-sourced def names are known,
+    // so a `def` arriving through `include` or `~/.jq` can shadow a builtin
+    // exactly as one written in the filter itself already does (#2036).
+    //
+    // The shadow-candidate set is a scan of the text being parsed, so the
+    // parse above -- the only one that can tell us *which* modules to load --
+    // is necessarily blind to their contents. Rather than rewrite the
+    // assembled tree afterwards (which would need a `Builtin` -> name map the
+    // crate does not have, and could not recover `range`'s arity, whose sugar
+    // marker is itself emitted only for a shadow candidate), feed the names
+    // back into a second parse. Widening the set is monotone, so this parse
+    // cannot fail where the first succeeded; the arm below is kept anyway
+    // rather than unwrapping a claim about another module's behavior.
+    //
+    // Skipped entirely when no module contributes a name -- including every
+    // filter with no `include` and no `~/.jq`, which is the overwhelmingly
+    // common case and pays nothing.
+    let module_def_names = match module_loader.unqualified_def_names(&program) {
+        Ok(names) => names,
+        Err(e) => {
+            eprintln!("jq: module error: {e}");
+            return Ok(exit_codes::COMPILE_ERROR);
+        }
+    };
+    let program = if module_def_names.is_empty() {
+        program
+    } else {
+        match jq::parse_program_with_extra_shadowable_defs(
+            &filter_str,
+            jq::ParserMode::Jq,
+            false,
+            &module_def_names,
+        ) {
+            Ok(program) => program,
+            Err(e) => {
+                eprintln!("jq: compile error: {e}");
+                return Ok(exit_codes::COMPILE_ERROR);
+            }
+        }
+    };
+
     let expr = match module_loader.process_program(&program) {
         Ok(expr) => expr,
         Err(e) => {
