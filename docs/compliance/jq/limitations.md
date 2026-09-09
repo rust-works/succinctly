@@ -708,7 +708,7 @@ is the revert that established what the other one costs.
    unchanged: `substitute_bound_var`'s widening is jq-mode only
    ([#2643](https://github.com/rust-works/succinctly/issues/2643)).
 
-   Fifteen rows stay refuse-only, each pinned in `test_path_bind_origin_matrix_refuse_only_2042`
+   Fourteen rows stay refuse-only, each pinned in `test_path_bind_origin_matrix_refuse_only_2042`
    (`src/jq/eval.rs`) and `scripts/jq-bind-origin-oracle-sweep.sh`'s own `REFUSE_ONLY` list:
 
    | Filter                                                   | jq                          | Why succinctly still refuses                                                                                                                                                                                              |
@@ -726,7 +726,6 @@ is the revert that established what the other one costs.
    | `path(.a as $y \| (.c \| $y \| .b) as $w \| .a.b \| $w)` | `["a","b"]`                 | a marker is re-rooted only at the head of a source (`$y.b as $w`, `(($y \| .b) \| .c) as $w`); elsewhere it is certified against the ambient position                                                                     |
    | `path(.a[1:] as $y \| .a[1:3] \| $y)` on `{"a":[1,2,3]}` | `["a",{"start":1,"end":3}]` | jq's `.a[1:]` and `.a[1:3]` of a 3-array are the same jv (same offset and length); the slice components differ, so the spelling never matches                                                                             |
    | `path(.a as $y \| .a \| try error("x") catch $y)`        | `["a"]`                     | the handler resolves under an unknown frame and a raising `try` stage does not carry the register — pre-existing: `path(. as $x \| try error("x") catch $x)` refuses too (jq `[]`)                                        |
-   | `path(.a as $y \| .a \| . as [$q] ?// $q \| $y)`         | `["a"]`                     | an `?//` destructuring stage resolves as an opaque leaf and drops the register — pre-existing: `path(. as $x \| . as [$q] ?// $q \| $x)` refuses too (jq `[]`)                                                            |
    | `path(.a as $y \| .a \| 5 \| reduce (1) as $i (0; $y))`  | `["a"]`                     | after a literal the register is only *carried*, and a fold whose INIT is untracked seeds its own register from the ambient literal — pre-existing: `path(. as $x \| 5 \| reduce (1) as $i (0; $x))` refuses too (jq `[]`) |
 
    Two related divergences are pre-existing and out of scope for #2042, tracked separately:
@@ -753,6 +752,99 @@ is the revert that established what the other one costs.
    certifies the register (`path(.a as $y | .c | $y)` must keep refusing, since jq's own
    `jv_identical` compares the register's pointer, not the bind site), not a new place to
    get the node from.
+
+   [#2649](https://github.com/rust-works/succinctly/issues/2649) closed the last shape in this
+   family with no resolver arm at all: a **destructuring bind**. jq compiles
+   `SRC as PATTERN \| BODY` so that `SRC` runs with tracking suspended — #2042's rule, above —
+   while every index step *inside* `PATTERN` runs tracked: `gen_object_matcher`/
+   `gen_array_matcher` emit ordinary `INDEX` ops, so each step first checks its input is the
+   register's own node (`path_intact`) and then moves the register onto the matched member.
+   Object entries run in source order, array elements in **reverse** index order (jq nests each
+   earlier element inside the later one), and `BODY` then sees the ambient `.` as its input
+   while the register sits at the pattern's final position. succinctly had no `Expr::AsPattern`
+   arm at all, so every such filter fell to `resolve_leaf`'s catch-all: `path(. as {a:$q} \| $q)`,
+   jq's `["a"]`, refused "with result [1,2,3]".
+
+   `walk_pattern` (`src/jq/eval.rs`) now performs the steps and hands back the moved register
+   plus one binding per name, carrying an `Origin::At` marker (`Frame::origin_at`) wherever the
+   bound value is provably the register's node; `resolve_as_pattern` seeds `BODY` as a pipe
+   whose register sits at the pattern's final position while its input is the ambient value
+   (`resolve_seq_from_seed`), and the stage rules above do the rest unchanged — `$q`
+   re-establishes through `reestablishes_register`, `.a` raises from `resolve_leaf`, a literal
+   stays untracked. On `{"a":[1,2,3],"b":{"c":5}}`, `path(. as {a:$q} \| $q)` is `["a"]`,
+   `path(. as {b:{c:$r}} \| $r)` and `path(. as {b:$b} \| $b.c)` are `["b","c"]`,
+   `path(. as {a:$q} \| .a)` raises jq's own `Invalid path expression near attempt to access
+   element "a" of {"a":[1,2,3],"b":{"c":5}}`, `path(. as {a:$q, b:$r} \| .)` raises at the
+   *second* entry, `path(.a as [$x,$y] \| .)` raises at element `1` (reverse order), and
+   `del(. as {a:$q} \| $q)` / `(. as {a:$q} \| $q[1]) += 10` write through `["a"]`. A `null`
+   input still steps, so the value-mode null short-circuit is deliberately not reused here: on
+   `{}`, `path(. as {a:{b:$q}} \| $q)` is `["a","b"]`, and on `null`,
+   `path(. as {a:$q,b:$r} \| $r)` is `["a","b"]` too, because a `null` parent is `jv_identical`
+   to the `null` register. `{$b: P}` is **one** index step in jq's grammar rather than two, so
+   `PatternEntry` gained a `bind: Option<String>` and the parser emits a single entry for it:
+   `path(. as {$b: {c:$x}} \| $x)` is `["b","c"]`, while the explicit `{b:$m, b:{c:$x}}` still
+   performs two steps and refuses at the second, as jq does. The `?//` row the table above used
+   to carry (`path(.a as $y \| .a \| . as [$q] ?// $q \| $y)`) is one this closed: both tools now
+   answer `["a"]`, and it moved into #2042's *accepting* matrix.
+
+   The arm is **jq mode only.** Real yq v4.53.3's lexer rejects any destructuring pattern at all
+   (`. as {a:$q} \| $q` on `a: 1` is `Error: 1:7: lexer: invalid input text "a:$q} \| $q"`), so
+   there is no oracle to model; `succinctly yq --jq-extensions 'path(. as {a:$q} \| $q)'` keeps
+   its pre-existing fall-through, yielding nothing at exit 0 rather than raising, because the
+   generic evaluator's path bridge has no case for a `Pattern` other than a single bare `Var`.
+   `test_as_pattern_arm_is_jq_mode_only_2649` pins that outcome as unaffected by this change.
+
+   `?//` alternatives retry as they do in value mode, with one deliberate exception: the
+   **artefact guard**. This resolver raises refusals jq never raises — a nested `Pipe` carries
+   no register, so a `$q[0]` under an `if` or a `,` raises near-access even though the register
+   is standing right there — and retrying on one of those lands on the *wrong* alternative,
+   which a write then goes through. `path(. as {a:$q} ?// $z \| if $q then $q[0] else $z end)`
+   is `["a",0]` in jq and would otherwise have answered `[]`, and the matching
+   `del(. as {a:$q} ?// $z \| if $q then $q[0] else $z end)` on `{"a":[1,2,3]}` is `{"a":[2,3]}`
+   in jq and would have deleted through that fabricated `[]`. So a body error of the resolver's
+   own two kinds (`UntrackedNavigation`/`InvalidPathExpression`) never retries, and on an
+   untracked stage a multi-alternative pattern keeps the old opaque-leaf fall-through, since
+   such a stage cannot see the register the first step is compared against. Genuine jq errors
+   (`Cannot index X with Y` from the walk or the body, `error(..)`, `Break`) retry as before,
+   and branches already emitted stay emitted, as in jq
+   (`path(. as {a:$q} ?// {b:$r} \| $q, $r)` prints `["a"]` and then raises, in both). Both
+   rows above are pinned as soundness rows in `test_destructuring_moves_path_register_2649`
+   (`tests/jq_cli_tests.rs`).
+
+   The guard's price, and the rest of the residue, is **refuse-only** — succinctly declines
+   where jq answers, never the reverse, and no row writes. Each is pinned in that same CLI test
+   or in `test_path_destructure_matrix_refuses_2649` (`src/jq/eval.rs`), on
+   `{"a":[1,2,3],"b":{"c":5}}`:
+
+   | Filter                                            | jq                 | Why succinctly still refuses                                                                                                                 |
+   | ------------------------------------------------- | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
+   | `path(. as {a:$q} \| .a as $z \| $z)`             | `["a"]`            | a bind whose source navigates needs a trackable stage, and the pattern's body stage is untracked by construction                             |
+   | `path(. as {a:$q} \| $q as [$x] \| $x)`           | `["a",0]`          | same, for a nested pattern on the bound copy                                                                                                 |
+   | `path(. as $x \| 5 \| $x as {a:$q} \| $q)`        | `["a"]`            | a marker-headed source on an untracked stage: the arm cannot see the register the pattern's first step is compared against                   |
+   | `path(.b as $y \| .b \| 5 \| $y as {c:$w} \| $w)` | `["b","c"]`        | same                                                                                                                                         |
+   | `path(. as {a:$q} ?// {b:$r} \| $r)`              | `["b"]`            | jq retries after its own terminal path refusal; the artefact guard cannot tell that refusal from a fabrication artefact                      |
+   | `path(. as {a:$q} ?// $r \| $r)`                  | `[]`               | same                                                                                                                                         |
+   | `path(. as {a:$q} ?// $z \| .a)`                  | `["a"]`            | same, reached through a genuine near-access error rather than the terminal check                                                             |
+   | `path(. as {a:$q} \| $q[0], $q)`                  | `["a",0]`, `["a"]` | pre-existing: a `$var` nested under `,`/`if` gets no register (the scope limit above) — `path(.a as $y \| .a \| 5 \| $y[0], $y)` refuses too |
+
+   Two further rows differ only in **wording**, both tools refusing and neither writing:
+   `path(. as {a:$q} \| $q as [$h] \| $q)` (jq names the whole value, succinctly names the step)
+   and `[path(. as {a:$q} ?// {b:$r} \| $q[0], $r)]` (the two name different containers). Two
+   others are pre-existing gaps shared with a plain `as` over an untracked stage, not caused by
+   this change: `path(. as {a:$q} \| $q \| first)`, jq `["a",0]`
+   ([#2646](https://github.com/rust-works/succinctly/issues/2646)), refuses exactly as
+   `path(.a as $y \| .a \| 5 \| $y \| first)` does, and a `def` inside `path()`
+   (`path(def f: . as {a:$q} \| $q; f)`, jq `["a"]`) resolves as an opaque leaf — the same `def`
+   limitation that table already records.
+
+   Two follow-ups are filed rather than closed here.
+   [#2676](https://github.com/rust-works/succinctly/issues/2676) is the fold's own loop
+   variable: `path(foreach .b as {c:$x} (.; .; $x))` is `["b","c"]` and
+   `path(reduce .b as {c:$x} (.; .))` is `[]` in jq, while `resolve_node`'s `[Pattern::Var(_)]`
+   guard still falls through (see the fold paragraph below).
+   [#2678](https://github.com/rust-works/succinctly/issues/2678) is a parse gap that predates
+   path mode entirely: a computed-key pattern (`. as {("a"): $q} \| $q`, jq `["a"]`) is
+   `parse error at position 11: expected identifier, found '('` here, exit 3.
 
 2. **`?//`-alternatives folds aren't path-tracked at all** (refuse-only) —
    `path(. as $x \| reduce (1) as $y ?// $z (0; $x))` on `{"a":1}` is `[]` in jq; succinctly
@@ -786,16 +878,32 @@ register's value was promoted: `(reduce (1) as $i (.; {a:.a})) = 9` wrote `9` wh
 raises and leaves the input untouched. That was the one divergence in this section that ran
 in the unsafe direction, and it is closed.
 
-The fold's own **loop-variable destructuring pattern** (`as [$i]`, `as {v:$v}`) is *not* a
-behavioural divergence: real jq refuses every such fold in path position, even when the
-pattern matches cleanly (`path(. as $x \| reduce ([1]) as [$i] (0; $x))` raises "near attempt
-to access element 0 of [1]", confirmed against jq 1.7.1, while the bare-`$var` spelling of
-the same fold is `[]`), and `resolve_node`'s `[Pattern::Var(_)]` guard reproduces that
-refusal — same outcome, same exit 5, no document written either side. Only the **wording**
-differs: falling through to `resolve_leaf`'s catch-all names the whole fold's own value
+The fold's own **loop-variable destructuring pattern** (`as [$i]`, `as {v:$v}`) splits along
+the same line #2649 drew for a plain `as` — whether the fold's *source* is the register — and
+`resolve_node`'s `[Pattern::Var(_)]` guard (pinned by
+`test_reduce_foreach_path_dispatch_falls_back_1440`, `src/jq/eval.rs`) falls through for both
+halves, so both refuse here.
+
+Where the source is **not** the register, jq refuses too and only the **wording** differs:
+`path(. as $x \| reduce ([1]) as [$i] (0; $x))` raises "Invalid path expression near attempt
+to access element 0 of [1]" in jq 1.7.1 (while the bare-`$var` spelling of the same fold is
+`[]`), and falling through to `resolve_leaf`'s catch-all names the whole fold's own value
 ("Invalid path expression with result `{"a":1}`") rather than the destructuring step jq
-blames. That is the same catch-all wording every unresolvable filter already gets here, and
-is the general message-fidelity gap covered above, not a fold-specific one.
+blames. A multi-element array pattern refuses in jq even when its source *is* the register,
+for the reverse-order reason #2649 records above — `path(foreach .a as [$x,$y] (.; .; $x))`
+on `{"a":[1,2,3],"b":{"c":5}}` raises at element `0` of `[1,2,3]` in jq, where the catch-all
+names `1` here. Same outcome, same exit 5, no document written either side; that is the
+general message-fidelity gap covered above, not a fold-specific one.
+
+Where the source **is** the register, jq answers and succinctly refuses — a real behavioural
+divergence, refuse-only, tracked as
+[#2676](https://github.com/rust-works/succinctly/issues/2676). On
+`{"a":[1,2,3],"b":{"c":5}}`, `path(foreach .b as {c:$x} (.; .; $x))` is `["b","c"]` in jq and
+`path(reduce .b as {c:$x} (.; .))` is `[]`, against "with result 5" and "with result
+`{"a":[1,2,3],"b":{"c":5}}`" here. #2649 gave a plain `as` the machinery for this
+(`walk_pattern` plus an `Origin::At` marker per binding); what #2676 still needs is to run it
+per element inside `resolve_reduce`/`resolve_foreach`'s own `FoldRegister` model, which has
+its own persistence rule and so its own oracle round.
 
 **Fixed by [#1467](https://github.com/rust-works/succinctly/issues/1467),
 [#1872](https://github.com/rust-works/succinctly/issues/1872),

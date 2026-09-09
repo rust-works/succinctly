@@ -118,6 +118,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   main filter still beats a module's, and `include` is still not transitive.
   `succinctly yq` is unaffected; it has no `-L` and never builds a module loader.
 
+- **A destructuring bind now moves the path register through its pattern, the way
+  jq's own `INDEX` steps do** (#2649). Real jq compiles `SRC as PATTERN | BODY` so
+  that `SRC` runs with path tracking suspended, but every index step *inside* the
+  pattern runs tracked (`gen_object_matcher`/`gen_array_matcher` emit ordinary
+  `INDEX` ops): each step first checks its input is the register's own node, then
+  moves the register onto the matched member -- object entries in source order,
+  array elements in reverse index order -- and `BODY` then sees the ambient `.` as
+  input while the register sits at the pattern's final position. succinctly's
+  `path()` resolver had no `Expr::AsPattern` arm at all, so the whole `as`-pipe fell
+  to the opaque-leaf catch-all and every such filter refused with
+  `Invalid path expression with result <whole value>`. On
+  `{"a":[1,2,3],"b":{"c":5}}`:
+
+  | Filter                         | jq 1.7.1                        | before                 | now     |
+  | ------------------------------ | ------------------------------- | ---------------------- | ------- |
+  | `path(. as {a:$q} \| $q)`      | `["a"]`                         | refuses                | `["a"]` |
+  | `path(. as {b:$b} \| $b.c)`    | `["b","c"]`                     | refuses                | matches |
+  | `path(. as {a:$q} \| .a)`      | near-access `"a"` of the root   | refuses, wrong wording | matches |
+  | `path(.a as [$x,$y] \| .)`     | near-access `1` (reverse order) | refuses, wrong wording | matches |
+  | `del(. as {a:$q} \| $q)`       | `{"b":{"c":5}}`                 | refuses                | matches |
+  | `(. as {a:$q} \| $q[1]) += 10` | `{"a":[1,12,3],"b":{"c":5}}`    | refuses                | matches |
+
+  `walk_pattern` performs the steps and hands back the moved register plus one
+  binding per name, carrying an `Origin::At` marker (#2042's frame witness) wherever
+  the bound value is provably the register's node; `resolve_as_pattern` then seeds
+  `BODY` as a pipe whose register sits at the pattern's final position while its
+  input is the ambient value, and the existing stage rules do the rest unchanged.
+  A `null` input still steps, as in jq -- `path(. as {a:{b:$q}} | $q)` on `{}` is
+  `["a","b"]` -- so the value-mode null short-circuit is deliberately not reused.
+
+  **`{$b: P}` is one index step, not two.** jq's grammar compiles it as a single
+  `INDEX "b"` that binds `$b` and then runs `P`, so `PatternEntry` gained a
+  `bind: Option<String>` and the parser emits one entry for it:
+  `path(. as {$b: {c:$x}} | $x)` is `["b","c"]`, while the explicit `{b:$m, b:{c:$x}}`
+  still performs two steps and refuses at the second, as jq does. Value-mode
+  semantics are unchanged.
+
+  **An artefact guard keeps `?//` from writing through the wrong alternative.**
+  Alternatives retry as they do in value mode, except that the resolver's own two
+  refusal kinds never retry: some of them are artefacts jq never raises (a nested
+  pipe carries no register, so a `$q[0]` under an `if` or a `,` raises near-access),
+  and retrying on one lands on the *wrong* alternative --
+  `path(. as {a:$q} ?// $z | if $q then $q[0] else $z end)` is `["a",0]` in jq and
+  would otherwise have answered `[]`, which the matching `del(...)` on
+  `{"a":[1,2,3]}` would then have deleted through. Genuine jq errors still retry.
+  The price is refuse-only, and the rows are pinned as soundness rows in
+  `test_destructuring_moves_path_register_2649`.
+
+  **jq mode only.** Real yq v4.53.3's lexer rejects any destructuring pattern
+  (`. as {a:$q} | $q` on `a: 1` is `lexer: invalid input text "a:$q} | $q"`), so
+  there is no oracle to model and `succinctly yq --jq-extensions` keeps its
+  pre-existing fall-through.
+
+  Verified against /usr/bin/jq 1.7.1 on a 122-row probe: 104 rows identical, and all
+  18 remaining rows refusals -- the residue is recorded row by row in
+  [docs/compliance/jq/limitations.md](docs/compliance/jq/limitations.md) (shape #1).
+  Every one of them is succinctly declining where jq answers (or, on two rows, both
+  tools refusing with different wording), never the reverse. Two follow-ups are
+  filed rather than closed here: #2676 for the same mechanism inside a
+  `reduce`/`foreach` loop variable (`path(foreach .b as {c:$x} (.; .; $x))` is
+  `["b","c"]` in jq and still refuses here), and #2678 for a computed-key pattern
+  (`. as {("a"): $q}`), which this parser rejects outright.
+
 - **An `as`-bound variable now stands at the node it was bound from, instead of
   being a value with no position** (#2072). Real yq's variables hold *nodes*,
   parent pointers and all, so `.a.b as $x | $x | key` is `"b"` there;
@@ -150,7 +213,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   jq mode is unchanged by design -- `path()`'s resolver honours only
   `BoundVar::tracked` and never the origin, so every jq-mode row still matches
   jq 1.7.1 and #2042 (the jq-mode half) stays open with the bind-time node now
-  available to it. Writes through a variable stay refused in both modes.
+  available to it. (Superseded on the jq side: #2042 has since admitted writes
+  through a navigated variable -- `(.a as $y | .a | $y) = 9` on
+  `{"a":{"b":1},"c":2}` writes `{"a":9,"c":2}`, as jq 1.7.1 does. yq mode leaves
+  the document untouched there, as yq v4.53.3 does.)
 
   Measured on the same machine, interleaved per repetition, outputs identical:
   `.[] as $x | ...` over 2.4 MB and 24 MB arrays runs **18-38% faster**, since

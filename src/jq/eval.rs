@@ -86189,17 +86189,24 @@ mod tests {
     /// existing and would otherwise be silently re-routed into
     /// `resolve_reduce`/`resolve_foreach` by a future widening.
     ///
-    /// **A destructuring pattern falls back because jq refuses it too.**
-    /// Confirmed live against jq 1.7.1: `path(. as $x | reduce ([1]) as
-    /// [$i] (0; $x))` raises "Invalid path expression near attempt to
-    /// access element 0 of [1]" and the object form raises the analogous
-    /// message, even though both patterns match cleanly and the bare-`$var`
-    /// spelling of the same fold is `[]`. Widening the guard to any
-    /// single pattern would make succinctly *accept* a fold jq rejects,
-    /// and on the write side mutate a document jq leaves untouched. Only
-    /// the refusal is asserted, not the message: the catch-all says
-    /// "Invalid path expression with result ..." where jq says "near
-    /// attempt to access ...", a pre-existing `resolve_leaf` wording gap.
+    /// **A destructuring pattern falls back, which matches jq only while
+    /// the fold's source is not the register.** Confirmed live against jq
+    /// 1.7.1: `path(. as $x | reduce ([1]) as [$i] (0; $x))` raises
+    /// "Invalid path expression near attempt to access element 0 of [1]"
+    /// and the object form raises the analogous message -- the pattern's
+    /// own tracked index step compares its input against the register,
+    /// and a constructed `[1]` is not it. With a register-derived source
+    /// jq *answers* (`path(foreach .b as {c:$x} (.; .; $x))` on
+    /// `{"b":{"c":5}}` is `["b","c"]`, the step having moved the register),
+    /// so the fall-back is a refuse-only divergence there, tracked as
+    /// #2676. Widening the guard without performing the pattern's register
+    /// step (the `walk_pattern` model #2649 gave `Expr::AsPattern`) would
+    /// accept the `([1])` shape jq rejects and, on the write side, mutate a
+    /// document jq leaves untouched -- which is why the guard stays until
+    /// #2676 lands. Only the refusal is asserted, not the message: the
+    /// catch-all says "Invalid path expression with result ..." where jq
+    /// says "near attempt to access ...", a pre-existing `resolve_leaf`
+    /// wording gap.
     ///
     /// **`?//`-alternatives fall back despite jq accepting them** — the one
     /// refuse-only divergence here (confirmed live: `path(. as $x | reduce
