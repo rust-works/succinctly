@@ -85226,7 +85226,7 @@ mod tests {
         for (input, filter, is_near_access) in rows {
             match bind_origin_outputs(input, filter) {
                 Err(e) if *is_near_access => {
-                    assert!(e.is_untracked_navigation_error(), "{filter}: {}", e.message)
+                    assert!(e.is_untracked_navigation_error(), "{filter}: {}", e.message);
                 }
                 Err(e) => assert!(e.is_invalid_path_expression(), "{filter}: {}", e.message),
                 Ok(got) => panic!("{filter}: answered {got} where jq refuses"),
