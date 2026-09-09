@@ -30505,18 +30505,19 @@ fn resolve_foreach<'a, S: EvalSemantics>(
             if update_branches.is_empty() {
                 (state_at_register, state_snapshot) = reg.branch_provenance(None);
             }
-            let last_branch_index = update_branches.len().wrapping_sub(1);
-            for (branch_index, update_branch) in update_branches.iter().enumerate() {
-                // Only the *last* branch carries forward as the next
-                // element's state (see the comment above this loop) — the
-                // others are read straight off `update_branch` below for
-                // EXTRACT/emission, so cloning `state` for them too is pure
-                // waste, doubled (or worse) by every extra UPDATE output.
-                if branch_index == last_branch_index {
-                    (state_at_register, state_snapshot) =
-                        reg.branch_provenance(Some(update_branch));
-                    state = update_branch.value.clone().into_owned();
-                }
+            for update_branch in &update_branches {
+                // Every output, not just the last: a review pass tried
+                // carrying only the last one (the others are read straight
+                // off `update_branch` for EXTRACT/emission, so the clone
+                // looked like waste) and the oracle disagreed -- once an
+                // earlier output's emission is refused and the source's
+                // `?//` retries, the retried step must see *that* output as
+                // its state, or `path(foreach (1 as $x ?// $y | if $x == 1
+                // then 1 else 2 end) as $v (.; if $v == 2 then . else (1, 2)
+                // end))` answers `[]` at exit 0 where jq 1.7.1 refuses with
+                // "result 1" -- a wrong accept, the write-side hazard class.
+                (state_at_register, state_snapshot) = reg.branch_provenance(Some(update_branch));
+                state = update_branch.value.clone().into_owned();
                 if let Some(ext_expr) = &substituted_extract {
                     if let Some(control) = charge_budget(&mut budget, "foreach") {
                         return stop_with_escape(&mut aborted, control);
