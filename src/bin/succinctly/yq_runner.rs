@@ -3660,7 +3660,7 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
             for (_value, comments) in docs.iter_mut() {
                 apply_meta_assign_writes(&resolved_meta_writes, comments);
             }
-        }
+        } // omni-dev: coverage tolerate-line reason="unreachable: every arm of the `match result { .. }` above that assigns `docs` (L3492-3622) constructs `Ok(..)` -- none ever produces `Err`, so this `if let`'s implicit else can't be taken; symmetric to L1625's `?` (#798)"
     }
 
     // A bare top-level/navigated scalar result drops all its own styling,
