@@ -32264,7 +32264,7 @@ enum WalkNode<'v> {
 /// would not survive the expression it appears in.
 static WALK_NODE_NULL: OwnedValue = OwnedValue::Null;
 
-impl<'v> WalkNode<'v> {
+impl WalkNode<'_> {
     /// A value the walk built, wrapped for buffering.
     fn made(value: OwnedValue) -> Self {
         Self::Made(Rc::new(value))
@@ -32285,10 +32285,12 @@ impl<'v> WalkNode<'v> {
     /// [`classify_static_component`] resolved, or the one
     /// [`Expr::Iterate`](Expr) is enumerating.
     ///
-    /// A document node's child is borrowed at the *document's* own lifetime
-    /// (hence `*value`, not `value`: re-borrowing through the `&self` here
-    /// would shorten it and break the closure property above). Residue's child
-    /// is cloned into a fresh `Rc`.
+    /// A document node's child is borrowed at the *document's* own lifetime,
+    /// not at the shorter one of the `&self` it was read through -- deref
+    /// coercion copies the inner `&'v` reference out rather than reborrowing
+    /// through it, which is what keeps the returned node a `WalkNode<'v>` and
+    /// so keeps the type closed under navigation. Residue's child has no
+    /// document to borrow from and is cloned into a fresh `Rc` instead.
     fn child_at(&self, slot: usize) -> Self {
         match self {
             Self::Doc(value) => slot_of(value, slot).map_or(Self::Null, Self::Doc),

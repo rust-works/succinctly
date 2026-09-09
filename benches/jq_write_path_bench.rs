@@ -1255,7 +1255,7 @@ fn bench_path_leading_iterate_comma(c: &mut Criterion) {
         .map(|b| format!(".b{b}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let tail = vec![".d"; LEADING_ITERATE_DEPTH].join(" | ");
+    let tail = [".d"; LEADING_ITERATE_DEPTH].join(" | ");
     let expr =
         parse(&format!("[path(.foo[] | ({branches}) | {tail})] | length")).expect("must parse");
 
