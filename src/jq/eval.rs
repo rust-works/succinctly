@@ -26731,7 +26731,7 @@ type PathResolveResult<'a> = Result<Vec<PathBranch<'a>>, (Vec<PathBranch<'a>>, E
 ///
 /// [`Keep::AtMost`] exists for the one context where that rule is wrong: a
 /// `reduce`/`foreach` *source*, which jq evaluates with tracking on while
-/// consuming **every** value it produces (see [`resolve_fold_source`]).
+/// consuming **every** value it produces (see [`drive_fold_source`]).
 /// There the leaf's outputs are the fold's real values, so truncating to
 /// the first silently runs the fold too few times. `AtMost(1)` is
 /// byte-identical to `First` — the two are kept distinct only so the
@@ -26793,6 +26793,29 @@ fn path_result(branches: Vec<PathBranch<'_>>, escape: Option<EvalEscape>) -> Pat
         Some(e) => Err((branches, e)),
         None => Ok(branches),
     }
+}
+
+/// [`path_result`]'s sink-shaped twin: how a producer that already
+/// delivered every branch ended.
+fn flow_result(escape: Option<EvalEscape>) -> ResolveFlow {
+    match escape {
+        Some(e) => ResolveFlow::Escaped(e),
+        None => ResolveFlow::Exhausted,
+    }
+}
+
+/// Deliver `branches` in order, stopping at the sink's first
+/// [`Demand::Stop`] and reporting it.
+fn emit_branches<'a>(
+    branches: Vec<PathBranch<'a>>,
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> Demand {
+    for branch in branches {
+        if sink(branch) == Demand::Stop {
+            return Demand::Stop;
+        }
+    }
+    Demand::Continue
 }
 
 /// Peel any wrapping `Expr::Paren` down to the inner expression — `(false)`
@@ -27674,6 +27697,104 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             }
         }
 
+        // #1440: `reduce`/`foreach` are real sugar over the same
+        // variable-binding primitive every other construct uses (real jq
+        // has no fold-specific path machinery at all), so a path-trackable
+        // variable referenced inside UPDATE/EXTRACT should track the same
+        // way it does anywhere else — but until this arm existed, both
+        // fell to `resolve_leaf`'s catch-all, which evaluates the whole
+        // construct via the ordinary value evaluator and always marks the
+        // result untracked. See `resolve_reduce`/`resolve_foreach` and
+        // `FoldRegister` for the full model, derived empirically against
+        // jq 1.7.1.
+        //
+        // The guard is `[Pattern::Var(_)]` — exactly one alternative, and
+        // that alternative a bare `$var` — because everything outside it
+        // is a shape real jq itself refuses in path position, or one this
+        // resolver cannot model:
+        //
+        // - **A destructuring pattern** (`as [$i]`, `as {v:$v}`) is refused
+        //   by jq *unconditionally* here, even when it matches cleanly:
+        //   `path(. as $x | reduce ([1]) as [$i] (0; $x))` raises "near
+        //   attempt to access element 0 of [1]", and the object form raises
+        //   the analogous message (both confirmed live against jq 1.7.1),
+        //   while the bare-`$var` spelling of the same fold is `[]`. So
+        //   falling through to `resolve_leaf` for a destructuring pattern
+        //   is jq's own behaviour, not a divergence — matching it here is
+        //   what keeps `resolve_reduce`/`resolve_foreach` from *accepting*
+        //   a fold jq rejects (and, on the write side, mutating a document
+        //   jq leaves untouched). The refusal matches; only the wording
+        //   does not — the catch-all names the whole fold's own value
+        //   rather than the destructuring step jq blames, which is the
+        //   pre-existing `resolve_leaf` message gap, not a new one.
+        //
+        // - **`?//`-alternatives** (`patterns.len() > 1`) are the one case
+        //   where falling through *is* a divergence: real jq still tracks a
+        //   variable through them (confirmed live: `path(. as $x | reduce
+        //   (1) as $y ?// $z (0; $x))` is `[]`). #1365's retry machinery
+        //   (`try_reduce_step_alternatives`/`try_foreach_step_alternatives`,
+        //   plus its null-fill for names the matching alternative doesn't
+        //   bind) landed on `main` after this arm was designed and isn't
+        //   threaded through path-tracking, so refusing is the safe answer
+        //   until it is — a refuse-only divergence, never a wrong path,
+        //   documented in `docs/compliance/jq/limitations.md`.
+        //
+        // Both fallbacks are pinned by
+        // `test_reduce_foreach_path_dispatch_falls_back_1440`.
+        //
+        // Native to the sink since #2235: each fold emission goes straight
+        // downstream, so the terminal `path()` check (`resolve_terminal`)
+        // refuses the first untracked output before the fold pulls its
+        // source again, exactly as jq's generator does.
+        Expr::Reduce {
+            input,
+            patterns,
+            init,
+            update,
+        } => match patterns.as_slice() {
+            [Pattern::Var(_)] => resolve_reduce::<S>(
+                input,
+                &patterns[0],
+                init,
+                update,
+                value,
+                trackable,
+                snapshot,
+                frame,
+                keep,
+                sink,
+            ),
+            _ => drain_path_result(
+                resolve_leaf::<S>(expr, value, trackable, snapshot, keep),
+                sink,
+            ),
+        },
+        Expr::Foreach {
+            input,
+            patterns,
+            init,
+            update,
+            extract,
+        } => match patterns.as_slice() {
+            [Pattern::Var(_)] => resolve_foreach::<S>(
+                input,
+                &patterns[0],
+                init,
+                update,
+                extract.as_deref(),
+                value,
+                trackable,
+                snapshot,
+                frame,
+                keep,
+                sink,
+            ),
+            _ => drain_path_result(
+                resolve_leaf::<S>(expr, value, trackable, snapshot, keep),
+                sink,
+            ),
+        },
+
         // `repeat(f)` (#1906) and the three bounded consumers below all
         // resolve through the sink now, so a bound threads through arbitrary
         // combinator nesting rather than only reaching a generator that is
@@ -27976,91 +28097,6 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
         Expr::Builtin(Builtin::RecurseCond(f, cond)) => {
             resolve_recurse::<S>(f, Some(cond), value, trackable, snapshot, frame, keep)
         }
-
-        // #1440: `reduce`/`foreach` are real sugar over the same
-        // variable-binding primitive every other construct uses (real jq
-        // has no fold-specific path machinery at all), so a path-trackable
-        // variable referenced inside UPDATE/EXTRACT should track the same
-        // way it does anywhere else — but until this arm existed, both
-        // fell to `resolve_leaf`'s catch-all, which evaluates the whole
-        // construct via the ordinary value evaluator and always marks the
-        // result untracked. See `resolve_reduce`/`resolve_foreach` and
-        // `FoldRegister` for the full model, derived empirically against
-        // jq 1.7.1.
-        //
-        // The guard is `[Pattern::Var(_)]` — exactly one alternative, and
-        // that alternative a bare `$var` — because everything outside it
-        // is a shape real jq itself refuses in path position, or one this
-        // resolver cannot model:
-        //
-        // - **A destructuring pattern** (`as [$i]`, `as {v:$v}`) is refused
-        //   by jq *unconditionally* here, even when it matches cleanly:
-        //   `path(. as $x | reduce ([1]) as [$i] (0; $x))` raises "near
-        //   attempt to access element 0 of [1]", and the object form raises
-        //   the analogous message (both confirmed live against jq 1.7.1),
-        //   while the bare-`$var` spelling of the same fold is `[]`. So
-        //   falling through to `resolve_leaf` for a destructuring pattern
-        //   is jq's own behaviour, not a divergence — matching it here is
-        //   what keeps `resolve_reduce`/`resolve_foreach` from *accepting*
-        //   a fold jq rejects (and, on the write side, mutating a document
-        //   jq leaves untouched). The refusal matches; only the wording
-        //   does not — the catch-all names the whole fold's own value
-        //   rather than the destructuring step jq blames, which is the
-        //   pre-existing `resolve_leaf` message gap, not a new one.
-        //
-        // - **`?//`-alternatives** (`patterns.len() > 1`) are the one case
-        //   where falling through *is* a divergence: real jq still tracks a
-        //   variable through them (confirmed live: `path(. as $x | reduce
-        //   (1) as $y ?// $z (0; $x))` is `[]`). #1365's retry machinery
-        //   (`try_reduce_step_alternatives`/`try_foreach_step_alternatives`,
-        //   plus its null-fill for names the matching alternative doesn't
-        //   bind) landed on `main` after this arm was designed and isn't
-        //   threaded through path-tracking, so refusing is the safe answer
-        //   until it is — a refuse-only divergence, never a wrong path,
-        //   documented in `docs/compliance/jq/limitations.md`.
-        //
-        // Both fallbacks are pinned by
-        // `test_reduce_foreach_path_dispatch_falls_back_1440`.
-        Expr::Reduce {
-            input,
-            patterns,
-            init,
-            update,
-        } => match patterns.as_slice() {
-            [Pattern::Var(_)] => resolve_reduce::<S>(
-                input,
-                &patterns[0],
-                init,
-                update,
-                value,
-                trackable,
-                snapshot,
-                frame,
-                keep,
-            ),
-            _ => resolve_leaf::<S>(expr, value, trackable, snapshot, keep),
-        },
-        Expr::Foreach {
-            input,
-            patterns,
-            init,
-            update,
-            extract,
-        } => match patterns.as_slice() {
-            [Pattern::Var(_)] => resolve_foreach::<S>(
-                input,
-                &patterns[0],
-                init,
-                update,
-                extract.as_deref(),
-                value,
-                trackable,
-                snapshot,
-                frame,
-                keep,
-            ),
-            _ => resolve_leaf::<S>(expr, value, trackable, snapshot, keep),
-        },
 
         // #844: a frozen variable snapshot from a statically-verified
         // identity-passthrough `as`-binding (see `is_identity_passthrough`
@@ -28528,7 +28564,7 @@ fn resolve_leaf<'a, S: EvalSemantics>(
     // every ordinary `path()`/`=`/`|=`/`del()` entry, which is exactly the
     // stop-after-first sink described above. A `reduce`/`foreach` *source*
     // passes [`Keep::AtMost`] instead, because jq's fold does ask the
-    // generator for every value — see [`resolve_fold_source`].
+    // generator for every value — see [`drive_fold_source`].
     let limit = keep.limit();
     let mut values: Vec<OwnedValue> = Vec::new();
     let flow = eval_each_owned::<S>(expr, value, false, &mut |v| {
@@ -29350,111 +29386,98 @@ impl FoldRegister {
     }
 }
 
-/// Resolve a `reduce`/`foreach` source expression to the values the fold
-/// iterates, plus whatever control terminated it -- shared by
-/// [`resolve_reduce`] and [`resolve_foreach`] (#1467, #1872).
+/// Drive a `reduce`/`foreach` SOURCE **by demand** in path context,
+/// handing each element to `step` as the source produces it -- the fold
+/// loop runs *inside* `step`, so the next element is pulled only once the
+/// previous step has resolved, and a step that answers [`Demand::Stop`]
+/// ends the pull with nothing past it ever evaluated. That is jq's own
+/// generator model: `. as $x | path(foreach (.[] | stderr) as $i (0; $x))`
+/// on `[1,2,3]` writes `1` to stderr once and then raises on the first
+/// step's untrackable UPDATE (jq 1.7.1), where the collect-then-loop shape
+/// this replaced (#2235) pulled the whole source first and wrote `123`.
 ///
-/// Real jq evaluates a fold's source "with tracking on" and raises when it
-/// navigates *through* a computed value (`. as $x | reduce (keys[]) as $k
-/// (.; .)` raises "near attempt to iterate through" -- `keys[]`'s `Iterate`
-/// reaches into `keys`'s own untracked output -- live-verified against jq
-/// 1.7.1), even though most sources (`.a`, `.[]`, `keys`, `range(n)`, a
-/// literal) are accepted. `resolve_node`'s existing recursive dispatch
-/// already gets every one of those cases right for any other tracked
-/// position in this file, so routing the source through it reuses that
-/// logic rather than re-deriving it.
+/// Returns the source's own trailing escape, if it ended in one, *after*
+/// every element before it has been delivered -- the caller applies it once
+/// its own per-step verdict (stashed beside the drive, see
+/// [`reclaim_fold_escape`]) has had its say, for `reduce` too: `path(reduce
+/// (1,2,error("s")) as $i (.; stderr))` runs both UPDATE steps before
+/// raising `s`, exactly as jq does. `Exhausted` and `Stopped` both answer
+/// `None`; a stop's own reason lives in the caller's slot, and a
+/// [`Flow::Stopped`]'s `pending` (an eager fallback's already-computed
+/// escape) is dropped, because jq would never have pulled that far.
+///
+/// **The resolver's stream is the fold's stream.** In jq mode every branch
+/// the resolver delivers, trackable or not, is a real fold value, carrying
+/// its own navigated path as [`FoldSourceValue::register_path`] (#2031;
+/// [`resolve_reduce`]/[`resolve_foreach`] seed a per-step register from it
+/// rather than discarding that provenance -- an earlier attempt that
+/// streamed the values without the register is what randomised
+/// differential fuzzing against jq 1.7.1 caught, eleven of four thousand
+/// generated folds, every one a source with a trackable branch). And every
+/// escape the resolver raises, of any kind, is the fold's escape. Until
+/// #2235 an escape that was neither `Halt` nor an untracked-navigation
+/// error fell back to re-evaluating the whole source untracked, on the
+/// theory that the resolver's prefix might be *shorter* than jq's. That
+/// re-evaluation was itself the divergence: it double-fired the source's
+/// side effects, and it discarded the per-step register, turning jq's
+/// refusal into an answer -- `[label $out | path(foreach (.[], break $out)
+/// as $i (.; .))]` on `[1,2]` printed `[[],[]]` at exit 0 where jq raises
+/// "Invalid path expression with result [1,2]". A streaming source cannot
+/// take that decision back after emitting anyway, so the contract is now
+/// the simpler one, and the resolver's own arms are held to it: an arm
+/// that escapes must have delivered everything jq would have bound first
+/// (`Expr::Alternative`'s unfiltered escape prefix was the one such arm,
+/// fixed alongside).
 ///
 /// **Gated on `any_subexpr` finding an actual navigation step
-/// (`Field`/`Index`/`Slice`/`Iterate`)
-/// anywhere in `source`** -- only such a step can ever reach one of
-/// `resolve_node`'s own raising arms in the first place, so a source with
-/// none (`range(n)`, `keys`, a literal, and critically `input`/`inputs`)
-/// goes straight to `eval_owned_expr_fork` and is never resolved here at
-/// all. This isn't just an optimization: an earlier, ungated version of
-/// #1467's check evaluated `input`/`inputs`-sourced folds *twice* -- once
-/// for the check, once more for the real value -- silently desynchronizing
-/// the two evaluations' shared input-reader position, so the fold ran
-/// against the *second* input document while reporting an error that named
-/// the first (`reduce input as $x (0; $x)` over `10\n20\n30\n`: real jq
-/// names `10`, the ungated version named `20`).
+/// (`Field`/`Index`/`Slice`/`Iterate`) anywhere in `source`** -- only such
+/// a step can ever reach one of the resolver's own raising arms, so a
+/// source with none (`range(n)`, `keys`, a literal, and critically
+/// `input`/`inputs`) is driven by value through [`eval_each_owned`] and
+/// never resolved here at all. `input`/`inputs` is why the gate is not just
+/// an optimisation: the resolver's leaf collects a generator before
+/// delivering it, which would drain the shared input reader
+/// (`reduce input as $x (0; $x)` over `10\n20\n30\n` names `10` in jq),
+/// where the value-mode `each_inputs` pulls one document per demand.
 ///
-/// For a navigating source in jq mode whose resolved branches are all
-/// **untracked**, there is exactly **one** evaluation: [`Keep::AtMost`]
-/// makes `resolve_leaf`'s general case keep every output instead of #987's
-/// first one, so those branches' values *are* the fold's real values. That
-/// is what closes both of #1467's documented costs at once:
+/// [`Keep::AtMost`] is the dial that keeps a multi-output leaf whole:
+/// `Keep::First` would narrow `range(3)` to its first value, which is not
+/// a shorter error prefix but a *wrong fold* -- `reduce (limit(2;
+/// range(5)), .a) as $i` would run two iterations instead of three -- and
+/// blinds the check itself (`path(foreach (range(3) | (., if . == 2 then .a
+/// else empty end)) as $k (.; .))` raises jq's "near attempt to access
+/// element" only once the leaf reaches its third output). A bounded
+/// consumer *inside* the source still narrows it (`first(range(2e9))`
+/// contributes one element, not two billion).
 ///
-/// - a navigating source's first output no longer fires its side effect
-///   twice (`. as $x | path(reduce (.[] | stderr) as $i (0; $x))` on `[1]`
-///   writes `1` once, matching jq);
-/// - `foreach` keeps the outputs a source legitimately streamed before the
-///   element that raises -- `path(foreach (1,2,keys[]) as $k (.; .))` on
-///   `{"a":1}` now streams `[]` twice before raising, as jq does (#1872).
-///   The escape is returned *with* those values rather than short-circuiting,
-///   and [`resolve_foreach`]'s own per-element loop applies it after
-///   streaming them, exactly as it already did for an ordinary `Partial`
-///   source.
+/// Six places below this call launder an `Err` into a short `Ok` --
+/// `Expr::Optional`'s blanket arm, `resolve_catch`'s no-`catch` case,
+/// `Expr::Label` on a matching break, `resolve_bounded_sink`'s
+/// satisfied-bound fold to `Exhausted`, `resolve_recurse`'s
+/// `RECURSE_MAX_ITEMS` cap, and `resolve_repeat_sink`'s round cap. The
+/// values they deliver are a fold's values here, so anyone changing one of
+/// those is changing a fold's values too.
 ///
-/// A *trackable* branch means the source is itself a path expression in
-/// jq's eyes, and jq's fold then behaves in a way #1467's original shape
-/// alone could not model: the source's own navigation clobbers the shared
-/// path register, so a later UPDATE step's own emission is checked against
-/// *that* clobbered position, not the fold's persistent, INIT-seeded one
-/// (`path(foreach (.a) as $k (.; .))` on `{"a":1}` exits 5 in jq — #2031).
-/// Every resolved branch, trackable or not, becomes a real source value
-/// here (`Keep::AtMost` above already guarantees these are jq's real fold
-/// values); a trackable branch's own path rides along as
-/// [`FoldSourceValue::register_path`] so [`resolve_reduce`]/
-/// [`resolve_foreach`] can seed a fresh, per-step register from it instead
-/// of silently discarding that provenance. An earlier, cruder attempt at
-/// this — streaming the resolved values without also threading the
-/// per-step register override — is what randomised differential fuzzing
-/// against jq 1.7.1 caught: it regressed eleven of four thousand generated
-/// folds, every one of them a source with a trackable branch, and zero
-/// without. The threading in `resolve_reduce`/`resolve_foreach` is what
-/// closes that gap rather than reopening it; see those functions' own doc
-/// comments for the register-clobber mechanism itself.
+/// A source with a `?//` re-enters `step` after a stop has been reported
+/// (#1519's retry, seen from the consuming side): the caller resets its
+/// slot on every entry and stashes through [`stop_with_escape`], which is
+/// what keeps a halted step from being retried -- `path(foreach (1 as $x
+/// ?// $y | 1) as $v (.; stderr | error("u")))` on `1` writes `1null` then
+/// raises `u` in jq 1.7.1 (the retry runs the step on the reset state),
+/// while the same shape with `halt_error` halts once.
 ///
-/// `Keep::First` would silently break both: it narrows a multi-output leaf
-/// like `range(3)` to its first value, which is not merely a shorter error
-/// prefix but a *wrong fold* -- `reduce (limit(2; range(5)), .a) as $i` would
-/// run two iterations instead of three. It also makes the check itself
-/// blind: `path(foreach (range(3) | (., if . == 2 then .a else empty end))
-/// as $k (.; .))` raises jq's tracked "near attempt to access element" only
-/// once the leaf is allowed to reach its third output.
-///
-/// **The invariant this now depends on is stronger than the one this file
-/// generally maintains.** A resolved prefix is only ever promised to be no
-/// *longer* than jq's; a *shorter* one has always been acceptable, because
-/// branches were previously discarded here.
-/// They are values now, so a short prefix is a wrong answer rather than a
-/// wrong error message. The `Err(_)` arm below deliberately falls back to
-/// `eval_owned_expr_fork` for any escape that is neither `Halt` nor
-/// `EvalError::is_untracked_navigation_error`, which covers the escapes
-/// this check exists to surface and leaves every other one to the untracked
-/// evaluator that has always answered them (and keeps
-/// `test_reduce_foreach_escapes_and_partial_prefix_1440`'s `foreach
-/// (1,2,error("s"))` prefix intact). It does **not** cover the six places
-/// that launder an `Err` into a short `Ok` below this call -- `Expr::Optional`'s
-/// blanket arm, `resolve_catch`'s no-`catch` case, `Expr::Label` on a
-/// matching break, `resolve_bounded_sink`'s satisfied-bound fold to
-/// `Exhausted`, `resolve_recurse`'s `RECURSE_MAX_ITEMS` cap, and
-/// `resolve_repeat_sink`'s round cap. Anyone changing
-/// one of those is changing a fold's values here too.
-///
-/// **`EvalTag::Jq` only.** Real yq's lexer rejects `reduce`, `foreach` *and*
-/// `path` outright (confirmed live against yq v4.53.3), so yq mode has no
-/// oracle to check a value against, and `resolve_index_expr`'s yq-only
-/// `scalar_noop` arm would feed the *unchanged target* into the fold where
-/// the evaluator raises. Yq keeps #1467's original two-pass shape: check
-/// with `Keep::First`, take the values from `eval_owned_expr_fork`.
-fn resolve_fold_source<S: EvalSemantics>(
+/// **`EvalTag::Jq` only.** Real yq's lexer rejects `reduce`, `foreach`
+/// *and* `path` outright (confirmed live against yq v4.53.3), so yq mode
+/// has no oracle to check a value against, and `resolve_index_expr`'s
+/// yq-only `scalar_noop` arm would feed the *unchanged target* into the
+/// fold where the evaluator raises. Yq keeps #1467's original two-pass
+/// shape: check with `Keep::First`, then drive the values by value.
+fn drive_fold_source<S: EvalSemantics>(
     source: &Expr,
-    value: &OwnedValue,
-    trackable: bool,
-    snapshot: &Snapshot,
-    frame: &Frame,
-) -> (Vec<FoldSourceValue>, Option<Control>) {
+    ambient: &FoldSourceAmbient<'_>,
+    relocate_base: Option<&Rc<PathPrefix>>,
+    step: &mut dyn FnMut(FoldSourceValue) -> Demand,
+) -> Option<Control> {
     let has_navigation = any_subexpr(source, &mut |e| {
         matches!(
             e,
@@ -29462,57 +29485,84 @@ fn resolve_fold_source<S: EvalSemantics>(
         )
     });
     if !has_navigation {
-        let (values, control) = eval_owned_expr_fork::<S>(source, value, false);
-        return (no_fold_register(values), control);
+        return drive_fold_source_by_value::<S>(source, ambient.value, step);
     }
-    let keep = if S::TAG == EvalTag::Jq {
-        Keep::AtMost(usize::MAX)
-    } else {
-        Keep::First
-    };
-    let resolved = resolve_node::<S>(source, value, trackable, snapshot, frame, keep);
     if S::TAG != EvalTag::Jq {
         // Yq: branches discarded, only the fatal escape kept (#1467's
         // original shape) -- see this function's doc comment.
-        return match resolved {
-            Err((_, e @ EvalEscape::Halt(_))) => (Vec::new(), Some(e.into())),
+        return match resolve_node::<S>(
+            source,
+            ambient.value,
+            ambient.trackable,
+            &ambient.snapshot,
+            &ambient.frame,
+            Keep::First,
+        ) {
+            Err((_, e @ EvalEscape::Halt(_))) => Some(e.into()),
             Err((_, EvalEscape::Error(e))) if e.is_untracked_navigation_error() => {
-                (Vec::new(), Some(Control::Error(e)))
+                Some(Control::Error(e))
             }
-            _ => {
-                let (values, control) = eval_owned_expr_fork::<S>(source, value, false);
-                (no_fold_register(values), control)
-            }
+            _ => drive_fold_source_by_value::<S>(source, ambient.value, step),
         };
     }
-    let (branches, escape) = match resolved {
-        Ok(branches) => (branches, None),
-        Err((prefix, e @ EvalEscape::Halt(_))) => (prefix, Some(e)),
-        Err((prefix, EvalEscape::Error(e))) if e.is_untracked_navigation_error() => {
-            (prefix, Some(EvalEscape::Error(e)))
-        }
-        // Any other escape is the untracked evaluator's to report -- see
-        // this function's doc comment.
-        Err(_) => {
-            let (values, control) = eval_owned_expr_fork::<S>(source, value, false);
-            return (no_fold_register(values), control);
-        }
-    };
-    // #2031: every resolved branch becomes a real source value regardless
-    // of its own trackability -- see this function's doc comment. A
-    // trackable branch's own path is threaded through as `register_path`
-    // rather than discarded.
-    let elements = branches
-        .into_iter()
-        .map(|b| {
-            let register_path = b.trackable.then(|| Rc::clone(&b.path));
-            FoldSourceValue {
-                value: b.value.into_owned(),
+    let flow = resolve_node_sink::<S>(
+        source,
+        ambient.value,
+        ambient.trackable,
+        &ambient.snapshot,
+        &ambient.frame,
+        Keep::AtMost(usize::MAX),
+        &mut |branch| {
+            // #2031: a trackable branch's own path rides along as
+            // `register_path` -- rebased onto the register for the one
+            // ambient shape whose paths come back relative to it
+            // (`FoldSourceAmbient::relocate`, #2388), mirroring
+            // `FoldRegister::relocate`'s own trackable arm.
+            let register_path = branch.trackable.then(|| match relocate_base {
+                Some(base) => PathPrefix::extend_many(base, branch.path.to_vec()),
+                None => Rc::clone(&branch.path),
+            });
+            step(FoldSourceValue {
+                value: branch.value.into_owned(),
                 register_path,
-            }
+            })
+        },
+    );
+    match flow {
+        ResolveFlow::Exhausted | ResolveFlow::Stopped => None,
+        ResolveFlow::Escaped(e) => Some(e.into()),
+    }
+}
+
+/// The value-mode half of [`drive_fold_source`]: the source driven through
+/// [`eval_each_owned`], each output a [`FoldSourceValue`] with no register
+/// provenance to seed a per-step register from.
+fn drive_fold_source_by_value<S: EvalSemantics>(
+    source: &Expr,
+    value: &OwnedValue,
+    step: &mut dyn FnMut(FoldSourceValue) -> Demand,
+) -> Option<Control> {
+    match eval_each_owned::<S>(source, value, false, &mut |value| {
+        step(FoldSourceValue {
+            value,
+            register_path: None,
         })
-        .collect();
-    (elements, escape.map(Control::from))
+    }) {
+        Flow::Exhausted | Flow::Stopped { .. } => None,
+        Flow::Escaped(control) => Some(control),
+    }
+}
+
+/// A fold's verdict once [`drive_fold_source`] returns: the step's own
+/// stashed escape wins over the source's trailing one (a stopped drive has
+/// no trailing escape; an escaped drive never stopped), and reclaiming the
+/// stash clears the non-retryable side channel [`stop_with_escape`] set,
+/// the same way [`resume_from_escape`] does for a [`Flow`]-shaped reclaim.
+fn reclaim_fold_escape(aborted: Option<Control>, source: Option<Control>) -> Option<Control> {
+    if aborted.is_some() {
+        clear_nonretryable_stop();
+    }
+    aborted.or(source)
 }
 
 /// One value a fold's source stream produced, alongside whether *that
@@ -29528,17 +29578,12 @@ fn resolve_fold_source<S: EvalSemantics>(
 /// `None` means this element was merely computed (a literal, `keys[]`'s
 /// own untracked output, ...), in which case UPDATE is checked against the
 /// fold's usual persistent register exactly as it always has been --
-/// [`resolve_fold_source`]'s pre-#2031 behaviour, unchanged for this case.
+/// [`drive_fold_source`]'s pre-#2031 behaviour, unchanged for this case.
 struct FoldSourceValue {
     value: OwnedValue,
     register_path: Option<Rc<PathPrefix>>,
 }
 
-/// [`FoldSourceValue`]s with no register provenance, for the two
-/// [`resolve_fold_source`] exits that never resolve through
-/// [`resolve_node`] at all (yq mode, and a source with no navigation
-/// shape) -- their values carry no path-navigation provenance to seed a
-/// per-step register from.
 /// Evaluate an `as`-binding's source in path position, for
 /// `resolve_node`'s `Expr::As` arm (#2042): each bound value paired with
 /// the [`Origin`] its marker should carry -- `Some(Origin::At { .. })` when
@@ -29848,20 +29893,10 @@ fn slice_witnesses_node(path: &PathPrefix, value: &OwnedValue) -> bool {
     }
 }
 
-fn no_fold_register(values: Vec<OwnedValue>) -> Vec<FoldSourceValue> {
-    values
-        .into_iter()
-        .map(|value| FoldSourceValue {
-            value,
-            register_path: None,
-        })
-        .collect()
-}
-
 /// The ambient `.` a fold's SOURCE runs against on **one** INIT fork, plus
 /// that ambient's own provenance relative to that fork's own
-/// [`FoldRegister`] -- exactly the trio [`resolve_fold_source`] takes
-/// (#2388).
+/// [`FoldRegister`] -- exactly what [`drive_fold_source`] resolves the
+/// source against (#2388).
 struct FoldSourceAmbient<'v> {
     value: &'v OwnedValue,
     trackable: bool,
@@ -29870,8 +29905,8 @@ struct FoldSourceAmbient<'v> {
     /// ambient, unknown for the later forks' `null`.
     frame: Frame,
     /// Whether a trackable SOURCE branch's own path is *relative to*
-    /// `reg.path` rather than absolute, so [`relocate_source_registers`]
-    /// has to rebase it. Only ever `true` on a `null`-ambient fork whose
+    /// `reg.path` rather than absolute, so [`drive_fold_source`] has to
+    /// rebase it (its `relocate_base`). Only ever `true` on a `null`-ambient fork whose
     /// register sits somewhere other than the root -- on the first fork the
     /// ambient is the document itself, which is only ever at the register
     /// when the register is the root.
@@ -29896,7 +29931,7 @@ struct FoldSourceAmbient<'v> {
 ///
 /// -- the `length` row is what rules out treating this as a mere
 /// trackability question: the *values* SOURCE produces differ per fork too,
-/// so the substituted ambient has to reach [`resolve_fold_source`] itself,
+/// so the substituted ambient has to reach [`drive_fold_source`] itself,
 /// not just its two `bool`s.
 ///
 /// In `path()` context that is what makes a navigating SOURCE raise on the
@@ -29975,20 +30010,6 @@ fn fold_source_ambient<'v>(
     }
 }
 
-/// Rebase every trackable SOURCE element's own
-/// [`register_path`](FoldSourceValue::register_path) onto `base`, for the
-/// one ambient shape whose resolved paths come back relative to the
-/// register rather than absolute -- see
-/// [`FoldSourceAmbient::relocate`] (#2388). Mirrors
-/// [`FoldRegister::relocate`]'s own trackable arm exactly.
-fn relocate_source_registers(elements: &mut [FoldSourceValue], base: &Rc<PathPrefix>) {
-    for elem in elements {
-        if let Some(path) = &elem.register_path {
-            elem.register_path = Some(PathPrefix::extend_many(base, path.to_vec()));
-        }
-    }
-}
-
 /// `path()`-tracking counterpart of [`eval_reduce`] — resolves
 /// `reduce EXPR as $var (INIT; UPDATE)` in path context, replicating
 /// `eval_reduce`'s own control flow (INIT forks, per-source-element UPDATE
@@ -30026,7 +30047,8 @@ fn resolve_reduce<'a, S: EvalSemantics>(
     snapshot: &Snapshot,
     frame: &Frame,
     keep: Keep,
-) -> PathResolveResult<'a> {
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
     // INIT resolved first, before SOURCE (#2031, reordered from the
     // original #1467/#1872 shape): confirmed live against jq 1.7.1 (via
     // `debug`-instrumented INIT/SOURCE/UPDATE clauses) that real jq
@@ -30047,10 +30069,9 @@ fn resolve_reduce<'a, S: EvalSemantics>(
             Err((prefix, e)) => (prefix, Some(e)),
         };
     if init_branches.is_empty() {
-        return path_result(Vec::new(), init_escape);
+        return flow_result(init_escape);
     }
 
-    let mut out: Vec<PathBranch<'a>> = Vec::new();
     // Shared across every INIT fork (#695), same "whole tree, not
     // per-branch" accounting `eval_reduce` itself uses.
     let mut budget = REDUCE_FOREACH_MAX_STEPS;
@@ -30073,56 +30094,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
             snapshot,
             frame,
         );
-        // Mirrors `eval_reduce`'s own source-stream handling: `reduce`'s
-        // output is always single-shot, so a `Partial` input just extracts
-        // the control and drops the prefix (there's no path-tracking
-        // analogue of "a prefix" for the source stream itself, same as the
-        // value evaluator). `reduce` therefore returns on *any* source
-        // escape here, including #1467's path-check escape — only
-        // `foreach` has a prefix to stream first (#1872). Whatever earlier
-        // INIT forks already emitted into `out` survives, same as any
-        // other mid-loop abort below.
-        let (mut input_values, input_escape) = resolve_fold_source::<S>(
-            input,
-            ambient.value,
-            ambient.trackable,
-            &ambient.snapshot,
-            &ambient.frame,
-        );
-        if ambient.relocate {
-            relocate_source_registers(&mut input_values, &reg.path);
-        }
-        if let Some(control) = input_escape {
-            return path_result(out, Some(control.into()));
-        }
-
-        // `eval_reduce`'s own substitution, minus the two things this
-        // function's `[Pattern::Var(_)]` gate (see `resolve_node`'s
-        // dispatch arm) rules out: #1365's `patterns`-matrix, and #1368's
-        // null-fill for names an alternative leaves unbound -- a bare
-        // `$var` pattern binds its one name unconditionally, so there is
-        // never an unbound name to fill. #2031: an element whose own
-        // navigation moved the register (`register_path.is_some()`) marks
-        // its substituted `$var` as `Expr::TrackedVar` rather than a plain
-        // value, so a bare `$var` reference inside UPDATE can itself
-        // recognise the per-step register `FoldRegister::relocate`'s
-        // `identical()` fallback checks it against below (confirmed live:
-        // `path(foreach (.a) as $k (0; $k))` is `["a"]` -- `$k`'s own
-        // frozen value must be told apart from a coincidentally-equal
-        // computed one, exactly the distinction `PathBranch::snapshot`
-        // already exists to carry).
-        let substituted_updates: Vec<Result<Expr, EvalError>> = input_values
-            .iter()
-            .map(|elem| {
-                extract_pattern_bindings(pattern, &elem.value, false).map(|b| {
-                    if elem.register_path.is_some() {
-                        substitute_var_tracked(update, &b[0].0, &b[0].1)
-                    } else {
-                        substitute_vars(update, as_var_refs(&b))
-                    }
-                })
-            })
-            .collect();
+        let relocate_base = ambient.relocate.then_some(&reg.path);
 
         // `Option`, not a bare `OwnedValue`, mirroring `eval_reduce`'s own
         // accumulator exactly: a step whose UPDATE produces zero outputs
@@ -30160,20 +30132,54 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         // recognise `reg` itself when the two coincide (`identical()`'s
         // existing snapshot-gated fallback), exactly as any other
         // navigated value would.
-        for substituted in &substituted_updates {
+        //
+        // The source is driven by demand (#2235): each element runs its
+        // UPDATE step here, inside the drive, before the next one is
+        // pulled. `reduce` emits nothing per element, but the steps still
+        // run before a trailing source escape is raised, as jq's do
+        // (`path(reduce (1,2,error("s")) as $i (.; stderr))` writes twice
+        // then raises `s`); whatever earlier INIT forks already emitted
+        // has already reached the sink and survives an abort, same as
+        // before. `aborted` is this
+        // driver's out-of-band escape slot, reset on every entry because a
+        // `?//` in the source re-enters the callback after a stop was
+        // already reported (see `foreach_forks`'s identical `ended`).
+        let source_control = drive_fold_source::<S>(input, &ambient, relocate_base, &mut |elem| {
+            aborted = None;
             if let Some(control) = charge_budget(&mut budget, "reduce") {
-                aborted = Some(control);
-                break;
+                return stop_with_escape(&mut aborted, control);
             }
-            let substituted = match substituted {
-                Ok(expr) => expr,
-                Err(e) => {
-                    aborted = Some(Control::Error(e.clone()));
-                    break;
+            // `eval_reduce`'s own substitution, minus the two things this
+            // function's `[Pattern::Var(_)]` gate (see `resolve_node`'s
+            // dispatch arm) rules out: #1365's `patterns`-matrix, and
+            // #1368's null-fill for names an alternative leaves unbound --
+            // a bare `$var` pattern binds its one name unconditionally, so
+            // there is never an unbound name to fill. #2031: an element
+            // whose own navigation moved the register
+            // (`register_path.is_some()`) marks its substituted `$var` as
+            // `Expr::TrackedVar` rather than a plain value, so a bare
+            // `$var` reference inside UPDATE can itself recognise the
+            // per-step register `FoldRegister::relocate`'s `identical()`
+            // fallback checks it against below (confirmed live:
+            // `path(foreach (.a) as $k (0; $k))` is `["a"]` -- `$k`'s own
+            // frozen value must be told apart from a coincidentally-equal
+            // computed one, exactly the distinction `PathBranch::snapshot`
+            // already exists to carry).
+            let substituted = match extract_pattern_bindings(pattern, &elem.value, false) {
+                Ok(b) if elem.register_path.is_some() => {
+                    substitute_var_tracked(update, &b[0].0, &b[0].1)
                 }
+                Ok(b) => substitute_vars(update, as_var_refs(&b)),
+                Err(e) => return stop_with_escape(&mut aborted, Control::Error(e)),
             };
             let acc_input = acc.take().unwrap_or(OwnedValue::Null);
-            match reg.resolve::<S>(substituted, acc_input, acc_at_register, &acc_snapshot, keep) {
+            match reg.resolve::<S>(
+                &substituted,
+                acc_input,
+                acc_at_register,
+                &acc_snapshot,
+                keep,
+            ) {
                 Ok(branches) => {
                     // Only the last output of a multi-output UPDATE
                     // becomes the new accumulator (same rule as
@@ -30206,55 +30212,57 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                     let last = branches.into_iter().last();
                     (acc_at_register, acc_snapshot) = reg.branch_provenance(last.as_ref());
                     acc = last.map(|b| b.value.into_owned());
+                    Demand::Continue
                 }
-                Err((_prefix, e)) => {
-                    // Whatever this step's UPDATE partially resolved
-                    // before erroring never becomes a real accumulator —
-                    // the whole fork aborts here, same as `eval_reduce`'s
-                    // own `aborted = Some(control); break;`.
-                    aborted = Some(e.into());
-                    break;
-                }
+                // Whatever this step's UPDATE partially resolved before
+                // erroring never becomes a real accumulator — the whole
+                // fork aborts here, same as `eval_reduce`'s own `aborted =
+                // Some(control); break;`, and nothing past this element is
+                // ever pulled from the source.
+                Err((_prefix, e)) => stop_with_escape(&mut aborted, e.into()),
             }
+        });
+        if let Some(control) = reclaim_fold_escape(aborted, source_control) {
+            return ResolveFlow::Escaped(control.into());
         }
-        match aborted {
-            Some(control) => return path_result(out, Some(control.into())),
-            None => {
-                // Final emission: the accumulator, re-checked against the
-                // same fixed register one more time — reduce's own exit
-                // back into its caller is itself a "re-entry" boundary,
-                // exactly like the reset between source-element
-                // iterations above, so a transient trackable result from
-                // the last UPDATE step does not automatically survive
-                // (confirmed live, see this function's own doc comment).
-                //
-                // The re-check is on the accumulator's *provenance*, not on
-                // its value (#1466): a value comparison promoted any
-                // reconstruction that happened to land on the register's
-                // value, which is exactly what jq's pointer-based
-                // `jv_identical` refuses. The branch handed to `relocate` is
-                // therefore built *relative* to the register — an empty path
-                // for "still at the register", which `relocate` then extends
-                // by `reg.path` exactly once — rather than absolute, which
-                // would prepend `reg.path` a second time.
-                let acc = acc.unwrap_or(OwnedValue::Null);
-                let final_branch = if acc_at_register {
-                    PathBranch::new(PathPrefix::root(), Cow::Owned(acc), true)
-                } else {
-                    // `demoted`, not `untracked`: an accumulator that is
-                    // still a frozen snapshot stays recognisable to an
-                    // *outer* register when this fold is itself nested
-                    // inside another one, and to `relocate`'s own
-                    // `identical` check just below when this register is
-                    // trackable but the last UPDATE never navigated back
-                    // to it.
-                    PathBranch::demoted(acc_snapshot, Cow::Owned(acc))
-                };
-                out.extend(reg.relocate(vec![final_branch]));
-            }
+        // Final emission: the accumulator, re-checked against the
+        // same fixed register one more time — reduce's own exit
+        // back into its caller is itself a "re-entry" boundary,
+        // exactly like the reset between source-element
+        // iterations above, so a transient trackable result from
+        // the last UPDATE step does not automatically survive
+        // (confirmed live, see this function's own doc comment).
+        //
+        // The re-check is on the accumulator's *provenance*, not on
+        // its value (#1466): a value comparison promoted any
+        // reconstruction that happened to land on the register's
+        // value, which is exactly what jq's pointer-based
+        // `jv_identical` refuses. The branch handed to `relocate` is
+        // therefore built *relative* to the register — an empty path
+        // for "still at the register", which `relocate` then extends
+        // by `reg.path` exactly once — rather than absolute, which
+        // would prepend `reg.path` a second time.
+        let acc = acc.unwrap_or(OwnedValue::Null);
+        let final_branch = if acc_at_register {
+            PathBranch::new(PathPrefix::root(), Cow::Owned(acc), true)
+        } else {
+            // `demoted`, not `untracked`: an accumulator that is
+            // still a frozen snapshot stays recognisable to an
+            // *outer* register when this fold is itself nested
+            // inside another one, and to `relocate`'s own
+            // `identical` check just below when this register is
+            // trackable but the last UPDATE never navigated back
+            // to it.
+            PathBranch::demoted(acc_snapshot, Cow::Owned(acc))
+        };
+        // Emitted through the sink as soon as this fork is done, so a
+        // terminal consumer's refusal (or a bound's stop) is seen before
+        // the next INIT fork ever drives the source (#2235).
+        if emit_branches(reg.relocate(vec![final_branch]), sink) == Demand::Stop {
+            return ResolveFlow::Stopped;
         }
     }
-    path_result(out, init_escape)
+    flow_result(init_escape)
 }
 
 /// `path()`-tracking counterpart of [`eval_foreach`] — see [`resolve_reduce`]
@@ -30290,7 +30298,8 @@ fn resolve_foreach<'a, S: EvalSemantics>(
     snapshot: &Snapshot,
     frame: &Frame,
     keep: Keep,
-) -> PathResolveResult<'a> {
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
     // Ambient `snapshot` threaded the same way `resolve_reduce` threads it
     // into its own INIT resolution — see that function's doc comment
     // (#1591). #2031: INIT resolved before SOURCE, same reordering as
@@ -30302,10 +30311,9 @@ fn resolve_foreach<'a, S: EvalSemantics>(
             Err((prefix, e)) => (prefix, Some(e)),
         };
     if init_branches.is_empty() {
-        return path_result(Vec::new(), init_escape);
+        return flow_result(init_escape);
     }
 
-    let mut out: Vec<PathBranch<'a>> = Vec::new();
     let mut budget = REDUCE_FOREACH_MAX_STEPS;
     // #2388: see `resolve_reduce`'s identical hoist.
     let null_ambient = OwnedValue::Null;
@@ -30325,55 +30333,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
             snapshot,
             frame,
         );
-        // Unlike `reduce`, a `Partial` source stream's own prefix is
-        // iterated below — mirrors `eval_foreach`'s identical rule, and
-        // #1467's path-check escape is now just another such trailing
-        // control rather than a short-circuit ahead of this call, which is
-        // what lets the elements produced before it still stream (#1872).
-        let (mut input_values, input_control) = resolve_fold_source::<S>(
-            input,
-            ambient.value,
-            ambient.trackable,
-            &ambient.snapshot,
-            &ambient.frame,
-        );
-        if ambient.relocate {
-            relocate_source_registers(&mut input_values, &reg.path);
-        }
-
-        // `eval_foreach`'s own substitution, minus the two things this
-        // function's `[Pattern::Var(_)]` gate (see `resolve_node`'s dispatch
-        // arm) rules out: #1365's `patterns`-matrix, and #1368's null-fill for
-        // names an alternative leaves unbound — a bare `$var` pattern binds its
-        // one name unconditionally, so there is never an unbound name to fill
-        // (same reasoning as `resolve_reduce`'s own substitution above). Fused
-        // into one `Vec` (rather than three parallel ones keyed by the same
-        // index, reusing `eval_foreach`'s own `ForeachStepAlternative` pair
-        // type) so the extract/update agreement is unrepresentable rather than
-        // merely unreachable-in-practice — see #1369. Each element's bindings
-        // are dropped as soon as they are consumed instead of being retained as
-        // a second full copy of the input stream for the rest of the call.
-        // #2031: a trackable element's `$var` is substituted as
-        // `Expr::TrackedVar` (into both UPDATE and EXTRACT), the same
-        // reasoning as `resolve_reduce`'s own substitution above.
-        let substituted: Vec<ForeachStepAlternative> = input_values
-            .iter()
-            .map(|elem| {
-                extract_pattern_bindings(pattern, &elem.value, false).map(|b| {
-                    if elem.register_path.is_some() {
-                        (
-                            substitute_var_tracked(update, &b[0].0, &b[0].1),
-                            extract.map(|ext| substitute_var_tracked(ext, &b[0].0, &b[0].1)),
-                        )
-                    } else {
-                        (
-                            substitute_vars(update, as_var_refs(&b)),
-                            extract.map(|ext| substitute_vars(ext, as_var_refs(&b))),
-                        )
-                    }
-                })
-            })
-            .collect();
+        let relocate_base = ambient.relocate.then_some(&reg.path);
 
         // `state`'s own provenance (#1590), mirroring `resolve_reduce`'s
         // `acc_at_register`/`acc_snapshot` exactly — see `FoldRegister::resolve`'s
@@ -30382,18 +30342,58 @@ fn resolve_foreach<'a, S: EvalSemantics>(
         let mut state_at_register = init_branch.trackable;
         let mut state_snapshot = init_branch.snapshot.clone();
         let mut aborted: Option<Control> = None;
-        'input: for (elem, step) in input_values.iter().zip(&substituted) {
+        // The source is driven by demand (#2235): each element is folded
+        // here, inside the drive, before the next one is pulled, so a step
+        // that raises stops the source with nothing past it evaluated --
+        // `. as $x | path(foreach (.[] | stderr) as $i (0; $x))` on
+        // `[1,2,3]` writes `1` once, as jq does. The source's own trailing
+        // escape is applied after the drive, per fork (#534 follow-up), so
+        // the elements before it still stream (#1872). `aborted` is this
+        // driver's out-of-band escape slot, reset on every entry because a
+        // `?//` in the source re-enters the callback after a stop was
+        // already reported (see `foreach_forks`'s identical `ended`).
+        // Every emission goes straight to the sink, so a terminal
+        // consumer's refusal of the first output -- or an outer bound's
+        // stop -- ends the drive right there. `downstream_stopped` is reset
+        // on entry like `aborted`: jq retries a source `?//` after either
+        // kind of stop and it is the retry's verdict that counts
+        // (`resolve_terminal` resets its own slot for the same reason). A
+        // bound *outside* `path()` cannot reach here at all -- `path()`
+        // collects before its consumer sees anything -- so the retried
+        // over-delivery jq shows there (`[limit(1; path(foreach (1 as $x
+        // ?// $y | (stderr|1)) as $v (.; .)))]` is `[[],[]]` in jq 1.7.1)
+        // is not reproduced; see limitations.md.
+        let mut downstream_stopped = false;
+        let source_control = drive_fold_source::<S>(input, &ambient, relocate_base, &mut |elem| {
+            downstream_stopped = false;
+            aborted = None;
             if let Some(control) = charge_budget(&mut budget, "foreach") {
-                aborted = Some(control);
-                break;
+                return stop_with_escape(&mut aborted, control);
             }
-            let (substituted_update, substituted_extract) = match step {
-                Ok((upd, ext)) => (upd, ext),
-                Err(e) => {
-                    aborted = Some(Control::Error(e.clone()));
-                    break;
-                }
-            };
+            // `eval_foreach`'s own substitution, minus the two things this
+            // function's `[Pattern::Var(_)]` gate (see `resolve_node`'s
+            // dispatch arm) rules out: #1365's `patterns`-matrix, and
+            // #1368's null-fill for names an alternative leaves unbound — a
+            // bare `$var` pattern binds its one name unconditionally, so
+            // there is never an unbound name to fill (same reasoning as
+            // `resolve_reduce`'s own substitution). Substituted per element
+            // as it arrives, into UPDATE and EXTRACT together so their
+            // agreement is unrepresentable rather than merely
+            // unreachable-in-practice (#1369). #2031: a trackable element's
+            // `$var` is substituted as `Expr::TrackedVar` (into both), the
+            // same reasoning as `resolve_reduce`'s own substitution.
+            let (substituted_update, substituted_extract) =
+                match extract_pattern_bindings(pattern, &elem.value, false) {
+                    Ok(b) if elem.register_path.is_some() => (
+                        substitute_var_tracked(update, &b[0].0, &b[0].1),
+                        extract.map(|ext| substitute_var_tracked(ext, &b[0].0, &b[0].1)),
+                    ),
+                    Ok(b) => (
+                        substitute_vars(update, as_var_refs(&b)),
+                        extract.map(|ext| substitute_vars(ext, as_var_refs(&b))),
+                    ),
+                    Err(e) => return stop_with_escape(&mut aborted, Control::Error(e)),
+                };
             // #2031: see `resolve_reduce`'s identical per-step register
             // override.
             let (active_reg, active_at_register) = match &elem.register_path {
@@ -30488,25 +30488,36 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                 ),
             };
             let update_branches = match active_reg.resolve::<S>(
-                substituted_update,
-                state,
+                &substituted_update,
+                core::mem::replace(&mut state, OwnedValue::Null),
                 active_at_register,
                 &state_snapshot,
                 keep,
             ) {
                 Ok(branches) => branches,
-                Err((_prefix, e)) => {
-                    aborted = Some(e.into());
-                    break;
-                }
+                Err((_prefix, e)) => return stop_with_escape(&mut aborted, e.into()),
             };
+            // Each UPDATE output becomes the state *before* it is emitted --
+            // jq stores it first, then runs EXTRACT/emits -- so the last one
+            // carries forward as the next element's state (same rule as
+            // `eval_foreach`), with its provenance (#1590, mirroring
+            // `resolve_reduce`'s `acc_at_register`/`acc_snapshot`). The
+            // ordering is observable once a stop is retried by a source
+            // `?//`: the retried step re-enters from the refused output, not
+            // from the state before it, which is how `path(foreach (1 as $x
+            // ?// $y | if $x == 1 then 1 else 2 end) as $v (.; if $v == 2
+            // then . else $v end))` names `1` in jq 1.7.1's second refusal.
+            if update_branches.is_empty() {
+                (state_at_register, state_snapshot) = reg.branch_provenance(None);
+            }
             for update_branch in &update_branches {
-                if let Some(ext_expr) = substituted_extract {
+                (state_at_register, state_snapshot) = reg.branch_provenance(Some(update_branch));
+                state = update_branch.value.clone().into_owned();
+                if let Some(ext_expr) = &substituted_extract {
                     if let Some(control) = charge_budget(&mut budget, "foreach") {
-                        aborted = Some(control);
-                        break 'input;
+                        return stop_with_escape(&mut aborted, control);
                     }
-                    let extract_reg = active_reg.advance(update_branch, substituted_update, frame);
+                    let extract_reg = active_reg.advance(update_branch, &substituted_update, frame);
                     // `update_branch` is itself already relocated (it's
                     // `active_reg.resolve()`'s own output above), and
                     // `advance()` built `extract_reg` from this same
@@ -30523,49 +30534,57 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                         &extract_snapshot,
                         keep,
                     ) {
-                        Ok(branches) => out.extend(branches),
+                        Ok(branches) => {
+                            if emit_branches(branches, sink) == Demand::Stop {
+                                downstream_stopped = true;
+                                return Demand::Stop;
+                            }
+                        }
                         Err((prefix, e)) => {
-                            out.extend(prefix);
-                            aborted = Some(e.into());
-                            break 'input;
+                            if emit_branches(prefix, sink) == Demand::Stop {
+                                downstream_stopped = true;
+                                return Demand::Stop;
+                            }
+                            return stop_with_escape(&mut aborted, e.into());
                         }
                     }
-                } else if update_branch.trackable {
-                    out.push(PathBranch::new(
-                        update_branch.path.clone(),
-                        update_branch.value.clone(),
-                        true,
-                    ));
                 } else {
-                    // `demoted`, not `untracked`: an emitted value that is
-                    // still a frozen snapshot must stay recognisable to an
-                    // outer register when this `foreach` is nested inside
-                    // another fold (#1466) — same rule as `relocate`'s own
-                    // demotion arm.
-                    out.push(PathBranch::demoted(
-                        update_branch.snapshot.clone(),
-                        update_branch.value.clone(),
-                    ));
+                    let emitted = if update_branch.trackable {
+                        PathBranch::new(
+                            update_branch.path.clone(),
+                            update_branch.value.clone(),
+                            true,
+                        )
+                    } else {
+                        // `demoted`, not `untracked`: an emitted value that is
+                        // still a frozen snapshot must stay recognisable to an
+                        // outer register when this `foreach` is nested inside
+                        // another fold (#1466) — same rule as `relocate`'s own
+                        // demotion arm.
+                        PathBranch::demoted(
+                            update_branch.snapshot.clone(),
+                            update_branch.value.clone(),
+                        )
+                    };
+                    if sink(emitted) == Demand::Stop {
+                        downstream_stopped = true;
+                        return Demand::Stop;
+                    }
                 }
             }
-            // Only the last UPDATE output carries forward as state for the
-            // next source element — same rule as `eval_foreach`. Its
-            // provenance carries forward too now (#1590), mirroring
-            // `resolve_reduce`'s `acc_at_register`/`acc_snapshot` update via
-            // `FoldRegister::branch_provenance`.
-            let last = update_branches.into_iter().last();
-            (state_at_register, state_snapshot) = reg.branch_provenance(last.as_ref());
-            state = last.map_or(OwnedValue::Null, |b| b.value.into_owned());
-        }
+            Demand::Continue
+        });
         // The source stream's own trailing control belongs to this fork
-        // too, applied after its own inner loop — mirrors `eval_foreach`'s
+        // too, applied after its own inner drive — mirrors `eval_foreach`'s
         // #534-follow-up fix exactly.
-        let aborted = aborted.or_else(|| input_control.clone());
-        if let Some(control) = aborted {
-            return path_result(out, Some(control.into()));
+        if downstream_stopped {
+            return ResolveFlow::Stopped;
+        }
+        if let Some(control) = reclaim_fold_escape(aborted, source_control) {
+            return ResolveFlow::Escaped(control.into());
         }
     }
-    path_result(out, init_escape)
+    flow_result(init_escape)
 }
 
 /// Apply `Expr::Try`'s `catch` clause (if any) after `expr` failed to
@@ -32724,7 +32743,29 @@ fn assemble_one_branch(branch: &PathBranch<'_>) -> Expr {
     }
 }
 
-/// Raise on the first branch that was computed rather than navigated to.
+/// Resolve a top-level path expression and raise on the first branch that
+/// was computed rather than navigated to -- **as it is produced**, so the
+/// producer stops there and nothing past it is ever evaluated (#2235).
+/// jq validates each output of `path(f)` the instant it is emitted: `. as
+/// $x | path(foreach (.[] | stderr) as $i (0; $x))` on `[1,2,3]` writes `1`
+/// once and raises on the first step's own emission, never pulling the
+/// source again. Checking a collected vector after the fact, as this did
+/// until #2235, let every side effect in `f` fire first.
+///
+/// The check runs through [`resolve_node_sink`] with `Keep::First`, the
+/// terminal demand: a collecting sink that records the first violation
+/// and answers [`Demand::Stop`]. The slot is reset on every entry, because
+/// a `?//` in a fold's source re-enters after a stop has been reported
+/// (#1519's retry, seen from the consuming side) and it is the retry's
+/// verdict that counts -- confirmed live against jq 1.7.1:
+/// `path(foreach (1 as $x ?// $y | if $x == 1 then 1 else 2 end) as $v
+/// (.; .; if $v == 1 then 1 else . end))` is `[]`, the first
+/// alternative's refused `1` retried into the second's accepted `.`. A
+/// violation found among branches a
+/// *later* sibling's escape stopped resolution with still wins over that
+/// escape (#1560: `path(.a | (1, error("boom")))` raises "Invalid path
+/// expression with result 1" and never reaches `error("boom")`); with the
+/// stop at production that ordering falls out by construction.
 ///
 /// This is the genuinely terminal position (#986): `resolve_dynamic_indexes`
 /// is the top-level entry for all four of `path()`, `del()`, `=` and `|=`,
@@ -32818,68 +32859,47 @@ fn assemble_one_branch(branch: &PathBranch<'_>) -> Expr {
 /// direction, not merely a cosmetic one. Left on the pre-existing raise
 /// until that ordering is implemented for real; tracked as a follow-up
 /// rather than guessed at here.
-fn reject_untracked_at_terminal(
-    branches: Vec<PathBranch<'_>>,
+fn resolve_terminal<'a, S: EvalSemantics>(
+    expr: &Expr,
+    input: &'a OwnedValue,
     near_iterate: bool,
     skip_untracked: bool,
-) -> Result<Vec<PathBranch<'_>>, (Vec<PathBranch<'_>>, EvalEscape)> {
-    let mut kept = vec_with_capacity(branches.len());
-    for branch in branches {
-        if !branch.trackable {
-            if skip_untracked {
-                continue;
+) -> PathResolveResult<'a> {
+    let mut kept: Vec<PathBranch<'a>> = Vec::new();
+    let mut violation: Option<EvalEscape> = None;
+    // `input` is the call's own fresh document root — never itself a
+    // frozen `$x` snapshot, so ambient `snapshot` starts `false` (#1591),
+    // and the document `path()`/`=`/`|=`/`del()` were actually called on is
+    // always fully trackable (the untracked marker, #843, exists only for
+    // the value `resolve_catch` synthesizes for a `catch` handler).
+    let flow = resolve_node_sink::<S>(
+        expr,
+        input,
+        true,
+        &Snapshot::No,
+        &Frame::enter(expr),
+        Keep::First,
+        &mut |branch| {
+            violation = None;
+            if !branch.trackable {
+                if skip_untracked {
+                    return Demand::Continue;
+                }
+                violation = Some(if near_iterate {
+                    EvalError::invalid_path_expression_near_iterate(&branch.value).into()
+                } else {
+                    EvalError::invalid_path_expression(&branch.value).into()
+                });
+                return Demand::Stop;
             }
-            let error = if near_iterate {
-                EvalError::invalid_path_expression_near_iterate(&branch.value).into()
-            } else {
-                EvalError::invalid_path_expression(&branch.value).into()
-            };
-            return Err((kept, error));
-        }
-        kept.push(branch);
+            kept.push(branch);
+            Demand::Continue
+        },
+    );
+    match (violation, flow) {
+        (Some(e), _) | (None, ResolveFlow::Escaped(e)) => Err((kept, e)),
+        (None, ResolveFlow::Exhausted | ResolveFlow::Stopped) => Ok(kept),
     }
-    Ok(kept)
-}
-
-/// Same terminal check as [`reject_untracked_at_terminal`], but also run
-/// over whatever a *later* sibling's own escape stopped resolution with.
-///
-/// jq validates each `Expr::Comma` sibling's path-validity the instant it
-/// is produced, before the next sibling ever runs (confirmed live:
-/// `path(.a | (1, error("boom")))` raises "Invalid path expression with
-/// result 1" -- the first branch's own violation -- and never reaches
-/// `error("boom")` at all; jq prints nothing to stdout). `resolve_node`'s
-/// `Expr::Comma` arm cannot replicate that ordering on its own (#986
-/// Stage 2's reasoning still holds: mid-pipe, it does not yet know
-/// whether it is terminal), so it always resolves every sibling before
-/// returning. When a *later* sibling's own escape is what stopped that
-/// resolution, the branches collected before it still carry whatever an
-/// earlier, terminal-but-untracked sibling produced -- and without this,
-/// that branch skips the terminal check an all-`Ok` result gets, both
-/// surfacing the later sibling's error instead of jq's real one and
-/// leaking that untracked branch's stale path into the assembled prefix
-/// (#1560).
-fn reject_untracked_prefix_too(
-    result: PathResolveResult<'_>,
-    near_iterate: bool,
-    skip_untracked: bool,
-) -> PathResolveResult<'_> {
-    let (prefix, escape) = match result {
-        Ok(branches) => (branches, None),
-        Err((prefix, e)) => (prefix, Some(e)),
-    };
-    // `?` here is the priority rule: a terminal violation found in
-    // `prefix` propagates immediately, discarding `escape` (a later
-    // sibling's own error/break/halt that never got the chance to run
-    // in real jq either) -- exactly `path_result`'s own `Some`/`None`
-    // combine once a violation-free `prefix` reaches it. When
-    // `skip_untracked` is set, `reject_untracked_at_terminal` never
-    // returns `Err` at all (#1764), so this `?` is a no-op there and
-    // `escape` -- a genuine error/break/halt, never just an untracked
-    // value -- still always propagates through `path_result` below
-    // unchanged.
-    let checked = reject_untracked_at_terminal(prefix, near_iterate, skip_untracked)?;
-    path_result(checked, escape)
 }
 
 /// What `del()`'s own path prepass resolved a `del(f)` argument to.
@@ -32932,7 +32952,7 @@ enum DelPaths<'a> {
 ///   the moment it hits an untracked one, so mirroring the skip here would
 ///   make `del()` delete *more* than real yq does for some argument
 ///   orderings (`del(.a, 1)` deletes nothing in real yq; `del(1, .a)`
-///   deletes `.a`). See [`reject_untracked_at_terminal`]'s own doc comment
+///   deletes `.a`). See [`resolve_terminal`]'s own doc comment
 ///   for the live-verified permutations.
 ///
 /// The `Err` half is just the escape: `builtin_del` discards the assembled
@@ -32946,21 +32966,7 @@ fn resolve_del_path_branches<'a, S: EvalSemantics>(
     if !needs_path_prepass(expr) {
         return Ok(DelPaths::Verbatim);
     }
-    // `input` is this call's own fresh document root — never itself a frozen
-    // `$x` snapshot, so ambient `snapshot` starts `false` (#1591), same as
-    // `resolve_dynamic_indexes`'s own top-level entry.
-    match reject_untracked_prefix_too(
-        resolve_node::<S>(
-            expr,
-            input,
-            true,
-            &Snapshot::No,
-            &Frame::enter(expr),
-            Keep::First,
-        ),
-        false,
-        false,
-    ) {
+    match resolve_terminal::<S>(expr, input, false, false) {
         Ok(branches) => {
             if branches.iter().any(|b| b.path.depth() == 0) {
                 Ok(DelPaths::Root)
@@ -33018,7 +33024,7 @@ fn resolve_del_path_branches<'a, S: EvalSemantics>(
 /// - Each branch would expand against the document as it stands *after* the
 ///   earlier branches' writes, not against `input`; jq computes the whole
 ///   path set first and applies it after (#498's clobber case).
-/// - `reject_untracked_at_terminal` below answers trackability for every
+/// - `resolve_terminal` below answers trackability for every
 ///   branch before any branch's iterability is tested, inverting the two
 ///   against `resolve_seq`'s per-branch interleaving: `del((.a, 1) | .[])`
 ///   on `{"a":7}` reports jq's "Cannot iterate over number (7)" only while
@@ -33093,11 +33099,11 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
     // handler, never for anything reaching this top-level entry point. That
     // is about the *input*; individual branches can still come back
     // untracked from `resolve_leaf`'s deferred catch-all (#986), which is
-    // what `reject_untracked_at_terminal` above answers for.
+    // what `resolve_terminal` above answers for.
 
     // #888: a bare trailing iterate never needs its per-element *value* here
     // — this function is always the terminal entry point (see
-    // `reject_untracked_at_terminal`'s own doc comment above), so nothing
+    // `resolve_terminal`'s own doc comment above), so nothing
     // downstream of it ever consults one. Left inside `resolve_seq`'s
     // fan-out loop, it gets fully enumerated into one static `Index(i)`
     // branch per array element, turning a computed key ahead of it into
@@ -33121,35 +33127,17 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
         }
     }
 
-    // #1764 review: computed once here, as a plain `bool`, rather than
-    // threading `S: EvalSemantics` itself into `reject_untracked_at_
-    // terminal`/`reject_untracked_prefix_too` -- those two are otherwise
-    // non-generic, so making them generic purely to evaluate one `S::TAG`
-    // comparison would monomorphize (and so duplicate the compiled code
-    // for) both of them per `EvalSemantics` impl, for zero behavioral
-    // benefit over resolving the same fact once, here, where `S` is
-    // already bound. Unconditional now that `del()` -- the one caller that
-    // wanted `false` in yq mode -- resolves through
-    // `resolve_del_path_branches` instead (#1690).
+    // #1764 review: computed once here, as a plain `bool`, and passed
+    // down rather than re-derived from `S::TAG` at each check --
+    // `resolve_terminal` is generic over `S` anyway (it resolves), but the
+    // rule itself is decided once, here, where every entry point shares
+    // it. Unconditional now that `del()` -- the one caller that wanted
+    // `false` in yq mode -- resolves through `resolve_del_path_branches`
+    // instead (#1690).
     let skip_untracked = S::TAG == EvalTag::Yq;
 
     if trailing.is_empty() {
-        // `input` is this call's own fresh document root — never itself a
-        // frozen `$x` snapshot, so ambient `snapshot` starts `false` here,
-        // same as it does at this function's other top-level entry point
-        // below (#1591).
-        return match reject_untracked_prefix_too(
-            resolve_node::<S>(
-                expr,
-                input,
-                true,
-                &Snapshot::No,
-                &Frame::enter(expr),
-                Keep::First,
-            ),
-            false,
-            skip_untracked,
-        ) {
+        return match resolve_terminal::<S>(expr, input, false, skip_untracked) {
             Ok(branches) => Ok(assemble_path_branches(branches)),
             Err((prefix, e)) => Err((assemble_path_branches(prefix), e)),
         };
@@ -33160,18 +33148,7 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
         1 => flat.into_iter().next().expect("len checked"),
         _ => Expr::Pipe(flat),
     };
-    match reject_untracked_prefix_too(
-        resolve_node::<S>(
-            &reduced_expr,
-            input,
-            true,
-            &Snapshot::No,
-            &Frame::enter(&reduced_expr),
-            Keep::First,
-        ),
-        true,
-        skip_untracked,
-    ) {
+    match resolve_terminal::<S>(&reduced_expr, input, true, skip_untracked) {
         Ok(branches) => Ok(assemble_path_branches(branches)
             .into_iter()
             .map(|e| append_trailing(e, &trailing))
@@ -70577,7 +70554,7 @@ mod tests {
     }
 
     /// #1560: `resolve_dynamic_indexes` only ran its terminal
-    /// untracked-branch check (`reject_untracked_at_terminal`) on
+    /// untracked-branch check (`resolve_terminal`) on
     /// `resolve_node`'s *Ok* result. When a later `Expr::Comma` sibling's own
     /// escape stopped resolution first, an earlier sibling's own terminal
     /// violation -- already sitting in the `Err` prefix -- skipped that check
@@ -71482,7 +71459,7 @@ mod tests {
     /// select(true) = "X"` used to silently replace the *entire input
     /// document* with `"X"` instead of raising and writing nothing.
     /// `resolve_dynamic_indexes`'s own terminal check
-    /// (`reject_untracked_at_terminal`) is the general fix, not a
+    /// (`resolve_terminal`) is the general fix, not a
     /// `select`-specific patch — moved there from `resolve_catch`'s own
     /// top-level check by #1297, since `resolve_catch` is not always
     /// terminal itself (see its doc comment).
@@ -84321,11 +84298,12 @@ mod tests {
         // it, raising with nothing.
         //
         // This source contains no navigation step, so
-        // `resolve_fold_source`'s `any_subexpr` gate routes it straight to
-        // `eval_owned_expr_fork` and it never reaches the tracked resolver
-        // at all. That makes it the canary for anyone loosening that gate:
-        // an ungated version of #1467's own check discarded this `[[], []]`
-        // prefix, which is how the gate got written in the first place.
+        // `drive_fold_source`'s `any_subexpr` gate drives it by value
+        // through `eval_each_owned` and it never reaches the tracked
+        // resolver at all. That makes it the canary for anyone loosening
+        // that gate: an ungated version of #1467's own check discarded
+        // this `[[], []]` prefix, which is how the gate got written in the
+        // first place.
         query!(
             br#"{"a":1}"#,
             r#"path(foreach (1,2,error("s")) as $i (.; .))"#,
@@ -84376,7 +84354,7 @@ mod tests {
     /// `fold_source_*_1872` golden; they are repeated in-process because a
     /// golden compares whole streams while these assert the *prefix
     /// length*, which is what a `Keep::First` regression in
-    /// `resolve_fold_source` would silently shorten.
+    /// `drive_fold_source` would silently shorten.
     #[test]
     fn test_fold_source_streams_prefix_before_fatal_escape_1872() {
         // The issue's own repro: elements `1` and `2` fold and emit, then
@@ -84446,7 +84424,7 @@ mod tests {
         );
     }
 
-    /// #1872: `Keep::AtMost` is introduced by `resolve_fold_source` and
+    /// #1872: `Keep::AtMost` is introduced by `drive_fold_source` and
     /// nowhere else, so an ordinary `path()` still sees #987's
     /// stop-after-first leaf. These are the shapes that would change if it
     /// ever leaked out of a fold source into `resolve_dynamic_indexes`'s

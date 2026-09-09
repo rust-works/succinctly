@@ -97,7 +97,7 @@ between copies:
 ## Where the bind path comes from
 
 `resolve_bind_source` resolves an `as` source in path position — reusing the same
-value-vs-path fork `resolve_fold_source` already established for fold sources
+value-vs-path fork `drive_fold_source` already established for fold sources
 (`#1467`/`#2031`) — as **a witness only**: jq evaluates an `as` source with path tracking
 suspended (`subexp_nest > 0` in the real interpreter), so the source itself never moves the
 register (`path(.a as $y \| .b)` is `["b"]`, not an error) and never raises a path error of
