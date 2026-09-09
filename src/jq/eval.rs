@@ -25683,12 +25683,12 @@ fn needs_path_prepass(expr: &Expr) -> bool {
 ///
 /// This function instead answers a narrower question, asked only once
 /// `resolve_seq` has *already* been reached (a real computed key elsewhere
-/// in the pipe, or -- unconditionally -- `resolve_recurse` resolving `f`):
+/// in the pipe, or -- unconditionally -- `resolve_recurse_sink` resolving `f`):
 /// can its "nothing left needs resolving" fast path assume the remaining
 /// tail is single-valued? For `Iterate` the answer is no --
 /// [`value_after_components`] treats any component producing zero or more
 /// than one output as pruning the whole branch (`Ok(None)`, #2124), which
-/// `resolve_recurse` reads as "no children" and drops, silently discarding
+/// `resolve_recurse_sink` reads as "no children" and drops, silently discarding
 /// every result whenever a trailing `.foo[]`/`.foo[]?` reaches a 2+-element
 /// container (#682). Fanning it out through the same loop already used for
 /// a genuine computed key fixes that, without touching
@@ -25783,7 +25783,7 @@ fn push_path_components(out: &mut Vec<Expr>, expr: &Expr) {
 /// A thin adapter over [`eval_owned_multi_keep_partial`] that discards
 /// whatever prefix `expr` already produced before the escape — the right
 /// contract for every caller except `recurse`'s own children evaluation
-/// (`builtin_recurse_f`/`builtin_recurse_cond`/`resolve_recurse`), which
+/// (`builtin_recurse_f`/`builtin_recurse_cond`/`resolve_recurse_sink`), which
 /// call `eval_owned_multi_keep_partial` directly instead (#842).
 ///
 /// The one caller that must NOT use this — `update_path`'s `Expr::Identity`
@@ -25850,7 +25850,7 @@ fn eval_owned_multi_first<S: EvalSemantics>(
 /// `builtin_recurse_cond`, both evaluate `f` through this function
 /// directly), `builtin_in`'s own `xs`-evaluation step (also value
 /// position — the candidates to check `.` against can themselves be a
-/// multi-output generator with the same shape), `resolve_recurse`'s own
+/// multi-output generator with the same shape), `resolve_recurse_sink`'s own
 /// `cond`-evaluation step in path
 /// position (#854 — `cond` can itself be a multi-output generator whose own
 /// later output errors after an earlier one already fired truthy for the
@@ -25861,7 +25861,7 @@ fn eval_owned_multi_first<S: EvalSemantics>(
 /// `Select`/`If` arms (their `cond`), its `GetPath` arm (its `arg`), and
 /// `resolve_index_expr` (its `key`) — the same argument-can-itself-be-a-
 /// generator shape #842/#854 fixed for `recurse`, independently live at
-/// these 4 unrelated call sites too (#896). `resolve_recurse`'s own
+/// these 4 unrelated call sites too (#896). `resolve_recurse_sink`'s own
 /// `f`-evaluation step is the one exception: it resolves `f` through
 /// `resolve_node`/`resolve_against_cow` instead — a structurally different
 /// call whose `PathResolveResult` already threads a prefix through its own
@@ -27169,10 +27169,7 @@ fn resolve_limit_sink<'a, S: EvalSemantics>(
             other => return other,
         }
     }
-    match escape {
-        Some(e) => ResolveFlow::Escaped(e),
-        None => ResolveFlow::Exhausted,
-    }
+    flow_result(escape)
 }
 
 /// `path(nth(n; expr))` (#1952) — the arm `nth` had none of at all, which is
@@ -27243,10 +27240,7 @@ fn resolve_nth_sink<'a, S: EvalSemantics>(
             other => return other,
         }
     }
-    match escape {
-        Some(e) => ResolveFlow::Escaped(e),
-        None => ResolveFlow::Exhausted,
-    }
+    flow_result(escape)
 }
 
 /// Collecting adapter over [`resolve_node_sink`] — the shape every caller
@@ -27385,7 +27379,7 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // `eval_owned_multi`/`eval_owned_expr`, and republishes `value` once
         // per truthy output rather than collapsing every output into one
         // always-truthy array (#628, mirroring #627's
-        // `builtin_recurse_cond`/`resolve_recurse` fix): confirmed against jq
+        // `builtin_recurse_cond`/`resolve_recurse_sink` fix): confirmed against jq
         // 1.7.1, `path(select((false,false)))` is empty (not `[[]]`), and
         // `path(select((true,true)))` forks into two branches, `[[],[]]`.
         // Keeping the partial prefix (rather than discarding it on a later
@@ -27463,6 +27457,36 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                 resolve_node_sink::<S>(branch, value, trackable, snapshot, frame, keep, sink)
             })
         }
+        // `E?` (bare postfix `?`, sugar for `try E`, #2235): streams through
+        // `resolve_node_sink` rather than collecting via `resolve_node`
+        // first, so a `?`-wrapped generator (`.[]?`, `(f)?`) interleaves its
+        // own side effects with whatever drives it — a fold source shaped
+        // `(.[] | stderr)?` no longer fires every `stderr` write before the
+        // fold's first step runs. See [`resolve_optional_sink`].
+        Expr::Optional(inner) => {
+            resolve_optional_sink::<S>(inner, value, trackable, snapshot, frame, keep, sink)
+        }
+        // `recurse(f)`/`recurse(f; cond)` (#2235): the parameterised
+        // spellings have no static shortcut the way bare `..`/`recurse` do
+        // (`f` is arbitrary, so the queue has to run) — always `trackable`
+        // here too, same guard as the bare spellings just below in
+        // `resolve_node_eager`. `resolve_recurse_sink` itself asserts this
+        // rather than re-deriving it (#843 review). Streams each visited
+        // node to `sink` as it is popped, so a bounded consumer no longer
+        // pays for nodes past the ones it actually asked for — see that
+        // function's own doc comment for what this does, and does not,
+        // close.
+        Expr::Builtin(Builtin::RecurseF(_) | Builtin::RecurseCond(_, _))
+            if !trackable && !snapshot.is_marked() =>
+        {
+            ResolveFlow::Escaped(recurse_untracked_error(value).1)
+        }
+        Expr::Builtin(Builtin::RecurseF(f)) => {
+            resolve_recurse_sink::<S>(f, None, value, trackable, snapshot, frame, keep, sink)
+        }
+        Expr::Builtin(Builtin::RecurseCond(f, cond)) => {
+            resolve_recurse_sink::<S>(f, Some(cond), value, trackable, snapshot, frame, keep, sink)
+        }
         // `try expr catch handler` (and `expr?`, sugar for `try expr`):
         // resolve `expr`; if that fails and there is no `catch`, prune the
         // branch exactly like `Optional`'s blanket arm above. With a
@@ -27482,15 +27506,11 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         Expr::Try { expr, catch } => {
             match resolve_node_sink::<S>(expr, value, trackable, snapshot, frame, keep, sink) {
                 ResolveFlow::Escaped(EvalEscape::Error(e)) if !e.is_uncatchable() => {
-                    drain_path_result(
-                        resolve_catch::<S>(catch.as_deref(), Vec::new(), e.payload(), frame, keep),
-                        sink,
-                    )
+                    resolve_catch_sink::<S>(catch.as_deref(), e.payload(), frame, keep, sink)
                 }
-                ResolveFlow::Escaped(EvalEscape::Break(_)) => drain_path_result(
-                    resolve_catch::<S>(catch.as_deref(), Vec::new(), OwnedValue::Null, frame, keep),
-                    sink,
-                ),
+                ResolveFlow::Escaped(EvalEscape::Break(_)) => {
+                    resolve_catch_sink::<S>(catch.as_deref(), OwnedValue::Null, frame, keep, sink)
+                }
                 other => other,
             }
         }
@@ -27867,165 +27887,6 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
     keep: Keep,
 ) -> PathResolveResult<'a> {
     match expr {
-        Expr::Optional(inner) => match inner.as_ref() {
-            // `E[K]?` only covers a failure to *index* — evaluating `E` or `K`
-            // is not covered (see `eval_index_expr`'s doc comment, which the
-            // value-position evaluator already honors). The blanket catch below
-            // is right for every other `?`-wrapped node, where evaluation and
-            // indexing are the same step, but it would also swallow an error
-            // raised while computing `K` itself, e.g. `"str" | .[.k]? = 5`
-            // (#413). Only the bare shape needs intercepting, and that is jq's
-            // own distinction rather than a limit of what parses: `(.[.k])?` is
-            // `try .[.k]`, which catches everything inside it including the key,
-            // so `"str" | (.[.k])? = 5` is `"str"` there while
-            // `"str" | .[.k]? = 5` raises. A parenthesised key therefore *should*
-            // reach the blanket arm below. It cannot yet — the postfix `?` takes
-            // a path expression and nothing else until #367 — but when it can,
-            // this arm still wants to see only the bare shape.
-            Expr::IndexExpr { target, key } => {
-                resolve_index_expr::<S>(target, key, value, true, trackable, frame, keep)
-            }
-
-            // `E[S:T]?` is the same bare shape for slice bounds: only a
-            // failure to *slice* is covered, never `E`, `S`, or `T`'s own
-            // evaluation — see `resolve_slice_expr`'s doc comment.
-            Expr::SliceExpr { target, start, end } => {
-                resolve_slice_expr::<S>(target, start, end, value, true, trackable, frame, keep)
-            }
-
-            // Every other `?`-wrapped node (`.foo?`, `.[0]?`, ...): evaluation
-            // and indexing are the same step, so any failure anywhere
-            // underneath is the failure to index, and `?` covers all of it.
-            //
-            // The `Expr::Optional` wrapper below marks the branch as one `?`
-            // reached, for whatever downstream still wants to know that —
-            // but it is *not* an instruction to keep suppressing failures at
-            // write time. `resolve_dynamic_indexes` strips every such
-            // wrapper from the final component list before handing it to
-            // `set_path`/`update_path`/`delete_at_path`, because those
-            // functions apply an already-resolved path unconditionally, the
-            // same way jq's `setpath` never re-consults the `?` that
-            // `path()` already spent (#498's multi-branch case: a sibling
-            // write earlier in the same fan-out batch can still clobber the
-            // container this branch needs, and that failure must propagate
-            // regardless of this branch's own `?`).
-            _ => {
-                // A failure under `?` prunes just the error, keeping whatever
-                // was already resolved before it (confirmed live: `(.a,
-                // .b[0])?` prints `["a"]` and silently stops) — except
-                // `invalid_path_expression` (#530), which `?` does not
-                // suppress in jq at all: it is a statement that the filter is
-                // not a path expression, not a value error raised while
-                // collecting one (confirmed live: `path(("a")?)` still
-                // raises in jq).
-                //
-                // #843's "near attempt" error (`is_untracked_navigation_error`)
-                // has its own, narrower carve-out: `?` *does* usually suppress
-                // it (unlike `#530`'s classic message) — except when `inner`
-                // is itself one of the four bare navigation primitives this
-                // error can come from (`Field`/`Index`/`Iterate`/`Slice`),
-                // i.e. a *bare* postfix `?` (`.b?`, not `(.b)?`). Confirmed
-                // live against jq 1.7.1: `path(try (.a, error(5)) catch
-                // .b?)` still raises "near attempt to access element \"b\"
-                // of 5" (exit 5), while the parenthesized `(.b)?` — which
-                // also reaches this same generic arm, since `Paren` isn't
-                // one of the primitives either — suppresses the very same
-                // error and prints only `["a"]`. `try .b` (no catch, no `?`
-                // at all) matches the parenthesized form, not the bare one
-                // (also confirmed live) — jq's distinction is specific to
-                // postfix `?` binding directly to a bare primitive, not to
-                // "any wrapper around one", so this only needs to special-
-                // case `inner`'s shape right here, not `Expr::Try`'s own
-                // handling elsewhere. An *ordinary* failure to index (e.g.
-                // `"str" | path(.foo?)`) still prunes here exactly as it
-                // always did — this only withholds pruning for the specific
-                // #843 error kind.
-                //
-                // A `break $label` is pruned the same unconditional way,
-                // regardless of which label it targets — jq's `?`/bare `try`
-                // (no `catch`) always intercepts a break passing through
-                // (confirmed live: `label $out | ((.a, break $out)?)` is `1`
-                // and exits 0, never reaching `$out`; the value-position
-                // evaluator's `eval_try` already applies the same rule, #562)
-                // — never something to re-raise like the invalid-path-
-                // expression carve-out above.
-                let bare_navigation_primitive = matches!(
-                    inner.as_ref(),
-                    Expr::Field(_) | Expr::Index { .. } | Expr::Iterate | Expr::Slice { .. }
-                );
-                let branches =
-                    match resolve_node::<S>(inner, value, trackable, snapshot, frame, keep) {
-                        Ok(branches) => branches,
-                        // Only a genuine collection failure prunes to the
-                        // already-resolved prefix: `halt`/`halt_error(n)` is
-                        // never caught by `?`, in path expressions any more than
-                        // in value position (#791), an invalid-path-expression
-                        // complaint survives `?` too (#530), a decode failure
-                        // does as well -- matching the sibling `Expr::Try` arm's
-                        // `is_uncatchable()` guard, since `expr?` is documented
-                        // sugar for `try expr` and the two must agree (#1746) --
-                        // and — only for a bare navigation primitive — so does
-                        // #843's "near attempt" complaint.
-                        Err((prefix, EvalEscape::Error(e)))
-                            if !(e.is_uncatchable()
-                                || (bare_navigation_primitive
-                                    && e.is_untracked_navigation_error())) =>
-                        {
-                            prefix
-                        }
-                        Err((prefix, EvalEscape::Break(_))) => prefix,
-                        Err(escape) => return Err(escape),
-                    };
-                Ok(branches
-                    .into_iter()
-                    .map(
-                        |PathBranch {
-                             path: components,
-                             value: v,
-                             trackable,
-                             snapshot,
-                             register,
-                         }| {
-                            let components = components.to_vec();
-                            let inner_path = if components.len() == 1 {
-                                components.into_iter().next().expect("len checked")
-                            } else {
-                                // Unreached *today*, and deliberately not a panic: the
-                                // postfix `?` attaches to a single path element until
-                                // #367, so `(.a.b)?`, `(..)?` and `recurse?` are parse
-                                // errors, and `E[K]?` — which used to arrive here with
-                                // its target's components attached — now goes to
-                                // `resolve_index_expr`. #367 reopens it on purpose:
-                                // `(.a[.k])?` resolves through the `Paren` arm to
-                                // `["a","b"]`, two components, and jq writes
-                                // `{"a":{"b":5},"k":"b"}` for it. `eval_generic` can
-                                // synthesize `Expr::Optional` around any expression
-                                // too, so this was never an invariant of the type.
-                                Expr::Pipe(components)
-                            };
-                            PathBranch {
-                                // Wrapping in `?` navigates nothing, so it
-                                // neither grants nor removes trackability —
-                                // nor, for the same reason, the snapshot
-                                // provenance a `$x` inside it carries (#1466).
-                                path: PathPrefix::from_components([Expr::Optional(Box::new(
-                                    inner_path,
-                                ))]),
-                                value: v,
-                                // Same reason as `trackable`/`snapshot`
-                                // above: `?` navigates nothing, so a live
-                                // path register survives it untouched
-                                // (#1573).
-                                register,
-                                trackable,
-                                snapshot,
-                            }
-                        },
-                    )
-                    .collect())
-            }
-        },
-
         Expr::IndexExpr { target, key } => {
             resolve_index_expr::<S>(target, key, value, false, trackable, frame, keep)
         }
@@ -28055,18 +27916,16 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
         // `&& !snapshot` (#1591): mirrors `getpath([])`'s own identical
         // carve-out just below — a deferred `$x` snapshot must reach the
         // recurse-specific arms below (which then correctly emit *self*
-        // with the mark intact, via `resolve_recurse`'s seed or
+        // with the mark intact, via `resolve_recurse_sink`'s seed or
         // `resolve_recursive_descent`'s root patch) rather than being
         // refused here before `f`/`cond` are ever even evaluated. Confirmed
         // live, `path(. as $x | reduce (1) as $i (0; $x | ..))` on
         // `{"a":1}` is `[[]]` in jq, not a refusal.
-        Expr::RecursiveDescent
-        | Expr::Builtin(
-            Builtin::Recurse
-            | Builtin::RecurseDown
-            | Builtin::RecurseF(_)
-            | Builtin::RecurseCond(_, _),
-        ) if !trackable && !snapshot.is_marked() => Err(recurse_untracked_error(value)),
+        Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown)
+            if !trackable && !snapshot.is_marked() =>
+        {
+            Err(recurse_untracked_error(value))
+        }
 
         // `..` fans out to every node in the tree (pre-order, self before
         // children), so each needs its own Field/Index chain rather than the
@@ -28076,7 +27935,7 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
         // Bare `recurse` *is* `..` — jq defines it as `recurse(.[]?)` and
         // `[recurse]` and `[..]` agree output for output, so this arm
         // handles both spellings identically. Sharing `..`'s resolver rather
-        // than routing `.[]?` through `resolve_recurse` is both simpler and
+        // than routing `.[]?` through `resolve_recurse_sink` is both simpler and
         // what keeps the components bare: resolving under a `?` wraps each
         // one in `Expr::Optional`, which the walkers that *write*
         // (`set_path_steps`, `update_path`, `delete_at_path`) then have to
@@ -28086,16 +27945,6 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
         // caught every recurse-family spelling otherwise.
         Expr::RecursiveDescent | Expr::Builtin(Builtin::Recurse | Builtin::RecurseDown) => {
             Ok(resolve_recursive_descent(value, trackable, snapshot))
-        }
-        // The parameterised spellings have no such shortcut: `f` is
-        // arbitrary, so the queue has to run — always `trackable` here too,
-        // same reason as just above. `resolve_recurse` itself asserts this
-        // rather than re-deriving it (#843 review).
-        Expr::Builtin(Builtin::RecurseF(f)) => {
-            resolve_recurse::<S>(f, None, value, trackable, snapshot, frame, keep)
-        }
-        Expr::Builtin(Builtin::RecurseCond(f, cond)) => {
-            resolve_recurse::<S>(f, Some(cond), value, trackable, snapshot, frame, keep)
         }
 
         // #844: a frozen variable snapshot from a statically-verified
@@ -28336,6 +28185,152 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
         }
 
         other => resolve_leaf::<S>(other, value, trackable, snapshot, keep),
+    }
+}
+
+/// [`resolve_node_sink`]'s `Expr::Optional` arm (`E?`, and `E[K]?`/`E[S:T]?`
+/// bare-index/slice sugar) — #2235: streams the generic case through
+/// `resolve_node_sink` instead of collecting via `resolve_node` first, so a
+/// `?`-wrapped generator (`.[]?`, `(f)?`) interleaves its own side effects
+/// with whatever drives it, the same demand-driven guarantee
+/// `drive_fold_source` gives a fold source that runs through one.
+///
+/// `E[K]?`/`E[S:T]?` only cover a failure to *index*/*slice* — evaluating
+/// `E`, `K`, `S`, or `T` is not covered (see `resolve_index_expr`'s doc
+/// comment, which the value-position evaluator already honors) — and
+/// neither one is itself a generator source (`resolve_index_expr`/
+/// `resolve_slice_expr` each resolve exactly one target), so there is
+/// nothing to stream at this arm; delivered through the existing Vec-based
+/// resolvers via [`drain_path_result`]. A parenthesised key/bound instead
+/// reaches the blanket arm below: `(.[.k])?` is `try .[.k]`, which catches
+/// everything inside it including the key, so `"str" | (.[.k])? = 5` is
+/// `"str"` there while `"str" | .[.k]? = 5` raises (#413) — jq's own
+/// distinction, not a limit of what parses.
+///
+/// Every other `?`-wrapped node (`.foo?`, `.[0]?`, ...): evaluation and
+/// indexing are the same step, so any failure anywhere underneath is the
+/// failure to index, and `?` covers all of it. A failure under `?` prunes
+/// just the error, keeping whatever was already streamed to `sink` before
+/// it (confirmed live: `(.a, .b[0])?` prints `["a"]` and silently stops) —
+/// except `invalid_path_expression` (#530), which `?` does not suppress in
+/// jq at all: it is a statement that the filter is not a path expression,
+/// not a value error raised while collecting one (confirmed live:
+/// `path(("a")?)` still raises in jq).
+///
+/// #843's "near attempt" error (`is_untracked_navigation_error`) has its
+/// own, narrower carve-out: `?` *does* usually suppress it (unlike #530's
+/// classic message) — except when `inner` is itself one of the four bare
+/// navigation primitives this error can come from (`Field`/`Index`/
+/// `Iterate`/`Slice`), i.e. a *bare* postfix `?` (`.b?`, not `(.b)?`).
+/// Confirmed live against jq 1.7.1: `path(try (.a, error(5)) catch .b?)`
+/// still raises "near attempt to access element \"b\" of 5" (exit 5), while
+/// the parenthesized `(.b)?` — which also reaches this same generic arm,
+/// since `Paren` isn't one of the primitives either — suppresses the very
+/// same error and prints only `["a"]`. A `break $label` is pruned the same
+/// unconditional way, regardless of which label it targets — jq's `?`/bare
+/// `try` (no `catch`) always intercepts a break passing through (confirmed
+/// live: `label $out | ((.a, break $out)?)` is `1` and exits 0, never
+/// reaching `$out`).
+///
+/// A branch that streams through successfully is wrapped in `Expr::Optional`
+/// — marking it as one `?` reached, for whatever downstream still wants to
+/// know that, but not an instruction to keep suppressing failures at write
+/// time; every wrapper is stripped again by `strip_resolved_optional` before
+/// any resolved path reaches `set_path`/`update_path`/`delete_at_path` or
+/// `path()`'s own output. That universal strip is also why a branch that
+/// streamed out ahead of an escape that turns out to *propagate* (rather
+/// than prune) needs no separate unwrapped code path here, unlike the old
+/// eager version's `Err(escape) => return Err(escape)` short-circuit: the
+/// wrapper never survives to be observed either way.
+fn resolve_optional_sink<'a, S: EvalSemantics>(
+    inner: &Expr,
+    value: &'a OwnedValue,
+    trackable: bool,
+    snapshot: &Snapshot,
+    frame: &Frame,
+    keep: Keep,
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
+    match inner {
+        Expr::IndexExpr { target, key } => drain_path_result(
+            resolve_index_expr::<S>(target, key, value, true, trackable, frame, keep),
+            sink,
+        ),
+        Expr::SliceExpr { target, start, end } => drain_path_result(
+            resolve_slice_expr::<S>(target, start, end, value, true, trackable, frame, keep),
+            sink,
+        ),
+        _ => {
+            let bare_navigation_primitive = matches!(
+                inner,
+                Expr::Field(_) | Expr::Index { .. } | Expr::Iterate | Expr::Slice { .. }
+            );
+            let flow = resolve_node_sink::<S>(
+                inner,
+                value,
+                trackable,
+                snapshot,
+                frame,
+                keep,
+                &mut |branch| sink(wrap_optional_branch(branch)),
+            );
+            match flow {
+                // Only a genuine collection failure prunes: `halt`/
+                // `halt_error(n)` is never caught by `?`, in path
+                // expressions any more than in value position (#791), an
+                // invalid-path-expression complaint survives `?` too (#530),
+                // a decode failure does as well -- matching the sibling
+                // `Expr::Try` arm's `is_uncatchable()` guard, since `expr?`
+                // is documented sugar for `try expr` and the two must agree
+                // (#1746) -- and, only for a bare navigation primitive, so
+                // does #843's "near attempt" complaint.
+                ResolveFlow::Escaped(EvalEscape::Error(e))
+                    if !(e.is_uncatchable()
+                        || (bare_navigation_primitive && e.is_untracked_navigation_error())) =>
+                {
+                    ResolveFlow::Exhausted
+                }
+                ResolveFlow::Escaped(EvalEscape::Break(_)) => ResolveFlow::Exhausted,
+                other => other,
+            }
+        }
+    }
+}
+
+/// Wrap a resolved branch's path in `Expr::Optional`, marking it as reached
+/// through a `?` — see [`resolve_optional_sink`]. Wrapping in `?` navigates
+/// nothing, so it neither grants nor removes trackability, nor, for the
+/// same reason, the snapshot provenance a `$x` inside it carries (#1466),
+/// nor a live path register (#1573) -- all three pass through unchanged.
+fn wrap_optional_branch(branch: PathBranch<'_>) -> PathBranch<'_> {
+    let PathBranch {
+        path: components,
+        value,
+        trackable,
+        snapshot,
+        register,
+    } = branch;
+    let components = components.to_vec();
+    let inner_path = if components.len() == 1 {
+        components.into_iter().next().expect("len checked")
+    } else {
+        // Unreached *today*, and deliberately not a panic: the postfix `?`
+        // attaches to a single path element until #367, so `(.a.b)?`,
+        // `(..)?` and `recurse?` are parse errors, and `E[K]?` — which used
+        // to arrive here with its target's components attached — now goes
+        // to `resolve_index_expr`. #367 reopens it on purpose: `(.a[.k])?`
+        // resolves through the `Paren` arm to `["a","b"]`, two components,
+        // and jq writes `{"a":{"b":5},"k":"b"}` for it. `eval_generic` can
+        // synthesize `Expr::Optional` around any expression too, so this
+        // was never an invariant of the type.
+        Expr::Pipe(components)
+    };
+    PathBranch {
+        path: PathPrefix::from_components([Expr::Optional(Box::new(inner_path))]),
+        value,
+        register,
+        trackable,
+        snapshot,
     }
 }
 
@@ -28697,7 +28692,7 @@ fn untracked_branches(
 /// a *trackable* or a *deferred-snapshot* value through, and structural
 /// descent can't change which one `value` was). `snapshot` is different:
 /// `..`'s own *first* output is `.` — no navigation at all — so it inherits
-/// whatever `value` already was (mirroring `resolve_recurse`'s own seed),
+/// whatever `value` already was (mirroring `resolve_recurse_sink`'s own seed),
 /// but every other node in the tree is reached by genuine Field/Index
 /// descent, which breaks the mark regardless of ambient —
 /// `push_recursive_branches` never sees `snapshot` at all, so it keeps
@@ -29453,7 +29448,7 @@ impl FoldRegister {
 /// Six places below this call launder an `Err` into a short `Ok` --
 /// `Expr::Optional`'s blanket arm, `resolve_catch`'s no-`catch` case,
 /// `Expr::Label` on a matching break, `resolve_bounded_sink`'s
-/// satisfied-bound fold to `Exhausted`, `resolve_recurse`'s
+/// satisfied-bound fold to `Exhausted`, `resolve_recurse_sink`'s
 /// `RECURSE_MAX_ITEMS` cap, and `resolve_repeat_sink`'s round cap. The
 /// values they deliver are a fold's values here, so anyone changing one of
 /// those is changing a fold's values too.
@@ -30510,9 +30505,18 @@ fn resolve_foreach<'a, S: EvalSemantics>(
             if update_branches.is_empty() {
                 (state_at_register, state_snapshot) = reg.branch_provenance(None);
             }
-            for update_branch in &update_branches {
-                (state_at_register, state_snapshot) = reg.branch_provenance(Some(update_branch));
-                state = update_branch.value.clone().into_owned();
+            let last_branch_index = update_branches.len().wrapping_sub(1);
+            for (branch_index, update_branch) in update_branches.iter().enumerate() {
+                // Only the *last* branch carries forward as the next
+                // element's state (see the comment above this loop) — the
+                // others are read straight off `update_branch` below for
+                // EXTRACT/emission, so cloning `state` for them too is pure
+                // waste, doubled (or worse) by every extra UPDATE output.
+                if branch_index == last_branch_index {
+                    (state_at_register, state_snapshot) =
+                        reg.branch_provenance(Some(update_branch));
+                    state = update_branch.value.clone().into_owned();
+                }
                 if let Some(ext_expr) = &substituted_extract {
                     if let Some(control) = charge_budget(&mut budget, "foreach") {
                         return stop_with_escape(&mut aborted, control);
@@ -30527,26 +30531,22 @@ fn resolve_foreach<'a, S: EvalSemantics>(
                     // `identical()` check (#1590).
                     let (extract_at_register, extract_snapshot) =
                         extract_reg.branch_provenance(Some(update_branch));
-                    match extract_reg.resolve::<S>(
-                        ext_expr,
-                        update_branch.value.clone().into_owned(),
-                        extract_at_register,
-                        &extract_snapshot,
-                        keep,
+                    match drain_path_result(
+                        extract_reg.resolve::<S>(
+                            ext_expr,
+                            update_branch.value.clone().into_owned(),
+                            extract_at_register,
+                            &extract_snapshot,
+                            keep,
+                        ),
+                        sink,
                     ) {
-                        Ok(branches) => {
-                            if emit_branches(branches, sink) == Demand::Stop {
-                                downstream_stopped = true;
-                                return Demand::Stop;
-                            }
+                        ResolveFlow::Stopped => {
+                            downstream_stopped = true;
+                            return Demand::Stop;
                         }
-                        Err((prefix, e)) => {
-                            if emit_branches(prefix, sink) == Demand::Stop {
-                                downstream_stopped = true;
-                                return Demand::Stop;
-                            }
-                            return stop_with_escape(&mut aborted, e.into());
-                        }
+                        ResolveFlow::Escaped(e) => return stop_with_escape(&mut aborted, e.into()),
+                        ResolveFlow::Exhausted => {}
                     }
                 } else {
                     let emitted = if update_branch.trackable {
@@ -30588,30 +30588,32 @@ fn resolve_foreach<'a, S: EvalSemantics>(
 }
 
 /// Apply `Expr::Try`'s `catch` clause (if any) after `expr` failed to
-/// resolve as a path, keeping `prefix` — whatever `expr` had already
-/// resolved before the failure — ahead of the handler's own output. Shared
-/// by `resolve_node`'s `Expr::Try` arm's `Error` and `Break` cases, which
-/// differ only in what `payload` binds to: the raised error's own value for
-/// an ordinary failure, `null` for a `break` (mirroring the value-position
-/// `eval_try`'s treatment of jq's internal break marker, since #562's rule
-/// is "catch catches break the same way it catches error").
+/// resolve as a path, streaming its output straight to `sink` (#2235) —
+/// `expr`'s own already-resolved branches reached `sink` directly through
+/// `resolve_node_sink` before this ever runs, so there is no separate
+/// prefix to thread here. Shared by `resolve_node_sink`'s `Expr::Try` arm's
+/// `Error` and `Break` cases, which differ only in what `payload` binds to:
+/// the raised error's own value for an ordinary failure, `null` for a
+/// `break` (mirroring the value-position `eval_try`'s treatment of jq's
+/// internal break marker, since #562's rule is "catch catches break the
+/// same way it catches error").
 ///
-/// A no-catch `try` (or bare `?`, sugar for one) keeps just `prefix`
-/// (confirmed live: `path(try (.a, .b[0]))` prints `["a"]` and stops).
-/// With a `catch`, `catch_expr` resolves as a path expression too, and its
-/// output is appended after `prefix` — `catch`'s handler runs in addition
-/// to, not instead of, whatever the failed body already resolved (confirmed
-/// live: `path(try (.a, .x[0]) catch empty)` on `{"a":1,"x":5}` prints
-/// `["a"]`, not nothing).
+/// A no-catch `try` (or bare `?`, sugar for one) resolves nothing further
+/// (confirmed live: `path(try (.a, .b[0]))` prints `["a"]` and stops). With
+/// a `catch`, `catch_expr` resolves as a path expression too, and its
+/// output streams after whatever `expr` already delivered — `catch`'s
+/// handler runs in addition to, not instead of, whatever the failed body
+/// already resolved (confirmed live: `path(try (.a, .x[0]) catch empty)` on
+/// `{"a":1,"x":5}` prints `["a"]`, not nothing).
 ///
 /// If `catch_expr` itself then fails — with an ordinary error (including
 /// #530's "Invalid path expression"), a `break` targeting some outer label,
-/// or a `halt`/`halt_error` — `prefix` (and whatever partial output the
-/// handler itself already resolved before its own failure) is threaded into
-/// the returned `Err` rather than dropped, matching every other arm in this
-/// resolver (`Expr::Comma`, `Expr::As`, ...) that already keeps its
-/// accumulated prefix on the error path (#832; before this fix, all three
-/// escape kinds silently discarded `prefix` here — confirmed live:
+/// or a `halt`/`halt_error` — whatever the handler itself already streamed
+/// to `sink` before its own failure stays delivered, and the escape
+/// propagates through the returned `ResolveFlow`, matching every other arm
+/// in this resolver (`Expr::Comma`, `Expr::As`, ...) that already keeps its
+/// accumulated prefix on the error path (#832; before that fix, all three
+/// escape kinds silently discarded the prefix here — confirmed live:
 /// `path(try (.a, .x[0]) catch "x")` on `{"a":1,"x":5}` dropped `["a"]`
 /// before raising `"x"`'s own #530 error, and
 /// `label $out | path(try (.a, break $out) catch error("y"))` on `{"a":1}`
@@ -30649,38 +30651,38 @@ fn resolve_foreach<'a, S: EvalSemantics>(
 /// that motivated the original eager check: `try (.a, error({y:99})) catch
 /// select(true) = "X"` still raises rather than silently replacing the
 /// whole document, caught now by `resolve_dynamic_indexes` instead of here.
-fn resolve_catch<'a, S: EvalSemantics>(
+///
+/// Streams through [`resolve_against_cow_sink`] rather than collecting via
+/// [`resolve_against_cow`] (#2235): a catch handler that itself iterates a
+/// generator (e.g. `try f catch (.[] | stderr)`) streams that generator's
+/// own side effects to `sink` one at a time instead of batching them all
+/// ahead of whatever consumes them — the same demand-driven guarantee
+/// `drive_fold_source` gives a fold source that runs through `try`/`catch`.
+fn resolve_catch_sink<'a, S: EvalSemantics>(
     catch: Option<&Expr>,
-    prefix: Vec<PathBranch<'a>>,
     payload: OwnedValue,
     frame: &Frame,
     keep: Keep,
-) -> PathResolveResult<'a> {
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
     let Some(catch_expr) = catch else {
-        return Ok(prefix);
+        return ResolveFlow::Exhausted;
     };
-    let mut out = prefix;
     // A caught error/break payload is never a snapshot (#1591): jq's own
     // handler binding is unrelated to any `$x` frozen elsewhere in scope.
-    match resolve_against_cow::<S>(
+    resolve_against_cow_sink::<S>(
         catch_expr,
         Cow::Owned(payload),
         false,
         &Snapshot::No,
         &frame.unknown(),
         keep,
-    ) {
-        Ok(branches) => out.extend(branches),
-        Err((branches, e)) => {
-            out.extend(branches);
-            return Err((out, e));
-        }
-    }
-    Ok(out)
+        sink,
+    )
 }
 
 /// Shared "defer the escape, queue what's left" step for `recurse`'s three
-/// stack-driven implementations (`resolve_recurse`,
+/// stack-driven implementations (`resolve_recurse_sink`,
 /// `builtin_recurse_f`/`builtin_recurse_cond`) (#842, extended to `cond`'s
 /// own fan-out by #854).
 ///
@@ -30719,7 +30721,7 @@ fn queue_recurse_children<T>(
 }
 
 /// Shared `recurse(f; cond)` "gate one child through `cond`" step used by
-/// both `resolve_recurse` (path position) and `builtin_recurse_cond` (value
+/// both `resolve_recurse_sink` (path position) and `builtin_recurse_cond` (value
 /// position) — #854 added the identical "evaluate `cond` via
 /// `eval_owned_multi_keep_partial`, fork-push each truthy output, defer any
 /// `cond` error" sequence to each function by hand (#897: extracted, the
@@ -30729,9 +30731,9 @@ fn queue_recurse_children<T>(
 /// `cond` is evaluated on `child` unconditionally — even when the caller
 /// won't end up queueing anything for it (`gate: false`) — because a
 /// `cond` error/side effect must still surface even for a node whose
-/// children are otherwise pruned from further recursion (`resolve_recurse`'s
+/// children are otherwise pruned from further recursion (`resolve_recurse_sink`'s
 /// `is_null_current` rule, #856). `gate` is the one real divergence between
-/// the two call sites: `resolve_recurse` passes `!is_null_current` since a
+/// the two call sites: `resolve_recurse_sink` passes `!is_null_current` since a
 /// null node's own line of descent ends there; `builtin_recurse_cond` has no
 /// such rule and always passes `true` — the two evaluators don't actually
 /// share a growth-bounding policy, just this evaluation step.
@@ -30759,7 +30761,7 @@ fn eval_recurse_cond<S: EvalSemantics>(
 }
 
 /// Item cap shared by every `recurse`-family explicit-stack walker
-/// (`resolve_recurse`, `builtin_recurse_f`, `builtin_recurse_cond`) — a
+/// (`resolve_recurse_sink`, `builtin_recurse_f`, `builtin_recurse_cond`) — a
 /// single definition so a future retuning can't silently miss one of the
 /// three copies it used to be (#1023 review of #1021, echoing #106's
 /// "duplicated predicates diverge silently").
@@ -30772,7 +30774,7 @@ const RECURSE_MAX_ITEMS: usize = 10000;
 /// loop short instead. This matches the pre-existing `MAX_ITEMS` silent-
 /// truncation convention everywhere else in this file, rather than
 /// surfacing an error whose presence would otherwise depend on where the
-/// arbitrary cap happened to land — see `resolve_recurse`'s own matching
+/// arbitrary cap happened to land — see `resolve_recurse_sink`'s own matching
 /// check for the fuller rationale (#842 review).
 #[inline]
 fn finish_recurse_walk<'a, W>(
@@ -30879,7 +30881,11 @@ fn finish_recurse_walk<'a, W>(
 /// forces that node's branch back to `Cow::Owned`, so it costs exactly what
 /// it always did — no regression, but no improvement either, since a real
 /// per-node computation dominates over the clone anyway.
-fn resolve_recurse<'a, S: EvalSemantics>(
+#[allow(clippy::too_many_arguments)] // STYLE-0004: `sink` joins the resolver's own established
+                                     // ambient-threading parameter list (#2235); a context struct
+                                     // just for this one call site would diverge from that
+                                     // convention.
+fn resolve_recurse_sink<'a, S: EvalSemantics>(
     f: &Expr,
     cond: Option<&Expr>,
     value: &'a OwnedValue,
@@ -30887,28 +30893,56 @@ fn resolve_recurse<'a, S: EvalSemantics>(
     snapshot: &Snapshot,
     frame: &Frame,
     keep: Keep,
-) -> PathResolveResult<'a> {
-    // Every caller in `resolve_node` already short-circuits on the shared
-    // recurse-family untracked guard before ever reaching here (#843's
-    // "recurse's first output is `.` itself" rule) — this loop should only
-    // ever run starting from a value already known-trackable, *or* one the
-    // guard deliberately deferred because it's a frozen `$x` snapshot
-    // (#1591 loosened the guard to `!trackable && !snapshot`, specifically
-    // so this function's own seed can still emit *self* with the mark
-    // intact). `trackable`/`snapshot` are threaded as real parameters (not
-    // just documented as an invariant in prose) specifically so this
-    // assertion can catch a future refactor of that guard silently letting
-    // a value through that is neither, instead of depending on every call
-    // site to keep re-deriving the same guarantee (review finding on #843:
-    // an invariant that only lives in a comment is one a later edit can
-    // quietly break).
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
+    // Every caller in `resolve_node_sink` already short-circuits on the
+    // shared recurse-family untracked guard before ever reaching here
+    // (#843's "recurse's first output is `.` itself" rule) — this loop
+    // should only ever run starting from a value already known-trackable,
+    // *or* one the guard deliberately deferred because it's a frozen `$x`
+    // snapshot (#1591 loosened the guard to `!trackable && !snapshot`,
+    // specifically so this function's own seed can still emit *self* with
+    // the mark intact). `trackable`/`snapshot` are threaded as real
+    // parameters (not just documented as an invariant in prose)
+    // specifically so this assertion can catch a future refactor of that
+    // guard silently letting a value through that is neither, instead of
+    // depending on every call site to keep re-deriving the same guarantee
+    // (review finding on #843: an invariant that only lives in a comment is
+    // one a later edit can quietly break).
     debug_assert!(
         trackable || snapshot.is_marked(),
-        "resolve_recurse called with trackable=false, snapshot=false; the \
-         untracked recurse-family guard in resolve_node should have caught \
+        "resolve_recurse_sink called with trackable=false, snapshot=false; the \
+         untracked recurse-family guard in resolve_node_sink should have caught \
          this first"
     );
-    let mut outputs: Vec<PathBranch<'a>> = Vec::new();
+    // #2235: each node is delivered to `sink` as soon as it is popped, and
+    // `f`/`cond` are resolved for a node only *after* that node's own
+    // delivery is accepted — never before, and never for a node whose
+    // delivery already stopped the walk — so a bounded consumer (`limit`,
+    // `first`, an enclosing fold's own early stop, including a stop that
+    // fires immediately off the seed itself) no longer pays for `f`/`cond`
+    // on any node it never asked to see, all the way down to the seed
+    // needing none at all: `path(limit(1; recurse(if (.|debug) < 3 then .+1
+    // else empty end)))` runs `debug` zero times in both jq and here, and
+    // `path(limit(2; ...))` (the same seed, needing one more output) runs it
+    // once in both — this function no longer runs it for every node up to
+    // `RECURSE_MAX_ITEMS` regardless of what was asked for, the way the
+    // collecting version always did.
+    //
+    // **What this does not close**: `f` is still resolved for one *accepted*
+    // node in full via `resolve_against_cow`, so if `f` is itself a
+    // multi-output generator, every one of that node's own outputs (and
+    // their side effects) fires even when a bounded consumer only ever asks
+    // for the first child's own subtree — confirmed live, `path(limit(2;
+    // recurse((.a|debug), (.b|debug))))` on `{"a":1,"b":2}` writes `debug`
+    // for `.a` only in jq (the second call's own child, `.b`, is never
+    // asked for once the bound is satisfied by `.a`'s own self-emission);
+    // here both fire. Real jq's `f | select(cond) | r` pulls `f`'s own
+    // outputs one at a time, fully recursing into each (`r`) before asking
+    // `f` for the next — closing this needs `f`'s own generator interleaved
+    // with this function's recursion, not just streamed delivery of what it
+    // already produced in one shot. See limitations.md.
+    let mut emitted = 0usize;
     // The seed is `.` itself -- no navigation -- so it inherits whatever
     // `value` already was (#1591), same as `resolve_recursive_descent`'s own
     // root entry. Every subsequent node on the stack comes from `f`, and
@@ -30923,7 +30957,7 @@ fn resolve_recurse<'a, S: EvalSemantics>(
     // error/break/halt — see that function's doc comment (#842).
     let mut pending_error: Option<EvalEscape> = None;
 
-    while !stack.is_empty() && outputs.len() < RECURSE_MAX_ITEMS {
+    while !stack.is_empty() && emitted < RECURSE_MAX_ITEMS {
         // `snapshot` is *not* uniformly `false` across this walk, though
         // this comment claimed it was until #1591. The seed is a
         // `PathBranch::new` (so `false`), but children come from `f`, and
@@ -30948,7 +30982,8 @@ fn resolve_recurse<'a, S: EvalSemantics>(
         // `current.clone()` is cheap (`Cow`, #668). `prefix` is a
         // `PathPrefix` (#701): `Rc::clone` is O(1), not the O(path length)
         // `Vec<Expr>` clone this used to pay per node.
-        outputs.push(PathBranch {
+        emitted += 1;
+        if sink(PathBranch {
             path: Rc::clone(&prefix),
             value: current.clone(),
             register: None,
@@ -30964,7 +30999,10 @@ fn resolve_recurse<'a, S: EvalSemantics>(
             // caller actually observes, so it is the one whose provenance a
             // downstream `FoldRegister` reads.
             snapshot: node_snapshot.clone(),
-        });
+        }) == Demand::Stop
+        {
+            return ResolveFlow::Stopped;
+        }
 
         let is_null_current = matches!(current.as_ref(), OwnedValue::Null);
 
@@ -31104,11 +31142,14 @@ fn resolve_recurse<'a, S: EvalSemantics>(
 
     // Same pending_error/stack-drain rule `finish_recurse_walk` documents
     // (#842, #1023) — can't share that helper directly, since this returns
-    // `PathResolveResult`, not `QueryResult`.
+    // `ResolveFlow`, not `QueryResult`. Hitting `RECURSE_MAX_ITEMS` with the
+    // stack still non-empty silently truncates without raising
+    // `pending_error`, exactly as the collecting version always did — not
+    // this change's rule to revisit.
     if stack.is_empty() {
-        path_result(outputs, pending_error)
+        flow_result(pending_error)
     } else {
-        Ok(outputs)
+        ResolveFlow::Exhausted
     }
 }
 
@@ -37077,7 +37118,7 @@ fn builtin_recurse_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // output is visited as one node (not spliced into its elements)
         // (#490). Pushed reversed so the first child stays on top and its
         // whole subtree completes before the next sibling is reached
-        // (#635) — see `resolve_recurse`'s doc comment for the general
+        // (#635) — see `resolve_recurse_sink`'s doc comment for the general
         // shape this mirrors. An error aborts the whole traversal, same as
         // jq's `def r: ., (f | r); r;` (#636) — but not until whatever `f`
         // itself already produced at this node has had its own full
@@ -37116,7 +37157,7 @@ fn builtin_recurse_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// (`f`'s children, with `cond`'s fork flattened in encounter order) into a
 /// local `next` buffer, then pushes `next` onto the stack reversed, so the
 /// first entry — and its whole subtree — is visited before the next one
-/// (#635). See `resolve_recurse`'s doc comment for the same mechanism
+/// (#635). See `resolve_recurse_sink`'s doc comment for the same mechanism
 /// spelled out in more depth.
 ///
 /// An error from `f` or `cond` aborts the whole traversal (#636), but not
@@ -37159,7 +37200,7 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         let (children, mut deferred_error) = eval_owned_multi_keep_partial::<S>(f, &current);
 
         // Collected in encounter order, then pushed onto `stack` reversed —
-        // see `resolve_recurse`'s doc comment (#635) — so the first entry's
+        // see `resolve_recurse_sink`'s doc comment (#635) — so the first entry's
         // whole subtree completes before the next is reached.
         let mut next: Vec<OwnedValue> = Vec::new();
         for child in children {
@@ -37168,9 +37209,9 @@ fn builtin_recurse_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // rather than discarding `next`'s already-approved siblings from
             // earlier in this same loop (#854) — see `eval_recurse_cond`'s
             // own doc comment (#897) for the shared mechanics, and
-            // `resolve_recurse`'s matching arm for the full jq 1.7.1
+            // `resolve_recurse_sink`'s matching arm for the full jq 1.7.1
             // confirmation. No `is_null_current`-style gate here: unlike
-            // `resolve_recurse`, this evaluator has no such rule, so `cond`
+            // `resolve_recurse_sink`, this evaluator has no such rule, so `cond`
             // always gates for real (`gate: true`).
             if let Some(e) = eval_recurse_cond::<S>(cond, &child, true, || {
                 next.push(child.clone());
@@ -79774,8 +79815,8 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_recurse_keeps_f_partial_fanout_before_error_842() {
-        // Issue #842's path-position repro (`resolve_recurse`, no `cond`).
+    fn test_resolve_recurse_sink_keeps_f_partial_fanout_before_error_842() {
+        // Issue #842's path-position repro (`resolve_recurse_sink`, no `cond`).
         // Confirmed against real jq 1.7.1:
         // `echo '{"a":1,"b":2}' | jq -c 'path(recurse(if . ==
         // {"a":1,"b":2} then (.a, .b[0]) else empty end))'` prints `[]`
@@ -79793,7 +79834,7 @@ mod tests {
     #[test]
     fn test_resolve_recurse_cond_keeps_f_partial_fanout_before_error_842() {
         // Same as the previous test, but with `cond` present (always `true`,
-        // so it never itself gates or errors) — exercises `resolve_recurse`'s
+        // so it never itself gates or errors) — exercises `resolve_recurse_sink`'s
         // `Some(cond)` arm through the same deferred-error path.
         assert_eq!(
             outputs(
@@ -79858,8 +79899,8 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_recurse_max_items_truncation_suppresses_a_pending_error_842() {
-        // Path-position sibling of the previous test: `resolve_recurse`'s
+    fn test_resolve_recurse_sink_max_items_truncation_suppresses_a_pending_error_842() {
+        // Path-position sibling of the previous test: `resolve_recurse_sink`'s
         // own `stack.is_empty()` check (its `else` branch, hit only when
         // `MAX_ITEMS` truncates the drain before a `pending_error` would
         // otherwise surface) needs the same coverage as
@@ -79882,7 +79923,7 @@ mod tests {
 
     /// #1023: cross-check that `finish_recurse_walk`'s `stack_is_empty` gate
     /// (now shared by `builtin_recurse_f`/`builtin_recurse_cond`) and
-    /// `resolve_recurse`'s own independent `stack.is_empty()` gate still
+    /// `resolve_recurse_sink`'s own independent `stack.is_empty()` gate still
     /// agree on the MAX_ITEMS-truncates-a-pending-error edge case, rather
     /// than relying only on the two sibling tests above individually
     /// matching their own hand-picked expectations -- an invariant test
@@ -79962,7 +80003,7 @@ mod tests {
 
     #[test]
     fn test_resolve_recurse_cond_keeps_already_approved_siblings_before_error_854() {
-        // Path-position sibling of the previous test (`resolve_recurse`'s
+        // Path-position sibling of the previous test (`resolve_recurse_sink`'s
         // `Some(cond)` arm). Confirmed against real jq 1.7.1:
         // `echo '[1,2,3]' | jq -c 'path(recurse(if type=="array" then .[]
         // else empty end; if . == 2 then error("boom") else true end))'`
@@ -80105,7 +80146,7 @@ mod tests {
 
     #[test]
     fn test_resolve_recurse_cond_keeps_already_approved_siblings_before_break_854() {
-        // Path-position counterpart of the previous test (`resolve_recurse`'s
+        // Path-position counterpart of the previous test (`resolve_recurse_sink`'s
         // `Some(cond)` arm) -- the value-position case above was covered,
         // but the path-tracking evaluator's own `break` handling through the
         // same deferred-`cond_err` mechanism wasn't separately pinned.
@@ -80190,7 +80231,7 @@ mod tests {
 
     #[test]
     fn test_resolve_recurse_cond_max_items_truncation_suppresses_a_pending_error_854() {
-        // Path-position sibling of the previous test: `resolve_recurse`'s
+        // Path-position sibling of the previous test: `resolve_recurse_sink`'s
         // own `stack.is_empty()` check needs the same coverage when the
         // deferred error is sourced from `cond` rather than `f`.
         let large_doc = format!(
@@ -80208,7 +80249,7 @@ mod tests {
 
     #[test]
     fn test_resolve_recurse_cond_and_builtin_recurse_cond_agree_897() {
-        // #897: `resolve_recurse`'s `Some(cond)` arm and `builtin_recurse_cond`
+        // #897: `resolve_recurse_sink`'s `Some(cond)` arm and `builtin_recurse_cond`
         // share their per-child "gate through cond, fork on truthy outputs"
         // step via `eval_recurse_cond` (extracted here) -- this test is the
         // "cross-implementation invariant test" the issue itself suggested as
@@ -84852,12 +84893,12 @@ mod tests {
         );
     }
 
-    /// #1591: `resolve_recurse` dropped the `snapshot` mark from `f`'s own
+    /// #1591: `resolve_recurse_sink` dropped the `snapshot` mark from `f`'s own
     /// output at three sites, and — beyond what that issue's own repro
     /// needed — the mark was never threaded as *ambient input* through
     /// `resolve_node`'s dispatch at all, so every "passes a value through
     /// without navigating" arm (`select`, the typeof filters, a no-key
-    /// `getpath([])`, an already-untracked bare `.`, and `resolve_recurse`'s
+    /// `getpath([])`, an already-untracked bare `.`, and `resolve_recurse_sink`'s
     /// own seed/`..`'s own root entry) rebuilt its branch as a plain
     /// computed one instead of inheriting whatever `value` already was.
     /// Fixed by giving `snapshot` the same ambient-parameter treatment
@@ -84900,11 +84941,11 @@ mod tests {
             // navigation) — bounded with `limit(1; ...)` to isolate that
             // one output from `.a`'s own genuinely-navigated child (which
             // no longer matches `$x` and *should* still refuse; see
-            // `test_resolve_recurse_field_navigation_into_snapshot_wording_gap_1591`).
+            // `test_resolve_recurse_sink_field_navigation_into_snapshot_wording_gap_1591`).
             // The shared recurse-family untracked guard (`resolve_node`'s
             // own `RecursiveDescent | Recurse | RecurseDown | RecurseF |
             // RecurseCond` arm) used to refuse *any* untracked value
-            // unconditionally, before `resolve_recurse`'s own seed or
+            // unconditionally, before `resolve_recurse_sink`'s own seed or
             // `resolve_recursive_descent`'s root patch ever got a chance to
             // recognise a deferred snapshot — closed by loosening the guard
             // to `!trackable && !snapshot`, the same carve-out
@@ -85026,7 +85067,7 @@ mod tests {
     }
 
     /// A narrow, cosmetic gap the guard-loosening above exposed rather than
-    /// caused: `resolve_recurse` was previously unreachable with an
+    /// caused: `resolve_recurse_sink` was previously unreachable with an
     /// untracked seed at all (its own `debug_assert!` required
     /// `trackable`), so nothing ever exercised what happens when `f`
     /// *itself* fails to navigate from one. Both sides still refuse (exit
@@ -85039,13 +85080,13 @@ mod tests {
     /// that function's own doc comment). `$x` reestablishes against the
     /// fold's register (the document root), so `recurse(.a?)` now runs with
     /// genuine `trackable: true` instead of hitting `resolve_leaf`'s
-    /// untracked-`Field` guard before `resolve_recurse` is ever reached —
+    /// untracked-`Field` guard before `resolve_recurse_sink` is ever reached —
     /// and *that* is what produces jq's own `#530` "with result 1" wording
     /// (`.a` on `$x`'s value, `1`, is not itself a further path-shaped
     /// value) instead of `#843`'s "near attempt" message. Confirmed live
     /// against jq 1.7.1: byte-identical message and exit code.
     #[test]
-    fn test_resolve_recurse_field_navigation_into_snapshot_wording_gap_1591() {
+    fn test_resolve_recurse_sink_field_navigation_into_snapshot_wording_gap_1591() {
         query!(br#"{"a":1}"#,
             "path(. as $x | reduce (1) as $i (0; $x | recurse(.a?)))",
             QueryResult::Error(e) => {
