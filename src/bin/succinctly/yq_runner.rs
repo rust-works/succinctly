@@ -2964,25 +2964,6 @@ fn static_nav_steps(expr: &Expr) -> Option<Vec<TreeStep<'_>>> {
     }
 }
 
-/// [`static_nav_steps`], but with an `Expr::Identity` arm resolving to the
-/// empty path (`comment_tree_at_path_mut(tree, &[])` returns `tree` itself,
-/// unchanged) — used only by the `#798` metadata-assignment write path
-/// below, never by [`propagate_assign_alias_marks`]. Unlike an alias mark
-/// (which can never survive at the root, per `static_nav_steps`'s own doc
-/// comment), a root-level metadata write is real: live-verified against
-/// pinned yq, `. anchor = "z"` and `. line_comment = "q"` both succeed and
-/// are readable back via pipe (`. anchor = "z" | anchor` => `"z"`), even
-/// though only `style` actually renders at the root today (`. style =
-/// "flow"` => `{a: 1}`; `line_comment`/`anchor` set but don't visibly
-/// render there) — pinning that inconsistency, not "fixing" it into
-/// uniformity, since it's what the oracle itself does.
-fn meta_assign_target_steps(expr: &Expr) -> Option<Vec<TreeStep<'_>>> {
-    match expr {
-        Expr::Identity => Some(Vec::new()),
-        _ => static_nav_steps(expr),
-    }
-}
-
 /// Extract `expr`'s `(path, value)` pairs when its shape is a plain
 /// [`Expr::Assign`] (`=`), or a [`Expr::Pipe`] containing one or more such
 /// assigns applied in order (`.c = .b | .d = .c`), unwrapping
@@ -3110,29 +3091,71 @@ fn propagate_assign_alias_marks(expr: &Expr, tree: &mut CommentTree) {
     }
 }
 
+/// One step of the path a resolved `Expr::MetaAssign` write (#798) addresses
+/// in a result document -- owned rather than borrowed from the AST like
+/// [`TreeStep`], because it comes out of evaluating `path(TARGET)` against
+/// the document, not out of the target's syntax. That is what lets `.[]`,
+/// `..`, `.a[-1]` and a computed `.[(.i)]` resolve at every candidate the
+/// same way a static `.a.b` does (real yq writes every candidate:
+/// `.[] line_comment = "hi"` on `a: 1\nb: 2` => `a: 1 # hi` / `b: 2 # hi`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MetaPathStep {
+    Key(String),
+    Index(usize),
+}
+
 /// The concrete effect of one resolved `Expr::MetaAssign` write (#798),
-/// computed once against the pristine document by [`resolve_meta_assign_writes`]
-/// before any per-result `CommentTree` exists to mutate. `steps` addresses
-/// the target via [`meta_assign_target_steps`] (root-aware, unlike
-/// `static_nav_steps`).
-enum ResolvedMetaWrite<'e> {
-    /// `None` clears the comment -- an empty-string RHS, matching
-    /// `comments=""`'s clearing behaviour (live-verified against pinned yq:
-    /// `.a line_comment = ""` on `a: 1 # x` => `a: 1`).
-    LineComment(Vec<TreeStep<'e>>, Option<String>),
-    Style(Vec<TreeStep<'e>>, &'static str),
+/// computed once by [`resolve_meta_assign_writes`] before any per-result
+/// `CommentTree` exists to mutate.
+enum MetaEffect {
+    /// The stored comment text (see [`meta_comment_text`]), or `None` to
+    /// clear -- an empty-string RHS, matching `comments=""`'s clearing
+    /// behaviour (live-verified against pinned yq: `.a line_comment = ""`
+    /// on `a: 1 # x` => `a: 1`).
+    LineComment(Option<String>),
+    Style(&'static str),
     /// `None` clears the anchor (live-verified: `.a anchor = ""` on
     /// `a: &z 1` => `a: 1`).
-    Anchor(Vec<TreeStep<'e>>, Option<String>),
+    Anchor(Option<String>),
+}
+
+/// One resolved metadata write: which node, and what to do to it.
+struct ResolvedMetaWrite {
+    path: Vec<MetaPathStep>,
+    effect: MetaEffect,
+}
+
+/// The three [`MetaSlot`]s this write pass can actually apply. `tag`/
+/// `head_comment`/`foot_comment`/`comments` already error from
+/// `eval_meta_assign` (`src/jq/eval.rs`) during the real evaluation this
+/// pass runs *before* -- nothing to resolve for them here, and reporting
+/// again would double the diagnostic.
+#[derive(Clone, Copy)]
+enum WritableSlot {
+    LineComment,
+    Style,
+    Anchor,
+}
+
+impl WritableSlot {
+    fn of(slot: MetaSlot) -> Option<Self> {
+        match slot {
+            MetaSlot::LineComment => Some(Self::LineComment),
+            MetaSlot::Style => Some(Self::Style),
+            MetaSlot::Anchor => Some(Self::Anchor),
+            MetaSlot::Tag | MetaSlot::HeadComment | MetaSlot::FootComment | MetaSlot::Comments => {
+                None
+            }
+        }
+    }
 }
 
 /// Real yq's accepted `style =` vocabulary, live-verified against pinned
-/// v4.53.3 (`unknown style bogus` for anything else, `a: |-\n  1` / `a: >-\n
-/// 1` / `a: !!int 1` for `literal`/`folded`/`tagged` respectively -- all
-/// real, rendering features there). `literal`/`folded`/`tagged` are
-/// accepted here to match that vocabulary even though succinctly's own
-/// emitter (`yaml_quote_string_with_style`) only actually changes rendering
-/// for `flow`/`single`/`double` today -- see this issue's entry in
+/// v4.53.3 (`unknown style bogus` for anything else). `literal`/`folded`/
+/// `tagged` are in the vocabulary but not in [`RENDERABLE_STYLES`]: real yq
+/// renders all three (`a: |-\n  1` / `a: >-\n  1` / `a: !!int 1`),
+/// succinctly's emitter can't yet, so they are refused explicitly rather
+/// than accepted and silently ignored -- see this issue's entry in
 /// `docs/compliance/yq/limitations.md`.
 fn validate_style(s: &str) -> Option<&'static str> {
     match s {
@@ -3147,195 +3170,510 @@ fn validate_style(s: &str) -> Option<&'static str> {
     }
 }
 
-/// Resolve every `Expr::MetaAssign` in `expr` (through `Paren`/`Optional`/
-/// `Pipe`, mirroring [`collect_assign_chain`]'s own limited descent -- a
-/// pass-through stage like `select(...)`/`del(...)` between two writes
-/// can't itself contain one, so it's simply skipped rather than recursed
-/// into) into a list of concrete writes, evaluating each RHS against
-/// `root_value` up front -- before any per-result `CommentTree` exists,
-/// since `=`/`|=`'s RHS here never depends on which specific result
-/// document is being produced (comment/style/anchor don't fork the value
-/// the way a real `set_path` write would).
+/// The subset of [`validate_style`]'s vocabulary the DOM emitter
+/// (`emit_yaml_value_at_depth`/`yaml_quote_string_with_style`) has a real
+/// rendering arm for.
+const RENDERABLE_STYLES: &[&str] = &["", "flow", "double", "single"];
+
+/// The text a `line_comment = s` write stores in `NodeMeta.comment`, or
+/// `None` for a clearing write.
 ///
-/// Returns `None` if anything failed (already reported via `sink`) -- the
-/// caller must then suppress the whole result, matching real yq's own
-/// "error, no document printed" contract (e.g. `unknown style bogus`). A
-/// non-static target path is *not* an error: it's silently skipped, the
-/// same limitation `propagate_assign_alias_marks`/`static_nav_steps` already
-/// document for other write forms.
-fn resolve_meta_assign_writes<'e>(
-    expr: &'e Expr,
-    root_value: &OwnedValue,
-    sink: &mut ErrorSink,
-) -> Option<Vec<ResolvedMetaWrite<'e>>> {
-    let mut out = Vec::new();
-    collect_meta_assigns(expr, root_value, sink, &mut out).then_some(out)
+/// `NodeMeta.comment` holds the raw trailing text *with* its leading `# `
+/// (see `line_comment_raw_checked`'s own `strip_prefix("# ")` on the read
+/// side, and [`trailing_comment_suffix`], which adds only the separating
+/// space) -- not bare text. A multi-line `s` is stored one rendered comment
+/// line per `\n`, exactly as real yq's go-yaml emitter renders it
+/// (live-verified against pinned v4.53.3, every rule below):
+///
+/// - a line already starting with `#` is kept verbatim (`"#raw"` renders
+///   `a: 1 #raw`, not `# #raw`); any other non-empty line gets `# `
+///   (`"  #x"` renders `#   #x`);
+/// - an empty line stays empty (`"m\n\nl"` renders a blank line between the
+///   two comment lines, not `#`);
+/// - trailing newlines are dropped (`"m\n"` and `"m\n\n"` both render
+///   `# m`), a leading one is not (`"\nl"` renders an empty first line, so
+///   the value's line ends in the separating space alone);
+/// - `""` clears.
+///
+/// The per-line indentation and real yq's blank line before a top-level
+/// continuation are the emitter's business -- see [`trailing_comment_suffix`].
+fn meta_comment_text(s: &str) -> Option<String> {
+    let s = s.trim_end_matches('\n');
+    if s.is_empty() {
+        return None;
+    }
+    Some(
+        s.split('\n')
+            .map(|line| {
+                if line.is_empty() || line.starts_with('#') {
+                    line.to_string()
+                } else {
+                    format!("# {line}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
 }
 
-fn collect_meta_assigns<'e>(
-    expr: &'e Expr,
+/// The anchor name an `anchor = s` write declares (`None` clears), or real
+/// yq's own refusal for a name its emitter cannot write.
+///
+/// The rule is go-yaml's emitter check as measured on pinned v4.53.3, not
+/// YAML 1.2's anchor grammar: every printable ASCII byte is accepted
+/// (`x+y`, `x/y`, `x@y`, `x?y`, `x'y`, `x"y`, `x#y`, `&x`, `*x`, ... all
+/// emit) except the flow indicators `,`/`[`/`]`/`{`/`}`, the mapping
+/// indicator `:`, and whitespace; a non-ASCII name (`ü`, `€`) is refused
+/// too. Refusing matters: the emitter would otherwise write `&bad name 1`
+/// for `"bad name"` and change the value on read-back.
+fn meta_anchor_name(s: &str) -> Result<Option<String>, EvalError> {
+    if s.is_empty() {
+        return Ok(None);
+    }
+    let valid = s
+        .bytes()
+        .all(|b| b.is_ascii_graphic() && !matches!(b, b',' | b'[' | b']' | b'{' | b'}' | b':'));
+    if valid {
+        Ok(Some(s.to_string()))
+    } else {
+        // Real yq's exact text, doubled `yaml: ` prefix included.
+        Err(EvalError::new(
+            "yaml: yaml: anchor value must contain valid characters only",
+        ))
+    }
+}
+
+/// The plain (unquoted) YAML spelling of a non-string scalar, or `None` for
+/// a string or a container. Used by a `style = "double"`/`"single"` write
+/// to turn the scalar *into* that string, which is what real yq's output
+/// amounts to (live-verified: `.a style = "double"` on `a: 1` / `a: true` /
+/// `a: null` / `a: 1.50` / `a: 1e3` prints `"1"` / `"true"` / `"null"` /
+/// `"1.50"` / `"1e3"` -- the source spelling, quoted -- and the result
+/// reads back as a string in both tools). Done to the value rather than in
+/// the emitter so that an *existing* non-string scalar whose cursor reports
+/// a quoted style (`a: !!int "5"`, #747) keeps rendering as it does today.
+fn plain_scalar_text(value: &OwnedValue) -> Option<String> {
+    match value {
+        OwnedValue::Null => Some("null".to_string()),
+        OwnedValue::Bool(b) => Some(b.to_string()),
+        OwnedValue::Int(n) => Some(n.to_string()),
+        OwnedValue::Float(f) if f.is_nan() || f.is_infinite() => {
+            Some(nonfinite_display_string::<YqSemantics>(*f).to_string())
+        }
+        OwnedValue::Float(f) => Some(format_float_yq_yaml(*f)),
+        OwnedValue::NumberLiteral(_, literal) => Some(literal.to_string()),
+        OwnedValue::String(_) | OwnedValue::Array(_) | OwnedValue::Object(_) => None,
+    }
+}
+
+/// The [`MetaPathStep`] path named by one output of `path(TARGET)`, or
+/// `None` for a path component that isn't a key or an index. A negative
+/// index is resolved against the array it indexes in `current` (`.a[-1]`
+/// on `a: [1, 2]` is `["a", 1]`; real yq writes the last element), and
+/// stays unresolvable -- `None` -- when there is no array there yet or it
+/// is too short.
+fn meta_path_from_value(path: &OwnedValue, current: &OwnedValue) -> Option<Vec<MetaPathStep>> {
+    let OwnedValue::Array(steps) = path else {
+        return None;
+    };
+    let mut out = Vec::with_capacity(steps.len());
+    for step in steps {
+        let step = match step {
+            OwnedValue::String(k) => MetaPathStep::Key(k.clone()),
+            OwnedValue::Int(i) if *i >= 0 => MetaPathStep::Index(*i as usize),
+            OwnedValue::Int(i) => {
+                let Some(OwnedValue::Array(items)) = owned_value_at(current, &out) else {
+                    return None;
+                };
+                MetaPathStep::Index(usize::try_from(items.len() as i64 + *i).ok()?)
+            }
+            _ => return None,
+        };
+        out.push(step);
+    }
+    Some(out)
+}
+
+/// Navigate `value` by a [`MetaPathStep`] path.
+fn owned_value_at<'v>(value: &'v OwnedValue, path: &[MetaPathStep]) -> Option<&'v OwnedValue> {
+    let mut node = value;
+    for step in path {
+        node = match (node, step) {
+            (OwnedValue::Object(fields), MetaPathStep::Key(k)) => fields.get(k)?,
+            (OwnedValue::Array(items), MetaPathStep::Index(i)) => items.get(*i)?,
+            _ => return None,
+        };
+    }
+    Some(node)
+}
+
+/// [`owned_value_at`], mutably.
+fn owned_value_at_mut<'v>(
+    value: &'v mut OwnedValue,
+    path: &[MetaPathStep],
+) -> Option<&'v mut OwnedValue> {
+    let mut node = value;
+    for step in path {
+        node = match (node, step) {
+            (OwnedValue::Object(fields), MetaPathStep::Key(k)) => fields.get_mut(k)?,
+            (OwnedValue::Array(items), MetaPathStep::Index(i)) => items.get_mut(*i)?,
+            _ => return None,
+        };
+    }
+    Some(node)
+}
+
+/// [`evaluate_input`], but reporting nothing: `None` for any uncaught
+/// error/`break`/`halt` (a partial result counts as one), `Some(outputs)`
+/// otherwise. For the metadata write pass's own re-evaluation of pipe
+/// stages the real evaluation is about to run anyway -- whatever fails
+/// there is reported *there*, once, not a second time here.
+fn evaluate_input_quiet(input: &OwnedValue, expr: &jq::Expr) -> Option<Vec<OwnedValue>> {
+    let json_str = input.to_json_for_reindex::<jq::JqSemantics>();
+    let json_bytes = json_str.as_bytes();
+    let index = JsonIndex::build(json_bytes);
+    let cursor = index.root(json_bytes);
+    match jq::eval::<Vec<u64>, YqSemantics>(expr, cursor) {
+        QueryResult::One(v) => generic_to_owned(&v).ok().map(|v| vec![v]),
+        QueryResult::OneCursor(c) => generic_to_owned(&c.value()).ok().map(|v| vec![v]),
+        QueryResult::Many(vs) => vs
+            .iter()
+            .map(generic_to_owned)
+            .collect::<Result<_, _>>()
+            .ok(),
+        QueryResult::None => Some(Vec::new()),
+        QueryResult::Owned(v) => Some(vec![v]),
+        QueryResult::ManyOwned(vs) => Some(vs),
+        QueryResult::Error(_)
+        | QueryResult::Break(_)
+        | QueryResult::Halt(_)
+        | QueryResult::Partial(..) => None,
+    }
+}
+
+/// How many `Expr::MetaAssign` nodes `expr` contains anywhere, so
+/// [`resolve_meta_assign_writes`] can tell a top-level pipe stage it
+/// resolved from one buried somewhere it doesn't descend (a `reduce` body,
+/// an `as` binding's body, a `def`, ...) and refuse the latter out loud
+/// rather than silently leaving it a no-op.
+fn count_meta_assigns(expr: &Expr) -> usize {
+    let mut count = 0;
+    jq::walk::any_subexpr(expr, &mut |e| {
+        if matches!(e, Expr::MetaAssign { .. }) {
+            count += 1;
+        }
+        false
+    });
+    count
+}
+
+/// The top-level pipe stages of `expr`, flattened through `Paren`/
+/// `Optional`/`Shared` and a leading `def`'s `then` -- the same shapes
+/// [`is_alias_sensitive_assign`]'s `is_shape_preserving` sees through, so a
+/// metadata write it admitted is a stage here.
+fn flatten_pipe_stages<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
+    match expr {
+        Expr::Paren(inner) | Expr::Optional(inner) => flatten_pipe_stages(inner, out),
+        Expr::Shared(inner) => flatten_pipe_stages(inner, out),
+        Expr::Pipe(stages) => stages.iter().for_each(|s| flatten_pipe_stages(s, out)),
+        Expr::FuncDef { then, .. } => flatten_pipe_stages(then, out),
+        _ => out.push(expr),
+    }
+}
+
+/// Whether a pipe stage passes its input through as its output unchanged,
+/// so [`resolve_meta_assign_writes`] needn't re-evaluate it to know the
+/// document the next stage sees -- and, for `debug`, *mustn't*: its side
+/// effect would print a second time.
+fn is_value_identity_stage(stage: &Expr) -> bool {
+    matches!(
+        stage,
+        Expr::Identity | Expr::Builtin(Builtin::Debug | Builtin::DebugMsg(_))
+    )
+}
+
+/// Resolve every `Expr::MetaAssign` pipe stage of `expr` into concrete
+/// writes, evaluating each stage's target paths and right-hand side against
+/// the document *that stage* sees -- `root_value` for the first stage, and
+/// after that the (first) output of re-evaluating each preceding stage,
+/// so `.a = 2 | .b line_comment = (.a | tostring)` writes `# 2` and `.a = 2
+/// | .a line_comment |= . + "x"` writes `# 2x`, as in real yq (both
+/// live-verified). Resolved before any per-result `CommentTree` exists,
+/// since comment/style/anchor never depend on which result document is
+/// being produced (unlike a real `set_path` write) and a validation
+/// failure has to suppress the whole result the way real yq's own "error,
+/// no document printed" contract does.
+///
+/// Returns `None` if anything failed (already reported via `sink`) -- the
+/// caller must then suppress the whole result. Three things are *not*
+/// failures: a target that resolves to no candidate at all (`.a[]` on a
+/// scalar, `.zz[]`; a no-op in real yq too), a right-hand side that yields
+/// nothing (`select(false)`; same), and a target or earlier stage whose
+/// evaluation errors -- the real evaluation reports that, so the pass just
+/// stops resolving there.
+///
+/// A metadata write anywhere *other* than a top-level pipe stage (inside a
+/// `reduce`/`foreach` body, an `as` binding's body, a `def`, ...) is refused
+/// explicitly: this pass can't see the document such a write would run
+/// against, and a silent no-op is the one outcome #798's own triage ruled
+/// out.
+fn resolve_meta_assign_writes(
+    expr: &Expr,
     root_value: &OwnedValue,
     sink: &mut ErrorSink,
-    out: &mut Vec<ResolvedMetaWrite<'e>>,
-) -> bool {
-    match expr {
-        Expr::Paren(inner) | Expr::Optional(inner) => {
-            collect_meta_assigns(inner, root_value, sink, out)
-        }
-        Expr::Pipe(stages) => stages
-            .iter()
-            .all(|stage| collect_meta_assigns(stage, root_value, sink, out)),
-        Expr::MetaAssign {
+) -> Option<Vec<ResolvedMetaWrite>> {
+    let total = count_meta_assigns(expr);
+    if total == 0 {
+        return Some(Vec::new());
+    }
+    let mut stages = Vec::new();
+    flatten_pipe_stages(expr, &mut stages);
+    let top_level = stages
+        .iter()
+        .filter(|s| matches!(s, Expr::MetaAssign { .. }))
+        .count();
+    if top_level != total {
+        sink.report(
+            DiagStyle::Yq,
+            &EvalError::new(
+                "metadata assignment (line_comment/style/anchor = ...) is only supported as a \
+                 top-level pipe stage",
+            ),
+            &no_location(),
+        );
+        return None;
+    }
+    let last_meta = stages
+        .iter()
+        .rposition(|s| matches!(s, Expr::MetaAssign { .. }))
+        .unwrap_or(0);
+
+    let mut out = Vec::new();
+    let mut current = std::borrow::Cow::Borrowed(root_value);
+    for (i, stage) in stages.iter().enumerate() {
+        if let Expr::MetaAssign {
             target,
             slot,
             value,
             is_update,
-        } => resolve_one_meta_assign(target, *slot, value, *is_update, root_value, sink, out),
-        _ => true,
+        } = stage
+        {
+            if !resolve_one_meta_assign(target, *slot, value, *is_update, &current, sink, &mut out)
+            {
+                return None;
+            }
+        }
+        if i >= last_meta {
+            break;
+        }
+        if !is_value_identity_stage(stage) {
+            match evaluate_input_quiet(&current, stage).and_then(|vs| vs.into_iter().next()) {
+                Some(next) => current = std::borrow::Cow::Owned(next),
+                None => break,
+            }
+        }
     }
+    Some(out)
 }
 
-/// Resolves one `Expr::MetaAssign` node into zero or one [`ResolvedMetaWrite`]
-/// pushed onto `out`. Returns `false` (after reporting via `sink`) only on a
-/// genuine validation failure; a non-static path or an empty RHS is a silent
-/// no-op (`true`, nothing pushed), matching this file's other write-pass
-/// conventions.
-fn resolve_one_meta_assign<'e>(
-    target: &'e Expr,
+/// Resolve one `Expr::MetaAssign` stage against `current`, the document it
+/// runs on, pushing one [`ResolvedMetaWrite`] per candidate onto `out`.
+/// Returns `false` (after reporting via `sink`) only on a genuine
+/// validation failure -- see [`resolve_meta_assign_writes`] for the
+/// non-failures.
+fn resolve_one_meta_assign(
+    target: &Expr,
     slot: MetaSlot,
     value: &Expr,
     is_update: bool,
-    root_value: &OwnedValue,
+    current: &OwnedValue,
     sink: &mut ErrorSink,
-    out: &mut Vec<ResolvedMetaWrite<'e>>,
+    out: &mut Vec<ResolvedMetaWrite>,
 ) -> bool {
-    // Tag/HeadComment/FootComment/Comments already error from
-    // `eval_meta_assign` (`src/jq/eval.rs`) during the real evaluation this
-    // early pass runs *before* -- nothing to resolve here, and reporting
-    // again here would double the diagnostic.
-    if !matches!(
-        slot,
-        MetaSlot::LineComment | MetaSlot::Style | MetaSlot::Anchor
-    ) {
-        return true;
-    }
-
-    let Some(steps) = meta_assign_target_steps(target) else {
+    let Some(slot) = WritableSlot::of(slot) else {
         return true;
     };
 
-    // A *written* root `line_comment` never renders in real yq, even though
-    // it's readable back through a pipe (`. line_comment = "q" | line_comment`
-    // => `"q"`, live-verified) -- unlike an *existing* root comment read
-    // straight from the source document, which round-trips through identity
-    // exactly as #710 already handles (`a: 1 # existing` | `.` =>
-    // `a: 1 # existing`, `output_value`'s own root-comment append). Real
-    // yq's `&anchor`/`style` writes at root both *do* render (`. anchor =
-    // "z"` => `&z`; `. style = "flow"` => `{a: 1}`), so this is specific to
-    // `line_comment`, not a general "root writes are inert" rule -- pinning
-    // the asymmetry rather than reconciling it. Since this write pass has no
-    // read-after-write model at all (the `line_comment` GET-form still reads
-    // the original cursor, not this file's `CommentTree`, so within one pipe
-    // `. line_comment = "q" | line_comment` doesn't yet return `"q"` either
-    // -- a real gap, recorded in `docs/compliance/yq/limitations.md`), simply
-    // never writing this slot at the root reproduces the observed output
-    // without inventing new emitter logic for a case that has no visible
-    // effect anyway.
-    if slot == MetaSlot::LineComment && steps.is_empty() {
+    // `path(TARGET)` names every candidate, creating nothing -- the real
+    // evaluation's `TARGET |= .` (see `eval_meta_assign`) is what pads a
+    // missing key/index into existence, and it names the same paths.
+    let path_expr = Expr::Builtin(Builtin::Path(Box::new(target.clone())));
+    let Some(paths) = evaluate_input_quiet(current, &path_expr) else {
+        return true;
+    };
+    let paths: Vec<Vec<MetaPathStep>> = paths
+        .iter()
+        .filter_map(|p| meta_path_from_value(p, current))
+        .collect();
+    if paths.is_empty() {
         return true;
     }
 
-    // `=` evaluates its RHS once against root; `|=` binds `.` to the
-    // target's own current value instead -- live-verified against pinned
-    // yq: `.a line_comment |= . + "-suffix"` on `a: 5 # x` => `# 5-suffix`,
-    // not `# x-suffix` (the slot's *old* text, which `|=` never sees here).
+    // Every slot coerces its right-hand side to text first, never requiring
+    // a string outright (live-verified against pinned yq: `.a style = 5` =>
+    // `unknown style 5`, `.a style = true` => `unknown style true`, `.a
+    // style = {}` => `unknown style {}` -- always coerced, then checked).
+    let stringify = Expr::Pipe(vec![value.clone(), Expr::Builtin(Builtin::ToString)]);
     let reports_before = sink.report_count();
-    let rhs_input = if is_update {
-        let targets = evaluate_input(root_value, target, sink).unwrap_or_default();
-        // omni-dev: coverage tolerate reason="unreachable via any expressible filter: `target` only reaches here once `meta_assign_target_steps` (above) has already accepted it as a static Field/Index(literal)/Paren/Optional/Pipe chain -- and re-evaluating that exact shape through `evaluate_input` never reports through `sink`, since yq's own navigation semantics silently yield nothing (not an error) for a type mismatch (live-verified: `.a[0]`/`.a.b` on a scalar `a` both exit 0 with no output, in both pinned yq and succinctly). Kept for symmetry with the RHS-value error check just below, which *is* reachable (`value` is an arbitrary filter, not steps-restricted) (#798)"
-        if sink.report_count() != reports_before {
-            return false;
-        }
-        // omni-dev: coverage end
-        let Some(first) = targets.into_iter().next() else {
-            return true;
-        };
-        first
-    } else {
-        root_value.clone()
-    };
-
-    match slot {
-        // Style shares LineComment/Anchor's stringify-first approach rather
-        // than requiring an `OwnedValue::String` outright (live-verified
-        // against pinned yq: `.a style = 5` => `unknown style 5`, `.a style =
-        // true` => `unknown style true`, `.a style = {}` => `unknown style
-        // {}` -- real yq always coerces to text and rejects it against the
-        // style vocabulary, never a separate "must be a string" type error).
-        MetaSlot::Style | MetaSlot::LineComment | MetaSlot::Anchor => {
-            let stringify = Expr::Pipe(vec![value.clone(), Expr::Builtin(Builtin::ToString)]);
-            let results = evaluate_input(&rhs_input, &stringify, sink).unwrap_or_default();
+    let mut texts = Vec::with_capacity(paths.len());
+    if is_update {
+        // `|=` binds `.` to each candidate's own current value -- not the
+        // slot's old text (`a: 5 # x` + `.a line_comment |= . + "-suffix"`
+        // => `# 5-suffix`, live-verified); a candidate the real evaluation
+        // is about to create reads as `null` here, as it does there.
+        for path in paths {
+            let candidate = owned_value_at(current, &path)
+                .cloned()
+                .unwrap_or(OwnedValue::Null);
+            let results = evaluate_input(&candidate, &stringify, sink).unwrap_or_default();
             if sink.report_count() != reports_before {
                 return false;
             }
-            let Some(OwnedValue::String(s)) = results.into_iter().next() else {
-                return true;
-            };
-            if slot == MetaSlot::Style {
-                let Some(style) = validate_style(&s) else {
+            if let Some(OwnedValue::String(s)) = results.into_iter().next() {
+                texts.push((path, s));
+            }
+        }
+    } else {
+        // `=` evaluates its right-hand side once, against the stage's own
+        // input; a multi-output right-hand side keeps its first output
+        // (`.a line_comment = ("x","y")` => `# x`, live-verified).
+        let results = evaluate_input(current, &stringify, sink).unwrap_or_default();
+        if sink.report_count() != reports_before {
+            return false;
+        }
+        let Some(OwnedValue::String(s)) = results.into_iter().next() else {
+            return true;
+        };
+        texts.extend(paths.into_iter().map(|path| (path, s.clone())));
+    }
+
+    for (path, s) in texts {
+        let effect = match slot {
+            WritableSlot::Style => match validate_style(&s) {
+                Some(style) if RENDERABLE_STYLES.contains(&style) => MetaEffect::Style(style),
+                Some(style) => {
+                    sink.report(
+                        DiagStyle::Yq,
+                        &EvalError::new(format!("style = \"{style}\" is not yet supported")),
+                        &no_location(),
+                    );
+                    return false;
+                }
+                None => {
                     sink.report(
                         DiagStyle::Yq,
                         &EvalError::new(format!("unknown style {s}")),
                         &no_location(),
                     );
                     return false;
-                };
-                out.push(ResolvedMetaWrite::Style(steps, style));
-            } else if slot == MetaSlot::LineComment {
-                // `NodeMeta.comment` stores the raw trailing text *with*
-                // its leading `# ` (see `line_comment_raw_checked`'s own
-                // `strip_prefix("# ")` on the read side, and this file's
-                // `format!(" {c}")` render site, which adds only the
-                // separating space) -- not bare text.
-                let text = (!s.is_empty()).then(|| format!("# {s}"));
-                out.push(ResolvedMetaWrite::LineComment(steps, text));
-            } else {
-                let text = (!s.is_empty()).then_some(s);
-                out.push(ResolvedMetaWrite::Anchor(steps, text));
-            }
-        }
-        MetaSlot::Tag | MetaSlot::HeadComment | MetaSlot::FootComment | MetaSlot::Comments => {
-            // omni-dev: coverage tolerate reason="unreachable: the `matches!` gate above (`slot` must be LineComment/Style/Anchor) already returns `true` for these four slots before this match is reached, so this arm exists only for the outer match's exhaustiveness (#798)"
-            unreachable!("filtered above")
-            // omni-dev: coverage end
-        }
+                }
+            },
+            WritableSlot::LineComment => MetaEffect::LineComment(meta_comment_text(&s)),
+            WritableSlot::Anchor => match meta_anchor_name(&s) {
+                Ok(name) => MetaEffect::Anchor(name),
+                Err(e) => {
+                    sink.report(DiagStyle::Yq, &e, &no_location());
+                    return false;
+                }
+            },
+        };
+        out.push(ResolvedMetaWrite { path, effect });
     }
     true
 }
 
-/// Apply every resolved write from [`resolve_meta_assign_writes`] into one
-/// result document's `CommentTree`, mutating each target's `NodeMeta`
-/// directly -- mirrors `propagate_assign_alias_marks`'s own "mutate in
-/// place, never replace the node wholesale" rule (comment/style/anchor live
-/// in this side-tree, not on the value the JSON/YAML write already
-/// replaced).
-fn apply_meta_assign_writes(writes: &[ResolvedMetaWrite<'_>], tree: &mut CommentTree) {
+/// [`comment_tree_at_path_mut`], but growing `tree` to reach a node the
+/// value tree has and the comment tree doesn't yet (#798): the real
+/// evaluation's `TARGET |= .` (see `eval_meta_assign`) creates a missing
+/// `.a.b` as `a: {b: null}`, and the reconciled tree for that fresh value
+/// stops at a leaf for `a` -- so a key step into a leaf makes it an
+/// object, an index step into a leaf makes it an array, and a missing
+/// field/element is added with empty metadata, exactly what the emitter
+/// assumes for a node it has no metadata for. A genuine mismatch (a key
+/// step into an array node, or the reverse) is still `None`.
+fn comment_tree_at_path_or_create_mut<'t>(
+    tree: &'t mut CommentTree,
+    steps: &[TreeStep<'_>],
+) -> Option<&'t mut CommentTree> {
+    let mut node = tree;
+    for step in steps {
+        if let CommentTree::Leaf(_) = node {
+            let meta = core::mem::take(node.meta_mut());
+            *node = match step {
+                TreeStep::Key(_) => CommentTree::Object(meta, IndexMap::new(), IndexMap::new()),
+                TreeStep::Index(_) => CommentTree::Array(meta, Vec::new()),
+            };
+        }
+        node = match (node, step) {
+            (CommentTree::Object(_, fields, _), TreeStep::Key(k)) => fields
+                .entry((*k).to_string())
+                .or_insert_with(|| CommentTree::Leaf(NodeMeta::empty())),
+            (CommentTree::Array(_, items), TreeStep::Index(i)) => {
+                if items.len() <= *i {
+                    items.resize_with(*i + 1, || CommentTree::Leaf(NodeMeta::empty()));
+                }
+                &mut items[*i]
+            }
+            _ => return None,
+        };
+    }
+    Some(node)
+}
+
+/// Apply every write from [`resolve_meta_assign_writes`] into one result
+/// document, mutating each target's `NodeMeta` directly -- mirrors
+/// `propagate_assign_alias_marks`'s own "mutate in place, never replace the
+/// node wholesale" rule. `value` is needed alongside `tree` for the two
+/// rules real yq decides by the target's *value*, both live-verified:
+///
+/// - a `line_comment` written onto a block-rendered container is dropped
+///   (`.a line_comment = "y"` on `a:\n  b: 1` prints it unchanged; so does
+///   a block root, and a scalar root, which never renders one), while a
+///   flow or empty container keeps it on its one line (`a: {b: 1} # y`,
+///   `a: [] # y`) -- the emitter's own [`defers_to_own_block`] is exactly
+///   that split;
+/// - `style = "double"`/`"single"` on a non-string scalar turns it into the
+///   quoted string, see [`plain_scalar_text`].
+///
+/// A path that doesn't exist in this result (a later `del` in the pipe, or
+/// a candidate the reconciled tree has no node for) is skipped.
+fn apply_meta_assign_writes(
+    writes: &[ResolvedMetaWrite],
+    value: &mut OwnedValue,
+    tree: &mut CommentTree,
+) {
     for write in writes {
-        match write {
-            ResolvedMetaWrite::LineComment(steps, text) => {
-                if let Some(node) = comment_tree_at_path_mut(tree, steps) {
-                    node.meta_mut().comment.clone_from(text);
+        let steps: Vec<TreeStep<'_>> = write
+            .path
+            .iter()
+            .map(|s| match s {
+                MetaPathStep::Key(k) => TreeStep::Key(k.as_str()),
+                MetaPathStep::Index(i) => TreeStep::Index(*i),
+            })
+            .collect();
+        let Some(node_value) = owned_value_at_mut(value, &write.path) else {
+            continue;
+        };
+        let Some(node) = comment_tree_at_path_or_create_mut(tree, &steps) else {
+            continue;
+        };
+        match &write.effect {
+            MetaEffect::LineComment(text) => {
+                if defers_to_own_block(node_value, node) {
+                    continue;
                 }
+                node.meta_mut().comment.clone_from(text);
             }
-            ResolvedMetaWrite::Style(steps, style) => {
-                if let Some(node) = comment_tree_at_path_mut(tree, steps) {
-                    node.meta_mut().style = style;
+            MetaEffect::Style(style) => {
+                if matches!(*style, "double" | "single") {
+                    if let Some(plain) = plain_scalar_text(node_value) {
+                        *node_value = OwnedValue::String(plain);
+                    }
                 }
+                node.meta_mut().style = style;
             }
-            ResolvedMetaWrite::Anchor(steps, text) => {
-                if let Some(node) = comment_tree_at_path_mut(tree, steps) {
-                    node.meta_mut().anchor = text.clone().map(AnchorMark::Declares);
-                }
+            MetaEffect::Anchor(name) => {
+                node.meta_mut().anchor = name.clone().map(AnchorMark::Declares);
             }
         }
     }
@@ -3410,14 +3748,16 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     };
 
     // Resolve every `PATH <slot> = value` / `PATH <slot> |= filter` (#798)
-    // in `expr` against the pristine document, before evaluation begins --
-    // comment/style/anchor never depend on which result document is being
-    // produced (unlike a real `set_path` write), so there's exactly one
-    // answer to compute regardless of how many results `expr` yields, and
-    // computing it now lets a validation failure (`unknown style bogus`)
-    // suppress the whole result the same way `sink.materialize`'s other
-    // early returns in this function already do, matching real yq's own
-    // "error, no document printed" contract for this case.
+    // in `expr` before evaluation begins, starting from the pristine
+    // document and re-evaluating each earlier pipe stage to reach the
+    // document each write actually sees -- comment/style/anchor never
+    // depend on which result document is being produced (unlike a real
+    // `set_path` write), so there's exactly one answer to compute
+    // regardless of how many results `expr` yields, and computing it now
+    // lets a validation failure (`unknown style bogus`) suppress the whole
+    // result the same way `sink.materialize`'s other early returns in this
+    // function already do, matching real yq's own "error, no document
+    // printed" contract for this case.
     let resolved_meta_writes = match presentation_sync_ctx.as_ref() {
         Some((pristine, _)) => match resolve_meta_assign_writes(expr, pristine, sink) {
             Some(writes) => writes,
@@ -3657,8 +3997,8 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     // whether or not the document has any `&anchor`/`*alias` in it at all.
     if !resolved_meta_writes.is_empty() {
         if let Ok(docs) = &mut docs {
-            for (_value, comments) in docs.iter_mut() {
-                apply_meta_assign_writes(&resolved_meta_writes, comments);
+            for (value, comments) in docs.iter_mut() {
+                apply_meta_assign_writes(&resolved_meta_writes, value, comments);
             }
         } // omni-dev: coverage tolerate-line reason="unreachable: every arm of the `match result { .. }` above that assigns `docs` (L3492-3622) constructs `Ok(..)` -- none ever produces `Err`, so this `if let`'s implicit else can't be taken; symmetric to L1625's `?` (#798)"
     }
@@ -4067,7 +4407,7 @@ fn output_value<W: Write>(
         // data to tell the two cases apart.
         let output = if matches!(value, OwnedValue::Array(_) | OwnedValue::Object(_)) {
             if is_flow_safe(value, comments) {
-                format!("{body}{}", trailing_comment_suffix(comments))
+                format!("{body}{}", trailing_comment_suffix(comments, ""))
             } else {
                 append_own_comment_line(body, comments.own(), "")
             }
@@ -4212,8 +4552,32 @@ fn anchor_decl_prefix(comments: &CommentTree) -> String {
 /// convention shared by every `emit_yaml_value` call site that appends one
 /// *on the same line* as the rest of the value (safe only when that value
 /// renders as a single line — a scalar, or an empty/flow-style container).
-fn trailing_comment_suffix(comments: &CommentTree) -> String {
-    comments.own().map_or_else(String::new, |c| format!(" {c}"))
+///
+/// A multi-line comment (one `line_comment = "m\nl"` write can store one,
+/// #798 — see [`meta_comment_text`] for the stored shape) puts its first
+/// line there and every further line on its own line at `indent`, the
+/// indent of the line the value sits on (its key's, or its `- `'s). One
+/// real-yq quirk on top, live-verified against pinned v4.53.3: at the top
+/// level (`indent` empty) go-yaml inserts a blank line before the
+/// continuation (`a: 1 # m` / blank / `# l`), and nowhere else (`  b: 1 #
+/// m` / `  # l`). An empty stored line stays empty rather than indented.
+fn trailing_comment_suffix(comments: &CommentTree, indent: &str) -> String {
+    let Some(comment) = comments.own() else {
+        return String::new();
+    };
+    let mut lines = comment.split('\n');
+    let mut out = format!(" {}", lines.next().unwrap_or_default());
+    for (i, line) in lines.enumerate() {
+        if i == 0 && indent.is_empty() {
+            out.push('\n');
+        }
+        out.push('\n');
+        if !line.is_empty() {
+            out.push_str(indent);
+            out.push_str(line);
+        }
+    }
+    out
 }
 
 /// Append a container's own trailing comment (#710/#793) as a standalone
@@ -4229,7 +4593,17 @@ fn trailing_comment_suffix(comments: &CommentTree) -> String {
 /// collide.
 fn append_own_comment_line(body: String, own_comment: Option<&str>, indent: &str) -> String {
     match own_comment {
-        Some(c) => format!("{body}\n{indent}{c}"),
+        // Line by line, for the multi-line shape a `line_comment =` write
+        // can store (#798): each stored line is already a complete comment
+        // line (or empty), so it only needs the indent.
+        Some(c) => c.split('\n').fold(body, |mut acc, line| {
+            acc.push('\n');
+            if !line.is_empty() {
+                acc.push_str(indent);
+                acc.push_str(line);
+            }
+            acc
+        }),
         None => body,
     }
 }
@@ -4471,7 +4845,7 @@ fn emit_yaml_value_at_depth(
                                 depth + 1,
                                 &val_indent,
                             );
-                            let comment_suffix = trailing_comment_suffix(elem_comments);
+                            let comment_suffix = trailing_comment_suffix(elem_comments, indent);
                             let anchor = anchor_decl_prefix(elem_comments);
                             format!("{indent}-{anchor} {item}{comment_suffix}")
                         }
@@ -4520,7 +4894,7 @@ fn emit_yaml_value_at_depth(
                     .map(|(k, v)| {
                         let key = yaml_quote_key(k);
                         let field_comments = comments.field(k);
-                        let comment_suffix = trailing_comment_suffix(field_comments);
+                        let comment_suffix = trailing_comment_suffix(field_comments, indent);
                         // #1485: steps from `recursion_base`, not `indent`
                         // -- see `compact_child_indent`'s own doc comment.
                         let val_indent =

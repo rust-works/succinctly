@@ -23458,26 +23458,22 @@ fn meta_slot_keyword(slot: MetaSlot) -> &'static str {
 /// so that evaluation can't happen here without the target's resolved value
 /// in hand anyway.
 ///
-/// So at this layer the value tree is simply untouched. Naively reusing
-/// `eval_assign::<W, S>(target, target, input, optional)` (assigning
-/// `target` to itself) looked like a free way to inherit its path
-/// resolution/forking for `?`, but it also inherits `=`'s *value-forking*
-/// rule: real jq's `PATH = VALUE` forks the whole document once per RHS
-/// *output*, not once per LHS path, and `target` is itself the RHS here --
-/// so a multi-valued target like `.[]` (two paths, `.a`/`.b`) evaluates
-/// `target` as the RHS too, gets two RHS outputs, and forks into a `[1,1]`/
-/// `[2,2]`-shaped mess instead of leaving `[1,2]` untouched (caught live:
-/// `.[] line_comment = "hi"` on `a: 1\nb: 2` corrupted the document into
-/// `a: 2\nb: 2`). Real yq's own contract for a multi-candidate metadata
-/// write is exactly one *unchanged* document, comments/style/anchor added at
-/// every candidate (live-verified: `.[] line_comment = "hi"` => `a: 1 # hi`
-/// / `b: 1 # hi`... `b: 2 # hi`, still two distinct values). So instead:
-/// evaluate `target` purely to let a genuinely erroring/`break`ing/`halt`ing
-/// path still propagate (`error("boom") style = "x"` must still raise), then
-/// discard whatever it produced and return `input` untouched, exactly once,
-/// regardless of how many candidates `target` found -- `resolve_meta_assign_writes`
-/// in `yq_runner.rs` is what actually applies the write, at every resolved
-/// candidate, into the `CommentTree` side-table.
+/// What this layer *does* do to the value tree is exactly what real yq's
+/// path traversal does for any assignment-family operator: it walks to
+/// every candidate, **creating** whatever is missing on the way, and leaves
+/// each candidate's value as it was -- live-verified against pinned yq:
+/// `.a line_comment = "y"` on `b: 1` prints `a: null # y`, `.a.b
+/// line_comment = "y"` on `c: 1` prints `a:\n  b: null # y`, and `.a[2]
+/// line_comment = "y"` on `a: [1]` pads two `null`s. That is precisely
+/// `PATH |= .`, so the value-tree half is delegated to [`eval_update`] with
+/// an identity filter: same candidate resolution, same creation rule, same
+/// yq-mode no-op for `.[]` on a scalar, and the same error/`break`/`halt`
+/// propagation for a genuinely failing target (`error("boom") style = "x"`
+/// still raises). An identity `|=` never forks the document however many
+/// candidates the target has (`.[] line_comment = "hi"` on `a: 1\nb: 2`
+/// stays two distinct values, as in yq) -- unlike the `=` form, whose
+/// per-RHS-output forking corrupted a multi-candidate target when an earlier
+/// draft reused `eval_assign` here.
 ///
 /// `tag`/`head_comment`/`foot_comment`/`comments` have no write mechanism in
 /// succinctly yet (`NodeMeta` has no tag slot, #747; head/foot comments have
@@ -23491,15 +23487,8 @@ fn eval_meta_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     match slot {
         MetaSlot::LineComment | MetaSlot::Style | MetaSlot::Anchor => {
-            match eval_single::<W, S>(target, input.clone(), optional) {
-                QueryResult::Error(e) => suppress_or_raise(e, optional),
-                QueryResult::Break(label) => QueryResult::Break(label),
-                QueryResult::Halt(code) => QueryResult::Halt(code),
-                QueryResult::Partial(_, Control::Error(e)) => suppress_or_raise(e, optional),
-                QueryResult::Partial(_, Control::Break(label)) => QueryResult::Break(label),
-                QueryResult::Partial(_, Control::Halt(code)) => QueryResult::Halt(code),
-                _ => QueryResult::One(input),
-            }
+            let identity = Expr::Identity;
+            eval_update::<W, S>(target, &identity, input, optional, true)
         }
         MetaSlot::Tag | MetaSlot::HeadComment | MetaSlot::FootComment | MetaSlot::Comments => {
             suppress_or_raise(
