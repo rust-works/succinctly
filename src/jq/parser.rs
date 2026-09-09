@@ -1538,6 +1538,10 @@ impl<'a> Parser<'a> {
             // Dot-based expressions
             Some('.') => {
                 self.next();
+                // Where the `.` itself ended -- `skip_ws` moving past here
+                // is what makes `. style = ...` a root metadata write (#798)
+                // rather than a field access, see below.
+                let dot_end = self.pos;
                 self.skip_ws();
 
                 // Check for `..` (recursive descent)
@@ -1575,11 +1579,24 @@ impl<'a> Parser<'a> {
                 // above), so without this check the keyword would be
                 // swallowed here as an ordinary field name before
                 // `parse_assignment`'s own metadata-op lookahead ever gets a
-                // chance to see it. Only fires when the keyword really is
+                // chance to see it.
+                //
+                // The whitespace is the discriminator, exactly as in real
+                // yq's lexer: `.style = 2` (no gap) is an ordinary write to
+                // a field named `style`, `. style = "flow"` (gap) is the
+                // root's own style. Without the `pos > dot_end` guard every
+                // top-level key named after one of the seven keywords broke
+                // (`.style = 2` raised `unknown style 2`, `.comments = []`
+                // raised "not yet supported", and `.anchor = "x"` /
+                // `.line_comment = "x"` silently discarded the write --
+                // caught in review). Only fires when the keyword really is
                 // followed by `=`/`|=` -- `. style` alone (no operator that
                 // follows) is still the ordinary GET-form field access
                 // `.style`, unchanged.
-                if self.mode == ParserMode::Yq && self.peeks_meta_op_keyword_then_assign() {
+                if self.mode == ParserMode::Yq
+                    && self.pos > dot_end
+                    && self.peeks_meta_op_keyword_then_assign()
+                {
                     return Ok(Expr::Identity);
                 }
 

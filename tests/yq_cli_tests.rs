@@ -13603,6 +13603,9 @@ fn test_line_comment_builtin_710() -> Result<()> {
 mod meta_assign_798 {
     use super::{run_yq_stdin, run_yq_stdin_with_stderr};
     use anyhow::Result;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use tempfile::NamedTempFile;
 
     #[test]
     fn line_comment_assign_sets_a_new_trailing_comment() -> Result<()> {
@@ -13705,10 +13708,10 @@ mod meta_assign_798 {
         Ok(())
     }
 
-    /// Root (`.`) targets: `anchor`/`style` render at the document root,
-    /// `line_comment` does not -- both live-verified against pinned yq,
-    /// which is itself asymmetric here (not a succinctly gap; see this
-    /// issue's `docs/compliance/yq/limitations.md` entry).
+    /// Root (`.`) targets: `anchor`/`style` render at the document root;
+    /// `line_comment` on a block-rendered root does not, in either tool
+    /// (real yq drops a line comment written onto any block container --
+    /// see `line_comment_on_a_container_follows_yqs_block_vs_flow_rule`).
     #[test]
     fn root_anchor_and_style_assign_render_but_root_line_comment_does_not() -> Result<()> {
         let (out, code) = run_yq_stdin(". anchor = \"z\"", "a: 1\n", &[])?;
@@ -13784,19 +13787,381 @@ mod meta_assign_798 {
         }
     }
 
-    /// A metadata assignment doesn't touch the JSON/YAML value tree at all
-    /// -- confirms the regression the naive "self-assign via `eval_assign`"
-    /// implementation attempt caused: forking per RHS output corrupted a
-    /// multi-candidate target's *values* (`.[] line_comment = "hi"` on
-    /// `a: 1\nb: 2` briefly became `a: 2\nb: 2`). Values must stay intact
-    /// even where the (out-of-scope-for-PR1) multi-candidate write itself
-    /// isn't applied.
+    /// A multi-candidate target writes every candidate and leaves every
+    /// value intact (live-verified against pinned yq). Also confirms the
+    /// regression the naive "self-assign via `eval_assign`" implementation
+    /// attempt caused: forking per RHS output corrupted the *values*
+    /// (`.[] line_comment = "hi"` on `a: 1\nb: 2` briefly became
+    /// `a: 2\nb: 2`).
     #[test]
-    fn multi_candidate_target_never_corrupts_the_document_values() -> Result<()> {
+    fn multi_candidate_target_writes_every_candidate_without_forking() -> Result<()> {
         let (out, code) = run_yq_stdin(".[] line_comment = \"hi\"", "a: 1\nb: 2\n", &[])?;
         assert_eq!(code, 0);
-        assert!(out.contains("a: 1"), "stdout: {out:?}");
-        assert!(out.contains("b: 2"), "stdout: {out:?}");
+        assert_eq!(out, "a: 1 # hi\nb: 2 # hi\n");
+
+        // `..` (recursive descent) and a piped target resolve the same way,
+        // through `path(TARGET)` rather than a static syntactic walk.
+        let (out, code) = run_yq_stdin(".. style = \"\"", "a: \"x\"\nb:\n  c: \"y\"\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "a: x\nb:\n  c: y\n");
+
+        let (out, code) = run_yq_stdin("(.a | .) line_comment = \"y\"", "a: 1\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "a: 1 # y\n");
+
+        // `.a[-1]` resolves against the array's length; `.a[]` on a scalar
+        // has no candidates and is a no-op, as in yq.
+        let (out, code) = run_yq_stdin(".a[-1] anchor = \"z\"", "a:\n  - 1\n  - 2\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "a:\n  - 1\n  - &z 2\n");
+
+        let (out, code) = run_yq_stdin(".a[] line_comment = \"x\"", "a: 1\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "a: 1\n");
+        Ok(())
+    }
+
+    /// Every top-level key named after one of the seven metadata keywords
+    /// must keep parsing as a field write: the whitespace after `.` is the
+    /// discriminator (`. style = ...` is the root's style, `.style = ...` is
+    /// a field named `style`), exactly as in real yq's lexer. Before the
+    /// gate, `.style = 2` raised `unknown style 2`, `.comments = []` raised
+    /// "not yet supported", and `.anchor = "x"`/`.line_comment = "x"`
+    /// silently discarded the write (caught in review).
+    #[test]
+    fn field_named_after_a_metadata_keyword_is_still_a_field_write() -> Result<()> {
+        for (filter, input, expected) in [
+            (".style = 2", "style: 1\n", "style: 2\n"),
+            (".style |= . + 1", "style: 1\n", "style: 2\n"),
+            (".tag = \"x\"", "tag: 1\n", "tag: x\n"),
+            (".anchor = \"x\"", "anchor: 1\n", "anchor: x\n"),
+            (".comments = []", "comments: 1\n", "comments: []\n"),
+            (
+                ".line_comment = \"x\"",
+                "line_comment: 1\n",
+                "line_comment: x\n",
+            ),
+            (
+                ".head_comment = \"x\"",
+                "head_comment: 1\n",
+                "head_comment: x\n",
+            ),
+            (
+                ".foot_comment = \"x\"",
+                "foot_comment: 1\n",
+                "foot_comment: x\n",
+            ),
+            (".a.style = 2", "a:\n  style: 1\n", "a:\n  style: 2\n"),
+            // ... while the spaced form still addresses the root's own slot.
+            (". style = \"flow\"", "style: 1\n", "{style: 1}\n"),
+        ] {
+            let (out, code) = run_yq_stdin(filter, input, &[])?;
+            assert_eq!(code, 0, "[{filter}]");
+            assert_eq!(out, expected, "[{filter}]");
+        }
+        Ok(())
+    }
+
+    /// A missing target is created on the way, as real yq's path traversal
+    /// does for any assignment-family operator (the value-tree half of a
+    /// metadata write is `TARGET |= .`): a missing key becomes `null`, a
+    /// missing nested path is built, and a short array is padded. All
+    /// live-verified against pinned yq.
+    #[test]
+    fn missing_target_is_created_like_any_yq_assignment() -> Result<()> {
+        for (filter, input, expected) in [
+            (".a line_comment = \"y\"", "b: 1\n", "b: 1\na: null # y\n"),
+            (".a anchor = \"z\"", "b: 1\n", "b: 1\na: &z null\n"),
+            (
+                ".a.b line_comment = \"y\"",
+                "c: 1\n",
+                "c: 1\na:\n  b: null # y\n",
+            ),
+            (
+                ".a[2] line_comment = \"y\"",
+                "a:\n  - 1\n",
+                "a:\n  - 1\n  - null\n  - null # y\n",
+            ),
+            // A target deleted earlier in the pipe is re-created too.
+            (
+                "del(.a) | .a line_comment = \"y\"",
+                "a: 1\nb: 2\n",
+                "b: 2\na: null # y\n",
+            ),
+        ] {
+            let (out, code) = run_yq_stdin(filter, input, &[])?;
+            assert_eq!(code, 0, "[{filter}]");
+            assert_eq!(out, expected, "[{filter}]");
+        }
+        Ok(())
+    }
+
+    /// Each stage's right-hand side runs against the document *that stage*
+    /// sees: an earlier write in the pipe is visible to a later `=` RHS,
+    /// and to the candidate value a later `|=` binds `.` to. Both
+    /// live-verified against pinned yq (`# 2`, `# 2x` -- not the pristine
+    /// `# 1`/`# 1x`).
+    #[test]
+    fn rhs_sees_earlier_writes_in_the_same_pipe() -> Result<()> {
+        let (out, code) = run_yq_stdin(
+            ".a = 2 | .b line_comment = (.a | tostring)",
+            "a: 1\nb: 1\n",
+            &[],
+        )?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "a: 2\nb: 1 # 2\n");
+
+        let (out, code) = run_yq_stdin(".a = 2 | .a line_comment |= . + \"x\"", "a: 1\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "a: 2 # 2x\n");
+
+        // `|=` binds `.` per candidate.
+        let (out, code) = run_yq_stdin(".[] line_comment |= . + \"x\"", "a: 1\nb: 2\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "a: 1 # 1x\nb: 2 # 2x\n");
+
+        // Two writes to the same slot: the later one wins.
+        let (out, code) = run_yq_stdin(
+            ".a line_comment = \"x\" | .a line_comment = \"y\"",
+            "a: 1\n",
+            &[],
+        )?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "a: 1 # y\n");
+        Ok(())
+    }
+
+    /// A multi-line comment renders go-yaml's way, every rule live-verified
+    /// against pinned yq: first line after the value; each further line as
+    /// its own comment line at the containing line's indent; an empty line
+    /// left empty; trailing newlines dropped, a leading one kept; a line
+    /// already starting with `#` kept raw; and -- top level only -- one
+    /// blank line before the continuation. Before this, `"m\nl"` emitted a
+    /// bare `l` line that real yq could not parse back.
+    #[test]
+    fn multi_line_comment_renders_like_go_yaml() -> Result<()> {
+        for (filter, input, args, expected) in [
+            (
+                ".a line_comment = \"m\\nl\"",
+                "a: 1\nb: 2\n",
+                &[][..],
+                "a: 1 # m\n\n# l\nb: 2\n",
+            ),
+            (
+                ".a line_comment = \"m\\nl\\nz\"",
+                "a: 1\n",
+                &[],
+                "a: 1 # m\n\n# l\n# z\n",
+            ),
+            (
+                ".a.b line_comment = \"m\\nl\"",
+                "a:\n  b: 1\n",
+                &[],
+                "a:\n  b: 1 # m\n  # l\n",
+            ),
+            (
+                ".a.b line_comment = \"m\\n\\nl\"",
+                "a:\n  b: 1\n  c: 2\n",
+                &[],
+                "a:\n  b: 1 # m\n\n  # l\n  c: 2\n",
+            ),
+            (
+                ".[0] line_comment = \"m\\nl\"",
+                "- 1\n- 2\n",
+                &[],
+                "- 1 # m\n\n# l\n- 2\n",
+            ),
+            (
+                ".a line_comment = \"m\\nl\"",
+                "a: {b: 1}\nc: 2\n",
+                &[],
+                "a: {b: 1} # m\n\n# l\nc: 2\n",
+            ),
+            (
+                ".a.b line_comment = \"m\\nl\"",
+                "a:\n  b: 1\n",
+                &["-I", "4"],
+                "a:\n    b: 1 # m\n    # l\n",
+            ),
+            (".a line_comment = \"m\\n\\n\"", "a: 1\n", &[], "a: 1 # m\n"),
+            (
+                ".a line_comment = \"\\nl\"",
+                "a: 1\n",
+                &[],
+                "a: 1 \n\n# l\n",
+            ),
+            (".a line_comment = \"#raw\"", "a: 1\n", &[], "a: 1 #raw\n"),
+            (".a line_comment = \"  #x\"", "a: 1\n", &[], "a: 1 #   #x\n"),
+        ] {
+            let (out, code) = run_yq_stdin(filter, input, args)?;
+            assert_eq!(code, 0, "[{filter}]");
+            assert_eq!(out, expected, "[{filter}]");
+        }
+        Ok(())
+    }
+
+    /// The output must read back as the same document in succinctly's own
+    /// parser -- the rule every emitter path is held to.
+    #[test]
+    fn multi_line_comment_output_reads_back() -> Result<()> {
+        let (out, code) = run_yq_stdin(".a line_comment = \"m\\nl\"", "a: 1\nb: 2\n", &[])?;
+        assert_eq!(code, 0);
+        let (json, code) = run_yq_stdin(".", &out, &["-o", "json", "-I", "0"])?;
+        assert_eq!(code, 0);
+        assert_eq!(json.trim(), "{\"a\":1,\"b\":2}");
+        Ok(())
+    }
+
+    /// Real yq drops a `line_comment` written onto a block-rendered
+    /// container (there is no line to trail) but keeps one on a flow or
+    /// empty container, and on a flow root; a scalar root never renders
+    /// one. All live-verified.
+    #[test]
+    fn line_comment_on_a_container_follows_yqs_block_vs_flow_rule() -> Result<()> {
+        for (filter, input, expected) in [
+            (".a line_comment = \"y\"", "a:\n  b: 1\n", "a:\n  b: 1\n"),
+            (".a line_comment = \"y\"", "a:\n  - 1\n", "a:\n  - 1\n"),
+            (
+                ".a[0] line_comment = \"y\"",
+                "a:\n  - b: 1\n",
+                "a:\n  - b: 1\n",
+            ),
+            (
+                ".a line_comment = \"y\"",
+                "a: # old\n  b: 1\n",
+                "a: # old\n  b: 1\n",
+            ),
+            (".a line_comment = \"y\"", "a: {b: 1}\n", "a: {b: 1} # y\n"),
+            (".a line_comment = \"y\"", "a: [1, 2]\n", "a: [1, 2] # y\n"),
+            (".a line_comment = \"y\"", "a: {}\n", "a: {} # y\n"),
+            (".a line_comment = \"y\"", "a: []\n", "a: [] # y\n"),
+            (". line_comment = \"q\"", "[1, 2]\n", "[1, 2] # q\n"),
+            (". line_comment = \"q\"", "a: 1\n", "a: 1\n"),
+            (". line_comment = \"q\"", "1\n", "1\n"),
+            // Setting flow style first makes the same container keep it.
+            (
+                ".a style = \"flow\" | .a line_comment = \"y\"",
+                "a:\n  b: 1\n",
+                "a: {b: 1} # y\n",
+            ),
+        ] {
+            let (out, code) = run_yq_stdin(filter, input, &[])?;
+            assert_eq!(code, 0, "[{filter}]");
+            assert_eq!(out, expected, "[{filter} on {input:?}]");
+        }
+        Ok(())
+    }
+
+    /// `style = "double"`/`"single"` on a non-string scalar turns it into
+    /// the quoted string, spelling preserved (live-verified against pinned
+    /// yq); on a container it is accepted and changes nothing; and a later
+    /// stage in the same pipe still sees the original type.
+    #[test]
+    fn style_double_or_single_on_a_non_string_scalar_quotes_it() -> Result<()> {
+        for (filter, input, expected) in [
+            (".a style = \"double\"", "a: 1\n", "a: \"1\"\n"),
+            (".a style = \"double\"", "a: true\n", "a: \"true\"\n"),
+            (".a style = \"double\"", "a: null\n", "a: \"null\"\n"),
+            (".a style = \"double\"", "a: 1.50\n", "a: \"1.50\"\n"),
+            (".a style = \"double\"", "a: 1e3\n", "a: \"1e3\"\n"),
+            (".a style = \"single\"", "a: null\n", "a: 'null'\n"),
+            (
+                ".[] style |= \"double\"",
+                "a: 1\nb: x\n",
+                "a: \"1\"\nb: \"x\"\n",
+            ),
+            (".a style = \"double\"", "a: {b: 1}\n", "a:\n  b: 1\n"),
+            (".a style = \"double\" | .a + 1", "a: 1\n", "2\n"),
+        ] {
+            let (out, code) = run_yq_stdin(filter, input, &[])?;
+            assert_eq!(code, 0, "[{filter}]");
+            assert_eq!(out, expected, "[{filter} on {input:?}]");
+        }
+        Ok(())
+    }
+
+    /// `literal`/`folded`/`tagged` are in real yq's vocabulary (so they
+    /// never raise `unknown style`) but succinctly's emitter can't render
+    /// them -- refused explicitly rather than accepted and ignored.
+    #[test]
+    fn style_literal_folded_tagged_raise_not_yet_supported() {
+        for style in ["literal", "folded", "tagged"] {
+            let filter = format!(".a style = \"{style}\"");
+            let (_out, err, code) = run_yq_stdin_with_stderr(&filter, "a: hello\n", &[]).unwrap();
+            assert_eq!(code, 1, "[{filter}] stderr: {err}");
+            assert!(
+                err.contains(&format!("style = \"{style}\" is not yet supported")),
+                "[{filter}] stderr: {err}"
+            );
+        }
+    }
+
+    /// An anchor name go-yaml's emitter refuses raises real yq's exact
+    /// error (and no document is printed); the accepted set is the measured
+    /// one -- printable ASCII except `,[]{}:` and whitespace. Before the
+    /// check the emitter wrote `&bad name 1`, which reads back differently.
+    #[test]
+    fn anchor_name_is_validated_like_go_yaml() -> Result<()> {
+        for name in ["bad name", "a:b", "x,y", "x[y", "x{y", "\u{fc}", "x\ty"] {
+            let filter = format!(".a anchor = \"{name}\"");
+            let (out, err, code) = run_yq_stdin_with_stderr(&filter, "a: 1\n", &[])?;
+            assert_eq!(code, 1, "[{filter}] stderr: {err}");
+            assert_eq!(out, "", "[{filter}]");
+            assert!(
+                err.contains("yaml: yaml: anchor value must contain valid characters only"),
+                "[{filter}] stderr: {err}"
+            );
+        }
+        for name in ["x+y/z.w", "a-b_c1", "x@y", "x?y", "x#y", "&x", "*x"] {
+            let filter = format!(".a anchor = \"{name}\"");
+            let (out, code) = run_yq_stdin(&filter, "a: 1\n", &[])?;
+            assert_eq!(code, 0, "[{filter}]");
+            assert_eq!(out, format!("a: &{name} 1\n"), "[{filter}]");
+        }
+        Ok(())
+    }
+
+    /// A metadata write anywhere other than a top-level pipe stage is
+    /// refused out loud: the write pass can't see the document such a
+    /// nested write runs against, and a silent no-op is the one outcome
+    /// #798's triage ruled out. Real yq supports these; recorded in
+    /// `docs/compliance/yq/limitations.md`.
+    #[test]
+    fn nested_metadata_assignment_is_refused_explicitly() {
+        for filter in [
+            ".b as $x | .a line_comment = $x",
+            ".b as $x | (.a style = \"double\")",
+        ] {
+            let (out, err, code) = run_yq_stdin_with_stderr(filter, "a: 1\nb: hi\n", &[]).unwrap();
+            assert_eq!(code, 1, "[{filter}] stderr: {err}");
+            assert_eq!(out, "", "[{filter}]");
+            assert!(
+                err.contains("only supported as a top-level pipe stage"),
+                "[{filter}] stderr: {err}"
+            );
+        }
+    }
+
+    /// `--inplace` takes the same DOM write path (`is_alias_sensitive_assign`
+    /// admits `MetaAssign`), so the comment lands in the file -- never a
+    /// silent drop.
+    #[test]
+    fn inplace_applies_the_metadata_write_to_the_file() -> Result<()> {
+        let mut input_file = NamedTempFile::new()?;
+        write!(input_file, "a: 1\nb: 2\n")?;
+        let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+            .arg("yq")
+            .arg("-i")
+            .arg(".a line_comment = \"y\" | .b anchor = \"z\"")
+            .arg(input_file.path())
+            .stdin(Stdio::null())
+            .output()?;
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(output.status.success(), "stderr: {stderr}");
+        assert_eq!(
+            std::fs::read_to_string(input_file.path())?,
+            "a: 1 # y\nb: &z 2\n"
+        );
         Ok(())
     }
 

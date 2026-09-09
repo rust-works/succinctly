@@ -3330,50 +3330,93 @@ Refuse-only is the permitted direction (ADR-0018 rule 4): the document is untouc
 `$x[0] = 9` into a document write. `succinctly jq` matches jq 1.7.1 here exactly (both
 raise `Invalid path expression …`, exit 5) and is not affected.
 
-### `tag =`/`head_comment =`/`foot_comment =`/`comments =` parse but raise "not yet supported" (#798 PR1)
+### Metadata assignment (`PATH <slot> = value`): what `succinctly yq` refuses or drops (#798 PR1)
 
-`succinctly yq` now parses real yq's juxtaposed metadata-assignment grammar (`PATH <slot> =
+`succinctly yq` parses real yq's juxtaposed metadata-assignment grammar (`PATH <slot> =
 value` / `PATH <slot> |= filter`, e.g. `.a style = "flow"`) for all seven of yq's metadata
 op-tokens (`line_comment`, `head_comment`, `foot_comment`, `comments`, `style`, `tag`,
-`anchor`) — `src/jq/parser.rs`'s `try_parse_meta_op`/`Expr::MetaAssign`. Only three slots
-actually write anything yet: `line_comment =`, `style =`, `anchor =`
-(`src/bin/succinctly/yq_runner.rs`'s `resolve_meta_assign_writes`/`apply_meta_assign_writes`,
-modeled on the existing `propagate_assign_alias_marks`). `tag =`, `head_comment =`,
-`foot_comment =` and `comments =` are real, working yq features (live-verified against
-pinned v4.53.3: `.a tag = "!!str"` coerces the value's type; `.a head_comment = "hi"` and
-`.a foot_comment = "bye"` insert standalone comment lines; `.a comments = "x"` sets head,
-line and foot together) — succinctly deliberately raises `<slot> = ... is not yet
-supported` for all four instead of silently no-oping, since none has a write mechanism yet:
-`NodeMeta` (`src/jq/eval_generic.rs`) has no tag slot (#747), and head/foot comments have no
-backing field at all (the single-slot `line_comments` side-table this issue's own triage
-plans to widen — see #798's design-issue and triage comments). Tracked to land in PR2
-(`NodeMeta`/`CommentTree` data-model widening) through PR5 (`comments =`/`comments |=` and
-`...` recursive descent in yq mode); cross-link #1079/#1080/#1085 above.
+`anchor`) — `src/jq/parser.rs`'s `try_parse_meta_op`/`Expr::MetaAssign`. The whitespace is
+the discriminator, as in yq's own lexer: `.style = 2` is a write to a field named `style`,
+`. style = "flow"` is the root's own style. `line_comment =`, `style =` and `anchor =` are
+applied by `src/bin/succinctly/yq_runner.rs`'s `resolve_meta_assign_writes`/
+`apply_meta_assign_writes` (modeled on the existing `propagate_assign_alias_marks`): the
+target's candidates come from evaluating `path(TARGET)` against the document the stage
+sees, so `.[]`, `..`, `.a[-1]` and a computed index all write every candidate, a missing
+target is created (`.a.b line_comment = "y"` on `c: 1` prints `a:\n  b: null # y`, `.a[2]`
+pads with `null`s), `=`'s right-hand side is evaluated once against the stage's input and
+`|=`'s once per candidate against that candidate's value, and an earlier write in the
+pipe is visible to a later stage's right-hand side (`.a = 2 | .b line_comment = (.a |
+tostring)` writes `# 2`) — every one of those live-verified against pinned v4.53.3 and
+pinned by a `meta_assign_*_798` golden.
 
-Two further, narrower divergences from real yq's own `style =` and root-`line_comment =`
-behaviour, both live-verified against pinned v4.53.3:
+What is refused explicitly (an error, never a silent no-op — the outcome #798's triage
+ruled out), even though real yq supports every one of them:
 
-- **`style = "literal"`/`"folded"`/`"tagged"` are accepted (no `unknown style` error,
-  matching real yq's vocabulary) but don't change succinctly's own rendering.** Real yq's
-  three are fully working, rendering features (`a: |-\n  1` / `a: >-\n  1` / `a: !!int 1`);
-  succinctly's emitter (`yaml_quote_string_with_style` in `yq_runner.rs`) only has real arms
-  for `flow`/`single`/`double` today, so the other three parse and validate but the output
-  is unchanged plain/block scalar rendering. The same gap already exists for a non-string
-  scalar under `style = "double"`/`"single"` — real yq coerces `a: 1` to `a: "1"`;
-  succinctly leaves it `a: 1` unquoted, since `yaml_quote_string_with_style` only special-
-  cases `OwnedValue::String`, never a number/bool being *turned into* a quoted string.
-- **A written root `line_comment` never renders**, matching real yq exactly (`.
-  line_comment = "q"` on `a: 1` stays `a: 1` in both), but for a narrower reason on
-  succinctly's side: this write pass has no read-after-write model at all — the
-  `line_comment` GET-form (`Builtin::LineComment`) still reads the original YAML cursor's
-  comment index, never this write pass's `CommentTree`, so `. line_comment = "q" |
-  line_comment` returns `""` on succinctly where real yq returns `"q"` (live-verified). Real
-  yq's own asymmetry is narrower still: its `&anchor`/`style` writes at root *do* render
-  (`. anchor = "z"` => `&z`; `. style = "flow"` => `{a: 1}`) and *are* readable back within
-  the same pipe, so only its root-`line_comment`-write case coincides with succinctly's
-  broader gap here — succinctly gets the observable output right by simply never writing
-  the root `line_comment` slot at all (`resolve_one_meta_assign`'s explicit root check),
-  not by having the same underlying mechanism.
+- **`tag =`, `head_comment =`, `foot_comment =`, `comments =`** raise `<slot> = ... is not
+  yet supported`. Real yq's `.a tag = "!!str"` coerces the value's type, `.a head_comment
+  = "hi"`/`.a foot_comment = "bye"` insert standalone comment lines, and `.a comments =
+  "x"` sets head, line and foot together. None has a write mechanism here yet: `NodeMeta`
+  (`src/jq/eval_generic.rs`) has no tag slot (#747), and head/foot comments have no backing
+  field at all (the single-slot `line_comments` side-table this issue's own triage plans to
+  widen — see #798's design-issue and triage comments). Tracked to land in PR2 (data-model
+  widening) through PR5 (`comments =`/`comments |=` and `...` recursive descent in yq
+  mode); cross-link #1079/#1080/#1085 above.
+- **`style = "literal"`/`"folded"`/`"tagged"`** raise `style = "<name>" is not yet
+  supported` (an unknown name still raises real yq's own `unknown style <name>`). Real yq
+  renders all three (`a: |-\n  hello` / `a: >-\n  hello` / `a: !!int 1`); succinctly's DOM
+  emitter (`yaml_quote_string_with_style` in `yq_runner.rs`) only has arms for `flow`/
+  `single`/`double`/`""`, and already re-renders an *existing* block scalar as a quoted
+  string on any DOM write (`a: |\n  x` + `.b = 1` prints `a: "x\n"`), so accepting the
+  style would set a value the emitter then ignores.
+- **`anchor = "<name>"` with a name go-yaml's emitter refuses** raises real yq's exact
+  `yaml: yaml: anchor value must contain valid characters only`. The accepted set is the
+  measured one, not YAML 1.2's: printable ASCII except `,`/`[`/`]`/`{`/`}`/`:` and
+  whitespace, and nothing non-ASCII. Without the check the emitter wrote `&bad name 1`
+  for `"bad name"`, which reads back as a different value.
+- **A metadata write anywhere other than a top-level pipe stage** (inside a `reduce`/
+  `foreach` body, an `as` binding's body — `.b as $x | .a line_comment = $x` — a `def`,
+  ...) raises `metadata assignment (...) is only supported as a top-level pipe stage`. The
+  write pass resolves stages against the document each one sees and can't see the input
+  such a nested write would run against; real yq handles all of them.
+
+Two rendering divergences, both readable back and both pinned:
+
+- **`.a[-1] line_comment = "y"` on a flow sequence** `a: [1, 2]` prints the block form
+  `a:\n  - 1\n  - 2 # y`; real yq keeps the flow sequence and emits `a: [1, 2, # y\n]`
+  (a comment after a trailing comma inside the brackets). succinctly's flow emitter has
+  no position for an element's own comment, so the sequence falls back to block form
+  exactly as an *existing* element comment already does (`is_flow_safe`).
+- **`style = "double"`/`"single"` on a non-string scalar** rewrites the value into the
+  quoted string (`a: 1` becomes `a: "1"`, `a: null` becomes `a: 'null'`), which is what
+  real yq's output amounts to — the result reads back as a string in both tools, and a
+  later stage in the same pipe still sees the original type in both (`.a style = "double"
+  | .a + 1` is `2`). Done to the value rather than in the emitter so an existing
+  tagged scalar whose cursor reports a quoted style (`a: !!int "5"`, #747) keeps its
+  current (already divergent, pre-#798) rendering.
+
+Three known gaps this write shares with every other write form, none specific to #798:
+
+- **No read-after-write within one pipe.** The `line_comment`/`style`/`anchor` GET-forms
+  still read the original YAML cursor, never the write pass's `CommentTree`, so `.a anchor
+  = "z" | .a | anchor` returns `""` where real yq returns `"z"` (live-verified). A written
+  root `line_comment` never renders in either tool, but on succinctly's side that is the
+  block-container rule below at work (`. line_comment = "q"` on `[1, 2]`, a flow root,
+  does render `[1, 2] # q` in both).
+- **Navigation after the write drops the presentation** (`.a.b style = "double" | .a`
+  prints `b: x`; yq prints `b: "x"`) — the same hole `.a.b = "y" | .a` already falls into
+  for every comment, style and anchor, since the result's `CommentTree` is lost once the
+  pipe stops being shape-preserving.
+- **A multi-result filter carries no `CommentTree` at all** (`.a line_comment = "y" | .,
+  .` prints two uncommented copies) — #1349's `GenericResult::Many` limitation, above.
+
+Finally, one rule real yq decides by the target's value, reproduced rather than "fixed":
+a `line_comment` written onto a **block-rendered container** is dropped (`.a line_comment
+= "y"` on `a:\n  b: 1` prints it unchanged; so does a block root), while a flow or empty
+container keeps it on its one line (`a: {b: 1} # y`, `a: [] # y`). The emitter's own
+`defers_to_own_block` is exactly that split. A multi-line comment (`"m\nl"`) renders
+go-yaml's way: first line after the value, each further line as its own comment line at
+the key's indent, an empty line left empty, and — top level only — one blank line before
+the continuation (`a: 1 # m` / blank / `# l`, but `  b: 1 # m` / `  # l` when nested).
 
 ### Other categories
 
