@@ -74,8 +74,17 @@ pub(crate) struct BomPrefix {
 }
 
 pub(crate) fn bom_prefix(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> BomPrefix {
+    bom_prefix_from(raw_bytes.iter().flat_map(|(_, raw)| raw.iter().copied()))
+}
+
+/// Same rule as [`bom_prefix`], but scanning any byte iterator directly --
+/// so a single already-owned buffer (like `value_ranges`'s) never needs to
+/// be wrapped in a fresh `Vec` just to match [`bom_prefix`]'s multi-source
+/// signature. Only ever reads at most `UTF8_BOM.len() + 1` bytes before
+/// returning, so callers may pass an iterator over arbitrarily large input.
+fn bom_prefix_from(bytes: impl Iterator<Item = u8>) -> BomPrefix {
     let mut consumed = 0;
-    for byte in raw_bytes.iter().flat_map(|(_, raw)| raw.iter().copied()) {
+    for byte in bytes {
         if consumed == UTF8_BOM.len() || byte != UTF8_BOM[consumed] {
             // A mismatch at offset 0 just means "no BOM here"; one after a
             // partial match is the malformed case. Running out of input
@@ -138,7 +147,7 @@ pub(crate) fn for_each_warning(raw_bytes: &[(Option<usize>, Vec<u8>)], emit: &mu
 /// later handed to the materializer.  Diagnostics use the original bytes at
 /// their separate call site, so invalid UTF-8 retains jq's raw-byte columns.
 pub(crate) fn value_ranges(bytes: &[u8]) -> Vec<(usize, usize)> {
-    let bom = bom_prefix(&[(None, bytes.to_vec())]);
+    let bom = bom_prefix_from(bytes.iter().copied());
     let mut ignore = |_: &str| {};
     let mut reader = Reader::new(bom, &mut ignore);
     reader.run(bytes.iter().copied().enumerate().skip(bom.consumed));
