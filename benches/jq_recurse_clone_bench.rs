@@ -16,13 +16,23 @@
 //! turns out to be a poor isolator: `builtin_path` calls
 //! `resolve_dynamic_indexes` (which drives `push_recursive_branches`) and
 //! *then* re-walks every one of the `depth + 1` resolved paths from the
-//! document root via `walk_path`/`step_into`, each step of which clones the
-//! value reached so far. That second pass was measured (`temp_probe`-style,
-//! not checked in) to cost **~250x** `push_recursive_branches`'s own share at
-//! depth 400 (1.9s vs 7-8ms) and scales worse than quadratically — so a
-//! `path(..)` benchmark would be dominated by `walk_path`, not by the
-//! function #668 targets, near-invisible to that fix, and would repeat
-//! exactly the mistake #675 was filed to correct in the first place.
+//! document root via `walk_path`/`step_into`. That second pass was measured
+//! (`temp_probe`-style, not checked in) to cost **~250x**
+//! `push_recursive_branches`'s own share at depth 400 (1.9s vs 7-8ms) and to
+//! scale worse than quadratically — so a `path(..)` benchmark would be
+//! dominated by `walk_path`, not by the function #668 targets, near-invisible
+//! to that fix, and would repeat exactly the mistake #675 was filed to
+//! correct in the first place.
+//!
+//! **Two corrections to the mechanism named above**, neither of which changes
+//! the conclusion (`del(..)`, not `path(..)`, is the isolator). The clone
+//! this paragraph blamed on "each step" of `walk_path`/`step_into` stopped
+//! being per-step at #2058, which made a single branch's walk O(depth) by
+//! navigating it destructively; what remained was one deep clone of the whole
+//! document per *resolved branch*, in `builtin_path_on_owned`. #2190 removed
+//! that one too — the walkers borrow the document now — so `path(..)`'s
+//! second pass is no longer quadratic in the branch count either. The figures
+//! above date from before both and should be read as history.
 //! `del(..)` instead reaches `resolve_del_path_branches` and then applies
 //! `delete_at_path`/`DeleteTrie` directly to the already-resolved static
 //! paths — no second walk of the original tree — so its cost tracks
