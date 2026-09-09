@@ -3109,6 +3109,23 @@ fn push_generic_truthiness<V: DocumentValue>(
 /// cursors `//` exists to keep. A prefix element that fails to convert
 /// replaces the terminating control with its own error, the same precedence
 /// [`flatten_generic_results`] uses when materializing a batch.
+///
+/// #2661 originally tagged this function's `Err` arm as unreachable, on the
+/// premise that both call sites only place already-successfully-converted
+/// items into `kept`. That premise holds for the `Many` (bare `V`) call site
+/// -- its loop already ran `to_owned` on each item before keeping it -- but
+/// not for `ManyCursor`: its loop only runs the cheap
+/// [`push_generic_document_validation_error`] walk before keeping a cursor,
+/// and that walk deliberately stops at a container-target alias (#1804), so
+/// a kept item can be an alias whose target is corrupt. `to_owned_cursor`
+/// here has no such short-circuit and genuinely fails on it -- confirmed live
+/// with `x: &X ["bad\qc"]` / `y: &Y [*X, "bad\qd"]` / `a:\n  q: *Y`, filter
+/// `.a | (.q[] // 1)`: `*X` passes the cheap check (kept), a later element
+/// fails it (the `control` this function is called with), and re-converting
+/// `*X` here fails too -- for a different reason than `control`, per this
+/// function's own documented precedence above. So this arm is reachable and
+/// exercised by `test_alternative_manycursor_prefix_conversion_error_2476`
+/// (`tests/yq_cli_tests.rs`), not tolerate-line'd.
 fn owned_prefix_partial<V: DocumentValue, T>(
     kept: &[T],
     to_owned_one: impl Fn(&T) -> Result<OwnedValue, EvalError>,
@@ -3118,7 +3135,7 @@ fn owned_prefix_partial<V: DocumentValue, T>(
     for item in kept {
         match to_owned_one(item) {
             Ok(v) => prefix.push(v),
-            Err(e) => return GenericResult::Error(e), // omni-dev: coverage tolerate-line reason="unreachable: both call sites only place already-successfully-converted items into `kept` before this re-converts them via the same pure `to_owned`/`to_owned_cursor` function, which cannot fail the second time on the same input (#2661)"
+            Err(e) => return GenericResult::Error(e),
         }
     }
     partial_generic(prefix, control)
