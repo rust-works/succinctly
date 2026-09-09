@@ -3829,7 +3829,7 @@ where
         // for another value anyway -- which is the bug this arm exists to fix.
         if result.is_escape() {
             if let Some(control) = push_owned_values(result, &mut out) {
-                body_control = Some(control);
+                return stop_with_escape(&mut body_control, control);
             }
             return Demand::Stop;
         }
