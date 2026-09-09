@@ -1252,7 +1252,10 @@ the reasoning behind each placement:
    `path()` is lazy end to end and never evaluates the trailing `halt_error` at all).
    Left and right therefore answer differently, deliberately: both rows are pinned in
    `test_short_circuit_side_effect_leaks_820_932_987`, and `Flow::Stopped`'s own doc
-   comment now records this as its one stated exception.
+   comment now records this as its one stated exception. The repro has moved twice, since
+   it needs an operand that still reaches the eager fallback (the only thing that
+   *produces* a `pending`): `if` until #1462 gave it a lazy arm, then `foreach` until #2180
+   WP3 gave it one, and now `recurse`, which `eval_each` still has no arm for.
 7. **Stage 5** — widen the lazy arm set. Filed **#1462**, which re-rated it Medium rather
    than the low-priority tail this document predicted: the wrappers destroy `input`
    documents, they do not merely leak stderr. **Implemented** as `each_if`, `each_try`
@@ -1525,37 +1528,82 @@ the reasoning behind each placement:
     pushes its outputs as they are produced, and its `outputs: &mut Vec<OwnedValue>` parameter
     became a `Demand`-answering sink. Four findings:
 
-    - **The stop-as-break rule extended to state threading with no exception anywhere the
-      oracle could show one.** `foreach`'s `?//` retries on `Flow::Stopped` under
-      `is_retryable_stop`, and the retried alternative resumes from the accumulator the stopped
-      attempt already produced @EM@ `[first(foreach (1) as $x ?// $y (0;.+1;.), "z")]` is `[1,2]`,
-      not `[1,1]`. That is exactly #1458's rule for a `Control::Break` escaping EXTRACT (the
-      retry is seeded with the failed EXTRACT call's own input), and the composed row
-      `[first(foreach (1) as $x ?// $y (0; .+1; (1 as $a ?// $b | .)))]` = `[1,1,2,2]` was
-      predicted by the implementation before it was captured, then confirmed. The plan flagged a
-      possible divergence between the stop rule and the break rule as the case to stop and report
-      on; there was none.
-    - **One step loop, parameterised over the source strategy @EM@ and the parameter that made it
-      possible was the *substituted row*, not the source value.** The eager path hoists a whole
-      substitution matrix outside the INIT-fork loop (#695) and the lazy path structurally
-      cannot, so a core taking source values would have forced one side to give that up.
-      `foreach_fork` takes a `drive_source` closure that hands over already-substituted rows
-      instead: `eval_foreach_with_values` walks its matrix, `each_foreach`/`each_foreach_generic`
-      substitute per element as it arrives (`substitute_foreach_steps`, lifted out of the matrix
-      build), and neither pays for the other's shape.
+    - **The stop-as-break rule extended to state threading.** `foreach`'s `?//` retries on
+      `Flow::Stopped` under `is_retryable_stop`, and the retried alternative resumes from the
+      accumulator the stopped attempt already produced — `[first(foreach (1) as $x ?// $y
+      (0;.+1;.), "z")]` is `[1,2]`, not `[1,1]`. That is exactly #1458's rule for a
+      `Control::Break` escaping EXTRACT (the retry is seeded with the failed EXTRACT call's own
+      input), and the composed row `[first(foreach (1) as $x ?// $y (0; .+1; (1 as $a ?// $b |
+      .)))]` = `[1,1,2,2]` was predicted by the implementation before it was captured, then
+      confirmed. WP3 recorded here that the stop rule and the break rule "never differed anywhere
+      the oracle could show"; **that is wrong for a `Halt`, and its review found the rows** — see
+      the review's own findings below.
+    - **One step loop, parameterised over the source strategy.** WP3 parameterised it over the
+      already-*substituted row* rather than the source value, so the eager path could keep the
+      whole-matrix hoist (#695) the lazy path structurally cannot have. Its review then drove
+      the eager path lazily too, which removed the matrix outright: `foreach_forks` takes a
+      source-drive closure handing over one source *value* at a time and substitutes per element
+      (`substitute_foreach_steps`), and `eval_foreach_with_values`/`foreach_fork`/`ForeachRowSink`
+      are gone. So the finding survives one level up — there is one step loop — but the parameter
+      that made it possible was the source value after all, once the matrix stopped existing.
     - **A stop always ends the whole `foreach`, which is what makes INIT fan-out cheap to keep
       eager.** `[first(foreach (1) as $x ?// $y ((0,100); .+1; .))]` is `[1,2]`: the `100` fork is
-      never attempted. So the first INIT fork can drive the source lazily while recording what it
-      saw, and later forks replay the recording @EM@ sound *because* a later fork is only ever
-      reached when the first ran the source to exhaustion. Re-driving instead would have
-      re-evaluated the source's side effects and re-popped `input`, a behaviour change the eager
-      path does not have.
+      never attempted. WP3 concluded from this that the first INIT fork could drive the source
+      while *recording* it, with later forks replaying the recording — sound, it argued, because
+      a later fork is only ever reached when the first ran the source to exhaustion. **That is
+      true of the fold's own termination and false of `?//`**, and its review found the rows: a
+      later fork's own consumer stop has to reach a source-position bind just as the first fork's
+      does (`[limit(3; foreach (1 as $x ?// $y | 1, 2) as $v ((0,100); .+$v; .))]` is
+      `[1,3,101,102]` in jq, `[1,3,101]` with the recording), and `recorded.push` ran once per
+      *offer*, so an element a source-side `?//` re-offered was recorded twice. jq re-evaluates
+      the source per fork anyway, side effects included (`[foreach (1, ("B"|stderr)) as $x
+      ((0,100); .+1)]` writes `B` twice), so the "behaviour change" the recording was protecting
+      was itself the divergence. `foreach_forks` re-drives.
     - **Two positions inside `foreach` are left eager on purpose, and the sweep deliberately does
       not carry them.** A `?//` in **UPDATE** (`[first(foreach (1) as $v (0; . + G))]` is `[1,1]`
       in jq, `[1]` here) needs `fold_step_via_accumulator_or_fork` reshaped into a sink, and that
-      helper is shared with `reduce`'s own O(n) accumulator fix (#2157) @EM@ its outputs are
+      helper is shared with `reduce`'s own O(n) accumulator fix (#2157) — its outputs are
       simultaneously the fold's next state. A `?//` in **INIT** (`[2,2]` in jq, `[2]` here) would
       mean making jq's outermost loop (#534) lazy, which also has to stay ahead of the source
       (#2440). Both are pinned as CLI rows rather than swept, so the sweep keeps its
       0-unexpected/0-known contract; see
       [`docs/compliance/jq/limitations.md`](../compliance/jq/limitations.md).
+
+    **WP3's review** (`/code-review high` over its three commits) found two correctness defects,
+    a memory regression and a duplicated core. Both sweeps stay at 648/490, 0 unexpected / 0
+    known. Three findings, none of them about `?//` retry *policy*:
+
+    - **A stop can carry a reason, and a `Halt`'s reason has to survive it.** A driver that ends
+      its drive because something escaped can only answer `Demand`, so it stashes the escape out
+      of band (`escape`/`downstream`/`ended`, roughly forty sites across the two evaluators) and
+      returns `Demand::Stop`. Everything between it and a `?//` saw a bare `Flow::Stopped
+      { pending: None }`, so #1519's retry fired and the halted alternative ran again:
+      `first((1 as $x ?// $y | 1) as $v | ("h"|halt_error(3)))` wrote `h` twice where jq 1.7.1
+      writes it once, and `[limit(10; foreach (1 as $x ?// $y | 1) as $v ((0, 100); if . == 0
+      then ("x"|halt_error(3)) else "OK:\(.)" end; .))]` *swallowed* the halt entirely and exited
+      0. `nonretryable_stop` is the shared side channel [#2567](https://github.com/rust-works/succinctly/issues/2567)
+      asked for: set by `stop_with_escape` using `is_retryable_control`'s two
+      position-independent exclusions (`Halt`, decode failure), read by `is_retryable_stop`, so
+      all three `?//` retry decisions inherit it from one definition. It is cleared on entry to
+      every alternative attempt rather than by whoever set it, which makes what a retry reads
+      exactly "did *this* attempt's evaluation end in an unretryable escape". An ordinary
+      `error`/`break` still retries, as jq does. This also closed #2567's own remaining gap: the
+      illegitimate retry after `nth`'s skipped-item decode failure no longer runs at all.
+    - **A precheck the twin already had was missing on the new arm.** WP3 shipped `each_foreach`
+      without the `streams_unbounded` gate `each_foreach_generic` carries, so
+      `all(foreach repeat(1) as $x (0; .+1); . > 0)` fell through to `foreach`'s own step budget
+      instead of `repeat`'s round cap, and the generic arm's comment ("reaches `eval.rs`'s
+      bounded evaluation exactly as before") was false while it said so. Both arms are gated
+      identically now and `streams_unbounded` lives in `eval.rs`, one definition for both
+      evaluators.
+    - **Removing the recording was also the memory fix.** Peak RSS on
+      `[foreach .[] as $x (0; .+$x)] | length` over a 1,000,000-element array is 30.4 MB, down
+      from 522.1 MB (debug binaries, same machine) — the recording *and* the #695 substitution
+      matrix both held one entry per source element, in the overwhelmingly common single-INIT
+      case that can never replay anything. The remaining 30 MB is the collected output array
+      itself.
+
+    One route split closed with it: `[foreach (1 as $x ?// $y | 1) as $v (0; if . == 0 then
+    error("x") else "OK:\(.)" end; .)]` raised where jq and every `first`/`limit` spelling answer
+    `["OK:null"]`, because the eager route materialized the source before the fold ran and left
+    no `?//` for the step's escape to retry. Both routes drive it the same way now.
