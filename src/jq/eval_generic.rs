@@ -8177,9 +8177,8 @@ fn each_repeat_generic<S: EvalSemantics, V: DocumentValue>(
         let flow = eval_each_owned::<S>(f, &owned, optional, &mut |v| {
             produced_any = true;
             if let Some(control) = super::eval::charge_budget(&mut budget, "repeat") {
-                budget_control = Some(control);
                 stopped = true;
-                return Demand::Stop;
+                return stop_with_escape(&mut budget_control, control);
             }
             match sink(GenericItem::Owned(v)) {
                 Demand::Continue => Demand::Continue,
@@ -11289,7 +11288,7 @@ where
         // would be parked and the sink would ask for another value anyway.
         if result.is_escape() {
             if let Some(control) = push_generic_owned_values(result, &mut out) {
-                body_control = Some(control);
+                return stop_with_escape(&mut body_control, control);
             }
             return Demand::Stop;
         }
