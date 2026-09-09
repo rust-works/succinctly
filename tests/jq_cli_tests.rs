@@ -35947,36 +35947,31 @@ fn test_seq_value_error_location_marker_1723() -> Result<()> {
 /// them emitted values.
 #[test]
 fn test_seq_adjacent_tokens_never_fabricate_1723() -> Result<()> {
-    for (input, why) in [
-        ("\x1e1-2\n", "one malformed number, not `1` and `-2`"),
-        ("\x1e1null\n", "not `1` and `null`"),
-        ("\x1e12true\n", "not `12` and `true`"),
-        ("\x1etrue1\n", "not `true` and `1`"),
+    for (input, expected, why) in [
+        ("\x1e1-2\n", "", "one malformed number, not `1` and `-2`"),
+        ("\x1e1null\n", "", "not `1` and `null`"),
+        ("\x1e12true\n", "", "not `12` and `true`"),
+        ("\x1etrue1\n", "", "not `true` and `1`"),
         (
             "\x1e5-3 7\n",
+            "7\n",
             "must not print `-3` out of the middle of a bad token",
         ),
-        ("\x1e1.5true\n", "a fractional number is no different"),
-        ("\x1e0007null\n", "nor is a leading-zero one"),
+        ("\x1e1.5true\n", "", "a fractional number is no different"),
+        ("\x1e0007null\n", "", "nor is a leading-zero one"),
     ] {
         let (stdout, _stderr, code) = run_jq_full(&["--seq", "-c", "."], Some(input))?;
         let stripped: String = stdout.chars().filter(|&c| c != '\u{1e}').collect();
-        assert_eq!(stripped, "", "input {input:?} -- {why}");
+        assert_eq!(stripped, expected, "input {input:?} -- {why}");
         assert_eq!(code, 0, "input {input:?}");
     }
     Ok(())
 }
 
-/// #1723: the cost of never fabricating is that a record jq can *partially*
-/// read is dropped whole.
-///
-/// Recorded as a test, not just prose, so the divergence is visible and its
-/// direction is pinned: succinctly's output is always a subset of jq's here,
-/// never a superset. Reaching jq's own answer needs its incremental parser's
-/// failure classification, which is what #1723 still tracks.
+/// #2653: a malformed suffix preserves values jq handed off before it.
 #[test]
-fn test_seq_partially_readable_record_is_dropped_whole_1723() -> Result<()> {
-    for (input, jq_would_emit) in [
+fn test_seq_partially_readable_record_emits_jq_prefix_2653() -> Result<()> {
+    for (input, expected) in [
         ("\x1e1 {invalid\n", "1"),
         ("\x1e1,2\n", "2"),
         ("\x1e} 5\n", "5"),
@@ -35985,8 +35980,9 @@ fn test_seq_partially_readable_record_is_dropped_whole_1723() -> Result<()> {
         let (stdout, _stderr, code) = run_jq_full(&["--seq", "-c", "."], Some(input))?;
         let stripped: String = stdout.chars().filter(|&c| c != '\u{1e}').collect();
         assert_eq!(
-            stripped, "",
-            "input {input:?}: dropped whole; real jq emits {jq_would_emit}"
+            stripped,
+            format!("{expected}\n"),
+            "input {input:?}: jq emits {expected}"
         );
         assert_eq!(code, 0, "input {input:?}");
     }
