@@ -39155,6 +39155,15 @@ fn test_alternative_keeps_the_cursor_it_hands_on_2476() -> Result<()> {
 /// evaluation, and `to_entries` has already left the cursor domain by then.
 /// That is #715/#1405's recursion list, not this arm's, and deliberately not
 /// touched here -- #2416 pins that table.
+///
+/// A second, distinct gap: this arm's position-reading fix above is for a
+/// *present* left/ambient position. An *absent* one is still wrong in both
+/// directions -- `.a.missing | (key // 1)` is `1` here (should be `missing`,
+/// yq v4.53.3's own answer) on this branch, and identically `1` on `main`
+/// pre-#2476 (`//` still bridging there) -- so this is not a regression this
+/// arm introduced, just one it does not close. Root cause not chased down
+/// here; flagged so this table is not read as "position-reading through `//`
+/// is now generally correct."
 #[test]
 fn test_alternative_operands_read_the_real_position_2476() -> Result<()> {
     let doc = "a: {b: 1, e: 2}\n";
