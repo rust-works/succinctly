@@ -353,11 +353,16 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
     /// the mapping/sequence node in place of its own first field (#835).
     ///
     /// [`Self::anchor`], [`Self::explicit_tag`], [`Self::style`], and the
-    /// `line_comment*` family all call this internally, so callers of those
-    /// never need to resolve first. [`Self::first_child`] deliberately does
-    /// **not** self-resolve (this method's own `first_child()` call below
-    /// would recurse), so a caller walking a value's fields/elements via
-    /// `first_child()` — [`is_yaml_cursor_container`],
+    /// `line_comment*` family deliberately do **not** call this internally
+    /// (each reads `self.bp_pos`/`self.index` directly — see their own doc
+    /// comments) since they're called on the hot per-field/per-item render
+    /// path where the caller already resolved `self`; paying to resolve
+    /// again there measured as a real streaming regression. Their callers
+    /// resolve at their own cursor's extraction point instead — see
+    /// `YamlElements`' `DocumentElements` impl. [`Self::first_child`]
+    /// likewise does **not** self-resolve (this method's own `first_child()`
+    /// call below would recurse), so a caller walking a value's
+    /// fields/elements via `first_child()` — [`is_yaml_cursor_container`],
     /// [`Self::stream_yaml_value`]'s `Mapping` arm, `merge_sources`,
     /// [`Self::write_leading_anchor`] — must still call this explicitly.
     ///
@@ -2026,18 +2031,40 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                     // Block style
                     let mut first = true;
                     let mut elems = elements;
-                    // `uncons_resolved_cursor`, not `uncons_cursor`: this
-                    // loop reads `is_yaml_cursor_container`/`first_child`-
-                    // shaped properties of each item's *value*, so a bare
-                    // `-` item needs to already be resolved past its
-                    // sequence-item wrapper before it gets here — see
-                    // `uncons_resolved_cursor`'s own doc comment (#835).
-                    while let Some((cursor, rest)) = elems.uncons_resolved_cursor() {
+                    // `uncons_raw_cursor` + an explicit
+                    // `resolve_bare_seq_item`, rather than
+                    // `uncons_resolved_cursor` directly: this loop needs
+                    // both the true, never-unwrapped wrapper cursor -- to
+                    // read a bare item's own trailing comment off the
+                    // wrapper's bp (#1079; `uncons_cursor`'s own inline
+                    // heuristic isn't good enough here, see
+                    // `uncons_raw_cursor`'s doc comment) -- and the
+                    // resolved value cursor for the
+                    // `is_yaml_cursor_container`/`first_child`-shaped
+                    // properties it already read here before (#835). Same
+                    // one resolve per element either way.
+                    while let Some((raw, rest)) = elems.uncons_raw_cursor() {
+                        let cursor = raw.resolve_bare_seq_item();
                         if !first {
                             out.write_char('\n')?;
                             out.write_str(indent)?;
                         }
                         first = false;
+                        // A comment captured on a bare `-` wrapper itself
+                        // (#1079) -- only present when this item really was
+                        // a bare wrapper whose value deferred to the next
+                        // line; `raw.line_comment_raw()` reads
+                        // `raw.bp_position()` directly without resolving
+                        // (see `resolve_bare_seq_item`'s doc comment above,
+                        // corrected in this same change), so comparing
+                        // positions is what tells a real deferred item
+                        // apart from an already-compact one (`- x` on one
+                        // line, where `uncons_cursor` already returns the
+                        // value's own cursor and the two positions are
+                        // equal).
+                        let wrapper_comment = (raw.bp_position() != cursor.bp_position())
+                            .then(|| raw.line_comment_raw())
+                            .flatten();
                         // A non-empty, non-flow mapping/sequence value
                         // renders in real yq's "compact" form: `- ` shares
                         // its line with the value's own first field/element,
@@ -2070,7 +2097,33 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             // alias node is never a container), so `None`
                             // skips a second resolve.
                             let tag = cursor.explicit_tag_at(None);
-                            if anchor.is_some() || tag.is_some() {
+                            if let Some(comment) = wrapper_comment {
+                                // #1079: the item's own trailing comment
+                                // (no anchor -- `wrapper_comment` and a
+                                // property-prefixed item are mutually
+                                // exclusive; the parser only captures this
+                                // slot when `had_property == false`) stays
+                                // on the dash's own line, then the
+                                // container's content starts on the next
+                                // one -- same shape as the anchor/tag arm
+                                // below, comment in place of `&anchor`/
+                                // `!!tag`.
+                                out.write_char('-')?;
+                                out.write_char(' ')?;
+                                out.write_str(comment)?;
+                                out.write_char('\n')?;
+                                let child_indent = compact_yaml_indent(indent);
+                                out.write_str(&child_indent)?;
+                                cursor.stream_yaml_value(
+                                    out,
+                                    &child_indent,
+                                    indent_spaces,
+                                    unit,
+                                    sort_keys,
+                                    true,
+                                    recursion_base,
+                                )?;
+                            } else if anchor.is_some() || tag.is_some() {
                                 out.write_char('-')?;
                                 write_anchor_tag(out, anchor, tag)?;
                                 out.write_char('\n')?;
@@ -2135,6 +2188,28 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                             // "compact" in real yq, deferred scalar values
                             // included -- `compact_yaml_indent`, not
                             // `deeper_yaml_indent`, is the right step here.
+                            if let Some(comment) = wrapper_comment {
+                                // #1079: real yq attaches a bare item's own
+                                // comment to the scalar node it defers to
+                                // (case C) -- an absent (null) value has no
+                                // node to attach it to and instead floats
+                                // it forward onto the next sibling item
+                                // (case D), which needs a multi-valued
+                                // head/line/foot comment slot this codebase
+                                // doesn't have yet (#798 PR2); only write
+                                // it here when the value actually
+                                // materializes. Gated on
+                                // `wrapper_comment.is_some()` (rare), so
+                                // this second `.value()` resolve -- on top
+                                // of the one `write_deferred_value` below
+                                // does internally -- only costs anything on
+                                // items that already carry this comment.
+                                if !is_deferred_value_absent_at(&cursor.value()) {
+                                    out.write_str(comment)?;
+                                    out.write_char('\n')?;
+                                    out.write_str(indent)?;
+                                }
+                            }
                             out.write_char('-')?;
                             let child_indent = compact_yaml_indent(indent);
                             write_deferred_value(
@@ -2145,7 +2220,32 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
                                 unit,
                                 sort_keys,
                             )?;
-                            write_line_comment(out, cursor.line_comment_raw())?;
+                            // A bare `- # c` item with nothing at all after
+                            // it (no key, no nested value) shares its bp
+                            // with the wrapper -- same as a genuine compact
+                            // scalar (`- foo # own`), since neither opens a
+                            // separate child node. `raw == cursor` covers
+                            // both shapes; only the absent one is a comment
+                            // `maybe_capture_line_comment` stashed here
+                            // earlier in this branch as a head-comment
+                            // slot (#1079), not a real same-line trailing
+                            // comment on a materialized node -- and real yq
+                            // never renders that inline either way (it
+                            // relocates or floats forward, #798 PR2), so
+                            // suppress it here instead of misrendering it.
+                            // A compact scalar's own genuine comment
+                            // (`is_deferred_value_absent_at` false there)
+                            // is unaffected.
+                            let own_comment = cursor.line_comment_raw();
+                            let own_comment = if own_comment.is_some()
+                                && raw.bp_position() == cursor.bp_position()
+                                && is_deferred_value_absent_at(&cursor.value())
+                            {
+                                None
+                            } else {
+                                own_comment
+                            };
+                            write_line_comment(out, own_comment)?;
                         }
                         elems = rest;
                     }
@@ -5103,6 +5203,35 @@ impl<'a, W: AsRef<[u64]>> YamlElements<'a, W> {
     pub fn uncons_resolved_cursor(&self) -> Option<(YamlCursor<'a, W>, Self)> {
         let (cursor, rest) = self.uncons_cursor()?;
         Some((cursor.resolve_bare_seq_item(), rest))
+    }
+
+    /// Like [`Self::uncons_cursor`], but never applies its same-line
+    /// "inline" heuristic ([`starts_inline_seq_entry`]) — always returns
+    /// the element exactly as stored, before any unwrapping.
+    ///
+    /// `uncons_cursor`'s heuristic only checks the byte immediately after
+    /// the `-` (a space or tab), which is true for `- # comment` just as
+    /// much as for `- foo` — a trailing comment with nothing else on the
+    /// line is not "content on the same line" in the sense that heuristic
+    /// means, but it satisfies the check anyway, so `uncons_cursor` already
+    /// unwraps past the wrapper for that shape before a caller ever sees
+    /// it. A caller that needs the wrapper's own bp itself — to read a
+    /// comment captured there when the value is genuinely deferred
+    /// (#1079) — needs this instead, then can call
+    /// [`YamlCursor::resolve_bare_seq_item`] itself for the resolved
+    /// value; that method's own `starts_seq_entry` check (unlike
+    /// `starts_inline_seq_entry`) doesn't need to distinguish same-line
+    /// from deferred at all — it unwraps whenever the wrapper structurally
+    /// has a child, which is the same outcome `uncons_cursor` +
+    /// `resolve_bare_seq_item` (i.e. [`Self::uncons_resolved_cursor`])
+    /// already produces for every other cursor shape.
+    #[inline]
+    pub(crate) fn uncons_raw_cursor(&self) -> Option<(YamlCursor<'a, W>, Self)> {
+        let element_cursor = self.element_cursor?;
+        let rest = YamlElements {
+            element_cursor: element_cursor.next_sibling(),
+        };
+        Some((element_cursor, rest))
     }
 
     /// Get the first element and the remaining elements.
