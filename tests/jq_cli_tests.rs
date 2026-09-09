@@ -39681,6 +39681,31 @@ fn fold_source_is_pulled_by_demand_2235() -> Result<()> {
             invalid("1"),
             5,
         ),
+        // ... and from a multi-output UPDATE's *first* output when that is
+        // the one refused: every output becomes the state before it is
+        // emitted, not only the last.
+        (
+            r#"{"a":1}"#,
+            "path(foreach (1 as $x ?// $y | if $x == 1 then 1 else 2 end) as $v (.; if $v == 2 then . else (1, 2) end))",
+            String::new(),
+            invalid("1"),
+            5,
+        ),
+        // Sources reached through `?` and `try`/`catch` stream too.
+        (
+            "[1,2,3]",
+            ". as $x | path(foreach ((.[] | stderr)?) as $i (0; $x))",
+            String::new(),
+            format!("1{}", invalid("[1,2,3]")),
+            5,
+        ),
+        (
+            r#"[{"a":1},{"a":2}]"#,
+            "path(foreach (.[] | stderr | (.a)?) as $i (.; .; error(\"u\")))",
+            String::new(),
+            format!("{{\"a\":1}}{}", e("u")),
+            5,
+        ),
         // `//` in the source: its escape prefix is truthy-filtered (one step,
         // not two), and its left side is pulled by demand.
         (
@@ -39700,6 +39725,33 @@ fn fold_source_is_pulled_by_demand_2235() -> Result<()> {
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(code, want_code, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout, want_out, "{filter}");
+        assert_eq!(stderr, want_err, "{filter}");
+    }
+
+    // `recurse(f)` delivers each node before resolving its `f`, so a bound
+    // never pays for `f` on a node it did not ask for: `limit(1)` runs
+    // `debug` zero times, `limit(2)` once and then refuses the computed
+    // child. Captured from jq 1.7.1.
+    for (filter, want_out, want_err, want_code) in [
+        (
+            "path(limit(1; recurse(if (.|debug) < 3 then .+1 else empty end)))",
+            "[]\n",
+            String::new(),
+            0,
+        ),
+        (
+            "path(limit(2; recurse(if (.|debug) < 3 then .+1 else empty end)))",
+            "[]\n",
+            format!("[\"DEBUG:\",0]\n{}", invalid("1")),
+            5,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("0"))?;
+        assert_eq!(
+            code, want_code,
+            "{filter}: stdout: {stdout:?} stderr: {stderr:?}"
+        );
         assert_eq!(stdout, want_out, "{filter}");
         assert_eq!(stderr, want_err, "{filter}");
     }
