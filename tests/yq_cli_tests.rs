@@ -13655,6 +13655,25 @@ mod meta_assign_798 {
         assert!(err.contains("unknown style bogus"), "stderr: {err}");
     }
 
+    /// `style =`'s RHS coerces to text before checking the style vocabulary,
+    /// the same way `line_comment =`/`anchor =` already do -- it never
+    /// requires a string outright. Live-verified against pinned yq: a
+    /// non-string RHS still produces `unknown style <value>`, never a
+    /// distinct type error.
+    #[test]
+    fn style_assign_non_string_coerces_before_the_vocabulary_check() {
+        for (filter, expected) in [
+            (".a style = 5", "unknown style 5"),
+            (".a style = true", "unknown style true"),
+            (".a style = {}", "unknown style {}"),
+            (".a style = null", "unknown style null"),
+        ] {
+            let (_out, err, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[]).unwrap();
+            assert_eq!(code, 1, "[{filter}] stderr: {err}");
+            assert!(err.contains(expected), "[{filter}] stderr: {err}");
+        }
+    }
+
     #[test]
     fn anchor_assign_declares_the_anchor_in_rendered_output() -> Result<()> {
         let (out, code) = run_yq_stdin(".a anchor = \"z\"", "a: 1\n", &[])?;
@@ -13730,6 +13749,20 @@ mod meta_assign_798 {
         }
     }
 
+    /// A metadata keyword immediately following a path but with no `=`/`|=`
+    /// after it isn't the assignment grammar at all -- `try_parse_meta_op`
+    /// backs off and lets the ordinary operator checks (and eventually the
+    /// caller above them) surface it as an ordinary syntax error, the same
+    /// way any other stray token would. Real yq raises its own distinct
+    /// "bad expression" text here; succinctly's is a generic parse error, so
+    /// only the exit code and general shape are asserted.
+    #[test]
+    fn bare_metadata_keyword_without_assign_is_a_parse_error() {
+        let (_out, err, code) = run_yq_stdin_with_stderr(".a style", "a: 1\n", &[]).unwrap();
+        assert_eq!(code, 1, "stderr: {err}");
+        assert!(err.contains("parse error"), "stderr: {err}");
+    }
+
     /// `tag =`/`head_comment =`/`foot_comment =`/`comments =` parse (the
     /// shared grammar is complete) but raise an explicit "not yet
     /// supported" error rather than silently no-oping -- real yq itself
@@ -13789,6 +13822,137 @@ mod meta_assign_798 {
         let (out, code) = run_yq_stdin(".style", "style: 1\n", &[])?;
         assert_eq!(code, 0);
         assert_eq!(out.trim(), "1");
+        Ok(())
+    }
+
+    /// A metadata assignment wrapped in parens still resolves -- the write
+    /// pass descends through `Expr::Paren`/`Expr::Optional` the same way it
+    /// descends through `Expr::Pipe`.
+    #[test]
+    fn parenthesized_target_still_resolves() -> Result<()> {
+        let (out, code) = run_yq_stdin("(.a style = \"double\")", "a: hello\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "a: \"hello\"\n");
+        Ok(())
+    }
+
+    /// `|=`'s target is evaluated once to bind `.` for the RHS filter; when
+    /// that target evaluates to *no* candidates (an out-of-bounds index into
+    /// a scalar), the write is silently skipped -- live-verified against
+    /// pinned yq, which leaves the document untouched.
+    #[test]
+    fn update_form_silently_skips_a_target_with_no_candidates() -> Result<()> {
+        let (out, code) = run_yq_stdin(".a[3] line_comment |= . + \"-x\"", "a: hello\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "a: hello\n");
+        Ok(())
+    }
+
+    /// A genuinely erroring `|=` target still raises, even though its value
+    /// is otherwise discarded (only used to bind `.` for the RHS) --
+    /// live-verified against pinned yq.
+    #[test]
+    fn update_form_propagates_a_genuinely_erroring_target() {
+        let (_out, err, code) =
+            run_yq_stdin_with_stderr("(error(\"boom\")) line_comment |= . + \"x\"", "a: 1\n", &[])
+                .unwrap();
+        assert_eq!(code, 1, "stderr: {err}");
+        assert!(err.contains("boom"), "stderr: {err}");
+    }
+
+    /// A `=`-form target is evaluated purely to let a genuinely erroring
+    /// path still propagate (its value is otherwise unused, since `=` binds
+    /// the RHS against root, not the target) -- live-verified against
+    /// pinned yq.
+    #[test]
+    fn assign_form_propagates_a_genuinely_erroring_target() {
+        let (_out, err, code) =
+            run_yq_stdin_with_stderr("(error(\"boom\")) style = \"flow\"", "a: 1\n", &[]).unwrap();
+        assert_eq!(code, 1, "stderr: {err}");
+        assert!(err.contains("boom"), "stderr: {err}");
+    }
+
+    /// An erroring or empty-producing RHS filter for `style |=`/`line_comment
+    /// |=` is handled the same way as an erroring/empty target above: a
+    /// genuine error still raises, and a filter that legitimately produces
+    /// no output (`select(false)`) is a silent no-op. Both live-verified
+    /// against pinned yq.
+    #[test]
+    fn update_form_rhs_error_and_empty_output_both_match_yq() {
+        for (filter, expect_err) in [
+            (".a style |= error(\"boom\")", true),
+            (".a line_comment |= error(\"boom\")", true),
+        ] {
+            let (_out, err, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[]).unwrap();
+            assert_eq!(code, 1, "[{filter}] stderr: {err}");
+            assert_eq!(expect_err, err.contains("boom"), "[{filter}] stderr: {err}");
+        }
+
+        for filter in [
+            ".a style |= select(false)",
+            ".a line_comment |= select(false)",
+        ] {
+            let (out, code) = run_yq_stdin(filter, "a: 1\n", &[]).unwrap();
+            assert_eq!(code, 0, "[{filter}]");
+            assert_eq!(out, "a: 1\n", "[{filter}]");
+        }
+    }
+
+    /// A target that produces some output before hitting a genuine error
+    /// (as opposed to erroring outright) still propagates that error --
+    /// `eval_meta_assign`'s `QueryResult::Partial(_, Control::Error(_))`
+    /// arm. Live-verified against pinned yq (plain `,`/`error` need no
+    /// extension).
+    #[test]
+    fn update_form_target_partial_output_then_error_still_propagates() {
+        let (_out, err, code) =
+            run_yq_stdin_with_stderr("(.a, error(\"boom\")) style = \"flow\"", "a: 1\n", &[])
+                .unwrap();
+        assert_eq!(code, 1, "stderr: {err}");
+        assert!(err.contains("boom"), "stderr: {err}");
+    }
+
+    /// Break/halt from a target's evaluation must propagate the same way a
+    /// plain error does (`eval_meta_assign`'s `QueryResult::Break`/`Halt`
+    /// arms, both bare and wrapped in `QueryResult::Partial` when the target
+    /// produces output before escaping) -- real yq has no `label`/`break`/
+    /// `halt` vocabulary at all (lexer rejects it outright, live-verified),
+    /// so this is succinctly's own `--jq-extensions` surface, checked here
+    /// for internal consistency rather than against the yq oracle: every
+    /// escape is swallowed by the enclosing construct (`label`, or the
+    /// process itself for `halt`) before any document is printed, so the
+    /// metadata write never applies.
+    #[test]
+    fn update_form_target_break_and_halt_both_propagate() -> Result<()> {
+        // Bare escape, no prior output from the target.
+        let (out, code) = run_yq_stdin(
+            "label $out | (break $out) style = \"flow\"",
+            "a: 1\n",
+            &["--jq-extensions"],
+        )?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "");
+
+        let (out, code) = run_yq_stdin("(halt) style = \"flow\"", "a: 1\n", &["--jq-extensions"])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "");
+
+        // Partial: the target yields one output before escaping.
+        let (out, code) = run_yq_stdin(
+            "label $out | (.a, break $out) style = \"flow\"",
+            "a: 1\n",
+            &["--jq-extensions"],
+        )?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "");
+
+        let (out, code) = run_yq_stdin(
+            "(.a, halt) style = \"flow\"",
+            "a: 1\n",
+            &["--jq-extensions"],
+        )?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "");
         Ok(())
     }
 }

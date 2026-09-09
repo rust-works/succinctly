@@ -3252,9 +3252,11 @@ fn resolve_one_meta_assign<'e>(
     let reports_before = sink.report_count();
     let rhs_input = if is_update {
         let targets = evaluate_input(root_value, target, sink).unwrap_or_default();
+        // omni-dev: coverage tolerate reason="unreachable via any expressible filter: `target` only reaches here once `meta_assign_target_steps` (above) has already accepted it as a static Field/Index(literal)/Paren/Optional/Pipe chain -- and re-evaluating that exact shape through `evaluate_input` never reports through `sink`, since yq's own navigation semantics silently yield nothing (not an error) for a type mismatch (live-verified: `.a[0]`/`.a.b` on a scalar `a` both exit 0 with no output, in both pinned yq and succinctly). Kept for symmetry with the RHS-value error check just below, which *is* reachable (`value` is an arbitrary filter, not steps-restricted) (#798)"
         if sink.report_count() != reports_before {
             return false;
         }
+        // omni-dev: coverage end
         let Some(first) = targets.into_iter().next() else {
             return true;
         };
@@ -3264,33 +3266,13 @@ fn resolve_one_meta_assign<'e>(
     };
 
     match slot {
-        MetaSlot::Style => {
-            let results = evaluate_input(&rhs_input, value, sink).unwrap_or_default();
-            if sink.report_count() != reports_before {
-                return false;
-            }
-            let Some(result) = results.into_iter().next() else {
-                return true;
-            };
-            let OwnedValue::String(s) = result else {
-                sink.report(
-                    DiagStyle::Yq,
-                    &EvalError::new("style must be a string"),
-                    &no_location(),
-                );
-                return false;
-            };
-            let Some(style) = validate_style(&s) else {
-                sink.report(
-                    DiagStyle::Yq,
-                    &EvalError::new(format!("unknown style {s}")),
-                    &no_location(),
-                );
-                return false;
-            };
-            out.push(ResolvedMetaWrite::Style(steps, style));
-        }
-        MetaSlot::LineComment | MetaSlot::Anchor => {
+        // Style shares LineComment/Anchor's stringify-first approach rather
+        // than requiring an `OwnedValue::String` outright (live-verified
+        // against pinned yq: `.a style = 5` => `unknown style 5`, `.a style =
+        // true` => `unknown style true`, `.a style = {}` => `unknown style
+        // {}` -- real yq always coerces to text and rejects it against the
+        // style vocabulary, never a separate "must be a string" type error).
+        MetaSlot::Style | MetaSlot::LineComment | MetaSlot::Anchor => {
             let stringify = Expr::Pipe(vec![value.clone(), Expr::Builtin(Builtin::ToString)]);
             let results = evaluate_input(&rhs_input, &stringify, sink).unwrap_or_default();
             if sink.report_count() != reports_before {
@@ -3299,21 +3281,33 @@ fn resolve_one_meta_assign<'e>(
             let Some(OwnedValue::String(s)) = results.into_iter().next() else {
                 return true;
             };
-            out.push(if slot == MetaSlot::LineComment {
+            if slot == MetaSlot::Style {
+                let Some(style) = validate_style(&s) else {
+                    sink.report(
+                        DiagStyle::Yq,
+                        &EvalError::new(format!("unknown style {s}")),
+                        &no_location(),
+                    );
+                    return false;
+                };
+                out.push(ResolvedMetaWrite::Style(steps, style));
+            } else if slot == MetaSlot::LineComment {
                 // `NodeMeta.comment` stores the raw trailing text *with*
                 // its leading `# ` (see `line_comment_raw_checked`'s own
                 // `strip_prefix("# ")` on the read side, and this file's
                 // `format!(" {c}")` render site, which adds only the
                 // separating space) -- not bare text.
                 let text = (!s.is_empty()).then(|| format!("# {s}"));
-                ResolvedMetaWrite::LineComment(steps, text)
+                out.push(ResolvedMetaWrite::LineComment(steps, text));
             } else {
                 let text = (!s.is_empty()).then_some(s);
-                ResolvedMetaWrite::Anchor(steps, text)
-            });
+                out.push(ResolvedMetaWrite::Anchor(steps, text));
+            }
         }
         MetaSlot::Tag | MetaSlot::HeadComment | MetaSlot::FootComment | MetaSlot::Comments => {
+            // omni-dev: coverage tolerate reason="unreachable: the `matches!` gate above (`slot` must be LineComment/Style/Anchor) already returns `true` for these four slots before this match is reached, so this arm exists only for the outer match's exhaustiveness (#798)"
             unreachable!("filtered above")
+            // omni-dev: coverage end
         }
     }
     true
