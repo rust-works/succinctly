@@ -3086,7 +3086,7 @@ collects it and returns before its source drive is ever called. The rows above a
 `test_nested_short_circuit_consumer_hides_the_stop_2180` and
 `test_short_circuit_side_effect_leaks_820_932_987` (`tests/jq_cli_tests.rs`); they are
 deliberately *not* in `scripts/jq-alt-retry-oracle-sweep.sh`, which reports 0 unexpected and 0
-known over 648 cases and would lose that contract if permanent divergences were swept.
+known over 819 cases and would lose that contract if permanent divergences were swept.
 
 **Two rows recorded here as of #2180's filing have since closed** — the issue text was stale on
 them. `1 | [label $o | (1 as $x ?// $y | 5) | (., break $o)]` closed at
@@ -3129,8 +3129,10 @@ split the residual into four work packages — WP1 (nested consumers), WP2a (`//
 divergences attributed to it to none (612 cases, 0 unexpected, 258 known across WP2a/WP2b/WP3);
 WP2a then took its own 96 to none (162 known across WP2b/WP3); WP2b took its own 144 to none (612
 cases, 0 unexpected, 18 known, all WP3's `foreach`); WP3 took the last 18 to none and added
-pattern-position and EXTRACT-position wrapper entries, leaving **648 cases, 0 unexpected, 0
-known**. All four left `scripts/jq-fanout-oracle-sweep.sh` at 490/490.
+pattern-position and EXTRACT-position wrapper entries, and its review added a `limit(3; ...)`
+consumer plus three multi-INIT-fork wrappers — the only shapes that reach a `foreach`'s second
+fork at all — leaving **819 cases, 0 unexpected, 0 known**. All four left
+`scripts/jq-fanout-oracle-sweep.sh` at 490/490.
 
 Unrelated to the other `?//` divergence recorded above
 ([#1365](https://github.com/rust-works/succinctly/issues/1365), `?//`-alternatives folds not being
