@@ -42833,3 +42833,134 @@ fn test_path_through_bound_variable_matches_jq_2072() -> Result<()> {
 
     Ok(())
 }
+
+/// #2103 review (coverage-diff bot, PR #2652): `eval_each_pipe_generic`'s
+/// empty-`exprs` tail fix changed the shape of item that flows out of a
+/// bare `keys_unsorted[]` (`OneCursorValue` instead of `One`), which
+/// changed nothing observable at the top level -- but at the *top* level,
+/// `.a // X`/`try X catch Y`/`X?` all dispatch through `eval_each_generic`'s
+/// own native, push-model arms (`Expr::Try`/`Expr::Optional` ->
+/// `each_try_generic`), never through `eval_single`'s pull-model twins
+/// (`try_single_generic`, `prepend_generic`, `fold_lazy_keys_stage`,
+/// `fold_lazy_seq_stage`, `eval_limit_generic`). Those pull-model functions
+/// are only reached once something *nested* forces `eval_single` --
+/// `Expr::Alternative` (`//`) and `Expr::Object` (`{...}`) are the two
+/// shapes with no native push arm at all (see `eval_each_generic`'s own
+/// wildcard fallback), so this is where the existing test suite's coverage
+/// of them lived. The suite's own regression tests for those pull-model
+/// arms all happened to route their `keys_unsorted`/`limit`/`map` shapes
+/// through the exact one construction the #2103 fix touched, so once that
+/// shape started flowing an `OneCursorValue` (still handled correctly, just
+/// via a different arm than before), a batch of *other*, unrelated arms in
+/// the same functions lost their only test-suite path in. This restores
+/// each with a construction that doesn't touch `OneCursorValue` at all --
+/// confirmed directly against `cargo llvm-cov`'s per-line hit data on this
+/// tree, not by static reading alone:
+///
+/// - `.a // (try (...) catch ...)`: forces the `try`/`catch` through
+///   `eval_single`'s own `Expr::Try` arm (`try_single_generic`), not the
+///   native push route.
+/// - `prepend_generic`'s `Owned(v)` arm: a `try` body that raises through a
+///   `Comma` (itself only reached via `eval_single`, splicing outputs via
+///   `push_generic_owned_values`) after collecting a literal prefix, caught
+///   by a single-value handler.
+/// - `try_single_generic`'s `LazySeq` arm's `Halt` case: a `try (map(...))`
+///   body materializing to a `LazySeq` whose own filter halts.
+/// - `try_single_generic`'s `LazyKeys` arm, both outcomes: a well-formed
+///   document takes the `Ok(())` re-wrap; a document with a missing member
+///   delimiter takes the `Err(_)` guard (the guard's own body stays
+///   genuinely dead for every format shipped today, per the existing
+///   comment right above it -- only the guard *line* needing a `Err(_)` to
+///   reach it at all).
+/// - `fold_lazy_keys_stage`'s `Expr::Iterate` arm: `{v: (keys_unsorted |
+///   .[])}` forces the pipe through `eval_single`'s own `Expr::Pipe` arm
+///   (`fold_pipe_stages`) instead of the sink-based
+///   `each_lazy_keys_iterate_sink` route `keys_unsorted[]` takes at the top
+///   level.
+/// - `eval_limit_generic`'s `items_to_generic_result` error arm: `limit(2;
+///   5, .arr[0])` pulls a literal and a lazy, not-yet-decoded array-element
+///   cursor cleanly (no escape during the pull), so the decode failure
+///   surfaces only when the mixed batch is converted afterward.
+#[test]
+fn test_pull_model_arms_reachable_only_through_a_nested_forcing_context_2103() -> Result<()> {
+    // `prepend_generic`'s `Owned(v)` arm, plus `push_generic_owned_values`'s
+    // own `One`/`Owned` split feeding it (a comma of two literals then an
+    // error, caught by a single-value handler).
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#".a // (try (1,2,error("boom")) catch "c")"#],
+        Some(r#"{"a":null}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr}");
+    assert_eq!(stdout, "1\n2\n\"c\"\n");
+
+    // `fold_lazy_seq_stage`'s `Expr::Iterate` arm's `Halt` case: a `map`
+    // whose body halts, then iterated one more stage.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#".a // (try (.arr | map(halt) | .[]) catch "c")"#],
+        Some(r#"{"a":null,"arr":[1,2,3]}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr}");
+    assert_eq!(stdout, "");
+
+    // `try_single_generic`'s `LazySeq` arm's `Halt` case (no further
+    // `Expr::Iterate` needed -- `map(halt)` alone materializes atomically).
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#".a // (try (map(halt)) catch "c")"#],
+        Some(r#"{"a":null,"b":1,"c":2}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr}");
+    assert_eq!(stdout, "");
+
+    // `try_single_generic`'s `LazyKeys` arm: well-formed document takes the
+    // `Ok(())` re-wrap and keeps streaming.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"{v: (try (keys_unsorted) catch "c")}"#],
+        Some(r#"{"b":1,"a":2}"#),
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr}");
+    assert_eq!(stdout, "{\"v\":[\"b\",\"a\"]}\n");
+
+    // Same `LazyKeys` arm, malformed document: reaches the `Err(_)` guard
+    // (`keys_are_well_formed`'s own error is never `is_decode_failure()`
+    // today, so the guard's body stays dead -- this only needs the guard
+    // line itself to be evaluated, which any `Err(_)` here does).
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", r#"{v: (try (keys_unsorted) catch "c")}"#],
+        Some(r#"{"a" 1, "b": 2}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr}");
+    assert!(stdout.trim().is_empty(), "stdout: {stdout:?}");
+    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr}");
+
+    // `fold_lazy_keys_stage`'s `Expr::Iterate if !sorted` arm's `Err` case:
+    // `keys_unsorted | .[]` folded through `eval_single`'s own pull-model
+    // `Expr::Pipe` handling (forced by the enclosing object-construction
+    // value slot, which has no native push arm) walks the whole object to
+    // collect every cursor and hits the missing-delimiter check.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "{v: (keys_unsorted | .[])}"],
+        Some(r#"{"a" 1, "b": 2}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr}");
+    assert!(stdout.trim().is_empty(), "stdout: {stdout:?}");
+    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr}");
+
+    // `eval_limit_generic`'s `items_to_generic_result` error arm: `5` pulls
+    // clean (an owned literal), `.arr[0]` pulls clean too (an
+    // undecoded cursor onto a malformed object -- indexing into an array
+    // element never decodes the element itself), so the pull loop stops at
+    // `n=2` without ever escaping; the malformed-delimiter decode failure
+    // only surfaces once the captured batch is converted afterward, mid-way
+    // through the mixed (`Owned`, `OneCursor`) batch -- keeping `5` as the
+    // already-converted prefix, same as this file's other
+    // streams-before-erroring assertions.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "{v: (limit(2; 5, .arr[0]))}"],
+        Some(r#"{"arr":[{"bad" 1}]}"#),
+    )?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr}");
+    assert_eq!(stdout, "{\"v\":5}\n");
+    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr}");
+
+    Ok(())
+}
