@@ -62,16 +62,16 @@ use super::eval::{
     index_component_value, index_in_array_bounds, index_one_owned as index_owned_by_key,
     is_pure_chain_link, is_retryable_stop, literal_to_owned, mark_nonretryable_escape,
     needs_path_context, numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned,
-    owned_bound_to_i64, owned_to_expr, owned_to_string, param_names, prefer_pending_control,
-    resume_from_escape, select_emits, slice_component_value, slice_object_as_yq_children,
-    slice_owned_value_read, stop_with_downstream, stop_with_error, stop_with_escape,
-    streams_escaped_generator_prefix, streams_unbounded, substitute_bound_var_from,
-    substitute_vars, suppress_or_raise, suppresses, tonumber_from_str, vec_with_capacity,
-    yq_absent_key_read_is_empty, yq_assign_rhs_document, yq_empty_operand_output,
-    yq_field_index_on_scalar_is_empty, yq_negative_index_check, yq_numeric_index_on_object_is_null,
-    yq_object_key_stringify, yq_read_only_context, BinaryFanoutRules, Control, Demand,
-    EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, ForeachElementSink, JqSemantics,
-    LimitN, PathTrail, QueryResult, YqSemantics,
+    owned_bound_to_i64, owned_to_expr, owned_to_string, param_names,
+    pattern_alternatives_var_names, prefer_pending_control, resume_from_escape, select_emits,
+    slice_component_value, slice_object_as_yq_children, slice_owned_value_read,
+    stop_with_downstream, stop_with_error, stop_with_escape, streams_escaped_generator_prefix,
+    streams_unbounded, substitute_bound_var_from, substitute_vars, suppress_or_raise, suppresses,
+    tonumber_from_str, vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
+    yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_negative_index_check,
+    yq_numeric_index_on_object_is_null, yq_object_key_stringify, yq_read_only_context,
+    BinaryFanoutRules, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
+    ForeachElementSink, JqSemantics, LimitN, PathTrail, QueryResult, YqSemantics,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -8714,12 +8714,7 @@ fn each_as_pattern_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Flow {
-    let mut all_var_names: Vec<String> = Vec::new();
-    for pattern in patterns {
-        collect_pattern_var_names(pattern, &mut all_var_names);
-    }
-    all_var_names.sort_unstable();
-    all_var_names.dedup();
+    let all_var_names = pattern_alternatives_var_names(patterns);
 
     fanout_arg_each_generic::<S, V, _>(expr, value.clone(), optional, cursor, |bound_val| {
         each_pattern_alternatives_generic::<S, V>(

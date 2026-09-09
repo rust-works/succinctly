@@ -1512,7 +1512,7 @@ fn test_parity_positive_index_trailing_comma_2312() {
 /// re-entry" entry and `eval.rs`'s
 /// `test_foreach_reduce_init_fork_source_reads_ambient_input_2163`). Both
 /// front ends here (`full_outputs`/`generic_outputs`) ultimately dispatch to
-/// the same shared `eval_reduce_with_values`/`eval_foreach_with_values` core,
+/// the same shared `eval_reduce_with_values`/`foreach_forks` core,
 /// so this does not double-verify two independently-coded evaluators — it
 /// pins that each front end's own input-collection step still feeds that
 /// shared core the same way, so a future change to either front end's
@@ -1533,13 +1533,15 @@ fn test_parity_foreach_reduce_init_fork_source_reads_ambient_input_2163() {
 /// as $x (error("init"); .)` reports `init`, and `reduce`'s twin does too;
 /// succinctly reported `in` from both front ends before the fix.
 ///
-/// The two front ends share `eval_foreach_with_values`/
+/// The two front ends share `foreach_forks`/
 /// `eval_reduce_with_values` (see the #2163 test above for what that does and
 /// does not prove), but the ordering being pinned here is *each front end's
 /// own*: the fix moved the INIT evaluation out of the callers' hand-rolled
-/// prologues and into a `source` closure the shared core decides whether to
-/// call at all, so a front end that reverted to evaluating SOURCE eagerly
-/// would fail here while still compiling.
+/// prologues and into a source strategy the shared core decides whether to
+/// call at all (`reduce` still passes a `source` closure; `foreach`, since
+/// #2180 WP3's review, passes a drive called once per INIT fork), so a front
+/// end that reverted to evaluating SOURCE eagerly would fail here while still
+/// compiling.
 #[test]
 fn test_parity_fold_init_evaluated_before_source_2440() {
     for filter in [
