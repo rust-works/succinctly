@@ -13933,8 +13933,8 @@ mod meta_assign_798 {
 
     /// `style = "double"`/`"single"` on every non-string scalar kind
     /// [`plain_scalar_text`] handles, live-verified against pinned yq: a
-    /// `null`, a bare int, a finite float and both non-finite floats all
-    /// stringify to their source spelling, quoted.
+    /// `null` and both non-finite floats all stringify to their source
+    /// spelling, quoted.
     #[test]
     fn style_assign_double_on_every_non_string_scalar_kind() -> Result<()> {
         for (input, expected) in [
@@ -13948,6 +13948,26 @@ mod meta_assign_798 {
             assert_eq!(code, 0, "[{input}]");
             assert_eq!(out, expected, "[{input}]");
         }
+        Ok(())
+    }
+
+    /// [`plain_scalar_text`]'s plain `Int`/`Float` arms specifically (as
+    /// opposed to `NumberLiteral`, which is what a number read straight off
+    /// the page decodes to, per this codebase's own type-preservation
+    /// design -- P10 in `CLAUDE.md`): a number that reaches the target
+    /// *computed* by an earlier pipe stage, rather than read directly from
+    /// the document, loses its source spelling and decodes as a plain
+    /// `Int`/`Float` instead. Both still stringify the same way, live-
+    /// verified against pinned yq.
+    #[test]
+    fn style_assign_double_on_a_computed_int_or_float_scalar() -> Result<()> {
+        let (out, code) = run_yq_stdin(".a = (.a + 0) | .a style = \"double\"", "a: 5\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "a: \"5\"\n");
+
+        let (out, code) = run_yq_stdin(".a = (.a + 0.0) | .a style = \"double\"", "a: 1.5\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "a: \"1.5\"\n");
         Ok(())
     }
 
@@ -13983,6 +14003,23 @@ mod meta_assign_798 {
         let (out, code) = run_yq_stdin(".a[0:2] line_comment = \"x\"", "a: [1, 2, 3]\n", &[])?;
         assert_eq!(code, 0);
         assert_eq!(out, "a: [1, 2, 3]\n");
+        Ok(())
+    }
+
+    /// `|=`'s per-candidate value fetch ([`owned_value_at`]'s `Array`/
+    /// `Index` arm) reads an array element's own current value, not just an
+    /// object field's -- `line_comment_update_rhs_dot_binds_to_the_targets_
+    /// value_not_the_old_comment` above only exercises the object-field
+    /// side of the same match. Live-verified against pinned yq.
+    #[test]
+    fn update_form_reads_an_array_elements_own_value() -> Result<()> {
+        let (out, code) = run_yq_stdin(
+            ".a[0] line_comment |= . + \"-c\"",
+            "a:\n  - x\n  - y\n",
+            &[],
+        )?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "a:\n  - x # x-c\n  - y\n");
         Ok(())
     }
 
@@ -14073,6 +14110,10 @@ mod meta_assign_798 {
             run_yq_stdin_with_stderr(".a line_comment = error(\"boom\")", "a: 1\n", &[]).unwrap();
         assert_eq!(code, 1, "stderr: {err}");
         assert!(err.contains("boom"), "stderr: {err}");
+
+        let (out, code) = run_yq_stdin(".a line_comment = empty", "a: 1\n", &[]).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(out, "a: 1\n");
     }
 
     /// Known gap, not specific to #798: [`resolve_meta_assign_writes`]
