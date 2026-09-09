@@ -2453,17 +2453,22 @@ impl<'a> Parser<'a> {
                     // destructure the matched value -- `$a` still binds the
                     // whole value under its own name (same as the bare
                     // shorthand), *and* `Pattern` binds again, independently,
-                    // against that same value. Desugared here into *two*
-                    // ordinary entries sharing one key, rather than a new
-                    // `Pattern` variant: `Pattern::Object`'s own evaluation
-                    // already re-fetches the value once per entry regardless
-                    // of key uniqueness (real jq's own object patterns
-                    // already tolerate a repeated key the same way --
-                    // confirmed live), so two same-key entries reproduce
-                    // `{$a: Pattern}`'s exact semantics with no new
-                    // AST shape or evaluator match arm needed. Peeking past
-                    // the identifier for `:` is required to tell the two
-                    // `$`-led shapes apart.
+                    // against that same value. Real jq's `parser.y` compiles
+                    // `'$' IDENT ':' Pattern` as a *single* production --
+                    // `gen_object_matcher(gen_const(name), BLOCK(DUP, STOREV,
+                    // Pattern))` -- i.e. one `INDEX name` step whose bytecode
+                    // both stores the matched value into `$a` and recurses
+                    // `Pattern` over it. That single-INDEX shape matters once
+                    // path tracking is involved (#2649): a path-mode reader
+                    // walks one `PatternEntry` as one tracked index step, so
+                    // desugaring `{$a: Pattern}` into *two* same-key entries
+                    // would wrongly perform a second tracked step against the
+                    // parent value -- while an explicit `{a:$m, a:Pattern}`
+                    // (two real entries, no `$`) must still perform two,
+                    // matching jq's own refusal at the second step there.
+                    // `PatternEntry.bind` carries the `$a` binding so a single
+                    // entry can do both jobs. Peeking past the identifier for
+                    // `:` is required to tell the two `$`-led shapes apart.
                     if self.peek() == Some('$') {
                         self.next();
                         let name = self.parse_ident()?;
@@ -2474,15 +2479,13 @@ impl<'a> Parser<'a> {
                             let nested = self.parse_pattern()?;
                             entries.push(PatternEntry {
                                 key: name.clone(),
-                                pattern: Pattern::Var(name.clone()),
-                            });
-                            entries.push(PatternEntry {
-                                key: name,
+                                bind: Some(name),
                                 pattern: nested,
                             });
                         } else {
                             entries.push(PatternEntry {
                                 key: name.clone(),
+                                bind: None,
                                 pattern: Pattern::Var(name),
                             });
                         }
@@ -2500,7 +2503,11 @@ impl<'a> Parser<'a> {
 
                         // Parse the pattern for this key
                         let pattern = self.parse_pattern()?;
-                        entries.push(PatternEntry { key, pattern });
+                        entries.push(PatternEntry {
+                            key,
+                            bind: None,
+                            pattern,
+                        });
                     }
 
                     self.skip_ws();

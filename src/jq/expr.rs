@@ -1066,6 +1066,10 @@ pub enum Pattern {
 pub struct PatternEntry {
     /// The key to match (always a string literal in patterns)
     pub key: String,
+    /// The `$name` of a `{$name: P}` entry, bound to the matched value before
+    /// `pattern` runs on it. `None` for `{key: P}` and for the `{$name}`
+    /// shorthand (which desugars to `key: name, pattern: Var(name)`).
+    pub bind: Option<String>,
     /// The pattern to bind the value to
     pub pattern: Pattern,
 }

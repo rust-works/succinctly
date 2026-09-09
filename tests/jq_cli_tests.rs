@@ -18335,15 +18335,17 @@ fn test_foreach_and_reduce_object_pattern_duplicate_var_keeps_first_field_1366()
     Ok(())
 }
 
-/// #1366 code review: `{$a: Pattern}` (#1204's key-shorthand pattern)
-/// desugars into two `PatternEntry`s sharing the key `"a"` -- an implicit
-/// whole-field bind (`{key:"a", pattern:Var("a")}`) followed by whatever
-/// the user's own nested `Pattern` does. When that nested pattern also
-/// binds `$a`, this is a same-name collision baked into one syntactic
-/// construct rather than two explicit fields, and it happens to already
-/// resolve correctly (the auto-bind is the object pattern's *first* field
-/// textually, so it wins under the plain, non-`?//` rule) -- pinned here
-/// since none of the tests above exercise this desugaring path.
+/// #1366 code review: `{$a: Pattern}` (#1204's key-shorthand pattern) is one
+/// `PatternEntry` (key `"a"`, `bind: Some("a")`, `pattern: Pattern`) whose
+/// evaluation binds the whole matched value to `$a` *before* running the
+/// user's own nested `Pattern` against that same value (#2649 needed this
+/// as a single tracked step, matching jq's own single-`INDEX` compilation).
+/// When that nested pattern also binds `$a`, this is a same-name collision
+/// baked into one syntactic construct rather than two explicit fields, and
+/// it happens to already resolve correctly (the `bind` runs before the
+/// sub-pattern's own bindings, so the sub-pattern wins under the plain,
+/// non-`?//` rule) -- pinned here since none of the tests above exercise
+/// this desugaring path.
 #[test]
 fn test_key_shorthand_pattern_duplicate_var_1366() -> Result<()> {
     let (stdout, _stderr, code) =
