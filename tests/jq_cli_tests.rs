@@ -41007,6 +41007,59 @@ fn test_as_binding_keeps_the_input_identity_2563() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// #2072's `owned_identity_bind_values` fallback: an `as` stage inside the
+/// owned identity pipe first tries to run its own bind source *as stages of
+/// this same pipe* (`owned_identity_pipe_supported`), so `$x` can carry the
+/// bind source's own node identity (see
+/// [`test_as_binding_keeps_the_input_identity_2563`]'s `.a.b | . as $x`
+/// rows). A self-recursive `def` can't be admitted that way: the gate is
+/// static, so it cannot see that `rec(0)`'s condition takes the base case
+/// immediately -- it has to assume the worst (the `else` branch's own
+/// recursive call always might be taken) and unfolds through
+/// `OWNED_IDENTITY_DEF_UNFOLD_LIMIT` (8) levels of `def` binding before
+/// giving up, regardless of the argument actually passed at runtime. Once
+/// declined, the bind source falls back to being resolved as a single value
+/// through the ordinary (eager) route instead, and that route carries no
+/// node identity at all -- `$x`'s origin is `None`, so `key`/`path` on it
+/// fall back to `bound_var_identity`'s detached case (the bound value `0`
+/// isn't equal to the current input `1`, so unlike
+/// [`test_bound_var_falls_back_without_a_resolvable_origin_2072`]'s
+/// value-equality fallback, `$x` here has no position at all) even though
+/// `$x` itself still carries the right value.
+///
+/// `key`/`path` are succinctly's own extension surface (no jq equivalent),
+/// so there is no oracle to check here -- only the internally consistent
+/// answer: `$x` prints its bound value, but has no position of its own.
+#[test]
+fn test_recursive_def_bind_source_has_no_node_identity_2072() -> anyhow::Result<()> {
+    let doc = r#"{"a":1}"#;
+    let filter = "def rec(n): if n <= 0 then n else (n - 1 | rec(n-1)) end; \
+                  (.a + 0) | (rec(0)) as $x | $x";
+    for (suffix, want) in [("", "0"), (" | key", ""), (" | path", "[]")] {
+        let full = format!("{filter}{suffix}");
+        let (out, err, code) = run_jq_full(&["-c", &full], Some(doc))?;
+        assert_eq!(code, 0, "`{full}`: {out:?} {err}");
+        assert_eq!(out.trim_end(), want, "`{full}`");
+    }
+    Ok(())
+}
+
+/// #2072's `materialize_bound_values_with_origin` empty-output arm: an `as`
+/// binding whose source produces *no* values and raises no escape (`empty`,
+/// as opposed to an error/break/halt) still has to report that "nothing
+/// bound" outcome as a plain `Flow::Exhausted`, not an escape -- the same
+/// contract the pre-#2072 `materialize_bound_values_generic` already had for
+/// this exact shape, now duplicated onto the twin that also records origins.
+/// Captured live from `/usr/bin/jq` 1.7.1: `empty as $x | 1` prints nothing,
+/// exit 0.
+#[test]
+fn test_empty_bind_source_reports_exhausted_not_an_escape_2072() -> anyhow::Result<()> {
+    let (out, err, code) = run_jq_full(&["-c", "empty as $x | 1"], Some("null"))?;
+    assert_eq!(code, 0, "{out:?} {err}");
+    assert_eq!(out, "", "`empty as $x | 1` should print nothing");
+    Ok(())
+}
+
 /// Spine 2416's identity pass in jq mode. jq 1.7.1 has no `key`/`parent`/
 /// `path/0`, so every row here is succinctly's own extension surface, pinned
 /// so the route change is readable: the first table is unchanged from

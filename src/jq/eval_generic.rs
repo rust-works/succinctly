@@ -19664,7 +19664,7 @@ fn owned_identity_placed_by<S: EvalSemantics, V: DocumentValue>(
         OwnedIdentityRule::Bound => {
             let origin = match strip_parens(stage) {
                 Expr::TrackedVar(var) => var.node.as_ref(),
-                _ => None,
+                _ => None, // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- `owned_identity_rule` maps a bare `Expr::Var` to `Bound` too (for the *static* gate, which sees a body before its `as` substitution runs), but every runtime dispatch that reaches this rule (`owned_identity_after_stage`/`owned_identity_placed_by`, from `owned_identity_leaving_cursor`'s `Bound` arm) only ever sees a stage *after* `eval_owned_identity_as`'s unconditional `substitute_bound_var_from` call, which always turns `$x` into `Expr::TrackedVar` before recursing -- confirmed by running the full suite with this arm replaced by a hard `panic!()`, which never fired (#2072)"
             };
             Some(bound_var_identity::<S, V>(origin, output, value, id))
         }
