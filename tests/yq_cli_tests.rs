@@ -13597,6 +13597,202 @@ fn test_line_comment_builtin_710() -> Result<()> {
     Ok(())
 }
 
+/// #798 PR1: `PATH <slot> = value` / `PATH <slot> |= filter` metadata
+/// assignment grammar. Every expected value below is live-verified against
+/// pinned yq v4.53.3 (`tests/data/yq-golden/YQ_VERSION`).
+mod meta_assign_798 {
+    use super::{run_yq_stdin, run_yq_stdin_with_stderr};
+    use anyhow::Result;
+
+    #[test]
+    fn line_comment_assign_sets_a_new_trailing_comment() -> Result<()> {
+        let (out, code) = run_yq_stdin(".a line_comment = \"y\"", "a: 1\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "a: 1 # y\n");
+        Ok(())
+    }
+
+    #[test]
+    fn line_comment_assign_empty_string_clears_an_existing_comment() -> Result<()> {
+        let (out, code) = run_yq_stdin(".a line_comment = \"\"", "a: 1 # x\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "a: 1\n");
+        Ok(())
+    }
+
+    /// `|=`'s RHS binds `.` to the target's own *value* (5), not the
+    /// slot's old text ("x") -- live-verified: real yq's `# 5-suffix`, not
+    /// `# x-suffix`.
+    #[test]
+    fn line_comment_update_rhs_dot_binds_to_the_targets_value_not_the_old_comment() -> Result<()> {
+        let (out, code) = run_yq_stdin(".a line_comment |= . + \"-suffix\"", "a: 5 # x\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "a: 5 # 5-suffix\n");
+        Ok(())
+    }
+
+    #[test]
+    fn style_assign_flow_renders_a_flow_mapping() -> Result<()> {
+        let (out, code) = run_yq_stdin(". style = \"flow\"", "a: 1\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "{a: 1}\n");
+        Ok(())
+    }
+
+    #[test]
+    fn style_assign_double_quotes_a_string_scalar() -> Result<()> {
+        let (out, code) = run_yq_stdin(".a style = \"double\"", "a: hello\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "a: \"hello\"\n");
+        Ok(())
+    }
+
+    #[test]
+    fn style_assign_unknown_value_raises() {
+        let (_out, err, code) =
+            run_yq_stdin_with_stderr(".a style = \"bogus\"", "a: 1\n", &[]).unwrap();
+        assert_eq!(code, 1, "stderr: {err}");
+        assert!(err.contains("unknown style bogus"), "stderr: {err}");
+    }
+
+    #[test]
+    fn anchor_assign_declares_the_anchor_in_rendered_output() -> Result<()> {
+        let (out, code) = run_yq_stdin(".a anchor = \"z\"", "a: 1\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "a: &z 1\n");
+        Ok(())
+    }
+
+    /// Known gap (documented in `docs/compliance/yq/limitations.md`'s #798
+    /// entry): this write pass has no read-after-write model, so a GET-form
+    /// builtin later in the *same* pipe still reads the original YAML
+    /// cursor, not the write this pass resolved -- unlike real yq, which
+    /// live-verified returns `"z"` here. Pinning the current (wrong, but
+    /// intentional-for-PR1) output so a future fix updates this test
+    /// deliberately instead of silently.
+    #[test]
+    fn anchor_assign_is_not_yet_readable_back_within_the_same_pipe() -> Result<()> {
+        let (out, code) = run_yq_stdin(".a anchor = \"z\" | .a | anchor", "a: 1\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out.trim(), "");
+        Ok(())
+    }
+
+    #[test]
+    fn anchor_assign_empty_string_clears_an_existing_anchor() -> Result<()> {
+        let (out, code) = run_yq_stdin(".a anchor = \"\"", "a: &z 1\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "a: 1\n");
+        Ok(())
+    }
+
+    /// Root (`.`) targets: `anchor`/`style` render at the document root,
+    /// `line_comment` does not -- both live-verified against pinned yq,
+    /// which is itself asymmetric here (not a succinctly gap; see this
+    /// issue's `docs/compliance/yq/limitations.md` entry).
+    #[test]
+    fn root_anchor_and_style_assign_render_but_root_line_comment_does_not() -> Result<()> {
+        let (out, code) = run_yq_stdin(". anchor = \"z\"", "a: 1\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "&z\na: 1\n");
+
+        let (out, code) = run_yq_stdin(". style = \"flow\"", "a: 1\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "{a: 1}\n");
+
+        let (out, code) = run_yq_stdin(". line_comment = \"q\"", "a: 1\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "a: 1\n");
+        Ok(())
+    }
+
+    /// A direct juxtaposed metadata assignment (`.a line_comment = "y"`, no
+    /// pipe) now parses straight to the new grammar, so the only way an
+    /// ordinary `=`/`|=`'s path can *be* a bare metadata builtin is through
+    /// a preceding pipe stage splitting the keyword off from its target
+    /// (`.a | line_comment` is a complete GET-form pipe stage on its own,
+    /// then `= "y"` is an ordinary, invalid assignment to it). Real yq
+    /// raises the same text for every slot and for both `=`/`|=`.
+    #[test]
+    fn piped_metadata_builtin_as_assign_lhs_raises_yqs_own_error() {
+        for filter in [
+            ".a | line_comment = \"y\"",
+            ".a | line_comment |= \"y\"",
+            ".a | style = \"flow\"",
+            ".a | anchor = \"z\"",
+        ] {
+            let (_out, err, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[]).unwrap();
+            assert_eq!(code, 1, "[{filter}] stderr: {err}");
+            assert!(
+                err.contains("'|' expects 2 args but there is 1"),
+                "[{filter}] stderr: {err}"
+            );
+        }
+    }
+
+    /// `tag =`/`head_comment =`/`foot_comment =`/`comments =` parse (the
+    /// shared grammar is complete) but raise an explicit "not yet
+    /// supported" error rather than silently no-oping -- real yq itself
+    /// fully supports all four; succinctly doesn't yet (#798 PR2/PR3/PR5).
+    #[test]
+    fn stub_slots_parse_but_raise_not_yet_supported() {
+        for (filter, slot) in [
+            (".a tag = \"!!str\"", "tag"),
+            (".a head_comment = \"hi\"", "head_comment"),
+            (".a foot_comment = \"bye\"", "foot_comment"),
+            (".a comments = \"x\"", "comments"),
+        ] {
+            let (_out, err, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[]).unwrap();
+            assert_eq!(code, 1, "[{filter}] stderr: {err}");
+            assert!(
+                err.contains(&format!("{slot} = ... is not yet supported")),
+                "[{filter}] stderr: {err}"
+            );
+        }
+    }
+
+    /// A metadata assignment doesn't touch the JSON/YAML value tree at all
+    /// -- confirms the regression the naive "self-assign via `eval_assign`"
+    /// implementation attempt caused: forking per RHS output corrupted a
+    /// multi-candidate target's *values* (`.[] line_comment = "hi"` on
+    /// `a: 1\nb: 2` briefly became `a: 2\nb: 2`). Values must stay intact
+    /// even where the (out-of-scope-for-PR1) multi-candidate write itself
+    /// isn't applied.
+    #[test]
+    fn multi_candidate_target_never_corrupts_the_document_values() -> Result<()> {
+        let (out, code) = run_yq_stdin(".[] line_comment = \"hi\"", "a: 1\nb: 2\n", &[])?;
+        assert_eq!(code, 0);
+        assert!(out.contains("a: 1"), "stdout: {out:?}");
+        assert!(out.contains("b: 2"), "stdout: {out:?}");
+        Ok(())
+    }
+
+    /// The existing `line_comment`/`style`/`anchor` GET-forms are the
+    /// regression gate this PR's own staging plan calls for: byte-identical
+    /// before and after adding the assignment grammar.
+    #[test]
+    fn existing_get_forms_are_unaffected() -> Result<()> {
+        let (out, code) = run_yq_stdin(".a | line_comment", "a: 1 # keep this\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out.trim(), "keep this");
+
+        let (out, code) = run_yq_stdin(".a | style", "a: \"1\"\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out.trim(), "double");
+
+        let (out, code) = run_yq_stdin(".a | anchor", "a: &z 1\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out.trim(), "z");
+
+        // An ordinary field named "style"/"anchor"/"line_comment" must still
+        // parse as plain field access, not the new metadata-op grammar.
+        let (out, code) = run_yq_stdin(".style", "style: 1\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out.trim(), "1");
+        Ok(())
+    }
+}
+
 /// No space after `#` - nothing to strip, matching real `yq`'s value. A
 /// bare top-level scalar result drops its own styling unconditionally
 /// (#852), so this prints raw `#keep this` even though an unquoted string

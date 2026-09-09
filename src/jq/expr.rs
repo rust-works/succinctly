@@ -761,6 +761,50 @@ pub enum Expr {
         /// Default value expression (right side)
         value: Box<Self>,
     },
+
+    /// yq metadata assignment: `PATH <slot> = value` / `PATH <slot> |= filter`
+    /// (#798), e.g. `.a line_comment = "hi"`, `.a style = "flow"`,
+    /// `.a anchor = "z"`. Distinct grammar from `Assign`/`Update`: the target
+    /// is a node's metadata slot (comment/style/anchor/...), not a value
+    /// position, and the value itself is left unchanged.
+    MetaAssign {
+        /// The node whose metadata is being written (parsed like `Assign`'s
+        /// `path`, but not a value-tree path — see [`MetaSlot`]).
+        target: Box<Self>,
+        /// Which metadata slot to write.
+        slot: MetaSlot,
+        /// Right-hand side. For `=`, evaluated once against the root input.
+        /// For `|=` (`is_update`), evaluated with `.` bound to the target
+        /// node's own value (matching real yq's measured behaviour, not the
+        /// slot's prior value).
+        value: Box<Self>,
+        /// `false` for `=`, `true` for `|=`.
+        is_update: bool,
+    },
+}
+
+/// The metadata slot addressed by a yq `PATH <slot> = value` assignment (#798).
+///
+/// Mirrors the existing GET-form [`Builtin`] keywords
+/// (`Tag`/`Anchor`/`Style`/`LineComment`) but is a distinct type: this
+/// grammar recognizes `head_comment`/`foot_comment`/`comments` too, which
+/// have no GET-form `Builtin` variant yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetaSlot {
+    /// `line_comment = ...` — the node's trailing same-line comment.
+    LineComment,
+    /// `style = ...` — the node's YAML style (flow/double/single/literal/folded/tagged).
+    Style,
+    /// `anchor = ...` — the node's `&anchor` declaration.
+    Anchor,
+    /// `tag = ...` — the node's YAML type tag. Parses; not yet supported (#798 PR1).
+    Tag,
+    /// `head_comment = ...` — standalone comment lines above the node. Parses; not yet supported (#798 PR1).
+    HeadComment,
+    /// `foot_comment = ...` — standalone comment lines below the node. Parses; not yet supported (#798 PR1).
+    FootComment,
+    /// `comments = ...` — sets head/line/foot together. Parses; not yet supported (#798 PR1).
+    Comments,
 }
 
 /// A [`Expr::DefCall`]'s substituted body, computed on first evaluation and

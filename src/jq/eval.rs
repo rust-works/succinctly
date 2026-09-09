@@ -364,8 +364,8 @@ use crate::json::light::{JsonCursor, JsonElements, JsonFields, StandardJson};
 
 use super::expr::{
     ArithOp, AssignOp, BindOrigin, BoundBody, Builtin, CompareOp, Expr, FormatType, FuncDefBound,
-    FuncDefData, Literal, MergeFlags, NumberKey, ObjectEntry, ObjectKey, Origin, Param, Pattern,
-    StringPart, Tracked,
+    FuncDefData, Literal, MergeFlags, MetaSlot, NumberKey, ObjectEntry, ObjectKey, Origin, Param,
+    Pattern, StringPart, Tracked,
 };
 use super::value::{
     assert_value_tree_depth, cmp_f64, infinite_float_preview_text, is_infinity_sentinel,
@@ -1310,6 +1310,7 @@ fn contains_assign_scoped<'e>(expr: &'e Expr, scope: &mut DefScope<'e>) -> bool 
         | Expr::Update { .. }
         | Expr::CompoundAssign { .. }
         | Expr::AlternativeAssign { .. }
+        | Expr::MetaAssign { .. }
         | Expr::Builtin(Builtin::Del(_) | Builtin::SetPath(..) | Builtin::DelPaths(_)) => true,
         Expr::Paren(inner) | Expr::Optional(inner) => contains_assign_scoped(inner, scope),
         Expr::Shared(inner) => contains_assign_scoped(inner, scope),
@@ -1386,6 +1387,7 @@ pub fn is_alias_sensitive_assign(expr: &Expr) -> bool {
             | Expr::Update { .. }
             | Expr::CompoundAssign { .. }
             | Expr::AlternativeAssign { .. }
+            | Expr::MetaAssign { .. }
             | Expr::Identity
             | Expr::Builtin(
                 Builtin::Del(_)
@@ -2755,6 +2757,9 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         } => eval_compound_assign::<W, S>(*op, path, val, value, optional),
         Expr::AlternativeAssign { path, value: val } => {
             eval_alternative_assign::<W, S>(path, val, value, optional)
+        }
+        Expr::MetaAssign { target, slot, .. } => {
+            eval_meta_assign::<W, S>(target, *slot, value, optional)
         }
 
         // Label-break for non-local control flow
@@ -22442,6 +22447,11 @@ fn eval_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     input: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    if S::TAG == EvalTag::Yq {
+        if let Some(e) = yq_metadata_builtin_as_assign_path_error(path_expr) {
+            return QueryResult::Error(e);
+        }
+    }
     let yq_noop_check = match yq_assign_noop_check::<_, S>(path_expr, &input) {
         Ok(check) => check,
         Err(e) => return QueryResult::Error(e),
@@ -22615,6 +22625,11 @@ fn eval_update<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     scalar_slice_noop: bool,
 ) -> QueryResult<'a, W> {
+    if S::TAG == EvalTag::Yq {
+        if let Some(e) = yq_metadata_builtin_as_assign_path_error(path_expr) {
+            return QueryResult::Error(e);
+        }
+    }
     // Convert input to owned for modification. #1953: a non-decode-failure
     // to_owned error respects `optional` like every other fallible
     // step at this boundary (see this function's own `resolve_dynamic_indexes`
@@ -23411,6 +23426,119 @@ fn eval_alternative_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             )
         },
     )
+}
+
+/// The keyword spelling of a [`MetaSlot`], for error messages.
+fn meta_slot_keyword(slot: MetaSlot) -> &'static str {
+    match slot {
+        MetaSlot::LineComment => "line_comment",
+        MetaSlot::Style => "style",
+        MetaSlot::Anchor => "anchor",
+        MetaSlot::Tag => "tag",
+        MetaSlot::HeadComment => "head_comment",
+        MetaSlot::FootComment => "foot_comment",
+        MetaSlot::Comments => "comments",
+    }
+}
+
+/// Evaluate a yq metadata assignment: `PATH <slot> = value` / `PATH <slot>
+/// |= filter` (#798), e.g. `.a line_comment = "hi"`, `.a style = "flow"`,
+/// `.a anchor = "z"`.
+///
+/// `line_comment`/`style`/`anchor` don't live in the JSON/YAML value tree at
+/// all -- they're tracked in a separate `CommentTree` side-table
+/// (`src/jq/eval_generic.rs`'s `NodeMeta`) that only the yq CLI runner
+/// (`src/bin/succinctly/yq_runner.rs`) has access to. That runner applies the
+/// real metadata write from this same unevaluated `Expr::MetaAssign` node
+/// (mirroring how `propagate_assign_alias_marks` already threads `&anchor`/
+/// `*alias` identity through a plain `Expr::Assign`), including evaluating
+/// `value` itself -- live-verified against pinned yq that `|=`'s RHS binds
+/// `.` to the target's own *value* (`a: 5 # x` + `.a line_comment |= . +
+/// "-suffix"` => `# 5-suffix`, not `# x-suffix`), not the old metadata text,
+/// so that evaluation can't happen here without the target's resolved value
+/// in hand anyway.
+///
+/// So at this layer the value tree is simply untouched. Naively reusing
+/// `eval_assign::<W, S>(target, target, input, optional)` (assigning
+/// `target` to itself) looked like a free way to inherit its path
+/// resolution/forking for `?`, but it also inherits `=`'s *value-forking*
+/// rule: real jq's `PATH = VALUE` forks the whole document once per RHS
+/// *output*, not once per LHS path, and `target` is itself the RHS here --
+/// so a multi-valued target like `.[]` (two paths, `.a`/`.b`) evaluates
+/// `target` as the RHS too, gets two RHS outputs, and forks into a `[1,1]`/
+/// `[2,2]`-shaped mess instead of leaving `[1,2]` untouched (caught live:
+/// `.[] line_comment = "hi"` on `a: 1\nb: 2` corrupted the document into
+/// `a: 2\nb: 2`). Real yq's own contract for a multi-candidate metadata
+/// write is exactly one *unchanged* document, comments/style/anchor added at
+/// every candidate (live-verified: `.[] line_comment = "hi"` => `a: 1 # hi`
+/// / `b: 1 # hi`... `b: 2 # hi`, still two distinct values). So instead:
+/// evaluate `target` purely to let a genuinely erroring/`break`ing/`halt`ing
+/// path still propagate (`error("boom") style = "x"` must still raise), then
+/// discard whatever it produced and return `input` untouched, exactly once,
+/// regardless of how many candidates `target` found -- `resolve_meta_assign_writes`
+/// in `yq_runner.rs` is what actually applies the write, at every resolved
+/// candidate, into the `CommentTree` side-table.
+///
+/// `tag`/`head_comment`/`foot_comment`/`comments` have no write mechanism in
+/// succinctly yet (`NodeMeta` has no tag slot, #747; head/foot comments have
+/// no backing field at all, #798 PR2/PR3/PR5) -- explicit error, never a
+/// silent no-op, even though real yq itself fully supports all four.
+fn eval_meta_assign<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    target: &Expr,
+    slot: MetaSlot,
+    input: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match slot {
+        MetaSlot::LineComment | MetaSlot::Style | MetaSlot::Anchor => {
+            match eval_single::<W, S>(target, input.clone(), optional) {
+                QueryResult::Error(e) => suppress_or_raise(e, optional),
+                QueryResult::Break(label) => QueryResult::Break(label),
+                QueryResult::Halt(code) => QueryResult::Halt(code),
+                QueryResult::Partial(_, Control::Error(e)) => suppress_or_raise(e, optional),
+                QueryResult::Partial(_, Control::Break(label)) => QueryResult::Break(label),
+                QueryResult::Partial(_, Control::Halt(code)) => QueryResult::Halt(code),
+                _ => QueryResult::One(input),
+            }
+        }
+        MetaSlot::Tag | MetaSlot::HeadComment | MetaSlot::FootComment | MetaSlot::Comments => {
+            suppress_or_raise(
+                EvalError::new(format!(
+                    "{} = ... is not yet supported",
+                    meta_slot_keyword(slot)
+                )),
+                optional,
+            )
+        }
+    }
+}
+
+/// yq's own grammar-quirk error for piping into a bare metadata GET-form and
+/// then assigning to it -- live-verified against pinned yq v4.53.3, same
+/// text for every slot and for both `=` and `|=`:
+/// `.a | line_comment = "y"` / `.a | line_comment |= "y"` / `.a | style =
+/// "flow"` / `.a | anchor = "z"` / `.a | tag = "!!str"` all raise `'|'
+/// expects 2 args but there is 1` in real yq, instead of succeeding.
+///
+/// Because a *direct* juxtaposed metadata assignment (`.a line_comment =
+/// "y"`, no pipe) now parses straight to `Expr::MetaAssign` (see
+/// `parse_assignment`'s `try_parse_meta_op`), the only way an ordinary
+/// `Expr::Assign`/`Expr::Update`'s `path` can itself *be* a bare metadata
+/// builtin is through a preceding pipe stage splitting the keyword off from
+/// its target (`.a | line_comment` is a complete GET-form pipe stage on its
+/// own, then `= "y"` is parsed as a separate, ordinary assignment to it) --
+/// so detecting the shape doesn't need to inspect the pipe at all, just
+/// `path`'s own value.
+fn yq_metadata_builtin_as_assign_path_error(path_expr: &Expr) -> Option<EvalError> {
+    let mut target = path_expr;
+    while let Expr::Paren(inner) | Expr::Optional(inner) = target {
+        target = inner;
+    }
+    matches!(
+        target,
+        Expr::Builtin(Builtin::LineComment | Builtin::Style | Builtin::Anchor | Builtin::Tag)
+    )
+    .then(|| EvalError::new("'|' expects 2 args but there is 1"))
 }
 
 /// Turn `root` into a fresh empty object if it is `Null`, otherwise leave it
