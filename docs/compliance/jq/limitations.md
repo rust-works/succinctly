@@ -893,7 +893,7 @@ adds the register threading that closes it instead of reopening it; re-run again
 succeeds" count for this whole fold-source area dropped from 67 to 3, with no increase in any
 other divergence category.
 
-Four residual divergences remain in this area:
+Five residual divergences remain in this area:
 
 - **A fold source whose navigation is discarded by a later non-navigating stage still
   clobbers jq's real path register, undetected.** `path(foreach (.a|tostring) as $k (.; .a))`
@@ -919,6 +919,19 @@ Four residual divergences remain in this area:
   it cannot stop the fold (`[limit(1; path(foreach (1 as $x ?// $y | (stderr|1)) as $v (.;
   .)))]` is `[[],[]]` with two writes in jq — its `limit` break is retried by the source's
   `?//` and the retried output lands past the bound — and `[[]]` with one write here).
+- **`recurse(f)`/`recurse(f; cond)` still collects one node's own `f` in full.**
+  `resolve_recurse_sink` (#2235) streams each visited node to a bounded consumer as soon as
+  it is popped, and defers `f`/`cond` for a node until its own delivery is accepted — so
+  `path(limit(1; recurse(if (.|debug) < 3 then .+1 else empty end)))` now runs `debug` zero
+  times in both jq and here, where the pre-#2235 collecting version ran it for every node up
+  to `RECURSE_MAX_ITEMS` regardless of the bound. What remains: `f` itself is still resolved
+  for an accepted node via `resolve_against_cow`, not streamed, so a multi-output `f`'s later
+  outputs fire even when only the first is ever consumed — confirmed live,
+  `path(limit(2; recurse((.a|debug), (.b|debug))))` on `{"a":1,"b":2}` writes `debug` for
+  `.a` only in jq (the bound is satisfied by `.a`'s own self-emission before `.b` is ever
+  asked for); both fire here. Same underlying cause as the bullet above — `resolve_against_cow`
+  has no sink form either — narrower in practice since it only over-fires a node's own
+  later `f` outputs, not an entire subtree.
 - **`E[K]` evaluates its target once where jq re-runs it per key.** jq compiles `E[K]` as
   `K as $k | E | .[$k]`, so a side effect in `E` fires once per output of `K`; here it fires
   once total — `[(.[] | stderr)[("a","b")]?]` on `[1,2]` writes `1212` in jq and `12` here.
