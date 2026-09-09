@@ -44116,3 +44116,35 @@ fn test_pull_model_arms_reachable_only_through_a_nested_forcing_context_2103() -
 
     Ok(())
 }
+
+/// #2180 WP1 coverage: `each_first_generic`/`each_nth_generic` keep #1309's
+/// input-queue guard, which hands the whole `first(...)`/`nth(n; ...)` to
+/// [`bridge_to_each_owned_flow`] rather than walking it here -- `eval.rs`'s
+/// `eval_each` has the native `Builtin::Inputs` arm this module lacks, so
+/// bridging is what stops the shared queue being drained twice.
+///
+/// Reaching that guard needs #1504's *cursor-metadata carve-out*: a program
+/// that mentions an input builtin normally never reaches `eval_each_generic`
+/// at all (`takes_input_queue_bridge` hands it straight to `eval.rs`), and
+/// the one exception is a program that also reads `line`/`column`/
+/// `at_offset`/... , whose answers exist only on this module's cursor. Hence
+/// the trailing `, line` on both filters -- it is what routes the input-
+/// reading `first`/`nth` through the arm under test.
+///
+/// jq 1.7.1 has no `line` builtin, so the combined program has no oracle; its
+/// input-reading half does, and that half is what the assertions pin.
+/// Captured live against jq 1.7.1 on the same three documents:
+/// `jq -n 'first(inputs)'` is `1` and `jq -n 'nth(1; inputs)'` is `2`.
+#[test]
+fn test_first_and_nth_over_inputs_keep_the_owned_bridge_2180() -> Result<()> {
+    for (filter, want) in [
+        ("first(inputs), line", "1\n1"),
+        ("nth(1; inputs), line", "2\n1"),
+    ] {
+        let (stdout, code) = run_jq_stdin(filter, "1\n2\n3\n", &["-n", "-c"])?;
+        assert_eq!(code, 0, "`{filter}` -- stdout: {stdout:?}");
+        assert_eq!(stdout.trim(), want, "`{filter}`");
+    }
+
+    Ok(())
+}
