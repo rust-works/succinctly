@@ -36013,6 +36013,26 @@ fn test_seq_trailing_unresolved_still_reports_unknown_1723() -> Result<()> {
         ("\x1e\"a\"", "z.json:0", "single resolved value"),
         ("\x1e1", "<unknown>", "single unresolved bare number"),
         ("\x1e{\"a\":1", "<unknown>", "unterminated container"),
+        (
+            "\x1e\"a",
+            "<unknown>",
+            "unterminated string, not just container",
+        ),
+        (
+            "\x1e\"\\uZZZZ\"",
+            "<unknown>",
+            "scans as a complete string but fails strict validation",
+        ),
+        (
+            "\x1e1a",
+            "<unknown>",
+            "pending number token butts against a non-delimiter byte",
+        ),
+        (
+            "\x1etrue",
+            "z.json:0",
+            "bare literal alone at real EOF is still terminated, unlike a number",
+        ),
     ] {
         std::fs::write(&file, input)?;
         let (_out, stderr, _code) =
