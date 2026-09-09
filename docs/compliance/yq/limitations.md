@@ -65,15 +65,19 @@ Error: bad file '-': yaml: line 1, column 5: unknown anchor 'x' referenced
 succinctly refuses to produce that output. `enforce_anchor_soundness`
 ([src/bin/succinctly/yq_runner.rs](../../../src/bin/succinctly/yq_runner.rs), from
 [#763](https://github.com/rust-works/succinctly/issues/763)) emits a `*name` only when a
-matching `&name` exists, is emitted **earlier**, and holds an **equal** value; otherwise the
-mark is dropped and the value printed:
+matching `&name` exists, is emitted **earlier**, and holds an **identical** value —
+structural identity, not jq value equality, so `NaN` counts as identical to itself even
+though `NaN != NaN` under jq's own `==`
+([#1360](https://github.com/rust-works/succinctly/issues/1360): under jq equality an
+anchored `.nan` looked diverged from itself for no real reason, and lost its mark); otherwise
+the mark is dropped and the value printed:
 
 ```bash
 $ printf 'a: &x 1\nb: *x\n' | succinctly yq 'del(.a)'
 b: 1
 ```
 
-The equal-value clause is also the backstop for alias *node identity*
+The identical-value clause is also the backstop for alias *node identity*
 ([#1351](https://github.com/rust-works/succinctly/issues/1351)). Real yq treats `&x`/`*x` as
 one node: a write whose path passes *through* an alias and continues (`.b.p = 9` on `b: *x`)
 mutates the anchor's node and every position follows, while a path that ends exactly at the
@@ -91,10 +95,10 @@ $ printf 'a: &x {p: 1}\nb: *x\nc: *x\n' | succinctly yq -o=json -I=0 '.[] .p += 
 {"a":{"p":4},"b":{"p":4},"c":{"p":4}}        # three positions, one node: matches yq
 ```
 
-The redirect is gated on *identity by equality*: it applies only while the alias position
+The redirect is gated on structural identity: it applies only while the alias position
 still holds the anchor's value, so a position rebound earlier in the pipe (`.b = 5 | .b.p =
 9`) is written positionally, as yq treats a rebound position. The gate's one false positive
-is a rebind to a value *equal* to the anchor's: `.b = .a | .a.p = 9` (or `.b = {"p": 1, "q":
+is a rebind to a value *identical* to the anchor's: `.b = .a | .a.p = 9` (or `.b = {"p": 1, "q":
 2} | .a.p = 9`) detaches `b` in yq (`b: {p: 1, q: 2}`), while succinctly cannot tell the
 rebound copy from an untouched one and keeps its value in step (`b: {p: 9, q: 2}`; the `*x`
 mark itself is cleared by the plain `=`, see the assignment rule below). The written value is
@@ -117,8 +121,8 @@ consequences are recorded divergences/limitations rather than matches:
   ([#2501](https://github.com/rust-works/succinctly/issues/2501), the value-level twin of
   #870).
 
-Wherever the redirect declines, the values differ and the equal-value clause drops the mark
-and prints the computed value, rather than emitting `*x` and discarding the write.
+Wherever the redirect declines, the values differ and the identical-value clause drops the
+mark and prints the computed value, rather than emitting `*x` and discarding the write.
 
 The redirect runs wherever a write goes through `evaluate_yaml_cursor` — stdout,
 `--split-exp`, `--front-matter`, and since
@@ -260,8 +264,7 @@ so any shape that can reach the M2 fast path gets the same soundness check.
 Related open items in the same family, still unresolved:
 [#1359](https://github.com/rust-works/succinctly/issues/1359) (a write that changes a node's
 kind drops its `&anchor`, where real yq keeps it),
-[#1360](https://github.com/rust-works/succinctly/issues/1360) (NaN false-positives the
-equal-value rule), [#1352](https://github.com/rust-works/succinctly/issues/1352) and
+[#1352](https://github.com/rust-works/succinctly/issues/1352) and
 [#1353](https://github.com/rust-works/succinctly/issues/1353).
 
 ### `-0`/`--nul-output` multi-document separator — rule 4(a)
