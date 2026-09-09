@@ -223,6 +223,35 @@ Three findings, in order of what they cost:
   navigating inside their own jq-level definitions against a *constructed* value inside
   `path()` never raise, found by `scripts/jq-bind-origin-fuzz.py`'s differential fuzz and
   confirmed pre-existing (not caused by this change).
+- **Destructuring binds — closed by
+  [#2649](https://github.com/rust-works/succinctly/issues/2649).** `SRC as PATTERN | BODY`
+  was the last shape in this family with no resolver arm at all. jq runs `SRC` with tracking
+  suspended (this note's own rule) but compiles `PATTERN` into ordinary tracked `INDEX`
+  steps, so the pattern *moves* the register: `walk_pattern` now performs those steps
+  (object entries in source order, array elements in reverse, a `null` input still stepping)
+  and hands each binding an `Origin::At` marker built by `Frame::origin_at`, and
+  `resolve_as_pattern` seeds `BODY` through `resolve_seq_from_seed` with the register at the
+  pattern's final position while the input stays the ambient value — so the three comparison
+  sites above, unchanged, produce jq's answers. `path(. as {a:$q} | $q)` is `["a"]`;
+  `del(. as {a:$q} | $q)` and `(. as {a:$q} | $q[1]) += 10` write through it. jq mode only:
+  real yq v4.53.3's lexer rejects the syntax outright, so there is no oracle. Refuse-only
+  residue, all recorded in limitations.md shape #1: a bind whose source navigates the
+  pattern's (untracked) body stage (`path(. as {a:$q} | .a as $z | $z)`, jq `["a"]`), a
+  marker-headed source on an untracked stage (`path(. as $x | 5 | $x as {a:$q} | $q)`, jq
+  `["a"]`) — the arm cannot see the register the carrying stage holds, and threading that
+  register into it is the only sound extension, since a frame alone survives an opaque
+  stage and would fabricate — and the `?//` alternatives the
+  artefact guard declines to retry (`path(. as {a:$q} ?// {b:$r} | $r)`, jq `["b"]`), since
+  retrying on one of *this* resolver's own refusals lands on the wrong alternative and a
+  `del` would write through it.
+- [#2676](https://github.com/rust-works/succinctly/issues/2676) — the same mechanism for a
+  `reduce`/`foreach` loop variable, which lives in `FoldRegister`'s per-element model rather
+  than in `resolve_seq`'s stages and needs its own oracle round for reduce's persistence
+  rule (`path(foreach .b as {c:$x} (.; .; $x))` is `["b","c"]` in jq,
+  `path(reduce .b as {c:$x} (.; .))` is `[]`; both refuse here).
+- [#2678](https://github.com/rust-works/succinctly/issues/2678) — a computed-key pattern
+  (`. as {("a"): $q}`, jq `["a"]`) is a parse error here, so path mode never sees it; the
+  gap predates this design note entirely.
 
 See [docs/compliance/jq/limitations.md](../compliance/jq/limitations.md) (shape #1, under
 "Where succinctly errors and jq does not") for the user-facing record of what's closed and
