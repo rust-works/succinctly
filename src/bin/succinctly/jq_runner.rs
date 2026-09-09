@@ -7687,4 +7687,98 @@ mod tests {
         assert!(matches!(out.as_slice(), [JqValue::RawNumber(_)]));
         assert!(sink.hit());
     }
+
+    /// #2103 review: `generic_result_to_jq_values`'s `None`/`Error`/
+    /// `ManyOwned`/`Break`/`Halt`/`Partial` arms all lost their only route
+    /// once the eager M2 evaluator was deleted (#2103) -- its sole remaining
+    /// caller, `evaluate_bytes_streaming`, feeds it exclusively through
+    /// `generic_item_to_result`, which only ever produces `One`/`OneCursor`/
+    /// `Owned`/`LazyKeys`/`LazyIndexRange`/`LazySeq` per item, plus a bare
+    /// `Owned` from the input-queue-bridge branch; the top-level `Control`
+    /// a filter escapes with is reported by that caller directly (its own
+    /// `match control` a few lines up), never funneled back through this
+    /// function. Direct construction, same as the `One`/`Many` precedent
+    /// above (#1192) -- these variants are exhaustiveness/symmetry with
+    /// `GenericResult`'s other producers (`eval.rs`'s owned path), not code
+    /// this binary's own CLI surface can reach today.
+    #[test]
+    fn test_generic_result_to_jq_values_terminal_arms_2103() {
+        let json: &[u8] = b"null";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let at = InputLocation::at(None, 1);
+
+        let mut sink = ErrorSink::default();
+        let out = generic_result_to_jq_values(GenericResult::None, cursor, &at, &mut sink);
+        assert!(out.is_empty());
+        assert!(!sink.hit());
+
+        let mut sink = ErrorSink::default();
+        let out = generic_result_to_jq_values(
+            GenericResult::Error(EvalError::new("boom")),
+            cursor,
+            &at,
+            &mut sink,
+        );
+        assert!(out.is_empty());
+        assert!(sink.hit());
+
+        let mut sink = ErrorSink::default();
+        let out = generic_result_to_jq_values(
+            GenericResult::ManyOwned(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
+            cursor,
+            &at,
+            &mut sink,
+        );
+        assert!(matches!(out.as_slice(), [JqValue::Int(1), JqValue::Int(2)]));
+        assert!(!sink.hit());
+
+        let mut sink = ErrorSink::default();
+        let out = generic_result_to_jq_values(
+            GenericResult::Break("out".to_string()),
+            cursor,
+            &at,
+            &mut sink,
+        );
+        assert!(out.is_empty());
+        assert!(sink.hit());
+
+        let mut sink = ErrorSink::default();
+        let out = generic_result_to_jq_values(GenericResult::Halt(3), cursor, &at, &mut sink);
+        assert!(out.is_empty());
+        assert_eq!(sink.halted(), Some(3));
+
+        let mut sink = ErrorSink::default();
+        let out = generic_result_to_jq_values(
+            GenericResult::Partial(
+                vec![OwnedValue::Int(1)],
+                jq::Control::Error(EvalError::new("boom")),
+            ),
+            cursor,
+            &at,
+            &mut sink,
+        );
+        assert!(matches!(out.as_slice(), [JqValue::Int(1)]));
+        assert!(sink.hit());
+
+        let mut sink = ErrorSink::default();
+        let out = generic_result_to_jq_values(
+            GenericResult::Partial(vec![OwnedValue::Int(1)], jq::Control::Break("out".into())),
+            cursor,
+            &at,
+            &mut sink,
+        );
+        assert!(matches!(out.as_slice(), [JqValue::Int(1)]));
+        assert!(sink.hit());
+
+        let mut sink = ErrorSink::default();
+        let out = generic_result_to_jq_values(
+            GenericResult::Partial(vec![OwnedValue::Int(1)], jq::Control::Halt(7)),
+            cursor,
+            &at,
+            &mut sink,
+        );
+        assert!(matches!(out.as_slice(), [JqValue::Int(1)]));
+        assert_eq!(sink.halted(), Some(7));
+    }
 }
