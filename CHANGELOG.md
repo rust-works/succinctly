@@ -181,6 +181,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `["b","c"]` in jq and still refuses here), and #2678 for a computed-key pattern
   (`. as {("a"): $q}`), which this parser rejects outright.
 
+  Two smaller fixes came out of the review. An empty `{}`/`[]` pattern is a syntax
+  error in jq 1.7.1 (`unexpected '}'`, exit 3); succinctly parsed it, and in path
+  position a pattern with no step would have answered `path(. as {} | .)` with `[]`
+  -- and written through `del(. as {} | .)` -- where jq never compiles. It is a parse
+  error now, in every position. And a `?` over a stage that navigates nothing
+  (`$x?`, `5?`) no longer counts as navigation in the path resolver: `path(. as $x |
+  5 | $x?)` is jq's `[]` (it refused), `path(.b as $y | .b | 5 | $y? | .c)` is
+  `["b","c"]`, and `path(. as {a:$q} | ($q | .x)?)` yields nothing, as in jq --
+  the old one-component `Optional` wrapper dropped the register a `?` never moves.
+
 - **An `as`-bound variable now stands at the node it was bound from, instead of
   being a value with no position** (#2072). Real yq's variables hold *nodes*,
   parent pointers and all, so `.a.b as $x | $x | key` is `"b"` there;
