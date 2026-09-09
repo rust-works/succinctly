@@ -8399,13 +8399,20 @@ mod tests {
     /// within a client's control.
     /// Runs the body on a thread with a stack big enough for
     /// [`MAX_EXPR_DEPTH`] levels. Cargo's harness gives each test 2 MiB,
-    /// which is smaller than the 8 MiB main thread the CLI actually uses and
     /// too small for the heaviest constructs at this limit -- see
     /// [`MAX_EXPR_DEPTH`]'s own note. Pinning the stack here keeps these
-    /// tests measuring the guard rather than the harness.
+    /// tests measuring the guard rather than the harness -- both the
+    /// harness's 2 MiB and the CLI's own real evaluation-thread budget
+    /// (`EVAL_STACK_SIZE` in `src/bin/succinctly/main.rs`, 2 GiB in debug)
+    /// are far from this number either way, so it isn't meant to model
+    /// either one, just to comfortably clear a 256-ish-level unoptimized
+    /// recursive-descent parse. 32 MiB rather than #1156's original 8 MiB:
+    /// an unoptimized ARM64 frame for the same recursive-descent chain
+    /// measured larger than x86_64's, and 8 MiB aborted in CI (#798) even
+    /// though the identical query was comfortably within budget on x86_64.
     fn with_parser_stack(f: impl FnOnce() + Send + 'static) {
         std::thread::Builder::new()
-            .stack_size(8 * 1024 * 1024)
+            .stack_size(32 * 1024 * 1024)
             .spawn(f)
             .expect("spawn")
             .join()
