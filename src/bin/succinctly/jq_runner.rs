@@ -7781,4 +7781,39 @@ mod tests {
         assert!(matches!(out.as_slice(), [JqValue::Int(1)]));
         assert_eq!(sink.halted(), Some(7));
     }
+
+    /// #2103 review (coverage-diff bot, PR #2652): `generic_result_to_jq_values`'s
+    /// `ManyCursor` arm has the identical unreachable-via-CLI story as the
+    /// batch `test_generic_result_to_jq_values_terminal_arms_2103` above
+    /// already covers -- `evaluate_bytes_streaming`'s sole conversion route,
+    /// `generic_item_to_result`, never produces a `Many`/`ManyCursor`/
+    /// `ManyOwned` `GenericResult` from a single `GenericItem` (there is no
+    /// `GenericItem` counterpart for any of the three). That batch's own
+    /// commit only pinned the six arms the earlier "eager M2 route deleted"
+    /// coverage-diff round flagged; `ManyCursor` surfaced as its own,
+    /// separate finding once the `keys_unsorted[]` cursor-preservation fix
+    /// (#2103's own change) shifted which other, unrelated arms the test
+    /// suite's existing `keys_unsorted`/`limit` shapes happened to reach.
+    /// Direct construction, same precedent as `Many`'s own #1192 test.
+    #[test]
+    fn test_generic_result_to_jq_values_many_cursor_2103() {
+        let json: &[u8] = b"[1, 2, 3]";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let StandardJson::Array(elements) = cursor.value() else {
+            panic!("expected an array");
+        };
+        let cursors: Vec<_> = elements.cursor_iter().collect();
+        let at = InputLocation::at(None, 1);
+
+        let mut sink = ErrorSink::default();
+        let out =
+            generic_result_to_jq_values(GenericResult::ManyCursor(cursors), cursor, &at, &mut sink);
+        assert_eq!(out.len(), 3);
+        assert!(
+            out.iter().all(|v| matches!(v, JqValue::Cursor(_))),
+            "{out:?}"
+        );
+        assert!(!sink.hit());
+    }
 }
