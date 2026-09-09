@@ -27691,6 +27691,43 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                 Some(control) => ResolveFlow::Escaped(control.into()),
             }
         }
+        // #2649: `SRC as PATTERN | body`, jq's destructuring bind. Like `As`
+        // above, jq evaluates SRC with tracking suspended, so the source
+        // itself never moves the register -- but the *pattern* is compiled
+        // into ordinary `INDEX` steps (`gen_object_matcher`/
+        // `gen_array_matcher`) that run tracked: each first checks its input
+        // is the register's own node (`path_intact`), then moves the
+        // register onto the matched member. After `. as {a:$q}` the register
+        // sits at `["a"]` holding `.a`'s node while `body` still sees the
+        // ambient `.`: `path(. as {a:$q} | $q)` is `["a"]`, `path(. as {a:$q}
+        // | .a)` raises "near attempt to access element "a" of <root>" (the
+        // root is no longer the register), and `path(. as {a:$q, b:$r} |
+        // ...)` raises at the *second* step whatever the body. All confirmed
+        // live against jq 1.7.1; see [`walk_pattern`] for the step model and
+        // [`resolve_as_pattern`] for how the body is then seeded.
+        //
+        // jq mode only: real yq's lexer rejects any destructuring pattern,
+        // so there is no yq behaviour to match and yq keeps the opaque-leaf
+        // fall-through below. The other guard is the identity premise: the
+        // pattern's first step compares the source value against the
+        // register, which this arm can only see while `trackable` (the
+        // register is then `value` itself). Once the stage has stepped off
+        // it, the register is carried out of this arm's sight, so a
+        // first-step refusal here would be an artefact -- jq's own answer for
+        // everything but a null/bool register, but an artefact nonetheless
+        // -- which a `?//` retry must never act on: it would land on the
+        // wrong alternative, and `del`/`=` would write through it. A single
+        // pattern may still raise that refusal (jq's own wording and exit
+        // code); a chain falls through untouched.
+        Expr::AsPattern {
+            expr,
+            patterns,
+            body,
+        } if S::TAG == EvalTag::Jq && (trackable || patterns.len() == 1) => {
+            resolve_as_pattern::<S>(
+                expr, patterns, body, value, trackable, snapshot, frame, keep, sink,
+            )
+        }
         // #2234: `stderr`/`debug`/`debug(msg)` are true identity passthroughs
         // in jq -- their value-mode implementations (`builtin_stderr`/
         // `builtin_debug`/`builtin_debug_msg` below) all decode-then-return
@@ -29845,6 +29882,453 @@ fn resolve_bind_source_in<S: EvalSemantics>(
             Some(Control::from(escape)),
         ),
     }
+}
+
+/// The path register as a destructuring pattern walks it (#2649) -- jq's
+/// `(path, value_at_path)` pair, relative to the stage the `as` sits in.
+#[derive(Clone, Debug)]
+struct PatternRegister {
+    /// Where the register sits, relative to the enclosing stage.
+    path: Rc<PathPrefix>,
+    /// The register's value.
+    value: OwnedValue,
+    /// Whether the value the walk is about to step *from* is the register's
+    /// own node (jq's `jv_identical`), as opposed to merely equal to it.
+    is_input: bool,
+}
+
+/// One binding produced by [`walk_pattern`]: the variable, its value, and --
+/// when the value is provably the register's node at that point -- the
+/// [`Origin::At`] marker that lets a `$var` reference in the body
+/// re-establish the register ([`Frame::certifies`]). `None` binds by value
+/// only.
+struct PatternBinding {
+    name: String,
+    value: OwnedValue,
+    origin: Option<Origin>,
+}
+
+/// One tracked index step of a destructuring pattern: an object entry's key
+/// or an array element's position. Carries both spellings the step needs --
+/// the [`Expr`] path component the register is extended by, and the
+/// [`OwnedValue`] element a refusal names.
+enum PatternStep<'a> {
+    Field(&'a str),
+    Index(usize),
+}
+
+impl PatternStep<'_> {
+    /// The path component this step appends to the register's path.
+    fn component(&self) -> Expr {
+        match self {
+            Self::Field(key) => Expr::Field((*key).to_string()),
+            Self::Index(i) => Expr::Index {
+                idx: *i as i64,
+                key: None,
+            },
+        }
+    }
+
+    /// Read `input[step]` the way jq's `jv_get` does: `null` yields `null`
+    /// for any key or index, an object/array yields the member or `null`
+    /// when it is absent, and any other kind is the ordinary
+    /// `Cannot index <type> with ...` error -- exactly the messages
+    /// [`extract_pattern_bindings`] raises in value mode. That function's
+    /// `null` short-circuit is deliberately *not* reproduced: jq still
+    /// performs (and tracks) every step on `null`, so `{}` gives
+    /// `path(. as {a:{b:$q}} | $q)` = `["a","b"]`.
+    fn child(&self, input: &OwnedValue) -> Result<OwnedValue, EvalError> {
+        match (self, input) {
+            (_, OwnedValue::Null) => Ok(OwnedValue::Null),
+            (Self::Field(key), OwnedValue::Object(obj)) => {
+                Ok(obj.get(*key).cloned().unwrap_or(OwnedValue::Null))
+            }
+            (Self::Field(key), _) => Err(EvalError::cannot_index_with_field(
+                owned_type_name(input),
+                key,
+            )),
+            (Self::Index(i), OwnedValue::Array(arr)) => {
+                Ok(arr.get(*i).cloned().unwrap_or(OwnedValue::Null))
+            }
+            (Self::Index(_), _) => Err(EvalError::cannot_index_with_type(
+                owned_type_name(input),
+                "number",
+            )),
+        }
+    }
+}
+
+/// Perform one tracked pattern step from `input`, returning the child value
+/// and the register it moves to. The identity check runs *before* the kind
+/// check, matching jq's `path_intact`-then-`jv_get` order.
+fn walk_pattern_step(
+    step: &PatternStep<'_>,
+    input: &OwnedValue,
+    reg: &PatternRegister,
+) -> Result<(OwnedValue, PatternRegister), EvalError> {
+    let component = step.component();
+    // jq's `path_intact`: the step's input must be the register's own node.
+    // Only `null`/`true`/`false` are `jv_identical` by value, which is what
+    // lets a second entry step from a `null` parent (`null | . as {a:$q,
+    // b:$r}` walks to `["a","b"]`).
+    if !(reg.is_input
+        || (matches!(input, OwnedValue::Null | OwnedValue::Bool(_)) && *input == reg.value))
+    {
+        let Some(element) = navigation_element(&component) else {
+            unreachable!("a pattern step's component is always Field/Index")
+        };
+        return Err(EvalError::invalid_path_expression_near_access(
+            &element, input,
+        ));
+    }
+    let child = step.child(input)?;
+    let moved = PatternRegister {
+        path: PathPrefix::extend(&reg.path, component),
+        value: child.clone(),
+        is_input: true,
+    };
+    Ok((child, moved))
+}
+
+/// Walk `pattern` over `input` the way jq's destructuring matcher does in
+/// path position (#2649), collecting the bindings into `out` and returning
+/// where the path register ends up.
+///
+/// jq compiles `SRC as PATTERN | BODY` so that `SRC` runs with tracking
+/// suspended but every index step *inside* the pattern runs tracked: before
+/// each step `path_intact` checks the step's input is `jv_identical` to the
+/// register's value (else `Invalid path expression near attempt to access
+/// element K of V`), then `jv_get` reads `V[K]`, `K` is appended to the
+/// register's path and `V[K]` becomes its value. Modelled here as:
+///
+/// - **identity before kind**: the `path_intact` refusal precedes `jv_get`,
+///   so `path(. as {a:$q} | ($q|.[0]) as [$z] | $z)` is "near attempt to
+///   access element 0 of 1", not "Cannot index number with number".
+/// - **`null` still steps**: unlike value mode's `null` short-circuit
+///   ([`extract_pattern_bindings`]), each step is performed and tracked on a
+///   `null` input, and `null`/booleans are `jv_identical` by value, so the
+///   walk continues across entries.
+/// - **entry order**: object entries run in source order
+///   (`gen_object_matcher`), array elements in **reverse** index order --
+///   `gen_array_matcher` nests each earlier element *after* the later one,
+///   so `path(.a as [$x,$y] | x)` on `[1,2,3]` refuses at element `0`, not
+///   `1`.
+/// - **`{$b: P}` is one step**: the entry binds `$b` to `V[b]` and then runs
+///   `P` on that same value (one `INDEX` in jq's compilation), where an
+///   explicit `{b:$m, b:$n}` performs two and refuses at the second.
+/// - **a bare `$x` performs no step**: it binds the current input and leaves
+///   the register alone, marked with [`Frame::origin_at`] exactly when that
+///   input *is* the register's node.
+fn walk_pattern(
+    pattern: &Pattern,
+    input: &OwnedValue,
+    reg: PatternRegister,
+    frame: &Frame,
+    out: &mut Vec<PatternBinding>,
+) -> Result<PatternRegister, EvalError> {
+    match pattern {
+        Pattern::Var(name) => {
+            let origin = if reg.is_input {
+                frame.origin_at(&reg.path)
+            } else {
+                None
+            };
+            out.push(PatternBinding {
+                name: name.clone(),
+                value: input.clone(),
+                origin,
+            });
+            Ok(reg)
+        }
+        Pattern::Object(entries) => {
+            let mut reg = reg;
+            let mut first = true;
+            for entry in entries {
+                // Every entry after the first steps from the *parent* input
+                // again, which is no longer the register's node -- only the
+                // null/bool value clause in the identity check can still
+                // admit it. The register the walk *returns* keeps the mark
+                // the last step left it with: that is what the body is
+                // seeded from, not something further steps run against.
+                if !first {
+                    reg.is_input = false;
+                }
+                first = false;
+                let step = PatternStep::Field(&entry.key);
+                let (child, moved) = walk_pattern_step(&step, input, &reg)?;
+                // `{$b: P}`: the bind names the node the register just moved
+                // to, so it carries that position's marker, and is pushed
+                // ahead of `P`'s own bindings (matching value mode's order).
+                if let Some(bind) = &entry.bind {
+                    out.push(PatternBinding {
+                        name: bind.clone(),
+                        value: child.clone(),
+                        origin: frame.origin_at(&moved.path),
+                    });
+                }
+                reg = walk_pattern(&entry.pattern, &child, moved, frame, out)?;
+            }
+            Ok(reg)
+        }
+        Pattern::Array(patterns) => {
+            let mut reg = reg;
+            let mut first = true;
+            for (i, pat) in patterns.iter().enumerate().rev() {
+                // As in the object arm: only the highest index (the element
+                // jq's right-to-left matcher runs first) steps from the
+                // register's own node.
+                if !first {
+                    reg.is_input = false;
+                }
+                first = false;
+                let step = PatternStep::Index(i);
+                let (child, moved) = walk_pattern_step(&step, input, &reg)?;
+                reg = walk_pattern(pat, &child, moved, frame, out)?;
+            }
+            Ok(reg)
+        }
+    }
+}
+
+/// Whether `pattern` performs at least one tracked index step, i.e. whether
+/// The `Expr::AsPattern` arm of [`resolve_node_sink`] (#2649): jq's
+/// destructuring bind in path position. The arm's own comment gives the jq
+/// model, [`walk_pattern`] the per-step rule; this function drives the
+/// alternatives and seeds the body.
+///
+/// **The body is a seeded pipe.** After the walk, jq's register sits at the
+/// pattern's final position `P` holding the node matched there, while `body`
+/// still runs against the ambient input. That is exactly the branch shape
+/// [`resolve_seq_stage`] already threads after an untracked stage -- `path:
+/// P`, `value: <ambient>`, `trackable: false`, `register: Some(<node at
+/// P>)` -- so the body goes through [`resolve_seq_from_seed`] with that seed
+/// and every existing stage rule produces jq's answer: a `$q` marker built
+/// from `frame.origin_at(P)` re-establishes at `P` (`reestablishes_register`
+/// with `Frame::certifies`), `$q[0]`/`$q | .[]` continue from there, `.a`
+/// raises `resolve_leaf`'s "near attempt to access element" against the
+/// ambient value, a literal stays untracked for the terminal check, and a
+/// `null`/`true`/`false` re-establishes by value. When the ambient value is
+/// itself identical to the moved register by that same null/bool rule
+/// (`null | path(. as {a:$q} | .)` is `["a"]`), the seed is simply trackable
+/// at `P`. A bare `$x` alternative performs no step, so its body resolves
+/// exactly as the `As` arm's does.
+///
+/// **`?//` alternatives** follow [`each_pattern_alternatives`]'s value-mode
+/// rules per source output: a pattern-step error, or a body error/`break`,
+/// falls to the next alternative unless it is the last; `halt` always
+/// propagates; whatever an earlier alternative already handed to the sink
+/// stays there (jq never un-emits -- `path(. as {a:$q} ?// {b:$r} | $q, $r)`
+/// prints `["a"]` before raising). One deliberate exception: the resolver's
+/// *own* refusals (`is_untracked_navigation_error` /
+/// `is_invalid_path_expression`) never retry. Some of those are artefacts jq
+/// never raises -- a nested pipe carries no register, so `$q[0]` inside an
+/// `if` refuses here where jq navigates -- and retrying on one lands on the
+/// wrong alternative: `path(. as {a:$q} ?// $z | if $q then $q[0] else $z
+/// end)` is jq's `["a",0]`, and a retry would answer `[]`, which `del`/`=`
+/// then write through. Not retrying costs only the rows where jq's *own*
+/// path error triggers the next alternative (`path(. as {a:$q} ?// $z |
+/// .a)`, jq `["a"]`) -- a refusal, the safe direction. A refusal jq raises
+/// only at `PATH_END` (an untracked branch) is likewise not observable here
+/// and does not retry.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: the resolver's threaded ambients, as `resolve_node_sink`
+fn resolve_as_pattern<'a, S: EvalSemantics>(
+    source: &Expr,
+    patterns: &[Pattern],
+    body: &Expr,
+    value: &'a OwnedValue,
+    trackable: bool,
+    snapshot: &Snapshot,
+    frame: &Frame,
+    keep: Keep,
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
+    // A subexp: evaluated by value, never a path witness (jq's
+    // `subexp_nest > 0` -- the same rule `resolve_bind_source`'s
+    // `by_value` follows).
+    let (sources, trailing) = eval_owned_expr_fork::<S>(source, value, false);
+    let head = unwrap_paren(source);
+    let all_names = pattern_alternatives_var_names(patterns);
+    let last_idx = patterns.len() - 1;
+    for bound in &sources {
+        // jq's `path_intact` at the pattern's first step: is the source
+        // value the register's own node? While `trackable` the register is
+        // `value` itself, so `.` is, a marker the frame certifies is (the
+        // `TrackedVar` arm's own rule), and anything else only by jq's
+        // null/bool value identity. Untracked: the register is out of
+        // sight, so never (the arm admits only a single pattern then).
+        let identical = trackable
+            && match head {
+                Expr::Identity => true,
+                Expr::TrackedVar(marker) => {
+                    marker.value == *value && frame.certifies(&marker.origin)
+                }
+                _ => matches!(bound, OwnedValue::Null | OwnedValue::Bool(_)) && *bound == *value,
+            };
+        for (i, pattern) in patterns.iter().enumerate() {
+            let is_last = i == last_idx;
+            let mut bindings = Vec::new();
+            let seed = PatternRegister {
+                path: PathPrefix::root(),
+                value: value.clone(),
+                is_input: identical,
+            };
+            let reg = match walk_pattern(pattern, bound, seed, frame, &mut bindings) {
+                Ok(reg) => reg,
+                Err(e) => {
+                    if is_last {
+                        return ResolveFlow::Escaped(e.into());
+                    }
+                    continue;
+                }
+            };
+            let substituted = bind_pattern_body(
+                source,
+                body,
+                pattern,
+                bound,
+                bindings,
+                &all_names,
+                patterns.len() > 1,
+            );
+            clear_nonretryable_stop();
+            let flow = if reg.path.depth() == 0 {
+                // No step ran (a bare `$x` alternative, or an empty
+                // pattern): the register is untouched, so the body resolves
+                // exactly as the `As` arm's does.
+                resolve_node_sink::<S>(&substituted, value, trackable, snapshot, frame, keep, sink)
+            } else {
+                let seed = if matches!(value, OwnedValue::Null | OwnedValue::Bool(_))
+                    && *value == reg.value
+                {
+                    PathBranch::new(reg.path, Cow::Borrowed(value), true)
+                } else {
+                    PathBranch::passthrough(reg.path, Cow::Borrowed(value), false, Snapshot::No)
+                        .with_register(Some(Cow::Owned(reg.value)))
+                };
+                resolve_seq_from_seed::<S>(
+                    core::slice::from_ref(&substituted),
+                    seed,
+                    frame,
+                    keep,
+                    sink,
+                )
+            };
+            match flow {
+                ResolveFlow::Exhausted => break,
+                ResolveFlow::Stopped => {
+                    if is_retryable_stop(is_last) {
+                        continue;
+                    }
+                    return ResolveFlow::Stopped;
+                }
+                ResolveFlow::Escaped(EvalEscape::Error(e)) => {
+                    if is_last
+                        || e.is_decode_failure()
+                        || e.is_untracked_navigation_error()
+                        || e.is_invalid_path_expression()
+                    {
+                        return ResolveFlow::Escaped(EvalEscape::Error(e));
+                    }
+                    continue;
+                }
+                ResolveFlow::Escaped(EvalEscape::Break(label)) => {
+                    if is_last {
+                        return ResolveFlow::Escaped(EvalEscape::Break(label));
+                    }
+                    continue;
+                }
+                ResolveFlow::Escaped(halt @ EvalEscape::Halt(_)) => {
+                    return ResolveFlow::Escaped(halt);
+                }
+            }
+        }
+    }
+    match trailing {
+        None => ResolveFlow::Exhausted,
+        Some(control) => ResolveFlow::Escaped(control.into()),
+    }
+}
+
+/// Splice one alternative's bindings into `body` for [`resolve_as_pattern`].
+///
+/// A binding whose value the walk proved to be the register's node at some
+/// position carries an `Origin::At` marker for it (`substitute_var_impl` with
+/// a [`LazyMarker`], the same splice `substitute_bound_var_at` performs);
+/// one bound by value only is a plain literal. A bare `$x` alternative goes
+/// through `substitute_bound_var_at` itself so an identity source gets its
+/// `Origin::Snapshot` exactly as under `As`. Names any *other* alternative
+/// binds become `null`, as in value mode (`each_pattern_alternatives`).
+fn bind_pattern_body(
+    source: &Expr,
+    body: &Expr,
+    pattern: &Pattern,
+    bound: &OwnedValue,
+    bindings: Vec<PatternBinding>,
+    all_names: &[String],
+    invert_dedup: bool,
+) -> Expr {
+    let mut bound_names: Vec<String> = Vec::new();
+    let mut substituted = match pattern {
+        Pattern::Var(name) => {
+            bound_names.push(name.clone());
+            let origin = bindings.into_iter().next().and_then(|b| b.origin);
+            substitute_bound_var_at(source, body, name, bound, origin, None)
+        }
+        Pattern::Object(_) | Pattern::Array(_) => {
+            let bindings = dedup_pattern_bindings(pattern, bindings, invert_dedup);
+            let mut substituted = body.clone();
+            for binding in &bindings {
+                bound_names.push(binding.name.clone());
+                substituted = match &binding.origin {
+                    Some(origin) => {
+                        let marker = LazyMarker::new(&binding.value, origin.clone(), None);
+                        substitute_var_impl(
+                            &substituted,
+                            &binding.name,
+                            &binding.value,
+                            Some(&marker),
+                        )
+                    }
+                    None => substitute_var(&substituted, &binding.name, &binding.value),
+                };
+            }
+            substituted
+        }
+    };
+    let null_value = OwnedValue::Null;
+    for name in all_names {
+        if !bound_names.iter().any(|n| n == name) {
+            substituted = substitute_var(&substituted, name, &null_value);
+        }
+    }
+    substituted
+}
+
+/// The duplicate-name rule of [`extract_pattern_bindings`]
+/// (`dedup_object_bindings`/`dedup_array_bindings`) applied to a walk's
+/// bindings, so `{a:$x, b:$x}` binds the same occurrence in path mode as in
+/// value mode: an object pattern keeps the first, an array pattern the last,
+/// both inverted under `?//`. (Only reachable with a `null` parent -- any
+/// other duplicate refuses at the second step -- but the surviving
+/// occurrence decides which marker `$x` carries.)
+fn dedup_pattern_bindings(
+    pattern: &Pattern,
+    bindings: Vec<PatternBinding>,
+    invert: bool,
+) -> Vec<PatternBinding> {
+    let keep_first = match pattern {
+        Pattern::Array(_) => invert,
+        Pattern::Object(_) | Pattern::Var(_) => !invert,
+    };
+    let mut map: IndexMap<String, PatternBinding> = IndexMap::new();
+    for binding in bindings {
+        if keep_first {
+            map.entry(binding.name.clone()).or_insert(binding);
+        } else {
+            map.insert(binding.name.clone(), binding);
+        }
+    }
+    map.into_values().collect()
 }
 
 /// Whether every node of `source` is one the resolver walks exactly as the
@@ -83730,6 +84214,339 @@ mod tests {
             QueryResult::Error(e) => Err(e),
             other => panic!("{filter}: unexpected result {other:?}"),
         }
+    }
+
+    /// #2649: `{"a":[1,2,3],"b":{"c":5}}` -- the probe input every
+    /// `walk_pattern` row below was captured against (jq 1.7.1).
+    fn walk_pattern_input_2649() -> OwnedValue {
+        let mut inner = IndexMap::new();
+        inner.insert("c".to_string(), OwnedValue::Int(5));
+        let mut obj = IndexMap::new();
+        obj.insert(
+            "a".to_string(),
+            OwnedValue::Array(vec![
+                OwnedValue::Int(1),
+                OwnedValue::Int(2),
+                OwnedValue::Int(3),
+            ]),
+        );
+        obj.insert("b".to_string(), OwnedValue::Object(inner));
+        OwnedValue::Object(obj)
+    }
+
+    fn walk_pattern_field_2649(name: &str) -> Expr {
+        Expr::Field(name.to_string())
+    }
+
+    fn walk_pattern_index_2649(idx: i64) -> Expr {
+        Expr::Index { idx, key: None }
+    }
+
+    /// Parse `filter` (an `as`-pattern pipe) into the alternatives it
+    /// declares plus a fresh [`Frame`] rooted at the ambient input, so a
+    /// binding's [`Origin::At`] marker names an absolute path.
+    fn walk_pattern_alternatives_2649(filter: &str) -> (Frame, Vec<Pattern>) {
+        let expr = parse(filter).unwrap();
+        let frame = Frame::enter(&expr);
+        assert!(frame.at.is_some(), "{filter}: frame must be rooted");
+        match &expr {
+            Expr::AsPattern { patterns, .. } => (frame, patterns.clone()),
+            other => panic!("{filter}: expected AsPattern, got {other:?}"),
+        }
+    }
+
+    /// Run alternative `alt` of `filter`'s pattern over `input`, seeded at
+    /// the relative root with `is_input`.
+    #[allow(clippy::type_complexity)]
+    fn walk_pattern_run_2649(
+        filter: &str,
+        alt: usize,
+        input: &OwnedValue,
+        is_input: bool,
+    ) -> (
+        Frame,
+        Result<PatternRegister, EvalError>,
+        Vec<PatternBinding>,
+    ) {
+        let (frame, patterns) = walk_pattern_alternatives_2649(filter);
+        let seed = PatternRegister {
+            path: PathPrefix::root(),
+            value: input.clone(),
+            is_input,
+        };
+        let mut out = Vec::new();
+        let result = walk_pattern(&patterns[alt], input, seed, &frame, &mut out);
+        (frame, result, out)
+    }
+
+    /// The absolute path an [`Origin::At`] marker names.
+    fn walk_pattern_origin_path_2649(origin: &Option<Origin>) -> Vec<Expr> {
+        match origin {
+            Some(Origin::At { path, .. }) => path.0.to_vec(),
+            other => panic!("expected Origin::At, got {other:?}"),
+        }
+    }
+
+    /// #2649: `path(. as {a:$q} | $q)` is `["a"]` in jq 1.7.1 -- the single
+    /// object step moves the register to `.a` and the binding carries that
+    /// position's marker.
+    #[test]
+    fn test_walk_pattern_object_step_moves_register_2649() {
+        let input = walk_pattern_input_2649();
+        let (frame, result, bindings) = walk_pattern_run_2649(". as {a:$q} | .", 0, &input, true);
+        let reg = result.expect("the step is taken from the register's own node");
+        assert_eq!(reg.path.to_vec(), vec![walk_pattern_field_2649("a")]);
+        assert_eq!(
+            reg.value,
+            OwnedValue::Array(vec![
+                OwnedValue::Int(1),
+                OwnedValue::Int(2),
+                OwnedValue::Int(3),
+            ])
+        );
+        assert!(
+            reg.is_input,
+            "the child is the register's node after a step"
+        );
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].name, "q");
+        assert_eq!(bindings[0].value, reg.value);
+        assert_eq!(
+            walk_pattern_origin_path_2649(&bindings[0].origin),
+            vec![walk_pattern_field_2649("a")]
+        );
+        // The marker is exactly what a `$q` reference re-establishes with.
+        let origin = bindings[0].origin.clone().unwrap();
+        assert!(frame.extend(&reg.path).certifies(&origin));
+        assert!(!frame.certifies(&origin), "not the root's own position");
+    }
+
+    /// #2649: `path(. as {b:{c:$r}} | $r)` is `["b","c"]` -- nested entries
+    /// step once each, in source order.
+    #[test]
+    fn test_walk_pattern_nested_object_2649() {
+        let input = walk_pattern_input_2649();
+        let (_, result, bindings) = walk_pattern_run_2649(". as {b:{c:$r}} | .", 0, &input, true);
+        let reg = result.expect("both steps run from the register");
+        assert_eq!(
+            reg.path.to_vec(),
+            vec![walk_pattern_field_2649("b"), walk_pattern_field_2649("c")]
+        );
+        assert_eq!(reg.value, OwnedValue::Int(5));
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].name, "r");
+        assert_eq!(bindings[0].value, OwnedValue::Int(5));
+        assert_eq!(
+            walk_pattern_origin_path_2649(&bindings[0].origin),
+            vec![walk_pattern_field_2649("b"), walk_pattern_field_2649("c")]
+        );
+    }
+
+    /// #2649: a second entry steps from the *parent* again, which is no
+    /// longer the register's node -- jq 1.7.1 raises "Invalid path
+    /// expression near attempt to access element \"b\" of {...}" for
+    /// `path(. as {a:$q, b:$r} | anything)`.
+    #[test]
+    fn test_walk_pattern_second_entry_refuses_2649() {
+        let input = walk_pattern_input_2649();
+        let (_, result, bindings) = walk_pattern_run_2649(". as {a:$q, b:$r} | .", 0, &input, true);
+        let err = result.expect_err("the second step is not from the register");
+        assert!(err.is_untracked_navigation_error(), "{}", err.message);
+        assert!(
+            err.message
+                .contains(r#"element "b" of {"a":[1,2,3],"b":{"c":5}}"#),
+            "{}",
+            err.message
+        );
+        // The first entry's binding was already collected before the refusal.
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].name, "q");
+    }
+
+    /// #2649: array elements run in **reverse** index order
+    /// (`gen_array_matcher` nests each earlier element after the later one),
+    /// so `path(.a as [$x,$y] | anything)` on `[1,2,3]` refuses at element
+    /// `0` in jq 1.7.1 -- element `1` already succeeded.
+    #[test]
+    fn test_walk_pattern_array_runs_in_reverse_2649() {
+        let input = OwnedValue::Array(vec![
+            OwnedValue::Int(1),
+            OwnedValue::Int(2),
+            OwnedValue::Int(3),
+        ]);
+        let (_, result, bindings) = walk_pattern_run_2649(". as [$x,$y] | .", 0, &input, true);
+        let err = result.expect_err("only the last element steps from the register");
+        assert!(err.is_untracked_navigation_error(), "{}", err.message);
+        assert!(
+            err.message.contains("element 0 of [1,2,3]"),
+            "{}",
+            err.message
+        );
+        assert_eq!(bindings.len(), 1, "`$y` bound before `$x` was attempted");
+        assert_eq!(bindings[0].name, "y");
+        assert_eq!(bindings[0].value, OwnedValue::Int(2));
+        assert_eq!(
+            walk_pattern_origin_path_2649(&bindings[0].origin),
+            vec![walk_pattern_index_2649(1)]
+        );
+
+        // With an untracked seed the *first* step attempted is the one that
+        // reports -- element 1, not element 0.
+        let (_, result, bindings) = walk_pattern_run_2649(". as [$x,$y] | .", 0, &input, false);
+        let err = result.expect_err("nothing steps from the register here");
+        assert!(
+            err.message.contains("element 1 of [1,2,3]"),
+            "{}",
+            err.message
+        );
+        assert!(bindings.is_empty());
+    }
+
+    /// #2649: on `null` every step is still performed and tracked, and
+    /// `null` is `jv_identical` to `null`, so a second entry passes by value:
+    /// jq 1.7.1 gives `["a","b"]` for `null | path(. as {a:$q,b:$r} | $r)`.
+    #[test]
+    fn test_walk_pattern_null_input_still_steps_2649() {
+        let input = OwnedValue::Null;
+        let (_, result, bindings) = walk_pattern_run_2649(". as {a:$q,b:$r} | .", 0, &input, true);
+        let reg = result.expect("a null parent is identical to the null register");
+        assert_eq!(
+            reg.path.to_vec(),
+            vec![walk_pattern_field_2649("a"), walk_pattern_field_2649("b")]
+        );
+        assert_eq!(reg.value, OwnedValue::Null);
+        assert_eq!(bindings.len(), 2);
+        assert!(bindings.iter().all(|b| b.value == OwnedValue::Null));
+        assert_eq!(
+            walk_pattern_origin_path_2649(&bindings[0].origin),
+            vec![walk_pattern_field_2649("a")]
+        );
+        assert_eq!(
+            walk_pattern_origin_path_2649(&bindings[1].origin),
+            vec![walk_pattern_field_2649("a"), walk_pattern_field_2649("b")]
+        );
+    }
+
+    /// #2649: value mode's `null` short-circuit must NOT be reproduced --
+    /// `{}` gives `path(. as {a:{b:$q}} | $q)` = `["a","b"]` in jq 1.7.1,
+    /// with `$q` bound to `null`.
+    #[test]
+    fn test_walk_pattern_missing_key_keeps_stepping_2649() {
+        let input = OwnedValue::Object(IndexMap::new());
+        let (_, result, bindings) = walk_pattern_run_2649(". as {a:{b:$q}} | .", 0, &input, true);
+        let reg = result.expect("the absent key yields null and the walk continues");
+        assert_eq!(
+            reg.path.to_vec(),
+            vec![walk_pattern_field_2649("a"), walk_pattern_field_2649("b")]
+        );
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].name, "q");
+        assert_eq!(bindings[0].value, OwnedValue::Null);
+        assert_eq!(
+            walk_pattern_origin_path_2649(&bindings[0].origin),
+            vec![walk_pattern_field_2649("a"), walk_pattern_field_2649("b")]
+        );
+    }
+
+    /// #2649: `{$b: P}` is ONE index step that binds `$b` and then runs `P`
+    /// on the same value -- jq 1.7.1 gives `path(. as {$b:{c:$x}} | $x)` =
+    /// `["b","c"]`, and `$b` names `["b"]`.
+    #[test]
+    fn test_walk_pattern_bind_entry_is_one_step_2649() {
+        let input = walk_pattern_input_2649();
+        let (_, result, bindings) = walk_pattern_run_2649(". as {$b:{c:$x}} | .", 0, &input, true);
+        let reg = result.expect("one step for the bind, one for the nested entry");
+        assert_eq!(
+            reg.path.to_vec(),
+            vec![walk_pattern_field_2649("b"), walk_pattern_field_2649("c")]
+        );
+        assert_eq!(bindings.len(), 2);
+        assert_eq!(bindings[0].name, "b");
+        let mut inner = IndexMap::new();
+        inner.insert("c".to_string(), OwnedValue::Int(5));
+        assert_eq!(bindings[0].value, OwnedValue::Object(inner));
+        assert_eq!(
+            walk_pattern_origin_path_2649(&bindings[0].origin),
+            vec![walk_pattern_field_2649("b")]
+        );
+        assert_eq!(bindings[1].name, "x");
+        assert_eq!(bindings[1].value, OwnedValue::Int(5));
+        assert_eq!(
+            walk_pattern_origin_path_2649(&bindings[1].origin),
+            vec![walk_pattern_field_2649("b"), walk_pattern_field_2649("c")]
+        );
+    }
+
+    /// #2649: an *explicit* duplicate key (`{b:$m, b:$n}`) is two steps, so
+    /// the second refuses exactly as any second entry does -- the
+    /// counterpart to `{$b: P}`'s single step above.
+    #[test]
+    fn test_walk_pattern_explicit_duplicate_key_refuses_2649() {
+        let input = walk_pattern_input_2649();
+        let (_, result, _) = walk_pattern_run_2649(". as {b:$m, b:$n} | .", 0, &input, true);
+        let err = result.expect_err("two entries means two steps");
+        assert!(err.is_untracked_navigation_error(), "{}", err.message);
+        assert!(
+            err.message
+                .contains(r#"element "b" of {"a":[1,2,3],"b":{"c":5}}"#),
+            "{}",
+            err.message
+        );
+    }
+
+    /// #2649: the identity check passes but the kind check does not -- these
+    /// are jq's ordinary indexing errors, the same ones
+    /// [`extract_pattern_bindings`] raises in value mode.
+    #[test]
+    fn test_walk_pattern_kind_errors_2649() {
+        let input = walk_pattern_input_2649();
+        let (_, result, _) = walk_pattern_run_2649(". as [$x] | .", 0, &input, true);
+        let err = result.expect_err("an object cannot be indexed with a number");
+        assert!(!err.is_untracked_navigation_error(), "{}", err.message);
+        assert_eq!(err.message, "Cannot index object with number");
+
+        let (_, result, _) = walk_pattern_run_2649(". as {a:$q} | .", 0, &OwnedValue::Int(1), true);
+        let err = result.expect_err("a number cannot be indexed with a field");
+        assert!(!err.is_untracked_navigation_error(), "{}", err.message);
+        // The value-mode constructor's own wording (`cannot_index_with_field`),
+        // which is jq's for a destructuring step: `1 | . as {a:$q} | $q`
+        // reports the key as a string.
+        assert_eq!(err.message, r#"Cannot index number with string "a""#);
+    }
+
+    /// #2649: a bare `$x` alternative performs no step -- it binds the
+    /// current input and leaves the register where the source left it, with
+    /// a marker only when that input *is* the register's node.
+    #[test]
+    fn test_walk_pattern_bare_var_keeps_register_2649() {
+        let input = walk_pattern_input_2649();
+        let (frame, result, bindings) =
+            walk_pattern_run_2649(". as {a:$q} ?// $x | .", 1, &input, true);
+        let reg = result.expect("a bare var never steps");
+        assert_eq!(reg.path.to_vec(), Vec::new());
+        assert_eq!(reg.value, input);
+        assert!(reg.is_input);
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].name, "x");
+        assert_eq!(bindings[0].value, input);
+        let origin = bindings[0]
+            .origin
+            .clone()
+            .expect("the input is the register");
+        assert!(
+            frame.certifies(&origin),
+            "the marker names the seed position"
+        );
+
+        let (_, result, bindings) =
+            walk_pattern_run_2649(". as {a:$q} ?// $x | .", 1, &input, false);
+        let reg = result.expect("a bare var never refuses either");
+        assert!(!reg.is_input);
+        assert_eq!(bindings.len(), 1);
+        assert!(
+            bindings[0].origin.is_none(),
+            "no marker when the value is merely equal to the register"
+        );
     }
 
     #[test]
