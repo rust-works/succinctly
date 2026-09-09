@@ -26,6 +26,18 @@
 # it was added); `scripts/jq-bind-origin-fuzz.py` is the randomised
 # companion whose alphabet covers the same constructs.
 #
+# The `destructure-*` rows are #2649: `SRC as PATTERN | BODY` moves the path
+# register through every pattern step, so a pattern variable is a tracked
+# node exactly where jq's own step check accepts it. Rows where jq itself
+# refuses (a second object entry, an array element in reverse order, a
+# navigated source) are carried as `agree` rows -- both binaries must exit 5
+# with nothing on stdout, which is what pins the *refusing* half of the arm.
+# The two `destructure-alt-artefact-guard*` rows are the load-bearing
+# not-a-fabrication assertion: jq answers `["a",0]` / deletes `.a[0]` there,
+# and the resolver must keep refusing rather than retry onto the `?// $z`
+# alternative -- if it ever answered `[]` (or deleted the whole document)
+# the row would classify `mismatch`, not `agree`, and fail the sweep.
+#
 # Usage:
 #   cargo build --release --features cli
 #   ./scripts/jq-bind-origin-oracle-sweep.sh                 # TSV + summary; exit 1 on fabricate/mismatch/new refuse-only
@@ -162,12 +174,51 @@ slice-spelling	{"a":[1,2,3]}	path(.a[1:] as $y | .a[1:3] | $y)
 catch-handler-var	{"a":{"b":1}}	path(.a as $y | .a | try error("x") catch $y)
 destructure-stage	{"a":{"b":1},"c":{"b":1}}	path(.a as $y | .a | . as [$q] ?// $q | $y)
 literal-then-fold-untracked-init	{"a":{"b":1},"c":{"b":1}}	path(.a as $y | .a | 5 | reduce (1) as $i (0; $y))
+destructure-object-var	{"a":[1,2,3],"b":{"c":5}}	path(. as {a:$q} | $q)
+destructure-var-index	{"a":[1,2,3],"b":{"c":5}}	path(. as {a:$q} | $q[0])
+destructure-nested-object	{"a":[1,2,3],"b":{"c":5}}	path(. as {b:{c:$r}} | $r)
+destructure-var-field	{"a":[1,2,3],"b":{"c":5}}	path(. as {b:$b} | $b.c)
+destructure-shorthand	{"a":[1,2,3],"b":{"c":5}}	path(. as {$a} | $a)
+destructure-shorthand-nested	{"a":[1,2,3],"b":{"c":5}}	path(. as {$b:{c:$x}} | $x)
+destructure-object-array	{"a":[1,2,3],"b":{"c":5}}	path(. as {a:[$h]} | $h)
+destructure-nested-array	[[1,2],[3,4]]	path(. as [[$a]] | $a)
+destructure-var-iterate	{"a":[1,2,3],"b":{"c":5}}	path(. as {a:$q} | $q | .[])
+destructure-var-recurse	{"a":[1,2,3],"b":{"c":5}}	path(. as {a:$q} | $q | recurse)
+destructure-alt-first	{"a":[1,2,3],"b":{"c":5}}	path(. as {a:$q} ?// [$q] | $q)
+destructure-alt-second	{"a":[1,2,3],"b":{"c":5}}	path(. as [$q] ?// {a:$q} | $q)
+destructure-alt-partial-bind	{"a":[1,2,3],"b":{"c":5}}	path(. as {a:$q, x:{y:$z}} ?// {b:$r} | $r)
+destructure-null-body	{"a":null}	path(. as {a:$q} | null)
+destructure-null-doc	null	path(. as {a:$q,b:$r} | $r)
+destructure-missing-key	{}	path(. as {a:{b:$q}} | $q)
+destructure-del	{"a":[1,2,3],"b":{"c":5}}	del(. as {a:$q} | $q)
+destructure-update-add	{"a":[1,2,3],"b":{"c":5}}	(. as {a:$q} | $q[1]) += 10
+destructure-body-navigation	{"a":[1,2,3],"b":{"c":5}}	path(. as {a:$q} | .a)
+destructure-second-entry	{"a":[1,2,3],"b":{"c":5}}	path(. as {a:$q, b:$r} | $r)
+destructure-array-reverse	{"a":[1,2,3],"b":{"c":5}}	path(.a as [$x,$y] | $y)
+destructure-duplicate-key	{"a":[1,2,3],"b":{"c":5}}	path(. as {b:$m, b:$n} | $n)
+destructure-navigated-source	{"a":[1,2,3],"b":{"c":5}}	[path(.b as {c:$v} | $v)]
+destructure-nested-pattern-on-copy	{"a":[1,2,3],"b":{"c":5}}	path(. as {a:$q} | ($q|.[0]) as [$z] | $z)
+destructure-bind-after-pattern	{"a":[1,2,3],"b":{"c":5}}	path(. as {a:$q} | .a as $z | $z)
+destructure-pattern-on-bound-copy	{"a":[1,2,3],"b":{"c":5}}	path(. as {a:$q} | $q as [$x] | $x)
+destructure-marker-source-literal	{"a":[1,2,3],"b":{"c":5}}	path(. as $x | 5 | $x as {a:$q} | $q)
+destructure-marker-source-navigated	{"a":[1,2,3],"b":{"c":5}}	path(.b as $y | .b | 5 | $y as {c:$w} | $w)
+destructure-alt-terminal-refusal	{"a":[1,2,3],"b":{"c":5}}	path(. as {a:$q} ?// {b:$r} | $r)
+destructure-alt-bare-var	{"a":[1,2,3],"b":{"c":5}}	path(. as {a:$q} ?// $r | $r)
+destructure-alt-navigation	{"a":[1,2,3],"b":{"c":5}}	path(. as {a:$q} ?// $z | .a)
+destructure-alt-artefact-guard	{"a":[1,2,3]}	path(. as {a:$q} ?// $z | if $q then $q[0] else $z end)
+destructure-alt-artefact-guard-del	{"a":[1,2,3]}	del(. as {a:$q} ?// $z | if $q then $q[0] else $z end)
+destructure-comma-marker-nav	{"a":[1,2,3],"b":{"c":5}}	path(. as {a:$q} | $q[0], $q)
+carried-register-passthrough	{"a":{"b":1}}	path(.a as $y | .a | 5 | select(true) | $y)
+destructure-passthrough-stage	{"a":[1,2,3],"b":{"c":5}}	path(. as {a:$q} | select(true) | $q)
 CASES_EOF
 )
 
 # Known refuse-only rows (jq answers, succinctly refuses), each with the
 # reason it is deliberately left refusing. A new one is a sweep failure.
-REFUSE_ONLY="value-mode-binding-same-node:eval_as (value mode) binds with no path; the value-mode half of #2042 is the accepting-direction twin of #2642
+# Quoted heredoc: a reason may quote a filter verbatim ($q, "a") without
+# the shell expanding it.
+REFUSE_ONLY=$(cat <<'REFUSE_EOF'
+value-mode-binding-same-node:eval_as (value mode) binds with no path; the value-mode half of #2042 is the accepting-direction twin of #2642
 tojson-between:tojson/fromjson are not on cannot_move_register's proven allowlist (#2041)
 def-body-in-path:a def inside path() resolves as an opaque leaf, before #2042 too
 source-rebuilt-container:the source navigates inside a construction, which jq's suspended tracking allows but the resolver refuses; falls back to a plain value
@@ -180,8 +231,21 @@ full-slice-is-the-array:jq's full slice is the array itself; the bind path ends 
 marker-not-at-head:a marker is re-rooted only at the head of a source; elsewhere it is certified against the ambient position
 slice-spelling:jq's .a[1:] and .a[1:3] of a 3-array are the same jv; the slice components differ, so the spelling never matches (open-ended twin of full-slice-is-the-array)
 catch-handler-var:the handler resolves under an unknown frame and a raising try stage does not carry the register; pre-existing, the root marker refuses too
-destructure-stage:an ?// destructuring stage resolves as an opaque leaf and drops the register; pre-existing, the root marker refuses too
-literal-then-fold-untracked-init:after a literal the register is only carried, and a fold with an untracked INIT seeds its register from the ambient literal; pre-existing, the root marker refuses too"
+literal-then-fold-untracked-init:after a literal the register is only carried, and a fold with an untracked INIT seeds its register from the ambient literal; pre-existing, the root marker refuses too
+destructure-bind-after-pattern:#2649 residue 1 -- a plain bind on the ambient input after a pattern moved the register: resolve_bind_source needs a trackable stage, and the pattern's body stage is not
+destructure-pattern-on-bound-copy:#2649 residue 1 -- a nested pattern whose source is the bound copy ($q as [$x]); the arm's source rule only trusts Identity/TrackedVar at the head of a trackable stage
+destructure-marker-source-literal:#2649 residue 2 -- a marker-headed pattern source on an untracked stage; the arm cannot see the register the stage carries, and reading stage_frame alone would fabricate
+destructure-marker-source-navigated:#2649 residue 2 -- same as destructure-marker-source-literal with a navigated bind (.b as $y | .b | 5 | $y as {c:$w})
+destructure-alt-terminal-refusal:#2649 residue 3 -- the first alternative binds and the body then fails only at path()'s terminal check; jq's PATH_END error retries the next alternative, the resolver's refusal does not
+destructure-alt-bare-var:#2649 residue 3 -- twin of destructure-alt-terminal-refusal with a bare-var alternative (jq answers [])
+destructure-alt-navigation:#2649 residue 3 -- the body navigates the ambient input, which raises a near-access refusal the artefact guard cannot tell from an artefact, so the ?// does not retry
+destructure-alt-artefact-guard:#2649 artefact guard -- MUST stay a refusal: retrying here would answer [] where jq answers ["a",0]; answering anything makes this row mismatch (fabrication assertion, not a bare allowlist entry)
+destructure-alt-artefact-guard-del:#2649 artefact guard -- the write twin: a retry would delete the whole document where jq deletes .a[0]
+destructure-comma-marker-nav:#2649 residue 4 -- pre-existing comma shape: a nested Pipe gets no register, so $q[0] inside a comma raises near-access (limitations.md, #2042)
+carried-register-passthrough:pre-existing (#2042): once the register is only *carried* (an untracked stage), a select/label/first/getpath passthrough re-seeds it from the ambient value and the marker no longer re-establishes; if/try/`. as $q | .`/literals keep it. Twin of literal-then-fold-untracked-init, found by the #2649 fuzz
+destructure-passthrough-stage:the destructuring door onto carried-register-passthrough -- a pattern body starts on an untracked stage, so the same select/label/first/getpath passthroughs drop the register; the baseline binary refuses the plain-bind twin identically, so this is not #2649's
+REFUSE_EOF
+)
 
 if [[ "${1:-}" == "--list-cases" ]]; then
   printf '%s\n' "$CASES"
