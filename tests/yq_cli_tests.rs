@@ -39792,3 +39792,50 @@ fn test_bound_variable_operand_pipe_does_not_abort_2072() -> Result<()> {
 
     Ok(())
 }
+
+/// #2103 review (coverage-diff bot, PR #2652): two more `eval_generic.rs`
+/// pull-model arms that only this evaluator's yq-mode `map()` scalar
+/// passthrough can reach, restored the same way as their jq-mode siblings
+/// in `jq_cli_tests.rs`'s own `#2103` test -- by nesting inside `//`, which
+/// has no native push-model arm and so forces `eval_single` (see that
+/// test's doc comment for the full mechanism).
+///
+/// Real yq no-ops `map(f)` on a scalar target entirely (`f` never runs,
+/// #1907) -- and for every *other* mode/target combination the value would
+/// already have been decoded by something upstream, so `push_generic_owned_values`'s
+/// `GenericItem::One(v)` arm (a cursor-less, `V`-typed value with no
+/// `GenericResult` counterpart worth adding just for this) and
+/// `eval_index_expr`'s identical key-generator arm are only ever fed by
+/// this one scalar-passthrough site, which forwards `value` byte-for-byte
+/// unread (#1820) -- including an undecodable one.
+#[test]
+fn test_yq_map_scalar_passthrough_feeds_one_item_arms_2103() -> Result<()> {
+    // `push_generic_owned_values`'s `GenericItem::One(v)` arm: a `Comma`
+    // (only reached via `eval_single`, itself forced by the enclosing `//`)
+    // pushes a literal, then `.c | map(.)` (yq-mode scalar passthrough),
+    // then raises -- caught by a single-value handler.
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(
+        r#".a // (try (1, (.c | map(.)), error("boom")) catch "c")"#,
+        "a: null\nc: 5\n",
+        &[],
+    )?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "1\n5\nc\n", "stdout: {stdout:?}");
+
+    // `eval_index_expr`'s key-generator sink, `GenericItem::One(v)` arm:
+    // the computed key `.bad | map(.)` passes an undecodable scalar
+    // (unpaired UTF-16 surrogate) through unread, and only fails once
+    // `to_owned_key_shape` tries to actually use it as an index.
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(
+        ".arr[(.bad | map(.))]",
+        "{\"arr\":[1,2],\"bad\": \"\\ud800\"}",
+        &[],
+    )?;
+    assert_eq!(code, 1, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(
+        stderr.contains("invalid escape sequence"),
+        "stderr: {stderr}"
+    );
+
+    Ok(())
+}
