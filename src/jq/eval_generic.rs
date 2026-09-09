@@ -8985,6 +8985,50 @@ fn each_limit_with_n_generic<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
+/// Drive `expr` and push only its `skip`-th output (0-indexed) to `sink`,
+/// stopping the drive right there -- the generic-evaluator shared skeleton
+/// behind [`each_first_generic`] (`skip == 0`) and [`each_nth_generic`]'s
+/// inner per-`n` walk, so they don't independently maintain two copies of
+/// the same `?//`-retry short-circuit rule ([`finish_short_circuit`]).
+///
+/// A *skipped* item's lazy computation still has to run for its own errors
+/// (#1607) even though its value is discarded -- checked before `flow`
+/// itself so a skipped item's decode failure cannot lose to whatever an
+/// illegitimate `?//` retry went on to produce through this same sink
+/// (#2199). When `skip == 0` no item is ever skipped, so this never engages
+/// there -- `each_first_generic` inherits the check for free rather than
+/// needing its own simpler loop.
+fn take_at_index_generic<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    skip: usize,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    let mut seen = 0usize;
+    let mut outer_stopped = false;
+    let mut skipped_err: Option<Control> = None;
+    let flow = eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| {
+        let at_or_past = seen >= skip;
+        seen += 1;
+        if at_or_past {
+            if sink(item) == Demand::Stop {
+                outer_stopped = true;
+            }
+            return Demand::Stop;
+        }
+        if let Err(control) = generic_item_into_owned(item) {
+            return stop_with_escape(&mut skipped_err, control);
+        }
+        Demand::Continue
+    });
+    if let Some(control) = skipped_err {
+        return Flow::Escaped(control);
+    }
+    finish_short_circuit(outer_stopped, flow)
+}
+
 /// Demand-forwarding twin of [`eval_first_or_last_generic`]'s `first` half
 /// (#2180 WP1) -- the generic-evaluator mirror of `eval::each_first`, and the
 /// arm `eval_each_generic` was missing for `Expr::FirstExpr`.
@@ -9022,16 +9066,7 @@ fn each_first_generic<S: EvalSemantics, V: DocumentValue>(
         );
     }
 
-    let mut outer_stopped = false;
-    let flow = eval_each_generic::<S, V>(inner, value, optional, cursor, &mut |item| {
-        if sink(item) == Demand::Stop {
-            outer_stopped = true;
-        }
-        // jq's `break $out`, unconditionally -- `first` is satisfied by its
-        // one output whether or not the wrapping consumer is.
-        Demand::Stop
-    });
-    finish_short_circuit(outer_stopped, flow)
+    take_at_index_generic::<S, V>(inner, value, optional, cursor, 0, sink)
 }
 
 /// Demand-forwarding twin of [`eval_nth_generic`]/[`nth_with_n_generic`]
@@ -9039,14 +9074,15 @@ fn each_first_generic<S: EvalSemantics, V: DocumentValue>(
 /// arm `eval_each_generic` was missing for `Builtin::NthStream`/
 /// `Expr::NthExpr`.
 ///
-/// Reproduces `nth_with_n_generic` line for line except that the kept item is
-/// pushed to `sink` as it is produced rather than collected, so every rule
-/// that function documents still applies here: `>=` rather than `==` with
-/// `seen` rising across a `?//` retry (#1519), `n` as the OUTER loop driven
-/// through [`fanout_arg_each_generic`] (#1687), the
+/// Reproduces `nth_with_n_generic`'s rules except that the kept item is
+/// pushed to `sink` as it is produced rather than collected: `>=` rather than
+/// `==` with `seen` rising across a `?//` retry (#1519), `n` as the OUTER
+/// loop driven through [`fanout_arg_each_generic`] (#1687), the
 /// [`limit_or_nth_uses_live_input_queue`] deferral (#1309), and the forced
 /// decode of a *skipped* item, whose lazy `GenericItem::LazySeq` computation
-/// must still run for its errors even though its value is discarded (#1607).
+/// must still run for its errors even though its value is discarded (#1607)
+/// -- the last three live in [`take_at_index_generic`], shared with
+/// [`each_first_generic`] (`skip == 0`).
 ///
 /// **#2199's ordering is kept, and #2567 is unchanged by this arm.** A
 /// skipped item's forced decode failure is reported ahead of anything a
@@ -9083,33 +9119,7 @@ fn each_nth_generic<S: EvalSemantics, V: DocumentValue>(
             Ok(n) => n,
             Err(e) => return Flow::Escaped(Control::Error(e)),
         };
-        let mut seen = 0usize;
-        let mut outer_stopped = false;
-        let mut skipped_err: Option<Control> = None;
-        let flow = eval_each_generic::<S, V>(expr, value.clone(), optional, cursor, &mut |item| {
-            let at_or_past = seen >= n;
-            seen += 1;
-            if at_or_past {
-                if sink(item) == Demand::Stop {
-                    outer_stopped = true;
-                }
-                return Demand::Stop;
-            }
-            // #1607: a skipped output is genuinely produced by jq's own
-            // `last(limit($n + 1; f))` desugaring, so its lazy computation
-            // still has to run for its errors -- see `nth_with_n_generic`.
-            if let Err(control) = generic_item_into_owned(item) {
-                return stop_with_escape(&mut skipped_err, control);
-            }
-            Demand::Continue
-        });
-        // #2199: checked before the flow, so a skipped item's decode failure
-        // cannot lose to whatever an illegitimate `?//` retry went on to
-        // produce through this same sink.
-        if let Some(control) = skipped_err {
-            return Flow::Escaped(control);
-        }
-        finish_short_circuit(outer_stopped, flow)
+        take_at_index_generic::<S, V>(expr, value.clone(), optional, cursor, n, sink)
     })
 }
 
@@ -9197,7 +9207,6 @@ fn each_index_expr_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Flow {
-    let mut outer_stopped = false;
     let mut escape: Option<Control> = None;
 
     let flow =
@@ -9220,7 +9229,6 @@ fn each_index_expr_generic<S: EvalSemantics, V: DocumentValue>(
                     optional,
                     cursor,
                     sink,
-                    &mut outer_stopped,
                     &mut escape,
                 ) {
                     Demand::Continue
@@ -9241,7 +9249,6 @@ fn each_index_expr_generic<S: EvalSemantics, V: DocumentValue>(
                     optional,
                     cursor,
                     sink,
-                    &mut outer_stopped,
                     &mut escape,
                 ) {
                     Demand::Continue
@@ -9265,7 +9272,6 @@ fn each_index_expr_generic<S: EvalSemantics, V: DocumentValue>(
                         optional,
                         cursor,
                         sink,
-                        &mut outer_stopped,
                         &mut escape,
                     ) {
                         return Demand::Stop;
@@ -9275,19 +9281,16 @@ fn each_index_expr_generic<S: EvalSemantics, V: DocumentValue>(
             }
         });
 
-    if outer_stopped {
-        return flow;
-    }
     resume_from_escape(escape, flow)
 }
 
 /// One already-computed key, indexed against `target` via
 /// [`eval_index_expr`] (unchanged) and forwarded to `sink` --
 /// [`each_index_expr_generic`]'s per-key body, split out as a free function
-/// taking `sink`/`outer_stopped`/`escape` as explicit `&mut` parameters
-/// rather than a closure capturing them: the borrow checker will not let one
-/// closure both drive [`eval_each_generic`]'s own sink *and* be called
-/// (mutably capturing the same state) from inside it.
+/// taking `sink`/`escape` as explicit `&mut` parameters rather than a
+/// closure capturing them: the borrow checker will not let one closure both
+/// drive [`eval_each_generic`]'s own sink *and* be called (mutably capturing
+/// the same state) from inside it.
 #[allow(clippy::too_many_arguments)] // STYLE-0004: every parameter is threaded straight
                                      // through to one `eval_index_expr` + `drain_result_generic`
                                      // call; a struct would just rename the same fields.
@@ -9298,17 +9301,13 @@ fn process_index_key<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
-    outer_stopped: &mut bool,
     escape: &mut Option<Control>,
 ) -> bool {
     let literal_key = owned_to_expr(k);
     let one_key_result = eval_index_expr::<S, V>(target, &literal_key, value, optional, cursor);
     match drain_result_generic(one_key_result, sink) {
         Flow::Exhausted => true,
-        Flow::Stopped { .. } => {
-            *outer_stopped = true;
-            false
-        }
+        Flow::Stopped { .. } => false,
         Flow::Escaped(control) => {
             stop_with_escape(escape, control);
             false
@@ -9371,7 +9370,6 @@ fn each_object_entries_generic<S: EvalSemantics, V: DocumentValue>(
             sink,
         ),
         ObjectKey::Expr(key_expr) => {
-            let mut outer_stopped = false;
             let mut escape: Option<Control> = None;
             let flow =
                 eval_each_generic::<S, V>(key_expr, value.clone(), optional, cursor, &mut |item| {
@@ -9405,16 +9403,10 @@ fn each_object_entries_generic<S: EvalSemantics, V: DocumentValue>(
                         sink,
                     ) {
                         Flow::Exhausted => Demand::Continue,
-                        Flow::Stopped { .. } => {
-                            outer_stopped = true;
-                            Demand::Stop
-                        }
+                        Flow::Stopped { .. } => Demand::Stop,
                         Flow::Escaped(control) => stop_with_escape(&mut escape, control),
                     }
                 });
-            if outer_stopped {
-                return flow;
-            }
             resume_from_escape(escape, flow)
         }
     }
@@ -9436,7 +9428,6 @@ fn each_object_value_generic<S: EvalSemantics, V: DocumentValue>(
     acc: &mut Vec<(String, OwnedValue)>,
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Flow {
-    let mut outer_stopped = false;
     let mut escape: Option<Control> = None;
     let flow =
         eval_each_generic::<S, V>(value_expr, value.clone(), optional, cursor, &mut |item| {
@@ -9456,16 +9447,10 @@ fn each_object_value_generic<S: EvalSemantics, V: DocumentValue>(
             acc.pop();
             match result {
                 Flow::Exhausted => Demand::Continue,
-                Flow::Stopped { .. } => {
-                    outer_stopped = true;
-                    Demand::Stop
-                }
+                Flow::Stopped { .. } => Demand::Stop,
                 Flow::Escaped(control) => stop_with_escape(&mut escape, control),
             }
         });
-    if outer_stopped {
-        return flow;
-    }
     resume_from_escape(escape, flow)
 }
 
