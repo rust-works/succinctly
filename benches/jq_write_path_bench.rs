@@ -1189,6 +1189,100 @@ fn bench_path_recursive_def_ast(c: &mut Criterion) {
     group.finish();
 }
 
+// =============================================================================
+// #2190: `path()`'s per-branch cost, with the document held structurally fixed
+// =============================================================================
+
+/// Element counts for the #2190 group. Deliberately small and doubling: the
+/// point is the *exponent* between adjacent rows, not any single time, and at
+/// the pre-fix ~1.98 the largest row already costs ~3s.
+const LEADING_ITERATE_ELEMS: &[usize] = &[50, 100, 200, 400];
+
+/// How many comma branches each element fans out into. #2190's table A holds
+/// the resolved-path count fixed and widens this from 1 to 32 for free, so the
+/// width itself is not a term -- 8 is simply a middle value that keeps the
+/// resolved-path count interesting at small element counts.
+const LEADING_ITERATE_WIDTH: usize = 8;
+
+/// How deep the static tail after the comma runs.
+const LEADING_ITERATE_DEPTH: usize = 4;
+
+/// `{"foo": [{"b0": <chain>, ..., "b7": <chain>}, ...]}` where `<chain>` is
+/// `{"d":{"d":{"d":{"d":0}}}}` -- #2190's own repro document.
+fn leading_iterate_comma_doc(elems: usize) -> Vec<u8> {
+    let mut chain = String::from("0");
+    for _ in 0..LEADING_ITERATE_DEPTH {
+        chain = format!(r#"{{"d":{chain}}}"#);
+    }
+    let element = (0..LEADING_ITERATE_WIDTH)
+        .map(|b| format!(r#""b{b}":{chain}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    let elements = (0..elems)
+        .map(|_| format!("{{{element}}}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(r#"{{"foo":[{elements}]}}"#).into_bytes()
+}
+
+/// `[path(.foo[] | (.b0, ..., .b7) | .d | .d | .d | .d)] | length` over
+/// [`leading_iterate_comma_doc`] -- #2190's repro, and the one shape the
+/// groups above miss.
+///
+/// The distinguishing feature is a **leading** bare iterate. #888 removed this
+/// exact O(n^2) for a *trailing* one by deferring it (`resolve_dynamic_indexes`'s
+/// `defer_trailing_iterate`), which is what `jq_write_path_path_array` above
+/// covers; a leading one is still enumerated to one resolved branch per
+/// element before the walk runs, so the branch count scales with the document.
+/// The comma is what forces the enumeration -- at width 1 the parenthesised
+/// group is an `Expr::Paren`, not an `Expr::Comma`, `needs_path_prepass` is
+/// false, and the whole shape collapses to a single branch.
+///
+/// Before #2190 `builtin_path_on_owned` handed each of those branches a **deep
+/// clone of the whole document**, so the cost was `branches x nodes` and both
+/// factors grow with `elems` together: measured exponent ~1.98 (each doubling
+/// costing ~3.94x). The fix borrows the document instead, which should read
+/// ~1.0 here. Because `Throughput::Elements` is set, an exponent regression is
+/// visible directly in Criterion's ns/element column without eyeballing the
+/// raw timings.
+///
+/// Wrapped in `length` so the timed *output* stays O(1) — this repo's own
+/// benchmarking discipline warns that a shape whose output grows with the
+/// input measures the renderer as much as the evaluator.
+fn bench_path_leading_iterate_comma(c: &mut Criterion) {
+    let mut group = c.benchmark_group("jq_write_path_path_leading_iterate_comma");
+    let branches = (0..LEADING_ITERATE_WIDTH)
+        .map(|b| format!(".b{b}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let tail = vec![".d"; LEADING_ITERATE_DEPTH].join(" | ");
+    let expr =
+        parse(&format!("[path(.foo[] | ({branches}) | {tail})] | length")).expect("must parse");
+
+    for &elems in LEADING_ITERATE_ELEMS {
+        let json = leading_iterate_comma_doc(elems);
+
+        // Guard the premise: one path per (element, comma branch) pair. A
+        // walk that silently drops branches would otherwise read as a
+        // speedup rather than a failure.
+        assert_eq!(
+            eval_one(&expr, &json),
+            OwnedValue::Int((elems * LEADING_ITERATE_WIDTH) as i64),
+            "elems={elems}: must report one path per element per comma branch"
+        );
+
+        let index = JsonIndex::build(&json);
+        group.throughput(Throughput::Elements((elems * LEADING_ITERATE_WIDTH) as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(elems), &json, |b, json| {
+            b.iter(|| {
+                let cursor = index.root(black_box(json));
+                black_box(eval::<Vec<u64>, JqSemantics>(&expr, cursor))
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_del_array,
@@ -1211,5 +1305,6 @@ criterion_group!(
     bench_path_paren_chain_ast,
     bench_path_if_fanout_ast,
     bench_path_recursive_def_ast,
+    bench_path_leading_iterate_comma,
 );
 criterion_main!(benches);

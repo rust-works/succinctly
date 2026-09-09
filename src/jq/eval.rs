@@ -32069,23 +32069,122 @@ fn value_after_components<S: EvalSemantics>(
     Ok(Some(current))
 }
 
-/// One step of [`value_after_components`]'s walk (#2058).
+/// Where a bare static [`Expr::Field`]/[`Expr::Index`] component lands, as a
+/// position in the container it was resolved against (#2190).
+///
+/// [`navigate_static_component`] (destructive, for `=`/`|=`/`del()`) and
+/// [`navigate_static_component_ref`] (borrowing, for `path()`) differ only in
+/// how they take that position *out* -- `swap_remove_index` versus
+/// `get_index`. Everything that could otherwise drift between them is decided
+/// once, in [`classify_static_component`]: the missing-key and out-of-bounds
+/// rules, the negative-index resolution, the step-through-`null` rule, and
+/// which error a container that cannot be indexed at all raises.
+///
+/// That is this repo's own "one definition, plus a test that the call sites
+/// agree" rule applied where a second navigator would otherwise have meant a
+/// *fourth* independent copy of jq's indexing rules -- the reason #2190's own
+/// fix-direction note called the borrowing walker blocked. The agreement
+/// test is
+/// `navigate_static_component_agrees_with_eval_owned_fast_path`.
+enum StaticAccess {
+    /// The child is at this position: `IndexMap` entry `i`, or array element
+    /// `i`. Already bounds-checked, and already resolved from the end for a
+    /// negative index, so neither extraction re-derives either.
+    Slot(usize),
+    /// The step reads as `null`: a missing key, an out-of-range index (either
+    /// sign), or a step through `null` -- none of which is an error in jq.
+    Null,
+    /// Not a bare `Field`/`Index` ([`Expr::Slice`] above all). Both
+    /// extractions hand it to [`eval_static_component_fallback`], which
+    /// borrows, so they share that arm verbatim rather than copying it.
+    Fallback,
+}
+
+/// Resolve `component` against `current` to a [`StaticAccess`] -- the one
+/// definition of jq's static-indexing rules that both navigators below share.
+///
+/// Takes `current` by reference deliberately: the destructive navigator calls
+/// this *before* consuming its value, which is sound only because the answer
+/// borrows nothing from it.
+fn classify_static_component(
+    component: &Expr,
+    current: &OwnedValue,
+) -> Result<StaticAccess, EvalEscape> {
+    match component {
+        Expr::Field(name) => match current {
+            // A missing key is `null`, not an error, exactly as
+            // `eval_owned_fast_path`'s own `Field` arm has it.
+            OwnedValue::Object(map) => Ok(map
+                .get_index_of(name.as_str())
+                .map_or(StaticAccess::Null, StaticAccess::Slot)),
+            OwnedValue::Null => Ok(StaticAccess::Null),
+            other => Err(EvalError::cannot_index_with_field(owned_type_name(other), name).into()),
+        },
+        Expr::Index { idx, .. } => match current {
+            OwnedValue::Array(items) => {
+                let resolved = if *idx < 0 {
+                    items.len() as i64 + idx
+                } else {
+                    *idx
+                };
+                Ok(usize::try_from(resolved)
+                    .ok()
+                    .filter(|&i| i < items.len())
+                    .map_or(StaticAccess::Null, StaticAccess::Slot))
+            }
+            OwnedValue::Null => Ok(StaticAccess::Null),
+            other => {
+                Err(EvalError::cannot_index_with_type(owned_type_name(other), "number").into())
+            }
+        },
+        _ => Ok(StaticAccess::Fallback),
+    }
+}
+
+/// The [`StaticAccess::Fallback`] step, answered by the value evaluator rather
+/// than by a second copy of its rules. Borrows `current`, so both navigators
+/// below share it unchanged.
+fn eval_static_component_fallback<S: EvalSemantics>(
+    component: &Expr,
+    current: &OwnedValue,
+) -> Result<Option<OwnedValue>, EvalEscape> {
+    let mut values = eval_owned_multi::<S>(component, current)?;
+    // Every caller hands this a tail already proven single-valued by
+    // construction (`resolve_seq`, gated on `needs_fanout_pass`) -- a
+    // `> 1` output count here is a genuine invariant violation, not
+    // the ordinary "component matched nothing" case (a missing key
+    // still yields exactly one output, `null`). #682 was exactly
+    // this: `Expr::Iterate` produced more than one output through
+    // this function, which silently discarded every branch but one
+    // instead of the fan-out its caller actually needed.
+    debug_assert!(
+        values.len() <= 1,
+        "eval_static_component_fallback: {component:?} produced {} outputs, but every \
+         caller requires a single-valued tail (see needs_fanout_pass)",
+        values.len()
+    );
+    Ok(match values.len() {
+        1 => Some(values.pop().expect("len checked")),
+        _ => None,
+    })
+}
+
+/// One step of [`value_after_components`]'s walk (#2058), taking its value by
+/// move -- the `=`/`|=`/`del()` side.
 ///
 /// A bare [`Expr::Field`]/[`Expr::Index`] -- the overwhelmingly common shape
-/// in a static tail (`.c.c.c...c[0]`) -- is handled here directly and
-/// destructively, mirroring [`eval_owned_fast_path`]'s own arms for those two
-/// (kept in sync deliberately: same missing-key/out-of-bounds ->
-/// `OwnedValue::Null` rule, same error types/messages for a non-indexable
-/// container) but consuming `current` instead of borrowing it.
-/// [`IndexMap::swap_remove`]/[`Vec::swap_remove`] -- not the order-preserving
-/// `shift_remove`/`Vec::remove` -- are what make this O(1) instead of O(n),
-/// and are safe here specifically because the container being consumed is
-/// *never read again*: every sibling still inside it is simply dropped, in
-/// whatever order swap-removal leaves them, the moment this function
-/// returns. (A container whose remaining order or contents an *other* live
-/// reference could still observe would need the order-preserving removal
-/// instead -- this one has no such reference; see `value_after_components`'s
-/// own doc comment for why.)
+/// in a static tail (`.c.c.c...c[0]`) -- is navigated destructively here.
+/// [`IndexMap::swap_remove_index`]/[`Vec::swap_remove`] -- not the
+/// order-preserving `shift_remove`/`Vec::remove` -- are what make this O(1)
+/// instead of O(n), and are safe here specifically because the container being
+/// consumed is *never read again*: every sibling still inside it is simply
+/// dropped, in whatever order swap-removal leaves them, the moment this
+/// function returns. (A container whose remaining order or contents an
+/// *other* live reference could still observe would need the order-preserving
+/// removal instead -- this one has no such reference; see
+/// `value_after_components`'s own doc comment for why. The borrowing twin,
+/// [`navigate_static_component_ref`], removes nothing at all and so carries no
+/// such requirement.)
 ///
 /// Anything else -- [`Expr::Slice`] (jq's own array slice keeps the sliced
 /// sub-range regardless, so there is no equivalent "don't clone the sibling"
@@ -32104,57 +32203,135 @@ fn navigate_static_component<S: EvalSemantics>(
     component: &Expr,
     current: OwnedValue,
 ) -> Result<Option<OwnedValue>, EvalEscape> {
-    match component {
-        Expr::Field(name) => Ok(Some(match current {
-            OwnedValue::Object(mut map) => map.swap_remove(name).unwrap_or(OwnedValue::Null),
-            OwnedValue::Null => OwnedValue::Null,
-            other => {
-                return Err(
-                    EvalError::cannot_index_with_field(owned_type_name(&other), name).into(),
-                );
+    Ok(Some(
+        match classify_static_component(component, &current)? {
+            StaticAccess::Slot(i) => match current {
+                OwnedValue::Object(mut map) => map
+                    .swap_remove_index(i)
+                    .map_or(OwnedValue::Null, |(_, value)| value),
+                OwnedValue::Array(mut items) => items.swap_remove(i),
+                // Unreachable: `classify_static_component` answers `Slot` only
+                // for the object/array it resolved the slot against. `null` is
+                // the answer it would give for a slot that is not there anyway,
+                // so this needs no panic of its own.
+                _ => OwnedValue::Null,
+            },
+            StaticAccess::Null => OwnedValue::Null,
+            StaticAccess::Fallback => {
+                return eval_static_component_fallback::<S>(component, &current)
             }
-        })),
-        Expr::Index { idx, .. } => Ok(Some(match current {
-            OwnedValue::Array(mut items) => {
-                let resolved = if *idx < 0 {
-                    items.len() as i64 + idx
-                } else {
-                    *idx
-                };
-                usize::try_from(resolved)
-                    .ok()
-                    .filter(|&i| i < items.len())
-                    .map_or(OwnedValue::Null, |i| items.swap_remove(i))
-            }
-            OwnedValue::Null => OwnedValue::Null,
-            other => {
-                return Err(
-                    EvalError::cannot_index_with_type(owned_type_name(&other), "number").into(),
-                );
-            }
-        })),
-        _ => {
-            let mut values = eval_owned_multi::<S>(component, &current)?;
-            // Every caller hands this a tail already proven single-valued by
-            // construction (`resolve_seq`, gated on `needs_fanout_pass`) -- a
-            // `> 1` output count here is a genuine invariant violation, not
-            // the ordinary "component matched nothing" case (a missing key
-            // still yields exactly one output, `null`). #682 was exactly
-            // this: `Expr::Iterate` produced more than one output through
-            // this function, which silently discarded every branch but one
-            // instead of the fan-out its caller actually needed.
-            debug_assert!(
-                values.len() <= 1,
-                "value_after_components: {component:?} produced {} outputs, but every \
-                 caller requires a single-valued tail (see needs_fanout_pass)",
-                values.len()
-            );
-            Ok(match values.len() {
-                1 => Some(values.pop().expect("len checked")),
-                _ => None,
-            })
+        },
+    ))
+}
+
+/// A node the `path()` walk stands on (#2190).
+///
+/// Mirrors `eval_generic::PathNode`'s own `At`/`Owned` split, minus the cursor
+/// variant this route has no use for: the document is **borrowed**, and only a
+/// value the walk itself *built* is owned.
+///
+/// The point is that this type is **closed under navigation** -- a child of a
+/// `WalkNode<'v>` is a `WalkNode<'v>` -- which is what lets
+/// [`walk_pipe`] keep buffering one stage's results in a plain `Vec` while
+/// still borrowing the document. `Cow<'v, OwnedValue>` cannot do that: `Vec`
+/// is invariant in its element type, so a stage reached *through* a
+/// `Cow::Owned` would have to hand its caller a `Cow` borrowed from that
+/// local buffer, at a strictly shorter lifetime. `Rc` breaks the chain --
+/// residue's children are cloned into a fresh `Rc` and so borrow nothing --
+/// at a cost paid only inside residue, exactly as
+/// `eval_generic::owned_nav_children` already pays it.
+///
+/// Before #2190 the walk took `OwnedValue` by move instead, which forced
+/// `builtin_path_on_owned` to deep-clone the whole document once per resolved
+/// branch: `branches x nodes`, an exponent of ~1.98 measured over resolved
+/// path count with the document size held fixed.
+enum WalkNode<'v> {
+    /// A node of the document being walked. Borrowed, never copied.
+    Doc(&'v OwnedValue),
+    /// A value the walk built rather than found -- a slice's array, or
+    /// [`eval_static_component_fallback`]'s output. `Rc` so that buffering it
+    /// in [`walk_pipe`] costs a refcount rather than a deep copy.
+    Made(Rc<OwnedValue>),
+    /// jq's `null`: a missing key, an out-of-range index, or a step through
+    /// `null`. Its own variant rather than a `Made(Rc::new(Null))` so the
+    /// common "the path names a place this document does not have" case
+    /// allocates nothing.
+    Null,
+}
+
+/// The `null` every [`WalkNode::Null`] hands out. A `static` rather than a
+/// promoted temporary because `OwnedValue` has drop glue, so `&OwnedValue::Null`
+/// would not survive the expression it appears in.
+static WALK_NODE_NULL: OwnedValue = OwnedValue::Null;
+
+impl<'v> WalkNode<'v> {
+    /// A value the walk built, wrapped for buffering.
+    fn made(value: OwnedValue) -> Self {
+        Self::Made(Rc::new(value))
+    }
+
+    /// What this node holds, for the steps that only need to *read* it --
+    /// deciding a component against it, or reporting jq's verdict for a step
+    /// that cannot be taken.
+    fn value(&self) -> &OwnedValue {
+        match self {
+            Self::Doc(value) => value,
+            Self::Made(value) => value,
+            Self::Null => &WALK_NODE_NULL,
         }
     }
+
+    /// The child at positional `slot` -- the `IndexMap` entry or array element
+    /// [`classify_static_component`] resolved, or the one
+    /// [`Expr::Iterate`](Expr) is enumerating.
+    ///
+    /// A document node's child is borrowed at the *document's* own lifetime
+    /// (hence `*value`, not `value`: re-borrowing through the `&self` here
+    /// would shorten it and break the closure property above). Residue's child
+    /// is cloned into a fresh `Rc`.
+    fn child_at(&self, slot: usize) -> Self {
+        match self {
+            Self::Doc(value) => slot_of(value, slot).map_or(Self::Null, Self::Doc),
+            Self::Made(value) => {
+                slot_of(value, slot).map_or(Self::Null, |child| Self::made(child.clone()))
+            }
+            Self::Null => Self::Null,
+        }
+    }
+}
+
+/// The value at positional `slot` of an object or an array -- the one
+/// container-agnostic accessor [`StaticAccess::Slot`] is defined against.
+fn slot_of(value: &OwnedValue, slot: usize) -> Option<&OwnedValue> {
+    match value {
+        OwnedValue::Object(map) => map.get_index(slot).map(|(_, child)| child),
+        OwnedValue::Array(items) => items.get(slot),
+        _ => None,
+    }
+}
+
+/// [`navigate_static_component`]'s borrowing twin -- the `path()` side (#2190).
+///
+/// Same rules, via the same [`classify_static_component`]; the only difference
+/// is that this one *reads* the resolved slot instead of removing it, so the
+/// document it walks is never consumed and never has to be cloned to be walked
+/// again by the next resolved branch.
+fn navigate_static_component_ref<'v, S: EvalSemantics>(
+    component: &Expr,
+    current: &WalkNode<'v>,
+) -> Result<Option<WalkNode<'v>>, EvalEscape> {
+    Ok(Some(
+        match classify_static_component(component, current.value())? {
+            StaticAccess::Slot(slot) => current.child_at(slot),
+            StaticAccess::Null => WalkNode::Null,
+            StaticAccess::Fallback => {
+                return Ok(
+                    eval_static_component_fallback::<S>(component, current.value())?
+                        .map(WalkNode::made),
+                )
+            }
+        },
+    ))
 }
 
 /// [`value_after_components`], except when `trackable` is false (#843): then
@@ -37754,13 +37931,14 @@ pub(crate) fn builtin_path_on_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantic
         // the expression is concretely walked) needs the same treatment:
         // whatever earlier resolved expressions already streamed into
         // `reached` survives, and only this one stops the walk.
-        // One clone of the whole document per resolved branch (#2058) --
-        // `walk_path`/`walk_pipe`/`step_into` below take their value by move
-        // and navigate destructively, so this is the only clone this branch
-        // pays, however deep it walks. `owned` is shared across every branch
-        // in `exprs` (each needs its own independent walk from the document
-        // root), so it cannot be moved in directly here.
-        if let Err(e) = walk_path::<S>(expr, owned.clone(), &root, &mut reached, optional) {
+        //
+        // No clone at all (#2190). `owned` is shared across every branch in
+        // `exprs` -- each needs its own independent walk from the document
+        // root -- and before #2190 that meant handing each one a deep copy of
+        // the whole document, because the walkers navigated by move. They
+        // borrow now ([`WalkNode`]), so the shared `&OwnedValue` is walked
+        // directly, `branches` times, and the `branches x nodes` term is gone.
+        if let Err(e) = walk_path::<S>(expr, WalkNode::Doc(owned), &root, &mut reached, optional) {
             walk_error = Some(e);
             break;
         }
@@ -37809,24 +37987,27 @@ pub(crate) fn builtin_path_on_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantic
 /// before it obey the same rules, and keeping two copies of them is what let
 /// `path(.b.c)` lose the path that `path(.b)` kept (#489).
 ///
-/// **Takes `value` by value, and consumes it destructively, for the same
-/// reason [`value_after_components`] does (#2058).** `builtin_path_on_owned`
-/// clones the document once per resolved branch at this function's one call
-/// site -- everything below navigates that clone by move, so a `d`-deep
-/// chain costs O(d) per branch instead of the O(d^2) a `.clone()` at every
-/// step used to cost (step `i` used to clone the whole remaining O(d-i)-sized
-/// subtree just to read one field out of it). This mirrors
-/// `value_after_components`'s own fix one level up: that one flattened
-/// `resolve_seq`'s pre-pass (which every one of `path()`/`=`/`del()` runs to
-/// turn a computed key into a resolved component list), while this one
-/// flattens `path()`'s *own* second walk over that resolved list -- the
-/// reason `path()` alone still read the full O(d^2) exponent even after the
-/// pre-pass was fixed, since `=`/`del()` never reach this function at all.
-fn walk_path<S: EvalSemantics>(
+/// **Borrows the document rather than consuming a private copy of it
+/// (#2190).** A [`WalkNode`] is either a node of the document itself or a
+/// value this walk built, so nothing here has to own the tree it navigates:
+/// `builtin_path_on_owned` hands every one of its resolved branches the same
+/// `&OwnedValue`. Before #2190 it handed each one a deep clone, because these
+/// three functions navigated by move -- `branches x nodes`, an exponent of
+/// ~1.98 measured against resolved path count alone.
+///
+/// A single branch's walk stays O(depth), which is what #2058 bought and what
+/// the move-based version existed to protect: a step reads its child out of
+/// the parent (`WalkNode::child_at`) rather than cloning the parent's whole
+/// remaining subtree to look inside it. #2058 achieved that by *consuming* the
+/// parent; borrowing achieves the same thing without needing a copy to consume
+/// in the first place. `value_after_components`, the `=`/`|=`/`del()` twin one
+/// level up, still navigates by move -- it genuinely needs an owned result --
+/// and is untouched.
+fn walk_path<'v, S: EvalSemantics>(
     expr: &Expr,
-    value: OwnedValue,
+    value: WalkNode<'v>,
     current_path: &Rc<PathTrail>,
-    out: &mut Vec<(Rc<PathTrail>, OwnedValue)>,
+    out: &mut Vec<(Rc<PathTrail>, WalkNode<'v>)>,
     optional: bool,
 ) -> Result<(), EvalEscape> {
     // Panics past `MAX_VALUE_TREE_DEPTH` levels (code review on #2058): a
@@ -37859,7 +38040,7 @@ fn walk_path<S: EvalSemantics>(
             step_into::<S>(
                 expr,
                 OwnedValue::String(name.clone()),
-                value,
+                &value,
                 current_path,
                 out,
                 optional,
@@ -37869,7 +38050,7 @@ fn walk_path<S: EvalSemantics>(
             step_into::<S>(
                 expr,
                 index_component_value(*idx, key.as_ref()),
-                value,
+                &value,
                 current_path,
                 out,
                 optional,
@@ -37884,7 +38065,7 @@ fn walk_path<S: EvalSemantics>(
             step_into::<S>(
                 expr,
                 slice_component_value(*start, start_key.as_ref(), *end, end_key.as_ref()),
-                value,
+                &value,
                 current_path,
                 out,
                 optional,
@@ -37894,27 +38075,31 @@ fn walk_path<S: EvalSemantics>(
         // The one step whose components come from the *value* rather than the
         // expression, so it reads them off the container directly. Anything
         // that is not a container still takes the evaluator's verdict, which
-        // is jq's `Cannot iterate over <t> (<v>)`. `value` is owned, so each
-        // element/entry moves into `out` directly rather than being cloned,
-        // and each element's own trail extension is O(1) (`PathTrail::extend`).
-        Expr::Iterate => match value {
-            OwnedValue::Array(arr) => {
-                for (i, val) in arr.into_iter().enumerate() {
+        // is jq's `Cannot iterate over <t> (<v>)`. Each child is reached by
+        // slot through `WalkNode::child_at`, so a document node's children are
+        // borrowed rather than copied (#2190), and each element's own trail
+        // extension is O(1) (`PathTrail::extend`). An object key is cloned --
+        // it names the path, so it has to be owned either way, and it is the
+        // same `clone()` the `Field` arm above already pays.
+        Expr::Iterate => match value.value() {
+            OwnedValue::Array(items) => {
+                for i in 0..items.len() {
                     out.push((
                         PathTrail::extend(current_path, OwnedValue::Int(i as i64)),
-                        val,
+                        value.child_at(i),
                     ));
                 }
             }
             OwnedValue::Object(entries) => {
-                for (key, val) in entries {
+                for i in 0..entries.len() {
+                    let (key, _) = entries.get_index(i).expect("i < len");
                     out.push((
-                        PathTrail::extend(current_path, OwnedValue::String(key)),
-                        val,
+                        PathTrail::extend(current_path, OwnedValue::String(key.clone())),
+                        value.child_at(i),
                     ));
                 }
             }
-            other => match eval_owned_multi::<S>(expr, &other) {
+            other => match eval_owned_multi::<S>(expr, other) {
                 Ok(_) => {}
                 // `?` silences only the genuine indexing error; a halt
                 // raised while producing the verdict still escapes (#791).
@@ -37949,20 +38134,23 @@ fn walk_path<S: EvalSemantics>(
 
 /// Walk a pipe of path steps, threading each value reached into the next step.
 ///
-/// `value` moves stage to stage -- see [`walk_path`]'s own doc comment for why
-/// that is the point of this whole rewrite (#2058): a straight-line chain of
-/// `Field`/`Index` stages now passes exactly one value along by move, never
-/// cloning the remaining document at any intermediate stage. `current_path`
-/// is an `Rc<PathTrail>` for the identical reason one level up: `rest` is
-/// already a borrowed `&[Expr]` slice here (no AST clone needed to recurse,
-/// unlike `eval_generic.rs`'s twin of this function, which has to rebuild an
-/// owned `Expr::Pipe` at each stage because its own per-step helper only
-/// takes a single `&Expr` -- see that function's own doc comment).
-fn walk_pipe<S: EvalSemantics>(
+/// A stage's results are buffered here before the next stage runs them, and
+/// that buffer is what dictates [`WalkNode`]'s shape: it must be closed under
+/// navigation, or `reached` below could not hold a stage's output at the same
+/// lifetime the caller's `out` expects (`Vec` is invariant in its element
+/// type, so a `Cow` borrowed from `reached` could never satisfy it). See
+/// [`WalkNode`]'s own doc comment.
+///
+/// `current_path` is an `Rc<PathTrail>` for the same reason one level up, and
+/// `rest` is already a borrowed `&[Expr]` slice here (no AST clone needed to
+/// recurse, unlike `eval_generic.rs`'s twin of this function, which has to
+/// rebuild an owned `Expr::Pipe` at each stage because its own per-step helper
+/// only takes a single `&Expr` -- see that function's own doc comment).
+fn walk_pipe<'v, S: EvalSemantics>(
     exprs: &[Expr],
-    value: OwnedValue,
+    value: WalkNode<'v>,
     current_path: &Rc<PathTrail>,
-    out: &mut Vec<(Rc<PathTrail>, OwnedValue)>,
+    out: &mut Vec<(Rc<PathTrail>, WalkNode<'v>)>,
     optional: bool,
 ) -> Result<(), EvalEscape> {
     let Some((first, rest)) = exprs.split_first() else {
@@ -37986,20 +38174,22 @@ fn walk_pipe<S: EvalSemantics>(
 /// Take one path step: `component` names it, and the value evaluator decides
 /// both what it reaches and whether it may be taken at all.
 ///
-/// Delegates the actual navigation to [`navigate_static_component`] -- the
-/// same destructive, move-based step [`value_after_components`] uses (#2058)
-/// -- rather than a second copy of jq's indexing rules here. `Err` is
-/// suppressed into no output under `?`, which is all `?` means on a path
-/// step.
-fn step_into<S: EvalSemantics>(
+/// Delegates the actual navigation to [`navigate_static_component_ref`],
+/// which decides the step through the very same
+/// [`classify_static_component`] that `=`/`|=`/`del()`'s destructive
+/// [`navigate_static_component`] uses -- one definition of jq's indexing
+/// rules, two extractions (#2058, #2190), rather than a second copy of them
+/// here. `Err` is suppressed into no output under `?`, which is all `?` means
+/// on a path step.
+fn step_into<'v, S: EvalSemantics>(
     step: &Expr,
     component: OwnedValue,
-    value: OwnedValue,
+    value: &WalkNode<'v>,
     current_path: &Rc<PathTrail>,
-    out: &mut Vec<(Rc<PathTrail>, OwnedValue)>,
+    out: &mut Vec<(Rc<PathTrail>, WalkNode<'v>)>,
     optional: bool,
 ) -> Result<(), EvalEscape> {
-    let reached = match navigate_static_component::<S>(step, value) {
+    let reached = match navigate_static_component_ref::<S>(step, value) {
         Ok(reached) => reached,
         // `?` turns only a genuine step error into no output; a halt raised
         // by the step still escapes (#791).
@@ -55426,6 +55616,117 @@ mod tests {
                  for {expr:?} on {input:?}"
             );
         }
+    }
+
+    /// #2190 pins the *other* half of the same drift risk. The two navigators
+    /// share [`classify_static_component`], so every rule they could disagree
+    /// on -- missing key, out of bounds either sign, negative-index
+    /// resolution, step through `null`, which `EvalError` a non-indexable
+    /// container raises -- has one definition and cannot drift by
+    /// construction. What is *not* shared is the extraction: `swap_remove_
+    /// index`/`Vec::swap_remove` against `get_index`/`<[_]>::get`, plus the
+    /// fallback's owned result being rewrapped as [`WalkNode::Made`]. This
+    /// pins those.
+    ///
+    /// The matrix is the sibling test's, plus the [`Expr::Slice`] rows it has
+    /// no reason to carry: `Slice` is the shape that reaches
+    /// [`eval_static_component_fallback`], and so the one case where the
+    /// borrowing navigator has to *build* its answer rather than borrow it.
+    #[test]
+    fn navigate_static_component_ref_agrees_with_navigate_static_component() {
+        let obj = || {
+            let mut m = indexmap::IndexMap::new();
+            m.insert("a".to_string(), OwnedValue::Int(1));
+            m.insert("b".to_string(), OwnedValue::Int(2));
+            OwnedValue::Object(m)
+        };
+        let arr = || {
+            OwnedValue::Array(vec![
+                OwnedValue::Int(10),
+                OwnedValue::Int(20),
+                OwnedValue::Int(30),
+            ])
+        };
+        let slice = |start: Option<i64>, end: Option<i64>| Expr::Slice {
+            start,
+            end,
+            start_key: None,
+            end_key: None,
+        };
+
+        let cases: Vec<(Expr, OwnedValue)> = vec![
+            // Field: present key, missing key, on null, on a type that
+            // cannot be field-indexed at all.
+            (Expr::Field("a".to_string()), obj()),
+            (Expr::Field("missing".to_string()), obj()),
+            (Expr::Field("a".to_string()), OwnedValue::Null),
+            (Expr::Field("a".to_string()), OwnedValue::Int(5)),
+            (Expr::Field("a".to_string()), arr()),
+            // Index: in bounds, negative-from-end, out of bounds (positive
+            // and negative), on null, on a type that cannot be
+            // position-indexed at all.
+            (Expr::index(1), arr()),
+            (Expr::index(-1), arr()),
+            (Expr::index(10), arr()),
+            (Expr::index(-10), arr()),
+            (Expr::index(0), OwnedValue::Null),
+            (Expr::index(0), OwnedValue::String("x".to_string())),
+            (Expr::index(0), obj()),
+            // Slice: the `eval_static_component_fallback` rows -- a sub-range,
+            // an open bound, a clamped one, and the two non-array inputs.
+            (slice(Some(0), Some(2)), arr()),
+            (slice(Some(1), None), arr()),
+            (slice(None, Some(1)), arr()),
+            (slice(Some(0), Some(99)), arr()),
+            (slice(Some(0), Some(2)), OwnedValue::Null),
+            (slice(Some(0), Some(2)), obj()),
+        ];
+
+        for (expr, input) in cases {
+            let destructive = navigate_static_component::<JqSemantics>(&expr, input.clone());
+            let borrowing =
+                navigate_static_component_ref::<JqSemantics>(&expr, &WalkNode::Doc(&input))
+                    .map(|reached| reached.map(|node| node.value().clone()));
+            assert_eq!(
+                destructive, borrowing,
+                "navigate_static_component_ref disagrees with navigate_static_component \
+                 for {expr:?} on {input:?}"
+            );
+        }
+    }
+
+    /// [`WalkNode`]'s closure property (#2190), asserted directly: a child of a
+    /// document node is the *same* node the document holds, and a child of walk
+    /// residue is a fresh copy -- which is what makes `WalkNode<'v>` closed
+    /// under navigation and so lets [`walk_pipe`] keep buffering a stage in a
+    /// plain `Vec`. Reached in practice by `path(.a[0:2][] | .b)`, where the
+    /// slice's fabricated array is the residue the rest of the pipe walks.
+    #[test]
+    fn walk_node_child_borrows_the_document_and_copies_residue() {
+        let doc = OwnedValue::Array(vec![OwnedValue::Int(10), OwnedValue::Int(20)]);
+
+        let from_doc = WalkNode::Doc(&doc).child_at(1);
+        let WalkNode::Doc(child) = from_doc else {
+            panic!("a document node's child must stay borrowed, not be copied");
+        };
+        assert!(
+            core::ptr::eq(child, &doc.as_array().expect("array")[1]),
+            "the child must be the document's own node, not a copy of it"
+        );
+
+        let residue = WalkNode::made(doc.clone());
+        let from_residue = residue.child_at(1);
+        assert!(
+            matches!(from_residue, WalkNode::Made(_)),
+            "residue's child must be owned -- it has no document to borrow from"
+        );
+        assert_eq!(*from_residue.value(), OwnedValue::Int(20));
+
+        // Out of range, on either kind, is jq's `null` rather than an error.
+        assert!(matches!(WalkNode::Doc(&doc).child_at(9), WalkNode::Null));
+        assert!(matches!(WalkNode::made(doc).child_at(9), WalkNode::Null));
+        assert!(matches!(WalkNode::Null.child_at(0), WalkNode::Null));
+        assert_eq!(*WalkNode::Null.value(), OwnedValue::Null);
     }
 
     /// The value matrix `eval_owned_pure`'s pinning tests run every
@@ -79356,7 +79657,7 @@ mod tests {
             let mut reached = Vec::new();
             let _ = walk_path::<JqSemantics>(
                 &unresolved(),
-                OwnedValue::Null,
+                WalkNode::Null,
                 &PathTrail::root(),
                 &mut reached,
                 false,
@@ -79373,7 +79674,7 @@ mod tests {
             let pipe = Expr::Pipe(vec![unresolved(), Expr::Field("a".to_string())]);
             let _ = walk_path::<JqSemantics>(
                 &pipe,
-                OwnedValue::Null,
+                WalkNode::Null,
                 &PathTrail::root(),
                 &mut reached,
                 false,
@@ -79474,7 +79775,7 @@ mod tests {
             let mut reached = Vec::new();
             let _ = walk_path::<JqSemantics>(
                 &unresolved(),
-                OwnedValue::Null,
+                WalkNode::Null,
                 &PathTrail::root(),
                 &mut reached,
                 false,
@@ -79490,7 +79791,7 @@ mod tests {
             let pipe = Expr::Pipe(vec![unresolved(), Expr::Field("a".to_string())]);
             let _ = walk_path::<JqSemantics>(
                 &pipe,
-                OwnedValue::Null,
+                WalkNode::Null,
                 &PathTrail::root(),
                 &mut reached,
                 false,
