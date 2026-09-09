@@ -7801,7 +7801,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let StandardJson::Array(elements) = cursor.value() else {
-            panic!("expected an array");
+            panic!("expected an array"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the fixed b\"[1, 2, 3]\" literal above always decodes to StandardJson::Array (#2103)"
         };
         let cursors: Vec<_> = elements.cursor_iter().collect();
         let at = InputLocation::at(None, 1);
