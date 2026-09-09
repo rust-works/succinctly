@@ -24,6 +24,32 @@ built succinctly binary and classified by direction:
 shape a bug lives in proves nothing. `--self-test` prints the pools so a
 shrink is visible.
 
+#2649 widened the alphabet with *destructuring* binds, because
+`SRC as PATTERN | BODY` moves the path register through every pattern step
+and none of the #2042 shapes could emit one. `PATTERNS` adds, on top of the
+plain `SRC as $v` bind every other pool assumes:
+
+  * object patterns `{k:$v}` and nested ones `{k:{k2:$v}}` / `{k:{k:$v}}`;
+  * array patterns `[$v]` and `[$v,$w]` -- jq runs array elements in
+    *reverse* index order, so both the first and the second element are
+    drawn as the variable the body uses;
+  * multi-entry `{k:$v, k2:$w}` -- jq's second entry refuses unless the
+    first step landed on a null/bool, so this is mostly a both-refuse shape
+    and that is the point (the refusing half of the arm is a claim too);
+  * the `{$k}` shorthand and `{$k:{k2:$v}}`, which jq compiles as *one*
+    INDEX step with two binds;
+  * `?//` chains of two alternatives, including a bare-variable alternative
+    (`{a:$v} ?// $v`), whose retry rule is where a wrong answer would be a
+    fabrication rather than a refusal.
+
+The pattern's variable is then fed to the existing `USES` pool, so every
+body shape (`$v`, `$v[0]`, `$v | .[]`, `$v.k`, folds, nested `path()`,
+comma, recurse) and every wrapper (`path`, `del`, `=`, `|=`) already
+applies to it -- the write shapes come for free from `program()`'s wrapper
+draw. Sources are drawn from the same `SOURCES` pool as a plain bind, so a
+pattern is exercised on `.`, on a prior binding `$x`, and on a navigation
+`.k` (which jq refuses at the first step: the source is not the register).
+
 Usage:
     cargo build --release --features cli
     ./scripts/jq-bind-origin-fuzz.py [--bin PATH] [--jq PATH] [-n N] [--seed S] [--show K]
@@ -70,7 +96,26 @@ USES = ["$v", "$v.b?", "($v | select(true))", "(if true then $v else 1 end)", "(
         "$v[0:1]?", "(.a[0:1]? | $v)", "(.arr[-1]? | $v)", "recurse(if . == $v and type == \"object\" then $v.b? else empty end)",
         "$v as $w | $w", "reduce (1) as $i (.; $v)", "reduce (1) as $i (.a; $v)", "reduce (1) as $i (.a; 5 | $v)",
         "foreach (1) as $i (0; $v; .)", "($v, .b?)", "(.x | (.a | $v))", "(.x | (.c as $z | $v))",
-        "path(.a | $v)", "(($v | .b?) as $w | .b? | $w)", "(.b? as $z | $v)", "($v | $v)"]
+        "path(.a | $v)", "(($v | .b?) as $w | .b? | $w)", "(.b? as $z | $v)", "($v | $v)",
+        # #2649: a pattern variable is indexed/iterated/navigated as often as
+        # it is used bare, and the register has to survive each of them.
+        "$v[0]?", "($v | .[]?)", "($v | recurse)", "($v[0]?, $v)", "($v | first(.[]?))"]
+
+# #2649 destructuring patterns: (pattern, the variable the body then uses).
+# `V` is replaced by this bind's generated name, `W` by its sibling.
+PATTERNS = [
+    ("{a:V}", "V"), ("{c:V}", "V"), ("{x:V}", "V"), ("{b:V}", "V"),
+    ("{a:{b:V}}", "V"), ("{x:{a:V}}", "V"), ("{x:{c:V}}", "V"),
+    ("[V]", "V"), ("[V,W]", "V"), ("[V,W]", "W"), ("[[V]]", "V"),
+    ("{a:V, c:W}", "V"), ("{a:V, c:W}", "W"), ("{a:V, a:W}", "W"),
+    ("{$a}", "$a"), ("{$a:{b:V}}", "V"), ("{$a, c:V}", "V"),
+    ("{a:[V]}", "V"), ("{arr:[V,W]}", "W"),
+    # `?//` alternatives: the retry rule is the fabrication-prone half.
+    ("{a:V} ?// [V]", "V"), ("[V] ?// {a:V}", "V"), ("{a:V} ?// V", "V"),
+    ("{a:V, d:W} ?// {c:V}", "V"), ("{a:V} ?// {c:V}", "V"),
+    ("V ?// {a:V}", "V"), ("{a:{b:V}} ?// {c:V}", "V"),
+]
+DESTRUCTURE_P = 0.5
 
 def stage(rng, v):
     r = rng.random()
@@ -87,7 +132,14 @@ def program(rng):
         v = f"$v{i}"
         cands = [s for s, needs in SOURCES if not needs or prev]
         src = rng.choice(cands).replace("$p", prev or "$v0")
-        parts.append(f"{src} as {v}")
+        if rng.random() < DESTRUCTURE_P:
+            # #2649: a destructuring bind; the body uses the pattern's variable.
+            pat, use = rng.choice(PATTERNS)
+            w = f"$w{i}"
+            parts.append(f"{src} as {pat.replace('V', v).replace('W', w)}")
+            v = use.replace("V", v).replace("W", w)
+        else:
+            parts.append(f"{src} as {v}")
         for _ in range(rng.choice([0, 1, 1, 2])):
             parts.append(stage(rng, v))
         prev = v
@@ -137,7 +189,8 @@ def main():
         sys.exit(f"error: {a.jq} is not the pinned oracle ({pin}): {version!r}")
     if a.self_test:
         for name, pool in [("SOURCES", [s for s, _ in SOURCES]), ("NAV", NAV), ("LITERAL", LITERAL),
-                           ("PASSTHROUGH", PASSTHROUGH), ("MOVES", MOVES), ("USES", USES)]:
+                           ("PASSTHROUGH", PASSTHROUGH), ("MOVES", MOVES), ("USES", USES),
+                           ("PATTERNS", [f"{p} -> {u}" for p, u in PATTERNS])]:
             print(f"{name} ({len(pool)}): " + " ; ".join(pool))
         return 0
     rng = random.Random(a.seed)

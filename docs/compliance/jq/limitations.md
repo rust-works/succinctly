@@ -826,6 +826,7 @@ is the revert that established what the other one costs.
    | `path(. as {a:$q} ?// $r \| $r)`                  | `[]`               | same                                                                                                                                         |
    | `path(. as {a:$q} ?// $z \| .a)`                  | `["a"]`            | same, reached through a genuine near-access error rather than the terminal check                                                             |
    | `path(. as {a:$q} \| $q[0], $q)`                  | `["a",0]`, `["a"]` | pre-existing: a `$var` nested under `,`/`if` gets no register (the scope limit above) — `path(.a as $y \| .a \| 5 \| $y[0], $y)` refuses too |
+   | `path(. as {a:$q} \| select(true) \| $q)`          | `["a"]`            | pre-existing: a `select`/`label`/`first(.)`/`getpath([])` passthrough on an untracked stage re-seeds the carried register from the ambient value — `path(.a as $y \| .a \| 5 \| select(true) \| $y)` refuses too; `if`/`try`/`. as $q \| .` carry it |
 
    Two further rows differ only in **wording**, both tools refusing and neither writing:
    `path(. as {a:$q} \| $q as [$h] \| $q)` (jq names the whole value, succinctly names the step)
