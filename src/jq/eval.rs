@@ -5357,7 +5357,6 @@ fn each_if<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
-    let mut outer_stopped = false;
     let mut escape: Option<Control> = None;
     let cond_flow = eval_each::<W, S>(cond, value.clone(), optional, &mut |item| {
         let branch = if item.is_truthy() {
@@ -5367,21 +5366,12 @@ fn each_if<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         };
         match eval_each::<W, S>(branch, value.clone(), optional, sink) {
             Flow::Exhausted => Demand::Continue,
-            Flow::Stopped { .. } => {
-                outer_stopped = true;
-                Demand::Stop
-            }
+            Flow::Stopped { .. } => Demand::Stop,
             Flow::Escaped(control) => stop_with_escape(&mut escape, control),
         }
     });
 
-    if outer_stopped {
-        return cond_flow;
-    }
-    match escape {
-        Some(control) => Flow::Escaped(control),
-        None => cond_flow,
-    }
+    resume_from_escape(escape, cond_flow)
 }
 
 /// Lazy twin of [`eval_try`]: pushes `expr`'s own outputs straight to `sink`,
@@ -5988,6 +5978,35 @@ fn counted_bool_flow_to_flow<'a, W: Clone + AsRef<[u64]>>(
     }
 }
 
+/// Drive `expr` and push only its `skip`-th output (0-indexed) to `sink`,
+/// stopping the drive right there -- the shared skeleton behind
+/// [`each_first`] (`skip == 0`) and [`each_nth`]'s inner per-`n` walk, so the
+/// `?//`-retry short-circuit rule ([`finish_short_circuit`]) has one
+/// implementation rather than two independently-maintained copies.
+fn take_at_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    skip: usize,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    let mut seen = 0usize;
+    let mut outer_stopped = false;
+    let flow = eval_each::<W, S>(expr, value, optional, &mut |item| {
+        let at_or_past = seen >= skip;
+        seen += 1;
+        if at_or_past {
+            if sink(item) == Demand::Stop {
+                outer_stopped = true;
+            }
+            Demand::Stop
+        } else {
+            Demand::Continue
+        }
+    });
+    finish_short_circuit(outer_stopped, flow)
+}
+
 /// Demand-forwarding twin of [`eval_first_expr`] (#2180 WP1): jq's
 /// `def first(f): label $out | (f, break $out);` transcribed as a sink
 /// rather than a `Vec`.
@@ -6001,23 +6020,16 @@ fn counted_bool_flow_to_flow<'a, W: Clone + AsRef<[u64]>>(
 /// stop (#1519): `[first(first(1 as $x ?// $y | 5, 6))]` is `[5,5]` in jq
 /// 1.7.1 and was `[5]` here, and `[first(first(1 as $x ?// $y | 1))]` is
 /// `[1,1]` where it was `[1]` (both captured live against the pinned oracle,
-/// input `1`).
+/// input `1`). [`take_at_index`] with `skip == 0`: `seen >= 0` is true on the
+/// very first output, so `first` still gets jq's own `break $out`
+/// unconditionally on that first item.
 fn each_first<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
-    let mut outer_stopped = false;
-    let flow = eval_each::<W, S>(expr, value, optional, &mut |item| {
-        if sink(item) == Demand::Stop {
-            outer_stopped = true;
-        }
-        // jq's `break $out`, unconditionally: `first` is satisfied by the
-        // one output whether or not the wrapping consumer is.
-        Demand::Stop
-    });
-    finish_short_circuit(outer_stopped, flow)
+    take_at_index::<W, S>(expr, value, optional, 0, sink)
 }
 
 /// Demand-forwarding twin of [`fanout_arg`]'s [`ArgFanout::All`] loop
@@ -6072,7 +6084,7 @@ where
     });
 
     match escape {
-        Some(control) => Flow::Escaped(control),
+        Some(_) => resume_from_escape(escape, flow),
         // `pending` is dropped for the reason every other lazy consumer
         // drops it: it belongs to an eager fallback jq would never reach.
         None if consumer_stopped => Flow::Stopped { pending: None },
@@ -6083,7 +6095,8 @@ where
 /// Demand-forwarding twin of [`builtin_nth_stream`]/[`eval_nth_expr`]
 /// (#2180 WP1): the same "pull until index `n`, emit, then break" macro
 /// [`each_take_nth`] transcribes, with the kept output pushed to `sink` as it
-/// is produced instead of collected.
+/// is produced instead of collected -- [`take_at_index`]'s per-`n` walk,
+/// shared with [`each_first`] (`skip == 0`).
 ///
 /// The index test is `>=`, not `==`, and `seen` deliberately keeps rising
 /// across a `?//` retry -- see [`each_take_nth`]'s own doc comment for jq's
@@ -6115,21 +6128,7 @@ fn each_nth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Ok(n) => n,
             Err(e) => return Flow::Escaped(Control::Error(e)),
         };
-        let mut seen = 0usize;
-        let mut outer_stopped = false;
-        let flow = eval_each::<W, S>(expr, value.clone(), optional, &mut |item| {
-            let at_or_past = seen >= n;
-            seen += 1;
-            if at_or_past {
-                if sink(item) == Demand::Stop {
-                    outer_stopped = true;
-                }
-                Demand::Stop
-            } else {
-                Demand::Continue
-            }
-        });
-        finish_short_circuit(outer_stopped, flow)
+        take_at_index::<W, S>(expr, value.clone(), optional, n, sink)
     })
 }
 
@@ -6215,9 +6214,10 @@ fn each_any_all_gen_cond<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         },
     );
 
-    let effective_flow = match (flow, probe_escape) {
-        (Flow::Stopped { .. }, Some(control)) => Flow::Escaped(control),
-        (flow, _) => flow,
+    let effective_flow = if matches!(flow, Flow::Stopped { .. }) && probe_escape.is_some() {
+        resume_from_escape(probe_escape, flow)
+    } else {
+        flow
     };
     counted_bool_flow_to_flow(!target_truthy, outer_stopped, effective_flow, sink)
 }
@@ -6523,7 +6523,6 @@ fn each_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
-    let mut outer_stopped = false;
     let mut escape: Option<Control> = None;
     let flow = eval_each::<W, S>(key, value.clone(), false, &mut |item| {
         let k = match item {
@@ -6542,17 +6541,11 @@ fn each_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         let one_key_result = eval_index_expr::<W, S>(target, &literal_key, value.clone(), optional);
         match drain_result(one_key_result, sink) {
             Flow::Exhausted => Demand::Continue,
-            Flow::Stopped { .. } => {
-                outer_stopped = true;
-                Demand::Stop
-            }
+            Flow::Stopped { .. } => Demand::Stop,
             Flow::Escaped(control) => stop_with_escape(&mut escape, control),
         }
     });
 
-    if outer_stopped {
-        return flow;
-    }
     resume_from_escape(escape, flow)
 }
 
@@ -6593,7 +6586,6 @@ fn each_string_parts<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             each_string_parts::<W, S>(rest, value, optional, slots, sink)
         }
         StringPart::Expr(expr) => {
-            let mut outer_stopped = false;
             let mut escape: Option<Control> = None;
             let flow = eval_each::<W, S>(expr, value.clone(), optional, &mut |item| {
                 let owned = match item.into_owned() {
@@ -6603,16 +6595,10 @@ fn each_string_parts<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 slots[idx] = owned_to_string::<S>(&owned);
                 match each_string_parts::<W, S>(rest, value.clone(), optional, slots, sink) {
                     Flow::Exhausted => Demand::Continue,
-                    Flow::Stopped { .. } => {
-                        outer_stopped = true;
-                        Demand::Stop
-                    }
+                    Flow::Stopped { .. } => Demand::Stop,
                     Flow::Escaped(control) => stop_with_escape(&mut escape, control),
                 }
             });
-            if outer_stopped {
-                return flow;
-            }
             resume_from_escape(escape, flow)
         }
     }
@@ -6674,7 +6660,6 @@ fn each_object_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             each_object_value::<W, S>(name.clone(), &entry.value, rest, value, optional, acc, sink)
         }
         ObjectKey::Expr(key_expr) => {
-            let mut outer_stopped = false;
             let mut escape: Option<Control> = None;
             let flow = eval_each::<W, S>(key_expr, value.clone(), optional, &mut |item| {
                 // #2022: `into_owned`, not the lossy conversion -- an
@@ -6712,16 +6697,10 @@ fn each_object_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     sink,
                 ) {
                     Flow::Exhausted => Demand::Continue,
-                    Flow::Stopped { .. } => {
-                        outer_stopped = true;
-                        Demand::Stop
-                    }
+                    Flow::Stopped { .. } => Demand::Stop,
                     Flow::Escaped(control) => stop_with_escape(&mut escape, control),
                 }
             });
-            if outer_stopped {
-                return flow;
-            }
             resume_from_escape(escape, flow)
         }
     }
@@ -6744,7 +6723,6 @@ fn each_object_value<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     acc: &mut Vec<(String, OwnedValue)>,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
-    let mut outer_stopped = false;
     let mut escape: Option<Control> = None;
     let flow = eval_each::<W, S>(value_expr, value.clone(), optional, &mut |item| {
         // #2022: same checked conversion as the key slot above.
@@ -6757,16 +6735,10 @@ fn each_object_value<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         acc.pop();
         match result {
             Flow::Exhausted => Demand::Continue,
-            Flow::Stopped { .. } => {
-                outer_stopped = true;
-                Demand::Stop
-            }
+            Flow::Stopped { .. } => Demand::Stop,
             Flow::Escaped(control) => stop_with_escape(&mut escape, control),
         }
     });
-    if outer_stopped {
-        return flow;
-    }
     resume_from_escape(escape, flow)
 }
 
@@ -8046,15 +8018,14 @@ pub(crate) fn boolean_fanout_each(
         }
     }
 
-    match abort {
-        Some(control) => Flow::Escaped(control),
-        // `and`/`or` never stop on their own account -- the short circuit
-        // skips one *pairing*, it does not end the stream -- so every stop
-        // reaching here is the wrapping consumer's, and
-        // [`finish_short_circuit`] propagates it (and whatever a `?//` retry
-        // turned it into) verbatim.
-        None => finish_short_circuit(outer_stopped, flow),
+    if abort.is_some() {
+        return resume_from_escape(abort, flow);
     }
+    // `and`/`or` never stop on their own account -- the short circuit skips
+    // one *pairing*, it does not end the stream -- so every stop reaching
+    // here is the wrapping consumer's, and [`finish_short_circuit`]
+    // propagates it (and whatever a `?//` retry turned it into) verbatim.
+    finish_short_circuit(outer_stopped, flow)
 }
 
 /// One left-operand truthiness bit, paired against the right operand --
@@ -29333,7 +29304,11 @@ fn resolve_bind_source<S: EvalSemantics>(
             return resolve_bind_source_in::<S>(&rest, &marker.value, true, &rerooted, by_value);
         }
     }
-    if !trackable || frame.at.is_none() || !is_pure_navigation(source) || !navigates(source) {
+    if !trackable || frame.at.is_none() {
+        return by_value();
+    }
+    let (pure_navigation, navigates) = classify_navigation(source);
+    if !pure_navigation || !navigates {
         return by_value();
     }
     resolve_bind_source_in::<S>(source, value, trackable, frame, by_value)
@@ -29412,40 +29387,69 @@ fn resolve_bind_source_in<S: EvalSemantics>(
 /// `docs/compliance/jq/limitations.md`.
 fn is_pure_navigation(source: &Expr) -> bool {
     !any_subexpr(source, &mut |e| {
-        !matches!(
-            e,
-            Expr::Identity
-                | Expr::Field(_)
-                | Expr::Index { .. }
-                | Expr::Slice { .. }
-                | Expr::Iterate
-                | Expr::RecursiveDescent
-                | Expr::Pipe(_)
-                | Expr::Comma(_)
-                | Expr::Paren(_)
-                | Expr::TrackedVar(_)
-                | Expr::Literal(_)
-                | Expr::Array(_)
-                | Expr::Error(_)
-                | Expr::Builtin(Builtin::GetPath(_) | Builtin::Recurse)
-        )
+        !(is_navigation_node(e)
+            || matches!(
+                e,
+                Expr::Identity
+                    | Expr::Pipe(_)
+                    | Expr::Comma(_)
+                    | Expr::Paren(_)
+                    | Expr::TrackedVar(_)
+                    | Expr::Literal(_)
+                    | Expr::Array(_)
+                    | Expr::Error(_)
+            ))
     })
 }
 
-/// Whether `source` navigates at all: a bare `.` (or a marker) resolves to
-/// its input and yields nothing a plain value binding does not.
-fn navigates(source: &Expr) -> bool {
-    any_subexpr(source, &mut |e| {
-        matches!(
-            e,
-            Expr::Field(_)
-                | Expr::Index { .. }
-                | Expr::Slice { .. }
-                | Expr::Iterate
-                | Expr::RecursiveDescent
-                | Expr::Builtin(Builtin::GetPath(_) | Builtin::Recurse)
-        )
-    })
+/// The navigation-shaped node kinds [`classify_navigation`] looks for,
+/// factored out once so this list and [`is_pure_navigation`]'s wider
+/// allow-list -- which admits every one of these plus the non-navigating
+/// shapes it also permits -- can't drift apart.
+fn is_navigation_node(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Field(_)
+            | Expr::Index { .. }
+            | Expr::Slice { .. }
+            | Expr::Iterate
+            | Expr::RecursiveDescent
+            | Expr::Builtin(Builtin::GetPath(_) | Builtin::Recurse)
+    )
+}
+
+/// Whether `source` is pure navigation *and* navigates at all, computed in
+/// one traversal instead of two: [`resolve_bind_source`]'s only call site
+/// needs both together (`is_pure_navigation(source) && navigates(source)`,
+/// the "does this source navigate anywhere a plain value binding wouldn't"
+/// question) and, on a source that *is* pure navigation -- the common case
+/// worth optimizing, since anything else returns `by_value()` immediately
+/// without ever consulting the navigates half -- two separate full-tree
+/// walks would otherwise run back to back. Recording the navigates flag as a
+/// side effect of the same walk that decides purity is sound because callers
+/// only ever read it when `pure` comes back `true`, i.e. exactly the case
+/// where the walk ran to completion (no early exit) and saw every node --
+/// matching [`is_pure_navigation`]'s own short-circuit-on-first-violation
+/// behavior exactly when `pure` is `false`, since nothing downstream looks
+/// at the navigates flag then either.
+fn classify_navigation(source: &Expr) -> (bool, bool) {
+    let mut navigates = false;
+    let pure = !any_subexpr(source, &mut |e| {
+        navigates |= is_navigation_node(e);
+        !(is_navigation_node(e)
+            || matches!(
+                e,
+                Expr::Identity
+                    | Expr::Pipe(_)
+                    | Expr::Comma(_)
+                    | Expr::Paren(_)
+                    | Expr::TrackedVar(_)
+                    | Expr::Literal(_)
+                    | Expr::Array(_)
+                    | Expr::Error(_)
+            ))
+    });
+    (pure, navigates)
 }
 
 /// Whether `$var` can reach a position `resolve_node` dispatches on in
