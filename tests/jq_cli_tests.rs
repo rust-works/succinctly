@@ -8722,7 +8722,7 @@ fn test_negative_index_lookup_resolves_element_2568() -> Result<()> {
 /// `key`/`parent`/`file_index` against the caller's own ambient position,
 /// mirroring `Expr::Limit`'s own hybrid dispatch above -- `input`/`INIT`
 /// route through the path-context evaluator only when either needs it,
-/// then feed `eval_reduce_with_values`/`eval_foreach_with_values` (the
+/// then feed `eval_reduce_with_values`/`foreach_forks` (the
 /// OwnedValue-domain core shared with each function's ordinary,
 /// cursor-sourced entry point) exactly as before. `UPDATE`/`EXTRACT` are
 /// deliberately unchanged: both evaluate against the accumulator, a
@@ -30884,7 +30884,7 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
             "h",
             3,
         ),
-        // `foreach_fork`'s own `ended` slot: the halt escapes UPDATE, and
+        // `foreach_forks`' own `ended` slot: the halt escapes UPDATE, and
         // the source's `?//` used to re-offer the same element to a second
         // alternative that halted again.
         (
@@ -30910,7 +30910,7 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
             3,
         ),
         // The shape where the retry did not merely repeat the halt but
-        // *swallowed* it: the retried alternative succeeded, `foreach_fork`
+        // *swallowed* it: the retried alternative succeeded, `foreach_forks`
         // cleared its own `ended` on the next step, and the whole fold went
         // on to answer with exit 0.
         (
