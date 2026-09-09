@@ -27595,6 +27595,85 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             emit_passthrough(value, trackable, snapshot, sink)
         }
 
+        // `a // b`: resolve `a`, pass only its truthy branches through — jq's
+        // `//` filters a multi-output left side rather than choosing all-or-
+        // nothing (`retain_truthy` is this rule's value-only twin) — and
+        // fall back to `b` only when none survive. An escape while resolving
+        // `a` propagates rather than falling back, matching `eval_alternative`:
+        // `//` only substitutes for falsy/absent output, never for a raised
+        // error. The truthy branches produced *before* that escape have
+        // already reached the sink, which is what makes the escape's own
+        // prefix jq's: the eager form this replaced (#2235) forwarded
+        // `left`'s escape with its prefix *unfiltered*, falsy branches
+        // included, so a fold whose source was `(.. , error("x")) // 9`
+        // would have run a step for a falsy element jq never bound
+        // (`path(reduce (((.[] | . and true), error("x")) // 9) as $i (.;
+        // stderr))` on `[true,false]` runs one step in jq 1.7.1, not two).
+        //
+        // #845: a *literal* `a` is the one exception — real jq only requires
+        // path-shape for whichever of `a`'s outputs actually survive the
+        // truthy filter, so `a` being itself falsy (`false`, `null`) must
+        // fall through to `b` without ever needing to resolve as a path at
+        // all: confirmed live, `path(false // .b)` on `{"a":10}` is `["b"]`,
+        // while `path(1 // .b)` still raises (`1` is truthy, and does need
+        // path-shape). A literal's own value is known statically, at zero
+        // evaluation cost and with no side effect to risk duplicating —
+        // unlike checking `a`'s general truthiness by evaluating it a
+        // *second* time (rejected in review: resolving `a` already evaluates
+        // it once by the time any failure is visible here, so a follow-up
+        // evaluation just to inspect truthiness double-fires anything `a`
+        // does — confirmed live, `path(stderr // .b)` wrote its input to
+        // stderr twice under that approach — and a catch-all on the retry's
+        // own outcome swallowed a `halt`/`break` the retry surfaced instead
+        // of letting it escape, same review round).
+        //
+        // A `Comma`-fanned `a` mixing a falsy/non-path sibling with a
+        // path-shaped or truthy one used to be the one shape this arm
+        // didn't handle (filed as #980): `Comma` used to commit to a
+        // sibling's own failure eagerly, before `//`'s truthy filter ever
+        // got a chance to see it. #1288's "`Expr::Comma` stops checking a
+        // position too early" fixed this incidentally, not this arm
+        // itself; confirmed live against jq 1.7.1, all eight shapes #980
+        // pinned (`path((.a, false) // .b)`, `path((false, .a) // .b)`,
+        // `path((.a, null) // .b)`, `path((null, false) // .b)`,
+        // `path((.x, .a) // .b)`, `path((false, false) // .b)`,
+        // `path((.a, false, .a) // .b)`, and the genuinely-still-erroring
+        // `path((.a, 1) // .b)`) now match.
+        //
+        // A downstream `Stop` propagates as-is; only `a` running to
+        // exhaustion with nothing truthy delivered falls through to `b`.
+        Expr::Alternative(left, right) => {
+            if let Expr::Literal(lit) = unwrap_paren(left) {
+                if !literal_to_owned(lit).is_truthy() {
+                    return resolve_node_sink::<S>(
+                        right, value, trackable, snapshot, frame, keep, sink,
+                    );
+                }
+            }
+            let mut emitted = false;
+            let flow = resolve_node_sink::<S>(
+                left,
+                value,
+                trackable,
+                snapshot,
+                frame,
+                keep,
+                &mut |branch| {
+                    if !branch.value.is_truthy() {
+                        return Demand::Continue;
+                    }
+                    emitted = true;
+                    sink(branch)
+                },
+            );
+            match flow {
+                ResolveFlow::Exhausted if !emitted => {
+                    resolve_node_sink::<S>(right, value, trackable, snapshot, frame, keep, sink)
+                }
+                other => other,
+            }
+        }
+
         // `repeat(f)` (#1906) and the three bounded consumers below all
         // resolve through the sink now, so a bound threads through arbitrary
         // combinator nesting rather than only reaching a generator that is
@@ -27896,62 +27975,6 @@ fn resolve_node_eager<'a, S: EvalSemantics>(
         }
         Expr::Builtin(Builtin::RecurseCond(f, cond)) => {
             resolve_recurse::<S>(f, Some(cond), value, trackable, snapshot, frame, keep)
-        }
-
-        // `a // b`: resolve `a`, keep only its truthy branches — jq's `//`
-        // filters a multi-output left side rather than choosing all-or-
-        // nothing (`retain_truthy` is this rule's value-only twin) — and
-        // fall back to `b` only when none survive. An error while resolving
-        // `a` propagates rather than falling back, matching `eval_alternative`:
-        // `//` only substitutes for falsy/absent output, never for a raised
-        // error, and the `?` here already gives us that for free.
-        //
-        // #845: a *literal* `a` is the one exception — real jq only requires
-        // path-shape for whichever of `a`'s outputs actually survive the
-        // truthy filter, so `a` being itself falsy (`false`, `null`) must
-        // fall through to `b` without ever needing to resolve as a path at
-        // all: confirmed live, `path(false // .b)` on `{"a":10}` is `["b"]`,
-        // while `path(1 // .b)` still raises (`1` is truthy, and does need
-        // path-shape — the `?` below still fires for it, unchanged). A
-        // literal's own value is known statically, at zero evaluation cost
-        // and with no side effect to risk duplicating — unlike checking
-        // `a`'s general truthiness by evaluating it a *second* time
-        // (rejected in review: a `resolve_node` call already evaluates `a`
-        // once by the time any failure is visible here, so a follow-up
-        // evaluation just to inspect truthiness double-fires anything `a`
-        // does — confirmed live, `path(stderr // .b)` wrote its input to
-        // stderr twice under that approach — and a catch-all on the retry's
-        // own outcome swallowed a `halt`/`break` the retry surfaced instead
-        // of letting it escape, same review round).
-        //
-        // A `Comma`-fanned `a` mixing a falsy/non-path sibling with a
-        // path-shaped or truthy one used to be the one shape this arm
-        // didn't handle (filed as #980): `Comma` used to commit to a
-        // sibling's own failure eagerly, before `//`'s truthy filter ever
-        // got a chance to see it. #1288's "`Expr::Comma` stops checking a
-        // position too early" fixed this incidentally, not this arm
-        // itself; confirmed live against jq 1.7.1, all eight shapes #980
-        // pinned (`path((.a, false) // .b)`, `path((false, .a) // .b)`,
-        // `path((.a, null) // .b)`, `path((null, false) // .b)`,
-        // `path((.x, .a) // .b)`, `path((false, false) // .b)`,
-        // `path((.a, false, .a) // .b)`, and the genuinely-still-erroring
-        // `path((.a, 1) // .b)`) now match.
-        Expr::Alternative(left, right) => {
-            if let Expr::Literal(lit) = unwrap_paren(left) {
-                if !literal_to_owned(lit).is_truthy() {
-                    return resolve_node::<S>(right, value, trackable, snapshot, frame, keep);
-                }
-            }
-            let branches: Vec<PathBranch<'a>> =
-                resolve_node::<S>(left, value, trackable, snapshot, frame, keep)?
-                    .into_iter()
-                    .filter(|b| b.value.is_truthy())
-                    .collect();
-            if branches.is_empty() {
-                resolve_node::<S>(right, value, trackable, snapshot, frame, keep)
-            } else {
-                Ok(branches)
-            }
         }
 
         // #1440: `reduce`/`foreach` are real sugar over the same
