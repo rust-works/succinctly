@@ -610,6 +610,11 @@ fn check(expr: &mut Expr, scope: &mut Scope, errors: &mut Vec<UnresolvedCall>) {
         | Expr::AlternativeAssign {
             path: left,
             value: right,
+        }
+        | Expr::MetaAssign {
+            target: left,
+            value: right,
+            ..
         } => {
             check(left, scope, errors);
             check(right, scope, errors);

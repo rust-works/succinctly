@@ -35,8 +35,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::expr::{
     ArithOp, AssignOp, Builtin, CompareOp, Expr, FormatType, FuncDefBound, Import, Include,
-    Literal, MergeFlags, MetaValue, ModuleMeta, NumberKey, ObjectEntry, ObjectKey, Param, Pattern,
-    PatternEntry, Program, StringPart,
+    Literal, MergeFlags, MetaSlot, MetaValue, ModuleMeta, NumberKey, ObjectEntry, ObjectKey, Param,
+    Pattern, PatternEntry, Program, StringPart,
 };
 use super::value::{parse_i64_or_f64, NumberRepr};
 
@@ -356,6 +356,23 @@ pub fn collect_call_sites(input: &str, mode: ParserMode, jq_extensions: bool) ->
 
 /// See [`Parser::shadow_retry_budget`].
 const SHADOW_RETRY_BUDGET: usize = 64;
+
+/// The seven yq metadata-assignment keywords (#798): `PATH <slot> = value` /
+/// `PATH <slot> |= filter` selects the assign variant when one of these is
+/// immediately followed by `=`/`|=`. Shared by `Parser::try_parse_meta_op`
+/// and `Parser::peeks_meta_op_keyword_then_assign` (the latter stops the
+/// leading-`.` handler from swallowing one of these as an ordinary field
+/// name, e.g. `. style = "flow"` addressing the root's own style rather than
+/// a field named `style`).
+const META_OP_KEYWORDS: &[(&str, MetaSlot)] = &[
+    ("line_comment", MetaSlot::LineComment),
+    ("head_comment", MetaSlot::HeadComment),
+    ("foot_comment", MetaSlot::FootComment),
+    ("comments", MetaSlot::Comments),
+    ("style", MetaSlot::Style),
+    ("tag", MetaSlot::Tag),
+    ("anchor", MetaSlot::Anchor),
+];
 
 impl<'a> Parser<'a> {
     #[allow(dead_code)] // STYLE-0005: kept for tests and future use
@@ -1546,6 +1563,23 @@ impl<'a> Parser<'a> {
 
                 // Check for identity (just `.`)
                 if self.is_eof() || self.is_expr_terminator() {
+                    return Ok(Expr::Identity);
+                }
+
+                // yq metadata-assignment grammar (#798): `. <slot> = value` /
+                // `. <slot> |= filter` addresses the *root* node's metadata
+                // (`. style = "flow"` live-verified against pinned yq to mean
+                // exactly that, not "assign to a field named `style`"). This
+                // parser otherwise treats `.` followed by whitespace then an
+                // identifier identically to `.identifier` (the `skip_ws()`
+                // above), so without this check the keyword would be
+                // swallowed here as an ordinary field name before
+                // `parse_assignment`'s own metadata-op lookahead ever gets a
+                // chance to see it. Only fires when the keyword really is
+                // followed by `=`/`|=` -- `. style` alone (no operator that
+                // follows) is still the ordinary GET-form field access
+                // `.style`, unchanged.
+                if self.mode == ParserMode::Yq && self.peeks_meta_op_keyword_then_assign() {
                     return Ok(Expr::Identity);
                 }
 
@@ -5100,11 +5134,108 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
+    /// yq metadata-assignment grammar (#798): `PATH <slot> = value` /
+    /// `PATH <slot> |= filter`, e.g. `.a style = "flow"`. Distinct production
+    /// from both dotted-field access (`.a.style` parses as three chained
+    /// `Field`s, not "style of `.a`") and the pipe GET-form (`.a | style`) --
+    /// real yq's own lexer treats these seven keywords as op tokens whose
+    /// following `=`/`|=` selects the assign variant (live-verified against
+    /// pinned yq v4.53.3, and confirmed there is no other valid continuation
+    /// for a bare metadata keyword once a path expression precedes it).
+    ///
+    /// Called only after `left` (the PATH) has already been parsed, so a
+    /// match here means the cursor sits right before the keyword. `left`
+    /// moves in and, on `Err`, straight back out unchanged -- see the call
+    /// site's own comment on why this returns a single `Expr` either way
+    /// rather than a separate tuple alongside it. Restores position (but not
+    /// `left`'s ownership path) if the keyword isn't followed by `=`/`|=` --
+    /// there's no other production for it here, so the caller falls through
+    /// to the ordinary operator checks and any leftover keyword surfaces as
+    /// a normal parse error.
+    fn try_parse_meta_op(&mut self, left: Expr) -> Result<Result<Expr, Expr>, ParseError> {
+        let Some(&(keyword, slot)) = META_OP_KEYWORDS
+            .iter()
+            .find(|(kw, _)| self.matches_keyword(kw))
+        else {
+            return Ok(Err(left));
+        };
+
+        let saved_pos = self.pos;
+        self.consume_keyword(keyword);
+        self.skip_ws();
+
+        let is_update = if self.peek_str(2) == "|=" {
+            self.next(); // |
+            self.next(); // =
+            true
+        } else if self.peek() == Some('=') && self.peek_str(2) != "==" {
+            self.next(); // =
+            false
+        } else {
+            self.pos = saved_pos;
+            return Ok(Err(left));
+        };
+
+        self.skip_ws();
+        let value = self.parse_alternative()?;
+        Ok(Ok(Expr::MetaAssign {
+            target: Box::new(left),
+            slot,
+            value: Box::new(value),
+            is_update,
+        }))
+    }
+
+    /// Non-consuming lookahead used by the leading-`.` handler in
+    /// `parse_primary_inner` (#798): does the current position start with
+    /// one of [`META_OP_KEYWORDS`], immediately followed (after
+    /// whitespace/comments) by `=` or `|=`? Saves and restores `self.pos`
+    /// rather than duplicating `skip_ws`'s whitespace/comment rules.
+    fn peeks_meta_op_keyword_then_assign(&mut self) -> bool {
+        let Some(&(keyword, _)) = META_OP_KEYWORDS
+            .iter()
+            .find(|(kw, _)| self.matches_keyword(kw))
+        else {
+            return false;
+        };
+        let saved_pos = self.pos;
+        self.consume_keyword(keyword);
+        self.skip_ws();
+        let matched =
+            self.peek_str(2) == "|=" || (self.peek() == Some('=') && self.peek_str(2) != "==");
+        self.pos = saved_pos;
+        matched
+    }
+
     /// Parse assignment expressions: `path = value`, `path |= filter`, `path += value`, etc.
     /// Assignment has higher precedence than pipe, lower than alternative.
     fn parse_assignment(&mut self) -> Result<Expr, ParseError> {
-        let left = self.parse_alternative()?;
+        let mut left = self.parse_alternative()?;
         self.skip_ws();
+
+        // yq metadata-assignment grammar (#798) -- must be tried before the
+        // operator checks below, since none of them can follow `left`
+        // directly here: there's always a keyword token in between. `left`
+        // moves into and (on a non-match) straight back out of
+        // `try_parse_meta_op` as a single `Expr`, rather than this function
+        // holding it *and* a separately-destructured `(MetaSlot, bool,
+        // Expr)` triple at once -- `Expr` is a large enum (96 bytes), and
+        // `parse_assignment` sits in the same recursive-descent chain
+        // `MAX_EXPR_DEPTH`'s stack-overflow regression test pins to an 8 MiB
+        // budget (`test_expr_depth_limit_returns_parse_error_not_overflow_1156`,
+        // debug build): the wider tuple briefly pushed a 257-level parens
+        // chain (`MAX_EXPR_DEPTH + 10`) over that budget even though jq mode
+        // never takes this branch at all, since an unoptimized build still
+        // reserves the frame slot for every local a function can lexically
+        // reach. One `Expr`-sized local here keeps this branch's cost in
+        // line with the pre-existing `=`/`|=`/compound-assign branches
+        // below, each of which already holds exactly one.
+        if self.mode == ParserMode::Yq {
+            left = match self.try_parse_meta_op(left)? {
+                Ok(meta) => return Ok(meta),
+                Err(left) => left,
+            };
+        }
 
         // Check for assignment operators
         let peek2 = self.peek_str(2);

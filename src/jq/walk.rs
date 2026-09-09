@@ -786,6 +786,17 @@ pub fn map_subexprs(expr: &Expr, mut f: &mut dyn FnMut(&Expr) -> Expr) -> Expr {
             path: Box::new(f(path)),
             value: Box::new(f(value)),
         },
+        Expr::MetaAssign {
+            target,
+            slot,
+            value,
+            is_update,
+        } => Expr::MetaAssign {
+            target: Box::new(f(target)),
+            slot: *slot,
+            value: Box::new(f(value)),
+            is_update: *is_update,
+        },
 
         // --- One required child plus optional siblings ------------------------
         Expr::SliceExpr { target, start, end } => Expr::SliceExpr {
@@ -1084,6 +1095,11 @@ pub fn any_subexpr(expr: &Expr, pred: &mut dyn FnMut(&Expr) -> bool) -> bool {
         | Expr::AlternativeAssign {
             path: left,
             value: right,
+        }
+        | Expr::MetaAssign {
+            target: left,
+            value: right,
+            ..
         } => any_subexpr(left, pred) || any_subexpr(right, pred),
 
         Expr::Try { expr, catch } => {

@@ -419,6 +419,20 @@ fn rewrite_namespaced_calls(expr: Expr) -> Expr {
             path: Box::new(rewrite_namespaced_calls(*path)),
             value: Box::new(rewrite_namespaced_calls(*value)),
         },
+        // #798: yq-mode-only grammar (the parser never produces this in jq
+        // mode, where namespaced calls/imports live), but still rewritten
+        // for consistency with every other assignment-family variant above.
+        Expr::MetaAssign {
+            target,
+            slot,
+            value,
+            is_update,
+        } => Expr::MetaAssign {
+            target: Box::new(rewrite_namespaced_calls(*target)),
+            slot,
+            value: Box::new(rewrite_namespaced_calls(*value)),
+            is_update,
+        },
         // Label-break
         Expr::Label { name, body } => Expr::Label {
             name,

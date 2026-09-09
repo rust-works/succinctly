@@ -3330,6 +3330,51 @@ Refuse-only is the permitted direction (ADR-0018 rule 4): the document is untouc
 `$x[0] = 9` into a document write. `succinctly jq` matches jq 1.7.1 here exactly (both
 raise `Invalid path expression …`, exit 5) and is not affected.
 
+### `tag =`/`head_comment =`/`foot_comment =`/`comments =` parse but raise "not yet supported" (#798 PR1)
+
+`succinctly yq` now parses real yq's juxtaposed metadata-assignment grammar (`PATH <slot> =
+value` / `PATH <slot> |= filter`, e.g. `.a style = "flow"`) for all seven of yq's metadata
+op-tokens (`line_comment`, `head_comment`, `foot_comment`, `comments`, `style`, `tag`,
+`anchor`) — `src/jq/parser.rs`'s `try_parse_meta_op`/`Expr::MetaAssign`. Only three slots
+actually write anything yet: `line_comment =`, `style =`, `anchor =`
+(`src/bin/succinctly/yq_runner.rs`'s `resolve_meta_assign_writes`/`apply_meta_assign_writes`,
+modeled on the existing `propagate_assign_alias_marks`). `tag =`, `head_comment =`,
+`foot_comment =` and `comments =` are real, working yq features (live-verified against
+pinned v4.53.3: `.a tag = "!!str"` coerces the value's type; `.a head_comment = "hi"` and
+`.a foot_comment = "bye"` insert standalone comment lines; `.a comments = "x"` sets head,
+line and foot together) — succinctly deliberately raises `<slot> = ... is not yet
+supported` for all four instead of silently no-oping, since none has a write mechanism yet:
+`NodeMeta` (`src/jq/eval_generic.rs`) has no tag slot (#747), and head/foot comments have no
+backing field at all (the single-slot `line_comments` side-table this issue's own triage
+plans to widen — see #798's design-issue and triage comments). Tracked to land in PR2
+(`NodeMeta`/`CommentTree` data-model widening) through PR5 (`comments =`/`comments |=` and
+`...` recursive descent in yq mode); cross-link #1079/#1080/#1085 above.
+
+Two further, narrower divergences from real yq's own `style =` and root-`line_comment =`
+behaviour, both live-verified against pinned v4.53.3:
+
+- **`style = "literal"`/`"folded"`/`"tagged"` are accepted (no `unknown style` error,
+  matching real yq's vocabulary) but don't change succinctly's own rendering.** Real yq's
+  three are fully working, rendering features (`a: |-\n  1` / `a: >-\n  1` / `a: !!int 1`);
+  succinctly's emitter (`yaml_quote_string_with_style` in `yq_runner.rs`) only has real arms
+  for `flow`/`single`/`double` today, so the other three parse and validate but the output
+  is unchanged plain/block scalar rendering. The same gap already exists for a non-string
+  scalar under `style = "double"`/`"single"` — real yq coerces `a: 1` to `a: "1"`;
+  succinctly leaves it `a: 1` unquoted, since `yaml_quote_string_with_style` only special-
+  cases `OwnedValue::String`, never a number/bool being *turned into* a quoted string.
+- **A written root `line_comment` never renders**, matching real yq exactly (`.
+  line_comment = "q"` on `a: 1` stays `a: 1` in both), but for a narrower reason on
+  succinctly's side: this write pass has no read-after-write model at all — the
+  `line_comment` GET-form (`Builtin::LineComment`) still reads the original YAML cursor's
+  comment index, never this write pass's `CommentTree`, so `. line_comment = "q" |
+  line_comment` returns `""` on succinctly where real yq returns `"q"` (live-verified). Real
+  yq's own asymmetry is narrower still: its `&anchor`/`style` writes at root *do* render
+  (`. anchor = "z"` => `&z`; `. style = "flow"` => `{a: 1}`) and *are* readable back within
+  the same pipe, so only its root-`line_comment`-write case coincides with succinctly's
+  broader gap here — succinctly gets the observable output right by simply never writing
+  the root `line_comment` slot at all (`resolve_one_meta_assign`'s explicit root check),
+  not by having the same underlying mechanism.
+
 ### Other categories
 
 Float and number formatting ([#1071](https://github.com/rust-works/succinctly/issues/1071),
