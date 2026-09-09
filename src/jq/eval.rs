@@ -29105,6 +29105,24 @@ fn cannot_move_register(expr: &Expr) -> bool {
         // where the same navigation as a stage would raise.
         Expr::As { body, .. } => cannot_move_register(body),
 
+        // #2649: same subexp-restore reasoning as `As` above for the
+        // *source* -- but unlike a bare `$x` pattern, a destructuring
+        // pattern (`{...}`/`[...]`) performs its own tracked index steps
+        // while matching, which do move the register (a bare `$x ?// $y`
+        // chain has no index step at all, so it's still safe). If any
+        // alternative destructures, this is `false` outright; otherwise
+        // fall through to the body exactly like `As`.
+        Expr::AsPattern { patterns, body, .. } => {
+            if patterns
+                .iter()
+                .any(|p| matches!(p, Pattern::Object(_) | Pattern::Array(_)))
+            {
+                false
+            } else {
+                cannot_move_register(body)
+            }
+        }
+
         // `error` raises; it navigates nothing. Its message expression is
         // still evaluated, so that recurses. Needed by the escaping-prefix
         // shape `($x, error("boom"))`, whose already-emitted `$x` jq keeps
@@ -29965,6 +29983,19 @@ fn var_reaches_path_position(body: &Expr, var: &str) -> bool {
         } => {
             var_reaches_path_position(expr, var)
                 || (bound != var && var_reaches_path_position(body, var))
+        }
+        // #2649: mirrors `As` above. The source is checked unconditionally;
+        // the body only counts when no alternative already binds `var` --
+        // an alternative that does shadows the outer occurrence for that
+        // branch, same reasoning as `bound != var` above.
+        Expr::AsPattern {
+            expr,
+            patterns,
+            body,
+        } => {
+            var_reaches_path_position(expr, var)
+                || (!patterns.iter().any(|p| pattern_binds_var(p, var))
+                    && var_reaches_path_position(body, var))
         }
         Expr::Try { expr, catch } => {
             var_reaches_path_position(expr, var)
@@ -32764,6 +32795,69 @@ fn resolve_seq_sink<'a, S: EvalSemantics>(
     register: Option<&'a OwnedValue>,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
+    // The root branch inherits this call's own trackability: seeding it
+    // `true` regardless is what made `catch (getpath(["other"]) | .qqq)`
+    // and `catch (select(true) | .y)` stop raising, since every later
+    // branch derives its flag from this one.
+    // The seed also inherits this call's own ambient `snapshot` (#1591), for
+    // the identical reason it inherits `trackable`: it is `value` itself,
+    // unchanged, before the first stage below ever runs.
+    //
+    // `register` (#2046) is attached the same way `PathBranch::with_register`
+    // always requires: only while `!trackable`, since a trackable seed's
+    // register is its own value at its own path and needs no second copy —
+    // `with_register` would otherwise `debug_assert!`. This is the one spot
+    // an externally-supplied register (from `FoldRegister::resolve`) enters
+    // the stage-to-stage carrying mechanism below; every subsequent stage
+    // reads it as `carried_register`, exactly as it already would for a
+    // register `resolve_leaf` established from inside this same call.
+    let seed = PathBranch::passthrough(
+        PathPrefix::root(),
+        Cow::Borrowed(value),
+        trackable,
+        snapshot.clone(),
+    )
+    .with_register(if trackable {
+        None
+    } else {
+        register.map(Cow::Borrowed)
+    });
+    resolve_seq_from_seed::<S>(exprs, seed, frame, keep, sink)
+}
+
+/// [`resolve_seq_sink`] from an explicit seed branch (#2649) — the whole of
+/// that function except the construction of its root seed.
+///
+/// The seed's contract is exactly the one [`resolve_seq_stage`] already
+/// threads from stage to stage, lifted to the entry of the pipe:
+///
+/// - `path` is where the path register sits *relative to this pipe*. It is
+///   `PathPrefix::root()` for every pre-#2649 caller (the pipe starts where
+///   its enclosing path does), and every path this function produces is
+///   placed onto it — both the static fast path below and
+///   [`resolve_seq_stage`]'s own `PathPrefix::extend_many(&prefix, ...)`
+///   sites.
+/// - `value` is the pipe's *input*, which need not be the value at `path`:
+///   when the input has stepped off the register, `trackable` is `false` and
+///   `register` carries the register's own value, which is precisely the
+///   shape a mid-pipe branch already has after an untracked stage (#1573).
+/// - `snapshot`/`register` seed the mechanisms described on
+///   [`resolve_seq_sink`]; nothing here reads them beyond handing them to the
+///   first stage.
+///
+/// The first non-root user is #2649's `Expr::AsPattern` arm: a destructuring
+/// `SRC as PATTERN | BODY` whose pattern moved jq's register to some position
+/// `P` inside the input, while `BODY` still runs against the *ambient* input.
+/// That is a seed with `path = P`, `value = <ambient>`, `trackable = false`
+/// and `register = Some(<value at P>)` — a combination the root seed above
+/// can never produce, which is why the split exists.
+fn resolve_seq_from_seed<'a, S: EvalSemantics>(
+    exprs: &[Expr],
+    seed: PathBranch<'a>,
+    frame: &Frame,
+    keep: Keep,
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
     let mut flat = Vec::new();
     for e in exprs {
         push_path_components(&mut flat, e);
@@ -32803,7 +32897,13 @@ fn resolve_seq_sink<'a, S: EvalSemantics>(
     // bespoke message for it — still a hard error either way, never the
     // silent wrong-success #843 is about.
     let Some(last_dynamic) = flat.iter().rposition(needs_fanout_pass) else {
-        let end = match resolve_static_tail::<S>(&flat, value, trackable) {
+        // The seed's own value and trackability, not the enclosing node's:
+        // for the root seed those are the same thing, and for a non-root one
+        // (#2649) the untracked-seed refusals below are exactly the ones jq
+        // raises for a body that navigates off the register — `.a` on an
+        // ambient input that is no longer the register gives "near attempt
+        // to access element", an empty `flat` gives `#530`'s "with result".
+        let end = match resolve_static_tail::<S>(&flat, &seed.value, seed.trackable) {
             Ok(Some(end)) => end,
             // A `?`-suppressed step somewhere in this purely-static pipe
             // prunes the whole branch (#2124) — zero output, not a
@@ -32814,23 +32914,32 @@ fn resolve_seq_sink<'a, S: EvalSemantics>(
         };
         // `resolve_static_tail` above already raised for an untracked
         // value, so this is `true` in practice — carried rather than
-        // asserted so the two can't drift.
+        // asserted so the two can't drift. It is also why the branch below
+        // needs no `with_register`: a register only ever rides an untracked
+        // branch (`with_register`'s own `debug_assert!`), and an untracked
+        // seed cannot reach this point at all.
         //
         // Snapshot survives only when `flat` is empty (#1591), the same
         // rule `apply_static_tail_one` already applies for its own tail: an
         // empty `flat` means the whole pipe was a no-op (`.`, `.?`, ...),
-        // so `end` is `value` handed straight back, still whatever ambient
-        // snapshot it already was. A non-empty `flat` genuinely navigated,
-        // which breaks the frozen-pointer identity regardless of ambient.
+        // so `end` is the seed's value handed straight back, still whatever
+        // ambient snapshot it already was. A non-empty `flat` genuinely
+        // navigated, which breaks the frozen-pointer identity regardless of
+        // ambient.
         let branch_snapshot = if flat.is_empty() {
-            snapshot.clone()
+            seed.snapshot.clone()
         } else {
             Snapshot::No
         };
+        // Placed *onto the seed's path*, not from the root: identical for a
+        // root seed (`from_components` is `extend_many` off a fresh root),
+        // and for a non-root one it is the same relative placement
+        // `resolve_seq_stage` performs at its own `extend_many(&prefix, ..)`
+        // sites.
         let branch = PathBranch::passthrough(
-            PathPrefix::from_components(flat),
+            PathPrefix::extend_many(&seed.path, flat),
             Cow::Owned(end),
-            trackable,
+            seed.trackable,
             branch_snapshot,
         );
         return match sink(branch) {
@@ -32839,33 +32948,6 @@ fn resolve_seq_sink<'a, S: EvalSemantics>(
         };
     };
 
-    // The root branch inherits this call's own trackability: seeding it
-    // `true` regardless is what made `catch (getpath(["other"]) | .qqq)`
-    // and `catch (select(true) | .y)` stop raising, since every later
-    // branch derives its flag from this one.
-    // The seed also inherits this call's own ambient `snapshot` (#1591), for
-    // the identical reason it inherits `trackable`: it is `value` itself,
-    // unchanged, before the first stage below ever runs.
-    //
-    // `register` (#2046) is attached the same way `PathBranch::with_register`
-    // always requires: only while `!trackable`, since a trackable seed's
-    // register is its own value at its own path and needs no second copy —
-    // `with_register` would otherwise `debug_assert!`. This is the one spot
-    // an externally-supplied register (from `FoldRegister::resolve`) enters
-    // the stage-to-stage carrying mechanism below; every subsequent stage
-    // reads it as `carried_register`, exactly as it already would for a
-    // register `resolve_leaf` established from inside this same call.
-    let seed = PathBranch::passthrough(
-        PathPrefix::root(),
-        Cow::Borrowed(value),
-        trackable,
-        snapshot.clone(),
-    )
-    .with_register(if trackable {
-        None
-    } else {
-        register.map(Cow::Borrowed)
-    });
     resolve_seq_stage::<S>(&flat, last_dynamic, 0, seed, frame, keep, sink)
 }
 
@@ -33987,9 +34069,9 @@ fn substitute_var_impl(
 fn pattern_binds_var(pattern: &Pattern, var_name: &str) -> bool {
     match pattern {
         Pattern::Var(name) => name == var_name,
-        Pattern::Object(entries) => entries
-            .iter()
-            .any(|e| pattern_binds_var(&e.pattern, var_name)),
+        Pattern::Object(entries) => entries.iter().any(|e| {
+            e.bind.as_deref() == Some(var_name) || pattern_binds_var(&e.pattern, var_name)
+        }),
         Pattern::Array(patterns) => patterns.iter().any(|p| pattern_binds_var(p, var_name)),
     }
 }
@@ -47568,6 +47650,13 @@ pub(crate) fn collect_pattern_var_names(pattern: &Pattern, names: &mut Vec<Strin
         Pattern::Var(name) => names.push(name.clone()),
         Pattern::Object(entries) => {
             for entry in entries {
+                // `{$b: P}` is one `PatternEntry` carrying both the `$b`
+                // bind and the sub-pattern `P` (#2649) -- both names must be
+                // visible here so the null short-circuit below and
+                // `pattern_alternatives_var_names` still see `$b`.
+                if let Some(bind) = &entry.bind {
+                    names.push(bind.clone());
+                }
                 collect_pattern_var_names(&entry.pattern, names);
             }
         }
@@ -47642,6 +47731,15 @@ pub(crate) fn extract_pattern_bindings(
                     }
                 };
                 let field_value = obj.get(&entry.key).cloned().unwrap_or(OwnedValue::Null);
+                // `{$b: P}` binds `$b` to the matched value *before* running
+                // `P` against that same value (one `INDEX` step in jq's own
+                // compilation, #2649) -- pushed ahead of the sub-pattern's
+                // own bindings so this preserves today's order (and hence
+                // `dedup_object_bindings`'s first/last-wins result) exactly
+                // as when this was desugared into two separate entries.
+                if let Some(bind) = &entry.bind {
+                    bindings.push((bind.clone(), field_value.clone()));
+                }
                 let sub_bindings = extract_pattern_bindings(&entry.pattern, &field_value, invert)?;
                 bindings.extend(sub_bindings);
             }
