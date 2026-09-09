@@ -29553,6 +29553,31 @@ mod tests {
         assert!(result.is_error(), "{result:?}");
     }
 
+    /// #2103 review (coverage-diff bot, PR #2652): `fold_pipe_stages`'s
+    /// `GenericResult::Halt(code)` arm lost its only test-suite path once
+    /// the `keys_unsorted[]` cursor-preservation fix shifted which shape the
+    /// suite's existing `halt`-through-a-pipe regression tests happened to
+    /// route through -- `Break` (the arm right above `Halt`) kept its
+    /// coverage, `Halt` alone did not. `eval()`'s top-level `Expr::Pipe`
+    /// dispatch (unlike the CLI's demand-driven streaming route) always
+    /// resolves its first stage eagerly through `eval_single` and folds the
+    /// rest through this exact function, no nested forcing context needed:
+    /// `halt` alone (no pending outputs) collapses straight to
+    /// `GenericResult::Halt(0)` via `partial_generic`'s empty-prefix
+    /// shortcut, and folding that through the remaining `.` stage re-enters
+    /// the loop with `current` already `Halt` -- the arm under test.
+    /// Confirmed against `cargo llvm-cov`'s per-line hit data, not static
+    /// reading alone.
+    #[test]
+    fn test_fold_pipe_stages_halt_arm_2103() {
+        let json: &[u8] = b"1";
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let result = eval(&crate::jq::parse("halt | .").unwrap(), value);
+        assert!(matches!(result, GenericResult::Halt(0)), "{result:?}");
+    }
+
     /// `fold_lazy_keys_stage`'s catch-all `_` arm (#1565) materializes every
     /// key via `materialize_lazy_keys` for any following stage that isn't
     /// one of the dedicated fast-path arms (`first`/`last`/`.[n]`/a leading
