@@ -3119,7 +3119,8 @@ Step 2 of ADR-0018's decision order therefore separates the two options and favo
 behaviour being given up. No rule-4 condition applies — the output is readable, nothing is
 corrupted or discarded, and neither choice takes the process down. **This is a deliberate
 divergence taken against the order's own answer**, on the same footing as the
-`path`/`getpath` entry below (#2168), and for the same three reasons:
+`path`/`getpath` entry below (#2168) and sanctioned with it by ADR-0018's #2103 amendment,
+and for the same three reasons:
 
 1. *The agreement being given up was an accident.* `to_owned_with_cursor` validated because
    it needed a value to bridge with, not because anyone decided `1+1` should validate its
@@ -4482,7 +4483,10 @@ and dropping it does not. The performance step is never reached. No rule-4 condi
 either — the output is readable, nothing is corrupted or discarded, and neither choice takes
 the process down. **This is a deliberate divergence taken against the order's own answer**,
 on the same footing as this section's other two entries recorded on their merits rather than
-under a carve-out.
+under a carve-out. This class of divergence, and #2103's, are now sanctioned by
+[ADR-0018](../../adrs/adr-0018.md)'s #2103 amendment — the reference rejects the whole
+document at parse time, and a semi-index that deliberately does not validate up front takes
+the uniform divergence over a per-spelling one — rather than resting on prose precedent alone.
 
 `key` and `parent` are the exception within the exception: neither is a jq builtin at all
 (`jq: error: key/0 is not defined`, exit 3), so for those two there is no jq oracle and no
