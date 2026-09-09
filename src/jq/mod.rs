@@ -110,9 +110,9 @@ pub use expr::{
 };
 pub use lazy::JqValue;
 pub use parser::{
-    collect_call_sites, parse, parse_program, parse_program_with_mode,
-    parse_program_with_mode_and_extensions, parse_with_mode, parse_with_mode_and_extensions,
-    CallSite, ParseError, ParserMode,
+    collect_call_sites, parse, parse_program, parse_program_with_extra_shadowable_defs,
+    parse_program_with_mode, parse_program_with_mode_and_extensions, parse_with_mode,
+    parse_with_mode_and_extensions, CallSite, ParseError, ParserMode,
 };
 pub use resolve::{resolve_func_calls, resolve_func_calls_all, UnresolvedCall};
 pub use stream::{StreamError, StreamStats, StreamableValue};
