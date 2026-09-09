@@ -84553,6 +84553,15 @@ mod tests {
     fn test_path_bind_origin_matrix_accepts_2042() {
         // (input, filter, jq 1.7.1's `-c '[FILTER]'`)
         let rows: &[(&[u8], &str, &str)] = &[
+            // destructure-stage (#2649): `[$q]` on an object is jq's own
+            // "Cannot index object with number", the `?// $q` alternative
+            // performs no step and restores the register, so `$y` is still
+            // at `.a` -- refuse-only before #2649 gave `AsPattern` an arm
+            (
+                br#"{"a":{"b":1},"c":{"b":1}}"#,
+                "path(.a as $y | .a | . as [$q] ?// $q | $y)",
+                r#"[["a"]]"#,
+            ),
             // same-node-sibling-pipe
             (
                 br#"{"a":{"b":1},"c":{"b":1}}"#,
@@ -85057,13 +85066,6 @@ mod tests {
             (
                 br#"{"a":{"b":1}}"#,
                 r#"path(.a as $y | .a | try error("x") catch $y)"#,
-                r#"[["a"]]"#,
-            ),
-            // destructure-stage: an `?//` destructuring stage resolves as an
-            // opaque leaf and drops the register (pre-existing, as above)
-            (
-                br#"{"a":{"b":1},"c":{"b":1}}"#,
-                "path(.a as $y | .a | . as [$q] ?// $q | $y)",
                 r#"[["a"]]"#,
             ),
             // literal-then-fold-untracked-init: after `5` the register is
