@@ -3830,8 +3830,8 @@ where
         if result.is_escape() {
             if let Some(control) = push_owned_values(result, &mut out) {
                 return stop_with_escape(&mut body_control, control);
-            }
-            return Demand::Stop;
+            } // omni-dev: coverage tolerate-line reason="unreachable: `is_escape()` is exactly `Error|Break|Halt|Partial`, and `push_owned_values` answers `Some(control)` for every one of those four, so the `None` continuation cannot be reached (#2180)"
+            return Demand::Stop; // omni-dev: coverage tolerate-line reason="unreachable: see the `if let` above -- `push_owned_values` never answers `None` for an `is_escape()` result (#2180)"
         }
         if out.is_empty() && pending_first.is_none() {
             pending_first = Some(result);
@@ -6678,7 +6678,7 @@ fn each_object_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                                 // See this function's own doc comment: the
                                 // eager `ObjectEscape::None` rule (discard
                                 // everything) is deliberately not reproduced.
-                                return Demand::Continue;
+                                return Demand::Continue; // omni-dev: coverage tolerate-line reason="unreachable: `optional` is never `true` here. `eval_each` is entered with a forced `true` at exactly one site (`Expr::Optional` over an `IndexExpr`/`SliceExpr`), and both of those evaluate their target (`eval_index_expr`) and their key (`eval_each(key, .., false)`) with a hardcoded `false`, so only the final index/slice step ever sees it -- nothing carries it down to an `Expr::Object` (#2180)"
                             }
                             return stop_with_escape(
                                 &mut escape,
@@ -35004,7 +35004,7 @@ pub(crate) fn stop_with_error(slot: &mut Option<EvalError>, error: EvalError) ->
     let demand = stop_with_escape(&mut control, Control::Error(error));
     match control {
         Some(Control::Error(error)) => *slot = Some(error),
-        _ => unreachable!("stop_with_escape stores exactly the control it was handed"),
+        _ => unreachable!("stop_with_escape stores exactly the control it was handed"), // omni-dev: coverage tolerate-line reason="unreachable: stop_with_escape's only write is `slot.set(Some(control))` with the control it was handed, which is always the `Control::Error` built one line above (#2180)"
     }
     demand
 }
@@ -51336,6 +51336,310 @@ mod tests {
             "{\"k\": .a}",
             QueryResult::Error(e) if e.is_decode_failure() => {}
         );
+    }
+
+    /// #2180: every lazy `each_*` driver this work package gave a
+    /// demand-forwarding arm converts the item it drives with the checked
+    /// `Item::into_owned`/`to_owned`, so an undecodable borrowed value must
+    /// raise `decode_failure` rather than silently becoming `""` -- the
+    /// #1746/#1972/#2022 bug shape, one arm per driver. Each row needs a
+    /// lazy consumer (`first(...)`) in front of it: without one the eager
+    /// sibling runs instead and never reaches these arms at all.
+    ///
+    /// Library-API-only, the same caveat #2022's own tests above record: the
+    /// shipped CLI's JSON reader substitutes U+FFFD before evaluation ever
+    /// sees the bytes, so there is no live-oracle analog to check against.
+    #[test]
+    fn test_lazy_each_drivers_raise_on_item_decode_failure_2180() {
+        const BAD_FIELD: &[u8] = b"{\"a\": \"\xff\xfe\"}";
+        const BAD_ROOT: &[u8] = b"\"\xff\xfe\"";
+        const BAD_ELEMENT: &[u8] = b"[\"\xff\xfe\"]";
+        for (json_bytes, filter) in [
+            // `each_negate`
+            (BAD_FIELD, "first(-(.a))"),
+            // `each_string_parts`
+            (BAD_FIELD, r#"first("x\(.a)")"#),
+            // `each_object_entries`' computed-key slot
+            (BAD_FIELD, "first({(.a): 1})"),
+            // `each_object_value`
+            (BAD_FIELD, "first({k: .a})"),
+            // `each_index_expr`'s computed-key slot (its `Item::Borrowed`
+            // arm, which `to_owned_key_shape` has to check itself)
+            (BAD_FIELD, "first(.[(.a)])"),
+            // `each_any_all_gen_cond`'s own input materialization
+            (BAD_ROOT, "first(any(.[]; .))"),
+            // `each_upper_in`'s own input materialization
+            (BAD_ROOT, "first(IN(1))"),
+            // `each_foreach`'s source drive
+            (BAD_ELEMENT, "first(foreach .[] as $x (0; . + 1; .))"),
+            // `fanout_arg`'s lazy sink, flushing a *buffered* first body
+            // result when the next argument value arrives...
+            (b"[\"\xff\xfe\", 2]", "nth((0, 1))"),
+            // ...and the same flush on the way out of an undecodable
+            // argument value of its own.
+            (BAD_ELEMENT, "first(nth((0, .[0])))"),
+        ] {
+            let index = JsonIndex::build(json_bytes);
+            let cursor = index.root(json_bytes);
+            let expr = parse(filter).unwrap();
+            match eval::<Vec<u64>, JqSemantics>(&expr, cursor) {
+                QueryResult::Error(e) if e.is_decode_failure() => {
+                    assert!(
+                        e.message.contains("invalid UTF-8"),
+                        "{filter}: unexpected message {}",
+                        e.message
+                    );
+                }
+                other => panic!("{filter}: expected a decode failure, got {other:?}"),
+            }
+        }
+        // Positive control for `each_index_expr`'s borrowed-key arm: a
+        // *decodable* document string used as the computed key still
+        // indexes, so the row above is the conversion failing, not the arm
+        // never producing a key at all. jq 1.7.1 answers `7`.
+        query!(
+            br#"{"a":"k","k":7}"#,
+            "first(.[(.a)])",
+            QueryResult::One(v) => assert_eq!(to_owned(&v).unwrap(), OwnedValue::Int(7))
+        );
+    }
+
+    /// #2180: the lazy object-construction driver's own flow forwarding --
+    /// `each_object_entries`/`each_object_value` must pass a nested
+    /// construct's `Stopped` and `Escaped` back out rather than treating
+    /// either as "this combination is done, carry on". Only reachable with a
+    /// consumer that stops (`first`) or an entry that escapes.
+    #[test]
+    fn test_lazy_object_construction_forwards_stop_and_escape_2180() {
+        // A stop delivered while the *value* generator of a computed-key
+        // entry still has outputs left: `each_object_value` answers
+        // `Stopped`, and the key loop has to end rather than ask the key
+        // generator for more.
+        query!(
+            br#"{"a":"k"}"#,
+            "first({(.a): (1, 2)})",
+            QueryResult::Owned(OwnedValue::Object(map)) => {
+                assert_eq!(map.get("k"), Some(&OwnedValue::Int(1)));
+            }
+        );
+        // An escape raised inside a computed-key entry's value.
+        query!(
+            br#"{"a":"k"}"#,
+            r#"first({(.a): error("x")})"#,
+            QueryResult::Error(e) => assert_eq!(e.message, "x")
+        );
+        // An escape raised by a *later* entry, which reaches
+        // `each_object_value` as its recursive `each_object_entries` call's
+        // verdict rather than as its own generator's.
+        query!(
+            br#"{"a":1}"#,
+            r#"first({x: 1, y: error("boom")})"#,
+            QueryResult::Error(e) => assert_eq!(e.message, "boom")
+        );
+    }
+
+    /// #2180: `each_object_entries`' non-string computed key. jq raises
+    /// `Cannot use <type> as object key`; yq stringifies it instead
+    /// (#2508's rule, which the lazy driver has to apply too). Both arms are
+    /// reachable only through a lazy consumer -- `{(1): 2}` on its own runs
+    /// `build_object_entries` eagerly.
+    #[test]
+    fn test_lazy_object_construction_non_string_key_2180() {
+        query!(
+            br#"{"a":1}"#,
+            "first({(1): 2})",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot use number (1) as object key");
+            }
+        );
+        yq_query!(
+            br#"{"a":1}"#,
+            "first({(1): 2})",
+            QueryResult::Owned(OwnedValue::Object(map)) => {
+                assert_eq!(map.get("1"), Some(&OwnedValue::Int(2)));
+            }
+        );
+    }
+
+    /// #2180: `halt` escaping out of object construction. The
+    /// `Control::Halt` -> `ObjectEscape::Halt` conversion and
+    /// `eval_object_construction_with`'s own `Halt` arm are the only route
+    /// by which a halt raised inside a key or value slot reaches the
+    /// caller; both were covered before this PR rewired the slot evaluators
+    /// and have to stay covered after it.
+    #[test]
+    fn test_object_construction_forwards_halt_2180() {
+        // Nothing assembled yet: a bare `Halt`.
+        query!(br#"{"a":1}"#, r#"{("k"): halt}"#, QueryResult::Halt(0) => {});
+        // One object already assembled: a `Partial` carrying it.
+        query!(
+            br#"{"a":1}"#,
+            "{k: (1, halt)}",
+            QueryResult::Partial(vs, Control::Halt(0)) => {
+                assert_eq!(vs.len(), 1);
+            }
+        );
+    }
+
+    /// #2180: `push_truthiness`' borrowed-`Many` arm. `and`/`or` collect
+    /// their operands' truthiness through it, and a document iteration
+    /// (`.[]`) is the shape that hands it borrowed values rather than owned
+    /// ones -- the arm this PR's rewiring of the boolean operators left
+    /// without a caller among the existing tests.
+    #[test]
+    fn test_boolean_operand_borrowed_many_truthiness_2180() {
+        query!(
+            br#"[1,2]"#,
+            ".[] and true",
+            QueryResult::ManyOwned(vs) => {
+                assert_eq!(vs, vec![OwnedValue::Bool(true), OwnedValue::Bool(true)]);
+            }
+        );
+    }
+
+    /// #2460/#2540 under a lazy consumer (#2180): yq's empty-operand tables
+    /// answer a pairing whose operand produced nothing, and the answer is
+    /// pushed straight to the sink -- so the sink can stop *on that answer*,
+    /// which every one of these three sites (the comparison fan-out's inner
+    /// loop, and the boolean pair's left and right halves) has to forward
+    /// rather than swallow. Reachable only in yq mode: jq mode has no
+    /// empty-operand table at all.
+    #[test]
+    fn test_yq_empty_operand_answer_forwards_a_stop_2180() {
+        // The comparison fan-out's inner loop.
+        yq_query!(
+            br#"[1,2]"#,
+            "first(1 == empty)",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+        yq_query!(
+            br#"[1,2]"#,
+            "first((1, 2) == empty)",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+        // The boolean pair's left half (`empty and ...`)...
+        yq_query!(
+            br#"[1,2]"#,
+            "first(empty and true)",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+        yq_query!(
+            br#"[1,2]"#,
+            "first(empty or (true, false))",
+            QueryResult::Owned(OwnedValue::Bool(true)) => {}
+        );
+        // ...and its right half (`... and empty`).
+        yq_query!(
+            br#"[1,2]"#,
+            "first((true, false) and empty)",
+            QueryResult::Owned(OwnedValue::Bool(false)) => {}
+        );
+    }
+
+    /// #2180 WP3: `each_foreach`'s bounded eager fallback, taken for a
+    /// source that streams without bound (`repeat`) and so cannot be driven
+    /// element-at-a-time. Both of its terminators matter: a consumer that
+    /// stops mid-prefix (`first`), and a source that runs out on its own
+    /// with no escape to report (`limit` capping the `repeat`).
+    #[test]
+    fn test_foreach_eager_source_fallback_terminators_2180() {
+        query!(
+            br#"[1,2]"#,
+            "first(foreach repeat(.) as $x (0; . + 1; .))",
+            QueryResult::Owned(OwnedValue::Int(1)) => {}
+        );
+        query!(
+            br#"[1,2]"#,
+            "[foreach limit(3; repeat(.)) as $x (0; . + 1; .)]",
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert_eq!(
+                    vs,
+                    vec![OwnedValue::Int(1), OwnedValue::Int(2), OwnedValue::Int(3)]
+                );
+            }
+        );
+        // A step that ends the fold part-way through the already-collected
+        // source prefix -- the drive has to stop pushing elements at it and
+        // leave the reason to `foreach_forks`, which already holds it.
+        query!(
+            br#"[1,2]"#,
+            r#"[foreach limit(3; repeat(.)) as $x (0; . + 1; if . > 1 then error("stop") else . end)]"#,
+            QueryResult::Error(e) => assert_eq!(e.message, "stop")
+        );
+        query!(
+            br#"[1,2]"#,
+            "label $out | [foreach limit(3; repeat(.)) as $x (0; . + 1; if . == 2 then break $out else . end)]",
+            QueryResult::None => {}
+        );
+        query!(
+            br#"[1,2]"#,
+            "[limit(1; foreach limit(3; repeat(.)) as $x (0; . + 1; .))]",
+            QueryResult::Owned(OwnedValue::Array(vs)) => {
+                assert_eq!(vs, vec![OwnedValue::Int(1)]);
+            }
+        );
+    }
+
+    /// #2180: `is_pure_navigation`'s marker-headed call site
+    /// (`resolve_bind_source`), which decides whether `($y | rest) as $w`
+    /// may bind the *node* `rest` reaches or has to fall back to binding by
+    /// value. Both verdicts matter: `.b` is on the closed navigation
+    /// grammar, `.b | length` is not. Outputs captured live from jq 1.7.1.
+    #[test]
+    fn test_marker_headed_bind_source_navigation_verdicts_2180() {
+        // Accepted: every node of `rest` is on the grammar.
+        query!(
+            br#"{"a":{"b":1}}"#,
+            "path(.a as $y | ($y | .b) as $w | $w)",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Invalid path expression with result 1");
+            }
+        );
+        // Refused: `length` is not, so the bind falls back to by-value with
+        // no origin -- which jq answers identically, the point being that
+        // the refusal must not fabricate one.
+        query!(
+            br#"{"a":{"b":1}}"#,
+            "path(.a as $y | ($y | .b | length) as $w | $w)",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Invalid path expression with result 1");
+            }
+        );
+        // Same refusal outside a path context still answers by value.
+        query!(
+            br#"{"a":{"b":1}}"#,
+            ".a as $y | ($y | .b | length) as $w | $w",
+            QueryResult::Owned(OwnedValue::Int(1)) => {}
+        );
+    }
+
+    /// #2180: [`stop_with_error`], the [`stop_with_escape`] wrapper for the
+    /// one driver whose out-of-band slot holds a bare `EvalError`. Its only
+    /// caller is `eval_generic`'s path-context array walk, so it is driven
+    /// here through that evaluator's own public entry point rather than
+    /// through `eval`.
+    ///
+    /// Library-API-only for the same reason as the decode-failure tests
+    /// above, and one more: the shipped CLI's JSON reader substitutes U+FFFD
+    /// for invalid UTF-8 before evaluation ever runs, so no CLI invocation
+    /// can present this driver with an item it cannot materialize.
+    #[test]
+    fn test_path_context_array_walk_raises_on_item_decode_failure_2180() {
+        let json_bytes: &[u8] = b"{\"a\": \"\xff\xfe\"}";
+        let index = JsonIndex::build(json_bytes);
+        for filter in [".a | [., key]", ".a | [key, .]"] {
+            let expr = parse(filter).unwrap();
+            let cursor = index.root(json_bytes);
+            match crate::jq::eval_generic::eval_with_cursor(&expr, cursor) {
+                crate::jq::eval_generic::GenericResult::Error(e) => {
+                    assert!(
+                        e.is_decode_failure() && e.message.contains("invalid UTF-8"),
+                        "{filter}: unexpected error {e:?}"
+                    );
+                }
+                other => panic!("{filter}: expected a decode failure, got {other:?}"),
+            }
+        }
     }
 
     /// #2022 sibling: jq-mode string interpolation (`string_part_outputs`,
