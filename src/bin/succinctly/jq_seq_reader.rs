@@ -40,10 +40,10 @@
 //! case-by-case against the pinned `/usr/bin/jq`. The source enumerates
 //! the categories; the binary decides what is actually emitted.
 //!
-//! This module classifies *failures only*. It builds no values and is not
-//! wired to what `--seq` emits on stdout -- that stays with
-//! [`super::jq_runner::seq_record_scan`], whose deliberate conservatism is
-//! documented there and in `docs/compliance/jq/limitations.md`.
+//! Besides diagnostics, the same state machine reports the byte ranges of
+//! values jq hands to its caller.  Keeping those two paths together matters:
+//! a value which looks complete to a token scanner can still be discarded by
+//! the scan call that discovers a malformed suffix (notably `1,2`).
 
 use crate::front_matter::UTF8_BOM;
 
@@ -130,7 +130,19 @@ pub(crate) fn for_each_warning(raw_bytes: &[(Option<usize>, Vec<u8>)], emit: &mu
         == Some(b'\n');
     let mut reader = Reader::new(bom, emit);
     reader.suppress_eof_warning = bom.malformed && ends_with_newline;
-    reader.run(stream_bytes(raw_bytes));
+    reader.run(stream_bytes(raw_bytes).enumerate());
+}
+
+/// Byte ranges of the values jq yields from one complete `--seq` stream.
+/// Ranges are into `bytes`, which must be the same UTF-8-normalized stream
+/// later handed to the materializer.  Diagnostics use the original bytes at
+/// their separate call site, so invalid UTF-8 retains jq's raw-byte columns.
+pub(crate) fn value_ranges(bytes: &[u8]) -> Vec<(usize, usize)> {
+    let bom = bom_prefix(&[(None, bytes.to_vec())]);
+    let mut ignore = |_: &str| {};
+    let mut reader = Reader::new(bom, &mut ignore);
+    reader.run(bytes.iter().copied().enumerate().skip(bom.consumed));
+    reader.values
 }
 
 /// The kinds jq's parser distinguishes while classifying a failure. It
@@ -211,6 +223,17 @@ struct Reader<'a> {
     /// Set by [`Reader::check_done`] when a value was handed off, which is
     /// one of the points jq's reader returns at.
     produced_value: bool,
+    /// The byte offset currently being scanned. `check_literal` finishes
+    /// before its delimiter, while strings and containers finish on the
+    /// current byte, so the completion site records the precise end here.
+    offset: usize,
+    value_start: Option<usize>,
+    value_end: usize,
+    /// A value is only committed after its entire `scan()` call succeeds.
+    /// jq therefore drops the tentative `1` in `1,2`, but has already handed
+    /// off the `1` in `1 {invalid}` when the space scan completed.
+    completed: Option<(usize, usize)>,
+    values: Vec<(usize, usize)>,
     /// See [`for_each_warning`]: a malformed BOM plus a newline-terminated
     /// stream means jq's own EOF report is wiped before it is written.
     suppress_eof_warning: bool,
@@ -236,6 +259,11 @@ impl<'a> Reader<'a> {
             last_ch_was_ws: false,
             resets_per_call: bom.malformed,
             produced_value: false,
+            offset: 0,
+            value_start: None,
+            value_end: 0,
+            completed: None,
+            values: Vec::new(),
             suppress_eof_warning: false,
             emit,
         }
@@ -253,10 +281,15 @@ impl<'a> Reader<'a> {
         self.token_len = 0;
         self.next = None;
         self.st = St::Normal;
+        self.value_start = None;
+        self.completed = None;
     }
 
-    fn run(&mut self, bytes: impl Iterator<Item = u8>) {
-        for ch in bytes {
+    fn run(&mut self, bytes: impl Iterator<Item = (usize, u8)>) {
+        let mut eof_offset = 0;
+        for (offset, ch) in bytes {
+            self.offset = offset;
+            eof_offset = offset + 1;
             if self.st == St::WaitingForRs {
                 if ch == b'\n' {
                     self.line += 1;
@@ -269,6 +302,15 @@ impl<'a> Reader<'a> {
                 }
                 continue;
             }
+            if self.st == St::Normal
+                && self.stack.is_empty()
+                && self.next.is_none()
+                && self.token_len == 0
+                && !ch.is_ascii_whitespace()
+                && ch != ASCII_RS
+            {
+                self.value_start = Some(offset);
+            }
             if let Err(category) = self.scan(ch) {
                 let (line, column) = (self.line, self.column);
                 if ch == ASCII_RS {
@@ -279,12 +321,23 @@ impl<'a> Reader<'a> {
                     ));
                 }
                 self.reset();
-            } else if self.resets_per_call && (self.produced_value || ch == b'\n') {
-                self.reset();
+            } else {
+                self.flush_completed();
+                if self.resets_per_call && (self.produced_value || ch == b'\n') {
+                    self.reset();
+                }
             }
             self.produced_value = false;
         }
+        self.offset = eof_offset;
         self.finish();
+    }
+
+    fn flush_completed(&mut self) {
+        if let Some(range) = self.completed.take() {
+            self.values.push(range);
+            self.produced_value = true;
+        }
     }
 
     /// jq's `scan`.
@@ -331,7 +384,14 @@ impl<'a> Reader<'a> {
             match cls {
                 Cls::Literal => self.token_add(ch),
                 Cls::Whitespace => {}
-                Cls::Quote => self.st = St::Str,
+                Cls::Quote => {
+                    // As with `1[1]`, a pending scalar can be followed by
+                    // an adjacent self-delimiting root string.
+                    if self.stack.is_empty() && self.next.is_none() {
+                        self.value_start = Some(self.offset);
+                    }
+                    self.st = St::Str;
+                }
                 Cls::Structure => self.token_structure(ch)?,
             }
             self.check_done();
@@ -379,7 +439,9 @@ impl<'a> Reader<'a> {
     fn check_done(&mut self) -> bool {
         if self.stack.is_empty() && self.next.is_some() {
             self.next = None;
-            self.produced_value = true;
+            if let Some(start) = self.value_start.take() {
+                self.completed = Some((start, self.value_end));
+            }
             true
         } else {
             false
@@ -404,6 +466,13 @@ impl<'a> Reader<'a> {
                 }
                 if self.next.is_some() {
                     return Err("Expected separator between values");
+                }
+                // A pending scalar can be followed immediately by a
+                // self-delimiting root value (`1[1]`). Its completion was
+                // queued earlier in this scan call; this delimiter begins
+                // the next root value.
+                if self.stack.is_empty() {
+                    self.value_start = Some(self.offset);
                 }
                 self.stack.push(if ch == b'[' {
                     Frame::Array { nonempty: false }
@@ -463,6 +532,7 @@ impl<'a> Reader<'a> {
                 }
                 self.stack.pop();
                 self.next = Some(Kind::Array);
+                self.value_end = self.offset + 1;
             }
             b'}' => {
                 if self.stack.is_empty() {
@@ -489,6 +559,7 @@ impl<'a> Reader<'a> {
                 }
                 self.stack.pop();
                 self.next = Some(Kind::Object);
+                self.value_end = self.offset + 1;
             }
             // Only `classify`'s `Structure` bytes reach this function.
             _ => {}
@@ -537,6 +608,7 @@ impl<'a> Reader<'a> {
             }
         };
         self.value(kind)?;
+        self.value_end = self.offset;
         self.token_len = 0;
         Ok(())
     }
@@ -592,6 +664,7 @@ impl<'a> Reader<'a> {
             }
         }
         self.value(Kind::String)?;
+        self.value_end = self.offset + 1;
         self.token_len = 0;
         Ok(())
     }
@@ -632,10 +705,13 @@ impl<'a> Reader<'a> {
             ));
             return;
         }
-        if !self.last_ch_was_ws && self.next.take() == Some(Kind::Number) {
+        if !self.last_ch_was_ws && self.next == Some(Kind::Number) {
             self.warn(&format!(
                 "Potentially truncated top-level numeric value at EOF at line {line}, column {column}"
             ));
+        } else {
+            self.check_done();
+            self.flush_completed();
         }
     }
 }
@@ -739,6 +815,17 @@ mod tests {
 
     fn assert_warnings(input: &[u8], expected: &[&str]) {
         assert_eq!(warnings(&[input]), expected, "input: {input:?}");
+    }
+
+    /// #2653: values are committed only after the scan call which completed
+    /// them has succeeded. Whitespace commits `1` before a malformed object;
+    /// a comma instead causes the same scan call to fail, so it is discarded.
+    #[test]
+    fn value_ranges_follow_jq_recovery_2653() {
+        assert_eq!(value_ranges(b"\x1e1 {invalid\n"), vec![(1, 2)]);
+        assert_eq!(value_ranges(b"\x1e1,2\n"), vec![(3, 4)]);
+        assert_eq!(value_ranges(b"\x1e1-2\n"), Vec::<(usize, usize)>::new());
+        assert_eq!(value_ranges(b"\x1e5-3 7\n"), vec![(5, 6)]);
     }
 
     /// Every message template, captured from `/usr/bin/jq` 1.7.1. The
