@@ -14442,6 +14442,129 @@ fn test_defer_line_comment_does_not_overwrite_already_pending_784() -> Result<()
 }
 
 // ============================================================================
+// Bare (no-anchor) sequence item's own trailing comment (#1079)
+// ============================================================================
+//
+// #784 (above) fixed this shape for a *property-prefixed* item (`- &x # c`);
+// this is the sibling gap for a *bare* item (`- # c`), same as #765 fixed
+// the mapping-key equivalent. Scoped to the three shapes where the deferred
+// value materializes into a real node - a mapping, a nested sequence, or a
+// scalar - since the comment is a `head_comment` on whichever node the
+// value contributes, per the issue's own oracle triage. An *absent* (null)
+// deferred value has no node to attach to; real yq instead floats the
+// comment forward onto the next sibling item that does exist, which needs a
+// multi-valued head/line/foot comment slot this codebase doesn't have yet
+// (#798 PR2) - that family stays exactly as it was (comment dropped), not a
+// regression, just not fixed here. Every expected string below was verified
+// byte-for-byte against the pinned real `yq` binary before being pinned.
+
+/// The issue's own repro: a bare item's trailing comment, value deferred to
+/// a nested mapping.
+#[test]
+fn test_bare_item_comment_preserved_with_nested_mapping_value_1079() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "- # comment\n  b: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "- # comment\n  b: 1\n");
+    Ok(())
+}
+
+/// Same shape, but the mapping has more than one field - the comment stays
+/// on the dash's own line regardless of how many fields follow.
+#[test]
+fn test_bare_item_comment_preserved_with_multi_field_mapping_value_1079() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "- # comment\n  b: 1\n  d: 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "- # comment\n  b: 1\n  d: 2\n");
+    Ok(())
+}
+
+/// Same shape, but the deferred value is a nested sequence rather than a
+/// nested mapping.
+#[test]
+fn test_bare_item_comment_preserved_with_nested_sequence_value_1079() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "- # comment\n  - 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "- # comment\n  - 1\n");
+    Ok(())
+}
+
+/// A bare item nested inside a mapping field - the comment stays on the
+/// dash's own line at the item's own indent, not the outer key's.
+#[test]
+fn test_bare_item_comment_preserved_with_nested_container_value_1079() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a:\n  - # comment\n    b: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a:\n  - # comment\n    b: 1\n");
+    Ok(())
+}
+
+/// The deferred value is a plain scalar rather than a container - real yq
+/// relocates the comment to its own standalone line at the item's own
+/// indent (column 0 at the top level), *above* the dash, rather than
+/// keeping it inline after `-`.
+#[test]
+fn test_bare_item_comment_relocates_above_scalar_value_1079() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "- # comment\n  x\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "# comment\n- x\n");
+    Ok(())
+}
+
+/// Same shape, nested inside a mapping field - the relocated comment lands
+/// at the item's own (nested) indent, not column 0.
+#[test]
+fn test_bare_item_comment_relocates_above_nested_scalar_value_1079() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "a:\n  - # comment\n    x\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "a:\n  # comment\n  - x\n");
+    Ok(())
+}
+
+/// The scalar value has its *own* trailing comment too - both survive,
+/// distinct bp slots (the item wrapper's vs. the scalar's own).
+#[test]
+fn test_bare_item_comment_and_own_scalar_comment_both_survive_1079() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "- # comment\n  x # own\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "# comment\n- x # own\n");
+    Ok(())
+}
+
+/// Real `yq` doesn't expose this comment through any getter, matching
+/// #765's own equivalent pin (`test_key_comment_not_exposed_via_line_comment_getter_765`) -
+/// it only survives via full-tree re-serialization. `line_comment` on the
+/// value (`.[0]`) or a descendant (`.[0].b`) must stay blank.
+#[test]
+fn test_bare_item_comment_not_exposed_via_line_comment_getter_1079() -> Result<()> {
+    let input = "- # comment\n  b: 1\n";
+
+    let (out, code) = run_yq_stdin(".[0] | line_comment", input, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "\n");
+
+    let (out, code) = run_yq_stdin(".[0].b | key | line_comment", input, &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "\n");
+
+    Ok(())
+}
+
+/// Known residual, out of scope for this fix: when the deferred value is
+/// *absent* (null - a sibling item follows at the same or lower indent),
+/// real yq floats the comment forward onto that sibling instead of
+/// attaching it here, which needs #798 PR2's multi-valued comment slot.
+/// Pinned as still-dropped (not the corrupted `- # c` inline rendering an
+/// earlier version of this fix produced) so a future #798 PR2 change has to
+/// deliberately update this test rather than silently drift.
+#[test]
+fn test_bare_item_comment_still_dropped_when_value_absent_1079() -> Result<()> {
+    let (out, code) = run_yq_stdin(".", "- # comment\n- 2\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "-\n- 2\n");
+    Ok(())
+}
+
+// ============================================================================
 // Explicit-key (`? k ... : v`) trailing comment (#795)
 // ============================================================================
 //

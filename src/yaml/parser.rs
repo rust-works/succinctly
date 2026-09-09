@@ -2359,14 +2359,18 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
         // Open the sequence item node
         self.write_bp_open_seq_item();
-        // Deliberately not a `take_pending_head_comment` call site (#784):
-        // this wrapper's own bp is never what the emitter reads for a
-        // trailing comment on this line — a plain-scalar item's line
-        // comment lives on the *scalar's* own bp (see the `take_pending_head_comment`
-        // call after `parse_value` below), and any other continuation
-        // (compact-mapping key, a nested `parse_mapping_entry`/
-        // `parse_sequence_item` reached via a fresh line dispatch) claims it
-        // at its own, already-instrumented key/wrapper-open site instead.
+        // Not a `take_pending_head_comment` call site (#784): a
+        // plain-scalar item's line comment lives on the *scalar's* own bp
+        // (see the `take_pending_head_comment` call after `parse_value`
+        // below), and any other continuation (compact-mapping key, a
+        // nested `parse_mapping_entry`/`parse_sequence_item` reached via a
+        // fresh line dispatch) claims it at its own, already-instrumented
+        // key/wrapper-open site instead. The wrapper's own bp *is* read for
+        // a bare item's (`had_property == false`) trailing comment when its
+        // value is deferred to the next line (#1079, below) — that comment
+        // has no node of its own yet, so the wrapper is the only bp
+        // available to key it against.
+        let wrapper_bp = self.last_open_bp_pos;
 
         // Skip `- `
         self.advance(); // -
@@ -2402,11 +2406,21 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         if self.at_line_end() {
             // A trailing comment here belongs to this item's own deferred
             // value, not to the item's dash line (#784, same shape as
-            // `parse_mapping_entry`'s anchor case) - only when there was a
-            // property to defer it past; a bare `- # comment` has no anchor
-            // to blame the deferral on and is a separate, untouched gap.
+            // `parse_mapping_entry`'s anchor case). A property-prefixed
+            // item defers it past the property (`defer_line_comment`,
+            // #784); a bare item has no property to defer past, so it's
+            // captured against the item wrapper's own bp instead (#1079) —
+            // the emitter only renders it when the deferred value
+            // materializes into a real node (a mapping, nested sequence, or
+            // scalar). An absent (null) value has nothing to attach it to
+            // and the comment is dropped here, matching current behavior —
+            // real yq floats it forward onto the next sibling item instead,
+            // which needs a multi-valued head/line/foot comment slot this
+            // codebase doesn't have yet (#798 PR2).
             if had_property {
                 self.defer_line_comment();
+            } else {
+                self.maybe_capture_line_comment(wrapper_bp);
             }
 
             // An anchor records the *next* BP position as its target, and a
