@@ -13931,6 +13931,179 @@ mod meta_assign_798 {
         Ok(())
     }
 
+    /// `style = "double"`/`"single"` on every non-string scalar kind
+    /// [`plain_scalar_text`] handles, live-verified against pinned yq: a
+    /// `null`, a bare int, a finite float and both non-finite floats all
+    /// stringify to their source spelling, quoted.
+    #[test]
+    fn style_assign_double_on_every_non_string_scalar_kind() -> Result<()> {
+        for (input, expected) in [
+            ("a: null\n", "a: \"null\"\n"),
+            ("a: 5\n", "a: \"5\"\n"),
+            ("a: 1.5\n", "a: \"1.5\"\n"),
+            ("a: .nan\n", "a: \".nan\"\n"),
+            ("a: .inf\n", "a: \".inf\"\n"),
+        ] {
+            let (out, code) = run_yq_stdin(".a style = \"double\"", input, &[])?;
+            assert_eq!(code, 0, "[{input}]");
+            assert_eq!(out, expected, "[{input}]");
+        }
+        Ok(())
+    }
+
+    /// A negative index (`.a[-1]`) resolved against a target that turns out
+    /// not to be a long-enough array -- including not existing at all --
+    /// leaves the metadata write pass with no candidate to resolve
+    /// ([`meta_path_from_value`]'s `None`); the real evaluation's own
+    /// `TARGET |= .` then raises the ordinary out-of-range error for the
+    /// same indexing, so the whole command still exits non-zero, just not
+    /// via the metadata write pass. Pre-existing divergence from real yq's
+    /// wording (`index [-1] out of range, array size is 0`), unrelated to
+    /// #798 -- reproduced by plain `.a[-1] = 5` on the same input.
+    #[test]
+    fn negative_index_target_missing_or_too_short_is_a_runtime_error_not_a_silent_skip() {
+        for input in ["b: 1\n", "a: []\n"] {
+            let (_out, err, code) =
+                run_yq_stdin_with_stderr(".a[-1] line_comment = \"x\"", input, &[]).unwrap();
+            assert_eq!(code, 1, "[{input}] stderr: {err}");
+            assert!(
+                err.contains("Out of bounds negative array index"),
+                "[{input}] stderr: {err}"
+            );
+        }
+    }
+
+    /// A slice target (`.a[0:2]`) has no [`MetaPathStep`] representation --
+    /// `path(.a[0:2])` names its component with `{"start":.., "end":..}`,
+    /// not a plain key or index -- so [`meta_path_from_value`] treats it as
+    /// having no candidates and the write is a silent no-op, matching real
+    /// yq's own (also silent) refusal to attach one comment to a range.
+    #[test]
+    fn slice_target_has_no_candidates_and_is_a_noop() -> Result<()> {
+        let (out, code) = run_yq_stdin(".a[0:2] line_comment = \"x\"", "a: [1, 2, 3]\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "a: [1, 2, 3]\n");
+        Ok(())
+    }
+
+    /// A resolved write whose path no longer exists by the time the result
+    /// is assembled -- a later `del()` in the same pipe, or a later stage
+    /// retyping the target -- is skipped ([`owned_value_at_mut`]'s `None`
+    /// arm and [`apply_meta_assign_writes`]'s own `continue`), never
+    /// resurrected or applied to the wrong node. Both live-verified against
+    /// pinned yq.
+    #[test]
+    fn write_skipped_when_a_later_stage_removes_or_retypes_its_target() -> Result<()> {
+        let (out, code) = run_yq_stdin(".a line_comment = \"y\" | del(.a)", "a: 1\nb: 2\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "b: 2\n");
+
+        let (out, code) = run_yq_stdin(".a.b line_comment = \"y\" | .a = 5", "a:\n  b: 1\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "a: 5\n");
+        Ok(())
+    }
+
+    /// A missing array target is created one leaf at a time
+    /// ([`comment_tree_at_path_or_create_mut`]'s leaf->array conversion and
+    /// its index-driven resize, both otherwise unexercised by
+    /// [`missing_target_is_created_like_any_yq_assignment`]'s `.a[2]` case,
+    /// where `a` already exists as an array so the comment tree never needs
+    /// to convert a leaf into one). Live-verified against pinned yq.
+    #[test]
+    fn array_target_created_from_a_wholly_missing_key() -> Result<()> {
+        let (out, code) = run_yq_stdin(".a[0] line_comment = \"y\"", "b: 1\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "b: 1\na:\n  - null # y\n");
+        Ok(())
+    }
+
+    /// `select(PRED)` ahead of a metadata write is shape-preserving
+    /// (`is_alias_sensitive_assign`'s `is_shape_preserving`, which the
+    /// write pass's own [`flatten_pipe_stages`] doc comment cross-links),
+    /// so [`resolve_meta_assign_writes`] re-evaluates it via
+    /// [`evaluate_input_quiet`] like any other non-identity stage instead
+    /// of losing the write the way an unsupported preceding stage does
+    /// (see the known-gap test below). Live-verified against pinned yq.
+    #[test]
+    fn select_prefix_stage_still_resolves_the_write() -> Result<()> {
+        let (out, code) = run_yq_stdin(
+            "select(true) | .a line_comment = \"hi\"",
+            "a: 1\nb: 2\n",
+            &[],
+        )?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "a: 1 # hi\nb: 2\n");
+        Ok(())
+    }
+
+    /// A stage between two metadata writes that genuinely errors (not
+    /// `1/0`, which yq evaluates to `+Infinity` rather than raising --
+    /// see the `feedback_live_probe_needs_a_genuinely_erroring_operation`
+    /// lesson) stops [`resolve_meta_assign_writes`]'s own re-evaluation
+    /// loop after the first write (`evaluate_input_quiet` -> `None` ->
+    /// `break`, [`resolve_meta_assign_writes`]'s doc comment). The first
+    /// write's resolution is simply discarded rather than applied, since
+    /// the real evaluation immediately afterward raises the same error and
+    /// the whole result is suppressed anyway -- live-verified against
+    /// pinned yq, which also raises `boom2` and prints nothing.
+    #[test]
+    fn erroring_stage_between_two_writes_matches_reals_all_or_nothing_failure() {
+        let (_out, err, code) = run_yq_stdin_with_stderr(
+            ".a line_comment = \"x\" | error(\"boom2\") | .b line_comment = \"y\"",
+            "a: 1\nb: 2\n",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(code, 1, "stderr: {err}");
+        assert!(err.contains("boom2"), "stderr: {err}");
+    }
+
+    /// `=`'s right-hand side is evaluated once via the real (non-quiet)
+    /// [`evaluate_input`], so an error there is reported exactly like any
+    /// other write-family RHS error (`resolve_one_meta_assign`'s
+    /// `sink.report_count()` check), and an empty-output RHS leaves no
+    /// candidate text to write at all (`results.into_iter().next()` is
+    /// `None`) -- both a silent no-op from the metadata pass's own
+    /// perspective, distinguished only by whether the real evaluation
+    /// afterward also fails.
+    #[test]
+    fn rhs_error_and_rhs_empty_output_both_short_circuit_the_write() {
+        let (_out, err, code) =
+            run_yq_stdin_with_stderr(".a line_comment = error(\"boom\")", "a: 1\n", &[]).unwrap();
+        assert_eq!(code, 1, "stderr: {err}");
+        assert!(err.contains("boom"), "stderr: {err}");
+    }
+
+    /// Known gap, not specific to #798: [`resolve_meta_assign_writes`]
+    /// resolves each non-identity preceding stage in total isolation
+    /// (`evaluate_input_quiet`, a fresh re-index-and-evaluate with no
+    /// access to the surrounding pipe's scope) -- the exact same hole
+    /// `.a | .b = 5` already falls into for comments on any write-family
+    /// operator (`is_alias_sensitive_assign`'s `is_shape_preserving` admits
+    /// only a fixed operator list, not arbitrary navigation), and that a
+    /// user-defined function call falls into doubly, since `f` alone is
+    /// unresolvable outside the `def` that introduced it. Both cases here
+    /// exit 0 with the write silently dropped rather than raising the
+    /// "top-level pipe stage" refusal #798's triage otherwise prefers
+    /// (`docs/compliance/yq/limitations.md`'s #798 entry) -- pinning the
+    /// current (non-ideal, but intentional-for-PR1) output so a future fix
+    /// updates this test deliberately instead of silently. `def` itself is
+    /// succinctly's own accepted (if undocumented) surface here; real yq's
+    /// lexer rejects it outright, so there is no oracle for the second
+    /// case.
+    #[test]
+    fn preceding_stage_outside_the_admitted_shapes_silently_drops_the_write() -> Result<()> {
+        let (out, code) = run_yq_stdin(".a | .b line_comment = \"hi\"", "a:\n  b: 1\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "b: 1\n");
+
+        let (out, code) = run_yq_stdin("def f: .; f | .a line_comment = \"hi\"", "a: 1\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "a: 1\n");
+        Ok(())
+    }
+
     /// A multi-line comment renders go-yaml's way, every rule live-verified
     /// against pinned yq: first line after the value; each further line as
     /// its own comment line at the containing line's indent; an empty line

@@ -3394,7 +3394,7 @@ Two rendering divergences, both readable back and both pinned:
   tagged scalar whose cursor reports a quoted style (`a: !!int "5"`, #747) keeps its
   current (already divergent, pre-#798) rendering.
 
-Three known gaps this write shares with every other write form, none specific to #798:
+Four known gaps this write shares with every other write form, none specific to #798:
 
 - **No read-after-write within one pipe.** The `line_comment`/`style`/`anchor` GET-forms
   still read the original YAML cursor, never the write pass's `CommentTree`, so `.a anchor
@@ -3408,6 +3408,19 @@ Three known gaps this write shares with every other write form, none specific to
   pipe stops being shape-preserving.
 - **A multi-result filter carries no `CommentTree` at all** (`.a line_comment = "y" | .,
   .` prints two uncommented copies) — #1349's `GenericResult::Many` limitation, above.
+- **A preceding stage outside the shapes `is_alias_sensitive_assign` admits silently drops
+  the write**, rather than raising the "top-level pipe stage" refusal above: `.a | .b
+  line_comment = "hi"` on `a:\n  b: 1\n` prints `b: 1` where real yq prints `b: 1 # hi`
+  (live-verified), because `resolve_meta_assign_writes` only runs at all when the whole
+  expression passes `is_shape_preserving` (`src/jq/eval.rs`) — a bare navigation stage like
+  `.a` is not in that fixed operator list, so the entire write pass, not just that one
+  stage, is skipped. A leading user-defined `def` compounds this: `def f: .; f | .a
+  line_comment = "hi"` also drops the write, since `resolve_meta_assign_writes` resolves
+  each preceding stage in total isolation (`evaluate_input_quiet`, a fresh re-index with no
+  access to the surrounding scope) and a bare `f` is unresolvable outside the `def` that
+  introduced it — real yq has no `def`/user-defined-function syntax at all, so there is no
+  oracle for that second case. Tracked as #2679; pinned by
+  `preceding_stage_outside_the_admitted_shapes_silently_drops_the_write`.
 
 Finally, one rule real yq decides by the target's value, reproduced rather than "fixed":
 a `line_comment` written onto a **block-rendered container** is dropped (`.a line_comment
