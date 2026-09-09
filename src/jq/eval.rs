@@ -5983,19 +5983,46 @@ fn counted_bool_flow_to_flow<'a, W: Clone + AsRef<[u64]>>(
 /// [`each_first`] (`skip == 0`) and [`each_nth`]'s inner per-`n` walk, so the
 /// `?//`-retry short-circuit rule ([`finish_short_circuit`]) has one
 /// implementation rather than two independently-maintained copies.
+///
+/// `materialize` reproduces the one real difference between the two eager
+/// fallbacks this replaces: [`eval_first_expr`] forwards its kept item as
+/// `Item::Borrowed` (zero-copy, decode deferred to whoever consumes it),
+/// while [`builtin_nth_stream`] is "always materializing" (#820) and forces
+/// [`Item::into_owned`]'s checked decode on its own kept item before
+/// returning it, so an undecodable string raises there rather than
+/// downstream (#1972). A bare pass-through here silently regressed that for
+/// `nth` (not `first`, which was never eager): a `?//` retry into a second
+/// alternative whose body is an undecodable string (`.bad` on `"\x"`) used
+/// to be caught -- via the eager path's own per-item `.into_owned()` loop --
+/// and correctly raised past the already-kept first alternative's output as
+/// a `Partial`; forwarded as a bare, still-lazy `Item` instead, it streamed
+/// straight to output unvalidated. `sink` still only ever sees the *kept*
+/// item -- one per `?//` alternative that reaches this skip index, same as
+/// before -- so `first`'s laziness is untouched by passing `materialize:
+/// false`.
 fn take_at_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
     skip: usize,
+    materialize: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
     let mut seen = 0usize;
     let mut outer_stopped = false;
+    let mut escape: Option<Control> = None;
     let flow = eval_each::<W, S>(expr, value, optional, &mut |item| {
         let at_or_past = seen >= skip;
         seen += 1;
         if at_or_past {
+            let item = if materialize {
+                match item.into_owned() {
+                    Ok(v) => Item::Owned(v),
+                    Err(e) => return stop_with_escape(&mut escape, Control::Error(e)),
+                }
+            } else {
+                item
+            };
             if sink(item) == Demand::Stop {
                 outer_stopped = true;
             }
@@ -6004,7 +6031,11 @@ fn take_at_index<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Demand::Continue
         }
     });
-    finish_short_circuit(outer_stopped, flow)
+    if escape.is_some() {
+        resume_from_escape(escape, flow)
+    } else {
+        finish_short_circuit(outer_stopped, flow)
+    }
 }
 
 /// Demand-forwarding twin of [`eval_first_expr`] (#2180 WP1): jq's
@@ -6029,7 +6060,7 @@ fn each_first<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
-    take_at_index::<W, S>(expr, value, optional, 0, sink)
+    take_at_index::<W, S>(expr, value, optional, 0, false, sink)
 }
 
 /// Demand-forwarding twin of [`fanout_arg`]'s [`ArgFanout::All`] loop
@@ -6115,7 +6146,10 @@ where
 /// *skipped* item's decode: `eval.rs`'s [`Item`]s are only ever borrowed or
 /// already-owned, never a lazy chain that still owes evaluation, so there is
 /// nothing to force and none of #2199/#2567's skipped-item retry problem
-/// arises on this side.
+/// arises on this side. The *kept* item is a different matter -- see
+/// [`take_at_index`]'s own `materialize` doc, passed `true` here to keep
+/// `builtin_nth_stream`'s "always materializing" (#820) decode-check on the
+/// one item this consumer actually returns.
 fn each_nth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     n_expr: &Expr,
     expr: &Expr,
@@ -6128,7 +6162,7 @@ fn each_nth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Ok(n) => n,
             Err(e) => return Flow::Escaped(Control::Error(e)),
         };
-        take_at_index::<W, S>(expr, value.clone(), optional, n, sink)
+        take_at_index::<W, S>(expr, value.clone(), optional, n, true, sink)
     })
 }
 

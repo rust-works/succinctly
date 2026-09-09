@@ -44024,11 +44024,6 @@ fn test_path_through_bound_variable_matches_jq_2072() -> Result<()> {
 ///   genuinely dead for every format shipped today, per the existing
 ///   comment right above it -- only the guard *line* needing a `Err(_)` to
 ///   reach it at all).
-/// - `fold_lazy_keys_stage`'s `Expr::Iterate` arm: `{v: (keys_unsorted |
-///   .[])}` forces the pipe through `eval_single`'s own `Expr::Pipe` arm
-///   (`fold_pipe_stages`) instead of the sink-based
-///   `each_lazy_keys_iterate_sink` route `keys_unsorted[]` takes at the top
-///   level.
 /// - `eval_limit_generic`'s `items_to_generic_result` error arm: `limit(2;
 ///   5, .arr[0])` pulls a literal and a lazy, not-yet-decoded array-element
 ///   cursor cleanly (no escape during the pull), so the decode failure
@@ -44084,17 +44079,29 @@ fn test_pull_model_arms_reachable_only_through_a_nested_forcing_context_2103() -
     assert!(stdout.trim().is_empty(), "stdout: {stdout:?}");
     assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr}");
 
-    // `fold_lazy_keys_stage`'s `Expr::Iterate if !sorted` arm's `Err` case:
-    // `keys_unsorted | .[]` folded through `eval_single`'s own pull-model
-    // `Expr::Pipe` handling (forced by the enclosing object-construction
-    // value slot, which has no native push arm) walks the whole object to
-    // collect every cursor and hits the missing-delimiter check.
+    // #2180 WP2b review: `{...}` gained its own native push arm
+    // (`each_object_entries_generic`/`each_object_value_generic`), so
+    // `keys_unsorted | .[]` inside a value slot no longer forces the whole
+    // object through `eval_single`'s pull model the way it did when this
+    // case was first written -- it now reaches `eval_each_pipe_generic` ->
+    // `fold_pipe_stages_sink` -> `each_lazy_keys_iterate_sink`'s own
+    // `!sorted` arm, the exact sink-based route `keys_unsorted[]` already
+    // takes at the top level (traced directly, not by static reading alone:
+    // `{v: (keys_unsorted | .[])}` alone, outside any object, streams the
+    // identical "a"/"b" prefix before erroring). That route delivers each
+    // key to `sink` as it is decoded and only checks the trailing
+    // member-delimiter fault once the walk is exhausted, so a valid-looking
+    // prefix streams before the malformed final delimiter raises --
+    // unlike the old pull-model arm, which walked (and so validated) the
+    // whole object before yielding anything. Both keys before the fault
+    // decode cleanly, so both stream (each wrapped by the enclosing `{v:
+    // ...}`) before the terminal `is_malformed()` check raises.
     let (stdout, stderr, code) = run_jq_full(
         &["-c", "{v: (keys_unsorted | .[])}"],
         Some(r#"{"a" 1, "b": 2}"#),
     )?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr}");
-    assert!(stdout.trim().is_empty(), "stdout: {stdout:?}");
+    assert_eq!(stdout, "{\"v\":\"a\"}\n{\"v\":\"b\"}\n");
     assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr}");
 
     // `eval_limit_generic`'s `items_to_generic_result` error arm: `5` pulls

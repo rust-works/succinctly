@@ -8998,6 +8998,28 @@ fn each_limit_with_n_generic<S: EvalSemantics, V: DocumentValue>(
 /// (#2199). When `skip == 0` no item is ever skipped, so this never engages
 /// there -- `each_first_generic` inherits the check for free rather than
 /// needing its own simpler loop.
+///
+/// A *second* (or later) kept item at this same index -- reachable only
+/// through a `?//` retry (#1519), since the sink answers `Demand::Stop` on
+/// the first one and a generator with no such retry is never asked again --
+/// is force-decoded the same way before it reaches `sink`, mirroring
+/// [`items_to_generic_result`]'s own multi-item rule (`take_at_index_generic`
+/// is the streaming twin of [`nth_with_n_generic`]/`each_take_first_generic`,
+/// both of which route a multi-item `wanted` batch through that function via
+/// [`take_stopping_items_to_generic_result`]). The *first* kept item stays
+/// lazy and cursor-backed either way: it is what makes the whole point of a
+/// demand-forwarding consumer work (a wrapping consumer sees it immediately,
+/// before any retry could even be known about), and in the overwhelmingly
+/// common non-retried case it is also the only item, where #607's
+/// duplicate-key fidelity still applies -- `[nth(0; .bad)]` alone must not
+/// pay this decode any more than it already didn't. Only once a second item
+/// actually arrives does forcing it cost nothing extra (the retry path is
+/// already the slow, jq-bug-compat one) and become necessary: without it, an
+/// undecodable retried alternative streamed straight to `sink` unvalidated
+/// instead of raising past the already-delivered first item, exactly the gap
+/// `test_generic_first_nth_retry_batch_still_raises_decode_failure_1519`
+/// exists to pin for the eager, `Vec`-collecting siblings this lazy skeleton
+/// was missing it relative to.
 fn take_at_index_generic<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     value: V,
@@ -9008,11 +9030,21 @@ fn take_at_index_generic<S: EvalSemantics, V: DocumentValue>(
 ) -> Flow {
     let mut seen = 0usize;
     let mut outer_stopped = false;
+    let mut kept_any = false;
     let mut skipped_err: Option<Control> = None;
     let flow = eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| {
         let at_or_past = seen >= skip;
         seen += 1;
         if at_or_past {
+            let item = if kept_any {
+                match generic_item_into_owned(item) {
+                    Ok(v) => GenericItem::Owned(v),
+                    Err(control) => return stop_with_escape(&mut skipped_err, control),
+                }
+            } else {
+                item
+            };
+            kept_any = true;
             if sink(item) == Demand::Stop {
                 outer_stopped = true;
             }
@@ -9342,6 +9374,17 @@ fn process_index_key<S: EvalSemantics, V: DocumentValue>(
 /// `build_object_entries_generic`'s own `ObjectEscapeGeneric::Suppressed`
 /// (discard every combination already produced) -- see that function's own
 /// doc comment for why this is unreached in practice, not merely untested.
+///
+/// A computed key's stringify check is deferred into
+/// [`each_object_value_generic`] itself, run once per *value* output rather
+/// than once per key output (#354 review): `build_object_entries_generic`
+/// only ever raises "cannot use as object key" from inside its own `for val
+/// in vals` loop, so a value slot with zero outputs (`{(.n): empty}`, `.n` a
+/// number) never reaches it at all -- the cartesian product is empty, and an
+/// invalid key that would have labeled a nonexistent entry must not surface
+/// as an error. Checking it here instead, right after the key is decoded and
+/// before any value is even evaluated, raised on every such key regardless
+/// of whether a value ever followed it.
 fn each_object_entries_generic<S: EvalSemantics, V: DocumentValue>(
     entries: &[ObjectEntry],
     value: V,
@@ -9360,7 +9403,7 @@ fn each_object_entries_generic<S: EvalSemantics, V: DocumentValue>(
 
     match &entry.key {
         ObjectKey::Literal(name) => each_object_value_generic::<S, V>(
-            name.clone(),
+            ObjectKeySlot::Literal(name.clone()),
             &entry.value,
             rest,
             value,
@@ -9377,23 +9420,8 @@ fn each_object_entries_generic<S: EvalSemantics, V: DocumentValue>(
                         Ok(v) => v,
                         Err(control) => return stop_with_escape(&mut escape, control),
                     };
-                    let key_str = match &key_owned {
-                        OwnedValue::String(s) => s.clone(),
-                        _ => match yq_object_key_stringify::<S>(&key_owned) {
-                            Some(s) => s,
-                            None => {
-                                if optional {
-                                    return Demand::Continue;
-                                }
-                                return stop_with_escape(
-                                    &mut escape,
-                                    Control::Error(EvalError::cannot_use_as_object_key(&key_owned)),
-                                );
-                            }
-                        },
-                    };
                     match each_object_value_generic::<S, V>(
-                        key_str,
+                        ObjectKeySlot::Computed(key_owned),
                         &entry.value,
                         rest,
                         value.clone(),
@@ -9412,6 +9440,16 @@ fn each_object_entries_generic<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
+/// A key slot on its way into [`each_object_value_generic`]: a literal
+/// entry's name never needs the "is this a string" check at all, while a
+/// computed entry's key is checked once per value output -- see that
+/// function's own call site in [`each_object_entries_generic`] for why the
+/// check cannot run any earlier.
+enum ObjectKeySlot {
+    Literal(String),
+    Computed(OwnedValue),
+}
+
 /// [`each_object_entries_generic`]'s value-slot half -- see that function's
 /// own doc comment.
 #[allow(clippy::too_many_arguments)] // STYLE-0004: mirrors `build_object_entries_generic`'s
@@ -9419,7 +9457,7 @@ fn each_object_entries_generic<S: EvalSemantics, V: DocumentValue>(
                                      // threaded straight through the recursion, a struct
                                      // would just rename the same fields.
 fn each_object_value_generic<S: EvalSemantics, V: DocumentValue>(
-    key: String,
+    key: ObjectKeySlot,
     value_expr: &Expr,
     rest: &[ObjectEntry],
     value: V,
@@ -9435,7 +9473,25 @@ fn each_object_value_generic<S: EvalSemantics, V: DocumentValue>(
                 Ok(v) => v,
                 Err(control) => return stop_with_escape(&mut escape, control),
             };
-            acc.push((key.clone(), val_owned));
+            let key_str = match &key {
+                ObjectKeySlot::Literal(s) => s.clone(),
+                ObjectKeySlot::Computed(key_owned) => match key_owned {
+                    OwnedValue::String(s) => s.clone(),
+                    _ => match yq_object_key_stringify::<S>(key_owned) {
+                        Some(s) => s,
+                        None => {
+                            if optional {
+                                return Demand::Continue;
+                            }
+                            return stop_with_escape(
+                                &mut escape,
+                                Control::Error(EvalError::cannot_use_as_object_key(key_owned)),
+                            );
+                        }
+                    },
+                },
+            };
+            acc.push((key_str, val_owned));
             let result = each_object_entries_generic::<S, V>(
                 rest,
                 value.clone(),
@@ -32312,7 +32368,10 @@ mod tests {
 
         let (out, flow) = drive_each_sink_cursorless(good, ".x[.k]");
         assert_eq!(out, vec![OwnedValue::from_number_literal("1")]);
-        assert!(matches!(flow, Flow::Exhausted), "expected the walk to exhaust");
+        assert!(
+            matches!(flow, Flow::Exhausted),
+            "expected the walk to exhaust"
+        );
 
         match drive_each_sink::<JqSemantics>(undecodable_key, ".x[.k]") {
             (_, Some(Control::Error(e))) => assert!(
@@ -32398,7 +32457,10 @@ mod tests {
             let expr = parse("limit((1,2); .a,.b)").expect("parses");
             match eval_with_cursor(&expr, cursor) {
                 GenericResult::Error(e) | GenericResult::Partial(_, Control::Error(e)) => {
-                    assert!(e.is_decode_failure(), "[{label}] expected a decode failure: {e:?}");
+                    assert!(
+                        e.is_decode_failure(),
+                        "[{label}] expected a decode failure: {e:?}"
+                    );
                 }
                 other => panic!("[{label}] expected a raise, got: {other:?}"),
             }
@@ -32472,7 +32534,9 @@ mod tests {
                     "[{filter}] expected a decode failure, got: {e:?}"
                 ),
                 (out, control) => {
-                    panic!("[{filter}] expected a raise, got outputs {out:?} and control {control:?}")
+                    panic!(
+                        "[{filter}] expected a raise, got outputs {out:?} and control {control:?}"
+                    )
                 }
             }
         }
