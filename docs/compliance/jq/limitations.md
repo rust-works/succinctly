@@ -2985,37 +2985,72 @@ destructive `input` spellings) in `test_short_circuit_side_effect_shapes_already
 that group, and with it the last of the originally-filed rows.** `each_foreach` (`src/jq/eval.rs`)
 and `each_foreach_generic` (`src/jq/eval_generic.rs`) drive the source through
 `eval_each`/`eval_each_generic` one element at a time, and `try_foreach_step_alternatives` drives
-each step's EXTRACT through `eval_each_owned`, pushing its outputs as they are produced. Both
-evaluators share one fold loop, `foreach_fork`, parameterised over the source strategy —
-`eval_foreach_with_values` passes the collecting one (its pre-built substitution matrix plus the
-source stream's own trailing control) and the two new arms pass the lazy drive — so the eager
-and demand-driven `foreach` cannot drift on `?//` state threading.
+each step's EXTRACT through `eval_each_owned`, pushing its outputs as they are produced. Since
+WP3's review **every** `foreach` entry point — the two demand-forwarding arms and both eager ones
+— shares one fold, `foreach_forks`, and drives the source the same way, so the two routes cannot
+answer differently: `[foreach (1 as $x ?// $y | 1) as $v (0; if . == 0 then error("x") else
+"OK:\(.)" end; .)]` used to raise from the eager route where jq and every `first`/`limit`
+spelling answer `["OK:null"]`.
 
 **The rule this group turns on: a sink's `Demand::Stop` is `Control::Break` in different clothes,
 state threading included.** `foreach`'s own `?//` retries on the stop under `is_retryable_stop`,
 the sibling of `is_retryable_control`, and the retried alternative resumes from the accumulator
 the stopped attempt had already produced — which is why jq answers `[1,2]` and not `[1,1]`. That
 is the same state-threading rule #1458 established for a `Control::Break` escaping EXTRACT (the
-retry is seeded with the failed EXTRACT call's own input), and the oracle never showed the two
-rules differing anywhere. Every row confirmed live against jq 1.7.1 under both wrappers, input
-`1`:
+retry is seeded with the failed EXTRACT call's own input). The two rules agree on *state*; they
+do **not** agree on what may be retried at all, which is the next section. Every row confirmed
+live against jq 1.7.1 under both wrappers, input `1`:
 
-| filter                                                                                       | jq 1.7.1 and `succinctly jq` |
-|------------------------------------------------------------------------------------------------|------------------------------|
-| `[first(foreach (1) as $x ?// $y (0;.+1;.), "z")]`, `[first(foreach (1) as $x ?// $y (0;.+1))]` | `[1,2]`                      |
-| `[first(foreach (1) as $x ?// $y (0;.+1;., 99))]`                                              | `[1,2]`                      |
-| `[first(foreach (1 as $x ?// $y \| 1) as $v (0; .+$v; .))]` (source, not pattern)               | `[1,2]`                      |
-| `[isempty(foreach (1 as $x ?// $y \| 1) as $v (0; .+$v; .))]`                                   | `[false,false]`              |
-| `[first(foreach (1) as $v (0; .; (1 as $x ?// $y \| 1)))]` (EXTRACT)                            | `[1,1]`                      |
-| `[first(foreach (1) as $x ?// $y (0; .+1; (1 as $a ?// $b \| .)))]` (both)                      | `[1,1,2,2]`                  |
-| `[first(foreach (1) as $x ?// $y ((0,100); .+1; .))]` (generator INIT)                          | `[1,2]`                      |
-| `[first(foreach (1) as [$x] ?// $y (0;.+1;.), "z")]` (first alternative cannot match)           | `[1]`                        |
+| filter                                                                                                     | jq 1.7.1 and `succinctly jq` |
+|------------------------------------------------------------------------------------------------------------|------------------------------|
+| `[first(foreach (1) as $x ?// $y (0;.+1;.), "z")]`, `[first(foreach (1) as $x ?// $y (0;.+1))]`            | `[1,2]`                      |
+| `[first(foreach (1) as $x ?// $y (0;.+1;., 99))]`                                                          | `[1,2]`                      |
+| `[first(foreach (1 as $x ?// $y \| 1) as $v (0; .+$v; .))]` (source, not pattern)                          | `[1,2]`                      |
+| `[isempty(foreach (1 as $x ?// $y \| 1) as $v (0; .+$v; .))]`                                              | `[false,false]`              |
+| `[first(foreach (1) as $v (0; .; (1 as $x ?// $y \| 1)))]` (EXTRACT)                                       | `[1,1]`                      |
+| `[first(foreach (1) as $x ?// $y (0; .+1; (1 as $a ?// $b \| .)))]` (both)                                 | `[1,1,2,2]`                  |
+| `[first(foreach (1) as $x ?// $y ((0,100); .+1; .))]` (generator INIT)                                     | `[1,2]`                      |
+| `[first(foreach (1) as [$x] ?// $y (0;.+1;.), "z")]` (first alternative cannot match)                      | `[1]`                        |
+| `[limit(3; foreach (1 as $x ?// $y \| 1, 2) as $v ((0,100); .+$v; .))]` (a later fork's own stop)          | `[1,3,101,102]`              |
+| `[foreach (1 as $x ?// $y \| 1) as $v (0; if . == 0 then error("x") else "OK:\(.)" end; .)]` (eager route) | `["OK:null"]`                |
 
-The last two rows are the group's own rules, which the plain rows do not pin. A generator INIT
+The last four rows are the group's own rules, which the plain rows do not pin. A generator INIT
 still fans out eagerly and outermost (#534), but a stop inside the *first* fork still reaches the
-pattern's `?//`, and then ends the whole `foreach` — the `100` fork is never attempted. And a
-first alternative that cannot match the source element is skipped without consuming a retry,
-leaving only the last one, whose stop is not retryable at all.
+pattern's `?//`, and then ends the whole `foreach` — the `100` fork is never attempted. A first
+alternative that cannot match the source element is skipped without consuming a retry, leaving
+only the last one, whose stop is not retryable at all. And **every INIT fork drives the source
+afresh**: WP3 recorded the first fork's elements and replayed them for later forks, which lost
+that later fork's own retry (`[1,3,101]`) and double-recorded any element a source-side `?//`
+re-offered. jq re-evaluates the source per fork anyway, side effects included — `[foreach (1,
+("B"|stderr)) as $x ((0,100); .+1)]` writes `B` twice in jq 1.7.1, and now here (it wrote it once
+under both the recording and the pre-WP3 eager path, a divergence WP3 inherited rather than
+introduced). Removing the recording, together with the #695 substitution matrix it replaced, took
+peak RSS on `[foreach .[] as $x (0; .+$x)] | length` over a 1,000,000-element array from 522.1 MB
+to 30.4 MB.
+
+**A `Halt` behind a stop is not retryable, and neither is a decode failure.** A driver that ends
+its drive because something *escaped* can only answer `Demand`, so it stashes the escape out of
+band and returns `Demand::Stop`; every `?//` between it and the consumer then saw a bare
+`Flow::Stopped` and retried the alternative that had already halted. `nonretryable_stop`
+(`src/jq/eval.rs`) records `is_retryable_control`'s two position-independent exclusions beside
+the stop, `is_retryable_stop` consults it, and `stop_with_escape` is the one place that sets it.
+This is the shared signal [#2567](https://github.com/rust-works/succinctly/issues/2567) asked
+for, and it closes that issue's own residual too (`nth`'s illegitimate retry after a skipped
+item's forced decode failure no longer runs the next alternative's body at all). Captured live,
+`-cn`:
+
+| filter                                                                                                                   | jq 1.7.1 and `succinctly jq`                              |
+|--------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------|
+| `[limit(1; (1 as $x ?// $y \| 1) \| ("h"\|halt_error(3)))]`                                                              | stderr `h`, exit 3 (wrote `hh`)                           |
+| `first((1 as $x ?// $y \| 1) as $v \| ("h"\|halt_error(3)))`                                                             | stderr `h`, exit 3 (wrote `hh`)                           |
+| `foreach (1 as $x ?// $y \| 1) as $v (0; ("h"\|halt_error(3)))`                                                          | stderr `h`, exit 3                                        |
+| `first(foreach (1 as $x ?// $y \| 1) as $v (0; ("E"\|stderr) \| ("H"\|halt_error(3)); .))`                               | stderr `EH`, exit 3 (wrote `EHEH`)                        |
+| `[limit(10; foreach (1 as $x ?// $y \| 1) as $v ((0, 100); if . == 0 then ("x"\|halt_error(3)) else "OK:\(.)" end; .))]` | stderr `x`, exit 3 (the retry swallowed the halt: exit 0) |
+| `[limit(1; (1 as $x ?// $y \| 1) \| ("e"\|stderr) \| error("boom"))]`                                                    | stderr `ee` + the error, exit 5 (unchanged)               |
+
+The last row is the control: an ordinary `error` (and a `break`) genuinely *does* retry through a
+source `?//` in jq, so the signal carries `is_retryable_control`'s rule rather than refusing every
+escape-backed stop.
 
 WP3 closed ordinary side-effect leaks with the same arms: `first(foreach (1, ("B"|stderr)) as $x
 (0; .+1))` and `first(foreach (1) as $x (0; .+1; ., ("E"|stderr)))` each ran a branch jq never
@@ -3023,31 +3058,31 @@ reaches, and the destructive `input` spelling `[first(foreach (1, input) as $x (
 over `"a" "b"` was `[1,"b"]` where jq answers `[1,"a"]`. Its over-stopping guard is pinned
 alongside them: a side effect *before* EXTRACT's first output (`first(foreach (1) as $x (0; .+1;
 ("E"|stderr), .))`) is genuinely reached, in jq and here. All in
-`test_short_circuit_side_effect_shapes_already_match_jq_820`, together with the `path(...)`
-/`halt_error` pair that used to pin `binary_fanout_each`'s inner/outer `Flow::Stopped { pending }`
-asymmetry — that pair used `foreach` precisely because it was the last construct still reaching
-the eager fallback that *produces* a `pending`, and with the arm in place both spellings now match
-jq exactly. The asymmetry itself is unchanged; it simply has no `foreach` repro left.
+`test_short_circuit_side_effect_shapes_already_match_jq_820`. The `path(...)`/`halt_error` pair
+that pins `binary_fanout_each`'s inner/outer `Flow::Stopped { pending }` asymmetry moved *out* of
+`foreach` with the same change: that pair needs an operand still reaching the eager fallback that
+*produces* a `pending`, so it used `if` until #1462, `foreach` until WP3, and now `recurse`, which
+`eval_each` has no arm for. The asymmetry itself is unchanged.
 
 **What still diverges: `foreach`'s UPDATE and its INIT, and only those.** Two positions inside
 `foreach` are still evaluated eagerly, so a `?//` bind in either never sees the stop, and a side
 effect in either fires where jq never reaches it. Confirmed live under both wrappers:
 
-| filter                                                                     | jq 1.7.1        | succinctly jq   |
-|------------------------------------------------------------------------------|-----------------|-----------------|
-| `[first(foreach (1) as $v (0; . + (1 as $x ?// $y \| 1)))]` (UPDATE)         | `[1,1]`         | `[1]`           |
-| `[isempty(foreach (1) as $v (0; . + (1 as $x ?// $y \| 1)))]`                | `[false,false]` | `[false]`       |
-| `[first(foreach (1) as $v ((1 as $x ?// $y \| 1); .+1; .))]` (INIT)          | `[2,2]`         | `[2]`           |
-| `[isempty(foreach (1) as $v ((1 as $x ?// $y \| 1); .+1; .))]`               | `[false,false]` | `[false]`       |
-| `first(foreach (1) as $x (0; (.+1, ("U"\|stderr)); .))` (stderr in UPDATE)   | no write        | writes `U`      |
-| `first(foreach (1) as $x ((0, ("I"\|stderr)); .+1))` (stderr in INIT)        | no write        | writes `I`      |
+| filter                                                                     | jq 1.7.1        | succinctly jq |
+|----------------------------------------------------------------------------|-----------------|---------------|
+| `[first(foreach (1) as $v (0; . + (1 as $x ?// $y \| 1)))]` (UPDATE)       | `[1,1]`         | `[1]`         |
+| `[isempty(foreach (1) as $v (0; . + (1 as $x ?// $y \| 1)))]`              | `[false,false]` | `[false]`     |
+| `[first(foreach (1) as $v ((1 as $x ?// $y \| 1); .+1; .))]` (INIT)        | `[2,2]`         | `[2]`         |
+| `[isempty(foreach (1) as $v ((1 as $x ?// $y \| 1); .+1; .))]`             | `[false,false]` | `[false]`     |
+| `first(foreach (1) as $x (0; (.+1, ("U"\|stderr)); .))` (stderr in UPDATE) | no write        | writes `U`    |
+| `first(foreach (1) as $x ((0, ("I"\|stderr)); .+1))` (stderr in INIT)      | no write        | writes `I`    |
 
 Both are deliberate. Driving **UPDATE** means reshaping `fold_step_via_accumulator_or_fork`,
 which `reduce`'s own O(n) accumulator fix (#2157) shares, and whose outputs are simultaneously
 the fold's next state — a separate change from WP3's rows. **INIT** is jq's outermost loop
 (#534: each INIT output is an independent run over the source) and must be evaluated before the
-source is ever pulled (#2440: `foreach halt_error as $x (empty; .)` exits 0), so both
-`eval_foreach` and `each_foreach` collect it. The rows above are pinned in
+source is ever pulled (#2440: `foreach halt_error as $x (empty; .)` exits 0), so `foreach_forks`
+collects it and returns before its source drive is ever called. The rows above are pinned in
 `test_nested_short_circuit_consumer_hides_the_stop_2180` and
 `test_short_circuit_side_effect_leaks_820_932_987` (`tests/jq_cli_tests.rs`); they are
 deliberately *not* in `scripts/jq-alt-retry-oracle-sweep.sh`, which reports 0 unexpected and 0
@@ -4580,10 +4615,11 @@ $ echo '{"a":1,"c":2}' | succinctly jq -c '[foreach (.a) as $k ((0,.c); $k)]'
 ```
 
 Two of succinctly's three jq evaluators — `eval.rs`'s value evaluator and
-`eval_generic.rs`'s generic/CLI evaluator — share one core
-(`eval_reduce_with_values`/`eval_foreach_with_values`) that computes SOURCE's values once,
-upfront, and reuses them across every INIT fork, so every fork sees SOURCE evaluated against
-the real ambient input there. That front-end-level agreement (not independent
+`eval_generic.rs`'s generic/CLI evaluator — share one core per construct
+(`eval_reduce_with_values`, `foreach_forks`), and neither ever substitutes a synthetic `null`
+for the ambient document: `reduce` computes SOURCE's values once, upfront, and reuses them
+across every INIT fork, while `foreach` (since #2180 WP3's review) re-drives SOURCE per fork
+— against the *real* ambient input every time, which is exactly the half jq does not do. That front-end-level agreement (not independent
 double-implementation of the fold itself, since both front ends call the same shared
 functions) is what `test_parity_foreach_reduce_init_fork_source_reads_ambient_input_2163`
 (`tests/jq_evaluator_parity_tests.rs`) pins.
@@ -4614,9 +4650,10 @@ structurally malformed value doesn't abort the rest of a multi-value stream" ent
 itself still open rather than a settled precedent to build on. Matching jq's quirk exactly
 would mean re-deriving jq's own undocumented VM register-threading rule (which expression
 shapes get a fresh backtrack point, and what `.` reads as across one) and reshaping the
-shared `eval_reduce_with_values`/`eval_foreach_with_values` core so it re-evaluates SOURCE
-per-fork against a synthetic `null` document instead of its current once-upfront
-computation. A prior attempt at a narrower version of this fix (nulling only the bound
+shared `eval_reduce_with_values`/`foreach_forks` core so it evaluates SOURCE per-fork against
+a synthetic `null` document — for `foreach` that is now only the synthetic-`null` half, since
+the per-fork re-evaluation itself already landed with #2180 WP3's review; for `reduce` it is
+still both halves. A prior attempt at a narrower version of this fix (nulling only the bound
 pattern variable, not re-deriving SOURCE itself) regressed a passing test
 (`test_eval_reduce_init_partial_prefix_still_forks_when_trailing_error_suppressed_1934`) —
 but that test's own SOURCE is a constant (`5`) that never reads `.` at all, so the regression
