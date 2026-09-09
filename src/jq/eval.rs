@@ -51489,7 +51489,7 @@ mod tests {
     #[test]
     fn test_boolean_operand_borrowed_many_truthiness_2180() {
         query!(
-            br#"[1,2]"#,
+            br"[1,2]",
             ".[] and true",
             QueryResult::ManyOwned(vs) => {
                 assert_eq!(vs, vec![OwnedValue::Bool(true), OwnedValue::Bool(true)]);
@@ -51508,29 +51508,29 @@ mod tests {
     fn test_yq_empty_operand_answer_forwards_a_stop_2180() {
         // The comparison fan-out's inner loop.
         yq_query!(
-            br#"[1,2]"#,
+            br"[1,2]",
             "first(1 == empty)",
             QueryResult::Owned(OwnedValue::Bool(false)) => {}
         );
         yq_query!(
-            br#"[1,2]"#,
+            br"[1,2]",
             "first((1, 2) == empty)",
             QueryResult::Owned(OwnedValue::Bool(false)) => {}
         );
         // The boolean pair's left half (`empty and ...`)...
         yq_query!(
-            br#"[1,2]"#,
+            br"[1,2]",
             "first(empty and true)",
             QueryResult::Owned(OwnedValue::Bool(false)) => {}
         );
         yq_query!(
-            br#"[1,2]"#,
+            br"[1,2]",
             "first(empty or (true, false))",
             QueryResult::Owned(OwnedValue::Bool(true)) => {}
         );
         // ...and its right half (`... and empty`).
         yq_query!(
-            br#"[1,2]"#,
+            br"[1,2]",
             "first((true, false) and empty)",
             QueryResult::Owned(OwnedValue::Bool(false)) => {}
         );
@@ -51544,12 +51544,12 @@ mod tests {
     #[test]
     fn test_foreach_eager_source_fallback_terminators_2180() {
         query!(
-            br#"[1,2]"#,
+            br"[1,2]",
             "first(foreach repeat(.) as $x (0; . + 1; .))",
             QueryResult::Owned(OwnedValue::Int(1)) => {}
         );
         query!(
-            br#"[1,2]"#,
+            br"[1,2]",
             "[foreach limit(3; repeat(.)) as $x (0; . + 1; .)]",
             QueryResult::Owned(OwnedValue::Array(vs)) => {
                 assert_eq!(
@@ -51562,17 +51562,17 @@ mod tests {
         // source prefix -- the drive has to stop pushing elements at it and
         // leave the reason to `foreach_forks`, which already holds it.
         query!(
-            br#"[1,2]"#,
+            br"[1,2]",
             r#"[foreach limit(3; repeat(.)) as $x (0; . + 1; if . > 1 then error("stop") else . end)]"#,
             QueryResult::Error(e) => assert_eq!(e.message, "stop")
         );
         query!(
-            br#"[1,2]"#,
+            br"[1,2]",
             "label $out | [foreach limit(3; repeat(.)) as $x (0; . + 1; if . == 2 then break $out else . end)]",
             QueryResult::None => {}
         );
         query!(
-            br#"[1,2]"#,
+            br"[1,2]",
             "[limit(1; foreach limit(3; repeat(.)) as $x (0; . + 1; .))]",
             QueryResult::Owned(OwnedValue::Array(vs)) => {
                 assert_eq!(vs, vec![OwnedValue::Int(1)]);
