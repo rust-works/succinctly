@@ -20459,7 +20459,7 @@ fn test_resolve_node_alternative_comma_three_siblings_mixed_980() -> Result<()> 
 /// forwarded `left`'s `Err` with its prefix *unfiltered* (`resolve_node(..)?`),
 /// so a consumer that launders the escape into a short `Ok` -- `?`, a
 /// matching `label`/`break` -- saw a falsy branch jq's `//` never emits.
-/// Invisible while `resolve_fold_source` re-evaluated an erroring source
+/// Invisible while `drive_fold_source` re-evaluated an erroring source
 /// untracked, and a wrong-fold hazard the moment the resolver's own prefix
 /// is trusted instead. All three captured from jq 1.7.1.
 #[test]
@@ -39427,7 +39427,7 @@ fn test_path_cursor_native_absent_nodes_and_pipes_2061() -> Result<()> {
     Ok(())
 }
 
-/// #1872: `resolve_fold_source` runs a navigating fold source **once**, with
+/// #1872: `drive_fold_source` runs a navigating fold source **once**, with
 /// tracking on, and the fold's real values come from that same evaluation --
 /// so a side effect embedded in the source fires exactly as often as it does
 /// in jq. Before #1872 the source was evaluated twice (once to path-check it,
@@ -39470,30 +39470,251 @@ fn fold_source_side_effect_fires_once_per_output_1872() -> Result<()> {
 /// `stderr`'s own path-trackability -- before that fix, this raised nowhere
 /// at all and instead answered wrongly with `[]` three times, exit 0.
 ///
-/// The one remaining divergence from jq is `stderr`'s own write *count*:
-/// `resolve_fold_source`'s `Keep::AtMost(usize::MAX)` (#1467) pulls the whole
-/// navigating source upfront, so all three writes happen before the fold
-/// loop ever inspects the first step's own UPDATE result -- jq's true
-/// demand-driven generator stops pulling the source the moment that first
-/// step fails to track, writing only once. Tracked separately (not #2234's
-/// own scope, which is specifically about stderr/debug's trackability, not
-/// fold-source pull laziness) -- filed as a follow-up.
+/// The write *count* matches since #2235: the source is pulled by demand
+/// (`drive_fold_source`), the fold emits each output straight to `path()`'s
+/// terminal check, and that check refuses the first step's emission before
+/// the source is ever pulled again. Before #2235 `Keep::AtMost(usize::MAX)`
+/// pulled the whole source upfront and all three writes fired first.
 #[test]
 fn fold_source_foreach_diverges_from_reduce_on_this_shape_1872() -> Result<()> {
+    for filter in [
+        ". as $x | path(foreach (.[] | stderr) as $i (0; $x))",
+        ". as $x | path(foreach (.[] | debug) as $i (0; $x))",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("[1,2,3]"))?;
+        assert_eq!(code, 5, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout, "", "{filter}");
+        let (writes, error) = stderr
+            .split_once("jq: error")
+            .unwrap_or_else(|| panic!("{filter}: no error on stderr: {stderr:?}"));
+        assert!(
+            writes == "1" || writes == "[\"DEBUG:\",1]\n",
+            "{filter}: one source write, then the raise -- got {writes:?}"
+        );
+        assert!(
+            error.contains("Invalid path expression with result [1,2,3]"),
+            "{filter}: stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #2235: a path-mode fold pulls its source **by demand** -- one element,
+/// one step, then the next element -- and its outputs reach `path()`'s
+/// terminal check as they are emitted, so whatever stops the fold (a step
+/// that raises, a terminal refusal, an outer bound, a `break`) stops the
+/// source with nothing past it evaluated. `reduce` runs its prefix steps
+/// before a trailing source escape is raised, and an erroring source is no
+/// longer re-evaluated untracked (the old fallback double-fired side effects
+/// and discarded the per-step register, turning jq's refusal into an
+/// answer). Every row is captured from jq 1.7.1: `(input, filter, stdout,
+/// stderr, exit)`; stderr is compared whole, so a `stderr`/`debug` write
+/// count is pinned exactly.
+#[test]
+fn fold_source_is_pulled_by_demand_2235() -> Result<()> {
+    let e = |msg: &str| format!("jq: error (at <stdin>:0): {msg}\n");
+    let invalid = |v: &str| e(&format!("Invalid path expression with result {v}"));
+    for (input, filter, want_out, want_err, want_code) in [
+        // EXTRACT raises on the first element.
+        (
+            "[1,2,3]",
+            "path(foreach (.[] | stderr) as $i (.; .; error(\"u\")))",
+            String::new(),
+            format!("1{}", e("u")),
+            5,
+        ),
+        // A `reduce` step raises on the first element.
+        (
+            "[1,2,3]",
+            "path(reduce (.[]|stderr|.+0) as $i (.; if $i==1 then error(\"u\") else . end))",
+            String::new(),
+            format!("1{}", e("u")),
+            5,
+        ),
+        // `reduce` runs its prefix steps before the source's own escape --
+        // an error, a halt (which also writes its own input), a break.
+        (
+            r#"{"a":1}"#,
+            "path(reduce (1,2,error(\"s\")) as $i (.; stderr))",
+            String::new(),
+            format!("{{\"a\":1}}{{\"a\":1}}{}", e("s")),
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            "path(reduce (1,2,halt_error(3)) as $i (.; stderr))",
+            String::new(),
+            "{\"a\":1}{\"a\":1}{\"a\":1}\n".to_string(),
+            3,
+        ),
+        (
+            r#"{"a":1}"#,
+            "[label $out | path(reduce (1,2,break $out) as $i (.; stderr))]",
+            "[]\n".to_string(),
+            "{\"a\":1}{\"a\":1}".to_string(),
+            0,
+        ),
+        // A step's `break` stops the pull.
+        (
+            "[1,2,3]",
+            "[label $out | path(reduce (.[]|stderr) as $i (.; if $i==2 then break $out else . end))]",
+            "[]\n".to_string(),
+            "12".to_string(),
+            0,
+        ),
+        // The old fallback's shapes: an ordinary error after a source output
+        // (`foreach` refuses step 1's emission first; `reduce` raises `s`
+        // after one write, not two), a `break` reached through the source,
+        // and an error with nothing delivered before it.
+        (
+            "[1,2,3]",
+            "path(foreach (.[] | stderr | ., error(\"s\")) as $i (.; .))",
+            String::new(),
+            format!("1{}", invalid("[1,2,3]")),
+            5,
+        ),
+        (
+            "[1,2]",
+            "path(reduce (.[]|stderr|(.,error(\"s\"))) as $i (.; .))",
+            String::new(),
+            format!("1{}", e("s")),
+            5,
+        ),
+        (
+            "[1,2]",
+            "[label $out | path(foreach (.[], break $out) as $i (.; .))]",
+            String::new(),
+            invalid("[1,2]"),
+            5,
+        ),
+        (
+            "[1,2]",
+            "[label $out | path(foreach ((.[]|stderr), break $out) as $i (.; .))]",
+            String::new(),
+            format!("1{}", invalid("[1,2]")),
+            5,
+        ),
+        (
+            "[1,2]",
+            "path(foreach ((.[]|stderr|empty), error(\"s\")) as $i (.; .))",
+            String::new(),
+            format!("12{}", e("s")),
+            5,
+        ),
+        // A halt later in the source is never reached once step 1 refuses.
+        (
+            "[1,2,3]",
+            "path(foreach (.[] | stderr | if . == 2 then halt_error else . end) as $i (.; .; .))",
+            String::new(),
+            format!("1{}", invalid("[1,2,3]")),
+            5,
+        ),
+        // A bound inside the source, and one outside the whole `path()`.
+        (
+            "[1,2,3]",
+            "path(foreach (limit(2; .[]|stderr)) as $i (.; .))",
+            String::new(),
+            format!("1{}", invalid("[1,2,3]")),
+            5,
+        ),
+        (
+            "[1,2,3,4]",
+            "[limit(2; path(foreach (.[]|stderr|.+0) as $i (0; .)))]",
+            String::new(),
+            format!("1{}", invalid("0")),
+            5,
+        ),
+        // Several INIT forks: the first fork's refusal stops everything; a
+        // later fork re-drives the source (with its side effects) only once
+        // the earlier one completed.
+        (
+            "[1,2,3]",
+            "path(foreach (.[]|stderr) as $i ((.,.); .))",
+            String::new(),
+            format!("1{}", invalid("[1,2,3]")),
+            5,
+        ),
+        (
+            "[1,2]",
+            "[path(foreach (.[]|stderr|.+0) as $i ((null,null); .))?]",
+            "[]\n".to_string(),
+            "1".to_string(),
+            0,
+        ),
+        (
+            "[1,2]",
+            "[path(reduce (.[]|stderr|.+0) as $i ((0,1); .))?]",
+            "[]\n".to_string(),
+            "12".to_string(),
+            0,
+        ),
+        // A `?//` in the source retries the step on the reset state after a
+        // step error, but never after a halt. A terminal refusal of the
+        // first alternative's output is retried too: into the second's
+        // accepted `.`, or -- when the retried step re-enters from the
+        // refused step's own output -- into a second refusal naming it.
+        (
+            "1",
+            "path(foreach (1 as $x ?// $y | 1) as $v (.; stderr | error(\"u\")))",
+            String::new(),
+            format!("1null{}", e("u")),
+            5,
+        ),
+        (
+            "1",
+            "path(foreach (1 as $x ?// $y | 1) as $v (.; stderr | halt_error))",
+            String::new(),
+            "11\n".to_string(),
+            5,
+        ),
+        (
+            r#"{"a":1}"#,
+            "path(foreach (1 as $x ?// $y | if $x == 1 then 1 else 2 end) as $v (.; .; if $v == 1 then 1 else . end))",
+            "[]\n".to_string(),
+            String::new(),
+            0,
+        ),
+        (
+            r#"{"a":1}"#,
+            "path(foreach (1 as $x ?// $y | if $x == 1 then 1 else 2 end) as $v (.; if $v == 2 then . else $v end))",
+            String::new(),
+            invalid("1"),
+            5,
+        ),
+        // `//` in the source: its escape prefix is truthy-filtered (one step,
+        // not two), and its left side is pulled by demand.
+        (
+            "[true,false]",
+            "path(reduce (((.[] | . and true), error(\"x\")) // 9) as $i (.; stderr))",
+            String::new(),
+            format!("[true,false]{}", e("x")),
+            5,
+        ),
+        (
+            "[1,2,3]",
+            "path(reduce ((.[]|stderr|.+0) // 9) as $i (.; if $i==2 then error(\"u\") else . end))",
+            String::new(),
+            format!("12{}", e("u")),
+            5,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, want_code, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout, want_out, "{filter}");
+        assert_eq!(stderr, want_err, "{filter}");
+    }
+
+    // `inputs` stays on the lazy value-mode producer: one document per
+    // demand, the rest still readable afterwards.
     let (stdout, stderr, code) = run_jq_full(
-        &["-c", ". as $x | path(foreach (.[] | stderr) as $i (0; $x))"],
-        Some("[1,2,3]"),
+        &[
+            "-nc",
+            "[try path(foreach inputs as $i (.; error(\"u\"))) catch .], input",
+        ],
+        Some("1 2 3"),
     )?;
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "");
-    assert!(
-        stderr.starts_with("123"),
-        "known divergence from jq's own single write -- see this test's doc comment; stderr: {stderr:?}"
-    );
-    assert!(
-        stderr.contains("Invalid path expression with result"),
-        "stderr: {stderr:?}"
-    );
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"u\"]\n2\n");
     Ok(())
 }
 
@@ -39531,13 +39752,13 @@ fn fold_source_bounded_generator_stays_bounded_1872() -> Result<()> {
     Ok(())
 }
 
-/// #1872: `resolve_fold_source` now takes a navigating source's values from
-/// `resolve_node`'s own branches, which makes a *short* branch prefix a wrong
+/// #1872: `drive_fold_source` takes a navigating source's values from the
+/// resolver's own branches, which makes a *short* branch prefix a wrong
 /// answer rather than merely a wrong error message. Several arms below that
 /// call launder an `Err` into a truncated `Ok` -- `Expr::Optional`'s blanket
-/// arm, `Expr::Label` on a matching break, a satisfied bound -- and none of
-/// them is covered by the `Err(_)` fallback. Each case's value count is
-/// captured from jq 1.7.1.
+/// arm, `Expr::Label` on a matching break, a satisfied bound -- so their
+/// values are a fold's values. Each case's value count is captured from jq
+/// 1.7.1.
 #[test]
 fn fold_source_laundered_short_prefix_value_counts_1872() -> Result<()> {
     for (input, filter, want, why) in [
@@ -39567,15 +39788,15 @@ fn fold_source_laundered_short_prefix_value_counts_1872() -> Result<()> {
     Ok(())
 }
 
-/// #1872: a fold source that produces a *trackable* branch falls back to
-/// #1467's two-pass shape instead of reusing the resolved values, because
-/// jq's own fold then clobbers its path register and refuses to emit at all
-/// (#2031). These pin the fallback: stdout stays empty and the exit code
-/// stays 5, exactly as in jq — only the *message* differs, which is #2031's
-/// divergence and not this one's.
+/// #1872/#2031: a fold source that produces a *trackable* branch seeds that
+/// step's register from the element's own path, so jq's own fold clobbers
+/// its path register and refuses to emit at all. These pin the refusal:
+/// stdout stays empty and the exit code stays 5, exactly as in jq — only the
+/// *message* differs, which is #2031's divergence and not this one's.
 ///
-/// This is the arm that randomised differential fuzzing against jq 1.7.1
-/// added: without it, eleven of four thousand generated folds streamed a
+/// This is the shape randomised differential fuzzing against jq 1.7.1
+/// caught: an earlier attempt that streamed the resolved values without the
+/// per-step register let eleven of four thousand generated folds stream a
 /// prefix jq never streams. No golden can pin it, since a golden compares
 /// stderr byte-for-byte on a failing case and the message diverges.
 #[test]

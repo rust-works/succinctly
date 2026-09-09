@@ -472,7 +472,7 @@ fn to_owned_at_depth<V: DocumentValue>(
         // #2286: `decode_failure`, not `new` -- same uncatchable class as
         // every other `StandardJson::Error`/`is_error()` site this issue
         // fixed (confirmed live: this exact generic-evaluator `to_owned_at_depth`
-        // is what `resolve_fold_source`/`reduce`'s fold-source path calls,
+        // is what `drive_fold_source`/`reduce`'s fold-source path calls,
         // so `[1, xyz123] | try add catch "caught"` stayed wrongly catchable
         // until this arm was retagged too).
         Err(EvalError::decode_failure(

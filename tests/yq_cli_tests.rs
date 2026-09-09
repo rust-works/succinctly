@@ -31173,7 +31173,7 @@ fn test_runaway_recursion_errors_cleanly_in_yq_mode_1371() -> Result<()> {
     Ok(())
 }
 
-/// #1872 gates `resolve_fold_source`'s single tracked evaluation on
+/// #1872 gates `drive_fold_source`'s single tracked evaluation on
 /// `EvalTag::Jq`. Real yq's lexer rejects `reduce`, `foreach` *and* `path`
 /// outright (confirmed live against yq v4.53.3), so yq mode has no oracle to
 /// check a fold's values against, and `resolve_index_expr`'s yq-only

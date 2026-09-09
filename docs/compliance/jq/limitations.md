@@ -798,13 +798,15 @@ blames. That is the same catch-all wording every unresolvable filter already get
 is the general message-fidelity gap covered above, not a fold-specific one.
 
 **Fixed by [#1467](https://github.com/rust-works/succinctly/issues/1467),
-[#1872](https://github.com/rust-works/succinctly/issues/1872) and
-[#2031](https://github.com/rust-works/succinctly/issues/2031):** the fold's **source
+[#1872](https://github.com/rust-works/succinctly/issues/1872),
+[#2031](https://github.com/rust-works/succinctly/issues/2031) and
+[#2235](https://github.com/rust-works/succinctly/issues/2235):** the fold's **source
 expression** is now evaluated the same way jq evaluates it — `resolve_reduce`/
-`resolve_foreach` route the source through `resolve_fold_source`, which resolves it with
-tracking on via `resolve_node`, but only when the source's own AST contains a real
-navigation step (`Field`/`Index`/`Slice`/`Iterate`) anywhere — checked via `any_subexpr` —
-since only those can ever reach one of `resolve_node`'s raising arms in the first place. jq
+`resolve_foreach` route the source through `drive_fold_source`, which resolves it with
+tracking on via `resolve_node_sink`, one element at a time as the fold consumes them, but
+only when the source's own AST contains a real navigation step
+(`Field`/`Index`/`Slice`/`Iterate`) anywhere — checked via `any_subexpr` — since only those
+can ever reach one of `resolve_node`'s raising arms in the first place. jq
 evaluates the source "with tracking on" and fails only where it navigates *through* an
 untrackable value, so `reduce (1,2) / (.a) / (.[]) / (keys) / (range(2)) as $i (0; $x)` all
 resolve in both, and `reduce (keys[]) as $k (.; .)` raises "near attempt to iterate through"
@@ -812,18 +814,22 @@ in both too (live-verified against jq 1.7.1, both the `path(...)` read side and 
 `(reduce ...) = 9` write side).
 
 A source with no navigation step (`range(n)`, `keys`, a literal, or critically
-`input`/`inputs`) skips the resolver entirely and its values come from
-`eval_owned_expr_fork` as they always did. That gate is not an optimization: an earlier,
-ungated version of #1467's check evaluated an `input`/`inputs`-sourced fold *twice* — once
-for the check, once for the real value — silently desynchronizing the two evaluations'
-shared input-reader position, so the fold ran against the *second* input document while
-reporting an error that named the first (`reduce input as $x (0; $x)` over `10\n20\n30\n`:
-real jq names `10`, the ungated version named `20`). Caught in code review before merging.
+`input`/`inputs`) skips the resolver entirely and is driven by value through
+`eval_each_owned`, the same demand-driven producer the value evaluator uses. That gate is
+not an optimization: an earlier, ungated version of #1467's check evaluated an
+`input`/`inputs`-sourced fold *twice* — once for the check, once for the real value —
+silently desynchronizing the two evaluations' shared input-reader position, so the fold ran
+against the *second* input document while reporting an error that named the first (`reduce
+input as $x (0; $x)` over `10\n20\n30\n`: real jq names `10`, the ungated version named
+`20`). Caught in code review before merging. Since #2235 the gate is also what keeps
+`inputs` lazy: the resolver's leaf collects a generator before delivering it, where
+value-mode `each_inputs` pulls one document per demand (`[try path(foreach inputs as $i (.;
+error("u"))) catch .], input` over `1 2 3` answers `["u"]` then `2` in both).
 
 A source that *does* navigate is resolved **once**, in jq mode, and — when every resolved
 branch is *untracked* — those branches' values are the fold's real values; `Keep::AtMost`
 makes `resolve_leaf`'s general case keep every output rather than #987's first one. That
-closes both of #1467's original costs:
+closed both of #1467's original costs:
 
 1. A navigating source's outputs fire their side effects exactly as often as in jq: `. as $x
    | path(reduce (.[] | stderr) as $i (0; $x))` on `[1]` writes `1` once in both (measured
@@ -831,16 +837,36 @@ closes both of #1467's original costs:
    two-pass shape wrote it twice.
 2. `foreach` keeps the outputs a source legitimately streamed before the element that
    raises: `path(foreach (1,2,keys[]) as $k (.; .))` on `{"a":1}` streams `[]` twice before
-   raising, matching jq. The escape is carried out of `resolve_fold_source` *with* those
-   values and applied by `resolve_foreach`'s own per-element loop afterwards, exactly as it
-   already did for an ordinary `Partial` source. `reduce`'s output is single-shot, so it
-   still raises with nothing.
+   raising, matching jq. The escape is applied after the drive, once every element before
+   it has been folded. `reduce`'s output is single-shot, so it still emits nothing — but
+   since #2235 its prefix steps run first, as jq's do: `path(reduce (1,2,error("s")) as $i
+   (.; stderr))` on `{"a":1}` writes the state twice and then raises `s` in both.
 
 Keeping every output also made the check itself accurate. A stop-after-first resolver could
 miss the navigation entirely when it happened on a later output of the same leaf:
 `path(foreach (range(3) | (., if . == 2 then .a else empty end)) as $k (.; .))` on `{"a":1}`
 reported the untracked `Cannot index number with string "a"` where jq reports the tracked
 `near attempt to access element "a" of 2`; both now agree.
+
+**Since [#2235](https://github.com/rust-works/succinctly/issues/2235) the source is pulled by
+demand, and the resolver's stream is the fold's stream.** Until then `drive_fold_source`'s
+predecessor collected every resolved branch before the fold ran a single step, so a source's
+side effects all fired before the first step could refuse: `. as $x | path(foreach (.[] |
+stderr) as $i (0; $x))` on `[1,2,3]` wrote `123` where jq writes `1` once and raises on the
+first step's own untrackable emission. Three things had to move together. The source is
+resolved through `resolve_node_sink`, each element folded inside the sink before the next is
+pulled; the folds themselves emit through a sink, so `path()`'s terminal check
+(`resolve_terminal`) refuses the first untracked output before the fold pulls again; and the
+old fallback that re-evaluated an *erroring* source untracked (any escape that was neither
+`Halt` nor an untracked-navigation error) is gone. That fallback was itself the larger
+divergence: it double-fired side effects (`path(foreach ((.[]|stderr|empty), error("s")) as
+$i (.; .))` on `[1,2]` wrote `1212` for jq's `12`) and, by discarding the per-step register,
+turned a jq refusal into an answer — `[label $out | path(foreach (.[], break $out) as $i (.;
+.))]` on `[1,2]` printed `[[],[]]` at exit 0 where jq raises "Invalid path expression with
+result [1,2]", a write-side hazard. Every escape the resolver raises is now the fold's
+escape, which holds the resolver's arms to a stricter contract: an arm that escapes must
+already have delivered everything jq would have bound (`Expr::Alternative` forwarded its
+left side's escape prefix *unfiltered*, falsy branches included, and was fixed alongside).
 
 A *trackable* branch means the source is itself a path expression in jq's eyes, and — since
 [#2031](https://github.com/rust-works/succinctly/issues/2031) — that is no longer treated as
@@ -874,22 +900,25 @@ Four residual divergences remain in this area:
   on `{"a":1,"b":{"c":2}}` raises `Invalid path expression near attempt to access element "a"
   of {"a":1,"b":{"c":2}}` in jq; succinctly prints `["a"]`. `.a` genuinely navigates (moving
   jq's real register) before `tostring` — not itself a path primitive — discards that
-  provenance from the *source element's own* final value; `resolve_fold_source` only inspects
+  provenance from the *source element's own* final value; `drive_fold_source` only inspects
   each element's final `PathBranch.trackable`, so a source like this looks exactly like an
   ordinary computed value to it. Distinct from — and not closed by — #2031's fix, confirmed via
   `git stash` A/B against the pre-#2031 build on `main` too. Tracked as
   [#2159](https://github.com/rust-works/succinctly/issues/2159).
 
-- **An ordinary-error source is still evaluated twice, and now every output rather than just
-  the first.** `resolve_fold_source` treats only `Halt` and
-  `EvalError::is_untracked_navigation_error` as answers it can return; any *other* escape —
-  an ordinary runtime `Error`, a `break` — falls back to `eval_owned_expr_fork`, discarding
-  what the resolver produced, because those escapes have always been the untracked
-  evaluator's to report and the resolver's `Ok` prefix is only guaranteed to be *no longer*
-  than jq's, not equal to it. So `path(reduce ((.[] | stderr), error("x")) as $i (0; $x))`
-  on `[1,2,3]` writes `123` in jq and `123123` here. Fixing it means depending on the
-  resolver's prefix for erroring sources too, which is the stronger invariant this
-  deliberately does not yet assume.
+- **A generator the resolver reaches only through an eager arm is still collected before
+  its first element is folded.** `drive_fold_source` pulls by demand only as far as
+  `resolve_node_sink`'s lazy arms reach; `resolve_leaf`'s general case, an `if`/`select`
+  condition (`eval_owned_multi_keep_partial`), an `as` source (`resolve_bind_source`) and a
+  fold nested inside the source all materialize their own generator first. So `path(foreach
+  (inputs | .a) as $i (.; .))` drains every remaining input document where jq consumes one,
+  and `path(reduce (if (.[]|stderr) then 1 else 2 end) as $i (.; error("u")))` on
+  `[1,2,3]` writes `123` for jq's `1`. Same cause as [#2466](https://github.com/rust-works/succinctly/pull/2466)'s
+  own left-out list: `resolve_leaf` has no sink form. The consumer side has the same edge:
+  `path()` itself collects every path before its own consumer sees one, so a bound *outside*
+  it cannot stop the fold (`[limit(1; path(foreach (1 as $x ?// $y | (stderr|1)) as $v (.;
+  .)))]` is `[[],[]]` with two writes in jq — its `limit` break is retried by the source's
+  `?//` and the retried output lands past the bound — and `[[]]` with one write here).
 - **`E[K]` evaluates its target once where jq re-runs it per key.** jq compiles `E[K]` as
   `K as $k | E | .[$k]`, so a side effect in `E` fires once per output of `K`; here it fires
   once total — `[(.[] | stderr)[("a","b")]?]` on `[1,2]` writes `1212` in jq and `12` here.
@@ -900,8 +929,8 @@ Four residual divergences remain in this area:
   `foreach` *and* `path` outright (confirmed live against yq v4.53.3), so `succinctly yq`
   has no oracle for a fold's values, and `resolve_index_expr`'s yq-only `scalar_noop` arm
   would hand the *unchanged target* to the fold where the evaluator raises. `succinctly yq`
-  therefore still path-checks with `Keep::First` and takes its values from
-  `eval_owned_expr_fork`; only the jq-mode value reuse is new.
+  therefore still path-checks with `Keep::First` and then drives its values by value
+  through `eval_each_owned`; only the jq-mode value reuse is new.
 
 ## Duplicate object keys collapse, except under `--preserve-input`
 
@@ -4628,7 +4657,7 @@ functions) is what `test_parity_foreach_reduce_init_fork_source_reads_ambient_in
 
 The **third** evaluator — the path-context evaluator's `resolve_reduce`/`resolve_foreach`
 (`src/jq/eval.rs`) — is not part of that shared core and is not consistent with it here: its
-own SOURCE resolution (`resolve_fold_source`, added by #2031 for path-trackability, not for
+own SOURCE resolution (`drive_fold_source`, added by #2031 for path-trackability, not for
 this divergence) already re-runs once per INIT fork, inside the per-branch loop, using the
 real document every time rather than a cached value — architecturally the closest thing in
 this codebase to what a jq-matching fix would need, but it does not inject a synthetic
