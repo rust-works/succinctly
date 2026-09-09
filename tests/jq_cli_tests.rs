@@ -20454,6 +20454,40 @@ fn test_resolve_node_alternative_comma_three_siblings_mixed_980() -> Result<()> 
     Ok(())
 }
 
+/// #2235: the escape prefix of `//`'s left side is filtered by truthiness
+/// exactly like its exhausted output. The eager `Expr::Alternative` arm
+/// forwarded `left`'s `Err` with its prefix *unfiltered* (`resolve_node(..)?`),
+/// so a consumer that launders the escape into a short `Ok` -- `?`, a
+/// matching `label`/`break` -- saw a falsy branch jq's `//` never emits.
+/// Invisible while `resolve_fold_source` re-evaluated an erroring source
+/// untracked, and a wrong-fold hazard the moment the resolver's own prefix
+/// is trusted instead. All three captured from jq 1.7.1.
+#[test]
+fn test_resolve_node_alternative_escape_prefix_is_truthy_filtered_2235() -> Result<()> {
+    for (input, filter, want) in [
+        (
+            "[true,false]",
+            "[path(((.[], error(\"x\")) // 9)?)]",
+            "[[0]]",
+        ),
+        (
+            "[false,true]",
+            "[path(((.[], error(\"x\")) // 9)?)]",
+            "[[1]]",
+        ),
+        (
+            "[true,false,true]",
+            "[label $o | path(((.[], break $o) // 9))]",
+            "[[0],[2]]",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(code, 0, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "{filter}");
+    }
+    Ok(())
+}
+
 /// #980 boundary: a later sibling that is truthy but *not* path-shaped
 /// still raises -- the fix only lets *falsy* siblings through `//`'s
 /// filter uncontested, it doesn't exempt every non-path-shaped value.
