@@ -32183,4 +32183,298 @@ mod tests {
             other => panic!("expected the walk's root to escape, got: {other:?}"),
         }
     }
+
+    /// Drive `filter` through the sink evaluator against `json`, returning
+    /// every output that reached the sink plus the terminating control.
+    ///
+    /// [`eval_each_with_cursor_using`] is the only door into
+    /// [`eval_each_generic`], where every `each_*_generic` arm #2180 added
+    /// lives; the eager `eval`/`eval_with_cursor` entries reach those arms'
+    /// *eager* twins instead, so a test that wants the sink arm has to come
+    /// in this way. Same shape as [`drive_each`] above, keeping the outputs
+    /// as well as the count.
+    fn drive_each_sink<S: EvalSemantics>(
+        json: &[u8],
+        filter: &str,
+    ) -> (Vec<OwnedValue>, Option<Control>) {
+        let expr = parse(filter).expect("filter parses");
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let mut out = Vec::new();
+        let mut on_value = |result: GenericResult<_>| {
+            let _ = push_generic_owned_values(result, &mut out);
+            true
+        };
+        let control = eval_each_with_cursor_using::<S, _>(&expr, cursor, &mut on_value);
+        (out, control)
+    }
+
+    /// [`drive_each_sink`] without a cursor: [`eval_each_generic`] called
+    /// directly with `cursor: None`, which is the only way a
+    /// `GenericItem::One`/`GenericResult::Many` (the cursor-less shapes of
+    /// `GenericItem::OneCursor`/`ManyCursor`) reaches a sink arm at all --
+    /// every public entry point that drives this evaluator hands it a live
+    /// document cursor.
+    fn drive_each_sink_cursorless(json: &[u8], filter: &str) -> (Vec<OwnedValue>, Flow) {
+        let expr = parse(filter).expect("filter parses");
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let mut out = Vec::new();
+        let flow = eval_each_generic::<JqSemantics, _>(&expr, value, false, None, &mut |item| {
+            let _ = push_generic_owned_values(generic_item_to_result(item), &mut out);
+            Demand::Continue
+        });
+        (out, flow)
+    }
+
+    /// #2180 coverage: every sink arm this issue added that has to pull one
+    /// item out of the stream shares a failure mode -- a `map(f)` operand
+    /// arrives still lazy (`GenericItem::LazySeq`), and forcing it
+    /// (`generic_item_into_owned` / `generic_item_truthiness`) is where its
+    /// error first appears. Each row below is a different arm's own
+    /// `Err(control) => stop_with_escape(..)`; before #2180 the same filters
+    /// took the eager fallback, so none of these arms existed.
+    ///
+    /// Captured live against jq 1.7.1 (input `{"x":{"a":1},"k":"a"}`): every
+    /// row exits 5 with `number (1) and number (0) cannot be divided because
+    /// the divisor is zero`, and `succinctly jq` matches on all of them.
+    #[test]
+    fn each_sink_arms_raise_a_lazy_seq_materialization_failure_2180() {
+        let json: &[u8] = br#"{"x":{"a":1},"k":"a"}"#;
+        for (arm, filter) in [
+            (
+                "drive_foreach_source_generic",
+                "foreach map(1/0) as $x (0; .+1)",
+            ),
+            ("each_if_generic's cond", "if map(1/0) then 1 else 2 end"),
+            (
+                "take_at_index_generic's skipped item",
+                "nth(1; map(1/0), 2)",
+            ),
+            ("each_object_entries_generic's key slot", "{(map(1/0)): 1}"),
+            ("each_object_value_generic's value slot", "{a: map(1/0)}"),
+            (
+                "each_object_entries_generic's escaping value slot",
+                r#"{("a"): (1/0)}"#,
+            ),
+            ("each_boolean_generic's operand", ".x | (key and map(1/0))"),
+        ] {
+            match drive_each_sink::<JqSemantics>(json, filter) {
+                (_, Some(Control::Error(e))) => assert!(
+                    e.message.contains("divided"),
+                    "[{arm}] unexpected message: {}",
+                    e.message
+                ),
+                (out, control) => {
+                    panic!("[{arm}] expected a raise, got outputs {out:?} and control {control:?}")
+                }
+            }
+        }
+    }
+
+    /// #2180 coverage: [`each_nth_generic`]'s own `classify_nth_n` rejection,
+    /// the one thing its `fanout_arg_each_generic` body decides before
+    /// delegating to [`take_at_index_generic`]. jq 1.7.1 exits 5 with `nth
+    /// doesn't support negative indices` (captured live), and `succinctly jq`
+    /// matches.
+    #[test]
+    fn each_nth_generic_rejects_a_negative_index_2180() {
+        match drive_each_sink::<JqSemantics>(b"null", "nth(-1; 1,2)") {
+            (_, Some(Control::Error(e))) => assert!(
+                e.message.contains("negative indices"),
+                "unexpected message: {}",
+                e.message
+            ),
+            (out, control) => {
+                panic!("expected a raise, got outputs {out:?} and control {control:?}")
+            }
+        }
+    }
+
+    /// #2180 coverage: [`each_index_expr_generic`]'s per-key arms. The key
+    /// generator's outputs arrive as whatever shape the key expression
+    /// produced, and each shape has its own `to_owned_key_shape*` conversion
+    /// -- `OneCursor` when the key is read from the document (the CLI's
+    /// shape, since every public entry hands this evaluator a cursor), `One`
+    /// when it is not.
+    ///
+    /// Both spellings' happy path is `{"k":"a","x":{"a":1}} | .x[.k]` = `1`
+    /// in jq 1.7.1 (captured live); both raise on a key whose bytes do not
+    /// decode (#1247), which no `?` suppresses (#1620).
+    #[test]
+    fn each_index_expr_generic_indexes_by_a_document_key_2180() {
+        let good: &[u8] = br#"{"k":"a","x":{"a":1}}"#;
+        let undecodable_key: &[u8] = b"{\"k\":\"\xff\xfe\",\"x\":{\"a\":1}}";
+
+        let (out, control) = drive_each_sink::<JqSemantics>(good, ".x[.k]");
+        assert_eq!(out, vec![OwnedValue::from_number_literal("1")]);
+        assert!(control.is_none(), "unexpected control: {control:?}");
+
+        let (out, flow) = drive_each_sink_cursorless(good, ".x[.k]");
+        assert_eq!(out, vec![OwnedValue::from_number_literal("1")]);
+        assert!(matches!(flow, Flow::Exhausted), "expected the walk to exhaust");
+
+        match drive_each_sink::<JqSemantics>(undecodable_key, ".x[.k]") {
+            (_, Some(Control::Error(e))) => assert!(
+                e.is_decode_failure(),
+                "expected a decode failure, got: {e:?}"
+            ),
+            (out, control) => {
+                panic!("expected a raise, got outputs {out:?} and control {control:?}")
+            }
+        }
+        match drive_each_sink_cursorless(undecodable_key, ".x[.k]") {
+            (_, Flow::Escaped(Control::Error(e))) => assert!(
+                e.is_decode_failure(),
+                "expected a decode failure, got: {e:?}"
+            ),
+            (out, _) => panic!("expected a decode-failure raise, got outputs {out:?}"),
+        }
+    }
+
+    /// #2180 coverage: [`each_object_entries_generic`]'s two remaining
+    /// computed-key verdicts, the ones its `cannot_use_as_object_key` raise
+    /// (already covered) is the third of.
+    ///
+    /// yq stringifies a scalar key (`yq_object_key_stringify`): `{(1): 2}` is
+    /// `{"1":2}` in yq v4.53.3, captured live, and `succinctly yq` matches.
+    /// jq mode has no such conversion, so an ambient `optional` makes the
+    /// key contribute nothing instead: `{"k":"a"} | {([.k]): 1}?` is empty
+    /// with exit 0 in jq 1.7.1, also captured live (spelled `[.k]` rather
+    /// than a literal `[...]`, which jq constant-folds into a *compile*
+    /// error before the filter ever runs).
+    #[test]
+    fn each_object_entries_generic_computed_key_verdicts_2180() {
+        let (out, control) = drive_each_sink::<YqSemantics>(br#"{"x":1}"#, "{(1): 2}");
+        assert_eq!(
+            out,
+            vec![OwnedValue::Object(IndexMap::from([(
+                "1".to_string(),
+                OwnedValue::from_number_literal("2")
+            )]))]
+        );
+        assert!(control.is_none(), "unexpected control: {control:?}");
+
+        let (out, control) = drive_each_sink::<JqSemantics>(br#"{"k":"a"}"#, "{([.k]): 1}?");
+        assert!(out.is_empty(), "expected no output, got {out:?}");
+        assert!(control.is_none(), "unexpected control: {control:?}");
+    }
+
+    /// #2180 review coverage: [`fanout_arg_generic`]'s three
+    /// buffered-first/decode-failure exits, all on the *eager* `limit`/`nth`
+    /// route (`eval_single` -> `eval_limit_generic`), which is what the
+    /// library's own `eval` entry point takes -- the CLI's sink route reaches
+    /// [`fanout_arg_each_generic`] instead.
+    ///
+    /// Row 1 is the argument's own decode failure: `n` arrives as a still-lazy
+    /// `map(f)` whose materialization errors. Rows 2 and 3 are the buffered
+    /// single-output fast path (#1531): with two `n` values, the first body
+    /// result is buffered and flushed on the second iteration, so an
+    /// undecodable value in it is reported from the *flush* rather than from
+    /// the push that produced it, and an undecodable value in the second
+    /// result is reported from the push.
+    ///
+    /// jq 1.7.1, live: `limit(map(1/0); 1,2)` exits 5 with the divide error,
+    /// and `{"a":1,"b":2} | limit((1,2); .a,.b)` is `1, 1, 2` -- the
+    /// well-formed shape rows 2 and 3 corrupt one value of.
+    #[test]
+    fn fanout_arg_generic_reports_argument_and_buffered_body_failures_2180() {
+        let json: &[u8] = br#"{"a":1,"b":2}"#;
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let expr = parse("limit(map(1/0); 1,2)").expect("parses");
+        assert!(
+            matches!(eval(&expr, value), GenericResult::Error(ref e) if e.message.contains("divided")),
+            "an undecodable `n` argument must raise"
+        );
+
+        // `.a` undecodable: the buffered first result fails on its flush.
+        let first_bad: &[u8] = b"{\"a\":\"\xff\xfe\",\"b\":2}";
+        // `.b` undecodable: the first flush succeeds and the second push fails.
+        let second_bad: &[u8] = b"{\"a\":1,\"b\":\"\xff\xfe\"}";
+        for (label, json) in [("buffered first", first_bad), ("second push", second_bad)] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let expr = parse("limit((1,2); .a,.b)").expect("parses");
+            match eval_with_cursor(&expr, cursor) {
+                GenericResult::Error(e) | GenericResult::Partial(_, Control::Error(e)) => {
+                    assert!(e.is_decode_failure(), "[{label}] expected a decode failure: {e:?}");
+                }
+                other => panic!("[{label}] expected a raise, got: {other:?}"),
+            }
+        }
+    }
+
+    /// #2180 review coverage: [`nth_with_n_generic`]'s "nothing was wanted and
+    /// the walk escaped" exit -- the eager `nth` route's own tail, reached
+    /// when `n` is past everything the source produced *and* the source ended
+    /// in a control. jq 1.7.1, live: `nth(5; 1, error("boom"))` exits 5 with
+    /// `boom`.
+    ///
+    /// The sink route ([`each_nth_generic`], #2180 WP1) is what a CLI query
+    /// takes now, so this exit is reachable only through the library's own
+    /// eager `eval` entry point.
+    #[test]
+    fn nth_with_n_generic_raises_when_nothing_was_captured_2180() {
+        let json: &[u8] = br#"{"a":1}"#;
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+        let expr = parse(r#"nth(5; 1, error("boom"))"#).expect("parses");
+        assert!(
+            matches!(eval(&expr, value), GenericResult::Error(ref e) if e.message.contains("boom")),
+            "an escaping source with nothing captured must raise"
+        );
+    }
+
+    /// #2180 review coverage (indirect): the *eager* `select` and `//` arms
+    /// that the sink evaluator's own new arms ([`each_select_generic`],
+    /// `Expr::Alternative`'s bridge) took over for every CLI query -- they are
+    /// still what the library's non-streaming `eval` entry point runs, and
+    /// each has one control-carrying exit no sink test can reach any more.
+    ///
+    /// `select`'s condition escaping is `push_generic_truthiness`'s own
+    /// `GenericResult::Error` arm; `//`'s is its `Break` arm, which escapes
+    /// the operator instead of selecting a branch. jq 1.7.1, live:
+    /// `select(1/0)` exits 5 with the divide error, and
+    /// `label $out | ((break $out) // 1)` is empty with exit 0.
+    #[test]
+    fn eager_select_and_alternative_control_exits_2180() {
+        let json: &[u8] = br#"{"a":1}"#;
+        let index = JsonIndex::build(json);
+        let value = index.root(json).value();
+
+        let expr = parse("select(1/0)").expect("parses");
+        assert!(
+            matches!(eval(&expr, value.clone()), GenericResult::Error(ref e) if e.message.contains("divided")),
+            "an erroring condition must escape `select`"
+        );
+
+        let expr = parse("(break $out) // 1").expect("parses");
+        assert!(
+            matches!(eval(&expr, value), GenericResult::Break(_)),
+            "a `break` must escape `//` rather than selecting its right side"
+        );
+    }
+
+    /// #2180 review coverage: [`bridge_to_each_owned_flow`]'s own
+    /// materialization failure. Every sink arm that has no lazy twin hands its
+    /// expression to `eval.rs` through this bridge, and the bridge has to own
+    /// the whole ambient value to do it -- so a document that cannot be
+    /// materialized at all (#1247) fails here, before `eval_each_owned` ever
+    /// runs. `?` does not suppress it (#1620), which is the second assertion.
+    #[test]
+    fn bridge_to_each_owned_flow_raises_on_an_undecodable_document_2180() {
+        let json: &[u8] = b"{\"a\":\"\xff\xfe\"}";
+        for filter in ["-(.a)", "-(.a)?"] {
+            match drive_each_sink::<JqSemantics>(json, filter) {
+                (_, Some(Control::Error(e))) => assert!(
+                    e.is_decode_failure(),
+                    "[{filter}] expected a decode failure, got: {e:?}"
+                ),
+                (out, control) => {
+                    panic!("[{filter}] expected a raise, got outputs {out:?} and control {control:?}")
+                }
+            }
+        }
+    }
 }
