@@ -38501,6 +38501,54 @@ fn test_as_binding_keeps_the_input_identity_2563() -> Result<()> {
     Ok(())
 }
 
+/// #2072's two node-vs-detached fallback edges for a bound variable's
+/// identity, both reached only when `$x`'s own `BindOrigin` is `None` (a
+/// bind source that never carried a cursor to begin with) or names a node
+/// the current walk cannot resolve against -- as opposed to
+/// [`test_as_binding_keeps_the_input_identity_2563`]'s `. as $x`, whose
+/// origin is always `Some(BindOrigin::Node)` naming a node in the very
+/// document being walked.
+///
+/// `. // 1` is the bind source that produces the first case: `Alternative`
+/// has no native `eval_single` arm, so it bridges through the full
+/// evaluator's own fresh reindex, and that bridge always converts its
+/// result to a plain `GenericResult::Owned` -- discarding the cursor.
+/// `$x`'s `BindOrigin` therefore ends up `None`, exercising
+/// `eval_single`'s `Expr::TrackedVar` arm's `None` branch and
+/// `bind_origin_cursor`'s `_ => None` fallback. With no origin to place it,
+/// `bound_var_identity` falls back to comparing `$x`'s frozen value against
+/// the current input by value: here they're equal (both the whole
+/// document), so `$x` stands at the *current* position -- the document
+/// root, which has no key/path of its own. Captured live against Homebrew
+/// yq v4.53.3 (nothing for `key`, `[]` for `path` -- yq's own
+/// `Alternative` has the identical no-native-position behavior, confirmed
+/// by hand since this shape isn't part of the pinned golden fixtures).
+///
+/// `.c.nonexistent` (an absent field) produces the second case within a
+/// walk that already resolved `$x`'s origin to a real node (`.a.b`, bound
+/// before the absent read): the walk's own current position has detached to
+/// `PathNode::Absent`, so `path_context_step_generic`'s search for a live
+/// ancestor to resolve `$x`'s origin against has to climb past it -- still
+/// finding the document root, which is where `$x`'s `.a.b` origin resolves
+/// correctly, so `$x` reports its own true position rather than falling
+/// back. Captured live against yq v4.53.3.
+#[test]
+fn test_bound_var_falls_back_without_a_resolvable_origin_2072() -> Result<()> {
+    let doc = "a:\n  b: 1\nc: {}\n";
+    let args = &["-o", "json", "-I0"];
+    for (filter, expected) in [
+        ("(. // 1) as $x | $x | key", ""),
+        ("(. // 1) as $x | $x | path", "[]"),
+        (".a.b as $x | .c.nonexistent | $x | key", "\"b\""),
+        (".a.b as $x | .c.nonexistent | $x | path", "[\"a\",\"b\"]"),
+    ] {
+        let (output, code) = run_yq_stdin(filter, doc, args)?;
+        assert_eq!(code, 0, "`{filter}`: {output:?}");
+        assert_eq!(output.trim_end(), expected, "`{filter}`");
+    }
+    Ok(())
+}
+
 /// #2161's yq-mode gate. The `foreach` fold register fix lets a step whose
 /// accumulator is still the register's own value re-enter the register
 /// instead of refusing — which on the *write* side turns a refusal into a

@@ -6190,7 +6190,7 @@ mod tests {
         assert!(
             cursors.len() > 10,
             "the fixture must be big enough to be worth walking, got {}",
-            cursors.len()
+            cursors.len() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is a panic-message format argument for the #2072 pin itself, only evaluated if the assert's own condition is false (#2072)"
         );
 
         for c in &cursors {
@@ -6201,7 +6201,7 @@ mod tests {
             assert!(
                 back.same_node(c),
                 "id {id} re-resolved to bp {} instead of {}",
-                back.node_id(),
+                back.node_id(), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is a panic-message format argument for the #2072 pin itself, only evaluated if the assert's own condition is false (#2072)"
                 id
             );
             assert_eq!(back.node_id(), id, "the round trip must be idempotent");
@@ -6282,7 +6282,7 @@ mod tests {
                 c.document_token(),
                 token,
                 "bp {} disagreed about its own document",
-                c.node_id()
+                c.node_id() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is a panic-message format argument for the #2072 pin itself, only evaluated if the assert's own condition is false (#2072)"
             );
         }
 

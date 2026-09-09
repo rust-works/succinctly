@@ -81270,7 +81270,7 @@ mod tests {
             Some(node.clone()),
         );
         let Expr::TrackedVar(var) = &navigated else {
-            panic!("expected a TrackedVar, got {navigated:?}");
+            panic!("expected a TrackedVar, got {navigated:?}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the #2072 pin itself, only formatted if the let-else pattern fails to match (#2072)"
         };
         assert_eq!(var.origin, Origin::Untracked);
         assert_eq!(var.node, Some(node.clone()));
@@ -81281,7 +81281,7 @@ mod tests {
         let passthrough =
             substitute_bound_var_from(&parse(".").unwrap(), &body, "y", &root, Some(node.clone()));
         let Expr::TrackedVar(var) = &passthrough else {
-            panic!("expected a TrackedVar, got {passthrough:?}");
+            panic!("expected a TrackedVar, got {passthrough:?}"); // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the #2072 pin itself, only formatted if the let-else pattern fails to match (#2072)"
         };
         assert_eq!(var.origin, Origin::Snapshot);
         assert_eq!(var.node, Some(node));
@@ -81302,7 +81302,7 @@ mod tests {
         // | $x)` is `[]` in jq 1.7.1.
         match path_of(passthrough) {
             QueryResult::Owned(OwnedValue::Array(path)) => assert!(path.is_empty()),
-            other => panic!("expected [], got {other:?}"),
+            other => panic!("expected [], got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the #2072 pin itself, only formatted if the match doesn't hit the expected arm above (#2072)"
         }
         // The same value, untracked, is a literal to the resolver whatever
         // node it carries -- refused, not certified by value equality.
@@ -81318,7 +81318,7 @@ mod tests {
         );
         match path_of(untracked_root) {
             QueryResult::Error(e) => assert!(e.is_invalid_path_expression()),
-            other => panic!("expected a refusal, got {other:?}"),
+            other => panic!("expected a refusal, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the panic message for the #2072 pin itself, only formatted if the match doesn't hit the expected arm above (#2072)"
         }
     }
 
