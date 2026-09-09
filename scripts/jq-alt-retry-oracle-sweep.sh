@@ -82,12 +82,18 @@ else
 fi
 echo "oracle: $JQ ($("$JQ" --version)), succinctly: $SUCC" >&2
 
-# 6 outer short-circuiting consumers, __W__ substituted with each wrapper
+# 7 outer short-circuiting consumers, __W__ substituted with each wrapper
 # construct below.
+#
+# `limit(3; ...)` is the one that asks for more than a single output, added by
+# #2180 WP3's review: every other consumer here is satisfied by the first
+# value, so none of them can reach a `foreach`'s *second* INIT fork, which is
+# exactly where WP3's record-and-replay lost a retry.
 C_SHAPES=(
   'first(__W__)'
   'isempty(__W__)'
   'limit(1; __W__)'
+  'limit(3; __W__)'
   'nth(0; __W__)'
   'any(__W__; .)'
   'IN(__W__)'
@@ -153,12 +159,22 @@ W_ENTRIES=(
   # -- WP3: CLOSED. each_foreach (eval.rs) and each_foreach_generic
   #    (eval_generic.rs) drive the source through eval_each/eval_each_generic
   #    and each step's EXTRACT through eval_each_owned, over the one shared
-  #    fold loop foreach_fork; the sink's Demand::Stop is treated by
+  #    fold loop foreach_forks -- which, since WP3's review, both eager entry
+  #    points drive the same way too; the sink's Demand::Stop is treated by
   #    foreach's own ?// exactly as an escaping Control::Break is, with the
   #    same state threading -- so these rows must match jq now and any
   #    divergence here is unexpected by definition. UPDATE and INIT stay
   #    eager and are pinned as CLI rows instead (header note above). --
   'foreach-source::::foreach (__G__) as $v (0; .+$v; .)'
+  # #2180 WP3's review: a *later* INIT fork's own consumer stop has to reach
+  # the source bind just as the first fork's does, and an element a
+  # source-side `?//` re-offers must not be counted twice. WP3 drove the
+  # source once and replayed a recording for later forks, which failed both
+  # (`[1,3,101]` and `[1,6,7]` respectively); only the `limit(3; ...)`
+  # consumer above is unsatisfied early enough to see either.
+  'foreach-source-multi-init::::foreach (__G__, 2) as $v ((0,100); .+$v; .)'
+  'foreach-pattern-multi-init::::foreach (1, 2) as $x ?// $y ((0,100); .+1; .)'
+  'foreach-retry-then-replay::::foreach (__G__) as $v ((0, 5); if . == 0 then error("boom") else .+1 end; .)'
   # The pattern-position bind: __G__ does not appear (foreach's own `?//` is
   # the bind under test), so the three G variants generate three identical
   # cases per consumer. See the header note.

@@ -1520,8 +1520,9 @@ the reasoning behind each placement:
       analogy to `each_if`'s eager `cond`; both justifications were pre-#1519 and both are gone.
 
     **WP3 landed**, closing the last 18 sweep rows attributed to this issue. The sweep now runs
-    648 cases (WP3 added pattern-position and EXTRACT-position wrapper entries) at **0 unexpected,
-    0 known**, with `scripts/jq-fanout-oracle-sweep.sh` still 490/490. `eval.rs` gained
+    819 cases (WP3 added pattern-position and EXTRACT-position wrapper entries; its review added
+    a `limit(3; ...)` consumer and three multi-INIT-fork wrappers) at **0 unexpected, 0 known**,
+    with `scripts/jq-fanout-oracle-sweep.sh` still 490/490. `eval.rs` gained
     `each_foreach` and `eval_generic.rs` a native `each_foreach_generic`, both driving the source
     through `eval_each`/`eval_each_generic` one element at a time;
     `try_foreach_step_alternatives` now drives each step's EXTRACT through `eval_each_owned` and
@@ -1570,8 +1571,9 @@ the reasoning behind each placement:
       [`docs/compliance/jq/limitations.md`](../compliance/jq/limitations.md).
 
     **WP3's review** (`/code-review high` over its three commits) found two correctness defects,
-    a memory regression and a duplicated core. Both sweeps stay at 648/490, 0 unexpected / 0
-    known. Three findings, none of them about `?//` retry *policy*:
+    a memory regression and a duplicated core. Both sweeps stay green (819/490, 0 unexpected /
+    0 known); the six rows the new wrappers add all failed on the pre-review binary, which is
+    what makes them coverage rather than decoration. Three findings, none of them about `?//` retry *policy*:
 
     - **A stop can carry a reason, and a `Halt`'s reason has to survive it.** A driver that ends
       its drive because something escaped can only answer `Demand`, so it stashes the escape out
