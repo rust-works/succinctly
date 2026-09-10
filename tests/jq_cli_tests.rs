@@ -25761,6 +25761,17 @@ fn test_jq_cursor_transparent_fast_paths_empty_container_stray_comma_now_raises_
         ("{,}", "map(.)"),
         ("{,}", "paths"),
         ("{,}", r#"getpath(["a"])"#),
+        // The path domain reaches the same walks through
+        // `path_step_generic`'s own `PathNode::At` arms, which hold the
+        // container cursor just as the value-side arms do. Found by review
+        // of this fix's first draft: `{,} | path(.a)` answered `["a"]`
+        // while the bare `.a` already raised.
+        ("{,}", "path(.a)"),
+        ("{,}", "path(.[])"),
+        ("{,}", "[path(..)]"),
+        ("[,]", "path(.[0])"),
+        ("[,]", "path(.[])"),
+        ("[,]", "[path(..)]"),
     ] {
         let (out, stderr, code) = run_jq_full(&["-c", query], Some(input))?;
         assert_eq!(
@@ -25811,6 +25822,11 @@ fn test_jq_genuinely_empty_containers_unaffected_2594() -> Result<()> {
         ("{}", r#"has("a")"#, "false"),
         ("{}", ".[]", ""),
         ("{}", "paths", ""),
+        ("{}", "path(.a)", r#"["a"]"#),
+        ("{}", "path(.[])", ""),
+        ("{}", "[path(..)]", "[[]]"),
+        ("[]", "path(.[])", ""),
+        ("[]", "[path(..)]", "[[]]"),
         ("{ }", "length", "0"),
         ("{\n\t}", "length", "0"),
         (r#"{"a":{}}"#, ".a|length", "0"),

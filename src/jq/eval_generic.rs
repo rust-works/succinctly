@@ -13938,6 +13938,11 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
                     if v.is_null() {
                         PathNode::Absent
                     } else if let Some(fields) = v.as_object() {
+                        // #2594: `find_cursor` walks fields alone, so a
+                        // zero-field `{,}` simply missed and this step
+                        // reported an absent position -- `path(.a)` answered
+                        // `["a"]` where the bare `.a` raises.
+                        empty_fields_tail_gap_ok(&fields, Some(c))?;
                         match fields.find_cursor(name)? {
                             Some(fc) => PathNode::At(fc),
                             None => PathNode::Absent,
@@ -14005,6 +14010,10 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
                     if v.is_null() {
                         PathNode::Absent
                     } else if let Some(elements) = v.as_array() {
+                        // #2594: the zero-element `[,]` no element-only walk
+                        // can see -- `path(.[0])` answered `[0]` where the
+                        // bare `.[0]` raises.
+                        empty_elements_tail_gap_ok(&elements, Some(c))?;
                         // yq mode only (#2254): a negative index still
                         // negative after resolving against the length raises
                         // in real yq, and the path-context walk (#2416 phase
@@ -14090,6 +14099,9 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
             PathNode::At(c) => {
                 let v = c.value();
                 if let Some(fields) = v.as_object() {
+                    // #2594: the zero-field `{,}` `effective_fields_checked`
+                    // cannot see, same as the value-side `Expr::Iterate` arm.
+                    empty_fields_tail_gap_ok(&fields, Some(c))?;
                     // `effective_fields_checked` with the mode's own
                     // duplicate-key rule, plus `key_display_string` -- the
                     // same two helpers `collect_paths_generic` uses, reused
@@ -14108,6 +14120,8 @@ fn path_step_generic<S: EvalSemantics, V: DocumentValue>(
                     }
                     Ok(())
                 } else if let Some(elements) = v.as_array() {
+                    // #2594: and the zero-element `[,]` it still cannot see.
+                    empty_elements_tail_gap_ok(&elements, Some(c))?;
                     // #2261 (systematic sweep): `collect_cursors_checked`,
                     // not the unchecked `collect_cursors` this arm used --
                     // the object arm just above already routes through the
