@@ -39878,6 +39878,39 @@ fn test_foreach_register_reentry_is_jq_mode_only_on_the_write_side_2161() -> Res
     Ok(())
 }
 
+/// #2632's yq-mode gate — `resolve_reduce`'s own copy of the #2161 write-side
+/// hazard above, gated the same way and for the same reason (real yq's
+/// lexer rejects `reduce` outright, same as `foreach`, so `(null | .a) = 5`
+/// staying a no-op live against v4.53.3 is as close as the oracle gets).
+///
+/// jq mode keeps the write -- `jq -n '(reduce (1) as $k (null; .a)) = 5'` is
+/// `5` (the fold's own final path is root, not `.a`; see
+/// `test_reduce_reenters_register_every_step_not_just_the_first_2632`'s own
+/// doc comment for why), and `succinctly jq` matches it.
+#[test]
+fn test_reduce_register_reentry_is_jq_mode_only_on_the_write_side_2632() -> Result<()> {
+    for filter in [
+        "(reduce (1) as $k (null; .a)) = 5",
+        "(reduce (1,2) as $k (null; .a)) = 5",
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "null\n", &[])?;
+        assert_eq!(
+            code, 1,
+            "`{filter}` -- stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert!(
+            stdout.trim().is_empty(),
+            "`{filter}` must not write: stdout: {stdout:?}"
+        );
+        assert!(
+            stderr.contains("Invalid path expression"),
+            "`{filter}` -- stderr: {stderr:?}"
+        );
+    }
+
+    Ok(())
+}
+
 /// #2692, yq twin of `test_truthiness_probes_validate_nothing_2692` in
 /// `tests/jq_cli_tests.rs`: the same corpus through the YAML cursor (and, for
 /// the JSON-syntax rows, through yq's own reading of them -- most of the JSON

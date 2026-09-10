@@ -30858,6 +30858,28 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                 Ok(b) => substitute_vars(update, as_var_refs(&b)),
                 Err(e) => return stop_with_escape(&mut aborted, Control::Error(e)),
             };
+            // **#2632**: mirrors `resolve_foreach`'s own `None`-arm widening
+            // (#2161) — `acc_at_register` alone is the previous step's
+            // `branch_provenance`, a path comparison, which is `false` from
+            // step 2 onward because UPDATE's whole job is to navigate away
+            // from the register. jq's actual rule is
+            // `jv_identical(current_input, value_at_path)`: this step is at
+            // the register when the accumulator arriving at it is still the
+            // register's own value, which `register_identical` answers
+            // directly. `||`, not a replacement — `register_identical`
+            // demands `snapshot || Null | Bool`, so it alone is `false` for
+            // step 1 of an object-valued register, where the carried
+            // provenance is the correct `true`. jq mode only, for the same
+            // reason `resolve_foreach`'s widening is: on the *write* side an
+            // un-gated widening turns a refusal into a write where real yq
+            // no-ops (`(null | .a) = 5` is a no-op on `null`, live against
+            // v4.53.3).
+            if let Some(a) = acc.as_ref() {
+                acc_at_register = acc_at_register
+                    || (S::TAG == EvalTag::Jq
+                        && reg.trackable
+                        && register_identical(&reg.value, &reg.frame, a, &acc_snapshot));
+            }
             let acc_input = acc.take().unwrap_or(OwnedValue::Null);
             match reg.resolve::<S>(
                 &substituted,
@@ -30884,17 +30906,11 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                     // register instead — the persistent register is what
                     // every step *without* its own source-derived register
                     // (including reduce's own final emission below) is
-                    // still checked against.
-                    //
-                    // **#2161**: `resolve_foreach`'s equivalent site no
-                    // longer treats provenance as the whole rule -- it also
-                    // consults `register_identical`, so a step whose
-                    // accumulator is still the register's own value
-                    // re-enters it. This site was deliberately left alone
-                    // (fixing it moves 696 more cases onto jq, measured),
-                    // so `path(reduce (1,2) as $k (.b; .a))` on `{"a":1}`
-                    // still refuses where the `foreach` spelling succeeds.
-                    // Tracked at #2632.
+                    // still checked against. The widening just above only
+                    // affects what is fed *into* this step's `reg.resolve`;
+                    // this carry-forward still derives the *next* step's
+                    // starting point purely from this step's own output
+                    // branch, same as before #2632.
                     let last = branches.into_iter().last();
                     (acc_at_register, acc_snapshot) = reg.branch_provenance(last.as_ref());
                     acc = last.map(|b| b.value.into_owned());
@@ -30959,15 +30975,15 @@ fn resolve_reduce<'a, S: EvalSemantics>(
 /// control is applied per-fork after that fork's own inner loop (#534
 /// follow-up), not deferred until every fork has run.
 ///
-/// **#2161 adds a fourth difference, and it is a divergence from
-/// [`resolve_reduce`] rather than a shared rule**: this function re-enters
-/// the fixed register on every source element, deciding each step's
-/// `at_register` from jq's own `jv_identical(current_input, value_at_path)`
-/// (via [`register_identical`]) *as well as* the previous step's
-/// [`FoldRegister::branch_provenance`]. `resolve_reduce`'s own carry-forward
-/// still uses provenance alone, so `path(reduce (1,2) as $k (.b; .a))` on
-/// `{"a":1}` still refuses where the `foreach` spelling now succeeds --
-/// tracked at #2632, not an intended asymmetry.
+/// **#2161 adds a fourth difference**: this function re-enters the fixed
+/// register on every source element, deciding each step's `at_register` from
+/// jq's own `jv_identical(current_input, value_at_path)` (via
+/// [`register_identical`]) *as well as* the previous step's
+/// [`FoldRegister::branch_provenance`]. #2632 gave [`resolve_reduce`]'s own
+/// carry-forward the same widening, so this is no longer a divergence
+/// between the two functions -- see that function's own doc comment for why
+/// its call site looks different (no per-source-element register override
+/// to fold the widening into) even though the rule is now shared.
 #[allow(clippy::too_many_arguments)] // STYLE-0004: `snapshot` (#1591) joins `trackable` as the
                                      // ambient pair threaded verbatim through every one of
                                      // `resolve_node`'s ~20 recursive call sites in this file; a

@@ -41352,6 +41352,97 @@ fn test_foreach_reenters_register_every_step_not_just_the_first_2161() -> Result
     Ok(())
 }
 
+/// #2632: `resolve_reduce`'s own copy of #2161's bug, fixed the same way.
+/// Unlike `foreach`, `reduce` emits only once, at the very end of the fold,
+/// re-checking the *final* accumulator's provenance against the register --
+/// so these shapes pin the same register-reentry rule through a single
+/// emission (or a single raise) instead of one per step. All values below
+/// are live jq 1.7.1 captures.
+#[test]
+fn test_reduce_reenters_register_every_step_not_just_the_first_2632() -> Result<()> {
+    // `.b` is absent, so the accumulator stays `null` -- identical to the
+    // register's own value at every step, so the fold's own final path is
+    // still the register's path, not a deeper one (`.a` on a `null`
+    // register-identical value never extends the emitted path).
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(reduce (1,2,3) as $k (.b; .a))"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("[\"b\"]\n", 0),
+        "stderr: {stderr:?}"
+    );
+
+    // A deeper UPDATE repeats the same way.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(reduce (1,2) as $k (.b; .a.c))"],
+        Some(r#"{"a":1}"#),
+    )?;
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("[\"b\"]\n", 0),
+        "stderr: {stderr:?}"
+    );
+
+    // The counterpart that must still raise: once the accumulator stops
+    // being the register's value, the step is genuinely untracked. `reduce`
+    // emits nothing before the raise (unlike `foreach`, which streams every
+    // earlier step's own output first) since there is no per-step emission
+    // to have already reached the sink.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(reduce (1,2,3) as $k (.b; .a))"],
+        Some(r#"{"a":1,"b":{"a":{"a":9}}}"#),
+    )?;
+    assert_eq!(stdout, "", "stderr: {stderr:?}");
+    assert!(
+        stderr.contains(r#"attempt to access element "a" of {"a":9}"#),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+
+    // Same shape one level deeper, to pin that the raise names the step's
+    // own input rather than anything about the register.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(reduce (1,2,3) as $k (.b; .a.a))"],
+        Some(r#"{"a":1,"b":{"a":{"a":9}}}"#),
+    )?;
+    assert_eq!(stdout, "", "stderr: {stderr:?}");
+    assert!(
+        stderr.contains(r#"attempt to access element "a" of 9"#),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+
+    // A non-navigating UPDATE leaves the accumulator *at* the register, so
+    // the carried-provenance half keeps answering `true` -- `["b"]`, no
+    // raise, even though the value is an object.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(reduce (1,2,3) as $k (.b; .))"],
+        Some(r#"{"a":1,"b":{"a":{"a":9}}}"#),
+    )?;
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("[\"b\"]\n", 0),
+        "stderr: {stderr:?}"
+    );
+
+    // INIT navigating to the document root behaves the same way: step 1
+    // tracks, step 2's accumulator (`1`) is no longer the register.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path(reduce (1,2) as $k (.; .a))"],
+        Some(r#"{"a":1,"b":{"a":{"a":9}}}"#),
+    )?;
+    assert_eq!(stdout, "", "stderr: {stderr:?}");
+    assert!(
+        stderr.contains(r#"attempt to access element "a" of 1"#),
+        "stderr: {stderr:?}"
+    );
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+
+    Ok(())
+}
+
 /// #2031's mixed-source variant: a source with *some* trackable branches
 /// and some untracked ones must still stream every branch before the
 /// trackable one, exactly as an all-untracked source already did (#1872) --
