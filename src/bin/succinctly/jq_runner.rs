@@ -57,6 +57,31 @@ pub struct ModuleLoader {
     auto_loaded_defs: Vec<(String, Vec<Param>, Expr)>,
 }
 
+/// Resolve a module path to a file path within `search_path`.
+///
+/// A free function rather than a `ModuleLoader` method (#2395): its only
+/// caller, [`ModuleLoader::ensure_module_loaded`], holds a mutable borrow of
+/// the module cache across the call, which an `&self` method could not
+/// coexist with. It reads nothing but the search path either way.
+fn resolve_module_in(search_path: &[PathBuf], module_path: &str) -> Option<PathBuf> {
+    // Add .jq extension if not present
+    let module_file = if module_path.ends_with(".jq") {
+        module_path.to_string()
+    } else {
+        format!("{module_path}.jq")
+    };
+
+    // Search in each path
+    for base in search_path {
+        let full_path = base.join(&module_file);
+        if full_path.is_file() {
+            return Some(full_path);
+        }
+    }
+
+    None
+}
+
 impl ModuleLoader {
     /// Create a new module loader with the given search paths.
     pub fn new(library_paths: &[PathBuf]) -> Self {
@@ -103,54 +128,50 @@ impl ModuleLoader {
         }
     }
 
-    /// Resolve a module path to a file path.
-    fn resolve_module(&self, module_path: &str) -> Option<PathBuf> {
-        // Add .jq extension if not present
-        let module_file = if module_path.ends_with(".jq") {
-            module_path.to_string()
-        } else {
-            format!("{module_path}.jq")
-        };
+    /// Load a module if it is not already cached, and borrow its function
+    /// definitions (name, params, body) in place.
+    ///
+    /// The borrowing form exists so a caller that only needs to *read* the
+    /// defs -- [`Self::unqualified_def_names`], which wants their names --
+    /// does not pay for a deep clone of every def body it is about to drop
+    /// (#2395). [`Self::load_module`] is this plus that clone, for callers
+    /// that need an owned copy.
+    fn ensure_module_loaded(
+        &mut self,
+        module_path: &str,
+    ) -> Result<&Vec<(String, Vec<Param>, Expr)>> {
+        // `entry` rather than `get`-then-insert: the borrow checker cannot
+        // see that an early `return` of `get`'s borrow ends it, so the
+        // `contains_key` spelling would need an unreachable `expect` on the
+        // re-lookup. The key allocation on the cached path is one short
+        // module-path string, against the file read and parse it replaces.
+        match self.loaded_modules.entry(module_path.to_string()) {
+            std::collections::btree_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                // Resolve the module path
+                let file_path =
+                    resolve_module_in(&self.search_path, module_path).ok_or_else(|| {
+                        anyhow::anyhow!("module '{module_path}' not found in search path")
+                    })?;
 
-        // Search in each path
-        for base in &self.search_path {
-            let full_path = base.join(&module_file);
-            if full_path.is_file() {
-                return Some(full_path);
+                // Read and parse the module
+                let contents = std::fs::read_to_string(&file_path)
+                    .with_context(|| format!("failed to read module: {}", file_path.display()))?;
+
+                let program = jq::parse_program(&contents).map_err(|e| {
+                    anyhow::anyhow!("parse error in module '{}': {}", file_path.display(), e)
+                })?;
+
+                // Extract function definitions from the expression
+                Ok(entry.insert(extract_func_defs(&program.expr)))
             }
         }
-
-        None
     }
 
-    /// Load a module and return its function definitions (name, params, body).
+    /// Load a module and return an owned copy of its function definitions
+    /// (name, params, body).
     pub fn load_module(&mut self, module_path: &str) -> Result<Vec<(String, Vec<Param>, Expr)>> {
-        // Check if already loaded
-        if let Some(defs) = self.loaded_modules.get(module_path) {
-            return Ok(defs.clone());
-        }
-
-        // Resolve the module path
-        let file_path = self
-            .resolve_module(module_path)
-            .ok_or_else(|| anyhow::anyhow!("module '{module_path}' not found in search path"))?;
-
-        // Read and parse the module
-        let contents = std::fs::read_to_string(&file_path)
-            .with_context(|| format!("failed to read module: {}", file_path.display()))?;
-
-        let program = jq::parse_program(&contents).map_err(|e| {
-            anyhow::anyhow!("parse error in module '{}': {}", file_path.display(), e)
-        })?;
-
-        // Extract function definitions from the expression
-        let defs = extract_func_defs(&program.expr);
-
-        // Cache the loaded module
-        self.loaded_modules
-            .insert(module_path.to_string(), defs.clone());
-
-        Ok(defs)
+        self.ensure_module_loaded(module_path).cloned()
     }
 
     /// Every def name this program's modules will put into the main filter's
@@ -178,8 +199,8 @@ impl ModuleLoader {
             .collect();
 
         for include in &program.includes {
-            let defs = self.load_module(&include.path)?;
-            names.extend(defs.into_iter().map(|(name, _, _)| name));
+            let defs = self.ensure_module_loaded(&include.path)?;
+            names.extend(defs.iter().map(|(name, _, _)| name.clone()));
         }
 
         Ok(names)

@@ -377,17 +377,7 @@ const META_OP_KEYWORDS: &[(&str, MetaSlot)] = &[
 impl<'a> Parser<'a> {
     #[allow(dead_code)] // STYLE-0005: kept for tests and future use
     fn new(input: &'a str) -> Self {
-        Parser {
-            input,
-            pos: 0,
-            mode: ParserMode::Jq,
-            jq_extensions: false,
-            pattern_depth: 0,
-            expr_depth: 0,
-            call_sites: Vec::new(),
-            shadowable_defs: collect_def_names(input),
-            shadow_retry_budget: SHADOW_RETRY_BUDGET,
-        }
+        Self::with_mode_extensions_and_extra_defs(input, ParserMode::Jq, false, &BTreeSet::new())
     }
 
     fn with_mode_and_extensions(input: &'a str, mode: ParserMode, jq_extensions: bool) -> Self {
