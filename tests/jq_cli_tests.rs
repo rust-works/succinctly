@@ -42837,6 +42837,107 @@ fn test_path_answers_past_a_structural_fault_it_never_reads_2168() -> Result<()>
     Ok(())
 }
 
+/// #2646: a jq-*defined* navigating builtin (`first` is `.[0]`, `add` is
+/// `reduce .[] as $x ...`) applied to a constructed value inside `path()`
+/// must raise, exactly as the navigation it desugars to would.
+///
+/// The bug this pins was an *accept-where-jq-refuses*: the builtin was
+/// opaque to the resolver, so the branch went untracked, and a continuation
+/// emitting nothing (`| empty`, `| select(false)`) left nothing for the
+/// terminal check to object to. `path(...)` answered `[]` and, worse,
+/// `del(...)` returned the document unchanged at exit 0 where jq exits 5 --
+/// no wrong value was written, but a refused edit looked like a successful
+/// no-op. Every row captured live from jq 1.7.1.
+#[test]
+fn test_jq_defined_navigating_builtins_raise_inside_path_2646() -> Result<()> {
+    for (filter, element) in [
+        ("[path(([1] | first) | empty)]", "element 0 of [1]"),
+        ("[path(([1] | last) | empty)]", "element -1 of [1]"),
+        ("[path(([[1]] | add) | empty)]", "iterate through [[1]]"),
+        ("[path(([1] | first) | select(false))]", "element 0 of [1]"),
+        // the continuation does not have to be empty-producing -- it is
+        // just what made the gap invisible
+        ("[path(([1] | first))]", "element 0 of [1]"),
+        ("del(([1] | first) | empty)", "element 0 of [1]"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
+        assert_ne!(code, 0, "{filter}: stdout {stdout:?}");
+        assert!(
+            stderr.contains("Invalid path expression near attempt to access ")
+                || stderr.contains("Invalid path expression near attempt to iterate "),
+            "{filter}: {stderr:?}"
+        );
+        assert!(stderr.contains(element), "{filter}: {stderr:?}");
+    }
+    Ok(())
+}
+
+/// #2646: the boundary of that set, which is decided by jq's own
+/// implementation rather than by whether the builtin "looks like" it reads a
+/// container. `sort`, `min`, `group_by`, `to_entries`, `keys`, `has` and
+/// `getpath` all read their input and all answer `[]`, because jq implements
+/// them in C and no jq-level navigation happens; `unique` raises only
+/// because it is *defined* as `group_by(.) | map(.[0])`.
+///
+/// Arity matters too: `any`/`any(cond)` iterate their input, while
+/// `any(gen; cond)` iterates `gen` instead -- so `any(1;.)` must stay silent
+/// here. If `any(.[];.)` raises, that is the argument navigating, which the
+/// resolver already handled. All captured live from jq 1.7.1.
+#[test]
+fn test_only_jq_defined_navigators_raise_inside_path_2646() -> Result<()> {
+    for filter in [
+        "[path(([1] | sort) | empty)]",
+        "[path(([1] | sort_by(.)) | empty)]",
+        "[path(([1] | group_by(.)) | empty)]",
+        "[path(([1] | min) | empty)]",
+        "[path(([1] | max) | empty)]",
+        "[path(([1] | to_entries) | empty)]",
+        "[path(([1] | keys) | empty)]",
+        "[path(([1] | length) | empty)]",
+        "[path(([1] | getpath([0])) | empty)]",
+        "[path(([1] | tostream) | empty)]",
+        "[path(([1] | has(0)) | empty)]",
+        // the two-argument `any`/`all`, whose generator replaces the input
+        "[path(([1] | any(1;.)) | empty)]",
+        "[path(([1] | all(1;.)) | empty)]",
+        // `walk` navigates only on its array arm; a scalar hits its `else .`
+        "[path((5 | walk(.)) | empty)]",
+        r#"[path(("s" | walk(.)) | empty)]"#,
+        "[path((null | walk(.)) | empty)]",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
+        assert_eq!(code, 0, "{filter}: stderr {stderr:?}");
+        assert_eq!(stdout.trim(), "[]", "{filter}");
+    }
+    Ok(())
+}
+
+/// #2646: the raise is independent of the input's type for every entry but
+/// `walk` -- `first` on a scalar still reports `element 0 of 5`, matching
+/// jq, rather than being skipped as "not a container". `walk` is the one
+/// exception, because its own definition branches on `type`: the array arm
+/// reaches `.[]` and raises, the object arm goes through `map_values`
+/// (deferred, #2743), and a scalar navigates nothing. Captured live from
+/// jq 1.7.1.
+#[test]
+fn test_navigating_builtins_raise_regardless_of_input_type_2646() -> Result<()> {
+    for (filter, element) in [
+        ("[path((5 | first) | empty)]", "element 0 of 5"),
+        (r#"[path(("s" | first) | empty)]"#, r#"element 0 of "s""#),
+        ("[path((null | first) | empty)]", "element 0 of null"),
+        ("[path((null | add) | empty)]", "iterate through null"),
+        ("[path(({} | add) | empty)]", "iterate through {}"),
+        ("[path(([] | first) | empty)]", "element 0 of []"),
+        ("[path(([] | add) | empty)]", "iterate through []"),
+        ("[path(([1] | walk(.)) | empty)]", "iterate through [1]"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
+        assert_ne!(code, 0, "{filter}: stdout {stdout:?}");
+        assert!(stderr.contains(element), "{filter}: {stderr:?}");
+    }
+    Ok(())
+}
+
 /// #2349 control: the same gate's *array* elements must also validate the
 /// leading-comma/duplicate-comma shape (`[1,,2]`), not just the trailing
 /// stray-comma cases above -- a distinct `#1677` check
