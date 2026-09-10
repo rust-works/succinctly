@@ -186,11 +186,11 @@ impl ModuleLoader {
     /// defines one; only `m::length` reaches the module's).
     ///
     /// Loading here rather than in `process_program` costs nothing:
-    /// [`Self::load_module`] memoizes on the module path, so the later
-    /// `process_program` re-reads and re-parses nothing. A module that cannot
-    /// be resolved fails here instead of there, one step earlier but still
-    /// after the main filter has parsed, so the caller's error and exit code
-    /// are unchanged.
+    /// [`Self::ensure_module_loaded`] memoizes on the module path and this
+    /// only borrows the names out of it, so the later `process_program`
+    /// re-reads and re-parses nothing. A module that cannot be resolved fails
+    /// here instead of there, one step earlier but still after the main filter
+    /// has parsed, so the caller's error and exit code are unchanged.
     pub fn unqualified_def_names(&mut self, program: &Program) -> Result<BTreeSet<String>> {
         let mut names: BTreeSet<String> = self
             .auto_loaded_defs
@@ -1329,6 +1329,18 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     // Get the filter expression
     let filter_str = get_filter(&args)?;
 
+    // The main filter is parsed *twice* (#2395 -- see the re-parse below), and
+    // the second result is the one that runs, so a drift between the two in
+    // mode or extensions would be silent: the first parse's shape would simply
+    // be discarded. One closure therefore owns that choice for both calls
+    // rather than each spelling it out. It reproduces `jq::parse_program`'s own
+    // defaults (`ParserMode::Jq`, extensions off -- `jq_extensions` is ignored
+    // in jq mode regardless), which is what this call site used before the
+    // second parse existed.
+    let parse_filter = |extra: &BTreeSet<String>| {
+        jq::parse_program_with_extra_shadowable_defs(&filter_str, jq::ParserMode::Jq, false, extra)
+    };
+
     // Parse the filter as a full program (with module directives).
     //
     // Returns the exit code rather than an `anyhow` error (#1473): a failed
@@ -1337,7 +1349,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     // from `main`'s own reporting. Both were confirmed live against jq 1.7.1,
     // which exits 3 with no such line. Nothing else distinguished this arm
     // from a resolution failure below, so the two now answer identically.
-    let program = match jq::parse_program(&filter_str) {
+    let program = match parse_filter(&BTreeSet::new()) {
         Ok(program) => program,
         Err(e) => {
             eprintln!("jq: compile error: {e}");
@@ -1400,13 +1412,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
         // costs only this filter's module-sourced shadowing -- exactly the
         // behavior before this fix -- where an error would reject a filter
         // that compiles today and that real jq accepts.
-        jq::parse_program_with_extra_shadowable_defs(
-            &filter_str,
-            jq::ParserMode::Jq,
-            false,
-            &module_def_names,
-        )
-        .unwrap_or(program) // omni-dev: coverage tolerate-line reason="unreachable: widening the shadow-candidate set never rejects a program the first parse accepted -- a newly covered name only wraps an already-successful dedicated parse, and a failing one would have propagated its error in the first parse too, so the retry budget is charged at the identical sites in both (#2395)"
+        parse_filter(&module_def_names).unwrap_or(program) // omni-dev: coverage tolerate-line reason="unreachable: widening the shadow-candidate set never rejects a program the first parse accepted -- a newly covered name only wraps an already-successful dedicated parse, and a failing one would have propagated its error in the first parse too, so the retry budget is charged at the identical sites in both (#2395)"
     };
 
     let expr = match module_loader.process_program(&program) {
