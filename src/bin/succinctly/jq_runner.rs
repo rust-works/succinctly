@@ -1345,9 +1345,7 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     // assembled tree afterwards (which would need a `Builtin` -> name map the
     // crate does not have, and could not recover `range`'s arity, whose sugar
     // marker is itself emitted only for a shadow candidate), feed the names
-    // back into a second parse. Widening the set is monotone, so this parse
-    // cannot fail where the first succeeded; the arm below is kept anyway
-    // rather than unwrapping a claim about another module's behavior.
+    // back into a second parse.
     //
     // Skipped entirely when no module contributes a name -- including every
     // filter with no `include` and no `~/.jq`, which is the overwhelmingly
@@ -1362,18 +1360,32 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
     let program = if module_def_names.is_empty() {
         program
     } else {
-        match jq::parse_program_with_extra_shadowable_defs(
+        // Widening the candidate set cannot make a program stop parsing, so
+        // this second parse succeeds whenever the first did.
+        //
+        // At a name the set newly covers, the parser's dedicated parse still
+        // runs first and, on success, is merely wrapped as a fallback -- no
+        // token is consumed differently and `pos` does not move. The only
+        // other outcome is that the dedicated parse *fails*, and there the
+        // widening is what rescues it: a candidate retries as a generic call
+        // (`retry_shadow_candidate_as_generic_call`) where a non-candidate
+        // propagates the error outright -- meaning the first parse would have
+        // failed at that same site. `SHADOW_RETRY_BUDGET` cannot flip the
+        // conclusion either, since it is charged only at those failing sites,
+        // which are therefore the identical set in both parses.
+        //
+        // The arm below is kept rather than unwrapped anyway: if that
+        // reasoning is ever wrong, falling back to the already-parsed program
+        // costs only this filter's module-sourced shadowing -- exactly the
+        // behavior before this fix -- where an error would reject a filter
+        // that compiles today and that real jq accepts.
+        jq::parse_program_with_extra_shadowable_defs(
             &filter_str,
             jq::ParserMode::Jq,
             false,
             &module_def_names,
-        ) {
-            Ok(program) => program,
-            Err(e) => {
-                eprintln!("jq: compile error: {e}");
-                return Ok(exit_codes::COMPILE_ERROR);
-            }
-        }
+        )
+        .unwrap_or(program) // omni-dev: coverage tolerate-line reason="unreachable: widening the shadow-candidate set never rejects a program the first parse accepted -- a newly covered name only wraps an already-successful dedicated parse, and a failing one would have propagated its error in the first parse too, so the retry budget is charged at the identical sites in both (#2395)"
     };
 
     let expr = match module_loader.process_program(&program) {
