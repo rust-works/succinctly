@@ -1065,6 +1065,43 @@ mod tests {
     }
 
     #[test]
+    fn test_head_and_foot_comments_always_empty_798() {
+        // head/foot comment capture is deliberately unimplemented today
+        // (#798 PR2) -- these getters exist only so that follow-up work has
+        // a stable place to read from. Exercise both the "position has
+        // other comment metadata" (`Some(NodeComments)`) and "position has
+        // none at all" (`None`) paths through the `map_or` default.
+        let yaml = b"a: 1 # keep this\nb: 2\n";
+        let index = YamlIndex::build(yaml).expect("valid YAML");
+        let root = index.root(yaml);
+        use crate::yaml::light::YamlValue;
+        let YamlValue::Sequence(docs) = root.value() else {
+            panic!("root is always the virtual document sequence");
+        };
+        let (doc_cursor, _) = docs.uncons_cursor().expect("at least one document");
+        let YamlValue::Mapping(fields) = doc_cursor.value() else {
+            panic!("expected a mapping document");
+        };
+        for field in fields {
+            let YamlValue::String(k) = field.key() else {
+                panic!("expected string keys");
+            };
+            let bp_pos = field.value_cursor().bp_position();
+            assert!(index.get_head_comments(bp_pos).is_empty());
+            assert!(index.get_foot_comments(bp_pos).is_empty());
+            if k.raw_bytes() == b"a" {
+                // This position does carry other comment metadata (a line
+                // comment), so `comments.get` takes the `Some` arm.
+                assert!(index.get_line_comment(bp_pos).is_some());
+            } else {
+                // This position has no entry in `comments` at all, so
+                // `map_or` falls through to its `&[]` default.
+                assert!(index.get_line_comment(bp_pos).is_none());
+            }
+        }
+    }
+
+    #[test]
     fn test_line_comment_on_sequence_items() {
         let yaml = b"a:\n  - 1 # first\n  - 2 # second\n";
         let index = YamlIndex::build(yaml).expect("valid YAML");
