@@ -57,12 +57,12 @@ use super::eval::{
     classify_nth_n, classify_parent_n, clear_nonretryable_stop, collapse_vec,
     collect_pattern_var_names, compare_values, debug_assert_materialization_error,
     enter_def_call_frame, entries_to_object, eval_each_owned, eval_full as full_eval,
-    eval_reduce_with_values, extract_pattern_bindings, finish_fork_from_flow, finish_short_circuit,
-    fold_escaped_generator_prefix, foreach_forks, format_owned, has_type_mismatch_is_permissive,
-    index_component_value, index_in_array_bounds, index_one_owned as index_owned_by_key,
-    is_pure_chain_link, is_retryable_stop, literal_to_owned, mark_nonretryable_escape,
-    needs_path_context, numeric_key_to_array_index, numeric_key_to_index, numeric_length_owned,
-    owned_bound_to_i64, owned_to_expr, owned_to_string, param_names,
+    eval_reduce_with_values, extract_pattern_bindings, finish_fork_flow, finish_fork_from_flow,
+    finish_short_circuit, fold_escaped_generator_prefix, foreach_forks, format_owned,
+    has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
+    index_one_owned as index_owned_by_key, is_pure_chain_link, is_retryable_stop, literal_to_owned,
+    mark_nonretryable_escape, needs_path_context, numeric_key_to_array_index, numeric_key_to_index,
+    numeric_length_owned, owned_bound_to_i64, owned_to_expr, owned_to_string, param_names,
     pattern_alternatives_var_names, prefer_pending_control, resume_from_escape, select_emits,
     slice_component_value, slice_object_as_yq_children, slice_owned_value_read,
     stop_with_downstream, stop_with_error, stop_with_escape, streams_escaped_generator_prefix,
@@ -6948,25 +6948,34 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // eager bridge used to hand it `null + 10`. That is what admits
         // `Expr::Arithmetic` to `path_context_single_native`.
         //
-        // **Gated on `needs_path_context`, unlike the `Expr::Compare` arm
-        // above.** The eager bridge materializes the ambient value on its
-        // way through, and for a #1194-malformed document (`{123: 1}`) that
-        // materialization is the decode failure jq answers *every* query on
-        // that document with -- including one that never reads `.`, like
-        // `try (1+1) catch "x"` (exit 5, live-verified against jq 1.7.1 and
-        // pinned by `test_try_catch_contains_a_genuinely_catchable_malformed_key_error_1812`).
-        // An ungated arm here would answer `2` and lose that. The gate keeps
-        // arithmetic that reads no path context on the bridge, where it
-        // still pays the ambient decode; arithmetic that does read path
-        // context could not have been on a malformed document's root and
-        // survived the walk anyway. (`Expr::Compare`'s own arm already
-        // diverges here -- `1==1` on `{123: 1}` answers `true` -- which is a
-        // pre-existing gap, not one this arm widens.)
-        Expr::Arithmetic { left, right, .. }
-            if needs_path_context(left) || needs_path_context(right) =>
-        {
-            collect_each_generic::<S, V>(expr, value, optional, cursor)
-        }
+        // **Ungated since #2626.** The gate kept an arithmetic whose
+        // operands read no position on the eager bridge, whose first act is
+        // `to_owned_with_cursor` -- and that materialization does two things
+        // the gate was not asking for. It collapses duplicate mapping keys
+        // through its `IndexMap`, so `length + 0` on `b: 1\na: 2\nb: 3\n`
+        // answered `2` in yq mode where this binary's own bare `length`
+        // answers `3` and yq v4.53.3 answers `3`. And it re-roots the value
+        // at a fresh JSON serialization, which stubs every yq node-metadata
+        // builtin `needs_path_context` does not cover: `.b | (line + 0)`
+        // answered `0` where `.b | line` answers `2`, `(anchor + "")` and
+        // `(style + "")` answered `""`, and `di + 0` answered `0` for every
+        // document in a stream.
+        //
+        // The gate's stated purpose was the bridge's *ambient decode* --
+        // the raise a malformed document produces for a filter that reads
+        // nothing (`try (1+1) catch "x"`, #1812). Nothing replaces it here,
+        // and that is the point rather than an omission: #2103 recorded
+        // that a filter validates only what it reads, and #2173 applied it
+        // to exactly this bridge, so a closed term already answers instead
+        // of raising. What was left was the *document-reading* half, where
+        // the split was between one spelling and another rather than
+        // between filters -- on `a: "bad\q"`, `length` answered `1`,
+        // `first(length + 0)` answered `1`, and only `length + 0` raised,
+        // because only it bridged. Removing the gate removes that last
+        // spelling dependence too; the divergence is recorded in
+        // `docs/compliance/yq/limitations.md` and pinned by
+        // `test_arithmetic_validates_only_what_it_reads_2626`.
+        Expr::Arithmetic { .. } => collect_each_generic::<S, V>(expr, value, optional, cursor),
 
         // Spine 2416 (the exit): unary minus over a path-context operand.
         // The eager evaluator carried this as `eval_negate_with_path_context`
@@ -6982,10 +6991,13 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // select((file_index * -1) == -1)]'` is `[20]` -- the read happens at
         // the node either way.
         //
-        // Gated on `needs_path_context` for the same #1812 reason as the
-        // `Expr::Arithmetic` arm above: an ungated arm would stop paying the
-        // bridge's ambient decode on a malformed document.
-        Expr::Negate(inner) if needs_path_context(inner) => {
+        // Ungated since #2626, for the reasons the `Expr::Arithmetic` arm
+        // above gives at length: the gate kept an ungated `-x` on the
+        // bridge, and the bridge collapsed duplicate mapping keys on its way
+        // through. `-length` on `b: 1\na: 2\nb: 3\n` answered `-2` where
+        // bare `length` answers `3` and `length * -1` -- real yq's own
+        // spelling, since yq has no unary minus -- now answers `-3`.
+        Expr::Negate(inner) => {
             let (values, control) =
                 stream_owned_outputs_generic::<S, V>(inner, value, optional, cursor);
             let mut out: Vec<OwnedValue> = vec_with_capacity(values.len());
@@ -8065,8 +8077,17 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             let mut acc = Vec::new();
             each_object_entries_generic::<S, V>(entries, value, optional, cursor, &mut acc, sink)
         }
-        Expr::Negate(operand) if !needs_path_context(operand) => {
-            bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink)
+        // Ungated since #2626. This arm bridged an operand that reads no
+        // position, and `bridge_to_each_owned_flow`'s materialization
+        // collapses duplicate mapping keys, so `first(-length)` answered
+        // `-2` on `b: 1\na: 2\nb: 3\n` once `eval_single`'s own
+        // `Expr::Negate` arm had been fixed to answer `-3` -- the same
+        // filter contradicting itself by position, which is the shape #2626
+        // was filed about. `each_negate_generic` is `eval::each_negate` with
+        // the cursor threaded through, so the demand-forwarding and
+        // `?//`-retry rows that arm pins are the same definition here.
+        Expr::Negate(operand) => {
+            each_negate_generic::<S, V>(operand, value, optional, cursor, sink)
         }
         // jq mode only -- yq mode's string interpolation isn't a fan-out
         // generator at all (`eval::eval_string_interpolation`'s own doc
@@ -10999,6 +11020,58 @@ fn each_boolean_generic<S: EvalSemantics, V: DocumentValue>(
         binary_fanout_rules::<S>(EmptyOperandOp::Boolean),
         &mut |bit| sink(GenericItem::Owned(OwnedValue::Bool(bit))),
     )
+}
+
+/// Unary minus with the cursor threaded into its operand (#2626) -- the
+/// generic twin of [`super::eval::each_negate`], arm for arm.
+///
+/// `eval_each_generic`'s `Expr::Negate` arm bridged an operand that reads no
+/// position, which materializes the ambient value and so collapses duplicate
+/// mapping keys before the operand runs. That made the same filter answer
+/// differently by position once `eval_single`'s own `Expr::Negate` arm was
+/// fixed: `-length` on `b: 1\na: 2\nb: 3\n` was `-3` and `first(-length)`
+/// was still `-2`.
+///
+/// The loop is `eval::each_negate`'s, not a new rule: forward each operand
+/// output through `arith_negate` as it arrives, stop the whole fan-out on a
+/// type error rather than skipping the pairing, keep the prefix already
+/// negated, and let [`super::eval::finish_fork_flow`] apply the #1902 rule
+/// that an ambient `?` never suppresses a decode failure.
+fn each_negate_generic<S: EvalSemantics, V: DocumentValue>(
+    operand: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    let mut outer_stopped = false;
+    let mut escape: Option<Control> = None;
+    let flow = eval_each_generic::<S, V>(operand, value, optional, cursor, &mut |item| {
+        let owned = match generic_item_into_owned(item) {
+            Ok(v) => v,
+            Err(control) => return stop_with_escape(&mut escape, control),
+        };
+        match crate::jq::eval::arith_negate::<S>(owned) {
+            Ok(negated) => {
+                if sink(GenericItem::Owned(negated)) == Demand::Stop {
+                    outer_stopped = true;
+                    Demand::Stop
+                } else {
+                    Demand::Continue
+                }
+            }
+            Err(e) => stop_with_escape(&mut escape, Control::Error(e)),
+        }
+    });
+
+    if outer_stopped {
+        return flow;
+    }
+    let control = escape.or(match flow {
+        Flow::Exhausted | Flow::Stopped { .. } => None,
+        Flow::Escaped(control) => Some(control),
+    });
+    finish_fork_flow(control, optional)
 }
 
 /// Shared resolution of [`each_take_first_generic`]'s and
