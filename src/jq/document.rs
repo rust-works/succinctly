@@ -651,6 +651,31 @@ pub trait DocumentCursor: Sized + Copy + Clone {
         Ok(None)
     }
 
+    /// Get the standalone comment lines directly above this node — its
+    /// *head* comment (#798) — stripped of each line's leading `#`/space,
+    /// one entry per line in source order. Empty when the node has none, and
+    /// for formats without comments at all (e.g. JSON), mirroring
+    /// [`line_comment`](Self::line_comment)'s "not available" contract: the
+    /// builtin newline-joins these, so empty becomes `""`.
+    ///
+    /// For a mapping entry these belong to the *key* node, not the value —
+    /// real yq answers `.b | key | head_comment` and gives `""` for
+    /// `.b | head_comment`. A sequence item owns its own directly.
+    ///
+    /// Owned rather than borrowed for the same reason
+    /// [`line_comment`](Self::line_comment) is: a `Copy` cursor obtained
+    /// from `Option<V::Cursor>::and_then` has a borrow too short to hand
+    /// back slices of the source text.
+    fn head_comment(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// The standalone comment lines directly below this node — its *foot*
+    /// comment (#798). See [`head_comment`](Self::head_comment).
+    fn foot_comment(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Create a cursor at the specified byte offset (0-indexed).
     ///
     /// Returns None if:

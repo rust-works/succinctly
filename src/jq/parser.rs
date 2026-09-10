@@ -4646,6 +4646,20 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::LineComment));
         }
 
+        // head_comment / foot_comment - yq: standalone comment lines above /
+        // below this node, or "" (#798). Ungated, exactly like
+        // `line_comment` above: neither is `ParserMode::Yq`-only nor behind
+        // `--jq-extensions`, so both parse in jq mode too and simply answer
+        // "" there, JSON having no comments.
+        if self.matches_keyword("head_comment") {
+            self.consume_keyword("head_comment");
+            return Ok(Some(Builtin::HeadComment));
+        }
+        if self.matches_keyword("foot_comment") {
+            self.consume_keyword("foot_comment");
+            return Ok(Some(Builtin::FootComment));
+        }
+
         // document_index / di - yq: return 0-indexed document position in multi-doc stream
         if self.matches_keyword("document_index") {
             self.consume_keyword("document_index");

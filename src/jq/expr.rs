@@ -1482,6 +1482,15 @@ pub enum Builtin {
     DocumentIndex,
     /// `line_comment` - return the trailing same-line comment text, or "" (yq, #710)
     LineComment,
+    /// `head_comment` - return the standalone comment lines directly above
+    /// this node, newline-joined, or "" (yq, #798). For a mapping entry
+    /// these live on the *key* node, so real yq answers
+    /// `.b | key | head_comment` and returns "" for `.b | head_comment`; a
+    /// sequence item owns its own directly.
+    HeadComment,
+    /// `foot_comment` - the standalone comment lines directly below this
+    /// node, newline-joined, or "" (yq, #798). See [`Self::HeadComment`].
+    FootComment,
     /// `file_index` / `fileIndex` / `fi` - return the 0-indexed origin file
     /// position within an `--eval-all` combined evaluation (yq/succinctly
     /// extension, #715). Resolves via the same `current_path`-derived

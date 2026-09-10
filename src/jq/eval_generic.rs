@@ -18085,6 +18085,32 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             None => GenericResult::Owned(OwnedValue::String(String::new())),
         },
 
+        // #798: the standalone comment lines above/below this node,
+        // newline-joined -- real yq returns one string, not a list, and ""
+        // when there are none.
+        //
+        // Answered from whatever cursor the pipe stands on, which reaches
+        // a sequence item and the document root but *not* a mapping
+        // entry's: those comments live on the entry's **key** node, and a
+        // `key` stage leaves the cursor domain, so `.b | key | head_comment`
+        // is still `""` where real yq answers the comment. That is the same
+        // gap `line_comment` has had since #765 -- `.a | key | line_comment`
+        // is `""` here and `keyc` in yq -- and closing it means routing a
+        // `... | key | <metadata>` pipe to a position-carrying evaluator,
+        // which the walk route currently intercepts. Tracked separately;
+        // these two builtins deliberately inherit the existing gap rather
+        // than inventing a second, different one.
+        Builtin::HeadComment => GenericResult::Owned(OwnedValue::String(
+            cursor
+                .map(|c| c.head_comment().join("\n"))
+                .unwrap_or_default(),
+        )),
+        Builtin::FootComment => GenericResult::Owned(OwnedValue::String(
+            cursor
+                .map(|c| c.foot_comment().join("\n"))
+                .unwrap_or_default(),
+        )),
+
         Builtin::Select(cond) => {
             // Evaluate condition with cursor context preserved.
             // This is critical for select(di == N) to work correctly.
@@ -19808,6 +19834,10 @@ fn owned_identity_rule(stage: &Expr) -> Option<OwnedIdentityRule> {
             | Builtin::Anchor
             | Builtin::DocumentIndex
             | Builtin::LineComment
+            // #798: same class as `line_comment` -- a metadata read that
+            // leaves the value standing where it stood.
+            | Builtin::HeadComment
+            | Builtin::FootComment
             | Builtin::SplitDoc
             | Builtin::Shuffle
             | Builtin::Trim
