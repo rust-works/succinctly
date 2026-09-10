@@ -83,6 +83,28 @@ struct BlockScalarHeader {
     explicit_indent: u8,
 }
 
+/// Head/line/foot comments attached to one node, keyed by its own bp
+/// position (#798 PR2). `head`/`foot` hold zero or more standalone `#` lines
+/// (consecutive lines join into one logical block, hence `Vec` rather than
+/// `Option` -- real yq treats them as one comment either way, and #1085
+/// needs more than one comment associated with a single node at all).
+///
+/// `head`/`foot` are always empty today -- capturing standalone comment
+/// lines is separate, follow-up work; this type only widens the storage
+/// shape so that work has somewhere to write. `line` alone is exactly the
+/// single-slot `(u32, u32)` this type replaces, with unchanged semantics.
+#[derive(Debug, Clone, Default)]
+pub struct NodeComments {
+    /// Standalone `#` lines directly above the node. Always empty today.
+    pub head: Vec<(u32, u32)>,
+    /// The node's own trailing same-line comment: `(start, end)` byte range
+    /// of the raw comment text, starting at `#` and running to end of line
+    /// (exclusive of the line break, inclusive of any trailing whitespace).
+    pub line: Option<(u32, u32)>,
+    /// Standalone `#` lines directly below the node. Always empty today.
+    pub foot: Vec<(u32, u32)>,
+}
+
 /// Output from parsing: the semi-index structures.
 #[derive(Debug)]
 pub struct SemiIndex {
@@ -121,12 +143,10 @@ pub struct SemiIndex {
     pub aliases: BTreeMap<usize, usize>,
     /// Explicit source tags: BP position → raw tag text (see [`YamlIndex::get_tag`](super::index::YamlIndex::get_tag))
     pub tags: BTreeMap<usize, String>,
-    /// Trailing same-line comments: BP position of the node the comment trails →
-    /// `(start, end)` byte range of the raw comment text, starting at `#` and
-    /// running to end of line (exclusive of the line break, inclusive of any
-    /// trailing whitespace). Only line comments (issue #710) — standalone
-    /// head/foot comments are not captured.
-    pub line_comments: BTreeMap<usize, (u32, u32)>,
+    /// Head/line/foot comments, keyed by the BP position of the node they
+    /// attach to. See [`NodeComments`] -- only `line` (issue #710) is
+    /// captured today; `head`/`foot` are always empty.
+    pub comments: BTreeMap<usize, NodeComments>,
 }
 
 /// Maximum nesting depth for recursively-parsed constructs (flow collections
@@ -207,10 +227,9 @@ struct Parser<'a, const HAS_CR: bool> {
     /// so a stale value can only equal the position of the exact node the
     /// property was scanned for — never any later node.
     pending_property_bp: Option<usize>,
-    /// Trailing same-line comments collected during parsing: bp_pos of the
-    /// owning node → `(start, end)` byte range of the raw `#...` comment text.
-    /// See [`SemiIndex::line_comments`].
-    line_comments: BTreeMap<usize, (u32, u32)>,
+    /// Head/line/foot comments collected during parsing, bp_pos of the
+    /// owning node → [`NodeComments`]. See [`SemiIndex::comments`].
+    comments: BTreeMap<usize, NodeComments>,
 
     /// A comment trailing a `&anchor`/`!tag` whose value is deferred to a
     /// later line, not yet attached to any node (#784).
@@ -318,7 +337,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             aliases: BTreeMap::new(),
             tags: BTreeMap::new(),
             pending_property_bp: None,
-            line_comments: BTreeMap::new(),
+            comments: BTreeMap::new(),
             pending_head_comment: None,
             in_document: false,
             document_start_bp_pos: 0,
@@ -532,13 +551,17 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     #[inline]
     fn maybe_capture_line_comment(&mut self, owner_bp_pos: usize) {
         if let Some(range) = self.scan_trailing_comment() {
-            self.line_comments.entry(owner_bp_pos).or_insert(range);
+            self.comments
+                .entry(owner_bp_pos)
+                .or_default()
+                .line
+                .get_or_insert(range);
         }
     }
 
     /// Like [`Self::maybe_capture_line_comment`], but the owning node doesn't
     /// exist yet: stash the comment's byte range in
-    /// [`Self::pending_head_comment`] instead of `line_comments` directly.
+    /// [`Self::pending_head_comment`] instead of `comments` directly.
     /// [`Self::take_pending_head_comment`] attaches it once that node opens
     /// (#784).
     ///
@@ -581,14 +604,18 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// same-line capture for the same `owner_bp_pos` has already had its
     /// chance to run (e.g. after `maybe_capture_line_comment`/
     /// `set_bp_text_end`'s own call for that bp), never before. Both use the
-    /// same `entry().or_insert()` idiom, so whichever runs first wins the
-    /// slot — calling this first would silently destroy a node's own
-    /// genuine trailing comment in favor of an unrelated floated one instead
-    /// of just leaving the floated one to be dropped (#784 review).
+    /// same "leave an existing slot alone" idiom, so whichever runs first
+    /// wins the slot — calling this first would silently destroy a node's
+    /// own genuine trailing comment in favor of an unrelated floated one
+    /// instead of just leaving the floated one to be dropped (#784 review).
     #[inline]
     fn take_pending_head_comment(&mut self, owner_bp_pos: usize) {
         if let Some(range) = self.pending_head_comment.take() {
-            self.line_comments.entry(owner_bp_pos).or_insert(range);
+            self.comments
+                .entry(owner_bp_pos)
+                .or_default()
+                .line
+                .get_or_insert(range);
         }
     }
 
@@ -5349,7 +5376,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             bp_to_anchor: core::mem::take(&mut self.bp_to_anchor),
             aliases: core::mem::take(&mut self.aliases),
             tags: core::mem::take(&mut self.tags),
-            line_comments: core::mem::take(&mut self.line_comments),
+            comments: core::mem::take(&mut self.comments),
         })
     }
 

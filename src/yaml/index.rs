@@ -20,7 +20,7 @@ use super::advance_positions::{build_cumulative_rank, OpenPositions};
 use super::end_positions::EndPositions;
 use super::error::YamlError;
 use super::light::YamlCursor;
-use super::parser::build_semi_index;
+use super::parser::{build_semi_index, NodeComments};
 use super::starts_seq_entry;
 
 /// Index structures for navigating YAML.
@@ -72,9 +72,10 @@ pub struct YamlIndex<W = Vec<u64>> {
     /// resolves to a tag by reference the way an alias resolves to an
     /// anchor, so this is a single side table, not three (#224).
     tags: BTreeMap<usize, String>,
-    /// Trailing same-line comments: BP position of the owning node → `(start, end)`
-    /// byte range of the raw `#...` comment text (issue #710).
-    line_comments: BTreeMap<usize, (u32, u32)>,
+    /// Head/line/foot comments, keyed by the BP position of the owning node.
+    /// See [`NodeComments`] -- only `line` (issue #710) is captured today;
+    /// `head`/`foot` are always empty (#798 PR2).
+    comments: BTreeMap<usize, NodeComments>,
     /// Line starts for line/column lookup (built lazily on first use).
     /// Only needed by `to_line_column()` and `to_offset()` (used by the
     /// `yq-locate` CLI and the `at_position` jq builtin).
@@ -156,7 +157,7 @@ impl YamlIndex<Vec<u64>> {
             bp_to_anchor: semi.bp_to_anchor,
             aliases: semi.aliases,
             tags: semi.tags,
-            line_comments: semi.line_comments,
+            comments: semi.comments,
             lines: OnceCell::new(),
             canonicalize_numbers: false,
         };
@@ -191,7 +192,7 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         // position, last-wins) by inversion rather than #1353's per-
         // declaration tracking: this constructor takes a pre-built
         // `anchors` map with no per-declaration history left to recover,
-        // and (like `line_comments` below) has no caller in this codebase
+        // and (like `comments` below) has no caller in this codebase
         // today to regress on a redefined-anchor input.
         let bp_to_anchor: BTreeMap<usize, String> = anchors
             .iter()
@@ -216,10 +217,10 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
             bp_to_anchor,
             aliases,
             tags,
-            // `from_parts` predates line-comment tracking and has no caller
+            // `from_parts` predates comment tracking and has no caller
             // in this codebase today; a future caller that needs it can be
             // given an explicit parameter then.
-            line_comments: BTreeMap::new(),
+            comments: BTreeMap::new(),
             lines: OnceCell::new(),
             canonicalize_numbers: false,
         }
@@ -537,7 +538,23 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
     /// already-retained text rather than a stored string.
     #[inline]
     pub fn get_line_comment(&self, bp_pos: usize) -> Option<(u32, u32)> {
-        self.line_comments.get(&bp_pos).copied()
+        self.comments.get(&bp_pos).and_then(|c| c.line)
+    }
+
+    /// Get the standalone `#` comment lines directly above a BP position
+    /// (#798 PR2). Always empty today -- capturing these is separate,
+    /// follow-up work; this getter exists only so that work has a stable
+    /// place to read from.
+    #[inline]
+    pub fn get_head_comments(&self, bp_pos: usize) -> &[(u32, u32)] {
+        self.comments.get(&bp_pos).map_or(&[], |c| &c.head)
+    }
+
+    /// Get the standalone `#` comment lines directly below a BP position
+    /// (#798 PR2). Always empty today -- see [`Self::get_head_comments`].
+    #[inline]
+    pub fn get_foot_comments(&self, bp_pos: usize) -> &[(u32, u32)] {
+        self.comments.get(&bp_pos).map_or(&[], |c| &c.foot)
     }
 
     /// Resolve an alias at the given BP position to a cursor pointing to
