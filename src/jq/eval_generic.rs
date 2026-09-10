@@ -106,7 +106,7 @@ use crate::json::JsonIndex;
 ///
 /// #2627 revisited this for [`to_owned`]/[`to_owned_cursor`] specifically:
 /// by the time the `needs_path_context` gate's "wildcard bridge" (the arms
-/// that fall to these two when an expression like `1+1`/`true and true`
+/// that fall to these two when an expression like `. + 1`/`. and true`
 /// doesn't need path context) started reaching this guard on an
 /// adversarially deep document, both functions had *already* grown a
 /// `Result<OwnedValue, EvalError>` signature for an unrelated reason
@@ -123,6 +123,15 @@ use crate::json::JsonIndex;
 /// [`to_owned_with_comments`] keeps the panic: it is reached only by
 /// `yq_runner.rs`'s comment/anchor-preserving DOM write path, not this
 /// bridge, and was out of #2627's scope.
+///
+/// A genuinely closed term (`1+1`, `true and true` -- no operand reads `.`
+/// anywhere) no longer reaches this guard at all: `bridge_ambient_input`
+/// (#2173's `walk::reads_ambient_value` gate, landed the same day as this
+/// fix) hands such a term `OwnedValue::Null` instead of the real document,
+/// so the depth check below never sees it. `. + 1`/`. and true` above are
+/// the minimal ambient-reading shapes that still route through the wildcard
+/// bridge while leaving `needs_path_context` false -- this guard, and its
+/// tests, deliberately use that shape rather than a fully closed one.
 ///
 /// 256, not the 128 `src/yaml/parser.rs`/`src/json/validate.rs` use for
 /// their own (unrelated) guards: `tests/jq_cli_tests.rs`'s
@@ -22584,13 +22593,21 @@ mod tests {
 
     /// #2627: the `needs_path_context` gate's wildcard/ambient bridge used
     /// to reach [`assert_nesting_depth`]'s `panic!` on a >256-deep document
-    /// for an expression that never even reads `.` -- e.g. `1+1`, whose
-    /// gated native arm (`Expr::Arithmetic`) only fires when an operand
-    /// needs path context, so an ungated `1+1` falls to the catch-all `_`
-    /// arm's `to_owned_with_cursor` materialization
-    /// ([`to_owned_cursor_at_depth`]). Called through [`eval`] (not the CLI,
-    /// which already wraps evaluation in `catch_unwind`, #1793) so this
-    /// pins the library-embedder-facing gap directly: no panic, just a
+    /// for an expression whose gated native arm (`Expr::Arithmetic`) only
+    /// fires when an operand needs path context, so an ungated arithmetic
+    /// expression falls to the catch-all `_` arm's `to_owned_with_cursor`
+    /// materialization ([`to_owned_cursor_at_depth`]). `. + 1`, not `1+1`:
+    /// a fully closed term (no operand reads `.` at all) no longer reaches
+    /// this materialization in the first place -- #2173's
+    /// `walk::reads_ambient_value` gate (`bridge_ambient_input`, landed the
+    /// same day as this fix) hands it `OwnedValue::Null` instead of the
+    /// real document, so the depth guard never sees it. `. + 1` keeps
+    /// `needs_path_context` false (routing through this same wildcard
+    /// bridge) while still reading `.` (`Expr::Identity` always reports
+    /// `reads_ambient_value == true`), so it's the minimal shape that still
+    /// exercises this guard. Called through [`eval`] (not the CLI, which
+    /// already wraps evaluation in `catch_unwind`, #1793) so this pins the
+    /// library-embedder-facing gap directly: no panic, just a
     /// `decode_failure`-tagged `Err`, same as real jq's own parse-time
     /// "Exceeds depth limit for parsing" rejection (which a `try`/`catch`
     /// inside the filter can't catch either, since jq's parser rejects the
@@ -22603,7 +22620,7 @@ mod tests {
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
         let value = cursor.value();
-        let expr = crate::jq::parse("1+1").unwrap();
+        let expr = crate::jq::parse(". + 1").unwrap();
 
         match eval(&expr, value) {
             GenericResult::Error(e) => {
@@ -22619,7 +22636,10 @@ mod tests {
     }
 
     /// Companion to the test above: an ungated `1+1` well under the limit
-    /// must still answer normally through the same wildcard bridge.
+    /// must still answer normally through the same wildcard bridge. Kept as
+    /// the fully closed `1+1` (unlike the over-limit test's `. + 1` above)
+    /// -- there's no depth guard to dodge here, and the closed shape is a
+    /// simpler check that ordinary evaluation is untouched.
     #[test]
     fn test_arithmetic_wildcard_bridge_accepts_nesting_under_limit_2627() {
         use crate::json::JsonIndex;
@@ -22642,15 +22662,23 @@ mod tests {
     /// the full materialization above (#2476's O(N) replacement for the
     /// bridge's O(2^N) cost) -- but its depth guard panicked exactly the
     /// same way before this fix, as its own doc comment
-    /// (`ambient_validation_error`) already flagged. `true and true` has no
-    /// path-context operand on either side, so it takes this route.
+    /// (`ambient_validation_error`) already flagged. `. and true`, not
+    /// `true and true`: both keep `needs_path_context` false (no `key`/
+    /// `parent`/`path` operand on either side, so this still takes the
+    /// bridge route), but a fully closed `true and true` no longer reaches
+    /// this walk at all -- #2173's `walk::reads_ambient_value` gate
+    /// (landed the same day as this fix) substitutes `OwnedValue::Null` for
+    /// a closed term before this function is ever called. `.` on the left
+    /// makes the whole expression ambient-reading (`Expr::Identity` always
+    /// reports `reads_ambient_value == true`), which is what keeps the real
+    /// document -- and this guard -- in the loop.
     ///
     /// [`eval_with_cursor`], not [`eval`]: `ambient_validation_error` walks
     /// from a `DocumentCursor`, so it is a deliberate no-op without one
     /// (see its own doc comment's "`None` without a cursor" paragraph) --
     /// this is the real public `succinctly::jq::eval` shape, which always
     /// supplies a cursor (confirmed live via `eval::eval`'s own
-    /// `needs_path_context` gate: a pipe like `key?, (true and true)` on a
+    /// `needs_path_context` gate: a pipe like `key?, (. and true)` on a
     /// document nested deeper than 256 levels reaches this exact guard
     /// through the public API, not just this module's own internal
     /// callers).
@@ -22661,7 +22689,7 @@ mod tests {
         let json = json.as_bytes();
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
-        let expr = crate::jq::parse("true and true").unwrap();
+        let expr = crate::jq::parse(". and true").unwrap();
 
         match eval_with_cursor(&expr, cursor) {
             GenericResult::Error(e) => {
@@ -22678,7 +22706,10 @@ mod tests {
 
     /// Companion to the test above: `true and true` well under the limit
     /// must still answer normally through `eval_boolean_generic`'s own
-    /// ambient-validation gate.
+    /// ambient-validation gate. Kept as the fully closed `true and true`
+    /// (unlike the over-limit test's `. and true` above) -- there's no
+    /// depth guard to dodge here, and the closed shape is a simpler check
+    /// that ordinary evaluation is untouched.
     #[test]
     fn test_boolean_ambient_validation_accepts_nesting_under_limit_2627() {
         use crate::json::JsonIndex;
@@ -22699,6 +22730,8 @@ mod tests {
     /// [`to_owned_with_cursor`]'s `Some(cursor)` branch
     /// ([`to_owned_cursor_at_depth`]) is fixed too, not just the `None`
     /// branch ([`to_owned_at_depth`]) that a cursor-less [`eval`] exercises.
+    /// `. + 1`, not `1+1`, for the same reason as the first test above: a
+    /// closed term no longer reaches this materialization at all.
     #[test]
     fn test_arithmetic_wildcard_bridge_with_cursor_reports_clean_error_past_nesting_limit_2627() {
         use crate::json::JsonIndex;
@@ -22706,7 +22739,7 @@ mod tests {
         let json = json.as_bytes();
         let index = JsonIndex::build(json);
         let cursor = index.root(json);
-        let expr = crate::jq::parse("1+1").unwrap();
+        let expr = crate::jq::parse(". + 1").unwrap();
 
         match eval_with_cursor(&expr, cursor) {
             GenericResult::Error(e) => {
