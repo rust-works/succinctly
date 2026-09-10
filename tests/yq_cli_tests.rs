@@ -13773,6 +13773,130 @@ fn test_sort_keys_preserves_comments_710() -> Result<()> {
     Ok(())
 }
 
+/// #798: the `head_comment`/`foot_comment` getters. Every expectation was
+/// captured from pinned `yq` v4.53.3 before being written here.
+mod head_foot_comment_798 {
+    use super::{run_jq_stdin, run_yq_stdin, run_yq_stdin_with_stderr};
+    use anyhow::Result;
+
+    #[test]
+    fn a_leading_block_is_the_documents_head_798() -> Result<()> {
+        let (out, code) = run_yq_stdin(". | head_comment", "# lead\na: 1\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out.trim_end(), "lead");
+        Ok(())
+    }
+
+    #[test]
+    fn consecutive_lines_join_with_a_newline_798() -> Result<()> {
+        let (out, code) = run_yq_stdin(". | head_comment", "# l1\n# l2\na: 1\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "l1\nl2\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_trailing_block_detached_by_a_blank_is_the_documents_foot_798() -> Result<()> {
+        let (out, code) = run_yq_stdin(". | foot_comment", "a: 1\n\n# trail\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out.trim_end(), "trail");
+        Ok(())
+    }
+
+    /// A sequence item owns its head/foot directly — no `key` step, unlike
+    /// a mapping entry.
+    #[test]
+    fn sequence_items_answer_directly_798() -> Result<()> {
+        let (out, code) = run_yq_stdin(".[1] | head_comment", "- 1\n# mid\n- 2\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out.trim_end(), "mid");
+
+        let (out, code) = run_yq_stdin(".[0] | foot_comment", "- 1\n# mid\n\n- 2\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out.trim_end(), "mid");
+
+        let (out, code) = run_yq_stdin(".[1] | foot_comment", "- 1\n- 2\n# trail\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out.trim_end(), "trail");
+        Ok(())
+    }
+
+    /// Total function: always a string, `""` when absent, never an error —
+    /// including on computed values with no document position at all.
+    #[test]
+    fn always_a_string_never_an_error_798() -> Result<()> {
+        for filter in [
+            ".a | head_comment",
+            ".a | foot_comment",
+            "1 | head_comment",
+            "[1,2] | head_comment",
+            "(.a + 1) | head_comment",
+        ] {
+            let (out, err, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[])?;
+            assert_eq!(code, 0, "[{filter}] stderr: {err}");
+            assert_eq!(out, "\n", "[{filter}] stdout: {out:?}");
+        }
+        let (out, code) = run_yq_stdin(".a | head_comment | type", "a: 1\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out.trim_end(), "!!str");
+        Ok(())
+    }
+
+    /// A mapping entry's *value* has no head comment of its own — the
+    /// comment belongs to its key. Matching real yq, which also answers "".
+    #[test]
+    fn a_mapping_values_own_head_is_empty_798() -> Result<()> {
+        let (out, code) = run_yq_stdin(".b | head_comment", "# lead\na: 1\n# mid\nb: 2\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "\n");
+        Ok(())
+    }
+
+    /// Known gap, deliberately inherited rather than newly invented: a
+    /// mapping entry's head/foot live on its **key** node, and a `key` stage
+    /// leaves the cursor domain, so this is `""` where real yq answers
+    /// `mid`. `line_comment` has had exactly this gap since #765
+    /// (`.a | key | line_comment` is `""` here, `keyc` in yq) — pinned so
+    /// the follow-up that closes it updates both together, deliberately.
+    #[test]
+    fn key_node_head_comment_is_not_reachable_yet_798() -> Result<()> {
+        let (out, code) = run_yq_stdin(".b | key | head_comment", "a: 1\n# mid\nb: 2\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "\n");
+
+        let (out, code) = run_yq_stdin(".a | key | line_comment", "a: # keyc\n  b: 1\n", &[])?;
+        assert_eq!(code, 0);
+        assert_eq!(out, "\n");
+        Ok(())
+    }
+
+    /// Ungated, exactly like `line_comment`: both parse in jq mode too and
+    /// answer "" there, JSON having no comments.
+    #[test]
+    fn jq_mode_parses_them_and_answers_empty_798() -> Result<()> {
+        for filter in [".a | head_comment", ".a | foot_comment"] {
+            let (out, code) = run_jq_stdin(filter, "{\"a\": 1}", &[])?;
+            assert_eq!(code, 0, "[{filter}]");
+            assert_eq!(out, "\"\"\n", "[{filter}] stdout: {out:?}");
+        }
+        Ok(())
+    }
+
+    /// Real yq raises this for every metadata slot piped into an
+    /// assignment, `head_comment`/`foot_comment` included.
+    #[test]
+    fn piped_as_an_assign_lhs_raises_yqs_own_error_798() {
+        for filter in [".a | head_comment = \"x\"", ".a | foot_comment = \"x\""] {
+            let (_out, err, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[]).expect("run");
+            assert_eq!(code, 1, "[{filter}] stderr: {err}");
+            assert!(
+                err.contains("'|' expects 2 args but there is 1"),
+                "[{filter}] stderr: {err}"
+            );
+        }
+    }
+}
+
 /// `line_comment` getter: strips `# ` (hash + one space) when present.
 #[test]
 fn test_line_comment_builtin_710() -> Result<()> {

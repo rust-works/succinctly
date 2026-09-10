@@ -10100,6 +10100,8 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::Column => builtin_column::<W>(),
         Builtin::DocumentIndex => builtin_document_index::<W>(),
         Builtin::LineComment => builtin_line_comment::<W>(),
+        // #798: no cursor domain here either, so the same empty string.
+        Builtin::HeadComment | Builtin::FootComment => builtin_line_comment::<W>(),
         Builtin::FileIndex => {
             // The ambient node origin (#2427) when the CLI installed one --
             // the ordinary multi-file path and `--eval-all` both do, per
@@ -23570,7 +23572,14 @@ fn yq_metadata_builtin_as_assign_path_error(path_expr: &Expr) -> Option<EvalErro
     }
     matches!(
         target,
-        Expr::Builtin(Builtin::LineComment | Builtin::Style | Builtin::Anchor | Builtin::Tag)
+        Expr::Builtin(
+            Builtin::LineComment
+                | Builtin::HeadComment
+                | Builtin::FootComment
+                | Builtin::Style
+                | Builtin::Anchor
+                | Builtin::Tag,
+        )
     )
     .then(|| EvalError::new("'|' expects 2 args but there is 1"))
 }

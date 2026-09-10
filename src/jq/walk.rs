@@ -165,6 +165,8 @@ pub fn builtin_kids(builtin: &Builtin) -> BuiltinKids<'_> {
         | Builtin::Column
         | Builtin::DocumentIndex
         | Builtin::LineComment
+        | Builtin::HeadComment
+        | Builtin::FootComment
         | Builtin::FileIndex
         | Builtin::Shuffle
         | Builtin::Pivot
@@ -453,6 +455,8 @@ pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr)
         | Builtin::Column
         | Builtin::DocumentIndex
         | Builtin::LineComment
+        | Builtin::HeadComment
+        | Builtin::FootComment
         | Builtin::FileIndex
         | Builtin::Shuffle
         | Builtin::Pivot
@@ -1231,6 +1235,8 @@ pub fn uses_cursor_metadata_builtins(expr: &Expr) -> bool {
                 | Builtin::Anchor
                 | Builtin::Style
                 | Builtin::LineComment
+                | Builtin::HeadComment
+                | Builtin::FootComment
                 | Builtin::AtOffset(_)
                 | Builtin::AtPosition(_, _)
         )

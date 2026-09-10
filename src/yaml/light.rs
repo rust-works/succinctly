@@ -2733,6 +2733,53 @@ impl<'a, W: AsRef<[u64]>> YamlCursor<'a, W> {
         Some(raw.strip_prefix("# ").unwrap_or(raw))
     }
 
+    /// The standalone `#` comment lines directly above this node — its
+    /// *head* comment (#798) — raw, `#` and all, one entry per line in
+    /// source order. Empty when there are none.
+    ///
+    /// A line whose bytes aren't valid UTF-8 is skipped, matching
+    /// [`Self::line_comment_raw`]'s tolerance: these getters serve output
+    /// paths that must keep rendering the rest of the document.
+    #[inline]
+    pub fn head_comment_raw(&self) -> impl Iterator<Item = &str> {
+        Self::decode_comment_lines(self.text, self.index.get_head_comments(self.bp_pos))
+    }
+
+    /// [`Self::head_comment_raw`]'s counterpart for the lines directly
+    /// *below* this node — its *foot* comment (#798).
+    #[inline]
+    pub fn foot_comment_raw(&self) -> impl Iterator<Item = &str> {
+        Self::decode_comment_lines(self.text, self.index.get_foot_comments(self.bp_pos))
+    }
+
+    /// Shared decode for [`Self::head_comment_raw`]/[`Self::foot_comment_raw`].
+    #[inline]
+    fn decode_comment_lines<'t>(
+        text: &'t [u8],
+        ranges: &'t [(u32, u32)],
+    ) -> impl Iterator<Item = &'t str> {
+        ranges.iter().filter_map(move |&(start, end)| {
+            core::str::from_utf8(&text[start as usize..end as usize]).ok()
+        })
+    }
+
+    /// This node's head comment with each line's leading `#` and at most one
+    /// following space stripped (#798) — the same `"# "`-only rule
+    /// [`Self::line_comment`] applies, so `#\ttabbed` and a bare `#` come
+    /// back verbatim, matching real yq.
+    #[inline]
+    pub fn head_comment(&self) -> impl Iterator<Item = &str> {
+        self.head_comment_raw()
+            .map(|raw| raw.strip_prefix("# ").unwrap_or(raw))
+    }
+
+    /// [`Self::head_comment`]'s counterpart for the foot comment (#798).
+    #[inline]
+    pub fn foot_comment(&self) -> impl Iterator<Item = &str> {
+        self.foot_comment_raw()
+            .map(|raw| raw.strip_prefix("# ").unwrap_or(raw))
+    }
+
     /// Get this node's trailing same-line comment, distinguishing "no
     /// comment" (`Ok(None)`) from "comment present but not valid UTF-8"
     /// (`Err(_)`) — unlike [`Self::line_comment`], which silently collapses
@@ -6706,6 +6753,20 @@ impl<'a, W: AsRef<[u64]> + Clone> DocumentCursor for YamlCursor<'a, W> {
     #[inline]
     fn line_comment_checked(&self) -> Result<Option<String>, core::str::Utf8Error> {
         YamlCursor::line_comment_checked(self).map(|opt| opt.map(ToString::to_string))
+    }
+
+    #[inline]
+    fn head_comment(&self) -> Vec<String> {
+        YamlCursor::head_comment(self)
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[inline]
+    fn foot_comment(&self) -> Vec<String> {
+        YamlCursor::foot_comment(self)
+            .map(ToString::to_string)
+            .collect()
     }
 
     #[inline]
