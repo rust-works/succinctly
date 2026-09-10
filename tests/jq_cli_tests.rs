@@ -44920,6 +44920,81 @@ fn test_alternative_control_flow_2476() -> Result<()> {
     Ok(())
 }
 
+/// #2692: jq mode's `key`/`parent`/`path` inside a `//` now read the position
+/// the stage actually stands on, catching up with yq mode.
+///
+/// This is a *fidelity gain that fell out of* #2692 rather than something it
+/// set out to change, and it is pinned because the issue explicitly asked
+/// that path-context shapes be confirmed unchanged -- this is the one that
+/// moved, so it needs a reason on the record.
+///
+/// #2476 gave `eval_single` a native `Expr::Alternative` arm whose operands
+/// are evaluated *with the cursor*, and pinned the result for yq mode in
+/// `test_alternative_operands_read_the_real_position_2476`
+/// (`tests/yq_cli_tests.rs`), against yq v4.53.3's own answers. jq mode did
+/// not benefit, because a top-level `//` never reached that arm: it went to
+/// `eval_each_generic`'s `bridge_to_each_owned_flow`, which re-roots the
+/// document at this stage's input, so `key` resolved against a fresh root and
+/// answered nothing -- and "nothing" is not truthy, so `//` silently
+/// substituted the other side. #2692 replaced that bridge with
+/// `each_alternative_generic`, and the position reads came with it.
+///
+/// | filter                    | `.a \| key` alone | before | now   |
+/// |---------------------------|-------------------|--------|-------|
+/// | `.a \| (key // 1)`        | `"a"`             | `1`    | `"a"` |
+/// | `.a \| (parent // 1)`     | the root          | `{}`   | root  |
+/// | `.a \| (path // 1)`       | `["a"]`           | `[]`   | `["a"]` |
+///
+/// The "before" column is the bug: the same `key` answered differently
+/// depending on whether a `//` was wrapped around it, which is the
+/// spelling-dependence #2692 exists to remove.
+///
+/// `key`/`parent`/`path` with no argument are succinctly extensions in jq
+/// mode (real jq 1.7.1 errors on all three), so there is no jq oracle here.
+/// yq mode is the oracle-backed sibling, and the two now agree.
+///
+/// Two shapes deliberately left alone, both unchanged by this commit and both
+/// matching what the yq test records: an *absent* position
+/// (`.a.missing | (key // 1)`) still answers the fallback rather than
+/// `"missing"`, and a `//` after `to_entries` has left the cursor domain
+/// before the `//` is reached, so `needs_path_context`'s lack of an
+/// `Expr::Alternative` arm still keeps that pipe off path-context evaluation
+/// (#715/#1405's recursion table, pinned by #2416, not this arm's).
+#[test]
+fn test_alternative_operands_read_the_real_position_in_jq_mode_2692() -> Result<()> {
+    let doc = r#"{"a":{"b":1,"e":2}}"#;
+
+    for (filter, want) in [
+        (".a | (key // 1)", r#""a""#),
+        (".a.b | (key // \"x\")", r#""b""#),
+        (".a | (parent // 1)", r#"{"a":{"b":1,"e":2}}"#),
+        (".a | (path // 1)", r#"["a"]"#),
+        // `key` on the *right* side answers too: `.missing` is absent, so
+        // the fallback runs, and it runs at the same position.
+        (".a | (.missing // key)", r#""a""#),
+        // The bare spellings the rows above must now agree with.
+        (".a | key", r#""a""#),
+        (".a | path", r#"["a"]"#),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), want, "`{filter}` -- stderr: {stderr:?}");
+    }
+
+    // The two shapes this does not reach, pinned so the table above is not
+    // read as "position reading through `//` is now generally correct".
+    for (filter, want) in [
+        (".a.missing | (key // 1)", "1"),
+        (".a | to_entries | .[] | (key // 99)", "99\n99"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), want, "`{filter}` -- stderr: {stderr:?}");
+    }
+
+    Ok(())
+}
+
 /// #2173: `//`'s sibling of `test_not_still_raises_on_a_malformed_document_2476`
 /// just above. #2476 gave `Expr::Alternative` a native arm that called
 /// `ambient_validation_error` unconditionally, because the whole construct

@@ -39,6 +39,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   #1804's container-vs-scalar-alias carve-out is gone with the walk it was a
   property of.
 
+- **`succinctly jq`'s `key`, `parent` and `path` inside a `//` now read the
+  position the stage stands on** (#2692). `{"a":{"b":1}} | .a | (key // 1)`
+  is `"a"`, where it was `1`; `.a | (parent // 1)` and `.a | (path // 1)`
+  likewise answer instead of `{}` and `[]`. The old answers came from the
+  streaming route's owned bridge, which re-roots the document at the stage's
+  input, so `key` resolved against a fresh root and produced nothing -- and
+  "nothing" is not truthy, so `//` substituted the other side. #2476 fixed
+  this for `succinctly yq` against yq v4.53.3's own answers; jq mode did not
+  benefit because a top-level `//` never reached the arm that fixed it. The
+  two modes now agree, and `.a | (key // 1)` agrees with a bare `.a | key`.
+  These three are succinctly extensions in jq mode (real jq errors on all of
+  them), so there is no jq behaviour to diverge from.
+
 - **`path()`, `key`, `parent` and `getpath()` now validate only the nodes they
   navigate through, instead of the whole document** (#2168): on
   `{"a":"\ud800","d":5}`, `path(.d)` and `getpath(["d"])` answer where they
