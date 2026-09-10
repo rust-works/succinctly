@@ -48759,7 +48759,7 @@ fn bind_def_call_params(body: &Expr, params: &[Param], args: &[Expr]) -> Expr {
         // behaviour, not a panic.
         let mut params_and_args = params.iter().zip(args.iter());
         let Some((first_param, first_arg)) = params_and_args.next() else {
-            return body.clone();
+            return body.clone(); // omni-dev: coverage tolerate-line reason="unreachable: bind_def_call only calls this for a non-empty params, and install_def_calls only builds a DefCall whose args.len() equals params.len(), so the zip is never empty here (#2560)"
         };
         let mut result = substitute_func_param(
             body,
@@ -48792,7 +48792,7 @@ fn bind_def_call_params(body: &Expr, params: &[Param], args: &[Expr]) -> Expr {
             // Unreachable for a well-formed `DefCall` (same arity invariant
             // as the non-duplicate path above); skipping rather than
             // unwrapping keeps a malformed one from taking the process down.
-            continue;
+            continue; // omni-dev: coverage tolerate-line reason="unreachable: `name` was just read from `params`, so the zip over (params, args) has a matching pair unless args is shorter than params, which install_def_calls' own arity guard rules out (#2560)"
         };
         result = substitute_func_param_impl(
             &result,
