@@ -6654,6 +6654,27 @@ fn each_alternative<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// `eval_single` strategy rather than `eval_each_generic`'s hardcoded
 /// `false` for a comparison operand -- this arm shadows `eval_boolean`, so
 /// it has to make the same choice `eval_boolean` does.
+/// The one `and`/`or` operand strategy for this evaluator (#2669): drive
+/// `operand` through [`eval_each`] and hand each output's truthiness bit to
+/// `bit_sink`.
+///
+/// Shared by [`eval_boolean`] (collects the bits) and [`each_boolean`]
+/// (forwards them), which differ only in what they do with the bits, never in
+/// how the operands are enumerated -- the collecting route used to enumerate
+/// them eagerly and so could not interleave. One definition rather than the
+/// same closure twice (the #106 rule); `eval_generic.rs` carries the mirror
+/// `boolean_operand_bits_generic`.
+fn boolean_operand_bits<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    operand: &Expr,
+    value: StandardJson<'_, W>,
+    optional: bool,
+    bit_sink: &mut dyn FnMut(bool) -> Demand,
+) -> Flow {
+    eval_each::<W, S>(operand, value, optional, &mut |item| {
+        bit_sink(item.is_truthy())
+    })
+}
+
 fn each_boolean<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     left: &Expr,
     right: &Expr,
@@ -6664,9 +6685,7 @@ fn each_boolean<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> Flow {
     boolean_fanout_each(
         |operand, bit_sink| {
-            eval_each::<W, S>(operand, value.clone(), optional, &mut |item| {
-                bit_sink(item.is_truthy())
-            })
+            boolean_operand_bits::<W, S>(operand, value.clone(), optional, bit_sink)
         },
         left,
         right,
@@ -9424,9 +9443,7 @@ fn eval_boolean<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // they do with the bits.
     boolean_fanout_core(
         move |operand, bit_sink| {
-            eval_each::<W, S>(operand, value.clone(), optional, &mut |item| {
-                bit_sink(item.is_truthy())
-            })
+            boolean_operand_bits::<W, S>(operand, value.clone(), optional, bit_sink)
         },
         left,
         right,

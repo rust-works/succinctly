@@ -10989,15 +10989,7 @@ fn eval_boolean_generic<S: EvalSemantics, V: DocumentValue>(
     // do with the bits.
     let (bools, control) = boolean_fanout_bools(
         |operand, bit_sink| {
-            let mut escape: Option<Control> = None;
-            let flow =
-                eval_each_generic::<S, V>(operand, value.clone(), optional, cursor, &mut |item| {
-                    match generic_item_truthiness(item) {
-                        Ok(bit) => bit_sink(bit),
-                        Err(control) => stop_with_escape(&mut escape, control),
-                    }
-                });
-            resume_from_escape(escape, flow)
+            boolean_operand_bits_generic::<S, V>(operand, value.clone(), optional, cursor, bit_sink)
         },
         left,
         right,
@@ -11172,6 +11164,38 @@ fn each_alternative_generic<S: EvalSemantics, V: DocumentValue>(
 /// to the loop, so the control it carries is recorded beside the drive and
 /// folded in as this operand's own `Flow::Escaped` -- the same out-of-band
 /// shape `fanout_arg_each`/`each_any_all_gen_cond` use in `eval.rs`.
+/// The one `and`/`or` operand strategy for this evaluator (#2669): drive
+/// `operand` through [`eval_each_generic`] and hand each output's truthiness
+/// bit to `bit_sink`.
+///
+/// Both callers use this -- [`eval_boolean_generic`], which collects the bits
+/// into a `Vec<bool>`, and [`each_boolean_generic`], which forwards them to a
+/// sink. They differ only in what they do with the bits, never in how the
+/// operands are enumerated, which is the whole point of #2669: the collecting
+/// route used to enumerate them eagerly and so could not interleave.
+///
+/// One definition rather than the same closure written twice (the #106 rule).
+/// The first cut of #2669 did copy it, which would have left the
+/// `Err(control)` arm duplicated -- and that arm is reached by neither copy in
+/// the suite today, so a second one is a second thing to keep honest for no
+/// gain.
+fn boolean_operand_bits_generic<S: EvalSemantics, V: DocumentValue>(
+    operand: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    bit_sink: &mut dyn FnMut(bool) -> Demand,
+) -> Flow {
+    let mut escape: Option<Control> = None;
+    let flow = eval_each_generic::<S, V>(operand, value, optional, cursor, &mut |item| {
+        match generic_item_truthiness(item) {
+            Ok(bit) => bit_sink(bit),
+            Err(control) => stop_with_escape(&mut escape, control),
+        }
+    });
+    resume_from_escape(escape, flow)
+}
+
 fn each_boolean_generic<S: EvalSemantics, V: DocumentValue>(
     left: &Expr,
     right: &Expr,
@@ -11183,15 +11207,7 @@ fn each_boolean_generic<S: EvalSemantics, V: DocumentValue>(
 ) -> Flow {
     boolean_fanout_each(
         |operand, bit_sink| {
-            let mut escape: Option<Control> = None;
-            let flow =
-                eval_each_generic::<S, V>(operand, value.clone(), optional, cursor, &mut |item| {
-                    match generic_item_truthiness(item) {
-                        Ok(bit) => bit_sink(bit),
-                        Err(control) => stop_with_escape(&mut escape, control),
-                    }
-                });
-            resume_from_escape(escape, flow)
+            boolean_operand_bits_generic::<S, V>(operand, value.clone(), optional, cursor, bit_sink)
         },
         left,
         right,
