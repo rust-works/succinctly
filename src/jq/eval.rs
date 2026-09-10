@@ -32086,13 +32086,27 @@ fn value_after_components<S: EvalSemantics>(
 /// fix-direction note called the borrowing walker blocked. The agreement
 /// test is
 /// `navigate_static_component_agrees_with_eval_owned_fast_path`.
-enum StaticAccess {
-    /// The child is at this position: `IndexMap` entry `i`, or array element
-    /// `i`. Already bounds-checked, and already resolved from the end for a
-    /// negative index, so neither extraction re-derives either.
-    Slot(usize),
-    /// The step reads as `null`: a missing key, an out-of-range index (either
-    /// sign), or a step through `null` -- none of which is an error in jq.
+enum StaticAccess<'e> {
+    /// The child is this key of the object `current`, if the object has it --
+    /// "if" being the *extraction's* business, because that is the one place
+    /// the two sides genuinely differ in cost. Resolving the key to a slot
+    /// here instead would make the destructive side hash twice: once to find
+    /// the slot, and again inside `swap_remove_index` to re-find the bucket
+    /// the entry belongs to. That measured a systematic +1.7-3.3% across
+    /// every `jq_write_path_two_branch_{del,assign}_depth` point on an M4
+    /// Pro -- small, but a real cost charged to `=`/`|=`/`del()` for a
+    /// `path()` fix, so the key is carried verbatim and each side does its
+    /// own single hashed lookup (`swap_remove` or `get`).
+    Field(&'e str),
+    /// The child is array element `i` -- already bounds-checked, and already
+    /// resolved from the end for a negative index, so neither extraction
+    /// re-derives either. Unlike `Field` there is no hashing involved for an
+    /// array, so resolving it here costs nothing.
+    Index(usize),
+    /// The step reads as `null`: an out-of-range index (either sign), or a
+    /// step through `null` -- neither an error in jq. (A missing *key* is
+    /// `null` too, but it is not known to be missing until the lookup
+    /// happens, so it arrives through `Field` above.)
     Null,
     /// Not a bare `Field`/`Index` ([`Expr::Slice`] above all). Both
     /// extractions hand it to [`eval_static_component_fallback`], which
@@ -32105,18 +32119,14 @@ enum StaticAccess {
 ///
 /// Takes `current` by reference deliberately: the destructive navigator calls
 /// this *before* consuming its value, which is sound only because the answer
-/// borrows nothing from it.
-fn classify_static_component(
-    component: &Expr,
+/// borrows from `component` (the `'e` below) and never from `current`.
+fn classify_static_component<'e>(
+    component: &'e Expr,
     current: &OwnedValue,
-) -> Result<StaticAccess, EvalEscape> {
+) -> Result<StaticAccess<'e>, EvalEscape> {
     match component {
         Expr::Field(name) => match current {
-            // A missing key is `null`, not an error, exactly as
-            // `eval_owned_fast_path`'s own `Field` arm has it.
-            OwnedValue::Object(map) => Ok(map
-                .get_index_of(name.as_str())
-                .map_or(StaticAccess::Null, StaticAccess::Slot)),
+            OwnedValue::Object(_) => Ok(StaticAccess::Field(name.as_str())),
             OwnedValue::Null => Ok(StaticAccess::Null),
             other => Err(EvalError::cannot_index_with_field(owned_type_name(other), name).into()),
         },
@@ -32130,7 +32140,7 @@ fn classify_static_component(
                 Ok(usize::try_from(resolved)
                     .ok()
                     .filter(|&i| i < items.len())
-                    .map_or(StaticAccess::Null, StaticAccess::Slot))
+                    .map_or(StaticAccess::Null, StaticAccess::Index))
             }
             OwnedValue::Null => Ok(StaticAccess::Null),
             other => {
@@ -32205,15 +32215,18 @@ fn navigate_static_component<S: EvalSemantics>(
 ) -> Result<Option<OwnedValue>, EvalEscape> {
     Ok(Some(
         match classify_static_component(component, &current)? {
-            StaticAccess::Slot(i) => match current {
-                OwnedValue::Object(mut map) => map
-                    .swap_remove_index(i)
-                    .map_or(OwnedValue::Null, |(_, value)| value),
+            // A missing key is `null`, not an error, exactly as
+            // `eval_owned_fast_path`'s own `Field` arm has it.
+            StaticAccess::Field(name) => match current {
+                OwnedValue::Object(mut map) => map.swap_remove(name).unwrap_or(OwnedValue::Null),
+                // Unreachable: `classify_static_component` answers `Field`
+                // only for an object. `null` is what it would answer for a
+                // key that is not there anyway, so this needs no panic.
+                _ => OwnedValue::Null,
+            },
+            StaticAccess::Index(i) => match current {
                 OwnedValue::Array(mut items) => items.swap_remove(i),
-                // Unreachable: `classify_static_component` answers `Slot` only
-                // for the object/array it resolved the slot against. `null` is
-                // the answer it would give for a slot that is not there anyway,
-                // so this needs no panic of its own.
+                // Unreachable, and `null`, for the same reasons.
                 _ => OwnedValue::Null,
             },
             StaticAccess::Null => OwnedValue::Null,
@@ -32281,6 +32294,20 @@ impl WalkNode<'_> {
         }
     }
 
+    /// The child under object key `name`, or [`Self::Null`] if the object
+    /// does not have it (jq's missing-key rule). The key half of
+    /// [`Self::child_at`]'s positional lookup -- separate because an object
+    /// lookup is hashed, and doing it once per step rather than once in
+    /// [`classify_static_component`] and again here is what keeps the
+    /// destructive twin's cost exactly where it was (see
+    /// [`StaticAccess::Field`]).
+    fn field(&self, name: &str) -> Self {
+        self.pick(|value| match value {
+            OwnedValue::Object(map) => map.get(name),
+            _ => None,
+        })
+    }
+
     /// The child at positional `slot` -- the `IndexMap` entry or array element
     /// [`classify_static_component`] resolved, or the one
     /// [`Expr::Iterate`](Expr) is enumerating.
@@ -32292,11 +32319,24 @@ impl WalkNode<'_> {
     /// so keeps the type closed under navigation. Residue's child has no
     /// document to borrow from and is cloned into a fresh `Rc` instead.
     fn child_at(&self, slot: usize) -> Self {
+        self.pick(|value| slot_of(value, slot))
+    }
+
+    /// Apply a child selector, keeping this node's kind: a document node's
+    /// child is another document node and a residue node's child is more
+    /// residue. The one place the borrow-vs-clone rule is written down.
+    ///
+    /// `pick` is higher-ranked so that the `Doc` arm can instantiate it at
+    /// the *document's* `'v` rather than at the shorter lifetime of the
+    /// `&self` it was reached through -- that is what keeps the result a
+    /// `WalkNode<'v>`, and so keeps the type closed under navigation.
+    fn pick<F>(&self, pick: F) -> Self
+    where
+        F: for<'a> Fn(&'a OwnedValue) -> Option<&'a OwnedValue>,
+    {
         match self {
-            Self::Doc(value) => slot_of(value, slot).map_or(Self::Null, Self::Doc),
-            Self::Made(value) => {
-                slot_of(value, slot).map_or(Self::Null, |child| Self::made(child.clone()))
-            }
+            Self::Doc(value) => pick(value).map_or(Self::Null, Self::Doc),
+            Self::Made(value) => pick(value).map_or(Self::Null, |child| Self::made(child.clone())),
             Self::Null => Self::Null,
         }
     }
@@ -32324,7 +32364,8 @@ fn navigate_static_component_ref<'v, S: EvalSemantics>(
 ) -> Result<Option<WalkNode<'v>>, EvalEscape> {
     Ok(Some(
         match classify_static_component(component, current.value())? {
-            StaticAccess::Slot(slot) => current.child_at(slot),
+            StaticAccess::Field(name) => current.field(name),
+            StaticAccess::Index(slot) => current.child_at(slot),
             StaticAccess::Null => WalkNode::Null,
             StaticAccess::Fallback => {
                 return Ok(
