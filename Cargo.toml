@@ -108,7 +108,7 @@ memchr = "2.7"
 # `proc-macro2/span-locations` gives the audit line numbers to report; edition
 # 2021 means resolver v2, so it does not unify into the proc-macro/build-
 # dependency graph that actually runs the derive macros.
-syn = { version = "2.0", features = ["full", "visit"] }
+syn = { version = "3.0", features = ["full", "visit"] }
 proc-macro2 = { version = "1.0", features = ["span-locations"] }
 
 [[bench]]
