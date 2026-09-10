@@ -28085,6 +28085,29 @@ fn test_load_yaml_multi_document_raises_on_any_bad_document_1801() -> Result<()>
     Ok(())
 }
 
+/// #2747: jq defines `flatten` as `if $x < 0 then error("flatten depth must
+/// not be negative") else _flatten($x) end`, where `$x < 0` is jq's own
+/// total ordering, not a plain integer sign check -- so `null`/`false`/
+/// `true`/a negative float/`nan` all raise the identical message a negative
+/// integer does, since each ranks (or, for `nan`, orders) below every
+/// number in that ordering. All values below are live jq 1.7.1 captures.
+#[test]
+fn test_flatten_negative_depth_message_matches_jq_across_ordering_2747() -> Result<()> {
+    for depth in ["-1", "-1.5", "null", "false", "true", "nan"] {
+        let filter = format!("flatten({depth})");
+        let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some("[[1]]"))?;
+        assert_eq!(
+            code, 5,
+            "`{filter}` -- stdout: {stdout:?} stderr: {stderr:?}"
+        );
+        assert!(
+            stderr.contains("flatten depth must not be negative"),
+            "`{filter}` -- stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #1164 coverage: a negative `flatten` depth still errors even when the
 /// argument generator that produced it also has a trailing break -- the
 /// error arm wins outright (own-error-supersedes-argument's-escape, same
@@ -28097,7 +28120,10 @@ fn test_flatten_negative_depth_errors_even_with_trailing_break_1164() -> Result<
         Some("[[1]]"),
     )?;
     assert_ne!(code, 0);
-    assert!(err.contains("non-negative"), "err={err}");
+    assert!(
+        err.contains("flatten depth must not be negative"),
+        "err={err}"
+    );
     Ok(())
 }
 

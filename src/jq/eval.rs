@@ -12760,8 +12760,22 @@ fn builtin_flatten_depth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 OwnedValue::Int(d) | OwnedValue::NumberLiteral(NumberRepr::Int(d), _) if d >= 0 => {
                     d as usize
                 }
-                OwnedValue::Int(_) | OwnedValue::NumberLiteral(NumberRepr::Int(_), _) => {
-                    return QueryResult::Error(EvalError::new("depth must be non-negative"));
+                // #2747: jq defines this as `if $x < 0 then error(...) else
+                // _flatten($x) end`, where `$x < 0` is jq's own total
+                // ordering (`compare_values`), not a plain integer sign
+                // check -- so `null`/`false`/`true`/a negative float/`nan`
+                // all take this arm too, matching real jq (`null`, `false`
+                // and `true` all rank below every number in that ordering;
+                // `nan` orders as less than every other number, including
+                // itself -- see `compare_values`'s own doc comment).
+                // Checked *after* the non-negative-int arm above so that
+                // arm still owns the success path unchanged.
+                ref other
+                    if compare_values(other, &OwnedValue::Int(0)) == core::cmp::Ordering::Less =>
+                {
+                    return QueryResult::Error(EvalError::new(
+                        "flatten depth must not be negative",
+                    ));
                 }
                 _ => return QueryResult::Error(EvalError::type_error("number", "non-number")),
             };
