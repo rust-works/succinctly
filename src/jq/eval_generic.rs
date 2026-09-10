@@ -2918,21 +2918,33 @@ fn fold_generic_owned_values<V: DocumentValue>(
 /// colliding-decode-failure-key -- and if so, the `Control::Error` a
 /// caller should raise.
 ///
-/// The shared document-validation gate behind three call sites spanning
-/// two feature families -- `select`'s truthiness check
-/// (`push_generic_truthiness`, the only one actually about truthiness;
-/// see its own doc comment for why it falls through to
-/// [`DocumentCursor::is_falsy`]'s silent "not falsy" default otherwise)
-/// and `sort_by`/`unique_by`/`min_by`/`max_by`'s comparison key
-/// (`key_elements_generic`) -- not a truthiness-specific helper despite
-/// this function's former name (#2413): each of those callers needs the
-/// #1247/#1194 validation below without ever materializing an
-/// `OwnedValue` for the subtree it's validating. In both, the subtree
-/// walked is the value the query tests or emits. The path-context walk
-/// (`path_context_root`) and `path(...)` (`eval_builtin`) used to be the
-/// other two callers, running this over the *whole document* to answer a
-/// bounded query; #2168 (direction 2) dropped that, so they validate only
-/// the nodes they navigate through, like `.d` does.
+/// **One caller remains**: `sort_by`/`unique_by`/`min_by`/`max_by`'s
+/// comparison key (`key_elements_generic`), which needs the #1247/#1194
+/// validation below without materializing an `OwnedValue` for the element
+/// it only ever reorders. Not a truthiness-specific helper despite this
+/// function's former name (#2413) -- and, since #2692, not a truthiness
+/// helper at all.
+///
+/// The caller list has shrunk three times, each time by the same argument
+/// applied one step further out, and the shape of that argument is why this
+/// function should not acquire new callers casually:
+///
+/// - #2168 (direction 2) removed the path-context walk (`path_context_root`)
+///   and `path(...)` (`eval_builtin`), which ran this over the *whole
+///   document* to answer a bounded query. Naming a position does not read
+///   what is inside it.
+/// - #2476 briefly *added* `and`/`or`/`not`/`//`/`any`/`all` via
+///   `ambient_validation_error`, standing in for a materialization it had
+///   just deleted.
+/// - #2692 removed those again together with `select`/`if`'s own
+///   truthiness check (`push_generic_truthiness`) and `//`'s left-operand
+///   filter (`retain_truthy_generic`). Testing a value is
+///   [`DocumentCursor::is_falsy`], which is O(1) and decodes nothing, so a
+///   filter that only tests reads nothing to validate.
+///
+/// The rule that survives, and the one a prospective caller must satisfy:
+/// **validate what you materialize.** `key_elements_generic` qualifies
+/// because it builds a comparison key.
 ///
 /// This is [`to_owned_cursor_at_depth`]'s own traversal and validation
 /// (same object/array unconsing, same key-collision guard) -- but it
@@ -7011,15 +7023,17 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // Ungated since #2476. The arm used to be gated on
         // `needs_path_context` (as `Expr::Arithmetic` above still is) purely
         // to keep the bridge's *ambient* materialization on the shapes that
-        // do not read a position, because that materialization is what makes
+        // do not read a position, because that materialization is what made
         // `try (1+1) catch "x"` raise on a malformed document. It also made
         // every such `and`/`or` -- `true and true` included, operands
         // irrelevant -- cost the size of the expanded document, which is
-        // exponential on an alias fan-out (#2476). `eval_boolean_generic`
-        // now runs the same raise as a validation walk that builds nothing,
-        // on exactly the shape that used to bridge; see
-        // `ambient_validation_error` for why that is the same raise-set and
-        // why the path-context shape is deliberately not charged for it.
+        // exponential on an alias fan-out (#2476). #2476 replaced it with an
+        // equivalent validation walk; #2692 removed that too, so an
+        // `and`/`or` validates only what its operands materialize. See
+        // `eval_boolean_generic` for the rule, and `eval_each_generic`'s own
+        // `Expr::And`/`Expr::Or` arms for the streaming route, which had to
+        // be ungated separately -- a *top-level* `true and true` reaches
+        // those, not these.
         Expr::And(left, right) => {
             eval_boolean_generic::<S, V>(left, right, false, value, optional, cursor)
         }
@@ -7033,14 +7047,9 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // alias-fan-out cost as the ungated `and`/`or` above (#2476). `not`
         // is exactly the truthiness of `.`, negated, and
         // `push_generic_truthiness` already computes that truthiness for
-        // the identity result: its `OneCursor` arm runs
-        // `push_generic_document_validation_error` over the ambient cursor
-        // before reading `is_falsy`, which IS the raise the bridge's
-        // `to_owned_with_cursor` used to produce -- see
-        // `ambient_validation_error`'s doc comment for the parity evidence.
-        // So unlike the `And`/`Or` arms above, this needs no separate
-        // `ambient_validation_error` call; the walk is already inline in
-        // the truthiness check it was going to do anyway.
+        // the identity result -- so this arm has never needed a validation
+        // call of its own, and since #2692 there is none to make: that
+        // function's `OneCursor` arm reads `is_falsy` and nothing else.
         //
         // `eval::eval_not`'s own comment argues a container that merely
         // *holds* an undecodable string should answer `false` rather than
@@ -16370,6 +16379,11 @@ fn path_context_single_native(expr: &Expr) -> bool {
         // eager fanouts alike so the two routes agree on `key + 1`), and the
         // ambient decode `try (1+1) catch "x"` depends on for a malformed
         // document, which the arm's own `needs_path_context` gate preserves.
+        // (`Expr::Arithmetic` is the last arm still holding that gate for
+        // that reason; #2692 took it from every truthiness reader, and jq
+        // mode's own `1+1` answers through the M2 streaming route rather
+        // than here. yq mode still raises there -- see the reference-probe
+        // note in `test_truthiness_probes_validate_nothing_2692`'s yq twin.)
         Expr::Arithmetic { left, right, .. } => {
             path_context_single_native(left) && path_context_single_native(right)
         }
@@ -16379,10 +16393,10 @@ fn path_context_single_native(expr: &Expr) -> bool {
         Expr::Negate(inner) => path_context_single_native(inner),
         // Native since spine 2416 gate reason 3 (#2473): `eval_single`'s own
         // `Expr::And`/`Expr::Or` arms, above, over `eval_boolean_generic`.
-        // Those arms lost their `needs_path_context` gate in #2476 -- the
-        // ambient decode the gate preserved is now `ambient_validation_error`,
-        // a walk that builds nothing -- so the admission no longer depends on
-        // that gate at all. This entry is unchanged and stays recursive for
+        // Those arms lost their `needs_path_context` gate in #2476, and the
+        // validation walk that briefly replaced the ambient decode the gate
+        // preserved is gone too (#2692) -- so the admission does not depend
+        // on that gate at all. This entry is unchanged and stays recursive for
         // the other half of the question: `eval_boolean_generic` evaluates
         // each operand through `eval_single`, so an operand outside this
         // closed list bridges *there* and reads its position as `null`,
@@ -16549,8 +16563,10 @@ fn path_context_single_native(expr: &Expr) -> bool {
 /// ADR-0018's decision order does not license that (step 2 favours the old
 /// behaviour, and no rule-4 condition applies); it is a divergence taken on
 /// its merits and recorded as one in `docs/compliance/jq/limitations.md`,
-/// which carries the reasons. `select` and the `sort_by` family
-/// keep their gate: the value they test or emit *is* the walk's domain.
+/// which carries the reasons. The `sort_by` family keeps its gate, and since
+/// #2692 is the only caller that does: it materializes a comparison key,
+/// while `select` merely tests truthiness and so joined this side of the
+/// line.
 fn path_context_root<V: DocumentValue>(root: V::Cursor) -> Result<PathContextPos<V>, Control> {
     // The walk's input is not always the document root: a nested pipe
     // (`first(.a | parent | parent)`) is walked from the node the outer
@@ -27704,10 +27720,12 @@ mod tests {
     }
 
     /// `retain_truthy_generic`'s bare `One` arm's own error branch: a
-    /// genuinely undecodable scalar (not reached through any cursor, so
-    /// neither `ambient_validation_error` nor an `OneCursor`-style walk ever
-    /// runs) still has to raise from `to_owned(&v)` rather than being
-    /// silently treated as truthy.
+    /// genuinely undecodable scalar, reached through the cursor-less
+    /// `eval()` entry point. This arm is where `//` still raises, and it is
+    /// unaffected by #2692 -- the cursor arms stopped validating because
+    /// `is_falsy` decodes nothing, but a bare `V` has no cursor to probe, so
+    /// answering its truthiness *is* `to_owned(&v)`. Materializing is what
+    /// raises, which is the rule rather than a leftover.
     #[test]
     fn test_generic_alternative_one_arm_decode_error_2476() {
         let json = br#""bad\qc""#;

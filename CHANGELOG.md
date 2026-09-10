@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A filter now validates only what it *materializes*** (#2692). `select`,
+  `if`, `not`, `and`, `or`, `//` and zero-arity `any`/`all` answer through
+  `DocumentCursor::is_falsy`, which is O(1) and decodes nothing, so none of
+  them validates the value it tests. On `{123: 1}`, `1 and 1` and `not` and
+  `select(.) | 1` and `false // 1` now answer at exit 0, where they exited 5.
+
+  The bug this fixes is the *inconsistency*, not the validation: `1+1`
+  already answered `2` on that document, so which answer you got depended on
+  how the filter was spelled. That is the exact per-spelling split
+  [ADR-0018](docs/adrs/adr-0018.md)'s #2103 amendment exists to remove, and
+  it now lists this as an instance. The issue named four arms
+  (`and`/`or`/`//`/`not`); its own justification for `not` -- truthiness
+  decodes nothing -- applies equally to `select`/`if`/`any`/`all`, so fixing
+  only the four would have closed one split and opened another.
+
+  **This is a deliberate divergence from jq, and it widens an existing one.**
+  Real jq rejects every such document at parse time, whatever the filter, so
+  each of these raising *matched* jq's observable outcome and no longer does.
+  ADR-0018's decision order does not license the change on its own -- step 2
+  favours the behaviour being given up -- which is why it is recorded against
+  that amendment in
+  [docs/compliance/jq/limitations.md](docs/compliance/jq/limitations.md) and
+  [docs/compliance/yq/limitations.md](docs/compliance/yq/limitations.md).
+  Nothing that raised for a *reading* reason stopped raising: `.`, `.a`,
+  `-Sc .`, `to_entries`, `sort_by(.a)`, every write and the printer itself
+  all still reject the same documents, and `{123: 1} | any` still raises
+  because jq iterates an object's *values* (#422), which resolves its keys.
+  #1804's container-vs-scalar-alias carve-out is gone with the walk it was a
+  property of.
+
 - **`path()`, `key`, `parent` and `getpath()` now validate only the nodes they
   navigate through, instead of the whole document** (#2168): on
   `{"a":"\ud800","d":5}`, `path(.d)` and `getpath(["d"])` answer where they
@@ -522,6 +552,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **A top-level `//`, `and` or `or` no longer materializes the whole
+  document** (#2692). #2476 removed that materialization from
+  `eval_single`'s arms, but the CLI's own route is `eval_each_generic`, which
+  still sent all three to `bridge_to_each_owned_flow` -- `to_owned_with_cursor`
+  + reindex + `eval.rs`. So a *nested* `[true and true]` was already cheap
+  while a bare `true and true` still built an `OwnedValue` copy of the entire
+  input. `and`/`or` now take the existing native `each_boolean_generic`
+  ungated, and `//` a new `each_alternative_generic`, so neither builds
+  anything. The same commit removes the `O(N)` validation walk from
+  `select`/`if`/`not`/`//`/`any`/`all`.
+
+  Both are structural -- work deleted, verifiable from the call graph -- but
+  **not quantified**: the developer machine was not idle when this landed,
+  and this project's own benchmarking discipline says a laptop under load is
+  not a measurement. Worth an interleaved A/B on the pinned benchmark hosts
+  (ARM M4 Pro and x86 7950X) before any speedup is claimed in a number.
+
 - **`succinctly yq`'s streaming write path no longer resolves a scalar
   mapping field's (or flow-mapping field's) value twice** (#1114): every
   ordinary `key: value` field wrote its value by first resolving it once to
@@ -621,8 +668,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   change, #1804's own accepted trade-off now covering these constructs too:
   a decode failure reachable only through a container alias no longer
   raises from an ambient-scoped `not`/`//`/`any`/`all` (or `and`/`or` when
-  neither operand itself navigates) -- see
-  [docs/compliance/yq/limitations.md](docs/compliance/yq/limitations.md).
+  neither operand itself navigates). **Superseded by #2692 below**, which
+  removed the walk entirely: the container-alias scoping in that sentence no
+  longer describes anything, since none of these constructs validates at all
+  now. See [docs/compliance/yq/limitations.md](docs/compliance/yq/limitations.md).
   The sibling spellings `any(cond)`/`any(gen;cond)`/`isvalid`/`while`/
   `until` remain bridged, left as follow-ups.
 
