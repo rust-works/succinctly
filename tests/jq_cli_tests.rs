@@ -20836,6 +20836,41 @@ fn test_partial_result_over_depth_value_reports_cleanly_not_panic_1371() -> Resu
     Ok(())
 }
 
+/// #2627: the `needs_path_context` gate's wildcard/ambient bridge used to
+/// reach `eval_generic.rs`'s `assert_nesting_depth` `panic!` on a >256-deep
+/// *document* (not a constructed value, unlike #1371's `test_partial_result_
+/// over_depth_value_reports_cleanly_not_panic_1371` above) for an expression
+/// that never reads `.` at all, e.g. `true and true` (`and`/`or` have no
+/// native path-context arm, so an ungated pair falls to the bridge purely to
+/// surface a document-level fault, per `eval_boolean_generic`'s own comment).
+/// Already shielded at the CLI boundary by `catch_unwind` (#1793) before this
+/// fix -- confirmed via `!stderr.contains("panicked")` below, so this pins
+/// the *absence* of a regression there while the real fix (`eval_generic.rs`'s
+/// depth guard no longer panics at all) is what protects a library embedder
+/// calling `succinctly::jq::eval` directly, which had no such net.
+#[test]
+fn test_boolean_wildcard_bridge_over_depth_document_reports_cleanly_not_panic_2627() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "true and true"], Some(&nested_arrays(300)))?;
+    assert_eq!(stdout.trim_end(), "");
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(!stderr.contains("panicked"), "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 256"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// Companion to the test above: `true and true` on a document well under
+/// the limit must still evaluate normally through the same bridge.
+#[test]
+fn test_boolean_wildcard_bridge_accepts_depth_under_limit_2627() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-c", "true and true"], Some(&nested_arrays(100)))?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "true");
+    Ok(())
+}
+
 /// #1381 regression guard: the weighted-cost check must not fire before an
 /// *ordinary, non-chained* recursive `def` reaches its own
 /// `MAX_FUNC_EXPANSION_DEPTH` budget -- `deep(49)` (a thin single-argument
