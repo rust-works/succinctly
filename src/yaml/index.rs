@@ -1243,6 +1243,63 @@ mod tests {
         )
     }
 
+    /// `head`/`foot` of document `di`'s own content node (0-indexed) — what
+    /// real yq answers `select(di==N) | . | head_comment` from. Used by the
+    /// multi-document boundary tests below, which reach past document 0.
+    fn doc_head_foot_at(yaml: &[u8], di: usize) -> (Vec<String>, Vec<String>) {
+        use crate::yaml::light::YamlValue;
+
+        let index = YamlIndex::build(yaml).expect("valid YAML");
+        let root = index.root(yaml);
+        let YamlValue::Sequence(docs) = root.value() else {
+            panic!("root is always the virtual document sequence"); // omni-dev: coverage tolerate-line reason="unreachable: YamlIndex::build always wraps the parsed document(s) in a virtual root Sequence, at TY index 0 (#798)"
+        };
+        let mut rest = docs;
+        for _ in 0..di {
+            let (_, tail) = rest.uncons_cursor().expect("document index in range");
+            rest = tail;
+        }
+        let (doc_cursor, _) = rest.uncons_cursor().expect("document index in range");
+        let bp = doc_cursor.bp_position();
+        (
+            raw_lines(yaml, index.get_head_comments(bp)),
+            raw_lines(yaml, index.get_foot_comments(bp)),
+        )
+    }
+
+    /// `head`/`foot` of a top-level mapping entry's *key* node within
+    /// document `di` (0-indexed). See [`Self::doc_head_foot_at`].
+    fn field_key_head_foot_in_doc(yaml: &[u8], di: usize, key: &str) -> (Vec<String>, Vec<String>) {
+        use crate::yaml::light::YamlValue;
+
+        let index = YamlIndex::build(yaml).expect("valid YAML");
+        let root = index.root(yaml);
+        let YamlValue::Sequence(docs) = root.value() else {
+            panic!("root is always the virtual document sequence"); // omni-dev: coverage tolerate-line reason="unreachable: YamlIndex::build always wraps the parsed document(s) in a virtual root Sequence, at TY index 0 (#798)"
+        };
+        let mut rest = docs;
+        for _ in 0..di {
+            let (_, tail) = rest.uncons_cursor().expect("document index in range");
+            rest = tail;
+        }
+        let (doc_cursor, _) = rest.uncons_cursor().expect("document index in range");
+        let YamlValue::Mapping(fields) = doc_cursor.value() else {
+            panic!("expected a mapping document"); // omni-dev: coverage tolerate-line reason="unreachable: every fixture field_key_head_foot_in_doc is called with in this test module is a top-level mapping (#798)"
+        };
+        for field in fields {
+            if let YamlValue::String(k) = field.key() {
+                if k.raw_bytes() == key.as_bytes() {
+                    let bp = field.key_cursor().bp_position();
+                    return (
+                        raw_lines(yaml, index.get_head_comments(bp)),
+                        raw_lines(yaml, index.get_foot_comments(bp)),
+                    );
+                }
+            } // omni-dev: coverage tolerate-line reason="unreachable: a mapping key is always emitted as YamlValue::String -- it is never type-inferred like a value (#222), so this if-let's pattern can never fail to match (#798)"
+        }
+        panic!("key {key} not found in document {di}"); // omni-dev: coverage tolerate-line reason="unreachable: every call to field_key_head_foot_in_doc in this test module passes a key that the fixture's document actually has (#798)"
+    }
+
     /// `head`/`foot` of a nested mapping entry's key, reached as
     /// `outer.inner` — the `.a.b | key | head_comment` shape.
     fn nested_key_head_foot(yaml: &[u8], outer: &str, inner: &str) -> (Vec<String>, Vec<String>) {
@@ -1481,6 +1538,40 @@ mod tests {
         );
     }
 
+    /// `blank_line_between`/`blank_line_precedes` (`src/yaml/parser.rs`)
+    /// both special-case a CRLF so it counts as one line break rather than
+    /// two -- otherwise a lone `\r\n` between a comment and the next node
+    /// would be misread as a blank line. Every shape here needs the CRLF
+    /// to sit *inside* the scanned range (not just at its edge) to actually
+    /// exercise that collapse, mirroring the LF originals:
+    /// `standalone_comment_attaches_forward_to_the_next_key_798`,
+    /// `a_blank_line_before_a_block_still_attaches_it_forward_798`,
+    /// `a_blank_line_after_a_block_attaches_it_back_to_the_previous_key_798`,
+    /// `a_trailing_block_at_eof_attaches_back_to_the_last_key_798`.
+    #[test]
+    fn crlf_blank_line_detection_collapses_each_crlf_to_one_break_798() {
+        // No blank line: forward-attaches to `b`, same as the LF case --
+        // `blank_line_between`'s scanned range holds exactly one CRLF, and
+        // must not miscount it as two breaks.
+        let (head, _) = field_key_head_foot(b"a: 1\r\n# mid\r\nb: 2\r\n", "b");
+        assert_eq!(head, ["# mid"]);
+
+        // A blank line *before* the comment: `blank_line_precedes` walks
+        // back over a CRLF to find the line before it.
+        let (head, _) = field_key_head_foot(b"a: 1\r\n\r\n# mid\r\nb: 2\r\n", "b");
+        assert_eq!(head, ["# mid"]);
+
+        // A blank line *after* the comment: `blank_line_between`'s scanned
+        // range now holds two full CRLFs back to back, so it must collapse
+        // the first before it can even reach the second.
+        let (_, foot) = field_key_head_foot(b"a: 1\r\n# mid\r\n\r\nb: 2\r\n", "a");
+        assert_eq!(foot, ["# mid"]);
+
+        // Trailing block at EOF, no next node at all.
+        let (_, foot) = field_key_head_foot(b"a: 1\r\nb: 2\r\n# trail\r\n", "b");
+        assert_eq!(foot, ["# trail"]);
+    }
+
     #[test]
     fn the_raw_range_keeps_the_hash_and_any_odd_spacing_798() {
         // `# ` (hash *space*) is stripped at read time, so a tab-separated
@@ -1499,6 +1590,102 @@ mod tests {
         let (head, foot) = virtual_root_head_foot(b"# only\n");
         assert_eq!(head, ["# only"]);
         assert!(foot.is_empty(), "{foot:?}");
+    }
+
+    /// A block sitting directly against a `---` boundary (no blank line
+    /// between it and the marker) stays with the *closing* document as its
+    /// own root foot, rather than following the ordinary
+    /// adjacent-attaches-forward rule onto the new document's head. Measured
+    /// against pinned yq v4.53.3:
+    /// `printf 'a: 1\n# mid\n---\nb: 2\n' | yq eval-all 'select(di==0) | . | foot_comment'`
+    /// => `mid`, with document 1's root head, `.a`'s key foot, and `.b`'s
+    /// key head all empty.
+    #[test]
+    fn a_block_adjacent_to_a_document_boundary_stays_with_the_closing_document_798() {
+        let yaml = b"a: 1\n# mid\n---\nb: 2\n";
+        let (_, doc0_foot) = doc_head_foot_at(yaml, 0);
+        assert_eq!(doc0_foot, ["# mid"]);
+        let (doc1_head, _) = doc_head_foot_at(yaml, 1);
+        assert!(doc1_head.is_empty(), "{doc1_head:?}");
+        let (_, a_foot) = field_key_head_foot_in_doc(yaml, 0, "a");
+        assert!(a_foot.is_empty(), "{a_foot:?}");
+        let (b_head, _) = field_key_head_foot_in_doc(yaml, 1, "b");
+        assert!(b_head.is_empty(), "{b_head:?}");
+    }
+
+    /// A block separated from the `---` boundary by a blank line takes the
+    /// ordinary path instead, attaching to `PREV` within the closing
+    /// document (its last key) exactly as it would without the boundary at
+    /// all. Measured: `.a | key | foot_comment` == "mid" for document 0;
+    /// document 0's own root foot is empty.
+    #[test]
+    fn a_block_separated_from_a_document_boundary_by_a_blank_attaches_to_prev_798() {
+        let yaml = b"a: 1\n# mid\n\n---\nb: 2\n";
+        let (_, a_foot) = field_key_head_foot_in_doc(yaml, 0, "a");
+        assert_eq!(a_foot, ["# mid"]);
+        let (_, doc0_foot) = doc_head_foot_at(yaml, 0);
+        assert!(doc0_foot.is_empty(), "{doc0_foot:?}");
+    }
+
+    /// A block right after `---`, with no blank line before the new
+    /// document's first key, attaches forward to that key's head exactly
+    /// like an ordinary in-document adjacent block -- unaffected by the
+    /// boundary since it never needs the no-`PREV` fallback. Measured:
+    /// `.b | key | head_comment` == "mid".
+    #[test]
+    fn a_block_right_after_a_document_boundary_attaches_forward_to_the_next_key_798() {
+        let yaml = b"a: 1\n---\n# mid\nb: 2\n";
+        let (b_head, _) = field_key_head_foot_in_doc(yaml, 1, "b");
+        assert_eq!(b_head, ["# mid"]);
+        let (_, doc0_foot) = doc_head_foot_at(yaml, 0);
+        assert!(doc0_foot.is_empty(), "{doc0_foot:?}");
+    }
+
+    /// A block right after `---`, separated from the new document's first
+    /// key by a blank line, has no `PREV` in the new document (nothing has
+    /// opened there yet) -- it reaches back across the boundary onto the
+    /// *closing* document's root foot instead of following the new
+    /// document's key forward. Measured: `select(di==0) | . | foot_comment`
+    /// == "mid"; `.b | key | head_comment` and document 1's own head are
+    /// both empty. This is the no-`PREV` fallback
+    /// [`Self::document_boundary_fallback_bp`] (`src/yaml/parser.rs`) exists
+    /// for.
+    #[test]
+    fn a_block_after_a_boundary_detached_by_a_blank_falls_back_to_the_closing_document_798() {
+        let yaml = b"a: 1\n---\n# mid\n\nb: 2\n";
+        let (_, doc0_foot) = doc_head_foot_at(yaml, 0);
+        assert_eq!(doc0_foot, ["# mid"]);
+        let (b_head, _) = field_key_head_foot_in_doc(yaml, 1, "b");
+        assert!(b_head.is_empty(), "{b_head:?}");
+        let (doc1_head, _) = doc_head_foot_at(yaml, 1);
+        assert!(doc1_head.is_empty(), "{doc1_head:?}");
+    }
+
+    /// The fallback is armed once per document and consumed the moment a
+    /// real node opens -- after `.b` opens as document 1's first key, a
+    /// *second*, later blank-detached block in the same document must fall
+    /// forward as usual (onto document 1's own head or later keys), never
+    /// reaching back across the boundary a second time.
+    #[test]
+    fn the_boundary_fallback_does_not_survive_past_the_first_key_of_the_new_document_798() {
+        let yaml = b"a: 1\n---\nb: 1\n\n# mid\n\nc: 2\n";
+        let (_, b_foot) = field_key_head_foot_in_doc(yaml, 1, "b");
+        assert!(b_foot.is_empty(), "{b_foot:?}");
+        let (c_head, _) = field_key_head_foot_in_doc(yaml, 1, "c");
+        assert_eq!(c_head, ["# mid"]);
+        let (_, doc0_foot) = doc_head_foot_at(yaml, 0);
+        assert!(doc0_foot.is_empty(), "{doc0_foot:?}");
+    }
+
+    /// A leading block before the very first document's own `---` has no
+    /// closing document to reach back to, so it must take the ordinary path
+    /// (document 0's own head) rather than being silently dropped by the
+    /// boundary-aware flush. Regression guard for the `old_root_bp: None`
+    /// arm of `flush_pending_head_lines_at_boundary`.
+    #[test]
+    fn a_leading_block_before_the_first_documents_own_marker_is_still_its_head_798() {
+        let (head, _) = doc_head_foot_at(b"# lead\n---\na: 1\n", 0);
+        assert_eq!(head, ["# lead"]);
     }
 
     #[test]
