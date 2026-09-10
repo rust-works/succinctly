@@ -99,6 +99,19 @@ const READING: &[&str] = &[
     "paths",
     "to_entries",
     "getpath([\"a\"])",
+    // Assignments: the output is the document with a modification, so they
+    // read `.` even when path and value are both closed. `(1) = 5` is the
+    // row that caught the missing arm (#1764's no-op turned into `null`).
+    "(1) = 5",
+    "1 = 5",
+    "(1+1) = 5",
+    "(1, 2) = 5",
+    ".a = 5",
+    "1 |= . + 1",
+    ".a += 1",
+    ".a //= 1",
+    "del(.a)",
+    "setpath([\"a\"]; 1)",
 ];
 
 fn outputs(doc: &str, filter: &str) -> Result<Vec<String>, String> {

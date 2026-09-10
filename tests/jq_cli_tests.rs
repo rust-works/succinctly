@@ -44123,6 +44123,17 @@ fn test_ambient_validation_agrees_with_bridge_2476() -> Result<()> {
         ("false or true", "true"),
         ("false // 1", "1"),
     ];
+    // Four corpus rows are not about validation at all: `xyz123`, `[1,2`,
+    // `["a` and `[1] x` give the CLI's document reader no root value to
+    // delimit, so it raises before any filter runs. `empty` is the
+    // reference for that -- it has been native since long before #2173, so
+    // wherever *it* raises the failure belongs to the reader and not to any
+    // filter. Measured on the binaries either side of this change: `empty`
+    // exits 5 on exactly those four documents and 0 on the other 29, both
+    // before and after. Pinning the closed probes against `empty` rather
+    // than against a hard-coded list of labels states the actual claim --
+    // a closed term behaves exactly as the filter that reads nothing and
+    // does nothing -- and keeps working if the corpus grows.
     for (label, doc, want_code, want_stderr) in corpus {
         let mut seen: Vec<(String, i32, String)> = Vec::new();
         for probe in probes {
@@ -44146,17 +44157,22 @@ fn test_ambient_validation_agrees_with_bridge_2476() -> Result<()> {
                 "[{label}] `{probe}` disagrees with `select(.) | 1`"
             );
         }
+        let (_, _, empty_code) = run_jq_full(&["-c", "empty"], Some(doc))?;
         for (probe, want_stdout) in closed_probes {
             let (stdout, stderr, code) = run_jq_full(&["-c", probe], Some(doc))?;
             assert_eq!(
-                code, 0,
-                "[{label}] closed `{probe}`: exit {code}, want 0\nstderr: {stderr}"
+                code, empty_code,
+                "[{label}] closed `{probe}`: exit {code}, but `empty` exits \
+                 {empty_code} -- a filter that reads nothing must answer \
+                 exactly as `empty` does\nstderr: {stderr}"
             );
-            assert_eq!(
-                stdout.trim_end(),
-                want_stdout,
-                "[{label}] closed `{probe}`: stdout {stdout:?}"
-            );
+            if empty_code == 0 {
+                assert_eq!(
+                    stdout.trim_end(),
+                    want_stdout,
+                    "[{label}] closed `{probe}`: stdout {stdout:?}"
+                );
+            }
         }
     }
     Ok(())

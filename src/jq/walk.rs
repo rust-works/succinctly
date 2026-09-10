@@ -1297,6 +1297,20 @@ fn node_reads_ambient(node: &Expr) -> bool {
         // on. `error(f)` is fine -- `f` is a child.
         Expr::Error(inner) => inner.is_none(),
 
+        // An assignment's *output* is the input document with a
+        // modification applied, so it reads `.` however closed its path
+        // and value happen to be. `(1) = 5` on `{a: 1}` has two literal
+        // children and must still answer `{a: 1}` -- yq's own no-op for an
+        // untracked path (#1764) -- not `null`. Caught by
+        // `test_yq_untracked_bare_noncomma_branch_noop_1764` when these
+        // four fell through to the "children decide" group below; that is
+        // the wrong-`false` direction this predicate exists to avoid, so
+        // it is spelled out rather than inferred.
+        Expr::Assign { .. }
+        | Expr::Update { .. }
+        | Expr::CompoundAssign { .. }
+        | Expr::AlternativeAssign { .. } => true,
+
         // Reads unless the builtin is one of the few that ignore their input
         // entirely. Everything with an argument still reads: `map(1)`,
         // `select(true)` and `add` all consult `.` however closed the
@@ -1356,11 +1370,7 @@ fn node_reads_ambient(node: &Expr) -> bool {
         | Expr::AsPattern { .. }
         | Expr::Label { .. }
         | Expr::FuncDef { .. }
-        | Expr::DefCall { .. }
-        | Expr::Assign { .. }
-        | Expr::Update { .. }
-        | Expr::CompoundAssign { .. }
-        | Expr::AlternativeAssign { .. } => false,
+        | Expr::DefCall { .. } => false,
     }
 }
 

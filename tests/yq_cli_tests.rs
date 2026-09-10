@@ -39745,14 +39745,15 @@ fn test_ambient_validation_agrees_with_bridge_2476() -> Result<()> {
         ("false root", "false\n", 0, ""),
         ("well-formed", "a: [1, {b: c}]\n", 0, ""),
     ];
-    let probes = [
-        "select(.) | 1",
-        "true and true",
-        "false or true",
-        ". and true",
-        "not",
-        "false // 1",
-        "(.a? // 1) | 1",
+    // #2173 moved the closed terms out of this list -- see the jq twin's
+    // own comment. They no longer validate anything, so they cannot agree
+    // with `select(.) | 1` on a malformed row and are pinned separately
+    // below.
+    let probes = ["select(.) | 1", ". and true", "not", "(.a? // 1) | 1"];
+    let closed_probes = [
+        ("true and true", "true"),
+        ("false or true", "true"),
+        ("false // 1", "1"),
     ];
     for (label, doc, want_code, want_stderr) in corpus {
         let mut seen: Vec<(String, i32, String)> = Vec::new();
@@ -39776,6 +39777,27 @@ fn test_ambient_validation_agrees_with_bridge_2476() -> Result<()> {
                 (ref_code, ref_first),
                 "[{label}] `{probe}` disagrees with `select(.) | 1`"
             );
+        }
+        // #2173: a closed term answers exactly as `empty` does -- the
+        // filter that reads nothing and does nothing. Pinning against
+        // `empty` rather than a hard-coded exit code keeps the rows where
+        // the *reader* rejects the file (rather than a filter validating
+        // it) honest without listing them by label. See the jq twin.
+        let (_, _, empty_code) = run_yq_stdin_with_stderr("empty", doc, &[])?;
+        for (probe, want_stdout) in closed_probes {
+            let (stdout, stderr, code) = run_yq_stdin_with_stderr(probe, doc, &[])?;
+            assert_eq!(
+                code, empty_code,
+                "[{label}] closed `{probe}`: exit {code}, but `empty` exits \
+                 {empty_code}\nstderr: {stderr}"
+            );
+            if empty_code == 0 {
+                assert_eq!(
+                    stdout.trim(),
+                    want_stdout,
+                    "[{label}] closed `{probe}`: stdout {stdout:?}"
+                );
+            }
         }
     }
     Ok(())
@@ -39916,9 +39938,28 @@ fn test_and_or_no_longer_raise_through_a_container_alias_2476() -> Result<()> {
     let doc = "a: &a [\"bad\\qc\"]\nb: *a\n";
 
     // The alias position: the walk stops at the alias, so the boolean
-    // answers instead of raising. This is the row that changed (exit 1
-    // before, exit 0 now).
-    for filter in [".b | (true and true)", ".b | (false or true)"] {
+    // answers instead of raising. This is the row #2476 changed (exit 1
+    // before it, exit 0 after).
+    //
+    // Spelled with a `.` operand since #2173. `true and true` no longer
+    // walks at *any* position -- it reads nothing, so it validates nothing
+    // -- which would make these rows pass for the wrong reason and stop
+    // saying anything about aliases at all. `. and true` reads, so it
+    // still walks, and the alias short-circuit is still what decides it.
+    for filter in [".b | (. and true)", ".b | (false or .)"] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &[])?;
+        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), "true", "`{filter}` -- stderr: {stderr:?}");
+    }
+
+    // #2173's own row, here so the contrast is visible in one place: the
+    // closed spelling answers at every position, including the two that
+    // raise below.
+    for filter in [
+        "true and true",
+        ".a | (true and true)",
+        ".b | (true and true)",
+    ] {
         let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &[])?;
         assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
         assert_eq!(stdout.trim(), "true", "`{filter}` -- stderr: {stderr:?}");
@@ -39933,7 +39974,7 @@ fn test_and_or_no_longer_raise_through_a_container_alias_2476() -> Result<()> {
     );
 
     // ...and so does the same boolean at the anchor itself.
-    let (_, stderr, code) = run_yq_stdin_with_stderr(".a | (true and true)", doc, &[])?;
+    let (_, stderr, code) = run_yq_stdin_with_stderr(".a | (. and true)", doc, &[])?;
     assert_ne!(code, 0, "stderr: {stderr:?}");
     assert!(
         stderr.contains("invalid escape sequence"),
@@ -39944,7 +39985,7 @@ fn test_and_or_no_longer_raise_through_a_container_alias_2476() -> Result<()> {
     // so a root-level `and` raises too -- the corpus test's own
     // "anchored container" row, restated here so the three positions this
     // test cares about sit together.
-    let (_, stderr, code) = run_yq_stdin_with_stderr("true and true", doc, &[])?;
+    let (_, stderr, code) = run_yq_stdin_with_stderr(". and true", doc, &[])?;
     assert_ne!(code, 0, "stderr: {stderr:?}");
     assert!(
         stderr.contains("invalid escape sequence"),
