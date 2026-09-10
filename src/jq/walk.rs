@@ -1240,11 +1240,11 @@ pub fn uses_cursor_metadata_builtins(expr: &Expr) -> bool {
 /// `false` means *closed term*: the expression's outputs are the same
 /// whatever the input is, so a caller about to materialize the input purely
 /// to have something to evaluate against can hand it `OwnedValue::Null`
-/// instead. That is what [`super::eval_generic::bridge_ambient_input`] does,
+/// instead. That is what `eval_generic::bridge_ambient_input` does,
 /// and on a 16 MB document it is the difference between 443 MB of peak RSS
 /// and 29 MB for `[1+1]`.
 ///
-/// **Conservative in exactly one direction.** [`node_reads_ambient`] is
+/// **Conservative in exactly one direction.** `node_reads_ambient` is
 /// exhaustive over `Expr` with no wildcard arm, so a new variant is a compile
 /// error rather than a silent "closed", and every node whose own semantics
 /// could reach `.` answers `true` even when a child would not. The failure
