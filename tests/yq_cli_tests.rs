@@ -41688,3 +41688,36 @@ mod issue_1360_identity_not_jq_equality {
         Ok(())
     }
 }
+
+/// #2686 (yq half): the no-re-parse wrong-arity path keeps yq mode's own
+/// carve-out — `expect`'s natural parse error, never jq's "X/N is not
+/// defined".
+///
+/// `wrong_arity_or_expect` is the non-jq arm of the fix that replaced
+/// `rewind_to_wrong_arity_call` at the sites holding parsed arguments, and it
+/// reproduces the rewinding version's mode split exactly: name/arity
+/// resolution is jq vocabulary, and real yq has nothing to match it against,
+/// so borrowing jq's wording here would be a new divergence rather than a fix
+/// (ADR-0018). Kept in this file because the yq spawn helpers live here.
+#[test]
+fn test_wrong_arity_special_form_keeps_yq_parse_error_2686() -> Result<()> {
+    for (filter, want_fragment) in [
+        ("until(1;2;3)", "expected ')', found ';'"),
+        ("while(1;2;3)", "expected ')', found ';'"),
+        ("first(1;2)", "expected ')', found ';'"),
+        ("last(1;2)", "expected ')', found ';'"),
+    ] {
+        let (_stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[])?;
+        assert_ne!(code, 0, "`{filter}`: expected a rejection");
+        assert!(
+            stderr.contains(want_fragment),
+            "`{filter}`: stderr {stderr:?} lacks {want_fragment:?}"
+        );
+        assert!(
+            !stderr.contains("is not defined"),
+            "`{filter}`: yq mode must not borrow jq's name/arity wording: {stderr:?}"
+        );
+    }
+
+    Ok(())
+}
