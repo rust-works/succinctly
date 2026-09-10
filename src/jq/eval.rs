@@ -30153,8 +30153,14 @@ fn walk_pattern(
 /// then write through. Not retrying costs only the rows where jq's *own*
 /// path error triggers the next alternative (`path(. as {a:$q} ?// $z |
 /// .a)`, jq `["a"]`) -- a refusal, the safe direction. A refusal jq raises
-/// only at `PATH_END` (an untracked branch) is likewise not observable here
-/// and does not retry.
+/// only at `PATH_END` (an untracked branch) reaches this loop as
+/// `ResolveFlow::Stopped` -- `resolve_terminal`'s sink refuses the branch
+/// with `Demand::Stop` -- and retries like jq's fork does, `first`/`limit`
+/// consumer stops excepted (`is_retryable_stop`); a downstream stage's
+/// *error* escape stops the same way and retries too, exactly as value
+/// mode's `each_pattern_alternatives` does, stale escape and all. What
+/// never retries is the resolver's own refusal, raised as an *error* inside
+/// the body, per the guard above.
 #[allow(clippy::too_many_arguments)] // STYLE-0004: the resolver's threaded ambients, as `resolve_node_sink`
 fn resolve_as_pattern<'a, S: EvalSemantics>(
     source: &Expr,
@@ -33686,6 +33692,15 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
             ) {
                 ResolveFlow::Exhausted => Demand::Continue,
                 other => {
+                    // #2649: the one producer that may push again after a
+                    // `Demand::Stop` is a `?//` retry (`resolve_as_pattern`,
+                    // jq's fork catching whatever the rest of the pipe
+                    // raised). A halt or a decode failure downstream must
+                    // not be re-run through the next alternative, so mark
+                    // it the way value mode's `stop_with_downstream` does.
+                    if let ResolveFlow::Escaped(escape) = &other {
+                        mark_nonretryable_escape(&Control::from(escape.clone()));
+                    }
                     downstream = Some(other);
                     Demand::Stop
                 }
