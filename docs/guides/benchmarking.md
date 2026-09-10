@@ -944,10 +944,10 @@ touches and whether the signal is sensitive to each of them.
 
 ### 9. Pin the build profile before comparing two binaries
 
-`Cargo.toml` has no `[profile.release]`, so `cargo build --release` uses Rust's default
-`codegen-units = 16`, no LTO — the crate is split into 16 independently-optimized chunks, and
-changing code in one module can shift how LLVM lays out *unrelated* modules in the binary. That
-has nothing to do with the diff under test: `succinctly jq type`, a query that touches no keys,
+Until #2603, `Cargo.toml` had no `[profile.release]`, so `cargo build --release` used Rust's
+default `codegen-units = 16`, no LTO — the crate was split into 16 independently-optimized
+chunks, and changing code in one module could shift how LLVM laid out *unrelated* modules in the
+binary. That has nothing to do with the diff under test: `succinctly jq type`, a query that touches no keys,
 measured **+12% on an M4 Pro and +27% on a 7950X** between two binaries whose diff cannot reach
 that code path (#1587). It doesn't bisect to the same commit on both machines either — the
 signature of a placement artifact, not a real regression, which always gives the same answer on
@@ -959,30 +959,79 @@ placement drift between two genuinely *different* builds.
 
 Rebuilding both sides with `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1` removes it —
 `docs/plan/jq-duplicate-key-collapse.md` collapsed that same +12%/+27% pair to +0.2% this way,
-mid-investigation, before the practice was written down here. Set the env var for both
-`--before` and `--after` builds, then tell `scripts/ab-cli.py`/`scripts/perf-ab.py` what you did
-via `--before-profile`/`--after-profile` (free text, e.g. `codegen-units=1`) — the scripts
-cannot read a binary's codegen-units back out, so they only warn when the two builds' profiles
-are unrecorded or don't match:
+mid-investigation, before the practice was written down here. Since #2603 the crate's own
+`[profile.release]` pins `codegen-units = 1` and `lto = "fat"`, so a plain
+`cargo build --release` on both sides already satisfies this rule. The env-var form is still
+the right tool when one side predates #2603 (build *both* sides with it, so the profiles match
+rather than the pinned side inheriting the old default from its own `Cargo.toml`), and either
+way tell `scripts/ab-cli.py`/`scripts/perf-ab.py` what you did via
+`--before-profile`/`--after-profile` (free text, e.g. `codegen-units=1,lto=fat`) — the scripts
+cannot read a binary's profile back out, so they only warn when the two builds' profiles are
+unrecorded or don't match:
 
 ```bash
-CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 cargo build --release --features cli   # both checkouts
+CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_LTO=fat \
+    cargo build --release --features cli   # both checkouts, when either predates #2603
 
 scripts/ab-cli.py --before ./succ-base --after ./succ-head \
-    --before-profile codegen-units=1 --after-profile codegen-units=1 \
+    --before-profile codegen-units=1,lto=fat --after-profile codegen-units=1,lto=fat \
     --corpus ~/wrk/bench-scratch/mycorpus
 ```
 
-The crate's actual `[profile.release]` is deliberately left at Rust's default: pinning
-`codegen-units = 1` there costs real compile time, with no benefit to the interactive
-edit-compile-test loop, which uses debug builds, not release — so this is a benchmarking-time
-convention, not a shipped build setting. Three interleaved clean `cargo build --release --features
-cli` reps (18-core Apple M5 Max, `Johns-M5-Pro-Max` — a development machine running concurrent
-work, not one of the idle bench boxes named elsewhere in this guide, so treat this as directional)
-measured **1.4x-1.9x slower** (median 1.8x; 28.9s/24.1s/31.2s at `codegen-units=16` vs
-51.4s/46.9s/42.3s paired at `codegen-units=1`). The multiplier scales with available parallelism —
-losing per-crate codegen concurrency costs more on a wider machine — so don't expect a fixed ratio
-across hardware.
+#### Why the shipped profile is pinned too (#2603)
+
+For a year this was a benchmarking-time convention only: the shipped profile stayed at the
+default because pinning costs compile time, and the interactive loop uses debug builds anyway.
+#2603 — the third layout anomaly filed rather than explained, after #595 and #1587 — measured
+what the default costs the *shipped* binary instead. One source tree (`8142a5899`), four
+profiles, each A/B'd against the default per rule 1 (7 interleaved reps, output identity gated:
+0 differences in 29 configurations per box, both boxes idle, control floors −0.05% M4 Pro /
++0.05% 7950X). Median of per-row medians, negative is faster than the default:
+
+| workload set                                 | M4 Pro cgu1 | M4 Pro thin | M4 Pro cgu1+fat | 7950X cgu1 | 7950X thin | 7950X cgu1+fat |
+|----------------------------------------------|-------------|-------------|-----------------|------------|------------|----------------|
+| jq `.`/`keys_unsorted`/`length`, 3 shapes    | +0.07%      | −0.35%      | −1.26%          | −4.01%     | −1.86%     | −6.12%         |
+| jq #2168 shapes, users 14/74 MB              | −0.06%      | −0.78%      | +0.05%          | −15.42%    | +0.58%     | −17.54%        |
+| yq `.`/`length`/`.[0]`, 3 shapes             | +1.16%      | −1.30%      | +0.24%          | −2.51%     | −0.43%     | −4.01%         |
+| clean `cargo build --release --features cli` | 53 s        | 27 s        | 73 s            | 57 s       | 25 s       | 76 s           |
+
+Default-profile build time: 26 s on the M4 Pro, 25 s on the 7950X. `cgu1` = `codegen-units=1`,
+`thin` = `lto="thin"` at 16 units, `cgu1+fat` = both. The medians hide the shape of the x86
+result: one codegen unit makes the 7950X's JSON index build **13-21% faster** (`length`,
+`keys_unsorted`, every #2168 row) and the jq identity print path **4-6% slower** (`cgu1+fat`;
+**10-13%** under `cgu1` alone), while `yq` improves on all nine rows. On the M4 Pro every
+profile is within ±1.5% of the default except `cgu1`'s YAML identity rows, a uniform +3.3%.
+
+The deciding measurement is not speed but *drift*. #2603's own commit pair (`3070562d6` →
+`417f0948d`, the `getpath` commit and its parent, a diff that cannot reach `keys_unsorted[0]`,
+`length` or `.[][0]`) was rebuilt under each profile and A/B'd on the issue's users 14/74 MB
+inputs:
+
+| profile  | M4 Pro median (range) | 7950X median (range)              |
+|----------|-----------------------|-----------------------------------|
+| default  | +0.35% (−1.0%..+0.7%) | **−14.13% (−16.8%..−11.8%, 6/6)** |
+| thin     | +0.25% (−0.0%..+0.8%) | +2.17% (−5.4%..+6.0%)             |
+| cgu1     | +0.63% (−1.4%..+1.4%) | −1.86% (−5.7%..+2.0%)             |
+| cgu1+fat | −0.71% (−2.8%..+0.3%) | +1.96% (+1.4%..+3.2%)             |
+
+Two things follow. The default-profile binary's speed on the index-build path is a **±15%
+lottery on x86_64** drawn by every unrelated commit — the −14% here is the 7950X's `cgu1`
+"win" above seen from the other side: the main-tip default build had drawn a bad layout, the
+`getpath` commit's had drawn a good one. And thin LTO does not close that lottery (a ±6% band on
+the same pair); one codegen unit does. `cgu1+fat` has the narrowest band of the four on both
+boxes and dominates `cgu1` alone on every speed row, so it is what `[profile.release]` pins.
+The +6.2% ARM cost #2603 was filed on did not reproduce on the same box with the same source
+under any profile, the default included (the mini's rustc had moved from the one that built the
+issue's binaries) — which is itself the layout diagnosis confirmed: the effect belonged to one
+compiler's partitioning of one tree, not to the code.
+
+What it costs: release builds compile **~3x slower** on both boxes (the earlier 1.4-1.9x figure
+for `cgu1` alone, from a busy M5 Max laptop, is superseded by the idle-box numbers above), and
+the x86 jq identity path gives back 4-6% — a *deterministic*, `cg_annotate`-attributable
+inlining outcome (#2655's second finding put an equivalent `Ir` delta in `json/light.rs`,
+`trees/bp.rs`, `document.rs` and `memcpy`), which is a fixable follow-up in a way a layout
+lottery never was — tracked as #2720. `[profile.bench]` inherits `release`, so `cargo bench`
+builds pay the same compile cost and measure the same code.
 
 Also worth knowing: #595's x86-only 12-28% `block_scalars` anomaly was closed as "expected, no
 action — binary code-layout artifact from the recompile," using cachegrind to show flat
@@ -1215,9 +1264,10 @@ test bench_name ... bench:  1,234 ns/iter (+/- 56)
 - **Platform**: CPU model and OS version
 - **Tool versions**: For comparison benchmarks (jq-1.6, yq v4.48.1)
 - **Build flags**: Any special RUSTFLAGS or features, and — for an A/B comparing two binaries —
-  whether `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1` was pinned on both sides (see [A/B
-  Benchmarking Method § 9](#a-b-benchmarking-method), #1587). Unstated means default
-  `codegen-units=16`, which can add its own ±10-27% independent of the change being measured.
+  which release profile built each side (see [A/B Benchmarking Method § 9](#a-b-benchmarking-method),
+  #1587). Since #2603 a plain `cargo build --release` is `codegen-units=1`, `lto="fat"`; a binary
+  built from a tree older than that is default `codegen-units=16`, which can add its own
+  ±10-27% independent of the change being measured, so say which.
 
 **Example**:
 ```markdown

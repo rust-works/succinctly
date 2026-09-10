@@ -619,6 +619,7 @@ For detailed documentation on optimization techniques used in this project, see 
 - Re-derive a break-even before trusting it (#106: the issue's stated 12.5% dropped a bits-to-bytes conversion; the real gate was 3.125%)
 - A hash table is not automatically cheaper than a sort — above L3 a sort streams and a table does not, and which wins is architecture-dependent (#1514: the same table beat the sort on an M4 Pro and lost 24% to it on a 7950X at 7.1M keys)
 - To attribute a cost, build the binary again with the feature *disabled* and measure that — timings alone cannot separate what a check costs from what the code around it costs (#1514: it proved #1385's cost was 100% its probe, and caught a larger regression introduced by the fix)
+- A build profile is part of the measurement *and* of the shipped binary: at cargo's default 16 codegen units the same commit pair read -14% on x86_64 for a diff that could not reach the queries, and thin LTO left that class in place; `[profile.release]` pins one codegen unit plus fat LTO for it (#2603, closing the class #595/#1587/#2655 kept filing). Release builds compile ~3x slower; the debug loop is untouched
 
 ### Benchmarking Discipline
 

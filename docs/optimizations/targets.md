@@ -58,7 +58,11 @@ rustflags = [
     "-C", "codegen-units=1",
 ]
 
-# Profile for maximum performance
+# Profile for maximum performance -- codegen-units/lto here duplicate the
+# crate's own [profile.release] in Cargo.toml (pinned by #2603 for the same
+# reason: a placement-dependent regression the default 16-unit profile let
+# through). Only opt-level (already the release default) and strip are this
+# config's own addition; if either side changes, keep them consistent.
 [profile.release]
 opt-level = 3
 lto = "fat"
