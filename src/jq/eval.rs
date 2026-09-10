@@ -38975,12 +38975,32 @@ fn walk_pipe<'v, S: EvalSemantics>(
         return walk_path::<S>(first, value, current_path, out, optional);
     }
 
+    // #2680: the stage's `Result` is held back rather than `?`-propagated
+    // here. Positions it reached *before* failing come earlier in jq's
+    // generator order than its own error, so they still have to be walked
+    // through `rest` -- only then does the error surface. Propagating first
+    // dropped `reached` on the floor, and with it every path those positions
+    // would have named: `path((.a[] | .b) | .c[0:1])` on
+    // `{"a":[{"b":{}},5]}` printed the error alone, where jq prints
+    // `["a",0,"b","c",{"start":0,"end":1}]` and *then* the error.
+    //
+    // `out` is the caller's buffer, which is why the same pipe written flat
+    // (`path(.a[] | .b | .c[0:1])`) was already correct -- its earlier
+    // positions were pushed straight to `out` and survived the propagation.
+    // Only this local `reached` was lost, so only a *nested* (parenthesised)
+    // stage-1 pipe showed the bug.
+    //
+    // Exactly the shape `eval_generic.rs`'s twin `path_walk_pipe_generic`
+    // already uses, and for the reason its own comment gives: never un-emit
+    // an output already produced.
     let mut reached = Vec::new();
-    walk_path::<S>(first, value, current_path, &mut reached, optional)?;
+    let stepped = walk_path::<S>(first, value, current_path, &mut reached, optional);
     for (path, val) in reached {
+        // A failure *here* is earlier in generator order than `stepped`'s
+        // own, so it wins -- same as the twin.
         walk_pipe::<S>(rest, val, &path, out, optional)?;
     }
-    Ok(())
+    stepped
 }
 
 /// Take one path step: `component` names it, and the value evaluator decides
