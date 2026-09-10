@@ -46604,6 +46604,18 @@ fn test_collection_literal_postfix_does_not_capture_destructuring_2667() -> Resu
 /// rest: 147 ms at depth 14 against `until/3`'s 215 ms, both ~1.9×/level.
 /// Hence the table below covers all eight forms rather than the two named.
 ///
+/// **Scope: the eight dedicated special-form parsers only.** The same shape
+/// still exists behind `parse_required_single_arg`, which rewinds *after*
+/// parsing its argument and signals "not a match" so its caller re-parses --
+/// so the ~30 single-argument builtins in `try_parse_builtin` (`has`,
+/// `select`, ...) keep it. Measured on this branch: `"has(" * d + "1" +
+/// ";2)" * d` costs 2.4 s at depth 18, identical to the merge base, where
+/// the forms below are flat. That is a different protocol
+/// (`Result<Option<_>>`, resolved by the caller's own shadow fallback rather
+/// than in place), so it is tracked separately rather than folded in here --
+/// this test deliberately does not cover it, and should not be read as
+/// saying the wider surface is fixed.
+///
 /// Same timing-guard shape and generous margin as
 /// `test_def_shadow_deep_nesting_does_not_blow_up_2036` and
 /// `test_module_def_shadow_deep_nesting_does_not_blow_up_2395`: at 40 levels
