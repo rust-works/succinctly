@@ -41440,6 +41440,26 @@ fn test_reduce_reenters_register_every_step_not_just_the_first_2632() -> Result<
     );
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
 
+    // Code review on this fix's own PR caught a gap: a step whose UPDATE
+    // produces zero outputs (`empty`) leaves the accumulator as `None`, and
+    // the widening above must still recognise it as identical to a
+    // `null`/`bool` register -- `acc_input` two lines below already treats
+    // `None` the same as a real `Null` via `unwrap_or`, so the identity
+    // check has to be computed against that same effective value, not
+    // skipped when `acc` isn't `Some`.
+    let (stdout, stderr, code) = run_jq_full(
+        &[
+            "-c",
+            "path(reduce (1,2,3) as $k (.b; if $k==1 then empty else .a end))",
+        ],
+        Some(r#"{"a":1,"b":null}"#),
+    )?;
+    assert_eq!(
+        (stdout.as_str(), code),
+        ("[\"b\"]\n", 0),
+        "stderr: {stderr:?}"
+    );
+
     Ok(())
 }
 

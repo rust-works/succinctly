@@ -30874,12 +30874,26 @@ fn resolve_reduce<'a, S: EvalSemantics>(
             // un-gated widening turns a refusal into a write where real yq
             // no-ops (`(null | .a) = 5` is a no-op on `null`, live against
             // v4.53.3).
-            if let Some(a) = acc.as_ref() {
-                acc_at_register = acc_at_register
-                    || (S::TAG == EvalTag::Jq
-                        && reg.trackable
-                        && register_identical(&reg.value, &reg.frame, a, &acc_snapshot));
-            }
+            //
+            // Checked against `acc`'s own *effective* value — `acc.as_ref()`
+            // unwrapped to `&OwnedValue::Null`, not gated on `acc.is_some()`
+            // -- because a step whose UPDATE produced zero outputs (`empty`)
+            // leaves `acc` as `None`, and the very next line already treats
+            // that the same as a real `Null` accumulator
+            // (`unwrap_or(OwnedValue::Null)`) when it becomes `acc_input`.
+            // Skipping the check on `None` missed exactly that case: a
+            // `null`/`bool` register is unconditionally identical to a
+            // `null` accumulator via `register_identical`'s kind-based
+            // clause, `None` included, since there is no pointer/snapshot
+            // involved for that arm at all. Confirmed live against jq 1.7.1:
+            // `path(reduce (1,2,3) as $k (.b; if $k==1 then empty else .a
+            // end))` on `{"a":1,"b":null}` is `["b"]`, matching only once
+            // this is unconditional.
+            let acc_effective = acc.as_ref().unwrap_or(&OwnedValue::Null);
+            acc_at_register = acc_at_register
+                || (S::TAG == EvalTag::Jq
+                    && reg.trackable
+                    && register_identical(&reg.value, &reg.frame, acc_effective, &acc_snapshot));
             let acc_input = acc.take().unwrap_or(OwnedValue::Null);
             match reg.resolve::<S>(
                 &substituted,
