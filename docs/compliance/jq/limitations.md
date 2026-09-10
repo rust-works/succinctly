@@ -2109,7 +2109,9 @@ missing-colon/stray-comma corruption in a subtree the query only ever
 validates (never emits) silently passed — `{"c":{"a":1,},"t":5} |
 select(.c) | .t` answered `5` instead of raising, confirmed live. (`path()` left
 that list again in #2168, which decided that naming a position should not
-validate what is inside it; `select`/`sort_by` keep the checks this fix added.) See
+validate what is inside it, and `select` left it again in #2692, which decided that
+*testing* a value does not read it either; the `sort_by` family keeps the checks this fix
+added.) See
 this doc's "The validate-only traversal..." entry in `CHANGELOG.md` for
 the fix; the underlying lesson stands even though this specific
 conclusion didn't: a function lacking its own checks by inspection can
@@ -3516,6 +3518,23 @@ that reads nothing:
 | `1+1`, `try (1+1)`, `try (1+1) catch "x"` | `{"\ud800":1,"\ud800":2}`                                                       | error    | error — **matched jq** | `2` — **diverges**         |
 | `.,.`                                     | `{"\ud800":1,"\ud800":2}`                                                       | error    | error — **matched jq** | echoes twice — **diverges** |
 
+[#2692](https://github.com/rust-works/succinctly/issues/2692) extended the same divergence to
+every filter that reads only a value's **truthiness**. These rows moved for the same reason
+and are recorded against the same amendment:
+
+| filter                                                  | document                            | jq 1.7.1 | before #2692           | now                     |
+|---------------------------------------------------------|-------------------------------------|----------|------------------------|-------------------------|
+| `true and true`, `1 and 1`, `. and true`, `false or true` | `{123: 1}`, `["\x"]`, `{"\ud800":1,"\ud800":2}` | error | error — **matched jq** | `true` — **diverges**   |
+| `false // 1`, `1 // 2`                                  | same three                          | error    | error — **matched jq** | `1` — **diverges**      |
+| `not`, `.[] \| not`                                     | same three                          | error    | error — **matched jq** | `false` — **diverges**  |
+| `select(.) \| 1`, `if . then 1 else 2 end`              | same three                          | error    | error — **matched jq** | `1` — **diverges**      |
+| `any`, `all`                                            | `["\x"]`, `{"\ud800":1,"\ud800":2}` | error    | error — **matched jq** | `true` — **diverges**   |
+
+The last row's document list is shorter on purpose: `any`/`all` iterate an *object's* values
+under jq's own last-occurrence duplicate-key rule (#422), which resolves the keys — so
+`{123: 1} | any` still raises, because resolving a key reads it. That is the rule applying
+inside a single builtin, not an exception to it.
+
 Step 2 of ADR-0018's decision order therefore separates the two options and favours the
 behaviour being given up. No rule-4 condition applies — the output is readable, nothing is
 corrupted or discarded, and neither choice takes the process down. **This is a deliberate
@@ -3537,6 +3556,15 @@ and for the same three reasons:
 
 The rule #2168 recorded — *a builtin that navigates to a position validates only what it
 reads; one that materializes validates everything it materializes* — is what decides this.
+Since #2692 only its second half is needed, because "reads" turned out to be doing two jobs:
+navigating to a position and *testing* a value both leave the bytes undecoded, and only
+materializing looks at them. The rule is therefore now stated as **a filter validates only
+what it materializes, and everything it materializes**, with no exceptions — `select`, `if`,
+`not`, `and`/`or`, `//` and zero-arity `any`/`all` all answer through
+`DocumentCursor::is_falsy`, which is O(1) and decodes nothing, and so all validate nothing.
+`sort_by`/`unique_by`/`min_by`/`max_by` remain the one validating family, because they
+materialize a comparison key for an element they otherwise only reorder.
+
 `1+1` reads nothing and validates nothing. `.,.` forwards the root cursor to the printer,
 which walks it exactly as `.` does, so a structural fault is still found where the walk
 reaches it (`{123:1,"b":2}` still exits 5 under `.,.`, as under `.`) and a colliding
@@ -3615,7 +3643,15 @@ Pinned by `test_streaming_keys_unsorted_iterate_echoes_undecodable_key_raw_2103`
 `test_root_forwarding_filters_stream_without_validating_2103` and the revised rows of
 `test_materializing_route_raises_on_colliding_decode_failure_keys_1642` and
 `test_try_catch_contains_a_genuinely_catchable_malformed_key_error_1812`
-(`tests/jq_cli_tests.rs`). `scripts/jq-m2-streaming-sweep.sh`, which found the divergence,
+(`tests/jq_cli_tests.rs`). The #2692 rows are pinned by
+`test_truthiness_probes_validate_nothing_2692` (33 documents × every truthiness reader, each
+asserted to agree with a reads-nothing reference *and* to have the exit code the row
+requires) and its yq twin in `tests/yq_cli_tests.rs`, with the boundary cases in
+`test_select_passes_through_corruption_it_only_tests_1645_2692`,
+`test_any_all_validate_only_the_keys_they_resolve_2476_2692`,
+`test_alternative_validates_only_what_its_operands_read_2476_2692` and the
+`select`-answers rows of `test_lazy_validation_boundary_2168`.
+`scripts/jq-m2-streaming-sweep.sh`, which found the divergence,
 lost its route-against-route comparison along with the eager route. It now runs the one
 shipped route against pinned jq 1.7.1 over the same documents and filters and records every
 cell — jq's exit code, succinctly's exit code, succinctly's stdout — in a checked-in golden

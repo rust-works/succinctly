@@ -180,6 +180,27 @@ FILTERS=(
   '.a | 1+1'
   '.[] | select(. != null)'
   '.[] | tostring'
+  # #2692: filters that read only a value's *truthiness*. Each answers via
+  # `is_falsy`, which decodes nothing, so none of them validates the document
+  # -- they belong in the group above, and these rows are what pins that.
+  # `select(.) | 1` and `if . then 1 else 2 end` discard the tested value on
+  # purpose: without the discard the printer materializes it and the row would
+  # measure the writer instead of the operator.
+  'true and true'
+  '. and true'
+  'false or true'
+  'false // 1'
+  '. // 1'
+  'not'
+  '.[] | not'
+  'select(.) | 1'
+  'if . then 1 else 2 end'
+  'any'
+  'all'
+  # The one truthiness reader that still validates, and the family that still
+  # does: `any`/`all` resolve an *object's* keys (#422), and the `_by` forms
+  # materialize a comparison key.
+  'sort_by(.)'
 )
 
 ACTUAL="$WORK/actual.tsv"

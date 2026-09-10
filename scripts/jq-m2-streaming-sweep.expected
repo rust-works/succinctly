@@ -48,6 +48,18 @@
 {"a":1,"b":2}	.a | 1+1	0	0	2
 {"a":1,"b":2}	.[] | select(. != null)	0	0	1|2
 {"a":1,"b":2}	.[] | tostring	0	0	"1"|"2"
+{"a":1,"b":2}	true and true	0	0	true
+{"a":1,"b":2}	. and true	0	0	true
+{"a":1,"b":2}	false or true	0	0	true
+{"a":1,"b":2}	false // 1	0	0	1
+{"a":1,"b":2}	. // 1	0	0	{"a":1,"b":2}
+{"a":1,"b":2}	not	0	0	false
+{"a":1,"b":2}	.[] | not	0	0	false|false
+{"a":1,"b":2}	select(.) | 1	0	0	1
+{"a":1,"b":2}	if . then 1 else 2 end	0	0	1
+{"a":1,"b":2}	any	0	0	true
+{"a":1,"b":2}	all	0	0	true
+{"a":1,"b":2}	sort_by(.)	5	5	
 [1,2,3]	.	0	0	[1,2,3]
 [1,2,3]	.a	5	5	
 [1,2,3]	.b	5	5	
@@ -98,6 +110,18 @@
 [1,2,3]	.a | 1+1	5	5	
 [1,2,3]	.[] | select(. != null)	0	0	1|2|3
 [1,2,3]	.[] | tostring	0	0	"1"|"2"|"3"
+[1,2,3]	true and true	0	0	true
+[1,2,3]	. and true	0	0	true
+[1,2,3]	false or true	0	0	true
+[1,2,3]	false // 1	0	0	1
+[1,2,3]	. // 1	0	0	[1,2,3]
+[1,2,3]	not	0	0	false
+[1,2,3]	.[] | not	0	0	false|false|false
+[1,2,3]	select(.) | 1	0	0	1
+[1,2,3]	if . then 1 else 2 end	0	0	1
+[1,2,3]	any	0	0	true
+[1,2,3]	all	0	0	true
+[1,2,3]	sort_by(.)	0	0	[1,2,3]
 {"a":1,"a":2}	.	0	0	{"a":2}
 {"a":1,"a":2}	.a	0	0	2
 {"a":1,"a":2}	.b	0	0	null
@@ -148,6 +172,18 @@
 {"a":1,"a":2}	.a | 1+1	0	0	2
 {"a":1,"a":2}	.[] | select(. != null)	0	0	2
 {"a":1,"a":2}	.[] | tostring	0	0	"2"
+{"a":1,"a":2}	true and true	0	0	true
+{"a":1,"a":2}	. and true	0	0	true
+{"a":1,"a":2}	false or true	0	0	true
+{"a":1,"a":2}	false // 1	0	0	1
+{"a":1,"a":2}	. // 1	0	0	{"a":2}
+{"a":1,"a":2}	not	0	0	false
+{"a":1,"a":2}	.[] | not	0	0	false
+{"a":1,"a":2}	select(.) | 1	0	0	1
+{"a":1,"a":2}	if . then 1 else 2 end	0	0	1
+{"a":1,"a":2}	any	0	0	true
+{"a":1,"a":2}	all	0	0	true
+{"a":1,"a":2}	sort_by(.)	5	5	
 {123:1,"b":2}	.	5	5	
 {123:1,"b":2}	.a	5	5	
 {123:1,"b":2}	.b	5	5	
@@ -198,6 +234,18 @@
 {123:1,"b":2}	.a | 1+1	5	5	
 {123:1,"b":2}	.[] | select(. != null)	5	5	
 {123:1,"b":2}	.[] | tostring	5	5	
+{123:1,"b":2}	true and true	5	0	true
+{123:1,"b":2}	. and true	5	0	true
+{123:1,"b":2}	false or true	5	0	true
+{123:1,"b":2}	false // 1	5	0	1
+{123:1,"b":2}	. // 1	5	5	
+{123:1,"b":2}	not	5	0	false
+{123:1,"b":2}	.[] | not	5	5	
+{123:1,"b":2}	select(.) | 1	5	0	1
+{123:1,"b":2}	if . then 1 else 2 end	5	0	1
+{123:1,"b":2}	any	5	5	
+{123:1,"b":2}	all	5	5	
+{123:1,"b":2}	sort_by(.)	5	5	
 {"a":1,"b"}	.	5	5	
 {"a":1,"b"}	.a	5	5	
 {"a":1,"b"}	.b	5	5	
@@ -248,6 +296,18 @@
 {"a":1,"b"}	.a | 1+1	5	5	
 {"a":1,"b"}	.[] | select(. != null)	5	5	
 {"a":1,"b"}	.[] | tostring	5	5	
+{"a":1,"b"}	true and true	5	0	true
+{"a":1,"b"}	. and true	5	0	true
+{"a":1,"b"}	false or true	5	0	true
+{"a":1,"b"}	false // 1	5	0	1
+{"a":1,"b"}	. // 1	5	5	
+{"a":1,"b"}	not	5	0	false
+{"a":1,"b"}	.[] | not	5	5	
+{"a":1,"b"}	select(.) | 1	5	0	1
+{"a":1,"b"}	if . then 1 else 2 end	5	0	1
+{"a":1,"b"}	any	5	5	
+{"a":1,"b"}	all	5	5	
+{"a":1,"b"}	sort_by(.)	5	5	
 {"a":1, invalid}	.	5	5	
 {"a":1, invalid}	.a	5	5	
 {"a":1, invalid}	.b	5	5	
@@ -298,6 +358,18 @@
 {"a":1, invalid}	.a | 1+1	5	5	
 {"a":1, invalid}	.[] | select(. != null)	5	5	
 {"a":1, invalid}	.[] | tostring	5	5	
+{"a":1, invalid}	true and true	5	0	true
+{"a":1, invalid}	. and true	5	0	true
+{"a":1, invalid}	false or true	5	0	true
+{"a":1, invalid}	false // 1	5	0	1
+{"a":1, invalid}	. // 1	5	5	
+{"a":1, invalid}	not	5	0	false
+{"a":1, invalid}	.[] | not	5	5	
+{"a":1, invalid}	select(.) | 1	5	0	1
+{"a":1, invalid}	if . then 1 else 2 end	5	0	1
+{"a":1, invalid}	any	5	5	
+{"a":1, invalid}	all	5	5	
+{"a":1, invalid}	sort_by(.)	5	5	
 {"a" 1, "b":2}	.	5	5	
 {"a" 1, "b":2}	.a	5	5	
 {"a" 1, "b":2}	.b	5	0	2
@@ -348,6 +420,18 @@
 {"a" 1, "b":2}	.a | 1+1	5	5	
 {"a" 1, "b":2}	.[] | select(. != null)	5	5	
 {"a" 1, "b":2}	.[] | tostring	5	5	
+{"a" 1, "b":2}	true and true	5	0	true
+{"a" 1, "b":2}	. and true	5	0	true
+{"a" 1, "b":2}	false or true	5	0	true
+{"a" 1, "b":2}	false // 1	5	0	1
+{"a" 1, "b":2}	. // 1	5	5	
+{"a" 1, "b":2}	not	5	0	false
+{"a" 1, "b":2}	.[] | not	5	5	
+{"a" 1, "b":2}	select(.) | 1	5	0	1
+{"a" 1, "b":2}	if . then 1 else 2 end	5	0	1
+{"a" 1, "b":2}	any	5	5	
+{"a" 1, "b":2}	all	5	5	
+{"a" 1, "b":2}	sort_by(.)	5	5	
 [1,,3]	.	5	5	
 [1,,3]	.a	5	5	
 [1,,3]	.b	5	5	
@@ -398,6 +482,18 @@
 [1,,3]	.a | 1+1	5	5	
 [1,,3]	.[] | select(. != null)	5	5	1
 [1,,3]	.[] | tostring	5	5	"1"
+[1,,3]	true and true	5	0	true
+[1,,3]	. and true	5	0	true
+[1,,3]	false or true	5	0	true
+[1,,3]	false // 1	5	0	1
+[1,,3]	. // 1	5	5	
+[1,,3]	not	5	0	false
+[1,,3]	.[] | not	5	5	false
+[1,,3]	select(.) | 1	5	0	1
+[1,,3]	if . then 1 else 2 end	5	0	1
+[1,,3]	any	5	0	true
+[1,,3]	all	5	0	true
+[1,,3]	sort_by(.)	5	5	
 {"\ud800":1,"\ud800":2}	.	5	0	{"\ud800":1,"\ud800":2}
 {"\ud800":1,"\ud800":2}	.a	5	0	null
 {"\ud800":1,"\ud800":2}	.b	5	0	null
@@ -417,7 +513,7 @@
 {"\ud800":1,"\ud800":2}	first(map(.x) | .[])	5	5	
 {"\ud800":1,"\ud800":2}	limit(1; map(.x) | .[])	5	5	
 {"\ud800":1,"\ud800":2}	.,.	5	0	{"\ud800":1,"\ud800":2}|{"\ud800":1,"\ud800":2}
-{"\ud800":1,"\ud800":2}	if . then . else . end	5	5	
+{"\ud800":1,"\ud800":2}	if . then . else . end	5	0	{"\ud800":1,"\ud800":2}
 {"\ud800":1,"\ud800":2}	try .	5	0	{"\ud800":1,"\ud800":2}
 {"\ud800":1,"\ud800":2}	try (1+1) catch "x"	5	0	2
 {"\ud800":1,"\ud800":2}	try (1+1)	5	0	2
@@ -448,6 +544,18 @@
 {"\ud800":1,"\ud800":2}	.a | 1+1	5	0	2
 {"\ud800":1,"\ud800":2}	.[] | select(. != null)	5	0	1|2
 {"\ud800":1,"\ud800":2}	.[] | tostring	5	0	"1"|"2"
+{"\ud800":1,"\ud800":2}	true and true	5	0	true
+{"\ud800":1,"\ud800":2}	. and true	5	0	true
+{"\ud800":1,"\ud800":2}	false or true	5	0	true
+{"\ud800":1,"\ud800":2}	false // 1	5	0	1
+{"\ud800":1,"\ud800":2}	. // 1	5	0	{"\ud800":1,"\ud800":2}
+{"\ud800":1,"\ud800":2}	not	5	0	false
+{"\ud800":1,"\ud800":2}	.[] | not	5	0	false|false
+{"\ud800":1,"\ud800":2}	select(.) | 1	5	0	1
+{"\ud800":1,"\ud800":2}	if . then 1 else 2 end	5	0	1
+{"\ud800":1,"\ud800":2}	any	5	0	true
+{"\ud800":1,"\ud800":2}	all	5	0	true
+{"\ud800":1,"\ud800":2}	sort_by(.)	5	5	
 {"\ud800":1,"b":2}	.	5	0	{"\ud800":1,"b":2}
 {"\ud800":1,"b":2}	.a	5	0	null
 {"\ud800":1,"b":2}	.b	5	0	2
@@ -473,7 +581,7 @@
 {"\ud800":1,"b":2}	try (1+1)	5	0	2
 {"\ud800":1,"b":2}	.?	5	0	{"\ud800":1,"b":2}
 {"\ud800":1,"b":2}	label $x | .	5	0	{"\ud800":1,"b":2}
-{"\ud800":1,"b":2}	. as $x | $x	5	0	{"\\ud800":1,"b":2}
+{"\ud800":1,"b":2}	. as $x | $x	5	0	{"\ud800":1,"b":2}
 {"\ud800":1,"b":2}	def f: .; f	5	0	{"\ud800":1,"b":2}
 {"\ud800":1,"b":2}	first(.)	5	0	{"\ud800":1,"b":2}
 {"\ud800":1,"b":2}	limit(1;.)	5	0	{"\ud800":1,"b":2}
@@ -498,6 +606,18 @@
 {"\ud800":1,"b":2}	.a | 1+1	5	0	2
 {"\ud800":1,"b":2}	.[] | select(. != null)	5	0	1|2
 {"\ud800":1,"b":2}	.[] | tostring	5	0	"1"|"2"
+{"\ud800":1,"b":2}	true and true	5	0	true
+{"\ud800":1,"b":2}	. and true	5	0	true
+{"\ud800":1,"b":2}	false or true	5	0	true
+{"\ud800":1,"b":2}	false // 1	5	0	1
+{"\ud800":1,"b":2}	. // 1	5	0	{"\ud800":1,"b":2}
+{"\ud800":1,"b":2}	not	5	0	false
+{"\ud800":1,"b":2}	.[] | not	5	0	false|false
+{"\ud800":1,"b":2}	select(.) | 1	5	0	1
+{"\ud800":1,"b":2}	if . then 1 else 2 end	5	0	1
+{"\ud800":1,"b":2}	any	5	0	true
+{"\ud800":1,"b":2}	all	5	0	true
+{"\ud800":1,"b":2}	sort_by(.)	5	5	
 {"a\q":1,"b":2}	.	5	0	{"a\q":1,"b":2}
 {"a\q":1,"b":2}	.a	5	0	null
 {"a\q":1,"b":2}	.b	5	0	2
@@ -523,7 +643,7 @@
 {"a\q":1,"b":2}	try (1+1)	5	0	2
 {"a\q":1,"b":2}	.?	5	0	{"a\q":1,"b":2}
 {"a\q":1,"b":2}	label $x | .	5	0	{"a\q":1,"b":2}
-{"a\q":1,"b":2}	. as $x | $x	5	0	{"a\\q":1,"b":2}
+{"a\q":1,"b":2}	. as $x | $x	5	0	{"a\q":1,"b":2}
 {"a\q":1,"b":2}	def f: .; f	5	0	{"a\q":1,"b":2}
 {"a\q":1,"b":2}	first(.)	5	0	{"a\q":1,"b":2}
 {"a\q":1,"b":2}	limit(1;.)	5	0	{"a\q":1,"b":2}
@@ -548,6 +668,18 @@
 {"a\q":1,"b":2}	.a | 1+1	5	0	2
 {"a\q":1,"b":2}	.[] | select(. != null)	5	0	1|2
 {"a\q":1,"b":2}	.[] | tostring	5	0	"1"|"2"
+{"a\q":1,"b":2}	true and true	5	0	true
+{"a\q":1,"b":2}	. and true	5	0	true
+{"a\q":1,"b":2}	false or true	5	0	true
+{"a\q":1,"b":2}	false // 1	5	0	1
+{"a\q":1,"b":2}	. // 1	5	0	{"a\q":1,"b":2}
+{"a\q":1,"b":2}	not	5	0	false
+{"a\q":1,"b":2}	.[] | not	5	0	false|false
+{"a\q":1,"b":2}	select(.) | 1	5	0	1
+{"a\q":1,"b":2}	if . then 1 else 2 end	5	0	1
+{"a\q":1,"b":2}	any	5	0	true
+{"a\q":1,"b":2}	all	5	0	true
+{"a\q":1,"b":2}	sort_by(.)	5	5	
 [{"x":"\ud800"}]	.	5	0	[{"x":"\ud800"}]
 [{"x":"\ud800"}]	.a	5	5	
 [{"x":"\ud800"}]	.b	5	5	
@@ -567,7 +699,7 @@
 [{"x":"\ud800"}]	first(map(.x) | .[])	5	0	"\ud800"
 [{"x":"\ud800"}]	limit(1; map(.x) | .[])	5	0	"\ud800"
 [{"x":"\ud800"}]	.,.	5	0	[{"x":"\ud800"}]|[{"x":"\ud800"}]
-[{"x":"\ud800"}]	if . then . else . end	5	5	
+[{"x":"\ud800"}]	if . then . else . end	5	0	[{"x":"\ud800"}]
 [{"x":"\ud800"}]	try .	5	0	[{"x":"\ud800"}]
 [{"x":"\ud800"}]	try (1+1) catch "x"	5	0	2
 [{"x":"\ud800"}]	try (1+1)	5	0	2
@@ -587,7 +719,7 @@
 [{"x":"\ud800"}]	.[]|debug	5	5	
 [{"x":"\ud800"}]	.[] | (., debug)	5	5	{"x":"\ud800"}
 [{"x":"\ud800"}]	.[] | .,.	5	0	{"x":"\ud800"}|{"x":"\ud800"}
-[{"x":"\ud800"}]	.[] | if . then . else . end	5	5	
+[{"x":"\ud800"}]	.[] | if . then . else . end	5	0	{"x":"\ud800"}
 [{"x":"\ud800"}]	.[] | try (1+1) catch "x"	5	0	2
 [{"x":"\ud800"}]	.[] | 1+1	5	0	2
 [{"x":"\ud800"}]	.[] | label $x | .	5	0	{"x":"\ud800"}
@@ -598,3 +730,15 @@
 [{"x":"\ud800"}]	.a | 1+1	5	5	
 [{"x":"\ud800"}]	.[] | select(. != null)	5	5	
 [{"x":"\ud800"}]	.[] | tostring	5	5	
+[{"x":"\ud800"}]	true and true	5	0	true
+[{"x":"\ud800"}]	. and true	5	0	true
+[{"x":"\ud800"}]	false or true	5	0	true
+[{"x":"\ud800"}]	false // 1	5	0	1
+[{"x":"\ud800"}]	. // 1	5	0	[{"x":"\ud800"}]
+[{"x":"\ud800"}]	not	5	0	false
+[{"x":"\ud800"}]	.[] | not	5	0	false
+[{"x":"\ud800"}]	select(.) | 1	5	0	1
+[{"x":"\ud800"}]	if . then 1 else 2 end	5	0	1
+[{"x":"\ud800"}]	any	5	0	true
+[{"x":"\ud800"}]	all	5	0	true
+[{"x":"\ud800"}]	sort_by(.)	5	5	

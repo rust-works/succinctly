@@ -176,49 +176,48 @@ b: *x
 c: 2
 ```
 
-A related, narrower gap sits in `select`/`if`'s condition-truthiness check
-(`push_generic_document_validation_error`, [src/jq/eval_generic.rs](../../../src/jq/eval_generic.rs)):
-it does not walk into a *container* reached through an alias, so a decode failure reachable
-only that way no longer raises
-([#1804](https://github.com/rust-works/succinctly/issues/1804), fixed a real `O(2^N)` cost
-for a document shaped as a chain of anchors each referencing the previous one twice). This
-is not a yq-fidelity divergence — real yq rejects the whole document at parse time, so there
-is no yq behaviour to match either way:
+A related gap sits in **truthiness**, and it is now the whole of the rule rather than a
+carve-out. Since [#2692](https://github.com/rust-works/succinctly/issues/2692), *a filter
+validates only what it materializes* — and a filter that asks whether a value is truthy
+answers with `DocumentCursor::is_falsy`, which is O(1) and decodes nothing. So `select`,
+`if`, `not`, `and`, `or`, `//` and zero-arity `any`/`all` validate nothing at all, at any
+position. This is not a yq-fidelity divergence — real yq rejects the whole document at parse
+time, so there is no yq behaviour to match either way — and it is sanctioned by
+[ADR-0018](../../adrs/adr-0018.md)'s #2103 amendment, which lists it as an instance.
 
 ```bash
 $ printf 'a: &a ["bad\\q"]\nb: *a\n' | succinctly yq 'select(.b) | 1'
 1
+$ printf 'a: &a ["bad\\q"]\nb: *a\n' | succinctly yq 'select(.a) | 1'
+1
+$ printf 'a: &a ["bad\\q"]\nb: *a\n' | succinctly yq '.b | not'
+false
 $ printf 'a: &a ["bad\\q"]\nb: *a\n' | succinctly yq '.a'
 Error: invalid escape sequence
 $ printf 'a: &a ["bad\\q"]\nb: *a\n' | succinctly yq '.b[0]'
 Error: invalid escape sequence
 ```
 
-Scoped to a *container* alias target only: a bare scalar-target alias (`a: &a "bad\q"`)
-still raises from `select`/`if` exactly as before, since resolving one scalar costs `O(1)`
-and was never part of the cost this fix removes.
+**The history is worth keeping, because it explains the shape of the code.**
+[#1804](https://github.com/rust-works/succinctly/issues/1804) first made `select`/`if` skip
+a *container* reached through an alias, fixing a real `O(2^N)` cost on a document shaped as
+a chain of anchors each referencing the previous one twice; it deliberately excluded a bare
+scalar-target alias (`a: &a "bad\q"`), since resolving one scalar costs `O(1)` and was never
+part of that cost. [#2476](https://github.com/rust-works/succinctly/issues/2476) extended
+the same trade-off to `not`, `//` and `any`/`all`, which until then reached the cost only by
+falling to `eval_single`'s wildcard bridge.
 
-**[#2476](https://github.com/rust-works/succinctly/issues/2476)** extends this same
-trade-off to `not`, `//`, and zero-arity `any`/`all` at an alias position — the same
-O(2^N) fan-out cost `select`/`if` were fixed for, since all four used to reach it only by
-falling to `eval_single`'s wildcard bridge (which materializes the *ambient* value before
-running), and now instead run `push_generic_truthiness` directly, the same call `select`/`if`
-already used:
+Both of those were narrowings of a validation walk, and both left the answer depending on
+*which position* a filter stood on: `.b | not` answered while `.a | not` raised, for two
+names of one node. #2692 removed the walk instead, so neither the container/scalar
+distinction nor the alias/anchor one has any observable consequence left. Nothing that
+raised for a *reading* reason stopped raising — `.a`, `.b[0]` and every write still do.
 
-```bash
-$ printf 'a: &a ["bad\\q"]\nb: *a\n' | succinctly yq '.b | not'
-false
-$ printf 'a: &a ["bad\\q"]\nb: *a\n' | succinctly yq '.b[0]'
-Error: invalid escape sequence
-```
-
-`and`/`or` share it only in the same ambient-scoped shape `select`/`if` use, where neither
-operand itself navigates (`.b | (true and true)` answers `true`, not raising). A bare `.b and
-true` does not share it: `.b` as a direct operand needs path context, so that expression still
-runs through the pre-existing native evaluator (`eval_boolean_generic`'s path-context branch,
-present since #2473 and untouched by #2476), which resolves `.b`'s path and raises exactly as
-`.b[0]` does. Real yq rejects this whole document at parse time either way, so there is no yq
-behaviour to match for any of these constructs.
+`and`/`or` are no longer special here either. A bare `.b and true` used to be distinguished
+from `.b | (true and true)` because `.b` as a direct operand needs path context and so ran
+through `eval_boolean_generic`'s path-context branch (present since #2473), resolving `.b`'s
+path and raising as `.b[0]` does. Both spellings now answer `true`: resolving a path is not
+decoding the value at it.
 
 **[#2173](https://github.com/rust-works/succinctly/issues/2173) goes one step further, and
 this one *is* a new yq divergence rather than an extension of an existing one.** Every
