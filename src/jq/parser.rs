@@ -3807,14 +3807,11 @@ impl<'a> Parser<'a> {
         }
         if self.matches_keyword("inside") {
             self.reject_unless_jq_extensions("inside")?;
+            let keyword_start = self.pos;
             self.consume_keyword("inside");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let b = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::Inside(Box::new(b))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|b| Builtin::Inside(Box::new(b))));
         }
 
         // Phase 5: Array Functions
@@ -4057,14 +4054,11 @@ impl<'a> Parser<'a> {
 
         // isvalid(expr)
         if self.matches_keyword("isvalid") {
+            let keyword_start = self.pos;
             self.consume_keyword("isvalid");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let expr = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::IsValid(Box::new(expr))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|expr| Builtin::IsValid(Box::new(expr))));
         }
 
         // Phase 10: Path Expressions

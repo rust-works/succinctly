@@ -22126,6 +22126,10 @@ fn test_remaining_single_arg_builtins_wrong_arity_reports_not_defined_2573() -> 
     for (filter, name) in [
         ("bsearch", "bsearch/0"),
         ("bsearch(1;2)", "bsearch/2"),
+        ("inside", "inside/0"),
+        ("inside(1;2)", "inside/2"),
+        ("isvalid", "isvalid/0"),
+        ("isvalid(1;2)", "isvalid/2"),
         ("pick", "pick/0"),
         ("pick(1;2)", "pick/2"),
         ("omit", "omit/0"),
@@ -22162,12 +22166,19 @@ fn test_remaining_single_arg_builtins_wrong_arity_reports_not_defined_2573() -> 
     Ok(())
 }
 
-/// #2573: the point of the rewind, not just the message -- a wrong-arity
-/// spelling now falls back to an ordinary call, so a user `def` at that
-/// arity resolves instead of the parse dying first. Oracle-verified against
-/// jq 1.7.1, which answers `"shadow"` for each.
+/// #2573: arity **3**, which is what actually discriminates this change.
+///
+/// A previous draft of this test asserted that a wrong-arity spelling now
+/// lets a `def` at that arity shadow the builtin -- that claim was wrong.
+/// `def bsearch(a;b): "shadow"; bsearch(1;2)` already answered `"shadow"` on
+/// unmodified `main`, via `try_parse_builtin`'s pre-existing `Err`-arm retry
+/// (`retry_shadow_candidate_as_generic_call`), so the test passed either way
+/// and proved nothing. What the conversion changes is the *arity report* for
+/// a wrong-arity call with no shadowing `def` in sight -- covered by the
+/// sibling test above -- and it holds at every wrong arity, not just the two
+/// that draft happened to try. Oracle-verified against jq 1.7.1.
 #[test]
-fn test_remaining_single_arg_builtins_allow_a_shadowing_def_2573() -> Result<()> {
+fn test_remaining_single_arg_builtins_report_arity_three_2573() -> Result<()> {
     for name in [
         "bsearch",
         "pick",
@@ -22182,11 +22193,17 @@ fn test_remaining_single_arg_builtins_allow_a_shadowing_def_2573() -> Result<()>
         "indices",
         "rindex",
         "index",
+        "inside",
+        "isvalid",
     ] {
-        let filter = format!(r#"def {name}(a;b): "shadow"; {name}(1;2)"#);
+        let filter = format!("{name}(1;2;3)");
         let (stdout, stderr, code) = run_jq_full(&["-nc", &filter], None)?;
-        assert_eq!(code, 0, "{filter}: stderr {stderr:?}");
-        assert_eq!(stdout.trim_end(), r#""shadow""#, "{filter}");
+        assert_eq!(stdout, "", "{filter}: stderr {stderr:?}");
+        assert!(
+            stderr.contains(&format!("{name}/3 is not defined at <top-level>, line 1:")),
+            "{filter}: stderr {stderr:?}"
+        );
+        assert_eq!(code, 3, "{filter}: stderr {stderr:?}");
     }
     Ok(())
 }
