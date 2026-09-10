@@ -4050,37 +4050,28 @@ impl<'a> Parser<'a> {
         }
         if self.matches_keyword("indices") {
             self.reject_unless_jq_extensions("indices")?;
+            let keyword_start = self.pos;
             self.consume_keyword("indices");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let s = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::Indices(Box::new(s))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|s| Builtin::Indices(Box::new(s))));
         }
         // Check index before rindex since rindex contains "index"
         if self.matches_keyword("rindex") {
             self.reject_unless_jq_extensions("rindex")?;
+            let keyword_start = self.pos;
             self.consume_keyword("rindex");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let s = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::Rindex(Box::new(s))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|s| Builtin::Rindex(Box::new(s))));
         }
         if self.matches_keyword("index") {
             self.reject_unless_jq_extensions("index")?;
+            let keyword_start = self.pos;
             self.consume_keyword("index");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let s = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::Index(Box::new(s))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|s| Builtin::Index(Box::new(s))));
         }
         // INDEX(idx_expr) - build an object keyed by idx_expr from `.[]`
         // INDEX(stream; idx_expr) - build an object keyed by idx_expr from stream
@@ -4121,25 +4112,19 @@ impl<'a> Parser<'a> {
         }
         if self.matches_keyword("fromstream") {
             self.reject_unless_jq_extensions("fromstream")?;
+            let keyword_start = self.pos;
             self.consume_keyword("fromstream");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let f = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::FromStream(Box::new(f))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|f| Builtin::FromStream(Box::new(f))));
         }
         if self.matches_keyword("truncate_stream") {
             self.reject_unless_jq_extensions("truncate_stream")?;
+            let keyword_start = self.pos;
             self.consume_keyword("truncate_stream");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let f = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::TruncateStream(Box::new(f))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|f| Builtin::TruncateStream(Box::new(f))));
         }
         if self.matches_keyword("getpath") {
             self.reject_unless_jq_extensions("getpath")?;
@@ -4585,14 +4570,11 @@ impl<'a> Parser<'a> {
         }
         if self.matches_keyword("bsearch") {
             self.reject_unless_jq_extensions("bsearch")?;
+            let keyword_start = self.pos;
             self.consume_keyword("bsearch");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let x = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::BSearch(Box::new(x))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|x| Builtin::BSearch(Box::new(x))));
         }
 
         // Phase 10: Object functions
@@ -4606,26 +4588,20 @@ impl<'a> Parser<'a> {
 
         // pick(keys) - yq: select only specified keys from object/array
         if self.matches_keyword("pick") {
+            let keyword_start = self.pos;
             self.consume_keyword("pick");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let keys = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::Pick(Box::new(keys))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|keys| Builtin::Pick(Box::new(keys))));
         }
 
         // omit(keys) - yq: remove specified keys from object/indices from array
         if self.matches_keyword("omit") {
+            let keyword_start = self.pos;
             self.consume_keyword("omit");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let keys = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::Omit(Box::new(keys))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|keys| Builtin::Omit(Box::new(keys))));
         }
 
         // tag - yq: return YAML type tag (!!str, !!int, !!map, etc.)
@@ -4860,25 +4836,19 @@ impl<'a> Parser<'a> {
         }
         if self.matches_keyword("strftime") {
             self.reject_unless_jq_extensions("strftime")?;
+            let keyword_start = self.pos;
             self.consume_keyword("strftime");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let fmt = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::Strftime(Box::new(fmt))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|fmt| Builtin::Strftime(Box::new(fmt))));
         }
         if self.matches_keyword("strptime") {
             self.reject_unless_jq_extensions("strptime")?;
+            let keyword_start = self.pos;
             self.consume_keyword("strptime");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let fmt = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::Strptime(Box::new(fmt))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|fmt| Builtin::Strptime(Box::new(fmt))));
         }
         // #1907: same jq-only gating as gmtime/localtime/mktime above --
         // confirmed live (v4.53.3) real yq's lexer rejects all four of
@@ -4914,14 +4884,11 @@ impl<'a> Parser<'a> {
             return Ok(Some(Builtin::ToUnix));
         }
         if self.matches_keyword("tz") {
+            let keyword_start = self.pos;
             self.consume_keyword("tz");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let zone = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::Tz(Box::new(zone))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|zone| Builtin::Tz(Box::new(zone))));
         }
 
         // Phase 17: Combinations
@@ -4955,27 +4922,21 @@ impl<'a> Parser<'a> {
 
         // Phase 22: File operations (yq)
         if self.matches_keyword("load") {
+            let keyword_start = self.pos;
             self.consume_keyword("load");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let file_expr = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::Load(Box::new(file_expr))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|file_expr| Builtin::Load(Box::new(file_expr))));
         }
 
         // Phase 23: Position-based navigation (succinctly extension)
         // at_offset(n) - jump to node at byte offset n (0-indexed)
         if self.matches_keyword("at_offset") {
+            let keyword_start = self.pos;
             self.consume_keyword("at_offset");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let offset_expr = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            return Ok(Some(Builtin::AtOffset(Box::new(offset_expr))));
+            return Ok(self
+                .parse_required_single_arg(keyword_start)?
+                .map(|offset_expr| Builtin::AtOffset(Box::new(offset_expr))));
         }
 
         // at_position(line; col) - jump to node at line/column (1-indexed)
