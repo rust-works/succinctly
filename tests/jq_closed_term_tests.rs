@@ -28,7 +28,7 @@
 //! them here would only freeze a limitation in place.
 
 use succinctly::jq::walk::reads_ambient_value;
-use succinctly::jq::{eval_generic, parse};
+use succinctly::jq::{eval_generic, parse, parse_with_mode, ParserMode};
 use succinctly::json::JsonIndex;
 
 /// Structurally unrelated, all well-formed: an object, an array, a scalar,
@@ -114,6 +114,19 @@ const READING: &[&str] = &[
     "setpath([\"a\"]; 1)",
 ];
 
+/// yq's metadata-assignment grammar (#798), which only the yq-mode parser
+/// accepts. `PATH <slot> = value` leaves the value alone and answers with
+/// the document, metadata written -- so like every other assignment shape
+/// it reads `.` however closed its operands are. Added when a rebase
+/// brought `Expr::MetaAssign` onto `main` and `node_reads_ambient`'s
+/// exhaustive match refused to compile until it was classified.
+const READING_YQ: &[&str] = &[
+    r#".a line_comment = "hi""#,
+    r#".a style = "flow""#,
+    r#".a anchor = "z""#,
+    r#".a line_comment |= "hi""#,
+];
+
 fn outputs(doc: &str, filter: &str) -> Result<Vec<String>, String> {
     let bytes = doc.as_bytes();
     let index = JsonIndex::build(bytes);
@@ -163,6 +176,15 @@ fn reading_terms_are_reported_as_reading_2173() {
             reads_ambient_value(&expr),
             "`{filter}` reads the input but was reported closed -- \
              `bridge_ambient_input` would evaluate it against null"
+        );
+    }
+    // yq's metadata-assignment grammar (#798) needs the yq-mode parser.
+    for filter in READING_YQ {
+        let expr =
+            parse_with_mode(filter, ParserMode::Yq).expect("yq filter should parse in yq mode");
+        assert!(
+            reads_ambient_value(&expr),
+            "`{filter}` answers with the document and was reported closed"
         );
     }
 }
