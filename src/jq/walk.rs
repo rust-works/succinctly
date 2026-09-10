@@ -1234,6 +1234,136 @@ pub fn uses_cursor_metadata_builtins(expr: &Expr) -> bool {
     })
 }
 
+/// Whether evaluating `expr` could consult the **ambient input value** (`.`)
+/// anywhere in its tree (#2173).
+///
+/// `false` means *closed term*: the expression's outputs are the same
+/// whatever the input is, so a caller about to materialize the input purely
+/// to have something to evaluate against can hand it `OwnedValue::Null`
+/// instead. That is what [`super::eval_generic::bridge_ambient_input`] does,
+/// and on a 16 MB document it is the difference between 443 MB of peak RSS
+/// and 29 MB for `[1+1]`.
+///
+/// **Conservative in exactly one direction.** [`node_reads_ambient`] is
+/// exhaustive over `Expr` with no wildcard arm, so a new variant is a compile
+/// error rather than a silent "closed", and every node whose own semantics
+/// could reach `.` answers `true` even when a child would not. The failure
+/// mode of a wrong `true` is a materialization we could have skipped; the
+/// failure mode of a wrong `false` is an expression silently evaluated
+/// against `null`. Only the first is acceptable, so anything unclear is
+/// `true`.
+///
+/// **Deliberately imprecise about pipes.** `1 | .` reads `1`, not the
+/// document, but this walk sees an `Expr::Identity` node and reports
+/// `true`. Teaching it that a pipe stage's ambient value is the previous
+/// stage's output is a refinement, not a correction — it would widen what
+/// counts as closed, never narrow it.
+///
+/// Same expanded-program requirement as [`uses_input_builtins`]: a call
+/// reachable only through an imported module body still counts.
+pub fn reads_ambient_value(expr: &Expr) -> bool {
+    any_subexpr(expr, &mut node_reads_ambient)
+}
+
+/// One node's own answer for [`reads_ambient_value`], ignoring its children —
+/// [`any_subexpr`] visits those separately.
+///
+/// Exhaustive on purpose: see [`reads_ambient_value`] for why a wildcard arm
+/// here would be a correctness hazard rather than a convenience.
+fn node_reads_ambient(node: &Expr) -> bool {
+    match node {
+        // Navigation and whole-value reads: these *are* the ambient value.
+        Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Slice { .. }
+        | Expr::Iterate
+        | Expr::RecursiveDescent
+        // `not` and `@base64` and friends all apply to `.`.
+        | Expr::Not
+        | Expr::Format(_) => true,
+
+        // Both emit `.` itself and test `cond` against it, and neither
+        // emission is a child this walk would otherwise see.
+        Expr::Until { .. } | Expr::While { .. } => true,
+
+        // An unresolved call carries no body to descend into (a resolved
+        // `Expr::DefCall` does, and `any_subexpr` follows it). Whatever the
+        // body turns out to be, assume it reads.
+        Expr::FuncCall { .. } | Expr::NamespacedCall { .. } => true,
+
+        // The trap in this predicate: bare `error` raises `.` *as* the error
+        // value, and `any_subexpr` gives `Error(None)` no child to catch it
+        // on. `error(f)` is fine -- `f` is a child.
+        Expr::Error(inner) => inner.is_none(),
+
+        // Reads unless the builtin is one of the few that ignore their input
+        // entirely. Everything with an argument still reads: `map(1)`,
+        // `select(true)` and `add` all consult `.` however closed the
+        // argument is, so this allowlist holds only builtins whose whole
+        // answer comes from elsewhere -- the clock, the environment, the
+        // language itself. Verified against their `eval.rs` arms, each of
+        // which takes `_value`.
+        Expr::Builtin(builtin) => !matches!(
+            builtin,
+            Builtin::Empty
+                | Builtin::Now
+                | Builtin::Nan
+                | Builtin::Infinite
+                | Builtin::NullLit
+                | Builtin::Env
+                | Builtin::Builtins
+                | Builtin::Halt
+        ),
+
+        // Everything below contributes nothing of its own: whether it reads
+        // `.` is entirely a question about its children, which `any_subexpr`
+        // visits. Spelled out rather than left to a `_` arm so that adding an
+        // `Expr` variant forces a decision here.
+        Expr::Literal(_)
+        | Expr::Loc { .. }
+        | Expr::Env
+        | Expr::Var(_)
+        | Expr::TrackedVar(_)
+        | Expr::Break(_)
+        | Expr::Paren(_)
+        | Expr::Shared(_)
+        | Expr::Optional(_)
+        | Expr::Array(_)
+        | Expr::Pipe(_)
+        | Expr::Comma(_)
+        | Expr::Object(_)
+        | Expr::StringInterpolation(_)
+        | Expr::Arithmetic { .. }
+        | Expr::Negate(_)
+        | Expr::Compare { .. }
+        | Expr::And(..)
+        | Expr::Or(..)
+        | Expr::Alternative(..)
+        | Expr::If { .. }
+        | Expr::Try { .. }
+        | Expr::IndexExpr { .. }
+        | Expr::SliceExpr { .. }
+        | Expr::Range { .. }
+        | Expr::Reduce { .. }
+        | Expr::Foreach { .. }
+        | Expr::Limit { .. }
+        | Expr::FirstExpr(_)
+        | Expr::LastExpr(_)
+        | Expr::NthExpr { .. }
+        | Expr::Repeat(_)
+        | Expr::As { .. }
+        | Expr::AsPattern { .. }
+        | Expr::Label { .. }
+        | Expr::FuncDef { .. }
+        | Expr::DefCall { .. }
+        | Expr::Assign { .. }
+        | Expr::Update { .. }
+        | Expr::CompoundAssign { .. }
+        | Expr::AlternativeAssign { .. } => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -8467,28 +8467,35 @@ fn test_and_or_keep_path_context_2473() -> Result<()> {
     Ok(())
 }
 
-/// Spine 2416 gate reason 3 (#2473) companion: the `and`/`or` arms are gated
-/// on `needs_path_context`, exactly like `Expr::Arithmetic`'s (#2475), so an
-/// `and`/`or` that reads no path context still takes the eager bridge and
-/// still pays its ambient decode on a #1194-malformed document.
+/// Spine 2416 gate reason 3 (#2473) companion, as #2173 left it: an
+/// `and`/`or` that reads nothing pays no ambient decode on a
+/// #1194-malformed document.
 ///
-/// `try (key and true) catch "x"` exits 0 with no output on the native route,
-/// which is not a regression this arm introduces: `try (key + 1) catch "x"`
-/// and `try (key == 1) catch "x"` already did, from the `Expr::Arithmetic`
-/// and `Expr::Compare` arms. It is pinned here so the *difference* between a
-/// gated and an ungated arm stays visible, alongside
+/// This test was written the other way up. When #2473 landed, the `and`/`or`
+/// arms were gated on `needs_path_context`, so a shape reading no path
+/// context fell to the wildcard bridge and inherited that bridge's
+/// whole-document materialization -- and therefore its rejection. #2476
+/// replaced the materialization with a walk, keeping the rejection; #2173
+/// then charged the walk only to shapes that read `.`, so `true and true`
+/// answers `true` here where it used to exit 5.
+///
+/// The `key and true` row is unchanged and is why the test is still worth
+/// keeping: it exits 0 with no output on the native route, as
+/// `try (key + 1) catch "x"` and `try (key == 1) catch "x"` already did from
+/// the `Expr::Arithmetic` and `Expr::Compare` arms. What the test now pins
+/// is that a path-context read and a closed term reach the same answer from
+/// opposite directions -- alongside
 /// `test_try_catch_contains_a_genuinely_catchable_malformed_key_error_1812`.
 #[test]
-fn test_and_or_without_path_context_still_pays_the_ambient_decode_2473() -> Result<()> {
+fn test_and_or_without_path_context_pays_no_ambient_decode_2173() -> Result<()> {
     let doc = "{123: 1}";
-    for filter in ["true and true", r#"try (true and true) catch "x""#] {
+    for (filter, want) in [
+        ("true and true", "true"),
+        (r#"try (true and true) catch "x""#, "true"),
+    ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
-        assert_eq!(code, 5, "`{filter}` stdout: {stdout:?} stderr: {stderr}");
-        assert!(stdout.trim().is_empty(), "`{filter}` stdout: {stdout:?}");
-        assert!(
-            stderr.contains("Invalid JSON text"),
-            "`{filter}` stderr: {stderr}"
-        );
+        assert_eq!(code, 0, "`{filter}` stdout: {stdout:?} stderr: {stderr}");
+        assert_eq!(stdout.trim(), want, "`{filter}` stderr: {stderr}");
     }
     let (stdout, stderr, code) =
         run_jq_full(&["-c", r#"try (key and true) catch "x""#], Some(doc))?;
@@ -43955,6 +43962,15 @@ fn test_preserve_input_keeps_jq_escape_table_2209() -> Result<()> {
 /// (agreement alone would also pass if both routes silently stopped
 /// raising).
 ///
+/// **#2173 split the probe list in two.** The walk is now charged only to a
+/// construct that actually reads `.`, so `true and true`, `false or true`
+/// and `false // 1` moved to `closed_probes`, where they must answer at
+/// exit 0 on every row -- malformed or not -- with the same stdout either
+/// way. That is #2103's rule ("a filter validates only what it reads")
+/// applied to the last arms that were still an exception to it, and it is
+/// what makes `1+1` and `[1+1]` finally agree on the same document. The
+/// reading probes below are unchanged and still pin the full raise-set.
+///
 /// Rows this deliberately leaves out: a `>256`-deep document (both routes
 /// panic, #2627) and an empty document (exit 0 on every probe, nothing to
 /// pin). The alias-to-container shape is #1804's accepted trade-off and is
@@ -44093,15 +44109,19 @@ fn test_ambient_validation_agrees_with_bridge_2476() -> Result<()> {
         ("false root", "false", 0, ""),
         ("well-formed", r#"{"a":[1,{"b":"c"}]}"#, 0, ""),
     ];
-    // The reference route first; every construct that used to bridge after.
-    let probes = [
-        "select(.) | 1",
-        "true and true",
-        "false or true",
-        ". and true",
-        "not",
-        "false // 1",
-        "(.a? // 1) | 1",
+    // The reference route first; every construct that used to bridge and
+    // still reads `.` after it. #2173 moved the closed terms out of this
+    // list and into `closed_probes` below -- they no longer raise at all.
+    let probes = ["select(.) | 1", ". and true", "not", "(.a? // 1) | 1"];
+    // #2173: these read nothing, so they validate nothing and answer at
+    // exit 0 on every row of the corpus -- including the malformed ones.
+    // Their expected stdout is the same on a malformed document as on a
+    // well-formed one, which is the point: the answer no longer depends on
+    // the document at all.
+    let closed_probes = [
+        ("true and true", "true"),
+        ("false or true", "true"),
+        ("false // 1", "1"),
     ];
     for (label, doc, want_code, want_stderr) in corpus {
         let mut seen: Vec<(String, i32, String)> = Vec::new();
@@ -44126,18 +44146,129 @@ fn test_ambient_validation_agrees_with_bridge_2476() -> Result<()> {
                 "[{label}] `{probe}` disagrees with `select(.) | 1`"
             );
         }
+        for (probe, want_stdout) in closed_probes {
+            let (stdout, stderr, code) = run_jq_full(&["-c", probe], Some(doc))?;
+            assert_eq!(
+                code, 0,
+                "[{label}] closed `{probe}`: exit {code}, want 0\nstderr: {stderr}"
+            );
+            assert_eq!(
+                stdout.trim_end(),
+                want_stdout,
+                "[{label}] closed `{probe}`: stdout {stdout:?}"
+            );
+        }
     }
     Ok(())
 }
 
-/// #2476: `eval_single`'s `Expr::And`/`Expr::Or` arms lost their
-/// `needs_path_context` gate, and the gate existed for exactly one reason --
-/// an `and`/`or` reading no path context fell to the wildcard bridge, whose
-/// ambient `to_owned_with_cursor` is what rejects a malformed document for a
-/// query that never reads `.` (#1812: real jq rejects the whole document for
-/// every query). The arm runs `ambient_validation_error` in its place, so
-/// this pins the raise *through the ungated arm* rather than through the
-/// bridge that used to carry it.
+/// #2173: a filter that reads nothing answers the same on a malformed
+/// document as on a well-formed one, **whatever route its spelling takes**.
+///
+/// This is the test that says the split is gone. Before this change, whether
+/// a closed term inherited jq's whole-document rejection depended on nothing
+/// but which `match` arm the parser happened to hand it: `1+1` had a native
+/// streaming arm and answered `2`, while `[1+1]` -- the same closed term
+/// wrapped in a collector -- fell to `eval_single`'s wildcard, materialized
+/// 16 MB of document to have something to evaluate against, and exited 5.
+/// Same for `[range(3)]`, `$__loc__`, `now|floor`, `range(3)`,
+/// `true and true` and `false // 1`.
+///
+/// The corpus is the same six documents
+/// `test_root_forwarding_filters_stream_without_validating_2103` uses, one
+/// per malformed shape the codebase keeps deliberately distinct, and real jq
+/// 1.7.1 exits 5 on every cell of this grid -- it parses eagerly, so a fault
+/// anywhere fails every filter. succinctly is a semi-index and does not, and
+/// ADR-0018's #2103 amendment says that where the reference's answer is a
+/// whole-document rejection we deliberately do not perform, we take the
+/// *uniform* divergence rather than the one that depends on spelling. This
+/// grid is that uniformity, asserted.
+///
+/// `1+1` is a row on purpose: it already passed before #2173, and it is the
+/// control that makes the other rows mean something.
+#[test]
+fn test_closed_terms_do_not_validate_2173() -> Result<()> {
+    let docs = [
+        r#"{123:1,"b":2}"#,
+        r#"{"a":1,"b"}"#,
+        r#"{"a":1, invalid}"#,
+        r#"{"a" 1, "b":2}"#,
+        r"[1,,3]",
+        r#"{"\ud800":1,"\ud800":2}"#,
+    ];
+    // (filter, expected stdout) -- the expected output is the *same* on a
+    // malformed document as on any other, which is the property under test.
+    let closed = [
+        ("1+1", "2"),
+        ("[1+1]", "[2]"),
+        ("[range(3)]", "[0,1,2]"),
+        ("range(3)", "0\n1\n2"),
+        ("true and true", "true"),
+        ("false // 1", "1"),
+        (r#"{"k":1}"#, r#"{"k":1}"#),
+        ("if 1==1 then 2 else 3 end", "2"),
+        ("1 as $x | $x", "1"),
+        ("def f: 1; f", "1"),
+        ("[limit(1; 1,2)]", "[1]"),
+        ("empty", ""),
+    ];
+    for doc in docs {
+        for (filter, want) in closed {
+            let (out, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
+            assert_eq!(code, 0, "doc {doc:?} filter {filter:?}, stderr: {err}");
+            assert!(
+                err.is_empty(),
+                "doc {doc:?} filter {filter:?}, stderr: {err}"
+            );
+            assert_eq!(out.trim_end(), want, "doc {doc:?} filter {filter:?}");
+        }
+    }
+
+    // The other half of the rule, and the reason this is a narrowing rather
+    // than a blanket amnesty: a filter that *does* read the document still
+    // validates what it reads (#2168). Without these rows the grid above
+    // would pass just as well if validation had been deleted outright.
+    //
+    // The five structurally-malformed documents raise for every reading
+    // filter. The colliding-key document is the exception, and a
+    // pre-existing one that #2173 does not touch: `.`, `length` and `keys`
+    // never have to resolve `"\ud800"` to a display form, so they echo it
+    // at exit 0 exactly as #2103 recorded, while `. and true` and `not` go
+    // through the validation walk, which does resolve it, and raise #1642's
+    // collision. Encoded as measured rather than assumed -- the first draft
+    // of this test asserted a uniform 5 here and was wrong.
+    let structural = &docs[..5];
+    for doc in structural {
+        for filter in [".", "length", "keys", ". and true", "not"] {
+            let (_out, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
+            assert_eq!(code, 5, "doc {doc:?} filter {filter:?} must still raise");
+            assert!(!err.is_empty(), "doc {doc:?} filter {filter:?}");
+        }
+    }
+    let collision = docs[5];
+    for filter in [".", "length", "keys"] {
+        let (_out, err, code) = run_jq_full(&["-c", filter], Some(collision))?;
+        assert_eq!(code, 0, "`{filter}` on the collision doc, stderr: {err}");
+    }
+    for filter in [". and true", "not"] {
+        let (_out, err, code) = run_jq_full(&["-c", filter], Some(collision))?;
+        assert_eq!(code, 5, "`{filter}` on the collision doc must still raise");
+        assert!(err.contains("ambiguous"), "`{filter}` stderr: {err}");
+    }
+    Ok(())
+}
+
+/// #2173: which `and`/`or` shapes raise on a malformed document, and which
+/// answer.
+///
+/// #2476 ungated `eval_single`'s `Expr::And`/`Expr::Or` arms and had them
+/// run `ambient_validation_error` -- the bridge's ambient rejection without
+/// the bridge's allocation -- for every non-path-context shape. #2173 gates
+/// that walk on whether an operand actually reads `.`, because the wildcard
+/// bridge it stands in for stopped materializing for a closed term at the
+/// same time (`bridge_ambient_input`). Leaving the walk here would have
+/// re-created by hand the very spelling-dependence both changes remove:
+/// `true and true` raising while `1+1` answers, on one document, in one run.
 ///
 /// `test_try_catch_contains_a_genuinely_catchable_malformed_key_error_1812`
 /// pins the catchability rule and
@@ -44147,25 +44278,35 @@ fn test_ambient_validation_agrees_with_bridge_2476() -> Result<()> {
 /// (`test_and_or_over_alias_fanout_completes_2476` in
 /// `tests/yq_cli_tests.rs`), so a regression names itself.
 #[test]
-fn test_and_or_still_raise_on_a_malformed_document_2476() -> Result<()> {
-    for filter in [
-        "true and true",
-        ". and true",
-        "false or true",
-        // Short-circuiting cannot skip the check: it runs before the
-        // operands, exactly where the bridge's materialization used to.
-        "true or false",
-        "false and true",
+fn test_and_or_raise_only_when_an_operand_reads_the_document_2173() -> Result<()> {
+    // Reads `.`, so it validates `.` -- unchanged by #2173.
+    let (stdout, stderr, code) = run_jq_stdin_streams(". and true", "{123: 1}", &[])?;
+    assert_eq!(
+        code, 5,
+        "`. and true` must still reject the document -- stdout: {stdout:?} stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("Invalid JSON text"),
+        "`. and true` -- stderr: {stderr}"
+    );
+
+    // Reads nothing, so it validates nothing. Short-circuiting is not what
+    // decides this and never was: `true or false` never evaluates its right
+    // operand and `false and true` never evaluates its left, yet all four
+    // answer, because the question is what the *expression* can read, not
+    // which operand happens to run.
+    for (filter, want) in [
+        ("true and true", "true"),
+        ("false or true", "true"),
+        ("true or false", "true"),
+        ("false and true", "false"),
     ] {
         let (stdout, stderr, code) = run_jq_stdin_streams(filter, "{123: 1}", &[])?;
         assert_eq!(
-            code, 5,
-            "`{filter}` must still reject the document -- stdout: {stdout:?} stderr: {stderr:?}"
+            code, 0,
+            "`{filter}` reads nothing and must answer -- stdout: {stdout:?} stderr: {stderr:?}"
         );
-        assert!(
-            stderr.contains("Invalid JSON text"),
-            "`{filter}` -- stderr: {stderr}"
-        );
+        assert_eq!(stdout.trim(), want, "`{filter}` -- stderr: {stderr:?}");
     }
 
     Ok(())
@@ -44527,28 +44668,35 @@ fn test_alternative_control_flow_2476() -> Result<()> {
     Ok(())
 }
 
-/// #2476: `//`'s sibling of `test_not_still_raises_on_a_malformed_document_2476`
-/// just above. `Expr::Alternative` had no native arm at all, so unlike
-/// `and`/`or` there was no `needs_path_context` gate to drop -- the new arm
-/// calls `ambient_validation_error` unconditionally, because the whole
-/// construct is the "shape that used to bridge". These rows pin that the walk
-/// raises where the bridge's ambient materialization did: a #1194 malformed
-/// object key (raised for `false // 1`, which reads nothing at all, exactly
-/// as real jq rejects the document for every query), and a #1247 decode
-/// failure the walk actually visits.
+/// #2173: `//`'s sibling of `test_not_still_raises_on_a_malformed_document_2476`
+/// just above. #2476 gave `Expr::Alternative` a native arm that called
+/// `ambient_validation_error` unconditionally, because the whole construct
+/// was the "shape that used to bridge"; #2173 narrowed that to the shape
+/// that *reads*, since the bridge itself no longer materializes for a closed
+/// term either. So `.a // 1` still raises on a #1194 malformed object key
+/// and on a #1247 decode failure the walk visits, while `false // 1` --
+/// which reads nothing at all -- now answers, as `1+1` already did.
 #[test]
-fn test_alternative_still_raises_on_a_malformed_document_2476() -> Result<()> {
-    for filter in ["false // 1", ".a // 1"] {
-        let (stdout, stderr, code) = run_jq_stdin_streams(filter, "{123: 1}", &[])?;
-        assert_eq!(
-            code, 5,
-            "`{filter}` -- stdout: {stdout:?} stderr: {stderr:?}"
-        );
-        assert!(
-            stderr.contains("Invalid JSON text"),
-            "`{filter}` -- stderr: {stderr}"
-        );
-    }
+fn test_alternative_raises_only_when_it_reads_the_document_2173() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_stdin_streams(".a // 1", "{123: 1}", &[])?;
+    assert_eq!(
+        code, 5,
+        "`.a // 1` -- stdout: {stdout:?} stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("Invalid JSON text"),
+        "`.a // 1` -- stderr: {stderr}"
+    );
+
+    // #2173: `false // 1` reads nothing, so it no longer walks the document
+    // and no longer raises -- the same move the wildcard bridge made for
+    // `[1+1]`, applied to the arm that replaced it here.
+    let (stdout, stderr, code) = run_jq_stdin_streams("false // 1", "{123: 1}", &[])?;
+    assert_eq!(
+        code, 0,
+        "`false // 1` reads nothing -- stdout: {stdout:?} stderr: {stderr:?}"
+    );
+    assert_eq!(stdout.trim(), "1", "stderr: {stderr:?}");
 
     let (stdout, stderr, code) = run_jq_stdin_streams("(.[0] // 1)", "[\"\\x\"]", &[])?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
