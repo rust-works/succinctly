@@ -1805,22 +1805,41 @@ pinned rather than silently left uncovered, by
 in [tests/jq_cli_tests.rs](../../../tests/jq_cli_tests.rs).
 
 **#2211's own sibling shape (`[,]`, `{,}` -- a stray comma with *zero* real
-elements/fields) remains open through every path this section fixed**, for
-the same reason it remains open through `to_owned_at_depth`'s cursor-less
-callers (#2262's own account above): `container_gap_ok` needs a cursor to
-the *container itself* to find its opening bracket, and none of
+elements/fields) -- closed by #2594.** It was open through every path this
+section fixed, for the same reason it remains open through
+`to_owned_at_depth`'s cursor-less callers (#2262's own account above):
+`container_gap_ok` needs a cursor to the *container itself* to find its
+opening bracket, and none of
 `each_lazy_array_iterate_sink`/`collect_cursors_checked`/`len_checked`
 (elements only), `effective_fields_checked`/`effective_keys`/
 `DistinctKeyCursors`/`find_cursor` (fields only) ever receive one -- only
-per-child cursors, once a child exists to hold one. One path in this set
-*does* have a container cursor sitting unused at its call site:
-`eval_each_generic`'s `Expr::Iterate` arm already threads `cursor:
-Option<V::Cursor>` through to `each_lazy_array_iterate_sink`'s call site
-but doesn't pass it in. Deliberately not wired up here -- doing so would
-mean widening a hot-path function's signature and its one call site for a
-case outside this issue's own five repros, a scoped follow-up rather than
-opportunistic scope creep. Pinned as still open by
-`test_jq_cursor_transparent_fast_paths_empty_container_stray_comma_remains_a_known_gap_2261`.
+per-child cursors, once a child exists to hold one.
+
+That is still true of the walks, and #2594 did not change any of them. What
+it changed is where the check runs: every one of those walks is dispatched
+from an `eval_single`/`eval_builtin`/`path_step_generic` arm that already
+holds `cursor: Option<V::Cursor>` for the container (for type-name
+diagnostics), so the arm now calls `empty_fields_tail_gap_ok`/
+`empty_elements_tail_gap_ok` (`document.rs`) ahead of the walk that cannot.
+The observation recorded here -- that `eval_each_generic`'s `Expr::Iterate`
+arm had a container cursor sitting unused at its call site -- generalised:
+so did all the others.
+
+Per-arm rather than one guard at the top of either dispatch function,
+because #2173's closed terms (`empty`, `true and true`, `1 + 1`) dispatch
+through them too and must answer exactly as `empty` does on every document,
+malformed ones included; a hoisted guard fails
+`test_ambient_validation_agrees_with_bridge_2476`. Pinned by
+`test_jq_cursor_transparent_fast_paths_empty_container_stray_comma_now_raises_2594`,
+with `test_jq_genuinely_empty_containers_unaffected_2594` and
+`test_jq_closed_terms_unaffected_by_empty_container_check_2594` for the two
+things the fix must *not* do.
+
+Still open, unchanged by #2594: the same shape reached through
+`to_owned_at_depth`'s cursor-less top-level callers (#2262 above) and
+through `collect_paths_generic`'s value-domain recursion for a container
+nested *inside* a `paths`/`leaf_paths` walk -- neither has a container
+cursor to check against.
 
 **`length` (objects) -- fixed by #2307/#2311.** Not one of this issue's own
 five repros, originally left open here with reasoning that turned out to be
