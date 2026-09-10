@@ -2070,91 +2070,95 @@ fn test_builtin_select() -> Result<()> {
     Ok(())
 }
 
-/// #1645: `push_generic_truthiness`'s `OneCursor`/`ManyCursor` arms swapped a
-/// full materializing `to_owned_cursor(&c).is_truthy()` for the O(1)
-/// `DocumentCursor::is_falsy()` -- caught by review that `is_falsy()` itself
-/// is deliberately silent on a decode failure or a #1194 structural error
-/// (its own doc comment: "conservative assumption", matching
-/// `--exit-status`'s existing best-effort use of it), where the removed
-/// materializing path used to raise. `select` must still raise here rather
-/// than silently treating the value as truthy and passing it through.
+/// #1645/#2692: `select`'s condition is `DocumentCursor::is_falsy()`, which
+/// is O(1) and decodes nothing -- and, since #2692, that is the whole of it.
+///
+/// The history is the point of this test, so it is worth stating. #1645
+/// swapped a materializing `to_owned_cursor(&c).is_truthy()` for `is_falsy()`
+/// in `push_generic_truthiness`'s `OneCursor`/`ManyCursor` arms; review
+/// caught that `is_falsy()` is deliberately silent on a decode failure or a
+/// #1194 structural error (its own doc comment: "conservative assumption",
+/// matching `--exit-status`'s existing best-effort use of it), so a
+/// validation walk was put in front of it to keep the raise. #2692 removed
+/// that walk: under ADR-0018's #2103 amendment a filter validates only what
+/// it *materializes*, and testing truthiness materializes nothing. The
+/// silence #1645 guarded against is now the designed answer.
+///
+/// Each case therefore pins both halves, on one document: `select` passes the
+/// value through without raising, and a consumer that goes on to materialize
+/// the very same value still raises with the very same message. Nothing was
+/// lost -- the raise moved to whoever actually reads the bytes.
+///
+/// **Diverges from jq**, which rejects all four documents at parse time
+/// whatever the filter (`docs/compliance/jq/limitations.md`).
 #[test]
-fn test_select_raises_on_decode_failure_instead_of_silently_truthy_1645() -> Result<()> {
-    // `\x` is not a valid JSON escape -- structurally a string token, but
-    // its bytes don't decode (#1247's own trigger shape).
-    let (stdout, stderr, code) = run_jq_full(&[".[] | select(.)"], Some(r#"["\x"]"#))
-        .unwrap_or_else(|e| panic!("`select(.)` failed to run: {e}"));
-    assert_eq!(
-        code, 5,
-        "an undecodable value must not be silently treated as truthy\nstdout: {stdout:?}\nstderr: {stderr:?}"
-    );
-    assert!(
-        stderr.contains("invalid escape sequence"),
-        "stderr: {stderr:?}"
-    );
-    Ok(())
-}
+fn test_select_passes_through_corruption_it_only_tests_1645_2692() -> Result<()> {
+    // (label, document, select filter that only tests, materializing control)
+    let cases: &[(&str, &str, &str, &str, &str)] = &[
+        (
+            // `\x` is not a valid JSON escape -- structurally a string
+            // token, but its bytes don't decode (#1247's own trigger shape).
+            "decode failure, tested directly",
+            r#"["\x"]"#,
+            ".[] | select(.) | 1",
+            "[.[] | select(.)] | length",
+            "invalid escape sequence",
+        ),
+        (
+            // #1194: a token the semi-index accepted as a span but could
+            // not classify.
+            "structural error, tested directly",
+            "[xyz123]",
+            ".[] | select(.) | 1",
+            "[.[] | select(.)] | length",
+            "unexpected character",
+        ),
+        (
+            // Nested a level below the value the condition resolves to:
+            // `.bad` is the *array*, not the bad string. The walk #1645
+            // added recursed into container contents to reach this (an
+            // earlier version of that fix checked only the top-level cursor
+            // and silently missed this shape); #2692 removed the recursion
+            // along with the walk, so the pass-through has to hold at depth
+            // too.
+            "decode failure, nested in the tested container",
+            r#"{"bad": ["\x"], "keep": 5}"#,
+            "select(.bad) | .keep",
+            "[select(.bad)] | length",
+            "invalid escape sequence",
+        ),
+        (
+            "structural error, nested in the tested container",
+            r#"{"bad": [xyz123], "keep": 5}"#,
+            "select(.bad) | .keep",
+            "[select(.bad)] | length",
+            "unexpected character",
+        ),
+    ];
 
-/// #1645 sibling case: a *structurally* malformed value (#1194 -- a token
-/// the semi-index accepted as a span but couldn't classify) must also still
-/// raise through `select`'s truthiness check, not silently pass through.
-#[test]
-fn test_select_raises_on_structural_error_instead_of_silently_truthy_1645() -> Result<()> {
-    let (stdout, stderr, code) = run_jq_full(&[".[] | select(.)"], Some("[xyz123]"))
-        .unwrap_or_else(|e| panic!("`select(.)` failed to run: {e}"));
-    assert_eq!(
-        code, 5,
-        "a structurally malformed value must not be silently treated as truthy\nstdout: {stdout:?}\nstderr: {stderr:?}"
-    );
-    assert!(
-        stderr.contains("unexpected character"),
-        "expected the #1194 structural-error message on stderr: {stderr:?}"
-    );
-    Ok(())
-}
+    for (label, doc, tests_only, materializes, want_stderr) in cases {
+        let (stdout, stderr, code) = run_jq_full(&["-c", tests_only], Some(doc))?;
+        assert_eq!(
+            code, 0,
+            "[{label}] `{tests_only}` only tests the value and must not raise\
+             \nstdout: {stdout:?}\nstderr: {stderr:?}"
+        );
+        assert!(
+            stderr.is_empty(),
+            "[{label}] `{tests_only}`: stderr {stderr:?}"
+        );
 
-/// #1645: the same decode failure, but nested a level below the value
-/// `select`'s condition actually resolves to -- `.bad` resolves to the
-/// *array*, not the bad string directly, so this only passes if the
-/// truthiness check recurses into container contents rather than checking
-/// only the condition's own top-level cursor (an earlier version of this
-/// fix did exactly that and silently missed this shape -- caught by
-/// review).
-#[test]
-fn test_select_raises_on_decode_failure_nested_in_container_1645() -> Result<()> {
-    let (stdout, stderr, code) = run_jq_full(
-        &["select(.bad) | .keep"],
-        Some(r#"{"bad": ["\x"], "keep": 5}"#),
-    )
-    .unwrap_or_else(|e| panic!("`select(.bad)` failed to run: {e}"));
-    assert_eq!(
-        code, 5,
-        "a decode failure nested inside the condition's container must still raise\nstdout: {stdout:?}\nstderr: {stderr:?}"
-    );
-    assert!(
-        stderr.contains("invalid escape sequence"),
-        "stderr: {stderr:?}"
-    );
-    Ok(())
-}
-
-/// #1645 sibling case: a #1194 structural error nested a level below the
-/// condition's own top-level cursor.
-#[test]
-fn test_select_raises_on_structural_error_nested_in_container_1645() -> Result<()> {
-    let (stdout, stderr, code) = run_jq_full(
-        &["select(.bad) | .keep"],
-        Some(r#"{"bad": [xyz123], "keep": 5}"#),
-    )
-    .unwrap_or_else(|e| panic!("`select(.bad)` failed to run: {e}"));
-    assert_eq!(
-        code, 5,
-        "a structural error nested inside the condition's container must still raise\nstdout: {stdout:?}\nstderr: {stderr:?}"
-    );
-    assert!(
-        stderr.contains("unexpected character"),
-        "expected the #1194 structural-error message on stderr: {stderr:?}"
-    );
+        let (stdout, stderr, code) = run_jq_full(&["-c", materializes], Some(doc))?;
+        assert_eq!(
+            code, 5,
+            "[{label}] `{materializes}` materializes the same value and must still raise\
+             \nstdout: {stdout:?}\nstderr: {stderr:?}"
+        );
+        assert!(
+            stderr.contains(want_stderr),
+            "[{label}] `{materializes}`: stderr {stderr:?} lacks {want_stderr:?}"
+        );
+    }
     Ok(())
 }
 
@@ -2228,7 +2232,10 @@ fn assert_jq_answers(
 /// site agrees, not just that each is individually correct (see the
 /// `testing` skill and CLAUDE.md's "Duplicated predicates diverge silently"
 /// note, #106). #1803 extended this from 2 sites to 3: `select(.bad) | .keep`
-/// (`push_generic_document_validation_error`), `-Sc .bad` (`to_owned_at_depth`,
+/// (`push_generic_document_validation_error` -- since #2692 `select` no
+/// longer reaches that gate at all and is asserted on the answering side
+/// below, but it stays in the list because agreement is what this test is
+/// for), `-Sc .bad` (`to_owned_at_depth`,
 /// confirmed live via temporary tracing -- `-S` does *not* route through the
 /// cursor-aware sibling despite the name resemblance), and `-e .bad`
 /// (`cursor_to_owned_at_depth`, `lazy.rs` -- a JSON-only fourth
@@ -2292,15 +2299,6 @@ fn test_select_and_materialize_agree_on_corruption_1645() -> Result<()> {
     ];
 
     for (label, doc, expect_stderr) in cases {
-        assert_jq_raises(
-            label,
-            "select(.bad)",
-            &[],
-            "select(.bad) | .keep",
-            doc,
-            5,
-            expect_stderr,
-        );
         assert_jq_raises(label, "-Sc .bad", &["-Sc"], ".bad", doc, 5, expect_stderr);
         assert_jq_raises(
             label,
@@ -2323,15 +2321,19 @@ fn test_select_and_materialize_agree_on_corruption_1645() -> Result<()> {
             5,
             expect_stderr,
         );
-        // #2168: `path(.bad)` is the one row here that must *not* raise. It
-        // names a position and never reads the value at it, and every
-        // corruption in this list lives inside `.bad`'s value -- so it now
-        // follows the rule `.keep` on these same documents always did. The
-        // four rows above keep the gate: three materialize, and `sort_by`
-        // walks the element it reorders. Keeping it in this list rather than
-        // deleting it is the point: the list's job is pinning that every
-        // consumer of one document agrees, and "agrees" now includes knowing
-        // which side of the line each one is on.
+        // The rows that must *not* raise. `path(.bad)` names a position and
+        // never reads the value at it (#2168); `select(.bad)` tests that
+        // value's truthiness, which `is_falsy` answers without decoding it
+        // (#2692). Every corruption in this list lives inside `.bad`'s
+        // value, so both now follow the rule `.keep` on these same documents
+        // always did. The three rows above keep the gate: `-Sc`/`-e`
+        // materialize, and `sort_by` materializes the comparison key of an
+        // element it only reorders.
+        //
+        // Keeping both in this list rather than deleting them is the point:
+        // the list's job is pinning that every consumer of one document
+        // agrees, and "agrees" includes knowing which side of the line each
+        // one is on.
         assert_jq_answers(
             label,
             "path(.bad)",
@@ -2339,6 +2341,14 @@ fn test_select_and_materialize_agree_on_corruption_1645() -> Result<()> {
             "path(.bad)",
             doc,
             r#"["bad"]"#,
+        );
+        assert_jq_answers(
+            label,
+            "select(.bad) | .keep",
+            &["-c"],
+            "select(.bad) | .keep",
+            doc,
+            "5",
         );
     }
     Ok(())
@@ -2546,7 +2556,6 @@ proptest! {
         let expect_stderr = malformation.expect_stderr();
         let label = format!("{path:?}/{malformation:?}");
 
-        assert_jq_raises(&label, "select(.bad)", &[], "select(.bad) | .keep", &doc, 5, expect_stderr);
         assert_jq_raises(&label, "-Sc .bad", &["-Sc"], ".bad", &doc, 5, expect_stderr);
         assert_jq_raises(
             &label,
@@ -2558,16 +2567,21 @@ proptest! {
             expect_stderr,
         );
         assert_jq_raises(&label, "sort_by(.bad)", &[], "sort_by(.bad)", &doc, 5, expect_stderr);
-        // #2168: `path(.bad)` left the "must raise" battery above. It names
-        // a position and never reads the value there, and every corruption
-        // this fuzzer builds lives *inside* `.bad`'s value, so it answers --
+        // The consumers that left the "must raise" battery above, each for
+        // its own half of the same rule. `path(.bad)` names a position and
+        // never reads the value there (#2168); `select(.bad)` tests that
+        // value's truthiness without decoding it (#2692). Every corruption
+        // this fuzzer builds lives *inside* `.bad`'s value, so both answer --
         // the same rule `.keep` on these documents has always followed. The
-        // four consumers above keep the gate: three materialize, and
-        // `sort_by` walks the element it reorders. This row is what caught
-        // the mismatch when #2168 landed: the property was written against
-        // the old contract and this generator reached a shape the
-        // hand-written tests did not.
+        // three consumers above keep the gate: `-Sc`/`-e` materialize, and
+        // `sort_by` materializes the key of an element it only reorders.
+        //
+        // The `path` row is what caught the mismatch when #2168 landed: the
+        // property was written against the old contract and this generator
+        // reached a shape the hand-written tests did not. `select`'s row is
+        // here to do the same job for #2692's move.
         assert_jq_answers(&label, "path(.bad)", &["-c"], "path(.bad)", &doc, r#"["bad"]"#);
+        assert_jq_answers(&label, "select(.bad) | .keep", &["-c"], "select(.bad) | .keep", &doc, "5");
     }
 }
 
@@ -20942,29 +20956,38 @@ fn test_partial_result_over_depth_value_reports_cleanly_not_panic_1371() -> Resu
     Ok(())
 }
 
-/// #2627: the `needs_path_context` gate's wildcard/ambient bridge used to
-/// reach `eval_generic.rs`'s `assert_nesting_depth` `panic!` on a >256-deep
-/// *document* (not a constructed value, unlike #1371's `test_partial_result_
-/// over_depth_value_reports_cleanly_not_panic_1371` above) for an expression
-/// that has no native path-context arm (`and`/`or` fall to the bridge purely
-/// to surface a document-level fault, per `eval_boolean_generic`'s own
-/// comment). `. and true`, not `true and true`: a fully closed term (no
-/// operand reads `.` at all) no longer reaches the bridge's materialization
-/// in the first place -- #2173's `walk::reads_ambient_value` gate (landed
-/// the same day as this fix) substitutes `null` for a closed term instead of
-/// the real document, so `true and true` on this same input now answers
-/// `true` at exit 0 rather than reaching this guard. `.` on the left keeps
-/// `needs_path_context` false (still no `key`/`parent`/`path` operand) while
-/// making the whole expression read the ambient value, which is what keeps
-/// the real (over-deep) document in the loop. Already shielded at the CLI
-/// boundary by `catch_unwind` (#1793) before this fix -- confirmed via
-/// `!stderr.contains("panicked")` below, so this pins the *absence* of a
-/// regression there while the real fix (`eval_generic.rs`'s depth guard no
-/// longer panics at all) is what protects a library embedder calling
-/// `succinctly::jq::eval` directly, which had no such net.
+/// #2627: the wildcard/ambient bridge used to reach `eval_generic.rs`'s
+/// `assert_nesting_depth` `panic!` on a >256-deep *document* (not a
+/// constructed value, unlike #1371's `test_partial_result_
+/// over_depth_value_reports_cleanly_not_panic_1371` above). It now reports a
+/// clean error instead, and that is what these two pin.
+///
+/// The probe has moved twice, always for the same reason -- the set of
+/// spellings that still reach the bridge keeps shrinking, and this test has
+/// to follow it rather than pin a spelling that no longer gets there:
+///
+/// - `true and true` was the original. #2173's `walk::reads_ambient_value`
+///   gate substitutes `null` for a fully closed term instead of the real
+///   document, so it stopped reaching the bridge.
+/// - `. and true` replaced it, on the reasoning that `.` on the left keeps
+///   `needs_path_context` false while still making the expression read the
+///   ambient value. #2692 ended that too: `and`/`or` have a native,
+///   ungated streaming arm now, and reading `.`'s *truthiness* is
+///   `is_falsy` -- O(1), no recursion -- so `. and true` answers `true` at
+///   exit 0 on this same 300-deep input. That is pinned as its own claim by
+///   `test_truthiness_probes_do_not_trip_the_depth_guard_2692`.
+/// - `. as $x | $x` is the current probe: a binding still materializes the
+///   ambient value through the bridge, so it still reaches the guard.
+///
+/// Already shielded at the CLI boundary by `catch_unwind` (#1793) before the
+/// fix -- confirmed via `!stderr.contains("panicked")` below, so this pins
+/// the *absence* of a regression there, while the real fix
+/// (`eval_generic.rs`'s depth guard no longer panicking at all) is what
+/// protects a library embedder calling `succinctly::jq::eval` directly,
+/// which had no such net.
 #[test]
 fn test_boolean_wildcard_bridge_over_depth_document_reports_cleanly_not_panic_2627() -> Result<()> {
-    let (stdout, stderr, code) = run_jq_full(&["-c", ". and true"], Some(&nested_arrays(300)))?;
+    let (stdout, stderr, code) = run_jq_full(&["-c", ". as $x | $x"], Some(&nested_arrays(300)))?;
     assert_eq!(stdout.trim_end(), "");
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(!stderr.contains("panicked"), "stderr: {stderr:?}");
@@ -20975,14 +20998,15 @@ fn test_boolean_wildcard_bridge_over_depth_document_reports_cleanly_not_panic_26
     Ok(())
 }
 
-/// Companion to the test above: `. and true` on a document well under
-/// the limit must still evaluate normally through the same bridge -- `.`
-/// is a non-empty array either way, so this is `true` regardless of depth.
+/// Companion to the test above: the same spelling on a document well under
+/// the limit must still evaluate normally through the same bridge.
 #[test]
 fn test_boolean_wildcard_bridge_accepts_depth_under_limit_2627() -> Result<()> {
-    let (stdout, stderr, code) = run_jq_full(&["-c", ". and true"], Some(&nested_arrays(100)))?;
+    let under = nested_arrays(100);
+    let (stdout, stderr, code) = run_jq_full(&["-c", ". as $x | $x"], Some(&under))?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout.trim_end(), "true");
+    // The binding echoes the document, so the round trip is the assertion.
+    assert_eq!(stdout.trim_end(), under.trim_end());
     Ok(())
 }
 
@@ -39664,8 +39688,11 @@ fn test_path_answers_past_a_colliding_key_2168() -> Result<()> {
 /// `path()` was the query that reached that seeding re-walk; `path()` left
 /// the gate with this issue (see
 /// `test_path_answers_past_a_colliding_key_2168` next door, which is the
-/// same three documents on the other side of the line), and the four
-/// consumers that kept it are what still reach it.
+/// same three documents on the other side of the line), and the consumers
+/// that kept it are what still reach it. #2692 shrank that set further --
+/// `select` left too, on the argument that a truthiness test does not read
+/// what it tests -- leaving the `sort_by`/`unique_by`/`min_by`/`max_by`
+/// family as the gate's only remaining caller and so its only probe here.
 ///
 /// The fallback key must sit at index >= 1 for the re-walk to run at all --
 /// at index 0 there is no prefix to seed from, which is the shape the sibling
@@ -39686,11 +39713,10 @@ fn test_validation_gate_seeds_the_collision_map_prefix_2168() -> Result<()> {
     ] {
         let doc = format!(r#"{{"c":{inner},"t":5}}"#);
 
-        // `select` reaches the gate through its `OneCursor` truthiness arm.
-        let (stdout, stderr, code) = run_jq_stdin_streams("select(.c) | .t", &doc, &["-c"])?;
-        assert_eq!(code, 5, "select on {doc}: stdout {stdout:?}");
-        assert!(stderr.contains("is ambiguous"), "select: {stderr}");
-
+        // `select` used to reach the gate here through its `OneCursor`
+        // truthiness arm; since #2692 it does not reach the gate at all, and
+        // answers instead -- pinned as such below.
+        //
         // `sort_by` reaches it through the `_by` forms' own call, on an
         // element it only reorders and never materializes (#1755) -- a
         // second call site for one walk. The array wrapper has to be the
@@ -39705,10 +39731,22 @@ fn test_validation_gate_seeds_the_collision_map_prefix_2168() -> Result<()> {
 
         // The control, and the point of the whole #2168 split: the same
         // document, the same colliding pair, on a query that only names
-        // positions -- it answers.
-        let (stdout, stderr, code) = run_jq_stdin_streams("path(.t)", &doc, &["-c"])?;
-        assert_eq!(code, 0, "path(.t) on {doc}: stderr {stderr:?}");
-        assert_eq!(stdout.trim(), r#"["t"]"#);
+        // positions -- it answers. `select(.c) | .t` sits beside it since
+        // #2692, testing a position rather than naming one, and answering
+        // for the same reason: neither resolves the colliding keys.
+        for filter in ["path(.t)", "select(.c) | .t"] {
+            let (stdout, stderr, code) = run_jq_stdin_streams(filter, &doc, &["-c"])?;
+            assert_eq!(code, 0, "{filter} on {doc}: stderr {stderr:?}");
+            assert_eq!(
+                stdout.trim(),
+                if filter == "path(.t)" {
+                    r#"["t"]"#
+                } else {
+                    "5"
+                },
+                "{filter}"
+            );
+        }
     }
 
     // No collision, same shape: a fallback key at index 1 whose display
@@ -39831,12 +39869,17 @@ fn test_path_optional_still_raises_a_decode_failure_2168() -> Result<()> {
 /// query never reads, and which do not.
 ///
 /// The two halves of the decision belong next to each other, because the
-/// argument for it is their relationship. A builtin whose walk's domain *is*
-/// the value it tests or emits (`select`, the `sort_by` family) keeps the
-/// whole-subtree gate; one that only names or navigates to a position
-/// (`path`, `key`, `parent`) validates just what it touches, like plain
-/// navigation always has. Anything that materializes still validates
-/// everything it materializes.
+/// argument for it is their relationship. #2168 drew the line at "a builtin
+/// whose walk's domain *is* the value it tests or emits (`select`, the
+/// `sort_by` family) keeps the whole-subtree gate; one that only names or
+/// navigates to a position (`path`, `key`, `parent`) validates just what it
+/// touches". #2692 moved it once more, in the same direction: `select`'s
+/// condition only ever asks `is_falsy`, which decodes nothing, so testing a
+/// value is not reading it either and `select` joined the answering column.
+/// What is left is the simple rule -- **anything that materializes validates
+/// everything it materializes, and nothing else validates anything.** The
+/// `sort_by` family stays in the raising column under exactly that rule: it
+/// materializes a comparison key.
 ///
 /// **Every row diverges from jq**, which rejects this document at parse time
 /// whatever the filter -- including the rows that raise, since succinctly
@@ -39863,6 +39906,17 @@ fn test_lazy_validation_boundary_2168() -> Result<()> {
         ("[.[] | key]", r#"["a","d"]"#),
         ("[paths]", r#"[["a"],["d"]]"#),
         ("select(.d) | .d", "5"),
+        // #2692: `select`'s condition is answered by `is_falsy`, which
+        // decodes nothing -- so testing the *whole document* (`select(.)`)
+        // validates no more of it than `.d` does. This row asserted exit 5
+        // until #2692.
+        ("select(.) | .d", "5"),
+        // The same rule for the other truthiness readers, none of which
+        // decode what they test either.
+        ("if . then .d else 0 end", "5"),
+        ("(. // 1) | .d", "5"),
+        ("[.[] | not]", "[false,false]"),
+        ("(true and true) | 1", "1"),
     ] {
         let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
         assert_eq!(code, 0, "{filter}: stdout {stdout:?} stderr {stderr:?}");
@@ -39888,15 +39942,23 @@ fn test_lazy_validation_boundary_2168() -> Result<()> {
         );
     }
 
-    // `select` keeps its gate even though the value it tests is clean: the
-    // *condition's own subtree* is what it validates, and here that is the
-    // whole document (`select(.)` tests the root).
-    let (stdout, stderr, code) = run_jq_stdin_streams("select(.) | .d", doc, &["-c"])?;
-    assert_eq!(code, 5, "stdout {stdout:?} stderr {stderr:?}");
-    assert!(
-        stderr.contains("invalid unicode escape sequence"),
-        "{stderr:?}"
-    );
+    // The boundary #2692 left behind, pinned from the other side: testing the
+    // root is free, but *materializing* it right afterwards still raises. The
+    // condition is identical in both rows above and below -- only what the
+    // consumer does with the value it passed through differs, which is the
+    // whole of the surviving rule.
+    for filter in [
+        "select(.) | to_entries",
+        "select(.) | . as $x | $x",
+        "select(.) | [.[]] | length",
+    ] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &["-c"])?;
+        assert_eq!(code, 5, "{filter}: stdout {stdout:?} stderr {stderr:?}");
+        assert!(
+            stderr.contains("invalid unicode escape sequence"),
+            "{filter}: {stderr:?}"
+        );
+    }
 
     Ok(())
 }
@@ -42029,19 +42091,25 @@ fn test_seq_wellformed_and_leniency_unaffected_by_checked_swap_2295() -> Result<
 /// correctly raised. Repros and control verified live against `/usr/bin/jq`
 /// 1.7.1 in the issue's own filing.
 ///
-/// `path()` was a seventh caller of that gate when this test was written, and
-/// its own row lived here. #2168 removed it from the gate -- naming a
-/// position never reads what is inside it -- so that row now lives in
+/// The set of builtins reaching that gate has shrunk twice since. `path()`
+/// was a seventh caller when this test was written; #2168 removed it --
+/// naming a position never reads what is inside it -- so its row now lives in
 /// `test_path_answers_past_a_structural_fault_it_never_reads_2168`, asserting
-/// the opposite. The rows that remain are the builtins that still validate,
-/// because the subtree they walk is the value they test or emit.
+/// the opposite. #2692 then removed `select` (and `if`/`not`/`//`/`any`/
+/// `all`) for the same reason one step further on: a truthiness test is
+/// answered by `is_falsy`, which decodes nothing. Every row here therefore
+/// probes through the `sort_by`/`unique_by`/`min_by`/`max_by` family, now the
+/// gate's only caller and the only one that still fits the rule -- it
+/// materializes a comparison key. The rows whose documents look
+/// array-shaped-for-no-reason are the object cases rewritten to suit it; the
+/// corrupted subtree (`.c`) is still one the query never emits.
 #[test]
 fn test_validate_only_gate_delimiter_checks_2349() -> Result<()> {
     let cases: &[(&str, &str, &str)] = &[
         (
-            "trailing comma in nested object, select+field",
-            r#"{"c":{"a":1,},"t":5}"#,
-            "select(.c) | .t",
+            "trailing comma in nested object, sort_by",
+            r#"[{"k":1,"c":{"a":1,}}]"#,
+            "sort_by(.k) | length",
         ),
         (
             "trailing comma in nested array element, sort_by",
@@ -42060,18 +42128,18 @@ fn test_validate_only_gate_delimiter_checks_2349() -> Result<()> {
         ),
         (
             "stray comma with no real field, object",
-            r#"{"c":{,},"t":5}"#,
-            "select(.c) | .t",
+            r#"[{"k":1,"c":{,}}]"#,
+            "sort_by(.k) | length",
         ),
         (
             "stray comma with no real element, array",
-            r#"{"c":[,],"t":5}"#,
-            "select(.c) | .t",
+            r#"[{"k":1,"c":[,]}]"#,
+            "sort_by(.k) | length",
         ),
         (
             "missing colon between key and value",
-            r#"{"c":{"a" 1},"t":5}"#,
-            "select(.c) | .t",
+            r#"[{"k":1,"c":{"a" 1}}]"#,
+            "sort_by(.k) | length",
         ),
     ];
 
@@ -42089,10 +42157,12 @@ fn test_validate_only_gate_delimiter_checks_2349() -> Result<()> {
     }
 
     // Well-formed control: the same shape, no corruption, must be unaffected.
-    let (stdout, stderr, code) =
-        run_jq_full(&["-c", "select(.c) | .t"], Some(r#"{"c":{"a":1},"t":5}"#))?;
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "sort_by(.k) | length"],
+        Some(r#"[{"k":1,"c":{"a":1}}]"#),
+    )?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
-    assert_eq!(stdout.trim(), "5");
+    assert_eq!(stdout.trim(), "1");
 
     Ok(())
 }
@@ -42103,8 +42173,11 @@ fn test_validate_only_gate_delimiter_checks_2349() -> Result<()> {
 /// whole-document gate as the decode-failure raise, so dropping that gate for
 /// cursor-resolved path queries drops them too: `path(.c)` on a document whose
 /// `.c` holds a trailing comma now answers, because naming a position never
-/// reads what is inside it. `select`/`sort_by` keep their gate and so keep
-/// these checks -- their remaining rows in that test are the control.
+/// reads what is inside it. `sort_by` keeps its gate and so keeps these
+/// checks -- its rows in that test are the control. (`select` kept the gate
+/// too until #2692 took it, on the same argument one step further on: a
+/// truthiness test does not read the value either. Its row moved from the
+/// raising loop into the answering table below.)
 ///
 /// **Diverges from jq, deliberately:** real jq rejects `{"c":{"a":1,}}` at
 /// parse time whatever the filter, so the `path` rows here used to match its
@@ -42122,6 +42195,10 @@ fn test_path_answers_past_a_structural_fault_it_never_reads_2168() -> Result<()>
         ("path(.c)", r#"["c"]"#),
         ("[path(.[])]", r#"[["c"],["t"]]"#),
         (".t", "5"),
+        // #2692: `select` joined this column. Testing `.c`'s truthiness is
+        // `is_falsy`, which no more reads inside `.c` than `path(.c)` does.
+        // This row asserted a raise, in the loop below, until #2692.
+        ("select(.c) | .t", "5"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
         assert_eq!(code, 0, "{filter}: stdout {stdout:?} stderr {stderr:?}");
@@ -42130,7 +42207,7 @@ fn test_path_answers_past_a_structural_fault_it_never_reads_2168() -> Result<()>
 
     // Reading into the corrupted subtree still raises, on every route that
     // does read it -- the touched-node controls.
-    for filter in [".c", ".c.a", "select(.c) | .t", "sort_by(.c) | length"] {
+    for filter in [".c", ".c.a", "sort_by(.c) | length"] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
         assert_ne!(code, 0, "{filter}: stdout {stdout:?}");
         assert!(stderr.contains("Invalid JSON"), "{filter}: {stderr:?}");
@@ -42145,8 +42222,10 @@ fn test_path_answers_past_a_structural_fault_it_never_reads_2168() -> Result<()>
 /// (`preceding_delimiter_ok`) from the trailing/#2211 ones.
 #[test]
 fn test_validate_only_gate_array_element_delimiter_2349() -> Result<()> {
-    let (stdout, stderr, code) =
-        run_jq_full(&["-c", "select(.c) | .t"], Some(r#"{"c":[1,,2],"t":5}"#))?;
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "sort_by(.k) | length"],
+        Some(r#"[{"k":1,"c":[1,,2]}]"#),
+    )?;
     assert_ne!(
         code, 0,
         "duplicate comma between array elements should raise (stdout: {stdout:?})"
@@ -44123,19 +44202,13 @@ fn test_preserve_input_keeps_jq_escape_table_2209() -> Result<()> {
     Ok(())
 }
 
-/// #2476: `eval_single`'s wildcard bridge materializes the *ambient* value
-/// before the eager evaluator runs, and that materialization is what makes a
-/// query that never reads `.` still raise on a malformed document (#1812:
-/// jq rejects the whole document for every query). The native arms that
-/// replace the bridge for `and`/`or`/`not`/`//` run
-/// `ambient_validation_error` -- `push_generic_document_validation_error`,
-/// the walk `select(.)`/`if` already use -- instead. This corpus pins that
-/// the two raise identically: every malformed-document class the checks
-/// cover, each probed through the reference route (`select(.)`) and through
-/// every construct that used to bridge, asserting the same exit code and
-/// the same first stderr line, *and* the exit code the row must have
-/// (agreement alone would also pass if both routes silently stopped
-/// raising).
+/// #2692: **a filter validates only what it materializes**, stated as a
+/// corpus. Every malformed-document class succinctly's checks can detect,
+/// probed through a filter that reads nothing (`try (1+1)`) and through every
+/// filter that reads only *truthiness*, asserting they all give the same exit
+/// code and the same first stderr line -- and, separately, the exit code the
+/// row must have, since agreement alone would also pass if every probe
+/// started raising.
 ///
 /// **#2173 split the probe list in two.** The walk is now charged only to a
 /// construct that actually reads `.`, so `true and true`, `false or true`
@@ -44151,148 +44224,68 @@ fn test_preserve_input_keeps_jq_escape_table_2209() -> Result<()> {
 /// pin). The alias-to-container shape is #1804's accepted trade-off and is
 /// pinned by its own test instead of here.
 #[test]
-fn test_ambient_validation_agrees_with_bridge_2476() -> Result<()> {
+fn test_truthiness_probes_validate_nothing_2692() -> Result<()> {
     let deep200 = format!("{}1{}", "[".repeat(200), "]".repeat(200));
-    // (label, document, expected exit code, expected stderr substring)
-    let corpus: &[(&str, &str, i32, &str)] = &[
-        ("#1194 non-string key", "{123: 1}", 5, "expected string key"),
-        (
-            "decode failure, top level",
-            r#"{"bad": "\x", "keep": 5}"#,
-            5,
-            "invalid escape sequence",
-        ),
-        (
-            "decode failure, in array",
-            r#"["\x"]"#,
-            5,
-            "invalid escape sequence",
-        ),
-        (
-            "decode failure, root scalar",
-            r#""\x""#,
-            5,
-            "invalid escape sequence",
-        ),
+    // (label, document)
+    let corpus: &[(&str, &str)] = &[
+        ("#1194 non-string key", "{123: 1}"),
+        ("decode failure, top level", r#"{"bad": "\x", "keep": 5}"#),
+        ("decode failure, in array", r#"["\x"]"#),
+        ("decode failure, root scalar", r#""\x""#),
         (
             "decode failure, nested object",
             r#"{"bad": {"x": "\x"}, "keep": 5}"#,
-            5,
-            "invalid escape sequence",
         ),
         (
             "structural error, top level",
             r#"{"bad": xyz123, "keep": 5}"#,
-            5,
-            "unexpected character",
         ),
-        (
-            "structural error, in array",
-            "[xyz123]",
-            5,
-            "unexpected character",
-        ),
-        ("structural error, root", "xyz123", 5, "Invalid JSON text"),
+        ("structural error, in array", "[xyz123]"),
+        ("structural error, root", "xyz123"),
         (
             "#1642 colliding undecodable keys",
             r#"{"\ud800":1,"\ud800":2}"#,
-            5,
-            "is ambiguous",
         ),
-        (
-            "#1642 single undecodable key",
-            r#"{"\ud800": 1, "b": 2}"#,
-            0,
-            "",
-        ),
-        ("undecodable key, no collision", r#"{"a\q":1,"b":2}"#, 0, ""),
-        (
-            "#2211 trailing comma, array",
-            "[1,]",
-            5,
-            "expected JSON value, found ']'",
-        ),
-        (
-            "#2211 trailing comma, object",
-            r#"{"a":1,}"#,
-            5,
-            "expected string key, found '}'",
-        ),
-        (
-            "#2243 lone comma, array",
-            "[,]",
-            5,
-            "expected JSON value, found ','",
-        ),
-        (
-            "#2243 lone comma, object",
-            "{,}",
-            5,
-            "expected string key, found ','",
-        ),
-        (
-            "#2349 missing comma, array",
-            "[1 2]",
-            5,
-            "expected ',' or ']'",
-        ),
-        (
-            "#2349 double comma, array",
-            "[1,,2]",
-            5,
-            "expected JSON value, found ','",
-        ),
-        (
-            "#2349 missing comma, object",
-            r#"{"a":1 "b":2}"#,
-            5,
-            "expected ',' or '}'",
-        ),
-        (
-            "#2349 double comma, object",
-            r#"{"a":1,,"b":2}"#,
-            5,
-            "expected string key, found ','",
-        ),
-        (
-            "#2211 trailing comma, nested",
-            r#"{"a":[1,]}"#,
-            5,
-            "expected JSON value, found ']'",
-        ),
-        (
-            "#2243 lone comma, nested",
-            "[[,]]",
-            5,
-            "expected JSON value, found ','",
-        ),
-        ("#966 leading zero (sanitized, not raised)", "[01]", 0, ""),
-        (
-            "#966 two-dot number (sanitized, not raised)",
-            "[1..2]",
-            0,
-            "",
-        ),
-        ("deep, within the guard", deep200.as_str(), 0, ""),
-        ("duplicate key (valid)", r#"{"a":1,"a":2}"#, 0, ""),
-        ("unterminated array", "[1,2", 5, "Invalid JSON text"),
-        ("unterminated string", r#"["a"#, 5, "Invalid JSON text"),
-        ("missing colon", r#"{"a" 1}"#, 5, "expected ':'"),
-        ("bad literal", "[nul]", 5, "invalid null"),
-        ("trailing garbage", "[1] x", 5, "Invalid JSON text"),
-        ("null root", "null", 0, ""),
-        ("false root", "false", 0, ""),
-        ("well-formed", r#"{"a":[1,{"b":"c"}]}"#, 0, ""),
+        ("#1642 single undecodable key", r#"{"\ud800": 1, "b": 2}"#),
+        ("undecodable key, no collision", r#"{"a\q":1,"b":2}"#),
+        ("#2211 trailing comma, array", "[1,]"),
+        ("#2211 trailing comma, object", r#"{"a":1,}"#),
+        ("#2243 lone comma, array", "[,]"),
+        ("#2243 lone comma, object", "{,}"),
+        ("#2349 missing comma, array", "[1 2]"),
+        ("#2349 double comma, array", "[1,,2]"),
+        ("#2349 missing comma, object", r#"{"a":1 "b":2}"#),
+        ("#2349 double comma, object", r#"{"a":1,,"b":2}"#),
+        ("#2211 trailing comma, nested", r#"{"a":[1,]}"#),
+        ("#2243 lone comma, nested", "[[,]]"),
+        ("#966 leading zero (sanitized, not raised)", "[01]"),
+        ("#966 two-dot number (sanitized, not raised)", "[1..2]"),
+        ("deep, within the guard", deep200.as_str()),
+        ("duplicate key (valid)", r#"{"a":1,"a":2}"#),
+        ("unterminated array", "[1,2"),
+        ("unterminated string", r#"["a"#),
+        ("missing colon", r#"{"a" 1}"#),
+        ("bad literal", "[nul]"),
+        ("trailing garbage", "[1] x"),
+        ("null root", "null"),
+        ("false root", "false"),
+        ("well-formed", r#"{"a":[1,{"b":"c"}]}"#),
     ];
-    // The reference route first; every construct that used to bridge and
-    // still reads `.` after it. #2173 moved the closed terms out of this
-    // list and into `closed_probes` below -- they no longer raise at all.
-    let probes = ["select(.) | 1", ". and true", "not", "(.a? // 1) | 1"];
-    // #2173: these read nothing, so they validate nothing and answer at
-    // exit 0 on every row of the corpus -- including the malformed ones.
-    // Their expected stdout is the same on a malformed document as on a
-    // well-formed one, which is the point: the answer no longer depends on
-    // the document at all.
+    // Everything left in this list *navigates*: `(.a? // 1) | 1` resolves
+    // `.a`, and resolving a key reads it. #2173 moved the closed terms out
+    // of here into `closed_probes`; #2692 moved the *truthiness* readers out
+    // too, for the reason those two changes share -- `select(.)`, `. and
+    // true` and `not` all answer through `is_falsy`, which decodes nothing,
+    // so testing `.` is no more a read of it than never touching it was.
+    let probes = ["(.a? // 1) | 1"];
+    // #2173/#2692: these read nothing they decode, so they validate nothing
+    // and answer at exit 0 on every row of the corpus -- including the
+    // malformed ones. Their expected stdout is the same on a malformed
+    // document as on a well-formed one, which is the point: the answer no
+    // longer depends on the document at all.
+    //
+    // These are #2173's: closed terms, whose *value* is fixed too, because
+    // they never look at the document at all.
     let closed_probes = [
         ("true and true", "true"),
         ("false or true", "true"),
@@ -44307,6 +44300,24 @@ fn test_ambient_validation_agrees_with_bridge_2476() -> Result<()> {
         ("0 - 0", "0"),
         ("(-(1))", "-1"),
     ];
+    // #2692's addition, and the sharper claim: each of these *does* look at
+    // `.`, but only at its truthiness -- `select(.) | 1` tests the whole
+    // document, `not` negates it, `. and true` takes it as an operand,
+    // `if . then 1 else 2 end` branches on it. `is_falsy` answers all four
+    // without decoding anything, so none of them validates.
+    //
+    // Only the exit code is asserted, and deliberately so: their *values*
+    // legitimately vary with the document, because truthiness is exactly
+    // what they read (`null` and `false` roots are falsy, so `select(.)`
+    // emits nothing there and `not` is `true`). The claim is that no
+    // document makes them *raise* where `empty` does not, which is what a
+    // returning validation walk would break.
+    let truthiness_probes = [
+        "select(.) | 1",
+        ". and true",
+        "not",
+        "if . then 1 else 2 end",
+    ];
     // Four corpus rows are not about validation at all: `xyz123`, `[1,2`,
     // `["a` and `[1] x` give the CLI's document reader no root value to
     // delimit, so it raises before any filter runs. `empty` is the
@@ -44318,19 +44329,11 @@ fn test_ambient_validation_agrees_with_bridge_2476() -> Result<()> {
     // than against a hard-coded list of labels states the actual claim --
     // a closed term behaves exactly as the filter that reads nothing and
     // does nothing -- and keeps working if the corpus grows.
-    for (label, doc, want_code, want_stderr) in corpus {
+    for (label, doc) in corpus {
         let mut seen: Vec<(String, i32, String)> = Vec::new();
         for probe in probes {
             let (_stdout, stderr, code) = run_jq_full(&["-c", probe], Some(doc))?;
             let first = stderr.lines().next().unwrap_or("").to_string();
-            assert_eq!(
-                code, *want_code,
-                "[{label}] `{probe}`: exit {code}, want {want_code}\nstderr: {stderr}"
-            );
-            assert!(
-                first.contains(want_stderr),
-                "[{label}] `{probe}`: stderr {first:?} lacks {want_stderr:?}"
-            );
             seen.push((probe.to_string(), code, first));
         }
         let (_, ref_code, ref_first) = &seen[0];
@@ -44338,7 +44341,8 @@ fn test_ambient_validation_agrees_with_bridge_2476() -> Result<()> {
             assert_eq!(
                 (code, first),
                 (ref_code, ref_first),
-                "[{label}] `{probe}` disagrees with `select(.) | 1`"
+                "[{label}] `{probe}` disagrees with `{}`",
+                seen[0].0
             );
         }
         let (_, _, empty_code) = run_jq_full(&["-c", "empty"], Some(doc))?;
@@ -44357,6 +44361,15 @@ fn test_ambient_validation_agrees_with_bridge_2476() -> Result<()> {
                     "[{label}] closed `{probe}`: stdout {stdout:?}"
                 );
             }
+        }
+        for probe in truthiness_probes {
+            let (stdout, stderr, code) = run_jq_full(&["-c", probe], Some(doc))?;
+            assert_eq!(
+                code, empty_code,
+                "[{label}] truthiness `{probe}`: exit {code}, but `empty` exits \
+                 {empty_code} -- a filter that only tests `.` must answer \
+                 exactly as `empty` does\nstdout: {stdout:?}\nstderr: {stderr}"
+            );
         }
     }
     Ok(())
@@ -44436,70 +44449,88 @@ fn test_closed_terms_do_not_validate_2173() -> Result<()> {
     }
 
     // The other half of the rule, and the reason this is a narrowing rather
-    // than a blanket amnesty: a filter that *does* read the document still
-    // validates what it reads (#2168). Without these rows the grid above
+    // than a blanket amnesty: a filter that *materializes* the document
+    // still validates all of it (#2168). Without these rows the grid above
     // would pass just as well if validation had been deleted outright.
     //
-    // The five structurally-malformed documents raise for every reading
-    // filter. The colliding-key document is the exception, and a
-    // pre-existing one that #2173 does not touch: `.`, `length` and `keys`
-    // never have to resolve `"\ud800"` to a display form, so they echo it
-    // at exit 0 exactly as #2103 recorded, while `. and true` and `not` go
-    // through the validation walk, which does resolve it, and raise #1642's
-    // collision. Encoded as measured rather than assumed -- the first draft
-    // of this test asserted a uniform 5 here and was wrong.
+    // `. and true` and `not` sat in this list under #2173, which drew the
+    // line at "reads `.`". #2692 moved the line to "materializes `.`" and
+    // they moved with it: both answer through `is_falsy`, which decodes
+    // nothing. The collision document below is what made that line visible
+    // -- under #2173 `.`, `length` and `keys` echoed `"\ud800"` at exit 0
+    // (they never resolve it to a display form, exactly as #2103 recorded)
+    // while `. and true` and `not` raised #1642's collision, because the
+    // validation walk *did* resolve it. Nothing about the document
+    // distinguished those two groups; only whether a walk ran did. Now
+    // neither raises, and the row is a matched pair rather than a split.
     let structural = &docs[..5];
     for doc in structural {
-        for filter in [".", "length", "keys", ". and true", "not"] {
+        for filter in [".", "length", "keys"] {
             let (_out, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
             assert_eq!(code, 5, "doc {doc:?} filter {filter:?} must still raise");
             assert!(!err.is_empty(), "doc {doc:?} filter {filter:?}");
         }
+        for filter in [". and true", "not"] {
+            let (_out, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
+            assert_eq!(
+                code, 0,
+                "doc {doc:?} filter {filter:?} reads only truthiness, stderr: {err}"
+            );
+        }
     }
     let collision = docs[5];
-    for filter in [".", "length", "keys"] {
+    for filter in [".", "length", "keys", ". and true", "not"] {
         let (_out, err, code) = run_jq_full(&["-c", filter], Some(collision))?;
         assert_eq!(code, 0, "`{filter}` on the collision doc, stderr: {err}");
     }
-    for filter in [". and true", "not"] {
-        let (_out, err, code) = run_jq_full(&["-c", filter], Some(collision))?;
-        assert_eq!(code, 5, "`{filter}` on the collision doc must still raise");
-        assert!(err.contains("ambiguous"), "`{filter}` stderr: {err}");
+    // ... and the materializing routes on that same document still do raise
+    // the collision, which is what keeps the pair above meaningful.
+    for args in [["-Sc", "."], ["-sc", "."]] {
+        let (_out, err, code) = run_jq_full(&args, Some(collision))?;
+        assert_eq!(code, 5, "`{args:?}` on the collision doc must still raise");
+        assert!(err.contains("ambiguous"), "`{args:?}` stderr: {err}");
     }
     Ok(())
 }
 
-/// #2173: which `and`/`or` shapes raise on a malformed document, and which
-/// answer.
+/// #2173/#2692: which `and`/`or` shapes raise on a malformed document, and
+/// which answer. Since #2692 the answer is "none of them".
 ///
 /// #2476 ungated `eval_single`'s `Expr::And`/`Expr::Or` arms and had them
 /// run `ambient_validation_error` -- the bridge's ambient rejection without
-/// the bridge's allocation -- for every non-path-context shape. #2173 gates
+/// the bridge's allocation -- for every non-path-context shape. #2173 gated
 /// that walk on whether an operand actually reads `.`, because the wildcard
 /// bridge it stands in for stopped materializing for a closed term at the
-/// same time (`bridge_ambient_input`). Leaving the walk here would have
+/// same time (`bridge_ambient_input`). Leaving the walk there would have
 /// re-created by hand the very spelling-dependence both changes remove:
 /// `true and true` raising while `1+1` answers, on one document, in one run.
 ///
+/// #2692 then removed the walk outright, because #2173's line was in the
+/// wrong place by its own argument. `. and true` "reads `.`" only in the
+/// sense of asking whether it is `null` or `false` -- `is_falsy`, O(1), no
+/// decode -- which is not a read that can encounter a malformed byte. Gating
+/// on "reads `.`" therefore left the same split one spelling over:
+/// `. and true` raising while `.b`, `length` and `keys` on the same document
+/// all answer. That row is now inverted below.
+///
 /// `test_try_catch_contains_a_genuinely_catchable_malformed_key_error_1812`
 /// pins the catchability rule and
-/// `test_ambient_validation_agrees_with_bridge_2476` pins the whole
-/// raise-set across every malformed-document class; this is the focused
+/// `test_truthiness_probes_validate_nothing_2692` pins the whole
+/// answer-set across every malformed-document class; this is the focused
 /// sibling that sits next to the fan-out repro the ungating exists for
 /// (`test_and_or_over_alias_fanout_completes_2476` in
 /// `tests/yq_cli_tests.rs`), so a regression names itself.
 #[test]
-fn test_and_or_raise_only_when_an_operand_reads_the_document_2173() -> Result<()> {
-    // Reads `.`, so it validates `.` -- unchanged by #2173.
+fn test_and_or_raise_only_when_an_operand_materializes_2173_2692() -> Result<()> {
+    // Takes `.` as an operand, but only reads its truthiness -- so since
+    // #2692 it answers, exactly as `.b`/`length`/`keys` on this document
+    // always have. This row asserted exit 5 under #2173.
     let (stdout, stderr, code) = run_jq_stdin_streams(". and true", "{123: 1}", &[])?;
     assert_eq!(
-        code, 5,
-        "`. and true` must still reject the document -- stdout: {stdout:?} stderr: {stderr:?}"
+        code, 0,
+        "`. and true` reads only truthiness and must answer -- stdout: {stdout:?} stderr: {stderr:?}"
     );
-    assert!(
-        stderr.contains("Invalid JSON text"),
-        "`. and true` -- stderr: {stderr}"
-    );
+    assert_eq!(stdout.trim(), "true", "`. and true` -- stderr: {stderr:?}");
 
     // Reads nothing, so it validates nothing. Short-circuiting is not what
     // decides this and never was: `true or false` never evaluates its right
@@ -44520,31 +44551,49 @@ fn test_and_or_raise_only_when_an_operand_reads_the_document_2173() -> Result<()
         assert_eq!(stdout.trim(), want, "`{filter}` -- stderr: {stderr:?}");
     }
 
-    Ok(())
-}
-
-/// #2476: `not` gets its own native arm in `eval_single` (it never had a
-/// `needs_path_context` gate to lose -- it has no operand, only the ambient
-/// `.` -- so before this change it fell to the wildcard bridge
-/// unconditionally). This is `not`'s own sibling of
-/// `test_and_or_still_raise_on_a_malformed_document_2476` just above: the
-/// bridge's ambient decode is now `push_generic_truthiness`'s own validation
-/// walk (inline, no separate `ambient_validation_error` call needed -- see
-/// the arm's comment in `eval_generic.rs`), and it must still raise on
-/// exactly the same two shapes -- a #1194 malformed root, and a decode
-/// failure the walk actually has to visit through a `.[]` fan-out.
-#[test]
-fn test_not_still_raises_on_a_malformed_document_2476() -> Result<()> {
-    let (stdout, stderr, code) = run_jq_stdin_streams("not", "{123: 1}", &[])?;
+    // The control that keeps the rule honest: the same document, a filter
+    // that actually materializes it.
+    let (stdout, stderr, code) = run_jq_stdin_streams(".", "{123: 1}", &[])?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr}");
 
-    let (stdout, stderr, code) = run_jq_stdin_streams(".[] | not", "[\"\\x\"]", &[])?;
-    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert!(
-        stderr.contains("invalid escape sequence"),
-        "stderr: {stderr}"
-    );
+    Ok(())
+}
+
+/// #2476/#2692: `not` gets its own native arm in `eval_single` (it never had
+/// a `needs_path_context` gate to lose -- it has no operand, only the ambient
+/// `.` -- so before #2476 it fell to the wildcard bridge unconditionally).
+/// This is `not`'s own sibling of
+/// `test_and_or_no_longer_raise_on_a_malformed_document_2476_2692` just
+/// above.
+///
+/// `not` is exactly the truthiness of `.`, negated, and truthiness is
+/// `is_falsy` -- O(1), decoding nothing. #2476 kept the bridge's raise alive
+/// as a validation walk inside `push_generic_truthiness`; #2692 removed it,
+/// so both shapes below answer: a #1194 malformed root, and a decode failure
+/// the walk used to visit through a `.[]` fan-out. The second row is the one
+/// worth watching -- the fan-out puts `not` *directly on* the corrupt value
+/// rather than on a container holding it, and it still does not read it.
+///
+/// `eval::eval_not`'s own comment argued years earlier that a container
+/// merely *holding* an undecodable string should answer `false` rather than
+/// raise. That argument now wins on both routes.
+#[test]
+fn test_not_no_longer_raises_on_a_malformed_document_2476_2692() -> Result<()> {
+    for (filter, doc, want) in [
+        ("not", "{123: 1}", "false"),
+        (".[] | not", "[\"\\x\"]", "false"),
+    ] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &[])?;
+        assert_eq!(code, 0, "`{filter}` stdout: {stdout:?} stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), want, "`{filter}` stderr: {stderr}");
+    }
+
+    // Controls: materializing the very same values still raises.
+    for (filter, doc) in [(".", "{123: 1}"), (".[] | tostring", "[\"\\x\"]")] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, doc, &[])?;
+        assert_eq!(code, 5, "`{filter}` stdout: {stdout:?} stderr: {stderr:?}");
+    }
 
     Ok(())
 }
@@ -44651,14 +44700,13 @@ fn test_any_all_truthiness_table_2476() -> Result<()> {
     Ok(())
 }
 
-/// #2476: `any_all_generic` validates its whole input *before* the scan,
-/// rather than checking each element as the early exit reaches it. This is
-/// the test that decides that shape.
+/// #2476/#2692: `any_all_generic` used to validate its whole input *before*
+/// the scan. It no longer validates it at all, and this is the test that
+/// records why the earlier shape was chosen and why it was given up.
 ///
-/// The bridge materialized the whole container before `builtin_any` ran, so
-/// an element the early exit never reaches still raised. Real jq agrees, for
-/// the stronger reason that it rejects the entire document at parse time --
-/// captured live from jq 1.7.1:
+/// #2476's argument: the bridge materialized the whole container before
+/// `builtin_any` ran, so an element the early exit never reaches still
+/// raised, and real jq agrees -- captured live from jq 1.7.1:
 ///
 /// ```text
 /// echo '[true, "\x"]'  | jq any   jq: parse error: Invalid escape at line 1, column 11
@@ -44666,104 +44714,95 @@ fn test_any_all_truthiness_table_2476() -> Result<()> {
 /// echo '{123: 1}'      | jq any   jq: parse error: Object keys must be strings at line 1, column 5
 /// ```
 ///
-/// Per-element validation with early exit would answer `true` for the first
-/// row (the deciding element comes first) and drop a raise both the bridge
-/// and real jq make. Hence: one `push_generic_document_validation_error`
-/// over the input, then a pure `is_falsy` scan.
+/// #2692's answer: jq agrees there **for a different reason** -- it rejects
+/// the entire document at parse time, whatever the filter, including for
+/// `1+1` and `.` where succinctly has long answered. That is exactly the
+/// accidental agreement ADR-0018's #2103 amendment says not to buy with a
+/// per-spelling divergence. `any`/`all` read each element's truthiness and
+/// decode none of it, so they validate nothing; the array rows below moved
+/// from raising to answering.
 ///
-/// `?` does not rescue any of these: a decode failure and a #1194 structural
-/// error both outrank `optional` (#1620/#1989), and the validation walk is
-/// not routed through `optional` at all -- same as the `//` arm's own
-/// `ambient_validation_error` call.
+/// `?` never rescued these and still changes nothing -- a decode failure and
+/// a #1194 structural error both outrank `optional` (#1620/#1989) -- so both
+/// spellings are asserted on every row, in both directions.
 #[test]
-fn test_any_all_still_reject_a_malformed_document_2476() -> Result<()> {
+fn test_any_all_no_longer_reject_a_malformed_array_2692() -> Result<()> {
+    // An undecodable element is neither `null` nor `false`, so `is_falsy`'s
+    // documented conservative default makes it truthy -- and since #2692 that
+    // default is the answer rather than something a validation walk pre-empts.
     for (doc, filter, want) in [
-        // The deciding element comes *first*; the raise still wins.
-        (r#"[true, "\x"]"#, "any", "invalid escape sequence"),
-        (r#"[false, "\x"]"#, "all", "invalid escape sequence"),
-        (r#"[true, "\x"]"#, "all", "invalid escape sequence"),
-        (r#"[false, "\x"]"#, "any", "invalid escape sequence"),
-        ("{123: 1}", "any", "Invalid JSON text"),
-        ("{123: 1}", "all", "Invalid JSON text"),
+        (r#"[true, "\x"]"#, "any", "true"),
+        (r#"[false, "\x"]"#, "all", "false"),
+        (r#"[true, "\x"]"#, "all", "true"),
+        (r#"[false, "\x"]"#, "any", "true"),
     ] {
         for spelling in [filter.to_string(), format!("{filter}?")] {
-            let (_stdout, stderr, code) = run_jq_full(&["-c", &spelling], Some(doc))?;
-            assert_eq!(code, 5, "`{spelling}` on {doc} -- stderr: {stderr}");
-            assert!(
-                stderr.contains(want),
-                "`{spelling}` on {doc} -- stderr {stderr} lacks {want:?}"
-            );
+            let (stdout, stderr, code) = run_jq_full(&["-c", &spelling], Some(doc))?;
+            assert_eq!(code, 0, "`{spelling}` on {doc} -- stderr: {stderr}");
+            assert_eq!(stdout.trim(), want, "`{spelling}` on {doc}");
         }
+    }
+
+    // The object arm is *not* part of that removal and must still raise:
+    // jq iterates an object's values (#422) under its own last-occurrence
+    // duplicate-key rule, so `effective_fields_checked` genuinely resolves
+    // the keys -- reading them, not merely testing them. This row is the
+    // boundary of #2692 on this builtin, so it is pinned here rather than
+    // left to the corpus test.
+    for filter in ["any", "all", "any?", "all?"] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("{123: 1}"))?;
+        assert_eq!(code, 5, "`{filter}` -- stdout: {stdout:?} stderr: {stderr}");
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "`{filter}` -- stderr: {stderr}"
+        );
     }
     Ok(())
 }
 
-/// #2476: the container half of `test_ambient_validation_agrees_with_bridge_2476`,
-/// for `any`/`all`.
+/// #2476/#2692: the container half of
+/// `test_truthiness_probes_validate_nothing_2692`, for `any`/`all`.
 ///
-/// Kept separate rather than folded in as two more probes there: that
-/// corpus includes scalar and `null` roots, where `any`/`all` raise a *type*
-/// error of their own and would break the "every probe agrees" assertion for
-/// reasons that have nothing to do with the validation walk. Every row here
-/// is a container, so the only thing that can decide the exit code is the
-/// walk -- and it has to decide it the same way `select(.) | 1` does.
+/// Kept separate rather than folded in as two more probes there, for two
+/// reasons that have both survived #2692. That corpus includes scalar and
+/// `null` roots, where `any`/`all` raise a *type* error of their own; and its
+/// object rows reach `any`/`all`'s own object arm, which is the one place
+/// these builtins genuinely read rather than test. Every row here is
+/// therefore a container, and every row but one answers.
 ///
-/// Asserts the explicit expected code as well as agreement, for the reason
-/// the sibling gives: agreement alone would also pass if both routes
-/// silently stopped raising.
+/// The exception is the point of the test. `{123: 1}` still raises, because
+/// jq iterates an *object's values* (#422) under its own last-occurrence
+/// duplicate-key rule, so `effective_fields_checked` has to resolve the keys
+/// -- and resolving a key reads it. Every array row answers, because scanning
+/// elements for truthiness reads none of them. That is the whole of #2692's
+/// rule applied inside a single builtin, which is why it is worth pinning
+/// here rather than only in the arm's own focused test.
+///
+/// Note `{"\ud800":1,"\ud800":2}` answers: jq mode collapses duplicate keys,
+/// and the #1642 collision raise the *materializing* routes make is not one
+/// this arm reaches. Captured from the binary, not predicted.
 #[test]
-fn test_any_all_ambient_validation_agrees_with_bridge_2476() -> Result<()> {
-    // (label, document, expected exit code, expected stderr substring)
-    let corpus: &[(&str, &str, i32, &str)] = &[
-        ("#1194 non-string key", "{123: 1}", 5, "expected string key"),
-        (
-            "decode failure, in array",
-            r#"["\x"]"#,
-            5,
-            "invalid escape sequence",
-        ),
-        (
-            "structural error, in array",
-            "[xyz123]",
-            5,
-            "unexpected character",
-        ),
+fn test_any_all_validate_only_the_keys_they_resolve_2476_2692() -> Result<()> {
+    // (label, document, expected exit code)
+    let corpus: &[(&str, &str, i32)] = &[
+        // The one raising row: an object, so the keys are resolved.
+        ("#1194 non-string key", "{123: 1}", 5),
+        ("decode failure, in array", r#"["\x"]"#, 0),
+        ("structural error, in array", "[xyz123]", 0),
         (
             "#1642 colliding undecodable keys",
             r#"{"\ud800":1,"\ud800":2}"#,
-            5,
-            "is ambiguous",
+            0,
         ),
-        (
-            "#2211 trailing comma, array",
-            "[1,]",
-            5,
-            "expected JSON value, found ']'",
-        ),
-        (
-            "#2243 lone comma, array",
-            "[,]",
-            5,
-            "expected JSON value, found ','",
-        ),
-        (
-            "#2349 missing comma, array",
-            "[1 2]",
-            5,
-            "expected ',' or ']'",
-        ),
-        (
-            "#2211 trailing comma, nested",
-            r#"{"a":[1,]}"#,
-            5,
-            "expected JSON value, found ']'",
-        ),
-        ("duplicate key (valid)", r#"{"a":1,"a":2}"#, 0, ""),
-        ("well-formed", r#"{"a":[1,{"b":"c"}]}"#, 0, ""),
+        ("#2211 trailing comma, array", "[1,]", 0),
+        ("#2243 lone comma, array", "[,]", 0),
+        ("#2349 missing comma, array", "[1 2]", 0),
+        ("#2211 trailing comma, nested", r#"{"a":[1,]}"#, 0),
+        ("duplicate key (valid)", r#"{"a":1,"a":2}"#, 0),
+        ("well-formed", r#"{"a":[1,{"b":"c"}]}"#, 0),
     ];
-    // The reference route first; `any`/`all` after.
-    let probes = ["select(.) | 1", "any | 1", "all | 1"];
-    for (label, doc, want_code, want_stderr) in corpus {
+    let probes = ["any | 1", "all | 1"];
+    for (label, doc, want_code) in corpus {
         let mut seen: Vec<(String, i32, String)> = Vec::new();
         for probe in probes {
             let (_stdout, stderr, code) = run_jq_full(&["-c", probe], Some(doc))?;
@@ -44772,10 +44811,12 @@ fn test_any_all_ambient_validation_agrees_with_bridge_2476() -> Result<()> {
                 code, *want_code,
                 "[{label}] `{probe}`: exit {code}, want {want_code}\nstderr: {stderr}"
             );
-            assert!(
-                first.contains(want_stderr),
-                "[{label}] `{probe}`: stderr {first:?} lacks {want_stderr:?}"
-            );
+            if *want_code == 5 {
+                assert!(
+                    first.contains("expected string key"),
+                    "[{label}] `{probe}`: stderr {first:?}"
+                );
+            }
             seen.push((probe.to_string(), code, first));
         }
         let (_, ref_code, ref_first) = &seen[0];
@@ -44783,7 +44824,7 @@ fn test_any_all_ambient_validation_agrees_with_bridge_2476() -> Result<()> {
             assert_eq!(
                 (code, first),
                 (ref_code, ref_first),
-                "[{label}] `{probe}` disagrees with `select(.) | 1`"
+                "[{label}] `{probe}` disagrees with `any | 1`"
             );
         }
     }
@@ -44909,7 +44950,22 @@ fn test_alternative_raises_only_when_it_reads_the_document_2173() -> Result<()> 
     );
     assert_eq!(stdout.trim(), "1", "stderr: {stderr:?}");
 
-    let (stdout, stderr, code) = run_jq_stdin_streams("(.[0] // 1)", "[\"\\x\"]", &[])?;
+    // Navigates into the malformed object: still raises, as a bare `.a`
+    // does.
+    let (stdout, stderr, code) = run_jq_stdin_streams(".a // 1", "{123: 1}", &["-c"])?;
+    assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert!(stderr.contains("Invalid JSON text"), "stderr: {stderr}");
+
+    // Navigates to an undecodable *element* and forwards it: the cursor is
+    // passed through untouched, so this echoes the raw source bytes, exactly
+    // as a bare `.[0]` does on this document.
+    let (stdout, stderr, code) = run_jq_stdin_streams("(.[0] // 1)", "[\"\\x\"]", &["-c"])?;
+    assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(stdout.trim(), r#""\x""#, "stderr: {stderr:?}");
+
+    // ... and materializing that same forwarded value still raises.
+    let (stdout, stderr, code) =
+        run_jq_stdin_streams("(.[0] // 1) | tostring", "[\"\\x\"]", &["-c"])?;
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(
         stderr.contains("invalid escape sequence"),
