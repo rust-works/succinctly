@@ -2405,6 +2405,21 @@ no equivalent guard on either its default or materializing path at all (#1817). 
 live, also pre-existing and unrelated to either fix: `print_json`'s own guard can flush
 corrupted/truncated JSON to stdout before it fires (#1819).
 
+[#2692](https://github.com/rust-works/succinctly/issues/2692) widens the "accepts at
+parse/index time" story above to more filters, by the same mechanism as `.[1]`/`length`:
+`not`, `select`, `if`, `and`, `or`, `//` and zero-arity `any`/`all` used to reach this guard
+too, via `push_generic_document_validation_error`'s own `assert_nesting_depth` — the walk
+that validated on their behalf before #2692 removed it. None of them do enough work to need
+that guard on their own account (`DocumentCursor::is_falsy` never recurses into a
+container's children), so a document nested past 256 levels is no longer a reason for any of
+them to fail: `nested_arrays(300) | not` now answers `false` at exit 0, where it used to
+raise `nesting depth exceeds limit of 256`. This is a corollary of the same rule the rest of
+this section's #2692 instance rests on, not a fresh decision, and it does not touch the
+guard itself — `sort_by`/`unique_by`/`min_by`/`max_by` still materialize a comparison key
+through `key_elements_generic`, the one caller left, and still trip it on the same document.
+Pinned by `test_truthiness_probes_do_not_trip_the_depth_guard_2692`
+(`tests/jq_cli_tests.rs`).
+
 ## Regex flags `l` and `n`
 
 [ADR-0019](../../adrs/adr-0019.md) accepted two regex-flag gaps as permanent — rule 4(d)

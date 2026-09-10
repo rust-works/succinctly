@@ -235,14 +235,17 @@ rejects at parse time whatever the filter):
 | `true and true`, `false // 1`       | exit 1  | exit 1 — matched  | `true`, `1`    |
 | `{"k":1}`, `1 as $x \| $x`          | exit 1  | exit 0            | unchanged      |
 | `.b`                                | exit 1  | exit 0            | unchanged      |
-| `. and true`                        | exit 1  | exit 1            | unchanged      |
+| `. and true`                        | exit 1  | exit 1            | `true` (#2692) |
 
-So four spellings stop matching yq. The rows below them are why that is the *uniform*
-answer rather than a new inconsistency: `.b` and `{"k":1}` already answered at exit 0 on
-this document, because navigation validates only what it reads (#2168) and neither reaches
-the bad escape. Keeping `1+1` rejecting would have meant a binary that answers `.b` and
-`{"k":1}` while refusing `1+1` on one document in one run — the shape ADR-0018's #2103
-amendment exists to rule out. `. and true` still raises: it reads `.`.
+So four spellings stop matching yq here, and `. and true` joins them a step later. The rows
+below them are why that is the *uniform* answer rather than a new inconsistency: `.b` and
+`{"k":1}` already answered at exit 0 on this document, because navigation validates only what
+it reads (#2168) and neither reaches the bad escape. Keeping `1+1` rejecting would have meant a
+binary that answers `.b` and `{"k":1}` while refusing `1+1` on one document in one run — the
+shape ADR-0018's #2103 amendment exists to rule out. `. and true` raised here under #2173's own
+rule, because it reads `.` — but reading `.` as a boolean operand is *testing* it, not decoding
+it, so #2692 (recorded above) takes it the rest of the way: `. and true` now answers `true`,
+the same as `.b | (true and true)` always did.
 
 Same disposition, same sanction, and the same escape hatch as the jq side — a user who
 wants yq's rejection has `succinctly json validate` for JSON input, and the divergence is

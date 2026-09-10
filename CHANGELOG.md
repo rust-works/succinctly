@@ -37,7 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   all still reject the same documents, and `{123: 1} | any` still raises
   because jq iterates an object's *values* (#422), which resolves its keys.
   #1804's container-vs-scalar-alias carve-out is gone with the walk it was a
-  property of.
+  property of. So is the `MAX_NESTING_DEPTH` guard (#998/#2627) these seven
+  arms used to reach through it: none of them recurse on their own account,
+  so a JSON document nested past 256 levels no longer fails any of them
+  either -- `sort_by`/`unique_by`/`min_by`/`max_by` still materialize a
+  comparison key and still trip it.
 
 - **`succinctly jq`'s `key`, `parent` and `path` inside a `//` now read the
   position the stage stands on** (#2692). `{"a":{"b":1}} | .a | (key // 1)`
