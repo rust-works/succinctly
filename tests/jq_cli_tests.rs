@@ -23085,24 +23085,85 @@ fn test_bare_nested_param_wrongly_shadows_outer_dollar_func_param_known_gap_2283
     Ok(())
 }
 
-/// #2283 review: `bind_def_call`'s own argument-binding for a duplicate
-/// parameter name is *separately* broken, confirmed present on
-/// unmodified `main` (i.e. entirely unrelated to #2283's own shadow-check
-/// fix -- not a regression, and not fixed here) -- pinned as a known gap,
-/// tracked separately as #2560. jq 1.7.1 resolves `$a` to the *second* occurrence's own argument (`2`,
-/// ordinary later-wins parameter shadowing); this resolves to the first
-/// occurrence's argument (`1`) instead. See
-/// `test_duplicate_named_param_shadow_resolves_by_last_occurrence_2283`
-/// (`src/jq/eval.rs`) for direct, isolated confirmation that #2283's own
-/// shadow-check logic (which outer-`$var` substitution reaches a nested
-/// def's body) already resolves duplicate names correctly by the *last*
-/// occurrence -- this remaining gap is specifically in argument binding at
-/// call time, a different mechanism.
+/// #2560: `bind_def_call`'s own argument-binding for a duplicate parameter
+/// name now resolves by jq's ordinary later-wins parameter shadowing, the
+/// same rule `test_duplicate_named_param_shadow_resolves_by_last_occurrence_2283`
+/// (`src/jq/eval.rs`) already confirmed for the unrelated outer-`$var`
+/// shadow-check -- this was specifically call-time argument binding, a
+/// different mechanism, previously resolving to the *first* occurrence's
+/// argument (`1`) instead of the *second*'s (`2`). Confirmed live against
+/// jq 1.7.1.
 #[test]
-fn test_duplicate_named_param_argument_binding_known_gap_2283() -> Result<()> {
+fn test_duplicate_named_param_argument_binding_resolves_by_last_occurrence_2560() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(&["-nc", "9 as $a | def f(a; $a): $a; f(1;2)"], None)?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "2");
+    Ok(())
+}
+
+/// #2560 follow-on: two same-*kind* duplicated parameters resolve by last
+/// occurrence too, not just the mixed bare/`$` shape above -- both bare and
+/// both `$`-style. Confirmed live against jq 1.7.1.
+#[test]
+fn test_duplicate_named_param_same_kind_resolves_by_last_occurrence_2560() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "def f(a;a): a; f(1;2)"], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "2");
+
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "def f($a;$a): $a; f(1;2)"], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "2");
+    Ok(())
+}
+
+/// #2560 follow-on: a `$`-style parameter *before* a trailing bare parameter
+/// of the same name is the one shape where the winner differs by namespace --
+/// the trailing bare parameter shadows the bare namespace only, so the
+/// leading `$a`'s own binding is still what `$a` itself resolves to (`1`,
+/// not `2`), while a bare *reference* in the body follows the trailing
+/// parameter (`2`). Confirmed live against jq 1.7.1: this is the one
+/// duplicate-parameter shape that does *not* simply "last argument wins" for
+/// every reference in the body.
+#[test]
+fn test_duplicate_named_param_dollar_first_bare_last_splits_by_namespace_2560() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "def f($a; a): $a; f(1;2)"], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
     assert_eq!(stdout.trim_end(), "1");
+
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "def f($a; a): a; f(1;2)"], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "2");
+    Ok(())
+}
+
+/// #2560 follow-on: a body referencing *both* the bare and `$` occurrence of
+/// a duplicated name must resolve each independently, per the namespace
+/// rule above -- not just whichever single reference the other pinned tests
+/// happen to use. Confirmed live against jq 1.7.1.
+#[test]
+fn test_duplicate_named_param_combined_bare_and_dollar_reference_2560() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "def f($a; a): $a + a; f(1;2)"], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "3");
+
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "def f(a; $a): $a + a; f(1;2)"], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "4");
+    Ok(())
+}
+
+/// #2560 follow-on: three duplicated parameters, not just two -- the
+/// winner-selection must scan the *whole* remaining list, not just check
+/// one neighbor. Confirmed live against jq 1.7.1.
+#[test]
+fn test_duplicate_named_param_three_occurrences_2560() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "def f(a;a;a): a; f(1;2;3)"], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "3");
+
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "def f($a;$a;a): $a + a; f(1;2;3)"], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "5");
     Ok(())
 }
 

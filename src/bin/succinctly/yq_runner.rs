@@ -9580,7 +9580,7 @@ mod tests {
                 params: if args.is_empty() {
                     Vec::new()
                 } else {
-                    vec!["v".into()]
+                    vec![succinctly::jq::Param::Bare("v".to_string())]
                 },
                 body,
             }),
