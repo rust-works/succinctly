@@ -10533,12 +10533,17 @@ fn each_take_first_generic<S: EvalSemantics, V: DocumentValue>(
 ///
 /// `OneCursorValue` has no `GenericResult` counterpart to convert to, so it
 /// collapses to plain `OneCursor` here, dropping the pre-decoded value
-/// (#1609). That's fine: this function's only caller for a single captured
-/// item is `each_take_first_generic`'s `first(...)`/`last(...)` path, once
-/// per builtin call rather than once per key, so re-deriving the value via
-/// `GenericResult::OneCursor`'s later `.value()` costs nothing that matters
-/// -- adding a matching `GenericResult` variant just to avoid that one cold
-/// re-decode isn't worth `GenericResult`'s much larger consumer set.
+/// (#1609). That's fine for `each_take_first_generic`'s `first(...)`/
+/// `last(...)` path, once per builtin call rather than once per key, so
+/// re-deriving the value via `GenericResult::OneCursor`'s later `.value()`
+/// costs nothing that matters there -- adding a matching `GenericResult`
+/// variant just to avoid that one cold re-decode isn't worth
+/// `GenericResult`'s much larger consumer set. [`each_alternative_generic`]
+/// (#2692) is a second caller with a per-item rather than per-call
+/// frequency, so it does not route an `OneCursorValue` item through here at
+/// all -- it tests and forwards the pair directly, keeping #1609's win --
+/// and only reaches this conversion for a shape that never carried a
+/// pre-decoded value to begin with.
 fn generic_item_to_result<V: DocumentValue>(item: GenericItem<V>) -> GenericResult<V> {
     match item {
         GenericItem::One(v) => GenericResult::One(v),
@@ -10933,9 +10938,10 @@ fn eval_boolean_generic<S: EvalSemantics, V: DocumentValue>(
 ///
 /// Routed through [`generic_item_to_result`] + [`push_generic_truthiness`]
 /// rather than a fourth per-variant `match`: those two already answer this
-/// question for every shape an item can take -- including the cursor's own
-/// O(1) `is_falsy` fast path and the #1247/#1194 validation raise that has
-/// to come before it, and `LazySeq`'s materialize-to-find-out failure -- and
+/// question for every shape an item can take -- the cursor's own O(1)
+/// `is_falsy` fast path (since #2692, the whole of the cursor answer --
+/// no validation raise precedes it; see `push_generic_truthiness`'s own
+/// `OneCursor` arm) and `LazySeq`'s materialize-to-find-out failure -- and
 /// a copy here would be the "duplicated predicates diverge silently" shape
 /// this project has been bitten by before (#106).
 fn generic_item_truthiness<V: DocumentValue>(item: GenericItem<V>) -> Result<bool, Control> {
@@ -10966,12 +10972,16 @@ fn generic_item_truthiness<V: DocumentValue>(item: GenericItem<V>) -> Result<boo
 /// inside it (#1519) -- and an infinite left generator still terminates
 /// (`first(repeat(1) // 9)` is `1`, not a hang).
 ///
-/// **Every truthiness decision is [`retain_truthy_generic`]'s**, one item at
-/// a time rather than over a collected batch, so this route and
-/// `eval_single`'s cannot drift on what `//` keeps (the #106 rule:
-/// duplicated predicates diverge silently). That also means this arm
-/// validates exactly what that function validates, which since #2692 is
-/// nothing -- reading truthiness decodes nothing.
+/// **Every truthiness decision is [`retain_truthy_generic`]'s `is_falsy(Preserve)`
+/// rule**, one item at a time rather than over a collected batch, so this
+/// route and `eval_single`'s cannot drift on what `//` keeps (the #106 rule:
+/// duplicated predicates diverge silently). `OneCursorValue` is the one
+/// shape tested inline here rather than routed through that function --
+/// same rule, same call, kept intact alongside the pre-decoded value it
+/// carries (#1599/#1606/#1609) instead of collapsing it to a plain
+/// `OneCursor` first. Either way, this arm validates exactly what that rule
+/// validates, which since #2692 is nothing -- reading truthiness decodes
+/// nothing.
 ///
 /// The rules it restates for a pushed rather than collected stream are
 /// `eval::each_alternative`'s, whose doc comment carries the jq 1.7.1 oracle
@@ -10993,12 +11003,34 @@ fn each_alternative_generic<S: EvalSemantics, V: DocumentValue>(
     let mut outer_stopped = false;
     let mut escape: Option<Control> = None;
     let left_flow = eval_each_generic::<S, V>(left, value.clone(), optional, cursor, &mut |item| {
+        // Fast path: `OneCursorValue` carries an already-decoded value
+        // (#1599/#1606/#1609, e.g. a `keys_unsorted` iteration) that routing
+        // through `generic_item_to_result` would otherwise collapse to a
+        // bare `OneCursor`, discarding it and forcing a second cursor
+        // `.value()` resolve on every item this forwards. Truthiness only
+        // needs the cursor, so answer it directly and keep the pair intact.
+        if let GenericItem::OneCursorValue(ref c, _) = item {
+            if c.is_falsy(JsonConvention::Preserve) {
+                return Demand::Continue;
+            }
+            forwarded += 1;
+            return match push_one_generic(item, sink) {
+                Flow::Exhausted => Demand::Continue,
+                Flow::Stopped { .. } => {
+                    outer_stopped = true;
+                    Demand::Stop
+                }
+                Flow::Escaped(control) => stop_with_escape(&mut escape, control),
+            };
+        }
         match retain_truthy_generic(generic_item_to_result(item)) {
-            // Falsy: dropped, and the left operand keeps producing.
+            // Falsy: dropped, and the left operand keeps producing. A
+            // genuine `Error`/`Break`/`Halt` falls to the `kept` arm below
+            // rather than getting its own -- `drain_result_generic` already
+            // converts each straight to `Flow::Escaped` with no sink call,
+            // the same conversion every other call site in this file relies
+            // on (#106: no second copy of that mapping to drift from it).
             GenericResult::None => Demand::Continue,
-            GenericResult::Error(e) => stop_with_escape(&mut escape, Control::Error(e)),
-            GenericResult::Break(l) => stop_with_escape(&mut escape, Control::Break(l)),
-            GenericResult::Halt(c) => stop_with_escape(&mut escape, Control::Halt(c)),
             kept => {
                 forwarded += 1;
                 match drain_result_generic(kept, sink) {
@@ -11013,11 +11045,8 @@ fn each_alternative_generic<S: EvalSemantics, V: DocumentValue>(
         }
     });
 
-    if outer_stopped {
+    if outer_stopped || escape.is_some() {
         return resume_from_escape(escape, left_flow);
-    }
-    if let Some(control) = escape {
-        return resume_from_escape(Some(control), left_flow);
     }
     match left_flow {
         // Whatever the left ended in propagates, and the right side is not
@@ -11032,8 +11061,15 @@ fn each_alternative_generic<S: EvalSemantics, V: DocumentValue>(
     }
 }
 
-/// Demand-forwarding twin of [`eval_boolean_generic`] (#2180 WP2a), for an
-/// `and`/`or` whose operands read path context.
+/// Demand-forwarding twin of [`eval_boolean_generic`] (#2180 WP2a), for the
+/// streaming `and`/`or` route.
+///
+/// Originally introduced only for an `and`/`or` whose operands read path
+/// context, gated to match `eval_single`'s own then-gated pair; the
+/// `eval_each_generic` dispatch is ungated since #2692, so this is now the
+/// implementation for every streaming `and`/`or`, path-context operand or
+/// not (see the dispatch's own comment for why the gate had nothing left to
+/// preserve).
 ///
 /// The loop is `eval::boolean_fanout_each`, shared with every other route
 /// (see its own doc comment for the oracle rows that pinned the left-outer
@@ -16376,14 +16412,17 @@ fn path_context_single_native(expr: &Expr) -> bool {
         // shapes blocked this admission until now, and both are closed:
         // yq's rule for an operand that produces zero outputs (#2460,
         // `jq::eval::yq_empty_operand_output`, consulted by the generic and
-        // eager fanouts alike so the two routes agree on `key + 1`), and the
-        // ambient decode `try (1+1) catch "x"` depends on for a malformed
-        // document, which the arm's own `needs_path_context` gate preserves.
-        // (`Expr::Arithmetic` is the last arm still holding that gate for
-        // that reason; #2692 took it from every truthiness reader, and jq
-        // mode's own `1+1` answers through the M2 streaming route rather
-        // than here. yq mode still raises there -- see the reference-probe
-        // note in `test_truthiness_probes_validate_nothing_2692`'s yq twin.)
+        // eager fanouts alike so the two routes agree on `key + 1`), and an
+        // ambient decode `try (1+1) catch "x"` used to depend on for a
+        // malformed document, which the arm's own `needs_path_context` gate
+        // preserved. That gate is gone: #2173 narrowed the bridge's own
+        // materialization to operands that read the ambient value, leaving
+        // the gate nothing to preserve, and #2626 then removed it outright
+        // because the bridge it selected was *also* collapsing duplicate
+        // mapping keys and stubbing yq's node-metadata builtins. This entry
+        // is unchanged by either and stays recursive for its own question:
+        // whether both operands are shapes the walk can evaluate at a
+        // position, which is what `key + 10` needs.
         Expr::Arithmetic { left, right, .. } => {
             path_context_single_native(left) && path_context_single_native(right)
         }

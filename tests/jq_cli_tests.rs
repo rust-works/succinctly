@@ -44219,10 +44219,20 @@ fn test_preserve_input_keeps_jq_escape_table_2209() -> Result<()> {
 /// what makes `1+1` and `[1+1]` finally agree on the same document. The
 /// reading probes below are unchanged and still pin the full raise-set.
 ///
-/// Rows this deliberately leaves out: a `>256`-deep document (both routes
-/// panic, #2627) and an empty document (exit 0 on every probe, nothing to
-/// pin). The alias-to-container shape is #1804's accepted trade-off and is
-/// pinned by its own test instead of here.
+/// Rows this deliberately leaves out: an empty document (exit 0 on every
+/// probe, nothing to pin) and a `>256`-deep document. The alias-to-container
+/// shape is #1804's accepted trade-off and is pinned by its own test instead
+/// of here.
+///
+/// The `>256`-deep document is not "both routes panic" here -- that was true
+/// of the corpus this replaced, back when every probe reached
+/// `push_generic_document_validation_error`'s own `assert_nesting_depth`.
+/// None of the probes above do anymore: the reading probe navigates one
+/// level without touching what's below it, and every truthiness probe
+/// answers through `is_falsy`, which never recurses. See
+/// `test_truthiness_probes_do_not_trip_the_depth_guard_2692` for what a
+/// `>256`-deep document actually does now, and why that's a consequence of
+/// this same rule rather than a fresh decision.
 #[test]
 fn test_truthiness_probes_validate_nothing_2692() -> Result<()> {
     let deep200 = format!("{}1{}", "[".repeat(200), "]".repeat(200));
@@ -44372,6 +44382,58 @@ fn test_truthiness_probes_validate_nothing_2692() -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// #2692's consequence for the `#998`/`#2627` `MAX_NESTING_DEPTH` guard,
+/// which `test_truthiness_probes_validate_nothing_2692`'s own corpus
+/// deliberately leaves out: a document nested past 256 levels used to trip
+/// that guard from every one of these arms, because each one opened with
+/// `push_generic_document_validation_error`'s `assert_nesting_depth` before
+/// #2692 removed the call. None of them do anymore -- `is_falsy` never
+/// recurses into a container's children, and the reading probe below
+/// resolves one level without following what's underneath it -- so a
+/// document this deep is no longer a reason for any of these to fail.
+///
+/// This is not a new decision, just an unrecorded corollary of the one
+/// #2692 already made: the guard was never about these arms' own work (none
+/// of them do enough of it to risk a stack overflow), it was a side effect
+/// of the whole-subtree walk that validated on their behalf. Removing that
+/// walk and keeping its depth check would have meant charging a filter for
+/// a limit on work it no longer does.
+///
+/// `sort_by(.)` is the control: `key_elements_generic` is the one caller
+/// `push_generic_document_validation_error` has left (it materializes a
+/// comparison key), so the same document still trips the same guard there,
+/// proving this is about which arms reach it, not about the guard itself
+/// having stopped working.
+#[test]
+fn test_truthiness_probes_do_not_trip_the_depth_guard_2692() -> Result<()> {
+    let deep = nested_arrays(300);
+
+    for probe in [
+        "not",
+        "select(.) | 1",
+        "(.a? // 1) | 1",
+        "any",
+        "all",
+        "true and true",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", probe], Some(&deep))?;
+        assert_eq!(
+            code, 0,
+            "[depth guard] `{probe}` on a 300-deep document must not trip \
+             `MAX_NESTING_DEPTH` -- stdout: {stdout:?} stderr: {stderr:?}"
+        );
+    }
+
+    let (_stdout, stderr, code) = run_jq_full(&["-c", "sort_by(.)"], Some(&deep))?;
+    assert_eq!(code, 5, "control `sort_by(.)` -- stderr: {stderr:?}");
+    assert!(
+        stderr.contains("nesting depth exceeds limit of 256"),
+        "control `sort_by(.)` -- stderr: {stderr:?}"
+    );
+
     Ok(())
 }
 
