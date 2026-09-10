@@ -44227,6 +44227,17 @@ fn test_closed_terms_do_not_validate_2173() -> Result<()> {
         ("def f: 1; f", "1"),
         ("[limit(1; 1,2)]", "[1]"),
         ("empty", ""),
+        // `repeat`'s native arm (`each_repeat_generic`) bridged with
+        // `to_owned_with_cursor` directly instead of the closed-term-aware
+        // `bridge_ambient_input`, so a closed `repeat(f)` kept validating
+        // the whole document after #2173 landed everywhere else.
+        ("[limit(1; repeat(1))]", "[1]"),
+        // `env(NAME)`/`strenv(NAME)` (`Builtin::EnvObject`/`Builtin::StrEnv`)
+        // take no `value` parameter at all, but `node_reads_ambient`'s
+        // allowlist omitted both -- a var guaranteed absent makes the `?`
+        // outcome deterministic across environments.
+        ("[env(NONEXISTENT_VAR_XYZ_2173)?]", "[]"),
+        ("[strenv(NONEXISTENT_VAR_XYZ_2173)?]", "[]"),
     ];
     for doc in docs {
         for (filter, want) in closed {

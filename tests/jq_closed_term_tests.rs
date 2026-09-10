@@ -65,6 +65,16 @@ const CLOSED: &[&str] = &[
     "[1,2] as [$a,$b] | $a + $b",
     r#""x\(1+1)y""#,
     "label $out | (1, break $out)",
+    // `repeat`'s native arm materialized unconditionally, bypassing the
+    // predicate entirely -- caught only by a direct malformed-document
+    // probe (`test_closed_terms_do_not_validate_2173`), not this corpus,
+    // but still closed at the predicate level and belongs here too.
+    "[limit(1; repeat(1))]",
+    // `Builtin::EnvObject`/`Builtin::StrEnv` take no value parameter but
+    // were missing from `node_reads_ambient`'s allowlist. A var guaranteed
+    // absent keeps the `?` outcome document-independent.
+    "[env(NONEXISTENT_VAR_XYZ_2173)?]",
+    "[strenv(NONEXISTENT_VAR_XYZ_2173)?]",
 ];
 
 /// Filters that read the input. These must be reported as reading — a

@@ -1315,12 +1315,14 @@ fn node_reads_ambient(node: &Expr) -> bool {
         | Expr::MetaAssign { .. } => true,
 
         // Reads unless the builtin is one of the few that ignore their input
-        // entirely. Everything with an argument still reads: `map(1)`,
+        // entirely. Everything with an `Expr` argument still reads: `map(1)`,
         // `select(true)` and `add` all consult `.` however closed the
         // argument is, so this allowlist holds only builtins whose whole
         // answer comes from elsewhere -- the clock, the environment, the
-        // language itself. Verified against their `eval.rs` arms, each of
-        // which takes `_value`.
+        // language itself. `EnvObject`/`StrEnv` carry a plain `String` (the
+        // variable name), not an `Expr`, so there is no child for
+        // `any_subexpr` to miss either. Verified against their `eval.rs`
+        // arms, each of which takes `_value` or no value parameter at all.
         Expr::Builtin(builtin) => !matches!(
             builtin,
             Builtin::Empty
@@ -1329,6 +1331,8 @@ fn node_reads_ambient(node: &Expr) -> bool {
                 | Builtin::Infinite
                 | Builtin::NullLit
                 | Builtin::Env
+                | Builtin::EnvObject(_)
+                | Builtin::StrEnv(_)
                 | Builtin::Builtins
                 | Builtin::Halt
         ),

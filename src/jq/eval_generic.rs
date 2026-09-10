@@ -8295,7 +8295,12 @@ fn each_repeat_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Flow {
-    let owned = match to_owned_with_cursor(&value, cursor) {
+    // `f` is `Repeat`'s only child and the wrapper contributes nothing of
+    // its own (`walk.rs`'s `node_reads_ambient` leaves `Expr::Repeat` to the
+    // "children decide" group), so `reads_ambient_value(f)` is exactly
+    // `Repeat`'s own closedness -- bridging here keeps `repeat(f)` in step
+    // with every other native arm this file gives the same treatment (#2173).
+    let owned = match bridge_ambient_input(f, &value, cursor) {
         Ok(v) => v,
         Err(e) if suppresses(&e, optional) => return Flow::Exhausted,
         Err(e) => return Flow::Escaped(Control::Error(e)),
@@ -10892,9 +10897,15 @@ fn eval_boolean_generic<S: EvalSemantics, V: DocumentValue>(
     // either (`bridge_ambient_input`), so keeping the walk here would have
     // reinstated by hand the spelling-dependence both changes exist to
     // remove. `. and true` still walks.
-    let reads_ambient =
-        crate::jq::walk::reads_ambient_value(left) || crate::jq::walk::reads_ambient_value(right);
-    if reads_ambient && !needs_path_context(left) && !needs_path_context(right) {
+    // `needs_path_context` checked first so it can short-circuit `&&` and
+    // skip the `reads_ambient_value` tree walk entirely whenever either
+    // operand needs path context -- that case already makes the whole guard
+    // `false` regardless of what the walk would answer.
+    if !needs_path_context(left)
+        && !needs_path_context(right)
+        && (crate::jq::walk::reads_ambient_value(left)
+            || crate::jq::walk::reads_ambient_value(right))
+    {
         if let Some(control) = ambient_validation_error::<V>(cursor) {
             return partial_generic(Vec::new(), control);
         }
