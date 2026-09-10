@@ -46575,3 +46575,142 @@ fn test_collection_literal_postfix_does_not_capture_destructuring_2667() -> Resu
 
     Ok(())
 }
+
+/// #2686: a **wrong-arity** call to one of the eight dedicated special-form
+/// parsers cost `O(2^depth)` to *parse* when nested.
+///
+/// `rewind_to_wrong_arity_call` re-parsed the call's whole argument text from
+/// `start_pos` to resolve it as a (possibly shadowed) generic call. Every
+/// level therefore parsed its argument subtree twice — once on the way in,
+/// once on the rewind — and the rewind's own `parse_expr` descended into the
+/// next level down, which did the same. Measured before the fix:
+/// `until(` × 24 + `1;2;3` + `)` × 24 took **18 s** where jq 1.7.1 rejects the
+/// same text in 20 ms, growing ~1.9× per level.
+///
+/// `wrong_arity_call_from_parsed` hands the already-parsed arguments over and
+/// continues the argument loop from where the caller stopped, so nothing is
+/// re-parsed and the exponent is gone rather than merely bounded — the third
+/// instance of the shape #2036 closed twice (`wrap_shadowable_call`'s arg
+/// cloning, and `retry_shadow_candidate_as_generic_call`'s
+/// `SHADOW_RETRY_BUDGET`).
+///
+/// **Every** wrong-arity form was affected, not only the 2-arity ones. The
+/// issue reported `first/2` as flat and inferred that `until`/`limit`'s two
+/// already-parsed sub-expressions were needed to trigger it; that was a
+/// generator artifact. `"first(" * d + "1;2" + ")" * d` nests the call in
+/// argument *one*, so every level except the innermost is `first/1` — correct
+/// arity, which never rewinds. Built so each level really is wrong-arity
+/// (`"first(" * d + "1" + ";2)" * d`), `first/2` blew up exactly like the
+/// rest: 147 ms at depth 14 against `until/3`'s 215 ms, both ~1.9×/level.
+/// Hence the table below covers all eight forms rather than the two named.
+///
+/// Same timing-guard shape and generous margin as
+/// `test_def_shadow_deep_nesting_does_not_blow_up_2036` and
+/// `test_module_def_shadow_deep_nesting_does_not_blow_up_2395`: at 40 levels
+/// a reintroduced `2^depth` is astronomical, not merely slow, so a wide margin
+/// still catches the regression while tolerating this suite's own parallel-CPU
+/// contention.
+#[test]
+fn test_wrong_arity_deep_nesting_does_not_blow_up_2686() -> Result<()> {
+    // (keyword, the wrong-arity argument tail at every level)
+    for (kw, tail) in [
+        ("until", ";2;3"),
+        ("while", ";2;3"),
+        ("limit", ";2;3"),
+        ("first", ";2"),
+        ("last", ";2"),
+        ("repeat", ";2"),
+        ("range", ";2;3;4"),
+        ("error", ";2"),
+        // `limit(x)` — the missing-second-argument shape, which resolves
+        // through its own dedicated early return rather than a trailing
+        // separator mismatch.
+        ("limit", ""),
+    ] {
+        let depth = 40;
+        let filter = format!("{kw}(").repeat(depth) + "1" + &format!("{tail})").repeat(depth);
+        let start = std::time::Instant::now();
+        let (_stdout, _stderr, code) = run_jq_full(&["-nc", &filter], None)?;
+        let elapsed = start.elapsed();
+        // Every row is a wrong-arity call, so every row must be rejected --
+        // the point is that it is rejected *quickly*, with the same answer
+        // the rewinding version gave.
+        assert_ne!(code, 0, "`{kw}` {depth} levels: expected a rejection");
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "`{kw}` at {depth} levels took {elapsed:?} -- exponential parse blowup regressed"
+        );
+    }
+
+    Ok(())
+}
+
+/// #2686: the no-re-parse path must resolve a wrong-arity call to exactly
+/// what the rewinding path did — same message, same shadow resolution, same
+/// postfix handling.
+///
+/// Verified in bulk while making the change: 855 programs across all eight
+/// special forms × both modes (1710 pairs) — every argument count from 0 to
+/// 5, malformed separators, `def`-shadowed spellings, postfix chains,
+/// namespaced calls and nesting — produced byte-identical stdout, stderr and
+/// exit code against a binary built from the merge base. These rows are the
+/// load-bearing ones from that sweep, kept so the parity is pinned rather
+/// than only having been measured once.
+#[test]
+fn test_wrong_arity_resolution_is_unchanged_2686() -> Result<()> {
+    for (filter, want_code, want_fragment) in [
+        // The resolver's own name/arity diagnostic, not a raw parse error.
+        ("until(1;2;3)", 3, "until/3 is not defined"),
+        ("limit(1;2;3)", 3, "limit/3 is not defined"),
+        ("limit(1)", 3, "limit/1 is not defined"),
+        ("first(1;2)", 3, "first/2 is not defined"),
+        ("last(1;2)", 3, "last/2 is not defined"),
+        ("while(1;2;3)", 3, "while/3 is not defined"),
+        ("repeat(1;2)", 3, "repeat/2 is not defined"),
+        ("range(1;2;3;4)", 3, "range/4 is not defined"),
+        ("error(1;2)", 3, "error/2 is not defined"),
+        // #2237's postfix tail: a suffix after the wrong-arity call must
+        // still reach the resolver rather than becoming a syntax error.
+        ("range(1;2;3;4).foo", 3, "range/4 is not defined"),
+        ("until(1;2;3)[0]", 3, "until/3 is not defined"),
+        // A malformed separator inside the continued argument list keeps
+        // `parse_func_call_or_error`'s own wording.
+        ("until(1;2;3,)", 3, ""),
+    ] {
+        let (_stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, want_code, "`{filter}`: stderr {stderr:?}");
+        assert!(
+            stderr.contains(want_fragment),
+            "`{filter}`: stderr {stderr:?} lacks {want_fragment:?}"
+        );
+    }
+
+    // A `def` of the same name and arity still shadows -- the whole reason
+    // the wrong-arity path resolves as a generic call instead of raising.
+    for (filter, want) in [
+        ("def until(a;b;c): 42; until(1;2;3)", "42"),
+        ("def first(a;b): [a,b]; first(1;2)", "[1,2]"),
+        ("def range(a;b;c;d): 9; range(1;2;3;4)", "9"),
+        ("def limit(a): a; limit(7)", "7"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 0, "`{filter}`: stderr {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "`{filter}`");
+    }
+
+    // Correct-arity calls are untouched.
+    for (filter, want) in [
+        ("[limit(2; 1,2,3)]", "[1,2]"),
+        ("[range(1;5;2)]", "[1,3]"),
+        ("[range(3)]", "[0,1,2]"),
+        ("1 | until(. > 3; . + 1)", "4"),
+        ("[first(1,2)]", "[1]"),
+        ("[last(1,2)]", "[2]"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 0, "`{filter}`: stderr {stderr:?}");
+        assert_eq!(stdout.trim_end(), want, "`{filter}`");
+    }
+
+    Ok(())
+}
