@@ -49312,22 +49312,42 @@ fn subst_in_scope(e: &Expr, param: &str, arg: &Expr, scope: SubstScope) -> Expr 
     }
 }
 
-/// Whether `params` binds `$name` -- the *last* parameter of that name
-/// decides, per jq's later-wins parameter shadowing (#2560), and only a
-/// `$`-style one binds the variable namespace at all.
+/// Whether `params` binds `$name` at all -- i.e. whether an outer `$name`
+/// is shadowed for this def's whole body.
+///
+/// **`any`, not "the last one wins".** A parameter list asks three different
+/// questions about a repeated name, and only two of them are decided by the
+/// last occurrence:
+///
+/// 1. *Does anything here bind `$name`?* -- **this function**. Only a
+///    `$`-style parameter binds the variable namespace, and a later
+///    *bare* parameter of the same name does not unbind it: it shadows the
+///    filter namespace only, while the `$`-binding the earlier parameter
+///    established stays in scope for the body. Confirmed live against jq
+///    1.7.1: `def f($a): def h($a; a): $a; h(1;2); f(9)` is `1` -- `h`'s own
+///    leading `$a` still owns `$a` inside `h`, so the outer `9` must not
+///    reach it -- and `9 as $a | def f($a; a): $a; f(1;2)` is likewise `1`.
+/// 2. *Which argument does `$name` resolve to inside the def?* -- the last
+///    **`$`-style** occurrence, [`bind_def_call_params`]' own
+///    `rfind(is_dollar)`.
+/// 3. *Which argument does bare `name` resolve to?* -- the last occurrence
+///    of **any** spelling, since `$`-style binds the bare namespace too
+///    (#2560).
+///
+/// Reading (1) as (2)'s rule -- "the last parameter of this name, is it
+/// `$`-style?" -- gets `($a; a)` wrong in both directions: it let an outer
+/// `$a` leak into a body that binds its own, and it is what
+/// [`substitute_var_impl`]'s own copy of this check did before #2555.
 ///
 /// One definition, two call sites: [`substitute_var_impl`]'s `Expr::FuncDef`
-/// arm (may an outer `$name` substitution reach into this def's body?) and
-/// [`substitute_func_param_impl`]'s (same question, for an outer
-/// *parameter*'s own `$name` references). They asked the identical question
-/// with separately-written code until #2555; `test_params_bind_dollar_agrees_with_both_shadow_sites_2555`
-/// pins that they still agree.
+/// arm (may an outer `$name` *value* reach into this def's body?) and
+/// [`substitute_func_param_impl`]'s (the same question, for an outer
+/// *parameter*'s own `$name` references). They asked it with separately
+/// written code until #2555;
+/// `test_params_bind_dollar_agrees_with_both_shadow_sites_2555` pins that
+/// they still agree.
 fn params_bind_dollar(params: &[Param], name: &str) -> bool {
-    params
-        .iter()
-        .rev()
-        .find(|p| p.name() == name)
-        .is_some_and(Param::is_dollar)
+    params.iter().any(|p| p.is_dollar() && p.name() == name)
 }
 
 /// Which of a function parameter's two namespaces a substitution may still
@@ -49362,14 +49382,21 @@ struct SubstScope {
     /// `def` whose own matching parameter is `$`-style.
     dollar: bool,
     /// Bare `param` (`Expr::FuncCall { args: [] }`) still resolves to this
-    /// call's own argument. Only a *filter*-namespace binder clears it -- a
+    /// call's own argument. Only a *filter*-namespace binder clears it: a
     /// nested `def`'s matching parameter (of either spelling, since both
-    /// bind the bare name) or a nested zero-argument `def` of that name. An
-    /// `as`/`reduce`/`foreach` binder never does, however it is spelled:
-    /// confirmed live against jq 1.7.1, `def f(g): 1 as $g | $g + g; 10 as
-    /// $g | f($g)` is `11` -- the inner `1 as $g` shadows the inner `$g`
-    /// (evaluating to `1`) and never the bare `g` (still the caller's `$g`,
-    /// `10`).
+    /// bind the bare name), or -- in that def's `then` -- a nested
+    /// zero-argument `def` of the name. An `as`/`reduce`/`foreach` binder
+    /// never does, however it is spelled: confirmed live against jq 1.7.1,
+    /// `def f(g): 1 as $g | $g + g; 10 as $g | f($g)` is `11` -- the inner
+    /// `1 as $g` shadows the inner `$g` (evaluating to `1`) and never the
+    /// bare `g` (still the caller's `$g`, `10`).
+    ///
+    /// A nested zero-argument `def` does **not** clear this inside its own
+    /// `body`, where jq also has it in scope (`def` is recursive there).
+    /// That gap predates #2555 and is deliberately left alone: closing it
+    /// makes `def f(a): def a: a+1; a; f(1)` recurse forever, as jq does,
+    /// so it is a behaviour change that needs its own oracle matrix rather
+    /// than a drive-by. Tracked as #2737.
     bare: bool,
 }
 
@@ -49456,21 +49483,23 @@ fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, scope: Subst
         // the caller's scope and cannot mention the callee's own parameters.
         Expr::Shared(inner) => Expr::Shared(Rc::clone(inner)),
         // See `substitute_func_param`'s own doc comment above for why this
-        // exists at all (a `$`-style parameter's only binding mechanism)
-        // and why it's gated on `subst_dollar` rather than firing
-        // unconditionally the way the `FuncCall` arm below does.
+        // exists at all (a `$`-style parameter's only binding mechanism).
+        // Gated on `scope.dollar`, the variable namespace -- the bare
+        // `FuncCall` arm below reads `scope.bare` instead, and the two
+        // narrow on different binders (#2555).
         Expr::Var(name) if scope.dollar && name == param => arg.clone(),
         // #2095: does not recurse into `msg` -- see `map_subexprs`'s own doc
         // comment (`src/jq/walk.rs`) on its `Expr::Error` arm for why this is
         // preserved as a likely latent gap rather than fixed here.
         Expr::Error(msg) => Expr::Error(msg.clone()),
         Expr::Builtin(b) => Expr::Builtin(substitute_func_param_in_builtin(b, param, arg, scope)),
-        // #2141: unlike the pre-fix code, `expr`/`input`/`init` (evaluated
-        // in the *outer* scope) always keep the ambient `subst_dollar`, and
-        // `body`/`update`/`extract` (the bound-scope child) only ever clear
-        // it, never the bare-`param` substitution the `FuncCall` arm below
-        // still applies to every child unconditionally -- a `$`-bound
-        // binder can shadow `$param`, never a bare `param`.
+        // #2141: `expr`/`input`/`init` (evaluated in the *outer* scope)
+        // always keep the ambient scope, and `body`/`update`/`extract` (the
+        // bound-scope child) only ever clear its `dollar` half. An
+        // `as`/`reduce`/`foreach`/`?//` binder binds a *variable*, so it can
+        // shadow `$param` and never a bare `param`, however it is spelled
+        // (#2555: that asymmetry is now in the flags rather than implicit in
+        // the bare arm firing unconditionally).
         Expr::As { expr, var, body } => Expr::As {
             expr: Box::new(substitute_func_param_impl(expr, param, arg, scope)),
             var: var.clone(),
@@ -49888,23 +49917,28 @@ mod tests {
     /// `#[cfg(feature = "std")]`: `ambient_frame_depth` itself is a no-op
     /// under `no_std` (see its own module doc comment) -- there is no
     /// no_std variant of this mechanism to test.
-    /// #2283 review: `substitute_var_impl`'s shadow check must resolve a
-    /// duplicate-named parameter list by its *last* occurrence (jq's own
-    /// later-wins shadowing precedence), not its first -- an earlier
-    /// version of this exact fix used `.position()` (first match) and let
-    /// an outer `$a` leak straight into `def f(a; $a): $a`'s body despite
-    /// the *later* `$a` parameter being `$`-style. Verified directly on
-    /// the substitution itself (bypassing `bind_def_call`'s own separate,
-    /// pre-existing, unrelated bug in duplicate-name *argument* binding --
-    /// confirmed live against jq 1.7.1 that `9 as $a | def f(a; $a): $a;
-    /// f(1;2)` end-to-end is `2` on jq but `1` even on unmodified `main`,
-    /// for a reason unconnected to shadowing -- so this test checks the
-    /// shadow decision in isolation): `f`'s own `$a` reference inside
-    /// `body` must remain an unsubstituted `Expr::Var`, not get replaced
-    /// with the outer `9`, whichever position the `$`-style parameter
-    /// sits at.
+    /// #2283 review, corrected by #2555: `substitute_var_impl`'s shadow
+    /// check blocks an outer `$a` whenever a duplicate-named parameter list
+    /// binds `$a` *anywhere*, not merely at its last occurrence.
+    ///
+    /// #2283 originally wrote this as "the last occurrence decides, is it
+    /// `$`-style?", fixing a real bug (an earlier draft used `.position()`,
+    /// the *first* match, and let an outer `$a` leak into
+    /// `def f(a; $a): $a`'s body). That rule is right for deciding *which
+    /// argument* a reference resolves to, and wrong for deciding *whether
+    /// the name is bound at all* -- a trailing bare parameter shadows only
+    /// the filter namespace and cannot unbind a leading `$a`. See
+    /// [`params_bind_dollar`]'s own doc comment for the three separate
+    /// questions.
+    ///
+    /// Both rows below are the end-to-end behaviour of jq 1.7.1, captured
+    /// live: `9 as $a | def f(a; $a): $a; f(1;2)` is `2` and
+    /// `9 as $a | def f($a; a): $a; f(1;2)` is `1` -- in both cases `f`'s
+    /// own binding wins and the outer `9` never appears. This test checks
+    /// the shadow decision in isolation, so `f`'s own `$a` reference inside
+    /// `body` must stay an unsubstituted `Expr::Var` either way.
     #[test]
-    fn test_duplicate_named_param_shadow_resolves_by_last_occurrence_2283() {
+    fn test_duplicate_named_param_shadow_blocks_whenever_dollar_is_bound_2283_2555() {
         let make_funcdef = |params: Vec<Param>| Expr::FuncDef {
             name: "f".to_string(),
             params,
@@ -49929,11 +49963,13 @@ mod tests {
              unsubstituted, not become Literal(9)"
         );
 
-        // `$`-style parameter first, bare last: `def f($a; a): $a` -- the
-        // *bare* trailing parameter no longer has a `$`-binding of its own
-        // at that position, so this one is NOT shadowed (matches
-        // `test_bare_nested_param_no_longer_shadows_outer_dollar_binding_2283`'s
-        // own single-parameter case).
+        // `$`-style parameter first, bare last: `def f($a; a): $a`. #2283
+        // read this as "not shadowed" -- the trailing bare parameter has no
+        // `$`-binding, so the outer `$a` was let through. That is wrong:
+        // the *leading* `$a` still binds `$a` for the whole body, and a
+        // later bare parameter of the same name shadows only the filter
+        // namespace. Confirmed live against jq 1.7.1:
+        // `9 as $a | def f($a; a): $a; f(1;2)` is `1`, never `9`.
         let dollar_first = make_funcdef(vec![
             Param::Dollar("a".to_string()),
             Param::Bare("a".to_string()),
@@ -49944,9 +49980,26 @@ mod tests {
         };
         assert_eq!(
             **body,
+            Expr::Var("a".to_string()),
+            "the leading $-style parameter binds $a for the whole body -- a trailing bare \
+             parameter shadows only the filter namespace, so the outer $a must NOT reach through"
+        );
+
+        // Neither spelling binds `$a`: nothing shadows it, so the outer
+        // value does reach the body. Confirmed live against jq 1.7.1,
+        // `9 as $a | def f(a; a): $a; f(1;2)` is `9`.
+        let no_dollar = make_funcdef(vec![
+            Param::Bare("a".to_string()),
+            Param::Bare("a".to_string()),
+        ]);
+        let substituted = substitute_var(&no_dollar, "a", &OwnedValue::Int(9));
+        let Expr::FuncDef { body, .. } = &substituted else {
+            unreachable!("FuncDef arm always returns FuncDef"); // omni-dev: coverage tolerate-line reason="substitute_var_impl's FuncDef arm always returns FuncDef (#2283)"
+        };
+        assert_eq!(
+            **body,
             Expr::Literal(Literal::Int(9)),
-            "the later, bare parameter has no $-binding of its own -- the outer $a must \
-             reach through"
+            "bare parameters create no $-binding at all -- the outer $a must reach through"
         );
     }
 
@@ -49972,17 +50025,26 @@ mod tests {
             (
                 vec![bare("a"), dollar("a")],
                 true,
-                "duplicate, $-style last -- last occurrence decides",
+                "duplicate, $-style last",
             ),
             (
+                // Not "the last occurrence decides": the trailing bare
+                // parameter shadows the *filter* namespace only, and cannot
+                // unbind the `$a` the leading one established. jq 1.7.1:
+                // `9 as $a | def f($a; a): $a; f(1;2)` is `1`, not `9`.
                 vec![dollar("a"), bare("a")],
-                false,
-                "duplicate, bare last -- last occurrence decides",
+                true,
+                "duplicate, bare last -- the earlier $-style one still binds $a",
             ),
             (
                 vec![dollar("a"), bare("a"), dollar("a")],
                 true,
                 "three occurrences, $-style last",
+            ),
+            (
+                vec![bare("a"), bare("a")],
+                false,
+                "duplicate, no $-style occurrence at all",
             ),
             (vec![], false, "no parameters at all"),
         ] {
