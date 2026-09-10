@@ -84,24 +84,29 @@ struct BlockScalarHeader {
 }
 
 /// Head/line/foot comments attached to one node, keyed by its own bp
-/// position (#798 PR2). `head`/`foot` hold zero or more standalone `#` lines
-/// (consecutive lines join into one logical block, hence `Vec` rather than
-/// `Option` -- real yq treats them as one comment either way, and #1085
-/// needs more than one comment associated with a single node at all).
+/// position (#798). `head`/`foot` hold zero or more whole comment-only
+/// lines (consecutive lines are one logical block, hence `Vec` rather than
+/// `Option` -- real yq joins them with a newline either way, and #1085
+/// needs more than one comment associated with a single node at all);
+/// `line` is the node's own trailing same-line comment. A node can carry
+/// all three at once.
 ///
-/// `head`/`foot` are always empty today -- capturing standalone comment
-/// lines is separate, follow-up work; this type only widens the storage
-/// shape so that work has somewhere to write. `line` alone is exactly the
-/// single-slot `(u32, u32)` this type replaces, with unchanged semantics.
+/// Every range is raw, `#` included: the reader strips a leading `"# "` at
+/// the point of use, which is what makes `#\ttabbed` and a bare `#` come
+/// back verbatim, matching real yq.
 #[derive(Debug, Clone, Default)]
 pub struct NodeComments {
-    /// Standalone `#` lines directly above the node. Always empty today.
+    /// Standalone `#` lines directly above the node, in source order. For a
+    /// mapping entry these live on its *key* node; for a sequence item, on
+    /// the item's content node. See
+    /// [`Parser::record_standalone_comment`].
     pub head: Vec<(u32, u32)>,
     /// The node's own trailing same-line comment: `(start, end)` byte range
     /// of the raw comment text, starting at `#` and running to end of line
     /// (exclusive of the line break, inclusive of any trailing whitespace).
     pub line: Option<(u32, u32)>,
-    /// Standalone `#` lines directly below the node. Always empty today.
+    /// Standalone `#` lines directly below the node, in source order. See
+    /// [`Self::head`].
     pub foot: Vec<(u32, u32)>,
 }
 
@@ -144,8 +149,7 @@ pub struct SemiIndex {
     /// Explicit source tags: BP position → raw tag text (see [`YamlIndex::get_tag`](super::index::YamlIndex::get_tag))
     pub tags: BTreeMap<usize, String>,
     /// Head/line/foot comments, keyed by the BP position of the node they
-    /// attach to. See [`NodeComments`] -- only `line` (issue #710) is
-    /// captured today; `head`/`foot` are always empty.
+    /// attach to. See [`NodeComments`].
     pub comments: BTreeMap<usize, NodeComments>,
 }
 
@@ -243,6 +247,42 @@ struct Parser<'a, const HAS_CR: bool> {
     /// primary node (a mapping key or sequence item) actually opens.
     pending_head_comment: Option<(u32, u32)>,
 
+    /// A run of standalone `#` lines awaiting forward attachment as the
+    /// *next* node's `head` (#798). Distinct from
+    /// [`Self::pending_head_comment`], which despite its name carries a
+    /// single *trailing* comment floated past a deferred `&anchor`/`!tag`
+    /// (#784); this one carries whole comment-only lines.
+    ///
+    /// Lives on `Parser` rather than as a local threaded through the parse
+    /// functions on purpose: `Parser` is one struct in `build_semi_index`'s
+    /// frame, so a field here costs nothing per recursion level, whereas a
+    /// local in a recursive function is charged at every level and has twice
+    /// inverted a depth guard into a real stack overflow on this issue
+    /// (#798 PR1's `parse_assignment`, PR2's `NodeMeta`).
+    pending_head_lines: Vec<(u32, u32)>,
+    /// The most recently opened node that can own a head/foot comment: a
+    /// mapping *key* or a sequence item's *content* (#798). This is `PREV`
+    /// in [`Self::record_standalone_comment`]'s attachment rule.
+    ///
+    /// Deliberately not [`Self::last_open_bp_pos`], which is the last bp of
+    /// *any* kind: for an inline `k: v` that is the value node, while real
+    /// yq measurably attaches head/foot to the key
+    /// (`.b | key | foot_comment`, never `.b | foot_comment`).
+    last_head_foot_bp: Option<usize>,
+    /// High-water mark of recorded standalone-comment text (#798).
+    ///
+    /// Three `skip_newlines` call sites rewind after a speculative lookahead
+    /// (`following_value_is_null`, `parse_mapping_entry`'s anchored branch,
+    /// `parse_explicit_key`), so the same comment bytes pass through the
+    /// recorder more than once. Recording only ranges starting at or past
+    /// this mark makes the recorder idempotent without any call site needing
+    /// to know it is on a rewinding path.
+    comment_watermark: u32,
+    /// Whether any node that can own a head/foot comment has opened yet
+    /// (#798). Distinguishes a block trailing real content (the document
+    /// root's *foot*) from a comment-only document (its *head*).
+    saw_head_foot_node: bool,
+
     // Document tracking
     /// Whether we're currently inside a document
     in_document: bool,
@@ -339,6 +379,10 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             pending_property_bp: None,
             comments: BTreeMap::new(),
             pending_head_comment: None,
+            pending_head_lines: Vec::new(),
+            last_head_foot_bp: None,
+            comment_watermark: 0,
+            saw_head_foot_node: false,
             in_document: false,
             document_start_bp_pos: 0,
             pending_explicit_key: None,
@@ -557,6 +601,224 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 .line
                 .get_or_insert(range);
         }
+    }
+
+    /// Record a *standalone* comment line — one whose line holds nothing but
+    /// whitespace before the `#` — for later attachment as some node's
+    /// `head` or `foot` (#798).
+    ///
+    /// **Record-only.** Never moves `self.pos` and never changes a branch:
+    /// the caller's `skip_to_eol` still does the consuming. That is the whole
+    /// safety argument for touching `skip_newlines` at all — nothing reads
+    /// `head`/`foot` yet, so a mis-*attributed* comment cannot change any
+    /// output, but a disturbed parser position would be a real regression.
+    ///
+    /// Two guards make this safe at every call site rather than only at the
+    /// ones known to be well-behaved:
+    ///
+    /// - [`Self::comment_watermark`] makes it idempotent under the three
+    ///   rewinding lookahead sites.
+    /// - the standalone check below rejects a *trailing* comment reached
+    ///   mid-line, which happens whenever `skip_newlines` is entered after a
+    ///   document marker (`--- # c` leaves the cursor past the marker, and
+    ///   the space arm then walks straight onto the `#`).
+    ///
+    /// Attachment follows the rule measured against pinned yq v4.53.3 — a
+    /// block of consecutive comment lines sticks to whatever it is *not*
+    /// separated from by a blank line, preferring forward:
+    ///
+    /// ```text
+    /// PREV && !blank_before && (blank_after || no NEXT) -> PREV.foot
+    /// else if NEXT                                      -> NEXT.head
+    /// else                                              -> ROOT.foot
+    /// ```
+    ///
+    /// Only `blank_before` is decidable here (the lines *after* the block
+    /// have not been scanned yet), so this records into
+    /// [`Self::pending_head_lines`] and leaves the whole decision to
+    /// [`Self::flush_pending_head_lines`], which runs once the next node
+    /// opens (or at EOF) and can see both sides.
+    fn record_standalone_comment(&mut self, start: usize, end: usize) {
+        let (start, end) = (start as u32, end as u32);
+        if start < self.comment_watermark {
+            return;
+        }
+        if !self.is_line_start_before(start as usize) {
+            return;
+        }
+        self.comment_watermark = end;
+        // A blank line between the pending block and this line ends that
+        // block: its `blank_after` is now known to be true, so settle it
+        // before starting a new one. Without this, `a: 1 / # m1 / <blank> /
+        // # m2 / b: 2` would merge both blocks onto `b`, where real yq
+        // splits them `m1` -> `.a`'s foot, `m2` -> `.b`'s head.
+        if let Some(&(_, last_end)) = self.pending_head_lines.last() {
+            if self.blank_line_between(last_end as usize, start as usize) {
+                self.resolve_pending_block_backward();
+            }
+        }
+        // A blank line before this comment detaches it from `PREV`, so the
+        // block can only ever go forward from here — drop the back-reference
+        // rather than tracking `blank_before` per block.
+        if self.pending_head_lines.is_empty() && self.blank_line_precedes(start as usize) {
+            self.last_head_foot_bp = None;
+        }
+        self.pending_head_lines.push((start, end));
+    }
+
+    /// Attach the pending standalone-comment block (#798), applying the
+    /// measured rule in [`Self::record_standalone_comment`]'s doc comment.
+    ///
+    /// `next_bp` is the node that just opened and would own the block as its
+    /// `head`, or `None` at end of input. Called at every point a node that
+    /// can own a head comment opens — a mapping key, a sequence item's
+    /// content, and a document's content node — plus once at end of parse.
+    /// A no-op when nothing is pending, which is the overwhelmingly common
+    /// case, so the hooks cost one `Vec::is_empty` each.
+    fn flush_pending_head_lines(&mut self, next_bp: Option<usize>) {
+        if self.pending_head_lines.is_empty() {
+            return;
+        }
+        // A blank line between the block and whatever follows detaches it
+        // forward; so does having nothing follow at all. Either way it falls
+        // back onto `PREV` — which `record_standalone_comment` has already
+        // set to `None` if a blank line detached the block backwards too.
+        let block_end = self.pending_head_lines[self.pending_head_lines.len() - 1].1 as usize;
+        let detached_forward = next_bp.is_none() || self.blank_line_between(block_end, self.pos);
+        if detached_forward {
+            if let Some(prev) = self.last_head_foot_bp {
+                let pending = &mut self.pending_head_lines;
+                self.comments.entry(prev).or_default().foot.append(pending);
+                return;
+            }
+        }
+        let root = self.document_start_bp_pos;
+        let pending = &mut self.pending_head_lines;
+        match next_bp {
+            Some(bp) => self.comments.entry(bp).or_default().head.append(pending),
+            // Nothing follows and nothing precedes it closely enough, so the
+            // block belongs to the document root -- as its *foot* normally,
+            // but as its *head* when the document never opened a node at all
+            // (a comment-only document, where real yq answers
+            // `. | head_comment`, not `foot_comment`).
+            None if self.saw_head_foot_node => {
+                self.comments.entry(root).or_default().foot.append(pending);
+            }
+            None => self.comments.entry(root).or_default().head.append(pending),
+        }
+    }
+
+    /// Settle a pending block whose forward attachment is already disproven
+    /// (a blank line follows it) onto `PREV`'s foot. A no-op when `PREV` is
+    /// unset, which means a blank line detached the block backwards too —
+    /// it stays pending and goes forward to whatever opens next.
+    fn resolve_pending_block_backward(&mut self) {
+        if self.pending_head_lines.is_empty() {
+            return;
+        }
+        if let Some(prev) = self.last_head_foot_bp {
+            let pending = &mut self.pending_head_lines;
+            self.comments.entry(prev).or_default().foot.append(pending);
+        }
+    }
+
+    /// Hook for "a node that can own a standalone comment just opened at
+    /// [`Self::last_open_bp_pos`]" (#798): attach any pending block as its
+    /// `head`, and make it the `PREV` a later block can attach its `foot` to.
+    ///
+    /// Called where a mapping *key* opens and where a sequence item's
+    /// *content* opens — the two nodes real yq answers `head_comment`/
+    /// `foot_comment` from. Not called for container opens, which own no
+    /// standalone comment of their own (a comment above a nested mapping's
+    /// first key belongs to that key, measured), and not for an inline
+    /// `k: v`'s value node.
+    fn attach_head_foot_to_key(&mut self) {
+        self.attach_head_foot_at(self.last_open_bp_pos);
+    }
+
+    /// [`Self::attach_head_foot_to_key`] for a node whose bp is known but
+    /// which has not opened yet — a sequence item's content, flushed *before*
+    /// `parse_value` runs so [`Self::flush_pending_head_lines`] still sees
+    /// `self.pos` at the content's own line rather than past the whole value.
+    fn attach_head_foot_at(&mut self, bp: usize) {
+        self.flush_pending_head_lines(Some(bp));
+        self.last_head_foot_bp = Some(bp);
+        self.saw_head_foot_node = true;
+    }
+
+    /// Whether a wholly blank line lies in `[from, to)` — i.e. whether the
+    /// text there holds two or more line breaks (`\r\n` counting once). One
+    /// break is just the end of the earlier line; a second means an empty
+    /// line came between.
+    fn blank_line_between(&self, from: usize, to: usize) -> bool {
+        let mut breaks = 0usize;
+        let mut p = from;
+        let end = to.min(self.input.len());
+        while p < end {
+            if is_line_break(self.input[p]) {
+                breaks += 1;
+                if breaks >= 2 {
+                    return true;
+                }
+                // CRLF is one break.
+                if self.input[p] == b'\r' && p + 1 < end && self.input[p + 1] == b'\n' {
+                    p += 1;
+                }
+            }
+            p += 1;
+        }
+        false
+    }
+
+    /// Whether everything between `pos` and the start of its line is inline
+    /// whitespace — i.e. `pos` begins a *standalone* comment rather than one
+    /// trailing content. See [`Self::record_standalone_comment`].
+    fn is_line_start_before(&self, pos: usize) -> bool {
+        let mut p = pos;
+        while p > 0 && Self::is_inline_whitespace(self.input[p - 1]) {
+            p -= 1;
+        }
+        p == 0 || is_line_break(self.input[p - 1])
+    }
+
+    /// Whether the line before the one containing `pos` is blank (empty or
+    /// whitespace only). Start of input is not a blank line.
+    ///
+    /// Read straight off the text rather than tracked as parser state, so it
+    /// cannot be confused by a `skip_newlines` call entered mid-line — see
+    /// [`Self::record_standalone_comment`].
+    fn blank_line_precedes(&self, pos: usize) -> bool {
+        // Step back over this line's indent to its opening break, then over
+        // that break, then check whether the line before it is empty.
+        let mut p = pos;
+        while p > 0 && Self::is_inline_whitespace(self.input[p - 1]) {
+            p -= 1;
+        }
+        if p == 0 {
+            return false;
+        }
+        // `p - 1` is the break that ended the previous line. A CRLF counts
+        // once: step back over the `\n` and then over a `\r` if it precedes.
+        let mut q = p - 1;
+        if self.input[q] == b'\n' && q > 0 && self.input[q - 1] == b'\r' {
+            q -= 1;
+        }
+        if q == 0 {
+            return false;
+        }
+        // Walk the previous line backwards; blank iff we reach another break
+        // (or the start of input) without meeting content.
+        let mut r = q;
+        while r > 0 && !is_line_break(self.input[r - 1]) {
+            if !Self::is_inline_whitespace(self.input[r - 1]) {
+                return false;
+            }
+            r -= 1;
+        }
+        // A whitespace-only run back to the start of input is a blank line
+        // only if it is non-empty; `r == q` means the previous "line" was
+        // empty, which is blank either way.
+        r < q || r > 0
     }
 
     /// Like [`Self::maybe_capture_line_comment`], but the owning node doesn't
@@ -1263,14 +1525,18 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.skip_line_break();
             } else if b == b'#' {
                 // Comment line
+                let comment_start = self.pos;
                 self.skip_to_eol();
+                self.record_standalone_comment(comment_start, self.pos);
             } else if b == b' ' {
                 // Check if rest of line is whitespace or comment
                 let start = self.pos;
                 self.skip_inline_whitespace();
                 if self.at_break() || self.peek() == Some(b'#') || self.peek().is_none() {
                     if self.peek() == Some(b'#') {
+                        let comment_start = self.pos;
                         self.skip_to_eol();
+                        self.record_standalone_comment(comment_start, self.pos);
                     }
                     continue;
                 }
@@ -1385,6 +1651,20 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     fn start_document(&mut self) {
         self.in_document = true;
         self.document_start_bp_pos = self.bp_pos;
+        // A standalone comment block seen before this document's content
+        // belongs to the document's own node, not to its first key -- real
+        // yq answers `. | head_comment`, not `.a | key | head_comment`, for
+        // a leading `# lead` (#798). `document_start_bp_pos` is the bp the
+        // content node is about to take, and `end_document` synthesizes a
+        // node there even when the document turns out empty, so the block
+        // always lands on something real.
+        //
+        // Deliberately *before* `pending_head_comment` is cleared below:
+        // that field is #784's single floated trailing comment, unrelated to
+        // this block.
+        let root_bp = self.document_start_bp_pos;
+        self.flush_pending_head_lines(Some(root_bp));
+        self.last_head_foot_bp = None;
         // A comment deferred by an anchor in a *previous* document (#784)
         // has no node left to attach to once a new document starts -
         // `parse_document_line`'s own one-line grace period already covers
@@ -1465,13 +1745,20 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             if is_line_break(b) {
                 self.skip_line_break();
             } else if b == b'#' {
+                // The second whole-line-comment funnel (#798): a comment
+                // before the first `---` of a document *with* directives is
+                // consumed here and never reaches `skip_newlines`.
+                let comment_start = self.pos;
                 self.skip_to_eol();
+                self.record_standalone_comment(comment_start, self.pos);
             } else if b == b' ' || b == b'\t' {
                 let start = self.pos;
                 self.skip_inline_whitespace();
                 if self.at_break() || self.peek() == Some(b'#') || self.peek().is_none() {
                     if self.peek() == Some(b'#') {
+                        let comment_start = self.pos;
                         self.skip_to_eol();
+                        self.record_standalone_comment(comment_start, self.pos);
                     }
                     continue;
                 }
@@ -2530,6 +2817,13 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             // Parse the item value normally
             // Pass structure indent for block scalars (content must be > this)
             let bp_pos_before_value = self.bp_pos;
+            // A standalone comment above a sequence item attaches to the
+            // item's *content* node, which is about to open at
+            // `bp_pos_before_value` -- real yq answers `.[1] | head_comment`
+            // directly for one, with no `key` step (#798). Flushed before
+            // `parse_value` so the blank-line check still sees `self.pos` on
+            // the item's own line.
+            self.attach_head_foot_at(bp_pos_before_value);
             self.parse_value(indent)?;
             // Claim a comment deferred by an earlier anchor's deferred value
             // (#784): a plain-scalar item's own trailing comment lives on
@@ -2595,6 +2889,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
         // Open key node
         self.write_bp_open();
+        // Standalone comments attach to a mapping entry's *key* (#798).
+        self.attach_head_foot_to_key();
 
         // Check for a property on the key (`- &a k: v` / `- !!str k: v`) -
         // record it pointing to this key.
@@ -2838,6 +3134,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
 
         // Open key node
         self.write_bp_open();
+        // Standalone comments attach to a mapping entry's *key* (#798).
+        self.attach_head_foot_to_key();
 
         // Check for a property on the key - record it pointing to this key BP
         self.record_key_properties()?;
@@ -5330,6 +5628,11 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         if self.peek().is_some() {
             self.parse_documents()?;
         }
+
+        // A standalone comment block still pending at EOF has no following
+        // node to head (#798): it becomes the last key/item's foot, or the
+        // document root's foot when a blank line detached it from that too.
+        self.flush_pending_head_lines(None);
 
         // Close any remaining open document
         self.end_document();
