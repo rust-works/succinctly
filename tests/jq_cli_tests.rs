@@ -43110,6 +43110,90 @@ fn test_navigating_builtins_raise_regardless_of_input_type_2646() -> Result<()> 
     Ok(())
 }
 
+/// #2680: `walk_path`'s pipe walker must not un-emit paths a failing stage
+/// already reached. Positions produced *before* the error come earlier in
+/// jq's generator order than the error itself, so they still get walked
+/// through the remaining stages; only then does the error surface.
+///
+/// The parentheses are the whole difference, and the reason this hid: the
+/// same pipe written flat pushes its earlier positions straight to the
+/// caller's output buffer, which survives the error propagation. Only a
+/// *nested* stage-1 pipe buffers them locally, and that local buffer was
+/// being dropped. Both spellings are asserted here so a future change cannot
+/// fix one and lose the other. Captured live from jq 1.7.1.
+///
+/// The `[0:1]` is only there to force the DOM route --
+/// `path_expr_is_cursor_navigable` refuses a `Slice` -- so the walker under
+/// test is `eval.rs`'s `walk_pipe` rather than the cursor path.
+#[test]
+fn test_path_keeps_the_prefix_a_failing_nested_stage_reached_2680() -> Result<()> {
+    let doc = r#"{"a":[{"b":{}},5]}"#;
+
+    for (filter, want) in [
+        // nested (parenthesised) stage 1 -- the bug
+        (
+            "path((.a[] | .b) | .c[0:1])",
+            r#"["a",0,"b","c",{"start":0,"end":1}]"#,
+        ),
+        // a longer nested stage 1, same shape
+        (
+            "path((.a[] | .b | .c) | .d[0:1])",
+            r#"["a",0,"b","c","d",{"start":0,"end":1}]"#,
+        ),
+        // the flat spelling, which was already correct
+        (
+            "path(.a[] | .b | .c[0:1])",
+            r#"["a",0,"b","c",{"start":0,"end":1}]"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_ne!(code, 0, "{filter}: expected the error too, got {stdout:?}");
+        assert!(
+            stderr.contains(r#"Cannot index number with string "b""#),
+            "{filter}: {stderr:?}"
+        );
+        assert_eq!(
+            stdout.trim_end(),
+            want,
+            "{filter}: the prefix reached before the error must still be emitted"
+        );
+    }
+    Ok(())
+}
+
+/// #2680 boundary: a stage-1 failure with *nothing* reached before it stays
+/// output-free, and a nested pipe that never fails is unaffected. Without
+/// these, the fix above could have been "always emit something". jq 1.7.1
+/// agrees on every row.
+#[test]
+fn test_path_emits_nothing_when_the_failing_stage_reached_nothing_2680() -> Result<()> {
+    // The failing element comes *first*, so no position precedes the error.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "path((.a[] | .b) | .c[0:1])"], Some(r#"{"a":[5]}"#))?;
+    assert_ne!(code, 0, "stdout {stdout:?}");
+    assert!(
+        stderr.contains(r#"Cannot index number with string "b""#),
+        "{stderr:?}"
+    );
+    assert_eq!(
+        stdout.trim_end(),
+        "",
+        "nothing was reached before the error"
+    );
+
+    // No failure at all: every position is named, exit 0.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "[path((.a[] | .b) | .c[0:1])]"],
+        Some(r#"{"a":[{"b":{}},{"b":{}}]}"#),
+    )?;
+    assert_eq!(code, 0, "stderr {stderr:?}");
+    assert_eq!(
+        stdout.trim_end(),
+        r#"[["a",0,"b","c",{"start":0,"end":1}],["a",1,"b","c",{"start":0,"end":1}]]"#
+    );
+    Ok(())
+}
+
 /// #2349 control: the same gate's *array* elements must also validate the
 /// leading-comma/duplicate-comma shape (`[1,,2]`), not just the trailing
 /// stray-comma cases above -- a distinct `#1677` check
