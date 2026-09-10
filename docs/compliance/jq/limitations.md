@@ -2450,6 +2450,30 @@ through `key_elements_generic`, the one caller left, and still trip it on the sa
 Pinned by `test_truthiness_probes_do_not_trip_the_depth_guard_2692`
 (`tests/jq_cli_tests.rs`).
 
+**#2669 applied that same rule to the one `and`/`or` route that had kept the old
+behaviour.** #2692 removed the validation walk, and the lazy arms took that immediately —
+but the *collecting* entry points (`eval_boolean`, `eval_boolean_generic`) still passed the
+eager operand strategy, whose `push_generic_truthiness` ran
+`push_generic_document_validation_error` per item. So on a malformed document the same
+expression answered differently depending only on which consumer wrapped it, measured on
+`main` before #2669:
+
+| filter (input `{"a":1,}`)     | before #2669 | after   |
+|-------------------------------|--------------|---------|
+| `(.,.) and true` (bare)       | `true`       | `true`  |
+| `first((.,.) and true)`       | `true`       | `true`  |
+| `[limit(2; (.,.) and true)]`  | `[true,true]`| `[true,true]` |
+| `[(.,.) and true]`            | **exit 5**   | `[true,true]` |
+
+Three of the four already accepted, so #2669's switch to the lazy strategy moved the fourth
+to join them rather than the reverse — the direction #2692 chose. Real jq rejects all four
+(it cannot parse the document at all), so this is the existing #2692 divergence applied
+consistently, not a new one. Whether a truthiness-only read should validate at all remains
+open as [#2701](https://github.com/rust-works/succinctly/issues/2701); #2669 does not
+settle that, it only removes the route-dependence. A route that genuinely reads a member
+(`.a and true`) still raises. Pinned by
+`test_boolean_routes_agree_on_a_malformed_document_2669`.
+
 ## Regex flags `l` and `n`
 
 [ADR-0019](../../adrs/adr-0019.md) accepted two regex-flag gaps as permanent — rule 4(d)

@@ -47046,3 +47046,68 @@ fn test_wrong_arity_resolution_is_unchanged_2686() -> Result<()> {
 
     Ok(())
 }
+
+/// #2669: every route to `and`/`or` now agrees on a malformed document,
+/// which is #2692's rule applied to the one route that still had the old
+/// behaviour.
+///
+/// #2692 removed `push_generic_document_validation_error` from `and`/`or`'s
+/// behalf, deciding that *testing* a value does not read it. The lazy arms
+/// took that immediately, but the collecting entry points kept the eager
+/// operand strategy, whose `push_generic_truthiness` still ran the walk per
+/// item — so on `{"a":1,}` the identical expression answered differently
+/// depending only on which consumer wrapped it. Measured on `main` before
+/// this change:
+///
+/// | filter | main | now |
+/// |---|---|---|
+/// | `(.,.) and true` (bare) | `true` | `true` |
+/// | `first((.,.) and true)` | `true` | `true` |
+/// | `[limit(2; (.,.) and true)]` | `[true,true]` | `[true,true]` |
+/// | `[(.,.) and true]` | **exit 5** | `[true,true]` |
+///
+/// Three of the four already accepted; #2669 moved the fourth to join them
+/// rather than the reverse, because that is the direction #2692 chose. Real
+/// jq rejects **all four** — it cannot parse the document at all — so this is
+/// the pre-existing #2692 divergence being applied consistently, not a new
+/// one, and it is the reason the switch is not purely a stderr-ordering
+/// change. The open question of whether truthiness-only reads should
+/// validate at all is #2701; this test pins only that the routes agree.
+#[test]
+fn test_boolean_routes_agree_on_a_malformed_document_2669() -> Result<()> {
+    for doc in [r#"{"a":1,}"#, "{,}", "[1,]", r#"{"a":1,,"b":2}"#] {
+        // Every spelling of the same expression, one per route.
+        for (filter, want) in [
+            ("(.,.) and true", "true\ntrue"),
+            ("first((.,.) and true)", "true"),
+            ("[limit(2; (.,.) and true)]", "[true,true]"),
+            ("[(.,.) and true]", "[true,true]"),
+            ("[(.,.) and true] | length", "2"),
+            ("[(.,.) or false]", "[true,true]"),
+        ] {
+            let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+            assert_eq!(
+                code, 0,
+                "doc={doc} `{filter}`: every route must agree (#2692's rule): {stderr:?}"
+            );
+            assert_eq!(stdout.trim_end(), want, "doc={doc} `{filter}`");
+        }
+    }
+
+    // The guard on the other side: a route that genuinely *reads* the
+    // document still raises on the same input, so this is not a blanket
+    // "and/or suppresses validation everywhere" change.
+    for (filter, doc) in [(".a and true", r#"{"a":1,}"#), ("[.a] and true", "{,}")] {
+        let (_stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_ne!(
+            code, 0,
+            "`{filter}` on {doc}: reading a member must still raise"
+        );
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "`{filter}` on {doc}: stderr {stderr:?}"
+        );
+    }
+
+    Ok(())
+}
