@@ -39931,10 +39931,27 @@ fn test_truthiness_probes_validate_nothing_2692() -> Result<()> {
         ("well-formed", "a: [1, {b: c}]\n"),
     ];
     // #2173 moved the closed terms out of this list -- see the jq twin's
-    // own comment. They no longer validate anything, so they cannot agree
-    // with `select(.) | 1` on a malformed row and are pinned separately
-    // below.
-    let probes = ["select(.) | 1", ". and true", "not", "(.a? // 1) | 1"];
+    // own comment -- and they are pinned separately below.
+    //
+    // `1+1` leads, as the reads-nothing reference every truthiness reader
+    // must agree with. It belongs here rather than in `closed_probes`
+    // precisely because it is *not* a truthiness reader: if a validating
+    // walk ever came back to one of the three that follow, it would show up
+    // as a disagreement with this row rather than as a uniform failure.
+    //
+    // (An earlier draft of this test used `1==1` here and carried a comment
+    // claiming yq-mode `1+1` still validated the document. That was measured
+    // on a pre-rebase binary: #2173 narrowed the wildcard bridge's own
+    // materialization to operands that read the ambient value, so `1+1`
+    // answers `2` at exit 0 in yq mode too -- on every row of this corpus,
+    // re-verified against the shipped build.)
+    let probes = [
+        "1+1",
+        "select(.) | 1",
+        ". and true",
+        "not",
+        "(.a? // 1) | 1",
+    ];
     let closed_probes = [
         ("true and true", "true"),
         ("false or true", "true"),
@@ -39965,7 +39982,7 @@ fn test_truthiness_probes_validate_nothing_2692() -> Result<()> {
             assert_eq!(
                 (code, first),
                 (ref_code, ref_first),
-                "[{label}] `{probe}` disagrees with the reads-nothing reference `1==1`"
+                "[{label}] `{probe}` disagrees with the reads-nothing reference `1+1`"
             );
         }
         // #2173: a closed term answers exactly as `empty` does -- the
