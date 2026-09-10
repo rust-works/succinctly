@@ -42912,6 +42912,77 @@ fn test_only_jq_defined_navigators_raise_inside_path_2646() -> Result<()> {
     Ok(())
 }
 
+/// #2646: **every** entry in `builtin_navigation`'s table, not just the
+/// three the issue named. The two that a first draft got wrong (`join($x)`
+/// and `flatten($x)`, whose `$`-parameter runs before the iteration) had no
+/// assertion anywhere, which is exactly how they shipped wrong -- so this
+/// covers the whole table rather than a sample of it. Captured live from
+/// jq 1.7.1.
+#[test]
+fn test_every_navigating_builtin_table_entry_raises_2646() -> Result<()> {
+    for (builtin, element) in [
+        ("first", "element 0 of [1]"),
+        ("last", "element -1 of [1]"),
+        ("add", "iterate through [1]"),
+        ("any", "iterate through [1]"),
+        ("any(true)", "iterate through [1]"),
+        ("all", "iterate through [1]"),
+        ("all(true)", "iterate through [1]"),
+        ("flatten", "iterate through [1]"),
+        ("map(.)", "iterate through [1]"),
+        ("from_entries", "iterate through [1]"),
+        ("walk(.)", "iterate through [1]"),
+    ] {
+        let filter = format!("[path(([1] | {builtin}) | empty)]");
+        let (stdout, stderr, code) = run_jq_full(&["-c", &filter], Some(r#"{"a":1}"#))?;
+        assert_ne!(code, 0, "{filter}: stdout {stdout:?}");
+        assert!(stderr.contains(element), "{filter}: {stderr:?}");
+    }
+    Ok(())
+}
+
+/// #2646: `join($x)` and `flatten($x)` are **out** of the table, because
+/// jq's `def join($x)`/`def flatten($x)` desugar to `x as $x | ...` -- the
+/// argument is evaluated, and for `flatten` range-checked, *before* any
+/// iteration. Answering "iterate" for them pre-empts jq's own error, which
+/// a first draft of #2646 did. Bare `flatten` stays in the table: it is
+/// `_flatten(-1)`, whose argument is jq's own literal and cannot raise.
+/// Captured live from jq 1.7.1.
+#[test]
+fn test_dollar_param_builtins_keep_their_own_error_2646() -> Result<()> {
+    // The argument's error wins, not a path error.
+    for filter in [
+        r#"[path(([1] | join(error("boom"))) | empty)]"#,
+        r#"[path(([1] | flatten(error("boom"))) | empty)]"#,
+        r#"del(([1] | join(error("boom"))) | empty)"#,
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":1}"#))?;
+        assert_ne!(code, 0, "{filter}: stdout {stdout:?}");
+        assert!(stderr.contains("boom"), "{filter}: {stderr:?}");
+        assert!(
+            !stderr.contains("Invalid path expression"),
+            "{filter}: the argument's own error must win: {stderr:?}"
+        );
+    }
+
+    // `flatten`'s negative-depth guard likewise wins. (Its wording still
+    // differs from jq's -- #2747 -- so this asserts the class, not the text.)
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "[path(([1] | flatten(-1)) | empty)]"], Some("{}"))?;
+    assert_ne!(code, 0, "stdout {stdout:?}");
+    assert!(
+        !stderr.contains("Invalid path expression"),
+        "the depth guard must win: {stderr:?}"
+    );
+
+    // Bare `flatten` is still in the table.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-c", "[path(([1] | flatten) | empty)]"], Some("{}"))?;
+    assert_ne!(code, 0, "stdout {stdout:?}");
+    assert!(stderr.contains("iterate through [1]"), "{stderr:?}");
+    Ok(())
+}
+
 /// #2646: the raise is independent of the input's type for every entry but
 /// `walk` -- `first` on a scalar still reports `element 0 of 5`, matching
 /// jq, rather than being skipped as "not a container". `walk` is the one
