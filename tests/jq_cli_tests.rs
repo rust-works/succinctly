@@ -25786,37 +25786,167 @@ fn test_jq_keys_unsorted_positive_index_trailing_comma_remains_a_known_gap_2261(
     Ok(())
 }
 
-/// #2261: the #2211 sibling shape -- a stray `,` with *zero* real
-/// elements/fields (`[,]`, `{,}`) -- remains unreachable through the same
-/// fast paths above, for the same reason #2211's own `container_gap_ok`
-/// stays unreachable through `to_owned_at_depth`'s cursor-less callers
-/// (#2262's own documented residual): none of these paths ever receive a
-/// cursor to the *container itself*, only to its children -- and an
-/// apparently-empty container has none. `.a`/`.[0]` are excluded here: both
-/// still raise, but for an unrelated reason (indexing an array with a
-/// string key / an object with a number), not the delimiter check this
-/// test is about.
+/// #2594 (was #2261's documented residual): the #2211 sibling shape -- a
+/// stray `,` with *zero* real elements/fields (`[,]`, `{,}`) -- now raises
+/// through these fast paths too.
+///
+/// The residual this replaces rested on a premise that was true of the
+/// *walks* and false of the code around them: "none of these paths ever
+/// receive a cursor to the container itself, only to its children". The
+/// walks (`census`, `effective_keys`, `contains_checked`, `len_checked`,
+/// `collect_cursors_checked`, `find_cursor`, `LazySource::Elements`) really
+/// do take children alone -- but each is *dispatched* from an `eval_single`/
+/// `eval_builtin` arm that already holds `cursor: Option<V::Cursor>` for the
+/// container, for type-name diagnostics.
+/// `empty_fields_tail_gap_ok`/`empty_elements_tail_gap_ok` check there, at
+/// the arm, ahead of the walk that cannot.
+///
+/// Exit 5 with #2211's own strict-validator message, byte-identical to what
+/// `.` on the same document already produced -- the raise routes through
+/// `container_tail_gap_ok`, whose JSON `malformed_delimiter_error()` re-runs
+/// the validator over the whole document rather than inventing a second
+/// spelling. `.a?` is included deliberately: the raise carries #2286's
+/// always-uncatchable tag, so `?` does not suppress it, matching real jq --
+/// which cannot parse the document for *any* filter, optional or not.
 #[test]
-fn test_jq_cursor_transparent_fast_paths_empty_container_stray_comma_remains_a_known_gap_2261(
-) -> Result<()> {
+fn test_jq_cursor_transparent_fast_paths_empty_container_stray_comma_now_raises_2594() -> Result<()>
+{
+    for (input, query) in [
+        ("[,]", ".[]"),
+        ("[,]", "length"),
+        ("[,]", ".[0]"),
+        ("[,]", ".a?"),
+        ("[,]", "first"),
+        ("[,]", "last"),
+        ("[,]", "min"),
+        ("[,]", "sort"),
+        ("[,]", "reverse"),
+        ("[,]", "unique"),
+        ("[,]", "map(.)"),
+        ("[,]", "to_entries"),
+        ("[,]", "has(0)"),
+        ("[,]", "paths"),
+        ("[,]", "getpath([0])"),
+        ("{,}", "keys"),
+        ("{,}", "keys_unsorted"),
+        ("{,}", "to_entries"),
+        ("{,}", ".a"),
+        ("{,}", ".a?"),
+        ("{,}", "length"),
+        ("{,}", r#"has("a")"#),
+        ("{,}", ".[]"),
+        ("{,}", "map(.)"),
+        ("{,}", "paths"),
+        ("{,}", r#"getpath(["a"])"#),
+    ] {
+        let (out, stderr, code) = run_jq_full(&["-c", query], Some(input))?;
+        assert_eq!(
+            code, 5,
+            "input={input} query={query}: expected the #2211 raise, got out={out:?}"
+        );
+        assert!(
+            stderr.contains("Invalid JSON text"),
+            "input={input} query={query}: stderr {stderr:?} is not the strict-validator message"
+        );
+        assert!(
+            out.trim().is_empty(),
+            "input={input} query={query}: unexpected output {out:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// #2594: that raise fires on a *malformed* container only -- a genuinely
+/// empty one (`{}`/`[]`, with or without whitespace, nested or not) is
+/// untouched on every one of the same filters.
+///
+/// This is the half a "reject whenever the walk found no child" fix would
+/// have got wrong, and it is why the check is
+/// `DocumentCursor::container_gap_ok` (scan from the container's own opening
+/// bracket to its close) rather than an emptiness test.
+#[test]
+fn test_jq_genuinely_empty_containers_unaffected_2594() -> Result<()> {
     for (input, query, expected) in [
-        ("[,]", ".[]", ""),
-        ("[,]", "length", "0"),
-        ("{,}", "keys", "[]"),
-        ("{,}", "keys_unsorted", "[]"),
-        ("{,}", "to_entries", "[]"),
-        ("{,}", ".a", "null"),
+        ("[]", ".[]", ""),
+        ("[]", "length", "0"),
+        ("[]", ".[0]", "null"),
+        ("[]", "first", "null"),
+        ("[]", "last", "null"),
+        ("[]", "sort", "[]"),
+        ("[]", "unique", "[]"),
+        ("[]", "map(.)", "[]"),
+        ("[]", "to_entries", "[]"),
+        ("[]", "paths", ""),
+        ("[ ]", "length", "0"),
+        ("[\n\t]", "length", "0"),
+        ("{}", "keys", "[]"),
+        ("{}", "keys_unsorted", "[]"),
+        ("{}", "to_entries", "[]"),
+        ("{}", ".a", "null"),
+        ("{}", "length", "0"),
+        ("{}", r#"has("a")"#, "false"),
+        ("{}", ".[]", ""),
+        ("{}", "paths", ""),
+        ("{ }", "length", "0"),
+        ("{\n\t}", "length", "0"),
+        (r#"{"a":{}}"#, ".a|length", "0"),
+        (r#"{"a":[]}"#, ".a|length", "0"),
+        ("[[],{}]", "length", "2"),
     ] {
         let (out, stderr, code) = run_jq_full(&["-c", query], Some(input))?;
         assert_eq!(
             code, 0,
-            "input={input} query={query}: known gap, expected exit 0: stderr: {stderr:?}"
+            "input={input} query={query}: a genuine empty container must not raise: {stderr:?}"
         );
         assert_eq!(
             out.trim(),
             expected,
-            "input={input} query={query}: known gap"
+            "input={input} query={query}: unexpected output"
         );
+    }
+
+    Ok(())
+}
+
+/// #2594: a closed term still answers exactly as `empty` does on a `{,}`/
+/// `[,]` document -- #2173's rule, and the reason the new check sits in the
+/// arms that walk a container rather than at the top of `eval_single`/
+/// `eval_builtin`.
+///
+/// A guard hoisted to either dispatch function passes every row of the
+/// raise test above and fails this one (measured while writing the fix:
+/// `empty` on `[,]` went from exit 0 to exit 5).
+/// `test_ambient_validation_agrees_with_bridge_2476` pins the same rule
+/// across its own corpus; this states it for the two documents this issue
+/// is about.
+#[test]
+fn test_jq_closed_terms_unaffected_by_empty_container_check_2594() -> Result<()> {
+    for input in ["[,]", "{,}"] {
+        let (_, _, empty_code) = run_jq_full(&["-c", "empty"], Some(input))?;
+        assert_eq!(
+            empty_code, 0,
+            "input={input}: `empty` reads nothing, so it must not raise"
+        );
+        for (query, expected) in [
+            ("true and true", "true"),
+            ("false or true", "true"),
+            ("false // 1", "1"),
+            ("1 + 1", "2"),
+            ("0 - 0", "0"),
+            ("(-(1))", "-1"),
+        ] {
+            let (out, stderr, code) = run_jq_full(&["-c", query], Some(input))?;
+            assert_eq!(
+                code, empty_code,
+                "input={input} query={query}: a closed term must answer as `empty` does: {stderr:?}"
+            );
+            assert_eq!(
+                out.trim(),
+                expected,
+                "input={input} query={query}: unexpected output"
+            );
+        }
     }
 
     Ok(())
