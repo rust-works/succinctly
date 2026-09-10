@@ -26,6 +26,30 @@ fn generate_simple_kv(pairs: usize) -> Vec<u8> {
     yaml
 }
 
+/// Generate a mapping carrying YAML comments (#798).
+///
+/// Every `ratio`-th entry is preceded by a standalone comment line when
+/// `standalone`, or carries a trailing one when not. Until this existed the
+/// whole `yaml_bench` corpus held no YAML comment at all -- every `#` in
+/// this file was a Rust doc comment -- so the parser's comment capture was
+/// structurally invisible to it, and an A/B of that code measured only
+/// noise. A benchmark cannot measure a shape it does not generate.
+fn generate_commented(pairs: usize, ratio: usize, standalone: bool) -> Vec<u8> {
+    let mut yaml = Vec::with_capacity(pairs * 32);
+    for i in 0..pairs {
+        let commented = ratio != 0 && i % ratio == 0;
+        if commented && standalone {
+            yaml.extend_from_slice(b"# a standalone comment line\n");
+        }
+        if commented && !standalone {
+            yaml.extend_from_slice(format!("key{i}: value{i} # a trailing comment\n").as_bytes());
+        } else {
+            yaml.extend_from_slice(format!("key{i}: value{i}\n").as_bytes());
+        }
+    }
+    yaml
+}
+
 /// Generate nested mapping structure.
 /// Creates a tree with specified depth and width at each level.
 fn generate_nested(depth: usize, width: usize) -> Vec<u8> {
@@ -517,6 +541,33 @@ fn bench_crlf(c: &mut Criterion) {
     group.finish();
 }
 
+/// Comment capture cost (#798): standalone `#` lines land in each node's
+/// `head`/`foot`, trailing ones in its `line`. `every_4th`/`every_2nd` bound
+/// how much a comment-dense document pays; `none` is the control, and must
+/// stay level with `yaml/simple_kv/1000`.
+fn bench_comments(c: &mut Criterion) {
+    let mut group = c.benchmark_group("yaml/comments");
+
+    for &(label, ratio, standalone) in &[
+        ("none", 0usize, true),
+        ("standalone_every_4th", 4, true),
+        ("standalone_every_2nd", 2, true),
+        ("trailing_every_4th", 4, false),
+        ("trailing_every_2nd", 2, false),
+    ] {
+        let yaml = generate_commented(1000, ratio, standalone);
+        group.throughput(Throughput::Bytes(yaml.len() as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(label), &yaml, |b, yaml| {
+            b.iter(|| {
+                let index = YamlIndex::build(black_box(yaml)).unwrap();
+                black_box(index)
+            });
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_simple_kv,
@@ -529,5 +580,6 @@ criterion_group!(
     bench_anchors,
     bench_prose_scalars,
     bench_crlf,
+    bench_comments,
 );
 criterion_main!(benches);

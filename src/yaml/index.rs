@@ -73,8 +73,7 @@ pub struct YamlIndex<W = Vec<u64>> {
     /// anchor, so this is a single side table, not three (#224).
     tags: BTreeMap<usize, String>,
     /// Head/line/foot comments, keyed by the BP position of the owning node.
-    /// See [`NodeComments`] -- only `line` (issue #710) is captured today;
-    /// `head`/`foot` are always empty (#798 PR2).
+    /// See [`NodeComments`].
     comments: BTreeMap<usize, NodeComments>,
     /// Line starts for line/column lookup (built lazily on first use).
     /// Only needed by `to_line_column()` and `to_offset()` (used by the
@@ -541,17 +540,20 @@ impl<W: AsRef<[u64]>> YamlIndex<W> {
         self.comments.get(&bp_pos).and_then(|c| c.line)
     }
 
-    /// Get the standalone `#` comment lines directly above a BP position
-    /// (#798 PR2). Always empty today -- capturing these is separate,
-    /// follow-up work; this getter exists only so that work has a stable
-    /// place to read from.
+    /// Get the standalone `#` comment lines directly above a BP position:
+    /// its *head* comment (#798), one entry per line in source order.
+    ///
+    /// Ranges are raw, `#` included, like [`Self::get_line_comment`] --
+    /// the caller strips a leading `"# "` at the point of use. A mapping
+    /// entry's head lives on its *key* node; a sequence item's on the
+    /// item's content node.
     #[inline]
     pub fn get_head_comments(&self, bp_pos: usize) -> &[(u32, u32)] {
         self.comments.get(&bp_pos).map_or(&[], |c| &c.head)
     }
 
-    /// Get the standalone `#` comment lines directly below a BP position
-    /// (#798 PR2). Always empty today -- see [`Self::get_head_comments`].
+    /// Get the standalone `#` comment lines directly below a BP position:
+    /// its *foot* comment (#798). See [`Self::get_head_comments`].
     #[inline]
     pub fn get_foot_comments(&self, bp_pos: usize) -> &[(u32, u32)] {
         self.comments.get(&bp_pos).map_or(&[], |c| &c.foot)
@@ -1065,12 +1067,13 @@ mod tests {
     }
 
     #[test]
-    fn test_head_and_foot_comments_always_empty_798() {
-        // head/foot comment capture is deliberately unimplemented today
-        // (#798 PR2) -- these getters exist only so that follow-up work has
-        // a stable place to read from. Exercise both the "position has
-        // other comment metadata" (`Some(NodeComments)`) and "position has
-        // none at all" (`None`) paths through the `map_or` default.
+    fn test_head_and_foot_comments_empty_without_standalone_lines_798() {
+        // Standalone comment lines are captured now (see the attachment
+        // tests below), but a document with none must leave both slots
+        // empty -- and a *trailing* comment must land in `line` only, never
+        // in head/foot. Exercises both the "position has other comment
+        // metadata" (`Some(NodeComments)`) and "position has none at all"
+        // (`None`) paths through the getters' `map_or` default.
         let yaml = b"a: 1 # keep this\nb: 2\n";
         let index = YamlIndex::build(yaml).expect("valid YAML");
         let root = index.root(yaml);
@@ -1153,6 +1156,315 @@ mod tests {
             }
         }
         None
+    }
+
+    /// Helpers for the standalone head/foot comment capture (#798). Each
+    /// returns the raw `#...` text of every captured line, in source order.
+    ///
+    /// White-box on purpose: nothing exposes `head`/`foot` to a query yet
+    /// (that is the follow-up PR's job), so the index getters are the only
+    /// surface where the capture can be pinned. Every expectation in the
+    /// tests below was captured from pinned `yq` v4.53.3 first.
+    fn raw_lines(yaml: &[u8], ranges: &[(u32, u32)]) -> Vec<String> {
+        ranges
+            .iter()
+            .map(|&(s, e)| String::from_utf8_lossy(&yaml[s as usize..e as usize]).into_owned())
+            .collect()
+    }
+
+    /// `head`/`foot` of a top-level mapping entry's *key* node.
+    fn field_key_head_foot(yaml: &[u8], key: &str) -> (Vec<String>, Vec<String>) {
+        use crate::yaml::light::YamlValue;
+
+        let index = YamlIndex::build(yaml).expect("valid YAML");
+        let root = index.root(yaml);
+        let YamlValue::Sequence(docs) = root.value() else {
+            panic!("root is always the virtual document sequence");
+        };
+        let (doc_cursor, _) = docs.uncons_cursor().expect("at least one document");
+        let YamlValue::Mapping(fields) = doc_cursor.value() else {
+            panic!("expected a mapping document");
+        };
+        for field in fields {
+            if let YamlValue::String(k) = field.key() {
+                if k.raw_bytes() == key.as_bytes() {
+                    let bp = field.key_cursor().bp_position();
+                    return (
+                        raw_lines(yaml, index.get_head_comments(bp)),
+                        raw_lines(yaml, index.get_foot_comments(bp)),
+                    );
+                }
+            }
+        }
+        panic!("key {key} not found");
+    }
+
+    /// `head`/`foot` of a top-level sequence item's *content* node.
+    fn seq_item_head_foot(yaml: &[u8], idx: usize) -> (Vec<String>, Vec<String>) {
+        use crate::yaml::light::YamlValue;
+
+        let index = YamlIndex::build(yaml).expect("valid YAML");
+        let root = index.root(yaml);
+        let YamlValue::Sequence(docs) = root.value() else {
+            panic!("root is always the virtual document sequence");
+        };
+        let (doc_cursor, _) = docs.uncons_cursor().expect("at least one document");
+        let YamlValue::Sequence(items) = doc_cursor.value() else {
+            panic!("expected a sequence document");
+        };
+        let mut rest = items;
+        for _ in 0..idx {
+            let (_, tail) = rest.uncons_cursor().expect("index in range");
+            rest = tail;
+        }
+        let (item, _) = rest.uncons_cursor().expect("index in range");
+        let bp = item.bp_position();
+        (
+            raw_lines(yaml, index.get_head_comments(bp)),
+            raw_lines(yaml, index.get_foot_comments(bp)),
+        )
+    }
+
+    /// `head`/`foot` of the document's own content node — what real yq
+    /// answers `. | head_comment` / `. | foot_comment` from.
+    fn doc_head_foot(yaml: &[u8]) -> (Vec<String>, Vec<String>) {
+        use crate::yaml::light::YamlValue;
+
+        let index = YamlIndex::build(yaml).expect("valid YAML");
+        let root = index.root(yaml);
+        let YamlValue::Sequence(docs) = root.value() else {
+            panic!("root is always the virtual document sequence");
+        };
+        let (doc_cursor, _) = docs.uncons_cursor().expect("at least one document");
+        let bp = doc_cursor.bp_position();
+        (
+            raw_lines(yaml, index.get_head_comments(bp)),
+            raw_lines(yaml, index.get_foot_comments(bp)),
+        )
+    }
+
+    /// `head`/`foot` of a nested mapping entry's key, reached as
+    /// `outer.inner` — the `.a.b | key | head_comment` shape.
+    fn nested_key_head_foot(yaml: &[u8], outer: &str, inner: &str) -> (Vec<String>, Vec<String>) {
+        use crate::yaml::light::YamlValue;
+
+        let index = YamlIndex::build(yaml).expect("valid YAML");
+        let root = index.root(yaml);
+        let YamlValue::Sequence(docs) = root.value() else {
+            panic!("root is always the virtual document sequence");
+        };
+        let (doc_cursor, _) = docs.uncons_cursor().expect("at least one document");
+        let YamlValue::Mapping(fields) = doc_cursor.value() else {
+            panic!("expected a mapping document");
+        };
+        for field in fields {
+            let YamlValue::String(k) = field.key() else {
+                continue;
+            };
+            if k.raw_bytes() != outer.as_bytes() {
+                continue;
+            }
+            let YamlValue::Mapping(inner_fields) = field.value() else {
+                panic!("expected a nested mapping under {outer}");
+            };
+            for inner_field in inner_fields {
+                if let YamlValue::String(ik) = inner_field.key() {
+                    if ik.raw_bytes() == inner.as_bytes() {
+                        let bp = inner_field.key_cursor().bp_position();
+                        return (
+                            raw_lines(yaml, index.get_head_comments(bp)),
+                            raw_lines(yaml, index.get_foot_comments(bp)),
+                        );
+                    }
+                }
+            }
+        }
+        panic!("nested key {outer}.{inner} not found");
+    }
+
+    /// `head`/`foot` of the virtual root sequence itself — where a
+    /// comment-only document's block lands, since such a document opens no
+    /// content node of its own.
+    fn virtual_root_head_foot(yaml: &[u8]) -> (Vec<String>, Vec<String>) {
+        let index = YamlIndex::build(yaml).expect("valid YAML");
+        let bp = index.root(yaml).bp_position();
+        (
+            raw_lines(yaml, index.get_head_comments(bp)),
+            raw_lines(yaml, index.get_foot_comments(bp)),
+        )
+    }
+
+    /// A block sticks to whatever it is *not* separated from by a blank
+    /// line, preferring forward. Every expectation here was captured from
+    /// pinned `yq` v4.53.3 before being written down; the triage note that
+    /// described this rule stated it backwards, which is why each row cites
+    /// the getter it was measured through.
+    #[test]
+    fn standalone_comment_attaches_forward_to_the_next_key_798() {
+        // `.b | key | head_comment` == "mid"; `.a | key | foot_comment` empty.
+        let (head, foot) = field_key_head_foot(b"a: 1\n# mid\nb: 2\n", "b");
+        assert_eq!(head, ["# mid"]);
+        assert!(foot.is_empty());
+        let (_, a_foot) = field_key_head_foot(b"a: 1\n# mid\nb: 2\n", "a");
+        assert!(a_foot.is_empty(), "{a_foot:?}");
+    }
+
+    #[test]
+    fn a_blank_line_before_a_block_still_attaches_it_forward_798() {
+        // Measured: `.b | key | head_comment` == "mid" (NOT `.a`'s foot).
+        let (head, _) = field_key_head_foot(b"a: 1\n\n# mid\nb: 2\n", "b");
+        assert_eq!(head, ["# mid"]);
+    }
+
+    #[test]
+    fn a_blank_line_after_a_block_attaches_it_back_to_the_previous_key_798() {
+        // Measured: `.a | key | foot_comment` == "mid" (NOT `.b`'s head).
+        let yaml = b"a: 1\n# mid\n\nb: 2\n";
+        let (_, a_foot) = field_key_head_foot(yaml, "a");
+        assert_eq!(a_foot, ["# mid"]);
+        let (b_head, _) = field_key_head_foot(yaml, "b");
+        assert!(b_head.is_empty(), "{b_head:?}");
+    }
+
+    #[test]
+    fn blank_lines_on_both_sides_still_attach_forward_798() {
+        let yaml = b"a: 1\n\n# mid\n\nb: 2\n";
+        let (b_head, _) = field_key_head_foot(yaml, "b");
+        assert_eq!(b_head, ["# mid"]);
+        let (_, a_foot) = field_key_head_foot(yaml, "a");
+        assert!(a_foot.is_empty(), "{a_foot:?}");
+    }
+
+    #[test]
+    fn a_blank_line_splits_one_run_into_two_independently_attached_blocks_798() {
+        // Measured: `m1` -> `.a`'s foot, `m2` -> `.b`'s head.
+        let yaml = b"a: 1\n# m1\n\n# m2\nb: 2\n";
+        let (_, a_foot) = field_key_head_foot(yaml, "a");
+        assert_eq!(a_foot, ["# m1"]);
+        let (b_head, _) = field_key_head_foot(yaml, "b");
+        assert_eq!(b_head, ["# m2"]);
+    }
+
+    #[test]
+    fn consecutive_comment_lines_form_one_block_798() {
+        let (head, _) = field_key_head_foot(b"a: 1\n# m1\n# m2\nb: 2\n", "b");
+        assert_eq!(head, ["# m1", "# m2"]);
+    }
+
+    #[test]
+    fn a_trailing_block_at_eof_attaches_back_to_the_last_key_798() {
+        let (_, foot) = field_key_head_foot(b"a: 1\nb: 2\n# trail\n", "b");
+        assert_eq!(foot, ["# trail"]);
+    }
+
+    #[test]
+    fn a_trailing_block_detached_by_a_blank_becomes_the_document_foot_798() {
+        // Measured: `. | foot_comment` == "trail", `.b | key | foot_comment` empty.
+        let yaml = b"a: 1\nb: 2\n\n# trail\n";
+        let (_, doc_foot) = doc_head_foot(yaml);
+        assert_eq!(doc_foot, ["# trail"]);
+        let (_, b_foot) = field_key_head_foot(yaml, "b");
+        assert!(b_foot.is_empty(), "{b_foot:?}");
+    }
+
+    #[test]
+    fn a_leading_block_attaches_to_the_document_not_its_first_key_798() {
+        // Measured: `. | head_comment` == "lead"; `.a | key | head_comment` empty.
+        let yaml = b"# lead\na: 1\n";
+        let (doc_head, _) = doc_head_foot(yaml);
+        assert_eq!(doc_head, ["# lead"]);
+        let (a_head, _) = field_key_head_foot(yaml, "a");
+        assert!(a_head.is_empty(), "{a_head:?}");
+
+        // Multi-line, and still the document's even with a blank after it.
+        let (doc_head, _) = doc_head_foot(b"# l1\n# l2\na: 1\n");
+        assert_eq!(doc_head, ["# l1", "# l2"]);
+        let (doc_head, _) = doc_head_foot(b"# lead\n\na: 1\n");
+        assert_eq!(doc_head, ["# lead"]);
+    }
+
+    #[test]
+    fn sequence_items_own_head_and_foot_directly_no_key_step_798() {
+        // Measured: `.[1] | head_comment`, `.[0] | foot_comment`, `.[1] | foot_comment`.
+        let (head, _) = seq_item_head_foot(b"- 1\n# mid\n- 2\n", 1);
+        assert_eq!(head, ["# mid"]);
+        let (_, foot) = seq_item_head_foot(b"- 1\n# mid\n\n- 2\n", 0);
+        assert_eq!(foot, ["# mid"]);
+        let (_, foot) = seq_item_head_foot(b"- 1\n- 2\n# trail\n", 1);
+        assert_eq!(foot, ["# trail"]);
+        // A leading block still belongs to the document, not to item 0.
+        let yaml = b"# lead\n- 1\n- 2\n";
+        let (doc_head, _) = doc_head_foot(yaml);
+        assert_eq!(doc_head, ["# lead"]);
+        let (item_head, _) = seq_item_head_foot(yaml, 0);
+        assert!(item_head.is_empty(), "{item_head:?}");
+    }
+
+    #[test]
+    fn nested_blocks_attach_to_the_nested_key_not_its_container_798() {
+        // Measured: `.a.b | key | head_comment` == "inner"; `.a | head_comment` empty.
+        let (head, _) = nested_key_head_foot(b"a:\n  # inner\n  b: 1\nc: 2\n", "a", "b");
+        assert_eq!(head, ["# inner"]);
+        // At EOF inside the nested block it becomes the deepest key's foot.
+        let (_, foot) = nested_key_head_foot(b"a:\n  b: 1\n  # tail\n", "a", "b");
+        assert_eq!(foot, ["# tail"]);
+    }
+
+    #[test]
+    fn indentation_does_not_affect_attachment_798() {
+        // A comment indented deeper or shallower than the following key
+        // still attaches to it -- measured, indentation is irrelevant.
+        let (head, _) = field_key_head_foot(b"a: 1\n      # deep\nb: 2\n", "b");
+        assert_eq!(head, ["# deep"]);
+        let (head, _) = field_key_head_foot(b"a:\n  b: 1\n# after\nc: 2\n", "c");
+        assert_eq!(head, ["# after"]);
+        let (head, _) = field_key_head_foot(b"a:\n  b: 1\n\n# after\nc: 2\n", "c");
+        assert_eq!(head, ["# after"]);
+    }
+
+    #[test]
+    fn a_hash_inside_a_scalar_is_content_never_a_comment_798() {
+        // Block scalar content and quoted scalars must capture nothing --
+        // measured, real yq reports no head comment for either.
+        let (head, _) = field_key_head_foot(b"a: |\n  # not a comment\n  real\nb: 2\n", "b");
+        assert!(head.is_empty(), "{head:?}");
+        let (head, _) = field_key_head_foot(b"a: \"# not a comment\"\nb: 2\n", "b");
+        assert!(head.is_empty(), "{head:?}");
+    }
+
+    #[test]
+    fn a_trailing_comment_is_never_recorded_as_standalone_798() {
+        // The `line` slot still owns it, and `head`/`foot` stay empty --
+        // the regression this whole PR must not cause.
+        let yaml = b"a: 1 # trailing\nb: 2\n";
+        let (head, foot) = field_key_head_foot(yaml, "a");
+        assert!(head.is_empty() && foot.is_empty(), "{head:?} {foot:?}");
+        let (head, foot) = field_key_head_foot(yaml, "b");
+        assert!(head.is_empty() && foot.is_empty(), "{head:?} {foot:?}");
+        assert_eq!(
+            field_line_comment_raw(yaml, "a").as_deref(),
+            Some("# trailing")
+        );
+    }
+
+    #[test]
+    fn the_raw_range_keeps_the_hash_and_any_odd_spacing_798() {
+        // `# ` (hash *space*) is stripped at read time, so a tab-separated
+        // or bare `#` must survive verbatim in the stored range -- measured,
+        // real yq returns `#\ttabbed   ` and `#` unchanged.
+        let (head, _) = field_key_head_foot(b"a: 1\n#\ttabbed   \nb: 2\n", "b");
+        assert_eq!(head, ["#\ttabbed   "]);
+        let (head, _) = field_key_head_foot(b"a: 1\n#\nb: 2\n", "b");
+        assert_eq!(head, ["#"]);
+    }
+
+    #[test]
+    fn a_comment_only_document_keeps_its_block_as_a_head_798() {
+        // Measured: `. | head_comment` == "only", foot empty. succinctly has
+        // no document content node here, so it lands on the virtual root.
+        let (head, foot) = virtual_root_head_foot(b"# only\n");
+        assert_eq!(head, ["# only"]);
+        assert!(foot.is_empty(), "{foot:?}");
     }
 
     #[test]
