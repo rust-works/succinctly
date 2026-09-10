@@ -20840,17 +20840,25 @@ fn test_partial_result_over_depth_value_reports_cleanly_not_panic_1371() -> Resu
 /// reach `eval_generic.rs`'s `assert_nesting_depth` `panic!` on a >256-deep
 /// *document* (not a constructed value, unlike #1371's `test_partial_result_
 /// over_depth_value_reports_cleanly_not_panic_1371` above) for an expression
-/// that never reads `.` at all, e.g. `true and true` (`and`/`or` have no
-/// native path-context arm, so an ungated pair falls to the bridge purely to
-/// surface a document-level fault, per `eval_boolean_generic`'s own comment).
-/// Already shielded at the CLI boundary by `catch_unwind` (#1793) before this
-/// fix -- confirmed via `!stderr.contains("panicked")` below, so this pins
-/// the *absence* of a regression there while the real fix (`eval_generic.rs`'s
-/// depth guard no longer panics at all) is what protects a library embedder
-/// calling `succinctly::jq::eval` directly, which had no such net.
+/// that has no native path-context arm (`and`/`or` fall to the bridge purely
+/// to surface a document-level fault, per `eval_boolean_generic`'s own
+/// comment). `. and true`, not `true and true`: a fully closed term (no
+/// operand reads `.` at all) no longer reaches the bridge's materialization
+/// in the first place -- #2173's `walk::reads_ambient_value` gate (landed
+/// the same day as this fix) substitutes `null` for a closed term instead of
+/// the real document, so `true and true` on this same input now answers
+/// `true` at exit 0 rather than reaching this guard. `.` on the left keeps
+/// `needs_path_context` false (still no `key`/`parent`/`path` operand) while
+/// making the whole expression read the ambient value, which is what keeps
+/// the real (over-deep) document in the loop. Already shielded at the CLI
+/// boundary by `catch_unwind` (#1793) before this fix -- confirmed via
+/// `!stderr.contains("panicked")` below, so this pins the *absence* of a
+/// regression there while the real fix (`eval_generic.rs`'s depth guard no
+/// longer panics at all) is what protects a library embedder calling
+/// `succinctly::jq::eval` directly, which had no such net.
 #[test]
 fn test_boolean_wildcard_bridge_over_depth_document_reports_cleanly_not_panic_2627() -> Result<()> {
-    let (stdout, stderr, code) = run_jq_full(&["-c", "true and true"], Some(&nested_arrays(300)))?;
+    let (stdout, stderr, code) = run_jq_full(&["-c", ". and true"], Some(&nested_arrays(300)))?;
     assert_eq!(stdout.trim_end(), "");
     assert_eq!(code, 5, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(!stderr.contains("panicked"), "stderr: {stderr:?}");
@@ -20861,11 +20869,12 @@ fn test_boolean_wildcard_bridge_over_depth_document_reports_cleanly_not_panic_26
     Ok(())
 }
 
-/// Companion to the test above: `true and true` on a document well under
-/// the limit must still evaluate normally through the same bridge.
+/// Companion to the test above: `. and true` on a document well under
+/// the limit must still evaluate normally through the same bridge -- `.`
+/// is a non-empty array either way, so this is `true` regardless of depth.
 #[test]
 fn test_boolean_wildcard_bridge_accepts_depth_under_limit_2627() -> Result<()> {
-    let (stdout, stderr, code) = run_jq_full(&["-c", "true and true"], Some(&nested_arrays(100)))?;
+    let (stdout, stderr, code) = run_jq_full(&["-c", ". and true"], Some(&nested_arrays(100)))?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout.trim_end(), "true");
     Ok(())

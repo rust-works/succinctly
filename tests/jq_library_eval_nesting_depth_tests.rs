@@ -1,10 +1,10 @@
 //! #2627: a library embedder calling `succinctly::jq::eval` directly (no
 //! CLI, no `catch_unwind`) must never see a raw panic on a >256-deep
-//! document, even for a filter that reads no path context at all.
+//! document, even for a filter whose own operand doesn't need path context.
 //!
 //! `eval::eval`'s own top-level gate (`needs_path_context`) routes a whole
 //! expression through `eval_generic` only when *some* part of it needs path
-//! context (`key`/`parent`/`path`/...). A bare `true and true`/`1+1` on its
+//! context (`key`/`parent`/`path`/...). A bare `. and true`/`. + 1` on its
 //! own therefore never reaches `eval_generic`'s internal materialization
 //! through the public API -- but a pipe that combines a path-context need
 //! with an otherwise-ungated sub-expression does, and once inside
@@ -15,6 +15,15 @@
 //! there by `catch_unwind`, #1793). This file confirms the same document
 //! and filter shape, reached through the *public* library entry point with
 //! no such net, returns a clean `Err` instead of aborting the process.
+//!
+//! `(. and true)`, not `(true and true)`: a fully closed sub-expression (no
+//! operand reads `.` at all) no longer reaches the bridge's materialization
+//! in the first place -- #2173's `walk::reads_ambient_value` gate (landed
+//! the same day as this fix) substitutes `null` for a closed term instead of
+//! the real document, so the guard below never sees it. `.` keeps the
+//! sub-expression's own `needs_path_context` false (still no `key`/`parent`/
+//! `path` operand) while making it read the ambient value, which is what
+//! keeps the real (over-deep) document in the loop.
 //!
 //! Confirmed live before the fix that this exact shape panicked with no
 //! `catch_unwind` to save it (the underlying `assert_nesting_depth` `panic!`
@@ -32,10 +41,11 @@ fn nested_arrays(depth: usize) -> String {
 
 /// `key?` forces `eval::eval`'s own gate to route the whole pipe through
 /// `eval_generic` (confirmed by `needs_path_context`'s `Expr::Builtin(Builtin
-/// ::Key) => true` arm); `(true and true)` has no path-context operand of
-/// its own, so once inside `eval_generic` it independently falls to the
-/// wildcard/ambient bridge this issue is about.
-const FILTER: &str = "key?, (true and true)";
+/// ::Key) => true` arm); `(. and true)` has no path-context operand of its
+/// own, so once inside `eval_generic` it independently falls to the
+/// wildcard/ambient bridge this issue is about, while still reading the
+/// ambient value (see the module doc comment above).
+const FILTER: &str = "key?, (. and true)";
 
 #[test]
 fn test_public_eval_over_depth_document_returns_error_not_panic_2627() {
