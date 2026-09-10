@@ -46050,3 +46050,91 @@ fn test_first_and_nth_over_inputs_keep_the_owned_bridge_2180() -> Result<()> {
 
     Ok(())
 }
+
+/// #2667: a postfix chain applied directly to an array or object *literal*
+/// (`[1,2][]`, `{a:1}.a`) was a parse error everywhere, top level included.
+///
+/// `parse_primary_inner` routed only the parenthesized form through
+/// `parse_postfix`, so `([1,2])[]` always worked and `[1,2][]` never did --
+/// valid jq programs rejected before evaluation, with no wrong output.
+/// A collection literal is a primary term in jq's own grammar, exactly like
+/// `(...)`, `$var` and a function call, all of which already accepted the
+/// suffix chain.
+///
+/// Every row captured live from jq 1.7.1. The last three are the shapes the
+/// issue did not list, found while probing it: an ordinary index, a
+/// string-key index, and a slice.
+///
+/// Real yq v4.53.3 accepts all of these too (checked live: `[1,2][]`,
+/// `{"a":1}.a`, `[1,2][0]`, `{"a":1}["a"]`), so both modes want the same
+/// answer and there is no ADR-0018 divergence to record.
+#[test]
+// Object-construction filters (`{a:1}.a`) read as format specs to clippy; same
+// allow `eval.rs`'s own jq-source test literals carry.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_postfix_applies_directly_to_a_collection_literal_2667() -> Result<()> {
+    for (filter, want) in [
+        ("[1,2][]", "1\n2"),
+        ("{a:1}.a", "1"),
+        ("[[1,2][]]", "[1,2]"),
+        ("first([1,2][])", "1"),
+        ("[limit(1; [1,2][])]", "[1]"),
+        ("def f(g): g; f([1,2][])", "1\n2"),
+        (r"[first({a:(1 as $x ?// $y | 1)}.a)]", "[1,1]"),
+        ("[1,2][0]", "1"),
+        (r#"{a:1}["a"]"#, "1"),
+        ("[1,2][0:1]", "[1]"),
+        ("[1,2][-1]", "2"),
+        ("{a:{b:2}}.a.b", "2"),
+        ("[[1],[2]][0][0]", "1"),
+        ("{a:1}.a?", "1"),
+        ("[1,2][]?", "1\n2"),
+        // Whitespace and a newline between the literal and its suffix bind
+        // the same way in jq.
+        ("[1,2] [0]", "1"),
+        ("{a:1} .a", "1"),
+        ("[1,2]\n[0]", "1"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-cn", filter], None)?;
+        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), want, "`{filter}`");
+    }
+
+    Ok(())
+}
+
+/// #2667: making a collection literal a postfix target must not swallow the
+/// `[`/`{` that opens a **destructuring pattern** after `as`, which is the
+/// one place the same two characters follow a term and mean something else.
+///
+/// `[1,2] as [$a,$b]` has to keep binding a pattern rather than parsing as
+/// `[1,2]` indexed by `[$a,$b]`. It does, because `as` sits between them --
+/// but that is exactly the kind of thing a postfix widening breaks silently,
+/// so it is pinned rather than assumed. All rows captured from jq 1.7.1.
+#[test]
+// Object-construction filters (`{a:1}.a`) read as format specs to clippy; same
+// allow `eval.rs`'s own jq-source test literals carry.
+#[allow(clippy::literal_string_with_formatting_args)]
+fn test_collection_literal_postfix_does_not_capture_destructuring_2667() -> Result<()> {
+    for (filter, want) in [
+        ("[1,2] as [$a,$b] | $a", "1"),
+        ("[1,2] as [$a,$b] | [$a,$b]", "[1,2]"),
+        ("{a:1} as {a:$x} | $x", "1"),
+        (". as [$a] | $a", "null"),
+        ("[[1,2]] | .[] as [$a,$b] | $b", "2"),
+        ("[{a:1}] | .[] as {a:$v} | $v", "1"),
+        ("[[1,2],[3,4]] | .[] as [$a,$b] | $a+$b", "3\n7"),
+        ("[1,2] as $x | $x", "[1,2]"),
+        ("{a:1} as $x | $x.a", "1"),
+        // The literal-with-postfix form as a `reduce`/`foreach` source.
+        ("reduce [1,2][] as $x (0; .+$x)", "3"),
+        ("foreach [1,2][] as $x (0; .+$x)", "1\n3"),
+        ("[1,2][] as $x | $x", "1\n2"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-cn", filter], None)?;
+        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), want, "`{filter}`");
+    }
+
+    Ok(())
+}

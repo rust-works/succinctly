@@ -446,15 +446,30 @@ fn test_owned_target_of_the_wrong_kind_errors() {
 }
 
 #[test]
-fn test_collection_literal_as_a_target_is_a_parse_error() {
-    // DIVERGENCE from jq 1.7.1, and independent of #360 — a constant key is
-    // rejected just the same. jq reads `[1,2,3][0]` as `1` and `{"a":1}["a"]`
-    // as `1`; here the postfix chain never attaches to a collection literal, so
-    // both are refused before evaluation. This is why every owned target above
-    // is spelled `getpath(...)`.
-    for src in ["[1,2,3][0]", r#"{"a":1}["a"]"#, "[1,2,3][(0,2)]"] {
-        assert!(parse(src).is_err(), "`{src}` unexpectedly parsed");
-    }
+fn test_collection_literal_as_a_target_2667() {
+    // Was a documented DIVERGENCE from jq 1.7.1: the postfix chain never
+    // attached to a collection literal, so `[1,2,3][0]` and `{"a":1}["a"]`
+    // were refused before evaluation. That is why every owned target above is
+    // spelled `getpath(...)` — those spellings still work and are left as
+    // they are, but they are no longer the only way to reach an owned target.
+    //
+    // #2667 made a collection literal a primary term in `parse_primary_inner`,
+    // like the parenthesized form it always worked through (`([1,2,3])[0]`).
+    // Every row below captured live from jq 1.7.1, including the multi-output
+    // and `nan` keys that exercise this file's own computed-key machinery.
+    check("null", "[1,2,3][0]", Outcome::values(&["1"]));
+    check("null", r#"{"a":1}["a"]"#, Outcome::values(&["1"]));
+    check("null", "[1,2,3][(0,2)]", Outcome::values(&["1", "3"]));
+    check("null", "[1,2,3][(nan,0)]", Outcome::values(&["null", "1"]));
+    check(
+        "null",
+        r#"{"a":1}[("a","b")]"#,
+        Outcome::values(&["1", "null"]),
+    );
+    check("null", "[1,2,3][0:2]", Outcome::values(&["[1,2]"]));
+    // The postfix forms this fix did *not* change still parse, and agree.
+    check("null", "([1,2,3])[0]", Outcome::values(&["1"]));
+    check("null", "[1,2,3] | .[0]", Outcome::values(&["1"]));
 }
 
 // =============================================================================
