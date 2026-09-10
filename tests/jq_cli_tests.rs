@@ -22107,6 +22107,90 @@ fn test_more_single_arg_builtins_wrong_arity_reports_not_defined_2389() -> Resul
     Ok(())
 }
 
+/// #2573: the last thirteen `try_parse_builtin` sites still carrying
+/// #2237's inline `self.expect('(')?`/`self.parse_expr()?`/
+/// `self.expect(')')?` shape, finishing the batch #2389 started. Each was
+/// individually oracle-verified before converting, per #2389's own caution
+/// that two earlier regressions came from sites that looked like simple
+/// copies but were not -- the survey is in #2573.
+///
+/// Every row below reported succinctly's own *parse* error (`parse error at
+/// position N`) rather than jq's `<name>/<arity> is not defined` before the
+/// conversion: 26 of 26 diverged. Five of these names (`omit`, `tz`,
+/// `load`, `at_offset`, and `bsearch` in yq mode) are succinctly or yq
+/// extensions rather than jq builtins, but jq still answers "not defined"
+/// for *every* arity of a name it does not have, so the expectation is the
+/// same and the oracle is still authoritative.
+#[test]
+fn test_remaining_single_arg_builtins_wrong_arity_reports_not_defined_2573() -> Result<()> {
+    for (filter, name) in [
+        ("bsearch", "bsearch/0"),
+        ("bsearch(1;2)", "bsearch/2"),
+        ("pick", "pick/0"),
+        ("pick(1;2)", "pick/2"),
+        ("omit", "omit/0"),
+        ("omit(1;2)", "omit/2"),
+        ("strftime", "strftime/0"),
+        ("strftime(1;2)", "strftime/2"),
+        ("strptime", "strptime/0"),
+        ("strptime(1;2)", "strptime/2"),
+        ("tz", "tz/0"),
+        ("tz(1;2)", "tz/2"),
+        ("load", "load/0"),
+        ("load(1;2)", "load/2"),
+        ("at_offset", "at_offset/0"),
+        ("at_offset(1;2)", "at_offset/2"),
+        ("fromstream", "fromstream/0"),
+        ("fromstream(1;2)", "fromstream/2"),
+        ("truncate_stream", "truncate_stream/0"),
+        ("truncate_stream(1;2)", "truncate_stream/2"),
+        ("indices", "indices/0"),
+        ("indices(1;2)", "indices/2"),
+        ("rindex", "rindex/0"),
+        ("rindex(1;2)", "rindex/2"),
+        ("index", "index/0"),
+        ("index(1;2)", "index/2"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(stdout, "", "{filter}: stderr {stderr:?}");
+        assert!(
+            stderr.contains(&format!("{name} is not defined at <top-level>, line 1:")),
+            "{filter}: stderr {stderr:?}"
+        );
+        assert_eq!(code, 3, "{filter}: stdout: {stdout:?} stderr: {stderr:?}");
+    }
+    Ok(())
+}
+
+/// #2573: the point of the rewind, not just the message -- a wrong-arity
+/// spelling now falls back to an ordinary call, so a user `def` at that
+/// arity resolves instead of the parse dying first. Oracle-verified against
+/// jq 1.7.1, which answers `"shadow"` for each.
+#[test]
+fn test_remaining_single_arg_builtins_allow_a_shadowing_def_2573() -> Result<()> {
+    for name in [
+        "bsearch",
+        "pick",
+        "omit",
+        "strftime",
+        "strptime",
+        "tz",
+        "load",
+        "at_offset",
+        "fromstream",
+        "truncate_stream",
+        "indices",
+        "rindex",
+        "index",
+    ] {
+        let filter = format!(r#"def {name}(a;b): "shadow"; {name}(1;2)"#);
+        let (stdout, stderr, code) = run_jq_full(&["-nc", &filter], None)?;
+        assert_eq!(code, 0, "{filter}: stderr {stderr:?}");
+        assert_eq!(stdout.trim_end(), r#""shadow""#, "{filter}");
+    }
+    Ok(())
+}
+
 /// #2036: a user `def` can shadow a builtin of the same name, matching
 /// real jq -- the parser previously lowered a recognized builtin name to a
 /// typed `Expr::Builtin`/special-form node at parse time, before any `def`
