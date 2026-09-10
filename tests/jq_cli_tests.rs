@@ -22589,6 +22589,114 @@ fn test_module_def_shadow_deep_nesting_does_not_blow_up_2395() -> Result<()> {
     Ok(())
 }
 
+/// #2395: the module search path is tried in order and falls through -- a
+/// module absent from the first `-L` directory is still found in a later one.
+/// Confirmed live against jq 1.7.1, which resolves this identically.
+///
+/// Coverage-wise this is the only test that takes `resolve_module_in`'s loop
+/// past a non-matching candidate; every other module test in this file has the
+/// module in the first (and only) directory, so the miss-then-hit path went
+/// unexercised until the #2395 refactor surfaced it.
+#[test]
+fn test_module_search_path_falls_through_to_a_later_dir_2395() -> Result<()> {
+    let empty_dir = tempfile::tempdir()?;
+    let module_dir = tempfile::tempdir()?;
+    std::fs::write(
+        module_dir.path().join("mod.jq"),
+        "def length: \"s-length\";\n",
+    )?;
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command
+                .args(["jq", "-L"])
+                .arg(empty_dir.path())
+                .arg("-L")
+                .arg(module_dir.path())
+                .args(["-nc", r#"include "mod"; length"#]);
+            command
+        },
+        None,
+    )?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), r#""s-length""#);
+    Ok(())
+}
+
+/// #2395: a module whose own text does not parse is a compile error, exit 3 --
+/// not a panic, and not a silently ignored module. jq 1.7.1 also exits 3 here
+/// (its wording names the file and line, where succinctly reports the module
+/// path and a byte position -- the same pre-existing wording gap already
+/// recorded for `module not found`).
+#[test]
+fn test_module_with_a_syntax_error_is_a_compile_error_2395() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    std::fs::write(temp_dir.path().join("bad.jq"), "def broken: ( ;\n")?;
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command
+                .args(["jq", "-L"])
+                .arg(temp_dir.path())
+                .args(["-nc", r#"include "bad"; 1"#]);
+            command
+        },
+        None,
+    )?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 3, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("module error") && stderr.contains("parse error in module"),
+        "stderr: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// Characterization test, **pinning a known divergence from jq**: succinctly
+/// resolves `include "m.jq"` to the file `m.jq`, where real jq appends `.jq`
+/// unconditionally and therefore looks for `m.jq.jq` -- so jq rejects this
+/// program with `module not found: m.jq` (exit 3) while succinctly runs it.
+///
+/// Verified live against jq 1.7.1 both ways: with only `m.jq` present jq errors
+/// and succinctly returns the module's def, and with `m.jq.jq` also present jq
+/// reads *that* file while succinctly still reads `m.jq`.
+///
+/// Pre-existing and unrelated to #2395, which only relocated the `ends_with(".jq")`
+/// arm responsible; tracked as issue 2702. This test exists so that arm is
+/// covered rather than silently untested, and **is expected to flip** when 2702
+/// is fixed -- at which point it should assert jq's `module not found` and exit
+/// 3 instead.
+#[test]
+fn test_include_with_explicit_jq_suffix_diverges_from_jq_2702() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    std::fs::write(
+        temp_dir.path().join("mod.jq"),
+        "def length: \"s-length\";\n",
+    )?;
+    let (output, code) = spawn_with_signal_retry(
+        || {
+            let mut command = Command::new(succinctly_bin());
+            command
+                .args(["jq", "-L"])
+                .arg(temp_dir.path())
+                .args(["-nc", r#"include "mod.jq"; length"#]);
+            command
+        },
+        None,
+    )?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(
+        stdout.trim_end(),
+        r#""s-length""#,
+        "succinctly resolves the explicit .jq suffix; real jq would error here (issue 2702)"
+    );
+    Ok(())
+}
+
 /// #1376: `succinctly jq` now supports arity overloading, matching real
 /// jq -- `def f(x): ...` and `def f(x;y): ...` are distinct functions
 /// (`f/1` and `f/2`), and both stay callable after the second definition.
