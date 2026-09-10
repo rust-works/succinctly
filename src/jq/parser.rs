@@ -2015,8 +2015,9 @@ impl<'a> Parser<'a> {
             // `expect_or_wrong_arity`, #2391) instead removes this arm from
             // that fallback path entirely, exactly as it already does for
             // the other 7 forms.
-            if let Err(early) = self.expect_or_wrong_arity(')', start_pos) {
-                return early;
+            // #2686: hand the parsed `msg_expr` over instead of rewinding.
+            if self.peek() != Some(')') {
+                return self.wrong_arity_or_expect(start_pos, ')', vec![msg_expr]);
             }
             self.next();
             Some(Box::new(msg_expr))
@@ -2155,14 +2156,17 @@ impl<'a> Parser<'a> {
         // `expect(';')`, which raises its own natural error for that
         // specific mismatch, exactly as before this fix.
         if self.peek() == Some(')') && self.mode == ParserMode::Jq {
-            return self.rewind_to_wrong_arity_call(start_pos);
+            // #2686: `n` is already parsed; `wrong_arity_call_from_parsed`
+            // closes on the `)` we are sitting on and yields `limit/1`.
+            return self.wrong_arity_call_from_parsed(start_pos, vec![n]);
         }
         self.expect(';')?;
         self.skip_ws();
         let expr = self.parse_expr()?;
         self.skip_ws();
-        if let Err(early) = self.expect_or_wrong_arity(')', start_pos) {
-            return early;
+        // #2686: both arguments are in hand -- see `wrong_arity_or_expect`.
+        if self.peek() != Some(')') {
+            return self.wrong_arity_or_expect(start_pos, ')', vec![n, expr]);
         }
         self.next();
 
@@ -2188,15 +2192,17 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         let cond = self.parse_expr()?;
         self.skip_ws();
-        if let Err(early) = self.expect_or_wrong_arity(';', start_pos) {
-            return early;
+        // #2686: `until(a)` -- one argument parsed, no rewind needed.
+        if self.peek() != Some(';') {
+            return self.wrong_arity_or_expect(start_pos, ';', vec![cond]);
         }
         self.next();
         self.skip_ws();
         let update = self.parse_expr()?;
         self.skip_ws();
-        if let Err(early) = self.expect_or_wrong_arity(')', start_pos) {
-            return early;
+        // #2686: `until(a;b;c)` -- the shape that measured 18 s at depth 24.
+        if self.peek() != Some(')') {
+            return self.wrong_arity_or_expect(start_pos, ')', vec![cond, update]);
         }
         self.next();
 
@@ -2222,15 +2228,16 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         let cond = self.parse_expr()?;
         self.skip_ws();
-        if let Err(early) = self.expect_or_wrong_arity(';', start_pos) {
-            return early;
+        // #2686: same two shapes as `parse_until_expr`.
+        if self.peek() != Some(';') {
+            return self.wrong_arity_or_expect(start_pos, ';', vec![cond]);
         }
         self.next();
         self.skip_ws();
         let update = self.parse_expr()?;
         self.skip_ws();
-        if let Err(early) = self.expect_or_wrong_arity(')', start_pos) {
-            return early;
+        if self.peek() != Some(')') {
+            return self.wrong_arity_or_expect(start_pos, ')', vec![cond, update]);
         }
         self.next();
 
@@ -2256,8 +2263,9 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         let expr = self.parse_expr()?;
         self.skip_ws();
-        if let Err(early) = self.expect_or_wrong_arity(')', start_pos) {
-            return early;
+        // #2686: `repeat(a;b)` -- the parsed `expr` is the call's first arg.
+        if self.peek() != Some(')') {
+            return self.wrong_arity_or_expect(start_pos, ')', vec![expr]);
         }
         self.next();
 
@@ -2280,8 +2288,9 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let expr = self.parse_expr()?;
             self.skip_ws();
-            if let Err(early) = self.expect_or_wrong_arity(')', start_pos) {
-                return early;
+            // #2686: `first(a;b)` -- one argument already parsed.
+            if self.peek() != Some(')') {
+                return self.wrong_arity_or_expect(start_pos, ')', vec![expr]);
             }
             self.next();
             Ok(Expr::FirstExpr(Box::new(expr)))
@@ -2303,8 +2312,9 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let expr = self.parse_expr()?;
             self.skip_ws();
-            if let Err(early) = self.expect_or_wrong_arity(')', start_pos) {
-                return early;
+            // #2686: same shape as `parse_first_expr`.
+            if self.peek() != Some(')') {
+                return self.wrong_arity_or_expect(start_pos, ')', vec![expr]);
             }
             self.next();
             Ok(Expr::LastExpr(Box::new(expr)))
@@ -2390,8 +2400,9 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         let step = self.parse_expr()?;
         self.skip_ws();
-        if let Err(early) = self.expect_or_wrong_arity(')', start_pos) {
-            return early;
+        // #2686: `range(a;b;c;d)` -- all three parsed args handed over.
+        if self.peek() != Some(')') {
+            return self.wrong_arity_or_expect(start_pos, ')', vec![first, second, step]);
         }
         self.next();
 
@@ -2826,6 +2837,105 @@ impl<'a> Parser<'a> {
         self.pos = start_pos;
         let call = self.parse_func_call_or_error()?;
         self.parse_postfix(call)
+    }
+
+    /// [`Self::rewind_to_wrong_arity_call`] for a site that has **already
+    /// parsed** one or more argument expressions -- resolves the same
+    /// wrong-arity call without re-parsing them (#2686).
+    ///
+    /// The rewinding form re-parses the call's whole argument text from
+    /// `start_pos`. For a *nested* wrong-arity call that is
+    /// `O(2^depth)`: every level parses its argument subtree once on the
+    /// way in and once again on the rewind, and the rewind's own
+    /// `parse_expr` descends into the next level down, which does the same.
+    /// Measured before this existed, `until(` * 24 + `1;2;3` + `)` * 24 took
+    /// 18 s to *parse* where jq 1.7.1 rejects the same text in 20 ms, growing
+    /// ~1.9x per level. This is the same denial-of-service shape #2036 closed
+    /// twice (`wrap_shadowable_call`'s arg cloning, and
+    /// `retry_shadow_candidate_as_generic_call`'s `SHADOW_RETRY_BUDGET`); a
+    /// budget would only cap it, so this removes the exponent instead.
+    ///
+    /// The already-parsed `args` are exactly what a rewind would have
+    /// re-derived, so this picks up where the caller stopped: it continues
+    /// [`Self::parse_func_call_or_error`]'s own `;`-separated loop from the
+    /// current position, closes on `)`, and assembles the identical
+    /// `Expr::FuncCall` -- same name, same argument order, same `CallSite`
+    /// offset for #2085's diagnostics, and the same [`Self::parse_postfix`]
+    /// tail its rewinding sibling applies (`range(1;2;3;4).foo` must report
+    /// `range/4 is not defined`, not a syntax error).
+    ///
+    /// `start_pos` is read only to recover the call's *name*, which the
+    /// caller consumed as a keyword before it knew the arity was wrong; the
+    /// cursor is restored immediately, so no argument text is re-scanned.
+    ///
+    /// Call only in jq mode, same carve-out as the rewinding form.
+    fn wrong_arity_call_from_parsed(
+        &mut self,
+        start_pos: usize,
+        mut args: Vec<Expr>,
+    ) -> Result<Expr, ParseError> {
+        let resume = self.pos;
+        self.pos = start_pos;
+        let name = self.parse_ident()?;
+        self.pos = resume;
+
+        // `parse_func_call_or_error`'s own argument loop, entered mid-list.
+        // Every caller has just run `skip_ws`, which is where that loop
+        // expects to be when it inspects the separator.
+        loop {
+            match self.peek() {
+                Some(';') => {
+                    self.next();
+                    self.skip_ws();
+                    args.push(self.parse_expr()?);
+                    self.skip_ws();
+                }
+                Some(')') => break,
+                _ => {
+                    return Err(ParseError::new(
+                        "expected ';' or ')' in function arguments",
+                        self.pos,
+                    ));
+                }
+            }
+        }
+        self.expect(')')?;
+
+        self.call_sites.push(CallSite {
+            name: name.clone(),
+            arity: args.len(),
+            offset: start_pos,
+        });
+        let call = Expr::FuncCall {
+            name,
+            args,
+            builtin_fallback: None,
+        };
+        self.parse_postfix(call)
+    }
+
+    /// [`Self::expect_or_wrong_arity`] for the sites that hold already-parsed
+    /// arguments (#2686), routing to
+    /// [`Self::wrong_arity_call_from_parsed`] instead of a rewind.
+    ///
+    /// Shaped as "check, else return" rather than its sibling's
+    /// `Result<(), Result<..>>` so `args` is moved only on the failing
+    /// branch, which diverges -- the caller keeps using its own `cond`/
+    /// `update` bindings afterwards on the success path.
+    ///
+    /// Non-jq mode raises `expect`'s own natural error, identical to the
+    /// rewinding sibling's carve-out.
+    fn wrong_arity_or_expect(
+        &mut self,
+        start_pos: usize,
+        expected: char,
+        args: Vec<Expr>,
+    ) -> Result<Expr, ParseError> {
+        if self.mode == ParserMode::Jq {
+            return self.wrong_arity_call_from_parsed(start_pos, args);
+        }
+        self.expect(expected)?;
+        unreachable!("only called once `peek() != Some(expected)`, so `expect` must fail")
     }
 
     /// One shared definition of the 7-line argument-boundary checkpoint
