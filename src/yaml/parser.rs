@@ -282,6 +282,22 @@ struct Parser<'a, const HAS_CR: bool> {
     /// (#798). Distinguishes a block trailing real content (the document
     /// root's *foot*) from a comment-only document (its *head*).
     saw_head_foot_node: bool,
+    /// Whether [`Self::start_document`] has run at least once (#798) --
+    /// distinguishes "no previous document" (very first `start_document`
+    /// call) from "previous document's root is bp 0", which is otherwise
+    /// indistinguishable from the field's zero-initialized state.
+    seen_any_document: bool,
+    /// The root bp of whichever document [`Self::last_head_foot_bp`]'s `None`
+    /// currently means "nothing has opened in the *new* document yet",
+    /// rather than "a blank line detached the in-document `PREV`" (#798).
+    ///
+    /// Set at every [`Self::start_document`] to the document that just
+    /// closed (or `None` for the very first document), and cleared the
+    /// moment any node opens in the new document -- from then on an
+    /// in-document blank-line detachment must fall forward as usual, not
+    /// reach back across the boundary a second time. Consulted only by
+    /// [`Self::flush_pending_head_lines`]'s no-`PREV` fallback.
+    document_boundary_fallback_bp: Option<usize>,
 
     // Document tracking
     /// Whether we're currently inside a document
@@ -383,6 +399,8 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             last_head_foot_bp: None,
             comment_watermark: 0,
             saw_head_foot_node: false,
+            seen_any_document: false,
+            document_boundary_fallback_bp: None,
             in_document: false,
             document_start_bp_pos: 0,
             pending_explicit_key: None,
@@ -691,6 +709,21 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.comments.entry(prev).or_default().foot.append(pending);
                 return;
             }
+            // No `PREV` in *this* document -- if nothing has opened here yet
+            // because we just crossed a `---`/`...` boundary, the block
+            // reaches back across it onto the document that just closed,
+            // rather than forward into this one (measured against pinned yq
+            // v4.53.3: `a: 1\n---\n# mid\n\nb: 2\n` puts `mid` on the first
+            // document's own foot, not `.b`'s head, #798).
+            if let Some(old_root) = self.document_boundary_fallback_bp {
+                let pending = &mut self.pending_head_lines;
+                self.comments
+                    .entry(old_root)
+                    .or_default()
+                    .foot
+                    .append(pending);
+                return;
+            }
         }
         let root = self.document_start_bp_pos;
         let pending = &mut self.pending_head_lines;
@@ -744,6 +777,53 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         self.flush_pending_head_lines(Some(bp));
         self.last_head_foot_bp = Some(bp);
         self.saw_head_foot_node = true;
+        // A real node has now opened in this document, so a later blank
+        // line detaching *its own* `PREV` must fall forward as usual, not
+        // reach back across the document boundary a second time (#798).
+        self.document_boundary_fallback_bp = None;
+    }
+
+    /// [`Self::flush_pending_head_lines`], but called from
+    /// [`Self::start_document`] where the pending block may instead belong
+    /// to the document that's *closing*, not the one about to open (#798).
+    ///
+    /// Measured against pinned yq v4.53.3: a block sitting directly against
+    /// a `---`/`...` boundary (no blank line between the block and the
+    /// marker) stays with the closing document as its own root `foot`,
+    /// rather than following the ordinary adjacent-block-attaches-forward
+    /// rule onto the new document's `head` --
+    /// `a: 1\n# mid\n---\nb: 2\n` puts `mid` on document 0's `foot`, not
+    /// document 1's `head`. A block separated from the marker by a blank
+    /// line takes the ordinary path instead (delegated to
+    /// [`Self::flush_pending_head_lines`]), which already resolves it
+    /// correctly onto `PREV` — this runs before `last_head_foot_bp` is
+    /// reset below, so `PREV` is still the closing document's own last key.
+    ///
+    /// `old_root_bp` is `None` for the very first document (nothing to
+    /// reach back to), in which case this always defers to the ordinary
+    /// path.
+    fn flush_pending_head_lines_at_boundary(
+        &mut self,
+        next_bp: Option<usize>,
+        old_root_bp: Option<usize>,
+    ) {
+        if self.pending_head_lines.is_empty() {
+            return;
+        }
+        if let Some(old_root) = old_root_bp {
+            let block_end = self.pending_head_lines[self.pending_head_lines.len() - 1].1 as usize;
+            let adjacent_to_marker = !self.blank_line_between(block_end, self.pos);
+            if adjacent_to_marker {
+                let pending = &mut self.pending_head_lines;
+                self.comments
+                    .entry(old_root)
+                    .or_default()
+                    .foot
+                    .append(pending);
+                return;
+            }
+        }
+        self.flush_pending_head_lines(next_bp);
     }
 
     /// Whether a wholly blank line lies in `[from, to)` — i.e. whether the
@@ -1650,6 +1730,12 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// This doesn't open a container - the document IS its content.
     fn start_document(&mut self) {
         self.in_document = true;
+        // The document that's closing, if any -- `document_start_bp_pos`
+        // still holds its root right up until the overwrite below.
+        // `seen_any_document` is the only way to tell "no previous document"
+        // apart from "its root happens to be bp 0" (#798).
+        let old_root_bp = self.seen_any_document.then_some(self.document_start_bp_pos);
+        self.seen_any_document = true;
         self.document_start_bp_pos = self.bp_pos;
         // A standalone comment block seen before this document's content
         // belongs to the document's own node, not to its first key -- real
@@ -1661,10 +1747,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         //
         // Deliberately *before* `pending_head_comment` is cleared below:
         // that field is #784's single floated trailing comment, unrelated to
-        // this block.
+        // this block. Uses the boundary-aware flush, not the ordinary one:
+        // a block still pending here may belong to the *closing* document
+        // instead (see [`Self::flush_pending_head_lines_at_boundary`]).
         let root_bp = self.document_start_bp_pos;
-        self.flush_pending_head_lines(Some(root_bp));
+        self.flush_pending_head_lines_at_boundary(Some(root_bp), old_root_bp);
         self.last_head_foot_bp = None;
+        // Primes the no-`PREV` fallback for whatever comes next in the new
+        // document -- see [`Self::document_boundary_fallback_bp`].
+        self.document_boundary_fallback_bp = old_root_bp;
         // A comment deferred by an anchor in a *previous* document (#784)
         // has no node left to attach to once a new document starts -
         // `parse_document_line`'s own one-line grace period already covers
