@@ -684,6 +684,43 @@ it landed:
   needs to reorder/slice entries, not just stream them) — a real representation limit, not a
   missed wiring like the three above.
 
+**[#2626](https://github.com/rust-works/succinctly/issues/2626) closed one member that was
+missing from that list: arithmetic.** `eval_single`'s `Expr::Arithmetic`/`Expr::Negate` arms
+matched only when an operand needed path context, so every other arithmetic fell to the same
+wildcard bridge — and collapsed the document before either operand ran. The binary
+contradicted itself:
+
+```bash
+$ printf 'b: 1\na: 2\nb: 3\n' | succinctly yq 'length'       # 3
+$ printf 'b: 1\na: 2\nb: 3\n' | succinctly yq 'length + 0'   # 2  (was), 3 (now); yq: 3
+$ printf 'b: 1\na: 2\nb: 3\n' | succinctly yq 'length * -1'  # -2 (was), -3 (now); yq: -3
+```
+
+Unary minus needed the same fix twice, because it has two bridging arms: `eval_single`'s and
+`eval_each_generic`'s own. Fixing only the first left `-length` at `-3` while `first(-length)`
+still answered `-2` — the same filter contradicting itself by position — so
+`each_negate_generic` gives the lazy route a native arm too. Real yq has no unary minus, so
+the oracle for those rows is its own spelling, `length * -1`.
+
+The same bridge re-rooted the value at a fresh JSON serialization, which stubbed every yq
+node-metadata builtin `needs_path_context` does not cover: `.b | (line + 0)` answered `0`
+where `.b | line` answers `2`, `(anchor + "")`/`(style + "")` answered `""`, and `di + 0`
+answered `0` for every document. All of those now agree with their bare spellings, and with
+yq v4.53.3. Pinned by `test_arithmetic_reads_the_real_document_2626`.
+
+Two things it does not fix. `generic_item_into_owned` still folds each *operand* to an
+`OwnedValue`, so an operand whose own value is a duplicate-keyed container collapses there
+(`. + {}`) — the `OwnedValue::Object` representation limit ADR-0017 declares out of scope
+(#796), the same residual `reduce`'s bindings have above. And `column` inside an arithmetic
+now agrees with succinctly's own bare `column`, which itself answers the value's column where
+yq answers the anchor's — a pre-existing divergence in the builtin, unrelated to the bridge
+([#2712](https://github.com/rust-works/succinctly/issues/2712)).
+
+Leaving the bridge also means arithmetic stops validating the whole document, which is a
+deliberate divergence in its own right and is recorded under
+[jq Limitations § Arithmetic and unary minus validate only what they read](../jq/limitations.md#arithmetic-and-unary-minus-validate-only-what-they-read-2626)
+— the arms are shared, so the rule is one rule.
+
 **[#1975](https://github.com/rust-works/succinctly/issues/1975) found this same `parse_input`/
 `to_owned_canonicalizing_numbers` bridge — #1343's still-open DOM fallback for `--slurp`/
 `--eval-all`, and `--inplace`'s DOM-forcing flags — had neither the #1194 unpaired-tail check
