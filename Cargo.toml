@@ -21,6 +21,18 @@ include = [
     "README.md",
 ]
 
+# Pinned rather than left at cargo's default (codegen-units = 16, no LTO)
+# because the default made the shipped binary's speed depend on code the
+# query never runs: the same two commits, whose diff cannot reach a `length`
+# query, measured -14% apart on x86_64 at 16 codegen units and +2% apart
+# here (#2603; the same class as #595 and #1587). Thin LTO does not remove
+# that class -- a single codegen unit does. Release builds compile ~3x
+# slower for it; the debug builds `cargo test`/`clippy` use are untouched.
+# Measurements and the profiles rejected: docs/guides/benchmarking.md § 9.
+[profile.release]
+codegen-units = 1
+lto = "fat"
+
 [features]
 default = ["std"]
 
