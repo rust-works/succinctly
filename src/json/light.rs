@@ -1265,8 +1265,12 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
         // `EvalError::malformed_json_text(self.text)`, so the two raise the same
         // value. It is left as-is because routing to that helper would fix
         // nothing: it shares the blind spot this walk actually has, its `None`
-        // arm being `Ok(())`. What this needs is `container_tail_gap_ok`, whose
-        // `None` arm catches the zero-child `{,}` -- a behaviour change, #2594.
+        // arm being `Ok(())`. What closes that is `container_tail_gap_ok`, which
+        // needs a cursor to the object itself -- and a `JsonFields` holds only
+        // "the first field's key cursor, or `None`", so a zero-field `{,}`
+        // leaves it with nothing. #2594 closed the gap one level up instead, at
+        // `eval_generic`'s `Expr::Field` arm, which does hold that cursor;
+        // this walk is unchanged and still cannot make the check itself.
         let mut fields = *self;
         // (key's own text start, winning field, is this field the object's
         // first) -- same bookkeeping `find_cursor` keeps, needed so the
@@ -1374,7 +1378,9 @@ impl<'a, W: AsRef<[u64]>> JsonFields<'a, W> {
         // STYLE-0013-TAIL: `find`'s cursor-returning twin, exempt for the same
         // reason -- routing to `child_tail_gap_ok` is behaviour-preserving but
         // pointless, and the `container_tail_gap_ok` that would actually close
-        // the zero-child `{,}` case changes behaviour. Tracked as #2594.
+        // the zero-child `{,}` case needs a container cursor this walk never
+        // receives. Closed at the `Expr::Field` dispatch arm instead (#2594);
+        // see `find`'s own marker just above.
         let mut fields = *self;
         // (key's own text start, value cursor, is this field the object's
         // first) for the winning candidate seen so far.

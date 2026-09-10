@@ -1888,6 +1888,74 @@ pub fn tail_gap_ok<C: DocumentCursor>(
     }
 }
 
+/// [`container_tail_gap_ok`]'s zero-child half alone, for a **dispatch
+/// site** that holds the container's own cursor but hands the walk itself
+/// off to a helper that only ever sees children -- #2594.
+///
+/// Every shared object walk in this module ([`census`], [`checked_len`],
+/// [`effective_keys`], [`DocumentFields::contains_checked`],
+/// [`effective_fields_checked`]) takes `&F` and nothing else, so none of
+/// them can reach the container to tell a genuine `{}` from a stray `,`
+/// with no member at all (`{,}`). Widening all of them would mean a new
+/// parameter on each; their *callers* in the evaluator already carry
+/// `cursor: Option<V::Cursor>` beside the value for unrelated reasons
+/// (type-name diagnostics), so the check goes there instead, once per
+/// dispatch rather than once per member.
+///
+/// `Ok(())` whenever the walk found a member (the container is genuinely
+/// non-empty, and the *trailing*-comma shape `{"a":1,}` is what those
+/// walks already check for themselves) or the caller has no cursor (the
+/// true top level -- the documented gap [`tail_gap_ok`] describes).
+///
+/// **Call this from the arm that is about to walk the container, never from
+/// the top of the dispatch function it lives in.** `empty`, `true and true`
+/// and the rest of #2173's closed terms dispatch through `eval_single`/
+/// `eval_builtin` too, and a closed term must answer exactly as `empty`
+/// does on every document, malformed ones included -- reading no member is
+/// what makes it closed, so the check belongs where a member is about to
+/// be read. `test_ambient_validation_agrees_with_bridge_2476` pins that
+/// against `empty` itself, and a guard hoisted to the top of either
+/// function fails it.
+///
+/// The raise is the container's own `malformed_delimiter_error()`, which
+/// for JSON re-runs the strict validator over the whole document -- so the
+/// message is byte-identical to the one `.` already produces for the same
+/// input rather than a second spelling of it. It carries the
+/// always-uncatchable tag (#2286), so `.a?` on `{,}` raises too, matching
+/// real jq, which cannot parse the document for *any* filter.
+///
+/// Free for every format but JSON: [`DocumentCursor::container_gap_ok`] is
+/// a `true`-returning default everywhere else, since they validate while
+/// parsing.
+pub fn empty_fields_tail_gap_ok<F: DocumentFields>(
+    fields: &F,
+    container: Option<&F::Cursor>,
+) -> Result<(), EvalError> {
+    match container {
+        Some(c) if fields.is_empty() => container_tail_gap_ok::<F::Cursor>(c, None, b'}'),
+        _ => Ok(()),
+    }
+}
+
+/// [`empty_fields_tail_gap_ok`]'s array twin -- the zero-*element* stray
+/// comma (`[,]`, #2594).
+///
+/// For a dispatch site holding the array's own cursor while
+/// [`DocumentElements::len_checked`],
+/// [`DocumentElements::collect_cursors_checked`] and `LazySource::Elements`
+/// walk only its (zero) elements. Same contract as
+/// [`empty_fields_tail_gap_ok`], including the rule that it is called from
+/// the arm about to walk, never from the top of the dispatch function.
+pub fn empty_elements_tail_gap_ok<E: DocumentElements>(
+    elements: &E,
+    container: Option<&E::Cursor>,
+) -> Result<(), EvalError> {
+    match container {
+        Some(c) if elements.is_empty() => container_tail_gap_ok::<E::Cursor>(c, None, b']'),
+        _ => Ok(()),
+    }
+}
+
 /// [`trailing_element_gap_ok`], for a key-only object walk that has
 /// tracked only the last field's *key* cursor (`census`, `checked_len`,
 /// `contains_checked`'s exhaustion path, [`DistinctKeyCursors`]'s own

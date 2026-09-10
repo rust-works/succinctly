@@ -45,10 +45,10 @@ use indexmap::IndexMap;
 use super::document::{
     child_tail_gap_ok, collapsed_fields, collapsed_fields_if, container_tail_gap_ok,
     effective_fields_checked, effective_fields_with_raw_last, effective_keys,
-    effective_len_checked, key_delimiter_ok, key_display_string, key_display_string_kind,
-    key_is_malformed, resolve_display_key, tail_gap_ok, trailing_element_gap_ok,
-    value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors, DocumentCursor, DocumentElements,
-    DocumentFields, DocumentValue, IndentSpec, JsonConvention,
+    effective_len_checked, empty_elements_tail_gap_ok, empty_fields_tail_gap_ok, key_delimiter_ok,
+    key_display_string, key_display_string_kind, key_is_malformed, resolve_display_key,
+    tail_gap_ok, trailing_element_gap_ok, value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors,
+    DocumentCursor, DocumentElements, DocumentFields, DocumentValue, IndentSpec, JsonConvention,
 };
 use super::error::EvalEscape;
 use super::eval::{
@@ -352,7 +352,10 @@ fn malformed_object_member<F: DocumentFields>(fields: &F) -> Option<EvalError> {
     // would newly reject documents this function accepts today: a behaviour
     // change, not a refactor. The tail check it does make is
     // `ends_unpaired()` below, which catches a trailing orphan but not a
-    // zero-child `{,}` gap. Tracked as #2594.
+    // zero-child `{,}` gap. That one is closed by the `Builtin::ToEntries`
+    // arm's own `empty_fields_tail_gap_ok` call, immediately after this
+    // function returns (#2594) -- a caller with the container cursor this
+    // key-only walk was never given.
     let mut walk = fields.clone();
     let mut is_first = true;
     while let Some((key, cursor, rest)) = walk.uncons_key() {
@@ -379,6 +382,34 @@ fn malformed_object_member<F: DocumentFields>(fields: &F) -> Option<EvalError> {
         is_first = false;
     }
     walk.ends_unpaired().then(|| walk.malformed_member_error())
+}
+
+/// [`empty_fields_tail_gap_ok`]/[`empty_elements_tail_gap_ok`] for an arm
+/// that walks whichever container it was handed -- `paths`, `leaf_paths`,
+/// `getpath` (#2594).
+///
+/// Those three dispatch to a *value-domain* walk (`collect_paths_generic`,
+/// `getpath_walk_cursor`), so unlike the arms that call one of the two
+/// helpers directly they do not know which container they have until they
+/// look. Same contract as those helpers, including the rule that this is
+/// called from the arm about to walk, never from the top of the dispatch
+/// function -- see [`empty_fields_tail_gap_ok`]'s own doc comment.
+///
+/// Covers the container this arm is standing on. A `{,}` nested *inside*
+/// the walk stays unchecked, because `collect_paths_generic` recurses over
+/// values and carries no cursor to check against -- the same shape
+/// [`to_owned_at_depth`] documents, tracked separately.
+fn empty_container_gap_error<V: DocumentValue>(
+    value: &V,
+    cursor: Option<&V::Cursor>,
+) -> Option<EvalError> {
+    if let Some(fields) = value.as_object() {
+        empty_fields_tail_gap_ok(&fields, cursor).err()
+    } else if let Some(elements) = value.as_array() {
+        empty_elements_tail_gap_ok(&elements, cursor).err()
+    } else {
+        None
+    }
 }
 
 /// `cursor` is the cursor pointing at `value` itself, when the caller has
@@ -6505,7 +6536,21 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             // evaluator's `index_object_by_name` applies, from the same
             // definition.
             let absent_is_empty = yq_absent_key_read_is_empty::<S>();
+            // #2594: `.a` on an *array* never walks it -- it is a type error
+            // (or, under `?`, suppressed to empty), so `[,] | .a?` exited 0
+            // on a document real jq cannot parse. The malformed-document
+            // raise is not the type error `?` suppresses.
+            if let Some(elements) = value.as_array() {
+                if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
+                    return GenericResult::Error(err);
+                }
+            }
             if let Some(fields) = value.as_object() {
+                // #2594: `find_cursor`'s walk holds only fields, so a
+                // zero-field `{,}` answered `null` here for every name.
+                if let Err(err) = empty_fields_tail_gap_ok(&fields, cursor.as_ref()) {
+                    return GenericResult::Error(err);
+                }
                 match fields.find_cursor(name) {
                     Ok(Some(c)) => GenericResult::OneCursor(c),
                     // jq returns null for missing fields on objects (not an error)
@@ -6547,6 +6592,11 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
 
         Expr::Index { idx, .. } => {
             if let Some(elements) = value.as_array() {
+                // #2594: `len_checked`'s walk holds only elements, so a
+                // zero-element `[,]` answered `null` here for every index.
+                if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
+                    return GenericResult::Error(err);
+                }
                 // #2261: `_checked`, not the bare `len()` this used to call
                 // -- free here, unlike a *positive*-only lookup elsewhere
                 // in this evaluator (`Expr::Iterate`'s sorted-key positive-
@@ -6638,6 +6688,13 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
 
         Expr::Iterate => {
             if let Some(elements) = value.as_array() {
+                // #2594: and its own zero-element check, which
+                // `collect_cursors_checked`'s element-only walk cannot make
+                // (that function's own doc comment says so) -- `[,]`
+                // iterated nothing and succeeded.
+                if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
+                    return GenericResult::Error(err);
+                }
                 // #1677: `.[]` over an array reaches into every element
                 // without ever re-serializing the container whole, so it
                 // needs its own gap check between siblings.
@@ -6663,6 +6720,12 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
                 // The check is free here -- it rides the same walk this arm
                 // already ran unconditionally, same as `effective_len_checked`
                 // does for `length`.
+                //
+                // #2594: the zero-field `{,}` that walk cannot see, same as
+                // the array branch above.
+                if let Err(err) = empty_fields_tail_gap_ok(&fields, cursor.as_ref()) {
+                    return GenericResult::Error(err);
+                }
                 match effective_fields_checked(&fields, true) {
                     Ok(effective) => {
                         let cursors: Vec<_> = effective
@@ -7958,8 +8021,16 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // `DistinctKeyCursors`' streaming-collapse machinery extended to
         // also carry value cursors, a separate and larger change not
         // attempted here.
+        // #2594: the one streaming arm that walks a container without ever
+        // reaching `eval_single` (whose own guard covers the `None` fallback
+        // below and the object case) -- `each_lazy_array_iterate_sink` takes
+        // only the elements, so a zero-element `[,]` streamed nothing and
+        // succeeded. See `empty_container_gap_error`.
         Expr::Iterate => match value.as_array() {
-            Some(elements) => each_lazy_array_iterate_sink(elements, sink),
+            Some(elements) => match empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
+                Ok(()) => each_lazy_array_iterate_sink(elements, sink),
+                Err(err) => Flow::Escaped(Control::Error(err)),
+            },
             None => drain_result_generic(eval_single::<S, V>(expr, value, optional, cursor), sink),
         },
 
@@ -13376,10 +13447,17 @@ fn eval_has_one_key<S: EvalSemantics, V: DocumentValue>(
         // for why this walks to completion (a real cost increase for the
         // "key found early" case) rather than riding an already-mandatory
         // walk for free like every other #2261 fix.
-        (OwnedValue::String(key), Some(fields), _) => match fields.contains_checked(key) {
-            Ok(found) => GenericResult::Owned(OwnedValue::Bool(found)),
-            Err(err) => GenericResult::Error(err),
-        },
+        (OwnedValue::String(key), Some(fields), _) => {
+            // #2594: `contains_checked`'s walk still sees no member at all
+            // for `{,}`, which answered `false` for every key.
+            if let Err(err) = empty_fields_tail_gap_ok(&fields, cursor.as_ref()) {
+                return GenericResult::Error(err);
+            }
+            match fields.contains_checked(key) {
+                Ok(found) => GenericResult::Owned(OwnedValue::Bool(found)),
+                Err(err) => GenericResult::Error(err),
+            }
+        }
         (
             OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..),
             _,
@@ -13390,6 +13468,12 @@ fn eval_has_one_key<S: EvalSemantics, V: DocumentValue>(
             // reads only the count, never a value), so the #1677/#2261 gap
             // checks ride along for free, same reasoning as
             // `Expr::Index`'s own array arm in `eval_single`.
+            //
+            // #2594: and the zero-element `[,]` it cannot see, which
+            // answered `false` for every index.
+            if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
+                return GenericResult::Error(err);
+            }
             let len = match elements.len_checked() {
                 Ok(len) => len,
                 Err(err) => return GenericResult::Error(err),
@@ -18045,10 +18129,21 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         // non-goal and stays on the wildcard fallback below.
         Builtin::Map(f) => {
             if let Some(elements) = value.as_array() {
+                // #2594: `LazySource::Elements` pulls through
+                // `uncons_cursor` alone and runs no gap check at all, so
+                // `[,] | map(f)` produced `[]`.
+                if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
+                    return GenericResult::Error(err);
+                }
                 GenericResult::LazySeq(Box::new(
                     LazySeq::new(LazySource::Elements(elements)).push_map(f, S::TAG),
                 ))
             } else if let Some(fields) = value.as_object() {
+                // #2594: `LazySource::Values`/`collapsed_fields` likewise
+                // never see the zero-field `{,}`.
+                if let Err(err) = empty_fields_tail_gap_ok(&fields, cursor.as_ref()) {
+                    return GenericResult::Error(err);
+                }
                 // `.[]` collapses a repeated key to its first position but
                 // last-seen value in both modes (#1398), which needs every
                 // occurrence seen before any value can be emitted --
@@ -18258,6 +18353,12 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 // `len`'s plain `uncons` doesn't carry one) but keeping no
                 // `Vec`, same reasoning as `collect_cursors_checked`'s own
                 // O(1)-space sibling `len_checked`.
+                //
+                // #2594: and the zero-element `[,]` that walk cannot see,
+                // which answered `0`.
+                if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
+                    return GenericResult::Error(err);
+                }
                 match elements.len_checked() {
                     Ok(len) => GenericResult::Owned(OwnedValue::Int(len as i64)),
                     Err(err) => GenericResult::Error(err),
@@ -18276,6 +18377,12 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 //
                 // Distinct keys in jq mode (#1385) -- `{"a":1,"a":2}|length`
                 // is 1, because the object jq built only ever had one member.
+                //
+                // #2594: the zero-field `{,}` neither `census` nor
+                // `checked_len` can see, which answered `0`.
+                if let Err(err) = empty_fields_tail_gap_ok(&fields, cursor.as_ref()) {
+                    return GenericResult::Error(err);
+                }
                 match effective_len_checked(&fields, S::COLLAPSE_DUPLICATE_KEYS) {
                     Ok(len) => GenericResult::Owned(OwnedValue::Int(len as i64)),
                     Err(err) => GenericResult::Error(err),
@@ -18300,6 +18407,12 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 
         Builtin::Keys => {
             if let Some(fields) = value.as_object() {
+                // #2594: `effective_keys`, whatever eventually drains this
+                // `LazyKeys`, walks fields alone -- a zero-field `{,}`
+                // listed `[]` rather than raising.
+                if let Err(err) = empty_fields_tail_gap_ok(&fields, cursor.as_ref()) {
+                    return GenericResult::Error(err);
+                }
                 // Stay lazy here too (#683) — `length` can answer from
                 // `fields.len()` without decoding or sorting a single key.
                 // `.[]`/`.[n]`/`first`/`last`/bare output still need the
@@ -18324,6 +18437,13 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 // gap checks ride along for free, and `[1,2,3,] | keys`
                 // now agrees with real jq (parse error) instead of
                 // silently returning `[0,1,2]`.
+                //
+                // #2594: `len_checked` still cannot see the *zero*-element
+                // `[,]`, which listed `[]` the same way `{,}` listed `[]`
+                // in the object branch above.
+                if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
+                    return GenericResult::Error(err);
+                }
                 match elements.len_checked() {
                     Ok(len) => GenericResult::LazyIndexRange(len),
                     Err(err) => GenericResult::Error(err),
@@ -18339,6 +18459,10 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
 
         Builtin::KeysUnsorted => {
             if let Some(fields) = value.as_object() {
+                // #2594: same zero-field `{,}` gap as `Keys` above.
+                if let Err(err) = empty_fields_tail_gap_ok(&fields, cursor.as_ref()) {
+                    return GenericResult::Error(err);
+                }
                 // Stay lazy here — don't decode every key into an owned
                 // String yet. `length`, `.[]`, `.[n]`, `first`, and `last`
                 // can all answer directly from `fields` (see the `Pipe`
@@ -18352,7 +18476,11 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             } else if let Some(elements) = value.as_array() {
                 // Same laziness as the array branch of `Keys` above (#684),
                 // and the same #2261 fix: `len_checked` rides the same
-                // already-mandatory walk.
+                // already-mandatory walk -- plus the same #2594 zero-element
+                // check it cannot make.
+                if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
+                    return GenericResult::Error(err);
+                }
                 match elements.len_checked() {
                     Ok(len) => GenericResult::LazyIndexRange(len),
                     Err(err) => GenericResult::Error(err),
@@ -18399,7 +18527,11 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 //
                 // `_checked`: same #1677 gap check as `.[]`'s array arm --
                 // this walk visits every element regardless, so it's free
-                // to ride here too.
+                // to ride here too. And, #2594, the same zero-element `[,]`
+                // that walk cannot see, which produced `[]`.
+                if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
+                    return GenericResult::Error(err);
+                }
                 let cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
                 let mut entries: Vec<OwnedValue> = Vec::new();
                 for (i, elem_cursor) in cursors.into_iter().enumerate() {
@@ -18419,6 +18551,13 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 // key-only walk is negligible here next to materializing
                 // every value, which this builtin does anyway.
                 if let Some(err) = malformed_object_member(&fields) {
+                    return GenericResult::Error(err);
+                }
+                // #2594: that key-only walk sees no member at all for `{,}`,
+                // so its `ends_unpaired` tail check has nothing to fire on
+                // and `to_entries` produced `[]` (its own STYLE-0013-TAIL
+                // exemption says exactly this).
+                if let Err(err) = empty_fields_tail_gap_ok(&fields, cursor.as_ref()) {
                     return GenericResult::Error(err);
                 }
                 // A loop for the same reason as the array arm above.
@@ -18507,6 +18646,11 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         // format's own `effective_fields` rule at every nesting level, not
         // just the root.
         Builtin::Paths => {
+            // #2594: `collect_paths_generic` is a value-domain walk, so it
+            // cannot see the container it was handed is really `{,}`/`[,]`.
+            if let Some(err) = empty_container_gap_error(&value, cursor.as_ref()) {
+                return GenericResult::Error(err);
+            }
             let mut paths = Vec::new();
             match collect_paths_generic::<S, _>(&value, &mut Vec::new(), &mut paths, false) {
                 Ok(()) => collapse_vec(
@@ -18520,6 +18664,10 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         }
 
         Builtin::LeafPaths => {
+            // #2594: same value-domain walk as `Builtin::Paths` above.
+            if let Some(err) = empty_container_gap_error(&value, cursor.as_ref()) {
+                return GenericResult::Error(err);
+            }
             let mut paths = Vec::new();
             match collect_paths_generic::<S, _>(&value, &mut Vec::new(), &mut paths, true) {
                 Ok(()) => collapse_vec(
@@ -18585,6 +18733,12 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         Builtin::First => {
             // jq: first == .[0], so [] and null both yield null
             if let Some(elements) = value.as_array() {
+                // #2594: the zero-element `[,]` no element-only walk can
+                // see -- same gap as this arm's own #2261 fix, one step
+                // earlier (there is no element to hang a check on).
+                if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
+                    return GenericResult::Error(err);
+                }
                 match elements.get_cursor(0) {
                     Some(c) => GenericResult::OneCursor(c),
                     None => GenericResult::Owned(OwnedValue::Null),
@@ -18604,6 +18758,11 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         Builtin::Last => {
             // jq: last == .[-1], so [] and null both yield null
             if let Some(elements) = value.as_array() {
+                // #2594: the zero-element `[,]` no element-only walk can
+                // see, same as `Builtin::First` just above.
+                if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
+                    return GenericResult::Error(err);
+                }
                 // #2261: `len_checked`, not the bare `len()` -- unlike
                 // `Builtin::First` just above (genuinely O(1) via
                 // `get_cursor(0)`, left unchecked per #1629's precedent),
@@ -18681,6 +18840,12 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 );
             }
             if let Some(elements) = value.as_array() {
+                // #2594: the zero-element `[,]` no element-only walk can
+                // see -- same gap as this arm's own #2261 fix, one step
+                // earlier (there is no element to hang a check on).
+                if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
+                    return GenericResult::Error(err);
+                }
                 // #2261 (systematic sweep): `collect_cursors_checked`, not
                 // the unchecked `collect_cursors` this arm used -- this
                 // walk already resolves every element's cursor to reverse
@@ -18733,6 +18898,12 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     optional,
                 );
             };
+            // #2594: the zero-element `[,]` no element-only walk can
+            // see -- same gap as this arm's own #2261 fix, one step
+            // earlier (there is no element to hang a check on).
+            if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
+                return GenericResult::Error(err);
+            }
             let key = match builtin {
                 Builtin::SortBy(f) | Builtin::UniqueBy(f) => Some(&**f),
                 _ => None,
@@ -18781,6 +18952,12 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     optional,
                 );
             };
+            // #2594: the zero-element `[,]` no element-only walk can
+            // see -- same gap as this arm's own #2261 fix, one step
+            // earlier (there is no element to hang a check on).
+            if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
+                return GenericResult::Error(err);
+            }
             // #2261 (systematic sweep): `collect_cursors_checked`, not the
             // unchecked `collect_cursors` this arm used -- every one of
             // these builtins already resolves each element's cursor to
@@ -18961,13 +19138,20 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         // `Select` precedent), so this remains defensive rather than
         // load-bearing -- see `test_optional_ignored_sites_2280`.
         Builtin::GetPath(path_expr) => match cursor {
-            Some(root) => fanout_arg_generic::<S, V, _>(
-                path_expr,
-                value.clone(),
-                optional,
-                cursor,
-                |path_owned| getpath_walk_cursor::<S, V>(root, &path_owned, optional),
-            ),
+            Some(root) => {
+                // #2594: `getpath_walk_cursor` descends from `root` by name,
+                // so a zero-member `{,}` simply misses and answers `null`.
+                if let Some(err) = empty_container_gap_error(&value, Some(&root)) {
+                    return GenericResult::Error(err);
+                }
+                fanout_arg_generic::<S, V, _>(
+                    path_expr,
+                    value.clone(),
+                    optional,
+                    cursor,
+                    |path_owned| getpath_walk_cursor::<S, V>(root, &path_owned, optional),
+                )
+            }
             // A computed input has no position in any document, so there is
             // nothing to walk and nothing this arm could validate lazily:
             // the value is already in hand, and the owned table reads it

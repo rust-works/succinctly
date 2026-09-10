@@ -5282,7 +5282,10 @@ fn standard_json_to_jq_value<'a, W: Clone + AsRef<[u64]>>(
     // and this is the true top level -- the one entry point with none to
     // give, the same documented gap `owned_from_standard_json_at_depth`'s
     // own comment describes. Wiring in the callable half is a behaviour
-    // change; tracked with the rest in #2594.
+    // change, still untaken. #2594 did not reach this site: it closed the
+    // zero-child gap in the evaluator arms that *do* hold a container
+    // cursor, and by the time a value arrives here the walk that produced
+    // it has already been checked there.
     // STYLE-0013: `preceding_gap_ok` directly, not `key_delimiter_ok`/
     // `value_delimiter_ok` -- this is the CLI-crate lazy materializer, not
     // `DocumentFields`-generic, and its array/object arms below already
