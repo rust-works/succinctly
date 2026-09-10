@@ -2627,10 +2627,7 @@ fn reconcile_presentation_at_depth(
                 mark @ Some(AnchorMark::Aliases(_)) if !is_write_target => mark.clone(),
                 _ => None,
             };
-            CommentTree::Leaf(NodeMeta {
-                anchor,
-                ..NodeMeta::empty()
-            })
+            CommentTree::Leaf(NodeMeta::empty_with_anchor(anchor))
         }
         // Both scalars, any variant/value: same node, only its value
         // changed - its own comment, style and anchor mark survive. Real
@@ -4087,10 +4084,7 @@ fn strip_presentation_style(tree: &CommentTree) -> CommentTree {
 /// currently-live independent crash path.
 fn strip_presentation_style_at_depth(tree: &CommentTree, depth: usize) -> CommentTree {
     assert_value_tree_depth(depth);
-    let meta = NodeMeta {
-        style: "",
-        ..tree.meta().clone()
-    };
+    let meta = tree.meta().with_style("");
     match tree {
         CommentTree::Leaf(_) => CommentTree::Leaf(meta),
         CommentTree::Array(_, items) => CommentTree::Array(

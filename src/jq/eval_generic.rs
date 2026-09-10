@@ -939,14 +939,31 @@ pub struct NodeMeta {
     /// This node's `&anchor`/`*alias` syntax (issue #763), or `None` if it
     /// carried neither.
     pub anchor: Option<AnchorMark>,
-    /// Standalone comment lines directly above this node, one entry per
-    /// line, in source order (#798 PR2). Always empty today -- capturing
-    /// these is separate, follow-up work; this field only prepares a place
-    /// for that work to write into.
-    pub head_comment: Vec<String>,
-    /// Standalone comment lines directly below this node (#798 PR2). Always
-    /// empty today -- see [`Self::head_comment`].
-    pub foot_comment: Vec<String>,
+    /// Standalone head/foot comment lines (#798 PR2), boxed behind a single
+    /// `Option` rather than kept as two inline `Vec<String>` fields: a
+    /// review of this widening found that the extra ~48 stack bytes of two
+    /// always-empty `Vec`s was enough to make `reconcile_presentation_at_depth`
+    /// overflow the real stack *before* its own `MAX_VALUE_TREE_DEPTH` guard
+    /// could fire (`reconcile_presentation_panics_past_nesting_depth_limit_1005`).
+    /// `None` here costs one pointer and no allocation — exactly the
+    /// "always empty today" state every construction site below sets — and
+    /// only the (still unimplemented) capture work that fills these in pays
+    /// for the `Box`.
+    head_foot_comment: Option<Box<HeadFootComment>>,
+}
+
+/// The head/foot comment lines [`NodeMeta::head_foot_comment`] boxes away.
+/// One entry per standalone `#` line, in source order; consecutive lines
+/// join into one logical block (real yq treats them as one comment either
+/// way, and #1085 needs more than one comment associated with a single node
+/// at all). Always empty today -- capturing these is separate, follow-up
+/// work; this type only prepares a place for that work to write into.
+#[derive(Debug, Clone, Default)]
+struct HeadFootComment {
+    /// Standalone `#` lines directly above the node.
+    head: Vec<String>,
+    /// Standalone `#` lines directly below the node.
+    foot: Vec<String>,
 }
 
 impl NodeMeta {
@@ -958,8 +975,7 @@ impl NodeMeta {
             comment: None,
             style: "",
             anchor: None,
-            head_comment: Vec::new(),
-            foot_comment: Vec::new(),
+            head_foot_comment: None,
         }
     }
 
@@ -971,8 +987,47 @@ impl NodeMeta {
             comment,
             style,
             anchor: None,
-            head_comment: Vec::new(),
-            foot_comment: Vec::new(),
+            head_foot_comment: None,
+        }
+    }
+
+    /// Standalone comment lines directly above this node, in source order
+    /// (#798 PR2). Always empty today -- see [`HeadFootComment`].
+    pub fn head_comment(&self) -> &[String] {
+        self.head_foot_comment.as_deref().map_or(&[], |hf| &hf.head)
+    }
+
+    /// Standalone comment lines directly below this node (#798 PR2). Always
+    /// empty today -- see [`Self::head_comment`].
+    pub fn foot_comment(&self) -> &[String] {
+        self.head_foot_comment.as_deref().map_or(&[], |hf| &hf.foot)
+    }
+
+    /// [`Self::empty`] with `anchor` overridden — no comment, style or
+    /// head/foot comments. Used for a kind-changed node (container <->
+    /// scalar), which keeps at most an anchor mark, never presentation
+    /// (`yq_runner.rs`'s `reconcile_presentation_at_depth`). A method rather
+    /// than `NodeMeta { anchor, ..NodeMeta::empty() }` at the call site so
+    /// `head_foot_comment` can stay private across the bin/lib crate
+    /// boundary — functional-record-update requires every field visible at
+    /// the call site, not just the ones actually overridden.
+    pub fn empty_with_anchor(anchor: Option<AnchorMark>) -> Self {
+        Self {
+            anchor,
+            ..Self::empty()
+        }
+    }
+
+    /// This node's own metadata with `style` replaced, everything else
+    /// (comment, anchor, head/foot comments) kept as-is. Used by issue
+    /// #705's `-P` gate (`yq_runner.rs`'s `strip_presentation_style_at_depth`)
+    /// to clear style while keeping the rest untouched — see
+    /// [`Self::empty_with_anchor`] for why this is a method rather than a
+    /// struct-update literal at the call site.
+    pub fn with_style(&self, style: &'static str) -> Self {
+        Self {
+            style,
+            ..self.clone()
         }
     }
 }
@@ -1233,8 +1288,7 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
         comment: own_comment,
         style: own_style,
         anchor: own_anchor,
-        head_comment: Vec::new(),
-        foot_comment: Vec::new(),
+        head_foot_comment: None,
     };
     if let Some(fields) = value.as_object() {
         let mut map = IndexMap::new();
