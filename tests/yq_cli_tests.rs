@@ -32286,6 +32286,41 @@ fn test_recursive_def_evaluates_in_yq_mode_1371() -> Result<()> {
     Ok(())
 }
 
+/// #2646 is a **jq-mode** rule (ADR-0018: the mode decides, never the input
+/// format). `path()`'s untracked-navigation table refuses a jq-*defined*
+/// navigating builtin applied to a constructed value -- but `map`, `any`,
+/// `all` and `flatten` are real yq builtins with their own oracle, and yq
+/// v4.53.3 raises for none of them: the `del()` finds nothing to delete and
+/// the document comes back unchanged at exit 0.
+///
+/// A first draft of #2646 was not mode-gated and refused here instead. The
+/// rule is derived from how *jq* defines these in its own `builtin.jq`;
+/// yq's implementation shares none of that, so none of it applies.
+///
+/// These four are the whole verified list, not a sample: of the rest of the
+/// table, `add` and `last` are not yq builtins at all (its lexer rejects
+/// them, and so does succinctly's), `from_entries` errors identically in
+/// both, and `first` errors in yq while succinctly stays silent -- a
+/// pre-existing divergence, unchanged by #2646 and not something this test
+/// should assert either way.
+#[test]
+fn test_navigating_builtin_path_table_is_jq_mode_only_2646() -> Result<()> {
+    for filter in [
+        "del(([1,2] | map(.)) | select(false))",
+        "del(([1,2] | any) | select(false))",
+        "del(([1,2] | all) | select(false))",
+        "del(([1,2] | flatten) | select(false))",
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, "a: [1,2]\nb: 3\n", &[])?;
+        assert_eq!(code, 0, "{filter}: stdout {stdout:?}");
+        assert!(
+            stdout.contains("a:") && stdout.contains("b:"),
+            "{filter}: the document must come back unchanged: {stdout:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #2560: `bind_def_call`'s duplicate-parameter-name fix lives in `eval.rs`,
 /// shared by both evaluators -- confirm yq mode's own `DefCall` path
 /// resolves a duplicate parameter name by last occurrence too, not just

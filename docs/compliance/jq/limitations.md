@@ -737,7 +737,18 @@ is the revert that established what the other one costs.
    navigating inside their own jq-level definitions against a *constructed* value inside
    `path()` never raise, found by `scripts/jq-bind-origin-fuzz.py`'s differential fuzz and
    confirmed pre-existing (reproduces byte-for-byte on the commit before #2042), not caused by
-   this change.
+   this change. **#2646 is now fixed** — `builtin_navigation` (`src/jq/eval.rs`) answers what
+   each jq-defined navigating builtin indexes, and `resolve_leaf`'s `!trackable` guard raises
+   on it. Three groups remain, deliberately, and are divergences in their own right:
+
+   | Still diverging                                                                     | jq 1.7.1                                        | succinctly | Tracked                                                                  |
+   | ----------------------------------------------------------------------------------- | ----------------------------------------------- | ---------- | ------------------------------------------------------------------------ |
+   | `[path(([1] \| unique) \| empty)]`, and `unique_by`/`map_values`/`with_entries`/`fromstream`, `walk` on an *object*, `ascii_downcase`/`ascii_upcase`, the `match`/`sub`/`gsub` family | raises, naming a **derived** container (`iterate through [[1]]`) | `[]`       | [#2743](https://github.com/rust-works/succinctly/issues/2743) |
+   | `[path(([1,2,3] \| nth(2)) \| empty)]`, and `reverse`/`indices`/`index`/`rindex`; `INDEX(f)` and `transpose` | raises; element depends on an argument or `length` | `[]`       | [#2744](https://github.com/rust-works/succinctly/issues/2744) |
+   | `[path(([1] \| last(.[])) \| empty)]`, and `isempty(f)`/`any(gen;cond)`/`all(gen;cond)`/`INDEX(gen;f)` | raises — the *argument* navigates                | `[]`       | [#2746](https://github.com/rust-works/succinctly/issues/2746) |
+
+   The rule is **jq-mode only** (ADR-0018): `map`, `any`, `all` and `flatten` are real yq
+   builtins, and yq v4.53.3 raises for none of them, so `succinctly yq` does not either.
 
    [#2072](https://github.com/rust-works/succinctly/issues/2072) supplied the missing
    half of that but deliberately did not spend it here. `Expr::TrackedVar` now carries a

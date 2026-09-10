@@ -28598,19 +28598,33 @@ enum BuiltinNavigation {
 /// boundary siblings, `test_only_jq_defined_navigators_raise_inside_path_2646`
 /// and `test_navigating_builtins_raise_regardless_of_input_type_2646`.
 ///
-/// Two boundaries worth keeping in view when adding to this:
+/// Three boundaries worth keeping in view when adding to this:
 ///
 /// - **Arity changes the answer.** `any`/`any(cond)` iterate their input
 ///   and raise; `any(gen; cond)` does not — it iterates `gen`, so
-///   `[1] | any(1;.)` answers `[]` while `[1] | any(true)` raises. If
-///   `any(.[];.)` raises, that is its *argument* navigating, which the
-///   resolver already handles on its own.
+///   `[1] | any(1;.)` answers `[]` while `[1] | any(true)` raises.
+///   `[1] | any(.[];.)` *does* raise in jq, but that is its argument
+///   navigating, and this resolver does not currently catch it — one of a
+///   family of argument-side gaps (with `last(.[])`, `isempty(.[])`,
+///   `INDEX(.[];.)`), tracked in #2746.
+/// - **A `$`-parameter runs before the navigation.** `def join($x)` and
+///   `def flatten($x)` desugar to `x as $x | ...`, so jq evaluates — and
+///   for `flatten` range-checks — the argument *first*:
+///   `[1] | join(error("boom"))` raises `boom`, and `flatten(-1)` raises
+///   "flatten depth must not be negative". Neither is a path error, so
+///   answering `Iterate` here would pre-empt jq's own — they are out,
+///   under #2744. Bare `Flatten` stays: it is `_flatten(-1)`, whose
+///   argument is jq's own literal and cannot raise.
 /// - **Some raise against a container this function cannot name.**
 ///   `unique`, `unique_by`, `map_values`, `with_entries` and `fromstream`
 ///   raise against a *derived* value (`[1] | map_values(.)` reports
 ///   `element 0 of [[1],[]]`, the `group_by`/`to_entries` intermediate),
 ///   which a static answer here cannot produce. They are deliberately
-///   absent rather than reported with the wrong container — #2743.
+///   absent rather than reported with the wrong container — #2743, which
+///   also covers `ascii_downcase`/`ascii_upcase` (`explode | map(...)`) and
+///   the `match`/`sub`/`gsub` family, and `transpose` (which additionally
+///   raises only when `map(length)|max` exceeds zero). `INDEX(f)` is a
+///   clean `Iterate` on every input that simply has not been added yet.
 ///   `nth(n)`, `reverse` and `indices(i)` are absent for a related reason:
 ///   their element depends on an argument or on `length` (and `reverse`
 ///   does not raise at all on an empty input), so they need a value this
@@ -28625,8 +28639,6 @@ fn builtin_navigation(builtin: &Builtin, value: &OwnedValue) -> Option<BuiltinNa
         | Builtin::All
         | Builtin::AllF(_)
         | Builtin::Flatten
-        | Builtin::FlattenDepth(_)
-        | Builtin::Join(_)
         | Builtin::Map(_)
         | Builtin::FromEntries => Some(BuiltinNavigation::Iterate),
         // The one entry whose answer depends on the *input*, because its
@@ -28697,17 +28709,27 @@ fn resolve_leaf<'a, S: EvalSemantics>(
         // first) | empty)` answered `[]`, and `del(([1] | first) | empty)`
         // returned the document unchanged at exit 0, where jq raises. See
         // [`builtin_navigation`] for what is in the set and why.
-        if let Expr::Builtin(builtin) = expr {
-            if let Some(navigation) = builtin_navigation(builtin, value) {
-                let error = match navigation {
-                    BuiltinNavigation::Access(element) => {
-                        EvalError::invalid_path_expression_near_access(&element, value)
-                    }
-                    BuiltinNavigation::Iterate => {
-                        EvalError::invalid_path_expression_near_iterate(value)
-                    }
-                };
-                return Err((Vec::new(), error.into()));
+        //
+        // **jq mode only** (ADR-0018: the mode decides, never the input
+        // format). `map`, `any`, `all`, `flatten` and `from_entries` are
+        // real yq builtins with their own oracle, and yq v4.53.3 does not
+        // raise for any of them -- `del(([1,2] | map(.)) | select(false))`
+        // leaves the document alone at exit 0, where this table's rule
+        // would refuse. That rule is jq's, derived from how *jq* defines
+        // these in `builtin.jq`; yq's implementation shares none of it.
+        if S::TAG == EvalTag::Jq {
+            if let Expr::Builtin(builtin) = expr {
+                if let Some(navigation) = builtin_navigation(builtin, value) {
+                    let error = match navigation {
+                        BuiltinNavigation::Access(element) => {
+                            EvalError::invalid_path_expression_near_access(&element, value)
+                        }
+                        BuiltinNavigation::Iterate => {
+                            EvalError::invalid_path_expression_near_iterate(value)
+                        }
+                    };
+                    return Err((Vec::new(), error.into()));
+                }
             }
         }
         // `.` alone performs no navigation at all, so it is exempt from the
@@ -84685,7 +84707,7 @@ mod tests {
     /// stage mention `.a`" shortcut: no navigation appears in its text at
     /// all, and jq still refuses, because `first`'s own body is the `.[0]`
     /// that moves the register.
-    #[test]
+    ///
     /// #2646 sharpened four of these five. `cannot_move_register` made them
     /// *refuse*, which is what this test was written to pin, but with the
     /// generic "with result" wording; the builtin rows now raise at the
@@ -84693,6 +84715,7 @@ mod tests {
     /// its own wording rather than merely "some path error". The `def f: .a`
     /// row keeps the generic wording, in jq too -- a user-defined body is
     /// not in `builtin_navigation`'s table, and jq reports it the same way.
+    #[test]
     fn test_path_register_dropped_across_opaque_navigating_stage_1573() {
         for (filter, message) in [
             (
