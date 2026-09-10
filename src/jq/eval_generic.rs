@@ -11002,6 +11002,25 @@ fn each_alternative_generic<S: EvalSemantics, V: DocumentValue>(
     let mut forwarded = 0usize;
     let mut outer_stopped = false;
     let mut escape: Option<Control> = None;
+    // Both branches below reduce a `Flow` the same way -- one shared closure
+    // rather than two copies of the match, so a change to what `Stopped`/
+    // `Escaped` mean here can't update one arm and miss the other (#106).
+    // `push_one_generic` can only ever answer `Exhausted`/`Stopped` (its own
+    // body is `Continue`/`Stop`, nothing else), so the `Escaped` arm is
+    // unreachable from the fast path below on its own -- but it is reachable
+    // from `drain_result_generic`'s call, for a genuine `Error`/`Break`/
+    // `Halt` item, which is what keeps this arm covered without a
+    // tolerate-line for the fast path's narrower case.
+    let mut handle_flow = |flow: Flow| -> Demand {
+        match flow {
+            Flow::Exhausted => Demand::Continue,
+            Flow::Stopped { .. } => {
+                outer_stopped = true;
+                Demand::Stop
+            }
+            Flow::Escaped(control) => stop_with_escape(&mut escape, control),
+        }
+    };
     let left_flow = eval_each_generic::<S, V>(left, value.clone(), optional, cursor, &mut |item| {
         // Fast path: `OneCursorValue` carries an already-decoded value
         // (#1599/#1606/#1609, e.g. a `keys_unsorted` iteration) that routing
@@ -11014,14 +11033,7 @@ fn each_alternative_generic<S: EvalSemantics, V: DocumentValue>(
                 return Demand::Continue;
             }
             forwarded += 1;
-            return match push_one_generic(item, sink) {
-                Flow::Exhausted => Demand::Continue,
-                Flow::Stopped { .. } => {
-                    outer_stopped = true;
-                    Demand::Stop
-                }
-                Flow::Escaped(control) => stop_with_escape(&mut escape, control),
-            };
+            return handle_flow(push_one_generic(item, sink));
         }
         match retain_truthy_generic(generic_item_to_result(item)) {
             // Falsy: dropped, and the left operand keeps producing. A
@@ -11033,14 +11045,7 @@ fn each_alternative_generic<S: EvalSemantics, V: DocumentValue>(
             GenericResult::None => Demand::Continue,
             kept => {
                 forwarded += 1;
-                match drain_result_generic(kept, sink) {
-                    Flow::Exhausted => Demand::Continue,
-                    Flow::Stopped { .. } => {
-                        outer_stopped = true;
-                        Demand::Stop
-                    }
-                    Flow::Escaped(control) => stop_with_escape(&mut escape, control),
-                }
+                handle_flow(drain_result_generic(kept, sink))
             }
         }
     });
