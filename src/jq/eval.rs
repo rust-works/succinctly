@@ -28515,7 +28515,7 @@ fn wrap_optional_branch(branch: PathBranch<'_>) -> PathBranch<'_> {
         // and jq writes `{"a":{"b":5},"k":"b"}` for it. `eval_generic` can
         // synthesize `Expr::Optional` around any expression too, so this
         // was never an invariant of the type.
-        flatten_components(components.to_vec())
+        flatten_components(components.to_vec()) // omni-dev: coverage tolerate-line reason="unreachable today: postfix `?` attaches to a single path element until #367 reopens it, so no path this resolver builds has depth() != 1 here (#2649)"
     };
     PathBranch {
         path: PathPrefix::from_components([Expr::Optional(Box::new(inner_path))]),
@@ -30008,7 +30008,7 @@ fn walk_pattern_step(
     // b:$r}` walks to `["a","b"]`).
     if !(reg.is_input || null_bool_identical(input, &reg.value)) {
         let Some(element) = navigation_element(&component) else {
-            unreachable!("a pattern step's component is always Field/Index")
+            unreachable!("a pattern step's component is always Field/Index") // omni-dev: coverage tolerate-line reason="unreachable: PatternStep::component only ever builds Expr::Field/Expr::Index, and navigation_element answers Some for both (#2649)"
         };
         return Err(EvalError::invalid_path_expression_near_access(
             &element, input,
@@ -84309,7 +84309,7 @@ mod tests {
         assert!(frame.at.is_some(), "{filter}: frame must be rooted");
         match &expr {
             Expr::AsPattern { patterns, .. } => (frame, patterns.clone()),
-            other => panic!("{filter}: expected AsPattern, got {other:?}"),
+            other => panic!("{filter}: expected AsPattern, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- every filter this helper is called with parses to an AsPattern (#2649)"
         }
     }
 
@@ -84341,7 +84341,7 @@ mod tests {
     fn walk_pattern_origin_path_2649(origin: &Option<Origin>) -> Vec<Expr> {
         match origin {
             Some(Origin::At { path, .. }) => path.0.to_vec(),
-            other => panic!("expected Origin::At, got {other:?}"),
+            other => panic!("expected Origin::At, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- every call site passes the origin of a binding this same test already proved carries a marker (#2649)"
         }
     }
 
@@ -85219,7 +85219,7 @@ mod tests {
                 Ok(got) => assert_eq!(got, *expected, "{filter}"),
                 Err(e) => panic!(
                     "{filter}: refused where jq answers {expected}: {}",
-                    e.message
+                    e.message // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- every row here is a shape jq accepts, confirmed live (#2649)"
                 ),
             }
         }
@@ -85287,7 +85287,7 @@ mod tests {
                     assert!(e.is_untracked_navigation_error(), "{filter}: {}", e.message);
                 }
                 Err(e) => assert!(e.is_invalid_path_expression(), "{filter}: {}", e.message),
-                Ok(got) => panic!("{filter}: answered {got} where jq refuses"),
+                Ok(got) => panic!("{filter}: answered {got} where jq refuses"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- every row here is a shape jq refuses, confirmed live (#2649)"
             }
         }
     }
@@ -85325,6 +85325,118 @@ mod tests {
                 QueryResult::None => {}
             );
         }
+    }
+
+    /// #2649: `resolve_as_pattern`'s own `identical` check recognises a
+    /// `TrackedVar` source too, not only a bare `.` -- a destructuring
+    /// bind whose *source* is itself a variable frozen from the live
+    /// register re-establishes exactly as a plain `$q` reference does
+    /// elsewhere. Confirmed live: jq 1.7.1 answers `["a"]`.
+    #[test]
+    fn test_as_pattern_source_tracked_var_reestablishes_2649() {
+        assert_eq!(
+            outputs(br#"{"a":5}"#, r"path(. as $q | $q as {a:$r} ?// [$r] | $r)"),
+            [r#"["a"]"#]
+        );
+    }
+
+    /// #2649: a `?//` alternative whose patterns are *all* bare variables
+    /// (no `{...}`/`[...]`) performs no index step at all, so
+    /// [`cannot_move_register`] treats it exactly like a plain `As` body --
+    /// safe to carry the register across as a stage. Confirmed live: jq
+    /// 1.7.1 answers `[]`.
+    #[test]
+    fn test_as_pattern_var_only_alternatives_preserve_register_2649() {
+        assert_eq!(
+            outputs(
+                br#"{"a":{"b":1}}"#,
+                r"path(. as $x | (. as $y ?// $z | $y) | 5 | $x)"
+            ),
+            ["[]"]
+        );
+    }
+
+    /// #2649: a binding the walk proves is the register's node only by
+    /// *value* (a `null` source under an untracked frame, e.g. a
+    /// `try`/`catch` handler -- `trackable` is forced `false` there) still
+    /// succeeds the pattern step, but carries no [`Origin::At`] marker --
+    /// `bind_pattern_body`'s `None` arm splices it in as a plain value
+    /// instead. Confirmed live: jq 1.7.1 answers `["a"]` (the destructured
+    /// position itself still seeds the body, with or without a marker to
+    /// re-establish through).
+    #[test]
+    fn test_as_pattern_binding_without_marker_still_seeds_body_2649() {
+        assert_eq!(
+            outputs(br"null", r"path(try error(null) catch (. as {a:$q} | $q))"),
+            [r#"["a"]"#]
+        );
+    }
+
+    /// #2649: `?//`'s retry rule treats a `break` escaping a non-last
+    /// alternative's body exactly like an error -- move to the next
+    /// alternative rather than propagating. Pattern 1 (`{a:$q}`) binds `$q`
+    /// truthy and breaks; pattern 2 (`$z`) never does, so its own body
+    /// wins. Confirmed live: jq 1.7.1 answers `[]` (no error, no swallowed
+    /// break).
+    #[test]
+    fn test_as_pattern_break_retries_non_last_alternative_2649() {
+        assert_eq!(
+            outputs(
+                br#"{"a":1}"#,
+                r"path(label $out | . as {a:$q} ?// $z | (if $q then break $out else $z end))"
+            ),
+            ["[]"]
+        );
+    }
+
+    /// #2649: the same rule's other half -- a `break` from the *last*
+    /// alternative's body has nowhere left to retry to, so it propagates
+    /// (here straight into its own enclosing label, which swallows it).
+    /// Pattern 1 (`{a:$q}`) always errors on this array input, forcing the
+    /// retry into pattern 2 (`$z`), whose body breaks. Confirmed live: jq
+    /// 1.7.1 produces no output at all (the label catches its own break).
+    #[test]
+    fn test_as_pattern_break_propagates_from_last_alternative_2649() {
+        assert_eq!(
+            outputs(
+                br"[1,2,3]",
+                r"path(label $out | . as {a:$q} ?// $z | (if $z then break $out else $q end))"
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    /// #2649: `halt` always propagates out of a `?//` alternative's body,
+    /// even when it is not the last one -- unlike `break`/error, it never
+    /// retries. Pattern 1 (`{a:$q}`) binds `$q` truthy and halts; a wrongly
+    /// retried pattern 2 (`$z`) would answer `[]` instead of nothing.
+    /// Confirmed live: jq 1.7.1 produces no output (the process exits
+    /// cleanly before printing anything).
+    #[test]
+    fn test_as_pattern_halt_never_retries_2649() {
+        assert_eq!(
+            outputs(
+                br#"{"a":1}"#,
+                r"path(. as {a:$q} ?// $z | (if $q then halt else $z end))"
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    /// #2649: the `?//` source itself can escape after already producing
+    /// output (`(null, error(...))`'s second value) -- jq keeps what it
+    /// already emitted rather than un-emitting it, the same "escaping
+    /// prefix" rule [`test_path_register_reestablished_in_escaping_partial_prefix_1573`]
+    /// pins for a plain `As`. Confirmed live: jq 1.7.1 prints `[]`, then
+    /// raises `boom`.
+    #[test]
+    fn test_as_pattern_source_escape_reaches_sink_2649() {
+        query!(br"null", r#"path((null, error("boom")) as $q ?// $z | $q)"#,
+            QueryResult::Partial(vs, Control::Error(e)) => {
+                assert_eq!(prefix_json(&vs), ["[]"]);
+                assert_eq!(e.message, "boom");
+            }
+        );
     }
 
     /// #2042 review: the witness resolve is gated to pure-navigation
