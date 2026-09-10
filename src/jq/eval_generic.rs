@@ -22783,34 +22783,34 @@ mod tests {
         }
     }
 
-    /// #2627's other panic site: `And`/`Or` (`eval_boolean_generic`) and
-    /// `Alternative`/`//`/`Not` route their own "shape that used to bridge"
-    /// raise through [`push_generic_document_validation_error`] instead of
-    /// the full materialization above (#2476's O(N) replacement for the
-    /// bridge's O(2^N) cost) -- but its depth guard panicked exactly the
-    /// same way before this fix, as its own doc comment
-    /// (`ambient_validation_error`) already flagged. `. and true`, not
-    /// `true and true`: both keep `needs_path_context` false (no `key`/
-    /// `parent`/`path` operand on either side, so this still takes the
-    /// bridge route), but a fully closed `true and true` no longer reaches
-    /// this walk at all -- #2173's `walk::reads_ambient_value` gate
-    /// (landed the same day as this fix) substitutes `OwnedValue::Null` for
-    /// a closed term before this function is ever called. `.` on the left
-    /// makes the whole expression ambient-reading (`Expr::Identity` always
-    /// reports `reads_ambient_value == true`), which is what keeps the real
-    /// document -- and this guard -- in the loop.
+    /// #2627 used to reach its panic here too: `And`/`Or`
+    /// (`eval_boolean_generic`) routed its own "shape that used to bridge"
+    /// raise through `push_generic_document_validation_error`'s
+    /// `ambient_validation_error` walk, whose depth guard panicked on a
+    /// document nested past 256 levels before #2627's fix turned that into
+    /// a clean `Error`.
     ///
-    /// [`eval_with_cursor`], not [`eval`]: `ambient_validation_error` walks
-    /// from a `DocumentCursor`, so it is a deliberate no-op without one
-    /// (see its own doc comment's "`None` without a cursor" paragraph) --
-    /// this is the real public `succinctly::jq::eval` shape, which always
-    /// supplies a cursor (confirmed live via `eval::eval`'s own
-    /// `needs_path_context` gate: a pipe like `key?, (. and true)` on a
-    /// document nested deeper than 256 levels reaches this exact guard
-    /// through the public API, not just this module's own internal
-    /// callers).
+    /// #2692 then removed the walk itself: `eval_boolean_generic` no longer
+    /// validates anything ahead of its operands (see that function's own
+    /// doc comment), so `. and true` reads only `.`'s truthiness --
+    /// `is_falsy`, which never descends into a container's children -- and
+    /// a 256-deep-nested array is truthy same as a shallow one. This is the
+    /// `eval_generic.rs`-internal twin of the CLI-level corollary pinned by
+    /// `test_truthiness_probes_do_not_trip_the_depth_guard_2692`
+    /// (`tests/jq_cli_tests.rs`) and recorded in `docs/adrs/adr-0018.md` and
+    /// both compliance pages. `. and true`, not `true and true`: a fully
+    /// closed `true and true` no longer reaches this function's document
+    /// argument at all -- #2173's `walk::reads_ambient_value` gate
+    /// substitutes `OwnedValue::Null` for a closed term before
+    /// `eval_boolean_generic` is ever called -- while `.` on the left keeps
+    /// the real document (and cursor) in the loop, which is what still lets
+    /// this test exercise the guard's *absence* rather than a substituted
+    /// `Null`.
+    ///
+    /// [`eval_with_cursor`], not [`eval`]: matches the real public
+    /// `succinctly::jq::eval` shape, which always supplies a cursor.
     #[test]
-    fn test_boolean_ambient_validation_reports_clean_error_past_nesting_limit_2627() {
+    fn test_boolean_and_reads_truthiness_without_tripping_depth_guard_2692() {
         use crate::json::JsonIndex;
         let json = format!("{}1{}", "[".repeat(256), "]".repeat(256));
         let json = json.as_bytes();
@@ -22819,24 +22819,16 @@ mod tests {
         let expr = crate::jq::parse(". and true").unwrap();
 
         match eval_with_cursor(&expr, cursor) {
-            GenericResult::Error(e) => {
-                assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
-                assert!(
-                    e.message.contains("nesting depth exceeds limit of 256"),
-                    "message: {}",
-                    e.message
-                );
-            }
-            other => panic!("expected a decode failure, got: {other:?}"),
+            GenericResult::Owned(OwnedValue::Bool(true)) => {}
+            other => panic!("expected Owned(true), got: {other:?}"),
         }
     }
 
     /// Companion to the test above: `true and true` well under the limit
-    /// must still answer normally through `eval_boolean_generic`'s own
-    /// ambient-validation gate. Kept as the fully closed `true and true`
+    /// must still answer normally. Kept as the fully closed `true and true`
     /// (unlike the over-limit test's `. and true` above) -- there's no
-    /// depth guard to dodge here, and the closed shape is a simpler check
-    /// that ordinary evaluation is untouched.
+    /// depth guard to dodge here either way, and the closed shape is a
+    /// simpler check that ordinary evaluation is untouched.
     #[test]
     fn test_boolean_ambient_validation_accepts_nesting_under_limit_2627() {
         use crate::json::JsonIndex;
