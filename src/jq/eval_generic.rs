@@ -725,6 +725,49 @@ fn to_owned_with_cursor<V: DocumentValue>(
     }
 }
 
+/// [`to_owned_with_cursor`], but skipped entirely when `expr` cannot read
+/// the value being materialized (#2173).
+///
+/// Every bridge into the eager evaluator materializes the *ambient* value
+/// only because `eval_on_owned`/`eval_each_owned` need some input to run
+/// against. When `expr` is a closed term — `[1+1]`, `[range(3)]`,
+/// `$__loc__`, `now | floor`, `true and true` — that input is never read, so
+/// `OwnedValue::Null` serves as well as a full copy of the document and
+/// costs nothing. Measured on a 16 MB document: `[1+1]` 443 MB → 29 MB peak
+/// RSS, 0.75 s → 0.04 s; in yq mode, where every filter takes
+/// [`eval_single`], `1+1` 476 MB → 125 MB.
+///
+/// **This also drops a validation the materialization was performing as a
+/// side effect, and that is the intended behaviour, not a casualty.**
+/// `to_owned_with_cursor` walks the whole document, so it raises on a
+/// malformed one for a filter that reads nothing — which is what real jq and
+/// yq do, since both parse eagerly. succinctly is a semi-index and does not:
+/// the raise fired only for the spellings that happened to reach a bridge,
+/// so `1+1` answered `2` at exit 0 while `[1+1]` exited 5 on the same
+/// document. ADR-0018's #2103 amendment governs exactly this class — where
+/// the reference's answer is a whole-document rejection the semi-index
+/// deliberately does not perform, take the *uniform* divergence, the one
+/// under which a value is treated the same however the filter spells its way
+/// to it. So a closed term now validates nothing in either mode, matching
+/// what `1+1` already did on jq's streaming route since #2103. Recorded in
+/// `docs/compliance/jq/limitations.md` and its yq twin; pinned by
+/// `test_closed_terms_do_not_validate_2173`.
+///
+/// A filter that *does* read the document is untouched here: it still
+/// materializes, and so still validates everything it materializes, which is
+/// #2168's rule unchanged.
+fn bridge_ambient_input<V: DocumentValue>(
+    expr: &Expr,
+    value: &V,
+    cursor: Option<V::Cursor>,
+) -> Result<OwnedValue, EvalError> {
+    if crate::jq::walk::reads_ambient_value(expr) {
+        to_owned_with_cursor(value, cursor)
+    } else {
+        Ok(OwnedValue::Null)
+    }
+}
+
 /// [`to_owned_with_cursor`] for the one job that must not fail: rendering a
 /// value into the text of an error that is *already* being raised.
 ///
@@ -2272,7 +2315,7 @@ fn bridge_to_full_evaluator<S: EvalSemantics, V: DocumentValue>(
     // today: `to_owned_with_cursor`'s only error paths are
     // `is_decode_failure()`-tagged, never suppressed regardless of
     // `optional`.
-    match to_owned_with_cursor(&value, cursor) {
+    match bridge_ambient_input(expr, &value, cursor) {
         Ok(owned) => eval_on_owned::<S, V>(expr, owned, optional),
         Err(e) if suppresses(&e, optional) => GenericResult::None,
         Err(e) => GenericResult::Error(e),
@@ -2296,7 +2339,7 @@ fn bridge_to_full_evaluator_flow<S: EvalSemantics, V: DocumentValue>(
     // `bridge_to_full_evaluator`'s own sibling fix above -- a suppressed
     // error produces zero items (the sink is never called), same as
     // `GenericResult::None`'s sink-free semantics elsewhere in this file.
-    match to_owned_with_cursor(&value, cursor) {
+    match bridge_ambient_input(expr, &value, cursor) {
         Ok(owned) => drain_result_generic(eval_on_owned::<S, V>(expr, owned, optional), sink),
         Err(e) if suppresses(&e, optional) => Flow::Exhausted,
         Err(e) => Flow::Escaped(Control::Error(e)),
@@ -2335,7 +2378,7 @@ fn bridge_to_each_owned_flow<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
 ) -> Flow {
-    match to_owned_with_cursor(&value, cursor) {
+    match bridge_ambient_input(expr, &value, cursor) {
         Ok(owned) => {
             eval_each_owned::<S>(expr, &owned, optional, &mut |v| sink(GenericItem::Owned(v)))
         }
@@ -7060,8 +7103,15 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // only path-context read sits inside a `//` is still never routed to
         // path-context evaluation, and this arm does not change that table.
         Expr::Alternative(left, right) => {
-            if let Some(control) = ambient_validation_error::<V>(cursor) {
-                return partial_generic(Vec::new(), control);
+            // #2173: the walk is charged only to a `//` that reads the
+            // document. `false // 1` reads nothing, so under #2103's rule --
+            // a filter validates only what it reads -- it validates nothing,
+            // exactly as the bridge it replaces now does for the same shape
+            // (`bridge_ambient_input`). `(.a? // 1) | 1` still walks.
+            if crate::jq::walk::reads_ambient_value(expr) {
+                if let Some(control) = ambient_validation_error::<V>(cursor) {
+                    return partial_generic(Vec::new(), control);
+                }
             }
             match retain_truthy_generic(eval_single::<S, V>(left, value.clone(), optional, cursor))
             {
@@ -7397,7 +7447,14 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             // over the whole suite confirmed it: zero hits from any
             // parser-driven test). Whatever error escapes is caught, if at
             // all, by the caller's own `Expr::Optional`/`eval_try` boundary.
-            let owned = owned_or_err!(to_owned_with_cursor(&value, cursor));
+            // #2173: `bridge_ambient_input`, not `to_owned_with_cursor` --
+            // this arm is where `[1+1]`, `[range(3)]` and `$__loc__` each
+            // paid 443 MB on a 16 MB document for an input none of them
+            // read, and it is the whole of yq's route, so `1+1` paid it
+            // there too. A closed term bridges with `OwnedValue::Null`; the
+            // re-serialize and re-index below then cost nothing either,
+            // since they run on that `Null`.
+            let owned = owned_or_err!(bridge_ambient_input(expr, &value, cursor));
             let json_str = owned.to_json_for_reindex::<S>();
             let json_bytes = json_str.as_bytes();
             let index = JsonIndex::build(json_bytes);
@@ -10827,7 +10884,17 @@ fn eval_boolean_generic<S: EvalSemantics, V: DocumentValue>(
     // that raise without the value -- read its doc comment for the parity
     // evidence and for why an operand that *does* read path context is not
     // charged the walk (it never paid the materialization either).
-    if !needs_path_context(left) && !needs_path_context(right) {
+    //
+    // #2173 narrowed it once more, to operands that actually read `.`.
+    // `true and true` reads nothing, and #2103's rule -- a filter validates
+    // only what it reads -- says it should therefore validate nothing; the
+    // bridge that used to carry this raise no longer raises for that shape
+    // either (`bridge_ambient_input`), so keeping the walk here would have
+    // reinstated by hand the spelling-dependence both changes exist to
+    // remove. `. and true` still walks.
+    let reads_ambient =
+        crate::jq::walk::reads_ambient_value(left) || crate::jq::walk::reads_ambient_value(right);
+    if reads_ambient && !needs_path_context(left) && !needs_path_context(right) {
         if let Some(control) = ambient_validation_error::<V>(cursor) {
             return partial_generic(Vec::new(), control);
         }
@@ -18971,8 +19038,13 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // level up) for whichever of the five #2184-fixed builtins
             // above reach here; unverified for the rest of this arm's
             // callers (tracked separately as #2280).
-            let owned = owned_or_suppress!(to_owned_with_cursor(&value, cursor), optional);
-            eval_on_owned::<S, _>(&Expr::Builtin(builtin.clone()), owned, optional)
+            // #2173: `bridge_ambient_input`, so a builtin whose answer comes
+            // from somewhere other than `.` -- `now`, `empty`, `env` -- stops
+            // materializing the document to compute it. `now | floor` was
+            // 445 MB on a 16 MB input before this.
+            let expr = Expr::Builtin(builtin.clone());
+            let owned = owned_or_suppress!(bridge_ambient_input(&expr, &value, cursor), optional);
+            eval_on_owned::<S, _>(&expr, owned, optional)
         }
     }
 }

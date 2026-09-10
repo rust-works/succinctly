@@ -39823,6 +39823,73 @@ fn test_and_or_over_alias_fanout_completes_2476() -> Result<()> {
     Ok(())
 }
 
+/// #2173: the wildcard bridge's own fan-out repro — the peak-work
+/// regression test the issue asks for, expressed as termination.
+///
+/// #2476 fixed the `and`/`or`/`not`/`//` arms; every *other* closed term
+/// still fell to `eval_single`'s wildcard, which materializes the ambient
+/// value through `to_owned_with_cursor`. On an alias fan-out that value
+/// expands to `O(2^N)`, so a 23-line document was enough to make `1+1` take
+/// longer than anyone would wait — for an input it never reads.
+///
+/// The same method as `test_and_or_over_alias_fanout_completes_2476` above,
+/// and for the same reason: **no wall-clock bound is asserted.** A
+/// regression to `O(2^N)` announces itself by hanging the suite, and a
+/// threshold would only add flakiness under this suite's own subprocess
+/// contention. What the test asserts is that the process finishes and gives
+/// the right answer.
+///
+/// Measured on the two binaries either side of the change, `yq '''1+1'''` on
+/// this document shape — the pre-fix column quadruples for every two levels
+/// while the post-fix column does not move at all, which is the removed
+/// term made visible:
+///
+/// | N  | bytes | before  | after  |
+/// |----|-------|---------|--------|
+/// | 18 | 389   | 0.33 s  | 0.00 s |
+/// | 20 | 435   | 1.31 s  | 0.00 s |
+/// | 22 | 481   | 5.38 s  | 0.00 s |
+/// | 24 | 527   | 22.70 s | 0.01 s |
+///
+/// N=26 is used below — around 90 s per filter before the fix and six
+/// filters to get through, so a regression does not merely run slowly, it
+/// stops the suite. It costs nothing to assert, because the post-fix side
+/// is flat: a closed term never looks at the document, so the fan-out is
+/// never expanded and N does not enter the cost at all. (A regression that
+/// reinstated only the *walk* — `O(N)` rather than `O(2^N)`, as #2476's
+/// arms do — would still pass here, and rightly: this test is about the
+/// materialization, and `test_closed_terms_do_not_validate_2173` in
+/// `jq_cli_tests.rs` is what pins the walk's absence.)
+///
+/// Every filter here is a closed term, and none of them mentions `a26` —
+/// that is the point. The cost never came from what they read; it came from
+/// the route they took.
+#[test]
+fn test_wildcard_bridge_over_alias_fanout_completes_2173() -> Result<()> {
+    let mut doc = String::from("a0: &a0 leaf\n");
+    for i in 1..=26 {
+        doc.push_str(&format!("a{i}: &a{i} [*a{}, *a{}]\n", i - 1, i - 1));
+    }
+
+    for (filter, want) in [
+        ("1+1", "2"),
+        ("[1+1]", "- 2"),
+        ("1 as $x | $x", "1"),
+        ("if 1==1 then 2 else 3 end", "2"),
+        ("false // 1", "1"),
+        // No `limit`/`range`/`now` rows: yq's own lexer rejects them
+        // without `--jq-extensions` (#1512), so their fan-out cost is
+        // pinned on the jq side instead.
+        (r#"{"k": 1}"#, "k: 1"),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, &doc, &[])?;
+        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), want, "`{filter}` -- stderr: {stderr:?}");
+    }
+
+    Ok(())
+}
+
 /// #2476's one behaviour change: #1804's accepted trade-off, now shared by
 /// `and`/`or`.
 ///
