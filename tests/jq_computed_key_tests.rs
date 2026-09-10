@@ -376,9 +376,12 @@ fn test_mixed_borrowed_and_owned_results() {
 // =============================================================================
 //
 // `getpath(...)` returns a materialized value, so these exercise the owned
-// branch of the same rules. A collection literal would be the obvious way to
-// write them; it does not parse here — see
-// `test_collection_literal_as_a_target_is_a_parse_error`.
+// branch of the same rules. A collection literal is the obvious way to write
+// them, and since #2667 it parses too — see
+// `test_collection_literal_as_a_target_2667`, which covers the same rules
+// spelled that way. The `getpath(...)` spellings below are kept as they are:
+// they were written against the owned branch and still exercise it, and
+// rewriting them would churn a lot of coverage for no new signal.
 
 #[test]
 fn test_owned_target_follows_the_same_rules() {
