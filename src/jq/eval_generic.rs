@@ -992,7 +992,7 @@ impl NodeMeta {
     }
 
     /// Standalone comment lines directly above this node, in source order
-    /// (#798 PR2). Always empty today -- see [`HeadFootComment`].
+    /// (#798 PR2). Always empty today -- capturing these is follow-up work.
     pub fn head_comment(&self) -> &[String] {
         self.head_foot_comment.as_deref().map_or(&[], |hf| &hf.head)
     }
