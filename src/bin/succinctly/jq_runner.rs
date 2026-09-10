@@ -25,7 +25,7 @@ use succinctly::jq::{
     EvalError, Expr, FuncDefBound, JqSemantics, JqValue, OwnedValue, Param, Program, StreamStats,
     UnresolvedCall, MAX_VALUE_TREE_DEPTH,
 };
-use succinctly::json::light::{preceding_gap_ok, JsonCursor, StandardJson};
+use succinctly::json::light::{preceding_gap_ok, JsonCursor, JsonString, StandardJson};
 use succinctly::json::validate::{self, ValidationError};
 use succinctly::json::JsonIndex;
 
@@ -878,9 +878,41 @@ fn write_object_key<Out: Write, W: Clone + AsRef<[u64]>>(
     let StandardJson::String(key) = frame.cursor(field.key_bp).value() else {
         return Err(MalformedJsonError(EvalError::malformed_json_text(frame.text)).into());
     };
-    if !(config.ascii_output || field.escaped || field.has_del && config.jq_compat) {
-        out.write_all(field.raw)?;
-    } else if let Ok(decoded) = key.as_str() {
+    write_json_string_zero_copy(out, field.raw, field.escaped, field.has_del, key, config)?;
+    out.write_all(b":")?;
+    out.write_all(space_after_colon.as_bytes())?;
+    Ok(())
+}
+
+/// Writes a JSON string under `config`'s escaping convention, taking the
+/// zero-copy fast path when the source span needs no re-encoding.
+///
+/// `raw`/`escaped`/`has_del` are `s.raw_and_escaped()`'s own answer, taken as
+/// separate parameters (rather than recomputed here from `s`) because
+/// `write_object_key`'s caller already has to consult them a second time
+/// earlier, for duplicate-key collapse (#1385) -- rescanning here would pay
+/// for that a third time. Every other caller has nothing else to hoist them
+/// for and just passes `s.raw_and_escaped()` straight through.
+///
+/// #2591/#2592: `has_del && config.jq_compat` is the one extra case the
+/// zero-copy path cannot take under jq's own escape convention -- a raw DEL
+/// byte (`0x7f`) is legal unescaped JSON source, but jq's escape table still
+/// re-encodes it to `` on output. `--preserve-input`/yq's own
+/// `Preserve` convention (`!config.jq_compat`) leaves it raw, matching real
+/// yq. Shared by four call sites (this one plus three sibling ones in
+/// `print_json`/`keys_unsorted`, #2592) that used to each hand-roll this
+/// gate-and-branch shape independently.
+fn write_json_string_zero_copy<Out: Write>(
+    out: &mut Out,
+    raw: &[u8],
+    escaped: bool,
+    has_del: bool,
+    s: JsonString<'_>,
+    config: &OutputConfig,
+) -> Result<()> {
+    if !(config.ascii_output || escaped || has_del && config.jq_compat) {
+        out.write_all(raw)?;
+    } else if let Ok(decoded) = s.as_str() {
         out.write_all(b"\"")?;
         let text = if config.ascii_output {
             escape_json_string_ascii(&decoded)
@@ -890,10 +922,8 @@ fn write_object_key<Out: Write, W: Clone + AsRef<[u64]>>(
         out.write_all(text.as_bytes())?;
         out.write_all(b"\"")?;
     } else {
-        out.write_all(field.raw)?;
+        out.write_all(raw)?;
     }
-    out.write_all(b":")?;
-    out.write_all(space_after_colon.as_bytes())?;
     Ok(())
 }
 
@@ -6111,31 +6141,12 @@ where
                     out.write_all(formatter.format_raw_number(n.raw_bytes()).as_bytes())?;
                 }
                 StandardJson::String(s) => {
-                    // Zero-copy optimization: if no escapes (backslash) and not ASCII mode,
-                    // output raw bytes directly without decode/encode roundtrip.
-                    // This is valid because JSON strings without backslashes need no
-                    // normalization -- except a raw DEL byte (0x7f) under jq's own escape
-                    // convention, which still re-encodes it on output even though it's
-                    // legal unescaped in source (#2591/#2592; see
-                    // `write_json_string_pretty`'s identical gate in src/json/light.rs).
+                    // Zero-copy optimization when the source span needs no
+                    // re-encoding under jq's own escape convention -- see
+                    // `write_json_string_zero_copy`'s own doc comment
+                    // (#2591/#2592) for the raw-DEL-byte exception.
                     let (raw, escaped, has_del) = s.raw_and_escaped();
-                    if !(config.ascii_output || escaped || has_del && config.jq_compat) {
-                        // Zero-copy: output raw bytes directly (includes quotes)
-                        out.write_all(raw)?;
-                    } else if let Ok(decoded) = s.as_str() {
-                        // Has escapes or ASCII mode - decode and re-encode for normalization
-                        out.write_all(b"\"")?;
-                        let escaped = if config.ascii_output {
-                            escape_json_string_ascii(&decoded)
-                        } else {
-                            escape_json_string(&decoded)
-                        };
-                        out.write_all(escaped.as_bytes())?;
-                        out.write_all(b"\"")?;
-                    } else {
-                        // Decode failed - output raw bytes as fallback
-                        out.write_all(raw)?;
-                    }
+                    write_json_string_zero_copy(out, raw, escaped, has_del, s, config)?;
                 }
                 StandardJson::Array(elements) => {
                     if elements.is_empty() {
@@ -6666,25 +6677,12 @@ where
                         ))
                         .into());
                     };
-                    // #2591/#2592: a raw DEL byte (0x7f) is legal unescaped
-                    // JSON source but still needs re-encoding under jq's own
-                    // escape convention -- see the sibling gate in
-                    // `write_json_string_pretty` (src/json/light.rs).
+                    // Zero-copy optimization when the source span needs no
+                    // re-encoding under jq's own escape convention -- see
+                    // `write_json_string_zero_copy`'s own doc comment
+                    // (#2591/#2592) for the raw-DEL-byte exception.
                     let (raw, escaped, has_del) = k.raw_and_escaped();
-                    if !(config.ascii_output || escaped || has_del && config.jq_compat) {
-                        out.write_all(raw)?;
-                    } else if let Ok(decoded) = k.as_str() {
-                        out.write_all(b"\"")?;
-                        let escaped = if config.ascii_output {
-                            escape_json_string_ascii(&decoded)
-                        } else {
-                            escape_json_string(&decoded)
-                        };
-                        out.write_all(escaped.as_bytes())?;
-                        out.write_all(b"\"")?;
-                    } else {
-                        out.write_all(raw)?;
-                    }
+                    write_json_string_zero_copy(out, raw, escaped, has_del, k, config)?;
                 }
                 bail_if_keys_malformed(&keys, doc_text)?;
                 out.write_all(b"]")?;
@@ -6718,25 +6716,12 @@ where
                         ))
                         .into());
                     };
-                    // #2591/#2592: a raw DEL byte (0x7f) is legal unescaped
-                    // JSON source but still needs re-encoding under jq's own
-                    // escape convention -- see the sibling gate in
-                    // `write_json_string_pretty` (src/json/light.rs).
+                    // Zero-copy optimization when the source span needs no
+                    // re-encoding under jq's own escape convention -- see
+                    // `write_json_string_zero_copy`'s own doc comment
+                    // (#2591/#2592) for the raw-DEL-byte exception.
                     let (raw, escaped, has_del) = k.raw_and_escaped();
-                    if !(config.ascii_output || escaped || has_del && config.jq_compat) {
-                        out.write_all(raw)?;
-                    } else if let Ok(decoded) = k.as_str() {
-                        out.write_all(b"\"")?;
-                        let escaped = if config.ascii_output {
-                            escape_json_string_ascii(&decoded)
-                        } else {
-                            escape_json_string(&decoded)
-                        };
-                        out.write_all(escaped.as_bytes())?;
-                        out.write_all(b"\"")?;
-                    } else {
-                        out.write_all(raw)?;
-                    }
+                    write_json_string_zero_copy(out, raw, escaped, has_del, k, config)?;
                 }
                 bail_if_keys_malformed(&keys, doc_text)?;
                 out.write_all(separator.as_bytes())?;
