@@ -32171,7 +32171,7 @@ fn eval_static_component_fallback<S: EvalSemantics>(
         values.len() <= 1,
         "eval_static_component_fallback: {component:?} produced {} outputs, but every \
          caller requires a single-valued tail (see needs_fanout_pass)",
-        values.len()
+        values.len() // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- a panic-message format argument for the #682 single-valued-tail pin, evaluated only if that assert's own condition is false (#2190)"
     );
     Ok(match values.len() {
         1 => Some(values.pop().expect("len checked")),
@@ -32222,12 +32222,12 @@ fn navigate_static_component<S: EvalSemantics>(
                 // Unreachable: `classify_static_component` answers `Field`
                 // only for an object. `null` is what it would answer for a
                 // key that is not there anyway, so this needs no panic.
-                _ => OwnedValue::Null,
+                _ => OwnedValue::Null, // omni-dev: coverage tolerate-line reason="unreachable: classify_static_component answers Field only for OwnedValue::Object, and it was handed this very value (#2190)"
             },
             StaticAccess::Index(i) => match current {
                 OwnedValue::Array(mut items) => items.swap_remove(i),
                 // Unreachable, and `null`, for the same reasons.
-                _ => OwnedValue::Null,
+                _ => OwnedValue::Null, // omni-dev: coverage tolerate-line reason="unreachable: classify_static_component answers Index only for OwnedValue::Array, and it was handed this very value (#2190)"
             },
             StaticAccess::Null => OwnedValue::Null,
             StaticAccess::Fallback => {
@@ -32304,7 +32304,7 @@ impl WalkNode<'_> {
     fn field(&self, name: &str) -> Self {
         self.pick(|value| match value {
             OwnedValue::Object(map) => map.get(name),
-            _ => None,
+            _ => None, // omni-dev: coverage tolerate-line reason="unreachable: the only caller reaches this after classify_static_component answered Field for this same value, which it does only for an object (#2190)"
         })
     }
 
@@ -32348,7 +32348,7 @@ fn slot_of(value: &OwnedValue, slot: usize) -> Option<&OwnedValue> {
     match value {
         OwnedValue::Object(map) => map.get_index(slot).map(|(_, child)| child),
         OwnedValue::Array(items) => items.get(slot),
-        _ => None,
+        _ => None, // omni-dev: coverage tolerate-line reason="unreachable: both callers establish the container first -- navigate_static_component_ref via classify_static_component's Index arm, and walk_path's Expr::Iterate arm by matching on the container itself (#2190)"
     }
 }
 
@@ -55750,7 +55750,7 @@ mod tests {
 
         let from_doc = WalkNode::Doc(&doc).child_at(1);
         let WalkNode::Doc(child) = from_doc else {
-            panic!("a document node's child must stay borrowed, not be copied");
+            panic!("a document node's child must stay borrowed, not be copied") // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- this is the failure message for the assertion the test exists to make (#2190)"
         };
         assert!(
             core::ptr::eq(child, &doc.as_array().expect("array")[1]),
