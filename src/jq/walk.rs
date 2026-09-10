@@ -1309,7 +1309,10 @@ fn node_reads_ambient(node: &Expr) -> bool {
         Expr::Assign { .. }
         | Expr::Update { .. }
         | Expr::CompoundAssign { .. }
-        | Expr::AlternativeAssign { .. } => true,
+        | Expr::AlternativeAssign { .. }
+        // yq's `PATH <slot> = value` (#798) is the same shape: it answers
+        // with the document, metadata written, leaving the value alone.
+        | Expr::MetaAssign { .. } => true,
 
         // Reads unless the builtin is one of the few that ignore their input
         // entirely. Everything with an argument still reads: `map(1)`,
