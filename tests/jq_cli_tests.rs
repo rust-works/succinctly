@@ -23154,6 +23154,64 @@ fn test_outer_dollar_param_reaches_through_nesting_2555() -> Result<()> {
     Ok(())
 }
 
+/// #2555 review: a repeated parameter name asks *three* different questions,
+/// and "does this list bind `$name` at all?" is the one **not** decided by
+/// the last occurrence. A trailing *bare* parameter shadows the filter
+/// namespace only -- it cannot unbind the `$a` an earlier `$`-style
+/// parameter established, which stays in scope for the whole body. So an
+/// outer `$a` must not reach into a def declared `($a; a)`.
+///
+/// The first four rows caught a regression in this PR's own first draft,
+/// which asked the question with the *last-occurrence* rule and let the
+/// outer value leak in. The last two are the same defect at the sibling
+/// call site (`substitute_var_impl`), which was wrong on `main` too --
+/// nothing had exercised a repeated `($a; a)` parameter list with an
+/// enclosing `$a` to leak. All confirmed live against jq 1.7.1.
+#[test]
+fn test_trailing_bare_param_does_not_unbind_an_earlier_dollar_one_2555() -> Result<()> {
+    for (filter, expected) in [
+        ("def f($a): def h($a; a): $a; h(1;2); f(9)", "1"),
+        ("def f($a): def h($a; a): [$a, a]; h(1;2); f(9)", "[1,2]"),
+        ("def f($a): def h($a; a; a): $a; h(1;2;3); f(9)", "1"),
+        ("def f($a): def h($a; a): def q: $a; q; h(1;2); f(9)", "1"),
+        // the `substitute_var_impl` sibling: an outer `as`-bound $a, rather
+        // than an outer parameter's own
+        ("9 as $a | def f($a; a): $a; f(1;2)", "1"),
+        ("5 as $a | def f($a;a): [$a, a]; f(1;2)", "[1,2]"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 0, "filter: {filter:?}, stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "filter: {filter:?}");
+    }
+    Ok(())
+}
+
+/// #2555 review, the boundary either side of the rule above: a list with
+/// **no** `$`-style occurrence of the name binds no `$a`, so an outer one
+/// still reaches through; and the last-occurrence rule remains correct for
+/// the *other* two questions (which argument each namespace resolves to
+/// inside the def -- #2560). Confirmed live against jq 1.7.1.
+#[test]
+fn test_repeated_param_name_binding_questions_stay_distinct_2555() -> Result<()> {
+    for (filter, expected) in [
+        // no `$`-style occurrence at all -- outer $a reaches through
+        ("def f($a): def h(a; a): $a; h(1;2); f(9)", "9"),
+        // a `$`-style occurrence anywhere blocks it, leading or trailing
+        ("def f($a): def h(a; $a): $a; h(1;2); f(9)", "2"),
+        ("def f($a): def h($a; $a): $a; h(1;2); f(9)", "2"),
+        // ...and *which* argument $a then resolves to is still the last
+        // `$`-style occurrence, while bare `a` is the last of any spelling
+        ("def f($a; a): $a; f(1;2)", "1"),
+        ("def f($a; a): a; f(1;2)", "2"),
+        ("5 as $a | def f(a;a): $a + a; f(1;2)", "7"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 0, "filter: {filter:?}, stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "filter: {filter:?}");
+    }
+    Ok(())
+}
+
 /// #2726: a **bare** parameter creates no `$`-binding, so `$a` in its body
 /// is not this call's argument. jq 1.7.1 rejects the program outright
 /// ("$a is not defined"); succinctly answered `1`, silently treating the
@@ -23174,6 +23232,27 @@ fn test_bare_param_does_not_create_a_dollar_binding_2726() -> Result<()> {
         stderr.contains("$a"),
         "the error should name the unbound variable, got: {stderr:?}"
     );
+    Ok(())
+}
+
+/// #2726, the shape of that rejection as it actually ships: an *evaluation*
+/// error, so `try`/`?` catch it, where jq's compile-time refusal cannot be
+/// caught by the program at all. Pinned rather than left implicit, because
+/// it is the visible consequence of #2734 (the general
+/// compile-vs-evaluation timing gap) landing on this newly-rejected
+/// program, and it is what a reader comparing against jq will hit first.
+#[test]
+fn test_bare_param_dollar_rejection_is_catchable_here_unlike_jq_2726() -> Result<()> {
+    // jq: compile error, exit 3, nothing catches it.
+    let (stdout, stderr, code) =
+        run_jq_full(&["-nc", r#"def f(a): try $a catch "caught"; f(1)"#], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), r#""caught""#);
+
+    // Same for postfix `?`, which suppresses it into an empty stream.
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "def f(a): $a?; f(1)"], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "");
     Ok(())
 }
 

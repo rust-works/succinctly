@@ -653,16 +653,19 @@ pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr)
 /// - `Expr::FuncDef`: genuinely different in all three, not just in
 ///   *whether* something is shadowed but in what "shadowed" even means
 ///   (`install_def_calls`: same name and arity, and the fully-shadowed
-///   branch clones the whole node, preserving its cache; `substitute_func_param`:
-///   two independent conditions, one for `body` (a nested `def`'s own bare
-///   parameters) and one for `then` (a nested zero-arity `def` of the same
-///   name); `substitute_var_impl`: no shadow condition at all -- a nested
-///   `def`'s bare parameters live in a separate namespace from the `$`-bound
-///   name being substituted (#2141) and can never shadow it, so `body` and
-///   `then` are both always recursed) -- no shared unconditional shape
-///   exists to fall back to, so all three keep their own complete arm and
-///   never reach this
-///   function's own arm for it.
+///   branch clones the whole node, preserving its cache;
+///   `substitute_func_param`: since #2555, a per-namespace `SubstScope`
+///   rather than a boolean -- a nested matching parameter of *either*
+///   spelling shadows the bare name, a `$`-style one additionally shadows
+///   `$name`, and a nested zero-arity `def` of the name shadows the bare
+///   name in `then`, so a subtree can be shadowed in one namespace while
+///   the other still substitutes; `substitute_var_impl`: shadowed exactly
+///   when this def's own parameters bind `$name` (`params_bind_dollar`,
+///   shared with the above since #2555), since a nested `def`'s *bare*
+///   parameters live in a separate namespace from the `$`-bound name being
+///   substituted (#2141, #2283) and can never shadow it) -- no shared
+///   unconditional shape exists to fall back to, so all three keep their own
+///   complete arm and never reach this function's own arm for it.
 ///
 /// The five arms named above (`Shared`, `Error`, `Builtin`, `FuncDef`, and
 /// `install_def_calls`'s own `DefCall` policy) are therefore never actually
