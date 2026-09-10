@@ -3187,55 +3187,6 @@ fn push_generic_document_validation_error<C: DocumentCursor>(
     }
 }
 
-/// The wildcard bridge's ambient materialization, as a check that builds
-/// nothing (#2476).
-///
-/// `eval_single`'s `_` arm materializes the *ambient* value
-/// (`to_owned_with_cursor`) before handing the expression to the eager
-/// evaluator, and that materialization is where a malformed document raises
-/// for a query that never reads `.`: jq rejects the whole document for every
-/// query, and `test_try_catch_contains_a_genuinely_catchable_malformed_key_error_1812`
-/// pins `try (1+1) catch "x"` on `{123: 1}` exiting 5. The `Expr::And`/
-/// `Expr::Or`/`Expr::Arithmetic`/`Expr::Negate` arms were gated on
-/// `needs_path_context` purely to keep that raise (see their comments), so
-/// every ungated shape stayed on the bridge. But the materialization costs
-/// the size of the *expanded* value, and on a document shaped as an alias
-/// fan-out (`aN: &aN [*a(N-1), *a(N-1)]`) the root contains `aN`, so every
-/// bridged expression at the root -- `true and true`, `1+1`, `not`, `//`,
-/// `any` -- cost `O(2^N)` whatever its operands read (#2476).
-///
-/// This is the same raise without the value. [`push_generic_document_validation_error`]
-/// is `to_owned_cursor_at_depth`'s own traversal and checks (decode failures,
-/// #1194 structural errors, #1642 key collisions, #2211/#2243/#2349 comma
-/// gaps, the #998 depth guard) building no `OwnedValue`, and since #1804 it
-/// does not descend into a container reached through an alias -- which is
-/// what makes it `O(N)` on the fan-out where the bridge is `O(2^N)`.
-/// Verified against the bridge over a corpus spanning every class those
-/// checks cover, in both modes and for both cursor types
-/// (`test_ambient_validation_agrees_with_bridge_2476` in
-/// `tests/jq_cli_tests.rs` and its yq twin): identical exit code and message
-/// on every row. The one shape that differs by construction is #1804's
-/// accepted trade-off, now shared by every arm that calls this: a decode
-/// failure reachable *only* through an alias to a container no longer raises
-/// from these arms either (recorded in `docs/compliance/yq/limitations.md`).
-///
-/// `None` without a cursor: `to_owned_with_cursor(&value, None)` on an
-/// already-owned value cannot fail, so the bridge had nothing to raise there
-/// either. A document deeper than `MAX_NESTING_DEPTH` reports a
-/// `decode_failure`-tagged error from this walk, matching what
-/// `to_owned_with_cursor`'s own materialization now returns at the same
-/// boundary (#2627 fixed both from a `panic!` to this) -- route-independent.
-///
-/// Call this only on the shape that used to bridge (`!needs_path_context`
-/// for a gated arm; unconditionally for an arm that had no native route at
-/// all): an operand that reads path context could not have stood on a
-/// malformed document's root and survived the walk to it anyway, and that
-/// shape never paid the decode, so charging it a walk now would be a new
-/// cost, not a replaced one.
-fn ambient_validation_error<V: DocumentValue>(cursor: Option<V::Cursor>) -> Option<Control> {
-    cursor.and_then(|c| push_generic_document_validation_error(&c, 0))
-}
-
 /// Append one truthiness bit per output of a `GenericResult` stream to
 /// `out`. Mirrors [`super::eval::push_truthiness`] for the generic
 /// evaluator's cursor-aware result type — used to fan `select`'s condition
@@ -3249,17 +3200,22 @@ fn push_generic_truthiness<V: DocumentValue>(
         // `DocumentCursor::is_falsy` answers this in O(1) without
         // materializing the value at all -- an arbitrarily deep object/
         // array previously paid a full recursive `to_owned_cursor` copy
-        // just to learn it isn't `null`/`false` (#1645). `is_falsy` itself
-        // is deliberately silent on a value that fails to decode (its own
-        // doc comment: "conservative assumption", matching `--exit-status`'s
-        // pre-existing, best-effort use of it) -- `select`'s own filtering
-        // needs the real #1247/#1194 raise instead, so that check runs
-        // first, same as `to_owned_at_depth`'s own two checks in the same
-        // order, just without materializing on the ordinary-value path.
+        // just to learn it isn't `null`/`false` (#1645).
+        //
+        // #2692: and it is the *whole* of the answer. Until then a
+        // `push_generic_document_validation_error` walk ran first, so
+        // `select`/`if`/`not`/`and`/`or` raised on a malformed document
+        // they only ever asked "is this null or false?" about. That walk
+        // is gone: reading truthiness decodes nothing, so under ADR-0018's
+        // #2103 amendment it validates nothing. `is_falsy`'s deliberate
+        // silence on a value that fails to decode (its own doc comment:
+        // "conservative assumption", matching `--exit-status`'s
+        // pre-existing, best-effort use of it) is now the answer these
+        // callers get rather than a default the walk pre-empted. A caller
+        // that goes on to *materialize* the value still validates it
+        // there -- `select(.)` without a discarding `| 1` raises from the
+        // printer's own walk, exactly as a bare `.` does.
         GenericResult::OneCursor(c) => {
-            if let Some(control) = push_generic_document_validation_error(&c, 0) {
-                return Some(control);
-            }
             // `select`'s condition truthiness is about the real value, not
             // about what a later `-e`/JSON-output convention would sanitize
             // it to -- `Preserve` keeps a malformed number truthy here the
@@ -3274,9 +3230,6 @@ fn push_generic_truthiness<V: DocumentValue>(
         }
         GenericResult::ManyCursor(cs) => {
             for c in &cs {
-                if let Some(control) = push_generic_document_validation_error(c, 0) {
-                    return Some(control);
-                }
                 out.push(!c.is_falsy(JsonConvention::Preserve));
             }
         }
@@ -3325,22 +3278,23 @@ fn push_generic_truthiness<V: DocumentValue>(
 /// replaces the terminating control with its own error, the same precedence
 /// [`flatten_generic_results`] uses when materializing a batch.
 ///
-/// #2661 originally tagged this function's `Err` arm as unreachable, on the
-/// premise that both call sites only place already-successfully-converted
-/// items into `kept`. That premise holds for the `Many` (bare `V`) call site
-/// -- its loop already ran `to_owned` on each item before keeping it -- but
-/// not for `ManyCursor`: its loop only runs the cheap
-/// [`push_generic_document_validation_error`] walk before keeping a cursor,
-/// and that walk deliberately stops at a container-target alias (#1804), so
-/// a kept item can be an alias whose target is corrupt. `to_owned_cursor`
-/// here has no such short-circuit and genuinely fails on it -- confirmed live
-/// with `x: &X ["bad\qc"]` / `y: &Y [*X, "bad\qd"]` / `a:\n  q: *Y`, filter
-/// `.a | (.q[] // 1)`: `*X` passes the cheap check (kept), a later element
-/// fails it (the `control` this function is called with), and re-converting
-/// `*X` here fails too -- for a different reason than `control`, per this
-/// function's own documented precedence above. So this arm is reachable and
-/// exercised by `test_alternative_manycursor_prefix_conversion_error_2476`
-/// (`tests/yq_cli_tests.rs`), not tolerate-line'd.
+/// The `Err` arm below is unreachable, and the history is worth keeping
+/// because it has now flipped twice. #2661 first tagged it unreachable, on
+/// the premise that every call site only places already-successfully-
+/// converted items into `kept`. #2476 falsified that for the `ManyCursor`
+/// call site: its loop kept a cursor after only the cheap
+/// `push_generic_document_validation_error` walk, and that walk deliberately
+/// stopped at a container-target alias (#1804), so a kept item could be an
+/// alias whose target is corrupt and `to_owned_cursor` here genuinely failed
+/// on it. #2692 removed the walk from `retain_truthy_generic` altogether --
+/// reading truthiness validates nothing -- and with it the `ManyCursor` call
+/// site, which no longer has a mid-stream control to carry a prefix for.
+///
+/// So the only caller left is `retain_truthy_generic`'s `Many` (bare `V`)
+/// arm, whose loop runs `to_owned` on each item *before* keeping it. Every
+/// item in `kept` has therefore already converted successfully once, and
+/// re-converting it here cannot fail -- #2661's original premise, now true
+/// again because the counterexample was deleted rather than fixed.
 fn owned_prefix_partial<V: DocumentValue, T>(
     kept: &[T],
     to_owned_one: impl Fn(&T) -> Result<OwnedValue, EvalError>,
@@ -3350,7 +3304,7 @@ fn owned_prefix_partial<V: DocumentValue, T>(
     for item in kept {
         match to_owned_one(item) {
             Ok(v) => prefix.push(v),
-            Err(e) => return GenericResult::Error(e),
+            Err(e) => return GenericResult::Error(e), // omni-dev: coverage tolerate-line reason="unreachable: the sole remaining caller (`retain_truthy_generic`'s `Many` arm) runs `to_owned` on an item before keeping it, so re-converting a kept item here cannot fail; the `ManyCursor` caller that made this reachable went with the truthiness walk (#2692, re-establishing #2661's premise)"
         }
     }
     partial_generic(prefix, control)
@@ -3363,10 +3317,10 @@ fn owned_prefix_partial<V: DocumentValue, T>(
 ///
 /// Every arm answers truthiness by exactly the rule its
 /// `push_generic_truthiness` counterpart uses, so `//` and `and`/`or`/`not`
-/// cannot drift apart on what "truthy" means: `OneCursor`/`ManyCursor` run
-/// [`push_generic_document_validation_error`] first and then read
-/// `is_falsy(Preserve)` (so a #1194/#1247/#1642 document raises here as it
-/// does under `select`, and a malformed *number* stays truthy);
+/// cannot drift apart on what "truthy" means: `OneCursor`/`ManyCursor` read
+/// `is_falsy(Preserve)` and nothing else, validating nothing (#2692 -- see
+/// that function's `OneCursor` arm for why reading truthiness decodes
+/// nothing and so raises nothing, and a malformed *number* stays truthy);
 /// `LazyKeys`/`LazyIndexRange` are array-shaped and therefore always truthy
 /// without materializing; `LazySeq` must still be pulled, because it runs
 /// arbitrary `map(f)` whose failure has to surface rather than be reported as
@@ -3392,9 +3346,6 @@ fn retain_truthy_generic<V: DocumentValue>(result: GenericResult<V>) -> GenericR
             Err(e) => GenericResult::Error(e),
         },
         GenericResult::OneCursor(c) => {
-            if let Some(control) = push_generic_document_validation_error(&c, 0) {
-                return partial_generic(Vec::new(), control);
-            }
             if c.is_falsy(JsonConvention::Preserve) {
                 GenericResult::None
             } else {
@@ -3423,9 +3374,6 @@ fn retain_truthy_generic<V: DocumentValue>(result: GenericResult<V>) -> GenericR
         GenericResult::ManyCursor(cs) => {
             let mut kept: Vec<V::Cursor> = Vec::new();
             for c in cs {
-                if let Some(control) = push_generic_document_validation_error(&c, 0) {
-                    return owned_prefix_partial(&kept, to_owned_cursor, control);
-                }
                 if !c.is_falsy(JsonConvention::Preserve) {
                     kept.push(c);
                 }
@@ -7115,11 +7063,18 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // `needs_path_context` gate to lose, and no shape that escaped the
         // cost. The bridge's first act is `to_owned_with_cursor` on the
         // *ambient* value, `O(2^N)` on an alias fan-out document (#2476), and
-        // it is charged before either operand runs, so `(false // 1)` paid it
-        // exactly as `(.aN // 1)` did. `ambient_validation_error` is that
-        // materialization's raise without the value -- unconditional here,
-        // because the whole construct is the "shape that used to bridge" its
-        // doc comment names.
+        // it was charged before either operand ran, so `(false // 1)` paid it
+        // exactly as `(.aN // 1)` did. #2476 replaced that materialization
+        // with an equivalent validation walk (`ambient_validation_error`),
+        // which #2173 then charged only to a `//` that reads the document;
+        // #2692 removed the walk and its gate together, because a `//` that
+        // reads `.` reads only its truthiness -- `is_falsy`, which decodes
+        // nothing -- so it validates no more of the ambient value than
+        // `1+1` does. `false // 1` on a malformed document
+        // now answers `1` at exit 0, as `1+1` already answered `2`. What the
+        // operands themselves read is unchanged and still governs: `. // 1`
+        // reads `.`'s truthiness, and reading truthiness validates nothing
+        // either (see [`retain_truthy_generic`]).
         //
         // Below it, `eval::eval_alternative` mirrored arm for arm, with
         // `retain_truthy_generic` (the cursor-preserving twin of
@@ -7156,16 +7111,6 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // only path-context read sits inside a `//` is still never routed to
         // path-context evaluation, and this arm does not change that table.
         Expr::Alternative(left, right) => {
-            // #2173: the walk is charged only to a `//` that reads the
-            // document. `false // 1` reads nothing, so under #2103's rule --
-            // a filter validates only what it reads -- it validates nothing,
-            // exactly as the bridge it replaces now does for the same shape
-            // (`bridge_ambient_input`). `(.a? // 1) | 1` still walks.
-            if crate::jq::walk::reads_ambient_value(expr) {
-                if let Some(control) = ambient_validation_error::<V>(cursor) {
-                    return partial_generic(Vec::new(), control);
-                }
-            }
             match retain_truthy_generic(eval_single::<S, V>(left, value.clone(), optional, cursor))
             {
                 // A `break` escapes the operator rather than selecting a branch.
@@ -8053,41 +7998,34 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             | Builtin::UpperInSrc(..),
         ) => bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink),
 
-        // #2180 WP2a: `and`/`or` with a path-context operand, mirroring
-        // `eval_single`'s own gated `Expr::And`/`Expr::Or` pair above --
-        // same gate, same reason (#1812: the bridge's ambient
-        // materialization is what makes `try (1+1) catch "x"` fail on a
-        // #1194-malformed document, and a path-context operand could not
-        // have stood on such a document and survived the walk anyway). The
-        // ungated spelling would have silently taken `.[] | key == "a" and
-        // true` off its cursor when it is reached through a lazy consumer.
-        Expr::And(left, right) if needs_path_context(left) || needs_path_context(right) => {
+        // #2180 WP2a introduced this pair for `and`/`or` with a path-context
+        // operand, gated exactly as `eval_single`'s own `Expr::And`/`Expr::Or`
+        // pair then was, and for the same reason: the bridge's ambient
+        // materialization below is what made `try (1+1) catch "x"` fail on a
+        // #1194-malformed document (#1812), and only the gated-out shapes
+        // needed to keep reaching it.
+        //
+        // Ungated since #2692. That raise is gone -- an `and`/`or` validates
+        // only what its operands materialize, never the ambient document it
+        // does not read -- so the gate had nothing left to preserve, while
+        // the bridge it selected still cost a whole-document
+        // `to_owned_with_cursor` on every top-level `and`/`or`. Every
+        // spelling now takes this native, demand-forwarding arm, which is
+        // also what stops a top-level `true and true` answering differently
+        // from a nested `[true and true]`.
+        Expr::And(left, right) => {
             each_boolean_generic::<S, V>(left, right, false, value, optional, cursor, sink)
         }
-        Expr::Or(left, right) if needs_path_context(left) || needs_path_context(right) => {
+        Expr::Or(left, right) => {
             each_boolean_generic::<S, V>(left, right, true, value, optional, cursor, sink)
         }
-        // #2180 WP2a: everything else `and`/`or`, and `//` at any position,
-        // takes the demand-forwarding owned bridge -- which is *exactly*
-        // what these three already did, minus the demand. `Expr::And`/
-        // `Expr::Or` without path context fell to the `_` fallback below,
-        // whose `eval_single` in turn falls to its own wildcard bridge;
-        // `Expr::Alternative` has no native arm in `eval_single` at all, so
-        // it took that same wildcard for every input. Both wildcards are
-        // `to_owned_with_cursor` + reindex + `eval.rs`, which is
-        // [`bridge_to_each_owned_flow`]'s own body with `eval_full` in place
-        // of `eval_each` -- so nothing is lost by crossing here instead, and
-        // the far side now carries `eval.rs`'s new `each_alternative`/
-        // `each_boolean` arms. Rows captured live against jq 1.7.1 (input
-        // `1`, `G` = `1 as $x ?// $y | 1`): `[first((1 as $x ?// $y |
-        // 5)//9)]` is `[5,5]`, `[first(null // (G))]` is `[1,1]`, and all
-        // four `and`/`or` operand positions are `[true,true]` -- each
-        // answered once before this arm existed, on this route as well as
-        // `eval.rs`'s.
-        Expr::And(..) | Expr::Or(..) | Expr::Alternative(..) => {
-            bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink)
+        // #2692: `//` likewise, through this file's own
+        // [`each_alternative_generic`] rather than the owned bridge -- see
+        // that function for why the laziness the bridge provided had to be
+        // kept rather than dropped onto `eval_single`'s eager native arm.
+        Expr::Alternative(left, right) => {
+            each_alternative_generic::<S, V>(left, right, value, optional, cursor, sink)
         }
-
         // #2180 WP2b: the remaining eager sub-expression sites, mirroring
         // `eval.rs`'s own new arm set -- see that file's `eval_each` match
         // arm for the live-captured oracle rows every one of these closes.
@@ -10943,35 +10881,20 @@ fn eval_boolean_generic<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
-    // #2476: the one place the two arms above share, so the rule is stated
-    // once. A shape with no path-context operand is the shape that used to
-    // fall to the wildcard bridge, and the bridge's ambient materialization
-    // is what raised on a malformed document for an expression that reads
-    // nothing (`try (1+1) catch "x"`, #1812). `ambient_validation_error` is
-    // that raise without the value -- read its doc comment for the parity
-    // evidence and for why an operand that *does* read path context is not
-    // charged the walk (it never paid the materialization either).
+    // #2692: no ambient validation here, and no gate in front of one. This
+    // function used to open with `ambient_validation_error` -- the walk that
+    // stood in for the wildcard bridge's ambient materialization (#2476),
+    // itself standing in for jq's whole-document parse-time rejection
+    // (#1812) -- behind a `!needs_path_context(..)` gate, which #2173 then
+    // narrowed further to operands that actually read `.`.
     //
-    // #2173 narrowed it once more, to operands that actually read `.`.
-    // `true and true` reads nothing, and #2103's rule -- a filter validates
-    // only what it reads -- says it should therefore validate nothing; the
-    // bridge that used to carry this raise no longer raises for that shape
-    // either (`bridge_ambient_input`), so keeping the walk here would have
-    // reinstated by hand the spelling-dependence both changes exist to
-    // remove. `. and true` still walks.
-    // `needs_path_context` checked first so it can short-circuit `&&` and
-    // skip the `reads_ambient_value` tree walk entirely whenever either
-    // operand needs path context -- that case already makes the whole guard
-    // `false` regardless of what the walk would answer.
-    if !needs_path_context(left)
-        && !needs_path_context(right)
-        && (crate::jq::walk::reads_ambient_value(left)
-            || crate::jq::walk::reads_ambient_value(right))
-    {
-        if let Some(control) = ambient_validation_error::<V>(cursor) {
-            return partial_generic(Vec::new(), control);
-        }
-    }
+    // Both gates are gone with the walk they guarded. #2173 had already
+    // reached half of this conclusion for the same reason -- `true and true`
+    // reads nothing, so under ADR-0018's #2103 amendment it validates
+    // nothing -- and stopped at "reads `.`"; #2692 takes the other half,
+    // because `. and true` reads `.`'s *truthiness*, which is `is_falsy` and
+    // decodes nothing either. Each operand still validates whatever it
+    // materializes, via `eval_single` below.
     let (bools, control) = boolean_fanout_bools(
         |operand, out| {
             push_generic_truthiness(
@@ -11015,6 +10938,88 @@ fn generic_item_truthiness<V: DocumentValue>(item: GenericItem<V>) -> Result<boo
         // panic, the same defensive choice `binary_fanout_core` makes for
         // its own impossible `Flow::Stopped`.
         None => Ok(bits.first().copied().unwrap_or(false)),
+    }
+}
+
+/// Demand-forwarding twin of [`eval_alternative`-shaped `Expr::Alternative`
+/// evaluation](eval_single) and the generic mirror of `eval::each_alternative`
+/// (#2692).
+///
+/// `//` used to reach [`bridge_to_each_owned_flow`] from
+/// [`eval_each_generic`], which is `to_owned_with_cursor` + reindex +
+/// `eval.rs` -- so the whole ambient document was materialized before the
+/// operator ran, and that materialization validated it. #2476 gave
+/// `eval_single` a native `Expr::Alternative` arm but left this route
+/// bridged, so a *top-level* `false // 1` still raised on a malformed
+/// document while a nested `[false // 1]` did not. This arm closes that: the
+/// same native evaluation, still demand-forwarding, so a wrapping consumer's
+/// [`Demand::Stop`] reaches the left operand -- and with it a `?//` bind
+/// inside it (#1519) -- and an infinite left generator still terminates
+/// (`first(repeat(1) // 9)` is `1`, not a hang).
+///
+/// **Every truthiness decision is [`retain_truthy_generic`]'s**, one item at
+/// a time rather than over a collected batch, so this route and
+/// `eval_single`'s cannot drift on what `//` keeps (the #106 rule:
+/// duplicated predicates diverge silently). That also means this arm
+/// validates exactly what that function validates, which since #2692 is
+/// nothing -- reading truthiness decodes nothing.
+///
+/// The rules it restates for a pushed rather than collected stream are
+/// `eval::each_alternative`'s, whose doc comment carries the jq 1.7.1 oracle
+/// rows for all of them: truthy left outputs pass and falsy ones are
+/// dropped; the right side answers only when *no* truthy output was
+/// forwarded, and its outputs are emitted unfiltered; a left error or
+/// `break` propagates after the truthy prefix and does not select the right
+/// side; and `outer_stopped` short-circuits the close, because the consumer
+/// rather than the left operand is why production ended.
+fn each_alternative_generic<S: EvalSemantics, V: DocumentValue>(
+    left: &Expr,
+    right: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+) -> Flow {
+    let mut forwarded = 0usize;
+    let mut outer_stopped = false;
+    let mut escape: Option<Control> = None;
+    let left_flow = eval_each_generic::<S, V>(left, value.clone(), optional, cursor, &mut |item| {
+        match retain_truthy_generic(generic_item_to_result(item)) {
+            // Falsy: dropped, and the left operand keeps producing.
+            GenericResult::None => Demand::Continue,
+            GenericResult::Error(e) => stop_with_escape(&mut escape, Control::Error(e)),
+            GenericResult::Break(l) => stop_with_escape(&mut escape, Control::Break(l)),
+            GenericResult::Halt(c) => stop_with_escape(&mut escape, Control::Halt(c)),
+            kept => {
+                forwarded += 1;
+                match drain_result_generic(kept, sink) {
+                    Flow::Exhausted => Demand::Continue,
+                    Flow::Stopped { .. } => {
+                        outer_stopped = true;
+                        Demand::Stop
+                    }
+                    Flow::Escaped(control) => stop_with_escape(&mut escape, control),
+                }
+            }
+        }
+    });
+
+    if outer_stopped {
+        return resume_from_escape(escape, left_flow);
+    }
+    if let Some(control) = escape {
+        return resume_from_escape(Some(control), left_flow);
+    }
+    match left_flow {
+        // Whatever the left ended in propagates, and the right side is not
+        // consulted.
+        Flow::Escaped(control) => Flow::Escaped(control),
+        // At least one truthy output was forwarded, so `//` is answered.
+        Flow::Exhausted | Flow::Stopped { .. } if forwarded > 0 => Flow::Exhausted,
+        // No truthy output at all: the right side answers, unfiltered.
+        Flow::Exhausted | Flow::Stopped { .. } => {
+            eval_each_generic::<S, V>(right, value, optional, cursor, sink)
+        }
     }
 }
 
@@ -17717,27 +17722,24 @@ fn try_path_context_absent_walk<S: EvalSemantics, V: DocumentValue>(
 /// Apple M-series release build where the same answer is one `is_falsy`
 /// probe on the first element.
 ///
-/// **Validate once, then scan** -- deliberately *not* "validate each element
-/// as the scan reaches it". The bridge materialized the whole container
-/// before `builtin_any` ran, so an element the early exit never reaches
-/// still raised: `[true, "\x"] | any` exits 5, and real jq agrees for the
-/// stronger reason that it rejects the whole document at parse time
-/// (captured live from jq 1.7.1: `jq: parse error: Invalid escape at line 1,
-/// column 11`, and the same for `[false, "\x"] | all`). Checking per element
-/// with early exit would answer `true` there and drop a raise both
-/// references make. So [`push_generic_document_validation_error`] runs over
-/// the whole input first -- the same raise-set without the value, `O(N)` on
-/// the fan-out because of #1804's alias short-circuit -- and the loop below
-/// is then pure `is_falsy`, which materializes nothing and keeps the early
-/// exit `any_all_over` has always had.
+/// **Scan, and validate nothing** (#2692). #2476 opened this function with a
+/// whole-input [`push_generic_document_validation_error`] walk, so that an
+/// element the early exit never reaches still raised: `[true, "\x"] | any`
+/// exited 5, and real jq agreed -- but for the *stronger* reason that it
+/// rejects the whole document at parse time (captured live from jq 1.7.1:
+/// `jq: parse error: Invalid escape at line 1, column 11`, and the same for
+/// `[false, "\x"] | all`). That is precisely the accidental agreement
+/// ADR-0018's #2103 amendment names: succinctly is a semi-index and does not
+/// perform jq's whole-document rejection, so preserving it here bought a
+/// per-spelling divergence (`any` raising where `1+1`, `.` and `length` on
+/// the same document do not) rather than fidelity. `any`/`all` read each
+/// element's truthiness and decode none of it, so under that amendment they
+/// validate nothing, and the walk is gone. The loop below is pure
+/// `is_falsy`, keeping the early exit `any_all_over` has always had.
 ///
-/// It follows that this arm shares #1804's accepted trade-off, exactly as
-/// the `not`/`//` arms of this same issue do: a decode failure reachable
-/// *only* through an alias to a container no longer raises from `any`/`all`
-/// either (`a: &a ["bad\qc"]` / `b: *a` with `.b | any` is `true` at exit 0
-/// where it exited 1 before). `.a | any` and `.b[0]` still raise. Real yq
-/// rejects that document at parse time, so there is no yq behaviour to
-/// match.
+/// `effective_fields_checked`'s own #1642 duplicate-key raise is *not* part
+/// of that removal and still fires below: jq's last-occurrence rule needs the
+/// keys resolved, so the object arm genuinely reads them.
 ///
 /// Mode split mirrored arm for arm from [`super::eval::builtin_any`]/
 /// [`super::eval::builtin_all`], including the arm *order* #1901's review
@@ -17766,9 +17768,6 @@ fn any_all_generic<S: EvalSemantics, V: DocumentValue>(
     name: &str,
     target_truthy: bool,
 ) -> GenericResult<V> {
-    if let Some(control) = push_generic_document_validation_error(&cursor, 0) {
-        return partial_generic(Vec::new(), control);
-    }
     let answer = |b: bool| GenericResult::Owned(OwnedValue::Bool(b));
     // One closure called from both the object arm and the scalar arm, not
     // two copies of the same call -- `builtin_any`'s own `yq_reject_non_array`

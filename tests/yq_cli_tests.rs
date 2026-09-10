@@ -2539,6 +2539,32 @@ fn assert_yq_raises(
     );
 }
 
+/// [`assert_yq_raises`]'s opposite number, for the consumers of the same
+/// corrupted documents that must *not* raise since #2692: a filter that only
+/// tests a value's truthiness never decodes it.
+///
+/// Asserts the answer, not just exit 0, for the same reason its sibling
+/// asserts the message rather than the code -- "did not raise" and "produced
+/// the right value" are different claims, and only the second would catch a
+/// route that silently stopped emitting.
+fn assert_yq_answers(
+    label: &str,
+    op_label: &str,
+    filter: &str,
+    yaml: &str,
+    extra_args: &[&str],
+    expect_stdout: &str,
+) {
+    let (out, err, code) = run_yq_stdin_with_stderr(filter, yaml, extra_args)
+        .unwrap_or_else(|e| panic!("[{label}] {op_label} run failed: {e}"));
+    assert_eq!(code, 0, "[{label}] {op_label} must answer, stderr: {err}");
+    assert_eq!(
+        out.trim(),
+        expect_stdout,
+        "[{label}] {op_label} answer, stderr: {err}"
+    );
+}
+
 /// #1803: `select(.bad) | .keep` (`push_generic_document_validation_error`)
 /// and a write op (`.keep = 9`, which forces the YAML DOM path per ADR-0017
 /// -- `to_owned_with_comments_at_depth`/`to_owned_at_depth`/
@@ -2609,13 +2635,18 @@ keep: 5
     ];
 
     for (label, yaml, expect_stderr) in cases {
-        assert_yq_raises(
+        // #2692: `select` moved to the answering side -- it tests `.bad`'s
+        // truthiness without decoding it. Kept in this list rather than
+        // deleted, because the list's job is pinning that every consumer of
+        // one document agrees, and that includes which side of the line each
+        // one is on.
+        assert_yq_answers(
             label,
             "select(.bad)",
             "select(.bad) | .keep",
             yaml,
             &[],
-            expect_stderr,
+            "5",
         );
         assert_yq_raises(label, ".keep = 9", ".keep = 9", yaml, &[], expect_stderr);
         assert_yq_raises(
@@ -2773,7 +2804,9 @@ proptest! {
         let expect_stderr = malformation.expect_stderr();
         let label = format!("{path:?}/{malformation:?}/{style:?}");
 
-        assert_yq_raises(&label, "select(.bad)", "select(.bad) | .keep", &yaml, &[], expect_stderr);
+        // #2692: `select` answers -- it tests `.bad` without decoding it.
+        // The write ops below still raise, because they materialize.
+        assert_yq_answers(&label, "select(.bad)", "select(.bad) | .keep", &yaml, &[], "5");
         assert_yq_raises(&label, ".keep = 9", ".keep = 9", &yaml, &[], expect_stderr);
         assert_yq_raises(
             &label,
@@ -30749,38 +30782,42 @@ fn test_select_resolves_alias_falsiness_1645() -> Result<()> {
     Ok(())
 }
 
-/// #1645 code review: every JSON-side corruption regression test
-/// (`tests/jq_cli_tests.rs`) has no YAML sibling -- `push_generic_document_validation_error`
-/// is generic over `DocumentCursor` and reached identically by the yq
-/// evaluator, but nothing pinned that `select()` actually raises on a YAML
-/// decode failure nested inside its condition's container, only that it
-/// resolves alias falsiness correctly. Uses `\q` (not a recognized YAML
-/// escape) rather than `\x` (a valid two-hex-digit escape in YAML, unlike
-/// JSON) -- confirmed live against this binary that `\x41` decodes
-/// successfully in a YAML double-quoted string.
+/// #1645/#2692, the YAML sibling of
+/// `test_select_passes_through_corruption_it_only_tests_1645_2692`
+/// (`tests/jq_cli_tests.rs`).
+///
+/// #1645 code review noted that every JSON-side corruption regression test
+/// had no YAML sibling, even though the validation gate is generic over
+/// `DocumentCursor` and reached identically by the yq evaluator -- so this
+/// pinned `select()` raising on a YAML decode failure nested inside its
+/// condition's container. #2692 removed that gate from every truthiness
+/// reader in both modes, so the assertion inverts here exactly as it does on
+/// the jq side, and the materializing route below is what still raises.
+///
+/// Uses `\q` (not a recognized YAML escape) rather than `\x` (a valid
+/// two-hex-digit escape in YAML, unlike JSON) -- confirmed live against this
+/// binary that `\x41` decodes successfully in a YAML double-quoted string.
 #[test]
-fn test_select_raises_on_yaml_decode_failure_nested_in_container_1645() -> Result<()> {
+fn test_select_passes_through_yaml_decode_failure_nested_in_container_1645_2692() -> Result<()> {
     let doc = "bad:\n  - \"\\q\"\nkeep: 5\n";
 
     let (select_out, select_err, select_code) =
         run_yq_stdin_with_stderr("select(.bad) | .keep", doc, &[])?;
-    assert_ne!(
+    assert_eq!(
         select_code, 0,
-        "select(.bad) must raise on the nested decode failure\nstdout: {select_out:?}\nstderr: {select_err:?}"
+        "select(.bad) only tests the container and must not raise\
+         \nstdout: {select_out:?}\nstderr: {select_err:?}"
     );
-    assert!(
-        select_err.contains("invalid escape sequence"),
-        "stderr: {select_err:?}"
-    );
+    assert_eq!(select_out.trim(), "5", "stderr: {select_err:?}");
 
     // `.bad,.bad` is yq's multi-output materializing route (yq's analogue
-    // of jq's `-Sc`/`.,.` DOM-forcing tests) -- confirms select's new walk
-    // agrees with the pre-existing materializing path on this input.
+    // of jq's `-Sc`/`.,.` DOM-forcing tests) -- the raise did not disappear,
+    // it moved to whoever actually reads the bytes.
     let (materialize_out, materialize_err, materialize_code) =
         run_yq_stdin_with_stderr(".bad,.bad", doc, &[])?;
     assert_ne!(
         materialize_code, 0,
-        "the materializing route must raise the same way\nstdout: {materialize_out:?}\nstderr: {materialize_err:?}"
+        "the materializing route must still raise\nstdout: {materialize_out:?}\nstderr: {materialize_err:?}"
     );
     assert!(
         materialize_err.contains("invalid escape sequence"),
@@ -30901,30 +30938,48 @@ fn test_select_no_longer_raises_on_decode_failure_reachable_only_via_alias_1804(
     Ok(())
 }
 
-/// Code review on #1804's fix: an earlier version of the alias
-/// short-circuit gated on `c.is_alias()` before knowing whether the
-/// resolved target was a container or a scalar -- so it also swallowed a
-/// decode failure reachable through a bare *scalar*-target alias, even
-/// though resolving a scalar target costs O(1) (no children to cascade
-/// through) and was never part of the O(2^N) fan-out this issue fixes.
-/// Confirmed live against the two binaries either side of that fix: this
-/// exact input raised pre-fix, silently passed with the broad gate, and
-/// raises again with the container-only gate. Unlike the sibling test
-/// above (`b: *a` where `a` is an *array*), this one aliases a bare
-/// scalar directly.
+/// #1804's container/scalar distinction, and #2692 dissolving it.
+///
+/// Code review on #1804's fix caught that an earlier version of the alias
+/// short-circuit gated on `c.is_alias()` before knowing whether the resolved
+/// target was a container or a scalar -- so it also swallowed a decode
+/// failure reachable through a bare *scalar*-target alias, even though
+/// resolving a scalar target costs O(1) (no children to cascade through) and
+/// was never part of the O(2^N) fan-out that issue fixed. The gate was
+/// narrowed to containers, and this test pinned the scalar case still
+/// raising.
+///
+/// #2692 removed the walk that gate lived on: `select`'s condition is
+/// `is_falsy`, which decodes nothing, so *neither* alias shape raises now and
+/// the distinction has no observable consequence left. The test is kept,
+/// inverted, because the shape is still the one that would break first if a
+/// validating walk ever crept back into a truthiness check -- and because
+/// #1804's cost argument is the reason `select` was fast enough to leave
+/// alone until #2692 could remove the walk outright.
+///
+/// The raise moved rather than vanishing: materializing the same value still
+/// finds it, and that is asserted below.
 #[test]
-fn test_select_still_raises_on_decode_failure_reachable_only_via_scalar_alias_1804() -> Result<()> {
+fn test_select_no_longer_raises_via_scalar_alias_1804_2692() -> Result<()> {
     let doc = "a: &a \"b\\qc\"\nb: *a\n";
 
     let (stdout, stderr, code) = run_yq_stdin_with_stderr("select(.b) | 1", doc, &[])?;
-    assert_ne!(
+    assert_eq!(
         code, 0,
-        "a decode failure reached through a scalar-target alias must still raise\nstdout: {stdout:?}\nstderr: {stderr:?}"
+        "testing a value reached through a scalar-target alias reads nothing\
+         \nstdout: {stdout:?}\nstderr: {stderr:?}"
     );
-    assert!(
-        stderr.contains("invalid escape sequence"),
-        "stderr: {stderr}"
-    );
+    assert_eq!(stdout.trim(), "1", "stderr: {stderr:?}");
+
+    // The control: materializing that same value still raises.
+    for filter in [".b", ".a"] {
+        let (_, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &[])?;
+        assert_ne!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert!(
+            stderr.contains("invalid escape sequence"),
+            "`{filter}` -- stderr: {stderr}"
+        );
+    }
 
     Ok(())
 }
@@ -39823,93 +39878,57 @@ fn test_foreach_register_reentry_is_jq_mode_only_on_the_write_side_2161() -> Res
     Ok(())
 }
 
-/// #2476, yq twin of `test_ambient_validation_agrees_with_bridge_2476` in
+/// #2692, yq twin of `test_truthiness_probes_validate_nothing_2692` in
 /// `tests/jq_cli_tests.rs`: the same corpus through the YAML cursor (and, for
-/// the JSON-syntax rows, through yq's own reading of them -- most of the
-/// JSON comma-gap shapes are *valid* YAML plain scalars, so those rows pin
-/// exit 0 on every probe rather than a raise). See the jq test for what the
-/// corpus is for and why agreement alone is not the assertion.
+/// the JSON-syntax rows, through yq's own reading of them -- most of the JSON
+/// comma-gap shapes are *valid* YAML plain scalars, which is why they always
+/// answered). See the jq test for what the corpus is for and why agreement
+/// alone is not the assertion.
+///
+/// Every row answers here, with no "unbuildable" exceptions: YAML has no
+/// unterminated-input shape in this list, so the split the jq twin carries
+/// has nothing to catch on this side.
 #[test]
-fn test_ambient_validation_agrees_with_bridge_2476() -> Result<()> {
+fn test_truthiness_probes_validate_nothing_2692() -> Result<()> {
     let deep200 = format!("{}1{}\n", "[".repeat(100), "]".repeat(100));
-    // (label, document, expected exit code, expected stderr substring)
-    let corpus: &[(&str, &str, i32, &str)] = &[
-        (
-            "decode failure, mapping value",
-            "a: \"bad\\q\"\n",
-            1,
-            "invalid escape sequence",
-        ),
-        (
-            "decode failure, in flow sequence",
-            "a: [\"bad\\q\"]\n",
-            1,
-            "invalid escape sequence",
-        ),
+    // (label, document)
+    let corpus: &[(&str, &str)] = &[
+        ("decode failure, mapping value", "a: \"bad\\q\"\n"),
+        ("decode failure, in flow sequence", "a: [\"bad\\q\"]\n"),
         (
             "decode failure, anchored container (root walk reaches the anchor)",
             "a: &a [\"bad\\q\"]\nb: *a\n",
-            1,
-            "invalid escape sequence",
         ),
         (
             "decode failure, anchored scalar",
             "a: &a \"bad\\q\"\nb: *a\n",
-            1,
-            "invalid escape sequence",
         ),
-        (
-            "decode failure, block sequence",
-            "- \"bad\\q\"\n",
-            1,
-            "invalid escape sequence",
-        ),
-        (
-            "decode failure, root scalar",
-            "\"bad\\q\"\n",
-            1,
-            "invalid escape sequence",
-        ),
+        ("decode failure, block sequence", "- \"bad\\q\"\n"),
+        ("decode failure, root scalar", "\"bad\\q\"\n"),
         (
             "decode failure, nested mapping",
             "a:\n  b:\n    c: \"bad\\q\"\n",
-            1,
-            "invalid escape sequence",
         ),
-        (
-            "decode failure, explicitly tagged",
-            "a: !!int \"bad\\q\"\n",
-            1,
-            "invalid escape sequence",
-        ),
+        ("decode failure, explicitly tagged", "a: !!int \"bad\\q\"\n"),
         (
             "#1642 colliding undecodable keys (JSON syntax)",
             "{\"\\ud800\":1,\"\\ud800\":2}",
-            1,
-            "is ambiguous",
         ),
         (
             "#1642 single undecodable key (JSON syntax)",
             "{\"\\ud800\": 1, \"b\": 2}",
-            0,
-            "",
         ),
-        ("#1194 shape is a valid YAML mapping", "{123: 1}", 0, ""),
-        (
-            "JSON structural error is a valid plain scalar",
-            "[xyz123]",
-            0,
-            "",
-        ),
-        ("JSON trailing comma is valid YAML flow", "[1,]", 0, ""),
-        ("JSON lone comma is valid YAML flow", "[,]", 0, ""),
-        ("duplicate keys (valid)", "a: 1\na: 2\n", 0, ""),
-        ("flow trailing comma", "a: [1,]\n", 0, ""),
-        ("flow mapping trailing comma", "a: {b: 1,}\n", 0, ""),
-        ("deep, within the guard", deep200.as_str(), 0, ""),
-        ("null root", "null\n", 0, ""),
-        ("false root", "false\n", 0, ""),
-        ("well-formed", "a: [1, {b: c}]\n", 0, ""),
+        ("#1194 shape is a valid YAML mapping", "{123: 1}"),
+        ("JSON structural error is a valid plain scalar", "[xyz123]"),
+        ("JSON trailing comma is valid YAML flow", "[1,]"),
+        ("JSON lone comma is valid YAML flow", "[,]"),
+        ("duplicate keys (valid)", "a: 1\na: 2\n"),
+        ("flow trailing comma", "a: [1,]\n"),
+        ("flow mapping trailing comma", "a: {b: 1,}\n"),
+        ("deep, within the guard", deep200.as_str()),
+        ("null root", "null\n"),
+        ("false root", "false\n"),
+        ("well-formed", "a: [1, {b: c}]\n"),
     ];
     // #2173 moved the closed terms out of this list -- see the jq twin's
     // own comment. They no longer validate anything, so they cannot agree
@@ -39930,18 +39949,14 @@ fn test_ambient_validation_agrees_with_bridge_2476() -> Result<()> {
         ("0 - 0", "0"),
         ("(-(1))", "-1"),
     ];
-    for (label, doc, want_code, want_stderr) in corpus {
+    for (label, doc) in corpus {
         let mut seen: Vec<(String, i32, String)> = Vec::new();
         for probe in probes {
             let (_stdout, stderr, code) = run_yq_stdin_with_stderr(probe, doc, &[])?;
             let first = stderr.lines().next().unwrap_or("").to_string();
             assert_eq!(
-                code, *want_code,
-                "[{label}] `{probe}`: exit {code}, want {want_code}\nstderr: {stderr}"
-            );
-            assert!(
-                first.contains(want_stderr),
-                "[{label}] `{probe}`: stderr {first:?} lacks {want_stderr:?}"
+                code, 0,
+                "[{label}] `{probe}`: exit {code}, want 0\nstderr: {stderr}"
             );
             seen.push((probe.to_string(), code, first));
         }
@@ -39950,7 +39965,7 @@ fn test_ambient_validation_agrees_with_bridge_2476() -> Result<()> {
             assert_eq!(
                 (code, first),
                 (ref_code, ref_first),
-                "[{label}] `{probe}` disagrees with `select(.) | 1`"
+                "[{label}] `{probe}` disagrees with the reads-nothing reference `1==1`"
             );
         }
         // #2173: a closed term answers exactly as `empty` does -- the
@@ -40090,47 +40105,43 @@ fn test_wildcard_bridge_over_alias_fanout_completes_2173() -> Result<()> {
 /// #2476's one behaviour change: #1804's accepted trade-off, now shared by
 /// `and`/`or`.
 ///
-/// The ungated arms answer through `ambient_validation_error`, which is
-/// `push_generic_document_validation_error` -- and since #1804 that walk
-/// does not descend into a container reached through an alias (that
-/// short-circuit is exactly what makes it `O(N)` on the fan-out where the
-/// bridge is `O(2^N)`). So a decode failure reachable *only* through such an
-/// alias no longer raises from an `and`/`or` at that position, where the
-/// bridge's materialization used to raise. `select(.b) | 1` already answered
-/// `1` on this document before #2476
-/// (`test_select_no_longer_raises_on_decode_failure_reachable_only_via_alias_1804`),
-/// so this is the two routes converging, not a new class of silence.
+/// #2476 answered at the *alias* position only, and did so by inheriting
+/// #1804's short-circuit: the ambient validation walk did not descend into a
+/// container reached through an alias, which is exactly what made it `O(N)`
+/// where the bridge was `O(2^N)`. The anchor position and the root still
+/// raised, because the walk reached the failure from there. That left a
+/// genuinely odd split -- the same `true and true` answered or raised
+/// depending on which of two names for one node it stood on.
 ///
-/// Everything that actually reads the value still raises, and both are
-/// asserted below: `.b[0]` materializes through the alias, and
-/// `.a | (true and true)` starts its walk at the *anchor*, which is not an
-/// alias node, so the walk descends and finds the failure. Real yq rejects
-/// this whole document at parse time ("found unknown escape character",
-/// confirmed live against v4.53.3), so there is no yq behaviour to match
-/// either way.
+/// #2692 removed the walk, so the split is gone: `and`/`or` read no part of
+/// the document at any of the three positions and all three answer.
+/// `select(.b) | 1` answered on this document from #1804 onward
+/// (`test_select_no_longer_raises_on_decode_failure_reachable_only_via_alias_1804`)
+/// and `select(.a) | 1` joined it here, which is the two routes finally fully
+/// converging rather than a new class of silence.
+///
+/// Everything that actually reads the value still raises, and both shapes are
+/// asserted below. Real yq rejects this whole document at parse time ("found
+/// unknown escape character", confirmed live against v4.53.3), so there is no
+/// yq behaviour to match either way.
 #[test]
-fn test_and_or_no_longer_raise_through_a_container_alias_2476() -> Result<()> {
+fn test_and_or_no_longer_raise_anywhere_over_an_alias_fanout_2476_2692() -> Result<()> {
     let doc = "a: &a [\"bad\\qc\"]\nb: *a\n";
 
-    // The alias position: the walk stops at the alias, so the boolean
-    // answers instead of raising. This is the row #2476 changed (exit 1
-    // before it, exit 0 after).
-    //
-    // Spelled with a `.` operand since #2173. `true and true` no longer
-    // walks at *any* position -- it reads nothing, so it validates nothing
-    // -- which would make these rows pass for the wrong reason and stop
-    // saying anything about aliases at all. `. and true` reads, so it
-    // still walks, and the alias short-circuit is still what decides it.
-    for filter in [".b | (. and true)", ".b | (false or .)"] {
-        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &[])?;
-        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
-        assert_eq!(stdout.trim(), "true", "`{filter}` -- stderr: {stderr:?}");
-    }
-
-    // #2173's own row, here so the contrast is visible in one place: the
-    // closed spelling answers at every position, including the two that
-    // raise below.
+    // Every position, both spellings. #2476 made the *alias* position answer
+    // by inheriting #1804's short-circuit (the walk stopped at an alias);
+    // #2173 made the *closed* spelling answer everywhere (it reads nothing);
+    // #2692 removed the walk, so the remaining split -- `. and true`
+    // answering at `.b` and raising at `.a`, for two names of one node --
+    // is gone too.
     for filter in [
+        // Reads `.`'s truthiness. Raised at the anchor and at the root until
+        // #2692; `is_falsy` decodes nothing, so all three answer now.
+        ".b | (. and true)",
+        ".b | (false or .)",
+        ".a | (. and true)",
+        ". and true",
+        // Reads nothing at all -- #2173's rows, answering since then.
         "true and true",
         ".a | (true and true)",
         ".b | (true and true)",
@@ -40140,32 +40151,16 @@ fn test_and_or_no_longer_raise_through_a_container_alias_2476() -> Result<()> {
         assert_eq!(stdout.trim(), "true", "`{filter}` -- stderr: {stderr:?}");
     }
 
-    // Reading through the alias still raises...
-    let (_, stderr, code) = run_yq_stdin_with_stderr(".b[0]", doc, &[])?;
-    assert_ne!(code, 0, "stderr: {stderr:?}");
-    assert!(
-        stderr.contains("invalid escape sequence"),
-        "stderr: {stderr}"
-    );
-
-    // ...and so does the same boolean at the anchor itself.
-    let (_, stderr, code) = run_yq_stdin_with_stderr(".a | (. and true)", doc, &[])?;
-    assert_ne!(code, 0, "stderr: {stderr:?}");
-    assert!(
-        stderr.contains("invalid escape sequence"),
-        "stderr: {stderr}"
-    );
-
-    // The document root reaches the anchor without going through an alias,
-    // so a root-level `and` raises too -- the corpus test's own
-    // "anchored container" row, restated here so the three positions this
-    // test cares about sit together.
-    let (_, stderr, code) = run_yq_stdin_with_stderr(". and true", doc, &[])?;
-    assert_ne!(code, 0, "stderr: {stderr:?}");
-    assert!(
-        stderr.contains("invalid escape sequence"),
-        "stderr: {stderr}"
-    );
+    // What still raises, and the only thing that does: actually reading the
+    // value, through the alias or at the anchor.
+    for filter in [".b[0]", ".a", ".a[0]"] {
+        let (_, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &[])?;
+        assert_ne!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert!(
+            stderr.contains("invalid escape sequence"),
+            "`{filter}` -- stderr: {stderr}"
+        );
+    }
 
     Ok(())
 }
@@ -40206,58 +40201,56 @@ fn test_not_over_alias_fanout_completes_2476() -> Result<()> {
     Ok(())
 }
 
-/// #2476's `not` sibling of
-/// `test_and_or_no_longer_raise_through_a_container_alias_2476`: `not`
-/// shares the same `push_generic_truthiness` walk `and`/`or` do (inline,
-/// via its `OneCursor` arm), so it inherits #1804's identical trade-off. A
-/// decode failure reachable *only* through a container-target alias no
-/// longer raises from `not` at that alias position; visiting the anchor
-/// directly, or materializing through the alias, still raises.
+/// #2476/#2692: `not`'s sibling of
+/// `test_and_or_no_longer_raise_anywhere_over_an_alias_fanout_2476_2692`.
 ///
-/// The second document is the scalar-target sibling from
-/// `test_select_still_raises_on_decode_failure_reachable_only_via_scalar_alias_1804`:
-/// #1804 scoped its short-circuit to a *container* reached through an alias,
-/// not a bare scalar one -- resolving a scalar alias is O(1), never part of
-/// the fan-out this issue fixes -- so `.b | not` still raises there. Real yq
-/// rejects both documents at parse time (confirmed live against v4.53.3), so
-/// there is no yq behaviour to match either way.
+/// `not` shares the same `push_generic_truthiness` route `and`/`or` do (via
+/// its `OneCursor` arm), so it tracked that history exactly: #2476 had it
+/// answer at a *container*-target alias position by inheriting #1804's
+/// short-circuit, while the anchor position, the root, and a *scalar*-target
+/// alias all still raised -- #1804 having deliberately scoped its
+/// short-circuit to containers, since resolving one scalar is O(1) and never
+/// part of the fan-out cost it was fixing.
+///
+/// #2692 removed the walk, and with it every one of those distinctions.
+/// `not` is the truthiness of `.` negated, `is_falsy` decodes nothing, and
+/// so no position and no alias target shape raises. The container/scalar
+/// split this test was largely written to pin no longer exists; what is
+/// pinned now is that it does not.
+///
+/// Real yq rejects both documents at parse time (confirmed live against
+/// v4.53.3), so there is no yq behaviour to match either way.
 #[test]
-fn test_not_no_longer_raises_through_a_container_alias_2476() -> Result<()> {
-    let doc = "a: &a [\"bad\\qc\"]\nb: *a\n";
-
-    // The alias position: the walk stops at the alias, so `not` answers
-    // instead of raising. This is the row that changed (exit 1 before, exit
-    // 0 now).
-    let (stdout, stderr, code) = run_yq_stdin_with_stderr(".b | not", doc, &[])?;
-    assert_eq!(code, 0, "stderr: {stderr:?}");
-    assert_eq!(stdout.trim(), "false", "stderr: {stderr:?}");
-
-    // Visiting the anchor itself still raises.
-    let (_, stderr, code) = run_yq_stdin_with_stderr(".a | not", doc, &[])?;
-    assert_ne!(code, 0, "stderr: {stderr:?}");
-    assert!(
-        stderr.contains("invalid escape sequence"),
-        "stderr: {stderr}"
-    );
-
-    // Materializing through the alias still raises.
-    let (_, stderr, code) = run_yq_stdin_with_stderr(".b[0]", doc, &[])?;
-    assert_ne!(code, 0, "stderr: {stderr:?}");
-    assert!(
-        stderr.contains("invalid escape sequence"),
-        "stderr: {stderr}"
-    );
-
-    // The scalar-alias sibling: `.b`'s target is a bare scalar, not a
-    // container, so #1804's short-circuit does not apply and `.b | not`
-    // still raises.
+fn test_not_no_longer_raises_anywhere_over_an_alias_2476_2692() -> Result<()> {
+    let container_doc = "a: &a [\"bad\\qc\"]\nb: *a\n";
+    // #1804 scoped its short-circuit to a container target; a bare scalar
+    // one was excluded, so `.b | not` raised here until #2692.
     let scalar_doc = "a: &a \"bad\\qc\"\nb: *a\n";
-    let (_, stderr, code) = run_yq_stdin_with_stderr(".b | not", scalar_doc, &[])?;
-    assert_ne!(code, 0, "stderr: {stderr:?}");
-    assert!(
-        stderr.contains("invalid escape sequence"),
-        "stderr: {stderr}"
-    );
+
+    for (doc, label) in [
+        (container_doc, "container alias"),
+        (scalar_doc, "scalar alias"),
+    ] {
+        for filter in [".b | not", ".a | not", "not"] {
+            let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &[])?;
+            assert_eq!(code, 0, "[{label}] `{filter}` -- stderr: {stderr:?}");
+            assert_eq!(
+                stdout.trim(),
+                "false",
+                "[{label}] `{filter}` -- stderr: {stderr:?}"
+            );
+        }
+    }
+
+    // Materializing still raises, through the alias and at the anchor.
+    for filter in [".b[0]", ".a"] {
+        let (_, stderr, code) = run_yq_stdin_with_stderr(filter, container_doc, &[])?;
+        assert_ne!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert!(
+            stderr.contains("invalid escape sequence"),
+            "`{filter}` -- stderr: {stderr}"
+        );
+    }
 
     Ok(())
 }
@@ -40424,21 +40417,18 @@ fn test_any_all_reject_non_arrays_in_yq_mode_2476() -> Result<()> {
 /// #2476: `any`/`all` now share #1804's accepted trade-off, exactly as the
 /// `not` and `//` arms of this same issue do.
 ///
-/// `any_all_generic` validates its input with
-/// `push_generic_document_validation_error` -- and that walk deliberately
-/// does not descend into a container reached through an alias, because
-/// doing so is what costs `O(2^N)` on a fan-out. The scan that follows
-/// reads `is_falsy`, which materializes nothing. So a decode failure
-/// reachable *only* through an alias to a container no longer raises from
-/// `any`/`all`: `.b | any` on the document below exited 1 with "invalid
-/// escape sequence" before this change (via the bridge's materialization)
-/// and is `true` at exit 0 after it. Both halves verified against a release
-/// build of the parent commit and of this one.
+/// `any_all_generic` validated its input with
+/// `push_generic_document_validation_error` until #2692, and that walk
+/// deliberately did not descend into a container reached through an alias,
+/// because doing so is what costs `O(2^N)` on a fan-out. So under #2476 the
+/// *alias* position answered while the anchor position raised. #2692 removed
+/// the walk entirely -- the scan was always pure `is_falsy`, which
+/// materializes nothing -- so both positions answer and there is no
+/// alias-shaped carve-out left to describe.
 ///
-/// Everything that still raises is pinned here too, so the trade-off cannot
-/// silently widen: visiting the anchor directly, materializing through the
-/// alias, and the scalar-alias sibling #1804's own short-circuit
-/// deliberately excludes.
+/// Everything that still raises is pinned here too, so the rule cannot
+/// silently widen: materializing through the alias, and the scalar-alias
+/// row, which raises for a reason of its own (see its comment below).
 ///
 /// Real yq rejects this document at parse time (`yq` v4.53.3 refuses the
 /// `\q` escape outright), so there is no yq behaviour to match either way.
@@ -40455,15 +40445,14 @@ fn test_any_all_no_longer_raise_on_decode_failure_behind_a_container_alias_2476(
         assert_eq!(stdout.trim(), want, "`{filter}` -- stderr: {stderr:?}");
     }
 
-    // Visiting the anchor itself still raises -- it is not an alias, so the
-    // walk descends into its element and decodes the string.
-    for filter in [".a | any", ".a | all"] {
-        let (_, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &[])?;
-        assert_ne!(code, 0, "`{filter}` -- stderr: {stderr:?}");
-        assert!(
-            stderr.contains("invalid escape sequence"),
-            "`{filter}` -- stderr: {stderr}"
-        );
+    // Since #2692 the anchor position answers too. It is not an alias, so
+    // the old walk descended into its element and decoded the string; with
+    // the walk gone, scanning the element's truthiness reads nothing there
+    // either, and the alias/anchor distinction disappears.
+    for (filter, want) in [(".a | any", "true"), (".a | all", "true")] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &[])?;
+        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), want, "`{filter}` -- stderr: {stderr:?}");
     }
 
     // Materializing through the alias still raises.
@@ -40474,10 +40463,13 @@ fn test_any_all_no_longer_raise_on_decode_failure_behind_a_container_alias_2476(
         "stderr: {stderr}"
     );
 
-    // The scalar-alias sibling: `.b`'s target is a bare scalar, not a
-    // container, so #1804's short-circuit does not apply. The walk decodes
-    // it and raises before the yq-mode "only supports arrays" rejection the
-    // scalar would otherwise get -- decode failure wins (#1620/#1989).
+    // The scalar-alias sibling still raises, and #2692 did not change it --
+    // but the reason is worth stating, because it is no longer #1804's
+    // container/scalar scoping. `any` on a *scalar* takes yq mode's "only
+    // supports arrays" rejection, and building that diagnostic materializes
+    // the value (`decode_failure_or`), where the decode failure wins
+    // (#1620/#1989). It raises because something materialized it, which is
+    // the surviving rule rather than an exception to it.
     let scalar_doc = "a: &a \"bad\\qc\"\nb: *a\n";
     for filter in [".b | any", ".b | all"] {
         let (_, stderr, code) = run_yq_stdin_with_stderr(filter, scalar_doc, &[])?;
@@ -40642,101 +40634,82 @@ fn test_alternative_no_longer_raises_through_a_container_alias_2476() -> Result<
     Ok(())
 }
 
-/// `retain_truthy_generic`'s `OneCursor` arm (`eval_generic.rs`) runs its own
-/// `push_generic_document_validation_error` call over the `//`'s *left*
-/// operand specifically, separately from the `ambient_validation_error` call
-/// that guards the whole `Expr::Alternative` arm before either operand runs.
-/// Every existing `//`-and-alias test lands on `ambient_validation_error`
-/// instead, because in each of them the left operand's cursor is the same
-/// position as the ambient `.` (`(. // 1)`, `(key // 1)`, ...) -- so the two
-/// checks always agree and the `OneCursor` arm's own check never gets to
-/// disagree with the ambient one.
+/// #2476/#2692: `//` forwards its operand's cursor untouched, so a `//` at a
+/// position answers exactly as a bare navigation to that position does.
 ///
-/// This document splits the two: the ambient position (`.a`, an object with
-/// one field aliasing a corrupted array) is not itself an alias, so its walk
-/// descends one level and stops at the field's alias cursor (#1804's
-/// short-circuit) without ever reaching the array -- clean. The left operand
-/// (`.q[0]`) navigates *through* that alias into the array's own corrupted
-/// element, a plain scalar cursor with no alias short-circuit of its own, so
-/// only the `OneCursor` arm's check can catch it.
-#[test]
-fn test_alternative_onecursor_validation_error_differs_from_ambient_2476() -> Result<()> {
-    let doc = "x: &X [\"bad\\qc\"]\na:\n  q: *X\n";
-
-    let (_, stderr, code) = run_yq_stdin_with_stderr(".a | (.q[0] // 1)", doc, &[])?;
-    assert_ne!(code, 0, "stderr: {stderr:?}");
-    assert!(
-        stderr.contains("invalid escape sequence"),
-        "stderr: {stderr}"
-    );
-
-    Ok(())
-}
-
-/// `retain_truthy_generic`'s `ManyCursor` arm (`.[] // ...`, a fan-out
-/// through the left operand) hits a validation error partway through the
-/// fan-out, after at least one earlier element was already kept as truthy --
-/// exercising `owned_prefix_partial` (materializing that kept prefix into the
-/// `Partial` this stage terminates with) rather than just the arm's clean
-/// exhaustion path every other `//`-fan-out test takes.
+/// This replaces three tests (`..._onecursor_validation_error_differs_from_ambient_2476`,
+/// `..._manycursor_validation_error_keeps_prefix_2476`,
+/// `..._manycursor_prefix_conversion_error_2476`) that pinned the internals of
+/// a mechanism #2692 deleted. Each was built on `retain_truthy_generic`'s own
+/// `push_generic_document_validation_error` call over the left operand -- one
+/// on that call disagreeing with the separate ambient one, one on the kept
+/// prefix `owned_prefix_partial` materialized when the call failed mid-fan-out,
+/// one on that re-materialization raising an error of its own. With the walk
+/// gone, `//` decides truthiness with `is_falsy` alone and hands the surviving
+/// cursor straight on; two of the three kept passing only because the
+/// *printer* then materialized that cursor and raised, which pins the writer
+/// rather than the operator.
 ///
-/// Same alias-navigation shape as
-/// `test_alternative_onecursor_validation_error_differs_from_ambient_2476`
-/// just above, but `.q[]` instead of `.q[0]`: the ambient `.a` still stops at
-/// the field's alias short-circuit (clean), while the fan-out walks each
-/// array element's own cursor directly. `"ok"` streams out before the error,
-/// matching #400's rule (a generator's truthy prefix survives a
-/// mid-stream raise) -- `select`'s own `test_alternative_no_longer_raises_
-/// through_a_container_alias_2476` sibling never exercises this because its
-/// document has only one, single-element array.
-#[test]
-fn test_alternative_manycursor_validation_error_keeps_prefix_2476() -> Result<()> {
-    let doc = "x: &X [\"ok\", \"bad\\qc\"]\na:\n  q: *X\n";
-
-    let (stdout, stderr, code) = run_yq_stdin_with_stderr(".a | (.q[] // 1)", doc, &[])?;
-    assert_ne!(code, 0, "stderr: {stderr:?}");
-    assert!(
-        stderr.contains("invalid escape sequence"),
-        "stderr: {stderr}"
-    );
-    assert_eq!(stdout.trim(), "ok", "stdout: {stdout:?}");
-
-    Ok(())
-}
-
-/// `owned_prefix_partial`'s own `Err` arm (`src/jq/eval_generic.rs`) --
-/// #2661 tagged this branch unreachable on the premise that `kept` only ever
-/// holds already-successfully-converted items, but that premise doesn't hold
-/// for `retain_truthy_generic`'s `ManyCursor` arm: it only runs the cheap
-/// [`push_generic_document_validation_error`] walk before keeping a cursor,
-/// and that walk stops at a container-target alias (#1804) without
-/// descending into it -- so a kept item can be an alias to a corrupt
-/// container, passing the cheap check while its real materialization still
-/// fails.
+/// Their documents are kept, because the alias-through-navigation shapes are
+/// still the sharpest ones available: the ambient position (`.a`) is an object
+/// whose one field aliases a corrupted array, while the left operand navigates
+/// *through* that alias into the array's own elements.
 ///
-/// `*X` (an alias to an object with two different decode-failure keys that
-/// collide under YAML's shared `""` display fallback, #1642) is the first
-/// `.q[]` element and passes the cheap check -- container aliases are
-/// truthy regardless of contents -- so it lands in `kept`. The second
-/// element is a plain (non-aliased) decode failure, which the cheap check
-/// does catch and which becomes this fan-out's terminating `control`.
-/// `owned_prefix_partial` then re-converts `kept` for real via
-/// `to_owned_cursor`, which has no alias short-circuit: it dereferences `*X`
-/// and hits the #1642 collision instead, replacing the terminating
-/// `control` with its own error -- the precedence the function's own doc
-/// comment already claims (mirroring [`flatten_generic_results`]), just via
-/// a different element than any existing test exercised. Pinning this as
-/// the intended, documented behavior, not proposing a change to it.
+/// Real yq rejects every document here at parse time, so there is no yq
+/// behaviour to match either way.
 #[test]
-fn test_alternative_manycursor_prefix_conversion_error_2476() -> Result<()> {
-    let doc = "x: &X {\"a\\qb\": 1, \"c\\qd\": 2}\ny: &Y [*X, \"bad\\qe\"]\na:\n  q: *Y\n";
+fn test_alternative_forwards_its_operands_cursor_untouched_2476_2692() -> Result<()> {
+    // (label, document, `//` filter, the bare navigation it must match)
+    let cases: &[(&str, &str, &str, &str)] = &[
+        (
+            "single corrupted element",
+            "x: &X [\"bad\\qc\"]\na:\n  q: *X\n",
+            ".a | (.q[0] // 1)",
+            ".a | .q[0]",
+        ),
+        (
+            "fan-out, corruption after a clean element",
+            "x: &X [\"ok\", \"bad\\qc\"]\na:\n  q: *X\n",
+            ".a | (.q[] // 1)",
+            ".a | (.q[] , empty)",
+        ),
+        (
+            // `*X` is an object with two decode-failure keys that collide
+            // under YAML's shared `""` display fallback (#1642), so the
+            // first element raises a *different* error than the second.
+            // Whichever the bare navigation reports, `//` reports too.
+            "fan-out, colliding-key alias first",
+            "x: &X {\"a\\qb\": 1, \"c\\qd\": 2}\ny: &Y [*X, \"bad\\qe\"]\na:\n  q: *Y\n",
+            ".a | (.q[] // 1)",
+            ".a | (.q[] , empty)",
+        ),
+    ];
 
-    let (stdout, stderr, code) = run_yq_stdin_with_stderr(".a | (.q[] // 1)", doc, &[])?;
-    assert_ne!(code, 0, "stderr: {stderr:?}");
-    // The re-conversion's own error (`*X`'s #1642 collision), not the
-    // fan-out's original terminating control (`"bad\qe"`'s escape error).
-    assert!(stderr.contains("ambiguous"), "stderr: {stderr}");
-    assert_eq!(stdout.trim(), "", "stdout: {stdout:?}");
+    for (label, doc, alternative, bare) in cases {
+        let (alt_out, alt_err, alt_code) = run_yq_stdin_with_stderr(alternative, doc, &[])?;
+        let (bare_out, bare_err, bare_code) = run_yq_stdin_with_stderr(bare, doc, &[])?;
+        assert_ne!(
+            alt_code, 0,
+            "[{label}] `{alternative}` must still raise -- stdout {alt_out:?}"
+        );
+        assert_eq!(
+            (alt_code, alt_err.lines().next().unwrap_or("")),
+            (bare_code, bare_err.lines().next().unwrap_or("")),
+            "[{label}] `{alternative}` must answer as `{bare}` does"
+        );
+        assert_eq!(
+            alt_out.trim(),
+            bare_out.trim(),
+            "[{label}] `{alternative}` stdout must match `{bare}`"
+        );
+    }
+
+    // The other half of "forwards untouched": where the bare navigation
+    // answers, so does the `//`, and with the same value.
+    let clean = "a:\n  q: [\"ok\", \"two\"]\n";
+    let (alt_out, _, alt_code) = run_yq_stdin_with_stderr(".a | (.q[] // 1)", clean, &[])?;
+    assert_eq!(alt_code, 0);
+    assert_eq!(alt_out, "ok\ntwo\n");
 
     Ok(())
 }
