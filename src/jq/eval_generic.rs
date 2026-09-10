@@ -104,6 +104,26 @@ use crate::json::JsonIndex;
 /// blast radius — see #998's own text, which names a hard process abort as
 /// an acceptable outcome alongside a clean error.
 ///
+/// #2627 revisited this for [`to_owned`]/[`to_owned_cursor`] specifically:
+/// by the time the `needs_path_context` gate's "wildcard bridge" (the arms
+/// that fall to these two when an expression like `1+1`/`true and true`
+/// doesn't need path context) started reaching this guard on an
+/// adversarially deep document, both functions had *already* grown a
+/// `Result<OwnedValue, EvalError>` signature for an unrelated reason
+/// (#1098/#1247 decode failures) and every one of their call sites already
+/// threaded that `Result` through. So the "blast radius" this guard's
+/// panic was bought to avoid no longer applied to those two — only the
+/// depth check's own signaling needed to change, from `assert_nesting_depth`
+/// to a `decode_failure`-tagged `Err`. Tagging it a decode failure (rather
+/// than reusing [`check_nesting_depth`]'s plain, catchable `EvalError`)
+/// keeps the same "escapes even a `try`/`catch` inside the running filter"
+/// property the panic had, matching real jq's own parse-time rejection
+/// (which the running filter, and any `try`/`catch` in it, never even gets
+/// a chance to see) — see `EvalError::is_decode_failure`'s own doc comment.
+/// [`to_owned_with_comments`] keeps the panic: it is reached only by
+/// `yq_runner.rs`'s comment/anchor-preserving DOM write path, not this
+/// bridge, and was out of #2627's scope.
+///
 /// 256, not the 128 `src/yaml/parser.rs`/`src/json/validate.rs` use for
 /// their own (unrelated) guards: `tests/jq_cli_tests.rs`'s
 /// `test_walk_deep_nesting_does_not_overflow_the_stack` already pins
@@ -280,15 +300,14 @@ fn to_owned_checked_at_depth<V: DocumentValue>(
 /// Note: The order of checks is important! Check containers first, then scalars,
 /// because YAML scalars may have type coercion (e.g., unquoted "true" is a bool).
 ///
-/// Panics past [`MAX_NESTING_DEPTH`] levels of nesting (#998) rather than
-/// recursing unbounded and overflowing the call stack. That guard stays a
-/// `panic!` even though this function is now fallible: unbounded recursion is
-/// a different failure class from a data error, and routing it through
-/// `EvalError` would make a stack-overflow guard catchable by `try`/`catch`.
-///
-/// Returns `Err` when a scalar the semi-index accepted as a string token
-/// cannot be *decoded* (#1098, #1247) -- see
-/// [`DocumentValue::string_decode_error`].
+/// Returns `Err` past [`MAX_NESTING_DEPTH`] levels of nesting (#998,
+/// #2627) rather than recursing unbounded and overflowing the call stack --
+/// a `decode_failure`-tagged `EvalError`, so it is just as unable to be
+/// swallowed by a `try`/`catch` in the running filter as the `panic!` this
+/// guard used to be (see [`MAX_NESTING_DEPTH`]'s own doc comment for why
+/// that swap is sound here specifically). Also returns `Err` when a scalar
+/// the semi-index accepted as a string token cannot be *decoded* (#1098,
+/// #1247) -- see [`DocumentValue::string_decode_error`].
 pub fn to_owned<V: DocumentValue>(value: &V) -> Result<OwnedValue, EvalError> {
     // #2358: the true top level has no cursor by design -- see
     // `to_owned_at_depth`'s own `cursor` parameter doc comment below.
@@ -370,7 +389,11 @@ fn to_owned_at_depth<V: DocumentValue>(
     cursor: Option<&V::Cursor>,
     depth: usize,
 ) -> Result<OwnedValue, EvalError> {
-    assert_nesting_depth(depth);
+    if depth >= MAX_NESTING_DEPTH {
+        return Err(EvalError::decode_failure(
+            super::value::nesting_depth_exceeded_message(MAX_NESTING_DEPTH),
+        ));
+    }
     // Check containers first (arrays and objects have no type ambiguity)
     if let Some(fields) = value.as_object() {
         let mut map = IndexMap::new();
@@ -500,8 +523,8 @@ fn to_owned_at_depth<V: DocumentValue>(
 /// just the top-level one. Call sites that already hold a cursor (rather
 /// than a bare value) should use this instead of `to_owned(&cursor.value())`.
 ///
-/// Panics past [`MAX_NESTING_DEPTH`] levels of nesting (#998), same as
-/// [`to_owned`].
+/// Returns `Err` past [`MAX_NESTING_DEPTH`] levels of nesting (#998,
+/// #2627), same as [`to_owned`].
 pub fn to_owned_cursor<C: DocumentCursor>(cursor: &C) -> Result<OwnedValue, EvalError> {
     let result = to_owned_cursor_at_depth(cursor, 0);
     // #2334: see `debug_assert_materialization_error`'s own doc comment --
@@ -601,7 +624,11 @@ fn to_owned_cursor_at_depth<C: DocumentCursor>(
     cursor: &C,
     depth: usize,
 ) -> Result<OwnedValue, EvalError> {
-    assert_nesting_depth(depth);
+    if depth >= MAX_NESTING_DEPTH {
+        return Err(EvalError::decode_failure(
+            super::value::nesting_depth_exceeded_message(MAX_NESTING_DEPTH),
+        ));
+    }
     let value = cursor.value();
     if let Some(fields) = value.as_object() {
         let mut map = IndexMap::new();
@@ -2930,7 +2957,11 @@ fn push_generic_document_validation_error<C: DocumentCursor>(
     c: &C,
     depth: usize,
 ) -> Option<Control> {
-    assert_nesting_depth(depth);
+    if depth >= MAX_NESTING_DEPTH {
+        return Some(Control::Error(EvalError::decode_failure(
+            super::value::nesting_depth_exceeded_message(MAX_NESTING_DEPTH),
+        )));
+    }
     let value = c.value();
     if let Some(fields) = value.as_object() {
         // #1804: do not walk *into* an alias's container target here. A
@@ -3181,9 +3212,10 @@ fn push_generic_document_validation_error<C: DocumentCursor>(
 ///
 /// `None` without a cursor: `to_owned_with_cursor(&value, None)` on an
 /// already-owned value cannot fail, so the bridge had nothing to raise there
-/// either. A document deeper than `MAX_NESTING_DEPTH` panics inside the walk
-/// exactly as it panicked inside the bridge's materialization (#2627, tracked,
-/// route-independent).
+/// either. A document deeper than `MAX_NESTING_DEPTH` reports a
+/// `decode_failure`-tagged error from this walk, matching what
+/// `to_owned_with_cursor`'s own materialization now returns at the same
+/// boundary (#2627 fixed both from a `panic!` to this) -- route-independent.
 ///
 /// Call this only on the shape that used to bridge (`!needs_path_context`
 /// for a gated arm; unconditionally for an arm that had no native route at
@@ -22550,6 +22582,145 @@ mod tests {
         assert!(matches!(owned, OwnedValue::Object(_)));
     }
 
+    /// #2627: the `needs_path_context` gate's wildcard/ambient bridge used
+    /// to reach [`assert_nesting_depth`]'s `panic!` on a >256-deep document
+    /// for an expression that never even reads `.` -- e.g. `1+1`, whose
+    /// gated native arm (`Expr::Arithmetic`) only fires when an operand
+    /// needs path context, so an ungated `1+1` falls to the catch-all `_`
+    /// arm's `to_owned_with_cursor` materialization
+    /// ([`to_owned_cursor_at_depth`]). Called through [`eval`] (not the CLI,
+    /// which already wraps evaluation in `catch_unwind`, #1793) so this
+    /// pins the library-embedder-facing gap directly: no panic, just a
+    /// `decode_failure`-tagged `Err`, same as real jq's own parse-time
+    /// "Exceeds depth limit for parsing" rejection (which a `try`/`catch`
+    /// inside the filter can't catch either, since jq's parser rejects the
+    /// document before the filter ever runs).
+    #[test]
+    fn test_arithmetic_wildcard_bridge_reports_clean_error_past_nesting_limit_2627() {
+        use crate::json::JsonIndex;
+        let json = format!("{}1{}", "[".repeat(256), "]".repeat(256));
+        let json = json.as_bytes();
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let expr = crate::jq::parse("1+1").unwrap();
+
+        match eval(&expr, value) {
+            GenericResult::Error(e) => {
+                assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                assert!(
+                    e.message.contains("nesting depth exceeds limit of 256"),
+                    "message: {}",
+                    e.message
+                );
+            }
+            other => panic!("expected a decode failure, got: {other:?}"),
+        }
+    }
+
+    /// Companion to the test above: an ungated `1+1` well under the limit
+    /// must still answer normally through the same wildcard bridge.
+    #[test]
+    fn test_arithmetic_wildcard_bridge_accepts_nesting_under_limit_2627() {
+        use crate::json::JsonIndex;
+        let json = format!("{}1{}", "[".repeat(100), "]".repeat(100));
+        let json = json.as_bytes();
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let value = cursor.value();
+        let expr = crate::jq::parse("1+1").unwrap();
+
+        match eval(&expr, value) {
+            GenericResult::Owned(OwnedValue::Int(2)) => {}
+            other => panic!("expected Owned(2), got: {other:?}"),
+        }
+    }
+
+    /// #2627's other panic site: `And`/`Or` (`eval_boolean_generic`) and
+    /// `Alternative`/`//`/`Not` route their own "shape that used to bridge"
+    /// raise through [`push_generic_document_validation_error`] instead of
+    /// the full materialization above (#2476's O(N) replacement for the
+    /// bridge's O(2^N) cost) -- but its depth guard panicked exactly the
+    /// same way before this fix, as its own doc comment
+    /// (`ambient_validation_error`) already flagged. `true and true` has no
+    /// path-context operand on either side, so it takes this route.
+    ///
+    /// [`eval_with_cursor`], not [`eval`]: `ambient_validation_error` walks
+    /// from a `DocumentCursor`, so it is a deliberate no-op without one
+    /// (see its own doc comment's "`None` without a cursor" paragraph) --
+    /// this is the real public `succinctly::jq::eval` shape, which always
+    /// supplies a cursor (confirmed live via `eval::eval`'s own
+    /// `needs_path_context` gate: a pipe like `key?, (true and true)` on a
+    /// document nested deeper than 256 levels reaches this exact guard
+    /// through the public API, not just this module's own internal
+    /// callers).
+    #[test]
+    fn test_boolean_ambient_validation_reports_clean_error_past_nesting_limit_2627() {
+        use crate::json::JsonIndex;
+        let json = format!("{}1{}", "[".repeat(256), "]".repeat(256));
+        let json = json.as_bytes();
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = crate::jq::parse("true and true").unwrap();
+
+        match eval_with_cursor(&expr, cursor) {
+            GenericResult::Error(e) => {
+                assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                assert!(
+                    e.message.contains("nesting depth exceeds limit of 256"),
+                    "message: {}",
+                    e.message
+                );
+            }
+            other => panic!("expected a decode failure, got: {other:?}"),
+        }
+    }
+
+    /// Companion to the test above: `true and true` well under the limit
+    /// must still answer normally through `eval_boolean_generic`'s own
+    /// ambient-validation gate.
+    #[test]
+    fn test_boolean_ambient_validation_accepts_nesting_under_limit_2627() {
+        use crate::json::JsonIndex;
+        let json = format!("{}1{}", "[".repeat(100), "]".repeat(100));
+        let json = json.as_bytes();
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = crate::jq::parse("true and true").unwrap();
+
+        match eval_with_cursor(&expr, cursor) {
+            GenericResult::Owned(OwnedValue::Bool(true)) => {}
+            other => panic!("expected Owned(true), got: {other:?}"),
+        }
+    }
+
+    /// [`eval_with_cursor`] twin of the two error tests above: the same
+    /// document reached with a cursor rather than a bare value, confirming
+    /// [`to_owned_with_cursor`]'s `Some(cursor)` branch
+    /// ([`to_owned_cursor_at_depth`]) is fixed too, not just the `None`
+    /// branch ([`to_owned_at_depth`]) that a cursor-less [`eval`] exercises.
+    #[test]
+    fn test_arithmetic_wildcard_bridge_with_cursor_reports_clean_error_past_nesting_limit_2627() {
+        use crate::json::JsonIndex;
+        let json = format!("{}1{}", "[".repeat(256), "]".repeat(256));
+        let json = json.as_bytes();
+        let index = JsonIndex::build(json);
+        let cursor = index.root(json);
+        let expr = crate::jq::parse("1+1").unwrap();
+
+        match eval_with_cursor(&expr, cursor) {
+            GenericResult::Error(e) => {
+                assert!(e.is_decode_failure(), "expected decode failure, got: {e:?}");
+                assert!(
+                    e.message.contains("nesting depth exceeds limit of 256"),
+                    "message: {}",
+                    e.message
+                );
+            }
+            other => panic!("expected a decode failure, got: {other:?}"),
+        }
+    }
+
     /// #2231 finding 3: `Builtin::ToString`'s own dedicated arm and the
     /// catch-all wildcard fallback arm both raised an ordinary #1194
     /// malformed-member error unconditionally, ignoring `optional` --
@@ -29643,10 +29814,17 @@ mod tests {
     /// adversarially deep input — confirmed live, `succinctly jq '.'` on a
     /// 200,000-level-deep document used to abort with a raw stack overflow
     /// (SIGABRT) before this guard existed. 255 levels (just under the
-    /// limit) must still materialize normally; 256 must panic cleanly
-    /// rather than recurse further.
+    /// limit) must still materialize normally; 256 must stop cleanly rather
+    /// than recurse further.
+    ///
+    /// 256 used to `panic!` here (#998); #2627 changed the guard's own
+    /// signaling to a `decode_failure`-tagged `Err` instead (see
+    /// [`MAX_NESTING_DEPTH`]'s doc comment for why that swap is sound: it
+    /// keeps the exact same "unreachable via `try`/`catch`" property the
+    /// panic had, without the process-abort blast radius), so this no
+    /// longer needs `catch_unwind` to observe the boundary.
     #[test]
-    fn to_owned_panics_past_nesting_depth_limit_998() {
+    fn to_owned_reports_clean_error_past_nesting_depth_limit_998() {
         let json = linear_nest(255);
         let index = JsonIndex::build(json.as_bytes());
         let cursor = index.root(json.as_bytes());
@@ -29660,11 +29838,16 @@ mod tests {
         let index = JsonIndex::build(json.as_bytes());
         let cursor = index.root(json.as_bytes());
         let value = cursor.value();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| to_owned(&value)));
-        assert!(result.is_err(), "to_owned should panic at depth 256");
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| to_owned_cursor(&cursor)));
-        assert!(result.is_err(), "to_owned_cursor should panic at depth 256");
+        let err = to_owned(&value).expect_err("to_owned should error at depth 256");
+        assert!(
+            err.is_decode_failure(),
+            "expected decode failure, got: {err:?}"
+        );
+        let err = to_owned_cursor(&cursor).expect_err("to_owned_cursor should error at depth 256");
+        assert!(
+            err.is_decode_failure(),
+            "expected decode failure, got: {err:?}"
+        );
     }
 
     /// #1017: `owned_from_standard_json` is a third, independent copy of the
