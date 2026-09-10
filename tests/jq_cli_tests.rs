@@ -18342,10 +18342,10 @@ fn test_foreach_and_reduce_object_pattern_duplicate_var_keeps_first_field_1366()
 /// as a single tracked step, matching jq's own single-`INDEX` compilation).
 /// When that nested pattern also binds `$a`, this is a same-name collision
 /// baked into one syntactic construct rather than two explicit fields, and
-/// it happens to already resolve correctly (the `bind` runs before the
-/// sub-pattern's own bindings, so the sub-pattern wins under the plain,
-/// non-`?//` rule) -- pinned here since none of the tests above exercise
-/// this desugaring path.
+/// it happens to already resolve correctly (the `bind` is pushed ahead of
+/// the sub-pattern's own bindings, and the plain, non-`?//` dedup rule
+/// keeps the first occurrence, so the auto-bind wins) -- pinned here since
+/// none of the tests above exercise this desugaring path.
 #[test]
 fn test_key_shorthand_pattern_duplicate_var_1366() -> Result<()> {
     let (stdout, _stderr, code) =

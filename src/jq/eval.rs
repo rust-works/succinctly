@@ -29259,11 +29259,21 @@ fn register_identical(
     snapshot: &Snapshot,
 ) -> bool {
     value == register
-        && (matches!(*value, OwnedValue::Null | OwnedValue::Bool(_))
+        && (null_bool_identical(value, register)
             || match snapshot {
                 Snapshot::No => false,
                 Snapshot::Marked(origin) => register_frame.certifies(origin),
             })
+}
+
+/// [`register_identical`]'s `null`/`true`/`false` special case in isolation
+/// — the one arm of jq's `jv_identical` where having the same kind *and*
+/// value *is* being identical, with no pointer/snapshot involved. Factored
+/// out so #2649's pattern-walk code (which needs exactly this test, never
+/// the snapshot half) shares one definition with `register_identical`
+/// instead of hand-inlining the same `matches!` + `==` a third time.
+fn null_bool_identical(a: &OwnedValue, b: &OwnedValue) -> bool {
+    matches!(a, OwnedValue::Null | OwnedValue::Bool(_)) && a == b
 }
 
 /// The register `path()`-tracking compares each `reduce`/`foreach` fold
@@ -29933,9 +29943,10 @@ struct PatternBinding {
 }
 
 /// One tracked index step of a destructuring pattern: an object entry's key
-/// or an array element's position. Carries both spellings the step needs --
-/// the [`Expr`] path component the register is extended by, and the
-/// [`OwnedValue`] element a refusal names.
+/// or an array element's position. [`Self::component`] derives the [`Expr`]
+/// path component the register is extended by; a refusal names the input
+/// value separately, from the caller's own `input` (see
+/// [`walk_pattern_step`]).
 enum PatternStep<'a> {
     Field(&'a str),
     Index(usize),
@@ -29995,9 +30006,7 @@ fn walk_pattern_step(
     // Only `null`/`true`/`false` are `jv_identical` by value, which is what
     // lets a second entry step from a `null` parent (`null | . as {a:$q,
     // b:$r}` walks to `["a","b"]`).
-    if !(reg.is_input
-        || (matches!(input, OwnedValue::Null | OwnedValue::Bool(_)) && *input == reg.value))
-    {
+    if !(reg.is_input || null_bool_identical(input, &reg.value)) {
         let Some(element) = navigation_element(&component) else {
             unreachable!("a pattern step's component is always Field/Index")
         };
@@ -30193,7 +30202,7 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                 Expr::TrackedVar(marker) => {
                     marker.value == *value && frame.certifies(&marker.origin)
                 }
-                _ => matches!(bound, OwnedValue::Null | OwnedValue::Bool(_)) && *bound == *value,
+                _ => null_bool_identical(bound, value),
             };
         for (i, pattern) in patterns.iter().enumerate() {
             let is_last = i == last_idx;
@@ -30228,9 +30237,7 @@ fn resolve_as_pattern<'a, S: EvalSemantics>(
                 // exactly as the `As` arm's does.
                 resolve_node_sink::<S>(&substituted, value, trackable, snapshot, frame, keep, sink)
             } else {
-                let seed = if matches!(value, OwnedValue::Null | OwnedValue::Bool(_))
-                    && *value == reg.value
-                {
+                let seed = if null_bool_identical(value, &reg.value) {
                     PathBranch::new(reg.path, Cow::Borrowed(value), true)
                 } else {
                     PathBranch::passthrough(reg.path, Cow::Borrowed(value), false, Snapshot::No)
@@ -30351,15 +30358,15 @@ fn dedup_pattern_bindings(
         Pattern::Array(_) => invert,
         Pattern::Object(_) | Pattern::Var(_) => !invert,
     };
-    let mut map: IndexMap<String, PatternBinding> = IndexMap::new();
-    for binding in bindings {
-        if keep_first {
-            map.entry(binding.name.clone()).or_insert(binding);
-        } else {
-            map.insert(binding.name.clone(), binding);
-        }
+    if keep_first {
+        dedup_keep_first_by(bindings, pattern_binding_name)
+    } else {
+        dedup_keep_last_by(bindings, pattern_binding_name)
     }
-    map.into_values().collect()
+}
+
+fn pattern_binding_name(binding: &PatternBinding) -> &str {
+    &binding.name
 }
 
 /// Whether every node of `source` is one the resolver walks exactly as the
@@ -48345,32 +48352,43 @@ fn dedup_array_bindings(
     }
 }
 
-/// Drop every binding after the first for each repeated variable name,
-/// keeping first-insertion order -- `IndexMap::entry().or_insert()` only
-/// writes a key's value the first time it's seen, exactly this rule, so
-/// this needs no bespoke seen-set bookkeeping (#1366 code review; mirrors
+/// Drop every item after the first for each repeated `name`, keeping
+/// first-insertion order -- `IndexMap::entry().or_insert()` only writes a
+/// key's value the first time it's seen, exactly this rule, so this needs
+/// no bespoke seen-set bookkeeping (#1366 code review; mirrors
 /// `build_object_entries`'s own use of `IndexMap` for jq's analogous
-/// duplicate-*object-key* rule elsewhere in this file).
-fn dedup_keep_first_binding(bindings: Vec<(String, OwnedValue)>) -> Vec<(String, OwnedValue)> {
-    let mut map = IndexMap::new();
-    for (name, value) in bindings {
-        map.entry(name).or_insert(value);
+/// duplicate-*object-key* rule elsewhere in this file). Generic over the
+/// item type so both value-mode's `(String, OwnedValue)` bindings and path
+/// mode's [`PatternBinding`] (#2649) share one keep-first/keep-last rule
+/// instead of each hand-rolling its own `IndexMap` reduction.
+fn dedup_keep_first_by<T>(items: Vec<T>, name: impl for<'a> Fn(&'a T) -> &'a str) -> Vec<T> {
+    let mut map: IndexMap<String, T> = IndexMap::new();
+    for item in items {
+        map.entry(name(&item).to_string()).or_insert(item);
     }
-    map.into_iter().collect()
+    map.into_values().collect()
 }
 
-/// Drop every binding before the last for each repeated variable name --
-/// collecting into an `IndexMap` already gives "last value wins, first
-/// insertion position kept" for a repeated key (#1366 code review; the
-/// same `IndexMap` behavior `build_object_entries` documents for jq's
+/// Drop every item before the last for each repeated `name` -- inserting
+/// into an `IndexMap` already gives "last value wins, first insertion
+/// position kept" for a repeated key (#1366 code review; the same
+/// `IndexMap` behavior `build_object_entries` documents for jq's
 /// duplicate-object-key rule), so this needs no explicit reverse/re-reverse
-/// pass either.
+/// pass either. See [`dedup_keep_first_by`] for why this is generic.
+fn dedup_keep_last_by<T>(items: Vec<T>, name: impl for<'a> Fn(&'a T) -> &'a str) -> Vec<T> {
+    let mut map: IndexMap<String, T> = IndexMap::new();
+    for item in items {
+        map.insert(name(&item).to_string(), item);
+    }
+    map.into_values().collect()
+}
+
+fn dedup_keep_first_binding(bindings: Vec<(String, OwnedValue)>) -> Vec<(String, OwnedValue)> {
+    dedup_keep_first_by(bindings, |(name, _)| name.as_str())
+}
+
 fn dedup_keep_last_binding(bindings: Vec<(String, OwnedValue)>) -> Vec<(String, OwnedValue)> {
-    bindings
-        .into_iter()
-        .collect::<IndexMap<_, _>>()
-        .into_iter()
-        .collect()
+    dedup_keep_last_by(bindings, |(name, _)| name.as_str())
 }
 
 /// Evaluate `def name(params): body; then` (#1371).
