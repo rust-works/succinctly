@@ -25772,6 +25772,19 @@ fn test_jq_cursor_transparent_fast_paths_empty_container_stray_comma_now_raises_
         ("[,]", "path(.[0])"),
         ("[,]", "path(.[])"),
         ("[,]", "[path(..)]"),
+        // `keys`/`keys_unsorted` on an *array* take their own arm, distinct
+        // from the object rows above; `leaf_paths` takes one distinct from
+        // `paths`.
+        ("[,]", "keys"),
+        ("[,]", "keys_unsorted"),
+        ("[,]", "leaf_paths"),
+        ("{,}", "leaf_paths"),
+        // `.[]` collected reaches `eval_single`'s *eager* `Expr::Iterate`
+        // arm; the bare `.[]` rows above take the streaming one in
+        // `eval_each_generic`. Both need their own check.
+        ("[,]", "[.[]]"),
+        ("{,}", "[.[]]"),
+        ("[,]", "reduce .[] as $x (0; .)"),
     ] {
         let (out, stderr, code) = run_jq_full(&["-c", query], Some(input))?;
         assert_eq!(
@@ -25827,6 +25840,15 @@ fn test_jq_genuinely_empty_containers_unaffected_2594() -> Result<()> {
         ("{}", "[path(..)]", "[[]]"),
         ("[]", "path(.[])", ""),
         ("[]", "[path(..)]", "[[]]"),
+        ("[]", "keys", "[]"),
+        ("[]", "keys_unsorted", "[]"),
+        // Succinctly's `leaf_paths` extension counts an empty container as
+        // a leaf (see CLAUDE.md); `paths` does not. Both stay as they were.
+        ("[]", "leaf_paths", "[]"),
+        ("{}", "leaf_paths", "[]"),
+        ("[]", "[.[]]", "[]"),
+        ("{}", "[.[]]", "[]"),
+        ("[]", "reduce .[] as $x (0; .)", "0"),
         ("{ }", "length", "0"),
         ("{\n\t}", "length", "0"),
         (r#"{"a":{}}"#, ".a|length", "0"),
