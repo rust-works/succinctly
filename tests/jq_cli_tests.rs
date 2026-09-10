@@ -23057,31 +23057,142 @@ fn test_mixed_bare_and_dollar_params_in_one_def_2283() -> Result<()> {
     Ok(())
 }
 
-/// #2283 review: `substitute_func_param_impl`'s own `Expr::FuncDef` arm has
-/// a *different*, deeper, NOT-fixed-here gap next to the one this issue
-/// closed in `substitute_var_impl` -- pinned as a known gap per this
-/// project's convention rather than left silently wrong. `Param` confirms
-/// a nested def's own matching parameter (bare *or* `$`-style) correctly
-/// shadows an outer *bare* `param` substitution (`$`-style desugars to
-/// bind the bare namespace too, confirmed live: `def h($param): param`
-/// alone is a compile error, "param is not defined", so `$`-style alone
-/// never leaves bare `param` unbound) -- but the same blanket check also
-/// blocks an outer `$param`(dollar) substitution from reaching a nested
-/// *bare*-only parameter's body, which it should not (a bare parameter
-/// creates no `$`-binding of its own). Needs a second, independent
-/// `subst_bare`-style flag threaded through `substitute_func_param_impl`
-/// the way `subst_dollar` already is -- a materially larger change than
-/// #2283's own `Param` type, tracked separately as #2555. jq 1.7.1 answers
-/// `99` (`h`'s own bare parameter doesn't touch `$param`, so it resolves
-/// to `f`'s own); this answers `1` (`h`'s own argument, wrongly captured).
+/// #2555: an outer `$param` substitution reaches *through* a nested def's
+/// own **bare-only** parameter, because a bare parameter creates no
+/// `$`-binding to shadow it with. `substitute_func_param_impl`'s
+/// `Expr::FuncDef` arm used to answer this with one blanket
+/// "any matching parameter name shadows" check, which is right for the bare
+/// namespace and wrong for the `$` one -- it answered `1` (`h`'s own
+/// argument, wrongly captured) where jq 1.7.1 answers `99`. `SubstScope`
+/// now narrows the two namespaces independently.
+///
+/// The bare half of that check was and remains correct: a nested matching
+/// parameter of *either* spelling shadows a bare `param` reference, since a
+/// `$`-style parameter binds the bare namespace too (`def h($param): param`
+/// alone is a compile error, "param is not defined") -- pinned by
+/// `test_dollar_style_nested_param_still_shadows_bare_substitution_2555`
+/// below.
 #[test]
-fn test_bare_nested_param_wrongly_shadows_outer_dollar_func_param_known_gap_2283() -> Result<()> {
+fn test_outer_dollar_param_reaches_through_a_bare_nested_param_2555() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
         &["-nc", "def f($param): def h(param): $param; h(1); f(99)"],
         None,
     )?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
-    assert_eq!(stdout.trim_end(), "1");
+    assert_eq!(stdout.trim_end(), "99");
+    Ok(())
+}
+
+/// #2555, the other half of the split: a nested matching parameter still
+/// shadows the **bare** namespace whichever way it is spelled, and a
+/// `$`-style one still shadows the `$` namespace as well. These are the
+/// cases the pre-#2555 blanket check got right, pinned so that narrowing the
+/// `$` half cannot quietly widen this one. All confirmed live against
+/// jq 1.7.1.
+#[test]
+fn test_dollar_style_nested_param_still_shadows_bare_substitution_2555() -> Result<()> {
+    for (filter, expected) in [
+        // bare outer, bare nested -- nested wins the bare namespace
+        ("def f(param): def h(param): param; h(1); f(5)", "1"),
+        // bare outer, `$`-style nested -- still wins the bare namespace
+        ("def f(param): def h($param): param; h(1); f(5)", "1"),
+        // `$`-style outer, `$`-style nested -- wins both namespaces
+        ("def f($param): def h($param): $param; h(1); f(99)", "1"),
+        // `$`-style outer, bare nested, *bare* reference -- nested wins
+        ("def f($a): def h(a): a; h(0); f(1)", "0"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 0, "filter: {filter:?}, stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "filter: {filter:?}");
+    }
+    Ok(())
+}
+
+/// #2555: a nested zero-argument `def` of the parameter's name shadows the
+/// *filter* namespace only -- a `def` binds no `$name` at all, so an outer
+/// `$param` reaches straight through it. The pre-#2555 `then_shadowed`
+/// check blocked both namespaces, so the first row below failed outright
+/// with "undefined variable: $a". Confirmed live against jq 1.7.1.
+#[test]
+fn test_nested_zero_arg_def_shadows_only_the_bare_namespace_2555() -> Result<()> {
+    for (filter, expected) in [
+        ("def f($a): def a: 99; $a; f(2)", "2"),
+        // the bare half of the same shape, unchanged: the nested `def` wins
+        ("def f($a): def a: 99; a; f(2)", "99"),
+        ("def f(a): def a: 99; a; f(2)", "99"),
+        ("def f(g): def g: 99; g; f(1)", "99"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 0, "filter: {filter:?}, stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "filter: {filter:?}");
+    }
+    Ok(())
+}
+
+/// #2555: the reach-through has to survive every kind of nesting between
+/// the outer `$param` and its reference, not just a nested def's immediate
+/// body -- through a builtin argument, through a `reduce`, and through a
+/// second def level. Each of these answered the innermost argument before
+/// the fix. All confirmed live against jq 1.7.1.
+#[test]
+fn test_outer_dollar_param_reaches_through_nesting_2555() -> Result<()> {
+    for (filter, expected) in [
+        ("def f($a): def h(a): [a, $a]; h(0); f(1)", "[0,1]"),
+        ("def f($a): def h(a): select($a == 1); h(0); f(1)", "null"),
+        (
+            "def f($a): def h(a): reduce range(2) as $i (0; . + $a); h(0); f(7)",
+            "14",
+        ),
+        ("def f($a): def h(a): def g(a): $a; g(2); h(1); f(3)", "3"),
+        // ...but a genuine local `$a` binder in between still shadows it.
+        ("def f($a): def h(a): (1 as $a | $a); h(0); f(9)", "1"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 0, "filter: {filter:?}, stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "filter: {filter:?}");
+    }
+    Ok(())
+}
+
+/// #2726: a **bare** parameter creates no `$`-binding, so `$a` in its body
+/// is not this call's argument. jq 1.7.1 rejects the program outright
+/// ("$a is not defined"); succinctly answered `1`, silently treating the
+/// bare parameter as if it had been written `$a`. It now rejects it the
+/// same way it rejects any other unbound variable (see
+/// `test_bare_param_does_not_bind_dollar_leaves_outer_binding_2726` for the
+/// case where an enclosing binder *does* supply one).
+///
+/// Divergence that remains, and is not this issue's: jq rejects at compile
+/// time (exit 3), succinctly at evaluation (exit 5). That is how succinctly
+/// reports *every* unbound variable -- plain `$nope` diverges identically on
+/// unmodified `main` -- so it is a general gap, tracked separately.
+#[test]
+fn test_bare_param_does_not_create_a_dollar_binding_2726() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "def f(a): $a; f(1)"], None)?;
+    assert_ne!(code, 0, "stdout: {stdout:?}");
+    assert!(
+        stderr.contains("$a"),
+        "the error should name the unbound variable, got: {stderr:?}"
+    );
+    Ok(())
+}
+
+/// #2726: with the bare parameter no longer claiming `$a`, an enclosing
+/// binder's `$a` is what the body sees -- and the bare reference still
+/// resolves to the parameter. Confirmed live against jq 1.7.1.
+#[test]
+fn test_bare_param_does_not_bind_dollar_leaves_outer_binding_2726() -> Result<()> {
+    for (filter, expected) in [
+        ("9 as $a | def f(a): $a; f(1)", "9"),
+        ("9 as $a | def f(a): a; f(1)", "1"),
+        ("9 as $a | def f(a): [a, $a]; f(1)", "[1,9]"),
+        // a `$`-style parameter, by contrast, does claim `$a`
+        ("9 as $a | def f($a): $a; f(1)", "1"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 0, "filter: {filter:?}, stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "filter: {filter:?}");
+    }
     Ok(())
 }
 
