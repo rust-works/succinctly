@@ -1980,6 +1980,78 @@ impl KeyHashes {
     /// callers keep for small objects are cheaper anyway.
     const MIN_SLOTS: usize = 16;
 
+    /// Largest table built, in slots -- 8 MiB (#1588).
+    ///
+    /// Above this width the table is simply the wrong shape, and no tuning
+    /// of its *fill* can fix that. Measured directly (`examples/
+    /// keyhashes_rss.rs`, Apple M5 Max, peak RSS of a process that does
+    /// nothing else), growing from empty costs **twice** the final table,
+    /// because macOS keeps every intermediate's pages resident after it is
+    /// freed rather than reusing them for the next, larger one:
+    ///
+    /// | keys | grow from empty | one grow | pre-sized exactly | `Vec` + sort |
+    /// |---|---|---|---|---|
+    /// | 629,881 | 17.7 MiB | 13.6 | 9.6 | **8.6** |
+    /// | 5,635,780 | 129.8 MiB | 97.6 | 65.7 | **46.8** |
+    /// | 7,100,000 | 257.8 MiB | 193.6 | 129.7 | **57.9** |
+    ///
+    /// That is 24-38 bytes per key against the batch paths' 8.3 -- `Vec`
+    /// growth reallocs, which extends in place, so it retains nothing and
+    /// pays no copy. #1967 already took the fill from 1/2 to 3/4, which is
+    /// as far as fill alone reaches; the remaining factor is the doubling
+    /// itself plus power-of-two rounding (7.1M keys sit just past `2^23`'s
+    /// three-quarter mark, so the table is `2^24`).
+    ///
+    /// So the table stops here and [`DistinctKeyCursors`] settles a wider
+    /// object exactly, once, in the batch shape instead -- see
+    /// [`object_keys_repeat`] and `next`'s own saturation arm. The ceiling
+    /// bounds the table's contribution to 8 MiB live plus at most 8 MiB of
+    /// retained intermediates, for an object of *any* width.
+    ///
+    /// **Above the ceiling this is faster on x86 at every width, and costs
+    /// one row on ARM.** Settling costs a walk plus a sort of every hash,
+    /// against a saved rehash and the probing for whatever keys remain, so an
+    /// object barely wider than the ceiling pays most of the cost for little
+    /// of the saving -- and whether that nets out depends on the box.
+    /// Measured against `8142a5899` on both pinned boxes, idle,
+    /// `codegen-units=1` (#1587), each with a never-saturating `1 << 24`
+    /// build in the same run as a codegen-bias holdout; the numbers below
+    /// already have that holdout subtracted. `keys_unsorted`:
+    ///
+    /// | keys | 7950X | M4 Pro | peak RSS |
+    /// |---|---|---|---|
+    /// | 700,000 (below) | +0.3% | +0.8% | 0% |
+    /// | 1,600,000 (2x) | **-8.1%** | **+4.0%** | -43% |
+    /// | 3,200,000 (4x) | -14.1% | -1.8% | -45% to -50% |
+    /// | 7,100,000 (9x) | -21.3% | -19.6% | -43% to -51% |
+    ///
+    /// The holdout is not optional: an earlier run of this same comparison
+    /// read up to **-6.5% median on paths this change cannot touch**, purely
+    /// from code layout differing between two builds. `ab-cli.py --control`
+    /// cannot see that -- it compares a binary with itself.
+    ///
+    /// **The one ARM row is small only because the settle is seeded from the
+    /// table** rather than re-deriving what the walk already hashed (see
+    /// [`into_hashes`](Self::into_hashes)). Re-walking the whole object
+    /// instead measured **+20.5%** there, and still +4.3% at 4x -- the walk
+    /// dominates the settle, not the sort, which is why seeding buys back so
+    /// much of it.
+    ///
+    /// That x86 wins where ARM pays is the same architecture split #1514
+    /// recorded for table-vs-sort in the first place: a sort streams and a
+    /// table does not, so a 7950X's 32 MiB L3 feels the table's size sooner
+    /// than an M4 Pro does.
+    ///
+    /// The band moves with the ceiling rather than shrinking, so this is a
+    /// choice about which widths pay: at `1 << 19` the un-seeded form
+    /// measured +25% at 763K keys (1.9x that ceiling). `1 << 20` also keeps
+    /// `scripts/perf-guard.py` clear -- its pinned `wide_keys_unsorted` row is
+    /// 159K short top-level keys, 5x under the 786,432-key saturation point,
+    /// so that gate keeps measuring the pure streaming path it was added to
+    /// protect. Moving this without re-checking both the headroom and the
+    /// band silently re-prices a shape somebody depends on.
+    const MAX_SLOTS: usize = 1 << 20;
+
     /// An empty table that allocates on its first insertion.
     ///
     /// For callers that cannot count their keys up front, and for the ones
@@ -2034,10 +2106,23 @@ impl KeyHashes {
         // 15/16 buy no further memory (the same power-of-two table serves
         // all three at this key count) and only pay more probing, measuring
         // 0.114s and 0.115s respectively.
+        //
+        // The table also stops growing at `MAX_SLOTS` (#1588); see
+        // [`saturated`](Self::saturated) for what a caller does then.
         if (self.len + 1) * 4 > self.slots.len() * 3 {
+            if self.slots.len() >= Self::MAX_SLOTS {
+                // A saturated table answers conservatively rather than
+                // inserting, which is sound (the type reports a *possible*
+                // repeat and every caller resolves one exactly) and keeps
+                // the probe loop below from ever running out of free slots.
+                // `DistinctKeyCursors` checks `saturated()` *before* it
+                // probes, so it never reaches this -- it is here so the type
+                // stays safe in isolation, not because the tree needs it.
+                return true;
+            }
             self.grow();
         }
-        let hash = if hash == 0 { 1 } else { hash };
+        let hash = Self::fold_hash(hash);
         let mut at = (hash as usize) & self.mask;
         loop {
             match self.slots[at] {
@@ -2055,6 +2140,56 @@ impl KeyHashes {
     /// Distinct hashes recorded so far.
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    /// `0` is the empty-slot marker, so a key hashing to zero is stored as
+    /// `1` -- folding two hash values together, which this type's
+    /// conservatism already tolerates.
+    ///
+    /// **One definition, two call sites** (#1588): [`insert`](Self::insert)
+    /// folds on the way in, and [`object_keys_repeat`] folds the hashes it
+    /// collects by walking, because the two are mixed in one list once
+    /// [`into_hashes`](Self::into_hashes) seeds that walk from a saturated
+    /// table. Fold on only one side and a key that hashes to zero is stored
+    /// as `1` by the table and compared as `0` from the walk -- so a genuine
+    /// duplicate spanning the ceiling is silently missed, which is wrong
+    /// output rather than a slow path. Pinned by
+    /// `key_hashes_fold_agrees_across_the_seam_1588`.
+    const fn fold_hash(hash: u64) -> u64 {
+        if hash == 0 {
+            1
+        } else {
+            hash
+        }
+    }
+
+    /// The hashes this table holds, as a list, consuming it (#1588).
+    ///
+    /// Reuses the table's own allocation rather than collecting into a fresh
+    /// `Vec`: `retain` compacts in place, so a saturated 8 MiB table becomes
+    /// a 6 MiB list of 786,432 hashes with no second buffer alive at any
+    /// point, and with capacity already in hand for the walk that extends it.
+    /// The order is the table's slot order, which is hash-scattered and
+    /// meaningless -- the caller sorts.
+    fn into_hashes(mut self) -> Vec<u64> {
+        self.slots.retain(|&hash| hash != 0);
+        self.slots
+    }
+
+    /// Whether the next insertion would have to grow a table already at
+    /// this type's private `MAX_SLOTS` ceiling -- #1588.
+    ///
+    /// Exactly [`insert`](Self::insert)'s own growth predicate, ANDed with
+    /// "and it cannot grow", so this turns true at precisely the moment the
+    /// old code would have allocated the next table. A caller that sees it
+    /// must stop probing and settle its object some other way *before*
+    /// calling `insert` again -- both because `insert` degrades to an
+    /// unconditional conservative `true` past this point, and because that
+    /// answer would send a wide object into `collapse_confirmed_repeat`,
+    /// whose owned `String` per field is far more memory than the table this
+    /// ceiling exists to bound.
+    pub fn saturated(&self) -> bool {
+        self.slots.len() >= Self::MAX_SLOTS && (self.len + 1) * 4 > self.slots.len() * 3
     }
 
     /// Whether nothing has been recorded yet.
@@ -2287,6 +2422,63 @@ fn keys_repeat<V: DocumentValue, C: DocumentCursor>(fields: &[DocumentField<V, C
         return false;
     }
     let mut hashes: Vec<u64> = fields.iter().filter_map(field_key_hash).collect();
+    hashes.sort_unstable();
+    hashes_repeat(&hashes)
+}
+
+/// [`keys_repeat`] for a caller holding a live [`DocumentFields`] walk
+/// rather than a materialized slice -- "does any key repeat *anywhere* in
+/// this object?", in the batch shape (#1588).
+///
+/// The escape hatch for an object too wide for [`DistinctKeyCursors`]'s
+/// streaming [`KeyHashes`] probe. It costs one key-only walk and 8 bytes
+/// per key, against the table's 24-38 (measured; see
+/// [`KeyHashes::MAX_SLOTS`] for the table), and it hands back an answer
+/// covering the *whole* object -- including the fields the streaming walk
+/// has not reached yet -- so the caller can retire its probe outright
+/// instead of carrying it to the end.
+///
+/// Deliberately conservative in exactly the way [`keys_repeat`] and
+/// [`KeyHashes::insert`] are: two distinct keys sharing a 64-bit hash
+/// answer `true`, and the caller resolves that against the keys themselves.
+/// A field whose key does not stringify is skipped, matching the streaming
+/// probe (which only inserts where `key_hash_of` answers `Some`), so the
+/// two agree field for field.
+///
+/// Deliberately **not** [`census`], which is the other whole-object walk
+/// here: that narrows a hash collision exactly, with one owned `String` per
+/// colliding key, and re-runs the `,`/`:` delimiter checks (#1677) the
+/// streaming walk has already run on every field it examined. This caller
+/// needs neither.
+///
+/// `Vec::new()` and push, never `with_capacity` off a bound: #1588 measured
+/// a hint 16x too large at **149.2 MiB** against 37.1 for no hint at all, on
+/// a table whose exact size was 29.1 -- `alloc_zeroed`'s pages do fault in,
+/// so a loose bound is the catastrophic failure here, not the conservative
+/// one. Push growth reallocs instead, which extends in place, which is why
+/// this shape measures a flat 8.3 bytes per key at 7.1M keys where the
+/// table measures 37.8.
+fn object_keys_repeat<F: DocumentFields>(seed: Vec<u64>, pending: &F::Value, rest: &F) -> bool {
+    /// The one place a walked key's hash joins the list, so no call site can
+    /// forget the fold `seed`'s own entries already carry -- see
+    /// [`KeyHashes::fold_hash`] for why mixing folded and unfolded values
+    /// would be wrong output rather than a slow path. A key that does not
+    /// stringify contributes nothing, matching the streaming probe.
+    fn push<V: DocumentValue>(key: &V, hashes: &mut Vec<u64>) {
+        if let Some(hash) = key_hash_of(key) {
+            hashes.push(KeyHashes::fold_hash(hash));
+        }
+    }
+
+    let mut hashes = seed;
+    // The key the caller had already taken off `rest` but not probed: it sits
+    // between the seed and the walk and belongs to neither.
+    push(pending, &mut hashes);
+    let mut walk = rest.clone();
+    while let Some((key, _cursor, rest)) = walk.uncons_key() {
+        push(&key, &mut hashes);
+        walk = rest;
+    }
     hashes.sort_unstable();
     hashes_repeat(&hashes)
 }
@@ -2657,10 +2849,40 @@ impl<F: DocumentFields> Iterator for DistinctKeyCursors<F> {
         {
             self.delimiter_fault = true;
         }
-        let repeat = self
-            .seen
-            .as_mut()
-            .is_some_and(|seen| key_hash_of(&key).is_some_and(|hash| seen.insert(hash)));
+        // #1588: the probe table has filled to `KeyHashes::MAX_SLOTS` and
+        // would otherwise double again. Settle the whole object here
+        // instead, once, in the batch shape -- 8 bytes per key against the
+        // table's 24-38, and freed the moment it answers. Checked *before*
+        // the probe below, not after: past saturation `KeyHashes::insert`
+        // degrades to an unconditional conservative `true`, which would send
+        // a very wide object into `collapse_confirmed_repeat` and its owned
+        // `String` per field, the one outcome costlier than the table.
+        //
+        // Either answer covers the entire object, including the fields this
+        // walk has not reached, so neither leaves a later key unchecked.
+        // The two arms are mutually exclusive: a saturated table settles this
+        // key through the seed instead of probing it, and comes back with the
+        // whole object's answer; an unsaturated one probes exactly as before.
+        let repeat = if self.seen.as_ref().is_some_and(KeyHashes::saturated) {
+            // The table is not thrown away and re-derived: it already holds
+            // every hash this walk has seen, so it *seeds* the batch list and
+            // the walk covers only what is left. That is what keeps the band
+            // above the ceiling affordable -- re-walking the whole object
+            // instead measured +20.5% at twice the ceiling on ARM, where this
+            // measures +4.0% and x86 measures -8.1% (see
+            // `KeyHashes::MAX_SLOTS` for the table).
+            let seen = self.seen.take().expect("the check above found one");
+            // `self.seen` stays `None` from the `take` above, which is exactly
+            // the retirement the no-real-duplicate arm below performs, and
+            // sound for the same reason: the answer covers the whole object.
+            // `key` is handed over rather than probed -- it is the one field
+            // belonging to neither the seed nor the remaining walk.
+            object_keys_repeat(seen.into_hashes(), &key, &self.rest)
+        } else {
+            self.seen
+                .as_mut()
+                .is_some_and(|seen| key_hash_of(&key).is_some_and(|hash| seen.insert(hash)))
+        };
         if repeat {
             let confirmed = collapse_confirmed_repeat(&self.all);
             // #2261: `confirmed`'s own walk starts from `self.all` (the
@@ -3289,6 +3511,85 @@ mod key_hash_tests {
         assert_eq!(key_hash(b"abcdefghij"), key_hash(b"abcdefghij"));
     }
 
+    /// splitmix64 over a counter: 786,432 distinct hashes for the ceiling
+    /// test below without allocating a `String` per key, which in an
+    /// unoptimized test build dominates everything else.
+    fn mix(i: u64) -> u64 {
+        let mut z = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// The seed and the walk must agree about the zero fold (#1588).
+    ///
+    /// [`KeyHashes::into_hashes`] hands back what `insert` stored -- folded --
+    /// and `object_keys_repeat` extends that same list with hashes it folds
+    /// itself. If either side skipped the fold, a key hashing to zero would
+    /// be `1` on one side and `0` on the other, and a genuine duplicate
+    /// spanning the ceiling would be missed: wrong output, not a slow path.
+    /// Driven directly because no reachable key is known to hash to zero, so
+    /// no document-level test can produce this.
+    #[test]
+    fn key_hashes_fold_agrees_across_the_seam_1588() {
+        assert_eq!(KeyHashes::fold_hash(0), 1, "zero is the empty-slot marker");
+        assert_eq!(KeyHashes::fold_hash(1), 1, "and folds onto one");
+        assert_eq!(KeyHashes::fold_hash(7), 7, "everything else is itself");
+
+        // What the table stored for a zero hash is what the walk would
+        // produce for the same key -- the property the seam depends on.
+        let mut seen = KeyHashes::new();
+        assert!(!seen.insert(0));
+        assert_eq!(seen.into_hashes(), alloc::vec![KeyHashes::fold_hash(0)]);
+    }
+
+    /// The table stops doubling at [`KeyHashes::MAX_SLOTS`] and says so
+    /// (#1588), so a streaming caller can settle a wide object another way
+    /// instead of paying 24-38 bytes per key for one that keeps growing.
+    ///
+    /// Pins *where* saturation arrives, not merely that it does: one slot
+    /// early and the ceiling would bite objects `scripts/perf-guard.py`
+    /// measures on the pure streaming path; one late and `insert` would
+    /// already have degraded to its conservative answer before anyone
+    /// asked.
+    #[test]
+    fn key_hashes_stops_growing_at_the_ceiling_1588() {
+        let mut seen = KeyHashes::new();
+        let mut inserted = 0usize;
+        while !seen.saturated() {
+            inserted += 1;
+            assert!(
+                !seen.insert(mix(inserted as u64)),
+                "hash {inserted} is the first of its kind"
+            );
+            assert!(
+                seen.slots.len() <= KeyHashes::MAX_SLOTS,
+                "the table grew past its ceiling at {inserted} keys"
+            );
+        }
+        assert_eq!(seen.slots.len(), KeyHashes::MAX_SLOTS);
+        assert_eq!(
+            inserted,
+            KeyHashes::MAX_SLOTS * 3 / 4,
+            "saturation lands exactly where `insert` would next have doubled"
+        );
+        assert_eq!(seen.len(), inserted);
+
+        // Past saturation the table answers conservatively instead of
+        // inserting. That keeps the probe loop from ever running out of free
+        // slots for a caller that ignores `saturated()`, and it is sound
+        // because the type reports a *possible* repeat that every caller
+        // resolves against the keys themselves.
+        for i in 1..=1_000u64 {
+            assert!(
+                seen.insert(mix(u64::MAX - i)),
+                "a saturated table is conservative"
+            );
+        }
+        assert_eq!(seen.len(), inserted, "and records nothing further");
+        assert_eq!(seen.slots.len(), KeyHashes::MAX_SLOTS, "nor allocates");
+    }
+
     /// Low bits carry the index, so a run of keys differing only in their
     /// last byte must not pile into one probe chain. Without the
     /// splitmix64 finalizer this distribution collapses.
@@ -3306,6 +3607,60 @@ mod key_hash_tests {
         // Perfectly uniform is 256 per bucket; allow a wide margin so this
         // pins "not degenerate", not the exact hash function.
         assert!(lo > 150 && hi < 400, "buckets {buckets:?}");
+    }
+}
+
+#[cfg(test)]
+mod object_keys_repeat_tests {
+    use super::{census, object_keys_repeat, DocumentFields, DocumentValue};
+    use crate::json::JsonIndex;
+
+    /// [`object_keys_repeat`] is the batch escape hatch a saturated
+    /// [`KeyHashes`](super::KeyHashes) hands its whole object to (#1588),
+    /// and its verdict decides between retiring the probe outright and
+    /// running `collapse_confirmed_repeat`. So it has to agree with
+    /// [`census`], the other whole-object walk here, on every shape --
+    /// including a repeat that falls *after* the point a streaming probe
+    /// would have stopped, which is the case the saturation arm exists for.
+    ///
+    /// Driven here rather than only through a cap-crossing document because
+    /// tripping the real ceiling costs 786,432 keys: the semantics get
+    /// covered cheaply at this size, leaving the expensive integration test
+    /// to prove only that the arm is wired up.
+    #[test]
+    fn agrees_with_the_census_1588() {
+        for (json, repeated) in [
+            (&b"{}"[..], false),
+            (br#"{"a":1}"#, false),
+            (br#"{"a":1,"b":2}"#, false),
+            (br#"{"a":1,"b":2,"a":3}"#, true),
+            (br#"{"a":1,"a":2,"b":3}"#, true),
+            (br#"{"a":1,"b":2,"c":3,"b":4}"#, true),
+            // A key that does not stringify is skipped by both walks, so
+            // neither reports a repeat it cannot name.
+            (br#"{"a\q":1,"b":2}"#, false),
+        ] {
+            let index = JsonIndex::build(json);
+            let cursor = index.root(json);
+            let fields = cursor.value().as_object().expect("an object");
+            let document = String::from_utf8_lossy(json);
+            // An empty seed and the object's own first key pending: the
+            // shape `DistinctKeyCursors` hands over, with nothing yet walked.
+            let (first, _cursor, rest) = match fields.clone().uncons_key() {
+                Some(split) => split,
+                None => {
+                    assert!(!repeated, "an empty object cannot repeat: {document}");
+                    assert!(!census(&fields).repeated, "census on {document}");
+                    continue;
+                }
+            };
+            assert_eq!(
+                object_keys_repeat(Vec::new(), &first, &rest),
+                repeated,
+                "{document}"
+            );
+            assert_eq!(census(&fields).repeated, repeated, "census on {document}");
+        }
     }
 }
 

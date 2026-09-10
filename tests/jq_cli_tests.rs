@@ -3521,6 +3521,112 @@ fn test_duplicate_keys_collapse_wide_object_1385() -> Result<()> {
     Ok(())
 }
 
+/// #1588: an object wide enough to saturate `KeyHashes`'s 786,432-key
+/// ceiling hands itself to `object_keys_repeat` -- a whole-object batch
+/// probe -- instead of letting the streaming table double again. This pins
+/// that the handoff preserves jq's collapse rule; the semantics themselves
+/// are covered cheaply by `object_keys_repeat_tests` in `src/jq/document.rs`.
+///
+/// **The duplicate sits past the ceiling on purpose.** That is the case a
+/// wrong fix silently gets wrong: a table that merely *stopped inserting*
+/// when full would stream every key after saturation unchecked, report
+/// 400,000 keys where jq reports 399,999, and pass every test built from a
+/// duplicate near the head. The batch probe covers the whole object,
+/// including the fields the streaming walk has not reached, which is what
+/// makes retiring the probe on a clean answer sound.
+///
+/// **Every filter here iterates the key array**, which is what it takes to
+/// reach `DistinctKeyCursors` at all. The obvious spellings do not: bare
+/// `keys_unsorted | length`, `.k0000005` and `keys_unsorted | index(...)`
+/// are all answered by `census`, the batch walk, and keep reporting jq's
+/// numbers with the streaming probe disabled entirely -- verified by
+/// building the arm out and watching those three stay green while the two
+/// below flipped to 400000 and 2.
+///
+/// Every expectation below is jq 1.7.1's own output on the same input.
+#[test]
+fn test_duplicate_keys_collapse_past_the_probe_ceiling_1588() -> Result<()> {
+    // 800,000 fields: past `KeyHashes::MAX_SLOTS`'s 786,432-key saturation
+    // point, and no further -- this test's runtime is linear in it, so the
+    // margin is deliberately thin and moves with the ceiling. Fed on stdin,
+    // never argv (Linux CI's `ARG_MAX`).
+    const FIELDS: usize = 800_000;
+    const DUPLICATE_AT: usize = 799_000;
+    // Where the ceiling bites, and so where the collapsed list has to
+    // resume: `KeyHashes::MAX_SLOTS` * 3/4.
+    const SATURATES_AT: usize = 786_432;
+
+    // `repeat_at` places the object's *only* duplicate: `None` for a clean
+    // document, otherwise the field index whose key repeats `k0000005`.
+    let build = |repeat_at: Option<usize>| {
+        let mut out = String::from("{");
+        for i in 0..FIELDS {
+            if i > 0 {
+                out.push(',');
+            }
+            if repeat_at == Some(i) {
+                out.push_str("\"k0000005\":999999");
+            } else {
+                out.push_str(&format!("\"k{i:07}\":{i}"));
+            }
+        }
+        out.push('}');
+        out
+    };
+
+    // One invocation per document, because each already collects the whole
+    // key array: `length` proves the collapse rule, the three keys either
+    // side of the saturation point prove the collapsed list resumes exactly
+    // where the streaming walk stopped (an off-by-one in that resume shows
+    // here and nowhere else, since every other key is identical either way),
+    // and the final count proves the survivor survives exactly once.
+    let probe = format!(
+        "[keys_unsorted[]] | [length, .[{}], .[{}], .[{}], \
+         ([.[] | select(. == \"k0000005\")] | length)]",
+        SATURATES_AT - 1,
+        SATURATES_AT,
+        SATURATES_AT + 1,
+    );
+
+    // Clean: the probe proves the whole object distinct at saturation and
+    // retires, and every remaining key still streams.
+    let (clean, _, code) = run_jq_full(&["-c", &probe], Some(&build(None)))?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        clean.trim(),
+        r#"[800000,"k0786431","k0786432","k0786433",1]"#,
+        "retiring a clean probe must not drop or repeat a key after it"
+    );
+
+    let (repeated, _, code) = run_jq_full(&["-c", &probe], Some(&build(Some(DUPLICATE_AT))))?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        repeated.trim(),
+        r#"[799999,"k0786431","k0786432","k0786433",1]"#,
+        "a duplicate past the ceiling still collapses, once, in place"
+    );
+
+    // The key *at* the saturation boundary is the seam's own edge case: the
+    // settle seeds itself from the table, which holds every key before this
+    // one, and walks everything after it -- so this single key belongs to
+    // neither and is added by hand. A document whose only duplicate involves
+    // it is the one shape that notices if that hand-off is dropped; with the
+    // duplicate anywhere else, the exact re-walk finds it anyway and reports
+    // the right answer for the wrong reason.
+    let (boundary, _, code) = run_jq_full(
+        &["-c", "[keys_unsorted[]] | length"],
+        Some(&build(Some(SATURATES_AT))),
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        boundary.trim(),
+        "799999",
+        "the key being probed when the ceiling is reached must reach the seed"
+    );
+
+    Ok(())
+}
+
 /// #1385 review: collapsing must be linear in the field count. Picking each
 /// surviving key by scanning the keys accepted so far made a single
 /// duplicate in a 100K-field object take 8.5 s where not collapsing at all
