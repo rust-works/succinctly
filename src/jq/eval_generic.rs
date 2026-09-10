@@ -939,26 +939,40 @@ pub struct NodeMeta {
     /// This node's `&anchor`/`*alias` syntax (issue #763), or `None` if it
     /// carried neither.
     pub anchor: Option<AnchorMark>,
+    /// Standalone comment lines directly above this node, one entry per
+    /// line, in source order (#798 PR2). Always empty today -- capturing
+    /// these is separate, follow-up work; this field only prepares a place
+    /// for that work to write into.
+    pub head_comment: Vec<String>,
+    /// Standalone comment lines directly below this node (#798 PR2). Always
+    /// empty today -- see [`Self::head_comment`].
+    pub foot_comment: Vec<String>,
 }
 
 impl NodeMeta {
-    /// Metadata-free: no comment, no style, no anchor. `const` so the
-    /// module's empty-tree `static` can be built from it.
+    /// Metadata-free: no comment, no style, no anchor, no head/foot
+    /// comments. `const` so the module's empty-tree `static` can be built
+    /// from it.
     pub const fn empty() -> Self {
         Self {
             comment: None,
             style: "",
             anchor: None,
+            head_comment: Vec::new(),
+            foot_comment: Vec::new(),
         }
     }
 
     /// The comment/style pair read straight off a live cursor, with no
-    /// anchor mark — the shape every caller predating #763 built.
+    /// anchor mark or head/foot comments — the shape every caller predating
+    /// #763 built.
     pub fn from_comment_and_style(comment: Option<String>, style: &'static str) -> Self {
         Self {
             comment,
             style,
             anchor: None,
+            head_comment: Vec::new(),
+            foot_comment: Vec::new(),
         }
     }
 }
@@ -1219,6 +1233,8 @@ fn to_owned_with_comments_at_depth<V: DocumentValue>(
         comment: own_comment,
         style: own_style,
         anchor: own_anchor,
+        head_comment: Vec::new(),
+        foot_comment: Vec::new(),
     };
     if let Some(fields) = value.as_object() {
         let mut map = IndexMap::new();
