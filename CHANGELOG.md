@@ -80,6 +80,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`succinctly yq` no longer answers arithmetic from a collapsed copy of the
+  document** (#2626). `printf 'b: 1\na: 2\nb: 3\n' | succinctly yq 'length + 0'`
+  answered `2` while the same binary's bare `length` answered `3` — and real yq
+  v4.53.3 answers `3` for both. Adding `+ 0` changed how many keys the document
+  had. `length * -1` and `-length` were wrong the same way.
+
+  `eval_single`'s `Expr::Arithmetic` and `Expr::Negate` arms matched only when an
+  operand needed path context; every other arithmetic fell to the wildcard bridge,
+  whose first act is `to_owned_with_cursor` — an `IndexMap` walk that collapses
+  duplicate mapping keys before either operand runs. Both arms now take their
+  native, cursor-threaded route unconditionally. Unary minus needed the fix twice:
+  `eval_each_generic` has a bridging `Expr::Negate` arm of its own, so fixing only
+  `eval_single`'s left `-length` at `-3` while `first(-length)` still answered
+  `-2`. `each_negate_generic` mirrors `eval::each_negate`, with the
+  demand-forwarding and `?//`-retry behaviour verified unchanged against jq 1.7.1.
+
+  The same bridge re-rooted the value at a fresh JSON serialization, which silently
+  stubbed every yq node-metadata builtin `needs_path_context` does not cover:
+  `.b | (line + 0)` answered `0` where `.b | line` answers `2`, `(anchor + "")` and
+  `(style + "")` answered `""`, and `di + 0` answered `0` for every document in a
+  multi-document stream. All now match their bare spellings and yq v4.53.3.
+
+  **Leaving the bridge also means arithmetic stops validating the whole document,
+  and the raise-set moves with it** — `[length + 0]` and `(-length)` on a malformed
+  document now answer where they used to exit 5. That is #2173's rule one level in:
+  the split it removed was between filters, and this one was between two spellings
+  of the same read (`length` answered, `length + 0` raised, `first(length + 0)`
+  answered). An operand that actually reads the malformed scalar still raises.
+  Recorded in [docs/compliance/jq/limitations.md](docs/compliance/jq/limitations.md)
+  under ADR-0018's #2103 amendment, and pinned by
+  `test_arithmetic_validates_only_what_it_reads_2626`.
+
+  One residual, recorded in
+  [docs/compliance/yq/limitations.md](docs/compliance/yq/limitations.md): an operand
+  whose own value is a duplicate-keyed container still collapses when it is folded
+  to an `OwnedValue` (`. + {}`), the representation limit ADR-0017 declares out of
+  scope (#796).
+
 - **A `def` loaded through `include` or `~/.jq` can now shadow a builtin of the
   same name** (#2395, a #2036 follow-up). `jq -L . -nc 'include "mylib"; length'`
   with `def length: "shadowed-from-module";` in the module answered `0` -- the

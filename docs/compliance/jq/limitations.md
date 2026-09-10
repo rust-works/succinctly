@@ -3682,6 +3682,40 @@ documents, plus 5 reading spellings that must still raise), the split probe list
 if it calls a filter closed, the filter's output must not depend on the document — is
 `tests/jq_closed_term_tests.rs`.
 
+### Arithmetic and unary minus validate only what they read (#2626)
+
+[#2173](https://github.com/rust-works/succinctly/issues/2173) above stopped the wildcard
+bridge materializing for a *closed* term. `eval_single`'s `Expr::Arithmetic` and
+`Expr::Negate` arms were still gated on `needs_path_context`, so an arithmetic that **does**
+read `.` — `length + 0` — kept falling to that bridge and validating the whole document,
+while the same read spelled without the arithmetic did not. That is the same
+spelling-dependence one level in: not between filters, but between two spellings of one.
+
+On `{"a": "bad\x", "b": 5}`, which jq 1.7.1 rejects at parse time for every filter:
+
+| filter          | jq 1.7.1 | succinctly before | succinctly now |
+|-----------------|----------|-------------------|----------------|
+| `length`        | error    | `2` (exit 0)      | `2` — unchanged |
+| `length + 0`    | error    | `2` — unchanged   | `2` — unchanged |
+| `[length + 0]`  | error    | error             | `[2]`          |
+| `(-length)`     | error    | error             | `-2`           |
+| `.b + 0`        | error    | `5`               | `5` — unchanged |
+
+Dropping the gate is what closes it: both arms now take their native, cursor-threaded route
+on every input, so nothing materializes and nothing validates beyond what the operands
+actually read. Nothing replaces the bridge's ambient decode, and that is the point rather
+than an omission — it is the accident #2173's own entry describes, arrived at from a fourth
+direction. An operand that *does* read the malformed scalar still raises: `.a + ""` and
+`(.a + "") | length` both exit 5, exactly as bare `.a` does.
+
+`eval_each_generic`'s own `Expr::Negate` arm bridged too, and had to move with them, or
+`-length` and `first(-length)` would have disagreed.
+
+Sanctioned by ADR-0018's #2103 amendment, like the two entries above. Pinned by
+`test_arithmetic_validates_only_what_it_reads_2626` in `tests/yq_cli_tests.rs` (where the
+duplicate-key half of #2626 is also pinned) and by the arithmetic rows added to
+`test_closed_terms_do_not_validate_2173`'s closed-probe lists in both suites.
+
 ### A fault found by walking to it leaves the prefix on stdout
 
 succinctly is a semi-index and finds a malformed document only when the walk reaches the
