@@ -3098,9 +3098,11 @@ to the wrapping consumer and evaluates the right side only when the left forward
 to exhaustion. `and`/`or` gained `each_boolean`, over a new **shared** demand-driven
 `boolean_fanout_each` — the `and`/`or` twin of what #1459/#1481 did to `binary_fanout_core` for
 `Compare`/`Arithmetic`: one loop, parameterised over how an operand's truthiness bits are
-enumerated, with the pre-existing eager callers (`eval_boolean`, `eval_generic.rs`'s
-`eval_boolean_generic`) passing the collecting strategy and the new arms passing
-`eval_each`/`eval_each_generic`. `eval_each_generic` gained its own
+enumerated. WP2a left the pre-existing callers (`eval_boolean`, `eval_generic.rs`'s
+`eval_boolean_generic`) on an eager strategy while the new arms passed
+`eval_each`/`eval_each_generic`; #2669 moved those two onto the lazy strategy as well and removed
+the eager one, so the parameter now selects only *what is done with the bits* (collect into a
+`Vec<bool>` vs forward to a sink), never how the operands are enumerated. `eval_each_generic` gained its own
 `Expr::Alternative`/`Expr::And`/`Expr::Or` arms too, since `first(...)` never reaches `eval.rs`'s.
 Every row confirmed live against jq 1.7.1 under both wrappers, input `1`:
 
@@ -3129,21 +3131,25 @@ are pinned in `test_short_circuit_side_effect_shapes_already_match_jq_820`.
 **The loop shape was captured, not assumed.** jq 1.7.1, `-cn`:
 `[("A"|debug, "B"|debug) and ("C"|debug, "D"|debug)]` writes `A A C C D B C C D` to stderr — the
 **left** operand is the outer loop and the right one is re-evaluated per non-short-circuiting left
-output, interleaved. succinctly's eager route wrote `A A B C C D C C D` (left finished first) and
-still does for a bare top-level `and`/`or`; only the lazy arms move to jq's order, exactly as
-`Expr::Compare` did between #1459 and #1481. `[(false,true) and ("C"|debug)]` writes `C` once, not
-twice, which is the short-circuit rule.
+output, interleaved. succinctly's eager route wrote `A A B C C D C C D` (left finished first),
+exactly as `Expr::Compare` did between #1459 and #1481. `[(false,true) and ("C"|debug)]` writes `C`
+once, not twice, which is the short-circuit rule.
 
-That leaves one **new, narrower residual**, the `and`/`or` half of what #1481 did for
-`eval_binary_fanout`: `eval_boolean` still passes the eager operand strategy, so a *bare*
-top-level `[("A"|stderr,"B"|stderr) and ("C"|stderr,"D"|stderr)]` writes `AABCCDCCD` where jq
-writes `AACCDBCCD`. The delivered values are identical for side-effect-free operands, and the same
-expression reached through a lazy consumer (`first(...)`) or as a binary operand (`0 + (...)`)
-already matches jq exactly. All three rows are pinned in
-`test_short_circuit_side_effect_leaks_820_932_987` and
-`test_short_circuit_side_effect_shapes_already_match_jq_820`; closing it means routing
-`eval_boolean` (and `eval_boolean_generic`) through the lazy strategy the shared loop already
-accepts, which is a separate change from WP2a's own rows.
+**That residual is closed by #2669 — `and`/`or` now match jq on every route.** WP2a's own
+`eval_each` arms took the lazy operand strategy while the *collecting* entry points
+(`eval_boolean`, `eval_generic.rs`'s `eval_boolean_generic`) kept the eager one, so
+`[("A"|stderr,"B"|stderr) and ("C"|stderr,"D"|stderr)]` wrote `AABCCDCCD` where jq writes
+`AACCDBCCD` — while the *same operands* reached through a lazy consumer (`first(...)`,
+`limit(...)`), as a binary operand (`0 + (...)`), or simply unwrapped at the top level already
+matched, since those routes take the lazy arm. #2669 put both collecting entry points on the same
+lazy strategy, which is the `eval_boolean` half of what #1481 did for `eval_binary_fanout`, and
+deleted the eager strategy outright so there is no second one left to drift. The rows moved from
+`test_short_circuit_side_effect_leaks_820_932_987` to
+`test_short_circuit_side_effect_shapes_already_match_jq_820`.
+
+The delivered values never differed here — it was stderr ordering only, for side-effect-free
+operands. With `input`/`inputs` operands the same ordering decides which value each operand
+consumes, which is #1481's own argument for closing it rather than documenting it.
 
 **`if`'s condition, `as`/`as`-pattern's bound source, `select`, unary minus, an index key, string
 interpolation, an object value and `range`'s bound no longer diverge either — #2180 WP2b closed that
