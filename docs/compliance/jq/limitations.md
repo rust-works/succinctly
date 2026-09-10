@@ -3432,10 +3432,13 @@ which walks it exactly as `.` does, so a structural fault is still found where t
 reaches it (`{123:1,"b":2}` still exits 5 under `.,.`, as under `.`) and a colliding
 undecodable key, which the walk never has to resolve, is echoed as `.` echoes it. A filter
 whose only route is still the wildcard bridge — `. as $x | $x`, `if . then . else . end`,
-`[.]`, `{k: .}`, anything without a native streaming arm — still materializes and so still
-validates, which is the same rule applied to a route that reads the whole document, not an
-exception to it. (`label $x | .` is *not* one of those: it has a native arm and already
-answered at exit 0 on the eager route, as the matrix in 2 above records.)
+`[.]`, `{k: .}`, anything without a native streaming arm **that reads `.`** — still
+materializes and so still validates, which is the same rule applied to a route that reads
+the whole document, not an exception to it. (`label $x | .` is *not* one of those: it has a
+native arm and already answered at exit 0 on the eager route, as the matrix in 2 above
+records.) The four examples just named all read `.`, and all still materialize; what
+changed under #2173 is the bridge's behaviour for a filter that does **not** — see the
+next entry.
 
 The context that makes the loss survivable is the one #2168's entry states: succinctly
 already diverges on this whole class of document through `.` itself, deliberately, and a
@@ -3510,6 +3513,64 @@ table, `scripts/jq-m2-streaming-sweep.expected` (`--update` regenerates it). A c
 a table that matches; any cell that moves, in either direction, fails with a diff. The rows
 above are in that table at their post-#2103 values, so they are pinned rather than merely
 tolerated.
+
+### The wildcard bridge stops materializing for a filter that reads nothing (#2173)
+
+[#2103](https://github.com/rust-works/succinctly/issues/2103) above left one route out: a
+filter with no native streaming arm still fell to `eval_single`'s wildcard, and the
+wildcard's first act is `to_owned_with_cursor` on the *ambient* value — a complete
+`OwnedValue` copy of the document, built purely so the eager evaluator has an input to run
+against. Since that walk visits everything, it validated everything, so those spellings
+kept jq's whole-document rejection while the ones with a native arm had already lost it.
+On `{123: 1, "b": 2}`, one binary answered `1+1` with `2` at exit 0 and rejected `[1+1]` at
+exit 5. That is the spelling-dependence #1629/#1642/#2168 exist to remove, arrived at from
+a third direction.
+
+`bridge_ambient_input` hands a **closed term** — one that `jq::walk::reads_ambient_value`
+proves cannot consult `.` — `OwnedValue::Null` instead. Nothing is materialized, so nothing
+is validated. Captured against pinned jq 1.7.1 on `{123: 1, "b": 2}`, which it rejects at
+parse time for every filter:
+
+| filter                                            | jq 1.7.1 | succinctly before | succinctly now |
+|---------------------------------------------------|----------|-------------------|----------------|
+| `1+1`                                             | error    | `2` (exit 0)      | `2` — unchanged |
+| `[1+1]`                                           | error    | error             | `[2]`          |
+| `[range(3)]`, `range(3)`                          | error    | error             | `[0,1,2]`, `0 1 2` |
+| `now\|floor`, `$__loc__`                          | error    | error             | the value      |
+| `true and true`, `false or true`, `false // 1`    | error    | error             | `true`, `true`, `1` |
+
+The same three reasons #2103 records apply unchanged, and the first is the strongest here:
+*the agreement being given up was an accident.* Nothing decided that `[1+1]` should validate
+its input; `to_owned_with_cursor` validated because it needed a value to bridge with, and
+`1+1` escaped only because someone had written it a native arm. Sanctioned by ADR-0018's
+#2103 amendment, and now listed there as its own instance.
+
+**It also cost what #2103's own point 3 costs.** On a 16 MB `json generate` document,
+indicative single runs: `[1+1]` 443 MB / 0.75 s → 29 MB / 0.03 s; `[range(3)]` 446 MB /
+0.89 s → 29 MB; `false // 1` 445 MB / 0.86 s → 29 MB. In yq mode, where every filter takes
+`eval_single`, `1+1` went 476 MB / 0.90 s → 126 MB / 0.11 s on a 30 MB document. The
+baseline for both is a filter that already had a native arm.
+
+**What did not change.** A filter that reads `.` still materializes and still validates
+everything it materializes — `. as $x | $x`, `if . then . else . end`, `[.]`, `{k: .}`,
+`. and true`, `range(length; 3)`, and `.` itself all keep their exit 5. So do the
+materializing flag routes (`-S`, `-a`, `-s`, `-C`, `-n`), which never reach these sites and
+are #2662's. And a document whose *root* the reader cannot delimit at all — `xyz123`,
+`[1,2`, `["a`, `[1] x` — still fails for every filter including `empty`, because there is
+no value to skip reading; that is the reader, not a filter, and it matches jq.
+
+**#2476's arms moved with it.** `and`/`or`/`//` had been given `ambient_validation_error`
+— the same rejection as a walk that allocates nothing — days earlier, for the same shapes.
+Keeping it there while the bridge stopped raising would have re-created the split by hand,
+so the walk is now charged only to an operand that reads `.`. `not` is unchanged: it reads
+`.`'s truthiness, so it validates.
+
+Pinned by `test_closed_terms_do_not_validate_2173` (12 closed spellings x 6 malformed
+documents, plus 5 reading spellings that must still raise), the split probe lists in
+`test_ambient_validation_agrees_with_bridge_2476` and its yq twin, and
+`test_wildcard_bridge_over_alias_fanout_completes_2173`. The predicate's own soundness —
+if it calls a filter closed, the filter's output must not depend on the document — is
+`tests/jq_closed_term_tests.rs`.
 
 ### A fault found by walking to it leaves the prefix on stdout
 

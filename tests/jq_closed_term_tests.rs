@@ -36,9 +36,9 @@ use succinctly::json::JsonIndex;
 /// from the input, one of these five will make it show.
 const DOCS: &[&str] = &[
     r#"{"a":1,"b":{"c":[2,3]}}"#,
-    r#"[10,20,30]"#,
+    "[10,20,30]",
     r#""a string""#,
-    r#"{}"#,
+    "{}",
     r#"{"a":[{"z":null},false],"q":"x"}"#,
 ];
 
@@ -122,7 +122,10 @@ fn outputs(doc: &str, filter: &str) -> Result<Vec<String>, String> {
     let values = eval_generic::eval_with_cursor(&expr, cursor)
         .collect_owned()
         .map_err(|e| format!("eval {filter:?}: {e:?}"))?;
-    Ok(values.iter().map(|v| v.to_json()).collect())
+    Ok(values
+        .iter()
+        .map(succinctly::jq::OwnedValue::to_json)
+        .collect())
 }
 
 /// The soundness property: a filter the predicate calls closed must produce

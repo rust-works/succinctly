@@ -220,6 +220,41 @@ present since #2473 and untouched by #2476), which resolves `.b`'s path and rais
 `.b[0]` does. Real yq rejects this whole document at parse time either way, so there is no yq
 behaviour to match for any of these constructs.
 
+**[#2173](https://github.com/rust-works/succinctly/issues/2173) goes one step further, and
+this one *is* a new yq divergence rather than an extension of an existing one.** Every
+`succinctly yq` filter takes `eval_single`, so unlike jq mode nothing here had a native
+streaming arm to escape through: the wildcard bridge materialized the whole document for
+`1+1` as much as for `.a`, and validated it in passing. That rejection matched real yq,
+which parses eagerly. It no longer does, for a filter that provably reads nothing.
+
+Captured live against yq v4.53.3 on `a: "\x"` / `b: 5` (an invalid escape, which yq
+rejects at parse time whatever the filter):
+
+| filter                              | real yq | succinctly before | succinctly now |
+|-------------------------------------|---------|-------------------|----------------|
+| `1+1`, `[1+1]`                      | exit 1  | exit 1 — matched  | `2`, `- 2`     |
+| `true and true`, `false // 1`       | exit 1  | exit 1 — matched  | `true`, `1`    |
+| `{"k":1}`, `1 as $x \| $x`          | exit 1  | exit 0            | unchanged      |
+| `.b`                                | exit 1  | exit 0            | unchanged      |
+| `. and true`                        | exit 1  | exit 1            | unchanged      |
+
+So four spellings stop matching yq. The rows below them are why that is the *uniform*
+answer rather than a new inconsistency: `.b` and `{"k":1}` already answered at exit 0 on
+this document, because navigation validates only what it reads (#2168) and neither reaches
+the bad escape. Keeping `1+1` rejecting would have meant a binary that answers `.b` and
+`{"k":1}` while refusing `1+1` on one document in one run — the shape ADR-0018's #2103
+amendment exists to rule out. `. and true` still raises: it reads `.`.
+
+Same disposition, same sanction, and the same escape hatch as the jq side — a user who
+wants yq's rejection has `succinctly json validate` for JSON input, and the divergence is
+confined to documents real yq would refuse outright. Pinned by
+`test_closed_terms_do_not_validate_2173`'s yq twin behaviour through
+`test_ambient_validation_agrees_with_bridge_2476`'s closed-probe rows, and by
+`test_wildcard_bridge_over_alias_fanout_completes_2173`, which is also the memory guard:
+on #1804's fan-out shape (`aN: &aN [*a(N-1), *a(N-1)]`) the ambient materialization was
+`O(2^N)`, measured at 0.33 s / 1.31 s / 5.38 s / 22.70 s for N=18/20/22/24 and flat
+0.00 s after.
+
 **Resolved ([#1350](https://github.com/rust-works/succinctly/issues/1350)).**
 `enforce_anchor_soundness` takes a `sort_keys` argument and has always handled it correctly
 on the DOM path; the cursor-streaming path used to never call it, reproducing the unsound
