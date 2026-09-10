@@ -714,7 +714,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// it stays pending and goes forward to whatever opens next.
     fn resolve_pending_block_backward(&mut self) {
         if self.pending_head_lines.is_empty() {
-            return;
+            return; // omni-dev: coverage tolerate-line reason="unreachable: this function's sole caller (record_standalone_comment) only invokes it from inside a match on `pending_head_lines.last()`, so pending_head_lines is already known non-empty here (#798)"
         }
         if let Some(prev) = self.last_head_foot_bp {
             let pending = &mut self.pending_head_lines;
