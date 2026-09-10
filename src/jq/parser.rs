@@ -1449,11 +1449,23 @@ impl<'a> Parser<'a> {
                 self.parse_postfix(paren)
             }
 
-            // Array construction
-            Some('[') => self.parse_array_construction(),
+            // Array construction. #2667: a collection literal is a primary
+            // term in jq's own grammar, exactly like the parenthesized form
+            // just above, so the postfix chain applies to it directly --
+            // `[1,2][]`, `[1,2][0]` and `[1,2][0:1]` are all valid jq 1.7.1
+            // and were parse errors here. Only `(...)` routed through
+            // `parse_postfix`, which is why `([1,2])[]` always worked.
+            Some('[') => {
+                let array = self.parse_array_construction()?;
+                self.parse_postfix(array)
+            }
 
-            // Object construction
-            Some('{') => self.parse_object_construction(),
+            // Object construction -- same #2667 fix, for `{a:1}.a` and
+            // `{a:1}["a"]`.
+            Some('{') => {
+                let object = self.parse_object_construction()?;
+                self.parse_postfix(object)
+            }
 
             // String literal or interpolation
             Some('"') => self.parse_string_or_interpolation(),
