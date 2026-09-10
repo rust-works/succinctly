@@ -34579,11 +34579,7 @@ fn substitute_var_impl(
             // f(1)` is `3` (bare -- outer reaches in), `3 as $g | def
             // f($g): $g; f(1)` is `1` (dollar-style -- shadowed), matching
             // this fix.
-            let shadowed = params
-                .iter()
-                .rev()
-                .find(|p| p.name() == var_name)
-                .is_some_and(Param::is_dollar);
+            let shadowed = params_bind_dollar(params, var_name);
             Expr::FuncDef {
                 name: name.clone(),
                 params: params.clone(),
@@ -48764,24 +48760,18 @@ pub(crate) fn bind_def_call<'e>(
 /// possibly a different, earlier position (`def f($a; a): $a; f(1;2)` is
 /// `1`: the trailing bare `a` shadows the bare namespace only, so the
 /// leading `$a`'s own binding is still what `$a` resolves to). Substituting
-/// the bare winner first, with `subst_dollar: false` so it only touches
-/// bare `Expr::FuncCall` nodes, then the `$` winner (if any) with
-/// `subst_dollar: true`, reproduces this correctly regardless of which
-/// position wins which namespace.
+/// the bare winner under [`BARE_NAMESPACE_ONLY`] and the `$` winner (if any)
+/// under [`DOLLAR_NAMESPACE_ONLY`] reproduces this, whichever position wins
+/// which namespace.
 ///
-/// **Why the order is what makes that sound.** `subst_dollar` gates exactly
-/// one arm of [`substitute_func_param_impl`] -- `Expr::Var` -- and no other:
-/// it never gates the bare `Expr::FuncCall` arm, and it never decides
-/// whether to recurse, since every shadow check it passes
-/// (`Expr::FuncDef`'s `body_shadowed`/`then_shadowed`, the
-/// `As`/`Reduce`/`Foreach`/`AsPattern` binder checks) reads only `param` and
-/// nodes neither pass rewrites. So the two passes walk *identically*, and
-/// the set of bare references the `$` pass can reach is exactly the set the
-/// bare pass already replaced with an (opaque) `Expr::Shared` -- its
-/// unconditional bare arm therefore has nothing left to clobber. The same
-/// property is what makes the same-winner case (a trailing `$`-style
-/// parameter) compose back into precisely the single `subst_dollar: true`
-/// pass this replaced.
+/// The two passes are independent: each rewrites a disjoint set of nodes
+/// ([`SubstScope`] gates the `Expr::Var` and bare `Expr::FuncCall` arms
+/// separately since #2555), so neither can consume or clobber what the other
+/// is looking for, and their order does not matter. Before #2555 the bare
+/// arm fired unconditionally, and this relied on the bare pass running first
+/// and leaving opaque `Expr::Shared` behind for the `$` pass to skip over --
+/// correct, but only by construction rather than by the flags actually
+/// saying so.
 ///
 /// One consequence worth keeping: when a duplicated name has *no* `$`-style
 /// occurrence at all, the `$` pass never runs, so a `$name` in the body is
@@ -48812,14 +48802,10 @@ fn bind_def_call_params(body: &Expr, params: &[Param], args: &[Expr]) -> Expr {
         let Some((first_param, first_arg)) = params_and_args.next() else {
             return body.clone(); // omni-dev: coverage tolerate-line reason="unreachable: bind_def_call only calls this for a non-empty params, and install_def_calls only builds a DefCall whose args.len() equals params.len(), so the zip is never empty here (#2560)"
         };
-        let mut result = substitute_func_param(
-            body,
-            first_param.name(),
-            &Expr::Shared(Rc::new(first_arg.clone())),
-        );
+        let mut result =
+            substitute_func_param(body, first_param, &Expr::Shared(Rc::new(first_arg.clone())));
         for (param, arg) in params_and_args {
-            result =
-                substitute_func_param(&result, param.name(), &Expr::Shared(Rc::new(arg.clone())));
+            result = substitute_func_param(&result, param, &Expr::Shared(Rc::new(arg.clone())));
         }
         return result;
     }
@@ -48855,7 +48841,7 @@ fn bind_def_call_params(body: &Expr, params: &[Param], args: &[Expr]) -> Expr {
             result.as_ref().unwrap_or(body),
             name,
             &Expr::Shared(Rc::new(bare_arg.clone())),
-            false,
+            BARE_NAMESPACE_ONLY,
         );
 
         if let Some((_, dollar_arg)) = by_name().rfind(|(p, _)| p.is_dollar()) {
@@ -48863,7 +48849,7 @@ fn bind_def_call_params(body: &Expr, params: &[Param], args: &[Expr]) -> Expr {
                 &substituted,
                 name,
                 &Expr::Shared(Rc::new(dollar_arg.clone())),
-                true,
+                DOLLAR_NAMESPACE_ONLY,
             );
         }
         result = Some(substituted);
@@ -49303,30 +49289,134 @@ fn sibling_frame_charge(frames: u32, position: u32, in_recursive_body: bool) -> 
 /// system enforces -- debug-only, since every real (release) call already
 /// goes through [`bind_def_call`], which constructs the wrapper itself.
 ///
-/// Substitute into `e` unless `shadowed`, in which case leave it untouched
-/// (`shadowed` means some binder between here and `e` already rebinds
-/// `param`, so nothing further down can still be `param`'s substituted
-/// argument -- see each call site's own shadow condition). Collapses the
-/// "binder shadows `param` -> clone; otherwise recurse" idiom `FuncDef`'s
-/// own arm below needs for its two *independent* `body`/`then` shadow
-/// conditions (#2096 review). `As`/`Reduce`/`Foreach`/`AsPattern` used to
-/// share this too, before #2095 hoisted each of their single shadow
-/// conditions to a match guard instead, so their own non-shadowed case could
-/// fall through to [`map_subexprs`]'s (`src/jq/walk.rs`) shared,
-/// unconditional-recursion arm rather than calling back in here.
-fn subst_unless_shadowed(
-    shadowed: bool,
-    e: &Expr,
-    param: &str,
-    arg: &Expr,
-    subst_dollar: bool,
-) -> Expr {
-    if shadowed {
+/// Substitute into `e` under `scope`, skipping the walk entirely once
+/// `scope` has nothing left to rewrite.
+///
+/// #2555: this used to be `subst_unless_shadowed(shadowed: bool, ..)`, back
+/// when a binder shadowed `param` in *both* namespaces or neither, so
+/// "shadowed" could clone the subtree outright. Now that the two namespaces
+/// shadow independently, a nested `def` can shadow the bare name while
+/// leaving `$param` free to reach through it, and cloning on the first
+/// shadow would drop that remaining substitution — so the narrowing lives
+/// in [`SubstScope`] and only an *empty* scope short-circuits. That empty
+/// case is exactly the old `shadowed` fast path (#2096 review), and
+/// `FuncDef`'s arm below is still the only caller: `As`/`Reduce`/`Foreach`/
+/// `AsPattern` hoisted their own single shadow conditions to match guards in
+/// #2095 so their non-shadowed case falls through to [`map_subexprs`]'s
+/// (`src/jq/walk.rs`) shared unconditional-recursion arm instead.
+fn subst_in_scope(e: &Expr, param: &str, arg: &Expr, scope: SubstScope) -> Expr {
+    if scope.is_empty() {
         e.clone()
     } else {
-        substitute_func_param_impl(e, param, arg, subst_dollar)
+        substitute_func_param_impl(e, param, arg, scope)
     }
 }
+
+/// Whether `params` binds `$name` -- the *last* parameter of that name
+/// decides, per jq's later-wins parameter shadowing (#2560), and only a
+/// `$`-style one binds the variable namespace at all.
+///
+/// One definition, two call sites: [`substitute_var_impl`]'s `Expr::FuncDef`
+/// arm (may an outer `$name` substitution reach into this def's body?) and
+/// [`substitute_func_param_impl`]'s (same question, for an outer
+/// *parameter*'s own `$name` references). They asked the identical question
+/// with separately-written code until #2555; `test_params_bind_dollar_agrees_with_both_shadow_sites_2555`
+/// pins that they still agree.
+fn params_bind_dollar(params: &[Param], name: &str) -> bool {
+    params
+        .iter()
+        .rev()
+        .find(|p| p.name() == name)
+        .is_some_and(Param::is_dollar)
+}
+
+/// Which of a function parameter's two namespaces a substitution may still
+/// rewrite at the current point in the tree (#2555, #2726).
+///
+/// jq keeps these genuinely separate. A bare `name` reference
+/// (`Expr::FuncCall { name, args: [] }`, jq's call-by-name spelling for a
+/// parameter) lives in the *filter* namespace; a `$name` reference
+/// (`Expr::Var`) lives in the *variable* namespace. What binds each differs,
+/// so what shadows each differs too, and collapsing the two into one flag
+/// was wrong in both directions:
+///
+/// - a `$`-style parameter binds **both** ([`Param`]'s own doc comment: `def
+///   h($param): param` alone is a compile error, "param is not defined", so
+///   `$`-style always occupies the bare namespace too), while a bare-style
+///   parameter binds **only** `bare` -- so a bare parameter must not
+///   substitute a `$name` reference at all (#2726: `def f(a): $a; f(1)` is a
+///   compile error in jq 1.7.1, and answered `1` here);
+/// - a nested `def`'s own matching parameter, or a nested zero-argument
+///   `def` of the same name, shadows only what it actually binds -- a
+///   *bare-only* nested parameter leaves an outer `$param` free to reach
+///   through it (#2555: `def f($param): def h(param): $param; h(1); f(99)`
+///   is `99` in jq 1.7.1, and answered `1` here).
+///
+/// Cleared per-namespace as the walk crosses a binder, never re-set: once a
+/// name is rebound, nothing deeper down is still this parameter's argument.
+#[derive(Clone, Copy)]
+struct SubstScope {
+    /// `$param` (`Expr::Var`) still resolves to this call's own argument.
+    /// Cleared by any binder that rebinds `$param` for real -- `1 as
+    /// $param`, a `reduce`/`foreach`/`?//` pattern binding it, or a nested
+    /// `def` whose own matching parameter is `$`-style.
+    dollar: bool,
+    /// Bare `param` (`Expr::FuncCall { args: [] }`) still resolves to this
+    /// call's own argument. Only a *filter*-namespace binder clears it -- a
+    /// nested `def`'s matching parameter (of either spelling, since both
+    /// bind the bare name) or a nested zero-argument `def` of that name. An
+    /// `as`/`reduce`/`foreach` binder never does, however it is spelled:
+    /// confirmed live against jq 1.7.1, `def f(g): 1 as $g | $g + g; 10 as
+    /// $g | f($g)` is `11` -- the inner `1 as $g` shadows the inner `$g`
+    /// (evaluating to `1`) and never the bare `g` (still the caller's `$g`,
+    /// `10`).
+    bare: bool,
+}
+
+impl SubstScope {
+    /// The scope a call-time parameter binding starts in: a `$`-style
+    /// parameter owns both namespaces, a bare-style one owns only `bare`.
+    fn for_param(param: &Param) -> Self {
+        Self {
+            dollar: param.is_dollar(),
+            bare: true,
+        }
+    }
+
+    fn without_dollar(self) -> Self {
+        Self {
+            dollar: false,
+            ..self
+        }
+    }
+
+    fn without_bare(self) -> Self {
+        Self {
+            bare: false,
+            ..self
+        }
+    }
+
+    /// Nothing left to rewrite -- every reference this substitution could
+    /// have claimed is now bound by something nearer.
+    fn is_empty(self) -> bool {
+        !self.dollar && !self.bare
+    }
+}
+
+/// Rewrite only bare `param` references, leaving every `$param` alone --
+/// [`bind_def_call_params`]' bare-winner pass over a duplicated name.
+const BARE_NAMESPACE_ONLY: SubstScope = SubstScope {
+    dollar: false,
+    bare: true,
+};
+
+/// Rewrite only `$param` references, leaving every bare `param` alone --
+/// [`bind_def_call_params`]' `$`-winner pass over a duplicated name.
+const DOLLAR_NAMESPACE_ONLY: SubstScope = SubstScope {
+    dollar: true,
+    bare: false,
+};
 
 /// Substitute a function parameter with an argument expression.
 ///
@@ -49342,22 +49432,15 @@ fn subst_unless_shadowed(
 /// mechanism (the parser threw away the `$`), so they still rely on this
 /// same substitution to resolve at all (`def f($x): $x; f(5)` is `5`).
 ///
-/// `subst_dollar` tracks whether `$param` still means "this call's own
-/// argument" at the current point in the tree -- true everywhere by
-/// default, and cleared for one binder's own bound-scope child the moment
-/// that binder rebinds `$param` for real (`1 as $param`, or a `reduce`/
-/// `foreach`/`?//` pattern that binds `$param`), since a `$param`
-/// reference past that point is the *local* binding, not `param`'s own
-/// value. It never gates a *bare* `param` reference, which stays in its
-/// own namespace regardless: confirmed live against jq 1.7.1,
-/// `def f(g): 1 as $g | $g + g; 10 as $g | f($g)` is `11` -- the inner
-/// `1 as $g` shadows only the inner `$g` (evaluates to `1`), never the
-/// bare `g` (substituted with the caller's own `$g`, `10`).
-fn substitute_func_param(expr: &Expr, param: &str, arg: &Expr) -> Expr {
-    substitute_func_param_impl(expr, param, arg, true)
+/// Which namespaces the substitution may rewrite, and what narrows that as
+/// the walk crosses each binder, is [`SubstScope`] -- `param`'s own spelling
+/// decides where it starts (#2726), and only a binder in the matching
+/// namespace clears it (#2555).
+fn substitute_func_param(expr: &Expr, param: &Param, arg: &Expr) -> Expr {
+    substitute_func_param_impl(expr, param.name(), arg, SubstScope::for_param(param))
 }
 
-fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, subst_dollar: bool) -> Expr {
+fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, scope: SubstScope) -> Expr {
     debug_assert!(
         matches!(arg, Expr::Shared(_)),
         "substitute_func_param's capture-hygiene argument (#2096) requires `arg` to be \
@@ -49376,17 +49459,12 @@ fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, subst_dollar
         // exists at all (a `$`-style parameter's only binding mechanism)
         // and why it's gated on `subst_dollar` rather than firing
         // unconditionally the way the `FuncCall` arm below does.
-        Expr::Var(name) if subst_dollar && name == param => arg.clone(),
+        Expr::Var(name) if scope.dollar && name == param => arg.clone(),
         // #2095: does not recurse into `msg` -- see `map_subexprs`'s own doc
         // comment (`src/jq/walk.rs`) on its `Expr::Error` arm for why this is
         // preserved as a likely latent gap rather than fixed here.
         Expr::Error(msg) => Expr::Error(msg.clone()),
-        Expr::Builtin(b) => Expr::Builtin(substitute_func_param_in_builtin(
-            b,
-            param,
-            arg,
-            subst_dollar,
-        )),
+        Expr::Builtin(b) => Expr::Builtin(substitute_func_param_in_builtin(b, param, arg, scope)),
         // #2141: unlike the pre-fix code, `expr`/`input`/`init` (evaluated
         // in the *outer* scope) always keep the ambient `subst_dollar`, and
         // `body`/`update`/`extract` (the bound-scope child) only ever clear
@@ -49394,13 +49472,17 @@ fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, subst_dollar
         // still applies to every child unconditionally -- a `$`-bound
         // binder can shadow `$param`, never a bare `param`.
         Expr::As { expr, var, body } => Expr::As {
-            expr: Box::new(substitute_func_param_impl(expr, param, arg, subst_dollar)),
+            expr: Box::new(substitute_func_param_impl(expr, param, arg, scope)),
             var: var.clone(),
             body: Box::new(substitute_func_param_impl(
                 body,
                 param,
                 arg,
-                subst_dollar && var != param,
+                if var == param {
+                    scope.without_dollar()
+                } else {
+                    scope
+                },
             )),
         },
         Expr::Reduce {
@@ -49409,13 +49491,16 @@ fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, subst_dollar
             init,
             update,
         } => {
-            let still_dollar =
-                subst_dollar && !patterns.iter().any(|p| pattern_binds_var(p, param));
+            let bound_scope = if patterns.iter().any(|p| pattern_binds_var(p, param)) {
+                scope.without_dollar()
+            } else {
+                scope
+            };
             Expr::Reduce {
-                input: Box::new(substitute_func_param_impl(input, param, arg, subst_dollar)),
+                input: Box::new(substitute_func_param_impl(input, param, arg, scope)),
                 patterns: patterns.clone(),
-                init: Box::new(substitute_func_param_impl(init, param, arg, subst_dollar)),
-                update: Box::new(substitute_func_param_impl(update, param, arg, still_dollar)),
+                init: Box::new(substitute_func_param_impl(init, param, arg, scope)),
+                update: Box::new(substitute_func_param_impl(update, param, arg, bound_scope)),
             }
         }
         Expr::Foreach {
@@ -49425,16 +49510,19 @@ fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, subst_dollar
             update,
             extract,
         } => {
-            let still_dollar =
-                subst_dollar && !patterns.iter().any(|p| pattern_binds_var(p, param));
+            let bound_scope = if patterns.iter().any(|p| pattern_binds_var(p, param)) {
+                scope.without_dollar()
+            } else {
+                scope
+            };
             Expr::Foreach {
-                input: Box::new(substitute_func_param_impl(input, param, arg, subst_dollar)),
+                input: Box::new(substitute_func_param_impl(input, param, arg, scope)),
                 patterns: patterns.clone(),
-                init: Box::new(substitute_func_param_impl(init, param, arg, subst_dollar)),
-                update: Box::new(substitute_func_param_impl(update, param, arg, still_dollar)),
+                init: Box::new(substitute_func_param_impl(init, param, arg, scope)),
+                update: Box::new(substitute_func_param_impl(update, param, arg, bound_scope)),
                 extract: extract
                     .as_deref()
-                    .map(|e| Box::new(substitute_func_param_impl(e, param, arg, still_dollar))),
+                    .map(|e| Box::new(substitute_func_param_impl(e, param, arg, bound_scope))),
             }
         }
         Expr::AsPattern {
@@ -49442,12 +49530,15 @@ fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, subst_dollar
             patterns,
             body,
         } => {
-            let still_dollar =
-                subst_dollar && !patterns.iter().any(|p| pattern_binds_var(p, param));
+            let bound_scope = if patterns.iter().any(|p| pattern_binds_var(p, param)) {
+                scope.without_dollar()
+            } else {
+                scope
+            };
             Expr::AsPattern {
-                expr: Box::new(substitute_func_param_impl(expr, param, arg, subst_dollar)),
+                expr: Box::new(substitute_func_param_impl(expr, param, arg, scope)),
                 patterns: patterns.clone(),
-                body: Box::new(substitute_func_param_impl(body, param, arg, still_dollar)),
+                body: Box::new(substitute_func_param_impl(body, param, arg, bound_scope)),
             }
         }
         Expr::FuncDef {
@@ -49464,7 +49555,16 @@ fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, subst_dollar
             // leave the `g` in `then` alone so the evaluator's own
             // innermost-first def lookup resolves it to the nested `def g`,
             // not to `param`'s substituted argument.
-            let then_shadowed = name == param && params.is_empty();
+            // #2555: bare-namespace only. A `def` binds a *filter* name and
+            // never a `$name`, so an outer `$param` reaches straight through
+            // one -- confirmed live against jq 1.7.1, `def f($a): def a: 99;
+            // $a; f(2)` is `2` (this used to block both namespaces and
+            // answered "undefined variable: $a").
+            let then_scope = if name == param && params.is_empty() {
+                scope.without_bare()
+            } else {
+                scope
+            };
             // #2283 review: this blanket "any matching param name shadows,
             // bare or `$`-style alike" is correct as-is for the *bare*
             // `param`-reference substitution this arm mostly exists for --
@@ -49481,50 +49581,40 @@ fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, subst_dollar
             // shadow a bare substitution was wrong -- this line needed no
             // change once `Param` was available to check.
             //
-            // What *is* still wrong here, confirmed live and NOT fixed by
-            // this issue (tracked as a follow-up instead): this same
-            // blanket check also gates *`$param`-Var* substitution (via
-            // `subst_dollar` staying ambient into `body` below) whenever
-            // any matching param name exists, even a *bare* one -- but a
-            // bare nested parameter creates no `$name` binding at all, so
-            // an outer `$param` substitution should still reach through
-            // it. `def f($param): def h(param): $param; h(1); f(99)`
-            // answers `99` in jq (`h`'s own bare parameter doesn't touch
-            // `$param`, so it resolves to `f`'s own) but `1` here. Fixing
-            // this needs a second, independent `subst_bare`-style flag
-            // threaded through this whole function (this one gate
-            // conflates "block bare substitution" with "block
-            // `$`-substitution", and they need different shadowing rules)
-            // -- a materially larger change than this arm's own `Param`
-            // fix, out of scope here.
-            let body_shadowed = params.iter().any(|p| p.name() == param);
+            // #2555 splits the *other* half back out. This blanket check
+            // used to gate the `$param` substitution too, so an outer
+            // `$param` could not reach through a nested *bare-only*
+            // parameter either -- but a bare parameter creates no `$name`
+            // binding at all. Confirmed live against jq 1.7.1: `def
+            // f($param): def h(param): $param; h(1); f(99)` is `99` (`h`'s
+            // own bare parameter never touches `$param`), and answered `1`
+            // here. So the bare namespace is shadowed by a matching
+            // parameter of *either* spelling, while the `$` namespace is
+            // shadowed only when the binding one is `$`-style.
+            let mut body_scope = scope;
+            if params.iter().any(|p| p.name() == param) {
+                body_scope = body_scope.without_bare();
+            }
+            if params_bind_dollar(params, param) {
+                body_scope = body_scope.without_dollar();
+            }
             Expr::FuncDef {
                 name: name.clone(),
                 params: params.clone(),
-                body: Box::new(subst_unless_shadowed(
-                    body_shadowed,
-                    body,
-                    param,
-                    arg,
-                    subst_dollar,
-                )),
-                then: Box::new(subst_unless_shadowed(
-                    then_shadowed,
-                    then,
-                    param,
-                    arg,
-                    subst_dollar,
-                )),
+                body: Box::new(subst_in_scope(body, param, arg, body_scope)),
+                then: Box::new(subst_in_scope(then, param, arg, then_scope)),
                 // Rebuilt above, so any cache is stale (#2094).
                 bound: FuncDefBound::default(),
             }
         }
-        Expr::FuncCall { name, args, .. } if name == param && args.is_empty() => {
+        Expr::FuncCall { name, args, .. } if scope.bare && name == param && args.is_empty() => {
             // In jq, function parameters are bare identifiers that parse as
-            // zero-arg FuncCalls. This is a reference to the parameter --
-            // never gated on `subst_dollar` (see this function's own doc
-            // comment): a bare parameter has no `$`-namespace binder that
-            // could ever shadow it.
+            // zero-arg FuncCalls. This is a reference to the parameter.
+            //
+            // #2555: gated on `scope.bare`, not on `scope.dollar` -- only a
+            // *filter*-namespace binder (a nested `def`, or a nested def's
+            // own matching parameter) can shadow this, never an `as`/
+            // `reduce`/`foreach` binder, however that binder is spelled.
             arg.clone()
         }
 
@@ -49537,7 +49627,7 @@ fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, subst_dollar
         // for the full variant-by-variant justification, including the arms
         // above that stay explicit here instead of ever reaching it.
         _ => map_subexprs(expr, &mut |sub| {
-            substitute_func_param_impl(sub, param, arg, subst_dollar)
+            substitute_func_param_impl(sub, param, arg, scope)
         }),
     }
 }
@@ -49564,12 +49654,12 @@ fn install_def_calls_in_builtin(
 
 /// Substitute function parameter in a builtin expression.
 ///
-/// #2141 review: takes `subst_dollar` rather than calling the public
-/// [`substitute_func_param`] (which always starts a fresh `true`) --
-/// a builtin argument is ordinary structural nesting, not a
-/// substitution-scope boundary, so the ambient `subst_dollar` an
-/// enclosing `As`/`Reduce`/`Foreach`/`AsPattern` binder may have already
-/// cleared must carry into it. Confirmed live: without this,
+/// #2141 review: takes the ambient [`SubstScope`] rather than calling the
+/// public [`substitute_func_param`] (which starts a fresh scope from the
+/// parameter's own spelling) -- a builtin argument is ordinary structural
+/// nesting, not a substitution-scope boundary, so whatever an enclosing
+/// `As`/`Reduce`/`Foreach`/`AsPattern`/`FuncDef` binder has already narrowed
+/// must carry into it. Confirmed live: without this,
 /// `def f(g): 1 as $g | select($g == 1); f(999)` answered nothing
 /// (`select`'s own `$g` was wrongly re-substituted with `f`'s argument,
 /// `999`, instead of staying `1` from the enclosing `1 as $g`) where jq
@@ -49578,10 +49668,10 @@ fn substitute_func_param_in_builtin(
     builtin: &Builtin,
     param: &str,
     arg: &Expr,
-    subst_dollar: bool,
+    scope: SubstScope,
 ) -> Builtin {
     map_builtin_subexprs(builtin, &mut |e| {
-        substitute_func_param_impl(e, param, arg, subst_dollar)
+        substitute_func_param_impl(e, param, arg, scope)
     })
 }
 
@@ -49858,6 +49948,82 @@ mod tests {
             "the later, bare parameter has no $-binding of its own -- the outer $a must \
              reach through"
         );
+    }
+
+    /// #2555: `params_bind_dollar` is one definition serving two shadow
+    /// sites that ask the identical question -- `substitute_var_impl`'s
+    /// `Expr::FuncDef` arm (may an outer `$name` value reach this def's
+    /// body?) and `substitute_func_param_impl`'s (may an outer *parameter*'s
+    /// own `$name` reach it?). They were written separately, and this pins
+    /// that they now answer alike, per this project's own lesson that
+    /// duplicated predicates diverge silently (#106).
+    ///
+    /// Each row is checked three ways: the predicate itself, and both call
+    /// sites observed through their own public entry points.
+    #[test]
+    fn test_params_bind_dollar_agrees_with_both_shadow_sites_2555() {
+        let bare = |n: &str| Param::Bare(n.to_string());
+        let dollar = |n: &str| Param::Dollar(n.to_string());
+
+        for (params, binds_dollar, label) in [
+            (vec![bare("a")], false, "bare alone binds no $a"),
+            (vec![dollar("a")], true, "$-style alone binds $a"),
+            (vec![bare("b")], false, "a different name binds nothing"),
+            (
+                vec![bare("a"), dollar("a")],
+                true,
+                "duplicate, $-style last -- last occurrence decides",
+            ),
+            (
+                vec![dollar("a"), bare("a")],
+                false,
+                "duplicate, bare last -- last occurrence decides",
+            ),
+            (
+                vec![dollar("a"), bare("a"), dollar("a")],
+                true,
+                "three occurrences, $-style last",
+            ),
+            (vec![], false, "no parameters at all"),
+        ] {
+            assert_eq!(
+                params_bind_dollar(&params, "a"),
+                binds_dollar,
+                "params_bind_dollar disagrees: {label}"
+            );
+
+            // Site 1 -- `substitute_var_impl`: an outer `$a` reaches the
+            // body exactly when these params do NOT bind `$a`.
+            let def = Expr::FuncDef {
+                name: "f".to_string(),
+                params: params.clone(),
+                body: Box::new(Expr::Var("a".to_string())),
+                then: Box::new(Expr::Identity),
+                bound: FuncDefBound::default(),
+            };
+            let Expr::FuncDef { body, .. } = substitute_var(&def, "a", &OwnedValue::Int(9)) else {
+                unreachable!("FuncDef arm always returns FuncDef"); // omni-dev: coverage tolerate-line reason="substitute_var_impl's FuncDef arm always returns FuncDef (#2283)"
+            };
+            let var_site_reached = *body != Expr::Var("a".to_string());
+            assert_eq!(
+                var_site_reached, !binds_dollar,
+                "substitute_var_impl disagrees with params_bind_dollar: {label}"
+            );
+
+            // Site 2 -- `substitute_func_param_impl`: an outer `$`-style
+            // parameter's own `$a` reaches the nested def's body under
+            // exactly the same condition.
+            let arg = Expr::Shared(Rc::new(Expr::Literal(Literal::Int(7))));
+            let substituted = substitute_func_param(&def, &Param::Dollar("a".to_string()), &arg);
+            let Expr::FuncDef { body, .. } = substituted else {
+                unreachable!("FuncDef arm always returns FuncDef"); // omni-dev: coverage tolerate-line reason="substitute_func_param_impl's FuncDef arm always returns FuncDef (#2555)"
+            };
+            let param_site_reached = *body != Expr::Var("a".to_string());
+            assert_eq!(
+                param_site_reached, !binds_dollar,
+                "substitute_func_param_impl disagrees with params_bind_dollar: {label}"
+            );
+        }
     }
 
     /// #2560: [`bind_def_call_params`] directly, at the AST level, rather
@@ -80851,7 +81017,11 @@ mod tests {
             slice_number
         );
         assert_eq!(
-            substitute_func_param(&slice_number, "x", &Expr::Shared(Rc::new(Expr::Identity))),
+            substitute_func_param(
+                &slice_number,
+                &Param::Bare("x".to_string()),
+                &Expr::Shared(Rc::new(Expr::Identity))
+            ),
             slice_number
         );
     }
