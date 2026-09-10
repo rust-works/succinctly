@@ -11,12 +11,12 @@
 //!
 //! **This benchmark does not cover #668.** It was originally written
 //! attributing the O(depth^2) cost to `push_recursive_branches`/
-//! `resolve_recurse` (the `..`/`recurse` fan-out itself) rather than to
+//! `resolve_recurse_sink` (the `..`/`recurse` fan-out itself) rather than to
 //! `eval_index_expr`'s computed-key handling — plausible since the query
 //! below combines both, but wrong: PR #670 fixed `eval_index_expr` only, and
 //! that alone reproduced the full speedup, so the fan-out was never the
 //! bottleneck this benchmark measures. `push_recursive_branches`/
-//! `resolve_recurse` do still clone the value at every visited node
+//! `resolve_recurse_sink` do still clone the value at every visited node
 //! (`eval.rs:8595`, `8659`, `8664`), independently of this benchmark's
 //! query — that's #668, and #675 tracks adding a benchmark that isolates it
 //! (a query with no computed index, so it can't route through

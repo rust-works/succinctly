@@ -1,12 +1,12 @@
-//! Depth-scaling benchmark for `push_recursive_branches`/`resolve_recurse`'s
+//! Depth-scaling benchmark for `push_recursive_branches`/`resolve_recurse_sink`'s
 //! per-node clone cost (#668), split out of #675.
 //!
 //! `jq_recurse_depth_bench`'s query, `.. | .[.k]?`, does **not** reach
-//! `push_recursive_branches`/`resolve_recurse` (`src/jq/eval.rs`): bare `..`
+//! `push_recursive_branches`/`resolve_recurse_sink` (`src/jq/eval.rs`): bare `..`
 //! in value position dispatches to `eval_recursive_descent`/
 //! `collect_recursive`, which clones a cheap `StandardJson` cursor per node,
 //! not the materialized `OwnedValue` — see that benchmark's own corrected
-//! docstring. `push_recursive_branches`/`resolve_recurse` are reachable only
+//! docstring. `push_recursive_branches`/`resolve_recurse_sink` are reachable only
 //! through `resolve_node`, which `resolve_dynamic_indexes` calls solely when
 //! `needs_path_prepass` is true — true for `..`/`recurse` themselves, so only
 //! a *path-context* use (`path(..)`, `path(recurse(...))`, `=`, `|=`,

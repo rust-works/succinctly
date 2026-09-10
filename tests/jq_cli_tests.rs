@@ -14777,7 +14777,7 @@ fn test_recurse_f_keeps_own_partial_fanout_before_error_842() -> Result<()> {
     // (`.a, .b[0]`) is a generator like any other comma expression: a
     // later output of that same call erroring must not retroactively
     // un-emit an earlier one it already produced. Before this fix,
-    // `resolve_recurse`/`builtin_recurse_f` dropped `f`'s own partial
+    // `resolve_recurse_sink`/`builtin_recurse_f` dropped `f`'s own partial
     // fan-out on error, matching neither jq's semantics nor the codebase's
     // existing "never un-emit an already-produced output" rule (#530,
     // #636, #694, #824). Verified against jq 1.7.1:
@@ -14802,7 +14802,7 @@ fn test_recurse_f_keeps_own_partial_fanout_before_error_842() -> Result<()> {
 
 #[test]
 fn test_resolve_recurse_keeps_f_partial_fanout_before_error_842() -> Result<()> {
-    // Issue #842's secondary repro (path position, `resolve_recurse`).
+    // Issue #842's secondary repro (path position, `resolve_recurse_sink`).
     // Same underlying bug as the value-position test above, in the
     // path-tracking evaluator `path(...)` uses. Verified against jq 1.7.1:
     // `echo '{"a":1,"b":2}' | jq -c 'path(recurse(if . == {"a":1,"b":2}
@@ -14824,7 +14824,7 @@ fn test_resolve_recurse_keeps_f_partial_fanout_before_error_842() -> Result<()> 
     Ok(())
 }
 
-/// #856: `resolve_recurse`'s null-child guard (`if matches!(child_value...,
+/// #856: `resolve_recurse_sink`'s null-child guard (`if matches!(child_value...,
 /// OwnedValue::Null) { continue; }` in its main loop) stopped recursion
 /// *into* a null child, as documented -- but the bare `continue` also
 /// discarded the null child's own path entirely, rather than still
@@ -14850,7 +14850,7 @@ fn test_resolve_recurse_emits_null_childs_own_path() -> Result<()> {
 
 /// Companion to the test above: a null child emitted as a leaf must not
 /// jump ahead of an *earlier* sibling's own subtree just because it has no
-/// descendants of its own. `resolve_recurse` gates the null-recursion bound
+/// descendants of its own. `resolve_recurse_sink` gates the null-recursion bound
 /// at the point a node is popped from its DFS stack (the same point every
 /// other node is emitted), not at child-collection time, specifically so a
 /// null child queued alongside a non-null sibling still waits its correct
@@ -14898,7 +14898,7 @@ fn test_resolve_recurse_cond_still_gates_null_child_emission() -> Result<()> {
     Ok(())
 }
 
-/// Review-driven regression guard on #854's own rewrite of `resolve_recurse`'s
+/// Review-driven regression guard on #854's own rewrite of `resolve_recurse_sink`'s
 /// `Some(cond)` arm: switching `cond`'s own evaluation to
 /// `eval_owned_multi_keep_partial` must not drop the pre-existing
 /// `is_null_current` gate that bounds recursion *past* a null node (#856) --
@@ -15061,7 +15061,7 @@ fn test_recurse_cond_keeps_already_approved_siblings_before_error_854() -> Resul
 
 #[test]
 fn test_resolve_recurse_cond_keeps_already_approved_siblings_before_error_854() -> Result<()> {
-    // Issue #854's secondary repro (path position, `resolve_recurse`).
+    // Issue #854's secondary repro (path position, `resolve_recurse_sink`).
     // Same underlying bug as the value-position test above, in the
     // path-tracking evaluator `path(...)` uses. Verified against jq 1.7.1:
     // `echo '[1,2,3]' | jq -c 'path(recurse(if type=="array" then .[] else
@@ -36462,7 +36462,7 @@ fn test_raw_input_still_substitutes_under_validate_1247() -> Result<()> {
 /// `test_fold_register_accepts_variable_snapshot_through_combinators_1591`
 /// in `src/jq/eval.rs`'s unit tests). `recurse`'s `if . == $x then .a else
 /// $x end` visits `.a`'s value, whose `else` branch hands back `$x`'s own
-/// frozen value with no navigation — a `resolve_recurse` seed/child-queueing
+/// frozen value with no navigation — a `resolve_recurse_sink` seed/child-queueing
 /// bug (three sites) dropped that mark, and separately `select` had no
 /// ambient `snapshot` parameter to inherit it from at all, so the value
 /// reaching `FoldRegister::identical` looked indistinguishable from a

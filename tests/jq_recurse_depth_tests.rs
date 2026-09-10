@@ -2,7 +2,7 @@
 //!
 //! De-risk step for #626 (threading a `Cow<'a, OwnedValue>` lifetime through
 //! `PathBranch`/`resolve_node` in `src/jq/eval.rs` to kill the O(subtree)
-//! clone-per-node cost in `push_recursive_branches`/`resolve_recurse`).
+//! clone-per-node cost in `push_recursive_branches`/`resolve_recurse_sink`).
 //! Every existing recurse/`..` golden fixture nests three levels deep at
 //! most, so nothing today would catch a lifetime bug that only corrupts or
 //! truncates output once recursion goes deeper than a handful of frames.
@@ -77,7 +77,7 @@ fn bare_recurse_correct_at_depth() {
     assert_eq!(run_paths(&json, "path(recurse)"), expected_paths(DEPTH));
 }
 
-/// `recurse(f; cond)` — the `resolve_recurse` stack-based path. `cond` stops
+/// `recurse(f; cond)` — the `resolve_recurse_sink` stack-based path. `cond` stops
 /// exactly at the `{}` leaf (its `.k` is `null`, not an object), producing
 /// the same path set as the bare form on this document.
 #[test]
