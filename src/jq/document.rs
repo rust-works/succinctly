@@ -1892,8 +1892,8 @@ pub fn tail_gap_ok<C: DocumentCursor>(
 /// site** that holds the container's own cursor but hands the walk itself
 /// off to a helper that only ever sees children -- #2594.
 ///
-/// Every shared object walk in this module ([`census`], [`checked_len`],
-/// [`effective_keys`], [`DocumentFields::contains_checked`],
+/// Every shared object walk in this module (`census`, `checked_len`, both
+/// private, [`effective_keys`], [`DocumentFields::contains_checked`],
 /// [`effective_fields_checked`]) takes `&F` and nothing else, so none of
 /// them can reach the container to tell a genuine `{}` from a stray `,`
 /// with no member at all (`{,}`). Widening all of them would mean a new
