@@ -48737,11 +48737,32 @@ pub(crate) fn bind_def_call<'e>(
 /// the bare winner first, with `subst_dollar: false` so it only touches
 /// bare `Expr::FuncCall` nodes, then the `$` winner (if any) with
 /// `subst_dollar: true`, reproduces this correctly regardless of which
-/// position wins which namespace: the bare pass's insertions become
-/// `Expr::Shared`, already opaque to the `$` pass's own (unconditional)
-/// bare-matching arm by the time it runs. Verified against every bare/`$`
-/// ordering and combined bare-and-`$`-reference body jq 1.7.1 can express
-/// for two, and for three, duplicated parameters --
+/// position wins which namespace.
+///
+/// **Why the order is what makes that sound.** `subst_dollar` gates exactly
+/// one arm of [`substitute_func_param_impl`] -- `Expr::Var` -- and no other:
+/// it never gates the bare `Expr::FuncCall` arm, and it never decides
+/// whether to recurse, since every shadow check it passes
+/// (`Expr::FuncDef`'s `body_shadowed`/`then_shadowed`, the
+/// `As`/`Reduce`/`Foreach`/`AsPattern` binder checks) reads only `param` and
+/// nodes neither pass rewrites. So the two passes walk *identically*, and
+/// the set of bare references the `$` pass can reach is exactly the set the
+/// bare pass already replaced with an (opaque) `Expr::Shared` -- its
+/// unconditional bare arm therefore has nothing left to clobber. The same
+/// property is what makes the same-winner case (a trailing `$`-style
+/// parameter) compose back into precisely the single `subst_dollar: true`
+/// pass this replaced.
+///
+/// One consequence worth keeping: when a duplicated name has *no* `$`-style
+/// occurrence at all, the `$` pass never runs, so a `$name` in the body is
+/// left for an enclosing binder -- which is what jq does
+/// (`5 as $a | def f(a;a): $a + a; f(1;2)` is `7`; the blanket
+/// `subst_dollar: true` fold this replaced captured `$a` as the parameter
+/// and answered `6`).
+///
+/// Verified against every bare/`$` ordering and combined
+/// bare-and-`$`-reference body jq 1.7.1 can express for two, and for three,
+/// duplicated parameters --
 /// `test_bind_def_call_params_resolves_each_namespace_by_its_own_last_occurrence_2560`
 /// below, plus `tests/jq_cli_tests.rs`' own `test_duplicate_named_param_*_2560`
 /// family end to end.
@@ -48773,7 +48794,13 @@ fn bind_def_call_params(body: &Expr, params: &[Param], args: &[Expr]) -> Expr {
         return result;
     }
 
-    let mut result = body.clone();
+    // `None` until the first substitution, so that one rebuilds `body`
+    // itself rather than a copy of it -- the same O(body size)-per-bound-call
+    // allocation `bind_def_call`'s own #2094 comment above exists to avoid,
+    // which seeding this loop with `body.clone()` would put straight back
+    // (once per recursion level, for a recursive `def` that also duplicates a
+    // parameter name).
+    let mut result: Option<Expr> = None;
     let mut substituted_names: Vec<&str> = Vec::new();
     for param in params {
         let name = param.name();
@@ -48794,23 +48821,26 @@ fn bind_def_call_params(body: &Expr, params: &[Param], args: &[Expr]) -> Expr {
             // unwrapping keeps a malformed one from taking the process down.
             continue; // omni-dev: coverage tolerate-line reason="unreachable: `name` was just read from `params`, so the zip over (params, args) has a matching pair unless args is shorter than params, which install_def_calls' own arity guard rules out (#2560)"
         };
-        result = substitute_func_param_impl(
-            &result,
+        let mut substituted = substitute_func_param_impl(
+            result.as_ref().unwrap_or(body),
             name,
             &Expr::Shared(Rc::new(bare_arg.clone())),
             false,
         );
 
         if let Some((_, dollar_arg)) = by_name().rfind(|(p, _)| p.is_dollar()) {
-            result = substitute_func_param_impl(
-                &result,
+            substituted = substitute_func_param_impl(
+                &substituted,
                 name,
                 &Expr::Shared(Rc::new(dollar_arg.clone())),
                 true,
             );
         }
+        result = Some(substituted);
     }
-    result
+    // `unwrap_or_else`: same unreachable arity mismatch as the `else` arms
+    // above -- every distinct name substitutes at least once otherwise.
+    result.unwrap_or_else(|| body.clone()) // omni-dev: coverage tolerate-line reason="unreachable: `params` is non-empty here (bind_def_call's own guard) and its first entry is never skipped, so at least one substitution always ran (#2560)"
 }
 
 /// Evaluate an `Expr::DefCall` in the plain evaluator (#1371).

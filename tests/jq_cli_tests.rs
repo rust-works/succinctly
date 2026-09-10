@@ -23152,6 +23152,22 @@ fn test_duplicate_named_param_combined_bare_and_dollar_reference_2560() -> Resul
     Ok(())
 }
 
+/// #2560 follow-on: a duplicated name with *no* `$`-style occurrence must
+/// leave a `$name` in the body to whatever encloses the `def`, because a
+/// bare parameter creates no `$`-binding at all. This is the assertion that
+/// stops the `is_dollar` filter in `bind_def_call_params` from being
+/// "simplified" into always running the `$` pass: doing that would re-capture
+/// the outer `$a` as the parameter and answer `6`, which is what the
+/// pre-#2560 blanket `subst_dollar: true` fold did. jq 1.7.1 answers `7`.
+#[test]
+fn test_duplicate_bare_named_param_leaves_an_outer_dollar_binding_alone_2560() -> Result<()> {
+    let (stdout, stderr, code) =
+        run_jq_full(&["-nc", "5 as $a | def f(a;a): $a + a; f(1;2)"], None)?;
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout.trim_end(), "7");
+    Ok(())
+}
+
 /// #2560 follow-on: three duplicated parameters, not just two -- the
 /// winner-selection must scan the *whole* remaining list, not just check
 /// one neighbor. Confirmed live against jq 1.7.1.
