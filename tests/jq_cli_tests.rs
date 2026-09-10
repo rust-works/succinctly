@@ -3135,6 +3135,45 @@ fn test_preserve_input_leaves_raw_del_byte_in_key_unescaped_2591() -> Result<()>
     Ok(())
 }
 
+/// #2592: #2591's three sibling call sites, deliberately left unfixed by
+/// that issue to keep it narrowly scoped -- `print_json`'s own
+/// `JqValue::Cursor` -> `StandardJson::String` arm (per-result streaming
+/// output, e.g. `.[]`) shares the identical zero-copy-fast-path bug shape
+/// as the value/key sites #2591 already fixed. Uses `\x7f` (a Rust escape
+/// compiling to the same raw byte #2591's own tests embed literally), not
+/// a JSON `\u007f` escape in the input text -- the latter would already
+/// contain a backslash and take the slow, always-correct path.
+#[test]
+fn test_streamed_value_output_escapes_raw_del_byte_2592() -> Result<()> {
+    let input = "[\"x\x7fy\", \"b\"]";
+    let (out, _, code) = run_jq_full(&["-c", ".[]"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "\"x\\u007fy\"\n\"b\"\n", "stdout: {out:?}");
+    Ok(())
+}
+
+/// #2592: `keys_unsorted`'s compact-output key-printing loop, a second
+/// sibling of #2591's fixed sites.
+#[test]
+fn test_keys_unsorted_compact_output_escapes_raw_del_byte_2592() -> Result<()> {
+    let input = "{\"x\x7fy\": 1}";
+    let (out, _, code) = run_jq_full(&["-c", "keys_unsorted"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "[\"x\\u007fy\"]\n", "stdout: {out:?}");
+    Ok(())
+}
+
+/// #2592: `keys_unsorted`'s pretty-output key-printing loop, the third
+/// sibling of #2591's fixed sites.
+#[test]
+fn test_keys_unsorted_pretty_output_escapes_raw_del_byte_2592() -> Result<()> {
+    let input = "{\"x\x7fy\": 1}";
+    let (out, _, code) = run_jq_full(&["keys_unsorted"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "[\n  \"x\\u007fy\"\n]\n", "stdout: {out:?}");
+    Ok(())
+}
+
 /// #1830: real jq flushes each result as it's produced and errors on
 /// first sighting a NUL, rather than buffering the whole multi-result
 /// stream before writing anything -- confirmed live against jq 1.7.1:

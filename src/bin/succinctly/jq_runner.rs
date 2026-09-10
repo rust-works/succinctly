@@ -6111,12 +6111,15 @@ where
                     out.write_all(formatter.format_raw_number(n.raw_bytes()).as_bytes())?;
                 }
                 StandardJson::String(s) => {
-                    let raw = s.raw_bytes();
                     // Zero-copy optimization: if no escapes (backslash) and not ASCII mode,
                     // output raw bytes directly without decode/encode roundtrip.
-                    // This is valid because JSON strings without backslashes need no normalization.
-                    let content = &raw[1..raw.len().saturating_sub(1)]; // Content between quotes
-                    if !config.ascii_output && !content.contains(&b'\\') {
+                    // This is valid because JSON strings without backslashes need no
+                    // normalization -- except a raw DEL byte (0x7f) under jq's own escape
+                    // convention, which still re-encodes it on output even though it's
+                    // legal unescaped in source (#2591/#2592; see
+                    // `write_json_string_pretty`'s identical gate in src/json/light.rs).
+                    let (raw, escaped, has_del) = s.raw_and_escaped();
+                    if !(config.ascii_output || escaped || has_del && config.jq_compat) {
                         // Zero-copy: output raw bytes directly (includes quotes)
                         out.write_all(raw)?;
                     } else if let Ok(decoded) = s.as_str() {
@@ -6663,9 +6666,12 @@ where
                         ))
                         .into());
                     };
-                    let raw = k.raw_bytes();
-                    let content = &raw[1..raw.len().saturating_sub(1)];
-                    if !config.ascii_output && !content.contains(&b'\\') {
+                    // #2591/#2592: a raw DEL byte (0x7f) is legal unescaped
+                    // JSON source but still needs re-encoding under jq's own
+                    // escape convention -- see the sibling gate in
+                    // `write_json_string_pretty` (src/json/light.rs).
+                    let (raw, escaped, has_del) = k.raw_and_escaped();
+                    if !(config.ascii_output || escaped || has_del && config.jq_compat) {
                         out.write_all(raw)?;
                     } else if let Ok(decoded) = k.as_str() {
                         out.write_all(b"\"")?;
@@ -6712,9 +6718,12 @@ where
                         ))
                         .into());
                     };
-                    let raw = k.raw_bytes();
-                    let content = &raw[1..raw.len().saturating_sub(1)];
-                    if !config.ascii_output && !content.contains(&b'\\') {
+                    // #2591/#2592: a raw DEL byte (0x7f) is legal unescaped
+                    // JSON source but still needs re-encoding under jq's own
+                    // escape convention -- see the sibling gate in
+                    // `write_json_string_pretty` (src/json/light.rs).
+                    let (raw, escaped, has_del) = k.raw_and_escaped();
+                    if !(config.ascii_output || escaped || has_del && config.jq_compat) {
                         out.write_all(raw)?;
                     } else if let Ok(decoded) = k.as_str() {
                         out.write_all(b"\"")?;
