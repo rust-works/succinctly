@@ -2705,15 +2705,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             body,
             then,
             bound,
-        } => eval_func_def::<W, S>(
-            name,
-            &param_names(params),
-            body,
-            then,
-            bound,
-            value,
-            optional,
-        ),
+        } => eval_func_def::<W, S>(name, params, body, then, bound, value, optional),
         Expr::FuncCall {
             name,
             args,
@@ -5317,7 +5309,7 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             then,
             bound,
         } => {
-            let bound_then = bind_def(name, &param_names(params), body, then, bound);
+            let bound_then = bind_def(name, params, body, then, bound);
             eval_each::<W, S>(&bound_then, value, optional, sink)
         }
 
@@ -48409,7 +48401,7 @@ fn dedup_keep_last_binding(bindings: Vec<(String, OwnedValue)>) -> Vec<(String, 
 /// itself evaluates.
 fn eval_func_def<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     name: &str,
-    params: &[String],
+    params: &[Param],
     body: &Expr,
     then: &Expr,
     bound: &FuncDefBound,
@@ -48491,19 +48483,6 @@ mod ambient_frame_depth {
     }
 }
 
-/// The bare identifier of each of `params`, regardless of bare-vs-`$`
-/// spelling -- #2283: `bind_def`/`FuncDefData`'s own `params: Vec<String>`
-/// only ever needs the bare call-binding name (both spellings bind that
-/// identically; only `substitute_var_impl`/`substitute_func_param_impl`'s
-/// shadow checks need `Param`'s own `Bare`/`Dollar` distinction, and they
-/// run on the still-`Expr::FuncDef`-shaped tree before this conversion
-/// ever happens), so every one of `Expr::FuncDef`'s four evaluation arms
-/// converts once here rather than `bind_def` itself taking `&[Param]` and
-/// converting on every one of its own many (test-included) call sites.
-pub(crate) fn param_names(params: &[Param]) -> Vec<String> {
-    params.iter().map(|p| p.name().to_string()).collect()
-}
-
 /// Install `def name(params): body` over `then`, the shared first half of
 /// every `Expr::FuncDef` evaluation arm (#1371).
 ///
@@ -48529,7 +48508,7 @@ pub(crate) fn param_names(params: &[Param]) -> Vec<String> {
 /// all like [`BoundBody`] does.
 pub(crate) fn bind_def(
     name: &str,
-    params: &[String],
+    params: &[Param],
     body: &Expr,
     then: &Expr,
     bound: &FuncDefBound,
@@ -48721,24 +48700,117 @@ pub(crate) fn bind_def_call<'e>(
         // recursion level, since this whole function is gated by `bound`).
         // A zero-parameter `def` needs no substitution at all, so it skips
         // straight to installing over `&def.body` with no clone whatsoever.
-        let mut params_and_args = def.params.iter().zip(args.iter());
-        let installed_body = match params_and_args.next() {
-            Some((param, arg)) => {
-                let mut body =
-                    substitute_func_param(&def.body, param, &Expr::Shared(Rc::new(arg.clone())));
-                for (param, arg) in params_and_args {
-                    body = substitute_func_param(&body, param, &Expr::Shared(Rc::new(arg.clone())));
-                }
-                // `true`: this is `def`'s own body, the scope that repeats
-                // once per actual recursive level -- see
-                // `sibling_frame_charge`'s own doc comment (#2135 code
-                // review, Finding 1).
-                install_def_calls(&body, def, frames + 1, true)
-            }
-            None => install_def_calls(&def.body, def, frames + 1, true),
+        let installed_body = if def.params.is_empty() {
+            install_def_calls(&def.body, def, frames + 1, true)
+        } else {
+            let body = bind_def_call_params(&def.body, &def.params, args);
+            // `true`: this is `def`'s own body, the scope that repeats
+            // once per actual recursive level -- see
+            // `sibling_frame_charge`'s own doc comment (#2135 code
+            // review, Finding 1).
+            install_def_calls(&body, def, frames + 1, true)
         };
         Ok(Rc::new(installed_body))
     })
+}
+
+/// Substitute every parameter of a `def` call into its own body (#2560).
+///
+/// The common case -- no two parameters share a name -- is exactly the
+/// pre-#2560 code: one `substitute_func_param` fold per parameter, left to
+/// right, each substitution's `Expr::Shared` insertion opaque to the next
+/// (same cost, same behavior). A duplicate parameter name (rare -- `def
+/// f(a; $a): ...`) broke under that fold: sequential substitution resolves
+/// to the *first* occurrence, but jq's own parameter list is a chain of
+/// nested scopes, innermost (last) first, so a later same-named parameter
+/// entirely shadows an earlier one -- confirmed live against jq 1.7.1,
+/// `def f(a; $a): $a; f(1;2)` is `2`, not `1`.
+///
+/// A `$`-style parameter binds *both* the bare and `$` namespace ([`Param`]'s
+/// own doc comment); a bare-style parameter only the bare one. So for each
+/// distinct duplicated name, the bare namespace resolves to the *last*
+/// parameter overall with that name (whichever kind), and the `$` namespace
+/// resolves to the last `$`-style parameter with that name, if any --
+/// possibly a different, earlier position (`def f($a; a): $a; f(1;2)` is
+/// `1`: the trailing bare `a` shadows the bare namespace only, so the
+/// leading `$a`'s own binding is still what `$a` resolves to). Substituting
+/// the bare winner first, with `subst_dollar: false` so it only touches
+/// bare `Expr::FuncCall` nodes, then the `$` winner (if any) with
+/// `subst_dollar: true`, reproduces this correctly regardless of which
+/// position wins which namespace: the bare pass's insertions become
+/// `Expr::Shared`, already opaque to the `$` pass's own (unconditional)
+/// bare-matching arm by the time it runs. Verified against every bare/`$`
+/// ordering and combined bare-and-`$`-reference body jq 1.7.1 can express
+/// for two, and for three, duplicated parameters --
+/// `test_bind_def_call_params_resolves_each_namespace_by_its_own_last_occurrence_2560`
+/// below, plus `tests/jq_cli_tests.rs`' own `test_duplicate_named_param_*_2560`
+/// family end to end.
+fn bind_def_call_params(body: &Expr, params: &[Param], args: &[Expr]) -> Expr {
+    let has_duplicate_names = params
+        .iter()
+        .enumerate()
+        .any(|(i, p)| params[i + 1..].iter().any(|q| q.name() == p.name()));
+
+    if !has_duplicate_names {
+        // `zip` truncates to the shorter side, exactly as the pre-#2560
+        // fold did -- an arity mismatch cannot reach here (`install_def_calls`
+        // only builds a `DefCall` whose `args.len()` equals `params.len()`),
+        // and if one ever did, leaving the body unsubstituted is the old
+        // behaviour, not a panic.
+        let mut params_and_args = params.iter().zip(args.iter());
+        let Some((first_param, first_arg)) = params_and_args.next() else {
+            return body.clone();
+        };
+        let mut result = substitute_func_param(
+            body,
+            first_param.name(),
+            &Expr::Shared(Rc::new(first_arg.clone())),
+        );
+        for (param, arg) in params_and_args {
+            result =
+                substitute_func_param(&result, param.name(), &Expr::Shared(Rc::new(arg.clone())));
+        }
+        return result;
+    }
+
+    let mut result = body.clone();
+    let mut substituted_names: Vec<&str> = Vec::new();
+    for param in params {
+        let name = param.name();
+        if substituted_names.contains(&name) {
+            continue;
+        }
+        substituted_names.push(name);
+
+        let by_name = || {
+            params
+                .iter()
+                .zip(args.iter())
+                .filter(|(p, _)| p.name() == name)
+        };
+        let Some((_, bare_arg)) = by_name().next_back() else {
+            // Unreachable for a well-formed `DefCall` (same arity invariant
+            // as the non-duplicate path above); skipping rather than
+            // unwrapping keeps a malformed one from taking the process down.
+            continue;
+        };
+        result = substitute_func_param_impl(
+            &result,
+            name,
+            &Expr::Shared(Rc::new(bare_arg.clone())),
+            false,
+        );
+
+        if let Some((_, dollar_arg)) = by_name().rfind(|(p, _)| p.is_dollar()) {
+            result = substitute_func_param_impl(
+                &result,
+                name,
+                &Expr::Shared(Rc::new(dollar_arg.clone())),
+                true,
+            );
+        }
+    }
+    result
 }
 
 /// Evaluate an `Expr::DefCall` in the plain evaluator (#1371).
@@ -49728,6 +49800,80 @@ mod tests {
         );
     }
 
+    /// #2560: [`bind_def_call_params`] directly, at the AST level, rather
+    /// than only through the CLI (`tests/jq_cli_tests.rs`'s own
+    /// `test_duplicate_named_param_*_2560` family). Each expectation below
+    /// is what jq 1.7.1 answers for the equivalent program.
+    ///
+    /// The `$`-first/bare-last row is the one that pins the two winners
+    /// apart: `$a` must still resolve to the *leading* `$`-style
+    /// parameter's argument (the trailing bare parameter creates no
+    /// `$`-binding to shadow it with), while a bare `a` reference in the
+    /// same body resolves to the *trailing* one -- so a single "last
+    /// argument wins" rule, applied to both namespaces at once, would pass
+    /// every other row here and still be wrong.
+    #[test]
+    fn test_bind_def_call_params_resolves_each_namespace_by_its_own_last_occurrence_2560() {
+        let bare = |name: &str| Param::Bare(name.to_string());
+        let dollar = |name: &str| Param::Dollar(name.to_string());
+        let args = || {
+            vec![
+                Expr::Literal(Literal::Int(1)),
+                Expr::Literal(Literal::Int(2)),
+            ]
+        };
+        let dollar_ref = || Expr::Var("a".to_string());
+        let bare_ref = || Expr::FuncCall {
+            name: "a".to_string(),
+            args: Vec::new(),
+            builtin_fallback: None,
+        };
+        // `Expr::Shared`-wrapped, since that is what the substitution
+        // inserts (#2096 capture hygiene).
+        let shared = |n: i64| Expr::Shared(Rc::new(Expr::Literal(Literal::Int(n))));
+
+        // `def f(a; $a): $a` -- the issue's own repro: the `$` namespace
+        // resolves to the trailing `$`-style parameter (`2`), not the
+        // leading bare one (`1`, what the pre-#2560 fold answered).
+        assert_eq!(
+            bind_def_call_params(&dollar_ref(), &[bare("a"), dollar("a")], &args()),
+            shared(2)
+        );
+        // `def f(a; $a): a` -- a `$`-style parameter binds the bare
+        // namespace too, so it shadows the leading bare parameter there
+        // as well.
+        assert_eq!(
+            bind_def_call_params(&bare_ref(), &[bare("a"), dollar("a")], &args()),
+            shared(2)
+        );
+        // `def f($a; a): $a` -- the trailing *bare* parameter shadows only
+        // the bare namespace, so `$a` keeps the leading parameter's `1`.
+        assert_eq!(
+            bind_def_call_params(&dollar_ref(), &[dollar("a"), bare("a")], &args()),
+            shared(1)
+        );
+        // `def f($a; a): a` -- and the bare reference in that same shape
+        // still follows the trailing parameter.
+        assert_eq!(
+            bind_def_call_params(&bare_ref(), &[dollar("a"), bare("a")], &args()),
+            shared(2)
+        );
+
+        // No duplicate name: the untouched fast path, one substitution per
+        // parameter (`def f(a; $b): [a, $b]`).
+        assert_eq!(
+            bind_def_call_params(
+                &Expr::Array(Box::new(Expr::Comma(vec![
+                    bare_ref(),
+                    Expr::Var("b".to_string()),
+                ]))),
+                &[bare("a"), dollar("b")],
+                &args(),
+            ),
+            Expr::Array(Box::new(Expr::Comma(vec![shared(1), shared(2)]))),
+        );
+    }
+
     #[test]
     fn test_bind_def_memoizes_per_node_2094() {
         let Expr::FuncDef {
@@ -49741,9 +49887,9 @@ mod tests {
             panic!("expected a top-level FuncDef");
         };
 
-        let first = bind_def(&name, &param_names(&params), &body, &then, &bound);
+        let first = bind_def(&name, &params, &body, &then, &bound);
         let first_ptr = Rc::as_ptr(&first);
-        let second = bind_def(&name, &param_names(&params), &body, &then, &bound);
+        let second = bind_def(&name, &params, &body, &then, &bound);
         assert!(
             Rc::ptr_eq(&first, &second),
             "a second call at the same depth sharing the same FuncDefBound must reuse the \
@@ -49754,7 +49900,7 @@ mod tests {
         // An independent node's own cache cell is untouched by the one
         // above -- confirms the cache is keyed per-node, not global.
         let fresh_cache = FuncDefBound::default();
-        let third = bind_def(&name, &param_names(&params), &body, &then, &fresh_cache);
+        let third = bind_def(&name, &params, &body, &then, &fresh_cache);
         assert!(
             !Rc::ptr_eq(&first, &third),
             "a different FuncDefBound must compute its own Rc, not see another node's cache"
@@ -49786,7 +49932,7 @@ mod tests {
 
         // No ambient depth entered yet: a fresh top-level `def` still seeds
         // from `0`, matching every evaluator's actual call site.
-        match &*bind_def(&name, &param_names(&params), &body, &then, &cache) {
+        match &*bind_def(&name, &params, &body, &then, &cache) {
             Expr::DefCall { frames, .. } => assert_eq!(*frames, 0),
             other => panic!("expected DefCall, got {other:?}"),
         }
@@ -49798,7 +49944,7 @@ mod tests {
         // FuncDef node.
         {
             let _guard = enter_def_call_frame(MAX_EVAL_FRAMES - 1);
-            match &*bind_def(&name, &param_names(&params), &body, &then, &cache) {
+            match &*bind_def(&name, &params, &body, &then, &cache) {
                 Expr::DefCall { frames, .. } => assert_eq!(*frames, MAX_EVAL_FRAMES - 1),
                 other => panic!("expected DefCall, got {other:?}"),
             }
@@ -49808,7 +49954,7 @@ mod tests {
         // `def` reached *after* the nested call returns -- a sibling, not
         // something nested inside it -- does not inherit a depth that no
         // longer applies to it.
-        match &*bind_def(&name, &param_names(&params), &body, &then, &cache) {
+        match &*bind_def(&name, &params, &body, &then, &cache) {
             Expr::DefCall { frames, .. } => assert_eq!(*frames, 0),
             other => panic!("expected DefCall, got {other:?}"),
         }
@@ -49843,7 +49989,7 @@ mod tests {
 
         let cache = FuncDefBound::default();
 
-        let first = bind_def(&name, &param_names(&params), &body, &then, &cache);
+        let first = bind_def(&name, &params, &body, &then, &cache);
         let first_frames = match &*first {
             Expr::DefCall { frames, .. } => *frames,
             other => panic!("expected DefCall, got {other:?}"),
@@ -49854,7 +50000,7 @@ mod tests {
         // node being reached again through an `Expr::Shared` wrapper
         // threaded into a deeper recursive `DefCall`'s substituted body.
         let _guard = enter_def_call_frame(500);
-        let second = bind_def(&name, &param_names(&params), &body, &then, &cache);
+        let second = bind_def(&name, &params, &body, &then, &cache);
         let second_frames = match &*second {
             Expr::DefCall { frames, .. } => *frames,
             other => panic!("expected DefCall, got {other:?}"),
@@ -49897,7 +50043,7 @@ mod tests {
 
         let _guard = enter_def_call_frame(MAX_EVAL_FRAMES);
         let cache = FuncDefBound::default();
-        let bound_then = bind_def(&name, &param_names(&params), &body, &then, &cache);
+        let bound_then = bind_def(&name, &params, &body, &then, &cache);
         let Expr::DefCall {
             def,
             args,
@@ -87781,7 +87927,7 @@ mod tests {
                 params: if args.is_empty() {
                     Vec::new()
                 } else {
-                    vec!["v".into()]
+                    vec![Param::Bare("v".to_string())]
                 },
                 body,
             }),

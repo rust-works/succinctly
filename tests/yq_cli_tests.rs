@@ -32286,6 +32286,23 @@ fn test_recursive_def_evaluates_in_yq_mode_1371() -> Result<()> {
     Ok(())
 }
 
+/// #2560: `bind_def_call`'s duplicate-parameter-name fix lives in `eval.rs`,
+/// shared by both evaluators -- confirm yq mode's own `DefCall` path
+/// resolves a duplicate parameter name by last occurrence too, not just
+/// `succinctly jq`'s (`tests/jq_cli_tests.rs`'s
+/// `test_duplicate_named_param_argument_binding_resolves_by_last_occurrence_2560`,
+/// pinned against jq 1.7.1: `2`). `def` is itself a succinctly extension
+/// here (see this file's own `test_recursive_def_evaluates_in_yq_mode_1371`
+/// just above), so this pins parity with succinctly's own jq-mode answer
+/// rather than a yq reference.
+#[test]
+fn test_duplicate_named_param_argument_binding_resolves_by_last_occurrence_yq_2560() -> Result<()> {
+    let (stdout, code) = run_yq_stdin("def f(a; $a): $a; f(1;2)", "a: 1\n", &[])?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout.trim_end(), "2");
+    Ok(())
+}
+
 /// #1371: the generic evaluator's own demand-driven `DefCall`/`Shared` arms.
 /// A truncating consumer must not run the rest of a definition's body, nor the
 /// rest of an argument, after it already has its answer -- the same property

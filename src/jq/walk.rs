@@ -25,9 +25,9 @@ use alloc::rc::Rc;
 #[cfg(test)]
 use std::rc::Rc;
 
-#[cfg(test)]
-use super::FuncDefData;
 use super::{BoundBody, Builtin, Expr, FuncDefBound, ObjectEntry, ObjectKey, StringPart};
+#[cfg(test)]
+use super::{FuncDefData, Param};
 
 /// The sub-expressions a [`Builtin`] owns, in source order.
 ///
@@ -1905,7 +1905,7 @@ mod tests {
     fn map_subexprs_defcall_default_maps_args_and_resets_bound() {
         let def = Rc::new(FuncDefData {
             name: "f".into(),
-            params: vec!["x".into()],
+            params: vec![Param::Bare("x".to_string())],
             body: Expr::Identity,
         });
         let original = Expr::DefCall {

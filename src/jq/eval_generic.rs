@@ -62,7 +62,7 @@ use super::eval::{
     has_type_mismatch_is_permissive, index_component_value, index_in_array_bounds,
     index_one_owned as index_owned_by_key, is_pure_chain_link, is_retryable_stop, literal_to_owned,
     mark_nonretryable_escape, needs_path_context, numeric_key_to_array_index, numeric_key_to_index,
-    numeric_length_owned, owned_bound_to_i64, owned_to_expr, owned_to_string, param_names,
+    numeric_length_owned, owned_bound_to_i64, owned_to_expr, owned_to_string,
     pattern_alternatives_var_names, prefer_pending_control, resume_from_escape, select_emits,
     slice_component_value, slice_object_as_yq_children, slice_owned_value_read,
     stop_with_downstream, stop_with_error, stop_with_escape, streams_escaped_generator_prefix,
@@ -7890,7 +7890,7 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             then,
             bound,
         } => {
-            let bound_then = bind_def(name, &param_names(params), body, then, bound);
+            let bound_then = bind_def(name, params, body, then, bound);
             eval_each_generic::<S, V>(&bound_then, value, optional, cursor, sink)
         }
 
@@ -14389,7 +14389,7 @@ fn path_context_is_navigational_at(expr: &Expr, unfolded: u8) -> bool {
         } => {
             unfolded < OWNED_IDENTITY_DEF_UNFOLD_LIMIT
                 && path_context_is_navigational_at(
-                    &bind_def(name, &param_names(params), body, then, bound),
+                    &bind_def(name, params, body, then, bound),
                     unfolded + 1,
                 )
         }
@@ -14852,7 +14852,7 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             then,
             bound,
         } => {
-            let installed = bind_def(name, &param_names(params), body, then, bound);
+            let installed = bind_def(name, params, body, then, bound);
             path_context_step_generic::<S, V>(&installed, pos, out)
         }
         Expr::DefCall {
@@ -16254,10 +16254,7 @@ fn step_can_yield_absent(expr: &Expr, incoming: bool) -> bool {
             body,
             then,
             bound,
-        } => step_can_yield_absent(
-            &bind_def(name, &param_names(params), body, then, bound),
-            incoming,
-        ),
+        } => step_can_yield_absent(&bind_def(name, params, body, then, bound), incoming),
         Expr::DefCall {
             def,
             args,
@@ -16348,13 +16345,7 @@ fn path_context_stage_preserves_node(expr: &Expr) -> bool {
             body,
             then,
             bound,
-        } => path_context_stage_preserves_node(&bind_def(
-            name,
-            &param_names(params),
-            body,
-            then,
-            bound,
-        )),
+        } => path_context_stage_preserves_node(&bind_def(name, params, body, then, bound)),
         Expr::DefCall {
             def,
             args,
@@ -20092,7 +20083,7 @@ fn owned_identity_pipe_supported_at(stages: &[Expr], unfolded: u8) -> bool {
                 if unfolded >= OWNED_IDENTITY_DEF_UNFOLD_LIMIT {
                     return false;
                 }
-                let installed = bind_def(name, &param_names(params), def_body, then, bound);
+                let installed = bind_def(name, params, def_body, then, bound);
                 if !owned_identity_pipe_supported_at(
                     owned_identity_body_stages(&installed),
                     unfolded + 1,
@@ -22115,7 +22106,7 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
             then,
             bound,
         } => {
-            let installed = bind_def(name, &param_names(params), body, then, bound);
+            let installed = bind_def(name, params, body, then, bound);
             eval_owned_identity_spliced::<S, V>(&installed, rest, value, id, optional, tail)
         }
         Expr::DefCall {
@@ -31553,7 +31544,7 @@ mod tests {
 
         let _guard = enter_def_call_frame(crate::jq::eval::MAX_EVAL_FRAMES);
         let cache = FuncDefBound::default();
-        let defcall = bind_def(&name, &param_names(&params), &body, &then, &cache);
+        let defcall = bind_def(&name, &params, &body, &then, &cache);
         assert!(
             matches!(&*defcall, Expr::DefCall { frames, .. } if *frames == crate::jq::eval::MAX_EVAL_FRAMES),
             "expected bind_def to seed frames from the ambient depth"

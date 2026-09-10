@@ -957,8 +957,13 @@ impl core::fmt::Debug for FuncDefBound {
 pub struct FuncDefData {
     /// Function name.
     pub name: String,
-    /// Parameter names (empty for a no-argument definition).
-    pub params: Vec<String>,
+    /// Parameters, each still carrying its bare-vs-`$` spelling (empty for a
+    /// no-argument definition) -- #2560: `bind_def_call`'s own call-time
+    /// argument binding needs `Param`'s `Bare`/`Dollar` distinction to
+    /// resolve a duplicate parameter name the same way jq's later-wins
+    /// shadowing does, not just the bare identifier `param_names` used to
+    /// reduce this to.
+    pub params: Vec<Param>,
     /// Function body.
     pub body: Expr,
 }
@@ -2387,7 +2392,7 @@ mod tests {
         let call = |bound| Expr::DefCall {
             def: Rc::new(FuncDefData {
                 name: "f".into(),
-                params: alloc_vec(["n"]),
+                params: vec![Param::Bare("n".to_string())],
                 body: Expr::Identity,
             }),
             args: vec![Expr::Literal(Literal::Int(1))],
@@ -2474,11 +2479,5 @@ mod tests {
                 "the cache must not affect Debug output ({label})"
             );
         }
-    }
-
-    /// Helper: `Vec<String>` from string literals, without repeating the
-    /// `to_string` dance at each call site.
-    fn alloc_vec<const N: usize>(names: [&str; N]) -> Vec<String> {
-        names.iter().map(|n| (*n).to_string()).collect()
     }
 }
