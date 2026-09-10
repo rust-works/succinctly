@@ -21843,6 +21843,20 @@ fn test_yq_untracked_bare_noncomma_branch_noop_1764() -> Result<()> {
         assert_eq!(code, 0, "{filter}");
         let v: serde_json::Value = serde_json::from_str(&out)?;
         assert_eq!(v, serde_json::json!({"a": 1}), "{filter}");
+
+        // #2173: the same filters on the *default* YAML route, and through
+        // a following pipe stage. `-o json` is a DOM-forcing flag, so the
+        // rows above do not exercise the route ordinary `succinctly yq`
+        // takes -- an early cut of #2173's closed-term predicate answered
+        // `null` here while every `-o json` row above still passed.
+        let (out, code) = run_yq_stdin(filter, "a: 1\nb: 2\n", &[])?;
+        assert_eq!(code, 0, "{filter} (yaml route)");
+        assert_eq!(out.trim(), "a: 1\nb: 2", "{filter} (yaml route)");
+
+        let piped = format!("{filter} | length");
+        let (out, code) = run_yq_stdin(&piped, "a: 1\nb: 2\n", &[])?;
+        assert_eq!(code, 0, "{piped}");
+        assert_eq!(out.trim(), "2", "{piped}");
     }
     Ok(())
 }
