@@ -1282,6 +1282,11 @@ fn test_1398_dup_key_format_parity_across_filters() -> Result<()> {
         ),
         ("[.[]]", "[3,2]"),
         (".b", "3"),
+        // #2626: `length + 0` answered 2 here while bare `length` answered
+        // 3, because an arithmetic with no path-context operand fell to the
+        // wildcard bridge and its `IndexMap` collapsed the repeat before
+        // either operand ran. yq v4.53.3 answers 3 for both, captured live.
+        ("length + 0", "3"),
     ];
     for (filter, expected) in cases {
         let (json_out, json_code) =
@@ -1301,6 +1306,153 @@ fn test_1398_dup_key_format_parity_across_filters() -> Result<()> {
             "filter {filter:?} on YAML input"
         );
     }
+    Ok(())
+}
+
+/// #2626: arithmetic and unary minus answer from the *real* document, not
+/// from a materialized copy of it.
+///
+/// `eval_single`'s `Expr::Arithmetic`/`Expr::Negate` arms matched only when
+/// an operand needed path context, so an expression whose operands read no
+/// position fell to the wildcard bridge -- and the bridge's first act is
+/// `to_owned_with_cursor`, an `IndexMap` walk that collapses duplicate
+/// mapping keys and re-roots the value at a fresh JSON serialization. Two
+/// families lost information that way, and both were internal
+/// contradictions rather than mere divergences: the same binary answered
+/// differently for `X` and `X + 0`.
+///
+/// Every expectation below captured live from yq v4.53.3:
+///
+/// ```console
+/// $ printf 'b: 1\na: 2\nb: 3\n' | yq -o=json -I=0 'length + 0'        # 3
+/// $ printf 'b: 1\na: 2\nb: 3\n' | yq -o=json -I=0 '(keys|length) + 0'  # 3
+/// $ printf 'b: 1\na: 2\nb: 3\n' | yq -o=json -I=0 'length * -1'        # -3
+/// $ printf 'a: !!str 5\nb: &anc [1,2]\n' | yq -o=json -I=0 '.b | (line + 0)'    # 2
+/// $ printf 'a: !!str 5\nb: &anc [1,2]\n' | yq -o=json -I=0 '.b | (anchor + "")' # "anc"
+/// $ printf 'a: !!str 5\nb: &anc [1,2]\n' | yq -o=json -I=0 '.b | (style + "")'  # "flow"
+/// $ printf 'a: 1\n---\nb: 2\n' | yq -o=json -I=0 'di + 0'              # 0 then 1
+/// ```
+///
+/// Real yq has no unary minus, so `-length` has no oracle of its own; its
+/// yq-spelled twin `length * -1` is the oracle row, and `(-length)` is
+/// asserted alongside it as internal consistency.
+///
+/// **`column` is deliberately absent.** succinctly's own bare `.b | column`
+/// answers 9 where yq v4.53.3 answers 4 (yq reports the anchor's column,
+/// succinctly the value's). This change makes `(column + 0)` agree with
+/// succinctly's bare `column` -- internally consistent, still divergent --
+/// so pinning it here would pin the wrong number. Filed as #2712.
+#[test]
+fn test_arithmetic_reads_the_real_document_2626() -> Result<()> {
+    let dup = "b: 1\na: 2\nb: 3\n";
+    for (filter, expected) in [
+        ("length", "3"),
+        ("length + 0", "3"),
+        ("0 + length", "3"),
+        ("(keys|length) + 0", "3"),
+        ("(to_entries|length) + 0", "3"),
+        ("length * -1", "-3"),
+        // Parenthesized so the leading `-` is not read as a CLI flag; the
+        // parse is the same `Expr::Negate`.
+        ("(-length)", "-3"),
+        // Under a lazy consumer these take `eval_each_generic`'s own arms.
+        // Its `Expr::Negate` arm bridged too, so `first(-length)` was the
+        // last spelling still answering `-2` once the arms above were fixed.
+        ("first(length + 0)", "3"),
+        ("first(-length)", "-3"),
+    ] {
+        let (out, code) = run_yq_stdin(filter, dup, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "filter {filter}");
+        assert_eq!(out.trim(), expected, "filter {filter}");
+    }
+
+    // The node-metadata family: none of `line`/`anchor`/`style`/`di` is in
+    // `needs_path_context`, so all of them were silently stubbed inside an
+    // arithmetic by the bridge's re-rooting -- `(line + 0)` was 0, and
+    // `(anchor + "")`/`(style + "")` were empty strings.
+    let meta = "a: !!str 5\nb: &anc [1,2]\n";
+    for (filter, expected) in [
+        (".b | line", "2"),
+        (".b | (line + 0)", "2"),
+        (".b | anchor", "\"anc\""),
+        (".b | (anchor + \"\")", "\"anc\""),
+        (".b | style", "\"flow\""),
+        (".b | (style + \"\")", "\"flow\""),
+    ] {
+        let (out, code) = run_yq_stdin(filter, meta, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "filter {filter}");
+        assert_eq!(out.trim(), expected, "filter {filter}");
+    }
+
+    // `di` inside an arithmetic answered 0 for every document, where bare
+    // `di` already counted correctly.
+    let multidoc = "a: 1\n---\nb: 2\n";
+    for filter in ["di", "di + 0"] {
+        let (out, code) = run_yq_stdin(filter, multidoc, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "filter {filter}");
+        assert_eq!(out, "0\n1\n", "filter {filter}");
+    }
+
+    Ok(())
+}
+
+/// #2626: an arithmetic validates only what it reads, like every other
+/// filter since #2103 -- and unlike the bridge it used to take.
+///
+/// Removing the `needs_path_context` gate removes the last spelling on
+/// which a *document-reading* filter still validated the whole document.
+/// The split this closes was not between filters but between two spellings
+/// of one: on `a: "bad\q"` / `b: 5`, `length` answered `2`,
+/// `first(length + 0)` answered `2`, and only `length + 0` raised, because
+/// only it bridged.
+///
+/// **This is a deliberate divergence, and the raise-set moves with it.**
+/// Real yq rejects this document at parse time for *every* filter (v4.53.3:
+/// `Error: bad file ...: yaml: while scanning ...`, exit 1, captured live
+/// for `length`, `length + 0`, `.b` and `.b + 0` alike), so there is no yq
+/// answer to match on any row here. ADR-0018's #2103 amendment governs the
+/// class: where the reference's answer is a whole-document rejection the
+/// semi-index deliberately does not perform, take the *uniform* divergence
+/// rather than the one that depends on how the filter spells its way to the
+/// value. Recorded in `docs/compliance/yq/limitations.md`.
+#[test]
+fn test_arithmetic_validates_only_what_it_reads_2626() -> Result<()> {
+    let doc = "a: \"bad\\q\"\nb: 5\n";
+
+    // Reads the key count, not the bad scalar: every spelling agrees.
+    for (filter, expected) in [
+        ("length", "2"),
+        ("length + 0", "2"),
+        ("0 + length", "2"),
+        ("first(length + 0)", "2"),
+        ("(keys|length)", "2"),
+        ("(keys|length) + 0", "2"),
+        ("(-length)", "-2"),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), expected, "`{filter}` -- stderr: {stderr:?}");
+    }
+
+    // Navigating past the bad scalar is likewise unaffected by the `+ 0`.
+    for (filter, expected) in [(".b", "5"), (".b + 0", "5")] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &["-o=json", "-I=0"])?;
+        assert_eq!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert_eq!(stdout.trim(), expected, "`{filter}` -- stderr: {stderr:?}");
+    }
+
+    // The other half of the rule, and what keeps this from being a hole:
+    // an arithmetic that actually *reads* the malformed scalar still
+    // raises, exactly as the bare read does.
+    for filter in [".a", ".a + \"\"", "(.a + \"\") | length"] {
+        let (_, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &["-o=json", "-I=0"])?;
+        assert_ne!(code, 0, "`{filter}` -- stderr: {stderr:?}");
+        assert!(
+            stderr.contains("invalid escape sequence"),
+            "`{filter}` -- stderr: {stderr}"
+        );
+    }
+
     Ok(())
 }
 
@@ -39768,6 +39920,15 @@ fn test_ambient_validation_agrees_with_bridge_2476() -> Result<()> {
         ("true and true", "true"),
         ("false or true", "true"),
         ("false // 1", "1"),
+        // #2626 gave `Expr::Arithmetic`/`Expr::Negate` native arms, so they
+        // reach `bridge_ambient_input`'s closed-term path no longer -- they
+        // never materialize at all now. Either way the answer is #2173's:
+        // a term that reads nothing validates nothing. `(-(1))`, not `-1`,
+        // because the parser constant-folds the latter into a literal that
+        // never reaches `Expr::Negate`.
+        ("1 + 1", "2"),
+        ("0 - 0", "0"),
+        ("(-(1))", "-1"),
     ];
     for (label, doc, want_code, want_stderr) in corpus {
         let mut seen: Vec<(String, i32, String)> = Vec::new();

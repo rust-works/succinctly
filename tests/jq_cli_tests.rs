@@ -3415,6 +3415,16 @@ fn test_duplicate_keys_collapse_last_wins_1385() -> Result<()> {
         ("[.[]]", "[3,2]"),
         ("[paths]", r#"[["b"],["a"]]"#),
         ("to_entries|length", "2"),
+        // #2626 control. In yq mode the same three answered `2` from a
+        // *collapsed copy* of the document while bare `length` answered 3,
+        // and giving `Expr::Arithmetic`/`Expr::Negate` native arms moved
+        // them to 3. Here `2` is the right answer and must not move with
+        // them: jq really does build an object with one `b`, so
+        // `COLLAPSE_DUPLICATE_KEYS` makes the streaming route agree with the
+        // collapsed one. Captured from /usr/bin/jq 1.7.1.
+        ("length + 0", "2"),
+        ("(keys|length) + 0", "2"),
+        ("(-length)", "-2"),
     ] {
         let (out, _, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(code, 0, "filter {filter}");
@@ -31096,6 +31106,19 @@ fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
             "",
             0,
         ),
+        // #2626: the same row on the *generic* route. `-n` gives the
+        // evaluator no cursor, so the row above runs `eval.rs`'s own
+        // `each_negate`; with a document on stdin there is a cursor and
+        // `each_negate_generic` -- which that arm bridged to before #2626 --
+        // is what has to forward the demand. It was written to mirror
+        // `each_negate` precisely so these cannot drift.
+        (
+            &["-c", r#"first(-((1, ("B"|stderr))))"#],
+            Some("null"),
+            "-1\n",
+            "",
+            0,
+        ),
         // An index key: the first key already satisfies `first`, so a
         // second key generated after it is never reached.
         (
@@ -44124,6 +44147,15 @@ fn test_ambient_validation_agrees_with_bridge_2476() -> Result<()> {
         ("true and true", "true"),
         ("false or true", "true"),
         ("false // 1", "1"),
+        // #2626 gave `Expr::Arithmetic`/`Expr::Negate` native arms in
+        // `eval_single`, and unary minus one in `eval_each_generic` too, so
+        // neither reaches a bridge on any route now. The answer is #2173's
+        // either way: a term that reads nothing validates nothing.
+        // `(-(1))`, not `-1`, because the parser constant-folds the latter
+        // into a literal that never reaches `Expr::Negate`.
+        ("1 + 1", "2"),
+        ("0 - 0", "0"),
+        ("(-(1))", "-1"),
     ];
     // Four corpus rows are not about validation at all: `xyz123`, `[1,2`,
     // `["a` and `[1] x` give the CLI's document reader no root value to
