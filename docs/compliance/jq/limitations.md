@@ -3531,13 +3531,13 @@ proves cannot consult `.` — `OwnedValue::Null` instead. Nothing is materialize
 is validated. Captured against pinned jq 1.7.1 on `{123: 1, "b": 2}`, which it rejects at
 parse time for every filter:
 
-| filter                                            | jq 1.7.1 | succinctly before | succinctly now |
-|---------------------------------------------------|----------|-------------------|----------------|
-| `1+1`                                             | error    | `2` (exit 0)      | `2` — unchanged |
-| `[1+1]`                                           | error    | error             | `[2]`          |
-| `[range(3)]`, `range(3)`                          | error    | error             | `[0,1,2]`, `0 1 2` |
-| `now\|floor`, `$__loc__`                          | error    | error             | the value      |
-| `true and true`, `false or true`, `false // 1`    | error    | error             | `true`, `true`, `1` |
+| filter                                          | jq 1.7.1 | succinctly before | succinctly now      |
+|-------------------------------------------------|----------|-------------------|---------------------|
+| `1+1`                                           | error    | `2` (exit 0)      | `2` — unchanged     |
+| `[1+1]`                                         | error    | error             | `[2]`               |
+| `[range(3)]`, `range(3)`                        | error    | error             | `[0,1,2]`, `0 1 2`  |
+| `now\|floor`, `$__loc__`                        | error    | error             | the value           |
+| `true and true`, `false or true`, `false // 1`  | error    | error             | `true`, `true`, `1` |
 
 The same three reasons #2103 records apply unchanged, and the first is the strongest here:
 *the agreement being given up was an accident.* Nothing decided that `[1+1]` should validate
