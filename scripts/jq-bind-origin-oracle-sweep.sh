@@ -236,8 +236,6 @@ destructure-bind-after-pattern:#2649 residue 1 -- a plain bind on the ambient in
 destructure-pattern-on-bound-copy:#2649 residue 1 -- a nested pattern whose source is the bound copy ($q as [$x]); the arm's source rule only trusts Identity/TrackedVar at the head of a trackable stage
 destructure-marker-source-literal:#2649 residue 2 -- a marker-headed pattern source on an untracked stage; the arm cannot see the register the stage carries, and reading stage_frame alone would fabricate
 destructure-marker-source-navigated:#2649 residue 2 -- same as destructure-marker-source-literal with a navigated bind (.b as $y | .b | 5 | $y as {c:$w})
-destructure-alt-terminal-refusal:#2649 residue 3 -- the first alternative binds and the body then fails only at path()'s terminal check; jq's PATH_END error retries the next alternative, the resolver's refusal does not
-destructure-alt-bare-var:#2649 residue 3 -- twin of destructure-alt-terminal-refusal with a bare-var alternative (jq answers [])
 destructure-alt-navigation:#2649 residue 3 -- the body navigates the ambient input, which raises a near-access refusal the artefact guard cannot tell from an artefact, so the ?// does not retry
 destructure-alt-artefact-guard:#2649 artefact guard -- MUST stay a refusal: retrying here would answer [] where jq answers ["a",0]; answering anything makes this row mismatch (fabrication assertion, not a bare allowlist entry)
 destructure-alt-artefact-guard-del:#2649 artefact guard -- the write twin: a retry would delete the whole document where jq deletes .a[0]

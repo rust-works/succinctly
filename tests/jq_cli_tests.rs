@@ -45046,8 +45046,6 @@ fn test_destructuring_moves_path_register_2649() -> Result<()> {
         ),
         // jq: ["a"]
         (d, "path(. as {a:$q} | .a as $z | $z)"),
-        // jq: ["b"]
-        (d, "path(. as {a:$q} ?// {b:$r} | $r)"),
         // jq: ["a"]
         (d, "path(. as {a:$q} ?// $z | .a)"),
     ] {
@@ -45088,10 +45086,42 @@ fn test_destructuring_moves_path_register_2649() -> Result<()> {
         (d, "path(.b as $y | .b | 5 | $y? | .c)", "[\"b\",\"c\"]\n"),
         (d, "path(.b as $y | .b | 5? | $y)", "[\"b\"]\n"),
         (d, "path(.?)", "[]\n"),
+        // jq's `?//` fork also catches its own `PATH_END` refusal: the
+        // first alternative binds `$r` to nothing, the body's `null` is
+        // refused at the terminal check, and the next alternative answers.
+        // `resolve_terminal` refuses with `Demand::Stop`, which the retry
+        // loop treats as jq's fork does.
+        (d, "path(. as {a:$q} ?// {b:$r} | $r)", "[\"b\"]\n"),
+        (d, "path(. as {b:$r} ?// {a:$q} | $q)", "[\"a\"]\n"),
+        (d, "path(. as {a:$q} ?// $r | $r)", "[]\n"),
+        (d, "del(. as {a:$q} ?// {b:$r} | $r)", "{\"a\":[1,2,3]}\n"),
+        (
+            d,
+            "(. as {a:$q} ?// {b:$r} | $r) = 9",
+            "{\"a\":[1,2,3],\"b\":9}\n",
+        ),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(input))?;
         assert_eq!(code, 0, "`{filter}`: stderr={stderr}");
         assert_eq!(stdout, expected, "`{filter}`");
+    }
+
+    // A downstream halt must not be re-run through the next alternative
+    // (the stage closure marks it non-retryable). jq halts on the first
+    // alternative's `null` -- `halt_error` on `null` prints nothing, exit 5
+    // -- and never reaches the second, whose `{"c":5}` would otherwise be
+    // printed by a retried `halt_error`.
+    {
+        let (stdout, stderr, code) = run_jq_full(
+            &["-c", "path((. as {a:$q} ?// {b:$r} | $r) | halt_error)"],
+            Some(d),
+        )?;
+        assert_eq!(code, 5, "stdout={stdout} stderr={stderr}");
+        assert!(stdout.is_empty(), "must not print: {stdout}");
+        assert!(
+            !stderr.contains(r#"{"c":5}"#),
+            "halt_error ran again on the second alternative: {stderr}"
+        );
     }
 
     // An empty `{}`/`[]` pattern is a syntax error in jq (`unexpected '}'` /
