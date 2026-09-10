@@ -10980,12 +10980,24 @@ fn eval_boolean_generic<S: EvalSemantics, V: DocumentValue>(
     // because `. and true` reads `.`'s *truthiness*, which is `is_falsy` and
     // decodes nothing either. Each operand still validates whatever it
     // materializes, via `eval_single` below.
+    // #2669: `eval_each_generic`, not `eval_single` -- the operand strategy
+    // is what decides whether the loop can interleave, and this collecting
+    // entry point kept the eager one long after `each_boolean_generic` had
+    // the lazy one, so `[(..) and (..)]` ordered its operands differently
+    // from `first((..) and (..))` on the identical expression. Identical
+    // closure to `each_boolean_generic`'s; the two differ only in what they
+    // do with the bits.
     let (bools, control) = boolean_fanout_bools(
-        |operand, out| {
-            push_generic_truthiness(
-                eval_single::<S, V>(operand, value.clone(), optional, cursor),
-                out,
-            )
+        |operand, bit_sink| {
+            let mut escape: Option<Control> = None;
+            let flow =
+                eval_each_generic::<S, V>(operand, value.clone(), optional, cursor, &mut |item| {
+                    match generic_item_truthiness(item) {
+                        Ok(bit) => bit_sink(bit),
+                        Err(control) => stop_with_escape(&mut escape, control),
+                    }
+                });
+            resume_from_escape(escape, flow)
         },
         left,
         right,

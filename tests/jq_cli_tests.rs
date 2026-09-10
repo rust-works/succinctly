@@ -30873,6 +30873,52 @@ type SideEffectCase = (
 #[test]
 fn test_short_circuit_side_effect_shapes_already_match_jq_820() -> Result<()> {
     let cases: &[SideEffectCase] = &[
+        // #2669: the eager `and`/`or` route, moved here from
+        // `test_short_circuit_side_effect_leaks_820_932_987`.
+        //
+        // #2180 WP2a gave `and`/`or` a demand-forwarding `eval_each` arm
+        // sharing one loop with the eager route, but left the *collecting*
+        // entry points (`eval_boolean`, `eval_boolean_generic`) passing the
+        // eager operand strategy -- which finishes the left operand before
+        // the first pairing, where jq re-runs the right operand per left
+        // output. #2669 put both on the lazy strategy, the `eval_boolean`
+        // side of what #1481 did for `eval_binary_fanout`, leaving no second
+        // strategy to drift.
+        //
+        // Captured live against jq 1.7.1 (`stderr` writes a comma's first
+        // branch twice in both tools, so read the sequence, not the repeat
+        // count):
+        //
+        //   jq, and now succinctly   A A  C C D  B  C C D
+        //   succinctly before #2669  A A B  C C D  C C D
+        //
+        // The delivered values never differed -- this was stderr ordering
+        // only for side-effect-free operands -- but with `input`/`inputs`
+        // operands the same ordering decides which value each operand sees,
+        // which is #1481's own argument for closing it.
+        (
+            &[
+                "-cn",
+                r#"[("A"|stderr, "B"|stderr) and ("C"|stderr, "D"|stderr)]"#,
+            ],
+            None,
+            "[true,true,true,true]\n",
+            "AACCDBCCD",
+            0,
+        ),
+        // The `or` spelling short-circuits on the first truthy left output,
+        // so it never reached the divergence -- kept beside its `and` twin
+        // so the pair reads together.
+        (
+            &[
+                "-cn",
+                r#"[("A"|stderr, "B"|stderr) or ("C"|stderr, "D"|stderr)]"#,
+            ],
+            None,
+            "[true,true]\n",
+            "AAB",
+            0,
+        ),
         // `limit(n)` pulls exactly `n` values, so a side effect sitting at
         // position `n` IS reached. Stopping at the first would suppress it.
         (
@@ -32310,34 +32356,6 @@ fn test_short_circuit_side_effect_leaks_820_932_987() -> Result<()> {
             None,
             "1\n",
             "I",
-            0,
-        ),
-        // ---- #2180 WP2a's own residual: the EAGER `and`/`or` route -------
-        // The `Expr::Compare` situation between #1459 and #1481, one
-        // operator over. WP2a gave `and`/`or` a demand-forwarding
-        // `eval_each` arm sharing one loop with the eager route, but left
-        // `eval_boolean` passing the *eager* operand strategy, so a bare
-        // top-level `and`/`or` still finishes its left operand before the
-        // first pairing where jq interleaves. Captured live against jq
-        // 1.7.1 (`stderr` writes a comma's first branch twice in both
-        // tools, so read the sequence, not the repeat count):
-        //
-        //   jq          A A  C C D  B  C C D   <- right re-run per left output
-        //   succinctly  A A B  C C D  C C D    <- left finished first
-        //
-        // Reaching the same expression through a lazy consumer or as a
-        // binary operand already agrees with jq -- see the two matching
-        // rows in `test_short_circuit_side_effect_shapes_already_match_jq_820`.
-        // Closing this is the `eval_boolean`-side half #1481 did for
-        // `eval_binary_fanout`, not WP2a's scope.
-        (
-            &[
-                "-cn",
-                r#"[("A"|stderr, "B"|stderr) and ("C"|stderr, "D"|stderr)]"#,
-            ],
-            None,
-            "[true,true,true,true]\n",
-            "AABCCDCCD",
             0,
         ),
         // ---- `binary_fanout_each`'s inner/outer `pending` asymmetry ------

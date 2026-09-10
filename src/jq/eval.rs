@@ -8102,19 +8102,13 @@ fn eval_negate<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// pairing has failed. `eval_operand` closes over whichever evaluator
 /// (plain vs. path-context) its caller wants.
 fn boolean_fanout_core<'a, W: Clone + AsRef<[u64]>>(
-    eval_operand: impl Fn(&Expr) -> QueryResult<'a, W>,
+    each_operand: impl Fn(&Expr, &mut dyn FnMut(bool) -> Demand) -> Flow,
     left: &Expr,
     right: &Expr,
     short_circuit: bool,
     rules: BinaryFanoutRules,
 ) -> QueryResult<'a, W> {
-    let (out, control) = boolean_fanout_bools(
-        |expr, bools| push_truthiness(eval_operand(expr), bools),
-        left,
-        right,
-        short_circuit,
-        rules,
-    );
+    let (out, control) = boolean_fanout_bools(each_operand, left, right, short_circuit, rules);
     match control {
         Some(control) => partial(out.into_iter().map(OwnedValue::Bool).collect(), control),
         None => bools_to_result(out),
@@ -8126,6 +8120,20 @@ fn boolean_fanout_core<'a, W: Clone + AsRef<[u64]>>(
 /// operand strategy pushes bits and this returns bits, leaving each caller
 /// to build its own result from them.
 ///
+/// Takes the **lazy** operand strategy, the same one [`each_boolean`] and
+/// `eval_generic::each_boolean_generic` pass (#2669). It used to build an
+/// eager one internally -- evaluate the whole operand into a `Vec<bool>`,
+/// then replay -- which cannot show jq's interleaving, because it has
+/// finished the left operand before the first pairing. That made a
+/// *collecting* consumer disagree with a truncating one on the same
+/// expression: captured live on jq 1.7.1,
+/// `[("A"|stderr,"B"|stderr) and ("C"|stderr,"D"|stderr)]` writes `AACCDBCCD`,
+/// where this route wrote `AABCCDCCD` while `first(..)`/`limit(..)` around
+/// the identical operands already matched. With both callers on the lazy
+/// strategy there is no second strategy left to drift -- the same conclusion
+/// #1481 reached for `Compare`/`Arithmetic`, whose eager entry point had the
+/// matching gap between #1459 and #1481.
+///
 /// The generic evaluator's `and`/`or` arm (`eval_generic::eval_boolean_generic`,
 /// spine 2416 gate reason 3) is the second caller. It threads a cursor into
 /// both operands, which `QueryResult` cannot carry, so sharing the *body*
@@ -8135,7 +8143,7 @@ fn boolean_fanout_core<'a, W: Clone + AsRef<[u64]>>(
 /// [`binary_fanout_core`] and `eval_generic::binary_fanout_each_generic`
 /// already follow for arithmetic and comparison.
 pub(crate) fn boolean_fanout_bools(
-    push_operand: impl Fn(&Expr, &mut Vec<bool>) -> Option<Control>,
+    each_operand: impl Fn(&Expr, &mut dyn FnMut(bool) -> Demand) -> Flow,
     left: &Expr,
     right: &Expr,
     short_circuit: bool,
@@ -8143,25 +8151,7 @@ pub(crate) fn boolean_fanout_bools(
 ) -> (Vec<bool>, Option<Control>) {
     let mut out: Vec<bool> = Vec::new();
     let flow = boolean_fanout_each(
-        // The eager operand strategy: evaluate the whole operand, then
-        // replay its bits through the demand-driven loop. The replay is
-        // what re-enters this same strategy for the *other* operand, so
-        // `push_operand` has to be `Fn` rather than `FnMut` -- exactly the
-        // re-entrancy note [`binary_fanout_each`]'s own `each_operand`
-        // carries. Both existing callers already supply an `Fn`.
-        |expr, bit_sink| {
-            let mut bools = Vec::new();
-            let control = push_operand(expr, &mut bools);
-            for bit in bools {
-                if bit_sink(bit) == Demand::Stop {
-                    return Flow::Stopped { pending: None };
-                }
-            }
-            match control {
-                Some(control) => Flow::Escaped(control),
-                None => Flow::Exhausted,
-            }
-        },
+        each_operand,
         left,
         right,
         short_circuit,
@@ -9427,8 +9417,17 @@ fn eval_boolean<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     short_circuit: bool,
 ) -> QueryResult<'a, W> {
+    // #2669: `eval_each`, not `eval_single` -- the operand strategy is what
+    // decides whether the loop can interleave, and this collecting entry
+    // point kept the eager one long after `each_boolean` had the lazy one.
+    // Identical closure to `each_boolean`'s; the two differ only in what
+    // they do with the bits.
     boolean_fanout_core(
-        move |expr| eval_single::<W, S>(expr, value.clone(), optional),
+        move |operand, bit_sink| {
+            eval_each::<W, S>(operand, value.clone(), optional, &mut |item| {
+                bit_sink(item.is_truthy())
+            })
+        },
         left,
         right,
         short_circuit,
