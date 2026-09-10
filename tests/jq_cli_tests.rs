@@ -3174,6 +3174,42 @@ fn test_keys_unsorted_pretty_output_escapes_raw_del_byte_2592() -> Result<()> {
     Ok(())
 }
 
+/// #2592 (code review): `--preserve-input` must leave a raw DEL byte
+/// unescaped at all three new sites, mirroring #2591's own
+/// `test_preserve_input_leaves_raw_del_byte_in_key_unescaped_2591` -- flagged
+/// by review as a test-coverage gap (the behavior was manually verified but
+/// not pinned by an automated test).
+#[test]
+fn test_preserve_input_leaves_raw_del_byte_in_streamed_value_unescaped_2592() -> Result<()> {
+    let input = "[\"x\x7fy\"]";
+    let (out, _, code) = run_jq_full(&["--preserve-input", "-c", ".[]"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "\"x\x7fy\"\n", "stdout: {out:?}");
+    Ok(())
+}
+
+/// #2592 (code review): `--preserve-input` twin for `keys_unsorted`'s
+/// compact-output loop.
+#[test]
+fn test_preserve_input_leaves_raw_del_byte_in_keys_unsorted_compact_unescaped_2592() -> Result<()> {
+    let input = "{\"x\x7fy\": 1}";
+    let (out, _, code) = run_jq_full(&["--preserve-input", "-c", "keys_unsorted"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "[\"x\x7fy\"]\n", "stdout: {out:?}");
+    Ok(())
+}
+
+/// #2592 (code review): `--preserve-input` twin for `keys_unsorted`'s
+/// pretty-output loop.
+#[test]
+fn test_preserve_input_leaves_raw_del_byte_in_keys_unsorted_pretty_unescaped_2592() -> Result<()> {
+    let input = "{\"x\x7fy\": 1}";
+    let (out, _, code) = run_jq_full(&["--preserve-input", "keys_unsorted"], Some(input))?;
+    assert_eq!(code, 0);
+    assert_eq!(out, "[\n  \"x\x7fy\"\n]\n", "stdout: {out:?}");
+    Ok(())
+}
+
 /// #1830: real jq flushes each result as it's produced and errors on
 /// first sighting a NUL, rather than buffering the whole multi-result
 /// stream before writing anything -- confirmed live against jq 1.7.1:
