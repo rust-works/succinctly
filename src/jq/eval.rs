@@ -26993,14 +26993,9 @@ fn drain_path_result<'a>(
         Ok(branches) => (branches, None),
         Err((prefix, e)) => (prefix, Some(e)),
     };
-    for branch in branches {
-        if sink(branch) == Demand::Stop {
-            return ResolveFlow::Stopped;
-        }
-    }
-    match escape {
-        Some(e) => ResolveFlow::Escaped(e),
-        None => ResolveFlow::Exhausted,
+    match emit_branches(branches, sink) {
+        Demand::Stop => ResolveFlow::Stopped,
+        Demand::Continue => flow_result(escape),
     }
 }
 
@@ -27041,10 +27036,7 @@ fn resolve_cond_fork_sink(
             other => return other,
         }
     }
-    match cond_escape {
-        Some(e) => ResolveFlow::Escaped(e),
-        None => ResolveFlow::Exhausted,
-    }
+    flow_result(cond_escape)
 }
 
 /// `.[]`'s own path-branch construction (#1850), emitted one element at a
@@ -27755,84 +27747,10 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             emit_passthrough(value, trackable, snapshot, sink)
         }
 
-        // `a // b`: resolve `a`, pass only its truthy branches through — jq's
-        // `//` filters a multi-output left side rather than choosing all-or-
-        // nothing (`retain_truthy` is this rule's value-only twin) — and
-        // fall back to `b` only when none survive. An escape while resolving
-        // `a` propagates rather than falling back, matching `eval_alternative`:
-        // `//` only substitutes for falsy/absent output, never for a raised
-        // error. The truthy branches produced *before* that escape have
-        // already reached the sink, which is what makes the escape's own
-        // prefix jq's: the eager form this replaced (#2235) forwarded
-        // `left`'s escape with its prefix *unfiltered*, falsy branches
-        // included, so a fold whose source was `(.. , error("x")) // 9`
-        // would have run a step for a falsy element jq never bound
-        // (`path(reduce (((.[] | . and true), error("x")) // 9) as $i (.;
-        // stderr))` on `[true,false]` runs one step in jq 1.7.1, not two).
-        //
-        // #845: a *literal* `a` is the one exception — real jq only requires
-        // path-shape for whichever of `a`'s outputs actually survive the
-        // truthy filter, so `a` being itself falsy (`false`, `null`) must
-        // fall through to `b` without ever needing to resolve as a path at
-        // all: confirmed live, `path(false // .b)` on `{"a":10}` is `["b"]`,
-        // while `path(1 // .b)` still raises (`1` is truthy, and does need
-        // path-shape). A literal's own value is known statically, at zero
-        // evaluation cost and with no side effect to risk duplicating —
-        // unlike checking `a`'s general truthiness by evaluating it a
-        // *second* time (rejected in review: resolving `a` already evaluates
-        // it once by the time any failure is visible here, so a follow-up
-        // evaluation just to inspect truthiness double-fires anything `a`
-        // does — confirmed live, `path(stderr // .b)` wrote its input to
-        // stderr twice under that approach — and a catch-all on the retry's
-        // own outcome swallowed a `halt`/`break` the retry surfaced instead
-        // of letting it escape, same review round).
-        //
-        // A `Comma`-fanned `a` mixing a falsy/non-path sibling with a
-        // path-shaped or truthy one used to be the one shape this arm
-        // didn't handle (filed as #980): `Comma` used to commit to a
-        // sibling's own failure eagerly, before `//`'s truthy filter ever
-        // got a chance to see it. #1288's "`Expr::Comma` stops checking a
-        // position too early" fixed this incidentally, not this arm
-        // itself; confirmed live against jq 1.7.1, all eight shapes #980
-        // pinned (`path((.a, false) // .b)`, `path((false, .a) // .b)`,
-        // `path((.a, null) // .b)`, `path((null, false) // .b)`,
-        // `path((.x, .a) // .b)`, `path((false, false) // .b)`,
-        // `path((.a, false, .a) // .b)`, and the genuinely-still-erroring
-        // `path((.a, 1) // .b)`) now match.
-        //
-        // A downstream `Stop` propagates as-is; only `a` running to
-        // exhaustion with nothing truthy delivered falls through to `b`.
-        Expr::Alternative(left, right) => {
-            if let Expr::Literal(lit) = unwrap_paren(left) {
-                if !literal_to_owned(lit).is_truthy() {
-                    return resolve_node_sink::<S>(
-                        right, value, trackable, snapshot, frame, keep, sink,
-                    );
-                }
-            }
-            let mut emitted = false;
-            let flow = resolve_node_sink::<S>(
-                left,
-                value,
-                trackable,
-                snapshot,
-                frame,
-                keep,
-                &mut |branch| {
-                    if !branch.value.is_truthy() {
-                        return Demand::Continue;
-                    }
-                    emitted = true;
-                    sink(branch)
-                },
-            );
-            match flow {
-                ResolveFlow::Exhausted if !emitted => {
-                    resolve_node_sink::<S>(right, value, trackable, snapshot, frame, keep, sink)
-                }
-                other => other,
-            }
-        }
+        // `a // b`: see [`resolve_alternative_sink`].
+        Expr::Alternative(left, right) => resolve_alternative_sink::<S>(
+            left, right, value, trackable, snapshot, frame, keep, sink,
+        ),
 
         // #1440: `reduce`/`foreach` are real sugar over the same
         // variable-binding primitive every other construct uses (real jq
@@ -27888,49 +27806,44 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             patterns,
             init,
             update,
-        } => match patterns.as_slice() {
-            [Pattern::Var(_)] => resolve_reduce::<S>(
-                input,
-                &patterns[0],
-                init,
-                update,
-                value,
-                trackable,
-                snapshot,
-                frame,
-                keep,
-                sink,
-            ),
-            _ => drain_path_result(
-                resolve_leaf::<S>(expr, value, trackable, snapshot, keep),
-                sink,
-            ),
-        },
+        } if matches!(patterns.as_slice(), [Pattern::Var(_)]) => resolve_reduce::<S>(
+            input,
+            &patterns[0],
+            init,
+            update,
+            value,
+            trackable,
+            snapshot,
+            frame,
+            keep,
+            sink,
+        ),
         Expr::Foreach {
             input,
             patterns,
             init,
             update,
             extract,
-        } => match patterns.as_slice() {
-            [Pattern::Var(_)] => resolve_foreach::<S>(
-                input,
-                &patterns[0],
-                init,
-                update,
-                extract.as_deref(),
-                value,
-                trackable,
-                snapshot,
-                frame,
-                keep,
-                sink,
-            ),
-            _ => drain_path_result(
-                resolve_leaf::<S>(expr, value, trackable, snapshot, keep),
-                sink,
-            ),
-        },
+        } if matches!(patterns.as_slice(), [Pattern::Var(_)]) => resolve_foreach::<S>(
+            input,
+            &patterns[0],
+            init,
+            update,
+            extract.as_deref(),
+            value,
+            trackable,
+            snapshot,
+            frame,
+            keep,
+            sink,
+        ),
+        // A destructuring pattern or a `?//`-alternatives list falls back
+        // to the ordinary eager evaluator for both fold kinds alike — see
+        // the guarded arms' own doc comment above `Expr::Reduce` for why.
+        Expr::Reduce { .. } | Expr::Foreach { .. } => drain_path_result(
+            resolve_leaf::<S>(expr, value, trackable, snapshot, keep),
+            sink,
+        ),
 
         // `repeat(f)` (#1906) and the three bounded consumers below all
         // resolve through the sink now, so a bound threads through arbitrary
@@ -28414,6 +28327,106 @@ fn resolve_optional_sink<'a, S: EvalSemantics>(
     }
 }
 
+/// `a // b`: resolve `a`, pass only its truthy branches through — jq's
+/// `//` filters a multi-output left side rather than choosing all-or-
+/// nothing (`retain_truthy` is this rule's value-only twin) — and
+/// fall back to `b` only when none survive. An escape while resolving
+/// `a` propagates rather than falling back, matching `eval_alternative`:
+/// `//` only substitutes for falsy/absent output, never for a raised
+/// error. The truthy branches produced *before* that escape have
+/// already reached the sink, which is what makes the escape's own
+/// prefix jq's: the eager form this replaced (#2235) forwarded
+/// `left`'s escape with its prefix *unfiltered*, falsy branches
+/// included, so a fold whose source was `(.. , error("x")) // 9`
+/// would have run a step for a falsy element jq never bound
+/// (`path(reduce (((.[] | . and true), error("x")) // 9) as $i (.;
+/// stderr))` on `[true,false]` runs one step in jq 1.7.1, not two).
+///
+/// #845: a *literal* `a` is the one exception — real jq only requires
+/// path-shape for whichever of `a`'s outputs actually survive the
+/// truthy filter, so `a` being itself falsy (`false`, `null`) must
+/// fall through to `b` without ever needing to resolve as a path at
+/// all: confirmed live, `path(false // .b)` on `{"a":10}` is `["b"]`,
+/// while `path(1 // .b)` still raises (`1` is truthy, and does need
+/// path-shape). A literal's own value is known statically, at zero
+/// evaluation cost and with no side effect to risk duplicating —
+/// unlike checking `a`'s general truthiness by evaluating it a
+/// *second* time (rejected in review: resolving `a` already evaluates
+/// it once by the time any failure is visible here, so a follow-up
+/// evaluation just to inspect truthiness double-fires anything `a`
+/// does — confirmed live, `path(stderr // .b)` wrote its input to
+/// stderr twice under that approach — and a catch-all on the retry's
+/// own outcome swallowed a `halt`/`break` the retry surfaced instead
+/// of letting it escape, same review round).
+///
+/// A `Comma`-fanned `a` mixing a falsy/non-path sibling with a
+/// path-shaped or truthy one used to be the one shape this arm
+/// didn't handle (filed as #980): `Comma` used to commit to a
+/// sibling's own failure eagerly, before `//`'s truthy filter ever
+/// got a chance to see it. #1288's "`Expr::Comma` stops checking a
+/// position too early" fixed this incidentally, not this arm
+/// itself; confirmed live against jq 1.7.1, all eight shapes #980
+/// pinned (`path((.a, false) // .b)`, `path((false, .a) // .b)`,
+/// `path((.a, null) // .b)`, `path((null, false) // .b)`,
+/// `path((.x, .a) // .b)`, `path((false, false) // .b)`,
+/// `path((.a, false, .a) // .b)`, and the genuinely-still-erroring
+/// `path((.a, 1) // .b)`) now match.
+///
+/// A downstream `Stop` propagates as-is; only `a` running to
+/// exhaustion with nothing truthy delivered falls through to `b`.
+#[allow(clippy::too_many_arguments)] // STYLE-0004: matches the resolver's own established `left`/`right` + `value`/`trackable`/`snapshot`/`frame`/`keep`/`sink` argument set (`resolve_node_sink` and its siblings)
+fn resolve_alternative_sink<'a, S: EvalSemantics>(
+    left: &Expr,
+    right: &Expr,
+    value: &'a OwnedValue,
+    trackable: bool,
+    snapshot: &Snapshot,
+    frame: &Frame,
+    keep: Keep,
+    sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
+) -> ResolveFlow {
+    if let Expr::Literal(lit) = unwrap_paren(left) {
+        if !literal_to_owned(lit).is_truthy() {
+            return resolve_node_sink::<S>(right, value, trackable, snapshot, frame, keep, sink);
+        }
+    }
+    let mut emitted = false;
+    let flow = resolve_node_sink::<S>(
+        left,
+        value,
+        trackable,
+        snapshot,
+        frame,
+        keep,
+        &mut |branch| {
+            if !branch.value.is_truthy() {
+                return Demand::Continue;
+            }
+            emitted = true;
+            sink(branch)
+        },
+    );
+    match flow {
+        ResolveFlow::Exhausted if !emitted => {
+            resolve_node_sink::<S>(right, value, trackable, snapshot, frame, keep, sink)
+        }
+        other => other,
+    }
+}
+
+/// Flatten path components into one `Expr`, using `Expr::Pipe` only when
+/// there is more than one — the empty path is `Expr::Identity`. The one
+/// definition of that rule; [`wrap_optional_branch`], [`assemble_one_branch`]
+/// and `resolve_dynamic_indexes`'s own `append_trailing` all delegate to it
+/// rather than repeating the 0/1/N match independently.
+fn flatten_components(components: Vec<Expr>) -> Expr {
+    match components.len() {
+        0 => Expr::Identity,
+        1 => components.into_iter().next().expect("len checked"),
+        _ => Expr::Pipe(components),
+    }
+}
+
 /// Wrap a resolved branch's path in `Expr::Optional`, marking it as reached
 /// through a `?` — see [`resolve_optional_sink`]. Wrapping in `?` navigates
 /// nothing, so it neither grants nor removes trackability, nor, for the
@@ -28427,9 +28440,10 @@ fn wrap_optional_branch(branch: PathBranch<'_>) -> PathBranch<'_> {
         snapshot,
         register,
     } = branch;
-    let components = components.to_vec();
-    let inner_path = if components.len() == 1 {
-        components.into_iter().next().expect("len checked")
+    // `depth()`/`last()` are O(1); the O(depth) `to_vec()` flatten only runs
+    // in the `depth() != 1` arm, which is unreached *today* (see below).
+    let inner_path = if components.depth() == 1 {
+        components.last().expect("depth checked").clone()
     } else {
         // Unreached *today*, and deliberately not a panic: the postfix `?`
         // attaches to a single path element until #367, so `(.a.b)?`,
@@ -28440,7 +28454,7 @@ fn wrap_optional_branch(branch: PathBranch<'_>) -> PathBranch<'_> {
         // and jq writes `{"a":{"b":5},"k":"b"}` for it. `eval_generic` can
         // synthesize `Expr::Optional` around any expression too, so this
         // was never an invariant of the type.
-        Expr::Pipe(components)
+        flatten_components(components.to_vec())
     };
     PathBranch {
         path: PathPrefix::from_components([Expr::Optional(Box::new(inner_path))]),
@@ -30016,13 +30030,22 @@ struct FoldSourceAmbient<'v> {
     /// The frame `value` sits in (#2042): the fold's own for the document
     /// ambient, unknown for the later forks' `null`.
     frame: Frame,
+}
+
+impl FoldSourceAmbient<'_> {
     /// Whether a trackable SOURCE branch's own path is *relative to*
-    /// `reg.path` rather than absolute, so [`drive_fold_source`] has to
-    /// rebase it (its `relocate_base`). Only ever `true` on a `null`-ambient fork whose
-    /// register sits somewhere other than the root -- on the first fork the
-    /// ambient is the document itself, which is only ever at the register
-    /// when the register is the root.
-    relocate: bool,
+    /// `reg_path` rather than absolute, so [`drive_fold_source`] has to
+    /// rebase it. Only ever true on a `null`-ambient fork whose register
+    /// sits somewhere other than the root -- on the first fork the ambient
+    /// is the document itself, which is only ever at the register when the
+    /// register is the root, so `trackable && reg_path.depth() > 0` is
+    /// false there by construction (a trackable first-fork ambient implies
+    /// `reg_path` is already the root). Derived here rather than stored on
+    /// the struct, so [`fold_source_ambient`]'s two constructors can't drift
+    /// out of sync with it.
+    fn relocate_base<'r>(&self, reg_path: &'r Rc<PathPrefix>) -> Option<&'r Rc<PathPrefix>> {
+        (self.trackable && reg_path.depth() > 0).then_some(reg_path)
+    }
 }
 
 /// Which `.` a fold's SOURCE sees on INIT fork `fork_index`, and whether
@@ -30102,7 +30125,6 @@ fn fold_source_ambient<'v>(
             trackable: source_trackable,
             snapshot: source_snapshot,
             frame: frame.clone(),
-            relocate: false,
         };
     }
     // A later fork's ambient is `null`, so `branch_provenance`'s
@@ -30118,7 +30140,6 @@ fn fold_source_ambient<'v>(
         trackable: at_register,
         snapshot: Snapshot::No,
         frame: frame.unknown(),
-        relocate: at_register && reg.path.depth() > 0,
     }
 }
 
@@ -30206,7 +30227,7 @@ fn resolve_reduce<'a, S: EvalSemantics>(
             snapshot,
             frame,
         );
-        let relocate_base = ambient.relocate.then_some(&reg.path);
+        let relocate_base = ambient.relocate_base(&reg.path);
 
         // `Option`, not a bare `OwnedValue`, mirroring `eval_reduce`'s own
         // accumulator exactly: a step whose UPDATE produces zero outputs
@@ -30445,7 +30466,7 @@ fn resolve_foreach<'a, S: EvalSemantics>(
             snapshot,
             frame,
         );
-        let relocate_base = ambient.relocate.then_some(&reg.path);
+        let relocate_base = ambient.relocate_base(&reg.path);
 
         // `state`'s own provenance (#1590), mirroring `resolve_reduce`'s
         // `acc_at_register`/`acc_snapshot` exactly — see `FoldRegister::resolve`'s
@@ -33115,11 +33136,7 @@ fn assemble_one_branch(branch: &PathBranch<'_>) -> Expr {
         .into_iter()
         .map(strip_resolved_optional)
         .collect();
-    match components.len() {
-        0 => Expr::Identity,
-        1 => components.into_iter().next().expect("len checked"),
-        _ => Expr::Pipe(components),
-    }
+    flatten_components(components)
 }
 
 /// Resolve a top-level path expression and raise on the first branch that
@@ -33466,10 +33483,7 @@ fn resolve_dynamic_indexes<S: EvalSemantics>(
             other => vec![other],
         };
         components.extend(trailing.iter().cloned());
-        match components.len() {
-            1 => components.into_iter().next().expect("len checked"),
-            _ => Expr::Pipe(components),
-        }
+        flatten_components(components)
     }
 
     // The document `path()`/`=`/`|=`/`del()` were actually called on is

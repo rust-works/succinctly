@@ -1406,7 +1406,7 @@ fn test_write_clobber_through_a_static_optional_comma_raises_instead_of_swallowi
 /// `[recurse(.a?)]`) queues a null child like any other value instead of
 /// filtering it out, so it is no longer bounded by pruning — it runs to its
 /// own 10,000-item `MAX_ITEMS` cutoff and emits the root followed by 9,999
-/// nulls. `resolve_recurse` (the path-tracking evaluator behind
+/// nulls. `resolve_recurse_sink` (the path-tracking evaluator behind
 /// `path(recurse(f) | ...)`) still has to prune the null child instead: its
 /// queue holds `(path, value)` pairs, so running it to the same cutoff would
 /// grow the path prefix by one component every round — quadratic, and
@@ -1424,7 +1424,7 @@ fn test_recurse_over_a_null_producing_filter() {
     let expected_out = format!("[{}]", values.join(","));
     check(doc, r"[recurse(.a?)]", Outcome::values(&[&expected_out]));
 
-    // `resolve_recurse` prunes the null child and stops after one output.
+    // `resolve_recurse_sink` prunes the null child and stops after one output.
     check(
         doc,
         r"[path(recurse(.a?) | objects | .[.k]?)]",
@@ -1435,7 +1435,7 @@ fn test_recurse_over_a_null_producing_filter() {
 /// The three parameterised `recurse` spellings, which
 /// `test_multi_output_path_components_fan_out` exercises only in its bare
 /// `recurse` form. Bare `recurse` is `..` and shares its resolver; these do
-/// not, because `f` is arbitrary — `resolve_recurse` re-implements
+/// not, because `f` is arbitrary — `resolve_recurse_sink` re-implements
 /// `builtin_recurse_f`/`builtin_recurse_cond`'s queue in order to thread path
 /// components alongside each value, so the thing worth pinning is that it
 /// still visits what those two visit.
@@ -1443,7 +1443,7 @@ fn test_recurse_over_a_null_producing_filter() {
 /// It does not follow them in *every* respect, and the difference is
 /// deliberate: when `f` yields an array those two descend into its elements
 /// (an artefact of collapsing a stream into one array), where jq and the
-/// resolver both stop at the array. See `resolve_recurse`'s own note.
+/// resolver both stop at the array. See `resolve_recurse_sink`'s own note.
 #[test]
 fn test_recurse_variants_fan_out_like_their_value_paths() {
     let doc = r#"{"x":{"k":"v","v":1},"y":{"k":"w","w":2}}"#;

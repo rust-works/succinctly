@@ -919,6 +919,7 @@ Five residual divergences remain in this area:
   it cannot stop the fold (`[limit(1; path(foreach (1 as $x ?// $y | (stderr|1)) as $v (.;
   .)))]` is `[[],[]]` with two writes in jq — its `limit` break is retried by the source's
   `?//` and the retried output lands past the bound — and `[[]]` with one write here).
+  Tracked as [#2694](https://github.com/rust-works/succinctly/issues/2694).
 - **`recurse(f)`/`recurse(f; cond)` still collects one node's own `f` in full.**
   `resolve_recurse_sink` (#2235) streams each visited node to a bounded consumer as soon as
   it is popped, and defers `f`/`cond` for a node until its own delivery is accepted — so
@@ -931,7 +932,10 @@ Five residual divergences remain in this area:
   `.a` only in jq (the bound is satisfied by `.a`'s own self-emission before `.b` is ever
   asked for); both fire here. Same underlying cause as the bullet above — `resolve_against_cow`
   has no sink form either — narrower in practice since it only over-fires a node's own
-  later `f` outputs, not an entire subtree.
+  later `f` outputs, not an entire subtree. Tracked as
+  [#2693](https://github.com/rust-works/succinctly/issues/2693). Bare `..`/`recurse`, which
+  predates #2235 and was not part of that migration at all, has the same gap one level up —
+  tracked separately as [#2696](https://github.com/rust-works/succinctly/issues/2696).
 - **`E[K]` evaluates its target once where jq re-runs it per key.** jq compiles `E[K]` as
   `K as $k | E | .[$k]`, so a side effect in `E` fires once per output of `K`; here it fires
   once total — `[(.[] | stderr)[("a","b")]?]` on `[1,2]` writes `1212` in jq and `12` here.
