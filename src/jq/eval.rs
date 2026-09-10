@@ -28565,6 +28565,86 @@ fn navigation_element(component: &Expr) -> Option<OwnedValue> {
     }
 }
 
+/// How a builtin navigates *its own input*, for the untracked-value check
+/// in [`resolve_leaf`] (#2646).
+enum BuiltinNavigation {
+    /// Indexes one element, like `.[k]` — carries the `k` jq names.
+    Access(OwnedValue),
+    /// Iterates, like `.[]`.
+    Iterate,
+}
+
+/// The navigation a builtin performs on its input before anything else, or
+/// `None` if it performs none (#2646).
+///
+/// jq defines a family of builtins *in jq itself*, in terms of ordinary
+/// navigation — `first` is `.[0]`, `last` is `.[-1]`, `add` is
+/// `reduce .[] as $x ...`. Inside `path()`, that internal navigation is
+/// subject to the same rule as one the user wrote: applied to a value the
+/// resolver is not tracking, it raises rather than producing a path. This
+/// is the [`navigation_element`] question for a builtin, and the answer
+/// feeds the same two error constructors.
+///
+/// **Membership is decided by jq's own implementation, not by whether the
+/// builtin "looks like" it reads a container**, and the two are not the
+/// same set: `sort`, `min`, `max`, `group_by`, `to_entries`, `keys`,
+/// `has`, `getpath` and `tostream` all read their input and all answer
+/// `[]` here, because jq implements them in C, where no jq-level
+/// navigation ever happens. `unique` raises only because it is *defined*
+/// as `group_by(.) | map(.[0])`. Every entry below, and every one of those
+/// negatives, was captured live from jq 1.7.1 via
+/// `[path(([1] | X) | empty)]` — see `tests/jq_cli_tests.rs`'
+/// `test_jq_defined_navigating_builtins_raise_inside_path_2646` and its two
+/// boundary siblings, `test_only_jq_defined_navigators_raise_inside_path_2646`
+/// and `test_navigating_builtins_raise_regardless_of_input_type_2646`.
+///
+/// Two boundaries worth keeping in view when adding to this:
+///
+/// - **Arity changes the answer.** `any`/`any(cond)` iterate their input
+///   and raise; `any(gen; cond)` does not — it iterates `gen`, so
+///   `[1] | any(1;.)` answers `[]` while `[1] | any(true)` raises. If
+///   `any(.[];.)` raises, that is its *argument* navigating, which the
+///   resolver already handles on its own.
+/// - **Some raise against a container this function cannot name.**
+///   `unique`, `unique_by`, `map_values`, `with_entries` and `fromstream`
+///   raise against a *derived* value (`[1] | map_values(.)` reports
+///   `element 0 of [[1],[]]`, the `group_by`/`to_entries` intermediate),
+///   which a static answer here cannot produce. They are deliberately
+///   absent rather than reported with the wrong container — #2743.
+///   `nth(n)`, `reverse` and `indices(i)` are absent for a related reason:
+///   their element depends on an argument or on `length` (and `reverse`
+///   does not raise at all on an empty input), so they need a value this
+///   function is not given — #2744.
+fn builtin_navigation(builtin: &Builtin, value: &OwnedValue) -> Option<BuiltinNavigation> {
+    match builtin {
+        Builtin::First => Some(BuiltinNavigation::Access(OwnedValue::Int(0))),
+        Builtin::Last => Some(BuiltinNavigation::Access(OwnedValue::Int(-1))),
+        Builtin::Add
+        | Builtin::Any
+        | Builtin::AnyF(_)
+        | Builtin::All
+        | Builtin::AllF(_)
+        | Builtin::Flatten
+        | Builtin::FlattenDepth(_)
+        | Builtin::Join(_)
+        | Builtin::Map(_)
+        | Builtin::FromEntries => Some(BuiltinNavigation::Iterate),
+        // The one entry whose answer depends on the *input*, because its
+        // own definition branches on it: `def walk(f): def w: if type ==
+        // "object" then map_values(w) elif type == "array" then map(w)
+        // else . end | f; w;`. Only the array arm reaches a plain `.[]`.
+        // The object arm goes through `map_values`, which reports the
+        // derived `[<input>,[]]` container this function cannot name
+        // (#2743), and a scalar navigates nothing at all, so jq does not
+        // raise there -- `5 | walk(.)` inside `path()` answers `[]`, and
+        // raising "iterate through 5" would be a divergence of its own.
+        Builtin::Walk(_) if matches!(value, OwnedValue::Array(_)) => {
+            Some(BuiltinNavigation::Iterate)
+        }
+        _ => None,
+    }
+}
+
 /// The one error every `recurse`-family spelling raises against an
 /// untracked value (#843) — see the doc comment on `resolve_node`'s shared
 /// guard arm for `RecursiveDescent`/`Recurse`/`RecurseDown`/`RecurseF`/
@@ -28607,6 +28687,28 @@ fn resolve_leaf<'a, S: EvalSemantics>(
                 Vec::new(),
                 EvalError::invalid_path_expression_near_access(&element, value).into(),
             ));
+        }
+        // #2646: the same check for a builtin jq defines *in jq*, in terms
+        // of navigation it performs on its own input -- `first` is `.[0]`,
+        // `add` is `reduce .[] as $x ...`. Without this the builtin is just
+        // an opaque value-producing filter, so the branch goes untracked
+        // and a continuation that emits nothing (`| empty`, `| select(false)`)
+        // leaves nothing for `resolve_terminal` to object to: `path(([1] |
+        // first) | empty)` answered `[]`, and `del(([1] | first) | empty)`
+        // returned the document unchanged at exit 0, where jq raises. See
+        // [`builtin_navigation`] for what is in the set and why.
+        if let Expr::Builtin(builtin) = expr {
+            if let Some(navigation) = builtin_navigation(builtin, value) {
+                let error = match navigation {
+                    BuiltinNavigation::Access(element) => {
+                        EvalError::invalid_path_expression_near_access(&element, value)
+                    }
+                    BuiltinNavigation::Iterate => {
+                        EvalError::invalid_path_expression_near_iterate(value)
+                    }
+                };
+                return Err((Vec::new(), error.into()));
+            }
         }
         // `.` alone performs no navigation at all, so it is exempt from the
         // `is_primitive` gate just below (which requires `trackable`, for
@@ -84584,17 +84686,44 @@ mod tests {
     /// all, and jq still refuses, because `first`'s own body is the `.[0]`
     /// that moves the register.
     #[test]
+    /// #2646 sharpened four of these five. `cannot_move_register` made them
+    /// *refuse*, which is what this test was written to pin, but with the
+    /// generic "with result" wording; the builtin rows now raise at the
+    /// navigation itself and match jq's message exactly, so each row asserts
+    /// its own wording rather than merely "some path error". The `def f: .a`
+    /// row keeps the generic wording, in jq too -- a user-defined body is
+    /// not in `builtin_navigation`'s table, and jq reports it the same way.
     fn test_path_register_dropped_across_opaque_navigating_stage_1573() {
-        for filter in [
-            r"path(. as $x | (def f: .a; f) | $x)",
-            r"path(. as $x | ([.a]|first) | $x)",
-            r"path(. as $x | ([1]|first) | $x)",
-            r"path(. as $x | ([.a]|add) | $x)",
-            r"path(. as $x | ([.a]|first) | 5 | $x)",
+        for (filter, message) in [
+            (
+                r"path(. as $x | (def f: .a; f) | $x)",
+                r#"Invalid path expression with result {"a":{"b":1},"c":{"b":1}}"#,
+            ),
+            (
+                r"path(. as $x | ([.a]|first) | $x)",
+                r#"Invalid path expression near attempt to access element 0 of [{"b":1}]"#,
+            ),
+            (
+                r"path(. as $x | ([1]|first) | $x)",
+                r"Invalid path expression near attempt to access element 0 of [1]",
+            ),
+            (
+                r"path(. as $x | ([.a]|add) | $x)",
+                r#"Invalid path expression near attempt to iterate through [{"b":1}]"#,
+            ),
+            (
+                r"path(. as $x | ([.a]|first) | 5 | $x)",
+                r#"Invalid path expression near attempt to access element 0 of [{"b":1}]"#,
+            ),
         ] {
             query!(br#"{"a":{"b":1},"c":{"b":1}}"#, filter,
                 QueryResult::Error(e) => {
-                    assert!(e.is_invalid_path_expression(), "{filter}: {}", e.message);
+                    assert!(
+                        e.is_invalid_path_expression() || e.is_untracked_navigation_error(),
+                        "{filter}: {}",
+                        e.message
+                    );
+                    assert_eq!(e.message, message, "{filter}");
                 }
             );
         }
