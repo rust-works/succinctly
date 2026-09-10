@@ -38993,6 +38993,18 @@ fn walk_pipe<'v, S: EvalSemantics>(
     // Exactly the shape `eval_generic.rs`'s twin `path_walk_pipe_generic`
     // already uses, and for the reason its own comment gives: never un-emit
     // an output already produced.
+    //
+    // Two consequences worth knowing before touching this. The inner `?`
+    // makes a failure while walking `rest` for an *earlier* position win
+    // over `stepped` -- correct, since it comes first in generator order,
+    // and it changes the reported *message*, not just whether a prefix
+    // appears (`path((.a[] | .b) | .c[0:1])` on `{"a":[{"b":5},7]}` reports
+    // the `.c` failure, where propagating `stepped` first reported the `.b`
+    // one). And this function has no depth guard of its own: it relies on
+    // the `assert_value_tree_depth` at the top of `walk_path`, which it
+    // calls once per stage before recursing. The twin carries its own at
+    // entry -- an early return added *above* the `walk_path` call here would
+    // bypass the guard entirely.
     let mut reached = Vec::new();
     let stepped = walk_path::<S>(first, value, current_path, &mut reached, optional);
     for (path, val) in reached {

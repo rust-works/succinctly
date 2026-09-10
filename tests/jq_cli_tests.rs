@@ -43194,6 +43194,103 @@ fn test_path_emits_nothing_when_the_failing_stage_reached_nothing_2680() -> Resu
     Ok(())
 }
 
+/// #2680, the subtlest consequence: when stage 1 fails *and* a later stage
+/// fails for an earlier position, the later error wins -- it comes first in
+/// jq's generator order. The reported *message* therefore changed, not just
+/// whether a prefix appears: `main` reported stage 1's `"b"` error, jq and
+/// this report `rest`'s `"c"` one.
+///
+/// This is what the inner loop's `?` buys, and nothing pinned it. Captured
+/// live from jq 1.7.1.
+#[test]
+fn test_path_reports_the_earlier_failure_when_both_stages_fail_2680() -> Result<()> {
+    // `.a[0].b` is 5, so stage 1 succeeds there and `.c` fails on it;
+    // `.a[1]` is 7, so stage 1 itself fails there. `rest`'s failure is
+    // earlier, so it is the one reported.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path((.a[] | .b) | .c[0:1])"],
+        Some(r#"{"a":[{"b":5},7]}"#),
+    )?;
+    assert_ne!(code, 0, "stdout {stdout:?}");
+    assert!(
+        stderr.contains(r#"Cannot index number with string "c""#),
+        "the later stage's error must win, got: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains(r#"Cannot index number with string "b""#),
+        "stage 1's own error must not be the one reported: {stderr:?}"
+    );
+
+    // Stage 1 reaching two positions, the *second* of which fails in `rest`:
+    // the first still emits, then that failure is reported.
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "path((.a[] | .b) | .c[0:1])"],
+        Some(r#"{"a":[{"b":{}},{"b":5},7]}"#),
+    )?;
+    assert_ne!(code, 0, "stdout {stdout:?}");
+    assert_eq!(
+        stdout.trim_end(),
+        r#"["a",0,"b","c",{"start":0,"end":1}]"#,
+        "the position reached before either failure must still be emitted"
+    );
+    assert!(
+        stderr.contains(r#"Cannot index number with string "c""#),
+        "{stderr:?}"
+    );
+    Ok(())
+}
+
+/// #2680: the one *write* whose output moved. `setpath` consumes `path()`'s
+/// output, so a path that was previously dropped now reaches it and the
+/// write happens -- which is what jq does, since jq produced that path all
+/// along. Pinned because "a write appears where none did" is the kind of
+/// change that should never be inferred from a diff alone.
+///
+/// The write machinery itself (`del`/`=`/`|=`, via `set_path`/`update_path`/
+/// `delete_at_path`) is untouched by #2680 and its own behaviour is
+/// unchanged; only paths arriving *through* `path()` moved.
+#[test]
+fn test_path_prefix_reaches_setpath_2680() -> Result<()> {
+    let (stdout, stderr, code) = run_jq_full(
+        &["-c", "setpath(path((.a[] | .b) | .c); 9)"],
+        Some(r#"{"a":[{"b":{}},5]}"#),
+    )?;
+    assert_ne!(code, 0, "stdout {stdout:?}");
+    assert_eq!(
+        stdout.trim_end(),
+        r#"{"a":[{"b":{"c":9}},5]}"#,
+        "the recovered path must reach the write, as it does in jq"
+    );
+    assert!(
+        stderr.contains(r#"Cannot index number with string "b""#),
+        "{stderr:?}"
+    );
+    Ok(())
+}
+
+/// #2680's largest user-visible consequence: a truncating consumer now
+/// *succeeds*. `first` takes the recovered prefix and stops before the
+/// element that would have failed, so the program exits 0 with output where
+/// it previously exited 5 with none. jq 1.7.1 exits 0 here too.
+#[test]
+fn test_path_prefix_lets_a_truncating_consumer_succeed_2680() -> Result<()> {
+    for filter in [
+        "first(path((.a[] | .b) | .c[0:1]))",
+        "[limit(1; path((.a[] | .b) | .c[0:1]))]",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":[{"b":{}},5]}"#))?;
+        assert_eq!(
+            code, 0,
+            "{filter}: must now succeed, stdout {stdout:?} stderr {stderr:?}"
+        );
+        assert!(
+            stdout.contains(r#"["a",0,"b","c",{"start":0,"end":1}]"#),
+            "{filter}: {stdout:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #2349 control: the same gate's *array* elements must also validate the
 /// leading-comma/duplicate-comma shape (`[1,,2]`), not just the trailing
 /// stray-comma cases above -- a distinct `#1677` check
