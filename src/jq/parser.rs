@@ -2934,8 +2934,12 @@ impl<'a> Parser<'a> {
         if self.mode == ParserMode::Jq {
             return self.wrong_arity_call_from_parsed(start_pos, args);
         }
-        self.expect(expected)?;
-        unreachable!("only called once `peek() != Some(expected)`, so `expect` must fail")
+        // `expect` is guaranteed to fail: every caller checks
+        // `peek() != Some(expected)` before calling. Mapped rather than
+        // followed by an `unreachable!` statement so the never-taken arm is
+        // part of this one expression, exactly as `expect_or_wrong_arity`
+        // writes the identical carve-out just below.
+        self.expect(expected).map(|()| unreachable!())
     }
 
     /// One shared definition of the 7-line argument-boundary checkpoint

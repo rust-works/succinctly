@@ -46673,9 +46673,29 @@ fn test_wrong_arity_resolution_is_unchanged_2686() -> Result<()> {
         // still reach the resolver rather than becoming a syntax error.
         ("range(1;2;3;4).foo", 3, "range/4 is not defined"),
         ("until(1;2;3)[0]", 3, "until/3 is not defined"),
-        // A malformed separator inside the continued argument list keeps
-        // `parse_func_call_or_error`'s own wording.
-        ("until(1;2;3,)", 3, ""),
+        // A malformed separator inside the *continued* argument list -- the
+        // part this fix now parses itself rather than re-parsing -- keeps
+        // `parse_func_call_or_error`'s own wording and position.
+        (
+            "until(1;2;3 4)",
+            3,
+            "expected ';' or ')' in function arguments",
+        ),
+        (
+            "first(1;2 3)",
+            3,
+            "expected ';' or ')' in function arguments",
+        ),
+        (
+            "range(1;2;3;4 5)",
+            3,
+            "expected ';' or ')' in function arguments",
+        ),
+        (
+            "until(1;2;3]",
+            3,
+            "expected ';' or ')' in function arguments",
+        ),
     ] {
         let (_stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
         assert_eq!(code, want_code, "`{filter}`: stderr {stderr:?}");
