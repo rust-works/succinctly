@@ -680,11 +680,13 @@ pub(crate) fn yq_scalar_text_eq<S: EvalSemantics>(
     if S::TAG != EvalTag::Yq || !matches!(op, CompareOp::Eq | CompareOp::Ne) {
         return None;
     }
-    let equal = match (left, right) {
-        (OwnedValue::Array(_) | OwnedValue::Object(_), _)
-        | (_, OwnedValue::Array(_) | OwnedValue::Object(_)) => return None,
-        (OwnedValue::Null, r) => r.is_null(),
-        (l, r) => yq_match_key(&yq_scalar_text::<S>(l), &yq_scalar_text::<S>(r)),
+    let (Some(l), Some(r)) = (yq_scalar_text::<S>(left), yq_scalar_text::<S>(right)) else {
+        return None;
+    };
+    let equal = if left.is_null() {
+        right.is_null()
+    } else {
+        yq_match_key(&l, &r)
     };
     Some(if op == CompareOp::Eq { equal } else { !equal })
 }
@@ -693,10 +695,10 @@ pub(crate) fn yq_scalar_text_eq<S: EvalSemantics>(
 /// node): a string's own contents, borrowed; a number or bool as
 /// [`owned_to_string`] renders it; `null` as the four bytes `null`. Only the
 /// numeric arm allocates, so a string-against-string `==` stays free.
-///
-/// Scalars only -- the caller has already routed containers away.
-fn yq_scalar_text<S: EvalSemantics>(value: &OwnedValue) -> Cow<'_, str> {
-    match value {
+/// `None` for a container, which has no `.Value` and is the caller's cue to
+/// leave the pairing to the structural rule.
+fn yq_scalar_text<S: EvalSemantics>(value: &OwnedValue) -> Option<Cow<'_, str>> {
+    Some(match value {
         OwnedValue::String(s) => Cow::Borrowed(s),
         OwnedValue::Null => Cow::Borrowed("null"),
         OwnedValue::Bool(true) => Cow::Borrowed("true"),
@@ -704,11 +706,8 @@ fn yq_scalar_text<S: EvalSemantics>(value: &OwnedValue) -> Cow<'_, str> {
         OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..) => {
             Cow::Owned(numeric_display_string::<S>(value))
         }
-        OwnedValue::Array(_) | OwnedValue::Object(_) => {
-            unreachable!("yq_scalar_text_eq routes containers to the structural rule")
-            // omni-dev: coverage tolerate-line reason="unreachable: the sole caller (`yq_scalar_text_eq`) returns `None` for any container operand before this is called; kept for exhaustiveness (#2785)"
-        }
-    }
+        OwnedValue::Array(_) | OwnedValue::Object(_) => return None,
+    })
 }
 
 /// **The one definition of yq's read-only evaluation context** (#2470),
