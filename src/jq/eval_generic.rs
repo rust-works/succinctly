@@ -7191,11 +7191,9 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // operand for a `needs_path_context` gate to key on, so it fell to
         // the wildcard bridge below unconditionally, paying the same
         // alias-fan-out cost as the ungated `and`/`or` above (#2476). `not`
-        // is exactly the truthiness of `.`, negated, and
-        // `push_generic_truthiness` already computes that truthiness for
-        // the identity result -- so this arm has never needed a validation
-        // call of its own, and since #2692 there is none to make: that
-        // function's `OneCursor` arm reads `is_falsy` and nothing else.
+        // is exactly the truthiness of `.`, negated -- so this arm has never
+        // needed a validation call of its own, and since #2692 there is none
+        // to make.
         //
         // `eval::eval_not`'s own comment argues a container that merely
         // *holds* an undecodable string should answer `false` rather than
@@ -7204,13 +7202,38 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // still raises now (via the same decode, run as a walk instead of
         // a materialization), so this is a faster route to the same
         // raise-set, not a behaviour change.
+        //
+        // The identity result is always exactly one output (`cursor.map_or`
+        // never produces a stream), so this used to route through
+        // `push_generic_truthiness` -- built for genuinely multi-output
+        // streams -- via a `vec_with_capacity(1)`/push/index round-trip to
+        // extract one guaranteed bit. Inlined directly here instead (#2665
+        // item 4): [`cursor_is_truthy`] for the cursor case is the exact
+        // same rule that function's `OneCursor` arm uses, and the `None`
+        // case is the exact same `to_owned`-then-`is_truthy` its `One` arm
+        // uses, with the identical error surfaced the same way
+        // (`partial_generic` on an empty prefix collapses to
+        // `GenericResult::Error` -- see `partial_generic` above).
         Expr::Not => {
-            let identity = cursor.map_or(GenericResult::One(value), GenericResult::OneCursor);
-            let mut bits = vec_with_capacity(1);
-            if let Some(control) = push_generic_truthiness(identity, &mut bits) {
-                return partial_generic(Vec::new(), control);
-            }
-            GenericResult::Owned(OwnedValue::Bool(!bits[0]))
+            let truthy = match cursor {
+                Some(c) => cursor_is_truthy(&c),
+                // STYLE-0012: raises regardless of `optional`, and must --
+                // `not` has never consulted it. Two reasons, either
+                // sufficient. (1) `to_owned` raises only decode failures,
+                // which `suppresses` never suppresses -- routing this would
+                // be a guaranteed no-op, same as the `sort_by`/`unique_by`
+                // family's own `STYLE-0012` note above. (2) Before this
+                // refactor (#2665 item 4) this exact call lived inside
+                // `push_generic_truthiness`, a function with no `optional`
+                // parameter at all to route through; relocating it into this
+                // match does not change what it does with `optional` --
+                // still nothing, then and now.
+                None => match to_owned(&value) {
+                    Ok(v) => v.is_truthy(),
+                    Err(e) => return GenericResult::Error(e),
+                },
+            };
+            GenericResult::Owned(OwnedValue::Bool(!truthy))
         }
 
         // `//` had no native arm at all, so like `Expr::Not` above it fell to
