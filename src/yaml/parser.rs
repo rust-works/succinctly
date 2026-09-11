@@ -86,10 +86,14 @@ struct BlockScalarHeader {
 /// Head/line/foot comments attached to one node, keyed by its own bp
 /// position (#798). `head`/`foot` hold zero or more whole comment-only
 /// lines (consecutive lines are one logical block, hence `Vec` rather than
-/// `Option` -- real yq joins them with a newline either way, and #1085
-/// needs more than one comment associated with a single node at all);
-/// `line` is the node's own trailing same-line comment. A node can carry
-/// all three at once.
+/// `Option` -- real yq joins them with a newline either way). `line` is
+/// also a `Vec` (#1085): a mapping key's trailing-comment slot can hold
+/// *two* entries at once -- a comment floated onto it from an earlier
+/// anchor's deferred value, and the key's own genuine same-line comment --
+/// and real yq renders both (the first inline, any more as standalone
+/// lines) rather than letting one silently clobber the other. Every other
+/// node kind still ever gets at most one `line` entry. A node can carry
+/// all three fields at once.
 ///
 /// Every range is raw, `#` included: the reader strips a leading `"# "` at
 /// the point of use, which is what makes `#\ttabbed` and a bare `#` come
@@ -101,10 +105,12 @@ pub struct NodeComments {
     /// the item's content node. See
     /// [`Parser::record_standalone_comment`].
     pub head: Vec<(u32, u32)>,
-    /// The node's own trailing same-line comment: `(start, end)` byte range
-    /// of the raw comment text, starting at `#` and running to end of line
-    /// (exclusive of the line break, inclusive of any trailing whitespace).
-    pub line: Option<(u32, u32)>,
+    /// The node's own trailing same-line comment(s): `(start, end)` byte
+    /// ranges of the raw comment text, each starting at `#` and running to
+    /// end of line (exclusive of the line break, inclusive of any trailing
+    /// whitespace), in source order. See the struct doc comment for why
+    /// this can hold more than one entry (#1085).
+    pub line: Vec<(u32, u32)>,
     /// Standalone `#` lines directly below the node, in source order. See
     /// [`Self::head`].
     pub foot: Vec<(u32, u32)>,
@@ -628,22 +634,35 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
         }
     }
 
+    /// Push `range` onto `owner_bp_pos`'s `line` comments, unless that exact
+    /// range is already present.
+    ///
+    /// Shared by [`Self::maybe_capture_line_comment`] and
+    /// [`Self::take_pending_head_comment`], the two writers of this slot.
+    /// The dedup check is what `entry().or_insert()` used to provide back
+    /// when `line` was a single `Option` slot: a node captured explicitly at
+    /// a more specific point (e.g. a block scalar's header-line comment,
+    /// captured before its content is parsed) must never see a duplicate
+    /// entry from a later, spurious call for the same bp_pos with the same
+    /// range. It does *not* prevent a second, genuinely different range from
+    /// being appended -- that's exactly the #1085 shape this slot exists to
+    /// hold (a floated anchor comment and the node's own comment, in that
+    /// order, at the two mapping-key call sites below).
+    #[inline]
+    fn push_line_comment(&mut self, owner_bp_pos: usize, range: (u32, u32)) {
+        let line = &mut self.comments.entry(owner_bp_pos).or_default().line;
+        if !line.contains(&range) {
+            line.push(range);
+        }
+    }
+
     /// Capture a trailing same-line comment for `owner_bp_pos`. Callers
     /// still run their own `skip_to_eol`/`skip_newlines` afterward to
     /// actually advance past it.
-    ///
-    /// Uses `entry().or_insert()` rather than unconditional `insert()` so a
-    /// node captured explicitly at a more specific point (e.g. a block
-    /// scalar's header-line comment, captured before its content is parsed)
-    /// is never clobbered by a later, spurious call for the same bp_pos.
     #[inline]
     fn maybe_capture_line_comment(&mut self, owner_bp_pos: usize) {
         if let Some(range) = self.scan_trailing_comment() {
-            self.comments
-                .entry(owner_bp_pos)
-                .or_default()
-                .line
-                .get_or_insert(range);
+            self.push_line_comment(owner_bp_pos, range);
         }
     }
 
@@ -968,22 +987,31 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
     /// the anchor's own empty value instead of floating to the next
     /// sibling, matching real yq's own behavior.
     ///
-    /// **Ordering matters**: always call this *after* any ordinary
-    /// same-line capture for the same `owner_bp_pos` has already had its
-    /// chance to run (e.g. after `maybe_capture_line_comment`/
-    /// `set_bp_text_end`'s own call for that bp), never before. Both use the
-    /// same "leave an existing slot alone" idiom, so whichever runs first
-    /// wins the slot — calling this first would silently destroy a node's
-    /// own genuine trailing comment in favor of an unrelated floated one
-    /// instead of just leaving the floated one to be dropped (#784 review).
+    /// **Ordering, at the two mapping-key call sites**
+    /// (`parse_mapping_entry`, `parse_compact_mapping_entry`): call this
+    /// *before* the paired `maybe_capture_line_comment` call for the same
+    /// `owner_bp_pos`, not after. `line` is a `Vec` (#1085) precisely
+    /// because both a floated comment and the key's own genuine comment can
+    /// land on the same key, and real yq renders them in source order --
+    /// the floated one (written on an *earlier* line, by construction: it
+    /// was deferred from an anchor that had to appear before this key ever
+    /// opened) always precedes the key's own. Calling this first yields
+    /// push order `[floated, own]`, matching the oracle
+    /// (`.a.b | key | line_comment` joins them `"floated\nown"`). Getting
+    /// this backwards doesn't lose either comment -- both still end up in
+    /// the `Vec` either way -- but silently renders them in the wrong
+    /// order.
+    ///
+    /// (Historical note: before #1085, `line` was a single `Option` slot and
+    /// this function had to run *after* `maybe_capture_line_comment` so a
+    /// genuine same-line comment would win the only slot rather than being
+    /// clobbered by an unrelated floated one -- #784 review. `push_line_comment`
+    /// no longer clobbers anything, so that constraint is gone; only the
+    /// output *order* depends on call order now.)
     #[inline]
     fn take_pending_head_comment(&mut self, owner_bp_pos: usize) {
         if let Some(range) = self.pending_head_comment.take() {
-            self.comments
-                .entry(owner_bp_pos)
-                .or_default()
-                .line
-                .get_or_insert(range);
+            self.push_line_comment(owner_bp_pos, range);
         }
     }
 
@@ -3075,26 +3103,27 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 // primary node opens.
                 self.defer_line_comment();
             } else {
-                // No anchor - a trailing comment here is this key's own
-                // (issue #765) - `self.last_open_bp_pos` still holds the key
-                // node's bp_pos here since no value node has been opened yet
-                // (nothing opens a BP node between the key's own close above
-                // and this point). This mirrors `parse_mapping_entry`'s
+                // A trailing comment here is this key's own (issue #765) -
+                // `self.last_open_bp_pos` still holds the key node's bp_pos
+                // here since no value node has been opened yet (nothing
+                // opens a BP node between the key's own close above and
+                // this point). This mirrors `parse_mapping_entry`'s
                 // identical capture just below - missing here left a
                 // block-sequence item's *first* field (the only mapping
                 // entry parsed by this function rather than
                 // `parse_mapping_entry`) silently dropping its own key
                 // comment (#785).
                 //
-                // Falls back to a comment an *earlier*, unrelated anchor's
-                // deferred value floated onto this key (#784) only if this
-                // key's own line had nothing of its own - run the fallback
-                // second so a genuine same-line comment always wins the slot
-                // (#1081 review: consuming a floated comment eagerly at
-                // key-open, before this real capture had a chance to run,
-                // silently destroyed it).
-                self.maybe_capture_line_comment(self.last_open_bp_pos);
+                // Also claims a comment an *earlier*, unrelated anchor's
+                // deferred value floated onto this key (#784). `line` is a
+                // `Vec` (#1085): both can coexist, and real yq renders them
+                // in source order (floated, then this key's own), which is
+                // why `take_pending_head_comment` runs *first* here - see
+                // its own doc comment for the ordering rationale (this used
+                // to run second, to protect a single `Option` slot; that
+                // constraint no longer applies).
                 self.take_pending_head_comment(self.last_open_bp_pos);
+                self.maybe_capture_line_comment(self.last_open_bp_pos);
             }
             self.skip_to_eol();
 
@@ -3312,20 +3341,21 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 return Ok(());
             }
             // Value is on next line - check what kind of value. Capture a
-            // trailing comment on the key's own line first (issue #765) -
+            // trailing comment on the key's own line (issue #765) -
             // `self.last_open_bp_pos` still holds the key node's bp_pos here
             // since no value node has been opened yet (nothing opens a BP
             // node between the key's own close above and this point).
             //
-            // Falls back to a comment an *earlier*, unrelated anchor's
-            // deferred value floated onto this key (#784) only if this
-            // key's own line had nothing of its own - run the fallback
-            // second so a genuine same-line comment always wins the slot
-            // (#1081 review: consuming a floated comment eagerly at
-            // key-open, before this real capture had a chance to run,
-            // silently destroyed it).
-            self.maybe_capture_line_comment(self.last_open_bp_pos);
+            // Also claims a comment an *earlier*, unrelated anchor's
+            // deferred value floated onto this key (#784). `line` is a
+            // `Vec` (#1085): both can coexist, and real yq renders them in
+            // source order (floated, then this key's own), which is why
+            // `take_pending_head_comment` runs *first* here - see its own
+            // doc comment for the ordering rationale (this used to run
+            // second, to protect a single `Option` slot; that constraint no
+            // longer applies).
             self.take_pending_head_comment(self.last_open_bp_pos);
+            self.maybe_capture_line_comment(self.last_open_bp_pos);
             self.skip_to_eol();
 
             // Look ahead to see what the next content line looks like

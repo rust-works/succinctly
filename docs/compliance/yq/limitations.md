@@ -3698,8 +3698,10 @@ Float and number formatting ([#1071](https://github.com/rust-works/succinctly/is
 (succinctly's previews format via jq's rules rather than yq's verbatim echo —
 [#1055](https://github.com/rust-works/succinctly/issues/1055)), comment placement
 ([#1079](https://github.com/rust-works/succinctly/issues/1079),
-[#1080](https://github.com/rust-works/succinctly/issues/1080),
-[#1085](https://github.com/rust-works/succinctly/issues/1085)), and a missing
+[#1080](https://github.com/rust-works/succinctly/issues/1080)) — #1085's streaming/get-form
+gap (a floated anchor comment and a key's own comment couldn't coexist) is fixed; its
+DOM/write-form half (`-P` and every write form still show only one) is tracked separately as
+[#2806](https://github.com/rust-works/succinctly/issues/2806) — and a missing
 explicit-tag slot: `OwnedValue` has no field for it, so any
 computed/constructed value — including an object-slice result (#1102) — loses the source
 node's `!!map`/`!!seq` tag and quoting style in YAML output (`{"a":1,"b":2} | yq

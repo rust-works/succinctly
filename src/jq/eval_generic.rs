@@ -18524,10 +18524,25 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             GenericResult::Owned(OwnedValue::String(style.to_string()))
         }
 
+        // The primary (first) entry keeps the strict, UTF-8-checked path
+        // unchanged -- every pre-#1085 case has at most one entry, so this
+        // preserves #797's invalid-UTF-8 error behavior exactly. A mapping
+        // key can hold a second entry (#1085: a comment floated onto it
+        // from an earlier anchor's deferred value, plus its own genuine
+        // comment); any entries past the first are joined on tolerantly,
+        // matching `head_comment`/`foot_comment` below rather than erroring
+        // the whole result over a single bad line.
         Builtin::LineComment => match cursor.map(|c| c.line_comment_checked()) {
             Some(Err(_)) => GenericResult::Error(EvalError::invalid_utf8_in_comment()),
-            Some(Ok(comment)) => {
-                GenericResult::Owned(OwnedValue::String(comment.unwrap_or_default()))
+            Some(Ok(first)) => {
+                let mut joined = first.unwrap_or_default();
+                if let Some(c) = cursor {
+                    for extra in c.line_comments().into_iter().skip(1) {
+                        joined.push('\n');
+                        joined.push_str(&extra);
+                    }
+                }
+                GenericResult::Owned(OwnedValue::String(joined))
             }
             None => GenericResult::Owned(OwnedValue::String(String::new())),
         },
