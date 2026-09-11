@@ -27947,6 +27947,77 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
             resolve_nth_sink::<S>(n, expr, value, trackable, snapshot, frame, keep, sink)
         }
 
+        // #2689: array construction on an *untracked* input. jq's `[f]`
+        // (`gen_collect`) runs `f` with path tracking live -- unlike `{k:f}`,
+        // `if f`, `select(f)`, `try f`, an `as` source or `"\(f)"`, all of
+        // which suspend it -- so an INDEX/EACH inside the brackets on a value
+        // that is not `value_at_path` raises exactly as it would as a bare
+        // stage. Left to `resolve_leaf`'s catch-all, `[.a]` was evaluated
+        // *by value*: the `.a` inside succeeded, the array came back
+        // untracked, and a continuation that emitted nothing left nothing for
+        // `resolve_terminal` to object to. `path(1 | [.[]?] | empty)` and
+        // `path(. as {a:$v} | [.a] | ($v.b?) as $w | $w)` answered nothing at
+        // exit 0, and `del(...)` of the latter returned the document
+        // unchanged, where jq raises "near attempt to access element "a"" --
+        // the same accept-where-jq-refuses shape as #2646, on a leaf its
+        // static table cannot express because `inner` is arbitrary code.
+        //
+        // Resolving `inner` instead of evaluating it is what surfaces that
+        // navigation: the inner `Field`/`Index`/`Iterate`/`RecursiveDescent`
+        // arms already raise jq's exact wording against an untracked input,
+        // and a `TrackedVar` marker, a literal or `.` inside the brackets
+        // pass straight through, so `[5]`, `[$v]`, `[$v.b?]` and `[.]` stay
+        // accepted. jq drains the whole collect, so the inner bound is
+        // unlimited whatever the outer `keep` -- `keep` governs how many
+        // *arrays* the consumer wants, and there is exactly one.
+        //
+        // Keyed on `!trackable`: a trackable input (`path([.a] | empty)`,
+        // the plain-`as` control `path(.a as $v | [.a] | ...)`) is untouched
+        // and still takes the catch-all, so the seq-level register handling
+        // (`cannot_move_register`'s own `Array` arm) is unchanged. jq mode
+        // only (ADR-0018): real yq's lexer rejects every shape that reaches
+        // here, so there is no yq oracle, and yq mode keeps `skip_untracked`.
+        //
+        // **Also keyed on the brackets holding no `TrackedVar`.** A marker
+        // can *re-establish* tracking -- `$v` whose frozen value is still the
+        // live register is not navigation, it is the register (#1573) -- but
+        // that comparison happens one level up, in `resolve_seq_stage`,
+        // against a `carried_register` this function is not handed. Resolved
+        // from here with `trackable: false`, `[$v.b?]` saw `$v` as just
+        // another untracked value and refused `.b` on it, where jq (and the
+        // catch-all, by value) accepts. So the marker case keeps the
+        // catch-all, exactly as before; only pure navigation on the ambient
+        // input is intercepted. Re-establishment inside the brackets needs
+        // the register threaded down, which is #2759.
+        Expr::Array(inner)
+            if S::TAG == EvalTag::Jq
+                && !trackable
+                && !any_subexpr(inner, &mut |e| matches!(e, Expr::TrackedVar(_))) =>
+        {
+            let mut items = Vec::new();
+            let flow = resolve_node_sink::<S>(
+                inner,
+                value,
+                false,
+                snapshot,
+                frame,
+                Keep::AtMost(usize::MAX),
+                &mut |branch| {
+                    items.push(branch.value.into_owned());
+                    Demand::Continue
+                },
+            );
+            match flow {
+                ResolveFlow::Escaped(escape) => ResolveFlow::Escaped(escape),
+                ResolveFlow::Exhausted | ResolveFlow::Stopped => {
+                    match sink(PathBranch::untracked(Cow::Owned(OwnedValue::Array(items)))) {
+                        Demand::Continue => ResolveFlow::Exhausted,
+                        Demand::Stop => ResolveFlow::Stopped,
+                    }
+                }
+            }
+        }
+
         // Every remaining shape still resolves eagerly and reaches the sink
         // through `drain_path_result`, which is byte-identical to the eager
         // result for an always-`Continue` sink -- so this is a missed

@@ -43311,6 +43311,120 @@ fn test_path_prefix_lets_a_truncating_consumer_succeed_2680() -> Result<()> {
     Ok(())
 }
 
+/// #2689: an array constructor on an **untracked** input resolves its
+/// inside, so navigation within the brackets is refused as jq refuses it.
+///
+/// jq's `[f]` runs `f` with path tracking live (unlike `{k:f}`, `if f`,
+/// `select(f)`, `try f`, an `as` source, or `"\(f)"`, which all suspend
+/// it). Left to the evaluate-by-value catch-all, `[.a]` on a constructed
+/// value succeeded silently, and a continuation that emitted nothing left
+/// nothing to object to -- the same accept-where-jq-refuses shape as
+/// #2646, on a leaf a static table cannot express.
+///
+/// The issue reported this through a destructuring `as {a:$v}`, but the
+/// destructuring is not the cause -- it only supplies an untracked ambient
+/// value. The first rows below reproduce with no `as` at all. All captured
+/// live from jq 1.7.1.
+#[test]
+fn test_path_refuses_navigation_inside_array_on_untracked_input_2689() -> Result<()> {
+    for (filter, doc, element) in [
+        // no destructuring: the real root cause
+        ("path(1 | [.[]?] | empty)", "null", "iterate through 1"),
+        ("path(1 | [.a?] | empty)", "null", r#"element "a" of 1"#),
+        (
+            "path(. as $x | .a | $x | [.b] | empty)",
+            r#"{"a":1,"b":2}"#,
+            r#"element "b" of {"a":1,"b":2}"#,
+        ),
+        // the issue's own shape
+        (
+            "path(. as {a:$v0} | [.a] | ($v0.b?) as $v1 | $v1)",
+            r#"{"a":false}"#,
+            r#"element "a" of {"a":false}"#,
+        ),
+        // nested brackets, a comma, a pipe, and a postfix index inside
+        (
+            "path(. as {a:$v0} | [[.a]] | empty)",
+            r#"{"a":false}"#,
+            r#"element "a" of {"a":false}"#,
+        ),
+        (
+            "path(. as {a:$v0} | [.a, .b] | empty)",
+            r#"{"a":false}"#,
+            r#"element "a" of {"a":false}"#,
+        ),
+        (
+            "path(. as {a:$v0} | [.a][0] | empty)",
+            r#"{"a":false}"#,
+            r#"element "a" of {"a":false}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_ne!(code, 0, "{filter} on {doc}: stdout {stdout:?}");
+        assert!(
+            stderr.contains("Invalid path expression near attempt to "),
+            "{filter} on {doc}: {stderr:?}"
+        );
+        assert!(stderr.contains(element), "{filter} on {doc}: {stderr:?}");
+    }
+    Ok(())
+}
+
+/// #2689 seen from the side that does damage: `del()` and `=` consume the
+/// same resolution, so the missing refusal was a **refused edit reported as
+/// a successful no-op** -- the document came back unchanged at exit 0 where
+/// jq exits 5. Captured live from jq 1.7.1.
+#[test]
+fn test_write_refuses_navigation_inside_array_on_untracked_input_2689() -> Result<()> {
+    for filter in [
+        "del(. as {a:$v0} | [.a] | ($v0.b?) as $v1 | $v1)",
+        "del(. as {a:$v0} | [.a] | select(false))",
+        "(. as {a:$v0} | [.a] | select(false)) = 1",
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(r#"{"a":false}"#))?;
+        assert_ne!(
+            code, 0,
+            "{filter}: must refuse, not no-op; stdout {stdout:?}"
+        );
+        assert!(
+            stderr.contains(r#"near attempt to access element "a" of {"a":false}"#),
+            "{filter}: {stderr:?}"
+        );
+        assert_eq!(stdout.trim_end(), "", "{filter}: nothing written");
+    }
+    Ok(())
+}
+
+/// #2689's boundary, so the arm cannot degrade into "refuse every array on
+/// an untracked input". Each row is something jq accepts, and each is
+/// unchanged by the fix -- a trackable input, the plain-`as` control from
+/// the issue, a literal / identity / empty constructor, an object
+/// constructor (which jq evaluates with tracking *suspended*), and a
+/// `TrackedVar` inside the brackets, which the arm deliberately hands back to
+/// the catch-all because re-establishing the register needs machinery it is
+/// not given (#2759). All captured live from jq 1.7.1.
+#[test]
+fn test_array_on_untracked_input_boundary_2689() -> Result<()> {
+    for (filter, doc) in [
+        ("path([.a] | empty)", r#"{"a":false}"#),
+        (
+            "path(.a as $v0 | [.a] | ($v0.b?) as $v1 | $v1)",
+            r#"{"a":false}"#,
+        ),
+        ("path(. as {a:$v0} | [5] | empty)", r#"{"a":false}"#),
+        ("path(. as {a:$v0} | [.] | empty)", r#"{"a":false}"#),
+        ("path(. as {a:$v0} | [] | empty)", r#"{"a":false}"#),
+        ("path(. as {a:$v0} | {x:.a} | empty)", r#"{"a":false}"#),
+        ("path(. as {a:$v0} | [$v0] | empty)", r#"{"a":false}"#),
+        ("path(. as {a:$v0} | [$v0.b?] | empty)", r#"{"a":false}"#),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "{filter}: must stay accepted; stderr {stderr:?}");
+        assert_eq!(stdout.trim_end(), "", "{filter}");
+    }
+    Ok(())
+}
+
 /// #2349 control: the same gate's *array* elements must also validate the
 /// leading-comma/duplicate-comma shape (`[1,,2]`), not just the trailing
 /// stray-comma cases above -- a distinct `#1677` check
