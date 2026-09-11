@@ -44,10 +44,10 @@ use indexmap::IndexMap;
 
 use super::document::{
     child_tail_gap_ok, collapsed_fields, collapsed_fields_if, container_tail_gap_ok,
-    effective_fields_checked, effective_fields_with_raw_last, effective_keys,
-    effective_len_checked, empty_elements_tail_gap_ok, empty_fields_tail_gap_ok, key_delimiter_ok,
-    key_display_string, key_display_string_kind, key_is_malformed, resolve_display_key,
-    tail_gap_ok, trailing_element_gap_ok, value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors,
+    effective_fields_checked, effective_fields_with_raw_last, effective_len_checked,
+    empty_elements_tail_gap_ok, empty_fields_tail_gap_ok, key_delimiter_ok, key_display_string,
+    key_display_string_kind, key_is_malformed, resolve_display_key, tail_gap_ok,
+    trailing_element_gap_ok, value_delimiter_ok, DisplayKeyGuard, DistinctKeyCursors,
     DocumentCursor, DocumentElements, DocumentFields, DocumentValue, IndentSpec, JsonConvention,
 };
 use super::error::EvalEscape;
@@ -1697,13 +1697,68 @@ fn materialize_lazy_keys<V: DocumentValue>(
     sorted: bool,
     collapse: bool,
 ) -> Result<OwnedValue, EvalError> {
-    let mut keys = effective_keys(fields, collapse)?;
+    let mut keys = effective_key_values(fields, collapse)?;
     if sorted {
-        keys.sort();
+        keys.sort_by(compare_values);
     }
-    Ok(OwnedValue::Array(
-        keys.into_iter().map(OwnedValue::String).collect(),
-    ))
+    Ok(OwnedValue::Array(keys))
+}
+
+/// The value a mapping key materializes as (#2785): its display string for
+/// every key that can only be a string, and the ordinary scalar resolution
+/// -- `to_owned_cursor`, tag lookup included -- for a key spelled like a
+/// number, bool or null, which real yq keeps as an `!!int`/`!!bool`/
+/// `!!null`/`!!float` node through `key`, `keys` and `to_entries`.
+///
+/// The owned twin of the walk's key-node emission
+/// ([`path_context_item_to_owned`]'s `OneCursorValue` arm): both take the
+/// string straight from `key_display_string_kind` unless
+/// [`key_spelling_may_retype`] says the ladder could change it, so the
+/// `as_i64`/`as_f64` parse attempts stay off the common key (#2763's
+/// measured cost). Both also keep a key on the string route when its node
+/// carries an explicit tag, a decode-failure fallback spelling
+/// (#1247/#1642), or is a complex key (which decodes to `""`) -- the three
+/// cases `key_node_spells` refuses a node for.
+///
+/// `None` is `key_display_string`'s own `None`: a key the format's grammar
+/// rejects outright (#1194), which the caller raises on.
+pub(crate) fn key_owned_value<V: DocumentValue, C: DocumentCursor>(
+    key: &V,
+    key_cursor: &C,
+) -> Result<Option<OwnedValue>, EvalError> {
+    let Some((display, is_fallback)) = key_display_string_kind(key) else {
+        return Ok(None);
+    };
+    if is_fallback || !key_spelling_may_retype(&display) || key_cursor.explicit_tag().is_some() {
+        return Ok(Some(OwnedValue::String(display.into_owned())));
+    }
+    to_owned_cursor(key_cursor).map(Some)
+}
+
+/// [`effective_keys`](super::document::effective_keys) with each key
+/// materialized through [`key_owned_value`] instead of as its display
+/// string -- the same `DistinctKeyCursors` walk and the same three
+/// malformed-member checks, so `keys` cannot accept an object `keys_unsorted`
+/// refuses.
+fn effective_key_values<F: DocumentFields>(
+    fields: &F,
+    collapse: bool,
+) -> Result<Vec<OwnedValue>, EvalError> {
+    let mut keys = Vec::new();
+    let mut cursors = DistinctKeyCursors::new(fields, collapse);
+    for (key, cursor) in cursors.by_ref() {
+        let Some(key) = key_owned_value(&key, &cursor)? else {
+            return Err(fields.malformed_member_error());
+        };
+        keys.push(key);
+    }
+    if cursors.is_malformed() {
+        return Err(fields.malformed_member_error());
+    }
+    if !cursors.trailing_gap_ok(b'}') {
+        return Err(fields.malformed_member_error());
+    }
+    Ok(keys)
 }
 
 /// An object's key cursors in document order, with a repeated key dropped
@@ -6097,14 +6152,13 @@ fn each_lazy_keys_iterate_sink<S: EvalSemantics, V: DocumentValue>(
         return flow;
     }
 
-    let mut keys = match effective_keys(fields, collapse) {
+    let mut keys = match effective_key_values(fields, collapse) {
         Ok(keys) => keys,
         Err(e) => return Flow::Escaped(Control::Error(e)),
     };
-    keys.sort();
+    keys.sort_by(compare_values);
     drive_pipe_elements_generic::<S, V>(
-        keys.into_iter()
-            .map(|k| Ok(GenericItem::Owned(OwnedValue::String(k)))),
+        keys.into_iter().map(|k| Ok(GenericItem::Owned(k))),
         rest,
         optional,
         sink,
@@ -15388,30 +15442,32 @@ fn path_context_item_to_owned<V: DocumentValue>(
 ) -> Result<OwnedValue, EvalError> {
     match item {
         GenericItem::OneCursor(c) => to_owned_cursor(&c),
-        // #2763: the *key node* shape, and the one item here that is already
-        // known to be a plain, untagged string -- `key_node_spells` proved
-        // exactly that before emitting it, which is why this can take the
-        // string straight out of the value instead of re-deciding its type.
+        // #2763: the *key node* shape -- an untagged scalar key
+        // `key_node_spells` proved spells its display string. A key that
+        // cannot be anything but a string (`key_spelling_may_retype`) is
+        // taken straight out of the value, because deciding its type is the
+        // expensive part: `to_owned` would run `as_i64`/`as_f64` parse
+        // attempts to prove it is not a number, and `[.[] | key]`
+        // materializes every key it emits, so it would pay that per key.
         //
-        // That matters because deciding it is the expensive part: `to_owned`
-        // would run the same `as_i64`/`as_f64` parse attempts the emission
-        // gate was restructured to avoid, and `to_owned_cursor` would add a
-        // second `value()` plus the tag and canonicalization lookups the gate
-        // already ruled out. `[.[] | key]` materializes every key it emits,
-        // so it pays this per key.
+        // #2785: a key spelled like a number, bool or null is the one that
+        // takes the ladder -- it is a typed node in real yq (`1: x` is an
+        // `!!int` key), and `to_owned_with_cursor` resolves it the same way
+        // the member's *value* would resolve, tag lookup included.
         GenericItem::OneCursorValue(c, v) => match v.as_str() {
-            Some(s) => {
+            Some(s) if !key_spelling_may_retype(&s) => {
                 debug_assert!(
-                    plain_string_value(&v) && c.explicit_tag().is_none(),
+                    c.explicit_tag().is_none(),
                     "the walk emits OneCursorValue only for a key node \
-                     `key_node_spells` proved is a plain untagged string"
+                     `key_node_spells` proved is untagged"
                 );
                 Ok(OwnedValue::String(s.into_owned()))
             }
-            // Unreachable through the gate above; materialized the ordinary
-            // way rather than asserted, so a future walk arm emitting this
-            // shape for something else is merely slower, never wrong.
-            None => to_owned_with_cursor(&v, Some(c)),
+            // A retypable spelling, or (unreachable through the gate above)
+            // a non-string token: materialized the ordinary way rather than
+            // asserted, so a future walk arm emitting this shape for
+            // something else is merely slower, never wrong.
+            _ => to_owned_with_cursor(&v, Some(c)),
         },
         GenericItem::Owned(o) => Ok(o),
         GenericItem::One(_)
@@ -17053,19 +17109,20 @@ fn cursor_slot<C: DocumentCursor>(c: &C) -> Result<Option<CursorSlot<C>>, EvalEr
 }
 
 /// The key node `key` emits for the member value `c` -- its previous sibling
-/// -- when that node is a plain string spelling exactly `expected`, the
+/// -- when that node is a plain scalar spelling exactly `expected`, the
 /// display string the caller already holds for the member (#2763).
 ///
 /// The equality is the self-check that makes the O(1) sibling hop safe to
 /// take without a scan: a node that is not the raw member value, a complex
-/// (`? [a, b]`) key, a key whose bytes do not decode, an explicitly tagged
-/// key, and a *typed* key (`1: x`, `true: y`, `null: z`) all answer `None`,
-/// and `key` then keeps emitting the owned display string it always has.
-/// Typed keys are excluded on purpose: real yq's `key` there is an `!!int`/
-/// `!!bool`/`!!null` node, but its scalar `==` is stringly (`1 == "1"` is
-/// `true`) where succinctly's is typed, so a typed key node would break
-/// `select(key == "1")`, which matches yq today -- recorded in
-/// `docs/compliance/yq/limitations.md`.
+/// (`? [a, b]`) key, a key whose bytes do not decode and an explicitly
+/// tagged key all answer `None`, and `key` then keeps emitting the owned
+/// display string it always has. A *typed* key (`1: x`, `true: y`,
+/// `null: z`) is a node too since #2785: real yq's `key` there is an
+/// `!!int`/`!!bool`/`!!null` node, and now that yq-mode `==` compares
+/// scalars by text (`eval::yq_scalar_text_eq`), `select(key == "1")` and
+/// `select(key == 1)` both match it, as they do in yq. The node's value
+/// resolves through the ordinary scalar ladder downstream, so
+/// `[.[] | key]` prints `[1, true, null]` and `key | tag` answers `!!int`.
 /// Returns the node *and the value it was checked against*: the check has to
 /// resolve the key's value anyway and the emitted item carries it, so handing
 /// it back is what keeps `value()` to one call per key.
@@ -17076,8 +17133,10 @@ fn member_key_node<C: DocumentCursor>(c: &C, expected: &str) -> Option<(C, C::Va
 }
 
 /// Whether a key *spelled* like this could be resolved to something other
-/// than a string -- the prefilter that keeps [`key_node_spells`]'s type
-/// ladder off the common key.
+/// than a string -- the prefilter that keeps the scalar-type ladder off the
+/// common key when a key node is materialized ([`path_context_item_to_owned`]
+/// and [`key_owned_value`]; #2763 applied it inside `key_node_spells`, #2785
+/// moved it to the materializing side so a typed key can be emitted).
 ///
 /// Conservative in the only safe direction: `true` means "ask the node",
 /// never "this is not a string". The listed first bytes are every one a
@@ -17112,36 +17171,27 @@ fn key_spelling_may_retype(key: &str) -> bool {
     )
 }
 
-/// Whether the key node `kc` is a plain string that materializes as exactly
-/// `expected` -- the scalar order [`to_owned_at_depth`] applies, without the
-/// allocation.
+/// Whether the key node `kc` is an untagged scalar whose raw spelling is
+/// exactly `expected` -- a plain string, or a typed key whose text
+/// [`to_owned_at_depth`]'s ladder will retype downstream (#2785).
 ///
 /// The `as_str` comparison is not redundant with the sibling hop and is
 /// never skipped: it is what keeps an **undecodable** key (#1247/#1642) on
 /// the owned path, where `key` echoes the raw-byte fallback spelling rather
-/// than raising the decode failure materializing its node would.
+/// than raising the decode failure materializing its node would. It is also
+/// all the check costs per key: `as_str` reads the token, and no type is
+/// decided here -- #2763's `key_spelling_may_retype` prefilter moved to the
+/// materializing side ([`path_context_item_to_owned`], [`key_owned_value`]),
+/// where a key spelled like a number, bool or null pays the ladder and
+/// every other key stays a string without it.
 fn key_node_spells<C: DocumentCursor>(kc: &C, v: &C::Value, expected: &str) -> bool {
-    // Unconditional: an explicit tag can change what the node *materializes
-    // as* regardless of how the key is spelled (`!!null anything` resolves to
-    // null), so this cannot ride the rare branch below the way the type
-    // ladder can.
+    // An explicit tag can change what the node *materializes as* regardless
+    // of how the key is spelled (`!!null anything` resolves to null); such a
+    // key keeps the display-string route, unchanged from #2763.
     if kc.explicit_tag().is_some() {
         return false;
     }
-    if key_spelling_may_retype(expected) && !plain_string_value(v) {
-        return false;
-    }
     v.as_str().is_some_and(|s| s == expected)
-}
-
-/// The scalar-classification ladder [`to_owned_at_depth`] applies, asked as
-/// a yes/no: is this value a string rather than a `null`, a bool or a number?
-fn plain_string_value<V: DocumentValue>(v: &V) -> bool {
-    !v.is_null()
-        && v.as_bool().is_none()
-        && v.number_literal().is_none()
-        && v.as_i64().is_none()
-        && v.as_f64().is_none()
 }
 
 /// The path from the document root to `c`, the node at every proper prefix
@@ -19006,10 +19056,21 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
             // `optional`) the identical failure. Answering it twice is
             // what would change behaviour.
             if let Ok(container) = to_owned_cursor(&c) {
+                // #2785: a `with_entries` entry carries the document's own
+                // typed key, as `to_entries` builds it. STYLE-0012 again: a
+                // key that fails to materialize here fails identically in
+                // the fallback, so the strings stand in rather than raise.
+                let typed_keys = match family {
+                    MapFamily::WithEntries => value.as_object().and_then(|fields| {
+                        effective_key_values(&fields, S::COLLAPSE_DUPLICATE_KEYS).ok()
+                    }),
+                    MapFamily::Map | MapFamily::MapValues => None,
+                };
                 if let Some(result) = eval_map_family_positioned_result::<S, V>(
                     family,
                     f,
                     &container,
+                    typed_keys.as_deref(),
                     &OwnedIdentity::kept(c),
                     optional,
                 ) {
@@ -19636,8 +19697,14 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     // Report the same cause rather than invent a second one,
                     // so that if the pre-check is ever moved this arm is
                     // still right rather than merely quiet.
-                    let Some(key) = key_display_string(&field.key) else {
-                        return GenericResult::Error(fields.malformed_member_error());
+                    //
+                    // #2785: `key_owned_value`, not `key_display_string` --
+                    // a typed key is an `!!int`/`!!bool`/`!!null` node in
+                    // real yq's `to_entries` too.
+                    let key = match key_owned_value(&field.key, &field.key_cursor) {
+                        Ok(Some(key)) => key,
+                        Ok(None) => return GenericResult::Error(fields.malformed_member_error()),
+                        Err(e) => return GenericResult::Error(e),
                     };
                     // #1677: `malformed_object_member` above only checked
                     // the comma before each key; this loop already resolves
@@ -19657,7 +19724,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                         return GenericResult::Error(fields.malformed_member_error());
                     }
                     let mut entry = IndexMap::new();
-                    entry.insert("key".to_string(), OwnedValue::String(key.into_owned()));
+                    entry.insert("key".to_string(), key);
                     entry.insert(
                         "value".to_string(),
                         owned_or_suppress!(to_owned_cursor(&field.value_cursor), optional),
@@ -19685,6 +19752,43 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                         &value, cursor,
                     )))
                 })
+            }
+        }
+
+        // #2785: `with_entries(f)` on a document object is `to_entries |
+        // map(f) | from_entries` over the *typed* entries the arm above
+        // builds -- the `_` fallback below would reindex the object through
+        // JSON first, where every key is a string, so `with_entries(.key |=
+        // . + 1)` on `1: x` answered `"11"` where real yq answers `2: x`.
+        // The composition is the same one `eval::builtin_with_entries` is;
+        // only the entry array's provenance changes. A body that reads path
+        // context keeps its own routes (`map_family_positioned_builtin`
+        // above, or the fallback), where `key` is the entry's index.
+        Builtin::WithEntries(f) if value.as_object().is_some() && !needs_path_context(f) => {
+            let entries = match eval_builtin::<S, V>(&Builtin::ToEntries, value, optional, cursor) {
+                GenericResult::Owned(entries) => entries,
+                other => return other,
+            };
+            let mapped = Expr::Builtin(Builtin::Map(f.clone()));
+            let mut outputs: Vec<OwnedValue> = Vec::new();
+            if let Flow::Escaped(control) =
+                eval_each_owned::<S>(&mapped, &entries, optional, &mut |v| {
+                    outputs.push(v);
+                    Demand::Continue
+                })
+            {
+                return partial_generic(Vec::new(), control);
+            }
+            // `map` emits exactly one array (or nothing, when `f` was
+            // suppressed under `optional`).
+            match outputs.pop() {
+                Some(OwnedValue::Array(mapped)) => match entries_to_object::<S, _>(mapped) {
+                    Ok(fields) => GenericResult::Owned(OwnedValue::Object(fields)),
+                    Err(_) if optional => GenericResult::None,
+                    Err(e) => GenericResult::Error(e),
+                },
+                Some(other) => GenericResult::Owned(other),
+                None => GenericResult::None,
             }
         }
 
@@ -22689,22 +22793,35 @@ fn map_family_entry(key: OwnedValue, value: OwnedValue) -> OwnedValue {
 /// (unpositioned) evaluation of the whole builtin answers identically. Every
 /// mode-specific rule for a scalar input (`eval::builtin_map`'s yq no-op,
 /// #1907; `to_entries`'s "has no keys") therefore stays in exactly one place.
+///
+/// `typed_keys` is the document's own materialization of the object's keys
+/// ([`effective_key_values`], #2785), for a `with_entries` entry to carry a
+/// typed key the way `to_entries` does; an owned object only holds display
+/// strings. Used only when it lines up member for member with `container`
+/// -- it cannot when the mode kept a repeated key the `IndexMap` collapsed
+/// -- and `None` (the owned identity pipe's callers, and every other family)
+/// keeps the display string.
 fn map_family_members(
     family: MapFamily,
     container: &OwnedValue,
+    typed_keys: Option<&[OwnedValue]>,
 ) -> Option<Vec<(OwnedValue, OwnedValue)>> {
     let members = match container {
-        OwnedValue::Object(fields) => fields
-            .iter()
-            .enumerate()
-            .map(|(i, (k, v))| match family {
-                MapFamily::WithEntries => (
-                    OwnedValue::Int(i as i64),
-                    map_family_entry(OwnedValue::String(k.clone()), v.clone()),
-                ),
-                _ => (OwnedValue::String(k.clone()), v.clone()),
-            })
-            .collect(),
+        OwnedValue::Object(fields) => {
+            let typed_keys = typed_keys.filter(|keys| keys.len() == fields.len());
+            fields
+                .iter()
+                .enumerate()
+                .map(|(i, (k, v))| match family {
+                    MapFamily::WithEntries => {
+                        let key = typed_keys
+                            .map_or_else(|| OwnedValue::String(k.clone()), |keys| keys[i].clone());
+                        (OwnedValue::Int(i as i64), map_family_entry(key, v.clone()))
+                    }
+                    _ => (OwnedValue::String(k.clone()), v.clone()),
+                })
+                .collect()
+        }
         OwnedValue::Array(elements) => elements
             .iter()
             .enumerate()
@@ -22737,11 +22854,12 @@ fn eval_map_family_positioned<S: EvalSemantics, V: DocumentValue>(
     family: MapFamily,
     f: &Expr,
     container: &OwnedValue,
+    typed_keys: Option<&[OwnedValue]>,
     id: &OwnedIdentity<V>,
     optional: bool,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Option<Flow> {
-    let members = map_family_members(family, container)?;
+    let members = map_family_members(family, container, typed_keys)?;
     // `with_entries`'s member is an entry of the array `to_entries` built,
     // which stands where the container stood (`to_entries` keeps); the
     // other two families run over the container's own members.
@@ -22810,14 +22928,23 @@ fn eval_map_family_positioned_result<S: EvalSemantics, V: DocumentValue>(
     family: MapFamily,
     f: &Expr,
     container: &OwnedValue,
+    typed_keys: Option<&[OwnedValue]>,
     id: &OwnedIdentity<V>,
     optional: bool,
 ) -> Option<GenericResult<V>> {
     let mut collected: Vec<OwnedValue> = Vec::new();
-    let flow = eval_map_family_positioned::<S, V>(family, f, container, id, optional, &mut |v| {
-        collected.push(v);
-        Demand::Continue
-    })?;
+    let flow = eval_map_family_positioned::<S, V>(
+        family,
+        f,
+        container,
+        typed_keys,
+        id,
+        optional,
+        &mut |v| {
+            collected.push(v);
+            Demand::Continue
+        },
+    )?;
     Some(match flow {
         Flow::Exhausted | Flow::Stopped { .. } => owned_vec_to_generic_result(collected),
         Flow::Escaped(control) => partial_generic(collected, control),
@@ -23790,7 +23917,9 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
             // `with_entries` detaches), so `rest` continues identically
             // either way.
             let positioned = map_family_positioned(stage).and_then(|(family, f)| {
-                eval_map_family_positioned::<S, V>(family, f, &value, &id, optional, &mut emit)
+                eval_map_family_positioned::<S, V>(
+                    family, f, &value, None, &id, optional, &mut emit,
+                )
             });
             let upstream = match positioned {
                 Some(flow) => flow,

@@ -23,11 +23,10 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use super::document::{
-    key_display_string, DistinctKeyCursors, DocumentFields, IndentSpec, JsonConvention,
-};
+use super::document::{DistinctKeyCursors, DocumentFields, IndentSpec, JsonConvention};
 use super::error::EvalError;
 use super::escape::{write_json_body_jq, write_json_body_yq};
+use super::eval_generic::key_owned_value;
 use super::value::{
     assert_value_tree_depth, format_number_jq_compat, infinite_float_preview_text,
     jq_bare_float_display, NumberRepr, OwnedValue,
@@ -733,15 +732,27 @@ pub fn stream_lazy_keys_json<W: core::fmt::Write, F: DocumentFields>(
     }
     out.write_char('[')?;
     let mut cursors = DistinctKeyCursors::new(fields, collapse);
-    for (i, (key, _cursor)) in cursors.by_ref().enumerate() {
+    for (i, (key, cursor)) in cursors.by_ref().enumerate() {
         // A key that will not *decode* is preserved via its raw source
         // span rather than silently skipped (#1642), matching
         // `DocumentFields::keys()`. A key with no stringifiable spelling at
         // all (#1194) now stops the walk and reports via `error` instead of
         // silently skipping it, matching `effective_keys`.
-        let Some(key) = key_display_string(&key) else {
-            *error = Some(fields.malformed_member_error());
-            break;
+        //
+        // #2785: `key_owned_value`, not `key_display_string` -- a typed key
+        // (`1: x`) is an `!!int` node in real yq's `keys`, and this writer
+        // is the M2 fast path `keys` takes under default flags, so it has
+        // to agree with the materializing routes.
+        let key = match key_owned_value(&key, &cursor) {
+            Ok(Some(key)) => key,
+            Ok(None) => {
+                *error = Some(fields.malformed_member_error());
+                break;
+            }
+            Err(e) => {
+                *error = Some(e);
+                break;
+            }
         };
         if i > 0 {
             out.write_char(',')?;
@@ -750,7 +761,10 @@ pub fn stream_lazy_keys_json<W: core::fmt::Write, F: DocumentFields>(
             out.write_char('\n')?;
             write_indent(out, indent.width, indent.unit)?;
         }
-        stream_json_string(out, &key, write_json_body_yq)?;
+        match &key {
+            OwnedValue::String(key) => stream_json_string(out, key, write_json_body_yq)?,
+            typed => stream_owned_value_json(typed, out, 0, 0, ' ', false)?,
+        }
     }
     // #1956: `ended_unpaired()` alone missed a malformed `,`/`:` delimiter
     // -- `is_malformed()` checks both #1194 faults this walk can find.
@@ -1049,6 +1063,17 @@ pub fn stream_yaml_string<W: core::fmt::Write>(out: &mut W, s: &str) -> core::fm
     }
 }
 
+/// One materialized key as a YAML scalar: a string through
+/// [`stream_yaml_string`]'s quoting rule, a typed key (#2785) through the
+/// owned scalar writer -- always a scalar, so the container arms and their
+/// indentation never apply.
+fn stream_yaml_key_value<W: core::fmt::Write>(out: &mut W, key: &OwnedValue) -> core::fmt::Result {
+    match key {
+        OwnedValue::String(key) => stream_yaml_string(out, key),
+        typed => stream_owned_value_yaml(typed, out, "", 0, ' ', false),
+    }
+}
+
 /// Stream a `DocumentFields`' keys (`keys_unsorted`) as YAML without an
 /// intermediate `Vec<String>`/`OwnedValue::Array` (#685).
 ///
@@ -1077,19 +1102,27 @@ pub fn stream_lazy_keys_yaml<W: core::fmt::Write, F: DocumentFields>(
         // Flow style
         out.write_char('[')?;
         let mut cursors = DistinctKeyCursors::new(fields, collapse);
-        for (i, (key, _cursor)) in cursors.by_ref().enumerate() {
+        for (i, (key, cursor)) in cursors.by_ref().enumerate() {
             // Preserved via its raw source span rather than skipped on a
             // decode failure (#1642), matching `stream_lazy_keys_json`. A
             // non-stringifiable key (#1194) stops the walk and reports via
-            // `error` instead of silently skipping it.
-            let Some(key) = key_display_string(&key) else {
-                *error = Some(fields.malformed_member_error());
-                break;
+            // `error` instead of silently skipping it. A typed key is
+            // written as its node (#2785), as in `stream_lazy_keys_json`.
+            let key = match key_owned_value(&key, &cursor) {
+                Ok(Some(key)) => key,
+                Ok(None) => {
+                    *error = Some(fields.malformed_member_error());
+                    break;
+                }
+                Err(e) => {
+                    *error = Some(e);
+                    break;
+                }
             };
             if i > 0 {
                 out.write_str(", ")?;
             }
-            stream_yaml_string(out, &key)?;
+            stream_yaml_key_value(out, &key)?;
         }
         // #1956: `ended_unpaired()` alone missed a malformed `,`/`:` delimiter
         // -- `is_malformed()` checks both #1194 faults this walk can find.
@@ -1100,16 +1133,23 @@ pub fn stream_lazy_keys_yaml<W: core::fmt::Write, F: DocumentFields>(
     } else {
         // Block style
         let mut cursors = DistinctKeyCursors::new(fields, collapse);
-        for (i, (key, _cursor)) in cursors.by_ref().enumerate() {
-            let Some(key) = key_display_string(&key) else {
-                *error = Some(fields.malformed_member_error());
-                break;
+        for (i, (key, cursor)) in cursors.by_ref().enumerate() {
+            let key = match key_owned_value(&key, &cursor) {
+                Ok(Some(key)) => key,
+                Ok(None) => {
+                    *error = Some(fields.malformed_member_error());
+                    break;
+                }
+                Err(e) => {
+                    *error = Some(e);
+                    break;
+                }
             };
             if i > 0 {
                 out.write_char('\n')?;
             }
             out.write_str("- ")?;
-            stream_yaml_string(out, &key)?;
+            stream_yaml_key_value(out, &key)?;
         }
         // #1956: `ended_unpaired()` alone missed a malformed `,`/`:` delimiter
         // -- `is_malformed()` checks both #1194 faults this walk can find.
