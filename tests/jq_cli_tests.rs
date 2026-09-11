@@ -47616,3 +47616,93 @@ fn test_resource_limit_is_not_a_destructuring_retry_2132() -> Result<()> {
 
     Ok(())
 }
+
+/// #2710: which spelling an undecodable key echoes is decided by **whether
+/// the value is materialized**, and nothing else — so the boundary is worth
+/// pinning in CI rather than only in the sweep.
+///
+/// `docs/compliance/jq/limitations.md` has stated the rule since #2103: raw
+/// source bytes wherever the value is never materialized,
+/// `key_display_string`'s fallback (the source `\` doubled) wherever it is.
+/// #2710 found `scripts/jq-m2-streaming-sweep.expected` recording the
+/// *doubled* spelling for `. as $x | $x` while the binary emitted the raw
+/// one, and asked which side was right.
+///
+/// **The binary is.** A plain `$x` reference forwards the cursor rather than
+/// materializing, so the raw spelling is what the rule already prescribes —
+/// the rule needs no narrowing, and the drift was the golden going stale
+/// against a route that became a passthrough. Measured across the boundary,
+/// input `{"a\q":1,"b":2}`:
+///
+/// | raw (never materialized) | doubled (materialized) |
+/// |---|---|
+/// | `.`, `. \| .`, `first(.)` | `[.] \| .[0]`, `[.] as [$x] \| $x` |
+/// | `. as $x \| $x`, `. as {a:$v} \| .` | `. as $x \| [$x] \| .[0]` |
+/// | `if . then . else . end` | `. as $x \| $x + {}`, `tojson` |
+/// | `getpath([])`, `(., .) \| first(.)` | `to_entries`, `keys`, `with_entries(.)` |
+///
+/// Every raw row forwards a cursor; every doubled row builds an
+/// `OwnedValue`. There is no filter on either side that contradicts the
+/// rule, which is what makes "the rule stands, the golden was stale" the
+/// answer rather than "the wording needs narrowing".
+///
+/// jq 1.7.1 has no opinion to appeal to: it rejects both documents at parse
+/// time (`Invalid \uXXXX\uXXXX surrogate pair`, `Invalid escape`), so this
+/// is succinctly's own documented rule, not a fidelity question.
+///
+/// The sweep is a verification tool, not a CI gate — which is how the drift
+/// went unnoticed. These rows are.
+#[test]
+fn test_undecodable_key_spelling_follows_materialization_2710() -> Result<()> {
+    for doc in [r#"{"a\q":1,"b":2}"#, r#"{"\ud800":1,"b":2}"#] {
+        // The raw spelling is the document's own bytes back. Asserted per
+        // output line, not on the whole stdout: a multi-output row like
+        // `(., .) | first(.)` legitimately emits it twice, and the claim
+        // here is about the spelling, not the cardinality.
+        for filter in [
+            ".",
+            ". | .",
+            ". as $x | $x",
+            ". as $x | $x | .",
+            ". as {a:$v} | .",
+            "if . then . else . end",
+            "getpath([])",
+            "first(.)",
+            "(., .) | first(.)",
+        ] {
+            let (out, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
+            assert_eq!(code, 0, "`{filter}` on {doc}: stderr {err:?}");
+            let lines: Vec<&str> = out.lines().collect();
+            assert!(!lines.is_empty(), "`{filter}` produced nothing");
+            for line in lines {
+                assert_eq!(
+                    line, doc,
+                    "`{filter}` forwards a cursor, so it must echo the raw source bytes"
+                );
+            }
+        }
+
+        // ... and a materializing route doubles the source `\`.
+        let doubled = doc.replace('\\', "\\\\");
+        for filter in [
+            "[.] | .[0]",
+            "[.] as [$x] | $x",
+            ". as $x | [$x] | .[0]",
+            ". as $x | $x + {}",
+            "with_entries(.)",
+        ] {
+            let (out, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
+            assert_eq!(code, 0, "`{filter}` on {doc}: stderr {err:?}");
+            let lines: Vec<&str> = out.lines().collect();
+            assert!(!lines.is_empty(), "`{filter}` produced nothing");
+            for line in lines {
+                assert_eq!(
+                    line, doubled,
+                    "`{filter}` materializes, so it must use key_display_string's fallback"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}

@@ -3706,6 +3706,31 @@ escape sequence` on `keys_unsorted[]` — was a bug, not a candidate:
 `eval_each_pipe_generic`'s empty-stages arm dropped the cursor and decoded the key. Fixed in
 the same change.
 
+**#2710 checked the rule against a route that changed under it, and the rule held.**
+`scripts/jq-m2-streaming-sweep.expected` recorded the *doubled* spelling for
+`. as $x | $x` while the binary emitted the raw one. The binary is right: a plain `$x`
+reference forwards the cursor rather than materializing, so raw is exactly what the rule
+above prescribes — the wording needs no narrowing, and what went stale was the golden,
+against a route that became a passthrough. Measured across the boundary on
+`{"a\q":1,"b":2}`:
+
+| raw (never materialized) | doubled (materialized) |
+|---|---|
+| `.`, `. \| .`, `first(.)`, `getpath([])` | `[.] \| .[0]`, `[.] as [$x] \| $x` |
+| `. as $x \| $x`, `. as {a:$v} \| .` | `. as $x \| [$x] \| .[0]`, `. as $x \| $x + {}` |
+| `if . then . else . end` | `tojson`, `to_entries`, `keys`, `with_entries(.)` |
+
+Every raw row forwards a cursor; every doubled row builds an `OwnedValue`. No filter on
+either side contradicts the rule, which is what makes "the golden was stale" the answer
+rather than "the rule is too broad". jq 1.7.1 has no opinion to appeal to — it rejects both
+documents at parse time — so this is succinctly's own rule throughout.
+
+The sweep is a verification tool, not a CI gate, which is how the drift went unnoticed;
+`test_undecodable_key_spelling_follows_materialization_2710` (`tests/jq_cli_tests.rs`) now
+pins both halves of the boundary where CI runs them. The sweep's own `FILTERS` grouping
+("materializing eager twin") is a historical label from the two-route era and no longer
+describes which routes materialize — several rows in that group forward a cursor today.
+
 Six further cells move off jq's exit 5 as a consequence of that rule, beyond the 19 rows
 above: `limit(1; keys_unsorted[])` and `limit(2; keys_unsorted[])` on each of
 `{"\ud800":1,"\ud800":2}`, `{"\ud800":1,"b":2}` and `{"a\q":1,"b":2}` now echo the key raw
