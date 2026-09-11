@@ -14701,15 +14701,31 @@ fn path_context_item_to_owned<V: DocumentValue>(
 ) -> Result<OwnedValue, EvalError> {
     match item {
         GenericItem::OneCursor(c) => to_owned_cursor(&c),
-        // #2763: a key node carries its own already-decoded value, so this
-        // is the one shape here that does not re-derive it -- the second
-        // `value()` plus the tag and number-canonicalization lookups
-        // `to_owned_cursor` makes are what `[.[] | key]` was paying twice.
-        // Dropping the cursor is sound *because* of the emission's own gate:
-        // `key_node_spells` refuses a node with an explicit tag and one that
-        // is not a plain string, which are exactly the two things
-        // `to_owned_cursor` consults a cursor for.
-        GenericItem::OneCursorValue(_, v) => to_owned(&v),
+        // #2763: the *key node* shape, and the one item here that is already
+        // known to be a plain, untagged string -- `key_node_spells` proved
+        // exactly that before emitting it, which is why this can take the
+        // string straight out of the value instead of re-deciding its type.
+        //
+        // That matters because deciding it is the expensive part: `to_owned`
+        // would run the same `as_i64`/`as_f64` parse attempts the emission
+        // gate was restructured to avoid, and `to_owned_cursor` would add a
+        // second `value()` plus the tag and canonicalization lookups the gate
+        // already ruled out. `[.[] | key]` materializes every key it emits,
+        // so it pays this per key.
+        GenericItem::OneCursorValue(c, v) => match v.as_str() {
+            Some(s) => {
+                debug_assert!(
+                    plain_string_value(&v) && c.explicit_tag().is_none(),
+                    "the walk emits OneCursorValue only for a key node \
+                     `key_node_spells` proved is a plain untagged string"
+                );
+                Ok(OwnedValue::String(s.into_owned()))
+            }
+            // Unreachable through the gate above; materialized the ordinary
+            // way rather than asserted, so a future walk arm emitting this
+            // shape for something else is merely slower, never wrong.
+            None => to_owned_with_cursor(&v, Some(c)),
+        },
         GenericItem::Owned(o) => Ok(o),
         GenericItem::One(_)
         | GenericItem::LazyKeys { .. }
@@ -16414,6 +16430,10 @@ fn key_spelling_may_retype(key: &str) -> bool {
 /// the owned path, where `key` echoes the raw-byte fallback spelling rather
 /// than raising the decode failure materializing its node would.
 fn key_node_spells<C: DocumentCursor>(kc: &C, expected: &str) -> bool {
+    // Unconditional: an explicit tag can change what the node *materializes
+    // as* regardless of how the key is spelled (`!!null anything` resolves to
+    // null), so this cannot ride the rare branch below the way the type
+    // ladder can.
     if kc.explicit_tag().is_some() {
         return false;
     }
