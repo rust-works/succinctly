@@ -125,6 +125,14 @@ const CLOSED: &[&str] = &[
     "isempty(1)",
     "isempty(empty)",
     "isempty(range(9))",
+    // #2794 review: `isempty(f)` gets its own `reads_ambient_value` arm
+    // (not just the flat allowlist) so a rebinding construct nested inside
+    // `f` still gets the same Pipe/Reduce/Foreach refinement a top-level
+    // filter would -- `1 | .` reads the rebound `1`, not the document,
+    // whether or not it sits inside `isempty(...)`.
+    "isempty(1 | .)",
+    "isempty([1,2,3] | .[])",
+    "isempty(reduce (1,2,3) as $x (0; . + $x) | empty)",
     // #2794: `any(gen; cond)`/`all(gen; cond)` desugar to `gen | cond`, so
     // `cond` sees gen's *output*, not the document -- closed when `gen` is,
     // whatever `cond` looks like.
