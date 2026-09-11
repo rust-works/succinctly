@@ -27999,6 +27999,29 @@ fn test_error_message_substitution_reaches_bound_names_2727() -> Result<()> {
     Ok(())
 }
 
+/// #2728: a leading underscore is a valid identifier-start character
+/// throughout jq (`def _walk: ...` is a common real-jq library convention),
+/// but the bare-name/call dispatch gate in `parse_primary` only checked
+/// `c.is_alphabetic()`, so a leading `_` never even reached `parse_ident`
+/// (which already accepted it) -- surfacing as a raw "unexpected character
+/// '_', expected expression" parse error instead. Covers the def name, a
+/// bare parameter, a mid-name underscore, and a double-underscore prefix,
+/// each cross-checked live against jq 1.7.1.
+#[test]
+fn test_leading_underscore_identifier_parses_2728() -> Result<()> {
+    for (filter, expected) in [
+        ("def _g: 42; _g", "42\n"),
+        ("def f(_x): _x; f(1)", "1\n"),
+        ("def __double: 7; __double", "7\n"),
+        ("def foo_bar: 5; foo_bar", "5\n"),
+    ] {
+        let (out, err, code) = run_jq_full(&["-cn", filter], None)?;
+        assert_eq!(code, 0, "`{filter}` -- out={out:?} err={err:?}");
+        assert_eq!(out, expected, "`{filter}`");
+    }
+    Ok(())
+}
+
 /// #1164 coverage: the `optional` (`?`) arm of a wrong-typed argument is a
 /// separate branch from the non-optional error arm every other test above
 /// already exercises -- `?` suppresses the type mismatch to no output

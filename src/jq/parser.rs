@@ -1664,7 +1664,18 @@ impl<'a> Parser<'a> {
             }
 
             // Keywords: null, true, false, not, if, try, error, reduce, foreach, etc.
-            Some(c) if c.is_alphabetic() => {
+            //
+            // #2728: `|| c == '_'` -- a leading underscore is a valid
+            // identifier-start character throughout jq (`def _walk: ...` is
+            // a common real-jq library convention), and `parse_ident`
+            // itself already accepts it (`c.is_alphabetic() || c == '_'`,
+            // used by both the `$var` and `.field` dispatch paths just
+            // above this arm). This gate is what decides whether a bare
+            // name/call/keyword position is even attempted at all, so
+            // without it a leading `_` never reached `parse_ident` --
+            // confirmed live against jq 1.7.1: `def _g: 42; _g` is `42`
+            // there and a parse error here before this fix.
+            Some(c) if c.is_alphabetic() || c == '_' => {
                 let keyword_start = self.pos;
                 if self.matches_keyword("null") {
                     self.consume_keyword("null");
