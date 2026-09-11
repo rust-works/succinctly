@@ -123,6 +123,41 @@ the level reappears inside one and the common `select(.x and .y)` idiom is
 unaffected: `.items[] | select(.name and .value)` filters per element in both
 modes, exactly as in jq.
 
+### `==`/`!=` compare scalars by text, with a wildcard on the right
+
+Real yq's equality is not jq's typed equality (#2785). Between two scalars it
+compares the nodes' *text*, and the right-hand operand is a wildcard pattern:
+`*` matches zero or more bytes, `?` exactly one byte, nothing else is special.
+A `null` on the left is equal only to a `null` on the right. `succinctly yq`
+follows yq, `succinctly jq` follows jq:
+
+| Filter                            | `succinctly yq` / `yq` | `succinctly jq` / `jq` |
+|-----------------------------------|------------------------|------------------------|
+| `1 == "1"`                        | `true`                 | `false`                |
+| `true == "true"`                  | `true`                 | `false`                |
+| `1 == 1.0`                        | `false`                | `true`                 |
+| `"abc" == "a*"`                   | `true`                 | `false`                |
+| `"a*" == "abc"`                   | `false`                | `false`                |
+| `null == "null"`                  | `false`                | `false`                |
+| `"null" == null`                  | `true`                 | `false`                |
+| `.[] \| select(key == "ab*")`     | every `ab…` member     | *(no match)*           |
+
+Only `==`/`!=` take this rule. `unique`, `group_by`, `contains` and the
+ordering comparators keep their own semantics, and a container pairing is
+compared structurally here where real yq answers `false` for every one — see
+[limitations.md](../compliance/yq/limitations.md) for the recorded gaps.
+
+Because a mapping key is resolved with the same scalar rules as a value, a
+typed key (`1: x`, `true: y`, `null: z`) is an `!!int`/`!!bool`/`!!null` node
+through `key`, `keys`, `to_entries` and `with_entries`, and `select(key == 1)`
+and `select(key == "1")` both match it:
+
+```bash
+printf '1: x\ntrue: y\n"2": v\n' | succinctly yq -o json '[.[] | key]'      # [1, true, "2"]
+printf '1: x\ntrue: y\n"2": v\n' | succinctly yq '[.[] | key | tag]'         # !!int, !!bool, !!str
+printf '1: x\n2: y\n' | succinctly yq 'with_entries(.key |= . + 1)'          # 2: x, 3: y
+```
+
 ---
 
 ## YAML-Specific Features
