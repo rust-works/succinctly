@@ -43341,8 +43341,9 @@ fn test_path_prefix_lets_a_truncating_consumer_succeed_2680() -> Result<()> {
 /// inside, so navigation within the brackets is refused as jq refuses it.
 ///
 /// jq's `[f]` runs `f` with path tracking live (unlike `{k:f}`, `if f`,
-/// `select(f)`, `try f`, an `as` source, or `"\(f)"`, which all suspend
-/// it). Left to the evaluate-by-value catch-all, `[.a]` on a constructed
+/// `select(f)`, an `as` source, or `"\(f)"`, which all suspend it -- and
+/// unlike `try f`, which keeps it live but *catches* the resulting path
+/// error). Left to the evaluate-by-value catch-all, `[.a]` on a constructed
 /// value succeeded silently, and a continuation that emitted nothing left
 /// nothing to object to -- the same accept-where-jq-refuses shape as
 /// #2646, on a leaf a static table cannot express.
@@ -43355,8 +43356,8 @@ fn test_path_prefix_lets_a_truncating_consumer_succeed_2680() -> Result<()> {
 fn test_path_refuses_navigation_inside_array_on_untracked_input_2689() -> Result<()> {
     for (filter, doc, element) in [
         // no destructuring: the real root cause
-        ("path(1 | [.[]?] | empty)", "null", "iterate through 1"),
-        ("path(1 | [.a?] | empty)", "null", r#"element "a" of 1"#),
+        ("path(1 | [.[]] | empty)", "null", "iterate through 1"),
+        ("path(1 | [.a] | empty)", "null", r#"element "a" of 1"#),
         (
             "path(. as $x | .a | $x | [.b] | empty)",
             r#"{"a":1,"b":2}"#,
@@ -43418,6 +43419,26 @@ fn test_write_refuses_navigation_inside_array_on_untracked_input_2689() -> Resul
         );
         assert_eq!(stdout.trim_end(), "", "{filter}: nothing written");
     }
+
+    // The other direction: a write jq performs as a no-op must still be a
+    // no-op, not a refusal. These are the deferred shapes -- a first draft
+    // refused every one of them.
+    for (filter, doc) in [
+        ("del(. as {a:$v0} | [5] | select(false))", r#"{"a":false}"#),
+        (
+            "del(. as {a:$x} | [getpath([])] | select(false))",
+            r#"{"a":false}"#,
+        ),
+        ("(1 | [recurse(empty)] | select(false)) = 1", "null"),
+        (
+            "del([.a] | [(.a)? | type] | select(false))",
+            r#"{"a":{"b":{"c":1}}}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(code, 0, "{filter}: must stay a no-op; stderr {stderr:?}");
+        assert_eq!(stdout.trim_end(), doc, "{filter}: document unchanged");
+    }
     Ok(())
 }
 
@@ -43425,10 +43446,17 @@ fn test_write_refuses_navigation_inside_array_on_untracked_input_2689() -> Resul
 /// an untracked input". Each row is something jq accepts, and each is
 /// unchanged by the fix -- a trackable input, the plain-`as` control from
 /// the issue, a literal / identity / empty constructor, an object
-/// constructor (which jq evaluates with tracking *suspended*), and a
-/// `TrackedVar` inside the brackets, which the arm deliberately hands back to
-/// the catch-all because re-establishing the register needs machinery it is
-/// not given (#2759). All captured live from jq 1.7.1.
+/// constructor (which jq evaluates with tracking *suspended*).
+///
+/// The last block is the set of shapes the arm deliberately hands back to
+/// the evaluate-by-value catch-all, because their own untracked handling is
+/// wrong as a bare stage and routing the brackets through it would turn
+/// working programs into errors -- which a first draft of this fix did, on
+/// 69 shapes. A `TrackedVar` cannot re-establish the register from inside
+/// the arm (#2759); `getpath([])` and the `recurse` family refuse eagerly
+/// where jq refuses only on real navigation; and `(.a)?` is jq's *caught*
+/// `try .a` but the parser stores it as the uncaught `.a?` (#2764). All
+/// captured live from jq 1.7.1.
 #[test]
 fn test_array_on_untracked_input_boundary_2689() -> Result<()> {
     for (filter, doc) in [
@@ -43441,8 +43469,13 @@ fn test_array_on_untracked_input_boundary_2689() -> Result<()> {
         ("path(. as {a:$v0} | [.] | empty)", r#"{"a":false}"#),
         ("path(. as {a:$v0} | [] | empty)", r#"{"a":false}"#),
         ("path(. as {a:$v0} | {x:.a} | empty)", r#"{"a":false}"#),
+        // deferred shapes -- accepted by jq, and must stay accepted here
         ("path(. as {a:$v0} | [$v0] | empty)", r#"{"a":false}"#),
         ("path(. as {a:$v0} | [$v0.b?] | empty)", r#"{"a":false}"#),
+        ("path(1 | [getpath([])] | empty)", "null"),
+        ("path(1 | [recurse(empty)] | empty)", "null"),
+        ("path(1 | [(..)?] | empty)", "null"),
+        ("path(1 | [(.a.b)? | type] | empty)", "null"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
         assert_eq!(code, 0, "{filter}: must stay accepted; stderr {stderr:?}");
