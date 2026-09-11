@@ -27952,6 +27952,53 @@ fn test_error_message_arg_break_semantics_unaffected_by_1164() -> Result<()> {
     Ok(())
 }
 
+/// #2727: `error(...)`'s message sub-expression used to be cloned rather
+/// than recursed into by all three tree rewriters (`substitute_func_param_impl`,
+/// `substitute_var_impl`, `install_def_calls`), so a `def` parameter, a bound
+/// variable, or a recursive call referenced inside it was never substituted
+/// -- surfacing as a confusing "undefined function"/wrong-message error
+/// instead of the program's own. All four shapes below are live jq 1.7.1
+/// captures.
+#[test]
+fn test_error_message_substitution_reaches_bound_names_2727() -> Result<()> {
+    // A `def` parameter referenced inside `error(...)`'s message.
+    let (out, _err, code) =
+        run_jq_full(&["-cn", r#"def f(a): try error(a) catch .; f("x")"#], None)?;
+    assert_eq!(code, 0, "out={out:?}");
+    assert_eq!(out, "\"x\"\n", "out={out:?}");
+
+    // An `as`-bound variable referenced inside `error(...)`'s message --
+    // not parameter-specific, per the issue's own "why this is separate"
+    // note.
+    let (out, _err, code) = run_jq_full(&["-cn", r#""x" as $a | try error($a) catch ."#], None)?;
+    assert_eq!(code, 0, "out={out:?}");
+    assert_eq!(out, "\"x\"\n", "out={out:?}");
+
+    // A `$`-style def parameter referenced inside `error(...)`'s message --
+    // the other substitution namespace `substitute_func_param_impl` handles.
+    let (out, _err, code) = run_jq_full(
+        &["-cn", r#"def f($a): try error($a) catch .; f("x")"#],
+        None,
+    )?;
+    assert_eq!(code, 0, "out={out:?}");
+    assert_eq!(out, "\"x\"\n", "out={out:?}");
+
+    // A recursive def call inside error(...)'s own message string --
+    // exercises `install_def_calls`'s copy of the same arm, which binds
+    // `Expr::FuncCall` to `Expr::DefCall` before evaluation ever runs.
+    let (out, _err, code) = run_jq_full(
+        &[
+            "-cn",
+            r#"def f(n): if n == 0 then "done" else error("depth \(f(n-1))") end; try f(2) catch ."#,
+        ],
+        None,
+    )?;
+    assert_eq!(code, 0, "out={out:?}");
+    assert_eq!(out, "\"depth done\"\n", "out={out:?}");
+
+    Ok(())
+}
+
 /// #1164 coverage: the `optional` (`?`) arm of a wrong-typed argument is a
 /// separate branch from the non-optional error arm every other test above
 /// already exercises -- `?` suppresses the type mismatch to no output
