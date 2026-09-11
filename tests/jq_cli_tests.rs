@@ -48455,3 +48455,66 @@ fn test_nth_result_twin_forces_skipped_elements_2666() -> Result<()> {
     assert!(err.contains("cannot be divided"), "stderr: {err:?}");
     Ok(())
 }
+
+/// #2730: `reverse` is jq-defined, not built in --
+/// `def reverse: [.[length - 1 - range(0;length)]]` -- so a non-array's fate
+/// is decided by its `length`, not its type. Anything whose length is `0`
+/// never indexes and answers `[]`; a boolean fails inside `length`; the rest
+/// reach `.[n]` and fail there. The issue found one cell (`{}`); the sweep
+/// found seven, plus a string that was being *reversed* on the owned route
+/// (`-n`), which no pinned jq does. Every cell captured against jq 1.7.1
+/// (1.8.2 agrees), on both routes: the cursor route via stdin and the owned
+/// route via `-n`.
+#[test]
+fn test_reverse_follows_jqs_own_definition_2730() -> Result<()> {
+    // (input, expected stdout, expected exit, stderr fragment)
+    let rows: &[(&str, &str, i32, &str)] = &[
+        ("{}", "[]", 0, ""),
+        ("null", "[]", 0, ""),
+        ("0", "[]", 0, ""),
+        ("-0", "[]", 0, ""),
+        (r#""""#, "[]", 0, ""),
+        ("[]", "[]", 0, ""),
+        ("[1,2]", "[2,1]", 0, ""),
+        ("[[1],[2]]", "[[2],[1]]", 0, ""),
+        (r#"{"a":1}"#, "", 5, "Cannot index object with number"),
+        ("5", "", 5, "Cannot index number with number"),
+        ("-3", "", 5, "Cannot index number with number"),
+        ("0.5", "", 5, "Cannot index number with number"),
+        // The row that used to answer "ba" on the owned route.
+        (r#""ab""#, "", 5, "Cannot index string with number"),
+        ("false", "", 5, "boolean (false) has no length"),
+        ("true", "", 5, "boolean (true) has no length"),
+    ];
+    for (input, want_out, want_code, want_err) in rows {
+        // cursor route
+        let (out, err, code) = run_jq_full(&["-c", "reverse"], Some(input))?;
+        assert_eq!(
+            (out.trim(), code),
+            (*want_out, *want_code),
+            "#2730 cursor route: `{input} | reverse` -- stderr: {err:?}"
+        );
+        assert!(
+            err.contains(want_err),
+            "#2730 cursor route: `{input}` -- stderr: {err:?}"
+        );
+        // owned route -- parenthesised so a negative literal is an expression,
+        // not a flag, and so `-0` is unary minus on 0 (length 0) as in jq.
+        let (out, err, code) = run_jq_full(&["-nc", &format!("({input}) | reverse")], None)?;
+        assert_eq!(
+            (out.trim(), code),
+            (*want_out, *want_code),
+            "#2730 owned route: `-n '{input} | reverse'` -- stderr: {err:?}"
+        );
+        assert!(
+            err.contains(want_err),
+            "#2730 owned route: `{input}` -- stderr: {err:?}"
+        );
+    }
+    // `?` suppresses the index error and the `length` error alike, as in jq.
+    for input in [r#"{"a":1}"#, "true", r#""ab""#] {
+        let (out, _, code) = run_jq_full(&["-c", "reverse?"], Some(input))?;
+        assert_eq!((out.trim(), code), ("", 0), "#2730: `{input} | reverse?`");
+    }
+    Ok(())
+}

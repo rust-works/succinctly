@@ -64,15 +64,16 @@ use super::eval::{
     mark_nonretryable_escape, needs_path_context, numeric_key_to_array_index, numeric_key_to_index,
     numeric_length_owned, owned_bound_to_i64, owned_to_expr, owned_to_string,
     pattern_alternatives_var_names, prefer_pending_control, range_max_exceeded_error, range_num,
-    range_values_f64, range_values_int, resume_from_escape, select_emits, slice_component_value,
-    slice_object_as_yq_children, slice_owned_value_read, stop_with_downstream, stop_with_error,
-    stop_with_escape, stop_with_escape_cell, streams_escaped_generator_prefix, streams_unbounded,
-    substitute_bound_var_from, substitute_vars, suppress_or_raise, suppresses, tonumber_from_str,
-    vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
-    yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_negative_index_check,
-    yq_numeric_index_on_object_is_null, yq_object_key_stringify, yq_read_only_context,
-    BinaryFanoutRules, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
-    ForeachElementSink, JqSemantics, LimitN, PathTrail, QueryResult, RangeNum, YqSemantics,
+    range_values_f64, range_values_int, resume_from_escape, reverse_length_is_empty, select_emits,
+    slice_component_value, slice_object_as_yq_children, slice_owned_value_read,
+    stop_with_downstream, stop_with_error, stop_with_escape, stop_with_escape_cell,
+    streams_escaped_generator_prefix, streams_unbounded, substitute_bound_var_from,
+    substitute_vars, suppress_or_raise, suppresses, tonumber_from_str, vec_with_capacity,
+    yq_absent_key_read_is_empty, yq_assign_rhs_document, yq_empty_operand_output,
+    yq_field_index_on_scalar_is_empty, yq_negative_index_check, yq_numeric_index_on_object_is_null,
+    yq_object_key_stringify, yq_read_only_context, BinaryFanoutRules, Control, Demand,
+    EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, ForeachElementSink, JqSemantics,
+    LimitN, PathTrail, QueryResult, RangeNum, YqSemantics,
 };
 #[cfg(test)]
 use super::expr::FuncDefBound;
@@ -19614,6 +19615,32 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                 let mut cursors = owned_or_suppress!(elements.collect_cursors_checked(), optional);
                 cursors.reverse();
                 GenericResult::LazySeq(Box::new(LazySeq::from_cursors(cursors)))
+            } else if S::TAG == EvalTag::Jq {
+                // #2730: jq defines `reverse` as `[.[length - 1 -
+                // range(0;length)]]`, so a non-array is decided by its
+                // `length`, not its type -- `{}`/`null`/`""`/`0` are `[]`,
+                // a boolean fails in `length`, the rest fail at `.[n]`.
+                // Ask this evaluator's own `Length` arm (gap checks, yq
+                // numeric rendering and the `has no length` wording all
+                // ride along) and ask `eval.rs`'s `reverse_length_is_empty` what
+                // counts as empty, so the two arms cannot drift on this again.
+                let length = eval_single::<S, V>(
+                    &Expr::Builtin(Builtin::Length),
+                    value.clone(),
+                    optional,
+                    cursor,
+                );
+                let index_error = || {
+                    EvalError::cannot_index_with_type(tagged_type_name(&value, cursor), "number")
+                };
+                match length {
+                    GenericResult::Owned(len) if reverse_length_is_empty(&len) => {
+                        GenericResult::Owned(OwnedValue::Array(Vec::new()))
+                    }
+                    GenericResult::Error(e) => GenericResult::Error(e),
+                    GenericResult::None => GenericResult::None,
+                    _ => GenericResult::Error(index_error()),
+                }
             } else if optional {
                 GenericResult::None
             } else {

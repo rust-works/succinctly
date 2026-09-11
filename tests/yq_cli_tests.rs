@@ -42656,3 +42656,27 @@ fn range_bounds_validate_only_what_they_read_2698() -> Result<()> {
     }
     Ok(())
 }
+
+/// #2730's yq-mode gate: real yq (v4.53.3) rejects every non-array
+/// `reverse` input -- `{}`, `null`, `""`, `0` included -- with "node at path
+/// [] is not an array", so the jq-mode `length`-decided rule must NOT reach
+/// here. Pins that every non-array still errors and every array still works.
+#[test]
+fn reverse_still_rejects_every_non_array_in_yq_mode_2730() -> Result<()> {
+    for input in ["{}", "a: 1", "null", r#""""#, "0", r#""ab""#, "true"] {
+        let (out, code) = run_yq_stdin("reverse", input, &["-o=json", "-I=0"])?;
+        assert_ne!(
+            code, 0,
+            "#2730 yq: `{input} | reverse` must error like real yq, got {out:?}"
+        );
+    }
+    for (input, want) in [("[]", "[]"), ("[1, 2]", "[2,1]")] {
+        let (out, code) = run_yq_stdin("reverse", input, &["-o=json", "-I=0"])?;
+        assert_eq!(
+            (out.trim(), code),
+            (want, 0),
+            "#2730 yq: `{input} | reverse`"
+        );
+    }
+    Ok(())
+}

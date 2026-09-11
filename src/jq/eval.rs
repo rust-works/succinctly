@@ -9935,7 +9935,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::First => builtin_first::<W>(value, optional),
         Builtin::Last => builtin_last::<W>(value, optional),
         Builtin::Nth(n) => builtin_nth::<W, S>(n, value, optional),
-        Builtin::Reverse => builtin_reverse::<W>(value, optional),
+        Builtin::Reverse => builtin_reverse::<W, S>(value, optional),
         Builtin::Flatten => builtin_flatten::<W, S>(value, optional, 1),
         Builtin::FlattenDepth(depth) => builtin_flatten_depth::<W, S>(depth, value, optional),
         Builtin::GroupBy(f) => builtin_group_by::<W, S>(f, value, optional),
@@ -12680,7 +12680,27 @@ fn builtin_nth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 }
 
 /// Builtin: reverse - reverse array
-fn builtin_reverse<W: Clone + AsRef<[u64]>>(
+///
+/// jq defines it, it does not implement it:
+///
+/// ```jq
+/// def reverse: [.[length - 1 - range(0;length)]];
+/// ```
+///
+/// so the non-array answer is decided by **`length`**, not by type (#2730).
+/// Anything whose `length` is `0` -- `{}`, `null`, `""`, `0` -- never indexes
+/// and answers `[]`; a boolean fails inside `length` ("boolean (true) has no
+/// length"); everything else with a positive length reaches `.[n]` and fails
+/// there ("Cannot index object with number"). Captured against jq 1.7.1 and
+/// 1.8.2, which agree on every cell. This arm used to decide by type: `{}`,
+/// `null`, `0`, `""` raised the index error, booleans raised it too, and a
+/// string was *reversed* -- a guess from the first implementation that no
+/// pinned jq has ever done. `reverse_length_is_empty` is the shared rule;
+/// `eval_generic.rs`'s own arm asks it too.
+///
+/// yq mode is untouched: real yq (v4.53.3) rejects every non-array with
+/// "node at path [] is not an array", `{}`/`null`/`""` included.
+fn builtin_reverse<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
@@ -12694,23 +12714,35 @@ fn builtin_reverse<W: Clone + AsRef<[u64]>>(
             items.reverse();
             QueryResult::Owned(OwnedValue::Array(items))
         }
-        // reverse also works on strings. #1620/#1660: an undecodable string
-        // must raise, not silently substitute an empty string.
-        StandardJson::String(s) => match s.as_str() {
-            Ok(cow) => {
-                let reversed: String = cow.chars().rev().collect();
-                QueryResult::Owned(OwnedValue::String(reversed))
+        _ if S::TAG == EvalTag::Jq => match builtin_length::<W, S>(value.clone(), optional) {
+            QueryResult::Owned(len) if reverse_length_is_empty(&len) => {
+                QueryResult::Owned(OwnedValue::Array(Vec::new()))
             }
-            Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
+            QueryResult::Error(e) => QueryResult::Error(e),
+            // `optional` already suppressed `length`'s own error.
+            QueryResult::None => QueryResult::None,
+            _ => QueryResult::Error(EvalError::cannot_index_with_type(
+                type_name(&value),
+                "number",
+            )),
         },
-        // jq: null | reverse => []
-        StandardJson::Null => QueryResult::Owned(OwnedValue::Array(Vec::new())),
         _ if optional => QueryResult::None,
         _ => QueryResult::Error(EvalError::cannot_index_with_type(
             type_name(&value),
             "number",
         )),
     }
+}
+
+/// The one rule in jq's `def reverse: [.[length - 1 - range(0;length)]]`
+/// that decides a non-array's fate (#2730): a `length` of `0` makes
+/// `range(0;0)` empty, so the comprehension is `[]` and the value's type is
+/// never consulted. Anything else runs `.[n]` and fails there. Shared by both
+/// evaluators' `Reverse` arms -- each asks its own `length`, then asks this --
+/// so the two cannot drift on what "empty" means (`0` and `0.0` both are;
+/// jq's `length` of a number is its absolute value, so `-0` is too).
+pub(crate) fn reverse_length_is_empty(length: &OwnedValue) -> bool {
+    matches!(length, OwnedValue::Int(0)) || matches!(length, OwnedValue::Float(f) if *f == 0.0)
 }
 
 /// Builtin: flatten - flatten nested arrays (1 level)
@@ -64651,10 +64683,36 @@ mod tests {
             }
         );
 
-        // Reverse also works on strings
+        // #2730: `reverse` does NOT work on strings in any pinned jq -- this
+        // test used to assert `"olleh"`, a guess from the first
+        // implementation that neither jq 1.7.1 nor 1.8.2 has ever made
+        // (`"hello" | reverse` is `Cannot index string with number` in
+        // both, captured live). jq's own `def reverse:
+        // [.[length - 1 - range(0;length)]]` indexes the string and fails.
         query!(br#""hello""#, "reverse",
-            QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "olleh");
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "Cannot index string with number");
+            }
+        );
+
+        // #2730: the same def makes anything of `length` 0 answer `[]` --
+        // `range(0;0)` is empty, so the type is never consulted.
+        query!(br"{}", "reverse",
+            QueryResult::Owned(OwnedValue::Array(arr)) => assert!(arr.is_empty())
+        );
+        query!(br"null", "reverse",
+            QueryResult::Owned(OwnedValue::Array(arr)) => assert!(arr.is_empty())
+        );
+        query!(br"0", "reverse",
+            QueryResult::Owned(OwnedValue::Array(arr)) => assert!(arr.is_empty())
+        );
+        query!(br#""""#, "reverse",
+            QueryResult::Owned(OwnedValue::Array(arr)) => assert!(arr.is_empty())
+        );
+        // ..and a boolean fails inside `length`, not at the index.
+        query!(br"true", "reverse",
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "boolean (true) has no length");
             }
         );
     }
