@@ -3429,12 +3429,16 @@ ruled out), even though real yq supports every one of them:
 - **`tag =`, `head_comment =`, `foot_comment =`, `comments =`** raise `<slot> = ... is not
   yet supported`. Real yq's `.a tag = "!!str"` coerces the value's type, `.a head_comment
   = "hi"`/`.a foot_comment = "bye"` insert standalone comment lines, and `.a comments =
-  "x"` sets head, line and foot together. None has a write mechanism here yet: `NodeMeta`
-  (`src/jq/eval_generic.rs`) has no tag slot (#747), and head/foot comments have no backing
-  field at all (the single-slot `line_comments` side-table this issue's own triage plans to
-  widen — see #798's design-issue and triage comments). Tracked to land in PR2 (data-model
-  widening) through PR5 (`comments =`/`comments |=` and `...` recursive descent in yq
-  mode); cross-link #1079/#1080/#1085 above.
+  "x"` sets head, line and foot together. None has a write mechanism here yet, though the
+  reason has changed since this entry was written: `NodeMeta` (`src/jq/eval_generic.rs`)
+  still has no tag slot (#747), but head/foot comments *do* now have a backing field —
+  `NodeComments { head, line, foot }` (#2690), which the parser populates (#2704, #2718)
+  and the `head_comment`/`foot_comment` getters read (#2758). What is still missing on the
+  write side is the other half of that pipeline: `NodeMeta.head_foot_comment` is `None` at
+  every construction site, and neither emitter renders head/foot lines at all, so a write
+  would have nowhere to land and nothing to print it. See the identity-round-trip gap below.
+  Remaining: the write forms (`comments =`/`comments |=`) and `...` recursive descent in yq
+  mode; cross-link #1079/#1080/#1085 above.
 - **`style = "literal"`/`"folded"`/`"tagged"`** raise `style = "<name>" is not yet
   supported` (an unknown name still raises real yq's own `unknown style <name>`). Real yq
   renders all three (`a: |-\n  hello` / `a: >-\n  hello` / `a: !!int 1`); succinctly's DOM
@@ -3467,6 +3471,55 @@ Two rendering divergences, both readable back and both pinned:
   | .a + 1` is `2`). Done to the value rather than in the emitter so an existing
   tagged scalar whose cursor reports a quoted style (`a: !!int "5"`, #747) keeps its
   current (already divergent, pre-#798) rendering.
+
+### Metadata getters answer from the wrong node after `key` (#2763)
+
+A mapping entry's metadata lives on its **key** node, and succinctly loses the key node's
+cursor at a `key` stage, so every metadata builtin after `key` answers from a no-cursor
+default. Measured against pinned yq v4.53.3 on `a: # keyc\n  b: 1\n` (and `"qk": 1` for
+`style`):
+
+| `.a \| key \| …` | yq | succinctly |
+|---|---|---|
+| `line_comment` | `keyc` | `""` |
+| `line` / `column` | `1` / `1` | `0` / `0` |
+| `style` (quoted key) | `double` | `""` |
+| `head_comment` / `foot_comment` | the comment | `""` |
+| `tag`, `kind` | `!!str`, `scalar` | same — already correct |
+
+This is not specific to comments, and it is older than #798: `line_comment` has had it
+since #765's capture side landed, and `line`/`column`/`style` were never recorded at all.
+`head_comment`/`foot_comment` (#2758) inherit exactly the same gap rather than introducing
+a different one — deliberately, so one fix closes all six. The natural spelling is
+unaffected and correct: `.b | head_comment` is `""` in both tools, because the comment
+genuinely belongs to the key; only the explicit `| key |` step diverges.
+
+The cause is routing, not a missing read. `cursor_key` (`src/jq/eval_generic.rs`) already
+holds `field.key_cursor` and discards it, but a `... | key | <metadata>` pipe never reaches
+the position-carrying evaluator: `owned_identity_pipe_applies` gates on
+`rest.iter().any(needs_path_context)` and these builtins do not need path context, while
+widening that gate still loses to the walk route, which `path_context_walk_split` leaves a
+non-empty rest for and which evaluates the tail from a materialized node. #2763 records two
+designs that look right and are not — returning the key's cursor from `key` regresses
+`.a.b | key | path`, which is currently correct.
+
+Pinned by `head_foot_comment_798::key_node_head_comment_is_not_reachable_yet_798`
+(`tests/yq_cli_tests.rs`), which asserts the current wrong answers for both `head_comment`
+and `line_comment` so the fix updates them together.
+
+### Standalone comments are dropped from every YAML output route (#798)
+
+The parser captures head/foot comments and the getters read them, but no emitter prints
+them, so a round trip loses them — data loss, not just a missing getter. On
+`# lead\na: 1\n# mid\nb: 2\n\n# trail\n`, real yq keeps all three comments through `.`,
+`-P '.'`, `.a = 5`, `del(.b)` (minus `# mid`, which belongs to the deleted key) and
+`select(true)`; succinctly drops all of them on every one. `-o=json` drops them in both,
+which is correct.
+
+Two independent halves: the streaming emitter (`stream_yaml_value_at`, `src/yaml/light.rs`)
+reads comments straight off the live cursor at ~9 sites and never consults `NodeMeta` —
+plain `yq '.'` goes through here — while the DOM emitter (`emit_yaml_value_at_depth`,
+`yq_runner.rs`) does consult `NodeMeta` but is never given head/foot to print.
 
 Four known gaps this write shares with every other write form, none specific to #798:
 
