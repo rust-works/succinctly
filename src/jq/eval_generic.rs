@@ -9054,7 +9054,12 @@ fn each_pattern_alternatives_generic<S: EvalSemantics, V: DocumentValue>(
             // `eval_single`'s wildcard fallback -- confirmed by removing
             // this arm and observing the exact silently-wrong-value bug
             // #1660 fixes elsewhere reappear here too.
-            Flow::Escaped(Control::Error(e)) if e.is_decode_failure() => {
+            //
+            // #2132: widened from `is_decode_failure()` to the shared
+            // value-position predicate, in step with `eval.rs`'s
+            // `each_pattern_alternatives` -- a resource cap inside a `?//`
+            // body must not read as "try the next alternative" either.
+            Flow::Escaped(Control::Error(e)) if e.is_uncatchable_at_value_position() => {
                 return Flow::Escaped(Control::Error(e));
             }
             // #1457: `Break` falls through like `Error`, not immediately

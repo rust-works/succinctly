@@ -4570,9 +4570,9 @@ The five evaluator-imposed caps documented in this file -- `range`'s `MAX_RANGE`
 `while`/`until`'s `WHILE_UNTIL_MAX_STEPS` (#534/#2087), `reduce`/`foreach`'s
 `REDUCE_FOREACH_MAX_STEPS` (#695/#2079), `repeat`'s `MAX_ITERATIONS` (#2014), and a recursive
 `def` past `MAX_EVAL_FRAMES` (#1371) -- raise as `ErrorKind::ResourceLimit`
-(`src/jq/error.rs`), which every `?`/`try`/`catch` boundary treats exactly like a decode
-failure: never suppressed, never handed to the handler. Before #2132 they were plain errors,
-and the catch swallowed them:
+(`src/jq/error.rs`), which every catch boundary treats exactly like a decode failure: never
+suppressed by `?`, never handed to `catch`, and never a reason for `?//` to try the next
+destructuring alternative. Before #2132 they were plain errors, and the catch swallowed them:
 
 ```console
 $ echo null | jq -c '[range(100001)?] | length'            # jq 1.7.1 -- no cap at all
@@ -4602,9 +4602,19 @@ retroactively discards it: `range(100001)?` prints `0` through `99999` and *then
 stderr at exit 5, as #2089 established for the un-suppressed form. An early-stopping
 consumer never reaches the cap at all (`[limit(5; range(100001))?]` is `[0,1,2,3,4]`).
 
+**`?//` is a catch boundary too.** Review of the first cut found the destructuring-alternative
+retry (`try_pattern_alternatives`, `each_pattern_alternatives` and its generic twin, and
+`reduce`/`foreach`'s `is_retryable_control`) still consulting `is_decode_failure()` alone --
+#1620/#1660's own exclusion -- so a cap raised inside a `?//` body read as "try the next
+alternative": `[. as $x ?// $y | if $x != null then range(100002) else 1 end] | length`
+answered `100001` at exit 0. All of them, and `suppresses` (the ambient-`?` rule every fold
+construct shares), now use the one value-position predicate the `?`/`try` dispatch points
+always did.
+
 Pinned by `test_resource_limit_caps_are_uncatchable_2132`,
-`test_resource_limit_prefix_still_streams_before_the_cap_2132` and
-`test_resource_limit_tag_leaves_ordinary_errors_catchable_2132` (`tests/jq_cli_tests.rs`),
+`test_resource_limit_prefix_still_streams_before_the_cap_2132`,
+`test_resource_limit_tag_leaves_ordinary_errors_catchable_2132` and
+`test_resource_limit_is_not_a_destructuring_retry_2132` (`tests/jq_cli_tests.rs`),
 `resource_limit_is_uncatchable_by_tag_not_message_2132` (`src/jq/error.rs`), and the yq
 twin `test_resource_limit_caps_are_uncatchable_in_yq_mode_2132`.
 
