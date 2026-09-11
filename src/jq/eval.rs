@@ -6638,22 +6638,6 @@ fn each_alternative<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
-/// Demand-forwarding twin of [`eval_boolean`] (#2180 WP2a) -- `and`/`or`
-/// with each pairing's boolean pushed to `sink` as it is decided.
-///
-/// The loop is [`boolean_fanout_each`]'s, shared with the eager route; this
-/// only supplies [`eval_each`] as the operand strategy (so the left
-/// operand's outputs and the right operand's per-output re-evaluations both
-/// stop when the consumer does) and adapts the `bool` the loop speaks to the
-/// `Item` the consumer expects. See [`boolean_fanout_each`] for the oracle
-/// rows that pinned the loop shape and the short-circuit rule, and
-/// [`eval_each`]'s own `Expr::And`/`Expr::Or` arms for the `?//` rows this
-/// closes.
-///
-/// `optional` is forwarded to the operands, matching [`eval_boolean`]'s own
-/// `eval_single` strategy rather than `eval_each_generic`'s hardcoded
-/// `false` for a comparison operand -- this arm shadows `eval_boolean`, so
-/// it has to make the same choice `eval_boolean` does.
 /// The one `and`/`or` operand strategy for this evaluator (#2669): drive
 /// `operand` through [`eval_each`] and hand each output's truthiness bit to
 /// `bit_sink`.
@@ -6675,6 +6659,22 @@ fn boolean_operand_bits<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     })
 }
 
+/// Demand-forwarding twin of [`eval_boolean`] (#2180 WP2a) -- `and`/`or`
+/// with each pairing's boolean pushed to `sink` as it is decided.
+///
+/// The loop is [`boolean_fanout_each`]'s, and since #2669 the operand
+/// strategy is [`boolean_operand_bits`]'s, both shared with the collecting
+/// route; this only adapts the `bool` the loop speaks to the `Item` the
+/// consumer expects, and lets the consumer's [`Demand::Stop`] reach inside
+/// an operand (so the left operand's outputs and the right operand's
+/// per-output re-evaluations both stop when the consumer does). See
+/// [`boolean_fanout_each`] for the oracle rows that pinned the loop shape
+/// and the short-circuit rule, and [`eval_each`]'s own `Expr::And`/`Expr::Or`
+/// arms for the `?//` rows this closes.
+///
+/// `optional` is forwarded to the operands, the same choice [`eval_boolean`]
+/// makes (both go through [`boolean_operand_bits`]) rather than
+/// `eval_each_generic`'s hardcoded `false` for a comparison operand.
 fn each_boolean<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     left: &Expr,
     right: &Expr,
@@ -8118,8 +8118,8 @@ fn eval_negate<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// has run its course. A control from evaluating the right operand for a
 /// given left output instead ends the whole expression immediately,
 /// matching jq's generator not asking for further left outputs once one
-/// pairing has failed. `eval_operand` closes over whichever evaluator
-/// (plain vs. path-context) its caller wants.
+/// pairing has failed. `each_operand` is the lazy operand strategy (#2669),
+/// closing over whichever evaluator its caller wants.
 fn boolean_fanout_core<'a, W: Clone + AsRef<[u64]>>(
     each_operand: impl Fn(&Expr, &mut dyn FnMut(bool) -> Demand) -> Flow,
     left: &Expr,
@@ -8201,15 +8201,21 @@ pub(crate) fn boolean_fanout_bools(
 /// copy of *this* loop for the lazy arms would have been a second chance at
 /// the same drift.
 ///
-/// The strategy differs by caller, never the loop:
+/// What differs by caller is only what is done with the bits, never the
+/// loop -- and, since #2669, never the strategy either:
 ///
-/// * [`boolean_fanout_bools`] passes the eager one (evaluate the whole
-///   operand into a `Vec<bool>`, then replay), which is what the two
-///   collecting callers -- [`eval_boolean`] and
-///   `eval_generic::eval_boolean_generic` -- had before WP2a and still have.
-/// * [`each_boolean`] and `eval_generic::each_boolean_generic` pass
-///   [`eval_each`]/`eval_each_generic`, so a wrapping consumer's
-///   [`Demand::Stop`] reaches *inside* an operand -- and, with it, a `?//`
+/// * [`boolean_fanout_bools`] collects them into a `Vec<bool>` for the two
+///   collecting callers, [`eval_boolean`] and
+///   `eval_generic::eval_boolean_generic`. Between WP2a and #2669 it built
+///   an eager strategy for them (evaluate the whole operand, then replay),
+///   which is why those two routes could not interleave.
+/// * [`each_boolean`] and `eval_generic::each_boolean_generic` forward them
+///   to a sink.
+///
+/// Every caller passes the lazy strategy ([`boolean_operand_bits`] /
+/// `boolean_operand_bits_generic`, over [`eval_each`]/`eval_each_generic`),
+/// so a wrapping consumer's [`Demand::Stop`] reaches *inside* an operand
+/// on every route -- and, with it, a `?//`
 ///   bind in there ([#1519](https://github.com/rust-works/succinctly/issues/1519)'s
 ///   retry-on-stop rule). Captured live against jq 1.7.1, input `1`:
 ///   `[first((1 as $x ?// $y | 1) and true)]` is `[true,true]`, and so are
@@ -8234,9 +8240,10 @@ pub(crate) fn boolean_fanout_bools(
 /// contributes that boolean *without evaluating the right operand at all*
 /// (which is what makes `false and error("x")` answer `false`); every other
 /// left output re-evaluates the whole right operand and contributes one
-/// boolean per right output. The eager strategy cannot show the
+/// boolean per right output. An eager strategy cannot show the
 /// interleaving -- it has already finished the left operand before the first
-/// pairing -- so only the lazy arms move to jq's own order here.
+/// pairing -- which is why the collecting routes kept the pre-WP2a order
+/// until #2669 put them on the lazy strategy too.
 ///
 /// Controls follow [`boolean_fanout_bools`]'s pre-WP2a rules unchanged
 /// (#400/#494): a *left* escape fires only after the ordinary per-output
@@ -53423,11 +53430,13 @@ mod tests {
         );
     }
 
-    /// #2180: `push_truthiness`' borrowed-`Many` arm. `and`/`or` collect
-    /// their operands' truthiness through it, and a document iteration
-    /// (`.[]`) is the shape that hands it borrowed values rather than owned
-    /// ones -- the arm this PR's rewiring of the boolean operators left
-    /// without a caller among the existing tests.
+    /// #2180: a document iteration (`.[]`) as an `and`/`or` operand -- the
+    /// shape that hands the operand strategy borrowed values rather than
+    /// owned ones. Written for `push_truthiness`' borrowed-`Many` arm, which
+    /// `and`/`or` collected through until #2669 moved them onto
+    /// `boolean_operand_bits` (`eval_each` per item); that arm is now reached
+    /// only through `eval_if`. The behaviour this pins is unchanged either
+    /// way, so the test stays with its original name.
     #[test]
     fn test_boolean_operand_borrowed_many_truthiness_2180() {
         query!(

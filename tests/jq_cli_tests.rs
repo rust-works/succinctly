@@ -12028,12 +12028,14 @@ fn test_break_via_ltrimstr_argument_reaches_outer_label_833() -> Result<()> {
 
 #[test]
 fn test_boolean_and_propagates_halt_from_right_operand() -> Result<()> {
-    // `push_truthiness`'s `Halt` arm (#791), reached through `eval_boolean`'s
-    // right-operand fork -- `and`/`or` are generators over both operands
-    // here, not scalar short-circuit operators, so the right operand's
-    // stream is pushed through `push_truthiness` once per non-short-circuiting
-    // left output. A halt while evaluating the right operand must escape
-    // immediately rather than contribute a truthiness bit. Verified against
+    // A halt from the right operand of `and` (#791). `and`/`or` are
+    // generators over both operands here, not scalar short-circuit
+    // operators, so the right operand is re-driven once per
+    // non-short-circuiting left output -- through `push_truthiness`'s `Halt`
+    // arm when this was written, and since #2669 through
+    // `boolean_operand_bits`' `eval_each` drive, whose `Flow::Escaped`
+    // carries the same halt. Either way it must escape immediately rather
+    // than contribute a truthiness bit. Verified against
     // jq 1.7.1: `jq -n 'true and halt_error(4)'` exits 4 with no output on
     // either stream (`.` at the point `halt_error` runs is still `null`,
     // which prints nothing).
@@ -12050,7 +12052,7 @@ fn test_arithmetic_propagates_halt_from_right_operand() -> Result<()> {
     // `binary_fanout_core`'s right-operand fork -- shared by every
     // arithmetic and comparison operator (#768). A halt while evaluating
     // the right operand must escape immediately, the `OwnedValue`-collecting
-    // analog of `push_truthiness`'s arm `and`/`or` use above. Verified
+    // analog of the escape `and`/`or` make above. Verified
     // against jq 1.7.1: `jq -n '1 + halt_error(6)'` exits 6 with no output
     // on either stream.
     let (stdout, stderr, code) = run_jq_full(&["-n", "1 + halt_error(6)"], None)?;
@@ -47061,7 +47063,7 @@ fn test_wrong_arity_resolution_is_unchanged_2686() -> Result<()> {
 ///
 /// | filter | main | now |
 /// |---|---|---|
-/// | `(.,.) and true` (bare) | `true` | `true` |
+/// | `(.,.) and true` (bare) | `true` `true` | `true` `true` |
 /// | `first((.,.) and true)` | `true` | `true` |
 /// | `[limit(2; (.,.) and true)]` | `[true,true]` | `[true,true]` |
 /// | `[(.,.) and true]` | **exit 5** | `[true,true]` |
