@@ -39963,6 +39963,43 @@ fn test_reduce_register_reentry_is_jq_mode_only_on_the_write_side_2632() -> Resu
     Ok(())
 }
 
+/// #2747's yq-mode gate. jq's `flatten` widened, in jq mode, to reach the
+/// "flatten depth must not be negative" arm for `null`/`false`/`true`/a
+/// negative float via jq's own total ordering, not just a literal negative
+/// integer -- but real yq's own grammar rejects every one of those shapes
+/// (and even a bare negative integer literal) as `flatten`'s argument at
+/// *parse* time (`Error: bad expression, please check expression syntax`,
+/// live-verified against yq v4.53.3; yq's `flatten` takes a bare
+/// non-negative integer literal token, nothing else). So there is no
+/// reachable yq behaviour for the widening to match, and yq mode must keep
+/// its exact pre-#2747 wording -- caught by review on this PR, which found
+/// the first pass changed yq-mode text to jq's with no yq oracle behind it.
+#[test]
+fn test_flatten_negative_depth_widening_is_jq_mode_only_2747() -> Result<()> {
+    // Unaffected: same wording succinctly yq raised before #2747.
+    let (_stdout, stderr, code) = run_yq_stdin_with_stderr("[[1]] | flatten(-1)", "null\n", &[])?;
+    assert_eq!(code, 1, "stderr: {stderr:?}");
+    assert!(
+        stderr.contains("depth must be non-negative"),
+        "stderr: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("flatten depth must not be negative"),
+        "stderr: {stderr:?}"
+    );
+
+    for filter in ["[[1]] | flatten(null)", "[[1]] | flatten(false)"] {
+        let (_stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "null\n", &[])?;
+        assert_eq!(code, 1, "`{filter}` -- stderr: {stderr:?}");
+        assert!(
+            stderr.contains("expected number, got non-number"),
+            "`{filter}` -- stderr: {stderr:?}"
+        );
+    }
+
+    Ok(())
+}
+
 /// #2692, yq twin of `test_truthiness_probes_validate_nothing_2692` in
 /// `tests/jq_cli_tests.rs`: the same corpus through the YAML cursor (and, for
 /// the JSON-syntax rows, through yq's own reading of them -- most of the JSON
