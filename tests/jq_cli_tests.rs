@@ -47944,6 +47944,31 @@ fn range_bounds_keep_their_fanout_semantics_2698() -> Result<()> {
     Ok(())
 }
 
+/// #2698: a non-numeric bound raises, in each of the three positions -- the
+/// `step` position is the one no other test reached (it is the innermost
+/// closure of `each_range_generic`, so a bad `from` or `to` never gets
+/// there).
+///
+/// The `from`/`to` message matches jq 1.7.1 ("Range bounds must be
+/// numeric"). The `step` one does not: jq adds the step first and reports
+/// `number (0) and string ("a") cannot be added`, while succinctly's
+/// `range_num` rejects all three positions with the same bounds message.
+/// That divergence predates this change -- the old bridge route answered
+/// identically -- so this row pins succinctly's existing behaviour rather
+/// than jq's, and is not a claim of fidelity.
+#[test]
+fn range_rejects_a_non_numeric_bound_in_every_position_2698() -> Result<()> {
+    for filter in ["[range(\"a\";3)]", "[range(0;\"b\")]", "[range(0;3;\"c\")]"] {
+        let (_, err, code) = run_jq_full(&["-c", filter], Some("null"))?;
+        assert_ne!(code, 0, "#2698: `{filter}` must raise");
+        assert!(
+            err.contains("Range bounds must be numeric"),
+            "#2698: `{filter}` -- stderr: {err:?}"
+        );
+    }
+    Ok(())
+}
+
 /// #2698 keeps #2089's `MAX_RANGE` rule: truncation raises only once a
 /// consumer has taken the whole capped batch and still wants more.
 ///
