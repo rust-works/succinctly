@@ -14701,9 +14701,17 @@ fn path_context_item_to_owned<V: DocumentValue>(
 ) -> Result<OwnedValue, EvalError> {
     match item {
         GenericItem::OneCursor(c) => to_owned_cursor(&c),
+        // #2763: a key node carries its own already-decoded value, so this
+        // is the one shape here that does not re-derive it -- the second
+        // `value()` plus the tag and number-canonicalization lookups
+        // `to_owned_cursor` makes are what `[.[] | key]` was paying twice.
+        // Dropping the cursor is sound *because* of the emission's own gate:
+        // `key_node_spells` refuses a node with an explicit tag and one that
+        // is not a plain string, which are exactly the two things
+        // `to_owned_cursor` consults a cursor for.
+        GenericItem::OneCursorValue(_, v) => to_owned(&v),
         GenericItem::Owned(o) => Ok(o),
         GenericItem::One(_)
-        | GenericItem::OneCursorValue(..)
         | GenericItem::LazyKeys { .. }
         | GenericItem::LazyIndexRange(_)
         | GenericItem::LazySeq(_) => {
@@ -14734,14 +14742,20 @@ fn path_context_items_to_owned<V: DocumentValue>(
 /// `path`, an absent node's `null`, a constructed array -- makes the whole
 /// result owned, exactly as #2061's walk produced.
 fn path_context_items_to_result<V: DocumentValue>(items: Vec<GenericItem<V>>) -> GenericResult<V> {
-    if items
-        .iter()
-        .all(|item| matches!(item, GenericItem::OneCursor(_)))
-    {
+    if items.iter().all(|item| {
+        matches!(
+            item,
+            GenericItem::OneCursor(_) | GenericItem::OneCursorValue(..)
+        )
+    }) {
         let mut cursors = vec_with_capacity(items.len());
         for item in items {
-            if let GenericItem::OneCursor(c) = item {
-                cursors.push(c);
+            match item {
+                // #2763: a key node carries its decoded value alongside its
+                // cursor; either shape is a node, so neither forces the
+                // whole result owned.
+                GenericItem::OneCursor(c) | GenericItem::OneCursorValue(c, _) => cursors.push(c),
+                _ => unreachable!("the loop above admitted only cursor-bearing items"),
             }
         }
         return match cursors.len() {
@@ -15871,8 +15885,14 @@ fn path_context_emitting_value<V: DocumentValue>(
                 _ => Ok(owned(OwnedValue::Int(*i))),
             },
             Some(OwnedValue::String(key)) => Ok(Some(match &pos.node {
+                // `OneCursorValue`, not `OneCursor`: the key's value is
+                // already decoded here, and re-deriving it downstream costs
+                // a second `value()` plus the tag and number-canonicalization
+                // lookups `to_owned_cursor` makes -- half of what this
+                // emission originally added on `[.[] | key]`, where the node
+                // is materialized straight back into the string it came from.
                 PathNode::At(c) => match member_key_node(c, key) {
-                    Some(kc) => GenericItem::OneCursor(kc),
+                    Some(kc) => GenericItem::OneCursorValue(kc, kc.value()),
                     None => GenericItem::Owned(OwnedValue::String(key.clone())),
                 },
                 PathNode::Absent | PathNode::Owned(_) => {
@@ -16348,20 +16368,70 @@ fn member_key_node<C: DocumentCursor>(c: &C, expected: &str) -> Option<C> {
     key_node_spells(&kc, expected).then_some(kc)
 }
 
+/// Whether a key *spelled* like this could be resolved to something other
+/// than a string -- the prefilter that keeps [`key_node_spells`]'s type
+/// ladder off the common key.
+///
+/// Conservative in the only safe direction: `true` means "ask the node",
+/// never "this is not a string". The listed first bytes are every one a
+/// YAML `null`, bool or number can begin with (the core schema plus YAML
+/// 1.1's `y`/`n`/`on`/`off` spellings, which go-yaml still resolves), so a
+/// spelling this rejects cannot be retyped by any of them and the ladder
+/// would only confirm what the text already says.
+///
+/// Worth a function because the ladder is not free: `as_i64`/`as_f64`
+/// *parse* the scalar to prove it is not a number, and that is charged to
+/// every key. Measured on an M4 Pro over a 100k-key mapping,
+/// `[.[] | key] | length`: 19 ms of the 37 ms this emission originally
+/// added.
+fn key_spelling_may_retype(key: &str) -> bool {
+    matches!(
+        key.as_bytes().first(),
+        None | Some(
+            b'-' | b'+' | b'.' | b'0'
+                ..=b'9'
+                    | b't'
+                    | b'T'
+                    | b'f'
+                    | b'F'
+                    | b'n'
+                    | b'N'
+                    | b'y'
+                    | b'Y'
+                    | b'o'
+                    | b'O'
+                    | b'~'
+        )
+    )
+}
+
 /// Whether the key node `kc` is a plain string that materializes as exactly
 /// `expected` -- the scalar order [`to_owned_at_depth`] applies, without the
 /// allocation.
+///
+/// The `as_str` comparison is not redundant with the sibling hop and is
+/// never skipped: it is what keeps an **undecodable** key (#1247/#1642) on
+/// the owned path, where `key` echoes the raw-byte fallback spelling rather
+/// than raising the decode failure materializing its node would.
 fn key_node_spells<C: DocumentCursor>(kc: &C, expected: &str) -> bool {
     if kc.explicit_tag().is_some() {
         return false;
     }
     let v = kc.value();
+    if key_spelling_may_retype(expected) && !plain_string_value(&v) {
+        return false;
+    }
+    v.as_str().is_some_and(|s| s == expected)
+}
+
+/// The scalar-classification ladder [`to_owned_at_depth`] applies, asked as
+/// a yes/no: is this value a string rather than a `null`, a bool or a number?
+fn plain_string_value<V: DocumentValue>(v: &V) -> bool {
     !v.is_null()
         && v.as_bool().is_none()
         && v.number_literal().is_none()
         && v.as_i64().is_none()
         && v.as_f64().is_none()
-        && v.as_str().is_some_and(|s| s == expected)
 }
 
 /// The path from the document root to `c`, the node at every proper prefix
