@@ -1488,6 +1488,39 @@ fn test_from_file() -> Result<()> {
     Ok(())
 }
 
+// #2688: `$__loc__` names the *program text* as `"<top-level>"` for a
+// filter that isn't sourced from a module -- across the inline form, `-f`
+// file form, and nested inside another filter (`map(...)`) -- each row
+// cross-checked live against jq 1.7.1.
+#[test]
+fn test_loc_top_level_2688() -> Result<()> {
+    let (stdout, code) = run_jq_null("$__loc__", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), r#"{"file":"<top-level>","line":1}"#);
+
+    let (stdout, code) = run_jq_stdin("map($__loc__)", "[1,2]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(
+        stdout.trim(),
+        r#"[{"file":"<top-level>","line":1},{"file":"<top-level>","line":1}]"#
+    );
+
+    let mut filter_file = NamedTempFile::new()?;
+    writeln!(filter_file, "$__loc__")?;
+    let (output, _code) = spawn_with_signal_retry(
+        || {
+            let mut cmd = Command::new(succinctly_bin());
+            cmd.arg("jq").arg("-c").arg("-f").arg(filter_file.path());
+            cmd
+        },
+        Some(b"null"),
+    )?;
+    let stdout = String::from_utf8(output.stdout)?;
+    assert_eq!(stdout.trim(), r#"{"file":"<top-level>","line":1}"#);
+
+    Ok(())
+}
+
 // =============================================================================
 // Exit Status Tests
 // =============================================================================

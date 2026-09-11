@@ -2650,10 +2650,19 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // arm is what actually decides path-trackability.
         Expr::TrackedVar(v) => QueryResult::Owned(v.value.clone()),
         Expr::Loc { line } => {
-            // $__loc__ returns {"file": "<stdin>", "line": N}
-            // where N is the 1-based line number in the jq filter source
+            // #2688: `$__loc__` names the *program text*, not the input --
+            // jq's own `locfile` uses the literal string `<top-level>` for
+            // a filter that didn't come from a module (confirmed live
+            // against jq 1.7.1; the runner's own unresolved-call diagnostic
+            // already uses this same string, so the two now agree). Not
+            // `"<stdin>"`: that's jq's distinct *runtime* error prefix
+            // (`jq: error (at <stdin>:1): ...`), naming the input, not the
+            // filter -- two different strings for two different things.
+            // A def sourced from an `include`d module or `~/.jq` should
+            // report that module's own path instead, per jq 1.7.1
+            // (confirmed live) -- tracked separately, #2774.
             let mut obj = IndexMap::new();
-            obj.insert("file".into(), OwnedValue::String("<stdin>".into()));
+            obj.insert("file".into(), OwnedValue::String("<top-level>".into()));
             obj.insert("line".into(), OwnedValue::Int(*line as i64));
             QueryResult::Owned(OwnedValue::Object(obj))
         }
@@ -79681,10 +79690,11 @@ mod tests {
 
     #[test]
     fn test_loc_basic() {
-        // $__loc__ returns {"file": "<stdin>", "line": N}
+        // #2688: $__loc__ returns {"file": "<top-level>", "line": N} for a
+        // filter that isn't sourced from a module (matches jq 1.7.1)
         query!(b"null", "$__loc__",
             QueryResult::Owned(OwnedValue::Object(obj)) => {
-                assert_eq!(obj.get("file"), Some(&OwnedValue::String("<stdin>".into())));
+                assert_eq!(obj.get("file"), Some(&OwnedValue::String("<top-level>".into())));
                 assert_eq!(obj.get("line"), Some(&OwnedValue::Int(1)));
             }
         );
@@ -79702,10 +79712,10 @@ mod tests {
 
     #[test]
     fn test_loc_file() {
-        // $__loc__.file should be "<stdin>"
+        // #2688: $__loc__.file should be "<top-level>" (matches jq 1.7.1)
         query!(b"null", "$__loc__.file",
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "<stdin>");
+                assert_eq!(s, "<top-level>");
             }
         );
     }
