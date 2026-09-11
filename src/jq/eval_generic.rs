@@ -15908,7 +15908,7 @@ fn path_context_emitting_value<V: DocumentValue>(
                 // emission originally added on `[.[] | key]`, where the node
                 // is materialized straight back into the string it came from.
                 PathNode::At(c) => match member_key_node(c, key) {
-                    Some(kc) => GenericItem::OneCursorValue(kc, kc.value()),
+                    Some((kc, v)) => GenericItem::OneCursorValue(kc, v),
                     None => GenericItem::Owned(OwnedValue::String(key.clone())),
                 },
                 PathNode::Absent | PathNode::Owned(_) => {
@@ -16379,9 +16379,13 @@ fn cursor_slot<C: DocumentCursor>(c: &C) -> Result<Option<CursorSlot<C>>, EvalEr
 /// `true`) where succinctly's is typed, so a typed key node would break
 /// `select(key == "1")`, which matches yq today -- recorded in
 /// `docs/compliance/yq/limitations.md`.
-fn member_key_node<C: DocumentCursor>(c: &C, expected: &str) -> Option<C> {
+/// Returns the node *and the value it was checked against*: the check has to
+/// resolve the key's value anyway and the emitted item carries it, so handing
+/// it back is what keeps `value()` to one call per key.
+fn member_key_node<C: DocumentCursor>(c: &C, expected: &str) -> Option<(C, C::Value)> {
     let kc = c.prev_sibling()?;
-    key_node_spells(&kc, expected).then_some(kc)
+    let v = kc.value();
+    key_node_spells(&kc, &v, expected).then_some((kc, v))
 }
 
 /// Whether a key *spelled* like this could be resolved to something other
@@ -16429,7 +16433,7 @@ fn key_spelling_may_retype(key: &str) -> bool {
 /// never skipped: it is what keeps an **undecodable** key (#1247/#1642) on
 /// the owned path, where `key` echoes the raw-byte fallback spelling rather
 /// than raising the decode failure materializing its node would.
-fn key_node_spells<C: DocumentCursor>(kc: &C, expected: &str) -> bool {
+fn key_node_spells<C: DocumentCursor>(kc: &C, v: &C::Value, expected: &str) -> bool {
     // Unconditional: an explicit tag can change what the node *materializes
     // as* regardless of how the key is spelled (`!!null anything` resolves to
     // null), so this cannot ride the rare branch below the way the type
@@ -16437,8 +16441,7 @@ fn key_node_spells<C: DocumentCursor>(kc: &C, expected: &str) -> bool {
     if kc.explicit_tag().is_some() {
         return false;
     }
-    let v = kc.value();
-    if key_spelling_may_retype(expected) && !plain_string_value(&v) {
+    if key_spelling_may_retype(expected) && !plain_string_value(v) {
         return false;
     }
     v.as_str().is_some_and(|s| s == expected)
@@ -19640,7 +19643,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
         // `key_node_spells` is the same string/tag check the walk applies.
         Builtin::Key if cursor.is_some() => match cursor_slot(&cursor.expect("guarded")) {
             Ok(Some(CursorSlot::Value { key, key_cursor })) => match &key {
-                OwnedValue::String(s) if key_node_spells(&key_cursor, s) => {
+                OwnedValue::String(s) if key_node_spells(&key_cursor, &key_cursor.value(), s) => {
                     GenericResult::OneCursor(key_cursor)
                 }
                 _ => GenericResult::Owned(key),
@@ -22373,7 +22376,9 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
             let key_node = match (id.key_node, id.ancestors.as_slice(), id.base) {
                 (false, [], Some(c)) => match cursor_slot(&c) {
                     Ok(Some(CursorSlot::Value { key, key_cursor })) => match &key {
-                        OwnedValue::String(s) if key_node_spells(&key_cursor, s) => {
+                        OwnedValue::String(s)
+                            if key_node_spells(&key_cursor, &key_cursor.value(), s) =>
+                        {
                             Some(key_cursor)
                         }
                         _ => None,
@@ -33289,7 +33294,10 @@ mod tests {
         };
         // The O(1) hop the emission takes, and the check that guards it.
         assert!(value.prev_sibling().unwrap().same_node(&key_cursor));
-        assert!(member_key_node(&value, "b").unwrap().same_node(&key_cursor));
+        assert!(member_key_node(&value, "b")
+            .unwrap()
+            .0
+            .same_node(&key_cursor));
         assert!(
             member_key_node(&value, "elsewhere").is_none(),
             "the spelling has to match the member's own key"
