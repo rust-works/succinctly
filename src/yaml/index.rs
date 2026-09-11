@@ -20,7 +20,7 @@ use super::advance_positions::{build_cumulative_rank, OpenPositions};
 use super::end_positions::EndPositions;
 use super::error::YamlError;
 use super::light::YamlCursor;
-use super::parser::{build_semi_index, NodeComments};
+use super::parser::{build_semi_index, build_semi_index_json_strict, NodeComments, SemiIndex};
 use super::starts_seq_entry;
 
 /// Index structures for navigating YAML.
@@ -126,9 +126,26 @@ impl YamlIndex<Vec<u64>> {
     /// Returns [`YamlError::InputTooLarge`] for inputs over `u32::MAX` bytes
     /// (just under 4 GiB): the semi-index stores text positions as `u32`
     /// (#188). Other variants report malformed YAML.
-    pub fn build(yaml: &[u8]) -> Result<Self, YamlError> {
-        let semi = build_semi_index(yaml)?;
+    /// [`build`](Self::build) for input the caller already knows is JSON,
+    /// pairing the parse with [`mark_json_sourced`](Self::mark_json_sourced)
+    /// so the two can never drift apart (#2279).
+    ///
+    /// Prefer this over `build` + `mark_json_sourced`: the flow-sequence
+    /// delimiter rules real yq enforces for `-p json` (`[1,]`, `[,1]`,
+    /// `[1,,2]`) can only be applied while parsing, so a caller that marks
+    /// the index afterwards has already accepted the malformed input. See
+    /// `Parser::json_strict` for the exact scope.
+    pub fn build_json_sourced(yaml: &[u8]) -> Result<Self, YamlError> {
+        let mut index = Self::from_semi_index(yaml, build_semi_index_json_strict(yaml)?)?;
+        index.mark_json_sourced();
+        Ok(index)
+    }
 
+    pub fn build(yaml: &[u8]) -> Result<Self, YamlError> {
+        Self::from_semi_index(yaml, build_semi_index(yaml)?)
+    }
+
+    fn from_semi_index(yaml: &[u8], semi: SemiIndex) -> Result<Self, YamlError> {
         let ib_len = yaml.len();
         let ib_rank = build_ib_rank(&semi.ib);
         let containers_rank = build_containers_rank(&semi.containers);

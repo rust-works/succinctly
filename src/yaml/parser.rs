@@ -353,6 +353,31 @@ struct Parser<'a, const HAS_CR: bool> {
     /// (#710) needs the real bit position, since that's what every
     /// `YamlCursor` method (`self.bp_pos`) keys its lookups on.
     last_open_bp_pos: usize,
+
+    /// Enforce JSON's stricter flow-*sequence* delimiter rules (#2279).
+    ///
+    /// Set only for input the caller already knows is JSON, i.e. exactly the
+    /// callers that follow `YamlIndex::build` with
+    /// [`mark_json_sourced`](crate::yaml::YamlIndex::mark_json_sourced).
+    /// JSON is a subset of YAML's flow grammar, so the YAML parser accepts
+    /// it as-is -- but it also accepts `[1,]`/`[,1]`/`[1,,2]`, which real yq
+    /// rejects for `-p json` input, because its own JSON front end validates
+    /// array delimiters. `DocumentCursor::preceding_delimiter_ok`'s doc
+    /// comment names the invariant this restores: *every format but JSON
+    /// validates delimiters while parsing*. JSON-sourced YAML was the one
+    /// case that did neither -- a YAML parse that permits what JSON forbids,
+    /// feeding cursors whose delimiter checks all default to `true`.
+    ///
+    /// Deliberately a runtime flag rather than a third const generic: it
+    /// would multiply the `HAS_CR` monomorphizations (#340) for a branch
+    /// that is predictable and off the scalar-scanning hot path.
+    ///
+    /// **Sequences only.** Real yq's own object handling is *lenient* here
+    /// -- it ignores punctuation inside `{}` entirely and pairs up tokens
+    /// (`{"a":1,}`, `{,}`, `{"a" 1}` all parse) -- so extending this to flow
+    /// mappings would refuse input the reference accepts. Scalar grammar is
+    /// untouched for the same reason: yq accepts `[01]`/`[00]`/`[1.]`.
+    json_strict: bool,
 }
 
 impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
@@ -405,6 +430,7 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
             document_start_bp_pos: 0,
             pending_explicit_key: None,
             nesting_depth: 0,
+            json_strict: false,
             #[cfg(debug_assertions)]
             wrapper_slots: Vec::with_capacity(estimated_opens),
             #[cfg(debug_assertions)]
@@ -4523,6 +4549,15 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 });
             }
 
+            // #2279: a leading `,` (`[,1]`, and `[,]`'s first pass) is an
+            // element YAML reads as an empty scalar and JSON has no spelling
+            // for at all.
+            if first && self.json_strict && self.peek() == Some(b',') {
+                return Err(
+                    self.err_unexpected_char(self.pos, "expected value or ']' in flow sequence")
+                );
+            }
+
             if !first {
                 // Expect comma
                 if self.peek() != Some(b',') {
@@ -4533,8 +4568,20 @@ impl<'a, const HAS_CR: bool> Parser<'a, HAS_CR> {
                 self.advance(); // Skip `,`
                 self.skip_flow_whitespace();
 
-                // Allow trailing comma
+                // #2279: `[1,,2]` -- a second `,` where an element belongs.
+                if self.json_strict && self.peek() == Some(b',') {
+                    return Err(
+                        self.err_unexpected_char(self.pos, "expected value in flow sequence")
+                    );
+                }
+
+                // Allow trailing comma -- except for JSON-sourced input
+                // (#2279), where `[1,]` is exactly what real yq rejects.
                 if self.peek() == Some(b']') {
+                    if self.json_strict {
+                        return Err(self
+                            .err_unexpected_char(self.pos, "trailing ',' in JSON array (#2279)"));
+                    }
                     break;
                 }
             }
@@ -6257,7 +6304,21 @@ pub(crate) fn scan_tag_extent(bytes: &[u8], start: usize) -> (usize, bool) {
 /// Other variants report malformed YAML. (Pathological YAML can also push the
 /// BP bit count past `u32::MAX` before the text does; `BalancedParens`
 /// asserts its own ceiling as a loud backstop.)
+/// [`build_semi_index`], enforcing JSON's flow-sequence delimiter rules
+/// (#2279) -- for callers that already know the bytes are JSON and pair this
+/// with [`YamlIndex::mark_json_sourced`](crate::yaml::YamlIndex::mark_json_sourced).
+///
+/// See `Parser::json_strict` for what this does and does not tighten (flow
+/// sequences only; never flow mappings, never scalar grammar).
+pub fn build_semi_index_json_strict(input: &[u8]) -> Result<SemiIndex, YamlError> {
+    build_semi_index_impl(input, true)
+}
+
 pub fn build_semi_index(input: &[u8]) -> Result<SemiIndex, YamlError> {
+    build_semi_index_impl(input, false)
+}
+
+fn build_semi_index_impl(input: &[u8], json_strict: bool) -> Result<SemiIndex, YamlError> {
     // Text positions (bp_to_text/bp_to_text_end and the select samples and
     // rank arrays derived from them) are stored as u32, so inputs past
     // u32::MAX bytes would silently truncate offsets (#188). Every position
@@ -6273,9 +6334,13 @@ pub fn build_semi_index(input: &[u8]) -> Result<SemiIndex, YamlError> {
     // through at 16-32 bytes per iteration and leaves it warm in cache for the
     // parse that follows.
     if crate::util::simd::escape::contains_cr(input) {
-        Parser::<true>::new(input).parse()
+        let mut p = Parser::<true>::new(input);
+        p.json_strict = json_strict;
+        p.parse()
     } else {
-        Parser::<false>::new(input).parse()
+        let mut p = Parser::<false>::new(input);
+        p.json_strict = json_strict;
+        p.parse()
     }
 }
 
