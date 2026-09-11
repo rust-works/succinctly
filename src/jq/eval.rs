@@ -27963,12 +27963,11 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // static table cannot express because `inner` is arbitrary code.
         //
         // Resolving `inner` instead of evaluating it is what surfaces that
-        // navigation: the inner `Field`/`Index`/`Iterate`/`RecursiveDescent`
-        // arms already raise jq's exact wording against an untracked input,
-        // and a `TrackedVar` marker, a literal or `.` inside the brackets
-        // pass straight through, so `[5]`, `[$v]`, `[$v.b?]` and `[.]` stay
-        // accepted. jq drains the whole collect, so the inner bound is
-        // unlimited whatever the outer `keep` -- `keep` governs how many
+        // navigation: the inner `Field`/`Index`/`Slice`/`Iterate` arms raise
+        // jq's exact wording against an untracked input, and a literal, `.`
+        // or an empty constructor pass straight through, so `[5]`, `[.]` and
+        // `[]` stay accepted. jq drains the whole collect, so the inner bound
+        // is unlimited whatever the outer `keep` -- `keep` governs how many
         // *arrays* the consumer wants, and there is exactly one.
         //
         // Keyed on `!trackable`: a trackable input (`path([.a] | empty)`,
@@ -27978,21 +27977,54 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // only (ADR-0018): real yq's lexer rejects every shape that reaches
         // here, so there is no yq oracle, and yq mode keeps `skip_untracked`.
         //
-        // **Also keyed on the brackets holding no `TrackedVar`.** A marker
-        // can *re-establish* tracking -- `$v` whose frozen value is still the
-        // live register is not navigation, it is the register (#1573) -- but
-        // that comparison happens one level up, in `resolve_seq_stage`,
-        // against a `carried_register` this function is not handed. Resolved
-        // from here with `trackable: false`, `[$v.b?]` saw `$v` as just
-        // another untracked value and refused `.b` on it, where jq (and the
-        // catch-all, by value) accepts. So the marker case keeps the
-        // catch-all, exactly as before; only pure navigation on the ambient
-        // input is intercepted. Re-establishment inside the brackets needs
-        // the register threaded down, which is #2759.
+        // **Also keyed on `inner` containing none of the shapes whose own
+        // untracked handling is wrong.** Evaluating by value had been
+        // *masking* those bugs inside brackets, and routing the brackets
+        // through the resolver unmasks them -- turning working programs into
+        // errors, the one direction this fix must never move. Each is a
+        // pre-existing bare-stage bug with its own oracle bracket, kept on
+        // the catch-all here rather than fixed in passing:
+        //
+        // - `TrackedVar`: a marker *re-establishes* tracking -- `$v` whose
+        //   frozen value is still the live register is not navigation, it is
+        //   the register (#1573) -- but that comparison happens one level up
+        //   in `resolve_seq_stage`, against a `carried_register` this
+        //   function is not handed. Resolved from here, `[$v.b?]` saw `$v` as
+        //   just another untracked value and refused `.b` where jq accepts.
+        //   #2759.
+        // - `GetPath`: `getpath([])` refuses *eagerly* on an untracked input
+        //   (its own `keys.is_empty()` arm), where jq treats it as a
+        //   passthrough and refuses only at the terminal. `path(1 |
+        //   [getpath([])] | empty)` is accepted by jq. #2764.
+        // - `Recurse`/`RecurseF`/`RecurseCond`/`RecursiveDescent`: the shared
+        //   `recurse_untracked_error` guard refuses eagerly whether or not
+        //   `f` navigates -- `recurse(empty)`, `recurse(.+1; .<3)` and a
+        //   caught `(..)?` are all accepted by jq. And its error is
+        //   uncatchable here, so `[try (..)]` cannot rescue it either. #2764.
+        // - `Optional`: the parser erases the parentheses in `(.a)?`, which
+        //   is jq's `try .a` (a *caught* path error), into `.a?`, which is
+        //   jq's `INDEX_OPT` (an uncaught one). Bare `[.a?]` happens to agree
+        //   with jq either way, but `[(.a)? | f]` does not, and this function
+        //   cannot tell the two spellings apart. #2764.
+        //
+        // The scan is O(|inner|), the same order as resolving it.
         Expr::Array(inner)
             if S::TAG == EvalTag::Jq
                 && !trackable
-                && !any_subexpr(inner, &mut |e| matches!(e, Expr::TrackedVar(_))) =>
+                && !any_subexpr(inner, &mut |e| {
+                    matches!(
+                        e,
+                        Expr::TrackedVar(_)
+                            | Expr::Optional(_)
+                            | Expr::RecursiveDescent
+                            | Expr::Builtin(
+                                Builtin::GetPath(_)
+                                    | Builtin::Recurse
+                                    | Builtin::RecurseF(_)
+                                    | Builtin::RecurseCond(_, _)
+                            )
+                    )
+                }) =>
         {
             let mut items = Vec::new();
             let flow = resolve_node_sink::<S>(
