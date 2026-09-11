@@ -3231,6 +3231,15 @@ fn push_generic_document_validation_error<C: DocumentCursor>(
     }
 }
 
+/// The one rule every cursor-backed truthiness check in this file answers
+/// by: `is_falsy(Preserve)`, negated. Pulled out so `//`/`and`/`or`/`not`
+/// structurally cannot drift on what "truthy" means — previously enforced
+/// only by [`push_generic_truthiness`] and [`retain_truthy_generic`]'s
+/// matching doc comments (#2665 item 3).
+fn cursor_is_truthy<C: DocumentCursor>(c: &C) -> bool {
+    !c.is_falsy(JsonConvention::Preserve)
+}
+
 /// Append one truthiness bit per output of a `GenericResult` stream to
 /// `out`. Mirrors [`super::eval::push_truthiness`] for the generic
 /// evaluator's cursor-aware result type — used to fan `select`'s condition
@@ -3265,7 +3274,7 @@ fn push_generic_truthiness<V: DocumentValue>(
             // it to -- `Preserve` keeps a malformed number truthy here the
             // same way it always has (see `StreamableValue::is_falsy`'s own
             // doc comment for the convention this parameter selects).
-            out.push(!c.is_falsy(JsonConvention::Preserve));
+            out.push(cursor_is_truthy(&c));
         }
         GenericResult::Many(vs) => {
             for v in &vs {
@@ -3274,7 +3283,7 @@ fn push_generic_truthiness<V: DocumentValue>(
         }
         GenericResult::ManyCursor(cs) => {
             for c in &cs {
-                out.push(!c.is_falsy(JsonConvention::Preserve));
+                out.push(cursor_is_truthy(c));
             }
         }
         // A lazy keys array, materialized or not, sorted or not, is
@@ -3361,8 +3370,8 @@ fn owned_prefix_partial<V: DocumentValue, T>(
 ///
 /// Every arm answers truthiness by exactly the rule its
 /// `push_generic_truthiness` counterpart uses, so `//` and `and`/`or`/`not`
-/// cannot drift apart on what "truthy" means: `OneCursor`/`ManyCursor` read
-/// `is_falsy(Preserve)` and nothing else, validating nothing (#2692 -- see
+/// cannot drift apart on what "truthy" means: `OneCursor`/`ManyCursor` share
+/// [`cursor_is_truthy`] and nothing else, validating nothing (#2692 -- see
 /// that function's `OneCursor` arm for why reading truthiness decodes
 /// nothing and so raises nothing, and a malformed *number* stays truthy);
 /// `LazyKeys`/`LazyIndexRange` are array-shaped and therefore always truthy
@@ -3390,10 +3399,10 @@ fn retain_truthy_generic<V: DocumentValue>(result: GenericResult<V>) -> GenericR
             Err(e) => GenericResult::Error(e),
         },
         GenericResult::OneCursor(c) => {
-            if c.is_falsy(JsonConvention::Preserve) {
-                GenericResult::None
-            } else {
+            if cursor_is_truthy(&c) {
                 GenericResult::OneCursor(c)
+            } else {
+                GenericResult::None
             }
         }
         GenericResult::Many(vs) => {
@@ -3418,7 +3427,7 @@ fn retain_truthy_generic<V: DocumentValue>(result: GenericResult<V>) -> GenericR
         GenericResult::ManyCursor(cs) => {
             let mut kept: Vec<V::Cursor> = Vec::new();
             for c in cs {
-                if !c.is_falsy(JsonConvention::Preserve) {
+                if cursor_is_truthy(&c) {
                     kept.push(c);
                 }
             }
