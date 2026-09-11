@@ -45700,6 +45700,37 @@ mod typed_key_node_2785 {
         ])
     }
 
+    /// The native `with_entries` arm keeps `?`'s suppression and the
+    /// reassembly error exactly as the composed `to_entries | map(f) |
+    /// from_entries` had them: a body that raises, and a rebuilt key that
+    /// cannot be an object key, both raise without `?` and vanish under it.
+    #[test]
+    fn with_entries_raises_and_suppresses_as_before_2785() -> Result<()> {
+        const AB: &str = "a: 1\nb: 2\n";
+        for filter in [
+            "with_entries(.key = [1])",
+            "with_entries(.value |= error(\"boom\"))",
+        ] {
+            let (out, code) = run_yq_stdin(filter, AB, JSON)?;
+            assert_eq!(code, 1, "`{filter}`: {out:?}");
+        }
+        check(&[
+            ("[with_entries(.key = [1])?]", AB, JSON, "[]\n"),
+            (
+                "[with_entries(.value |= error(\"boom\"))?]",
+                AB,
+                JSON,
+                "[]\n",
+            ),
+            (
+                "with_entries(.key = [1])? // \"fallback\"",
+                AB,
+                JSON,
+                "\"fallback\"\n",
+            ),
+        ])
+    }
+
     /// The keys that must *not* retype: a quoted spelling, an explicitly
     /// tagged key, a JSON-sourced key (always a string), a string key
     /// beside a typed one, and the key of a JSON document in jq mode.

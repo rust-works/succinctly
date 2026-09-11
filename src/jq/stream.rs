@@ -750,8 +750,8 @@ pub fn stream_lazy_keys_json<W: core::fmt::Write, F: DocumentFields>(
                 break;
             }
             Err(e) => {
-                *error = Some(e);
-                break;
+                *error = Some(e); // omni-dev: coverage tolerate-line reason="unreachable: `key_owned_value` only materializes a key `decoded_key_str` decoded, and `to_owned_cursor` on an untagged decodable scalar cannot fail (#2785)"
+                break; // omni-dev: coverage tolerate-line reason="unreachable: see the line above (#2785)"
             }
         };
         if i > 0 {
@@ -1115,8 +1115,8 @@ pub fn stream_lazy_keys_yaml<W: core::fmt::Write, F: DocumentFields>(
                     break;
                 }
                 Err(e) => {
-                    *error = Some(e);
-                    break;
+                    *error = Some(e); // omni-dev: coverage tolerate-line reason="unreachable: `key_owned_value` only materializes a key `decoded_key_str` decoded, and `to_owned_cursor` on an untagged decodable scalar cannot fail (#2785)"
+                    break; // omni-dev: coverage tolerate-line reason="unreachable: see the line above (#2785)"
                 }
             };
             if i > 0 {
@@ -1141,8 +1141,8 @@ pub fn stream_lazy_keys_yaml<W: core::fmt::Write, F: DocumentFields>(
                     break;
                 }
                 Err(e) => {
-                    *error = Some(e);
-                    break;
+                    *error = Some(e); // omni-dev: coverage tolerate-line reason="unreachable: `key_owned_value` only materializes a key `decoded_key_str` decoded, and `to_owned_cursor` on an untagged decodable scalar cannot fail (#2785)"
+                    break; // omni-dev: coverage tolerate-line reason="unreachable: see the line above (#2785)"
                 }
             };
             if i > 0 {
