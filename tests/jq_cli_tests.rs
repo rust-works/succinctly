@@ -48402,3 +48402,56 @@ fn test_parenthesised_pipe_agrees_with_flat_pipe_under_first_2666() -> Result<()
     assert_eq!((flat.0.trim(), flat.2), ("3", 0));
     Ok(())
 }
+
+/// #2666: a `break` or `halt` raised by a `map` body is delivered from
+/// inside the validation window through `escape_via_sink` -- the same path a
+/// mid-sequence escape took before the window existed -- with nothing
+/// emitted. jq agrees on every row: `map` is atomic, so a `break` on the
+/// second element discards the first, and the enclosing `label` then yields
+/// nothing.
+#[test]
+fn test_break_and_halt_inside_the_map_window_2666() -> Result<()> {
+    let input = "[1,2,3]";
+    for (filter, want_out, want_code) in [
+        (
+            "label $o | map(if . == 2 then break $o else . end) | .[]",
+            "",
+            0,
+        ),
+        (
+            "[label $o | map(if . == 2 then break $o else . end) | .[]]",
+            "[]",
+            0,
+        ),
+        (
+            "label $o | map(if . == 2 then halt_error else . end) | .[]",
+            "",
+            5,
+        ),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (out.trim(), code),
+            (want_out, want_code),
+            "#2666: `{filter}` -- stderr: {err:?}"
+        );
+    }
+    Ok(())
+}
+
+/// `nth_with_n_generic`'s skipped-element force, reached through the
+/// result-returning twin (`map(nth(..))`): an element `nth` skips is still
+/// decoded, so a `map(10/.)` that divides by zero on a skipped `[0]` raises
+/// rather than being silently stepped over. The doc comment on that force
+/// gives this exact shape; it had no test on this route. Matches jq 1.7.1.
+#[test]
+fn test_nth_result_twin_forces_skipped_elements_2666() -> Result<()> {
+    let (out, err, code) = run_jq_full(
+        &["-c", "map(nth(2; .[] | map(10/.)))"],
+        Some("[[[1],[0],[2]]]"),
+    )?;
+    assert_eq!(code, 5, "stdout: {out:?} stderr: {err:?}");
+    assert!(out.trim().is_empty(), "nothing may be emitted, got {out:?}");
+    assert!(err.contains("cannot be divided"), "stderr: {err:?}");
+    Ok(())
+}

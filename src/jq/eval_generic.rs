@@ -23528,7 +23528,7 @@ mod tests {
         let run = |budget: Budget| -> (Vec<String>, Option<String>) {
             let seq = match eval_with_cursor(&map_expr, root) {
                 GenericResult::LazySeq(seq) => seq,
-                other => panic!("map(.+1) should be a LazySeq here, got {other:?}"),
+                other => panic!("map(.+1) should be a LazySeq here, got {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the fixture's map(.+1) is always a LazySeq; this arm is the test's own diagnostic (#2666)"
             };
             // A real truncating consumer stops once it has its `n`; a sink that
             // kept answering `Continue` past its own budget would pull the tail
@@ -23556,7 +23556,7 @@ mod tests {
             let flow = each_lazy_seq_iterate_sink::<JqSemantics, _>(*seq, &[], false, &mut sink);
             let err = match flow {
                 Flow::Escaped(Control::Error(e)) => Some(e.to_string()),
-                Flow::Escaped(other) => panic!("unexpected escape {other:?}"),
+                Flow::Escaped(other) => panic!("unexpected escape {other:?}"), // omni-dev: coverage tolerate-line reason="unreachable in a passing suite by design -- the fixture's only escape is Control::Error; this arm is the test's own diagnostic (#2666)"
                 Flow::Exhausted | Flow::Stopped { .. } => None,
             };
             (got, err)
