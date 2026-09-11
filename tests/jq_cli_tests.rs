@@ -28153,7 +28153,7 @@ fn test_label_does_not_shadow_same_named_variable_2739() -> Result<()> {
         ("1 as $x | label $x | (label $x | $x)", "1\n"),
         ("label $x | (2 as $x | $x)", "2\n"),
         ("1 as $x | label $x | (2, break $x, 3)", "2\n"),
-        (r#"def f: label $x | (1, break $x, 2); [f]"#, "[1]\n"),
+        (r"def f: label $x | (1, break $x, 2); [f]", "[1]\n"),
         ("def f($x): label $x | $x; f(1)", "1\n"),
     ] {
         let (out, err, code) = run_jq_full(&["-cn", filter], None)?;
