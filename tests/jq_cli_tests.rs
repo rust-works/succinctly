@@ -46023,6 +46023,12 @@ fn test_closed_terms_do_not_validate_2173() -> Result<()> {
         ("isempty(1)", "false"),
         ("any(range(3); . > 1)", "true"),
         ("all(range(3); . >= 0)", "true"),
+        // #2698: `range` with a *closed* bound was already here in spirit
+        // (`[range(3)]` above); these pin that the native arm keeps it so on
+        // every route, including the ones that used to bridge.
+        ("last(range(3))", "2"),
+        ("[range(0;3)]", "[0,1,2]"),
+        ("reduce range(3) as $x (0; .+$x)", "3"),
     ];
     for doc in docs {
         for (filter, want) in closed {
@@ -47963,6 +47969,60 @@ fn range_rejects_a_non_numeric_bound_in_every_position_2698() -> Result<()> {
         assert_ne!(code, 0, "#2698: `{filter}` must raise");
         assert!(
             err.contains("Range bounds must be numeric"),
+            "#2698: `{filter}` -- stderr: {err:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #2698: a `range` bound validates only what it reads -- the #2103/#2173
+/// divergence, one construct over, recorded in `limitations.md`.
+///
+/// The fault is a bad escape inside a *leaf value*, which `length` and `.b`
+/// never decode. That choice is the whole test: a structural fault at the
+/// root (`{123:1}`) is read by `length` itself and raises on every route,
+/// which is exactly what the first version of this PR checked and then
+/// wrongly reported as "malformed documents unchanged". Real jq 1.7.1
+/// rejects this document at parse time for every filter.
+#[test]
+fn range_bounds_validate_only_what_they_read_2698() -> Result<()> {
+    let doc = r#"{"a": "bad\x", "b": 5}"#;
+
+    // Reads the key count / a good sibling, never the bad scalar: answers.
+    for (filter, want) in [
+        ("[range(length)]", "[0,1]"),
+        ("first(range(length))", "0"),
+        ("[range(.b)]", "[0,1,2,3,4]"),
+        ("reduce range(length) as $x (0;.+$x)", "1"),
+        ("last(range(0;.b))", "4"),
+    ] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_eq!(
+            (out.trim(), code),
+            (want, 0),
+            "#2698: `{filter}` -- stderr: {err:?}"
+        );
+    }
+
+    // The other half, which keeps this from being a hole: a bound that DOES
+    // read the malformed scalar still raises, exactly as `.a | length` does.
+    // (Not bare `.a`: in jq mode that streams the raw bytes through as
+    // `"bad\x"` without decoding them -- the M2 passthrough, pre-existing
+    // and identical on both binaries -- so it is not a "reads the scalar"
+    // control here the way it is in yq mode's #2626 twin.)
+    for filter in [
+        ".a | length",
+        "[.a]",
+        "[range(.a|length)]",
+        "first(range(.a|length))",
+    ] {
+        let (_, err, code) = run_jq_full(&["-c", filter], Some(doc))?;
+        assert_ne!(
+            code, 0,
+            "#2698: `{filter}` must still raise -- stderr: {err:?}"
+        );
+        assert!(
+            err.contains("invalid escape"),
             "#2698: `{filter}` -- stderr: {err:?}"
         );
     }

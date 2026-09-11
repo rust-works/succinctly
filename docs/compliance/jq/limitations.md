@@ -3913,6 +3913,44 @@ Sanctioned by ADR-0018's #2103 amendment, like the two entries above. Pinned by
 duplicate-key half of #2626 is also pinned) and by the arithmetic rows added to
 `test_closed_terms_do_not_validate_2173`'s closed-probe lists in both suites.
 
+### `range` bounds validate only what they read (#2698)
+
+The same mechanism as the [#2626](https://github.com/rust-works/succinctly/issues/2626) entry
+above, one construct over. Both of `range`'s dispatch sites reached the eager evaluator
+through `bridge_ambient_input`, so a bound that reads the document — `range(length)`,
+`range(0; .b)` — materialized a full `OwnedValue` copy of it, and that walk validated every
+byte. [#2698](https://github.com/rust-works/succinctly/issues/2698) gives both sites a native,
+cursor-threaded arm (`each_range_generic`), so the bound now reads exactly what it reads and
+nothing else is validated.
+
+On `{"a": "bad\x", "b": 5}`, which jq 1.7.1 rejects at parse time for every filter:
+
+| filter                                | jq 1.7.1 | succinctly before | succinctly now |
+|---------------------------------------|----------|-------------------|----------------|
+| `length`                              | error    | `2` (exit 0)      | `2` — unchanged |
+| `[range(3)]`                          | error    | `[0,1,2]`         | `[0,1,2]` — unchanged |
+| `[range(length)]`                     | error    | error             | `[0,1]`        |
+| `first(range(length))`                | error    | error             | `0`            |
+| `[range(.b)]`                         | error    | error             | `[0,1,2,3,4]`  |
+| `reduce range(length) as $x (0;.+$x)` | error    | error             | `1`            |
+| `[range(.a \| length)]`               | error    | error — unchanged | error — unchanged |
+
+The last row is the rule stated positively: a bound that *does* read the malformed scalar
+still raises, exactly as bare `.a` does. Only the validation the bridge performed as a side
+effect of building an input it never needed is gone — the accident #2173's own entry
+describes, arrived at from a fifth direction. Same in yq mode (`--jq-extensions`), where
+real yq rejects the document at read time and succinctly now answers.
+
+**This entry exists because the first version of the PR claimed the opposite.** It was
+checked against `{123: 1, "b": 2}` — a *structural* fault at the root, which `length` itself
+reads and so still raises on both binaries — and that was taken as "unchanged in both
+directions". A fault the bound does *not* read is the case that moves, and the check has to
+be built from one. The #2797 review caught it with a bad escape inside a leaf value.
+
+Sanctioned by ADR-0018's #2103 amendment, like the entries above. Pinned by the `range`
+rows in `test_closed_terms_do_not_validate_2173` (jq) and
+`range_bounds_validate_only_what_they_read_2698` (yq).
+
 ### A fault found by walking to it leaves the prefix on stdout
 
 succinctly is a semi-index and finds a malformed document only when the walk reaches the
