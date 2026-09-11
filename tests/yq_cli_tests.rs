@@ -6679,9 +6679,14 @@ fn test_yaml_explicit_tag_eq_and_arithmetic_resolve_747() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(eq_str.trim(), "true");
 
+    // `true`, not `false`: the tag resolves the node to the string `"1"`,
+    // and yq's `==` then compares that text against `1`'s text (#2785,
+    // captured live from v4.53.3 -- the earlier `false` pin here was never
+    // captured). `tag` still answers `!!str`, so the tag *is* honoured; it
+    // just cannot make two identical texts unequal.
     let (eq_num, code) = run_yq_stdin(".a == 1", "a: !!str 1\n", &[])?;
     assert_eq!(code, 0);
-    assert_eq!(eq_num.trim(), "false");
+    assert_eq!(eq_num.trim(), "true");
 
     let (add, code) = run_yq_stdin(".a + 1", "a: !!int \"5\"\n", &[])?;
     assert_eq!(code, 0);
@@ -6697,11 +6702,24 @@ fn test_yaml_explicit_tag_eq_and_arithmetic_resolve_747() -> Result<()> {
     assert_eq!(code, 0);
     assert_eq!(eq_null.trim(), "true");
 
+    // Real yq answers `false` here (captured, v4.53.3): its `==` compares
+    // the node's *text* `yes` against `true` (#2785). The tag resolves the
+    // value to `Bool(true)` on the way to `OwnedValue`, and that spelling is
+    // gone by the time `==` runs -- the same spelling class as `.a |
+    // tostring` printing `"true"` where yq prints `"yes"`. A recorded
+    // residual, not a target.
     let (eq_bool, code) = run_yq_stdin(".a == true", "a: !!bool \"yes\"\n", &[])?;
     assert_eq!(code, 0);
     assert_eq!(eq_bool.trim(), "true");
 
+    // `false`, as in real yq (captured): text `5` against `5.0`. The tag
+    // still makes the node a float -- `.a == 5` is `true` in both, and the
+    // materialized value is what `tagged_scalar_to_owned`'s Float arm built.
     let (eq_float, code) = run_yq_stdin(".a == 5.0", "a: !!float \"5\"\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(eq_float.trim(), "false");
+
+    let (eq_float, code) = run_yq_stdin(".a == 5", "a: !!float \"5\"\n", &[])?;
     assert_eq!(code, 0);
     assert_eq!(eq_float.trim(), "true");
 
@@ -22602,12 +22620,18 @@ fn test_yq_ordering_still_widens_int_and_float_950() -> Result<()> {
     Ok(())
 }
 
-/// Sanity: a strict numeric-vs-non-numeric comparison is unaffected --
-/// `2 == "2"` is `false` in both jq and yq, and #950's gate only fires
-/// when *both* operands are already numeric.
+/// Sanity: #950's gate only fires when *both* operands are numeric. A
+/// numeric-vs-string comparison is decided by yq's text rule instead
+/// (#2785): `2 == "2"` is `true` in real yq (captured live from v4.53.3 --
+/// this test pinned `false` from memory before #2785 captured it), and
+/// `false` in jq.
 #[test]
 fn test_yq_equality_numeric_vs_string_unaffected_950() -> Result<()> {
     let (out, code) = run_yq_stdin(r#". == "2""#, "2", &[])?;
+    assert_eq!(code, 0, "out: {out:?}");
+    assert_eq!(out.trim(), "true");
+
+    let (out, code) = run_yq_stdin(r#". == "2.0""#, "2", &[])?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "false");
     Ok(())
@@ -45319,4 +45343,141 @@ fn test_yq_sort_keys_vivifies_past_a_fanout_known_gap_2870() -> Result<()> {
         "a:\n  - b: 2\n    q: 1\n  - q: 3\n    b: null"
     );
     Ok(())
+}
+
+/// #2785: real yq's `==`/`!=` between two scalars compares their *text*, with
+/// its wildcard matcher applied to the right-hand operand -- not jq's typed
+/// equality. See `eval::yq_scalar_text_eq`. Every expectation below was
+/// captured live from yq v4.53.3 with `-o=json -I0`.
+mod yq_text_equality_2785 {
+    use super::run_yq_stdin;
+    use anyhow::Result;
+
+    /// One member per (type, spelling) pairing the rule has to tell apart.
+    const VALS: &str = "a: 1\nb: \"1\"\nc: true\nd: \"true\"\ne: null\nf: \"null\"\n\
+                        g: 1.0\nh: \"1.0\"\ni: ~\nj: \"~\"\nl: !!str 1\nm: abc\n";
+
+    fn check(rows: &[(&str, &str)]) -> Result<()> {
+        for (filter, want) in rows {
+            let (out, code) = run_yq_stdin(filter, VALS, &["-o=json", "-I=0"])?;
+            assert_eq!(code, 0, "`{filter}` exited {code}: {out:?}");
+            assert_eq!(out, format!("{want}\n"), "`{filter}`");
+        }
+        Ok(())
+    }
+
+    /// Type is irrelevant: a number, a bool and a string with the same text
+    /// are equal, and the same number spelled two ways is not.
+    #[test]
+    fn scalars_compare_by_text_2785() -> Result<()> {
+        check(&[
+            (".a == .b", "true"),
+            (".b == .a", "true"),
+            ("1 == \"1\"", "true"),
+            ("\"1\" == 1", "true"),
+            (".c == .d", "true"),
+            ("true == \"true\"", "true"),
+            (".l == 1", "true"),
+            (".l == .a", "true"),
+            (".a == .g", "false"),
+            ("1 == 1.0", "false"),
+            (".g == .h", "true"),
+            ("1.0 == \"1.0\"", "true"),
+            (".a != .b", "false"),
+            (".a != .g", "true"),
+            ("\"a\" == \"A\"", "false"),
+            ("(1 + 1) == \"2\"", "true"),
+            ("(0.5 + 0.5) == 1", "true"),
+            ("(0.5 + 0.5) == \"1\"", "true"),
+            (".a == (.b | tonumber)", "true"),
+        ])
+    }
+
+    /// `null` is the one type the rule keeps: a `!!null` left operand equals
+    /// only another `!!null`, while a `!!null` *right* operand is just the
+    /// text `null` to a scalar on the left.
+    #[test]
+    fn null_is_typed_on_the_left_and_text_on_the_right_2785() -> Result<()> {
+        check(&[
+            (".e == .i", "true"),
+            ("null == \"null\"", "false"),
+            (".e == .f", "false"),
+            ("null == \"*\"", "false"),
+            ("null == 0", "false"),
+            ("null != \"null\"", "true"),
+            ("\"null\" == null", "true"),
+            (".f == .e", "true"),
+            ("\"null\" != null", "false"),
+            ("0 == null", "false"),
+            ("\"nul?\" == null", "false"),
+            (".e == .j", "false"),
+            (".i == \"~\"", "false"),
+        ])
+    }
+
+    /// The right-hand operand is a pattern: `*` is zero or more bytes, `?`
+    /// exactly one byte, nothing else is special. The left never is.
+    #[test]
+    fn the_right_operand_is_a_wildcard_pattern_2785() -> Result<()> {
+        check(&[
+            (".m == \"a*\"", "true"),
+            ("\"abc\" == \"a*\"", "true"),
+            ("\"a*\" == \"abc\"", "false"),
+            ("\"abc\" == \"a?c\"", "true"),
+            ("\"abc\" != \"a*\"", "false"),
+            ("1 == \"*\"", "true"),
+            (".a == \"*\"", "true"),
+            ("true == \"t*\"", "true"),
+            ("\"Abc\" == \"a*\"", "false"),
+            ("\"a\" == \"[a]\"", "false"),
+            ("\"\" == \"\"", "true"),
+            ("\"\" == \"*\"", "true"),
+            ("\"a\" == \"\"", "false"),
+            ("\"é\" == \"?\"", "false"),
+            ("\"é\" == \"??\"", "true"),
+            ("[.[] | select(. == \"1*\")] | length", "5"),
+            (".[] | select(. == \"a*\")", "\"abc\""),
+        ])
+    }
+
+    /// Only `==`/`!=` take the text rule; the rest of the equality family
+    /// keeps its typed answer, and containers keep structural equality.
+    /// The first five rows differ from real yq (`[1]`, `[[1,"1"]]`, `1`,
+    /// `false`, `false`) and are recorded divergences in
+    /// `docs/compliance/yq/limitations.md`, pinned here so a change to any
+    /// of them is a deliberate one; the rest already agree with yq and
+    /// guard that the text rule stops at the scalar boundary.
+    #[test]
+    fn the_rest_of_the_equality_family_is_unchanged_2785() -> Result<()> {
+        check(&[
+            ("[.a, .b] | unique", "[1,\"1\"]"),
+            ("[.a, .b] | group_by(.)", "[[1],[\"1\"]]"),
+            ("[.a, .b] | group_by(.) | length", "2"),
+            ("[1] == [1]", "true"),
+            (". == .", "true"),
+            // Agree with yq already.
+            ("{\"x\": .a} == {\"x\": .b}", "false"),
+            ("[.a] == [.b]", "false"),
+            ("[.a] | contains([\"1\"])", "false"),
+            ("[.a, .g] | unique", "[1,1.0]"),
+            ("[1] == null", "false"),
+            ("null == [1]", "false"),
+        ])
+    }
+
+    /// jq mode is untouched: `1 == "1"` is `false` there, as in jq 1.7.1.
+    #[test]
+    fn jq_mode_keeps_typed_equality_2785() -> Result<()> {
+        for (filter, want) in [
+            ("1 == \"1\"", "false\n"),
+            ("\"abc\" == \"a*\"", "false\n"),
+            ("1 == 1.0", "true\n"),
+            ("\"null\" == null", "false\n"),
+        ] {
+            let (out, code) = super::run_jq_stdin(filter, "{}", &[])?;
+            assert_eq!(code, 0, "`{filter}`");
+            assert_eq!(out, want, "`{filter}`");
+        }
+        Ok(())
+    }
 }
