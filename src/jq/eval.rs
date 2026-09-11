@@ -706,6 +706,7 @@ fn yq_scalar_text<S: EvalSemantics>(value: &OwnedValue) -> Cow<'_, str> {
         }
         OwnedValue::Array(_) | OwnedValue::Object(_) => {
             unreachable!("yq_scalar_text_eq routes containers to the structural rule")
+            // omni-dev: coverage tolerate-line reason="unreachable: the sole caller (`yq_scalar_text_eq`) returns `None` for any container operand before this is called; kept for exhaustiveness (#2785)"
         }
     }
 }
