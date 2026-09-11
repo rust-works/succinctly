@@ -3710,8 +3710,11 @@ the same change.
 `scripts/jq-m2-streaming-sweep.expected` recorded the *doubled* spelling for
 `. as $x | $x` while the binary emitted the raw one. The binary is right: a plain `$x`
 reference forwards the cursor rather than materializing, so raw is exactly what the rule
-above prescribes — the wording needs no narrowing, and what went stale was the golden,
-against a route that became a passthrough. Measured across the boundary on
+above prescribes — the wording needs no narrowing, and what had gone stale was the golden,
+against a route that became a passthrough. (The mismatch is no longer observable: #2692
+regenerated the golden as a side effect of adding filters, and recorded the drift as
+pre-existing rather than absorbing it silently. Running the sweep today shows a clean
+table — the rows below, not the sweep, are what now holds the answer.) Measured across the boundary on
 `{"a\q":1,"b":2}`:
 
 | raw (never materialized) | doubled (materialized) |
@@ -3725,7 +3728,8 @@ either side contradicts the rule, which is what makes "the golden was stale" the
 rather than "the rule is too broad". jq 1.7.1 has no opinion to appeal to — it rejects both
 documents at parse time — so this is succinctly's own rule throughout.
 
-The sweep is a verification tool, not a CI gate, which is how the drift went unnoticed;
+The sweep is a verification tool, not a CI gate, which is how the drift survived long
+enough to be absorbed by an unrelated `--update`;
 `test_undecodable_key_spelling_follows_materialization_2710` (`tests/jq_cli_tests.rs`) now
 pins both halves of the boundary where CI runs them. The sweep's own `FILTERS` grouping
 ("materializing eager twin") is a historical label from the two-route era and no longer

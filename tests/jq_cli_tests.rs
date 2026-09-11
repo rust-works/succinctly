@@ -47651,7 +47651,9 @@ fn test_resource_limit_is_not_a_destructuring_retry_2132() -> Result<()> {
 /// is succinctly's own documented rule, not a fidelity question.
 ///
 /// The sweep is a verification tool, not a CI gate — which is how the drift
-/// went unnoticed. These rows are.
+/// went unnoticed until #2692 regenerated the golden over it. These rows are
+/// the CI-gated half, so the next such drift fails a build rather than
+/// waiting for someone to run the sweep and read a 154-row `--update`.
 #[test]
 fn test_undecodable_key_spelling_follows_materialization_2710() -> Result<()> {
     for doc in [r#"{"a\q":1,"b":2}"#, r#"{"\ud800":1,"b":2}"#] {
