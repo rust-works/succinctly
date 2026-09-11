@@ -1,0 +1,9 @@
+a: 1
+b: "1"
+c: true
+d: "true"
+e: null
+f: "null"
+g: 1.0
+i: ~
+m: abc

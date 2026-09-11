@@ -76,6 +76,7 @@ pub mod escape;
 mod eval;
 pub mod eval_generic;
 mod expr;
+mod glob;
 mod lazy;
 mod parser;
 pub mod resolve;
