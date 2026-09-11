@@ -12692,14 +12692,17 @@ fn builtin_nth<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// and answers `[]`; a boolean fails inside `length` ("boolean (true) has no
 /// length"); everything else with a positive length reaches `.[n]` and fails
 /// there ("Cannot index object with number"). Captured against jq 1.7.1 and
-/// 1.8.2, which agree on every cell. This arm used to decide by type: `{}`,
-/// `null`, `0`, `""` raised the index error, booleans raised it too, and a
-/// string was *reversed* -- a guess from the first implementation that no
-/// pinned jq has ever done. `reverse_length_is_empty` is the shared rule;
-/// `eval_generic.rs`'s own arm asks it too.
+/// 1.8.2, which agree on every cell. This arm used to decide by type, in
+/// both modes: `null` answered `[]`, a string was *reversed* (so `""` came
+/// back as `""`) -- both guesses from the first implementation that no
+/// pinned jq or yq has ever made -- and everything else, `{}`, `0` and the
+/// booleans included, raised the index error. `reverse_length_is_empty` is
+/// the shared rule; `eval_generic.rs`'s own arm asks it too.
 ///
-/// yq mode is untouched: real yq (v4.53.3) rejects every non-array with
-/// "node at path [] is not an array", `{}`/`null`/`""` included.
+/// yq mode takes the fall-through only: real yq (v4.53.3) rejects every
+/// non-array with "node at path [] is not an array", `{}`/`null`/`""`
+/// included, so dropping the `null`/string arms moved this route toward yq
+/// as well (`.a |= reverse` on `{}` used to write `{"a":[]}`; yq errors).
 fn builtin_reverse<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
@@ -64715,6 +64718,32 @@ mod tests {
                 assert_eq!(e.message, "boolean (true) has no length");
             }
         );
+    }
+
+    /// #2730: `builtin_reverse`'s jq-mode arm forwards `length`'s own
+    /// `optional` suppression (`QueryResult::None`) rather than turning it
+    /// into an index error. No real syntax reaches a builtin with
+    /// `optional = true` (`reverse?` parses to `Expr::Optional`, whose catch
+    /// evaluates the inner builtin at the ambient `optional` -- see
+    /// `test_generic_plain_map_optional_on_non_container_is_unreachable_via_parser_725`
+    /// in `eval_generic.rs`), so pin the arm by calling the dispatcher
+    /// directly, as that test does.
+    #[test]
+    fn test_builtin_reverse_forwards_lengths_optional_suppression_2730() {
+        let json_bytes: &[u8] = br"true";
+        let index = JsonIndex::build(json_bytes);
+        let cursor = index.root(json_bytes);
+        let expr = Expr::Builtin(Builtin::Reverse);
+        assert!(matches!(
+            eval_single::<Vec<u64>, JqSemantics>(&expr, cursor.value(), true),
+            QueryResult::None
+        ));
+        // The positive control: the same input un-suppressed is `length`'s
+        // own error, not the fall-through index error.
+        match eval_single::<Vec<u64>, JqSemantics>(&expr, cursor.value(), false) {
+            QueryResult::Error(e) => assert_eq!(e.message, "boolean (true) has no length"),
+            other => panic!("expected length's error, got: {other:?}"),
+        }
     }
 
     #[test]
