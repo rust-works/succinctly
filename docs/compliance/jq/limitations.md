@@ -2897,11 +2897,19 @@ a pipe, under `try`/`?`/`//`, in a `def` body, as a `foreach` source — leaked 
 regardless of who was downstream. It now asks: every sink carries a
 [`Budget`](../../../src/jq/eval_generic.rs) (`Unbounded` unless a truncating consumer says
 `AtMost(n)`), and `each_lazy_seq_iterate_sink` validates the first `n` elements of `map(f)`
-*before* the first output leaves — all of them when unbounded. So the divergence is exactly:
+*before* the first output leaves — all of them when unbounded. So the divergence is bounded
+by:
 
-> the first `n` elements of `map(f)` are validated before the first output, where `n` is the
-> truncating consumer's count; an element past that window is never run if the consumer
-> stops before reaching it.
+> **at least** the first `n` elements of `map(f)` are validated before the first output, where
+> `n` is the truncating consumer's count; an element past that window is run only if the
+> consumer's remaining stages pull it.
+
+"At least", not "exactly": a stage after `.[]` that *expands* an element (`(.,.)`) or that a
+`try`/`//`/`as` closure interposes resets the count upward, so more may be validated than the
+consumer strictly needed — the safe direction. `nth(k; ..)` and `.[k]` validate `k + 1`
+elements whatever bound the consumer behind them carries, because that is how many they must
+examine; `limit(n; ..)` composes with the consumer behind it (`first(limit(3; ..))` validates
+one).
 
 `limit(2; ..)` on `[1,2,"x"]` is the worked example of what still diverges — two elements
 are pulled, both good, the consumer stops, the third is never run — while `limit(2; ..)` on
@@ -2921,10 +2929,14 @@ $ echo '[1,"x",3]' | succinctly jq -c 'limit(3; map(.+1) | .[])'    # error, exi
 Two shapes that used to diverge now match jq for free: `first(try (map(f)|.[]) catch c)`
 and `first((map(f)|.[]) // 0)`. A `try`/`//` interposes its own closure between `first` and
 the producer, and that closure carries the `Unbounded` default — so `map` is atomic inside
-it, and `try` sees an error and no output, as in jq. The design allows a forwarding wrapper
-that would let such closures inherit `first`'s bound for speed; it is deliberately not
-built, because it can only make a shape *less* jq-like, and ADR-0018 puts fidelity ahead of
-that O(n). See [ADR-0022](../../adrs/adr-0022.md).
+it, and `try` sees an error and no output, as in jq. The cost is real and accepted under
+ADR-0018's decision order: those shapes, and `label $o | (map(f) | .[] | ., break $o)` (jq's
+own `first`, whose `break` no static budget can see), run in ~0.58 s on 2M elements against
+the flat `first(map(f) | .[])`'s 0.047 s — roughly jq's own 0.48 s, rather than the 11× lead
+the divergence used to buy them. A forwarding wrapper *is* applied at one place, for the
+opposite reason: the parenthesised `first((map(f) | .[]) | g)` is the same program as the flat
+spelling and must answer and run alike, which it now does. See
+[ADR-0022](../../adrs/adr-0022.md).
 
 Pinned by [`test_map_iterate_atomicity_outside_truncators_2666`](../../../tests/jq_cli_tests.rs)
 (every row above, both directions, one assertion each — the preserved rows carry the
