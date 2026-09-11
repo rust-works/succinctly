@@ -3508,40 +3508,42 @@ Two rendering divergences, both readable back and both pinned:
   tagged scalar whose cursor reports a quoted style (`a: !!int "5"`, #747) keeps its
   current (already divergent, pre-#798) rendering.
 
-### Metadata getters answer from the wrong node after `key` (#2763)
+### A typed mapping key is not emitted as a node by `key` (#2763 residual)
 
-A mapping entry's metadata lives on its **key** node, and succinctly loses the key node's
-cursor at a `key` stage, so every metadata builtin after `key` answers from a no-cursor
-default. Measured against pinned yq v4.53.3 on `a: # keyc\n  b: 1\n` (and `"qk": 1` for
-`style`):
+`key` emits the key **node** of a string-keyed member since #2763, so `line_comment`,
+`head_comment`, `foot_comment`, `line`, `column`, `style` and `anchor` after it read the
+key's own metadata, matching yq v4.53.3. A *typed* (non-string) key does not: `1: x`,
+`true: y` and `null: z` keep the display string `key` always emitted, so their metadata
+still reads the no-cursor default (`.["1"] | key | line` is `0`; yq answers `1`), and
+`[.[] | key]` prints `["1", "true", "null"]` where yq prints `[1, true, null]`.
 
-| `.a \| key \| …` | yq | succinctly |
-|---|---|---|
-| `line_comment` | `keyc` | `""` |
-| `line` / `column` | `1` / `1` | `0` / `0` |
-| `style` (quoted key) | `double` | `""` |
-| `head_comment` / `foot_comment` | the comment | `""` |
-| `tag`, `kind` | `!!str`, `scalar` | same — already correct |
+Deliberate, and blocked on a different divergence rather than on this mechanism: real yq's
+scalar `==` is stringly (`1 == "1"` is `true` there, `false` here), so it can emit an
+`!!int` key node and still answer `select(key == "1")`. succinctly's `==` is typed, so
+emitting one would break `select(key == "1")` — which matches yq today — to fix a metadata
+read that nothing else depends on. The key-node hop therefore takes the string case only
+(`key_node_spells`, `src/jq/eval_generic.rs`), and every other key falls back to the
+display string byte-for-byte: a complex `? [a, b]` key, an explicitly tagged key, a key
+whose bytes do not decode, and a node that is not the raw member value.
 
-This is not specific to comments, and it is older than #798: `line_comment` has had it
-since #765's capture side landed, and `line`/`column`/`style` were never recorded at all.
-`head_comment`/`foot_comment` (#2758) inherit exactly the same gap rather than introducing
-a different one — deliberately, so one fix closes all six. The natural spelling is
-unaffected and correct: `.b | head_comment` is `""` in both tools, because the comment
-genuinely belongs to the key; only the explicit `| key |` step diverges.
+Pinned by `key_node_metadata_2763::a_typed_key_keeps_its_display_string_2763`
+(`tests/yq_cli_tests.rs`), so closing the typing gap has to update this together.
 
-The cause is routing, not a missing read. `cursor_key` (`src/jq/eval_generic.rs`) already
-holds `field.key_cursor` and discards it, but a `... | key | <metadata>` pipe never reaches
-the position-carrying evaluator: `owned_identity_pipe_applies` gates on
-`rest.iter().any(needs_path_context)` and these builtins do not need path context, while
-widening that gate still loses to the walk route, which `path_context_walk_split` leaves a
-non-empty rest for and which evaluates the tail from a materialized node. #2763 records two
-designs that look right and are not — returning the key's cursor from `key` regresses
-`.a.b | key | path`, which is currently correct.
+Three narrower residuals of the same fix, each captured live from v4.53.3:
 
-Pinned by `head_foot_comment_798::key_node_head_comment_is_not_reachable_yet_798`
-(`tests/yq_cli_tests.rs`), which asserts the current wrong answers for both `head_comment`
-and `line_comment` so the fix updates them together.
+- A `key | <metadata>` nested inside a bounded consumer (`first`/`limit`/`last`) or an `as`
+  *source* still answers the default when a later stage also reads path context
+  (`.a.b | first(key | line) | path`). The bounded consumers are not real yq builtins
+  anyway — its lexer rejects `limit`, `last` and `try`, and its own `first(f)` ignores `f`
+  (#2377) — so these shapes are succinctly extensions.
+- Metadata through a *constructed* container is the container's, not the key's:
+  `map_values(key | line)` is `a: 1` in yq and `a: 0` here, as are
+  `to_entries[0].key | line` and `[.a | key] | .[0] | line`.
+- The wider question this issue does not settle: whether an ordinary owned value that
+  *kept* its position answers metadata from it. On `a:\n  b: 1\n`, `.a | del(.b) | line`,
+  `.a | .b = 3 | line` and `.a | key as $k | . | line` are all `2` in yq (the line `.a`
+  itself stands on) and `0` here. Only the key-node case is answered, because only it is
+  what `key` emits.
 
 ### Standalone comments are dropped from every YAML output route (#798)
 
