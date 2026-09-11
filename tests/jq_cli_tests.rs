@@ -45966,6 +45966,23 @@ fn test_closed_terms_do_not_validate_2173() -> Result<()> {
         // `bridge_ambient_input`, so a closed `repeat(f)` kept validating
         // the whole document after #2173 landed everywhere else.
         ("[limit(1; repeat(1))]", "[1]"),
+        // #2699: `repeat`'s bridge takes the *inner* `f`, so once a pipe /
+        // `reduce` / `foreach` counts as closed, these stop validating too.
+        // This is the same sanctioned divergence the rows above are, but it
+        // is a NEW instance of it and it is the one #2790 nearly shipped
+        // unrecorded: `[limit(1; repeat(1))]` above cannot flip (it was
+        // already closed), so the pre-existing row proved nothing about the
+        // change. Real jq 1.7.1 exits 5 on every cell, as with every row here.
+        ("[limit(1; repeat(1 | .))]", "[1]"),
+        ("[limit(1; repeat([1,2,3] | length))]", "[3]"),
+        (
+            "[limit(1; repeat(reduce (1,2,3) as $x (0; . + $x)))]",
+            "[6]",
+        ),
+        (
+            "[limit(1; repeat([foreach (1,2) as $x (0; . + $x)]))]",
+            "[[1,3]]",
+        ),
         // `env(NAME)`/`strenv(NAME)` (`Builtin::EnvObject`/`Builtin::StrEnv`)
         // take no `value` parameter at all, but `node_reads_ambient`'s
         // allowlist omitted both -- a var guaranteed absent makes the `?`
