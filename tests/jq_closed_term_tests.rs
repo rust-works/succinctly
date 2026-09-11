@@ -75,6 +75,51 @@ const CLOSED: &[&str] = &[
     // absent keeps the `?` outcome document-independent.
     "[env(NONEXISTENT_VAR_XYZ_2173)?]",
     "[strenv(NONEXISTENT_VAR_XYZ_2173)?]",
+    // #2699: a pipe stage's ambient value is the previous stage's output,
+    // so a closed first stage closes the whole pipe.
+    "1 | .",
+    "now | type",
+    "[1,2,3] | length",
+    r#""abc" | ascii_upcase"#,
+    "2 | . + 1",
+    "[1] | .[0]",
+    "1 | length",
+    "[1,2,3] | .[1:2]",
+    "[1,2] | add",
+    "{} | keys",
+    "1 | if . then 2 else 3 end",
+    "[1,2] | map(. + 1)",
+    "1 | 2 | 3 | .",
+    "[1,2,3] | .[] | . + 1",
+    // `reduce`/`foreach` rebind `.` to the accumulator in `update`.
+    "reduce (1,2,3) as $x (0; . + $x)",
+    "[foreach (1,2) as $x (0; . + $x)]",
+    "[foreach (1,2) as $x (0; . + $x; . * 10)]",
+    // The ambient-transparent wrappers carry the refinement through.
+    "(1 | .) | .a?",
+    "[1 | .]",
+    "[[1,2] | length]",
+    "((1 | .))",
+    // The `Expr::Optional` arm's only witness. Every other `?` in this
+    // corpus sits in a *later* stage, which `stage_escapes_own_input`
+    // judges -- so removing the `Optional` arm broke no test at all until
+    // this row existed (found by the #2790 review's arm-by-arm mutation).
+    "(1 | .)?",
+    "[(1 | .), (2 | .)]",
+    // Closed *and* ill-typed: `.a` applies to the previous stage's `1`, so
+    // the outcome is the same whatever the document is -- which is the
+    // property under test. Note these raise on the CLI ("Cannot index
+    // number with string \"a\"", matching jq 1.7.1) but reach this
+    // library harness as no output, because `collect_owned` stops at the
+    // failure rather than propagating it. Either way: document-independent.
+    // `[foreach ...; .a]` is here for the same reason, and is the row that
+    // proves `extract` sees the accumulator rather than the document.
+    "1 | .a",
+    "1 | .[0]",
+    r#""abc" | .a"#,
+    "1 | keys",
+    "[1,2] | .a",
+    "[foreach (1,2) as $x (0; . + $x; .a)]",
 ];
 
 /// Filters that read the input. These must be reported as reading — a
@@ -118,6 +163,49 @@ const READING: &[&str] = &[
     "(1, 2) = 5",
     ".a = 5",
     "1 |= . + 1",
+    // #2699: the refinement must NOT reach these.
+    //
+    // `as` binds a variable but leaves `.` on the OUTER ambient, so the
+    // body still reads the document. This is the row that makes the pipe
+    // rule safe: it parses as `Expr::As`, never `Expr::Pipe`.
+    "1 as $x | .",
+    "1 as $x | .a",
+    "[1,2] as [$a,$b] | .",
+    "{} as {a:$a} | .",
+    // A closed first stage does not help if a later stage reaches the
+    // document through a channel that bypasses the ambient value.
+    "1 | input",
+    "1 | [inputs]",
+    "1 | key",
+    "1 | parent",
+    "1 | path(.)",
+    "1 | [paths]",
+    "1 | [leaf_paths]",
+    "1 | getpath([\"a\"])",
+    "1 | line",
+    "1 | column",
+    // The five siblings missing from `stage_escapes_own_input` on day one
+    // (#2790 review). None could be turned into a wrong answer, but the
+    // omissions are what a fail-open list looks like in practice.
+    "1 | path",
+    "1 | [paths(numbers)]",
+    "1 | file_index",
+    "1 | tag",
+    "1 | kind",
+    // An unresolved call carries no body to inspect.
+    "1 | f",
+    // A reading first stage keeps the whole pipe reading, at any depth.
+    ". | 1",
+    ".a | 1",
+    "(. | 1) | 2",
+    "[. | 1]",
+    ". | . | .",
+    "(.a, 1) | 1",
+    // `reduce`/`foreach` read the document through `input` and `init`.
+    "reduce .[] as $x (0; . + $x)",
+    "reduce (1,2) as $x (.; . + $x)",
+    "[foreach .[] as $x (0; . + $x)]",
+    "[foreach (1,2) as $x (.; . + $x)]",
     ".a += 1",
     ".a //= 1",
     "del(.a)",
@@ -251,4 +339,19 @@ fn input_independent_builtins_are_closed_2173() {
             "`{filter}` consults `.` however closed its argument is"
         );
     }
+}
+
+/// The defensive arm: an empty `Expr::Pipe` answers `true` (#2699).
+///
+/// The parser never builds one — a pipe always has at least the stage before
+/// its `|` — but `reads_ambient_value` is `pub`, so a library caller can
+/// construct one directly, which is what this test does. `true` is the only
+/// safe guess: `false` would tell `bridge_ambient_input` to hand `null` to an
+/// expression nobody has inspected.
+#[test]
+fn an_empty_pipe_is_conservatively_reading_2699() {
+    assert!(
+        reads_ambient_value(&succinctly::jq::Expr::Pipe(vec![])),
+        "an empty pipe has no first stage to judge, so it must not be called closed"
+    );
 }

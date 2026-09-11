@@ -3797,6 +3797,27 @@ its input; `to_owned_with_cursor` validated because it needed a value to bridge 
 `1+1` escaped only because someone had written it a native arm. Sanctioned by ADR-0018's
 #2103 amendment, and now listed there as its own instance.
 
+**Widened by [#2699](https://github.com/rust-works/succinctly/issues/2699): a pipe stage
+rebinds `.`, so more filters are closed than the predicate used to admit.** `1 | .`,
+`[1,2,3] | length`, `reduce (1,2,3) as $x (0; . + $x)` and friends read the previous stage's
+output, never the document, and are now recognised as such. Where that reaches a bridge, the
+rows above gain siblings — `repeat` bridges its *inner* `f`, so on the same
+`{123: 1, "b": 2}`:
+
+| filter                                                   | jq 1.7.1 | before #2699 | now         |
+|----------------------------------------------------------|----------|--------------|-------------|
+| `[limit(1; repeat(1))]`                                  | error    | `[1]`        | `[1]` — unchanged |
+| `[limit(1; repeat(1 \| .))]`                             | error    | error        | `[1]`       |
+| `[limit(1; repeat([1,2,3] \| length))]`                   | error    | error        | `[3]`       |
+| `[limit(1; repeat(reduce (1,2,3) as $x (0; . + $x)))]`   | error    | error        | `[6]`       |
+| `[limit(1; repeat([foreach (1,2) as $x (0; . + $x)]))]`  | error    | error        | `[[1,3]]`   |
+| `[limit(1; repeat(.))]` (control, reads)                 | error    | error        | error — unchanged |
+
+Same sanction, same reasoning: which spelling kept the rejection was still an accident, now
+one level further in. Pinned by the corresponding rows in
+`test_closed_terms_do_not_validate_2173`. The materialization this skips is not small —
+on a 13 MB document that filter goes from 354 MB peak and 8.9 s to 30 MB and 1.1 s.
+
 **It also cost what #2103's own point 3 costs.** On a 16 MB `json generate` document,
 indicative single runs: `[1+1]` 443 MB / 0.75 s → 29 MB / 0.03 s; `[range(3)]` 446 MB /
 0.89 s → 29 MB; `false // 1` 445 MB / 0.86 s → 29 MB. In yq mode, where every filter takes

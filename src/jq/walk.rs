@@ -1265,16 +1265,167 @@ pub fn uses_cursor_metadata_builtins(expr: &Expr) -> bool {
 /// against `null`. Only the first is acceptable, so anything unclear is
 /// `true`.
 ///
-/// **Deliberately imprecise about pipes.** `1 | .` reads `1`, not the
-/// document, but this walk sees an `Expr::Identity` node and reports
-/// `true`. Teaching it that a pipe stage's ambient value is the previous
-/// stage's output is a refinement, not a correction — it would widen what
-/// counts as closed, never narrow it.
+/// **Structure-aware for the three binders that rebind `.`** (#2699).
+/// A pipe stage's ambient value is the *previous stage's output*, so
+/// `Expr::Pipe` is closed when its first stage is closed — `1 | .`,
+/// `[1,2,3] | length`, `"abc" | ascii_upcase` all read `1`/`[1,2,3]`/`"abc"`,
+/// never the document. `Expr::Reduce`/`Expr::Foreach` rebind `.` the same
+/// way in their `update`/`extract` arms, where `.` is the accumulator
+/// (verified against jq 1.7.1: `reduce (1,2,3) as $x (0; . + $x + (.zz|length))`
+/// fails with *Cannot index number*, naming the accumulator, not the
+/// document).
+///
+/// Every other variant still takes the whole-tree
+/// [`any_subexpr`] answer, so this widens what counts as closed and never
+/// narrows it. In particular `Expr::As` is **not** one of these: `1 as $x | .`
+/// binds `$x` but leaves `.` pointing at the *outer* ambient, so its body
+/// must keep reading through to the document.
+///
+/// A later stage still reaches the document if it uses a channel that does
+/// not flow through the ambient *value* — `input`, cursor metadata, `key`,
+/// `parent`, path tracking, or an unresolved call whose body cannot be
+/// inspected. `stage_escapes_own_input` is that gate, and any stage
+/// tripping it forces the whole pipe back to `true`.
 ///
 /// Same expanded-program requirement as [`uses_input_builtins`]: a call
 /// reachable only through an imported module body still counts.
 pub fn reads_ambient_value(expr: &Expr) -> bool {
-    any_subexpr(expr, &mut node_reads_ambient)
+    match expr {
+        // `stages[0]` sees the document; every later stage sees the stage
+        // before it. An empty `Pipe` is not something the parser produces,
+        // but `false` would be the wrong way to guess if it ever did.
+        Expr::Pipe(stages) => match stages.split_first() {
+            Some((first, rest)) => {
+                reads_ambient_value(first) || rest.iter().any(stage_escapes_own_input)
+            }
+            None => true,
+        },
+
+        // `input` and `init` are evaluated against the document; `update`
+        // (and `foreach`'s `extract`) against the accumulator.
+        // `patterns` is not consulted: `PatternEntry::key` is a `String`,
+        // so a pattern holds no `Expr` to reach the document with. #2677
+        // would change that by widening it to a computed key -- if it lands,
+        // the new key expression is evaluated against the *document* and
+        // belongs on the `reads_ambient_value` side of these arms.
+        Expr::Reduce {
+            input,
+            init,
+            update,
+            ..
+        } => {
+            reads_ambient_value(input)
+                || reads_ambient_value(init)
+                || stage_escapes_own_input(update)
+        }
+        Expr::Foreach {
+            input,
+            init,
+            update,
+            extract,
+            ..
+        } => {
+            reads_ambient_value(input)
+                || reads_ambient_value(init)
+                || stage_escapes_own_input(update)
+                || extract.as_deref().is_some_and(stage_escapes_own_input)
+        }
+
+        // Ambient-transparent wrappers: each child is evaluated against the
+        // very same `.` this node received, so the refinement above has to
+        // survive being wrapped in one -- `[foreach (1,2) as $x (0; . + $x)]`
+        // and `(1 | .) | .a` are closed for exactly the reasons their
+        // unwrapped forms are.
+        Expr::Paren(inner) | Expr::Array(inner) | Expr::Optional(inner) => {
+            reads_ambient_value(inner)
+        }
+        Expr::Comma(branches) => branches.iter().any(reads_ambient_value),
+
+        // Everything else keeps the flat whole-tree answer. That is still
+        // sound -- `any_subexpr` reaches every descendant, so a `.` anywhere
+        // reports `true` -- just less precise than it could be: a `Pipe`
+        // nested under a variant not listed above is judged by its parts
+        // rather than by its first stage. Widening this list is a further
+        // refinement in the same safe direction, never a correction.
+        _ => any_subexpr(expr, &mut node_reads_ambient),
+    }
+}
+
+/// Whether a subtree evaluated against a *rebound* `.` (a later pipe stage, a
+/// `reduce`/`foreach` update) could still reach the document (#2699).
+///
+/// Its own `.` is safe by construction — that is the previous stage's output.
+/// What is not safe is a channel that bypasses the ambient value entirely, so
+/// this lists those channels, and it is deliberately broader than "reads the
+/// document": `1 | key` and `1 | path(.)` answer from cursor and
+/// path-tracking context that [`reads_ambient_value`]'s caller
+/// (`eval_generic::bridge_ambient_input`) is not deciding about, so they keep
+/// their materialization rather than have this predicate reason about them.
+///
+/// **This list is fail-open, which is the opposite of the discipline the rest
+/// of this module uses, and that is a known weakness rather than a choice.**
+/// `node_reads_ambient` is exhaustive over `Expr` with no wildcard so a new
+/// variant is a compile error, and its `Builtin` arm is a negative allowlist
+/// so a new builtin defaults to "reads" — both fail *safe*. Here a builtin
+/// nobody adds to this list defaults to "does not escape", i.e. to the
+/// wrong-answer direction. `Builtin` has 209 variants, so the fail-closed
+/// reshape (an exhaustive match, one decision per variant) is its own change
+/// with its own review; it is tracked as #2791.
+///
+/// The concrete cost of the fail-open shape is already on record: an
+/// adversarial review of #2790 found five siblings of listed entries missing
+/// from the first version of this list — `path` (the no-argument, yq-native
+/// spelling of `path(f)`), `paths(f)`, `file_index`, `tag` and `kind` — none
+/// of which could be turned into a wrong answer, but all of which were
+/// omitted on day one. They are listed below now.
+///
+/// `needs_path_context` in `eval.rs` answers a related question and is
+/// deliberately *not* reused: it is superlinear on recursive definitions, and
+/// `bridge_ambient_input` runs per evaluation.
+///
+/// One walk, not four: the four separate whole-subtree scans this started as
+/// measured 2.7-4.2x slower than the single walk it replaced, on a predicate
+/// that runs per evaluation.
+fn stage_escapes_own_input(expr: &Expr) -> bool {
+    any_subexpr(expr, &mut |e| match e {
+        // An unresolved call carries no body to inspect, exactly as
+        // `node_reads_ambient` treats it.
+        Expr::FuncCall { .. } | Expr::NamespacedCall { .. } => true,
+        Expr::Builtin(b) => matches!(
+            b,
+            // `input`/`inputs`/`input_line_number` (`uses_input_builtins`).
+            Builtin::Input
+                | Builtin::Inputs
+                | Builtin::InputLineNumber
+                // Cursor metadata (`uses_cursor_metadata_builtins`).
+                | Builtin::Line
+                | Builtin::Column
+                | Builtin::DocumentIndex
+                | Builtin::Anchor
+                | Builtin::Style
+                | Builtin::LineComment
+                | Builtin::HeadComment
+                | Builtin::FootComment
+                | Builtin::AtOffset(_)
+                | Builtin::AtPosition(_, _)
+                // Path tracking and traversal context.
+                | Builtin::Key
+                | Builtin::Parent
+                | Builtin::ParentN(_)
+                | Builtin::Path(_)
+                | Builtin::PathNoArg
+                | Builtin::Paths
+                | Builtin::PathsFilter(_)
+                | Builtin::LeafPaths
+                | Builtin::GetPath(_)
+                // Invocation context (which file, which node), not a value
+                // read -- the #2790 review's remaining three.
+                | Builtin::FileIndex
+                | Builtin::Tag
+                | Builtin::Kind
+        ),
+        _ => false,
+    })
 }
 
 /// One node's own answer for [`reads_ambient_value`], ignoring its children —
