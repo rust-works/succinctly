@@ -23718,9 +23718,17 @@ fn test_def_param_shadow_scoping_2723() -> Result<()> {
 /// noise rather than a tight benchmark.
 #[test]
 fn test_def_param_scan_unclosed_list_does_not_blow_up_2805() -> Result<()> {
+    // Via a `-f` file, not a `-nc <filter>` argument: a 300,000-byte
+    // filter exceeds Linux CI's ARG_MAX for a single exec'd argument
+    // ("Argument list too long", os error 7) -- confirmed live on this
+    // PR's own CI run, matching the codebase's established large-filter
+    // test pattern (`test_wide_non_recursive_literals_and_pipes_unaffected_2135`).
     let filter = "def a(".repeat(50_000);
+    let mut filter_file = NamedTempFile::new()?;
+    write!(filter_file, "{filter}")?;
     let start = std::time::Instant::now();
-    let (_, stderr, code) = run_jq_full(&["-nc", &filter], None)?;
+    let (_, stderr, code) =
+        run_jq_full(&["-nc", "-f", filter_file.path().to_str().unwrap()], None)?;
     let elapsed = start.elapsed();
     assert_ne!(code, 0, "stderr: {stderr:?}");
     assert!(!stderr.contains("panicked"), "stderr: {stderr:?}");
