@@ -2890,16 +2890,46 @@ sequence before emitting anything — reinstating exactly the O(n) cost
 [#1565](https://github.com/rust-works/succinctly/issues/1565) removed (a 2M-element
 `first(map(.+1) | .[] | .+1)` went from ~1.8 s to ~0.04 s).
 
-The divergence is bounded to consumers that genuinely truncate. Anything that has to see
-the whole array still errors, in both tools:
+**The bound is enforced, not accidental (#2666).** Before #2666 the bound was wherever the
+consumer happened to stop, and `map(f) | .[]` with *no* truncating consumer at all — bare, in
+a pipe, under `try`/`?`/`//`, in a `def` body, as a `foreach` source — leaked the prefix
+`2` to stdout before raising, because the iterate consumer streamed one element at a time
+regardless of who was downstream. It now asks: every sink carries a
+[`Budget`](../../../src/jq/eval_generic.rs) (`Unbounded` unless a truncating consumer says
+`AtMost(n)`), and `each_lazy_seq_iterate_sink` validates the first `n` elements of `map(f)`
+*before* the first output leaves — all of them when unbounded. So the divergence is exactly:
+
+> the first `n` elements of `map(f)` are validated before the first output, where `n` is the
+> truncating consumer's count; an element past that window is never run if the consumer
+> stops before reaching it.
+
+`limit(2; ..)` on `[1,2,"x"]` is the worked example of what still diverges — two elements
+are pulled, both good, the consumer stops, the third is never run — while `limit(2; ..)` on
+`[1,"x",3]` now errors like jq because the failing element is inside the window. Anything
+that has to see the whole array still errors, in both tools, and bare `map(f) | .[]` has
+moved into this block:
 
 ```
-$ echo '[1,"x",3]' | succinctly jq -c 'map(.+1)'         # error, exit 5
-$ echo '[1,"x",3]' | succinctly jq -c 'map(.+1) | last'  # error, exit 5
-$ echo '[1,"x",3]' | succinctly jq -c '[map(.+1) | .[]]' # error, exit 5
+$ echo '[1,"x",3]' | succinctly jq -c 'map(.+1)'                    # error, exit 5
+$ echo '[1,"x",3]' | succinctly jq -c 'map(.+1) | .[]'              # error, exit 5, no output
+$ echo '[1,"x",3]' | succinctly jq -c 'try (map(.+1)|.[]) catch "c"' # "c"
+$ echo '[1,"x",3]' | succinctly jq -c 'map(.+1) | last'             # error, exit 5
+$ echo '[1,"x",3]' | succinctly jq -c '[map(.+1) | .[]]'            # error, exit 5
+$ echo '[1,"x",3]' | succinctly jq -c 'limit(3; map(.+1) | .[])'    # error, exit 5
 ```
 
-Pinned by [`test_generic_lazy_seq_first_after_map_skips_later_error_725`](../../../tests/jq_cli_tests.rs)
+Two shapes that used to diverge now match jq for free: `first(try (map(f)|.[]) catch c)`
+and `first((map(f)|.[]) // 0)`. A `try`/`//` interposes its own closure between `first` and
+the producer, and that closure carries the `Unbounded` default — so `map` is atomic inside
+it, and `try` sees an error and no output, as in jq. The design allows a forwarding wrapper
+that would let such closures inherit `first`'s bound for speed; it is deliberately not
+built, because it can only make a shape *less* jq-like, and ADR-0018 puts fidelity ahead of
+that O(n). See [ADR-0022](../../adrs/adr-0022.md).
+
+Pinned by [`test_map_iterate_atomicity_outside_truncators_2666`](../../../tests/jq_cli_tests.rs)
+(every row above, both directions, one assertion each — the preserved rows carry the
+divergent literal on purpose so the boundary is pinned from both sides),
+[`test_generic_lazy_seq_first_after_map_skips_later_error_725`](../../../tests/jq_cli_tests.rs)
 (the `map(f) | first` / `map(f) | .[0]` spelling) and
 [`test_first_over_lazy_seq_iterate_skips_later_error_1565`](../../../tests/jq_cli_tests.rs)
 (the `first(map(f) | .[] | g)` spelling, plus the draining counter-cases above).
