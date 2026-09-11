@@ -172,6 +172,22 @@ const MAX_PATTERN_DEPTH: usize = 256;
 /// the same caveat; the two deliberately share one number.
 const MAX_EXPR_DEPTH: usize = 256;
 
+/// The one definition of "does a bare identifier (function/parameter name,
+/// zero-arg call, `def` name) start here" -- underscore included, since jq
+/// accepts `_` as an identifier-start character throughout and
+/// leading-underscore names (`def _walk: ...`) are a common real-jq library
+/// convention. Shared by [`collect_def_names`]'s own local scan,
+/// [`Parser::parse_ident`], and `Parser::parse_primary_inner`'s bare-name
+/// dispatch gate (#2728: those three had drifted -- `parse_ident` and
+/// `collect_def_names` already included `_`, the dispatch gate didn't, so a
+/// leading `_` reached `parse_ident` only when something else had already
+/// decided to call it -- exactly the "duplicated predicates diverge
+/// silently" failure mode CLAUDE.md's #106 note warns about, now closed by
+/// having one definition instead of three hand-kept copies).
+fn is_ident_start_char(c: char) -> bool {
+    c.is_alphabetic() || c == '_'
+}
+
 /// #2036 Direction 3: a cheap, deliberately over-approximate scan for every
 /// identifier spelled after a `def` keyword anywhere in `input` -- see
 /// `Parser::shadowable_defs`'s own doc comment for why imprecision here is
@@ -183,9 +199,6 @@ const MAX_EXPR_DEPTH: usize = 256;
 /// comments, so `"def foo"` or `# def foo` also add `foo` to the set. Plain
 /// substring scanning, not a real lexer pass, by design.
 fn collect_def_names(input: &str) -> BTreeSet<String> {
-    fn is_ident_start(c: char) -> bool {
-        c.is_alphabetic() || c == '_'
-    }
     // Yq mode's own `-`-in-identifier extension (`.my-key`) is folded in
     // unconditionally here too, even though real `def` doesn't exist in yq
     // at all without succinctly's own extension -- a mode-blind superset
@@ -200,7 +213,7 @@ fn collect_def_names(input: &str) -> BTreeSet<String> {
         let before_ok = input[..start]
             .chars()
             .next_back()
-            .map_or(true, |c| !is_ident_continue(c) && !is_ident_start(c));
+            .map_or(true, |c| !is_ident_continue(c) && !is_ident_start_char(c));
         let after_ok = input[end..]
             .chars()
             .next()
@@ -232,7 +245,7 @@ fn collect_def_names(input: &str) -> BTreeSet<String> {
         let Some((_, first)) = chars.next() else {
             continue;
         };
-        if !is_ident_start(first) {
+        if !is_ident_start_char(first) {
             continue;
         }
         let ident_end = chars
@@ -635,7 +648,7 @@ impl<'a> Parser<'a> {
 
         // First character must be alphabetic or underscore
         match self.peek() {
-            Some(c) if c.is_alphabetic() || c == '_' => {
+            Some(c) if is_ident_start_char(c) => {
                 self.next();
             }
             Some(c) => {
@@ -1665,17 +1678,17 @@ impl<'a> Parser<'a> {
 
             // Keywords: null, true, false, not, if, try, error, reduce, foreach, etc.
             //
-            // #2728: `|| c == '_'` -- a leading underscore is a valid
-            // identifier-start character throughout jq (`def _walk: ...` is
-            // a common real-jq library convention), and `parse_ident`
-            // itself already accepts it (`c.is_alphabetic() || c == '_'`,
-            // used by both the `$var` and `.field` dispatch paths just
-            // above this arm). This gate is what decides whether a bare
-            // name/call/keyword position is even attempted at all, so
-            // without it a leading `_` never reached `parse_ident` --
-            // confirmed live against jq 1.7.1: `def _g: 42; _g` is `42`
-            // there and a parse error here before this fix.
-            Some(c) if c.is_alphabetic() || c == '_' => {
+            // #2728: `is_ident_start_char`, not a bare `c.is_alphabetic()`
+            // -- this gate decides whether a bare name/call/keyword
+            // position is even attempted at all, so it has to agree with
+            // `parse_ident`'s own start-check (used by both the `$var` and
+            // `.field` dispatch paths just above this arm) or a leading `_`
+            // never reaches `parse_ident` in the first place, no matter how
+            // permissive that function itself is. Confirmed live against jq
+            // 1.7.1: `def _g: 42; _g` is `42` there and was a parse error
+            // here before this fix (`is_ident_start_char`'s own doc comment
+            // has the full history).
+            Some(c) if is_ident_start_char(c) => {
                 let keyword_start = self.pos;
                 if self.matches_keyword("null") {
                     self.consume_keyword("null");
