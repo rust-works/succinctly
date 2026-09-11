@@ -209,7 +209,8 @@ fn dollar_var_expr(name: String, line: usize) -> Expr {
 }
 
 /// #2036 Direction 3: a cheap, deliberately over-approximate scan for every
-/// identifier spelled after a `def` keyword anywhere in `input` -- see
+/// identifier spelled after a `def` keyword anywhere in `input`, plus (#2723)
+/// every identifier spelled in that `def`'s own parameter list -- see
 /// `Parser::shadowable_defs`'s own doc comment for why imprecision here is
 /// safe (a false positive costs one wasted double-parse at one call site; a
 /// false negative is impossible to turn into a wrong *answer* either, since
@@ -225,6 +226,23 @@ fn collect_def_names(input: &str) -> BTreeSet<String> {
     // only ever widens the (already-imprecise) set, never narrows it.
     fn is_ident_continue(c: char) -> bool {
         c.is_alphanumeric() || c == '_' || c == '-'
+    }
+
+    // #2036 review round 2's comment-skip loop, factored out so the
+    // parameter-list scan below (#2723) can reuse it verbatim instead of
+    // hand-duplicating it -- real jq's own `skip_ws` skips both whitespace
+    // and comments, repeatedly, wherever it appears in a `def` header.
+    fn skip_ws_and_comments(mut rest: &str) -> &str {
+        loop {
+            let trimmed = rest.trim_start();
+            let Some(after_hash) = trimmed.strip_prefix('#') else {
+                return trimmed;
+            };
+            rest = match after_hash.find('\n') {
+                Some(i) => &after_hash[i..],
+                None => "",
+            };
+        }
     }
 
     let mut names = BTreeSet::new();
@@ -249,18 +267,7 @@ fn collect_def_names(input: &str) -> BTreeSet<String> {
         // shadow it should have enabled silently never fires. Confirmed
         // live: `def #c\nlength: 99; length` returned `0` (the real
         // builtin) instead of `99` before this fix.
-        let mut rest = &input[end..];
-        loop {
-            let trimmed = rest.trim_start();
-            let Some(after_hash) = trimmed.strip_prefix('#') else {
-                rest = trimmed;
-                break;
-            };
-            rest = match after_hash.find('\n') {
-                Some(i) => &after_hash[i..],
-                None => "",
-            };
-        }
+        let rest = skip_ws_and_comments(&input[end..]);
         let mut chars = rest.char_indices();
         let Some((_, first)) = chars.next() else {
             continue;
@@ -272,6 +279,47 @@ fn collect_def_names(input: &str) -> BTreeSet<String> {
             .find(|&(_, c)| !is_ident_continue(c))
             .map_or(rest.len(), |(i, _)| i);
         names.insert(rest[..ident_end].to_string());
+
+        // #2723: a def's *parameters* can shadow a zero-arity (or
+        // wrong-arity-shadowable) builtin inside the def's own body
+        // exactly the way the def's own name can -- confirmed live against
+        // jq 1.7.1, `def f(length): length; f(1)` answers `1`, not the
+        // real `length` builtin's `0`. `resolve.rs::check`'s `FuncDef` arm
+        // already pushes every parameter into scope at arity 0, identically
+        // to the def's own name, so once a bare `length` reference reaches
+        // it as a shadow candidate it resolves correctly -- the only gap
+        // was here: this prescan used to collect only the def's own name,
+        // so the parser committed a parameter-shadowed builtin straight to
+        // `Expr::Builtin(Length)` with no shadow-candidate wrapping at all,
+        // and `resolve.rs`'s scope-aware check never got a chance to see
+        // it. Scanning the parameter list on the same "cheap, deliberately
+        // over-approximate" terms as the rest of this function closes that
+        // gap: a `$`-style parameter is stripped of its leading `$` before
+        // being recorded, since it binds a *variable* (`$name`), never the
+        // bare-identifier builtin spelling this set exists to catch --
+        // recording it anyway would only cost a harmless extra wasted
+        // double-parse at any call site spelled with that bare name, never
+        // a wrong answer.
+        let after_name = skip_ws_and_comments(&rest[ident_end..]);
+        if let Some(params) = after_name.strip_prefix('(') {
+            if let Some(close) = params.find(')') {
+                for part in params[..close].split(';') {
+                    let part = skip_ws_and_comments(part);
+                    let part = part.strip_prefix('$').unwrap_or(part);
+                    let mut pchars = part.char_indices();
+                    let Some((_, pfirst)) = pchars.next() else {
+                        continue;
+                    };
+                    if !is_ident_start_char(pfirst) {
+                        continue;
+                    }
+                    let pend = pchars
+                        .find(|&(_, c)| !is_ident_continue(c))
+                        .map_or(part.len(), |(i, _)| i);
+                    names.insert(part[..pend].to_string());
+                }
+            }
+        }
     }
     names
 }

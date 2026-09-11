@@ -23590,6 +23590,97 @@ fn test_bare_param_does_not_bind_dollar_leaves_outer_binding_2726() -> Result<()
     Ok(())
 }
 
+/// #2723: a `def` parameter whose name collides with a zero-arity builtin
+/// must shadow it -- `substitute_func_param_impl`'s bare-parameter
+/// substitution never runs on these because the parser used to commit a
+/// builtin-named identifier straight to its dedicated `Expr` variant
+/// (`Expr::Builtin(Length)`, `Expr::Not`, ...) without ever routing it
+/// through the `#2036` shadow-candidate machinery -- that machinery only
+/// ever knew about a `def`'s own name, not its *parameters*. All four rows
+/// confirmed live against jq 1.7.1; `empty` is the most consequential
+/// misresolution, since a shadowed reference to it silently discards the
+/// substituted argument's output rather than merely computing the wrong
+/// value.
+#[test]
+fn test_def_param_shadows_zero_arity_builtin_2723() -> Result<()> {
+    for (filter, expected) in [
+        ("def f(length): length; f(1)", "1"),
+        ("def f(not): not; f(1)", "1"),
+        ("def f(empty): [empty]; f(1)", "[1]"),
+        ("def f(recurse): recurse; f(1)", "1"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 0, "filter: {filter:?}, stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "filter: {filter:?}");
+    }
+    Ok(())
+}
+
+/// #2723: `collect_def_names`'s new parameter-list scan is, like the rest
+/// of that function, a cheap *and deliberately not lexically aware* text
+/// scan -- it does not know a `#`-comment can itself contain a `)`
+/// character, so a comment inside a parameter list can trick it into
+/// treating that in-comment `)` as the list's real close. A malformed `def`
+/// header exercising that gap (and the sibling "first parameter character
+/// isn't an identifier start" gap, from a raw non-identifier token in
+/// parameter position) must still fail as an ordinary compile error --
+/// never panic -- since this scan runs on every filter's raw source text
+/// unconditionally, valid or not, before the real parser ever sees it.
+#[test]
+fn test_def_param_scan_malformed_headers_do_not_panic_2723() -> Result<()> {
+    for filter in [
+        // A comment's own `)` short-circuits the naive `find(')')`, so the
+        // scan treats the comment body as the entire parameter list.
+        "def f(#c) 0: 1; f",
+        // A non-identifier token in parameter position.
+        "def f(1): 5; f",
+        // An opening paren with no closing paren anywhere in the rest of
+        // the input at all -- `params.find(')')` answers `None`, so the
+        // scan never enters the parameter-splitting loop for this `def`.
+        "def f(a",
+    ] {
+        let (_, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_ne!(code, 0, "filter: {filter:?} unexpectedly compiled");
+        assert!(
+            !stderr.contains("panicked"),
+            "filter: {filter:?}, stderr: {stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #2723 review: the shadow must actually be scoped like any other
+/// parameter -- unrelated to the builtin's own name, a real (non-shadowed)
+/// use of the same builtin elsewhere in the program stays a real builtin
+/// call, and a comment sitting between the parameter name and the closing
+/// `)` doesn't hide it from the parser's own prescan. All confirmed live
+/// against jq 1.7.1.
+#[test]
+fn test_def_param_shadow_scoping_2723() -> Result<()> {
+    for (filter, expected) in [
+        // The real builtin is untouched outside the shadowing def.
+        ("[1,2,3] | length", "3"),
+        ("def f(length): length; [f(1), ([1,2,3]|length)]", "[1,3]"),
+        // A `$`-style parameter shadows the bare namespace too, not just
+        // its own `$name` -- real jq desugars `def f($x): body` to
+        // `def f(x): x as $x | body`, so `$length` also binds bare
+        // `length` to the same argument (confirmed live: `[1,2,3] | def
+        // f($length): length; f(1)` is `1` in jq, not `3` -- this is why
+        // `collect_def_names`'s parameter scan strips a leading `$` before
+        // recording the name, rather than skipping `$`-style parameters).
+        ("[1,2,3] | def f($length): length; f(1)", "1"),
+        // Multiple params, only one of which shadows a builtin.
+        ("def f(a; length; b): [a,length,b]; f(1;2;3)", "[1,2,3]"),
+        // A comment between the parameter name and `)` still counts.
+        ("def f(#c\nlength): length; f(1)", "1"),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
+        assert_eq!(code, 0, "filter: {filter:?}, stderr: {stderr:?}");
+        assert_eq!(stdout.trim_end(), expected, "filter: {filter:?}");
+    }
+    Ok(())
+}
+
 /// #2560: `bind_def_call`'s own argument-binding for a duplicate parameter
 /// name now resolves by jq's ordinary later-wins parameter shadowing, the
 /// same rule `test_duplicate_named_param_shadow_resolves_by_last_occurrence_2283`
