@@ -1341,6 +1341,22 @@ pub fn reads_ambient_value(expr: &Expr) -> bool {
         }
         Expr::Comma(branches) => branches.iter().any(reads_ambient_value),
 
+        // #2794: `any(gen; cond)`/`all(gen; cond)` evaluate `cond` with `.`
+        // rebound to each output of `gen` -- real jq desugars both to
+        // `generator | condition` (confirmed live: `any(1,2,3; .a > 1)` on
+        // `{"a":99}` errors "Cannot index number with string \"a\"", naming
+        // gen's own numeric output, not the document) -- the same rebinding
+        // `Expr::Reduce`'s `update` and `Expr::Foreach`'s `extract` get
+        // above. Without this arm, the flat fallback below finds `.` inside
+        // `cond` (e.g. `any(range(3); . > 1)`) and blames the document for
+        // a read that is actually gen's rebound value, which is *safe*
+        // (over-materializes) but defeats the fix this issue is about --
+        // `gen` itself is still ordinary ambient-reading, only `cond` is
+        // rebound.
+        Expr::Builtin(Builtin::AnyCond(gen, cond) | Builtin::AllCond(gen, cond)) => {
+            reads_ambient_value(gen) || stage_escapes_own_input(cond)
+        }
+
         // Everything else keeps the flat whole-tree answer. That is still
         // sound -- `any_subexpr` reaches every descendant, so a `.` anywhere
         // reports `true` -- just less precise than it could be: a `Pipe`
@@ -1486,6 +1502,17 @@ fn node_reads_ambient(node: &Expr) -> bool {
         // variable name), not an `Expr`, so there is no child for
         // `any_subexpr` to miss either. Verified against their `eval.rs`
         // arms, each of which takes `_value` or no value parameter at all.
+        //
+        // #2794: `IsEmpty`/`AnyCond`/`AllCond` (the 2-arg `isempty(f)`,
+        // `any(gen; cond)`, `all(gen; cond)` forms) join the allowlist too --
+        // they consume a *generator* argument rather than reading `.`
+        // themselves, and `any_subexpr` already visits that argument
+        // separately, so the node's own contribution is nothing. Their
+        // arity-0/1 siblings (`Any`, `AnyF`, `All`, `AllF` -- `any`, `all`,
+        // `any(cond)`, `all(cond)`) are deliberately NOT here: those desugar
+        // to an implicit `.[]` generator (jq: "true if cond is truthy for
+        // any/every element of `.[]`"), so they read `.` on their own
+        // account and must keep the default "reads" answer.
         Expr::Builtin(builtin) => !matches!(
             builtin,
             Builtin::Empty
@@ -1498,6 +1525,9 @@ fn node_reads_ambient(node: &Expr) -> bool {
                 | Builtin::StrEnv(_)
                 | Builtin::Builtins
                 | Builtin::Halt
+                | Builtin::IsEmpty(_)
+                | Builtin::AnyCond(_, _)
+                | Builtin::AllCond(_, _)
         ),
 
         // Everything below contributes nothing of its own: whether it reads

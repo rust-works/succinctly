@@ -120,6 +120,24 @@ const CLOSED: &[&str] = &[
     "1 | keys",
     "[1,2] | .a",
     "[foreach (1,2) as $x (0; . + $x; .a)]",
+    // #2794: `isempty(f)`'s argument is evaluated against the true ambient,
+    // so it is closed exactly when `f` is.
+    "isempty(1)",
+    "isempty(empty)",
+    "isempty(range(9))",
+    // #2794: `any(gen; cond)`/`all(gen; cond)` desugar to `gen | cond`, so
+    // `cond` sees gen's *output*, not the document -- closed when `gen` is,
+    // whatever `cond` looks like.
+    "any(range(3); . > 1)",
+    "any(range(3); . > 5)",
+    "all(range(3); . >= 0)",
+    "all(range(3); . > 5)",
+    "any(1,2,3; . == 2)",
+    "all(1,2,3; . > 0)",
+    // Closed *and* ill-typed, mirroring `[foreach ...; .a]` above: `.a`
+    // applies to gen's own `1`, not the document.
+    "any(1; .a)",
+    "all(1; .a)",
 ];
 
 /// Filters that read the input. These must be reported as reading — a
@@ -210,6 +228,19 @@ const READING: &[&str] = &[
     ".a //= 1",
     "del(.a)",
     "setpath([\"a\"]; 1)",
+    // #2794: a reading `isempty`/`any`/`all` argument keeps the whole node
+    // reading.
+    "isempty(.[])",
+    "isempty(.a)",
+    "any(.[]; . > 1)",
+    "all(.[]; . > 0)",
+    // #2794: `gen` closed but `cond` escapes through a channel that
+    // bypasses gen's rebound value entirely -- the same rule
+    // `stage_escapes_own_input` already enforces for `reduce`/`foreach`.
+    "any(1; key)",
+    "any(1; input)",
+    "any(1; path(.))",
+    "all(1; key)",
 ];
 
 /// yq's metadata-assignment grammar (#798), which only the yq-mode parser
