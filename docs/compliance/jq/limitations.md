@@ -3845,6 +3845,40 @@ documents, plus 5 reading spellings that must still raise), the split probe list
 if it calls a filter closed, the filter's output must not depend on the document — is
 `tests/jq_closed_term_tests.rs`.
 
+**Widened again by [#2794](https://github.com/rust-works/succinctly/issues/2794): `isempty(f)`,
+`any(gen; cond)` and `all(gen; cond)` are argument-transparent, so a closed argument closes
+the whole builtin.** `node_reads_ambient`'s `Builtin` arm was a negative allowlist that
+forced `true` for every builtin except ten, regardless of its arguments — right for a
+builtin that reads `.` itself (`length`, `add`, ...), wrong for one whose whole answer comes
+from a generator it consumes. `isempty(f)`'s argument sees the true ambient, so it joins the
+allowlist directly; `any(gen; cond)`/`all(gen; cond)` desugar to `gen | cond` (confirmed
+live: `any(1,2,3; .a > 1)` on `{"a":99}` errors "Cannot index number with string \"a\"",
+naming gen's own numeric output, not the document), the same rebinding `reduce`'s `update`
+and `foreach`'s `extract` already get, so they need a dedicated `reads_ambient_value` arm
+rather than the flat allowlist. On the same `{123: 1, "b": 2}`:
+
+| filter                          | jq 1.7.1 | succinctly before | succinctly now |
+|----------------------------------|----------|--------------------|-----------------|
+| `isempty(1)`, `isempty(empty)`  | error    | error              | `false`, `true` |
+| `any(range(3); . > 1)`          | error    | error              | `true`          |
+| `all(range(3); . >= 0)`         | error    | error              | `true`          |
+| `isempty(1 \| .)`                | error    | error              | `false`         |
+
+The last row is its own instance of the #2699 widening, one level in: `isempty`'s own arm
+recurses through `reads_ambient_value` rather than the flat allowlist specifically so a
+rebinding construct nested inside its argument (a pipe, a `reduce`, a `foreach`) gets the
+same refinement a top-level filter would, not just a bare `.`.
+
+Measured on a 96 MB `json generate` document (Apple M4 Pro, release build; the baseline for
+a filter that reads nothing is ~110 MB): `isempty(empty)` 2020 MB → 110 MB,
+`isempty(range(9))` 2020 MB → 110 MB, `isempty(1 | .)` 2118 MB → 110 MB,
+`any(range(3); . > 1)` 3763 MB → 110 MB, `all(range(3); . >= 0)` 3764 MB → 110 MB.
+
+`any`/`all`'s arity-0/1 forms (`any`, `all`, `any(cond)`, `all(cond)`) are deliberately
+unaffected: those desugar to an implicit `.[]` generator and genuinely read `.` on their own
+account. Pinned by the same `test_closed_terms_do_not_validate_2173` and
+`tests/jq_closed_term_tests.rs` the #2699 rows above are.
+
 ### Arithmetic and unary minus validate only what they read (#2626)
 
 [#2173](https://github.com/rust-works/succinctly/issues/2173) above stopped the wildcard

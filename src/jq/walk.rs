@@ -1357,6 +1357,20 @@ pub fn reads_ambient_value(expr: &Expr) -> bool {
             reads_ambient_value(gen) || stage_escapes_own_input(cond)
         }
 
+        // `isempty(f)`'s argument sees the true ambient `.`, not a rebound
+        // value (unlike `cond` above), so a plain `reads_ambient_value(f)`
+        // is sound -- and strictly more precise than falling through to the
+        // flat allowlist entry below, which loses the recursive refinement
+        // this function gives Pipe/Reduce/Foreach/Comma: `isempty(1 | .)`
+        // is closed (the `.` reads the rebound `1` from the first pipe
+        // stage, matching `1 | .`'s own row in this function's Pipe arm
+        // above), but the flat `any_subexpr` walk cannot tell that nested
+        // `.` apart from a real document read. Measured: fixing this arm
+        // took `isempty(1 | .)` from 2.1 GB to the ~110 MB baseline on a
+        // 96 MB document, the same class of gap #2794's `AnyCond`/`AllCond`
+        // arm above closes for their own rebound stage.
+        Expr::Builtin(Builtin::IsEmpty(f)) => reads_ambient_value(f),
+
         // Everything else keeps the flat whole-tree answer. That is still
         // sound -- `any_subexpr` reaches every descendant, so a `.` anywhere
         // reports `true` -- just less precise than it could be: a `Pipe`
