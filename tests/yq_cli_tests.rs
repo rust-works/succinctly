@@ -41934,3 +41934,119 @@ fn test_resource_limit_caps_are_uncatchable_in_yq_mode_2132() -> Result<()> {
 
     Ok(())
 }
+
+// ============================================================================
+// #2279: JSON-sourced flow-sequence delimiter validation
+// ============================================================================
+
+/// Every row below was captured live from Homebrew `yq` v4.53.3, comparing
+/// `(exit code, stdout)` rather than the exit code alone -- the object rows
+/// agree on "accepted" while disagreeing on the *value*, so an exit-code-only
+/// comparison scores them as matching when they are not.
+///
+/// The table is deliberately two-sided. Half of it pins shapes this fix
+/// *changes* (`[1,]` and friends now error); the other half pins shapes it
+/// must **not** change -- the object rows real yq accepts, and the array
+/// scalars whose grammar JSON rejects but yq allows (`[01]`, `[00]`, `[1.]`).
+/// Routing a leaf through stricter machinery is exactly how a fidelity fix
+/// over-reaches, so the must-not-change rows are the load-bearing ones.
+const JSON_SOURCED_DELIMITER_ROWS: &[(&str, Option<&str>)] = &[
+    // --- flow sequences: real yq rejects, and now so do we -------------
+    ("[1,]", None),
+    ("[1,2,]", None),
+    ("[,]", None),
+    ("[,1]", None),
+    ("[1,,2]", None),
+    ("[1,2,,]", None),
+    ("[[1,],2]", None),
+    (r#"{"a":[1,]}"#, None),
+    // --- flow mappings: real yq ACCEPTS these; we must not start -------
+    // refusing them. yq ignores punctuation inside `{}` and pairs up
+    // tokens, so a trailing/stray comma there is simply dropped.
+    (r#"{"a":1,}"#, Some(r#"{"a":1}"#)),
+    (r#"{"a":1,"b":2,}"#, Some(r#"{"a":1,"b":2}"#)),
+    (r#"[{"a":1,}]"#, Some(r#"[{"a":1}]"#)),
+    (r#"{"a":{"b":1,}}"#, Some(r#"{"a":{"b":1}}"#)),
+    // --- scalar grammar is NOT tightened: yq accepts all three --------
+    ("[01]", Some("[1]")),
+    ("[00]", Some("[0]")),
+    ("[1.]", Some("[1]")),
+    // --- well-formed controls ----------------------------------------
+    ("[1]", Some("[1]")),
+    ("[]", Some("[]")),
+    ("{}", Some("{}")),
+    ("[[]]", Some("[[]]")),
+    ("[1 ,2]", Some("[1,2]")),
+    ("[1, 2]", Some("[1,2]")),
+    ("[1,\n2]", Some("[1,2]")),
+    ("[1,\r\n2]", Some("[1,2]")),
+    (r#"[{"a":1},{"b":2}]"#, Some(r#"[{"a":1},{"b":2}]"#)),
+];
+
+#[test]
+fn json_sourced_flow_sequence_delimiters_match_yq_2279() -> Result<()> {
+    for (input, expected) in JSON_SOURCED_DELIMITER_ROWS {
+        let (stdout, code) = run_yq_stdin(
+            ".",
+            input,
+            &["--input-format", "json", "-o=json", "-I=0"],
+        )?;
+        match expected {
+            Some(want) => {
+                assert_eq!(
+                    (stdout.trim(), code),
+                    (*want, 0),
+                    "#2279: {input:?} must still be accepted with this exact value \
+                     (real yq v4.53.3 accepts it)"
+                );
+            }
+            None => {
+                assert_ne!(
+                    code, 0,
+                    "#2279: {input:?} must be rejected (real yq v4.53.3 rejects it), \
+                     got stdout {stdout:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The gap was never output-shaped: `length` and `keys` answer from the BP
+/// structure, so they diverged too and no serializer-side check could have
+/// caught them. Parsing is the only place that fixes every route at once.
+#[test]
+fn json_sourced_delimiter_check_covers_every_route_2279() -> Result<()> {
+    for filter in [".", ".[0]", ".[]", "length", "keys"] {
+        let (stdout, code) = run_yq_stdin(
+            filter,
+            "[1,]",
+            &["--input-format", "json", "-o=json", "-I=0"],
+        )?;
+        assert_ne!(
+            code, 0,
+            "#2279: `{filter}` on `[1,]` must be rejected, got stdout {stdout:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The tightening is gated on JSON-sourced input. Genuine YAML keeps YAML's
+/// own flow rules, where a trailing comma is legal -- and real yq agrees.
+#[test]
+fn genuine_yaml_flow_sequences_keep_their_trailing_comma_2279() -> Result<()> {
+    for (input, want) in [
+        ("[1,]", "[1]"),
+        ("[1, 2,]", "[1,2]"),
+        ("a: [1,]", r#"{"a":[1]}"#),
+        ("{a: 1,}", r#"{"a":1}"#),
+    ] {
+        let (stdout, code) = run_yq_stdin(".", input, &["-o=json", "-I=0"])?;
+        assert_eq!(
+            (stdout.trim(), code),
+            (want, 0),
+            "#2279: genuine YAML {input:?} must be unaffected by the JSON-sourced gate"
+        );
+    }
+    Ok(())
+}
