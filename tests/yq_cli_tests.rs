@@ -16298,7 +16298,12 @@ fn test_absent_item_comment_residuals_1079_float() -> Result<()> {
 
     let input = "- k:\n  - # c\n  - # d\n- 2\n";
     assert_yq_getter(input, ".[0].k | key | foot_comment", "d\n")?;
-    assert_yq_getter(input, ".[1] | head_comment", "c\n")
+    assert_yq_getter(input, ".[1] | head_comment", "c\n")?;
+    // A root-level nested sequence has no key to settle onto and the next
+    // outer item is itself absent: real yq keeps only `c5` on `.[2]`.
+    let input = "-\n  - # c3\n- # c5\n- 6\n";
+    assert_yq_getter(input, ".[2] | head_comment", "c3\nc5\n")?;
+    assert_yq_getter(input, ".[1] | foot_comment", "\n")
 }
 
 /// A standalone block above a bare `-` whose value is deferred to the next
