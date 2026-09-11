@@ -1468,11 +1468,15 @@ fn evaluate_yaml_direct_filtered(
         sort_keys,
         mark_json_sourced,
     } = opts;
-    let mut index =
-        YamlIndex::build(bytes).map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
-    if mark_json_sourced {
-        index.mark_json_sourced();
+    // #2279: build_json_sourced parses with JSON's flow-sequence delimiter
+    // rules *and* marks the index; the two cannot be applied separately,
+    // since `[1,]` is already accepted by the time a post-build mark runs.
+    let index = if mark_json_sourced {
+        YamlIndex::build_json_sourced(bytes)
+    } else {
+        YamlIndex::build(bytes)
     }
+    .map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
     let root = index.root(bytes);
 
     // YAML documents are wrapped in a sequence at the root
@@ -6405,11 +6409,13 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
             if let Some(code) = yaml_validate_guard(&yaml_bytes, fmt, args.validate, None) {
                 return Ok(code);
             }
-            let mut index = YamlIndex::build(&yaml_bytes)
-                .map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
-            if fmt == InputFormat::Json {
-                index.mark_json_sourced();
+            let index = if fmt == InputFormat::Json {
+                // #2279: see `evaluate_yaml_direct_filtered`'s own call.
+                YamlIndex::build_json_sourced(&yaml_bytes)
+            } else {
+                YamlIndex::build(&yaml_bytes)
             }
+            .map_err(|e| anyhow::anyhow!("YAML parse error: {e}"))?;
 
             // #1350/#2486: `--sort-keys` has no soundness pass on the M2
             // fast path below -- fall back to the DOM evaluator (via
@@ -6585,16 +6591,19 @@ pub fn run_yq(args: YqCommand) -> Result<i32> {
                     writer.flush()?;
                     return Ok(code);
                 }
-                let mut index = match YamlIndex::build(&yaml_bytes) {
+                // #2279: see `evaluate_yaml_direct_filtered`'s own call.
+                let built = if fmt == InputFormat::Json {
+                    YamlIndex::build_json_sourced(&yaml_bytes)
+                } else {
+                    YamlIndex::build(&yaml_bytes)
+                };
+                let index = match built {
                     Ok(index) => index,
                     Err(e) => {
                         let e = anyhow::anyhow!("YAML parse error in {file_path}: {e}");
                         return flush_then_err(&mut writer, e);
                     }
                 };
-                if fmt == InputFormat::Json {
-                    index.mark_json_sourced();
-                }
 
                 // #1350/#2486: see the stdin branch's identical check above
                 // for the full rationale.
