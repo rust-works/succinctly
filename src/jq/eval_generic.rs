@@ -5777,16 +5777,24 @@ fn drive_pipe_elements_generic<S: EvalSemantics, V: DocumentValue>(
                     other => return other,
                 }
             }
-            Err(Control::Error(e)) => return drain_result_generic(GenericResult::Error(e), sink),
-            Err(Control::Break(label)) => {
-                return drain_result_generic(GenericResult::Break(label), sink);
-            }
-            Err(Control::Halt(code)) => {
-                return drain_result_generic(GenericResult::Halt(code), sink)
-            }
+            Err(control) => return escape_via_sink(control, sink),
         }
     }
     Flow::Exhausted
+}
+
+/// A `Control` that ended a generator before its next element, delivered
+/// the way [`drive_pipe_elements_generic`] always has: as the matching
+/// `GenericResult` through `drain_result_generic`, so `sink` sees the same
+/// terminal shape it would for any other escape. Factored out (#2666) so the
+/// validation window in [`each_lazy_seq_iterate_sink`] takes the identical
+/// path when the failure is inside the window and nothing has been emitted.
+fn escape_via_sink<V: DocumentValue>(control: Control, sink: &mut dyn Sink<V>) -> Flow {
+    match control {
+        Control::Error(e) => drain_result_generic(GenericResult::Error(e), sink),
+        Control::Break(label) => drain_result_generic(GenericResult::Break(label), sink),
+        Control::Halt(code) => drain_result_generic(GenericResult::Halt(code), sink),
+    }
 }
 
 /// Demand-aware `Expr::Iterate` fan-out for a `LazyIndexRange` (#1565): no
@@ -5991,18 +5999,47 @@ fn each_lazy_keys_iterate_sink<S: EvalSemantics, V: DocumentValue>(
 /// `test_first_over_lazy_seq_iterate_skips_later_error_1565`; recorded in
 /// `docs/compliance/jq/limitations.md`.
 fn each_lazy_seq_iterate_sink<S: EvalSemantics, V: DocumentValue>(
-    seq: LazySeq<V>,
+    mut seq: LazySeq<V>,
     rest: &[Expr],
     optional: bool,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
+    // #2666: the validation window. Pull as many elements as the consumer
+    // will ever accept *before* pushing the first one, so a failure inside
+    // that window raises with nothing emitted -- the atomicity `map` has in
+    // jq, where the whole array is built before `.[]` can observe it.
+    //
+    // `Unbounded` (top level, `[..]`, `reduce`, `try`, `def` bodies, ..)
+    // pulls the whole `seq`: exactly `fold_lazy_seq_stage`'s `Expr::Iterate`
+    // arm's atomicity, at the O(n) buffer jq itself pays for the array.
+    // `AtMost(1)` (`first`, `.[0]`, `nth(0)`) pulls one element and pushes
+    // it -- bit-for-bit #1565's work, the 2M-element win untouched.
+    // `AtMost(n)` pulls `min(n, len)` first, so `limit(3; map(.+1) | .[])`
+    // on a 3-element array errors like jq, while `limit(1; ..)` still pulls
+    // one. Past the window the tail streams one element at a time exactly
+    // as before, so the remaining divergence is bounded to "an element past
+    // the window, when the consumer stopped before reaching it".
+    let window = match sink.budget() {
+        Budget::Unbounded => usize::MAX,
+        Budget::AtMost(n) => n,
+    };
+    let (lower, _) = seq.size_hint();
+    let mut head: Vec<LazyElem<V>> = vec_with_capacity(lower.min(window));
+    for item in seq.by_ref().take(window) {
+        match item {
+            Ok(elem) => head.push(elem),
+            // Nothing has reached `sink` yet, so this is the whole answer.
+            Err(control) => return escape_via_sink(control, sink),
+        }
+    }
+    let to_item = |elem: LazyElem<V>| match elem {
+        LazyElem::Cursor(c) => GenericItem::OneCursor(c),
+        LazyElem::Owned(o) => GenericItem::Owned(o),
+    };
     drive_pipe_elements_generic::<S, V>(
-        seq.map(|item| {
-            item.map(|elem| match elem {
-                LazyElem::Cursor(c) => GenericItem::OneCursor(c),
-                LazyElem::Owned(o) => GenericItem::Owned(o),
-            })
-        }),
+        head.into_iter()
+            .map(|elem| Ok(to_item(elem)))
+            .chain(seq.map(move |item| item.map(to_item))),
         rest,
         optional,
         sink,
@@ -7676,18 +7713,110 @@ enum GenericItem<V: DocumentValue> {
     LazySeq(Box<LazySeq<V>>),
 }
 
+/// How many outputs the consumer behind a [`Sink`] will accept before it
+/// stops (#2666).
+///
+/// `Unbounded` unless a *truncating* consumer -- `first`, `limit(n; ..)`,
+/// `nth`, `.[0]` -- says otherwise. A producer that has to choose between
+/// streaming its outputs one at a time and validating them as a batch
+/// before the first one leaves reads this to decide: with a bound it may
+/// stream (nothing past the bound can be observed anyway), without one it
+/// must not (see `each_lazy_seq_iterate_sink`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Budget {
+    Unbounded,
+    AtMost(usize),
+}
+
+impl Budget {
+    /// The tighter of two budgets -- a bounded consumer inside another
+    /// bounded consumer accepts at most the smaller count.
+    fn min(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Unbounded, b) | (b, Self::Unbounded) => b,
+            (Self::AtMost(a), Self::AtMost(b)) => Self::AtMost(a.min(b)),
+        }
+    }
+}
+
 /// The push boundary between a producer and whatever consumes its outputs
 /// (#2666) -- what every `sink: &mut dyn FnMut(GenericItem<V>) -> Demand`
-/// parameter in this module used to be, as a trait.
+/// parameter in this module used to be, as a trait so the consumer can
+/// also *describe itself*.
 ///
-/// [`push`](Self::push) is the old closure call, and this commit changes
-/// nothing else: the trait exists so the consumer can later *describe
-/// itself* to the producer (how many outputs it will accept), which a bare
-/// closure cannot. That method, and why a trait rather than a second
-/// parameter threaded alongside the closure, arrive with the behaviour
-/// change that needs them.
+/// [`push`](Self::push) is the old closure call. [`budget`](Self::budget)
+/// is why this is a trait rather than a second parameter threaded alongside
+/// the closure: with a parallel `budget` argument the default at each of
+/// the ~60 closures that interpose between producer and consumer is
+/// whatever their author typed, and "inherit" typed where "reset" was
+/// needed silently re-opens the very leak #2666 closes. With the trait, a
+/// closure that names no budget *is* `Unbounded` -- atomic, jq-matching,
+/// correct -- through the blanket impl below. Laziness is opt-in via
+/// [`bounded`] and nothing else: a closure that interposes between a
+/// bounded consumer and the producer resets the budget, which costs a
+/// materialization on that shape and buys jq's atomicity for it. It
+/// cannot cost a wrong answer.
 trait Sink<V: DocumentValue> {
     fn push(&mut self, item: GenericItem<V>) -> Demand;
+
+    /// How many more outputs the consumer will accept. `Unbounded` unless a
+    /// truncating consumer says otherwise -- see [`Budget`].
+    fn budget(&self) -> Budget {
+        Budget::Unbounded
+    }
+}
+
+/// A sink with an explicit [`Budget`]: the only way a consumer opts *out*
+/// of the atomic default (#2666).
+///
+/// [`bounded`] is a truncating consumer (`first`, `limit(n; ..)`, `nth`,
+/// `.[0]`) announcing how many outputs it will take -- composed with
+/// whatever budget the sink *it* feeds already carries, so
+/// `first(limit(3; ..))` is `AtMost(1)` and `[limit(3; ..)]` is `AtMost(3)`.
+///
+/// There is deliberately no `forward` -- a pass-through wrapper that would
+/// let `try`/`//`/`?//`/`as` *inherit* an inner bound instead of resetting
+/// it to `Unbounded`. The design allows one, and #2666's plan sketched it as
+/// a perf-only opt-in "applied where measured". Measured, it has no case:
+/// every interposing closure that resets the budget makes its shape *more*
+/// atomic, i.e. closer to jq -- `first(try (map(f)|.[]) catch c)` answers
+/// `c` exactly as jq does precisely because `try` resets -- and ADR-0018's
+/// decision order puts that fidelity ahead of the O(n) it costs on those
+/// shapes. The one shape whose laziness matters, #1565's bare
+/// `first(map(f) | .[])`, has no wrapper in the way (0.047 s on 2M elements
+/// before and after). Re-introducing a forwarder is a fidelity regression
+/// on every shape it touches and needs its own recorded divergence.
+///
+/// Takes the inner budget as a value rather than holding `&dyn Sink`: the
+/// closure it wraps already borrows that sink mutably to push into it, and
+/// `Budget` is `Copy`, so reading it once up front is both the
+/// borrow-checker's answer and the cheaper one.
+struct WithBudget<F> {
+    budget: Budget,
+    f: F,
+}
+
+impl<V: DocumentValue, F: FnMut(GenericItem<V>) -> Demand> Sink<V> for WithBudget<F> {
+    fn push(&mut self, item: GenericItem<V>) -> Demand {
+        (self.f)(item)
+    }
+    fn budget(&self) -> Budget {
+        self.budget
+    }
+}
+
+/// See [`WithBudget`]: a consumer that will take at most `n` outputs,
+/// composed with `inner` (the budget of the sink `f` pushes into, or
+/// `Unbounded` for a result-returning consumer with no sink behind it).
+fn bounded<V: DocumentValue, F: FnMut(GenericItem<V>) -> Demand>(
+    n: usize,
+    inner: Budget,
+    f: F,
+) -> WithBudget<F> {
+    WithBudget {
+        budget: Budget::AtMost(n).min(inner),
+        f,
+    }
 }
 
 /// Every existing `&mut |item| ..` closure is a `Sink` with the default
@@ -9235,17 +9364,24 @@ fn each_limit_with_n_generic<S: EvalSemantics, V: DocumentValue>(
 
     let mut count = 0usize;
     let mut outer_stopped = false;
-    let flow = eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| {
-        count += 1;
-        if sink.push(item) == Demand::Stop {
-            outer_stopped = true;
-            Demand::Stop
-        } else if count >= n {
-            Demand::Stop
-        } else {
-            Demand::Continue
-        }
-    });
+    let outer_budget = sink.budget();
+    let flow = eval_each_generic::<S, V>(
+        expr,
+        value,
+        optional,
+        cursor,
+        &mut bounded(n, outer_budget, |item| {
+            count += 1;
+            if sink.push(item) == Demand::Stop {
+                outer_stopped = true;
+                Demand::Stop
+            } else if count >= n {
+                Demand::Stop
+            } else {
+                Demand::Continue
+            }
+        }),
+    );
 
     // The wrapping consumer, not our own `n` cap, is why the generator
     // stopped -- propagate its verdict (and whatever `pending` came with it)
@@ -9306,29 +9442,36 @@ fn take_at_index_generic<S: EvalSemantics, V: DocumentValue>(
     let mut outer_stopped = false;
     let mut kept_any = false;
     let mut skipped_err: Option<Control> = None;
-    let flow = eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| {
-        let at_or_past = seen >= skip;
-        seen += 1;
-        if at_or_past {
-            let item = if kept_any {
-                match generic_item_into_owned(item) {
-                    Ok(v) => GenericItem::Owned(v),
-                    Err(control) => return stop_with_escape(&mut skipped_err, control),
+    let outer_budget = sink.budget();
+    let flow = eval_each_generic::<S, V>(
+        expr,
+        value,
+        optional,
+        cursor,
+        &mut bounded(skip + 1, outer_budget, |item| {
+            let at_or_past = seen >= skip;
+            seen += 1;
+            if at_or_past {
+                let item = if kept_any {
+                    match generic_item_into_owned(item) {
+                        Ok(v) => GenericItem::Owned(v),
+                        Err(control) => return stop_with_escape(&mut skipped_err, control),
+                    }
+                } else {
+                    item
+                };
+                kept_any = true;
+                if sink.push(item) == Demand::Stop {
+                    outer_stopped = true;
                 }
-            } else {
-                item
-            };
-            kept_any = true;
-            if sink.push(item) == Demand::Stop {
-                outer_stopped = true;
+                return Demand::Stop;
             }
-            return Demand::Stop;
-        }
-        if let Err(control) = generic_item_into_owned(item) {
-            return stop_with_escape(&mut skipped_err, control);
-        }
-        Demand::Continue
-    });
+            if let Err(control) = generic_item_into_owned(item) {
+                return stop_with_escape(&mut skipped_err, control);
+            }
+            Demand::Continue
+        }),
+    );
     if let Some(control) = skipped_err {
         return Flow::Escaped(control);
     }
@@ -10671,10 +10814,16 @@ fn each_take_first_generic<S: EvalSemantics, V: DocumentValue>(
     // alternative. Under a single alternative this is still entered exactly
     // once and returns exactly one item.
     let mut taken: Vec<GenericItem<V>> = Vec::new();
-    let flow = eval_each_generic::<S, V>(inner, value, optional, cursor, &mut |item| {
-        taken.push(item);
-        Demand::Stop
-    });
+    let flow = eval_each_generic::<S, V>(
+        inner,
+        value,
+        optional,
+        cursor,
+        &mut bounded(1, Budget::Unbounded, |item| {
+            taken.push(item);
+            Demand::Stop
+        }),
+    );
     (taken, flow)
 }
 
@@ -12038,14 +12187,20 @@ fn limit_with_n_generic<S: EvalSemantics, V: DocumentValue>(
     // too (`limit(2; .[])` on a sequence of duplicate-keyed mappings), not
     // only across the `limit`/`nth` walk itself.
     let mut out: Vec<GenericItem<V>> = Vec::new();
-    let flow = eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| {
-        out.push(item);
-        if out.len() >= n {
-            Demand::Stop
-        } else {
-            Demand::Continue
-        }
-    });
+    let flow = eval_each_generic::<S, V>(
+        expr,
+        value,
+        optional,
+        cursor,
+        &mut bounded(n, Budget::Unbounded, |item| {
+            out.push(item);
+            if out.len() >= n {
+                Demand::Stop
+            } else {
+                Demand::Continue
+            }
+        }),
+    );
     match flow {
         // The sink returns `Demand::Stop` the instant `out.len() >= n`, and
         // every `eval_each_generic` arm stops pulling as soon as `Demand`
@@ -12138,36 +12293,42 @@ fn nth_with_n_generic<S: EvalSemantics, V: DocumentValue>(
     let mut seen = 0usize;
     let mut wanted: Vec<GenericItem<V>> = Vec::new();
     let mut skipped_err: Option<Control> = None;
-    let flow = eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| {
-        // #1519: `>=`, not `==`, and a `Vec` rather than a latch -- see
-        // `eval::each_take_nth`'s doc comment for why jq's own counter keeps
-        // rising across a `?//` retry and emits again
-        // (`[nth(1; 1 as $x ?// $y | 5, 6)]` is `[6,5]`). Outside a `?//`
-        // chain the sink is never re-entered after its stop, so this is
-        // exactly the previous behaviour.
-        let at_or_past = seen >= n;
-        seen += 1;
-        if at_or_past {
-            wanted.push(item);
-            return Demand::Stop;
-        }
-        // jq defines `nth($n; f)` as `last(limit($n + 1; f))`: every output
-        // of `f` up to index `n` is genuinely produced, not just the one
-        // ultimately kept -- a *skipped* item's own lazy computation (a
-        // buffered `map`/`select` chain, `GenericItem::LazySeq`, #724/#725)
-        // must still run for its side effects/errors even though its value
-        // is discarded here. `each_take_nth` in `eval.rs` gets this for
-        // free (its `Item`s are never themselves lazy, only ever borrowed
-        // or already-owned); this sink has to force it explicitly, or
-        // `nth(2; .[] | map(10/.))` over `[[1],[0],[2]]` would silently
-        // skip the division-by-zero `map` never ran on `[0]` and answer
-        // from `[2]` instead of erroring. The item *at* index `n` is
-        // deliberately exempted from this force -- see below.
-        if let Err(control) = generic_item_into_owned(item) {
-            return stop_with_escape(&mut skipped_err, control);
-        }
-        Demand::Continue
-    });
+    let flow = eval_each_generic::<S, V>(
+        expr,
+        value,
+        optional,
+        cursor,
+        &mut bounded(n + 1, Budget::Unbounded, |item| {
+            // #1519: `>=`, not `==`, and a `Vec` rather than a latch -- see
+            // `eval::each_take_nth`'s doc comment for why jq's own counter keeps
+            // rising across a `?//` retry and emits again
+            // (`[nth(1; 1 as $x ?// $y | 5, 6)]` is `[6,5]`). Outside a `?//`
+            // chain the sink is never re-entered after its stop, so this is
+            // exactly the previous behaviour.
+            let at_or_past = seen >= n;
+            seen += 1;
+            if at_or_past {
+                wanted.push(item);
+                return Demand::Stop;
+            }
+            // jq defines `nth($n; f)` as `last(limit($n + 1; f))`: every output
+            // of `f` up to index `n` is genuinely produced, not just the one
+            // ultimately kept -- a *skipped* item's own lazy computation (a
+            // buffered `map`/`select` chain, `GenericItem::LazySeq`, #724/#725)
+            // must still run for its side effects/errors even though its value
+            // is discarded here. `each_take_nth` in `eval.rs` gets this for
+            // free (its `Item`s are never themselves lazy, only ever borrowed
+            // or already-owned); this sink has to force it explicitly, or
+            // `nth(2; .[] | map(10/.))` over `[[1],[0],[2]]` would silently
+            // skip the division-by-zero `map` never ran on `[0]` and answer
+            // from `[2]` instead of erroring. The item *at* index `n` is
+            // deliberately exempted from this force -- see below.
+            if let Err(control) = generic_item_into_owned(item) {
+                return stop_with_escape(&mut skipped_err, control);
+            }
+            Demand::Continue
+        }),
+    );
     // #2199: `skipped_err` is checked *before* `wanted`, reversing this
     // function's own prior order -- the comment that used to sit here
     // claimed "by construction, over `skipped_err` too -- once `wanted` is
@@ -23270,6 +23431,117 @@ mod tests {
     use super::super::expr::{CompareOp, FormatType, Literal};
     use super::super::value::NumberRepr;
     use super::*;
+
+    // ---- #2666: Budget composition and the validation window ----
+
+    #[test]
+    fn budget_min_is_the_tighter_bound_2666() {
+        use Budget::{AtMost, Unbounded};
+        assert_eq!(Unbounded.min(Unbounded), Unbounded);
+        assert_eq!(Unbounded.min(AtMost(3)), AtMost(3));
+        assert_eq!(AtMost(3).min(Unbounded), AtMost(3));
+        assert_eq!(AtMost(3).min(AtMost(1)), AtMost(1));
+        assert_eq!(AtMost(1).min(AtMost(3)), AtMost(1));
+    }
+
+    /// `bounded(n, inner, f)` composes: `first(limit(3; ..))` is `AtMost(1)`,
+    /// `[limit(3; ..)]` is `AtMost(3)`; a bare closure is `Unbounded` -- the
+    /// default that makes the design safe.
+    #[test]
+    fn bounded_composes_as_documented_2666() {
+        use Budget::{AtMost, Unbounded};
+        type V<'a> = crate::json::light::StandardJson<'a, Vec<u64>>;
+        let noop = |_: GenericItem<V<'_>>| Demand::Continue;
+        assert_eq!(Sink::<V<'_>>::budget(&noop), Unbounded);
+        assert_eq!(
+            Sink::<V<'_>>::budget(&bounded(3, Unbounded, noop)),
+            AtMost(3)
+        );
+        assert_eq!(
+            Sink::<V<'_>>::budget(&bounded(3, AtMost(1), noop)),
+            AtMost(1)
+        );
+        assert_eq!(
+            Sink::<V<'_>>::budget(&bounded(1, AtMost(3), noop)),
+            AtMost(1)
+        );
+    }
+
+    /// The window on `[1,2,"x"] | map(.+1) | .[]`, driven straight through
+    /// `each_lazy_seq_iterate_sink` with a sink of each budget. `AtMost(2)`
+    /// yields `2, 3` and never reaches the failing third element -- the new,
+    /// stated bound of the divergence. `AtMost(3)` and `Unbounded` pull the
+    /// failing element into the window and raise with nothing emitted.
+    #[test]
+    fn lazy_seq_iterate_window_follows_the_sink_budget_2666() {
+        use Budget::{AtMost, Unbounded};
+        let doc = br#"[1,2,"x"]"#;
+        let index = crate::json::JsonIndex::build(doc);
+        let root = index.root(doc);
+        let map_expr = super::super::parse("map(.+1)").expect("parses");
+
+        let run = |budget: Budget| -> (Vec<String>, Option<String>) {
+            let seq = match eval_with_cursor(&map_expr, root) {
+                GenericResult::LazySeq(seq) => seq,
+                other => panic!("map(.+1) should be a LazySeq here, got {other:?}"),
+            };
+            // A real truncating consumer stops once it has its `n`; a sink that
+            // kept answering `Continue` past its own budget would pull the tail
+            // and see the failing element regardless of the window.
+            let take = match budget {
+                AtMost(n) => n,
+                Unbounded => usize::MAX,
+            };
+            let mut got: Vec<String> = Vec::new();
+            let mut sink = WithBudget {
+                budget,
+                f: |item: GenericItem<_>| {
+                    got.push(
+                        generic_item_into_owned(item)
+                            .expect("element decodes")
+                            .to_json(),
+                    );
+                    if got.len() >= take {
+                        Demand::Stop
+                    } else {
+                        Demand::Continue
+                    }
+                },
+            };
+            let flow = each_lazy_seq_iterate_sink::<JqSemantics, _>(*seq, &[], false, &mut sink);
+            let err = match flow {
+                Flow::Escaped(Control::Error(e)) => Some(e.to_string()),
+                Flow::Escaped(other) => panic!("unexpected escape {other:?}"),
+                Flow::Exhausted | Flow::Stopped { .. } => None,
+            };
+            (got, err)
+        };
+
+        let (got, err) = run(AtMost(2));
+        assert_eq!(
+            got,
+            ["2", "3"],
+            "AtMost(2): the failing element is past the window"
+        );
+        assert!(err.is_none(), "AtMost(2): {err:?}");
+
+        let (got, err) = run(AtMost(3));
+        assert!(
+            got.is_empty(),
+            "AtMost(3): nothing may be emitted, got {got:?}"
+        );
+        assert!(
+            err.is_some(),
+            "AtMost(3): the failing element is inside the window"
+        );
+
+        let (got, err) = run(Unbounded);
+        assert!(
+            got.is_empty(),
+            "Unbounded: nothing may be emitted, got {got:?}"
+        );
+        assert!(err.is_some(), "Unbounded: atomic, like jq");
+    }
 
     /// #1909: [`reindex_bridge_is_identity`] claims to describe exactly when
     /// `eval_on_owned`'s serialize + `JsonIndex::build` +
