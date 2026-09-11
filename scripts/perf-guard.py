@@ -114,6 +114,23 @@ QUERIES = [
     ("users_identity", "users", "2mb", "jq", "."),
     ("arrays_identity", "arrays", "2mb", "jq", "."),
     ("users_yq_keys_unsorted", "users", "2mb", "yq", "keys_unsorted"),
+    # #2666: the two sides of the `map(f) | .[]` atomicity boundary, on the
+    # one fixture where `map` applies at the root (a top-level array of
+    # arrays). The first is #1565's win -- a truncating consumer over a
+    # `LazySeq` pulls one element and stops -- and is the row that must NOT
+    # move when #2666 lands. The second is the shape #2666 makes atomic: it
+    # goes from streaming to the O(n) buffer jq itself pays for the array
+    # `map` builds, so it is *expected* to move. Its `QUERY_THRESHOLDS`
+    # entry arrives with the fix PR, sized from that PR's own merge-base
+    # delta (`--baseline-binary`, #1582) -- the one measurement that can be
+    # attributed to the fix. It is deliberately absent here: an override
+    # committed before the fix is a permanent loosening on a row whose only
+    # job is to be watched, during a window in which nothing has moved.
+    # Neither row existed before, which is how #2042's +21-33% resolver
+    # regression passed at -0.0% (#2655) -- this guard cannot see a shape
+    # it does not run.
+    ("arrays_first_map_iterate", "arrays", "2mb", "jq", "first(map(length) | .[])"),
+    ("arrays_map_iterate", "arrays", "2mb", "jq", "map(length) | .[]"),
 ]
 
 IR_PATTERN = re.compile(r"I\s+refs:\s+([\d,]+)")

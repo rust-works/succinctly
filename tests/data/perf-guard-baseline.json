@@ -1,18 +1,22 @@
 {
   "ARM64-Linux": {
-    "arrays_identity": 594207638,
-    "users_identity": 289261734,
-    "users_keys_unsorted": 44367858,
-    "users_yq_keys_unsorted": 73041061,
-    "wide_identity": 467108181,
-    "wide_keys_unsorted": 291360706
+    "arrays_first_map_iterate": 111093246,
+    "arrays_identity": 594206439,
+    "arrays_map_iterate": 1119002742,
+    "users_identity": 289260562,
+    "users_keys_unsorted": 44366766,
+    "users_yq_keys_unsorted": 73403543,
+    "wide_identity": 467107189,
+    "wide_keys_unsorted": 290310316
   },
   "x86_64": {
-    "arrays_identity": 659508283,
-    "users_identity": 354088795,
-    "users_keys_unsorted": 66351190,
-    "users_yq_keys_unsorted": 80986986,
-    "wide_identity": 578685455,
-    "wide_keys_unsorted": 346886468
+    "arrays_first_map_iterate": 121074952,
+    "arrays_identity": 659510931,
+    "arrays_map_iterate": 1161373631,
+    "users_identity": 354091314,
+    "users_keys_unsorted": 66354067,
+    "users_yq_keys_unsorted": 81210364,
+    "wide_identity": 578688312,
+    "wide_keys_unsorted": 345792588
   }
 }
