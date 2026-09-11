@@ -22329,6 +22329,45 @@ fn owned_identity_after_prefetch(
     }
 }
 
+/// The live key-node cursor `id` stands at, if any (#2763) -- re-derived
+/// rather than trusted from `id.key_node` alone. The `Key` arm of
+/// [`eval_owned_identity_stages`] sets that flag for an array index and for
+/// a key that is not a string node too, because a second `key` must emit
+/// nothing there as well (yq v4.53.3: `.x[0] | key | key` prints nothing);
+/// but `id.base` in those cases is the *value's* cursor, carried for
+/// `path`/`parent`, and reading metadata from it leaked the element's own
+/// line (`.x[0] | tostring | key | line` answered `4`, yq `0`). Only a base
+/// that `cursor_slot` itself reports as a key node is one.
+///
+/// `Ok` is assumed: whichever branch of the `Key` arm produced this `id`
+/// already ran the identical `cursor_slot(&c)` and would have returned its
+/// error itself, before `key_node` was ever set.
+/// The node-metadata getter `stage` is, if it is one: the builtins that read
+/// nothing but a cursor and so answer their `""`/`0` defaults over an owned
+/// value (#2763).
+fn node_metadata_getter(stage: &Expr) -> Option<&Builtin> {
+    match strip_parens(stage) {
+        Expr::Builtin(
+            builtin @ (Builtin::Line
+            | Builtin::Column
+            | Builtin::Style
+            | Builtin::Anchor
+            | Builtin::LineComment
+            | Builtin::HeadComment
+            | Builtin::FootComment),
+        ) => Some(builtin),
+        _ => None,
+    }
+}
+
+fn owned_identity_live_key_node<V: DocumentValue>(id: &OwnedIdentity<V>) -> Option<V::Cursor> {
+    if !id.key_node || !id.ancestors.is_empty() {
+        return None;
+    }
+    let c = id.base?;
+    matches!(cursor_slot(&c), Ok(Some(CursorSlot::Key(_)))).then_some(c)
+}
+
 /// The stages of an owned identity pipe, run from `(value, id)` and ending
 /// in `tail` (spine 2416 step 3; the transparent constructs and the tail
 /// since the identity pass).
@@ -22359,6 +22398,45 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
             Ok(()) => Flow::Exhausted,
             Err(control) => Flow::Escaped(control),
         };
+    }
+    // #2763: the node-metadata getters at a key-node position. Every other
+    // stage in this route is evaluated by `eval_each_owned`, which has no
+    // cursor and answers these with their `""`/`0` defaults -- correct for a
+    // value the query *built*, wrong for the key `key` just emitted, which is
+    // a document node real yq reads the entry's comments, line, column, style
+    // and anchor from. Narrowed to a key node deliberately: whether an
+    // *ordinary* kept owned value should answer metadata from its base is the
+    // wider question this issue does not settle (`.a | del(.b) | line` is `2`
+    // in yq, `0` here). Decided before the match so the key-node check --
+    // a member scan -- runs once, and only for a metadata stage.
+    if let Some(builtin) = node_metadata_getter(stage) {
+        if let Some(c) = owned_identity_live_key_node(&id) {
+            let outputs = eval_builtin::<S, V>(builtin, c.value(), optional, Some(c));
+            let mut downstream: Option<Flow> = None;
+            let flow = drain_result_generic::<V>(outputs, &mut |item| {
+                let output = match owned_identity_materialize::<V>(item) {
+                    Ok(o) => o,
+                    Err(control) => {
+                        return stop_with_downstream(&mut downstream, Flow::Escaped(control))
+                    }
+                };
+                // Every one of these is `OwnedIdentityRule::Keeps`, so the
+                // output stands where its input did -- at the key node, no
+                // longer *as* the key (`.a.b | key | line | key` is `"b"` in
+                // yq v4.53.3).
+                match eval_owned_identity_stages::<S, V>(
+                    rest,
+                    output,
+                    id.clone().with_key_node(false),
+                    optional,
+                    tail.reborrow(),
+                ) {
+                    Flow::Exhausted => Demand::Continue,
+                    other => stop_with_downstream(&mut downstream, other),
+                }
+            });
+            return downstream.unwrap_or(flow);
+        }
     }
     match strip_parens(stage) {
         // #2471: the emitted key keeps the node's position, flagged so a
@@ -22428,51 +22506,6 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                 Ok(None) => Flow::Exhausted,
                 Err(e) => Flow::Escaped(Control::Error(e)),
             }
-        }
-        // #2763: the node-metadata getters at a key-node position. Every
-        // other stage in this route is evaluated by `eval_each_owned`, which
-        // has no cursor and answers these with their `""`/`0` defaults --
-        // correct for a value the query *built*, wrong for the key `key`
-        // just emitted, which is a document node real yq reads the entry's
-        // comments, line, column, style and anchor from. Narrowed to a key
-        // node deliberately: whether an *ordinary* kept owned value should
-        // answer metadata from its base is the wider question this issue
-        // does not settle (`.a | del(.b) | line` is `2` in yq, `0` here).
-        Expr::Builtin(
-            builtin @ (Builtin::Line
-            | Builtin::Column
-            | Builtin::Style
-            | Builtin::Anchor
-            | Builtin::LineComment
-            | Builtin::HeadComment
-            | Builtin::FootComment),
-        ) if id.key_node && id.ancestors.is_empty() && id.base.is_some() => {
-            let c = id.base.expect("guarded");
-            let outputs = eval_builtin::<S, V>(builtin, c.value(), optional, Some(c));
-            let mut downstream: Option<Flow> = None;
-            let flow = drain_result_generic::<V>(outputs, &mut |item| {
-                let output = match owned_identity_materialize::<V>(item) {
-                    Ok(o) => o,
-                    Err(control) => {
-                        return stop_with_downstream(&mut downstream, Flow::Escaped(control))
-                    }
-                };
-                // Every one of these is `OwnedIdentityRule::Keeps`, so the
-                // output stands where its input did -- at the key node, no
-                // longer *as* the key (`.a.b | key | line | key` is `"b"` in
-                // yq v4.53.3).
-                match eval_owned_identity_stages::<S, V>(
-                    rest,
-                    output,
-                    id.clone().with_key_node(false),
-                    optional,
-                    tail.reborrow(),
-                ) {
-                    Flow::Exhausted => Demand::Continue,
-                    other => stop_with_downstream(&mut downstream, other),
-                }
-            });
-            downstream.unwrap_or(flow)
         }
         Expr::Builtin(Builtin::PathNoArg) => match id.path() {
             Ok(path) => eval_owned_identity_stages::<S, V>(
