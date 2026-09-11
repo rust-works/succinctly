@@ -640,14 +640,14 @@ pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr)
 ///   Kept explicit in all three rather than folded here, despite being
 ///   identical across them, because each function's own comment on this arm
 ///   documents a different concrete hazard worth reading in place.
-/// - `Expr::Error`: also identical across all three (`msg.clone()`, no
-///   recursion into the message) -- and also kept explicit in all three
-///   rather than folded, but for the opposite reason from `Shared`: unlike
-///   `Shared`'s opacity, this one is not obviously a deliberate invariant.
-///   `error($x)` referencing a variable, parameter, or def-call the
-///   enclosing pass is substituting would not get substituted by any of the
-///   three today. Preserved as-is (behavior-preserving refactor, not a
-///   bugfix) but flagged here for follow-up.
+/// - `Expr::Error`: **no longer** kept explicit in any of the three (#2727)
+///   -- it used to be, identically, an unconditional `msg.clone()` with no
+///   recursion into the message, which meant `error($x)` referencing a
+///   variable, parameter, or def-call the enclosing pass was substituting
+///   never got substituted by any of the three. Unlike `Shared`'s opacity,
+///   that was never a deliberate invariant (flagged as a likely latent gap
+///   when this function was introduced), so all three now fall through to
+///   this function's own arm below, which does recurse into the message.
 /// - `Expr::Builtin`: always delegates to [`map_builtin_subexprs`], but
 ///   `install_def_calls_in_builtin` charges its own sub-expressions an extra
 ///   frame relative to every other structural descent (see its own doc
@@ -671,14 +671,17 @@ pub fn map_builtin_subexprs(builtin: &Builtin, f: &mut dyn FnMut(&Expr) -> Expr)
 ///   unconditional shape exists to fall back to, so all three keep their own
 ///   complete arm and never reach this function's own arm for it.
 ///
-/// The five arms named above (`Shared`, `Error`, `Builtin`, `FuncDef`, and
+/// The four arms named above (`Shared`, `Builtin`, `FuncDef`, and
 /// `install_def_calls`'s own `DefCall` policy) are therefore never actually
 /// exercised by any of today's three callers -- but this function still
 /// implements them, with a reasoned default, rather than reaching for a
 /// wildcard: the whole point of matching exhaustively is that a *future*
 /// `Expr` variant is a compile error here until it is categorized, and a
-/// wildcard on these five would quietly extend to that future variant too,
+/// wildcard on these four would quietly extend to that future variant too,
 /// recreating exactly the silent-drop risk this function exists to close.
+/// `Expr::Error` no longer joins them (#2727): all three now genuinely reach
+/// this function's own `Expr::Error` arm below, rather than shadowing it
+/// with their own copy first.
 ///
 /// **Deliberately has no wildcard arm**, for the same reason
 /// [`map_builtin_subexprs`] doesn't.
@@ -1862,11 +1865,11 @@ mod tests {
         assert_eq!(result, expr);
     }
 
-    /// `Expr::Error`'s default arm recurses into the message (unlike any of
-    /// today's three `eval.rs` callers, which all keep their own
-    /// non-recursing `Expr::Error(msg) => Expr::Error(msg.clone())` arm
-    /// instead of reaching this one -- see this function's own doc comment
-    /// for why). Confirms both the `Some` and `None` message shapes.
+    /// `Expr::Error`'s arm recurses into the message -- since #2727, all
+    /// three `eval.rs` callers now actually reach this one instead of
+    /// shadowing it with their own non-recursing copy (see this function's
+    /// own doc comment for the pre-#2727 history). Confirms both the `Some`
+    /// and `None` message shapes.
     #[test]
     fn map_subexprs_error_default_recurses_into_message() {
         let with_msg = parse("error(.a)").expect("filter should parse");

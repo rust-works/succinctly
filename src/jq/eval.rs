@@ -34793,10 +34793,13 @@ fn substitute_var_impl(
             Some(marker) => Expr::TrackedVar(marker.get()),
             None => owned_to_expr(replacement),
         },
-        // #2095: does not recurse into `msg` -- see `map_subexprs`'s own doc
-        // comment (`src/jq/walk.rs`) on its `Expr::Error` arm for why this is
-        // preserved as a likely latent gap rather than fixed here.
-        Expr::Error(msg) => Expr::Error(msg.clone()),
+        // #2727: `Expr::Error` used to stop here with `msg.clone()`,
+        // unconditionally opaque, so a bound variable referenced inside
+        // `error(...)`'s message was never substituted (#2095's own review
+        // flagged this as a likely latent gap rather than a deliberate
+        // invariant like `Shared`'s). No longer special-cased: it now falls
+        // through to the catch-all below, reaching `map_subexprs`'s own
+        // `Expr::Error` arm, which already recurses into the message.
         Expr::Builtin(b) => {
             Expr::Builtin(substitute_var_in_builtin(b, var_name, replacement, mark))
         }
@@ -34909,10 +34912,10 @@ fn substitute_var_impl(
         // `Expr`-typed child and rebuild the node, nothing else -- so it
         // lives once in `map_subexprs` (`src/jq/walk.rs`) instead of being
         // hand-repeated in all three. See that function's own doc comment
-        // for the full variant-by-variant justification, including the five
-        // arms (`Shared`, `Error`, `Builtin`, `FuncDef`, and
-        // `install_def_calls`'s own `DefCall` policy) that stay explicit
-        // above/in each caller instead of ever reaching it.
+        // for the full variant-by-variant justification, including the four
+        // arms (`Shared`, `Builtin`, `FuncDef`, and `install_def_calls`'s own
+        // `DefCall` policy) that stay explicit above/in each caller instead
+        // of ever reaching it -- `Expr::Error` used to be a fifth (#2727).
         _ => map_subexprs(expr, &mut |sub| {
             substitute_var_impl(sub, var_name, replacement, mark)
         }),
@@ -49317,10 +49320,12 @@ pub(crate) fn install_def_calls(
                 bound: BoundBody::default(),
             }
         }
-        // #2095: does not recurse into `msg` -- see `map_subexprs`'s own doc
-        // comment (`src/jq/walk.rs`) on its `Expr::Error` arm for why this is
-        // preserved as a likely latent gap rather than fixed here.
-        Expr::Error(msg) => Expr::Error(msg.clone()),
+        // #2727: `Expr::Error` used to stop here with `msg.clone()`,
+        // unconditionally opaque, so a recursive call inside `error(...)`'s
+        // message (e.g. `error("...\(f(n-1))...")`) was never bound to its
+        // `DefCall` wrapper. No longer special-cased: it now falls through
+        // to the catch-all below, reaching `map_subexprs`'s own
+        // `Expr::Error` arm, which already recurses into the message.
         Expr::Builtin(b) => Expr::Builtin(install_def_calls_in_builtin(
             b,
             def,
@@ -49843,10 +49848,12 @@ fn substitute_func_param_impl(expr: &Expr, param: &str, arg: &Expr, scope: Subst
         // `FuncCall` arm below reads `scope.bare` instead, and the two
         // narrow on different binders (#2555).
         Expr::Var(name) if scope.dollar && name == param => arg.clone(),
-        // #2095: does not recurse into `msg` -- see `map_subexprs`'s own doc
-        // comment (`src/jq/walk.rs`) on its `Expr::Error` arm for why this is
-        // preserved as a likely latent gap rather than fixed here.
-        Expr::Error(msg) => Expr::Error(msg.clone()),
+        // #2727: `Expr::Error` used to stop here with `msg.clone()`,
+        // unconditionally opaque, so a `def` parameter referenced inside
+        // `error(...)`'s message was never substituted. No longer
+        // special-cased: it now falls through to the catch-all below,
+        // reaching `map_subexprs`'s own `Expr::Error` arm, which already
+        // recurses into the message.
         Expr::Builtin(b) => Expr::Builtin(substitute_func_param_in_builtin(b, param, arg, scope)),
         // #2141: `expr`/`input`/`init` (evaluated in the *outer* scope)
         // always keep the ambient scope, and `body`/`update`/`extract` (the
