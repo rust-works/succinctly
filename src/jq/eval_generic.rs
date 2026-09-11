@@ -20633,9 +20633,13 @@ fn owned_identity_step<S: EvalSemantics, V: DocumentValue>(
             owned_identity_recurse_step::<S, V>(value, id, out);
             Ok(())
         }
-        // #2549: closed by that predicate's own `_ => false` -- a shape it
-        // has never heard of is not admitted, so it never reaches here. Pinned
-        // by `expr_dispatch_catchall_guards_default_conservatively_2549`.
+        // #2549 audit: `owned_identity_nav_supported`'s own `_ => false` keeps
+        // the *pipe/stages* route from reaching here. It is **not** the only
+        // gate: `owned_identity_operand` reaches this same dispatch under
+        // `owned_identity_operand_supported`, which admits `Expr::Literal` --
+        // a shape with no arm below. `.a | ((.b | 1) + 2) | key` aborts the
+        // process today; tracked as #2771, pinned by
+        // `expr_dispatch_catchall_guards_default_conservatively_2549`.
         _ => unreachable!("owned_identity_nav_supported admits no other shape"),
     }
 }
@@ -33319,11 +33323,13 @@ mod tests {
     /// add ~60 arms per site and move where the compile error lands without
     /// changing what a *new* variant does today.
     ///
-    /// Audited at #2549 pickup -- all closed, none a live gap:
+    /// Audited at #2549 pickup. Seven of the eight are closed; the eighth is
+    /// a live process abort, filed as #2771 (see the row below and the
+    /// divergence pinned at the end of this test):
     ///
     /// | catch-all | closed by |
     /// |---|---|
-    /// | `owned_identity_step` | `owned_identity_nav_supported`, `_ => false` |
+    /// | `owned_identity_step` | **NOT closed -- #2771** (two call sites, two guards) |
     /// | `owned_identity_computed_step` | its caller's arm pattern, syntactic |
     /// | `path_context_step_generic` | `path_context_is_navigational`, `_ => false` |
     /// | its two `Optional(..)` let-elses | the same arm's own `matches!` guard |
@@ -33337,6 +33343,16 @@ mod tests {
     /// edit that flips one of those defaults to `true` -- the only way a new
     /// variant could start reaching an `unreachable!` -- fails here instead
     /// of aborting a user's process.
+    ///
+    /// **A conservative default is necessary but not sufficient**, which is
+    /// what #2771 turned out to be: a dispatch reached from *two* call sites
+    /// under *two* guards is only as closed as the weaker one, however
+    /// conservative each is on its own. `owned_identity_step` is gated on
+    /// `owned_identity_nav_supported` from the pipe/stages route and on
+    /// `owned_identity_operand_supported` from `owned_identity_operand`, and
+    /// the two disagree on `Expr::Literal` -- which the dispatch has no arm
+    /// for. The first draft of this audit checked one call site, found its
+    /// guard conservative, and recorded the site as closed.
     #[test]
     fn expr_dispatch_catchall_guards_default_conservatively_2549() {
         // Guards `owned_identity_step`'s catch-all.
@@ -33355,14 +33371,14 @@ mod tests {
             assert!(!owned_identity_nav_supported(&e), "nav admitted `{src}`");
         }
 
-        // The *operand* guard, consulted by `owned_identity_nav_supported`'s
-        // own `IndexExpr`/`SliceExpr` arms for a computed bracket's target.
-        // Its sibling `owned_identity_component_supported` delegates to
+        // The *operand* guard: `owned_identity_step`'s second gate, via
+        // `owned_identity_operand`. Its sibling
+        // `owned_identity_component_supported` delegates to
         // `path_context_absent_resolvable`, a deliberately broader predicate
         // that admits folds and `if`: it decides whether a component can be
         // *resolved*, not whether a stage may be stepped, and guards no
         // `unreachable!`. A first draft of this test asserted against it and
-        // failed -- recorded here rather than quietly corrected, since
+        // failed -- recorded rather than quietly corrected, since
         // mis-attributing which guard closes a catch-all is exactly what
         // #2549 asked to check.
         for src in [
@@ -33410,5 +33426,22 @@ mod tests {
                 "binary stage not selected for `{src}`"
             );
         }
+
+        // #2771, the one gap this audit found: `owned_identity_step`'s two
+        // guards disagree on `Expr::Literal`, and the dispatch has no arm
+        // for it -- so `.a | ((.b | 1) + 2) | key` aborts the process.
+        // Pinned as the divergence it is, so the day `Expr::Literal` gets an
+        // arm this fails and the row above can move back to "closed".
+        let literal = parse("1").unwrap();
+        assert!(
+            owned_identity_operand_supported(&literal),
+            "a literal is a legitimate operand of a ruled stage"
+        );
+        assert!(
+            !owned_identity_nav_supported(&literal),
+            "a literal is not navigation"
+        );
+        // The two together are the gap: admitted by one gate, unhandled by
+        // the dispatch both gates share.
     }
 }
