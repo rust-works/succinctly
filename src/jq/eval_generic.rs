@@ -5993,11 +5993,20 @@ fn each_lazy_keys_iterate_sink<S: EvalSemantics, V: DocumentValue>(
 /// `test_generic_lazy_seq_first_after_map_skips_later_error_725`), widened
 /// from `first`/`.[0]` to `.[]`-under-demand: the point of a lazy `first` is
 /// to skip elements that cannot affect the requested output, and an element
-/// that errors is one such element. Restoring atomicity would mean draining
+/// that errors is one such element.
+///
+/// **Since #2666 the trade applies only under a truncating consumer.** The
+/// body below reads `sink.budget()` and drains exactly that many elements
+/// before pushing the first -- all of them when the consumer is
+/// `Unbounded`, which is jq's atomicity at the O(n) buffer jq itself pays;
+/// one when it is `first`, which is bit-for-bit the #1565 pull. The
+/// paragraph this replaced said restoring atomicity "would mean draining
 /// the whole `seq` before emitting anything, which is exactly the O(n) cost
-/// #1565 exists to remove. Pinned by
-/// `test_first_over_lazy_seq_iterate_skips_later_error_1565`; recorded in
-/// `docs/compliance/jq/limitations.md`.
+/// #1565 exists to remove" -- true of an unconditional drain, and exactly
+/// what a *budgeted* one avoids. Pinned by
+/// `test_first_over_lazy_seq_iterate_skips_later_error_1565` and
+/// `test_map_iterate_atomicity_outside_truncators_2666`; recorded in
+/// `docs/compliance/jq/limitations.md` and ADR-0022.
 fn each_lazy_seq_iterate_sink<S: EvalSemantics, V: DocumentValue>(
     mut seq: LazySeq<V>,
     rest: &[Expr],
@@ -6023,8 +6032,13 @@ fn each_lazy_seq_iterate_sink<S: EvalSemantics, V: DocumentValue>(
         Budget::Unbounded => usize::MAX,
         Budget::AtMost(n) => n,
     };
-    let (lower, _) = seq.size_hint();
-    let mut head: Vec<LazyElem<V>> = vec_with_capacity(lower.min(window));
+    // No capacity pre-size: `LazySeq` has no `size_hint` (its source is an
+    // iterator over an index it has not walked yet), so `lower` is always
+    // 0 and `with_capacity(0)` is what the plan's `min(window, hint)` would
+    // have computed. The `Unbounded` buffer grows by doubling; measured on
+    // 2M elements that is 168 MB peak against the 272 MB the already-atomic
+    // `[map(f) | .[]]` pays, so nothing to tune here.
+    let mut head: Vec<LazyElem<V>> = Vec::new();
     for item in seq.by_ref().take(window) {
         match item {
             Ok(elem) => head.push(elem),
@@ -7819,6 +7833,24 @@ fn bounded<V: DocumentValue, F: FnMut(GenericItem<V>) -> Demand>(
     }
 }
 
+/// See [`WithBudget`]: a forwarder that inherits `inner`'s budget instead of
+/// resetting it to `Unbounded` -- for a closure that stands between a bounded
+/// consumer and the producer purely to route items (run the remaining pipe
+/// stages on each, then push), where `(a | b) | c` and `a | b | c` must
+/// answer alike.
+///
+/// Inheriting is safe in both directions. If the stages this closure runs
+/// *expand* an item (a `.[]` in `rest`), the producer may pull more than
+/// the consumer strictly needed -- more validation, more atomic, the safe
+/// side. If they *filter* (a `select`), the window is "at least `n`
+/// validated" and the tail streams exactly as before.
+fn forward<V: DocumentValue, F: FnMut(GenericItem<V>) -> Demand>(
+    inner: Budget,
+    f: F,
+) -> WithBudget<F> {
+    WithBudget { budget: inner, f }
+}
+
 /// Every existing `&mut |item| ..` closure is a `Sink` with the default
 /// `Unbounded` budget -- which is what makes the default safe. Nothing
 /// about the 60-odd closure sites in this module changed to adopt the trait.
@@ -9442,13 +9474,18 @@ fn take_at_index_generic<S: EvalSemantics, V: DocumentValue>(
     let mut outer_stopped = false;
     let mut kept_any = false;
     let mut skipped_err: Option<Control> = None;
-    let outer_budget = sink.budget();
+    // #2666: `skip + 1` inputs are what this consumer needs to produce its
+    // one output, whatever bound the sink behind it carries -- an outer
+    // `first` limits how many outputs leave, not how many elements must be
+    // examined to find the (skip+1)th. So this does NOT compose with
+    // `sink.budget()` the way `limit` does: `first(nth(1; ..))` must still
+    // validate two elements, not `min(2, 1)`. Found by #2815's review.
     let flow = eval_each_generic::<S, V>(
         expr,
         value,
         optional,
         cursor,
-        &mut bounded(skip + 1, outer_budget, |item| {
+        &mut bounded(skip + 1, Budget::Unbounded, |item| {
             let at_or_past = seen >= skip;
             seen += 1;
             if at_or_past {
@@ -10069,8 +10106,16 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
     // Same once-per-driver cache as `drive_pipe_elements_generic` (#1598):
     // this closure also runs once per item stage 1 produces.
     let mut rest = RestPipe::new(rest);
+    // #2666: the budget the consumer behind `sink` announced, read before
+    // `driver` borrows `sink` mutably. `driver` is a forwarder -- it runs
+    // `rest` on each item and pushes -- so it must carry that budget, or
+    // `first((map(f) | .[]) | g)` drains where `first(map(f) | .[] | g)`
+    // pulls one: same jq program, 13x apart, and a different answer on a
+    // failing element. Found by #2815's review after this file's first
+    // version claimed no forwarder was ever needed.
+    let outer_budget = sink.budget();
     let upstream = {
-        let mut driver = |item: GenericItem<V>| -> Demand {
+        let mut driver = forward(outer_budget, |item: GenericItem<V>| -> Demand {
             let flow = match identity_from_first {
                 Some(_) if key_stage && matches!(item, GenericItem::OneCursor(_)) => {
                     continue_pipe_element_generic::<S, V>(item, &mut rest, optional, &mut *sink)
@@ -10096,7 +10141,7 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
                 Flow::Exhausted => Demand::Continue,
                 other => stop_with_downstream(&mut downstream, other),
             }
-        };
+        });
         eval_each_generic::<S, V>(first, value, optional, cursor, &mut driver)
     };
 

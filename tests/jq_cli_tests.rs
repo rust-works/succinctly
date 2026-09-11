@@ -48327,3 +48327,78 @@ fn test_map_iterate_atomicity_owned_and_generic_agree_2666() -> Result<()> {
     }
     Ok(())
 }
+
+/// #2666: the two `bounded` sites the §0 table never reached, and the two
+/// off-by-ones no §0 row could see -- found by #2815's review, which
+/// mutation-tested each site and each `n` and watched the whole suite stay
+/// green.
+///
+/// `limit_with_n_generic` and `nth_with_n_generic` are the *result-returning*
+/// twins of the sink-driven consumers, reached only when the truncating
+/// builtin's output is consumed by something that collects (`map(..)`, `+`),
+/// not by the top-level driver. Their `n` is only observable through a `rest`
+/// that *expands* an element into several outputs: `nth(1; .. | (.,.))` on
+/// `[1,"x"]` needs two outputs, both of which come from the first element,
+/// so a window of `n` (one element) yields `2` while jq's atomic `map` errors
+/// -- and a window of `n + 1` reaches the failing element and errors like jq.
+///
+/// The `first(nth(1; ..))` row pins the composition rule: `nth` needs
+/// `skip + 1` *inputs* whatever the outer bound accepts as *outputs*, so it
+/// must not take `min(skip + 1, outer)`. The first version of this PR did,
+/// and answered `2` there.
+#[test]
+fn test_bounded_result_returning_twins_and_their_n_2666() -> Result<()> {
+    // (input, filter, stdout, exit) -- all captured against jq 1.7.1, which
+    // is atomic on every row (exit 5, no output); the rows that yield are
+    // the #725/#1565 divergence reached through the result-returning twins.
+    let rows: &[(&str, &str, &str, i32)] = &[
+        // limit_with_n_generic -- would error like jq with its bound removed.
+        (r#"[[1,"x"]]"#, "map(limit(1; map(.+1) | .[]))", "[2]", 0),
+        (r#"[1,"x"]"#, "[limit(1; map(.+1)|.[])] + [1]", "[2,1]", 0),
+        // nth_with_n_generic -- same.
+        (r#"[[1,"x"]]"#, "map(nth(0; map(.+1) | .[]))", "[2]", 0),
+        // nth's `n + 1`: an expanding rest is the only way to see it. Top-level
+        // `nth` takes the sink-driven `take_at_index_generic`; it is the
+        // `map(..)`-wrapped spelling that reaches `nth_with_n_generic`, so
+        // both are here.
+        (r#"[1,"x"]"#, "nth(1; map(.+1)|.[] | (.,.))", "", 5),
+        (r#"[[1,"x"]]"#, "map(nth(1; map(.+1)|.[] | (.,.)))", "", 5),
+        // take_at_index's `skip + 1`, NOT min'd with the outer `first`.
+        (r#"[1,"x"]"#, "first(nth(1; map(.+1) | .[] | (.,.)))", "", 5),
+        // limit DOES compose with an outer bound: first(limit(3; ..)) pulls 1.
+        (r#"[1,"x",3]"#, "first(limit(3; map(.+1)|.[]))", "2", 0),
+        (r#"[1,"x",3]"#, "[limit(3; map(.+1)|.[])]", "", 5),
+    ];
+    for (input, filter, want_out, want_code) in rows {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(input))?;
+        assert_eq!(
+            (out.trim(), code),
+            (*want_out, *want_code),
+            "#2666: `{filter}` on {input} -- stderr: {err:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #2666: `(a | b) | c` and `a | b | c` are the same jq program and must
+/// answer alike -- and run alike. The parenthesised spelling routes its
+/// inner pipe through `eval_each_pipe_generic`'s driver closure, which is a
+/// forwarder; #2815's first version left that closure on the `Unbounded`
+/// default, so `first((map(.+1) | .[]) | .+1)` drained 2M elements (13x
+/// slower than the flat spelling) and answered differently on a failing
+/// element. The driver now carries the outer budget via `forward`. Pinned
+/// here by the answer; the timing lives in the PR's A/B table.
+#[test]
+fn test_parenthesised_pipe_agrees_with_flat_pipe_under_first_2666() -> Result<()> {
+    let input = r#"[1,"x",3]"#;
+    let flat = run_jq_full(&["-c", "first(map(.+1) | .[] | .+1)"], Some(input))?;
+    let parens = run_jq_full(&["-c", "first((map(.+1) | .[]) | .+1)"], Some(input))?;
+    assert_eq!(
+        (flat.0.trim(), flat.2),
+        (parens.0.trim(), parens.2),
+        "#2666: the two spellings of one program disagree -- flat: {flat:?}, parens: {parens:?}"
+    );
+    // And they agree on the deliberately-divergent literal, not on an error:
+    assert_eq!((flat.0.trim(), flat.2), ("3", 0));
+    Ok(())
+}
