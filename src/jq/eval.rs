@@ -25765,6 +25765,10 @@ fn wrap_fresh(steps: &[Expr], value: OwnedValue) -> Result<OwnedValue, EvalError
                 OwnedValue::Array(arr)
             }
             // `fresh_run_len` only ever collects `Field`/`Index` components.
+            // #2549: closed by construction, not by a predicate -- the caller
+            // passes the slice that `take_while` measured, so any other shape
+            // ends the run instead of arriving here. Pinned by
+            // `fresh_run_stops_at_a_non_field_index_step_2549`.
             _ => unreachable!("wrap_fresh only ever walks a fresh Field/Index run"),
         };
     }
@@ -88958,5 +88962,33 @@ mod tests {
         assert_eq!(meta_slot_keyword(MetaSlot::HeadComment), "head_comment");
         assert_eq!(meta_slot_keyword(MetaSlot::FootComment), "foot_comment");
         assert_eq!(meta_slot_keyword(MetaSlot::Comments), "comments");
+    }
+
+    /// #2549: `wrap_fresh`'s `unreachable!` catch-all is closed by
+    /// construction, not by a predicate -- its caller hands it
+    /// `&fresh[1..]`, and `fresh` is the slice `fresh_run_len`'s
+    /// `take_while(Field | Index)` measured. So the run stops at the first
+    /// step of any other shape, and a new `Expr` variant shortens the run
+    /// rather than reaching the dispatch.
+    ///
+    /// See `eval_generic`'s
+    /// `expr_dispatch_catchall_guards_default_conservatively_2549` for the
+    /// other five sites and the audit table.
+    #[test]
+    fn fresh_run_stops_at_a_non_field_index_step_2549() {
+        let steps = |f: &str| match parse(f).unwrap() {
+            Expr::Pipe(stages) => stages,
+            other => vec![other],
+        };
+        // A pure `Field`/`Index` run is measured whole ...
+        assert_eq!(fresh_run_len(&steps(".a | .b | .c")), 3);
+        assert_eq!(fresh_run_len(&steps(".a | .[0] | .b")), 3);
+        // ... and stops at the first step of any other shape, so `wrap_fresh`
+        // never walks one.
+        assert_eq!(fresh_run_len(&steps(".a | tostring | .b")), 1);
+        assert_eq!(fresh_run_len(&steps("tostring | .a")), 0);
+        assert_eq!(fresh_run_len(&steps(".a | .[] | .b")), 1);
+        assert_eq!(fresh_run_len(&steps(".a | .[1:2] | .b")), 1);
+        assert_eq!(fresh_run_len(&steps("length")), 0);
     }
 }

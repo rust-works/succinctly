@@ -10439,6 +10439,10 @@ fn cross_together<S: EvalSemantics, V: DocumentValue>(
             |left_val, right_val| arith_combine::<S>(*op, left_val, right_val),
             &mut collect,
         ),
+        // #2549: closed by `yq_list_stage`'s own `_ => {}` -- a stage it does
+        // not recognise selects nothing, so `YqListStage::Binary` (the only
+        // kind routed here) is reached for `Arithmetic`/`Compare` alone. Pinned
+        // by `expr_dispatch_catchall_guards_default_conservatively_2549`.
         _ => unreachable!("yq_list_stage selects only Compare/Arithmetic as a binary stage"),
     };
     if let Some(control) = stray {
@@ -15053,6 +15057,11 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             }
             control.map_or(Ok(()), Err)
         }
+        // #2549: closed by that predicate's own `_ => false`, same shape as
+        // `owned_identity_step`'s. Its two `Optional(..)` let-elses just
+        // above are closed more tightly still, by their own arm's `matches!`
+        // guard. Pinned by
+        // `expr_dispatch_catchall_guards_default_conservatively_2549`.
         other => unreachable!(
             "path_context_is_navigational admitted a stage the walk cannot step: {other:?}"
         ),
@@ -20624,6 +20633,9 @@ fn owned_identity_step<S: EvalSemantics, V: DocumentValue>(
             owned_identity_recurse_step::<S, V>(value, id, out);
             Ok(())
         }
+        // #2549: closed by that predicate's own `_ => false` -- a shape it
+        // has never heard of is not admitted, so it never reaches here. Pinned
+        // by `expr_dispatch_catchall_guards_default_conservatively_2549`.
         _ => unreachable!("owned_identity_nav_supported admits no other shape"),
     }
 }
@@ -20846,6 +20858,9 @@ fn owned_identity_computed_step<S: EvalSemantics, V: DocumentValue>(
             );
             control.map_or(Ok(()), Err)
         }
+        // #2549: closed syntactically -- the only caller routes here from an
+        // `Expr::IndexExpr { .. } | Expr::SliceExpr { .. }` arm, the two shapes
+        // this match handles. No predicate involved, nothing to pin.
         other => unreachable!("not a computed navigation step: {other:?}"),
     }
 }
@@ -33292,6 +33307,108 @@ mod tests {
                     )
                 }
             }
+        }
+    }
+
+    /// #2549: the `Expr`-dispatch `unreachable!` catch-alls in this file are
+    /// closed because each one's **guard defaults conservatively** -- a shape
+    /// the guard has never heard of answers "not admitted" and never reaches
+    /// the dispatch. That is the property that makes adding a new `Expr`
+    /// variant safe here, and the one worth pinning: spelling every dispatch
+    /// out per-variant (#2182's group (a) treatment, #1401's option 3) would
+    /// add ~60 arms per site and move where the compile error lands without
+    /// changing what a *new* variant does today.
+    ///
+    /// Audited at #2549 pickup -- all closed, none a live gap:
+    ///
+    /// | catch-all | closed by |
+    /// |---|---|
+    /// | `owned_identity_step` | `owned_identity_nav_supported`, `_ => false` |
+    /// | `owned_identity_computed_step` | its caller's arm pattern, syntactic |
+    /// | `path_context_step_generic` | `path_context_is_navigational`, `_ => false` |
+    /// | its two `Optional(..)` let-elses | the same arm's own `matches!` guard |
+    /// | `cross_together` | `yq_list_stage` picks `Binary` for arith/compare only |
+    /// | `eval::wrap_fresh` | the slice `fresh_run_len`'s `take_while` built |
+    ///
+    /// The issue listed five sites and counted six; the sixth is the second
+    /// `Optional(..)` let-else (`SliceExpr`, beside the `IndexExpr` one).
+    ///
+    /// Each row below drives a shape the guard does not admit, so a future
+    /// edit that flips one of those defaults to `true` -- the only way a new
+    /// variant could start reaching an `unreachable!` -- fails here instead
+    /// of aborting a user's process.
+    #[test]
+    fn expr_dispatch_catchall_guards_default_conservatively_2549() {
+        // Guards `owned_identity_step`'s catch-all.
+        for src in [
+            "tostring",
+            "length",
+            "(1, 2)",
+            "if . then . else . end",
+            "reduce .[] as $x (0; .)",
+            "{a: 1}",
+            "[.[]]",
+            "def f: .; f",
+            "error",
+        ] {
+            let e = parse(src).unwrap();
+            assert!(!owned_identity_nav_supported(&e), "nav admitted `{src}`");
+        }
+
+        // The *operand* guard, consulted by `owned_identity_nav_supported`'s
+        // own `IndexExpr`/`SliceExpr` arms for a computed bracket's target.
+        // Its sibling `owned_identity_component_supported` delegates to
+        // `path_context_absent_resolvable`, a deliberately broader predicate
+        // that admits folds and `if`: it decides whether a component can be
+        // *resolved*, not whether a stage may be stepped, and guards no
+        // `unreachable!`. A first draft of this test asserted against it and
+        // failed -- recorded here rather than quietly corrected, since
+        // mis-attributing which guard closes a catch-all is exactly what
+        // #2549 asked to check.
+        for src in [
+            "reduce .[] as $x (0; .)",
+            "if . then 1 else 2 end",
+            "(1, 2)",
+            "tostring",
+        ] {
+            let e = parse(src).unwrap();
+            assert!(
+                !owned_identity_operand_supported(&e),
+                "operand admitted `{src}`"
+            );
+        }
+
+        // Guards `path_context_step_generic`'s catch-all.
+        for src in ["tostring", "length", "to_entries", "[.[]]", "{a: .}"] {
+            let e = parse(src).unwrap();
+            assert!(
+                !path_context_is_navigational(&e),
+                "nav-walk admitted `{src}`"
+            );
+        }
+
+        // `yq_list_stage` routes to `cross_together` only for `Binary`.
+        fn stages_of(f: &str) -> Vec<Expr> {
+            let parsed = parse(f).unwrap();
+            let mut out = Vec::new();
+            yq_flatten_pipe_stages(core::slice::from_ref(&parsed), &mut out);
+            out
+        }
+        for src in ["tostring", "length", "[.[]]", ".a"] {
+            let picked = yq_list_stage(&stages_of(src), true);
+            assert!(
+                !matches!(picked, Some((_, YqListStage::Binary))),
+                "binary stage selected for `{src}`"
+            );
+        }
+        // ... and does pick it for the two it admits, so the above is not
+        // vacuous.
+        for src in [".a == 1", ".a + 1"] {
+            let picked = yq_list_stage(&stages_of(src), true);
+            assert!(
+                matches!(picked, Some((_, YqListStage::Binary))),
+                "binary stage not selected for `{src}`"
+            );
         }
     }
 }
