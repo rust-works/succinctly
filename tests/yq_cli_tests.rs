@@ -12728,6 +12728,11 @@ fn test_yq_halt_not_caught_by_try_catch_or_label() -> Result<()> {
 /// in yq mode too, not just jq mode.
 #[test]
 fn test_label_does_not_shadow_same_named_variable_yq_2739() -> Result<()> {
+    // The filter never reads the input document, so its content is
+    // irrelevant here -- "x: 1" matches this file's local convention for
+    // the surrounding block of tests, not a deliberate YAML-key-vs-jq-
+    // variable interaction (the `$x` above is a jq variable, entirely
+    // unrelated to the YAML key `x` below).
     let (stdout, code) = run_yq_stdin("1 as $x | label $x | $x", "x: 1\n", &[])?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim_end(), "1");

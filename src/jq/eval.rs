@@ -34963,8 +34963,11 @@ fn substitute_var_impl(
         // a break target, not a variable), so a same-named label must
         // never block a variable substitution from reaching into its
         // body -- confirmed live against jq 1.7.1 across the bare case,
-        // nested same-named labels, and a `break $x` inside a rebound
-        // `$x` scope. `map_subexprs`'s own `Expr::Label` arm already
+        // nested same-named labels, an unrelated rebinding inside the
+        // label body, and `break` still escaping to the right label
+        // afterward (each its own row in `test_label_does_not_shadow_
+        // same_named_variable_2739`, `tests/jq_cli_tests.rs`, not one
+        // combined case). `map_subexprs`'s own `Expr::Label` arm already
         // recurses into `body` unconditionally and leaves `name` (a plain
         // `String`, not an `Expr`) untouched, which is exactly right here.
         _ => map_subexprs(expr, &mut |sub| {
