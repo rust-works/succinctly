@@ -41882,3 +41882,55 @@ fn test_wrong_arity_special_form_keeps_yq_parse_error_2686() -> Result<()> {
 
     Ok(())
 }
+
+/// #2132 (yq half): the evaluator's resource caps are uncatchable in yq
+/// mode too -- they are not a reference behaviour in either mode, so the
+/// `ErrorKind::ResourceLimit` tag is mode-independent.
+///
+/// `range`/`repeat` are behind `--jq-extensions` here (#1512), so the rows
+/// use the guards yq mode reaches unaided: `while`/`until`'s
+/// `WHILE_UNTIL_MAX_STEPS` and a recursive `def` past `MAX_EVAL_FRAMES`.
+#[test]
+fn test_resource_limit_caps_are_uncatchable_in_yq_mode_2132() -> Result<()> {
+    for (filter, want_err) in [
+        (
+            "[.a | while(true; .+1)?] | length",
+            "while: maximum iterations exceeded",
+        ),
+        (
+            "[.a | try while(true; .+1) catch \"caught\"] | length",
+            "while: maximum iterations exceeded",
+        ),
+        (
+            "[.a | until(false; .+1)?] | length",
+            "until: maximum iterations exceeded",
+        ),
+        (
+            "def f: f; try f catch \"caught\"",
+            "f/0 exceeded maximum recursion depth",
+        ),
+        (
+            "def f: f; [f?] | length",
+            "f/0 exceeded maximum recursion depth",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "a: 1\n", &[])?;
+        assert_ne!(
+            code, 0,
+            "`{filter}`: the cap must not be caught: {stdout:?}"
+        );
+        assert!(stderr.contains(want_err), "`{filter}`: stderr {stderr:?}");
+        assert!(
+            !stdout.contains("caught"),
+            "`{filter}`: the handler ran: {stdout:?}"
+        );
+    }
+
+    // And an ordinary error is still caught, so this is the tag, not `try`.
+    let (stdout, _stderr, code) =
+        run_yq_stdin_with_stderr("[.a | try error(\"x\") catch \"c\"]", "a: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "- c");
+
+    Ok(())
+}

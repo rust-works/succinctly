@@ -2718,6 +2718,8 @@ match.
 
 ## Recursive `def`s: what a native call stack costs that jq's own does not — #1371
 
+> The `MAX_EVAL_FRAMES` raise is uncatchable by `?`/`try`/`catch` since #2132 -- see "Every resource cap is uncatchable" below.
+
 `succinctly jq` used to substitute a `def`'s body into each call site before evaluating
 anything, which cannot terminate for a self-recursive `def` (expansion has no way to see
 that `n == 0` will eventually hold) and so had to be bounded by three guards. The
@@ -4019,6 +4021,8 @@ than silently left unrecorded. See
 
 ### `repeat(f)` under `limit`/`first` (value mode): fixed (#2014); the eager fallback and path mode still cap, in two different ways
 
+> Both `MAX_ITERATIONS` raises are uncatchable by `?`/`try`/`catch` since #2132 -- see "Every resource cap is uncatchable" below.
+
 `repeat(f)` (`def repeat(f): f, repeat(f);`) has no base case at all: an `f`
 that never errors and never produces a value on some round recurses forever.
 Confirmed live that real jq itself hangs on this rather than raising or
@@ -4125,6 +4129,8 @@ demand-driven treatment to `resolve_repeat_sink` would close this the
 same way.
 
 ### `reduce`/`foreach`'s own step budget (#695/#2079): bounds genuine fanout, not ordinary element count
+
+> The budget's raise is uncatchable by `?`/`try`/`catch` since #2132 -- see "Every resource cap is uncatchable" below.
 
 `REDUCE_FOREACH_MAX_STEPS` (`src/jq/eval.rs`) is a shared step budget charged
 against `reduce`/`foreach` once per UPDATE eval, and -- `foreach` only --
@@ -4294,6 +4300,8 @@ extrapolated) rather than the tens of minutes a further 10x would cost at
 the same pathological shape.
 
 ### `while`/`until`'s own step budget (#534/#2087): the identical bug #2079 already fixed for `reduce`/`foreach`
+
+> The budget's raise is uncatchable by `?`/`try`/`catch` since #2132 -- see "Every resource cap is uncatchable" below.
 
 `WHILE_UNTIL_MAX_STEPS` (`src/jq/eval.rs`) is a shared step budget for
 `while`/`until`'s backtracking-generator evaluation, decremented once per
@@ -4503,6 +4511,8 @@ same one a computed bracket's component stream gets.
 
 ### `range`'s own accumulation cap (#2089): a resource-exhaustion guard, now raising instead of silently truncating
 
+> The cap's raise is uncatchable by `?`/`try`/`catch` since #2132 -- see "Every resource cap is uncatchable" just below.
+
 `MAX_RANGE` (`src/jq/eval.rs`, `100000`, shared by `eval_range_values` and
 `eval_range_values_f64`) caps how many values a single `(from, to, step)`
 combination will accumulate before raising, mirroring
@@ -4553,6 +4563,50 @@ own repro table didn't happen to list, not new ones introduced by this fix.
   needs its own oracle verification before choosing a direction. Tracked as
   [#2131](https://github.com/rust-works/succinctly/issues/2131). **Fixed**:
   see the next section.
+
+### Every resource cap is uncatchable by `?`/`try`/`catch` (#2132) -- shared by the five cap sections
+
+The five evaluator-imposed caps documented in this file -- `range`'s `MAX_RANGE` (#2089, above),
+`while`/`until`'s `WHILE_UNTIL_MAX_STEPS` (#534/#2087), `reduce`/`foreach`'s
+`REDUCE_FOREACH_MAX_STEPS` (#695/#2079), `repeat`'s `MAX_ITERATIONS` (#2014), and a recursive
+`def` past `MAX_EVAL_FRAMES` (#1371) -- raise as `ErrorKind::ResourceLimit`
+(`src/jq/error.rs`), which every `?`/`try`/`catch` boundary treats exactly like a decode
+failure: never suppressed, never handed to the handler. Before #2132 they were plain errors,
+and the catch swallowed them:
+
+```console
+$ echo null | jq -c '[range(100001)?] | length'            # jq 1.7.1 -- no cap at all
+100001
+$ echo null | succinctly jq -c '[range(100001)?] | length'  # before #2132
+100000                                                       # exit 0 -- silently truncated
+$ echo null | succinctly jq -c 'def f: f; try f catch "caught"'  # before #2132
+"caught"
+```
+
+That was exactly the silent-wrong-data class #2089 closed for the *un-suppressed* spelling,
+re-opened one `?` away. The caps are succinctly's own, with no jq counterpart, so a `?`/`try`
+written against jq semantics cannot have meant "accept a truncated result" -- under ADR-0018's
+decision order this is rule 4(b) (matching the reference's catch semantics for an error the
+reference cannot raise would corrupt data), decided identically in both modes since the caps
+are not a reference behaviour in either.
+
+**Ordinary errors are unchanged, and that is jq's own rule, not a residual.** Real jq keeps the
+prefix a generator produced and catches only the terminal error -- `[(1,2,error("x"),3)?]` is
+`[1,2]`, `[try (1,2,error("x"),3) catch "c"]` is `[1,2,"c"]` -- and succinctly matches it.
+The issue's broad reading ("discard what already came out") would have been a divergence.
+Nor does the tag look at message text: a user's own
+`error("range: maximum iterations exceeded")` is still caught (#1660's lesson).
+
+**The prefix still streams.** A cap is an error that ends the stream, not one that
+retroactively discards it: `range(100001)?` prints `0` through `99999` and *then* the error on
+stderr at exit 5, as #2089 established for the un-suppressed form. An early-stopping
+consumer never reaches the cap at all (`[limit(5; range(100001))?]` is `[0,1,2,3,4]`).
+
+Pinned by `test_resource_limit_caps_are_uncatchable_2132`,
+`test_resource_limit_prefix_still_streams_before_the_cap_2132` and
+`test_resource_limit_tag_leaves_ordinary_errors_catchable_2132` (`tests/jq_cli_tests.rs`),
+`resource_limit_is_uncatchable_by_tag_not_message_2132` (`src/jq/error.rs`), and the yq
+twin `test_resource_limit_caps_are_uncatchable_in_yq_mode_2132`.
 
 ### `range`'s `i64` fast path at extreme magnitude (#2131, #2219): overflow-checked in place, extending the same #2089 hang-avoidance divergence
 
