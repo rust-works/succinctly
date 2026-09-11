@@ -1847,9 +1847,11 @@ fn test_yq_bare_path_ungated_2430() -> Result<()> {
 /// built on top of (see the jq-mode test's own updated doc comment): an
 /// ambient `?` from an earlier stage no longer threads into `rest`'s
 /// evaluation at all, so the erroring element's error now escapes as an
-/// ordinary hard error instead of being swallowed. The prefix-keeping half
-/// of #1869's fix is unaffected and still holds here: the erroring element
-/// (1) still stops the traversal and keeps the pre-error prefix.
+/// ordinary hard error instead of being swallowed. The evaluator still
+/// keeps the pre-error prefix internally (jq-mode's own twin still asserts
+/// `[0]`), but #2392 discards it at the yq-mode runner's top-level
+/// emission boundary -- real yq streams nothing before a top-level
+/// error/break, so the surviving `key` never reaches stdout here.
 #[test]
 fn test_yq_iterate_path_context_ambient_optional_keeps_prefix_1869() -> Result<()> {
     let (stdout, stderr, code) = run_yq_stdin_with_stderr(
@@ -1859,7 +1861,7 @@ fn test_yq_iterate_path_context_ambient_optional_keeps_prefix_1869() -> Result<(
     )?;
     assert_eq!(code, 1, "stderr: {stderr}");
     assert!(stderr.contains("boom"), "stderr: {stderr}");
-    assert_eq!(stdout, "0\n");
+    assert_eq!(stdout, "");
     Ok(())
 }
 
@@ -13020,60 +13022,203 @@ fn test_yq_error_outranks_exit_status_flag() -> Result<()> {
     Ok(())
 }
 
+/// #2392: a top-level `(1,2,error("x"))`-shaped result never streams its
+/// already-produced prefix in yq mode -- real yq (mikefarah v4.53.3,
+/// live-verified) prints nothing at all on stdout for these filters and
+/// exits 1. This test used to pin the *opposite* behavior (succinctly
+/// streamed `1`/`2` before the failure, deliberately diverging from real
+/// yq's whole-buffer model) under the theory that #400/#494's jq-mode
+/// prefix-preservation contract should mirror into yq mode too -- that
+/// theory was never checked against the binary. It's wrong: real yq has no
+/// concept of "stream partial output then fail" at all, so succinctly now
+/// matches it by discarding the prefix at the runner's top-level emission
+/// boundary instead. yq's several evaluation routes each convert the
+/// top-level result separately, so every route is exercised here. The
+/// jq-mode twin of this test (`tests/jq_cli_tests.rs`) is untouched --
+/// jq's own prefix-preservation contract is unaffected by this fix.
 #[test]
-fn test_yq_outputs_before_an_error_or_break_survive() -> Result<()> {
-    // The yq side of #400/#494: a stream that produces outputs and *then*
-    // fails keeps those outputs, with the failure reported on stderr and in
-    // the exit code. yq's two evaluation routes each convert the result
-    // separately, so both are exercised here.
-    //
-    // Real yq (mikefarah v4.53.3) buffers the whole result before printing,
-    // so it emits nothing at all on stdout for these filters and exits 1 --
-    // succinctly streams instead. Only the diagnostic and exit code match.
-    // These therefore pin succinctly's own behavior; the byte-for-byte yq
-    // oracle lives in tests/yq_golden_tests.rs.
-
+fn test_yq_top_level_partial_prefix_never_streams_before_an_error_or_break_2392() -> Result<()> {
     // Default YAML input goes through the direct-cursor (generic) route.
     let (stdout, stderr, code) = run_yq_stdin_with_stderr(r#"1,2,error("x")"#, "a: 1\n", &[])?;
-    assert_eq!(stdout, "1\n2\n");
+    assert_eq!(stdout, "");
     assert_eq!(stderr.trim_end(), "Error: x");
     assert_eq!(code, 1);
 
     let (stdout, stderr, code) = run_yq_stdin_with_stderr("1,2,break $out", "a: 1\n", &[])?;
-    assert_eq!(stdout, "1\n2\n");
+    assert_eq!(stdout, "");
     assert_eq!(stderr.trim_end(), "Error: break $out not in label");
     assert_eq!(code, 1);
 
     // The same under `-o json`: the output format is orthogonal to the
-    // prefix-then-failure contract.
+    // no-prefix-before-failure rule.
     let (stdout, stderr, code) =
         run_yq_stdin_with_stderr(r#"1,2,error("x")"#, "a: 1\n", &["-o", "json"])?;
-    assert_eq!(stdout, "1\n2\n");
+    assert_eq!(stdout, "");
     assert_eq!(stderr.trim_end(), "Error: x");
     assert_eq!(code, 1);
 
     // `--null-input` and `--slurp` take the OwnedValue route, which converts
     // the full evaluator's result rather than the generic one's.
     let (stdout, stderr, code) = run_yq_stdin_with_stderr(r#"1,2,error("x")"#, "", &["-n"])?;
-    assert_eq!(stdout, "1\n2\n");
+    assert_eq!(stdout, "");
     assert_eq!(stderr.trim_end(), "Error: x");
     assert_eq!(code, 1);
 
     let (stdout, stderr, code) = run_yq_stdin_with_stderr("1,2,break $out", "", &["-n"])?;
-    assert_eq!(stdout, "1\n2\n");
+    assert_eq!(stdout, "");
     assert_eq!(stderr.trim_end(), "Error: break $out not in label");
     assert_eq!(code, 1);
 
     let (stdout, stderr, code) = run_yq_stdin_with_stderr("1,2,break $out", "a: 1\n", &["-s"])?;
-    assert_eq!(stdout, "1\n2\n");
+    assert_eq!(stdout, "");
     assert_eq!(stderr.trim_end(), "Error: break $out not in label");
     assert_eq!(code, 1);
     Ok(())
 }
 
+/// #2392's own oracle table, live-verified against yq v4.53.3 on the DOM
+/// route (`evaluate_yaml_cursor`): a comma-generator's already-produced
+/// values never reach stdout before a later branch's `error(...)` escapes,
+/// in every shape the issue enumerated.
+#[test]
+fn test_yq_top_level_partial_prefix_dom_route_oracle_table_2392() -> Result<()> {
+    let a1 = "a: 1\n";
+    let ab = "a: 1\nb: 2\n";
+    let arr = "arr:\n  - 1\n  - 2\n  - 3\n";
+
+    for (filter, doc) in [
+        (r#"(1,2,error("x"))"#, a1),
+        (r#"(.a,.b,error("x"))"#, ab),
+        (r#"(.a, error("x"))"#, ab),
+        (r#".arr | (.[0], error("x"))"#, arr),
+        (r#"(1, (2 | error("x")))"#, a1),
+    ] {
+        let (stdout, stderr, code) =
+            run_yq_stdin_with_stderr(filter, doc, &["-o", "json"]).unwrap();
+        assert_eq!(stdout, "", "filter: {filter}");
+        assert_eq!(stderr.trim_end(), "Error: x", "filter: {filter}");
+        assert_eq!(code, 1, "filter: {filter}");
+    }
+    Ok(())
+}
+
+/// #2392's generalization: the leak was never specific to a comma at all --
+/// any top-level result that resolves to `Partial(prefix, control)` leaks
+/// the same way, including a shape with no comma anywhere in it. `.arr[] |
+/// keys`/`to_entries` on a mixed-type array errors partway through the
+/// iteration, after already having produced output for the earlier,
+/// well-typed elements.
+#[test]
+fn test_yq_top_level_partial_prefix_no_comma_generalization_2392() -> Result<()> {
+    let mix = "arr:\n  - {x: 1}\n  - 2\n  - {x: 3}\n";
+
+    for filter in [".arr[] | keys", ".arr[] | to_entries"] {
+        let (stdout, stderr, code) =
+            run_yq_stdin_with_stderr(filter, mix, &["-o=json", "-I=0"]).unwrap();
+        assert_eq!(stdout, "", "filter: {filter}");
+        assert!(
+            stderr.contains("has no keys"),
+            "filter: {filter}, stderr: {stderr}"
+        );
+        assert_eq!(code, 1, "filter: {filter}");
+    }
+    Ok(())
+}
+
+/// #2392's site 3 (M2 streaming): `Expr::IndexExpr` is unconditionally
+/// M2-eligible (`can_use_m2_streaming`), and a computed comma-bound index
+/// (`.[(0,"a")]`) resolves the first key successfully before the second
+/// one fails -- exercising the M2 route's own `discard_yq_partial_prefix`
+/// call, not just the DOM/OwnedValue routes the other tests here cover.
+/// Live-verified against yq v4.53.3: real yq also prints nothing.
+#[test]
+fn test_yq_top_level_partial_prefix_m2_route_2392() -> Result<()> {
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(
+        r#".arr[(0,"a")]"#,
+        "arr:\n  - 1\n  - 2\n  - 3\n",
+        &["-o=json", "-I=0"],
+    )?;
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.contains("Cannot index array with string \"a\""),
+        "stderr: {stderr}"
+    );
+    assert_eq!(code, 1);
+    Ok(())
+}
+
+/// #2392 negative regression: a *caught* error must never reach the
+/// top-level-`Partial` discard at all -- `try`/`catch` intercepts the
+/// escape before it becomes the program's own top-level result, so the
+/// prefix and the caught value both survive exactly as before this fix.
+/// `try`/`catch` is succinctly-extension surface (real yq's lexer rejects
+/// it), so this pins succinctly's own internal consistency rather than an
+/// oracle comparison.
+#[test]
+fn test_yq_top_level_partial_prefix_caught_error_unaffected_2392() -> Result<()> {
+    let (stdout, code) = run_yq_stdin(r#"try (1,2,error("x")) catch ."#, "a: 1\n", &[])?;
+    assert_eq!(stdout, "1\n2\nx\n");
+    assert_eq!(code, 0);
+    Ok(())
+}
+
+/// #2392's `--eval-all`/`-n` regression coverage: site 2
+/// (`query_result_to_owned_values`) is a whole-run conversion, distinct
+/// from the DOM route's per-document `evaluate_yaml_cursor`.
+#[test]
+fn test_yq_top_level_partial_prefix_owned_route_2392() -> Result<()> {
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(r#"1,2,error("x")"#, "", &["-n"])?;
+    assert_eq!(stdout, "");
+    assert_eq!(stderr.trim_end(), "Error: x");
+    assert_eq!(code, 1);
+
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(
+        r#"(.a, error("x"))"#,
+        "a: 1\n---\na: 2\n",
+        &["-o", "json", "--eval-all"],
+    )?;
+    assert_eq!(stdout, "");
+    assert_eq!(stderr.trim_end(), "Error: x");
+    assert_eq!(code, 1);
+    Ok(())
+}
+
+/// #2392 regression pin: an erroring `--inplace` write must still leave the
+/// target file byte-for-byte untouched -- this fix changes what the runner
+/// streams to stdout, not `--inplace`'s own separate write path, but the
+/// two are close enough in the code that a stray write here would be the
+/// one place a regression could actually corrupt user data.
+#[test]
+fn test_yq_top_level_partial_prefix_inplace_no_stray_write_2392() -> Result<()> {
+    let original = "a: 1\n";
+    let mut input_file = NamedTempFile::new()?;
+    write!(input_file, "{original}")?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_succinctly"))
+        .arg("yq")
+        .arg("--inplace")
+        .arg(r#"(1,2,error("x"))"#)
+        .arg(input_file.path())
+        .stdin(Stdio::null())
+        .output()?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        !output.status.success(),
+        "--inplace with an erroring filter should raise, stderr: {stderr}"
+    );
+    assert!(stderr.contains("Error: x"), "stderr: {stderr}");
+
+    let file_contents = std::fs::read_to_string(input_file.path())?;
+    assert_eq!(
+        file_contents, original,
+        "an erroring --inplace write must leave the file untouched"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_693_optional_around_stream_stops_at_the_first_error() -> Result<()> {
-    // Mirrors `test_yq_outputs_before_an_error_or_break_survive`'s two-route
+    // Mirrors `test_yq_top_level_partial_prefix_never_streams_before_an_error_or_break_2392`'s two-route
     // pattern: yq's default (non-null-input) route evaluates through the
     // same native `eval_generic` cursor-based evaluator jq's default route
     // does (`yq_runner.rs`'s `evaluate_yaml_cursor`), while `--null-input`
@@ -33041,12 +33186,16 @@ fn test_negative_index_out_of_range_survives_try_catch_under_eval_all_2270() -> 
     Ok(())
 }
 
-/// #2270 review: the `Partial(prefix, Control::Error(e))` arm this fix
-/// touches (not just the bare `Error(e)` one the test above exercises) --
-/// a `try` body that produces some output *before* raising the
-/// negative-index error must keep that output on stdout while the error
-/// still survives to stderr uncaught, matching `Partial`'s own #400/#494
-/// prefix-preservation contract everywhere else in this codebase.
+/// #2270 review (updated by #2392): the `Partial(prefix, Control::Error(e))`
+/// arm this fix originally touched (not just the bare `Error(e)` one the
+/// test above exercises) -- a `try` body that produces some output *before*
+/// raising the negative-index error keeps that output internally right up
+/// to the runner's `--eval-all` boundary (`query_result_to_owned_values`),
+/// but #2392 discards it there: real yq streams nothing before a top-level
+/// error, and `try`/`catch` is succinctly-extension surface with no oracle
+/// of its own to override that rule (real yq's lexer rejects `try`/`catch`
+/// outright). Both sub-cases below are now empty stdout, matching every
+/// other top-level `Partial` in yq mode.
 #[test]
 fn test_negative_index_out_of_range_survives_try_catch_partial_prefix_2270() -> Result<()> {
     let multi_doc = "a: [1, 2]\n---\na: [3, 4]\n";
@@ -33057,28 +33206,22 @@ fn test_negative_index_out_of_range_survives_try_catch_partial_prefix_2270() -> 
         &["-o", "json", "--eval-all"],
     )?;
     assert_eq!(code, 1, "out: {out:?}");
-    // #2460 moved this line from `null` to nothing: the surviving prefix
-    // (`1`) is a detached value at the root position, and a `key` there now
-    // produces zero outputs in yq mode instead of the `null` placeholder --
-    // live-verified against yq v4.53.3 on the closest expressible shape,
-    // `.a | "\(key)" | key`, which prints nothing there too (real yq's lexer
-    // rejects `try`/`catch` outright, so this exact filter has no oracle).
     assert_eq!(out.trim(), "");
     assert_eq!(
         stderr.trim(),
         "Error: index [-5] out of range, array size is 2"
     );
 
-    // The prefix itself is still delivered -- what changed is only what a
-    // root `key` answers, not whether the `Partial` prefix survives. `[key]`
-    // makes that observable again: one `[]` line, one per prefix output.
+    // #2392: `[key]` used to make the surviving `Partial` prefix observable
+    // as one `[]` line; the runner now discards that prefix before it
+    // reaches stdout, so this is empty too.
     let (out, stderr, code) = run_yq_stdin_with_stderr(
         ".a | (try (1, .[-5]) catch \"c\") | [key]",
         multi_doc,
         &["-o", "json", "--eval-all"],
     )?;
     assert_eq!(code, 1, "out: {out:?}");
-    assert_eq!(out.trim(), "[]");
+    assert_eq!(out.trim(), "");
     assert_eq!(
         stderr.trim(),
         "Error: index [-5] out of range, array size is 2"
@@ -38980,10 +39123,9 @@ fn test_map_family_bodies_see_their_members_position_2471() -> Result<()> {
 /// back in as `Expr::Literal`s for the second evaluation instead of
 /// re-running the original expression, so the side effect fires once.
 ///
-/// Both shapes, captured on this fix (yq has no real reference for `key`,
-/// a succinctly extension; `halt_error`'s own exit code is yq's own -- `1`,
-/// not jq's `5` -- confirmed unchanged by this fix against the pre-#2495
-/// `.a | .[halt_error]` baseline with no `key` at all):
+/// Both shapes, captured on this fix (`halt_error`'s own exit code is yq's
+/// own -- `1`, not jq's `5` -- confirmed unchanged by this fix against the
+/// pre-#2495 `.a | .[halt_error]` baseline with no `key` at all):
 ///
 /// ```console
 /// $ succinctly yq -o=json -I0 '[.a | .[halt_error] | key]'   # a: {b: 1}
@@ -38991,6 +39133,18 @@ fn test_map_family_bodies_see_their_members_position_2471() -> Result<()> {
 /// $ succinctly yq -o=json -I0 '.arr | .[(0,"a")] | key'      # arr: [1,2,3]
 /// stdout: 0   stderr: Error: Cannot index array with string "a"   exit: 1
 /// ```
+///
+/// **#2392 update:** the second shape's claim that "yq has no real
+/// reference for `key`" was never actually checked against the binary --
+/// live-verified against v4.53.3, real yq prints *nothing* for
+/// `.arr | .[(0,"a")] | key` (`(nothing)` on stdout, same stderr/exit as
+/// above). The `0` this test used to assert was an unrecorded divergence,
+/// not a deliberate extension choice: #2392 discards it at the runner's
+/// top-level emission boundary, same rule as every other top-level
+/// `Partial(prefix, Error|Break)`. The `halt_error` sub-cases are
+/// unaffected -- array construction is already atomic (`Expr::Array`
+/// collapses a `Partial`-`Halt` before it ever reaches the runner), so
+/// they were already `""` and stay `""`.
 #[test]
 fn test_owned_identity_pipe_carries_control_and_prefix_2495() -> Result<()> {
     let args = &["-o", "json", "-I0"];
@@ -39015,9 +39169,9 @@ fn test_owned_identity_pipe_carries_control_and_prefix_2495() -> Result<()> {
     )?;
     assert_eq!(code, 1, "stdout={stdout:?} stderr={stderr:?}");
     assert_eq!(
-        stdout.trim_end(),
-        "0",
-        "the first component's already-answered key must survive the second component's error"
+        stdout, "",
+        "real yq streams nothing before a top-level error (#2392); the first \
+         component's already-answered key does not survive"
     );
     assert!(
         stderr.contains("Cannot index array with string \"a\""),
@@ -39044,7 +39198,10 @@ fn test_owned_identity_pipe_carries_control_and_prefix_2495() -> Result<()> {
         args,
     )?;
     assert_eq!(code, 1, "stdout={stdout:?} stderr={stderr:?}");
-    assert_eq!(stdout.trim_end(), "0");
+    assert_eq!(
+        stdout, "",
+        "same rule after `sort` reorders the input (#2392)"
+    );
     assert!(stderr.contains("Cannot index array with string \"a\""));
 
     Ok(())
