@@ -42661,6 +42661,13 @@ fn range_bounds_validate_only_what_they_read_2698() -> Result<()> {
 /// `reverse` input -- `{}`, `null`, `""`, `0` included -- with "node at path
 /// [] is not an array", so the jq-mode `length`-decided rule must NOT reach
 /// here. Pins that every non-array still errors and every array still works.
+///
+/// The second loop is the owned route (`-n`, and `.a |= reverse`, which
+/// materializes), where the pre-#2730 `eval.rs` arm answered `[]` for
+/// `null` and *reversed* a string in every mode -- `.a |= reverse` on `{}`
+/// wrote `{"a":[]}`, `"ab" | reverse` gave `"ba"`. Real yq errors on both
+/// (`node at path [a] is not an array (it's a !!null)`), so dropping those
+/// arms moved this route toward yq too; these rows fail on the old binary.
 #[test]
 fn reverse_still_rejects_every_non_array_in_yq_mode_2730() -> Result<()> {
     for input in ["{}", "a: 1", "null", r#""""#, "0", r#""ab""#, "true"] {
@@ -42668,6 +42675,20 @@ fn reverse_still_rejects_every_non_array_in_yq_mode_2730() -> Result<()> {
         assert_ne!(
             code, 0,
             "#2730 yq: `{input} | reverse` must error like real yq, got {out:?}"
+        );
+    }
+    for (filter, input, args) in [
+        (".a |= reverse", "{}", &["-o=json", "-I=0"][..]),
+        (".a | reverse", "{}", &["-o=json", "-I=0"][..]),
+        (".a |= reverse", "a: ab", &["-o=json", "-I=0"][..]),
+        ("null | reverse", "", &["-n", "-o=json", "-I=0"][..]),
+        (r#""ab" | reverse"#, "", &["-n", "-o=json", "-I=0"][..]),
+        (r#""" | reverse"#, "", &["-n", "-o=json", "-I=0"][..]),
+    ] {
+        let (out, code) = run_yq_stdin(filter, input, args)?;
+        assert_ne!(
+            code, 0,
+            "#2730 yq owned route: `{filter}` on {input:?} must error like real yq, got {out:?}"
         );
     }
     for (input, want) in [("[]", "[]"), ("[1, 2]", "[2,1]")] {

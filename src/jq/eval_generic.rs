@@ -19638,7 +19638,12 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                         GenericResult::Owned(OwnedValue::Array(Vec::new()))
                     }
                     GenericResult::Error(e) => GenericResult::Error(e),
-                    GenericResult::None => GenericResult::None,
+                    // `length` only answers `None` under `optional = true`,
+                    // which `eval_single`'s #2368 pin keeps from ever
+                    // reaching `Builtin::Reverse`; forwarded so the day a
+                    // dispatch path does grant it, the suppression is
+                    // `length`'s, not an index error.
+                    GenericResult::None => GenericResult::None, // omni-dev: coverage tolerate-line reason="unreachable by design -- eval_single's #2368 debug_assert forbids optional=true on Builtin::Reverse, so length never answers None here (#2730)"
                     _ => GenericResult::Error(index_error()),
                 }
             } else if optional {

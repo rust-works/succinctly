@@ -48473,6 +48473,13 @@ fn test_reverse_follows_jqs_own_definition_2730() -> Result<()> {
         ("null", "[]", 0, ""),
         ("0", "[]", 0, ""),
         ("-0", "[]", 0, ""),
+        // Float zeros: `length` of a number is its `fabs`, so these are the
+        // `Float(0.0)` half of `reverse_length_is_empty` as *documents* --
+        // stdin `-0` parses to `Int(0)`, and only the owned route's unary
+        // minus reaches the float arm through that row.
+        ("0.0", "[]", 0, ""),
+        ("-0.0", "[]", 0, ""),
+        ("1e-400", "[]", 0, ""),
         (r#""""#, "[]", 0, ""),
         ("[]", "[]", 0, ""),
         ("[1,2]", "[2,1]", 0, ""),
@@ -48515,6 +48522,21 @@ fn test_reverse_follows_jqs_own_definition_2730() -> Result<()> {
     for input in [r#"{"a":1}"#, "true", r#""ab""#] {
         let (out, _, code) = run_jq_full(&["-c", "reverse?"], Some(input))?;
         assert_eq!((out.trim(), code), ("", 0), "#2730: `{input} | reverse?`");
+    }
+    // An undecodable string root now fails in `length` (a decode failure,
+    // which `?` never suppresses) instead of at the type check, where the
+    // old arm raised a plain index error that `?` *did* swallow -- exit 0 on
+    // a document jq refuses to parse at all (`parse error: Invalid escape`,
+    // exit 5). Both routes through `length` (`length?`, the hand-desugared
+    // def) already behaved this way; `reverse` now agrees with them.
+    for filter in ["reverse", "reverse?", "try reverse catch ."] {
+        let (out, err, code) = run_jq_full(&["-c", filter], Some(r#""bad\x""#))?;
+        assert_eq!(
+            (out.trim(), code),
+            ("", 5),
+            "#2730: `{filter}` on an undecodable string -- stderr: {err:?}"
+        );
+        assert!(err.contains("invalid escape"), "stderr: {err:?}");
     }
     Ok(())
 }
