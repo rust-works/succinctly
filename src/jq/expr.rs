@@ -461,8 +461,10 @@ pub enum Expr {
     TrackedVar(Rc<Tracked>),
 
     /// Location reference: `$__loc__`
-    /// Returns `{"file": "<stdin>", "line": N}` where N is the 1-based line number
-    /// in the jq filter source where `$__loc__` appears.
+    /// Returns `{"file": "<top-level>", "line": N}` where N is the 1-based line
+    /// number in the jq filter source where `$__loc__` appears (#2688; a def
+    /// sourced from an `include`d module reports that module's own file path
+    /// in real jq instead -- not modeled here, tracked as #2774).
     Loc {
         /// 1-based line number in the jq source
         line: usize,
