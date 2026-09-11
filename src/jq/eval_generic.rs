@@ -2401,7 +2401,7 @@ fn bridge_to_full_evaluator_flow<S: EvalSemantics, V: DocumentValue>(
     value: V,
     cursor: Option<V::Cursor>,
     optional: bool,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     // #2327: consults `optional` via `suppresses`, matching
     // `bridge_to_full_evaluator`'s own sibling fix above -- a suppressed
@@ -2444,12 +2444,12 @@ fn bridge_to_each_owned_flow<S: EvalSemantics, V: DocumentValue>(
     value: V,
     cursor: Option<V::Cursor>,
     optional: bool,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     match bridge_ambient_input(expr, &value, cursor) {
-        Ok(owned) => {
-            eval_each_owned::<S>(expr, &owned, optional, &mut |v| sink(GenericItem::Owned(v)))
-        }
+        Ok(owned) => eval_each_owned::<S>(expr, &owned, optional, &mut |v| {
+            sink.push(GenericItem::Owned(v))
+        }),
         Err(e) if suppresses(&e, optional) => Flow::Exhausted,
         Err(e) => Flow::Escaped(Control::Error(e)),
     }
@@ -5764,7 +5764,7 @@ fn drive_pipe_elements_generic<S: EvalSemantics, V: DocumentValue>(
     elements: impl Iterator<Item = Result<GenericItem<V>, Control>>,
     rest: &[Expr],
     optional: bool,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     // One `RestPipe` for the whole drive, so an owned copy is built on the
     // first `Owned` element and reused by every element after it (#1598).
@@ -5798,7 +5798,7 @@ fn each_lazy_index_range_iterate_sink<S: EvalSemantics, V: DocumentValue>(
     len: usize,
     rest: &[Expr],
     optional: bool,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     drive_pipe_elements_generic::<S, V>(
         (0..len).map(|i| Ok(GenericItem::Owned(OwnedValue::Int(i as i64)))),
@@ -5900,7 +5900,7 @@ fn each_lazy_keys_iterate_sink<S: EvalSemantics, V: DocumentValue>(
     collapse: bool,
     rest: &[Expr],
     optional: bool,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     if !sorted {
         // Held by `by_ref` rather than moved into the `map` closure so the
@@ -5994,7 +5994,7 @@ fn each_lazy_seq_iterate_sink<S: EvalSemantics, V: DocumentValue>(
     seq: LazySeq<V>,
     rest: &[Expr],
     optional: bool,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     drive_pipe_elements_generic::<S, V>(
         seq.map(|item| {
@@ -6048,7 +6048,7 @@ fn each_lazy_seq_iterate_sink<S: EvalSemantics, V: DocumentValue>(
 /// the early-exit trade. Recorded in `docs/compliance/jq/limitations.md`.
 fn each_lazy_array_iterate_sink<V: DocumentValue>(
     elements: V::Elements,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     let mut elems = elements;
     let mut is_first = true;
@@ -6073,7 +6073,7 @@ fn each_lazy_array_iterate_sink<V: DocumentValue>(
         is_first = false;
         elems = next;
         last_cursor = Some(cursor);
-        if sink(GenericItem::OneCursor(cursor)) == Demand::Stop {
+        if sink.push(GenericItem::OneCursor(cursor)) == Demand::Stop {
             return Flow::Stopped { pending: None };
         }
     }
@@ -6137,7 +6137,7 @@ fn try_owned_format_or_tostring_bypass<S: EvalSemantics, V: DocumentValue>(
     remaining: &[Expr],
     o: OwnedValue,
     optional: bool,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Result<Flow, OwnedValue> {
     match remaining {
         [stage @ (Expr::Format(_) | Expr::Builtin(Builtin::ToString))] => Ok(drain_result_generic(
@@ -6152,7 +6152,7 @@ fn fold_pipe_stages_sink<S: EvalSemantics, V: DocumentValue>(
     mut current: GenericResult<V>,
     stages: &[Expr],
     optional: bool,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     let mut j = 0usize;
     loop {
@@ -6225,7 +6225,7 @@ fn fold_pipe_stages_sink<S: EvalSemantics, V: DocumentValue>(
                 };
                 let rest_pipe = Expr::Pipe(stages[j..].to_vec());
                 return eval_each_owned::<S>(&rest_pipe, &o, optional, &mut |o| {
-                    sink(GenericItem::Owned(o))
+                    sink.push(GenericItem::Owned(o))
                 });
             }
             // Nothing further to fold; push (or don't) and stop, same as
@@ -7676,12 +7676,32 @@ enum GenericItem<V: DocumentValue> {
     LazySeq(Box<LazySeq<V>>),
 }
 
+/// The push boundary between a producer and whatever consumes its outputs
+/// (#2666) -- what every `sink: &mut dyn FnMut(GenericItem<V>) -> Demand`
+/// parameter in this module used to be, as a trait.
+///
+/// [`push`](Self::push) is the old closure call, and this commit changes
+/// nothing else: the trait exists so the consumer can later *describe
+/// itself* to the producer (how many outputs it will accept), which a bare
+/// closure cannot. That method, and why a trait rather than a second
+/// parameter threaded alongside the closure, arrive with the behaviour
+/// change that needs them.
+trait Sink<V: DocumentValue> {
+    fn push(&mut self, item: GenericItem<V>) -> Demand;
+}
+
+/// Every existing `&mut |item| ..` closure is a `Sink` with the default
+/// `Unbounded` budget -- which is what makes the default safe. Nothing
+/// about the 60-odd closure sites in this module changed to adopt the trait.
+impl<V: DocumentValue, F: FnMut(GenericItem<V>) -> Demand> Sink<V> for F {
+    fn push(&mut self, item: GenericItem<V>) -> Demand {
+        self(item)
+    }
+}
+
 /// Push one item to `sink`, translating its `Demand` into a terminal `Flow`.
-fn push_one_generic<V: DocumentValue>(
-    item: GenericItem<V>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
-) -> Flow {
-    match sink(item) {
+fn push_one_generic<V: DocumentValue>(item: GenericItem<V>, sink: &mut dyn Sink<V>) -> Flow {
+    match sink.push(item) {
         Demand::Continue => Flow::Exhausted,
         Demand::Stop => Flow::Stopped { pending: None },
     }
@@ -7693,10 +7713,10 @@ fn push_one_generic<V: DocumentValue>(
 /// already hold gets wrapped into a `GenericItem`.
 fn push_many_generic<V: DocumentValue>(
     items: impl Iterator<Item = GenericItem<V>>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     for item in items {
-        if sink(item) == Demand::Stop {
+        if sink.push(item) == Demand::Stop {
             return Flow::Stopped { pending: None };
         }
     }
@@ -7718,7 +7738,7 @@ fn push_many_generic<V: DocumentValue>(
 /// never decomposed here -- see [`GenericItem`]'s own doc comment for why.
 fn drain_result_generic<V: DocumentValue>(
     result: GenericResult<V>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     match result {
         GenericResult::None => Flow::Exhausted,
@@ -7818,7 +7838,7 @@ fn eval_positioned_stage_generic<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     cursor: V::Cursor,
     optional: bool,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     // STYLE-0012: the decode failure of the node this stage stands on is
     // raised or suppressed as `optional` says -- the same choice the bridge
@@ -7841,7 +7861,7 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
     value: V,
     optional: bool,
     cursor: Option<V::Cursor>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     match expr {
         // Mirrors `eval::eval_each`'s own `Comma` arm exactly: the sink *is*
@@ -8314,7 +8334,7 @@ fn each_foreach_generic<S: EvalSemantics, V: DocumentValue>(
     value: V,
     optional: bool,
     cursor: Option<V::Cursor>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     // INIT first, source second (#2440), same as the eager arm above it.
     let (init_values, init_control) =
@@ -8330,7 +8350,7 @@ fn each_foreach_generic<S: EvalSemantics, V: DocumentValue>(
         &mut |per_element| {
             drive_foreach_source_generic::<S, V>(input, &value, optional, cursor, per_element)
         },
-        &mut |v| sink(GenericItem::Owned(v)),
+        &mut |v| sink.push(GenericItem::Owned(v)),
     )
 }
 
@@ -8341,9 +8361,9 @@ fn each_foreach_generic<S: EvalSemantics, V: DocumentValue>(
 /// (#1620), which escapes.
 fn each_recurse_cursor_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: V::Cursor,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
-    if matches!(sink(GenericItem::OneCursor(cursor)), Demand::Stop) {
+    if matches!(sink.push(GenericItem::OneCursor(cursor)), Demand::Stop) {
         return Flow::Stopped { pending: None };
     }
     let mut children: Vec<(Rc<PathTrail>, PathNode<V>)> = Vec::new();
@@ -8410,7 +8430,7 @@ fn each_repeat_generic<S: EvalSemantics, V: DocumentValue>(
     value: V,
     optional: bool,
     cursor: Option<V::Cursor>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     // `f` is `Repeat`'s only child and the wrapper contributes nothing of
     // its own (`walk.rs`'s `node_reads_ambient` leaves `Expr::Repeat` to the
@@ -8434,7 +8454,7 @@ fn each_repeat_generic<S: EvalSemantics, V: DocumentValue>(
                 stopped = true;
                 return stop_with_escape(&mut budget_control, control);
             }
-            match sink(GenericItem::Owned(v)) {
+            match sink.push(GenericItem::Owned(v)) {
                 Demand::Continue => Demand::Continue,
                 Demand::Stop => {
                     stopped = true;
@@ -8525,7 +8545,7 @@ fn continue_pipe_element_generic<S: EvalSemantics, V: DocumentValue>(
     item: GenericItem<V>,
     rest: &mut RestPipe<'_>,
     optional: bool,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     match item {
         GenericItem::One(v) => {
@@ -8554,7 +8574,7 @@ fn continue_pipe_element_generic<S: EvalSemantics, V: DocumentValue>(
                     Err(o) => o,
                 };
             eval_each_owned::<S>(rest.owned(), &o, optional, &mut |o| {
-                sink(GenericItem::Owned(o))
+                sink.push(GenericItem::Owned(o))
             })
         }
         item @ (GenericItem::LazyKeys { .. }
@@ -8599,7 +8619,7 @@ fn each_if_generic<S: EvalSemantics, V: DocumentValue>(
     value: V,
     optional: bool,
     cursor: Option<V::Cursor>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     let mut outer_stopped = false;
     let mut escape: Option<Control> = None;
@@ -8662,12 +8682,12 @@ fn each_try_generic<S: EvalSemantics, V: DocumentValue>(
     value: V,
     optional: bool,
     cursor: Option<V::Cursor>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     let mut lazy_fault: Option<Control> = None;
     let flow = eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| {
         match check_lazy_item_for_try(item) {
-            Ok(item) => sink(item),
+            Ok(item) => sink.push(item),
             Err(control) => stop_with_escape(&mut lazy_fault, control),
         }
     });
@@ -8715,7 +8735,7 @@ fn run_try_handler_generic<S: EvalSemantics, V: DocumentValue>(
     payload: OwnedValue,
     optional: bool,
     cursor: Option<V::Cursor>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     if let Some(c) = cursor {
         let stages = owned_identity_body_stages(handler);
@@ -8730,7 +8750,7 @@ fn run_try_handler_generic<S: EvalSemantics, V: DocumentValue>(
         }
     }
     eval_each_owned::<S>(handler, &payload, optional, &mut |o| {
-        sink(GenericItem::Owned(o))
+        sink.push(GenericItem::Owned(o))
     })
 }
 
@@ -8794,7 +8814,7 @@ fn each_label_generic<S: EvalSemantics, V: DocumentValue>(
     value: V,
     optional: bool,
     cursor: Option<V::Cursor>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     match eval_each_generic::<S, V>(body, value, optional, cursor, sink) {
         Flow::Escaped(Control::Break(label)) if label == name => Flow::Exhausted,
@@ -8932,7 +8952,7 @@ fn each_as_generic<S: EvalSemantics, V: DocumentValue>(
     value: V,
     optional: bool,
     cursor: Option<V::Cursor>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     fanout_arg_each_generic_with_origin::<S, V, _>(
         expr,
@@ -8961,7 +8981,7 @@ fn each_as_pattern_generic<S: EvalSemantics, V: DocumentValue>(
     value: V,
     optional: bool,
     cursor: Option<V::Cursor>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     let all_var_names = pattern_alternatives_var_names(patterns);
 
@@ -9021,7 +9041,7 @@ fn each_pattern_alternatives_generic<S: EvalSemantics, V: DocumentValue>(
     value: &V,
     optional: bool,
     cursor: Option<V::Cursor>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     let last_idx = patterns.len() - 1;
     // #1366: a genuine `?//`-chain (2+ patterns) inverts real jq's
@@ -9064,7 +9084,7 @@ fn each_pattern_alternatives_generic<S: EvalSemantics, V: DocumentValue>(
             optional,
             cursor,
             &mut |item| match check_lazy_item_for_try(item) {
-                Ok(item) => sink(item),
+                Ok(item) => sink.push(item),
                 Err(control) => stop_with_escape(&mut lazy_fault, control),
             },
         );
@@ -9172,7 +9192,7 @@ fn each_limit_generic<S: EvalSemantics, V: DocumentValue>(
     value: V,
     optional: bool,
     cursor: Option<V::Cursor>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     // Rebuilt once, up front: all three deferral points below hand the same
     // node to the same bridge (#1687 item 4).
@@ -9199,7 +9219,7 @@ fn each_limit_with_n_generic<S: EvalSemantics, V: DocumentValue>(
     value: V,
     optional: bool,
     cursor: Option<V::Cursor>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     let n = match classify_limit_n(n_value) {
         Ok(LimitN::Unlimited) => {
@@ -9217,7 +9237,7 @@ fn each_limit_with_n_generic<S: EvalSemantics, V: DocumentValue>(
     let mut outer_stopped = false;
     let flow = eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| {
         count += 1;
-        if sink(item) == Demand::Stop {
+        if sink.push(item) == Demand::Stop {
             outer_stopped = true;
             Demand::Stop
         } else if count >= n {
@@ -9280,7 +9300,7 @@ fn take_at_index_generic<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
     skip: usize,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     let mut seen = 0usize;
     let mut outer_stopped = false;
@@ -9299,7 +9319,7 @@ fn take_at_index_generic<S: EvalSemantics, V: DocumentValue>(
                 item
             };
             kept_any = true;
-            if sink(item) == Demand::Stop {
+            if sink.push(item) == Demand::Stop {
                 outer_stopped = true;
             }
             return Demand::Stop;
@@ -9340,7 +9360,7 @@ fn each_first_generic<S: EvalSemantics, V: DocumentValue>(
     value: V,
     optional: bool,
     cursor: Option<V::Cursor>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     if crate::jq::input_queue_is_active() && crate::jq::walk::uses_input_builtins(inner) {
         return bridge_to_each_owned_flow::<S, V>(
@@ -9385,7 +9405,7 @@ fn each_nth_generic<S: EvalSemantics, V: DocumentValue>(
     value: V,
     optional: bool,
     cursor: Option<V::Cursor>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     if limit_or_nth_uses_live_input_queue(n_expr, expr) {
         return bridge_to_each_owned_flow::<S, V>(
@@ -9441,7 +9461,7 @@ fn each_select_generic<S: EvalSemantics, V: DocumentValue>(
     cond: &Expr,
     value: V,
     cursor: Option<V::Cursor>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     let mut already_emitted = false;
     let mut escape: Option<Control> = None;
@@ -9454,8 +9474,8 @@ fn each_select_generic<S: EvalSemantics, V: DocumentValue>(
             return Demand::Continue;
         }
         match cursor {
-            Some(c) => sink(GenericItem::OneCursor(c)),
-            None => sink(GenericItem::One(value.clone())),
+            Some(c) => sink.push(GenericItem::OneCursor(c)),
+            None => sink.push(GenericItem::One(value.clone())),
         }
     });
     resume_from_escape(escape, flow)
@@ -9491,7 +9511,7 @@ fn each_index_expr_generic<S: EvalSemantics, V: DocumentValue>(
     value: V,
     optional: bool,
     cursor: Option<V::Cursor>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     let mut escape: Option<Control> = None;
 
@@ -9586,7 +9606,7 @@ fn process_index_key<S: EvalSemantics, V: DocumentValue>(
     value: V,
     optional: bool,
     cursor: Option<V::Cursor>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
     escape: &mut Option<Control>,
 ) -> bool {
     let literal_key = owned_to_expr(k);
@@ -9645,11 +9665,11 @@ fn each_object_entries_generic<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
     acc: &mut Vec<(String, OwnedValue)>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     let Some((entry, rest)) = entries.split_first() else {
         let object: IndexMap<String, OwnedValue> = acc.iter().cloned().collect();
-        return match sink(GenericItem::Owned(OwnedValue::Object(object))) {
+        return match sink.push(GenericItem::Owned(OwnedValue::Object(object))) {
             Demand::Continue => Flow::Exhausted,
             Demand::Stop => Flow::Stopped { pending: None },
         };
@@ -9718,7 +9738,7 @@ fn each_object_value_generic<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
     acc: &mut Vec<(String, OwnedValue)>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     let mut escape: Option<Control> = None;
     let flow =
@@ -9793,7 +9813,7 @@ fn eval_each_pipe_generic<S: EvalSemantics, V: DocumentValue>(
     value: V,
     optional: bool,
     cursor: Option<V::Cursor>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     // #2451 rule 1: in yq mode a pipe with a union in it is evaluated over a
     // whole context list, branch-major, by `eval_yq_context_pipe` -- ahead of
@@ -10100,7 +10120,7 @@ fn run_yq_stages_over_item<S: EvalSemantics, V: DocumentValue>(
     stages: &[Expr],
     item: &YqContextItem<V>,
     optional: bool,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     match item.tag.origin {
         Some(origin) => with_node_origin(origin, || {
@@ -10114,7 +10134,7 @@ fn run_yq_stages_bare<S: EvalSemantics, V: DocumentValue>(
     stages: &[Expr],
     item: &YqContextItem<V>,
     optional: bool,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     if stages.is_empty() {
         return push_one_generic(item.to_generic_item(), sink);
@@ -10294,7 +10314,7 @@ fn eval_yq_context_pipe<S: EvalSemantics, V: DocumentValue>(
     inputs: &[YqContextItem<V>],
     optional: bool,
     cur: &core::cell::Cell<YqContextTag>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     // `collectOperator`'s own `evaluateAllTogether` fold
     // (`operator_collect.go:33-38`): every node must carry the flag, and an
@@ -10449,7 +10469,7 @@ fn cross_together<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cur: &core::cell::Cell<YqContextTag>,
 ) -> Result<Vec<YqContextItem<V>>, Flow> {
-    let each_operand = |operand: &Expr, operand_sink: &mut dyn FnMut(GenericItem<V>) -> Demand| {
+    let each_operand = |operand: &Expr, operand_sink: &mut dyn Sink<V>| {
         let mut flat: Vec<Expr> = Vec::new();
         yq_flatten_pipe_stages(core::slice::from_ref(operand), &mut flat);
         eval_yq_context_pipe::<S, V>(&flat, context, false, cur, operand_sink)
@@ -10534,7 +10554,7 @@ fn try_yq_context_pipe<S: EvalSemantics, V: DocumentValue>(
     value: V,
     optional: bool,
     cursor: Option<V::Cursor>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Option<Flow> {
     if !yq_context_pipe_applies::<S>(exprs) {
         return None;
@@ -10776,13 +10796,13 @@ fn generic_item_into_owned_with_origin<V: DocumentValue>(
 /// `eval.rs`'s `binary_fanout_each` gives: the per-right-value call on `left`
 /// happens while the call on `right` is still on the stack.
 fn binary_fanout_each_generic<V: DocumentValue>(
-    each_operand: impl Fn(&Expr, &mut dyn FnMut(GenericItem<V>) -> Demand) -> Flow,
+    each_operand: impl Fn(&Expr, &mut dyn Sink<V>) -> Flow,
     left: &Expr,
     right: &Expr,
     optional: bool,
     rules: BinaryFanoutRules,
     mut combine: impl FnMut(OwnedValue, OwnedValue) -> Result<OwnedValue, EvalError>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     // #2470: same wrapper, same rule, same `BinaryFanoutRules::read_only`
     // flag as `eval::binary_fanout_each` -- see
@@ -10824,7 +10844,7 @@ fn binary_fanout_each_generic<V: DocumentValue>(
                 (inner_val, outer_val.clone())
             };
             match combine(left_val, right_val) {
-                Ok(v) => sink(GenericItem::Owned(v)),
+                Ok(v) => sink.push(GenericItem::Owned(v)),
                 // Reached by the `Expr::Arithmetic` caller only: the two
                 // `Expr::Compare` call sites wrap the infallible
                 // `apply_compare_op` in `Ok(...)` (`CompareOp` has no failure
@@ -10856,7 +10876,7 @@ fn binary_fanout_each_generic<V: DocumentValue>(
         if inner_seen == 0 && matches!(inner, Flow::Exhausted) {
             if let Some(op) = rules.empty {
                 if let Some(v) = yq_empty_operand_output(op, Some(&outer_val)) {
-                    if matches!(sink(GenericItem::Owned(v)), Demand::Stop) {
+                    if matches!(sink.push(GenericItem::Owned(v)), Demand::Stop) {
                         return stop_with_downstream(&mut abort, Flow::Stopped { pending: None });
                     }
                 }
@@ -10885,16 +10905,16 @@ fn binary_fanout_each_generic<V: DocumentValue>(
 /// `rules.read_only`.
 fn read_only_operand_strategy_generic<V: DocumentValue>(
     rules: BinaryFanoutRules,
-    each_operand: impl Fn(&Expr, &mut dyn FnMut(GenericItem<V>) -> Demand) -> Flow,
-) -> impl Fn(&Expr, &mut dyn FnMut(GenericItem<V>) -> Demand) -> Flow {
-    move |expr: &Expr, sink: &mut dyn FnMut(GenericItem<V>) -> Demand| {
+    each_operand: impl Fn(&Expr, &mut dyn Sink<V>) -> Flow,
+) -> impl Fn(&Expr, &mut dyn Sink<V>) -> Flow {
+    move |expr: &Expr, sink: &mut dyn Sink<V>| {
         if !rules.read_only {
             return each_operand(expr, sink);
         }
         let _scope = yq_read_only_context::enter();
         each_operand(expr, &mut |item| {
             let _suspended = yq_read_only_context::suspend();
-            sink(item)
+            sink.push(item)
         })
     }
 }
@@ -10904,10 +10924,10 @@ fn read_only_operand_strategy_generic<V: DocumentValue>(
 /// of `eval::empty_outer_operand_pass`, split out for the same reason (one
 /// `return` shape in the loop above).
 fn empty_outer_operand_pass_generic<V: DocumentValue>(
-    each_operand: &impl Fn(&Expr, &mut dyn FnMut(GenericItem<V>) -> Demand) -> Flow,
+    each_operand: &impl Fn(&Expr, &mut dyn Sink<V>) -> Flow,
     other: &Expr,
     op: EmptyOperandOp,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     let mut abort: Option<Flow> = None;
     let mut other_seen = 0usize;
@@ -10918,7 +10938,7 @@ fn empty_outer_operand_pass_generic<V: DocumentValue>(
             Err(control) => return stop_with_downstream(&mut abort, Flow::Escaped(control)),
         };
         match yq_empty_operand_output(op, Some(&other_val)) {
-            Some(v) => sink(GenericItem::Owned(v)),
+            Some(v) => sink.push(GenericItem::Owned(v)),
             None => Demand::Continue,
         }
     });
@@ -11134,7 +11154,7 @@ fn each_alternative_generic<S: EvalSemantics, V: DocumentValue>(
     value: V,
     optional: bool,
     cursor: Option<V::Cursor>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     let mut forwarded = 0usize;
     let mut outer_stopped = false;
@@ -11158,34 +11178,40 @@ fn each_alternative_generic<S: EvalSemantics, V: DocumentValue>(
             Flow::Escaped(control) => stop_with_escape(&mut escape, control),
         }
     };
-    let left_flow = eval_each_generic::<S, V>(left, value.clone(), optional, cursor, &mut |item| {
-        // Fast path: `OneCursorValue` carries an already-decoded value
-        // (#1599/#1606/#1609, e.g. a `keys_unsorted` iteration) that routing
-        // through `generic_item_to_result` would otherwise collapse to a
-        // bare `OneCursor`, discarding it and forcing a second cursor
-        // `.value()` resolve on every item this forwards. Truthiness only
-        // needs the cursor, so answer it directly and keep the pair intact.
-        if let GenericItem::OneCursorValue(ref c, _) = item {
-            if c.is_falsy(JsonConvention::Preserve) {
-                return Demand::Continue;
-            }
-            forwarded += 1;
-            return handle_flow(push_one_generic(item, sink));
-        }
-        match retain_truthy_generic(generic_item_to_result(item)) {
-            // Falsy: dropped, and the left operand keeps producing. A
-            // genuine `Error`/`Break`/`Halt` falls to the `kept` arm below
-            // rather than getting its own -- `drain_result_generic` already
-            // converts each straight to `Flow::Escaped` with no sink call,
-            // the same conversion every other call site in this file relies
-            // on (#106: no second copy of that mapping to drift from it).
-            GenericResult::None => Demand::Continue,
-            kept => {
+    let left_flow = eval_each_generic::<S, V>(
+        left,
+        value.clone(),
+        optional,
+        cursor,
+        &mut |item: GenericItem<V>| {
+            // Fast path: `OneCursorValue` carries an already-decoded value
+            // (#1599/#1606/#1609, e.g. a `keys_unsorted` iteration) that routing
+            // through `generic_item_to_result` would otherwise collapse to a
+            // bare `OneCursor`, discarding it and forcing a second cursor
+            // `.value()` resolve on every item this forwards. Truthiness only
+            // needs the cursor, so answer it directly and keep the pair intact.
+            if let GenericItem::OneCursorValue(ref c, _) = item {
+                if c.is_falsy(JsonConvention::Preserve) {
+                    return Demand::Continue;
+                }
                 forwarded += 1;
-                handle_flow(drain_result_generic(kept, sink))
+                return handle_flow(push_one_generic(item, sink));
             }
-        }
-    });
+            match retain_truthy_generic(generic_item_to_result(item)) {
+                // Falsy: dropped, and the left operand keeps producing. A
+                // genuine `Error`/`Break`/`Halt` falls to the `kept` arm below
+                // rather than getting its own -- `drain_result_generic` already
+                // converts each straight to `Flow::Escaped` with no sink call,
+                // the same conversion every other call site in this file relies
+                // on (#106: no second copy of that mapping to drift from it).
+                GenericResult::None => Demand::Continue,
+                kept => {
+                    forwarded += 1;
+                    handle_flow(drain_result_generic(kept, sink))
+                }
+            }
+        },
+    );
 
     if outer_stopped || escape.is_some() {
         return resume_from_escape(escape, left_flow);
@@ -11268,7 +11294,7 @@ fn each_boolean_generic<S: EvalSemantics, V: DocumentValue>(
     value: V,
     optional: bool,
     cursor: Option<V::Cursor>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     boolean_fanout_each(
         |operand, bit_sink| {
@@ -11278,7 +11304,7 @@ fn each_boolean_generic<S: EvalSemantics, V: DocumentValue>(
         right,
         short_circuit,
         binary_fanout_rules::<S>(EmptyOperandOp::Boolean),
-        &mut |bit| sink(GenericItem::Owned(OwnedValue::Bool(bit))),
+        &mut |bit| sink.push(GenericItem::Owned(OwnedValue::Bool(bit))),
     )
 }
 
@@ -11310,7 +11336,7 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
     value: V,
     optional: bool,
     cursor: Option<V::Cursor>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     // `Cell` for the same reason `each_range` uses one: `emit` and the three
     // operand closures are live simultaneously and each must be able to
@@ -11324,7 +11350,7 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
             (f, t, st) => range_values_f64(f.as_f64(), t.as_f64(), st.as_f64()),
         };
         for v in values {
-            if sink(GenericItem::Owned(v)) == Demand::Stop {
+            if sink.push(GenericItem::Owned(v)) == Demand::Stop {
                 sink_stopped = true;
                 return Demand::Stop;
             }
@@ -11432,7 +11458,7 @@ fn each_negate_generic<S: EvalSemantics, V: DocumentValue>(
     value: V,
     optional: bool,
     cursor: Option<V::Cursor>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     let mut outer_stopped = false;
     let mut escape: Option<Control> = None;
@@ -11443,7 +11469,7 @@ fn each_negate_generic<S: EvalSemantics, V: DocumentValue>(
         };
         match crate::jq::eval::arith_negate::<S>(owned) {
             Ok(negated) => {
-                if sink(GenericItem::Owned(negated)) == Demand::Stop {
+                if sink.push(GenericItem::Owned(negated)) == Demand::Stop {
                     outer_stopped = true;
                     Demand::Stop
                 } else {
@@ -16103,7 +16129,7 @@ fn path_context_emitting_value<V: DocumentValue>(
 fn path_context_walk_generic<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     pos: &PathContextPos<V>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Result<Demand, Control> {
     match expr {
         Expr::Paren(inner) => path_context_walk_generic::<S, V>(inner, pos, sink),
@@ -16138,7 +16164,7 @@ fn path_context_walk_generic<S: EvalSemantics, V: DocumentValue>(
                 return Err(Control::Error(e));
             }
             walked?;
-            Ok(sink(GenericItem::Owned(OwnedValue::Array(items))))
+            Ok(sink.push(GenericItem::Owned(OwnedValue::Array(items))))
         }
         // `key` at the document root emits nothing: real yq prints nothing
         // there (#2421, captured live from v4.53.3), and jq has no `key` at
@@ -16162,7 +16188,7 @@ fn path_context_walk_generic<S: EvalSemantics, V: DocumentValue>(
         // answer from the key -- see `path_context_emitting_value`.
         Expr::Builtin(Builtin::PathNoArg | Builtin::Key) => {
             match path_context_emitting_value(expr, pos) {
-                Ok(Some(item)) => Ok(sink(item)),
+                Ok(Some(item)) => Ok(sink.push(item)),
                 Ok(None) => Ok(Demand::Continue),
                 // `cursor_key`'s malformed-member-key error path, pre-existing
                 // before this refactor merged this arm with `PathNoArg`'s.
@@ -16173,7 +16199,7 @@ fn path_context_walk_generic<S: EvalSemantics, V: DocumentValue>(
             let mut heads = Vec::new();
             let stepped = path_context_step_generic::<S, V>(expr, pos, &mut heads);
             for head in heads {
-                if matches!(sink(path_context_emit_node(&head.node)), Demand::Stop) {
+                if matches!(sink.push(path_context_emit_node(&head.node)), Demand::Stop) {
                     return Ok(Demand::Stop);
                 }
             }
@@ -16187,10 +16213,10 @@ fn path_context_walk_generic<S: EvalSemantics, V: DocumentValue>(
 fn path_context_walk_pipe<S: EvalSemantics, V: DocumentValue>(
     exprs: &[Expr],
     pos: &PathContextPos<V>,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Result<Demand, Control> {
     match exprs.split_first() {
-        None => Ok(sink(path_context_emit_node(&pos.node))),
+        None => Ok(sink.push(path_context_emit_node(&pos.node))),
         Some((first, [])) => path_context_walk_generic::<S, V>(first, pos, sink),
         Some((first, rest)) => {
             let mut heads = Vec::new();
@@ -17203,7 +17229,7 @@ fn path_context_root<V: DocumentValue>(root: V::Cursor) -> Result<PathContextPos
 fn try_path_context_walk_sink<S: EvalSemantics, V: DocumentValue>(
     exprs: &[Expr],
     root: V::Cursor,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Option<Flow> {
     let (walked, rest) = path_context_walk_split(exprs)?;
     let root_pos = match path_context_root::<V>(root) {
@@ -17214,7 +17240,7 @@ fn try_path_context_walk_sink<S: EvalSemantics, V: DocumentValue>(
     let mut rest_pipe = RestPipe::new(rest);
     let walked_result = path_context_walk_pipe::<S, V>(walked, &root_pos, &mut |item| {
         if rest.is_empty() {
-            return sink(item);
+            return sink.push(item);
         }
         // Same driver shape as `eval_each_pipe_generic`'s own: a downstream
         // stop or escape ends the walk, and is what the caller sees.
@@ -18210,7 +18236,7 @@ fn path_context_resolve_parent(at: &PathContextAt<'_>, n: usize) -> Result<Expr,
 fn try_path_context_absent_sink<S: EvalSemantics, V: DocumentValue>(
     exprs: &[Expr],
     root: V::Cursor,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Option<Flow> {
     let (head, rest, route) = path_context_absent_split(exprs)?;
     let root_pos = match path_context_root::<V>(root) {
@@ -18257,7 +18283,7 @@ fn try_path_context_absent_sink<S: EvalSemantics, V: DocumentValue>(
                         match path_context_resolve_absent_stages::<S, V>(rest, pos) {
                             Ok(resolved) => {
                                 eval_each_owned::<S>(&resolved, &owned, false, &mut |v| {
-                                    sink(GenericItem::Owned(v))
+                                    sink.push(GenericItem::Owned(v))
                                 })
                             }
                             Err(e) => Flow::Escaped(Control::Error(e)),
@@ -22196,7 +22222,7 @@ fn eval_owned_identity_pipe<S: EvalSemantics, V: DocumentValue>(
     value: OwnedValue,
     id: OwnedIdentity<V>,
     optional: bool,
-    sink: &mut dyn FnMut(GenericItem<V>) -> Demand,
+    sink: &mut dyn Sink<V>,
 ) -> Flow {
     eval_owned_identity_stages::<S, V>(stages, value, id, optional, OwnedIdentityTail::Sink(sink))
 }
@@ -22205,7 +22231,7 @@ fn eval_owned_identity_pipe<S: EvalSemantics, V: DocumentValue>(
 /// (spine 2416, identity pass).
 enum OwnedIdentityTail<'a, V: DocumentValue> {
     /// The pipe's outputs are values: the identity has done its work.
-    Sink(&'a mut dyn FnMut(GenericItem<V>) -> Demand),
+    Sink(&'a mut dyn Sink<V>),
     /// An enclosing stage continues from each `(value, identity)` pair --
     /// a bounded consumer counting its body's outputs, a `try` that has to
     /// tell its body's errors from the rest of the pipe's, a map-family
