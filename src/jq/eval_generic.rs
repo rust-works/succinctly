@@ -11416,9 +11416,13 @@ fn each_alternative_generic<S: EvalSemantics, V: DocumentValue>(
             // through `generic_item_to_result` would otherwise collapse to a
             // bare `OneCursor`, discarding it and forcing a second cursor
             // `.value()` resolve on every item this forwards. Truthiness only
-            // needs the cursor, so answer it directly and keep the pair intact.
+            // needs the cursor, so answer it directly via `cursor_is_truthy`
+            // and keep the pair intact -- the same shared rule, not a second
+            // inlined copy of it (#2665 item 3 follow-up: this site was the one
+            // cursor-backed truthiness check `cursor_is_truthy`'s doc comment
+            // claimed to cover but didn't actually reach).
             if let GenericItem::OneCursorValue(ref c, _) = item {
-                if c.is_falsy(JsonConvention::Preserve) {
+                if !cursor_is_truthy(c) {
                     return Demand::Continue;
                 }
                 forwarded += 1;
