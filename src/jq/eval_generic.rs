@@ -19703,8 +19703,8 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     // real yq's `to_entries` too.
                     let key = match key_owned_value(&field.key, &field.key_cursor) {
                         Ok(Some(key)) => key,
-                        Ok(None) => return GenericResult::Error(fields.malformed_member_error()),
-                        Err(e) => return GenericResult::Error(e),
+                        Ok(None) => return GenericResult::Error(fields.malformed_member_error()), // omni-dev: coverage tolerate-line reason="unreachable: `malformed_object_member` above already proved every key stringifies, the same `else` this arm replaced (#2785)"
+                        Err(e) => return GenericResult::Error(e), // omni-dev: coverage tolerate-line reason="unreachable: `key_owned_value` only materializes a key `decoded_key_str` decoded, and `to_owned_cursor` on an untagged decodable scalar cannot fail (#2785)"
                     };
                     // #1677: `malformed_object_member` above only checked
                     // the comma before each key; this loop already resolves
@@ -19787,7 +19787,7 @@ fn eval_builtin<S: EvalSemantics, V: DocumentValue>(
                     Err(_) if optional => GenericResult::None,
                     Err(e) => GenericResult::Error(e),
                 },
-                Some(other) => GenericResult::Owned(other),
+                Some(other) => GenericResult::Owned(other), // omni-dev: coverage tolerate-line reason="unreachable: `map(f)` on an array emits exactly one array; kept so a future `map` shape is merely passed through, never a panic (#2785)"
                 None => GenericResult::None,
             }
         }
@@ -34413,6 +34413,35 @@ mod tests {
             cursor_ancestor(&at(".a.b[1]"), 4).is_none(),
             "above the root"
         );
+    }
+
+    /// #2785: `effective_key_values` is `effective_keys` with typed keys --
+    /// a plain `1`/`true`/`null`/`1.5` key resolves as the member's value
+    /// would, a quoted or string-spelled key stays a string, and the walk's
+    /// three malformed-member checks still fire (here, #2261's trailing
+    /// stray comma, which no earlier check on this route sees first).
+    #[test]
+    fn effective_key_values_types_a_plain_key_and_keeps_the_checks_2785() {
+        use crate::yaml::YamlIndex;
+
+        let yaml = b"1: x\ntrue: y\nnull: z\n1.5: w\n\"2\": v\nk: u\n";
+        let index = YamlIndex::build(yaml).expect("valid YAML");
+        let root = index.root(yaml);
+        let mapping = root.first_child().expect("a document");
+        let fields = mapping.value().as_object().expect("a mapping");
+        let keys = effective_key_values(&fields, false).expect("well formed");
+        assert_eq!(keys.len(), 6);
+        assert_eq!(keys[0].as_i64(), Some(1));
+        assert_eq!(keys[1], OwnedValue::Bool(true));
+        assert_eq!(keys[2], OwnedValue::Null);
+        assert_eq!(keys[3].as_f64(), Some(1.5));
+        assert_eq!(keys[4], OwnedValue::String("2".into()));
+        assert_eq!(keys[5], OwnedValue::String("k".into()));
+
+        let json: &[u8] = br#"{"a":1,}"#;
+        let index = JsonIndex::build(json);
+        let fields = index.root(json).value().as_object().expect("an object");
+        assert!(effective_key_values(&fields, true).is_err());
     }
 
     /// #2763: the key node is a slot of its own, and it is the member

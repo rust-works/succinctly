@@ -108,6 +108,8 @@ mod tests {
             ("", "*", true),
             ("a", "", false),
             ("nul?", "null", false),
+            ("a", "a?", false),
+            ("ab", "a?", true),
             ("x", "x", true),
         ] {
             assert_eq!(
