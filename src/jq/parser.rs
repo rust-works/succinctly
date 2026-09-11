@@ -245,6 +245,24 @@ fn collect_def_names(input: &str) -> BTreeSet<String> {
         }
     }
 
+    // Scans one identifier off the front of `s` (whitespace/comments
+    // already skipped by the caller), returning it and everything after
+    // it. Shared by the def-name extraction and the parameter-list walk
+    // below (#2805 review) rather than hand-duplicated between them, per
+    // this codebase's own "duplicated predicates diverge silently" lesson
+    // (#106, #2728) that `is_ident_start_char`'s own doc comment cites.
+    fn scan_leading_ident(s: &str) -> Option<(&str, &str)> {
+        let mut chars = s.char_indices();
+        let (_, first) = chars.next()?;
+        if !is_ident_start_char(first) {
+            return None;
+        }
+        let end = chars
+            .find(|&(_, c)| !is_ident_continue(c))
+            .map_or(s.len(), |(i, _)| i);
+        Some((&s[..end], &s[end..]))
+    }
+
     let mut names = BTreeSet::new();
     for (start, _) in input.match_indices("def") {
         let end = start + 3;
@@ -268,17 +286,10 @@ fn collect_def_names(input: &str) -> BTreeSet<String> {
         // live: `def #c\nlength: 99; length` returned `0` (the real
         // builtin) instead of `99` before this fix.
         let rest = skip_ws_and_comments(&input[end..]);
-        let mut chars = rest.char_indices();
-        let Some((_, first)) = chars.next() else {
+        let Some((name, after_name_start)) = scan_leading_ident(rest) else {
             continue;
         };
-        if !is_ident_start_char(first) {
-            continue;
-        }
-        let ident_end = chars
-            .find(|&(_, c)| !is_ident_continue(c))
-            .map_or(rest.len(), |(i, _)| i);
-        names.insert(rest[..ident_end].to_string());
+        names.insert(name.to_string());
 
         // #2723: a def's *parameters* can shadow a zero-arity (or
         // wrong-arity-shadowable) builtin inside the def's own body
@@ -292,31 +303,53 @@ fn collect_def_names(input: &str) -> BTreeSet<String> {
         // so the parser committed a parameter-shadowed builtin straight to
         // `Expr::Builtin(Length)` with no shadow-candidate wrapping at all,
         // and `resolve.rs`'s scope-aware check never got a chance to see
-        // it. Scanning the parameter list on the same "cheap, deliberately
-        // over-approximate" terms as the rest of this function closes that
-        // gap: a `$`-style parameter is stripped of its leading `$` before
-        // being recorded, since it binds a *variable* (`$name`), never the
-        // bare-identifier builtin spelling this set exists to catch --
-        // recording it anyway would only cost a harmless extra wasted
-        // double-parse at any call site spelled with that bare name, never
-        // a wrong answer.
-        let after_name = skip_ws_and_comments(&rest[ident_end..]);
-        if let Some(params) = after_name.strip_prefix('(') {
-            if let Some(close) = params.find(')') {
-                for part in params[..close].split(';') {
-                    let part = skip_ws_and_comments(part);
-                    let part = part.strip_prefix('$').unwrap_or(part);
-                    let mut pchars = part.char_indices();
-                    let Some((_, pfirst)) = pchars.next() else {
-                        continue;
-                    };
-                    if !is_ident_start_char(pfirst) {
-                        continue;
-                    }
-                    let pend = pchars
-                        .find(|&(_, c)| !is_ident_continue(c))
-                        .map_or(part.len(), |(i, _)| i);
-                    names.insert(part[..pend].to_string());
+        // it. `$`-style parameters are stripped of their leading `$` before
+        // being recorded, since they bind a *variable* (`$name`), but a
+        // `$`-style parameter *also* binds the bare namespace to the same
+        // argument per jq's own `def f($x): body` == `def f(x): x as $x |
+        // body` desugaring, so the bare spelling still needs to be in this
+        // set to shadow the builtin (confirmed live: `[1,2,3] | def
+        // f($length): length; f(1)` is `1` in jq, not `3`).
+        //
+        // #2805 review: a plain `find(')')`/`split(';')` over the raw
+        // remaining text -- this function's first cut at this scan -- is
+        // fooled by a `#`-comment inside the parameter list containing
+        // either character, silently reopening the exact bug this issue
+        // fixes for a comment-containing header (confirmed live: `def
+        // f(#c)\nlength): length; f(1)` mistook the comment's own `)` for
+        // the list's close and left `length` out of `names` entirely,
+        // still answering `0`), and the unbounded forward `find(')')` scan
+        // is O(n) *per `def` occurrence* even when the paren is never
+        // closed, making a file with many such occurrences O(n^2) overall
+        // (confirmed live: doubling a crafted `"def a(".repeat(n)` input
+        // roughly quadrupled prescan time). Walking the list one token at
+        // a time instead -- skipping whitespace/comments before every
+        // token via `skip_ws_and_comments`, the same helper the def name
+        // above already uses -- fixes both: a comment's `)`/`;` is
+        // invisible to this walk because the whole comment is skipped
+        // before the walk inspects what follows it, and the walk bails
+        // (keeping whatever it already collected) the moment a token isn't
+        // `IDENT` followed by `;`/`,`/`)`, so an unclosed list costs at
+        // most its own length, never a scan of everything after it. `,` is
+        // accepted alongside `;` to match `Parser::parse_func_params`'s own
+        // separator set -- this dialect's grammar, not real jq's (real jq
+        // rejects a comma-separated def parameter list outright, confirmed
+        // live) -- since a comma-separated parameter is otherwise silently
+        // dropped from the shadow set the exact same way (confirmed live:
+        // `def f(a, length): length; f(1;2)` answered `0`, not `2`).
+        let after_name = skip_ws_and_comments(after_name_start);
+        if let Some(mut rest_params) = after_name.strip_prefix('(') {
+            loop {
+                rest_params = skip_ws_and_comments(rest_params);
+                let unprefixed = rest_params.strip_prefix('$').unwrap_or(rest_params);
+                let Some((pname, after_pname)) = scan_leading_ident(unprefixed) else {
+                    break;
+                };
+                names.insert(pname.to_string());
+                rest_params = skip_ws_and_comments(after_pname);
+                match rest_params.chars().next() {
+                    Some(';' | ',') => rest_params = &rest_params[1..],
+                    _ => break,
                 }
             }
         }

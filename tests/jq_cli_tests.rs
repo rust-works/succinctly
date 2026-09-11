@@ -23616,28 +23616,30 @@ fn test_def_param_shadows_zero_arity_builtin_2723() -> Result<()> {
     Ok(())
 }
 
-/// #2723: `collect_def_names`'s new parameter-list scan is, like the rest
-/// of that function, a cheap *and deliberately not lexically aware* text
-/// scan -- it does not know a `#`-comment can itself contain a `)`
-/// character, so a comment inside a parameter list can trick it into
-/// treating that in-comment `)` as the list's real close. A malformed `def`
-/// header exercising that gap (and the sibling "first parameter character
-/// isn't an identifier start" gap, from a raw non-identifier token in
-/// parameter position) must still fail as an ordinary compile error --
-/// never panic -- since this scan runs on every filter's raw source text
-/// unconditionally, valid or not, before the real parser ever sees it.
+/// #2723: `collect_def_names`'s parameter-list scan is, like the rest of
+/// that function, a cheap and deliberately over-approximate text scan --
+/// it walks the list one token at a time (identifier, then a `;`/`,`/`)`)
+/// and simply stops, keeping whatever it already collected, the moment a
+/// token doesn't fit that shape. A malformed `def` header exercising that
+/// bail-out (a non-identifier token in parameter position, and a `(` with
+/// no closing `)` anywhere in the rest of the input) must still fail as an
+/// ordinary compile error -- never panic -- since this scan runs on every
+/// filter's raw source text unconditionally, valid or not, before the real
+/// parser ever sees it.
 #[test]
 fn test_def_param_scan_malformed_headers_do_not_panic_2723() -> Result<()> {
     for filter in [
-        // A comment's own `)` short-circuits the naive `find(')')`, so the
-        // scan treats the comment body as the entire parameter list.
-        "def f(#c) 0: 1; f",
         // A non-identifier token in parameter position.
         "def f(1): 5; f",
         // An opening paren with no closing paren anywhere in the rest of
-        // the input at all -- `params.find(')')` answers `None`, so the
-        // scan never enters the parameter-splitting loop for this `def`.
+        // the input at all -- the token walk bails on the first thing
+        // that isn't `IDENT` followed by `;`/`,`/`)`, here immediately
+        // (nothing follows the lone parameter `a`).
         "def f(a",
+        // A comment with no trailing newline anywhere, consuming the rest
+        // of the input -- the leading-identifier scan sees only `""` and
+        // bails with nothing collected for this def's parameter list.
+        "def f(#c) 0: 1; f",
     ] {
         let (_, stderr, code) = run_jq_full(&["-nc", filter], None)?;
         assert_ne!(code, 0, "filter: {filter:?} unexpectedly compiled");
@@ -23673,11 +23675,59 @@ fn test_def_param_shadow_scoping_2723() -> Result<()> {
         ("def f(a; length; b): [a,length,b]; f(1;2;3)", "[1,2,3]"),
         // A comment between the parameter name and `)` still counts.
         ("def f(#c\nlength): length; f(1)", "1"),
+        // `,` is accepted as a parameter separator alongside `;`, matching
+        // `Parser::parse_func_params`'s own grammar (a succinctly
+        // extension -- real jq rejects a comma-separated def parameter
+        // list outright, confirmed live). A first cut of this scan split
+        // only on `;`, silently dropping a comma-separated parameter from
+        // the shadow set the same way the original #2723 bug dropped an
+        // unscanned one (#2805 review; confirmed live pre-fix: `def f(a,
+        // length): length; f(1;2)` answered `0`, not `2`).
+        ("def f(a, length): length; f(1;2)", "2"),
+        // #2805 review: a `#`-comment *inside* the parameter list can
+        // contain a `)` or `;` of its own -- a naive `find(')')`/
+        // `split(';')` over the raw text is fooled by either, mistaking
+        // the comment's own character for the list's real delimiter and
+        // losing the real parameter that follows. All three confirmed
+        // live pre-fix to answer `0`/`[1,true]` (falling through to the
+        // real builtin) instead of the values below.
+        ("def f(#c)\nlength): length; f(1)", "1"),
+        ("def f(#comment; more comment\nlength): length; f(1)", "1"),
+        ("def f(a; #comment; junk\nnot): [a, not]; f(1;2)", "[1,2]"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-nc", filter], None)?;
         assert_eq!(code, 0, "filter: {filter:?}, stderr: {stderr:?}");
         assert_eq!(stdout.trim_end(), expected, "filter: {filter:?}");
     }
+    Ok(())
+}
+
+/// #2805 review: a first cut of `collect_def_names`'s parameter-list scan
+/// located the list's close with an unbounded `params.find(')')` -- a scan
+/// across *the rest of the entire remaining input*, repeated for every
+/// `def NAME(` occurrence. A file with many such occurrences and no nearby
+/// `)` made every occurrence re-scan an ever-shrinking-but-still-huge
+/// remaining suffix, an `O(n^2)` blowup confirmed live pre-fix (doubling a
+/// crafted `"def a(".repeat(n)` input roughly quadrupled prescan time, e.g.
+/// ~2.7s at 128,000 reps). The token-by-token walk this issue's own fix
+/// replaced it with instead bails the moment a token doesn't look like
+/// `IDENT` followed by `;`/`,`/`)`, so an unclosed list costs at most its
+/// own length, never a scan of everything after it -- pinned here the same
+/// way `test_def_shadow_deep_nesting_does_not_blow_up_2036` pins its own
+/// parser-level denial-of-service fix, with a generous margin against CI
+/// noise rather than a tight benchmark.
+#[test]
+fn test_def_param_scan_unclosed_list_does_not_blow_up_2805() -> Result<()> {
+    let filter = "def a(".repeat(50_000);
+    let start = std::time::Instant::now();
+    let (_, stderr, code) = run_jq_full(&["-nc", &filter], None)?;
+    let elapsed = start.elapsed();
+    assert_ne!(code, 0, "stderr: {stderr:?}");
+    assert!(!stderr.contains("panicked"), "stderr: {stderr:?}");
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "50,000 unclosed \"def a(\" reps took {elapsed:?} -- quadratic blowup regressed"
+    );
     Ok(())
 }
 
