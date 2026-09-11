@@ -34203,6 +34203,10 @@ fn resolve_terminal<'a, S: EvalSemantics>(
 ) -> PathResolveResult<'a> {
     let mut kept: Vec<PathBranch<'a>> = Vec::new();
     let mut violation: Option<EvalEscape> = None;
+    // The retry generation current when this sink last refused a branch,
+    // `Some` only between that refusal and the next invocation -- see the
+    // `debug_assert!` below and `terminal_retry` (#2691).
+    let mut refused_at: Option<u64> = None;
     // `input` is the call's own fresh document root — never itself a
     // frozen `$x` snapshot, so ambient `snapshot` starts `false` (#1591),
     // and the document `path()`/`=`/`|=`/`del()` were actually called on is
@@ -34216,6 +34220,23 @@ fn resolve_terminal<'a, S: EvalSemantics>(
         &Frame::enter(expr),
         Keep::First,
         &mut |branch| {
+            // #2691: the reset just below discards a violation this sink
+            // already recorded. That is correct for exactly one caller -- a
+            // `?//` alternative that stopped on the refusal and is now
+            // trying the next alternative through this same sink -- and
+            // would be a silent false success for any other producer that
+            // kept driving past `Demand::Stop` (the refused write would go
+            // through). So a re-invocation after a refusal must have seen a
+            // retry begin. Checked, not assumed: the full suite plus 10,400
+            // generated `path`/`del`/`=`/`|=` shapes without a `?//` never
+            // re-invoke here, and the one `?//` retry that does is the
+            // shape this admits.
+            if let Some(generation) = refused_at.take() {
+                debug_assert!(
+                    terminal_retry::began_since(generation),
+                    "resolve_terminal's sink was re-invoked after refusing a branch, but no                      `?//` alternative retry began in between -- a producer drove past                      `Demand::Stop`, and the refusal it just cleared would have been a                      false success (#2691): expr={expr:?}"
+                );
+            }
             violation = None;
             if !branch.trackable {
                 if skip_untracked {
@@ -34226,6 +34247,7 @@ fn resolve_terminal<'a, S: EvalSemantics>(
                 } else {
                     EvalError::invalid_path_expression(&branch.value).into()
                 });
+                refused_at = Some(terminal_retry::current());
                 return Demand::Stop;
             }
             kept.push(branch);
@@ -36532,6 +36554,74 @@ mod nonretryable_stop {
     }
 }
 
+/// The `?//` retry generation [`resolve_terminal`]'s sink checks before it
+/// discards a refusal it already recorded (#2691).
+///
+/// That sink resets its captured violation on every invocation. The reset
+/// exists for one kind of caller: a `?//` alternative loop that stopped on
+/// the refusal and then drives the *next* alternative through the same
+/// sink, at which point the earlier alternative's refusal must not stand.
+/// The loop is not always the resolver's own [`resolve_as_pattern`] -- when
+/// the `?//` sits in a demand-pulled `foreach`/`reduce` source, the sink's
+/// `Demand::Stop` unwinds into the *value-mode* loop, which retries and
+/// feeds the sink again (see [`clear_nonretryable_stop`]). Any other
+/// producer that re-invoked the sink after `Demand::Stop` would clear a
+/// real refusal and let `del`/`=`/`|=` write where jq refuses -- a false
+/// success, not a wrong message. Nothing at the sink can tell the two apart
+/// from the branch alone, so the retry announces itself here:
+/// [`begin_attempt`] bumps a generation on entry to every alternative
+/// attempt (from [`clear_nonretryable_stop`], which every such loop already
+/// calls), the sink records the generation when it refuses, and a
+/// re-invocation asserts the generation moved.
+///
+/// The check is a `debug_assert!`: it fires in the suite and every debug
+/// build, which is where the invariant is exercised, and costs a release
+/// build nothing beyond the `Option<u64>` the sink already keeps. Sound in
+/// the direction that matters -- a legitimate retry always bumps before it
+/// re-invokes, so it can never fire spuriously; a rogue re-invocation
+/// *inside* a nested `?//` that happened to bump first would be missed, not
+/// misreported.
+///
+/// Rides beside the stack the way [`nonretryable_stop`] does, with the same
+/// `#[cfg(feature = "std")]` split for the same reason.
+#[cfg(feature = "std")]
+mod terminal_retry {
+    use std::cell::Cell;
+
+    thread_local! {
+        static GENERATION: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn begin_attempt() {
+        GENERATION.with(|g| g.set(g.get().wrapping_add(1)));
+    }
+
+    pub(crate) fn current() -> u64 {
+        GENERATION.with(Cell::get)
+    }
+
+    /// Whether an attempt began since `generation` was read.
+    pub(crate) fn began_since(generation: u64) -> bool {
+        current() != generation
+    }
+}
+
+/// `no_std` has no `thread_local!`, so the generation never moves and the
+/// assertion answers vacuously -- unchecked there, exactly as it was before
+/// #2691, never falsely failing.
+#[cfg(not(feature = "std"))]
+mod terminal_retry {
+    pub(crate) fn begin_attempt() {}
+
+    pub(crate) fn current() -> u64 {
+        0
+    }
+
+    pub(crate) fn began_since(_generation: u64) -> bool {
+        true
+    }
+}
+
 /// `no_std` has no `thread_local!`, so the side channel is never set and
 /// every escape-backed stop stays retryable there -- exactly as it was
 /// before #2180 WP3, not worse. Same trade-off, and the same reasoning, as
@@ -36640,8 +36730,26 @@ pub(crate) fn resume_from_escape(slot: Option<Control>, flow: Flow) -> Flow {
 /// Clear the non-retryable-stop side channel on entry to one `?//`
 /// alternative's attempt. See [`nonretryable_stop`] for why the clear lives
 /// here rather than at whoever set the flag.
+///
+/// Also the one place a `?//` attempt announces itself to
+/// [`resolve_terminal`]'s sink ([`terminal_retry::begin_attempt`], #2691).
+/// Every `?//` attempt loop in both evaluators -- value-mode
+/// [`each_pattern_alternatives`]/[`try_pattern_alternatives`], the fold
+/// forms, `eval_generic`'s twin, and the resolver's own
+/// [`resolve_as_pattern`] -- already calls this on entry, so putting the
+/// bump here rather than at any retry site makes "a retry began since the
+/// refusal" true by construction for every retry form, including the one
+/// that is easy to miss: a refusal at the resolver's terminal sink inside a
+/// `foreach`/`reduce` whose *source* holds the `?//`. That source is pulled
+/// by demand (#2235), so the sink's `Demand::Stop` crosses the value/path
+/// boundary and it is the **value-mode** retry that drives the next source
+/// value back into the same sink -- `path(foreach (1 as $x ?// $y | ..) as
+/// $v (.; .; if $v == 1 then 1 else . end))` is jq's `[]` only because of
+/// it. A first cut of #2691 bumped at `resolve_as_pattern` alone and fired
+/// on exactly that row.
 pub(crate) fn clear_nonretryable_stop() {
     nonretryable_stop::clear();
+    terminal_retry::begin_attempt();
 }
 
 /// Try each `?//`-separated pattern alternative (#1365) for one `foreach`
@@ -69492,6 +69600,33 @@ mod tests {
             ),
             ["3"]
         );
+    }
+
+    /// #2691: the retry-generation predicate `resolve_terminal`'s
+    /// `debug_assert!` relies on genuinely discriminates -- read a
+    /// generation, and `began_since` is `false` until an attempt begins and
+    /// `true` after. Without this the assertion could be vacuously true
+    /// (the `no_std` half *is*, by design, and says so); with it, the one
+    /// way the check can pass in a `std` build is a real
+    /// `terminal_retry::begin_attempt()` between the refusal and the
+    /// re-invocation, which only `resolve_as_pattern`'s alternative loop
+    /// performs.
+    #[test]
+    #[cfg(feature = "std")]
+    fn terminal_retry_generation_discriminates_2691() {
+        let before = terminal_retry::current();
+        assert!(
+            !terminal_retry::began_since(before),
+            "no attempt began, so nothing may claim one did"
+        );
+        terminal_retry::begin_attempt();
+        assert!(terminal_retry::began_since(before));
+        // And it keeps moving: a second refusal reads a fresh generation
+        // that the *previous* attempt does not satisfy.
+        let after = terminal_retry::current();
+        assert!(!terminal_retry::began_since(after));
+        terminal_retry::begin_attempt();
+        assert!(terminal_retry::began_since(after));
     }
 
     #[test]
