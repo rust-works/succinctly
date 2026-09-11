@@ -42222,6 +42222,11 @@ mod key_node_metadata_2763 {
             (".ek | key | line", DOC, "8\n"),
             // A sequence element has an index, not a key node: 0 in yq too.
             (".x[0] | key | line", MIXED, "0\n"),
+            // An owned value standing on the element (reached via `tostring`,
+            // so `key` sees an already-owned position rather than a live
+            // cursor) still has no key node -- the element's own line must
+            // not leak through, matching the direct case above.
+            (".x[0] | tostring | key | line", MIXED, "0\n"),
             // An absent node likewise.
             (".zz | key | line", KEYC, "0\n"),
         ])
@@ -42239,6 +42244,8 @@ mod key_node_metadata_2763 {
         const TYPED: &str = "1: x\ntrue: y\n";
         check(&[
             (".[\"1\"] | key | line", TYPED, "0\n"),
+            // Same through a `tostring` detour into the owned domain first.
+            (".[\"1\"] | tostring | key | line", TYPED, "0\n"),
             ("[.[] | key | select(. == \"1\")]", TYPED, "- \"1\"\n"),
             (".[] | select(key == \"1\")", TYPED, "x\n"),
             // A string key beside a typed one still answers, on both the
