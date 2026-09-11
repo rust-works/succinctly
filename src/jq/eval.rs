@@ -34948,10 +34948,6 @@ fn substitute_var_impl(
                 bound: FuncDefBound::default(),
             }
         }
-        // Label-break
-        // Don't substitute if the label shadows our variable
-        Expr::Label { name, .. } if name == var_name => expr.clone(),
-
         // #2095: every remaining variant's recursive-structural-child
         // handling here is identical to `install_def_calls`'s and
         // `substitute_func_param`'s own -- apply this substitution to each
@@ -34961,7 +34957,16 @@ fn substitute_var_impl(
         // for the full variant-by-variant justification, including the four
         // arms (`Shared`, `Builtin`, `FuncDef`, and `install_def_calls`'s own
         // `DefCall` policy) that stay explicit above/in each caller instead
-        // of ever reaching it -- `Expr::Error` used to be a fifth (#2727).
+        // of ever reaching it -- `Expr::Error` used to be a fifth (#2727),
+        // and `Expr::Label` a sixth (#2739): a label name and a variable
+        // name live in different namespaces in jq (`label $x | ...` binds
+        // a break target, not a variable), so a same-named label must
+        // never block a variable substitution from reaching into its
+        // body -- confirmed live against jq 1.7.1 across the bare case,
+        // nested same-named labels, and a `break $x` inside a rebound
+        // `$x` scope. `map_subexprs`'s own `Expr::Label` arm already
+        // recurses into `body` unconditionally and leaves `name` (a plain
+        // `String`, not an `Expr`) untouched, which is exactly right here.
         _ => map_subexprs(expr, &mut |sub| {
             substitute_var_impl(sub, var_name, replacement, mark)
         }),

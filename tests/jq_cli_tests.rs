@@ -28136,6 +28136,33 @@ fn test_error_message_substitution_reaches_bound_names_2727() -> Result<()> {
     Ok(())
 }
 
+/// #2739: a label name and a variable name live in different namespaces in
+/// jq -- `label $x | ...` binds a break target, not a variable -- but
+/// `substitute_var_impl`'s `Expr::Label` arm treated a matching label as
+/// shadowing the variable, blocking substitution from reaching an in-scope
+/// `$x` read inside the label's body. Covers the bare case, a nested
+/// same-named label, an unrelated rebinding inside the label body (already
+/// correct, unaffected by this fix), `break` still escaping to the right
+/// label afterward, and the `$`-style def-parameter sibling case
+/// (`substitute_func_param_impl` has no such arm and stays correct). All
+/// rows are live jq 1.7.1 captures.
+#[test]
+fn test_label_does_not_shadow_same_named_variable_2739() -> Result<()> {
+    for (filter, expected) in [
+        ("1 as $x | label $x | $x", "1\n"),
+        ("1 as $x | label $x | (label $x | $x)", "1\n"),
+        ("label $x | (2 as $x | $x)", "2\n"),
+        ("1 as $x | label $x | (2, break $x, 3)", "2\n"),
+        (r#"def f: label $x | (1, break $x, 2); [f]"#, "[1]\n"),
+        ("def f($x): label $x | $x; f(1)", "1\n"),
+    ] {
+        let (out, err, code) = run_jq_full(&["-cn", filter], None)?;
+        assert_eq!(code, 0, "`{filter}` -- out={out:?} err={err:?}");
+        assert_eq!(out, expected, "`{filter}`");
+    }
+    Ok(())
+}
+
 /// #2728: a leading underscore is a valid identifier-start character
 /// throughout jq (`def _walk: ...` is a common real-jq library convention),
 /// but the bare-name/call dispatch gate in `parse_primary` only checked

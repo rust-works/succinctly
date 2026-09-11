@@ -12722,6 +12722,18 @@ fn test_yq_halt_not_caught_by_try_catch_or_label() -> Result<()> {
     Ok(())
 }
 
+/// #2739: the label/variable namespace fix applies uniformly (not gated by
+/// `S: EvalSemantics`, since `substitute_var_impl` is shared), so a
+/// same-named `label $x | ... $x ...` must resolve the variable correctly
+/// in yq mode too, not just jq mode.
+#[test]
+fn test_label_does_not_shadow_same_named_variable_yq_2739() -> Result<()> {
+    let (stdout, code) = run_yq_stdin("1 as $x | label $x | $x", "x: 1\n", &[])?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim_end(), "1");
+    Ok(())
+}
+
 /// #791 follow-up: `map(f)`'s path-context evaluator (only reachable via
 /// `--eval-all` when `f` references `file_index`/`key`/`path`/`parent`, which
 /// routes through the deleted eager path-context evaluator instead of the
